@@ -3,9 +3,9 @@
 """Megatron timers."""
 
 import logging
-import time
 from abc import ABC, abstractmethod
-from typing import List
+from collections import deque
+from typing import Deque, List
 
 import torch
 
@@ -110,6 +110,17 @@ class Timer(TimerBase):
     """
     Timer class with ability to start/stop.
 
+    Timing is taken from CUDA events, not the host clock, so start() and stop()
+    do not synchronize. An interval is resolved only once its events have
+    completed, which means a measurement is reported a few calls after the
+    interval it describes. Reporting is lagged but lossless: every interval is
+    reported exactly once, in order, so an aggregate over many iterations is
+    exact.
+
+    The alternative -- host clock plus torch.cuda.synchronize() -- fences the
+    whole training loop on every call, which both costs the sync and hides any
+    other host stall behind it.
+
     Comment on using `barrier`: If this flag is passed, then all
     the caller processes will wait till all reach the timing routine.
     It is up to the user to make sure all the ranks in `barrier_group`
@@ -118,6 +129,11 @@ class Timer(TimerBase):
     in torch distributed land, it will result in the global communicator.
     """
 
+    # Cap on unresolved windows. The CUDA launch queue bounds how far the host
+    # can run ahead in practice; this only stops events accumulating without
+    # limit if the device stalls, and costs one wait when hit.
+    _MAX_PENDING = 1024
+
     def __init__(self, name):
         """Initialize Timer.
 
@@ -125,12 +141,21 @@ class Timer(TimerBase):
             name (str): Name of the timer.
         """
         super().__init__(name)
-        self._elapsed = 0.0
         self._active_time = 0.0
         self._started = False
         # Note that None will default to the global process group
         self._barrier_group = None
-        self._start_time = time.time()
+        self._start_event = None
+        # Current window: intervals whose events have not completed yet, the
+        # seconds already resolved out of it, and how many intervals it holds.
+        self._open_window: Deque = deque()
+        self._open_resolved = 0.0
+        self._open_count = 0
+        # Windows closed by elapsed(), as (pending, resolved_seconds, count).
+        self._closed_windows: Deque = deque()
+        # Resolved window durations in seconds, oldest first, not yet reported.
+        self._ready: Deque = deque()
+        self._last_reported = 0.0
 
     def set_barrier_group(self, barrier_group):
         """Sets barrier group.
@@ -149,8 +174,8 @@ class Timer(TimerBase):
         assert not self._started, 'timer has already been started'
         if barrier:
             torch.distributed.barrier(group=self._barrier_group)
-        torch.cuda.synchronize()
-        self._start_time = time.time()
+        self._start_event = torch.cuda.Event(enable_timing=True)
+        self._start_event.record()
         self._started = True
 
     def stop(self, barrier=False):
@@ -162,16 +187,60 @@ class Timer(TimerBase):
         assert self._started, 'timer is not started'
         if barrier:
             torch.distributed.barrier(group=self._barrier_group)
-        torch.cuda.synchronize()
-        elapsed = time.time() - self._start_time
-        self._elapsed += elapsed
-        self._active_time += elapsed
+        stop_event = torch.cuda.Event(enable_timing=True)
+        stop_event.record()
+        self._open_window.append((self._start_event, stop_event))
+        self._open_count += 1
+        self._start_event = None
         self._started = False
+        # Fold away whatever has completed, so a window spanning many intervals
+        # holds only the events still in flight.
+        self._drain_open()
+
+    def _drain_open(self):
+        """Resolve completed intervals of the current window into a partial sum."""
+        while self._open_window and self._open_window[0][1].query():
+            start_event, stop_event = self._open_window.popleft()
+            # elapsed_time is milliseconds; this class reports seconds.
+            self._open_resolved += start_event.elapsed_time(stop_event) / 1000.0
+
+    def _resolve(self, block=False):
+        """Move every completed window from the pending queue to the ready queue.
+
+        Events complete in stream order, so the last event of a window standing
+        in for the whole window is sufficient.
+
+        Args:
+            block (bool): Wait for the first window rather than returning empty.
+                Used only for the very first report, which has no earlier value
+                to stand in for it.
+        """
+        while self._closed_windows:
+            pending, resolved, count = self._closed_windows[0]
+            if pending and not pending[-1][1].query():
+                if not block and len(self._closed_windows) <= self._MAX_PENDING:
+                    break
+                # Either the first report, or backlogged and holding too many
+                # events. Wait rather than report nothing / accumulate forever.
+                pending[-1][1].synchronize()
+            self._closed_windows.popleft()
+            if count == 0:
+                # Nothing was timed in this window. Reporting 0.0 for it would
+                # blow up the throughput the caller divides out of it.
+                continue
+            total = resolved + sum(s.elapsed_time(e) for s, e in pending) / 1000.0
+            self._ready.append(total)
+            self._active_time += total
+            block = False  # got one; go back to never waiting
 
     def reset(self):
-        """Reset timer."""
+        """Reset timer, discarding intervals not yet reported."""
         # Don't reset _active_time
-        self._elapsed = 0.0
+        self._open_window.clear()
+        self._open_resolved = 0.0
+        self._open_count = 0
+        self._closed_windows.clear()
+        self._ready.clear()
         self._started = False
 
     def set_elapsed(self, value):
@@ -183,31 +252,48 @@ class Timer(TimerBase):
         Args:
             value (float): The elapsed time value in seconds.
         """
-        self._elapsed = value
+        self._ready.append(value)
+        self._last_reported = value
 
     def elapsed(self, reset=True, barrier=False):
         """Calculates the elapsed time and restarts timer.
 
+        Reports the oldest interval whose events have completed, so the value
+        describes a slightly earlier window than the one just closed. Until the
+        first window resolves, reports the last value seen -- never 0.0, which
+        callers divide by to get throughput.
+
         Args:
-            reset (bool, optional): Resets timer before restarting. Defaults to True.
+            reset (bool, optional): Consume the reported value, so the next call
+                returns the following interval. When False, peek without
+                consuming. Defaults to True.
             barrier (bool, optional): Synchronizes ranks before stopping. Defaults to False.
 
         Returns:
-            float: Elapsed time.
+            float: Elapsed time in seconds.
         """
         _started = self._started
         # If the timing in progress, end it first.
         if self._started:
             self.stop(barrier=barrier)
-        # Get the elapsed time.
-        _elapsed = self._elapsed
-        # Reset the elapsed time
-        if reset:
-            self.reset()
-        # If timing was in progress, set it back.
+        # Everything recorded since the last call belongs to the window we close
+        # here. Restart immediately so the caller's remaining work lands in the
+        # next window rather than in a gap between windows.
+        self._drain_open()
+        self._closed_windows.append(
+            (self._open_window, self._open_resolved, self._open_count)
+        )
+        self._open_window = deque()
+        self._open_resolved = 0.0
+        self._open_count = 0
         if _started:
             self.start(barrier=barrier)
-        return _elapsed
+        # The first report has nothing to fall back on and the caller divides by
+        # it, so pay one wait for it. Once per run.
+        self._resolve(block=self._last_reported == 0.0)
+        if self._ready:
+            self._last_reported = self._ready.popleft() if reset else self._ready[0]
+        return self._last_reported
 
     def active_time(self):
         """Calculates the cumulative duration for which the timer has been active"""
