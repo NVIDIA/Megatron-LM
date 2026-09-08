@@ -202,19 +202,17 @@ def _te_mxfp8_batch_invariant_grouped_gemm(
         if isinstance(weight, list)
         else tex.te_general_grouped_gemm_for_grouped_tensor
     )
+    grouped_gemm_args = [weight, True, grouped_input, False, grouped_output, None]
+    # TE added an optional bias-scale argument to the low-level grouped-GEMM
+    # bindings. Mirror the signature of its Python wrapper so this path works
+    # with both API revisions.
+    wrapper_code = getattr(general_grouped_gemm_for_grouped_tensor, "__code__", None)
+    if wrapper_code is not None:
+        num_wrapper_args = wrapper_code.co_argcount + wrapper_code.co_kwonlyargcount
+        if "bias_scale" in wrapper_code.co_varnames[:num_wrapper_args]:
+            grouped_gemm_args.append(None)
     grouped_gemm_impl(
-        weight,
-        True,
-        grouped_input,
-        False,
-        grouped_output,
-        None,
-        alpha,
-        beta,
-        workspace_setup,
-        workspace_cublas,
-        False,
-        sm_count,
+        *grouped_gemm_args, alpha, beta, workspace_setup, workspace_cublas, False, sm_count
     )
 
 
@@ -238,13 +236,29 @@ def _get_te_mxfp8_batch_invariant_weight(normalized_weight):
         normalized_weight.quantized_tensors = original_members
     grouped_for_gemm = normalized_weight.copy()
     tex.grouped_swizzle_for_gemm(grouped_for_gemm, rowwise=True, columnwise=False)
-    swizzled_members = grouped_for_gemm.split_into_quantized_tensors()
+    # Newer TE revisions return grouped swizzled scales as a 2-D tensor, but
+    # split_into_quantized_tensors() indexes it with flat element offsets. Build
+    # the expert views explicitly so both the older flat and newer 2-D layouts
+    # are handled without copying.
+    scale_buffer = grouped_for_gemm.scale_inv.view(-1)
+    scale_offsets = grouped_for_gemm.scale_inv_offsets
+    swizzled_scales = []
+    next_scale_offset = 0
+    for expert_index, original in enumerate(original_members):
+        scale_numel = original._rowwise_scale_inv.numel()
+        scale_offset = (
+            scale_offsets[expert_index] if scale_offsets is not None else next_scale_offset
+        )
+        swizzled_scales.append(
+            scale_buffer.narrow(0, scale_offset, scale_numel).view_as(original._rowwise_scale_inv)
+        )
+        next_scale_offset = scale_offset + scale_numel
     gemm_members = [
         TEMXFP8Tensor(
             shape=original.shape,
             dtype=original.dtype,
             rowwise_data=original._rowwise_data,
-            rowwise_scale_inv=swizzled._rowwise_scale_inv,
+            rowwise_scale_inv=swizzled_scale,
             columnwise_data=None,
             columnwise_scale_inv=None,
             fp8_dtype=original._fp8_dtype,
@@ -252,7 +266,7 @@ def _get_te_mxfp8_batch_invariant_weight(normalized_weight):
             requires_grad=False,
             with_gemm_swizzled_scales=True,
         )
-        for original, swizzled in zip(original_members, swizzled_members)
+        for original, swizzled_scale in zip(original_members, swizzled_scales)
     ]
     cache = (grouped_for_gemm, gemm_members)
     setattr(normalized_weight, _TE_MXFP8_BATCH_INVARIANT_WEIGHT_CACHE, cache)
@@ -276,7 +290,7 @@ def refresh_te_mxfp8_batch_invariant_weight(weight) -> bool:
 
     grouped_for_gemm = normalized_weight.copy()
     tex.grouped_swizzle_for_gemm(grouped_for_gemm, rowwise=True, columnwise=False)
-    cached[0].scale_inv.copy_(grouped_for_gemm.scale_inv)
+    cached[0].scale_inv.view(-1).copy_(grouped_for_gemm.scale_inv.view(-1))
     return True
 
 
