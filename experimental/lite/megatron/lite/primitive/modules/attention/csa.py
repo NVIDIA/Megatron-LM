@@ -426,7 +426,11 @@ class CompressedSparseAttention(nn.Module):
         self.rope_head_dim = config.qk_rope_head_dim
         self.softmax_scale = self.head_dim**-0.5
         self.num_heads_per_group = config.num_attention_heads // config.o_groups
-        # Kernel / indexer-loss knobs are implementation config (not part of
+        # Kernel / indexer-loss knobs are implementation config (not part of the
+        # HF model config), threaded as constructor arguments like GLM-5's DSA.
+        # Fused DSA kernels are the production default; the unfused sparse-attn /
+        # indexer-loss path (Core's ``_unfused_indexer_sparse_attn_from_topk``) is
+        # a debug fallback selected via ``apply_dsa_kernel_fusion=False``.
         # the HF model config), threaded as constructor arguments like GLM-5's DSA.
         self.apply_dsa_kernel_fusion = apply_dsa_kernel_fusion
         self.dsa_indexer_loss_coeff = dsa_indexer_loss_coeff
@@ -534,7 +538,10 @@ class CompressedSparseAttention(nn.Module):
                 sin=sin,
             )
 
-        # The BSHD dense-softmax fallback (and its CP all-gather loop) has been removed: DSv4 sequence parallelism now goes exclusively through the THD
+        # The BSHD dense-softmax fallback (and its CP all-gather loop) has been
+        # removed: DSv4 sequence parallelism now goes exclusively through the THD
+        # packed CP path (``packed_seq_params is not None`` above), and the only
+        # supported BSHD routes are the CP=1 fused sparse kernels dispatched above.
         # packed CP path (``packed_seq_params is not None`` above), and the only supported BSHD routes are the CP=1 fused sparse kernels dispatched above.
         raise NotImplementedError(
             "DSv4 CSA BSHD path supports only the CP=1 fused sparse backends; pass "
@@ -643,7 +650,11 @@ class CompressedSparseAttention(nn.Module):
                 "DeepSeek V4 fused DSA path currently supports causal masking only."
             )
         dsa_kernels = _load_dsa_kernels()
-        # The cuDNN SM90 indexer requires seqlen_q <= seqlen_k * ratio, but the compressor floors to seq_len // ratio blocks,
+        # The cuDNN SM90 indexer requires seqlen_q <= seqlen_k * ratio, but the
+        # compressor floors to seq_len // ratio blocks, so a seq_len that is not a
+        # multiple of ratio leaves the last query token(s) without a compressed key
+        # block. Right-pad to a multiple of ratio (the causal tail attends only real
+        # tokens and is sliced off the output) so seqlen_k * ratio == seqlen_q.
         # so a seq_len that is not a multiple of ratio leaves the last query token(s) without a compressed key block.
         orig_seq_len = x.shape[1]
         ratio = self.compress_ratio
@@ -865,7 +876,11 @@ class CompressedSparseAttention(nn.Module):
                 x_thd, self.compress_ratio, self.config.sliding_window, cp_group
             )
         else:
-            # cp_size == 1 has no left neighbour, so the boundary window is exactly zeros.
+            # cp_size == 1 has no left neighbour, so the boundary window is exactly
+            # zeros. Core reaches ``_forward_thd_cp`` only at cp>1 and never calls
+            # the P2P exchange with an empty op list; the lite path routes cp=1 THD
+            # through the same method, so materialize the zero boundary directly
+            # (matching ``cp_utils.exchange_cp_boundary_hidden``'s D_window sizing).
             d_comp = (
                 8 if self.compress_ratio == 4 else self.compress_ratio if self.compress_ratio > 1 else 0
             )

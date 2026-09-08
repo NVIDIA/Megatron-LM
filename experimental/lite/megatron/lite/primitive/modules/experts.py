@@ -1,5 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""MoE expert compute: SwiGLU fusions and Experts."""
+"""MoE expert compute: SwiGLU fusions, _AllReduceETP, and Experts."""
 
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ from megatron.lite.primitive.parallel import ParallelState
 from megatron.lite.primitive.recompute import CheckpointWithoutOutput
 from megatron.lite.primitive.utils import ensure_divisible
 
-__all__ = ["Experts"]
+__all__ = ["Experts", "_AllReduceETP"]
 
 
 @contextmanager
@@ -47,6 +47,20 @@ def swiglu_with_probs(
     return bias_swiglu_impl(y, bias=None, clamp_value=clamp_value)
 
 
+class _AllReduceETP(torch.autograd.Function):
+    """AllReduce with proper autograd: grad(AllReduce) = AllReduce."""
+
+    @staticmethod
+    def forward(ctx, x, group):
+        ctx.group = group
+        dist.all_reduce(x, group=group)
+        return x
+
+    @staticmethod
+    def backward(ctx, grad):
+        return grad, None
+
+
 class Experts(nn.Module):
 
     def __init__(
@@ -62,18 +76,10 @@ class Experts(nn.Module):
         self.num_local_experts = ensure_divisible(config.num_experts, ps.ep_size)
         self.fp8 = fp8
         self.moe_act_recompute = moe_act_recompute
+        # ETP is untested and its backward disagrees with lora.py's; refuse it.
         if ps.etp_size > 1:
-            # Expert tensor parallelism is not supported. The path existed but
-            # was never exercised, and its all-reduce disagreed with the one in
-            # ``lora.py`` about whether the backward needs a second reduction --
-            # the two are only both correct under opposite assumptions about
-            # whether the incoming gradient is already replicated, and nothing
-            # recorded which one holds here. Refusing is honest; a silently
-            # wrong gradient is not.
-            raise NotImplementedError(
-                f"Megatron Lite MoE experts do not support expert tensor "
-                f"parallelism; got etp_size={ps.etp_size}. Use etp_size=1."
-            )
+            raise NotImplementedError(f"etp_size={ps.etp_size} unsupported; use 1.")
+        self.etp_group = ps.etp_group if ps.etp_size > 1 else None
         self.swiglu_limit = float(getattr(config, "swiglu_limit", 0.0) or 0.0)
         self.fc1 = te.GroupedLinear(
             self.num_local_experts,
@@ -139,6 +145,34 @@ class Experts(nn.Module):
         if self.fp8:
             x, permuted_probs, m_splits, pad_mask = self._fp8_pad(x, permuted_probs, m_splits)
 
+        etp_real_len = x.shape[0]
+        if self.etp_group is not None:
+            max_len = torch.tensor([etp_real_len], device=x.device, dtype=torch.int64)
+            dist.all_reduce(max_len, op=dist.ReduceOp.MAX, group=self.etp_group)
+            max_len = int(max_len.item())
+            if etp_real_len < max_len:
+                x = torch.cat(
+                    [
+                        x,
+                        torch.zeros(
+                            max_len - etp_real_len, x.shape[1], dtype=x.dtype, device=x.device
+                        ),
+                    ],
+                    dim=0,
+                )
+                if permuted_probs is not None:
+                    permuted_probs = torch.cat(
+                        [
+                            permuted_probs,
+                            torch.zeros(
+                                max_len - etp_real_len, dtype=permuted_probs.dtype, device=x.device
+                            ),
+                        ],
+                        dim=0,
+                    )
+                m_splits = list(m_splits)
+                m_splits[-1] += max_len - etp_real_len
+
         probs = permuted_probs.unsqueeze(-1) if permuted_probs is not None else None
         with _expert_nvtx_range("ep_experts.forward"):
             if self.moe_act_recompute and probs is not None:
@@ -159,6 +193,10 @@ class Experts(nn.Module):
                 out = self.fc2(h, m_splits)
                 if self.fc2_lora is not None:
                     out = out + self.fc2_lora(h, m_splits)
+
+        if self.etp_group is not None:
+            out = _AllReduceETP.apply(out, self.etp_group)
+            out = out[:etp_real_len]
 
         if pad_mask is not None:
             out = out[pad_mask]

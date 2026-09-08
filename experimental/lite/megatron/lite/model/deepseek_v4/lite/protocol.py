@@ -16,13 +16,11 @@ from megatron.lite.model.deepseek_v4.lite.checkpoint import (
     save_hf_weights as _save_hf_weights_impl,
 )
 from megatron.lite.model.protocol_utils import (
-    add_cross_entropy_fusion,
     add_loss_context_kwargs,
     nested_from_packed,
     pack_r3_replay_mask as _pack_r3_replay_mask,
     pack_routed_experts as _pack_routed_experts,
     router_replay_roots as router_replay_roots,
-    set_cross_entropy_fusion,
 )
 from megatron.lite.primitive.bundle import ModelBundle
 from megatron.lite.primitive.parallel import ParallelState, init_parallel
@@ -69,9 +67,6 @@ class ImplConfig:
     mtp_num_layers: int | None = None
     num_nextn_predict_layers: int | None = None
     mtp_loss_scaling_factor: float = 0.1
-    # Off by default despite Megatron Core running DeepSeek-V4 with --cross-entropy-loss-fusion: on
-    # this backend the fused path is measurably worse on both axes.
-    cross_entropy_fusion: bool = False
     qat: QATSpec | dict | None = None
 
 
@@ -144,8 +139,11 @@ def _infer_cp_local_seq_len(
     return seq_len // cp_size if seq_len % cp_size == 0 else seq_len
 
 
-# The 1-D-packed -> jagged-nested split is model-agnostic
-# and lives in the shared protocol_utils layer.
+# The 1-D-packed -> jagged-nested split is model-agnostic and lives in the shared
+# protocol_utils layer. DS4 only forks the *CP layout* pair (contiguous DSA, see
+# ``_prepare_packed_batch_kwargs`` below); this pre-CP primitive must not diverge,
+# so alias the shared implementation instead of re-copying it. Keeping the local
+# name preserves existing call sites and unit tests.
 _nested_from_packed_tensor = nested_from_packed
 
 
@@ -251,15 +249,17 @@ def _uses_csa(model) -> bool:
 
 
 def _prepare_model_forward_kwargs(model, batch: PackedBatch):
-    # THD-packed inputs (1-D values, or a single padded [1, S]
-    # row) carry their own cu_seqlens and go through the packed builder.
+    # THD-packed inputs (1-D values, or a single padded [1, S] row) carry their own
+    # cu_seqlens and go through the packed builder. A dense multi-row [B, S] batch is
+    # split per row under contiguous CP, where contiguous_position_ids_for_cp rebuilds
+    # the per-rank global position ids.
     input_ids = batch.input_ids
     is_thd_packed = input_ids.dim() == 1 or (input_ids.dim() == 2 and input_ids.size(0) == 1)
     if is_thd_packed:
         return _prepare_packed_batch_kwargs(model, batch)
-    # CSA has no dense BSHD path: the fallback and its CP all-gather loop
-    # were removed upstream, leaving the CP=1 fused sparse kernels and the THD packed route.
     if _uses_csa(model):
+        # CSA has no dense BSHD path; refusing here names the constraint at the
+        # boundary that can still act on it, instead of raising frames deeper.
         raise NotImplementedError(
             f"DeepSeek-V4 CSA has no dense BSHD path, but this batch is "
             f"[B, S] with B={input_ids.size(0)}. Pack the batch (1-D values, or a "
@@ -270,9 +270,7 @@ def _prepare_model_forward_kwargs(model, batch: PackedBatch):
 
 
 def _forward_step(model: nn.Module, batch: PackedBatch) -> dict:
-    kwargs = _prepare_model_forward_kwargs(model, batch)
-    add_cross_entropy_fusion(kwargs, model)
-    return model(**kwargs)
+    return model(**_prepare_model_forward_kwargs(model, batch))
 
 
 def unpack_forward_output(model: nn.Module, batch: PackedBatch, output) -> Any:
@@ -289,7 +287,12 @@ def unpack_forward_output(model: nn.Module, batch: PackedBatch, output) -> Any:
 
 
 def pack_routed_experts(model: nn.Module, batch: PackedBatch, routed_experts):
-    """Pack R3 routes using DS4's contiguous CP token layout."""
+    """Pack R3 routes using DS4's contiguous CP token layout.
+
+    The current rollout configuration does not run MTP, so the route layer axis
+    contains only main decoder routers.  If rollout later enables DeepSeek MTP
+    speculative decoding, this assumption must be reevaluated.
+    """
 
     return _pack_routed_experts(model, batch, routed_experts, contiguous=True)
 
@@ -317,7 +320,17 @@ def _apply_mtp_config(model_cfg: DeepseekV4Config, impl_cfg: ImplConfig) -> None
 
 
 def _make_aux_loss_hook():
-    """Per-step hook that syncs the MTP auxiliary-loss backward scale to the main loss scale (DP size / gradient accumulation), mirroring the sibling protocols (kimi_k2 / glm5 / qwen3_5 / qwen3_moe)."""
+    """Per-step hook that syncs the MTP auxiliary-loss backward scale to the main
+    loss scale (DP size / gradient accumulation), mirroring the sibling protocols
+    (kimi_k2 / glm5 / qwen3_5 / qwen3_moe).
+
+    DS4 only injects an MTP auxiliary loss: its MoE router is aux-loss-free
+    (``SigmoidTopKRouter(..., compute_aux_loss=False)``) and its CSA indexer runs
+    with ``sparse_loss=False``, so -- unlike GLM-5, which also scales the MoE-aux
+    and DSA-indexer losses -- only ``MTPLossAutoScaler`` needs scaling here.
+    Without this hook the injected MTP gradient keeps ``MTPLossAutoScaler``'s
+    class-default scale of 1.0 and is mis-weighted relative to the main loss.
+    """
     from megatron.lite.primitive.modules.mtp import MTPLossAutoScaler
 
     def hook(scale: torch.Tensor) -> None:
@@ -351,7 +364,11 @@ def _iter_transformer_units(chunk: nn.Module) -> list[nn.Module]:
 
 
 def _validate_parallel_scope(p: ParallelConfig) -> None:
-    """DS4 CSA attention is not tensor-parallel-capable (documented TP=1 case)."""
+    """DS4 CSA attention is not tensor-parallel-capable (documented TP=1 case).
+
+    PP / VPP / EP / CP are inherited from the Kimi skeleton and work; only
+    TP>1 / ETP>1 are unsupported.  Mirrors GLM-5's gate.
+    """
     etp = 1 if p.etp is None else p.etp
     if p.tp > 1:
         raise NotImplementedError(
@@ -418,8 +435,6 @@ def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBu
 
         for chunk in chunks:
             apply_offload(_iter_transformer_units(chunk), impl_cfg.offload, MODULE_MAP)
-
-    set_cross_entropy_fusion(chunks, impl_cfg.cross_entropy_fusion)
 
     # Parametrize before optimizer construction so it captures the BF16 master.
     apply_qat_to_chunks(chunks, normalize_qat_spec(impl_cfg.qat))

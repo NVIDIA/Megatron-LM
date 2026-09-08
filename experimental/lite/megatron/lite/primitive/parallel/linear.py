@@ -20,7 +20,21 @@ if TYPE_CHECKING:
     from megatron.lite.primitive.parallel.state import ParallelState
 
 
-# --------------------------------------------------------------------------- Vanilla column-parallel linear
+# ---------------------------------------------------------------------------
+# Vanilla column-parallel linear (torch.matmul kernel, NOT TE).
+#
+# Matches Megatron-Core `tensor_parallel.ColumnParallelLinear` bit-for-bit
+# in bf16: same `torch.matmul(input, weight.t())` forward, same
+# all-reduce-on-backward-grad_input pattern. Use this for heads like the
+# vocab LM projection where MC's GPT model uses vanilla torch matmul
+# (hardcoded in `LinearCrossEntropyModule(tensor_parallel.ColumnParallelLinear)`)
+# — TE's `te.Linear` uses a different cuBLAS algo selection that introduces
+# ~3e-4 loss-level drift under bf16 vs torch.matmul.
+#
+# For QKV / MoE experts we still prefer the TE path (fused LN+linear, FP8
+# readiness) — this vanilla path is a drop-in substitute only when kernel
+# parity with the reference backend is required.
+# ---------------------------------------------------------------------------
 # (torch.matmul kernel, NOT TE).
 
 

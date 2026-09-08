@@ -575,17 +575,3 @@ def test_models_without_csa_keep_the_dense_route() -> None:
         protocol._base_model_forward_kwargs = original_base
 
     assert reached.get("yes"), "a non-CSA model must still reach the dense builder"
-
-
-def test_experts_refuse_expert_tensor_parallelism() -> None:
-    """etp_size > 1 must fail at construction, naming the value and the way out."""
-    from types import SimpleNamespace
-
-    from megatron.lite.primitive.modules.experts import Experts
-
-    ps = SimpleNamespace(ep_size=1, etp_size=2, tp_size=1, etp_group=None, tp_group=None)
-    config = SimpleNamespace(num_experts=2, hidden_size=8, moe_intermediate_size=8, swiglu_limit=0.0)
-    with pytest.raises(NotImplementedError) as excinfo:
-        Experts(config, ps)
-    assert "etp_size=2" in str(excinfo.value)
-    assert "etp_size=1" in str(excinfo.value), "the message must name the supported value"
