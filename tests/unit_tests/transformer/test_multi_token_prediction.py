@@ -137,6 +137,7 @@ class TestMultiTokenPredictionLayer:
             mtp_use_repeated_layer=use_repeated_layer,
             enable_attention_residuals=enable_attention_residuals,
             attn_res_block_layers=2 if enable_attention_residuals else None,
+            attn_res_impl="eager",
         )
         if use_te:
             transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(

@@ -716,7 +716,7 @@ class AttentionResidual(MegatronModule):
     def __init__(self, config: TransformerConfig, layer_number: Optional[int] = None):
         super().__init__(config)
         self.eps = config.layernorm_epsilon
-        self.impl = getattr(config, 'attn_res_impl', 'eager')
+        self.impl = getattr(config, 'attn_res_impl', 'fla')
         self._fla_fused_attnres = _get_fla_fused_attnres() if self.impl == 'fla' else None
         if self.impl == 'fla' and self._fla_fused_attnres is None:
             raise ImportError(

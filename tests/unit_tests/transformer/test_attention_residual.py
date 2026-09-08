@@ -160,6 +160,7 @@ class TestAttnResHybridMTPNativeParity:
             num_attention_heads=4,
             enable_attention_residuals=True,
             attn_res_block_layers=1,
+            attn_res_impl="eager",
             is_hybrid_model=True,
             mtp_num_layers=2,
         )
@@ -518,7 +519,11 @@ class TestAttnResInitEquivalence:
             pipeline_dtype=torch.float32,
         )
         if enable_attn_res:
-            kwargs.update(enable_attention_residuals=True, attn_res_block_layers=block_layers)
+            kwargs.update(
+                enable_attention_residuals=True,
+                attn_res_block_layers=block_layers,
+                attn_res_impl="eager",
+            )
         config = TransformerConfig(**kwargs)
         spec = get_gpt_decoder_block_spec(config, use_transformer_engine=False)
         model = GPTModel(
@@ -569,7 +574,8 @@ class TestAttnResConfigValidation:
     def test_valid_config(self):
         from megatron.core.transformer.transformer_config import TransformerConfig
 
-        TransformerConfig(**self._base_kwargs())
+        config = TransformerConfig(**self._base_kwargs())
+        assert config.attn_res_impl == "fla"
 
     def test_variable_seq_lengths_supported_without_pipeline_parallelism(self):
         """Packed/variable sequence layouts are local tensors at PP=1."""
