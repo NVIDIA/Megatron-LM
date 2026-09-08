@@ -30,6 +30,7 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
     DSAttention,
     DSAttentionSubmodules,
     FusedDSAIndexerLoss,
+    _DSAIndexSharingPayload,
     _run_sparse_attention,
     _validate_nonpacked_cp_uniform_length,
     compute_dsa_indexer_loss,
@@ -54,6 +55,7 @@ from megatron.core.transformer.experimental_attention_variant.dsa_masking import
     masked_log_softmax,
     scatter_topk_into_index_mask,
 )
+from megatron.core.transformer.forward_sharing import get_forward_sharing_state
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
@@ -141,7 +143,7 @@ class TestDSAIndexShareHelpers:
         assert attention.indexer is None
         assert attention.source_layer == 1
 
-    def test_index_share_holder_uses_attention_mask_without_packed_seq_params(self):
+    def test_index_share_state_uses_attention_mask_without_packed_seq_params(self):
         config = SimpleNamespace(
             dsa_indexer_topk=8,
             dsa_indexer_topk_freq=4,
@@ -159,15 +161,15 @@ class TestDSAIndexShareHelpers:
         )
         attention_mask = torch.empty(1)
 
-        topk_holder = attention._get_index_share_topk_holder(None, attention_mask)
-        length_holder = attention._get_index_share_topk_length_holder(None, attention_mask)
+        index_payload = attention._get_dsa_index_sharing_payload(None, attention_mask)
 
-        assert topk_holder is getattr(attention_mask, DSAttention._HOLDER_ATTR)
-        assert length_holder is getattr(attention_mask, DSAttention._LENGTH_HOLDER_ATTR)
-        assert not hasattr(config, DSAttention._HOLDER_ATTR)
-        assert not hasattr(config, DSAttention._LENGTH_HOLDER_ATTR)
+        forward_state = get_forward_sharing_state(None, attention_mask, config)
+        dsa_payload = forward_state.get(_DSAIndexSharingPayload)
+        assert dsa_payload is not None
+        assert index_payload is dsa_payload
+        assert not hasattr(config, "_forward_sharing_state")
 
-    def test_index_share_holder_uses_packed_seq_params_when_available(self):
+    def test_index_share_state_uses_packed_seq_params_when_available(self):
         config = SimpleNamespace(
             dsa_indexer_topk=8,
             dsa_indexer_topk_freq=4,
@@ -186,15 +188,13 @@ class TestDSAIndexShareHelpers:
         packed_seq_params = PackedSeqParams(qkv_format="thd")
         attention_mask = torch.empty(1)
 
-        topk_holder = attention._get_index_share_topk_holder(packed_seq_params, attention_mask)
-        length_holder = attention._get_index_share_topk_length_holder(
-            packed_seq_params, attention_mask
-        )
+        index_payload = attention._get_dsa_index_sharing_payload(packed_seq_params, attention_mask)
 
-        assert topk_holder is getattr(packed_seq_params, DSAttention._HOLDER_ATTR)
-        assert length_holder is getattr(packed_seq_params, DSAttention._LENGTH_HOLDER_ATTR)
-        assert not hasattr(attention_mask, DSAttention._HOLDER_ATTR)
-        assert not hasattr(attention_mask, DSAttention._LENGTH_HOLDER_ATTR)
+        forward_state = get_forward_sharing_state(packed_seq_params, attention_mask, config)
+        dsa_payload = forward_state.get(_DSAIndexSharingPayload)
+        assert dsa_payload is not None
+        assert index_payload is dsa_payload
+        assert not hasattr(attention_mask, "_forward_sharing_state")
 
 
 def _build_packed_causal_mask_for_test(

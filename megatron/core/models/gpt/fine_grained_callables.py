@@ -15,6 +15,7 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
 )
 from megatron.core.pipeline_parallel.utils import ScheduleNode, make_viewless
 from megatron.core.transformer.enums import CudaGraphModule
+from megatron.core.transformer.forward_sharing import use_forward_sharing_state
 from megatron.core.transformer.module import GraphableMegatronModule, float16_to_fp32
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.multi_token_prediction import (
@@ -410,7 +411,20 @@ class TransformerLayerNode(ScheduleNode):
 
     def forward_impl(self, *args):
         """Calls the submodule as the forward pass."""
-        return self.submodule(self, *args)
+        sharing_state = getattr(self.chunk_state, 'forward_sharing_state', None)
+        if sharing_state is None:
+            return self.submodule(self, *args)
+        try:
+            with use_forward_sharing_state(
+                sharing_state,
+                self.chunk_state.packed_seq_params,
+                self.chunk_state.attention_mask,
+                self.chunk_state.model.config,
+            ):
+                return self.submodule(self, *args)
+        except Exception:
+            sharing_state.clear()
+            raise
 
     def backward_impl(self, outputs, output_grad):
         """Implements the backward pass for the transformer layer node."""

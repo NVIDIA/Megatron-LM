@@ -5,7 +5,7 @@ import functools
 import logging
 import math
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional, Tuple, Union
 
 import torch
@@ -30,6 +30,7 @@ from megatron.core.transformer.experimental_attention_variant import (
     dsa_layout,
     dsa_masking,
 )
+from megatron.core.transformer.forward_sharing import get_forward_sharing_state
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -1925,6 +1926,21 @@ def unfused_dsa_fn(
     return output
 
 
+@dataclass
+class _DSAIndexSharingPayload:
+    """Ordinary DSA index-sharing tensors carried across physical layers.
+
+    Source/skip layers follow the configured layer-number schedule. Tensors remain
+    available to decoder and MTP consumers until the enclosing forward is cleared.
+    """
+
+    topk_by_layer: dict[int, torch.Tensor] = field(default_factory=dict)
+    topk_length_by_layer: dict[int, torch.Tensor] = field(default_factory=dict)
+
+    def __copy__(self):
+        return type(self)(dict(self.topk_by_layer), dict(self.topk_length_by_layer))
+
+
 class DSAttention(MegatronModule):
     """
     This module implements sparse attention mechanism using an DSA Indexer to compute top-k
@@ -1936,8 +1952,6 @@ class DSAttention(MegatronModule):
 
     consumes_absorbed_v_up_projection = True
     requires_dsa_inputs = True
-    _HOLDER_ATTR = "_dsa_index_share_topk_holder"
-    _LENGTH_HOLDER_ATTR = "_dsa_index_share_topk_length_holder"
 
     def __init__(
         self,
@@ -1989,39 +2003,21 @@ class DSAttention(MegatronModule):
         self.softmax_scale = softmax_scale
         self.cp_comm_type = dsa_layout.normalize_cp_comm_type(cp_comm_type)
 
-    def _get_index_share_carrier(
+    def _get_forward_sharing_state(
         self, packed_seq_params: Optional[PackedSeqParams], attention_mask: Optional[torch.Tensor]
-    ) -> object:
-        """Return the object that carries DSA top-k sharing state for this forward."""
-        if packed_seq_params is not None:
-            return packed_seq_params
-        return attention_mask if attention_mask is not None else self.config
+    ):
+        """Return the generic state attached to this forward's canonical carrier."""
+        return get_forward_sharing_state(
+            packed_seq_params=packed_seq_params, attention_mask=attention_mask, config=self.config
+        )
 
-    def _get_index_share_topk_holder(
-        self,
-        packed_seq_params: Optional[PackedSeqParams],
-        attention_mask: Optional[torch.Tensor] = None,
-    ) -> dict[int, torch.Tensor]:
-        """Return the per-forward top-k holder for DSA index sharing."""
-        carrier = self._get_index_share_carrier(packed_seq_params, attention_mask)
-        holder = getattr(carrier, self._HOLDER_ATTR, None)
-        if holder is None:
-            holder = {}
-            setattr(carrier, self._HOLDER_ATTR, holder)
-        return holder
-
-    def _get_index_share_topk_length_holder(
-        self,
-        packed_seq_params: Optional[PackedSeqParams],
-        attention_mask: Optional[torch.Tensor] = None,
-    ) -> dict[int, torch.Tensor]:
-        """Return the optional per-forward top-k length holder."""
-        carrier = self._get_index_share_carrier(packed_seq_params, attention_mask)
-        holder = getattr(carrier, self._LENGTH_HOLDER_ATTR, None)
-        if holder is None:
-            holder = {}
-            setattr(carrier, self._LENGTH_HOLDER_ATTR, holder)
-        return holder
+    def _get_dsa_index_sharing_payload(
+        self, packed_seq_params: Optional[PackedSeqParams], attention_mask: Optional[torch.Tensor]
+    ) -> _DSAIndexSharingPayload:
+        """Return DSA's global payload for ordinary cross-layer index sharing."""
+        return self._get_forward_sharing_state(packed_seq_params, attention_mask).get_or_create(
+            _DSAIndexSharingPayload
+        )
 
     def backward_dw(self):
         """Compute the deferred weight gradients (delay_wgrad_compute) of the indexer."""
@@ -2343,13 +2339,8 @@ class DSAttention(MegatronModule):
             cp_group if cp_size > 1 and not self.config.calculate_per_token_loss else None
         )
 
-        topk_holder = (
-            self._get_index_share_topk_holder(packed_seq_params, attention_mask)
-            if self.index_share
-            else None
-        )
-        topk_length_holder = (
-            self._get_index_share_topk_length_holder(packed_seq_params, attention_mask)
+        index_payload = (
+            self._get_dsa_index_sharing_payload(packed_seq_params, attention_mask)
             if self.index_share
             else None
         )
@@ -2363,8 +2354,8 @@ class DSAttention(MegatronModule):
             local_packed_cp_query_len = sequence_parallel_tp_full_rows
 
         if self.skip_topk:
-            assert topk_holder is not None
-            if self.source_layer not in topk_holder:
+            assert index_payload is not None
+            if self.source_layer not in index_payload.topk_by_layer:
                 raise RuntimeError(
                     "DSA index-share skip layer "
                     f"(layer_number={self.layer_number}) needs top-k indices from source "
@@ -2373,11 +2364,10 @@ class DSAttention(MegatronModule):
                     "pipeline stage starts on a computing layer "
                     f"(dsa_indexer_topk_freq={self.index_topk_freq}, "
                     f"dsa_indexer_skip_topk_offset={self.index_skip_topk_offset}). "
-                    f"Holder has layers {sorted(topk_holder)}."
+                    f"Index sharing payload has layers {sorted(index_payload.topk_by_layer)}."
                 )
-            topk_indices = topk_holder[self.source_layer]
-            if topk_length_holder is not None:
-                topk_length = topk_length_holder.get(self.source_layer)
+            topk_indices = index_payload.topk_by_layer[self.source_layer]
+            topk_length = index_payload.topk_length_by_layer.get(self.source_layer)
         else:
             assert self.indexer is not None
             with torch.enable_grad() if use_indexer_loss else torch.no_grad():
@@ -2622,10 +2612,10 @@ class DSAttention(MegatronModule):
             slice_topk_to_local_sequence_parallel_rows()
 
         if self.index_share and computes_topk:
-            assert topk_holder is not None and topk_indices is not None
-            topk_holder[self.layer_number] = topk_indices
-            if topk_length_holder is not None and topk_length is not None:
-                topk_length_holder[self.layer_number] = topk_length
+            assert index_payload is not None and topk_indices is not None
+            index_payload.topk_by_layer[self.layer_number] = topk_indices
+            if topk_length is not None:
+                index_payload.topk_length_by_layer[self.layer_number] = topk_length
 
         # ===================================
         # Run sparse attention kernel
