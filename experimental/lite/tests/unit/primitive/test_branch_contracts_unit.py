@@ -58,6 +58,7 @@ def test_fused_per_head_rms_within_bound_on_gpu(dtype: torch.dtype, rtol: float)
     q = torch.randn(B, H, S, D).to(device="cuda", dtype=dtype)
     torch.testing.assert_close(_per_head_rms(q, EPS), _eager(q, EPS), rtol=rtol, atol=0)
 
+
 TOTAL, HEADS, HEAD_DIM, GROUPS = 17, 8, 6, 2
 ROPE_DIM = 4
 
@@ -77,6 +78,7 @@ def _cos_sin(dtype: torch.dtype, device: str):
 def test_fused_inverse_rope_matches_apply_partial_rope() -> None:
     """Core's fused inverse must agree with ``apply_partial_rope(cos, -sin)``."""
     from megatron.core.fusions.fused_mla_yarn_rope_apply import fused_mla_rope_out_of_place
+
     dtype = torch.bfloat16
     cu = torch.tensor([0, TOTAL], device="cuda", dtype=torch.int32)
     cos, sin = _cos_sin(dtype, "cuda")
@@ -98,6 +100,7 @@ def test_fused_inverse_rope_matches_apply_partial_rope() -> None:
 def test_forward_rotation_is_not_mistaken_for_the_inverse() -> None:
     """Negative control: ``inverse=False`` must not satisfy the bound above."""
     from megatron.core.fusions.fused_mla_yarn_rope_apply import fused_mla_rope_out_of_place
+
     dtype = torch.bfloat16
     cu = torch.tensor([0, TOTAL], device="cuda", dtype=torch.int32)
     cos, sin = _cos_sin(dtype, "cuda")
@@ -113,6 +116,7 @@ def test_forward_rotation_is_not_mistaken_for_the_inverse() -> None:
     eager = eager.squeeze(0).permute(1, 0, 2)
     scale = eager.float().abs().max()
     assert (wrong.float() - eager.float()).abs().max() > 2e-2 * scale
+
 
 TOKENS, FFN = 8, 16
 
@@ -135,9 +139,7 @@ def test_clamped_swiglu_matches_eager_reference(with_probs: bool) -> None:
     # Values well outside the clamp so the clamping actually participates; a test
     # that never saturates would pass with the clamp dropped entirely.
     y = torch.randn(TOKENS, FFN * 2, device="cuda", dtype=torch.bfloat16) * 8
-    probs = (
-        torch.rand(TOKENS, 1, device="cuda", dtype=torch.bfloat16) if with_probs else None
-    )
+    probs = torch.rand(TOKENS, 1, device="cuda", dtype=torch.bfloat16) if with_probs else None
     limit = 3.0
     assert y.float().abs().max() > limit, "fixture does not exercise the clamp"
 
@@ -332,4 +334,3 @@ def test_rope_table_rows_match_building_from_those_positions() -> None:
     torch.testing.assert_close(sin[0].index_select(0, rows), direct_sin[0])
     shifted = cos[0].index_select(0, rows + 4)
     assert not torch.allclose(shifted, direct_cos[0]), "wrong rows must not match"
-
