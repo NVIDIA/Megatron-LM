@@ -56,6 +56,11 @@ from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
     FullyShardedDataParallelV2,
 )
 from megatron.core.enums import ModelType
+
+try:
+    from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import fully_shard_context
+except ImportError:
+    fully_shard_context = None
 from megatron.core.fp8_utils import correct_amax_history_if_needed
 from megatron.core.full_cuda_graph import FullCudaGraphWrapper, get_shared_capture_stream
 from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
@@ -2332,25 +2337,43 @@ def wrap_model_chunks_with_ddp(
                 )
 
     # Wrap each chunk.
+    # MFSDP v2 chunks each open their own ``fully_shard_context`` scope via
+    # ``reuse_existing=True``. When a single call wraps multiple VPP chunks, open one
+    # ambient context around the whole loop so every chunk joins the SAME FSDP context,
+    # which is then finalized once here. Without this, each chunk would materialize its own
+    # streams and prefetch orders and the chunks would not share one context across VPP
+    # stages.
+    share_fsdp_context = (
+        fully_shard_context is not None
+        and (DP is FullyShardedDataParallel or DP is FullyShardedDataParallelV2)
+        and ddp_config.megatron_fsdp_version == 2
+        and n > 1
+    )
+    shared_context = (
+        fully_shard_context(reuse_existing=True, use_symmetric_memory=ddp_config.nccl_ub)
+        if share_fsdp_context
+        else nullcontext()
+    )
     wrapped = []
-    for chunk, layout, disable_bucketing in zip(
-        model_chunks, per_chunk_layouts, disable_bucketing_per_chunk
-    ):
-        chunk_kwargs = {}
-        # TorchFSDP takes process_group, not pg_collection.
-        if pg_collection is not None and not (HAVE_FSDP2 and DP is torch_FSDP):
-            chunk_kwargs["pg_collection"] = pg_collection
-        if layout is not None:
-            chunk_kwargs["full_param_layout"] = layout
-        wrapped.append(
-            DP(
-                config=config,
-                ddp_config=ddp_config,
-                module=chunk,
-                disable_bucketing=disable_bucketing,
-                **chunk_kwargs,
+    with shared_context:
+        for chunk, layout, disable_bucketing in zip(
+            model_chunks, per_chunk_layouts, disable_bucketing_per_chunk
+        ):
+            chunk_kwargs = {}
+            # TorchFSDP takes process_group, not pg_collection.
+            if pg_collection is not None and not (HAVE_FSDP2 and DP is torch_FSDP):
+                chunk_kwargs["pg_collection"] = pg_collection
+            if layout is not None:
+                chunk_kwargs["full_param_layout"] = layout
+            wrapped.append(
+                DP(
+                    config=config,
+                    ddp_config=ddp_config,
+                    module=chunk,
+                    disable_bucketing=disable_bucketing,
+                    **chunk_kwargs,
+                )
             )
-        )
     return wrapped
 
 
