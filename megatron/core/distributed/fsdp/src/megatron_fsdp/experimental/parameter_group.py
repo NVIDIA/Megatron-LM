@@ -193,7 +193,7 @@ class FsdpParameterGroup:
             )
             self._model_weight_is_stale = False
             self._unsharded_model_weight = DBuffer.from_mxfp8(
-                parameter_to_fqns, self.mesh, [Replicate()] * self.mesh.ndim
+                parameter_to_fqns, self.mesh, [Replicate()] * self.mesh.ndim, allocate_new=True
             )
         elif main_weight_dtype == self.dtype and main_weight_placements == model_weight_placements:
             self.model_weight = self.main_weight
@@ -255,19 +255,21 @@ class FsdpParameterGroup:
         fsdp_parameters: list[FsdpParameter] = []
         main_grad_dtype = self.main_grad.dtype if self.main_grad is not None else None
         for index, (parameter, fqns) in enumerate(parameter_to_fqns.items()):
-            unsharded_tensor = (
-                parameter if is_mxfp8 else self._unsharded_model_weight.get_local_tensor(index)
-            )
-            if parameter.is_meta:
+            if is_mxfp8:
+                # The MXFP8 prototype has one parameter per DBuffer, whose logical
+                # wrapper cannot be represented as a flat-storage tensor view.
+                unsharded_tensor = self._unsharded_model_weight.local_tensor
+            else:
+                unsharded_tensor = self._unsharded_model_weight.get_local_tensor(index)
+            if parameter.is_meta or is_mxfp8:
                 # A meta Parameter cannot set .data to a real tensor because their
-                # TensorImpl types are incompatible, so swap in a materialized Parameter.
-                # This may be problematic if attributes from the original Parameter need
-                # to be copied to the unsharded Parameter.
+                # TensorImpl types are incompatible. MXFP8 likewise needs to replace the
+                # original TE wrapper with the independently owned DBuffer wrapper.
                 materialized_parameter = nn.Parameter(
                     unsharded_tensor, requires_grad=parameter.requires_grad
                 )
                 torch.utils.swap_tensors(parameter, materialized_parameter)
-            elif not is_mxfp8:
+            else:
                 parameter.data = unsharded_tensor
                 parameter.grad = None
             # Parameter-owned markers must not retain their FSDP module tree.

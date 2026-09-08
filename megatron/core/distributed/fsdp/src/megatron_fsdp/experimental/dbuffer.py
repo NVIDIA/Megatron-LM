@@ -208,7 +208,9 @@ class DBuffer:
 
     @property
     def dtype(self) -> torch.dtype:
-        """Dtype of the stored tensor."""
+        """Dtype of the buffer's physical storage."""
+        if self.is_mxfp8:
+            return self.local_tensor._rowwise_data.dtype
         return self.local_tensor.dtype
 
     @property
@@ -723,9 +725,7 @@ class DBuffer:
         non-leading dimensions and only changes the leading dimension.
         """
         if self.is_mxfp8:
-            raise NotImplementedError(
-                "Access an MXFP8 DBuffer through its logical tensor attribute."
-            )
+            raise NotImplementedError("MXFP8 DBuffers do not expose flat-storage tensor views.")
         shape = self.layout.tensor_shapes[index]
         owned_range = self._get_owned_range(index)
 

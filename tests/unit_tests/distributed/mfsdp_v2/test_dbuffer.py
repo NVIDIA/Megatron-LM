@@ -742,6 +742,7 @@ def test_mxfp8_linear_training_step_uses_dbuffer(distributed_setup):
         linear = te.pytorch.Linear(
             64, 64, bias=False, params_dtype=torch.bfloat16, device=distributed_setup.device
         )
+    original_rowwise_data = linear.weight._rowwise_data
 
     mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
     placements = Placements(
@@ -757,11 +758,18 @@ def test_mxfp8_linear_training_step_uses_dbuffer(distributed_setup):
 
     parameter_group = linear.parameter_groups[0]
     assert parameter_group.model_weight.is_mxfp8
+    assert parameter_group.model_weight.dtype is torch.uint8
+    assert parameter_group.dtype is torch.bfloat16
     assert parameter_group.model_weight.local_tensor.shape == (64, 64)
     assert parameter_group.post_optimizer_model_weight is not parameter_group.model_weight
     assert parameter_group.post_optimizer_model_weight.local_tensor.shape == (32, 64)
     assert parameter_group._unsharded_model_weight.is_mxfp8
     assert parameter_group._unsharded_model_weight.local_tensor.shape == (64, 64)
+    unsharded_parameter = parameter_group.fsdp_parameters[0].unsharded
+    assert unsharded_parameter._rowwise_data.data_ptr() == (
+        parameter_group._unsharded_model_weight.local_tensor._rowwise_data.data_ptr()
+    )
+    assert unsharded_parameter._rowwise_data.data_ptr() != original_rowwise_data.data_ptr()
 
     optimizer = torch.optim.SGD(linear.parameters(), lr=0.1)
     fully_shard_optimizer(optimizer)
