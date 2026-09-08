@@ -978,7 +978,11 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         )
 
         mlp_output_with_bias = self._run_mlp(
-            pre_mlp_layernorm_output, residual, padding_mask, inference_context
+            pre_mlp_layernorm_output,
+            residual,
+            padding_mask,
+            inference_context,
+            packed_seq_params=packed_seq_params,
         )
 
         if moe_unflatten_mbs is not None:
@@ -1022,7 +1026,11 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         )
 
         mlp_output_with_bias = self._run_mlp(
-            pre_mlp_layernorm_output, residual, padding_mask, inference_context
+            pre_mlp_layernorm_output,
+            residual,
+            padding_mask,
+            inference_context,
+            packed_seq_params=packed_seq_params,
         )
 
         if moe_unflatten_mbs is not None:
@@ -1056,6 +1064,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         residual: Tensor,
         padding_mask: Tensor | None,
         inference_context: BaseInferenceContext | None,
+        packed_seq_params=None,
     ):
         """Execute the MLP submodule with the appropriate variant.
 
@@ -1099,10 +1108,15 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                     self.pg_collection.tp,
                     pre_mlp_layernorm_output,
                     padding_mask=padding_mask,
+                    **({'packed_seq_params': packed_seq_params} if self.is_moe_layer else {}),
                 )
             else:
                 mlp_output_with_bias = tensor_parallel.checkpoint(
-                    functools.partial(apply_module(self.mlp), padding_mask=padding_mask),
+                    functools.partial(
+                        apply_module(self.mlp),
+                        padding_mask=padding_mask,
+                        **({'packed_seq_params': packed_seq_params} if self.is_moe_layer else {}),
+                    ),
                     False,
                     pre_mlp_layernorm_output,
                 )
@@ -1134,7 +1148,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 # operation in MLP's fc2.
                 self._set_fc2_residual(residual)
             mlp_output_with_bias = apply_module(self.mlp)(
-                pre_mlp_layernorm_output, padding_mask=padding_mask
+                pre_mlp_layernorm_output,
+                padding_mask=padding_mask,
+                **({'packed_seq_params': packed_seq_params} if self.is_moe_layer else {}),
             )
 
         nvtx_range_pop(suffix="mlp")
@@ -2190,7 +2206,7 @@ class MoETransformerLayer(TransformerLayer):
         self._router_dtoh_event.record()
         self._router_dtoh_event.synchronize()
 
-    def _forward_mlp_router(self, hidden_states, padding_mask=None):
+    def _forward_mlp_router(self, hidden_states, padding_mask=None, packed_seq_params=None):
         """
         Executes the router phase of the MoE block.
 
@@ -2202,7 +2218,10 @@ class MoETransformerLayer(TransformerLayer):
         pre_mlp_layernorm_output, residual, _ = self._pre_mlp_layernorm_and_residual(hidden_states)
 
         hidden_states, probs, shared_expert_output = apply_module(self.mlp)(
-            pre_mlp_layernorm_output, intermediate_tensors=(), padding_mask=padding_mask
+            pre_mlp_layernorm_output,
+            intermediate_tensors=(),
+            padding_mask=padding_mask,
+            packed_seq_params=packed_seq_params,
         )
 
         if self.use_partial_cudagraphs:
@@ -2273,7 +2292,9 @@ class MoETransformerLayer(TransformerLayer):
         def _forward_mlp_partial_cudagraphs(
             hidden_states, inference_context=None, padding_mask=None
         ):
-            router_outputs = self._forward_mlp_router(hidden_states, padding_mask=padding_mask)
+            router_outputs = self._forward_mlp_router(
+                hidden_states, padding_mask=padding_mask, packed_seq_params=packed_seq_params
+            )
             (
                 residual,
                 hidden_states,

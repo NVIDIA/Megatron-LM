@@ -23,6 +23,7 @@ class BalancedCPScheduler:
         self.num_subsamples_processed = 0
         self.free_resources = []
         self.total_hdp_gpus = dp_cp_group.size()
+        self.config = None
 
     @lru_cache(maxsize=128)
     def get_total_workload(self, seq_length: int, cp_size: Optional[int] = None):
@@ -50,7 +51,16 @@ class BalancedCPScheduler:
         The number is rounded up to the next power of 2 to match the available
         hybrid context parallel process group sizes.
         """
-        return max(1, 2 ** ceil(log2((seq_len / self.max_seq_len_per_rank))))
+        # HACK: EP ranks run out of sync and can crash due to hang
+        # This is a temporary fix to ensure that expert ranks run in sync.
+        # TODO(pmannan): Remove this hack after fixing the hang issue.
+        # This is sufficient to get most of the benefits of HybridCP
+        min_cp_size = 1
+        if self.config is not None:
+            min_cp_size = max(
+                1, self.config.expert_model_parallel_size / self.config.tensor_model_parallel_size
+            )
+        return int(max(min_cp_size, 2 ** ceil(log2((seq_len / self.max_seq_len_per_rank)))))
 
     def make_buckets_equal(
         self,
@@ -458,6 +468,8 @@ class BalancedCPScheduler:
         This function recursively forms groups of sub-samples such that all DPxCP ranks
         have a roughly balanced workload in the group.
         """
+        # Stash the config so gpus_needed can read EP/TP sizes for the min-CP-size clamp.
+        self.config = config
         groups = []
         sample_id_groups = []
         # We assign a sample_id to each sub-sample in order to track assignment to each GPU.

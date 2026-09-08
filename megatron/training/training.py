@@ -3357,6 +3357,24 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     return {}, skipped_iter, should_checkpoint, should_exit, exit_code, grad_norm, num_zeros_in_grad, log_max_attention_logit
 
 
+def _get_hybrid_cp_num_groups_for_logging():
+    """Per-iteration forward-group count under hybrid CP, used for loss-scale logging.
+
+    Under hybrid context parallelism, the number of forward groups run per iteration
+    (logically equivalent to num_microbatches) is determined dynamically by the CP
+    scheduler, so logged MoE/MTP metrics must be scaled by it instead of the static
+    get_num_microbatches(). get_num_total_groups is published by the dynamic-CP
+    sequence-packing changes; fall back to get_num_microbatches() when it is not
+    available yet or has not reported any groups.
+    """
+    try:
+        from megatron.core.pipeline_parallel.hybrid_cp_schedule import get_num_total_groups
+    except ImportError:
+        return get_num_microbatches()
+    num_total_groups = get_num_total_groups()
+    return num_total_groups if num_total_groups > 0 else get_num_microbatches()
+
+
 def training_log(
     loss_dict,
     total_loss_dict,
@@ -3549,7 +3567,11 @@ def training_log(
     # Log MoE metrics.
     moe_log_string = ""
     if args.num_experts is not None:
-        moe_loss_scale = 1 / get_num_microbatches()
+        # For hybrid CP, num_total_groups replaces num_microbatches as the step count.
+        if args.hybrid_context_parallel:
+            moe_loss_scale = 1 / _get_hybrid_cp_num_groups_for_logging()
+        else:
+            moe_loss_scale = 1 / get_num_microbatches()
         track_names = []
         if "aux_loss" in args.moe_router_load_balancing_type:
             track_names.append("load_balancing_loss")
@@ -3616,7 +3638,11 @@ def training_log(
 
     # Log MTP metrics.
     if args.mtp_num_layers is not None:
-        mtp_loss_scale = 1 / get_num_microbatches()
+        # For hybrid CP, num_total_groups replaces num_microbatches as the step count.
+        if args.hybrid_context_parallel:
+            mtp_loss_scale = 1 / _get_hybrid_cp_num_groups_for_logging()
+        else:
+            mtp_loss_scale = 1 / get_num_microbatches()
         MTPLossLoggingHelper.track_mtp_metrics(
             mtp_loss_scale, iteration, writer, wandb_writer, total_loss_dict
         )
