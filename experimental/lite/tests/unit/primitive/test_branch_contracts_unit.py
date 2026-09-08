@@ -101,15 +101,12 @@ def _cos_sin(dtype: torch.dtype, device: str):
 
 @pytest.mark.gpus(1)
 def test_fused_inverse_rope_matches_apply_partial_rope() -> None:
-    """Core's fused inverse must agree with ``apply_partial_rope(cos, -sin)``."""
-
     torch.manual_seed(0)
     dtype = torch.bfloat16
     cu = torch.tensor([0, TOTAL], device="cuda", dtype=torch.int32)
     cos, sin = _cos_sin(dtype, "cuda")
     nope = HEAD_DIM - ROPE_DIM
     context = torch.randn(TOTAL, HEADS, HEAD_DIM, device="cuda", dtype=dtype)
-
     fused = fused_mla_rope_out_of_place(
         context, cos, sin, nope, ROPE_DIM, cu, 0, 1, inverse=True, remove_interleaving=True
     )
@@ -124,14 +121,12 @@ def test_fused_inverse_rope_matches_apply_partial_rope() -> None:
 @pytest.mark.gpus(1)
 def test_forward_rotation_is_not_mistaken_for_the_inverse() -> None:
     """Negative control: ``inverse=False`` must not satisfy the bound above."""
-
     torch.manual_seed(0)
     dtype = torch.bfloat16
     cu = torch.tensor([0, TOTAL], device="cuda", dtype=torch.int32)
     cos, sin = _cos_sin(dtype, "cuda")
     nope = HEAD_DIM - ROPE_DIM
     context = torch.randn(TOTAL, HEADS, HEAD_DIM, device="cuda", dtype=dtype)
-
     wrong = fused_mla_rope_out_of_place(
         context, cos, sin, nope, ROPE_DIM, cu, 0, 1, inverse=False, remove_interleaving=True
     )
@@ -169,7 +164,6 @@ def test_clamped_swiglu_matches_eager_reference(with_probs: bool) -> None:
     )
     limit = 3.0
     assert y.float().abs().max() > limit, "fixture does not exercise the clamp"
-
     actual = swiglu_with_probs(y, probs, limit)
     expected = _reference(y, probs, limit)
     assert actual.shape == (TOKENS, FFN)
@@ -192,10 +186,8 @@ def test_clamped_swiglu_is_differentiable() -> None:
     torch.manual_seed(0)
     y = (torch.randn(TOKENS, FFN * 2, device="cuda", dtype=torch.float32) * 8).requires_grad_()
     ref_in = y.detach().clone().requires_grad_()
-
     swiglu_with_probs(y, None, 3.0).sum().backward()
     _reference(ref_in, None, 3.0).sum().backward()
-
     assert y.grad is not None and torch.isfinite(y.grad).all()
     torch.testing.assert_close(y.grad, ref_in.grad, rtol=1e-4, atol=1e-4)
 
@@ -206,7 +198,6 @@ class _Params:
 
 def test_rope_tables_are_built_once_per_packed_batch() -> None:
     """A second layer asking for the same tables must get the first one's."""
-
     params = _Params()
     cu = torch.tensor([0, 4], dtype=torch.int32)
     kw = dict(config=None, use_yarn=False, device=torch.device("cpu"), dtype=torch.float32)
@@ -217,13 +208,11 @@ def test_rope_tables_are_built_once_per_packed_batch() -> None:
 
 def test_rope_tables_differ_across_batches_and_offsets() -> None:
     """Guard the guard: the tables must not outlive what defines them."""
-
     cu = torch.tensor([0, 4], dtype=torch.int32)
     kw = dict(config=None, use_yarn=False, device=torch.device("cpu"), dtype=torch.float32)
     a = rope_tables_for_packed_batch(_Params(), cu, 0, 4, 4, 10000.0, **kw)
     b = rope_tables_for_packed_batch(_Params(), cu, 0, 4, 4, 10000.0, **kw)
     assert a[0] is not b[0], "a new batch must not reuse the previous batch's tables"
-
     same = _Params()
     near = rope_tables_for_packed_batch(same, cu, 0, 4, 4, 10000.0, **kw)
     far = rope_tables_for_packed_batch(same, cu, 4, 4, 4, 10000.0, **kw)
@@ -252,11 +241,9 @@ def test_linear_accumulates_the_same_gradient_it_used_to_add() -> None:
     """``AccumulatingLinear`` must match the add it replaced, over 3 microbatches."""
     torch.manual_seed(0)
     inputs = [torch.randn(TOKENS, IN, device=DEVICE) for _ in range(MICROBATCHES)]
-
     reference = AccumulatingLinear(IN, OUT, bias=False).to(DEVICE)
     expected = _reference_accumulation(reference, inputs)
     assert not hasattr(reference.weight, "main_grad"), "reference must take the stock path"
-
     fused = AccumulatingLinear(IN, OUT, bias=False).to(DEVICE)
     with torch.no_grad():
         fused.weight.copy_(reference.weight)
@@ -264,7 +251,6 @@ def test_linear_accumulates_the_same_gradient_it_used_to_add() -> None:
     fused.weight.grad_added_to_main_grad = False
     for x in inputs:
         fused(x).sum().backward()
-
     assert fused.weight.main_grad.abs().max() > 0, "fused path produced no gradient"
     torch.testing.assert_close(fused.weight.main_grad, expected, rtol=1e-5, atol=1e-6)
 
@@ -285,20 +271,17 @@ def test_embedding_scatters_to_the_same_rows_it_used_to_add() -> None:
     torch.manual_seed(0)
     weight = torch.randn(VOCAB, IN, device=DEVICE, requires_grad=True)
     ids = [torch.randint(0, VOCAB, (TOKENS,), device=DEVICE) for _ in range(MICROBATCHES)]
-
     expected = torch.zeros(VOCAB, IN, dtype=torch.float32, device=DEVICE)
     for i in ids:
         out = weight[i]
         out.sum().backward()
         expected += weight.grad.data.float()
         weight.grad = None
-
     fused = weight.detach().clone().requires_grad_()
     fused.main_grad = torch.zeros(VOCAB, IN, dtype=torch.float32, device=DEVICE)
     fused.grad_added_to_main_grad = False
     for i in ids:
         _EmbeddingAccumulatingIntoMainGrad.apply(fused, i).sum().backward()
-
     assert fused.main_grad.abs().max() > 0, "scatter produced no gradient"
     torch.testing.assert_close(fused.main_grad, expected, rtol=1e-5, atol=1e-6)
 
@@ -311,9 +294,7 @@ def test_embedding_scatter_is_row_selective() -> None:
     weight.main_grad = torch.zeros(VOCAB, IN, dtype=torch.float32, device=DEVICE)
     weight.grad_added_to_main_grad = False
     ids = torch.zeros(4, dtype=torch.long, device=DEVICE)  # only row 0
-
     _EmbeddingAccumulatingIntoMainGrad.apply(weight, ids).sum().backward()
-
     assert weight.main_grad[0].abs().max() > 0
     assert torch.equal(weight.main_grad[1:], torch.zeros(VOCAB - 1, IN, device=DEVICE))
 
@@ -325,9 +306,7 @@ def test_embedding_reports_a_gradient_for_ddp() -> None:
     weight = torch.randn(VOCAB, IN, device=DEVICE, requires_grad=True)
     weight.main_grad = torch.zeros(VOCAB, IN, dtype=torch.float32, device=DEVICE)
     weight.grad_added_to_main_grad = False
-
     _EmbeddingAccumulatingIntoMainGrad.apply(weight, torch.randint(0, VOCAB, (TOKENS,), device=DEVICE)).sum().backward()
-
     assert weight.grad_added_to_main_grad is True
     assert weight.grad is not None, "DDP would assert on a missing gradient"
 
@@ -357,7 +336,6 @@ def test_only_switches_modules_whose_weights_have_main_grad() -> None:
     chunk.ready = _FakeTELinear(with_main_grad=True)
     chunk.not_ready = _FakeTELinear(with_main_grad=False)
     chunk.plain = _Plain()
-
     assert _enable_wgrad_accumulation_fusion([chunk]) == 1
     assert chunk.ready.fuse_wgrad_accumulation is True
     # No main_grad to accumulate into: TE would dereference a buffer that the
@@ -369,22 +347,18 @@ def test_only_switches_modules_whose_weights_have_main_grad() -> None:
 @pytest.mark.gpus(1)
 def test_fused_accumulation_matches_the_add_it_replaces() -> None:
     """Same accumulated gradient as ``main_grad.add_(grad)``, over two microbatches."""
-
     torch.manual_seed(0)
     shape = (64, 64)
     inputs = [torch.randn(32, 64, device="cuda", dtype=torch.bfloat16) for _ in range(2)]
-
     reference = te.Linear(*shape, bias=False, params_dtype=torch.bfloat16, device="cuda")
     fused = te.Linear(*shape, bias=False, params_dtype=torch.bfloat16, device="cuda")
     with torch.no_grad():
         fused.weight.copy_(reference.weight)
-
     accumulated = torch.zeros(shape, device="cuda", dtype=torch.float32)
     for x in inputs:
         reference(x).sum().backward()
         accumulated.add_(reference.weight.grad.data)
         reference.weight.grad = None
-
     fused.weight.main_grad = torch.zeros(shape, device="cuda", dtype=torch.float32)
     fused.weight.grad_added_to_main_grad = False
     chunk = torch.nn.Module()
@@ -392,7 +366,6 @@ def test_fused_accumulation_matches_the_add_it_replaces() -> None:
     assert _enable_wgrad_accumulation_fusion([chunk]) == 1
     for x in inputs:
         fused(x).sum().backward()
-
     assert fused.weight.main_grad.abs().max() > 0, "fusion produced no gradient at all"
     torch.testing.assert_close(fused.weight.main_grad, accumulated, rtol=2e-2, atol=2e-2)
 
@@ -467,7 +440,6 @@ def test_sinkhorn_regularisation_change_is_below_bf16_resolution() -> None:
     scale = torch.ones(3)
     base = torch.zeros((2 + N) * N)
     _, _, comb = split_sinkhorn(mixes, scale, base, N, 20, 1e-6)
-
     comb_mix = mixes.split([N, N, N * N], dim=-1)[2]
     legacy = _legacy_sinkhorn(comb_mix.view(S, B, N, N), 20, 1e-6)
     assert (comb - legacy).abs().max().item() < 1e-3
@@ -520,14 +492,11 @@ def _model_with(attention: torch.nn.Module) -> torch.nn.Module:
 
 def test_dense_multi_row_batch_is_refused_at_the_boundary() -> None:
     """``[B, S]`` with ``B > 1`` must raise here, naming the constraint."""
-
     model = _model_with(CompressedSparseAttention.__new__(CompressedSparseAttention))
     torch.nn.Module.__init__(model.attn)
-
     batch = type("B", (), {"input_ids": torch.zeros(4, 8, dtype=torch.long)})()
     with pytest.raises(NotImplementedError) as excinfo:
         protocol._prepare_model_forward_kwargs(model, batch)
-
     message = str(excinfo.value)
     assert "B=4" in message, "the message must name the batch that was rejected"
     assert "pack" in message.lower(), "the message must name the way out"
@@ -536,13 +505,10 @@ def test_dense_multi_row_batch_is_refused_at_the_boundary() -> None:
 @pytest.mark.parametrize("shape", [(8,), (1, 8)])
 def test_packed_shapes_still_take_the_packed_route(shape: tuple[int, ...]) -> None:
     """Guard the guard: the refusal must not swallow the shapes that do work."""
-
     called = {}
-
     def _fake_packed(model, batch):
         called["yes"] = True
         return {}
-
     original = protocol._prepare_packed_batch_kwargs
     protocol._prepare_packed_batch_kwargs = _fake_packed
     try:
@@ -550,19 +516,15 @@ def test_packed_shapes_still_take_the_packed_route(shape: tuple[int, ...]) -> No
         protocol._prepare_model_forward_kwargs(_model_with(_FakeCSA()), batch)
     finally:
         protocol._prepare_packed_batch_kwargs = original
-
     assert called.get("yes"), f"shape {shape} should have taken the packed route"
 
 
 def test_models_without_csa_keep_the_dense_route() -> None:
     """The refusal is CSA's constraint, not the batch builder's."""
-
     reached = {}
-
     def _fake_dense(model, kwargs):
         reached["yes"] = True
         return kwargs
-
     original_dense = protocol._prepare_contiguous_cp_kwargs
     original_base = protocol._base_model_forward_kwargs
     protocol._prepare_contiguous_cp_kwargs = _fake_dense
@@ -573,5 +535,4 @@ def test_models_without_csa_keep_the_dense_route() -> None:
     finally:
         protocol._prepare_contiguous_cp_kwargs = original_dense
         protocol._base_model_forward_kwargs = original_base
-
     assert reached.get("yes"), "a non-CSA model must still reach the dense builder"
