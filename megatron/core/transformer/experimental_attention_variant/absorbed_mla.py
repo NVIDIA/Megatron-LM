@@ -37,6 +37,10 @@ from megatron.core.tensor_parallel.mappings import (
 )
 from megatron.core.transformer.attention import Attention
 from megatron.core.transformer.enums import AttnMaskType
+from megatron.core.transformer.forward_sharing import (
+    is_forward_sharing_enabled,
+    preserve_forward_sharing_for_checkpoint,
+)
 from megatron.core.transformer.mla_qk_norm_config import QKNormConfigResolver
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import MLATransformerConfig
@@ -857,6 +861,10 @@ class AbsorbedMLASelfAttention(Attention):
         if attn_mask_type is None:
             attn_mask_type = self.attn_mask_type
         attn_mask_type = torch.tensor([attn_mask_type.value], dtype=torch.int)
+        if is_forward_sharing_enabled(self.config):
+            custom_forward = preserve_forward_sharing_for_checkpoint(
+                custom_forward, packed_seq_params, self.config, attention_mask_arg=4
+            )
         hidden_states = tensor_parallel.checkpoint(
             custom_forward,
             False,

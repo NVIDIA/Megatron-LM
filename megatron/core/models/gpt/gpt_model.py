@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from collections import OrderedDict
+from contextlib import nullcontext
 from typing import Any, Callable, Dict, Literal, Optional
 
 import torch
@@ -28,6 +29,10 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.quantization.utils import get_quant_config_or_none
 from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
 from megatron.core.transformer.enums import ModelType
+from megatron.core.transformer.forward_sharing import (
+    forward_sharing_lifetime,
+    is_forward_sharing_enabled,
+)
 from megatron.core.transformer.linear_cross_entropy import LinearCrossEntropyModule
 from megatron.core.transformer.moe.paged_stash import paged_stash_init_chunk_handler
 from megatron.core.transformer.multi_token_prediction import (
@@ -575,84 +580,91 @@ class GPTModel(LanguageModule):
             output_processor_context (Any, optional): User-defined context object forwarded to
                 `output_processor`.
         """
-        if self.config.fine_grained_activation_offloading:
-            self.preprocess_for_fine_grained_offloading()
 
-        if self.config.moe_paged_stash:
-            self.preprocess_for_paged_stash()
+        sharing_lifetime = nullcontext()
+        if is_forward_sharing_enabled(self.config):
+            sharing_lifetime = forward_sharing_lifetime(
+                packed_seq_params, attention_mask, self.config
+            )
+        with sharing_lifetime:
+            if self.config.fine_grained_activation_offloading:
+                self.preprocess_for_fine_grained_offloading()
 
-        inference_context = deprecate_inference_params(inference_context, inference_params)
+            if self.config.moe_paged_stash:
+                self.preprocess_for_paged_stash()
 
-        preproc_output = self._preprocess(
-            input_ids=input_ids,
-            position_ids=position_ids,
-            decoder_input=decoder_input,
-            inference_context=inference_context,
-            packed_seq_params=packed_seq_params,
-            padding_mask=padding_mask,
-        )
+            inference_context = deprecate_inference_params(inference_context, inference_params)
 
-        (
-            decoder_input,
-            rotary_pos_emb,
-            rotary_pos_cos,
-            rotary_pos_sin,
-            sequence_len_offset,
-            padding_mask,
-        ) = preproc_output[:6]
+            preproc_output = self._preprocess(
+                input_ids=input_ids,
+                position_ids=position_ids,
+                decoder_input=decoder_input,
+                inference_context=inference_context,
+                packed_seq_params=packed_seq_params,
+                padding_mask=padding_mask,
+            )
 
-        rotary_pos_cos_sin = preproc_output[6] if len(preproc_output) == 7 else None
+            (
+                decoder_input,
+                rotary_pos_emb,
+                rotary_pos_cos,
+                rotary_pos_sin,
+                sequence_len_offset,
+                padding_mask,
+            ) = preproc_output[:6]
 
-        # Pass input_ids to decoder for hash-based MoE routing
-        decoder_extra_block_kwargs = extra_block_kwargs or {}
-        if self.config.moe_n_hash_layers > 0 and input_ids is not None:
-            decoder_extra_block_kwargs['input_ids'] = input_ids
+            rotary_pos_cos_sin = preproc_output[6] if len(preproc_output) == 7 else None
 
-        # Run decoder.
-        decoder_output = self.decoder(
-            hidden_states=decoder_input,
-            attention_mask=attention_mask,
-            inference_context=inference_context,
-            rotary_pos_emb=rotary_pos_emb,
-            rotary_pos_cos=rotary_pos_cos,
-            rotary_pos_sin=rotary_pos_sin,
-            rotary_pos_cos_sin=rotary_pos_cos_sin,
-            packed_seq_params=packed_seq_params,
-            sequence_len_offset=sequence_len_offset,
-            padding_mask=padding_mask,
-            **decoder_extra_block_kwargs,
-        )
-        # When mHC + MTP, the decoder returns (contracted, multi-stream).
-        # MTP needs multi-stream; lm_head needs contracted.
-        if isinstance(decoder_output, tuple):
-            hidden_states, mhc_multistream = decoder_output
-        else:
-            hidden_states = decoder_output
-            mhc_multistream = None
+            # Pass input_ids to decoder for hash-based MoE routing
+            decoder_extra_block_kwargs = extra_block_kwargs or {}
+            if self.config.moe_n_hash_layers > 0 and input_ids is not None:
+                decoder_extra_block_kwargs['input_ids'] = input_ids
 
-        return self._postprocess(
-            hidden_states=hidden_states,
-            input_ids=input_ids,
-            position_ids=position_ids,
-            labels=labels,
-            rotary_pos_emb=rotary_pos_emb,
-            rotary_pos_cos=rotary_pos_cos,
-            rotary_pos_sin=rotary_pos_sin,
-            mtp_in_postprocess=self.mtp_process,
-            loss_mask=loss_mask,
-            decoder_input=decoder_input,
-            attention_mask=attention_mask,
-            padding_mask=padding_mask,
-            inference_params=inference_params,
-            packed_seq_params=packed_seq_params,
-            sequence_len_offset=sequence_len_offset,
-            runtime_gather_output=runtime_gather_output,
-            extra_block_kwargs=extra_block_kwargs,
-            inference_context=inference_context,
-            mhc_multistream=mhc_multistream,
-            output_processor=output_processor,
-            output_processor_context=output_processor_context,
-        )
+            # Run decoder.
+            decoder_output = self.decoder(
+                hidden_states=decoder_input,
+                attention_mask=attention_mask,
+                inference_context=inference_context,
+                rotary_pos_emb=rotary_pos_emb,
+                rotary_pos_cos=rotary_pos_cos,
+                rotary_pos_sin=rotary_pos_sin,
+                rotary_pos_cos_sin=rotary_pos_cos_sin,
+                packed_seq_params=packed_seq_params,
+                sequence_len_offset=sequence_len_offset,
+                padding_mask=padding_mask,
+                **decoder_extra_block_kwargs,
+            )
+            # When mHC + MTP, the decoder returns (contracted, multi-stream).
+            # MTP needs multi-stream; lm_head needs contracted.
+            if isinstance(decoder_output, tuple):
+                hidden_states, mhc_multistream = decoder_output
+            else:
+                hidden_states = decoder_output
+                mhc_multistream = None
+
+            return self._postprocess(
+                hidden_states=hidden_states,
+                input_ids=input_ids,
+                position_ids=position_ids,
+                labels=labels,
+                rotary_pos_emb=rotary_pos_emb,
+                rotary_pos_cos=rotary_pos_cos,
+                rotary_pos_sin=rotary_pos_sin,
+                mtp_in_postprocess=self.mtp_process,
+                loss_mask=loss_mask,
+                decoder_input=decoder_input,
+                attention_mask=attention_mask,
+                padding_mask=padding_mask,
+                inference_params=inference_params,
+                packed_seq_params=packed_seq_params,
+                sequence_len_offset=sequence_len_offset,
+                runtime_gather_output=runtime_gather_output,
+                extra_block_kwargs=extra_block_kwargs,
+                inference_context=inference_context,
+                mhc_multistream=mhc_multistream,
+                output_processor=output_processor,
+                output_processor_context=output_processor_context,
+            )
 
     def _postprocess(
         self,

@@ -24,9 +24,11 @@ from megatron.core.transformer.experimental_attention_variant.absorbed_mla impor
 from megatron.core.transformer.experimental_attention_variant.dsa import (
     DSAttention,
     DSAttentionSubmodules,
+    _DSAIndexSharingPayload,
     is_dsa_skip_topk_layer,
     source_dsa_compute_layer,
 )
+from megatron.core.transformer.forward_sharing import get_forward_sharing_state
 from megatron.training.argument_utils import _resolve_dsa_kernel_backend_cli_default
 from megatron.training.arguments import _add_experimental_attention_variant_args
 
@@ -89,7 +91,7 @@ def test_mtp_layer_number_offsets_index_share_schedule():
     assert attention.indexer is None
 
 
-def test_index_share_skip_layer_uses_request_scoped_holders(monkeypatch):
+def test_index_share_skip_layer_uses_request_scoped_state(monkeypatch):
     def fail_build_module(*_args, **_kwargs):
         raise AssertionError("skip layers must not build indexer modules")
 
@@ -114,13 +116,14 @@ def test_index_share_skip_layer_uses_request_scoped_holders(monkeypatch):
 
     packed_seq_params = PackedSeqParams(qkv_format="thd")
     attention_mask = torch.empty(1)
-    topk_holder = attention._get_index_share_topk_holder(packed_seq_params, attention_mask)
-    length_holder = attention._get_index_share_topk_length_holder(packed_seq_params, attention_mask)
+    index_payload = attention._get_dsa_index_sharing_payload(packed_seq_params, attention_mask)
 
-    assert topk_holder is getattr(packed_seq_params, DSAttention._HOLDER_ATTR)
-    assert length_holder is getattr(packed_seq_params, DSAttention._LENGTH_HOLDER_ATTR)
-    assert not hasattr(attention_mask, DSAttention._HOLDER_ATTR)
-    assert not hasattr(config, DSAttention._HOLDER_ATTR)
+    forward_state = get_forward_sharing_state(packed_seq_params, attention_mask, config)
+    dsa_payload = forward_state.get(_DSAIndexSharingPayload)
+    assert dsa_payload is not None
+    assert index_payload is dsa_payload
+    assert not hasattr(attention_mask, "_forward_sharing_state")
+    assert not hasattr(config, "_forward_sharing_state")
 
 
 def test_backward_dw_flushes_only_an_owned_indexer():
@@ -287,7 +290,9 @@ def test_checkpointed_absorbed_attention_keeps_metadata_out_of_tensor_args(monke
             return kwargs["x"]
 
     dummy_attention = SimpleNamespace(
-        attn_mask_type=AttnMaskType.causal, core_attention=CoreAttention()
+        attn_mask_type=AttnMaskType.causal,
+        core_attention=CoreAttention(),
+        config=SimpleNamespace(dsa_indexer_topk_freq=1),
     )
     monkeypatch.setattr(absorbed_mla_module.tensor_parallel, "checkpoint", fake_checkpoint)
 

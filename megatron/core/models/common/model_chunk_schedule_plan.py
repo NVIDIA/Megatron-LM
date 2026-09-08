@@ -16,6 +16,10 @@ from megatron.core.pipeline_parallel.utils import (
     get_comm_stream,
     get_comp_stream,
 )
+from megatron.core.transformer.forward_sharing import (
+    ForwardSharingState,
+    is_forward_sharing_enabled,
+)
 from megatron.core.utils import nvtx_range_pop, nvtx_range_push
 
 
@@ -692,6 +696,12 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         self._model_chunk_state.output_processor = output_processor
         self._model_chunk_state.output_processor_context = output_processor_context
         self._model_chunk_state.model = model
+        # The overlap schedule outlives GPTModel.forward and owns its IndexShare
+        # payloads until backward/recompute completes, not until a carrier is collected.
+        self._model_chunk_state.forward_sharing_state = None
+        if is_forward_sharing_enabled(model.config):
+            self._model_chunk_state.forward_sharing_state = ForwardSharingState()
+            self._model_chunk_state.forward_sharing_state.active = True
         self._model_chunk_state.context = None
         self._model_chunk_state.context_mask = None
         self._model_chunk_state.attention_bias = None
@@ -854,6 +864,10 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
 
     def release_state(self):
         """Release reference, this helps avoid memory leak."""
+        sharing_state = self._model_chunk_state.forward_sharing_state
+        if sharing_state is not None:
+            sharing_state.clear()
+            self._model_chunk_state.forward_sharing_state = None
         self._recompute_segments = []
         self._model_chunk_state.model = None
         self.pre_process.model_chunk_state = None
