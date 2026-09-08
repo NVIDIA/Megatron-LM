@@ -369,7 +369,7 @@ class OwnerGatherPlan:
                 buf = recv_buffers[src]
                 shards.append(buf[offset : offset + numel].view(row_count, plan.row_size))
         if len(shards) == 1:
-            return shards[0].contiguous()
+            return shards[0]
         return torch.cat(shards, dim=0)
 
 
