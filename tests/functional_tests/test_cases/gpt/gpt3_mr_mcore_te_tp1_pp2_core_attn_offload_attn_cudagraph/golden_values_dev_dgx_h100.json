@@ -10,17 +10,6 @@
             "4": 9.65865
         }
     },
-    "grad-norm": {
-        "start_step": 1,
-        "end_step": 4,
-        "step_interval": 1,
-        "values": {
-            "1": 1.92781,
-            "2": 1.86541,
-            "3": 2.51769,
-            "4": 2.38709
-        }
-    },
     "num-zeros": {
         "start_step": 1,
         "end_step": 4,

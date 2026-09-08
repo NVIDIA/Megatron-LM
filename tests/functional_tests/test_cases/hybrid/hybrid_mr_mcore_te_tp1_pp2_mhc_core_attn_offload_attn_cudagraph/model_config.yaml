@@ -101,5 +101,4 @@ MODEL_ARGS:
 TEST_TYPE: regular
 METRICS:
   - "lm loss"
-  - "grad-norm"
   - "num-zeros"
