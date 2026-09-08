@@ -752,8 +752,14 @@ _ASYNC_SUSPEND_RESUME_SCENARIOS = (
     _pair_scenario(
         "recompute-suspend-resume",
         "kv:recompute",
-        config={"kv_cache_management_mode": "recompute", "static_kv_memory_pointers": False},
-        signals=("recompute", "suspend-resume"),
+        config={
+            "kv_cache_management_mode": "recompute",
+            "static_kv_memory_pointers": False,
+            "return_log_probs": True,
+            "materialize_only_last_token_logits": False,
+        },
+        sampling=({"return_log_probs": True, "skip_prompt_log_probs": False, "top_n_logprobs": 3},),
+        signals=("recompute", "suspend-resume", "full-logits", "logprobs", "top-n"),
     ),
 )
 
