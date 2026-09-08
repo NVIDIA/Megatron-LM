@@ -294,11 +294,11 @@ class OwnerGatherPlan:
             owner = owners[param_index]
             if owner != this_rank:
                 send_sizes[owner] += plan.shard_numel(this_rank)
-            else:
-                for src in range(dp_size):
-                    if src == this_rank:
-                        continue
-                    recv_sizes[src] += plan.shard_numel(src)
+                continue
+            for src in range(dp_size):
+                if src == this_rank:
+                    continue
+                recv_sizes[src] += plan.shard_numel(src)
 
         send_buffers: dict[int, torch.Tensor] = {}
         for owner, size in send_sizes.items():
