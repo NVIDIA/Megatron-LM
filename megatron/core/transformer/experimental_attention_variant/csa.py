@@ -1914,19 +1914,22 @@ class CompressedSparseAttention(MegatronModule):
             precision=precision,
         )
         capturing = torch.cuda.is_current_stream_capturing()
-        workspace = self._active_bshd_compact_indexer_workspace
-        if capturing:
-            if workspace is not None and workspace.matches_shape(**match_kwargs):
+        active_workspace = self._active_bshd_compact_indexer_workspace
+        if active_workspace is not None and active_workspace.matches_shape(**match_kwargs):
+            return active_workspace
+
+        for workspace in self._bshd_compact_indexer_workspaces:
+            if workspace is active_workspace:
+                continue
+            if workspace.matches_shape(**match_kwargs):
+                self._active_bshd_compact_indexer_workspace = workspace
                 return workspace
+
+        if capturing:
             raise ValueError(
                 "BSHD compact CUDA graph capture requires an eagerly prepared compact "
                 "workspace for the active static geometry. Run eager warmup before capture."
             )
-
-        for workspace in self._bshd_compact_indexer_workspaces:
-            if workspace.matches_shape(**match_kwargs):
-                self._active_bshd_compact_indexer_workspace = workspace
-                return workspace
 
         q_bshd = q.permute(1, 0, 2, 3).contiguous()
         k_bsd = k.permute(1, 0, 2).contiguous()
@@ -1971,28 +1974,25 @@ class CompressedSparseAttention(MegatronModule):
             return None
 
         capturing = torch.cuda.is_current_stream_capturing()
-        workspace = self._active_thd_compact_indexer_workspace
-        if capturing:
-            if workspace is not None and workspace.matches(
-                q=q,
-                k=k,
-                topk=topk,
-                ratio=ratio,
-                cu_seqlens_q=cu_seqlens_q,
-                cu_seqlens_k=cu_seqlens_k,
-                max_seqlen_q=max_seqlen_q,
-                max_seqlen_k=max_seqlen_k,
-                q_causal_offsets=q_causal_offsets,
-                return_softmax=return_softmax,
-                precision=precision,
-            ):
-                return workspace
-            raise ValueError(
-                "THD compact CUDA graph capture requires an eagerly prepared compact "
-                "workspace for the active packed geometry. Run eager warmup before capture."
-            )
+        active_workspace = self._active_thd_compact_indexer_workspace
+        if active_workspace is not None and active_workspace.matches(
+            q=q,
+            k=k,
+            topk=topk,
+            ratio=ratio,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            q_causal_offsets=q_causal_offsets,
+            return_softmax=return_softmax,
+            precision=precision,
+        ):
+            return active_workspace
 
         for workspace in self._thd_compact_indexer_workspaces:
+            if workspace is active_workspace:
+                continue
             if workspace.matches(
                 q=q,
                 k=k,
@@ -2008,6 +2008,12 @@ class CompressedSparseAttention(MegatronModule):
             ):
                 self._active_thd_compact_indexer_workspace = workspace
                 return workspace
+
+        if capturing:
+            raise ValueError(
+                "THD compact CUDA graph capture requires an eagerly prepared compact "
+                "workspace for the active packed geometry. Run eager warmup before capture."
+            )
 
         workspace = prepare_thd_compact_indexer_workspace(
             q,
