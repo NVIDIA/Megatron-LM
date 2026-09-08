@@ -1,9 +1,18 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 import re
-from typing import Optional, Union
+from typing import Any, Optional, Union
 
 from .quant_config import GlobMatcher, MatchContext, QuantizationConfig, RecipeConfig
+
+
+def is_quantization_enabled(config: Any) -> bool:
+    """Return whether any global quantization mode is enabled."""
+    return bool(
+        getattr(config, "custom_recipe", None)
+        or getattr(config, "fp8", None)
+        or getattr(config, "fp4", None)
+    )
 
 
 def get_quant_config_or_none(

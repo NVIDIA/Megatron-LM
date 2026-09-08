@@ -1,5 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import dataclasses
+
 import pytest
 
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -96,6 +98,56 @@ def test_gdp_num_householder_accepts_positive_values():
     )
 
     assert config.gdp_num_householder == 5
+
+
+def test_custom_recipe_config_accepts_factory_path():
+    config = TransformerConfig(
+        num_layers=1, hidden_size=128, num_attention_heads=4, custom_recipe="package.module.factory"
+    )
+
+    assert config.custom_recipe == "package.module.factory"
+    assert config.fp8 is None
+    assert config.fp4 is None
+    assert config.fp8_quantizer_factory is None
+
+
+def test_custom_recipe_config_stays_format_neutral_when_copied():
+    config = TransformerConfig(
+        num_layers=1, hidden_size=128, num_attention_heads=4, custom_recipe="package.module.factory"
+    )
+
+    assert dataclasses.replace(config) == config
+
+
+@pytest.mark.parametrize("factory_path", [True, "", "  "])
+def test_custom_recipe_config_rejects_invalid_factory_path(factory_path):
+    with pytest.raises(ValueError, match="must be a non-empty Python import path"):
+        TransformerConfig(
+            num_layers=1, hidden_size=128, num_attention_heads=4, custom_recipe=factory_path
+        )
+
+
+@pytest.mark.parametrize(
+    ("overrides", "error"),
+    [
+        ({"fp8_param": True}, "do not yet support quantized parameter storage"),
+        ({"fp8": "hybrid"}, "cannot be combined with FP8/FP4"),
+        ({"fp4": "e2m1"}, "cannot be combined with FP8/FP4"),
+        (
+            {"fp8_recipe": "custom", "fp8_quantizer_factory": "package.module.legacy_factory"},
+            "cannot be combined with FP8/FP4",
+        ),
+    ],
+)
+def test_custom_recipe_config_rejects_invalid_flag_combinations(overrides, error):
+    with pytest.raises(ValueError, match=error):
+        TransformerConfig(
+            num_layers=1,
+            hidden_size=128,
+            num_attention_heads=4,
+            custom_recipe="package.module.factory",
+            **overrides,
+        )
 
 
 def test_from_config_creates_independent_target_config_without_reinitializing():

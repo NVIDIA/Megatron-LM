@@ -13,14 +13,14 @@ from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.enums import Fp8Recipe
 from megatron.core.extensions.transformer_engine import HAVE_TE
-from megatron.core.fp4_utils import get_fp4_context
-from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.utils import is_vp_first_stage, is_vp_last_stage
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.quantization.te_recipe import get_quantization_context
+from megatron.core.quantization.utils import is_quantization_enabled
 from megatron.core.recompute import checkpointed_forward
 from megatron.core.transformer.cuda_graphs import annotate_first_last_layer
 from megatron.core.transformer.enums import InferenceCudaGraphScope, LayerType
@@ -349,17 +349,9 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             else:
                 layer_config = self.config
 
-            # Get appropriate quantization context (FP8 and FP4 are mutually exclusive)
-            if layer_config.fp8:
-                quantization_context = get_fp8_context(
-                    layer_config, global_layer_number - 1, is_init=True
-                )
-            elif layer_config.fp4:
-                quantization_context = get_fp4_context(
-                    layer_config, global_layer_number - 1, is_init=True
-                )
-            else:
-                quantization_context = nullcontext()
+            quantization_context = get_quantization_context(
+                layer_config, global_layer_number - 1, is_init=True
+            )
 
             with quantization_context:
                 module = build_module(
@@ -634,9 +626,11 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             use_outer_quantization_context = self.config.fp8_recipe == Fp8Recipe.delayed
             use_inner_quantization_context = self.config.fp8_recipe != Fp8Recipe.delayed
             outer_quantization_context = (
-                get_fp8_context(self.config) if use_outer_quantization_context else nullcontext()
+                get_quantization_context(self.config)
+                if use_outer_quantization_context
+                else nullcontext()
             )
-        elif self.config.fp4:
+        elif is_quantization_enabled(self.config):
             use_outer_quantization_context = False
             use_inner_quantization_context = True
             outer_quantization_context = nullcontext()
@@ -693,16 +687,9 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                 for l_no, layer in enumerate(self.layers):
                     # Get appropriate inner quantization context
                     if use_inner_quantization_context:
-                        if self.config.fp8:
-                            inner_quantization_context = get_fp8_context(
-                                self.config, layer.layer_number - 1
-                            )
-                        elif self.config.fp4:
-                            inner_quantization_context = get_fp4_context(
-                                self.config, layer.layer_number - 1
-                            )
-                        else:
-                            inner_quantization_context = nullcontext()
+                        inner_quantization_context = get_quantization_context(
+                            self.config, layer.layer_number - 1
+                        )
                     else:
                         inner_quantization_context = nullcontext()
 

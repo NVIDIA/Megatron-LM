@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import importlib
 import inspect
+import warnings
 from typing import TYPE_CHECKING, Any, Callable
 
 if TYPE_CHECKING:
@@ -18,6 +19,7 @@ except ImportError:
 
 
 _CUSTOM_RECIPE_CACHE_ATTRIBUTE = "_mcore_custom_recipe_cache"
+_WARNED_LEGACY_CUSTOM_RECIPE_MODES: set[str] = set()
 
 
 def resolve_quantizer_factory(dotted_path: str) -> Callable[..., Any]:
@@ -120,3 +122,16 @@ def get_cached_custom_recipe(
             resolve_quantizer_factory(quantizer_factory_path), fp8_dpa=fp8_dpa, fp8_mha=fp8_mha
         )
     return cache[key]
+
+
+def warn_deprecated_legacy_custom_recipe(mode: str) -> None:
+    """Warn once per process for a legacy format-scoped custom recipe."""
+    if mode in _WARNED_LEGACY_CUSTOM_RECIPE_MODES:
+        return
+    _WARNED_LEGACY_CUSTOM_RECIPE_MODES.add(mode)
+    warnings.warn(
+        f"--{mode}-recipe custom and --{mode}-quantizer-factory are deprecated and will be "
+        "removed in a future release. Pass the factory path to --custom-recipe instead.",
+        FutureWarning,
+        stacklevel=3,
+    )

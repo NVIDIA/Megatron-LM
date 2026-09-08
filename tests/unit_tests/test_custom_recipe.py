@@ -8,7 +8,7 @@ import pytest
 
 from megatron.core.enums import Fp8Recipe
 from megatron.core.extensions import transformer_engine as te_extension
-from megatron.core.quantization import custom_recipe
+from megatron.core.quantization import custom_recipe, te_recipe
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 RECORDED_ROLES = []
@@ -108,6 +108,35 @@ def test_legacy_custom_recipe_paths_forward_attention_flags(config_kwargs, recip
     assert recipe.fp8_mha is True
 
 
+@pytest.mark.parametrize(
+    "config_kwargs",
+    [
+        {"fp8": "hybrid", "fp8_recipe": "custom", "fp8_quantizer_factory": TEST_FACTORY_PATH},
+        {"fp4": "e2m1", "fp4_recipe": "custom", "fp4_quantizer_factory": TEST_FACTORY_PATH},
+    ],
+)
+def test_legacy_custom_recipe_warns_once(config_kwargs):
+    mode = "fp8" if "fp8" in config_kwargs else "fp4"
+    custom_recipe._WARNED_LEGACY_CUSTOM_RECIPE_MODES.discard(mode)
+    try:
+        with pytest.warns(
+            FutureWarning, match="Pass the factory path to --custom-recipe"
+        ) as warnings:
+            for _ in range(2):
+                TransformerConfig(
+                    num_layers=1, hidden_size=128, num_attention_heads=4, **config_kwargs
+                )
+        custom_recipe_warnings = [
+            warning
+            for warning in warnings
+            if issubclass(warning.category, FutureWarning)
+            and f"--{mode}-recipe custom" in str(warning.message)
+        ]
+        assert len(custom_recipe_warnings) == 1
+    finally:
+        custom_recipe._WARNED_LEGACY_CUSTOM_RECIPE_MODES.discard(mode)
+
+
 @pytest.mark.skipif(not te_extension.HAVE_TE, reason="Transformer Engine is not installed")
 def test_per_module_custom_recipe_uses_format_neutral_autocast():
     config = te_extension.TEQuantizationRecipe(
@@ -140,3 +169,49 @@ def test_per_module_custom_recipe_rejects_quantized_parameter_storage():
                 "fp8_param": True,
             }
         )
+
+
+@pytest.mark.skipif(not te_recipe.HAVE_TE, reason="Transformer Engine is not installed")
+def test_get_quantization_context_uses_format_neutral_te_api():
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=128,
+        num_attention_heads=4,
+        custom_recipe=TEST_FACTORY_PATH,
+        fp8_dot_product_attention=True,
+        fp8_multi_head_attention=True,
+    )
+    expected_context = nullcontext()
+
+    with patch.object(te_recipe.te, "autocast", return_value=expected_context) as autocast:
+        context = te_recipe.get_quantization_context(config)
+
+    assert context is expected_context
+    call_kwargs = autocast.call_args.kwargs
+    assert call_kwargs["enabled"] is True
+    assert call_kwargs["amax_reduction_group"] is None
+    assert call_kwargs["recipe"].qfactory is delayed_scaling_test_factory
+    assert call_kwargs["recipe"].fp8_dpa is True
+    assert call_kwargs["recipe"].fp8_mha is True
+
+
+@pytest.mark.skipif(not te_recipe.HAVE_TE, reason="Transformer Engine is not installed")
+def test_custom_recipe_init_context_is_noop_without_parameter_storage():
+    config = TransformerConfig(
+        num_layers=1, hidden_size=128, num_attention_heads=4, custom_recipe=TEST_FACTORY_PATH
+    )
+
+    with te_recipe.get_quantization_context(config, is_init=True):
+        pass
+
+
+@pytest.mark.skipif(not te_extension.HAVE_TE, reason="Transformer Engine is not installed")
+def test_custom_recipe_is_materialized_once_per_config():
+    config = TransformerConfig(
+        num_layers=1, hidden_size=128, num_attention_heads=4, custom_recipe=TEST_FACTORY_PATH
+    )
+
+    first = te_recipe.get_te_quantization_recipe(config)
+    second = te_recipe.get_te_quantization_recipe(config)
+
+    assert first is second

@@ -864,6 +864,10 @@ if HAVE_TE:
             A disabled TE quantization context when quantization is active, otherwise a
             no-op context.
         """
+        if config.custom_recipe is not None:
+            from megatron.core.quantization.te_recipe import get_quantization_disabled_context
+
+            return get_quantization_disabled_context(config, is_init)
         if is_init:
             if not (config.fp8_param or config.fp4_param):
                 return nullcontext()

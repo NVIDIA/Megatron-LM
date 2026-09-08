@@ -2923,7 +2923,9 @@ def get_asyncio_loop(loop: asyncio.AbstractEventLoop | None = None) -> asyncio.A
 
 def is_using_quantization_scales(config):
     """Returns whether the model is using quantization scales based on the config."""
-    return getattr(config, "fp8", False) or getattr(config, "fp4", False)
+    from megatron.core.quantization.utils import is_quantization_enabled
+
+    return is_quantization_enabled(config)
 
 
 _ASYNC_TASK_STATS = defaultdict(lambda: [0, 0.0])  # cnt, total_time
