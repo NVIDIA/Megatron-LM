@@ -1367,6 +1367,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
     @pytest.mark.parametrize("kv_cache_management_mode", ["persist", "recompute"])
+    @torch.inference_mode()
     def test_start_suspended(self, kv_cache_management_mode: str) -> None:
         """Deferred capture happens on the first resume() and only there."""
         env = self._run_test(
