@@ -4187,7 +4187,7 @@ def checkpoint_and_decide_exit(
     # save if desired, all exits are persistent saves, persistent save takes priority over non-persistent
     if args.save:
         persistent_save = exit_now or (args.save_interval and ((iteration % args.save_interval) == 0))
-        non_persistent_save = !persistent_save and (args.non_persistent_save_interval and ((iteration % args.non_persistent_save_interval) == 0))
+        non_persistent_save = not persistent_save and (args.non_persistent_save_interval and ((iteration % args.non_persistent_save_interval) == 0))
 
         if persistent_save or non_persistent_save:
             save_checkpoint_and_time(
