@@ -479,12 +479,14 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
             # here would break live jobs.
             if not self._warned_qkv_split_disabled:
                 self._warned_qkv_split_disabled = True
+                debug_name = getattr(p, '_debug_name', '')
                 log_single_rank(
                     logger,
                     logging.WARNING,
                     f"Muon: split-QKV is disabled for GTP-sharded qkv weights under "
                     f"tp_mode='{mode}'"
                     + (f" (auto-resolved from '{self.tp_mode}')" if self.tp_mode == "auto" else "")
+                    + (f", first seen on {debug_name}" if debug_name else "")
                     + "; blockwise/distributed keep the rows sharded, so the q/k/v "
                     "boundaries are not available on any rank. These weights get "
                     "whole-matrix Newton-Schulz, which is NOT the update rule the same "
