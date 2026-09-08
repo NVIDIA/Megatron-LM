@@ -287,7 +287,7 @@ def _normalize_dsv4_hybrid_csa_compress_ratios(
     if variant != 'dsv4_hybrid':
         return
 
-    fixed_ratio_map = {Symbols.WINDOW: 0, Symbols.CSA: 4, Symbols.HCA: 128}
+    fixed_ratio_map = Symbols.DSV4_COMPRESS_RATIO_MAP
     ratio_symbols = set(fixed_ratio_map)
     sections = pattern.split(Symbols.MTP_SEPARATOR)
     layers = ''.join(section.replace(Symbols.PIPE, '') for section in sections)

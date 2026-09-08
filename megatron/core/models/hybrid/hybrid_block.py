@@ -64,9 +64,7 @@ class HybridStackSubmodules:
     attention_layer: Union[ModuleSpec, type] = IdentityOp
     dsa_layer: Union[ModuleSpec, type] = IdentityOp
     csa_layer: Union[ModuleSpec, type] = IdentityOp
-    hca_layer: Union[ModuleSpec, type] = IdentityOp
     mla_layer: Union[ModuleSpec, type] = IdentityOp
-    window_layer: Union[ModuleSpec, type] = IdentityOp
     mlp_layer: Union[ModuleSpec, type] = IdentityOp
     moe_layer: Union[ModuleSpec, type] = IdentityOp
     mtp_block_spec: Optional[ModuleSpec] = None
@@ -252,17 +250,6 @@ class HybridStack(MegatronModule):
                         pp_layer_offset=pp_layer_offset,
                         name=(name + f".layers.{i}") if name is not None else None,
                     )
-                elif type(layer_config) is layer_utils.HCALayerConfig:
-                    layer = build_module(
-                        submodules.hca_layer,
-                        config=layer_config,
-                        layer_number=layer_number,
-                        pg_collection=pg_collection,
-                        is_mtp_layer=is_mtp_layer,
-                        add_layer_offset=False,
-                        pp_layer_offset=pp_layer_offset,
-                        name=(name + f".layers.{i}") if name is not None else None,
-                    )
                 elif type(layer_config) is layer_utils.MLALayerConfig:
                     layer = build_module(
                         submodules.mla_layer,
@@ -272,17 +259,6 @@ class HybridStack(MegatronModule):
                         is_mtp_layer=is_mtp_layer,
                         add_layer_offset=False,
                         pp_layer_offset=pp_layer_offset,
-                    )
-                elif type(layer_config) is layer_utils.WindowAttentionLayerConfig:
-                    layer = build_module(
-                        submodules.window_layer,
-                        config=layer_config,
-                        layer_number=layer_number,
-                        pg_collection=pg_collection,
-                        is_mtp_layer=is_mtp_layer,
-                        add_layer_offset=False,
-                        pp_layer_offset=pp_layer_offset,
-                        name=(name + f".layers.{i}") if name is not None else None,
                     )
                 elif type(layer_config) is layer_utils.MLPLayerConfig:
                     layer = build_module(

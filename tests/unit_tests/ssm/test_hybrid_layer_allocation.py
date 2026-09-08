@@ -27,8 +27,6 @@ from megatron.core.transformer.attention_layer_config import AttentionLayerConfi
 from megatron.core.transformer.experimental_attention_variant.dsa_layer_config import DSALayerConfig
 from megatron.core.transformer.experimental_attention_variant.dsv4_layer_config import (
     CSALayerConfig,
-    HCALayerConfig,
-    WindowAttentionLayerConfig,
 )
 from megatron.core.transformer.mla_layer_config import MLALayerConfig
 from megatron.core.transformer.moe.moe_layer_config import MoELayerConfig
@@ -40,12 +38,14 @@ _EXPECTED_LAYER_CONFIG_CLASSES = {
     Symbols.ATTENTION: AttentionLayerConfig,
     Symbols.DS_ATTENTION: DSALayerConfig,
     Symbols.CSA: CSALayerConfig,
-    Symbols.HCA: HCALayerConfig,
+    Symbols.HCA: CSALayerConfig,
     Symbols.MLA: MLALayerConfig,
-    Symbols.WINDOW: WindowAttentionLayerConfig,
+    Symbols.WINDOW: CSALayerConfig,
     Symbols.MLP: MLPLayerConfig,
     Symbols.MOE: MoELayerConfig,
 }
+
+_DSV4_COMPRESS_RATIOS = {Symbols.CSA: 4, Symbols.HCA: 128, Symbols.WINDOW: 0}
 
 
 def _make_transformer_config() -> TransformerConfig:
@@ -59,9 +59,12 @@ def _assert_layer_config_types(layer_config_list, pattern: str) -> None:
 
 
 def _assert_config_contents_equal(actual, expected) -> None:
-    assert vars(actual).keys() == vars(expected).keys()
+    actual_vars = vars(actual).copy()
+    if type(actual) is CSALayerConfig:
+        actual_vars.pop("compress_ratio")
+    assert actual_vars.keys() == vars(expected).keys()
     for field_name, expected_value in vars(expected).items():
-        actual_value = getattr(actual, field_name)
+        actual_value = actual_vars[field_name]
         if isinstance(expected_value, functools.partial):
             assert isinstance(actual_value, functools.partial)
             assert actual_value.func is expected_value.func
@@ -158,6 +161,8 @@ class TestValidateSegmentLayers:
         assert layer_config_list[0] is not self.config
         _assert_config_contents_equal(layer_config_list[0], self.config)
         assert layer_config_list[0].hidden_size == self.config.hidden_size
+        if layer_symbol in _DSV4_COMPRESS_RATIOS:
+            assert layer_config_list[0].compress_ratio == _DSV4_COMPRESS_RATIOS[layer_symbol]
         _assert_layer_config_types(layer_config_list, layer_symbol)
 
     def test_all_layer_symbols_have_an_expected_config_class(self):
@@ -222,12 +227,12 @@ class TestValidateSegmentLayers:
 
     def test_dsv4_attention_symbols(self):
         assert {Symbols.WINDOW, Symbols.CSA, Symbols.HCA, Symbols.MLA} <= Symbols.MLA_ATTENTION
-        assert {
-            WindowAttentionLayerConfig,
-            CSALayerConfig,
-            HCALayerConfig,
-        } <= Symbols.ATTENTION_LAYER_CONFIGS
-        _assert_layer_config_types(validate_segment_layers("WDCH+", self.config), "WDCH+")
+        assert CSALayerConfig in Symbols.ATTENTION_LAYER_CONFIGS
+        layer_configs = validate_segment_layers("WDCH+", self.config)
+        _assert_layer_config_types(layer_configs, "WDCH+")
+        assert [layer_configs[index].compress_ratio for index in (0, 2, 3)] == [
+            _DSV4_COMPRESS_RATIOS[symbol] for symbol in (Symbols.WINDOW, Symbols.CSA, Symbols.HCA)
+        ]
         with pytest.raises(ValueError):
             validate_segment_layers("W*C", self.config)
 

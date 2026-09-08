@@ -127,6 +127,11 @@ class DSv4HybridAttention(Attention):
 
         ratio_idx = self.config.num_layers + layer_number - 1 if is_mtp_layer else layer_number - 1
         if compress_ratio is None:
+            # HybridModel carries the C/H/W choice on each layer config. Keep the
+            # global ratio list as a fallback for the legacy D-symbol and direct
+            # DSv4 attention construction paths.
+            compress_ratio = getattr(self.config, "compress_ratio", None)
+        if compress_ratio is None:
             if ratio_idx >= len(self.config.csa_compress_ratios):
                 layer_kind = "MTP" if is_mtp_layer else "decoder"
                 raise ValueError(

@@ -7,8 +7,6 @@ from megatron.core.transformer.attention_layer_config import AttentionLayerConfi
 from megatron.core.transformer.experimental_attention_variant.dsa_layer_config import DSALayerConfig
 from megatron.core.transformer.experimental_attention_variant.dsv4_layer_config import (
     CSALayerConfig,
-    HCALayerConfig,
-    WindowAttentionLayerConfig,
 )
 from megatron.core.transformer.mla_layer_config import MLALayerConfig
 from megatron.core.transformer.moe.moe_layer_config import MoELayerConfig
@@ -36,21 +34,15 @@ class Symbols:
         ATTENTION: AttentionLayerConfig,
         DS_ATTENTION: DSALayerConfig,
         CSA: CSALayerConfig,
-        HCA: HCALayerConfig,
+        HCA: CSALayerConfig,
         MLA: MLALayerConfig,
-        WINDOW: WindowAttentionLayerConfig,
+        WINDOW: CSALayerConfig,
         MLP: MLPLayerConfig,
         MOE: MoELayerConfig,
     }
+    DSV4_COMPRESS_RATIO_MAP = {CSA: 4, HCA: 128, WINDOW: 0}
     MLA_ATTENTION = {MLA, DS_ATTENTION, CSA, HCA, WINDOW}
-    ATTENTION_LAYER_CONFIGS = {
-        AttentionLayerConfig,
-        DSALayerConfig,
-        CSALayerConfig,
-        HCALayerConfig,
-        MLALayerConfig,
-        WindowAttentionLayerConfig,
-    }
+    ATTENTION_LAYER_CONFIGS = {AttentionLayerConfig, DSALayerConfig, CSALayerConfig, MLALayerConfig}
 
     @classmethod
     def name_sorted_valid_layer_symbols(cls) -> list[str]:
@@ -88,7 +80,10 @@ def create_layer_config(config: TransformerConfig, layer_symbol: str) -> Transfo
     """
     if not is_valid_symbol(layer_symbol):
         raise ValueError(f"Unexpected hybrid layer symbol: {layer_symbol}")
-    return Symbols.LAYER_CONFIG_MAP[layer_symbol].from_config(config)
+    layer_config = Symbols.LAYER_CONFIG_MAP[layer_symbol].from_config(config)
+    if type(layer_config) is CSALayerConfig:
+        layer_config.compress_ratio = Symbols.DSV4_COMPRESS_RATIO_MAP[layer_symbol]
+    return layer_config
 
 
 def get_layer_symbol_from_config(layer_config: TransformerConfig) -> str:
@@ -101,8 +96,18 @@ def get_layer_symbol_from_config(layer_config: TransformerConfig) -> str:
         The symbol corresponding to ``layer_config``.
 
     Raises:
-        ValueError: If the exact config type is unsupported.
+        ValueError: If the exact config type or DSv4 compression ratio is unsupported.
     """
+    if type(layer_config) is CSALayerConfig:
+        for symbol, compress_ratio in Symbols.DSV4_COMPRESS_RATIO_MAP.items():
+            if layer_config.compress_ratio == compress_ratio:
+                return symbol
+        valid_ratios = sorted(Symbols.DSV4_COMPRESS_RATIO_MAP.values())
+        raise ValueError(
+            f"Unexpected CSALayerConfig compress_ratio: {layer_config.compress_ratio}. "
+            f"Expected one of {valid_ratios}."
+        )
+
     for symbol, config_type in Symbols.LAYER_CONFIG_MAP.items():
         if type(layer_config) is config_type:
             return symbol

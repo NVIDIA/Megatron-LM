@@ -435,7 +435,7 @@ gdp_inference_stack_spec = gated_delta_product_inference_stack_spec
 
 
 def hybrid_dsv4_stack_spec(config: TransformerConfig) -> ModuleSpec:
-    """Build a HybridStack with fixed-ratio DSv4 C/H/W attention layers."""
+    """Build a HybridStack with DSv4 C/H/W attention layers."""
     assert (
         config.transformer_impl == "transformer_engine"
     ), "DSv4 HybridModel currently supports only the transformer-engine implementation."
@@ -446,22 +446,14 @@ def hybrid_dsv4_stack_spec(config: TransformerConfig) -> ModuleSpec:
         config=config, backend=TESpecProvider()
     )
 
-    def wrap_dsv4_layer(compress_ratio: int) -> ModuleSpec:
-        attention = replace(
-            dsv4_attention,
-            params={**(dsv4_attention.params or {}), "compress_ratio": compress_ratio},
-        )
-        return ModuleSpec(
-            module=TransformerLayer,
-            submodules=TransformerLayerSubmodules(
-                input_layernorm=TENorm, self_attention=attention, self_attn_bda=get_bias_dropout_add
-            ),
-        )
-
-    submodules = replace(
-        hybrid_stack_spec.submodules,
-        csa_layer=wrap_dsv4_layer(compress_ratio=4),
-        hca_layer=wrap_dsv4_layer(compress_ratio=128),
-        window_layer=wrap_dsv4_layer(compress_ratio=0),
+    dsv4_layer = ModuleSpec(
+        module=TransformerLayer,
+        submodules=TransformerLayerSubmodules(
+            input_layernorm=TENorm,
+            self_attention=dsv4_attention,
+            self_attn_bda=get_bias_dropout_add,
+        ),
     )
+
+    submodules = replace(hybrid_stack_spec.submodules, csa_layer=dsv4_layer)
     return replace(hybrid_stack_spec, submodules=submodules)
