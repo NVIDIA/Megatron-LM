@@ -327,7 +327,7 @@ def _get_param_groups(
         List of parameter groups.
     """
 
-    # Map (pg_overrides, is_expert_parallel) to params.
+    # Map (pg_overrides, is_expert_parallel, is_dsa_indexer) to params.
     params_map = {}
 
     for model_chunk in model_chunks:
@@ -351,12 +351,13 @@ def _get_param_groups(
                 param_override = None
 
             is_expert_parallel = not getattr(param, 'allreduce', True)
+            is_dsa_indexer = name.startswith("indexer.") or ".indexer." in name
 
             # Create config_tuple that is hash-able, and has a consistent ordering of the keys.
             param_override_tuple: tuple[tuple[str, Any], ...] | None = (
                 param_group_override_to_tuple(param_override)
             )
-            key = (param_override_tuple, is_expert_parallel)
+            key = (param_override_tuple, is_expert_parallel, is_dsa_indexer)
             if key not in params_map:
                 params_map[key] = []
             params_map[key].append(param)
@@ -373,9 +374,16 @@ def _get_param_groups(
                 params_key.append(key)
     # Need to pick one of the param_override_tuples to use for the param group.
     param_groups = []
+
     # Sort keys, None first.
-    for key in sorted(params_key, key=lambda x: (x[0] is not None, x[0])):
-        param_override_tuple, is_expert_parallel = key
+    # Keys gathered from other ranks or module domains may predate the is_dsa_indexer
+    # element; treat a missing element as False so ordering stays total either way.
+    def _key_order(key):
+        return (key[0] is not None, key[0], key[1], key[2] if len(key) > 2 else False)
+
+    for key in sorted(params_key, key=_key_order):
+        param_override_tuple, is_expert_parallel = key[0], key[1]
+        is_dsa_indexer = key[2] if len(key) > 2 else False
         params = params_map[key] if key in params_map else []
         if param_override_tuple is None:
             param_override: ParamGroupOverride = {}
@@ -397,6 +405,7 @@ def _get_param_groups(
             'wd_mult': 1.0,
             'lr_mult': 1.0,
             'is_decoupled_lr': False,
+            'is_dsa_indexer': False,
             # The following two fields may be important to keep even when we remove the
             #   above "backwards compatible" fields.
             "max_lr": config.lr,  # user may override this in param_override
@@ -412,6 +421,7 @@ def _get_param_groups(
             **default_config,
             **param_override,  # keep **param_override last so that users can override other fields.
         }
+        param_group['is_dsa_indexer'] = is_dsa_indexer
         param_groups.append(param_group)
 
     return param_groups
