@@ -329,6 +329,7 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
     _symm_agv_routing: Optional[dict] = None
     _symm_agv_probs: Optional[dict] = None
     _symm_rsv: Optional[dict] = None
+    _symm_metadata: Optional[dict] = None
 
     @classmethod
     def _get_rsv_tensor(cls) -> Optional[torch.Tensor]:
@@ -484,6 +485,8 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         )
         InferenceAllGatherDispatcherBase._host_valid_tokens_estimate = local_tokens * self.ep_size
         if self.config.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.FLASHINFER:
+            # FlashInfer ignores expert id -1. AllGather-V overwrites the compact
+            # valid prefix, leaving every unused row as an unrouted padding sentinel.
             cls._symm_agv_routing["tensor"].fill_(-1)
 
     def __init__(

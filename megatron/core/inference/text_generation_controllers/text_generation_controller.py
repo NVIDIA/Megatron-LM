@@ -759,17 +759,14 @@ class TextGenerationController(MTPInferenceMixin):
             position_ids (Tensor): The position IDs.
         """
         context = self.inference_wrapped_model.inference_context
-        token_capacity = self.model_config.inference_flashinfer_token_capacity
-        decode_token_upper_bound = (
+        token_capacity = (
             context.max_requests
             * (self.num_speculative_tokens + 1)
-            * self.model_config.expert_model_parallel_size
+            * context.expert_model_parallel_size
+            if context.can_use_bounded_flashinfer_rows()
+            else None
         )
-        InferenceMode.set_bounded_flashinfer_rows(
-            context.is_decode_only()
-            and token_capacity is not None
-            and decode_token_upper_bound <= token_capacity
-        )
+        InferenceMode.set_flashinfer_token_capacity(token_capacity)
         if context.config.materialize_only_last_token_logits:
             logits_seq_len = context.num_last_token_logits
         else:

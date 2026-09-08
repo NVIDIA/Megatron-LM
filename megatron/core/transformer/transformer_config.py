@@ -1320,13 +1320,17 @@ class TransformerConfig(ModelParallelConfig):
     fp8_recipe='mxfp8'. Set to True to disable fusion and use separate kernel
     launches (useful for debugging)."""
 
-    inference_flashinfer_token_capacity: int | None = None
-    """Optional fixed token-row capacity for FlashInfer MoE.
+    inference_flashinfer_bounded_rows: bool = False
+    """Use an inferred decode-only token-row bound for FlashInfer MoE.
 
-    Decode-only dynamic-inference graphs use this fixed prefix when their
-    host-known EP-wide token ceiling fits. Prefill, mixed, static-inference,
-    and oversized decode graphs retain the full dispatcher buffer. Requires
-    BF16 or MXFP8 parameters, the NVLS inference dispatcher, and EP > 1.
+    The bound is derived from the dynamic-inference request limit, speculative
+    decoding depth, and expert-parallel size. Dedicated disaggregated decode
+    engines use it without a per-step mode collective; dedicated prefill engines
+    retain the full dispatcher buffer. Under regular continuous batching it is
+    used only when every rank in the EP group is decode-only, with prefill and
+    mixed steps falling back to the full buffer after an EP-wide mode
+    agreement. Requires BF16 or MXFP8 parameters, the NVLS inference
+    dispatcher, and EP > 1.
     """
 
     inference_moe_token_dispatcher_type: Literal['nccl', 'nvls'] = 'nvls'
@@ -1810,12 +1814,7 @@ class TransformerConfig(ModelParallelConfig):
                     "gated_linear_unit=False, or select inference_grouped_gemm_backend='torch'."
                 )
 
-            if self.inference_flashinfer_token_capacity is not None:
-                if self.inference_flashinfer_token_capacity <= 0:
-                    raise ValueError(
-                        "inference_flashinfer_token_capacity must be > 0, got "
-                        f"{self.inference_flashinfer_token_capacity}"
-                    )
+            if self.inference_flashinfer_bounded_rows:
                 if (
                     self.inference_grouped_gemm_backend != InferenceGroupedGemmBackend.FLASHINFER
                     or not (
@@ -1826,7 +1825,7 @@ class TransformerConfig(ModelParallelConfig):
                     or self.expert_model_parallel_size <= 1
                 ):
                     raise ValueError(
-                        "inference_flashinfer_token_capacity requires "
+                        "inference_flashinfer_bounded_rows requires "
                         "inference_grouped_gemm_backend='flashinfer', BF16 parameters "
                         "with FP8 disabled or FP8 enabled with fp8_recipe='mxfp8', "
                         "inference_moe_token_dispatcher_type='nvls' and "

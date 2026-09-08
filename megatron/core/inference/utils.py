@@ -26,7 +26,7 @@ class InferenceMode:
     """
 
     _is_active: bool = False
-    _use_bounded_flashinfer_rows: bool = False
+    _flashinfer_token_capacity: int | None = None
 
     @classmethod
     def is_active(cls) -> bool:
@@ -37,23 +37,25 @@ class InferenceMode:
     def set_active(cls) -> None:
         """Mark the inference engine active and reset its phase to the safe default."""
         cls._is_active = True
-        cls._use_bounded_flashinfer_rows = False
+        cls._flashinfer_token_capacity = None
 
     @classmethod
-    def set_bounded_flashinfer_rows(cls, enabled: bool) -> None:
-        """Select bounded FlashInfer rows for the current inference step."""
-        cls._use_bounded_flashinfer_rows = enabled
+    def set_flashinfer_token_capacity(cls, token_capacity: int | None) -> None:
+        """Set the inferred FlashInfer row capacity for the current inference step."""
+        if token_capacity is not None and token_capacity <= 0:
+            raise ValueError(f"FlashInfer token capacity must be positive, got {token_capacity}")
+        cls._flashinfer_token_capacity = token_capacity
 
     @classmethod
-    def use_bounded_flashinfer_rows(cls) -> bool:
-        """Return whether the current step may use a configured bounded row prefix."""
-        return cls._use_bounded_flashinfer_rows
+    def flashinfer_token_capacity(cls) -> int | None:
+        """Return the inferred row capacity, or None when the full buffer is required."""
+        return cls._flashinfer_token_capacity
 
     @classmethod
     def unset_active(cls) -> None:
         """Mark the inference engine as inactive. Idempotent."""
         cls._is_active = False
-        cls._use_bounded_flashinfer_rows = False
+        cls._flashinfer_token_capacity = None
 
     @classmethod
     @contextlib.contextmanager

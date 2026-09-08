@@ -224,6 +224,11 @@ class InferenceStateHandoffMixin:
                     "do not configure prefix_caching_mamba_gb on the decode engine"
                 )
         self._kv_transfer_role = role
+        set_inference_role = getattr(self.context, "set_disaggregated_inference_role", None)
+        if set_inference_role is not None:
+            # FlashInfer row policy, in disaggregated mode, avoids an extra per-step EP agreement.
+            # Dedicated prefill always uses full rows.
+            set_inference_role(role)
         backend_cls = construct_kv_transfer_backend_class(backend)
 
         # Prefill output blocks stay pinned until the peer finishes reading

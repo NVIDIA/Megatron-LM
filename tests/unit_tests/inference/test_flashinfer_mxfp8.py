@@ -19,36 +19,159 @@ def reset_inference_mode():
     InferenceMode.unset_active()
 
 
-def test_inference_mode_tracks_bounded_flashinfer_rows():
+def test_inference_mode_tracks_flashinfer_token_capacity():
     InferenceMode.set_active()
-    assert not InferenceMode.use_bounded_flashinfer_rows()
+    assert InferenceMode.flashinfer_token_capacity() is None
 
-    InferenceMode.set_bounded_flashinfer_rows(True)
-    assert InferenceMode.use_bounded_flashinfer_rows()
+    InferenceMode.set_flashinfer_token_capacity(512)
+    assert InferenceMode.flashinfer_token_capacity() == 512
 
     InferenceMode.unset_active()
-    assert not InferenceMode.use_bounded_flashinfer_rows()
+    assert InferenceMode.flashinfer_token_capacity() is None
 
     InferenceMode.set_active()
-    assert not InferenceMode.use_bounded_flashinfer_rows()
+    assert InferenceMode.flashinfer_token_capacity() is None
+
+
+def test_inference_mode_rejects_nonpositive_flashinfer_token_capacity():
+    with pytest.raises(ValueError, match="must be positive"):
+        InferenceMode.set_flashinfer_token_capacity(0)
+
+
+def test_nvls_flashinfer_metadata_initializes_padding_routes_to_minus_one(monkeypatch):
+    from megatron.core.inference.moe import InferenceGroupedGemmBackend
+    from megatron.core.transformer.moe import token_dispatcher_inference as dispatcher_module
+
+    routing = torch.zeros(8, 2, dtype=torch.int64)
+    monkeypatch.setattr(
+        dispatcher_module.NVLSAllGatherVDispatcher, "_symm_agv_routing", {"tensor": routing}
+    )
+    monkeypatch.setattr(
+        dispatcher_module.NVLSAllGatherVDispatcher,
+        "_symm_metadata",
+        {"tensor": torch.empty(2, dtype=torch.int32), "handle": object()},
+    )
+    monkeypatch.setattr(
+        dispatcher_module.NVLSAllGatherVDispatcher,
+        "_step_metadata",
+        torch.zeros(3, dtype=torch.int32),
+    )
+    monkeypatch.setattr(dispatcher_module, "fused_metadata_update", lambda **kwargs: None)
+    dispatcher = SimpleNamespace(
+        config=SimpleNamespace(
+            inference_grouped_gemm_backend=InferenceGroupedGemmBackend.FLASHINFER
+        ),
+        ep_size=2,
+    )
+
+    dispatcher_module.NVLSAllGatherVDispatcher.update_metadata(dispatcher, local_tokens=4)
+
+    assert torch.equal(routing, torch.full_like(routing, -1))
+
+
+@pytest.mark.parametrize("bounded_rows_allowed", [False, True])
+def test_controller_infers_flashinfer_capacity_only_when_policy_allows(bounded_rows_allowed):
+    from megatron.core.inference.text_generation_controllers.text_generation_controller import (
+        TextGenerationController,
+    )
+
+    context = SimpleNamespace(
+        max_requests=128,
+        expert_model_parallel_size=4,
+        can_use_bounded_flashinfer_rows=lambda: bounded_rows_allowed,
+        config=SimpleNamespace(materialize_only_last_token_logits=True),
+        num_last_token_logits=1,
+        has_vlm_data=False,
+    )
+    logits = torch.empty(1, 1, 4)
+    controller = TextGenerationController.__new__(TextGenerationController)
+    controller.inference_wrapped_model = SimpleNamespace(
+        inference_context=context, run_one_forward_step=lambda inference_input: logits
+    )
+    controller.model_config = SimpleNamespace()
+    controller.num_speculative_tokens = 0
+    controller.model_is_pipeline_parallel = False
+    controller._enable_cuda_graph = False
+
+    controller._dynamic_step_forward_logits(
+        torch.zeros(1, 1, dtype=torch.int64), torch.zeros(1, 1, dtype=torch.int64)
+    )
+
+    assert InferenceMode.flashinfer_token_capacity() == (512 if bounded_rows_allowed else None)
 
 
 @pytest.mark.parametrize(
-    ("token_capacity", "use_bounded_rows", "expected"),
+    ("role", "prefill_req_count", "regular_ep_result", "expected", "expected_sync_calls"),
     [
-        (None, False, (65536, "full")),
-        (1024, False, (65536, "full")),
-        (1024, True, (1024, "bounded-decode")),
-        (131072, True, (65536, "bounded-decode")),
+        ("decode", 0, False, True, 0),
+        ("prefill", 0, True, False, 0),
+        (None, 0, True, True, 1),
+        (None, 1, False, False, 1),
+    ],
+    ids=[
+        "disaggregated-decode",
+        "disaggregated-prefill",
+        "regular-all-decode",
+        "regular-any-prefill",
     ],
 )
-def test_flashinfer_active_row_policy(token_capacity, use_bounded_rows, expected):
-    assert (
-        select_flashinfer_active_rows(
-            65536, token_capacity=token_capacity, use_bounded_rows=use_bounded_rows
-        )
-        == expected
+def test_flashinfer_row_policy_covers_disaggregated_and_regular_modes(
+    role, prefill_req_count, regular_ep_result, expected, expected_sync_calls
+):
+    from megatron.core.inference.batch_dimensions_utils import InferenceBatchDimensions
+    from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
+
+    sync_calls = []
+
+    def sync_all_ep_ranks_decode_only(batch_dimensions):
+        sync_calls.append(batch_dimensions)
+        return regular_ep_result
+
+    context = SimpleNamespace(
+        inference_flashinfer_bounded_rows=True,
+        is_creating_cuda_graphs=False,
+        _disaggregated_inference_role=role,
+        _sync_all_ep_ranks_decode_only=sync_all_ep_ranks_decode_only,
     )
+    batch_dimensions = InferenceBatchDimensions(
+        token_count=128,
+        prefill_req_count=prefill_req_count,
+        decode_req_count=128 if prefill_req_count == 0 else 0,
+    )
+
+    result = DynamicInferenceContext._resolve_bounded_flashinfer_rows(context, batch_dimensions)
+
+    assert result is expected
+    assert len(sync_calls) == expected_sync_calls
+
+
+def test_flashinfer_row_policy_rejects_prefill_on_disaggregated_decode():
+    from megatron.core.inference.batch_dimensions_utils import InferenceBatchDimensions
+    from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
+
+    context = SimpleNamespace(
+        inference_flashinfer_bounded_rows=True,
+        is_creating_cuda_graphs=False,
+        _disaggregated_inference_role="decode",
+    )
+    batch_dimensions = InferenceBatchDimensions(
+        token_count=128, prefill_req_count=1, decode_req_count=0
+    )
+
+    with pytest.raises(RuntimeError, match="decode engine cannot use a prefill-bearing batch"):
+        DynamicInferenceContext._resolve_bounded_flashinfer_rows(context, batch_dimensions)
+
+
+@pytest.mark.parametrize(
+    ("token_capacity", "expected"),
+    [
+        (None, (65536, "full")),
+        (1024, (1024, "bounded-decode")),
+        (131072, (65536, "bounded-decode")),
+    ],
+)
+def test_flashinfer_active_row_policy(token_capacity, expected):
+    assert select_flashinfer_active_rows(65536, token_capacity=token_capacity) == expected
 
 
 def _make_bounded_mxfp8_config(**overrides):
@@ -67,7 +190,7 @@ def _make_bounded_mxfp8_config(**overrides):
         expert_tensor_parallel_size=1,
         inference_grouped_gemm_backend="flashinfer",
         inference_moe_token_dispatcher_type="nvls",
-        inference_flashinfer_token_capacity=1024,
+        inference_flashinfer_bounded_rows=True,
         fp8="hybrid",
         fp8_recipe="mxfp8",
         fp8_param=True,
@@ -80,14 +203,14 @@ def _make_bounded_mxfp8_config(**overrides):
 def test_bounded_flashinfer_mxfp8_config_accepts_nvls_ep():
     config = _make_bounded_mxfp8_config()
 
-    assert config.inference_flashinfer_token_capacity == 1024
+    assert config.inference_flashinfer_bounded_rows
     assert config.inference_moe_token_dispatcher_type == "nvls"
     assert config.expert_model_parallel_size == 2
 
 
 def test_bf16_config_ignores_inactive_mxfp8_recipe_gates():
     config = _make_bounded_mxfp8_config(
-        fp8=None, fp8_param=False, activation_func=F.gelu, inference_flashinfer_token_capacity=None
+        fp8=None, fp8_param=False, activation_func=F.gelu, inference_flashinfer_bounded_rows=False
     )
 
     assert config.fp8 is None
@@ -110,7 +233,7 @@ def _make_bounded_bf16_config(**overrides):
         expert_tensor_parallel_size=1,
         inference_grouped_gemm_backend="flashinfer",
         inference_moe_token_dispatcher_type="nvls",
-        inference_flashinfer_token_capacity=1024,
+        inference_flashinfer_bounded_rows=True,
         fp8=None,
         fp8_param=False,
         activation_func=squared_relu,
@@ -122,13 +245,12 @@ def _make_bounded_bf16_config(**overrides):
 def test_bounded_flashinfer_bf16_config_accepts_nvls_ep():
     config = _make_bounded_bf16_config()
 
-    assert config.inference_flashinfer_token_capacity == 1024
+    assert config.inference_flashinfer_bounded_rows
 
 
 @pytest.mark.parametrize(
     ("overrides", "match"),
     [
-        ({"inference_flashinfer_token_capacity": 0}, "must be > 0"),
         ({"inference_grouped_gemm_backend": "vllm"}, "requires.*backend='flashinfer'"),
         (
             {"fp8": "hybrid", "fp8_recipe": "delayed", "fp8_param": True},
@@ -154,7 +276,7 @@ def test_flashinfer_mxfp8_config_rejects_unsupported_activation(activation_func)
     ("overrides", "match"),
     [
         (
-            {"inference_grouped_gemm_backend": "vllm", "inference_flashinfer_token_capacity": None},
+            {"inference_grouped_gemm_backend": "vllm", "inference_flashinfer_bounded_rows": False},
             "vLLM Triton fused MoE only supports BF16",
         ),
         ({"fp8_param": False}, "fp8_param must be enabled"),
@@ -236,11 +358,14 @@ def test_bf16_concatenated_weights_remain_refittable():
 def test_bf16_flashinfer_nvls_uses_dispatcher_copy_fallback(monkeypatch):
     from megatron.core.transformer.moe import experts
 
-    expected = torch.empty(4, 8, dtype=torch.bfloat16)
+    full_rows = 16
+    expected = torch.empty(full_rows, 8, dtype=torch.bfloat16)
     captured = {}
 
-    def cutlass_fused_moe(*args, **kwargs):
+    def cutlass_fused_moe(hidden_states, routing_map, probs, *args, **kwargs):
         captured["output"] = kwargs["output"]
+        captured["hidden_rows"] = hidden_states.shape[0]
+        captured["last_route"] = routing_map[-1].item()
         return (expected,)
 
     monkeypatch.setattr(experts, "HAVE_FLASHINFER", True)
@@ -253,20 +378,23 @@ def test_bf16_flashinfer_nvls_uses_dispatcher_copy_fallback(monkeypatch):
         _fc2_weight=torch.empty(2, 8, 8, dtype=torch.bfloat16),
         _flashinfer_activation_type=object(),
         _activation_clamp_scale=None,
-        _flashinfer_token_capacity=None,
         _nvls_dispatcher=True,
         ep_group=SimpleNamespace(size=lambda: 2, rank=lambda: 0),
     )
+    routing_map = torch.full((full_rows, 1), -1, dtype=torch.int64)
+    routing_map[-1] = 0
     output, bias = experts.InferenceGroupedMLP._flashinfer_forward(
         grouped_mlp,
-        torch.empty(4, 8, dtype=torch.bfloat16),
-        torch.zeros(4, 1, dtype=torch.int64),
-        torch.zeros(4, 1, dtype=torch.float32),
+        torch.empty(full_rows, 8, dtype=torch.bfloat16),
+        routing_map,
+        torch.zeros(full_rows, 1, dtype=torch.float32),
     )
 
     assert output is expected
     assert bias is None
     assert captured["output"] is None
+    assert captured["hidden_rows"] == full_rows
+    assert captured["last_route"] == 0
 
 
 def test_bounded_bf16_flashinfer_uses_active_prefix_and_full_rsv_output(monkeypatch):
@@ -299,12 +427,11 @@ def test_bounded_bf16_flashinfer_uses_active_prefix_and_full_rsv_output(monkeypa
         _fc2_weight=torch.empty(2, hidden_size, hidden_size, dtype=torch.bfloat16),
         _flashinfer_activation_type=object(),
         _activation_clamp_scale=None,
-        _flashinfer_token_capacity=active_rows,
         _nvls_dispatcher=True,
         ep_group=SimpleNamespace(size=lambda: 2, rank=lambda: 0),
     )
     InferenceMode.set_active()
-    InferenceMode.set_bounded_flashinfer_rows(True)
+    InferenceMode.set_flashinfer_token_capacity(active_rows)
 
     output, bias = experts.InferenceGroupedMLP._flashinfer_forward(
         grouped_mlp,

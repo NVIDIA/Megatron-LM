@@ -1193,7 +1193,6 @@ class InferenceGroupedMLP(TEGroupedMLP):
         self._activation_clamp_scale = config.activation_func_tanh_clamp_scale
         self.inference_grouped_gemm_backend = config.inference_grouped_gemm_backend
         self._nvls_dispatcher = config.inference_moe_token_dispatcher_type == 'nvls'
-        self._flashinfer_token_capacity = config.inference_flashinfer_token_capacity
 
     def _resolve_flashinfer_activation_type(self):
         """Map megatron activation config to FlashInfer ActivationType."""
@@ -1391,27 +1390,25 @@ class InferenceGroupedMLP(TEGroupedMLP):
                 local_expert_offset=self.ep_group.rank() * self.num_local_experts,
                 activation_type=self._flashinfer_activation_type.value,
                 out=(NVLSAllGatherVDispatcher._get_rsv_tensor() if self._nvls_dispatcher else None),
-                token_capacity=self._flashinfer_token_capacity,
-                use_bounded_rows=InferenceMode.use_bounded_flashinfer_rows(),
+                token_capacity=InferenceMode.flashinfer_token_capacity(),
             )
             return output, None
         full_rows = hidden_states.shape[0]
+        token_capacity = InferenceMode.flashinfer_token_capacity()
         active_rows, policy = select_flashinfer_active_rows(
-            full_rows,
-            token_capacity=self._flashinfer_token_capacity,
-            use_bounded_rows=InferenceMode.use_bounded_flashinfer_rows(),
+            full_rows, token_capacity=token_capacity
         )
-        if self._flashinfer_token_capacity is not None:
-            policy_key = (policy, self._flashinfer_token_capacity, full_rows)
+        if token_capacity is not None:
+            policy_key = (policy, token_capacity, full_rows)
             if policy_key not in _LOGGED_FLASHINFER_TOKEN_POLICIES:
                 _LOGGED_FLASHINFER_TOKEN_POLICIES.add(policy_key)
                 logger.info(
                     "FlashInfer BF16 token policy: %s active_rows=%d full_rows=%d "
-                    "configured_capacity=%d",
+                    "inferred_capacity=%d",
                     policy,
                     active_rows,
                     full_rows,
-                    self._flashinfer_token_capacity,
+                    token_capacity,
                 )
         output = fused_moe.cutlass_fused_moe(
             hidden_states[:active_rows],
