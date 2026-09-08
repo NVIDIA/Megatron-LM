@@ -361,11 +361,10 @@ class FsdpParameterGroup:
             # (FusedAdam empty-shard workaround) and carry no real gradient, so
             # their sharded.grad state does not affect the all-set/all-None
             # invariant for the params that actually participate in reduction.
-            try:
-                if fsdp_parameter.sharded.to_local().numel() == 0:
-                    continue
-            except Exception:
-                pass
+            # This is a defensive fallback - ``zero_grad`` clears these at the
+            # source too.
+            if _is_empty_local_shard(fsdp_parameter):
+                continue
             if fsdp_parameter.sharded.grad is None:
                 has_any_missing_grad = True
             else:
@@ -439,3 +438,18 @@ class FsdpParameterGroup:
             # sharded.grad is only read by the optimizer. However, for consistency and
             # debugging, keep sharded.grad valid even between microbatches.
             install_sharded_grads(self.main_grad)
+
+
+def _is_empty_local_shard(fsdp_parameter) -> bool:
+    """Return True if an FSDP parameter owns an empty local shard.
+
+    Empty local shards are filtered out of the optimizer param groups as a
+    FusedAdam workaround and carry no real gradient, so callers can treat their
+    gradient state as irrelevant. Shared by ``FullyShardedOptimizer.zero_grad``
+    (which clears them at the source) and ``FsdpParameterGroup._has_sharded_grads``
+    (which ignores them as a defensive safety net).
+    """
+    try:
+        return fsdp_parameter.sharded.to_local().numel() == 0
+    except Exception:
+        return False
