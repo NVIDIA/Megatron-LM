@@ -1160,7 +1160,7 @@ class TestDynamicMicrobatchSlots:
         helper._abort_capturing = lambda captured_graphs: helper._clear_thd_rotary_seq_lens()
         helper.flattened_callables = []
         helper.dp_cp_group = object()
-        helper.config = SimpleNamespace()
+        helper.config = SimpleNamespace(num_moe_experts=None)
         helper.chunks_with_decoder = []
         helper.callables_per_chunk = []
 

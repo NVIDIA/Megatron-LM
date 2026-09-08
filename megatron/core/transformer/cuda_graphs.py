@@ -3468,9 +3468,9 @@ class TECudaGraphHelper:
         """
         Capture CUDA Graphs per TransformerLayer per microbatch.
         """
-        validate_moe_cuda_graph_support(self.config)
         if self._capture_finished:
             raise RuntimeError("CUDA Graph capture has already been finished.")
+        validate_moe_cuda_graph_support(self.config)
 
         # A failed attempt clears capture-only RoPE limits so eager execution remains unchanged.
         # Restore the constructor-computed limits before every retry.
