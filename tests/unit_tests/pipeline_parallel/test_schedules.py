@@ -113,27 +113,32 @@ def _no_sync():
     yield
 
 
-def _patch_hybrid_cp_parallel_state(monkeypatch, *, is_first_tp_rank):
+class _FakeProcessGroup:
+    """Stand-in for a torch ProcessGroup exposing only rank() and size()."""
+
+    def __init__(self, rank, size):
+        self._rank = rank
+        self._size = size
+
+    def rank(self):
+        return self._rank
+
+    def size(self):
+        return self._size
+
+
+def _hybrid_cp_pg_collection(monkeypatch, *, is_first_tp_rank):
+    """Process groups for the hybrid CP scheduler: a TP group of size 2 and a single-rank
+    DP-CP group. The scheduler resolves the TP broadcast source through
+    torch.distributed.get_global_rank, which needs a real group, so map it to the group rank."""
     monkeypatch.setattr(
-        hybrid_cp_schedule.parallel_state,
-        "get_data_parallel_rank",
-        lambda with_context_parallel=False: 0,
+        hybrid_cp_schedule.torch.distributed,
+        "get_global_rank",
+        lambda group, group_rank: group_rank,
     )
-    monkeypatch.setattr(
-        hybrid_cp_schedule.parallel_state,
-        "get_tensor_model_parallel_rank",
-        lambda: 0 if is_first_tp_rank else 1,
-    )
-    monkeypatch.setattr(
-        hybrid_cp_schedule.parallel_state, "get_tensor_model_parallel_src_rank", lambda: 0
-    )
-    monkeypatch.setattr(
-        hybrid_cp_schedule.parallel_state, "get_tensor_model_parallel_group", lambda: "tp_group"
-    )
-    monkeypatch.setattr(
-        hybrid_cp_schedule.parallel_state,
-        "get_data_parallel_group",
-        lambda with_context_parallel=False: "dp_cp_group",
+    return SimpleNamespace(
+        tp=_FakeProcessGroup(rank=0 if is_first_tp_rank else 1, size=2),
+        dp_cp=_FakeProcessGroup(rank=0, size=1),
     )
 
 
@@ -153,7 +158,7 @@ def _patch_hybrid_cp_cpu_tensors(monkeypatch):
 
 def test_hybrid_context_parallel_forward_backward_passes_local_cp_size(monkeypatch):
     _patch_hybrid_cp_cpu_tensors(monkeypatch)
-    _patch_hybrid_cp_parallel_state(monkeypatch, is_first_tp_rank=True)
+    pg_collection = _hybrid_cp_pg_collection(monkeypatch, is_first_tp_rank=True)
 
     monkeypatch.setattr(
         hybrid_cp_schedule.torch.distributed, "broadcast", lambda *args, **kwargs: None
@@ -242,6 +247,7 @@ def test_hybrid_context_parallel_forward_backward_passes_local_cp_size(monkeypat
             total_num_tokens=0,
             check_first_val_step=lambda first_val_step, forward_only, is_first: is_first,
             model_type="unused",
+            pg_collection=pg_collection,
         )
     )
 
@@ -279,11 +285,11 @@ def test_hybrid_context_parallel_forward_backward_passes_local_cp_size(monkeypat
         ("input", 2.0, "grad"),
     ]
     assert all(call[3] is config for call in backward_calls)
-    assert "dp_cp_group" in barrier_groups
+    assert pg_collection.dp_cp in barrier_groups
 
 
 def test_hybrid_context_parallel_non_first_tp_rank_uses_broadcast_cp_size(monkeypatch):
-    _patch_hybrid_cp_parallel_state(monkeypatch, is_first_tp_rank=False)
+    pg_collection = _hybrid_cp_pg_collection(monkeypatch, is_first_tp_rank=False)
     monkeypatch.setattr(
         hybrid_cp_schedule.torch.cuda, "current_device", lambda: torch.device("cpu")
     )
@@ -339,6 +345,7 @@ def test_hybrid_context_parallel_non_first_tp_rank_uses_broadcast_cp_size(monkey
         total_num_tokens=0,
         check_first_val_step=lambda first_val_step, forward_only, is_first: is_first,
         model_type="unused",
+        pg_collection=pg_collection,
     )
 
     assert forward_calls == [(None, 7, 0)]
