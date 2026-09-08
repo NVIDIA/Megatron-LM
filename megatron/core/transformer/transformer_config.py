@@ -1329,9 +1329,6 @@ class TransformerConfig(ModelParallelConfig):
     BF16 or MXFP8 parameters, the NVLS inference dispatcher, and EP > 1.
     """
 
-    inference_flashinfer_mxfp8_token_capacity: int | None = None
-    """Deprecated alias for inference_flashinfer_token_capacity."""
-
     inference_moe_token_dispatcher_type: Literal['nccl', 'nvls'] = 'nvls'
     """Token dispatcher to use for MoE expert parallelism during inference.
     - 'nccl': AllGather/ReduceScatter via NCCL. Fixed token counts per rank; requires
@@ -1536,26 +1533,6 @@ class TransformerConfig(ModelParallelConfig):
         """
         super().__post_init__()
         self._validate_cp_layouts()
-
-        if self.inference_flashinfer_mxfp8_token_capacity is not None:
-            if (
-                self.inference_flashinfer_token_capacity is not None
-                and self.inference_flashinfer_token_capacity
-                != self.inference_flashinfer_mxfp8_token_capacity
-            ):
-                raise ValueError(
-                    "inference_flashinfer_token_capacity and its deprecated "
-                    "inference_flashinfer_mxfp8_token_capacity alias must match when both are set"
-                )
-            warnings.warn(
-                "inference_flashinfer_mxfp8_token_capacity is deprecated; use "
-                "inference_flashinfer_token_capacity instead.",
-                DeprecationWarning,
-                stacklevel=2,
-            )
-            self.inference_flashinfer_token_capacity = (
-                self.inference_flashinfer_mxfp8_token_capacity
-            )
 
         # Resolve deprecated attention variant spellings up front so that every consumer
         # downstream only has to handle the canonical names. Imported lazily because the

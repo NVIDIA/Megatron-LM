@@ -85,20 +85,6 @@ def test_bounded_flashinfer_mxfp8_config_accepts_nvls_ep():
     assert config.expert_model_parallel_size == 2
 
 
-def test_deprecated_mxfp8_capacity_alias_populates_shared_capacity():
-    with pytest.warns(DeprecationWarning, match="is deprecated"):
-        config = _make_bounded_mxfp8_config(
-            inference_flashinfer_token_capacity=None, inference_flashinfer_mxfp8_token_capacity=512
-        )
-
-    assert config.inference_flashinfer_token_capacity == 512
-
-
-def test_deprecated_mxfp8_capacity_alias_rejects_conflicting_value():
-    with pytest.raises(ValueError, match="must match"):
-        _make_bounded_mxfp8_config(inference_flashinfer_mxfp8_token_capacity=512)
-
-
 def test_bf16_config_ignores_inactive_mxfp8_recipe_gates():
     config = _make_bounded_mxfp8_config(
         fp8=None, fp8_param=False, activation_func=F.gelu, inference_flashinfer_token_capacity=None
