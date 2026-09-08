@@ -17,6 +17,7 @@ Low-level API reference for core Megatron components.
 transformer
 tensor_parallel
 pipeline_parallel
+process_groups
 fusions
 distributed
 datasets
