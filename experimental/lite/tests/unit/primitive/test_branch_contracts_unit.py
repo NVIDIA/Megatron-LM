@@ -300,12 +300,13 @@ def test_forward_aggregation_matches_pre_fusion_reference_gpu() -> None:
     torch.testing.assert_close(actual, expected, rtol=1e-4, atol=1e-4)
 
 
+_ROPE_KW = dict(config=None, use_yarn=False, device=torch.device("cpu"), dtype=torch.float32)
+
+
 def test_rope_table_is_shared_across_calls_and_grows_on_demand() -> None:
     """One table per parameter set, rebuilt only when a longer span is asked for."""
-    from megatron.lite.primitive.modules.attention.csa import _ROPE_TABLES, rope_table
-
     _ROPE_TABLES.clear()
-    kw = dict(config=None, use_yarn=False, device=torch.device("cpu"), dtype=torch.float32)
+    kw = _ROPE_KW
     first = rope_table(8, 4, 10000.0, **kw)
     assert rope_table(8, 4, 10000.0, **kw)[0] is first[0], "same span must reuse the table"
     assert rope_table(4, 4, 10000.0, **kw)[0] is first[0], "a shorter span must reuse it too"
@@ -321,12 +322,7 @@ def test_rope_table_rows_match_building_from_those_positions() -> None:
     axis: rows taken for the wrong positions must differ, or a table that
     ignored its index would satisfy the assertion above.
     """
-    from megatron.lite.primitive.modules.attention.csa import (
-        build_compressed_rope_cos_sin,
-        rope_table,
-    )
-
-    kw = dict(config=None, use_yarn=False, device=torch.device("cpu"), dtype=torch.float32)
+    kw = _ROPE_KW
     positions = torch.tensor([[0, 1, 2, 3]], dtype=torch.long)
     direct_cos, direct_sin = build_compressed_rope_cos_sin(positions, 4, 10000.0, **kw)
     cos, sin = rope_table(16, 4, 10000.0, **kw)

@@ -47,7 +47,6 @@ class _SingleRankGroup:
         return 1
 
 
-
 @jit_fuser
 def _per_head_rms(q: torch.Tensor, eps: float) -> torch.Tensor:
     """Weightless per-head RMS normalisation of the query."""
@@ -55,7 +54,6 @@ def _per_head_rms(q: torch.Tensor, eps: float) -> torch.Tensor:
     # reduce over it -- 77k Melem per step in the op census.
     inv = torch.rsqrt(q.pow(2).mean(dim=-1, keepdim=True, dtype=torch.float32) + eps)
     return q * inv.to(dtype=q.dtype)
-
 
 
 class GroupedLinear(nn.Module):
@@ -128,12 +126,9 @@ def build_yarn_rope_cos_sin(
 # but were rebuilt on every layer, every microbatch, and again under activation recompute.
 
 
-
-# Rotary tables depend only on the rope parameters and how far the positions
-# run, never on which tensor carries them. Core keys its cache on exactly those
-# scalars (``RotaryEmbedding.get_cached_cos_sin``) and lets callers index the
-# table; keying on a tensor's identity instead is what made the earlier cache
-# here unsound, since the caching allocator reuses addresses.
+# Keyed on the rope parameters alone, never on which tensor carries the
+# positions: the caching allocator reuses addresses, so tensor identity is not
+# a key. Callers index the table; Core does the same.
 _ROPE_TABLES: dict[Hashable, tuple[int, torch.Tensor, torch.Tensor]] = {}
 
 
@@ -149,21 +144,16 @@ def rope_table(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Cos/sin over ``[0, max_positions)``, grown on demand and shared.
 
-    Core's ``RotaryEmbedding.get_cached_cos_sin`` rebuilds only when the length
-    asked for exceeds what it holds, then slices; the same here. Building to
-    ``max_position_embeddings`` instead would be a 134 MB pair for a model that
-    declares a million positions and uses four thousand.
+    Mirrors Core's ``get_cached_cos_sin``: rebuild only when asked for a longer
+    span than is held. Sizing to ``max_position_embeddings`` would be a 134 MB
+    pair for a model declaring a million positions and using four thousand.
     """
     yarn = (
-        (
-            float(config.rotary_scaling_factor),
-            float(config.beta_fast),
-            float(config.beta_slow),
-            int(config.original_max_position_embeddings),
-        )
-        if use_yarn
-        else None
-    )
+        float(config.rotary_scaling_factor),
+        float(config.beta_fast),
+        float(config.beta_slow),
+        int(config.original_max_position_embeddings),
+    ) if use_yarn else None
     key = (int(rope_head_dim), float(rope_theta), bool(use_yarn), yarn, str(device), str(dtype))
     hit = _ROPE_TABLES.get(key)
     if hit is not None and hit[0] >= max_positions:
@@ -190,42 +180,8 @@ def rope_rows_for(
     global_start: int,
     length: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Select this rank's rows, for callers that cannot hand off ``cu_seqlens``."""
     rows = cp_utils._thd_cp_position_ids(cu_seqlens, global_start, length).long().view(-1)
     return cos[0].index_select(0, rows).unsqueeze(0), sin[0].index_select(0, rows).unsqueeze(0)
-
-
-def rope_tables_for_packed_batch(
-    packed_seq_params: Any,
-    cu_seqlens: torch.Tensor,
-    global_start: int,
-    length: int,
-    rope_head_dim: int,
-    rope_theta: float,
-    *,
-    config: Any,
-    use_yarn: bool,
-    device: torch.device,
-    dtype: torch.dtype,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """The shared table, for callers that hand ``cu_seqlens`` to the kernel.
-
-    Every layer derives the same within-sequence positions from the same
-    ``cu_seqlens`` and rank offset, so building per-layer tables rebuilt them
-    identically eight times over, and again under activation recompute. The
-    fused RoPE kernels take ``cu_seqlens`` and index the table themselves, so
-    they need no per-row form and no gather; ``rope_rows_for`` exists for the
-    one caller that does.
-    """
-    return rope_table(
-        int(packed_seq_params.max_seqlen_q),
-        rope_head_dim,
-        rope_theta,
-        config=config,
-        use_yarn=use_yarn,
-        device=device,
-        dtype=dtype,
-    )
 
 
 def build_compressed_rope_cos_sin(
@@ -881,11 +837,10 @@ class CompressedSparseAttention(nn.Module):
         # within-sequence positions), not the raw position_ids tensor, so the
         # mapping is identical to the unsharded reference at cp_size == 1.
         del position_ids
-        cos, sin = rope_tables_for_packed_batch(
-            packed_seq_params,
-            cu_seqlens,
-            global_start,
-            seq_len,
+        # Every layer derives the same positions from the same cu_seqlens and rank
+        # offset; the fused kernels index the shared table themselves.
+        cos, sin = rope_table(
+            int(packed_seq_params.max_seqlen_q),
             self.rope_head_dim,
             attention_rope_theta,
             config=self.config,
@@ -1035,12 +990,11 @@ class CompressedSparseAttention(nn.Module):
                 )
                 # ``apply_partial_rope`` below wants per-row tables, so this is
                 # the one caller that gathers rather than handing off cu_seqlens.
+                # apply_partial_rope below wants per-row tables, so this is the
+                # one caller that gathers rather than handing off cu_seqlens.
                 idx_cos, idx_sin = rope_rows_for(
-                    *rope_tables_for_packed_batch(
-                        packed_seq_params,
-                        cu_seqlens,
-                        global_start,
-                        l_local,
+                    *rope_table(
+                        int(packed_seq_params.max_seqlen_q),
                         indexer.rope_head_dim,
                         self.config.compress_rope_theta,
                         config=self.config,
