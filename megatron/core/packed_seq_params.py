@@ -7,6 +7,8 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch import Tensor
 
+from megatron.core.dynamic_cp_group import LogicalCPGroup
+
 if TYPE_CHECKING:
     from megatron.core.context_parallel_layout import ThdCpRoute
 
@@ -30,7 +32,7 @@ class PackedSeqParams:
     max_seqlen_q: int = None
     max_seqlen_kv: int = None
     local_cp_size: int = None
-    cp_group: dist.ProcessGroup = None
+    cp_group: Union[dist.ProcessGroup, LogicalCPGroup] = None
     total_tokens: int = None
     seq_idx: Tensor = None
     pad_between_seqs: Optional[bool] = None
@@ -54,7 +56,11 @@ class PackedSeqParams:
         cu_seqlens = (
             self.cu_seqlens_q_padded if self.cu_seqlens_q_padded is not None else self.cu_seqlens_q
         )
-        if isinstance(cu_seqlens, Tensor) and self.total_tokens is not None:
+        if (
+            self.seq_idx is None
+            and isinstance(cu_seqlens, Tensor)
+            and self.total_tokens is not None
+        ):
             total_tokens_tensor = torch.tensor(
                 [self.total_tokens], dtype=cu_seqlens.dtype, device=cu_seqlens.device
             )
@@ -414,7 +420,7 @@ def _resolve_thd_cp_geometry(
     Falling back to ``parallel_state`` preserves legacy call sites.
     """
     if cp_group is not None:
-        return int(dist.get_world_size(group=cp_group)), int(dist.get_rank(group=cp_group))
+        return int(cp_group.size()), int(cp_group.rank())
 
     if cp_size is not None:
         cp_size = int(cp_size)
@@ -425,7 +431,7 @@ def _resolve_thd_cp_geometry(
 
     if packed_seq_params.cp_group is not None:
         cp_group = packed_seq_params.cp_group
-        return int(dist.get_world_size(group=cp_group)), int(dist.get_rank(group=cp_group))
+        return int(cp_group.size()), int(cp_group.rank())
 
     if cp_size is None and packed_seq_params.local_cp_size is not None:
         cp_size = int(packed_seq_params.local_cp_size)
@@ -676,6 +682,7 @@ def pad_sequence_for_thd(
         ),
         local_cp_size=packed_seq_params.local_cp_size,
         cp_group=packed_seq_params.cp_group,
+        seq_idx=_pad_seq_tensor(packed_seq_params.seq_idx, local_target_len),
         cp_partition_mode=packed_seq_params.cp_partition_mode,
         total_tokens=local_target_len if target_cu_entries is None else None,
         pad_between_seqs=(

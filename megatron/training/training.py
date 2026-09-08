@@ -3651,6 +3651,7 @@ def training_log(
             mtp_num_layers=mtp_num_layers,
             pg_collection=pg_collection,
             total_loss_dict=total_loss_dict,
+            total_real_tokens=total_real_tokens_in_batch,
         )
 
     # Log MTP metrics.

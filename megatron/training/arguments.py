@@ -1595,6 +1595,20 @@ def validate_args(args, defaults={}):
             f"to {args.data_parallel_size * args.context_parallel_size}."
         )
 
+    if args.use_native_cp_transport:
+        if not args.dynamic_context_parallel:
+            raise ValueError('--use-native-cp-transport requires --dynamic-context-parallel.')
+        if args.distributed_backend != 'nccl':
+            raise ValueError('--use-native-cp-transport requires --distributed-backend=nccl.')
+        if args.transformer_impl != 'transformer_engine':
+            raise ValueError('--use-native-cp-transport requires Transformer Engine.')
+        if args.cp_comm_type != ['p2p']:
+            raise ValueError('--use-native-cp-transport requires --cp-comm-type=p2p.')
+        if args.max_seqlen_per_dp_cp_rank is None:
+            raise ValueError('--use-native-cp-transport requires --max-seqlen-per-dp-cp-rank.')
+        if args.fp8 is not None:
+            raise ValueError('--use-native-cp-transport does not support FP8 attention yet.')
+
     if getattr(args, 'pad_packed_seq_alignment', None) is not None:
         args.pad_packed_seq_alignment = _parse_pad_packed_seq_alignment(
             args.pad_packed_seq_alignment

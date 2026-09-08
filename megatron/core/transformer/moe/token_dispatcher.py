@@ -1,5 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import importlib
 import logging
 import os
 from abc import ABC, abstractmethod
@@ -18,21 +19,6 @@ from megatron.core.tensor_parallel import (
     reduce_scatter_to_sequence_parallel_region,
 )
 from megatron.core.transformer.enums import CudaGraphModule
-from megatron.core.transformer.moe.fused_a2a import (
-    HYBRIDEP_TOKEN_ALIGNMENT,
-    deepepv2_combine,
-    deepepv2_dispatch,
-    ensure_nccl_ep_bootstrapped,
-    fused_combine,
-    fused_dispatch,
-    get_elastic_buffer,
-    hybrid_ep_combine,
-    hybrid_ep_dispatch,
-    nccl_ep_combine,
-    nccl_ep_dispatch,
-    new_nccl_ep_buffer,
-    set_deepep_num_sms,
-)
 from megatron.core.transformer.moe.moe_utils import (
     ProcessGroupCollection,
     get_align_size_for_quantization,
@@ -47,6 +33,17 @@ from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 logger = logging.getLogger(__name__)
+
+_FUSED_A2A_MODULE = None
+
+
+def _get_fused_a2a_module():
+    """Load optional native MoE transports after distributed initialization."""
+    global _FUSED_A2A_MODULE
+    if _FUSED_A2A_MODULE is None:
+        _FUSED_A2A_MODULE = importlib.import_module("megatron.core.transformer.moe.fused_a2a")
+    return _FUSED_A2A_MODULE
+
 
 """ We use the following notation throughout this file:
      H: hidden size
@@ -1093,6 +1090,7 @@ class _HybridEPManager(_DispatchManager):
         self.num_local_experts = num_local_experts
         self.num_experts = num_experts
         self.config = config
+        self._fused_a2a = _get_fused_a2a_module()
         self.permute_fusion = config.moe_permute_fusion
         self.capacity_factor = config.moe_expert_capacity_factor
         # Drop and pad the input to capacity.
@@ -1111,7 +1109,7 @@ class _HybridEPManager(_DispatchManager):
         # Used for padding the output for each expert
         self.pad_multiple = None
 
-        if hybrid_ep_dispatch is None:
+        if self._fused_a2a.hybrid_ep_dispatch is None:
             raise ImportError(
                 "HybridEP is not installed. Please install HybridEP package from "
                 "https://github.com/deepseek-ai/DeepEP/tree/hybrid-ep."
@@ -1139,7 +1137,8 @@ class _HybridEPManager(_DispatchManager):
                 max_num_tokens_across_ep, op=torch.distributed.ReduceOp.MAX, group=self.group
             )
             padded_num_tokens = int(max_num_tokens_across_ep.item())
-            padded_num_tokens += -padded_num_tokens % HYBRIDEP_TOKEN_ALIGNMENT
+            token_alignment = self._fused_a2a.HYBRIDEP_TOKEN_ALIGNMENT
+            padded_num_tokens += -padded_num_tokens % token_alignment
         self._padded_num_tokens = padded_num_tokens
 
         routing_map = routing_map.reshape(num_tokens, self.num_experts)
@@ -1207,7 +1206,7 @@ class _HybridEPManager(_DispatchManager):
                 [hidden_states, hidden_states.new_zeros((pad_rows, hidden_states.shape[-1]))], dim=0
             )
         dispatched_hidden, self.dispatched_probs, _, tokens_per_expert, self.handle = (
-            hybrid_ep_dispatch(
+            self._fused_a2a.hybrid_ep_dispatch(
                 x=hidden_states,
                 routing_map=self.routing_map,
                 probs=self.token_probs,
@@ -1245,7 +1244,7 @@ class _HybridEPManager(_DispatchManager):
         async_finish: bool = True,
         allocate_on_comm_stream: bool = True,
     ) -> torch.Tensor:
-        hidden_states = hybrid_ep_combine(
+        hidden_states = self._fused_a2a.hybrid_ep_combine(
             x=hidden_states,
             handle=self.handle,
             num_permuted_tokens=self.num_permuted_tokens,
@@ -1326,6 +1325,7 @@ class _DeepepManager(_DispatchManager):
         self.group = group
         self.num_local_experts = num_local_experts
         self.config = config
+        self._fused_a2a = _get_fused_a2a_module()
 
         self.router_topk = router_topk
         self.num_experts = num_experts
@@ -1339,13 +1339,13 @@ class _DeepepManager(_DispatchManager):
         # Handle used for combine operation
         self.handle = None
 
-        if fused_dispatch is None:
+        if self._fused_a2a.fused_dispatch is None:
             raise ImportError(
                 "DeepEP is not installed. Please install DeepEP package from "
                 "https://github.com/deepseek-ai/deepep."
             )
         # None -> 20 (DeepEP's historical mcore default when moe_flex_dispatcher_num_sms is unset).
-        set_deepep_num_sms(
+        self._fused_a2a.set_deepep_num_sms(
             config.moe_flex_dispatcher_num_sms
             if config.moe_flex_dispatcher_num_sms is not None
             else 20
@@ -1377,7 +1377,7 @@ class _DeepepManager(_DispatchManager):
                 )
             self.token_probs = self.token_probs.float()  # downcast or upcast
         hidden_states, dispatched_indices, dispatched_probs, num_tokens_per_expert, handle = (
-            fused_dispatch(
+            self._fused_a2a.fused_dispatch(
                 hidden_states,
                 self.token_indices,
                 self.token_probs,
@@ -1436,7 +1436,7 @@ class _DeepepManager(_DispatchManager):
         async_finish: bool = False,
         allocate_on_comm_stream: bool = False,
     ) -> torch.Tensor:
-        hidden_states, _ = fused_combine(
+        hidden_states, _ = self._fused_a2a.fused_combine(
             hidden_states,
             self.group,
             self.handle,
@@ -1566,14 +1566,14 @@ class _DeepepV2Manager(_DeepepManager):
         self.handle = None
         self.buffer = None
 
-        if deepepv2_dispatch is None:
+        if self._fused_a2a.deepepv2_dispatch is None:
             raise ImportError(
                 "DeepEP v2 is not installed. Please install a DeepEP package that provides "
                 "ElasticBuffer."
             )
 
     def _get_buffer(self, hidden_states: torch.Tensor):
-        self.buffer = get_elastic_buffer(
+        self.buffer = self._fused_a2a.get_elastic_buffer(
             self.group,
             num_max_tokens_per_rank=hidden_states.shape[0],
             hidden=hidden_states.shape[1],
@@ -1596,7 +1596,7 @@ class _DeepepV2Manager(_DeepepManager):
             self.token_probs = self.token_probs.float()
         buffer = self._get_buffer(hidden_states)
         hidden_states, dispatched_indices, dispatched_probs, num_tokens_per_expert, handle = (
-            deepepv2_dispatch(
+            self._fused_a2a.deepepv2_dispatch(
                 buffer,
                 hidden_states,
                 self.token_indices,
@@ -1622,7 +1622,7 @@ class _DeepepV2Manager(_DeepepManager):
         async_finish: bool = False,
         allocate_on_comm_stream: bool = False,
     ) -> torch.Tensor:
-        hidden_states, _ = deepepv2_combine(
+        hidden_states, _ = self._fused_a2a.deepepv2_combine(
             self.buffer,
             hidden_states,
             self.handle,
@@ -1679,6 +1679,7 @@ class _NCCLEPManager(_DispatchManager):
         self.router_topk = router_topk
         self.num_experts = num_experts
         self.config = config
+        self._fused_a2a = _get_fused_a2a_module()
         # With MoE latent projections, the dispatcher operates on latent-dim tensors
         # (fc1_latent_proj runs before dispatch; see moe_layer.py), so the EP buffers must be
         # sized to the latent dim, not hidden_size.
@@ -1711,7 +1712,7 @@ class _NCCLEPManager(_DispatchManager):
                     "per-expert counts on device)."
                 )
 
-        if nccl_ep_dispatch is None:
+        if self._fused_a2a.nccl_ep_dispatch is None:
             raise ImportError(
                 "TransformerEngine NCCL EP is unavailable. The 'ncclep' backend requires a "
                 "TransformerEngine build with NCCL EP support (NVTE_BUILD_WITH_NCCL_EP=1)."
@@ -1764,7 +1765,7 @@ class _NCCLEPManager(_DispatchManager):
             budget += -budget % self.alignment
         self._recv_capacity = budget
 
-        ensure_nccl_ep_bootstrapped(
+        self._fused_a2a.ensure_nccl_ep_bootstrapped(
             self.group,
             num_experts=self.num_experts,
             max_tokens_per_rank=self._max_tokens_per_rank,
@@ -1789,7 +1790,7 @@ class _NCCLEPManager(_DispatchManager):
         # opaque ProcessGroup._get_backend()._comm_ptr() access that dynamo cannot trace.
         self._ensure_bootstrap()
         # Fresh buffer per dispatch; held until the matching combine consumes it.
-        self._buffer = new_nccl_ep_buffer(
+        self._buffer = self._fused_a2a.new_nccl_ep_buffer(
             top_k=self.router_topk,
             max_tokens_per_rank=self._max_tokens_per_rank,
             recv_capacity_per_rank=self._recv_capacity,
@@ -1804,7 +1805,7 @@ class _NCCLEPManager(_DispatchManager):
         # hidden_states: [num_local_tokens, H] -> recv_tokens: [recv_capacity_per_rank, H]
         #   tokens_per_expert: [num_local_experts]
         #   dispatched_probs: [recv_capacity_per_rank]
-        recv_tokens, tokens_per_expert, dispatched_probs = nccl_ep_dispatch(
+        recv_tokens, tokens_per_expert, dispatched_probs = self._fused_a2a.nccl_ep_dispatch(
             self._buffer, hidden_states, topk_idx, topk_weights
         )
         self.tokens_per_expert = tokens_per_expert.to(torch.int64)
@@ -1846,7 +1847,7 @@ class _NCCLEPManager(_DispatchManager):
         allocate_on_comm_stream: bool = True,
     ) -> torch.Tensor:
         # hidden_states: [recv_capacity_per_rank, H] -> [num_local_tokens, H]
-        hidden_states = nccl_ep_combine(
+        hidden_states = self._fused_a2a.nccl_ep_combine(
             self._buffer, hidden_states, num_local_tokens=self.num_local_tokens
         )
         # Drop the buffer; backward keeps handle_mem alive via save_for_backward.

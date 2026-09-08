@@ -1,11 +1,12 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
-from math import log2
+import math
 
 import pytest
 import torch
 
 import megatron.core.parallel_state as ps
+from megatron.core.dynamic_cp_group import LogicalCPGroup, build_bounded_peer_ring
 from megatron.core.process_groups_config import ProcessGroupCollection
 from tests.unit_tests.test_utilities import Utils
 
@@ -525,12 +526,74 @@ def test_dynamic_dp_cp_groups(world_size, tp_size, cp_size, dp_size):
     )
 
     dp_cp_size = ps.get_data_parallel_world_size(with_context_parallel=True)
-    group_sizes = [2**i for i in range(int(log2(dp_cp_size)))]
+    dp_cp_rank = ps.get_data_parallel_rank(with_context_parallel=True)
+    group_sizes = [2**i for i in range(int(math.log2(dp_cp_size)))]
     for group_size in group_sizes:
+        if dp_cp_rank >= dp_cp_size - dp_cp_size % group_size:
+            continue
         group = ps.get_dynamic_data_context_parallel_groups(group_size=group_size)
         assert group.size() == group_size
 
     Utils.destroy_model_parallel()
+
+
+@pytest.mark.parametrize(
+    ("group_start", "cp_size", "expected"),
+    [(0, 3, (0, 1, 2)), (0, 6, (0, 1, 3, 5, 4, 2)), (1, 5, (1, 3, 5, 4, 2))],
+)
+def test_bounded_dynamic_cp_ring(group_start, cp_size, expected):
+    assert build_bounded_peer_ring(range(16), group_start, cp_size) == expected
+
+
+def test_bounded_dynamic_cp_ring_peer_degree():
+    peers = [set() for _ in range(16)]
+    for cp_size in range(1, 17):
+        for group_start in range(0, 17 - cp_size):
+            ring = build_bounded_peer_ring(range(16), group_start, cp_size)
+            assert set(ring) == set(range(group_start, group_start + cp_size))
+            if cp_size == 1:
+                continue
+            for src, dst in zip(ring, ring[1:] + ring[:1]):
+                assert abs(src - dst) <= 2
+                peers[src].add(dst)
+                peers[dst].add(src)
+    assert max(map(len, peers)) == 4
+
+
+def test_native_dynamic_cp_groups_are_logical_and_include_parent(monkeypatch):
+    monkeypatch.setattr(
+        ps, "create_group", lambda *_args, **_kwargs: pytest.fail("created a ProcessGroup")
+    )
+
+    groups = ps.create_dynamic_dp_cp_groups(
+        rank=3, ranks=list(range(8)), pg_options=None, use_logical_groups=True
+    )
+
+    assert isinstance(groups[8], LogicalCPGroup)
+    assert groups[8].ranks == (0, 1, 3, 5, 7, 6, 4, 2)
+    assert groups[8].rank() == 2
+
+
+def test_legacy_dynamic_cp_groups_remain_power_of_two(monkeypatch):
+    monkeypatch.setattr(ps, "create_group", lambda ranks, **_kwargs: tuple(ranks))
+
+    groups = ps.create_dynamic_dp_cp_groups(
+        rank=0, ranks=list(range(8)), pg_options=None, use_logical_groups=False
+    )
+
+    assert groups == {1: (0,), 2: (0, 1), 4: (0, 1, 2, 3)}
+
+
+def test_native_dynamic_cp_group_can_start_at_noncanonical_tail(monkeypatch):
+    monkeypatch.setattr(ps, "_DYNAMIC_DP_CP_GROUPS", {})
+    monkeypatch.setattr(ps, "get_data_parallel_group", lambda **_kwargs: object())
+    monkeypatch.setattr(torch.distributed, "get_process_group_ranks", lambda _group: list(range(8)))
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 7)
+
+    group = ps.get_dynamic_data_context_parallel_groups(group_size=3, group_start=5)
+
+    assert group.ranks == (5, 7, 6)
+    assert group.rank() == 1
 
 
 def test_separate_all_gather_group():
