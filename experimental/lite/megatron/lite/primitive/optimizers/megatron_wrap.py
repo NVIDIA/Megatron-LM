@@ -76,9 +76,8 @@ def build_dist_opt_optimizer_config(
         "weight_decay": opt.weight_decay,
         "clip_grad": opt.clip_grad,
         "use_distributed_optimizer": True,
-        # Core requires this to carry the same value as the DDP config's, which
-        # the dist_opt stack sets; the optimizer needs to know the gather is
-        # already in flight so it does not issue its own.
+        # Core requires this to carry the same value as the DDP config's, which the dist_opt stack set
+        # s; the optimizer needs to know the gather is already in flight so it does not issue its own.
         "overlap_param_gather": True,
         "bf16": True,
         "params_dtype": torch.bfloat16,
