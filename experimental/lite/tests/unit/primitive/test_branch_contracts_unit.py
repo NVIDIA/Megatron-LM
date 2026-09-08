@@ -3,7 +3,19 @@
 
 from __future__ import annotations
 
-from megatron.lite.primitive.modules.attention.csa import _per_head_rms, apply_partial_rope
+import math
+
+import pytest
+import torch
+import torch.nn.functional as F
+
+from megatron.lite.primitive.modules.attention.csa import (
+    _ROPE_TABLES,
+    _per_head_rms,
+    apply_partial_rope,
+    build_compressed_rope_cos_sin,
+    rope_table,
+)
 from megatron.lite.primitive.modules.attention.hca import HyperConnection, split_sinkhorn
 from megatron.lite.primitive.modules.experts import swiglu_with_probs
 from megatron.lite.primitive.optimizers.megatron_wrap import _enable_wgrad_accumulation_fusion
@@ -11,10 +23,6 @@ from megatron.lite.primitive.parallel.linear import (
     AccumulatingLinear,
     _EmbeddingAccumulatingIntoMainGrad,
 )
-import math
-import pytest
-import torch
-import torch.nn.functional as F
 
 pytestmark = [pytest.mark.mlite]
 
@@ -306,26 +314,19 @@ _ROPE_KW = dict(config=None, use_yarn=False, device=torch.device("cpu"), dtype=t
 def test_rope_table_is_shared_across_calls_and_grows_on_demand() -> None:
     """One table per parameter set, rebuilt only when a longer span is asked for."""
     _ROPE_TABLES.clear()
-    kw = _ROPE_KW
-    first = rope_table(8, 4, 10000.0, **kw)
-    assert rope_table(8, 4, 10000.0, **kw)[0] is first[0], "same span must reuse the table"
-    assert rope_table(4, 4, 10000.0, **kw)[0] is first[0], "a shorter span must reuse it too"
-    grown = rope_table(64, 4, 10000.0, **kw)
+    first = rope_table(8, 4, 10000.0, **_ROPE_KW)
+    assert rope_table(8, 4, 10000.0, **_ROPE_KW)[0] is first[0], "same span must reuse"
+    assert rope_table(4, 4, 10000.0, **_ROPE_KW)[0] is first[0], "shorter span must reuse"
+    grown = rope_table(64, 4, 10000.0, **_ROPE_KW)
     assert grown[0] is not first[0], "a longer span must rebuild"
     assert len(_ROPE_TABLES) == 1, "growing must replace the entry, not add one"
 
 
 def test_rope_table_rows_match_building_from_those_positions() -> None:
-    """Gathering rows from the shared table equals building for those positions.
-
-    This is the property the shared table rests on. The control below fixes the
-    axis: rows taken for the wrong positions must differ, or a table that
-    ignored its index would satisfy the assertion above.
-    """
-    kw = _ROPE_KW
+    """Gathering rows from the shared table equals building for those positions."""
     positions = torch.tensor([[0, 1, 2, 3]], dtype=torch.long)
-    direct_cos, direct_sin = build_compressed_rope_cos_sin(positions, 4, 10000.0, **kw)
-    cos, sin = rope_table(16, 4, 10000.0, **kw)
+    direct_cos, direct_sin = build_compressed_rope_cos_sin(positions, 4, 10000.0, **_ROPE_KW)
+    cos, sin = rope_table(16, 4, 10000.0, **_ROPE_KW)
     rows = positions.view(-1)
     torch.testing.assert_close(cos[0].index_select(0, rows), direct_cos[0])
     torch.testing.assert_close(sin[0].index_select(0, rows), direct_sin[0])
