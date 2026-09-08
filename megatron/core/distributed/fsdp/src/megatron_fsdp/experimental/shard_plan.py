@@ -273,9 +273,6 @@ class OwnerGatherPlan:
         local_shards: Sequence[torch.Tensor],
         dp_size: int,
         this_rank: int,
-        *,
-        device: torch.device,
-        dtype: torch.dtype,
     ) -> Self:
         """Pack this rank's local shards into per-owner P2P send buffers.
 
@@ -285,9 +282,9 @@ class OwnerGatherPlan:
             local_shards: This rank's local shard per parameter.
             dp_size: DP group size.
             this_rank: This rank's DP index.
-            device: Device for the send buffers.
-            dtype: Dtype for the send buffers.
         """
+        device = local_shards[0].device
+        dtype = local_shards[0].dtype
         send_sizes: dict[int, int] = {owner: 0 for owner in range(dp_size) if owner != this_rank}
         recv_sizes: dict[int, int] = {sender: 0 for sender in range(dp_size) if sender != this_rank}
         for param_index, plan in enumerate(plans):

@@ -163,15 +163,7 @@ def test_pack_and_reconstruct_round_trip():
     per_rank_send = []
     per_rank_gather = []
     for r in range(dp_size):
-        gather = OwnerGatherPlan.pack(
-            plans,
-            owners,
-            per_rank_local[r],
-            dp_size,
-            r,
-            device=torch.device("cpu"),
-            dtype=torch.float32,
-        )
+        gather = OwnerGatherPlan.pack(plans, owners, per_rank_local[r], dp_size, r)
         per_rank_send.append(gather.send_buffers)
         per_rank_gather.append(gather)
 
