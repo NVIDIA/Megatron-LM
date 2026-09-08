@@ -1353,15 +1353,21 @@ class TransformerConfig(ModelParallelConfig):
     trailing partial block); every MTP depth reuses this immutable trunk source tuple and adds
     its own running partial. The paper finds ~8-10 sources recover most of the quality gain."""
 
-    attn_res_impl: str = "eager"
-    """Implementation of the AttnRes depth aggregation: 'eager' (a memory-lean custom autograd
-    Function built from plain PyTorch ops) or 'compile' (a plain PyTorch forward wrapped in
-    torch.compile, with AOTAutograd generating its backward and one specialization per depth
-    arity; falls back to the eager custom Function with a warning if compilation is unavailable),
-    or 'fla' (FLA's three-kernel fused training implementation with checkpoint_level=1; requires
-    flash-linear-attention). The eager loop is CPU-dispatch-bound — measured ~3-4 ms of CPU wall
-    per aggregation on GB200 at small hidden sizes — so 'fla' is recommended when the optional
-    dependency is installed, with 'compile' as the dependency-free optimized path."""
+    attn_res_impl: str = "fla"
+    """Implementation of the AttnRes depth aggregation.
+
+    Options:
+
+    - 'eager': a memory-lean custom autograd Function built from plain PyTorch ops.
+    - 'compile': a plain PyTorch forward wrapped in torch.compile, with AOTAutograd generating
+      its backward and one specialization per depth arity; falls back to the eager custom
+      Function with a warning if compilation is unavailable.
+    - 'fla': FLA's three-kernel fused training implementation with checkpoint_level=1; requires
+      flash-linear-attention.
+
+    The eager loop is CPU-dispatch-bound — measured ~3-4 ms of CPU wall per aggregation on GB200
+    at small hidden sizes — so 'fla' is the default, with 'compile' as the dependency-free
+    optimized path."""
 
     hybrid_layer_pattern: Optional[str] = None
     """Unified hybrid layer pattern string (mirrors --hybrid-layer-pattern; populated
