@@ -2365,6 +2365,48 @@ def _freeze_all_model_chunks(model_list):
     return model_list
 
 
+def _freeze_base_model_for_mtp(model_list):
+    """Freeze backbone parameters and router bias updates while keeping MTP trainable."""
+    frozen_params = 0
+    trainable_params = 0
+    frozen_router_biases = 0
+
+    for model_module in model_list:
+        for name, param in model_module.named_parameters():
+            is_mtp_parameter = 'mtp.layers.' in name
+            param.requires_grad_(is_mtp_parameter)
+            if is_mtp_parameter:
+                trainable_params += param.numel()
+            else:
+                frozen_params += param.numel()
+
+        for name, module in model_module.named_modules():
+            if hasattr(module, 'expert_bias'):
+                freeze_router_bias = 'mtp.layers.' not in name
+                module.frozen_expert_bias = freeze_router_bias
+                if freeze_router_bias:
+                    frozen_router_biases += 1
+
+    print_rank_0(
+        f'[freeze-base-model-for-mtp] Frozen {frozen_params:,} backbone parameters and '
+        f'{frozen_router_biases:,} backbone router expert-bias buffers. '
+        f'Trainable MTP parameters: {trainable_params:,}.'
+    )
+    return model_list
+
+
+def _add_model_freeze_pre_wrap_hook(model_config, *, freeze_all_layers, freeze_base_model_for_mtp):
+    """Install the requested freeze hook before a config-built model is wrapped."""
+    freeze_hook = None
+    if freeze_all_layers:
+        freeze_hook = _freeze_all_model_chunks
+    elif freeze_base_model_for_mtp:
+        freeze_hook = _freeze_base_model_for_mtp
+
+    if freeze_hook is not None and freeze_hook not in model_config.pre_wrap_hooks:
+        model_config.pre_wrap_hooks.append(freeze_hook)
+
+
 def _forward_backward_grad_context(args):
     """Grad context for a train step's forward/backward pass.
 
@@ -2453,6 +2495,8 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
     # For rare operations like post-training logits saving
     if args.freeze_all_layers:
         _freeze_all_model_chunks(model)
+    elif args.freeze_base_model_for_mtp:
+        _freeze_base_model_for_mtp(model)
 
     # Set tensor model parallel attributes if not set.
     # Only parameters that are already tensor model parallel have these
@@ -2720,10 +2764,13 @@ def setup_model_and_optimizer(
             builder_cls = model_config.get_builder_cls()
             builder = builder_cls(model_config)
 
-            # Inject freeze_all_layers as a pre-wrap hook so DDP sees requires_grad=False
-            # and skips grad-buffer allocation for all params (matching get_model behavior).
-            if args.freeze_all_layers:
-                model_config.pre_wrap_hooks.append(_freeze_all_model_chunks)
+            # Inject selective/all-layer freezing before wrapping so DDP/FSDP only allocates
+            # gradient storage for parameters that remain trainable (matching get_model behavior).
+            _add_model_freeze_pre_wrap_hook(
+                model_config,
+                freeze_all_layers=args.freeze_all_layers,
+                freeze_base_model_for_mtp=args.freeze_base_model_for_mtp,
+            )
 
             return builder.build_distributed_models(
                 pg_collection=pg_collection,
@@ -3310,6 +3357,31 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     return {}, skipped_iter, should_checkpoint, should_exit, exit_code, grad_norm, num_zeros_in_grad, log_max_attention_logit
 
 
+def _get_indexer_logging_layer_counts(args) -> tuple[int, int | None]:
+    """Return tracker slots and active CSA indexer modules for loss logging."""
+    tracker_layers = args.num_layers + (args.mtp_num_layers or 0)
+    if args.csa_compress_ratios is None:
+        return tracker_layers, None
+
+    ratios = args.csa_compress_ratios
+    if is_hybrid_model(args):
+        from megatron.core.models.hybrid.hybrid_layer_allocation import parse_hybrid_pattern
+
+        parsed_pattern = parse_hybrid_pattern(args.hybrid_layer_pattern)
+        mtp_pattern_layers = len(parsed_pattern.mtp_pattern or "")
+        tracker_layers = args.num_layers + mtp_pattern_layers
+        main_indexers = sum(ratio == 4 for ratio in ratios[: args.num_layers])
+        mtp_indexers_per_depth = sum(
+            ratio == 4 for ratio in ratios[args.num_layers : tracker_layers]
+        )
+        mtp_indexer_repeats = 1 if args.mtp_use_repeated_layer else parsed_pattern.mtp_num_depths
+        indexer_layers = main_indexers + (mtp_indexers_per_depth * mtp_indexer_repeats)
+    else:
+        indexer_layers = sum(ratio == 4 for ratio in ratios[:tracker_layers])
+
+    return tracker_layers, 0 if args.csa_dense_mode else indexer_layers
+
+
 def training_log(
     loss_dict,
     total_loss_dict,
@@ -3577,12 +3649,31 @@ def training_log(
     # Track sparse attention indexer loss.
     if args.dsa_indexer_loss_coeff is not None and args.dsa_indexer_loss_coeff > 0:
         indexer_loss_scale = 1 / get_num_microbatches()
+        if isinstance(pg_collection, MultiModuleProcessGroupCollection):
+            assert pg_collection.has_language_model(), (
+                "DSA indexer logging requires a language-model ProcessGroupCollection"
+            )
+            pg_collection = pg_collection.get_language_model_collection()
+        if pg_collection is None:
+            # Compatibility path for legacy training entrypoints such as tasks/finetune_utils.py.
+            # The core logger still receives explicit groups and does not read MPU globals.
+            pg_collection = ProcessGroupCollection.use_mpu_process_groups(
+                required_pgs=['pp', 'dp']
+            )
+        assert isinstance(
+            pg_collection, ProcessGroupCollection
+        ), "DSA indexer logging requires a ProcessGroupCollection"
+        indexer_tracker_layers, indexer_layer_count = _get_indexer_logging_layer_counts(args)
         DSAIndexerLossLoggingHelper.track_indexer_metrics(
             loss_scale=indexer_loss_scale,
             iteration=iteration,
             writer=writer,
+            pg_collection=pg_collection,
             wandb_writer=wandb_writer,
             total_loss_dict=total_loss_dict,
+            num_layers=indexer_tracker_layers,
+            num_indexer_layers=indexer_layer_count,
+            preserve_groups=args.cuda_graph_impl != "none",
         )
 
     # Dump memory snapshot and print metrics to stdout.

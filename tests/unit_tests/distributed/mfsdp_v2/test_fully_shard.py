@@ -7,6 +7,7 @@ import logging
 import pytest
 import torch
 import torch.distributed as dist
+import transformer_engine.pytorch as te
 from torch import nn
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import DTensor, Partial, Replicate, Shard
@@ -246,6 +247,62 @@ def test_fully_shard_sgd_losses_match_baseline(
         torch.stack(baseline_losses),
         msg="Sharded losses did not match baseline losses.",
     )
+
+
+def test_fully_shard_waits_for_delayed_te_weight_gradient(distributed_setup):
+    """TE's callback, not AccumulateGrad, completes MFSDP backward."""
+    world_size = distributed_setup.world_size
+    device = distributed_setup.device
+
+    mesh = init_device_mesh(device.type, (world_size,))
+    model = te.Linear(
+        16,
+        16,
+        bias=False,
+        params_dtype=torch.bfloat16,
+        device=device,
+        delay_wgrad_compute=True,
+        fuse_wgrad_accumulation=False,
+    )
+    with fully_shard_context(device=device):
+        fully_shard(model, mesh=mesh, placements=_flat_placements())
+
+    x = torch.randn(4, 16, device=device, dtype=torch.bfloat16, requires_grad=True)
+    model(x).float().square().mean().backward()
+    assert model.weight.grad is None
+    assert model.phase is FsdpModule.Phase.BACKWARD
+
+    model.backward_dw()
+
+    assert model.weight.grad is not None
+    assert model.phase is FsdpModule.Phase.RESTING
+
+
+def test_fully_shard_rejects_tied_delayed_weight_gradients(distributed_setup):
+    """Tied delayed weights are unsupported until TE accumulates their gradients."""
+    device = distributed_setup.device
+    model = nn.Sequential(
+        *(
+            te.Linear(
+                16,
+                16,
+                bias=False,
+                params_dtype=torch.bfloat16,
+                device=device,
+                delay_wgrad_compute=True,
+                fuse_wgrad_accumulation=False,
+            )
+            for _ in range(2)
+        )
+    )
+    model[1].weight = model[0].weight
+
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    with (
+        fully_shard_context(device=device),
+        pytest.raises(ValueError, match="Transformer Engine does not accumulate their gradients"),
+    ):
+        fully_shard(model, mesh=mesh, placements=_flat_placements())
 
 
 @pytest.mark.parametrize("use_reentrant", [False, True], ids=["non_reentrant", "reentrant"])

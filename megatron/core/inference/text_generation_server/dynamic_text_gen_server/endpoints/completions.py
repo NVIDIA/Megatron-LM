@@ -9,24 +9,15 @@ from megatron.core.inference.inference_request import unwrap_serialized_tensors
 from megatron.core.inference.sampling_params import SamplingParams
 
 from ..incremental_detokenizer import HuggingFaceFastIncrementalDetokenizer
-from ..openai_streaming import openai_stream
+from ..openai_streaming import (
+    detokenize_top_n_keys,
+    json_safe_logprobs,
+    json_safe_top_n_logprobs,
+    openai_stream,
+)
 from .common import abort_requests
 
 logger = logging.getLogger(__name__)
-
-
-def _detokenize_top_n_keys(top_n_logprobs, tokenizer):
-    """Re-key id-keyed top-n logprob dicts by detokenized string for the OpenAI wire format.
-
-    The engine keys these by token id so that byte-fallback tokens don't collide.
-    This endpoint's response schema is string-keyed, so convert back at the edge.
-    Distinct ids that detokenize to the same string (byte fallbacks) still collide
-    here; use /raw_completions when exact token identity matters.
-    """
-    return [
-        {tokenizer.detokenize([int(token_id)]): logprob for token_id, logprob in entry.items()}
-        for entry in top_n_logprobs
-    ]
 
 
 try:
@@ -319,21 +310,22 @@ try:
             if num_tokens_requested is None or len(generated_tokens) < num_tokens_requested:
                 finish_reason = "stop"
 
+            # Clamped: processed logprobs can be -inf, which JSON cannot carry.
+            generated_log_probs = json_safe_logprobs(result.get('generated_log_probs') or [])
+
             logprobs_data = None
             if sampling_params.return_log_probs:
-                # Get prompt tokens and logprobs
                 prompt_tokens_list = result["prompt_tokens"] or []
 
-                prompt_log_probs = result.get('prompt_log_probs') or []
-                prompt_top_n_logprobs = _detokenize_top_n_keys(
-                    result.get('prompt_top_n_logprobs') or [], tokenizer
+                prompt_log_probs = json_safe_logprobs(result.get('prompt_log_probs') or [])
+                prompt_top_n_logprobs = json_safe_top_n_logprobs(
+                    detokenize_top_n_keys(result.get('prompt_top_n_logprobs') or [], tokenizer)
                 )
 
                 # Get generated tokens and logprobs
                 generated_tokens_list = result["generated_tokens"] or []
-                generated_log_probs = result.get('generated_log_probs') or []
-                generated_top_n_logprobs = _detokenize_top_n_keys(
-                    result.get('generated_top_n_logprobs') or [], tokenizer
+                generated_top_n_logprobs = json_safe_top_n_logprobs(
+                    detokenize_top_n_keys(result.get('generated_top_n_logprobs') or [], tokenizer)
                 )
 
                 if echo:
@@ -393,7 +385,7 @@ try:
                 "finish_reason": finish_reason,
                 "prompt_token_ids": result["prompt_tokens"],
                 "generation_token_ids": result["generated_tokens"],
-                "generation_log_probs": result.get("generated_log_probs", []),
+                "generation_log_probs": generated_log_probs,
             }
 
             if result["routing_indices"] is not None:
