@@ -2637,6 +2637,29 @@ def destroy_model_parallel() -> None:
         except Exception:
             pass
 
+    # DTensor memoizes the OutputSharding of every op for the life of the process, keyed by
+    # the op's DTensorSpecs. A DTensorSpec hashes its DeviceMesh by rank layout, device type
+    # and dim names, not by process-group identity, so a mesh built over the next lifetime's
+    # groups is a memo hit that hands back a spec whose mesh still names this lifetime's
+    # groups; every DTensor produced through that hit (param.detach() in Module.state_dict(),
+    # for one) then resolves its groups to communicators destroyed below. Drop the memo while
+    # the groups are still alive: the Python LRU, and the native cache of the C++ dispatch fast
+    # path (pytorch#167051) that sits in front of it on newer torch. Only touch DTensor if
+    # something already imported it.
+    dtensor_module = sys.modules.get("torch.distributed.tensor")
+    if dtensor_module is not None:
+        try:
+            sharding_propagator = dtensor_module.DTensor._op_dispatcher.sharding_propagator
+            sharding_propagator.propagate_op_sharding.cache_clear()
+        except Exception:
+            pass
+        clear_native_cache = getattr(torch._C, "_clear_DTensor_sharding_propagator_cache", None)
+        if clear_native_cache is not None:
+            try:
+                clear_native_cache()
+            except Exception:
+                pass
+
     global _MODEL_PARALLEL_GROUP
     _MODEL_PARALLEL_GROUP = None
 
