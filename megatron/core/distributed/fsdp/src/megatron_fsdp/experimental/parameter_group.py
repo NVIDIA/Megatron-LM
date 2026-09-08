@@ -396,6 +396,15 @@ class FsdpParameterGroup:
         has_any_grad = False
         has_any_missing_grad = False
         for fsdp_parameter in self.fsdp_parameters:
+            # Empty local shards are filtered out of the optimizer param groups
+            # (FusedAdam empty-shard workaround) and carry no real gradient, so
+            # their sharded.grad state does not affect the all-set/all-None
+            # invariant for the params that actually participate in reduction.
+            try:
+                if fsdp_parameter.sharded.to_local().numel() == 0:
+                    continue
+            except Exception:
+                pass
             if fsdp_parameter.sharded.grad is None:
                 has_any_missing_grad = True
             else:
