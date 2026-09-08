@@ -101,6 +101,20 @@ class TestInferenceConfig:
         with pytest.raises(ValueError):
             InferenceConfig(async_sched_mode=invalid_mode)
 
+    def test_routing_alpha_accepts_values_above_one(self):
+        """Alpha is a load coefficient, not a blend weight, so 1 is not a ceiling.
+
+        The routing tests reach the scorer through a hand-built coordinator, so
+        they never exercise this validation; a value they rely on would have been
+        rejected on the real config path.
+        """
+        assert InferenceConfig(prefix_caching_routing_alpha=5.0).prefix_caching_routing_alpha == 5.0
+
+    def test_routing_alpha_must_be_non_negative(self):
+        """A negative alpha would reward load instead of penalising it."""
+        with pytest.raises(ValueError, match="prefix_caching_routing_alpha"):
+            InferenceConfig(prefix_caching_routing_alpha=-0.1)
+
     def test_media_cache_routing_weight_must_be_non_negative(self):
         with pytest.raises(ValueError, match="media_cache_routing_weight"):
             InferenceConfig(media_cache_routing_weight=-1.0)

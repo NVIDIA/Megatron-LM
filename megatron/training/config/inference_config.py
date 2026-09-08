@@ -179,24 +179,30 @@ class InferenceSetupConfig:
     """Enable/disable prefix caching for dynamic batching inference. When disabled, KV cache blocks
     cannot be shared between requests with identical prompt prefixes."""
 
-    inference_dynamic_batching_prefix_caching_eviction_policy: Literal["ref_zero", "lru"] = "ref_zero"
-    """Eviction policy for prefix caching blocks. "ref_zero" (default) immediately returns blocks to
+    inference_dynamic_batching_prefix_caching_eviction_policy: Literal["ref_zero", "lru"] = "lru"
+    """Eviction policy for prefix caching blocks. "ref_zero" immediately returns blocks to
     the free pool when ref_count hits 0. "lru" keeps blocks cached and evicts via LRU only when
     space is needed."""
 
     inference_dynamic_batching_prefix_caching_coordinator_policy: Literal[
         "longest_prefix", "first_prefix_block", "load_balanced"
-    ] = "load_balanced"
-    """Coordinator routing policy for prefix caching. "load_balanced" (default) routes to the rank
+    ] = "longest_prefix"
+    """Coordinator routing policy for prefix caching. "load_balanced" routes to the rank
     with the fewest in-flight requests, ignoring prefix affinity. "first_prefix_block" routes based
-    on the first block hash only. "longest_prefix" routes to the rank with the longest matching
+    on the first block hash only. "longest_prefix" (the default) routes to the rank with the longest matching
     prefix. "first_prefix_block" and "longest_prefix" both combine prefix affinity with load
     balancing and fall back to load-balanced routing when prefix caching is disabled or no prefix
     match exists."""
 
-    inference_dynamic_batching_prefix_caching_routing_alpha: float = 0.5
-    """Weight for prefix-aware routing score: score = alpha * match + (1 - alpha) * normalized_load.
-    Higher alpha favors prefix cache hits; lower alpha favors load balance."""
+    inference_dynamic_batching_prefix_caching_routing_alpha: float = 1.0
+    """How hard to penalise load when routing on prefix affinity:
+    score = cache_score - alpha * relative_load, where relative_load is a rank's in-flight count
+    measured against the fleet mean. 0 is pure prefix affinity; higher values divert to idle ranks
+    more readily as the fleet becomes lopsided. Dimensionless and not capped at 1."""
+
+    inference_dynamic_batching_prefix_cache_ttl_seconds: float = 300.0
+    """How long the coordinator assumes an engine still holds a block it routed there. It never
+    observes evictions, so entries untouched for this long are dropped rather than kept forever."""
 
     inference_dynamic_batching_media_cache_coordinator_policy: Literal[
         "affinity", "load_balanced"
@@ -386,6 +392,7 @@ class InferenceSetupConfig:
                 self.inference_dynamic_batching_prefix_caching_coordinator_policy
             ),
             prefix_caching_routing_alpha=self.inference_dynamic_batching_prefix_caching_routing_alpha,
+            prefix_cache_ttl_seconds=self.inference_dynamic_batching_prefix_cache_ttl_seconds,
             media_cache_coordinator_policy=MediaCacheCoordinatorPolicy(
                 self.inference_dynamic_batching_media_cache_coordinator_policy
             ),

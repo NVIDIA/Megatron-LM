@@ -13,18 +13,28 @@ from tests.functional_tests.python_test_utils.common import (
     NotApproximateError,
     NotDeterminsticError,
     TypeOfTestResult,
+    ValuePrecision,
     _filter_checks,
     pipeline,
+    read_golden_values_from_json,
     read_tb_logs_as_list,
 )
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 
 
-def make_metric(values: dict, step_interval: int = 1) -> GoldenValueMetric:
+def make_metric(
+    values: dict,
+    step_interval: int = 1,
+    value_precision: ValuePrecision = ValuePrecision.ROUNDED_5_DECIMAL_PLACES,
+) -> GoldenValueMetric:
     steps = sorted(values)
     return GoldenValueMetric(
-        start_step=steps[0], end_step=steps[-1], step_interval=step_interval, values=values
+        start_step=steps[0],
+        end_step=steps[-1],
+        step_interval=step_interval,
+        value_precision=value_precision,
+        values=values,
     )
 
 
@@ -73,6 +83,17 @@ def test_read_tb_logs_keeps_only_observed_samples(monkeypatch, tmp_path):
     assert result["lm loss"].values == {1: 1.4, 5: 1.3, 10: 1.2, 15: 1.1, 20: 1.0}
 
 
+def test_read_tb_logs_preserves_full_precision(monkeypatch, tmp_path):
+    (tmp_path / "events.out.tfevents.test").touch()
+    accumulator = FakeEventAccumulator({"lm loss": [(1, 1.23456789)]})
+    monkeypatch.setattr(common, "_load_event_accumulators_with_scalars", lambda _: [accumulator])
+
+    result = read_tb_logs_as_list(str(tmp_path), train_iters=1, start_idx=1, step_size=5)
+
+    assert result["lm loss"].value_precision == ValuePrecision.FULL
+    assert result["lm loss"].values == {1: 1.23456789}
+
+
 def test_read_tb_logs_skips_metric_without_sampled_values(monkeypatch, tmp_path):
     (tmp_path / "events.out.tfevents.test").touch()
     accumulator = FakeEventAccumulator({"iteration-time": [(2, 0.25), (3, 0.26)]})
@@ -89,6 +110,17 @@ def test_read_tb_logs_rejects_nonpositive_step_size():
 
 
 # ── ApproximateTest ───────────────────────────────────────────────────────────
+
+
+def test_read_golden_values_defaults_to_legacy_precision(tmp_path):
+    golden_path = tmp_path / "golden_values.json"
+    golden_path.write_text(
+        '{"loss": {"start_step": 1, "end_step": 1, "step_interval": 1, "values": {"1": 1.0}}}'
+    )
+
+    result = read_golden_values_from_json(golden_path)
+
+    assert result["loss"].value_precision == ValuePrecision.ROUNDED_5_DECIMAL_PLACES
 
 
 class TestApproximateTest:
@@ -154,6 +186,19 @@ class TestPipelineDeterministic:
         with pytest.raises(AssertionError, match="loss"):
             run({"loss": golden}, {"loss": actual}, {"loss": [DeterministicTest()]})
 
+    def test_legacy_golden_rounds_actual_to_five_decimal_places(self):
+        golden = make_metric({1: 1.23457})
+        actual = make_metric({1: 1.23456789}, value_precision=ValuePrecision.FULL)
+
+        run({"loss": golden}, {"loss": actual}, {"loss": [DeterministicTest()]})
+
+    def test_full_precision_golden_detects_sub_five_decimal_mismatch(self):
+        golden = make_metric({1: 1.23456781}, value_precision=ValuePrecision.FULL)
+        actual = make_metric({1: 1.23456789}, value_precision=ValuePrecision.FULL)
+
+        with pytest.raises(AssertionError, match="loss"):
+            run({"loss": golden}, {"loss": actual}, {"loss": [DeterministicTest()]})
+
     def test_skipped_in_compare_approximate_mode(self):
         # Deterministic checks must be silently skipped when
         # compare_approximate_results=True, even if values differ wildly.
@@ -175,6 +220,12 @@ class TestPipelineApproximate:
         golden = make_metric({1: 1.0, 2: 2.0})
         actual = make_metric({1: 1.04, 2: 2.04})  # 4 % < 5 % rtol
         run({"loss": golden}, {"loss": actual}, {"loss": [ApproximateTest(rtol=0.05)]})
+
+    def test_rounds_full_precision_values_to_five_decimal_places(self):
+        golden = make_metric({1: 1.234571}, value_precision=ValuePrecision.FULL)
+        actual = make_metric({1: 1.234574}, value_precision=ValuePrecision.FULL)
+
+        run({"loss": golden}, {"loss": actual}, {"loss": [ApproximateTest(rtol=0, atol=0)]})
 
     def test_outside_rtol_fails(self):
         golden = make_metric({1: 1.0, 2: 2.0})

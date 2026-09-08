@@ -116,6 +116,9 @@ dev = [
     "orjson",
     "fast-hadamard-transform",
     "zstandard",
+]
+
+inference = [
     "torch-memory-saver",
 ]
 

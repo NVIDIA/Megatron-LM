@@ -605,16 +605,22 @@ if HAVE_TE and is_te_min_version("1.13.0"):
                     layer_type = te.pytorch.ops.SwiGLU
                 elif config.activation_func == F.gelu:
                     layer_type = te.pytorch.ops.GEGLU
-                elif config.activation_func == F.silu:
+                elif config.activation_func == F.relu:
                     layer_type = te.pytorch.ops.ReGLU
             else:
                 if config.activation_func == F.gelu:
                     layer_type = te.pytorch.ops.GELU
-                elif config.activation_func == F.silu:
+                elif config.activation_func == F.relu:
                     layer_type = te.pytorch.ops.ReLU
+                elif config.activation_func == F.silu:
+                    if not is_te_min_version("2.8.0"):
+                        raise NotImplementedError(
+                            "SiLU activation requires Transformer Engine 2.8+"
+                        )
+                    layer_type = te.pytorch.ops.SiLU
             if layer_type is None:
                 raise Exception(
-                    'Only SwiGLU, GEGLU, ReGLU, GELU, ReLU are supported by '
+                    'Only SwiGLU, GEGLU, ReGLU, GELU, ReLU, SiLU are supported by '
                     'transformer engine. Please set use_te_activation_func=False'
                 )
             activation_func_kwargs = {}
@@ -2284,11 +2290,18 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         attention_bias: Optional[Tensor] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
         num_splits: Optional[int] = None,
+        bf16_backward: Optional[bool] = None,
     ) -> torch.Tensor:
         """Forward."""
         if packed_seq_params is not None:
             # If Dynamic CP group is provided, update TE DPA CP group
             if packed_seq_params.cp_group is not None:
+                # Hybrid/dynamic CP can enable CP at runtime on a model built
+                # with context_parallel_size == 1, where the constructor never
+                # allocated the auxiliary CP stream. Create it lazily; TE's
+                # AttnFuncWithCPAndKVP2P dereferences it unconditionally.
+                if TEDotProductAttention.cp_stream is None:
+                    TEDotProductAttention.cp_stream = torch.cuda.Stream()
                 self.cp_group = packed_seq_params.cp_group
                 super().set_context_parallel_group(
                     self.cp_group,
@@ -2351,6 +2364,8 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             )
             if num_splits is not None:
                 _fa_kwargs["num_splits"] = num_splits
+            if bf16_backward is not None:
+                _fa_kwargs["bf16_backward"] = bf16_backward
 
             core_attn_out = super().forward(query, key, value, attention_mask, **_fa_kwargs)
 
@@ -2381,6 +2396,8 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             _fa_kwargs = dict(**attention_bias_kwargs, **packed_seq_kwargs)
             if num_splits is not None:
                 _fa_kwargs["num_splits"] = num_splits
+            if bf16_backward is not None:
+                _fa_kwargs["bf16_backward"] = bf16_backward
             core_attn_out = super().forward(query, key, value, attention_mask, **_fa_kwargs)
 
         return core_attn_out

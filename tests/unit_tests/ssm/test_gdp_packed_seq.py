@@ -33,6 +33,7 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.context_parallel.chunkwise import build_packed_sequence_cp_metadata
 from megatron.core.ssm.gated_delta_product import (
+    HAVE_CUTEDSL_GDP_CP,
     GatedDeltaProductMixer,
     GatedDeltaProductMixerSubmodules,
 )
@@ -66,6 +67,7 @@ except ImportError:
 _WORLD_SIZE = int(os.environ.get("WORLD_SIZE", "1"))
 pytestmark = [
     pytest.mark.internal,
+    pytest.mark.launch_on_gb200,
     pytest.mark.skipif(
         _WORLD_SIZE < 2,
         reason=(
@@ -110,31 +112,35 @@ def _make_packed_seq_params(seq_lens: List[int]) -> PackedSeqParams:
     )
 
 
-def _make_config(cp_size: int, linear_cp_mode: str = "headwise") -> TransformerConfig:
+def _make_config(
+    cp_size: int, linear_cp_mode: str = "headwise", **config_overrides
+) -> TransformerConfig:
     """Small-but-shape-valid TransformerConfig for the v4 GDP mixer."""
-    return TransformerConfig(
-        num_layers=1,
-        hidden_size=64,
-        num_attention_heads=4,
-        num_query_groups=4,
-        ffn_hidden_size=128,
-        normalization="RMSNorm",
-        bf16=True,
-        mamba_num_heads=4,
-        mamba_head_dim=16,
-        mamba_num_groups=4,
-        mamba_state_dim=16,
-        tensor_model_parallel_size=1,
-        sequence_parallel=False,
-        context_parallel_size=cp_size,
-        linear_cp_mode=linear_cp_mode,
-        linear_cp_layout="contiguous" if linear_cp_mode == "chunkwise" else "zigzag",
-    )
+    config_kwargs = {
+        "num_layers": 1,
+        "hidden_size": 64,
+        "num_attention_heads": 4,
+        "num_query_groups": 4,
+        "ffn_hidden_size": 128,
+        "normalization": "RMSNorm",
+        "bf16": True,
+        "mamba_num_heads": 4,
+        "mamba_head_dim": 16,
+        "mamba_num_groups": 4,
+        "mamba_state_dim": 16,
+        "tensor_model_parallel_size": 1,
+        "sequence_parallel": False,
+        "context_parallel_size": cp_size,
+        "linear_cp_mode": linear_cp_mode,
+        "linear_cp_layout": "contiguous" if linear_cp_mode == "chunkwise" else "zigzag",
+    }
+    config_kwargs.update(config_overrides)
+    return TransformerConfig(**config_kwargs)
 
 
-def _build_mixer(cp_group, linear_cp_mode: str = "headwise"):
+def _build_mixer(cp_group, linear_cp_mode: str = "headwise", **config_overrides):
     """Construct a v4 GDP mixer wired to the given CP group."""
-    config = _make_config(cp_group.size(), linear_cp_mode=linear_cp_mode)
+    config = _make_config(cp_group.size(), linear_cp_mode=linear_cp_mode, **config_overrides)
     pg = ProcessGroupCollection(tp=parallel_state.get_tensor_model_parallel_group(), cp=cp_group)
     submodules = GatedDeltaProductMixerSubmodules(
         in_proj=TELayerNormColumnParallelLinear, out_proj=TERowParallelLinear
@@ -156,7 +162,7 @@ def _sync_weights_from_rank0(mixer):
         torch.distributed.broadcast(p.data, src=0)
 
 
-def _build_cp_pair(linear_cp_mode: str = "headwise"):
+def _build_cp_pair(linear_cp_mode: str = "headwise", **config_overrides):
     """Build a CP mixer and per-rank CP=1 reference mixers with identical weights.
 
     Returns ``(mixer_cp, mixer_cp1, config, cp_group, cp_rank)``. The cp=1
@@ -171,8 +177,8 @@ def _build_cp_pair(linear_cp_mode: str = "headwise"):
     cp1_groups = [torch.distributed.new_group(ranks=[r]) for r in range(world_size)]
     cp1_group = cp1_groups[global_rank]
 
-    mixer_cp, _ = _build_mixer(cp_group, linear_cp_mode=linear_cp_mode)
-    mixer_cp1, config = _build_mixer(cp1_group, linear_cp_mode=linear_cp_mode)
+    mixer_cp, _ = _build_mixer(cp_group, linear_cp_mode=linear_cp_mode, **config_overrides)
+    mixer_cp1, config = _build_mixer(cp1_group, linear_cp_mode=linear_cp_mode, **config_overrides)
     _sync_weights_from_rank0(mixer_cp)
     mixer_cp1.load_state_dict(mixer_cp.state_dict())
     return mixer_cp, mixer_cp1, config, cp_group, cp_rank
@@ -240,9 +246,9 @@ def _assert_chunkwise_equivalence(
         torch.distributed.all_reduce(reduced_grad, group=cp_group)
         reduced_gradients.append((name, local_grad, reference_grad, reduced_grad))
 
-    torch.testing.assert_close(local_output, reference_output[local_slice], atol=5e-2, rtol=5e-2)
+    torch.testing.assert_close(local_output, reference_output[local_slice], atol=1e-2, rtol=1e-2)
     torch.testing.assert_close(
-        local_input.grad, reference_input.grad[local_slice], atol=8e-2, rtol=8e-2
+        local_input.grad, reference_input.grad[local_slice], atol=3e-2, rtol=3e-2
     )
     assert set(reference_parameters) == set(local_parameters)
     for name, local_grad, reference_grad, reduced_grad in reduced_gradients:
@@ -250,7 +256,7 @@ def _assert_chunkwise_equivalence(
             continue
         assert local_grad is not None, f"chunkwise CP has no gradient for {name}"
         assert reference_grad is not None, f"reference has no gradient for {name}"
-        torch.testing.assert_close(reduced_grad, reference_grad, atol=8e-2, rtol=8e-2)
+        torch.testing.assert_close(reduced_grad, reference_grad, atol=3e-2, rtol=3e-2)
 
 
 @pytest.mark.internal
@@ -385,13 +391,21 @@ class TestGDPPackedSequence:
         )
         assert n_compared > 0, "no parameters received a gradient — test setup is wrong"
 
-    @pytest.mark.parametrize("packed", [False, True], ids=["blh", "thd"])
-    def test_chunkwise_forward_and_backward_equivalence(self, packed):
-        """Contiguous GDP CP matches a full-sequence FLA run for BLH and THD."""
+    @pytest.mark.parametrize(
+        "packed,recompute_modules",
+        (
+            pytest.param(False, [], id="blh"),
+            pytest.param(True, ["gdp_in_proj", "gdp_qkv"], id="thd-selective-recompute"),
+        ),
+    )
+    def test_chunkwise_forward_and_backward_equivalence(self, packed, recompute_modules):
+        """Contiguous GDP CP matches FLA with BLH, THD, and selective recompute."""
         if packed and not is_causal_conv1d_min_version("1.7.0"):
             pytest.skip("THD CP causal convolution requires causal-conv1d >= 1.7.0")
         mixer_cp, mixer_reference, config, cp_group, cp_rank = _build_cp_pair(
-            linear_cp_mode="chunkwise"
+            linear_cp_mode="chunkwise",
+            recompute_granularity="selective" if recompute_modules else None,
+            recompute_modules=recompute_modules,
         )
         if packed:
             hidden_full, packed_seq_params = _make_hidden_packed([20, 28], config.hidden_size)
@@ -406,6 +420,69 @@ class TestGDPPackedSequence:
         _assert_chunkwise_equivalence(
             mixer_cp, mixer_reference, cp_group, cp_rank, hidden_full, packed_seq_params
         )
+
+
+@pytest.mark.internal
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA + NCCL")
+@pytest.mark.skipif(
+    torch.cuda.device_count() < 2 if torch.cuda.is_available() else True,
+    reason="CP=2 test requires at least 2 GPUs",
+)
+@pytest.mark.skipif(not HAVE_MAMBA_DEPS, reason="GDP mixer requires mamba_ssm + einops")
+@pytest.mark.skipif(not HAVE_CUTEDSL_GDP_CP, reason="CuTeDSL GDP CP backend is unavailable")
+@pytest.mark.skipif(
+    not is_causal_conv1d_min_version("1.7.0"),
+    reason="GDP CP causal convolution requires causal-conv1d >= 1.7.0",
+)
+@pytest.mark.parametrize(
+    "seq_lens,recompute_modules",
+    (
+        pytest.param(None, [], id="blh-single-stream"),
+        pytest.param(
+            [256], ["gdp_in_proj", "gdp_qkv"], id="thd-single-sequence-selective-recompute"
+        ),
+        pytest.param([64, 192], [], id="thd-varlen"),
+    ),
+)
+def test_cutedsl_chunkwise_forward_and_backward_equivalence(seq_lens, recompute_modules):
+    """CuTeDSL CP=2 matches CP=1 for BLH, packed THD, and selective recompute."""
+    if torch.cuda.get_device_capability()[0] < 10:
+        pytest.skip("CuTeDSL GDP requires an SM100 GPU")
+
+    Utils.initialize_model_parallel(
+        tensor_model_parallel_size=1, pipeline_model_parallel_size=1, context_parallel_size=2
+    )
+    try:
+        model_parallel_cuda_manual_seed(123)
+        mixer_cp, mixer_reference, config, cp_group, cp_rank = _build_cp_pair(
+            linear_cp_mode="chunkwise",
+            hidden_size=128,
+            num_attention_heads=2,
+            num_query_groups=2,
+            ffn_hidden_size=256,
+            mamba_num_heads=2,
+            mamba_head_dim=64,
+            mamba_num_groups=2,
+            mamba_state_dim=128,
+            gdp_cutedsl_kernel=True,
+            gdp_num_chunk_states_to_recompute=2,
+            recompute_granularity="selective" if recompute_modules else None,
+            recompute_modules=recompute_modules,
+        )
+        if seq_lens is None:
+            packed_seq_params = None
+            torch.manual_seed(0)
+            hidden_full = torch.randn(
+                256, 1, config.hidden_size, device="cuda", dtype=torch.bfloat16
+            )
+            torch.distributed.broadcast(hidden_full, src=0)
+        else:
+            hidden_full, packed_seq_params = _make_hidden_packed(seq_lens, config.hidden_size)
+        _assert_chunkwise_equivalence(
+            mixer_cp, mixer_reference, cp_group, cp_rank, hidden_full, packed_seq_params
+        )
+    finally:
+        Utils.destroy_model_parallel()
 
 
 @pytest.mark.internal

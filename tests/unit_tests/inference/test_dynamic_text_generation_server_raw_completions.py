@@ -19,16 +19,16 @@ def test_parse_stop_token_sequences_accepts_token_zero():
 
 
 @pytest.mark.parametrize(
-    "request",
+    "payload",
     [
         {"stop_token_ids": [False]},
         {"stop_token_id_sequences": [[1, True]]},
         {"stop_token_id_sequences": [[]]},
     ],
 )
-def test_parse_stop_token_sequences_rejects_invalid_tokens(request):
+def test_parse_stop_token_sequences_rejects_invalid_tokens(payload):
     with pytest.raises(ValueError):
-        _parse_stop_token_sequences(request)
+        _parse_stop_token_sequences(payload)
 
 
 def test_trim_at_stop_sequences_uses_earliest_match_and_trims_logprobs():
@@ -60,7 +60,7 @@ def test_trim_at_stop_sequences_no_match_is_noop():
 
 
 @pytest.mark.parametrize(
-    ("request", "prompt_logprobs", "logprobs", "expected"),
+    ("payload", "prompt_logprobs", "logprobs", "expected"),
     [
         ({"top_prompt_logprobs": 1}, True, False, (1, 0, 1)),
         ({"top_logprobs": 2}, False, True, (0, 2, 2)),
@@ -68,21 +68,21 @@ def test_trim_at_stop_sequences_no_match_is_noop():
         ({}, False, False, (0, 0, 0)),
     ],
 )
-def test_parse_top_n_logprobs_accepts_valid_modes(request, prompt_logprobs, logprobs, expected):
-    assert _parse_top_n_logprobs(request, prompt_logprobs, logprobs) == expected
+def test_parse_top_n_logprobs_accepts_valid_modes(payload, prompt_logprobs, logprobs, expected):
+    assert _parse_top_n_logprobs(payload, prompt_logprobs, logprobs) == expected
 
 
 @pytest.mark.parametrize(
-    ("request", "prompt_logprobs", "logprobs"),
+    ("payload", "prompt_logprobs", "logprobs"),
     [
         ({"top_prompt_logprobs": 1}, False, False),
         ({"top_logprobs": 1}, False, False),
         ({"top_prompt_logprobs": -1}, True, False),
     ],
 )
-def test_parse_top_n_logprobs_rejects_invalid_modes(request, prompt_logprobs, logprobs):
+def test_parse_top_n_logprobs_rejects_invalid_modes(payload, prompt_logprobs, logprobs):
     with pytest.raises(ValueError):
-        _parse_top_n_logprobs(request, prompt_logprobs, logprobs)
+        _parse_top_n_logprobs(payload, prompt_logprobs, logprobs)
 
 
 def test_truncate_top_logprobs_preserves_requested_candidates():

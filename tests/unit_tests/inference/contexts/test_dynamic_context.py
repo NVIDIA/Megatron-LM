@@ -16,6 +16,7 @@ from megatron.core.inference.contexts.dynamic_context import (
     TokenOverflowError,
 )
 from megatron.core.inference.inference_request import DynamicInferenceRequest
+from megatron.core.inference.sampling.flashinfer_sampling import FlashInferSampling
 from megatron.core.inference.sampling.torch_sampling import TorchSampling
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
@@ -1752,6 +1753,17 @@ class TestDynamicContext:
                 logits_2d, expected_context, token_to_request_index=row_to_request
             )
 
+        def assert_sampled_log_prob(actual, expected_full, logits, row, token, req_sampling):
+            """Sampled tokens outside the processed support floor to the tempered
+            unfiltered logprob, never -inf."""
+            expected = expected_full[row, token].item()
+            if logprobs_mode == "raw_logprobs" or expected != float("-inf"):
+                assert actual == expected
+                return
+            scaled = logits.squeeze(0)[row].float() / max(req_sampling["temperature"], 1e-6)
+            tempered = (scaled[token] - scaled.logsumexp(0)).item()
+            assert actual == pytest.approx(tempered, rel=1e-5, abs=1e-6)
+
         # Populate gpu_view for calculate_log_probs (which reads from gpu_view).
         dynamic_context.initialize_attention_state()
         dynamic_context.transfer_bookkeeping_to_gpu()
@@ -1789,10 +1801,21 @@ class TestDynamicContext:
             request_tokens.append(prefill_new_tokens[i].item())
 
             for j, token in enumerate(request_tokens):
-                assert (
-                    prefill_log_probs[i][j]
-                    == expected_prefill_log_probs[initial_token_offset + j, token].item()
-                )
+                if j == req_len - 1:
+                    # The final position holds this request's engine-sampled token.
+                    assert_sampled_log_prob(
+                        prefill_log_probs[i][j],
+                        expected_prefill_log_probs,
+                        prefill_logits,
+                        initial_token_offset + j,
+                        token,
+                        data["sampling"],
+                    )
+                else:
+                    assert (
+                        prefill_log_probs[i][j]
+                        == expected_prefill_log_probs[initial_token_offset + j, token].item()
+                    )
 
         # Simulate decode step
         # All requests are active, so the mask will be all ones for the current active requests
@@ -1827,7 +1850,14 @@ class TestDynamicContext:
             assert len(decode_log_probs[i]) == 1, len(decode_log_probs[i])
 
             token = decode_new_tokens[i].item()
-            assert decode_log_probs[i][0] == expected_decode_log_probs[i, token].item()
+            assert_sampled_log_prob(
+                decode_log_probs[i][0],
+                expected_decode_log_probs,
+                decode_logits[:, :num_active_requests],
+                i,
+                token,
+                data["sampling"],
+            )
 
         # Simulate mixed prefill and decode step (adding a new request to existing context)
         dynamic_context.update_requests(
@@ -1912,11 +1942,13 @@ class TestDynamicContext:
                     )
 
                 # For the newly sampled token
-                assert (
-                    mixed_step_log_probs[i][expected_len - 1]
-                    == expected_mixed_step_log_probs[
-                        current_global_token_offset + expected_len - 1, new_sampled_token
-                    ].item()
+                assert_sampled_log_prob(
+                    mixed_step_log_probs[i][expected_len - 1],
+                    expected_mixed_step_log_probs,
+                    mixed_step_logits,
+                    current_global_token_offset + expected_len - 1,
+                    new_sampled_token,
+                    data["sampling"],
                 )
 
                 current_global_token_offset += expected_len
@@ -1928,11 +1960,13 @@ class TestDynamicContext:
 
                 # For decode, the log prob is for the single new token
                 new_sampled_token = mixed_step_new_tokens[i].item()
-                assert (
-                    mixed_step_log_probs[i][0]
-                    == expected_mixed_step_log_probs[
-                        current_global_token_offset, new_sampled_token
-                    ].item()
+                assert_sampled_log_prob(
+                    mixed_step_log_probs[i][0],
+                    expected_mixed_step_log_probs,
+                    mixed_step_logits,
+                    current_global_token_offset,
+                    new_sampled_token,
+                    data["sampling"],
                 )
 
                 current_global_token_offset += expected_len
@@ -4188,3 +4222,113 @@ class TestDynamicContext:
         expected_len = ctx.num_last_token_logits
         assert indices.numel() == expected_len
         assert indices.data_ptr() == ctx.active_logit_idxs.data_ptr()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="FlashInfer log-probs need CUDA")
+@pytest.mark.parametrize(
+    "top_k,top_p,finite_counts",
+    [
+        ([0, 0, 0], [0.0, 1.0, 1.0], [None, None, None]),  # all no-op: fast path
+        ([4, 0], [0.0, 1.0], [4, None]),  # mixed batch: per-row repair
+    ],
+)
+def test_flashinfer_no_op_filter_rows_get_exact_log_softmax(top_k, top_p, finite_counts):
+    """No-op rows bypass the renorm kernels (finite_count None = exact log_softmax row)."""
+    pytest.importorskip("flashinfer")
+    torch.manual_seed(0)
+    n = len(top_k)
+    logits = torch.randn(n, 64, device="cuda", dtype=torch.float32)
+    temperature = torch.ones(n)
+    top_k = torch.tensor(top_k, dtype=torch.int32)
+    top_p = torch.tensor(top_p)
+    context = SimpleNamespace(
+        gpu_view=SimpleNamespace(
+            temperature=temperature.cuda(), top_k=top_k.cuda(), top_p=top_p.cuda()
+        ),
+        active_request_metadata={"temperature": temperature, "top_k": top_k, "top_p": top_p},
+        total_request_count=n,
+        paused_request_count=0,
+    )
+    # Bind the real flags so the test exercises the production fast-path gate.
+    context.active_sampling_filter_flags = lambda count=None: (
+        DynamicInferenceContext.active_sampling_filter_flags(context, count)
+    )
+
+    backend = FlashInferSampling(64, torch.Generator(device="cuda"))
+    log_probs = backend.log_probs_kernel(logits, context)
+    expected = torch.log_softmax(logits, dim=-1)
+    for row, finite_count in enumerate(finite_counts):
+        if finite_count is None:
+            assert torch.equal(log_probs[row], expected[row])
+        else:
+            assert int(torch.isfinite(log_probs[row]).sum()) == finite_count
+
+
+@pytest.mark.parametrize(
+    "no_top_k,no_top_p,top_k,top_p,expected_kernel",
+    [
+        (True, True, [0, 0], [0.0, 0.0], "sampling_from_logits"),
+        (True, False, [0, 0], [0.9, 0.0], "top_p_sampling_from_probs"),
+        (False, True, [5, 0], [0.0, 0.0], "top_k_sampling_from_probs"),
+        (False, False, [5, 0], [0.0, 0.9], "top_k_top_p_sampling_from_logits"),
+    ],
+)
+def test_flashinfer_sample_kernel_dispatch(
+    monkeypatch, no_top_k, no_top_p, top_k, top_p, expected_kernel
+):
+    """Filter flags pick the right kernel; an unfiltered batch avoids the CDF kernels.
+
+    The probability-CDF kernels' fp32 fallback can emit the last positive-probability
+    vocab id (~1e-6 of draws), so the unfiltered batch must use `sampling_from_logits`.
+    """
+    kernels = (
+        "sampling_from_logits",
+        "sampling_from_probs",
+        "top_p_sampling_from_probs",
+        "top_k_sampling_from_probs",
+        "top_k_top_p_sampling_from_logits",
+    )
+    vocab_size = 16
+    n = len(top_k)
+    fake = mock.MagicMock()
+    for name in kernels:
+        getattr(fake.sampling, name).return_value = torch.zeros(n, dtype=torch.int32)
+    monkeypatch.setattr("megatron.core.inference.sampling.flashinfer_sampling.flashinfer", fake)
+
+    context = SimpleNamespace(
+        gpu_view=SimpleNamespace(
+            temperature=torch.ones(n),
+            top_k=torch.tensor(top_k, dtype=torch.int32),
+            top_p=torch.tensor(top_p),
+        )
+    )
+    rng = torch.Generator()
+    backend = FlashInferSampling(vocab_size, rng)
+    logits = torch.randn(n, vocab_size, dtype=torch.float32)
+    sampled = backend.sample_kernel(logits, n, context, no_top_k=no_top_k, no_top_p=no_top_p)
+
+    assert sampled.dtype == torch.int64
+    for name in kernels:
+        assert getattr(fake.sampling, name).call_count == (1 if name == expected_kernel else 0)
+
+    args, kwargs = getattr(fake.sampling, expected_kernel).call_args
+    assert kwargs["generator"] is rng
+    assert kwargs["deterministic"] is True
+    if expected_kernel.endswith("from_logits"):
+        # Logits kernels receive the temperature-scaled logits, never a softmax.
+        assert torch.equal(args[0], logits)
+    else:
+        # Probability kernels receive normalized rows.
+        assert torch.allclose(args[0].sum(dim=-1), torch.ones(n))
+
+    # Per-row no-op sentinels map to the kernels' keep-everything values.
+    expected_safe = {
+        "top_p_sampling_from_probs": [torch.tensor([0.9, 1.0])],
+        "top_k_sampling_from_probs": [torch.tensor([5, vocab_size], dtype=torch.int32)],
+        "top_k_top_p_sampling_from_logits": [
+            torch.tensor([5, vocab_size], dtype=torch.int32),
+            torch.tensor([1.0, 0.9]),
+        ],
+    }
+    for safe_arg, expected in zip(args[1:], expected_safe.get(expected_kernel, [])):
+        assert torch.equal(safe_arg, expected)

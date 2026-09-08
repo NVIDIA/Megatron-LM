@@ -768,6 +768,8 @@ class TestMambaPrefixCachingE2E:
         # chunk begins block-aligned at token 512, so (768 - 512) % 128 == 0 and
         # the state at this boundary is extracted and committed.
         assert len(seed.precomputed_block_hashes) == 3
+        assert seed.precomputed_block_hashes[0] in ctx.mamba_slot_allocator.hash_to_block_id
+        assert seed.precomputed_block_hashes[1] in ctx.mamba_slot_allocator.hash_to_block_id
         last_block_hash = seed.precomputed_block_hashes[2]
         assert (
             last_block_hash in ctx.mamba_slot_allocator.hash_to_block_id

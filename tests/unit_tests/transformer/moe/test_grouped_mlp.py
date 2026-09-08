@@ -706,6 +706,7 @@ def _make_fused_impl_support_module(
     module.config = SimpleNamespace(
         activation_func=activation_func,
         activation_func_clamp_value=activation_func_clamp_value,
+        activation_func_tanh_clamp_scale=None,
         gated_linear_unit=gated_linear_unit,
         use_fused_weighted_squared_relu=use_fused_weighted_squared_relu,
         moe_apply_probs_on_input=False,

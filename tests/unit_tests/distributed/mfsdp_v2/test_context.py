@@ -158,6 +158,22 @@ def test_nested_prefetch_orders_use_dfs(distributed_setup):
     assert list(context.backward_order) == [model, model.right, model.left, model.left.inner]
 
 
+def test_register_post_backward_hook_handles_parameterless_module(distributed_setup):
+    """A parameterless FSDP unit should invoke the external scheduler callback."""
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    model = nn.Identity().to(device)
+
+    with fully_shard_context(device=device):
+        fully_shard(model, mesh=mesh, placements=_flat_placements(), register_hooks=False)
+
+    callback_modules = []
+    model.register_post_backward_hook(callback_modules.append)
+    model(torch.ones(2, 4, device=device, requires_grad=True)).sum().backward()
+
+    assert callback_modules == [model]
+
+
 def test_nested_and_sibling_roots_use_cross_root_orders(distributed_setup):
     """Context orders should concatenate nested roots at construction boundaries."""
     device = distributed_setup.device

@@ -44,9 +44,11 @@ from megatron.core.ssm.context_parallel.chunkwise import (
     CPForwardPackedSummary,
     CPForwardSummary,
     CPSavedContext,
-    LinearAttentionCPBackend,
-    chunkwise_cp_backward,
-    chunkwise_cp_forward,
+)
+from megatron.core.ssm.context_parallel.gdp_common import (
+    GDPChunkwiseContextParallel,
+    GDPInputGradients,
+    GDPInputs,
 )
 
 
@@ -55,29 +57,6 @@ def _expand_cu_seqlens(cu_seqlens: torch.Tensor, num_householder: int) -> torch.
     if num_householder == 1:
         return cu_seqlens
     return cu_seqlens * num_householder
-
-
-@dataclass(frozen=True)
-class GDPInputs:
-    """Local FLA GDP operands passed to the CP backend."""
-
-    q: torch.Tensor
-    k: torch.Tensor
-    v: torch.Tensor
-    g: torch.Tensor
-    beta: torch.Tensor
-    cu_seqlens: torch.Tensor | None
-    num_householder: int
-    scale: float
-
-
-GDPInputGradients = tuple[
-    torch.Tensor,  # dq
-    torch.Tensor,  # dk
-    torch.Tensor,  # dv
-    torch.Tensor,  # dg
-    torch.Tensor,  # dbeta
-]
 
 
 @dataclass(frozen=True)
@@ -136,8 +115,17 @@ class GDPBackwardContext:
     dv: torch.Tensor
 
 
+class FLAGDPChunkwiseContextParallel(GDPChunkwiseContextParallel):
+    """FLA-decorated form of the shared GDP autograd adapter."""
+
+    forward = staticmethod(input_guard(autocast_custom_fwd(GDPChunkwiseContextParallel.forward)))
+    backward = staticmethod(input_guard(autocast_custom_bwd(GDPChunkwiseContextParallel.backward)))
+
+
 class FLAGatedDeltaProductCPBackend:
     """FLA implementation of the linear-attention chunkwise-CP interface."""
+
+    autograd_function = FLAGDPChunkwiseContextParallel
 
     def cp_forward_prepare(self, inputs: GDPInputs) -> tuple[CPForwardSummary, GDPLocalContext]:
         """Compute the local state summary and reusable FLA forward workspace."""
@@ -676,114 +664,4 @@ def _apply_fla_backward(
         dv.to(inputs.v),
         dg.to(dtype=inputs.g_dtype),
         db.to(inputs.beta),
-    )
-
-
-class _GDPChunkwiseContextParallel(torch.autograd.Function):
-    @staticmethod
-    @input_guard
-    @autocast_custom_fwd
-    def forward(
-        ctx,
-        q,
-        k,
-        v,
-        g,
-        beta,
-        cu_seqlens,
-        num_householder,
-        scale,
-        cp_group,
-        backend,
-        preceding_rank_start,
-        following_rank_stop,
-    ):
-        """Run chunkwise-CP forward and save the backend context for backward."""
-        inputs = GDPInputs(
-            q=q,
-            k=k,
-            v=v,
-            g=g,
-            beta=beta,
-            cu_seqlens=cu_seqlens,
-            num_householder=num_householder,
-            scale=scale,
-        )
-        cp_rank = cp_group.rank()
-        result = chunkwise_cp_forward(
-            backend=backend,
-            inputs=inputs,
-            cp_group=cp_group,
-            preceding_slice=slice(preceding_rank_start, cp_rank),
-        )
-        ctx.save_for_backward(*result.saved_context.tensors)
-        ctx.saved_context_metadata = result.saved_context.metadata
-        ctx.cp_group = cp_group
-        ctx.cp_rank = cp_rank
-        ctx.following_rank_stop = following_rank_stop
-        ctx.backend = backend
-        return result.output
-
-    @staticmethod
-    @input_guard
-    @autocast_custom_bwd
-    def backward(ctx, output_grad):
-        """Run chunkwise-CP backward using the saved backend context."""
-        saved_context = CPSavedContext(
-            tensors=ctx.saved_tensors, metadata=ctx.saved_context_metadata
-        )
-        dq, dk, dv, dg, dbeta = chunkwise_cp_backward(
-            backend=ctx.backend,
-            output_grad=output_grad,
-            saved_context=saved_context,
-            cp_group=ctx.cp_group,
-            following_slice=slice(ctx.cp_rank + 1, ctx.following_rank_stop),
-        )
-        return dq, dk, dv, dg, dbeta, None, None, None, None, None, None, None
-
-
-@torch.compiler.disable
-def gdp_chunkwise_context_parallel(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    g: torch.Tensor,
-    beta: torch.Tensor,
-    cu_seqlens: torch.Tensor | None,
-    num_householder: int,
-    scale: float,
-    cp_group: torch.distributed.ProcessGroup,
-    backend: LinearAttentionCPBackend[
-        GDPInputs, GDPLocalContext, GDPBackwardContext, GDPInputGradients
-    ],
-    preceding_rank_start: int = 0,
-    following_rank_stop: int | None = None,
-) -> torch.Tensor:
-    """Run FLA GDP with Megatron-owned chunkwise-CP communication."""
-    if following_rank_stop is None:
-        following_rank_stop = cp_group.size()
-    cp_rank = cp_group.rank()
-    if not 0 <= preceding_rank_start <= cp_rank:
-        raise ValueError(
-            "preceding_rank_start must be in [0, cp_rank], got "
-            f"{preceding_rank_start} for rank {cp_rank}"
-        )
-    if not cp_rank < following_rank_stop <= cp_group.size():
-        raise ValueError(
-            "following_rank_stop must be in (cp_rank, cp_size], got "
-            f"{following_rank_stop} for rank {cp_rank} and size {cp_group.size()}"
-        )
-    return _GDPChunkwiseContextParallel.apply(
-        q,
-        k,
-        v,
-        g,
-        beta,
-        cu_seqlens,
-        num_householder,
-        scale,
-        cp_group,
-        backend,
-        preceding_rank_start,
-        following_rank_stop,
     )

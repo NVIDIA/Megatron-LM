@@ -88,6 +88,8 @@ jobs:
           REPO = os.environ["GITHUB_REPOSITORY"]
           CONTRIBUTOR_TYPE = os.environ["CONTRIBUTOR_TYPE"]
           INTERNAL_SERVICE_ACCOUNTS = {"svcnemo-autobot"}
+          CICD_WORKFLOW_NAME = "CICD Megatron-LM"
+          FUNCTIONAL_TEST_LABEL = "Run functional tests"
           if CONTRIBUTOR_TYPE == "external":
               # Global limit across all branches — no division needed since we count globally.
               MAX_CONCURRENCY = int(os.environ["MAX_CONCURRENCY_EXTERNAL"])
@@ -170,6 +172,19 @@ jobs:
               base_branch = pr_info.get("base", {}).get("ref")
               return base_branch, pr_info
 
+          def has_functional_test_label(workflow_run):
+              """Return whether a PR workflow has opted into functional tests."""
+              head_branch = workflow_run.get("head_branch", "")
+              if not re.match(r"pull-request/(\d+)", head_branch):
+                  return False
+              _, pr_info = get_pr_base_branch(workflow_run)
+              if pr_info is None:
+                  raise RuntimeError(f"Failed to inspect labels for {head_branch}")
+              return any(
+                  label.get("name") == FUNCTIONAL_TEST_LABEL
+                  for label in pr_info.get("labels", [])
+              )
+
           def matches_contributor(workflow_run, contributor_type):
               """Return True if the workflow run matches the contributor type (ignores branch)."""
               _, pr_info = get_pr_base_branch(workflow_run)
@@ -214,19 +229,25 @@ jobs:
               exit(1)
           in_progress_workflow_runs = in_progress_resp.get("workflow_runs", [])
 
+          # The functional-test slot is global across all branch/contributor queues.
+          functional_test_workflow_running = any(
+              run.get("name") == CICD_WORKFLOW_NAME and has_functional_test_label(run)
+              for run in queued_workflow_runs + in_progress_workflow_runs
+          )
+
           # For external contributors, enforce a single global concurrency limit across ALL branches.
           # For internal contributors, enforce per-branch limits as before.
           if CONTRIBUTOR_TYPE == "external":
               queued_workflow_runs = [run for run in queued_workflow_runs
-                                      if run["name"] == "CICD Megatron-LM" and matches_contributor(run, CONTRIBUTOR_TYPE)]
+                                      if run["name"] == CICD_WORKFLOW_NAME and matches_contributor(run, CONTRIBUTOR_TYPE)]
               in_progress_workflow_runs = [run for run in in_progress_workflow_runs
-                                          if run["name"] == "CICD Megatron-LM" and matches_contributor(run, CONTRIBUTOR_TYPE)]
+                                          if run["name"] == CICD_WORKFLOW_NAME and matches_contributor(run, CONTRIBUTOR_TYPE)]
           else:
               # Filter for workflows belonging to PRs targeting ${{ matrix.branch }} with matching contributor type
               queued_workflow_runs = [run for run in queued_workflow_runs
-                                      if run["name"] == "CICD Megatron-LM" and matches_queue(run, "${{ matrix.branch }}", CONTRIBUTOR_TYPE)]
+                                      if run["name"] == CICD_WORKFLOW_NAME and matches_queue(run, "${{ matrix.branch }}", CONTRIBUTOR_TYPE)]
               in_progress_workflow_runs = [run for run in in_progress_workflow_runs
-                                          if run["name"] == "CICD Megatron-LM" and matches_queue(run, "${{ matrix.branch }}", CONTRIBUTOR_TYPE)]
+                                          if run["name"] == CICD_WORKFLOW_NAME and matches_queue(run, "${{ matrix.branch }}", CONTRIBUTOR_TYPE)]
 
           # Count running and queued workflows
           queued_workflows = len(queued_workflow_runs)
@@ -252,10 +273,10 @@ jobs:
           print("Pending workflows:", len(pending_workflows))
           if CONTRIBUTOR_TYPE == "external":
               pending_workflows = [run for run in pending_workflows
-                                  if run["name"] == "CICD Megatron-LM" and matches_contributor(run, CONTRIBUTOR_TYPE)]
+                                  if run["name"] == CICD_WORKFLOW_NAME and matches_contributor(run, CONTRIBUTOR_TYPE)]
           else:
               pending_workflows = [run for run in pending_workflows
-                                  if run["name"] == "CICD Megatron-LM" and matches_queue(run, "${{ matrix.branch }}", CONTRIBUTOR_TYPE)]
+                                  if run["name"] == CICD_WORKFLOW_NAME and matches_queue(run, "${{ matrix.branch }}", CONTRIBUTOR_TYPE)]
 
           # Sort deployments by creation date (oldest first)
           print("Sorting workflows...")
@@ -270,6 +291,14 @@ jobs:
 
               workflow_id = workflow["id"]
               workflow_name = workflow["display_title"]
+              runs_functional_tests = has_functional_test_label(workflow)
+              if runs_functional_tests and functional_test_workflow_running:
+                  print(
+                      f"Skipping functional-test workflow {workflow_name} with Run Id: {workflow_id}; "
+                      "another functional-test workflow is active"
+                  )
+                  continue
+
               print(f"Approving workflow {workflow_name} with Run Id: {workflow_id}")
 
               deployment_url = f"actions/runs/{workflow_id}/pending_deployments"
@@ -290,6 +319,8 @@ jobs:
 
               if result:
                   total_workflows += 1
+                  if runs_functional_tests:
+                      functional_test_workflow_running = True
               else:
                   print(f"Failed to approve deployment {deployment['id']}")
                   exit(1)
