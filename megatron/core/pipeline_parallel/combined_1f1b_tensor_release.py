@@ -1,16 +1,22 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Scheduled tensor release for the combined 1F1B pipeline schedule.
+"""Schedule-aware tensor release for the combined 1F1B pipeline schedule.
 
-Only tensors produced and consumed by a ``ScheduleNode`` participate.  Each
-model-chunk plan records the stream that produced a concrete tensor, consumes
-that binding at the next real node, and falls back to allocator ``record_stream``
-when an input came from outside the plan.
+When ``ep_overlap_use_scheduled_tensor_release`` is enabled, each model-chunk
+plan tracks the producer stream of concrete CUDA tensors passed between real
+``ScheduleNode`` objects.  A same-stream consumer can release storage
+immediately.  A cross-stream consumer instead holds a strong reference until a
+later node from the same plan acquires the producer stream.  That acquire already
+waits on the plan event, so storage can become reusable without adding another
+dependency or relying on the caching allocator's longer ``record_stream``
+lifetime.
 
-A cross-stream consumer holds the tensor until a later node from the same plan
-acquires the owner stream.  That acquire already waits on the plan event, so the
-release state can drop the reference (or empty forward storage) without adding a new
-dependency to the overlap schedule.
+Tracking is deliberately plan-local.  Inputs and detached gradients that enter
+outside the managed node chain keep the conservative ``record_stream`` path.
+Phase finalization hands remaining deferred tensors back to their producer
+streams and exports outputs leaving the plan.  Distinct edge tensors sharing one
+storage are rejected because tensor-object ownership cannot safely represent
+aliases when an input's entire storage may be released.
 """
 
 from __future__ import annotations

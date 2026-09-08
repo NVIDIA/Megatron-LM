@@ -161,7 +161,7 @@ def test_structured_tensors_are_deduplicated():
     assert not _owner_bindings(tensor_release)
 
 
-def test_two_managers_do_not_drain_another_microbatch():
+def test_two_release_states_do_not_drain_another_microbatch():
     owner = torch.cuda.Stream()
     consumer = torch.cuda.Stream()
     backward_event = torch.cuda.Event()
@@ -450,39 +450,82 @@ def test_no_external_consumed_grad_skips_record_stream(monkeypatch):
     tensor_release.export(input_grad)
 
 
-def test_allocator_reuse_poison_does_not_overwrite_delayed_consumer():
-    if not hasattr(torch.cuda, "_sleep"):
-        pytest.skip("torch.cuda._sleep is unavailable")
+def _measure_cross_stream_allocator(use_scheduled_release):
+    """Return peak reserved bytes and addresses for one safe release strategy."""
 
+    iterations = 8
+    elements = 4 * 1024 * 1024  # 16 MiB of int32 storage per iteration.
     owner = torch.cuda.Stream()
     consumer = torch.cuda.Stream()
     event = torch.cuda.Event()
-    tensor_release = Combined1F1BTensorRelease()
-    observed = []
+    tensor_release = Combined1F1BTensorRelease() if use_scheduled_release else None
+    checksums = torch.empty(iterations, dtype=torch.int32, device="cuda")
+    addresses = []
 
-    for pattern in range(1, 17):
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats()
+    baseline_reserved = torch.cuda.memory_reserved()
+
+    for pattern in range(1, iterations + 1):
         with torch.cuda.stream(owner):
-            tensor = torch.full((256 * 1024,), pattern, dtype=torch.int32, device="cuda")
+            tensor = torch.empty(elements, dtype=torch.int32, device="cuda")
+            tensor.fill_(pattern)
             event.record(owner)
-        _publish(tensor_release, tensor, owner, node=f"producer {pattern}")
+        addresses.append(tensor.data_ptr())
+        if tensor_release is not None:
+            _publish(tensor_release, tensor, owner, node=f"producer {pattern}")
+
         event.wait(consumer)
         with torch.cuda.stream(consumer):
-            torch.cuda._sleep(1_000_000)
-            observed.append(tensor.clone())
+            # Keep several consumer uses in flight so record_stream cannot retire
+            # their blocks before the host has enqueued the next allocations.
+            torch.cuda._sleep(10_000_000)
+            checksums[pattern - 1].copy_(tensor[0])
             event.record(consumer)
-        _consume_inputs_and_publish_outputs(
-            tensor_release, tensor, (), consumer, node=f"consumer {pattern}"
-        )
 
-        # The wait is enqueued before drain makes storage allocator-visible.
-        _wait_and_drain(tensor_release, event, owner)
-        with torch.cuda.stream(owner):
-            torch.full((256 * 1024,), -pattern, dtype=torch.int32, device="cuda")
+        if tensor_release is None:
+            tensor.record_stream(consumer)
+            tensor.untyped_storage().resize_(0)
+        else:
+            _consume_inputs_and_publish_outputs(
+                tensor_release, tensor, (), consumer, node=f"consumer {pattern}"
+            )
 
-    tensor_release.finalize_phase(event, "test")
+        # Both cases have the same consumer -> owner dependency.  The difference
+        # is whether the allocator polls record_stream or the release state makes
+        # the block reusable through owner-stream ordering.
+        event.wait(owner)
+        if tensor_release is not None:
+            with torch.cuda.stream(owner):
+                tensor_release.drain(owner)
+
+    assert not event.query(), "consumer backlog completed before allocator measurement"
+    peak_reserved = torch.cuda.max_memory_reserved() - baseline_reserved
     torch.cuda.synchronize()
-    for pattern, value in enumerate(observed, start=1):
-        assert torch.all(value == pattern)
+    assert checksums.tolist() == list(range(1, iterations + 1))
+
+    del checksums, tensor
+    torch.cuda.empty_cache()
+    return peak_reserved, len(set(addresses))
+
+
+def test_scheduled_release_reduces_cross_stream_reserved_memory():
+    if not hasattr(torch.cuda, "_sleep"):
+        pytest.skip("torch.cuda._sleep is unavailable")
+    if torch.cuda.memory.get_allocator_backend() != "native":
+        pytest.skip("reserved-memory comparison requires the native CUDA allocator")
+
+    record_stream_peak, record_stream_addresses = _measure_cross_stream_allocator(False)
+    scheduled_peak, scheduled_addresses = _measure_cross_stream_allocator(True)
+    tensor_bytes = 4 * 1024 * 1024 * torch.empty((), dtype=torch.int32).element_size()
+
+    assert scheduled_addresses == 1
+    assert record_stream_addresses > scheduled_addresses
+    assert record_stream_peak >= scheduled_peak + tensor_bytes, (
+        f"record_stream peak={record_stream_peak}, scheduled peak={scheduled_peak}, "
+        f"tensor bytes={tensor_bytes}"
+    )
 
 
 def test_full_graph_capture_drains_during_capture_not_replay():
