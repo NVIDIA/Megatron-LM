@@ -148,43 +148,6 @@ def test_clamped_and_unclamped_differ_on_saturating_input() -> None:
     assert not torch.allclose(clamped, unclamped, rtol=1e-2, atol=1e-2)
 
 
-class _Params:
-    """Stands in for PackedSeqParams: an object the layers all share."""
-
-
-def test_rope_tables_are_built_once_per_packed_batch() -> None:
-    """A second layer asking for the same tables must get the first one's."""
-    from megatron.lite.primitive.modules.attention.csa import rope_tables_for_packed_batch
-
-    params = _Params()
-    cu = torch.tensor([0, 4], dtype=torch.int32)
-    kw = dict(config=None, use_yarn=False, device=torch.device("cpu"), dtype=torch.float32)
-    first = rope_tables_for_packed_batch(params, cu, 0, 4, 4, 10000.0, **kw)
-    second = rope_tables_for_packed_batch(params, cu, 0, 4, 4, 10000.0, **kw)
-    assert first[0] is second[0] and first[1] is second[1]
-
-
-def test_rope_tables_differ_across_batches_and_offsets() -> None:
-    """Guard the guard: the tables must not outlive what defines them.
-
-    A cache that ignored the rank offset, or that lived longer than the batch,
-    would return the first batch's positions for the second -- finite, correctly
-    shaped, and wrong. Both axes are checked because either alone would pass.
-    """
-    from megatron.lite.primitive.modules.attention.csa import rope_tables_for_packed_batch
-
-    cu = torch.tensor([0, 4], dtype=torch.int32)
-    kw = dict(config=None, use_yarn=False, device=torch.device("cpu"), dtype=torch.float32)
-    a = rope_tables_for_packed_batch(_Params(), cu, 0, 4, 4, 10000.0, **kw)
-    b = rope_tables_for_packed_batch(_Params(), cu, 0, 4, 4, 10000.0, **kw)
-    assert a[0] is not b[0], "a new batch must not reuse the previous batch's tables"
-
-    same = _Params()
-    near = rope_tables_for_packed_batch(same, cu, 0, 4, 4, 10000.0, **kw)
-    far = rope_tables_for_packed_batch(same, cu, 4, 4, 4, 10000.0, **kw)
-    assert not torch.allclose(near[0], far[0]), "a different rank offset must rebuild"
-
-
 # ``main_grad`` only ever exists on CUDA -- the distributed optimizer allocates
 # it there -- and Core's accumulating linear has no CPU kernel, so these run on
 # the device the paths they cover actually run on.
@@ -335,3 +298,41 @@ def test_forward_aggregation_matches_pre_fusion_reference_gpu() -> None:
     expected = _reference_forward(module, x)
     actual, _, _ = module(x)
     torch.testing.assert_close(actual, expected, rtol=1e-4, atol=1e-4)
+
+
+def test_rope_table_is_shared_across_calls_and_grows_on_demand() -> None:
+    """One table per parameter set, rebuilt only when a longer span is asked for."""
+    from megatron.lite.primitive.modules.attention.csa import _ROPE_TABLES, rope_table
+
+    _ROPE_TABLES.clear()
+    kw = dict(config=None, use_yarn=False, device=torch.device("cpu"), dtype=torch.float32)
+    first = rope_table(8, 4, 10000.0, **kw)
+    assert rope_table(8, 4, 10000.0, **kw)[0] is first[0], "same span must reuse the table"
+    assert rope_table(4, 4, 10000.0, **kw)[0] is first[0], "a shorter span must reuse it too"
+    grown = rope_table(64, 4, 10000.0, **kw)
+    assert grown[0] is not first[0], "a longer span must rebuild"
+    assert len(_ROPE_TABLES) == 1, "growing must replace the entry, not add one"
+
+
+def test_rope_table_rows_match_building_from_those_positions() -> None:
+    """Gathering rows from the shared table equals building for those positions.
+
+    This is the property the shared table rests on. The control below fixes the
+    axis: rows taken for the wrong positions must differ, or a table that
+    ignored its index would satisfy the assertion above.
+    """
+    from megatron.lite.primitive.modules.attention.csa import (
+        build_compressed_rope_cos_sin,
+        rope_table,
+    )
+
+    kw = dict(config=None, use_yarn=False, device=torch.device("cpu"), dtype=torch.float32)
+    positions = torch.tensor([[0, 1, 2, 3]], dtype=torch.long)
+    direct_cos, direct_sin = build_compressed_rope_cos_sin(positions, 4, 10000.0, **kw)
+    cos, sin = rope_table(16, 4, 10000.0, **kw)
+    rows = positions.view(-1)
+    torch.testing.assert_close(cos[0].index_select(0, rows), direct_cos[0])
+    torch.testing.assert_close(sin[0].index_select(0, rows), direct_sin[0])
+    shifted = cos[0].index_select(0, rows + 4)
+    assert not torch.allclose(shifted, direct_cos[0]), "wrong rows must not match"
+

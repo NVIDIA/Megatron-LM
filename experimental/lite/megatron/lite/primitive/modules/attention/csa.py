@@ -129,6 +129,60 @@ def build_yarn_rope_cos_sin(
 
 
 
+# Rotary tables depend only on the rope parameters and how far the positions
+# run, never on which tensor carries them. Core keys its cache on exactly those
+# scalars (``RotaryEmbedding.get_cached_cos_sin``) and lets callers index the
+# table; keying on a tensor's identity instead is what made the earlier cache
+# here unsound, since the caching allocator reuses addresses.
+_ROPE_TABLES: dict[Hashable, tuple[int, torch.Tensor, torch.Tensor]] = {}
+
+
+def rope_table(
+    max_positions: int,
+    rope_head_dim: int,
+    rope_theta: float,
+    *,
+    config: Any,
+    use_yarn: bool,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Cos/sin over ``[0, max_positions)``, grown on demand and shared.
+
+    Core's ``RotaryEmbedding.get_cached_cos_sin`` rebuilds only when the length
+    asked for exceeds what it holds, then slices; the same here. Building to
+    ``max_position_embeddings`` instead would be a 134 MB pair for a model that
+    declares a million positions and uses four thousand.
+    """
+    yarn = (
+        (
+            float(config.rotary_scaling_factor),
+            float(config.beta_fast),
+            float(config.beta_slow),
+            int(config.original_max_position_embeddings),
+        )
+        if use_yarn
+        else None
+    )
+    key = (int(rope_head_dim), float(rope_theta), bool(use_yarn), yarn, str(device), str(dtype))
+    hit = _ROPE_TABLES.get(key)
+    if hit is not None and hit[0] >= max_positions:
+        return hit[1], hit[2]
+    grown = max(max_positions, hit[0] * 2 if hit is not None else 0)
+    positions = torch.arange(grown, device=device).view(1, grown)
+    cos, sin = build_compressed_rope_cos_sin(
+        positions,
+        rope_head_dim,
+        rope_theta,
+        config=config,
+        use_yarn=use_yarn,
+        device=device,
+        dtype=dtype,
+    )
+    _ROPE_TABLES[key] = (grown, cos, sin)
+    return cos, sin
+
+
 def rope_tables_for_packed_batch(
     packed_seq_params: Any,
     cu_seqlens: torch.Tensor,
@@ -142,42 +196,16 @@ def rope_tables_for_packed_batch(
     device: torch.device,
     dtype: torch.dtype,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Build the rotary tables once per packed batch instead of once per layer.
+    """Per-row tables for this rank's slice, gathered from the shared table.
 
-    Every layer derives the same positions from the same ``cu_seqlens`` and rank
-    offset, so the tables were rebuilt identically eight times over, and again
-    under activation recompute. Megatron Core builds them once above the layers
-    and hands them down.
-
-    The tables live on the ``packed_seq_params`` object, which is created once
-    per microbatch and passed to every layer, so its lifetime is exactly the
-    tables' validity. An earlier attempt cached them globally against the
-    position tensor's address; the caching allocator reuses addresses, so that
-    could return tables built for different positions. Attaching them to the
-    object that defines the positions has no such failure mode.
-
-    Core caches at a different shape and needs none of this: it builds one table
-    over ``[0, max_seq_len)`` keyed on scalars alone and lets the kernel index it
-    by ``cu_seqlens``. Reaching that here means moving the indexer off lite's
-    ``apply_partial_rope``, which consumes per-row tables, so it is left as
-    follow-up rather than approximated. The consequence to know about: editing
-    ``cu_seqlens`` in place on a params object already carrying tables returns
-    the ones built for the old boundaries.
+    Every layer derives the same within-sequence positions from the same
+    ``cu_seqlens`` and rank offset, so building the tables per layer rebuilt them
+    identically eight times over, and again under activation recompute. The
+    values live in one table keyed on scalars; this only selects the rows.
     """
-    key = (int(global_start), int(length), int(rope_head_dim), float(rope_theta),
-           bool(use_yarn), str(device), str(dtype))
-    cache = getattr(packed_seq_params, "_lite_rope_tables", None)
-    if cache is None:
-        cache = {}
-        try:
-            packed_seq_params._lite_rope_tables = cache
-        except AttributeError:
-            cache = None  # frozen params: fall through and rebuild each time
-    if cache is not None and key in cache:
-        return cache[key]
-    positions = cp_utils._thd_cp_position_ids(cu_seqlens, global_start, length)
-    built = build_compressed_rope_cos_sin(
-        positions.view(1, length).long(),
+    positions = cp_utils._thd_cp_position_ids(cu_seqlens, global_start, length).long()
+    cos, sin = rope_table(
+        int(packed_seq_params.max_seqlen_q),
         rope_head_dim,
         rope_theta,
         config=config,
@@ -185,9 +213,8 @@ def rope_tables_for_packed_batch(
         device=device,
         dtype=dtype,
     )
-    if cache is not None:
-        cache[key] = built
-    return built
+    rows = positions.view(-1)
+    return cos[0].index_select(0, rows).unsqueeze(0), sin[0].index_select(0, rows).unsqueeze(0)
 
 
 def build_compressed_rope_cos_sin(
