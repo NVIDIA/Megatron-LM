@@ -9,7 +9,7 @@ import torch
 import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
 from torch.distributed.device_mesh import init_device_mesh
-from torch.distributed.tensor import Partial, Replicate
+from torch.distributed.tensor import Partial, Replicate, Shard
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.dbuffer import DBuffer
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.placement import (
@@ -576,7 +576,7 @@ def test_get_dtensor_from_sharded_buffer(distributed_setup):
         dtensor.to_local(), sharded_buffer.get_local_tensor(0), rtol=0, atol=0
     )
     assert dtensor.shape == tensors[0].shape
-    assert dtensor.placements == (Flat(),)
+    assert dtensor.placements == (Shard(0),)
 
 
 def test_2d_mesh_replicate_flat_round_trip(distributed_setup):
