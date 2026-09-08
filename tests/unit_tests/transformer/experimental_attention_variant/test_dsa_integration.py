@@ -570,3 +570,41 @@ def test_dsv4_metric_logging_preserves_graph_groups_and_uses_indexer_layer_count
         assert helper.tracker["dynamic_cp_metric_group"] is dynamic_cp_metric_group
     finally:
         helper.tracker.clear()
+
+
+def test_dsv4_metric_logging_capture_reset_preserves_tracker_storage(monkeypatch):
+    """Capture cleanup removes synthetic indexer values without rebinding graph storage."""
+    from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
+    from megatron.core.transformer.moe import moe_logging
+
+    helper = dsa_module.DSAIndexerLossLoggingHelper
+    reduce_group = object()
+    avg_group = object()
+    metric_group = object()
+    values = torch.tensor([2.0, 3.0], device="cuda")
+    helper.tracker.clear()
+    helper.tracker.update(
+        {
+            "values": values,
+            "reduce_group": reduce_group,
+            "avg_group": avg_group,
+            "dynamic_cp_metric_group": metric_group,
+        }
+    )
+
+    graph_helper = object.__new__(TECudaGraphHelper)
+    graph_helper.config = SimpleNamespace(dsa_indexer_loss_coeff=1e-2)
+    graph_helper.model = []
+    graph_helper.optimizers = []
+    monkeypatch.setattr(moe_logging, "get_moe_metrics_tracker", lambda: {})
+
+    try:
+        graph_helper._reset_after_capture()
+
+        assert helper.tracker["values"] is values
+        torch.testing.assert_close(values, torch.zeros_like(values))
+        assert helper.tracker["reduce_group"] is reduce_group
+        assert helper.tracker["avg_group"] is avg_group
+        assert helper.tracker["dynamic_cp_metric_group"] is metric_group
+    finally:
+        helper.tracker.clear()

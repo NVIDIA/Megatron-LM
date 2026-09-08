@@ -3322,6 +3322,15 @@ class TECudaGraphHelper:
         from megatron.core.distributed.finalize_model_grads import reset_model_temporary_tensors
         from megatron.core.transformer.moe.moe_logging import get_moe_metrics_tracker
 
+        if (self.config.dsa_indexer_loss_coeff or 0.0) > 0:
+            from megatron.core.transformer.experimental_attention_variant.dsa import (
+                DSAIndexerLossLoggingHelper,
+            )
+
+            # Capture and warmup replay the tracked in-place accumulation. Keep its storage and
+            # process groups, but remove those synthetic values before the next training step.
+            DSAIndexerLossLoggingHelper.clean_loss_in_tracker(preserve_groups=True)
+
         for model_chunk in self.model:
             model_chunk.zero_grad_buffer()
         for optimizer in self.optimizers:
