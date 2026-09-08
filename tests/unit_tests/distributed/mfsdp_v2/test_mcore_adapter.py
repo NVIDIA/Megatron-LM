@@ -481,6 +481,9 @@ class TestMcoreAdapterCudaGraph:
                     megatron_fsdp_version=2,
                     use_distributed_optimizer=False,
                     data_parallel_sharding_strategy="optim_grads_params",
+                    # With the default None, MFSDP v2 uses BF16 main grads with FP32 main
+                    # params. Capturable FusedAdam in the TE revision under test requires
+                    # matching dtypes (https://github.com/NVIDIA/TransformerEngine/issues/3358).
                     megatron_fsdp_main_grads_dtype=torch.float32,
                     megatron_fsdp_cuda_graph_mode=enable_cuda_graph,
                 ),
