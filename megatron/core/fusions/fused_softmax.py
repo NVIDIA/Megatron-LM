@@ -226,9 +226,13 @@ class FusedScaleMaskSoftmax(nn.Module):
 
         In case attn_mask_type is causal the mask is generated and None can be passed.
         A user-defined mask is only needed when attn_mask_type is not causal.
+        A user-defined mask and window_size cannot be supplied together.
         """
         # [b, np, sq, sk]
         assert input.dim() == 4
+
+        if mask is not None and self.window_size is not None:
+            raise ValueError("mask and window_size cannot be supplied together")
 
         if self.is_kernel_available(mask, *input.size()) and softmax_offset is None:
             return self.forward_fused_softmax(input, mask)
@@ -319,12 +323,9 @@ class FusedScaleMaskSoftmax(nn.Module):
         # Generate causal mask if not given
         sq, sk = input.size(2), input.size(3)
         if self.window_size is not None:
-            sliding_window_mask = get_sliding_window_causal_mask(sq, sk, self.window_size)
-            # Compose with a caller-provided (e.g. padding or packed-sequence) mask
-            # instead of silently discarding it; both are bool with True = masked.
-            mask = (
-                sliding_window_mask if mask is None else torch.logical_or(mask, sliding_window_mask)
-            )
+            if mask is not None:
+                raise ValueError("mask and window_size cannot be supplied together")
+            mask = get_sliding_window_causal_mask(sq, sk, self.window_size)
         elif self.attn_mask_type == AttnMaskType.causal and mask is None and sq > 1:
             # If sq == 1 then either KV cache is used or one-element context is passed
             # so keeping mask=None in this case; subsequent code should handle it
