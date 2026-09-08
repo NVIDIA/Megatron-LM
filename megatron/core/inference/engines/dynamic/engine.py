@@ -166,6 +166,7 @@ class DynamicInferenceEngine(
     # object.__new__), and admitting a request reads this. An int is immutable, so
     # the += in resume() still rebinds onto the instance.
     _weight_epoch: int = 0
+    _deferred_cuda_graph_capture: bool = False
 
     # Defaults for instances created without __init__ (tests build the engine via __new__).
     payload_stager: Optional[RequestPayloadStager] = None
@@ -230,6 +231,7 @@ class DynamicInferenceEngine(
         self.metrics_writer = inference_config.metrics_writer
         self.logging_step_interval = inference_config.logging_step_interval
         self.unified_memory_level = inference_config.unified_memory_level
+        start_suspended = inference_config.start_suspended
         self.use_synchronous_zmq_collectives = inference_config.use_synchronous_zmq_collectives
         self.ep_consensus_interval = inference_config.ep_consensus_interval
         self.gc_mode = inference_config.gc_mode
@@ -295,11 +297,27 @@ class DynamicInferenceEngine(
                             max_step = int(val)
                     self.inference_step_offset = int(max_step)
 
-        # Mark the inference engine as active. Cleared in `suspend()` and re-set in `resume()`.
-        InferenceMode.set_active()
+        if start_suspended:
+            # Starting in the suspended case must support a case where the weights are not present
+            # upon engine construction; functionality that needs weights is deferred.
+            # The engine can still queue requests however.
+            self._deferred_cuda_graph_capture = True
+            InferenceMode.unset_active()
+            self.context.deallocate_inference_state_buffers()
+            self.resume_request_ids = []
+            self.state = EngineState.SUSPENDED
+            self._state_events[EngineState.RUNNING].clear()
+            self._state_events[EngineState.SUSPENDED].set()
+            logger.info(
+                "> dynamic_engine.py: constructed suspended; "
+                "the first resume() allocates the inference-state buffers and captures cuda graphs."
+            )
+        else:
+            # Mark the inference engine as active. Cleared in `suspend()` and re-set in `resume()`.
+            InferenceMode.set_active()
 
-        # Create cuda graphs.
-        self.create_cuda_graphs()
+            # Create cuda graphs.
+            self.create_cuda_graphs()
 
         self._enter_custom_gc_mode()
 
@@ -986,11 +1004,12 @@ class DynamicInferenceEngine(
             alloc_time = time.time() - alloc_time
 
             capture_time = time.time()
-            if (
+            if self._deferred_cuda_graph_capture or (
                 self.context.kv_cache_management_mode != KVCacheManagementMode.PERSIST
                 and not self.context.static_kv_memory_pointers
             ):
                 self.create_cuda_graphs()
+                self._deferred_cuda_graph_capture = False
             capture_time = time.time() - capture_time
 
             # Request records outlive the context buffers. Refresh every stale
