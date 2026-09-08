@@ -156,8 +156,12 @@ def rope_tables_for_packed_batch(
     could return tables built for different positions. Attaching them to the
     object that defines the positions has no such failure mode.
     """
+    # ``cu_seqlens._version`` catches an in-place edit of the lengths on a params
+    # object that is otherwise being reused. Here that is a sound use of the
+    # counter: the object pins the tensor's identity, so the counter only has to
+    # answer whether it changed, not whether it is the same tensor.
     key = (int(global_start), int(length), int(rope_head_dim), float(rope_theta),
-           bool(use_yarn), str(device), str(dtype))
+           bool(use_yarn), str(device), str(dtype), cu_seqlens._version)
     cache = getattr(packed_seq_params, "_lite_rope_tables", None)
     if cache is None:
         cache = {}

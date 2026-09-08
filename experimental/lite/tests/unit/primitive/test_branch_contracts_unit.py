@@ -335,3 +335,14 @@ def test_forward_aggregation_matches_pre_fusion_reference_gpu() -> None:
     expected = _reference_forward(module, x)
     actual, _, _ = module(x)
     torch.testing.assert_close(actual, expected, rtol=1e-4, atol=1e-4)
+
+
+def test_rope_tables_rebuild_when_cu_seqlens_is_edited_in_place() -> None:
+    """Editing the lengths on a reused params object must not return stale tables."""
+    params = _Params()
+    cu = torch.tensor([0, 4], dtype=torch.int32)
+    kw = dict(config=None, use_yarn=False, device=torch.device("cpu"), dtype=torch.float32)
+    first = rope_tables_for_packed_batch(params, cu, 0, 4, 4, 10000.0, **kw)
+    cu[1] = 3
+    second = rope_tables_for_packed_batch(params, cu, 0, 4, 4, 10000.0, **kw)
+    assert first[0] is not second[0], "an in-place edit must invalidate the entry"
