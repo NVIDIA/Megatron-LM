@@ -1378,7 +1378,8 @@ class TransformerConfig(ModelParallelConfig):
     stores one checkpoint per group of N+1 chunks (1/(N+1) the checkpoint memory) and the
     backward recomputes each group's N missing chunk states, trading recompute time for
     activation memory monotonically in N (sweet spot N=2..3). Only honored by kernel
-    builds that expose the num_chunk_states_to_recompute argument."""
+    builds that expose ``recompute_chunk_num`` or the legacy
+    ``num_chunk_states_to_recompute`` argument."""
 
     mlp_chunks_for_prefill: int = 1
     """The number of chunks along the sequence dimension to use for MLP computation
