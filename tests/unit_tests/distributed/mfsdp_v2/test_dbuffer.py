@@ -78,6 +78,8 @@ def test_block_atomic_layout_keeps_bf16_blocks_on_one_rank(distributed_setup):
         pytest.skip("Requires at least 2 ranks.")
 
     mesh = init_device_mesh(distributed_setup.device.type, (2,))
+    if mesh.get_coordinate() is None:
+        pytest.skip("Rank is outside the 2-rank BlockAtomic test mesh.")
     tensors = [
         torch.arange(24, dtype=torch.bfloat16, device=distributed_setup.device).reshape(4, 6),
         torch.arange(32, dtype=torch.bfloat16, device=distributed_setup.device).reshape(8, 4),
@@ -608,7 +610,7 @@ def test_2d_mesh_flat_before_replicate_is_rejected(distributed_setup):
         mesh_dim_names=("flat", "replicate"),
     )
 
-    with pytest.raises(ValueError, match="Flat placements must be a suffix"):
+    with pytest.raises(ValueError, match="Shard placements must be a suffix"):
         DBuffer(
             mesh=mesh,
             placements=[Flat(), Replicate()],
