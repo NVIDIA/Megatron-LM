@@ -769,11 +769,8 @@ class TestMcoreAdapterHybrid:
         assert torch.isfinite(reference).all()
         torch.testing.assert_close(hybrid, reference, rtol=1e-2, atol=0)
 
-    @pytest.mark.parametrize(
-        "dense_outer_strategy,expert_outer_strategy",
-        [("optim", "no_shard"), ("no_shard", "optim")],
-        ids=["dense-outer-optim", "expert-outer-optim"],
-    )
+    @pytest.mark.parametrize("dense_outer_strategy", ["optim", "no_shard"])
+    @pytest.mark.parametrize("expert_outer_strategy", ["optim", "no_shard"])
     def test_moe_with_independent_hybrid_placements(
         self, dense_outer_strategy, expert_outer_strategy
     ):
