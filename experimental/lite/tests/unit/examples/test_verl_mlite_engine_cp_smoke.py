@@ -190,7 +190,7 @@ def test_mlite_engine_runtime_thd_cp_uses_typed_packed_batch(
     torch = pytest.importorskip("torch")
     dist = pytest.importorskip("torch.distributed")
     TensorDict = pytest.importorskip("tensordict").TensorDict
-    pytest.importorskip("verl_mlite", reason="VERL is required for this optional example test.")
+    pytest.importorskip("verl", reason="VERL is required for this optional example test.")
     from verl_mlite.compat import apply_runtime_patches
 
     apply_runtime_patches()

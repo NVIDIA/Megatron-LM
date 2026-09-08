@@ -5,7 +5,7 @@ import pytest
 import torch
 from tensordict import TensorDict
 
-pytest.importorskip("verl_mlite", reason="VERL is required for this optional example test.")
+pytest.importorskip("verl", reason="VERL is required for this optional example test.")
 
 from verl_mlite.engine.mlite_engine import MegatronLiteEngine
 
