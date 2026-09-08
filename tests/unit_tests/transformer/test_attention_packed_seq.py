@@ -7,6 +7,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_submodules,
 )
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.attention import SelfAttention
 from megatron.core.transformer.enums import AttnMaskType
@@ -67,6 +68,9 @@ class TestParallelAttentionWithPackedSequence:
             get_gpt_layer_with_transformer_engine_submodules().self_attention.submodules,
             layer_number=1,
             attn_mask_type=AttnMaskType.causal,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(
+                required_pgs=['tp', 'cp', 'dp']
+            ),
         )
 
     def teardown_method(self, method):
@@ -143,6 +147,9 @@ class TestParallelAttentionWithPackedSequence:
             get_gpt_layer_with_transformer_engine_submodules().self_attention.submodules,
             layer_number=1,
             attn_mask_type=AttnMaskType.causal,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(
+                required_pgs=['tp', 'cp', 'dp']
+            ),
         )
         config = checkpointed_parallel_attention.config
 
@@ -229,6 +236,9 @@ class TestAttentionDynamicContextParallel:
             get_gpt_layer_with_transformer_engine_submodules().self_attention.submodules,
             layer_number=1,
             attn_mask_type=AttnMaskType.causal,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(
+                required_pgs=['tp', 'cp', 'dp']
+            ),
         )
 
     def teardown_method(self, method):
@@ -273,9 +283,10 @@ class TestAttentionDynamicContextParallel:
             dtype=torch.bfloat16,
             device="cuda",
         )
-        rotary_pos_emb = RotaryEmbedding(kv_channels=16, rotary_percent=1.0)(sequence_length)
-
         build_time_group = self.parallel_attention.pg_collection.cp
+        rotary_pos_emb = RotaryEmbedding(
+            kv_channels=16, rotary_percent=1.0, cp_group=build_time_group
+        )(sequence_length)
 
         # Microbatch with a runtime CP group: RoPE (and the collection) must
         # use it.

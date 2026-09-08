@@ -65,12 +65,13 @@ class DotProductAttention(MegatronModule):
         projection_size = self.config.kv_channels * self.config.num_attention_heads
 
         # Per attention head and per partition values.
-        if pg_collection is None:
-            pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp'])
-        else:
-            assert hasattr(
-                pg_collection, 'tp'
-            ), "DotProductAttention pg_collection must have tp process group"
+        assert pg_collection is not None, (
+            "DotProductAttention requires an explicit pg_collection; "
+            "see docs/developer/parallel-state-deprecation.md"
+        )
+        assert hasattr(
+            pg_collection, 'tp'
+        ), "DotProductAttention pg_collection must have tp process group"
         self.pg_collection = pg_collection
         self.tp_group = self.pg_collection.tp
 

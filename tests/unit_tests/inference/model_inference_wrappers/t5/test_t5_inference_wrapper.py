@@ -18,6 +18,7 @@ from megatron.core.models.T5.t5_spec import (
     get_t5_decoder_with_transformer_engine_block_spec,
     get_t5_encoder_with_transformer_engine_block_spec,
 )
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -75,6 +76,9 @@ class TestT5InferenceWrapper:
             post_process=True,
             add_encoder=True,
             add_decoder=True,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(
+                required_pgs=['tp', 'cp', 'pp']
+            ),
         ).cuda()
 
         inference_context = StaticInferenceContext(max_batch_size=8, max_sequence_length=2560)

@@ -802,7 +802,8 @@ def mtp_on_this_rank(
     mtp_num_layers: Optional[int] = None,
     ignore_virtual: Optional[bool] = True,
     vp_stage: Optional[int] = None,
-    pp_group: Optional[torch.distributed.ProcessGroup] = None,
+    *,
+    pp_group: torch.distributed.ProcessGroup,
     vp_size: Optional[int] = None,
 ) -> bool:
     """
@@ -818,13 +819,8 @@ def mtp_on_this_rank(
           pipeline stage. The function returns True only on the last pipeline stage.
     """
     mtp_on_this_rank = False
-    if pp_group is not None:
-        pp_rank = get_pg_rank(pp_group)
-        pp_size = get_pg_size(pp_group)
-    else:
-        # Compatibility fallback for callers that have not migrated to an explicit PP group.
-        pp_rank = parallel_state.get_pipeline_model_parallel_rank()
-        pp_size = None
+    pp_rank = get_pg_rank(pp_group)
+    pp_size = get_pg_size(pp_group)
     if vp_size is None and layout is not None:
         vp_size = layout.virtual_pipeline_model_parallel_size
     elif vp_size is None and not ignore_virtual:
@@ -845,9 +841,6 @@ def mtp_on_this_rank(
     else:
         # without custom PP layout, we only support put all of MTP layers on the last pipeline stage
         if mtp_num_layers is not None:
-            if pp_size is None:
-                # Compatibility fallback for callers without explicit pipeline metadata.
-                pp_size = parallel_state.get_pipeline_model_parallel_world_size()
             mtp_on_this_rank = pp_rank == pp_size - 1
             if mtp_on_this_rank and not ignore_virtual and vp_size not in (None, 1):
                 assert (
@@ -1825,7 +1818,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                     custom_forward,
                     self.config.distribute_saved_activations,
                     tensor_parallel.random.get_cuda_rng_tracker,
-                    parallel_state.get_tensor_model_parallel_group(),
+                    self.tp_group,
                     hidden_states,
                     decoder_input,
                     attention_mask,
@@ -2158,20 +2151,19 @@ class MultiTokenPredictionBlock(MegatronModule):
         # Initialize Context Parallelism (CP) support for MTP
         # This enables MTP to work with CP > 1 by providing the CP process group
         # to the roll_tensor function for proper boundary communication
-        if pg_collection is None:
-            # Use default MPU process groups if not provided
-            required_pgs = ['cp', 'tp', 'pp'] + (['dp'] if self.config.mtp_hsm else [])
-            pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=required_pgs)
-        else:
-            # Ensure the provided process groups include TP, CP, and PP.
-            for group_name in ('tp', 'cp', 'pp'):
-                assert (
-                    getattr(pg_collection, group_name, None) is not None
-                ), f"MultiTokenPredictionBlock pg_collection must have {group_name} process group"
-            if self.config.mtp_hsm:
-                assert hasattr(
-                    pg_collection, 'dp'
-                ), "MultiTokenPredictionBlock with HSM requires a dp process group"
+        assert pg_collection is not None, (
+            "MultiTokenPredictionBlock requires an explicit pg_collection with tp/cp/pp; "
+            "see docs/developer/parallel-state-deprecation.md"
+        )
+        # Ensure the provided process groups include TP, CP, and PP.
+        for group_name in ('tp', 'cp', 'pp'):
+            assert (
+                getattr(pg_collection, group_name, None) is not None
+            ), f"MultiTokenPredictionBlock pg_collection must have {group_name} process group"
+        if self.config.mtp_hsm:
+            assert hasattr(
+                pg_collection, 'dp'
+            ), "MultiTokenPredictionBlock with HSM requires a dp process group"
 
         self._build_layers(pg_collection)
         assert len(self.layers) > 0, "MultiTokenPredictionBlock must have at least one layer."
