@@ -359,15 +359,17 @@ class OwnerGatherPlan:
         """
         shards: list[torch.Tensor] = []
         for src in range(plan.dp_size):
-            row_count = plan.rank_row_count(src)
             if src == owner_rank:
                 shards.append(self.own_shards[param_index])
-            elif row_count == 0:
                 continue
-            else:
-                offset, numel, _ = self.recv_offsets[(param_index, src)]
-                buf = recv_buffers[src]
-                shards.append(buf[offset : offset + numel].view(row_count, plan.row_size))
+
+            row_count = plan.rank_row_count(src)
+            if row_count == 0:
+                continue
+
+            offset, numel, _ = self.recv_offsets[(param_index, src)]
+            buf = recv_buffers[src]
+            shards.append(buf[offset : offset + numel].view(row_count, plan.row_size))
         if len(shards) == 1:
             return shards[0]
         return torch.cat(shards, dim=0)
