@@ -60,9 +60,11 @@ def register_combined_1f1b_hooks(module: FsdpModule) -> None:
     register_refs(module, module)
 
     for submodule in module.modules():
-        submodule.register_forward_pre_hook(
-            _unshard_before_submodule_forward, prepend=True, with_kwargs=True
-        )
-        submodule.register_full_backward_pre_hook(_unshard_before_submodule_backward)
+        has_parameters = len(list(submodule.parameters(recurse=False))) > 0
+        if has_parameters:
+            submodule.register_forward_pre_hook(
+                _unshard_before_submodule_forward, prepend=True, with_kwargs=True
+            )
+            submodule.register_full_backward_pre_hook(_unshard_before_submodule_backward)
         if isinstance(submodule, FsdpModule):
             submodule.register_post_backward_hook(_module_post_backward_hook)

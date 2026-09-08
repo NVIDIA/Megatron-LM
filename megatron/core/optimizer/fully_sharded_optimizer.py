@@ -10,7 +10,6 @@ from torch.distributed.tensor import DTensor
 from ..config_logger import has_config_logger_enabled, log_config_to_disk
 from ..dist_checkpointing.mapping import ShardedStateDict
 from ..distributed.fsdp.src.megatron_fsdp.experimental.parameter_group import (
-    _is_empty_local_shard,
     sync_model_weights_from_main_weights,
 )
 from ..transformer.module import MegatronModule
@@ -214,24 +213,6 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
         # can still have stale module grads to clear.
         for model_chunk in self.model_chunks:
             model_chunk.zero_grad(set_to_none=set_to_none)
-
-        # Source fix: ``model_chunk.zero_grad`` only clears params that are bound in
-        # ``model_chunk.parameters()`` at this moment (the sharded view). Empty-shard
-        # params appear there in the unsharded view (or not at all), so their
-        # ``fsdp_parameter.sharded.grad`` survives from a prior step. Null those here
-        # so the all-set/all-None invariant holds at the source across steps.
-        for model_chunk in self.model_chunks:
-            self._clear_empty_shard_grads(model_chunk)
-
-    def _clear_empty_shard_grads(self, model_chunk) -> None:
-        """Null the sharded/unsharded grads of empty-shard params (source fix)."""
-        for module in model_chunk.modules():
-            for group in getattr(module, "_parameter_groups", ()):
-                for fsdp_parameter in getattr(group, "fsdp_parameters", ()):
-                    if not _is_empty_local_shard(fsdp_parameter):
-                        continue
-                    fsdp_parameter.sharded.grad = None
-                    fsdp_parameter.unsharded.grad = None
 
     def _copy_model_grads_to_main_grads(self) -> None:
         """Install optimizer-compatible gradients for non-precision-aware optimizers."""
