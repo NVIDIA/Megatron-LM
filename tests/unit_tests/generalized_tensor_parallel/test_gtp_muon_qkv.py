@@ -92,13 +92,15 @@ class TestQKVRowCount:
 
     @pytest.mark.parametrize("gtp_size", [1, 2, 4, 64])
     def test_decision_is_layout_invariant(self, gtp_size):
-        """Same weight, every GTP degree: always splittable, always the same row count."""
-        local_rows = _GROUP // gtp_size if gtp_size <= _GROUP else 1
-        global_rows = local_rows * gtp_size
-        rows, size, splittable = _rows(_param(local_rows), _SPLIT, gtp_size)
-        assert size == gtp_size
-        assert rows == global_rows
-        assert splittable == (global_rows % _GROUP == 0)
+        """ONE weight of _M rows, sharded every which way: same verdict, same count.
+
+        Asserted against constants, not against the implementation's own expression --
+        restating the formula would pass for any implementation that keeps it. At
+        gtp_size=64 the shard is 3 rows, so the shard-local test this replaced would
+        say False here while saying True at gtp_size=1.
+        """
+        assert _M % gtp_size == 0, "the fixture must shard evenly to stay one weight"
+        assert _rows(_param(_M // gtp_size), _SPLIT, gtp_size) == (_M, gtp_size, True)
 
     def test_local_shard_would_have_disabled(self):
         """The regression test: production's 102 x 64 = 6528, which the old
