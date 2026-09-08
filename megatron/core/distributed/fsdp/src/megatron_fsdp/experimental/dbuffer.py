@@ -22,7 +22,7 @@ import torch
 import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
 from torch.distributed import DeviceMesh
-from torch.distributed.tensor import DTensor, Partial, Replicate
+from torch.distributed.tensor import DTensor, Partial, Replicate, Shard
 from torch.distributed.tensor.placement_types import Placement
 
 from .layout import GlobalLayout, Shape, non_leading_numel
@@ -38,15 +38,19 @@ class _OwnedRange:
 
 def _validate_placements(placements: Iterable[Placement]) -> None:
     """Validate DBuffer placements form a supported contiguous local layout."""
-    seen_flat = False
+    seen_shard = False
     for placement in placements:
-        if not isinstance(placement, (Replicate, Partial, Flat, BlockAtomic)):
+        if not isinstance(placement, (Replicate, Partial, Shard)):
             raise TypeError(f"Unsupported DBuffer placement: {placement!r}.")
-        if isinstance(placement, (Flat, BlockAtomic)):
-            seen_flat = True
-        elif seen_flat:
+        if isinstance(placement, Shard):
+            if placement.dim != 0:
+                raise NotImplementedError(
+                    f"DBuffer supports only dim-0 Shard placements, got {placement!r}."
+                )
+            seen_shard = True
+        elif seen_shard:
             raise ValueError(
-                "Flat placements must be a suffix of the placement list so each "
+                "Shard placements must be a suffix of the placement list so each "
                 "local buffer is a contiguous global-buffer range."
             )
 
@@ -259,7 +263,7 @@ class DBuffer:
         source_placement = self.placements[changed_axis]
         destination_placement = placements[changed_axis]
         if isinstance(source_placement, (Replicate, Partial)) and isinstance(
-            destination_placement, Flat
+            destination_placement, Shard
         ):
             offset, local_numel = self.layout.get_local_range(self.mesh, placements)
             local_offset = offset - self.offset
@@ -413,13 +417,13 @@ class DBuffer:
         axis = changed_axis
         old_placement = self.placements[axis]
         new_placement = new_placements[axis]
-        if isinstance(old_placement, Flat) and isinstance(new_placement, Replicate):
+        if isinstance(old_placement, Shard) and isinstance(new_placement, Replicate):
             return self.allgather(axis, out=out)
         if isinstance(old_placement, Partial) and isinstance(new_placement, Replicate):
             return self.allreduce(axis, out=out)
-        if isinstance(old_placement, Partial) and isinstance(new_placement, Flat):
+        if isinstance(old_placement, Partial) and isinstance(new_placement, Shard):
             return self.reduce_scatter(axis, new_placement, out=out)
-        if isinstance(old_placement, Replicate) and isinstance(new_placement, Flat):
+        if isinstance(old_placement, Replicate) and isinstance(new_placement, Shard):
             view = self.view(new_placements)
             if out is None:
                 return view
@@ -454,9 +458,9 @@ class DBuffer:
 
     def allgather(self, mesh_axis: int, *, out: "DBuffer | None" = None) -> "DBuffer":
         """All-gather a sharded axis into Replicate placement."""
-        if not isinstance(self.placements[mesh_axis], Flat):
+        if not isinstance(self.placements[mesh_axis], Shard):
             raise ValueError(
-                f"allgather() currently requires Flat placement on axis {mesh_axis!r}."
+                f"allgather() currently requires a Shard placement on axis {mesh_axis!r}."
             )
 
         placements = list(self.placements)
@@ -495,8 +499,8 @@ class DBuffer:
     ) -> "DBuffer":
         """Reduce-scatter a Partial axis into ``new_placement``."""
         axis = mesh_axis
-        if not isinstance(new_placement, Flat):
-            raise NotImplementedError("DBuffer currently supports reduce_scatter() to Flat only.")
+        if not isinstance(new_placement, Shard):
+            raise NotImplementedError("DBuffer currently supports reduce_scatter() to Shard only.")
         partial_placement = self.placements[axis]
         if not isinstance(partial_placement, Partial):
             raise ValueError(f"reduce_scatter() requires Partial placement on axis {mesh_axis!r}.")
