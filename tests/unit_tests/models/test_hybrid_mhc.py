@@ -4,10 +4,10 @@ import pytest
 import torch
 
 from megatron.core.models.hybrid.hybrid_block import HybridStack, HybridStackSubmodules
-from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.models.hybrid.layers.hybrid_hyper_connection import HyperConnectionHybridLayer
+from megatron.core.models.hybrid.layers.utils import Symbols
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig

@@ -772,12 +772,8 @@ def validate_args(args, defaults={}):
             args.rank,
         )
 
-    from megatron.core.models.hybrid.hybrid_layer_allocation import (
-        Symbols,
-        get_hybrid_total_layer_count,
-        get_hybrid_total_pipeline_segment_count,
-        parse_hybrid_pattern,
-    )
+    from megatron.core.models.hybrid.layers.utils import Symbols
+
     sep = Symbols.MTP_SEPARATOR
 
     # Backward compat: convert legacy mtp_hybrid_override_pattern to unified format
@@ -794,6 +790,12 @@ def validate_args(args, defaults={}):
         print_rank_0(f"Converted legacy MTP pattern to unified: {args.hybrid_layer_pattern}")
 
     if args.hybrid_layer_pattern is not None:
+        from megatron.core.models.hybrid.hybrid_layer_allocation import (
+            get_hybrid_total_layer_count,
+            get_hybrid_total_pipeline_segment_count,
+            parse_hybrid_pattern,
+        )
+
         # Derive num_layers from pattern; hybrid_layer_pattern always overrides --num-layers when
         # both are present (e.g. when loading from checkpoint with --use-checkpoint-args).
         num_layers_in_pattern = get_hybrid_total_layer_count(args.hybrid_layer_pattern)
@@ -851,8 +853,8 @@ def validate_args(args, defaults={}):
             args.hybrid_layer_pattern
         )
         if hybrid_pipeline_segments == 1 and args.transformer_pipeline_model_parallel_size > 1:
-            # No pipes in pattern -- PP will be handled by select_pipeline_segment
-            # at model init time (for backwards compatibility).
+            # No pipes in the legacy pattern -- HybridModel converts it to a config list,
+            # then the native config-list selector distributes it across PP ranks.
             args.virtual_pipeline_model_parallel_size = None
         else:
             assert hybrid_pipeline_segments % args.transformer_pipeline_model_parallel_size == 0, (

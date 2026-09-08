@@ -118,6 +118,41 @@ class TestGetLayerSymbolFromConfig:
         ):
             layer_utils.get_layer_symbol_from_config(config)
 
+    def test_converts_config_list_in_order(self):
+        config = _make_transformer_config()
+        layer_config_list = [
+            config_type.from_config(config) for _, config_type in _EXPECTED_LAYER_CONFIG_TYPES
+        ]
+
+        assert layer_utils.get_layer_type_list_from_layer_config_list(layer_config_list) == [
+            symbol for symbol, _ in _EXPECTED_LAYER_CONFIG_TYPES
+        ]
+
+
+@pytest.mark.internal
+def test_get_layer_maps_from_layer_type_list():
+    symbols = [
+        layer_utils.Symbols.ATTENTION,
+        layer_utils.Symbols.DS_ATTENTION,
+        layer_utils.Symbols.GDN,
+        layer_utils.Symbols.MAMBA,
+        layer_utils.Symbols.MLA,
+        layer_utils.Symbols.MLP,
+        layer_utils.Symbols.MOE,
+        layer_utils.Symbols.ATTENTION,
+        layer_utils.Symbols.MAMBA,
+    ]
+
+    assert layer_utils.get_layer_maps_from_layer_type_list(symbols) == {
+        layer_utils.Symbols.ATTENTION: {0: 0, 7: 1},
+        layer_utils.Symbols.DS_ATTENTION: {1: 0},
+        layer_utils.Symbols.GDN: {2: 0},
+        layer_utils.Symbols.MAMBA: {3: 0, 8: 1},
+        layer_utils.Symbols.MLA: {4: 0},
+        layer_utils.Symbols.MLP: {5: 0},
+        layer_utils.Symbols.MOE: {6: 0},
+    }
+
 
 @pytest.mark.internal
 class TestCountLayerConfigs:

@@ -23,9 +23,6 @@ from megatron.core.fp4_utils import get_fp4_context
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.inference.utils import InferenceMode
-from megatron.core.models.hybrid.hybrid_layer_allocation import (
-    get_layer_type_list_from_layer_config_list,
-)
 from megatron.core.models.hybrid.layers import utils as layer_utils
 from megatron.core.models.hybrid.layers.hybrid_hyper_connection import HyperConnectionHybridLayer
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -326,7 +323,7 @@ class HybridStack(MegatronModule):
         ``HybridStack.layer_type_list`` continue to work. ``layer_config_list`` remains
         the source of truth.
         """
-        return get_layer_type_list_from_layer_config_list(self.layer_config_list)
+        return layer_utils.get_layer_type_list_from_layer_config_list(self.layer_config_list)
 
     def _fuse_mla_down_proj(self, submodules: HybridStackSubmodules) -> HybridStackSubmodules:
         # Avoid modifying the original object so users don't get surprised about their `submodules`

@@ -1,5 +1,6 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 # Note: --ckpt-format torch_dist has tests in tests/unit_tests/dist_checkpointing.
+import builtins
 import os
 from types import SimpleNamespace
 from typing import Optional
@@ -112,10 +113,18 @@ def test_checkpoint_model_family_prefers_explicit_flag(checkpoint_args, expected
     assert _checkpoint_is_hybrid_model(checkpoint_args) is expected
 
 
-def test_list_only_hybrid_checkpoint_does_not_take_gpt_remap_path():
+def test_list_only_hybrid_checkpoint_does_not_take_gpt_remap_path(monkeypatch):
     """A list-authored HybridModel resume is identified without a saved pattern."""
     args = SimpleNamespace(hybrid_layer_pattern=None)
     checkpoint_args = SimpleNamespace(checkpoint_model_is_hybrid=True)
+    original_import = builtins.__import__
+
+    def reject_gpt_interop(name, *import_args, **kwargs):
+        if name == "megatron.core.dist_checkpointing.gpt_checkpoint_interop":
+            pytest.fail("matching model families must not import GPT checkpoint interop")
+        return original_import(name, *import_args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", reject_gpt_interop)
 
     with mock.patch("megatron.training.checkpointing._contains_hybrid_model", return_value=True):
         layer_maps, load_optim = _maybe_setup_gpt_to_hybrid_load(args, checkpoint_args, [object()])

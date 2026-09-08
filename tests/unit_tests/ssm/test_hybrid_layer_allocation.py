@@ -1,7 +1,6 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 import functools
-import operator
 from unittest.mock import patch
 
 import pytest
@@ -12,7 +11,6 @@ from megatron.core.models.hybrid.hybrid_layer_allocation import (
     get_hybrid_layer_counts,
     get_hybrid_total_layer_count,
     get_hybrid_total_pipeline_segment_count,
-    get_layer_maps_from_layer_type_list,
     parse_hybrid_pattern,
     pattern_from_ratios,
     select_pipeline_segment,
@@ -913,102 +911,3 @@ class TestSelectPipelineSegmentLegacyFallback:
             assert offset == len(all_layers)
             all_layers.extend(layers)
         _assert_layer_config_types(all_layers, "M*M*M*")
-
-
-@pytest.mark.internal
-class TestGetLayerMapsFromLayerTypeList:
-    """Tests for get_layer_maps_from_layer_type_list."""
-
-    def test_standard_layer_types(self):
-        """Standard symbols each produce a single-entry map at local index 0."""
-        maps = get_layer_maps_from_layer_type_list(
-            [Symbols.ATTENTION, Symbols.MAMBA, Symbols.MLP, Symbols.MOE]
-        )
-        # We always get all symbols, not only those contained in the pattern.
-        assert len(maps) == len(Symbols.LAYER_CONFIG_MAP)
-        attention_map, mamba_map, mlp_map, moe_map = operator.itemgetter(
-            Symbols.ATTENTION, Symbols.MAMBA, Symbols.MLP, Symbols.MOE
-        )(maps)
-        assert attention_map == {0: 0}
-        assert mamba_map == {1: 0}
-        assert mlp_map == {2: 0}
-        assert moe_map == {3: 0}
-
-    def test_dsa(self):
-        """DSA layers have their own local cache indices."""
-        maps = get_layer_maps_from_layer_type_list(
-            [Symbols.DS_ATTENTION, Symbols.MAMBA, Symbols.DS_ATTENTION, Symbols.MAMBA]
-        )
-        attention_map, dsa_map, mamba_map, mlp_map, moe_map = operator.itemgetter(
-            Symbols.ATTENTION, Symbols.DS_ATTENTION, Symbols.MAMBA, Symbols.MLP, Symbols.MOE
-        )(maps)
-        assert attention_map == {}
-        assert dsa_map == {0: 0, 2: 1}
-        assert mamba_map == {1: 0, 3: 1}
-        assert mlp_map == {}
-        assert moe_map == {}
-
-    def test_mixed_attention_and_dsa(self):
-        """Attention and DSA layers maintain separate local indices."""
-        maps = get_layer_maps_from_layer_type_list(
-            [Symbols.ATTENTION, Symbols.DS_ATTENTION, Symbols.MAMBA, Symbols.MLP]
-        )
-        attention_map, dsa_map, mamba_map, mlp_map, moe_map = operator.itemgetter(
-            Symbols.ATTENTION, Symbols.DS_ATTENTION, Symbols.MAMBA, Symbols.MLP, Symbols.MOE
-        )(maps)
-        assert attention_map == {0: 0}
-        assert dsa_map == {1: 0}
-        assert mamba_map == {2: 0}
-        assert mlp_map == {3: 0}
-        assert moe_map == {}
-
-    def test_all_mamba(self):
-        """All-Mamba patterns leave the other maps empty."""
-        maps = get_layer_maps_from_layer_type_list([Symbols.MAMBA] * 3)
-        attention_map, mamba_map, mlp_map, moe_map = operator.itemgetter(
-            Symbols.ATTENTION, Symbols.MAMBA, Symbols.MLP, Symbols.MOE
-        )(maps)
-        assert attention_map == {}
-        assert mamba_map == {0: 0, 1: 1, 2: 2}
-        assert mlp_map == {}
-        assert moe_map == {}
-
-    def test_mla(self):
-        """MLA layers have their own local cache indices."""
-        maps = get_layer_maps_from_layer_type_list(
-            [Symbols.MLA, Symbols.MAMBA, Symbols.MLA, Symbols.MAMBA]
-        )
-        attention_map, dsa_map, mamba_map, mla_map, mlp_map, moe_map = operator.itemgetter(
-            Symbols.ATTENTION,
-            Symbols.DS_ATTENTION,
-            Symbols.MAMBA,
-            Symbols.MLA,
-            Symbols.MLP,
-            Symbols.MOE,
-        )(maps)
-        assert attention_map == {}
-        assert dsa_map == {}
-        assert mla_map == {0: 0, 2: 1}
-        assert mamba_map == {1: 0, 3: 1}
-        assert mlp_map == {}
-        assert moe_map == {}
-
-    def test_mixed_dsa_and_mla(self):
-        """DSA and MLA layers maintain separate local indices."""
-        maps = get_layer_maps_from_layer_type_list(
-            [Symbols.DS_ATTENTION, Symbols.MLA, Symbols.MAMBA, Symbols.MLP]
-        )
-        attention_map, dsa_map, mamba_map, mla_map, mlp_map, moe_map = operator.itemgetter(
-            Symbols.ATTENTION,
-            Symbols.DS_ATTENTION,
-            Symbols.MAMBA,
-            Symbols.MLA,
-            Symbols.MLP,
-            Symbols.MOE,
-        )(maps)
-        assert attention_map == {}
-        assert dsa_map == {0: 0}
-        assert mla_map == {1: 0}
-        assert mamba_map == {2: 0}
-        assert mlp_map == {3: 0}
-        assert moe_map == {}

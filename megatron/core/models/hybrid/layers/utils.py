@@ -92,6 +92,26 @@ def get_layer_symbol_from_config(layer_config: TransformerConfig) -> str:
     raise ValueError(f"Unexpected hybrid layer config type: {type(layer_config).__name__}")
 
 
+def get_layer_type_list_from_layer_config_list(
+    layer_config_list: Sequence[TransformerConfig],
+) -> list[str]:
+    """Return the canonical symbol for each layer config in order."""
+
+    return [get_layer_symbol_from_config(layer_config) for layer_config in layer_config_list]
+
+
+def get_layer_maps_from_layer_type_list(
+    layer_type_list: Sequence[str],
+) -> dict[str, dict[int, int]]:
+    """Map global layer indices to per-type indices for every supported layer type."""
+
+    layer_maps = {symbol: {} for symbol in Symbols.name_sorted_valid_layer_symbols()}
+    for global_layer_idx, layer_type in enumerate(layer_type_list):
+        layer_map = layer_maps[layer_type]
+        layer_map[global_layer_idx] = len(layer_map)
+    return layer_maps
+
+
 def validate_layer_config_types(layer_config_types: Collection[type[TransformerConfig]]) -> None:
     """Validate layer config types that share one hybrid model.
 

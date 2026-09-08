@@ -25,7 +25,7 @@ class MambaInferenceStateConfig:
     layer_type_list: List[str]
     """
     A list of strings that indicates the layer type (Mamba / GDN / Attention / MLP) for each layer.
-    See `megatron/core/models/hybrid/hybrid_layer_allocation.py` for the list of symbols.
+    See `megatron/core/models/hybrid/layers/utils.py` for the list of symbols.
     """
 
     conv_states_shape: Tuple[int]
@@ -75,7 +75,7 @@ class MambaInferenceStateConfig:
         ssm_states_dtype: Optional[torch.dtype] = None,
     ) -> Optional["MambaInferenceStateConfig"]:
         """Return recurrent inference state config for a Mamba or GDN hybrid model."""
-        from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
+        from megatron.core.models.hybrid.layers.utils import Symbols
         from megatron.core.ssm.ssm_inference import ssm_chunking
 
         decoder = get_attr_wrapped_model(model, "decoder")

@@ -19,7 +19,7 @@ from megatron.core.inference.config import (
 )
 from megatron.core.inference.moe import InferenceGroupedGemmBackend
 from megatron.core.inference.quantization.utils import resolve_mxfp8_backend
-from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
+from megatron.core.models.hybrid.layers.utils import Symbols
 from megatron.core.ssm.gated_delta_product import GatedDeltaProductMixer
 from megatron.core.ssm.mamba_mixer import MambaMixer
 from megatron.core.ssm.ops.gdp.common import CHUNK_SIZE as GDP_CHUNK_SIZE
@@ -277,7 +277,7 @@ class TestInferenceConfig:
 
 def _ssm_model(mixers):
     """A stand-in model exposing only what `MambaInferenceStateConfig.from_model` reads."""
-    from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
+    from megatron.core.models.hybrid.layers.utils import Symbols
 
     decoder = SimpleNamespace(
         layer_type_list=[Symbols.MAMBA] * len(mixers),
@@ -341,7 +341,7 @@ class TestSSMChunkAlignment:
     @pytest.mark.internal
     def test_stack_without_a_recurrent_layer_reports_no_chunking(self):
         """A pipeline stage of pure attention/MLP layers has nothing to report."""
-        from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
+        from megatron.core.models.hybrid.layers.utils import Symbols
         from megatron.core.ssm.ssm_inference import ssm_chunking
 
         layer_types = [Symbols.ATTENTION, Symbols.MLP]

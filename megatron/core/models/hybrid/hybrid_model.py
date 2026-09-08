@@ -17,6 +17,7 @@ from megatron.core.models.common.language_module.language_module import Language
 from megatron.core.models.hybrid.hybrid_layer_config import (
     ArchitectureEntry,
     scan_hybrid_layer_config_list,
+    select_pipeline_config_segment,
 )
 from megatron.core.models.hybrid.layers import utils as layer_utils
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -257,10 +258,6 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             layer_utils.validate_tp_comm_overlap(
                 self.config, decoder_layer_configs, has_mtp=True
             )
-        from megatron.core.models.hybrid.hybrid_layer_allocation import (
-            select_pipeline_config_segment,
-        )
-
         local_layer_config_list, layer_offset = select_pipeline_config_segment(
             decoder_entries, self.config, self.pg_collection.pp, self.vp_stage, **logging_pg_kwargs
         )

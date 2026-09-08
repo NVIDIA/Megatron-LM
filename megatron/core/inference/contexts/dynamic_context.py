@@ -33,10 +33,7 @@ from megatron.core.inference.unified_memory import (
 )
 from megatron.core.inference.utils import device_memory_summary, tensor_swap
 from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_emb
-from megatron.core.models.hybrid.hybrid_layer_allocation import (
-    Symbols,
-    get_layer_maps_from_layer_type_list,
-)
+from megatron.core.models.hybrid.layers.utils import Symbols, get_layer_maps_from_layer_type_list
 from megatron.core.package_info import __version__ as mcore_version
 from megatron.core.ssm.ops.gdp.metadata import max_gdp_chunk_counts
 from megatron.core.transformer import MLATransformerConfig, TransformerConfig

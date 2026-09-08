@@ -46,7 +46,10 @@ from megatron.core.dist_checkpointing.strategies.torch import (
 from megatron.core.msc_utils import MultiStorageClientFeature, maybe_msc
 from megatron.core.num_microbatches_calculator import update_num_microbatches
 from megatron.core.optimizer import DistributedOptimizer
-from megatron.core.post_training.modelopt.checkpointing import save_modelopt_state, save_sharded_modelopt_state
+from megatron.core.post_training.modelopt.checkpointing import (
+    save_modelopt_state,
+    save_sharded_modelopt_state,
+)
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.tokenizers import MegatronTokenizer
 from megatron.core.utils import get_pg_rank, get_pg_size, unwrap_model
@@ -2407,7 +2410,6 @@ def _maybe_setup_gpt_to_hybrid_load(args, ckpt_args, model):
     Returns ``(None, False)`` when checkpoint and runtime already agree. Raises
     RuntimeError for combinations that cannot be loaded.
     """
-    from megatron.core.dist_checkpointing.gpt_checkpoint_interop import gpt_compatible_layer_maps
     runtime_is_hybrid = any(_contains_hybrid_model(m) for m in model)
     ckpt_pattern = getattr(ckpt_args, 'hybrid_layer_pattern', None) or getattr(
         ckpt_args, 'hybrid_override_pattern', None
@@ -2435,6 +2437,8 @@ def _maybe_setup_gpt_to_hybrid_load(args, ckpt_args, model):
             '--hybrid-layer-pattern so checkpoint layers can be paired with '
             'hybrid layer positions.'
         )
+    from megatron.core.dist_checkpointing.gpt_checkpoint_interop import gpt_compatible_layer_maps
+
     try:
         layer_maps = gpt_compatible_layer_maps(args.hybrid_layer_pattern)
     except ValueError as exc:

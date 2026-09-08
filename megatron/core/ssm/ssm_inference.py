@@ -86,13 +86,13 @@ def ssm_chunking(layer_type_list: List[str], layers: Sequence) -> Optional[SSMCh
 
     Args:
         layer_type_list: Per-layer symbols, positionally matching `layers`. See
-            `megatron/core/models/hybrid/hybrid_layer_allocation.py`.
+            `megatron/core/models/hybrid/layers/utils.py`.
         layers: The stack's layers.
 
     Returns:
         The shared `SSMChunking`, or None if no layer is recurrent.
     """
-    from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
+    from megatron.core.models.hybrid.layers.utils import Symbols
 
     chunking = None
     first_layer_idx = None

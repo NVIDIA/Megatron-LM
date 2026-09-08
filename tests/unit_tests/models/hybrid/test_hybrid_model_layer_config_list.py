@@ -1,5 +1,8 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import builtins
+import subprocess
+import sys
 from contextlib import nullcontext
 from types import SimpleNamespace
 
@@ -8,6 +11,7 @@ import torch
 from torch import nn
 
 import megatron.core.models.hybrid.hybrid_layer_allocation as hybrid_allocation_module
+import megatron.core.models.hybrid.hybrid_layer_config as hybrid_config_module
 import megatron.core.models.hybrid.hybrid_model as hybrid_model_module
 import megatron.core.transformer.multi_token_prediction as mtp_module
 from megatron.core.models.common.language_module.language_module import LanguageModule
@@ -87,6 +91,19 @@ def _pg_collection(*, pp_rank: int = 0, pp_size: int = 1):
     )
 
 
+def test_importing_hybrid_model_does_not_import_legacy_allocation():
+    code = """
+import sys
+from megatron.core.models.hybrid.hybrid_model import HybridModel
+
+assert HybridModel is not None
+assert 'megatron.core.models.hybrid.hybrid_layer_allocation' not in sys.modules
+"""
+    result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+
+    assert result.returncode == 0, result.stderr
+
+
 @pytest.fixture
 def patch_cpu_model_construction(monkeypatch):
     build_calls = []
@@ -98,10 +115,10 @@ def patch_cpu_model_construction(monkeypatch):
 
     monkeypatch.setattr(LanguageModule, "_set_attention_backend", lambda self: None)
     monkeypatch.setattr(hybrid_model_module, "get_pg_size", lambda group: group.size())
-    monkeypatch.setattr(hybrid_allocation_module, "get_pg_rank", lambda group: group.rank())
-    monkeypatch.setattr(hybrid_allocation_module, "get_pg_size", lambda group: group.size())
+    monkeypatch.setattr(hybrid_config_module, "get_pg_rank", lambda group: group.rank())
+    monkeypatch.setattr(hybrid_config_module, "get_pg_size", lambda group: group.size())
     monkeypatch.setattr(
-        hybrid_allocation_module, "log_on_each_pipeline_stage", lambda *args, **kwargs: None
+        hybrid_config_module, "log_on_each_pipeline_stage", lambda *args, **kwargs: None
     )
     monkeypatch.setattr(hybrid_model_module, "build_module", fake_build_module)
     return build_calls
@@ -125,13 +142,13 @@ def test_uneven_pipeline_split_segments_preserve_ownership_and_offsets(
             architecture.append(PipelineSplit)
         architecture.extend(segment)
 
-    monkeypatch.setattr(hybrid_allocation_module, "get_pg_rank", lambda group: pp_rank)
-    monkeypatch.setattr(hybrid_allocation_module, "get_pg_size", lambda group: 2)
+    monkeypatch.setattr(hybrid_config_module, "get_pg_rank", lambda group: pp_rank)
+    monkeypatch.setattr(hybrid_config_module, "get_pg_size", lambda group: 2)
     monkeypatch.setattr(
-        hybrid_allocation_module, "log_on_each_pipeline_stage", lambda *args, **kwargs: None
+        hybrid_config_module, "log_on_each_pipeline_stage", lambda *args, **kwargs: None
     )
 
-    selected, offset = hybrid_allocation_module.select_pipeline_config_segment(
+    selected, offset = hybrid_config_module.select_pipeline_config_segment(
         architecture, config, _FakeGroup(pp_rank, 2), vp_stage
     )
 
@@ -151,13 +168,13 @@ def test_implicit_pipeline_selection_evenly_slices_pp_and_vpp(monkeypatch):
         _layer(MoELayerConfig, config),
         _layer(MLPLayerConfig, config),
     ]
-    monkeypatch.setattr(hybrid_allocation_module, "get_pg_rank", lambda group: 0)
-    monkeypatch.setattr(hybrid_allocation_module, "get_pg_size", lambda group: 2)
+    monkeypatch.setattr(hybrid_config_module, "get_pg_rank", lambda group: 0)
+    monkeypatch.setattr(hybrid_config_module, "get_pg_size", lambda group: 2)
     monkeypatch.setattr(
-        hybrid_allocation_module, "log_on_each_pipeline_stage", lambda *args, **kwargs: None
+        hybrid_config_module, "log_on_each_pipeline_stage", lambda *args, **kwargs: None
     )
 
-    selected, offset = hybrid_allocation_module.select_pipeline_config_segment(
+    selected, offset = hybrid_config_module.select_pipeline_config_segment(
         architecture, config, _FakeGroup(0, 2), vp_stage=1
     )
 
@@ -173,11 +190,11 @@ def test_implicit_pipeline_selection_requires_exact_divisibility(monkeypatch):
         _layer(AttentionLayerConfig, config),
         _layer(MLPLayerConfig, config),
     ]
-    monkeypatch.setattr(hybrid_allocation_module, "get_pg_rank", lambda group: 0)
-    monkeypatch.setattr(hybrid_allocation_module, "get_pg_size", lambda group: 2)
+    monkeypatch.setattr(hybrid_config_module, "get_pg_rank", lambda group: 0)
+    monkeypatch.setattr(hybrid_config_module, "get_pg_size", lambda group: 2)
 
     with pytest.raises(ValueError, match="should be divisible"):
-        hybrid_allocation_module.select_pipeline_config_segment(
+        hybrid_config_module.select_pipeline_config_segment(
             architecture, config, _FakeGroup(0, 2), vp_stage=None
         )
 
@@ -185,11 +202,11 @@ def test_implicit_pipeline_selection_requires_exact_divisibility(monkeypatch):
 def test_pipeline_selection_rejects_config_and_group_size_mismatch(monkeypatch):
     config = _config(num_layers=2, pp_size=2)
     architecture = [_layer(MambaLayerConfig, config), _layer(AttentionLayerConfig, config)]
-    monkeypatch.setattr(hybrid_allocation_module, "get_pg_rank", lambda group: 0)
-    monkeypatch.setattr(hybrid_allocation_module, "get_pg_size", lambda group: 1)
+    monkeypatch.setattr(hybrid_config_module, "get_pg_rank", lambda group: 0)
+    monkeypatch.setattr(hybrid_config_module, "get_pg_size", lambda group: 1)
 
     with pytest.raises(ValueError, match="process group has size 1"):
-        hybrid_allocation_module.select_pipeline_config_segment(
+        hybrid_config_module.select_pipeline_config_segment(
             architecture, config, _FakeGroup(), vp_stage=None
         )
 
@@ -197,11 +214,11 @@ def test_pipeline_selection_rejects_config_and_group_size_mismatch(monkeypatch):
 def test_pipeline_selection_rejects_decoder_count_mismatch(monkeypatch):
     config = _config(num_layers=2)
     architecture = [_layer(MambaLayerConfig, config)]
-    monkeypatch.setattr(hybrid_allocation_module, "get_pg_rank", lambda group: 0)
-    monkeypatch.setattr(hybrid_allocation_module, "get_pg_size", lambda group: 1)
+    monkeypatch.setattr(hybrid_config_module, "get_pg_rank", lambda group: 0)
+    monkeypatch.setattr(hybrid_config_module, "get_pg_size", lambda group: 1)
 
     with pytest.raises(ValueError, match="defines 1 decoder layers.*config.num_layers is 2"):
-        hybrid_allocation_module.select_pipeline_config_segment(
+        hybrid_config_module.select_pipeline_config_segment(
             architecture, config, _FakeGroup(), vp_stage=None
         )
 
@@ -213,11 +230,11 @@ def test_pipeline_selection_rejects_decoder_count_mismatch(monkeypatch):
 def test_pipeline_selection_validates_vp_stage(monkeypatch, vp_stage, error_match):
     config = _config(num_layers=4, pp_size=2, vp_size=2)
     architecture = [_layer(MambaLayerConfig, config) for _ in range(4)]
-    monkeypatch.setattr(hybrid_allocation_module, "get_pg_rank", lambda group: 0)
-    monkeypatch.setattr(hybrid_allocation_module, "get_pg_size", lambda group: 2)
+    monkeypatch.setattr(hybrid_config_module, "get_pg_rank", lambda group: 0)
+    monkeypatch.setattr(hybrid_config_module, "get_pg_size", lambda group: 2)
 
     with pytest.raises(ValueError, match=error_match):
-        hybrid_allocation_module.select_pipeline_config_segment(
+        hybrid_config_module.select_pipeline_config_segment(
             architecture, config, _FakeGroup(0, 2), vp_stage
         )
 
@@ -235,11 +252,11 @@ def test_pipeline_selection_validates_uneven_stage_counts(
         last_stage_layers=last_stage_layers,
     )
     architecture = [_layer(MambaLayerConfig, config) for _ in range(6)]
-    monkeypatch.setattr(hybrid_allocation_module, "get_pg_rank", lambda group: 0)
-    monkeypatch.setattr(hybrid_allocation_module, "get_pg_size", lambda group: pp_size)
+    monkeypatch.setattr(hybrid_config_module, "get_pg_rank", lambda group: 0)
+    monkeypatch.setattr(hybrid_config_module, "get_pg_size", lambda group: pp_size)
 
     with pytest.raises(ValueError, match="Pipeline allocation"):
-        hybrid_allocation_module.select_pipeline_config_segment(
+        hybrid_config_module.select_pipeline_config_segment(
             architecture, config, _FakeGroup(0, pp_size), vp_stage=None
         )
 
@@ -249,11 +266,11 @@ def test_pipeline_selection_requires_positive_vpp(monkeypatch, vp_size):
     config = _config(num_layers=1)
     config.virtual_pipeline_model_parallel_size = vp_size
     architecture = [_layer(MambaLayerConfig, config)]
-    monkeypatch.setattr(hybrid_allocation_module, "get_pg_rank", lambda group: 0)
-    monkeypatch.setattr(hybrid_allocation_module, "get_pg_size", lambda group: 1)
+    monkeypatch.setattr(hybrid_config_module, "get_pg_rank", lambda group: 0)
+    monkeypatch.setattr(hybrid_config_module, "get_pg_size", lambda group: 1)
 
     with pytest.raises(ValueError, match="virtual_pipeline_model_parallel_size must be positive"):
-        hybrid_allocation_module.select_pipeline_config_segment(
+        hybrid_config_module.select_pipeline_config_segment(
             architecture, config, _FakeGroup(), vp_stage=None
         )
 
@@ -261,15 +278,15 @@ def test_pipeline_selection_requires_positive_vpp(monkeypatch, vp_size):
 def test_pipeline_selection_requires_all_decoder_layers_to_be_owned(monkeypatch):
     config = _config(num_layers=4, pp_size=2)
     architecture = [_layer(MambaLayerConfig, config) for _ in range(4)]
-    monkeypatch.setattr(hybrid_allocation_module, "get_pg_rank", lambda group: 0)
-    monkeypatch.setattr(hybrid_allocation_module, "get_pg_size", lambda group: 2)
+    monkeypatch.setattr(hybrid_config_module, "get_pg_rank", lambda group: 0)
+    monkeypatch.setattr(hybrid_config_module, "get_pg_size", lambda group: 2)
     monkeypatch.setattr(
         "megatron.core.transformer.transformer_block.get_num_layers_to_build",
         lambda *args, **kwargs: 1,
     )
 
     with pytest.raises(ValueError, match="owns 2 decoder layers.*defines 4"):
-        hybrid_allocation_module.select_pipeline_config_segment(
+        hybrid_config_module.select_pipeline_config_segment(
             architecture, config, _FakeGroup(0, 2), vp_stage=None
         )
 
@@ -287,13 +304,13 @@ def test_converted_pattern_preserves_uneven_first_and_last_stages(
     )
     for index, layer_config in enumerate(architecture):
         layer_config.architecture_index = index
-    monkeypatch.setattr(hybrid_allocation_module, "get_pg_rank", lambda group: pp_rank)
-    monkeypatch.setattr(hybrid_allocation_module, "get_pg_size", lambda group: 4)
+    monkeypatch.setattr(hybrid_config_module, "get_pg_rank", lambda group: pp_rank)
+    monkeypatch.setattr(hybrid_config_module, "get_pg_size", lambda group: 4)
     monkeypatch.setattr(
-        hybrid_allocation_module, "log_on_each_pipeline_stage", lambda *args, **kwargs: None
+        hybrid_config_module, "log_on_each_pipeline_stage", lambda *args, **kwargs: None
     )
 
-    selected, offset = hybrid_allocation_module.select_pipeline_config_segment(
+    selected, offset = hybrid_config_module.select_pipeline_config_segment(
         architecture, config, _FakeGroup(pp_rank, 4), vp_stage=None
     )
 
@@ -322,13 +339,13 @@ def test_marker_free_selection_uses_canonical_uneven_vpp_allocation(
     for index, layer_config in enumerate(architecture):
         layer_config.architecture_index = index
 
-    monkeypatch.setattr(hybrid_allocation_module, "get_pg_rank", lambda group: pp_rank)
-    monkeypatch.setattr(hybrid_allocation_module, "get_pg_size", lambda group: 4)
+    monkeypatch.setattr(hybrid_config_module, "get_pg_rank", lambda group: pp_rank)
+    monkeypatch.setattr(hybrid_config_module, "get_pg_size", lambda group: 4)
     monkeypatch.setattr(
-        hybrid_allocation_module, "log_on_each_pipeline_stage", lambda *args, **kwargs: None
+        hybrid_config_module, "log_on_each_pipeline_stage", lambda *args, **kwargs: None
     )
 
-    selected, offset = hybrid_allocation_module.select_pipeline_config_segment(
+    selected, offset = hybrid_config_module.select_pipeline_config_segment(
         architecture, config, _FakeGroup(pp_rank, 4), vp_stage
     )
 
@@ -347,13 +364,13 @@ def test_marker_free_uneven_vpp_without_middle_stages(
     for index, layer_config in enumerate(architecture):
         layer_config.architecture_index = index
 
-    monkeypatch.setattr(hybrid_allocation_module, "get_pg_rank", lambda group: pp_rank)
-    monkeypatch.setattr(hybrid_allocation_module, "get_pg_size", lambda group: 2)
+    monkeypatch.setattr(hybrid_config_module, "get_pg_rank", lambda group: pp_rank)
+    monkeypatch.setattr(hybrid_config_module, "get_pg_size", lambda group: 2)
     monkeypatch.setattr(
-        hybrid_allocation_module, "log_on_each_pipeline_stage", lambda *args, **kwargs: None
+        hybrid_config_module, "log_on_each_pipeline_stage", lambda *args, **kwargs: None
     )
 
-    selected, offset = hybrid_allocation_module.select_pipeline_config_segment(
+    selected, offset = hybrid_config_module.select_pipeline_config_segment(
         architecture, config, _FakeGroup(pp_rank, 2), vp_stage
     )
 
@@ -368,11 +385,11 @@ def test_pipeline_config_selector_rejects_mtp_markers(monkeypatch):
         MTPSplit,
         _layer(AttentionLayerConfig, config),
     ]
-    monkeypatch.setattr(hybrid_allocation_module, "get_pg_rank", lambda group: 0)
-    monkeypatch.setattr(hybrid_allocation_module, "get_pg_size", lambda group: 1)
+    monkeypatch.setattr(hybrid_config_module, "get_pg_rank", lambda group: 0)
+    monkeypatch.setattr(hybrid_config_module, "get_pg_size", lambda group: 1)
 
     with pytest.raises(ValueError, match="must not contain MTPSplit"):
-        hybrid_allocation_module.select_pipeline_config_segment(
+        hybrid_config_module.select_pipeline_config_segment(
             architecture, config, _FakeGroup(), vp_stage=None
         )
 
@@ -461,13 +478,14 @@ def test_list_is_snapshotted_before_decoder_selection(patch_cpu_model_constructi
     config = _config(num_layers=2)
     source_config = _layer(AttentionLayerConfig, config)
     architecture = [source_config, source_config]
-    monkeypatch.setattr(
-        hybrid_allocation_module,
-        "layer_config_list_from_hybrid_layer_pattern",
-        lambda *_args, **_kwargs: pytest.fail(
-            "explicit config lists must skip the pattern adapter"
-        ),
-    )
+    original_import = builtins.__import__
+
+    def reject_legacy_allocation(name, *args, **kwargs):
+        if name == "megatron.core.models.hybrid.hybrid_layer_allocation":
+            pytest.fail("explicit config lists must not import hybrid_layer_allocation")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", reject_legacy_allocation)
 
     model = HybridModel(
         config=config,

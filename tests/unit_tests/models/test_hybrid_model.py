@@ -21,9 +21,9 @@ from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.common.embeddings.yarn_rotary_pos_embedding import YarnRotaryEmbedding
-from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel, _hybrid_logging_pg_kwargs
+from megatron.core.models.hybrid.layers.utils import Symbols
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.ssm.mamba_layer_config import MambaLayerConfig
 from megatron.core.ssm.mlp_layer_config import MLPLayerConfig
