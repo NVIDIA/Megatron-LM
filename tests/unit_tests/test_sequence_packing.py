@@ -18,6 +18,7 @@ from megatron.core.datasets.data_schedule import (
     wrap_data_iterator,
 )
 from megatron.core.datasets.data_schedule_utils import (
+    align_sample_id_groups,
     next_hdp_group_packing_aware,
     reroute_samples_to_dcp_ranks,
 )
@@ -82,7 +83,7 @@ def test_scheduler_sanitizes_thd_padding_values():
     assert torch.equal(batch['position_ids'], torch.tensor([0, 1, 0, 0, 0]))
 
 
-def test_scheduler_reroute_uses_dp_all_gather(monkeypatch):
+def test_scheduler_reroute_reuses_equivalent_dp_cp_group(monkeypatch):
     class _Group:
         def __init__(self, size, rank):
             self._size = size
@@ -137,6 +138,7 @@ def test_scheduler_reroute_uses_dp_all_gather(monkeypatch):
         output.copy_(torch.cat([input_, remote]))
 
     monkeypatch.setattr(torch.cuda, 'current_device', lambda: torch.device('cpu'))
+    monkeypatch.setattr(torch.distributed, 'is_initialized', lambda: False)
     monkeypatch.setattr(torch.distributed, 'all_gather_into_tensor', _all_gather_into_tensor)
     monkeypatch.setattr(
         torch.distributed,
@@ -161,7 +163,35 @@ def test_scheduler_reroute_uses_dp_all_gather(monkeypatch):
     assert torch.equal(received[2]['position_ids'], torch.tensor([0, 1, 2, 3]))
     assert torch.equal(received[2]['original_seq_len'], torch.tensor([4], dtype=torch.int32))
     assert torch.equal(received[2]['padded_seq_len'], torch.tensor([4], dtype=torch.int32))
-    assert gather_groups == [dp_group] * 6
+    assert gather_groups == [dp_cp_group] * 6
+
+    with pytest.raises(RuntimeError, match="must use the same rank order"):
+        reroute_samples_to_dcp_ranks(
+            batch=batch,
+            global_ids_this_rank=torch.tensor([0, 1]),
+            global_id_seqlens=[(0, 2), (1, 1), (2, 4)],
+            sample_id_groups=[[[2], [0, 1]]],
+            offsets=torch.tensor([0, 2, 3]),
+            dp_group=_Group(size=2, rank=1),
+            dp_cp_group=dp_cp_group,
+        )
+
+    monkeypatch.setattr(torch.distributed, 'is_initialized', lambda: True)
+    monkeypatch.setattr(
+        torch.distributed,
+        'get_process_group_ranks',
+        lambda group: [0, 1] if group is dp_group else [0, 2],
+    )
+    with pytest.raises(RuntimeError, match="must use the same rank order"):
+        reroute_samples_to_dcp_ranks(
+            batch=batch,
+            global_ids_this_rank=torch.tensor([0, 1]),
+            global_id_seqlens=[(0, 2), (1, 1), (2, 4)],
+            sample_id_groups=[[[2], [0, 1]]],
+            offsets=torch.tensor([0, 2, 3]),
+            dp_group=dp_group,
+            dp_cp_group=dp_cp_group,
+        )
 
 
 def test_scheduler_reroute_rejects_unsupported_sample_keys():
@@ -699,6 +729,44 @@ def test_next_hdp_group_packing_aware_can_use_larger_cp_group_for_short_sequence
     assert micro_batches == [[6144, 2048], [6144, 2048]]
     assert sample_ids == [[0, 1], [0, 1]]
     assert exec_times[0] == exec_times[1]
+
+
+def test_align_sample_id_groups_splits_packed_full_cp_group():
+    sample_id_groups = [
+        [[0] for _ in range(8)],
+        [[1] for _ in range(8)],
+        [[2, 3] for _ in range(8)],
+    ]
+
+    aligned = align_sample_id_groups(sample_id_groups, 4)
+
+    assert len(aligned) == 4
+    assert aligned[2] == [[2] for _ in range(8)]
+    assert aligned[3] == [[3] for _ in range(8)]
+
+
+def test_align_sample_id_groups_repeatedly_splits_packed_full_cp_group():
+    sample_id_groups = [[list(range(16)) for _ in range(8)]]
+
+    aligned = align_sample_id_groups(sample_id_groups, 16)
+
+    assert len(aligned) == 16
+    assert all(rank_ids == group[0] for group in aligned for rank_ids in group)
+    assert sorted(sample_id for group in aligned for sample_id in group[0]) == list(range(16))
+
+
+def test_align_sample_id_groups_prefers_existing_cp_block_split():
+    untouched_full_group = [[10, 11] for _ in range(8)]
+    sample_id_groups = [
+        [[20] for _ in range(8)],
+        [[0], [0], [0], [0], [1], [1], [2], [2]],
+        untouched_full_group,
+    ]
+
+    aligned = align_sample_id_groups(sample_id_groups, 4)
+
+    assert len(aligned) == 4
+    assert aligned[2] == untouched_full_group
 
 
 def test_next_hdp_group_packing_aware_fills_non_power_of_two_dpxcp_group():

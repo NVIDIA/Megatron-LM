@@ -301,6 +301,7 @@ class DSAIndexerLossLoggingHelper:
         num_layers: int,
         reduce_group: torch.distributed.ProcessGroup = None,
         avg_group: torch.distributed.ProcessGroup = None,
+        dynamic_cp_metric_group: torch.distributed.ProcessGroup = None,
     ):
         """Save the indexer loss for logging.
 
@@ -310,6 +311,7 @@ class DSAIndexerLossLoggingHelper:
             num_layers: The number of total layers.
             reduce_group: The group for reducing the loss.
             avg_group: The group for averaging the loss.
+            dynamic_cp_metric_group: Stable DP-CP group for mixed-CP metric reduction.
         """
         # Skip indexer loss logging if layer_number is None.
         if layer_number is None:
@@ -329,6 +331,14 @@ class DSAIndexerLossLoggingHelper:
             )
             grown[: tracker["values"].shape[0]] = tracker["values"]
             tracker["values"] = grown
+        if dynamic_cp_metric_group is not None:
+            existing_group = tracker.get("dynamic_cp_metric_group")
+            if existing_group is not None and existing_group is not dynamic_cp_metric_group:
+                raise RuntimeError(
+                    "DSA indexer tracker observed multiple dynamic-CP metric groups."
+                )
+            tracker["dynamic_cp_metric_group"] = dynamic_cp_metric_group
+
         tracker["values"][layer_number - 1] += loss.detach()
         tracker["reduce_group"] = reduce_group
         tracker["avg_group"] = avg_group
@@ -339,10 +349,14 @@ class DSAIndexerLossLoggingHelper:
         tracker = DSAIndexerLossLoggingHelper.tracker
         reduce_group = tracker.get("reduce_group") if preserve_groups else None
         avg_group = tracker.get("avg_group") if preserve_groups else None
+        dynamic_cp_metric_group = (
+            tracker.get("dynamic_cp_metric_group") if preserve_groups else None
+        )
         if "values" in tracker:
             tracker["values"].zero_()
         tracker["reduce_group"] = reduce_group
         tracker["avg_group"] = avg_group
+        tracker["dynamic_cp_metric_group"] = dynamic_cp_metric_group
 
     @staticmethod
     def reduce_loss_in_tracker(num_layers: Optional[int] = None):
@@ -394,13 +408,18 @@ class DSAIndexerLossLoggingHelper:
         values = tracker["values"]
 
         torch.distributed.all_reduce(values, group=pp_group)
-        # Reduce indexer losses across ranks.
-        if tracker.get('reduce_group') is not None:
-            torch.distributed.all_reduce(values, group=tracker.get('reduce_group'))
-        if tracker.get('avg_group') is not None:
+        if tracker.get("dynamic_cp_metric_group") is not None:
             torch.distributed.all_reduce(
-                values, group=tracker['avg_group'], op=torch.distributed.ReduceOp.AVG
+                values, group=tracker["dynamic_cp_metric_group"], op=torch.distributed.ReduceOp.AVG
             )
+        else:
+            # Fixed CP retains its existing SUM/AVG behavior.
+            if tracker.get('reduce_group') is not None:
+                torch.distributed.all_reduce(values, group=tracker.get('reduce_group'))
+            if tracker.get('avg_group') is not None:
+                torch.distributed.all_reduce(
+                    values, group=tracker['avg_group'], op=torch.distributed.ReduceOp.AVG
+                )
         torch.distributed.all_reduce(
             values,
             group=parallel_state.get_data_parallel_group(with_context_parallel=False),
@@ -2342,6 +2361,9 @@ class DSAttention(MegatronModule):
         indexer_avg_group = (
             cp_group if cp_size > 1 and not self.config.calculate_per_token_loss else None
         )
+        dynamic_cp_metric_group = (
+            self.pg_collection.dp_cp if self.config.dynamic_context_parallel else None
+        )
 
         topk_holder = (
             self._get_index_share_topk_holder(packed_seq_params, attention_mask)
@@ -2485,6 +2507,7 @@ class DSAttention(MegatronModule):
                     ),
                     reduce_group=indexer_reduce_group,
                     avg_group=indexer_avg_group,
+                    dynamic_cp_metric_group=dynamic_cp_metric_group,
                 )
                 output = DSAIndexerLossAutoScaler.apply(output, indexer_loss)
             return _normalize_dsattention_output_rank(output, x.ndim)
@@ -2575,6 +2598,7 @@ class DSAttention(MegatronModule):
                     ),
                     reduce_group=indexer_reduce_group,
                     avg_group=indexer_avg_group,
+                    dynamic_cp_metric_group=dynamic_cp_metric_group,
                 )
         elif topk_indices is None:
             assert q is not None and k is not None and weights is not None

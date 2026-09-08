@@ -355,6 +355,22 @@ def create_data_iterator(
     return new_data_iterator
 
 
+def get_data_parallel_gather_group(dp_group, dp_cp_group):
+    """Reuse DPxCP only when it has exactly the same ordered ranks as DP."""
+    if dp_group.size() != dp_cp_group.size():
+        return dp_group
+
+    if dp_group is not dp_cp_group and torch.distributed.is_initialized():
+        dp_ranks = torch.distributed.get_process_group_ranks(dp_group)
+        dp_cp_ranks = torch.distributed.get_process_group_ranks(dp_cp_group)
+        groups_match = dp_ranks == dp_cp_ranks
+    else:
+        groups_match = dp_group.rank() == dp_cp_group.rank()
+    if not groups_match:
+        raise RuntimeError("Equivalent DP and DPxCP groups must use the same rank order.")
+    return dp_cp_group
+
+
 def reroute_samples_to_dcp_ranks(
     batch, global_ids_this_rank, global_id_seqlens, sample_id_groups, offsets, dp_group, dp_cp_group
 ):
@@ -364,7 +380,8 @@ def reroute_samples_to_dcp_ranks(
     Each CP lane gathers the samples from its DP group, then keeps only the
     samples assigned to its DPxCP rank. Gathering within ``dp_group`` avoids
     collecting the identical input held by every CP sibling and avoids the
-    fully connected P2P transport created by NCCL all-to-all.
+    fully connected P2P transport created by NCCL all-to-all. When DP and
+    DPxCP are equivalent, the already-warmed DPxCP communicator is reused.
 
     All ranks in ``dp_group`` must provide the same set of data keys. CP siblings
     that share a non-CP DP rank must additionally provide byte-identical sample
@@ -380,6 +397,7 @@ def reroute_samples_to_dcp_ranks(
     dcp_rank = dp_cp_group.rank()
     dp_rank = dp_group.rank()
     dp_size = dp_group.size()
+    gather_group = get_data_parallel_gather_group(dp_group, dp_cp_group)
 
     # Keep collective ordering independent of dictionary insertion order. Unknown
     # keys require an explicit layout classification rather than being silently dropped.
@@ -462,7 +480,9 @@ def reroute_samples_to_dcp_ranks(
             gathered_tensor = gather_input
         else:
             gathered_tensor = local_tensor.new_empty(dp_size * max_rank_numel)
-            torch.distributed.all_gather_into_tensor(gathered_tensor, gather_input, group=dp_group)
+            torch.distributed.all_gather_into_tensor(
+                gathered_tensor, gather_input, group=gather_group
+            )
 
         for gid in recv_ids:
             start, sample_numel = sample_slices[gid]
@@ -594,6 +614,7 @@ def next_hdp_group_packing_aware(
     total_gpus: int,
     max_seq_len_per_rank: int,
     min_cp_size: int = 1,
+    max_num_seqs: Optional[int] = None,
 ) -> Tuple[List[List[int]], List[Tuple[int, int]], List[float], List[List[int]]]:
     """Form one DCP microbatch with packing-aware CP group selection.
 
@@ -607,7 +628,7 @@ def next_hdp_group_packing_aware(
     The scheduler keeps the legacy invariant that each returned microbatch has
     no empty DPxCP rank after the fill step. For non-power-of-two DPxCP layouts,
     it falls back to the full DPxCP group if power-of-two expansion cannot fill
-    every rank.
+    every rank. ``max_num_seqs`` optionally caps the real sequences per subgroup.
     """
     if not sample_seqlens:
         return (
@@ -667,6 +688,11 @@ def next_hdp_group_packing_aware(
 
             for group_id, size in list(group_size.items()):
                 if size != cp_size:
+                    continue
+                if (
+                    max_num_seqs is not None
+                    and len(micro_batches[group_members[group_id][0]]) >= max_num_seqs
+                ):
                     continue
                 if packing_sequence_len.get(group_id, 0) + seq_len / cp_size > max_seq_len_per_rank:
                     continue
@@ -803,7 +829,9 @@ def next_hdp_group_packing_aware(
 
         for sample_id, seq_len in sample_seqlens:
             per_rank_len = seq_len / total_gpus
-            if packed_sequence_len + per_rank_len <= max_seq_len_per_rank:
+            if (
+                max_num_seqs is None or len(selected) < max_num_seqs
+            ) and packed_sequence_len + per_rank_len <= max_seq_len_per_rank:
                 selected.append((sample_id, seq_len))
                 packed_sequence_len += per_rank_len
             else:
@@ -840,7 +868,7 @@ def align_sample_id_groups(sample_id_groups: List, microbatch_group_size_per_vp_
     remainder = (-len(sample_id_groups)) % multiple
     i = len(sample_id_groups) - 1
 
-    def split_group(sample_id_group):
+    def split_group(sample_id_group, allow_packed_full_group=False):
         total_hdp_ranks = len(sample_id_group)
         cu_ranks = [0]
         prev_cp_size = 0
@@ -860,7 +888,20 @@ def align_sample_id_groups(sample_id_groups: List, microbatch_group_size_per_vp_
             cu_ranks.append(start_rank + cp_size)
             prev_cp_size = cp_size
         if len(cu_ranks) == 2:
-            return None, None
+            if not allow_packed_full_group:
+                return None, None
+            packed_ids = sample_id_group[0]
+            if len(packed_ids) < 2:
+                return None, None
+            assert all(
+                rank_ids == packed_ids for rank_ids in sample_id_group
+            ), "A full DPxCP group must carry the same packed sample IDs on every rank."
+            kept_ids = packed_ids[:-1]
+            moved_ids = packed_ids[-1:]
+            return (
+                [list(kept_ids) for _ in range(total_hdp_ranks)],
+                [list(moved_ids) for _ in range(total_hdp_ranks)],
+            )
 
         k = 0
         while cu_ranks[k] < total_hdp_ranks // 2:
@@ -906,17 +947,26 @@ def align_sample_id_groups(sample_id_groups: List, microbatch_group_size_per_vp_
         return sample_id_group
 
     attempts_since_split = 0
+    allow_packed_full_group = False
     while remainder > 0:
         if i < 0:
             if attempts_since_split >= len(sample_id_groups):
-                assert False, 'align_sample_id_groups: no tail microbatch has enough ids to split'
+                if allow_packed_full_group:
+                    assert (
+                        False
+                    ), 'align_sample_id_groups: no tail microbatch has enough ids to split'
+                allow_packed_full_group = True
+                attempts_since_split = 0
             i = len(sample_id_groups) - 1
-        group1, group2 = split_group(sample_id_groups[i])
+        group1, group2 = split_group(
+            sample_id_groups[i], allow_packed_full_group=allow_packed_full_group
+        )
         if group1 is not None and group2 is not None:
             sample_id_groups[i] = group1
             sample_id_groups.append(group2)
             remainder -= 1
             attempts_since_split = 0
+            allow_packed_full_group = False
         else:
             attempts_since_split += 1
         i -= 1

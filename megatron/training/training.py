@@ -4558,6 +4558,9 @@ def train(
 
     # Initialize CUDA Graphs helper.
     if args.cuda_graph_impl == "transformer_engine":
+        config.thd_max_subsamples_per_item = (
+            1 if args.use_varlen_dataset else args.thd_max_packed_sequences
+        )
         cuda_graph_helper = TECudaGraphHelper(
             model=model,
             config=config,
@@ -4565,6 +4568,9 @@ def train(
             micro_batch_size=args.micro_batch_size,
             optimizers=[optimizer],
             thd_sequence_length_upper_bound=_get_thd_sequence_length_upper_bound(args),
+            dynamic_cp_group_getter=(
+                get_dynamic_data_context_parallel_groups if args.dynamic_context_parallel else None
+            ),
         )
 
     # Run training iterations till done.
@@ -4977,7 +4983,7 @@ def train(
             break
 
     # Destroy CUDA Graphs.
-    if args.cuda_graph_impl == "transformer_engine" and cuda_graph_helper.graphs_created():
+    if args.cuda_graph_impl == "transformer_engine":
         cuda_graph_helper.delete_cuda_graphs()
 
     # Call OptimizerCudaGraph destructor to destroy optimizer CUDA graph

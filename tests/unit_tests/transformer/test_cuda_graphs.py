@@ -1200,7 +1200,10 @@ class TestTECudaGraphHelper:
         helper.config = _te_whole_moe_paged_stash_config(cuda_graph_modules=cuda_graph_modules)
         helper.flattened_callables = [layer]
         helper.callables_per_chunk = []
+        helper.chunks_with_decoder = []
         helper.num_microbatches = 1
+        helper._thd_rotary_seq_lens = {}
+        helper._capture_finished = False
         helper._start_capturing = lambda: 0.0
         helper._finish_capturing = lambda _start_time: None
         helper._get_cuda_graph_input_data = lambda: ([()], {'_order': [1, -1]})
@@ -1515,6 +1518,38 @@ class TestTECudaGraphHelper:
         assert (
             len(order) == expected_order_length
         ), f"Order length mismatch: expected {expected_order_length}, got {len(order)}"
+
+
+class TestSlotAliasedVariantOrder:
+    @staticmethod
+    def _dynamic_cp_capture_order():
+        helper = object.__new__(TECudaGraphHelper)
+        helper.flattened_callables = [torch.nn.Identity()]
+        helper.num_microbatches = 1
+        helper.num_layers_per_chunk = [1]
+        helper.num_model_chunks = 1
+        capture_banks = []
+        for cp_size in (4, 2, 1):
+            capture_banks.append(
+                (
+                    cp_size,
+                    None,
+                    ((),),
+                    {'_order': (1, -1), '_reuse_graph_input_output_buffers': True},
+                )
+            )
+        _, _, kwargs = helper._get_dynamic_cp_variant_capture_data(capture_banks)
+        return kwargs['_order']
+
+    def test_capture_uses_minimum_cp_as_canonical(self):
+        assert self._dynamic_cp_capture_order() == [3, -3, 1, -1, 2, -2]
+
+    def test_variant_major_starts_with_canonical_variant(self):
+        order = TECudaGraphHelper._build_slot_aliased_variant_order(
+            [1, 2, -2, -1], num_variants=4, num_model_chunks=2, canonical_variant=3
+        )
+
+        assert order == [7, 8, -8, -7, 1, 2, -2, -1, 3, 4, -4, -3, 5, 6, -6, -5]
 
 
 class TestRequiredNumMicrobatchSlots:
