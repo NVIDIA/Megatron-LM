@@ -784,6 +784,10 @@ class TestMegatronNetworkArgumentGeneration:
         with pytest.raises(ArgumentError, match="invalid choice"):
             self._parser().parse_args(["--mhc-fused-backend", "cuda"])
 
+    def test_train_full_dataset_flag(self):
+        assert self._parser().parse_args([]).train_full_dataset is False
+        assert self._parser().parse_args(["--train-full-dataset"]).train_full_dataset
+
 
 class TestMegatronMLAArgumentGeneration:
     """Test Megatron's manually registered MLA arguments."""
