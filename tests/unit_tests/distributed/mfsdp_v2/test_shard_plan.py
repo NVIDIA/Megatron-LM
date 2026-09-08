@@ -42,9 +42,9 @@ def _ns_cost(num_ns_steps: int) -> Callable[[ShardPlan], int]:
 
 
 def test_compute_shard_plan_even_split():
-    """A matrix exactly divisible by world_size splits evenly across ranks."""
+    """A matrix exactly divisible by dp_size splits evenly across ranks."""
     plan = ShardPlan.from_layout_params(
-        torch.Size((8, 4)), tensor_flat_offset=0, rank_flat_shard_size=16, world_size=2
+        torch.Size((8, 4)), tensor_flat_offset=0, rank_flat_shard_size=16, dp_size=2
     )
     assert plan.full_shape == torch.Size((8, 4))
     assert plan.row_size == 4
@@ -58,7 +58,7 @@ def test_compute_shard_plan_boundary_param_split_across_ranks():
     # 6 rows, 3 cols; each rank's flat shard is 9 elements (= 3 rows). rank0 owns flat [0,9), rank1
     # owns [9,18). Tensor occupies [0,18) fully.
     plan = ShardPlan.from_layout_params(
-        torch.Size((6, 3)), tensor_flat_offset=0, rank_flat_shard_size=9, world_size=2
+        torch.Size((6, 3)), tensor_flat_offset=0, rank_flat_shard_size=9, dp_size=2
     )
     assert plan.rank_rows == ((0, 3), (3, 3))
     assert plan.is_boundary()
@@ -69,7 +69,7 @@ def test_compute_shard_plan_fully_local_param_on_one_rank():
     # 4 rows, 2 cols = 8 elements. rank0 shard = [0,12), rank1 = [12,24). Tensor at offset 0 with 8
     # elements fits entirely in rank0.
     plan = ShardPlan.from_layout_params(
-        torch.Size((4, 2)), tensor_flat_offset=0, rank_flat_shard_size=12, world_size=2
+        torch.Size((4, 2)), tensor_flat_offset=0, rank_flat_shard_size=12, dp_size=2
     )
     assert plan.rank_rows == ((0, 4), (0, 0))
     assert not plan.is_boundary()
@@ -80,7 +80,7 @@ def test_compute_shard_plan_empty_rank_has_zero_rows():
     """A rank whose flat shard does not overlap the tensor owns zero rows."""
     # Tensor offset 12 (entirely in rank1). rank0 gets (0,0).
     plan = ShardPlan.from_layout_params(
-        torch.Size((4, 3)), tensor_flat_offset=12, rank_flat_shard_size=12, world_size=2
+        torch.Size((4, 3)), tensor_flat_offset=12, rank_flat_shard_size=12, dp_size=2
     )
     assert plan.rank_rows == ((0, 0), (0, 4))
     assert plan.is_boundary() is False
@@ -126,14 +126,14 @@ def test_assign_owner_work_fully_local_owner_is_single_candidate():
 
 
 def _simulate_p2p(
-    per_rank_send_buffers: list[dict[int, torch.Tensor]], world_size: int
+    per_rank_send_buffers: list[dict[int, torch.Tensor]], dp_size: int
 ) -> list[dict[int, torch.Tensor]]:
     """Deliver per-owner send buffers to their owners (CPU sim of batch_isend_irecv).
 
     Returns, per rank, the dict of `{src_rank: received_buffer}` it receives.
     """
-    per_rank_recv: list[dict[int, torch.Tensor]] = [dict() for _ in range(world_size)]
-    for src in range(world_size):
+    per_rank_recv: list[dict[int, torch.Tensor]] = [dict() for _ in range(dp_size)]
+    for src in range(dp_size):
         for dst, buf in per_rank_send_buffers[src].items():
             if buf.numel() == 0:
                 continue
@@ -144,10 +144,10 @@ def _simulate_p2p(
 def test_pack_and_reconstruct_round_trip():
     """Gathered + reconstructed shards matches the concatenation of local shards."""
     torch.manual_seed(0)
-    world_size = 2
+    dp_size = 2
     # Two params, both boundary, shapes (6,3) and (4,2). Owners: param0->rank0, param1->rank1.
-    plan0 = ShardPlan.from_layout_params(torch.Size((6, 3)), 0, 9, world_size)
-    plan1 = ShardPlan.from_layout_params(torch.Size((4, 2)), 0, 4, world_size)
+    plan0 = ShardPlan.from_layout_params(torch.Size((6, 3)), 0, 9, dp_size)
+    plan1 = ShardPlan.from_layout_params(torch.Size((4, 2)), 0, 4, dp_size)
     plans = [plan0, plan1]
     owners = {0: 0, 1: 1}
 
@@ -155,19 +155,19 @@ def test_pack_and_reconstruct_round_trip():
     full_p0 = torch.arange(18, dtype=torch.float32).reshape(6, 3)
     full_p1 = torch.arange(8, dtype=torch.float32).reshape(4, 2) + 100
     per_rank_local = []
-    for r in range(world_size):
+    for r in range(dp_size):
         rs0, rc0 = plan0.rank_rows[r]
         rs1, rc1 = plan1.rank_rows[r]
         per_rank_local.append([full_p0[rs0 : rs0 + rc0].clone(), full_p1[rs1 : rs1 + rc1].clone()])
 
     per_rank_send = []
     per_rank_gather = []
-    for r in range(world_size):
+    for r in range(dp_size):
         gather = OwnerGatherPlan.pack(
             plans,
             owners,
             per_rank_local[r],
-            world_size,
+            dp_size,
             r,
             device=torch.device("cpu"),
             dtype=torch.float32,
@@ -175,7 +175,7 @@ def test_pack_and_reconstruct_round_trip():
         per_rank_send.append(gather.send_buffers)
         per_rank_gather.append(gather)
 
-    recv = _simulate_p2p(per_rank_send, world_size)
+    recv = _simulate_p2p(per_rank_send, dp_size)
 
     # Rank0 owns param0; reconstruct and compare to full_p0.
     full0 = per_rank_gather[0].reconstruct_full(0, plan0, recv[0], owner_rank=0)
@@ -188,9 +188,9 @@ def test_pack_and_reconstruct_round_trip():
 def test_pack_and_unpack_result_round_trip():
     """Scattered result shards match the owner's full result sliced per rank."""
     torch.manual_seed(1)
-    world_size = 2
-    plan0 = ShardPlan.from_layout_params(torch.Size((6, 3)), 0, 9, world_size)
-    plan1 = ShardPlan.from_layout_params(torch.Size((4, 2)), 0, 4, world_size)
+    dp_size = 2
+    plan0 = ShardPlan.from_layout_params(torch.Size((6, 3)), 0, 9, dp_size)
+    plan1 = ShardPlan.from_layout_params(torch.Size((4, 2)), 0, 4, dp_size)
     plans = [plan0, plan1]
     owners = {0: 0, 1: 1}
 
@@ -200,12 +200,12 @@ def test_pack_and_unpack_result_round_trip():
 
     per_rank_send = []
     per_rank_scatter = []
-    for r in range(world_size):
+    for r in range(dp_size):
         scatter = OwnerScatterPlan.pack(
             full_results_by_rank[r],
             plans,
             owners,
-            world_size,
+            dp_size,
             r,
             device=torch.device("cpu"),
             dtype=torch.float32,
@@ -213,9 +213,9 @@ def test_pack_and_unpack_result_round_trip():
         per_rank_send.append(scatter.send_buffers)
         per_rank_scatter.append(scatter)
 
-    recv = _simulate_p2p(per_rank_send, world_size)
+    recv = _simulate_p2p(per_rank_send, dp_size)
 
-    for r in range(world_size):
+    for r in range(dp_size):
         received = per_rank_scatter[r].unpack(recv[r])
         # Rank r receives the result shard for the param it does NOT own.
         other = 1 - r

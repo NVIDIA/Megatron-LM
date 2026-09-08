@@ -59,7 +59,7 @@ class ShardPlan:
         full_shape: torch.Size,
         tensor_flat_offset: int,
         rank_flat_shard_size: int,
-        world_size: int,
+        dp_size: int,
     ) -> ShardPlan:
         """Compute the per-rank row ranges for one 2D parameter in a flat DBuffer.
 
@@ -68,8 +68,8 @@ class ShardPlan:
             tensor_flat_offset: Flat-element offset of this parameter inside the DBuffer's global
                 layout.
             rank_flat_shard_size: Flat elements each DP rank owns (uniform for the even all-`Flat`
-                layout: `layout.size // world_size`).
-            world_size: DP group size.
+                layout: `layout.size // dp_size`).
+            dp_size: DP group size.
         """
         if len(full_shape) != 2:
             raise ValueError(f"ShardPlan.from_layout_params requires a 2D shape, got {full_shape}.")
@@ -81,7 +81,7 @@ class ShardPlan:
         tensor_end = tensor_flat_offset + full_shape.numel()
 
         rank_rows: list[tuple[int, int]] = []
-        for rank in range(world_size):
+        for rank in range(dp_size):
             rank_start = rank * rank_flat_shard_size
             rank_end = rank_start + rank_flat_shard_size
             overlap_start = max(tensor_flat_offset, rank_start)
@@ -106,7 +106,7 @@ class ShardPlan:
         return cls(full_shape=torch.Size(full_shape), rank_rows=tuple(rank_rows), row_size=row_size)
 
     @classmethod
-    def from_layout(cls, layout: GlobalLayout, tensor_index: int, world_size: int) -> ShardPlan:
+    def from_layout(cls, layout: GlobalLayout, tensor_index: int, dp_size: int) -> ShardPlan:
         """Build a shard plan for one parameter from a `GlobalLayout`.
 
         Extracts the parameter's shape, flat offset, and per-rank shard size from `layout` and
@@ -115,17 +115,17 @@ class ShardPlan:
         Args:
             layout: The DBuffer global layout that contains the parameter.
             tensor_index: Index of the parameter within `layout`.
-            world_size: DP group size.
+            dp_size: DP group size.
         """
         return cls.from_layout_params(
             layout.tensor_shapes[tensor_index],
             layout.tensor_to_offset[tensor_index],
-            layout.size // world_size,
-            world_size,
+            layout.size // dp_size,
+            dp_size,
         )
 
     @property
-    def world_size(self) -> int:
+    def dp_size(self) -> int:
         """Number of ranks in the DP group for this parameter."""
         return len(self.rank_rows)
 
@@ -171,7 +171,7 @@ def assign_owner_work(
         Mapping from parameter index (in `plans`) to owner rank.
     """
     assignments: dict[int, int] = {}
-    running: dict[int, float] = {r: 0.0 for r in range(plans[0].world_size)} if plans else {}
+    running: dict[int, float] = {r: 0.0 for r in range(plans[0].dp_size)} if plans else {}
     for param_index, plan in enumerate(plans):
         candidates = plan.owner_candidates()
         if not candidates:
@@ -272,7 +272,7 @@ class OwnerGatherPlan:
         plans: Sequence[ShardPlan],
         owners: dict[int, int],
         local_shards: Sequence[torch.Tensor],
-        world_size: int,
+        dp_size: int,
         this_rank: int,
         *,
         device: torch.device,
@@ -284,19 +284,19 @@ class OwnerGatherPlan:
             plans: Shard plans in parameter order.
             owners: Mapping from parameter index to owner rank.
             local_shards: This rank's local shard per parameter.
-            world_size: DP group size.
+            dp_size: DP group size.
             this_rank: This rank's DP index.
             device: Device for the send buffers.
             dtype: Dtype for the send buffers.
         """
-        send_sizes: dict[int, int] = {o: 0 for o in range(world_size) if o != this_rank}
-        recv_sizes: dict[int, int] = {s: 0 for s in range(world_size) if s != this_rank}
+        send_sizes: dict[int, int] = {o: 0 for o in range(dp_size) if o != this_rank}
+        recv_sizes: dict[int, int] = {s: 0 for s in range(dp_size) if s != this_rank}
         for param_index, plan in enumerate(plans):
             owner = owners[param_index]
             if owner != this_rank:
                 send_sizes[owner] += plan.shard_numel(this_rank)
             else:
-                for src in range(world_size):
+                for src in range(dp_size):
                     if src == this_rank:
                         continue
                     recv_sizes[src] += plan.shard_numel(src)
@@ -323,7 +323,7 @@ class OwnerGatherPlan:
         # Per (owned param, src) recv offset within the recv buffer from src.
         recv_offsets: dict[tuple[int, int], tuple[int, int, int]] = {}
         owned_indices = [i for i in range(len(plans)) if owners[i] == this_rank]
-        for src in range(world_size):
+        for src in range(dp_size):
             if src == this_rank:
                 continue
             offset = 0
@@ -359,7 +359,7 @@ class OwnerGatherPlan:
             owner_rank: The owner rank (== the rank running reconstruction).
         """
         shards: list[torch.Tensor] = []
-        for src in range(plan.world_size):
+        for src in range(plan.dp_size):
             row_count = plan.rank_row_count(src)
             if src == owner_rank:
                 shards.append(self.own_shards[param_index])
@@ -400,7 +400,7 @@ class OwnerScatterPlan:
         full_results: dict[int, torch.Tensor],
         plans: Sequence[ShardPlan],
         owners: dict[int, int],
-        world_size: int,
+        dp_size: int,
         this_rank: int,
         *,
         device: torch.device,
@@ -412,17 +412,17 @@ class OwnerScatterPlan:
             full_results: Full result tensor per owned parameter index.
             plans: Shard plans in parameter order.
             owners: Mapping from parameter index to owner rank.
-            world_size: DP group size.
+            dp_size: DP group size.
             this_rank: This rank's DP index.
             device: Device for the send buffers.
             dtype: Dtype for the send buffers.
         """
         owned_indices = [i for i in range(len(plans)) if owners[i] == this_rank]
-        send_sizes: dict[int, int] = {d: 0 for d in range(world_size) if d != this_rank}
-        recv_sizes: dict[int, int] = {o: 0 for o in range(world_size) if o != this_rank}
+        send_sizes: dict[int, int] = {d: 0 for d in range(dp_size) if d != this_rank}
+        recv_sizes: dict[int, int] = {o: 0 for o in range(dp_size) if o != this_rank}
         for param_index in owned_indices:
             plan = plans[param_index]
-            for dest in range(world_size):
+            for dest in range(dp_size):
                 if dest == this_rank:
                     continue
                 send_sizes[dest] += plan.shard_numel(dest)
@@ -437,7 +437,7 @@ class OwnerScatterPlan:
             send_buffers[dest] = torch.empty(size, dtype=dtype, device=device)
 
         cursors: dict[int, int] = {d: 0 for d in send_buffers}
-        for dest in range(world_size):
+        for dest in range(dp_size):
             if dest == this_rank:
                 continue
             for param_index in owned_indices:
@@ -454,7 +454,7 @@ class OwnerScatterPlan:
                 cursors[dest] += numel
 
         recv_offsets: dict[tuple[int, int], tuple[int, int, int]] = {}
-        for owner in range(world_size):
+        for owner in range(dp_size):
             if owner == this_rank:
                 continue
             offset = 0
