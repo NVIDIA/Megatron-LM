@@ -103,6 +103,19 @@ def tag_params_for_buffer_routing(model_chunks) -> None:
             param.is_managed_by_layer_wise_optimizer = is_managed_by_layer_wise_optimizer(param)
 
 
+def _all_gather_param_group_metadata(param_group, pg_collection):
+    """Gather optimizer-group metadata within the group that owns the parameters."""
+    process_group = (
+        pg_collection.expt_dp
+        if param_group.get('is_expert_parallel', False)
+        else pg_collection.dp_cp
+    )
+    assert process_group is not None, "LayerWise optimizer checkpoint group is not initialized"
+    all_rank_groups = [None for _ in range(get_pg_size(process_group))]
+    torch.distributed.all_gather_object(all_rank_groups, param_group, group=process_group)
+    return all_rank_groups
+
+
 def _build_gtp_replica_fold(pg_collection, model_chunks) -> Dict[str, Tuple[int, int]]:
     """Map each (E)GTP-remat-replicated parameter to its replica-fold coordinates."""
     gtp_fold: Dict[str, Tuple[int, int]] = {}
@@ -1253,8 +1266,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                 local_params = group.pop('params')
                 # save whether this group is empty, so we can use non-empty rank for metadata
                 group['params'] = bool(local_params.unwrap())
-                all_rank_groups = [None for _ in range(torch.distributed.get_world_size())]
-                torch.distributed.all_gather_object(all_rank_groups, group)
+                all_rank_groups = _all_gather_param_group_metadata(group, self.pg_collection)
                 # find first non-empty group if it exists
                 nonempty_rank_group = next((g for g in all_rank_groups if g['params']), group)
                 nonempty_rank_group['params'] = local_params

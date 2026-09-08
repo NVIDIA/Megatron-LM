@@ -263,9 +263,7 @@ class TestLayerWiseOptimizer:
         if use_layer_wise:
             from megatron.training.training import wrap_model_chunks_with_ddp
 
-            ddp_config = DistributedDataParallelConfig(
-                use_layer_wise_param_layout=use_param_layout
-            )
+            ddp_config = DistributedDataParallelConfig(use_layer_wise_param_layout=use_param_layout)
             model = wrap_model_chunks_with_ddp(
                 [model],
                 TransformerConfig(num_attention_heads=1, num_layers=1),
@@ -637,22 +635,14 @@ class TestLayerWiseOptimizer:
             for sh_base in nested_values(sharded_state_dict)
             if isinstance(sh_base, ShardedTensor)
         ]
-        gathered_replica_ids = [None for _ in range(torch.distributed.get_world_size())]
-        torch.distributed.all_gather_object(gathered_replica_ids, replica_ids)
-        for rank, rank_replica_ids in enumerate(gathered_replica_ids):
-            for replica_id in rank_replica_ids:
-                if isinstance(replica_id, int):
-                    assert (
-                        replica_id == 0
-                    ), f'Expected replica_id to be 0 on rank {rank}, got: {replica_id}'
-                else:
-                    assert len(replica_id) == 3, (
-                        'Expected replica_id format (PP, TP, DP) '
-                        f'on rank {rank}, got: {replica_id}'
-                    )
-                    assert (
-                        replica_id[2] == 0
-                    ), f'Expected DP replica_id to be 0 on rank {rank}, got: {replica_id[2]}'
+        for replica_id in replica_ids:
+            if isinstance(replica_id, int):
+                assert replica_id == 0, f'Expected replica_id to be 0, got: {replica_id}'
+            else:
+                assert (
+                    len(replica_id) == 3
+                ), f'Expected replica_id format (PP, TP, DP), got: {replica_id}'
+                assert replica_id[2] == 0, f'Expected DP replica_id to be 0, got: {replica_id[2]}'
 
     @pytest.mark.parametrize('use_param_layout', [False, True])
     def test_multiple_optimizers(self, use_param_layout):
