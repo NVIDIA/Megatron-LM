@@ -112,6 +112,17 @@ def unimodal_build_distributed_models(
         else:
             logger.warning("Final pre wrap hook returned None, skipping pre wrap hooks.")
 
+    # DSA parameter freezing (--dsa-train-indexer-only / --dsa-train-main-only).
+    # Must happen here, before prepare_existing_model_chunks_for_distributed_training
+    # moves the model to GPU and wraps it in DDP: requires_grad is captured at wrap
+    # time, so freezing afterwards is a no-op that fails silently.
+    #
+    # This used to live in megatron.training.training.get_model, which the GPT and
+    # Hybrid builders no longer call. Imported lazily to avoid a circular import.
+    from megatron.training.training import apply_dsa_param_freezing
+
+    apply_dsa_param_freezing(model_list)
+
     return prepare_existing_model_chunks_for_distributed_training(
         model_list,
         transformer_config,
