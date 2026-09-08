@@ -850,20 +850,10 @@ def _get_megatron_emerging_optimizer(
         opt_name = group.get('optimizer', eopt_name)
         is_expert = group['is_expert_parallel'] and not use_layer_wise
         if is_mfsdp_v2 and opt_name == eopt_name:
-            params_by_mesh = defaultdict(list)
-            for parameter in group['params']:
-                parameter_mesh = parameter.device_mesh
-                mesh_ranks = tuple(
-                    torch.distributed.get_process_group_ranks(parameter_mesh.get_group())
-                )
-                params_by_mesh[mesh_ranks].append(parameter)
-
-            for parameters in params_by_mesh.values():
-                mesh_group = group.copy()
-                mesh_group['params'] = parameters
-                grouped_param_groups[(opt_name, False, None)].append(mesh_group)
-        else:
-            grouped_param_groups[(opt_name, is_expert, None)].append(group)
+            # Use one mixed dense/expert Muon bucket; each parameter retains its own
+            # expert metadata and MFSDP communication group.
+            is_expert = False
+        grouped_param_groups[(opt_name, is_expert, None)].append(group)
 
     # Set up DistOpt process groups + filtered buffers once, only if we'll
     # construct a DistributedOptimizer for non-Muon groups in layer-wise mode.
@@ -944,14 +934,6 @@ def _get_megatron_emerging_optimizer(
                 parameters = [parameter for group in groups for parameter in group['params']]
                 if not parameters:
                     raise RuntimeError("MFSDP v2 Muon received no parameters on this rank.")
-
-                for parameter in parameters:
-                    parameter_mesh = parameter.device_mesh
-                    if parameter_mesh.ndim != 1:
-                        raise ValueError(
-                            "MFSDP v2 Muon currently supports one-dimensional data-parallel "
-                            f"meshes, got mesh shape {tuple(parameter_mesh.mesh.shape)}."
-                        )
 
                 optimizer = FsdpMuon(
                     groups,

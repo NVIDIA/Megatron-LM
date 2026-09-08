@@ -78,7 +78,53 @@ _LocalUpdate = tuple[int, dict[str, Any], DTensor, torch.Tensor]
 
 
 def _get_parameter_dp_group(param: DTensor) -> dist.ProcessGroup:
-    return cast(FsdpParameterGroup, get_containing_parameter_group(param)).mesh.get_group()
+    parameter_group = cast(FsdpParameterGroup, get_containing_parameter_group(param))
+    mesh = parameter_group.mesh
+    flat_axes = [
+        axis
+        for axis, placement in enumerate(parameter_group.main_weight.placements)
+        if isinstance(placement, Flat)
+    ]
+    if len(flat_axes) == 1:
+        return mesh.get_group(flat_axes[0])
+    if mesh.ndim == 2 and flat_axes == [0, 1]:
+        flattened_group = getattr(mesh, "_mfsdp_flattened_group", None)
+        if flattened_group is not None:
+            return flattened_group
+        return mesh._flatten().get_group()
+    raise ValueError(
+        "MFSDP Muon requires either one Flat axis or a two-dimensional all-Flat mesh, "
+        f"got mesh shape {tuple(mesh.mesh.shape)} and placements "
+        f"{parameter_group.main_weight.placements}."
+    )
+
+
+def _get_parameter_shard_order(
+    param: DTensor, process_group: dist.ProcessGroup
+) -> tuple[int, ...]:
+    """Map outer-major process-group ranks to flat-shard order."""
+    parameter_group = cast(FsdpParameterGroup, get_containing_parameter_group(param))
+    mesh = parameter_group.mesh
+    flat_axes = [
+        axis
+        for axis, placement in enumerate(parameter_group.main_weight.placements)
+        if isinstance(placement, Flat)
+    ]
+    world_size = dist.get_world_size(group=process_group)
+    if len(flat_axes) == 1:
+        return tuple(range(world_size))
+
+    outer_size, inner_size = mesh.size(0), mesh.size(1)
+    if outer_size * inner_size != world_size:
+        raise ValueError(
+            f"HFSDP mesh size {outer_size}x{inner_size} does not match "
+            f"process-group size {world_size}."
+        )
+    return tuple(
+        inner_rank * outer_size + outer_rank
+        for outer_rank in range(outer_size)
+        for inner_rank in range(inner_size)
+    )
 
 
 def _always_nvtx_decorator(message: str) -> Callable:
@@ -213,8 +259,8 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
             super().__init__(params, {})
         self._inner = inner_optimizer
 
-        # Assert all-`Flat` placements: this optimizer only supports the
-        # all-Flat layout (parameter=Flat, gradient=Flat, optimizer=Flat).
+        # Muon requires every optimizer-managed buffer to retain at least one
+        # sharded axis; HSDP may replicate the outer axis.
         _seen_groups: set[FsdpParameterGroup] = set()
         for _param in self._all_params():
             _group = get_containing_parameter_group(_param)
@@ -224,11 +270,10 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
             for _buf in (_group.main_weight, _group.model_weight, _group.main_grad):
                 if _buf is None:
                     continue
-                if not all(isinstance(_p, Flat) for _p in _buf.placements):
+                if not any(isinstance(_p, Flat) for _p in _buf.placements):
                     raise ValueError(
-                        "FsdpOrthogonalizedOptimizer requires all-Flat placements "
-                        "(parameter=Flat, gradient=Flat, optimizer=Flat), but "
-                        f"{_group} has non-Flat placements "
+                        "FsdpOrthogonalizedOptimizer requires at least one Flat axis, but "
+                        f"{_group} has placements "
                         f"{[type(_p).__name__ for _p in _buf.placements]}."
                     )
 
@@ -356,9 +401,17 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
                 plans.append(None)
                 continue
             tensor_flat_offset = layout.tensor_to_offset[index]
-            world_size = dist.get_world_size(group=group.mesh.get_group())
+            process_group = _get_parameter_dp_group(param)
+            world_size = dist.get_world_size(group=process_group)
             rank_flat_shard_size = layout.size // world_size
-            plan = compute_shard_plan(shape, tensor_flat_offset, rank_flat_shard_size, world_size)
+            shard_order = _get_parameter_shard_order(param, process_group)
+            plan = compute_shard_plan(
+                shape,
+                tensor_flat_offset,
+                rank_flat_shard_size,
+                world_size,
+                shard_order=shard_order,
+            )
             self._shard_plans[key] = plan
             plans.append(plan)
         return plans
@@ -429,7 +482,7 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
         chunks: dict[tuple, list[list[int]]] = {}
         for index, (param, shard, plan) in enumerate(zip(params, local_shards, plans)):
             group = get_containing_parameter_group(param)
-            collective_group = group.mesh.get_group() if group is not None else None
+            collective_group = _get_parameter_dp_group(param) if group is not None else None
             key = (plan.is_boundary(), id(collective_group), shard.device, shard.dtype, param.dtype)
             compatible_chunks = chunks.setdefault(key, [])
             if (

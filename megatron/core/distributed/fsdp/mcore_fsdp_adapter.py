@@ -614,7 +614,10 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             # each axis takes the placements of its own strategy, so no_shard outer over
             # ZeRO-3 inner is HSDP and ZeRO-1 outer over ZeRO-3 inner is HFSDP.
             dp_mesh = _build_hybrid_dp_mesh(
-                pg_collection.inter_dist_opt, pg_collection.intra_dp_cp, device_type
+                pg_collection.inter_dist_opt,
+                pg_collection.intra_dp_cp,
+                pg_collection.dp_cp,
+                device_type,
             )
             outer = _DATA_PARALLEL_PLACEMENTS[ddp_config.outer_dp_sharding_strategy]
             inner = _DATA_PARALLEL_PLACEMENTS[ddp_config.data_parallel_sharding_strategy]
@@ -879,7 +882,7 @@ _DATA_PARALLEL_PLACEMENTS = {
 }
 
 
-def _build_hybrid_dp_mesh(outer_group, inner_group, device_type):
+def _build_hybrid_dp_mesh(outer_group, inner_group, flattened_group, device_type):
     """Build the ("dp_outer", "dp_shard") mesh for a hybrid data-parallel domain.
 
     DeviceMesh.from_group requires an explicit rank table when given more than one group,
@@ -891,10 +894,11 @@ def _build_hybrid_dp_mesh(outer_group, inner_group, device_type):
     table is its mesh coordinate: a table with the right members in the wrong order would
     keep reducing over valid groups while assigning every shard index to the wrong rank.
     """
-    if outer_group is None or inner_group is None:
+    if outer_group is None or inner_group is None or flattened_group is None:
         raise ValueError(
             "MFSDP v2 with num_distributed_optimizer_instances > 1 requires both the "
-            "inter- and intra-distributed-optimizer process groups."
+            "inter- and intra-distributed-optimizer process groups and the full "
+            "data-parallel process group."
         )
 
     inner_size = inner_group.size()
@@ -905,6 +909,7 @@ def _build_hybrid_dp_mesh(outer_group, inner_group, device_type):
     expected_outer = [row[inner_index] for row in layout]
     actual_inner = dist.get_process_group_ranks(inner_group)
     actual_outer = dist.get_process_group_ranks(outer_group)
+    actual_flattened = dist.get_process_group_ranks(flattened_group)
     if actual_inner != expected_inner:
         raise ValueError(
             f"MFSDP v2 hybrid mesh row {expected_inner} does not match the intra "
@@ -915,13 +920,21 @@ def _build_hybrid_dp_mesh(outer_group, inner_group, device_type):
             f"MFSDP v2 hybrid mesh column {expected_outer} does not match the inter "
             f"distributed-optimizer group {actual_outer}."
         )
+    expected_flattened = list(range(dist.get_world_size()))
+    if actual_flattened != expected_flattened:
+        raise ValueError(
+            f"MFSDP v2 flattened hybrid mesh {expected_flattened} does not match the "
+            f"full data-parallel group {actual_flattened}."
+        )
 
-    return DeviceMesh.from_group(
+    mesh = DeviceMesh.from_group(
         [outer_group, inner_group],
         device_type=device_type,
         mesh=layout,
         mesh_dim_names=("dp_outer", "dp_shard"),
     )
+    mesh._mfsdp_flattened_group = flattened_group
+    return mesh
 
 
 def _get_hsdp_tp_mesh(outer_fsdp_dp_group, dp_cp_group, tp_group, ep_size=1):
