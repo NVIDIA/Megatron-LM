@@ -2,15 +2,15 @@
 
 """Utility functions related to FP8 that are used throughout Megatron core"""
 
-import importlib
 import weakref
 from contextlib import nullcontext
 from functools import wraps
-from typing import List, Optional, Union
+from typing import List, Optional
 
 import torch
 
-from megatron.core.enums import Fp4Recipe, Fp8Recipe
+from megatron.core.enums import Fp8Recipe
+from megatron.core.quantization.custom_recipe import get_cached_custom_recipe
 from megatron.core.tensor_parallel import (
     ColumnParallelLinear,
     RowParallelLinear,
@@ -306,51 +306,6 @@ def dequantize_fp8_tensor(fp8_tensor: torch.Tensor) -> torch.Tensor:
         return fp8_tensor.dequantize()
     else:
         return fp8_tensor.from_float8()
-
-
-def _resolve_callable_from_python_import_path(dotted_path: str):
-    """Resolve a Python import path like 'pkg.mod.func' to a callable.
-
-    Raises ValueError with clear message on failure.
-    """
-    if not isinstance(dotted_path, str) or not dotted_path:
-        raise ValueError(
-            "fp8_quantizer_factory must be a non-empty string with format 'pkg.mod.func'."
-        )
-
-    parts = dotted_path.rsplit(".", 1)
-    if len(parts) == 1:
-        raise ValueError(f"Invalid fp8_quantizer_factory '{dotted_path}'. Expected 'pkg.mod.func'.")
-    module_path, attr = parts[0], parts[1]
-
-    try:
-        mod = importlib.import_module(module_path)
-    except Exception as exc:
-        raise ValueError(
-            f"Failed to import module '{module_path}' for fp8_quantizer_factory: {exc}"
-        ) from exc
-
-    fn = getattr(mod, attr, None)
-    if fn is None:
-        raise ValueError(
-            f"Attribute '{attr}' not found in module '{module_path}' for fp8_quantizer_factory."
-        )
-    if not callable(fn):
-        raise ValueError(
-            f"Resolved attribute '{module_path}.{attr}' is not callable for fp8_quantizer_factory."
-        )
-    return fn
-
-
-def _get_custom_recipe(quantizer_factory_python_path: str) -> Union[Fp8Recipe, Fp4Recipe]:
-    quantizer_factory = _resolve_callable_from_python_import_path(quantizer_factory_python_path)
-    try:
-        custom_recipe = transformer_engine.common.recipe.CustomRecipe(qfactory=quantizer_factory)
-    except AttributeError:
-        raise ValueError("""CustomRecipe recipe is not available in this version of 
-            Transformer Engine. Please make sure you are using TE version 
-            >= 2.9.0.dev0.""")
-    return custom_recipe
 
 
 def get_fp8_align_size(fp8_recipe: Fp8Recipe) -> int:
@@ -788,7 +743,12 @@ if HAVE_TE:
                 )
             elif config.fp8_recipe == Fp8Recipe.custom:
                 assert config.fp8_quantizer_factory is not None
-                fp8_recipe = _get_custom_recipe(config.fp8_quantizer_factory)
+                fp8_recipe = get_cached_custom_recipe(
+                    config,
+                    config.fp8_quantizer_factory,
+                    fp8_dpa=config.fp8_dot_product_attention,
+                    fp8_mha=config.fp8_multi_head_attention,
+                )
             else:
                 raise ValueError(
                     "Float8CurrentScaling, MXFP8BlockScaling, Float8BlockwiseScaling and "

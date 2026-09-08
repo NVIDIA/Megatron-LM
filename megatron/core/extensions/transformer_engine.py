@@ -34,6 +34,7 @@ from megatron.core.parallel_state import (
     model_parallel_is_initialized,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection, resolve_gtp_remat_group
+from megatron.core.quantization.custom_recipe import get_cached_custom_recipe
 from megatron.core.quantization.quant_config import QuantizationConfig
 from megatron.core.quantization.utils import get_quant_config_or_none
 from megatron.core.tensor_parallel.layers import (
@@ -200,6 +201,10 @@ class TEQuantizationRecipe:
         ):
             if instance.custom_recipe_factory is None:
                 raise ValueError("custom fp8 or fp4 recipe requires custom_recipe_factory")
+            if instance.fp8_param or instance.fp4_param:
+                raise ValueError(
+                    "Per-module custom recipes do not yet support quantized parameter storage."
+                )
         return instance
 
     @classmethod
@@ -255,6 +260,7 @@ class TEQuantizationParams:
 
 
 def _get_fp8_model_init_for_quant_recipe(qrecipe: TEQuantizationRecipe):
+    custom_recipe = False
     if qrecipe.fp8_quantization_recipe is None and qrecipe.fp4_quantization_recipe is None:
         enabled = False
         quant_recipe = None
@@ -268,10 +274,9 @@ def _get_fp8_model_init_for_quant_recipe(qrecipe: TEQuantizationRecipe):
             raise ValueError(f"Unhandled fp8_format {qrecipe.fp8_format}")
 
         if qrecipe.fp8_quantization_recipe == Fp8Recipe.custom:
-            from megatron.core.fp8_utils import _get_custom_recipe
-
+            custom_recipe = True
             assert qrecipe.custom_recipe_factory is not None
-            quant_recipe = _get_custom_recipe(qrecipe.custom_recipe_factory)
+            quant_recipe = get_cached_custom_recipe(qrecipe, qrecipe.custom_recipe_factory)
         elif qrecipe.fp8_quantization_recipe == Fp8Recipe.tensorwise:
             quant_recipe = te.common.recipe.Float8CurrentScaling(fp8_format=fp8_format)
         elif qrecipe.fp8_quantization_recipe == Fp8Recipe.blockwise:
@@ -284,20 +289,22 @@ def _get_fp8_model_init_for_quant_recipe(qrecipe: TEQuantizationRecipe):
         # Fp4 configured.
         enabled = qrecipe.fp4_param
         if qrecipe.fp4_quantization_recipe == Fp4Recipe.custom:
-            from megatron.core.fp8_utils import _get_custom_recipe
-
+            custom_recipe = True
             assert qrecipe.custom_recipe_factory is not None
-            quant_recipe = _get_custom_recipe(qrecipe.custom_recipe_factory)
+            quant_recipe = get_cached_custom_recipe(qrecipe, qrecipe.custom_recipe_factory)
         elif qrecipe.fp4_quantization_recipe == Fp4Recipe.nvfp4:
             quant_recipe = te.common.recipe.NVFP4BlockScaling()
         else:
             raise ValueError(f"Unhandled fp4 recipe: {qrecipe.fp4_quantization_recipe}")
 
-    return fp8_model_init(
-        enabled=enabled,
-        recipe=quant_recipe,
-        preserve_high_precision_init_val=torch.is_grad_enabled(),
-    )
+    context_args = {
+        "enabled": enabled,
+        "recipe": quant_recipe,
+        "preserve_high_precision_init_val": torch.is_grad_enabled(),
+    }
+    if custom_recipe:
+        return te.pytorch.quantized_model_init(**context_args)
+    return fp8_model_init(**context_args)
 
 
 def _get_fp8_model_init_for_quant_params(qparams: TEQuantizationParams | None, training: bool):
@@ -326,14 +333,13 @@ def _get_fp8_autocast_for_quant_recipe(qrecipe: TEQuantizationRecipe):
             amax_group = get_amax_reduction_group(
                 with_context_parallel=True, tp_only_amax_red=qrecipe.tp_only_amax_red
             )
-        if (
+        custom_recipe = (
             qrecipe.fp8_quantization_recipe == Fp8Recipe.custom
             or qrecipe.fp4_quantization_recipe == Fp4Recipe.custom
-        ):
-            from megatron.core.fp8_utils import _get_custom_recipe
-
+        )
+        if custom_recipe:
             assert qrecipe.custom_recipe_factory is not None
-            quant_recipe = _get_custom_recipe(qrecipe.custom_recipe_factory)
+            quant_recipe = get_cached_custom_recipe(qrecipe, qrecipe.custom_recipe_factory)
         elif qrecipe.fp8_quantization_recipe is not None:
             if qrecipe.fp8_format == "e4m3":
                 fp8_format = te.common.recipe.Format.E4M3
@@ -357,6 +363,10 @@ def _get_fp8_autocast_for_quant_recipe(qrecipe: TEQuantizationRecipe):
             else:
                 raise ValueError(f"Unhandled fp4 recipe: {qrecipe.fp8_quantization_recipe}")
 
+        if custom_recipe:
+            return te.pytorch.autocast(
+                enabled=True, recipe=quant_recipe, amax_reduction_group=amax_group
+            )
         return fp8_autocast(enabled=True, fp8_recipe=quant_recipe, fp8_group=amax_group)
 
 
