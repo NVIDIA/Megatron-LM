@@ -139,6 +139,18 @@ class BalancedCPScheduler:
                 [[] for _ in range(total_gpus)],
             )
 
+        oversized = [
+            (sample_id, seq_len, self.gpus_needed(seq_len))
+            for sample_id, seq_len in sample_seqlens
+            if self.gpus_needed(seq_len) > total_gpus
+        ]
+        if oversized:
+            sample_id, seq_len, required_size = oversized[0]
+            raise ValueError(
+                f"Sample {sample_id} with sequence length {seq_len} requires "
+                f"{required_size} DPxCP ranks, but the group has only {total_gpus} ranks."
+            )
+
         # Get buckets of sequences with balanced work
         buckets = self.make_buckets_equal(sample_seqlens, compute_estimator)
 
@@ -151,6 +163,24 @@ class BalancedCPScheduler:
         group_members = {}
         group_size = {}
         next_gid = 0
+
+        def get_aligned_free_members(size: int):
+            """Return the least-loaded pre-created communicator block of ``size``."""
+            if size == total_gpus:
+                candidates = [list(range(total_gpus))]
+            else:
+                candidates = [
+                    list(range(start, start + size))
+                    for start in range(0, total_gpus - size + 1, size)
+                ]
+            candidates = [
+                members
+                for members in candidates
+                if all(gpu_group_id[rank] is None for rank in members)
+            ]
+            if not candidates:
+                return None
+            return min(candidates, key=lambda members: max(exec_times[rank] for rank in members))
 
         pp_cursor = 0
         prev_needed = None
@@ -178,8 +208,7 @@ class BalancedCPScheduler:
                 candidate_gids = [gid for gid, sz in group_size.items() if sz == needed]
 
                 # (b) Or enough completely free GPUs to start a new group?
-                free_ranks = [r for r, gid in enumerate(gpu_group_id) if gid is None]
-                if candidate_gids or len(free_ranks) >= needed:
+                if candidate_gids or get_aligned_free_members(needed) is not None:
                     sample_seq_tuple, bucket_idx = cand_tuple, idx
                     break
 
@@ -210,11 +239,9 @@ class BalancedCPScheduler:
                 best_gid, best_load = None, float("inf")
 
             # (b)  Hypothetical **new** group from completely free GPUs
-            free_ranks = [r for r, gid in enumerate(gpu_group_id) if gid is None]
-            if len(free_ranks) >= needed:
-                free_sorted = sorted(free_ranks, key=lambda r: exec_times[r])
-                new_members = free_sorted[:needed]
-                new_load = exec_times[new_members[-1]]
+            new_members = get_aligned_free_members(needed)
+            if new_members is not None:
+                new_load = max(exec_times[r] for r in new_members)
 
                 if new_load < best_load:
                     best_gid = None
@@ -361,6 +388,108 @@ class BalancedCPScheduler:
                     group_members,
                     group_size,
                 )  # No empty GPUs, we're done
+
+            # Hybrid CP communicators are pre-created as aligned contiguous
+            # blocks for each power-of-two size. Repacking is therefore needed
+            # for power-of-two domains too: an in-place expansion can otherwise
+            # create a block such as [2, 3, 4, 5], while the lookup API returns
+            # only [0, 1, 2, 3] or [4, 5, 6, 7].
+            if group_members:
+                records = []
+                for gid, members in sorted(group_members.items(), key=lambda item: item[1][0]):
+                    first_rank = members[0]
+                    seqs = list(micro_batches[first_rank])
+                    sample_ids = list(sample_ids_per_gpu[first_rank])
+                    required_size = max((self.gpus_needed(seq) for seq in seqs), default=1)
+                    records.append((gid, seqs, sample_ids, len(members), required_size))
+
+                legal_sizes = [1]
+                size = 2
+                while size < total_gpus:
+                    legal_sizes.append(size)
+                    size *= 2
+                if total_gpus not in legal_sizes:
+                    legal_sizes.append(total_gpus)
+
+                # Find the least disruptive legal partition.  Existing groups
+                # may shrink as well as grow: a group previously expanded to 4
+                # can safely return to 2 when its samples only require CP2.
+                choices = [
+                    [size for size in legal_sizes if size >= required_size]
+                    for _, _, _, _, required_size in records
+                ]
+                best_targets = None
+                if all(choices):
+                    # Dynamic programming keeps this bounded by the domain
+                    # size instead of enumerating every group-size combination.
+                    # State value: (total cost, selected target sizes).
+                    states = {0: (0, [])}
+                    for record, targets in zip(records, choices):
+                        next_states = {}
+                        for used, (cost, selected) in states.items():
+                            for target in targets:
+                                new_used = used + target
+                                # ``used`` is the start rank of this block.
+                                # Static process groups are aligned to their
+                                # own size, so only select an aligned block.
+                                if new_used > total_gpus or used % target != 0:
+                                    continue
+                                new_cost = cost + abs(target - record[3])
+                                previous = next_states.get(new_used)
+                                if previous is None or new_cost < previous[0]:
+                                    next_states[new_used] = (new_cost, selected + [target])
+                        states = next_states
+                    if total_gpus in states:
+                        best_targets = states[total_gpus][1]
+
+                # Some workloads cannot be represented as a partition of the
+                # power-of-two sizes (e.g. two CP2 groups in a 14-rank domain).
+                # Merge them into the full DPxCP group, which is always a legal
+                # communicator and preserves every sample exactly once.
+                if best_targets is None:
+                    merged_seqs = [seq for _, seqs, _, _, _ in records for seq in seqs]
+                    merged_sample_ids = [
+                        sample_id
+                        for _, _, sample_ids, _, _ in records
+                        for sample_id in sample_ids
+                    ]
+                    required_size = max(
+                        (self.gpus_needed(seq) for seq in merged_seqs), default=1
+                    )
+                    if required_size > total_gpus:
+                        raise ValueError(
+                            f"A sample requires {required_size} DPxCP ranks, "
+                            f"but the group has only {total_gpus} ranks."
+                        )
+                    records = [
+                        (records[0][0], merged_seqs, merged_sample_ids, total_gpus, required_size)
+                    ]
+                    best_targets = [total_gpus]
+
+                if best_targets is not None:
+                    new_micro_batches = [[] for _ in range(total_gpus)]
+                    new_exec_times = [0.0] * total_gpus
+                    new_sample_ids_per_gpu = [[] for _ in range(total_gpus)]
+                    new_group_members = {}
+                    new_group_size = {}
+                    cursor = 0
+                    for (gid, seqs, sample_ids, _, _), target in zip(records, best_targets):
+                        members = list(range(cursor, cursor + target))
+                        workload = sum(self.get_total_workload(seq, target) for seq in seqs)
+                        for rank in members:
+                            new_micro_batches[rank] = list(seqs)
+                            new_exec_times[rank] = workload
+                            new_sample_ids_per_gpu[rank] = list(sample_ids)
+                        new_group_members[gid] = members
+                        new_group_size[gid] = target
+                        cursor += target
+                    return (
+                        new_micro_batches,
+                        new_exec_times,
+                        new_sample_ids_per_gpu,
+                        new_group_members,
+                        new_group_size,
+                    )
 
             # Find the smallest group size that exists
             existing_group_sizes = set(group_size.values())
