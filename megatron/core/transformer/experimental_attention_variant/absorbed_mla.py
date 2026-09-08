@@ -227,6 +227,7 @@ class AbsorbedMLASelfAttention(Attention):
             v_channels=self.config.kv_lora_rank,
             cp_comm_type=cp_comm_type,
             pg_collection=self.pg_collection,
+            name=(name + ".core_attention") if name is not None else None,
         )
 
         # Output.

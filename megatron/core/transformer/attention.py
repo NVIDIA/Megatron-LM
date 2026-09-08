@@ -389,6 +389,7 @@ class Attention(MegatronModule, ABC):
             cp_comm_type=cp_comm_type,
             softmax_scale=self.config.softmax_scale,
             pg_collection=self.pg_collection,
+            name=(name + ".core_attention") if name is not None else None,
         )
 
         self.checkpoint_core_attention = (

@@ -276,8 +276,10 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         post_process: bool = True,
         pg_collection: Optional[ProcessGroupCollection] = None,
         vp_stage: Optional[int] = None,
+        name: str | None = None,
     ):
         super().__init__(config=config)
+        self.name = name
 
         if pg_collection is None:
             pg_collection = ProcessGroupCollection.use_mpu_process_groups()
@@ -360,6 +362,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     layer_number=layer_number,
                     pg_collection=self.pg_collection,
                     vp_stage=self.vp_stage,
+                    name=(f"{self.name}.layers.{layer_number - 1}" if self.name else None),
                 )
             if layer_config.enable_mhc_connections and not getattr(
                 module, "supports_mhc_connections", False

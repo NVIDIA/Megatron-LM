@@ -5,11 +5,16 @@ from contextlib import nullcontext
 from unittest.mock import Mock, patch
 
 import pytest
+import torch
 
 from megatron.core.enums import Fp8Recipe
 from megatron.core.extensions import transformer_engine as te_extension
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.quantization import custom_recipe, te_recipe
+from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
+from tests.unit_tests.test_utilities import Utils
 
 RECORDED_ROLES = []
 
@@ -228,3 +233,53 @@ def test_custom_recipe_alignment_uses_declared_value_or_conservative_fallback():
     assert te_recipe.get_quantization_alignment(config) == expected
     with patch.object(te_recipe, "get_te_quantization_recipe", return_value=object()):
         assert te_recipe.get_quantization_alignment(config) == 128
+
+
+@pytest.mark.skipif(not te_extension.HAVE_TE, reason="Transformer Engine is not installed")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_custom_recipe_dense_forward_backward_receives_semantic_role_names():
+    availability = te_extension.te.pytorch.is_fp8_available()
+    if isinstance(availability, tuple):
+        fp8_available, reason = availability
+    else:
+        fp8_available, reason = availability, "FP8 execution is unavailable"
+    if not fp8_available:
+        pytest.skip(reason)
+
+    Utils.initialize_model_parallel(1, 1)
+    try:
+        model_parallel_cuda_manual_seed(123)
+        RECORDED_ROLES.clear()
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=128,
+            ffn_hidden_size=256,
+            num_attention_heads=4,
+            attention_dropout=0.0,
+            hidden_dropout=0.0,
+            params_dtype=torch.bfloat16,
+            custom_recipe=TEST_FACTORY_PATH,
+            fp8_dot_product_attention=True,
+        )
+        block = TransformerBlock(
+            config, get_gpt_layer_with_transformer_engine_spec(), name="decoder"
+        )
+        hidden_states = torch.randn(
+            16, 2, config.hidden_size, device="cuda", dtype=torch.bfloat16, requires_grad=True
+        )
+        output = block(hidden_states=hidden_states, attention_mask=None)
+        output.float().square().mean().backward()
+
+        assert torch.isfinite(output).all()
+        assert hidden_states.grad is not None
+        assert torch.isfinite(hidden_states.grad).all()
+        role_names = {role.name for role in RECORDED_ROLES if role is not None}
+        assert {
+            "decoder.layers.0.self_attention.linear_qkv",
+            "decoder.layers.0.self_attention.linear_proj",
+            "decoder.layers.0.mlp.linear_fc1",
+            "decoder.layers.0.mlp.linear_fc2",
+            "decoder.layers.0.self_attention.core_attention",
+        } <= role_names
+    finally:
+        Utils.destroy_model_parallel()

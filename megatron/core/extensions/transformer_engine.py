@@ -988,6 +988,9 @@ if HAVE_TE and is_te_min_version("1.13.0"):
             accumulate_into_main_grad=module.fuse_wgrad_accumulation,
             userbuffers_options=userbuffers_options,
         )
+        # BasicLinear does not expose a constructor name argument, but it does
+        # read ``self.name`` before materializing custom quantizers on forward.
+        op.name = getattr(module, "name", None)
         op.weight = weight
         return op
 
@@ -1350,6 +1353,7 @@ class TELinear(te.pytorch.Linear):
                 bias=bias,
                 return_bias=self.te_return_bias,
                 parallel_mode=te_parallel_mode,
+                name=name,
                 **extra_kwargs,
             )
 
@@ -1586,6 +1590,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
                 parallel_mode="column",
                 return_layernorm_output=False,
                 zero_centered_gamma=self.config.layernorm_zero_centered_gamma,
+                name=name,
                 **extra_kwargs,
             )
 
@@ -2111,6 +2116,7 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         num_splits: Optional[int] = None,
         cp_comm_type: Optional[str] = "p2p",
         pg_collection: Optional[ProcessGroupCollection] = None,
+        name: str | None = None,
     ):
         if not HAVE_TE:
             raise ImportError(
@@ -2287,6 +2293,7 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             ),
             tp_group=pg_collection.tp,
             layer_number=layer_number,
+            name=name,
             **extra_kwargs,
         )
 
@@ -2594,6 +2601,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                     bias=bias,
                     return_bias=self.te_return_bias,
                     parallel_mode=parallel_mode,
+                    name=name,
                     **extra_kwargs,
                 )
 

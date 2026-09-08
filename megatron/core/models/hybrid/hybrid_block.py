@@ -207,6 +207,7 @@ class HybridStack(MegatronModule):
                         layer_number=layer_number,
                         pp_layer_offset=pp_layer_offset,
                         pg_collection=pg_collection,
+                        name=(name + f".layers.{i}") if name is not None else None,
                     )
                 elif type(layer_config) is layer_utils.AttentionLayerConfig:
                     layer = build_module(
@@ -217,6 +218,7 @@ class HybridStack(MegatronModule):
                         is_mtp_layer=is_mtp_layer,
                         add_layer_offset=False,
                         pp_layer_offset=pp_layer_offset,
+                        name=(name + f".layers.{i}") if name is not None else None,
                     )
                 elif type(layer_config) is layer_utils.DSALayerConfig:
                     layer = build_module(
@@ -227,6 +229,7 @@ class HybridStack(MegatronModule):
                         is_mtp_layer=is_mtp_layer,
                         add_layer_offset=False,
                         pp_layer_offset=pp_layer_offset,
+                        name=(name + f".layers.{i}") if name is not None else None,
                     )
                 elif type(layer_config) is layer_utils.MLALayerConfig:
                     layer = build_module(
@@ -237,6 +240,7 @@ class HybridStack(MegatronModule):
                         is_mtp_layer=is_mtp_layer,
                         add_layer_offset=False,
                         pp_layer_offset=pp_layer_offset,
+                        name=(name + f".layers.{i}") if name is not None else None,
                     )
                 elif type(layer_config) is layer_utils.MLPLayerConfig:
                     layer = build_module(
@@ -245,6 +249,7 @@ class HybridStack(MegatronModule):
                         layer_number=layer_number,
                         pg_collection=pg_collection,
                         add_layer_offset=False,
+                        name=(name + f".layers.{i}") if name is not None else None,
                     )
                 elif type(layer_config) is layer_utils.MoELayerConfig:
                     layer = build_module(
@@ -254,6 +259,7 @@ class HybridStack(MegatronModule):
                         pg_collection=pg_collection,
                         is_mtp_layer=is_mtp_layer,
                         add_layer_offset=False,
+                        name=(name + f".layers.{i}") if name is not None else None,
                     )
                 elif type(layer_config) is layer_utils.GDNLayerConfig:
                     gdn_layer_spec = submodules.gdn_layer
@@ -272,6 +278,7 @@ class HybridStack(MegatronModule):
                         # Set to False as we do not want to change offset.
                         add_layer_offset=False,
                         pp_layer_offset=pp_layer_offset,
+                        name=(name + f".layers.{i}") if name is not None else None,
                     )
                 else:
                     raise ValueError(
