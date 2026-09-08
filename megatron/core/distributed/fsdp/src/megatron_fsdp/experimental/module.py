@@ -28,10 +28,11 @@ from torch.distributed.tensor.placement_types import Placement
 
 from ..mixed_precision import MixedPrecisionPolicy
 from .countdown import Countdown
+from .dbuffer import is_mxfp8_tensor
 from .indexed_order import IndexedOrder
 from .module_utils import get_parameter_owner
 from .parameter_group import FsdpParameterGroup, get_containing_parameter_group
-from .placement import Flat
+from .placement import BlockAtomic, Flat
 from .schedule import SchedulePolicy
 
 
@@ -199,22 +200,27 @@ class FsdpModule:
             raise ValueError(f"grad_divisor must be positive, got {grad_divisor}.")
         parameter_groups = []
         for group_parameters in _group_parameters(owned_parameters):
-            group_dtype = next(iter(group_parameters.values())).dtype
+            first_parameter = next(iter(group_parameters.values()))
+            group_dtype = first_parameter.dtype
+            is_mxfp8 = is_mxfp8_tensor(first_parameter)
             parameter_groups.append(
                 FsdpParameterGroup(
                     owning_module=self,
                     parameters=group_parameters,
                     mesh=mesh,
                     model_weight_placements=_specialize_placements(
-                        model_weight_placements, group_dtype
+                        model_weight_placements, group_dtype, is_mxfp8=is_mxfp8
                     ),
-                    main_grad_placements=_specialize_placements(main_grad_placements, group_dtype),
+                    main_grad_placements=_specialize_placements(
+                        main_grad_placements, group_dtype, is_mxfp8=is_mxfp8
+                    ),
                     main_weight_placements=_specialize_placements(
-                        main_weight_placements, group_dtype
+                        main_weight_placements, group_dtype, is_mxfp8=is_mxfp8
                     ),
                     mixed_precision_policy=mixed_precision_policy,
                     grad_divisor=grad_divisor,
                     use_symmetric_memory=use_symmetric_memory,
+                    is_mxfp8=is_mxfp8,
                 )
             )
         self._parameter_groups = tuple(parameter_groups)
@@ -601,15 +607,15 @@ def _collect_owned_parameters(root_module: nn.Module) -> dict[str, nn.Parameter]
 
 
 def _group_parameters(parameters: dict[str, nn.Parameter]) -> list[dict[str, nn.Parameter]]:
-    grouped: dict[tuple[torch.dtype, bool], dict[str, nn.Parameter]] = {}
+    grouped: dict[tuple[torch.dtype, bool, bool], dict[str, nn.Parameter]] = {}
     for name, parameter in parameters.items():
-        key = (parameter.dtype, parameter.requires_grad)
+        key = (parameter.dtype, parameter.requires_grad, is_mxfp8_tensor(parameter))
         grouped.setdefault(key, {})[name] = parameter
     return [grouped[key] for key in grouped]
 
 
 def _specialize_placements(
-    placements: tuple[Placement, ...], dtype: torch.dtype
+    placements: tuple[Placement, ...], dtype: torch.dtype, *, is_mxfp8: bool = False
 ) -> tuple[Placement, ...]:
     """Specialize public placements for one homogeneous parameter group.
 
@@ -624,4 +630,7 @@ def _specialize_placements(
             raise NotImplementedError(
                 "MFSDP currently supports only dim-0 Shard placements, " f"got {placement!r}."
             )
-    return tuple(Flat() if type(placement) is Shard else placement for placement in placements)
+    placement_type = BlockAtomic(32) if is_mxfp8 else Flat()
+    return tuple(
+        placement_type if type(placement) is Shard else placement for placement in placements
+    )

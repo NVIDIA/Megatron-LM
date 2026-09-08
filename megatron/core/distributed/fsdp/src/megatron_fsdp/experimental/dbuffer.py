@@ -24,8 +24,26 @@ from torch.distributed import DeviceMesh
 from torch.distributed.tensor import DTensor, Partial, Replicate, Shard
 from torch.distributed.tensor.placement_types import Placement
 
+from ..mixed_precision import HAVE_TE_MXFP8TENSOR
 from .layout import GlobalLayout, Shape, non_leading_numel
 from .placement import changed_mesh_axis
+
+if HAVE_TE_MXFP8TENSOR:
+    from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Tensor
+else:
+    MXFP8Tensor = None
+
+_MXFP8_BLOCK_SIZE = 32
+
+
+def is_mxfp8_tensor(tensor: torch.Tensor) -> bool:
+    """Whether ``tensor`` is a TE MXFP8 tensor with both physical data representations."""
+    return (
+        HAVE_TE_MXFP8TENSOR
+        and isinstance(tensor, MXFP8Tensor)
+        and tensor._rowwise_data is not None
+        and tensor._columnwise_data is not None
+    )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -64,9 +82,10 @@ class DBuffer:
     """A distributed buffer holding a group of logical tensors.
 
     DBuffer is analogous to DTensor, but manages a group of logical tensors in
-    one local storage tensor. It stores enough metadata to return per-tensor
-    views, redistribute the buffer across mesh axes, and materialize per-tensor
-    DTensors for optimizer state or distributed checkpointing.
+    one local storage tensor, or a TE-owned MXFP8 logical tensor with its
+    physical data and scale tensors. It stores enough metadata to return
+    per-tensor views, redistribute the buffer across mesh axes, and materialize
+    per-tensor DTensors for optimizer state or distributed checkpointing.
     """
 
     # DBuffer owns only the data-parallel sub-mesh. Higher-level callers, such as
@@ -77,6 +96,7 @@ class DBuffer:
     layout: GlobalLayout
     offset: int
     local_buffer: torch.Tensor
+    tensor: torch.Tensor | None
 
     def __init__(
         self,
@@ -103,7 +123,6 @@ class DBuffer:
                 f"Expected {mesh.ndim} placements for device mesh, got {len(placements)}."
             )
         _validate_placements(placements)
-
         self.mesh = mesh
         self.placements = placements
 
@@ -114,15 +133,97 @@ class DBuffer:
 
         self.offset, local_numel = self.layout.get_local_range(self.mesh, self.placements)
         self.local_buffer = torch.empty(local_numel, dtype=dtype, device=device)
+        self.tensor = None
+
+    @classmethod
+    def from_mxfp8(
+        cls,
+        tensors: Iterable[torch.Tensor],
+        mesh: DeviceMesh,
+        placements: Iterable[Placement],
+        *,
+        allocate_new: bool = False,
+    ) -> "DBuffer":
+        """Create a DBuffer whose logical tensor is a TE MXFP8Tensor.
+
+        TE owns the physical data and scale subtensors. DBuffer owns their
+        placement and collective lifecycle through the retained logical wrapper.
+        """
+        tensors = tuple(tensors)
+        if len(tensors) != 1:
+            raise NotImplementedError("Experimental MXFP8 MFSDP supports one parameter per group.")
+        tensor = tensors[0]
+        placements = tuple(placements)
+        if not is_mxfp8_tensor(tensor) or tensor.ndim != 2:
+            raise TypeError("DBuffer.from_mxfp8() requires a 2D materialized MXFP8Tensor.")
+        if len(placements) != mesh.ndim:
+            raise ValueError(
+                f"Expected {mesh.ndim} placements for device mesh, got {len(placements)}."
+            )
+        _validate_placements(placements)
+        if mesh.ndim != 1 or any(
+            not isinstance(placement, (Replicate, Shard)) for placement in placements
+        ):
+            raise NotImplementedError(
+                "Experimental MXFP8 MFSDP supports one-dimensional Replicate/Shard meshes."
+            )
+        if allocate_new:
+            tensor = cls._empty_mxfp8_like(tensor)
+        is_replicated = all(isinstance(placement, Replicate) for placement in placements)
+        if is_replicated:
+            local_tensor = tensor
+        else:
+            if tensor.shape[0] % _MXFP8_BLOCK_SIZE or mesh.size() != 2:
+                raise NotImplementedError("MXFP8 MFSDP requires two equal 32-row-block shards.")
+            local_rows = tensor.shape[0] // mesh.size()
+            if local_rows % _MXFP8_BLOCK_SIZE:
+                raise NotImplementedError("MXFP8 MFSDP requires two equal 32-row-block shards.")
+            local_tensor = tensor.split(local_rows, dim=0)[mesh.get_local_rank()]
+
+        buffer = cls.__new__(cls)
+        buffer.mesh = mesh
+        buffer.placements = placements
+        buffer.layout = GlobalLayout.build(
+            [tensor.shape], dp_size=mesh.size(), block_size=_MXFP8_BLOCK_SIZE
+        )
+        buffer.offset, _ = buffer.layout.get_local_range(mesh, placements)
+        buffer.tensor = local_tensor
+        # Keep DBuffer's single-buffer compatibility surface for callers that
+        # inspect the allocation. MXFP8 collectives use the TE wrapper's full
+        # physical tensor set instead.
+        buffer.local_buffer = local_tensor._rowwise_data.view(-1)
+        return buffer
+
+    @staticmethod
+    def _empty_mxfp8_like(tensor: torch.Tensor) -> torch.Tensor:
+        """Allocate an independent TE MXFP8 wrapper with the same physical layout."""
+        assert is_mxfp8_tensor(tensor)
+        return MXFP8Tensor(
+            shape=tensor.shape,
+            dtype=tensor.dtype,
+            rowwise_data=torch.empty_like(tensor._rowwise_data),
+            rowwise_scale_inv=torch.empty_like(tensor._rowwise_scale_inv),
+            columnwise_data=torch.empty_like(tensor._columnwise_data),
+            columnwise_scale_inv=torch.empty_like(tensor._columnwise_scale_inv),
+            fp8_dtype=tensor._fp8_dtype,
+            quantizer=tensor._quantizer,
+            with_gemm_swizzled_scales=tensor._with_gemm_swizzled_scales,
+            device=tensor.device,
+            requires_grad=False,
+        )
 
     @property
     def dtype(self) -> torch.dtype:
         """Dtype of the local buffer."""
+        if self.tensor is not None:
+            return self.tensor.dtype
         return self.local_buffer.dtype
 
     @property
     def device(self) -> torch.device:
         """Device of the local buffer."""
+        if self.tensor is not None:
+            return self.tensor.device
         return self.local_buffer.device
 
     @property
@@ -132,27 +233,68 @@ class DBuffer:
             self.local_buffer
         )
 
+    @property
+    def is_mxfp8(self) -> bool:
+        """Whether this buffer is backed by a TE MXFP8 logical tensor."""
+        return self.tensor is not None and is_mxfp8_tensor(self.tensor)
+
+    def _mxfp8_physical_tensors(self) -> tuple[torch.Tensor, ...]:
+        """Return the physical tensors owned by this buffer's TE wrapper."""
+        assert self.is_mxfp8 and self.tensor is not None
+        return (
+            self.tensor._rowwise_data,
+            self.tensor._columnwise_data,
+            self.tensor._rowwise_scale_inv,
+            self.tensor._columnwise_scale_inv,
+        )
+
+    @staticmethod
+    def _compact_mxfp8_scale(tensor: torch.Tensor, *, columnwise: bool) -> torch.Tensor:
+        """Return the valid, non-padded region of one TE MXFP8 scale tensor."""
+        if columnwise:
+            return tensor._columnwise_scale_inv[
+                : tensor.shape[0] // _MXFP8_BLOCK_SIZE, : tensor.shape[1]
+            ].contiguous()
+        return tensor._rowwise_scale_inv[
+            : tensor.shape[0], : tensor.shape[1] // _MXFP8_BLOCK_SIZE
+        ].contiguous()
+
+    @staticmethod
+    def _unpack_mxfp8_scale(destination: torch.Tensor, source: torch.Tensor) -> None:
+        """Copy compact MXFP8 scales into TE's padded scale allocation."""
+        destination.zero_()
+        destination[: source.shape[0], : source.shape[1]].copy_(source)
+
     def reallocate_storage(self) -> None:
         """Restore the local buffer's backing storage to its logical size."""
         # The allocator may hand back a different address than release_storage() freed.
         # Tensors sharing this Storage read its pointer on each access, so views into the
         # buffer -- including ones autograd saved -- follow it to the new allocation.
-        self._resize_storage(self.local_buffer.numel())
+        if self.is_mxfp8:
+            for tensor in self._mxfp8_physical_tensors():
+                self._resize_storage(tensor, tensor.numel())
+            return
+        self._resize_storage(self.local_buffer, self.local_buffer.numel())
 
     def release_storage(self) -> None:
         """Release local buffer storage without replacing the Storage object."""
         # Autograd may save views that share this Storage object. Resizing the
         # existing Storage releases the allocation while preserving those aliases
         # for a later reallocate_storage().
-        self._resize_storage(0)
+        if self.is_mxfp8:
+            for tensor in self._mxfp8_physical_tensors():
+                self._resize_storage(tensor, 0)
+            return
+        self._resize_storage(self.local_buffer, 0)
 
     def rendezvous(self, mesh_axis: int) -> None:
         """Rendezvous this local buffer for symmetric-memory collectives."""
         group = self.mesh.get_group(mesh_axis)
         symm_mem.rendezvous(self.local_buffer, group=group.group_name)
 
-    def _resize_storage(self, numel: int) -> None:
-        self.local_buffer.untyped_storage().resize_(numel * self.local_buffer.element_size())
+    @staticmethod
+    def _resize_storage(tensor: torch.Tensor, numel: int) -> None:
+        tensor.untyped_storage().resize_(numel * tensor.element_size())
 
     def _get_owned_range(self, tensor_index: int) -> _OwnedRange | None:
         """Return this buffer's owned range for logical tensor ``tensor_index``."""
@@ -217,6 +359,7 @@ class DBuffer:
         buffer.layout = layout
         buffer.offset = offset
         buffer.local_buffer = local_buffer
+        buffer.tensor = None
         return buffer
 
     def view(self, placements: Iterable[Placement]) -> "DBuffer":
@@ -227,6 +370,8 @@ class DBuffer:
         only a storage destination: callers must populate it with a reduction
         before reading it.
         """
+        if self.is_mxfp8:
+            raise NotImplementedError("MXFP8 DBuffer views are not supported; use redistribute().")
         placements = tuple(placements)
         if len(placements) != self.mesh.ndim:
             raise ValueError(
@@ -348,8 +493,17 @@ class DBuffer:
             raise ValueError(f"Expected out device {self.device}, got {out.device}.")
         return out
 
+    def sync_from_main(self, main_weight: "DBuffer") -> None:
+        """Refresh an MXFP8 compute buffer by quantizing its local master shard."""
+        if not self.is_mxfp8 or self.tensor is None:
+            raise TypeError("sync_from_main() requires an MXFP8 DBuffer.")
+        with torch.no_grad():
+            self.tensor.quantize_(main_weight.get_local_tensor(0))
+
     def cast(self, dtype: torch.dtype, *, out: "DBuffer | None" = None) -> "DBuffer":
         """Return this buffer with the same layout and placements in ``dtype``."""
+        if self.is_mxfp8:
+            raise NotImplementedError("Cast MXFP8 DBuffers by requantizing from their main weight.")
         if self.dtype == dtype and out is None:
             return self
 
@@ -374,6 +528,9 @@ class DBuffer:
                 f"{len(new_placements)}."
             )
         _validate_placements(new_placements)
+
+        if self.is_mxfp8:
+            return self._redistribute_mxfp8(new_placements, out=out)
 
         changed_axis = changed_mesh_axis(self.placements, new_placements)
         if changed_axis is None:
@@ -419,12 +576,61 @@ class DBuffer:
             f"{axis}: {old_placement!r} -> {new_placement!r}."
         )
 
+    def _redistribute_mxfp8(
+        self, new_placements: tuple[Placement, ...], *, out: "DBuffer | None"
+    ) -> "DBuffer":
+        """Redistribute TE MXFP8 physical storage while preserving its wrapper."""
+        if out is None or not out.is_mxfp8:
+            raise ValueError(
+                "MXFP8 DBuffer redistribution requires a preallocated MXFP8 out buffer."
+            )
+        if out.mesh != self.mesh or out.placements != new_placements:
+            raise ValueError(
+                "MXFP8 DBuffer out buffer must match the requested mesh and placements."
+            )
+        changed_axis = changed_mesh_axis(self.placements, new_placements)
+        if changed_axis is None:
+            for destination, source in zip(
+                out._mxfp8_physical_tensors(), self._mxfp8_physical_tensors()
+            ):
+                destination.copy_(source)
+            return out
+
+        source_placement = self.placements[changed_axis]
+        destination_placement = new_placements[changed_axis]
+        if isinstance(source_placement, Shard) and isinstance(destination_placement, Replicate):
+            return self.allgather(changed_axis, out=out)
+        if isinstance(source_placement, Replicate) and isinstance(destination_placement, Shard):
+            assert self.tensor is not None and out.tensor is not None
+            local_rows = self.tensor.shape[0] // self.mesh.size(changed_axis)
+            source_shard = self.tensor.split(local_rows, dim=0)[
+                self.mesh.get_local_rank(changed_axis)
+            ]
+            for destination, source in zip(
+                out._mxfp8_physical_tensors(),
+                (
+                    source_shard._rowwise_data,
+                    source_shard._columnwise_data,
+                    source_shard._rowwise_scale_inv,
+                    source_shard._columnwise_scale_inv,
+                ),
+            ):
+                destination.copy_(source)
+            return out
+        raise NotImplementedError(
+            f"Unsupported MXFP8 DBuffer placement transition: {source_placement!r} -> "
+            f"{destination_placement!r}."
+        )
+
     def allgather(self, mesh_axis: int, *, out: "DBuffer | None" = None) -> "DBuffer":
         """All-gather a sharded axis into Replicate placement."""
         if not isinstance(self.placements[mesh_axis], Shard):
             raise ValueError(
                 f"allgather() currently requires a Shard placement on axis {mesh_axis!r}."
             )
+
+        if self.is_mxfp8:
+            return self._allgather_mxfp8(mesh_axis, out=out)
 
         placements = list(self.placements)
         placements[mesh_axis] = Replicate()
@@ -439,6 +645,33 @@ class DBuffer:
             input_tensor=self.local_buffer,
             group=self.mesh.get_group(mesh_axis),
         )
+        return out
+
+    def _allgather_mxfp8(self, mesh_axis: int, *, out: "DBuffer | None") -> "DBuffer":
+        """All-gather an MXFP8 wrapper's data and compact valid scale regions."""
+        if out is None or not out.is_mxfp8:
+            raise ValueError("MXFP8 DBuffer all-gather requires a preallocated MXFP8 out buffer.")
+        assert self.tensor is not None and out.tensor is not None
+        if not isinstance(out.placements[mesh_axis], Replicate):
+            raise ValueError("MXFP8 all-gather out buffer must replicate the gathered mesh axis.")
+        group = self.mesh.get_group(mesh_axis)
+        dist.all_gather_into_tensor(
+            out.tensor._rowwise_data, self.tensor._rowwise_data, group=group
+        )
+        dist.all_gather_into_tensor(
+            out.tensor._columnwise_data, self.tensor._columnwise_data, group=group
+        )
+        for columnwise in (False, True):
+            source = self._compact_mxfp8_scale(self.tensor, columnwise=columnwise)
+            gathered = torch.empty(
+                (self.mesh.size(mesh_axis), *source.shape), dtype=source.dtype, device=source.device
+            )
+            dist.all_gather_into_tensor(gathered, source, group=group)
+            compact = gathered.flatten(0, 1)
+            destination = (
+                out.tensor._columnwise_scale_inv if columnwise else out.tensor._rowwise_scale_inv
+            )
+            self._unpack_mxfp8_scale(destination, compact)
         return out
 
     def allreduce(self, mesh_axis: int, *, out: "DBuffer | None" = None) -> "DBuffer":
@@ -498,6 +731,10 @@ class DBuffer:
         Flat placements shard dim 0, so the returned view preserves all
         non-leading dimensions and only changes the leading dimension.
         """
+        if self.is_mxfp8:
+            raise NotImplementedError(
+                "Access an MXFP8 DBuffer through its logical tensor attribute."
+            )
         shape = self.layout.tensor_shapes[index]
         owned_range = self._get_owned_range(index)
 

@@ -84,7 +84,8 @@ class FsdpParameterGroup:
     requires_grad: bool
     main_weight: DBuffer
     model_weight: DBuffer
-    # Optimizer-layout view into model_weight storage, avoiding a second allocation.
+    # Compute-weight representation in the optimizer's placements. Ordinary
+    # DBuffers view model_weight storage; MXFP8 DBuffers own an independent TE wrapper.
     post_optimizer_model_weight: DBuffer
     # sync_model_weight_from_main_weight() updates only this rank's optimizer-layout
     # view; the remaining model_weight slices must be all-gathered before compute.
@@ -112,6 +113,7 @@ class FsdpParameterGroup:
         mixed_precision_policy: MixedPrecisionPolicy,
         grad_divisor: int = 1,
         use_symmetric_memory: bool = False,
+        is_mxfp8: bool = False,
     ) -> None:
         """Create persistent sharded buffers for a group of parameters.
 
@@ -178,7 +180,22 @@ class FsdpParameterGroup:
         else:
             self._symm_mem_pool = None
 
-        if main_weight_dtype == self.dtype and main_weight_placements == model_weight_placements:
+        if is_mxfp8:
+            self.model_weight = DBuffer.from_mxfp8(
+                parameter_to_fqns, self.mesh, model_weight_placements, allocate_new=True
+            )
+            self.post_optimizer_model_weight = DBuffer.from_mxfp8(
+                parameter_to_fqns, self.mesh, main_weight_placements, allocate_new=True
+            )
+            self.post_optimizer_model_weight.sync_from_main(self.main_weight)
+            self.post_optimizer_model_weight.redistribute(
+                model_weight_placements, out=self.model_weight
+            )
+            self._model_weight_is_stale = False
+            self._unsharded_model_weight = DBuffer.from_mxfp8(
+                parameter_to_fqns, self.mesh, [Replicate()] * self.mesh.ndim
+            )
+        elif main_weight_dtype == self.dtype and main_weight_placements == model_weight_placements:
             self.model_weight = self.main_weight
         else:
             # Keep the configured compute-weight layout alive for the lifetime of this
@@ -194,22 +211,23 @@ class FsdpParameterGroup:
                     device=self.main_weight.device,
                     block_size=block_size,
                 )
-        self.post_optimizer_model_weight = self.model_weight.view(main_weight_placements)
-        # Cast into the preallocated optimizer-layout view on the current stream.
-        self.main_weight.cast(self.model_weight.dtype, out=self.post_optimizer_model_weight)
-        self._model_weight_is_stale = (
-            self.post_optimizer_model_weight.placements != self.model_weight.placements
-        )
-
-        with self._symmetric_memory_context():
-            self._unsharded_model_weight = DBuffer(
-                mesh=self.mesh,
-                placements=[Replicate()] * self.mesh.ndim,
-                tensor_shapes=tensor_shapes,
-                dtype=self.dtype,
-                device=self.main_weight.device,
-                block_size=block_size,
+        if not is_mxfp8:
+            self.post_optimizer_model_weight = self.model_weight.view(main_weight_placements)
+            # Cast into the preallocated optimizer-layout view on the current stream.
+            self.main_weight.cast(self.model_weight.dtype, out=self.post_optimizer_model_weight)
+            self._model_weight_is_stale = (
+                self.post_optimizer_model_weight.placements != self.model_weight.placements
             )
+
+            with self._symmetric_memory_context():
+                self._unsharded_model_weight = DBuffer(
+                    mesh=self.mesh,
+                    placements=[Replicate()] * self.mesh.ndim,
+                    tensor_shapes=tensor_shapes,
+                    dtype=self.dtype,
+                    device=self.main_weight.device,
+                    block_size=block_size,
+                )
 
         self.main_grad = None
         self.pre_optimizer_main_grad = None
@@ -237,7 +255,9 @@ class FsdpParameterGroup:
         fsdp_parameters: list[FsdpParameter] = []
         main_grad_dtype = self.main_grad.dtype if self.main_grad is not None else None
         for index, (parameter, fqns) in enumerate(parameter_to_fqns.items()):
-            unsharded_tensor = self._unsharded_model_weight.get_local_tensor(index)
+            unsharded_tensor = (
+                parameter if is_mxfp8 else self._unsharded_model_weight.get_local_tensor(index)
+            )
             if parameter.is_meta:
                 # A meta Parameter cannot set .data to a real tensor because their
                 # TensorImpl types are incompatible, so swap in a materialized Parameter.
@@ -247,7 +267,7 @@ class FsdpParameterGroup:
                     unsharded_tensor, requires_grad=parameter.requires_grad
                 )
                 torch.utils.swap_tensors(parameter, materialized_parameter)
-            else:
+            elif not is_mxfp8:
                 parameter.data = unsharded_tensor
                 parameter.grad = None
             # Parameter-owned markers must not retain their FSDP module tree.
@@ -290,6 +310,12 @@ class FsdpParameterGroup:
 
     def sync_model_weight_from_main_weight(self) -> None:
         """Refresh compute weights from optimizer weights."""
+        if self.model_weight.is_mxfp8:
+            self.post_optimizer_model_weight.sync_from_main(self.main_weight)
+            self._model_weight_is_stale = (
+                self.post_optimizer_model_weight.placements != self.model_weight.placements
+            )
+            return
         self.main_weight.cast(self.model_weight.dtype, out=self.post_optimizer_model_weight)
         self._model_weight_is_stale = (
             self.post_optimizer_model_weight.placements != self.model_weight.placements
@@ -297,6 +323,18 @@ class FsdpParameterGroup:
 
     def unshard_parameters(self) -> None:
         """Install full parameters for local compute."""
+        if self.model_weight.is_mxfp8:
+            if self._model_weight_is_stale:
+                self.post_optimizer_model_weight.redistribute(
+                    self.model_weight.placements, out=self.model_weight
+                )
+                self._model_weight_is_stale = False
+            self._unsharded_model_weight.reallocate_storage()
+            self.model_weight.redistribute(
+                [Replicate()] * self.mesh.ndim, out=self._unsharded_model_weight
+            )
+            self._switch_to_unsharded_parameters()
+            return
         if self._model_weight_is_stale:
             self.post_optimizer_model_weight.redistribute(
                 self.model_weight.placements, out=self.model_weight
