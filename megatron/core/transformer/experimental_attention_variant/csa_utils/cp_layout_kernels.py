@@ -605,11 +605,19 @@ def _run_compiled_launch(
 ) -> None:
     """Compile/cache a CuTe launch function and invoke it on the current stream."""
     static_arg_set = set(static_arg_indices)
+    # Tensor layouts are marked dynamic below, so one compiled kernel serves every
+    # shape/stride whose last dimension is contiguous; all sizes reach the kernel as
+    # runtime scalars. Keying on shapes would recompile once per microbatch because
+    # l_local, sequence count, and compact length change with each batch.
+    for tensor in tensor_args:
+        if tensor.ndim != 0 and tensor.stride(-1) != 1:
+            raise RuntimeError(
+                f"CSA CP CuTe kernel {launch_fn.__name__} requires last-dim-contiguous "
+                f"tensors, got shape {tuple(tensor.shape)} stride {tuple(tensor.stride())}."
+            )
     key = (
         launch_fn.__name__,
-        tuple(
-            (tensor.dtype, tuple(tensor.shape), tuple(tensor.stride())) for tensor in tensor_args
-        ),
+        tuple((tensor.dtype, tensor.ndim) for tensor in tensor_args),
         tuple((i, scalar_args[i]) for i in static_arg_indices),
     )
     compiled = _COMPILED_LAUNCH_CACHE.get(key)
