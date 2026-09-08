@@ -101,8 +101,15 @@ def wrap_active_modules_with_ddp(
 ) -> None:
     """Freeze (per --freeze-* flags), Float16Module-wrap, and DDP-wrap each active module."""
     if mimo_model.language_model is not None:
+        freeze_projection = bool(getattr(args, "freeze_projection", False))
+        input_projections = mimo_model.language_model_input_projections
+        assert input_projections is not None
         if getattr(args, "freeze_lm", False):
             mimo_model.language_model.requires_grad_(False)
+            if not freeze_projection:
+                input_projections.requires_grad_(True)
+        elif freeze_projection:
+            input_projections.requires_grad_(False)
         lm_config = _module_config(mimo_model.language_model)
         print_rank_0("wrapping language model in DDP")
         mimo_model.language_model = prepare_existing_model_chunks_for_distributed_training(

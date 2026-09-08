@@ -42,6 +42,7 @@ _ROUND_TRIP_ARGS = {
     "do_test",
     "do_train",
     "do_valid",
+    "exit_interval",
     "exit_on_missing_checkpoint",
     "iteration",
     "load",
@@ -66,6 +67,11 @@ def _run_launcher(
         env["MIMO_CHECKPOINT_TEST_RESAVE"] = "1"
     env.pop("NVTE_FLASH_ATTN", None)
     env.pop("NVTE_FUSED_ATTN", None)
+    placement_args = (
+        ["--mimo-run-input-projections-on-llm-ranks"]
+        if os.environ.get("MIMO_RUN_INPUT_PROJECTIONS_ON_LLM_RANKS")
+        else []
+    )
     command = [
         "bash",
         str(_LAUNCHER),
@@ -74,6 +80,7 @@ def _run_launcher(
         "--no-save-tokenizer-assets",
         "--ckpt-format",
         "torch_dist",
+        *placement_args,
         *args,
     ]
     return subprocess.run(

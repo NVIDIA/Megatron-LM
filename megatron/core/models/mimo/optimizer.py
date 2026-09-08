@@ -67,8 +67,12 @@ class MimoOptimizer(MegatronOptimizer):
 
         for i, (name, info) in enumerate(sorted(self.module_infos.items())):
             if info.is_active and info.optimizer:
-                module_norm = info.optimizer.get_grad_norm() or 0.0
-                norm_sq[i] = module_norm**2
+                module_norm = info.optimizer.get_grad_norm()
+                if module_norm is not None:
+                    module_norm = torch.as_tensor(
+                        module_norm, device=norm_sq.device, dtype=norm_sq.dtype
+                    ).reshape(())
+                    norm_sq[i].copy_(module_norm.square())
 
         torch.distributed.all_reduce(norm_sq, op=torch.distributed.ReduceOp.MAX)
         return torch.sqrt(norm_sq.sum()).item()
@@ -381,18 +385,20 @@ def get_mimo_optimizer(mimo_model: "MimoModel", config: OptimizerConfig) -> Mimo
     module_infos: Dict[str, ModuleOptimizerInfo] = {}
 
     for module_name, grid in grid_map.items():
-        is_active = grid.is_current_rank_in_grid()
-
         optimizer = None
         pg_collection = None
+        is_active = False
 
-        if is_active:
+        if grid.is_current_rank_in_grid():
             if module_name == lang_key:
                 module = mimo_model.language_model
             else:
                 module = mimo_model.modality_submodules[module_name]
 
-            if module is not None:
+            if module is not None and any(
+                parameter.requires_grad for parameter in module.parameters()
+            ):
+                is_active = True
                 pg_collection = getattr(unwrap_model(module), 'pg_collection', None)
                 assert (
                     pg_collection is not None

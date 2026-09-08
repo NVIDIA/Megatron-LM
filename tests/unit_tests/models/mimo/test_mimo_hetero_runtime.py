@@ -152,6 +152,35 @@ def test_supplied_ddp_config_wins_over_global_args(mocker):
     assert mimo_model.modality_submodules[ENCODER] is wrapped_encoder
 
 
+def test_freezing_language_model_keeps_language_projection_trainable(mocker):
+    language_model = torch.nn.Linear(4, 4)
+    projection = torch.nn.Linear(8, 4)
+    projections = torch.nn.ModuleDict({ENCODER: projection})
+    mimo_model = SimpleNamespace(
+        language_model=language_model,
+        language_model_input_projections=projections,
+        modality_submodules={},
+    )
+    topology = SimpleNamespace(module_pgs={MIMO_LANGUAGE_MODULE_KEY: mocker.Mock()})
+    mocker.patch(
+        "examples.mimo.training.runtime.prepare_existing_model_chunks_for_distributed_training",
+        return_value=[language_model],
+    )
+    mocker.patch("examples.mimo.training.runtime._module_config", return_value=mocker.Mock())
+    mocker.patch("examples.mimo.training.runtime.print_rank_0")
+
+    wrap_active_modules_with_ddp(
+        _args(freeze_lm=True, freeze_projection=False),
+        mimo_model,
+        topology,
+        DistributedDataParallelConfig(),
+    )
+
+    assert not language_model.weight.requires_grad
+    assert not language_model.bias.requires_grad
+    assert all(parameter.requires_grad for parameter in projection.parameters())
+
+
 def _eight_gpu_topology():
     """Encoder dp=4 at ranks 0-3; language dp=4 at ranks 4-7 (non-colocated, tiles world)."""
     return create_topology(
