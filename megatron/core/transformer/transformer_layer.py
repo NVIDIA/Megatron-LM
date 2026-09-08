@@ -1451,9 +1451,13 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 f"No layer CUDA graph bank entry for local_cp_size={dynamic_cp_size}; "
                 f"available sizes are {sorted(graph_bank)}."
             )
-        expected_group = parallel_state.get_dynamic_data_context_parallel_groups(
-            group_size=dynamic_cp_size
-        )
+        group_bank = self.cuda_graph_cp_groups_by_dynamic_cp_size
+        if dynamic_cp_size not in group_bank:
+            raise RuntimeError(
+                f"No captured process group for local_cp_size={dynamic_cp_size}; "
+                f"available sizes are {sorted(group_bank)}."
+            )
+        expected_group = group_bank[dynamic_cp_size]
         if packed_seq_params.cp_group is not expected_group:
             raise RuntimeError(
                 "Dynamic-CP CUDA graph replay received a process group that does not match "

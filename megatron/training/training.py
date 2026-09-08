@@ -4568,6 +4568,11 @@ def train(
             micro_batch_size=args.micro_batch_size,
             optimizers=[optimizer],
             thd_sequence_length_upper_bound=_get_thd_sequence_length_upper_bound(args),
+            dynamic_cp_group_getter=(
+                get_dynamic_data_context_parallel_groups
+                if args.dynamic_context_parallel
+                else None
+            ),
         )
 
     # Run training iterations till done.
@@ -5119,7 +5124,7 @@ def evaluate(
             ft_integration.on_eval_step_start()
             if getattr(config, 'sequence_packing_scheduler', None) is not None:
                 try:
-                    packed_data_iterator, scheduled_eval_num_microbatches, _, _ = (
+                    (packed_data_iterator, scheduled_eval_num_microbatches, _, _) = (
                         wrap_data_iterator(data_iterator, config, eval_num_microbatches)
                     )
                 except StopIteration:
@@ -5417,7 +5422,7 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
 
     args = get_args()
 
-    train_dataloader, valid_dataloaders, test_dataloader = (None, None, None)
+    (train_dataloader, valid_dataloaders, test_dataloader) = (None, None, None)
 
     print_rank_0('> building train, validation, and test datasets ...')
 

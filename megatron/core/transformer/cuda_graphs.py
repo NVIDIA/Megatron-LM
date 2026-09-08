@@ -1797,6 +1797,7 @@ class TECudaGraphHelper:
         optimizers=[],
         pg_collection=None,
         thd_sequence_length_upper_bound=None,
+        dynamic_cp_group_getter=None,
     ):
         assert HAVE_TE_GRAPHS, "CUDA Graphs are not supported without TE."
         assert (
@@ -1815,6 +1816,7 @@ class TECudaGraphHelper:
         self.thd_sequence_length_upper_bound = thd_sequence_length_upper_bound
         self.micro_batch_size = micro_batch_size
         self.optimizers = optimizers
+        self.dynamic_cp_group_getter = dynamic_cp_group_getter
         self.pg_collection = pg_collection
         if self.pg_collection is None:
             self.pg_collection = ProcessGroupCollection.use_mpu_process_groups()
@@ -2931,8 +2933,13 @@ class TECudaGraphHelper:
         if not self.config.dynamic_context_parallel:
             return [(None, None)]
 
+        if self.dynamic_cp_group_getter is None:
+            raise RuntimeError(
+                "Dynamic-CP CUDA graph capture requires an explicit process-group getter."
+            )
+
         return [
-            (size, parallel_state.get_dynamic_data_context_parallel_groups(group_size=size))
+            (size, self.dynamic_cp_group_getter(group_size=size))
             for size in self._get_dynamic_cp_capture_sizes()
         ]
 
@@ -3283,6 +3290,7 @@ class TECudaGraphHelper:
     def _clear_cuda_graph_state(layer):
         layer.cuda_graphs = []
         layer.cuda_graphs_by_dynamic_cp_size = {}
+        layer.cuda_graph_cp_groups_by_dynamic_cp_size = {}
         layer.cuda_graph_manual_hooks = []
         clear_static_inputs = getattr(layer, 'clear_te_cuda_graph_static_hidden_inputs', None)
         if clear_static_inputs is not None:
@@ -3391,7 +3399,7 @@ class TECudaGraphHelper:
                     else num_layers_accumulated * self.num_microbatches + layer_number
                 )
                 stride = 1 if self.config.overlap_moe_expert_parallel_comm else len(layers)
-                for cp_size, _ in capture_contexts:
+                for cp_size, cp_group in capture_contexts:
                     graphs = captured_graphs[cp_size]
                     layer_graphs = [
                         graphs[base + batch_number * stride]
@@ -3401,6 +3409,7 @@ class TECudaGraphHelper:
                     layer.cuda_graphs = layer_graphs
                     if cp_size is not None:
                         layer.cuda_graphs_by_dynamic_cp_size[cp_size] = layer_graphs
+                        layer.cuda_graph_cp_groups_by_dynamic_cp_size[cp_size] = cp_group
                     if captured_sample_args is not None:
                         sample_args = captured_sample_args[cp_size]
                         static_hidden_inputs = [

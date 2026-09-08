@@ -188,6 +188,7 @@ class GraphableMegatronModule(MegatronModule):
             self.cuda_graphs = []
             # DCP communicators are capture-time constants, so keep one graph list per CP size.
             self.cuda_graphs_by_dynamic_cp_size = {}
+            self.cuda_graph_cp_groups_by_dynamic_cp_size = {}
             # Positional hidden-state inputs used as TE's fixed CUDA Graph input
             # surfaces, indexed exactly like ``cuda_graphs``.  Most layers do not
             # need to retain these handles.  They are exposed for eager producers

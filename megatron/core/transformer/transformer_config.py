@@ -4147,29 +4147,6 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError("Dynamic CP CUDA graphs require dynamic microbatch slots.")
             if self.delay_wgrad_compute or self.overlap_moe_expert_parallel_comm:
                 raise ValueError("Dynamic CP graphs do not support delayed wgrad or EP overlap.")
-            captures_attention = (
-                not self.cuda_graph_modules or CudaGraphModule.attn in self.cuda_graph_modules
-            )
-            if captures_attention and (
-                (
-                    self.fp8 is not None
-                    and (
-                        self.fp8_dot_product_attention
-                        or self.fp8_multi_head_attention
-                        or self.fp8_recipe == Fp8Recipe.custom
-                    )
-                )
-                or (
-                    self.fp4 is not None
-                    and (self.fp8_dot_product_attention or self.fp4_recipe == Fp4Recipe.custom)
-                )
-            ):
-                raise ValueError(
-                    "Dynamic CP CUDA graph attention does not support FP8 DPA/MHA or custom "
-                    "FP8/FP4 recipes: TE's P2P context-parallel backward can use a "
-                    "logical-subgroup all-to-all that cannot use the shared parent graph "
-                    "communicator."
-                )
 
         if self.sequence_packing_scheduler is not None:
             # Check TE version.

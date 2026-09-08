@@ -1058,7 +1058,7 @@ class TestDynamicMicrobatchSlots:
         "fp8_attention_flag",
         ("fp8_dot_product_attention", "fp8_multi_head_attention", "custom_recipe"),
     )
-    def test_dynamic_cp_graph_attention_rejects_fp8_attention(self, fp8_attention_flag):
+    def test_dynamic_cp_graph_attention_accepts_fp8_with_native_groups(self, fp8_attention_flag):
         from megatron.core.enums import Fp8Recipe
         from megatron.core.transformer.enums import CudaGraphModule
 
@@ -1067,26 +1067,26 @@ class TestDynamicMicrobatchSlots:
             if fp8_attention_flag == "custom_recipe"
             else {fp8_attention_flag: True}
         )
-        with pytest.raises(ValueError, match="does not support FP8 DPA/MHA or custom"):
-            TransformerConfig(
-                num_layers=1,
-                hidden_size=128,
-                num_attention_heads=4,
-                dynamic_context_parallel=True,
-                cuda_graph_impl="transformer_engine",
-                cuda_graph_modules=[CudaGraphModule.attn],
-                cuda_graph_dynamic_microbatches=True,
-                cp_comm_type="p2p",
-                fp8="hybrid",
-                max_seqlen_per_dp_cp_rank=128,
-                pad_packed_seq_alignment=128,
-                thd_max_packed_sequences=2,
-                **kwargs,
-            )
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=128,
+            num_attention_heads=4,
+            dynamic_context_parallel=True,
+            cuda_graph_impl="transformer_engine",
+            cuda_graph_modules=[CudaGraphModule.attn],
+            cuda_graph_dynamic_microbatches=True,
+            cp_comm_type="p2p",
+            fp8="hybrid",
+            max_seqlen_per_dp_cp_rank=128,
+            pad_packed_seq_alignment=128,
+            thd_max_packed_sequences=2,
+            **kwargs,
+        )
+        assert config.dynamic_context_parallel
 
     @pytest.mark.internal
     @pytest.mark.parametrize("fp4_attention_flag", ("fp8_dot_product_attention", "custom_recipe"))
-    def test_dynamic_cp_graph_attention_rejects_fp4_attention(self, fp4_attention_flag):
+    def test_dynamic_cp_graph_attention_accepts_fp4_with_native_groups(self, fp4_attention_flag):
         from megatron.core.enums import Fp4Recipe
         from megatron.core.transformer.enums import CudaGraphModule
 
@@ -1095,39 +1095,34 @@ class TestDynamicMicrobatchSlots:
             if fp4_attention_flag == "custom_recipe"
             else {fp4_attention_flag: True}
         )
-        with pytest.raises(ValueError, match="does not support FP8 DPA/MHA or custom"):
-            TransformerConfig(
-                num_layers=1,
-                hidden_size=128,
-                num_attention_heads=4,
-                dynamic_context_parallel=True,
-                cuda_graph_impl="transformer_engine",
-                cuda_graph_modules=[CudaGraphModule.attn],
-                cuda_graph_dynamic_microbatches=True,
-                cp_comm_type="p2p",
-                fp4="e2m1",
-                max_seqlen_per_dp_cp_rank=128,
-                pad_packed_seq_alignment=128,
-                thd_max_packed_sequences=2,
-                **kwargs,
-            )
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=128,
+            num_attention_heads=4,
+            dynamic_context_parallel=True,
+            cuda_graph_impl="transformer_engine",
+            cuda_graph_modules=[CudaGraphModule.attn],
+            cuda_graph_dynamic_microbatches=True,
+            cp_comm_type="p2p",
+            fp4="e2m1",
+            max_seqlen_per_dp_cp_rank=128,
+            pad_packed_seq_alignment=128,
+            thd_max_packed_sequences=2,
+            **kwargs,
+        )
+        assert config.dynamic_context_parallel
 
     @pytest.mark.internal
-    def test_dynamic_cp_graph_bank_and_capture_contexts(self, monkeypatch):
-        from megatron.core import parallel_state
+    def test_dynamic_cp_graph_bank_and_capture_contexts(self):
         from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
 
         groups = {size: object() for size in (1, 2, 4, 8)}
-        monkeypatch.setattr(
-            parallel_state,
-            'get_dynamic_data_context_parallel_groups',
-            lambda group_size: groups[group_size],
-        )
         helper = TECudaGraphHelper.__new__(TECudaGraphHelper)
         helper.config = SimpleNamespace(
             dynamic_context_parallel=True, min_dynamic_context_parallel_size=1
         )
         helper.dp_cp_group = SimpleNamespace(size=lambda: 8)
+        helper.dynamic_cp_group_getter = lambda group_size: groups[group_size]
         assert helper._get_dynamic_cp_capture_contexts() == [
             (size, groups[size]) for size in (8, 4, 2, 1)
         ]
@@ -1137,6 +1132,7 @@ class TestDynamicMicrobatchSlots:
         layer = SimpleNamespace(
             cuda_graphs=[],
             cuda_graphs_by_dynamic_cp_size=bank,
+            cuda_graph_cp_groups_by_dynamic_cp_size=groups,
             activate_te_cuda_graph_static_hidden_inputs=activated_static_input_banks.append,
         )
         params = SimpleNamespace(local_cp_size=4, cp_group=groups[4])

@@ -1060,7 +1060,7 @@ class TestMHCWithCudaGraph:
                 (torch.empty(2, device="cuda"),), dynamic_cp_size=2
             )
 
-    def test_te_graph_static_hidden_inputs_follow_dynamic_cp_graph_bank(self, monkeypatch):
+    def test_te_graph_static_hidden_inputs_follow_dynamic_cp_graph_bank(self):
         """DCP replay must switch the graph and mHC direct-write input as one bank."""
         layer, _ = self._create_mhc_layer(cuda_graph_impl="transformer_engine")
         graph_banks = {1: [object(), object()], 2: [object(), object()]}
@@ -1070,17 +1070,13 @@ class TestMHCWithCudaGraph:
         }
         cp_groups = {1: object(), 2: object()}
         layer.cuda_graphs_by_dynamic_cp_size = graph_banks
+        layer.cuda_graph_cp_groups_by_dynamic_cp_size = cp_groups
         for cp_size in (1, 2):
             layer.cuda_graphs = graph_banks[cp_size]
             layer.set_te_cuda_graph_static_hidden_inputs(
                 input_banks[cp_size], dynamic_cp_size=cp_size
             )
 
-        monkeypatch.setattr(
-            parallel_state,
-            "get_dynamic_data_context_parallel_groups",
-            lambda group_size: cp_groups[group_size],
-        )
         layer.current_microbatch = 1
         for cp_size in (1, 2, 1):
             layer._activate_dynamic_cp_cuda_graph(
@@ -1093,17 +1089,13 @@ class TestMHCWithCudaGraph:
         assert not layer._te_cuda_graph_static_hidden_inputs_by_dynamic_cp_size
         assert not layer._te_cuda_graph_static_hidden_input_ptrs_by_dynamic_cp_size
 
-    def test_dynamic_cp_graph_bank_rejects_invalid_runtime_metadata(self, monkeypatch):
+    def test_dynamic_cp_graph_bank_rejects_invalid_runtime_metadata(self):
         """Runtime graph selection must keep its guards under optimized Python."""
         expected_group = object()
         layer = SimpleNamespace(
             cuda_graphs_by_dynamic_cp_size={2: [object()]},
+            cuda_graph_cp_groups_by_dynamic_cp_size={2: expected_group},
             activate_te_cuda_graph_static_hidden_inputs=lambda _cp_size: None,
-        )
-        monkeypatch.setattr(
-            parallel_state,
-            "get_dynamic_data_context_parallel_groups",
-            lambda group_size: expected_group,
         )
 
         for params in (None, SimpleNamespace(local_cp_size=None, cp_group=expected_group)):
