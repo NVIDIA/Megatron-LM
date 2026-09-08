@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # Portions of this code are from DeepSeek DeepEP project
 # Copyright (c) 2025 DeepSeek
 # Licensed under the MIT License - https://github.com/deepseek-ai/DeepEP/blob/main/LICENSE
@@ -31,6 +31,8 @@ except ImportError:
     HAVE_DEEP_EP_V2 = False
 
 import torch
+
+from megatron.core.pipeline_parallel.reusable_buffers import ReusableOutputBufferPool
 
 _buffer = None
 _elastic_buffer = None
@@ -498,6 +500,8 @@ except ImportError:
     HAVE_HYBRIDEP = False
 
 _hybrid_ep_buffer = None
+_hybrid_ep_dispatch_output_pool = ReusableOutputBufferPool("HybridEP dispatch output")
+_hybrid_ep_expert_output_pool = ReusableOutputBufferPool("HybridEP expert output")
 
 # HybridEP dispatch/combine kernels use 64-token chunks for their public APIs.
 HYBRIDEP_TOKEN_ALIGNMENT = 64
@@ -574,6 +578,20 @@ def reset_hybrid_ep_buffer():
     '''
     global _hybrid_ep_buffer
     _hybrid_ep_buffer = None
+    _hybrid_ep_dispatch_output_pool.reset()
+    _hybrid_ep_expert_output_pool.reset()
+
+
+def acquire_hybrid_ep_expert_output_buffer(
+    like: torch.Tensor, num_expert_output_buffers: int
+) -> torch.Tensor | None:
+    """Acquire a persistent buffer for the fused expert FC2 output.
+
+    HybridEP's expert output has the same static shape and dtype as its dispatched token input.
+    The buffer is released after HybridEP combine enqueues its final read.
+    """
+    _hybrid_ep_expert_output_pool.configure(num_expert_output_buffers)
+    return _hybrid_ep_expert_output_pool.acquire(tuple(like.shape), like.dtype, like.device)
 
 
 class HybridEPDispatch(torch.autograd.Function):
@@ -597,11 +615,17 @@ class HybridEPDispatch(torch.autograd.Function):
         num_permuted_tokens=None,
         pad_multiple=None,
         num_sms_preprocessing_api=108,
+        num_dispatch_output_buffers=0,
     ):
         '''
         Forward pass of fused dispatch of the HybridEP backend
         '''
-        if fused or num_blocks_permute is not None or num_blocks_unpermute is not None:
+        if (
+            fused
+            or num_blocks_permute is not None
+            or num_blocks_unpermute is not None
+            or num_dispatch_output_buffers > 0
+        ):
             import inspect
             import warnings
 
@@ -618,6 +642,13 @@ class HybridEPDispatch(torch.autograd.Function):
                 num_blocks_permute = None
                 num_blocks_unpermute = None
 
+            if num_dispatch_output_buffers > 0 and 'output_token' not in sig.parameters:
+                raise RuntimeError(
+                    "HybridEP caller-provided dispatch buffers require a DeepEP build whose "
+                    "dispatch_with_permute API accepts output_token; loaded "
+                    f"{inspect.getfile(HybridEPBuffer)} with signature {sig}"
+                )
+
         if _hybrid_ep_buffer is None:
             num_tokens, hidden_dim = x.shape[-2:]
             fp8_dispatch = False  # Currently, we do not support fp8 dispatch
@@ -633,6 +664,18 @@ class HybridEPDispatch(torch.autograd.Function):
                 fp8_dispatch,
                 num_sms_preprocessing_api,
             )
+        _hybrid_ep_dispatch_output_pool.configure(num_dispatch_output_buffers)
+        output_token = None
+        if _hybrid_ep_dispatch_output_pool.enabled:
+            if num_permuted_tokens is None:
+                raise RuntimeError(
+                    "HybridEP caller-provided dispatch buffers require a static "
+                    "num_permuted_tokens"
+                )
+            output_token = _hybrid_ep_dispatch_output_pool.acquire(
+                (num_permuted_tokens, x.shape[-1]), x.dtype, x.device
+            )
+
         # If we provide the num_permuted_tokens, we do not need to use sync to
         # wait for the data in pinned memory ready
         non_blocking = num_permuted_tokens is not None
@@ -652,6 +695,7 @@ class HybridEPDispatch(torch.autograd.Function):
             pad_multiple=pad_multiple,
             num_permuted_tokens=num_permuted_tokens,
             non_blocking=non_blocking,
+            **({"output_token": output_token} if output_token is not None else {}),
             **({"fuse_permute_dispatch": fused} if fused else {}),
         )
 
@@ -683,6 +727,7 @@ class HybridEPDispatch(torch.autograd.Function):
             combined_hidden,
             None,
             combined_probs,
+            None,
             None,
             None,
             None,
@@ -731,6 +776,15 @@ class HybridEPCombine(torch.autograd.Function):
             handle=handle,
             pad_multiple=ctx.pad_multiple,
             num_permuted_tokens=ctx.num_permuted_tokens,
+            **(
+                {
+                    "output_token": _hybrid_ep_dispatch_output_pool.acquire(
+                        (ctx.num_permuted_tokens, grad_x.shape[-1]), grad_x.dtype, grad_x.device
+                    )
+                }
+                if _hybrid_ep_dispatch_output_pool.enabled
+                else {}
+            ),
             **({"fuse_permute_dispatch": ctx.fused} if ctx.fused else {}),
         )
         return dispatched_hidden, None, None, None, None
@@ -753,6 +807,7 @@ if HAVE_HYBRIDEP:
         num_permuted_tokens=None,
         pad_multiple=None,
         num_sms_preprocessing_api=108,
+        num_dispatch_output_buffers=0,
     ):
         '''
         Perform fused dispatch for "permute + dispatch a2a + permute" using the
@@ -801,6 +856,7 @@ if HAVE_HYBRIDEP:
             num_permuted_tokens,
             pad_multiple,
             num_sms_preprocessing_api,
+            num_dispatch_output_buffers,
         )
 
     @internal_api

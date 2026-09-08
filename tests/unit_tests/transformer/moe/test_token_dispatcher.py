@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import dataclasses
 from types import SimpleNamespace
@@ -6,12 +6,17 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+import megatron.core.transformer.moe.token_dispatcher as token_dispatcher_module
 from megatron.core import config, parallel_state
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_submodules
 from megatron.core.transformer.moe.fused_a2a import HYBRIDEP_TOKEN_ALIGNMENT, reset_hybrid_ep_buffer
 from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
 from megatron.core.transformer.moe.moe_utils import get_capacity
-from megatron.core.transformer.moe.token_dispatcher import MoETokenDispatcher, _HybridEPManager
+from megatron.core.transformer.moe.token_dispatcher import (
+    MoEFlexTokenDispatcher,
+    MoETokenDispatcher,
+    _HybridEPManager,
+)
 from megatron.core.transformer.spec_utils import get_submodules
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.typed_torch import apply_module
@@ -106,6 +111,72 @@ def test_hybridep_variable_tokens_are_padded_to_group_max(monkeypatch):
     assert manager.token_probs.shape == (expected_num_tokens, manager.num_experts)
     assert not manager.routing_map[local_num_tokens:].any()
     assert not manager.token_probs[local_num_tokens:].any()
+
+
+def test_hybridep_combine_releases_expert_output_at_final_consumer(monkeypatch):
+    manager = object.__new__(_HybridEPManager)
+    manager.handle = object()
+    manager.num_permuted_tokens = 8
+    manager.pad_multiple = 4
+    manager.config = SimpleNamespace(moe_permute_fusion_into_hybridep=False)
+    manager._padded_num_tokens = None
+    manager._original_num_tokens = None
+    manager.drop_and_pad = False
+    expert_output = torch.empty(8, 4)
+    combined_output = torch.empty(2, 4)
+    stream = object()
+    releases = []
+
+    monkeypatch.setattr(token_dispatcher_module, "hybrid_ep_combine", lambda **_: combined_output)
+    monkeypatch.setattr(
+        token_dispatcher_module,
+        "release_reusable_output_buffer",
+        lambda tensor, release_stream: releases.append((tensor, release_stream)) or True,
+    )
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: stream)
+
+    output = manager.combine(expert_output)
+
+    assert output is combined_output
+    assert releases == [(expert_output, stream)]
+
+
+def test_hybridep_dispatcher_acquires_expert_output_buffer(monkeypatch):
+    dispatcher = object.__new__(MoEFlexTokenDispatcher)
+    dispatcher.config = SimpleNamespace(
+        moe_flex_dispatcher_backend="hybridep", moe_hybridep_num_expert_output_buffers=4
+    )
+    dispatched_input = torch.empty(8, 4)
+    expected = torch.empty_like(dispatched_input)
+    calls = []
+    monkeypatch.setattr(
+        token_dispatcher_module,
+        "acquire_hybrid_ep_expert_output_buffer",
+        lambda tensor, slots: calls.append((tensor, slots)) or expected,
+    )
+
+    output = dispatcher.get_expert_output_buffer(dispatched_input)
+
+    assert output is expected
+    assert calls == [(dispatched_input, 4)]
+
+
+def test_hybridep_expert_output_buffers_reject_regular_schedule():
+    with pytest.raises(ValueError, match="requires overlap_moe_expert_parallel_comm"):
+        TransformerConfig(
+            num_layers=1,
+            hidden_size=16,
+            num_attention_heads=4,
+            num_moe_experts=2,
+            moe_ffn_hidden_size=16,
+            moe_grouped_gemm=True,
+            use_transformer_engine_op_fuser=True,
+            moe_token_dispatcher_type="flex",
+            moe_flex_dispatcher_backend="hybridep",
+            moe_expert_rank_capacity_factor=1.0,
+            moe_hybridep_num_expert_output_buffers=2,
+            overlap_moe_expert_parallel_comm=False,
+        )
 
 
 class MoEModelTestContainer:
@@ -210,7 +281,7 @@ class MoEModelTestContainer:
         probs, indices = apply_module(moe_layer.router)(hidden_states)
         probs = torch.ones_like(probs) / moe_layer.router.topk
 
-        (permuted_local_hidden_states, tokens_per_expert, permuted_probs) = token_permutation(
+        permuted_local_hidden_states, tokens_per_expert, permuted_probs = token_permutation(
             moe_layer.token_dispatcher, hidden_states, probs, indices
         )
 
@@ -253,7 +324,7 @@ class MoEModelTestContainer:
         restored_hidden_states_answer = hidden_states * local_probss.sum(dim=1).unsqueeze(1)
         restored_hidden_states_answer = restored_hidden_states_answer.to(dtype=self.test_dtype)
 
-        (permuted_local_hidden_states, tokens_per_expert, permuted_probs) = token_permutation(
+        permuted_local_hidden_states, tokens_per_expert, permuted_probs = token_permutation(
             moe_layer.token_dispatcher, hidden_states, probs, indices
         )
 
@@ -304,7 +375,7 @@ class MoEModelTestContainer:
         hidden_states.requires_grad = True
 
         probs_1, indices_1 = apply_module(moe_layer.router)(hidden_states)
-        (permuted_input_1, tokens_per_expert, permuted_probs_1) = token_permutation(
+        permuted_input_1, tokens_per_expert, permuted_probs_1 = token_permutation(
             moe_layer.token_dispatcher, hidden_states, probs_1, indices_1
         )
         permuted_input_1 = permuted_input_1 * permuted_probs_1.unsqueeze(-1)
@@ -322,7 +393,7 @@ class MoEModelTestContainer:
         moe_layer_2.load_state_dict(moe_layer.state_dict())
 
         probs_2, indices_2 = apply_module(moe_layer_2.router)(hidden_states)
-        (permuted_input_2, tokens_per_expert, permuted_probs_2) = token_permutation(
+        permuted_input_2, tokens_per_expert, permuted_probs_2 = token_permutation(
             moe_layer_2.token_dispatcher, hidden_states, probs_2, indices_2
         )
         permuted_input_2 = permuted_input_2 * permuted_probs_2.unsqueeze(-1)
@@ -375,7 +446,7 @@ class MoEModelTestContainer:
         hidden_states.requires_grad = True
 
         probs_1, indices_1 = apply_module(moe_layer.router)(hidden_states)
-        (permuted_input_1, tokens_per_expert_1, permuted_probs_1) = token_permutation(
+        permuted_input_1, tokens_per_expert_1, permuted_probs_1 = token_permutation(
             moe_layer.token_dispatcher, hidden_states, probs_1, indices_1
         )
         permuted_input_1 = permuted_input_1 * permuted_probs_1.unsqueeze(-1)
@@ -392,7 +463,7 @@ class MoEModelTestContainer:
         moe_layer_2.load_state_dict(moe_layer.state_dict())
 
         probs_2, indices_2 = apply_module(moe_layer_2.router)(hidden_states)
-        (permuted_input_2, tokens_per_expert_2, permuted_probs_2) = token_permutation(
+        permuted_input_2, tokens_per_expert_2, permuted_probs_2 = token_permutation(
             moe_layer_2.token_dispatcher, hidden_states, probs_2, indices_2
         )
         assert (
