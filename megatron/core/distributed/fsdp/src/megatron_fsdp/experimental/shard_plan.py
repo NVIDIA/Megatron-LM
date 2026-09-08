@@ -12,11 +12,10 @@ function. `ShardPlan.from_layout_params` builds a plan from DBuffer layout metad
 and `OwnerScatterPlan.unpack` extracts received result shards.
 """
 
-from __future__ import annotations
-
 import dataclasses
 import functools
 from collections.abc import Callable, Sequence
+from typing import Self
 
 import torch
 
@@ -60,7 +59,7 @@ class ShardPlan:
         tensor_flat_offset: int,
         rank_flat_shard_size: int,
         dp_size: int,
-    ) -> ShardPlan:
+    ) -> Self:
         """Compute the per-rank row ranges for one 2D parameter in a flat DBuffer.
 
         Args:
@@ -106,7 +105,7 @@ class ShardPlan:
         return cls(full_shape=torch.Size(full_shape), rank_rows=tuple(rank_rows), row_size=row_size)
 
     @classmethod
-    def from_layout(cls, layout: GlobalLayout, tensor_index: int, dp_size: int) -> ShardPlan:
+    def from_layout(cls, layout: GlobalLayout, tensor_index: int, dp_size: int) -> Self:
         """Build a shard plan for one parameter from a `GlobalLayout`.
 
         Extracts the parameter's shape, flat offset, and per-rank shard size from `layout` and
@@ -277,7 +276,7 @@ class OwnerGatherPlan:
         *,
         device: torch.device,
         dtype: torch.dtype,
-    ) -> OwnerGatherPlan:
+    ) -> Self:
         """Pack this rank's local shards into per-owner P2P send buffers.
 
         Args:
@@ -405,7 +404,7 @@ class OwnerScatterPlan:
         *,
         device: torch.device,
         dtype: torch.dtype,
-    ) -> OwnerScatterPlan:
+    ) -> Self:
         """Pack this owner rank's full results into per-destination P2P send buffers.
 
         Args:
