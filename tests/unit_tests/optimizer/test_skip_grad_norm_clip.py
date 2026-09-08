@@ -15,7 +15,7 @@ Covers the four reviewer findings:
   B5 (review point 5): clip_grad_by_total_norm_fp32 receives the narrowed norm (clippable
       subs only), so Adam is not clipped according to Muon's huge grads.
 
-Run: torchrun --nproc_per_node=2 -m pytest tests/unit_tests/optimizer/test_skip_grad_norm_clip.py
+Run: torchrun --nproc_per_node=8 -m pytest tests/unit_tests/optimizer/test_skip_grad_norm_clip.py
      with NVIDIA_PYTORCH_VERSION>25.05 set.
 """
 
@@ -238,6 +238,13 @@ class TestSkipGradNormClip:
         import megatron.core.optimizer.optimizer as opt_mod
 
         model, opt = self._build(MuonAdamMix(), 'muon', use_layer_wise=True, clip_grad=1.0)
+        # LayerWise shards whole parameters. With eight ranks, this model's two
+        # Adam biases only belong to two ranks; the others must not clip locally.
+        expected_clip_calls = sum(
+            bool(sub.get_parameters())
+            for sub in opt.chained_optimizers
+            if not _is_orthogonalizing(sub)
+        )
         self._forward_backward(model)
         for p in model.parameters():
             g = p.main_grad if getattr(p, 'main_grad', None) is not None else p.grad
@@ -257,8 +264,15 @@ class TestSkipGradNormClip:
             update_successful, full_norm, _ = opt.step()
         finally:
             opt_mod.clip_grad_by_total_norm_fp32 = orig
+        # Reduce before rank-local assertions so a missing call cannot strand
+        # other ranks in this collective. Also reject an all-ranks-no-op result.
+        global_clip_calls = torch.tensor(len(captured), dtype=torch.int64, device='cuda')
+        torch.distributed.all_reduce(global_clip_calls, group=opt.dp_cp)
         assert update_successful is True
-        assert captured, "expected the Adam sub to be clipped"
+        assert (
+            len(captured) == expected_clip_calls
+        ), f"expected {expected_clip_calls} local Adam clipping calls, got {len(captured)}"
+        assert global_clip_calls.item() > 0, "expected Adam clipping on at least one rank"
         assert all(n < 10.0 for n in captured), f"clip used un-narrowed norm(s): {captured}"
         assert float(full_norm) > 1.0e4, "reported grad_norm should remain the full norm"
 
