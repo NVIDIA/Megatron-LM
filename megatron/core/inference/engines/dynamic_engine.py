@@ -2019,6 +2019,45 @@ class DynamicInferenceEngine(AbstractEngine):
         if not retain_state:
             self._discard_prompt_logprob_state(entry)
 
+    def _promote_recomputed_prompt_scores(self, entry: RequestEntry) -> None:
+        """Restore the original prompt scores from the first complete recomputation."""
+        record = entry.record
+        original_request = record[0]
+        expected_count = len(original_request.prompt_tokens) - 1
+        needs_top_n = original_request.sampling_params.top_n_logprobs > 0
+
+        def has_complete_prompt_scores(request: DynamicInferenceRequest) -> bool:
+            logprob_count = 0 if request.prompt_log_probs is None else len(request.prompt_log_probs)
+            top_n_count = (
+                0 if request.prompt_top_n_logprobs is None else len(request.prompt_top_n_logprobs)
+            )
+            return logprob_count >= expected_count and (
+                not needs_top_n or top_n_count >= expected_count
+            )
+
+        if (
+            len(record.requests) == 1
+            or entry.prompt_logprobs_cache_key is not None
+            or not original_request.sampling_params.return_log_probs
+            or original_request.sampling_params.skip_prompt_log_probs
+            or expected_count <= 0
+            or has_complete_prompt_scores(original_request)
+        ):
+            return
+
+        # Prefix-cache offsets are reconstructed while sidecars own the score state.
+        # Without sidecars, a full recomputation starts at prompt position zero.
+        for recomputed_request in record.requests[1:]:
+            if has_complete_prompt_scores(recomputed_request):
+                original_request.prompt_log_probs = list(
+                    recomputed_request.prompt_log_probs[:expected_count]
+                )
+                if needs_top_n:
+                    original_request.prompt_top_n_logprobs = list(
+                        recomputed_request.prompt_top_n_logprobs[:expected_count]
+                    )
+                return
+
     def _discard_prompt_logprob_state(self, entry: RequestEntry) -> None:
         """Release request-private prompt-score references and continuation state."""
         request_id = entry.record[-1].request_id
@@ -2484,6 +2523,10 @@ class DynamicInferenceEngine(AbstractEngine):
                         request.prompt_top_n_logprobs.append(logit_dict)
                     else:
                         request.generated_top_n_logprobs.append(logit_dict)
+
+            # Both record.merge() and coordinator streaming read original prompt
+            # scores from record[0], so repair it as soon as recomputation completes.
+            self._promote_recomputed_prompt_scores(self.requests[request_id])
 
             if request_finished:
                 # Finish only after this step's scores have been attached. In
