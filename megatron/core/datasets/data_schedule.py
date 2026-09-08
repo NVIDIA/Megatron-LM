@@ -8,6 +8,7 @@ import torch
 from megatron.core import parallel_state
 from megatron.core.datasets.data_schedule_utils import (
     _get_global_seqlens_and_ids,
+    _pack_sequences,
     broadcast_scalars,
     broadcast_tensor,
     broadcast_to_pp_group,
@@ -19,6 +20,7 @@ from megatron.core.datasets.data_schedule_utils import (
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.hybrid_cp_schedule import BalancedCPScheduler
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.rerun_state_machine import RerunDataIterator
 
 try:
     # Register the TE CUDA kernels
@@ -317,6 +319,182 @@ class HybridCPDataLoaderWrapper:
                 batch_unpacked.append(sub_sample_dict)
         return batch_unpacked
 
+    def _get_pad_len(self, seq_len: int, local_cp_size: int) -> int:
+        """
+        Calculates the number of padding tokens to append to a packed sequence.
+
+        Step 1: The packed sequence must be divisible by local_cp_size * 2,
+        or local_cp_size * tp_size * 2 when using sequence parallel.
+        Step 2: The per-rank sequence shard may need extra alignment
+        (e.g. MXFP8 block size or HybridEP chunk size).
+        """
+        tp_size = 1
+        if self.config.sequence_parallel:
+            tp_size = self.tp_group.size()
+        pad_granularity = local_cp_size * tp_size * 2
+        mod_token_count = seq_len % pad_granularity
+        seq_pad_len = 0
+        if mod_token_count != 0:
+            seq_pad_len = pad_granularity - mod_token_count
+
+        total_seq_len = seq_len + seq_pad_len
+
+        sharded_pad_granularity = 1
+        # MXFP8 BLOCK_SIZE is 32 and the sequence shard should be divisible by it.
+        if self.config.fp8 is not None and self.config.fp8_recipe == "mxfp8":
+            sharded_pad_granularity = 32
+        if (
+            self.config.moe_token_dispatcher_type == "flex"
+            and self.config.moe_flex_dispatcher_backend == "hybridep"
+        ):
+            # HybridEP requires MAX_NUM_OF_TOKENS_PER_RANK to be divisible
+            # by NUM_OF_TOKENS_PER_CHUNK (128).
+            sharded_pad_granularity = 128
+
+        # tp_size is set to 1 when sequence parallel is not enabled.
+        sharded_tensor_shape = total_seq_len // (local_cp_size * tp_size)
+        mod_token_count = sharded_tensor_shape % sharded_pad_granularity
+        sharded_pad_len = 0
+        if mod_token_count != 0:
+            sharded_pad_len = (sharded_pad_granularity - mod_token_count) * (
+                local_cp_size * tp_size
+            )
+
+        return sharded_pad_len + seq_pad_len
+
+    def _pack_sequences(
+        self, samples: List[Dict[str, torch.Tensor]], local_cp_size: int
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Packs the sub-samples assigned to this rank for one microbatch into a
+        single packed sample, pads the packed sequence to the hybrid-CP pad
+        granularity, and attaches the microbatch's local_cp_size.
+
+        Delegates the packing mechanics to ``data_schedule_utils._pack_sequences``
+        and reshapes the result to the 2-D batched schema
+        ``get_batch_on_this_tp_rank`` expects under hybrid context parallelism.
+        """
+        dev = torch.cuda.current_device()
+        # The dataset already pads individual sub-samples, so the padded and
+        # original lengths coincide here.
+        # TODO(pmannan): We need to be able to differentiate if the original data_iterator
+        # is providing padded samples or valid lengths.
+        sample_lens = torch.tensor([s["tokens"].shape[0] for s in samples], dtype=torch.int32)
+        new_sample = _pack_sequences(samples, sample_lens, sample_lens, dev)
+
+        # We only pad after packing because the dataset already pads
+        # individual sub-samples.
+        pad_len = self._get_pad_len(int(new_sample["tokens"].shape[0]), local_cp_size)
+        if pad_len > 0:
+            tokens = new_sample["tokens"]
+            labels = new_sample["labels"]
+            loss_mask = new_sample["loss_mask"]
+            position_ids = new_sample["position_ids"]
+            new_sample["tokens"] = torch.cat(
+                [tokens, torch.zeros(pad_len, dtype=tokens.dtype, device=tokens.device)]
+            )
+            new_sample["labels"] = torch.cat(
+                [labels, torch.zeros(pad_len, dtype=labels.dtype, device=labels.device)]
+            )
+            new_sample["loss_mask"] = torch.cat(
+                [loss_mask, torch.zeros(pad_len, dtype=loss_mask.dtype, device=loss_mask.device)]
+            )
+            next_position_id = int(position_ids[-1].item()) + 1
+            new_sample["position_ids"] = torch.cat(
+                [
+                    position_ids,
+                    torch.arange(
+                        next_position_id,
+                        next_position_id + pad_len,
+                        dtype=position_ids.dtype,
+                        device=position_ids.device,
+                    ),
+                ]
+            )
+            # The padding extends the last packed sub-sample.
+            new_sample["cu_seqlens"][-1] += pad_len
+            new_sample["cu_seqlens_padded"][-1] += pad_len
+            new_sample["max_seqlen"] = torch.max(torch.diff(new_sample["cu_seqlens_padded"])).to(
+                dtype=torch.int32
+            )
+
+        new_sample["local_cp_size"] = torch.tensor([local_cp_size], device=dev, dtype=torch.int32)
+
+        # Reshape to the 2-D batched schema (batch dim of 1) that
+        # get_batch_on_this_tp_rank expects under hybrid context parallelism.
+        for key in ("tokens", "labels", "loss_mask", "position_ids"):
+            new_sample[key] = new_sample[key].unsqueeze(0)
+        new_sample["cu_seqlens"] = new_sample["cu_seqlens"].unsqueeze(0)
+        new_sample["cu_seqlens_padded"] = new_sample["cu_seqlens_padded"].unsqueeze(0)
+        new_sample["max_seqlen"] = new_sample["max_seqlen"].reshape(1)
+
+        return new_sample
+
+    def _build_packed_microbatches(
+        self,
+        grouped_samples: List[List[Dict[str, torch.Tensor]]],
+        sample_id_groups: List[List[int]],
+        hdp_rank: int,
+    ) -> List[Dict[str, torch.Tensor]]:
+        """
+        Build packed samples for each microbatch given a pre-built list of `samples` per microbatch.
+
+        Args:
+            grouped_samples: List of length `num_microbatches`. Each element is the `samples` list
+                (list[sample]) for that microbatch, where `sample` is the dict returned by
+                `dataset.__getitem__`.
+            sample_id_groups: List of length `num_microbatches`.
+                Each element is the `sample_id_groups` list (list[sample_id]) for that microbatch,
+                where `sample_id` is the id of the sub-sample.
+
+        Returns:
+            new_samples: list of packed samples (dicts) length == num_micro_batches.
+        """
+        num_micro_batches = len(grouped_samples)
+
+        new_samples: List[Dict[str, torch.Tensor]] = []
+        for i in range(num_micro_batches):
+            samples = grouped_samples[i]
+            local_cp_size = -1
+            # sample_id_groups = [[[0, 1, 2], [0, 1, 2]], [[3, 4, 5], [6, 7, 8]]]
+            # Indicates the sub-sample ids per microbatch for each DPxCP rank.
+            for sub_sample_id in sample_id_groups[i][hdp_rank]:  # i:0 hdp_rank:0 [[0, 1, 2]]
+                # sub_sample_id: 0 / 1 / 2
+                partner_cp_size = len(
+                    [True for sample_ids in sample_id_groups[i] if sub_sample_id in sample_ids]
+                )
+
+                if local_cp_size == -1:
+                    local_cp_size = partner_cp_size
+                else:
+                    assert local_cp_size == partner_cp_size, (
+                        f"found sample within a packed microbatch with different local_cp_size: "
+                        f"{local_cp_size} != {partner_cp_size}"
+                    )
+
+            new_sample = self._pack_sequences(samples, local_cp_size)
+            new_samples.append(new_sample)
+
+        return new_samples
+
+    def unpad_batch(self, batch):
+        """
+        Removes the end padding from the batch which could lead to an invalid sample.
+        This could be a result of truncation or padding in the dataset.
+        For example, a packed sample is truncated and is left with prompt tokens
+        which leads to a sample with all zero loss mask.
+        We do this before scheduling.
+        """
+        for sample in batch:
+            end_sample_token_count = int(sample["cu_seqlens"][-1] - sample["cu_seqlens"][-2])
+            if sample["loss_mask"][-end_sample_token_count:].sum() == 0:
+                sample["cu_seqlens"][-1] = sample["cu_seqlens"][-2]
+                for key in sample.keys():
+                    if key in ["cu_seqlens", "batch_idx", "max_seqlen"]:
+                        continue
+                    sample[key] = sample[key][:-end_sample_token_count]
+        return batch
+
     def __next__(self) -> Any:
         """
         Get the next item from the dataset, pull scheduling metadata and return it.
@@ -326,6 +504,7 @@ class HybridCPDataLoaderWrapper:
             return None, None
         else:
             batch = next(self.data_iterator)
+        batch = self.unpad_batch(batch)
         subsample_seqlens = []
         for sample in batch:
             subsample_seqlens.extend(
@@ -349,7 +528,25 @@ class HybridCPDataLoaderWrapper:
         samples_this_rank_with_id = self.reroute_samples_to_hdp_ranks(
             batch, global_ids_this_rank, global_id_seqlens, sample_id_groups, offsets
         )
-        return samples_this_rank_with_id, sample_id_groups
+
+        hdp_rank = self.dp_cp_group.rank()
+        num_micro_batches = len(sample_id_groups)
+
+        grouped_samples = [
+            [
+                samples_this_rank_with_id[sub_sample_id]
+                for sub_sample_id in sample_id_groups[i][hdp_rank]
+            ]
+            for i in range(num_micro_batches)
+        ]
+
+        new_samples = self._build_packed_microbatches(
+            grouped_samples=grouped_samples, sample_id_groups=sample_id_groups, hdp_rank=hdp_rank
+        )
+
+        new_data_iterator = RerunDataIterator(iter(new_samples))
+
+        return new_data_iterator, sample_id_groups
 
 
 class BasePackingScheduler:

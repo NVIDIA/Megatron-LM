@@ -2678,7 +2678,7 @@ def get_batch_on_this_cp_rank(
         ``_get_batch_on_this_cp_rank_per_document_balancing``.
       - **Hybrid CP**: When ``cu_seqlens`` is present and ``is_hybrid_cp`` is
         True, creates a local hybrid CP group (via ``hybrid_cp_group_func``)
-        and delegates to ``_get_batch_on_this_cp_rank_per_sequence_balancing``.
+        and delegates to ``_get_batch_on_this_cp_rank_per_document_balancing``.
       - **Contiguous CP**: Keeps the hybrid residual stream in causal rank order.
 
     Args:
@@ -2711,12 +2711,9 @@ def get_batch_on_this_cp_rank(
         assert (
             batch['local_cp_size'] is not None
         ), "local_cp_size is required for hybrid context parallel"
-        if batch['local_cp_size'].item() > 1:
-            hybrid_cp_group = hybrid_cp_group_func(group_size=batch['local_cp_size'].item())
-            batch = _get_batch_on_this_cp_rank_per_sequence_balancing(
-                batch, cp_group=hybrid_cp_group
-            )
-            batch["hybrid_cp_group"] = hybrid_cp_group
+        hybrid_cp_group = hybrid_cp_group_func(group_size=batch['local_cp_size'].item())
+        batch = _get_batch_on_this_cp_rank_per_document_balancing(batch, cp_group=hybrid_cp_group)
+        batch["hybrid_cp_group"] = hybrid_cp_group
     else:
         batch = _get_batch_on_this_cp_rank_per_document_balancing(batch, cp_group=cp_group)
     return batch
