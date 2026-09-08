@@ -118,13 +118,15 @@ class StaticBufferLoader:
         else:
 
             for k in inputs.keys():
-                if k not in StaticBufferLoader.static_buffers[stage][microbatch]:
-                    if isinstance(inputs[k], torch.Tensor):
-                        StaticBufferLoader.static_buffers[stage][microbatch][k] = torch.empty_like(
-                            inputs[k], device="cuda"
-                        )
-                    else:
-                        StaticBufferLoader.static_buffers[stage][microbatch][k] = inputs[k]
+                static_value = StaticBufferLoader.static_buffers[stage][microbatch].get(k)
+                if isinstance(inputs[k], torch.Tensor) and not isinstance(
+                    static_value, torch.Tensor
+                ):
+                    StaticBufferLoader.static_buffers[stage][microbatch][k] = torch.empty_like(
+                        inputs[k], device="cuda"
+                    )
+                elif k not in StaticBufferLoader.static_buffers[stage][microbatch]:
+                    StaticBufferLoader.static_buffers[stage][microbatch][k] = inputs[k]
 
             self.stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(self.stream):
@@ -167,16 +169,20 @@ class FullCudaGraphWrapper:
         else:
             assert isinstance(data_iterator, list) and len(data_iterator) == len(model)
             data_list = []
+            static_buffer_base = 0
             for i in range(len(model)):
                 if data_iterator[i] is not None:
                     data_list_i = []
                     for b in range(num_microbatches):
                         data_list_i.append(
                             self.static_loader(
-                                next(data_iterator[i]), 'training' if training else 'validation', b
+                                next(data_iterator[i]),
+                                'training' if training else 'validation',
+                                static_buffer_base + b,
                             )
                         )
                     data_list.append(iter(data_list_i))
+                    static_buffer_base += num_microbatches
                 else:
                     data_list.append(None)
         return data_list
