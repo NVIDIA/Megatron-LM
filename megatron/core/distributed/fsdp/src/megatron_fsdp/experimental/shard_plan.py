@@ -25,8 +25,8 @@ from .layout import non_leading_numel
 class ShardPlan:
     """How a single 2D parameter's full matrix is split across the DP group.
 
-    M-FSDPv2's all-`Flat` layout shards dim-0 rows contiguously in rank order,
-    so rank `r` owns the contiguous global row range
+    M-FSDPv2's all-`Flat` layout shards dim-0 rows contiguously. For each
+    process-group rank `r`, `rank_rows[r]` gives the contiguous global row range
     `[start, start + count)` where `start`/`count` come from the flat
     DBuffer layout. A rank with `count == 0` holds no shard of this parameter.
     """
@@ -73,7 +73,11 @@ class ShardPlan:
 
 
 def compute_shard_plan(
-    full_shape: torch.Size, tensor_flat_offset: int, rank_flat_shard_size: int, world_size: int
+    full_shape: torch.Size,
+    tensor_flat_offset: int,
+    rank_flat_shard_size: int,
+    world_size: int,
+    shard_order: Sequence[int] | None = None,
 ) -> ShardPlan:
     """Compute the per-rank row ranges for one 2D parameter in a flat DBuffer.
 
@@ -84,6 +88,8 @@ def compute_shard_plan(
         rank_flat_shard_size: Flat elements each DP rank owns (uniform for the
             even all-`Flat` layout: `layout.size // world_size`).
         world_size: DP group size.
+        shard_order: Flat DBuffer shard index for each process-group rank.
+            Defaults to process-group rank order.
 
     Returns:
         The `ShardPlan` describing which rows each rank owns.
@@ -95,9 +101,11 @@ def compute_shard_plan(
         raise ValueError(f"compute_shard_plan requires non-empty rows, got shape {full_shape}.")
     tensor_end = tensor_flat_offset + full_shape.numel()
 
+    if shard_order is None:
+        shard_order = range(world_size)
     rank_rows: list[tuple[int, int]] = []
-    for rank in range(world_size):
-        rank_start = rank * rank_flat_shard_size
+    for shard_index in shard_order:
+        rank_start = shard_index * rank_flat_shard_size
         rank_end = rank_start + rank_flat_shard_size
         overlap_start = max(tensor_flat_offset, rank_start)
         overlap_end = min(tensor_end, rank_end)
@@ -287,7 +295,7 @@ def reconstruct_full_tensor(
 ) -> torch.Tensor:
     """Reconstruct the full 2D tensor for one owned parameter from its per-rank shards.
 
-    Concatenates shards in rank order: the owner's own local shard at its rank rows and each
+    Concatenates shards in global row order: the owner's own local shard at its rank rows and each
     source's received shard at that source's rank rows. The shard content lives in `gather_plan`
     (`own_shards` + `recv_offsets`), so this works for the pre-NS owner-gather path and for a weight
     gather plan alike – pass a weight gather plan built with `pack_owner_work` to reconstruct the
@@ -305,7 +313,10 @@ def reconstruct_full_tensor(
     world_size = plan.world_size
     owner_rank = torch.distributed.get_rank(group=gather_plan.comm_groups[param_index])
     shards: list[torch.Tensor] = []
-    for src in range(world_size):
+    ranks_by_row = sorted(
+        range(world_size), key=lambda rank: plan.rank_rows[rank][0]
+    )
+    for src in ranks_by_row:
         row_count = plan.rank_row_count(src)
         if src == owner_rank:
             shards.append(gather_plan.own_shards[param_index])

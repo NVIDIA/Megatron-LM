@@ -605,7 +605,10 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             # each axis takes the placements of its own strategy, so no_shard outer over
             # ZeRO-3 inner is HSDP and ZeRO-1 outer over ZeRO-3 inner is HFSDP.
             dp_mesh = _build_hybrid_dp_mesh(
-                pg_collection.inter_dist_opt, pg_collection.intra_dp_cp, device_type
+                pg_collection.inter_dist_opt,
+                pg_collection.intra_dp_cp,
+                device_type,
+                flattened_group=pg_collection.dp_cp,
             )
             outer = _DATA_PARALLEL_PLACEMENTS[ddp_config.outer_dp_sharding_strategy]
             inner = _DATA_PARALLEL_PLACEMENTS[ddp_config.data_parallel_sharding_strategy]
@@ -941,7 +944,10 @@ def _build_expert_mesh_and_placements(
         # Match v1 topology: dense and expert parameters share the outer DP axis,
         # while experts use the existing expert-DP inner group. Only placements differ.
         dp_mesh = _build_hybrid_dp_mesh(
-            pg_collection.inter_dist_opt, pg_collection.intra_expt_dp, device_type
+            pg_collection.inter_dist_opt,
+            pg_collection.intra_expt_dp,
+            device_type,
+            flattened_group=pg_collection.expt_dp,
         )
         inner = _DATA_PARALLEL_PLACEMENTS[inner_strategy]
         outer = _DATA_PARALLEL_PLACEMENTS[ddp_config.expert_outer_dp_sharding_strategy]
@@ -966,8 +972,23 @@ def _build_expert_mesh_and_placements(
     return dp_mesh, placements
 
 
-def _build_hybrid_dp_mesh(outer_group, inner_group, device_type):
-    """Build the ("dp_outer", "dp_shard") mesh for a hybrid data-parallel domain."""
+def _build_hybrid_dp_mesh(outer_group, inner_group, device_type, flattened_group=None):
+    """Build the ("dp_outer", "dp_shard") mesh for a hybrid data-parallel domain.
+
+    DeviceMesh.from_group requires an explicit rank table when given more than one group,
+    since no single argument spans the mesh. parallel_state cuts the data-parallel domain
+    into num_distributed_optimizer_instances contiguous chunks, so the table is world
+    ranks reshaped to (outer, inner).
+
+    The assumption is checked rather than trusted, because the position of a rank in the
+    table is its mesh coordinate: a table with the right members in the wrong order would
+    keep reducing over valid groups while assigning every shard index to the wrong rank.
+
+    ``flattened_group`` is the full data-parallel group that these two axes partition
+    (``dp_cp`` for dense parameters, ``expt_dp`` for experts). DeviceMesh cannot recover
+    the union of two axes, so it is recorded on the mesh for distributed Muon, which
+    builds its owner communication groups over the whole flat DP domain.
+    """
     if outer_group is None or inner_group is None:
         raise ValueError(
             "MFSDP v2 hybrid sharding requires inter- and intra-instance process groups."
@@ -996,12 +1017,15 @@ def _build_hybrid_dp_mesh(outer_group, inner_group, device_type):
             f"distributed-optimizer group {outer_ranks}."
         )
 
-    return DeviceMesh.from_group(
+    mesh = DeviceMesh.from_group(
         [outer_group, inner_group],
         device_type=device_type,
         mesh=layout,
         mesh_dim_names=("dp_outer", "dp_shard"),
     )
+    if flattened_group is not None:
+        mesh._mfsdp_flattened_group = flattened_group
+    return mesh
 
 
 def _get_hsdp_tp_mesh(outer_fsdp_dp_group, dp_cp_group, tp_group, ep_size=1):
