@@ -382,6 +382,13 @@ class InferenceConfig:
     See `KVCacheManagementMode` for options.
     """
 
+    start_suspended: bool = False
+    """
+    Construct the engine in the `SUSPENDED` state instead of `RUNNING`.
+    Allow for the engine to be constructed without model weights by deferring all such
+    functionality until after the first `resume()`.
+    """
+
     # =================================
     # CUDA graph config
     # =================================
