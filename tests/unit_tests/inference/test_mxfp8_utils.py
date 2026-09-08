@@ -1053,6 +1053,80 @@ class TestTENativeGroupedMxfp8:
         ]
         return bf16_weights, [quantizer(weight) for weight in bf16_weights]
 
+    def test_low_level_grouped_gemm_accepts_bias_scale_api(self, monkeypatch):
+        """The direct fixed-M launch follows TE's evolving low-level signature."""
+        import megatron.core.inference.moe.fused_moe as fused_moe
+
+        calls = []
+
+        def wrapper_with_bias_scale(*args, bias_scale=None):
+            del args, bias_scale
+
+        def record_call(*args):
+            calls.append(args)
+
+        monkeypatch.setattr(
+            fused_moe, "general_grouped_gemm_for_grouped_tensor", wrapper_with_bias_scale
+        )
+        monkeypatch.setattr(fused_moe.tex, "te_general_grouped_gemm_for_discrete_in", record_call)
+        monkeypatch.setattr(fused_moe, "_get_te_sm_count", lambda: 1)
+        alpha = torch.ones(1)
+        beta = torch.zeros(1)
+        workspace_setup = torch.empty(1, dtype=torch.uint8)
+        workspace_cublas = torch.empty(1, dtype=torch.uint8)
+
+        fused_moe._te_mxfp8_batch_invariant_grouped_gemm(
+            [object()], object(), object(), alpha, beta, workspace_setup, workspace_cublas
+        )
+
+        assert len(calls) == 1
+        assert len(calls[0]) == 13
+        assert calls[0][6] is None
+        assert calls[0][7] is alpha
+
+    def test_single_grouped_2d_swizzled_scale_layout(self, monkeypatch):
+        """Single grouped weights accept TE's newer 2-D swizzled scale buffer."""
+        import transformer_engine.pytorch as te
+        from transformer_engine.common.recipe import MXFP8BlockScaling
+
+        import megatron.core.inference.moe.fused_moe as fused_moe
+
+        num_experts = 2
+        monkeypatch.setenv("NVTE_GROUPED_LINEAR_SINGLE_PARAM", "1")
+        with te.fp8_model_init(enabled=True, recipe=MXFP8BlockScaling()):
+            layer = te.GroupedLinear(
+                num_experts,
+                128,
+                64,
+                bias=False,
+                params_dtype=torch.bfloat16,
+                device="cuda",
+                single_grouped_weight=True,
+            )
+        torch.cuda.synchronize()
+
+        original_swizzle = fused_moe.tex.grouped_swizzle_for_gemm
+
+        def swizzle_with_2d_output(grouped, rowwise, columnwise):
+            original_swizzle(grouped, rowwise, columnwise)
+            grouped.scale_inv = grouped.scale_inv.view(num_experts, -1)
+
+        monkeypatch.setattr(fused_moe.tex, "grouped_swizzle_for_gemm", swizzle_with_2d_output)
+        fused_moe.prepare_te_mxfp8_batch_invariant_weight(layer.weight)
+
+        cached_storage, cached_members = getattr(
+            layer.weight, fused_moe._TE_MXFP8_BATCH_INVARIANT_WEIGHT_CACHE
+        )
+        assert cached_storage.scale_inv.ndim == 2
+        for expert_index, member in enumerate(cached_members):
+            expected_offset = cached_storage.scale_inv_offsets[expert_index]
+            assert member._rowwise_scale_inv.data_ptr() == (
+                cached_storage.scale_inv.data_ptr()
+                + expected_offset * cached_storage.scale_inv.element_size()
+            )
+
+        assert fused_moe.refresh_te_mxfp8_batch_invariant_weight(layer.weight)
+
     def test_moe_zero_pads_splits_to_256_and_matches_reference(self, monkeypatch):
         import megatron.core.inference.moe.fused_moe as fused_moe
 
