@@ -281,6 +281,11 @@ _hybrid_ep_buffer = None
 # HybridEP dispatch/combine kernels use 64-token chunks for their public APIs.
 HYBRIDEP_TOKEN_ALIGNMENT = 64
 
+# Position of overflow_flag in the handle returned by HybridEP dispatch. DeepEP appends new
+# fields to the end of the handle (num_of_valid_tokens since 15f4acf), so it must not be
+# read as handle[-1].
+HYBRIDEP_HANDLE_OVERFLOW_FLAG_INDEX = 10
+
 
 def init_hybrid_ep_buffer(
     group: torch.distributed.ProcessGroup,
