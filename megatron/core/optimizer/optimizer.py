@@ -252,7 +252,7 @@ class MegatronOptimizer(ABC):
         Quantized model params (MXFP8, NVFP4) are stored dequantized and carry no block
         scales, so loading them re-quantizes a value that has already been through one
         quantization round trip, which need not land on the same block scales the saving job
-        chose from its main params. Re-deriving the model params from those masters
+        chose from its main params. Re-deriving the model params from those main params
         reproduces the saved weights exactly.
         """
         self._stage_model_params_from_main_params()

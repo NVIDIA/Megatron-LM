@@ -798,10 +798,10 @@ class TestFP8Param:
 
         Quantized params are dequantized to BF16 for the checkpoint and MXFP8 block scales
         are not stored, so loading re-quantizes a value that has already been through one
-        quantization round trip, whereas a training step quantizes the FP32 master. Same
+        quantization round trip, whereas a training step quantizes the FP32 main param. Same
         quantizer, same blocks, different input: roughly 5% of 32-element blocks come back
         one E8M0 exponent finer, and every element in those blocks re-encodes. The load path
-        re-derives the params from the restored FP32 masters, which reproduces them exactly.
+        re-derives the params from the restored FP32 main params, which reproduces them exactly.
 
         Tensorwise and delayed scaling are expected to round-trip on their own, and are
         covered here so the re-derivation cannot silently perturb them.
@@ -833,7 +833,7 @@ class TestFP8Param:
                 tp_size, recipe, str(ckpt_dir), **kwargs
             )
             self.run_train_steps(args, model, optimizer, num_steps=3)
-            # Mirror save_checkpoint_and_time: the params are staged from the FP32 masters
+            # Mirror save_checkpoint_and_time: the params are staged from the FP32 main params
             # and gathered before the state dict is taken.
             force_param_sync(model, optimizer=optimizer)
             saved_state = self.quantized_param_state(model[0])

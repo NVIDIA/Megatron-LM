@@ -2917,8 +2917,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         if self.is_stub_optimizer:
             return
         if self.config.reuse_grad_buf_for_mxfp8_param_ag:
-            # The param buffer is BF16, so the masters land there down-cast; the MXFP8
-            # quantization happens after the all-gather, in _post_param_sync.
+            # MXFP8 reuses the grad buffer for the param all-gather; the quantization
+            # happens after the all-gather, in _post_param_sync.
             self._copy_main_params_to_param_buffer()
         else:
             self._copy_main_params_to_model_params()

@@ -103,7 +103,7 @@ def test_the_refresh_never_zeroes_the_grad_buffer(reuse_grad_buf):
 
     It is not merely redundant under --reuse-grad-buf-for-mxfp8-param-ag: zeroing a bucket
     that mixes quantized and non-quantized params would clear the non-quantized weights,
-    which alias that buffer and are not restaged from the masters.
+    which alias that buffer and are not restaged from the main params.
     """
     optimizer, log = _build(reuse_grad_buf=reuse_grad_buf)
 

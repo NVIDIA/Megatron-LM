@@ -502,7 +502,7 @@ class TestFP4Param:
         NVFP4 is block-scaled like MXFP8: an E4M3 scale per 16-element block on top of a
         per-tensor FP32 scale. Quantized params are stored dequantized to BF16 and the block
         scales are not stored, so loading re-quantizes a value that has already been through
-        one quantization round trip, whereas a training step quantizes the FP32 master. That
+        one quantization round trip, whereas a training step quantizes the FP32 main param. That
         costs MXFP8 its block scales; NVFP4 is measured to survive it today, so this is a
         regression guard rather than a reproduction of a known break.
         """
@@ -517,7 +517,7 @@ class TestFP4Param:
                 tp_size, str(ckpt_dir), **kwargs
             )
             self.run_train_steps(args, model, optimizer, num_steps=3)
-            # Mirror save_checkpoint_and_time: the params are staged from the FP32 masters
+            # Mirror save_checkpoint_and_time: the params are staged from the FP32 main params
             # and gathered before the state dict is taken.
             force_param_sync(model, optimizer=optimizer)
             saved_state = self.quantized_param_state(model[0])
