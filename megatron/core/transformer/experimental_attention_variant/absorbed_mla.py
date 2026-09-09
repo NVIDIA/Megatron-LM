@@ -10,6 +10,9 @@ This module implements MLA with matrix absorption:
 
 The absorption is mathematically equivalent to standard MLA but enables MQA-style attention which
 can be more efficient for certain attention variants.
+
+In-framework inference is not supported. Export to Hugging Face and serve with vLLM
+(see NVIDIA/Megatron-LM#7106).
 """
 
 import math
@@ -135,6 +138,10 @@ class AbsorbedMLASelfAttention(Attention):
 
     The absorption is mathematically equivalent to standard MLA but enables MQA-style attention
     computation which can be more efficient for certain attention variants.
+
+    In-framework inference is not supported: ``forward`` rejects ``inference_context`` /
+    ``inference_params``. Export to Hugging Face and serve with vLLM
+    (see NVIDIA/Megatron-LM#7106).
     """
 
     def __init__(
@@ -827,9 +834,11 @@ class AbsorbedMLASelfAttention(Attention):
         assert not (
             self.training and self.cache_mla_latents
         ), "cache_mla_latents conflicts with training."
-        assert (
-            inference_context is None and inference_params is None
-        ), "Inference is not supported for AbsorbedMLA"
+        assert inference_context is None and inference_params is None, (
+            "AbsorbedMLA (experimental_attention_variant='dsa') has no Megatron in-framework "
+            "inference path. Export to Hugging Face and serve with vLLM "
+            "(https://github.com/NVIDIA/Megatron-LM/issues/7106)."
+        )
 
         # =====================
         # Query, Key, and Value
