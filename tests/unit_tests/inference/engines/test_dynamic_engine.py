@@ -391,6 +391,8 @@ class DynamicEngineTestConfig:
     # relevant to the test. The tests only check if the required
     # context attributes are set correctly.
     suspend_resume_interval: Optional[int] = None
+    # Build the engine SUSPENDED; _run_test resumes it before adding requests.
+    start_suspended: bool = False
     kv_cache_management_mode: str = "persist"
     static_kv_memory_pointers: bool = True
     track_generated_token_events: bool = False
@@ -573,6 +575,7 @@ class DynamicInferenceEngineTestBase:
                 offset_sampling_seed_by_dp_rank=test_config.offset_sampling_seed_by_dp_rank,
                 async_sched_mode=test_config.async_sched_mode,
                 logprobs_mode=test_config.logprobs_mode,
+                start_suspended=test_config.start_suspended,
             ),
         )
 
@@ -861,6 +864,13 @@ class DynamicInferenceEngineTestBase:
         # Test environment.
         test_config = DynamicEngineTestConfig(**test_config_kwargs)
         env = cls._build_test_env(test_config)
+        if test_config.start_suspended:
+            # Nothing weight-dependent may have run yet; the first resume() is what captures.
+            assert env.engine.state == EngineState.SUSPENDED
+            assert env.engine.capture_stats is None
+            assert not env.engine.context.is_tensor_state_allocated
+            env.engine.resume()
+            assert env.engine.state == EngineState.RUNNING
 
         # Add requests to engine.
         env.mem_usage["start"] = torch.cuda.memory_stats()
@@ -1351,6 +1361,35 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                     f"result ({request.generated_tokens}) != "
                     f"expected ({expected_generated_tokens})."
                 )
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @pytest.mark.parametrize("kv_cache_management_mode", ["persist", "recompute"])
+    @torch.inference_mode()
+    def test_start_suspended(self, kv_cache_management_mode: str) -> None:
+        """Deferred capture happens on the first resume() and only there."""
+        env = self._run_test(
+            num_tokens_to_generate=16,
+            num_cuda_graphs=1,
+            force_build_cuda_graphs=True,
+            context_max_requests=128,
+            use_cuda_graphs_for_non_decode_steps=False,
+            kv_cache_management_mode=kv_cache_management_mode,
+            static_kv_memory_pointers=(kv_cache_management_mode == "persist"),
+            start_suspended=True,
+        )
+        first_capture = env.engine.capture_stats
+        assert first_capture is not None
+        for request in env.requests:
+            assert request.status == Status.COMPLETED
+
+        # Later cycles follow the normal rule: PERSIST keeps the graphs, RECOMPUTE recaptures.
+        env.engine.suspend()
+        env.engine.resume()
+        kept = env.engine.capture_stats is first_capture
+        assert kept == (kv_cache_management_mode == "persist")
 
     @pytest.mark.internal
     @pytest.mark.skipif(

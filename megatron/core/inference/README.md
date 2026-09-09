@@ -52,6 +52,26 @@ async def main():
 asyncio.run(main())
 ```
 
+### Serving before the weights are final
+
+`InferenceConfig(start_suspended=True)` builds the engine in the `SUSPENDED` state. The coordinator, the engine loop and the `serve()` frontends come up immediately and requests are queued rather than failed, while buffer allocation and CUDA-graph capture wait for the first `resume()`. Use it when the weights the engine will run with are not in place at construction, e.g. an RL rollout engine that receives them through a refit:
+
+```python
+from megatron.core.inference.config import InferenceConfig
+
+llm = MegatronAsyncLLM(
+    model=model,
+    tokenizer=tokenizer,
+    inference_config=InferenceConfig(start_suspended=True),
+)
+await llm.serve(ServeConfig(port=5000), blocking=False)  # the endpoint answers from here on
+load_weights_in_place(model)                             # e.g. the first refit
+await llm.resume()                                       # allocate buffers, capture CUDA graphs
+await llm.unpause()                                      # start serving
+```
+
+Coordinator mode only: direct mode has no `resume()`, so `start_suspended` raises `ValueError` there.
+
 ## Public API
 
 | Symbol | Purpose |
@@ -66,6 +86,7 @@ asyncio.run(main())
 - Call `initialize_megatron(...)` (full Megatron distributed setup) BEFORE construction.
 - Call `model.eval()` BEFORE construction. The class does not toggle model state.
 - Lifecycle methods (`pause`/`unpause`/`suspend`/`resume`) require `use_coordinator=True`; they raise `RuntimeError` in direct mode.
+- With `InferenceConfig(start_suspended=True)`, call `resume()` and then `unpause()` once the weights are in place; until then submitted requests wait.
 
 ## Future roadmap
 
