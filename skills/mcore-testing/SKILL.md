@@ -43,10 +43,12 @@ tests/
 
 Directories under `tests/unit_tests/` mirror the corresponding relative paths
 under `megatron/`; for example, hybrid model tests belong in
-`tests/unit_tests/core/models/hybrid/`. The two explicit exceptions are
+`tests/unit_tests/core/models/hybrid/`. Explicit exceptions are
 `core/distributed/mfsdp_v1/` and `core/distributed/mfsdp_v2/`, which keep the
-FSDP versions separate. Keep shared test infrastructure and tests for code
-outside `megatron/` as flat files at the unit-test root.
+FSDP versions separate, and the `core/determinism/` subtree, which keeps its
+shared helpers and `correctness/` tests together. Keep other shared test
+infrastructure and tests for code outside `megatron/` as flat files at the
+unit-test root.
 
 ---
 

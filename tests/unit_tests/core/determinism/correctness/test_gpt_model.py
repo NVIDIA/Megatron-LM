@@ -3,7 +3,7 @@
 """Model-level determinism check for GPTModel.
 
 Adding a new parallelism cell is a one-line append to
-``determinism_configs.PARALLELISM_CONFIGS`` — this file does not need to change.
+``configs.PARALLELISM_CONFIGS`` — this file does not need to change.
 
 The model factory + inputs + runner-builder live here (not in a separate
 helpers file) because ``test_fp8_determinism.py`` is the only other
@@ -13,18 +13,14 @@ the module body only defines helpers + the ``RUNNER`` singleton (no test
 side effects at import time).
 """
 
-from tests.unit_tests import determinism_env  # noqa: F401
-
-# isort: split
-
 import pytest
 import torch
 
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.transformer.transformer_config import TransformerConfig
-from tests.unit_tests.determinism_bit_exact_runner import BitExactRunner
-from tests.unit_tests.determinism_configs import GPT_CONFIGS, PARALLELISM_CONFIGS, gpt_base
+from tests.unit_tests.core.determinism.bit_exact_runner import BitExactRunner
+from tests.unit_tests.core.determinism.configs import GPT_CONFIGS, PARALLELISM_CONFIGS, gpt_base
 
 SEQ_LEN = 32
 MICRO_BATCH = 4

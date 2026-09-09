@@ -6,7 +6,7 @@ Test files instantiate ``BitExactRunner`` once with their model-specific
 factory + input-builder + base-config, then call
 ``runner.run(cfg_overrides, parallelism)`` from a parametrized test. Adding
 a new parallelism config means appending a single entry to
-``determinism_configs.PARALLELISM_CONFIGS`` — no test-file edits required.
+``configs.PARALLELISM_CONFIGS`` — no test-file edits required.
 
 For any parallelism dict the runner performs two forward+backward passes
 under the same restored RNG state and asserts that outputs and gradients
@@ -14,7 +14,7 @@ are bit-identical. It handles:
 
 * TP, PP, VPP, CP, EP via ``Utils.initialize_model_parallel``.
 * FSDP via ``fully_shard_model`` wrap.
-* MoE auto-enable when ``EP > 1`` (merges ``determinism_configs.moe_overrides(tp, ep)``).
+* MoE auto-enable when ``EP > 1`` (merges ``configs.moe_overrides(tp, ep)``).
 * num_layers auto-bump when ``PP * VPP`` exceeds the preset's layer count.
 * sequence_parallel + tensor_model_parallel_size propagation when MoE+TP.
 * Pipeline schedule (``get_forward_backward_func``) when ``PP > 1``;
@@ -31,12 +31,12 @@ import torch
 from megatron.core import parallel_state
 from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from tests.unit_tests.determinism_configs import (
+from tests.unit_tests.core.determinism.configs import (
     apply_parallelism,
     moe_overrides,
     required_world_size,
 )
-from tests.unit_tests.determinism_utils import (
+from tests.unit_tests.core.determinism.utils import (
     assert_bit_exact,
     capture_rng_state,
     collect_grads,
@@ -93,7 +93,7 @@ class BitExactRunner:
         tp = min(self.default_tp, Utils.world_size)
         Utils.initialize_model_parallel(tensor_model_parallel_size=tp)
         # Determinism env vars are pinned for the lifetime of the test
-        # process by the test module's eager import of ``determinism_env``.
+        # process by ``correctness/__init__.py:apply_determinism_env(os.environ)``.
         # The deterministic-algos flag is set here per-test but never
         # toggled off in teardown — flipping it off would contaminate any
         # code that runs later in the same pytest process and assumes the

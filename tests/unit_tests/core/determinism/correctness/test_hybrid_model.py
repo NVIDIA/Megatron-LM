@@ -3,13 +3,9 @@
 """Model-level determinism check for HybridModel (Mamba + attention).
 
 Adding a new parallelism cell is a one-line append to
-``determinism_configs.PARALLELISM_CONFIGS``. ``HYBRID_CONFIGS`` provides the
+``configs.PARALLELISM_CONFIGS``. ``HYBRID_CONFIGS`` provides the
 (layer_pattern, overrides) presets specific to this model class.
 """
-
-from tests.unit_tests import determinism_env  # noqa: F401
-
-# isort: split
 
 import pytest
 import torch
@@ -17,8 +13,8 @@ import torch
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.transformer.transformer_config import TransformerConfig
-from tests.unit_tests.determinism_bit_exact_runner import BitExactRunner
-from tests.unit_tests.determinism_configs import HYBRID_CONFIGS, hybrid_base
+from tests.unit_tests.core.determinism.bit_exact_runner import BitExactRunner
+from tests.unit_tests.core.determinism.configs import HYBRID_CONFIGS, hybrid_base
 
 # Hybrid covers the cheap-and-valuable composites that exercise Mamba +
 # parallelism interactions. The first cell pays a ~60s JIT tax (TE attention

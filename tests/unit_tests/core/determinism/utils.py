@@ -2,9 +2,10 @@
 
 """Shared helpers for per-module determinism tests.
 
-The correctness tests import ``tests.unit_tests.determinism_env`` before
-their other dependencies so the environment settings take effect before
-any cuBLAS / Transformer Engine call inside a test module.
+The env vars required for bit-exact reproducibility are set in each
+subpackage's ``__init__.py`` (``correctness/`` always; ``perf/`` only when
+``DETERMINISM_PERF_MODE != 'nondet'``) so they take effect on package
+import, before any cuBLAS / TE call inside a test module.
 """
 
 import random

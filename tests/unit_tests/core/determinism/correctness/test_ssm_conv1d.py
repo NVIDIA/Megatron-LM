@@ -3,13 +3,9 @@
 """Determinism checks for the SSM causal convolution.
 
 Operator-level rather than model-level: the conv's channel-last backward reduces its weight
-gradient over ``micro_batch * ceil(seq_len / 128)`` blocks with ``atomicAdd``, and the
-model-level determinism checks run 32x2, which is two blocks -- too few to expose a regression.
+gradient over ``micro_batch * ceil(seq_len / 128)`` blocks with ``atomicAdd``, and the model
+cells in this directory run 32x2, which is two blocks -- too few to expose a regression.
 """
-
-from tests.unit_tests import determinism_env  # noqa: F401
-
-# isort: split
 
 import pytest
 import torch
@@ -21,8 +17,8 @@ from megatron.core.ssm.causal_conv1d import assert_causal_conv1d_deterministic
 from megatron.core.ssm.mamba_mixer import MambaMixer
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
-from tests.unit_tests.determinism_configs import hybrid_base
-from tests.unit_tests.determinism_utils import (
+from tests.unit_tests.core.determinism.configs import hybrid_base
+from tests.unit_tests.core.determinism.utils import (
     assert_bit_exact,
     capture_rng_state,
     collect_grads,

@@ -14,14 +14,10 @@ modes don't depend on parallelism degree):
 * ``fp4-nvfp4``      — Blackwell-only NVFP4 block scaling; capability-skipped on Hopper.
 """
 
-from tests.unit_tests import determinism_env  # noqa: F401
-
-# isort: split
-
 import pytest
 import torch
 
-from tests.unit_tests.core.models.gpt.test_gpt_model_determinism import make_gpt_runner
+from tests.unit_tests.core.determinism.correctness.test_gpt_model import make_gpt_runner
 
 # Hopper = SM 9.0, Blackwell = SM 10.0+. mxfp8 + nvfp4 need Blackwell.
 _IS_BLACKWELL = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 10

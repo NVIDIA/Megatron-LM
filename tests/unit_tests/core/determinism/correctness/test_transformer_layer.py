@@ -11,7 +11,7 @@ Three sub-tests:
 
 1. ``test_bit_exact_under_parallelism`` — runner-driven, covers every entry
    in the filtered parallelism matrix (TP / EP / FSDP and composites; PP
-   composites are covered by ``test_gpt_model_determinism``).
+   composites are covered by ``test_gpt_model``).
 2. ``test_bit_exact_under_racing_streams`` — TP=4 + side-stream contention.
    ``skipif(CUDA_DEVICE_MAX_CONNECTIONS=='1')`` because side streams can't
    actually race when serialised through a single hardware queue (Hopper
@@ -20,10 +20,6 @@ Three sub-tests:
    per-submodule launch timing on the default stream, so it stresses
    cross-rank NCCL race ordering even under ``CUDA_DEVICE_MAX_CONNECTIONS=1``.
 """
-
-from tests.unit_tests import determinism_env  # noqa: F401
-
-# isort: split
 
 import os
 
@@ -35,15 +31,15 @@ from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transfor
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
-from tests.unit_tests.determinism_configs import GPT_CONFIGS, gpt_base, parallelism_configs
+from tests.unit_tests.core.determinism.configs import GPT_CONFIGS, gpt_base, parallelism_configs
 
 # Layer-stack determinism: drop PP composites — the full PP path (embedding +
 # block + logits through the schedule) is exhaustively covered by
-# ``test_gpt_model_determinism``. Keep TP / EP / FSDP cells that exercise the layer's
+# ``test_gpt_model``. Keep TP / EP / FSDP cells that exercise the layer's
 # own parallelism plumbing.
 _LAYER_PARALLELISM_CONFIGS = parallelism_configs(exclude=("pp2", "pp4", "tp2-pp2", "pp2-vpp2"))
-from tests.unit_tests.determinism_bit_exact_runner import BitExactRunner
-from tests.unit_tests.determinism_utils import (
+from tests.unit_tests.core.determinism.bit_exact_runner import BitExactRunner
+from tests.unit_tests.core.determinism.utils import (
     CudaSleepJitter,
     RacingStreams,
     assert_bit_exact,
