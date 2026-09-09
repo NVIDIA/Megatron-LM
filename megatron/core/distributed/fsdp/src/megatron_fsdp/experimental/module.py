@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -26,11 +26,11 @@ from torch.distributed import DeviceMesh
 from torch.distributed.tensor import Shard
 from torch.distributed.tensor.placement_types import Placement
 
-from ..mixed_precision import MixedPrecisionPolicy
+from ..mixed_precision import MixedPrecisionPolicy, fp8_need_transpose_data, is_float8tensor
 from .countdown import Countdown
 from .indexed_order import IndexedOrder
 from .module_utils import get_parameter_owner
-from .parameter_group import FsdpParameterGroup, get_containing_parameter_group
+from .parameter_group import Fp8ParameterGroup, FsdpParameterGroup, get_containing_parameter_group
 from .placement import Flat
 from .schedule import SchedulePolicy
 
@@ -38,6 +38,11 @@ from .schedule import SchedulePolicy
 def _is_in_backward() -> bool:
     """Return whether the current thread is executing an autograd GraphTask."""
     return torch._C._current_graph_task_id() != -1
+
+
+def _is_fp8_parameter(parameter: nn.Parameter) -> bool:
+    """Whether ``parameter`` is an MXFP8 primary weight (needs both orientations)."""
+    return is_float8tensor(parameter) and fp8_need_transpose_data(parameter)
 
 
 class FsdpContext:
@@ -197,11 +202,24 @@ class FsdpModule:
         owned_parameters = _collect_owned_parameters(self)
         if grad_divisor <= 0:
             raise ValueError(f"grad_divisor must be positive, got {grad_divisor}.")
+
+        for name, parameter in owned_parameters.items():
+            if is_float8tensor(parameter) and not fp8_need_transpose_data(parameter):
+                raise ValueError(
+                    f"MFSDP v2 only supports MXFP8 primary weights; parameter {name!r} is "
+                    f"a {type(parameter).__name__} without transpose data."
+                )
+
         parameter_groups = []
         for group_parameters in _group_parameters(owned_parameters):
             group_dtype = next(iter(group_parameters.values())).dtype
+            parameter_group_cls = (
+                Fp8ParameterGroup
+                if all(_is_fp8_parameter(parameter) for parameter in group_parameters.values())
+                else FsdpParameterGroup
+            )
             parameter_groups.append(
-                FsdpParameterGroup(
+                parameter_group_cls(
                     owning_module=self,
                     parameters=group_parameters,
                     mesh=mesh,
@@ -429,13 +447,18 @@ class FsdpModule:
             prefetched_size += next_module.num_parameter_elements
             next_module = order.next_item(next_module)
 
-    def _unshard_parameter_groups(self) -> None:
+    def _unshard_parameter_groups(self, orientation: str = "rowwise") -> None:
         """Unshard this FsdpModule's parameter groups on the all-gather stream.
 
         If ``_unshard_event`` is already set, this FsdpModule was already
         unsharded or prefetched and this method is a no-op. Otherwise, this
         method records ``_unshard_event`` after materialization so compute
         can wait without depending on later release work.
+
+        Args:
+            orientation: Payload orientation to gather for MXFP8 groups —
+                ``"rowwise"`` on the forward pass, ``"colwise"`` on the
+                backward pass. Ignored by regular groups.
         """
         if self._unshard_event is not None:
             return
@@ -443,7 +466,7 @@ class FsdpModule:
         allgather_stream = self.context.allgather_stream
         with torch.cuda.stream(allgather_stream):
             for group in self._parameter_groups:
-                group.unshard_parameters()
+                group.unshard_parameters(orientation)
             self._unshard_event = allgather_stream.record_event()
 
     def post_forward(self) -> None:
@@ -601,9 +624,9 @@ def _collect_owned_parameters(root_module: nn.Module) -> dict[str, nn.Parameter]
 
 
 def _group_parameters(parameters: dict[str, nn.Parameter]) -> list[dict[str, nn.Parameter]]:
-    grouped: dict[tuple[torch.dtype, bool], dict[str, nn.Parameter]] = {}
+    grouped: dict[tuple[torch.dtype, bool, bool], dict[str, nn.Parameter]] = {}
     for name, parameter in parameters.items():
-        key = (parameter.dtype, parameter.requires_grad)
+        key = (parameter.dtype, parameter.requires_grad, _is_fp8_parameter(parameter))
         grouped.setdefault(key, {})[name] = parameter
     return [grouped[key] for key in grouped]
 

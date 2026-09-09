@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -160,6 +160,10 @@ def fully_shard(
             hooks on ``module``. Disable this when an external scheduler invokes the
             corresponding FSDP lifecycle methods explicitly. The state-dict safety hook
             is registered independently.
+
+        Parameters that are TE MXFP8 primary weights (detected via
+        ``is_float8tensor`` + ``fp8_need_transpose_data``) are grouped into
+        ``Fp8ParameterGroup`` automatically; no flag is needed.
     """
     if isinstance(module, FsdpModule):
         raise ValueError("This module is already managed by FSDP.")
