@@ -5,7 +5,7 @@
 # This source code is licensed under the Apache license found in the
 # LICENSE file in the root directory of this source tree.
 
-from functools import partial
+from functools import lru_cache, partial
 from typing import Optional
 
 import torch
@@ -33,6 +33,23 @@ from megatron.core.ssm.gated_delta_net.internal_gdn_backend.chunk import (
     prepare_validated_chunk_metadata as prepare_internal_gdr_chunk_metadata,
 )
 from megatron.core.utils import deprecate_inference_params, nvtx_range_pop, nvtx_range_push
+
+
+@lru_cache(maxsize=1)
+def _get_cudnn_gated_delta_rule():
+    """Enable and return cuDNN Frontend's FLA-compatible GDR implementation."""
+    try:
+        import cudnn.fla as cudnn_fla
+        from fla.ops import gated_delta_rule as fla_gated_delta_rule
+
+        cudnn_fla.accelerate_fla(verbose=False, targets="gdn")
+    except (AttributeError, ImportError) as error:
+        raise ImportError(
+            "gdn_gdr_backend='cudnn' requires a cuDNN Frontend build with "
+            "cudnn.fla GDN support."
+        ) from error
+
+    return fla_gated_delta_rule.chunk_gated_delta_rule
 
 
 class GatedDeltaNet(_GDNBase):
@@ -69,6 +86,8 @@ class GatedDeltaNet(_GDNBase):
             self.gated_delta_rule = torch_chunk_gated_delta_rule
         elif self.config.gdn_gdr_backend == "fla":
             self.gated_delta_rule = chunk_gated_delta_rule
+        elif self.config.gdn_gdr_backend == "cudnn":
+            self.gated_delta_rule = _get_cudnn_gated_delta_rule()
         elif self.config.gdn_gdr_backend == "internal":
             self.gated_delta_rule = partial(
                 internal_chunk_gated_delta_rule, recompute_h=self.config.gdn_gdr_recompute_h
