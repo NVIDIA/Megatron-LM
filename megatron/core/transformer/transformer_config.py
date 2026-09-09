@@ -2318,6 +2318,10 @@ class TransformerConfig(ModelParallelConfig):
             )
 
         if self.moe_paged_stash:
+            # Without this the kernel is a mock (paged_stash.py guards the triton import), so the
+            # first launch raises TypeError: '_GeneratorContextManager' object is not
+            # subscriptable, mid-step and naming neither triton nor this flag. Nothing else
+            # rejects the combination.
             if importlib.util.find_spec("triton") is None:
                 raise ValueError(
                     "moe_paged_stash requires triton, which is not installed. "
