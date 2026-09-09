@@ -20,4 +20,16 @@ def test_broadcast_data():
     actual_output = broadcast_data([0, 1], input_data, dtype)
     assert torch.equal(actual_output[0], input_data[0])
     assert torch.equal(actual_output[1], input_data[1])
+
+    # A custom process group must be used for both shape metadata and payload.
+    world_input = (
+        {"value": torch.arange(12, dtype=dtype, device="cuda").reshape(3, 4)}
+        if torch.distributed.get_rank() == 0
+        else None
+    )
+    world_output = broadcast_data(
+        ["value"], world_input, dtype, tp_group=torch.distributed.group.WORLD
+    )
+    expected = torch.arange(12, dtype=dtype, device="cuda").reshape(3, 4)
+    assert torch.equal(world_output["value"], expected)
     Utils.destroy_model_parallel()

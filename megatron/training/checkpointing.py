@@ -1524,7 +1524,7 @@ def maybe_save_dataloader_state(
         get_pg_rank(tp_group) == 0
         if tp_group is not None
         else mpu.get_tensor_model_parallel_rank() == 0
-    )
+    ) and mpu.get_context_parallel_rank() == 0
     if not first_rank:
         return
 

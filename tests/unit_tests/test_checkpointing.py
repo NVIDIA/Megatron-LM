@@ -150,6 +150,29 @@ def test_maybe_save_dataloader_state_skips_empty_state_after_barriers(tmp_path):
     save.assert_not_called()
 
 
+def test_maybe_save_dataloader_state_skips_duplicate_context_parallel_rank(tmp_path):
+    """Only CP rank zero writes each data-parallel dataloader shard."""
+    group = SimpleNamespace(rank=0, size=1)
+    iterator = SimpleNamespace(iterable=SimpleNamespace(save_state=mock.Mock()))
+
+    with (
+        mock.patch(
+            "megatron.training.checkpointing.get_pg_rank",
+            side_effect=lambda process_group: process_group.rank,
+        ),
+        mock.patch("megatron.training.checkpointing.mpu.get_context_parallel_rank", return_value=1),
+        mock.patch("megatron.training.checkpointing.torch.distributed.barrier") as barrier,
+        mock.patch("megatron.training.checkpointing.torch.save") as save,
+    ):
+        maybe_save_dataloader_state(
+            iterator, 2, tmp_path, tp_group=group, pp_group=group, dp_group=group
+        )
+
+    iterator.iterable.save_state.assert_not_called()
+    barrier.assert_not_called()
+    save.assert_not_called()
+
+
 class MockOptParamScheduler(MockState):
     def __init__(self, state_dict):
         super().__init__(state_dict)
