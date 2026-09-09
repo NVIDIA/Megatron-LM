@@ -57,7 +57,7 @@ def test_compute_shard_plan_even_split():
     plan = ParameterLayout.from_layout(layout, tensor_index=0, dp_size=2)
     assert plan.full_shape == torch.Size((8, 4))
     assert plan.row_size == 4
-    assert plan.rank_rows == ((0, 4), (4, 4))
+    assert plan.row_counts == (4, 4)
     assert plan.shard_numel(0) == 16
     assert plan.shard_numel(1) == 16
 
@@ -68,7 +68,7 @@ def test_compute_shard_plan_boundary_param_split_across_ranks():
     # owns [9,18). Tensor occupies [0,18) fully.
     layout = _layout([(6, 3)], [0], 18)
     plan = ParameterLayout.from_layout(layout, tensor_index=0, dp_size=2)
-    assert plan.rank_rows == ((0, 3), (3, 3))
+    assert plan.row_counts == (3, 3)
     assert plan.is_boundary()
 
 
@@ -78,7 +78,7 @@ def test_compute_shard_plan_fully_local_param_on_one_rank():
     # elements fits entirely in rank0.
     layout = _layout([(4, 2)], [0], 24)
     plan = ParameterLayout.from_layout(layout, tensor_index=0, dp_size=2)
-    assert plan.rank_rows == ((0, 4), (0, 0))
+    assert plan.row_counts == (4, 0)
     assert not plan.is_boundary()
     assert plan.owner_candidates() == (0,)
 
@@ -88,7 +88,7 @@ def test_compute_shard_plan_empty_rank_has_zero_rows():
     # Tensor at offset 12 (entirely in rank1). rank0 gets (0,0).
     layout = _layout([(4, 3)], [12], 24)
     plan = ParameterLayout.from_layout(layout, tensor_index=0, dp_size=2)
-    assert plan.rank_rows == ((0, 0), (0, 4))
+    assert plan.row_counts == (0, 4)
     assert plan.is_boundary() is False
     assert plan.owner_candidates() == (1,)
 
@@ -101,8 +101,8 @@ def test_compute_shard_plan_empty_rank_has_zero_rows():
 def test_assign_owner_work_balances_by_cost():
     """Owners are balanced so the cheapest eligible rank takes each parameter."""
     # Two boundary params, all four ranks eligible for each.
-    plan0 = ParameterLayout(torch.Size((8, 8)), ((0, 4), (0, 4), (0, 4), (0, 4)), 8)  # cost 64*41
-    plan1 = ParameterLayout(torch.Size((4, 4)), ((0, 2), (0, 2), (0, 2), (0, 2)), 4)  # cost 16*21
+    plan0 = ParameterLayout(torch.Size((8, 8)), (4, 4, 4, 4), 8)  # cost 64*41
+    plan1 = ParameterLayout(torch.Size((4, 4)), (2, 2, 2, 2), 4)  # cost 16*21
     # Greedy min running cost: first param -> rank0 (cost 2624), second -> rank1 (cost 336).
     owners = assign_owner_work([plan0, plan1], _ns_cost(5))
     assert owners == {0: 0, 1: 1}
@@ -111,8 +111,8 @@ def test_assign_owner_work_balances_by_cost():
 def test_assign_owner_work_only_eligible_ranks_can_own():
     """A rank with an empty shard can never be the owner."""
     # Only ranks 0 and 2 have shards for both params.
-    plan0 = ParameterLayout(torch.Size((8, 8)), ((0, 4), (0, 0), (0, 4), (0, 0)), 8)
-    plan1 = ParameterLayout(torch.Size((8, 8)), ((0, 4), (0, 0), (0, 4), (0, 0)), 8)
+    plan0 = ParameterLayout(torch.Size((8, 8)), (4, 0, 4, 0), 8)
+    plan1 = ParameterLayout(torch.Size((8, 8)), (4, 0, 4, 0), 8)
     owners = assign_owner_work([plan0, plan1], _ns_cost(5))
     assert all(owners[i] in (0, 2) for i in owners)
     # Two equal-cost params split across the two eligible ranks.
@@ -121,7 +121,7 @@ def test_assign_owner_work_only_eligible_ranks_can_own():
 
 def test_assign_owner_work_skips_non_boundary():
     """Non-boundary parameters stay on their original rank – no assignment needed."""
-    plan = ParameterLayout(torch.Size((4, 2)), ((0, 4), (0, 0)), 2)
+    plan = ParameterLayout(torch.Size((4, 2)), (4, 0), 2)
     owners = assign_owner_work([plan], _ns_cost(3))
     assert owners == {}
 
@@ -164,8 +164,8 @@ def test_pack_and_reconstruct_round_trip():
     full_p1 = torch.arange(8, dtype=torch.float32).reshape(4, 2) + 100
     per_rank_local = []
     for r in range(dp_size):
-        rs0, rc0 = plan0.rank_rows[r]
-        rs1, rc1 = plan1.rank_rows[r]
+        rs0, rc0 = plan0.rank_row_start(r), plan0.rank_row_count(r)
+        rs1, rc1 = plan1.rank_row_start(r), plan1.rank_row_count(r)
         per_rank_local.append([full_p0[rs0 : rs0 + rc0].clone(), full_p1[rs1 : rs1 + rc1].clone()])
 
     per_rank_send = []
@@ -222,7 +222,7 @@ def test_pack_and_unpack_result_round_trip():
         # Rank r receives the result shard for the param it does NOT own.
         other = 1 - r
         plan = plans[other]
-        rs, rc = plan.rank_rows[r]
+        rs, rc = plan.rank_row_start(r), plan.rank_row_count(r)
         expected = full_results_by_rank[owners[other]][other][rs : rs + rc]
         torch.testing.assert_close(received[other], expected, atol=0, rtol=0)
 
@@ -246,7 +246,7 @@ def test_from_layout_per_rank_data_not_uniform():
     #   rank 2: [16, 24) -> 4 elements -> 1 row  (4 elements of padding)
     layout = _layout([(5, 4)], [0], 24)
     plan = ParameterLayout.from_layout(layout, tensor_index=0, dp_size=3)
-    assert plan.rank_rows == ((0, 2), (2, 2), (4, 1))
+    assert plan.row_counts == (2, 2, 1)
     assert plan.shard_numel(0) == 8
     assert plan.shard_numel(1) == 8
     assert plan.shard_numel(2) == 4

@@ -31,19 +31,18 @@ class ParameterLayout:
 
     Attributes:
         full_shape: Global `(rows, cols)` shape of the parameter.
-        rank_rows: Per-rank `(row_start, row_count)` tuples; `row_count == 0` means the rank holds
-            no shard.
+        row_counts: Per-rank row count; `0` means the rank holds no shard.
         row_size: Number of elements per row (= `full_shape[1:].numel()`).
     """
 
     full_shape: torch.Size
-    rank_rows: tuple[tuple[int, int], ...]
+    row_counts: tuple[int, ...]
     row_size: int
 
     def __post_init__(self) -> None:
         if len(self.full_shape) != 2:
             raise ValueError(f"ParameterLayout requires a 2D full_shape, got {self.full_shape}.")
-        if len(self.rank_rows) == 0:
+        if len(self.row_counts) == 0:
             raise ValueError("ParameterLayout requires at least one rank.")
         if self.row_size != non_leading_numel(self.full_shape):
             raise ValueError(
@@ -75,14 +74,14 @@ class ParameterLayout:
             )
         tensor_end = tensor_flat_offset + full_shape.numel()
 
-        rank_rows: list[tuple[int, int]] = []
+        row_counts: list[int] = []
         for rank in range(dp_size):
             rank_start = rank * rank_flat_shard_size
             rank_end = rank_start + rank_flat_shard_size
             overlap_start = max(tensor_flat_offset, rank_start)
             overlap_end = min(tensor_end, rank_end)
             if overlap_start >= overlap_end:
-                rank_rows.append((0, 0))
+                row_counts.append(0)
                 continue
             if (overlap_start - tensor_flat_offset) % row_size != 0:
                 raise RuntimeError(
@@ -95,19 +94,24 @@ class ParameterLayout:
                     f"Flat shard overlap is not row-aligned for shape {full_shape}: "
                     f"overlap_numel={overlap_numel}, row_size={row_size}."
                 )
-            row_start = (overlap_start - tensor_flat_offset) // row_size
             row_count = overlap_numel // row_size
-            rank_rows.append((row_start, row_count))
-        return cls(full_shape=torch.Size(full_shape), rank_rows=tuple(rank_rows), row_size=row_size)
+            row_counts.append(row_count)
+        return cls(
+            full_shape=torch.Size(full_shape), row_counts=tuple(row_counts), row_size=row_size
+        )
 
     @property
     def dp_size(self) -> int:
         """Number of ranks in the DP group for this parameter."""
-        return len(self.rank_rows)
+        return len(self.row_counts)
+
+    def rank_row_start(self, rank: int) -> int:
+        """Return the starting row of `rank`'s shard within the full tensor."""
+        return sum(self.row_counts[:rank])
 
     def rank_row_count(self, rank: int) -> int:
         """Return the number of rows owned by `rank`."""
-        return self.rank_rows[rank][1]
+        return self.row_counts[rank]
 
     def shard_numel(self, rank: int) -> int:
         """Return the number of elements in `rank`'s shard."""
@@ -115,11 +119,11 @@ class ParameterLayout:
 
     def owner_candidates(self) -> tuple[int, ...]:
         """Return the ranks that hold a non-empty shard of this parameter."""
-        return tuple(r for r, (_, count) in enumerate(self.rank_rows) if count > 0)
+        return tuple(r for r, count in enumerate(self.row_counts) if count > 0)
 
     def is_boundary(self) -> bool:
         """True if more than one rank owns a non-empty shard of this parameter."""
-        return any(0 < count < self.full_shape[0] for _, count in self.rank_rows)
+        return any(0 < count < self.full_shape[0] for count in self.row_counts)
 
     def full_numel(self) -> int:
         """Return the total number of elements in the full (unsharded) parameter."""
@@ -417,7 +421,8 @@ class OwnerScatterPlan:
                 continue
             for param_index in owned_indices:
                 plan = plans[param_index]
-                row_start, row_count = plan.rank_rows[dest]
+                row_count = plan.rank_row_count(dest)
+                row_start = plan.rank_row_start(dest)
                 numel = row_count * plan.row_size
                 if numel == 0:
                     continue
