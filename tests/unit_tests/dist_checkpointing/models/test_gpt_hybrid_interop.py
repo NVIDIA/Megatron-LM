@@ -66,9 +66,10 @@ class TestGPTCompatLayerMaps:
     def test_metadata_less_bridge_checkpoint_uses_regular_load_path(self):
         runtime_model = object.__new__(HybridModel)
 
-        assert _maybe_setup_gpt_to_hybrid_load(
-            mock.Mock(), SimpleNamespace(), [runtime_model]
-        ) == (None, False)
+        assert _maybe_setup_gpt_to_hybrid_load(mock.Mock(), SimpleNamespace(), [runtime_model]) == (
+            None,
+            False,
+        )
 
     def test_pairs_positions_in_pattern_order(self):
         maps = gpt_compatible_layer_maps('M*-M*-')
