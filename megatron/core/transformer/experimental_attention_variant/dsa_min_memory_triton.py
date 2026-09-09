@@ -2273,6 +2273,7 @@ def triton_sparse_attention_backward_supported(
     grad_output: torch.Tensor,
     grad_query: torch.Tensor,
 ) -> bool:
+    """Whether the fused sparse-attention backward supports this tensor configuration."""
     return (
         _can_use_sparse_attention(query, key, value, topk_indices)
         and _supported_tensor(grad_output)
@@ -2283,6 +2284,7 @@ def triton_sparse_attention_backward_supported(
 def triton_sparse_attention_backward_path(
     query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, topk_indices: torch.Tensor
 ) -> str:
+    """Name the backward path taken, for tests that assert the fused kernel was used."""
     if not _can_use_sparse_attention(query, key, value, topk_indices):
         return "unsupported"
     num_heads = query.size(2)
@@ -2309,6 +2311,7 @@ def triton_sparse_attention_backward_accumulate(
     softmax_scale: float,
     q_start: int,
 ) -> bool:
+    """Accumulate sparse-attention gradients into dQ, dK and dV."""
     if not triton_sparse_attention_backward_supported(
         query, key, value, topk_indices, grad_output, grad_query
     ):
@@ -2338,6 +2341,7 @@ def triton_sparse_attention_backward_accumulate(
 def triton_linear_wgrad(
     grad_output: torch.Tensor, input_tensor: torch.Tensor, grad_weight: torch.Tensor
 ) -> bool:
+    """Weight gradient of a linear layer, accumulated in fp32."""
     if _triton_disabled():
         return False
     if not (
@@ -2510,6 +2514,7 @@ def triton_simplified_gathered_linear_wgrad(
 def triton_scatter_selected_grad_to_sequence(
     grad_output: torch.Tensor, topk_indices: torch.Tensor, sequence_length: int
 ) -> Optional[torch.Tensor]:
+    """Scatter per-selection gradients back to their key positions, accumulating in fp32."""
     if _triton_disabled():
         return None
     if not (_supported_tensor(grad_output) and _supported_index_tensor(topk_indices)):
@@ -2683,6 +2688,7 @@ def triton_topk_index_block(
     apply_relu: bool = True,
     score_scale: float = 1.0,
 ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+    """Select the top-k keys for one query tile from streamed index scores."""
     if not _can_use_index_scores(q_index, weights, k_index, topk):
         return None
     key_len = k_index.size(0)
@@ -2854,6 +2860,7 @@ def triton_simplified_selected_index_scores_backward_qk(
     score_scale: float,
     q_start: int,
 ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+    """Gradients of the selected index scores with respect to the indexer Q and K."""
     if _triton_disabled() or not (
         _supported_tensor(q_index)
         and _supported_tensor(selected_k_index)
@@ -2989,6 +2996,7 @@ def _triton_selected_index_scores_backward(
 def triton_indexer_loss_grad(
     selected_scores: torch.Tensor, teacher: torch.Tensor, scale: torch.Tensor
 ) -> Optional[torch.Tensor]:
+    """Gradient of the indexer KL loss with respect to the index scores."""
     if _triton_disabled():
         return None
     if not (_supported_tensor(selected_scores) and _supported_tensor(teacher)):
@@ -3024,6 +3032,7 @@ def triton_sparse_attention_tile(
     softmax_scale: float,
     q_start: int,
 ) -> Optional[torch.Tensor]:
+    """Attention output for one query tile over its selected keys."""
     if not _can_use_sparse_attention(query, key, value, topk_indices):
         return None
     return _triton_sparse_attention_forward(query, key, value, topk_indices, softmax_scale, q_start)
@@ -3036,6 +3045,7 @@ def triton_teacher_scores_tile(
     softmax_scale: float,
     q_start: int,
 ) -> Optional[torch.Tensor]:
+    """Main-attention scores for one query tile, the KL target the indexer is trained on."""
     if not _can_use_sparse_attention(query, key, key, topk_indices):
         return None
     query_len, batch_size, num_heads, head_dim = query.shape
