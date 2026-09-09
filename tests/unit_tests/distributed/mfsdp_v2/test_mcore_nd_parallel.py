@@ -191,31 +191,55 @@ class TestMfsdpV2OverlapParity:
 
     @classmethod
     def _run_training(cls, *, use_mfsdp_v2: bool):
-        Utils.initialize_model_parallel(expert_model_parallel_size=2)
+        # Both runs use the SAME expert-topology (EP=2) so expert parameters are named and
+        # laid out identically.  The only difference is the reference (use_mfsdp_v2=False)
+        # trains the dense layer gradients via plain DDP ALL-REDUCE (no distributed optimizer,
+        # no sharded reduce-scatter), while MFSDP v2 uses its own fully-sharded optimizer.
+        # Because EP and the expert layout match, the two runs' parameter names line up 1:1
+        # and can be compared directly.
+        is_reference = not use_mfsdp_v2
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+            expert_model_parallel_size=2,
+        )
         data_parallel_group = mpu.get_data_parallel_group()
         _set_manual_seed(42)
+
+        overrides = {
+            "micro_batch_size": cls.MICRO_BATCH_SIZE,
+            "global_batch_size": cls.GLOBAL_BATCH_SIZE,
+            "vocab_size": cls.VOCAB_SIZE,
+            "padded_vocab_size": cls.VOCAB_SIZE,
+            "untie_embeddings_and_output_weights": True,
+            "seq_length": cls.SEQUENCE_LENGTH,
+            "train_iters": cls.NUM_STEPS,
+            "expert_model_parallel_size": 2,
+            "bf16": True,
+            "data_parallel_sharding_strategy": "optim_grads_params",
+            "clip_grad": 1.0,
+            "megatron_fsdp_main_grads_dtype": torch.float32,
+            "moe_grouped_gemm": True,
+            "moe_token_dispatcher_type": "alltoall",
+        }
+        if is_reference:
+            # Dense gradients use DDP ALL-REDUCE (use_distributed_optimizer=False), so the
+            # reference is a plain full-model replica + all-reduce, not the sharded
+            # reduce-scatter of the distributed optimizer.  Drop the EP-overlap / delayed-wgrad
+            # schedule settings that only apply to the MFSDP v2 overlap run.
+            overrides["use_distributed_optimizer"] = False
+        else:
+            overrides.update(
+                {
+                    "overlap_moe_expert_parallel_comm": True,
+                    "delay_wgrad_compute": True,
+                }
+            )
 
         try:
             model, optimizer = _make_model_and_optimizer(
                 use_mfsdp_v2=use_mfsdp_v2,
-                overrides={
-                    "micro_batch_size": cls.MICRO_BATCH_SIZE,
-                    "global_batch_size": cls.GLOBAL_BATCH_SIZE,
-                    "vocab_size": cls.VOCAB_SIZE,
-                    "padded_vocab_size": cls.VOCAB_SIZE,
-                    "untie_embeddings_and_output_weights": True,
-                    "seq_length": cls.SEQUENCE_LENGTH,
-                    "train_iters": cls.NUM_STEPS,
-                    "expert_model_parallel_size": 2,
-                    "bf16": True,
-                    "data_parallel_sharding_strategy": "optim_grads_params",
-                    "clip_grad": 1.0,
-                    "megatron_fsdp_main_grads_dtype": torch.float32,
-                    "moe_grouped_gemm": True,
-                    "moe_token_dispatcher_type": "alltoall",
-                    "overlap_moe_expert_parallel_comm": True,
-                    "delay_wgrad_compute": True,
-                },
+                overrides=overrides,
             )
 
             num_micro_batches = (
