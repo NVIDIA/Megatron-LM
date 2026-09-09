@@ -43,7 +43,6 @@ def _is_in_backward() -> bool:
 class FsdpContext:
     """Runtime stream and prefetch state shared by FSDP roots constructed together."""
 
-    device: torch.device
     allgather_stream: torch.cuda.Stream
     reduce_scatter_stream: torch.cuda.Stream
     # HFSDP/HSDP need explicit last-microbatch state. First-microbatch state is
@@ -73,7 +72,6 @@ class FsdpContext:
             unify_communication_stream: Whether all-gathers and reduce-scatters share one
                 communication stream to reduce peak transient memory.
         """
-        self.device = device
         self.is_last_microbatch = True
         self.use_symmetric_memory = use_symmetric_memory
         self.unify_communication_stream = unify_communication_stream
