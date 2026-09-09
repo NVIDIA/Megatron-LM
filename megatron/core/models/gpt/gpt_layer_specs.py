@@ -9,7 +9,7 @@ from megatron.core.models.backends import (
     InferenceSpecProvider,
     backend_slot,
     get_backend,
-    get_backend_spec_provider,
+    get_backend_from_config,
     require,
 )
 from megatron.core.models.gpt.moe_module_specs import get_moe_module_spec_for_backend
@@ -695,7 +695,7 @@ def get_gpt_decoder_block_spec(
 
     # The final norm is the same operation as every other norm in the block, so it comes
     # from the same backend rather than from a second selection path.
-    backend = get_backend_spec_provider(
+    backend = get_backend_from_config(
         config, transformer_impl=_base_backend_name(config, use_transformer_engine)
     )
     layer_norm_impl = backend.layer_norm(
@@ -719,7 +719,7 @@ def get_gpt_mtp_block_spec(
     """GPT Multi-Token Prediction (MTP) block spec."""
     # MTP has only ever used the Transformer Engine or the local backend, never the
     # inference one, so it does not go through _base_backend_name().
-    backend: BackendSpecProvider = get_backend_spec_provider(
+    backend: BackendSpecProvider = get_backend_from_config(
         config, transformer_impl="transformer_engine" if use_transformer_engine else "local"
     )
     return get_gpt_mtp_block_spec_for_backend(
@@ -759,7 +759,7 @@ def get_gpt_mtp_block_spec_for_backend(
         mtp_layer_specs = [mtp_layer_spec] * mtp_num_layers
 
     if not config.mtp_use_repeated_layer:
-        offset = get_mtp_layer_offset(config, vp_stage=vp_stage)
+        offset = get_mtp_layer_offset(config, vp_stage=vp_stage, pp_rank=pp_rank)
         # Split the MTP layer specs to only include the layers that are built in this
         # pipeline stage.
         mtp_layer_specs = mtp_layer_specs[offset : offset + num_layers_to_build]

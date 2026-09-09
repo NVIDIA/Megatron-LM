@@ -12,6 +12,7 @@ from unittest.mock import patch
 
 import pytest
 
+from megatron.core.extensions.transformer_engine import te_cross_entropy
 from megatron.core.fusions.fused_cross_entropy import fused_vocab_parallel_cross_entropy
 from megatron.core.fusions.fused_layer_norm import HAVE_FUSED_LAYER_NORM, FusedLayerNorm
 from megatron.core.models.backends import (
@@ -20,10 +21,9 @@ from megatron.core.models.backends import (
     LocalSpecProvider,
     backend_slot,
     get_backend,
-    get_backend_spec_provider,
-    te_cross_entropy,
-    unfused_cross_entropy,
+    get_backend_from_config,
 )
+from megatron.core.tensor_parallel.cross_entropy import unfused_cross_entropy
 from megatron.core.transformer.multi_token_prediction import get_mtp_layer_spec_for_backend
 from megatron.core.transformer.torch_norm import WrappedTorchNorm
 from tests.unit_tests.test_utilities import Utils
@@ -82,18 +82,18 @@ class TestCrossEntropyFollowsTheConfig:
     """Which kernel is a config decision, not a property of the chosen backend."""
 
     def test_no_fusion(self):
-        target = get_backend_spec_provider(_config()).vocab_parallel_cross_entropy()
+        target = get_backend_from_config(_config()).vocab_parallel_cross_entropy()
         assert target is unfused_cross_entropy
 
     def test_native_fusion(self):
-        target = get_backend_spec_provider(
+        target = get_backend_from_config(
             _config(cross_entropy_loss_fusion=True)
         ).vocab_parallel_cross_entropy()
         assert target is fused_vocab_parallel_cross_entropy
 
     def test_an_explicit_te_request_is_not_silently_ignored(self):
         """megatron/training/arguments.py rejects this, but a config built directly can ask."""
-        target = get_backend_spec_provider(
+        target = get_backend_from_config(
             _config(cross_entropy_loss_fusion=True, cross_entropy_fusion_impl="te")
         ).vocab_parallel_cross_entropy()
         assert target is not fused_vocab_parallel_cross_entropy
@@ -102,17 +102,41 @@ class TestCrossEntropyFollowsTheConfig:
     def test_an_unknown_impl_is_refused_rather_than_quietly_downgraded(self):
         """Base raised UnboundLocalError here -- ugly, but not silent."""
         with pytest.raises(ValueError, match="unknown cross_entropy_fusion_impl"):
-            get_backend_spec_provider(
+            get_backend_from_config(
                 _config(cross_entropy_loss_fusion=True, cross_entropy_fusion_impl="TE")
             ).vocab_parallel_cross_entropy()
 
     def test_the_choice_does_not_depend_on_which_backend_supplies_the_model(self):
         settings = dict(cross_entropy_loss_fusion=True, cross_entropy_fusion_impl="native")
-        local = get_backend_spec_provider(_config(**settings)).vocab_parallel_cross_entropy()
-        te = get_backend_spec_provider(
+        local = get_backend_from_config(_config(**settings)).vocab_parallel_cross_entropy()
+        te = get_backend_from_config(
             _config(transformer_impl="transformer_engine", **settings)
         ).vocab_parallel_cross_entropy()
         assert local is te
+
+    def test_full_iteration_graphs_reject_te_older_than_2_7(self):
+        config = _config(
+            cross_entropy_loss_fusion=True,
+            cross_entropy_fusion_impl="te",
+            cuda_graph_impl="full_iteration",
+        )
+        with (
+            patch("megatron.core.models.backends.is_te_min_version", return_value=False),
+            patch("megatron.core.utils.get_te_version", return_value="2.6.0"),
+        ):
+            with pytest.raises(AssertionError, match="TransformerEngine >= 2.7.0"):
+                get_backend_from_config(config).vocab_parallel_cross_entropy()
+
+    @pytest.mark.parametrize("cuda_graph_impl", [None, "full_iteration"])
+    def test_te_receives_the_graph_capture_setting(self, cuda_graph_impl):
+        config = _config(
+            cross_entropy_loss_fusion=True,
+            cross_entropy_fusion_impl="te",
+            cuda_graph_impl=cuda_graph_impl,
+        )
+        with patch("megatron.core.models.backends.is_te_min_version", return_value=True):
+            target = get_backend_from_config(config).vocab_parallel_cross_entropy()
+        assert target.keywords["cuda_graph_capturable"] == (cuda_graph_impl == "full_iteration")
 
 
 class TestBertLmHeadNormDoesNotFollowTransformerImpl:
@@ -232,7 +256,7 @@ class TestDecoderBlockAsksForItsConfigsNorm:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
-    def _final_norm(self, normalization):
+    def _final_norm(self, normalization, transformer_impl="local"):
         from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_block_spec
         from megatron.core.transformer.transformer_config import TransformerConfig
 
@@ -241,7 +265,7 @@ class TestDecoderBlockAsksForItsConfigsNorm:
             hidden_size=16,
             num_attention_heads=1,
             normalization=normalization,
-            transformer_impl="local",
+            transformer_impl=transformer_impl,
             use_cpu_initialization=True,
         )
         return get_gpt_decoder_block_spec(config, use_transformer_engine=False).layer_norm
@@ -251,6 +275,38 @@ class TestDecoderBlockAsksForItsConfigsNorm:
 
     def test_layer_norm_is_unchanged(self):
         assert self._final_norm("LayerNorm") is LocalSpecProvider().layer_norm(rms_norm=False)
+
+    def test_local_layers_override_the_configs_default_te_backend(self):
+        assert (
+            self._final_norm("RMSNorm", transformer_impl="transformer_engine") is WrappedTorchNorm
+        )
+
+
+class TestExperimentalAttentionKeepsKitchen:
+    """The config factory must preserve Kitchen's TE fallback and attention options."""
+
+    def test_kitchen_wraps_the_te_provider(self):
+        from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
+        from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
+            _get_backend_spec_provider,
+        )
+
+        config = _config(
+            transformer_impl="transformer_engine",
+            use_kitchen=True,
+            use_kitchen_attention=True,
+            kitchen_attention_backend="fa",
+        )
+        with (
+            patch("megatron.core.extensions.kitchen.HAVE_KITCHEN", True),
+            patch("megatron.core.extensions.kitchen.KitchenSpecProvider") as kitchen,
+        ):
+            backend = _get_backend_spec_provider(config)
+        assert backend is kitchen.return_value
+        kitchen.assert_called_once()
+        assert isinstance(kitchen.call_args.kwargs["fallback"], TESpecProvider)
+        assert kitchen.call_args.kwargs["use_kitchen_attention"] is True
+        assert kitchen.call_args.kwargs["kitchen_attention_backend"] == "fa"
 
 
 class TestMissingOptionalPackagesAreRefused:

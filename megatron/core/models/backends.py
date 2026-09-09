@@ -14,13 +14,12 @@ from megatron.core.extensions.transformer_engine import (
     TELinear,
     TENorm,
     TERowParallelGroupedLinear,
+    te_cross_entropy,
 )
 from megatron.core.fusions.fused_cross_entropy import (
     fused_vocab_parallel_cross_entropy as _fused_ce,
 )
-from megatron.core.tensor_parallel.cross_entropy import (
-    vocab_parallel_cross_entropy as _reference_ce,
-)
+from megatron.core.tensor_parallel.cross_entropy import unfused_cross_entropy
 from megatron.core.tensor_parallel.inference_layers import (
     InferenceColumnParallelLinear,
     InferenceLayerNormColumnParallelLinear,
@@ -48,19 +47,6 @@ the row max and exponentiate in place, so a caller that needs them afterwards pa
 """
 
 
-def unfused_cross_entropy(
-    logits: torch.Tensor,
-    labels: torch.Tensor,
-    tp_group: Optional[torch.distributed.ProcessGroup] = None,
-) -> torch.Tensor:
-    """Megatron's custom-autograd cross entropy, in target order.
-
-    An adapter only because the kernel's third positional argument is ``label_smoothing``.
-    The fused kernel already matches the target shape and is used directly.
-    """
-    return _reference_ce(logits, labels, tp_group=tp_group)
-
-
 def require(requirement: str, requested_by: str = "This backend", instead: str = "") -> None:
     """Refuse a backend whose optional package is missing or too old.
 
@@ -80,26 +66,6 @@ def require(requirement: str, requested_by: str = "This backend", instead: str =
     if not HAVE_TE:
         message = f"Transformer Engine is not installed, and {requested_by} needs it."
         raise ImportError(f"{message} {instead}".strip())
-
-
-def te_cross_entropy(
-    logits: torch.Tensor,
-    labels: torch.Tensor,
-    tp_group: Optional[torch.distributed.ProcessGroup] = None,
-    *,
-    cuda_graph_capturable: bool = False,
-) -> torch.Tensor:
-    """Transformer Engine's cross entropy, in target order.
-
-    TE's kernel requires a specific label stride, which this adapter supplies rather than
-    leaving to the caller.
-    """
-    from megatron.core.extensions.transformer_engine import te_parallel_cross_entropy
-
-    if te_parallel_cross_entropy is None:
-        raise RuntimeError("Trying to use a TE block when it's not present.")
-    labels = torch.as_strided(labels, labels.size(), (labels.size()[1], 1))
-    return te_parallel_cross_entropy(logits, labels, tp_group, cuda_graph_capturable)
 
 
 def select_cross_entropy(
@@ -201,8 +167,7 @@ class BackendSpecProvider(Protocol):
 class LocalSpecProvider(BackendSpecProvider):
     """Every backend a Megatron-Core-only run uses."""
 
-    #: Megatron Core only, so there is nothing optional to check. A provider that does need an
-    #: optional package names it here and gets the check for free.
+    # No optional package is required for the local backend.
     REQUIRES: Optional[str] = None
 
     def __init__(
@@ -389,23 +354,38 @@ def get_backend(
     use_kitchen: bool = False,
     use_kitchen_attention: bool = False,
     kitchen_attention_backend: str = "sdpa",
-    **settings,
+    use_te_op_fuser: bool = False,
+    cross_entropy_loss_fusion: bool = False,
+    cross_entropy_fusion_impl: str = "native",
+    cuda_graph_impl: str | None = None,
 ) -> BackendSpecProvider:
     """Build the provider for a named backend.
 
-    The whole of backend selection is here: three names, three providers, plus Kitchen layered
-    over whichever was chosen.
+    Kitchen is enabled independently of ``transformer_impl``. It overrides selected
+    operations and delegates the rest to the chosen base provider through ``fallback``.
+    ``use_te_op_fuser`` applies only to the Transformer Engine provider.
     """
     if transformer_impl == "transformer_engine":
         from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
 
-        base: BackendSpecProvider = TESpecProvider(**settings)
+        base: BackendSpecProvider = TESpecProvider(
+            use_te_op_fuser=use_te_op_fuser,
+            cross_entropy_loss_fusion=cross_entropy_loss_fusion,
+            cross_entropy_fusion_impl=cross_entropy_fusion_impl,
+            cuda_graph_impl=cuda_graph_impl,
+        )
     elif transformer_impl == "inference_optimized":
-        settings.pop("use_te_op_fuser", None)
-        base = InferenceSpecProvider(**settings)
+        base = InferenceSpecProvider(
+            cross_entropy_loss_fusion=cross_entropy_loss_fusion,
+            cross_entropy_fusion_impl=cross_entropy_fusion_impl,
+            cuda_graph_impl=cuda_graph_impl,
+        )
     elif transformer_impl == "local":
-        settings.pop("use_te_op_fuser", None)
-        base = LocalSpecProvider(**settings)
+        base = LocalSpecProvider(
+            cross_entropy_loss_fusion=cross_entropy_loss_fusion,
+            cross_entropy_fusion_impl=cross_entropy_fusion_impl,
+            cuda_graph_impl=cuda_graph_impl,
+        )
     else:
         raise ValueError(
             f"unknown transformer_impl='{transformer_impl}'. "
@@ -430,13 +410,15 @@ def get_backend(
     )
 
 
-def get_backend_spec_provider(
+def get_backend_from_config(
     config: object, *, transformer_impl: Optional[str] = None
 ) -> BackendSpecProvider:
     """Build the provider a TransformerConfig asks for.
 
-    ``transformer_impl`` overrides ``config.transformer_impl``, for the callers that build a
-    Transformer Engine spec regardless of what the config says.
+    GPT spec builders also accept ``use_transformer_engine``, which can select local
+    layers while ``config.transformer_impl`` retains its default of ``transformer_engine``.
+    They pass the selected implementation here so the final norm and MTP use the same
+    backend as the layers. Other callers use ``config.transformer_impl`` unchanged.
     """
     impl = transformer_impl or getattr(config, "transformer_impl", None)
     if impl is None:

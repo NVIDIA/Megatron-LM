@@ -233,3 +233,16 @@ def vocab_parallel_cross_entropy(
     return _VocabParallelCrossEntropy.apply(
         vocab_parallel_logits, target, label_smoothing, tp_group
     )
+
+
+def unfused_cross_entropy(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    tp_group: torch.distributed.ProcessGroup | None = None,
+) -> torch.Tensor:
+    """Adapt vocab-parallel cross entropy to the backend target signature.
+
+    Pass the process group by keyword because the kernel's third positional argument
+    is ``label_smoothing``.
+    """
+    return vocab_parallel_cross_entropy(logits, labels, tp_group=tp_group)

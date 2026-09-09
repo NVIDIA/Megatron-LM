@@ -21,6 +21,7 @@ from megatron.core.utils import null_decorator
 try:
     import triton
     import triton.language as tl
+    from triton.language.extra import libdevice
 
     HAVE_TRITON = True
 except ImportError:
@@ -63,10 +64,20 @@ def _squared_relu_with_probs_kernel(
     probs_ptr,
     hidden_size,
     max_rows,
+    clamp_scale,
+    CLAMP: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     NUM_BLOCKS: tl.constexpr,
 ):
-    """Apply squared ReLU and router probabilities in training order."""
+    """Apply squared ReLU and router probabilities in training order.
+
+    With CLAMP set this reproduces training's fused ``weighted_clamped_squared_relu`` bit
+    for bit: the soft-clamped pre-activation and the square both stay in FP32, and the only
+    BF16 round is the final one after the FP32 routing probability is applied.
+
+    Without CLAMP the square is materialized in BF16 first, matching the unclamped
+    ``weighted_squared_relu``, which squares a BF16 ReLU output.
+    """
     pid = tl.program_id(0)
     n_used = tl.load(n_used_ptr)
     if pid >= n_used:
@@ -81,15 +92,168 @@ def _squared_relu_with_probs_kernel(
                     mask = cols < hidden_size
                     value = tl.load(input_ptr + row * hidden_size + cols, mask=mask).to(tl.float32)
                     value = tl.maximum(value, 0.0)
-                    value = (value * value).to(tl.bfloat16)
-                    value = (value.to(tl.float32) * prob).to(tl.bfloat16)
+                    if CLAMP:
+                        value = clamp_scale * libdevice.tanh(value / clamp_scale)
+                    value = value * value
+                    if not CLAMP:
+                        # Unclamped training (weighted_squared_relu) squares a BF16 ReLU
+                        # output, so the BF16 materialization is part of matching it. The
+                        # clamped path stays in FP32 to the single final round instead.
+                        value = value.to(tl.bfloat16).to(tl.float32)
+                    value = (value * prob).to(tl.bfloat16)
                     tl.store(output_ptr + row * hidden_size + cols, value, mask=mask)
 
 
-def squared_relu_with_probs(
+@triton.jit
+def _swiglu_with_probs_kernel(
+    input_ptr,
+    output_ptr,
+    permutation_map_ptr,
+    n_used_ptr,
+    probs_ptr,
+    ffn_size,  # output width; input row width is 2*ffn_size (gate | up)
+    max_rows,
+    BLOCK_SIZE: tl.constexpr,
+    NUM_BLOCKS: tl.constexpr,
+):
+    """Apply gated SiLU (SwiGLU) and router probabilities in training order.
+
+    Matches the training fused weighted-swiglu rounding: SiLU(gate)*up*prob is
+    computed in FP32 with a single BF16 round at the end. Input row width is
+    2*ffn_size: gate = first half, up = second half (megatron chunk
+    convention). Fixed NUM_BLOCKS CTAs iterating rows -> CUDA-graph safe.
+    """
+    pid = tl.program_id(0)
+    n_used = tl.load(n_used_ptr)
+    if pid >= n_used:
+        return
+    two_n = 2 * ffn_size
+
+    for row in tl.range(pid, max_rows, NUM_BLOCKS):
+        if row < n_used:
+            if tl.load(permutation_map_ptr + row) >= 0:
+                prob = tl.load(probs_ptr + row)
+                for offset in tl.range(0, ffn_size, BLOCK_SIZE):
+                    cols = offset + tl.arange(0, BLOCK_SIZE)
+                    mask = cols < ffn_size
+                    gate = tl.load(input_ptr + row * two_n + cols, mask=mask).to(tl.float32)
+                    up = tl.load(input_ptr + row * two_n + ffn_size + cols, mask=mask).to(
+                        tl.float32
+                    )
+                    value = gate * tl.sigmoid(gate) * up * prob
+                    tl.store(output_ptr + row * ffn_size + cols, value.to(tl.bfloat16), mask=mask)
+
+
+def swiglu_with_probs(
     x: torch.Tensor, permutation_map: torch.Tensor, n_used: torch.Tensor, probs: torch.Tensor
 ) -> torch.Tensor:
-    """Match training's BF16 squared-ReLU rounding before the FP32 probability multiply."""
+    """Gated-SiLU counterpart of squared_relu_with_probs (SwiGLU models)."""
+    num_rows, two_ffn = x.shape
+    ffn_size = two_ffn // 2
+    out = torch.empty(num_rows, ffn_size, dtype=x.dtype, device=x.device)
+    block_size = min(triton.next_power_of_2(ffn_size), 1024)
+    num_blocks = min(num_rows, 512)
+    _swiglu_with_probs_kernel[(num_blocks,)](
+        x,
+        out,
+        permutation_map,
+        n_used,
+        probs,
+        ffn_size,
+        num_rows,
+        BLOCK_SIZE=block_size,
+        NUM_BLOCKS=num_blocks,
+    )
+    return out
+
+
+@triton.jit
+def _weighted_silu_mul_bounded_kernel(
+    in_ptr0, in_ptr1, out_ptr0, bound_ptr, xnumel, HALF_N: tl.constexpr, XBLOCK: tl.constexpr
+):
+    """Device-bounded weighted SwiGLU with training-parity rounding.
+
+    The per-element instruction sequence is copied VERBATIM from Inductor's
+    emitted Triton for the training fused weighted-swiglu
+    (bf16 -> fp32 silu(gate) * up * prob -> bf16, single final rounding), so a
+    token's activation bits match the training forward exactly. Elementwise
+    kernels have no cross-element reduction, so only the per-element sequence
+    determines bits; the schedule below is a persistent 1D grid (static launch,
+    CUDA-graph-safe) striding while xoffset < a DEVICE element bound
+    (= valid_tokens * topk * HALF_N — the live prefix of the flat token-major
+    layout). Rows beyond the bound are neither read nor written.
+    """
+    xbound = tl.load(bound_ptr)
+    num_progs = tl.num_programs(0)
+    xoffset = tl.program_id(0) * XBLOCK
+    while xoffset < xbound:
+        xindex = xoffset + tl.arange(0, XBLOCK)[:]
+        xmask = (xindex < xbound) & (xindex < xnumel)
+        x0 = xindex % HALF_N
+        x1 = xindex // HALF_N
+        tmp0 = tl.load(in_ptr0 + (x0 + 2 * HALF_N * x1), xmask).to(tl.float32)
+        tmp8 = tl.load(in_ptr0 + (HALF_N + x0 + 2 * HALF_N * x1), xmask).to(tl.float32)
+        tmp11 = tl.load(in_ptr1 + (x1), xmask, eviction_policy='evict_last')
+        tmp1 = tmp0.to(tl.float32)
+        tmp2 = -tmp1
+        tmp3 = libdevice.exp(tmp2)
+        tmp4 = tl.full([1], 1.0, tl.float32)
+        tmp5 = tmp3 + tmp4
+        tmp6 = tmp1 / tmp5
+        tmp7 = tmp6.to(tl.float32)
+        tmp9 = tmp7 * tmp8
+        tmp10 = tmp9.to(tl.float32)
+        tmp12 = tmp10 * tmp11
+        tmp13 = tmp12.to(tl.float32)
+        tl.store(out_ptr0 + xindex, tmp13, xmask)
+        xoffset += num_progs * XBLOCK
+
+
+def weighted_silu_mul_bounded(
+    y: torch.Tensor,
+    weights_flat: torch.Tensor,
+    bound_elems: torch.Tensor,
+    num_programs: Optional[int] = None,
+    xblock: int = 1024,
+) -> torch.Tensor:
+    """SwiGLU with routing weights applied at the activation (training parity).
+
+    y: [rows, 2*half_n] bf16 (gate | up); weights_flat: [rows] fp32 routing
+    probabilities; bound_elems: device scalar = live_rows * half_n.
+    Returns [rows, half_n] bf16; rows beyond the live bound are untouched.
+
+    num_programs defaults to SMs * 8 waves (Inductor's persistent-grid sizing;
+    1184 on the B200 this was captured from). Grid size cannot affect bits:
+    the kernel is elementwise with each program owning a disjoint strided
+    index range, so it is an occupancy knob only.
+    """
+    rows, two_half_n = y.shape
+    half_n = two_half_n // 2
+    if num_programs is None:
+        # Lazy import: permute.py imports this module at its top level.
+        from megatron.core.inference.moe.permute import _get_num_sms
+
+        num_programs = _get_num_sms(y.device) * 8
+    out = torch.empty(rows, half_n, dtype=y.dtype, device=y.device)
+    _weighted_silu_mul_bounded_kernel[(num_programs,)](
+        y, weights_flat, out, bound_elems, rows * half_n, HALF_N=half_n, XBLOCK=xblock
+    )
+    return out
+
+
+def squared_relu_with_probs(
+    x: torch.Tensor,
+    permutation_map: torch.Tensor,
+    n_used: torch.Tensor,
+    probs: torch.Tensor,
+    clamp_scale: Optional[float] = None,
+) -> torch.Tensor:
+    """Match training's BF16 squared-ReLU rounding before the FP32 probability multiply.
+
+    Args:
+        clamp_scale: config.activation_func_tanh_clamp_scale. If set, precondition the
+            input with the tanh soft clamp ``s * tanh(x / s)``.
+    """
     num_rows, hidden_size = x.shape
     out = torch.empty_like(x)
     block_size = min(triton.next_power_of_2(hidden_size), 1024)
@@ -102,6 +266,8 @@ def squared_relu_with_probs(
         probs,
         hidden_size,
         num_rows,
+        clamp_scale if clamp_scale is not None else 0.0,
+        CLAMP=clamp_scale is not None,
         BLOCK_SIZE=block_size,
         NUM_BLOCKS=num_blocks,
     )

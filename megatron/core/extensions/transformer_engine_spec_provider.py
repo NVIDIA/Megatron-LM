@@ -40,11 +40,8 @@ class _TENormWithResidual:
 class TESpecProvider(BackendSpecProvider):
     """A protocol for providing the submodules used in Spec building."""
 
-    #: The optional package this backend needs. Declared here so there is one place to read
-    #: it from, and checked by ``require`` at the point a caller wants an early, clear
-    #: refusal. It is deliberately *not* checked when the provider is built: a spec may be
-    #: assembled without Transformer Engine installed -- several module-level specs are, at
-    #: import time -- and it is instantiating a TE module that fails.
+    # Checked by require() when a caller needs an early refusal. Spec construction itself
+    # does not require TE, since several module-level specs are assembled at import time.
     REQUIRES = "transformer_engine"
 
     def __init__(

@@ -6,11 +6,10 @@ from typing import Optional, Tuple
 import torch
 from torch import Tensor
 
-from megatron.core import parallel_state
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.models.backends import (
     backend_slot,
-    get_backend_spec_provider,
+    get_backend_from_config,
     select_cross_entropy,
 )
 from megatron.core.pipeline_parallel.utils import (
@@ -27,6 +26,7 @@ from megatron.core.transformer.multi_token_prediction import tie_word_embeddings
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import ensure_metadata_has_dp_cp_group
 from megatron.core.utils import (
+    get_pg_rank,
     get_tensor_model_parallel_group_if_none,
     make_tp_sharded_tensor_for_checkpoint,
 )
@@ -62,15 +62,14 @@ class LanguageModule(MegatronModule):
         self.vp_stage = None
         self.vp_size = self.config.virtual_pipeline_model_parallel_size
         # Choose the cross entropy implementation once, here, rather than on every forward.
-        # Fusion settings, the Transformer Engine version check, and CUDA graph capture are
-        # all resolved inside the backend before the first step runs.
+        # select_cross_entropy checks TE >= 2.7.0 for full-iteration CUDA graphs here.
         self.vocab_parallel_cross_entropy = backend_slot(
-            get_backend_spec_provider(config),
-            "vocab_parallel_cross_entropy",
-            lambda: select_cross_entropy(
-                getattr(config, "cross_entropy_loss_fusion", False),
-                getattr(config, "cross_entropy_fusion_impl", "native"),
-                getattr(config, "cuda_graph_impl", None),
+            backend=get_backend_from_config(config),
+            name="vocab_parallel_cross_entropy",
+            default=lambda: select_cross_entropy(
+                cross_entropy_loss_fusion=getattr(config, "cross_entropy_loss_fusion", False),
+                cross_entropy_fusion_impl=getattr(config, "cross_entropy_fusion_impl", "native"),
+                cuda_graph_impl=getattr(config, "cuda_graph_impl", None),
             ),
         )
 
@@ -488,7 +487,7 @@ class LanguageModule(MegatronModule):
         last_stage_word_emb_replica_id = (
             1,  # copy of first stage embedding
             0,
-            parallel_state.get_data_parallel_rank(with_context_parallel=True),
+            get_pg_rank(metadata['dp_cp_group']),
         )
 
         sharded_state_dict[output_layer_weight_key] = make_tp_sharded_tensor_for_checkpoint(
