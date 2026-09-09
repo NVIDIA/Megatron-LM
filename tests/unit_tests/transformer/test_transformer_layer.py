@@ -101,6 +101,29 @@ class TestParallelTransformerLayer:
         num_weights = sum([p.numel() for p in parallel_transformer_layer.parameters()])
         assert num_weights == 1884
 
+    def test_mtp_flag_is_forwarded_to_attention(self):
+        """All attention builders receive the MTP-layer flag."""
+        config = TransformerConfig(
+            num_layers=2, hidden_size=12, num_attention_heads=4, use_cpu_initialization=True
+        )
+        config.experimental_attention_variant = "gdn"
+        strict_attention_spec = object()
+        submodules = TransformerLayerSubmodules(self_attention=strict_attention_spec)
+        attention_kwargs = {}
+
+        def fake_build_module(spec, *args, **kwargs):
+            if spec is strict_attention_spec:
+                attention_kwargs.update(kwargs)
+            return torch.nn.Identity()
+
+        with patch(
+            "megatron.core.transformer.transformer_layer.build_module",
+            side_effect=fake_build_module,
+        ):
+            TransformerLayer(config, submodules, is_mtp_layer=True)
+
+        assert attention_kwargs["is_mtp_layer"] is True
+
     def test_gpu_forward(self):
         parallel_transformer_layer = self.parallel_transformer_layer
         config: TransformerConfig = parallel_transformer_layer.config

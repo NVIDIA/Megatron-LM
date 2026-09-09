@@ -164,6 +164,7 @@ def test_bf16_flashinfer_nvls_uses_dispatcher_copy_fallback(monkeypatch):
         _fc1_weight=torch.empty(2, 8, 8, dtype=torch.bfloat16),
         _fc2_weight=torch.empty(2, 8, 8, dtype=torch.bfloat16),
         _flashinfer_activation_type=object(),
+        _activation_clamp_scale=None,
         _nvls_dispatcher=True,
         ep_group=SimpleNamespace(size=lambda: 2, rank=lambda: 0),
     )

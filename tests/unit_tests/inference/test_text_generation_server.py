@@ -27,9 +27,17 @@ async def test_server_exposes_multimodal_prompt_config(monkeypatch, provide_conf
             self.blueprints.append(blueprint)
 
     class FakeClient:
-        def __init__(self, address, deserialize):
+        def __init__(
+            self,
+            address,
+            deserialize,
+            block_size_tokens=None,
+            prefix_caching_coordinator_policy=None,
+        ):
             self.address = address
             self.deserialize = deserialize
+            self.block_size_tokens = block_size_tokens
+            self.prefix_caching_coordinator_policy = prefix_caching_coordinator_policy
             self.started = False
             self.stopped = False
             clients.append(self)

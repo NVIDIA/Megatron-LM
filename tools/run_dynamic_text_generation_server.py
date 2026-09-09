@@ -36,10 +36,12 @@ from megatron.core.inference.text_generation_server.dynamic_text_gen_server impo
     start_text_gen_server,
     stop_text_gen_server,
 )
-from megatron.core.inference.text_generation_server.dynamic_text_gen_server.vlm_dynamic_inference import (  # noqa: E402,E501
+from megatron.core.inference.text_generation_server.dynamic_text_gen_server.vlm_dynamic_inference import (
     _detect_vlm_from_checkpoint,
     _print_resolved_args,
     add_vlm_inference_args,
+)
+from megatron.core.inference.text_generation_server.dynamic_text_gen_server.vlm_dynamic_inference import (  # noqa: E402,E501
     get_model as get_vlm_model,
 )
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer  # noqa: E402
@@ -297,6 +299,13 @@ async def run_text_generation_server(
                 default_top_p=default_top_p,
                 default_top_k=default_top_k,
                 eval_mode=eval_mode,
+                # Taken from the engine so the frontend hashes on the same block
+                # boundaries the engine caches on; a mismatch would name blocks it
+                # never held and every routing decision would miss.
+                block_size_tokens=engine.context.block_size_tokens,
+                prefix_caching_coordinator_policy=(
+                    engine.context.prefix_caching_coordinator_policy
+                ),
             )
 
         if getattr(args, 'frontend_on_all_ranks', False):

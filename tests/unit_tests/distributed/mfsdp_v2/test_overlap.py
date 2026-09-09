@@ -8,12 +8,13 @@ import pytest
 import torch
 import torch.distributed as dist
 from torch import nn
-from torch.distributed.device_mesh import DeviceMesh
+from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 from torch.distributed.tensor import Partial, Replicate, Shard
 from torch.profiler import ProfilerActivity, profile
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     Placements,
+    SchedulePolicy,
     fully_shard,
     fully_shard_context,
     fully_shard_optimizer,
@@ -251,3 +252,55 @@ def test_overlaps_communication_and_compute(
 
     # Release the dedicated communicator so it does not leak into the shared session.
     dist.destroy_process_group(dp_group)
+
+
+def test_prefetch_size_zero_disables_allgather_overlap(distributed_setup):
+    """Zero per-module prefetch budgets should launch all-gathers before compute."""
+    world_size = distributed_setup.world_size
+    device = distributed_setup.device
+    if world_size < 2:
+        pytest.skip("This test requires at least 2 ranks.")
+
+    dim = 16384
+    num_children = 4
+    dtype = torch.bfloat16
+    if not dist.is_initialized():
+        dist.init_process_group(backend="nccl")
+    mesh = init_device_mesh(device.type, (world_size,))
+    model = MultiChildModel(dim=dim, num_children=num_children).to(device=device, dtype=dtype)
+    policy = MixedPrecisionPolicy(main_params_dtype=dtype, main_grads_dtype=dtype)
+    placements = _flat_placements()
+    with fully_shard_context(device=device) as context:
+        for layer in model.layers:
+            fully_shard(
+                layer,
+                mesh=mesh,
+                placements=placements,
+                mixed_precision_policy=policy,
+                schedule_policy=SchedulePolicy(forward_prefetch_size=0, backward_prefetch_size=0),
+            )
+
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01, foreach=False)
+    fully_shard_optimizer(optimizer)
+    x = torch.randn(8192, dim, device=device, dtype=dtype, requires_grad=True)
+
+    def train_one_step() -> None:
+        optimizer.zero_grad(set_to_none=True)
+        for microbatch_index in range(2):
+            with microbatch(context, is_last=microbatch_index == 1):
+                model(x).sum().backward()
+        optimizer.step()
+
+    train_one_step()
+    torch.cuda.synchronize(device)
+    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+        train_one_step()
+        torch.cuda.synchronize(device)
+
+    gemm_groups = collect_linked_event_groups(prof, _GEMM_OP_NAME_SUBSTRING)
+    allgather_groups = collect_linked_event_groups(prof, _ALL_GATHER_OP_NAME_SUBSTRING)
+    assert len(allgather_groups) == 4 * num_children
+    assert all(
+        not any(event_groups_overlap(allgather, gemm) for gemm in gemm_groups)
+        for allgather in allgather_groups
+    ), "All-gathers overlapped GEMM compute despite zero prefetch budgets."
