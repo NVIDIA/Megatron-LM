@@ -405,7 +405,7 @@ class FsdpParameterGroup:
         return has_any_grad
 
     def reduce_partial_gradients(
-        self, partial_grad: DBuffer, is_last_microbatch: bool = True
+        self, partial_grad: DBuffer, *, is_last_microbatch: bool
     ) -> None:
         """Reduce a packed partial gradient buffer into sharded parameter gradients.
 
