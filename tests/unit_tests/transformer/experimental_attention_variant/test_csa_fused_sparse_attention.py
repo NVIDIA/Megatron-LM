@@ -654,6 +654,10 @@ def test_real_sbhd_teacher_lse_kernel_matches_bounded_reference():
     torch.testing.assert_close(actual, expected, atol=2e-2, rtol=1e-2)
 
 
+# Disabled in dev (flaky_in_dev) and LTS (flaky) CI because the CI image builds
+# flash_mla with FLASH_MLA_DISABLE_SM90=1. Re-enable once SM90 kernels are included.
+@pytest.mark.flaky
+@pytest.mark.flaky_in_dev
 @pytest.mark.parametrize("num_heads", [1, 2])
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 def test_real_fused_sbhd_forward_backward_matches_native_reference(num_heads):
