@@ -859,7 +859,7 @@ class TestMcoreAdapterHybrid:
             if parameter.grad is None:
                 continue
             # In this model, expert weights live under mlp.experts; router weights are dense.
-            if ".mlp.experts." in name:
+            if "experts" in name:
                 expert_parameters.append((name, parameter))
             else:
                 dense_parameters.append((name, parameter))
