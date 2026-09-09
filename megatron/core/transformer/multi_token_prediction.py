@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import warnings
-from contextlib import nullcontext
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Callable, List, Optional, Union
 
@@ -1426,6 +1426,14 @@ class MultiTokenPredictionLayer(MegatronModule):
                 setattr(self.hc_head_base, "sequence_parallel", True)
                 setattr(self.hc_head_scale, "sequence_parallel", True)
         self.offload_context = nullcontext()
+
+    def get_inner_quantization_context(self) -> AbstractContextManager:
+        """Return the quantization context for fine-grained MTP execution."""
+        if self.config.fp8 and self.config.fp8_recipe != Fp8Recipe.delayed:
+            return get_fp8_context(self.config)
+
+        # FP4 in MTP layers still needs numerical validation.
+        return nullcontext()
 
     def _get_embeddings(
         self,
