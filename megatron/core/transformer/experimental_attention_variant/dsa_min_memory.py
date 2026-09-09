@@ -98,6 +98,7 @@ class _DSATimingProfiler:
 
     @contextmanager
     def record(self, name: str, device: Optional[torch.device] = None):
+        """Time the enclosed block under ``name``, or yield straight through if disabled."""
         if not self.enabled:
             yield
             return
@@ -124,6 +125,7 @@ class _DSATimingProfiler:
             self.records.append((name, (time.perf_counter() - start_time) * 1000.0, None, None))
 
     def log(self, phase: str) -> None:
+        """Print the accumulated per-region timings for ``phase`` and reset them."""
         if not self.enabled or not self.records:
             return
 
@@ -151,6 +153,7 @@ class _DSATimingProfiler:
         parts = " ".join(
             f"{name}={totals[name]:.3f}ms(avg={totals[name]/counts[name]:.3f}ms)" for name in order
         )
+        # pylint: disable=bad-builtin
         print(f"[rank{self.rank}] DSA min-memory {phase}{label}: {parts}", flush=True)
 
         _csv_exclude = {"selected_index_scores_fwd_score_fallback"}
@@ -180,6 +183,7 @@ class _DSATimingProfiler:
                 med = sorted_pairs[len(sorted_pairs) // 2]
                 ft, fc, fo = med["forward"]
                 bt, bc, bo = med["backward"]
+                # pylint: disable=bad-builtin
                 print(
                     f"[rank{self.rank}] CSV (median fwd of {_DSATimingProfiler._MEDIAN_WINDOW}):\n"
                     f"{_csv_header(fo)}\n"
@@ -1155,6 +1159,7 @@ class DSASimplifiedMinMemoryGQAFn(torch.autograd.Function):
         cache_indexer_k: bool = False,
         use_triton: bool = True,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Run the sparse forward, streaming index scores so the full score matrix is never held."""
         profile = _DSATimingProfiler(profile_enabled, profile_rank, profile_label, query.device)
         key_chunk_size = _routing_key_chunk_size(key_chunk_size, key.size(0), use_triton)
         routing_topk_cache = [] if cache_routing else None
@@ -1237,6 +1242,7 @@ class DSASimplifiedMinMemoryGQAFn(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor, grad_indexer_loss: torch.Tensor):
+        """Recompute the tiles the forward streamed, and accumulate their gradients."""
         query, key, value, hidden_states, linear_q_weight, linear_k_weight, cached_k = (
             ctx.saved_tensors
         )
@@ -1831,6 +1837,7 @@ class DSASimplifiedDenseIndexerLossFn(torch.autograd.Function):
         profile_label: str = "",
         use_triton: bool = True,
     ) -> torch.Tensor:
+        """Compute the dense indexer KL loss without materializing the full score matrix."""
         profile = _DSATimingProfiler(profile_enabled, profile_rank, profile_label, query.device)
         with torch.no_grad(), _triton_dispatch_enabled(use_triton):
             with profile.record("dense_indexer_kl_fwd_total", query.device):
@@ -1877,6 +1884,7 @@ class DSASimplifiedDenseIndexerLossFn(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_loss: torch.Tensor):
+        """Recompute the dense score tiles and accumulate the indexer's gradients."""
         query, key, hidden_states, linear_q_weight, linear_k_weight = ctx.saved_tensors
         grad_linear_q_weight = (
             _grad_accumulator(linear_q_weight) if ctx.needs_input_grad[3] else None
