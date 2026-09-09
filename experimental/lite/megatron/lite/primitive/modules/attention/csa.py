@@ -8,10 +8,8 @@ import torch.nn as nn
 
 # Zero-copy imports of the DSv4 THD-CP helpers that live in Megatron Core.
 # The development branch groups them under the csa_utils package.
-from megatron.core.fusions.fused_mla_yarn_rope_apply import fused_mla_rope_out_of_place
 from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
 from megatron.core.transformer.experimental_attention_variant.csa import (
-    _apply_fused_rope,
     _unfused_indexer_sparse_attn_from_topk,
     unfused_compressed_sparse_attn,
 )
@@ -33,18 +31,6 @@ from megatron.lite.primitive.modules.attention.dsa import rotate_activation
 from megatron.lite.primitive.parallel.linear import AccumulatingLinear
 from megatron.lite.primitive.parallel.state import ParallelState
 from megatron.lite.primitive.utils.rotary import _yarn_find_correction_range, _yarn_linear_ramp_mask
-
-
-class _SingleRankGroup:
-    """Stand-in for a process group when CP is off."""
-
-    @staticmethod
-    def rank() -> int:
-        return 0
-
-    @staticmethod
-    def size() -> int:
-        return 1
 
 
 @jit_fuser
@@ -886,12 +872,14 @@ class CompressedSparseAttention(nn.Module):
         cos_thd = cos.squeeze(0)
         sin_thd = sin.squeeze(0)
         nope_dim = self.head_dim - self.rope_head_dim
-        rope_group = cp_group if cp_group is not None else _SingleRankGroup()
-        query_thd = _apply_fused_rope(
-            query_thd, cos_thd, sin_thd, nope_dim, self.rope_head_dim, cu_seqlens, rope_group
+        # DS4 uses contiguous CP shards. The generic Core helper interprets
+        # cp_rank/cp_size as a zigzag shard, so pass the explicit global row
+        # offset through the contiguous-THD helper instead.
+        query_thd = cp_utils.apply_thd_cp_local_rope_fused(
+            query_thd, cos_thd, sin_thd, nope_dim, self.rope_head_dim, cu_seqlens, global_start
         )
-        key_thd = _apply_fused_rope(
-            key_thd, cos_thd, sin_thd, nope_dim, self.rope_head_dim, cu_seqlens, rope_group
+        key_thd = cp_utils.apply_thd_cp_local_rope_fused(
+            key_thd, cos_thd, sin_thd, nope_dim, self.rope_head_dim, cu_seqlens, global_start
         )
         x_thd = x.transpose(0, 1).contiguous()  # (total, 1, hidden)
         qr_thd = q_low.transpose(0, 1).contiguous()  # (total, 1, q_lora_rank)
@@ -920,17 +908,15 @@ class CompressedSparseAttention(nn.Module):
         )
         # context: (total, 1, np * hn).
         context = context.squeeze(1).view(seq_len, self.num_heads, self.head_dim)
-        context = fused_mla_rope_out_of_place(
+        context = cp_utils.apply_thd_cp_local_rope_fused(
             context,
             cos_thd,
             sin_thd,
             nope_dim,
             self.rope_head_dim,
             cu_seqlens,
-            rope_group.rank(),
-            rope_group.size(),
+            global_start,
             inverse=True,
-            remove_interleaving=True,
         )
         grouped = context.view(
             1, seq_len, self.config.o_groups, self.num_heads_per_group * self.head_dim
