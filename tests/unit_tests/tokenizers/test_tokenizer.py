@@ -565,9 +565,7 @@ def test_sft_tokenizer_target_masking(prompt_format, expect_masked_tokens):
     ]
 
     tokens, targets = tokenizer.tokenize_conversation(
-        conversation,
-        return_target=True,
-        add_generation_prompt=False,
+        conversation, return_target=True, add_generation_prompt=False
     )
     sft_tokenizer = tokenizer._tokenizer
     expected_targets = np.asarray(tokens).copy()
