@@ -2,12 +2,14 @@
 import logging
 from collections import namedtuple
 from functools import partial
+from itertools import chain
 from typing import List, Optional
 
 import torch
 
 from megatron.core import tensor_parallel
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
+from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.models.gpt import GPTModel
@@ -73,6 +75,8 @@ class LLaVAModel(MegatronModule):
         vision_projection_type (str): Type of the vision projection. Default: 2-layer MLP.
         allow_missing_vision_projection_checkpoint (bool): Allow vision projection weights to be
             missing when loading a checkpoint. Default False.
+        allow_llm_only_checkpoint (bool): Load language weights from an LLM-only distributed
+            checkpoint and leave multimodal modules initialized locally. Default False.
         parallel_output (bool): Keep outputs split across tensor parallel ranks.
             This is typically True for training and False for inference.
         share_embeddings_and_output_weights (bool): Input embedding and output layer share weights.
@@ -111,6 +115,7 @@ class LLaVAModel(MegatronModule):
         vision_projection_layer_spec: ModuleSpec,
         vision_projection_type: str = "mlp",
         allow_missing_vision_projection_checkpoint: bool = False,
+        allow_llm_only_checkpoint: bool = False,
         parallel_output: bool = True,
         share_embeddings_and_output_weights: bool = False,
         language_position_embedding_type: str = 'learned_absolute',
@@ -182,6 +187,7 @@ class LLaVAModel(MegatronModule):
         self.tensor_model_parallel_size_lm = language_transformer_config.tensor_model_parallel_size
         # Used by finalize_model_grads._allreduce_word_embedding_grads.
         self.share_embeddings_and_output_weights = share_embeddings_and_output_weights
+        self._allow_llm_only_checkpoint = allow_llm_only_checkpoint
 
         # Audio/video/image attributes.
         self.image_token_index = image_token_index
@@ -493,6 +499,16 @@ class LLaVAModel(MegatronModule):
             self.vision_model.register_load_state_dict_post_hook(
                 _load_state_dict_hook_ignore_extra_state
             )
+            if allow_llm_only_checkpoint:
+                vision_model_param_names = [
+                    f"vision_model.{name}"
+                    for name, _ in chain(
+                        self.vision_model.named_parameters(), self.vision_model.named_buffers()
+                    )
+                ]
+                self.vision_model.register_load_state_dict_post_hook(
+                    partial(_load_state_dict_hook_ignore_param_names, vision_model_param_names)
+                )
 
             vision_encoder_output_size = getattr(
                 self.vision_model, 'out_hidden_size', vision_transformer_config.hidden_size
@@ -513,7 +529,7 @@ class LLaVAModel(MegatronModule):
             # This should be disabled by default but can be enabled if your checkpoint contains
             # pretrained vision and language models but not the projection from vision model
             # outputs to language model inputs.
-            if allow_missing_vision_projection_checkpoint:
+            if allow_missing_vision_projection_checkpoint or allow_llm_only_checkpoint:
                 vision_projection_param_names = [
                     f"vision_projection.{name}"
                     for name in self.vision_projection.state_dict().keys()
@@ -554,6 +570,23 @@ class LLaVAModel(MegatronModule):
         if self.add_decoder:
             return self.language_model.shared_embedding_or_output_weight()
         return None
+
+    def sharded_state_dict(self, prefix: str = '', sharded_offsets: tuple = (), metadata=None):
+        """Build a sharded state dict, optionally targeting an LLM-only checkpoint."""
+        sharded_state_dict = super().sharded_state_dict(prefix, sharded_offsets, metadata)
+
+        if self._allow_llm_only_checkpoint and (metadata or {}).get(
+            'load_from_llm_only_checkpoint', False
+        ):
+            multimodal_prefixes = tuple(
+                f'{prefix}{module_name}.' for module_name in ('vision_model', 'vision_projection')
+            )
+            for key in list(sharded_state_dict):
+                if key.startswith(multimodal_prefixes):
+                    del sharded_state_dict[key]
+            apply_prefix_mapping(sharded_state_dict, {f'{prefix}language_model.': prefix})
+
+        return sharded_state_dict
 
     def set_input_tensor(self, input_tensor) -> None:
         """Set model chunk input tensor."""
