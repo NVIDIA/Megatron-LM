@@ -31,18 +31,12 @@ SELECTOR_TIMEOUT_SECONDS = 300
 SAFE_DOCUMENTATION_SUFFIXES = {".gif", ".jpeg", ".jpg", ".md", ".png", ".rst", ".svg"}
 HIGH_IMPACT_PATTERNS = (
     ".github/**",
-    ".gitlab/**",
-    ".coveragerc",
     "docker/**",
     "megatron/__init__.py",
     "megatron/**/__init__.py",
     # MegatronTokenizer loads backends with importlib, outside the static graph.
     "megatron/core/tokenizers/**",
     "pyproject.toml",
-    "pytest.ini",
-    "requirements*.txt",
-    "requirements/**",
-    "setup.cfg",
     "setup.py",
     "tests/test_utils/python_scripts/launch_nemo_run_workload.py",
     "tests/test_utils/python_scripts/recipe_parser.py",
@@ -55,7 +49,6 @@ HIGH_IMPACT_PATTERNS = (
     "tests/unit_tests/find_test_cases.py",
     "tests/unit_tests/run_ci_test.sh",
     "tests/unit_tests/selective_test_guard.py",
-    "tox.ini",
     "uv.lock",
 )
 UNSAFE_SELECTOR_OUTPUT = re.compile(
