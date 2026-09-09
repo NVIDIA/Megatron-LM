@@ -38,7 +38,7 @@ tests/
 │   │   │   │       └── golden_values_{env}_{platform}.json
 │   │   │   └── transformer/moe/{test_case}/
 │   │   ├── ckpt_converter/               # external tool scenario bundle
-│   │   └── *-nemo_*/                     # external NeMo scenario bundles
+│   │   └── gpt-nemo/                     # external NeMo scenario bundles
 │   ├── shell_test_utils/                # shared shell runners
 │   └── python_test_utils/               # shared output validation
 └── test_utils/
@@ -50,9 +50,9 @@ tests/
 
 Package directories under `functional_tests/test_cases/` mirror `megatron/`.
 Each scenario keeps its config, scripts, and golden values together in a named
-subdirectory. Scenario directories, including the external checkpoint-converter
-and NeMo bundles directly under `test_cases/`, are exceptions to package
-mirroring. GPT and Mixtral scenarios live under `core/models/gpt/`; hybrid and
+subdirectory. Scenario directories, the external `ckpt_converter/` bundle, and
+the original `gpt-nemo/` hierarchy are exceptions to package mirroring.
+GPT and Mixtral scenarios live under `core/models/gpt/`; hybrid and
 Nemotron scenarios live under `core/models/hybrid/`; MoE scenarios and the
 `moe_perf/` bundle live under `core/transformer/moe/`. Shared Python and shell
 helpers remain in

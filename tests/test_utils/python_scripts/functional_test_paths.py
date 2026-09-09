@@ -17,7 +17,7 @@ MODEL_DIRECTORIES = {
     "multimodal-llava": "core/models/multimodal",
     "t5": "core/models/T5",
     "moe": "core/transformer/moe",
-    "gpt-nemo": "",
+    "gpt-nemo": "gpt-nemo",
 }
 COMMON_DIRECTORIES = {
     "ckpt_converter": "ckpt_converter",
