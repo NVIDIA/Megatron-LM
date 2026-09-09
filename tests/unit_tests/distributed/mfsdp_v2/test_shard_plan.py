@@ -3,7 +3,7 @@
 """
 Pure CPU tests for the shard-planning and owner-compute packing logic.
 
-These tests exercise `ShardPlan.from_layout`, `assign_owner_work`, `OwnerGatherPlan.pack`,
+These tests exercise `ParameterLayout.from_layout`, `assign_owner_work`, `OwnerGatherPlan.pack`,
 `OwnerGatherPlan.reconstruct_full`, `OwnerScatterPlan.pack`, and `OwnerScatterPlan.unpack` without a
 process group or any `torch.distributed` dependency. P2P communication is simulated in-process by
 `_simulate_p2p`.
@@ -17,19 +17,19 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.layout import
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.shard_plan import (
     OwnerGatherPlan,
     OwnerScatterPlan,
-    ShardPlan,
+    ParameterLayout,
     assign_owner_work,
 )
 
 
-def _ns_cost(num_ns_steps: int) -> Callable[[ShardPlan], int]:
+def _ns_cost(num_ns_steps: int) -> Callable[[ParameterLayout], int]:
     """Cost function matching the Newton-Schulz orthogonalization estimate.
 
     `numel * (min(rows, cols) * num_steps + 1)` – used by the tests to exercise the greedy balancer
     with a non-trivial cost.
     """
 
-    def cost_fn(plan: ShardPlan) -> int:
+    def cost_fn(plan: ParameterLayout) -> int:
         rows, cols = plan.full_shape
         short_dim = min(rows, cols)
         return plan.full_numel() * (short_dim * num_ns_steps + 1)
@@ -54,7 +54,7 @@ def _layout(shapes, offsets, size) -> GlobalLayout:
 def test_compute_shard_plan_even_split():
     """A matrix exactly divisible by dp_size splits evenly across ranks."""
     layout = _layout([(8, 4)], [0], 32)
-    plan = ShardPlan.from_layout(layout, tensor_index=0, dp_size=2)
+    plan = ParameterLayout.from_layout(layout, tensor_index=0, dp_size=2)
     assert plan.full_shape == torch.Size((8, 4))
     assert plan.row_size == 4
     assert plan.rank_rows == ((0, 4), (4, 4))
@@ -67,7 +67,7 @@ def test_compute_shard_plan_boundary_param_split_across_ranks():
     # 6 rows, 3 cols; each rank's flat shard is 9 elements (= 3 rows). rank0 owns flat [0,9), rank1
     # owns [9,18). Tensor occupies [0,18) fully.
     layout = _layout([(6, 3)], [0], 18)
-    plan = ShardPlan.from_layout(layout, tensor_index=0, dp_size=2)
+    plan = ParameterLayout.from_layout(layout, tensor_index=0, dp_size=2)
     assert plan.rank_rows == ((0, 3), (3, 3))
     assert plan.is_boundary()
 
@@ -77,7 +77,7 @@ def test_compute_shard_plan_fully_local_param_on_one_rank():
     # 4 rows, 2 cols = 8 elements. rank0 shard = [0,12), rank1 = [12,24). Tensor at offset 0 with 8
     # elements fits entirely in rank0.
     layout = _layout([(4, 2)], [0], 24)
-    plan = ShardPlan.from_layout(layout, tensor_index=0, dp_size=2)
+    plan = ParameterLayout.from_layout(layout, tensor_index=0, dp_size=2)
     assert plan.rank_rows == ((0, 4), (0, 0))
     assert not plan.is_boundary()
     assert plan.owner_candidates() == (0,)
@@ -87,7 +87,7 @@ def test_compute_shard_plan_empty_rank_has_zero_rows():
     """A rank whose flat shard does not overlap the tensor owns zero rows."""
     # Tensor at offset 12 (entirely in rank1). rank0 gets (0,0).
     layout = _layout([(4, 3)], [12], 24)
-    plan = ShardPlan.from_layout(layout, tensor_index=0, dp_size=2)
+    plan = ParameterLayout.from_layout(layout, tensor_index=0, dp_size=2)
     assert plan.rank_rows == ((0, 0), (0, 4))
     assert plan.is_boundary() is False
     assert plan.owner_candidates() == (1,)
@@ -101,8 +101,8 @@ def test_compute_shard_plan_empty_rank_has_zero_rows():
 def test_assign_owner_work_balances_by_cost():
     """Owners are balanced so the cheapest eligible rank takes each parameter."""
     # Two boundary params, all four ranks eligible for each.
-    plan0 = ShardPlan(torch.Size((8, 8)), ((0, 4), (0, 4), (0, 4), (0, 4)), 8)  # cost 64*41
-    plan1 = ShardPlan(torch.Size((4, 4)), ((0, 2), (0, 2), (0, 2), (0, 2)), 4)  # cost 16*21
+    plan0 = ParameterLayout(torch.Size((8, 8)), ((0, 4), (0, 4), (0, 4), (0, 4)), 8)  # cost 64*41
+    plan1 = ParameterLayout(torch.Size((4, 4)), ((0, 2), (0, 2), (0, 2), (0, 2)), 4)  # cost 16*21
     # Greedy min running cost: first param -> rank0 (cost 2624), second -> rank1 (cost 336).
     owners = assign_owner_work([plan0, plan1], _ns_cost(5))
     assert owners == {0: 0, 1: 1}
@@ -111,8 +111,8 @@ def test_assign_owner_work_balances_by_cost():
 def test_assign_owner_work_only_eligible_ranks_can_own():
     """A rank with an empty shard can never be the owner."""
     # Only ranks 0 and 2 have shards for both params.
-    plan0 = ShardPlan(torch.Size((8, 8)), ((0, 4), (0, 0), (0, 4), (0, 0)), 8)
-    plan1 = ShardPlan(torch.Size((8, 8)), ((0, 4), (0, 0), (0, 4), (0, 0)), 8)
+    plan0 = ParameterLayout(torch.Size((8, 8)), ((0, 4), (0, 0), (0, 4), (0, 0)), 8)
+    plan1 = ParameterLayout(torch.Size((8, 8)), ((0, 4), (0, 0), (0, 4), (0, 0)), 8)
     owners = assign_owner_work([plan0, plan1], _ns_cost(5))
     assert all(owners[i] in (0, 2) for i in owners)
     # Two equal-cost params split across the two eligible ranks.
@@ -121,7 +121,7 @@ def test_assign_owner_work_only_eligible_ranks_can_own():
 
 def test_assign_owner_work_skips_non_boundary():
     """Non-boundary parameters stay on their original rank – no assignment needed."""
-    plan = ShardPlan(torch.Size((4, 2)), ((0, 4), (0, 0)), 2)
+    plan = ParameterLayout(torch.Size((4, 2)), ((0, 4), (0, 0)), 2)
     owners = assign_owner_work([plan], _ns_cost(3))
     assert owners == {}
 
@@ -154,8 +154,8 @@ def test_pack_and_reconstruct_round_trip():
     # Two params, both boundary, shapes (6,3) and (4,2). Owners: param0->rank0, param1->rank1.
     layout0 = _layout([(6, 3)], [0], 18)
     layout1 = _layout([(4, 2)], [0], 8)
-    plan0 = ShardPlan.from_layout(layout0, tensor_index=0, dp_size=dp_size)
-    plan1 = ShardPlan.from_layout(layout1, tensor_index=0, dp_size=dp_size)
+    plan0 = ParameterLayout.from_layout(layout0, tensor_index=0, dp_size=dp_size)
+    plan1 = ParameterLayout.from_layout(layout1, tensor_index=0, dp_size=dp_size)
     plans = [plan0, plan1]
     owners = {0: 0, 1: 1}
 
@@ -191,8 +191,8 @@ def test_pack_and_unpack_result_round_trip():
     dp_size = 2
     layout0 = _layout([(6, 3)], [0], 18)
     layout1 = _layout([(4, 2)], [0], 8)
-    plan0 = ShardPlan.from_layout(layout0, tensor_index=0, dp_size=dp_size)
-    plan1 = ShardPlan.from_layout(layout1, tensor_index=0, dp_size=dp_size)
+    plan0 = ParameterLayout.from_layout(layout0, tensor_index=0, dp_size=dp_size)
+    plan1 = ParameterLayout.from_layout(layout1, tensor_index=0, dp_size=dp_size)
     plans = [plan0, plan1]
     owners = {0: 0, 1: 1}
 
@@ -245,7 +245,7 @@ def test_from_layout_per_rank_data_not_uniform():
     #   rank 1: [8, 16)  -> 8 elements -> 2 rows
     #   rank 2: [16, 24) -> 4 elements -> 1 row  (4 elements of padding)
     layout = _layout([(5, 4)], [0], 24)
-    plan = ShardPlan.from_layout(layout, tensor_index=0, dp_size=3)
+    plan = ParameterLayout.from_layout(layout, tensor_index=0, dp_size=3)
     assert plan.rank_rows == ((0, 2), (2, 2), (4, 1))
     assert plan.shard_numel(0) == 8
     assert plan.shard_numel(1) == 8

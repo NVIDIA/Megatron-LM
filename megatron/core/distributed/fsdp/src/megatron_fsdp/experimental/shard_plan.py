@@ -3,10 +3,10 @@
 """
 Pure shard-planning and owner-compute packing logic for MFSDP v2's all-`Flat` layout.
 
-The central data structure is `ShardPlan`, which describes how a single 2D parameter's full matrix
-is split across the DP group under MFSDP v2's all-`Flat` layout. Given shard plans,
+The central data structure is `ParameterLayout`, which describes how a single 2D parameter's full
+matrix is split across the DP group under MFSDP v2's all-`Flat` layout. Given shard plans,
 `assign_owner_work` balances owner-compute work across owner ranks using a caller-supplied cost
-function. `ShardPlan.from_layout` builds a plan from DBuffer layout metadata,
+function. `ParameterLayout.from_layout` builds a plan from DBuffer layout metadata,
 `OwnerGatherPlan.pack`/`OwnerScatterPlan.pack` build the flat P2P send/recv buffers,
 `OwnerGatherPlan.reconstruct_full` stitches gathered shards back into the full matrix on the owner,
 and `OwnerScatterPlan.unpack` extracts received result shards.
@@ -22,7 +22,7 @@ from .layout import GlobalLayout, non_leading_numel
 
 
 @dataclasses.dataclass(frozen=True)
-class ShardPlan:
+class ParameterLayout:
     """How a single 2D parameter's full matrix is split across the DP group.
 
     MFSDP v2's all-`Flat` layout shards dim-0 rows contiguously in rank order, so rank `r` owns the
@@ -42,12 +42,12 @@ class ShardPlan:
 
     def __post_init__(self) -> None:
         if len(self.full_shape) != 2:
-            raise ValueError(f"ShardPlan requires a 2D full_shape, got {self.full_shape}.")
+            raise ValueError(f"ParameterLayout requires a 2D full_shape, got {self.full_shape}.")
         if len(self.rank_rows) == 0:
-            raise ValueError("ShardPlan requires at least one rank.")
+            raise ValueError("ParameterLayout requires at least one rank.")
         if self.row_size != non_leading_numel(self.full_shape):
             raise ValueError(
-                f"ShardPlan row_size {self.row_size} != full_shape row size "
+                f"ParameterLayout row_size {self.row_size} != full_shape row size "
                 f"{non_leading_numel(self.full_shape)}."
             )
 
@@ -67,11 +67,11 @@ class ShardPlan:
         rank_flat_shard_size = layout.size // dp_size
 
         if len(full_shape) != 2:
-            raise ValueError(f"ShardPlan.from_layout requires a 2D shape, got {full_shape}.")
+            raise ValueError(f"ParameterLayout.from_layout requires a 2D shape, got {full_shape}.")
         row_size = non_leading_numel(full_shape)
         if row_size <= 0:
             raise ValueError(
-                f"ShardPlan.from_layout requires non-empty rows, got shape {full_shape}."
+                f"ParameterLayout.from_layout requires non-empty rows, got shape {full_shape}."
             )
         tensor_end = tensor_flat_offset + full_shape.numel()
 
@@ -127,7 +127,7 @@ class ShardPlan:
 
 
 def assign_owner_work(
-    plans: Sequence[ShardPlan], cost_fn: Callable[[ShardPlan], float]
+    plans: Sequence[ParameterLayout], cost_fn: Callable[[ParameterLayout], float]
 ) -> dict[int, int]:
     """Assign one owner rank to each boundary parameter, balanced by cost.
 
@@ -184,7 +184,7 @@ class OwnerGatherPlan:
     param_1: torch.Tensor
     # Params are in this order as observed by MFSDP.
     model.param_groups == [{"params": [param_0, param_1]}]
-    # Both params are owned by rank 1 (was previously determined using `ShardPlan`s).
+    # Both params are owned by rank 1 (was previously determined using `ParameterLayout`s).
     param_0.owner == 1
     param_1.owner == 1
 
@@ -243,7 +243,7 @@ class OwnerGatherPlan:
     @classmethod
     def pack(
         cls,
-        plans: Sequence[ShardPlan],
+        plans: Sequence[ParameterLayout],
         owners: dict[int, int],
         local_shards: Sequence[torch.Tensor],
         dp_size: int,
@@ -314,7 +314,7 @@ class OwnerGatherPlan:
     def reconstruct_full(
         self,
         param_index: int,
-        plan: ShardPlan,
+        plan: ParameterLayout,
         recv_buffers: dict[int, torch.Tensor],
         owner_rank: int,
     ) -> torch.Tensor:
@@ -371,7 +371,7 @@ class OwnerScatterPlan:
     def pack(
         cls,
         full_results: dict[int, torch.Tensor],
-        plans: Sequence[ShardPlan],
+        plans: Sequence[ParameterLayout],
         owners: dict[int, int],
         dp_size: int,
         this_rank: int,
