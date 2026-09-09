@@ -8,11 +8,6 @@ from typing import List, Optional
 import click
 import yaml
 
-if __package__:
-    from .functional_test_paths import functional_test_case_dir
-else:
-    from functional_test_paths import functional_test_case_dir
-
 BASE_PATH = pathlib.Path(__file__).parent.resolve()
 
 logger = logging.getLogger(__name__)
@@ -47,6 +42,54 @@ LEGACY_SCOPE_ALIASES = {
     "nightly": ("L2", ["nightly"]),
     "weekly": ("L3", ["weekly"]),
 }
+
+
+FUNCTIONAL_TEST_ROOT = pathlib.Path("tests/functional_tests/test_cases")
+
+MODEL_DIRECTORIES = {
+    "bert": "core/models/bert",
+    "gpt": "core/models/gpt",
+    "mixtral": "core/models/gpt",
+    "hybrid": "core/models/hybrid",
+    "nemotron": "core/models/hybrid",
+    "mimo": "core/models/mimo",
+    "multimodal-llava": "core/models/multimodal",
+    "t5": "core/models/T5",
+    "moe": "core/transformer/moe",
+    "gpt-nemo": "gpt-nemo",
+}
+COMMON_DIRECTORIES = {
+    "ckpt_converter": "ckpt_converter",
+    "moe_perf": "core/transformer/moe/moe_perf",
+}
+
+
+def functional_test_case_dir(
+    model: str, test_case: str, repo_root: pathlib.Path | None = None
+) -> pathlib.Path:
+    """Return a case directory relative to the repository root.
+
+    Model and case names remain the identifiers used by recipes and CI artifacts.
+    Prefer the package-based layout, while supporting checkouts that still have
+    the old layout (for example, when bisecting older commits).
+
+    Args:
+        model: Logical model family from the recipe or CI job.
+        test_case: Scenario name from the recipe or CI job.
+        repo_root: Checkout to inspect; defaults to this module's checkout.
+    """
+    repo_root = BASE_PATH.parents[2] if repo_root is None else pathlib.Path(repo_root)
+    legacy_path = FUNCTIONAL_TEST_ROOT / model / test_case
+    if model == "common" and test_case in COMMON_DIRECTORIES:
+        path = FUNCTIONAL_TEST_ROOT / COMMON_DIRECTORIES[test_case]
+    elif model in MODEL_DIRECTORIES:
+        path = FUNCTIONAL_TEST_ROOT / MODEL_DIRECTORIES[model] / test_case
+    else:
+        return legacy_path
+
+    if not (repo_root / path).is_dir() and (repo_root / legacy_path).is_dir():
+        return legacy_path
+    return path
 
 
 def _resolve_scope_alias(scope_value: str) -> str:

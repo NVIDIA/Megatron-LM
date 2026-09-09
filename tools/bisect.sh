@@ -45,19 +45,20 @@ for sha in "${CHERRYPICK_SHAS[@]}"; do
    git cherry-pick "${sha}"
 done
 
-if [[ -f tests/test_utils/python_scripts/functional_test_paths.py ]]; then
-    GOLDEN_DIR=$(python - "${MODEL}" "${TESTCASE}" <<'PY'
+GOLDEN_DIR=$(python - "${MODEL}" "${TESTCASE}" <<'PY'
+import pathlib
 import sys
 
-from tests.test_utils.python_scripts.functional_test_paths import functional_test_case_dir
+from tests.test_utils.python_scripts import recipe_parser
 
-print(functional_test_case_dir(sys.argv[1], sys.argv[2]))
+# Historical commits may predate the package-directory resolver.
+resolve_path = getattr(recipe_parser, "functional_test_case_dir", None)
+if resolve_path is None:
+    print(pathlib.Path("tests/functional_tests/test_cases") / sys.argv[1] / sys.argv[2])
+else:
+    print(resolve_path(sys.argv[1], sys.argv[2]))
 PY
-    )
-else
-    # Historical commits keep their test bundles under the logical model name.
-    GOLDEN_DIR="tests/functional_tests/test_cases/${MODEL}/${TESTCASE}"
-fi
+)
 
 python -m tests.test_utils.python_scripts.generate_local_jobs --environment dev --scope mr
 

@@ -21,7 +21,6 @@ from jetclient.facades.objects import log as jet_log
 from jetclient.services.dtos.pipeline import PipelineStatus
 
 from tests.test_utils.python_scripts import recipe_parser
-from tests.test_utils.python_scripts.functional_test_paths import functional_test_case_dir
 
 BASE_PATH = pathlib.Path(__file__).parent.resolve()
 DASHBOARD_ENDPOINT = os.getenv("DASHBOARD_ENDPOINT")
@@ -445,7 +444,9 @@ def main(
     logger.info("Started")
 
     model_config_path = (
-        BASE_PATH.parents[2] / functional_test_case_dir(model, test_case) / "model_config.yaml"
+        BASE_PATH.parents[2]
+        / recipe_parser.functional_test_case_dir(model, test_case)
+        / "model_config.yaml"
     )
 
     if model_config_path.exists():

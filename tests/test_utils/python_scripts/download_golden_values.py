@@ -13,9 +13,9 @@ import gitlab
 import requests
 
 if __package__:
-    from .functional_test_paths import functional_test_case_dir
+    from .recipe_parser import functional_test_case_dir
 else:
-    from functional_test_paths import functional_test_case_dir
+    from recipe_parser import functional_test_case_dir
 
 BASE_PATH = pathlib.Path(__file__).parent.resolve()
 PROJECT_ID = int(os.getenv("CI_PROJECT_ID", 19378))
