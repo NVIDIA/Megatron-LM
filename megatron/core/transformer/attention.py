@@ -801,7 +801,10 @@ class Attention(MegatronModule, ABC):
             cache_seqlens=sequence_len_offset,
             rotary_interleaved=rotary_interleaved,
         )
-        softcap = self._get_inference_softcap()
+        # This path bypasses self.core_attention and calls flash-attention directly, so the
+        # configured cap has to be passed here too. Only when set, so runs without softcapping
+        # keep their current call signature on older flash-attention builds.
+        softcap = self.config.attn_logit_softcapping
         if softcap is not None:
             assert is_fa_min_version(
                 "2.6.0"
@@ -815,17 +818,6 @@ class Attention(MegatronModule, ABC):
         else:
             out = flash_attn_with_kvcache(**kv_kwargs)
         return out
-
-    def _get_inference_softcap(self) -> Optional[float]:
-        """Return the attention logit softcap for the direct flash-attention paths.
-
-        The inference paths bypass ``self.core_attention`` and call flash-attention
-        directly, so the configured cap has to be plumbed back out here. Returns None
-        when softcapping is disabled; callers that build a kwargs dict omit the kwarg
-        entirely in that case, so runs without softcapping keep their existing call
-        signatures and older flash-attention builds are unaffected.
-        """
-        return self.config.attn_logit_softcapping
 
     def _get_inference_softmax_offset(self) -> Optional[Tensor]:
         """Return the per-head sink (off-by-one / learnable) softmax logit, or None.
@@ -966,7 +958,7 @@ class Attention(MegatronModule, ABC):
             "softmax_scale": softmax_scale,
             "causal": True,
             "attention_chunk": 0,
-            "softcap": self._get_inference_softcap() or 0.0,
+            "softcap": self.config.attn_logit_softcapping or 0.0,
             "window_size": window_size,
             "window_size_left": window_size[0],
             "window_size_right": window_size[1],
@@ -1107,7 +1099,7 @@ class Attention(MegatronModule, ABC):
                 softmax_scale = self.softmax_scale
             else:
                 softmax_scale = q.shape[-1] ** -0.5
-            softcap = self._get_inference_softcap()
+            softcap = self.config.attn_logit_softcapping
             softcap_kwargs = {} if softcap is None else {"softcap": softcap}
             if use_fa4:
                 output_total, softmax_lse = flash_attn4_varlen_func(
@@ -1208,7 +1200,7 @@ class Attention(MegatronModule, ABC):
                     "FlashMLA decode kernel does not support sliding window attention. "
                     "Set config.window_size = None or use a non-MLA attention layer."
                 )
-                assert self._get_inference_softcap() is None, (
+                assert self.config.attn_logit_softcapping is None, (
                     "FlashMLA decode kernel does not support attention logit softcapping. "
                     "Set config.attn_logit_softcapping = None or use a non-MLA attention layer."
                 )
@@ -1251,7 +1243,7 @@ class Attention(MegatronModule, ABC):
                         softmax_scale = q.shape[-1] ** -0.5
                     # Reshape q from (B, S, H, D) to (B*S, H, D) for varlen interface
                     q_varlen = q.reshape(-1, q.shape[-2], q.shape[-1])
-                    decode_softcap = self._get_inference_softcap()
+                    decode_softcap = self.config.attn_logit_softcapping
                     softcap_kwargs = {} if decode_softcap is None else {"softcap": decode_softcap}
                     output_total, softmax_lse = flash_attn4_varlen_func(
                         q_varlen,
@@ -1293,7 +1285,7 @@ class Attention(MegatronModule, ABC):
                         "page_table" if use_fa3 else "block_table": block_table,
                         "num_splits": 0 if not self.batch_invariant_mode else 1,
                     }
-                    decode_softcap = self._get_inference_softcap()
+                    decode_softcap = self.config.attn_logit_softcapping
                     if decode_softcap is not None:
                         flash_attn_args["softcap"] = decode_softcap
                     if need_lse:
