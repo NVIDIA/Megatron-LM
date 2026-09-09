@@ -116,6 +116,11 @@ For new configuration objects, prefer dataclasses with typed fields. Put a
 docstring immediately after each public configuration field, following
 [TransformerConfig](megatron/core/transformer/transformer_config.py).
 
+Keep each configuration dataclass specific to the component it configures. Avoid
+catch-all configurations that mix unrelated concerns or carry arbitrary option
+dictionaries. Share a base configuration only when its fields have the same meaning
+across the components that use it.
+
 Make required values explicit where the existing inheritance/API permits it.
 Choose meaningful defaults and explain sentinel values such as `None` or `0`.
 Use `field(default_factory=...)` for mutable defaults. Validate invalid values and
