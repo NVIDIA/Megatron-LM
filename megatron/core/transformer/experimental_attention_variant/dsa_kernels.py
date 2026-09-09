@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Optional, Tuple
 from torch import Tensor
 
 from megatron.core.transformer.enums import AttnBackend, AttnMaskType
+from megatron.core.utils import filter_kwargs_for_callable
 
 if TYPE_CHECKING:
     from megatron.core.packed_seq_params import PackedSeqParams
@@ -74,6 +75,33 @@ def _log_declined_hook(config: TransformerConfig, hook_name: str, reason: str) -
     )
 
 
+def _packed_layout_hook_kwargs(
+    fn,
+    *,
+    varlen_is_plain_causal: bool,
+    packed_thd_causal_identity_layout: bool,
+    packed_thd_single_sequence: bool,
+    opaque_fallback_names: Tuple[str, ...] = (),
+):
+    """Offer CP-independent layout facts only to hooks that declare support."""
+    return filter_kwargs_for_callable(
+        fn,
+        {
+            "varlen_is_plain_causal": varlen_is_plain_causal,
+            "packed_thd_causal_identity_layout": packed_thd_causal_identity_layout,
+            "packed_thd_single_sequence": packed_thd_single_sequence,
+        },
+        signature_unavailable_fallback=opaque_fallback_names,
+    )
+
+
+def _legacy_packed_cp_flags(
+    *, cp_size: int, use_local_indexer_varlen: bool, single_packed_thd_sequence: bool
+) -> Tuple[bool, bool]:
+    """Return packed-layout backend hook flags with their CP-only contract."""
+    return (use_local_indexer_varlen and cp_size > 1, single_packed_thd_sequence and cp_size > 1)
+
+
 def _resolve_fused_hook(config: TransformerConfig, hook_name: str):
     """Return the selected backend's ``hook_name`` callable, or None if unavailable.
 
@@ -114,11 +142,22 @@ def run_fused_qk_topk(
     local_packed_cp_query_len: Optional[int] = None,
     packed_seq_params: Optional[PackedSeqParams] = None,
     cp_size: int = 1,
+    varlen_is_plain_causal: bool = False,
 ) -> Optional[Tuple[Tensor, Optional[Tensor]]]:
-    """Optional fused indexer hook for backend-specific implementations."""
+    """Optional fused indexer hook for backend-specific implementations.
+
+    ``single_packed_thd_sequence`` and ``use_local_indexer_varlen`` are CP-only
+    backend kwargs. CP-independent layout facts are offered as optional,
+    signature-filtered kwargs.
+    """
     fn = _resolve_fused_hook(config, "run_fused_qk_topk")
     if fn is None:
         return None
+    legacy_local_varlen, legacy_single_sequence = _legacy_packed_cp_flags(
+        cp_size=cp_size,
+        use_local_indexer_varlen=use_local_indexer_varlen,
+        single_packed_thd_sequence=single_packed_thd_sequence,
+    )
     result = fn(
         q=q,
         k=k,
@@ -128,13 +167,19 @@ def run_fused_qk_topk(
         ends=ends,
         block_size=block_size,
         use_relu=use_relu,
-        use_local_indexer_varlen=use_local_indexer_varlen,
-        single_packed_thd_sequence=single_packed_thd_sequence,
+        use_local_indexer_varlen=legacy_local_varlen,
+        single_packed_thd_sequence=legacy_single_sequence,
         local_packed_cp_rank=local_packed_cp_rank,
         local_packed_cp_query_start=local_packed_cp_query_start,
         local_packed_cp_query_len=local_packed_cp_query_len,
         packed_seq_params=packed_seq_params,
         cp_size=cp_size,
+        **_packed_layout_hook_kwargs(
+            fn,
+            varlen_is_plain_causal=varlen_is_plain_causal,
+            packed_thd_causal_identity_layout=use_local_indexer_varlen,
+            packed_thd_single_sequence=single_packed_thd_sequence,
+        ),
     )
     if result is None:
         _log_declined_hook(config, "run_fused_qk_topk", "backend returned None")
@@ -165,11 +210,21 @@ def run_fused_qk_topk_with_loss(
     local_packed_cp_query_len: Optional[int] = None,
     packed_seq_params: Optional[PackedSeqParams] = None,
     cp_size: int = 1,
+    varlen_is_plain_causal: bool = False,
 ) -> Optional[Tuple[Tensor, Optional[Tensor], Tensor]]:
-    """Optional fused indexer+loss hook for backend-specific implementations."""
+    """Optional fused indexer+loss hook for backend-specific implementations.
+
+    Packed-layout backend kwargs are CP-only; CP-independent facts use optional,
+    signature-filtered kwargs.
+    """
     fn = _resolve_fused_hook(config, "run_fused_qk_topk_with_loss")
     if fn is None:
         return None
+    legacy_local_varlen, legacy_single_sequence = _legacy_packed_cp_flags(
+        cp_size=cp_size,
+        use_local_indexer_varlen=use_local_indexer_varlen,
+        single_packed_thd_sequence=single_packed_thd_sequence,
+    )
     result = fn(
         config=config,
         q=q,
@@ -187,13 +242,19 @@ def run_fused_qk_topk_with_loss(
         query_valid_rows=query_valid_rows,
         calculate_per_token_loss=calculate_per_token_loss,
         use_relu=use_relu,
-        use_local_indexer_varlen=use_local_indexer_varlen,
-        single_packed_thd_sequence=single_packed_thd_sequence,
+        use_local_indexer_varlen=legacy_local_varlen,
+        single_packed_thd_sequence=legacy_single_sequence,
         local_packed_cp_rank=local_packed_cp_rank,
         local_packed_cp_query_start=local_packed_cp_query_start,
         local_packed_cp_query_len=local_packed_cp_query_len,
         packed_seq_params=packed_seq_params,
         cp_size=cp_size,
+        **_packed_layout_hook_kwargs(
+            fn,
+            varlen_is_plain_causal=varlen_is_plain_causal,
+            packed_thd_causal_identity_layout=use_local_indexer_varlen,
+            packed_thd_single_sequence=single_packed_thd_sequence,
+        ),
     )
     if result is None:
         _log_declined_hook(config, "run_fused_qk_topk_with_loss", "backend returned None")
@@ -251,10 +312,19 @@ def run_fused_dsa_attention(
     local_packed_cp_query_len: Optional[int] = None,
     pg_collection: Optional[ProcessGroupCollection] = None,
 ) -> Optional[Tuple[Tensor, Tensor]]:
-    """Optional full fused DSA hook for backends that fuse indexer and attention together."""
+    """Optional full fused DSA hook for backends that fuse indexer and attention together.
+
+    Packed-layout backend kwargs are CP-only; CP-independent facts use optional,
+    signature-filtered kwargs.
+    """
     fn = _resolve_fused_hook(config, "run_fused_dsa_attention")
     if fn is None:
         return None
+    legacy_local_varlen, legacy_single_sequence = _legacy_packed_cp_flags(
+        cp_size=cp_size,
+        use_local_indexer_varlen=use_local_indexer_varlen,
+        single_packed_thd_sequence=single_packed_thd_sequence,
+    )
     result = fn(
         config=config,
         query=query,
@@ -277,10 +347,17 @@ def run_fused_dsa_attention(
         varlen_ends=varlen_ends,
         key_positions=key_positions,
         query_valid_rows=query_valid_rows,
-        varlen_is_plain_causal=varlen_is_plain_causal,
+        **_packed_layout_hook_kwargs(
+            fn,
+            varlen_is_plain_causal=varlen_is_plain_causal,
+            packed_thd_causal_identity_layout=use_local_indexer_varlen,
+            packed_thd_single_sequence=single_packed_thd_sequence,
+            # The full-hook contract includes this kwarg even for opaque callables.
+            opaque_fallback_names=("varlen_is_plain_causal",),
+        ),
         use_relu=use_relu,
-        use_local_indexer_varlen=use_local_indexer_varlen,
-        single_packed_thd_sequence=single_packed_thd_sequence,
+        use_local_indexer_varlen=legacy_local_varlen,
+        single_packed_thd_sequence=legacy_single_sequence,
         local_packed_cp_rank=local_packed_cp_rank,
         local_packed_cp_query_start=local_packed_cp_query_start,
         local_packed_cp_query_len=local_packed_cp_query_len,

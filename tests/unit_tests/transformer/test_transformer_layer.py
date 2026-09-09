@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 
+import copy
 import gc
 
 import pytest
@@ -26,6 +27,7 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import (
     HyperConnectionTransformerLayer,
     TransformerLayer,
+    TransformerLayerSubmodules,
     get_transformer_layer_offset,
 )
 from megatron.core.utils import is_te_min_version
@@ -108,6 +110,23 @@ class TestParallelTransformerLayer:
 
         num_weights = sum([p.numel() for p in parallel_transformer_layer.parameters()])
         assert num_weights == 1884
+
+    def test_dynamic_cp_passes_cp_comm_type_at_configured_cp1(self):
+        seen = {}
+
+        class RecordingAttention(torch.nn.Module):
+            def __init__(self, *, cp_comm_type=None, **_kwargs):
+                super().__init__()
+                seen["cp_comm_type"] = cp_comm_type
+
+        config = copy.deepcopy(self.parallel_transformer_layer.config)
+        config.context_parallel_size = 1
+        config.dynamic_context_parallel = True
+        config.cp_comm_type = "all_gather"
+
+        TransformerLayer(config, TransformerLayerSubmodules(self_attention=RecordingAttention))
+
+        assert seen["cp_comm_type"] == "all_gather"
 
     def test_split_branch_norms_join_mhc_recompute_manager(self, monkeypatch):
         """Explicit norms in split hybrid branches use the unified mHC manager."""

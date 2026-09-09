@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import os
 import time
@@ -50,6 +50,93 @@ def test_divide_properly():
 def test_divide_improperly():
     with pytest.raises(AssertionError):
         util.divide(4, 5)
+
+
+@pytest.mark.parametrize(
+    ("device", "expected_non_blocking"),
+    [(torch.device("cpu"), False), (torch.device("cuda"), True)],
+)
+def test_move_host_tensor_to_device(device, expected_non_blocking):
+    values = mock.Mock()
+    moved = object()
+    values.to.return_value = moved
+
+    assert util.move_host_tensor_to_device(values, device) is moved
+    values.to.assert_called_once_with(device, non_blocking=expected_non_blocking)
+
+
+@pytest.fixture
+def clear_callable_kwarg_signature_cache():
+    util._CALLABLE_KWARG_SIGNATURE_CACHE.clear()
+    yield
+    util._CALLABLE_KWARG_SIGNATURE_CACHE.clear()
+
+
+def test_filter_kwargs_for_callable_inspects_signature_once(
+    monkeypatch, clear_callable_kwarg_signature_cache
+):
+    inspected = []
+    original_signature = util.inspect.signature
+
+    def target(*, supported=False):
+        return supported
+
+    def track_signature(func):
+        inspected.append(func)
+        return original_signature(func)
+
+    monkeypatch.setattr(util.inspect, "signature", track_signature)
+    candidates = {"supported": True, "unsupported": True}
+
+    assert util.filter_kwargs_for_callable(target, candidates) == {"supported": True}
+    assert util.filter_kwargs_for_callable(target, candidates) == {"supported": True}
+    assert inspected == [target]
+
+
+def test_filter_kwargs_for_callable_keeps_only_keyword_capable_parameters(
+    clear_callable_kwarg_signature_cache,
+):
+    def target(positional_only, /, positional_or_keyword=None, *, keyword_only=None):
+        return positional_only, positional_or_keyword, keyword_only
+
+    candidates = {
+        "positional_only": 1,
+        "positional_or_keyword": 2,
+        "keyword_only": 3,
+        "unsupported": 4,
+    }
+
+    assert util.filter_kwargs_for_callable(target, candidates) == {
+        "positional_or_keyword": 2,
+        "keyword_only": 3,
+    }
+
+
+def test_filter_kwargs_for_callable_keeps_all_for_var_keyword(clear_callable_kwarg_signature_cache):
+    def target(**kwargs):
+        return kwargs
+
+    candidates = {"first": 1, "second": 2}
+
+    assert util.filter_kwargs_for_callable(target, candidates) == candidates
+
+
+@pytest.mark.parametrize("exception_type", [TypeError, ValueError])
+def test_filter_kwargs_for_callable_uses_signature_unavailable_fallback(
+    monkeypatch, clear_callable_kwarg_signature_cache, exception_type
+):
+    def target(**kwargs):
+        return kwargs
+
+    def fail_signature(_func):
+        raise exception_type("signature unavailable")
+
+    monkeypatch.setattr(util.inspect, "signature", fail_signature)
+    candidates = {"legacy": 1, "new": 2}
+
+    assert util.filter_kwargs_for_callable(
+        target, candidates, signature_unavailable_fallback=(name for name in ("legacy",))
+    ) == {"legacy": 1}
 
 
 @pytest.mark.skipif(not util.HAVE_PACKAGING, reason="packaging is not installed")
