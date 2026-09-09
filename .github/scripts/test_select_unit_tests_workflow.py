@@ -183,6 +183,32 @@ Path(args[args.index('--summary') + 1]).write_text('Full suite' if full else 'Se
                 if environment.get("TEST_LABEL_FAILURE"):
                     self.assertEqual(outputs["selective_label_present"], "unknown")
 
+    def test_selection_and_image_build_are_independent_prerequisites_of_execution(self):
+        jobs = self.workflow["jobs"]
+
+        def ancestors(job):
+            pending = list(jobs[job].get("needs", []))
+            seen = set()
+            while pending:
+                dependency = pending.pop()
+                if dependency not in seen:
+                    seen.add(dependency)
+                    pending.extend(jobs[dependency].get("needs", []))
+            return seen
+
+        selection = "cicd-parse-unit-tests"
+        build = "cicd-container-build"
+        execution = "cicd-unit-tests-latest"
+        self.assertNotIn(build, ancestors(selection))
+        self.assertNotIn(selection, ancestors(build))
+        for job in (selection, build):
+            self.assertIn("cicd-wait-in-queue", ancestors(job))
+            self.assertIn(job, ancestors(execution))
+            self.assertIn(f"needs.{job}.result == 'success'", jobs[execution]["if"])
+        source_sha = jobs[build]["with"]["source-sha"]
+        self.assertEqual(self._step(selection, "Checkout")["with"]["ref"], source_sha)
+        self.assertEqual(self._step(execution, "Checkout")["with"]["ref"], source_sha)
+
     def test_selection_compares_entire_pr_and_keeps_the_tested_merge_checkout(self):
         base = self._merge_commit()
         tested_merge = self._git("rev-parse", "HEAD")

@@ -732,6 +732,7 @@ jobs:
       source-sha: ${{ needs.configure.outputs.sha }}
       lts: ${{ needs.configure.outputs.lts == 'true' }}
 
+  # CPU-only selection uses its own Python environment and can overlap the image build.
   cicd-parse-unit-tests:
     runs-on: ubuntu-latest
     outputs:
@@ -740,12 +741,10 @@ jobs:
       - pre-flight
       - configure
       - cicd-wait-in-queue
-      - cicd-container-build
     if: |
       needs.pre-flight.result != 'cancelled'
       && needs.configure.result != 'cancelled'
       && needs.cicd-wait-in-queue.result != 'cancelled'
-      && needs.cicd-container-build.result != 'cancelled'
       && (
         success()
         || needs.pre-flight.outputs.is_ci_workload == 'true'
@@ -896,7 +895,7 @@ jobs:
       && needs.pre-flight.result != 'cancelled'
       && needs.configure.result != 'cancelled'
       && needs.cicd-wait-in-queue.result != 'cancelled'
-      && needs.cicd-container-build.result != 'cancelled'
+      && needs.cicd-container-build.result == 'success'
       && needs.cicd-parse-unit-tests.result == 'success'
       && (
         success()

@@ -14,6 +14,10 @@ CI authorization. `Run full unit tests` overrides selection and requests the
 full suite when both labels are present.
 The existing GB200 hardware-specific marker suite remains enabled separately.
 
+Test selection runs on a CPU runner alongside the Docker image build, using its
+own Python environment. It adds no packages to the GPU image. The GPU test jobs
+wait for both the selection plan and a successful image build before starting.
+
 The baseline covers basic setup, model-parallel configuration, process groups,
 rank utilities, shared utilities, tensor-parallel cross entropy, transformer
 configuration, GPT construction, and checkpoint mappings. Edit the JSON list to
