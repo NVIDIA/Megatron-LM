@@ -785,8 +785,11 @@ class TestMegatronNetworkArgumentGeneration:
             self._parser().parse_args(["--mhc-fused-backend", "cuda"])
 
     def test_train_full_dataset_flag(self):
-        assert self._parser().parse_args([]).train_full_dataset is False
-        assert self._parser().parse_args(["--train-full-dataset"]).train_full_dataset
+        from megatron.training.arguments import _add_training_args
+
+        parser = _add_training_args(ArgumentParser(exit_on_error=False))
+        assert parser.parse_args([]).train_full_dataset is False
+        assert parser.parse_args(["--train-full-dataset"]).train_full_dataset
 
 
 def test_sft_loss_log_mode_argument():

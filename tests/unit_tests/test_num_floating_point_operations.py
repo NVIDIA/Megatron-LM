@@ -542,9 +542,11 @@ class TestPackedSequenceStatsAccumulator:
         stats = consume_packed_sequence_stats_in_iteration()
 
         lengths = torch.tensor([100, 150, 25, 200], dtype=torch.float64)
-        assert stats["packed_sequence/total_tokens"] == lengths.sum().item()
-        assert stats["packed_sequence/trained_tokens"] == 6.0
-        assert stats["packed_sequence/original_samples"] == 4.0
+        # Each rank contributes these samples; the consumer reports global totals.
+        world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+        assert stats["packed_sequence/total_tokens"] == lengths.sum().item() * world_size
+        assert stats["packed_sequence/trained_tokens"] == 6.0 * world_size
+        assert stats["packed_sequence/original_samples"] == 4.0 * world_size
         assert stats["packed_sequence/original_sample_length_min"] == 25.0
         assert stats["packed_sequence/original_sample_length_mean"] == lengths.mean().item()
         assert stats["packed_sequence/original_sample_length_max"] == 200.0
