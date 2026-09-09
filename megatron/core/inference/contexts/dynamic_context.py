@@ -56,11 +56,12 @@ from megatron.core.utils import divide as core_divide
 from megatron.core.utils import get_pg_rank, get_pg_size, internal_api
 
 from .attention_context.mamba_metadata import MambaMetadata
-from .attention_context.mha_metadata import GraphedMHAMetadata, NonGraphedMHAMetadata
+from .attention_context.mha_metadata import GraphedMHAMetadata, MHAMetadata, NonGraphedMHAMetadata
 from .base_context import BaseInferenceContext
 from .gpu_view import ContextGPUView
 from .kv_block_allocator import KVBlockAllocator
 from .mamba_slot_allocator import MAX_INTERMEDIATE_OFFSETS_PER_REQUEST, MambaSlotAllocator
+from .mtp_metadata import MTPMetadata
 from .routing_metadata import RoutingMetadata
 
 # These callbacks are currently consumed only by the Dynamo frontend.
@@ -503,7 +504,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         # for the repeated MTP draft attention. Main KV position i and MTP KV position i are
         # position-aligned and MTP length <= main length, so the MTP layer reuses main's block
         # table; only its per-request length offset is tracked separately. The MTP forward routes
-        # its append/read to this slot via the `_mtp_forward_active` flag (see
+        # its append/read to this slot via the `mtp.forward_active` flag (see
         # append_key_value_cache / key_value_cache), so no attention-layer renumbering is needed.
         #
         # Always on wherever it is implementable -- there is no opt-in flag. The draft KV is an
@@ -541,11 +542,6 @@ class DynamicInferenceContext(BaseInferenceContext):
             and getattr(model_config, "mtp_use_repeated_layer", False)
             and mtp_head_is_single_attention
         )
-        self._mtp_forward_active = False
-        # Whether the current MTP draft loop is replaying captured CUDA graphs (True) or running
-        # eager (False). Seeded by `_mtp_begin_decode` from the main decode step's graph decision;
-        # `_mtp_setup_decode_step` reads it to route to graph vs non-graph attention metadata.
-        self._mtp_graphed = False
         if self.enable_mtp_kv_cache:
             self.mtp_kv_layer_slot = self.num_attention_layers
             self.num_attention_layers += 1
@@ -792,6 +788,18 @@ class DynamicInferenceContext(BaseInferenceContext):
             max_requests=self.max_requests,
             block_size_tokens=self.block_size_tokens,
             max_seqlen=self.max_sequence_length,
+        )
+
+        # MTP draft-loop metadata. Inert unless `enable_mtp_kv_cache`; its buffers are reserved
+        # by `initialize_all_tensors` so no tensor is allocated during construction.
+        self.mtp_metadata = MTPMetadata(
+            enabled=self.enable_mtp_kv_cache,
+            max_requests=self.max_requests,
+            max_kv_block_count=self.max_kv_block_count,
+            block_size_tokens=self.block_size_tokens,
+            dummy_block_idx=self.kv_block_allocator.dummy_block_idx,
+            # Matches the `mha_block_table` view in ContextGPUView.
+            block_table_dtype=torch.int32,
         )
 
         self.moe_enable_routing_replay = model_config.moe_enable_routing_replay
@@ -1630,6 +1638,11 @@ class DynamicInferenceContext(BaseInferenceContext):
                 dtype=self.params_dtype,
             )
 
+        # MTP draft-loop scratch: fixed-address buffers updated in place by every MTP forward.
+        self.mtp_metadata.allocate(
+            device=torch.cuda.current_device(), block_table_template=self.request_to_kv_block_ids
+        )
+
         # Reset tensor-related metadata.
         self.reset_metadata()
 
@@ -1709,6 +1722,8 @@ class DynamicInferenceContext(BaseInferenceContext):
                 value = getattr(self, key)
                 if isinstance(value, torch.Tensor):
                     delattr(self, key)
+            # The MTP scratch buffers hang off `self.mtp_metadata`, so the sweep above misses them.
+            self.mtp_metadata.deallocate()
 
     @classmethod
     def round_up_tokens(cls, value, tp_size=None):
@@ -1861,7 +1876,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             key (Tensor): Key tensor.
             value (Tensor): Value tensor.
         """
-        if self._mtp_forward_active:
+        if self.mtp_metadata.forward_active:
             # Redirect the MTP draft attention to its reserved KV-buffer slot regardless of the
             # inner layer's layer_number (which reuses decoder numbering for router/aux-loss).
             attention_layer_number = self.mtp_kv_layer_slot
@@ -1918,7 +1933,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             (Tuple[Tensor, Tensor, Tensor]) The key and value pointer tensors that point
             to blocks within the block-level memory buffer as well as the block table.
         """
-        if self._mtp_forward_active:
+        if self.mtp_metadata.forward_active:
             attention_layer_number = self.mtp_kv_layer_slot
         else:
             attention_layer_number = self.layer_map[layer_number - 1]
@@ -1960,7 +1975,49 @@ class DynamicInferenceContext(BaseInferenceContext):
     # positions + block table; `_mtp_setup_decode_step` populates the write maps + MHA read
     # metadata for one depth; `_mtp_advance_decode_step` bumps the positions; `_mtp_end_decode`
     # restores non-MTP mode. RoPE is assumed absent (v1).
+    #
+    # Every MTP forward — decode depth or varlen commit pass — prepares the same three pieces of
+    # state, so they share one interface, which the step setups below call in order:
+    #   1. `mtp.write_token_maps`      : per-token KV write destinations (where this forward's
+    #                                    K/V lands), from (row, position) pairs + a block table.
+    #   2. `mtp.write_mha_metadata`    : per-request MHA read metadata (query/kv lengths, their
+    #                                    cumulative sums, block table), plus padded-row sentinels.
+    #   3. `_mtp_activate_attn_metadata`: pick the graphed vs eager metadata object, publish the
+    #                                    sequence-length bounds and token counts for the step.
+    # The step setups differ only in how they derive the (row, position) pairs and the per-request
+    # lengths. Everything persistent lives in `self.mtp_metadata` (:class:`MTPMetadata`), whose
+    # buffers are allocated once and updated in place, so no draft depth allocates metadata tensors.
     # ------------------------------------------------------------------
+    def _mtp_activate_attn_metadata(
+        self,
+        graphed: bool,
+        padded_request_count: int,
+        max_seqlen_q: int,
+        max_seqlen_k: int,
+        token_count: int,
+        padded_token_count: int,
+    ) -> MHAMetadata:
+        """Publish the attention metadata for one MTP forward and return the active MHA object.
+
+        The buffer writes above target the fixed-address `gpu_view` buffers that the append/attend
+        kernels read; those buffers are shared by the graphed and non-graphed MHA metadata objects,
+        so a captured MTP graph replays correctly against whatever positions were just written.
+        Only the metadata object selected here, the sequence-length bounds, and the token counts
+        vary per step.
+        """
+        attn_metadata = self.graph_attn_metadata if graphed else self.non_graph_attn_metadata
+        mha = attn_metadata["mha_metadata"]
+        mha.set_state_data(
+            padded_active_request_count=padded_request_count,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+        )
+        self.active_attn_metadata = attn_metadata
+        self.active_token_count = token_count
+        self.padded_active_token_count = padded_token_count
+        self._using_cuda_graph_this_step = graphed
+        return mha
+
     def _mtp_begin_decode(
         self,
         active_request_count: int,
@@ -1979,16 +2036,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         attention metadata so the captured KV-aware MTP graph is replayed.
         """
         assert self.enable_mtp_kv_cache
-        self._mtp_graphed = graphed
         active_slice = slice(self.paused_request_count, self.total_request_count)
-        device = self.gpu_view.token_to_block_idx.device
-        self._mtp_active_request_count = active_request_count
-        self._mtp_padded_count = padded_count
-        # Depth-0 write positions on the GPU, advanced per depth. Clone so the advance does not
-        # mutate the caller's tensor.
-        self._mtp_offsets_gpu = (
-            start_positions[:active_request_count].to(device, non_blocking=True).to(torch.int32)
-        ).clone()
         # Block table for the active requests. MUST use the PRE-REWIND snapshot: the MTP draft
         # loop writes D+1 speculative positions (up to committed-1+D), which extend past the
         # accepted range into blocks that `_rewind_kv_cache` releases (and clears to -1) when a
@@ -1997,16 +2045,17 @@ class DynamicInferenceContext(BaseInferenceContext):
         # The pre-rewind table (captured right after the main forward, before rewind) still holds
         # every block the main model allocated for its own D+1 forward positions.
         block_table_src = (
-            self._mtp_prerewind_block_table
-            if getattr(self, "_mtp_prerewind_block_table", None) is not None
+            self.mtp_metadata.prerewind_block_table
+            if self.mtp_metadata.prerewind_block_table is not None
             else self.request_to_kv_block_ids
         )
-        self._mtp_block_table_gpu = (
-            block_table_src[active_slice][:active_request_count]
-            .to(device, non_blocking=True)
-            .to(self.gpu_view.mha_block_table.dtype)
+        self.mtp_metadata.begin_decode(
+            active_request_count=active_request_count,
+            padded_count=padded_count,
+            start_positions=start_positions,
+            block_table_src=block_table_src[active_slice],
+            graphed=graphed,
         )
-        self._mtp_forward_active = True
 
     def _mtp_begin_decode_for_capture(self, padded_count: int) -> None:
         """Set up synthetic (safe) graphed MTP decode metadata for CUDA-graph CAPTURE at warmup.
@@ -2018,19 +2067,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         bounds (padded_count, max_seqlen) matter, and those match the runtime graphed step.
         """
         assert self.enable_mtp_kv_cache
-        device = self.gpu_view.token_to_block_idx.device
-        self._mtp_active_request_count = padded_count
-        self._mtp_padded_count = padded_count
-        self._mtp_offsets_gpu = torch.zeros(padded_count, dtype=torch.int32, device=device)
-        max_blocks = self.gpu_view.mha_block_table.shape[1]
-        self._mtp_block_table_gpu = torch.full(
-            (padded_count, max_blocks),
-            self.kv_block_allocator.dummy_block_idx,
-            dtype=self.gpu_view.mha_block_table.dtype,
-            device=device,
-        )
-        self._mtp_graphed = True
-        self._mtp_forward_active = True
+        self.mtp_metadata.begin_decode_for_capture(padded_count)
 
     def _mtp_snapshot_prerewind_block_table(self) -> None:
         """Capture the block table before `_rewind_kv_cache` releases draft blocks.
@@ -2039,85 +2076,54 @@ class DynamicInferenceContext(BaseInferenceContext):
         reuses this snapshot so its speculative writes/reads land on the blocks the main model
         allocated for its own base+draft forward, not on blocks rewind has since released.
         """
-        if self.enable_mtp_kv_cache:
-            self._mtp_prerewind_block_table = self.request_to_kv_block_ids.clone()
+        self.mtp_metadata.snapshot_prerewind_block_table(self.request_to_kv_block_ids)
 
     def _mtp_setup_decode_step(self) -> None:
         """Populate token write maps + MHA read metadata for one MTP draft depth."""
-        gv = self.gpu_view
-        device = gv.token_to_block_idx.device
-        n = self._mtp_active_request_count
-        padded = self._mtp_padded_count
-        block_size = self.block_size_tokens
+        mtp = self.mtp_metadata
+        n = mtp.active_request_count
+        padded = mtp.padded_count
 
-        positions = self._mtp_offsets_gpu  # [n] int, MTP write position P_r for this depth
-        block_within = (positions // block_size).to(torch.long)
-        local = positions % block_size
-        rows = torch.arange(n, device=device)
+        positions = mtp.active_offsets  # [n] int, MTP write position P_r for this depth
 
-        # Token write maps (one token per active request).
-        gv.token_to_block_idx[:n] = self._mtp_block_table_gpu[rows, block_within].to(
-            gv.token_to_block_idx.dtype
+        # Token write maps (one token per active request), padded rows sent to the dummy block.
+        mtp.write_token_maps(
+            gpu_view=self.gpu_view,
+            rows=mtp.row_ids[:n],
+            positions=positions,
+            block_table=mtp.active_block_table,
+            padded_token_count=padded,
         )
-        gv.token_to_local_position_within_kv_block[:n] = local.to(
-            gv.token_to_local_position_within_kv_block.dtype
-        )
-        gv.token_to_request_idx[:n] = rows.to(gv.token_to_request_idx.dtype)
-        gv.token_to_position_in_request[:n] = positions.to(gv.token_to_position_in_request.dtype)
-        gv.token_to_pos_ids[:n] = positions.to(gv.token_to_pos_ids.dtype)
 
         # MHA read metadata: query_length=1 per request, kv_length = P_r + 1 (write-then-attend).
-        kv_len = positions + 1
-        gv.mha_query_lengths[:n] = 1
-        gv.mha_cu_query_seq_lengths[: n + 1] = torch.arange(
-            0, n + 1, device=device, dtype=gv.mha_cu_query_seq_lengths.dtype
+        query_lengths, kv_len = mtp.stage_decode_lengths()
+        mtp.write_mha_metadata(
+            gpu_view=self.gpu_view,
+            query_lengths=query_lengths,
+            kv_lengths=kv_len,
+            block_table=mtp.active_block_table,
+            padded_request_count=padded,
         )
-        gv.mha_kv_seq_lengths[:n] = kv_len.to(gv.mha_kv_seq_lengths.dtype)
-        gv.mha_cu_kv_seq_lengths[0] = 0
-        gv.mha_cu_kv_seq_lengths[1 : n + 1] = torch.cumsum(kv_len, dim=0).to(
-            gv.mha_cu_kv_seq_lengths.dtype
-        )
-        gv.mha_block_table[:n] = self._mtp_block_table_gpu
 
-        # Zero/sentinel-pad the padding rows so padded slots never index real KV.
-        if padded > n:
-            gv.token_to_block_idx[n:padded] = self.kv_block_allocator.dummy_block_idx
-            gv.token_to_local_position_within_kv_block[n:padded] = 0
-            gv.mha_query_lengths[n:padded] = 0
-            gv.mha_cu_query_seq_lengths[n + 1 : padded + 1] = gv.mha_cu_query_seq_lengths[n]
-            gv.mha_kv_seq_lengths[n:padded] = 0
-            gv.mha_cu_kv_seq_lengths[n + 1 : padded + 1] = gv.mha_cu_kv_seq_lengths[n]
-            gv.mha_block_table[n:padded] = -1
-
-        # The metadata fills above wrote the fixed-address `gpu_view` buffers that the append/attend
-        # kernels read; those buffers are shared by the graph and non-graph MHA metadata objects,
-        # so a captured MTP graph replays correctly against whatever positions we just wrote. The
-        # per-step `_mtp_block_table_gpu`/`_mtp_offsets_gpu` are freshly cloned each step, but the
-        # graph never reads them directly (only `gpu_view`), so that is graph-safe.
-        if self._mtp_graphed:
+        # The staged buffers above are read only by these writes; the graph reads `gpu_view`
+        # alone, whose addresses are fixed, so replaying against them is graph-safe.
+        if mtp.graphed:
             # Graphed: route to the graph metadata and use the FIXED capture-time sequence-length
             # bound (baked into the flash-attn kernel launch at capture) rather than a per-step
             # `.item()` sync. `kv_len = position + 1 <= max_sequence_length`, so `max_seqlen` is a
             # safe upper bound; the actual per-request lengths come from the GPU cu_kv tensors.
-            mha = self.graph_attn_metadata["mha_metadata"]
-            mha.set_state_data(
-                padded_active_request_count=padded, max_seqlen_q=1, max_seqlen_k=mha.max_seqlen
-            )
-            self.active_attn_metadata = self.graph_attn_metadata
-            self.active_token_count = n
-            self.padded_active_token_count = padded
-            self._using_cuda_graph_this_step = True
+            max_seqlen_k = self.graph_attn_metadata["mha_metadata"].max_seqlen
         else:
             # Eager: tight per-step max via a GPU->CPU sync, non-graph metadata, graphs disabled.
             max_seqlen_k = int(kv_len.max().item()) if n > 0 else 1
-            mha = self.non_graph_attn_metadata["mha_metadata"]
-            mha.set_state_data(
-                padded_active_request_count=padded, max_seqlen_q=1, max_seqlen_k=max_seqlen_k
-            )
-            self.active_attn_metadata = self.non_graph_attn_metadata
-            self.active_token_count = n
-            self.padded_active_token_count = padded
-            self._using_cuda_graph_this_step = False
+        mha = self._mtp_activate_attn_metadata(
+            graphed=mtp.graphed,
+            padded_request_count=padded,
+            max_seqlen_q=1,
+            max_seqlen_k=max_seqlen_k,
+            token_count=n,
+            padded_token_count=padded,
+        )
 
         # Shapes only -- no `.tolist()`/`.item()` on the GPU metadata here. This runs during
         # CUDA-graph warmup too, and a device sync in that path would be both slow and
@@ -2157,7 +2163,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         assert self.enable_mtp_kv_cache
         gv = self.gpu_view
         device = gv.token_to_block_idx.device
-        block_size = self.block_size_tokens
         num_prefill = append_counts.numel()
         total = int(append_counts.sum().item())
         padded_total = total if padded_token_count is None else padded_token_count
@@ -2171,85 +2176,49 @@ class DynamicInferenceContext(BaseInferenceContext):
         if request_start_positions is not None:
             positions = positions + request_start_positions.to(device)[rows]
 
-        gv.token_to_block_idx[:total] = block_table_prefill[
-            rows, (positions // block_size).to(torch.long)
-        ].to(gv.token_to_block_idx.dtype)
-        gv.token_to_local_position_within_kv_block[:total] = (positions % block_size).to(
-            gv.token_to_local_position_within_kv_block.dtype
+        self.mtp_metadata.write_token_maps(
+            gpu_view=gv,
+            rows=rows,
+            positions=positions,
+            block_table=block_table_prefill,
+            padded_token_count=padded_total,
         )
-        gv.token_to_request_idx[:total] = rows.to(gv.token_to_request_idx.dtype)
-        gv.token_to_position_in_request[:total] = positions.to(
-            gv.token_to_position_in_request.dtype
+
+        # MHA metadata: fresh causal prefill, so per-request kv_length == query_length and one
+        # staged length buffer serves as both. `stage_prefill_lengths` also absorbs the padded
+        # query rows, either into a trailing pad request or into the last real request.
+        seq_lengths = self.mtp_metadata.stage_prefill_lengths(
+            append_counts=append_counts, pad_tokens=padded_total - total
         )
-        gv.token_to_pos_ids[:total] = positions.to(gv.token_to_pos_ids.dtype)
+        p = seq_lengths.numel()
+        padded_p = max(padded_p, p)
 
-        # MHA metadata: fresh causal prefill, so per-request kv_length == query_length.
-        p = num_prefill
-        gv.mha_query_lengths[:p] = append_counts.to(gv.mha_query_lengths.dtype)
-        gv.mha_cu_query_seq_lengths[0] = 0
-        cu = torch.cumsum(append_counts, 0).to(gv.mha_cu_query_seq_lengths.dtype)
-        gv.mha_cu_query_seq_lengths[1 : p + 1] = cu
-        gv.mha_kv_seq_lengths[:p] = append_counts.to(gv.mha_kv_seq_lengths.dtype)
-        gv.mha_cu_kv_seq_lengths[0] = 0
-        gv.mha_cu_kv_seq_lengths[1 : p + 1] = cu
-        gv.mha_block_table[:p] = block_table_prefill
-
-        pad_tokens = padded_total - total
-        if pad_tokens > 0:
-            gv.token_to_block_idx[total:padded_total] = self.kv_block_allocator.dummy_block_idx
-            gv.token_to_local_position_within_kv_block[total:padded_total] = 0
-            # The pad rows are query rows as well as KV writes. The packed hidden is padded up
-            # to a TP multiple so it can be scattered for sequence parallelism, so after the
-            # MTP layer's internal gather the attention sees `padded_total` query rows while
-            # `append_counts` describes only `total` of them. Varlen attention requires
-            # `q.shape[0] == cu_seqlens_q[-1]`, so every pad row is given an owning request.
-            # Only the write maps decide where this forward's KV lands, and they were just
-            # redirected to the dummy block, so the extra query rows are inert wherever they
-            # are attributed; the output hidden is discarded either way.
-            if p < gv.mha_query_lengths.numel():
-                # Spare request slot: carry the pad rows in their own trailing request, which
-                # attends solely to itself out of the dummy block.
-                gv.mha_query_lengths[p] = pad_tokens
-                gv.mha_kv_seq_lengths[p] = pad_tokens
-                gv.mha_cu_query_seq_lengths[p + 1] = padded_total
-                gv.mha_cu_kv_seq_lengths[p + 1] = padded_total
-                gv.mha_block_table[p] = self.kv_block_allocator.dummy_block_idx
-                p += 1
-                padded_p = max(padded_p, p)
-            else:
-                # A full batch occupies every request slot, so extend the last real request's
-                # run instead. Its reads stay inside the blocks it already owns: this varlen
-                # forward reads from the head of each request's block-table row, and the run
-                # grows by at most `tp_size - 1`.
-                gv.mha_query_lengths[p - 1] += pad_tokens
-                gv.mha_kv_seq_lengths[p - 1] += pad_tokens
-                gv.mha_cu_query_seq_lengths[p] = padded_total
-                gv.mha_cu_kv_seq_lengths[p] = padded_total
-        if padded_p > p:
-            gv.mha_query_lengths[p:padded_p] = 0
-            gv.mha_cu_query_seq_lengths[p + 1 : padded_p + 1] = gv.mha_cu_query_seq_lengths[p]
-            gv.mha_kv_seq_lengths[p:padded_p] = 0
-            gv.mha_cu_kv_seq_lengths[p + 1 : padded_p + 1] = gv.mha_cu_kv_seq_lengths[p]
-            gv.mha_block_table[p:padded_p] = -1
-
-        # Read the bound back off the query lengths rather than off `append_counts`: either
-        # branch above may have introduced a run longer than any single `append_counts` entry.
-        max_seqlen = int(gv.mha_query_lengths[:p].max().item()) if p > 0 else 1
-        mha = self.non_graph_attn_metadata["mha_metadata"]
-        mha.set_state_data(
-            padded_active_request_count=padded_p, max_seqlen_q=max_seqlen, max_seqlen_k=max_seqlen
+        self.mtp_metadata.write_mha_metadata(
+            gpu_view=gv,
+            query_lengths=seq_lengths,
+            kv_lengths=seq_lengths,
+            block_table=block_table_prefill,
+            padded_request_count=padded_p,
         )
-        self.active_attn_metadata = self.non_graph_attn_metadata
-        self.active_token_count = total
-        self.padded_active_token_count = padded_total
-        self._using_cuda_graph_this_step = False
-        self._mtp_forward_active = True
+
+        # Read the bound back off `seq_lengths` rather than off `append_counts`: either branch
+        # above may have introduced a run longer than any single `append_counts` entry.
+        max_seqlen = int(seq_lengths.max().item()) if p > 0 else 1
+        mha = self._mtp_activate_attn_metadata(
+            graphed=False,
+            padded_request_count=padded_p,
+            max_seqlen_q=max_seqlen,
+            max_seqlen_k=max_seqlen,
+            token_count=total,
+            padded_token_count=padded_total,
+        )
+        self.mtp_metadata.forward_active = True
         # This is a VARLEN forward (per-request query lengths differ). Force the attention onto
         # the prefill/varlen path: on a pure-decode step num_prefill_requests==0 would make
         # is_decode_only() True, routing to the decode kernel whose uniform
         # `q.reshape(num_requests, tokens_per_request, ...)` fails on ragged input. Restored in
         # _mtp_finalize_prefill_step.
-        self._mtp_saved_num_prefill_requests = self.num_prefill_requests
+        self.mtp_metadata.saved_num_prefill_requests = self.num_prefill_requests
         self.num_prefill_requests = max(1, num_prefill)
 
         log_mtp_debug(
@@ -2264,22 +2233,22 @@ class DynamicInferenceContext(BaseInferenceContext):
             append_counts=append_counts.tolist(),
             cu_query_seq_lengths_shape=tuple(mha.state_data["cu_query_seq_lengths"].shape),
             block_table_shape=tuple(mha.state_data["block_table"].shape),
-            saved_num_prefill_requests=self._mtp_saved_num_prefill_requests,
+            saved_num_prefill_requests=self.mtp_metadata.saved_num_prefill_requests,
         )
 
     def _mtp_finalize_prefill_step(self) -> None:
         """Exit MTP-forward mode after the commit-pass (varlen) forward."""
-        self._mtp_forward_active = False
-        self.num_prefill_requests = self._mtp_saved_num_prefill_requests
+        self.mtp_metadata.end_forward()
+        self.num_prefill_requests = self.mtp_metadata.saved_num_prefill_requests
         log_mtp_debug("finalize_prefill_step", self)
 
     def _mtp_advance_decode_step(self) -> None:
         """Advance each active request's MTP write position by one after a depth forward."""
-        self._mtp_offsets_gpu += 1
+        self.mtp_metadata.advance_decode_step()
 
     def _mtp_end_decode(self) -> None:
         """Exit MTP-forward mode. No persistent MTP length state to write back."""
-        self._mtp_forward_active = False
+        self.mtp_metadata.end_forward()
 
     def mamba_states_cache(
         self, layer_number: int, intermediate: bool = False

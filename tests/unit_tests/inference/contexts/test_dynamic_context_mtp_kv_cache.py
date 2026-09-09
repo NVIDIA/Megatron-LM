@@ -181,13 +181,13 @@ class TestMtpDecodeBookkeeping:
 
         context._mtp_begin_decode(2, 2, start_positions)
 
-        assert context._mtp_forward_active is True
-        assert context._mtp_graphed is False
-        assert context._mtp_active_request_count == 2
-        assert context._mtp_padded_count == 2
-        assert context._mtp_offsets_gpu.dtype == torch.int32
-        assert context._mtp_offsets_gpu.cpu().tolist() == [5, 11]
-        assert context._mtp_block_table_gpu[:, :2].cpu().tolist() == [[3, 4], [7, 9]]
+        assert context.mtp_metadata.forward_active is True
+        assert context.mtp_metadata.graphed is False
+        assert context.mtp_metadata.active_request_count == 2
+        assert context.mtp_metadata.padded_count == 2
+        assert context.mtp_metadata.active_offsets.dtype == torch.int32
+        assert context.mtp_metadata.active_offsets.cpu().tolist() == [5, 11]
+        assert context.mtp_metadata.active_block_table[:, :2].cpu().tolist() == [[3, 4], [7, 9]]
 
     def test_begin_decode_clones_caller_start_positions(self):
         """`_mtp_advance_decode_step` must not mutate the caller's `base_position - 1` tensor."""
@@ -203,7 +203,7 @@ class TestMtpDecodeBookkeeping:
             5,
             11,
         ], "advancing the MTP write positions aliased and corrupted the caller's tensor"
-        assert context._mtp_offsets_gpu.cpu().tolist() == [7, 13]
+        assert context.mtp_metadata.active_offsets.cpu().tolist() == [7, 13]
 
     def test_begin_decode_honors_paused_request_offset(self):
         """Active requests start at `paused_request_count`, not at row 0."""
@@ -214,7 +214,7 @@ class TestMtpDecodeBookkeeping:
         context._mtp_begin_decode(2, 2, start_positions)
 
         # Rows 0-1 are paused (still the -1 fill); the block table must hold the ACTIVE rows.
-        assert context._mtp_block_table_gpu[:, :2].cpu().tolist() == [[3, 4], [7, 9]]
+        assert context.mtp_metadata.active_block_table[:, :2].cpu().tolist() == [[3, 4], [7, 9]]
 
     def test_begin_decode_prefers_prerewind_block_table(self):
         """Deep drafts extend past the accepted range into blocks rewind has since released."""
@@ -226,7 +226,7 @@ class TestMtpDecodeBookkeeping:
 
         context._mtp_begin_decode(1, 1, torch.tensor([9], device=torch.cuda.current_device()))
 
-        assert int(context._mtp_block_table_gpu[0, 1].item()) == 4, (
+        assert int(context.mtp_metadata.active_block_table[0, 1].item()) == 4, (
             "the draft loop read the post-rewind block table and would send deep drafts to "
             "block -1"
         )
@@ -235,11 +235,11 @@ class TestMtpDecodeBookkeeping:
         """With no snapshot taken (e.g. a pure-prefill step) the live table is used."""
         context = _make_context()
         _seed_requests(context, [[3, 4]])
-        assert getattr(context, "_mtp_prerewind_block_table", None) is None
+        assert context.mtp_metadata.prerewind_block_table is None
 
         context._mtp_begin_decode(1, 1, torch.tensor([9], device=torch.cuda.current_device()))
 
-        assert context._mtp_block_table_gpu[0, :2].cpu().tolist() == [3, 4]
+        assert context.mtp_metadata.active_block_table[0, :2].cpu().tolist() == [3, 4]
 
     def test_snapshot_is_a_copy_not_an_alias(self):
         context = _make_context()
@@ -247,12 +247,12 @@ class TestMtpDecodeBookkeeping:
         context._mtp_snapshot_prerewind_block_table()
         context.request_to_kv_block_ids[0, 0] = 99
 
-        assert int(context._mtp_prerewind_block_table[0, 0].item()) == 3
+        assert int(context.mtp_metadata.prerewind_block_table[0, 0].item()) == 3
 
     def test_snapshot_is_a_noop_when_disabled(self):
         context = _make_context(num_speculative_tokens=0)
         context._mtp_snapshot_prerewind_block_table()
-        assert getattr(context, "_mtp_prerewind_block_table", None) is None
+        assert context.mtp_metadata.prerewind_block_table is None
 
     def test_setup_decode_step_writes_roll_by_one_maps(self):
         """Depth 0 writes at `base_position - 1` and attends over `position + 1` keys."""
@@ -436,7 +436,7 @@ class TestMtpDecodeBookkeeping:
         context._mtp_end_decode()
 
         assert seen_positions == [[0, 0], [1, 1], [2, 2]]
-        assert context._mtp_forward_active is False
+        assert context.mtp_metadata.forward_active is False
 
     def test_capture_crossing_a_block_boundary_stays_on_scratch(self):
         """Even past a block boundary the capture must not touch a real block."""
@@ -475,12 +475,12 @@ class TestMtpDecodeBookkeeping:
         context._mtp_begin_decode_for_capture(4)
 
         dummy = context.kv_block_allocator.dummy_block_idx
-        assert context._mtp_graphed is True
-        assert context._mtp_forward_active is True
-        assert context._mtp_active_request_count == 4
-        assert context._mtp_padded_count == 4
-        assert (context._mtp_offsets_gpu == 0).all()
-        assert (context._mtp_block_table_gpu == dummy).all()
+        assert context.mtp_metadata.graphed is True
+        assert context.mtp_metadata.forward_active is True
+        assert context.mtp_metadata.active_request_count == 4
+        assert context.mtp_metadata.padded_count == 4
+        assert (context.mtp_metadata.active_offsets == 0).all()
+        assert (context.mtp_metadata.active_block_table == dummy).all()
 
         # A capture-time setup step must not write any real block id.
         context._mtp_setup_decode_step()
@@ -490,11 +490,11 @@ class TestMtpDecodeBookkeeping:
         context = _make_context()
         _seed_requests(context, [[3, 4]])
         context._mtp_begin_decode(1, 1, torch.tensor([5], device=torch.cuda.current_device()))
-        assert context._mtp_forward_active is True
+        assert context.mtp_metadata.forward_active is True
 
         context._mtp_end_decode()
 
-        assert context._mtp_forward_active is False
+        assert context.mtp_metadata.forward_active is False
 
     def test_begin_decode_asserts_when_disabled(self):
         context = _make_context(num_speculative_tokens=0)
@@ -727,7 +727,7 @@ class TestMtpPrefillBookkeeping:
         assert context.num_prefill_requests == 2
         assert context.is_decode_only() is False
         assert context._using_cuda_graph_this_step is False
-        assert context._mtp_forward_active is True
+        assert context.mtp_metadata.forward_active is True
         assert context.active_attn_metadata is context.non_graph_attn_metadata
         mha = context.non_graph_attn_metadata["mha_metadata"]
         assert mha.state_data["max_seqlen_q"] == 2
@@ -748,7 +748,7 @@ class TestMtpPrefillBookkeeping:
         context._mtp_finalize_prefill_step()
 
         assert context.num_prefill_requests == 0
-        assert context._mtp_forward_active is False
+        assert context.mtp_metadata.forward_active is False
 
     def test_prefill_step_asserts_when_disabled(self):
         context = _make_context(num_speculative_tokens=0)

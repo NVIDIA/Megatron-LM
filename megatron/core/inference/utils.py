@@ -58,12 +58,14 @@ def log_mtp_debug(tag: str, context=None, **fields) -> None:
             "paused_request_count",
             "num_prefill_requests",
             "chunked_prefill_request_id",
-            "_mtp_forward_active",
-            "_mtp_graphed",
             "_using_cuda_graph_this_step",
             "mtp_kv_layer_slot",
         ):
             parts.append(f"{name.lstrip('_')}={getattr(context, name, '<absent>')}")
+        mtp = getattr(context, "mtp_metadata", None)
+        if mtp is not None:
+            parts.append(f"mtp_forward_active={mtp.forward_active}")
+            parts.append(f"mtp_graphed={mtp.graphed}")
     parts.extend(f"{key}={value}" for key, value in fields.items())
     _mtp_debug_logger.info("[MTP-DBG][rank %s] %s | %s", rank, tag, " ".join(parts))
 
