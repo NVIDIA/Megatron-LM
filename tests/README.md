@@ -2,84 +2,107 @@
 
 ## Selective Unit Testing
 
-Pull requests labeled `Run selective unit tests` use `pytest-impacted` to select
-H100 unit-test files affected by the PR diff. The selected files are mapped to
-the existing unit-test buckets, and only buckets with selected files are
-launched. Without the label, CI uses the standard full H100 unit-test matrix.
-The GB200 unit-test job still runs its full recipe.
+PR builds select H100 unit-test **files** affected by the whole PR diff using
+`pytest-impacted`, including transitive import dependencies. CI adds the 10
+baseline files in [`unit_tests/always_run_tests.json`](unit_tests/always_run_tests.json)
+to every selection, maps the union to the existing buckets, and launches only
+buckets with selected files. Each file can contain multiple parametrized test
+cases. Documentation-only PRs run the baseline after the usual CI authorization.
+The existing GB200 hardware-specific marker suite remains enabled separately.
 
-Selection is fail-closed: CI runs the full H100 unit-test matrix whenever the
-analysis is unavailable or ambiguous. Full-suite fallbacks include a missing or
-invalid base commit, selector errors, empty or invalid selector output, deleted
-or renamed files, changes to CI/test configuration or dependencies, shared
-fixtures and test runners, package `__init__.py` files, selector timeouts, and
-files that `pytest-impacted` cannot analyze safely. The PR base must be an exact
-commit that is an ancestor of the tested head. The merge queue and
-scheduled/nightly workflows also run the full matrix. On a PR, either the `Run
-tests` or `Run functional tests` label requests a full matrix and takes
-precedence over `Run selective unit tests`. The workflow summary reports the
-selection mode, fallback reason, selector overhead, file count, and bucket
-count.
+The baseline covers basic setup, model-parallel configuration, process groups,
+rank utilities, shared utilities, tensor-parallel cross entropy, transformer
+configuration, GPT construction, and checkpoint mappings. Edit the JSON list to
+change the baseline; entries must be unique, existing unit-test files owned by a
+CI bucket. Changes to the baseline itself run the full suite for validation.
 
-After the matrix is emitted, an invalid per-job payload or a selected bucket
-that collects no tests fails the job rather than allowing a green partial run.
+| Build or change | H100 unit tests |
+| --- | --- |
+| PR source or test changes | Affected files plus the baseline |
+| Documentation-only PR | Baseline only |
+| PR labeled `Run full unit tests` | Full suite |
+| Merge queue, nightly/CI workload, manual dispatch | Full suite |
+| Unsupported change or failed/ambiguous analysis | Full suite |
 
-`pytest-impacted` is stateless between invocations. CI does not restore or save
-a dependency-analysis cache; the dependency graph is rebuilt from the checked
-out commit on every run. Cache-hit rate is therefore not applicable; selector
-overhead is measured directly instead.
+`Run tests` and `Run functional tests` retain their functional-test behavior;
+they do not disable unit-test selection. No opt-in label is required. The old
+`Run selective unit tests` and `Run selective unit tests on latest commit`
+labels are unnecessary; selection always covers the entire PR, including
+changes in earlier commits.
 
-### Run impacted tests locally
+Selection is conservative: missing/invalid base commits, selector errors,
+timeouts, deleted or renamed files, shared fixtures, test runners, dependency
+and CI configuration changes, package `__init__.py` changes, and unsupported
+files request the full matrix. Tokenizer changes also run the full suite because
+their dynamic imports hide consumers from static analysis. Empty impact results for source changes also
+request the full suite; the baseline cannot hide an analysis failure. The
+analyzed base must be an exact ancestor of the same commit used by test jobs.
+Static imports cannot prove complete runtime coverage of dynamic imports,
+plugins, or monkeypatching; the full merge-queue suite remains the final check.
 
-Generate the bucket list once per shell session:
+The workflow summary reports the mode, fallback reason, affected and baseline
+file counts, total selected files, buckets, and selector overhead. The dependency
+graph is rebuilt on every run, so there is no persistent impact cache. Invalid
+per-job payloads and selections that collect no runnable tests fail the job.
+
+### Analyze changes locally
+
+The selector has its own locked Python environment in `.github/test-selection`.
+It does not install Megatron or require GPUs for analysis, and its dependencies
+do not conflict with the main package's linting environment. Run the following
+inside the development container, from the repository root:
 
 ```bash
 bucket_file="$(mktemp)"
 selection_file="$(mktemp)"
 trap 'rm -f "$bucket_file" "$selection_file"' EXIT
 
-yq -o=json '[.products[].test_case[] | {"bucket": .}]' \
-  tests/test_utils/recipes/h100/unit-tests.yaml > "$bucket_file"
-```
+python - <<'PYTHON' > "$bucket_file"
+import json
+from pathlib import Path
 
-To analyze unstaged and untracked changes, run:
+import yaml
 
-```bash
-uv run --locked --no-default-groups \
-  --group build --group test --group selective-testing \
+recipe = yaml.safe_load(Path("tests/test_utils/recipes/h100/unit-tests.yaml").read_text())
+print(json.dumps([bucket for product in recipe["products"] for bucket in product["test_case"]]))
+PYTHON
+
+uv run --locked --project .github/test-selection \
   python .github/scripts/select_unit_tests.py \
   --buckets-file "$bucket_file" \
   --git-mode unstaged \
-  --output "$selection_file" \
-  --run
+  --output "$selection_file"
 ```
 
-Staged-only changes are intentionally not analyzed in `unstaged` mode and cause
-a full-suite fallback. To analyze all committed changes on a branch, first make
-sure `origin/main` is current, then use its exact merge-base commit:
+`unstaged` mode includes untracked files. Staged changes cause a full-suite
+fallback. For committed changes, replace `--git-mode unstaged` with
+`--git-mode branch --base-ref "$(git merge-base <base-branch> HEAD)"`, using your
+current target branch. The report contains the selected files and CI matrix.
+
+To execute the selection, use the **GPU development environment** rather than
+the selector environment, which only contains analysis dependencies:
 
 ```bash
-base_sha="$(git merge-base origin/main HEAD)"
+python - "$selection_file" <<'PYTHON'
+import json
+import subprocess
+import sys
 
-uv run --locked --no-default-groups \
-  --group build --group test --group selective-testing \
-  python .github/scripts/select_unit_tests.py \
-  --buckets-file "$bucket_file" \
-  --git-mode branch \
-  --base-ref "$base_sha" \
-  --output "$selection_file" \
-  --run
+with open(sys.argv[1]) as stream:
+    report = json.load(stream)
+targets = report["selected_files"] if report["mode"] == "selective" else ["tests/unit_tests"]
+raise SystemExit(subprocess.call([
+    sys.executable, "-m", "torch.distributed.run", "--nproc-per-node", "8",
+    "-m", "pytest", "-q", "-m", "not flaky_in_dev", *targets,
+]))
+PYTHON
 ```
 
-Both commands print whether selection was selective or fell back to the full
-suite and record the details in `$selection_file`. They launch tests with eight
-processes by default, matching CI.
-
-To bypass selection and run the full unit-test suite directly:
+Run the CPU regression checks for the selector, workflow, and launch path with:
 
 ```bash
-uv run python -m torch.distributed.run --nproc-per-node 8 -m pytest -q \
-  tests/unit_tests
+uv run --locked --project .github/test-selection \
+  python -m unittest discover -s .github/scripts -p 'test_select*.py' -v
 ```
 
 ## Updating Functional Test Golden Values

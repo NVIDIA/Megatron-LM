@@ -25,5 +25,8 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
     both selective marker phases are empty.
     """
 
-    if exitstatus == pytest.ExitCode.NO_TESTS_COLLECTED:
+    if (
+        os.environ.get("MCORE_SELECTED_TEST_SENTINEL")
+        and exitstatus == pytest.ExitCode.NO_TESTS_COLLECTED
+    ):
         session.exitstatus = pytest.ExitCode.OK

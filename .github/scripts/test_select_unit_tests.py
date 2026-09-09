@@ -3,6 +3,7 @@
 
 import base64
 import json
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -17,6 +18,7 @@ from select_unit_tests import (
     build_bucket_ownership,
     find_changes,
     full_run_reason,
+    read_always_run_tests,
     read_buckets,
     select_unit_tests,
 )
@@ -41,6 +43,7 @@ class TestSelectUnitTests(unittest.TestCase):
         self._write("tests/unit_tests/data/test_data.py")
         self._write("tests/unit_tests/models/test_model.py")
         self._write("tests/unit_tests/models/special/test_special.py")
+        self._write("tests/unit_tests/always_run_tests.json", '["tests/unit_tests/test_root.py"]')
 
         self.buckets = [
             "tests/unit_tests/**",
@@ -94,7 +97,9 @@ class TestSelectUnitTests(unittest.TestCase):
         return select_unit_tests(
             repo_root=self.repo_root,
             buckets=self.buckets,
-            changes=changes or [Change(status="M", path="megatron/core/layers.py")],
+            changes=(
+                [Change(status="M", path="megatron/core/layers.py")] if changes is None else changes
+            ),
             git_mode="branch",
             base_ref="base-sha",
             force_full=force_full,
@@ -123,6 +128,18 @@ class TestSelectUnitTests(unittest.TestCase):
             ),
             "high-impact file": (
                 [Change(status="M", path=".github/workflows/cicd-main.yml")],
+                "high-impact file changed",
+            ),
+            "baseline configuration": (
+                [Change(status="M", path="tests/unit_tests/always_run_tests.json")],
+                "high-impact file changed",
+            ),
+            "dynamically loaded tokenizer backend": (
+                [
+                    Change(
+                        status="M", path="megatron/core/tokenizers/text/libraries/null_tokenizer.py"
+                    )
+                ],
                 "high-impact file changed",
             ),
             "package root": (
@@ -280,25 +297,29 @@ class TestSelectUnitTests(unittest.TestCase):
         report = self._select(result)
 
         self.assertEqual(report["mode"], "selective")
-        self.assertEqual(report["selected_count"], 2)
+        self.assertEqual(report["selected_count"], 3)
         self.assertEqual(report["total_count"], 4)
+        self.assertEqual(report["impacted_count"], 2)
+        self.assertEqual(report["always_run_count"], 1)
         self.assertEqual(
             report["selected_files"],
             [
                 "tests/unit_tests/models/special/test_special.py",
                 "tests/unit_tests/models/test_model.py",
+                "tests/unit_tests/test_root.py",
             ],
         )
-        self.assertEqual(
-            [entry["bucket"] for entry in report["matrix"]],
-            ["tests/unit_tests/models/**", "tests/unit_tests/models/special/test_special.py"],
-        )
+        self.assertEqual([entry["bucket"] for entry in report["matrix"]], self.buckets)
         self.assertEqual(
             _decode_test_files(report["matrix"][0]["unit_test_files"]),
-            ["tests/unit_tests/models/test_model.py"],
+            ["tests/unit_tests/test_root.py"],
         )
         self.assertEqual(
             _decode_test_files(report["matrix"][1]["unit_test_files"]),
+            ["tests/unit_tests/models/test_model.py"],
+        )
+        self.assertEqual(
+            _decode_test_files(report["matrix"][2]["unit_test_files"]),
             ["tests/unit_tests/models/special/test_special.py"],
         )
         self.assertEqual(len(self.runner_calls), 1)
@@ -342,6 +363,164 @@ class TestSelectUnitTests(unittest.TestCase):
         self._assert_full_report(
             report, "pytest-impacted returned no unit tests for an analyzable change"
         )
+
+    def test_documentation_only_runs_baseline_without_the_analysis_tool(self) -> None:
+        report = self._select(
+            CommandResult(returncode=7, stdout="", stderr="tool unavailable"),
+            changes=[Change(status="M", path="docs/guide.md")],
+        )
+
+        self.assertEqual(report["mode"], "selective")
+        self.assertEqual(report["selected_files"], ["tests/unit_tests/test_root.py"])
+        self.assertEqual(report["always_run_count"], 1)
+        self.assertEqual(report["impacted_count"], 0)
+        self.assertEqual(self.runner_calls, [])
+
+    def test_baseline_is_deduplicated_from_impacted_tests(self) -> None:
+        report = self._select(
+            CommandResult(returncode=0, stdout="tests/unit_tests/test_root.py\n", stderr="")
+        )
+
+        self.assertEqual(report["selected_count"], 1)
+        self.assertEqual(report["impacted_count"], 1)
+        self.assertEqual(report["always_run_count"], 1)
+
+    def test_changed_test_and_baseline_do_not_mask_empty_source_analysis(self) -> None:
+        for stdout in ("", "tests/unit_tests/test_root.py\n"):
+            with self.subTest(stdout=stdout):
+                report = self._select(
+                    CommandResult(returncode=0, stdout=stdout, stderr=""),
+                    changes=[
+                        Change(status="M", path="megatron/core/layers.py"),
+                        Change(status="M", path="tests/unit_tests/test_root.py"),
+                    ],
+                )
+
+                self._assert_full_report(
+                    report, "pytest-impacted returned no unit tests for an analyzable change"
+                )
+
+    def test_missing_baseline_falls_back_to_full(self) -> None:
+        (self.repo_root / "tests/unit_tests/always_run_tests.json").unlink()
+
+        report = self._select(CommandResult(returncode=0, stdout="", stderr=""))
+
+        self._assert_full_report(report, "always-run test configuration is invalid")
+        self.assertEqual(self.runner_calls, [])
+
+    def test_invalid_baselines_fall_back_to_full(self) -> None:
+        cases = [
+            "not JSON",
+            "[]",
+            "{}",
+            '["tests/unit_tests/test_missing.py"]',
+            '["tests/unit_tests/../../test_escape.py"]',
+            '["tests/unit_tests/test_*.py"]',
+            '["tests/unit_tests/test_root.py", "tests/unit_tests/test_root.py"]',
+            '["megatron/core/layers.py"]',
+            '["tests/unit_tests/models/../test_root.py"]',
+            '[42]',
+        ]
+        for contents in cases:
+            with self.subTest(contents=contents):
+                self._write("tests/unit_tests/always_run_tests.json", contents)
+                report = self._select(CommandResult(returncode=0, stdout="", stderr=""))
+                self._assert_full_report(report, "always-run test configuration is invalid")
+
+    def test_repository_baseline_contains_ten_existing_owned_test_files(self) -> None:
+        root = Path(__file__).resolve().parents[2]
+        ownership = build_bucket_ownership(root, ["tests/unit_tests/**"])
+
+        baseline = read_always_run_tests(
+            root, root / "tests/unit_tests/always_run_tests.json", ownership
+        )
+
+        self.assertEqual(len(baseline), 10)
+
+    def test_runner_setup_failure_falls_back_to_full(self) -> None:
+        with mock.patch("select_unit_tests.run_pytest_impacted", side_effect=FileNotFoundError):
+            report = self._select(CommandResult(returncode=0, stdout="", stderr=""))
+
+        self._assert_full_report(report, "pytest-impacted could not run")
+
+    def test_invalid_unchanged_consumer_cannot_silently_remove_dependency_edges(self) -> None:
+        self._write(
+            "tests/unit_tests/models/helpers.py",
+            "from megatron.core.layers import Layer\ndef invalid(:\n",
+        )
+
+        report = self._select(
+            CommandResult(returncode=0, stdout="tests/unit_tests/test_root.py\n", stderr="")
+        )
+
+        self._assert_full_report(report, "cannot analyze Python dependency input")
+        self.assertEqual(self.runner_calls, [])
+
+    def test_non_utf8_input_cannot_silently_remove_dependency_edges(self) -> None:
+        (self.repo_root / "megatron/core/layers.py").write_bytes(b"# \xff\n")
+
+        report = self._select(
+            CommandResult(returncode=0, stdout="tests/unit_tests/test_root.py\n", stderr="")
+        )
+
+        self._assert_full_report(report, "cannot analyze Python dependency input")
+        self.assertEqual(self.runner_calls, [])
+
+    @unittest.skipUnless(
+        shutil.which("impacted-tests"), "requires the selective-testing environment"
+    )
+    def test_real_analysis_follows_relative_imports_and_transitive_test_helpers(self) -> None:
+        from pytest_impacted._rust import RUST_AVAILABLE
+
+        if not RUST_AVAILABLE:
+            self.skipTest("requires pytest-impacted[fast]")
+        self._write("megatron/core/__init__.py", "raise RuntimeError('must not import source')\n")
+        self._write("megatron/core/leaf.py", "VALUE = 1\n")
+        self._write("megatron/core/layers.py", "from .leaf import VALUE\n")
+        self._write(
+            "tests/unit_tests/models/helpers.py", "from megatron.core.layers import VALUE\n"
+        )
+        self._write(
+            "tests/unit_tests/models/test_model.py",
+            "from tests.unit_tests.models.helpers import VALUE\n",
+        )
+        base_sha = self._initialize_git_repository()
+
+        for changed_path, contents in (
+            ("megatron/core/leaf.py", "VALUE = 2\n"),
+            (
+                "tests/unit_tests/models/helpers.py",
+                "from megatron.core.layers import VALUE\nRESULT = VALUE + 1\n",
+            ),
+        ):
+            with self.subTest(changed_path=changed_path):
+                self._write(changed_path, contents)
+                subprocess.run(["git", "add", "."], cwd=self.repo_root, check=True)
+                subprocess.run(
+                    ["git", "commit", "--quiet", "-m", "change"], cwd=self.repo_root, check=True
+                )
+                report = select_unit_tests(
+                    self.repo_root,
+                    self.buckets,
+                    find_changes(self.repo_root, "branch", base_sha),
+                    "branch",
+                    base_sha,
+                )
+                self.assertEqual(report["mode"], "selective", report["reason"])
+                self.assertEqual(
+                    report["impacted_files"], ["tests/unit_tests/models/test_model.py"]
+                )
+                self.assertEqual(
+                    report["selected_files"],
+                    ["tests/unit_tests/models/test_model.py", "tests/unit_tests/test_root.py"],
+                )
+                base_sha = subprocess.run(
+                    ["git", "rev-parse", "HEAD"],
+                    cwd=self.repo_root,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout.strip()
 
     def test_source_test_output_is_ignored_then_empty_result_falls_back(self) -> None:
         report = self._select(

@@ -128,10 +128,14 @@ TEST_TARGETS=()
 PYTEST_GUARD_ARGS=()
 
 load_full_bucket() {
+    local ignored_files
+    # Capture the helper's status: process substitution would hide a failure
+    # and silently run child buckets without their required exclusions.
+    ignored_files=$(python tests/unit_tests/find_test_cases.py "$BUCKET" "$PLATFORM")
     IGNORE_ARGS=()
     while IFS= read -r line; do
         [[ -n "$line" ]] && IGNORE_ARGS+=("$line")
-    done < <(python tests/unit_tests/find_test_cases.py "$BUCKET" "$PLATFORM")
+    done <<< "$ignored_files"
     TEST_TARGETS=("${BUCKET%/\*\*/\*.py}")
 }
 

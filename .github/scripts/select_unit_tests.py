@@ -11,6 +11,7 @@ full bucket matrix instead of an empty or incomplete test run.
 from __future__ import annotations
 
 import argparse
+import ast
 import base64
 import fnmatch
 import glob
@@ -25,6 +26,7 @@ from typing import Callable, Sequence
 
 UNIT_TEST_ROOT = Path("tests/unit_tests")
 SOURCE_ROOT = Path("megatron")
+ALWAYS_RUN_FILE = UNIT_TEST_ROOT / "always_run_tests.json"
 SELECTOR_TIMEOUT_SECONDS = 300
 SAFE_DOCUMENTATION_SUFFIXES = {".gif", ".jpeg", ".jpg", ".md", ".png", ".rst", ".svg"}
 HIGH_IMPACT_PATTERNS = (
@@ -34,6 +36,8 @@ HIGH_IMPACT_PATTERNS = (
     "docker/**",
     "megatron/__init__.py",
     "megatron/**/__init__.py",
+    # MegatronTokenizer loads backends with importlib, outside the static graph.
+    "megatron/core/tokenizers/**",
     "pyproject.toml",
     "pytest.ini",
     "requirements*.txt",
@@ -44,6 +48,7 @@ HIGH_IMPACT_PATTERNS = (
     "tests/test_utils/python_scripts/recipe_parser.py",
     "tests/test_utils/recipes/**/unit-tests.yaml",
     "tests/unit_tests/__init__.py",
+    "tests/unit_tests/always_run_tests.json",
     "tests/unit_tests/**/__init__.py",
     "tests/unit_tests/conftest.py",
     "tests/unit_tests/**/conftest.py",
@@ -357,6 +362,30 @@ def build_bucket_ownership(repo_root: Path, buckets: Sequence[str]) -> dict[str,
     return owned
 
 
+def read_always_run_tests(repo_root: Path, path: Path, ownership: dict[str, set[str]]) -> set[str]:
+    """Validate the maintained list of test files that every PR must run."""
+
+    data = json.loads(path.read_text())
+    if not isinstance(data, list) or not data:
+        raise ValueError("always-run file must contain a nonempty JSON list")
+    owned = set().union(*ownership.values())
+    selected: set[str] = set()
+    for entry in data:
+        if (
+            not isinstance(entry, str)
+            or re.fullmatch(r"tests/unit_tests/[A-Za-z0-9_./+-]+\.py", entry) is None
+            or ".." in Path(entry).parts
+            or not Path(entry).name.startswith("test_")
+            or entry not in owned
+            or (repo_root / entry).resolve().relative_to(repo_root).as_posix() != entry
+        ):
+            raise ValueError(f"invalid or unowned always-run test: {entry!r}")
+        if entry in selected:
+            raise ValueError(f"duplicate always-run test: {entry}")
+        selected.add(entry)
+    return selected
+
+
 def _normalize_selector_output(repo_root: Path, stdout: str) -> tuple[set[str], str | None]:
     selected: set[str] = set()
     unit_root = (repo_root / UNIT_TEST_ROOT).resolve()
@@ -395,10 +424,33 @@ def _directly_changed_tests(changes: Sequence[Change]) -> set[str]:
     }
 
 
+def analysis_input_error(repo_root: Path) -> str | None:
+    """Reject unreadable or invalid Python before the Rust parser drops edges.
+
+    pytest-impacted 0.28.0's fast backend silently returns no imports when a
+    file cannot be read or parsed. Validate all graph inputs, including
+    unchanged consumers, so incomplete analysis cannot look successful.
+    """
+
+    path = repo_root
+    try:
+        for root in (SOURCE_ROOT, Path("tests")):
+            for path in sorted((repo_root / root).rglob("*.py")):
+                ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    except (OSError, SyntaxError, UnicodeError) as error:
+        return f"cannot analyze Python dependency input {path.relative_to(repo_root)}: {error}"
+    return None
+
+
 def run_pytest_impacted(
     repo_root: Path, git_mode: str, base_ref: str | None, runner: SelectorRunner = _run_command
 ) -> CommandResult:
-    """Invoke pytest-impacted with the repository's package and test roots."""
+    """Invoke pytest-impacted with the repository's package and test roots.
+
+    Keep ``tests`` as the root: pytest-impacted 0.28.0 strips parent prefixes
+    from nested test directories, breaking imports of ``tests.unit_tests``
+    helpers if ``tests/unit_tests`` is passed here instead.
+    """
 
     command = [
         "impacted-tests",
@@ -445,6 +497,7 @@ def select_unit_tests(
     base_ref: str | None,
     force_full: str | None = None,
     runner: SelectorRunner = _run_command,
+    always_run_file: Path | None = None,
 ) -> dict[str, object]:
     """Return a deterministic selective/full report for CI and local use."""
 
@@ -456,23 +509,60 @@ def select_unit_tests(
     if policy_reason:
         return _full_report(policy_reason, buckets, ownership, changes)
 
-    result = run_pytest_impacted(repo_root, git_mode, base_ref, runner=runner)
-    if result.returncode != 0:
-        reason = f"pytest-impacted failed with exit code {result.returncode}"
-        return _full_report(reason, buckets, ownership, changes)
-    normalized_stderr = " ".join(result.stderr.split())
-    if UNSAFE_SELECTOR_OUTPUT.search(normalized_stderr):
+    baseline_path = always_run_file or ALWAYS_RUN_FILE
+    if not baseline_path.is_absolute():
+        baseline_path = repo_root / baseline_path
+    try:
+        always_run = read_always_run_tests(repo_root, baseline_path, ownership)
+    except (OSError, ValueError) as error:
         return _full_report(
-            "pytest-impacted reported an analysis error", buckets, ownership, changes
+            f"always-run test configuration is invalid: {error}", buckets, ownership, changes
         )
 
-    selected, output_error = _normalize_selector_output(repo_root, result.stdout)
-    if output_error:
-        return _full_report(output_error, buckets, ownership, changes)
-    selected.update(_directly_changed_tests(changes))
+    documentation_only = all(
+        _is_documentation_path(path) for change in changes for path in change.paths
+    )
+    impacted: set[str] = set()
+    if not documentation_only:
+        input_error = analysis_input_error(repo_root)
+        if input_error:
+            return _full_report(input_error, buckets, ownership, changes)
+        try:
+            result = run_pytest_impacted(repo_root, git_mode, base_ref, runner=runner)
+        except (OSError, subprocess.SubprocessError, ValueError) as error:
+            return _full_report(
+                f"pytest-impacted could not run: {error}", buckets, ownership, changes
+            )
+        if result.returncode != 0:
+            reason = f"pytest-impacted failed with exit code {result.returncode}"
+            return _full_report(reason, buckets, ownership, changes)
+        normalized_stderr = " ".join(result.stderr.split())
+        if UNSAFE_SELECTOR_OUTPUT.search(normalized_stderr):
+            return _full_report(
+                "pytest-impacted reported an analysis error", buckets, ownership, changes
+            )
+
+        impacted, output_error = _normalize_selector_output(repo_root, result.stdout)
+        if output_error:
+            return _full_report(output_error, buckets, ownership, changes)
+        changed_tests = _directly_changed_tests(changes)
+        # Neither the baseline nor a directly changed test can rescue missing
+        # impact analysis for production code or a shared test helper.
+        analyzable_helpers_or_source = any(
+            Path(change.path).suffix == ".py" and change.path not in changed_tests
+            for change in changes
+        )
+        if not (impacted - changed_tests) and analyzable_helpers_or_source:
+            return _full_report(
+                "pytest-impacted returned no unit tests for an analyzable change",
+                buckets,
+                ownership,
+                changes,
+            )
+        impacted.update(changed_tests)
 
     all_owned_files = set().union(*ownership.values())
-    unknown = sorted(selected - all_owned_files)
+    unknown = sorted(impacted - all_owned_files)
     if unknown:
         return _full_report(
             f"selected tests are not owned by the H100 recipe: {', '.join(unknown)}",
@@ -480,7 +570,7 @@ def select_unit_tests(
             ownership,
             changes,
         )
-    if not selected:
+    if not impacted and not documentation_only:
         return _full_report(
             "pytest-impacted returned no unit tests for an analyzable change",
             buckets,
@@ -488,6 +578,7 @@ def select_unit_tests(
             changes,
         )
 
+    selected = impacted | always_run
     matrix = []
     for bucket in buckets:
         bucket_files = sorted(selected & ownership[bucket])
@@ -498,10 +589,18 @@ def select_unit_tests(
 
     return {
         "mode": "selective",
-        "reason": f"pytest-impacted selected {len(selected)} unit-test file(s)",
+        "reason": (
+            "documentation-only change; running the always-run baseline"
+            if documentation_only
+            else f"{len(impacted)} impacted + {len(always_run)} always-run files (deduplicated)"
+        ),
         "changed_files": sorted({path for change in changes for path in change.paths}),
         "selected_files": sorted(selected),
         "selected_count": len(selected),
+        "impacted_files": sorted(impacted),
+        "impacted_count": len(impacted),
+        "always_run_files": sorted(always_run),
+        "always_run_count": len(always_run),
         "total_count": len(all_owned_files),
         "matrix": matrix,
     }
@@ -528,6 +627,13 @@ def write_summary(report: dict[str, object], destination: Path) -> None:
         f"| Selector overhead | `{duration}` seconds |",
         "| Persistent dependency cache | Not required (pytest-impacted is stateless across runs) |",
     ]
+    if mode == "selective":
+        lines.extend(
+            [
+                f"| Impacted test files | `{report['impacted_count']}` |",
+                f"| Always-run test files | `{report['always_run_count']}` |",
+            ]
+        )
     selected_files = report.get("selected_files")
     if isinstance(selected_files, list) and selected_files:
         lines.extend(["", "<details><summary>Selected test files</summary>", "", "```text"])
@@ -569,6 +675,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo-root", type=Path, default=Path.cwd())
     parser.add_argument("--buckets-file", type=Path, required=True)
+    parser.add_argument("--always-run-file", type=Path, default=ALWAYS_RUN_FILE)
     parser.add_argument("--git-mode", choices=("branch", "unstaged"), default="branch")
     parser.add_argument("--base-ref")
     parser.add_argument("--force-full", metavar="REASON")
@@ -602,6 +709,7 @@ def main() -> int:
             git_mode=args.git_mode,
             base_ref=args.base_ref,
             force_full=args.force_full,
+            always_run_file=args.always_run_file,
         )
     except (OSError, subprocess.SubprocessError, ValueError) as error:
         ownership = build_bucket_ownership(repo_root, buckets)

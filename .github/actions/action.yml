@@ -24,7 +24,7 @@ inputs:
     default: "30"
   script:
     description: "Test script to execute"
-    required: true
+    required: false
   is-optional:
     description: "Pass this job on failure."
     required: false
@@ -127,6 +127,7 @@ runs:
         printf '%s' "$UNIT_TEST_FILES_B64" > unit-test-files.b64
         cmd=$(cat <<'RUN_TEST_EOF'
         #!/bin/bash
+        set -euxo pipefail
 
         export PYTHONPATH=$(pwd)
         export NEMORUN_HOME=$(pwd)

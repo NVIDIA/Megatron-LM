@@ -1,6 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Fused preparation for a Gated Delta Product decode step.
+"""Fused decode-step preparation for Gated Delta Product.
 
 Between the short-conv update and the recurrent kernel, GDP decode does nothing
 but reshape and gate: it splits the post-conv activations into `value`, `key`
