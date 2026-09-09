@@ -62,6 +62,7 @@ class MegatronMultimodalTokenizer:
         special_tokens: List[str],
         image_tag_type: str,
         force_system_message: bool = False,
+        use_gigatoken: bool = False,
         **kwargs,
     ):
         """Tokenizer with a support for non-text inputs.
@@ -74,6 +75,8 @@ class MegatronMultimodalTokenizer:
             special_tokens (List[str]): Non-text tokens.
             image_tag_type (str): Image tag to apply, if any. For example <img><image></img>.
         """
+        self.use_gigatoken = use_gigatoken
+
         if not HAVE_TRANSFORMERS:
             raise ImportError(
                 "MegatronMultimodalTokenizer currently requires "
@@ -199,6 +202,12 @@ class MegatronMultimodalTokenizer:
         self._prompt_format = prompt_format
         self._image_tag = IMAGE_TAGS[image_tag_type]
 
+        self._hf_tokenizer = self.tokenizer
+        if self.use_gigatoken:
+            import gigatoken as gt
+
+            self.tokenizer = gt.Tokenizer(self.tokenizer).as_hf()
+
     def _apply_image_tag(self, text: Union[str, List[Dict]]):
         """Surround <image> with image tags such as <img> and </img>."""
         if self._image_tag is None:
@@ -276,7 +285,7 @@ class MegatronMultimodalTokenizer:
         # Apply possible image tag.
         conversation = self._apply_image_tag(conversation)
 
-        tokens = self.tokenizer.apply_chat_template(
+        tokens = self._hf_tokenizer.apply_chat_template(
             conversation,
             tokenize=tokenize,
             add_generation_prompt=add_generation_prompt,
@@ -300,7 +309,7 @@ class MegatronMultimodalTokenizer:
             if len(turn["content"]) == 0:
                 raise ValueError(f"empty turn in conversation: {conversation}. Skipping.")
 
-            turn_tokens = self.tokenizer.apply_chat_template(
+            turn_tokens = self._hf_tokenizer.apply_chat_template(
                 [turn],
                 tokenize=True,
                 return_dict=False,
