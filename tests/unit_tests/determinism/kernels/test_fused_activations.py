@@ -95,6 +95,11 @@ GATED_CASES = {
         lambda x, w: weighted_squared_relu_impl(x, w, clamp_scale=10.0),
         (_act((TOKENS, FFN)), _weights(TOKENS)),
     ),
+    # Unweighted clamped path (weights=None) used by the dense MLP; saves only x for backward.
+    "clamped_squared_relu": lambda: (
+        lambda x: weighted_squared_relu_impl(x, None, clamp_scale=10.0),
+        (_act((TOKENS, FFN)),),
+    ),
 }
 
 
