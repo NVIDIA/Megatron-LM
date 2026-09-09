@@ -59,12 +59,12 @@ spec:
         "CHECKPOINT_SAVE_PATH={artifacts_dir}/checkpoints"
         "CHECKPOINT_LOAD_PATH=/mnt/artifacts"
         "TRAINING_SCRIPT_PATH=./examples/mimo/train.py"
-        "TRAINING_PARAMS_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/model_config.yaml"
-        "GOLDEN_VALUES_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/golden_values_{environment}_{platforms}.json"
+        "TRAINING_PARAMS_PATH=./{functional_test_case_dir}/model_config.yaml"
+        "GOLDEN_VALUES_PATH=./{functional_test_case_dir}/golden_values_{environment}_{platforms}.json"
         "N_REPEAT={n_repeat}"
     )
 
-    bash ./tests/functional_tests/shell_test_utils/run_ci_test.sh ${{ARGUMENTS[@]}}
+    bash ./tests/functional_tests/run_ci_test.sh ${{ARGUMENTS[@]}}
 
 products:
   - test_case: [mimo_vlm_pretrain_convergence_tp1_pp1_cp1_dp8]
@@ -98,4 +98,4 @@ products:
             export PYTHONPATH="$(pwd):${{PYTHONPATH:-}}"
 
             uv run --no-sync pytest -s \
-              tests/functional_tests/test_cases/mimo/{test_case}/test_checkpoint_round_trip.py
+              {functional_test_case_dir}/test_checkpoint_round_trip.py

@@ -80,8 +80,8 @@ megatron/training/arguments.py
 .github/oncall_schedule.json @NVIDIA/mcore-oncall-rotation
 .gitlab-ci.yml @NVIDIA/ci
 docker/  @NVIDIA/ci
-tests/functional_tests/python_test_utils/ @NVIDIA/ci
-tests/functional_tests/shell_test_utils/ @NVIDIA/ci
+tests/functional_tests/*.py @NVIDIA/ci
+tests/functional_tests/*.sh @NVIDIA/ci
 tests/test_utils/recipes/ @NVIDIA/ci
 tests/unit_tests/run_ci_test.sh @NVIDIA/ci
 

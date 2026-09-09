@@ -54,12 +54,12 @@ spec:
         "CHECKPOINT_SAVE_PATH={artifacts_dir}/checkpoints"
         "CHECKPOINT_LOAD_PATH=/mnt/artifacts/model/{name}"
         "TRAINING_SCRIPT_PATH=\"nemo llm pretrain -y --factory {nemo_model}\""
-        "TRAINING_PARAMS_PATH=/opt/megatron-lm/tests/functional_tests/test_cases/{model}/{test_case}/model_config.yaml"
-        "GOLDEN_VALUES_PATH=/opt/megatron-lm/tests/functional_tests/test_cases/{model}/{test_case}/golden_values_{environment}_{platforms}.json"
+        "TRAINING_PARAMS_PATH=/opt/megatron-lm/{functional_test_case_dir}/model_config.yaml"
+        "GOLDEN_VALUES_PATH=/opt/megatron-lm/{functional_test_case_dir}/golden_values_{environment}_{platforms}.json"
         "N_REPEAT={n_repeat}"
     )
 
-    bash /opt/megatron-lm/tests/functional_tests/shell_test_utils/run_ci_test.sh ${{ARGUMENTS[@]}}
+    bash /opt/megatron-lm/tests/functional_tests/run_ci_test.sh ${{ARGUMENTS[@]}}
 
 products:
   - test_case: [llama3-nemo_8b_mr_mbs1_gbs8_mcore_te_8experts_tp2_ep2_pp2_dgx_a100_1N8G]

@@ -21,6 +21,7 @@ from jetclient.facades.objects import log as jet_log
 from jetclient.services.dtos.pipeline import PipelineStatus
 
 from tests.test_utils.python_scripts import recipe_parser
+from tests.test_utils.python_scripts.functional_test_paths import functional_test_case_dir
 
 BASE_PATH = pathlib.Path(__file__).parent.resolve()
 DASHBOARD_ENDPOINT = os.getenv("DASHBOARD_ENDPOINT")
@@ -443,15 +444,8 @@ def main(
     logging.basicConfig(level=logging.INFO)
     logger.info("Started")
 
-    model_config_path = pathlib.Path(
-        BASE_PATH
-        / ".."
-        / ".."
-        / "functional_tests"
-        / "test_cases"
-        / model
-        / test_case
-        / "model_config.yaml"
+    model_config_path = (
+        BASE_PATH.parents[2] / functional_test_case_dir(model, test_case) / "model_config.yaml"
     )
 
     if model_config_path.exists():
@@ -584,7 +578,10 @@ def main(
                 continue
 
             if (
-                "FAILED tests/functional_tests/python_test_utils" in concat_mainrank_log
+                re.search(
+                    r"FAILED tests/functional_tests/(?:python_test_utils/)?test_[^/\s]+\.py",
+                    concat_mainrank_log,
+                )
                 or "Throughput is slower than expected!" in concat_mainrank_log
             ) and re.compile(r"\bEXIT_CODE=0\b").search(concat_mainrank_log) is not None:
                 n_nondeterminism_attemps += 1

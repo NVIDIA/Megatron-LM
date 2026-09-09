@@ -19,7 +19,6 @@ CHERRYPICK_SHAS=(
     "bfa0f308aa5f2df76eb24e6b9fb86de5b39b5334"
 )
 TEST_SCRIPT="test_cases/${MODEL}/${TESTCASE}.sh"
-GOLDEN_DIR="tests/functional_tests/test_cases/${MODEL}/${TESTCASE}"
 LOG_FILE="log.txt"
 
 REPO_ROOT="$(git rev-parse --show-toplevel)"
@@ -45,6 +44,20 @@ for sha in "${CHERRYPICK_SHAS[@]}"; do
    git fetch origin "${sha}"
    git cherry-pick "${sha}"
 done
+
+if [[ -f tests/test_utils/python_scripts/functional_test_paths.py ]]; then
+    GOLDEN_DIR=$(python - "${MODEL}" "${TESTCASE}" <<'PY'
+import sys
+
+from tests.test_utils.python_scripts.functional_test_paths import functional_test_case_dir
+
+print(functional_test_case_dir(sys.argv[1], sys.argv[2]))
+PY
+    )
+else
+    # Historical commits keep their test bundles under the logical model name.
+    GOLDEN_DIR="tests/functional_tests/test_cases/${MODEL}/${TESTCASE}"
+fi
 
 python -m tests.test_utils.python_scripts.generate_local_jobs --environment dev --scope mr
 

@@ -12,7 +12,7 @@ For latency-style metrics:
   - Fail when measured > baseline * (1 + tol).        ← regression (slower)
 
 The two-sided check on throughput matches the rule the old
-tests/functional_tests/python_test_utils/test_inference_regular_pipeline.py
+tests/functional_tests/test_inference_regular_pipeline.py
 applied. Speed-ups beyond UPPER_TOL would silently weaken regression detection
 for future runs, so we force a baseline refresh instead.
 

@@ -443,7 +443,7 @@ jobs:
           mapfile -t GOLDEN_VALUES_FILES < <(
             git diff --name-only --diff-filter=ACMR \
               --merge-base "origin/$BASE_REF" -- \
-              ':(glob)tests/functional_tests/test_cases/**/golden_values*.json'
+              ':(glob)tests/functional_tests/**/golden_values*.json'
           )
 
           if (( ${#GOLDEN_VALUES_FILES[@]} == 0 )); then

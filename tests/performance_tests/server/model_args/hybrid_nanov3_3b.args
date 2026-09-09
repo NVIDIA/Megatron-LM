@@ -1,5 +1,5 @@
 # Model-specific args for the nanov3 3B hybrid MoE checkpoint (TP=1 PP=1 EP=8 — 8 GPUs).
-# Sourced from tests/functional_tests/test_cases/hybrid/hybrid_dynamic_inference_tp1_ep8_nanov3_chunked_prefill/model_config.yaml
+# Sourced from tests/functional_tests/core/models/hybrid/hybrid_dynamic_inference_tp1_ep8_nanov3_chunked_prefill/model_config.yaml
 --load ${CHECKPOINT_LOAD_PATH}/model/nemotron6/3b_hybrid_moe/checkpoints/phase2_lc_reinit_emb/
 --tokenizer-model ${CHECKPOINT_LOAD_PATH}/model/nemotron6/tokenizers/multiMixV8.gpt4o_nc_sd.500000.128k.vocab.json
 --tokenizer-type TikTokenizer

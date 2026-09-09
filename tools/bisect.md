@@ -13,7 +13,7 @@ It is used during a manual `git bisect` workflow to determine which commit first
 | Argument | Description |
 |----------|-------------|
 | `<COMMIT>` | Any ref (SHA, branch, tag) that `git checkout` can resolve |
-| `<MODEL>` | Model subdirectory under `test_cases/` (e.g. `gpt`) |
+| `<MODEL>` | Logical recipe model name (e.g. `gpt`) |
 | `<TESTCASE>` | Test-case name (e.g. `gpt3_mcore_te_tp2_pp1_resume_torch_dist_cp2_nondeterministic`) |
 
 Example:
@@ -32,7 +32,7 @@ Example:
 | 4 | Generate local job configs (`generate_local_jobs --environment dev --scope mr`) |
 | 5 | Run `test_cases/gpt/gpt3_mcore_te_tp2_pp1_resume_torch_dist_cp2_nondeterministic.sh`, tee output to `log.txt` |
 | 6 | Parse `OUTPUT_PATH` from the line `This test wrote results into …` |
-| 7 | Copy `golden_values*.json` from `OUTPUT_PATH` into `tests/functional_tests/test_cases/gpt/gpt3_mcore_te_tp2_pp1_resume_torch_dist_cp2_nondeterministic/` |
+| 7 | Copy `golden_values*.json` from `OUTPUT_PATH` into `tests/functional_tests/core/models/gpt/gpt3_mcore_te_tp2_pp1_resume_torch_dist_cp2_nondeterministic/` |
 | 8 | Re-run the test to validate against the newly copied golden values |
 
 Steps 1–3 are commented out because during a `git bisect run` workflow the caller is expected to handle the checkout externally.
@@ -62,4 +62,4 @@ The NeMo 25.11 image ships megatron-lm pre-installed at `/opt/megatron-lm`. Clon
 ## Output
 
 - `log.txt` — cumulative log for both test runs (appended with `tee -a`).
-- `tests/functional_tests/test_cases/gpt/gpt3_mcore_te_tp2_pp1_resume_torch_dist_cp2_nondeterministic/golden_values*.json` — updated golden values copied from the first run.
+- `tests/functional_tests/core/models/gpt/gpt3_mcore_te_tp2_pp1_resume_torch_dist_cp2_nondeterministic/golden_values*.json` — updated golden values copied from the first run.

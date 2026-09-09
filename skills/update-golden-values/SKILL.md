@@ -9,7 +9,7 @@ End-to-end workflow for refreshing golden values from a GitHub Actions workflow 
 
 The skill orchestrates two scripts that already live in the repo:
 
-- `tests/test_utils/python_scripts/download_golden_values.py` — pulls artifacts from a workflow run and overwrites `tests/functional_tests/test_cases/**/golden_values_*.json`.
+- `tests/test_utils/python_scripts/download_golden_values.py` — pulls artifacts from a workflow run and overwrites `tests/functional_tests/**/golden_values_*.json`.
 - `tests/test_utils/python_scripts/compare_golden_values_kl.py` — diffs the working-tree goldens against `git HEAD` and reports per-metric `avg_rel_diff = mean((old − new) / old)`. (Filename keeps the legacy `_kl` suffix; the script no longer computes KL divergence.)
 
 ## Inputs to gather from the user
@@ -52,8 +52,8 @@ Reuse `/tmp/gv_venv` if it already exists. The comparison script only depends on
 If the working tree already has prior golden-value modifications you want to discard before re-downloading:
 
 ```bash
-git checkout -- tests/functional_tests/test_cases/
-git ls-files --others --exclude-standard tests/functional_tests/test_cases/ \
+git checkout -- ':(glob)tests/functional_tests/**/golden_values_*.json'
+git ls-files --others --exclude-standard ':(glob)tests/functional_tests/**/golden_values_*.json' \
   | while IFS= read -r f; do rm -f "$f"; done
 ```
 
@@ -175,7 +175,7 @@ Match the `download_golden_values.py` command in the bullet list to the scope us
 **Golden value updates**
 
 - Re-ran `tests/test_utils/python_scripts/download_golden_values.py --source github --pipeline-id <WORKFLOW_RUN_ID> <--only-failing if scope=only-failing>`.
-- Updated **<N> golden-value files** under `tests/functional_tests/test_cases/`.
+- Updated **<N> golden-value files** under `tests/functional_tests/`.
 
 ### Signed per-model relative differences
 

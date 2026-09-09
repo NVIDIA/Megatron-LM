@@ -28,10 +28,11 @@ GB200 functional tests live in `tests/test_utils/recipes/gb200/`:
 | `gpt-1node.yaml` | 1-node GPT tests (create if not present) |
 
 Model configs live at:
-`tests/functional_tests/test_cases/{model}/{test_case}/model_config.yaml`
+`tests/functional_tests/{package_path}/{test_case}/model_config.yaml`, where
+`package_path` is `core/models/gpt` for GPT and `core/transformer/moe` for MoE.
 
 1-node test cases use the `_1node` suffix:
-`tests/functional_tests/test_cases/{model}/{test_case}_1node/model_config.yaml`
+`tests/functional_tests/{package_path}/{test_case}_1node/model_config.yaml`
 
 ---
 
@@ -77,9 +78,9 @@ Going from 8 GPUs → 4 GPUs:
 
 ```bash
 # Trivial copy
-mkdir -p tests/functional_tests/test_cases/{model}/{test_case}_1node
-cp tests/functional_tests/test_cases/{model}/{test_case}/model_config.yaml \
-   tests/functional_tests/test_cases/{model}/{test_case}_1node/model_config.yaml
+mkdir -p tests/functional_tests/{package_path}/{test_case}_1node
+cp tests/functional_tests/{package_path}/{test_case}/model_config.yaml \
+   tests/functional_tests/{package_path}/{test_case}_1node/model_config.yaml
 
 # Then apply any parallelism changes (EP or PP) with Edit tool
 ```

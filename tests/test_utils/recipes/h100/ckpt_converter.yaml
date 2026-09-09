@@ -50,7 +50,7 @@ spec:
       --tee "0:3,7:3" \
       --redirects "3" \
       --nproc_per_node 8 \
-      -m tests.functional_tests.test_cases.common.{test_case}
+      -m tests.functional_tests.{test_case}
 
 products:
   - test_case: [ckpt_converter]

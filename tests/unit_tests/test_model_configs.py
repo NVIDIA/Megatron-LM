@@ -3,7 +3,7 @@ import pathlib
 import pytest
 import yaml
 
-YAML_DIR = pathlib.Path(__file__).parent / ".." / "functional_tests" / "test_cases"
+YAML_DIR = pathlib.Path(__file__).parent / ".." / "functional_tests"
 
 
 def get_yaml_files(directory):
@@ -25,7 +25,7 @@ def load_yaml(file_path):
 def test_model_config_tracks_memory(yaml_file, metric):
     """Test if each YAML file contains the required record."""
     print("gpt3-nemo" in str(yaml_file) or "ckpt_converter" in str(yaml_file))
-    if any(k in str(yaml_file) for k in ["gpt3-nemo", "ckpt_converter", "gpt-nemo", "inference"]):
+    if any(k in str(yaml_file) for k in ["-nemo", "ckpt_converter", "inference"]):
         pytest.skip("Skipping `test_model_config_tracks_memory`")
 
     model_config = load_yaml(yaml_file)

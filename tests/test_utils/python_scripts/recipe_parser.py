@@ -8,6 +8,11 @@ from typing import List, Optional
 import click
 import yaml
 
+if __package__:
+    from .functional_test_paths import functional_test_case_dir
+else:
+    from functional_test_paths import functional_test_case_dir
+
 BASE_PATH = pathlib.Path(__file__).parent.resolve()
 
 logger = logging.getLogger(__name__)
@@ -184,6 +189,10 @@ def flatten_workload(workload_manifest: dotdict) -> List[dotdict]:
         workload = copy.deepcopy(workload_manifest)
         workload["spec"] = {k: v for k, v in workload["spec"].items() if k not in product.keys()}
         workload["spec"] = dict(**dict(workload["spec"].items()), **product)
+        if "{functional_test_case_dir}" in workload["spec"].get("script", ""):
+            workload["spec"]["functional_test_case_dir"] = str(
+                functional_test_case_dir(workload["spec"]["model"], workload["spec"]["test_case"])
+            )
         workload_manifests.append(dotdict(**workload))
     return workload_manifests
 
