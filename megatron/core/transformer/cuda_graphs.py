@@ -477,9 +477,10 @@ def make_weakref(ten, inplace=True):
         # Fallback to keeping a strong reference. There is a known bug where some
         # dtypes (e.g. torch.float64) are not mapped to a representation in
         # transformer_engine/pytorch/utils.py.
+        wr = ten
         if torch.distributed.get_rank() == 0:
             logger.warning(
-                f"Could not create weak ref for tensor with dtype {arg.dtype}; "
+                f"Could not create weak ref for tensor with dtype {ten.dtype}; "
                 f"keeping strong ref with a potential memory overhead."
             )
 
