@@ -2314,6 +2314,73 @@ class TestCompressedSparseAttentionThd:
             f"{(out_sbhd.float() - out_thd.float()).abs().max().item():.4e}"
         )
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_thd_fused_no_grad_and_grad_forwards_share_key_order(self, monkeypatch):
+        """Path C (no autograd) and Path B (grad-enabled) hand FlashMLA the same
+        compacted key ids in the same slot order, so re-scoring a batch without
+        gradients reproduces the training forward's attention exactly."""
+        from megatron.core.transformer.experimental_attention_variant.csa_utils import (
+            fused_sparse_attention as fsa,
+        )
+
+        try:
+            fsa._ensure_dsa_namespace()
+        except ImportError:
+            pytest.skip("cuDNN Frontend DSA namespace not available")
+
+        captured = []
+
+        def fake_flash(q, kv, topk_idxs, softmax_scale, d_v=512, **kwargs):
+            topk_length = kwargs.get("topk_length")
+            captured.append(
+                (topk_idxs.clone(), None if topk_length is None else topk_length.clone())
+            )
+            lse = torch.zeros(q.shape[0], q.shape[1], dtype=torch.float32, device=q.device)
+            return torch.zeros_like(q), lse, None
+
+        monkeypatch.setattr(fsa, "_csa_fwd_flash_mla", fake_flash)
+
+        overrides = {
+            "dsa_kernel_backend": "cudnn",
+            "deterministic_mode": True,
+            "dsa_indexer_loss_coeff": 0.0,
+        }
+        saved = {name: getattr(self.config, name) for name in overrides}
+        for name, value in overrides.items():
+            setattr(self.config, name, value)
+        try:
+            csa = self._build_csa(compress_ratio=4)
+            torch.manual_seed(7)
+            query, key, value, x, qr, packed = self._make_thd_inputs([96, 40, 72])
+            csa.train()
+            with torch.no_grad():
+                csa(
+                    query=query,
+                    key=key,
+                    value=value,
+                    attention_mask=None,
+                    x=x,
+                    qr=qr,
+                    packed_seq_params=packed,
+                )
+            csa(
+                query=query,
+                key=key,
+                value=value,
+                attention_mask=None,
+                x=x,
+                qr=qr,
+                packed_seq_params=packed,
+            )
+        finally:
+            for name, value in saved.items():
+                setattr(self.config, name, value)
+
+        assert len(captured) == 2
+        (no_grad_idxs, no_grad_lengths), (grad_idxs, grad_lengths) = captured
+        assert torch.equal(no_grad_lengths, grad_lengths)
+        assert torch.equal(no_grad_idxs, grad_idxs)
+
 
 # ===========================================================================
 # _apply_rope direct THD tests (4 corners: ratio={1, >1} × fused={False, True})

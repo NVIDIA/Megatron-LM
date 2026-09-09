@@ -29,6 +29,7 @@ from megatron.core.transformer.experimental_attention_variant.csa_utils.fused_sp
     BSHDCompactIndexerWorkspace,
     FusedCSAIndexerSparseAttnFromTopkFunc,
     THDCompactIndexerWorkspace,
+    _compact_flat_topk_idxs,
     batch_of_row,
     bshd_compact_indexer_available,
     build_flat_topk_idxs,
@@ -2202,8 +2203,10 @@ class CompressedSparseAttention(MegatronModule):
             deterministic=self.config.deterministic_mode,
         )
         compress_topk_idxs = torch.where(topk_indices_cmp >= 0, topk_indices_cmp + offset, -1)
+        # Compressed ids first, matching the training path's key order so both
+        # forwards drive FlashMLA identically.
         flat_idxs, flat_tlen = build_flat_topk_idxs(
-            window_idxs, compress_topk_idxs, batch_size=b, compact=True
+            compress_topk_idxs, window_idxs, batch_size=b, compact=True
         )
         nvtx_range_pop("compressed_indices")
 
@@ -2656,6 +2659,11 @@ class CompressedSparseAttention(MegatronModule):
                 deterministic=self.config.deterministic_mode,
             )
 
+        # The training path lowers these ids compressed-first (the indexer-loss
+        # layout) and compacts them afterwards. Use the same lowering here so a
+        # no-grad forward hands FlashMLA exactly the key order a grad-enabled
+        # forward does; the online-softmax result depends on that order.
+        compressed_first = topk_indices_cmp.shape[-1] > 0
         flat_idxs, flat_tlen, _, _ = thd_layout_kernels.build_attention_indices(
             cu_seqlens_q,
             0,
@@ -2666,11 +2674,14 @@ class CompressedSparseAttention(MegatronModule):
             topk_indices_cmp.shape[-1],
             topk_indices_cmp,
             cu_seqlens_compressed=cu_seqlens_compressed,
+            for_indexer_loss=compressed_first,
             compressed_base=compressed_base,
             compressed_rows=compressed_rows,
             compressed_is_sequence_major=True,
             output_alignment=get_flash_mla_topk_alignment(),
         )
+        if compressed_first:
+            flat_idxs, flat_tlen = _compact_flat_topk_idxs(flat_idxs)
         output = csa_sparse_attn(
             query,
             kv_full_thd,
