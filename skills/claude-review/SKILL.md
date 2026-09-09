@@ -4,8 +4,6 @@ description: Prompt asset for the Claude Code Review GitHub Action. It is read a
 license: Apache-2.0
 disable-model-invocation: true
 user_invocable: false
-metadata:
-  author: Oliver Koenig <okoenig@nvidia.com>
 ---
 
 # Claude PR Review
