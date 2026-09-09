@@ -228,9 +228,13 @@ class MegatronMultimodalTokenizer:
         return self.tokenizer.encode(text)
 
     def tokenize_conversation(
-        self, conversation: List[Dict], return_target: bool, add_generation_prompt: bool
+        self,
+        conversation: List[Dict],
+        return_target: bool,
+        add_generation_prompt: bool,
+        tokenize: bool = True,
     ):
-        """Convert a conversation to tokens.
+        """Convert a conversation to tokens, or to a rendered string.
 
         Args:
             conversation (List[Dict]): Sequence of system/user/assistant messages.
@@ -240,23 +244,23 @@ class MegatronMultimodalTokenizer:
                     {"role": "assistant", "content": "something2"},
                 ]
             return_target (bool): Return target tokens with system and assistant masked.
+                Only supported when tokenize=True, since masking relies on token indices.
             add_generation_prompt (bool): Add assistant prefix to the end.
+            tokenize (bool): If False, return the rendered conversation string(s) instead
+                of token ids. Mirrors tokenizer.apply_chat_template's tokenize flag.
         """
+        if return_target and not tokenize:
+            raise ValueError(
+                "return_target=True requires tokenize=True: target masking is computed "
+                "over token indices and has no meaning on untokenized text."
+            )
+
         # Skip system message if the tokenizer doesn't have a system role.
         if not self._prompt_config.has_system_role and conversation[0]["role"] == "system":
             conversation = conversation[1:]
 
         if self._prompt_config.force_system_message:
             assert (
-                self._prompt_config.system_default is not None
-            ), "Trying to force system message with empty system default"
-            if conversation[0]["role"] == "system":
-                conversation[0] = self._prompt_config.system_default
-            else:
-                conversation = [self._prompt_config.system_default] + conversation
-
-        if self._prompt_format == "nemotron5-aligned":
-            for turn in conversation:
                 tmp = turn['role']
                 turn['role'] = tmp[:1].upper() + tmp[1:]
 
@@ -265,13 +269,16 @@ class MegatronMultimodalTokenizer:
 
         tokens = self.tokenizer.apply_chat_template(
             conversation,
-            tokenize=True,
+            tokenize=tokenize,
             add_generation_prompt=add_generation_prompt,
             return_assistant_token_mask=False,
-            return_tensors="np",
+            return_tensors="np" if tokenize else None,
             return_dict=False,
             chat_template=self._prompt_config.custom_chat_template,
-        )[0]
+        )
+
+        if tokenize:
+            tokens = tokens[0]
 
         if not return_target:
             return tokens
