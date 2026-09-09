@@ -21,6 +21,7 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from megatron.core.inference.communication_utils import broadcast_from_last_pipeline_stage
+from megatron.core.inference.utils import log_mtp_debug
 from megatron.core.tensor_parallel.mappings import (
     gather_from_sequence_parallel_region,
     scatter_to_sequence_parallel_region,
@@ -270,6 +271,19 @@ class MTPInferenceMixin:
             token_ids = F.pad(token_ids, (0, padded_total - total))
             position_ids = F.pad(position_ids, (0, padded_total - total))
 
+        log_mtp_debug(
+            "commit_pass_forward",
+            context,
+            total=total,
+            padded_total=padded_total,
+            active_request_count=active_request_count,
+            num_decode_requests=num_decode_requests,
+            hidden_states_shape=tuple(packed_hidden.shape),
+            token_ids_shape=tuple(token_ids.shape),
+            block_table_shape=tuple(block_table.shape),
+            sp_enabled=self._sp_enabled,
+            tp_size=self._tp_size,
+        )
         # Run the MTP attention to populate K/V only (output hidden discarded).
         unwrapped_model.mtp.layers[0].forward_single_position(
             hidden_states=packed_hidden,
@@ -301,6 +315,15 @@ class MTPInferenceMixin:
             )
         dummy_tokens = torch.zeros((1, n), device=device, dtype=torch.long)
         dummy_positions = torch.zeros((1, n), device=device, dtype=torch.long)
+        log_mtp_debug(
+            "dummy_prefill_forward",
+            context,
+            n=n,
+            hidden_states_shape=tuple(dummy_hidden.shape),
+            token_ids_shape=tuple(dummy_tokens.shape),
+            sp_enabled=self._sp_enabled,
+            tp_size=self._tp_size,
+        )
         unwrapped_model.mtp.layers[0].forward_single_position(
             hidden_states=dummy_hidden,
             next_token_ids=dummy_tokens,
@@ -490,6 +513,21 @@ class MTPInferenceMixin:
                 mtp_depth = None if unwrapped_model.mtp.mtp_use_repeated_layer else depth
                 if mtp_kv_cache_on:
                     context._mtp_setup_decode_step()
+                log_mtp_debug(
+                    "draft_depth_forward",
+                    context,
+                    depth=depth,
+                    mtp_depth=mtp_depth,
+                    active_request_count=active_request_count,
+                    padded_count=padded_count,
+                    num_mtp_draft_requests=num_mtp_draft_requests,
+                    mtp_graphed=mtp_graphed,
+                    graph_key_prefix=mtp_graph_key_prefix,
+                    hidden_states_shape=tuple(current_hidden.shape),
+                    token_ids_shape=tuple(token_ids_buf.shape),
+                    sp_enabled=self._sp_enabled,
+                    tp_size=self._tp_size,
+                )
                 current_hidden, mtp_logits = unwrapped_model.compute_mtp_single_step(
                     hidden_states=current_hidden,
                     next_token_ids=token_ids_buf,
@@ -547,6 +585,16 @@ class MTPInferenceMixin:
             context._mtp_setup_decode_step()
             extra_depth = (
                 None if unwrapped_model.mtp.mtp_use_repeated_layer else self.num_mtp_depths - 1
+            )
+            log_mtp_debug(
+                "extra_append_forward",
+                context,
+                extra_depth=extra_depth,
+                active_request_count=active_request_count,
+                padded_count=padded_count,
+                mtp_graphed=mtp_graphed,
+                hidden_states_shape=tuple(current_hidden.shape),
+                token_ids_shape=tuple(token_ids_buf.shape),
             )
             # The extra-append is a structurally identical one-token append+attend, so it reuses the
             # last depth's captured KV-aware graph key (repeated-layer -> ("mtp_kv", n, None);
@@ -650,6 +698,16 @@ class MTPInferenceMixin:
             mtp_logits_2d = None
             if has_mtp:
                 mtp_depth = None if unwrapped_model.mtp.mtp_use_repeated_layer else depth
+                log_mtp_debug(
+                    "dummy_draft_depth_forward",
+                    context,
+                    depth=depth,
+                    mtp_depth=mtp_depth,
+                    padded_count=padded_count,
+                    mtp_forward_eager=mtp_forward_eager,
+                    hidden_states_shape=tuple(dummy_hidden.shape),
+                    token_ids_shape=tuple(dummy_token_ids.shape),
+                )
                 dummy_hidden, mtp_logits = unwrapped_model.compute_mtp_single_step(
                     hidden_states=dummy_hidden,
                     next_token_ids=dummy_token_ids,

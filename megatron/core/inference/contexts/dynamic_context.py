@@ -36,7 +36,7 @@ from megatron.core.inference.unified_memory import (
     UnifiedMemoryUnsupportedError,
     create_unified_mempool,
 )
-from megatron.core.inference.utils import device_memory_summary, tensor_swap
+from megatron.core.inference.utils import device_memory_summary, log_mtp_debug, tensor_swap
 from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_emb
 from megatron.core.models.hybrid.hybrid_layer_allocation import (
     Symbols,
@@ -2119,6 +2119,21 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.padded_active_token_count = padded
             self._using_cuda_graph_this_step = False
 
+        # Shapes only -- no `.tolist()`/`.item()` on the GPU metadata here. This runs during
+        # CUDA-graph warmup too, and a device sync in that path would be both slow and
+        # misleading about what the captured graph sees.
+        log_mtp_debug(
+            "setup_decode_step",
+            self,
+            n=n,
+            padded=padded,
+            max_seqlen_q=mha.state_data["max_seqlen_q"],
+            max_seqlen_k=mha.state_data["max_seqlen_k"],
+            cu_query_seq_lengths_shape=tuple(mha.state_data["cu_query_seq_lengths"].shape),
+            kv_seq_lengths_shape=tuple(mha.state_data["kv_seq_lengths"].shape),
+            block_table_shape=tuple(mha.state_data["block_table"].shape),
+        )
+
     def _mtp_setup_prefill_step(
         self,
         append_counts: Tensor,
@@ -2207,10 +2222,26 @@ class DynamicInferenceContext(BaseInferenceContext):
         self._mtp_saved_num_prefill_requests = self.num_prefill_requests
         self.num_prefill_requests = max(1, num_prefill)
 
+        log_mtp_debug(
+            "setup_prefill_step",
+            self,
+            num_prefill=num_prefill,
+            total=total,
+            padded_total=padded_total,
+            padded_request_count=padded_p,
+            max_seqlen=max_seqlen,
+            # `total` above already forced a device sync, so this adds no new one.
+            append_counts=append_counts.tolist(),
+            cu_query_seq_lengths_shape=tuple(mha.state_data["cu_query_seq_lengths"].shape),
+            block_table_shape=tuple(mha.state_data["block_table"].shape),
+            saved_num_prefill_requests=self._mtp_saved_num_prefill_requests,
+        )
+
     def _mtp_finalize_prefill_step(self) -> None:
         """Exit MTP-forward mode after the commit-pass (varlen) forward."""
         self._mtp_forward_active = False
         self.num_prefill_requests = self._mtp_saved_num_prefill_requests
+        log_mtp_debug("finalize_prefill_step", self)
 
     def _mtp_advance_decode_step(self) -> None:
         """Advance each active request's MTP write position by one after a depth forward."""
