@@ -150,7 +150,13 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
             )
         self.inner_layer = layer
         self.layer_number = layer.layer_number
+        self._offload_module_in_cuda_graph_cached: Optional[bool] = None
         self.hyper_connection = HyperConnectionModule(config=config, layer_number=self.layer_number)
+        # This wrapper is the TE graph callable, so it owns the captured offload event
+        # boundary. Reuse the inner Transformer's interface instead of reaching across
+        # modules for its private factory. Only TransformerLayer-backed wrappers can
+        # report an offload boundary in ``offload_module_in_cuda_graph``.
+        self.off_interface = layer.off_interface if isinstance(layer, TransformerLayer) else None
         if config.params_dtype is not None:
             convert_module_to_dtype_except_fp32_marked(self.hyper_connection, config.params_dtype)
         if hasattr(layer, 'tp_group'):
@@ -240,6 +246,39 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
             and CudaGraphModule.moe_router in self.config.cuda_graph_modules
         )
 
+    def _compute_inner_offload_module_in_cuda_graph(self) -> bool:
+        """Whether the captured inner TransformerLayer contains an offload boundary.
+
+        HybridStack can split attention and MoE into separate TransformerLayers while
+        sharing one global config, so require the configured scope to have a concrete
+        branch in this split layer.
+        """
+        if not isinstance(self.inner_layer, TransformerLayer):
+            return False
+        return self.inner_layer.offload_scope_in_cuda_graph(require_concrete_modules=True)
+
+    def _compute_offload_module_in_cuda_graph(self) -> bool:
+        """Compute the effective offload state for this complete TE callable."""
+        if self._compute_inner_offload_module_in_cuda_graph():
+            return True
+        group_tail = self._get_te_cuda_graph_group_tail()
+        return bool(
+            group_tail is not None and group_tail._compute_inner_offload_module_in_cuda_graph()
+        )
+
+    @property
+    def offload_module_in_cuda_graph(self) -> bool:
+        """Whether TE must join the wrapper graph with offload streams.
+
+        The graph-group tail setter is the only grouping mutation and invalidates
+        this replay-hot-path cache whenever it attaches a tail.
+        """
+        cached = self._offload_module_in_cuda_graph_cached
+        if cached is None:
+            cached = self._compute_offload_module_in_cuda_graph()
+            self._offload_module_in_cuda_graph_cached = cached
+        return cached
+
     def _can_group_te_cuda_graph_with(self, next_layer: MegatronModule) -> bool:
         """Whether this attention layer and the following MoE prefix can share one TE graph.
 
@@ -277,6 +316,7 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
         # Bypass nn.Module.__setattr__: next_layer remains registered exactly once in
         # HybridStack.layers, so this capture-only reference cannot alter state_dict keys.
         object.__setattr__(self, '_te_cuda_graph_group_tail', next_layer)
+        self._offload_module_in_cuda_graph_cached = None
 
     def _get_te_cuda_graph_group_tail(self) -> Optional['HyperConnectionHybridLayer']:
         """Return the capture-only MoE tail, if discovery grouped this layer."""
@@ -326,20 +366,52 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
         """
         self._reconstruct_packed_seq_params_from_kwargs(kwargs)
 
+        # The Hybrid wrapper, not its inner TransformerLayer(s), is the TE graph
+        # callable. Place the offload events at this outer boundary so every D2H/H2D
+        # stream dependency belongs to the graph being captured.
+        offload_in_graph = self.offload_module_in_cuda_graph
+        off_interface = self.off_interface
+        if offload_in_graph:
+            assert off_interface is not None, (
+                "offload_module_in_cuda_graph requires a TransformerLayer-backed "
+                "Hybrid wrapper with an offload interface."
+            )
+            if args:
+                hidden_states = off_interface.backward_record(args[0])
+                args = (hidden_states,) + args[1:]
+            else:
+                hidden_states = off_interface.backward_record(kwargs.pop('hidden_states'))
+                kwargs['hidden_states'] = hidden_states
+
+        cuda_graph_outputs = self._te_cuda_graph_capture_impl(*args, **kwargs)
+
+        if offload_in_graph:
+            off_interface.forward_record()
+        return cuda_graph_outputs
+
+    def _te_cuda_graph_capture_impl(self, *args, **kwargs):
+        """Capture the wrapper body without adding offload boundary events."""
+        assert 'cu_seqlens_q' not in kwargs, (
+            "Hybrid CUDA graph capture body received raw THD sequence tensors. "
+            "The outer capture boundary must reconstruct PackedSeqParams first."
+        )
+
         group_tail = self._get_te_cuda_graph_group_tail()
         if group_tail is not None:
             hidden_states, context = self.forward(*args, **kwargs)
             assert context is None, "Grouped hybrid CUDA graphs do not support cross-attention."
             tail_kwargs = dict(kwargs)
             tail_kwargs.pop("hidden_states", None)
-            return group_tail._te_cuda_graph_capture(hidden_states, **tail_kwargs)
+            return group_tail._te_cuda_graph_capture_impl(hidden_states, **tail_kwargs)
 
         if self._inner_is_partial_moe_capture():
             hidden_states = args[0] if args else kwargs["hidden_states"]
             aggregated, h_res, h_post, residual = self.hyper_connection(hidden_states)
             inner_kwargs = dict(kwargs)
             inner_kwargs.pop("hidden_states", None)
-            inner_out = list(self.inner_layer._te_cuda_graph_capture(aggregated, **inner_kwargs))
+            inner_out = list(
+                self.inner_layer._te_cuda_graph_capture_impl(aggregated, **inner_kwargs)
+            )
             # inner_out = router/preprocess intermediates ending in the inner residual;
             # append the mHC state AND the n-stream `residual` returned by the (graphed)
             # hyper_connection. Routing `residual` through the graph as an output keeps its
@@ -365,19 +437,27 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
         experts eagerly and apply the mHC n-stream BDA — reproducing exactly the eager
         wrapper tail (``layer_delta = layer_output - aggregated`` then
         ``fused_h_res_h_post_bda``), just with the deterministic prefix graphed.
+
+        Captured ``core_attn`` offload synchronization uses the wrapper-level events in
+        ``_te_cuda_graph_capture`` and does not use the delayed-offload queue. Delayed
+        expert offload is intentionally outside the Hybrid CUDA Graph support in this
+        change, so this wrapper must not enter or flush that queue around replay.
         """
         self._decompose_packed_seq_params_to_kwargs(kwargs)
+        return self._te_cuda_graph_replay_impl(args, kwargs)
+
+    def _te_cuda_graph_replay_impl(self, args, kwargs):
+        """Replay the wrapper graph, then run any eager continuation."""
 
         group_tail = self._get_te_cuda_graph_group_tail()
+        cuda_graph_output = list(super()._te_cuda_graph_replay(*args, **kwargs))
+
         if group_tail is not None:
-            out = list(super()._te_cuda_graph_replay(*args, **kwargs))
-            return group_tail._resume_partial_moe_cuda_graph(out)
+            return group_tail._resume_partial_moe_cuda_graph(cuda_graph_output)
 
         if self._inner_is_partial_moe_capture():
-            out = list(super()._te_cuda_graph_replay(*args, **kwargs))
-            return self._resume_partial_moe_cuda_graph(out)
+            return self._resume_partial_moe_cuda_graph(cuda_graph_output)
 
-        cuda_graph_output = list(super()._te_cuda_graph_replay(*args, **kwargs))
         return cuda_graph_output[0], None
 
     def _resume_partial_moe_cuda_graph(self, out: List[Tensor]) -> Tuple[Tensor, Optional[Tensor]]:
