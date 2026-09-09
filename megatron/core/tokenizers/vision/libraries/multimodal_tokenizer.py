@@ -261,6 +261,15 @@ class MegatronMultimodalTokenizer:
 
         if self._prompt_config.force_system_message:
             assert (
+                self._prompt_config.system_default is not None
+            ), "Trying to force system message with empty system default"
+            if conversation[0]["role"] == "system":
+                conversation[0] = self._prompt_config.system_default
+            else:
+                conversation = [self._prompt_config.system_default] + conversation
+
+        if self._prompt_format == "nemotron5-aligned":
+            for turn in conversation:
                 tmp = turn['role']
                 turn['role'] = tmp[:1].upper() + tmp[1:]
 
