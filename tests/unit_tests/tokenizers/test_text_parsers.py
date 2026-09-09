@@ -237,3 +237,99 @@ def test_qwen3_coder_arguments_are_always_valid_json():
                 raise AssertionError(f"emitted bare {constant} in {raw}")
 
             json.loads(raw, parse_constant=_bare)
+
+
+# ---------------------------------------------------------------------------
+# Qwen3-Coder tool parser: grammar parity
+# ---------------------------------------------------------------------------
+# Coercion parity (above) left the surrounding grammar untouched. These cases
+# cover the shapes where the two grammars visibly disagreed; every expectation
+# is what vLLM 0.25.1 actually returned for the same input, measured by running
+# both stacks over a shared corpus in one process.
+#
+# The reference implementation is vllm/parser/qwen3.py:
+#
+#     _PARAM_RE = r"<\s*parameter\s*=\s*([^>]*)>(.*?)"
+#                 r"(?:<\s*/\s*parameter\s*>|(?=<\s*parameter\s*=))"
+#     params[name] = value.strip()      # the NAME is deliberately not stripped
+
+GRAMMAR_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "f",
+            "parameters": {"properties": {"a": {"type": "string"}, "b": {"type": "integer"}}},
+        },
+    }
+]
+
+
+def call_args(body, tools=GRAMMAR_TOOLS):
+    """Parse one tool call and return its arguments dict (None if no call)."""
+    info = _Qwen3CoderToolParser().extract_tool_calls(body, tools=tools)
+    calls = info.get("tool_calls") or []
+    if not calls:
+        return None
+    return json.loads(calls[0]["function"]["arguments"])
+
+
+@pytest.mark.parametrize(
+    "body,expected",
+    [
+        # Whitespace is permitted anywhere inside the parameter tag. `\s*` after
+        # `=` consumes leading whitespace in the name; `[^>]*` keeps trailing
+        # whitespace, which vLLM also keeps.
+        ("<function=f>\n< parameter = a >x</parameter>\n</function>", {"a ": "x"}),
+        ("<function=f>\n<parameter =a>x</parameter>\n</function>", {"a": "x"}),
+        ("<function=f>\n<parameter= a>x</parameter>\n</function>", {"a": "x"}),
+        ("<function=f>\n<parameter=a >x</parameter>\n</function>", {"a ": "x"}),
+        ("<function=f>\n<parameter= a >x</parameter>\n</function>", {"a ": "x"}),
+        # ...and inside the closing tag.
+        ("<function=f>\n<parameter=a>x</ parameter >\n</function>", {"a": "x"}),
+        ("<function=f>\n<parameter=a>x</parameter >\n</function>", {"a": "x"}),
+        # A parameter is only recognised when closed by </parameter> or followed
+        # by another <parameter=>. An unclosed one is dropped, not salvaged.
+        ("<function=f>\n<parameter=a>x\n</function>", {}),
+        ("<function=f>\n<parameter=a>x\n<parameter=b>7\n</function>", {"a": "x"}),
+    ],
+)
+def test_qwen3_coder_parameter_grammar_matches_vllm(body, expected):
+    assert call_args(f"<tool_call>\n{body}\n</tool_call>") == expected
+
+
+def test_qwen3_coder_tool_call_end_inside_value_does_not_terminate_the_call():
+    """A </tool_call> written inside a parameter value belongs to the value.
+
+    vLLM's engine tracks that it is inside a parameter; matching that here means
+    consuming complete <parameter>...</parameter> blocks atomically.
+    """
+    body = (
+        "<tool_call>\n<function=f>\n"
+        "<parameter=a>see </tool_call> here</parameter>\n"
+        "</function>\n</tool_call>"
+    )
+    assert call_args(body) == {"a": "see </tool_call> here"}
+
+
+@pytest.mark.parametrize(
+    "text,expected_name",
+    [
+        # Generation stopped before the function tag closed. vLLM still emits a
+        # call named after the remaining text; dropping it instead left
+        # "<tool_call>" in the post-parse content, which NeMo-Gym scores as
+        # is_invalid_tool_call and converts into a -5.0 advantage.
+        ("<tool_call>\n<function=f", "f"),
+        ("text mentioning <function= but never closing", "but never closing"),
+    ],
+)
+def test_qwen3_coder_truncated_function_tag_still_yields_a_call(text, expected_name):
+    info = _Qwen3CoderToolParser().extract_tool_calls(text, tools=GRAMMAR_TOOLS)
+    calls = info.get("tool_calls") or []
+    assert [c["function"]["name"] for c in calls] == [expected_name]
+    assert "<tool_call>" not in (info.get("content") or "")
+
+
+def test_qwen3_coder_truncated_tool_call_without_function_yields_nothing():
+    """`<tool_call>` with no `<function=` is not a call in either engine."""
+    info = _Qwen3CoderToolParser().extract_tool_calls("<tool_call>\n", tools=GRAMMAR_TOOLS)
+    assert not (info.get("tool_calls") or [])

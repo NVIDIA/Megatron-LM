@@ -181,10 +181,38 @@ class _Qwen3CoderToolParser:
 
     # Regex patterns
     tool_call_complete_regex = re.compile(r"<tool_call>(.*?)</tool_call>", re.DOTALL)
-    tool_call_regex = re.compile(r"<tool_call>(.*?)</tool_call>|<tool_call>(.*?)$", re.DOTALL)
+    # A `</tool_call>` occurring INSIDE a parameter value must not terminate the
+    # call. vLLM's engine is a state machine that knows it is inside a parameter;
+    # the equivalent here is to consume complete `<parameter=...>...</parameter>`
+    # blocks atomically, so any `</tool_call>` within one is absorbed. Everything
+    # else is consumed a character at a time, guarded by a negative lookahead.
+    # This stays linear: measured 3.5x the old pattern at a constant ratio from
+    # 5k to 60k characters (~6 ms on a 60k-char truncated generation).
+    # The second alternative is unchanged and still salvages a call whose
+    # `</tool_call>` never arrived.
+    tool_call_regex = re.compile(
+        r"<tool_call>("
+        r"(?:<\s*parameter\s*=[^>]*>.*?<\s*/\s*parameter\s*>|(?!</tool_call>).)*"
+        r")</tool_call>"
+        r"|<tool_call>(.*?)$",
+        re.DOTALL,
+    )
     tool_call_function_regex = re.compile(r"<function=(.*?)</function>|<function=(.*)$", re.DOTALL)
+    # Mirrors vLLM's `_PARAM_RE` in `vllm/parser/qwen3.py`. Three properties are
+    # load-bearing and each was previously wrong:
+    #   * the tag tolerates whitespace -- `< parameter = a >`, `</ parameter >`
+    #   * the name is captured separately, so `\s*` after `=` eats leading
+    #     whitespace while `[^>]*` keeps trailing whitespace (vLLM does not
+    #     strip the name)
+    #   * a parameter is recognised ONLY when closed by `</parameter>` or
+    #     followed by another `<parameter=`. vLLM has no `</function>` or
+    #     end-of-string terminator, so an unclosed parameter is dropped rather
+    #     than salvaged.
     tool_call_parameter_regex = re.compile(
-        r"<parameter=(.*?)(?:</parameter>|(?=<parameter=)|(?=</function>)|$)", re.DOTALL
+        r"<\s*parameter\s*=\s*([^>]*)>"
+        r"(.*?)"
+        r"(?:<\s*/\s*parameter\s*>|(?=<\s*parameter\s*=))",
+        re.DOTALL,
     )
 
     def _generate_tool_call_id(self) -> str:
@@ -232,24 +260,32 @@ class _Qwen3CoderToolParser:
     def _parse_xml_function_call(
         self, function_call_str: str, tools: list[ChatCompletionToolsParam] | None
     ) -> ToolCall | None:
-        # Extract function name
+        # Extract function name. When the opening tag was never closed -- e.g.
+        # generation stopped mid-name, leaving `<function=f` -- vLLM still emits
+        # a call named after the remaining text. Returning None here instead
+        # left `<tool_call>` in the post-parse content, which NeMo-Gym reads as
+        # `is_invalid_tool_call` and turns into a -5.0 advantage, so a merely
+        # truncated call was being punished as a malformed one.
         end_index = function_call_str.find(">")
         if end_index == -1:
-            return None
+            function_name = function_call_str.strip()
+            if not function_name:
+                return None
+            return ToolCall(
+                type="function",
+                id=self._generate_tool_call_id(),
+                function=FunctionCall(name=function_name, arguments="{}"),
+            )
         function_name = function_call_str[:end_index]
         param_config = self._get_arguments_config(function_name, tools)
         parameters = function_call_str[end_index + 1 :]
         param_dict = {}
-        for match_text in self.tool_call_parameter_regex.findall(parameters):
-            idx = match_text.find(">")
-            # Malformed parameter block with no name/value delimiter, e.g. truncated tool call.
-            if idx == -1:
-                continue
-            param_name = match_text[:idx]
-            param_value = str(match_text[idx + 1 :])
+        for param_name, param_value in self.tool_call_parameter_regex.findall(parameters):
             # vLLM's _qwen3_arg_converter strips the value before coercion, so
-            # whitespace around a value never reaches the tool.
-            param_value = param_value.strip()
+            # whitespace around a value never reaches the tool. The NAME is not
+            # stripped: `\s*` in the pattern already removed anything leading,
+            # and vLLM preserves trailing whitespace inside `[^>]*`.
+            param_value = str(param_value).strip()
 
             param_dict[param_name] = self._convert_param_value(
                 param_value, param_name, param_config, function_name
