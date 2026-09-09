@@ -93,10 +93,10 @@ def fully_shard_context(
             requested = device if device is not None else torch.device(
                 "cuda", torch.cuda.current_device()
             )
-            if existing.device != requested:
+            if existing.allgather_stream.device != requested:
                 raise ValueError(
                     "fully_shard_context cannot be shared across devices: active context "
-                    f"is on {existing.device}, requested {requested}."
+                    f"is on {existing.allgather_stream.device}, requested {requested}."
                 )
             # Join the outermost scope's context. Only the scope that created the
             # context finalizes it; reused scopes leave finalization to the creator.
