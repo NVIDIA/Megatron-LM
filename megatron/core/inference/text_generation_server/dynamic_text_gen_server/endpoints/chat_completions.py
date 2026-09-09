@@ -555,20 +555,29 @@ def _replace_prefix_tokens(
     if previous_turn_token_ids and previous_turn_token_ids[-1] == eos_token_id:
         previous_turn_token_ids = previous_turn_token_ids[:-1]
 
-    # Find the last EOS token id in the previous turn token ids
-    last_eos_token_id_index = len(retokeenized_previous_turn_token_ids) - 1
-    # Note that the current conversation stat may be shorter than the previous conversation state.
-    scan_len = min(len(retokeenized_previous_turn_token_ids), len(current_turn_token_ids))
-    for i in reversed(range(scan_len)):
-        if current_turn_token_ids[i] == eos_token_id:
-            last_eos_token_id_index = i
-            break
+    last_eos_token_id_index = _prefix_replacement_start(
+        eos_token_id, retokeenized_previous_turn_token_ids, current_turn_token_ids
+    )
 
     # Replace the current turn token ids with the tokens from the previous generation
     current_turn_additional_token_ids = current_turn_token_ids[last_eos_token_id_index:]
 
     # Return the previous turn token ids + the current turn token ids
     return previous_turn_token_ids + current_turn_additional_token_ids
+
+
+def _prefix_replacement_start(
+    eos_token_id, retokenized_previous_turn_token_ids, current_turn_token_ids
+):
+    """Locate the rendered boundary at which an exact prior prefix is spliced."""
+    last_eos_token_id_index = len(retokenized_previous_turn_token_ids) - 1
+    # The current conversation state may be shorter than the previous conversation state.
+    scan_len = min(len(retokenized_previous_turn_token_ids), len(current_turn_token_ids))
+    for i in reversed(range(scan_len)):
+        if current_turn_token_ids[i] == eos_token_id:
+            last_eos_token_id_index = i
+            break
+    return last_eos_token_id_index
 
 
 def _apply_chat_template_sync(
