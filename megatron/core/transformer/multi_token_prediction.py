@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import warnings
-from contextlib import nullcontext
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Callable, List, Optional, Union
 
@@ -1427,6 +1427,14 @@ class MultiTokenPredictionLayer(MegatronModule):
                 setattr(self.hc_head_scale, "sequence_parallel", True)
         self.offload_context = nullcontext()
 
+    def get_inner_quantization_context(self) -> AbstractContextManager:
+        """Return the quantization context for fine-grained MTP execution."""
+        if self.config.fp8 and self.config.fp8_recipe != Fp8Recipe.delayed:
+            return get_fp8_context(self.config)
+
+        # FP4 in MTP layers still needs numerical validation.
+        return nullcontext()
+
     def _get_embeddings(
         self,
         input_ids: torch.Tensor,
@@ -1747,8 +1755,7 @@ class MultiTokenPredictionLayer(MegatronModule):
         packed_seq_params_by_layout: Optional[dict[CPLayout, PackedSeqParams | None]] = None,
         cp_layout_plan: Optional[THDCPLayoutPlan] = None,
     ):
-        """Forward through ``_proj_and_transformer_layer`` with activation
-        recomputation.
+        """Forward a legacy GPT MTP layer with activation recomputation.
 
         Mirrors ``transformer_block._checkpointed_forward``:
 
@@ -1760,6 +1767,10 @@ class MultiTokenPredictionLayer(MegatronModule):
           context entered before ``te_checkpoint``; see the
           ``outer_quantization_context`` block below.
         """
+
+        assert (
+            self.mtp_layer_pattern is None
+        ), "Hybrid MTP delegates full activation recomputation to its nested HybridStack."
 
         def custom_forward(
             hidden_states,
@@ -1947,7 +1958,15 @@ class MultiTokenPredictionLayer(MegatronModule):
             )
         )
 
-        if self.config.recompute_granularity == 'full' and self.training:
+        # Legacy GPT MTP owns one outer checkpoint around its projection and Transformer
+        # layer. Hybrid MTP instead delegates full recompute to the nested HybridStack so
+        # that ``recompute_num_layers`` controls its layer chunks without nesting checkpoints.
+        use_outer_recompute = (
+            self.config.recompute_granularity == 'full'
+            and self.training
+            and self.mtp_layer_pattern is None
+        )
+        if use_outer_recompute:
             hidden_states = self._checkpointed_forward(
                 hidden_states=hidden_states,
                 decoder_input=decoder_input,

@@ -502,6 +502,13 @@ products:
         scope: [unit-tests]
         n_repeat: [1]
         time_limit: [1800]
+  - test_case: [tests/unit_tests/core/pipeline_parallel/test_schedule_quantization_context.py]
+    products:
+      - environment: [lts, dev]
+        tag: [latest]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
   - test_case: [tests/unit_tests/core/determinism/correctness/**/*.py]
     products:
       - environment: [lts, dev]
