@@ -302,10 +302,27 @@ runs:
         fi
 
     - name: Upload coverage
+      id: upload-coverage
       uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
       if: ${{ always() && steps.check.outputs.coverage_report != 'none' }}
+      continue-on-error: true
       with:
         name: ${{ steps.check.outputs.coverage_report }}
+        path: |
+          coverage.xml
+          .coverage
+        include-hidden-files: true
+
+    - name: Back off after coverage upload failure
+      if: ${{ always() && steps.upload-coverage.outcome == 'failure' }}
+      shell: bash
+      run: sleep 10
+
+    - name: Retry coverage upload
+      uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+      if: ${{ always() && steps.upload-coverage.outcome == 'failure' }}
+      with:
+        name: ${{ steps.check.outputs.coverage_report }}-retry
         path: |
           coverage.xml
           .coverage

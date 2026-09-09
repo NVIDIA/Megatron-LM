@@ -459,7 +459,7 @@ def get_rng_state(
     """Collect rng state across data parallel ranks.
 
     dp_group threads the data-parallel group used for RNG gather/indexing.
-    dp_cp_group threads the data-parallel (with context-parallel) group used for checkpoint replica id.
+    dp_cp_group threads the data-parallel (with context-parallel) group used for the rng shard key.
     key_prefix namespaces the rng ShardedObject key so disjoint grids avoid a key collision (default '').
     """
     args = get_args()
@@ -485,24 +485,30 @@ def get_rng_state(
     else:
         rng_state_list = [rng_state]
 
-    dp_cp_rank = (
-        get_pg_rank(dp_cp_group)
+    dp_cp_group = (
+        dp_cp_group
         if dp_cp_group is not None
-        else mpu.get_data_parallel_rank(with_context_parallel=True)
+        else mpu.get_data_parallel_group(with_context_parallel=True)
     )
+    dp_cp_rank = get_pg_rank(dp_cp_group)
     if ckpt_format == 'torch_dist':
         pp_rank = get_pg_rank(pp_group)
         pp_size = get_pg_size(pp_group)
         tp_rank = get_pg_rank(tp_group)
         tp_size = get_pg_size(tp_group)
+        # Tracker streams are seeded per rank (tensor_parallel/random.py), so an axis left out
+        # of the key becomes a replica and those ranks restore a peer's stream. ep/etp/gtp_remat
+        # do not tile the grid; pp x tp x dp_cp does.
+        dp_cp_size = get_pg_size(dp_cp_group)
         rng_state_list = ShardedObject(
             f'{key_prefix}rng_state',
             rng_state_list,
-            (pp_size, tp_size),
-            (pp_rank, tp_rank),
-            replica_id=dp_cp_rank,
+            (pp_size, tp_size, dp_cp_size),
+            (pp_rank, tp_rank, dp_cp_rank),
         )
     elif ckpt_format == 'fsdp_dtensor':
+        # TODO: this key omits dp_cp, so dp_cp peers become replicas and restore each other's
+        # tracker streams. Fixing it also needs the matching lookup in load_checkpoint.
         pp_rank = get_pg_rank(pp_group)
         tp_rank = get_pg_rank(tp_group)
         rng_state_list = {f'({pp_rank}, {tp_rank})': rng_state_list}
@@ -1267,6 +1273,8 @@ def save_tokenizer_assets(
     tokenizer: MegatronTokenizer,
     config: TokenizerConfig,
     checkpoint_path: str,
+    *,
+    raise_on_error: bool = False,
 ) -> None:
     """Save tokenizer files to the checkpoint directory.
 
@@ -1278,6 +1286,7 @@ def save_tokenizer_assets(
         tokenizer: The tokenizer instance to save.
         config: Tokenizers config.
         checkpoint_path: The checkpoint directory path.
+        raise_on_error: Propagate tokenizer persistence errors to the caller.
     """
     if tokenizer is None:
         return
@@ -1396,6 +1405,8 @@ def save_tokenizer_assets(
             import traceback
 
             logger.error(traceback.format_exc())
+        if raise_on_error:
+            raise
 
 
 @_disable_gc()
@@ -2577,8 +2588,11 @@ def load_checkpoint(
         )
 
         # Determine if RNG state will be loaded
+        # world_size must match too: the rng shard key includes dp_cp, so a DP rescale leaves this
+        # rank with no shard to load.
         if (
             ckpt_tp_pp == run_tp_pp
+            and ckpt_world_size == run_world_size
             and not release
             and not args.finetune
             and not args.no_load_rng
@@ -2600,6 +2614,8 @@ def load_checkpoint(
             gen_sd_rng_state = None
             if ckpt_tp_pp != run_tp_pp:
                 print_rank_0('{}: RNG state will be ignored'.format(mismatch_msg))
+            elif ckpt_world_size != run_world_size:
+                print_rank_0('Job sharding has changed: RNG state will be ignored')
 
         if ckpt_type == CheckpointType.LOCAL:
             sharded_sd_metadata = _build_sharded_state_dict_metadata(args, dp_cp_group=dp_cp_group)
@@ -3211,51 +3227,3 @@ def _to_dtensor(wrapped_model, model_state_dict):
             new_model_sd[k] = torch.distributed.tensor.distribute_tensor(v, device_mesh)
 
     return new_model_sd
-
-
-def load_biencoder_checkpoint(
-    model, only_query_model=False, only_context_model=False, custom_load_path=None
-):
-    """
-    selectively load retrieval models for indexing/retrieving
-    from saved checkpoints
-    """
-
-    args = get_args()
-
-    model = unwrap_model(model)
-
-    load_path = custom_load_path if custom_load_path is not None else args.load
-
-    tracker_filename = get_checkpoint_tracker_filename(load_path)
-
-    with maybe_msc.open(tracker_filename, 'r') as f:
-        iteration = int(f.read().strip())
-
-    checkpoint_name = get_checkpoint_name(
-        load_path, iteration, args.use_distributed_optimizer, release=False
-    )
-
-    if mpu.get_data_parallel_rank() == 0:
-        print(
-            'global rank {} is loading checkpoint {}'.format(
-                torch.distributed.get_rank(), checkpoint_name
-            )
-        )
-
-    state_dict = torch.load(checkpoint_name, map_location='cpu')
-    ret_state_dict = state_dict['model']
-
-    if only_query_model:
-        ret_state_dict.pop('context_model')
-    if only_context_model:
-        ret_state_dict.pop('query_model')
-
-    assert len(model) == 1
-    model[0].load_state_dict(ret_state_dict)
-    torch.distributed.barrier()
-
-    if mpu.get_data_parallel_rank() == 0:
-        print(' successfully loaded {}'.format(checkpoint_name))
-
-    return model
