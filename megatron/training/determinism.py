@@ -27,9 +27,9 @@ ARG_VALUES_REQUIRED_FOR_DETERMINISM = {
 }
 
 # Not in the dict above because it inherits: unset means "follow moe_router_fusion".
-# The fused aux loss reaches the backward via MoEAuxLossAutoScaler; the fused TopK routing
-# only selects experts, so it is not required off. Unverified upstream report, not measured
-# here -- this rejects a config, it does not change numerics.
+# TE's fused aux-loss kernel is non-deterministic: on identical input it returns a
+# different aux loss run to run, while the unfused path is bit-identical. The fused TopK
+# routing has no such report against it, so it is not required off.
 AUX_LOSS_FUSION_ARG = "moe_router_aux_loss_fusion"
 
 # Env-var defaults required for bit-exact reproducibility.
