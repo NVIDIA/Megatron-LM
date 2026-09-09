@@ -361,6 +361,57 @@ class TestHybridModelBuilderBuildModel:
         assert kw["vp_stage"] is None
 
 
+class TestHybridModelBuilderEngram:
+    """Exercise the real provider helper through the declarative Hybrid builder."""
+
+    @pytest.mark.parametrize(('pad_override', 'resolved_pad'), [(None, 7), (0, 0)])
+    def test_enabled_provider_forwards_tokenizer_lookup_and_pad(self, pad_override, resolved_pad):
+        from megatron.core.transformer.engram.hybrid_adapter import EngramHybridProvider
+
+        transformer = _make_transformer(
+            num_layers=4,
+            num_moe_experts=4,
+            moe_ffn_hidden_size=128,
+            engram_layer_ids=[1],
+            engram_target_layer_indices=[2],
+            engram_hash_table_min_sizes=[17, 19],
+        )
+        config = _make_hybrid_config(
+            transformer=transformer, hybrid_layer_pattern='*-*E', engram_pad_id=pad_override
+        )
+        tokenizer = Mock()
+        lookup = torch.arange(16)
+        pg = Mock()
+        with (
+            patch('megatron.training.models.hybrid.HybridModel') as model,
+            patch('megatron.training.get_tokenizer', return_value=tokenizer) as get_tokenizer,
+            patch(
+                'megatron.core.transformer.engram.tokenizer.build_engram_tokenizer_lookup',
+                return_value=lookup,
+            ) as build_lookup,
+            patch(
+                'megatron.core.transformer.engram.tokenizer.get_engram_tokenizer_pad_id',
+                return_value=resolved_pad,
+            ) as get_pad,
+        ):
+            HybridModelBuilder(config).build_model(pg, pre_process=True, post_process=True)
+
+        get_tokenizer.assert_called_once_with()
+        build_lookup.assert_called_once_with(tokenizer)
+        get_pad.assert_called_once_with(tokenizer, pad_override)
+        kwargs = model.call_args.kwargs
+        provider = kwargs['token_context_provider_spec']
+        assert isinstance(provider, ModuleSpec)
+        assert provider.module is EngramHybridProvider
+        assert provider.params['tokenizer_lookup'] is lookup
+        assert provider.params['pad_id'] == resolved_pad
+        assert provider.params['hybrid_layer_pattern'] == '*-*E'
+        assert kwargs['config'] is transformer
+        assert kwargs['pg_collection'] is pg
+        assert transformer.engram_layer_ids == [1]
+        assert transformer.engram_target_layer_indices == [2]
+
+
 class TestHybridModelBuilderBuildDistributedModels:
     """Tests for HybridModelBuilder.build_distributed_models() — delegation to unimodal helper, hook composition, and default kwargs."""
 
@@ -368,6 +419,27 @@ class TestHybridModelBuilderBuildDistributedModels:
         self.config = _make_hybrid_config(vocab_size=32000)
         self.builder = HybridModelBuilder(self.config)
         self.pg = Mock()
+
+    @pytest.mark.parametrize('fsdp_flag', ['use_megatron_fsdp', 'use_torch_fsdp2'])
+    @pytest.mark.parametrize('table_backend', [None, 'local', 'row_a2a'])
+    @patch('megatron.training.models.hybrid.unimodal_build_distributed_models')
+    def test_fsdp_wrapper_flags_respect_engram_scope(self, mock_unimodal, table_backend, fsdp_flag):
+        """Reject unsupported wrappers from the actual builder API before allocating a model."""
+        model_list = [Mock()]
+        mock_unimodal.return_value = model_list
+        if table_backend is not None:
+            self.config.transformer.engram_layer_ids = [0]
+            self.config.transformer.engram_table_backend = table_backend
+
+        if table_backend is not None:
+            with pytest.raises(ValueError, match='ordinary Megatron DDP only'):
+                self.builder.build_distributed_models(self.pg, **{fsdp_flag: True})
+            mock_unimodal.assert_not_called()
+        else:
+            result = self.builder.build_distributed_models(self.pg, **{fsdp_flag: True})
+            assert result is model_list
+            flag_position = 5 if fsdp_flag == 'use_megatron_fsdp' else 6
+            assert mock_unimodal.call_args.args[flag_position] is True
 
     @patch("megatron.training.models.hybrid.compose_hooks")
     @patch("megatron.training.models.hybrid.unimodal_build_distributed_models")

@@ -1973,8 +1973,14 @@ def pretrain(
                 dataset_provider_parameters = inspect.signature(train_valid_test_dataset_provider).parameters
                 assert "vp_stage" in dataset_provider_parameters, \
                     "vp_stage must be a kwarg in train_valid_test_dataset_provider when using virtual pipeline parallelism"
-                vp_stage_train_valid_test_dataset_provider = \
-                    functools.partial(train_valid_test_dataset_provider, vp_stage=vp_stage)
+                provider_kwargs = {'vp_stage': vp_stage}
+                if 'requires_token_ids' in dataset_provider_parameters:
+                    provider_kwargs['requires_token_ids'] = getattr(
+                        unwrap_model(model[vp_stage]), 'requires_token_context', False
+                    )
+                vp_stage_train_valid_test_dataset_provider = functools.partial(
+                    train_valid_test_dataset_provider, **provider_kwargs
+                )
                 if getattr(train_valid_test_dataset_provider, 'is_distributed', False):
                     vp_stage_train_valid_test_dataset_provider.is_distributed = True
                 iterators = build_train_valid_test_data_iterators(
@@ -1984,8 +1990,19 @@ def pretrain(
                 valid_data_iterator.append(iterators[1])
                 test_data_iterator.append(iterators[2])
         else:
+            dataset_provider = train_valid_test_dataset_provider
+            if 'requires_token_ids' in inspect.signature(dataset_provider).parameters:
+                dataset_provider = functools.partial(
+                    dataset_provider,
+                    requires_token_ids=getattr(
+                        unwrap_model(model[0]), 'requires_token_context', False
+                    ),
+                )
+                dataset_provider.is_distributed = getattr(
+                    train_valid_test_dataset_provider, 'is_distributed', False
+                )
             train_data_iterator, valid_data_iterator, test_data_iterator = (
-                build_train_valid_test_data_iterators(train_valid_test_dataset_provider)
+                build_train_valid_test_data_iterators(dataset_provider)
             )
     timers('train/valid/test-data-iterators-setup').stop()
     print_datetime('after dataloaders are built')

@@ -35,6 +35,7 @@ def checkpointed_forward(
     layer_offset: int = 0,
     cp_layout_state: Optional[ContextParallelLayoutState] = None,
     packed_sequence_cp_metadata: object | None = None,
+    token_context: Tensor | None = None,
 ) -> Union[Tensor, Tuple[Tensor, Tensor]]:
     """Forward method with activation checkpointing.
 
@@ -47,6 +48,7 @@ def checkpointed_forward(
             global indices when checking extract_layer_indices.
         cp_layout_state (ContextParallelLayoutState, optional): CP layout state for this forward.
         packed_sequence_cp_metadata (optional): Packed-sequence CP metadata for Mamba layers.
+        token_context (Tensor, optional): Explicit microbatch context saved for consumer layers.
 
     Returns:
         If extract_layer_indices is empty: hidden_states tensor
@@ -70,6 +72,7 @@ def checkpointed_forward(
             rotary_pos_emb_local,
             rotary_pos_emb_global,
             padding_mask=None,
+            token_context=None,
         ):
             rotary_pos_emb = (
                 (rotary_pos_emb_local, rotary_pos_emb_global)
@@ -117,6 +120,8 @@ def checkpointed_forward(
                     packed_seq_params=layer_packed_seq_params,
                     padding_mask=padding_mask,
                 )
+                if getattr(layer, 'accepts_token_context', False):
+                    layer_kwargs['token_context'] = token_context
                 with inner_quantization_context:
                     if isinstance(layer, TransformerLayer):
                         hidden_states, context = layer(**layer_kwargs)
@@ -147,7 +152,15 @@ def checkpointed_forward(
         nonlocal hidden_states, context
         cf = custom(start, end)
         # Unpack the RoPE tuple as torch cannot save tuples for backward pass.
-        args = (hidden_states, attention_mask, context, context_mask, *rotary_pos_emb, padding_mask)
+        args = (
+            hidden_states,
+            attention_mask,
+            context,
+            context_mask,
+            *rotary_pos_emb,
+            padding_mask,
+            token_context,
+        )
         if use_checkpoint:
             # Precision-aware activation checkpoint: TE under FP8/FP4,
             # tensor_parallel under BF16/FP16/FP32.
