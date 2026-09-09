@@ -3568,16 +3568,16 @@ def training_log(
                 wandb_writer.log({'grpo_collection_iteration': grpo_collection_iteration}, iteration)
         if args.log_memory_to_tensorboard:
             mem_stats = torch.cuda.memory_stats()
-            writer.add_scalar(
-                "mem-reserved-bytes", mem_stats["reserved_bytes.all.current"], iteration
-            )
-            writer.add_scalar(
-                "mem-allocated-bytes", mem_stats["allocated_bytes.all.current"], iteration
-            )
-            writer.add_scalar(
-                "mem-max-allocated-bytes", mem_stats["allocated_bytes.all.peak"], iteration
-            )
-            writer.add_scalar("mem-allocated-count", mem_stats["allocation.all.current"], iteration)
+            memory_metrics = {
+                "mem-reserved-bytes": mem_stats["reserved_bytes.all.current"],
+                "mem-allocated-bytes": mem_stats["allocated_bytes.all.current"],
+                "mem-max-allocated-bytes": mem_stats["allocated_bytes.all.peak"],
+                "mem-allocated-count": mem_stats["allocation.all.current"],
+            }
+            for metric, value in memory_metrics.items():
+                writer.add_scalar(metric, value, iteration)
+            if wandb_writer:
+                wandb_writer.log(memory_metrics, iteration)
         if args.log_max_attention_logit:
             writer.add_scalar('max_attention_logit', max_attention_logit, iteration)
             if wandb_writer:
@@ -3717,6 +3717,23 @@ def training_log(
                 writer.add_scalar('iteration-time', elapsed_time_per_iteration, iteration)
             if wandb_writer:
                 wandb_writer.log({'iteration-time': elapsed_time_per_iteration}, iteration)
+        if iteration % args.log_interval == 0:
+            # Report this update, including the first update after a restart.
+            # Interval accumulators can overlap the initial startup report.
+            health_metrics = {
+                'optimizer-skipped-iterations': int(skipped_iter),
+                'nan-iterations': int(got_nan),
+            }
+            if args.log_throughput:
+                # Match the nominal-token throughput used by native telemetry.
+                health_metrics['tokens-per-second'] = (
+                    batch_size * args.seq_length / elapsed_time_per_iteration
+                )
+            if writer:
+                for metric, value in health_metrics.items():
+                    writer.add_scalar(metric, value, iteration)
+            if wandb_writer:
+                wandb_writer.log(health_metrics, iteration)
         log_string = f" [{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')}]"
         log_string += ' iteration {:8d}/{:8d} |'.format(iteration, args.train_iters)
         log_string += ' consumed samples: {:12d} |'.format(args.consumed_train_samples)
