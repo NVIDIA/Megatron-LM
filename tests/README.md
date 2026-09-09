@@ -39,6 +39,15 @@ they do not enable or disable unit-test selection. The older
 Use `Run selective unit tests`; analysis always covers the entire PR, including
 changes in earlier commits. The full-suite override takes precedence.
 
+For labeled PRs, CI compares the exact synthetic merge commit being built and
+tested with its first parent (`git diff HEAD^1 HEAD`). That parent is the
+revision of `main` used to create the merge, so the comparison includes all PR
+changes without including unrelated changes already on `main`. It does not
+depend on the base SHA reported separately in PR metadata. The selection
+artifact records `tested_sha` and `diff_base_sha`, and the job summary shows
+the comparison. `diff_base_sha` is null when selection is bypassed before a
+comparison base is established, such as for an unlabeled PR.
+
 Selection is conservative: missing/invalid base commits, selector errors,
 timeouts, deleted or renamed files, shared fixtures, test runners, dependency
 and CI configuration changes, package `__init__.py` changes, and unsupported

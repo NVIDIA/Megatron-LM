@@ -199,7 +199,6 @@ jobs:
       pr_number: ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }}
       unit_test_reason: ${{ steps.configure.outputs.unit_test_reason }}
       sha:            ${{ steps.resolve-sha.outputs.sha }}
-      base_sha:       ${{ steps.resolve-sha.outputs.base_sha }}
     steps:
       - name: Get PR info
         id: get-pr-info
@@ -220,16 +219,12 @@ jobs:
         run: |
           if [[ "$IS_PR" == "true" ]]; then
             SHA='${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').merge_commit_sha }}'
-            BASE_SHA='${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').base.sha }}'
           elif [[ "$IS_MERGE_GROUP" == "true" ]]; then
             SHA='${{ github.event.merge_group.head_sha }}'
-            BASE_SHA=''
           else
             SHA='${{ github.sha }}'
-            BASE_SHA=''
           fi
           echo "sha=${SHA}" | tee -a "$GITHUB_OUTPUT"
-          echo "base_sha=${BASE_SHA}" | tee -a "$GITHUB_OUTPUT"
 
       - name: Generate GitHub App token
         id: app-token
@@ -773,7 +768,6 @@ jobs:
         id: parse-unit-tests
         shell: bash -e -u -o pipefail {0}
         env:
-          BASE_SHA: ${{ needs.configure.outputs.base_sha }}
           EVENT_NAME: ${{ github.event_name }}
           FORCE_RUN_ALL: ${{ needs.pre-flight.outputs.force_run_all }}
           IS_CI_WORKLOAD: ${{ needs.pre-flight.outputs.is_ci_workload }}
@@ -783,6 +777,8 @@ jobs:
           UNIT_TEST_REASON: ${{ needs.configure.outputs.unit_test_reason }}
         run: |
           PLANNING_STARTED=$SECONDS
+          TESTED_SHA=$(git rev-parse --verify HEAD)
+          BASE_SHA=''
           FORCE_FULL_REASON=''
           if [[ "$IS_MERGE_GROUP" == "true" ]]; then
             FORCE_FULL_REASON='merge queue validation always runs the full unit-test suite'
@@ -796,20 +792,18 @@ jobs:
             FORCE_FULL_REASON='selective testing is limited to pull-request pushes'
           elif [[ "$SELECTIVE_TESTS" != "true" ]]; then
             FORCE_FULL_REASON="${UNIT_TEST_REASON:-unit-test selection is disabled}"
-          elif [[ -z "$BASE_SHA" || "$BASE_SHA" == "null" ]]; then
-            FORCE_FULL_REASON='the pull-request base SHA is unavailable'
           fi
 
           # The checked-out synthetic merge is the same commit built and tested
-          # downstream. Its first parent must match the exact base from PR info;
-          # a stale or missing merge/base pair falls back to the full suite.
+          # downstream. Compare it with its own first parent: the exact main
+          # revision used for this merge. PR metadata can report an older base.
+          # This diff includes every PR commit and excludes main-only changes.
           if [[ -z "$FORCE_FULL_REASON" ]]; then
-            if ! git rev-parse --verify 'HEAD^2' >/dev/null 2>&1; then
+            if ! git rev-parse --verify 'HEAD^2^{commit}' >/dev/null 2>&1; then
               FORCE_FULL_REASON='the tested commit is not a pull-request merge'
-            elif ! MERGE_BASE_SHA=$(git rev-parse --verify 'HEAD^1' 2>/dev/null); then
+            elif ! BASE_SHA=$(git rev-parse --verify 'HEAD^1^{commit}' 2>/dev/null); then
+              BASE_SHA=''
               FORCE_FULL_REASON='the tested pull-request merge has no base parent'
-            elif [[ "$BASE_SHA" != "$MERGE_BASE_SHA" ]]; then
-              FORCE_FULL_REASON='the pull-request base does not match the tested merge'
             fi
           fi
 
@@ -857,10 +851,17 @@ jobs:
           # spent installing/starting the selector, including failed attempts.
           jq --slurpfile buckets unit-test-buckets.json \
             --argjson elapsed "$((SECONDS - PLANNING_STARTED))" \
-            '. + {total_bucket_count: ($buckets[0] | length), planning_duration_seconds: $elapsed}' \
+            --arg tested_sha "$TESTED_SHA" --arg diff_base_sha "$BASE_SHA" \
+            '. + {total_bucket_count: ($buckets[0] | length), planning_duration_seconds: $elapsed,
+                  tested_sha: $tested_sha, diff_base_sha: (if $diff_base_sha == "" then null else $diff_base_sha end)}' \
             unit-test-selection.json > unit-test-selection.tmp
           mv unit-test-selection.tmp unit-test-selection.json
 
+          printf '\nTested commit: `%s`\n' "$TESTED_SHA" >> unit-test-selection-summary.md
+          if [[ -n "$BASE_SHA" ]]; then
+            printf '\nPR comparison: `%s..%s` (merge first parent to tested merge).\n' \
+              "$BASE_SHA" "$TESTED_SHA" >> unit-test-selection-summary.md
+          fi
           echo "unit-tests=$(jq -c '.matrix' unit-test-selection.json)" | tee -a "$GITHUB_OUTPUT"
           cat unit-test-selection-summary.md >> "$GITHUB_STEP_SUMMARY"
 

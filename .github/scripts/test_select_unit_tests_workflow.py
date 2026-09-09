@@ -41,8 +41,8 @@ class TestUnitTestWorkflow(unittest.TestCase):
             "TEST_LABELS": "[]",
             "SELECTIVE_TESTS": "true",
             "UNIT_TEST_REASON": "PR-wide impact analysis plus the always-run baseline",
-            "BASE_SHA": "",
         }
+        self.environment.pop("BASE_SHA", None)
         self._command(
             "gh",
             """
@@ -122,15 +122,23 @@ Path(args[args.index('--summary') + 1]).write_text('Full suite' if full else 'Se
         self._git("config", "user.name", "Workflow test")
         self._git("config", "user.email", "workflow@example.com")
         self._git("config", "commit.gpgsign", "false")
-        self._git("commit", "--quiet", "--allow-empty", "-m", "base")
-        base = self._git("rev-parse", "HEAD")
+        self._commit_file("README.md", "Common branch point\n", "base")
+        self.branch_point_sha = self._git("rev-parse", "HEAD")
         self._git("checkout", "--quiet", "-b", "feature")
-        self._git("commit", "--quiet", "--allow-empty", "-m", "first change")
-        self._git("commit", "--quiet", "--allow-empty", "-m", "second change")
-        self._git("checkout", "--quiet", "--detach", base)
+        self._commit_file("megatron/core/pr_first.py", "first = True\n", "first PR change")
+        self._commit_file("megatron/core/pr_second.py", "second = True\n", "second PR change")
+        self._git("checkout", "--quiet", "--detach", self.branch_point_sha)
+        self._commit_file("megatron/core/main_only.py", "main = True\n", "main advances")
+        base = self._git("rev-parse", "HEAD")
         self._git("merge", "--quiet", "--no-ff", "feature", "-m", "synthetic PR merge")
-        self.environment["BASE_SHA"] = base
         return base
+
+    def _commit_file(self, relative_path, contents, message):
+        path = self.root / relative_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(contents)
+        self._git("add", relative_path)
+        self._git("commit", "--quiet", "-m", message)
 
     def test_pr_without_opt_in_runs_full_units_and_preserves_functional_scope(self):
         cases = [
@@ -209,21 +217,40 @@ Path(args[args.index('--summary') + 1]).write_text('Full suite' if full else 'Se
         self.assertEqual(self._step(selection, "Checkout")["with"]["ref"], source_sha)
         self.assertEqual(self._step(execution, "Checkout")["with"]["ref"], source_sha)
 
-    def test_selection_compares_entire_pr_and_keeps_the_tested_merge_checkout(self):
+    def test_selection_uses_tested_merge_parent_and_ignores_external_base_metadata(self):
         base = self._merge_commit()
         tested_merge = self._git("rev-parse", "HEAD")
-        result, outputs = self._run("cicd-parse-unit-tests", "Parse unit tests")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        args = json.loads((self.root / "selector-args.json").read_text())
-        self.assertEqual(args[args.index("--base-ref") + 1], base)
-        self.assertEqual(self._git("rev-parse", "HEAD"), tested_merge)
-        self.assertEqual(json.loads(outputs["unit-tests"])[0]["unit_test_files"], "selected")
+        unrelated = self._git(
+            "commit-tree", self._git("rev-parse", "HEAD^{tree}"), "-m", "unrelated"
+        )
+        cases = [{}, {"BASE_SHA": ""}, {"BASE_SHA": self.branch_point_sha}, {"BASE_SHA": unrelated}]
+        for environment in cases:
+            with self.subTest(environment=environment):
+                result, outputs = self._run(
+                    "cicd-parse-unit-tests", "Parse unit tests", **environment
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(
+                    json.loads(outputs["unit-tests"])[0]["unit_test_files"], "selected"
+                )
+                args = json.loads((self.root / "selector-args.json").read_text())
+                selected_base = args[args.index("--base-ref") + 1]
+                self.assertEqual(selected_base, base)
+                self.assertEqual(
+                    self._git("diff", "--name-only", selected_base, "HEAD").splitlines(),
+                    ["megatron/core/pr_first.py", "megatron/core/pr_second.py"],
+                )
+                self.assertEqual(self._git("rev-parse", "HEAD"), tested_merge)
+                manifest = json.loads((self.root / "unit-test-selection.json").read_text())
+                self.assertEqual(manifest["tested_sha"], tested_merge)
+                self.assertEqual(manifest["diff_base_sha"], base)
+                summary = (self.root / "summary").read_text()
+                self.assertIn(tested_merge, summary)
+                self.assertIn(base, summary)
 
-    def test_ambiguous_base_or_selector_failure_falls_back_to_full_matrix(self):
+    def test_selector_failure_or_disabled_selection_falls_back_to_full_matrix(self):
         self._merge_commit()
         cases = [
-            {"BASE_SHA": ""},
-            {"BASE_SHA": "a" * 40},
             {"TEST_SELECTOR_FAILURE": "true"},
             {"TEST_INVALID_MATRIX": "true"},
             {"SELECTIVE_TESTS": "false", "UNIT_TEST_REASON": "full suite requested"},
@@ -237,6 +264,40 @@ Path(args[args.index('--summary') + 1]).write_text('Full suite' if full else 'Se
                 self.assertEqual(json.loads(outputs["unit-tests"])[0]["unit_test_files"], "")
                 args = json.loads((self.root / "selector-args.json").read_text())
                 self.assertIn("--force-full", args)
+                if environment.get("SELECTIVE_TESTS") == "false":
+                    manifest = json.loads((self.root / "unit-test-selection.json").read_text())
+                    self.assertIsNone(manifest["diff_base_sha"])
+
+    def test_non_merge_commit_falls_back_to_full_matrix_without_comparison_base(self):
+        base = self._merge_commit()
+        for ref in (base, self.branch_point_sha):
+            with self.subTest(ref=ref):
+                self._git("checkout", "--quiet", "--detach", ref)
+                result, outputs = self._run("cicd-parse-unit-tests", "Parse unit tests")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(json.loads(outputs["unit-tests"])[0]["unit_test_files"], "")
+                args = json.loads((self.root / "selector-args.json").read_text())
+                self.assertIn("--force-full", args)
+                self.assertNotIn("--base-ref", args)
+                manifest = json.loads((self.root / "unit-test-selection.json").read_text())
+                self.assertEqual(manifest["tested_sha"], ref)
+                self.assertIsNone(manifest["diff_base_sha"])
+                self.assertEqual(self._git("rev-parse", "HEAD"), ref)
+
+    def test_missing_merge_base_object_falls_back_to_full_matrix(self):
+        base = self._merge_commit()
+        tested_merge = self._git("rev-parse", "HEAD")
+        # Model incomplete checkout history without replacing the real git CLI.
+        (self.root / ".git" / "objects" / base[:2] / base[2:]).unlink()
+        result, outputs = self._run("cicd-parse-unit-tests", "Parse unit tests")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(outputs["unit-tests"])[0]["unit_test_files"], "")
+        args = json.loads((self.root / "selector-args.json").read_text())
+        self.assertIn("--force-full", args)
+        self.assertNotIn("--base-ref", args)
+        manifest = json.loads((self.root / "unit-test-selection.json").read_text())
+        self.assertEqual(manifest["tested_sha"], tested_merge)
+        self.assertIsNone(manifest["diff_base_sha"])
 
     def test_docs_only_still_requires_unit_success_but_skips_training(self):
         result, outputs = self._run("cicd-integration-gate", "gate", DOCS_ONLY="true")
