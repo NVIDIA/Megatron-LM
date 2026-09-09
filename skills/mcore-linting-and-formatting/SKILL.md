@@ -40,11 +40,10 @@ uv run isort <file1>.py <file2>.py
 
 ## Setting Up the Linting Group
 
-Inside the development container, from the repository root:
+Inside the container:
 
 ```bash
 uv sync --locked --only-group linting
-export PATH="$PWD/.venv/bin:$PATH"
 ```
 
 This installs `ruff`, `black`, `isort`, `pylint` — the same tools used by

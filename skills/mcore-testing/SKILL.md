@@ -28,7 +28,7 @@ For questions about disabling tests without deleting them:
 
 ```text
 tests/
-├── unit_tests/          # pytest; GPU/process topology depends on the test and recipe
+├── unit_tests/          # pytest, 1 node × 8 GPUs, torch.distributed runner
 ├── functional_tests/    # end-to-end shell + training scripts
 │   └── test_cases/
 │       └── {model}/{test_case}/
@@ -117,13 +117,8 @@ scope: [mr-github-broken]
 
 ## Running Unit Tests Locally
 
-Many unit tests initialize an NCCL process group and require GPUs. Run those
-through `torch.distributed.run` with the process count and hardware required by
-the selected test or CI recipe. Tests without GPU or distributed requirements
-can run directly with pytest in a configured development environment.
-
-The commands below use eight GPUs, a common H100 CI setup; adjust the topology
-for the selected tests:
+All unit tests initialize a `torch.distributed` group, so every invocation
+requires GPU access and must go through `torch.distributed.run`:
 
 ```bash
 # Full suite
