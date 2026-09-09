@@ -12,6 +12,7 @@ import torch.nn.functional as F  # type: ignore
 from torch import Tensor  # type: ignore
 
 from megatron.core import parallel_state
+from megatron.core.enums import Fp8Recipe
 from megatron.core.inference.batch_dimensions_utils import TOKEN_ROUNDER as _TOKEN_ROUNDER
 from megatron.core.inference.batch_dimensions_utils import (
     CUDAGraphBatchDimensionBuilder,
@@ -24,6 +25,7 @@ from megatron.core.inference.config import (
 )
 from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.moe import InferenceGroupedGemmBackend
+from megatron.core.inference.moe.flashinfer_mxfp8 import enforce_flashinfer_mxfp8_min_token_capacity
 from megatron.core.inference.moe.vllm_fused_moe import VllmFusedMoeBuffers
 from megatron.core.inference.sampling.base import Sampling
 from megatron.core.inference.sampling_params import (
@@ -400,6 +402,11 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         self.batch_invariant_mode = model_config.batch_invariant_mode
         self.inference_flashinfer_bounded_rows = model_config.inference_flashinfer_bounded_rows
+        self._uses_flashinfer_mxfp8 = (
+            model_config.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.FLASHINFER
+            and bool(model_config.fp8)
+            and model_config.fp8_recipe == Fp8Recipe.mxfp8
+        )
         self._disaggregated_inference_role: Optional[str] = None
         self._use_bounded_flashinfer_rows = False
         self.num_speculative_tokens = inference_config.num_speculative_tokens
@@ -1723,12 +1730,15 @@ class DynamicInferenceContext(BaseInferenceContext):
         return self.inference_flashinfer_bounded_rows and self._use_bounded_flashinfer_rows
 
     def flashinfer_token_capacity(self) -> int | None:
-        """Return the inferred FlashInfer row capacity for this step, if enabled."""
+        """Return the effective FlashInfer row capacity for this step, if enabled."""
         if not self.can_use_bounded_flashinfer_rows():
             return None
-        return (
+        token_capacity = (
             self.max_requests * (self.num_speculative_tokens + 1) * self.expert_model_parallel_size
         )
+        if getattr(self, "_uses_flashinfer_mxfp8", False):
+            return enforce_flashinfer_mxfp8_min_token_capacity(token_capacity)
+        return token_capacity
 
     def set_disaggregated_inference_role(self, role: str) -> None:
         """Publish a dedicated prefill/decode role to row-policy selection."""

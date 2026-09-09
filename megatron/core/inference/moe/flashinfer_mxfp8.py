@@ -27,6 +27,8 @@ except ImportError as exc:
 from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
 
 logger = logging.getLogger(__name__)
+# 512 is the smallest capacity available in the TRTLLM block-scale runner.
+FLASHINFER_MXFP8_MIN_ACTIVE_ROWS = 512
 _LOGGED_TOKEN_POLICIES: set[tuple[str, int, int]] = set()
 
 
@@ -245,6 +247,29 @@ def select_flashinfer_active_rows(full_rows: int, *, token_capacity: int | None)
     return min(token_capacity, full_rows), "bounded-decode"
 
 
+def enforce_flashinfer_mxfp8_min_token_capacity(token_capacity: int | None) -> int | None:
+    """Floor bounded MXFP8 rows at the minimum verified kernel-covered capacity."""
+    if token_capacity is None:
+        return None
+    if token_capacity <= 0:
+        raise ValueError(f"token_capacity must be positive; got {token_capacity}")
+    return max(token_capacity, FLASHINFER_MXFP8_MIN_ACTIVE_ROWS)
+
+
+def select_flashinfer_mxfp8_active_rows(
+    full_rows: int, *, token_capacity: int | None
+) -> tuple[int, str]:
+    """Validate and select routed MXFP8 rows for a kernel-covered shape."""
+    active_rows, policy = select_flashinfer_active_rows(full_rows, token_capacity=token_capacity)
+    if active_rows < FLASHINFER_MXFP8_MIN_ACTIVE_ROWS:
+        raise ValueError(
+            "FlashInfer MXFP8 requires at least "
+            f"{FLASHINFER_MXFP8_MIN_ACTIVE_ROWS} active rows to avoid an unsupported "
+            f"kernel shape; got {active_rows}"
+        )
+    return active_rows, policy
+
+
 def flashinfer_routed_mxfp8_moe_prequantized(
     quantized_hidden: torch.Tensor,
     hidden_scale: torch.Tensor,
@@ -327,7 +352,9 @@ def flashinfer_routed_mxfp8_moe(
         )
 
     full_rows = hidden_states.shape[0]
-    active_rows, policy = select_flashinfer_active_rows(full_rows, token_capacity=token_capacity)
+    active_rows, policy = select_flashinfer_mxfp8_active_rows(
+        full_rows, token_capacity=token_capacity
+    )
     if token_capacity is not None:
         policy_key = (policy, token_capacity, full_rows)
         if policy_key not in _LOGGED_TOKEN_POLICIES:

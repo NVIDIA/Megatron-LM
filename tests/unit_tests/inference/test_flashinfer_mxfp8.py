@@ -7,7 +7,11 @@ import torch
 import torch.nn.functional as F
 
 from megatron.core.activations import squared_relu
-from megatron.core.inference.moe.flashinfer_mxfp8 import select_flashinfer_active_rows
+from megatron.core.inference.moe.flashinfer_mxfp8 import (
+    enforce_flashinfer_mxfp8_min_token_capacity,
+    select_flashinfer_active_rows,
+    select_flashinfer_mxfp8_active_rows,
+)
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.transformer.transformer_config import TransformerConfig
 
@@ -85,18 +89,25 @@ def test_nvls_flashinfer_metadata_only_initializes_bounded_prefix(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("bounded_rows_allowed", "num_speculative_tokens", "expected"),
-    [(False, 2, None), (True, 2, 1536)],
+    ("bounded_rows_allowed", "max_requests", "num_speculative_tokens", "uses_mxfp8", "expected"),
+    [
+        (False, 64, 0, True, None),
+        (True, 128, 2, True, 1536),
+        (True, 64, 0, True, 512),
+        (True, 64, 0, False, 256),
+    ],
+    ids=["disabled", "large-mxfp8", "small-mxfp8-floored", "small-bf16-unchanged"],
 )
 def test_context_infers_flashinfer_capacity_only_when_policy_allows(
-    bounded_rows_allowed, num_speculative_tokens, expected
+    bounded_rows_allowed, max_requests, num_speculative_tokens, uses_mxfp8, expected
 ):
     from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
 
     context = SimpleNamespace(
-        max_requests=128,
+        max_requests=max_requests,
         num_speculative_tokens=num_speculative_tokens,
         expert_model_parallel_size=4,
+        _uses_flashinfer_mxfp8=uses_mxfp8,
         can_use_bounded_flashinfer_rows=lambda: bounded_rows_allowed,
     )
 
@@ -175,6 +186,22 @@ def test_flashinfer_row_policy_rejects_prefill_on_disaggregated_decode():
 )
 def test_flashinfer_active_row_policy(token_capacity, expected):
     assert select_flashinfer_active_rows(65536, token_capacity=token_capacity) == expected
+
+
+@pytest.mark.parametrize(
+    ("token_capacity", "expected"), [(None, None), (256, 512), (512, 512), (1024, 1024)]
+)
+def test_flashinfer_mxfp8_capacity_avoids_small_kernel_hole(token_capacity, expected):
+    assert enforce_flashinfer_mxfp8_min_token_capacity(token_capacity) == expected
+
+
+def test_flashinfer_mxfp8_active_rows_reject_small_kernel_shape():
+    with pytest.raises(ValueError, match="requires at least 512 active rows"):
+        select_flashinfer_mxfp8_active_rows(65536, token_capacity=256)
+
+
+def test_flashinfer_mxfp8_active_rows_accept_verified_kernel_shape():
+    assert select_flashinfer_mxfp8_active_rows(65536, token_capacity=512) == (512, "bounded-decode")
 
 
 def _make_bounded_mxfp8_config(**overrides):
