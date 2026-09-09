@@ -32,7 +32,6 @@ from megatron.core.transformer import MegatronModule, TransformerConfig
 from megatron.core.transformer.module import Float16Module
 from megatron.core.utils import get_model_config, get_pg_rank
 
-
 try:
     from megatron.core.fp8_utils import correct_amax_history_if_needed
 except ImportError:
