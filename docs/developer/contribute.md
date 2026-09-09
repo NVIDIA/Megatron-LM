@@ -32,8 +32,12 @@ File any bugs you find, keeping the following in mind:
 
 ### Do
 
-- Follow the [repository style guide](https://github.com/NVIDIA/Megatron-LM/blob/main/style-guide.md) and keep changes consistent with the file being changed. Run the configured formatting and lint checks described in the guide.
+- Follow the [repository style guide](https://github.com/NVIDIA/Megatron-LM/blob/main/style-guide.md) and keep changes consistent with the file being changed. Run the configured formatting and lint checks using [tools/autoformat.sh](https://github.com/NVIDIA/Megatron-LM/blob/main/tools/autoformat.sh).
 - Use the docstring style and format [the documentation generator is configured for](../conf.py): [Google style](https://google.github.io/styleguide/pyguide.html#38-comments-and-docstrings) with [MyST format](https://mystmd.org/).
+- Keep configuration dataclasses specific to the component they configure. Avoid
+  catch-all configurations that mix unrelated concerns or carry arbitrary option
+  dictionaries. Share a base configuration only when its fields have the same
+  meaning across the components that use it.
 - Split your changes into separate, atomic commits, that is, a commit per feature or fix.
 - Make sure your commits are rebased on the `main` branch.
 - Write the commit message subject line in the imperative mood ("Change the default argument for X", not "Changed the default argument for X").

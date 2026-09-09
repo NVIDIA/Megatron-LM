@@ -60,5 +60,5 @@ This installs `ruff`, `black`, `isort`, `pylint` — the same tools used by
 - **Line length**: 100 characters (configured in `pyproject.toml` and `.pylintrc`).
 - **No bare `except`**: always catch specific exception types.
 
-See the [repository style guide](../../style-guide.md) for the full conventions
-and the distinction between recommendations and enforced checks.
+See the [repository style guide](../../style-guide.md) for repository overrides
+to the Google Python style guide.
