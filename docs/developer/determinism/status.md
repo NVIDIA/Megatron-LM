@@ -23,9 +23,10 @@ environment values.
 
 ## Validation
 
-- **Module-level bit-exact suite** (`tests/unit_tests/determinism/`): Runs a
+- **Module-level bit-exact suite** (`tests/unit_tests/core/determinism/`): Runs a
   model or block twice under restored RNG state and asserts bit-identical
-  outputs and gradients. Coverage includes:
+  outputs and gradients. Tests live in `correctness/`, alongside shared helpers
+  in the parent directory. Coverage includes:
 
   - GPTModel, TransformerBlock, and HybridModel
   - Tensor parallelism, expert parallelism, fully sharded data parallel, pipeline

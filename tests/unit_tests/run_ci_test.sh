@@ -123,6 +123,9 @@ for element in "${MARKER[@]:1}"; do
 done
 
 export BUCKET
+# Historical checkouts keep their own selector helper, which can ignore this
+# variable while newer helpers exclude buckets from the other suite version.
+export UNIT_TEST_TAG="$TAG"
 IGNORE_ARGS=()
 while IFS= read -r line; do
     [[ -n "$line" ]] && IGNORE_ARGS+=("$line")
