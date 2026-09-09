@@ -2334,9 +2334,12 @@ def load_args_from_checkpoint(args, load_arg='load', checkpointing_context=None)
     _set_arg('moe_router_enable_expert_bias', force=True)
     _set_arg('moe_router_topk_scaling_factor', force=True)
 
-    # ScMoE shortcut-connection args.
+    # ScMoE shortcut-connection args. Both of these change the parameter set: every shortcut pair
+    # owns an extra pre-MLP norm, and moe_shortcut_post_norm adds a second norm per pair, so they
+    # must follow the checkpoint. moe_shortcut_parallel is deliberately not restored; it only
+    # selects the all-to-all overlap schedule and should stay under launch-time control.
     _set_arg('moe_shortcut_connection', force=True)
-    _set_arg('moe_shortcut_parallel', force=True)
+    _set_arg('moe_shortcut_post_norm', force=True)
 
     # Mamba args.
     _set_arg('mamba_state_dim', force=True)

@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+import transformer_engine as te
 
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols as LayerSymbols
 from megatron.core.models.hybrid.shortcut_block import (
@@ -14,20 +15,28 @@ from megatron.core.models.hybrid.shortcut_block import (
 from megatron.core.transformer.module import TwoStageAttentionLayer
 from megatron.core.transformer.transformer_config import TransformerConfig
 
+# The shortcut-owned norms are Transformer Engine norms, which need a full TransformerConfig to
+# build and a GPU to run.
+pytestmark = pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="shortcut norms are Transformer Engine norms"
+)
+
 
 def _shortcut_config(*, parallel: bool = False, normalization: str = "RMSNorm"):
-    return SimpleNamespace(
-        moe_shortcut_parallel=parallel,
-        fp32_residual_connection=False,
+    return TransformerConfig(
+        num_layers=1,
         hidden_size=8,
-        layernorm_epsilon=1e-5,
+        num_attention_heads=2,
         normalization=normalization,
+        # Sequence parallelism is what marks the norm parameters, and TransformerConfig only
+        # allows it alongside tensor parallelism.
+        tensor_model_parallel_size=2,
         sequence_parallel=True,
+        num_moe_experts=1,
+        moe_shortcut_connection=True,
         moe_shortcut_post_norm=True,
-        recompute_granularity=None,
-        recompute_modules=[],
-        fine_grained_activation_offloading=False,
-        offload_modules=[],
+        moe_shortcut_parallel=parallel,
+        add_bias_linear=False,
     )
 
 
@@ -80,6 +89,10 @@ class _FakeMoE(torch.nn.Module):
         self.submodules_config = SimpleNamespace(pre_mlp_layernorm=_FakeNorm)
         self.mlp = _FakeMLP()
 
+    def _pre_mlp_layernorm_and_residual(self, hidden_states):
+        """Stand-in for the layer protocol: norm output, residual, and an empty payload."""
+        return hidden_states, hidden_states, ()
+
     @staticmethod
     def _maybe_unflatten_for_moe(hidden_states, padding_mask, packed_seq_params):
         return hidden_states, padding_mask, None
@@ -126,7 +139,7 @@ def test_group_layers_into_shortcut_blocks(compute_symbol, parallel):
     assert shortcut.moe_local_idx == 2
     assert shortcut.overlap_mode is parallel
     assert shortcut.shortcut_pre_mlp_layernorm is not paired_moe.pre_mlp_layernorm
-    assert isinstance(shortcut.shortcut_post_norm, torch.nn.RMSNorm)
+    assert isinstance(shortcut.shortcut_post_norm, te.pytorch.RMSNorm)
     for norm in (shortcut.shortcut_pre_mlp_layernorm, shortcut.shortcut_post_norm):
         assert all(parameter.sequence_parallel for parameter in norm.parameters())
 
@@ -169,17 +182,18 @@ def test_shortcut_owns_cp_layout_transitions(monkeypatch):
 
     def shared(hidden_states, padding_mask=None, packed_seq_params=None):
         observed["shared_packed"] = packed_seq_params
-        return torch.zeros_like(hidden_states), None
+        return torch.zeros_like(hidden_states), None, hidden_states, ()
 
     def postprocess(
-        hidden_states,
+        residual,
         combined_output,
         shared_expert_output,
         packed_seq_params=None,
         moe_unflatten_mbs=None,
+        mlp_state=(),
     ):
         observed["postprocess_packed"] = packed_seq_params
-        return hidden_states
+        return residual
 
     @contextmanager
     def quant_context_factory(*_args):
@@ -228,8 +242,8 @@ def test_shortcut_owns_cp_layout_transitions(monkeypatch):
 @pytest.mark.parametrize(
     ("normalization", "norm_type"),
     [
-        pytest.param("LayerNorm", torch.nn.LayerNorm, id="layer-norm"),
-        pytest.param("RMSNorm", torch.nn.RMSNorm, id="rms-norm"),
+        pytest.param("LayerNorm", te.pytorch.LayerNorm, id="layer-norm"),
+        pytest.param("RMSNorm", te.pytorch.RMSNorm, id="rms-norm"),
     ],
 )
 def test_shortcut_post_norm_follows_config(normalization, norm_type):
@@ -289,6 +303,78 @@ def test_group_layers_rejects_invalid_shortcut_pair(compute_symbol, compute, err
         )
 
 
+def test_group_layers_rejects_pair_split_across_pipeline_stages():
+    """A stage that starts with an MoE has lost its shortcut partner to the previous stage."""
+    config = _shortcut_config()
+    with pytest.raises(ValueError, match="cannot cross pipeline-stage boundaries"):
+        group_layers_into_shortcut_blocks(
+            torch.nn.ModuleList([_FakeMoE(config, layer_number=5), _FakeCompute(config)]),
+            [LayerSymbols.MOE, LayerSymbols.MAMBA],
+            config,
+            pp_layer_offset=4,
+        )
+
+
+def test_group_layers_allows_leading_moe_on_the_first_stage():
+    """The model's very first MoE has no predecessor, so it keeps its standard routing path."""
+    config = _shortcut_config()
+    leading_moe = _FakeMoE(config, layer_number=1)
+
+    grouped = group_layers_into_shortcut_blocks(
+        torch.nn.ModuleList([leading_moe, _FakeCompute(config)]),
+        [LayerSymbols.MOE, LayerSymbols.MAMBA],
+        config,
+        pp_layer_offset=0,
+    )
+
+    assert list(grouped)[0] is leading_moe
+    assert not any(isinstance(layer, ShortcutMoEBlock) for layer in grouped)
+
+
+def test_shared_experts_propagates_the_layers_residual_and_mlp_state():
+    """The layer owns the unpack and the payload; the block must carry both through."""
+    config = _shortcut_config()
+    moe_layer = _FakeMoE(config)
+    block = ShortcutMoEBlock(_FakeCompute(config), moe_layer, overlap_a2a=False)
+
+    hidden_states = torch.ones(2, 1, config.hidden_size)
+    normalized = hidden_states * 2
+    # Distinct objects, so reusing hidden_states or dropping the payload is detectable.
+    layer_residual = hidden_states.clone()
+    layer_mlp_state = ("h_res", "h_post")
+    moe_layer._pre_mlp_layernorm_and_residual = lambda states: (
+        normalized,
+        layer_residual,
+        layer_mlp_state,
+    )
+    moe_layer.mlp.shared_experts_compute = lambda states: states
+
+    shared_expert_output, _, residual, mlp_state = block._moe_shared_experts(hidden_states)
+
+    assert torch.equal(shared_expert_output, normalized)
+    assert residual is layer_residual
+    assert mlp_state is layer_mlp_state
+
+
+def test_postprocess_forwards_mlp_state_to_the_bda_step():
+    """A layer subclass that needs its payload must receive it, not an empty default."""
+    config = _shortcut_config()
+    moe_layer = _FakeMoE(config)
+    block = ShortcutMoEBlock(_FakeCompute(config), moe_layer, overlap_a2a=False)
+
+    seen = {}
+    moe_layer.mlp.postprocess = lambda combined, shared: combined
+    moe_layer._apply_mlp_bda_step = lambda output_with_bias, residual, mlp_state=(): (
+        seen.update(mlp_state=mlp_state) or output_with_bias[0]
+    )
+
+    block = block.cuda()
+    hidden_states = torch.ones(2, 1, config.hidden_size, device=torch.cuda.current_device())
+    block._postprocess(hidden_states, hidden_states, hidden_states, mlp_state=("h_res", "h_post"))
+
+    assert seen["mlp_state"] == ("h_res", "h_post")
+
+
 def test_eager_overlap_matches_serial_output_and_gradients(monkeypatch):
     """Schedules preserve numerics while each physical layer uses its own quant context."""
     config = TransformerConfig(num_layers=2, hidden_size=4, num_attention_heads=1)
@@ -340,6 +426,7 @@ def test_eager_overlap_matches_serial_output_and_gradients(monkeypatch):
     class FakeMoE(torch.nn.Module):
         def __init__(self):
             super().__init__()
+            self.config = config
             self.layer_number = 2
 
             class FakeNorm:
@@ -362,9 +449,13 @@ def test_eager_overlap_matches_serial_output_and_gradients(monkeypatch):
             self, hidden_states, padding_mask=None, packed_seq_params=None
         ):
             assert_quant_layer(1)
-            return hidden_states * self.shared_scale, None
+            return hidden_states * self.shared_scale, None, hidden_states, ()
 
-        def _apply_mlp_bda_step(self, output_with_bias, residual):
+        @staticmethod
+        def _maybe_reflatten_from_moe(output, packed_seq_params, mbs):
+            return output
+
+        def _apply_mlp_bda_step(self, output_with_bias, residual, mlp_state=()):
             assert_quant_layer(1)
             return output_with_bias[0] + residual
 
@@ -412,7 +503,6 @@ def test_eager_overlap_matches_serial_output_and_gradients(monkeypatch):
             packed_seq_params=None,
             padding_mask=None,
             quant_context_factory=quant_context_factory,
-            quant_config=None,
         )
         output.sum().backward()
         gradients = {
@@ -500,11 +590,13 @@ def test_shortcut_norm_recompute_and_offload(monkeypatch):
     mlp.postprocess = lambda combined_output, shared_expert_output: combined_output
     moe_layer._forward_pre_mlp_layernorm = lambda hidden_states: hidden_states
     moe_layer._apply_mlp_bda_step = (
-        lambda output_with_bias, residual: output_with_bias[0] + residual
+        lambda output_with_bias, residual, mlp_state=(): output_with_bias[0] + residual
     )
 
-    block = ShortcutMoEBlock(_FakeCompute(config), moe_layer, overlap_a2a=False)
-    hidden_states = torch.randn(2, 1, config.hidden_size, requires_grad=True)
+    block = ShortcutMoEBlock(_FakeCompute(config), moe_layer, overlap_a2a=False).cuda()
+    hidden_states = torch.randn(
+        2, 1, config.hidden_size, device=torch.cuda.current_device(), requires_grad=True
+    )
 
     @contextmanager
     def quant_context_factory(*_args):
@@ -519,7 +611,6 @@ def test_shortcut_norm_recompute_and_offload(monkeypatch):
         packed_seq_params=None,
         padding_mask=None,
         quant_context_factory=quant_context_factory,
-        quant_config=None,
     )
     output.sum().backward()
 

@@ -6,6 +6,7 @@ from typing import Sequence
 
 import torch
 
+from megatron.core.extensions.transformer_engine import TENorm
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols as LayerSymbols
 from megatron.core.tensor_parallel.random import CheckpointWithoutOutput
 from megatron.core.transformer.identity_op import IdentityOp
@@ -14,6 +15,16 @@ from megatron.core.transformer.moe.shared_experts import set_tensor_grad_fn_sequ
 from megatron.core.transformer.spec_utils import build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.typed_torch import apply_module
+
+# Layer symbols that may precede a shortcut MoE
+SUPPORTED_SHORTCUT_PREDECESSORS = frozenset(
+    {LayerSymbols.MAMBA, LayerSymbols.GDN}
+    | {
+        symbol
+        for symbol, layer_config in LayerSymbols.LAYER_CONFIG_MAP.items()
+        if layer_config in LayerSymbols.ATTENTION_LAYER_CONFIGS
+    }
+)
 
 
 def _get_offloading_interface():
@@ -49,10 +60,12 @@ def group_layers_into_shortcut_blocks(
         ValueError: If an MoE has an unsupported predecessor or its shortcut pair crosses a
             pipeline-stage boundary.
     """
+
     if pp_layer_offset > 0 and layer_type_list and layer_type_list[0] == LayerSymbols.MOE:
         raise ValueError(
             "Shortcut MoE pairs cannot cross pipeline-stage boundaries; this pipeline stage "
-            "begins with an MoE layer."
+            f"begins with an MoE layer (global layer {pp_layer_offset + 1}). Move the stage "
+            "boundary so each MoE layer stays on the same stage as the layer before it."
         )
 
     grouped_layers = torch.nn.ModuleList()
@@ -69,12 +82,7 @@ def group_layers_into_shortcut_blocks(
 
         attn_layer = layers[physical_index]
         paired_type = layer_type_list[physical_index]
-        supported_predecessors = {
-            LayerSymbols.MAMBA,
-            LayerSymbols.GDN,
-            *LayerSymbols.ATTENTION_LAYERS,
-        }
-        if paired_type not in supported_predecessors:
+        if paired_type not in SUPPORTED_SHORTCUT_PREDECESSORS:
             raise ValueError(
                 "Shortcut MoE must be preceded by a Mamba, GDN, or supported attention layer"
             )
@@ -147,20 +155,21 @@ class ShortcutMoEBlock(MegatronModule):
         self.off_interface = _get_offloading_interface()
         self.shortcut_pre_mlp_layernorm_checkpoint = None
 
-        # The shortcut path uses the same normalization implementation and configuration as
-        # the MoE path, but owns an independent parameter.
+        shortcut_norm_spec = TENorm
         self.shortcut_pre_mlp_layernorm = build_module(
-            moe_layer.submodules_config.pre_mlp_layernorm,
+            shortcut_norm_spec,
             config=self.config,
             hidden_size=self.config.hidden_size,
             eps=self.config.layernorm_epsilon,
+            has_residual=False,
         )
         self.shortcut_post_norm = (
             build_module(
-                moe_layer.submodules_config.pre_mlp_layernorm,
+                shortcut_norm_spec,
                 config=self.config,
                 hidden_size=self.config.hidden_size,
                 eps=self.config.layernorm_epsilon,
+                has_residual=False,
             )
             if self.config.moe_shortcut_post_norm
             else IdentityOp()
@@ -183,24 +192,30 @@ class ShortcutMoEBlock(MegatronModule):
         return self.moe_layer.mlp.preprocess(shortcut_input, probs, routing_map)
 
     def _moe_shared_experts(self, hidden_states, padding_mask=None, packed_seq_params=None):
-        """Run the paired MoE layer's pre-MLP norm and shared experts."""
-        pre_mlp_output = self.moe_layer._forward_pre_mlp_layernorm(hidden_states)
+        """Run the paired MoE layer's pre-MLP norm and shared experts.
+
+        Returns:
+            ``(shared_expert_output, moe_unflatten_mbs, residual, mlp_state)``.
+        """
+        pre_mlp_output, residual, mlp_state = self.moe_layer._pre_mlp_layernorm_and_residual(
+            hidden_states
+        )
         pre_mlp_output, _, moe_unflatten_mbs = self.moe_layer._maybe_unflatten_for_moe(
             pre_mlp_output, padding_mask, packed_seq_params
         )
         shared_expert_output = self.moe_layer.mlp.shared_experts_compute(pre_mlp_output)
-        return shared_expert_output, moe_unflatten_mbs
+        return shared_expert_output, moe_unflatten_mbs, residual, mlp_state
 
     def _postprocess(
         self,
-        hidden_states,
+        residual,
         combined_output,
         shared_expert_output,
         packed_seq_params=None,
         moe_unflatten_mbs=None,
+        mlp_state=(),
     ):
         """Join routed/shared output, apply shortcut post-norm, and finish residual/BDA."""
-        residual = hidden_states.float() if self.config.fp32_residual_connection else hidden_states
         output = self.moe_layer.mlp.postprocess(combined_output, shared_expert_output)
         post_norm_input = output
         post_norm_manager = self.off_interface(
@@ -212,7 +227,7 @@ class ShortcutMoEBlock(MegatronModule):
         output = self.moe_layer._maybe_reflatten_from_moe(
             output, packed_seq_params, moe_unflatten_mbs
         )
-        output = self.moe_layer._apply_mlp_bda_step((output, None), residual)
+        output = self.moe_layer._apply_mlp_bda_step((output, None), residual, mlp_state)
         return output[0] if isinstance(output, tuple) else output
 
     def _launch_dispatch(
@@ -269,14 +284,13 @@ class ShortcutMoEBlock(MegatronModule):
         packed_seq_params,
         padding_mask,
         quant_context_factory,
-        quant_config=None,
         cp_layout_state=None,
         packed_sequence_cp_metadata=None,
     ):
         """Run the eager schedule with each physical layer's quantization context."""
 
-        attn_config = getattr(self.attn_layer, "config", quant_config)
-        moe_config = getattr(self.moe_layer, "config", quant_config)
+        attn_config = self.attn_layer.config
+        moe_config = self.moe_layer.config
         if cp_layout_state is not None:
             assert self.attn_local_idx is not None and self.moe_local_idx is not None
             hidden_states, packed_seq_params = cp_layout_state.prepare_layer(
@@ -315,7 +329,9 @@ class ShortcutMoEBlock(MegatronModule):
                 route_input, route_probs, async_op=self.overlap_mode
             )
             if self.overlap_mode:
-                dispatch_output = self._wait_dispatch(dispatched_input, dispatched_probs)
+                dispatched_input, dispatched_probs = self._wait_dispatch(
+                    dispatched_input, dispatched_probs
+                )
 
             output, _ = self.moe_layer.mlp.routed_experts_compute(
                 dispatched_input, dispatched_probs
@@ -340,10 +356,12 @@ class ShortcutMoEBlock(MegatronModule):
 
         # launch the moe shared experts and combine attn and moe layer outputs
         with quant_context_factory(moe_config, self.moe_layer_idx):
-            shared_expert_output, moe_unflatten_mbs = self._moe_shared_experts(
-                attn_layer_output,
-                padding_mask=padding_mask,
-                packed_seq_params=moe_packed_seq_params,
+            shared_expert_output, moe_unflatten_mbs, mlp_residual, mlp_state = (
+                self._moe_shared_experts(
+                    attn_layer_output,
+                    padding_mask=padding_mask,
+                    packed_seq_params=moe_packed_seq_params,
+                )
             )
             if self.overlap_mode:
                 combined_output = self._wait_combine(combined_output)
@@ -351,11 +369,12 @@ class ShortcutMoEBlock(MegatronModule):
             # Ensure the combine autograd node is scheduled first before shared_experts
             set_tensor_grad_fn_sequence_sr(combined_output, torch.iinfo(torch.int).max)
             output = self._postprocess(
-                attn_layer_output,
+                mlp_residual,
                 combined_output,
                 shared_expert_output,
                 packed_seq_params=moe_packed_seq_params,
                 moe_unflatten_mbs=moe_unflatten_mbs,
+                mlp_state=mlp_state,
             )
         if cp_layout_state is not None:
             output = cp_layout_state.finalize_layer(self.moe_local_idx, output)

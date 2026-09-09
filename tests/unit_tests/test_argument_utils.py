@@ -131,6 +131,28 @@ def test_freeze_base_model_for_mtp_validation(monkeypatch, overrides, error):
         validate_args(args)
 
 
+@pytest.mark.parametrize("fsdp_flag", ["use_torch_fsdp2", "use_megatron_fsdp"])
+def test_shortcut_connection_rejects_fsdp(monkeypatch, fsdp_flag):
+    """validate_args should reject FSDP, whose per-layer param gather the block bypasses."""
+    monkeypatch.setattr(sys, 'argv', ['test_argument_utils.py'])
+    args = parse_args()
+    args.num_layers = 2
+    args.hidden_size = 128
+    args.num_attention_heads = 4
+    args.max_position_embeddings = 1024
+    args.seq_length = 1024
+    args.micro_batch_size = 1
+    args.train_iters = 1
+    args.lr = 1e-4
+    args.tokenizer_type = 'NullTokenizer'
+    args.vocab_size = 1024
+    args.moe_shortcut_connection = True
+    setattr(args, fsdp_flag, True)
+
+    with pytest.raises(AssertionError, match="FSDP is not supported"):
+        validate_args(args)
+
+
 @dataclass
 class ConfigWithOptional:
     """Config with optional fields."""

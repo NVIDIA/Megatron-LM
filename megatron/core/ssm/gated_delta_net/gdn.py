@@ -16,6 +16,7 @@ from megatron.core.inference.contexts import BaseInferenceContext, DynamicInfere
 from megatron.core.inference.contexts.attention_context.triton.tensor_ops import (
     tensor_masked_update,
 )
+from megatron.core.inference.utils import InferenceMode
 from megatron.core.jit import jit_fuser
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.ssm.gated_delta_net.common import (
@@ -111,31 +112,17 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
         )
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
+        # Training-only. Inference is dispatched by forward() before this stage, because
+        # ssm_dynamic_inference already applies the output projection while this method must
+        # return the tensor before it. Both conditions are checked: a stray context would be
+        # ignored here, and an inference run that never threads one would silently take the
+        # training path.
+        assert (
+            inference_context is None and not InferenceMode.is_active()
+        ), "Two-stage GDN execution is training-only; inference is dispatched by forward()."
 
         seq_len, batch, _ = hidden_states.shape
         seq_len = seq_len * self.sp_size * self.cp_size
-
-        if inference_context is not None:
-            if inference_context.is_dynamic_batching():
-                assert (
-                    not self.config.deterministic_mode
-                ), "GDN dynamic inference requires the FLA recurrent kernels."
-                assert (
-                    not self.config.batch_invariant_mode
-                ), "GDN dynamic inference does not support batch-invariant mode."
-                assert (
-                    self.cp_size == 1
-                ), "Context parallelism is not supported for GDN dynamic inference."
-                assert (
-                    inference_context.num_speculative_tokens == 0
-                ), "GDN dynamic inference does not support speculative decoding."
-                assert (
-                    not inference_context.enable_prefix_caching
-                ), "GDN dynamic inference does not support prefix caching."
-                return self.ssm_dynamic_inference(hidden_states, inference_context)
-            assert inference_context.is_static_batching()
-            assert not self.config.sequence_parallel
-            raise NotImplementedError("GDN static-batching inference is not supported.")
 
         if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
             assert batch == 1, "Packed sequence expects batch dimension to be 1"
@@ -283,6 +270,59 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
             )
 
         return norm_out
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor,
+        inference_context: Optional[BaseInferenceContext] = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
+        sequence_len_offset: Optional[int] = None,
+        *,
+        inference_params: Optional[BaseInferenceContext] = None,
+        **kwargs,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Dispatch inference, then fall through to the training two-stage path.
+
+        ``ssm_dynamic_inference`` applies the output projection itself, so its result already
+        satisfies this method's ``(output, bias)`` contract and is returned directly. It cannot
+        live in ``forward_pre_attn_and_core_attn``, whose contract is the tensor *before* that
+        projection, because the base ``forward`` would then project it a second time.
+
+        Return:
+            tuple[torch.Tensor, torch.Tensor | None]: GDN output and bias.
+        """
+        inference_context = deprecate_inference_params(inference_context, inference_params)
+
+        if inference_context is not None:
+            if inference_context.is_dynamic_batching():
+                assert (
+                    not self.config.deterministic_mode
+                ), "GDN dynamic inference requires the FLA recurrent kernels."
+                assert (
+                    not self.config.batch_invariant_mode
+                ), "GDN dynamic inference does not support batch-invariant mode."
+                assert (
+                    self.cp_size == 1
+                ), "Context parallelism is not supported for GDN dynamic inference."
+                assert (
+                    inference_context.num_speculative_tokens == 0
+                ), "GDN dynamic inference does not support speculative decoding."
+                assert (
+                    not inference_context.enable_prefix_caching
+                ), "GDN dynamic inference does not support prefix caching."
+                return self.ssm_dynamic_inference(hidden_states, inference_context)
+            assert inference_context.is_static_batching()
+            assert not self.config.sequence_parallel
+            raise NotImplementedError("GDN static-batching inference is not supported.")
+
+        return super().forward(
+            hidden_states,
+            attention_mask,
+            packed_seq_params=packed_seq_params,
+            sequence_len_offset=sequence_len_offset,
+            **kwargs,
+        )
 
     def _split_projection(
         self, projected: torch.Tensor, batch: int, seq_len: int
