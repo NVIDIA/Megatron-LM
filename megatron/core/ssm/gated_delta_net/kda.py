@@ -261,14 +261,6 @@ class KimiDeltaAttention(_GDNBase):
                 self.v_dim_local_tp,
             )
 
-        # All projection layouts produce these five runtime sections before CP A2A.
-        self.runtime_projection_split_sections = (
-            self.qk_dim_local_tp,
-            self.qk_dim_local_tp,
-            self.v_dim_local_tp,
-            self.qk_dim_local_tp,
-            self.v_dim_local_tp,
-        )
         self.dt_bias_dim = self.qk_dim_local_tp
         self.a_log_dim = self.num_k_heads_local_tp
         self.gate_params_dtype = torch.float32
@@ -525,33 +517,61 @@ class KimiDeltaAttention(_GDNBase):
         """Core KDA computation (projections -> conv1d -> KDA -> norm -> out_proj)."""
 
         nvtx_range_push(suffix="in_proj")
+        raw_g = None
+        gate = None
+
+        # TODO: Overlap each projection GEMM with its headwise-CP A2A.
         if self.use_legacy_fused_projections:
             qkvfg, _ = self.in_proj(hidden_states)
+            qkv_or_qkvfg, thd_cp_a2a_inv = a2a_cp_to_hp(
+                qkvfg,
+                self.in_proj_split_sections,
+                cp_size_headwise,
+                cp_group_headwise,
+                cu_seqlens_q,
+                seq_len_post_headwise,
+                packed_seq_params,
+            )
         else:
             qkv, _ = self.in_proj(hidden_states)
+            qkv_or_qkvfg, thd_cp_a2a_inv = a2a_cp_to_hp(
+                qkv,
+                self.in_proj_split_sections,
+                cp_size_headwise,
+                cp_group_headwise,
+                cu_seqlens_q,
+                seq_len_post_headwise,
+                packed_seq_params,
+            )
             if self.config.kda_f_lora_rank is None:
                 raw_g, _ = self.f_proj(hidden_states)
             else:
                 f_latent, _ = self.f_a_proj(hidden_states)
                 raw_g, _ = self.f_b_proj(f_latent)
+            raw_g, _ = a2a_cp_to_hp(
+                raw_g,
+                (self.qk_dim_local_tp,),
+                cp_size_headwise,
+                cp_group_headwise,
+                cu_seqlens_q,
+                seq_len_post_headwise,
+                packed_seq_params,
+            )
             if self.config.kda_gate_lora_rank is None:
                 gate, _ = self.g_proj(hidden_states)
             else:
                 gate_latent, _ = self.g_a_proj(hidden_states)
                 gate, _ = self.g_b_proj(gate_latent)
-            qkvfg = torch.cat((qkv, raw_g, gate), dim=-1)
+            gate, _ = a2a_cp_to_hp(
+                gate,
+                (self.v_dim_local_tp,),
+                cp_size_headwise,
+                cp_group_headwise,
+                cu_seqlens_q,
+                seq_len_post_headwise,
+                packed_seq_params,
+            )
         beta, _ = self.beta_proj(hidden_states)
-        nvtx_range_pop(suffix="in_proj")
-
-        qkvfg, thd_cp_a2a_inv = a2a_cp_to_hp(
-            qkvfg,
-            self.runtime_projection_split_sections,
-            cp_size_headwise,
-            cp_group_headwise,
-            cu_seqlens_q,
-            seq_len_post_headwise,
-            packed_seq_params,
-        )
         beta, _ = a2a_cp_to_hp(
             beta,
             (self.num_k_heads_local_tp,),
@@ -561,6 +581,7 @@ class KimiDeltaAttention(_GDNBase):
             seq_len_post_headwise,
             packed_seq_params,
         )
+        nvtx_range_pop(suffix="in_proj")
 
         if self.gdn_pre_gated_delta_rule_fusion:
             raise NotImplementedError(
@@ -580,7 +601,7 @@ class KimiDeltaAttention(_GDNBase):
 
         nvtx_range_push(suffix="pre_gated_delta_rule")
         query, key, value, gate, beta, raw_g, A_log, dt_bias = self.pre_gated_delta_rule(
-            qkvfg,
+            qkv_or_qkvfg,
             beta,
             batch,
             seq_len_post_headwise,
@@ -589,6 +610,8 @@ class KimiDeltaAttention(_GDNBase):
             cu_seqlens_q,
             chunkwise_cp_context,
             packed_seq_params=packed_seq_params,
+            raw_g=raw_g,
+            gate=gate,
         )
         kernel_inputs = {
             "q": query,
@@ -684,7 +707,7 @@ class KimiDeltaAttention(_GDNBase):
 
     def pre_gated_delta_rule(
         self,
-        qkvfg,
+        qkv_or_qkvfg,
         beta,
         batch,
         seq_len,
@@ -693,12 +716,25 @@ class KimiDeltaAttention(_GDNBase):
         cu_seqlens_q=None,
         chunkwise_cp_context=None,
         packed_seq_params=None,
+        raw_g=None,
+        gate=None,
     ):
         """Prepare QKV, output gate, beta, and raw decay tensors before KDA."""
 
-        qkvfg = qkvfg.transpose(0, 1)
+        qkv_or_qkvfg = qkv_or_qkvfg.transpose(0, 1)
         beta = beta.transpose(0, 1)
-        qkv, raw_g, gate = torch.split(qkvfg, self._get_feat_dim_split(cp_size_headwise), dim=-1)
+        if self.use_legacy_fused_projections:
+            if raw_g is not None or gate is not None:
+                raise ValueError("Legacy KDA projections must pass raw_g and gate in qkvfg.")
+            qkv, raw_g, gate = torch.split(
+                qkv_or_qkvfg, self._get_feat_dim_split(cp_size_headwise), dim=-1
+            )
+        else:
+            if raw_g is None or gate is None:
+                raise ValueError("Non-legacy KDA projections require standalone raw_g and gate.")
+            qkv = qkv_or_qkvfg
+            raw_g = raw_g.transpose(0, 1)
+            gate = gate.transpose(0, 1)
         gate = gate.reshape(batch, seq_len, -1, self.value_head_dim)
 
         nvtx_range_push(suffix="conv1d")
