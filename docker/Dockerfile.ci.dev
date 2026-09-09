@@ -96,6 +96,17 @@ RUN --mount=type=cache,target=/root/.cache/uv \
         --no-install-package nvidia-cusparselt-cu12 \
         --no-install-package nvidia-nccl-cu12
 
+    # FA2 is provided by the base image while FA4 contributes the flash_attn.cute subpackage in
+    # the uv environment. Merge that subpackage into FA2's package so both implementations are
+    # importable, and prevent the base image's older CuTeDSL .pth file from shadowing the locked one.
+    FA2_PACKAGE_DIR=$(python -c 'import flash_attn; print(flash_attn.__path__[0])')
+    FA4_PACKAGE_DIR=$(python -c 'import site; print(site.getsitepackages()[0] + "/flash_attn/cute")')
+    test -d "${FA2_PACKAGE_DIR}"
+    test -d "${FA4_PACKAGE_DIR}"
+    cp -a "${FA4_PACKAGE_DIR}" "${FA2_PACKAGE_DIR}/"
+    find /usr/local/lib/python*/dist-packages -name 'nvidia_cutlass_dsl*.pth' -delete
+    python -c 'from flash_attn.cute import flash_attn_func, flash_attn_varlen_func'
+
     # NCCL EP embeds its build-time JIT header path in Transformer Engine. Persist the headers
     # outside the BuildKit cache mount so zero-copy kernels can be compiled at runtime.
     TE_REV=$(sed -n 's/^transformer-engine = .*rev = "\([^"]*\)".*/\1/p' /workspace/pyproject.toml)
