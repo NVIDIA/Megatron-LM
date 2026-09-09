@@ -50,6 +50,7 @@ from .uneven_dtensor import update_uneven_dtensor_chunk_metadata, validate_uneve
 from .utils import (
     _MODEL_PARALLEL_RNG_TRACKER_NAME,
     FSDPDistributedIndex,
+    GlobalMemoryBuffer,
     all_sharding_strategies_in,
     get_global_memory_buffer,
     get_mcore_tensor_parallel_partition_dim,
@@ -105,8 +106,6 @@ except ImportError:
         NCCL_ALLOCATOR = "APEX"
     except ImportError:
         nccl_allocator = None
-
-NCCL_MEMORY_POOL = None
 
 
 def _p_assert(cond: Any, s: str, raise_assertion_error: bool = True) -> None:
@@ -231,6 +230,16 @@ class MultiGroupUBRAllocator:
                 f"group.group_desc:{group.group_desc}",
             )
             backend.register_mem_pool(self.pool)
+
+
+class _ManualRegistrationState(Enum):
+    """Internal lifecycle of manual FSDP NCCL memory-pool registration."""
+
+    UNREGISTERED = "unregistered"
+    REGISTERING = "registering"
+    REGISTERED = "registered"
+    FAILED = "failed"
+    DEREGISTERED = "deregistered"
 
 
 @dataclasses.dataclass
@@ -693,12 +702,16 @@ class FixedPoolAllocator(TemporaryBucketAllocator):
         size: int = 2,
         dtype_fn: Callable[["ParameterGroup"], torch.dtype] = operator.attrgetter("dtype"),
         fallback_to_persistent_buffer: bool = False,
+        memory_buffer: GlobalMemoryBuffer | None = None,
     ):
         self.name = name
         self.fsdp_param_groups = fsdp_param_groups
         self.size = size  # Number of buffers in the pool (default is 2 for double buffering)
         self.allocation_tracker = {}  # tracking the global buffer allocation status
         self.dtype_fn = dtype_fn
+        self.memory_buffer = (
+            memory_buffer if memory_buffer is not None else get_global_memory_buffer()
+        )
 
         # Build a mapping from FSDP unit id to its associated bucket ids.
         fsdp_unit_buckets = defaultdict(dict)
@@ -875,7 +888,7 @@ class FixedPoolAllocator(TemporaryBucketAllocator):
                 bucket_id=bucket_id, size=size, dtype=dtype, device=device
             )
 
-        # Use buffer_name to get memory from global memory.
+        # Use buffer_name to get memory from this allocator's persistent arena.
         if mem_alloc_context is not None and mem_alloc_context != nullcontext:
             # Check if a new buffer allocation is required
             if (
@@ -886,7 +899,7 @@ class FixedPoolAllocator(TemporaryBucketAllocator):
                 self.allocation_tracker[(buffer_name, dtype)] = size
                 torch.cuda.synchronize()
         return Bucket(
-            data=get_global_memory_buffer().get_tensor(
+            data=self.memory_buffer.get_tensor(
                 [size], dtype=dtype, name=buffer_name, mem_alloc_context=mem_alloc_context
             )
         )
@@ -937,6 +950,7 @@ class MaxPoolAllocator(TemporaryBucketAllocator):
         size: int = 2,
         dtype_fn: Callable[["ParameterGroup"], torch.dtype] = operator.attrgetter("dtype"),
         fallback_to_persistent_buffer: bool = False,
+        memory_buffer: GlobalMemoryBuffer | None = None,
     ):
         self.name = name
         self.fsdp_param_groups = fsdp_param_groups
@@ -945,6 +959,9 @@ class MaxPoolAllocator(TemporaryBucketAllocator):
         self.bucket_alloc_index = {}  # map bucket ID to offset
         self.max_dtype_bucket_sizes = {}  # dtype -> [bucket sizes from smallest to largest]
         self.dtype_fn = dtype_fn
+        self.memory_buffer = (
+            memory_buffer if memory_buffer is not None else get_global_memory_buffer()
+        )
 
         # Build a mapping from FSDP unit id to its associated bucket ids.
         fsdp_unit_buckets = defaultdict(list)
@@ -1172,7 +1189,7 @@ class MaxPoolAllocator(TemporaryBucketAllocator):
                 bucket_id=bucket_id, size=size, dtype=dtype, device=device
             )
 
-        # Use buffer_name to get memory from global memory.
+        # Use buffer_name to get memory from this allocator's persistent arena.
         if mem_alloc_context is not None and mem_alloc_context != nullcontext:
             # Check if a new buffer allocation is required. Mirror the logic in
             # GlobalMemoryBuffer.get_tensor() to ensure MALLOC synchronization.
@@ -1184,7 +1201,7 @@ class MaxPoolAllocator(TemporaryBucketAllocator):
                 self.allocation_tracker[(buffer_name, dtype)] = size
                 torch.cuda.synchronize()
         return Bucket(
-            data=get_global_memory_buffer().get_tensor(
+            data=self.memory_buffer.get_tensor(
                 [size], dtype=dtype, name=buffer_name, mem_alloc_context=mem_alloc_context
             )
         )
@@ -2108,7 +2125,10 @@ class ParamAndGradBuffer:
             reset_parameters_for_meta_device_init_module
         )
         self.ubr_groups = None
-        self.already_registered = False
+        self.nccl_mem_pool = None
+        self.persistent_memory_buffer = GlobalMemoryBuffer()
+        self._manual_registration_state = _ManualRegistrationState.UNREGISTERED
+        self._registered_ubr_groups = []
         # User buffer registration related settings
         if self.ddp_config.nccl_ub:
             assert nccl_allocator is not None, (
@@ -2119,10 +2139,9 @@ class ParamAndGradBuffer:
             # it always uses fsdp double buffer.
             self.ddp_config.fsdp_double_buffer = True
             # Initialize the NCCL memory pool.
-            global NCCL_MEMORY_POOL
             # Initialize NCCL allocator runtime if available
             nccl_allocator.init()
-            NCCL_MEMORY_POOL = nccl_allocator.create_nccl_mem_pool(
+            self.nccl_mem_pool = nccl_allocator.create_nccl_mem_pool(
                 symmetric=not self.ddp_config.disable_symmetric_registration
             )
             log_single_rank(
@@ -2236,7 +2255,7 @@ class ParamAndGradBuffer:
                 "To use user buffer registration, "
                 "either requires megatron.core.nccl_allocator or apex.contrib.nccl_allocator"
             )
-            global NCCL_MEMORY_POOL
+            assert self.nccl_mem_pool is not None, "NCCL memory pool is not initialized"
             if groups is None:
                 # data parallel group is a default group for user buffer registration
                 groups = [self.dist_index.get_fsdp_group(is_expert_parallel=False)]
@@ -2244,20 +2263,20 @@ class ParamAndGradBuffer:
             if NCCL_ALLOCATOR == "MCORE":
                 if self.ddp_config.fsdp_manual_registration:
                     return functools.partial(
-                        nccl_allocator.MemPoolAllocatorWithoutRegistration, NCCL_MEMORY_POOL
+                        nccl_allocator.MemPoolAllocatorWithoutRegistration, self.nccl_mem_pool
                     )
                 if len(groups) == 1:
                     # register buffers to the default group directly using nccl memory allocator
                     mem_alloc_context = functools.partial(
                         nccl_allocator.nccl_mem,
-                        NCCL_MEMORY_POOL,
+                        self.nccl_mem_pool,
                         group=groups[0],
                         symmetric=symmetric,
                     )
                 else:
                     mem_alloc_context = functools.partial(
                         nccl_allocator.MultiGroupMemPoolAllocator,
-                        NCCL_MEMORY_POOL,
+                        self.nccl_mem_pool,
                         groups=groups,
                         symmetric=symmetric,
                     )
@@ -2278,12 +2297,12 @@ class ParamAndGradBuffer:
                 if len(groups) == 1:
                     # register buffers to the default group directly using nccl memory allocator
                     mem_alloc_context = functools.partial(
-                        nccl_allocator.nccl_mem, NCCL_MEMORY_POOL, group=groups[0]
+                        nccl_allocator.nccl_mem, self.nccl_mem_pool, group=groups[0]
                     )
                 else:
                     # Supports multiple groups registration for APEX NCCL allocator.
                     mem_alloc_context = functools.partial(
-                        MultiGroupUBRAllocator, NCCL_MEMORY_POOL, groups=groups
+                        MultiGroupUBRAllocator, self.nccl_mem_pool, groups=groups
                     )
             else:
                 raise ValueError(f"Invalid NCCL allocator: {NCCL_ALLOCATOR}")
@@ -2291,40 +2310,89 @@ class ParamAndGradBuffer:
         else:
             return nullcontext
 
-    def manual_buffer_registration(self):
+    def manual_buffer_registration(self) -> None:
         """
         Manually register the FSDP communication buffers to NCCL user buffer.
         """
         assert self.ddp_config.nccl_ub, "NCCL UBR is not enabled"
         assert self.ddp_config.fsdp_double_buffer, "FSDP double buffer is not enabled"
         assert self.ddp_config.fsdp_manual_registration, "FSDP manual registration is not enabled"
-        assert not self.already_registered, "Mem pool is already registered"
+        assert self.nccl_mem_pool is not None, "NCCL memory pool is not initialized"
+        assert self._manual_registration_state == _ManualRegistrationState.UNREGISTERED, (
+            "Mem pool cannot be registered from state "
+            f"{self._manual_registration_state.value}"
+        )
 
-        self.already_registered = True
+        self._manual_registration_state = _ManualRegistrationState.REGISTERING
+        try:
+            torch.cuda.synchronize()
+            torch.distributed.barrier(async_op=False)
+            torch.cuda.synchronize()
+            for group in self.ubr_groups:
+                log_single_rank(
+                    logger,
+                    logging.INFO,
+                    f"[MCORE][FSDP][Manual REG] Registering mem pool to group {group},"
+                    f"group.group_desc:{group.group_desc}, group.size(): {group.size()}",
+                )
+                nccl_allocator.register_mem_pool(
+                    self.nccl_mem_pool,
+                    group,
+                    symmetric=not self.ddp_config.disable_symmetric_registration,
+                )
+                self._registered_ubr_groups.append(group)
+                log_single_rank(
+                    logger,
+                    logging.INFO,
+                    f"[MCORE][FSDP][Manual REG] Registered mem pool to group {group},"
+                    f"group.group_desc:{group.group_desc}, group.size(): {group.size()}",
+                )
+        except Exception:
+            # Registration is collective. Do not attempt rollback here because ranks may
+            # have failed at different groups; a rollback collective could deadlock.
+            self._manual_registration_state = _ManualRegistrationState.FAILED
+            raise
+        self._manual_registration_state = _ManualRegistrationState.REGISTERED
 
-        global NCCL_MEMORY_POOL
+    @property
+    def already_registered(self) -> bool:
+        """Whether the application completed registration for every expected group."""
+        return self._manual_registration_state == _ManualRegistrationState.REGISTERED
+
+    def manual_buffer_deregistration(self) -> None:
+        """Collectively deregister manually registered groups in reverse order.
+
+        All ranks in each registered group must call this method in the same sequence.
+        """
+        assert self.ddp_config.nccl_ub, "NCCL UBR is not enabled"
+        assert self.ddp_config.fsdp_double_buffer, "FSDP double buffer is not enabled"
+        assert self.ddp_config.fsdp_manual_registration, "FSDP manual registration is not enabled"
+        assert self.nccl_mem_pool is not None, "NCCL memory pool is not initialized"
+        if self._manual_registration_state == _ManualRegistrationState.DEREGISTERED:
+            return
+        if self._manual_registration_state == _ManualRegistrationState.UNREGISTERED:
+            return
+        if self._manual_registration_state != _ManualRegistrationState.REGISTERED:
+            raise RuntimeError(
+                "Cannot safely deregister an FSDP NCCL memory pool from state "
+                f"{self._manual_registration_state.value}; communicator teardown is required."
+            )
+
         torch.cuda.synchronize()
-        torch.distributed.barrier(async_op=False)
-        torch.cuda.synchronize()
+        try:
+            for group in reversed(self._registered_ubr_groups):
+                if NCCL_ALLOCATOR == "MCORE":
+                    nccl_allocator.deregister_mem_pool(self.nccl_mem_pool, group)
+                else:
+                    backend = group._get_backend(torch.device("cuda", torch.cuda.current_device()))
+                    if self.nccl_mem_pool.snapshot():
+                        backend.deregister_mem_pool(self.nccl_mem_pool)
+        except Exception:
+            self._manual_registration_state = _ManualRegistrationState.FAILED
+            raise
 
-        for group in self.ubr_groups:
-            log_single_rank(
-                logger,
-                logging.INFO,
-                f"[MCORE][FSDP][Manual REG] Registering mem pool to group {group},"
-                f"group.group_desc:{group.group_desc}, group.size(): {group.size()}",
-            )
-            nccl_allocator.register_mem_pool(
-                NCCL_MEMORY_POOL,
-                group,
-                symmetric=not self.ddp_config.disable_symmetric_registration,
-            )
-            log_single_rank(
-                logger,
-                logging.INFO,
-                f"[MCORE][FSDP][Manual REG] Registered mem pool to group {group},"
-                f"group.group_desc:{group.group_desc}, group.size(): {group.size()}",
-            )
+        self._registered_ubr_groups.clear()
+        self._manual_registration_state = _ManualRegistrationState.DEREGISTERED
 
     def _log_parameter_groups(self):
         """Compact log of FSDP parameter groups and their parameters."""
@@ -2588,12 +2656,14 @@ class ParamAndGradBuffer:
                 fsdp_param_groups=self.parameter_groups,
                 size=UB_BUFFER_NUM,
                 fallback_to_persistent_buffer=self.ddp_config.fsdp_db_use_persist_buf_on_alloc_fail,
+                memory_buffer=self.persistent_memory_buffer,
             )
             self.transpose_weight_alloc = FIXED_POOL_ALLOC_TYPE(
                 name="fsdp_fp8_transpose_params",
                 fsdp_param_groups=self.parameter_groups,
                 size=UB_BUFFER_NUM,
                 fallback_to_persistent_buffer=self.ddp_config.fsdp_db_use_persist_buf_on_alloc_fail,
+                memory_buffer=self.persistent_memory_buffer,
             )
             # Resolve gradient bucket dtype used for MaxPoolAllocator bucket allocation
             # planning and FixedPoolAllocator unit symmetries. Falls back to each
@@ -2611,6 +2681,7 @@ class ParamAndGradBuffer:
                 fallback_to_persistent_buffer=(
                     self.ddp_config.fsdp_db_use_persist_buf_on_alloc_fail
                 ),
+                memory_buffer=self.persistent_memory_buffer,
             )
             if self.dist_index.use_hybrid_fsdp:
                 # Only required for custom communication dtype buffer allocation
@@ -2625,6 +2696,7 @@ class ParamAndGradBuffer:
                     fallback_to_persistent_buffer=(
                         self.ddp_config.fsdp_db_use_persist_buf_on_alloc_fail
                     ),
+                    memory_buffer=self.persistent_memory_buffer,
                 )
             self.double_buf_units = self.weight_alloc.fsdp_double_buffer_units
         else:

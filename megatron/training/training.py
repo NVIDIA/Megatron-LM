@@ -1516,6 +1516,47 @@ def preprocess_common_state_dict(common_state_dict):
     return preprocessed_common_state_dict
 
 
+def _deregister_nccl_memory_pools(model: list[torch.nn.Module], args: argparse.Namespace) -> None:
+    """Deregister model-owned NCCL pools before process-group teardown.
+
+    ProcessGroupNCCL destruction may otherwise deregister retained symmetric handles again.
+    """
+    fsdp_buffers = []
+    ddp_buffers = []
+    for model_module in model:
+        if isinstance(model_module, (FullyShardedDataParallelV1, FullyShardedDataParallelV2)):
+            param_and_grad_buffer = model_module.param_and_grad_buffer
+            if (
+                param_and_grad_buffer.ddp_config.fsdp_manual_registration
+                and param_and_grad_buffer.nccl_mem_pool is not None
+            ):
+                fsdp_buffers.append(param_and_grad_buffer)
+
+        if isinstance(model_module, DDP):
+            ddp_buffers.extend(
+                buffer
+                for buffer in model_module.buffers + model_module.expert_parallel_buffers
+                if buffer.nccl_mem_pool is not None
+            )
+
+    gtp_registration_enabled = getattr(args, 'gtp_remat_nccl_ub', False) or getattr(
+        args, 'gtp_expert_remat_nccl_ub', False
+    )
+    if not gtp_registration_enabled and not fsdp_buffers and not ddp_buffers:
+        return
+
+    torch.distributed.barrier()
+    if gtp_registration_enabled:
+        from megatron.core.tensor_parallel.gtp_api import deregister_and_clear_gtp_symm_pools
+
+        deregister_and_clear_gtp_symm_pools()
+
+    for param_and_grad_buffer in fsdp_buffers:
+        param_and_grad_buffer.manual_buffer_deregistration()
+    for buffer in ddp_buffers:
+        nccl_allocator.deregister_mem_pool(buffer.nccl_mem_pool, buffer.data_parallel_group)
+
+
 def pretrain(
     cfg_container: PretrainConfigContainer,
     train_valid_test_dataset_provider,
@@ -2161,12 +2202,7 @@ def pretrain(
     if args.perform_rl_step:
         rl_utils.rl_inference_interface_shutdown()
 
-    if getattr(args, 'gtp_remat_nccl_ub', False) or getattr(args, 'gtp_expert_remat_nccl_ub', False):
-        from megatron.core.tensor_parallel.gtp_api import deregister_and_clear_gtp_symm_pools
-
-        # Deregister the GTP symmetric-memory pools: windows left registered when the
-        # process groups are destroyed make NCCL abort.
-        deregister_and_clear_gtp_symm_pools()
+    _deregister_nccl_memory_pools(model, args)
 
     ft_integration.shutdown()
     one_logger_utils.finish()
@@ -5195,23 +5231,8 @@ def train(
 
     # If any exit conditions (signal handler, duration, iterations) have been reached, exit.
     if should_exit:
-        # Deregister NCCL user-buffer memory pools before exit.
-        # Without this, ProcessGroupNCCL's destructor calls abort() which uses
-        # ncclCommDeregister on handles created by ncclCommWindowRegister,
-        # causing "NCCL WARN Deregister: Could not find handle" and a crash.
-        torch.distributed.barrier()
-        if getattr(args, 'gtp_remat_nccl_ub', False) or getattr(args, 'gtp_expert_remat_nccl_ub', False):
-            from megatron.core.tensor_parallel.gtp_api import deregister_and_clear_gtp_symm_pools
-
-            # Deregister the GTP symmetric-memory pools: windows left registered when the
-            # process groups are destroyed make NCCL abort.
-            deregister_and_clear_gtp_symm_pools()
-
-        for model_module in model:
-            if isinstance(model_module, DDP):
-                for buf in model_module.buffers + model_module.expert_parallel_buffers:
-                    if getattr(buf, 'nccl_mem_pool', None) is not None:
-                        nccl_allocator.deregister_mem_pool(buf.nccl_mem_pool, buf.data_parallel_group)
+        # Deregister retained pools before ProcessGroupNCCL destructors run.
+        _deregister_nccl_memory_pools(model, args)
         one_logger and one_logger.log_metrics(
             {'app_finish_time': one_logger_utils.get_timestamp_in_ms()}
         )
