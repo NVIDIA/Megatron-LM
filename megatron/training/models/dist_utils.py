@@ -337,14 +337,21 @@ def _ddp_wrap(
         # DistOpt-style buffer.
         tag_params_for_buffer_routing(model)
 
-    if get_model_config(model[0]).cuda_graph_impl == "full_iteration":
+    cuda_graph_impl = get_model_config(model[0]).cuda_graph_impl
+    current_stream = torch.cuda.current_stream()
+    if cuda_graph_impl == "full_iteration":
         # DDP initialization must use the full-iteration capture stream so its retained
         # AccumulateGrad nodes do not reference a different, non-capturing stream.
         ddp_stream = get_shared_capture_stream()
+    elif cuda_graph_impl == "none":
+        # Eager initialization is serialized with the current stream. A one-shot side stream
+        # can leave cached blocks unavailable to later allocations on the current stream.
+        ddp_stream = current_stream
     else:
         # Preserve a dedicated initialization stream for all other implementations.
         ddp_stream = torch.cuda.Stream()
-    ddp_stream.wait_stream(torch.cuda.current_stream())
+    if ddp_stream is not current_stream:
+        ddp_stream.wait_stream(current_stream)
 
     with torch.cuda.stream(ddp_stream):
         dp_init_kwargs = {}
@@ -403,8 +410,9 @@ def _ddp_wrap(
             wrapped_model.append(wrapped_chunk)
         model = wrapped_model
 
-    # Ensure initialization-stream work completes before touching params on the default stream.
-    torch.cuda.current_stream().wait_stream(ddp_stream)
+    # Ensure side-stream initialization completes before touching params on the current stream.
+    if ddp_stream is not current_stream:
+        current_stream.wait_stream(ddp_stream)
 
     # Broadcast params from data parallel src rank to other data parallel ranks.
     if data_parallel_random_init:
