@@ -60,6 +60,46 @@ def set_moe_metrics_tracker(tracker: 'MoEMetricsTracker') -> None:
     _MOE_METRICS_TRACKER = tracker
 
 
+def get_mtp_metric_slots(config) -> int:
+    """Number of per-layer metric slots occupied by the MTP module.
+
+    ``mtp_num_layers`` counts MTP *depths*, which is not the same as the number
+    of transformer layers a depth contains. On the hybrid path a depth is a
+    ``HybridStack`` built one layer per character of the MTP pattern (see
+    ``validate_segment_layers``), and every depth restarts its layer numbering
+    at 1 because it is created with ``pp_layer_offset=0``. The router indexes
+    this tracker with that inner layer number, so the highest slot it can touch
+    is the pattern length, not the depth count — e.g. ``"*E"`` needs two slots
+    even though ``mtp_num_layers == 1``, and the MoE layer is the second one.
+    On the GPT path a depth is a single layer and the two counts coincide.
+
+    The MTP pattern is read from the deprecated ``mtp_hybrid_override_pattern``
+    when set, otherwise from the MTP section of the unified
+    ``hybrid_layer_pattern``, so either spelling of the same model gives the
+    same answer.
+
+    Args:
+        config: A ``TransformerConfig`` (or provider derived from one).
+
+    Returns:
+        Slots to reserve after the main decoder's ``num_layers``; 0 without MTP.
+    """
+    mtp_num_layers = getattr(config, "mtp_num_layers", None) or 0
+    if mtp_num_layers == 0:
+        return 0
+
+    pattern = getattr(config, "mtp_hybrid_override_pattern", None)
+    if pattern is None:
+        hybrid_layer_pattern = getattr(config, "hybrid_layer_pattern", None)
+        if hybrid_layer_pattern:
+            # Imported here: megatron.core.models imports back into this package.
+            from megatron.core.models.hybrid.hybrid_layer_allocation import parse_hybrid_pattern
+
+            pattern = parse_hybrid_pattern(hybrid_layer_pattern).mtp_pattern
+
+    return len(pattern) if pattern else mtp_num_layers
+
+
 def destroy_moe_metrics_tracker() -> None:
     """Reset the global MoE metrics tracker to ``None``."""
     global _MOE_METRICS_TRACKER
