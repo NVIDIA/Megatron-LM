@@ -2,12 +2,16 @@
 
 ## Selective Unit Testing
 
-PR builds select H100 unit-test **files** affected by the whole PR diff using
-`pytest-impacted`, including transitive import dependencies. CI adds the 10
-baseline files in [`unit_tests/always_run_tests.json`](unit_tests/always_run_tests.json)
+Add the **`Run selective unit tests`** label to a PR to select H100 unit-test
+**files** affected by the whole PR diff using `pytest-impacted`, including
+transitive import dependencies. PRs without this label run the full unit-test
+suite, including documentation-only PRs. CI adds the 10 baseline files in
+[`unit_tests/always_run_tests.json`](unit_tests/always_run_tests.json)
 to every selection, maps the union to the existing buckets, and launches only
 buckets with selected files. Each file can contain multiple parametrized test
-cases. Documentation-only PRs run the baseline after the usual CI authorization.
+cases. Documentation-only PRs with this label run the baseline after the usual
+CI authorization. `Run full unit tests` overrides selection and requests the
+full suite when both labels are present.
 The existing GB200 hardware-specific marker suite remains enabled separately.
 
 The baseline covers basic setup, model-parallel configuration, process groups,
@@ -18,17 +22,18 @@ CI bucket. Changes to the baseline itself run the full suite for validation.
 
 | Build or change | H100 unit tests |
 | --- | --- |
-| PR source or test changes | Affected files plus the baseline |
-| Documentation-only PR | Baseline only |
-| PR labeled `Run full unit tests` | Full suite |
+| PR without `Run selective unit tests`, including documentation-only PRs | Full suite |
+| PR labeled `Run selective unit tests`, source or test changes | Affected files plus the baseline |
+| Documentation-only PR labeled `Run selective unit tests` | Baseline only |
+| PR labeled `Run full unit tests`, including when both labels are present | Full suite |
 | Merge queue, nightly/CI workload, manual dispatch | Full suite |
 | Unsupported change or failed/ambiguous analysis | Full suite |
 
 `Run tests` and `Run functional tests` retain their functional-test behavior;
-they do not disable unit-test selection. No opt-in label is required. The old
-`Run selective unit tests` and `Run selective unit tests on latest commit`
-labels are unnecessary; selection always covers the entire PR, including
-changes in earlier commits.
+they do not enable or disable unit-test selection. The older
+`Run selective unit tests on latest commit` label does not enable selection.
+Use `Run selective unit tests`; analysis always covers the entire PR, including
+changes in earlier commits. The full-suite override takes precedence.
 
 Selection is conservative: missing/invalid base commits, selector errors,
 timeouts, deleted or renamed files, shared fixtures, test runners, dependency
@@ -40,10 +45,44 @@ analyzed base must be an exact ancestor of the same commit used by test jobs.
 Static imports cannot prove complete runtime coverage of dynamic imports,
 plugins, or monkeypatching; the full merge-queue suite remains the final check.
 
-The workflow summary reports the mode, fallback reason, affected and baseline
+The selection summary reports the mode, fallback reason, affected and baseline
 file counts, total selected files, buckets, and selector overhead. The dependency
-graph is rebuilt on every run, so there is no persistent impact cache. Invalid
+graph is rebuilt on each selective run, so there is no persistent impact cache. Invalid
 per-job payloads and selections that collect no runnable tests fail the job.
+
+### Compare runs with and without selection
+
+CI records metrics for both labeled and unlabeled runs in its workflow summary
+and the `unit-test-metrics-<run-id>-<run-attempt>` artifact, retained for 90 days.
+It contains `unit-test-metrics.json`, `unit-test-metrics.csv`, and
+`unit-test-metrics.md`; the CSV contains one row per run. The separate
+`unit-test-selection-<run-id>-<run-attempt>` artifact preserves the selection
+manifest. Compare `selective_label_present` and `mode` together:
+a labeled PR can still fall back to the full suite, with the reason recorded in
+`selection_reason`.
+
+Download a run's metrics with:
+
+```bash
+gh run download <run-id> --repo NVIDIA/Megatron-LM \
+  --pattern 'unit-test-metrics-*' --dir ./unit-test-metrics/<run-id>
+```
+
+The report includes selected and available H100 test-file counts, selected
+bucket count, selector duration, observed job counts, and job outcomes. These
+file counts describe the test plan; a file can contain many parametrized cases.
+Job timing comes from the actual GitHub Actions jobs:
+
+- `sum_job_execution_seconds` totals execution time across H100 unit-test jobs.
+- `job_execution_span_seconds` measures the interval from the first H100 job
+  starting to the last finishing, including overlap between parallel jobs.
+- `timing_complete` indicates whether every expected job has usable timing.
+  Complete timing totals are null for incomplete data; any partial duration is
+  reported separately as `observed_job_execution_seconds`.
+
+Compare equivalent commits and environments when assessing the opt-in mode.
+These metrics exclude GB200 jobs and do not measure queue time or predict how
+long a skipped test would have taken.
 
 ### Analyze changes locally
 
