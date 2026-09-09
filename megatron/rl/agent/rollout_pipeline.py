@@ -80,6 +80,7 @@ class _GranularityConfig(NamedTuple):
         return {
             "R": self.num_groups_per_batch * self.rollouts_per_group,
             "G": self.num_groups_per_batch,
+            "E": len(self.num_groups_per_env),
             "B": 1,
         }[self.submission]
 
@@ -110,9 +111,9 @@ class _SubmissionGate:
     """Gate capacity is measured in units of the configured submission granularity.
 
     Each granularity has a single release point: R slots free when inference
-    completes, so the gate bounds engine concurrency in rollouts. G and B
-    slots free when the trainer consumes the group/batch, so the gate
-    enforces the --rl-generation-lag run-ahead cap in groups/batches
+    completes, so the gate bounds engine concurrency in rollouts. G, E, and B
+    slots free when the trainer consumes the group/env-unit/batch, so the gate
+    enforces the --rl-generation-lag run-ahead cap in groups/env-units/batches
     respectively.
     """
 
@@ -377,7 +378,14 @@ class RolloutPipeline:
             while True:
                 await self.gate.acquire_for("B")
 
+                previous_env_index = -1
                 for index_in_batch in range(self.gran_policy.num_groups_per_batch):
+                    env_index = self.gran_policy.env_of_index(index_in_batch)
+                    if env_index != previous_env_index:
+                        # Env-unit boundary: under E submission, hold one gate
+                        # slot per env-unit until the trainer consumes it.
+                        await self.gate.acquire_for("E")
+                        previous_env_index = env_index
                     await self.gate.acquire_for("G")
                     self._groups_in_flight += 1
                     env_index = self.gran_policy.env_of_index(index_in_batch)
@@ -584,6 +592,7 @@ class RolloutPipeline:
         """Deliver groups in the order defined by the consumption granularity."""
         consume = {
             "G": self._consume_completion_order,
+            "E": self._consume_env_units,
             "B": self._consume_batch_order,
         }[self.gran_policy.consumption]
         async for group in consume():
@@ -591,34 +600,41 @@ class RolloutPipeline:
             yield group
 
     async def _consume_completion_order(self) -> AsyncIterator[RolloutGroup]:
-        """G consumption: deliver groups in completion order, balanced across envs."""
-        groups_per_env_per_batch = self.gran_policy.num_groups_per_env
-        pending_groups_by_env: list[deque[RolloutGroup]] = [
-            deque() for _ in groups_per_env_per_batch
-        ]
-        delivered_groups_by_env = [0] * len(groups_per_env_per_batch)
+        """G consumption: deliver each group as soon as it assembles, in global completion order."""
+        while (group := await self._next_complete_group()) is not None:
+            yield group
+            self.gate.release_for("G")
+
+    async def _consume_env_units(self) -> AsyncIterator[RolloutGroup]:
+        """Balanced-E consumption: each env's earliest completed groups in units of
+        num_groups_per_env[e], one unit per env per batch; a fast env's extra units
+        wait, so no env runs more than one delivered batch ahead."""
+        num_envs = len(self.gran_policy.num_groups_per_env)
+        pending: list[list[RolloutGroup]] = [[] for _ in range(num_envs)]
+        ready_units: list[deque[list[RolloutGroup]]] = [deque() for _ in range(num_envs)]
+        delivered_units = [0] * num_envs
+        current_batch = 0
         while (group := await self._next_complete_group()) is not None:
             env_index = self.gran_policy.env_of_index(group.index_in_batch)
-            pending_groups_by_env[env_index].append(group)
-            yielded_any = True
-            while yielded_any:
-                yielded_any = False
-                for env, queue in enumerate(pending_groups_by_env):
-                    if queue and delivered_groups_by_env[env] < groups_per_env_per_batch[env]:
-                        yield queue.popleft()
-                        self.gate.release_for("G")
-                        delivered_groups_by_env[env] += 1
-                        yielded_any = True
-                if all(
-                    count == quota
-                    for count, quota in zip(delivered_groups_by_env, groups_per_env_per_batch)
-                ):
-                    delivered_groups_by_env = [0] * len(groups_per_env_per_batch)
-        # The stream is over; nothing is left to balance against, so drain any pending groups.
-        for queue in pending_groups_by_env:
-            while queue:
-                yield queue.popleft()
-                self.gate.release_for("G")
+            pending[env_index].append(group)
+            unit_size = self.gran_policy.num_groups_per_env[env_index]
+            if len(pending[env_index]) >= unit_size:
+                ready_units[env_index].append(pending[env_index][:unit_size])
+                pending[env_index] = pending[env_index][unit_size:]
+            progressed = True
+            while progressed:
+                progressed = False
+                for env in range(num_envs):
+                    if delivered_units[env] == current_batch and ready_units[env]:
+                        for unit_group in ready_units[env].popleft():
+                            yield unit_group
+                            self.gate.release_for("G")
+                        self.gate.release_for("E")
+                        delivered_units[env] += 1
+                        progressed = True
+                if all(count > current_batch for count in delivered_units):
+                    current_batch += 1
+                    progressed = True
 
     async def _consume_batch_order(self) -> AsyncIterator[RolloutGroup]:
         """B consumption: deliver whole batches in dataset order."""
@@ -633,7 +649,13 @@ class RolloutPipeline:
                 batch = pending.pop(next_batch_id)
                 batch.sort(key=lambda group: group.index_in_batch)
                 next_batch_id += 1
-                for group in batch:
-                    yield group
-                    self.gate.release_for("G")
+                # Env blocks are contiguous in index_in_batch order, so the
+                # sorted batch is env 0's unit, then env 1's, and so on.
+                start = 0
+                for unit_size in self.gran_policy.num_groups_per_env:
+                    for group in batch[start : start + unit_size]:
+                        yield group
+                        self.gate.release_for("G")
+                    self.gate.release_for("E")
+                    start += unit_size
                 self.gate.release_for("B")

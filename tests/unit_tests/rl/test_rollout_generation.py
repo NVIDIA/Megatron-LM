@@ -237,12 +237,12 @@ def _assert_batches_arrive_in_submission_order(groups, num_groups):
 
 class TestSubmissionGate:
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("submission", ["R", "G", "B"])
+    @pytest.mark.parametrize("submission", ["R", "G", "E", "B"])
     async def test_release_requires_matching_granularity(self, submission):
         gate = _SubmissionGate(capacity=1, submission=submission)
         await gate.acquire_for(submission)
         assert gate.held == 1
-        for granularity in ("R", "G", "B"):
+        for granularity in ("R", "G", "E", "B"):
             if granularity == submission:
                 continue
             gate.release_for(granularity)
@@ -261,6 +261,7 @@ class TestConsumptionRelease:
         "consumption_granularity, num_groups",
         [
             pytest.param("G", 1, id="group_consumption"),
+            pytest.param("E", 1, id="env_consumption"),
             pytest.param("B", 2, id="batch_consumption"),
         ],
     )
@@ -898,8 +899,12 @@ class TestGroupedRollouts:
         [
             pytest.param("B", "B", 0, 1, 2, id="batch_batch"),
             pytest.param("G", "G", 0, 1, 2, id="group_group"),
-            # Balanced G under out-of-order completion and a depth-2 gate.
-            pytest.param("G", "G", 2, 2, 3, id="group_group_out_of_order"),
+            pytest.param("E", "E", 0, 1, 2, id="env_env"),
+            pytest.param("G", "E", 0, 1, 2, id="group_env"),
+            # Balanced E under out-of-order completion and a depth-2 gate. G no
+            # longer balances on its own (that guarantee moved to E), so this
+            # case targets E instead of the old group_group_out_of_order.
+            pytest.param("E", "E", 2, 2, 3, id="env_env_out_of_order"),
         ],
     )
     async def test_weighted_multi_task(
@@ -983,9 +988,40 @@ class TestGroupedRollouts:
             pipeline.assert_no_inflight_rollouts()
 
     @pytest.mark.asyncio
+    async def test_env_consumption_balances_each_batch(self):
+        """Balanced-E: every trainer-batch window holds each env's exact share."""
+        configs = [
+            AgentConfig(agent_type=MockGenerator, agent_args={"env_id": "a"}, weight=3.0),
+            AgentConfig(agent_type=MockGenerator, agent_args={"env_id": "b"}, weight=1.0),
+        ]
+        mt = WeightedMultiTask(configs)
+
+        request = GroupedRolloutRequest(
+            num_groups=4,
+            rollouts_per_group=1,
+            inference_interface=MockInferenceInterface(num_slow_calls=2),
+            streaming=True,
+            submission_granularity="E",
+            consumption_granularity="E",
+        )
+        groups = []
+        async for group in RolloutPipeline(mt, request, parallel_generation_tasks=2).run():
+            groups.append(group)
+            if len(groups) >= 12:
+                break
+
+        for start in range(0, 12, 4):
+            env_ids = [g[0].env_id for g in groups[start : start + 4]]
+            assert sorted(env_ids) == ["a", "a", "a", "b"]
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize(
         "submission_granularity, consumption_granularity",
-        [pytest.param("B", "G", id="batch_group")],
+        [
+            pytest.param("B", "G", id="batch_group"),
+            pytest.param("B", "E", id="batch_env"),
+            pytest.param("E", "G", id="env_group"),
+        ],
     )
     async def test_consumption_finer_than_submission_rejected(
         self, submission_granularity, consumption_granularity
