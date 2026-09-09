@@ -852,7 +852,7 @@ Case A is what §1.3's "tail slice" framing describes for the reassembled tensor
 
 ```bash
 # 4 GPUs. GTP_remat requires TransformerEngine >= 2.19.
-torchrun --nproc-per-node 4 -m pytest tests/unit_tests/generalized_tensor_parallel/ -v
+torchrun --nproc-per-node 4 -m pytest tests/unit_tests/core/tensor_parallel/test_*gtp*.py -v
 ```
 
 | Test file | What it guards |
@@ -874,10 +874,10 @@ torchrun --nproc-per-node 4 -m pytest tests/unit_tests/generalized_tensor_parall
 | `test_gtp_ddp_param_sync_race.py` | Parameter-readiness ordering (§3.2): GTP_remat's ahead-of-consume prefetch must not read a bucket DDP has not published. Structural and numerical (stale-value) guards on the default one-weight-ahead chain, the grouped-expert one-block-ahead chain, and the recompute exclusion. |
 | `test_gtp_custom_pgs.py` | `pg_collection` plumbing: a custom `gtp_remat` group (permuted ranks, same size) must give the same fwd/bwd results as the MPU groups — catches modules reading `parallel_state` instead of the collection passed to them. |
 
-The fp32-accumulation primitive itself is covered outside this suite, by `tests/unit_tests/distributed/test_reduce_scatter_with_fp32_accumulation.py`, which does not require GTP_remat.
+The fp32-accumulation primitive itself is covered outside this suite, by `tests/unit_tests/core/distributed/test_reduce_scatter_with_fp32_accumulation.py`, which does not require GTP_remat.
 
-The parameter-readiness contract itself (§3.2) is likewise covered outside this suite, by `tests/unit_tests/distributed/test_param_readiness.py` — CPU-only, no GPU or GTP_remat required. It pins the branches the 4-GPU test does not exercise: `align_param_gather`, pre-hooks removed mid-sequence, and a collected DDP or bucket group.
+The parameter-readiness contract itself (§3.2) is likewise covered outside this suite, by `tests/unit_tests/core/distributed/test_param_readiness.py` — CPU-only, no GPU or GTP_remat required. It pins the branches the 4-GPU test does not exercise: `align_param_gather`, pre-hooks removed mid-sequence, and a collected DDP or bucket group.
 
-The `num_zeros` padding correction (§3.7) has two more layers of coverage outside this suite, both CPU-only: `tests/unit_tests/tensor_parallel/test_layers.py::TestGtpLocalPadZeroCount` unit-tests `gtp_local_pad_zero_count`'s row-offset math directly (no padding, tail-only, DP-fragment overlap variants, and the small-`dim0` spillover case), and `tests/unit_tests/optimizer/test_clip_grads.py::TestCountZerosFp32GtpPadding` checks `count_zeros_fp32`'s subtraction with and without an explicit `.gtp_pad_zeros` stamp.
+The `num_zeros` padding correction (§3.7) has two more layers of coverage outside this suite, both CPU-only: `tests/unit_tests/core/tensor_parallel/test_layers.py::TestGtpLocalPadZeroCount` unit-tests `gtp_local_pad_zero_count`'s row-offset math directly (no padding, tail-only, DP-fragment overlap variants, and the small-`dim0` spillover case), and `tests/unit_tests/core/optimizer/test_clip_grads.py::TestCountZerosFp32GtpPadding` checks `count_zeros_fp32`'s subtraction with and without an explicit `.gtp_pad_zeros` stamp.
 
 All tests require ≥ 4 GPUs and TransformerEngine >= 2.19; they self-skip when those are unavailable. A green run (skips for unmet hardware/config are acceptable) is the minimum bar for any GTP_remat change.

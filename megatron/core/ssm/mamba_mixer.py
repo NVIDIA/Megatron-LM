@@ -360,7 +360,7 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule):
             # The first weight init is not strictly required, but keeping the
             # old RNG consumption reduces this PR's blast radius. The
             # hard-coded hybrid inference token baselines in
-            # tests/unit_tests/inference/engines/test_dynamic_engine.py could
+            # tests/unit_tests/core/inference/engines/test_dynamic_engine.py could
             # be relaxed/updated instead if we remove this extra initialization.
             nn.init.kaiming_uniform_(self.conv1d_weight, a=math.sqrt(5))
             fan_in = self.conv1d_weight.size(1) * self.conv1d_weight.size(2)

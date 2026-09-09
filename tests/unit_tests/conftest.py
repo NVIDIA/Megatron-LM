@@ -10,7 +10,7 @@ import torch.distributed
 from megatron.core import config
 from megatron.core.utils import is_te_min_version
 from tests.test_utils.python_scripts.download_unit_tests_dataset import download_and_extract_asset
-from tests.unit_tests.dist_checkpointing import TempNamedDir
+from tests.unit_tests.core.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
 
 
