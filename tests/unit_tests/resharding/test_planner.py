@@ -1145,3 +1145,62 @@ class TestTensorReshardSpecs:
 
         assert error is None
         assert [(spec.src_ranks, spec.dst_ranks) for spec in specs] == [((0,), (2,)), ((1,), (3,))]
+
+
+class TestDefaultParameterCap:
+    """Execution batches are on by default, capped by logical parameters per batch."""
+
+    @staticmethod
+    def _rosters(num_params):
+        names = [f"p{i}" for i in range(num_params)]
+        return [
+            (
+                [
+                    _meta(name=n, shape=(8,), owner_rank=0, tp_ranks=[0], dp_ranks=[0])
+                    for n in names
+                ],
+                [],
+            ),
+            (
+                [],
+                [
+                    _meta(name=n, shape=(8,), owner_rank=1, tp_ranks=[1], dp_ranks=[1])
+                    for n in names
+                ],
+            ),
+        ]
+
+    def test_default_cap_splits_large_plans_consistently(self, monkeypatch):
+        monkeypatch.delenv("MEGATRON_REFIT_MAX_PARAMS_PER_BATCH", raising=False)
+        monkeypatch.setattr(planner, "DEFAULT_MAX_PARAMS_PER_BATCH", 32)
+        plans = _build_all(self._rosters(70))
+        assert {plan.num_batches for plan in plans.values()} == {3}
+        assert {plan.total_tasks for plan in plans.values()} == {70}
+        send_batches = {op.task_id: op.batch_id for op in plans[0].send_ops}
+        recv_batches = {op.task_id: op.batch_id for op in plans[1].recv_ops}
+        assert send_batches == recv_batches
+        assert max(send_batches.values()) == 2
+        # Exactly the cap in every full batch.
+        from collections import Counter
+
+        assert sorted(Counter(send_batches.values()).values()) == [6, 32, 32]
+
+    def test_small_plans_stay_in_one_batch(self, monkeypatch):
+        monkeypatch.delenv("MEGATRON_REFIT_MAX_PARAMS_PER_BATCH", raising=False)
+        plans = _build_all(self._rosters(5))
+        assert {plan.num_batches for plan in plans.values()} == {1}
+
+    def test_env_override_and_disable(self, monkeypatch):
+        monkeypatch.setenv("MEGATRON_REFIT_MAX_PARAMS_PER_BATCH", "10")
+        plans = _build_all(self._rosters(25))
+        assert {plan.num_batches for plan in plans.values()} == {3}
+        monkeypatch.setenv("MEGATRON_REFIT_MAX_PARAMS_PER_BATCH", "0")
+        plans = _build_all(self._rosters(70))
+        assert {plan.num_batches for plan in plans.values()} == {1}
+
+    def test_byte_limit_and_parameter_cap_compose(self, monkeypatch):
+        monkeypatch.setenv("MEGATRON_REFIT_MAX_PARAMS_PER_BATCH", "1000")
+        plans = _build_all(
+            self._rosters(4), execution_batch_bytes=64
+        )  # two 32-byte params per batch
+        assert {plan.num_batches for plan in plans.values()} == {2}

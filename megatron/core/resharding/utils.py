@@ -163,6 +163,10 @@ class ReshardPlan:
     # Number of globally coordinated batches in send_ops/recv_ops. Backends
     # that require one stable model-wide registration can opt out at execution.
     num_batches: int = 1
+    # Total number of transfers (task ids) in the global schedule, identical on
+    # every rank. Lets a copy service size its submissions from plan-global data
+    # rather than from this rank's own op count, so all ranks decide alike.
+    total_tasks: int | None = None
     # Effective soft execution limit after ranks agree on the smallest
     # configured value. Native backends may reuse this coordinated value for
     # their own grouped submissions.
