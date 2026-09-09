@@ -37,7 +37,9 @@ class GlobalLayout:
     size: int
 
     @classmethod
-    def build(cls, shapes: Iterable[Shape], dp_size: int) -> "GlobalLayout":
+    def build(
+        cls, shapes: Iterable[Shape], dp_size: int, subgroup_size: int | None = None
+    ) -> "GlobalLayout":
         """Compute global tensor element offsets and padded size.
 
         This is a DBuffer-specific reimplementation of
@@ -70,6 +72,10 @@ class GlobalLayout:
         Args:
             shapes: Logical tensor shapes in tensor-id order.
             dp_size: Data-parallel shard count for this global layout.
+            subgroup_size: Optional number of contiguous DP ranks per parameter-placement
+                subgroup. When set below ``dp_size``, ordinary tensors are packed wholly inside
+                one equally sized subgroup span. Tensors larger than the average subgroup payload
+                may cross subgroup boundaries to avoid disproportionate padding.
 
         Returns:
             Global layout with row-aligned tensor offsets and a total size padded
@@ -88,6 +94,13 @@ class GlobalLayout:
                     f"Cannot compute a layout for zero-sized non-leading dims: {shape}."
                 )
             chunk_size = math.lcm(chunk_size, row_size)
+
+        if subgroup_size is not None:
+            if subgroup_size < dp_size:
+                offsets, size = _build_subgroup_layout(
+                    tensor_shapes, chunk_size, dp_size, subgroup_size
+                )
+                return cls(tensor_shapes=tensor_shapes, tensor_to_offset=offsets, size=size)
 
         # chunk_size is the packing granularity. Since every tensor row size divides it,
         # DP shard boundaries that are multiples of chunk_size avoid splitting dim-0 rows.
@@ -246,6 +259,66 @@ def non_leading_numel(shape: torch.Size) -> int:
     if len(shape) == 0:
         raise ValueError(f"DBuffer layout does not support 0D tensor shapes: {shape}.")
     return shape[1:].numel()
+
+
+def _build_subgroup_layout(
+    tensor_shapes: tuple[torch.Size, ...], chunk_size: int, dp_size: int, subgroup_size: int
+) -> tuple[tuple[int, ...], int]:
+    """Keep ordinary tensors subgroup-local while allowing oversized tensors to cross."""
+    num_subgroups = dp_size // subgroup_size
+    tensor_ids = sorted(
+        range(len(tensor_shapes)), key=lambda i: (-tensor_shapes[i].numel(), i)
+    )
+    # Keep moderately large tensors subgroup-local; only oversized tensors may cross.
+    average_payload = 1.7 * sum(shape.numel() for shape in tensor_shapes) / num_subgroups
+    large_ids = [i for i in tensor_ids if tensor_shapes[i].numel() > average_payload]
+    small_ids = [i for i in tensor_ids if tensor_shapes[i].numel() <= average_payload]
+
+    # Pack oversized tensors contiguously at the front; this region may span subgroups.
+    offsets = [-1] * len(tensor_shapes)
+    large_size = 0
+    for tensor_id in sorted(large_ids):
+        shape = tensor_shapes[tensor_id]
+        large_size = _pad_to_multiple(large_size, non_leading_numel(shape))
+        offsets[tensor_id] = large_size
+        large_size += shape.numel()
+
+    if not small_ids:
+        return tuple(offsets), _pad_to_multiple(large_size, chunk_size * dp_size)
+
+    # Try each possible split between the shared large-tensor region and local subgroups.
+    def build_candidate(large_spans: int) -> tuple[int, int, list[tuple[int, int, int]]]:
+        cursors = [0] * (num_subgroups - large_spans)
+        placements = []
+        # Largest-first greedy packing keeps each small tensor inside one subgroup.
+        for tensor_id in small_ids:
+            shape = tensor_shapes[tensor_id]
+            starts = [_pad_to_multiple(cursor, non_leading_numel(shape)) for cursor in cursors]
+            bin_id = min(
+                range(len(cursors)),
+                key=lambda i: (starts[i] + shape.numel(), cursors[i], i),
+            )
+            placements.append((tensor_id, bin_id, starts[bin_id]))
+            cursors[bin_id] = starts[bin_id] + shape.numel()
+        span = _pad_to_multiple(
+            max(
+                (large_size + large_spans - 1) // large_spans if large_spans else 0,
+                max(cursors),
+            ),
+            chunk_size * subgroup_size,
+        )
+        return span * num_subgroups, large_spans, placements
+
+    # Minimize total padded storage, then prefer fewer spans for oversized tensors.
+    total_size, large_spans, placements = min(
+        (build_candidate(n) for n in range(bool(large_ids), num_subgroups)), key=lambda item: item[:2]
+    )
+    # Convert subgroup-local placements into offsets in the global flat buffer.
+    subgroup_span = total_size // num_subgroups
+    small_base = large_spans * subgroup_span
+    for tensor_id, bin_id, local_offset in placements:
+        offsets[tensor_id] = small_base + bin_id * subgroup_span + local_offset
+    return tuple(offsets), total_size
 
 
 def _pad_to_multiple(value: int, multiple: int) -> int:

@@ -205,6 +205,10 @@ class DistributedDataParallelConfig:
     Only effective with ``outer_dp_sharding_strategy='optim'``.
     """
 
+    muon_dp_subgroup_size: Optional[int] = None
+    """Maximum number of same-node DP ranks across which one parameter may be sharded for
+    MFSDP v2 Muon."""
+
     def __post_init__(self):
         import os
 

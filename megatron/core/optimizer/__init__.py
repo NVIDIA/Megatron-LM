@@ -764,8 +764,25 @@ def _get_megatron_emerging_optimizer(
         eopt_name = bare_name
         use_layer_wise = True
 
-    if isinstance(model_chunks[0], FullyShardedDataParallelV2):
-        raise NotImplementedError("MFSDP v2 with emerging optimizers is not currently validated.")
+    is_mfsdp_v2 = isinstance(model_chunks[0], FullyShardedDataParallelV2)
+    if is_mfsdp_v2:
+        if eopt_name != 'muon':
+            raise NotImplementedError(
+                "MFSDP v2 currently supports only Muon among emerging optimizers, "
+                f"got {eopt_name!r}."
+            )
+        if use_layer_wise:
+            raise ValueError(
+                "MFSDP v2 Muon uses owner-compute sharding and does not support the "
+                "layer-wise distributed optimizer."
+            )
+        if config.use_distributed_optimizer:
+            raise ValueError("MFSDP v2 currently requires use_distributed_optimizer=False.")
+        if config.muon_scalar_optimizer != 'adam':
+            raise ValueError(
+                "MFSDP v2 Muon routes excluded parameters through Adam and requires "
+                "muon_scalar_optimizer='adam'."
+            )
 
     if not HAVE_EMERGING_OPTIMIZERS:
         raise ImportError(
@@ -822,7 +839,8 @@ def _get_megatron_emerging_optimizer(
                 override['optimizer'] = config.muon_scalar_optimizer
     config_overrides.update(default_param_overrides)
 
-    # Build param groups and bucket by (optimizer_name, is_expert_parallel).
+    # Build param groups. MFSDP v2 combines all Muon DP groups into one optimizer so
+    # expert-local NS can overlap dense owner communication.
     # Layer-wise distributed optimizer handles expert params internally so we skip that split.
     all_param_groups = _get_param_groups(
         model_chunks, config, config_overrides, param_group_process_group
@@ -831,7 +849,11 @@ def _get_megatron_emerging_optimizer(
     for group in all_param_groups:
         opt_name = group.get('optimizer', eopt_name)
         is_expert = group['is_expert_parallel'] and not use_layer_wise
-        grouped_param_groups[(opt_name, is_expert)].append(group)
+        if is_mfsdp_v2 and opt_name == eopt_name:
+            # Use one mixed dense/expert Muon bucket; each parameter retains its own
+            # expert metadata and MFSDP communication group.
+            is_expert = False
+        grouped_param_groups[(opt_name, is_expert, None)].append(group)
 
     # Set up DistOpt process groups + filtered buffers once, only if we'll
     # construct a DistributedOptimizer for non-Muon groups in layer-wise mode.
@@ -859,7 +881,7 @@ def _get_megatron_emerging_optimizer(
         # whose optimizer is not the primary emerging optimizer (stored in ``eopt_name``,
         # e.g., Muon). This includes scalar optimizers like Adam or Lion.
         not (opt_name == eopt_name and opt_name in _EMERGING_OPTIMIZERS)
-        for (opt_name, _), groups in grouped_param_groups.items()
+        for (opt_name, _, _), groups in grouped_param_groups.items()
         if groups
     ):
         # ``setup_process_groups_for_optimizer`` rejects Gloo groups whenever
@@ -891,7 +913,7 @@ def _get_megatron_emerging_optimizer(
     # and the rest go through DistOpt's standard byte-level shard machinery.
     results = []
     layer_wise_base_results = []  # (raw_optimizer, init_state_fn) feeding LayerWise.
-    for (opt_name, is_expert), groups in grouped_param_groups.items():
+    for (opt_name, is_expert, _mesh_ranks), groups in grouped_param_groups.items():
         if not groups:
             continue
 
@@ -904,6 +926,32 @@ def _get_megatron_emerging_optimizer(
             optimizer, init_state_fn = _create_emerging_optimizer(
                 config, groups, eopt_name, model_chunks, pg_collection
             )
+            if is_mfsdp_v2:
+                from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.orthogonalized_optimizer import (
+                    FsdpMuon,
+                )
+
+                parameters = [parameter for group in groups for parameter in group['params']]
+                if not parameters:
+                    raise RuntimeError("MFSDP v2 Muon received no parameters on this rank.")
+
+                optimizer = FsdpMuon(
+                    groups,
+                    inner_optimizer=optimizer,
+                    max_params_per_owner_chunk=config.muon_max_params_per_owner_chunk,
+                )
+                optimizer = FullyShardedOptimizer(
+                    optimizer, config, None, init_state_fn, model_chunks=model_chunks
+                )
+                setattr(optimizer, 'grad_stats_parallel_group', torch.distributed.group.WORLD)
+                setattr(optimizer, 'tp_group', pg_collection.tp)
+                setattr(
+                    optimizer,
+                    'expert_tp_group',
+                    getattr(pg_collection, 'expt_tp', pg_collection.tp),
+                )
+                results.append(optimizer)
+                continue
             if use_layer_wise:
                 layer_wise_base_results.append((optimizer, init_state_fn))
                 continue
@@ -923,6 +971,16 @@ def _get_megatron_emerging_optimizer(
         else:
             fallback_config = copy.copy(config)
             fallback_config.optimizer = opt_name
+            if is_mfsdp_v2:
+                # Match the standard MFSDP v2 Adam path: empty local DTensor shards
+                # have no optimizer state or data to update and must be omitted.
+                for group in groups:
+                    group['params'] = [
+                        parameter
+                        for parameter in group['params']
+                        if parameter.to_local().numel() > 0
+                    ]
+                groups = [group for group in groups if group['params']]
             if use_separate_distributed_optimizer:
                 # Route non-emerging params (adam/lion) through a real DistributedOptimizer
                 # (byte-level sharding) instead of stuffing them inside LayerWise.

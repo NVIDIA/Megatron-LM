@@ -42,7 +42,7 @@ from .quantization import (
 _CONTAINING_PARAMETER_GROUP_ATTR = "_mfsdp_parameter_group"
 
 
-def get_containing_parameter_group(parameter: nn.Parameter) -> "FsdpParameterGroup | None":
+def get_containing_parameter_group(parameter: torch.Tensor) -> "FsdpParameterGroup | None":
     """Return the FSDP parameter group that owns ``parameter``, if any."""
     # This parameter-owned backedge must be weak; otherwise it forms a reference
     # cycle with the parameter group and delays releasing its CUDA storage.
@@ -120,6 +120,7 @@ class FsdpParameterGroup:
         mixed_precision_policy: MixedPrecisionPolicy,
         grad_divisor: int = 1,
         use_symmetric_memory: bool = False,
+        subgroup_size: int | None = None,
     ) -> None:
         """Create persistent sharded buffers for a group of parameters.
 
@@ -135,6 +136,8 @@ class FsdpParameterGroup:
                 NCCL symmetric-memory pool.
             grad_divisor: Additional divisor applied on top of the mesh-size
                 averaging. See ``fully_shard``.
+            subgroup_size: Optional contiguous DP parameter-placement subgroup size.
+                The value is already normalized to this parameter group's mesh.
         """
         if not parameters:
             raise ValueError("FsdpParameterGroup requires at least one parameter.")
@@ -153,6 +156,7 @@ class FsdpParameterGroup:
         self.mesh = mesh
         self.grad_divisor = grad_divisor
         first_parameter = next(iter(parameter_to_fqns))
+        self.subgroup_size = subgroup_size
         self.dtype = first_parameter.dtype
         self.requires_grad = first_parameter.requires_grad
         for parameter, fqns in parameter_to_fqns.items():
@@ -181,7 +185,10 @@ class FsdpParameterGroup:
                     parameters_with_high_precision_init.append(parameter)
             main_weight_sources.append(source.to(dtype=main_weight_dtype))
         self.main_weight = DBuffer.distribute_tensors(
-            main_weight_sources, mesh=self.mesh, placements=main_weight_placements
+            main_weight_sources,
+            mesh=self.mesh,
+            placements=main_weight_placements,
+            subgroup_size=self.subgroup_size,
         )
         for parameter in parameters_with_high_precision_init:
             parameter.clear_high_precision_init_val()
@@ -286,6 +293,7 @@ class FsdpParameterGroup:
                     tensor_shapes=tensor_shapes,
                     dtype=self.dtype,
                     device=self.main_weight.device,
+                    subgroup_size=self.subgroup_size,
                 )
         self.post_optimizer_model_weight = self.model_weight.view(main_weight_placements)
         # Cast into the preallocated optimizer-layout view on the current stream.
@@ -301,6 +309,7 @@ class FsdpParameterGroup:
                 tensor_shapes=tensor_shapes,
                 dtype=self.dtype,
                 device=self.main_weight.device,
+                subgroup_size=self.subgroup_size,
             )
 
     def _materialize_unsharded_parameter(
@@ -409,6 +418,7 @@ class FsdpParameterGroup:
                 tensor_shapes=tuple(grad.shape for grad in grads),
                 dtype=grads[0].dtype,
                 device=grads[0].device,
+                subgroup_size=self.subgroup_size,
             )
 
     def copy_gradients_to_partial_buffer(self, partial_grad: DBuffer) -> None:
@@ -527,6 +537,7 @@ class Fp8ParameterGroup(FsdpParameterGroup):
         mixed_precision_policy: MixedPrecisionPolicy,
         grad_divisor: int = 1,
         use_symmetric_memory: bool = False,
+        subgroup_size: int | None = None,
     ) -> None:
         if use_symmetric_memory:
             raise ValueError("MFSDP v2 fp8 model weights do not support symmetric memory yet.")
@@ -545,6 +556,7 @@ class Fp8ParameterGroup(FsdpParameterGroup):
             mixed_precision_policy=mixed_precision_policy,
             use_symmetric_memory=False,
             grad_divisor=grad_divisor,
+            subgroup_size=subgroup_size,
         )
         # Compute weights must be initialized before the first forward;
         # subsequent refreshes happen from the optimizer's post-step hook.

@@ -1787,6 +1787,11 @@ class ChainedOptimizer(MegatronOptimizer):
 
     def grads_states_parallel_group_is_shared(self):
         """Check if all optimizers share the same gradient statistics parallel group."""
+        if any(
+            getattr(optimizer, 'requires_individual_grad_stats', False)
+            for optimizer in self.chained_optimizers
+        ):
+            return False
         reference_group = self.chained_optimizers[0].get_grad_stats_parallel_group()
         return all(
             optimizer.get_grad_stats_parallel_group() == reference_group
