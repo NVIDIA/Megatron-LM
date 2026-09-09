@@ -2184,9 +2184,8 @@ class MultiTokenPredictionBlock(MegatronModule):
         assert len(self.layers) > 0, "MultiTokenPredictionBlock must have at least one layer."
 
         if self.mtp_use_repeated_layer:
-            # forward() drives the single shared layer once per depth, so its first forward is
-            # paired with its last backward. Acting on is_first_microbatch there would let the
-            # first depth's wgrad GEMM overwrite the gradients the later depths accumulated.
+            # One layer object, called once per MTP depth, every call adding into the same
+            # main_grad. A True would make one of those calls overwrite instead of add.
             for m in self.layers.modules():
                 if hasattr(m, 'is_first_microbatch'):
                     m.is_repeated_layer = True

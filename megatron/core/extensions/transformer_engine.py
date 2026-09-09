@@ -402,18 +402,10 @@ def _get_should_context_be_quantized_params(
 
 
 def _resolve_is_first_microbatch(module) -> Optional[bool]:
-    """The value of ``is_first_microbatch`` to hand TE, or ``None`` when the flag is meaningless.
+    """The value to pass TE, or ``None`` meaning "no opinion, just accumulate".
 
-    TE reads the flag twice: it refreshes the quantized parameter cache on ``True``, and it
-    derives the weight-gradient accumulation mode from it in backward --
-    ``accumulate = fuse_wgrad_accumulation and not is_first_microbatch`` -- so a wrong ``True``
-    makes a wgrad GEMM OVERWRITE ``main_grad`` instead of accumulating into it. ``None`` opts out
-    of both: always accumulate, never cache.
-
-    That is the right answer whenever nobody keeps the flag honest: the transpose cache is off,
-    the config is not quantized so :meth:`MegatronModule.set_is_first_microbatch` never re-arms
-    it, or the module belongs to a repeated layer, run once per MTP depth, which pairs its first
-    forward with its last backward and so inverts what the flag means.
+    A ``True`` tells TE the gradient is fresh, so backward writes over ``main_grad`` instead of
+    adding into it. Pass the flag on only when it can be trusted.
     """
     if (
         module.disable_parameter_transpose_cache

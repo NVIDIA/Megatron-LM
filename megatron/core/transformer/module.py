@@ -28,20 +28,14 @@ def param_is_not_shared(param):  # pylint: disable=missing-function-docstring
 
 
 def is_first_microbatch_tracked(config) -> bool:
-    """Whether ``is_first_microbatch`` is maintained across iterations for this config.
+    """True if ``is_first_microbatch`` is still being kept up to date.
 
-    :meth:`MegatronModule.set_is_first_microbatch` re-arms the flag only for quantized configs,
-    because its purpose is refreshing TE's quantized parameter cache. Outside those configs the
-    flag is set once at module construction and cleared after the first forward, so it is stale
-    for the rest of the process and carries no meaning.
+    A training step runs N microbatches. The flag marks microbatch 1 -- the one that
+    re-quantizes the weights and starts a fresh main_grad, while 2..N reuse and accumulate::
 
-    This predicate is the definition, not a heuristic: ``set_is_first_microbatch`` consults it to
-    re-arm the flag and TE call sites consult it before reading, so the two cannot drift. Its body
-    is quantization-shaped only because re-arming exists to refresh TE's quantized parameter cache.
-
-    Callers must consult this before passing the flag to TE. Passing a stale flag corrupts
-    gradients rather than merely missing an optimization -- see
-    ``megatron.core.extensions.transformer_engine._resolve_is_first_microbatch``.
+        layer is built      ->  flag = True
+        every forward       ->  flag = False   (microbatch 1 is over)
+        start of each step  ->  flag = True    (only quantized configs)
     """
     return (
         config.fp8 is not None
