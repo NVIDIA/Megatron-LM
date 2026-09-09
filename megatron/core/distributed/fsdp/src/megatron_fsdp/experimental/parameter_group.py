@@ -126,6 +126,34 @@ class FsdpParameterGroup:
             grad_divisor: Additional divisor applied on top of the mesh-size
                 averaging. See ``fully_shard``.
         """
+        parameter_to_fqns, self.dtype, self.requires_grad = self._collect_parameter_metadata(
+            parameters, use_symmetric_memory
+        )
+        self._owning_module = ref(owning_module)
+        self.mesh = mesh
+        self.grad_divisor = grad_divisor
+
+        self._initialize_weight_buffers(
+            parameter_to_fqns,
+            model_weight_placements,
+            main_weight_placements,
+            mixed_precision_policy,
+            use_symmetric_memory,
+        )
+
+        self._initialize_gradient_buffers(
+            main_grad_placements, main_weight_placements, mixed_precision_policy
+        )
+        self.fsdp_parameters = self._build_fsdp_parameters(parameter_to_fqns)
+
+        self._unsharded_model_weight.release_storage()
+        self._switch_to_sharded_parameters()
+
+    @staticmethod
+    def _collect_parameter_metadata(
+        parameters: dict[str, nn.Parameter], use_symmetric_memory: bool
+    ) -> tuple[dict[nn.Parameter, list[str]], torch.dtype, bool]:
+        """Group tied parameters and validate their shared metadata."""
         if not parameters:
             raise ValueError("FsdpParameterGroup requires at least one parameter.")
         if use_symmetric_memory and not hasattr(symm_mem, "is_symm_mem_tensor"):
@@ -137,24 +165,30 @@ class FsdpParameterGroup:
 
         # Python dicts preserve insertion order, so parameter_to_fqns and
         # fsdp_parameters define the same stable DBuffer tensor order.
-        self._owning_module = ref(owning_module)
-        self.mesh = mesh
-        self.grad_divisor = grad_divisor
         first_parameter = next(iter(parameter_to_fqns))
-        self.dtype = first_parameter.dtype
-        self.requires_grad = first_parameter.requires_grad
+        dtype = first_parameter.dtype
+        requires_grad = first_parameter.requires_grad
         for parameter, fqns in parameter_to_fqns.items():
-            if parameter.dtype != self.dtype:
+            if parameter.dtype != dtype:
                 raise ValueError(
-                    f"Expected parameter {fqns!r} to have dtype {self.dtype}, "
-                    f"got {parameter.dtype}."
+                    f"Expected parameter {fqns!r} to have dtype {dtype}, got {parameter.dtype}."
                 )
-            if parameter.requires_grad != self.requires_grad:
+            if parameter.requires_grad != requires_grad:
                 raise ValueError(
-                    f"Expected parameter {fqns!r} to have requires_grad={self.requires_grad}, "
+                    f"Expected parameter {fqns!r} to have requires_grad={requires_grad}, "
                     f"got {parameter.requires_grad}."
                 )
+        return parameter_to_fqns, dtype, requires_grad
 
+    def _initialize_weight_buffers(
+        self,
+        parameter_to_fqns: dict[nn.Parameter, list[str]],
+        model_weight_placements: tuple[Placement, ...],
+        main_weight_placements: tuple[Placement, ...],
+        mixed_precision_policy: MixedPrecisionPolicy,
+        use_symmetric_memory: bool,
+    ) -> None:
+        """Allocate the main, model, and unsharded weight buffers."""
         tensor_shapes = tuple(parameter.shape for parameter in parameter_to_fqns)
         main_weight_dtype = mixed_precision_policy.main_params_dtype or torch.float32
         self.main_weight = DBuffer.distribute_tensors(
@@ -201,28 +235,42 @@ class FsdpParameterGroup:
                 device=self.main_weight.device,
             )
 
+    def _initialize_gradient_buffers(
+        self,
+        main_grad_placements: tuple[Placement, ...],
+        main_weight_placements: tuple[Placement, ...],
+        mixed_precision_policy: MixedPrecisionPolicy,
+    ) -> None:
+        """Allocate the persistent main-gradient buffer when gradients are required."""
         self.main_grad = None
         self.pre_optimizer_main_grad = None
         self._main_grad_is_stale = False
-        if self.requires_grad:
-            grad_dtype = mixed_precision_policy.main_grads_dtype or self.dtype
-            # Keep main_grad persistent for the initial implementation. For micro-batch
-            # size 1, this allocation could be delayed until post_backward and then
-            # eagerly deallocated right after optimizer.step(), avoiding main_grad
-            # storage during forward. That requires a separate lifetime contract with
-            # the optimizer, so this version keeps the simpler persistent buffer.
-            self.main_grad = DBuffer(
-                mesh=self.mesh,
-                placements=main_grad_placements,
-                tensor_shapes=self.main_weight.layout.tensor_shapes,
-                dtype=grad_dtype,
-                device=self.main_weight.device,
-            )
-            self.pre_optimizer_main_grad = self.main_grad.view(main_weight_placements)
-            assert self.main_grad.layout == self.main_weight.layout, (
-                "main_grad is built from main_weight tensor shapes on the same mesh, "
-                "and DBuffer layouts are deterministic from those shapes and mesh size."
-            )
+        if not self.requires_grad:
+            return
+
+        grad_dtype = mixed_precision_policy.main_grads_dtype or self.dtype
+        # Keep main_grad persistent for the initial implementation. For micro-batch
+        # size 1, this allocation could be delayed until post_backward and then
+        # eagerly deallocated right after optimizer.step(), avoiding main_grad
+        # storage during forward. That requires a separate lifetime contract with
+        # the optimizer, so this version keeps the simpler persistent buffer.
+        self.main_grad = DBuffer(
+            mesh=self.mesh,
+            placements=main_grad_placements,
+            tensor_shapes=self.main_weight.layout.tensor_shapes,
+            dtype=grad_dtype,
+            device=self.main_weight.device,
+        )
+        self.pre_optimizer_main_grad = self.main_grad.view(main_weight_placements)
+        assert self.main_grad.layout == self.main_weight.layout, (
+            "main_grad is built from main_weight tensor shapes on the same mesh, "
+            "and DBuffer layouts are deterministic from those shapes and mesh size."
+        )
+
+    def _build_fsdp_parameters(
+        self, parameter_to_fqns: dict[nn.Parameter, list[str]]
+    ) -> tuple[FsdpParameter, ...]:
+        """Materialize parameter storage and build its FSDP representations."""
         fsdp_parameters: list[FsdpParameter] = []
         main_grad_dtype = self.main_grad.dtype if self.main_grad is not None else None
         for index, (parameter, fqns) in enumerate(parameter_to_fqns.items()):
@@ -251,10 +299,7 @@ class FsdpParameterGroup:
             fsdp_parameters.append(
                 FsdpParameter(fqns=tuple(fqns), sharded=sharded_parameter, unsharded=parameter)
             )
-        self.fsdp_parameters = tuple(fsdp_parameters)
-
-        self._unsharded_model_weight.release_storage()
-        self._switch_to_sharded_parameters()
+        return tuple(fsdp_parameters)
 
     def _symmetric_memory_context(self):
         if self._symm_mem_pool is None:
