@@ -136,8 +136,9 @@ def assign_owner_work(
     """Assign one owner rank to each boundary parameter, balanced by cost.
 
     Non-boundary parameters stay on their original rank and are skipped. Only ranks that own a
-    non-empty shard of a parameter are eligible owners. Assignment greedily gives each boundary
-    parameter to its eligible rank with the smallest running cost total.
+    non-empty shard of a parameter are eligible owners. Boundary parameters are processed in
+    descending cost order, and each is greedily given to its eligible rank with the smallest running
+    cost total.
 
     Args:
         layouts: Parameter layouts indexed by their position in the input sequence.
@@ -151,17 +152,27 @@ def assign_owner_work(
         are absent, as they stay on their original rank.
     """
     assignments: dict[int, int] = {}
-    running: dict[int, float] = {r: 0.0 for r in range(layouts[0].dp_size)} if layouts else {}
-    for param_index, layout in enumerate(layouts):
-        if not layout.is_boundary():
-            continue
+    if not layouts:
+        return assignments
+    running: dict[int, float] = {r: 0.0 for r in range(layouts[0].dp_size)}
+    # Sort boundary params by descending cost (longest processing time first).
+    boundary_costs = sorted(
+        (
+            (param_index, cost_fn(layout))
+            for param_index, layout in enumerate(layouts)
+            if layout.is_boundary()
+        ),
+        key=lambda item: item[1],
+        reverse=True,
+    )
+    for param_index, cost in boundary_costs:
+        layout = layouts[param_index]
         candidates = layout.owner_candidates()
         if not candidates:
             raise RuntimeError(
                 f"No eligible owner for parameter {param_index} with shape {layout.full_shape}; "
                 "no rank owns a shard."
             )
-        cost = cost_fn(layout)
         owner = min(candidates, key=lambda r: running[r])
         assignments[param_index] = owner
         running[owner] += cost

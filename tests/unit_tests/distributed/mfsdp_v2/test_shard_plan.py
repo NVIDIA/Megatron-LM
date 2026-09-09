@@ -119,6 +119,21 @@ def test_assign_owner_work_only_eligible_ranks_can_own():
     assert owners[0] != owners[1]
 
 
+def test_assign_owner_work_lpt_sorts_by_descending_cost():
+    """Params are assigned in descending cost order, not input order.
+
+    With two boundary params (cheap first, expensive second in input order), LPT processes the
+    expensive one first.
+    """
+    # Cheap param listed FIRST in input order.
+    layout_cheap = ParameterLayout(torch.Size((8, 1)), (1, 1, 1, 1), 1)
+    # Expensive param listed SECOND in input order.
+    layout_expensive = ParameterLayout(torch.Size((8, 8)), (2, 2, 2, 2), 8)
+    owners = assign_owner_work([layout_cheap, layout_expensive], _ns_cost(5))
+    # LPT: expensive (index 1) → rank0 first, then cheap (index 0) → rank1.
+    assert owners == {0: 1, 1: 0}
+
+
 def test_assign_owner_work_skips_non_boundary():
     """Non-boundary parameters stay on their original rank – no assignment needed."""
     layout = ParameterLayout(torch.Size((4, 2)), (4, 0), 2)
