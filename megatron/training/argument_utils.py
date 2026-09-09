@@ -431,7 +431,8 @@ def core_transformer_config_from_args(args, config_class=None):
     if use_situ_glu:
         kw_args['activation_func'] = situlu
         kw_args['gated_linear_unit'] = True
-        kw_args['use_te_activation_func'] = True
+        # Preserve the explicit backend choice. The native SiTU-GLU path is
+        # also valid on TE builds that do not provide the SiTUGLU operation.
         kw_args['bias_activation_fusion'] = False
     elif args.swiglu:
         kw_args['activation_func'] = F.silu

@@ -123,6 +123,11 @@ class KimiDeltaAttention(_GDNBase):
     def _setup_variant_attrs(self) -> None:
         """Set KDA dimensions, projection checkpoint metadata, and kernel callable."""
 
+        # KDA's Q/K/V short convolutions always use SiLU, independently of
+        # the feed-forward activation (for example SiTU-GLU in Kimi-K3).
+        # Keep the native and fused convolution paths on the same function.
+        self.act_fn = F.silu
+        self.activation = "silu"
         self.gdn_pre_gated_delta_rule_fusion = self.config.gdn_pre_gated_delta_rule_fusion
 
         # Channel-wise raw memory-decay gate g.

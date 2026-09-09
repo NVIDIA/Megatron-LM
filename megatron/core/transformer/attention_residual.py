@@ -734,7 +734,13 @@ class AttentionResidual(MegatronModule):
         """Aggregate depth sources (+ optional partial sum) into the sublayer input."""
         assert len(values) >= 1, "AttentionResidual requires at least one depth source"
         nvtx_range_push(msg=f"attn_res.aggregate_n{len(values)}")
-        if self.impl == 'fla':
+        if len(values) == 1:
+            # A one-source softmax is identically one. Keep explicit zero
+            # parameter gradients for DDP's grad-ready accounting, without
+            # introducing fused-backward cancellation noise at block 0.
+            zero = (self.pseudo_query.sum() + self.key_norm_weight.sum()) * 0.0
+            out = values[0] + zero.to(values[0].dtype)
+        elif self.impl == 'fla':
             assert self._fla_fused_attnres is not None
             out = self._fla_fused_attnres(
                 self.pseudo_query,

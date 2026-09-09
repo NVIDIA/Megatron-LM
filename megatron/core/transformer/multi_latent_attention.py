@@ -809,6 +809,9 @@ class MLASelfAttention(MultiLatentAttention):
         # =========================================
         # Prepare RoPE and seqlen related params
         # =========================================
+        no_rope = bool(self.config.no_rope_freq and self.config.no_rope_freq[self.layer_number - 1])
+        if no_rope and inference_context is not None:
+            raise NotImplementedError("MLA no_rope_freq currently supports training only.")
         rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
             inference_context, None, hidden_states, self.config, packed_seq_params
         )
@@ -818,8 +821,10 @@ class MLASelfAttention(MultiLatentAttention):
         rotary_pos_cos = None
         rotary_pos_sin = None
         thd_packed_seq = packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
-        use_fused_rope = should_use_fused_mla_rope(self.config)
-        if use_fused_rope:
+        use_fused_rope = not no_rope and should_use_fused_mla_rope(self.config)
+        if no_rope:
+            rotary_pos_emb = None
+        elif use_fused_rope:
             rotary_pos_cos, rotary_pos_sin = self.rotary_pos_emb.get_cached_cos_sin(
                 rotary_seq_len, dtype=hidden_states.dtype, packed_seq=thd_packed_seq
             )
@@ -994,7 +999,16 @@ class MLASelfAttention(MultiLatentAttention):
             k_pos_emb = torch.unsqueeze(k_pos_emb, -2)
 
             # todo add assert about fusions and caching
-            if use_fused_rope:
+            if no_rope:
+                # K3 keeps the positional projection channels (and the original
+                # attention scale), but does not rotate them. Dropping those
+                # channels would change the architecture and checkpoint shapes.
+                query = q
+                k_no_pe, value = torch.split(
+                    kv, [self.config.qk_head_dim, self.config.v_head_dim], dim=-1
+                )
+                key = torch.cat([k_no_pe, k_pos_emb.expand(*k_no_pe.shape[:-1], -1)], dim=-1)
+            elif use_fused_rope:
                 cp_rank = self.pg_collection.cp.rank()
                 cp_size = self.pg_collection.cp.size()
                 query = fused_apply_mla_rope_for_q(

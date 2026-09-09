@@ -56,3 +56,62 @@ Use `m` for MTP layers in the pipeline layout string. For example:
 ## Unsupported Combinations
 
 Context Parallel (CP), arbitrary `AttnMaskType`, and learned absolute position embeddings are not supported with MTP.
+
+## K3-style Hybrid Attention Residuals and MTP
+
+Hybrid MTP can combine Kimi Delta Attention (`K`), gated MLA (`+`), dense MLP
+(`-`), and MoE (`E`) with `enable_attention_residuals=True`. This integrates the
+K3 residual structure into MCore's existing MTP embedding shift, projection,
+prediction head, and auxiliary loss. It does not claim to reproduce K3's
+unpublished training-time MTP topology. The source reference is
+[Kimi-K3 at f831ab6](https://huggingface.co/moonshotai/Kimi-K3/tree/f831ab66814297da540d832a5235f8e904f29d06),
+`modeling_kimi_linear.py`, specifically `_apply_attn_res` and
+`KimiDecoderLayer._forward_attn_residual`.
+
+### Residual state and layer counting
+
+Hybrid patterns count attention and FFN as separate entries: K3's block size of
+12 physical decoder layers maps to `attn_res_block_layers=24`, not 12. For
+example, a 16-pair training proxy can use
+`K-KEKE+EKEKEKE+EKEKEKE+EKEKEKE+E/+E` with `num_layers=32` and
+`mtp_num_layers=1`. Append another `/+E` for two MTP depths. The trunk may use
+`|` for pipeline boundaries; MTP remains on the last stage. FLA is the default
+AttnRes backend; `attn_res_impl=compile` explicitly selects the compiled path.
+For K3's MLA NoPE, set `no_rope_freq=1` and keep `qk_pos_emb_head_dim=64`:
+these shared key/query channels are still projected, but are not rotated.
+MLA's `no_rope_freq` path currently supports training, not cached inference.
+Use `qk_layernorm=True` for K3's query/key-value latent norms. SiTU-GLU can use
+the existing native activation path (`use_te_activation_func=False`) on images
+without TE's SiTUGLU operation; selecting `situ_glu` preserves that choice.
+KDA's short convolutions use SiLU independently of the FFN activation, including
+when the FFN uses SiTU-GLU. Both native and fused convolution paths follow this
+rule from the reference implementation.
+
+The trunk exports an immutable tuple of the embedding, completed residual
+blocks, and final partial **before** its output aggregation and normalization.
+Every MTP depth reads that same tuple. Its projected embedding/previous-hidden
+combination initializes a fresh local partial, and each nested entry attends
+over the trunk tuple plus that partial. The entry's bias/dropout contribution
+is added directly to the partial, without reconstructing a delta by subtracting
+BF16 tensors. Normal module hooks and selective recomputation are preserved.
+
+At the end of each MTP depth, aggregate the trunk tuple plus its final partial
+once, then apply the existing MTP output norm. The result feeds the next depth's
+projection, but is never appended to the trunk tuple. `mtp_detach_heads` detaches
+the hidden state, all trunk sources, and shifted embeddings while retaining
+gradients for MTP parameters. Repeated MTP layers share parameters, not mutable
+residual history. There is no module-level cache of sources across microbatches.
+
+Start training validation without activation offloading or recomputation, then
+enable existing selective recomputation independently. This support does not
+extend full-layer recomputation, CUDA graphs, standalone MTP pipeline placement,
+or the existing activation-offload module allowlist. The broader offloading
+follow-up is developed on a separate branch.
+
+The K3-specific GPU tests include independent native-Torch output/input/parameter
+gradient comparisons, full-dimension NoPE MLA, and ten optimizer updates with
+real KDA/MLA/MoE and two MTP depths. Reduced end-to-end training has been verified
+for single-GPU MTP1/MTP2 and TP2 with sequence parallelism. PP2 validation was
+interrupted by cluster SSH loss; K3 end-to-end selective-recompute, compile, and
+checkpoint-resume runs remain pending. This is not a complete distributed
+training support matrix.

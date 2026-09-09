@@ -683,15 +683,14 @@ class AttnResHybridLayer(MegatronModule):
 
         partial = None if block-start else hidden_states
         h = AttentionResidual(sources [+ partial])
-        output = inner_layer(h, ...)   # inner adds its local residual to h
-        delta = output - h             # exact sublayer contribution
+        delta = inner_layer(h, ..., _return_layer_delta=True)
         new_partial = delta (+ partial)
 
-    The delta reconstruction is exact because every hybrid entry computes
-    ``output = input + dropout(f(norm(input)) + bias)``, and both fused
-    residual norms and fp32 residual connections are rejected by the AttnRes
-    config validation. This mirrors HyperConnectionHybridLayer's generic inner
-    call — including the checkpoint-key nesting under ``inner_layer.``.
+    TransformerLayer entries (including KDA, MLA, dense MLP and MoE) return the
+    bias/dropout contribution directly through their normal module call. This
+    avoids cancellation in BF16 ``(input + branch) - input``. Non-transformer
+    entries retain their legacy residual reconstruction. Checkpoint keys remain
+    nested under ``inner_layer.``.
     """
 
     def __init__(
@@ -763,6 +762,7 @@ class AttnResHybridLayer(MegatronModule):
                 padding_mask=padding_mask,
                 input_ids=input_ids,
                 _called_from_hybrid_attn_res_wrapper=True,
+                _return_layer_delta=True,
             )
         else:
             # Non-transformer entries (e.g. MambaLayer) accept only the common
@@ -777,9 +777,9 @@ class AttnResHybridLayer(MegatronModule):
             output = output[0]
 
         nvtx_range_push(msg="attn_res.hybrid_delta")
-        # The inner entry added its local residual to `aggregated`; subtracting
-        # it back recovers exactly dropout(f(norm(h)) + bias).
-        delta = output - aggregated
+        # Only legacy non-transformer entries add a local residual. Split
+        # TransformerLayer entries already return the bias/dropout contribution.
+        delta = output if isinstance(self.inner_layer, TransformerLayer) else output - aggregated
         new_partial = delta if partial is None else partial + delta
         nvtx_range_pop(msg="attn_res.hybrid_delta")
         return new_partial
@@ -989,6 +989,7 @@ class HybridStack(MegatronModule):
                         config=self.config,
                         layer_number=layer_number,
                         pg_collection=pg_collection,
+                        is_mtp_layer=is_mtp_layer,
                         add_layer_offset=False,
                         name=(name + f".layers.{i}") if name is not None else None,
                     )

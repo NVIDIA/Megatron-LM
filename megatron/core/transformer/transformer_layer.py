@@ -885,6 +885,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         called_from_hybrid_attn_res_wrapper = kwargs.pop(
             "_called_from_hybrid_attn_res_wrapper", False
         )
+        return_layer_delta = kwargs.pop("_return_layer_delta", False)
         if self.config.enable_attention_residuals and not called_from_hybrid_attn_res_wrapper:
             raise RuntimeError(
                 "TransformerLayer.forward() must not be called directly when "
@@ -892,6 +893,12 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 "automatically by the GPT layer specs); AttnResHybridLayer drives the "
                 "wrapped layer through this path automatically for hybrid stacks."
             )
+        if return_layer_delta:
+            if not called_from_hybrid_attn_res_wrapper:
+                raise RuntimeError(
+                    "Layer deltas are only supported for the hybrid AttnRes wrapper."
+                )
+            return self._forward_hybrid_attn_res_delta(*args, **kwargs)
         hidden_states, context = self._forward_attention(*args, **kwargs)
         output = self._forward_mlp(
             hidden_states,
@@ -901,6 +908,49 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             packed_seq_params=kwargs.get("packed_seq_params", None),
         )
         return output, context
+
+    def _forward_hybrid_attn_res_delta(self, hidden_states: Tensor, **kwargs):
+        """Return a split hybrid entry's contribution without rounding a local residual.
+
+        This is dispatched from ``forward``, not called by the wrapper directly:
+        normal module hooks (in particular parameter all-gather hooks) must run.
+        Adding a scalar zero through the entry's BDA preserves its bias/dropout
+        implementation without the lossy BF16 ``(input + branch) - input`` round trip.
+        """
+        has_attention = not isinstance(self.self_attention, IdentityOp)
+        has_mlp = not isinstance(self.mlp, IdentityOp)
+        if has_attention == has_mlp or not isinstance(self.cross_attention, IdentityOp):
+            raise ValueError(
+                "Hybrid AttnRes requires exactly one attention or MLP branch per entry."
+            )
+        if kwargs.get("inference_context") is not None:
+            raise NotImplementedError("Attention residuals do not support inference yet.")
+
+        if has_attention:
+            output_with_bias, norm_manager, norm_input = (
+                self._forward_self_attention_output_with_bias(
+                    hidden_states,
+                    attention_mask=kwargs.get("attention_mask"),
+                    rotary_pos_emb=kwargs.get("rotary_pos_emb"),
+                    sequence_len_offset=kwargs.get("sequence_len_offset"),
+                    packed_seq_params=kwargs.get("packed_seq_params"),
+                )
+            )
+            with self.bias_dropout_add_exec_handler():
+                delta = self.self_attn_bda(self.training, self.config.bias_dropout_fusion)(
+                    output_with_bias, output_with_bias[0].new_zeros(()), self.hidden_dropout
+                )
+            delta = norm_manager.group_offload(delta, forced_released_tensors=[norm_input])
+            return delta, kwargs.get("context")
+
+        output_with_bias, residual = self._forward_mlp_output_with_bias(
+            hidden_states,
+            padding_mask=kwargs.get("padding_mask"),
+            input_ids=kwargs.get("input_ids"),
+            packed_seq_params=kwargs.get("packed_seq_params"),
+        )
+        delta = self._forward_post_mlp(output_with_bias, residual, _return_layer_delta=True)
+        return delta, kwargs.get("context")
 
     def _forward_pre_mlp_layernorm(
         self, hidden_states: Tensor, mhc_recompute_manager: Optional['MHCCheckpointManager'] = None
@@ -1136,7 +1186,11 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             return self._forward_post_mlp(mlp_output_with_bias, residual)
 
     def _forward_post_mlp(
-        self, mlp_output_with_bias: tuple[Tensor, Tensor | None], residual: Tensor
+        self,
+        mlp_output_with_bias: tuple[Tensor, Tensor | None],
+        residual: Tensor,
+        *,
+        _return_layer_delta: bool = False,
     ) -> Tensor:
         """
         Perform operations after the MLP computation.
@@ -1144,6 +1198,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         Args:
             mlp_output_with_bias (Tensor): Output tensor of the MLP layer with bias.
             residual (Tensor): Residual tensor.
+            _return_layer_delta (bool): Internal split-hybrid mode: omit the residual
+                addition while retaining norm ownership and recompute hooks.
 
         Returns:
             output (Tensor): Transformed hidden states of shape [s, b, h].
@@ -1171,7 +1227,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         else:
             with self.bias_dropout_add_exec_handler():
                 hidden_states = self.mlp_bda(self.training, self.config.bias_dropout_fusion)(
-                    mlp_output_with_bias, residual, self.hidden_dropout
+                    mlp_output_with_bias,
+                    residual.new_zeros(()) if _return_layer_delta else residual,
+                    self.hidden_dropout,
                 )
         nvtx_range_pop(suffix="mlp_bda")
         # Delay the offload of the mlp norm until after the mlp_bda has been computed
