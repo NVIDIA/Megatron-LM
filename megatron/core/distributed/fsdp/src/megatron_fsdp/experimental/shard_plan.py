@@ -6,7 +6,7 @@ Pure shard-planning and owner-compute packing logic for MFSDP v2's all-`Flat` l
 The central data structure is `ShardPlan`, which describes how a single 2D parameter's full matrix
 is split across the DP group under MFSDP v2's all-`Flat` layout. Given shard plans,
 `assign_owner_work` balances owner-compute work across owner ranks using a caller-supplied cost
-function. `ShardPlan.from_layout_params` builds a plan from DBuffer layout metadata,
+function. `ShardPlan.from_layout` builds a plan from DBuffer layout metadata,
 `OwnerGatherPlan.pack`/`OwnerScatterPlan.pack` build the flat P2P send/recv buffers,
 `OwnerGatherPlan.reconstruct_full` stitches gathered shards back into the full matrix on the owner,
 and `OwnerScatterPlan.unpack` extracts received result shards.
@@ -52,29 +52,26 @@ class ShardPlan:
             )
 
     @classmethod
-    def from_layout_params(
-        cls,
-        full_shape: torch.Size,
-        tensor_flat_offset: int,
-        rank_flat_shard_size: int,
-        dp_size: int,
-    ) -> Self:
-        """Compute the per-rank row ranges for one 2D parameter in a flat DBuffer.
+    def from_layout(cls, layout: GlobalLayout, tensor_index: int, dp_size: int) -> Self:
+        """Build a shard plan for one parameter from a `GlobalLayout`.
+
+        Computes the per-rank row ranges for the given 2D parameter in a flat DBuffer layout.
 
         Args:
-            full_shape: Global `(rows, cols)` shape of the parameter.
-            tensor_flat_offset: Flat-element offset of this parameter inside the DBuffer's global
-                layout.
-            rank_flat_shard_size: Flat elements each DP rank owns (uniform for the even all-`Flat`
-                layout: `layout.size // dp_size`).
+            layout: The DBuffer global layout that contains the parameter.
+            tensor_index: Index of the parameter within `layout`.
             dp_size: DP group size.
         """
+        full_shape = layout.tensor_shapes[tensor_index]
+        tensor_flat_offset = layout.tensor_to_offset[tensor_index]
+        rank_flat_shard_size = layout.size // dp_size
+
         if len(full_shape) != 2:
-            raise ValueError(f"ShardPlan.from_layout_params requires a 2D shape, got {full_shape}.")
+            raise ValueError(f"ShardPlan.from_layout requires a 2D shape, got {full_shape}.")
         row_size = non_leading_numel(full_shape)
         if row_size <= 0:
             raise ValueError(
-                f"ShardPlan.from_layout_params requires non-empty rows, got shape {full_shape}."
+                f"ShardPlan.from_layout requires non-empty rows, got shape {full_shape}."
             )
         tensor_end = tensor_flat_offset + full_shape.numel()
 
@@ -102,25 +99,6 @@ class ShardPlan:
             row_count = overlap_numel // row_size
             rank_rows.append((row_start, row_count))
         return cls(full_shape=torch.Size(full_shape), rank_rows=tuple(rank_rows), row_size=row_size)
-
-    @classmethod
-    def from_layout(cls, layout: GlobalLayout, tensor_index: int, dp_size: int) -> Self:
-        """Build a shard plan for one parameter from a `GlobalLayout`.
-
-        Extracts the parameter's shape, flat offset, and per-rank shard size from `layout` and
-        delegates to `from_layout_params`.
-
-        Args:
-            layout: The DBuffer global layout that contains the parameter.
-            tensor_index: Index of the parameter within `layout`.
-            dp_size: DP group size.
-        """
-        return cls.from_layout_params(
-            layout.tensor_shapes[tensor_index],
-            layout.tensor_to_offset[tensor_index],
-            layout.size // dp_size,
-            dp_size,
-        )
 
     @property
     def dp_size(self) -> int:
