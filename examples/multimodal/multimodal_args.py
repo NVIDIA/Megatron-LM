@@ -15,7 +15,23 @@ def add_multimodal_extra_args(parser):
     group.add_argument('--sound-model-type', type=str, default=None)
     group.add_argument("--disable-vision-class-token", action="store_true", default=False)
     group.add_argument(
+        "--vision-projection-type",
+        type=str,
+        choices=["mlp", "affine"],
+        default="mlp",
+        help="Projection from vision encoder features into the language-model hidden size.",
+    )
+    group.add_argument(
         "--allow-missing-vision-projection-checkpoint", action="store_true", default=False
+    )
+    group.add_argument(
+        "--allow-llm-only-checkpoint",
+        action="store_true",
+        default=False,
+        help=(
+            "Allow loading an LLM-only distributed checkpoint into a multimodal model by "
+            "remapping language-model keys and leaving multimodal modules initialized locally."
+        ),
     )
     group.add_argument(
         "--allow-missing-sound-projection-checkpoint", action="store_true", default=False
@@ -26,6 +42,15 @@ def add_multimodal_extra_args(parser):
     group.add_argument("--use-te", action="store_true", default=False)
     group.add_argument(
         "--dataloader-save", type=str, default=None, help="Energon dataloader state save path"
+    )
+    group.add_argument(
+        "--strict-dataloader-state-load",
+        action="store_true",
+        default=False,
+        help=(
+            "Fail if Energon dataloader state is missing or cannot be restored. Missing state "
+            "for an initial finetune or pretrained-checkpoint load is still tolerated."
+        ),
     )
     group.add_argument(
         "--use-tiling", action="store_true", default=False, help="Use input image tiling"
@@ -48,6 +73,12 @@ def add_multimodal_extra_args(parser):
         type=int,
         default=0,
         help="The seed for the dataloader to use for training.",
+    )
+    group.add_argument(
+        "--dataloader-prefetch-factor",
+        type=int,
+        default=8,
+        help="Number of batches prefetched by each Energon worker. Default: 8.",
     )
     group.add_argument(
         "--lr-data-range-start",
@@ -80,10 +111,18 @@ def add_multimodal_extra_args(parser):
         "--tokenizer-prompt-format",
         type=str,
         choices=["mistral", "llama3", "chatml", "nvlm-yi-34b", "qwen2p0", "qwen2p5", "llama3p1", "nemotron5",
-                 "nemotron5-aligned", "llama_nemotron_8b", "nemotron-h-5p5-reasoning",
-                 "nemotron-h-5p5-reasoning-inference", "nemotron6-moe"],
+                 "nemotron5-aligned", "llama_nemotron_8b", "nemotron6-moe"],
         required=True,
         help="Prompt format to use with the tokenizer.",
+    )
+    group.add_argument(
+        "--reset-position-ids-from-packed-metadata",
+        action="store_true",
+        default=False,
+        help=(
+            "For packed samples, rebuild position IDs from packed cumulative-length "
+            "metadata instead of using one left-to-right sequence."
+        ),
     )
     group.add_argument("--pixel-shuffle", action="store_true", default=False)
     group.add_argument(
@@ -102,10 +141,79 @@ def add_multimodal_extra_args(parser):
         help="Enable sample packing by setting the buffer size to > 0",
     )
     group.add_argument(
+        "--deduplicate-dataloader-across-context-parallel",
+        action="store_true",
+        default=False,
+        help=(
+            "Build one dataloader per data-parallel replica on TP=0/CP=0 and broadcast "
+            "each batch across the joint TP x CP group."
+        ),
+    )
+    group.add_argument(
+        "--balance-vision-context-parallel-by-tokens",
+        action="store_true",
+        default=False,
+        help=(
+            "Partition dynamic-resolution images into contiguous CP shards balanced by "
+            "post-compression vision token count."
+        ),
+    )
+    group.add_argument(
+        "--profile-vision-context-parallel-partition",
+        action="store_true",
+        default=False,
+        help="Log the per-rank vision-token loads selected by the CP partitioner.",
+    )
+    group.add_argument(
         "--packing-seq-length", type=int, default=0, help="Packing sequence length. Must be > 0 if using packing."
     )
     group.add_argument(
-        "--packing-knapsack-algorithm", type=str, default="greedy_knapsack", help="Knapsack algorithm to use for packing."
+        "--packing-knapsack-algorithm",
+        type=str,
+        default="greedy_knapsack",
+        help=(
+            "Knapsack algorithm to use for packing. Supported values: greedy_knapsack, "
+            "balanced_greedy_knapsack, bucketing_greedy_knapsack, "
+            "streaming_prompt_dedup_first_fit_knapsack."
+        ),
+    )
+    group.add_argument(
+        "--packing-algorithm-parameters",
+        type=str,
+        default="",
+        help=(
+            "Optional packing algorithm parameters as a JSON/Python dict or "
+            "comma-separated key=value string. Supported key: balanced_knapsack_delta "
+            "(default: 20 for balanced_greedy_knapsack)."
+        ),
+    )
+    group.add_argument(
+        "--max-samples-per-sequence",
+        type=int,
+        default=100,
+        help="Maximum number of raw samples per Energon source slice.",
+    )
+    group.add_argument(
+        "--shuffle-buffer-size",
+        type=int,
+        default=100,
+        help="Energon sample shuffle buffer size before task encoding and packing.",
+    )
+    group.add_argument(
+        "--filter-identity-keywords",
+        nargs="+",
+        default=[],
+        metavar="KEYWORD",
+        help=(
+            "Drop samples from configured datasets when assistant text contains any of these "
+            "case-insensitive keywords."
+        ),
+    )
+    group.add_argument(
+        "--log-packed-sequence-stats",
+        action="store_true",
+        default=False,
+        help="Log per-global-batch packed SFT sequence statistics to Weights & Biases.",
     )
     group.add_argument(
         "--recompute-vision", action="store_true", default=False, help="Enable activation checkpointing in the vision model"
@@ -166,6 +274,15 @@ def add_multimodal_extra_args(parser):
     )
     group.add_argument(
         "--video-frame-temporal-jitter", action="store_true", default=False, help="Enable temporal jittering of the frames to sample from the video as input to the model.",
+    )
+    group.add_argument(
+        "--video-decode-thread-count",
+        type=int,
+        default=8,
+        help=(
+            "Enable worker-local FFmpeg frame threads while preserving Energon's frame "
+            "selection. Set to 0 to leave the decoder unchanged. Default: 8."
+        ),
     )
     group.add_argument(
         "--video-target-img-size", type=int, default=None,
@@ -288,6 +405,15 @@ def add_multimodal_extra_args(parser):
     )
     group.add_argument(
         "--relax-thinking-trace-check", action="store_true", default=False, help="Relax the checks in the dataloader which ensure the thinking trace is well formatted."
+    )
+    group.add_argument(
+        "--thinking-trace-format",
+        choices=["normalized", "ultra"],
+        default="normalized",
+        help=(
+            "Formatting applied around assistant thinking traces. 'normalized' preserves the "
+            "existing newline behavior; 'ultra' emits <think>\\nreasoning</think>answer."
+        ),
     )
     group.add_argument(
         "--allow-cross-sample-attention", action="store_true", default=False, help="Allow cross sample attention when using sample packing."
