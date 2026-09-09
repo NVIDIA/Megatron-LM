@@ -14,6 +14,7 @@ definition used by the static path (``SoftmaxOne``) — i.e.
 
     softmax_with_sink(s)_i = exp(s_i) / (exp(sink) + sum_j exp(s_j))
 """
+
 import pytest
 import torch
 

@@ -449,7 +449,7 @@ class TestPrepareNextForwardPass:
         "num_decode,num_prefill,num_spec", [(1, 0, 2), (3, 0, 2), (3, 2, 2), (0, 3, 2), (5, 3, 4)]
     )
     def test_basic(self, num_decode, num_prefill, num_spec):
-        (output_tokens, required_logit_indices, input_tokens, accepted_mask, last_one_indices) = (
+        output_tokens, required_logit_indices, input_tokens, accepted_mask, last_one_indices = (
             self._setup(num_decode, num_prefill, num_spec)
         )
 

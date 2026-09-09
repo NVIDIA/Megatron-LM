@@ -8,6 +8,7 @@ on a CPU-only box. The point is to exercise the wrapper's branching logic
 keying, error path) and the ``parakeet`` substring rules in
 ``get_hf_model_type`` / ``build_hf_model``.
 """
+
 from __future__ import annotations
 
 import sys

@@ -355,7 +355,7 @@ class TestDynamicResCPDistributed:
         )
         num_frames = torch.tensor([frames_per_video] * num_videos, dtype=torch.int32, device="cuda")
 
-        (local_t, local_imgs_sizes, _packed, has_padding, num_padded_ranks, local_num_frames) = (
+        local_t, local_imgs_sizes, _packed, has_padding, num_padded_ranks, local_num_frames = (
             split_to_context_parallel_ranks_dynamic_res(
                 global_t,
                 global_imgs_sizes,

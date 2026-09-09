@@ -1,5 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Tests for batch-invariant MoE grouped GEMM."""
+
 import pytest
 import torch
 import torch.nn.functional as F

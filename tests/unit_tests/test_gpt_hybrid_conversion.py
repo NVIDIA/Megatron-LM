@@ -24,9 +24,7 @@ import pytest
 import torch
 
 # Add the tools/checkpoint directory to the path so we can import the module
-sys.path.insert(
-    0, os.path.join(os.path.dirname(__file__), '..', '..', 'tools', 'checkpoint')
-)
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'tools', 'checkpoint'))
 
 from gpt_hybrid_conversion import (
     build_layer_index_mapping,
