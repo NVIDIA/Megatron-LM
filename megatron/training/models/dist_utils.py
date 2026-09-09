@@ -375,6 +375,14 @@ def _ddp_wrap(
             if share_fsdp_context
             else nullcontext()
         )
+        # MFSDP v2 rejects ``disable_bucketing=True`` (see
+        # FullyShardedDataParallelV2._validate_config) and does not use the classic
+        # per-chunk disabling that the DDP/distributed-optimizer path relies on to size
+        # only the first chunk's parameter layout. Each VPP chunk is sharded
+        # independently over its own FsdpModule, so bucketing must stay enabled for every
+        # chunk. Otherwise a multi-chunk (VPP) wrap sets ``disable_bucketing=True`` on
+        # non-first chunks and fails validation.
+        is_mfsdp_v2 = use_megatron_fsdp and ddp_config.megatron_fsdp_version == 2
 
         wrapped_model = []
         with shared_context:
@@ -383,7 +391,7 @@ def _ddp_wrap(
                 disable_bucketing = (
                     (model_chunk_idx > 0)
                     or overlap_param_gather_with_optimizer_step
-                )
+                ) if not is_mfsdp_v2 else False
 
                 # Pre-compute parameter layouts for the distributed optimizer.
                 # Only pass to DDP; FSDP variants don't accept full_param_layout.
