@@ -375,6 +375,11 @@ class DynamicEngineTestConfig:
     skip_prompt_log_probs: bool = False
     enable_chunked_prefill: bool = False
     enable_prefix_caching: bool = False
+    # Hybrid (Mamba) models need a Mamba-state cache budget for prefix caching to skip any
+    # prefill. Left None, `DynamicInferenceContext` logs a warning and runs in memory-only
+    # mode: prefixes are deduplicated but `prefix_skip_tokens` is forced to 0, so every token
+    # is recomputed and `engine._prefill_tokens_skipped` stays 0.
+    prefix_caching_mamba_gb: Optional[float] = None
     prefix_caching_eviction_policy: PrefixCachingEvictionPolicy = (
         PrefixCachingEvictionPolicy.REF_ZERO
     )
@@ -578,6 +583,7 @@ class DynamicInferenceEngineTestBase:
                 static_kv_memory_pointers=test_config.static_kv_memory_pointers,
                 enable_chunked_prefill=test_config.enable_chunked_prefill,
                 enable_prefix_caching=test_config.enable_prefix_caching,
+                prefix_caching_mamba_gb=test_config.prefix_caching_mamba_gb,
                 prefix_caching_eviction_policy=test_config.prefix_caching_eviction_policy,
                 use_flashinfer_fused_rope=test_config.use_flashinfer_fused_rope,
                 # this is for compatibility with the LTS environment
@@ -629,7 +635,20 @@ class DynamicInferenceEngineTestBase:
                 moe_pad_experts_for_cuda_graph_inference=(
                     test_config.moe_pad_experts_for_cuda_graph_inference
                 ),
-                moe_router_dtype=test_config.moe_router_dtype,
+                # An explicit `moe_router_dtype` on the test config wins; otherwise fall back to
+                # fp32 for inference-optimized MoE, which `TransformerConfig.__post_init__`
+                # requires (it raises otherwise). Scenarios such as the async-scheduling
+                # "topology:ep" pair rely on that fallback instead of setting the field.
+                moe_router_dtype=(
+                    test_config.moe_router_dtype
+                    if test_config.moe_router_dtype is not None
+                    else (
+                        "fp32"
+                        if test_config.transformer_impl == "inference_optimized"
+                        and test_config.expert_model_parallel_size > 1
+                        else None
+                    )
+                ),
                 hidden_size=(
                     test_config.hidden_size
                     if test_config.hidden_size is not None
@@ -667,12 +686,6 @@ class DynamicInferenceEngineTestBase:
                     if test_config.transformer_impl == "inference_optimized"
                     and test_config.expert_model_parallel_size > 1
                     else torch.nn.functional.gelu
-                ),
-                moe_router_dtype=(
-                    "fp32"
-                    if test_config.transformer_impl == "inference_optimized"
-                    and test_config.expert_model_parallel_size > 1
-                    else None
                 ),
                 inference_moe_token_dispatcher_type=(
                     test_config.inference_moe_token_dispatcher_type

@@ -301,6 +301,27 @@ class TestDynamicInferenceEngineParallel(DynamicInferenceEngineTestBase):
         )
         assert context.mtp_kv_layer_slot is not None
 
+    @staticmethod
+    def _assert_drafts_were_accepted(env):
+        """Assert at least one speculative token was accepted over the whole run.
+
+        With zero acceptance the MTP KV cache is only half-exercised: `_mtp_commit_pass`
+        returns False on every decode-only step (`total == 0`), so the caller falls back to
+        `_mtp_dummy_prefill_forward` and the decode REFRESH branch -- the one that rewrites
+        accepted-draft positions from the main hidden states -- never runs. `base_position`
+        also advances by exactly 1 each step, so the multi-position advance never happens.
+        """
+        engine = env.engine
+        proposed = int(engine._spec_tokens_proposed_per_pos.sum())
+        accepted = int(engine._spec_tokens_accepted_per_pos.sum())
+        assert proposed > 0, "no speculative tokens were proposed; MTP drafting never ran"
+        assert accepted > 0, (
+            f"no speculative token was accepted ({accepted}/{proposed} proposed), so the "
+            "decode-refresh branch of _mtp_commit_pass never ran and the MTP KV cache is only "
+            "exercised on prefill. Acceptance depends on the (randomly initialised) weights "
+            "agreeing between the MTP head and the main model."
+        )
+
     @pytest.mark.internal
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
@@ -335,6 +356,14 @@ class TestDynamicInferenceEngineParallel(DynamicInferenceEngineTestBase):
             # Local CUDA graphs + EP > 1 require expert padding: the graphs are captured
             # with it enabled, so the router must not drop it at replay time.
             moe_pad_experts_for_cuda_graph_inference=num_cuda_graphs is not None,
+            # Every EP rank must run the SAME NUMBER of engine steps: the graphed path
+            # all-reduces the batch dimensions over the EP group once per step
+            # (`adjust_batch_dims_for_expert_parallelism`), so a rank that finishes early
+            # leaves its peer blocked in that collective. All DP ranks here hold identical
+            # requests, but the default per-DP-rank seed offset makes them sample different
+            # tokens, hence accept different numbers of drafts, hence need different step
+            # counts. Sharing the seed keeps sampling stochastic but rank-identical.
+            offset_sampling_seed_by_dp_rank=False,
             context_max_requests=8,
             materialize_only_last_token_logits=False,
         )
@@ -344,6 +373,105 @@ class TestDynamicInferenceEngineParallel(DynamicInferenceEngineTestBase):
             assert (
                 request.status == Status.COMPLETED
             ), f"Request {request.request_id}: status={request.status}"
+
+    @staticmethod
+    def _force_full_draft_acceptance(env):
+        """Pin base and MTP logits to token 0 so every speculative token is accepted.
+
+        Wraps the REAL forwards instead of replacing them, so the entire MTP KV cache path --
+        commit pass, per-depth draft appends, extra append, and the read-back through
+        attention -- still executes for real; only the token choice becomes deterministic.
+        Mirrors the `all_accepted` arm of
+        `test_dynamic_engine.py::test_speculative_sequence_length_double_counting`.
+        """
+        model = env.engine.controller.inference_wrapped_model.model
+        unwrapped = env.engine.controller._unwrapped_model
+        real_forward = model.forward
+        real_mtp = unwrapped.compute_mtp_single_step
+
+        def deterministic_forward(*args, **kwargs):
+            logits = real_forward(*args, **kwargs)
+            logits.zero_()
+            logits[..., 0] = 100.0
+            return logits
+
+        def deterministic_mtp(*args, **kwargs):
+            # Pass args through rather than naming them: the KV-cache path adds
+            # `mtp_inference_context`, which a fixed signature would reject.
+            hidden_states, logits = real_mtp(*args, **kwargs)
+            logits.zero_()
+            logits[..., 0] = 100.0
+            return hidden_states, logits
+
+        model.forward = deterministic_forward
+        unwrapped.compute_mtp_single_step = deterministic_mtp
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @torch.inference_mode()
+    def test_mtp_kv_cache_decode_refresh_with_forced_acceptance(self):
+        """Exercise the decode-REFRESH branch of `_mtp_commit_pass`, which needs acceptance.
+
+        Every other MTP KV cache test here runs on randomly initialised weights, where the MTP
+        head and the main model essentially never agree, so acceptance is ~0. At zero
+        acceptance a decode-only step computes `total == 0` in `_mtp_commit_pass`, which
+        returns False and hands off to `_mtp_dummy_prefill_forward` -- so the branch that
+        rewrites accepted positions' draft KV from the main hidden states never runs, and
+        `base_position` only ever advances by 1.
+
+        Forcing acceptance makes that branch run every decode step: `accepted > 0` on one step
+        means the next step's commit pass has `total_a > 0` and takes the refresh path. Eager
+        (no CUDA graphs) so the in-place logit overwrite never touches a graph output buffer,
+        and so EP ranks need not agree on a step count.
+        """
+        from tests.unit_tests.inference.engines.test_dynamic_engine import DynamicEngineTestConfig
+
+        skip_if_mamba_sequence_packing_not_available("hybrid")
+        if int(os.environ.get("WORLD_SIZE", "1")) < 2:
+            pytest.skip("Test requires at least 2 GPUs")
+
+        num_tokens_to_generate = 6
+        test_config = DynamicEngineTestConfig(
+            model_provider="hybrid",
+            # An attention (not recurrent) MTP head is what enables the draft KV cache.
+            mtp_layer_pattern="*-",
+            expert_model_parallel_size=2,
+            num_speculative_tokens=2,
+            mtp_use_repeated_layer=True,
+            num_requests=4,
+            min_prompt_length=8,
+            max_prompt_length=16,
+            num_tokens_to_generate=num_tokens_to_generate,
+            num_gap_steps=1,
+            context_max_requests=8,
+            materialize_only_last_token_logits=False,
+        )
+        env = self._build_test_env(test_config)
+        self._assert_mtp_kv_cache_active(env)
+        self._force_full_draft_acceptance(env)
+
+        # Mirrors `_run_test`'s driver; inlined so the patch lands between build and run.
+        for request in env.requests:
+            env.engine._add_request(request)
+            request.state = "pending"
+            for _ in range(test_config.num_gap_steps):
+                self._run_step(env)
+        while True:
+            self._run_step(env)
+            if not env.engine.has_unfinished_requests():
+                break
+
+        self._assert_drafts_were_accepted(env)
+        for request in env.requests:
+            assert (
+                request.status == Status.COMPLETED
+            ), f"Request {request.request_id}: status={request.status}"
+            assert len(request.output) == num_tokens_to_generate, (
+                f"Request {request.request_id} generated {len(request.output)} tokens, expected "
+                f"{num_tokens_to_generate}; accepted drafts must not change the emitted count"
+            )
 
     @pytest.mark.internal
     @pytest.mark.skipif(
@@ -458,6 +586,11 @@ class TestDynamicInferenceEngineParallel(DynamicInferenceEngineTestBase):
             num_speculative_tokens=2,
             mtp_use_repeated_layer=True,
             enable_prefix_caching=True,
+            # Required for a hybrid model to actually SKIP prefill on a cache hit. Without a
+            # Mamba-state budget the context falls back to memory-only prefix caching, which
+            # deduplicates blocks but recomputes every token, leaving the inherited-draft-KV
+            # branch of `_mtp_commit_pass` unexercised.
+            prefix_caching_mamba_gb=0.2,
             enable_chunked_prefill=enable_chunked_prefill,
             num_tokens_to_generate=4,
             max_sequence_length=768,
@@ -670,6 +803,9 @@ class TestDynamicInferenceEngineParallel(DynamicInferenceEngineTestBase):
             num_gap_steps=1,
             num_cuda_graphs=num_cuda_graphs,
             force_build_cuda_graphs=num_cuda_graphs is not None,
+            # Keep every EP rank on the same step count -- see the note in
+            # `test_mtp_kv_cache_expert_parallel`.
+            offset_sampling_seed_by_dp_rank=False,
             context_max_requests=8,
             materialize_only_last_token_logits=False,
         )
@@ -679,7 +815,14 @@ class TestDynamicInferenceEngineParallel(DynamicInferenceEngineTestBase):
 
         # Assert the graph regime we actually ran in, so a silent downgrade is not a pass.
         if num_cuda_graphs is None:
-            assert not context.use_cuda_graphs_for_non_decode_steps
+            # `use_cuda_graphs_for_non_decode_steps` records whether non-decode graphs are
+            # PERMITTED (config flag minus the nccl/training-dispatcher force-disable), not
+            # whether any graph was built -- so it stays True for the nvls dispatcher even
+            # here. Assert on the graphs themselves instead.
+            assert not context.cuda_graph_batch_dimensions_list, (
+                "expected no CUDA graphs to be captured with num_cuda_graphs=None, got "
+                f"{len(context.cuda_graph_batch_dimensions_list)}"
+            )
         elif dispatcher == "nvls":
             assert (
                 context.use_cuda_graphs_for_non_decode_steps
@@ -758,6 +901,9 @@ class TestDynamicInferenceEngineParallel(DynamicInferenceEngineTestBase):
             num_speculative_tokens=2,
             mtp_use_repeated_layer=True,
             enable_prefix_caching=True,
+            # Hybrid models need a Mamba-state budget before prefix caching skips any prefill
+            # -- see the note in `test_mtp_kv_cache_prefix_caching_matches_across_schedulers`.
+            prefix_caching_mamba_gb=0.2,
             enable_chunked_prefill=enable_chunked_prefill,
             async_sched_mode=AsyncScheduleMode.ASYNC,
             num_tokens_to_generate=4,
