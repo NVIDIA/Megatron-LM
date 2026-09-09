@@ -215,6 +215,8 @@ functional:configure:
   rules:
     - if: $BUILD == "no"
       when: never
+    - if: $CI_PIPELINE_SOURCE != "schedule"
+      when: never
     - if: $FUNCTIONAL_TEST == "yes" && $FUNCTIONAL_TEST_SCOPE =~ /^(mr|nightly|weekly|release)$/
       when: on_success
     - when: never
