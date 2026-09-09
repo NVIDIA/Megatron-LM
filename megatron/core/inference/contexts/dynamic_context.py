@@ -377,6 +377,12 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.cache_mla_latent = (
             isinstance(model_config, MLATransformerConfig) and model_config.cache_mla_latents
         )
+        self.cache_dsa_indexer_keys = getattr(
+            model_config, "experimental_attention_variant", None
+        ) == "dsa" and getattr(model_config, "dsa_simplified_use_learned_k", False)
+        self.dsa_indexer_head_dim = (
+            getattr(model_config, "dsa_indexer_head_dim", 0) if self.cache_dsa_indexer_keys else 0
+        )
         if self.cache_mla_latent:
             assert (
                 inference_config.block_size_tokens == 64
@@ -524,6 +530,13 @@ class DynamicInferenceContext(BaseInferenceContext):
                 * self.block_size_tokens
                 * self.num_attention_heads_per_partition
                 * self.hidden_size_per_attention_head
+            )
+        if self.cache_dsa_indexer_keys:
+            self.block_size_bytes += (
+                kv_dtype_size_bytes
+                * self.num_attention_layers
+                * self.block_size_tokens
+                * self.dsa_indexer_head_dim
             )
         assert self.block_size_bytes > 0
 
@@ -993,6 +1006,17 @@ class DynamicInferenceContext(BaseInferenceContext):
                 dtype=self.params_dtype,
                 device=torch.cuda.current_device(),
             )
+        if self.cache_dsa_indexer_keys:
+            self.dsa_memory_buffer = torch.empty(
+                (
+                    self.num_attention_layers,
+                    self.kv_block_allocator.pool_size,
+                    self.block_size_tokens,
+                    self.dsa_indexer_head_dim,
+                ),
+                dtype=self.params_dtype,
+                device=torch.cuda.current_device(),
+            )
         if (
             self.kv_cache_management_mode == KVCacheManagementMode.OFFLOAD
             and not self._uses_torch_memory_saver
@@ -1002,6 +1026,11 @@ class DynamicInferenceContext(BaseInferenceContext):
             self._offloadable_cpu_backups["memory_buffer"] = torch.empty_like(
                 self.memory_buffer, device="cpu"
             ).pin_memory()
+            if self.cache_dsa_indexer_keys:
+                self._offloadable_tensor_names.add("dsa_memory_buffer")
+                self._offloadable_cpu_backups["dsa_memory_buffer"] = torch.empty_like(
+                    self.dsa_memory_buffer, device="cpu"
+                ).pin_memory()
 
     def _allocate_mamba_states(self):
         """Allocate Mamba states for hybrid models."""
@@ -1877,6 +1906,36 @@ class DynamicInferenceContext(BaseInferenceContext):
                 self.active_attn_metadata["mha_metadata"].state_data["block_table"],
             )
 
+    def append_dsa_key_cache(self, layer_number: int, key: Tensor) -> None:
+        """Append learned simplified-indexer keys to their paged cache."""
+        assert self.cache_dsa_indexer_keys, "DSA indexer key cache is not enabled."
+        attention_layer_number = self.layer_map[layer_number - 1]
+        block_idx = self.gpu_view.token_to_block_idx[: self.padded_active_token_count]
+        local_kv_seq_idx = self.gpu_view.token_to_local_position_within_kv_block[
+            : self.padded_active_token_count
+        ]
+
+        if key.dim() == 4:
+            assert key.size(1) == 1 and key.size(2) == 1
+            key = key.squeeze(1).squeeze(1)
+        elif key.dim() == 3:
+            assert key.size(1) == 1
+            key = key.squeeze(1)
+
+        self.dsa_memory_buffer[attention_layer_number, block_idx, local_kv_seq_idx] = key[
+            : self.padded_active_token_count
+        ]
+
+    def dsa_key_cache(self, layer_number: int) -> Tuple[Tensor, Tensor]:
+        """Return a layer's learned indexer-key cache and active block table."""
+        assert self.cache_dsa_indexer_keys, "DSA indexer key cache is not enabled."
+        attention_layer_number = self.layer_map[layer_number - 1]
+        assert self.active_attn_metadata is not None
+        return (
+            self.dsa_memory_buffer[attention_layer_number],
+            self.active_attn_metadata["mha_metadata"].state_data["block_table"],
+        )
+
     def mamba_states_cache(
         self, layer_number: int, intermediate: bool = False
     ) -> Tuple[Tensor, Tensor]:
@@ -2043,15 +2102,21 @@ class DynamicInferenceContext(BaseInferenceContext):
         n = self.padded_active_token_count
         query_seq_idx = self.gpu_view.token_to_pos_ids[:n]
         query_emb = query_emb[query_seq_idx]
-        query[:n] = apply_rotary_pos_emb(
-            t=query[:n],
+        # Frequencies are already selected per token, including decode offsets.
+        # Passing cu_seqlens again would reindex them by request-local positions
+        # (and mis-handle padding). Use the token-aligned SBHD path for THD Q too.
+        query_tokens = query[:n]
+        packed_query = query_tokens.dim() == 3
+        rotated_query = apply_rotary_pos_emb(
+            t=query_tokens.unsqueeze(1) if packed_query else query_tokens,
             freqs=query_emb[:n],
             config=config,
-            cu_seqlens=cu_seqlens_q,
+            cu_seqlens=None,
             cp_group=cp_group,
             mscale=mscale,
             mla_rotary_interleaved=config.multi_latent_attention,
         )
+        query[:n] = rotated_query.squeeze(1) if packed_query else rotated_query
         return query
 
     def apply_rotary_emb_key(
