@@ -10,6 +10,7 @@ from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 
 from megatron.core.dist_checkpointing.dict_utils import nested_values
 from megatron.core.dist_checkpointing.mapping import LocalNonpersistentObject, ShardedStateDict
+from megatron.core.dist_checkpointing.utils import add_prefix_for_sharding
 from megatron.core.distributed.param_and_grad_buffer import group_params_for_buffers
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.utils import get_pg_rank, get_pg_size, log_single_rank
@@ -28,6 +29,7 @@ from .optimizer import (
     MegatronOptimizer,
     _get_param_grad_norm_group,
     _validate_grad_norm_group,
+    param_group_identifier_keys,
 )
 from .optimizer_config import OptimizerConfig
 from .param_layout import (
@@ -103,16 +105,17 @@ def tag_params_for_buffer_routing(model_chunks) -> None:
             param.is_managed_by_layer_wise_optimizer = is_managed_by_layer_wise_optimizer(param)
 
 
-def _all_gather_param_group_metadata(param_group, pg_collection):
-    """Gather optimizer-group metadata within the group that owns the parameters."""
-    process_group = (
-        pg_collection.expt_dp
-        if param_group.get('is_expert_parallel', False)
-        else pg_collection.dp_cp
+def _param_group_identifier(param_group: dict) -> tuple:
+    """Return the rank-stable identifier used to match optimizer parameter groups."""
+    return tuple(
+        param_group.get(key, param_group.get(f'pre_{key}')) for key in param_group_identifier_keys
     )
-    assert process_group is not None, "LayerWise optimizer checkpoint group is not initialized"
-    all_rank_groups = [None for _ in range(get_pg_size(process_group))]
-    torch.distributed.all_gather_object(all_rank_groups, param_group, group=process_group)
+
+
+def _all_gather_param_group_metadata(param_groups):
+    """Gather one rank's optimizer-group metadata in a fixed collective schedule."""
+    all_rank_groups = [None for _ in range(torch.distributed.get_world_size())]
+    torch.distributed.all_gather_object(all_rank_groups, param_groups)
     return all_rank_groups
 
 
@@ -1218,9 +1221,29 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         Sharded state dict for torch_dist format checkpointing.
         For fixed DP usage only, set replica_id to 0 for all ShardedTensor.
         """
-        sharded_state_dict = super().sharded_state_dict(
-            model_sharded_state_dict, is_loading, **kwargs
-        )
+        # Super can take different child-only collective paths when this rank owns no
+        # parameters, so build each local child directly before the fixed world gather below.
+        metadata = kwargs.get("metadata") or {}
+        from .distrib_optimizer import DistributedOptimizer
+
+        should_add_prefix = (
+            "distrib_optim_sharding_type" in metadata
+            and metadata["distrib_optim_sharding_type"]
+            not in DistributedOptimizer.checkpoint_fully_reshardable_formats
+        ) or not metadata.get("chained_optim_avoid_prefix", False)
+        self._synchronize_steps()
+        sharded_state_dict = {}
+        for optimizer_idx, optimizer in enumerate(self.chained_optimizers):
+            optim_state_dict = optimizer.sharded_state_dict(
+                model_sharded_state_dict, is_loading, **kwargs
+            )
+            if should_add_prefix:
+                add_prefix_for_sharding(optim_state_dict, f"chained_{optimizer_idx}.")
+            sharded_state_dict[optimizer_idx] = optim_state_dict
+
+        # Preserve ChainedOptimizer's single-child return shape.
+        if len(self.chained_optimizers) == 1:
+            sharded_state_dict = sharded_state_dict[0]
 
         # (E)GTP-remat replicas need distinct TP coordinates after fixed-DP folding.
         gtp_fold = _build_gtp_replica_fold(self.pg_collection, self.model_chunks)
@@ -1239,7 +1262,9 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                 )
 
         # later code assume list but chained optimizer fallback to non-list if there's only one
-        if len(self.chained_optimizers) == 1:
+        if len(self.chained_optimizers) == 0:
+            wrapped_sharded_state_dict = {}
+        elif len(self.chained_optimizers) == 1:
             wrapped_sharded_state_dict = {1: sharded_state_dict}
         else:
             wrapped_sharded_state_dict = sharded_state_dict
@@ -1260,15 +1285,79 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             # state is a single dict and will be empty if optimizer is fully empty
             if not sd['optimizer']['state']:
                 sd['optimizer']['state'] = LocalNonpersistentObject(sd['optimizer']['state'])
-            # group keys(e.g. 'step') might be missing or not updated
-            for i, group in enumerate(sd['optimizer']['param_groups']):
-                # keep local param tensor so we only gather metadata
+        # Every global rank must issue one collective even when its local optimizer chain or
+        # parameter groups are empty. Group identifiers come from the same rank-aligned
+        # configuration fields used by optimizer checkpoint loading; unlike child/group
+        # positions they remain stable when an entire local child is absent.
+        param_group_records = []
+        local_metadata_by_group = {False: {}, True: {}}
+        for sd in wrapped_sharded_state_dict.values():
+            for group_index, group in enumerate(sd['optimizer']['param_groups']):
                 local_params = group.pop('params')
-                # save whether this group is empty, so we can use non-empty rank for metadata
-                group['params'] = bool(local_params.unwrap())
-                all_rank_groups = _all_gather_param_group_metadata(group, self.pg_collection)
-                # find first non-empty group if it exists
-                nonempty_rank_group = next((g for g in all_rank_groups if g['params']), group)
-                nonempty_rank_group['params'] = local_params
-                sd['optimizer']['param_groups'][i] = nonempty_rank_group
+                metadata = dict(group)
+                metadata['params'] = bool(local_params.unwrap())
+                group_identifier = _param_group_identifier(metadata)
+                is_expert = metadata.get('is_expert_parallel', False)
+                if group_identifier in local_metadata_by_group[is_expert]:
+                    raise ValueError(
+                        "LayerWise optimizer checkpoint metadata contains duplicate parameter "
+                        f"group identifier {group_identifier}"
+                    )
+                local_metadata_by_group[is_expert][group_identifier] = metadata
+                param_group_records.append(
+                    (sd, group_index, local_params, metadata, group_identifier, is_expert)
+                )
+
+        # The LayerWise wrapper exists on every global rank even when its local child list is
+        # empty. Batching dense and expert metadata into this single world collective avoids
+        # both per-group call-count divergence and subgroup-order divergence.
+        all_rank_metadata = _all_gather_param_group_metadata(local_metadata_by_group)
+        gathered_metadata = {
+            is_expert: [rank_metadata[is_expert] for rank_metadata in all_rank_metadata]
+            for is_expert in (False, True)
+        }
+        for is_expert, rank_metadata in gathered_metadata.items():
+            all_group_identifiers = {
+                group_identifier for groups in rank_metadata for group_identifier in groups
+            }
+            for group_identifier in all_group_identifiers:
+                matching_metadata = [
+                    groups[group_identifier]
+                    for groups in rank_metadata
+                    if group_identifier in groups and groups[group_identifier]['params']
+                ]
+                if not matching_metadata:
+                    continue
+                expected_metadata = {
+                    key: value for key, value in matching_metadata[0].items() if key != 'params'
+                }
+                if any(
+                    {key: value for key, value in metadata.items() if key != 'params'}
+                    != expected_metadata
+                    for metadata in matching_metadata[1:]
+                ):
+                    raise ValueError(
+                        "LayerWise optimizer checkpoint metadata disagrees for parameter group "
+                        f"{group_identifier} in {'expert' if is_expert else 'dense'} ranks"
+                    )
+
+        for (
+            sd,
+            group_index,
+            local_params,
+            local_metadata,
+            group_identifier,
+            is_expert,
+        ) in param_group_records:
+            matching_metadata = [
+                groups[group_identifier]
+                for groups in gathered_metadata[is_expert]
+                if group_identifier in groups and groups[group_identifier]['params']
+            ]
+            if matching_metadata:
+                reconciled_metadata = dict(matching_metadata[0])
+            else:
+                reconciled_metadata = dict(local_metadata)
+            reconciled_metadata['params'] = local_params
+            sd['optimizer']['param_groups'][group_index] = reconciled_metadata
         return sharded_state_dict

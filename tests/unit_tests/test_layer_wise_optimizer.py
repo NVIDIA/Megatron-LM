@@ -609,8 +609,12 @@ class TestLayerWiseOptimizer:
         # Get model sharded state dict
         model_sharded_state_dict = model.sharded_state_dict()
 
-        # Test sharded_state_dict
-        sharded_state_dict = optimizer.sharded_state_dict(model_sharded_state_dict)
+        # Production checkpointing always selects a supported DistOpt format. Using the
+        # deprecated implicit fully_sharded_model_space default would fail before this test can
+        # exercise LayerWise metadata reconciliation across empty optimizer ranks.
+        sharded_state_dict = optimizer.sharded_state_dict(
+            model_sharded_state_dict, metadata={'distrib_optim_sharding_type': 'dp_reshardable'}
+        )
 
         # Verify the sharded_state_dict is not None and has expected structure.
         # With multiple chained optimizers (muon + adam), the top-level keys are
