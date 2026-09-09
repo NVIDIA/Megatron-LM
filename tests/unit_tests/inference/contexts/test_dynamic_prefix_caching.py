@@ -599,7 +599,7 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
 
         req2 = self._req(ctx, prompt.clone(), request_id=2)
         # no prefill skipping
-        (matched, _, _, _, prefix_skip, eff_chunk) = ctx._compute_prefix_match(req2, len(prompt))
+        matched, _, _, _, prefix_skip, eff_chunk = ctx._compute_prefix_match(req2, len(prompt))
         assert len(matched) == 3 and prefix_skip == 0 and eff_chunk == len(prompt)
 
         ctx.add_request(req2)
@@ -730,7 +730,7 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         self._mamba_allocate_and_register(ctx, self._block_ids(ctx, 0, 3)[:1])
         req2 = self._req(ctx, prompt.clone(), request_id=2)
         req2._mamba_num_matched_blocks = 1
-        (matched, _, _, _, prefix_skip, eff_chunk) = ctx._compute_prefix_match(req2, len(prompt))
+        matched, _, _, _, prefix_skip, eff_chunk = ctx._compute_prefix_match(req2, len(prompt))
         assert len(matched) == 3 and prefix_skip == bs and eff_chunk == len(prompt) - bs
 
         # no mamba match means no skip
@@ -739,7 +739,7 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         ctx2.add_request(self._req(ctx2, p2.clone()))
         req2b = self._req(ctx2, p2.clone(), request_id=2)
         req2b._mamba_num_matched_blocks = 0
-        (m2, _, _, _, ps2, ec2) = ctx2._compute_prefix_match(req2b, len(p2))
+        m2, _, _, _, ps2, ec2 = ctx2._compute_prefix_match(req2b, len(p2))
         assert len(m2) == 3 and ps2 == 0 and ec2 == len(p2)
 
         # zero prefill for hybrid (mamba-cached, block-aligned)
@@ -749,7 +749,7 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         self._mamba_allocate_and_register(ctx3, self._block_ids(ctx3, 0, 3))
         req3 = self._req(ctx3, p3.clone(), request_id=2)
         req3._mamba_num_matched_blocks = 3
-        (m3, _, _, _, ps3, ec3) = ctx3._compute_prefix_match(req3, len(p3))
+        m3, _, _, _, ps3, ec3 = ctx3._compute_prefix_match(req3, len(p3))
         assert len(m3) == 3 and ps3 == 2 * bs and ec3 == bs
 
         # KV-only prefix skip with non-block-aligned prompt: all 3 full blocks
@@ -761,7 +761,7 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         req4a = self._req(ctx4, p4.clone())
         ctx4.add_request(req4a)
         req4b = self._req(ctx4, p4.clone(), request_id=2)
-        (m4, _, _, _, ps4, ec4) = ctx4._compute_prefix_match(req4b, len(p4))
+        m4, _, _, _, ps4, ec4 = ctx4._compute_prefix_match(req4b, len(p4))
         assert len(m4) == 3 and ps4 == 3 * bs4 and ec4 == tail
         ctx4.add_request(req4b)
 
@@ -790,7 +790,7 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         self._mamba_allocate_and_register(ctx, self._block_ids(ctx, 0, 4)[:2])
         req2 = self._req(ctx, prompt.clone(), request_id=2)
         req2._mamba_num_matched_blocks = 2
-        (matched, _, _, overall, prefix_skip, _) = ctx._compute_prefix_match(req2, len(prompt))
+        matched, _, _, overall, prefix_skip, _ = ctx._compute_prefix_match(req2, len(prompt))
         # Copy block IDs to slot 1 so compute_and_store_offsets can resolve EOS block
         ctx.request_to_kv_block_ids[1] = ctx.request_to_kv_block_ids[0]
         msa.compute_and_store_offsets(
@@ -1339,3 +1339,113 @@ class TestPerBlockRouting(PrefixCachingTestBase):
         assert np.allclose(alloc.get_block_routing(b0), routing_b0)
         assert alloc.get_block_routing(b1) is not None
         assert np.allclose(alloc.get_block_routing(b1), routing_b1)
+
+
+class TestPrefixCacheReuse(PrefixCachingTestBase):
+    """Cross-request prefix reuse on hybrid (Mamba) models:
+
+    - reset(preserve_prefix_cache=True) keeps the cache; a plain reset() clears it.
+    - Per-context prefill token accounting (computed vs skipped).
+    - Mamba state is extracted for the last complete block of a multi-chunk prompt.
+    """
+
+    @pytest.mark.internal
+    def test_reset_preserves_prefix_cache_when_requested(self):
+        # LRU + prefix caching enabled: reset(preserve_prefix_cache=True) keeps the
+        # KV hash index (so an idle dummy_forward does not wipe cross-request reuse),
+        # while a plain reset() clears it.
+        ctx = self._ctx(enable_prefix_caching=True)
+        bs = ctx.block_size_tokens
+        ctx.add_request(self._req(ctx, self._prompt(bs * 2)))
+        cached = dict(ctx.kv_block_allocator.kv_hash_to_block_id)
+        assert len(cached) == 2
+
+        ctx.reset(preserve_prefix_cache=True)
+        assert ctx.kv_block_allocator.kv_hash_to_block_id == cached  # preserved
+
+        ctx.reset()  # default: full reset
+        assert len(ctx.kv_block_allocator.kv_hash_to_block_id) == 0  # cleared
+
+    @pytest.mark.internal
+    def test_reset_disabled_ignores_preserve_flag(self):
+        # When prefix caching is disabled, preserve_prefix_cache=True still performs
+        # a full reset: step_count returns to 0.
+        ctx_off = self._ctx(enable_prefix_caching=False)
+        ctx_off.step_count = 7
+        ctx_off.reset(preserve_prefix_cache=True)
+        assert ctx_off.step_count == 0
+
+        # With caching ON, preserve keeps step_count monotonic (for logging cadence).
+        ctx_on = self._ctx(enable_prefix_caching=True)
+        ctx_on.step_count = 7
+        ctx_on.reset(preserve_prefix_cache=True)
+        assert ctx_on.step_count == 7
+
+    @pytest.mark.internal
+    def test_prefill_computed_and_skipped_counters(self):
+        # A second request that shares a cached prefix should skip that prefix's
+        # prefill; the per-context counters must reflect computed vs skipped tokens.
+        ctx = self._ctx(enable_prefix_caching=True)
+        bs = ctx.block_size_tokens
+
+        ctx.add_request(self._req(ctx, self._prompt(bs * 4), request_id=1))
+        assert ctx.prefix_cache_prefill_skipped_tokens == 0
+        assert ctx.prefix_cache_prefill_computed_tokens == bs * 4
+
+        # request 2 shares the first 4 blocks, adds 2 new blocks
+        req2 = self._req(ctx, self._prompt(bs * 6), request_id=2)
+        matched, _, _, _, prefix_skip, _ = ctx._compute_prefix_match(req2, bs * 6)
+        assert len(matched) == 4 and prefix_skip == bs * 4
+        ctx.add_request(req2)
+
+        assert ctx.prefix_cache_prefill_skipped_tokens == bs * 4
+        assert ctx.prefix_cache_prefill_computed_tokens == bs * 6  # 4bs + 2bs
+
+    @pytest.mark.internal
+    def test_mamba_extraction_covers_last_block_of_continuation_chunk(self):
+        # For a non-block-aligned, multi-chunk prompt, the last complete block lies
+        # in a continuation chunk. Extraction offsets are chunk-relative, so that
+        # boundary's Mamba state is recorded when its chunk is scheduled.
+        ctx = self._ctx(
+            mamba_config=self._mamba_config(),
+            prefix_caching_mamba_gb=0.01,
+            block_size_tokens=256,
+            max_sequence_length=4096,
+        )  # mamba prefix caching enabled
+        bs = ctx.block_size_tokens
+        assert bs == 256
+        msa = ctx.mamba_slot_allocator
+
+        prompt_len = bs * 3 + 64  # 3 complete blocks + a 64-token remainder
+        req = self._req(ctx, self._prompt(prompt_len))
+        ctx.add_request(req)  # populates request_to_kv_block_ids[0]
+        overall_blocks = ctx.request_kv_block_counts[0].item()
+        assert overall_blocks == 4  # ceil(832 / 256)
+
+        # Simulate the continuation chunk that covers tokens [2*bs, prompt_len):
+        # finished=2*bs, no prefix skip, the rest of the prompt as the chunk.
+        req.finished_chunk_token_count = 2 * bs
+        cont_chunk = prompt_len - 2 * bs
+        msa.compute_and_store_offsets(
+            req,
+            current_id=0,
+            skip_tokens=0,
+            prefill_chunk_length=cont_chunk,
+            num_matched_blocks=0,
+            matched_block_ids=[],
+            overall_required_blocks=overall_blocks,
+        )
+
+        # last complete block boundary = 3*bs (768); chunk-relative offset = 768-512=256.
+        last_aligned_abs = (prompt_len // bs) * bs
+        expected_offset = last_aligned_abs - 2 * bs
+        count = msa._intermediate_counts_cpu[0].item()
+        assert count >= 1
+        recorded = msa._intermediate_offsets_cpu[0, :count].tolist()
+        assert expected_offset in recorded
+        # the recorded boundary maps to the last complete block (index 2)
+        idx = recorded.index(expected_offset)
+        assert (
+            msa._intermediate_block_ids_cpu[0, idx].item()
+            == ctx.request_to_kv_block_ids[0][last_aligned_abs // bs - 1].item()
+        )

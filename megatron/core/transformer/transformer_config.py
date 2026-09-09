@@ -33,6 +33,7 @@ from megatron.core.transformer.pipeline_parallel_layer_layout import PipelinePar
 from megatron.core.utils import experimental_api
 
 from .._rank_utils import log_single_rank
+from ..activations import situlu
 from ..fusions.fused_bias_geglu import quick_gelu
 from ..model_parallel_config import ModelParallelConfig
 from ..utils import (
@@ -359,6 +360,9 @@ class TransformerConfig(ModelParallelConfig):
     dsa_indexer_use_sparse_loss: bool = False
     """Whether to use sparse DSA indexer loss. If True, the indexer loss will be computed using the
     top-k indices."""
+
+    dsa_indexer_precision: Literal["bf16", "mxfp8"] = "bf16"
+    """Precision used only by the fused compact DSA indexer forward and Top-K."""
 
     dsa_kernel_backend: Literal["none", "tilelang", "cudnn"] = "none"
     """Optional fused ordinary-DSA kernel backend. Unsupported layouts use PyTorch fallback."""
@@ -804,6 +808,17 @@ class TransformerConfig(ModelParallelConfig):
     use_grouped_gemm_for_shared_expert is set.
     """
 
+    moe_megakernel_backend: Optional[str] = None
+    """Optional backend that replaces MoE dispatch, expert computation, and combine.
+    Supported values: None and "mok".
+    """
+
+    moe_megakernel_backend_config: Optional[dict] = None
+    """Backend options for moe_megakernel_backend.
+
+    For example, ``fwd_num_comm_sms`` is a valid MOK backend option.
+    """
+
     moe_layer_freq: Union[int, List[int]] = 1
     """Frequency between MoE layers and Dense layers. Accepts either:
     - An integer N: Represents a 1:N ratio, meaning one expert layer for every N-1 dense layers.
@@ -1085,6 +1100,12 @@ class TransformerConfig(ModelParallelConfig):
     moe_hybridep_num_sms_preprocessing: int = 108
     """Number of SMs to use for HybridEP preprocessing (metadata scan kernel)."""
 
+    moe_hybridep_routing_map_mode: Literal['indices', 'bool'] = 'indices'
+    """Routing-map format for HybridEP. ``indices`` requests int16 top-k indices and is the
+    default, while ``bool`` forces the bool token-to-expert map. Index routing remains gated on
+    Transformer Engine and HybridEP support and the int16 expert limit; unsupported configurations
+    fall back to the bool routing-map path."""
+
     moe_ncclep_static_shape: bool = False
     """For the 'ncclep' flex dispatcher: feed the experts the full fixed-size receive buffer
     instead of narrowing to the (data-dependent) number of received tokens, removing the D2H sync
@@ -1354,6 +1375,12 @@ class TransformerConfig(ModelParallelConfig):
 
     use_te_activation_func: bool = False
     """Whether to use ffn activation functions implemented by TransformerEngine"""
+
+    situ_glu_beta1: float = 4.0
+    """SiTU-GLU gate tanh soft-cap."""
+
+    situ_glu_beta2: float = 25.0
+    """SiTU-GLU up-branch tanh soft-cap."""
 
     use_te_rng_tracker: bool = False
     """ Whether to use the TE or MCore version of the RNG tracker. """
@@ -1889,6 +1916,11 @@ class TransformerConfig(ModelParallelConfig):
                     "cp_comm_type=allgather only."
                 )
         elif self.experimental_attention_variant == "dsv4_hybrid":
+            if self.dsa_indexer_precision not in ("bf16", "mxfp8"):
+                raise ValueError(
+                    "dsa_indexer_precision must be 'bf16' or 'mxfp8', "
+                    f"got {self.dsa_indexer_precision!r}"
+                )
             assert self.multi_latent_attention, "DSv4 Hybrid requires multi_latent_attention."
             assert self.csa_compress_ratios is not None, "csa_compress_ratios must be set"
             mtp_layers = self.mtp_num_layers or 0
@@ -1911,6 +1943,12 @@ class TransformerConfig(ModelParallelConfig):
             assert not self.qk_clip, "QK clipping is not supported with DSv4 Hybrid Attention."
             self.hetereogenous_dist_checkpoint = True
 
+            uses_ratio4_indexer = 4 in self.csa_compress_ratios and not self.csa_dense_mode
+            indexer_loss_enabled = (self.dsa_indexer_loss_coeff or 0.0) > 0
+            uses_mxfp8_indexer = uses_ratio4_indexer and self.dsa_indexer_precision == "mxfp8"
+            if uses_mxfp8_indexer and self.dsa_kernel_backend != "cudnn":
+                raise ValueError("MXFP8 DSA indexer precision requires dsa_kernel_backend='cudnn'")
+
             if self.dsa_kernel_backend == "tilelang":
                 raise ValueError(
                     "dsv4_hybrid does not support dsa_kernel_backend='tilelang'; use 'cudnn' "
@@ -1924,8 +1962,20 @@ class TransformerConfig(ModelParallelConfig):
                     f"dsa_kernel_backend='cudnn' requires SM90+ (Hopper or later), "
                     f"but current device has compute capability {sm[0]}.{sm[1]}."
                 )
-                uses_ratio4_indexer = 4 in self.csa_compress_ratios and not self.csa_dense_mode
-                indexer_loss_enabled = (self.dsa_indexer_loss_coeff or 0.0) > 0
+                if uses_mxfp8_indexer:
+                    if sm[0] < 10:
+                        raise ValueError("MXFP8 compact DSA indexer requires SM100 or later")
+                    if self.dsa_indexer_n_heads != 64 or self.dsa_indexer_head_dim != 128:
+                        raise ValueError(
+                            "MXFP8 compact DSA indexer requires dsa_indexer_n_heads=64 and "
+                            "dsa_indexer_head_dim=128"
+                        )
+                    if indexer_loss_enabled and not self.dsa_indexer_use_sparse_loss:
+                        raise ValueError(
+                            "MXFP8 DSA indexer loss supports only sparse loss; set "
+                            "dsa_indexer_use_sparse_loss=True"
+                        )
+
                 if (
                     sm[0] == 9
                     and uses_ratio4_indexer
@@ -1939,6 +1989,33 @@ class TransformerConfig(ModelParallelConfig):
                     )
 
                 from cudnn import DSA
+
+                if sm[0] >= 10 and uses_ratio4_indexer:
+                    compact_wrapper = getattr(DSA, "indexer_forward_top_k_wrapper", None)
+                    required_parameters = {"deterministic"}
+                    if uses_mxfp8_indexer:
+                        required_parameters.update(
+                            {
+                                "precision",
+                                "q_scale",
+                                "k_scale",
+                                "cu_seqlens_q_scale_padded",
+                                "cu_seqlens_k_scale_padded",
+                                "sf_vec_size",
+                            }
+                        )
+                    wrapper_parameters = (
+                        set(inspect.signature(compact_wrapper).parameters)
+                        if callable(compact_wrapper)
+                        else set()
+                    )
+                    missing_parameters = required_parameters - wrapper_parameters
+                    if missing_parameters:
+                        raise ValueError(
+                            "Fused DSA indexer requires a compatible cuDNN Frontend compact "
+                            "wrapper; "
+                            f"missing parameters: {', '.join(sorted(missing_parameters))}"
+                        )
 
                 if (
                     self.context_parallel_size > 1 or self.dynamic_context_parallel
@@ -2164,6 +2241,15 @@ class TransformerConfig(ModelParallelConfig):
                     "(--fp4-param-gather). Without FP4 parameter gather, Transformer Engine "
                     "uses a split-quantize fallback that is being deprecated."
                 )
+            if not self.use_transformer_engine_op_fuser and self.moe_megakernel_backend != "mok":
+                raise ValueError(
+                    "moe_single_grouped_weight requires "
+                    "use_transformer_engine_op_fuser=True. The non-op-fuser TE GroupedLinear "
+                    "path splits the grouped parameter into per-expert tensors and does not "
+                    "support single-grouped-weight training. The MOK integration is the only "
+                    "exception because it consumes the grouped parameter directly and never "
+                    "calls the TE GroupedLinear forward path."
+                )
             if not self.moe_use_grouped_tensor:
                 raise ValueError("moe_single_grouped_weight requires moe_use_grouped_tensor=True.")
         if self.moe_single_grouped_bias and not self.add_bias_linear:
@@ -2190,6 +2276,9 @@ class TransformerConfig(ModelParallelConfig):
                     "Flex token dispatcher with deepep/deepepv2 backend does not support "
                     "moe_pad_expert_input_to_capacity"
                 )
+
+        if self.moe_hybridep_routing_map_mode not in ("indices", "bool"):
+            raise ValueError("moe_hybridep_routing_map_mode must be one of 'indices' or 'bool'.")
 
         if self.moe_flex_dispatcher_backend == "ncclep":
             if self.moe_token_dispatcher_type != "flex":
@@ -2249,6 +2338,74 @@ class TransformerConfig(ModelParallelConfig):
             )
             self.moe_router_load_balancing_type = "quantile_balancing"
             self.moe_aux_loss_coeff = self.moe_aux_loss_coeff[0]
+
+        if self.moe_megakernel_backend not in (None, "mok"):
+            raise ValueError(
+                "moe_megakernel_backend must be None or 'mok', got "
+                f"{self.moe_megakernel_backend!r}"
+            )
+        if self.moe_megakernel_backend is None and self.moe_megakernel_backend_config:
+            raise ValueError(
+                "moe_megakernel_backend_config requires moe_megakernel_backend to be set"
+            )
+
+        if self.moe_megakernel_backend == "mok":
+            # TODO: Add a materialized-wgrad adapter for non-fused accumulation.
+            if not self.gradient_accumulation_fusion:
+                raise ValueError("MOK currently requires gradient_accumulation_fusion=True")
+            if not self.moe_grouped_gemm:
+                raise ValueError("MOK currently requires moe_grouped_gemm=True")
+            mok_bf16 = (
+                self.bf16
+                and not self.fp16
+                and self.fp8 is None
+                and not self.fp8_param
+                and self.fp4 is None
+                and not self.fp4_param
+            )
+            mok_mxfp8 = (
+                self.fp8 is not None and self.fp8_recipe == Fp8Recipe.mxfp8 and self.fp8_param
+            )
+            if not (mok_bf16 or mok_mxfp8):
+                raise ValueError(
+                    "MOK routed experts require either bf16=True with no FP8/FP4 mode, "
+                    "or MXFP8 with fp8_param=True; FP32, FP16, and FP4 are not supported"
+                )
+            if self.overlap_moe_expert_parallel_comm:
+                raise ValueError(
+                    "MOK does not support overlap_moe_expert_parallel_comm; the megakernel "
+                    "replaces MCore's dispatcher/expert/combine schedule"
+                )
+            if self.delay_wgrad_compute:
+                raise ValueError("MOK does not support delay_wgrad_compute")
+            if self.overlap_dispatch_backward_with_experts_wgrad:
+                raise ValueError(
+                    "MOK does not support overlap_dispatch_backward_with_experts_wgrad; "
+                    "the megakernel never runs the native dispatch path"
+                )
+            if self.tensor_model_parallel_size != 1 or self.expert_tensor_parallel_size != 1:
+                raise ValueError("MOK currently requires TP=1 and expert TP=1")
+            if self.expert_model_parallel_size not in (1, 4, 8, 16, 32, 64):
+                raise ValueError("MOK requires EP in {1, 4, 8, 16, 32, 64}")
+            if self.moe_shared_expert_intermediate_size is None:
+                raise ValueError("MOK requires a shared expert")
+            if self.moe_shared_expert_gate or self.moe_shared_expert_overlap:
+                raise ValueError("MOK does not support the MCore shared-expert gate/overlap")
+            if self.moe_latent_size is not None:
+                raise ValueError("MOK does not support latent MoE")
+            if self.recompute_modules and "shared_experts" in self.recompute_modules:
+                raise ValueError(
+                    "MOK does not support recompute_modules=['shared_experts']; shared-expert "
+                    "computation is fused into the megakernel. Use whole-MoE recompute "
+                    "instead."
+                )
+            if self.log_moe_overload_factor:
+                raise ValueError(
+                    "MOK does not support log_moe_overload_factor because it bypasses the "
+                    "native token-dispatcher accounting path"
+                )
+            if not self.gated_linear_unit or self.activation_func != F.silu:
+                raise ValueError("MOK currently requires SwiGLU")
 
         if isinstance(self.moe_router_load_balancing_type, list):
             assert isinstance(self.moe_aux_loss_coeff, list) and len(
@@ -2897,12 +3054,25 @@ class TransformerConfig(ModelParallelConfig):
                 )
 
         if self.use_te_activation_func:
-            if self.activation_func not in (F.gelu, F.silu, F.relu):
+            if self.activation_func not in (F.gelu, F.silu, F.relu, situlu):
                 raise ValueError(
-                    "TransformerEngine only support gelu, geglu, silu, swiglu, relu, reglu. "
+                    "TransformerEngine only supports gelu, geglu, silu, swiglu, relu, reglu, "
+                    "and situ-glu. "
                     "If you don't want to use TransformerEngine activation function, set "
                     "use_te_activation_func to False"
                 )
+
+        if self.activation_func == situlu:
+            if not self.gated_linear_unit:
+                raise ValueError("SiTU-GLU requires gated_linear_unit=True.")
+            if self.activation_func_clamp_value is not None:
+                raise ValueError("SiTU-GLU does not use activation_func_clamp_value.")
+            if self.glu_linear_offset != 0.0:
+                raise ValueError("SiTU-GLU requires glu_linear_offset=0.0.")
+            if not math.isfinite(self.situ_glu_beta1) or self.situ_glu_beta1 <= 0:
+                raise ValueError("situ_glu_beta1 must be finite and positive.")
+            if not math.isfinite(self.situ_glu_beta2) or self.situ_glu_beta2 <= 0:
+                raise ValueError("situ_glu_beta2 must be finite and positive.")
 
         if self.activation_func_fp8_input_store:
             if self.activation_func != F.silu or not self.gated_linear_unit:
@@ -3268,6 +3438,27 @@ class TransformerConfig(ModelParallelConfig):
         assert not (
             self.cuda_graph_impl == "full_iteration" and self.cuda_graph_modules
         ), 'cuda_graph_modules must be empty when cuda_graph_impl="full_iteration".'
+
+        if self.moe_megakernel_backend == "mok":
+            if self.cuda_graph_impl in ("local", "transformer_engine"):
+                if not self.cuda_graph_modules:
+                    raise ValueError(
+                        "MOK does not support per-layer whole-layer CUDA Graph capture"
+                    )
+                if any(
+                    scope in self.cuda_graph_modules
+                    for scope in (
+                        CudaGraphModule.moe,
+                        CudaGraphModule.moe_router,
+                        CudaGraphModule.moe_preprocess,
+                    )
+                ):
+                    raise ValueError(
+                        "MOK does not support per-layer CUDA Graph scopes containing "
+                        "moe/moe_router/moe_preprocess"
+                    )
+            elif self.cuda_graph_impl not in ("none", "full_iteration"):
+                raise ValueError(f"MOK does not support cuda_graph_impl={self.cuda_graph_impl!r}")
 
         # mHC selective recompute composes with CUDA graphs on two paths: the
         # opt-in attention-only split, and whole-range capture for everything
