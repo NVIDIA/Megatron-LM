@@ -373,7 +373,12 @@ class DpBalancedScheduler(BasePackingScheduler):
 
             # Step 6: Build packed microbatches
             new_samples = build_packed_microbatches(
-                samples_this_rank_with_id, sample_id_groups, dcp_rank, dev, self.is_dynamic_cp
+                samples_this_rank_with_id,
+                sample_id_groups,
+                dcp_rank,
+                dev,
+                self.is_dynamic_cp,
+                sequence_parallel_size=getattr(self, 'sequence_parallel_size', 1),
             )
 
             # Step 7: Calculate FLOPs info
@@ -421,13 +426,21 @@ class DefaultDynamicCPScheduler(DpBalancedScheduler):
     Dynamic CP scheduler that balances workload across variable CP sizes.
     """
 
-    def __init__(self, *args, min_cp_size=1, allow_arbitrary_group_starts=False, **kwargs):
+    def __init__(
+        self,
+        *args,
+        min_cp_size=1,
+        allow_arbitrary_group_starts=False,
+        sequence_parallel_size=1,
+        **kwargs,
+    ):
         super().__init__(*args, **kwargs)
         self.is_dynamic_cp = True
         self.max_seq_len_per_rank = self.max_seqlen_per_dp_cp_rank
         self.total_hdp_gpus = self.dp_size * self.cp_size
         self.min_cp_size = min_cp_size
         self.allow_arbitrary_group_starts = allow_arbitrary_group_starts
+        self.sequence_parallel_size = sequence_parallel_size
 
     def get_groups_and_subsamples(self, sample_id_seqlens):
         """
@@ -447,6 +460,7 @@ class DefaultDynamicCPScheduler(DpBalancedScheduler):
                 max_seq_len_per_rank=mslpr,
                 min_cp_size=min_cp,
                 allow_arbitrary_group_starts=self.allow_arbitrary_group_starts,
+                sequence_parallel_size=self.sequence_parallel_size,
             )
             sample_id_groups.append(sample_ids)
 
@@ -455,7 +469,9 @@ class DefaultDynamicCPScheduler(DpBalancedScheduler):
             and self.microbatch_group_size_per_vp_stage > 1
         ):
             sample_id_groups = align_sample_id_groups(
-                sample_id_groups, self.microbatch_group_size_per_vp_stage
+                sample_id_groups,
+                self.microbatch_group_size_per_vp_stage,
+                allow_arbitrary_group_starts=self.allow_arbitrary_group_starts,
             )
 
         return sample_id_groups
@@ -541,6 +557,8 @@ def wrap_data_iterator(
         scheduler_kwargs['allow_arbitrary_group_starts'] = getattr(
             config, 'use_native_cp_transport', False
         )
+        if scheduler_kwargs['allow_arbitrary_group_starts'] and config.sequence_parallel:
+            scheduler_kwargs['sequence_parallel_size'] = config.tensor_model_parallel_size
 
     scheduler_max_num_seqs = (
         _get_scheduler_max_real_num_seqs(config)

@@ -1547,6 +1547,7 @@ class _DeepepV2Manager(_DeepepManager):
         self.group = group
         self.num_local_experts = num_local_experts
         self.config = config
+        self._fused_a2a = _get_fused_a2a_module()
 
         self.router_topk = router_topk
         self.num_experts = num_experts

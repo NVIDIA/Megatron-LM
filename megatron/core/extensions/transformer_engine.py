@@ -1903,7 +1903,8 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             pair_bytes = 2 * kv_bytes
             payload_bytes = ((pair_bytes + 255) // 256) * 256 + pair_bytes
             if self.config.num_moe_experts:
-                max_packed_sequences = max(1, self.config.thd_max_packed_sequences or 1)
+                # PackedSeqParams reserves an additional ID for an implicit padding tail.
+                max_packed_sequences = max(1, self.config.thd_max_packed_sequences or 1) + 1
                 aux_bytes = self.config.num_moe_experts * max_packed_sequences * 8
                 payload_bytes = max(payload_bytes, ((aux_bytes + 255) // 256) * 256 + aux_bytes)
             initialize_native_cp_transport(self._dynamic_cp_parent_group, payload_bytes)

@@ -584,6 +584,30 @@ def test_legacy_dynamic_cp_groups_remain_power_of_two(monkeypatch):
     assert groups == {1: (0,), 2: (0, 1), 4: (0, 1, 2, 3)}
 
 
+@pytest.mark.parametrize("parent_size", [1, 3, 6, 8, 10, 12, 14, 16])
+@pytest.mark.parametrize("min_cp_size", [1, 2])
+def test_legacy_dynamic_cp_groups_preserve_layouts_and_tails(monkeypatch, parent_size, min_cp_size):
+    """Every legacy rank must retain the layouts requested by initialization warmup."""
+    monkeypatch.setattr(ps, "create_group", lambda ranks, **_kwargs: tuple(ranks))
+    sizes = [2**i for i in range(int(math.log2(parent_size))) if 2**i >= min_cp_size]
+    for parent_rank in range(parent_size):
+        groups = ps.create_dynamic_dp_cp_groups(
+            rank=parent_rank,
+            ranks=list(range(parent_size)),
+            pg_options=None,
+            min_cp_size=min_cp_size,
+        )
+        expected = {
+            size: tuple(
+                range(
+                    parent_rank // size * size, min((parent_rank // size + 1) * size, parent_size)
+                )
+            )
+            for size in sizes
+        }
+        assert groups == expected
+
+
 def test_native_dynamic_cp_group_can_start_at_noncanonical_tail(monkeypatch):
     monkeypatch.setattr(ps, "_DYNAMIC_DP_CP_GROUPS", {})
     monkeypatch.setattr(ps, "get_data_parallel_group", lambda **_kwargs: object())

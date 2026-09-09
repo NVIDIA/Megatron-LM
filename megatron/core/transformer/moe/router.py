@@ -519,12 +519,14 @@ class TopKRouter(Router):
             seq_idx = seq_idx.narrow(0, self.tp_group.rank() * local_rows, local_rows)
         seq_idx = seq_idx.to(torch.int64)
 
-        cu_seqlens = packed_seq_params.cu_seqlens_q
+        cu_seqlens = packed_seq_params.cu_seqlens_q_padded
         if cu_seqlens is None:
-            cu_seqlens = packed_seq_params.cu_seqlens_q_padded
+            cu_seqlens = packed_seq_params.cu_seqlens_q
         if cu_seqlens is None:
             raise RuntimeError("Packed sequence aux loss requires cu_seqlens metadata")
-        num_sequence_slots = cu_seqlens.numel() - 1
+        # PackedSeqParams assigns an implicit tail the index len(cu_seqlens) - 1.
+        # Reserve that slot on every CP rank, even ranks with no local tail tokens.
+        num_sequence_slots = cu_seqlens.numel()
 
         local_tokens_per_expert = scores_for_aux_loss.new_zeros(
             (num_sequence_slots, self.config.num_moe_experts)
@@ -697,6 +699,8 @@ class TopKRouter(Router):
             and self.config.mtp_num_layers is not None
         ):
             aux_loss = aux_loss / self.config.mtp_num_layers
+            if metric_value is not None:
+                metric_value = metric_value / self.config.mtp_num_layers
 
         # TODO (zijiey): fix the per_layer_logging for MTP, currently it will incorrectly
         # add the aux loss logging value to other layer's since it is difficult to get the

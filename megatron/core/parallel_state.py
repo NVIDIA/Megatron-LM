@@ -434,15 +434,16 @@ def create_dynamic_dp_cp_groups(rank, ranks, pg_options, min_cp_size=1, use_logi
     if use_logical_groups:
         group_sizes = range(min_cp_size, len(ranks) + 1)
     else:
+        # Preserve the legacy floor(log2(parent_size)) layouts, including tails.
         group_sizes = [
             size
-            for size in (1 << i for i in range(len(ranks).bit_length()))
+            for size in (1 << i for i in range(len(ranks).bit_length() - 1))
             if min_cp_size <= size < len(ranks)
         ]
     for group_size in group_sizes:
         for i in range(0, len(ranks), group_size):
             group_ranks = ranks[i : i + group_size]
-            if len(group_ranks) != group_size:
+            if use_logical_groups and len(group_ranks) != group_size:
                 continue
             if use_logical_groups:
                 if rank not in group_ranks:
@@ -963,7 +964,7 @@ def initialize_model_parallel(
         if not use_native_cp_transport:
             group_sizes = [
                 size
-                for size in (1 << i for i in range(data_parallel_size_with_cp.bit_length()))
+                for size in (1 << i for i in range(data_parallel_size_with_cp.bit_length() - 1))
                 if min_dynamic_context_parallel_size <= size < data_parallel_size_with_cp
             ]
             if data_parallel_size_with_cp not in group_sizes:

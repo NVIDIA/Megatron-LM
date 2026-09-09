@@ -1,7 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from functools import lru_cache
-from math import ceil
+from math import ceil, lcm
 from typing import Dict, List, Literal, Optional, Sequence, Tuple
 
 import torch
@@ -229,6 +229,11 @@ def _get_global_seqlens_and_ids(subsample_seqlens: torch.Tensor, dp_group):
     return global_id_seqlens, global_ids_this_rank, offsets, seqlens_gathered
 
 
+def _cp_sequence_alignment(cp_size: int, sequence_parallel_size: int = 1) -> int:
+    """Align global rows for both CP zigzag chunks and local sequence parallelism."""
+    return cp_size * lcm(2 if cp_size > 1 else 1, sequence_parallel_size)
+
+
 def _pack_sequences(
     samples: List,
     padded_lengths: torch.Tensor,
@@ -236,12 +241,13 @@ def _pack_sequences(
     local_cp_size: Optional[torch.Tensor],
     local_cp_group_start: Optional[torch.Tensor],
     dev: torch.device,
+    sequence_parallel_size: int = 1,
 ) -> Dict[str, torch.Tensor]:
     """Pack multiple samples into a single packed sample."""
 
     padded_lengths = padded_lengths.to(device=dev, dtype=torch.int32, non_blocking=True).reshape(-1)
-    if local_cp_size is not None and int(local_cp_size.item()) > 1:
-        alignment = 2 * int(local_cp_size.item())
+    if local_cp_size is not None:
+        alignment = _cp_sequence_alignment(int(local_cp_size.item()), sequence_parallel_size)
         padded_lengths = ((padded_lengths + alignment - 1) // alignment) * alignment
     padded_lengths_cpu = padded_lengths.cpu().tolist()
 
@@ -496,6 +502,7 @@ def build_packed_microbatches(
     dcp_rank: int,
     dev: torch.device,
     is_dynamic_cp: bool = False,
+    sequence_parallel_size: int = 1,
 ) -> List[Dict[str, torch.Tensor]]:
     """Build packed samples for each microbatch.
 
@@ -506,6 +513,7 @@ def build_packed_microbatches(
         dcp_rank: This rank's index within the DP×CP group.
         dev: Target device.
         is_dynamic_cp: Whether dynamic context parallel is enabled.
+        sequence_parallel_size: Tensor parallel size when sequence parallelism is enabled.
     """
     num_micro_batches = len(sample_id_groups)
     seg_starts: List[int] = [0]
@@ -559,7 +567,13 @@ def build_packed_microbatches(
         local_cp_size = local_cp_sizes_gpu[i] if is_dynamic_cp else None
         local_cp_group_start = local_cp_group_starts_gpu[i] if is_dynamic_cp else None
         new_sample = _pack_sequences(
-            samples, lens_padded, lens_original, local_cp_size, local_cp_group_start, dev
+            samples,
+            lens_padded,
+            lens_original,
+            local_cp_size,
+            local_cp_group_start,
+            dev,
+            sequence_parallel_size=sequence_parallel_size,
         )
         new_samples.append(new_sample)
 
@@ -622,6 +636,7 @@ def next_hdp_group_packing_aware(
     max_seq_len_per_rank: int,
     min_cp_size: int = 1,
     allow_arbitrary_group_starts: bool = False,
+    sequence_parallel_size: int = 1,
 ) -> Tuple[List[List[int]], List[Tuple[int, int]], List[float], List[List[int]]]:
     """Form one DCP microbatch with packing-aware CP group selection.
 
@@ -648,15 +663,19 @@ def next_hdp_group_packing_aware(
         )
 
     def cp_min_fn(seq_len: int) -> int:
-        return dcp_gpus_needed(
+        cp_size = dcp_gpus_needed(
             seq_len,
             max_seq_len_per_rank,
             min_cp_size,
             round_to_power_of_two=not allow_arbitrary_group_starts,
         )
+        while cp_size <= total_gpus and per_rank_length(seq_len, cp_size) > max_seq_len_per_rank:
+            cp_size = cp_size + 1 if allow_arbitrary_group_starts else cp_size * 2
+        return cp_size
 
     def per_rank_length(seq_len: int, cp_size: int) -> int:
-        return 2 * ceil(seq_len / (2 * cp_size))
+        alignment = _cp_sequence_alignment(cp_size, sequence_parallel_size)
+        return ((seq_len + alignment - 1) // alignment) * (alignment // cp_size)
 
     def workload(seq_len: int, cp_size: int) -> float:
         return per_rank_length(seq_len, cp_size) ** 2 * cp_size
@@ -892,7 +911,11 @@ def next_hdp_group_packing_aware(
     return micro_batches, leftovers, exec_times, sample_ids_per_gpu
 
 
-def align_sample_id_groups(sample_id_groups: List, microbatch_group_size_per_vp_stage: int) -> List:
+def align_sample_id_groups(
+    sample_id_groups: List,
+    microbatch_group_size_per_vp_stage: int,
+    allow_arbitrary_group_starts: bool = False,
+) -> List:
     """Align len(sample_id_groups) to microbatch_group_size_per_vp_stage when VPP is enabled.
 
     Standalone version extracted from DefaultDynamicCPScheduler.
@@ -916,16 +939,22 @@ def align_sample_id_groups(sample_id_groups: List, microbatch_group_size_per_vp_
                 else:
                     break
             assert (
-                prev_cp_size == 0 or cp_size <= prev_cp_size
+                allow_arbitrary_group_starts or prev_cp_size == 0 or cp_size <= prev_cp_size
             ), f"split_group: CP size is not decreasing: prev={prev_cp_size}, cur={cp_size}"
             cu_ranks.append(start_rank + cp_size)
             prev_cp_size = cp_size
         if len(cu_ranks) == 2:
             return None, None
 
-        k = 0
-        while cu_ranks[k] < total_hdp_ranks // 2:
-            k += 1
+        if allow_arbitrary_group_starts:
+            k = min(
+                range(1, len(cu_ranks) - 1),
+                key=lambda index: abs(2 * cu_ranks[index] - total_hdp_ranks),
+            )
+        else:
+            k = 0
+            while cu_ranks[k] < total_hdp_ranks // 2:
+                k += 1
 
         old_mb = sample_id_group[: cu_ranks[k]] + [[] for _ in range(total_hdp_ranks - cu_ranks[k])]
         new_mb = sample_id_group[cu_ranks[k] :] + [[] for _ in range(cu_ranks[k])]
@@ -934,6 +963,17 @@ def align_sample_id_groups(sample_id_groups: List, microbatch_group_size_per_vp_
         return new_mb, old_mb
 
     def fill_empty_by_expanding_cp(sample_id_group):
+        if allow_arbitrary_group_starts:
+            # A logical group can absorb any tail length, including one smaller
+            # than its current CP size. Repeating its rank assignment changes
+            # CP only; the two split microbatches retain disjoint sample IDs.
+            tail_start = next(i for i, samples in enumerate(sample_id_group) if not samples)
+            sample_id_group[tail_start:] = [
+                list(sample_id_group[tail_start - 1])
+                for _ in range(len(sample_id_group) - tail_start)
+            ]
+            return sample_id_group
+
         def fill_empty(sample_id_group):
             empty_size = sum(1 for x in sample_id_group if len(x) == 0)
             i = len(sample_id_group) - 1 - empty_size
@@ -963,7 +1003,10 @@ def align_sample_id_groups(sample_id_groups: List, microbatch_group_size_per_vp_
             return sample_id_group
 
         while len(sample_id_group[-1]) == 0:
+            filled_ranks = sum(bool(samples) for samples in sample_id_group)
             sample_id_group = fill_empty(sample_id_group)
+            if sum(bool(samples) for samples in sample_id_group) <= filled_ranks:
+                raise RuntimeError('Cannot fill VPP ranks by expanding the available CP groups')
         return sample_id_group
 
     attempts_since_split = 0

@@ -60,6 +60,30 @@ else:
 _SEED = 42
 
 
+def test_native_dynamic_cp_rejects_mtp_before_initialization(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["test_native_dynamic_cp_mtp"])
+    args = parse_args()
+    args.num_layers = 2
+    args.hidden_size = 128
+    args.num_attention_heads = 8
+    args.max_position_embeddings = 256
+    args.seq_length = 256
+    args.micro_batch_size = 1
+    args.train_iters = 1
+    args.position_embedding_type = "rope"
+    args.mtp_num_layers = 1
+    args.dynamic_context_parallel = True
+    args.calculate_per_token_loss = True
+    args.use_native_cp_transport = True
+    args.max_seqlen_per_dp_cp_rank = 256
+    args.transformer_impl = "transformer_engine"
+    args.distributed_backend = "nccl"
+    args.cp_comm_type = ["p2p"]
+    args.bf16 = True
+    with pytest.raises(ValueError, match="does not support MTP halo communication"):
+        validate_args(args)
+
+
 class TestMultiTokenPredictionLayer:
     def setup_method(self, method):
         os.environ['CUDA_DEVICE_MAX_CONNECTIONS'] = '1'

@@ -20,6 +20,8 @@ from megatron.core.datasets.data_schedule import (
 )
 from megatron.core.datasets.data_schedule_utils import (
     _pack_sequences,
+    align_sample_id_groups,
+    build_packed_microbatches,
     dcp_gpus_needed,
     next_hdp_group_packing_aware,
     reroute_samples_to_dcp_ranks,
@@ -105,6 +107,74 @@ def test_pack_sequences_aligns_each_sequence_to_local_cp_size():
     assert torch.equal(packed['cu_seqlens'], torch.tensor([0, 5, 9], dtype=torch.int32))
     assert torch.equal(packed['cu_seqlens_padded'], torch.tensor([0, 6, 12], dtype=torch.int32))
     assert packed['local_cp_group_start'].item() == 2
+
+
+@pytest.mark.parametrize('sequence_parallel_size', [1, 2, 4, 8])
+def test_arbitrary_cp_packing_preserves_sequence_parallel_alignment(sequence_parallel_size):
+    samples = {
+        sid: {
+            'tokens': torch.arange(length),
+            'padded_seq_len': torch.tensor(length),
+            'original_seq_len': torch.tensor(length),
+        }
+        for sid, length in enumerate([1408, 128])
+    }
+    microbatches, leftovers, exec_times, sample_ids = next_hdp_group_packing_aware(
+        [(0, 1408), (1, 128)],
+        total_gpus=4,
+        max_seq_len_per_rank=512,
+        allow_arbitrary_group_starts=True,
+        sequence_parallel_size=sequence_parallel_size,
+    )
+    assert not leftovers
+    assert sample_ids == [[0]] * 3 + [[1]]
+    for rank in range(4):
+        packed = build_packed_microbatches(
+            samples,
+            [sample_ids],
+            rank,
+            torch.device('cpu'),
+            is_dynamic_cp=True,
+            sequence_parallel_size=sequence_parallel_size,
+        )[0]
+        cp_size = packed['local_cp_size'].item()
+        local_rows = packed['tokens'].numel() // cp_size
+        assert local_rows % sequence_parallel_size == 0
+        assert local_rows <= 512
+        assert exec_times[rank] == local_rows**2 * cp_size
+        assert packed['cu_seqlens'][-1].item() == sum(microbatches[rank])
+
+
+def test_arbitrary_cp_scheduler_accounts_for_sp_padding_at_capacity_boundary():
+    _, leftovers, _, sample_ids = next_hdp_group_packing_aware(
+        [(0, 1536)],
+        total_gpus=3,
+        max_seq_len_per_rank=515,
+        allow_arbitrary_group_starts=True,
+        sequence_parallel_size=8,
+    )
+    # CP3 fits (512 local rows); 1540 would require 520 aligned rows on CP3.
+    assert not leftovers
+    assert sample_ids == [[0]] * 3
+    with pytest.raises(AssertionError, match='requires CP size 4'):
+        next_hdp_group_packing_aware(
+            [(0, 1540)],
+            total_gpus=3,
+            max_seq_len_per_rank=515,
+            allow_arbitrary_group_starts=True,
+            sequence_parallel_size=8,
+        )
+
+    _, leftovers, _, sample_ids = next_hdp_group_packing_aware(
+        [(0, 2040), (1, 128)],
+        total_gpus=6,
+        max_seq_len_per_rank=510,
+        allow_arbitrary_group_starts=True,
+        sequence_parallel_size=8,
+    )
+    # Raw CP4 would exceed capacity after SP padding (512 > 510), so use CP5.
+    assert not leftovers
+    assert sample_ids == [[0]] * 5 + [[1]]
 
 
 def test_scheduler_reroute_uses_dp_all_gather(monkeypatch):
@@ -772,6 +842,43 @@ def test_next_hdp_group_packing_aware_allows_cp5_plus_tail_cp3():
 
     assert leftovers == []
     assert sample_ids == [[0]] * 5 + [[1]] * 3
+
+
+def test_native_dcp_vpp_alignment_handles_cp5_plus_cp3():
+    scheduler = DefaultDynamicCPScheduler(
+        max_seqlen_per_dp_cp_rank=512,
+        cp_size=8,
+        dp_size=1,
+        microbatch_group_size_per_vp_stage=2,
+        allow_arbitrary_group_starts=True,
+        sequence_parallel_size=4,
+    )
+
+    groups = scheduler.get_groups_and_subsamples([(0, 2304), (1, 1408)])
+
+    assert groups == [[[1]] * 8, [[0]] * 8]
+
+
+def test_vpp_alignment_rejects_layout_that_cannot_expand():
+    with pytest.raises(RuntimeError, match='Cannot fill VPP ranks'):
+        align_sample_id_groups([[[0]] * 5 + [[1]] * 3], 2)
+
+
+@pytest.mark.parametrize('group_sizes', [[5, 3], [1, 7], [3, 5], [3, 3, 1, 1], [5, 4, 3, 2, 1, 1]])
+def test_native_dcp_vpp_alignment_preserves_each_sample_once(group_sizes):
+    parent_size = sum(group_sizes)
+    initial_group = [[sid] for sid, size in enumerate(group_sizes) for _ in range(size)]
+    groups = align_sample_id_groups(
+        [initial_group], len(group_sizes), allow_arbitrary_group_starts=True
+    )
+
+    assert len(groups) == len(group_sizes)
+    sample_ids = []
+    for group in groups:
+        assert len(group) == parent_size
+        assert all(rank_samples == group[0] for rank_samples in group)
+        sample_ids.extend(group[0])
+    assert sorted(sample_ids) == list(range(len(group_sizes)))
 
 
 def test_next_hdp_group_packing_aware_supports_every_cp_size_through_16():

@@ -11,7 +11,11 @@ from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_submodu
 from megatron.core.transformer.moe.fused_a2a import HYBRIDEP_TOKEN_ALIGNMENT, reset_hybrid_ep_buffer
 from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
 from megatron.core.transformer.moe.moe_utils import get_capacity
-from megatron.core.transformer.moe.token_dispatcher import MoETokenDispatcher, _HybridEPManager
+from megatron.core.transformer.moe.token_dispatcher import (
+    MoETokenDispatcher,
+    _DeepepV2Manager,
+    _HybridEPManager,
+)
 from megatron.core.transformer.spec_utils import get_submodules
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.typed_torch import apply_module
@@ -80,6 +84,7 @@ def test_set_cudagraph_attr_supports_nested_paths():
 
 def test_hybridep_variable_tokens_are_padded_to_group_max(monkeypatch):
     manager = object.__new__(_HybridEPManager)
+    manager._fused_a2a = SimpleNamespace(HYBRIDEP_TOKEN_ALIGNMENT=HYBRIDEP_TOKEN_ALIGNMENT)
     manager.config = SimpleNamespace(moe_hybridep_pad_variable_tokens=True)
     manager.group = object()
     manager.num_experts = 2
@@ -106,6 +111,27 @@ def test_hybridep_variable_tokens_are_padded_to_group_max(monkeypatch):
     assert manager.token_probs.shape == (expected_num_tokens, manager.num_experts)
     assert not manager.routing_map[local_num_tokens:].any()
     assert not manager.token_probs[local_num_tokens:].any()
+
+
+@pytest.mark.parametrize("available", [False, True])
+def test_deepepv2_initializes_optional_transport_without_v1(monkeypatch, available):
+    # A v2-only module deliberately provides no v1 Buffer/dispatch symbols.
+    fused_a2a = SimpleNamespace(deepepv2_dispatch=object() if available else None)
+    monkeypatch.setattr(
+        "megatron.core.transformer.moe.token_dispatcher._get_fused_a2a_module", lambda: fused_a2a
+    )
+    config = SimpleNamespace(
+        moe_router_dtype="fp32",
+        moe_expert_capacity_factor=None,
+        moe_permute_fusion=False,
+        moe_flex_dispatcher_num_sms=None,
+    )
+    if not available:
+        with pytest.raises(ImportError, match="DeepEP v2 is not installed"):
+            _DeepepV2Manager(object(), 4, 2, 8, config)
+    else:
+        manager = _DeepepV2Manager(object(), 4, 2, 8, config)
+        assert manager._fused_a2a is fused_a2a
 
 
 class MoEModelTestContainer:
@@ -210,7 +236,7 @@ class MoEModelTestContainer:
         probs, indices = apply_module(moe_layer.router)(hidden_states)
         probs = torch.ones_like(probs) / moe_layer.router.topk
 
-        (permuted_local_hidden_states, tokens_per_expert, permuted_probs) = token_permutation(
+        permuted_local_hidden_states, tokens_per_expert, permuted_probs = token_permutation(
             moe_layer.token_dispatcher, hidden_states, probs, indices
         )
 
@@ -253,7 +279,7 @@ class MoEModelTestContainer:
         restored_hidden_states_answer = hidden_states * local_probss.sum(dim=1).unsqueeze(1)
         restored_hidden_states_answer = restored_hidden_states_answer.to(dtype=self.test_dtype)
 
-        (permuted_local_hidden_states, tokens_per_expert, permuted_probs) = token_permutation(
+        permuted_local_hidden_states, tokens_per_expert, permuted_probs = token_permutation(
             moe_layer.token_dispatcher, hidden_states, probs, indices
         )
 
@@ -304,7 +330,7 @@ class MoEModelTestContainer:
         hidden_states.requires_grad = True
 
         probs_1, indices_1 = apply_module(moe_layer.router)(hidden_states)
-        (permuted_input_1, tokens_per_expert, permuted_probs_1) = token_permutation(
+        permuted_input_1, tokens_per_expert, permuted_probs_1 = token_permutation(
             moe_layer.token_dispatcher, hidden_states, probs_1, indices_1
         )
         permuted_input_1 = permuted_input_1 * permuted_probs_1.unsqueeze(-1)
@@ -322,7 +348,7 @@ class MoEModelTestContainer:
         moe_layer_2.load_state_dict(moe_layer.state_dict())
 
         probs_2, indices_2 = apply_module(moe_layer_2.router)(hidden_states)
-        (permuted_input_2, tokens_per_expert, permuted_probs_2) = token_permutation(
+        permuted_input_2, tokens_per_expert, permuted_probs_2 = token_permutation(
             moe_layer_2.token_dispatcher, hidden_states, probs_2, indices_2
         )
         permuted_input_2 = permuted_input_2 * permuted_probs_2.unsqueeze(-1)
@@ -375,7 +401,7 @@ class MoEModelTestContainer:
         hidden_states.requires_grad = True
 
         probs_1, indices_1 = apply_module(moe_layer.router)(hidden_states)
-        (permuted_input_1, tokens_per_expert_1, permuted_probs_1) = token_permutation(
+        permuted_input_1, tokens_per_expert_1, permuted_probs_1 = token_permutation(
             moe_layer.token_dispatcher, hidden_states, probs_1, indices_1
         )
         permuted_input_1 = permuted_input_1 * permuted_probs_1.unsqueeze(-1)
@@ -392,7 +418,7 @@ class MoEModelTestContainer:
         moe_layer_2.load_state_dict(moe_layer.state_dict())
 
         probs_2, indices_2 = apply_module(moe_layer_2.router)(hidden_states)
-        (permuted_input_2, tokens_per_expert_2, permuted_probs_2) = token_permutation(
+        permuted_input_2, tokens_per_expert_2, permuted_probs_2 = token_permutation(
             moe_layer_2.token_dispatcher, hidden_states, probs_2, indices_2
         )
         assert (
