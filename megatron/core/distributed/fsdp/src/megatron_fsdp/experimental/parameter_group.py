@@ -146,6 +146,8 @@ class FsdpParameterGroup:
         )
         self.fsdp_parameters = self._build_fsdp_parameters(parameter_to_fqns)
 
+        # _build_fsdp_parameters() creates views into this storage, which requires a valid
+        # storage size. Release it only after construction; a later unshard reallocates it.
         self._unsharded_model_weight.release_storage()
         self._switch_to_sharded_parameters()
 
