@@ -429,8 +429,14 @@ def test_hybrid_stack_rejects_same_named_config_type():
             post_process=False,
             pg_collection=_make_pg_collection(),
         )
+_BF16 = {"bf16": True, "params_dtype": torch.bfloat16}
+# Current scaling, not delayed: delayed scaling opens one outer fp8 context for the whole stack
+# and the per-layer factory degenerates to nullcontext, so the block's interleaving of the two
+# physical layers' contexts would not actually run.
+_FP8 = {**_BF16, "fp8": "e4m3", "fp8_recipe": "tensorwise"}
+
 TWO_STAGE_ATTENTION_CASES = [
-    pytest.param(Symbols.MAMBA, hybrid_stack_spec, {}, id="mamba"),
+    pytest.param(Symbols.MAMBA, hybrid_stack_spec, _BF16, id="mamba"),
     pytest.param(
         Symbols.GDN,
         hybrid_stack_spec,
@@ -442,7 +448,8 @@ TWO_STAGE_ATTENTION_CASES = [
         marks=pytest.mark.skipif(not HAVE_GDN, reason="FLA is not installed"),
         id="gdn",
     ),
-    pytest.param(Symbols.ATTENTION, hybrid_stack_spec, {}, id="attention"),
+    pytest.param(Symbols.ATTENTION, hybrid_stack_spec, _BF16, id="attention"),
+    pytest.param(Symbols.ATTENTION, hybrid_stack_spec, _FP8, id="attention-fp8"),
     pytest.param(
         Symbols.MAMBA,
         gated_delta_product_stack_spec,
@@ -859,6 +866,7 @@ class TestHybridBlock:
             add_bias_linear=False,
             hidden_dropout=0.0,
             attention_dropout=0.0,
+            **_BF16,
         )
         shortcut = block.layers[0]
         assert isinstance(shortcut, ShortcutMoEBlock)

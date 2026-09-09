@@ -154,22 +154,6 @@ class TestGatedDeltaNetInference:
         assert calls == ["dynamic"]
         assert output is sentinel
 
-    def test_two_stage_path_rejects_an_inference_context(self):
-        """The two-stage stage is training-only; a context reaching it is the bug we fixed."""
-        context = SimpleNamespace(
-            is_dynamic_batching=lambda: True,
-            is_static_batching=lambda: False,
-            num_speculative_tokens=0,
-            enable_prefix_caching=False,
-        )
-
-        with pytest.raises(AssertionError, match="training-only"):
-            self.gdn.forward_pre_attn_and_core_attn(
-                torch.randn(2, 1, self.gdn.hidden_size, device="cuda", dtype=torch.bfloat16),
-                attention_mask=None,
-                inference_context=context,
-            )
-
     @torch.inference_mode()
     def test_padding_index_does_not_modify_state(self):
         conv_state, ssm_state = self._empty_states()

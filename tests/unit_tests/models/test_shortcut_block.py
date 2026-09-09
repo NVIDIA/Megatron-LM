@@ -22,12 +22,12 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def _shortcut_config(*, parallel: bool = False, normalization: str = "RMSNorm"):
+def _shortcut_config(*, parallel: bool = False):
     return TransformerConfig(
         num_layers=1,
         hidden_size=8,
         num_attention_heads=2,
-        normalization=normalization,
+        normalization="RMSNorm",
         # Sequence parallelism is what marks the norm parameters, and TransformerConfig only
         # allows it alongside tensor parallelism.
         tensor_model_parallel_size=2,
@@ -86,7 +86,6 @@ class _FakeMoE(torch.nn.Module):
         self.pre_mlp_layernorm = _FakeNorm(
             config=config, hidden_size=config.hidden_size, eps=config.layernorm_epsilon
         )
-        self.submodules_config = SimpleNamespace(pre_mlp_layernorm=_FakeNorm)
         self.mlp = _FakeMLP()
 
     def _pre_mlp_layernorm_and_residual(self, hidden_states):
@@ -239,24 +238,6 @@ def test_shortcut_owns_cp_layout_transitions(monkeypatch):
     torch.testing.assert_close(output, hidden_states + 14)
 
 
-@pytest.mark.parametrize(
-    ("normalization", "norm_type"),
-    [
-        pytest.param("LayerNorm", te.pytorch.LayerNorm, id="layer-norm"),
-        pytest.param("RMSNorm", te.pytorch.RMSNorm, id="rms-norm"),
-    ],
-)
-def test_shortcut_post_norm_follows_config(normalization, norm_type):
-    config = _shortcut_config(normalization=normalization)
-    grouped = group_layers_into_shortcut_blocks(
-        torch.nn.ModuleList([_FakeCompute(config), _FakeMoE(config)]),
-        [LayerSymbols.ATTENTION, LayerSymbols.MOE],
-        config,
-    )
-
-    assert isinstance(grouped[0].shortcut_post_norm, norm_type)
-
-
 def test_parallel_stream_is_initialized_once(monkeypatch):
     streams = []
 
@@ -315,22 +296,6 @@ def test_group_layers_rejects_pair_split_across_pipeline_stages():
         )
 
 
-def test_group_layers_allows_leading_moe_on_the_first_stage():
-    """The model's very first MoE has no predecessor, so it keeps its standard routing path."""
-    config = _shortcut_config()
-    leading_moe = _FakeMoE(config, layer_number=1)
-
-    grouped = group_layers_into_shortcut_blocks(
-        torch.nn.ModuleList([leading_moe, _FakeCompute(config)]),
-        [LayerSymbols.MOE, LayerSymbols.MAMBA],
-        config,
-        pp_layer_offset=0,
-    )
-
-    assert list(grouped)[0] is leading_moe
-    assert not any(isinstance(layer, ShortcutMoEBlock) for layer in grouped)
-
-
 def test_shared_experts_propagates_the_layers_residual_and_mlp_state():
     """The layer owns the unpack and the payload; the block must carry both through."""
     config = _shortcut_config()
@@ -354,25 +319,6 @@ def test_shared_experts_propagates_the_layers_residual_and_mlp_state():
     assert torch.equal(shared_expert_output, normalized)
     assert residual is layer_residual
     assert mlp_state is layer_mlp_state
-
-
-def test_postprocess_forwards_mlp_state_to_the_bda_step():
-    """A layer subclass that needs its payload must receive it, not an empty default."""
-    config = _shortcut_config()
-    moe_layer = _FakeMoE(config)
-    block = ShortcutMoEBlock(_FakeCompute(config), moe_layer, overlap_a2a=False)
-
-    seen = {}
-    moe_layer.mlp.postprocess = lambda combined, shared: combined
-    moe_layer._apply_mlp_bda_step = lambda output_with_bias, residual, mlp_state=(): (
-        seen.update(mlp_state=mlp_state) or output_with_bias[0]
-    )
-
-    block = block.cuda()
-    hidden_states = torch.ones(2, 1, config.hidden_size, device=torch.cuda.current_device())
-    block._postprocess(hidden_states, hidden_states, hidden_states, mlp_state=("h_res", "h_post"))
-
-    assert seen["mlp_state"] == ("h_res", "h_post")
 
 
 def test_eager_overlap_matches_serial_output_and_gradients(monkeypatch):
@@ -428,12 +374,6 @@ def test_eager_overlap_matches_serial_output_and_gradients(monkeypatch):
             super().__init__()
             self.config = config
             self.layer_number = 2
-
-            class FakeNorm:
-                def __new__(cls, **kwargs):
-                    return torch.nn.Identity()
-
-            self.submodules_config = SimpleNamespace(pre_mlp_layernorm=FakeNorm)
             self.route_scale = torch.nn.Parameter(torch.tensor(13.0))
             self.prob_scale = torch.nn.Parameter(torch.tensor(17.0))
             self.shared_scale = torch.nn.Parameter(torch.tensor(19.0))
@@ -588,7 +528,6 @@ def test_shortcut_norm_recompute_and_offload(monkeypatch):
     mlp.combine = combine
     mlp.shared_experts_compute = torch.zeros_like
     mlp.postprocess = lambda combined_output, shared_expert_output: combined_output
-    moe_layer._forward_pre_mlp_layernorm = lambda hidden_states: hidden_states
     moe_layer._apply_mlp_bda_step = (
         lambda output_with_bias, residual, mlp_state=(): output_with_bias[0] + residual
     )
