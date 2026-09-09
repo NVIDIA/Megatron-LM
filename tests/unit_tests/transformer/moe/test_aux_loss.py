@@ -465,10 +465,16 @@ class TestRouterAuxLoss:
     def test_aux_loss_fusion_equivalence(self, aux_type):
         # Compare fused vs unfused aux loss path to ensure numerical equivalence
         router_ref = self.new_router(
-            moe_router_load_balancing_type=aux_type, moe_aux_loss_coeff=1.0, moe_router_dtype="fp32"
+            moe_router_load_balancing_type=aux_type,
+            moe_aux_loss_coeff=1.0,
+            moe_router_dtype="fp32",
+            moe_router_fusion=False,
         ).cuda()
         router_fused = self.new_router(
-            moe_router_load_balancing_type=aux_type, moe_aux_loss_coeff=1.0, moe_router_dtype="fp32"
+            moe_router_load_balancing_type=aux_type,
+            moe_aux_loss_coeff=1.0,
+            moe_router_dtype="fp32",
+            moe_router_fusion=True,
         ).cuda()
 
         with torch.no_grad():
@@ -485,7 +491,6 @@ class TestRouterAuxLoss:
         loss_name = loss_name_map[aux_type]
 
         # Unfused
-        router_ref.config.moe_router_fusion = False
         clear_aux_losses_tracker()
         router_ref.weight.grad = None
         scores_ref, routing_ref = router_ref(hidden_states)
@@ -497,7 +502,6 @@ class TestRouterAuxLoss:
         reduce_from_tensor_model_parallel_region(aux_loss_ref, router_ref.tp_cp_group)
 
         # Fused
-        router_fused.config.moe_router_fusion = True
         clear_aux_losses_tracker()
         router_fused.weight.grad = None
         scores_fused, routing_fused = router_fused(hidden_states)

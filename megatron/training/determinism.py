@@ -153,7 +153,7 @@ def apply_determinism_to_args(args) -> None:
         if (actual := getattr(args, name)) != required
     ]
 
-    # Mirrors TransformerConfig.moe_router_aux_loss_fusion_enabled; no config exists yet here.
+    # Mirrors the TransformerConfig.__post_init__ fallback; no config exists yet here.
     aux_loss_fusion = getattr(args, AUX_LOSS_FUSION_ARG, None)
     if aux_loss_fusion is None:
         aux_loss_fusion = getattr(args, "moe_router_fusion", False)

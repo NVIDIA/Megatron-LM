@@ -710,17 +710,15 @@ def test_topk_routing_precomputed_indices_equivalence(score_function, use_pre_so
 
 
 def test_moe_router_aux_loss_fusion_defaults_to_router_fusion():
-    """Unset follows moe_router_fusion, including after post-construction mutation."""
+    """Unset resolves to moe_router_fusion; an explicit value is left alone."""
     kwargs = dict(num_layers=1, hidden_size=8, num_attention_heads=1, num_moe_experts=4)
 
-    config = TransformerConfig(**kwargs)
-    assert config.moe_router_aux_loss_fusion is None
-    assert config.moe_router_aux_loss_fusion_enabled is False
-    config.moe_router_fusion = True
-    assert config.moe_router_aux_loss_fusion_enabled is True
+    for routing in (False, True):
+        config = TransformerConfig(moe_router_fusion=routing, **kwargs)
+        assert config.moe_router_aux_loss_fusion is routing
 
     for routing, aux in ((True, False), (False, True)):
         config = TransformerConfig(
             moe_router_fusion=routing, moe_router_aux_loss_fusion=aux, **kwargs
         )
-        assert config.moe_router_aux_loss_fusion_enabled is aux
+        assert config.moe_router_aux_loss_fusion is aux
