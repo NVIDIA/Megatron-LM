@@ -365,11 +365,27 @@ class TransformerConfig(ModelParallelConfig):
     dsa_indexer_scoring_relu: bool = True
     """Whether DSA indexer should apply ReLU to q@k^T scores before weighting."""
 
+    dsa_indexer_kpool_fp8: bool = False
+    """Match FP8 KPool index scores
+       model weights and attention remain in their configured dtype."""
+
     dsa_indexer_k_norm_epsilon: Optional[float] = None
     """Optional epsilon override for the DSA indexer key LayerNorm."""
 
     dsa_indexer_k_norm_fp32: bool = False
     """Whether DSA indexer key LayerNorm should run on fp32 inputs."""
+
+    mla_disable_attention_fp8: bool = False
+    """Force MLA attention GEMMs (q_a_proj, q_b_proj, kv_a_proj, o_proj) to BF16
+    even under FP8 training. This aligns the actor's attention path with vLLM
+    rollout, which runs the main MLA attention in BF16. Only the attention GEMMs
+    (~2.5% of model params) are affected; MoE experts stay FP8."""
+
+    dsa_indexer_kpool: int = 1
+    """Number of keys per softmax-weighted indexer pool; 1 keeps per-token selection."""
+
+    dsa_indexer_kpool_always_select_tail: bool = False
+    """Append each query's incomplete causal pool after the selected history tokens."""
 
     ####################
     # Compressed sparse attention
