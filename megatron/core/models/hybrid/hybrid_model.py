@@ -482,6 +482,8 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         if in_inference_mode:
             assert runtime_gather_output, "Inference must always gather TP logits"
 
+        use_precomputed_mtp_embeddings = decoder_input is not None
+
         # Decoder embedding.
         if decoder_input is not None:
             pass
@@ -596,6 +598,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 input_ids=input_ids,
                 position_ids=position_ids,
                 hidden_states=hidden_states,
+                decoder_input=decoder_input if use_precomputed_mtp_embeddings else None,
                 mhc_multistream=mhc_multistream,
                 labels=labels,
                 loss_mask=loss_mask,
@@ -603,7 +606,8 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 packed_seq_params=packed_seq_params,
                 cp_batch=cp_batch,
             )
-            assert mtp_inputs.input_ids is not None and mtp_inputs.position_ids is not None
+            if mtp_inputs.decoder_input is None:
+                assert mtp_inputs.input_ids is not None and mtp_inputs.position_ids is not None
             mtp_hidden_states = self.mtp(
                 input_ids=mtp_inputs.input_ids,
                 position_ids=mtp_inputs.position_ids,
@@ -614,6 +618,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 rotary_pos_emb=rotary_pos_emb,
                 packed_seq_params=mtp_inputs.packed_seq_params,
                 embedding=self.embedding,
+                decoder_input=mtp_inputs.decoder_input,
                 mtp_input_mask=mtp_inputs.mtp_input_mask,
                 packed_seq_params_by_layout=packed_seq_params_by_layout,
                 cp_layout_plan=cp_layout_plan,
