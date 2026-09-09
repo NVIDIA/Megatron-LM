@@ -56,6 +56,121 @@ class _OwnedRange:
     buffer_relative_offset: int
 
 
+@dataclasses.dataclass
+class _MXFP8LocalTensor:
+    """Packed MXFP8 physical planes and the TE views they define."""
+
+    rowwise_data: torch.Tensor
+    columnwise_data: torch.Tensor
+    rowwise_scale_inv: torch.Tensor
+    columnwise_scale_inv: torch.Tensor
+    shapes: tuple[torch.Size | None, ...]
+    rowwise_scale_shapes: tuple[torch.Size | None, ...]
+    columnwise_scale_shapes: tuple[torch.Size | None, ...]
+    offsets: tuple[int | None, ...]
+    scale_offsets: tuple[int, ...]
+    columnwise_scale_offsets: tuple[int, ...]
+    tensors: tuple[torch.Tensor | None, ...]
+
+    @classmethod
+    def allocate(
+        cls,
+        shapes: tuple[torch.Size | None, ...],
+        data_numel: int,
+        data_offsets: tuple[int | None, ...],
+        device: torch.device | str,
+    ) -> "_MXFP8LocalTensor":
+        """Allocate packed MXFP8 planes for local logical tensor shapes."""
+        quantizer = MXFP8Quantizer(tex.DType.kFloat8E4M3)
+        placeholders = [
+            (
+                None
+                if shape is None
+                else quantizer(torch.zeros(shape, dtype=torch.bfloat16, device=device))
+            )
+            for shape in shapes
+        ]
+        rowwise_scale_shapes = tuple(
+            None if tensor is None else tensor._rowwise_scale_inv.shape for tensor in placeholders
+        )
+        columnwise_scale_shapes = tuple(
+            None if tensor is None else tensor._columnwise_scale_inv.shape
+            for tensor in placeholders
+        )
+
+        def offsets(sizes: Iterable[int]) -> tuple[int, ...]:
+            result = [0]
+            for size in sizes:
+                result.append(result[-1] + size)
+            return tuple(result)
+
+        scale_offsets = offsets(
+            0 if shape is None else shape.numel() for shape in rowwise_scale_shapes
+        )
+        columnwise_scale_offsets = offsets(
+            0 if shape is None else shape.numel() for shape in columnwise_scale_shapes
+        )
+        storage = cls(
+            rowwise_data=torch.empty(data_numel, dtype=torch.uint8, device=device),
+            columnwise_data=torch.empty(data_numel, dtype=torch.uint8, device=device),
+            rowwise_scale_inv=torch.empty(scale_offsets[-1], dtype=torch.uint8, device=device),
+            columnwise_scale_inv=torch.empty(
+                columnwise_scale_offsets[-1], dtype=torch.uint8, device=device
+            ),
+            shapes=shapes,
+            rowwise_scale_shapes=rowwise_scale_shapes,
+            columnwise_scale_shapes=columnwise_scale_shapes,
+            offsets=data_offsets,
+            scale_offsets=scale_offsets,
+            columnwise_scale_offsets=columnwise_scale_offsets,
+            tensors=(),
+        )
+        storage.tensors = tuple(storage._make_tensor(index) for index in range(len(shapes)))
+        return storage
+
+    def physical_tensors(self) -> tuple[torch.Tensor, ...]:
+        """Return the packed physical tensors that own all MXFP8 storage."""
+        return (
+            self.rowwise_data,
+            self.columnwise_data,
+            self.rowwise_scale_inv,
+            self.columnwise_scale_inv,
+        )
+
+    def tensor(self, index: int) -> torch.Tensor | None:
+        """Return TE's logical MXFP8 tensor view for one packed member."""
+        return self.tensors[index]
+
+    def _make_tensor(self, index: int) -> torch.Tensor | None:
+        """Create one persistent TE wrapper over this payload's plane views."""
+        shape = self.shapes[index]
+        start = self.offsets[index]
+        if shape is None or start is None:
+            return None
+        end = start + shape.numel()
+        scale_start, scale_end = self.scale_offsets[index : index + 2]
+        columnwise_scale_start, columnwise_scale_end = self.columnwise_scale_offsets[
+            index : index + 2
+        ]
+        return MXFP8Tensor(
+            shape=shape,
+            dtype=torch.bfloat16,
+            rowwise_data=self.rowwise_data.narrow(0, start, end - start).view(shape),
+            rowwise_scale_inv=self.rowwise_scale_inv.narrow(
+                0, scale_start, scale_end - scale_start
+            ).view(self.rowwise_scale_shapes[index]),
+            columnwise_data=self.columnwise_data.narrow(0, start, end - start).view(shape),
+            columnwise_scale_inv=self.columnwise_scale_inv.narrow(
+                0, columnwise_scale_start, columnwise_scale_end - columnwise_scale_start
+            ).view(self.columnwise_scale_shapes[index]),
+            fp8_dtype=tex.DType.kFloat8E4M3,
+            quantizer=MXFP8Quantizer(tex.DType.kFloat8E4M3),
+            with_gemm_swizzled_scales=False,
+            device=self.rowwise_data.device,
+            requires_grad=False,
+        )
+
+
 def _validate_placements(placements: Iterable[Placement]) -> None:
     """Validate DBuffer placements form a supported contiguous local layout."""
     seen_shard = False
@@ -98,7 +213,7 @@ class DBuffer:
     placements: tuple[Placement, ...]
     layout: GlobalLayout
     offset: int
-    local_tensor: torch.Tensor
+    local_tensor: torch.Tensor | _MXFP8LocalTensor
 
     def __init__(
         self,
@@ -135,14 +250,15 @@ class DBuffer:
         )
 
         self.offset, local_numel = self.layout.get_local_range(self.mesh, self.placements)
+        self._local_numel = local_numel
         if dtype != torch.uint8:
             self.local_tensor = torch.empty(local_numel, dtype=dtype, device=device)
             return
 
         if not HAVE_TE_MXFP8TENSOR:
             raise RuntimeError("MXFP8 DBuffer construction requires Transformer Engine.")
-        if len(tensor_shapes) != 1 or len(tensor_shapes[0]) != 2:
-            raise NotImplementedError("Experimental MXFP8 MFSDP supports one 2D tensor per group.")
+        if any(len(shape) != 2 for shape in tensor_shapes):
+            raise NotImplementedError("Experimental MXFP8 MFSDP supports 2D tensors only.")
         if mesh.ndim != 1 or any(
             not isinstance(placement, (Replicate, Shard)) for placement in placements
         ):
@@ -150,33 +266,45 @@ class DBuffer:
                 "Experimental MXFP8 MFSDP supports one-dimensional Replicate/Shard meshes."
             )
 
-        if all(isinstance(placement, Replicate) for placement in placements):
-            local_shape = tensor_shapes[0]
-        else:
-            if tensor_shapes[0][0] % _MXFP8_BLOCK_SIZE or mesh.size() != 2:
-                raise NotImplementedError("MXFP8 MFSDP requires two equal 32-row-block shards.")
-            local_rows = tensor_shapes[0][0] // mesh.size()
-            if local_rows % _MXFP8_BLOCK_SIZE:
-                raise NotImplementedError("MXFP8 MFSDP requires two equal 32-row-block shards.")
-            local_shape = torch.Size((local_rows, tensor_shapes[0][1]))
-
-        # Quantizing zeros is the public, layout-driven way to allocate both
-        # MXFP8 representations and their scale tensors. sync_from_main()
-        # overwrites the placeholder values before the buffer is used.
-        self.local_tensor = MXFP8Quantizer(tex.DType.kFloat8E4M3)(
-            torch.zeros(local_shape, dtype=torch.bfloat16, device=device)
+        local_shapes: list[torch.Size | None] = []
+        data_offsets: list[int | None] = []
+        for index, shape in enumerate(tensor_shapes):
+            owned_range = self._get_owned_range(index)
+            if owned_range is None:
+                local_shapes.append(None)
+                data_offsets.append(None)
+                continue
+            row_size = shape[1]
+            if owned_range.tensor_relative_offset % row_size or owned_range.numel % row_size:
+                raise NotImplementedError("MXFP8 MFSDP requires dim-0 tensor shards.")
+            local_shape = torch.Size((owned_range.numel // row_size, row_size))
+            local_end = owned_range.tensor_relative_offset + owned_range.numel
+            if (
+                owned_range.tensor_relative_offset % (128 * row_size)
+                or (local_end < shape.numel() and local_end % (128 * row_size))
+                or local_shape[1] % _MXFP8_BLOCK_SIZE
+            ):
+                raise NotImplementedError(
+                    "MXFP8 MFSDP requires 32-column tensors and 128-row internal shard boundaries."
+                )
+            local_shapes.append(local_shape)
+            data_offsets.append(owned_range.buffer_relative_offset)
+        self.local_tensor = _MXFP8LocalTensor.allocate(
+            tuple(local_shapes), local_numel, tuple(data_offsets), device
         )
 
     @property
     def dtype(self) -> torch.dtype:
         """Dtype of the buffer's physical storage."""
         if self.is_mxfp8:
-            return self.local_tensor._rowwise_data.dtype
+            return self.local_tensor.rowwise_data.dtype
         return self.local_tensor.dtype
 
     @property
     def device(self) -> torch.device:
         """Device of the stored tensor."""
+        if self.is_mxfp8:
+            return self.local_tensor.rowwise_data.device
         return self.local_tensor.device
 
     @property
@@ -191,17 +319,12 @@ class DBuffer:
     @property
     def is_mxfp8(self) -> bool:
         """Whether this buffer is backed by a TE MXFP8 logical tensor."""
-        return is_mxfp8_tensor(self.local_tensor)
+        return isinstance(self.local_tensor, _MXFP8LocalTensor)
 
     def _mxfp8_physical_tensors(self) -> tuple[torch.Tensor, ...]:
         """Return the physical tensors owned by this buffer's TE wrapper."""
         assert self.is_mxfp8
-        return (
-            self.local_tensor._rowwise_data,
-            self.local_tensor._columnwise_data,
-            self.local_tensor._rowwise_scale_inv,
-            self.local_tensor._columnwise_scale_inv,
-        )
+        return self.local_tensor.physical_tensors()
 
     @staticmethod
     def _compact_mxfp8_scale(tensor: torch.Tensor, *, columnwise: bool) -> torch.Tensor:
@@ -256,7 +379,7 @@ class DBuffer:
         tensor_start = self.layout.tensor_to_offset[tensor_index]
         tensor_end = tensor_start + self.layout.tensor_shapes[tensor_index].numel()
         buffer_start = self.offset
-        buffer_end = self.offset + self.local_tensor.numel()
+        buffer_end = self.offset + self._local_numel
 
         overlap_start = max(tensor_start, buffer_start)
         overlap_end = min(tensor_end, buffer_end)
@@ -314,6 +437,7 @@ class DBuffer:
         buffer.layout = layout
         buffer.offset = offset
         buffer.local_tensor = local_buffer
+        buffer._local_numel = local_numel
         return buffer
 
     def view(self, placements: Iterable[Placement]) -> "DBuffer":
@@ -450,10 +574,11 @@ class DBuffer:
     def sync_from_main(self, main_weight: "DBuffer") -> None:
         """Refresh this compute buffer from optimizer-layout master weights."""
         if self.is_mxfp8:
-            # MXFP8 has one logical tensor and TE performs the quantization into
-            # the physical data and inverse-scale tensors owned by local_tensor.
             with torch.no_grad():
-                self.local_tensor.quantize_(main_weight.get_local_tensor(0))
+                for index in range(len(self.layout.tensor_shapes)):
+                    destination = self._get_mxfp8_tensor(index)
+                    if destination is not None:
+                        destination.quantize_(main_weight.get_local_tensor(index))
         else:
             main_weight.cast(self.dtype, out=self)
 
@@ -478,7 +603,7 @@ class DBuffer:
     def initialize_unsharded_parameter(self, parameter: "torch.nn.Parameter", index: int) -> None:
         """Install this buffer's initial local tensor into one module parameter."""
         if parameter.is_meta or self.is_mxfp8:
-            local_tensor = self.local_tensor if self.is_mxfp8 else self.get_local_tensor(index)
+            local_tensor = self.get_local_tensor(index)
             materialized = torch.nn.Parameter(local_tensor, requires_grad=parameter.requires_grad)
             torch.utils.swap_tensors(parameter, materialized)
         else:
@@ -488,8 +613,8 @@ class DBuffer:
     def install_unsharded_parameter_views(self, parameters: Iterable["torch.nn.Parameter"]) -> None:
         """Point ordinary unsharded parameters at this buffer's current local views."""
         if self.is_mxfp8:
-            # The TE wrapper was installed once by initialize_unsharded_parameter().
-            # Its physical tensors are updated in place by materialize_unsharded_from().
+            # TE wrappers installed by initialize_unsharded_parameter() retain views
+            # into the packed physical planes and are updated in place.
             return
         for index, parameter in enumerate(parameters):
             parameter.data = self.get_local_tensor(index)
@@ -595,20 +720,23 @@ class DBuffer:
         if isinstance(source_placement, Shard) and isinstance(destination_placement, Replicate):
             return self.allgather(changed_axis, out=out)
         if isinstance(source_placement, Replicate) and isinstance(destination_placement, Shard):
-            local_rows = self.local_tensor.shape[0] // self.mesh.size(changed_axis)
-            source_shard = self.local_tensor.split(local_rows, dim=0)[
-                self.mesh.get_local_rank(changed_axis)
-            ]
             for destination, source in zip(
-                out._mxfp8_physical_tensors(),
-                (
-                    source_shard._rowwise_data,
-                    source_shard._columnwise_data,
-                    source_shard._rowwise_scale_inv,
-                    source_shard._columnwise_scale_inv,
-                ),
+                out._mxfp8_physical_tensors()[:2], self._mxfp8_physical_tensors()[:2]
             ):
-                destination.copy_(source)
+                destination.copy_(source.narrow(0, out.offset - self.offset, out._local_numel))
+            for index in range(len(self.layout.tensor_shapes)):
+                destination = out._get_mxfp8_tensor(index)
+                if destination is None:
+                    continue
+                owned_range = out._get_owned_range(index)
+                assert owned_range is not None
+                source = self.get_local_tensor(index)
+                row_size = source.shape[1]
+                destination.copy_(
+                    source.narrow(
+                        0, owned_range.tensor_relative_offset // row_size, destination.shape[0]
+                    )
+                )
             return out
         raise NotImplementedError(
             f"Unsupported MXFP8 DBuffer placement transition: {source_placement!r} -> "
@@ -647,25 +775,57 @@ class DBuffer:
         if not isinstance(out.placements[mesh_axis], Replicate):
             raise ValueError("MXFP8 all-gather out buffer must replicate the gathered mesh axis.")
         group = self.mesh.get_group(mesh_axis)
-        dist.all_gather_into_tensor(
-            out.local_tensor._rowwise_data, self.local_tensor._rowwise_data, group=group
-        )
-        dist.all_gather_into_tensor(
-            out.local_tensor._columnwise_data, self.local_tensor._columnwise_data, group=group
-        )
-        for columnwise in (False, True):
-            source = self._compact_mxfp8_scale(self.local_tensor, columnwise=columnwise)
-            gathered = torch.empty(
-                (self.mesh.size(mesh_axis), *source.shape), dtype=source.dtype, device=source.device
+        for destination, source in zip(
+            out._mxfp8_physical_tensors()[:2], self._mxfp8_physical_tensors()[:2]
+        ):
+            dist.all_gather_into_tensor(destination, source, group=group)
+        for index, shape in enumerate(self.layout.tensor_shapes):
+            source_tensor = self._get_mxfp8_tensor(index)
+            destination_tensor = out.get_local_tensor(index)
+            owned_range = self._get_owned_range(index)
+            local_rows = 0 if owned_range is None else owned_range.numel // shape[1]
+            row_counts = torch.empty(
+                self.mesh.size(mesh_axis), dtype=torch.int64, device=self.device
             )
-            dist.all_gather_into_tensor(gathered, source, group=group)
-            compact = gathered.flatten(0, 1)
-            destination = (
-                out.local_tensor._columnwise_scale_inv
-                if columnwise
-                else out.local_tensor._rowwise_scale_inv
+            dist.all_gather_into_tensor(
+                row_counts,
+                torch.tensor([local_rows], dtype=torch.int64, device=self.device),
+                group=group,
             )
-            self._unpack_mxfp8_scale(destination, compact)
+            max_rows = int(row_counts.max())
+            for columnwise in (False, True):
+                scale_rows = local_rows // _MXFP8_BLOCK_SIZE if columnwise else local_rows
+                max_scale_rows = max_rows // _MXFP8_BLOCK_SIZE if columnwise else max_rows
+                scale_columns = shape[1] if columnwise else shape[1] // _MXFP8_BLOCK_SIZE
+                source = torch.zeros(
+                    (max_scale_rows, scale_columns), dtype=torch.uint8, device=self.device
+                )
+                if source_tensor is not None:
+                    source[:scale_rows].copy_(
+                        self._compact_mxfp8_scale(source_tensor, columnwise=columnwise)
+                    )
+                gathered = torch.empty(
+                    (self.mesh.size(mesh_axis), max_scale_rows, scale_columns),
+                    dtype=torch.uint8,
+                    device=self.device,
+                )
+                dist.all_gather_into_tensor(gathered, source, group=group)
+                compact = torch.empty(
+                    (shape[0] // _MXFP8_BLOCK_SIZE if columnwise else shape[0], scale_columns),
+                    dtype=torch.uint8,
+                    device=self.device,
+                )
+                offset = 0
+                for rank, rows in enumerate(row_counts.tolist()):
+                    count = rows // _MXFP8_BLOCK_SIZE if columnwise else rows
+                    compact[offset : offset + count].copy_(gathered[rank, :count])
+                    offset += count
+                destination = (
+                    destination_tensor._columnwise_scale_inv
+                    if columnwise
+                    else destination_tensor._rowwise_scale_inv
+                )
+                self._unpack_mxfp8_scale(destination, compact)
         return out
 
     def allreduce(self, mesh_axis: int, *, out: "DBuffer | None" = None) -> "DBuffer":
@@ -725,10 +885,14 @@ class DBuffer:
         Flat placements shard dim 0, so the returned view preserves all
         non-leading dimensions and only changes the leading dimension.
         """
-        if self.is_mxfp8:
-            raise NotImplementedError("MXFP8 DBuffers do not expose flat-storage tensor views.")
         shape = self.layout.tensor_shapes[index]
         owned_range = self._get_owned_range(index)
+
+        if self.is_mxfp8:
+            tensor = self._get_mxfp8_tensor(index)
+            if tensor is not None:
+                return tensor
+            return torch.empty((0, *shape[1:]), dtype=torch.uint8, device=self.device)
 
         row_size = non_leading_numel(shape)
         if owned_range is None:
@@ -743,6 +907,11 @@ class DBuffer:
         return self.local_tensor.narrow(
             0, owned_range.buffer_relative_offset, owned_range.numel
         ).view(local_shape)
+
+    def _get_mxfp8_tensor(self, index: int) -> torch.Tensor | None:
+        """Return this rank's TE wrapper for one logical MXFP8 tensor, if owned."""
+        assert self.is_mxfp8
+        return self.local_tensor.tensor(index)
 
     def get_dtensor(self, index: int) -> DTensor:
         """Return logical tensor ``index`` as a DTensor."""

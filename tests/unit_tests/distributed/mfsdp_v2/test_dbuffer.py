@@ -730,7 +730,7 @@ def test_2d_mesh_replicate_flat_view_to_flat_flat(distributed_setup):
 
 
 def test_mxfp8_linear_training_step_uses_dbuffer(distributed_setup):
-    """A TE MXFP8 Linear uses DBuffer-owned physical storage on two ranks."""
+    """Two TE MXFP8 Linear weights share packed DBuffer-owned storage on two ranks."""
     te = pytest.importorskip("transformer_engine")
     if distributed_setup.world_size != 2:
         pytest.skip("MXFP8 DBuffer coverage requires exactly two ranks.")
@@ -739,10 +739,15 @@ def test_mxfp8_linear_training_step_uses_dbuffer(distributed_setup):
 
     recipe = te.common.recipe.MXFP8BlockScaling(fp8_format=te.common.recipe.Format.HYBRID)
     with te.pytorch.quantized_model_init(recipe=recipe, preserve_high_precision_init_val=True):
-        linear = te.pytorch.Linear(
-            64, 64, bias=False, params_dtype=torch.bfloat16, device=distributed_setup.device
+        linear = torch.nn.Sequential(
+            te.pytorch.Linear(
+                256, 256, bias=False, params_dtype=torch.bfloat16, device=distributed_setup.device
+            ),
+            te.pytorch.Linear(
+                256, 512, bias=False, params_dtype=torch.bfloat16, device=distributed_setup.device
+            ),
         )
-    original_rowwise_data = linear.weight._rowwise_data
+    original_rowwise_data = linear[0].weight._rowwise_data
 
     mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
     placements = Placements(
@@ -760,14 +765,23 @@ def test_mxfp8_linear_training_step_uses_dbuffer(distributed_setup):
     assert parameter_group.model_weight.is_mxfp8
     assert parameter_group.model_weight.dtype is torch.uint8
     assert parameter_group.dtype is torch.bfloat16
-    assert parameter_group.model_weight.local_tensor.shape == (64, 64)
+    assert len(parameter_group.fsdp_parameters) == 2
+    assert [parameter_group.model_weight.get_local_tensor(index).shape for index in range(2)] == [
+        (256, 256),
+        (512, 256),
+    ]
     assert parameter_group.post_optimizer_model_weight is not parameter_group.model_weight
-    assert parameter_group.post_optimizer_model_weight.local_tensor.shape == (32, 64)
+    assert sum(
+        parameter_group.post_optimizer_model_weight.get_local_tensor(index).numel()
+        for index in range(2)
+    ) == (256 * 256) + (128 * 256)
     assert parameter_group._unsharded_model_weight.is_mxfp8
-    assert parameter_group._unsharded_model_weight.local_tensor.shape == (64, 64)
+    assert [
+        parameter_group._unsharded_model_weight.get_local_tensor(index).shape for index in range(2)
+    ] == [(256, 256), (512, 256)]
     unsharded_parameter = parameter_group.fsdp_parameters[0].unsharded
     assert unsharded_parameter._rowwise_data.data_ptr() == (
-        parameter_group._unsharded_model_weight.local_tensor._rowwise_data.data_ptr()
+        parameter_group._unsharded_model_weight.get_local_tensor(0)._rowwise_data.data_ptr()
     )
     assert unsharded_parameter._rowwise_data.data_ptr() != original_rowwise_data.data_ptr()
 
@@ -775,7 +789,7 @@ def test_mxfp8_linear_training_step_uses_dbuffer(distributed_setup):
     fully_shard_optimizer(optimizer)
     main_weight_before = parameter_group.main_weight.local_tensor.detach().clone()
 
-    x = torch.randn(32, 64, dtype=torch.bfloat16, device=distributed_setup.device)
+    x = torch.randn(32, 256, dtype=torch.bfloat16, device=distributed_setup.device)
     optimizer.zero_grad(set_to_none=True)
     with te.pytorch.autocast(recipe=recipe):
         loss = linear(x).float().square().mean()
