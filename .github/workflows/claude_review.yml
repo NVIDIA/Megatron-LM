@@ -65,7 +65,10 @@ jobs:
                Common skill names: build-and-dependency, testing, cicd, linting-and-formatting, run-on-slurm,
                nightly-sync, create-issue, respond-to-issue, split-pr, onboard-gb200-1node-tests.
             3. Read the SKILL.md files for all relevant areas using the Read tool.
-            4. Only then perform the review using the skill context.
+            4. For Python changes, read the local style-guide.md using the Read tool.
+               Consult only relevant sections of the linked Google Python Style Guide to resolve
+               specific questions; do not load the entire guide or its linked references.
+            5. Only then perform the review using the skill context and applicable style guidance.
 
             You are doing a light code review. Keep it concise and actionable.
 
@@ -76,6 +79,7 @@ jobs:
               - If the PR adds a new feature or significant functionality without corresponding tests, suggest adding tests
               - If the PR fixes a bug that was not caught by an existing unit test, suggest adding a regression test to prevent recurrence
             - Outdated or inaccurate documentation affected by the changes
+            - Clear violations of style-guide.md in changed Python code that configured linters/formatters do not enforce
             - New direct global process group access in `megatron/core` production code
               - Flag added calls to `parallel_state.get_*_group()` or directly imported
                 `get_*_group()` helpers unless they are in `parallel_state.py`,
@@ -85,9 +89,9 @@ jobs:
                 `torch.distributed.ProcessGroup` from the caller
 
             Do NOT comment on:
-            - Style preferences or formatting
+            - Subjective style preferences or issues already covered by configured linters/formatters
             - Minor naming suggestions
-            - Architectural opinions or refactoring ideas
+            - Architectural opinions or refactoring ideas unrelated to style-guide.md
             - Performance unless there is a clear, measurable issue
 
             Only use inline ```suggestion blocks for simple, self-contained line replacements (typos,
@@ -168,7 +172,10 @@ jobs:
                Common skill names: build-and-dependency, testing, cicd, linting-and-formatting, run-on-slurm,
                nightly-sync, create-issue, respond-to-issue, split-pr, onboard-gb200-1node-tests.
             3. Read the SKILL.md files for all relevant areas using the Read tool.
-            4. Only then perform the review using the skill context.
+            4. For Python changes, read the local style-guide.md using the Read tool.
+               Consult only relevant sections of the linked Google Python Style Guide to resolve
+               specific questions; do not load the entire guide or its linked references.
+            5. Only then perform the review using the skill context and applicable style guidance.
 
             You are performing a strict, comprehensive code review on a **Megatron-LM** Pull Request.
             Megatron-LM is NVIDIA's large-scale distributed training framework for LLMs.
@@ -246,6 +253,9 @@ jobs:
 
             ## Suggestions (Nice to Have)
 
+            ### Code Style
+            - Flag violations of style-guide.md in changed Python code that configured linters/formatters do not enforce
+
             ### Naming
             - Name must describe what the thing *is*, not what it's *used for*
             - No abbreviations in parallel/distributed code — use full names (token_dispatcher, routing_map, comm_manager, world_size)
@@ -266,7 +276,7 @@ jobs:
             - Missing shape/dtype assertions at parallelism boundaries
 
             ## What NOT to Comment On
-            - Style/formatting issues (leave to linters)
+            - Subjective style preferences or issues already covered by configured linters/formatters
             - Test code that is reasonably clear
             - Clearly intentional design decisions by the author
             - Pure refactoring that preserves identical behavior (verify via diff)
@@ -278,6 +288,7 @@ jobs:
             - `**[CRITICAL Implementation]**`, `**[CRITICAL Correctness]**`
             - `**[IMPORTANT Performance]**`, `**[IMPORTANT Compatibility]**`
             - `**[SUGGESTION Naming]**`, `**[SUGGESTION Simplification]**`
+            - `**[SUGGESTION Style]**`
 
             For each finding, explain: (1) what the issue is, (2) why it matters (impact/risk), (3) specific suggestion for fix.
 

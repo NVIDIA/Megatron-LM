@@ -38,8 +38,6 @@ workspace.
 
 ### Code Quality
 
-- Read [style-guide.md](style-guide.md) for repository overrides to the Google
-  Python style guide.
 - After editing imports in any Python files, always run `uv run isort` on those files to fix import order before committing.
 
 ### Megatron Core Process Groups
