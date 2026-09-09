@@ -10,11 +10,10 @@
 import logging
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import Callable, Optional, Protocol, Union
+from typing import Optional, Protocol, Union
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 from megatron.core.fp8_utils import get_fp8_align_size
 from megatron.core.inference.contexts import BaseInferenceContext
@@ -43,6 +42,7 @@ from megatron.core.utils import nvtx_range_pop, nvtx_range_push
 try:
     from fla.modules.convolution import causal_conv1d
     from fla.modules.l2norm import l2norm
+    from fla.ops.cp import build_cp_context
     from fla.ops.gated_delta_rule import chunk_gated_delta_rule
 
     HAVE_FLA = True
@@ -50,6 +50,7 @@ except ImportError:
     causal_conv1d = None
     l2norm = None
     chunk_gated_delta_rule = None
+    build_cp_context = None
 
     HAVE_FLA = False
 
@@ -146,8 +147,8 @@ class _GDNBase(MegatronModule):
                 ignored; GDN implements context parallelism with its own all-to-alls rather
                 than the attention CP communication schemes.
             pp_layer_offset: Offset of this pipeline stage's first global layer.
+            is_mtp_layer (bool): Whether this module is inside an MTP prediction depth.
         """
-        del is_mtp_layer
         if not HAVE_FLA:
             raise ImportError(
                 "FLA is not installed. Please install it with "
@@ -159,6 +160,7 @@ class _GDNBase(MegatronModule):
         # Attributes from arguments
         self.layer_number = layer_number
         self.pp_layer_offset = pp_layer_offset
+        self.is_mtp_layer = is_mtp_layer
         self.bias = bias
         self.conv_bias = conv_bias
         self.conv_init = conv_init
@@ -196,14 +198,16 @@ class _GDNBase(MegatronModule):
             "in_proj_extra_dim",
             "in_proj_split_names",
             "in_proj_split_sections",
-            "feat_dim_split",
             "gated_delta_rule",
         )
         self._setup_variant_attrs()
         for attr in attrs_to_check:
             assert getattr(self, attr, None) is not None, f"Attribute {attr} for GDN is not set"
-        # QK, V, gate, shared across all variants
-        self.in_proj_qkvg_dim = self.qk_dim * 2 + self.v_dim * 2
+        # Two-stage gates use separate projections; in_proj emits QKV only.
+        if getattr(self, "two_stage_gates", False):
+            self.in_proj_qkvg_dim = self.qk_dim * 2 + self.v_dim
+        else:
+            self.in_proj_qkvg_dim = self.qk_dim * 2 + self.v_dim * 2
         self.in_proj_dim = self.in_proj_qkvg_dim + self.in_proj_extra_dim
 
         if self.config.fp8:
@@ -249,7 +253,9 @@ class _GDNBase(MegatronModule):
 
         self.dt_bias = nn.Parameter(
             torch.empty(
-                self.dt_bias_dim, dtype=self.config.params_dtype, device=torch.cuda.current_device()
+                self.dt_bias_dim,
+                dtype=getattr(self, "gate_params_dtype", self.config.params_dtype),
+                device=torch.cuda.current_device(),
             )
         )
         setattr(self.dt_bias, "tensor_model_parallel", True)
@@ -257,7 +263,9 @@ class _GDNBase(MegatronModule):
 
         self.A_log = nn.Parameter(
             torch.empty(
-                self.a_log_dim, dtype=self.config.params_dtype, device=torch.cuda.current_device()
+                self.a_log_dim,
+                dtype=getattr(self, "gate_params_dtype", self.config.params_dtype),
+                device=torch.cuda.current_device(),
             )
         )
         setattr(self.A_log, "tensor_model_parallel", True)
@@ -272,8 +280,10 @@ class _GDNBase(MegatronModule):
         )
         self.recompute_norm_out = False
         self.norm_out_checkpoint = None
-        if self.config.recompute_granularity == "selective":
+        self.recompute_gdn = False
+        if self.config.recompute_granularity == "selective" and self.config.recompute_modules:
             self.recompute_norm_out = "gdn_norm_out" in self.config.recompute_modules
+            self.recompute_gdn = "gdn" in self.config.recompute_modules
 
         self.out_proj = build_module(
             submodules.out_proj,
@@ -289,6 +299,9 @@ class _GDNBase(MegatronModule):
             tp_group=self.pg_collection.tp,
             name=(name + ".out_proj") if name is not None else None,
         )
+        # TODO: Packed sequence cu_seqlens can vary per batch; cache only static SBHD
+        # cp_context entries here and revisit routing metadata lifetime in the CP layout refactor.
+        self._chunkwise_cp_context_cache: dict[tuple[int, int], tuple[torch.Tensor, object]] = {}
 
         self.reset_parameters()
 
@@ -393,6 +406,7 @@ class _GDNBase(MegatronModule):
         batch: int,
         seq_len: int,
         *gate_feats: tuple[torch.Tensor],
+        cp_size_headwise: int | None = None,
     ) -> dict[str, torch.Tensor]:
         """
         Prepare all gated delta rule kernel inputs.
@@ -406,11 +420,10 @@ class _GDNBase(MegatronModule):
             ``k``, ``v``, ``g``, plus the variant-specific gates), and the output
             gate (z) tensor under the ``gate`` key, which is not a kernel input.
         """
+        cp_size = self.cp_size if cp_size_headwise is None else cp_size_headwise
         # Split qkv into query_key and value
         query_key, value = torch.split(
-            qkv,
-            [2 * self.qk_dim_local_tp // self.cp_size, self.v_dim_local_tp // self.cp_size],
-            dim=-1,
+            qkv, [2 * self.qk_dim_local_tp // cp_size, self.v_dim_local_tp // cp_size], dim=-1
         )
 
         # Reshape query_key and value
@@ -422,7 +435,7 @@ class _GDNBase(MegatronModule):
             query_key = l2norm(query_key.contiguous())
 
         # Split query and key
-        split_size = self.qk_dim_local_tp // self.key_head_dim // self.cp_size
+        split_size = self.qk_dim_local_tp // self.key_head_dim // cp_size
         query, key = torch.split(query_key, [split_size, split_size], dim=2)
 
         # Expand query and key if needed (grouped query attention)
