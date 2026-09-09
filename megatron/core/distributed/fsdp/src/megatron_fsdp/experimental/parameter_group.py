@@ -132,17 +132,15 @@ class FsdpParameterGroup:
         self._owning_module = ref(owning_module)
         self.mesh = mesh
         self.grad_divisor = grad_divisor
+        parameters = tuple(parameter_to_fqns)
 
-        self._initialize_weight_buffers(
-            parameter_to_fqns,
+        self._initialize_buffers(
+            parameters,
             model_weight_placements,
+            main_grad_placements,
             main_weight_placements,
             mixed_precision_policy,
             use_symmetric_memory,
-        )
-
-        self._initialize_gradient_buffers(
-            main_grad_placements, main_weight_placements, mixed_precision_policy
         )
         self.fsdp_parameters = self._build_fsdp_parameters(parameter_to_fqns)
 
@@ -182,19 +180,20 @@ class FsdpParameterGroup:
                 )
         return parameter_to_fqns, dtype, requires_grad
 
-    def _initialize_weight_buffers(
+    def _initialize_buffers(
         self,
-        parameter_to_fqns: dict[nn.Parameter, list[str]],
+        parameters: tuple[nn.Parameter, ...],
         model_weight_placements: tuple[Placement, ...],
+        main_grad_placements: tuple[Placement, ...],
         main_weight_placements: tuple[Placement, ...],
         mixed_precision_policy: MixedPrecisionPolicy,
         use_symmetric_memory: bool,
     ) -> None:
-        """Allocate the main, model, and unsharded weight buffers."""
-        tensor_shapes = tuple(parameter.shape for parameter in parameter_to_fqns)
+        """Allocate weight and gradient buffers in their required dependency order."""
+        tensor_shapes = tuple(parameter.shape for parameter in parameters)
         main_weight_dtype = mixed_precision_policy.main_params_dtype or torch.float32
         self.main_weight = DBuffer.distribute_tensors(
-            (parameter.to(dtype=main_weight_dtype) for parameter in parameter_to_fqns),
+            (parameter.to(dtype=main_weight_dtype) for parameter in parameters),
             mesh=self.mesh,
             placements=main_weight_placements,
         )
@@ -237,13 +236,6 @@ class FsdpParameterGroup:
                 device=self.main_weight.device,
             )
 
-    def _initialize_gradient_buffers(
-        self,
-        main_grad_placements: tuple[Placement, ...],
-        main_weight_placements: tuple[Placement, ...],
-        mixed_precision_policy: MixedPrecisionPolicy,
-    ) -> None:
-        """Allocate the persistent main-gradient buffer when gradients are required."""
         self.main_grad = None
         self.pre_optimizer_main_grad = None
         self._main_grad_is_stale = False
