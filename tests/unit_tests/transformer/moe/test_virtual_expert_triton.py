@@ -413,8 +413,8 @@ def test_virtual_expert_mxfp8_transport_moves_one_orientation_at_a_time():
 
 @requires_four_ranks
 def test_virtual_expert_histogram_exchange_matches_all_gather():
-    """The planner's symmetric-memory histogram exchange gathers what an all-gather gathers and
-    fills the local histogram, launch after launch (the flags carry a sequence)."""
+    """The planner's symmetric-memory histogram exchange gathers what an all-gather gathers,
+    launch after launch (the flags self-reset)."""
     Utils.initialize_distributed()
     group = dist.group.WORLD
     rank, world_size = dist.get_rank(group), dist.get_world_size(group)
@@ -442,8 +442,6 @@ def test_virtual_expert_histogram_exchange_matches_all_gather():
             dist.all_gather_into_tensor(expected.view(-1), histogram, group=group)
             torch.cuda.synchronize(device)
             assert torch.equal(gathered, expected)
-            assert torch.equal(workspace.field("tokens_per_expert"), histogram)
-            assert int(workspace.field("sequence").item()) == launch + 1
             # Every route lands on some rank's runtime expert; the mapping's exactness against
             # a torch reference is tier 1's job.
             assert plan.virtual_experts.shape == (num_tokens, topk)
@@ -455,3 +453,242 @@ def test_virtual_expert_histogram_exchange_matches_all_gather():
     finally:
         workspace.destroy()
         dist.barrier(group=group, device_ids=[device.index])
+
+
+# --------------------------------------------------------------------------------------
+# Planner: placement and route mapping through the real histogram exchange
+# --------------------------------------------------------------------------------------
+
+# One fixed planner shape drives every placement test: four ranks owning two
+# experts each, sixteen tokens picking three distinct experts.
+EP_SIZE = 4
+NUM_LOCAL_EXPERTS = 2
+NUM_EXPERTS = EP_SIZE * NUM_LOCAL_EXPERTS
+NUM_TOKENS = 16
+ROUTER_TOPK = 3
+NUM_ROUTES = NUM_TOKENS * ROUTER_TOPK
+
+
+def _routes_for_skew(skew: str, num_tokens: int = NUM_TOKENS) -> torch.Tensor:
+    """Return ``[ep_size, num_tokens, router_topk]`` semantic routes for one load skew."""
+    weights = torch.ones(NUM_EXPERTS)
+    if skew == "hot_expert":
+        weights[0] = 20.0
+    elif skew == "hot_rank":
+        weights[:NUM_LOCAL_EXPERTS] = 12.0
+    elif skew == "two_ranks_own_everything":
+        # Only ranks 0 and 1 hold routed experts, so ranks 2 and 3 must receive
+        # a full capacity each from a single sender: the tightest slot fit the
+        # single-sender migration rule allows.
+        weights[ROUTER_TOPK:] = 0.0
+    elif skew != "balanced":
+        raise ValueError(f"Unknown skew {skew!r}.")
+    generator = torch.Generator().manual_seed(1234)
+    return torch.stack(
+        [
+            torch.stack(
+                [
+                    torch.multinomial(weights, ROUTER_TOPK, replacement=False, generator=generator)
+                    for _ in range(num_tokens)
+                ]
+            )
+            for _ in range(EP_SIZE)
+        ]
+    )
+
+
+def _histogram(routes: torch.Tensor) -> torch.Tensor:
+    """Return the ``[ep_size, num_experts]`` route histogram of every rank."""
+    return torch.stack(
+        [torch.bincount(rank.reshape(-1), minlength=NUM_EXPERTS) for rank in routes]
+    ).to(torch.int32)
+
+
+def _reference_map_routes(
+    routes: torch.Tensor, workspace: VirtualExpertPlannerWorkspace
+) -> torch.Tensor:
+    """Torch oracle for the planner's route mapping: stable sort by expert, one global array of
+    segment ends, then the runtime id of every route."""
+    num_local_experts, ep_size = workspace.num_local_experts, workspace.ep_size
+    flat = routes.reshape(-1)
+    experts, order = torch.sort(flat, stable=True)
+    tokens_per_expert = torch.bincount(flat, minlength=workspace.num_experts)
+    bucket_start = torch.cumsum(tokens_per_expert, 0) - tokens_per_expert
+    boundaries = (
+        workspace.field("destination_boundaries")[:, :ep_size]
+        .clamp(min=0)
+        .minimum(tokens_per_expert[:, None])
+    )
+    ends = (bucket_start[:, None] + boundaries).reshape(-1)
+    positions = torch.arange(flat.numel(), device=flat.device, dtype=torch.int64)
+    destination = torch.searchsorted(ends, positions, right=True) - experts * ep_size
+    slot = workspace.field("virtual_expert_slots").view(-1)[experts * ep_size + destination]
+    runtime_local = torch.where(
+        destination == experts // num_local_experts,
+        experts % num_local_experts,
+        num_local_experts + slot,
+    )
+    virtual = torch.empty_like(positions)
+    virtual[order] = destination * (2 * num_local_experts) + runtime_local
+    return virtual.view(routes.shape)
+
+
+def _plan_on_this_rank(routes, probs=None):
+    """Plan this rank's routes of a complete four-rank group through the real histogram
+    exchange, and check what a torch oracle can reproduce: the local histogram, the exchanged
+    window and the route mapping. The caller destroys the returned workspace."""
+    Utils.initialize_distributed()
+    group = dist.group.WORLD
+    assert dist.get_world_size(group) == EP_SIZE
+    rank = dist.get_rank(group)
+    device = torch.device("cuda", torch.cuda.current_device())
+    workspace = VirtualExpertPlannerWorkspace.allocate(
+        num_experts=NUM_EXPERTS, device=device, group=group
+    )
+    own = routes[rank].to(device=device, dtype=torch.int64)
+    if probs is None:
+        probs = torch.rand(own.shape, device=device)
+    plan, runtime_probs = plan_virtual_expert_routes(own, probs, workspace)
+    torch.cuda.synchronize(device)
+    counts = _histogram(routes).to(device)
+    assert torch.equal(workspace.gathered_counts, counts)
+    assert torch.equal(plan.virtual_experts.long(), _reference_map_routes(own, workspace))
+    return workspace, plan, runtime_probs, rank, group
+
+
+def _release(workspace, group):
+    workspace.destroy()
+    dist.barrier(group=group, device_ids=[torch.cuda.current_device()])
+
+
+@pytest.mark.internal
+@requires_four_ranks
+@pytest.mark.parametrize("skew", ["balanced", "hot_expert", "hot_rank", "two_ranks_own_everything"])
+def test_virtual_expert_placement_balances_every_destination(skew):
+    """Equalize route load across ranks without over-subscribing virtual-expert slots."""
+    routes = _routes_for_skew(skew)
+    counts = _histogram(routes)
+    workspace, plan, _, _, group = _plan_on_this_rank(routes)
+    try:
+        allocation = workspace.field("allocation").cpu()
+        experts_to_copy = plan.experts_to_copy.cpu()
+        global_per_expert = counts.sum(0).to(torch.int32)
+
+        # Every rank executes exactly its own route capacity. The dispatcher's
+        # dropless rank capacity is derived from this equality, so a placement that
+        # merely reduced the imbalance would silently drop real routes.
+        torch.testing.assert_close(
+            allocation.sum(0).to(torch.int32),
+            torch.full((EP_SIZE,), NUM_ROUTES, dtype=torch.int32),
+            rtol=0,
+            atol=0,
+        )
+        # Migration moves routes; it never invents or loses them.
+        torch.testing.assert_close(
+            allocation.sum(1).to(torch.int32), global_per_expert, rtol=0, atol=0
+        )
+        assert (allocation >= 0).all()
+        torch.testing.assert_close(
+            workspace.field("balance").cpu(),
+            global_per_expert.view(EP_SIZE, NUM_LOCAL_EXPERTS).sum(1).to(torch.int32) - NUM_ROUTES,
+            rtol=0,
+            atol=0,
+        )
+        for destination in range(EP_SIZE):
+            slots = experts_to_copy[destination].tolist()
+            migrated = {
+                expert
+                for expert in range(NUM_EXPERTS)
+                if expert // NUM_LOCAL_EXPERTS != destination
+                and allocation[expert, destination] > 0
+            }
+            filled = [expert for expert in slots if expert >= 0]
+            # A remote expert that receives routes but owns no virtual-expert slot would
+            # execute against a stale slot's weights. The single-sender rule bounds
+            # this set by num_local_experts; the device assert covers the rest.
+            assert (
+                set(filled) == migrated
+            ), f"rank {destination} slots {slots} vs migrated {migrated}"
+            assert len(filled) == len(set(filled))
+            assert all(expert // NUM_LOCAL_EXPERTS != destination for expert in filled)
+            # The slot table is written only for assigned slots; check exactly those.
+            for slot, expert in enumerate(slots):
+                if expert >= 0:
+                    assert int(workspace.field("virtual_expert_slots")[expert, destination]) == slot
+
+        # Every rank computes the placement independently and must agree exactly.
+        for tensor in (
+            workspace.field("balance"),
+            workspace.field("allocation"),
+            plan.experts_to_copy,
+        ):
+            tensor = tensor.contiguous()
+            gathered = [torch.empty_like(tensor) for _ in range(EP_SIZE)]
+            dist.all_gather(gathered, tensor, group=group)
+            assert all(torch.equal(peer, tensor) for peer in gathered)
+    finally:
+        _release(workspace, group)
+
+
+@pytest.mark.internal
+@requires_four_ranks
+@pytest.mark.parametrize("skew", ["hot_expert", "two_ranks_own_everything"])
+def test_virtual_expert_planner_maps_every_route_to_the_expert_it_selected(skew):
+    """Decode each virtual route back to the semantic expert and destination it was given."""
+    routes = _routes_for_skew(skew)
+    workspace, plan, _, rank, group = _plan_on_this_rank(routes)
+    try:
+        allocation = workspace.field("allocation").cpu()
+        experts_to_copy = plan.experts_to_copy.cpu()
+        observed = torch.zeros((NUM_EXPERTS, EP_SIZE), dtype=torch.int32)
+        for route, virtual in zip(
+            routes[rank].reshape(-1).tolist(), plan.virtual_experts.cpu().reshape(-1).tolist()
+        ):
+            destination, runtime_local = divmod(virtual, 2 * NUM_LOCAL_EXPERTS)
+            if runtime_local < NUM_LOCAL_EXPERTS:
+                assert (destination, runtime_local) == divmod(
+                    route, NUM_LOCAL_EXPERTS
+                ), f"route to expert {route} became native id {virtual}"
+            else:
+                slot = runtime_local - NUM_LOCAL_EXPERTS
+                assert int(experts_to_copy[destination][slot]) == route, (
+                    f"route to expert {route} became virtual-expert slot {slot} on rank "
+                    f"{destination}, which holds expert "
+                    f"{int(experts_to_copy[destination][slot])}"
+                )
+            observed[route, destination] += 1
+        # The allocation names how many routes each destination owes each expert;
+        # the routes every rank mapped must reproduce it exactly, not merely in aggregate.
+        observed = observed.cuda()
+        dist.all_reduce(observed, group=group)
+        torch.testing.assert_close(observed.cpu(), allocation, rtol=0, atol=0)
+    finally:
+        _release(workspace, group)
+
+
+@pytest.mark.internal
+@requires_four_ranks
+@pytest.mark.parametrize("skew", ["balanced", "hot_expert", "two_ranks_own_everything"])
+@pytest.mark.parametrize("num_tokens", [NUM_TOKENS, 1000])
+def test_virtual_expert_planner_writes_hybridep_inputs_with_probability_gradients(skew, num_tokens):
+    """The planner's dense runtime probabilities match a torch scatter of the router's compact
+    probabilities at the mapped runtime ids, and their gradient flows back to those entries."""
+    device = torch.device("cuda", torch.cuda.current_device())
+    generator = torch.Generator(device="cuda").manual_seed(4321)
+    routes = _routes_for_skew(skew, num_tokens)
+    probs = torch.rand((num_tokens, ROUTER_TOPK), device=device, generator=generator)
+    probs = probs.requires_grad_(True)
+    workspace, plan, runtime_probs, _, group = _plan_on_this_rank(routes, probs)
+    try:
+        expected = torch.zeros((num_tokens, 2 * NUM_EXPERTS), device=device)
+        expected = expected.scatter(1, plan.virtual_experts.long(), probs)
+        torch.testing.assert_close(runtime_probs, expected, rtol=0, atol=0)
+        assert runtime_probs.requires_grad and not plan.virtual_experts.requires_grad
+        assert plan.virtual_experts.dtype == torch.int16
+
+        grad = torch.rand(runtime_probs.shape, device=device, generator=generator)
+        (actual_grad,) = torch.autograd.grad(runtime_probs, probs, grad)
+        (expected_grad,) = torch.autograd.grad(expected, probs, grad)
+        torch.testing.assert_close(actual_grad, expected_grad, rtol=0, atol=0)
+    finally:
+        _release(workspace, group)
