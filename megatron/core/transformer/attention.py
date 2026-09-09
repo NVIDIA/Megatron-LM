@@ -803,6 +803,9 @@ class Attention(MegatronModule, ABC):
         )
         softcap = self._get_inference_softcap()
         if softcap is not None:
+            assert is_fa_min_version(
+                "2.6.0"
+            ), "attn_logit_softcapping requires flash-attn 2.6.0 or newer."
             kv_kwargs["softcap"] = softcap
         if need_lse:
             kv_kwargs["return_softmax_lse"] = True
@@ -818,8 +821,9 @@ class Attention(MegatronModule, ABC):
 
         The inference paths bypass ``self.core_attention`` and call flash-attention
         directly, so the configured cap has to be plumbed back out here. Returns None
-        when softcapping is disabled, so callers can omit the kwarg entirely and leave
-        older flash-attention builds untouched.
+        when softcapping is disabled; callers that build a kwargs dict omit the kwarg
+        entirely in that case, so runs without softcapping keep their existing call
+        signatures and older flash-attention builds are unaffected.
         """
         return self.config.attn_logit_softcapping
 
@@ -980,6 +984,10 @@ class Attention(MegatronModule, ABC):
             assert isinstance(_flash_attn_forward, torch._library.custom_ops.CustomOpDef)
             sig = inspect.signature(_flash_attn_forward._init_fn)
         valid_kwargs = set(sig.parameters.keys())
+        assert candidate_kwargs["softcap"] == 0.0 or "softcap" in valid_kwargs, (
+            "This FlashAttention 3 build does not accept softcap, so attn_logit_softcapping "
+            "cannot be honoured. Install a softcap-capable build or unset the config field."
+        )
         final_kwargs = {k: candidate_kwargs[k] for k in valid_kwargs if k in candidate_kwargs}
 
         ret = _flash_attn_forward(**final_kwargs)
@@ -1199,6 +1207,10 @@ class Attention(MegatronModule, ABC):
                 assert window_size == (-1, -1), (
                     "FlashMLA decode kernel does not support sliding window attention. "
                     "Set config.window_size = None or use a non-MLA attention layer."
+                )
+                assert self._get_inference_softcap() is None, (
+                    "FlashMLA decode kernel does not support attention logit softcapping. "
+                    "Set config.attn_logit_softcapping = None or use a non-MLA attention layer."
                 )
                 softmax_scale = self.softmax_scale
 
