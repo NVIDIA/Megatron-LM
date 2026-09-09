@@ -16,8 +16,8 @@ from torch.testing import assert_close
 
 import megatron.core.parallel_state as mpu
 from gpt_builders import gpt_builder
-from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
 from megatron.core.distributed import finalize_model_grads
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
 from megatron.core.enums import ModelType
 from megatron.core.num_microbatches_calculator import destroy_num_microbatches_calculator
 from megatron.core.pipeline_parallel.schedules import get_forward_backward_func
