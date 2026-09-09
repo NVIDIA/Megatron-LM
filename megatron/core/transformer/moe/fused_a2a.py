@@ -276,11 +276,6 @@ except ImportError:
     HAVE_HYBRIDEP = False
 
 _hybrid_ep_buffer = None
-# The process group _hybrid_ep_buffer was built for. Tracked module-side because the buffer
-# object does not reliably expose it, and dispatching through a buffer whose group has been
-# replaced (e.g. after destroy_model_parallel + re-initialization) fails inside deep_ep with
-# "NCCL communicator was aborted".
-_hybrid_ep_buffer_group = None
 
 
 # HybridEP dispatch/combine kernels use 64-token chunks for their public APIs.
@@ -330,7 +325,7 @@ def init_hybrid_ep_buffer(
             Number of SMs used by the preprocessing (metadata scan) kernel.
     '''
     assert not fp8_dispatch, "HybridEP dispatcher does not support fp8 dispatch now"
-    global _hybrid_ep_buffer, _hybrid_ep_buffer_group
+    global _hybrid_ep_buffer
     kwargs = {}
     if num_sms_dispatch_api is not None:
         kwargs['num_sms_dispatch_api'] = num_sms_dispatch_api
@@ -350,16 +345,14 @@ def init_hybrid_ep_buffer(
         use_fp8=fp8_dispatch,
         **kwargs,
     )
-    _hybrid_ep_buffer_group = group
 
 
 def reset_hybrid_ep_buffer():
     '''
     Reset the HybridEP buffer
     '''
-    global _hybrid_ep_buffer, _hybrid_ep_buffer_group
+    global _hybrid_ep_buffer
     _hybrid_ep_buffer = None
-    _hybrid_ep_buffer_group = None
 
 
 def reset_fused_a2a_buffers():
@@ -416,9 +409,7 @@ class HybridEPDispatch(torch.autograd.Function):
                 num_blocks_permute = None
                 num_blocks_unpermute = None
 
-        # Rebuild when the group changed (like the DeepEP get_buffer group check): a buffer
-        # from a previous model-parallel lifetime holds a destroyed communicator.
-        if _hybrid_ep_buffer is None or _hybrid_ep_buffer_group is not group:
+        if _hybrid_ep_buffer is None:
             num_tokens, hidden_dim = x.shape[-2:]
             fp8_dispatch = False  # Currently, we do not support fp8 dispatch
             init_hybrid_ep_buffer(
