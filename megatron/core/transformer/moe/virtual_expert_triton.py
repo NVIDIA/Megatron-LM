@@ -500,7 +500,7 @@ def _cross_rank_barrier(
 
 
 @triton.jit
-def _push_projection(
+def _push_fc_layer(
     bases,
     plan,
     peer_bases,
@@ -613,20 +613,20 @@ def _virtual_expert_weight_push_kernel(
     # One bulk-copy engine per block serves every component, so the much smaller
     # scale transfers follow the data rather than competing with it.
     # fmt: off
-    _push_projection(
+    _push_fc_layer(
         fc1_bases, plan, peer_bases, entry, mine, ordinal, active, block, rank,
         FC1_BYTES, 0, TILE_BYTES, NUM_LOCAL_EXPERTS, NUM_SMS,
     )
-    _push_projection(
+    _push_fc_layer(
         fc2_bases, plan, peer_bases, entry, mine, ordinal, active, block, rank,
         FC2_BYTES, FC2_ARENA, TILE_BYTES, NUM_LOCAL_EXPERTS, NUM_SMS,
     )
     if FC1_SCALE_BYTES > 0:
-        _push_projection(
+        _push_fc_layer(
             fc1_scale_bases, plan, peer_bases, entry, mine, ordinal, active, block, rank,
             FC1_SCALE_BYTES, FC1_SCALE_ARENA, SCALE_TILE_BYTES, NUM_LOCAL_EXPERTS, NUM_SMS,
         )
-        _push_projection(
+        _push_fc_layer(
             fc2_scale_bases, plan, peer_bases, entry, mine, ordinal, active, block, rank,
             FC2_SCALE_BYTES, FC2_SCALE_ARENA, SCALE_TILE_BYTES, NUM_LOCAL_EXPERTS, NUM_SMS,
         )
@@ -677,7 +677,7 @@ def _virtual_expert_grad_reduce_kernel(
     """Reduce every peer's virtual-expert gradients into native wgrad staging.
 
     ``[TILE_BEGIN, TILE_END)`` selects the transport tiles of one launch: the FC1 members, the FC2
-    members, or both. The bridge launches the projections separately so each can start as soon as
+    members, or both. The host launches the FC layers separately so each can start as soon as
     its wgrad GEMM has finished.
 
     ``plan`` holds the destination-major ``[world, num_local_experts]`` table of globally numbered
@@ -721,8 +721,8 @@ def _virtual_expert_grad_reduce_kernel(
 
     # One descriptor whose outermost index selects the peer: the source loop sits inside the
     # pipelined tile loop, where Triton cannot build a descriptor, so one has to reach every peer.
-    # The symmetric allocator maps each rank's arena at a fixed virtual stride; the bridge verifies
-    # that on the host.
+    # The symmetric allocator maps each rank's arena at a fixed virtual stride; the host workspace
+    # verifies that once.
     bases = peer_bases.to(tl.pointer_type(tl.int64))
     base = tl.load(bases)
     window = tl.make_tensor_descriptor(
@@ -828,27 +828,23 @@ def _allocate_descriptor_scratch(size: int, alignment: int, stream) -> torch.Ten
 
 
 def launch_virtual_expert_weight_prefetch(
+    workspace,
     *,
     sources: tuple[torch.Tensor, torch.Tensor],
-    arena: torch.Tensor,
-    peer_bases: int,
-    signal_bases: int,
     experts_to_copy: torch.Tensor,
-    grid_barrier: torch.Tensor,
-    rank: int,
-    world_size: int,
-    num_local_experts: int,
-    member_numels: tuple[int, int],
-    num_sms: int,
     scale_sources: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> None:
     """Push BF16 or native MXFP8 owner weights into destination virtual slots.
 
-    ``sources`` and ``scale_sources`` are ``int64`` pointer tables with one FC1 or FC2 member base
-    per local expert; ``peer_bases`` and ``signal_bases`` are the raw device addresses a
-    symmetric-memory handle exposes. A ``uint8`` arena selects the MXFP8 layout and requires the
-    matching orientation's scale tables.
+    ``workspace`` is the host's transport workspace: ``weight_arena`` with its symmetric-memory
+    ``weight_handle`` and ``weight_grid_barrier``, plus ``rank``, ``world_size``,
+    ``num_local_experts``, ``member_numels`` and ``num_sms``. ``sources`` and ``scale_sources``
+    are ``int64`` pointer tables with one FC1 or FC2 member base per local expert. A ``uint8``
+    arena selects the MXFP8 layout and requires the matching orientation's scale tables.
     """
+    world_size, num_local_experts = workspace.world_size, workspace.num_local_experts
+    member_numels, num_sms = workspace.member_numels, workspace.num_sms
+    arena = workspace.weight_arena
     _validate_transport_shape(world_size, num_local_experts, num_sms)
     mxfp8 = arena.dtype == torch.uint8
     if arena.dtype not in (torch.uint8, torch.bfloat16) or mxfp8 != (scale_sources is not None):
@@ -867,12 +863,12 @@ def launch_virtual_expert_weight_prefetch(
     triton.set_allocator(_allocate_descriptor_scratch)
     _virtual_expert_weight_push_kernel[(num_sms,)](
         *tables,
-        int(peer_bases),
-        int(signal_bases),
+        int(workspace.weight_handle.buffer_ptrs_dev),
+        int(workspace.weight_handle.signal_pad_ptrs_dev),
         _check_table(experts_to_copy, torch.int32, (world_size, num_local_experts), "plans"),
-        grid_barrier,
+        workspace.weight_grid_barrier,
         _barrier_scratch(arena.device.index),
-        rank,
+        workspace.rank,
         FC1_BYTES=member_bytes[0],
         FC2_BYTES=member_bytes[1],
         FC1_SCALE_BYTES=scale_bytes[0],
@@ -891,26 +887,24 @@ def launch_virtual_expert_weight_prefetch(
 
 
 def launch_virtual_expert_grad_reduce(
+    workspace,
     *,
-    arena: torch.Tensor,
     native_grads: tuple[torch.Tensor, torch.Tensor],
-    peer_bases: int,
-    signal_bases: int,
     experts_to_copy: torch.Tensor,
-    grid_barrier: torch.Tensor,
-    rank: int,
-    world_size: int,
-    num_local_experts: int,
-    member_numels: tuple[int, int],
-    num_sms: int,
-    projections: tuple[int, ...] = (0, 1),
+    fc_layers: tuple[int, ...] = (0, 1),
 ) -> None:
     """Accumulate every peer's virtual-expert gradients into native wgrad staging.
 
-    ``native_grads`` are ``int64`` pointer tables with one FC1 or FC2 staging base per local expert;
-    ``projections`` selects which of the two this launch reduces. Used virtual-expert slots are left
-    holding their partials; the next wgrad GEMM overwrites them.
+    ``workspace`` is the host's transport workspace: ``grad_arena`` with its symmetric-memory
+    ``grad_handle`` and ``grad_grid_barrier``, plus ``rank``, ``world_size``,
+    ``num_local_experts``, ``member_numels`` and ``num_sms``. ``native_grads`` are ``int64``
+    pointer tables with one FC1 or FC2 staging base per local expert; ``fc_layers`` selects
+    which of the two this launch reduces. Used virtual-expert slots are left holding their
+    partials; the next wgrad GEMM overwrites them.
     """
+    world_size, num_local_experts = workspace.world_size, workspace.num_local_experts
+    member_numels, num_sms = workspace.member_numels, workspace.num_sms
+    arena = workspace.grad_arena
     _validate_transport_shape(world_size, num_local_experts, num_sms)
     if arena.dtype not in (torch.float32, torch.bfloat16):
         raise ValueError(
@@ -926,19 +920,19 @@ def launch_virtual_expert_grad_reduce(
             _check_table(table, torch.int64, (num_local_experts,), "pointer tables")
             for table in native_grads
         ),
-        int(peer_bases),
-        int(signal_bases),
+        int(workspace.grad_handle.buffer_ptrs_dev),
+        int(workspace.grad_handle.signal_pad_ptrs_dev),
         _check_table(experts_to_copy, torch.int32, (world_size, num_local_experts), "plans"),
         _source_scratch(device_index, (world_size + 1) * num_local_experts + 1),
-        grid_barrier,
+        workspace.grad_grid_barrier,
         _barrier_scratch(device_index),
-        rank,
+        workspace.rank,
         FC1_ROWS=member_numels[0] // _ROW.value,
         FC2_ROWS=member_numels[1] // _ROW.value,
         TILE_ROWS=tile // _ROW.value,
         ELEMENT_BYTES=arena.dtype.itemsize,
-        TILE_BEGIN=0 if 0 in projections else fc1_tiles,
-        TILE_END=fc1_tiles + fc2_tiles if 1 in projections else fc1_tiles,
+        TILE_BEGIN=0 if 0 in fc_layers else fc1_tiles,
+        TILE_END=fc1_tiles + fc2_tiles if 1 in fc_layers else fc1_tiles,
         NUM_LOCAL_EXPERTS=num_local_experts,
         WORLD=world_size,
         WORLD_POW2=triton.next_power_of_2(world_size),
