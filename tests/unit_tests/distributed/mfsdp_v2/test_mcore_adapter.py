@@ -846,31 +846,27 @@ class TestMcoreAdapterHybrid:
         success, _, _ = optimizer.step()
         assert success
 
-        meshes = {
+        mesh_dim_names = {
             parameter.grad.device_mesh.mesh_dim_names
             for parameter in model.parameters()
             if parameter.grad is not None
         }
-        expected_meshes = {("dp_outer", "dp_shard")}
-        assert (
-            meshes == expected_meshes
-        ), f"unexpected meshes: expected {expected_meshes}, got {meshes}"
-        placements = {
-            parameter.grad.placements
-            for parameter in model.parameters()
-            if parameter.grad is not None
-        }
+        assert mesh_dim_names == {("dp_outer", "dp_shard")}
+
+        dense_parameters = []
+        expert_parameters = []
+        for name, parameter in model.named_parameters():
+            if parameter.grad is None:
+                continue
+            # In this model, expert weights live under mlp.experts; router weights are dense.
+            if ".mlp.experts." in name:
+                expert_parameters.append((name, parameter))
+            else:
+                dense_parameters.append((name, parameter))
         dense_outer = Replicate() if dense_outer_strategy == "no_shard" else Shard(0)
+        for name, parameter in dense_parameters:
+            assert parameter.grad.placements == (dense_outer, Shard(0)), name
+
         expert_outer = Replicate() if expert_outer_strategy == "no_shard" else Shard(0)
-        dense_placements = (dense_outer, Shard(0))
-        expert_placements = (expert_outer, Shard(0))
-        assert (
-            dense_placements in placements
-        ), f"missing placements {dense_placements} from {placements}"
-        assert (
-            expert_placements in placements
-        ), f"missing placements {expert_placements} from {placements}"
-        expected_placements = {dense_placements, expert_placements}
-        assert (
-            placements == expected_placements
-        ), f"unexpected placements: expected {expected_placements}, got {placements}"
+        for name, parameter in expert_parameters:
+            assert parameter.grad.placements == (expert_outer, Shard(0)), name
