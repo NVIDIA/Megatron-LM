@@ -41,7 +41,7 @@ version = "1.0.0+9edee0c"
 [[manifest.dependency-metadata]]
 name = "mamba-ssm"
 version = "2.3.2.post1"
-requires-dist = ["torch", "tilelang==0.1.13", "apache-tvm-ffi<=0.1.12", "quack-kernels>=0.3.4", "triton>=3.5.0", "ninja", "einops", "transformers", "packaging", "setuptools>=61.0.0"]
+requires-dist = ["torch", "tilelang==0.1.8", "apache-tvm-ffi<=0.1.12", "quack-kernels>=0.3.4", "triton>=3.5.0", "ninja", "einops", "transformers", "packaging", "setuptools>=61.0.0"]
 
 [[manifest.dependency-metadata]]
 name = "transformer-engine"
@@ -2198,7 +2198,7 @@ wheels = [
 [[package]]
 name = "mamba-ssm"
 version = "2.3.2.post1"
-source = { git = "https://github.com/state-spaces/mamba.git?rev=ed6ce09e4d802e274b1ecc7205757b892e180a93#ed6ce09e4d802e274b1ecc7205757b892e180a93" }
+source = { git = "https://github.com/state-spaces/mamba.git?rev=0048fbf2e7b2f214dcbe703ea3dec2b9647595e1#0048fbf2e7b2f214dcbe703ea3dec2b9647595e1" }
 dependencies = [
     { name = "apache-tvm-ffi" },
     { name = "einops" },
@@ -2473,7 +2473,7 @@ requires-dist = [
     { name = "gigatoken", marker = "extra == 'mlm'" },
     { name = "gigatoken", marker = "extra == 'training'" },
     { name = "hypercorn", marker = "extra == 'dev'" },
-    { name = "mamba-ssm", marker = "extra == 'ssm'", git = "https://github.com/state-spaces/mamba.git?rev=ed6ce09e4d802e274b1ecc7205757b892e180a93" },
+    { name = "mamba-ssm", marker = "extra == 'ssm'", git = "https://github.com/state-spaces/mamba.git?rev=0048fbf2e7b2f214dcbe703ea3dec2b9647595e1" },
     { name = "megatron-energon", extras = ["av-decode"], marker = "extra == 'dev'", specifier = "~=7.0" },
     { name = "multi-storage-client", marker = "extra == 'dev'", specifier = "~=0.50" },
     { name = "nemo-lens", marker = "extra == 'dev'", git = "https://github.com/NVIDIA-NeMo/Lens.git?rev=b85578fc2b736a1804705e537001b5f45e9c715d" },
