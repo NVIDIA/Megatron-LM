@@ -1603,11 +1603,6 @@ def validate_args(args, defaults={}):
             raise ValueError('--use-native-cp-transport requires --max-seqlen-per-dp-cp-rank.')
         if args.fp8 is not None:
             raise ValueError('--use-native-cp-transport does not support FP8 attention yet.')
-        if args.mtp_num_layers:
-            raise ValueError(
-                '--use-native-cp-transport does not support MTP halo communication yet; '
-                'disable native transport when using --mtp-num-layers.'
-            )
 
     if getattr(args, 'pad_packed_seq_alignment', None) is not None:
         args.pad_packed_seq_alignment = _parse_pad_packed_seq_alignment(

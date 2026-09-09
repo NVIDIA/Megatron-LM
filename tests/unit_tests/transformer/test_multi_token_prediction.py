@@ -8,6 +8,7 @@ import pytest
 import torch
 from torch import Tensor
 
+from megatron.core.dynamic_cp_group import LogicalCPGroup
 from megatron.core.enums import ModelType
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.models.gpt.gpt_layer_specs import (
@@ -28,10 +29,12 @@ from megatron.core.transformer.multi_token_prediction import (
     ContiguousPackedCPRollContext,
     ContiguousPackedCPRollHalos,
     ContiguousPackedSeqRollPlan,
+    MTPLossAutoScaler,
     MTPLossLoggingHelper,
     MultiTokenPredictionBlock,
     MultiTokenPredictionLayer,
     _mtp_logits_are_vocab_sharded,
+    bind_native_mtp_cp_group,
     prepare_mtp_sequence_roll_context,
     process_mtp_loss,
     roll_tensor,
@@ -60,7 +63,183 @@ else:
 _SEED = 42
 
 
-def test_native_dynamic_cp_rejects_mtp_before_initialization(monkeypatch):
+@pytest.fixture
+def native_mtp_parent():
+    if not torch.cuda.is_available() or not HAVE_TE:
+        pytest.skip("Native MTP requires CUDA and Transformer Engine")
+    import transformer_engine_torch as tex
+    from transformer_engine.pytorch.attention.native_cp_transport import (
+        destroy_native_cp_transport,
+        initialize_native_cp_transport,
+    )
+
+    if not hasattr(tex, "cp_native_transport_create"):
+        pytest.skip("Transformer Engine was built without native CP transport")
+    Utils.initialize_distributed()
+    parent = torch.distributed.group.WORLD
+    initialize_native_cp_transport(parent, 65536)
+    try:
+        yield parent
+    finally:
+        destroy_native_cp_transport(parent)
+
+
+def _native_mtp_test_group(parent, cp_size):
+    ranks = torch.distributed.get_process_group_ranks(parent)
+    if len(ranks) < cp_size:
+        pytest.skip(f"CP{cp_size} requires at least {cp_size} ranks")
+    rank = torch.distributed.get_rank()
+    if rank not in ranks[:cp_size]:
+        return None
+    group = LogicalCPGroup.from_parent_interval(ranks, 0, cp_size, rank)
+    bind_native_mtp_cp_group(group, parent)
+    return group
+
+
+@pytest.mark.parametrize("cp_size", [1, 3, 5, 8])
+@pytest.mark.parametrize("layout", ["unpacked", "zigzag", "contiguous", "prefetch"])
+def test_native_mtp_repeated_roll_matches_full_sequences(
+    native_mtp_parent, monkeypatch, cp_size, layout
+):
+    group = _native_mtp_test_group(native_mtp_parent, cp_size)
+    if group is None:
+        return
+    lengths = [4 * cp_size, 6 * cp_size]
+    total = sum(lengths)
+    padded_cu = torch.tensor([0, lengths[0], total, total], device="cuda", dtype=torch.int32)
+    cu = torch.tensor([0, lengths[0] - 1, total - 3, total - 3], device="cuda", dtype=torch.int32)
+    full_ids = torch.arange(1, total + 1, device="cuda", dtype=torch.int64).view(1, -1)
+    full_padding = torch.zeros_like(full_ids, dtype=torch.bool)
+    full_padding[:, lengths[0] - 1] = True
+    full_padding[:, -2:] = True
+    full_ids.masked_fill_(full_padding, 0)
+    full_values = [full_ids, full_padding, (~full_padding).float()]
+    params = (
+        None
+        if layout == "unpacked"
+        else PackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=cu,
+            cu_seqlens_q_padded=padded_cu,
+            cp_group=group,
+            local_cp_size=cp_size,
+            cp_partition_mode="contiguous" if layout in ("contiguous", "prefetch") else "zigzag",
+        )
+    )
+    if layout in ("contiguous", "prefetch"):
+        indices = torch.arange(total // cp_size, device="cuda") + group.rank() * (total // cp_size)
+    else:
+        chunks = []
+        start = 0
+        for length in ([total] if layout == "unpacked" else lengths):
+            width = length // (2 * cp_size)
+            for chunk in (group.rank(), 2 * cp_size - 1 - group.rank()):
+                chunks.append(torch.arange(width, device="cuda") + start + chunk * width)
+            start += length
+        indices = torch.cat(chunks)
+    local_values = [value.index_select(-1, indices) for value in full_values]
+    context = prepare_mtp_sequence_roll_context(
+        tensor=local_values[0], cp_group=group, packed_seq_params=params
+    )
+
+    def reject_nccl(*args, **kwargs):
+        raise AssertionError("Logical MTP must not call torch.distributed P2P/all_reduce")
+
+    for name in ("isend", "irecv", "batch_isend_irecv", "all_reduce"):
+        monkeypatch.setattr(torch.distributed, name, reject_nccl)
+    if layout == "prefetch" and context is not None:
+        context = context.prefetch_halos(
+            width=3,
+            input_ids=local_values[0],
+            padding_mask=local_values[1],
+            loss_mask=local_values[2],
+        )
+    fill_values = [0, True, 0]
+    ends = [total - 1] if layout == "unpacked" else [lengths[0] - 1, total - 1]
+    for depth in range(3):
+        local_values = roll_tensor(
+            local_values,
+            cp_group=group,
+            packed_seq_params=params,
+            fill_values=fill_values,
+            roll_context=context,
+            sequence_fields=["input_ids", "padding_mask", "loss_mask"],
+            roll_depth=depth,
+        )
+        for index, fill in enumerate(fill_values):
+            full_values[index] = torch.roll(full_values[index], -1, -1)
+            full_values[index][:, ends] = fill
+            torch.testing.assert_close(
+                local_values[index], full_values[index].index_select(-1, indices)
+            )
+
+
+@pytest.mark.parametrize("cp_size", [1, 3, 5, 8])
+def test_native_mtp_loss_cp_normalization_matches_cp1(native_mtp_parent, monkeypatch, cp_size):
+    group = _native_mtp_test_group(native_mtp_parent, cp_size)
+    if group is None:
+        return
+    length = 4 * cp_size
+    local_length = length // cp_size
+    start = group.rank() * local_length
+    config = TransformerConfig(
+        hidden_size=8,
+        num_layers=2,
+        num_attention_heads=2,
+        mtp_num_layers=2,
+        calculate_per_token_loss=True,
+        mtp_loss_scaling_factor=1.0,
+    )
+    params = PackedSeqParams(
+        qkv_format="thd",
+        cu_seqlens_q=torch.tensor([0, length], device="cuda", dtype=torch.int32),
+        cp_partition_mode="contiguous",
+    )
+    full_labels = torch.ones((1, length), device="cuda", dtype=torch.int64)
+    full_mask = torch.zeros((1, length), device="cuda")
+    valid_positions = [0, 1, 2] if cp_size == 1 else [0, local_length, local_length + 1]
+    full_mask[:, valid_positions] = 1
+    # Rolling moves valid tokens across CP ranks with different local T0/Tk ratios;
+    # some ranks have no rolled tokens, so normalization must use CP-global counts.
+    global_hidden = torch.randn((3, length, 1, 1), device="cuda")
+    monkeypatch.setattr(MTPLossAutoScaler, "main_loss_backward_scale", torch.ones(1, device="cuda"))
+
+    def run(hidden, labels, mask, cp_group):
+        hidden = hidden.detach().clone().reshape(-1, 1, 1).requires_grad_()
+        result = process_mtp_loss(
+            hidden_states=hidden,
+            labels=labels,
+            loss_mask=mask,
+            output_layer=lambda hidden, **kwargs: (hidden, None),
+            output_weight=None,
+            runtime_gather_output=None,
+            is_training=False,
+            compute_language_model_loss=lambda labels, logits: logits.squeeze(-1).transpose(0, 1),
+            config=config,
+            cp_group=cp_group,
+            packed_seq_params=params,
+        )
+        (result.sum() * 0).backward()
+        return hidden.grad.reshape(3, -1, 1, 1)
+
+    baseline_grad = run(global_hidden, full_labels, full_mask, None)
+
+    def reject_nccl(*args, **kwargs):
+        raise AssertionError("Logical MTP must reduce normalization with the native transport")
+
+    for name in ("isend", "irecv", "batch_isend_irecv", "all_reduce"):
+        monkeypatch.setattr(torch.distributed, name, reject_nccl)
+    local_grad = run(
+        global_hidden[:, start : start + local_length],
+        full_labels[:, start : start + local_length],
+        full_mask[:, start : start + local_length],
+        group,
+    )
+    assert torch.isfinite(local_grad).all()
+    torch.testing.assert_close(local_grad, baseline_grad[:, start : start + local_length])
+
+
+def test_native_dynamic_cp_accepts_mtp(monkeypatch):
     monkeypatch.setattr(sys, "argv", ["test_native_dynamic_cp_mtp"])
     args = parse_args()
     args.num_layers = 2
@@ -80,8 +259,139 @@ def test_native_dynamic_cp_rejects_mtp_before_initialization(monkeypatch):
     args.distributed_backend = "nccl"
     args.cp_comm_type = ["p2p"]
     args.bf16 = True
-    with pytest.raises(ValueError, match="does not support MTP halo communication"):
-        validate_args(args)
+    validate_args(args)
+    assert args.use_native_cp_transport and args.mtp_num_layers == 1
+
+
+def test_gpt_forward_keeps_full_token_padding_mask_for_mtp():
+    """Decoder SP preprocessing must not replace the token mask used by MTP."""
+    tokens = torch.ones((1, 16), dtype=torch.long)
+    padding_mask = torch.arange(16).view(1, -1) % 3 == 0
+    sp_mask = padding_mask[:, :4]
+    hidden = torch.zeros((4, 1, 8))
+    seen = {}
+
+    def decoder(**kwargs):
+        seen["decoder_mask"] = kwargs["padding_mask"]
+        return hidden
+
+    def postprocess(**kwargs):
+        seen["mtp_mask"] = kwargs["padding_mask"]
+        return kwargs["hidden_states"]
+
+    model = types.SimpleNamespace(
+        config=types.SimpleNamespace(
+            fine_grained_activation_offloading=False, moe_paged_stash=False, moe_n_hash_layers=0
+        ),
+        mtp_process=True,
+        _preprocess=lambda **kwargs: (hidden, None, None, None, None, sp_mask),
+        decoder=decoder,
+        _postprocess=postprocess,
+    )
+    GPTModel.forward(model, tokens, tokens, None, padding_mask=padding_mask)
+    assert seen["decoder_mask"] is sp_mask
+    assert seen["mtp_mask"] is padding_mask
+
+
+@pytest.mark.parametrize("cp_size", [1, 3])
+@pytest.mark.parametrize("tp_size", [2, 4])
+@pytest.mark.parametrize("initial_sp_mask", [False, True])
+@pytest.mark.parametrize("hybrid", [False, True])
+def test_native_mtp_tp_sp_keeps_token_and_transformer_masks_separate(
+    native_mtp_parent, monkeypatch, cp_size, tp_size, initial_sp_mask, hybrid
+):
+    """Repeated rolls retain full CP masks; only Transformer/checkpoint inputs use SP."""
+    if native_mtp_parent.size() < tp_size * cp_size:
+        pytest.skip(f"TP{tp_size} CP{cp_size} requires at least {tp_size * cp_size} ranks")
+    from megatron.core.transformer import multi_token_prediction as mtp_module
+
+    Utils.initialize_model_parallel(tensor_model_parallel_size=tp_size, context_parallel_size=1)
+    try:
+        tp_group = ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp"]).tp
+        parent_ranks = torch.distributed.get_process_group_ranks(native_mtp_parent)
+        cp_ranks = parent_ranks[tp_group.rank() :: tp_size][:cp_size]
+        rank = torch.distributed.get_rank()
+        if rank not in cp_ranks:
+            return
+        group = LogicalCPGroup.from_parent_interval(cp_ranks, 0, cp_size, rank)
+        bind_native_mtp_cp_group(group, native_mtp_parent)
+        local_length = 16
+        length = local_length * cp_size
+        start = group.rank() * local_length
+        full_tokens = torch.arange(1, length + 1, device="cuda").view(1, -1)
+        full_mask = full_tokens % 7 == 0
+        tokens = full_tokens[:, start : start + local_length].clone()
+        mask = full_mask[:, start : start + local_length].clone()
+        params = PackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=torch.tensor([0, length], device="cuda", dtype=torch.int32),
+            cp_partition_mode="contiguous",
+            cp_group=group,
+            local_cp_size=cp_size,
+        )
+        context = prepare_mtp_sequence_roll_context(tokens, group, params)
+        if context is not None:
+            context = context.prefetch_halos(width=3, input_ids=tokens, padding_mask=mask)
+        seen = {}
+
+        def transformer(**kwargs):
+            seen["mask"] = kwargs["padding_mask"].clone()
+            assert kwargs["hidden_states"].shape[0] == local_length // tp_size
+            return kwargs["hidden_states"]
+
+        hidden = torch.zeros((local_length // tp_size, 1, 8), device="cuda")
+        embedding = lambda **kwargs: torch.zeros_like(hidden)
+        embedding.add_position_embedding = False
+        layer = types.SimpleNamespace(
+            config=types.SimpleNamespace(
+                sequence_parallel=True, mtp_detach_heads=False, recompute_granularity="full"
+            ),
+            cp_group=group,
+            tp_group=tp_group,
+            _mtp_cp_parent_group=native_mtp_parent,
+            training=True,
+            mtp_layer_pattern="*" if hybrid else None,
+            _proj_and_transformer_layer=transformer,
+            _checkpointed_forward=transformer,
+        )
+        layer._get_embeddings = types.MethodType(MultiTokenPredictionLayer._get_embeddings, layer)
+        original_gather = mtp_module.gather_from_sequence_parallel_region
+        gather_calls = 0
+
+        def counted_gather(*args, **kwargs):
+            nonlocal gather_calls
+            gather_calls += 1
+            return original_gather(*args, **kwargs)
+
+        monkeypatch.setattr(mtp_module, "gather_from_sequence_parallel_region", counted_gather)
+        if initial_sp_mask:
+            mask = mask.chunk(tp_size, dim=-1)[tp_group.rank()].contiguous()
+        for depth in range(2):
+            hidden, tokens, _, mask = MultiTokenPredictionLayer.forward(
+                layer,
+                tokens,
+                tokens,
+                hidden,
+                None,
+                padding_mask=mask,
+                packed_seq_params=params,
+                sequence_roll_context=context,
+                roll_depth=depth,
+                embedding=embedding,
+            )
+            full_tokens = torch.roll(full_tokens, -1, -1)
+            full_tokens[:, -1] = 0
+            full_mask = torch.roll(full_mask, -1, -1)
+            full_mask[:, -1] = True
+            expected_mask = full_mask[:, start : start + local_length]
+            torch.testing.assert_close(tokens, full_tokens[:, start : start + local_length])
+            torch.testing.assert_close(mask, expected_mask)
+            torch.testing.assert_close(
+                seen["mask"], expected_mask.chunk(tp_size, -1)[tp_group.rank()]
+            )
+        assert gather_calls == int(initial_sp_mask)
+    finally:
+        Utils.destroy_model_parallel()
 
 
 class TestMultiTokenPredictionLayer:

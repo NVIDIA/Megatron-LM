@@ -26,6 +26,7 @@ from megatron.core.transformer.module import GraphableMegatronModule
 from megatron.core.transformer.moe.paged_stash import paged_stash_init_chunk_handler
 from megatron.core.transformer.multi_token_prediction import (
     MultiTokenPredictionBlock,
+    bind_native_mtp_cp_group,
     mtp_on_this_rank,
     prepare_mtp_sequence_roll_context,
     process_mtp_loss,
@@ -623,6 +624,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             and not (in_inference_mode or is_spec_decode)
         ):
             mtp_cp_group = resolve_cp_group(self.pg_collection.cp, packed_seq_params)
+            bind_native_mtp_cp_group(mtp_cp_group, getattr(self.pg_collection, "dp_cp", None))
             # Build layout-specific metadata once, then fetch every locally owned
             # MTP field's compact successor rows in one grouped operation. The extra
             # row covers RL's initial label derivation before the per-layer rolls.

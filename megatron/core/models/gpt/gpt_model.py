@@ -32,6 +32,7 @@ from megatron.core.transformer.linear_cross_entropy import LinearCrossEntropyMod
 from megatron.core.transformer.moe.paged_stash import paged_stash_init_chunk_handler
 from megatron.core.transformer.multi_token_prediction import (
     MultiTokenPredictionBlock,
+    bind_native_mtp_cp_group,
     mtp_on_this_rank,
     prepare_mtp_sequence_roll_context,
     process_mtp_loss,
@@ -583,6 +584,8 @@ class GPTModel(LanguageModule):
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
+        # MTP rolls tokens before SP; decoder preprocessing may shard only its mask.
+        token_padding_mask = padding_mask
         preproc_output = self._preprocess(
             input_ids=input_ids,
             position_ids=position_ids,
@@ -642,7 +645,7 @@ class GPTModel(LanguageModule):
             loss_mask=loss_mask,
             decoder_input=decoder_input,
             attention_mask=attention_mask,
-            padding_mask=padding_mask,
+            padding_mask=token_padding_mask,
             inference_params=inference_params,
             packed_seq_params=packed_seq_params,
             sequence_len_offset=sequence_len_offset,
@@ -704,6 +707,7 @@ class GPTModel(LanguageModule):
             and not (in_inference_mode or is_spec_decode)
         ):
             mtp_cp_group = resolve_cp_group(self.pg_collection.cp, packed_seq_params)
+            bind_native_mtp_cp_group(mtp_cp_group, getattr(self.pg_collection, "dp_cp", None))
             # Build layout-specific metadata once, then fetch every locally owned
             # MTP field's compact successor rows in one grouped operation. The extra
             # row covers RL's initial label derivation before the per-layer rolls.
