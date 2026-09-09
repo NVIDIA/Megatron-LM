@@ -60,7 +60,7 @@ jobs:
             PR NUMBER: ${{ env.PR_NUMBER }}
             REVIEW DEPTH: light
 
-            Read `skills/claude-review/SKILL.md` with the Read tool and follow it exactly.
+            Read `skills/pr-review/SKILL.md` with the Read tool and follow it exactly.
             It is checked out at the PR head alongside this workflow.
 
   # ──────────────────────────────────────────────────────────────────
@@ -126,5 +126,5 @@ jobs:
             BASE REF: origin/${{ steps.pr-info.outputs.base_ref }}
             REVIEW DEPTH: strict
 
-            Read `skills/claude-review/SKILL.md` with the Read tool and follow it exactly.
+            Read `skills/pr-review/SKILL.md` with the Read tool and follow it exactly.
             It is checked out at the PR head alongside this workflow.

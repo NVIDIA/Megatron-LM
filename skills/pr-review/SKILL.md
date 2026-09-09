@@ -1,5 +1,5 @@
 ---
-name: claude-review
+name: pr-review
 description: Prompt asset for the Claude Code Review GitHub Action. It is read as a file by .github/workflows/claude_review.yml and is not an interactive skill — do not load it to answer questions or to review code outside that workflow.
 license: Apache-2.0
 disable-model-invocation: true
@@ -27,8 +27,8 @@ rubric, so loading the other adds nothing but noise:
 
 | `REVIEW DEPTH` | Comment trigger | Read |
 | -------------- | --------------- | ---- |
-| `light` | `/claude review` | `skills/claude-review/references/light.md` |
-| `strict` | `/claude strict-review` | `skills/claude-review/references/strict.md` |
+| `light` | `/claude review` | `skills/pr-review/references/light.md` |
+| `strict` | `/claude strict-review` | `skills/pr-review/references/strict.md` |
 
 ## Mandatory workflow — never skip or reorder
 
