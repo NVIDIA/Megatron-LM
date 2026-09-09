@@ -1410,9 +1410,13 @@ class InferenceGroupedMLP(TEGroupedMLP):
                     full_rows,
                     token_capacity,
                 )
+        if routing_map.dtype != torch.int32:
+            raise TypeError(
+                f"FlashInfer BF16 requires int32 expert indices; got {routing_map.dtype}"
+            )
         output = fused_moe.cutlass_fused_moe(
             hidden_states[:active_rows],
-            routing_map[:active_rows].int(),
+            routing_map[:active_rows],
             probs[:active_rows],
             self._fc1_weight,
             self._fc2_weight,

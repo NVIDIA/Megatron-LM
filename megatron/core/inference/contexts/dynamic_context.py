@@ -434,6 +434,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         # match_graph_config() uses this to perform the MAX reduction on the
         # CPU, avoiding a per-step NCCL AllReduce kernel on the compute stream.
         self._ep_zmq_communicator = None
+        self._ep_mode_sync_tensor = None
 
         # Mamba states.
         mamba_inference_state_config = inference_config.mamba_inference_state_config
@@ -828,6 +829,12 @@ class DynamicInferenceContext(BaseInferenceContext):
                 topk=model_config.moe_router_topk,
                 hidden_size=moe_hidden_size,
                 ep_group=self.expert_model_parallel_group,
+                routing_dtype=(
+                    torch.int32
+                    if model_config.inference_grouped_gemm_backend
+                    == InferenceGroupedGemmBackend.FLASHINFER
+                    else torch.int64
+                ),
             )
 
         # Pre-allocate the vLLM fused-MoE intermediates so no allocation happens
@@ -1117,6 +1124,12 @@ class DynamicInferenceContext(BaseInferenceContext):
                 "All tensors should be allocated within `initialize_all_tensors()`. "
                 f"Please move tensor '{key}'."
             )
+
+        self._ep_mode_sync_tensor = (
+            torch.zeros(1, dtype=torch.int32, device=torch.cuda.current_device())
+            if self.inference_flashinfer_bounded_rows and self.expert_model_parallel_size > 1
+            else None
+        )
 
         # Per-request state (CPU, pinned memory for fast H2D transfer).
         self.request_ids = torch.full(
@@ -1736,9 +1749,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         if self._ep_zmq_communicator is not None:
             any_rank_has_prefill = self._ep_zmq_communicator.sync_all_reduce_max(local_has_prefill)
         else:
-            sync_tensor = torch.tensor(
-                [local_has_prefill], dtype=torch.int32, device=torch.cuda.current_device()
-            )
+            sync_tensor = self._ep_mode_sync_tensor
+            assert sync_tensor is not None
+            sync_tensor.fill_(local_has_prefill)
             torch.distributed.all_reduce(
                 sync_tensor,
                 op=torch.distributed.ReduceOp.MAX,

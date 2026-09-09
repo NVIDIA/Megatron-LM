@@ -57,6 +57,33 @@ def test_nvls_flashinfer_metadata_initializes_padding_routes_to_minus_one(monkey
     assert torch.equal(routing, torch.full_like(routing, -1))
 
 
+def test_nvls_flashinfer_metadata_only_initializes_bounded_prefix(monkeypatch):
+    from megatron.core.inference.moe import InferenceGroupedGemmBackend
+    from megatron.core.transformer.moe import token_dispatcher_inference as dispatcher_module
+
+    routing = torch.zeros(8, 2, dtype=torch.int32)
+    for name, value in {
+        "_symm_agv_routing": {"tensor": routing},
+        "_symm_metadata": {"tensor": torch.empty(2, dtype=torch.int32), "handle": object()},
+        "_step_metadata": torch.zeros(3, dtype=torch.int32),
+    }.items():
+        monkeypatch.setattr(dispatcher_module.NVLSAllGatherVDispatcher, name, value)
+    monkeypatch.setattr(dispatcher_module, "fused_metadata_update", lambda **kwargs: None)
+    dispatcher = SimpleNamespace(
+        config=SimpleNamespace(
+            inference_grouped_gemm_backend=InferenceGroupedGemmBackend.FLASHINFER
+        ),
+        ep_size=2,
+    )
+    InferenceMode.set_active()
+    InferenceMode.set_flashinfer_token_capacity(3)
+
+    dispatcher_module.NVLSAllGatherVDispatcher.update_metadata(dispatcher, local_tokens=1)
+
+    assert torch.equal(routing[:3], torch.full_like(routing[:3], -1))
+    assert torch.equal(routing[3:], torch.zeros_like(routing[3:]))
+
+
 @pytest.mark.parametrize(
     ("bounded_rows_allowed", "num_speculative_tokens", "expected"),
     [(False, 2, None), (True, 2, 1536)],
@@ -334,7 +361,7 @@ def test_bf16_flashinfer_nvls_uses_dispatcher_copy_fallback(monkeypatch):
     output, bias = experts.InferenceGroupedMLP._flashinfer_forward(
         grouped_mlp,
         torch.empty(full_rows, 8, dtype=torch.bfloat16),
-        torch.zeros(full_rows, 1, dtype=torch.int64),
+        torch.zeros(full_rows, 1, dtype=torch.int32),
         torch.zeros(full_rows, 1, dtype=torch.float32),
     )
 
@@ -358,6 +385,7 @@ def test_bounded_bf16_flashinfer_uses_active_prefix_and_full_rsv_output(monkeypa
     def cutlass_fused_moe(hidden_states, routing_map, probs, *args, **kwargs):
         captured["hidden_shape"] = tuple(hidden_states.shape)
         captured["routing_shape"] = tuple(routing_map.shape)
+        captured["routing_dtype"] = routing_map.dtype
         captured["prob_shape"] = tuple(probs.shape)
         return (expected,)
 
@@ -373,7 +401,7 @@ def test_bounded_bf16_flashinfer_uses_active_prefix_and_full_rsv_output(monkeypa
     output, bias = experts.InferenceGroupedMLP._flashinfer_forward(
         grouped_mlp,
         torch.empty(full_rows, hidden_size, dtype=torch.bfloat16),
-        torch.zeros(full_rows, 1, dtype=torch.int64),
+        torch.zeros(full_rows, 1, dtype=torch.int32),
         torch.zeros(full_rows, 1, dtype=torch.float32),
     )
 
@@ -382,6 +410,7 @@ def test_bounded_bf16_flashinfer_uses_active_prefix_and_full_rsv_output(monkeypa
     assert captured == {
         "hidden_shape": (active_rows, hidden_size),
         "routing_shape": (active_rows, 1),
+        "routing_dtype": torch.int32,
         "prob_shape": (active_rows, 1),
     }
     assert torch.equal(rsv_output[:active_rows], expected.float())

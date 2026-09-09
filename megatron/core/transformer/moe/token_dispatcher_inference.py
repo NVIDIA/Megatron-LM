@@ -35,6 +35,7 @@ from megatron.core.inference.communication.torch_symm_triton import (
 from megatron.core.inference.moe import InferenceGroupedGemmBackend, batch_invariant
 from megatron.core.inference.moe.metadata import fused_metadata_update
 from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
+from megatron.core.inference.utils import InferenceMode
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel import (
     gather_from_sequence_parallel_region,
@@ -324,7 +325,8 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
     _real_token_count_tensor: Optional[torch.Tensor] = None
 
     # ── Class-level symmetric buffer handles (allocated once at model init) ───────
-    # Dtypes: hidden=bf16, routing=int64, probs=fp32, rsv=fp32.
+    # Dtypes: hidden=bf16, routing=int32 for FlashInfer or int64 otherwise,
+    # probs=fp32, rsv=fp32.
     _symm_agv_hidden: Optional[dict] = None  # {"tensor": ..., "handle": ...}
     _symm_agv_routing: Optional[dict] = None
     _symm_agv_probs: Optional[dict] = None
@@ -388,6 +390,7 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         topk: int,
         hidden_size: int,
         ep_group: torch.distributed.ProcessGroup,
+        routing_dtype: torch.dtype = torch.int64,
     ) -> None:
         """Allocate all symmetric buffers and initialize class-level metadata.
 
@@ -401,6 +404,8 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
             topk: MoE router top-k value.
             hidden_size: Model hidden dimension.
             ep_group: Expert parallel process group.
+            routing_dtype: Dtype produced by the inference router. FlashInfer consumes
+                int32 expert indices; other grouped-GEMM backends retain int64.
         """
         ep_size = get_pg_size(ep_group)
         cls._per_rank_worst_case_token_count = per_rank_worst_case_token_count
@@ -427,8 +432,8 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         ).maybe_get_tensor(agv_h_shape, dtype=torch.bfloat16)
 
         cls._symm_agv_routing = SymmetricMemoryManager.get_buffer(
-            "ep_agv_r", process_group=ep_group, size_mb=_size_mb(agv_r_shape, torch.int64)
-        ).maybe_get_tensor(agv_r_shape, dtype=torch.int64)
+            "ep_agv_r", process_group=ep_group, size_mb=_size_mb(agv_r_shape, routing_dtype)
+        ).maybe_get_tensor(agv_r_shape, dtype=routing_dtype)
 
         cls._symm_agv_probs = SymmetricMemoryManager.get_buffer(
             "ep_agv_p", process_group=ep_group, size_mb=_size_mb(agv_p_shape, torch.float32)
@@ -487,7 +492,11 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         if self.config.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.FLASHINFER:
             # FlashInfer ignores expert id -1. AllGather-V overwrites the compact
             # valid prefix, leaving every unused row as an unrouted padding sentinel.
-            cls._symm_agv_routing["tensor"].fill_(-1)
+            routing = cls._symm_agv_routing["tensor"]
+            token_capacity = InferenceMode.flashinfer_token_capacity()
+            if token_capacity is not None:
+                routing = routing[:token_capacity]
+            routing.fill_(-1)
 
     def __init__(
         self,
@@ -557,7 +566,8 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
 
         Returns:
             (hidden_states, probs) gathered to [global_max, *] shape.
-            Also updates self.routing_map to [global_max, topk] int64.
+            Also updates self.routing_map to [global_max, topk]. FlashInfer uses
+            int32 expert indices; other backends use int64.
         """
         if self.ep_size == 1:
             if self._runs_metadata_sync:

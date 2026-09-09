@@ -34,7 +34,7 @@ except ImportError:
 
 @triton.jit
 def _mask_routing_padding_kernel(
-    routing_map_ptr,  # int64* [total_rows, topk]
+    routing_map_ptr,  # int32* or int64* [total_rows, topk]
     real_token_count_ptr,  # int32* [1]
     total_rows: tl.int32,
     tp_rank: tl.int32,  # SP/TP rank — local row r maps to global row r + tp_rank*total_rows
@@ -58,7 +58,7 @@ def _mask_routing_padding_kernel(
     offs = rows[:, None].to(tl.int64) * TOPK + cols[None, :].to(tl.int64)
     mask = row_mask[:, None] & col_mask[None, :]
 
-    neg_one = tl.full((BLOCK_M, BLOCK_TOPK), -1, dtype=tl.int64)
+    neg_one = tl.full((BLOCK_M, BLOCK_TOPK), -1, dtype=tl.int32)
     tl.store(routing_map_ptr + offs, neg_one, mask=mask)
 
 
@@ -68,7 +68,7 @@ def mask_routing_padding(
     """In-place fill -1 into ``routing_map[real_token_count:, :]``.
 
     Args:
-        routing_map: ``[N, topk]`` int64 local routing map. ``N`` is the
+        routing_map: [N, topk] int32 or int64 local routing map. N is the
             (possibly CUDA-graph-padded) local token count.
         real_token_count_tensor: ``[1]`` int32 GPU tensor holding the real
             (unpadded) token count for this step, in the global (pre-SP-shard)
