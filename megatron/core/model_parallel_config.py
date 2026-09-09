@@ -346,7 +346,10 @@ class ModelParallelConfig:
     When enabled, each model-chunk plan binds tensors produced by schedule nodes to
     their creation stream and hands them back through the existing event chain.
     External and detached gradients keep using allocator ``record_stream`` release.
-    This option is experimental and disabled by default.
+    Enable this option only for the sync-free combined 1F1B path with
+    ``overlap_moe_expert_parallel_comm`` enabled, where schedule nodes pass tensors
+    across CUDA streams.  Other schedules should leave it disabled and use the
+    default allocator ``record_stream`` release path.  This option is experimental.
     """
 
     delay_wgrad_compute: bool = False
