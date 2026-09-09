@@ -5,6 +5,7 @@ from typing import Callable, Dict, List, Optional, Union
 
 import torch
 from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
+
 from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
     uneven_dtensor_to_full_tensor,
 )
@@ -204,6 +205,35 @@ def _allreduce_word_embedding_grads(
     )
 
 
+def _full_embedding_grad(orig_grad):
+    """Expand an MFSDP v2 uneven (flat-buffer) sharded embedding grad to the full logical gradient.
+
+    MFSDP v2 shards the shared word embedding with uneven (flat-buffer) offsets, and different
+    PP stages can hold the same logical slice at different flat-buffer offsets with different local
+    shard shapes. ``uneven_dtensor_to_full_tensor`` gathers each rank's chunk metadata and local
+    buffer and reconstructs the full logical gradient in a canonical (uniform-row) layout so that
+    position ``i`` denotes the same logical element on every rank; only then can a cross-stage
+    all-reduce combine matching elements.
+    """
+    return uneven_dtensor_to_full_tensor(orig_grad) if orig_grad is not None else None
+
+
+def _copy_embedding_grad_back(orig_grad, full_grad):
+    """Copy this rank's logical slice from the full gradient back into its shard's local tensor.
+
+    After the all-reduce, ``full_grad`` holds the accumulated logical gradient in canonical layout.
+    Each rank owns a contiguous slice (the chunk ``orig_grad.__create_chunk_list__()[0]``) in its
+    own flattened shard, located by ``offsets``/``sizes``; copying that slice back into
+    ``orig_grad._local_tensor`` restores the stage's local shard without changing the (identical)
+    contents on other ranks.
+    """
+    chunk = orig_grad.__create_chunk_list__()[0]
+    local_slice = tuple(
+        slice(offset, offset + size) for offset, size in zip(chunk.offsets, chunk.sizes)
+    )
+    orig_grad._local_tensor.copy_(full_grad[local_slice])
+
+
 def _allreduce_embedding_grad(
     model: List[torch.nn.Module],
     embd_group: torch.distributed.ProcessGroup,
@@ -253,14 +283,9 @@ def _allreduce_embedding_grad(
         grad_attr = _get_main_grad_attr(weight)
         orig_grad = getattr(weight, grad_attr)
         if ddp_config.use_megatron_fsdp:
-            # MFSDP v2 shards the embedding with uneven (flat-buffer) offsets, and
-            # different PP stages can use different flattened layouts. Two ranks that
-            # own the same logical tensor slice may therefore hold it at different
-            # flat-buffer offsets with different local shard shapes, so reducing the
-            # raw local shards directly would combine mismatched elements. Reconstruct
-            # the full logical gradient before the all-reduce, then copy back the slice
-            # this rank owns into its shard's local tensor.
-            grad = uneven_dtensor_to_full_tensor(orig_grad) if orig_grad is not None else None
+            # Expand the uneven (flat-buffer) sharded embedding grad to the full logical gradient
+            # so the cross-stage all-reduce below combines matching rows (see _full_embedding_grad).
+            grad = _full_embedding_grad(orig_grad)
         else:
             grad = _unshard_if_dtensor(orig_grad)
         # When the embedding is frozen, the grad is None.
@@ -268,11 +293,7 @@ def _allreduce_embedding_grad(
             return
         torch.distributed.all_reduce(grad, group=embd_group)
         if ddp_config.use_megatron_fsdp:
-            chunk = orig_grad.__create_chunk_list__()[0]
-            local_slice = tuple(
-                slice(offset, offset + size) for offset, size in zip(chunk.offsets, chunk.sizes)
-            )
-            orig_grad._local_tensor.copy_(grad[local_slice])
+            _copy_embedding_grad_back(orig_grad, grad)
         else:
             setattr(weight, grad_attr, _reshard_if_dtensor(grad, orig_grad))
 
