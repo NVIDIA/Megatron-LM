@@ -407,3 +407,74 @@ def test_layer_wise_muon_grad_norm_uses_expert_tp_group_for_row_parallel_bias():
         assert actual_norm_value == pytest.approx(expected_norm)
     finally:
         Utils.destroy_model_parallel()
+
+
+@pytest.mark.parametrize("expert_parallel_size", (1, 2))
+def test_layer_wise_param_norm_counts_owners_before_param_sync(monkeypatch, expert_parallel_size):
+    """Norms use updated owner weights while non-owner model copies remain stale."""
+    from megatron.core.optimizer.layer_wise_optimizer import LayerWiseDistributedOptimizer
+    from megatron.core.process_groups_config import ProcessGroupCollection
+
+    if Utils.world_size < 4 or Utils.world_size % 2 != 0:
+        pytest.skip("test requires an even world size of at least four")
+
+    monkeypatch.setattr(
+        common_utils, "get_args", lambda: SimpleNamespace(use_megatron_fsdp=False, bf16=True)
+    )
+    try:
+        Utils.initialize_model_parallel(expert_model_parallel_size=expert_parallel_size)
+        model = _build_tiny_moe_gpt(
+            tensor_parallel_size=1,
+            expert_parallel_size=expert_parallel_size,
+            expert_tensor_parallel_size=1,
+            bf16=True,
+        ).bfloat16()
+        _fill_parameters_with_ones(model)
+        expected_numel = sum(
+            p.numel() * (1 if getattr(p, "allreduce", True) else expert_parallel_size)
+            for p in model.parameters()
+        )
+        model = DistributedDataParallel(
+            model.config, DistributedDataParallelConfig(overlap_param_gather=True), model
+        )
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        optimizer = get_megatron_optimizer(
+            OptimizerConfig(
+                optimizer="muon",
+                lr=0.0,
+                bf16=True,
+                use_layer_wise_distributed_optimizer=True,
+                muon_tp_mode="duplicated",
+            ),
+            [model],
+            use_gloo_process_groups=False,
+            pg_collection=pg_collection,
+        )
+        assert isinstance(optimizer, LayerWiseDistributedOptimizer)
+        assert optimizer.overlap_param_gather
+        params = list(model.parameters())
+        assert all(getattr(p, "main_param_sharded", False) for p in params)
+        assert common_utils.calc_params_l2_norm(model) == pytest.approx(math.sqrt(expected_numel))
+        assert common_utils.calc_params_l2_norm(
+            model, force_create_fp32_copy=True
+        ) == pytest.approx(math.sqrt(expected_numel))
+
+        # Simulate an optimizer update before DDP's next parameter gather. Use an
+        # exactly representable value, so rounding cannot explain a norm mismatch.
+        with torch.no_grad():
+            for param in params:
+                main_param = getattr(param, "main_param", None)
+                if main_param is not None:
+                    main_param.fill_(2.0)
+                else:
+                    torch.testing.assert_close(param, torch.ones_like(param))
+                    assert common_utils._get_param_data(param, False, True) == (None, True)
+        assert common_utils.calc_params_l2_norm(model) == pytest.approx(
+            2.0 * math.sqrt(expected_numel)
+        )
+        # Explicit model-copy mode must continue to read the unsynchronized copies.
+        assert common_utils.calc_params_l2_norm(model, force_create_fp32_copy=True) < (
+            2.0 * math.sqrt(expected_numel)
+        )
+    finally:
+        Utils.destroy_model_parallel()
