@@ -44,6 +44,7 @@ For NVIDIA GPU Cloud (NGC) container setup and all installation options, review 
 - **[Your First Training Run](https://docs.nvidia.com/megatron-core/developer-guide/latest/get-started/quickstart.html)** - End-to-end training examples with data preparation
 - **[Parallelism Strategies](https://docs.nvidia.com/megatron-core/developer-guide/latest/user-guide/parallelism-guide.html)** - Scale training across GPUs with TP, PP, DP, EP, and CP
 - **[Contribution Guide](https://docs.nvidia.com/megatron-core/developer-guide/latest/developer/contribute.html)** - How to contribute to Megatron Core
+- **[Style Guide](style-guide.md)** - Coding conventions, documentation, and checks
 
 # Latest News
 

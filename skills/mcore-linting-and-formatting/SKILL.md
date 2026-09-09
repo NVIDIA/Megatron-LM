@@ -40,10 +40,11 @@ uv run isort <file1>.py <file2>.py
 
 ## Setting Up the Linting Group
 
-Inside the container:
+Inside the development container, from the repository root:
 
 ```bash
 uv sync --locked --only-group linting
+export PATH="$PWD/.venv/bin:$PATH"
 ```
 
 This installs `ruff`, `black`, `isort`, `pylint` — the same tools used by
@@ -53,8 +54,11 @@ This installs `ruff`, `black`, `isort`, `pylint` — the same tools used by
 
 ## Code Style Rules
 
-- **Type hints**: required on all public API functions. Use `X | None`, not `Optional[X]`.
+- **Type hints**: required on all public API functions. Prefer `X | None` for new interfaces; preserve nearby annotation conventions when extending existing code.
 - **Docstrings**: Google-style on all public classes and functions.
 - **Naming**: follow Python conventions — `snake_case` for functions and variables, `PascalCase` for classes.
-- **Line length**: 119 characters (configured in `pyproject.toml`).
+- **Line length**: 100 characters (configured in `pyproject.toml` and `.pylintrc`).
 - **No bare `except`**: always catch specific exception types.
+
+See the [repository style guide](../../style-guide.md) for the full conventions
+and the distinction between recommendations and enforced checks.
