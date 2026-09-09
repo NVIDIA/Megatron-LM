@@ -22,14 +22,14 @@ class MTPMetadata:
 
     The buffers fall into two groups:
       * Draft-loop state (`offsets`, `block_table`): staged once per step by
-        :meth:`begin_decode` and advanced per depth by :meth:`advance_decode_step`.
+        `begin_decode` and advanced per depth by `advance_decode_step`.
       * Per-forward staging (`query_lengths`, `kv_lengths`): rebuilt by `stage_*_lengths` for
-        each forward, then written into the context's `gpu_view` by :meth:`write_mha_metadata`.
+        each forward, then written into the context's `gpu_view` by `write_mha_metadata`.
         They are staged here rather than written straight into `gpu_view` because the padded-row
         adjustments must be applied before the cumulative sums are taken.
 
-    Construction is cheap and unconditional; :meth:`allocate` (called from the context's
-    ``initialize_all_tensors``) is what reserves GPU memory, and only when `enabled`.
+    Construction is cheap and unconditional; `allocate` (called from the context's
+    `initialize_all_tensors`) is what reserves GPU memory, and only when `enabled`.
 
     Args:
         enabled (bool): Whether MTP KV caching is active for this context. When False the
@@ -105,7 +105,7 @@ class MTPMetadata:
         self.prerewind_buf = torch.empty_like(block_table_template).pin_memory()
 
     def deallocate(self) -> None:
-        """Release the persistent buffers, mirroring :meth:`allocate`.
+        """Release the persistent buffers, mirroring `allocate`.
 
         Used by the context's suspend path, which drops its tensors and rebuilds them from
         `initialize_all_tensors` on resume.
@@ -212,7 +212,7 @@ class MTPMetadata:
         internal gather the attention sees `total + pad_tokens` query rows while `append_counts`
         describes only `total` of them. Varlen attention requires `q.shape[0] == cu_seqlens_q[-1]`,
         so every pad row is given an owning request. Only the write maps decide where a forward's
-        KV lands, and :meth:`write_token_maps` redirects the pad rows to the dummy block, so the
+        KV lands, and `write_token_maps` redirects the pad rows to the dummy block, so the
         extra query rows are inert wherever they are attributed.
 
         Args:
@@ -297,7 +297,7 @@ class MTPMetadata:
                 tensor as `query_lengths` when the two coincide.
             block_table (Tensor): Block ids for the first `block_table.shape[0]` requests. Any
                 remaining request slot -- the trailing pad request staged by
-                :meth:`stage_prefill_lengths` -- is pointed at the dummy block.
+                `stage_prefill_lengths` -- is pointed at the dummy block.
             padded_request_count (int): Request slots the kernel launches over, including
                 padding. Padded slots get zero lengths and a -1 block table, so they never index
                 real KV.

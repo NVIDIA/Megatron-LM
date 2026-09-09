@@ -300,9 +300,9 @@ class MTPInferenceMixin:
 
         Every rank must run exactly one MTP "prefill-slot" forward per step so the MoE/EP
         all-to-alls stay balanced when some ranks seed a real prompt and others (idle ranks,
-        or active ranks with no prefill this step) do not. Uses ``inference_context=None`` so
+        or active ranks with no prefill this step) do not. Uses `inference_context=None` so
         the attention runs cache-free (no child append); only the MoE all-to-all matters here.
-        Mirrors the real seed's single ``forward_single_position`` call.
+        Mirrors the real seed's single `forward_single_position` call.
         """
         device = torch.cuda.current_device()
         dtype = self.model_config.params_dtype
@@ -630,10 +630,10 @@ class MTPInferenceMixin:
         EP all-to-all collectives. The dummy EP rank must issue matching
         collective calls so the real ranks do not hang.
 
-        This mirrors the structure of ``_compute_serial_mtp_and_sample``:
-        - On the last PP stage (where MTP resides): run ``compute_mtp_single_step``
+        This mirrors the structure of `_compute_serial_mtp_and_sample`:
+        - On the last PP stage (where MTP resides): run `compute_mtp_single_step`
           with dummy tensors so the MoE all-to-all is executed.
-        - When PP > 1: participate in the ``broadcast_from_last_pipeline_stage``
+        - When PP > 1: participate in the `broadcast_from_last_pipeline_stage`
           that the real ranks also perform.
         """
         if self.num_speculative_tokens == 0 or self.num_mtp_depths == 0:

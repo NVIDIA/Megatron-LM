@@ -1985,7 +1985,7 @@ class DynamicInferenceContext(BaseInferenceContext):
     #   3. `_mtp_activate_attn_metadata`: pick the graphed vs eager metadata object, publish the
     #                                    sequence-length bounds and token counts for the step.
     # The step setups differ only in how they derive the (row, position) pairs and the per-request
-    # lengths. Everything persistent lives in `self.mtp_metadata` (:class:`MTPMetadata`), whose
+    # lengths. Everything persistent lives in `self.mtp_metadata` (`MTPMetadata`), whose
     # buffers are allocated once and updated in place, so no draft depth allocates metadata tensors.
     # ------------------------------------------------------------------
     def _mtp_activate_attn_metadata(

@@ -36,7 +36,7 @@ MTP_DEBUG_SHAPES = os.environ.get("MCORE_MTP_DEBUG_SHAPES", "0").lower() not in 
 def log_mtp_debug(tag: str, context=None, **fields) -> None:
     """Log one MTP forward's context metadata alongside caller-supplied tensor shapes.
 
-    No-op unless ``MCORE_MTP_DEBUG_SHAPES`` is set. Every line is prefixed with the global rank
+    No-op unless `MCORE_MTP_DEBUG_SHAPES` is set. Every line is prefixed with the global rank
     and the engine step so lines can be correlated across ranks and against a crash traceback.
 
     Args:
