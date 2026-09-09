@@ -178,10 +178,10 @@ def test_pack_and_reconstruct_round_trip():
     recv = _simulate_p2p(per_rank_send, dp_size)
 
     # Rank0 owns param0; reconstruct and compare to full_p0.
-    full0 = per_rank_gather[0].reconstruct_full(0, plan0, recv[0], owner_rank=0)
+    full0 = per_rank_gather[0].reconstruct_full(0, recv[0])
     torch.testing.assert_close(full0, full_p0, atol=0, rtol=0)
     # Rank1 owns param1; reconstruct and compare to full_p1.
-    full1 = per_rank_gather[1].reconstruct_full(1, plan1, recv[1], owner_rank=1)
+    full1 = per_rank_gather[1].reconstruct_full(1, recv[1])
     torch.testing.assert_close(full1, full_p1, atol=0, rtol=0)
 
 

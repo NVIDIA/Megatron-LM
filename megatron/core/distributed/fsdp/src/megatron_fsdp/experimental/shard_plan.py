@@ -231,14 +231,16 @@ class OwnerGatherPlan:
             other than this rank appear.
         own_shards: This rank's local shard per owned parameter (used directly in reconstruction,
             not communicated).
-        recv_offsets: Per `(param_index, src_rank)` of `(offset, numel, row_count)` describing where
-            this param's shard lands inside the recv buffer received from `src_rank`.
+        recv_offsets: Per `(param_index, src_rank)`, the flat offset of this param's shard inside
+            the recv buffer received from `src_rank`.
     """
 
+    plans: tuple[ParameterLayout, ...]
+    this_rank: int
     send_buffers: dict[int, torch.Tensor]
     recv_sizes: dict[int, int]
     own_shards: dict[int, torch.Tensor]
-    recv_offsets: dict[tuple[int, int], tuple[int, int, int]]
+    recv_offsets: dict[tuple[int, int], int]
 
     @classmethod
     def pack(
@@ -292,19 +294,19 @@ class OwnerGatherPlan:
             cursors[owner] += numel
 
         # Per (owned param, src) recv offset within the recv buffer from src.
-        recv_offsets: dict[tuple[int, int], tuple[int, int, int]] = {}
+        recv_offsets: dict[tuple[int, int], int] = {}
         owned_indices = [i for i in range(len(plans)) if owners[i] == this_rank]
         for src in range(dp_size):
             if src == this_rank:
                 continue
             offset = 0
             for param_index in owned_indices:
-                plan = plans[param_index]
-                numel = plan.shard_numel(src)
-                recv_offsets[(param_index, src)] = (offset, numel, plan.rank_row_count(src))
-                offset += numel
+                recv_offsets[(param_index, src)] = offset
+                offset += plans[param_index].shard_numel(src)
 
         return cls(
+            plans=tuple(plans),
+            this_rank=this_rank,
             send_buffers=send_buffers,
             recv_sizes=recv_sizes,
             own_shards=own_shards,
@@ -312,26 +314,21 @@ class OwnerGatherPlan:
         )
 
     def reconstruct_full(
-        self,
-        param_index: int,
-        plan: ParameterLayout,
-        recv_buffers: dict[int, torch.Tensor],
-        owner_rank: int,
+        self, param_index: int, recv_buffers: dict[int, torch.Tensor]
     ) -> torch.Tensor:
         """Reconstruct the full 2D tensor for one owned parameter from its per-rank shards.
 
-        Concatenates shards in rank order: the owner's own local shard at its rank rows and each
+        Concatenates shards in rank order: this rank's own local shard at its rank rows and each
         source's received shard at that source's rank rows.
 
         Args:
             param_index: Index of the parameter within the sequence of plans passed to `pack`.
-            plan: Shard plan for this parameter.
             recv_buffers: Per-source-rank received buffer (only sources that sent).
-            owner_rank: The owner rank (== the rank running reconstruction).
         """
+        plan = self.plans[param_index]
         shards: list[torch.Tensor] = []
         for src in range(plan.dp_size):
-            if src == owner_rank:
+            if src == self.this_rank:
                 shards.append(self.own_shards[param_index])
                 continue
 
@@ -339,7 +336,8 @@ class OwnerGatherPlan:
             if row_count == 0:
                 continue
 
-            offset, numel, _ = self.recv_offsets[(param_index, src)]
+            offset = self.recv_offsets[(param_index, src)]
+            numel = plan.shard_numel(src)
             buf = recv_buffers[src]
             shards.append(buf[offset : offset + numel].view(row_count, plan.row_size))
         if len(shards) == 1:
@@ -359,13 +357,15 @@ class OwnerScatterPlan:
             params it owns, in param order). Only destinations other than this rank appear.
         recv_sizes: Per-owner-rank element count this rank (as a destination) receives. Only owners
             other than this rank appear.
-        recv_offsets: Per `(param_index, owner_rank)` of `(offset, numel, row_count)` describing
-            where this param's result shard lands inside the recv buffer received from `owner_rank`.
+        recv_offsets: Per `(param_index, owner_rank)`, the flat offset of this param's result shard
+            inside the recv buffer received from `owner_rank`.
     """
 
+    plans: tuple[ParameterLayout, ...]
+    this_rank: int
     send_buffers: dict[int, torch.Tensor]
     recv_sizes: dict[int, int]
-    recv_offsets: dict[tuple[int, int], tuple[int, int, int]]
+    recv_offsets: dict[tuple[int, int], int]
 
     @classmethod
     def pack(
@@ -428,7 +428,7 @@ class OwnerScatterPlan:
                 )
                 cursors[dest] += numel
 
-        recv_offsets: dict[tuple[int, int], tuple[int, int, int]] = {}
+        recv_offsets: dict[tuple[int, int], int] = {}
         for owner in range(dp_size):
             if owner == this_rank:
                 continue
@@ -436,11 +436,16 @@ class OwnerScatterPlan:
             for param_index, plan in enumerate(plans):
                 if owners[param_index] != owner:
                     continue
-                numel = plan.shard_numel(this_rank)
-                recv_offsets[(param_index, owner)] = (offset, numel, plan.rank_row_count(this_rank))
-                offset += numel
+                recv_offsets[(param_index, owner)] = offset
+                offset += plan.shard_numel(this_rank)
 
-        return cls(send_buffers=send_buffers, recv_sizes=recv_sizes, recv_offsets=recv_offsets)
+        return cls(
+            plans=tuple(plans),
+            this_rank=this_rank,
+            send_buffers=send_buffers,
+            recv_sizes=recv_sizes,
+            recv_offsets=recv_offsets,
+        )
 
     def unpack(self, recv_buffers: dict[int, torch.Tensor]) -> dict[int, torch.Tensor]:
         """Extract this rank's local result shards from the per-owner recv buffers.
@@ -453,10 +458,12 @@ class OwnerScatterPlan:
             parameters this rank does NOT own.
         """
         results: dict[int, torch.Tensor] = {}
-        for (param_index, owner), (offset, numel, row_count) in self.recv_offsets.items():
+        for (param_index, owner), offset in self.recv_offsets.items():
+            plan = self.plans[param_index]
+            numel = plan.shard_numel(self.this_rank)
             if numel == 0:
                 continue
+            row_count = plan.rank_row_count(self.this_rank)
             buf = recv_buffers[owner]
-            row_size = numel // row_count if row_count else 1
-            results[param_index] = buf[offset : offset + numel].view(row_count, row_size)
+            results[param_index] = buf[offset : offset + numel].view(row_count, plan.row_size)
         return results
