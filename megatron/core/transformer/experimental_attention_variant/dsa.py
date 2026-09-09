@@ -1202,6 +1202,7 @@ class DSAIndexer(MegatronModule):
         config: TransformerConfig,
         submodules: DSAIndexerSubmodules,
         pg_collection: Optional[ProcessGroupCollection] = None,
+        name: str | None = None,
     ) -> None:
         """Initialize the indexer.
 
@@ -1209,6 +1210,7 @@ class DSAIndexer(MegatronModule):
             config (TransformerConfig): The configuration for the transformer model.
             submodules (DSAIndexerSubmodules): Indexer submodules specification.
             pg_collection (ProcessGroupCollection, optional): Process groups for the indexer.
+            name (str | None): module instance name passed top-down from its parent module.
         """
         super().__init__(config=config)
         self.hidden_size = self.config.hidden_size
@@ -1265,6 +1267,7 @@ class DSAIndexer(MegatronModule):
             skip_bias_add=False,
             skip_weight_param_allocation=False,
             parallel_mode="duplicated",
+            name=(name + ".linear_wq_b") if name is not None else None,
         )
 
         self.linear_wk = build_module(
@@ -1277,6 +1280,7 @@ class DSAIndexer(MegatronModule):
             skip_bias_add=False,
             skip_weight_param_allocation=False,
             parallel_mode="duplicated",
+            name=(name + ".linear_wk") if name is not None else None,
         )
 
         k_norm_config = copy.copy(self.config)
@@ -1300,6 +1304,7 @@ class DSAIndexer(MegatronModule):
             skip_bias_add=False,
             skip_weight_param_allocation=False,
             parallel_mode="duplicated",
+            name=(name + ".linear_weights_proj") if name is not None else None,
         )
         # Indexer projections are duplicated across tensor-parallel ranks, so their gradients
         # should be averaged during final gradient synchronization.
@@ -1653,10 +1658,12 @@ class DSAttention(MegatronModule):
         v_channels: Optional[int] = None,
         cp_comm_type: str = "p2p",
         pg_collection: ProcessGroupCollection = None,
+        name: str | None = None,
     ):
         super().__init__(config=config)
 
         self.layer_number = layer_number
+        self.name = name
         self.index_topk = self.config.dsa_indexer_topk
         self.index_topk_freq = self.config.dsa_indexer_topk_freq or 1
         self.index_skip_topk_offset = self.config.dsa_indexer_skip_topk_offset or 0
@@ -1679,7 +1686,10 @@ class DSAttention(MegatronModule):
         self.indexer = None
         if not self.skip_topk:
             self.indexer = build_module(
-                submodules.indexer, config=self.config, pg_collection=self.pg_collection
+                submodules.indexer,
+                config=self.config,
+                pg_collection=self.pg_collection,
+                name=(name + ".indexer") if name is not None else None,
             )
 
         if softmax_scale is None:

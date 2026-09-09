@@ -1,6 +1,8 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import operator
+import sys
+import warnings
 from contextlib import nullcontext
 from unittest.mock import Mock, patch
 
@@ -222,22 +224,129 @@ def test_custom_recipe_is_materialized_once_per_config():
     assert first is second
 
 
+CUSTOM_RECIPE_SPELLINGS = [
+    pytest.param({"custom_recipe": TEST_FACTORY_PATH}, id="canonical"),
+    pytest.param(
+        {"fp8": "hybrid", "fp8_recipe": "custom", "fp8_quantizer_factory": TEST_FACTORY_PATH},
+        id="legacy-fp8",
+    ),
+    pytest.param(
+        {"fp4": "e2m1", "fp4_recipe": "custom", "fp4_quantizer_factory": TEST_FACTORY_PATH},
+        id="legacy-fp4",
+    ),
+]
+
+
 @pytest.mark.skipif(not te_extension.HAVE_TE, reason="Transformer Engine is not installed")
-def test_custom_recipe_alignment_uses_declared_value_or_conservative_fallback():
+@pytest.mark.parametrize("config_kwargs", CUSTOM_RECIPE_SPELLINGS)
+def test_custom_recipe_alignment_uses_declared_value_or_conservative_fallback(config_kwargs):
+    from megatron.core.transformer.moe.moe_utils import get_align_size_for_quantization
+
     config = TransformerConfig(
-        num_layers=1, hidden_size=128, num_attention_heads=4, custom_recipe=TEST_FACTORY_PATH
+        num_layers=1, hidden_size=128, num_attention_heads=4, **config_kwargs
     )
     recipe = te_recipe.get_te_quantization_recipe(config)
 
+    # Every custom spelling must use the recipe's declared alignment rather than the
+    # 16-byte default of the legacy FP8 enum.
     expected = getattr(recipe, "quantization_alignment", 128)
+    assert expected != 16
     assert te_recipe.get_quantization_alignment(config) == expected
+    assert get_align_size_for_quantization(config) == expected
     with patch.object(te_recipe, "get_te_quantization_recipe", return_value=object()):
         assert te_recipe.get_quantization_alignment(config) == 128
 
 
-@pytest.mark.skipif(not te_extension.HAVE_TE, reason="Transformer Engine is not installed")
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_custom_recipe_dense_forward_backward_receives_semantic_role_names():
+@pytest.mark.parametrize(
+    ("quant_kwargs", "num_local_experts", "expected"),
+    [
+        pytest.param({}, 1, False, id="bf16-single-local-expert"),
+        pytest.param({}, 2, True, id="bf16-multi-local-expert"),
+        pytest.param({"fp8": "hybrid", "fp8_recipe": "mxfp8"}, 1, True, id="builtin-fp8"),
+        pytest.param({"custom_recipe": TEST_FACTORY_PATH}, 1, False, id="custom-single"),
+        pytest.param({"custom_recipe": TEST_FACTORY_PATH}, 2, True, id="custom-multi"),
+        pytest.param(
+            {"fp8": "hybrid", "fp8_recipe": "custom", "fp8_quantizer_factory": TEST_FACTORY_PATH},
+            1,
+            False,
+            id="legacy-custom-single",
+        ),
+    ],
+)
+def test_should_free_input_keeps_high_precision_rule_for_custom_recipes(
+    quant_kwargs, num_local_experts, expected
+):
+    """Custom factories may return Identity quantizers that alias the MLP input.
+
+    Only built-in FP8/FP4 recipes guarantee that TE saved a separate quantized copy, so
+    only they may free the expert input when the dispatcher hands it over unchanged.
+    """
+    from megatron.core.models.common.utils import should_free_input
+
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=128,
+        num_attention_heads=4,
+        num_moe_experts=2,
+        moe_ffn_hidden_size=128,
+        moe_token_dispatcher_type="alltoall",
+        **quant_kwargs,
+    )
+
+    assert should_free_input("mlp", True, config, num_local_experts) is expected
+
+
+@pytest.mark.skipif(not te_recipe.HAVE_TE, reason="Transformer Engine is not installed")
+@pytest.mark.parametrize(
+    ("quant_kwargs", "expected"),
+    [
+        pytest.param({}, False, id="bf16"),
+        pytest.param({"fp8": "hybrid", "fp8_recipe": "delayed"}, False, id="fp8-delayed"),
+        pytest.param({"fp8": "hybrid", "fp8_recipe": "mxfp8"}, True, id="fp8-mxfp8"),
+        pytest.param({"fp4": "e2m1", "fp4_recipe": "nvfp4"}, True, id="fp4-nvfp4"),
+        pytest.param({"custom_recipe": TEST_FACTORY_PATH}, "te-validates", id="custom"),
+        pytest.param(
+            {"fp8": "hybrid", "fp8_recipe": "custom", "fp8_quantizer_factory": TEST_FACTORY_PATH},
+            "te-validates",
+            id="legacy-custom",
+        ),
+    ],
+)
+def test_supports_save_original_input_matches_recipe_family(quant_kwargs, expected):
+    """Custom recipes rely on TE's per-quantizer validation of save_original_input."""
+    config = TransformerConfig(num_layers=1, hidden_size=128, num_attention_heads=4, **quant_kwargs)
+    if expected == "te-validates":
+        expected = te_recipe._te_validates_save_original_input()
+        # Without TE's validation helper, custom recipes must stay conservative.
+        with patch.dict(sys.modules, {"transformer_engine.pytorch.module._common": None}):
+            assert te_recipe.supports_save_original_input(config) is False
+
+    assert te_recipe.supports_save_original_input(config) is expected
+
+
+def test_mfsdp_v2_rejects_custom_recipe_at_startup():
+    from types import SimpleNamespace
+
+    from megatron.core.distributed.distributed_data_parallel_config import (
+        DistributedDataParallelConfig,
+    )
+    from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallelV2
+
+    config = TransformerConfig(
+        num_layers=1, hidden_size=128, num_attention_heads=4, custom_recipe=TEST_FACTORY_PATH
+    )
+    ddp_config = DistributedDataParallelConfig(data_parallel_sharding_strategy="optim_grads_params")
+    pg_collection = SimpleNamespace(
+        dp_cp=object(), tp=None, pp=None, cp=None, ep=None, expt_dp=None
+    )
+
+    with pytest.raises(ValueError, match="custom quantization recipes"):
+        FullyShardedDataParallelV2._validate_config(
+            config, ddp_config, torch.nn.Linear(2, 2), pg_collection, disable_bucketing=False
+        )
+
+
+def _skip_unless_fp8_available():
     availability = te_extension.te.pytorch.is_fp8_available()
     if isinstance(availability, tuple):
         fp8_available, reason = availability
@@ -245,6 +354,12 @@ def test_custom_recipe_dense_forward_backward_receives_semantic_role_names():
         fp8_available, reason = availability, "FP8 execution is unavailable"
     if not fp8_available:
         pytest.skip(reason)
+
+
+@pytest.mark.skipif(not te_extension.HAVE_TE, reason="Transformer Engine is not installed")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_custom_recipe_dense_forward_backward_receives_semantic_role_names():
+    _skip_unless_fp8_available()
 
     Utils.initialize_model_parallel(1, 1)
     try:
@@ -264,11 +379,21 @@ def test_custom_recipe_dense_forward_backward_receives_semantic_role_names():
         block = TransformerBlock(
             config, get_gpt_layer_with_transformer_engine_spec(), name="decoder"
         )
+        # The projection reuses the attention output saved by DPA instead of a quantized
+        # copy; TE validates the factory's quantizer at runtime.
+        linear_proj = block.layers[0].self_attention.linear_proj
+        assert linear_proj.save_original_input is te_recipe.supports_save_original_input(config)
         hidden_states = torch.randn(
             16, 2, config.hidden_size, device="cuda", dtype=torch.bfloat16, requires_grad=True
         )
-        output = block(hidden_states=hidden_states, attention_mask=None)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            output = block(hidden_states=hidden_states, attention_mask=None)
         output.float().square().mean().backward()
+        if linear_proj.save_original_input:
+            # The delayed-scaling test factory cannot requantize deterministically, so TE must
+            # downgrade the optimization with a warning rather than fail or silently drift.
+            assert any("save_original_input" in str(w.message) for w in caught)
 
         assert torch.isfinite(output).all()
         assert hidden_states.grad is not None
@@ -281,5 +406,70 @@ def test_custom_recipe_dense_forward_backward_receives_semantic_role_names():
             "decoder.layers.0.mlp.linear_fc2",
             "decoder.layers.0.self_attention.core_attention",
         } <= role_names
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.skipif(not te_extension.HAVE_TE, reason="Transformer Engine is not installed")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_custom_recipe_grouped_moe_checkpoint_extra_state_is_stateless():
+    """Grouped experts must checkpoint without unpickling the CustomRecipe factory.
+
+    TE stores the CustomRecipe object, including its quantizer factory, in the TE extra
+    state. The restricted checkpoint unpickler cannot decode an arbitrary factory, so the
+    per-GEMM split used by distributed checkpointing must treat the recipe as stateless.
+    """
+    _skip_unless_fp8_available()
+
+    Utils.initialize_model_parallel(1, 1)
+    try:
+        model_parallel_cuda_manual_seed(123)
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=128,
+            ffn_hidden_size=256,
+            num_attention_heads=4,
+            attention_dropout=0.0,
+            hidden_dropout=0.0,
+            params_dtype=torch.bfloat16,
+            add_bias_linear=False,
+            custom_recipe=TEST_FACTORY_PATH,
+            num_moe_experts=2,
+            moe_ffn_hidden_size=256,
+            moe_grouped_gemm=True,
+            moe_router_topk=2,
+            moe_token_dispatcher_type="alltoall",
+            moe_router_padding_for_quantization=True,
+        )
+        block = TransformerBlock(
+            config,
+            get_gpt_layer_with_transformer_engine_spec(num_experts=2, moe_grouped_gemm=True),
+            name="decoder",
+        )
+        hidden_states = torch.randn(
+            16, 2, config.hidden_size, device="cuda", dtype=torch.bfloat16, requires_grad=True
+        )
+        output = block(hidden_states=hidden_states, attention_mask=None)
+        output.float().square().mean().backward()
+
+        # Distributed-checkpoint save path: one extra state per expert GEMM.
+        sharded_state_dict = block.sharded_state_dict()
+        grouped_extra_states = {
+            key: value
+            for key, value in sharded_state_dict.items()
+            if ".experts.linear_fc" in key and "_extra_state" in key
+        }
+        assert len(grouped_extra_states) == 4, sorted(grouped_extra_states)
+        for sharded_object in grouped_extra_states.values():
+            assert sharded_object.data.numel() == 0
+
+        # Distributed-checkpoint load path: per-GEMM empty states are merged back by the
+        # grouped linear's load pre-hook without decoding any pickled recipe.
+        grouped_linear = block.layers[0].mlp.experts.linear_fc1
+        grouped_state_dict = grouped_linear.state_dict()
+        grouped_state_dict["_extra_state"] = torch.empty(0, dtype=torch.uint8)
+        for gemm_idx in range(1, grouped_linear.num_gemms):
+            grouped_state_dict[f"_extra_state{gemm_idx}"] = torch.empty(0, dtype=torch.uint8)
+        grouped_linear.load_state_dict(grouped_state_dict)
     finally:
         Utils.destroy_model_parallel()

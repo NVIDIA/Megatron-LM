@@ -27,6 +27,7 @@ from megatron.core.models.common.embeddings import (
     apply_rotary_pos_emb,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.quantization.te_recipe import supports_save_original_input
 from megatron.core.quantization.utils import is_quantization_enabled
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear
 from megatron.core.tensor_parallel.mappings import (
@@ -39,7 +40,7 @@ from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.mla_qk_norm_config import QKNormConfigResolver
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import MLATransformerConfig
-from megatron.core.utils import deprecate_inference_params, get_pg_size, is_te_min_version
+from megatron.core.utils import deprecate_inference_params, get_pg_size
 
 try:
     from megatron.core.fusions.fused_mla_yarn_rope_apply import (
@@ -249,16 +250,9 @@ class AbsorbedMLASelfAttention(Attention):
         if (
             HAVE_TE
             and isinstance(self.linear_proj, TELinear)
-            and (
-                (
-                    self.config.fp8
-                    and self.config.fp8_recipe != 'delayed'
-                    and is_te_min_version("2.6.0dev0")
-                )
-                or (self.config.fp4 and is_te_min_version("2.7.0.dev0"))
-            )
+            and supports_save_original_input(self.config)
         ):
-            # For fp8/fp4 training, the output of the fused core_attn is saved by itself, and
+            # For quantized training, the output of the fused core_attn is saved by itself, and
             # linear_proj also saves the quantized tensor of this output. Here we set the
             # linear_proj to save the original input tensors to avoid the extra memory usage of
             # the quantized tensor.

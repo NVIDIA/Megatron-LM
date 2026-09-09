@@ -7,8 +7,10 @@ from __future__ import annotations
 from contextlib import nullcontext
 from typing import TYPE_CHECKING, Any, ContextManager
 
+from megatron.core.enums import Fp8Recipe
 from megatron.core.quantization.custom_recipe import get_cached_custom_recipe
-from megatron.core.quantization.utils import is_quantization_enabled
+from megatron.core.quantization.utils import is_custom_recipe_selected, is_quantization_enabled
+from megatron.core.utils import is_te_min_version
 
 if TYPE_CHECKING:
     from megatron.core.transformer.transformer_config import TransformerConfig
@@ -51,7 +53,9 @@ def get_te_quantization_recipe(config: TransformerConfig) -> Any:
 
 def get_quantization_alignment(config: TransformerConfig) -> int:
     """Return the required tensor alignment without probing an opaque factory."""
-    if config.custom_recipe is not None:
+    if is_custom_recipe_selected(config):
+        # Canonical and legacy custom spellings share the recipe's declared alignment;
+        # the legacy FP8 enum would otherwise fall through to the 16-byte FP8 default.
         recipe = get_te_quantization_recipe(config)
         return getattr(recipe, "quantization_alignment", 128)
     if config.fp8:
@@ -63,6 +67,39 @@ def get_quantization_alignment(config: TransformerConfig) -> int:
 
         return get_fp4_align_size(config.fp4_recipe)
     return 0
+
+
+def _te_validates_save_original_input() -> bool:
+    """Feature-detect Transformer Engine's per-quantizer validation of ``save_original_input``."""
+    if not HAVE_TE:
+        return False
+    try:
+        from transformer_engine.pytorch.module._common import (  # noqa: F401
+            can_reconstruct_wgrad_input_from_original,
+        )
+    except ImportError:
+        return False
+    return True
+
+
+def supports_save_original_input(config: TransformerConfig) -> bool:
+    """Return whether TE linears may keep their original input instead of a quantized copy.
+
+    Megatron enables ``save_original_input`` on linears whose input is already retained by an
+    upstream operation, such as the attention output projection consuming the saved
+    dot-product-attention output. Built-in recipes keep their existing gates: delayed scaling
+    cannot requantize deterministically, and older TE lacks the option. For custom recipes,
+    Transformer Engine validates the resolved input quantizer at runtime and downgrades
+    delayed-scaling, unsafe Hybrid, and stochastic-rounding NVFP4 quantizers with a warning,
+    so the optimization is enabled only on TE builds that ship that validation.
+    """
+    if is_custom_recipe_selected(config):
+        return _te_validates_save_original_input()
+    if config.fp8:
+        return config.fp8_recipe != Fp8Recipe.delayed and is_te_min_version("2.6.0dev0")
+    if config.fp4:
+        return is_te_min_version("2.7.0.dev0")
+    return False
 
 
 def get_quantization_context(

@@ -3994,6 +3994,34 @@ class TestDSAModuleSpecDispatch:
         assert spec.submodules.core_attention.submodules.indexer.module == DSAIndexer
         assert spec.params["attn_mask_type"] == AttnMaskType.causal
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_dsa_spec_builds_with_semantic_module_name(self):
+        """Attention passes ``name`` to the core attention; DSA must accept and propagate it."""
+        from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
+        from megatron.core.transformer.spec_utils import build_module
+
+        config = self._make_dsa_config(experimental_attention_variant="dsa")
+        spec = get_dsa_module_spec_for_backend(config, backend=TESpecProvider())
+
+        attention = build_module(
+            spec, config=config, layer_number=1, name="decoder.layers.0.self_attention"
+        )
+
+        core_attention = attention.core_attention
+        assert isinstance(core_attention, DSAttention)
+        assert core_attention.name == "decoder.layers.0.self_attention.core_attention"
+        indexer_prefix = "decoder.layers.0.self_attention.core_attention.indexer"
+        assert core_attention.indexer.linear_wq_b.name == f"{indexer_prefix}.linear_wq_b"
+        assert core_attention.indexer.linear_wk.name == f"{indexer_prefix}.linear_wk"
+        assert (
+            core_attention.indexer.linear_weights_proj.name
+            == f"{indexer_prefix}.linear_weights_proj"
+        )
+
+        # Unnamed construction must keep working for specs that do not name their modules.
+        unnamed = build_module(spec, config=config, layer_number=1)
+        assert unnamed.core_attention.name is None
+
     def test_get_dsa_module_spec_requires_mla(self):
         """get_dsa_module_spec_for_backend rejects configs without MLA."""
         from megatron.core.transformer import TransformerConfig as _TransformerConfig

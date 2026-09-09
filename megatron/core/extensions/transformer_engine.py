@@ -259,6 +259,12 @@ class TEQuantizationParams:
             raise NotImplementedError(f"Unhandled configuration type {config_type}")
 
 
+def _is_te_custom_recipe(recipe) -> bool:
+    """Return whether ``recipe`` is a Transformer Engine ``CustomRecipe`` instance."""
+    custom_recipe_cls = getattr(te.common.recipe, "CustomRecipe", None) if HAVE_TE else None
+    return custom_recipe_cls is not None and isinstance(recipe, custom_recipe_cls)
+
+
 def _get_fp8_model_init_for_quant_recipe(qrecipe: TEQuantizationRecipe):
     custom_recipe = False
     if qrecipe.fp8_quantization_recipe is None and qrecipe.fp4_quantization_recipe is None:
@@ -2832,6 +2838,14 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
 
             if not fp8_checkpoint:
                 return [state] * self.num_gemms
+
+            if _is_te_custom_recipe(self.fp8_meta.get("recipe")):
+                # TE serializes the CustomRecipe object itself, including its quantizer
+                # factory, into the extra state. The restricted unpickler used for
+                # checkpoints cannot decode an arbitrary factory, and TE ignores this
+                # payload when loading. Store an empty per-GEMM extra state instead; any
+                # delayed-scaling state produced by a custom factory is not persisted.
+                return [torch.empty(0, dtype=torch.uint8)] * self.num_gemms
 
             state = self._decode_extra_state(state)
             if state is None:

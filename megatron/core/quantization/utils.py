@@ -3,6 +3,8 @@
 import re
 from typing import Any, Optional, Union
 
+from megatron.core.enums import Fp4Recipe, Fp8Recipe
+
 from .quant_config import GlobMatcher, MatchContext, QuantizationConfig, RecipeConfig
 
 
@@ -13,6 +15,21 @@ def is_quantization_enabled(config: Any) -> bool:
         or getattr(config, "fp8", None)
         or getattr(config, "fp4", None)
     )
+
+
+def is_custom_recipe_selected(config: Any) -> bool:
+    """Return whether the global quantization mode is a Transformer Engine custom recipe.
+
+    Covers the canonical ``custom_recipe`` path as well as the deprecated
+    ``fp8_recipe="custom"`` and ``fp4_recipe="custom"`` spellings.
+    """
+    if getattr(config, "custom_recipe", None):
+        return True
+    if getattr(config, "fp8", None) and getattr(config, "fp8_recipe", None) == Fp8Recipe.custom:
+        return True
+    if getattr(config, "fp4", None) and getattr(config, "fp4_recipe", None) == Fp4Recipe.custom:
+        return True
+    return False
 
 
 def get_quant_config_or_none(
