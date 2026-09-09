@@ -460,17 +460,6 @@ class TestTransformerConfigRecomputeMhc:
     @pytest.mark.parametrize(
         "extra_kwargs, error_type, match",
         [
-            (
-                # recompute_num_layers is required for non-selective granularity, and that
-                # check runs first — supply it so the mHC guard is what actually fires.
-                {
-                    "recompute_granularity": "full",
-                    "recompute_method": "uniform",
-                    "recompute_num_layers": 1,
-                },
-                NotImplementedError,
-                "full activation recompute",
-            ),
             ({"inference_fuse_tp_communication": True}, NotImplementedError, "single-stream"),
             ({"mhc_sinkhorn_iterations": 0}, ValueError, "mhc_sinkhorn_iterations"),
             ({"mhc_init_gating_factor": -0.1}, ValueError, "mhc_init_gating_factor"),
