@@ -2,16 +2,19 @@
 
 """MCore optimizer wrapper for experimental Megatron-FSDP v2."""
 
-from typing import Callable, List, Optional, override
+from collections.abc import Iterator
+from typing import Any, Callable, List, Optional, override
 
 import torch
 from torch.distributed.tensor import DTensor
 
 from ..config_logger import has_config_logger_enabled, log_config_to_disk
 from ..dist_checkpointing.mapping import ShardedStateDict
+from ..distributed.fsdp.src.megatron_fsdp.experimental import init_optimizer_state
 from ..distributed.fsdp.src.megatron_fsdp.experimental.parameter_group import (
     sync_model_weights_from_main_weights,
 )
+from ..transformer.fsdp_dtensor_checkpoint import get_global_unique_param_name
 from ..transformer.module import MegatronModule
 from .grad_scaler import MegatronGradScaler
 from .optimizer import MixedPrecisionOptimizer
@@ -83,6 +86,15 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
                 raise ValueError("All MFSDP v2 model chunks must share the same ddp_config.")
         self.is_stub_optimizer = optimizer is None
         self._casted_grads = []
+        # Each parameter's globally unique checkpoint name, mirroring
+        # :class:`DistributedOptimizer`'s ``param_to_name``. Keyed by parameter because that
+        # is the direction the checkpoint path resolves, and because the optimizer names each
+        # parameter once: a tied parameter is one ``nn.Parameter`` with one state entry, and
+        # its several FQNs are the model state dict's business, not this map's.
+        self._param_to_fqn: dict[torch.nn.Parameter, str] = {
+            param: get_global_unique_param_name(self.model_chunks, param)
+            for param in self._trainable_parameters()
+        }
 
     @staticmethod
     def _validate_config(config: OptimizerConfig, model_chunks: List[MegatronModule]) -> None:
@@ -111,16 +123,116 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
     def state_dict(self):
         """Return optimizer state.
 
-        MFSDP v2 optimizer checkpointing needs an FSDP-native DTensor state
-        contract. Keep this intentionally unsupported for the prototype instead
-        of falling back to DDP-buffer assumptions.
+        Deliberately unsupported: MFSDP v2 checkpoints through :meth:`sharded_state_dict`,
+        and Megatron-FSDP always runs with ``--ckpt-format fsdp_dtensor`` (see
+        ``validate_args``), so nothing reaches this accessor. Forwarding the wrapped
+        optimizer's state here would only produce a checkpoint that silently drops the
+        cross-rank resharding metadata.
         """
-        raise NotImplementedError("MFSDP v2 optimizer checkpointing is not yet supported.")
+        raise NotImplementedError(
+            "MFSDP v2 optimizer checkpointing goes through sharded_state_dict "
+            "(--ckpt-format fsdp_dtensor)."
+        )
+
+    def _trainable_parameters(self) -> Iterator[torch.nn.Parameter]:
+        """Yield the parameters the base optimizer owns, in model order.
+
+        This is the same set ``_get_param_groups`` builds, read off the model so that it is
+        available before the optimizer exists and on a rank whose optimizer is a stub.
+        """
+        for model_chunk in self.model_chunks:
+            for param in model_chunk.parameters():
+                if param.requires_grad:
+                    yield param
+
+    def _raise_if_parameters_span_multiple_meshes(self) -> None:
+        """Reject a model whose parameters do not all share one device mesh.
+
+        MFSDP v2 shards expert parameters over the expert-DP mesh and everything else over
+        the DP mesh (see :class:`FullyShardedDataParallelV2`), and expert parallelism gives
+        each rank a different set of expert FQNs. The ``fsdp_dtensor`` format needs a
+        rank-identical DTensor keyspace, because ``preprocess_state_dict_for_uneven_dtensor``
+        walks the state dict's DTensors in sorted key order and gathers over each one; a
+        keyspace that differs across ranks desynchronizes those collectives.
+
+        Raises:
+            NotImplementedError: If the parameters span more than one device mesh, which is
+                what expert parallelism produces. Not yet supported rather than refused on
+                principle -- describing such a model needs a keyspace built per mesh -- and
+                training under expert parallelism is unaffected, only checkpointing.
+        """
+        meshes = {
+            param.device_mesh
+            for param in self._trainable_parameters()
+            if isinstance(param, DTensor)
+        }
+        if len(meshes) > 1:
+            raise NotImplementedError(
+                "MFSDP v2 optimizer checkpointing does not support expert parallelism yet: "
+                "its parameters span more than one device mesh."
+            )
+
+    def _param_to_group_meta(self) -> dict[str, Any]:
+        """Map each parameter's FQN to its param-group hyperparameters.
+
+        The base optimizer (TE FusedAdam) tracks ``step`` per group rather than per
+        parameter, so ``step`` round-trips here rather than in the per-parameter state.
+        Keying by parameter rather than by group index means a load matches groups by the
+        parameters in them, so a checkpoint still applies when the groups are ordered
+        differently.
+        """
+        return {
+            self._param_to_fqn[param]: {
+                key: value for key, value in group.items() if key != "params"
+            }
+            for group in self.optimizer.param_groups
+            for param in group["params"]
+        }
+
+    def _param_groups_from_group_meta(
+        self, param_to_group_meta: dict[str, Any]
+    ) -> list[dict[str, Any]]:
+        """Rebuild FQN-keyed torch param groups matching this rank's current optimizer.
+
+        Iterating ``self.optimizer.param_groups`` preserves the current parameter order
+        within each group, which is what :meth:`torch.optim.Optimizer.load_state_dict` uses
+        to map the checkpoint's FQN-keyed state onto parameter tensors.
+        """
+        param_groups = []
+        for group in self.optimizer.param_groups:
+            fqns = [self._param_to_fqn[param] for param in group["params"]]
+            missing = [fqn for fqn in fqns if fqn not in param_to_group_meta]
+            if missing:
+                raise ValueError(
+                    f"Parameters {missing} are missing from the checkpoint's "
+                    "param_to_group_meta; the checkpoint's optimizer param groups do not "
+                    "match this model."
+                )
+            # Every parameter of a group carries that group's hyperparameters, so read them
+            # from the first one.
+            hyperparameters = param_to_group_meta[fqns[0]] if fqns else {}
+            param_groups.append({"params": fqns, **hyperparameters})
+        return param_groups
 
     @override
-    def load_state_dict(self, state_dict):
-        """Load optimizer state."""
-        raise NotImplementedError("MFSDP v2 optimizer checkpointing is not yet supported.")
+    def load_state_dict(self, state_dict: ShardedStateDict) -> None:
+        """Load optimizer state produced by :meth:`sharded_state_dict`.
+
+        By the time this runs DCP has already written the checkpoint's tensors into the
+        resting optimizer-state DTensors in place, since ``sharded_state_dict(is_loading=True)``
+        exposed them as the load destinations. What is left is to restore the param-group
+        hyperparameters (including the group-level ``step``) and re-bind the FQN-keyed state
+        to the current parameters, mirroring the Megatron-FSDP branch of
+        :meth:`DistributedOptimizer.load_state_dict`.
+        """
+        self.optimizer.load_state_dict(
+            {
+                "state": state_dict["state"],
+                "param_groups": self._param_groups_from_group_meta(
+                    state_dict["param_to_group_meta"]
+                ),
+            }
+        )
 
     @override
     def sharded_state_dict(
@@ -129,8 +241,45 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
         is_loading: bool = False,
         metadata: Optional[dict] = None,
     ) -> ShardedStateDict:
-        """Build a sharded optimizer state dict."""
-        raise NotImplementedError("MFSDP v2 optimizer checkpointing is not yet supported.")
+        """Build the ``fsdp_dtensor`` sharded optimizer state dict.
+
+        The layout mirrors :meth:`DistributedOptimizer.sharded_param_state_fsdp_dtensor`, so
+        v1 and v2 write the same on-disk format::
+
+            {"state": {fqn: {"exp_avg": DTensor, "exp_avg_sq": DTensor}},
+             "param_to_group_meta": {fqn: {...group hyperparameters...}}}
+
+        That is also why the FQNs come from ``get_global_unique_param_name`` instead of
+        torch's :func:`~torch.distributed.checkpoint.state_dict.get_optimizer_state_dict`,
+        whose names are the plain ``named_parameters`` ones rather than MCore's PP/EP-unique
+        checkpoint names.
+
+        Rank consistency is the load-bearing invariant here: every rank's optimizer holds
+        every trainable parameter, including the ones whose local shard is empty, so the
+        emitted DTensor keyspace is the same on all of them. That is what
+        ``preprocess_state_dict_for_uneven_dtensor`` needs, since it walks the DTensors in
+        sorted key order and gathers over each one.
+
+        Args:
+            model_sharded_state_dict: Accepted for interface parity; the optimizer state is
+                read from the wrapped optimizer directly.
+            is_loading: Whether the state dict will be filled by a load. If so, the optimizer
+                state is materialized first so the load has DTensors to write into.
+            metadata: Accepted for interface parity; the ``fsdp_dtensor`` format takes no
+                sharding options.
+
+        Returns:
+            The optimizer state dict, in the ``fsdp_dtensor`` format described above.
+        """
+        self._raise_if_parameters_span_multiple_meshes()
+        if is_loading:
+            init_optimizer_state(self.optimizer)
+
+        packed_state = {
+            self._param_to_fqn[param]: param_state
+            for param, param_state in self.optimizer.state.items()
+        }
+        return {"state": packed_state, "param_to_group_meta": self._param_to_group_meta()}
 
     @override
     def get_grad_norm(self):
