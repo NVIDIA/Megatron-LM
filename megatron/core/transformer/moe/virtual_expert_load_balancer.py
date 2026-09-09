@@ -11,7 +11,6 @@ import functools
 import gc
 import math
 import weakref
-from collections.abc import Callable
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
@@ -77,7 +76,7 @@ class VirtualExpertPlan:
 
 def _scratch_layout(num_experts: int, ep_size: int) -> tuple[dict, int]:
     """Fields of the planner's int32 scratch arena as ``name -> (offset, shape)`` plus its total
-    size; mirrors ``_planner_fields`` in the Triton module."""
+    size; mirrors the field offsets in ``_plan_virtual_expert_routes_kernel``."""
     block_ep = 1 << (ep_size - 1).bit_length()
     # Each flag word gets its own 128-byte line (the kernel's _FLAG_STRIDE).
     fields = (
@@ -85,15 +84,13 @@ def _scratch_layout(num_experts: int, ep_size: int) -> tuple[dict, int]:
         ("_pad0", (31,)),
         ("grid_sync", (1,)),
         ("_pad1", (31,)),
-        ("sequence", (1,)),  # exchange launch counter the flags carry
-        ("_pad2", (31,)),
         ("balance", (ep_size,)),  # native load minus rank capacity
         ("allocation", (num_experts, ep_size)),  # routes of each expert per destination
         ("destination_boundaries", (num_experts, block_ep)),  # segment ends, local ordinals
         ("virtual_expert_slots", (num_experts, ep_size)),  # slot holding an expert on a rank
         ("program_histogram", (PLANNER_PROGRAMS, num_experts)),
         ("running_counts", (PLANNER_PROGRAMS, num_experts)),
-        ("tokens_per_expert", (num_experts,)),  # this rank's histogram
+        ("tokens_per_expert", (num_experts,)),  # atomic histogram target, zeroed after use
     )
     layout, offset = {}, 0
     for name, shape in fields:
@@ -146,35 +143,18 @@ class VirtualExpertPlannerWorkspace:
             symm_mem.set_backend("NCCL")
         window = symm_mem.empty(ep_size * num_experts, dtype=torch.int32, device=device)
         handle = symm_mem.rendezvous(window, group)
-        if handle.signal_pad_size < ep_size * 4 * 4:
+        if handle.signal_pad_size < ep_size * 4:
             raise RuntimeError(
                 "Virtual-expert planner needs one signal word per EP rank; the symmetric "
                 f"memory signal pad holds {handle.signal_pad_size} bytes for {ep_size} ranks."
             )
-        return cls.local(
-            num_experts,
-            ep_size,
-            device,
-            rank=dist.get_rank(group=group),
-            gathered_counts=window.view(ep_size, num_experts),
-            histogram_handle=handle,
-        )
-
-    @classmethod
-    def local(
-        cls, num_experts, ep_size, device, *, rank=0, gathered_counts=None, histogram_handle=None
-    ):
-        """The scratch without a window (process-local tests): ``gathered_counts`` is plain
-        memory the caller fills with every rank's histogram."""
-        if gathered_counts is None:
-            gathered_counts = torch.empty((ep_size, num_experts), dtype=torch.int32, device=device)
         _, size = _scratch_layout(num_experts, ep_size)
         return cls(
             num_experts=num_experts,
             ep_size=ep_size,
-            rank=rank,
-            gathered_counts=gathered_counts,
-            histogram_handle=histogram_handle,
+            rank=dist.get_rank(group=group),
+            gathered_counts=window.view(ep_size, num_experts),
+            histogram_handle=handle,
             scratch=torch.zeros(size, dtype=torch.int32, device=device),
         )
 
@@ -199,9 +179,9 @@ class _PlanRoutes(torch.autograd.Function):
     the router's ``[num_tokens, topk]`` probabilities through a gather at the runtime ids."""
 
     @staticmethod
-    def forward(ctx, probs, top_indices, workspace, exchange):
+    def forward(ctx, probs, top_indices, workspace):
         virtual_experts, runtime_probs, experts_to_copy = launch_virtual_expert_planner(
-            top_indices, probs, workspace, exchange=exchange
+            top_indices, probs, workspace
         )
         ctx.save_for_backward(virtual_experts)
         ctx.probs_dtype = probs.dtype
@@ -213,33 +193,28 @@ class _PlanRoutes(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_virtual_experts, grad_runtime_probs, grad_experts_to_copy):
         if grad_runtime_probs is None:
-            return None, None, None, None
+            return None, None, None
         (virtual_experts,) = ctx.saved_tensors
         grad_probs = grad_runtime_probs.gather(1, virtual_experts.long()).to(ctx.probs_dtype)
-        return grad_probs, None, None, None
+        return grad_probs, None, None
 
 
 def plan_virtual_expert_routes(
-    top_indices: torch.Tensor,
-    probs: torch.Tensor,
-    workspace: VirtualExpertPlannerWorkspace,
-    *,
-    exchange: bool = True,
+    top_indices: torch.Tensor, probs: torch.Tensor, workspace: VirtualExpertPlannerWorkspace
 ) -> tuple[VirtualExpertPlan, torch.Tensor]:
     """Plan deterministic virtual-expert placement for one EP group and map this rank's routes.
 
     ``top_indices`` / ``probs`` are the router's ``[num_tokens, topk]`` expert ids and
     probabilities; every rank must route the same number of tokens. The histograms are the only
     cross-rank input and the planner kernel exchanges them itself, so every rank computes the
-    same placement. ``exchange=False`` (process-local tests) plans from a pre-filled window.
-    Returns the plan and the dense float32 ``[num_tokens, 2 * num_experts]`` runtime
+    same placement. Returns the plan and the dense float32 ``[num_tokens, 2 * num_experts]`` runtime
     probabilities HybridEP consumes, which carry the gradient back to ``probs``.
     """
     if top_indices.shape != probs.shape or top_indices.dtype not in (torch.int32, torch.int64):
         raise ValueError("Virtual-expert planner takes matching [num_tokens, topk] ids and probs.")
     top_indices, probs = top_indices.contiguous(), probs.contiguous()
     virtual_experts, runtime_probs, experts_to_copy = _PlanRoutes.apply(
-        probs, top_indices, workspace, exchange
+        probs, top_indices, workspace
     )
     return VirtualExpertPlan(virtual_experts, experts_to_copy), runtime_probs
 
