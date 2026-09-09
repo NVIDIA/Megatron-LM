@@ -799,20 +799,6 @@ def delete_cuda_graphs():
         runner.fwd_graph = None
         runner.bwd_graph = None
         runner.mempool = None
-
-    for record in [
-        *_CudagraphGlobalRecord.cudagraph_record,
-        *_CudagraphGlobalRecord.cudagraph_inference_record,
-    ]:
-        runner = record[0]
-        assert isinstance(runner, _CudaGraphRunner)
-
-        runner.cudagraph_created = False
-        runner.fwd_graph_recorded = False
-        runner.bwd_graph_recorded = False
-        runner.fwd_graph = None
-        runner.bwd_graph = None
-        runner.mempool = None
         runner._gtp_fwd_params_to_ensure_ready = ()
 
     # Reset global tracking state

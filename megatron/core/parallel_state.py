@@ -160,9 +160,8 @@ _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP = None
 _GLOBAL_MEMORY_BUFFER = None
 
 
-# List of all process groups
-# Used for updating the timeout for all process groups
-# None represents the default process group
+# Member groups recorded by create_group, in creation order, for timeout updates
+# and teardown. The first entry, None, represents the default process group.
 _global_process_group_list = None
 
 
@@ -230,12 +229,6 @@ def update_pg_timeout(
             raise e
 
 
-# Every ProcessGroup create_group handed out to this rank, in creation order. Only groups
-# this rank is a member of are tracked (non-member ranks get the NON_GROUP_MEMBER sentinel
-# back from new_group, which there is nothing to destroy for).
-_CREATED_PROCESS_GROUPS: List[torch.distributed.ProcessGroup] = []
-
-
 def create_group(
     ranks=None,
     timeout=None,
@@ -270,10 +263,6 @@ def create_group(
         _global_process_group_list = [None]
     if torch.distributed.get_rank() in ranks:
         _global_process_group_list.append(group)
-        # Tracked so destroy_model_parallel can release them. Clearing the module globals only
-        # drops Megatron's reference; c10d keeps its own, so the communicator would survive
-        # and, with NVLS enabled, hold a multicast reservation for the life of the process.
-        _CREATED_PROCESS_GROUPS.append(group)
     return group
 
 
@@ -2514,151 +2503,89 @@ def get_all_ranks():
 
 
 def _destroy_created_process_groups():
-    """Destroy every ProcessGroup create_group made on this rank, newest first.
-
-    Aliases are assignments rather than creations, so each group appears here once.
-
-    Each NCCL backend is aborted before the group is destroyed (the pattern
-    nvidia-resiliency-ext uses in inprocess/abort.py). destroy_process_group()
-    alone runs ProcessGroupNCCL::shutdown(), whose ncclCommFinalize blocks until
-    every rank of that communicator arrives and until nothing references the
-    communicator anymore — it deadlocks on rank skew and on communicators still
-    referenced by captured CUDA graphs (pytorch#115388). ncclCommAbort is
-    unilateral, also drops the communicator's allocator-hook registrations
-    (which shutdown() leaves dangling in torch's ncclCommMemPoolMap), and makes
-    the subsequent destroy_process_group() a fast local cleanup.
-    """
-    if not _CREATED_PROCESS_GROUPS:
-        return
-    if torch.distributed.is_initialized():
-        # Quiesce first so no rank aborts a communicator a peer still has kernels
-        # in flight on; an abort would surface as an error in the peer's op.
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-        try:
-            # A bounded wait, not a bare barrier: under the default
-            # TORCH_NCCL_ASYNC_ERROR_HANDLING a hung barrier is unrecoverable (the
-            # watchdog rethrows on its own thread and SIGABRTs the process), while
-            # an explicit work timeout raises here in the main thread, letting a
-            # rank whose peer died fall through to the unilateral aborts below.
-            work = torch.distributed.barrier(async_op=True)
-            work.wait(timeout=timedelta(seconds=60))
-        except Exception:
-            pass
-    cuda_device = torch.device("cuda") if torch.cuda.is_available() else None
-    while _CREATED_PROCESS_GROUPS:
-        group = _CREATED_PROCESS_GROUPS.pop()
-        if torch.distributed.distributed_c10d._world.pg_map.get(group, None) is None:
-            # Already destroyed elsewhere (e.g. the explicit Gloo-group teardown).
-            continue
-        backend = None
-        if cuda_device is not None:
-            try:
-                backend = group._get_backend(cuda_device)
-            except Exception:
-                backend = None  # No CUDA backend (e.g. a Gloo-only group).
-        if backend is not None and isinstance(
-            backend, getattr(torch.distributed, "ProcessGroupNCCL", ())
-        ):
-            if hasattr(backend, "abort"):
-                backend.abort()
-            else:  # torch < 2.6
-                backend._shutdown()
-        torch.distributed.destroy_process_group(group)
+    """Destroy this rank's created groups in reverse order, preserving WORLD."""
+    global _global_process_group_list
+    # create_group records each creation once; aliases do not add entries. None is
+    # the default group used by update_pg_timeout, which this function does not own.
+    for group in reversed(_global_process_group_list or []):
+        if group is not None and group in torch.distributed.distributed_c10d._world.pg_map:
+            torch.distributed.destroy_process_group(group)
+    _global_process_group_list = None
 
 
 def destroy_model_parallel() -> None:
-    """Destroy model-parallel process groups and clear their global state."""
-    # Everything below up to _destroy_created_process_groups() releases process-lifetime
-    # caches that hold communicator-backed resources, in each case while the communicators
-    # are still alive. Any cache that survives past the group destruction at the end of
-    # this function resurfaces later as "NCCL communicator was aborted on rank N".
+    """Destroy model-parallel process groups and clear their global state.
 
-    # Release the NCCL EP context (if the 'ncclep' flex dispatcher bootstrapped one) before the
-    # process group's communicator is torn down. TE registers an atexit ep_finalize that would
-    # otherwise run after dist.destroy_process_group() and hit a corrupted comm object at exit.
-    # Idempotent and a no-op when NCCL EP was never bootstrapped. Also drop the module-global
-    # DeepEP/HybridEP buffers: they embed the expert-parallel group of the lifetime that built
-    # them and are reused without liveness checks.
-    try:
-        from megatron.core.transformer.moe.fused_a2a import (
-            nccl_ep_finalize,
-            reset_fused_a2a_buffers,
-        )
-
-        nccl_ep_finalize()
-        reset_fused_a2a_buffers()
-    except Exception:  # finalize must never block teardown
-        pass
-
-    # The 'ncclep' zero-copy path keeps class-level symmetric-memory buffers allocated from
-    # TE's pool on the expert-parallel group; drop them so the next lifetime reallocates.
-    token_dispatcher_module = sys.modules.get("megatron.core.transformer.moe.token_dispatcher")
-    if token_dispatcher_module is not None:
+    Call on every member of each group after communications and Transformer Engine
+    autocast contexts have finished. Release any CUDA graphs managed by the caller
+    before invoking this function. The default process group is preserved.
+    """
+    fp8_state_manager = None
+    if "transformer_engine.pytorch" in sys.modules:
         try:
-            manager = token_dispatcher_module._NCCLEPManager
-            manager._zc_fwd_token_buf = None
-            manager._zc_bwd_token_buf = None
-            manager._zc_recv_topk_weights_buf = None
+            from transformer_engine.pytorch.quantization import FP8GlobalStateManager
+        except ImportError:  # TE < 2.9
+            from transformer_engine.pytorch.fp8 import FP8GlobalStateManager
+
+        fp8_state_manager = FP8GlobalStateManager
+        state = getattr(fp8_state_manager, "quantization_state", fp8_state_manager)
+        if any(
+            getattr(state, name, 0)
+            for name in ("autocast_depth", "AUTOCAST_DEPTH", "FP8_AUTOCAST_DEPTH")
+        ):
+            raise RuntimeError(
+                "Exit Transformer Engine autocast before destroying model parallelism."
+            )
+
+    # Release cached resources while their process groups still exist.
+    fused_a2a_module = sys.modules.get("megatron.core.transformer.moe.fused_a2a")
+    if fused_a2a_module is not None:
+        token_dispatcher_module = sys.modules.get("megatron.core.transformer.moe.token_dispatcher")
+        try:
+            if token_dispatcher_module is not None:
+                token_dispatcher_module.nccl_ep_release_context()
+            else:
+                fused_a2a_module.nccl_ep_finalize()
         except Exception:
-            pass
+            logger.warning(
+                "Failed to finalize NCCL EP during model-parallel teardown.", exc_info=True
+            )
+        fused_a2a_module.reset_fused_a2a_buffers()
 
     # Captured CUDA graphs keep references to the communicators whose collectives they
     # captured; ncclCommFinalize/Destroy cannot complete while such a graph is alive
     # (pytorch#115388). Only touch the module if something already imported it.
     cuda_graphs_module = sys.modules.get("megatron.core.transformer.cuda_graphs")
     if cuda_graphs_module is not None:
-        try:
-            # Skip when no graph state exists: delete_cuda_graphs runs a full
-            # gc.collect + empty_cache, which is pure overhead on graph-free
-            # teardowns (twice per unit-test cycle). cudagraph_record alone is not
-            # enough — creation clears it while the graphs live on in the runners.
-            record = cuda_graphs_module._CudagraphGlobalRecord
-            if (
-                record.cudagraph_created
-                or record.cudagraph_record
-                or record.cudagraph_inference_record
-                or cuda_graphs_module.CudaGraphManager.global_mempool is not None
-            ):
-                cuda_graphs_module.delete_cuda_graphs()
-        except Exception:
-            pass
+        # Avoid gc.collect and empty_cache when no graphs have been recorded.
+        record = cuda_graphs_module._CudagraphGlobalRecord
+        if (
+            record.cudagraph_created
+            or record.cudagraph_record
+            or record.cudagraph_inference_record
+            or cuda_graphs_module.CudaGraphManager.global_mempool is not None
+        ):
+            cuda_graphs_module.delete_cuda_graphs()
 
-    # Transformer Engine caches its FP8 reduction group globally. Clear the cache while the
-    # communicator still exists so later model-parallel initializations cannot reuse it.
-    if "transformer_engine.pytorch" in sys.modules:
-        try:
-            try:
-                from transformer_engine.pytorch.quantization import FP8GlobalStateManager
-            except ImportError:  # TE < 2.9 keeps it in transformer_engine.pytorch.fp8
-                from transformer_engine.pytorch.fp8 import FP8GlobalStateManager
+    # TE retains FP8 reduction groups and per-model tensor caches. The full reset is
+    # safe here because active autocast contexts were rejected before any cleanup.
+    if fp8_state_manager is not None:
+        fp8_state_manager.reset()
 
-            FP8GlobalStateManager.reset()
-        except Exception:
-            pass
-
-    # DTensor memoizes the OutputSharding of every op for the life of the process, keyed by
-    # the op's DTensorSpecs. A DTensorSpec hashes its DeviceMesh by rank layout, device type
-    # and dim names, not by process-group identity, so a mesh built over the next lifetime's
-    # groups is a memo hit that hands back a spec whose mesh still names this lifetime's
-    # groups; every DTensor produced through that hit (param.detach() in Module.state_dict(),
-    # for one) then resolves its groups to communicators destroyed below. Drop the memo while
-    # the groups are still alive: the Python LRU, and the native cache of the C++ dispatch fast
-    # path (pytorch#167051) that sits in front of it on newer torch. Only touch DTensor if
-    # something already imported it.
+    # DTensor's sharding cache compares meshes by layout, not process-group identity.
+    # A later initialization with the same layout would reuse specs naming dead groups.
+    # Clear both the Python LRU and the optional C++ dispatch cache (pytorch#167051).
     dtensor_module = sys.modules.get("torch.distributed.tensor")
     if dtensor_module is not None:
-        try:
-            sharding_propagator = dtensor_module.DTensor._op_dispatcher.sharding_propagator
-            sharding_propagator.propagate_op_sharding.cache_clear()
-        except Exception:
-            pass
+        sharding_propagator = dtensor_module.DTensor._op_dispatcher.sharding_propagator
+        cache = sharding_propagator.propagate_op_sharding
+        clear_python_cache = getattr(cache, "cache_clear", None)
+        if clear_python_cache is None:  # Older LocalLRUCache only exposes the wrapped LRU.
+            clear_python_cache = cache.cache.cache_clear
+        clear_python_cache()
         clear_native_cache = getattr(torch._C, "_clear_DTensor_sharding_propagator_cache", None)
         if clear_native_cache is not None:
-            try:
-                clear_native_cache()
-            except Exception:
-                pass
+            clear_native_cache()
 
     global _MODEL_PARALLEL_GROUP
     _MODEL_PARALLEL_GROUP = None
@@ -2736,23 +2663,9 @@ def destroy_model_parallel() -> None:
     _GLOBAL_MEMORY_BUFFER = None
 
     global _DATA_PARALLEL_GROUP_GLOO
-    if (
-        _DATA_PARALLEL_GROUP_GLOO is not None
-        and torch.distributed.distributed_c10d._world.pg_map.get(_DATA_PARALLEL_GROUP_GLOO, None)
-        is not None
-    ):
-        torch.distributed.destroy_process_group(_DATA_PARALLEL_GROUP_GLOO)
     _DATA_PARALLEL_GROUP_GLOO = None
 
     global _DATA_PARALLEL_GROUP_WITH_CP_GLOO
-    if (
-        _DATA_PARALLEL_GROUP_WITH_CP_GLOO is not None
-        and torch.distributed.distributed_c10d._world.pg_map.get(
-            _DATA_PARALLEL_GROUP_WITH_CP_GLOO, None
-        )
-        is not None
-    ):
-        torch.distributed.destroy_process_group(_DATA_PARALLEL_GROUP_WITH_CP_GLOO)
     _DATA_PARALLEL_GROUP_WITH_CP_GLOO = None
 
     # Destroy parallel state related to expert parallelism.
@@ -2799,28 +2712,12 @@ def destroy_model_parallel() -> None:
     _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_WITH_GTP_REMAT = None
 
     global _EXPERT_DATA_PARALLEL_GROUP_GLOO
-    if (
-        _EXPERT_DATA_PARALLEL_GROUP_GLOO is not None
-        and torch.distributed.distributed_c10d._world.pg_map.get(
-            _EXPERT_DATA_PARALLEL_GROUP_GLOO, None
-        )
-        is not None
-    ):
-        torch.distributed.destroy_process_group(_EXPERT_DATA_PARALLEL_GROUP_GLOO)
     _EXPERT_DATA_PARALLEL_GROUP_GLOO = None
 
     global _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP
     _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP = None
 
     global _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_GLOO
-    if (
-        _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_GLOO is not None
-        and torch.distributed.distributed_c10d._world.pg_map.get(
-            _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_GLOO, None
-        )
-        is not None
-    ):
-        torch.distributed.destroy_process_group(_INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_GLOO)
     _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_GLOO = None
 
     global _INTER_PARTIAL_EXPERT_DATA_PARALLEL_GROUP
@@ -2829,9 +2726,6 @@ def destroy_model_parallel() -> None:
 
     global _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP
     _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP = None
-
-    global _global_process_group_list
-    _global_process_group_list = None
 
     SymmetricMemoryManager.destroy()
 
