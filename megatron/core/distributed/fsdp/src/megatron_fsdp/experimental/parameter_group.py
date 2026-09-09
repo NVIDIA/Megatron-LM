@@ -344,8 +344,13 @@ class FsdpParameterGroup:
             self.post_optimizer_model_weight.placements != self.model_weight.placements
         )
 
-    def unshard_parameters(self) -> None:
-        """Install full parameters for local compute."""
+    def unshard_parameters(self, orientation: str = "rowwise") -> None:
+        """Install full parameters for local compute.
+
+        ``orientation`` selects the payload orientation for MXFP8 groups; it is
+        ignored by regular groups.
+        """
+        del orientation
         if self._model_weight_is_stale:
             self.post_optimizer_model_weight.redistribute(
                 self.model_weight.placements, out=self.model_weight
@@ -693,15 +698,17 @@ class Fp8ParameterGroup(FsdpParameterGroup):
                 temp._columnwise_data.reshape(-1)[start_offset:end_offset].view(rows_local, -1)
             )
 
-    def unshard_parameters(self) -> None:
+    def unshard_parameters(self, orientation: str = "rowwise") -> None:
         """Gather both payload orientations and bind them on the fp8 tensors.
 
-        Both orientations are always gathered and bound: Megatron's TE layers call
+        ``orientation`` is accepted for schedule compatibility but both
+        orientations are always gathered and bound: Megatron's TE layers call
         ``update_usage(rowwise=True, columnwise=True)`` on fp8 primary weights
         at forward, so the tensor must carry both row-wise and column-wise
         data and scale inverses for compute. The scale-inverse grids live on
         the tensors (global after quantize) and are never gathered.
         """
+        del orientation
         for source, target in (
             (self._rowwise_buffer, self._unsharded_rowwise),
             (self._colwise_buffer, self._unsharded_colwise),
