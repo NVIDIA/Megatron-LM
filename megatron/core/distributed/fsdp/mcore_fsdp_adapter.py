@@ -736,9 +736,13 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             # silently inflated norm.
             raise ValueError("MFSDP v2 does not currently support mtp_detach_heads.")
 
+        # Pipeline parallelism is supported with MFSDP v2 as long as a single shared
+        # FsdpContext is opened across all VPP model chunks (see
+        # wrap_model_chunks_with_ddp / dist_utils._ddp_wrap). The data-parallel mesh is
+        # built solely from dp_cp, so DP sharding is unaffected by how layers are split
+        # across pipeline stages or virtual stages.
         unsupported_parallelisms = [
             "tensor_model_parallel_size",
-            "pipeline_model_parallel_size",
             "context_parallel_size",
         ]
         if any(getattr(config, parallelism) != 1 for parallelism in unsupported_parallelisms):
@@ -752,7 +756,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
 
         # The config validates the requested topology, while these checks validate the
         # materialized topology supplied by the caller's process-group collection.
-        for group_name in ("tp", "pp", "cp"):
+        for group_name in ("tp", "cp"):
             group = getattr(pg_collection, group_name, None)
             if group is not None and group.size() != 1:
                 raise ValueError(
