@@ -16,11 +16,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from megatron.core.fp8_utils import get_fp8_align_size
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.jit import jit_fuser
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.quantization.te_recipe import get_quantization_alignment
+from megatron.core.quantization.utils import is_quantization_enabled
 from megatron.core.ssm.mamba_context_parallel import (
     _all_to_all_cp2hp,
     _all_to_all_hp2cp,
@@ -206,11 +207,12 @@ class _GDNBase(MegatronModule):
         self.in_proj_qkvg_dim = self.qk_dim * 2 + self.v_dim * 2
         self.in_proj_dim = self.in_proj_qkvg_dim + self.in_proj_extra_dim
 
-        if self.config.fp8:
-            fp8_align_size = get_fp8_align_size(self.config.fp8_recipe)
-            assert self.in_proj_dim % fp8_align_size == 0, (
-                "For FP8, the innermost dimension of the GDN layer "
-                "input projection output tensor must be a multiple of 16."
+        if is_quantization_enabled(self.config):
+            quantization_alignment = get_quantization_alignment(self.config)
+            assert self.in_proj_dim % quantization_alignment == 0, (
+                "For quantized execution, the innermost dimension of the GDN layer "
+                "input projection output tensor must be a multiple of "
+                f"{quantization_alignment}."
             )
         self.in_proj = build_module(
             submodules.in_proj,

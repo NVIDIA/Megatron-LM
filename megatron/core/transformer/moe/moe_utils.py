@@ -9,9 +9,8 @@ import torch
 
 from megatron.core import parallel_state
 from megatron.core.extensions.transformer_engine import HAVE_TE
-from megatron.core.fp4_utils import get_fp4_align_size
-from megatron.core.fp8_utils import get_fp8_align_size
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.quantization.te_recipe import get_quantization_alignment
 from megatron.core.tensor_parallel import (
     get_cuda_rng_tracker,
     get_data_parallel_rng_tracker_name,
@@ -1478,12 +1477,7 @@ def get_align_size_for_quantization(config: TransformerConfig) -> int:
     # TE's grouped-tensor and fused grouped-MLP kernels require 256-token alignment.
     if config.use_transformer_engine_op_fuser or config.moe_use_grouped_tensor:
         return 256
-    if config.fp8:
-        return get_fp8_align_size(config.fp8_recipe)
-    if config.fp4:
-        return get_fp4_align_size(config.fp4_recipe)
-    # Legacy high-precision grouped GEMM does not require padding. Defaults to 0.
-    return 0
+    return get_quantization_alignment(config)
 
 
 def _deepep_permute_pads_grouped_tensor_input(config: TransformerConfig) -> bool:

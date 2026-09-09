@@ -26,6 +26,7 @@ from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.quantization.utils import is_quantization_enabled
 from megatron.core.transformer.cuda_graphs import is_graph_capturing
 from megatron.core.transformer.enums import CudaGraphModule, InferenceCudaGraphScope, LayerType
 from megatron.core.transformer.identity_op import IdentityFuncOp, IdentityOp
@@ -480,7 +481,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             if "layernorm" in self.config.recompute_modules:
                 if not isinstance(self.input_layernorm, IdentityOp):
                     self.recompute_input_layernorm = True
-                    if self.config.fp8 or self.config.fp4:
+                    if is_quantization_enabled(self.config):
                         self.self_attention.set_for_recompute_input_layernorm()
 
                 def can_recompute_pre_mlp_layernorm_for_cudagraph():
@@ -530,7 +531,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                     and can_recompute_pre_mlp_layernorm_for_cudagraph()
                 ):
                     self.recompute_pre_mlp_layernorm = True
-                    if self.config.fp8 or self.config.fp4:
+                    if is_quantization_enabled(self.config):
                         if isinstance(self.mlp, MoELayer):
                             self.mlp.set_for_recompute_pre_mlp_layernorm()
                         else:
@@ -1089,7 +1090,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         )
 
         if self.recompute_mlp:
-            if self.config.fp8 or self.config.fp4:
+            if is_quantization_enabled(self.config):
                 # import here to avoid circular import
                 from megatron.core.extensions.transformer_engine import te_checkpoint
 
@@ -2300,7 +2301,7 @@ class MoETransformerLayer(TransformerLayer):
             )
 
             if self.moe_layer_recompute:
-                if self.config.fp8 or self.config.fp4:
+                if is_quantization_enabled(self.config):
                     from megatron.core.extensions.transformer_engine import te_checkpoint
 
                     result = te_checkpoint(

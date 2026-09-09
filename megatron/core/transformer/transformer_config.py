@@ -14,6 +14,7 @@ from megatron.core.activations import squared_relu
 from megatron.core.context_parallel import CPLayout
 from megatron.core.enums import Fp4Recipe, Fp8Recipe
 from megatron.core.inference.moe import InferenceGroupedGemmBackend
+from megatron.core.quantization.custom_recipe import warn_deprecated_legacy_custom_recipe
 from megatron.core.quantization.quant_config import RecipeConfig
 from megatron.core.transformer.cuda_graph_config import (
     ALLOWED_INFERENCE_SCOPES,
@@ -612,6 +613,14 @@ class TransformerConfig(ModelParallelConfig):
     "mhc" use output-discarding checkpointing, "core_attn", "mlp", "moe", and
     "shared_experts" use normal checkpointing.
     """
+
+    #########################
+    # custom recipe related
+    #########################
+    custom_recipe: str | None = None
+    """Python import path to a callable quantizer factory for a format-neutral Transformer Engine
+    custom recipe. Providing this path enables custom quantization and cannot be combined with FP8
+    or FP4 mode."""
 
     ####################
     # fp8 related
@@ -1533,6 +1542,24 @@ class TransformerConfig(ModelParallelConfig):
         super().__post_init__()
         self._validate_cp_layouts()
 
+        if self.custom_recipe is not None:
+            if not isinstance(self.custom_recipe, str) or not self.custom_recipe.strip():
+                raise ValueError(
+                    "custom_recipe must be a non-empty Python import path to a quantizer factory."
+                )
+            if not (
+                self.fp8 is None
+                and self.fp8_recipe in (None, Fp8Recipe.delayed)
+                and self.fp8_quantizer_factory is None
+                and self.fp4 is None
+                and self.fp4_recipe in (None, Fp4Recipe.nvfp4)
+                and self.fp4_quantizer_factory is None
+            ):
+                raise ValueError(
+                    "custom_recipe cannot be combined with FP8/FP4 format, recipe, or "
+                    "quantizer-factory settings."
+                )
+
         # Resolve deprecated attention variant spellings up front so that every consumer
         # downstream only has to handle the canonical names. Imported lazily because the
         # spec module imports this one.
@@ -1733,6 +1760,18 @@ class TransformerConfig(ModelParallelConfig):
                         "Specify a Python import path (e.g., package.module.quantizer_factory) "
                         "via --fp8-quantizer-factory."
                     )
+                warn_deprecated_legacy_custom_recipe("fp8")
+
+        custom_recipe_enabled = (
+            self.custom_recipe is not None
+            or (bool(self.fp8) and self.fp8_recipe == Fp8Recipe.custom)
+            or (bool(self.fp4) and self.fp4_recipe == Fp4Recipe.custom)
+        )
+        if custom_recipe_enabled and (self.fp8_param or self.fp4_param):
+            raise ValueError(
+                "Custom recipes do not yet support quantized parameter storage or "
+                "FP8/FP4 parameter gather."
+            )
 
         if self.fp8_param and not self.fp8:
             raise ValueError("fp8_param must be used together with fp8 mode.")
@@ -1759,6 +1798,36 @@ class TransformerConfig(ModelParallelConfig):
                     "Specify a Python import path (e.g., package.module.quantizer_factory) "
                     "via --fp4-quantizer-factory."
                 )
+            warn_deprecated_legacy_custom_recipe("fp4")
+
+        if custom_recipe_enabled:
+            if self.tp_comm_overlap:
+                raise ValueError(
+                    "Custom recipes do not yet support TP communication overlap/Userbuffers."
+                )
+            if self.fp8_dot_product_attention and self.context_parallel_size > 1:
+                raise ValueError(
+                    "Custom-recipe dot-product attention does not support context parallelism."
+                )
+            if self.moe_single_grouped_weight or self.moe_single_grouped_bias:
+                raise ValueError(
+                    "Custom recipes do not yet support MoE single grouped parameters. "
+                    "Use discrete expert weights and biases."
+                )
+            if self.use_grouped_gemm_for_shared_expert:
+                raise ValueError(
+                    "Custom recipes do not yet support the fused grouped shared-expert MLP."
+                )
+            if self.moe_expert_rank_capacity_factor is not None:
+                raise ValueError(
+                    "Custom recipes do not yet support fixed-capacity HybridEP/NCCL-EP dispatch."
+                )
+            if self.transformer_impl == "inference_optimized":
+                raise ValueError(
+                    "Custom recipes do not yet support inference-optimized transformer layers."
+                )
+            if self.cuda_graph_impl != "none" or self.enable_cuda_graph or self.external_cuda_graph:
+                raise ValueError("Custom recipes do not yet support CUDA graphs in Megatron Core.")
 
         if self.apply_query_key_layer_scaling:
             self.attention_softmax_in_fp32 = True
@@ -2896,9 +2965,10 @@ class TransformerConfig(ModelParallelConfig):
             self.moe_router_padding_for_quantization = True
 
         if self.moe_router_padding_for_quantization:
-            if self.fp8 is None and self.fp4 is None:
+            if self.fp8 is None and self.fp4 is None and self.custom_recipe is None:
                 raise ValueError(
-                    "fp8/fp4 must be specified when moe_router_padding_for_quantization is True."
+                    "FP8, FP4, or a custom recipe must be specified when "
+                    "moe_router_padding_for_quantization is True."
                 )
 
             if self.moe_token_dispatcher_type in ["allgather", "alltoall_seq"]:

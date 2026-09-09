@@ -16,12 +16,13 @@ from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping, replace_prefix_for_sharding
 from megatron.core.enums import Fp8Recipe
 from megatron.core.extensions.transformer_engine import HAVE_TE
-from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.backends import BackendSpecProvider, LocalSpecProvider
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.utils import is_vp_last_stage
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.quantization.te_recipe import get_quantization_context
+from megatron.core.quantization.utils import is_quantization_enabled
 from megatron.core.tensor_parallel import (
     gather_from_tensor_model_parallel_region,
     scatter_to_sequence_parallel_region,
@@ -1609,24 +1610,21 @@ class MultiTokenPredictionLayer(MegatronModule):
         else:
             rng_context = nullcontext()
 
-        # Unlike transformer_block.py which needs to support mixed-precision in
-        # different layers,currently MTP only use global fp8 context.
-        if self.config.fp8:
-            fp8_context = get_fp8_context(self.config)
-            transformer_layer_fp8_context = get_fp8_context(self.config)
+        # Unlike TransformerBlock, MTP uses one global quantization recipe.
+        if is_quantization_enabled(self.config):
+            quantization_context = get_quantization_context(self.config)
+            transformer_layer_quantization_context = get_quantization_context(self.config)
         else:
-            fp8_context = nullcontext()
-            transformer_layer_fp8_context = nullcontext()
+            quantization_context = nullcontext()
+            transformer_layer_quantization_context = nullcontext()
 
-        # TODO: currently ignoring FP4 in MTP layers because we need more numerical validation
         with rng_context:
-            with fp8_context:
+            with quantization_context:
                 hidden_states = self._concat_embeddings(hidden_states, decoder_input)
 
-            # Use a separate fp8 context for the transformer layer. This is to ensure that when the
-            # transformer layer is cudagraphed, the FP8GlobalStateManager.is_first_fp8_module() is
-            # True so that the fp8 weight caching can be triggered correctly.
-            with transformer_layer_fp8_context:
+            # Use a separate context for the transformer layer so TE sees it as
+            # the first quantized module and can trigger its weight cache.
+            with transformer_layer_quantization_context:
                 if self.mtp_layer_pattern is not None:
                     hidden_states = self.mtp_model_layer(
                         hidden_states=hidden_states,
@@ -1808,7 +1806,7 @@ class MultiTokenPredictionLayer(MegatronModule):
         # the inner context entered inside ``_proj_and_transformer_layer``
         # is sufficient.
         if self.config.fp8 and self.config.fp8_recipe == Fp8Recipe.delayed:
-            outer_quantization_context = get_fp8_context(self.config)
+            outer_quantization_context = get_quantization_context(self.config)
         else:
             outer_quantization_context = nullcontext()
 
@@ -1818,7 +1816,7 @@ class MultiTokenPredictionLayer(MegatronModule):
             # ``fp8_autocast`` (see ``fp4_utils.get_fp4_context``), so
             # quantized recompute on either fp8 or fp4 must go through
             # ``te_checkpoint``. Matches ``transformer_block``'s policy.
-            if self.config.fp8 or self.config.fp4:
+            if is_quantization_enabled(self.config):
                 from megatron.core.extensions.transformer_engine import te_checkpoint
 
                 return te_checkpoint(

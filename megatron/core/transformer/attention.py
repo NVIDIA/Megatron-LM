@@ -32,6 +32,7 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.quantization.te_recipe import supports_save_original_input
 from megatron.core.tensor_parallel.mappings import all_gather_last_dim_from_tensor_parallel_region
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule
@@ -391,6 +392,7 @@ class Attention(MegatronModule, ABC):
             cp_comm_type=cp_comm_type,
             softmax_scale=self.config.softmax_scale,
             pg_collection=self.pg_collection,
+            name=(name + ".core_attention") if name is not None else None,
         )
 
         self.checkpoint_core_attention = (
@@ -432,16 +434,9 @@ class Attention(MegatronModule, ABC):
         if (
             HAVE_TE
             and isinstance(self.linear_proj, TELinear)
-            and (
-                (
-                    self.config.fp8
-                    and self.config.fp8_recipe != 'delayed'
-                    and is_te_min_version("2.6.0dev0")
-                )
-                or (self.config.fp4 and is_te_min_version("2.7.0.dev0"))
-            )
+            and supports_save_original_input(self.config)
         ):
-            # For fp8/fp4 training, the output of the fused core_attn is saved by itself, and
+            # For quantized training, the output of the fused core_attn is saved by itself, and
             # linear_proj also saves the quantized tensor of this output. Here we set the
             # linear_proj to save the original input tensors to avoid the extra memory usage of
             # the quantized tensor.

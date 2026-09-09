@@ -247,6 +247,7 @@ class ViTModel(MegatronModule):
             post_process=False,
             pg_collection=pg_collection,
             vp_stage=vp_stage,
+            name="decoder",
         )
 
         # Optional Pixtral-Large-style 2×2 patch merger after the transformer stack.
@@ -608,6 +609,7 @@ class QwenVLViTModel(MegatronModule):
             post_process=False,
             pg_collection=pg_collection,
             vp_stage=vp_stage,
+            name="decoder",
         )
 
         # Patch merger
@@ -905,6 +907,7 @@ class KimiViTModel(MegatronModule):
             post_process=False,
             pg_collection=pg_collection,
             vp_stage=vp_stage,
+            name="decoder",
         )
 
         # Final layer norm (Kimi has a post-transformer norm)

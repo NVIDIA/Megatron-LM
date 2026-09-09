@@ -38,6 +38,7 @@ from megatron.core.config_logger import has_config_logger_enabled, log_config_to
 from megatron.core.distributed.data_parallel_base import _BaseDataParallel
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.quantization.utils import is_quantization_enabled
 from megatron.core.ssm.mamba_layer import MambaLayer
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -785,8 +786,14 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             raise ValueError("MFSDP v2 does not currently support gradient accumulation fusion.")
         if config.calculate_per_token_loss:
             raise ValueError("MFSDP v2 does not currently support per-token loss normalization.")
-        if config.fp8 or config.fp4 or ddp_config.fp8_param_gather or ddp_config.fp4_param_gather:
-            raise ValueError("MFSDP v2 does not currently support FP8 or FP4.")
+        if (
+            is_quantization_enabled(config)
+            or ddp_config.fp8_param_gather
+            or ddp_config.fp4_param_gather
+        ):
+            raise ValueError(
+                "MFSDP v2 does not currently support FP8, FP4, or custom quantization recipes."
+            )
         if config.cuda_graph_impl != "none" or ddp_config.megatron_fsdp_cuda_graph_mode:
             raise ValueError("MFSDP v2 does not currently support CUDA graphs.")
 

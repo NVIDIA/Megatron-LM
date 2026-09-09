@@ -34,6 +34,7 @@ from megatron.core.parallel_state import (
     model_parallel_is_initialized,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection, resolve_gtp_remat_group
+from megatron.core.quantization.custom_recipe import get_cached_custom_recipe
 from megatron.core.quantization.quant_config import QuantizationConfig
 from megatron.core.quantization.utils import get_quant_config_or_none
 from megatron.core.tensor_parallel.layers import (
@@ -200,6 +201,10 @@ class TEQuantizationRecipe:
         ):
             if instance.custom_recipe_factory is None:
                 raise ValueError("custom fp8 or fp4 recipe requires custom_recipe_factory")
+            if instance.fp8_param or instance.fp4_param:
+                raise ValueError(
+                    "Per-module custom recipes do not yet support quantized parameter storage."
+                )
         return instance
 
     @classmethod
@@ -254,7 +259,14 @@ class TEQuantizationParams:
             raise NotImplementedError(f"Unhandled configuration type {config_type}")
 
 
+def _is_te_custom_recipe(recipe) -> bool:
+    """Return whether ``recipe`` is a Transformer Engine ``CustomRecipe`` instance."""
+    custom_recipe_cls = getattr(te.common.recipe, "CustomRecipe", None) if HAVE_TE else None
+    return custom_recipe_cls is not None and isinstance(recipe, custom_recipe_cls)
+
+
 def _get_fp8_model_init_for_quant_recipe(qrecipe: TEQuantizationRecipe):
+    custom_recipe = False
     if qrecipe.fp8_quantization_recipe is None and qrecipe.fp4_quantization_recipe is None:
         enabled = False
         quant_recipe = None
@@ -268,10 +280,9 @@ def _get_fp8_model_init_for_quant_recipe(qrecipe: TEQuantizationRecipe):
             raise ValueError(f"Unhandled fp8_format {qrecipe.fp8_format}")
 
         if qrecipe.fp8_quantization_recipe == Fp8Recipe.custom:
-            from megatron.core.fp8_utils import _get_custom_recipe
-
+            custom_recipe = True
             assert qrecipe.custom_recipe_factory is not None
-            quant_recipe = _get_custom_recipe(qrecipe.custom_recipe_factory)
+            quant_recipe = get_cached_custom_recipe(qrecipe, qrecipe.custom_recipe_factory)
         elif qrecipe.fp8_quantization_recipe == Fp8Recipe.tensorwise:
             quant_recipe = te.common.recipe.Float8CurrentScaling(fp8_format=fp8_format)
         elif qrecipe.fp8_quantization_recipe == Fp8Recipe.blockwise:
@@ -284,20 +295,22 @@ def _get_fp8_model_init_for_quant_recipe(qrecipe: TEQuantizationRecipe):
         # Fp4 configured.
         enabled = qrecipe.fp4_param
         if qrecipe.fp4_quantization_recipe == Fp4Recipe.custom:
-            from megatron.core.fp8_utils import _get_custom_recipe
-
+            custom_recipe = True
             assert qrecipe.custom_recipe_factory is not None
-            quant_recipe = _get_custom_recipe(qrecipe.custom_recipe_factory)
+            quant_recipe = get_cached_custom_recipe(qrecipe, qrecipe.custom_recipe_factory)
         elif qrecipe.fp4_quantization_recipe == Fp4Recipe.nvfp4:
             quant_recipe = te.common.recipe.NVFP4BlockScaling()
         else:
             raise ValueError(f"Unhandled fp4 recipe: {qrecipe.fp4_quantization_recipe}")
 
-    return fp8_model_init(
-        enabled=enabled,
-        recipe=quant_recipe,
-        preserve_high_precision_init_val=torch.is_grad_enabled(),
-    )
+    context_args = {
+        "enabled": enabled,
+        "recipe": quant_recipe,
+        "preserve_high_precision_init_val": torch.is_grad_enabled(),
+    }
+    if custom_recipe:
+        return te.pytorch.quantized_model_init(**context_args)
+    return fp8_model_init(**context_args)
 
 
 def _get_fp8_model_init_for_quant_params(qparams: TEQuantizationParams | None, training: bool):
@@ -326,14 +339,13 @@ def _get_fp8_autocast_for_quant_recipe(qrecipe: TEQuantizationRecipe):
             amax_group = get_amax_reduction_group(
                 with_context_parallel=True, tp_only_amax_red=qrecipe.tp_only_amax_red
             )
-        if (
+        custom_recipe = (
             qrecipe.fp8_quantization_recipe == Fp8Recipe.custom
             or qrecipe.fp4_quantization_recipe == Fp4Recipe.custom
-        ):
-            from megatron.core.fp8_utils import _get_custom_recipe
-
+        )
+        if custom_recipe:
             assert qrecipe.custom_recipe_factory is not None
-            quant_recipe = _get_custom_recipe(qrecipe.custom_recipe_factory)
+            quant_recipe = get_cached_custom_recipe(qrecipe, qrecipe.custom_recipe_factory)
         elif qrecipe.fp8_quantization_recipe is not None:
             if qrecipe.fp8_format == "e4m3":
                 fp8_format = te.common.recipe.Format.E4M3
@@ -357,6 +369,10 @@ def _get_fp8_autocast_for_quant_recipe(qrecipe: TEQuantizationRecipe):
             else:
                 raise ValueError(f"Unhandled fp4 recipe: {qrecipe.fp8_quantization_recipe}")
 
+        if custom_recipe:
+            return te.pytorch.autocast(
+                enabled=True, recipe=quant_recipe, amax_reduction_group=amax_group
+            )
         return fp8_autocast(enabled=True, fp8_recipe=quant_recipe, fp8_group=amax_group)
 
 
@@ -978,6 +994,9 @@ if HAVE_TE and is_te_min_version("1.13.0"):
             accumulate_into_main_grad=module.fuse_wgrad_accumulation,
             userbuffers_options=userbuffers_options,
         )
+        # BasicLinear does not expose a constructor name argument, but it does
+        # read ``self.name`` before materializing custom quantizers on forward.
+        op.name = getattr(module, "name", None)
         op.weight = weight
         return op
 
@@ -1340,6 +1359,7 @@ class TELinear(te.pytorch.Linear):
                 bias=bias,
                 return_bias=self.te_return_bias,
                 parallel_mode=te_parallel_mode,
+                name=name,
                 **extra_kwargs,
             )
 
@@ -1576,6 +1596,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
                 parallel_mode="column",
                 return_layernorm_output=False,
                 zero_centered_gamma=self.config.layernorm_zero_centered_gamma,
+                name=name,
                 **extra_kwargs,
             )
 
@@ -2101,6 +2122,7 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         num_splits: Optional[int] = None,
         cp_comm_type: Optional[str] = "p2p",
         pg_collection: Optional[ProcessGroupCollection] = None,
+        name: str | None = None,
     ):
         if not HAVE_TE:
             raise ImportError(
@@ -2277,6 +2299,7 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             ),
             tp_group=pg_collection.tp,
             layer_number=layer_number,
+            name=name,
             **extra_kwargs,
         )
 
@@ -2584,6 +2607,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                     bias=bias,
                     return_bias=self.te_return_bias,
                     parallel_mode=parallel_mode,
+                    name=name,
                     **extra_kwargs,
                 )
 
@@ -2814,6 +2838,14 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
 
             if not fp8_checkpoint:
                 return [state] * self.num_gemms
+
+            if _is_te_custom_recipe(self.fp8_meta.get("recipe")):
+                # TE serializes the CustomRecipe object itself, including its quantizer
+                # factory, into the extra state. The restricted unpickler used for
+                # checkpoints cannot decode an arbitrary factory, and TE ignores this
+                # payload when loading. Store an empty per-GEMM extra state instead; any
+                # delayed-scaling state produced by a custom factory is not persisted.
+                return [torch.empty(0, dtype=torch.uint8)] * self.num_gemms
 
             state = self._decode_extra_state(state)
             if state is None:
