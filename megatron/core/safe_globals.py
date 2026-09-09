@@ -44,6 +44,7 @@ SAFE_GLOBALS = [
     RerunMode,
     RerunState,
     BytesIO,
+    frozenset,
     Signals,
     torch._C.Generator,  # Needed for torch ckpt format loading after weights_only default change
 ]
