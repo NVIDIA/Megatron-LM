@@ -541,6 +541,33 @@ def test_supplied_block_hashes_are_not_re_salted():
     assert request.precomputed_block_hashes == [11, 22]
 
 
+def test_payload_staging_metadata_survives_checkpoint_and_stays_off_reply():
+    admission = {"rollout_id": "r0", "model_call_id": "c1"}
+    request = _make_dynamic_request(
+        uid="chatcmpl-fixed", request_metadata={"ng_capture": admission}, generated_tokens=[10]
+    )
+    request.generated_log_probs = [-0.25]
+    record = DynamicInferenceRequestRecord.from_request(request)
+    record.checkpoint()
+    merged = record.merge()
+
+    assert merged.uid == "chatcmpl-fixed"
+    assert merged.request_metadata == {"ng_capture": admission}
+
+    serialized = merged.serialize(
+        payload_offloaded=True,
+        payload_stage_metadata={"ng_commit_coords": {"staging_key": "r0/c1"}},
+    )
+    assert serialized["uid"] == "chatcmpl-fixed"
+    assert "request_metadata" not in serialized
+    assert serialized["generated_log_probs"] is None
+    assert serialized["payload_offloaded"] is True
+    assert serialized["payload_stage_metadata"] == {"ng_commit_coords": {"staging_key": "r0/c1"}}
+    round_trip = DynamicInferenceRequest.deserialize(unwrap_serialized_tensors(serialized))
+    assert round_trip.payload_offloaded is True
+    assert round_trip.payload_stage_metadata == {"ng_commit_coords": {"staging_key": "r0/c1"}}
+
+
 def test_offloaded_request_payload_and_serialize():
     """The payload copies a finished request's per-token data as plain host-side lists;
     serialize(payload_offloaded=True) drops that data from the wire, marks the reply, and

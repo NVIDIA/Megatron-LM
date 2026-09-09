@@ -42,6 +42,7 @@ from megatron.core.inference.inference_request import (
     DynamicInferenceRequest,
     DynamicInferenceRequestRecord,
     DynamicVLMInferenceRequest,
+    RequestPayloadStageResult,
     Status,
     compute_block_hashes_batched,
     compute_media_cache_key,
@@ -1193,8 +1194,11 @@ class _RecordingStager:
     def __init__(self):
         self.staged = []
 
-    def stage(self, uid, payload):
+    def stage(self, uid, payload, *, finished_metadata, request_metadata=None):
         self.staged.append((uid, payload))
+        self.finished_metadata = finished_metadata
+        self.request_metadata = request_metadata
+        return RequestPayloadStageResult()
 
 
 def _reply_request(uid, status, log_probs):
@@ -1248,6 +1252,39 @@ def test_payload_offload_stages_and_strips_completed_replies(with_stager):
     # Token ids stay on the wire, and the drop is wire-only: the request keeps its log probs.
     assert ok_wire["generated_tokens"] == [10, 11]
     assert completed.generated_log_probs == [-0.5, -0.25]
+
+
+def test_engine_prepares_prompt_before_model_parallel_broadcast():
+    class _Preparer:
+        def prepare_prompt(self, prompt, *, request_metadata=None):
+            metadata = dict(request_metadata or {})
+            metadata["prepared"] = True
+            return [1, 2, *prompt], metadata
+
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine.prompt_preparer = _Preparer()
+    sampling_params = SamplingParams(temperature=0.5).serialize()
+    message = [
+        msgpack.packb(
+            [
+                Headers.SUBMIT_REQUEST.value,
+                17,
+                sampling_params,
+                None,
+                {"ng_capture": {"rollout_id": "r0"}},
+            ],
+            use_bin_type=True,
+        ),
+        msgpack.packb([3, 4], use_bin_type=True),
+        msgpack.packb(None, use_bin_type=True),
+    ]
+
+    prepared = engine._prepare_submit_request_message(message)
+    metadata = msgpack.unpackb(prepared[0], raw=False)
+
+    assert metadata[:4] == [Headers.SUBMIT_REQUEST.value, 17, sampling_params, None]
+    assert metadata[4] == {"ng_capture": {"rollout_id": "r0"}, "prepared": True}
+    assert msgpack.unpackb(prepared[1], raw=False) == [1, 2, 3, 4]
 
 
 def test_streaming_partials_buffer_until_token_interval():

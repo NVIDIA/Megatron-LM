@@ -151,6 +151,7 @@ class InferenceClient:
         sampling_params: SamplingParams,
         *,
         multi_modal_data=None,
+        request_metadata: Optional[dict] = None,
     ) -> asyncio.Future:
         """
         Submits a new inference request to the coordinator.
@@ -175,15 +176,20 @@ class InferenceClient:
                 Audio:
                     Audio does not yet have any supported data preprocessing
                     or modeling formats.
+            request_metadata: Opaque JSON/msgpack-compatible metadata forwarded
+                to the engine's payload stager.
 
         Returns:
             asyncio.Future: A future that will be resolved with a
             `DynamicInferenceRequest` object (if deserialize=True) or a raw
             serialized dict (if deserialize=False) containing the completed result.
         """
-        return self.add_request_with_id(prompt, sampling_params, multi_modal_data=multi_modal_data)[
-            1
-        ]
+        return self.add_request_with_id(
+            prompt,
+            sampling_params,
+            multi_modal_data=multi_modal_data,
+            request_metadata=request_metadata,
+        )[1]
 
     def add_request_with_id(
         self,
@@ -191,6 +197,7 @@ class InferenceClient:
         sampling_params: SamplingParams,
         *,
         multi_modal_data=None,
+        request_metadata: Optional[dict] = None,
     ) -> tuple[int, asyncio.Future]:
         """Submit a request and return its id alongside its completion future.
 
@@ -212,10 +219,14 @@ class InferenceClient:
         """
         request_id = self.next_request_id
         self.next_request_id += 1
-        frames = self._pack_submit_frames(request_id, prompt, sampling_params, multi_modal_data)
+        frames = self._pack_submit_frames(
+            request_id, prompt, sampling_params, multi_modal_data, request_metadata=request_metadata
+        )
         return request_id, self._submit_request(frames, request_id)
 
-    def _pack_submit_frames(self, request_id, prompt, sampling_params, multi_modal_data):
+    def _pack_submit_frames(
+        self, request_id, prompt, sampling_params, multi_modal_data, *, request_metadata=None
+    ):
         """Build the multipart frames for a SUBMIT_REQUEST.
 
         Shared by the blocking and streaming submit paths so the wire format is
@@ -255,7 +266,13 @@ class InferenceClient:
         )
         return [
             msgpack.packb(
-                [Headers.SUBMIT_REQUEST.value, request_id, sampling_params.serialize(), media_meta],
+                [
+                    Headers.SUBMIT_REQUEST.value,
+                    request_id,
+                    sampling_params.serialize(),
+                    media_meta,
+                    request_metadata,
+                ],
                 use_bin_type=True,
             ),
             self._pack_prompt(prompt),
@@ -408,6 +425,7 @@ class InferenceClient:
         sampling_params: SamplingParams,
         *,
         multi_modal_data=None,
+        request_metadata: Optional[dict] = None,
     ) -> AsyncStream[dict]:
         """Submit a streaming inference request.
 
@@ -438,6 +456,8 @@ class InferenceClient:
                 Audio:
                     Audio does not yet have any supported data preprocessing
                     or modeling formats.
+            request_metadata: Opaque JSON/msgpack-compatible metadata forwarded
+                to the engine's payload stager.
 
         Returns:
             AsyncStream[dict]: Per-step partial and final reply frames.
@@ -445,7 +465,9 @@ class InferenceClient:
         sampling_params.streaming = True
         request_id = self.next_request_id
         self.next_request_id += 1
-        frames = self._pack_submit_frames(request_id, prompt, sampling_params, multi_modal_data)
+        frames = self._pack_submit_frames(
+            request_id, prompt, sampling_params, multi_modal_data, request_metadata=request_metadata
+        )
         return self._submit_stream(frames, request_id)
 
     def _submit_request(self, frames: list, request_id: int) -> asyncio.Future:

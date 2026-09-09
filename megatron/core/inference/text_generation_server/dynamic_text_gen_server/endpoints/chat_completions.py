@@ -756,6 +756,14 @@ try:
         parsers = current_app.config['parsers']
 
         req = await request.get_json()
+        ng_capture = req.get("ng_capture")
+        if ng_capture is not None and not isinstance(ng_capture, dict):
+            return Response("'ng_capture' must be an object", status=400)
+        capture_prefix_requested = bool(
+            ng_capture is not None and ng_capture.get("mode") == "token_in"
+        )
+        prompt_suffix_token_ids = None
+        prefix_boundary_token_id = None
         prevent_retokenization = req.get(
             "prevent_retokenization", not current_app.config.get('eval_mode', False)
         )
@@ -867,7 +875,11 @@ try:
                         ),
                     )
 
-                if prevent_retokenization or required_prefix_token_ids is not None:
+                if (
+                    prevent_retokenization
+                    or required_prefix_token_ids is not None
+                    or capture_prefix_requested
+                ):
                     # If we are avoiding retokenization, we need to replace some prompt tokens with the prompt/generation tokens from the previous generation
                     # This improves prefix cache hits and reduces logprob variation between training and inference.
 
@@ -883,16 +895,19 @@ try:
                         if last_assistant_message_idx is not None
                         else None
                     )
-                    if required_prefix_token_ids is not None and last_assistant_message is None:
+                    if (
+                        required_prefix_token_ids is not None or capture_prefix_requested
+                    ) and last_assistant_message is None:
                         raise ValueError(
-                            "'required_prefix_token_ids' was supplied but the conversation "
-                            "has no assistant message to anchor the provided tokens."
+                            "An exact token prefix was requested but the conversation has no "
+                            "assistant message to anchor it."
                         )
 
                     # Only proceed if the last assistant message has the token IDs from a previous generation.
                     # Dataset-provided conversation history won't have these fields.
                     if last_assistant_message is not None and (
                         required_prefix_token_ids is not None
+                        or capture_prefix_requested
                         or (
                             isinstance(last_assistant_message.get("prompt_token_ids"), list)
                             and isinstance(last_assistant_message.get("generation_token_ids"), list)
@@ -907,8 +922,10 @@ try:
                         previous_prompt_token_ids = last_assistant_message.get(
                             "compact_prompt_token_ids"
                         )
-                        if required_prefix_token_ids is None and not isinstance(
-                            previous_prompt_token_ids, list
+                        if (
+                            required_prefix_token_ids is None
+                            and not capture_prefix_requested
+                            and not isinstance(previous_prompt_token_ids, list)
                         ):
                             raise ValueError(
                                 "Prefix stitching requires compact_prompt_token_ids "
@@ -955,7 +972,17 @@ try:
                                 )
                             )
 
-                        if required_prefix_token_ids is not None:
+                        if capture_prefix_requested:
+                            suffix_start = _prefix_replacement_start(
+                                eos_token_id, retokenized_previous_turn_token_ids, prompt_tokens
+                            )
+                            if not 0 <= suffix_start < len(prompt_tokens):
+                                raise ValueError(
+                                    "could not locate the exact-prefix splice boundary"
+                                )
+                            prompt_suffix_token_ids = prompt_tokens[suffix_start:]
+                            prefix_boundary_token_id = eos_token_id
+                        elif required_prefix_token_ids is not None:
                             # Tokens for the previous turn are supplied by the user.
                             previous_turn_token_ids = required_prefix_token_ids
                         else:
@@ -963,16 +990,19 @@ try:
                                 previous_prompt_token_ids
                                 + last_assistant_message["generation_token_ids"]
                             )
-                        prompt_tokens = _replace_prefix_tokens(
-                            eos_token_id,
-                            previous_turn_token_ids,
-                            retokenized_previous_turn_token_ids,
-                            prompt_tokens,
-                        )
+                        if not capture_prefix_requested:
+                            prompt_tokens = _replace_prefix_tokens(
+                                eos_token_id,
+                                previous_turn_token_ids,
+                                retokenized_previous_turn_token_ids,
+                                prompt_tokens,
+                            )
 
             else:
                 if media_slots:
                     raise ValueError("Multimodal chat requests require a chat template.")
+                if required_prefix_token_ids is not None or capture_prefix_requested:
+                    raise ValueError("exact token prefixes require a tokenizer chat template")
                 warnings.warn(
                     "Tokenizer does not support 'apply_chat_template'. Using tokenize instead."
                 )
@@ -996,6 +1026,8 @@ try:
             top_p = float(_get_non_none(req, "top_p", current_app.config.get('default_top_p', 1.0)))
             top_k = int(_get_non_none(req, "top_k", current_app.config.get('default_top_k', 0)))
             n = int(_get_non_none(req, "n", 1))  # Number of choices to generate
+            if ng_capture is not None and n != 1:
+                raise ValueError("'ng_capture' requires n=1")
 
             if temperature == 0.0:
                 top_k = 1
@@ -1068,6 +1100,17 @@ try:
         # them as a serialized tensor dict on the wire, skip the encoder for
         # admissions 2..n). Kept as a known limitation for a follow-up so this
         # PR stays scoped.
+        request_metadata = None
+        if ng_capture is not None:
+            request_metadata = {"ng_capture": ng_capture}
+            if capture_prefix_requested:
+                request_metadata.update(
+                    ng_prompt_suffix_token_ids=prompt_suffix_token_ids,
+                    ng_prefix_boundary_token_id=prefix_boundary_token_id,
+                )
+        capture_request_kwargs = (
+            {"request_metadata": request_metadata} if request_metadata is not None else {}
+        )
         stream_requested = bool(req.get("stream", False))
         if stream_requested:
             # Streaming currently supports only Hugging Face fast tokenizers.
@@ -1081,7 +1124,10 @@ try:
 
             streams = [
                 client.add_request_streaming(
-                    prompt_tokens, sampling_params, multi_modal_data=multi_modal_data
+                    prompt_tokens,
+                    sampling_params,
+                    multi_modal_data=multi_modal_data,
+                    **capture_request_kwargs,
                 )
                 for _ in range(n)
             ]
@@ -1149,7 +1195,10 @@ try:
         try:
             for _ in range(n):
                 request_id, future = client.add_request_with_id(
-                    prompt_tokens, sampling_params, multi_modal_data=multi_modal_data
+                    prompt_tokens,
+                    sampling_params,
+                    multi_modal_data=multi_modal_data,
+                    **capture_request_kwargs,
                 )
                 request_ids.append(request_id)
                 tasks.append(future)
@@ -1227,10 +1276,18 @@ try:
         # engine kept the prompt_tokens tensor on the payload.
         request_idx = 0
         response_uid = None
+        response_metadata = {}
         for result_item in batch_results:
             result = unwrap_serialized_tensors(result_item)
             if response_uid is None:
                 response_uid = result["uid"]
+            stage_metadata = result.get("payload_stage_metadata") or {}
+            for key, value in stage_metadata.items():
+                if key in response_metadata and response_metadata[key] != value:
+                    raise ValueError(
+                        f"payload stager returned conflicting response metadata for {key!r}"
+                    )
+                response_metadata[key] = value
 
             text_output = TextGenerationController.detokenize(
                 tokenizer,
@@ -1319,7 +1376,7 @@ try:
             if "reasoning" in metadata:
                 message["reasoning_content"] = metadata["reasoning"]
 
-            if return_tokenized_data:
+            if return_tokenized_data and not payload_offloaded:
                 # Wire contract matches vLLM: prompt_token_ids are model-input tokens
                 # (post vision/video expansion). Preserve the exact compact form
                 # separately for lossless multi-turn prefix stitching.
@@ -1328,7 +1385,7 @@ try:
                     result.get("compact_prompt_tokens") or result["prompt_tokens"]
                 )
                 message["generation_token_ids"] = result["generated_tokens"]
-            if return_raw_text:
+            if return_raw_text and not payload_offloaded:
                 prompt_str = tokenizer.detokenize(result["prompt_tokens"])
                 message["raw_text"] = prompt_str + text_output
             if not payload_offloaded:
@@ -1394,6 +1451,12 @@ try:
                 "prompt_tokens_details": {"cached_tokens": cached_token_count},
             },
         }
+        overlap = set(response).intersection(response_metadata)
+        if overlap:
+            raise ValueError(
+                f"payload stager response metadata collides with reserved fields: {sorted(overlap)}"
+            )
+        response.update(response_metadata)
 
         if HAVE_ORJSON:
             # Use orjson for faster serialization

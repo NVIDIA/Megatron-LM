@@ -7,7 +7,7 @@ import uuid
 import warnings
 from dataclasses import asdict, dataclass, field
 from enum import Enum, auto
-from typing import Any, Dict, List, Optional, Protocol, Tuple
+from typing import Any, Dict, List, Optional, Protocol, Tuple, Union
 
 import numpy as np
 import torch
@@ -706,6 +706,8 @@ class DynamicInferenceRequest(InferenceRequest):
     prompt: Optional[str] = None
     prompt_tokens: Optional[torch.Tensor] = None
     compact_prompt_tokens: Optional[torch.Tensor] = None
+    # Opaque JSON/msgpack-compatible metadata owned by an external payload stager.
+    request_metadata: Optional[Dict[str, Any]] = None
     # remaining prompt tokens are used for chunked prefill
     remaining_prompt_tokens: Optional[torch.Tensor] = None
     policy_epoch: Optional[list[tuple[int, int]]] = None
@@ -743,6 +745,8 @@ class DynamicInferenceRequest(InferenceRequest):
     # per-token payload (log probs, MoE routing indices) from the wire; the engine sets it
     # only for requests whose payload it handed to its RequestPayloadStager.
     payload_offloaded: bool = False
+    # Response-only metadata returned by the payload stager.
+    payload_stage_metadata: Dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self):
         self.sampling_params = copy.deepcopy(self.sampling_params)
@@ -792,12 +796,18 @@ class DynamicInferenceRequest(InferenceRequest):
             )
         )
 
-    def serialize(self, payload_offloaded: bool = False):
+    def serialize(
+        self,
+        payload_offloaded: bool = False,
+        payload_stage_metadata: Optional[Dict[str, Any]] = None,
+    ):
         """Converts the instance into a serializable dictionary.
 
         Args:
             payload_offloaded (bool): Drop the per-token payload (log probs, MoE routing
                 indices) from the wire; the engine's RequestPayloadStager has custody of it.
+            payload_stage_metadata: Opaque metadata returned by the stager for the
+                REST endpoint to attach to its response.
 
         Returns:
             (dict) A dictionary representation of the instance suitable for
@@ -823,10 +833,12 @@ class DynamicInferenceRequest(InferenceRequest):
 
         sampling_params = self.sampling_params
         dropped_fields = {}
-        if (
-            self.prompt_tokens is not None
-            and sampling_params is not None
-            and not getattr(sampling_params, "return_prompt_tokens", False)
+        if self.prompt_tokens is not None and (
+            payload_offloaded
+            or (
+                sampling_params is not None
+                and not getattr(sampling_params, "return_prompt_tokens", False)
+            )
         ):
             dropped_fields["prompt_tokens"] = self.prompt_tokens
         if payload_offloaded:
@@ -846,8 +858,12 @@ class DynamicInferenceRequest(InferenceRequest):
 
         obj["events"] = [e.serialize() for e in self.events]
         obj.pop("event_add_engine", None)
+        # Request metadata is input-only. Only the stager's response metadata
+        # crosses back to the REST endpoint.
+        obj.pop("request_metadata", None)
         obj["prompt_length"] = prompt_len
         obj["payload_offloaded"] = payload_offloaded
+        obj["payload_stage_metadata"] = dict(payload_stage_metadata or {})
 
         nvtx_range_pop("DynamicInferenceRequest.serialize")
         return obj
@@ -1068,9 +1084,11 @@ class DynamicInferenceRequestRecord:
         # expanded prompt. The previous hash list may not include newly completed blocks.
         common_kwargs = dict(
             request_id=old_request.request_id,
+            uid=old_request.uid,
             prompt_tokens=new_prompt_tokens,
             compact_prompt_tokens=old_request.compact_prompt_tokens,
             sampling_params=new_sampling_params,
+            request_metadata=copy.deepcopy(old_request.request_metadata),
             policy_epoch=policy_epoch,
             kv_cache_epoch=kv_cache_epoch,
             block_size_tokens=old_request.block_size_tokens,
@@ -1144,6 +1162,7 @@ class DynamicInferenceRequestRecord:
             prompt=prompt_text,
             prompt_tokens=prompt_tokens,
             compact_prompt_tokens=first_request.compact_prompt_tokens,
+            request_metadata=copy.deepcopy(first_request.request_metadata),
             prompt_log_probs=self.requests[0].prompt_log_probs,
             prompt_top_n_logprobs=self.requests[0].prompt_top_n_logprobs,
             generated_text=generated_text,
@@ -1263,11 +1282,38 @@ class OffloadedRequestPayload:
         )
 
 
+@dataclass(frozen=True)
+class RequestPayloadStageResult:
+    """A custody acknowledgement and opaque metadata for the served response."""
+
+    response_metadata: Dict[str, Any] = field(default_factory=dict)
+
+
 class RequestPayloadStager(Protocol):
     """Protocol to handle offloading of request payloads to a storage backend."""
 
-    def stage(self, uid: str, payload: OffloadedRequestPayload) -> None:
-        """Take custody of one finished request's payload, keyed by its OpenAI response id."""
+    def stage(
+        self,
+        uid: str,
+        payload: OffloadedRequestPayload,
+        *,
+        finished_metadata: FinishedRequestRecord,
+        request_metadata: Optional[Dict[str, Any]] = None,
+    ) -> Optional[RequestPayloadStageResult]:
+        """Stage a payload, or return ``None`` to keep it on the normal reply path."""
+        ...
+
+
+class RequestPromptPreparer(Protocol):
+    """Protocol for resolving an exact prompt before engine admission."""
+
+    def prepare_prompt(
+        self,
+        prompt: Union[str, List[int], torch.Tensor],
+        *,
+        request_metadata: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[Union[str, List[int], torch.Tensor], Optional[Dict[str, Any]]]:
+        """Return the engine prompt and metadata that describe that prompt."""
         ...
 
 
