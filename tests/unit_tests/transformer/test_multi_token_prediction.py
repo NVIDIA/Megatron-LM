@@ -3849,6 +3849,7 @@ class TestMultiTokenPredictionHybrid:
 
         torch.testing.assert_close(output, hidden_states.transpose(0, 1).contiguous())
         torch.testing.assert_close(inference_context.mtp_decoder_hidden_states, hidden_states)
+        assert call_counts.pop("decoder_input") is None
         assert call_counts.pop("mtp_input_mask") is None
         assert call_counts == {"mtp": 0, "mtp_loss": 0, "main_loss": 0}
 

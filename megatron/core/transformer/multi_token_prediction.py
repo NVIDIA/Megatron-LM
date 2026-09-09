@@ -358,11 +358,14 @@ def _roll_tensor_packed_seq(
             valid_length = cu_seqlens[i + 1] - cu_seqlens[i]
             end_idx = start_idx + valid_length
             physical_end_idx = physical_cu_seqlens[i + 1]
-            seq_slice = slice_sequence(tensor, start_idx, end_idx)
-            rolled_seq = torch.roll(seq_slice, shifts=shifts, dims=sequence_dim)
-            # Zero out the last position(s) that would cross sequence boundaries
-            rolled_seq.select(sequence_dim, shifts).zero_()
-            assign_sequence(rolled_tensor, start_idx, end_idx, rolled_seq)
+            # Shard-local packed boundaries can collapse documents outside this
+            # SP rank to empty slices. They have no boundary token to clear.
+            if end_idx > start_idx:
+                seq_slice = slice_sequence(tensor, start_idx, end_idx)
+                rolled_seq = torch.roll(seq_slice, shifts=shifts, dims=sequence_dim)
+                # Zero out the last position that would cross a document boundary.
+                rolled_seq.select(sequence_dim, shifts).zero_()
+                assign_sequence(rolled_tensor, start_idx, end_idx, rolled_seq)
             assign_sequence(rolled_tensor, end_idx, physical_end_idx, 0)
         rolled_sum = rolled_tensor.sum() if return_sum else None
         return rolled_tensor, rolled_sum
