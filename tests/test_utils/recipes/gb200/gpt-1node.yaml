@@ -65,7 +65,7 @@ spec:
     )
 
     set +x
-    bash ./tests/functional_tests/run_ci_test.sh ${{ARGUMENTS[@]}}
+    bash ./tests/functional_tests/shell_test_utils/run_ci_test.sh ${{ARGUMENTS[@]}}
     exit_code=$?
     echo "Exit code: $exit_code"
     rm -rf /lustre/fsw/coreai_dlalgo_mcore/mcore_ci/data/$RUN_ID || true

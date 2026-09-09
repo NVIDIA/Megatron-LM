@@ -200,5 +200,5 @@ for routing metrics — that file handles lightweight count monitoring
 
 - API reference: [`megatron/core/inference/README.md`](../../megatron/core/inference/README.md)
 - Low-level engine: [`megatron/core/inference/`](../../megatron/core/inference/)
-- Functional tests: `tests/functional_tests/core/models/gpt/gpt_offline_inference_*` + `gpt_inference_server_smoke_*`
+- Functional tests: `tests/functional_tests/test_cases/core/models/gpt/gpt_offline_inference_*` + `gpt_inference_server_smoke_*`
 - Unit tests: `tests/unit_tests/inference/high_level_api/`

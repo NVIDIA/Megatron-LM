@@ -3,7 +3,7 @@ import pathlib
 import pytest
 import yaml
 
-YAML_DIR = pathlib.Path(__file__).parent / ".." / "functional_tests"
+YAML_DIR = pathlib.Path(__file__).parent / ".." / "functional_tests" / "test_cases"
 
 
 def get_yaml_files(directory):

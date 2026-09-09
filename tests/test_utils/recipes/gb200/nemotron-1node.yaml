@@ -65,7 +65,7 @@ spec:
         "RECORD_CHECKPOINTS=${{RECORD_CHECKPOINTS:-}}"
     )
 
-    bash ./tests/functional_tests/run_ci_test.sh "${{ARGUMENTS[@]}}"
+    bash ./tests/functional_tests/shell_test_utils/run_ci_test.sh "${{ARGUMENTS[@]}}"
 
 products:
   - test_case: [nemotron3_5_lightning_no_load_optim_tp1_pp1_cp1_ep4_dgx_gb200_1N4G]

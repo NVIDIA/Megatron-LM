@@ -108,16 +108,23 @@ def load_from_git(rev: str, path: pathlib.Path) -> dict | None:
 
 
 def list_modified_golden_files() -> list[pathlib.Path]:
-    """Files under tests/functional_tests changed vs HEAD (tracked + untracked)."""
+    """Files under tests/functional_tests/test_cases changed vs HEAD (tracked + untracked)."""
     tracked = subprocess.run(
-        ["git", "diff", "--name-only", "HEAD", "--", "tests/functional_tests"],
+        ["git", "diff", "--name-only", "HEAD", "--", "tests/functional_tests/test_cases"],
         check=True,
         capture_output=True,
         text=True,
         cwd=REPO_ROOT,
     ).stdout.splitlines()
     untracked = subprocess.run(
-        ["git", "ls-files", "--others", "--exclude-standard", "--", "tests/functional_tests"],
+        [
+            "git",
+            "ls-files",
+            "--others",
+            "--exclude-standard",
+            "--",
+            "tests/functional_tests/test_cases",
+        ],
         check=True,
         capture_output=True,
         text=True,
@@ -126,7 +133,7 @@ def list_modified_golden_files() -> list[pathlib.Path]:
 
     paths: list[pathlib.Path] = []
     for rel in tracked + untracked:
-        if not pathlib.Path(rel).name.startswith("golden_values") or not rel.endswith(".json"):
+        if not rel.endswith(".json"):
             continue
         p = REPO_ROOT / rel
         if p.exists():
@@ -316,7 +323,7 @@ def main(
         if not target_files:
             print(
                 "No modified golden-value files found under "
-                "tests/functional_tests. Pass --file or --old/--new explicitly."
+                "tests/functional_tests/test_cases. Pass --file or --old/--new explicitly."
             )
             sys.exit(0)
 

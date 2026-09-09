@@ -60,7 +60,7 @@ spec:
         "RECORD_CHECKPOINTS=${{RECORD_CHECKPOINTS:-}}"
     )
 
-    bash ./tests/functional_tests/run_ci_test.sh ${{ARGUMENTS[@]}}
+    bash ./tests/functional_tests/shell_test_utils/run_ci_test.sh ${{ARGUMENTS[@]}}
 
 products:
   - test_case: [hybrid_mr_mcore_te_tp1_pp1_cp1_dgx_a100_1N8G]

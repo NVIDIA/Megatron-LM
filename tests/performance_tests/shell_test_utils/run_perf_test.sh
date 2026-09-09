@@ -2,7 +2,7 @@
 # Run an inference performance test.
 #
 # Invoked by `cog submit` (or local equivalent) with KEY=VALUE positional args,
-# mirroring tests/functional_tests/run_ci_test.sh.
+# mirroring tests/functional_tests/shell_test_utils/run_ci_test.sh.
 #
 # Required:
 #   CONFIG_PATH=tests/performance_tests/test_cases/<model>/<case>/model_config.yaml

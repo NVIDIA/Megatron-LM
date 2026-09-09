@@ -30,16 +30,17 @@ For questions about disabling tests without deleting them:
 tests/
 ├── unit_tests/          # pytest, 1 node × 8 GPUs, torch.distributed runner
 ├── functional_tests/    # end-to-end shell + training scripts
-│   ├── core/
-│   │   ├── models/
-│   │   │   └── {bert,gpt,hybrid,mimo,multimodal,T5}/{test_case}/
-│   │   │       ├── model_config.yaml      # training args
-│   │   │       └── golden_values_{env}_{platform}.json
-│   │   └── transformer/moe/{test_case}/
-│   ├── ckpt_converter/                   # external tool scenario bundle
-│   ├── *-nemo_*/                         # external NeMo scenario bundles
-│   ├── run_ci_test.sh                    # shared runners and helpers at root
-│   └── test_*.py                         # shared output validation
+│   ├── test_cases/
+│   │   ├── core/
+│   │   │   ├── models/
+│   │   │   │   └── {bert,gpt,hybrid,mimo,multimodal,T5}/{test_case}/
+│   │   │   │       ├── model_config.yaml  # training args
+│   │   │   │       └── golden_values_{env}_{platform}.json
+│   │   │   └── transformer/moe/{test_case}/
+│   │   ├── ckpt_converter/               # external tool scenario bundle
+│   │   └── *-nemo_*/                     # external NeMo scenario bundles
+│   ├── shell_test_utils/                # shared shell runners
+│   └── python_test_utils/               # shared output validation
 └── test_utils/
     ├── recipes/
     │   ├── h100/        # YAML recipes for H100 jobs
@@ -47,14 +48,16 @@ tests/
     └── python_scripts/  # helpers (recipe_parser, golden-value download, …)
 ```
 
-Functional-test package directories mirror `megatron/`. Each scenario keeps
-its config, scripts, and golden values together in a named subdirectory.
-Scenario directories, including the external checkpoint-converter and NeMo
-bundles at the root, are exceptions to package mirroring. GPT and Mixtral
-scenarios live under `core/models/gpt/`; hybrid and Nemotron scenarios live
-under `core/models/hybrid/`; MoE scenarios and the `moe_perf/` bundle live
-under `core/transformer/moe/`. Shared Python and shell helpers live directly
-under `tests/functional_tests/`.
+Package directories under `functional_tests/test_cases/` mirror `megatron/`.
+Each scenario keeps its config, scripts, and golden values together in a named
+subdirectory. Scenario directories, including the external checkpoint-converter
+and NeMo bundles directly under `test_cases/`, are exceptions to package
+mirroring. GPT and Mixtral scenarios live under `core/models/gpt/`; hybrid and
+Nemotron scenarios live under `core/models/hybrid/`; MoE scenarios and the
+`moe_perf/` bundle live under `core/transformer/moe/`. Shared Python and shell
+helpers remain in
+`tests/functional_tests/python_test_utils/` and
+`tests/functional_tests/shell_test_utils/`.
 
 ---
 
@@ -71,7 +74,7 @@ at `/opt/megatron-lm`; training data is mounted at `/mnt/artifacts`.
   GitHub artifact after the run.
 
 **Functional tests** are driven by
-`tests/functional_tests/run_ci_test.sh`. Only rank 0 runs the
+`tests/functional_tests/shell_test_utils/run_ci_test.sh`. Only rank 0 runs the
 pytest validation step; training output from all ranks is uploaded as an artifact.
 
 **Flaky-failure auto-retry**: `launch_nemo_run_workload.py` retries up to
@@ -103,7 +106,7 @@ spec:
   script_setup: |
     ...
   script: |-
-    bash tests/functional_tests/run_ci_test.sh ...
+    bash tests/functional_tests/shell_test_utils/run_ci_test.sh ...
 products:
   - test_case: [my_test]
     products:
@@ -115,7 +118,7 @@ products:
 Key runtime placeholders: `{assets_dir}`, `{artifacts_dir}`, `{test_case}`,
 `{environment}`, `{platforms}`, `{n_repeat}`, `{functional_test_case_dir}`.
 `{functional_test_case_dir}` resolves to the scenario directory, for example
-`tests/functional_tests/core/models/gpt/{test_case}` for `model: gpt`.
+`tests/functional_tests/test_cases/core/models/gpt/{test_case}` for `model: gpt`.
 Recipe model names and test-case names remain independent of package paths.
 
 ### Disabling a Test Without Deleting It
@@ -202,8 +205,8 @@ For ad-hoc runs, prefer the direct `torch.distributed.run` invocations above.
 ## Adding a Functional / Integration Test
 
 1. Create a scenario directory under the matching Megatron package, for
-   example `tests/functional_tests/core/models/gpt/<test_name>/` or
-   `tests/functional_tests/core/transformer/moe/<test_name>/`.
+   example `tests/functional_tests/test_cases/core/models/gpt/<test_name>/` or
+   `tests/functional_tests/test_cases/core/transformer/moe/<test_name>/`.
 2. Write `model_config.yaml` with `MODEL_ARGS`, `ENV_VARS`, and `TEST_TYPE`.
 3. Add a YAML recipe under `tests/test_utils/recipes/h100/` (and `gb200/` if
    needed). Required fields: `scope`, `environment`, `platform`, `n_repeat`,

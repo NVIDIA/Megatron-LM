@@ -4,8 +4,8 @@ import os
 import subprocess
 from pathlib import Path
 
-RUN_CI_TEST = Path("tests/functional_tests/run_ci_test.sh")
-RUN_TRAINING = Path("tests/functional_tests/_run_training.sh")
+RUN_CI_TEST = Path("tests/functional_tests/shell_test_utils/run_ci_test.sh")
+RUN_TRAINING = Path("tests/functional_tests/shell_test_utils/_run_training.sh")
 SENSITIVE_ASSIGNMENTS = {
     "WANDB_API_KEY": "wandb-value-must-not-appear",
     "CI_JOB_TOKEN": "token-value-must-not-appear",

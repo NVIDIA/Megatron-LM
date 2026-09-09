@@ -64,7 +64,7 @@ spec:
         "RECORD_CHECKPOINTS=${{RECORD_CHECKPOINTS:-}}"
     )
 
-    bash ./tests/functional_tests/run_ci_test.sh ${{ARGUMENTS[@]}}
+    bash ./tests/functional_tests/shell_test_utils/run_ci_test.sh ${{ARGUMENTS[@]}}
 
 products:
   - test_case: [deepseek_proxy_mfsdp_v1_ep2_1node]

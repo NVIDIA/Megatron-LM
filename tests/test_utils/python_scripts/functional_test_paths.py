@@ -5,7 +5,7 @@
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
-FUNCTIONAL_TEST_ROOT = Path("tests/functional_tests")
+FUNCTIONAL_TEST_ROOT = Path("tests/functional_tests/test_cases")
 
 MODEL_DIRECTORIES = {
     "bert": "core/models/bert",
@@ -38,7 +38,7 @@ def functional_test_case_dir(model: str, test_case: str, repo_root: Path | None 
         repo_root: Checkout to inspect; defaults to this module's checkout.
     """
     repo_root = REPO_ROOT if repo_root is None else Path(repo_root)
-    legacy_path = FUNCTIONAL_TEST_ROOT / "test_cases" / model / test_case
+    legacy_path = FUNCTIONAL_TEST_ROOT / model / test_case
     if model == "common" and test_case in COMMON_DIRECTORIES:
         path = FUNCTIONAL_TEST_ROOT / COMMON_DIRECTORIES[test_case]
     elif model in MODEL_DIRECTORIES:

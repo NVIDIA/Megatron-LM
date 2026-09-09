@@ -578,10 +578,7 @@ def main(
                 continue
 
             if (
-                re.search(
-                    r"FAILED tests/functional_tests/(?:python_test_utils/)?test_[^/\s]+\.py",
-                    concat_mainrank_log,
-                )
+                "FAILED tests/functional_tests/python_test_utils" in concat_mainrank_log
                 or "Throughput is slower than expected!" in concat_mainrank_log
             ) and re.compile(r"\bEXIT_CODE=0\b").search(concat_mainrank_log) is not None:
                 n_nondeterminism_attemps += 1

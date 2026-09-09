@@ -10,7 +10,9 @@ import pytest
 from examples.inference import utils as inference_utils
 from examples.inference.offline_inference import _capture_engine_stats
 from examples.inference.utils import dump_inference_results_to_json
-from tests.functional_tests.test_inference_regular_pipeline import _NON_REQUEST_TOP_LEVEL_KEYS
+from tests.functional_tests.python_test_utils.test_inference_regular_pipeline import (
+    _NON_REQUEST_TOP_LEVEL_KEYS,
+)
 
 
 def test_dump_inference_results_to_json_writes_async_sched_counters(tmp_path):

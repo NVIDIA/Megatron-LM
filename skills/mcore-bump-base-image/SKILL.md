@@ -146,7 +146,7 @@ All three lines should show `nvcr.io/nvidia/pytorch:<YY.MM>-py3`. If they don't,
 | --------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------- |
 | `docker/.ngc_version.dev`                                                                     | Overwrite with new `nvcr.io/nvidia/pytorch:<YY.MM>-py3`                                |
 | `.gitlab/stages/01.build.yml`                                                                 | Update both `IMAGE_TYPE: dev` `BASE_IMAGE:` rows (amd64 + arm64)                       |
-| `tests/functional_tests/**/golden_values_dev_dgx_{h100,gb200}.json`                           | Refresh via the `update-golden-values` skill                                           |
+| `tests/functional_tests/test_cases/**/golden_values_dev_dgx_{h100,gb200}.json`                | Refresh via the `update-golden-values` skill                                           |
 | `tests/test_utils/recipes/<arch>/<suite>.yaml`                                                | Flip drifting / hanging cases to `mr-broken` / `mr-github-broken` with an issue link    |
 | `docker/.ngc_version.lts`, `.gitlab/stages/01.build.yml` `FILE: Dockerfile.ci.lts` rows       | **Skip unless explicitly bumping LTS.** LTS has its own release cadence and its own Dockerfile (`docker/Dockerfile.ci.lts`); LTS Python deps are pinned in `docker/lts/requirements.txt`. |
 
