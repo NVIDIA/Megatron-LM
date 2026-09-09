@@ -747,18 +747,6 @@ def save_checkpoint(
         return_base_dir=return_base_dir,
     )
 
-    # Save dataloader state if the external dataloader supports it. The dataloader shards on the
-    # full data-distribution axis, so gtp_remat peers hold distinct micro-batches and need
-    # distinct state files: pass dp x gtp_remat here, not the replicate dp_group.
-    maybe_save_dataloader_state(
-        train_data_iterator,
-        iteration,
-        getattr(args, 'dataloader_save', None),
-        tp_group=tp_group,
-        pp_group=pp_group,
-        dp_group=dp_gtp_remat_group,
-    )
-
     # Save distributed optimizer's custom parameter state.
     if (
         args.use_distributed_optimizer
@@ -1036,6 +1024,21 @@ def save_checkpoint(
                 # Save.
                 ensure_directory_exists(checkpoint_name)
                 torch.save(state_dict, checkpoint_name)
+
+    # Save dataloader state if the external dataloader supports it. This runs after the
+    # checkpoint write: the dataloader state lands in the same iteration directory, and
+    # dist_checkpointing.save treats a non-empty directory as a partial checkpoint left by a
+    # crash. The dataloader shards on the full data-distribution axis, so gtp_remat peers hold
+    # distinct micro-batches and need distinct state files: pass dp x gtp_remat here, not the
+    # replicate dp_group.
+    maybe_save_dataloader_state(
+        train_data_iterator,
+        iteration,
+        getattr(args, 'dataloader_save', None),
+        tp_group=tp_group,
+        pp_group=pp_group,
+        dp_group=dp_gtp_remat_group,
+    )
 
     start_misc = time()
     if ckpt_type != CheckpointType.LOCAL:
