@@ -982,6 +982,11 @@ class _DispatchManager(ABC):
     can be the number of local experts, or the size of sub_group.
     """
 
+    # Whether setup_metadata takes the dispatcher's unified [num_tokens, world, num_local_experts]
+    # routing map and probabilities; a manager that plans from the router's compact
+    # [num_tokens, topk] routes receives those instead.
+    dense_routing_metadata: bool = True
+
     @abstractmethod
     def setup_metadata(self, routing_map: torch.Tensor, probs: torch.Tensor):
         """Set up metadata of routing_map and probs."""
@@ -1010,9 +1015,6 @@ class _DispatchManager(ABC):
     def wrap_layer_input(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Return the layer input unchanged."""
         return hidden_states
-
-    def plan_dispatch(self) -> None:
-        """Perform no additional dispatch planning."""
 
     def finalize_output(self, output: torch.Tensor) -> torch.Tensor:
         """Return the layer output unchanged."""
@@ -1290,9 +1292,13 @@ class _VirtualExpertHybridEPManager(VirtualExpertLoadBalancer, _HybridEPManager)
             self.num_experts, self.num_local_experts
         )
 
+    dense_routing_metadata = False
+
     def setup_metadata(self, top_indices: torch.Tensor, probs: torch.Tensor):
-        """The router hands this path its ``[num_tokens, topk]`` expert ids and probabilities."""
-        self.setup_virtual_expert_metadata(top_indices, probs)
+        """Plan the router's ``[num_tokens, topk]`` routes and start the weight push; HybridEP's
+        own metadata is set up at dispatch, from the planner's runtime routes."""
+        self.token_probs = probs
+        self.plan_dispatch(top_indices, probs)
 
     def dispatch(
         self,
@@ -1300,24 +1306,19 @@ class _VirtualExpertHybridEPManager(VirtualExpertLoadBalancer, _HybridEPManager)
         async_finish: bool = True,
         allocate_on_comm_stream: bool = True,
     ) -> torch.Tensor:
-        hidden_states, plan, num_permuted_tokens = self.prepare_virtual_expert_dispatch(
-            hidden_states,
-            num_runtime_experts=self.num_local_experts,
-            alignment=self._quantization_alignment(),
-        )
-        # The dense runtime probabilities travel outside the plan: they carry the gradient.
-        probs, self.runtime_probs = self.runtime_probs, None
+        hidden_states, runtime_experts, probs = self.prepare_virtual_expert_dispatch(hidden_states)
         if self._dense_topk_routing:
-            super().setup_metadata(None, probs, topk_idx=plan.virtual_experts)
+            super().setup_metadata(None, probs, topk_idx=runtime_experts)
         else:
             # This HybridEP lacks dense top-k routing: expand the runtime ids into its map.
             routing_map = torch.zeros_like(probs, dtype=torch.bool)
-            routing_map.scatter_(1, plan.virtual_experts.long(), True)
+            routing_map.scatter_(1, runtime_experts.long(), True)
             super().setup_metadata(routing_map, probs)
+
         # The planner gives every rank exactly its own route count, and HybridEP pads each of
         # the 2L runtime expert segments on top; the base budget (routes x capacity factor)
         # would make HybridEP drop the padded routes.
-        self.num_permuted_tokens = num_permuted_tokens
+        self.num_permuted_tokens = self.rank_capacity
         return super().dispatch(
             hidden_states,
             async_finish=async_finish,
@@ -2052,6 +2053,7 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
 
         return routing_map, probs
 
+    @jit_fuser
     def dispatch_preprocess(
         self, hidden_states: torch.Tensor, routing_map: torch.Tensor, probs: torch.Tensor
     ):
@@ -2069,21 +2071,10 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         Returns:
             A tuple of reshaped hidden states and token probabilities.
         """
-        hidden_states, token_probs = self._dispatch_preprocess(hidden_states, routing_map, probs)
-        # Keep manager planning outside the jit-fused tensor preprocessing region.
-        self._comm_manager.plan_dispatch()
-        return hidden_states, token_probs
-
-    @jit_fuser
-    def _dispatch_preprocess(
-        self, hidden_states: torch.Tensor, routing_map: torch.Tensor, probs: torch.Tensor
-    ):
         self.hidden_shape = hidden_states.shape
         hidden_states = hidden_states.view(-1, self.hidden_shape[-1])
 
-        # Virtual-expert planning takes the router's [num_tokens, topk] ids and probabilities
-        # as they are; every other backend takes the dense map and probabilities.
-        if not self.config.moe_virtual_expert_load_balance:
+        if self._comm_manager.dense_routing_metadata:
             routing_map, probs = self._initialize_metadata(routing_map, probs)
 
         self._comm_manager.setup_metadata(routing_map, probs)

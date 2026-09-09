@@ -14,6 +14,7 @@ which is what actually moves the number.
 
 import gc
 import os
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -48,7 +49,7 @@ def test_virtual_expert_transport_shape_guards():
         _validate_transport_shape(
             world_size=4, num_local_experts=32, num_sms=MAX_VIRTUAL_EXPERT_WEIGHT_SMS + 1
         )
-    # Both projections share one row-aligned tile, so an odd member breaks it.
+    # Both FC layers share one row-aligned tile, so an odd member breaks it.
     with pytest.raises(ValueError, match="256-aligned"):
         _transport_tile(32768 // torch.bfloat16.itemsize, 16384, 16385)
 
@@ -76,21 +77,21 @@ def _pointer_table(members):
     )
 
 
-def _arena_view(arena, member_numels, scale_numels, projection, num_local_experts):
-    """Return the ``[num_local_experts, numel]`` data and scale views of one projection."""
+def _arena_view(arena, member_numels, scale_numels, fc_layer, num_local_experts):
+    """Return the ``[num_local_experts, numel]`` data and scale views of one FC layer."""
     stride = (
         member_numels
         if scale_numels is None
         else tuple(member + scale for member, scale in zip(member_numels, scale_numels))
     )
-    offset = num_local_experts * sum(stride[:projection])
-    member = member_numels[projection]
+    offset = num_local_experts * sum(stride[:fc_layer])
+    member = member_numels[fc_layer]
     data = arena.narrow(0, offset, num_local_experts * member).view(num_local_experts, member)
     if scale_numels is None:
         return data, None
     scale = arena.narrow(
-        0, offset + num_local_experts * member, num_local_experts * scale_numels[projection]
-    ).view(num_local_experts, scale_numels[projection])
+        0, offset + num_local_experts * member, num_local_experts * scale_numels[fc_layer]
+    ).view(num_local_experts, scale_numels[fc_layer])
     return data, scale
 
 
@@ -145,7 +146,7 @@ def test_virtual_expert_weight_transport(grad_dtype):
     device = torch.device("cuda", torch.cuda.current_device())
     num_local_experts = 8
     # Keep the test compact while using the same 8-KiB-aligned transactions as
-    # the production 2048x640 expert projections.
+    # the production 2048x640 expert FC layers.
     member_numels = (262144, 524288)
     arena_numel = num_local_experts * sum(member_numels)
     weight_arena, weight_handle = _allocate_symmetric(arena_numel, torch.bfloat16, group)
@@ -154,20 +155,31 @@ def test_virtual_expert_weight_transport(grad_dtype):
         torch.empty(num_local_experts, member, dtype=torch.bfloat16, device=device)
         for member in member_numels
     )
-    for projection, source in enumerate(sources):
+    for fc_layer, source in enumerate(sources):
         source.copy_(
             (
                 torch.arange(num_local_experts, dtype=torch.bfloat16, device=device)
                 + rank * num_local_experts
-                + projection * 1000
+                + fc_layer * 1000
             )[:, None]
         )
     main_grads = tuple(
         torch.empty(num_local_experts, member, dtype=grad_dtype, device=device)
         for member in member_numels
     )
-    weight_barrier = torch.zeros(1, dtype=torch.int32, device=device)
-    grad_barrier = torch.zeros(1, dtype=torch.int32, device=device)
+    workspace = SimpleNamespace(
+        weight_arena=weight_arena,
+        weight_handle=weight_handle,
+        weight_grid_barrier=torch.zeros(1, dtype=torch.int32, device=device),
+        grad_arena=grad_arena,
+        grad_handle=grad_handle,
+        grad_grid_barrier=torch.zeros(1, dtype=torch.int32, device=device),
+        rank=rank,
+        world_size=world_size,
+        num_local_experts=num_local_experts,
+        member_numels=member_numels,
+        num_sms=NUM_SMS,
+    )
 
     cases = (
         ("all-peers", tuple(range(num_local_experts))),
@@ -193,98 +205,76 @@ def test_virtual_expert_weight_transport(grad_dtype):
             torch.cuda.synchronize(device)
             dist.barrier(group=group, device_ids=[device.index])
             launch_virtual_expert_weight_prefetch(
+                workspace,
                 sources=tuple(_pointer_table(source) for source in sources),
-                arena=weight_arena,
-                peer_bases=weight_handle.buffer_ptrs_dev,
-                signal_bases=weight_handle.signal_pad_ptrs_dev,
                 experts_to_copy=plan,
-                grid_barrier=weight_barrier,
-                rank=rank,
-                world_size=world_size,
-                num_local_experts=num_local_experts,
-                member_numels=member_numels,
-                num_sms=NUM_SMS,
             )
             torch.cuda.synchronize(device)
 
-            for projection in range(len(member_numels)):
+            for fc_layer in range(len(member_numels)):
                 view, _ = _arena_view(
-                    weight_arena, member_numels, None, projection, num_local_experts
+                    weight_arena, member_numels, None, fc_layer, num_local_experts
                 )
                 _check_ends(
                     view,
                     [
                         torch.tensor(
-                            -123 if rows[rank][slot] < 0 else projection * 1000 + rows[rank][slot],
+                            -123 if rows[rank][slot] < 0 else fc_layer * 1000 + rows[rank][slot],
                             dtype=torch.bfloat16,
                         ).item()
                         for slot in range(num_local_experts)
                     ],
-                    f"{case} p{projection} weight",
+                    f"{case} p{fc_layer} weight",
                     errors,
                 )
 
             grad_arena.fill_(-77)
-            for projection in range(len(member_numels)):
-                view, _ = _arena_view(
-                    grad_arena, member_numels, None, projection, num_local_experts
-                )
+            for fc_layer in range(len(member_numels)):
+                view, _ = _arena_view(grad_arena, member_numels, None, fc_layer, num_local_experts)
                 for slot in local_slots:
-                    view[slot].fill_(projection * 1000 + rank * 100 + slot + 1)
-                main_grads[projection].fill_(projection + 5)
+                    view[slot].fill_(fc_layer * 1000 + rank * 100 + slot + 1)
+                main_grads[fc_layer].fill_(fc_layer + 5)
             torch.cuda.synchronize(device)
             dist.barrier(group=group, device_ids=[device.index])
             launch_virtual_expert_grad_reduce(
-                arena=grad_arena,
+                workspace,
                 native_grads=tuple(_pointer_table(grad) for grad in main_grads),
-                peer_bases=grad_handle.buffer_ptrs_dev,
-                signal_bases=grad_handle.signal_pad_ptrs_dev,
                 experts_to_copy=plan,
-                grid_barrier=grad_barrier,
-                rank=rank,
-                world_size=world_size,
-                num_local_experts=num_local_experts,
-                member_numels=member_numels,
-                num_sms=NUM_SMS,
             )
             torch.cuda.synchronize(device)
 
-            for projection in range(len(member_numels)):
+            for fc_layer in range(len(member_numels)):
                 # BF16 partials accumulate in FP32 registers and round once on
                 # the final store, so build the reference the same way.
                 expected = torch.full(
-                    (num_local_experts,), scalar(projection + 5), dtype=torch.float32, device=device
+                    (num_local_experts,), scalar(fc_layer + 5), dtype=torch.float32, device=device
                 )
                 for destination in range(world_size):
                     for slot in range(num_local_experts):
                         expert = rows[destination][slot]
                         if expert // num_local_experts == rank and expert >= 0:
                             expected[expert % num_local_experts] += scalar(
-                                projection * 1000 + destination * 100 + slot + 1
+                                fc_layer * 1000 + destination * 100 + slot + 1
                             )
                 try:
                     torch.testing.assert_close(
-                        main_grads[projection][:, 0], expected.to(grad_dtype), rtol=0, atol=0
+                        main_grads[fc_layer][:, 0], expected.to(grad_dtype), rtol=0, atol=0
                     )
                 except AssertionError as exc:
-                    errors.append(f"{case} p{projection} main_grad: {exc}")
+                    errors.append(f"{case} p{fc_layer} main_grad: {exc}")
 
                 # The reduction reads the slots and leaves them as they were;
                 # TE's overwriting wgrad GEMM refreshes them next backward.
-                view, _ = _arena_view(
-                    grad_arena, member_numels, None, projection, num_local_experts
-                )
+                view, _ = _arena_view(grad_arena, member_numels, None, fc_layer, num_local_experts)
                 _check_ends(
                     view,
                     [
                         scalar(
-                            projection * 1000 + rank * 100 + slot + 1
-                            if slot in local_slots
-                            else -77
+                            fc_layer * 1000 + rank * 100 + slot + 1 if slot in local_slots else -77
                         )
                         for slot in range(num_local_experts)
                     ],
-                    f"{case} p{projection} grad",
+                    f"{case} p{fc_layer} grad",
                     errors,
                 )
         _report(errors, group)
@@ -328,9 +318,9 @@ def test_virtual_expert_mxfp8_transport_moves_one_orientation_at_a_time():
             torch.empty(num_local_experts, numel, dtype=torch.uint8, device=device)
             for numel in numels
         )
-        for projection, tensor in enumerate(tensors):
+        for fc_layer, tensor in enumerate(tensors):
             for expert in range(num_local_experts):
-                tensor[expert].fill_(base + rank * num_local_experts + expert + 20 * projection)
+                tensor[expert].fill_(base + rank * num_local_experts + expert + 20 * fc_layer)
         sources[(orientation, kind)] = tensors
 
     # Every rank materializes its right-hand neighbour's whole expert set.
@@ -343,33 +333,35 @@ def test_virtual_expert_mxfp8_transport_moves_one_orientation_at_a_time():
             dtype=torch.int32,
             device=device,
         )
-    barriers = {
-        orientation: torch.zeros(1, dtype=torch.int32, device=device) for orientation in arenas
-    }
-
-    def launch(orientation):
-        dist.barrier(group=group, device_ids=[device.index])
-        launch_virtual_expert_weight_prefetch(
-            sources=tuple(_pointer_table(s) for s in sources[(orientation, "data")]),
-            scale_sources=tuple(_pointer_table(s) for s in sources[(orientation, "scale")]),
-            arena=arenas[orientation],
-            peer_bases=handles[orientation].buffer_ptrs_dev,
-            signal_bases=handles[orientation].signal_pad_ptrs_dev,
-            experts_to_copy=plan,
-            grid_barrier=barriers[orientation],
+    workspaces = {
+        orientation: SimpleNamespace(
+            weight_arena=arenas[orientation],
+            weight_handle=handles[orientation],
+            weight_grid_barrier=torch.zeros(1, dtype=torch.int32, device=device),
             rank=rank,
             world_size=world_size,
             num_local_experts=num_local_experts,
             member_numels=member_numels,
             num_sms=NUM_SMS,
         )
+        for orientation in arenas
+    }
+
+    def launch(orientation):
+        dist.barrier(group=group, device_ids=[device.index])
+        launch_virtual_expert_weight_prefetch(
+            workspaces[orientation],
+            sources=tuple(_pointer_table(s) for s in sources[(orientation, "data")]),
+            scale_sources=tuple(_pointer_table(s) for s in sources[(orientation, "scale")]),
+            experts_to_copy=plan,
+        )
         torch.cuda.synchronize(device)
 
     def verify(orientation):
         owner = (rank + 1) % world_size
-        for projection in range(len(member_numels)):
+        for fc_layer in range(len(member_numels)):
             data, scale = _arena_view(
-                arenas[orientation], member_numels, scale_numels, projection, num_local_experts
+                arenas[orientation], member_numels, scale_numels, fc_layer, num_local_experts
             )
             experts = torch.arange(
                 owner * num_local_experts,
@@ -378,14 +370,14 @@ def test_virtual_expert_mxfp8_transport_moves_one_orientation_at_a_time():
                 device=device,
             )
             for view, kind in ((data, "data"), (scale, "scale")):
-                expected = (experts + bases[(orientation, kind)] + 20 * projection).to(torch.uint8)
+                expected = (experts + bases[(orientation, kind)] + 20 * fc_layer).to(torch.uint8)
                 for column, label in ((0, "head"), (-1, "tail")):
                     torch.testing.assert_close(
                         view[:, column],
                         expected,
                         rtol=0,
                         atol=0,
-                        msg=lambda msg: f"{orientation} p{projection} {kind} {label}: {msg}",
+                        msg=lambda msg: f"{orientation} p{fc_layer} {kind} {label}: {msg}",
                     )
 
     try:
