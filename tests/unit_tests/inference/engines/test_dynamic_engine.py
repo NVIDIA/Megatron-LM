@@ -21,12 +21,14 @@ from tqdm import tqdm
 from transformer_engine.pytorch.fp8 import check_fp8_support
 
 from megatron.core import parallel_state
+from megatron.core.activations import squared_relu
 from megatron.core.inference.config import (
     AsyncScheduleMode,
     CudaGraphSizingDistribution,
     InferenceConfig,
     KVCacheManagementMode,
     MambaInferenceStateConfig,
+    PrefixCachingEvictionPolicy,
 )
 from megatron.core.inference.contexts.dynamic_context import (
     ActiveRequestCountOverflowError,
@@ -37,6 +39,7 @@ from megatron.core.inference.contexts.dynamic_context import (
 )
 from megatron.core.inference.engines import DynamicInferenceEngine
 from megatron.core.inference.engines.dynamic_engine import EngineState
+from megatron.core.inference.headers import Headers
 from megatron.core.inference.inference_request import (
     DynamicInferenceRequest,
     DynamicInferenceRequestRecord,
@@ -343,6 +346,9 @@ class DynamicEngineTestConfig:
     tensor_model_parallel_size: int = 1
     pipeline_model_parallel_size: int = 1
     expert_model_parallel_size: int = 1
+    # EP process groups can also exercise dense models; build MoE layers only
+    # when a test explicitly owns that model behavior.
+    use_moe_layer_spec: bool = False
     sequence_parallel: bool = False
 
     use_fixed_output_lengths: bool = False
@@ -353,7 +359,10 @@ class DynamicEngineTestConfig:
     # linear decode-only graphs). Tests that assert on exact token counts can pin a
     # single distribution here.
     cuda_graph_sizing_distribution: CudaGraphSizingDistribution = CudaGraphSizingDistribution.HYBRID
+    cuda_graph_mixed_prefill_count: Optional[int] = 16
+    cuda_graph_max_tokens: int = 512
     fp8: bool = False
+    hidden_size: Optional[int] = None
     model_provider: str = "gpt"
     # Which linear-attention mixer a hybrid stack uses ("mamba", "gdp", or
     # "gdn"). Ignored unless model_provider == "hybrid": all three build a
@@ -366,6 +375,9 @@ class DynamicEngineTestConfig:
     skip_prompt_log_probs: bool = False
     enable_chunked_prefill: bool = False
     enable_prefix_caching: bool = False
+    prefix_caching_eviction_policy: PrefixCachingEvictionPolicy = (
+        PrefixCachingEvictionPolicy.REF_ZERO
+    )
     cuda_graph_modules: List[CudaGraphModule] = field(default_factory=list)
     inference_cuda_graph_scope: InferenceCudaGraphScope = InferenceCudaGraphScope.block
     cuda_graph_impl: Optional[str] = None
@@ -384,10 +396,12 @@ class DynamicEngineTestConfig:
     track_generated_token_events: bool = False
     num_speculative_tokens: int = 0
     position_embedding_type: str = "learned_absolute"
+    use_flashinfer_fused_rope: Optional[bool] = None
     sampling_backend: str = 'torch'
     temperature: float = 1.0
     top_k: int = 0
     top_p: float = 0.0
+    offset_sampling_seed_by_dp_rank: bool = True
     async_sched_mode: AsyncScheduleMode = AsyncScheduleMode.ASYNC
     # Sliding-window attention config. When `window_size` is None, SWA is
     # disabled and all layers do full causal attention. When set to a
@@ -529,11 +543,13 @@ class DynamicInferenceEngineTestBase:
             inference_config=InferenceConfig(
                 max_sequence_length=test_config.max_sequence_length,
                 num_cuda_graphs=test_config.num_cuda_graphs,
+                cuda_graph_mixed_prefill_count=test_config.cuda_graph_mixed_prefill_count,
+                cuda_graph_sizing_distribution=test_config.cuda_graph_sizing_distribution,
+                cuda_graph_max_tokens=test_config.cuda_graph_max_tokens,
                 use_cuda_graphs_for_non_decode_steps=(
                     test_config.use_cuda_graphs_for_non_decode_steps
                 ),
                 cuda_graph_all_prefills=test_config.cuda_graph_all_prefills,
-                cuda_graph_sizing_distribution=test_config.cuda_graph_sizing_distribution,
                 buffer_size_gb=test_config.context_buffer_size_gb,
                 paused_buffer_size_gb=test_config.context_paused_buffer_size_gb,
                 block_size_tokens=test_config.context_block_size_tokens,
@@ -547,12 +563,14 @@ class DynamicInferenceEngineTestBase:
                 static_kv_memory_pointers=test_config.static_kv_memory_pointers,
                 enable_chunked_prefill=test_config.enable_chunked_prefill,
                 enable_prefix_caching=test_config.enable_prefix_caching,
-                use_flashinfer_fused_rope=None,  # default to using flash-infer if available
+                prefix_caching_eviction_policy=test_config.prefix_caching_eviction_policy,
+                use_flashinfer_fused_rope=test_config.use_flashinfer_fused_rope,
                 # this is for compatibility with the LTS environment
                 unified_memory_level=0,  # unit tests currently broken with UVM
                 track_generated_token_events=test_config.track_generated_token_events,
                 num_speculative_tokens=test_config.num_speculative_tokens,
                 sampling_backend=test_config.sampling_backend,
+                offset_sampling_seed_by_dp_rank=test_config.offset_sampling_seed_by_dp_rank,
                 async_sched_mode=test_config.async_sched_mode,
                 logprobs_mode=test_config.logprobs_mode,
             ),
@@ -592,7 +610,11 @@ class DynamicInferenceEngineTestBase:
                 params_dtype=torch.bfloat16,
                 num_layers=4,
                 mtp_num_layers=test_config.num_speculative_tokens,
-                hidden_size=128 if test_config.fp8 else 32,
+                hidden_size=(
+                    test_config.hidden_size
+                    if test_config.hidden_size is not None
+                    else (128 if test_config.fp8 else 32)
+                ),
                 num_attention_heads=4,
                 use_cpu_initialization=True,
                 cuda_graph_impl=effective_cuda_graph_impl,
@@ -620,6 +642,18 @@ class DynamicInferenceEngineTestBase:
                     else InferenceCudaGraphScope.none
                 ),
                 transformer_impl=test_config.transformer_impl,
+                activation_func=(
+                    squared_relu
+                    if test_config.transformer_impl == "inference_optimized"
+                    and test_config.expert_model_parallel_size > 1
+                    else torch.nn.functional.gelu
+                ),
+                moe_router_dtype=(
+                    "fp32"
+                    if test_config.transformer_impl == "inference_optimized"
+                    and test_config.expert_model_parallel_size > 1
+                    else None
+                ),
                 inference_moe_token_dispatcher_type=(
                     test_config.inference_moe_token_dispatcher_type
                 ),
@@ -633,12 +667,17 @@ class DynamicInferenceEngineTestBase:
                 window_size=test_config.window_size,
                 window_attn_skip_freq=test_config.window_attn_skip_freq,
             )
+            # Layer-spec factories do not receive TransformerConfig. Forward num_moe_experts
+            # explicitly for MoE test cases so they build MoE layers instead of a dense MLP.
+            num_experts = (
+                transformer_config.num_moe_experts if test_config.use_moe_layer_spec else None
+            )
             if test_config.fp8 or test_config.transformer_impl == "transformer_engine":
-                layer_spec = get_gpt_layer_with_transformer_engine_spec()
+                layer_spec = get_gpt_layer_with_transformer_engine_spec(num_experts=num_experts)
             elif test_config.transformer_impl == "local":
-                layer_spec = get_gpt_layer_local_spec()
+                layer_spec = get_gpt_layer_local_spec(num_experts=num_experts)
             elif test_config.transformer_impl == "inference_optimized":
-                layer_spec = get_gpt_layer_with_inference_spec()
+                layer_spec = get_gpt_layer_with_inference_spec(num_experts=num_experts)
 
             # MTP block spec (needed for speculative decoding).
             mtp_block_spec = None
@@ -960,6 +999,7 @@ def test_recompute_suspend_resume_readds_prefix_cached_request_with_fresh_hashes
     )
     engine.requests = {request.request_id: types.SimpleNamespace(record=record)}
     engine.waiting_request_ids = deque()
+    engine.controller = types.SimpleNamespace(_async_sched_logits=mock.Mock())
     engine.state = EngineState.RUNNING
     engine.unified_memory_level = 0
     engine.use_coordinator = False
@@ -987,6 +1027,7 @@ def test_recompute_suspend_resume_readds_prefix_cached_request_with_fresh_hashes
 
     assert engine.context.deallocate_inference_state_buffers.call_count == 1
     assert engine.context.reinitialize_inference_state_buffers.call_count == 1
+    engine.controller._async_sched_logits.clear.assert_called_once_with()
     assert engine.state == EngineState.RUNNING
     assert engine._add_request.call_count == 1
     assert engine._add_request.call_args.args[0] is checkpointed
@@ -1162,12 +1203,14 @@ def test_streaming_partials_are_sent():
 
     engine._try_send_streaming_partials()
 
-    engine.socket_for_receiving_requests.send.assert_called_once()
+    # Partials go out as [metadata, body] frames: the metadata names the request
+    # ids so the coordinator can route without decoding the bodies.
+    engine.socket_for_receiving_requests.send_multipart.assert_called_once()
+    frames = engine.socket_for_receiving_requests.send_multipart.call_args.args[0]
+    assert msgpack.unpackb(frames[0], raw=False) == [Headers.ENGINE_REPLY_PARTIAL.value, [7]]
+    assert msgpack.unpackb(frames[1], raw=False)["new_tokens"] == [11, 12, 13]
     assert engine._partial_emit_lengths == {7: 3}
-    payload = msgpack.unpackb(
-        engine.socket_for_receiving_requests.send.call_args.args[0], raw=False
-    )
-    partial = payload[1][0]
+    partial = msgpack.unpackb(frames[1], raw=False)
     assert partial["new_top_n_logprobs"] == request.generated_top_n_logprobs
     assert partial["prompt_log_probs"] == request.prompt_log_probs
     assert partial["prompt_top_n_logprobs"] == request.prompt_top_n_logprobs
@@ -1188,13 +1231,13 @@ def test_streaming_partials_buffer_until_token_interval():
 
     engine._try_send_streaming_partials()
 
-    engine.socket_for_receiving_requests.send.assert_not_called()
+    engine.socket_for_receiving_requests.send_multipart.assert_not_called()
     assert engine._partial_emit_lengths == {}
 
     request.generated_tokens.append(13)
     engine._try_send_streaming_partials()
 
-    engine.socket_for_receiving_requests.send.assert_called_once()
+    engine.socket_for_receiving_requests.send_multipart.assert_called_once()
     assert engine._partial_emit_lengths == {7: 3}
 
 
@@ -2293,7 +2336,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         if not fp8_available:
             pytest.skip(reason_for_no_fp8)
 
-        self._run_test(model_provider=model_provider, fp8=True)
+        self._run_test(model_provider=model_provider, fp8=True, hidden_size=128)
 
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
