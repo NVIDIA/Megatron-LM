@@ -127,7 +127,7 @@ class FsdpParameterGroup:
                 averaging. See ``fully_shard``.
         """
         parameter_to_fqns, self.dtype, self.requires_grad = self._collect_parameter_metadata(
-            parameters, use_symmetric_memory
+            parameters
         )
         self._owning_module = ref(owning_module)
         self.mesh = mesh
@@ -151,14 +151,11 @@ class FsdpParameterGroup:
 
     @staticmethod
     def _collect_parameter_metadata(
-        parameters: dict[str, nn.Parameter], use_symmetric_memory: bool
+        parameters: dict[str, nn.Parameter],
     ) -> tuple[dict[nn.Parameter, list[str]], torch.dtype, bool]:
         """Group tied parameters and validate their shared metadata."""
         if not parameters:
             raise ValueError("FsdpParameterGroup requires at least one parameter.")
-        if use_symmetric_memory and not hasattr(symm_mem, "is_symm_mem_tensor"):
-            raise RuntimeError("Symmetric-memory MFSDP requires PyTorch 2.12 or later.")
-
         parameter_to_fqns: dict[nn.Parameter, list[str]] = {}
         for fqn, parameter in parameters.items():
             parameter_to_fqns.setdefault(parameter, []).append(fqn)
@@ -190,6 +187,9 @@ class FsdpParameterGroup:
         use_symmetric_memory: bool,
     ) -> None:
         """Allocate weight and gradient buffers in their required dependency order."""
+        if use_symmetric_memory and not hasattr(symm_mem, "is_symm_mem_tensor"):
+            raise RuntimeError("Symmetric-memory MFSDP requires PyTorch 2.12 or later.")
+
         tensor_shapes = tuple(parameter.shape for parameter in parameters)
         main_weight_dtype = mixed_precision_policy.main_params_dtype or torch.float32
         self.main_weight = DBuffer.distribute_tensors(
