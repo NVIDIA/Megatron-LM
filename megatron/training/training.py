@@ -854,7 +854,15 @@ def _dsa_sparse_core_scale(total_real_tokens, seqlen_squared_sum, dsa_indexer_to
 
 
 def _dsa_indexer_flops(
-    *, hidden_size, q_lora_rank, n_heads, head_dim, num_indexer_layers, indexer_loss_coeff
+    *,
+    hidden_size,
+    q_lora_rank,
+    n_heads,
+    head_dim,
+    num_indexer_layers,
+    dsa_indexer_loss_coeff,
+    dsa_indexer_use_sparse_loss=False,
+    sparse_core_scale=1.0,
 ):
     """DSA lightning-indexer FLOPs coefficients, fwd/bwd expansion included.
 
@@ -881,12 +889,27 @@ def _dsa_indexer_flops(
       * loss on  -> the projections (wq_b / wk / weights_proj) read a detached
         input, so autograd skips their dgrad and they pay fwd + wgrad = 2x.
         The scoring GEMM has two activation operands that both need gradients
-        to reach those weights, so it pays fwd + dq + dk = 3x.
+        to reach those weights, so it pays fwd + dq + dk. Forward scoring is
+        always dense (top-k selection needs every score). How much of the
+        backward is dense depends on the loss variant:
+
+          - dense KL (``dsa_indexer_use_sparse_loss=False``, the default):
+            every causal (query, key) pair carries a gradient, so
+            dq + dk are dense too and the scoring pays 3x.
+          - sparse KL (``dsa_indexer_use_sparse_loss=True``): the KL is
+            taken over the selected top-k keys only, so the score gradient is
+            zero outside them and dq + dk span just the top-k pairs. The
+            scoring pays ``1 + 2 * sparse_core_scale``, with
+            ``sparse_core_scale`` the same top-k / dense pair ratio that
+            ``_dsa_sparse_core_scale`` applies to core attention. The fused
+            cuDNN backend (``_compute_sparse_indexer_loss_and_grads``)
+            executes exactly this sparse backward; the reference PyTorch path
+            multiplies a dense zero-padded gradient instead, which is an
+            implementation detail and, like the dense-masked reference
+            attention, does not enter the model FLOPs count.
 
     Whether the indexer is trained is part of the training procedure rather
-    than the kernel schedule, so it belongs in this model-FLOPs count. (With
-    ``dsa_indexer_use_sparse_loss`` the scoring backward only covers the top-k
-    entries, which the 3x does not model; it defaults to False.)
+    than the kernel schedule, so it belongs in this model-FLOPs count.
 
     Returns ``(token_linear, core)`` INCLUDING the fwd/bwd and FMA factors.
     Multiply ``token_linear`` by the real token count and ``core`` by
@@ -906,10 +929,18 @@ def _dsa_indexer_flops(
     # Scoring each query against every past token under a causal mask (/2).
     core = num_indexer_layers * index_dim / 2
     fma_expansion_factor = 2
-    loss_enabled = (indexer_loss_coeff or 0.0) > 0
+    loss_enabled = (dsa_indexer_loss_coeff or 0.0) > 0
+    if not loss_enabled:
+        token_expansion, core_expansion = 1, 1
+    else:
+        # Projections: fwd + wgrad (input is detached, no dgrad).
+        token_expansion = 2
+        # Scoring: dense fwd + dq + dk, where dq/dk cover only the top-k pairs
+        # under the sparse KL loss (see docstring).
+        core_expansion = 1 + 2 * (sparse_core_scale if dsa_indexer_use_sparse_loss else 1.0)
     return (
-        (2 if loss_enabled else 1) * fma_expansion_factor * token_linear,
-        (3 if loss_enabled else 1) * fma_expansion_factor * core,
+        token_expansion * fma_expansion_factor * token_linear,
+        core_expansion * fma_expansion_factor * core,
     )
 
 
@@ -1474,6 +1505,9 @@ def num_floating_point_operations(
             linear_self_attn_term = 0
             num_standard_attention_layers = num_layers
 
+            dsa_sparse_core_scale = _dsa_sparse_core_scale(
+                total_real_tokens_in_batch, seqlen_squared_sum_in_batch, args.dsa_indexer_topk
+            )
             standard_self_attn_core_term = (
                 forward_backward_expansion_factor
                 * fma_expansion_factor
@@ -1481,9 +1515,7 @@ def num_floating_point_operations(
                     args.num_attention_heads * (args.kv_lora_rank + args.qk_pos_emb_head_dim) / 2
                     + args.num_attention_heads * args.kv_lora_rank / 2
                 )
-                * _dsa_sparse_core_scale(
-                    total_real_tokens_in_batch, seqlen_squared_sum_in_batch, args.dsa_indexer_topk
-                )
+                * dsa_sparse_core_scale
             )
             dsa_extra_term, dsa_extra_core_term = _dsa_indexer_flops(
                 hidden_size=args.hidden_size,
@@ -1493,7 +1525,9 @@ def num_floating_point_operations(
                 num_indexer_layers=_num_dsa_indexer_layers(
                     num_layers, args.dsa_indexer_skip_topk_offset, args.dsa_indexer_topk_freq
                 ),
-                indexer_loss_coeff=args.dsa_indexer_loss_coeff,
+                dsa_indexer_loss_coeff=args.dsa_indexer_loss_coeff,
+                dsa_indexer_use_sparse_loss=getattr(args, "dsa_indexer_use_sparse_loss", False),
+                sparse_core_scale=dsa_sparse_core_scale,
             )
         else:
             num_linear_attention_layers = 0
@@ -1656,7 +1690,11 @@ def num_floating_point_operations(
                 n_heads=args.dsa_indexer_n_heads,
                 head_dim=args.dsa_indexer_head_dim,
                 num_indexer_layers=num_indexer_layers,
-                indexer_loss_coeff=args.dsa_indexer_loss_coeff,
+                dsa_indexer_loss_coeff=args.dsa_indexer_loss_coeff,
+                dsa_indexer_use_sparse_loss=getattr(args, "dsa_indexer_use_sparse_loss", False),
+                sparse_core_scale=_dsa_sparse_core_scale(
+                    total_real_tokens_in_batch, seqlen_squared_sum_in_batch, args.dsa_indexer_topk
+                ),
             )
             dsa_token_linear_term = num_dsa_layers * per_layer_token_linear + indexer_token_linear
             dsa_core_term = num_dsa_layers * per_layer_core + indexer_core
