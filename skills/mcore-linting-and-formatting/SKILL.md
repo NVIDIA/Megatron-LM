@@ -54,11 +54,4 @@ This installs `ruff`, `black`, `isort`, `pylint` — the same tools used by
 
 ## Code Style Rules
 
-- **Type hints**: required on all public API functions. Prefer `X | None` for new interfaces; preserve nearby annotation conventions when extending existing code.
-- **Docstrings**: Google-style on all public classes and functions.
-- **Naming**: follow Python conventions — `snake_case` for functions and variables, `PascalCase` for classes.
-- **Line length**: 100 characters (configured in `pyproject.toml` and `.pylintrc`).
-- **No bare `except`**: always catch specific exception types.
-
-See the [repository style guide](../../style-guide.md) for repository overrides
-to the Google Python style guide.
+Follow [style-guide.md](../../style-guide.md).
