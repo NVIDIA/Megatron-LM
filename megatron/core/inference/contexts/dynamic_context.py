@@ -2194,9 +2194,25 @@ class DynamicInferenceContext(BaseInferenceContext):
         gv.mha_cu_kv_seq_lengths[1 : p + 1] = cu
         gv.mha_block_table[:p] = block_table_prefill
 
-        if padded_total > total:
+        pad_tokens = padded_total - total
+        if pad_tokens > 0:
             gv.token_to_block_idx[total:padded_total] = self.kv_block_allocator.dummy_block_idx
             gv.token_to_local_position_within_kv_block[total:padded_total] = 0
+            # The pad rows are query rows as well as KV writes. The packed hidden is padded up
+            # to a TP multiple so it can be scattered for sequence parallelism, so after the
+            # MTP layer's internal gather the attention sees `padded_total` query rows while
+            # `append_counts` describes only `total` of them. Varlen attention requires
+            # `q.shape[0] == cu_seqlens_q[-1]`, so the pad rows are carried by a trailing
+            # synthetic request that attends only to itself out of the dummy block. Its KV
+            # writes are redirected there just above and this forward's output hidden is
+            # discarded, so the request is inert.
+            gv.mha_query_lengths[p] = pad_tokens
+            gv.mha_kv_seq_lengths[p] = pad_tokens
+            gv.mha_cu_query_seq_lengths[p + 1] = padded_total
+            gv.mha_cu_kv_seq_lengths[p + 1] = padded_total
+            gv.mha_block_table[p] = self.kv_block_allocator.dummy_block_idx
+            p += 1
+            padded_p = max(padded_p, p)
         if padded_p > p:
             gv.mha_query_lengths[p:padded_p] = 0
             gv.mha_cu_query_seq_lengths[p + 1 : padded_p + 1] = gv.mha_cu_query_seq_lengths[p]
@@ -2204,7 +2220,9 @@ class DynamicInferenceContext(BaseInferenceContext):
             gv.mha_cu_kv_seq_lengths[p + 1 : padded_p + 1] = gv.mha_cu_kv_seq_lengths[p]
             gv.mha_block_table[p:padded_p] = -1
 
-        max_seqlen = int(append_counts.max().item()) if p > 0 else 1
+        # `p` may now count the trailing pad request, so bound the real requests by
+        # `num_prefill` and let the pad run raise the bound when it is the longest.
+        max_seqlen = max(int(append_counts.max().item()) if num_prefill > 0 else 1, pad_tokens)
         mha = self.non_graph_attn_metadata["mha_metadata"]
         mha.set_state_data(
             padded_active_request_count=padded_p, max_seqlen_q=max_seqlen, max_seqlen_k=max_seqlen

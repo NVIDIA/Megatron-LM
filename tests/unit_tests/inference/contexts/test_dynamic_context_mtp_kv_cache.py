@@ -609,13 +609,72 @@ class TestMtpPrefillBookkeeping:
         dummy = context.kv_block_allocator.dummy_block_idx
         assert gv.token_to_block_idx[5:8].cpu().tolist() == [dummy, dummy, dummy]
         assert gv.token_to_local_position_within_kv_block[5:8].cpu().tolist() == [0, 0, 0]
-        assert gv.mha_query_lengths[2:4].cpu().tolist() == [0, 0]
-        assert gv.mha_kv_seq_lengths[2:4].cpu().tolist() == [0, 0]
-        assert gv.mha_cu_query_seq_lengths[2:5].cpu().tolist() == [5, 5, 5]
-        assert gv.mha_cu_kv_seq_lengths[2:5].cpu().tolist() == [5, 5, 5]
-        assert (gv.mha_block_table[2:4] == -1).all()
+        # Row 2 is the trailing pad request carrying the 3 SP pad tokens; it reads the dummy
+        # block. Row 3 is request padding proper: zero-length and never indexed.
+        assert gv.mha_query_lengths[2:4].cpu().tolist() == [3, 0]
+        assert gv.mha_kv_seq_lengths[2:4].cpu().tolist() == [3, 0]
+        assert gv.mha_cu_query_seq_lengths[2:5].cpu().tolist() == [5, 8, 8]
+        assert gv.mha_cu_kv_seq_lengths[2:5].cpu().tolist() == [5, 8, 8]
+        assert (gv.mha_block_table[2] == dummy).all()
+        assert (gv.mha_block_table[3:4] == -1).all()
         assert context.active_token_count == 5
         assert context.padded_active_token_count == 8
+
+    @pytest.mark.parametrize(
+        "append_counts_list, padded_token_count",
+        [([0, 1, 0], 4), ([3, 2], 8), ([2, 2], 4)],
+        ids=["single_token_tp4", "five_tokens_pad8", "already_aligned"],
+    )
+    def test_prefill_step_query_metadata_covers_every_padded_token(
+        self, append_counts_list, padded_token_count
+    ):
+        """`cu_seqlens_q` must describe the SP pad rows, not only the committed ones.
+
+        The packed hidden is padded to a TP multiple before the sequence-parallel scatter, so
+        after the MTP layer's internal gather the attention receives `padded_token_count` query
+        rows. Varlen attention requires `q.shape[0] == cu_seqlens_q[-1]`, so every padded row
+        has to be accounted for by some request in the metadata.
+
+        `single_token_tp4` is the shape that arises whenever exactly one draft position is
+        committed under TP=4: one real token padded up to four.
+        """
+        context = _make_context()
+        device = torch.cuda.current_device()
+        append_counts = torch.tensor(append_counts_list, device=device)
+        num_requests = len(append_counts_list)
+        total = int(append_counts.sum())
+        pad_tokens = padded_token_count - total
+        block_table = self._block_table(context, [[3, 4]] * num_requests)
+
+        context._mtp_setup_prefill_step(
+            append_counts=append_counts,
+            block_table_prefill=block_table,
+            padded_token_count=padded_token_count,
+            padded_request_count=num_requests,
+        )
+
+        gv = context.gpu_view
+        mha = context.non_graph_attn_metadata["mha_metadata"]
+        padded_p = mha.state_data["cu_query_seq_lengths"].numel() - 1
+        cu_q = gv.mha_cu_query_seq_lengths[: padded_p + 1].cpu().tolist()
+
+        assert cu_q[0] == 0
+        assert cu_q[-1] == padded_token_count, (
+            f"cu_seqlens_q ends at {cu_q[-1]} but attention will be handed "
+            f"{padded_token_count} query rows"
+        )
+        assert int(gv.mha_query_lengths[:padded_p].sum()) == padded_token_count
+        # Causal prefill: the kv run matches the query run for every request, pad row included.
+        assert gv.mha_cu_kv_seq_lengths[: padded_p + 1].cpu().tolist() == cu_q
+        # The kernel's seqlen bound has to cover the pad run as well as the real requests.
+        assert mha.state_data["max_seqlen_q"] >= max([*append_counts_list, pad_tokens])
+        if pad_tokens > 0:
+            # The pad request must read a real (dummy) block; -1 is not a valid page index.
+            assert (
+                gv.mha_block_table[num_requests] == context.kv_block_allocator.dummy_block_idx
+            ).all()
+        assert context.active_token_count == total
+        assert context.padded_active_token_count == padded_token_count
 
     def test_prefill_step_forces_varlen_path_on_a_pure_decode_step(self):
         """`num_prefill_requests` is forced >= 1 so the ragged forward avoids the decode kernel."""
