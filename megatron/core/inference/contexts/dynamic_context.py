@@ -2202,17 +2202,29 @@ class DynamicInferenceContext(BaseInferenceContext):
             # to a TP multiple so it can be scattered for sequence parallelism, so after the
             # MTP layer's internal gather the attention sees `padded_total` query rows while
             # `append_counts` describes only `total` of them. Varlen attention requires
-            # `q.shape[0] == cu_seqlens_q[-1]`, so the pad rows are carried by a trailing
-            # synthetic request that attends only to itself out of the dummy block. Its KV
-            # writes are redirected there just above and this forward's output hidden is
-            # discarded, so the request is inert.
-            gv.mha_query_lengths[p] = pad_tokens
-            gv.mha_kv_seq_lengths[p] = pad_tokens
-            gv.mha_cu_query_seq_lengths[p + 1] = padded_total
-            gv.mha_cu_kv_seq_lengths[p + 1] = padded_total
-            gv.mha_block_table[p] = self.kv_block_allocator.dummy_block_idx
-            p += 1
-            padded_p = max(padded_p, p)
+            # `q.shape[0] == cu_seqlens_q[-1]`, so every pad row is given an owning request.
+            # Only the write maps decide where this forward's KV lands, and they were just
+            # redirected to the dummy block, so the extra query rows are inert wherever they
+            # are attributed; the output hidden is discarded either way.
+            if p < gv.mha_query_lengths.numel():
+                # Spare request slot: carry the pad rows in their own trailing request, which
+                # attends solely to itself out of the dummy block.
+                gv.mha_query_lengths[p] = pad_tokens
+                gv.mha_kv_seq_lengths[p] = pad_tokens
+                gv.mha_cu_query_seq_lengths[p + 1] = padded_total
+                gv.mha_cu_kv_seq_lengths[p + 1] = padded_total
+                gv.mha_block_table[p] = self.kv_block_allocator.dummy_block_idx
+                p += 1
+                padded_p = max(padded_p, p)
+            else:
+                # A full batch occupies every request slot, so extend the last real request's
+                # run instead. Its reads stay inside the blocks it already owns: this varlen
+                # forward reads from the head of each request's block-table row, and the run
+                # grows by at most `tp_size - 1`.
+                gv.mha_query_lengths[p - 1] += pad_tokens
+                gv.mha_kv_seq_lengths[p - 1] += pad_tokens
+                gv.mha_cu_query_seq_lengths[p] = padded_total
+                gv.mha_cu_kv_seq_lengths[p] = padded_total
         if padded_p > p:
             gv.mha_query_lengths[p:padded_p] = 0
             gv.mha_cu_query_seq_lengths[p + 1 : padded_p + 1] = gv.mha_cu_query_seq_lengths[p]
@@ -2220,9 +2232,9 @@ class DynamicInferenceContext(BaseInferenceContext):
             gv.mha_cu_kv_seq_lengths[p + 1 : padded_p + 1] = gv.mha_cu_kv_seq_lengths[p]
             gv.mha_block_table[p:padded_p] = -1
 
-        # `p` may now count the trailing pad request, so bound the real requests by
-        # `num_prefill` and let the pad run raise the bound when it is the longest.
-        max_seqlen = max(int(append_counts.max().item()) if num_prefill > 0 else 1, pad_tokens)
+        # Read the bound back off the query lengths rather than off `append_counts`: either
+        # branch above may have introduced a run longer than any single `append_counts` entry.
+        max_seqlen = int(gv.mha_query_lengths[:p].max().item()) if p > 0 else 1
         mha = self.non_graph_attn_metadata["mha_metadata"]
         mha.set_state_data(
             padded_active_request_count=padded_p, max_seqlen_q=max_seqlen, max_seqlen_k=max_seqlen

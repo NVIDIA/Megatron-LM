@@ -676,6 +676,40 @@ class TestMtpPrefillBookkeeping:
         assert context.active_token_count == total
         assert context.padded_active_token_count == padded_token_count
 
+    def test_prefill_step_pads_query_metadata_with_every_request_slot_taken(self):
+        """A full batch leaves no spare request row, so the pad rows join the last request.
+
+        `mha_query_lengths` and friends are sized to `max_requests`, so when every slot holds a
+        real request the trailing-request form has nowhere to go. `cu_seqlens_q[-1]` must still
+        equal the padded query-row count.
+        """
+        max_requests = 3
+        context = _make_context(max_requests=max_requests)
+        device = torch.cuda.current_device()
+        append_counts = torch.tensor([0, 1, 0], device=device)
+        block_table = self._block_table(context, [[3, 4]] * max_requests)
+        padded_token_count = 4
+
+        context._mtp_setup_prefill_step(
+            append_counts=append_counts,
+            block_table_prefill=block_table,
+            padded_token_count=padded_token_count,
+            padded_request_count=max_requests,
+        )
+
+        gv = context.gpu_view
+        mha = context.non_graph_attn_metadata["mha_metadata"]
+        assert gv.mha_query_lengths.numel() == max_requests, "test needs a fully occupied batch"
+        cu_q = gv.mha_cu_query_seq_lengths[: max_requests + 1].cpu().tolist()
+        assert cu_q[-1] == padded_token_count
+        assert int(gv.mha_query_lengths[:max_requests].sum()) == padded_token_count
+        # The pad rows joined the last real request, so its run grew by the pad amount.
+        assert gv.mha_query_lengths[max_requests - 1].item() == 3
+        assert gv.mha_kv_seq_lengths[max_requests - 1].item() == 3
+        assert gv.mha_cu_kv_seq_lengths[: max_requests + 1].cpu().tolist() == cu_q
+        assert mha.state_data["max_seqlen_q"] >= 3
+        assert context.padded_active_token_count == padded_token_count
+
     def test_prefill_step_forces_varlen_path_on_a_pure_decode_step(self):
         """`num_prefill_requests` is forced >= 1 so the ragged forward avoids the decode kernel."""
         context = _make_context()
