@@ -9,6 +9,7 @@ prefix match, and maintains per-rank shadow state (cached hashes and timestamps)
 
 import asyncio
 import itertools
+import time
 from collections import deque
 from typing import Dict, Optional
 from unittest.mock import MagicMock
@@ -25,7 +26,15 @@ from megatron.core.inference.config import (
 from megatron.core.inference.data_parallel_inference_coordinator import (
     DataParallelInferenceCoordinator,
 )
-from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine, RequestEntry
+from megatron.core.inference.data_parallel_inference_coordinator.handlers import (
+    handle_engine_reply,
+    handle_submit_request,
+)
+from megatron.core.inference.engines.dynamic_engine import (
+    DynamicInferenceEngine,
+    RequestEntry,
+    _engine_reply_frames,
+)
 from megatron.core.inference.headers import Headers
 from megatron.core.inference.inference_client import InferenceClient
 from megatron.core.inference.inference_request import (
@@ -157,10 +166,9 @@ class DummyEngine(DynamicInferenceEngine):
                 entry.future.set_result(entry.record)
                 to_remove.append(request_id)
                 if self.is_mp_coordinator:
-                    payload = msgpack.packb(
-                        [Headers.ENGINE_REPLY.value, [entry.record.serialize()]], use_bin_type=True
+                    self.socket_for_receiving_requests.send_multipart(
+                        _engine_reply_frames([entry.record.serialize()])
                     )
-                    self.socket_for_receiving_requests.send(payload)
 
         for request_id in to_remove:
             del self.requests[request_id]
@@ -202,6 +210,7 @@ def make_coordinator_direct(
     enable_prefix_caching=True,
     deterministic_mode=True,
     prefix_caching_routing_alpha=0.5,
+    prefix_cache_ttl_seconds=300.0,
     media_policy=MediaCacheCoordinatorPolicy.AFFINITY,
     vision_embedding_cache_enabled=True,
     max_requests=10,
@@ -221,6 +230,7 @@ def make_coordinator_direct(
         enable_prefix_caching=enable_prefix_caching,
         deterministic_mode=deterministic_mode,
         prefix_caching_routing_alpha=prefix_caching_routing_alpha,
+        prefix_cache_ttl_seconds=prefix_cache_ttl_seconds,
         media_policy=media_policy,
         vision_embedding_cache_enabled=vision_embedding_cache_enabled,
         max_requests=max_requests,
@@ -256,18 +266,6 @@ class TestCoordinatorHashComputation:
         hashes_from_list = coordinator.compute_request_hashes([1, 2, 3, 4, 5, 6, 7, 8])
         assert hashes_from_str == hashes_from_list
 
-    def test_hash_empty_when_disabled(self):
-        """Returns empty list when prefix caching is disabled."""
-        coordinator = make_coordinator_direct(enable_prefix_caching=False)
-        hashes = coordinator.compute_request_hashes([1, 2, 3, 4])
-        assert hashes == []
-
-    def test_hash_empty_when_no_block_size(self):
-        """Returns empty list when block_size_tokens is None."""
-        coordinator = make_coordinator_direct(block_size_tokens=None)
-        hashes = coordinator.compute_request_hashes([1, 2, 3, 4])
-        assert hashes == []
-
     def test_hash_partial_block_ignored(self):
         """Tokens that don't fill a complete block produce no hash."""
         coordinator = make_coordinator_direct()
@@ -293,6 +291,172 @@ class TestCoordinatorHashComputation:
         assert h1[0] != h2[0]
         # Block 2 hashes also differ due to parent chaining.
         assert h1[1] != h2[1]
+
+
+class TestSubmitDoesNotDecodePrompt:
+    """The coordinator must not decode the prompt when no routing needs it.
+
+    Decoding is O(prompt length) on the coordinator's single serial loop, so
+    skipping it is the point of carrying the prompt in its own frame. Each test
+    sends a prompt frame that is deliberately *not* valid msgpack: if the
+    handler tried to decode it the call would raise, so completing cleanly is
+    proof the bytes were forwarded untouched.
+    """
+
+    UNDECODABLE_PROMPT = b"\xc1not-valid-msgpack"
+    UNDECODABLE_MEDIA = b"\xc1not-valid-msgpack-either"
+
+    def _submit(self, coordinator, block_hashes=None, media_meta=None):
+        """Drive handle_submit_request once and return the frames sent onward."""
+        coordinator.known_clients = {b"client-A"}
+        coordinator.next_request_id = 0
+        coordinator.request_id_to_client_id = {}
+        coordinator.request_id_to_client_request_id = {}
+        coordinator.client_request_to_request_id = {}
+        coordinator.request_id_to_rank = {}
+        coordinator.schedule_records = None
+        coordinator.router_socket = MagicMock()
+
+        metadata = [Headers.SUBMIT_REQUEST.value, 7, {"temperature": 1.0}, media_meta]
+        bodies = [
+            self.UNDECODABLE_PROMPT,
+            msgpack.packb(block_hashes, use_bin_type=True),
+            self.UNDECODABLE_MEDIA,
+        ]
+        handle_submit_request(coordinator, b"client-A", metadata, bodies)
+        return coordinator.router_socket.send_multipart.call_args.args[0]
+
+    def test_load_balanced_forwards_prompt_verbatim(self):
+        """LOAD_BALANCED ignores hashes, so the prompt is never decoded."""
+        coordinator = make_coordinator_direct(data_parallel_size=2)
+        coordinator.prefix_caching_coordinator_policy = PrefixCachingCoordinatorPolicy.LOAD_BALANCED
+        _identity, _metadata, prompt_frame, _media = self._submit(coordinator, block_hashes=[])
+        assert prompt_frame is self.UNDECODABLE_PROMPT
+
+    def test_disabled_prefix_caching_forwards_prompt_verbatim(self):
+        """With prefix caching off there are no hashes to compute either."""
+        coordinator = make_coordinator_direct(data_parallel_size=2, enable_prefix_caching=False)
+        _identity, _metadata, prompt_frame, _media = self._submit(coordinator, block_hashes=[])
+        assert prompt_frame is self.UNDECODABLE_PROMPT
+
+    def test_prefix_routing_uses_frontend_hashes_without_decoding_prompt(self):
+        """Prefix-affinity routing reads the frontend's hashes, not the prompt.
+
+        This is the case the split exists for: the coordinator has to route on
+        prefix affinity *and* still never look at the prompt. It only holds
+        because the frontend hashed the tokens it already had.
+        """
+        coordinator = make_coordinator_direct(data_parallel_size=2)
+        coordinator.prefix_caching_coordinator_policy = (
+            PrefixCachingCoordinatorPolicy.LONGEST_PREFIX
+        )
+        _identity, _metadata, prompt_frame, _media = self._submit(
+            coordinator, block_hashes=[11, 22]
+        )
+        assert prompt_frame is self.UNDECODABLE_PROMPT
+
+    def test_frontend_hashes_are_recorded_against_the_chosen_rank(self):
+        """The supplied hashes drive affinity, so they must reach the rank table."""
+        coordinator = make_coordinator_direct(data_parallel_size=2)
+        coordinator.prefix_caching_coordinator_policy = (
+            PrefixCachingCoordinatorPolicy.LONGEST_PREFIX
+        )
+        identity, _metadata, _prompt, _media = self._submit(coordinator, block_hashes=[11, 22])
+        # A second request with the same prefix must now land on the same rank.
+        again, _m, _p, _md = self._submit(coordinator, block_hashes=[11, 22])
+        assert again == identity
+
+    def test_unhashed_prompt_falls_back_to_the_coordinator(self):
+        """A client that could not hash sends None, and the coordinator hashes.
+
+        That happens for a string prompt, which needs a tokenizer the client does
+        not have. It is the only case that still decodes the prompt here, and it
+        is distinct from an empty list, which means the client hashed and the
+        prompt was shorter than one block.
+        """
+        coordinator = make_coordinator_direct(data_parallel_size=2)
+        coordinator.prefix_caching_coordinator_policy = (
+            PrefixCachingCoordinatorPolicy.LONGEST_PREFIX
+        )
+        coordinator.known_clients = {b"client-A"}
+        coordinator.next_request_id = 0
+        coordinator.request_id_to_client_id = {}
+        coordinator.request_id_to_client_request_id = {}
+        coordinator.client_request_to_request_id = {}
+        coordinator.request_id_to_rank = {}
+        coordinator.schedule_records = None
+        coordinator.router_socket = MagicMock()
+        coordinator.compute_request_hashes = MagicMock(return_value=[5])
+
+        metadata = [
+            Headers.SUBMIT_REQUEST.value,
+            7,
+            {"temperature": 1.0},
+            {"media_cache_key": "img-1"},
+        ]
+        prompt = msgpack.packb([1, 2, 3], use_bin_type=True)
+        handle_submit_request(
+            coordinator,
+            b"client-A",
+            metadata,
+            [prompt, msgpack.packb(None, use_bin_type=True), self.UNDECODABLE_MEDIA],
+        )
+
+        # Decoded here, and salted with whatever media key the metadata carried.
+        coordinator.compute_request_hashes.assert_called_once_with([1, 2, 3], cache_salt="img-1")
+
+    def test_empty_hash_list_is_not_a_fallback(self):
+        """An empty list means "hashed, no complete blocks" -- do not re-hash.
+
+        Treating it as unhashed would decode the prompt on this loop for every
+        short request, which is exactly the cost this design removes.
+        """
+        coordinator = make_coordinator_direct(data_parallel_size=2)
+        coordinator.prefix_caching_coordinator_policy = (
+            PrefixCachingCoordinatorPolicy.LONGEST_PREFIX
+        )
+        coordinator.compute_request_hashes = MagicMock(return_value=[5])
+        _identity, _metadata, prompt_frame, _media = self._submit(coordinator, block_hashes=[])
+        assert prompt_frame is self.UNDECODABLE_PROMPT
+        coordinator.compute_request_hashes.assert_not_called()
+
+    def test_media_frame_is_forwarded_without_being_decoded(self):
+        """The media bytes reach the engine untouched.
+
+        Media is the largest thing on the wire -- raw video runs to hundreds of
+        megabytes -- and this loop is shared by every rank, so decoding it here
+        would cost far more than the prompt decode the split already removed.
+        An undecodable frame proves nothing looked at it.
+        """
+        coordinator = make_coordinator_direct(data_parallel_size=2)
+        coordinator.prefix_caching_coordinator_policy = (
+            PrefixCachingCoordinatorPolicy.LONGEST_PREFIX
+        )
+        _identity, _metadata, _prompt, media_frame = self._submit(
+            coordinator, block_hashes=[11, 22], media_meta={"media_cache_key": "img-1"}
+        )
+        assert media_frame is self.UNDECODABLE_MEDIA
+
+    def test_media_identity_routes_without_the_media_payload(self):
+        """Affinity keys on the descriptor in metadata, never on the bytes."""
+        coordinator = make_coordinator_direct(data_parallel_size=2)
+        coordinator.prefix_caching_coordinator_policy = PrefixCachingCoordinatorPolicy.LOAD_BALANCED
+        identity, _m, _p, _md = self._submit(
+            coordinator, block_hashes=[], media_meta={"media_cache_key": "img-1"}
+        )
+        assert coordinator._media_cache_affinity["img-1"] == identity
+
+    def test_metadata_frame_is_rewritten_with_server_request_id(self):
+        """The client's request id is swapped for the coordinator's own."""
+        coordinator = make_coordinator_direct(data_parallel_size=2)
+        coordinator.prefix_caching_coordinator_policy = PrefixCachingCoordinatorPolicy.LOAD_BALANCED
+        _identity, metadata_frame, _prompt, _media = self._submit(coordinator, block_hashes=[])
+        header, request_id, sampling_params, media_meta = msgpack.unpackb(metadata_frame, raw=False)
+        assert header == Headers.SUBMIT_REQUEST.value
+        assert request_id == 0  # server-side id, not the client's 7
+        assert sampling_params == {"temperature": 1.0}
+        assert media_meta is None
+        assert coordinator.request_id_to_client_request_id[0] == 7
 
 
 class TestCoordinatorPrefixRouting:
@@ -488,16 +652,25 @@ class TestCoordinatorShadowState:
         coordinator._update_rank_hashes(rank_0, [100, 200, 300])
         assert all(coordinator._hash_table.get(h, {}).get(idx_0, 0) > 0 for h in [100, 200, 300])
 
-    def test_update_rank_hashes_increments_counter(self):
-        """Each call to _update_rank_hashes increments the assignment counter."""
+    def test_update_rank_hashes_stamps_the_current_time(self, monkeypatch):
+        """Entries carry the time they were routed, which is what expiry reads.
+
+        A monotonic clock replaced the assignment counter: ordering alone cannot
+        say whether an entry is older than the TTL.
+        """
         coordinator = make_coordinator_direct()
         rank_0 = coordinator.identities_of_data_parallel_ranks[0]
+        rank_idx = coordinator.identity_to_rank_index[rank_0]
 
-        assert coordinator._hash_assignment_counter == 0
+        monkeypatch.setattr(time, "monotonic", lambda: 500.0)
         coordinator._update_rank_hashes(rank_0, [100])
-        assert coordinator._hash_assignment_counter == 1
+        assert coordinator._hash_table[100][rank_idx] == 500.0
+
+        monkeypatch.setattr(time, "monotonic", lambda: 700.0)
         coordinator._update_rank_hashes(rank_0, [200])
-        assert coordinator._hash_assignment_counter == 2
+        assert coordinator._hash_table[200][rank_idx] == 700.0
+        # One queue entry per (touch, hash), so expiry can sweep in order.
+        assert list(coordinator._hash_expiry) == [(500.0, 100), (700.0, 200)]
 
     def test_timestamps_updated_on_reassignment(self):
         """Re-assigning a hash to the same rank updates its timestamp."""
@@ -551,29 +724,6 @@ class TestCoordinatorShadowState:
         # Second request with same tokens: should go to same rank.
         rank2 = coordinator.get_best_data_parallel_rank(hashes)
         assert rank2 == rank
-
-    def test_recency_breaks_tie_at_equal_load(self):
-        """When two ranks match the same prefix and have equal load, the more
-        recently assigned rank wins."""
-        coordinator = make_coordinator_direct()
-        tokens = [1, 2, 3, 4, 5, 6, 7, 8]
-        hashes = coordinator.compute_request_hashes(tokens)
-
-        rank_0 = coordinator.identities_of_data_parallel_ranks[0]
-        rank_1 = coordinator.identities_of_data_parallel_ranks[1]
-
-        # Equal load on both ranks.
-        coordinator._pending_counts[coordinator.identity_to_rank_index[rank_0]] = 1
-        coordinator._pending_counts[coordinator.identity_to_rank_index[rank_1]] = 1
-
-        # Both have the prefix, but rank_1 was assigned more recently.
-        for h in hashes:
-            _set_hash_rank(coordinator, h, rank_0, 1)
-            _set_hash_rank(coordinator, h, rank_1, 5)
-
-        # rank_1 wins via recency despite rank_0 having a lower index.
-        selected = coordinator.get_best_data_parallel_rank(hashes)
-        assert selected == rank_1
 
 
 @pytest.mark.skipif(ZMQ_FLAKY_SHUTDOWN, reason="ZMQ shutdown is flaky")
@@ -842,158 +992,273 @@ class TestLoadAwarePrefixRouting:
 
 
 class TestScoringFunctionRouting:
-    """Test the alpha-based scoring function: score = alpha * match + (1 - alpha) * normalized_load."""
+    """The scoring function: score = cache_score - alpha * relative_load."""
 
-    def test_high_alpha_prefers_prefix_match(self):
-        """With alpha=1.0, a rank with a prefix hit is always preferred over a free rank."""
-        coordinator = make_coordinator_direct(prefix_caching_routing_alpha=1.0, max_requests=10)
-        tokens = [1, 2, 3, 4]
-        hashes = coordinator.compute_request_hashes(tokens)
-
+    def test_zero_alpha_is_pure_prefix_affinity(self):
+        """alpha=0 drops the load term, so the prefix holder wins however loaded."""
+        coordinator = make_coordinator_direct(prefix_caching_routing_alpha=0.0, max_requests=10)
+        hashes = coordinator.compute_request_hashes([1, 2, 3, 4])
         rank_0 = coordinator.identities_of_data_parallel_ranks[0]
         rank_1 = coordinator.identities_of_data_parallel_ranks[1]
-
-        # rank_0 has the prefix but is heavily loaded (9/10 slots used).
         _set_hash_rank(coordinator, hashes[0], rank_0, 1)
         coordinator._pending_counts[coordinator.identity_to_rank_index[rank_0]] = 9
-
-        # rank_1 has no prefix match but is idle.
         coordinator._pending_counts[coordinator.identity_to_rank_index[rank_1]] = 0
+        assert coordinator.get_best_data_parallel_rank(hashes) == rank_0
 
-        # alpha=1.0: score(rank_0) = 1*1 + 0*0.1 = 1.0
-        #            score(rank_1) = 1*0 + 0*1.0 = 0.0
-        selected = coordinator.get_best_data_parallel_rank(hashes)
-        assert selected == rank_0
+    def test_mild_imbalance_does_not_overturn_a_cache_hit(self):
+        """One extra in-flight request must not cost a whole prefill.
 
-    def test_low_alpha_prefers_free_capacity(self):
-        """With alpha=0.0, the rank with the most free capacity is preferred."""
-        coordinator = make_coordinator_direct(prefix_caching_routing_alpha=0.0, max_requests=10)
-        tokens = [1, 2, 3, 4]
-        hashes = coordinator.compute_request_hashes(tokens)
-
-        rank_0 = coordinator.identities_of_data_parallel_ranks[0]
-        rank_1 = coordinator.identities_of_data_parallel_ranks[1]
-
-        # rank_0 has the prefix but is heavily loaded.
-        _set_hash_rank(coordinator, hashes[0], rank_0, 1)
-        coordinator._pending_counts[coordinator.identity_to_rank_index[rank_0]] = 8
-
-        # rank_1 has no prefix match but is nearly idle.
-        coordinator._pending_counts[coordinator.identity_to_rank_index[rank_1]] = 1
-
-        # alpha=0.0: score(rank_0) = 0*1 + 1*(2/10) = 0.2
-        #            score(rank_1) = 0*0 + 1*(9/10) = 0.9
-        selected = coordinator.get_best_data_parallel_rank(hashes)
-        assert selected == rank_1
-
-    def test_balanced_alpha_trades_off(self):
-        """With alpha=0.5, prefix match and load are balanced."""
+        At the default alpha a full hit stays decisive until the fleet is
+        genuinely uneven; alpha=1 would put this exactly on a knife edge.
+        """
         coordinator = make_coordinator_direct(prefix_caching_routing_alpha=0.5, max_requests=10)
-        tokens = [1, 2, 3, 4]
-        hashes = coordinator.compute_request_hashes(tokens)
-
+        hashes = coordinator.compute_request_hashes([1, 2, 3, 4])
         rank_0 = coordinator.identities_of_data_parallel_ranks[0]
         rank_1 = coordinator.identities_of_data_parallel_ranks[1]
-
-        # rank_0 has prefix match, 7 pending (3 free).
         _set_hash_rank(coordinator, hashes[0], rank_0, 1)
-        coordinator._pending_counts[coordinator.identity_to_rank_index[rank_0]] = 7
-
-        # rank_1 has no prefix match, 0 pending (10 free).
+        coordinator._pending_counts[coordinator.identity_to_rank_index[rank_0]] = 1
         coordinator._pending_counts[coordinator.identity_to_rank_index[rank_1]] = 0
+        # mean 0.5 (floored divisor 1.0) -> relative_load [+0.5, -0.5]
+        # scores = [1 - 0.5*0.5, 0 + 0.5*0.5] = [0.75, 0.25]
+        assert coordinator.get_best_data_parallel_rank(hashes) == rank_0
 
-        # alpha=0.5: score(rank_0) = 0.5*1 + 0.5*(3/10) = 0.5 + 0.15 = 0.65
-        #            score(rank_1) = 0.5*0 + 0.5*(10/10) = 0.0 + 0.5  = 0.5
-        selected = coordinator.get_best_data_parallel_rank(hashes)
-        assert selected == rank_0
-
-    def test_balanced_alpha_prefers_free_when_heavily_loaded(self):
-        """With alpha=0.5, a completely free rank beats a nearly-full rank with prefix match."""
+    def test_saturated_rank_loses_to_an_idle_one(self):
+        """The drain at the end of a batch: spread rather than strand work."""
         coordinator = make_coordinator_direct(prefix_caching_routing_alpha=0.5, max_requests=10)
-        tokens = [1, 2, 3, 4]
-        hashes = coordinator.compute_request_hashes(tokens)
-
+        hashes = coordinator.compute_request_hashes([1, 2, 3, 4])
         rank_0 = coordinator.identities_of_data_parallel_ranks[0]
         rank_1 = coordinator.identities_of_data_parallel_ranks[1]
-
-        # rank_0 has prefix match, 10 pending (0 free).
         _set_hash_rank(coordinator, hashes[0], rank_0, 1)
         coordinator._pending_counts[coordinator.identity_to_rank_index[rank_0]] = 10
-
-        # rank_1 has no prefix match, 0 pending (10 free).
         coordinator._pending_counts[coordinator.identity_to_rank_index[rank_1]] = 0
+        # mean 5 -> relative_load [+1, -1]; scores tie at 0.5, tiebreak to least loaded.
+        assert coordinator.get_best_data_parallel_rank(hashes) == rank_1
 
-        # alpha=0.5: score(rank_0) = 0.5*1 + 0.5*(0/10) = 0.5
-        #            score(rank_1) = 0.5*0 + 0.5*(10/10) = 0.5
-        # Tie broken by rank index: rank_0 has lower index.
-        selected = coordinator.get_best_data_parallel_rank(hashes)
-        assert selected == rank_0
+    def test_balanced_fleet_ignores_load_entirely(self):
+        """Equal load is a zero penalty for everyone, whatever alpha is.
 
-    def test_scoring_tiebreak_by_rank_index(self):
-        """When scores are equal, the rank with lower index is preferred."""
-        coordinator = make_coordinator_direct(prefix_caching_routing_alpha=0.5, max_requests=10)
-        tokens = [1, 2, 3, 4]
-        hashes = coordinator.compute_request_hashes(tokens)
-
+        This is what measuring against the fleet mean buys: the term expresses
+        *imbalance*, so with none it cannot outvote a cache hit.
+        """
+        coordinator = make_coordinator_direct(prefix_caching_routing_alpha=5.0, max_requests=10)
+        hashes = coordinator.compute_request_hashes([1, 2, 3, 4])
         rank_0 = coordinator.identities_of_data_parallel_ranks[0]
         rank_1 = coordinator.identities_of_data_parallel_ranks[1]
-
-        # Both ranks have prefix match and same load.
         _set_hash_rank(coordinator, hashes[0], rank_0, 1)
-        _set_hash_rank(coordinator, hashes[0], rank_1, 1)
-        coordinator._pending_counts[coordinator.identity_to_rank_index[rank_0]] = 5
-        coordinator._pending_counts[coordinator.identity_to_rank_index[rank_1]] = 5
+        for rank in (rank_0, rank_1):
+            coordinator._pending_counts[coordinator.identity_to_rank_index[rank]] = 8
+        assert coordinator.get_best_data_parallel_rank(hashes) == rank_0
 
-        selected = coordinator.get_best_data_parallel_rank(hashes)
-        assert selected == rank_0
-
-    def test_scoring_spreads_load_across_ranks(self):
-        """Scoring function distributes requests when all ranks have prefix match."""
-        coordinator = make_coordinator_direct(
-            data_parallel_size=3, prefix_caching_routing_alpha=0.5, max_requests=10
-        )
-        tokens = [1, 2, 3, 4, 5, 6, 7, 8]
-        hashes = coordinator.compute_request_hashes(tokens)
-
+    def test_deeper_prefix_outscores_a_shallower_one(self):
+        """Depth is graded, not awarded only to the deepest holder."""
+        coordinator = make_coordinator_direct(prefix_caching_routing_alpha=0.0, max_requests=10)
+        hashes = coordinator.compute_request_hashes([1, 2, 3, 4, 5, 6, 7, 8])
+        assert len(hashes) >= 2
         rank_0 = coordinator.identities_of_data_parallel_ranks[0]
         rank_1 = coordinator.identities_of_data_parallel_ranks[1]
-        rank_2 = coordinator.identities_of_data_parallel_ranks[2]
-
-        # All three ranks have both blocks cached.
         for h in hashes:
             _set_hash_rank(coordinator, h, rank_0, 1)
-            _set_hash_rank(coordinator, h, rank_1, 1)
-            _set_hash_rank(coordinator, h, rank_2, 1)
+        _set_hash_rank(coordinator, hashes[0], rank_1, 1)
+        assert coordinator.get_best_data_parallel_rank(hashes) == rank_0
 
-        # Simulate sending 6 requests.
-        assigned_ranks = []
-        for _ in range(6):
-            rank = coordinator.get_best_data_parallel_rank(hashes)
-            coordinator._pending_counts[coordinator.identity_to_rank_index[rank]] += 1
-            assigned_ranks.append(rank)
+    def test_deep_block_without_its_prefix_is_not_credited(self):
+        """Depth counts forward from block 0, so an evicted prefix earns nothing.
 
-        from collections import Counter
-
-        counts = Counter(assigned_ranks)
-        # Each rank should get exactly 2 of the 6 requests.
-        assert counts[rank_0] == 2
-        assert counts[rank_1] == 2
-        assert counts[rank_2] == 2
-
-    def test_scoring_with_no_prefix_match_anywhere(self):
-        """When no rank has a prefix match, load alone determines the winner."""
-        coordinator = make_coordinator_direct(prefix_caching_routing_alpha=0.5, max_requests=10)
-        tokens = [1, 2, 3, 4]
-        hashes = coordinator.compute_request_hashes(tokens)
-
+        The hashes chain, so a later block whose prefix is gone cannot be reused
+        and must not be scored as if it could.
+        """
+        coordinator = make_coordinator_direct(prefix_caching_routing_alpha=0.0, max_requests=10)
+        hashes = coordinator.compute_request_hashes([1, 2, 3, 4, 5, 6, 7, 8])
+        assert len(hashes) >= 2
         rank_0 = coordinator.identities_of_data_parallel_ranks[0]
         rank_1 = coordinator.identities_of_data_parallel_ranks[1]
+        _set_hash_rank(coordinator, hashes[-1], rank_1, 1)
+        coordinator._pending_counts[coordinator.identity_to_rank_index[rank_0]] = 0
+        coordinator._pending_counts[coordinator.identity_to_rank_index[rank_1]] = 3
+        # No genuine hit anywhere, so this falls back to load balancing.
+        assert coordinator.get_best_data_parallel_rank(hashes) == rank_0
 
-        # No prefix matches for either rank.
+    def test_ties_break_towards_the_least_loaded_rank(self):
+        """Equal affinity, so only the tiebreak decides."""
+        coordinator = make_coordinator_direct(prefix_caching_routing_alpha=0.0, max_requests=10)
+        hashes = coordinator.compute_request_hashes([1, 2, 3, 4])
+        rank_0 = coordinator.identities_of_data_parallel_ranks[0]
+        rank_1 = coordinator.identities_of_data_parallel_ranks[1]
+        for rank in (rank_0, rank_1):
+            _set_hash_rank(coordinator, hashes[0], rank, 1)
         coordinator._pending_counts[coordinator.identity_to_rank_index[rank_0]] = 5
-        coordinator._pending_counts[coordinator.identity_to_rank_index[rank_1]] = 2
+        coordinator._pending_counts[coordinator.identity_to_rank_index[rank_1]] = 1
+        assert coordinator.get_best_data_parallel_rank(hashes) == rank_1
 
-        # alpha=0.5: score(rank_0) = 0 + 0.5*(5/10) = 0.25
-        #            score(rank_1) = 0 + 0.5*(8/10) = 0.4
-        selected = coordinator.get_best_data_parallel_rank(hashes)
-        assert selected == rank_1
+
+class TestPrefixCacheTTL:
+    """Entries the coordinator has not routed for the TTL stop counting as hits.
+
+    The coordinator only ever observes blocks being routed, never blocks being
+    evicted, so without expiry its view of each engine's cache is monotonically
+    optimistic and it keeps routing for prefixes that are long gone.
+    """
+
+    def _coord(self, ttl=300.0):
+        coordinator = make_coordinator_direct(
+            prefix_caching_routing_alpha=0.0, prefix_cache_ttl_seconds=ttl
+        )
+        coordinator.request_id_to_hashes = {}
+        return coordinator
+
+    def test_untouched_entries_are_dropped_after_the_ttl(self, monkeypatch):
+        coordinator = self._coord(ttl=300.0)
+        rank_0 = coordinator.identities_of_data_parallel_ranks[0]
+        hashes = coordinator.compute_request_hashes([1, 2, 3, 4])
+
+        monkeypatch.setattr(time, "monotonic", lambda: 1000.0)
+        coordinator._update_rank_hashes(rank_0, hashes)
+        assert hashes[0] in coordinator._hash_table
+
+        # Still inside the TTL: another request touching different blocks must not
+        # evict this one.
+        monkeypatch.setattr(time, "monotonic", lambda: 1200.0)
+        coordinator._update_rank_hashes(rank_0, coordinator.compute_request_hashes([9, 9, 9, 9]))
+        assert hashes[0] in coordinator._hash_table
+
+        # Past it now.
+        monkeypatch.setattr(time, "monotonic", lambda: 1400.0)
+        coordinator._update_rank_hashes(rank_0, coordinator.compute_request_hashes([8, 8, 8, 8]))
+        assert hashes[0] not in coordinator._hash_table
+
+    def test_rerouting_a_block_refreshes_it(self, monkeypatch):
+        """A block still in use must survive its original queue entry."""
+        coordinator = self._coord(ttl=300.0)
+        rank_0 = coordinator.identities_of_data_parallel_ranks[0]
+        hashes = coordinator.compute_request_hashes([1, 2, 3, 4])
+
+        monkeypatch.setattr(time, "monotonic", lambda: 1000.0)
+        coordinator._update_rank_hashes(rank_0, hashes)
+        monkeypatch.setattr(time, "monotonic", lambda: 1250.0)
+        coordinator._update_rank_hashes(rank_0, hashes)
+
+        # The 1000.0 queue entry expires here, but the block was re-routed at
+        # 1250.0 and carries the newer timestamp, so it is left alone.
+        monkeypatch.setattr(time, "monotonic", lambda: 1400.0)
+        coordinator._update_rank_hashes(rank_0, coordinator.compute_request_hashes([7, 7, 7, 7]))
+        assert hashes[0] in coordinator._hash_table
+
+    def test_expired_entries_stop_winning_routing(self, monkeypatch):
+        """The point of expiring: a cold rank must stop attracting requests."""
+        coordinator = self._coord(ttl=300.0)
+        rank_0 = coordinator.identities_of_data_parallel_ranks[0]
+        rank_1 = coordinator.identities_of_data_parallel_ranks[1]
+        hashes = coordinator.compute_request_hashes([1, 2, 3, 4])
+
+        monkeypatch.setattr(time, "monotonic", lambda: 1000.0)
+        coordinator._update_rank_hashes(rank_0, hashes)
+        coordinator._pending_counts[coordinator.identity_to_rank_index[rank_0]] = 2
+        coordinator._pending_counts[coordinator.identity_to_rank_index[rank_1]] = 0
+        assert coordinator.get_best_data_parallel_rank(hashes) == rank_0
+
+        monkeypatch.setattr(time, "monotonic", lambda: 1400.0)
+        coordinator._update_rank_hashes(rank_1, coordinator.compute_request_hashes([5, 5, 5, 5]))
+        # rank_0's claim has aged out, so this falls back to load balancing.
+        assert coordinator.get_best_data_parallel_rank(hashes) == rank_1
+
+    def test_expiry_survives_an_engine_being_removed(self, monkeypatch):
+        """Removing an engine renumbers ranks; queued expiry must not follow stale indices.
+
+        The queue is keyed on the hash rather than the rank index for exactly this
+        reason: after a renumber, an index queued earlier names a different rank.
+        """
+        coordinator = self._coord(ttl=300.0)
+        rank_0 = coordinator.identities_of_data_parallel_ranks[0]
+        rank_1 = coordinator.identities_of_data_parallel_ranks[1]
+        kept = coordinator.compute_request_hashes([1, 2, 3, 4])
+
+        monkeypatch.setattr(time, "monotonic", lambda: 1000.0)
+        coordinator._update_rank_hashes(rank_0, kept)
+        monkeypatch.setattr(time, "monotonic", lambda: 1100.0)
+        coordinator._update_rank_hashes(rank_1, kept)
+
+        coordinator._remove_engine(rank_0)
+
+        # rank_1's entry, now at a shifted index, must still be here and must not
+        # be evicted by the queue entry that was made for rank_0.
+        monkeypatch.setattr(time, "monotonic", lambda: 1350.0)
+        coordinator._update_rank_hashes(rank_1, coordinator.compute_request_hashes([6, 6, 6, 6]))
+        assert kept[0] in coordinator._hash_table
+
+
+class TestMalformedSubmissionsAreDropped:
+    """A badly framed submission must cost its sender, not the coordinator.
+
+    The event loop serves every rank and every client, so an exception raised out
+    of a handler takes the whole coordinator down with it.
+    """
+
+    def _coordinator(self):
+        coordinator = make_coordinator_direct(data_parallel_size=2)
+        coordinator.known_clients = {b"client-A"}
+        coordinator.next_request_id = 0
+        coordinator.request_id_to_client_id = {}
+        coordinator.request_id_to_client_request_id = {}
+        coordinator.client_request_to_request_id = {}
+        coordinator.request_id_to_rank = {}
+        coordinator.schedule_records = None
+        coordinator.router_socket = MagicMock()
+        return coordinator
+
+    def test_submission_missing_the_hash_frame_is_dropped(self):
+        """Two frames was the old wire format; it must not raise IndexError."""
+        coordinator = self._coordinator()
+        metadata = [Headers.SUBMIT_REQUEST.value, 7, {"temperature": 1.0}, None]
+        handle_submit_request(coordinator, b"client-A", metadata, [b"\xc0"])
+        coordinator.router_socket.send_multipart.assert_not_called()
+        assert coordinator.next_request_id == 0
+
+    def test_submission_missing_the_media_frame_is_dropped(self):
+        """Three frames was the previous wire format; it must not raise either."""
+        coordinator = self._coordinator()
+        metadata = [Headers.SUBMIT_REQUEST.value, 7, {"temperature": 1.0}, None]
+        handle_submit_request(coordinator, b"client-A", metadata, [b"\xc0", b"\xc0"])
+        coordinator.router_socket.send_multipart.assert_not_called()
+        assert coordinator.next_request_id == 0
+
+    def test_submission_with_short_metadata_is_dropped(self):
+        """Too few metadata fields must not raise a ValueError on unpack."""
+        coordinator = self._coordinator()
+        metadata = [Headers.SUBMIT_REQUEST.value, 7, {"temperature": 1.0}]
+        handle_submit_request(coordinator, b"client-A", metadata, [b"\xc0", b"\xc0", b"\xc0"])
+        coordinator.router_socket.send_multipart.assert_not_called()
+        assert coordinator.next_request_id == 0
+
+
+class TestEngineReplyDetokenization:
+    """The coordinator detokenizes a reply only when its client asked it to."""
+
+    def _coordinator(self):
+        coordinator = make_coordinator_direct(data_parallel_size=2)
+        coordinator.request_id_to_client_id = {5: b"client-A"}
+        coordinator.request_id_to_client_request_id = {5: 55}
+        coordinator.client_request_to_request_id = {(b"client-A", 55): 5}
+        coordinator.request_id_to_rank = {}
+        coordinator.identities_of_data_parallel_ranks = deque([b"rank_0"])
+        coordinator._pending_counts = np.zeros(1, dtype=np.int32)
+        coordinator.identity_to_rank_index = {b"rank_0": 0}
+        coordinator.router_socket = MagicMock()
+        coordinator.detokenize = MagicMock()
+        return coordinator
+
+    def test_detokenizes_when_the_client_asked(self):
+        coordinator = self._coordinator()
+        metadata = [Headers.ENGINE_REPLY.value, [[5, True]]]
+        body = msgpack.packb({"request_id": 5}, use_bin_type=True)
+        handle_engine_reply(coordinator, b"rank_0", metadata, [body])
+        coordinator.detokenize.assert_called_once()
+
+    def test_forwards_the_body_untouched_when_it_did_not(self):
+        """The opt-out is the whole point: the body is never decoded."""
+        coordinator = self._coordinator()
+        metadata = [Headers.ENGINE_REPLY.value, [[5, False]]]
+        body = msgpack.packb({"request_id": 5}, use_bin_type=True)
+        handle_engine_reply(coordinator, b"rank_0", metadata, [body])
+        coordinator.detokenize.assert_not_called()
+        sent = coordinator.router_socket.send_multipart.call_args.args[0]
+        assert body in sent, "an un-detokenized body must be forwarded verbatim"

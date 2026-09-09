@@ -302,6 +302,7 @@ class Attention(MegatronModule, ABC):
         cp_comm_type: str | None = None,
         pg_collection: ProcessGroupCollection | None = None,
         pp_layer_offset: Optional[int] = None,
+        is_mtp_layer: bool = False,
         name: str | None = None,
     ):
         """
@@ -313,6 +314,7 @@ class Attention(MegatronModule, ABC):
         self.config = config
         self.layer_number = layer_number
         self._pp_layer_offset = pp_layer_offset
+        self.is_mtp_layer = is_mtp_layer
 
         self.attn_mask_type = attn_mask_type
         self.attention_type = attention_type
@@ -342,6 +344,9 @@ class Attention(MegatronModule, ABC):
                 pg_collection, 'cp'
             ), "Attention pg_collection must have cp process group"
         self.pg_collection = pg_collection
+        # Build-time CP group, kept so runtime (hybrid/dynamic) CP can restore
+        # it on microbatches that carry no per-microbatch CP group.
+        self._build_time_cp_group = pg_collection.cp
         self.tp_group = pg_collection.tp
 
         # Per attention head and per partition values
@@ -1554,6 +1559,20 @@ class Attention(MegatronModule, ABC):
                 cu_seqlens_q = cu_seqlens_kv = None
                 rope_freqs_max_seqlen = None
 
+            # Hybrid/dynamic CP: bind the sub-sample's runtime CP group
+            # (packed_seq_params.cp_group) on the process-group collection so
+            # RoPE below — and any other CP consumer in this forward — uses
+            # the group this microbatch was actually sharded with. The fused
+            # THD RoPE kernel takes the full cu_seqlens plus (cp_size,
+            # cp_rank) to locate this rank's zigzag slice, and the build-time
+            # group reports cp_size=1. Restore the build-time group when no
+            # runtime group is bound (e.g. local_cp_size == 1 sub-samples):
+            # the previous microbatch may have left a larger group behind.
+            if packed_seq_params is not None and packed_seq_params.cp_group is not None:
+                self.pg_collection.cp = packed_seq_params.cp_group
+            elif self.pg_collection.cp is not self._build_time_cp_group:
+                self.pg_collection.cp = self._build_time_cp_group
+
             if split_qkv:
                 if q_pos_emb is not None:
                     # TODO VIJAY: simplify
@@ -1721,6 +1740,7 @@ class SelfAttention(Attention):
         cp_comm_type: str | None = None,
         pg_collection: ProcessGroupCollection | None = None,
         pp_layer_offset: Optional[int] = None,
+        is_mtp_layer: bool = False,
         name: str | None = None,
     ):
         """
@@ -1736,6 +1756,7 @@ class SelfAttention(Attention):
             cp_comm_type=cp_comm_type,
             pg_collection=pg_collection,
             pp_layer_offset=pp_layer_offset,
+            is_mtp_layer=is_mtp_layer,
             name=name,
         )
 
@@ -2138,6 +2159,7 @@ class CrossAttention(Attention):
         attn_mask_type: AttnMaskType = AttnMaskType.padding,
         cp_comm_type: str | None = None,
         pg_collection: ProcessGroupCollection | None = None,
+        is_mtp_layer: bool = False,
         name: str | None = None,
     ):
         """
@@ -2152,6 +2174,7 @@ class CrossAttention(Attention):
             attention_type="cross",
             cp_comm_type=cp_comm_type,
             pg_collection=pg_collection,
+            is_mtp_layer=is_mtp_layer,
             name=name,
         )
 
