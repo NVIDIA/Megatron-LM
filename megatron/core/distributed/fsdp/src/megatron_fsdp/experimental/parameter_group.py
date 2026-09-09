@@ -84,7 +84,8 @@ class FsdpParameterGroup:
     requires_grad: bool
     main_weight: DBuffer
     model_weight: DBuffer
-    # Optimizer-layout view into model_weight storage, avoiding a second allocation.
+    # Compute-weight representation in the optimizer's placements. Ordinary
+    # DBuffers view model_weight storage; MXFP8 DBuffers own an independent TE wrapper.
     post_optimizer_model_weight: DBuffer
     # sync_model_weight_from_main_weight() updates only this rank's optimizer-layout
     # view; the remaining model_weight slices must be all-gathered before compute.
@@ -112,6 +113,7 @@ class FsdpParameterGroup:
         mixed_precision_policy: MixedPrecisionPolicy,
         grad_divisor: int = 1,
         use_symmetric_memory: bool = False,
+        is_mxfp8: bool = False,
     ) -> None:
         """Create persistent sharded buffers for a group of parameters.
 
@@ -178,7 +180,37 @@ class FsdpParameterGroup:
         else:
             self._symm_mem_pool = None
 
-        if main_weight_dtype == self.dtype and main_weight_placements == model_weight_placements:
+        if is_mxfp8:
+            self.model_weight = DBuffer(
+                mesh=self.mesh,
+                placements=model_weight_placements,
+                tensor_shapes=tensor_shapes,
+                dtype=torch.uint8,
+                device=self.main_weight.device,
+                block_size=block_size,
+            )
+            self.post_optimizer_model_weight = DBuffer(
+                mesh=self.mesh,
+                placements=main_weight_placements,
+                tensor_shapes=tensor_shapes,
+                dtype=torch.uint8,
+                device=self.main_weight.device,
+                block_size=block_size,
+            )
+            self.post_optimizer_model_weight.sync_from_main(self.main_weight)
+            self.post_optimizer_model_weight.redistribute(
+                model_weight_placements, out=self.model_weight
+            )
+            self._model_weight_is_stale = False
+            self._unsharded_model_weight = DBuffer(
+                mesh=self.mesh,
+                placements=[Replicate()] * self.mesh.ndim,
+                tensor_shapes=tensor_shapes,
+                dtype=torch.uint8,
+                device=self.main_weight.device,
+                block_size=block_size,
+            )
+        elif main_weight_dtype == self.dtype and main_weight_placements == model_weight_placements:
             self.model_weight = self.main_weight
         else:
             # Keep the configured compute-weight layout alive for the lifetime of this
@@ -194,22 +226,23 @@ class FsdpParameterGroup:
                     device=self.main_weight.device,
                     block_size=block_size,
                 )
-        self.post_optimizer_model_weight = self.model_weight.view(main_weight_placements)
-        # Cast into the preallocated optimizer-layout view on the current stream.
-        self.main_weight.cast(self.model_weight.dtype, out=self.post_optimizer_model_weight)
-        self._model_weight_is_stale = (
-            self.post_optimizer_model_weight.placements != self.model_weight.placements
-        )
-
-        with self._symmetric_memory_context():
-            self._unsharded_model_weight = DBuffer(
-                mesh=self.mesh,
-                placements=[Replicate()] * self.mesh.ndim,
-                tensor_shapes=tensor_shapes,
-                dtype=self.dtype,
-                device=self.main_weight.device,
-                block_size=block_size,
+        if not is_mxfp8:
+            self.post_optimizer_model_weight = self.model_weight.view(main_weight_placements)
+            # Cast into the preallocated optimizer-layout view on the current stream.
+            self.main_weight.cast(self.model_weight.dtype, out=self.post_optimizer_model_weight)
+            self._model_weight_is_stale = (
+                self.post_optimizer_model_weight.placements != self.model_weight.placements
             )
+
+            with self._symmetric_memory_context():
+                self._unsharded_model_weight = DBuffer(
+                    mesh=self.mesh,
+                    placements=[Replicate()] * self.mesh.ndim,
+                    tensor_shapes=tensor_shapes,
+                    dtype=self.dtype,
+                    device=self.main_weight.device,
+                    block_size=block_size,
+                )
 
         self.main_grad = None
         self.pre_optimizer_main_grad = None
@@ -237,19 +270,7 @@ class FsdpParameterGroup:
         fsdp_parameters: list[FsdpParameter] = []
         main_grad_dtype = self.main_grad.dtype if self.main_grad is not None else None
         for index, (parameter, fqns) in enumerate(parameter_to_fqns.items()):
-            unsharded_tensor = self._unsharded_model_weight.get_local_tensor(index)
-            if parameter.is_meta:
-                # A meta Parameter cannot set .data to a real tensor because their
-                # TensorImpl types are incompatible, so swap in a materialized Parameter.
-                # This may be problematic if attributes from the original Parameter need
-                # to be copied to the unsharded Parameter.
-                materialized_parameter = nn.Parameter(
-                    unsharded_tensor, requires_grad=parameter.requires_grad
-                )
-                torch.utils.swap_tensors(parameter, materialized_parameter)
-            else:
-                parameter.data = unsharded_tensor
-                parameter.grad = None
+            self._unsharded_model_weight.initialize_unsharded_parameter(parameter, index)
             # Parameter-owned markers must not retain their FSDP module tree.
             setattr(parameter, _CONTAINING_PARAMETER_GROUP_ATTR, ref(self))
 
@@ -290,7 +311,7 @@ class FsdpParameterGroup:
 
     def sync_model_weight_from_main_weight(self) -> None:
         """Refresh compute weights from optimizer weights."""
-        self.main_weight.cast(self.model_weight.dtype, out=self.post_optimizer_model_weight)
+        self.post_optimizer_model_weight.sync_from_main(self.main_weight)
         self._model_weight_is_stale = (
             self.post_optimizer_model_weight.placements != self.model_weight.placements
         )
@@ -302,25 +323,13 @@ class FsdpParameterGroup:
                 self.model_weight.placements, out=self.model_weight
             )
             self._model_weight_is_stale = False
-        if self.model_weight.placements == self._unsharded_model_weight.placements:
-            unsharded_model_weight = self.model_weight
-        else:
-            with self._symmetric_memory_context():
-                self._unsharded_model_weight.reallocate_storage()
-            # This buffer backs unsharded Parameters whose views may be saved by autograd.
-            # Autograd records a tensor's version counter when saving it for backward, and
-            # in-place writes like the out= redistribution below increment that counter even
-            # under no_grad. Without preserving it, backward can fail with "modified by an
-            # inplace operation" even though FSDP only materialized internal storage.
-            with torch.autograd._unsafe_preserve_version_counter(
-                self._unsharded_model_weight.local_buffer
-            ):
-                self.model_weight.redistribute(
-                    self._unsharded_model_weight.placements, out=self._unsharded_model_weight
-                )
-            unsharded_model_weight = self._unsharded_model_weight
-        for index, fsdp_parameter in enumerate(self.fsdp_parameters):
-            fsdp_parameter.unsharded.data = unsharded_model_weight.get_local_tensor(index)
+        with self._symmetric_memory_context():
+            unsharded_model_weight = self._unsharded_model_weight.materialize_unsharded_from(
+                self.model_weight
+            )
+        unsharded_model_weight.install_unsharded_parameter_views(
+            fsdp_parameter.unsharded for fsdp_parameter in self.fsdp_parameters
+        )
         self._switch_to_unsharded_parameters()
 
     def reshard_parameters(self) -> None:
@@ -402,7 +411,7 @@ class FsdpParameterGroup:
             # optimizer view. Clear the persistent full accumulation buffer before this
             # new step; set_to_none=True needs no clear because out= below overwrites it.
             if has_sharded_grads:
-                self.main_grad.local_buffer.zero_()
+                self.main_grad.local_tensor.zero_()
             self._main_grad_is_stale = False
 
         if can_reduce_into_main_grad := (
@@ -416,13 +425,13 @@ class FsdpParameterGroup:
         # Scale this backward's contribution before accumulating it so repeated
         # backwards do not repeatedly scale the running total.
         if self.grad_divisor != 1:
-            reduced_grad.local_buffer.div_(self.grad_divisor)
+            reduced_grad.local_tensor.div_(self.grad_divisor)
 
         if reduced_grad is not self.main_grad:
             if has_sharded_grads:
-                self.main_grad.local_buffer.add_(reduced_grad.local_buffer)
+                self.main_grad.local_tensor.add_(reduced_grad.local_tensor)
             else:
-                self.main_grad.local_buffer.copy_(reduced_grad.local_buffer)
+                self.main_grad.local_tensor.copy_(reduced_grad.local_tensor)
 
         def install_sharded_grads(main_grad: DBuffer) -> None:
             for index, fsdp_parameter in enumerate(self.fsdp_parameters):

@@ -11,11 +11,18 @@ import torch.distributed._symmetric_memory as symm_mem
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import Partial, Replicate, Shard
 
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
+    Placements,
+    fully_shard,
+    fully_shard_context,
+    fully_shard_optimizer,
+)
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.dbuffer import DBuffer
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.placement import (
     BlockAtomic,
     Flat,
 )
+from megatron.core.distributed.fsdp.src.megatron_fsdp.mixed_precision import MixedPrecisionPolicy
 
 
 def _same_tensors_on_all_ranks(device: torch.device) -> list[torch.Tensor]:
@@ -133,7 +140,7 @@ def test_compute_layout_fills_lcm_padding_gaps(distributed_setup):
         assert buffer.get_dtensor(index).shape == shapes[index]
 
 
-def test_constructor_allocates_local_buffer(distributed_setup):
+def test_constructor_allocates_tensor(distributed_setup):
     """DBuffer allocates local storage from shape, mesh, placement, dtype, and device."""
     mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
     tensor_shapes = [torch.Size((7, 3)), torch.Size((2, 5)), torch.Size((7,))]
@@ -159,14 +166,14 @@ def test_constructor_allocates_local_buffer(distributed_setup):
     assert replicated_buffer.offset == 0
     expected_sharded_local_numel = replicated_buffer.layout.size // distributed_setup.world_size
     assert sharded_buffer.offset == distributed_setup.rank * expected_sharded_local_numel
-    assert replicated_buffer.local_buffer.numel() == replicated_buffer.layout.size
+    assert replicated_buffer.local_tensor.numel() == replicated_buffer.layout.size
     assert (
-        sharded_buffer.local_buffer.numel()
+        sharded_buffer.local_tensor.numel()
         == replicated_buffer.layout.size // distributed_setup.world_size
     )
     assert sharded_buffer.layout.size % (15 * mesh_size) == 0
     assert replicated_buffer.dtype == torch.float32
-    assert sharded_buffer.local_buffer.device == distributed_setup.device
+    assert sharded_buffer.local_tensor.device == distributed_setup.device
 
 
 def test_cast_to_same_dtype_returns_self(distributed_setup):
@@ -209,12 +216,12 @@ def test_cast_with_out_reuses_destination_and_casts_values(distributed_setup):
         dtype=torch.bfloat16,
         device=distributed_setup.device,
     )
-    destination_data_ptr = destination.local_buffer.data_ptr()
+    destination_data_ptr = destination.local_tensor.data_ptr()
 
     result = buffer.cast(torch.bfloat16, out=destination)
 
     assert result is destination
-    assert destination.local_buffer.data_ptr() == destination_data_ptr
+    assert destination.local_tensor.data_ptr() == destination_data_ptr
     _assert_dbuffer_local_tensors_close(
         destination, [tensor.to(dtype=torch.bfloat16) for tensor in tensors]
     )
@@ -233,14 +240,14 @@ def test_release_and_reallocate_storage_preserves_buffer_views(distributed_setup
     tensor_view = buffer.get_local_tensor(0)
 
     buffer.release_storage()
-    assert buffer.local_buffer.untyped_storage().nbytes() == 0
+    assert buffer.local_tensor.untyped_storage().nbytes() == 0
 
     buffer.reallocate_storage()
     assert (
-        buffer.local_buffer.untyped_storage().nbytes()
-        == buffer.local_buffer.numel() * buffer.local_buffer.element_size()
+        buffer.local_tensor.untyped_storage().nbytes()
+        == buffer.local_tensor.numel() * buffer.local_tensor.element_size()
     )
-    buffer.local_buffer.fill_(7.0)
+    buffer.local_tensor.fill_(7.0)
     torch.testing.assert_close(tensor_view, torch.full_like(tensor_view, 7.0))
 
 
@@ -251,14 +258,14 @@ def test_from_local_reuses_required_local_buffer(distributed_setup):
     replicated_buffer = DBuffer.distribute_tensors(tensors, mesh, [Replicate()])
     local_numel = replicated_buffer.layout.size // distributed_setup.world_size
     offset = distributed_setup.rank * local_numel
-    local_buffer = replicated_buffer.local_buffer.narrow(0, offset, local_numel)
+    local_buffer = replicated_buffer.local_tensor.narrow(0, offset, local_numel)
 
     sharded_buffer = DBuffer.from_local(local_buffer, mesh, [Flat()], replicated_buffer.layout)
 
     assert sharded_buffer.placements == (Flat(),)
     assert sharded_buffer.layout == replicated_buffer.layout
     assert sharded_buffer.offset == offset
-    assert sharded_buffer.local_buffer.data_ptr() == local_buffer.data_ptr()
+    assert sharded_buffer.local_tensor.data_ptr() == local_buffer.data_ptr()
     _assert_dbuffer_local_tensors_close(sharded_buffer.allgather(0), tensors)
 
 
@@ -295,7 +302,7 @@ def test_distribute_tensors_moves_inputs_to_mesh_device(distributed_setup):
 
     buffer = DBuffer.distribute_tensors(tensors, mesh, [Replicate()])
 
-    assert buffer.local_buffer.device == distributed_setup.device
+    assert buffer.local_tensor.device == distributed_setup.device
     _assert_dbuffer_local_tensors_close(
         buffer, [tensor.to(distributed_setup.device) for tensor in tensors]
     )
@@ -312,7 +319,7 @@ def test_distribute_tensors_detaches_and_contiguizes_inputs(distributed_setup):
 
     assert not parameter.is_contiguous()
     assert buffer.get_local_tensor(0).is_contiguous()
-    assert not buffer.local_buffer.requires_grad
+    assert not buffer.local_tensor.requires_grad
     torch.testing.assert_close(
         buffer.get_local_tensor(0), parameter.detach().contiguous(), rtol=0, atol=0
     )
@@ -346,14 +353,14 @@ def test_sharded_allgather_into_existing_buffer(distributed_setup):
         placements=[Replicate()],
         tensor_shapes=sharded_buffer.layout.tensor_shapes,
         dtype=sharded_buffer.dtype,
-        device=sharded_buffer.local_buffer.device,
+        device=sharded_buffer.local_tensor.device,
     )
-    destination_data_ptr = destination.local_buffer.data_ptr()
+    destination_data_ptr = destination.local_tensor.data_ptr()
 
     result = sharded_buffer.allgather(0, out=destination)
 
     assert result is destination
-    assert destination.local_buffer.data_ptr() == destination_data_ptr
+    assert destination.local_tensor.data_ptr() == destination_data_ptr
     _assert_dbuffer_local_tensors_close(destination, tensors)
 
 
@@ -369,7 +376,7 @@ def test_replicate_view_round_trip(distributed_setup):
         placements=[Flat()],
         tensor_shapes=replicated_buffer.layout.tensor_shapes,
         dtype=replicated_buffer.dtype,
-        device=replicated_buffer.local_buffer.device,
+        device=replicated_buffer.local_tensor.device,
     )
     redistributed_sharded_buffer = replicated_buffer.redistribute(
         [Flat()], out=redistribute_destination
@@ -381,11 +388,11 @@ def test_replicate_view_round_trip(distributed_setup):
     expected_sharded_local_numel = replicated_buffer.layout.size // distributed_setup.world_size
     assert sharded_buffer.offset == distributed_setup.rank * expected_sharded_local_numel
     assert (
-        sharded_buffer.local_buffer.untyped_storage()
-        is replicated_buffer.local_buffer.untyped_storage()
+        sharded_buffer.local_tensor.untyped_storage()
+        is replicated_buffer.local_tensor.untyped_storage()
     )
     torch.testing.assert_close(
-        sharded_buffer.local_buffer, redistributed_sharded_buffer.local_buffer, rtol=0, atol=0
+        sharded_buffer.local_tensor, redistributed_sharded_buffer.local_tensor, rtol=0, atol=0
     )
     _assert_dbuffer_local_tensors_close(sharded_buffer.allgather(0), tensors)
 
@@ -408,7 +415,7 @@ def test_partial_allreduce(distributed_setup):
         torch.full((5, 3), scale_sum, dtype=torch.float32, device=distributed_setup.device),
         torch.full((4,), scale_sum * 10, dtype=torch.float32, device=distributed_setup.device),
     ]
-    assert replicated_buffer.local_buffer.data_ptr() == partial_buffer.local_buffer.data_ptr()
+    assert replicated_buffer.local_tensor.data_ptr() == partial_buffer.local_tensor.data_ptr()
     _assert_dbuffer_local_tensors_close(replicated_buffer, expected)
 
 
@@ -427,7 +434,7 @@ def test_partial_allreduce_average(distributed_setup):
         placements=[Replicate()],
         tensor_shapes=partial_buffer.layout.tensor_shapes,
         dtype=partial_buffer.dtype,
-        device=partial_buffer.local_buffer.device,
+        device=partial_buffer.local_tensor.device,
     )
     replicated_buffer = partial_buffer.allreduce(0, out=destination)
 
@@ -459,8 +466,8 @@ def test_partial_reduce_scatter_to_flat(distributed_setup):
     assert sharded_buffer.placements == (Flat(),)
     assert sharded_buffer.layout == layout
     assert (
-        sharded_buffer.local_buffer.untyped_storage()
-        is partial_buffer.local_buffer.untyped_storage()
+        sharded_buffer.local_tensor.untyped_storage()
+        is partial_buffer.local_tensor.untyped_storage()
     )
     assert replicated_buffer.layout == layout
     scale_sum = float(distributed_setup.world_size * (distributed_setup.world_size + 1) // 2)
@@ -527,7 +534,7 @@ def test_symmetric_memory_partial_reduce_scatter_to_flat_average(distributed_set
     pool = symm_mem.get_mem_pool(device)
     with torch.cuda.use_mem_pool(pool):
         partial_buffer = DBuffer.distribute_tensors(tensors, mesh, [Partial("avg")])
-    assert symm_mem.is_symm_mem_tensor(partial_buffer.local_buffer)
+    assert symm_mem.is_symm_mem_tensor(partial_buffer.local_tensor)
 
     sharded_buffer = partial_buffer.reduce_scatter(0, Flat())
     replicated_buffer = sharded_buffer.allgather(0)
@@ -553,7 +560,7 @@ def test_symmetric_memory_partial_reduce_scatter_to_flat_sum(distributed_setup):
     pool = symm_mem.get_mem_pool(device)
     with torch.cuda.use_mem_pool(pool):
         partial_buffer = DBuffer.distribute_tensors(tensors, mesh, [Partial("sum")])
-    assert symm_mem.is_symm_mem_tensor(partial_buffer.local_buffer)
+    assert symm_mem.is_symm_mem_tensor(partial_buffer.local_tensor)
 
     sharded_buffer = partial_buffer.reduce_scatter(0, Flat())
     replicated_buffer = sharded_buffer.allgather(0)
@@ -642,7 +649,7 @@ def test_2d_mesh_shards_across_all_ranks(distributed_setup):
     )
     assert fully_sharded_buffer.offset == expected_offset
     assert (
-        fully_sharded_buffer.local_buffer.numel() == fully_sharded_buffer.layout.size // mesh.size()
+        fully_sharded_buffer.local_tensor.numel() == fully_sharded_buffer.layout.size // mesh.size()
     )
     for index, _ in enumerate(tensors):
         assert fully_sharded_buffer.get_local_tensor(index).is_contiguous()
@@ -677,8 +684,8 @@ def test_2d_mesh_partial_flat_reduce_scatter_to_flat_flat(distributed_setup):
     )
     assert fully_sharded_buffer.offset == expected_offset
     assert (
-        fully_sharded_buffer.local_buffer.numel()
-        == partial_sharded_buffer.local_buffer.numel() // 2
+        fully_sharded_buffer.local_tensor.numel()
+        == partial_sharded_buffer.local_tensor.numel() // 2
     )
 
     outer_scale_sum = float(mesh.size(0) * (mesh.size(0) + 1) // 2)
@@ -716,7 +723,78 @@ def test_2d_mesh_replicate_flat_view_to_flat_flat(distributed_setup):
     )
     assert fully_sharded_buffer.offset == expected_offset
     assert (
-        fully_sharded_buffer.local_buffer.numel()
-        == replicated_sharded_buffer.local_buffer.numel() // 2
+        fully_sharded_buffer.local_tensor.numel()
+        == replicated_sharded_buffer.local_tensor.numel() // 2
     )
     _assert_dbuffer_local_tensors_close(replicated_buffer, tensors)
+
+
+def test_mxfp8_linear_training_step_uses_dbuffer(distributed_setup):
+    """Two TE MXFP8 Linear weights share packed DBuffer-owned storage on two ranks."""
+    te = pytest.importorskip("transformer_engine")
+    if distributed_setup.world_size != 2:
+        pytest.skip("MXFP8 DBuffer coverage requires exactly two ranks.")
+    if torch.cuda.get_device_capability(distributed_setup.device)[0] < 10:
+        pytest.skip("MXFP8 requires Blackwell-or-newer CUDA hardware.")
+
+    recipe = te.common.recipe.MXFP8BlockScaling(fp8_format=te.common.recipe.Format.HYBRID)
+    with te.pytorch.quantized_model_init(recipe=recipe, preserve_high_precision_init_val=True):
+        linear = torch.nn.Sequential(
+            te.pytorch.Linear(
+                256, 256, bias=False, params_dtype=torch.bfloat16, device=distributed_setup.device
+            ),
+            te.pytorch.Linear(
+                256, 512, bias=False, params_dtype=torch.bfloat16, device=distributed_setup.device
+            ),
+        )
+    original_rowwise_data = linear[0].weight._rowwise_data
+
+    mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
+    placements = Placements(
+        dp_axes=[0], parameter=[Replicate()], gradient=[Shard(0)], optimizer=[Shard(0)]
+    )
+    with fully_shard_context(device=distributed_setup.device):
+        fully_shard(
+            linear,
+            mesh=mesh,
+            placements=placements,
+            mixed_precision_policy=MixedPrecisionPolicy(main_params_dtype=torch.float32),
+        )
+
+    parameter_group = linear.parameter_groups[0]
+    assert parameter_group.model_weight.is_mxfp8
+    assert parameter_group.model_weight.dtype is torch.uint8
+    assert parameter_group.dtype is torch.bfloat16
+    assert len(parameter_group.fsdp_parameters) == 2
+    assert [parameter_group.model_weight.get_local_tensor(index).shape for index in range(2)] == [
+        (256, 256),
+        (512, 256),
+    ]
+    assert parameter_group.post_optimizer_model_weight is not parameter_group.model_weight
+    assert sum(
+        parameter_group.post_optimizer_model_weight.get_local_tensor(index).numel()
+        for index in range(2)
+    ) == (256 * 256) + (128 * 256)
+    assert parameter_group._unsharded_model_weight.is_mxfp8
+    assert [
+        parameter_group._unsharded_model_weight.get_local_tensor(index).shape for index in range(2)
+    ] == [(256, 256), (512, 256)]
+    unsharded_parameter = parameter_group.fsdp_parameters[0].unsharded
+    assert unsharded_parameter._rowwise_data.data_ptr() == (
+        parameter_group._unsharded_model_weight.get_local_tensor(0)._rowwise_data.data_ptr()
+    )
+    assert unsharded_parameter._rowwise_data.data_ptr() != original_rowwise_data.data_ptr()
+
+    optimizer = torch.optim.SGD(linear.parameters(), lr=0.1)
+    fully_shard_optimizer(optimizer)
+    main_weight_before = parameter_group.main_weight.local_tensor.detach().clone()
+
+    x = torch.randn(32, 256, dtype=torch.bfloat16, device=distributed_setup.device)
+    optimizer.zero_grad(set_to_none=True)
+    with te.pytorch.autocast(recipe=recipe):
+        loss = linear(x).float().square().mean()
+    loss.backward()
+    optimizer.step()
+
+    assert torch.isfinite(loss)
+    assert not torch.equal(main_weight_before, parameter_group.main_weight.local_tensor)
