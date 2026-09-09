@@ -102,7 +102,7 @@ class FsdpParameterGroup:
     def __init__(
         self,
         owning_module: nn.Module,
-        parameters: dict[str, nn.Parameter],
+        fqn_to_parameter: dict[str, nn.Parameter],
         mesh: DeviceMesh,
         model_weight_placements: tuple[Placement, ...],
         main_grad_placements: tuple[Placement, ...],
@@ -115,7 +115,7 @@ class FsdpParameterGroup:
 
         Args:
             owning_module: Closest FSDP root module that owns this parameter group.
-            parameters: Root-module-relative FQNs and their parameters.
+            fqn_to_parameter: Root-module-relative FQNs and their parameters.
             mesh: Parent device mesh containing the data-parallel axes.
             model_weight_placements: Compute-weight buffer placements.
             main_grad_placements: Main-gradient buffer placements.
@@ -127,7 +127,7 @@ class FsdpParameterGroup:
                 averaging. See ``fully_shard``.
         """
         parameter_to_fqns, self.dtype, self.requires_grad = self._collect_parameter_metadata(
-            parameters
+            fqn_to_parameter
         )
         self._owning_module = ref(owning_module)
         self.mesh = mesh
@@ -151,13 +151,13 @@ class FsdpParameterGroup:
 
     @staticmethod
     def _collect_parameter_metadata(
-        parameters: dict[str, nn.Parameter],
+        fqn_to_parameter: dict[str, nn.Parameter],
     ) -> tuple[dict[nn.Parameter, list[str]], torch.dtype, bool]:
         """Group tied parameters and validate their shared metadata."""
-        if not parameters:
+        if not fqn_to_parameter:
             raise ValueError("FsdpParameterGroup requires at least one parameter.")
         parameter_to_fqns: dict[nn.Parameter, list[str]] = {}
-        for fqn, parameter in parameters.items():
+        for fqn, parameter in fqn_to_parameter.items():
             parameter_to_fqns.setdefault(parameter, []).append(fqn)
 
         # Python dicts preserve insertion order, so parameter_to_fqns and
