@@ -102,7 +102,7 @@ def native_sinkhorn(input_logits: Tensor, num_iterations: int, eps: float = 1e-6
 @torch.compile
 def native_h_aggregate(x: Tensor, h_pre: Tensor) -> Tensor:
     """Native n-stream weighted aggregation: out = sum_j(h_pre_j * x_j)."""
-    return (x * h_pre.unsqueeze(-1)).sum(dim=2)
+    return (x * h_pre.unsqueeze(-1)).sum(dim=2).to(x.dtype)
 
 
 @torch.compile
@@ -112,19 +112,23 @@ def native_h_post_bda(
     """Native H_res.T @ residual + H_post * (x [+ bias])."""
     s, b, n, C = original_residual.shape
     h_res_batched = h_res.view(s * b, n, n)
-    residual_batched = original_residual.view(s * b, n, C)
+    residual_batched = original_residual.view(s * b, n, C).to(h_res.dtype)
     mixed = torch.bmm(h_res_batched.transpose(1, 2), residual_batched).view(s, b, n, C)
     x_expanded = h_post.unsqueeze(-1) * x.unsqueeze(2)
     if bias is not None:
         bias_expanded = h_post.unsqueeze(-1) * bias.view(1, 1, 1, C)
-        return x_expanded + bias_expanded + mixed
-    return x_expanded + mixed
+        return (x_expanded + bias_expanded + mixed).to(original_residual.dtype)
+    return (x_expanded + mixed).to(original_residual.dtype)
 
 
 @torch.compile
-def native_proj_rms(x: Tensor, weight: Tensor, eps: float = 1e-6) -> Tuple[Tensor, Tensor]:
+def native_proj_rms(
+    x: Tensor, weight: Tensor, eps: float = 1e-6, eps_inside_sqrt: bool = False
+) -> Tuple[Tensor, Tensor]:
     """Native fused projection + RMS normalization."""
     proj = torch.matmul(x, weight.t())
+    if eps_inside_sqrt:
+        return proj, torch.rsqrt(x.square().mean(dim=-1, keepdim=True) + eps)
     norm = x.norm(dim=-1, keepdim=True)
     K = x.shape[-1]
     v = norm / math.sqrt(K) + eps
@@ -239,7 +243,7 @@ class HyperConnectionModule(MegatronModule):
         mark_keep_in_fp32(self.alpha_post)
         mark_keep_in_fp32(self.alpha_res)
         mark_keep_in_fp32(self.bias)
-        self.norm_eps = 1e-6
+        self.norm_eps = config.layernorm_epsilon if config.mhc_norm_eps_inside_sqrt else 1e-6
 
         # Choose implementation: unified fused kernels vs reference modules.
         # The fused public API selects the backend per operation internally.
@@ -251,9 +255,13 @@ class HyperConnectionModule(MegatronModule):
         # The fused path computes the projection and compute_h in one op, so
         # _projection_and_get_norm — and therefore _proj_rms_op — is only ever
         # reached on the unfused path.
-        self._proj_rms_op = native_proj_rms
+        self._proj_rms_op = partial(
+            native_proj_rms, eps_inside_sqrt=config.mhc_norm_eps_inside_sqrt
+        )
 
         if config.use_fused_mhc:
+            if config.mhc_norm_eps_inside_sqrt or config.mhc_keep_mappings_in_fp32:
+                raise ValueError("Fused mHC does not support FP32 mixing or epsilon inside sqrt.")
             from megatron.core.fusions.fused_mhc_kernels import (
                 fused_h_aggregate,
                 fused_h_post_bda,
@@ -302,9 +310,7 @@ class HyperConnectionModule(MegatronModule):
             x: [s, b, n*C] - n-stream hidden states
         """
         s, b, nC = x.shape
-        # The mHC mapping computation runs in FP32: the parameters are kept in
-        # FP32 and the activations are upcast here, then compute_mappings casts
-        # the bounded mixing weights back to the activation dtype.
+        # Mapping projections use FP32 regardless of the activation dtype.
         x_2d = x.reshape(s * b, nC).to(torch.float32)
         weight = self.mapping_proj.weight.to(torch.float32)
         proj, r = self._proj_rms_op(x_2d, weight, self.norm_eps)
@@ -389,10 +395,7 @@ class HyperConnectionModule(MegatronModule):
             h_res, self.sinkhorn_iterations, self.sinkhorn_eps
         )  # [s, b, n, n]
 
-        # The mixing weights are bounded (sigmoid outputs / doubly stochastic
-        # matrix), so after the FP32 computation they are safe to apply to the
-        # streams in the activation dtype.
-        dtype = x.dtype
+        dtype = torch.float32 if self.config.mhc_keep_mappings_in_fp32 else x.dtype
         return h_pre.to(dtype), h_post.to(dtype), h_res.to(dtype)
 
     @torch.compile
@@ -512,7 +515,7 @@ class HyperConnectionModule(MegatronModule):
         # Reshape for bmm: [s, b, n, n] -> [s*b, n, n]
         h_res_batched = h_res.view(s * b, n, n)
         # [s, b, n*C] -> [s, b, n, C] -> [s*b, n, C]
-        residual_batched = residual.view(s, b, n, C).view(s * b, n, C)
+        residual_batched = residual.view(s * b, n, C).to(h_res.dtype)
 
         # Batch matrix multiply: [s*b, n, n].T @ [s*b, n, C] -> [s*b, n, C]
         mixed = torch.bmm(h_res_batched.transpose(1, 2), residual_batched)
@@ -772,7 +775,7 @@ class HyperConnectionModule(MegatronModule):
         bda_func = get_bias_dropout_add(training, fused)
         with torch.cuda.nvtx.range("HyperConnection::bda"):
             output = bda_func((x_expanded, bias_expanded), mixed, dropout_prob)
-        return output
+        return output.to(original_residual.dtype)
 
     @nvtx_decorator(message="HyperConnection::fused_h_res_h_post_bda_with_checkpoint")
     def _fused_h_res_h_post_bda_with_checkpoint(
@@ -847,7 +850,7 @@ class HyperConnectionModule(MegatronModule):
                         bias_expanded = None
                 with torch.cuda.nvtx.range("HyperConnection::bda"):
                     output = bda_func((x_expanded, bias_expanded), mixed, dropout_prob)
-                return output
+                return output.to(original_residual.dtype)
 
             ckpt = CheckpointWithoutOutput(ckpt_manager=manager)
             if has_bias:

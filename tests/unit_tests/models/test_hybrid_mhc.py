@@ -11,7 +11,10 @@ from megatron.core.models.hybrid.layers.hybrid_hyper_connection import HyperConn
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
-from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.module import (
+    MegatronModule,
+    convert_module_to_dtype_except_fp32_marked,
+)
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.multi_token_prediction import MultiTokenPredictionLayer
 from megatron.core.transformer.spec_utils import ModuleSpec
@@ -160,6 +163,22 @@ class TestHybridStackMHC:
         ):
             assert getattr(hyper_connection, op_name).keywords["backend"] == "native"
 
+    def test_wrapped_residual_layer_does_not_double_count_input(self):
+        config = _get_config(num_layers=1)
+        wrapper = _get_stack(config, num_local_layers=1).cuda().layers[0]
+        hidden = torch.randn(
+            8, 2, config.hidden_size * config.mhc_num_residual_streams, device="cuda"
+        )
+        aggregated, h_res, h_post, residual = wrapper.hyper_connection(hidden, return_residual=True)
+        branch = 0.125 * wrapper.inner_layer.proj(aggregated)
+        expected = wrapper.hyper_connection.fused_h_res_h_post_bda(
+            h_res, residual, h_post, (branch, None), dropout_prob=0.0, training=True, fused=False
+        )
+
+        actual, _ = wrapper(hidden, attention_mask=None)
+
+        torch.testing.assert_close(actual, expected)
+
     def test_wrapped_gdn_preserves_dynamic_inference_state_shapes(self):
         config = _get_config(num_layers=1)
         submodules = _get_dummy_submodules()
@@ -184,8 +203,13 @@ class TestHybridStackMHC:
                 "recompute_modules": ["core_attn", "mhc"],
                 "mhc_recompute_layer_num": 2,
             },
+            {
+                "recompute_granularity": "full",
+                "recompute_method": "uniform",
+                "recompute_num_layers": 1,
+            },
         ],
-        ids=["none", "selective_mhc"],
+        ids=["none", "selective_mhc", "full"],
     )
     def test_forward_backward(self, recompute_kwargs):
         config = _get_config(num_layers=3, **recompute_kwargs)
@@ -207,6 +231,42 @@ class TestHybridStackMHC:
             )
         for name in ("hc_head_fn", "hc_head_base", "hc_head_scale"):
             assert getattr(stack, name).grad is not None
+
+    @pytest.mark.parametrize("recompute_method", ["uniform", "block"])
+    @pytest.mark.parametrize("precision", ["fp32", "bf16_fp32_mixing", "bf16_fused"])
+    def test_full_recompute_matches_forward_backward(self, recompute_method, precision):
+        dtype = torch.float32 if precision == "fp32" else torch.bfloat16
+        config_kwargs = dict(
+            num_layers=3,
+            bf16=dtype == torch.bfloat16,
+            params_dtype=dtype,
+            use_fused_mhc=precision == "bf16_fused",
+            mhc_norm_eps_inside_sqrt=precision == "bf16_fp32_mixing",
+            mhc_keep_mappings_in_fp32=precision == "bf16_fp32_mixing",
+        )
+        reference = _get_stack(_get_config(**config_kwargs), num_local_layers=3).cuda()
+        config = _get_config(
+            **config_kwargs,
+            recompute_granularity="full",
+            recompute_method=recompute_method,
+            recompute_num_layers=2,
+        )
+        checkpointed = _get_stack(config, num_local_layers=3).cuda()
+        for stack in (reference, checkpointed):
+            convert_module_to_dtype_except_fp32_marked(stack, dtype)
+        checkpointed.load_state_dict(reference.state_dict())
+        hidden = torch.randn(8, 2, config.hidden_size, device="cuda", dtype=dtype)
+        reference_input = hidden.clone().requires_grad_()
+        checkpointed_input = hidden.clone().requires_grad_()
+
+        expected = reference(reference_input, attention_mask=None)
+        actual = checkpointed(checkpointed_input, attention_mask=None)
+        torch.testing.assert_close(actual, expected)
+        expected.float().square().mean().backward()
+        actual.float().square().mean().backward()
+        torch.testing.assert_close(checkpointed_input.grad, reference_input.grad)
+        for name, param in checkpointed.named_parameters():
+            torch.testing.assert_close(param.grad, reference.get_parameter(name).grad, msg=name)
 
     def test_fused_bf16_forward_backward(self):
         config = _get_config(
