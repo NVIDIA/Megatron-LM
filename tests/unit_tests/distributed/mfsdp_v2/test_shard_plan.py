@@ -203,15 +203,7 @@ def test_pack_and_unpack_result_round_trip():
     per_rank_send = []
     per_rank_scatter = []
     for r in range(dp_size):
-        scatter = OwnerScatterPlan.pack(
-            full_results_by_rank[r],
-            layouts,
-            owners,
-            dp_size,
-            r,
-            device=torch.device("cpu"),
-            dtype=torch.float32,
-        )
+        scatter = OwnerScatterPlan.pack(full_results_by_rank[r], layouts, owners, dp_size, r)
         per_rank_send.append(scatter.send_buffers)
         per_rank_scatter.append(scatter)
 

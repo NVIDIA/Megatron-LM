@@ -383,9 +383,6 @@ class OwnerScatterPlan:
         owners: dict[int, int],
         dp_size: int,
         this_rank: int,
-        *,
-        device: torch.device,
-        dtype: torch.dtype,
     ) -> Self:
         """Pack this owner rank's full results into per-destination P2P send buffers.
 
@@ -395,9 +392,11 @@ class OwnerScatterPlan:
             owners: Mapping from parameter index to owner rank.
             dp_size: DP group size.
             this_rank: This rank's DP index.
-            device: Device for the send buffers.
-            dtype: Dtype for the send buffers.
         """
+        if full_results:
+            first = next(iter(full_results.values()))
+            device = first.device
+            dtype = first.dtype
         owned_indices = [i for i in range(len(layouts)) if owners[i] == this_rank]
         send_sizes: dict[int, int] = {}
         recv_sizes: dict[int, int] = {}
