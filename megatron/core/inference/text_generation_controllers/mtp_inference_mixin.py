@@ -239,15 +239,30 @@ class MTPInferenceMixin:
     ) -> _CommitSegments:
         """Seed the prompt positions of every prefill request from main hiddens (roll-by-one).
 
-        request_query_lengths is this step's CHUNK length `q` and request_kv_length_offsets is how
-        many prompt tokens prior chunks already prefilled (`off`), so each request seeds positions
-        off..off+q-2 (its last chunk position off+q-1 is seeded next chunk, or by the decode draft
-        loop on the final/only chunk). For a continuation chunk (off > 0) the position straddling
-        the previous chunk, off-1, is also seeded here from the carried-over previous-chunk hidden
-        h_{off-1} paired with this chunk's first token t_off. Built per request (num_prefill
-        is small and this forward is eager) so the continuation stays ONE segment -> the
-        segment count stays active_request_count and the fixed-size MHA-metadata buffers
-        never overflow.
+        A draft entry at MTP position p is f(h_p + emb(t_{p+1})): hidden and token come from
+        positions one apart. request_query_lengths is this step's CHUNK length `q` and
+        request_kv_length_offsets is how many prompt tokens prior chunks already prefilled
+        (`off`), so pairing each of a chunk's hiddens with the token that follows it seeds
+        positions off..off+q-2. The chunk's last hidden is dropped because its partner token
+        t_{off+q} is not in this chunk -- it is seeded by the next chunk's seam entry below, or
+        by decode depth 0 on the final/only chunk.
+
+        SEAM: position off-1 pairs the PREVIOUS chunk's last hidden with this chunk's first
+        token, so only this chunk can write it, and only if that hidden was carried over -- i.e.
+        this same request computed off-1 itself. At most one request per step qualifies, because
+        chunked prefill admits a single in-flight request. A prefix-cache hit also produces
+        off > 0, but there the skipped prefix was computed by a DIFFERENT request whose
+        activations are gone, so the seam is left unwritten: entries at p <= off-2 are already
+        correct in the inherited blocks (t_{p+1} lies inside the shared prefix, so it is the same
+        token for every sibling), and off-1 -- the one entry that does differ, because it consumes
+        t_off, the first divergent token -- lives in a ref-counted block shared with the producer
+        and every sibling, so writing this request's value would corrupt theirs. One stale
+        key/value at the divergence point costs a little draft acceptance and cannot affect
+        verified output.
+
+        Every request contributes exactly ONE segment (q-1 entries, or q with a seam), so the
+        segment count stays active_request_count and the fixed-size MHA-metadata buffers never
+        overflow.
 
         Also refreshes the carried chunk-boundary hidden for the in-flight chunked request.
         """
@@ -266,56 +281,57 @@ class MTPInferenceMixin:
             decode_len : decode_len + total_prompt
         ].to(device)
 
-        p_counts, p_starts, p_hidden_segs, p_token_segs = [], [], [], []
-        cum = 0
-        for q, off, rid in zip(q_list, off_list, id_list):
-            h_i = prefill_hidden[cum : cum + q]  # [q, 1, H] this chunk's hiddens
-            t_i = prefill_tokens[cum : cum + q]  # [q]     this chunk's tokens
-            cum += q
-            # h_{off-1} is needed to seed the straddling entry at off-1, and is available only
-            # when this request computed position off-1 itself, i.e. off came from its own
-            # previous chunk. A prefix-cache hit also produces off > 0, but there the skipped
-            # prefix was computed by a DIFFERENT request whose activations are gone -- see the
-            # `else` branch.
-            own_prior_chunk = (
-                self._mtp_chunk_boundary_hidden is not None
-                and self._mtp_chunk_boundary_req_id == rid
-            )
-            if off > 0 and own_prior_chunk:
-                # Continuation chunk: boundary position off-1 = f(carried h_{off-1} + t_off),
-                # then this chunk's roll-by-one off..off+q-2. count = q, start = off-1.
-                p_hidden_segs.append(self._mtp_chunk_boundary_hidden.to(device))
-                p_hidden_segs.append(h_i[:-1])
-                p_token_segs.append(t_i[:1])
-                p_token_segs.append(t_i[1:])
-                p_counts.append(q)
-                p_starts.append(off - 1)
-            else:
-                # off == 0 (nothing precedes), or a prefix-cache hit. On a hit this request
-                # inherits the matched blocks' draft KV, which is already correct for every
-                # position p <= off-2: that entry is f(h_p + emb(t_{p+1})) and t_{p+1} lies
-                # inside the shared prefix, so it is the same token for every request sharing
-                # the block. Only position off-1 differs, because its entry consumes t_off --
-                # the first token where children diverge. That entry is NOT rewritten here: it
-                # lives in a ref-counted block shared with the producer and every sibling, so
-                # writing this request's value would corrupt theirs. One stale key/value at the
-                # divergence point costs a little draft acceptance and cannot affect verified
-                # output. count = q-1, start = off.
-                p_hidden_segs.append(h_i[:-1])
-                p_token_segs.append(t_i[1:])
-                p_counts.append(q - 1)
-                p_starts.append(off)
-            # Carry this step's in-flight chunk's last hidden for the next chunk's boundary.
-            if chunked_id != -1 and rid == chunked_id:
-                self._mtp_chunk_boundary_hidden = h_i[-1].detach().clone().view(1, 1, -1)
-                self._mtp_chunk_boundary_req_id = chunked_id
+        # Host-side chunk geometry. `q_list` entries are >= 1, so every request contributes
+        # q-1 >= 0 body rows and `chunk_start[i]` is the first row of request i's chunk.
+        num_prefill = len(q_list)
+        chunk_start = [0] * num_prefill
+        for i in range(1, num_prefill):
+            chunk_start[i] = chunk_start[i - 1] + q_list[i - 1]
+        counts = torch.tensor([q - 1 for q in q_list], dtype=torch.long, device=device)
+        starts = torch.tensor(off_list, dtype=torch.long, device=device)
 
-        return _CommitSegments(
-            counts=torch.tensor(p_counts, dtype=torch.long, device=device),
-            starts=torch.tensor(p_starts, dtype=torch.long, device=device),
-            hidden=torch.cat(p_hidden_segs),
-            tokens=torch.cat(p_token_segs),
+        # Body rows: for request i, chunk rows chunk_start[i] .. chunk_start[i]+q_i-2. Built
+        # arithmetically (segment row -> global row) rather than by masking, so no
+        # `nonzero()`-style device sync is introduced.
+        body_total = total_prompt - num_prefill
+        rows = torch.repeat_interleave(torch.arange(num_prefill, device=device), counts)
+        chunk_start_gpu = torch.tensor(chunk_start, dtype=torch.long, device=device)
+        within = (
+            torch.arange(body_total, device=device) - (torch.cumsum(counts, 0) - counts)[rows]
         )
+        body_idx = chunk_start_gpu[rows] + within
+        hidden = prefill_hidden[body_idx]
+        tokens = prefill_tokens[body_idx + 1]  # the token one position to the right
+
+        # Seam: at most one request continues its own prior chunk, so this is a single splice
+        # rather than a per-request branch.
+        seam = (
+            id_list.index(self._mtp_chunk_boundary_req_id)
+            if self._mtp_chunk_boundary_hidden is not None
+            and self._mtp_chunk_boundary_req_id in id_list
+            else None
+        )
+        if seam is not None and off_list[seam] > 0:
+            # The seam row precedes request `seam`'s body rows, which start after every earlier
+            # request's q-1 body rows.
+            insert_at = chunk_start[seam] - seam
+            seam_token = prefill_tokens[chunk_start[seam] : chunk_start[seam] + 1]  # t_off
+            hidden = torch.cat(
+                [hidden[:insert_at], self._mtp_chunk_boundary_hidden.to(device), hidden[insert_at:]]
+            )
+            tokens = torch.cat([tokens[:insert_at], seam_token, tokens[insert_at:]])
+            counts[seam] += 1
+            starts[seam] -= 1
+
+        # Carry the in-flight chunk's last hidden so its next chunk can write the seam entry.
+        if chunked_id != -1 and chunked_id in id_list:
+            i = id_list.index(chunked_id)
+            last_row = chunk_start[i] + q_list[i] - 1
+            carried = prefill_hidden[last_row].detach().clone()
+            self._mtp_chunk_boundary_hidden = carried.view(1, 1, -1)
+            self._mtp_chunk_boundary_req_id = chunked_id
+
+        return _CommitSegments(counts=counts, starts=starts, hidden=hidden, tokens=tokens)
 
     def _mtp_commit_forward(
         self,
