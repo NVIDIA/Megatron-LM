@@ -50,9 +50,6 @@ from megatron.core.transformer.moe.token_dispatcher_inference import (
     InferenceAllGatherDispatcherBase,
     NVLSAllGatherVDispatcher,
 )
-from megatron.core.transformer.moe.virtual_expert_load_balancer import (
-    FORWARD as VIRTUAL_EXPERT_FORWARD,
-)
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import (
     ensure_metadata_has_dp_cp_group,
@@ -196,16 +193,18 @@ class _VirtualExpertFC2WgradStore:
 
     context = None
 
-    def __init__(self, bridge) -> None:
-        self._bridge = bridge
+    def __init__(self, load_balancer) -> None:
+        self._load_balancer = load_balancer
 
     @staticmethod
     def delay_wgrad_compute() -> bool:
+        """TE routes the wgrad GEMM through :meth:`put` when this is true."""
         return True
 
     def put(self, tensors, wgrad_gemm) -> None:
+        """Run the wgrad GEMM now and start FC2's virtual-expert reduction behind it."""
         wgrad_gemm(*tensors)
-        self._bridge.start_fc2_grad_reduce()
+        self._load_balancer.start_fc2_grad_reduce()
 
 
 class TEGroupedMLP(MegatronModule):
@@ -318,7 +317,7 @@ class TEGroupedMLP(MegatronModule):
             ), "Fused GroupedMLP is not supported for this configuration."
         self._with_fused_impl: bool = self.config.use_transformer_engine_op_fuser
         self._fused_ops: Optional[Tuple[torch.nn.Module]] = None
-        self._virtual_expert_weight_bridge = None
+        self._virtual_experts = None
         if (
             self.config.gated_linear_unit
             and self.config.moe_mlp_glu_interleave_size is not None
@@ -342,13 +341,14 @@ class TEGroupedMLP(MegatronModule):
                 self.num_local_experts, align_size=align_size
             )
 
-    def set_virtual_expert_weight_bridge(self, bridge) -> None:
-        """Use bridge-owned native and virtual-expert weights for fused expert compute."""
+    def bind_virtual_experts(self, load_balancer) -> None:
+        """Run the fused expert compute over the load balancer's native and virtual-expert
+        runtime weights."""
         if self._fused_ops is not None:
             raise RuntimeError(
                 "Virtual-expert weights must be bound before the first expert forward."
             )
-        self._virtual_expert_weight_bridge = bridge
+        self._virtual_experts = load_balancer
 
     @staticmethod
     def _apply_packed_bias(intermediate_parallel, packed_bias, tokens_per_expert, permuted_probs):
@@ -556,10 +556,8 @@ class TEGroupedMLP(MegatronModule):
         # for runs that enable it via overlap_dispatch_backward_with_experts_wgrad.
         fc1_delay_wgrad_compute = self.linear_fc1.delay_wgrad_compute
         fc2_delay_wgrad_compute = self.linear_fc2.delay_wgrad_compute
-        virtual_expert_bridge = self._virtual_expert_weight_bridge
-        virtual_expert_num_gemms = (
-            virtual_expert_bridge.num_runtime_experts if virtual_expert_bridge else None
-        )
+        virtual_experts = self._virtual_experts
+        virtual_expert_num_gemms = virtual_experts.num_runtime_experts if virtual_experts else None
 
         # Create a parameterless op shell and then attach the existing GroupedLinear weights below.
         # Using meta avoids allocating duplicate weights for the fused wrapper.
@@ -572,14 +570,14 @@ class TEGroupedMLP(MegatronModule):
             dtype=fc1_weight_dtype,
             accumulate_into_main_grad=self.linear_fc1.fuse_wgrad_accumulation,
             single_grouped_weight=(
-                False if virtual_expert_bridge is not None else fc1_single_grouped_weight
+                False if virtual_experts is not None else fc1_single_grouped_weight
             ),
             single_grouped_bias=fc1_single_grouped_bias,
             delay_wgrad_compute=fc1_delay_wgrad_compute,
         )
 
-        if virtual_expert_bridge is not None:
-            register_virtual_expert_weights(op, virtual_expert_bridge.runtime_fc1_weights)
+        if virtual_experts is not None:
+            register_virtual_expert_weights(op, virtual_experts.runtime_weights(0))
         else:
             register_grouped_linear_params(
                 op, self.linear_fc1, fc1_single_grouped_weight, fc1_single_grouped_bias
@@ -681,7 +679,7 @@ class TEGroupedMLP(MegatronModule):
             dtype=fc2_weight_dtype,
             accumulate_into_main_grad=self.linear_fc2.fuse_wgrad_accumulation,
             single_grouped_weight=(
-                False if virtual_expert_bridge is not None else fc2_single_grouped_weight
+                False if virtual_experts is not None else fc2_single_grouped_weight
             ),
             single_grouped_bias=fc2_single_grouped_bias,
             delay_wgrad_compute=fc2_delay_wgrad_compute,
@@ -689,9 +687,9 @@ class TEGroupedMLP(MegatronModule):
             **fc2_bias_kwargs,
         )
 
-        if virtual_expert_bridge is not None:
-            register_virtual_expert_weights(op, virtual_expert_bridge.runtime_fc2_weights)
-            op.wgrad_store = _VirtualExpertFC2WgradStore(virtual_expert_bridge)
+        if virtual_experts is not None:
+            register_virtual_expert_weights(op, virtual_experts.runtime_weights(1))
+            op.wgrad_store = _VirtualExpertFC2WgradStore(virtual_experts)
         else:
             register_grouped_linear_params(
                 op, self.linear_fc2, fc2_single_grouped_weight, fc2_single_grouped_bias
@@ -723,12 +721,10 @@ class TEGroupedMLP(MegatronModule):
 
         def forward_pre_hook(module, *_) -> None:
             self.prepare_fused_impl_parameters()
-            bridge = self._virtual_expert_weight_bridge
-            if bridge is not None:
-                bridge.wait_prefetch(bridge.last_plan)
-                # GTP consumes the expert weights here, right before the expert GEMMs, as it
-                # would without virtual experts; the push above only peeked at them.
-                bridge.consume(VIRTUAL_EXPERT_FORWARD)
+            if self._virtual_experts is not None:
+                # Wait for the weight push; GTP consumes the expert weights here, right before
+                # the expert GEMMs, as it would without virtual experts (the push only peeked).
+                self._virtual_experts.prepare_expert_forward()
 
         return forward_pre_hook
 

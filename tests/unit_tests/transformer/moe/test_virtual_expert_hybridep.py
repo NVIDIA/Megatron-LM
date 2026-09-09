@@ -26,9 +26,7 @@ import torch.nn.functional as F
 
 from megatron.core.activations import squared_relu
 from megatron.core.transformer.moe import fused_a2a
-from megatron.core.transformer.moe.virtual_expert_load_balancer import (
-    finalize_virtual_expert_weight_bridges,
-)
+from megatron.core.transformer.moe.virtual_expert_load_balancer import finalize_virtual_experts
 
 MXFP8_COMPONENTS = (
     "_rowwise_data",
@@ -75,7 +73,7 @@ def _set_main_grad(parameter, dtype=torch.float32):
 
 
 def _dense_linears(layer):
-    """The layer's ordinary TE linears: latent projections and shared experts, if present."""
+    """The layer's ordinary TE linears: latent FC layers and shared experts, if present."""
     linears = []
     if layer.config.moe_latent_size is not None:
         linears += [layer.fc1_latent_proj, layer.fc2_latent_proj]
@@ -106,51 +104,50 @@ def _weight_storage_ptrs(weight):
     return (weight.data_ptr(),)
 
 
-def _assert_mxfp8_prefetch_exact(bridge, orientation):
+def _assert_mxfp8_prefetch_exact(manager, plan, orientation):
     """Check every active virtual MXFP8 component byte-for-byte against its owning rank."""
     components = MXFP8_COMPONENTS[:2] if orientation == "rowwise" else MXFP8_COMPONENTS[2:]
     errors = []
-    for index, projection in enumerate(bridge.projections):
+    for index, fc_layer in enumerate(manager.fc_layers):
         for component in components:
-            local = torch.stack(
-                tuple(getattr(source, component) for source in projection.parameters)
-            )
-            gathered = [torch.empty_like(local) for _ in range(bridge.world_size)]
-            torch.distributed.all_gather(gathered, local, group=bridge.group)
-            for slot, expert in enumerate(bridge.last_plan.experts_to_copy[bridge.rank].tolist()):
+            local = torch.stack(tuple(getattr(source, component) for source in fc_layer.parameters))
+            gathered = [torch.empty_like(local) for _ in range(manager.ep_size)]
+            torch.distributed.all_gather(gathered, local, group=manager.group)
+            for slot, expert in enumerate(plan.experts_to_copy[manager.ep_rank].tolist()):
                 if expert < 0:
                     continue
-                owner, owned = divmod(expert, bridge.num_local_experts)
+                owner, owned = divmod(expert, manager.num_owned_experts)
                 if not torch.equal(
-                    getattr(projection.virtual_weights[slot], component), gathered[owner][owned]
+                    getattr(fc_layer.virtual_weights[slot], component), gathered[owner][owned]
                 ):
-                    errors.append(f"projection={index} {component} slot={slot} expert={expert}")
-    any_error = torch.tensor(int(bool(errors)), dtype=torch.int32, device=bridge.device)
-    torch.distributed.all_reduce(any_error, op=torch.distributed.ReduceOp.MAX, group=bridge.group)
-    assert not any_error.item(), f"rank {bridge.rank} {orientation} MXFP8 prefetch mismatch: " + (
+                    errors.append(f"fc_layer={index} {component} slot={slot} expert={expert}")
+    any_error = torch.tensor(int(bool(errors)), dtype=torch.int32, device=manager.device)
+    torch.distributed.all_reduce(any_error, op=torch.distributed.ReduceOp.MAX, group=manager.group)
+    assert (
+        not any_error.item()
+    ), f"rank {manager.ep_rank} {orientation} MXFP8 prefetch mismatch: " + (
         ", ".join(errors) if errors else "reported by another rank"
     )
 
 
-def _assert_bridge_layout(bridge, *, grad_dtype, mxfp8):
-    """Check that the runtime weights and grads TE executes against alias bridge storage."""
-    assert bridge.workspace.grad_arena.dtype == grad_dtype
-    for projection, runtime_weights in zip(
-        bridge.projections, (bridge.runtime_fc1_weights, bridge.runtime_fc2_weights)
-    ):
-        assert len(runtime_weights) == bridge.num_runtime_experts
-        assert projection.virtual_grad.dtype == grad_dtype
+def _assert_runtime_layout(manager, *, grad_dtype, mxfp8):
+    """Check that the runtime weights and grads TE executes against alias the shared arenas."""
+    assert manager.workspace.grad_arena.dtype == grad_dtype
+    for index, fc_layer in enumerate(manager.fc_layers):
+        runtime_weights = manager.runtime_weights(index)
+        assert len(runtime_weights) == manager.num_runtime_experts
+        assert fc_layer.virtual_grad.dtype == grad_dtype
         for index, runtime_weight in enumerate(runtime_weights):
-            if index < bridge.num_local_experts:
+            if index < manager.num_owned_experts:
                 # A bare MoELayer has no DDP-time GTP wrapper, so natives alias the
                 # optimizer parameters directly.
-                assert projection.gtp_leader is None
-                expected_weight = projection.parameters[index]
-                expected_grad = projection.native_grad[index]
+                assert fc_layer.gtp_leader is None
+                expected_weight = fc_layer.parameters[index]
+                expected_grad = fc_layer.native_grad[index]
             else:
-                slot = index - bridge.num_local_experts
-                expected_weight = projection.virtual_weights[slot]
-                expected_grad = projection.virtual_grad[slot]
+                slot = index - manager.num_owned_experts
+                expected_weight = fc_layer.virtual_weights[slot]
+                expected_grad = fc_layer.virtual_grad[slot]
                 if mxfp8:
                     # One arena serves both orientations; only one is live at a time.
                     assert (
@@ -277,32 +274,42 @@ def _run_full_layer_parity(
         _set_main_grads(ref_layer, grad_dtype)
         _set_main_grads(virtual_expert_layer, grad_dtype)
 
-        bridge = virtual_expert_layer.token_dispatcher._comm_manager._ensure_experts_bound()
-        _assert_bridge_layout(bridge, grad_dtype=grad_dtype, mxfp8=mxfp8)
+        torch.manual_seed(1234)
+        test_input = torch.randn(2, 4, 1024, device="cuda", dtype=torch.bfloat16)
+        manager = virtual_expert_layer.token_dispatcher._comm_manager
+        manager._runtime_init(test_input)
+        _assert_runtime_layout(manager, grad_dtype=grad_dtype, mxfp8=mxfp8)
+        # The plan is dropped from the manager at the layer output; keep each forward's for the
+        # checks below.
+        plans = []
+        plan_dispatch = manager.plan_dispatch
+
+        def record_plan(*routes):
+            plan_dispatch(*routes)
+            plans.append(manager._temporaries.plan)
+
+        manager.plan_dispatch = record_plan
         if mxfp8:
             # A state_dict load does not carry the quantized component storage,
             # so mirror it explicitly before comparing the two layers.
             for linear, virtual_expert in zip(
-                (ref_layer.experts.linear_fc1, ref_layer.experts.linear_fc2), bridge.projections
+                (ref_layer.experts.linear_fc1, ref_layer.experts.linear_fc2), manager.fc_layers
             ):
                 for index, destination in enumerate(virtual_expert.parameters):
                     source = linear.get_parameter(f"weight{index}")
                     for component in MXFP8_COMPONENTS:
                         getattr(destination, component).copy_(getattr(source, component))
 
-        torch.manual_seed(1234)
-        test_input = torch.randn(2, 4, 1024, device="cuda", dtype=torch.bfloat16)
-
-        def run(layer, *, virtual_expert_bridge=None):
+        def run(layer, *, virtual_experts=None):
             hidden = test_input.detach().clone().requires_grad_(True)
             output, _ = layer(hidden)
-            if virtual_expert_bridge is not None and mxfp8:
-                _assert_mxfp8_prefetch_exact(virtual_expert_bridge, "rowwise")
+            if virtual_experts is not None and mxfp8:
+                _assert_mxfp8_prefetch_exact(virtual_experts, plans[-1], "rowwise")
             output.float().sum().backward()
-            if virtual_expert_bridge is not None:
-                for projection in virtual_expert_bridge.projections:
-                    for parameter in projection.parameters:
-                        if projection.gtp_leader is None:
+            if virtual_experts is not None:
+                for fc_layer in virtual_experts.fc_layers:
+                    for parameter in fc_layer.parameters:
+                        if fc_layer.gtp_leader is None:
                             # The bridge hands the reduced wgrad to the optimizer
                             # parameter through autograd's main-grad protocol.
                             assert parameter.grad is not None
@@ -310,11 +317,11 @@ def _run_full_layer_parity(
                         parameter.grad = None
                 assert all(
                     runtime_parameter.grad is None
-                    for projection in virtual_expert_bridge.projections
-                    for runtime_parameter in projection.runtime_parameters
+                    for fc_layer in virtual_experts.fc_layers
+                    for runtime_parameter in fc_layer.runtime_parameters
                 )
                 if mxfp8:
-                    _assert_mxfp8_prefetch_exact(virtual_expert_bridge, "columnwise")
+                    _assert_mxfp8_prefetch_exact(virtual_experts, plans[-1], "columnwise")
             values = [
                 output.detach(),
                 hidden.grad.detach(),
@@ -340,9 +347,8 @@ def _run_full_layer_parity(
             torch.distributed.barrier()
             fused_a2a.reset_hybrid_ep_buffer()
             torch.distributed.barrier()
-        virtual_expert_values = run(virtual_expert_layer, virtual_expert_bridge=bridge)
+        virtual_expert_values = run(virtual_expert_layer, virtual_experts=manager)
 
-        manager = virtual_expert_layer.token_dispatcher._comm_manager
         assert manager.moe_expert_rank_capacity_factor == 1.0
         assert not manager.over_budget.item()
         if mxfp8:
@@ -356,7 +362,8 @@ def _run_full_layer_parity(
             dispatched_probs = manager.dispatched_probs[:num_dispatched]
             assert torch.count_nonzero(dispatched_probs).item() == num_routes
         # A run in which no expert was materialized would compare nothing.
-        active_virtual_expert = torch.any(bridge.last_plan.experts_to_copy >= 0).to(torch.int32)
+        assert len(plans) == 1
+        active_virtual_expert = torch.any(plans[0].experts_to_copy >= 0).to(torch.int32)
         torch.distributed.all_reduce(active_virtual_expert, op=torch.distributed.ReduceOp.MAX)
         assert active_virtual_expert.item(), "parity must exercise an active virtual-expert"
 
@@ -391,7 +398,7 @@ def _run_full_layer_parity(
     finally:
         # Release the arenas while their communicator is alive, then destroy the
         # process-global HybridEP buffer in lockstep across ranks.
-        finalize_virtual_expert_weight_bridges()
+        finalize_virtual_experts()
         Utils.destroy_model_parallel()
         torch.cuda.synchronize()
         torch.distributed.barrier()
@@ -533,9 +540,9 @@ def _run_repeated_mtp_parity(monkeypatch):
         plans = []
         plan_dispatch = manager.plan_dispatch
 
-        def record_plan():
-            plan_dispatch()
-            plans.append(manager._plan)
+        def record_plan(*routes):
+            plan_dispatch(*routes)
+            plans.append(manager._temporaries.plan)
 
         manager.plan_dispatch = record_plan
         virtual_expert_loss = forward(virtual_expert_model)
@@ -551,7 +558,7 @@ def _run_repeated_mtp_parity(monkeypatch):
 
         virtual_expert_loss.sum().backward()
         virtual_expert_gradients = snapshot(virtual_expert_model)
-        assert manager._plan is None and manager._context is None
+        assert manager._temporaries is None
 
         torch.testing.assert_close(
             virtual_expert_loss,
@@ -592,7 +599,7 @@ def _run_repeated_mtp_parity(monkeypatch):
         # aliasing the symmetric arenas; drop them so the arenas are released with the group.
         reference_loss = virtual_expert_loss = None
         del reference_model, virtual_expert_model
-        finalize_virtual_expert_weight_bridges()
+        finalize_virtual_experts()
         Utils.destroy_model_parallel()
         torch.cuda.synchronize()
         torch.distributed.barrier()
