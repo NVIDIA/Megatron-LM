@@ -13,7 +13,6 @@ and `OwnerScatterPlan.unpack` extracts received result shards.
 """
 
 import dataclasses
-import functools
 from collections.abc import Callable, Sequence
 from typing import Self
 
@@ -136,12 +135,10 @@ class ShardPlan:
         """Return the number of elements in `rank`'s shard."""
         return self.rank_row_count(rank) * self.row_size
 
-    @functools.lru_cache(maxsize=None)
     def owner_candidates(self) -> tuple[int, ...]:
         """Return the ranks that hold a non-empty shard of this parameter."""
         return tuple(r for r, (_, count) in enumerate(self.rank_rows) if count > 0)
 
-    @functools.lru_cache(maxsize=None)
     def is_boundary(self) -> bool:
         """True if more than one rank owns a non-empty shard of this parameter."""
         return any(0 < count < self.full_shape[0] for _, count in self.rank_rows)
