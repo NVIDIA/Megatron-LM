@@ -230,9 +230,9 @@ class OwnerGatherPlan:
 
     Attributes:
         send_buffers: Per-destination-owner flat send buffer (this rank's shards for that owner's
-            params, in param order). Only owners other than this rank appear.
+            params, in param order). Only owners with non-zero send size appear.
         recv_sizes: Per-source-rank element count this rank (as an owner) receives. Only sources
-            other than this rank appear.
+            with non-zero total size appear.
         own_shards: This rank's local shard per owned parameter (used directly in reconstruction,
             not communicated).
         recv_offsets: Per `(param_index, src_rank)`, the flat offset of this param's shard inside
@@ -266,17 +266,21 @@ class OwnerGatherPlan:
         """
         device = local_shards[0].device
         dtype = local_shards[0].dtype
-        send_sizes: dict[int, int] = {owner: 0 for owner in range(dp_size) if owner != this_rank}
-        recv_sizes: dict[int, int] = {sender: 0 for sender in range(dp_size) if sender != this_rank}
+        send_sizes: dict[int, int] = {}
+        recv_sizes: dict[int, int] = {}
         for param_index, layout in enumerate(layouts):
             owner = owners[param_index]
             if owner != this_rank:
-                send_sizes[owner] += layout.shard_numel(this_rank)
+                send_numel = layout.shard_numel(this_rank)
+                if send_numel > 0:
+                    send_sizes[owner] = send_sizes.get(owner, 0) + send_numel
                 continue
             for src in range(dp_size):
                 if src == this_rank:
                     continue
-                recv_sizes[src] += layout.shard_numel(src)
+                recv_numel = layout.shard_numel(src)
+                if recv_numel > 0:
+                    recv_sizes[src] = recv_sizes.get(src, 0) + recv_numel
 
         send_buffers: dict[int, torch.Tensor] = {}
         for owner, size in send_sizes.items():
@@ -358,9 +362,9 @@ class OwnerScatterPlan:
 
     Attributes:
         send_buffers: Per-destination-rank flat send buffer (this owner's result shards for the
-            params it owns, in param order). Only destinations other than this rank appear.
+            params it owns, in param order). Only destinations with non-zero send size appear.
         recv_sizes: Per-owner-rank element count this rank (as a destination) receives. Only owners
-            other than this rank appear.
+            with non-zero total size appear.
         recv_offsets: Per `(param_index, owner_rank)`, the flat offset of this param's result shard
             inside the recv buffer received from `owner_rank`.
     """
@@ -395,21 +399,23 @@ class OwnerScatterPlan:
             dtype: Dtype for the send buffers.
         """
         owned_indices = [i for i in range(len(layouts)) if owners[i] == this_rank]
-        send_sizes: dict[int, int] = {
-            receiver: 0 for receiver in range(dp_size) if receiver != this_rank
-        }
-        recv_sizes: dict[int, int] = {owner: 0 for owner in range(dp_size) if owner != this_rank}
+        send_sizes: dict[int, int] = {}
+        recv_sizes: dict[int, int] = {}
         for param_index in owned_indices:
             layout = layouts[param_index]
             for dest in range(dp_size):
                 if dest == this_rank:
                     continue
-                send_sizes[dest] += layout.shard_numel(dest)
+                numel = layout.shard_numel(dest)
+                if numel > 0:
+                    send_sizes[dest] = send_sizes.get(dest, 0) + numel
         for param_index, layout in enumerate(layouts):
             owner = owners[param_index]
             if owner == this_rank:
                 continue
-            recv_sizes[owner] += layout.shard_numel(this_rank)
+            numel = layout.shard_numel(this_rank)
+            if numel > 0:
+                recv_sizes[owner] = recv_sizes.get(owner, 0) + numel
 
         send_buffers: dict[int, torch.Tensor] = {}
         for dest, size in send_sizes.items():
