@@ -14,7 +14,8 @@ The only state the mixin writes is its own: the sampling/draft buffers allocated
 `_mtp_commit_pass`. Everything else it touches belongs to the inference context or the model.
 """
 
-from typing import Optional
+from dataclasses import dataclass
+from typing import List, Optional
 
 import torch
 import torch.nn.functional as F
@@ -29,6 +30,29 @@ from megatron.core.tensor_parallel.mappings import (
 from megatron.core.transformer.enums import InferenceCudaGraphScope
 from megatron.core.transformer.moe.token_dispatcher_inference import NVLSAllGatherVDispatcher
 from megatron.core.utils import nvtx_range_pop, nvtx_range_push, round_up_to_nearest_multiple
+
+
+@dataclass
+class _CommitSegments:
+    """One request class's contribution to the commit pass, in active-request order.
+
+    The commit pass concatenates the decode and prefill contributions into a single varlen
+    forward, so both are described the same way: one (count, start) pair per request, plus the
+    packed hidden/token rows those counts index into.
+
+    Args:
+        counts (Tensor): [R] tokens each request rewrites this step. May be 0 for a request
+            with nothing to refresh; the entry is still required, because the commit pass's
+            segment count must stay equal to the active request count.
+        starts (Tensor): [R] MTP write position of each request's first rewritten token.
+        hidden (Tensor | None): [T, 1, H] packed main hidden states, None when T == 0.
+        tokens (Tensor | None): [T] next-token ids paired with `hidden`, None when T == 0.
+    """
+
+    counts: Tensor
+    starts: Tensor
+    hidden: Optional[Tensor]
+    tokens: Optional[Tensor]
 
 
 class MTPInferenceMixin:
@@ -120,109 +144,23 @@ class MTPInferenceMixin:
             (single-chunk) case.
         Returns True if it issued a forward (caller runs a dummy slot otherwise for EP balance).
         """
-        device = gathered_hidden.device
         stride = self.num_speculative_tokens + 1
         decode_len = num_decode_requests * stride
-        active_slice = slice(context.paused_request_count, context.total_request_count)
         chunked_id = context.chunked_prefill_request_id
 
-        hidden_parts, token_parts, append_parts, start_parts = [], [], [], []
-
-        # --- Decode requests: refresh accepted-draft positions from main hiddens. ---
+        segments: List[_CommitSegments] = []
         if num_decode_requests > 0:
-            accepted = (
-                self._accepted_token_counts_per_request[:num_decode_requests]
-                .to(device, non_blocking=True)
-                .to(torch.long)
+            segments.append(
+                self._mtp_decode_commit_segments(
+                    context, gathered_hidden, num_decode_requests, base_position, stride
+                )
             )
-            append_parts.append(accepted)
-            # start of each request's refreshed run: (last committed MTP pos) - a_r.
-            start_parts.append(base_position[:num_decode_requests] - 1 - accepted)
-            total_a = int(accepted.sum().item())
-            if total_a > 0:
-                decode_hidden = gathered_hidden[:decode_len]  # [num_decode*stride, 1, H]
-                decode_tokens = context.gpu_view.token_to_input_ids[:decode_len].to(device)
-                rows_d = torch.repeat_interleave(
-                    torch.arange(num_decode_requests, device=device), accepted
-                )
-                within_d = (
-                    torch.arange(total_a, device=device)
-                    - (torch.cumsum(accepted, 0) - accepted)[rows_d]
-                )
-                hidden_idx = rows_d * stride + within_d  # base..draft_{a-2} main hiddens
-                hidden_parts.append(decode_hidden[hidden_idx])
-                token_parts.append(decode_tokens[hidden_idx + 1])  # draft_0..draft_{a-1}
-
-        # --- Prefill requests: seed their prompt positions from main hiddens (roll-by-one). ---
-        # request_query_lengths is this step's CHUNK length `q` and request_kv_length_offsets is how
-        # many prompt tokens prior chunks already prefilled (`off`), so each request seeds positions
-        # off..off+q-2 (its last chunk position off+q-1 is seeded next chunk, or by the decode draft
-        # loop on the final/only chunk). For a continuation chunk (off > 0) the position straddling
-        # the previous chunk, off-1, is also seeded here from the carried-over previous-chunk hidden
-        # h_{off-1} paired with this chunk's first token t_off. Built per request (num_prefill
-        # is small and this forward is eager) so the continuation stays ONE segment -> the
-        # segment count stays active_request_count and the fixed-size MHA-metadata buffers
-        # never overflow.
-        # request_* are CPU pinned tensors, so `.tolist()` is a cheap host read (no GPU sync).
         if active_request_count > num_decode_requests:
-            prefill_slice = slice(num_decode_requests, active_request_count)
-            q_list = context.request_query_lengths[active_slice][prefill_slice].tolist()
-            off_list = context.request_kv_length_offsets[active_slice][prefill_slice].tolist()
-            id_list = context.request_ids[active_slice][prefill_slice].tolist()
-            total_prompt = sum(q_list)
-            prefill_hidden = gathered_hidden[decode_len : decode_len + total_prompt]
-            prefill_tokens = context.gpu_view.token_to_input_ids[
-                decode_len : decode_len + total_prompt
-            ].to(device)
-
-            p_counts, p_starts, p_hidden_segs, p_token_segs = [], [], [], []
-            cum = 0
-            for q, off, rid in zip(q_list, off_list, id_list):
-                h_i = prefill_hidden[cum : cum + q]  # [q, 1, H] this chunk's hiddens
-                t_i = prefill_tokens[cum : cum + q]  # [q]     this chunk's tokens
-                cum += q
-                # h_{off-1} is needed to seed the straddling entry at off-1, and is available only
-                # when this request computed position off-1 itself, i.e. off came from its own
-                # previous chunk. A prefix-cache hit also produces off > 0, but there the skipped
-                # prefix was computed by a DIFFERENT request whose activations are gone -- see the
-                # `else` branch.
-                own_prior_chunk = (
-                    self._mtp_chunk_boundary_hidden is not None
-                    and self._mtp_chunk_boundary_req_id == rid
+            segments.append(
+                self._mtp_prefill_commit_segments(
+                    context, gathered_hidden, decode_len, num_decode_requests, active_request_count
                 )
-                if off > 0 and own_prior_chunk:
-                    # Continuation chunk: boundary position off-1 = f(carried h_{off-1} + t_off),
-                    # then this chunk's roll-by-one off..off+q-2. count = q, start = off-1.
-                    p_hidden_segs.append(self._mtp_chunk_boundary_hidden.to(device))
-                    p_hidden_segs.append(h_i[:-1])
-                    p_token_segs.append(t_i[:1])
-                    p_token_segs.append(t_i[1:])
-                    p_counts.append(q)
-                    p_starts.append(off - 1)
-                else:
-                    # off == 0 (nothing precedes), or a prefix-cache hit. On a hit this request
-                    # inherits the matched blocks' draft KV, which is already correct for every
-                    # position p <= off-2: that entry is f(h_p + emb(t_{p+1})) and t_{p+1} lies
-                    # inside the shared prefix, so it is the same token for every request sharing
-                    # the block. Only position off-1 differs, because its entry consumes t_off --
-                    # the first token where children diverge. That entry is NOT rewritten here: it
-                    # lives in a ref-counted block shared with the producer and every sibling, so
-                    # writing this request's value would corrupt theirs. One stale key/value at the
-                    # divergence point costs a little draft acceptance and cannot affect verified
-                    # output. count = q-1, start = off.
-                    p_hidden_segs.append(h_i[:-1])
-                    p_token_segs.append(t_i[1:])
-                    p_counts.append(q - 1)
-                    p_starts.append(off)
-                # Carry this step's in-flight chunk's last hidden for the next chunk's boundary.
-                if chunked_id != -1 and rid == chunked_id:
-                    self._mtp_chunk_boundary_hidden = h_i[-1].detach().clone().view(1, 1, -1)
-                    self._mtp_chunk_boundary_req_id = chunked_id
-
-            append_parts.append(torch.tensor(p_counts, dtype=torch.long, device=device))
-            start_parts.append(torch.tensor(p_starts, dtype=torch.long, device=device))
-            hidden_parts.append(torch.cat(p_hidden_segs))
-            token_parts.append(torch.cat(p_token_segs))
+            )
 
         # No in-flight chunked request (none, or it finished its final chunk this step): drop the
         # carried boundary hidden so a later request can never match a stale id.
@@ -230,16 +168,175 @@ class MTPInferenceMixin:
             self._mtp_chunk_boundary_hidden = None
             self._mtp_chunk_boundary_req_id = -1
 
-        append_counts = torch.cat(append_parts)
-        request_start_positions = torch.cat(start_parts)
-        total = int(append_counts.sum().item())
+        append_counts = torch.cat([s.counts for s in segments]) if segments else None
+        total = 0 if append_counts is None else int(append_counts.sum().item())
         if total == 0:
             # Nothing committed to (re)write this step (e.g. all decode requests accepted 0 drafts
             # and no prefill). Caller runs a dummy slot so the EP forward count stays matched.
             return False
 
-        packed_hidden = torch.cat(hidden_parts)  # [total, 1, H], decode-first request order
-        packed_tokens = torch.cat(token_parts)  # [total]
+        self._mtp_commit_forward(
+            context,
+            unwrapped_model,
+            # [total, 1, H] and [total], both in decode-first request order.
+            packed_hidden=torch.cat([s.hidden for s in segments if s.hidden is not None]),
+            packed_tokens=torch.cat([s.tokens for s in segments if s.tokens is not None]),
+            append_counts=append_counts,
+            request_start_positions=torch.cat([s.starts for s in segments]),
+            total=total,
+            active_request_count=active_request_count,
+            num_decode_requests=num_decode_requests,
+        )
+        return True
+
+    def _mtp_decode_commit_segments(
+        self, context, gathered_hidden, num_decode_requests: int, base_position, stride: int
+    ) -> _CommitSegments:
+        """Refresh the accepted-draft positions of every decode request from this step's hiddens.
+
+        Request r accepted `a_r` drafts, whose KV was written during the previous step's draft
+        loop from chained draft hiddens. Rewrite the earlier `a_r` of those positions from the
+        main hiddens now that they are committed; the last accepted position is (re)written by
+        decode depth 0, so it is excluded here.
+        """
+        device = gathered_hidden.device
+        decode_len = num_decode_requests * stride
+        accepted = (
+            self._accepted_token_counts_per_request[:num_decode_requests]
+            .to(device, non_blocking=True)
+            .to(torch.long)
+        )
+        # start of each request's refreshed run: (last committed MTP pos) - a_r.
+        starts = base_position[:num_decode_requests] - 1 - accepted
+
+        total_a = int(accepted.sum().item())
+        if total_a == 0:
+            # Every decode request accepted zero drafts: the (count, start) pairs are still
+            # needed to keep one segment per active request, but there are no rows to rewrite.
+            return _CommitSegments(counts=accepted, starts=starts, hidden=None, tokens=None)
+
+        decode_hidden = gathered_hidden[:decode_len]  # [num_decode*stride, 1, H]
+        decode_tokens = context.gpu_view.token_to_input_ids[:decode_len].to(device)
+        rows_d = torch.repeat_interleave(torch.arange(num_decode_requests, device=device), accepted)
+        within_d = (
+            torch.arange(total_a, device=device) - (torch.cumsum(accepted, 0) - accepted)[rows_d]
+        )
+        hidden_idx = rows_d * stride + within_d  # base..draft_{a-2} main hiddens
+        return _CommitSegments(
+            counts=accepted,
+            starts=starts,
+            hidden=decode_hidden[hidden_idx],
+            tokens=decode_tokens[hidden_idx + 1],  # draft_0..draft_{a-1}
+        )
+
+    def _mtp_prefill_commit_segments(
+        self,
+        context,
+        gathered_hidden,
+        decode_len: int,
+        num_decode_requests: int,
+        active_request_count: int,
+    ) -> _CommitSegments:
+        """Seed the prompt positions of every prefill request from main hiddens (roll-by-one).
+
+        request_query_lengths is this step's CHUNK length `q` and request_kv_length_offsets is how
+        many prompt tokens prior chunks already prefilled (`off`), so each request seeds positions
+        off..off+q-2 (its last chunk position off+q-1 is seeded next chunk, or by the decode draft
+        loop on the final/only chunk). For a continuation chunk (off > 0) the position straddling
+        the previous chunk, off-1, is also seeded here from the carried-over previous-chunk hidden
+        h_{off-1} paired with this chunk's first token t_off. Built per request (num_prefill
+        is small and this forward is eager) so the continuation stays ONE segment -> the
+        segment count stays active_request_count and the fixed-size MHA-metadata buffers
+        never overflow.
+
+        Also refreshes the carried chunk-boundary hidden for the in-flight chunked request.
+        """
+        device = gathered_hidden.device
+        active_slice = slice(context.paused_request_count, context.total_request_count)
+        chunked_id = context.chunked_prefill_request_id
+
+        # request_* are CPU pinned tensors, so `.tolist()` is a cheap host read (no GPU sync).
+        prefill_slice = slice(num_decode_requests, active_request_count)
+        q_list = context.request_query_lengths[active_slice][prefill_slice].tolist()
+        off_list = context.request_kv_length_offsets[active_slice][prefill_slice].tolist()
+        id_list = context.request_ids[active_slice][prefill_slice].tolist()
+        total_prompt = sum(q_list)
+        prefill_hidden = gathered_hidden[decode_len : decode_len + total_prompt]
+        prefill_tokens = context.gpu_view.token_to_input_ids[
+            decode_len : decode_len + total_prompt
+        ].to(device)
+
+        p_counts, p_starts, p_hidden_segs, p_token_segs = [], [], [], []
+        cum = 0
+        for q, off, rid in zip(q_list, off_list, id_list):
+            h_i = prefill_hidden[cum : cum + q]  # [q, 1, H] this chunk's hiddens
+            t_i = prefill_tokens[cum : cum + q]  # [q]     this chunk's tokens
+            cum += q
+            # h_{off-1} is needed to seed the straddling entry at off-1, and is available only
+            # when this request computed position off-1 itself, i.e. off came from its own
+            # previous chunk. A prefix-cache hit also produces off > 0, but there the skipped
+            # prefix was computed by a DIFFERENT request whose activations are gone -- see the
+            # `else` branch.
+            own_prior_chunk = (
+                self._mtp_chunk_boundary_hidden is not None
+                and self._mtp_chunk_boundary_req_id == rid
+            )
+            if off > 0 and own_prior_chunk:
+                # Continuation chunk: boundary position off-1 = f(carried h_{off-1} + t_off),
+                # then this chunk's roll-by-one off..off+q-2. count = q, start = off-1.
+                p_hidden_segs.append(self._mtp_chunk_boundary_hidden.to(device))
+                p_hidden_segs.append(h_i[:-1])
+                p_token_segs.append(t_i[:1])
+                p_token_segs.append(t_i[1:])
+                p_counts.append(q)
+                p_starts.append(off - 1)
+            else:
+                # off == 0 (nothing precedes), or a prefix-cache hit. On a hit this request
+                # inherits the matched blocks' draft KV, which is already correct for every
+                # position p <= off-2: that entry is f(h_p + emb(t_{p+1})) and t_{p+1} lies
+                # inside the shared prefix, so it is the same token for every request sharing
+                # the block. Only position off-1 differs, because its entry consumes t_off --
+                # the first token where children diverge. That entry is NOT rewritten here: it
+                # lives in a ref-counted block shared with the producer and every sibling, so
+                # writing this request's value would corrupt theirs. One stale key/value at the
+                # divergence point costs a little draft acceptance and cannot affect verified
+                # output. count = q-1, start = off.
+                p_hidden_segs.append(h_i[:-1])
+                p_token_segs.append(t_i[1:])
+                p_counts.append(q - 1)
+                p_starts.append(off)
+            # Carry this step's in-flight chunk's last hidden for the next chunk's boundary.
+            if chunked_id != -1 and rid == chunked_id:
+                self._mtp_chunk_boundary_hidden = h_i[-1].detach().clone().view(1, 1, -1)
+                self._mtp_chunk_boundary_req_id = chunked_id
+
+        return _CommitSegments(
+            counts=torch.tensor(p_counts, dtype=torch.long, device=device),
+            starts=torch.tensor(p_starts, dtype=torch.long, device=device),
+            hidden=torch.cat(p_hidden_segs),
+            tokens=torch.cat(p_token_segs),
+        )
+
+    def _mtp_commit_forward(
+        self,
+        context,
+        unwrapped_model,
+        packed_hidden: Tensor,
+        packed_tokens: Tensor,
+        append_counts: Tensor,
+        request_start_positions: Tensor,
+        total: int,
+        active_request_count: int,
+        num_decode_requests: int,
+    ) -> None:
+        """Run the packed commit-pass rows through the MTP layer to populate draft K/V.
+
+        Pads to a TP multiple and scatters for sequence parallelism, publishes the varlen write
+        metadata on the context, and issues the forward. The output hidden is discarded -- only
+        the KV write matters.
+        """
+        device = packed_hidden.device
+        active_slice = slice(context.paused_request_count, context.total_request_count)
         block_table = (
             context.request_to_kv_block_ids[active_slice][:active_request_count]
             .to(device, non_blocking=True)
@@ -293,7 +390,6 @@ class MTPInferenceMixin:
             inference_context=context,
         )
         context._mtp_finalize_prefill_step()
-        return True
 
     def _mtp_dummy_prefill_forward(self, context, unwrapped_model) -> None:
         """Issue one MTP-layer forward with dummy tensors and NO KV append.
