@@ -1053,6 +1053,19 @@ def validate_args(args, defaults={}):
         assert args.overlap_grad_reduce, \
             'Must use --overlap-param-gather with --overlap-grad-reduce'
 
+    # A shortcut block calls its paired layers' sub-methods directly rather than their forward, so
+    # the FSDP parameter all-gather hooks registered on the TransformerLayer/MambaLayer FSDP units
+    # never fire and those parameters stay sharded. The expert-parallel overlap schedule hit the
+    # same problem and needed explicit release hooks that only cover TransformerLayer, HybridStack
+    # and MTP layers, none of which a shortcut block is.
+    assert not (
+        args.moe_shortcut_connection and (args.use_torch_fsdp2 or args.use_megatron_fsdp)
+    ), (
+        "FSDP is not supported with --moe-shortcut-connection: the shortcut block bypasses the "
+        "per-layer FSDP parameter all-gather hooks, leaving the paired attention and MoE layer "
+        "parameters sharded. Use DDP or --use-distributed-optimizer instead."
+    )
+
     if args.use_torch_fsdp2:
         assert is_torch_min_version("2.4.0"), \
             'FSDP2 requires PyTorch >= 2.4.0 with FSDP 2 support.'

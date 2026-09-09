@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+import transformer_engine as te
 
 import megatron.core.models.hybrid.hybrid_block as hybrid_block_module
 import megatron.core.transformer.utils as transformer_utils
@@ -825,9 +826,62 @@ class TestHybridBlock:
             shortcut.shortcut_post_norm,
         )
         assert len({id(norm.weight) for norm in logical_norms}) == len(logical_norms)
+        # This config leaves --normalization at its LayerNorm default.
+        assert all(isinstance(norm, te.pytorch.LayerNorm) for norm in logical_norms)
         for norm in logical_norms:
             assert norm.weight.grad is not None
             assert torch.isfinite(norm.weight.grad).all()
+        assert hidden_states.grad is not None
+        assert torch.isfinite(hidden_states.grad).all()
+
+    def test_shortcut_pair_supports_a_residual_returning_pre_mlp_norm(self):
+        """A fused residual pre-MLP norm spec is honoured, not rejected."""
+        import copy
+
+        from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
+
+        stack_spec = copy.deepcopy(hybrid_stack_spec)
+        stack_spec.submodules.moe_layer.submodules.pre_mlp_layernorm = TESpecProvider().layer_norm(
+            has_residual=True
+        )
+        block = self.get_hybrid_block(
+            Symbols.MAMBA + Symbols.MOE,
+            stack_spec=stack_spec,
+            num_moe_experts=1,
+            moe_router_topk=1,
+            moe_router_pre_softmax=True,
+            moe_token_dispatcher_type="allgather",
+            moe_shortcut_connection=True,
+            moe_shortcut_post_norm=True,
+            moe_shared_expert_intermediate_size=256,
+            normalization="RMSNorm",
+            fused_residual_rmsnorm=True,
+            add_bias_linear=False,
+            hidden_dropout=0.0,
+            attention_dropout=0.0,
+        )
+        shortcut = block.layers[0]
+        assert isinstance(shortcut, ShortcutMoEBlock)
+
+        # The MoE layer keeps the residual norm the spec asked for; the shortcut-owned norms,
+        # which have no residual partner, drop that intent.
+        assert shortcut.moe_layer.pre_mlp_layernorm.returns_residual
+        assert not shortcut.shortcut_pre_mlp_layernorm.returns_residual
+        assert not shortcut.shortcut_post_norm.returns_residual
+        # Dropping residual intent must not drop --normalization RMSNorm.
+        assert isinstance(shortcut.shortcut_pre_mlp_layernorm, te.pytorch.RMSNorm)
+        assert isinstance(shortcut.shortcut_post_norm, te.pytorch.RMSNorm)
+
+        block = block.cuda()
+        block.train()
+        hidden_states = torch.randn(
+            16, 2, block.config.hidden_size, device=torch.cuda.current_device(), requires_grad=True
+        )
+
+        output = block(hidden_states, attention_mask=None)
+        output.float().square().mean().backward()
+
+        assert output.shape == hidden_states.shape
         assert hidden_states.grad is not None
         assert torch.isfinite(hidden_states.grad).all()
 
