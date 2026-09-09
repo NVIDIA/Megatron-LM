@@ -433,8 +433,8 @@ class OptimizerConfig:
             )
 
         if self.optimizer_cuda_graph:
-            assert (
-                not math.isfinite(self.grad_norm_skip_threshold)
+            assert not math.isfinite(
+                self.grad_norm_skip_threshold
             ), 'Setting grad_norm_skip_threshold not supported with optimizer CUDA graph'
 
         if self.use_precision_aware_optimizer:
