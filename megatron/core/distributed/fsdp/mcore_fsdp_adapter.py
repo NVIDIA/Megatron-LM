@@ -648,7 +648,9 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             forward_prefetch_size=ddp_config.suggested_communication_unit_size,
             backward_prefetch_size=ddp_config.suggested_communication_unit_size,
         )
-        with fully_shard_context(device=device, use_symmetric_memory=ddp_config.nccl_ub):
+        with fully_shard_context(
+            device=device, use_symmetric_memory=ddp_config.nccl_ub, reuse_existing=True
+        ):
             if expert_dp_mesh is not None:
                 # Expert parameters are replicated over expert-DP, not the full DP group.
                 # Their gradients need the EP divisor because the same expert receives
