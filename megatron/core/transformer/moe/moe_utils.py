@@ -1,6 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import functools
+import logging
 import math
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Union
@@ -8,6 +9,7 @@ from typing import List, Optional, Tuple, Union
 import torch
 
 from megatron.core import parallel_state
+from megatron.core._rank_utils import log_single_rank
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fp4_utils import get_fp4_align_size
 from megatron.core.fp8_utils import get_fp8_align_size
@@ -58,6 +60,8 @@ else:
         fused_unpermute,
         te_general_gemm,
     ) = (None, None, None, None, None, None, None, None, None, None)
+
+logger = logging.getLogger(__name__)
 
 
 def switch_load_balancing_loss_func(
@@ -761,6 +765,43 @@ def pad_routing_map(routing_map: torch.Tensor, pad_multiple: int) -> torch.Tenso
 
     routing_map = routing_map.transpose(0, 1)
     return routing_map
+
+
+def warn_if_tokens_per_expert_unaligned(
+    tokens_per_expert: torch.Tensor, pad_multiple: int
+) -> None:
+    """Warn when router padding could not make every expert's token count aligned.
+
+    `pad_routing_map` pads an expert by flipping zero entries of the routing map, so it can
+    only reach the next multiple of `pad_multiple` while that multiple still fits inside
+    `num_tokens`. When it does not, the map that comes back keeps an unaligned count and the
+    grouped GEMM gets segments that break the alignment it was promised.
+
+    Pass `tokens_per_expert` once it is on the host. A CUDA tensor is left alone, so this
+    never forces a device synchronization.
+
+    Args:
+        tokens_per_expert (torch.Tensor): Number of tokens per local expert.
+        pad_multiple (int): The alignment that was requested from the padding.
+    """
+    if pad_multiple <= 0 or not torch.is_tensor(tokens_per_expert):
+        return
+    if tokens_per_expert.is_cuda:
+        return
+    misaligned = tokens_per_expert % pad_multiple != 0
+    if not misaligned.any():
+        return
+    log_single_rank(
+        logger,
+        logging.WARNING,
+        "Router padding could not align every local expert: got %s tokens for expert(s) %s, "
+        "which is not a multiple of %d. The next multiple of %d does not fit in the tokens "
+        "those experts can receive, so the grouped GEMM will see unaligned segments.",
+        tokens_per_expert[misaligned].tolist(),
+        misaligned.nonzero().flatten().tolist(),
+        pad_multiple,
+        pad_multiple,
+    )
 
 
 def topk_routing_with_score_function(
