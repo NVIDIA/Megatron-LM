@@ -287,7 +287,7 @@ class MegatronMultimodalTokenizer:
             chat_template=self._prompt_config.custom_chat_template,
         )
 
-        if tokenize:
+        if not self.use_gigatoken:
             tokens = tokens[0]
         else:
             # Tokenize conversation using gigatoken (when tokenize=False).
