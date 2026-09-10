@@ -69,10 +69,7 @@ class MegatronTokenizerVision(MegatronTokenizerBase):
         return self._tokenizer.detokenize(ids)
 
     def tokenize_conversation(
-        self,
-        conversation: List[Dict],
-        return_target: bool,
-        add_generation_prompt: bool,
+        self, conversation: List[Dict], return_target: bool, add_generation_prompt: bool
     ):
         """Convert a conversation to tokens.
 

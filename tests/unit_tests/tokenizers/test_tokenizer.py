@@ -605,7 +605,7 @@ def test_multimodal_matches_gigatoken_tokenizer():
     ), "default and gigatoken tokenization do not match."
     assert (
         target_tokens_default.tolist() == target_tokens_gigatoken.tolist()
-    ), "default and gigatoken tokenization do not match."    
+    ), "default and gigatoken tokenization do not match."
 
 
 def test_null_multimodal_tokenizer():
