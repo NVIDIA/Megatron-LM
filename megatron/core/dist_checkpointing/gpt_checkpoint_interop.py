@@ -8,9 +8,6 @@ sub-modules under ``decoder.layers.<i>.``. HybridModel gives every sub-block
 its own layer: in a pattern such as ``M*-M*-`` each GPT layer corresponds to
 one attention ('*') position and one MLP ('-' dense or 'E' MoE) position,
 while SSM ('M') positions have no GPT counterpart.
-Bracketed groups keep the same physical pairing, but combine their members'
-storage keys under one logical layer index. Their explicit module paths retain
-the inner ``layers.<member>.`` nesting.
 
 Rather than rewriting the checkpoint on disk, the hybrid run's own sharded
 state dict is retargeted at load time:
@@ -20,8 +17,7 @@ state dict is retargeted at load time:
   ``key`` (``decoder.layers.<g>.mlp...`` -> ``decoder.layers.mlp...``) and
   the matching GPT layer index becomes a prepended sharding axis, exactly
   mirroring ``TransformerBlock.sharded_state_dict`` with
-  ``non_homogeneous_layers=False``. When source checkpoint metadata has explicit
-  layer keys, the GPT layer index stays in the key and no axis is added;
+  ``non_homogeneous_layers=False`` (the format GPTModel training saves);
 * ``decoder.final_norm`` is pointed at GPT's ``decoder.final_layernorm``;
 * HybridModel's empty ``output_layer._extra_state`` entry stays local because
   GPT checkpoints intentionally omit that backward-compatibility key;
@@ -62,11 +58,8 @@ from megatron.core.dist_checkpointing.mapping import (
 )
 from megatron.core.models.hybrid.hybrid_layer_allocation import (
     Symbols,
-    flatten_layer_type_list,
     get_layer_maps_from_layer_type_list,
-    is_layer_group,
     parse_hybrid_pattern,
-    parse_segment_layers,
 )
 
 # Hybrid layer symbols that have a GPT-side source of weights ('*', '-', 'E')
@@ -96,15 +89,12 @@ class GPTCompatLayerMaps:
         fresh_init: hybrid global layer indices with no GPT counterpart;
             their modules keep the run's fresh initialization.
         num_gpt_layers: number of layers the source GPT checkpoint must have.
-        logical_to_physical: physical index, or tuple of member indices for a
-            bracketed group, for each logical layer in the model's storage keys.
     """
 
     attention_to_gpt: Mapping[int, int]
     mlp_to_gpt: Mapping[int, int]
     fresh_init: frozenset
     num_gpt_layers: int
-    logical_to_physical: tuple[int | tuple[int, ...], ...]
 
 
 def gpt_compatible_layer_maps(hybrid_layer_pattern: str) -> GPTCompatLayerMaps:
@@ -133,8 +123,7 @@ def gpt_compatible_layer_maps(hybrid_layer_pattern: str) -> GPTCompatLayerMaps:
     if not main_pattern:
         raise ValueError("Hybrid layer pattern is empty; set --hybrid-layer-pattern.")
 
-    logical_layers = parse_segment_layers(main_pattern)
-    layer_type_list = flatten_layer_type_list(logical_layers)
+    layer_type_list = list(main_pattern)
     translatable = set(_GPT_SOURCED_SYMBOLS) | set(_FRESH_INIT_SYMBOLS)
     unknown = sorted(set(layer_type_list) - translatable)
     if unknown:
@@ -165,62 +154,12 @@ def gpt_compatible_layer_maps(hybrid_layer_pattern: str) -> GPTCompatLayerMaps:
             f"sub-module, so the pattern needs an equal, nonzero number of each."
         )
 
-    logical_to_physical = []
-    physical_idx = 0
-    for layer in logical_layers:
-        if is_layer_group(layer):
-            logical_to_physical.append(tuple(range(physical_idx, physical_idx + len(layer))))
-            physical_idx += len(layer)
-        else:
-            logical_to_physical.append(physical_idx)
-            physical_idx += 1
-
     return GPTCompatLayerMaps(
         attention_to_gpt=dict(attention_map),
         mlp_to_gpt=dict(mlp_map),
         fresh_init=frozenset(layer_maps[Symbols.MAMBA]),
         num_gpt_layers=len(attention_map),
-        logical_to_physical=tuple(logical_to_physical),
     )
-
-
-def _resolve_hybrid_layer(key, layer_match, layer_maps, *, explicit=False):
-    """Resolve a logical storage key or nested module key to a physical layer."""
-    logical_idx = int(layer_match.group(1))
-    suffix = key[layer_match.end() :]
-    if logical_idx >= len(layer_maps.logical_to_physical):
-        raise ValueError(
-            f"State dict entry {key!r} refers to hybrid layer {logical_idx}, which is not "
-            "part of the hybrid layer pattern used to derive the GPT layer maps."
-        )
-    physical_indices = layer_maps.logical_to_physical[logical_idx]
-    if isinstance(physical_indices, int):
-        return physical_indices, suffix
-
-    # FSDP uses the actual nested module path, whereas sharded storage keys
-    # coalesce all members of a group under the same logical layer index.
-    if explicit:
-        member_match = re.match(r'layers\.(\d+)\.', suffix)
-        if member_match is not None:
-            member_idx = int(member_match.group(1))
-            if member_idx < len(physical_indices):
-                return physical_indices[member_idx], suffix[member_match.end() :]
-        raise ValueError(
-            f"State dict entry {key!r} does not identify a member of its hybrid group."
-        )
-
-    if suffix.startswith(('self_attention.', 'input_layernorm.')):
-        candidates = layer_maps.attention_to_gpt
-    elif suffix.startswith(('mlp.', 'pre_mlp_layernorm.')):
-        candidates = layer_maps.mlp_to_gpt
-    elif suffix.startswith(('mixer.', 'norm.')):
-        candidates = layer_maps.fresh_init
-    else:
-        candidates = ()
-    matches = [idx for idx in physical_indices if idx in candidates]
-    if len(matches) != 1:
-        raise ValueError(f"Cannot identify the hybrid group member for state dict entry {key!r}.")
-    return matches[0], suffix
 
 
 def _prepend_gpt_layer_axis(entry, gpt_layer_idx: int, num_gpt_layers: int):
@@ -264,15 +203,13 @@ def _prepend_gpt_layer_axis(entry, gpt_layer_idx: int, num_gpt_layers: int):
 
 
 def retarget_sharded_state_dict_to_gpt_checkpoint(
-    sharded_state_dict: ShardedStateDict,
-    layer_maps: GPTCompatLayerMaps,
-    checkpoint_keys: Iterable[str] | None = None,
+    sharded_state_dict: ShardedStateDict, layer_maps: GPTCompatLayerMaps
 ) -> None:
     """Point a hybrid model's sharded state dict at a GPT checkpoint, in place.
 
     Only the storage lookup metadata (``key`` and sharding axes) of each
-    ``ShardedBase`` entry is rewritten into the GPT checkpoint's layer format;
-    the nested state dict structure (used by the subsequent
+    ``ShardedBase`` entry is rewritten into the GPT checkpoint's homogeneous
+    layer format; the nested state dict structure (used by the subsequent
     ``load_state_dict``) keeps the hybrid model's own names. Entries of layers
     with no GPT counterpart are replaced by ``LocalNonpersistentObject`` so the
     loaded state dict returns their current (freshly initialized) values.
@@ -288,13 +225,7 @@ def retarget_sharded_state_dict_to_gpt_checkpoint(
             state dict.
         layer_maps: maps from :func:`gpt_compatible_layer_maps` derived from
             the same pattern the model was built with.
-        checkpoint_keys: source checkpoint storage keys. Indexed layer keys
-            select the heterogeneous format; otherwise prepend a layer axis.
-            Omit to use the historical homogeneous GPT format.
     """
-    non_homogeneous_layers = checkpoint_keys is not None and any(
-        _DECODER_LAYER_KEY_RE.search(key) is not None for key in checkpoint_keys
-    )
 
     def _retarget(entry):
         if not isinstance(entry, ShardedBase):
@@ -305,7 +236,7 @@ def retarget_sharded_state_dict_to_gpt_checkpoint(
 
         layer_match = _DECODER_LAYER_KEY_RE.search(entry.key)
         if layer_match is not None:
-            hybrid_idx, suffix = _resolve_hybrid_layer(entry.key, layer_match, layer_maps)
+            hybrid_idx = int(layer_match.group(1))
             if hybrid_idx in layer_maps.fresh_init:
                 return LocalNonpersistentObject(entry.data)
             gpt_idx = layer_maps.attention_to_gpt.get(hybrid_idx)
@@ -318,12 +249,12 @@ def retarget_sharded_state_dict_to_gpt_checkpoint(
                     f"used to derive the GPT layer maps. The pattern and the "
                     f"instantiated model do not match."
                 )
-            layer_prefix = f'{entry.key[:layer_match.start()]}decoder.layers.'
-            if non_homogeneous_layers:
-                entry.key = f'{layer_prefix}{gpt_idx}.{suffix}'
-                return entry
-            # Homogeneous GPT checkpoints encode the layer as a sharding axis.
-            entry.key = f'{layer_prefix}{suffix}'
+            # GPT checkpoints use the homogeneous layer format: no layer index
+            # in the key, the layer is a sharding axis instead.
+            entry.key = (
+                f'{entry.key[:layer_match.start()]}decoder.layers.'
+                f'{entry.key[layer_match.end():]}'
+            )
             return _prepend_gpt_layer_axis(entry, gpt_idx, layer_maps.num_gpt_layers)
 
         for hybrid_prefix, gpt_prefix in _GPT_FINAL_NORM_KEY_MAP.items():
@@ -353,7 +284,7 @@ def _retarget_explicit_key_to_gpt_checkpoint(
 
     layer_match = _DECODER_LAYER_KEY_RE.search(key)
     if layer_match is not None:
-        hybrid_idx, suffix = _resolve_hybrid_layer(key, layer_match, layer_maps, explicit=True)
+        hybrid_idx = int(layer_match.group(1))
         if hybrid_idx in layer_maps.fresh_init:
             return None
         gpt_idx = layer_maps.attention_to_gpt.get(hybrid_idx)
@@ -365,7 +296,7 @@ def _retarget_explicit_key_to_gpt_checkpoint(
                 "which is not part of the hybrid layer pattern used to derive the "
                 "GPT layer maps."
             )
-        key = f'{key[:layer_match.start()]}decoder.layers.{gpt_idx}.{suffix}'
+        key = f'{key[:layer_match.start()]}decoder.layers.{gpt_idx}.' f'{key[layer_match.end():]}'
 
     for hybrid_prefix, gpt_prefix in _GPT_FINAL_NORM_KEY_MAP.items():
         pos = key.find(hybrid_prefix)

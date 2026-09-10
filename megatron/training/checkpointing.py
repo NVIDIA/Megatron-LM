@@ -46,10 +46,7 @@ from megatron.core.dist_checkpointing.strategies.torch import (
 from megatron.core.msc_utils import MultiStorageClientFeature, maybe_msc
 from megatron.core.num_microbatches_calculator import update_num_microbatches
 from megatron.core.optimizer import DistributedOptimizer
-from megatron.core.post_training.modelopt.checkpointing import (
-    save_modelopt_state,
-    save_sharded_modelopt_state,
-)
+from megatron.core.post_training.modelopt.checkpointing import save_modelopt_state, save_sharded_modelopt_state
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.tokenizers import MegatronTokenizer
 from megatron.core.utils import get_pg_rank, get_pg_size, unwrap_model
@@ -2752,14 +2749,6 @@ def load_checkpoint(
                 retarget_sharded_state_dict_to_gpt_checkpoint,
             )
 
-            # GPT can save either homogeneous layer axes or explicit layer keys.
-            # Inspect the saved keys: content metadata alone does not capture all
-            # TransformerBlock switches that select the heterogeneous format.
-            gpt_checkpoint_keys = (
-                dist_checkpointing.load_tensors_metadata(checkpoint_name)
-                if ckpt_type == CheckpointType.GLOBAL
-                else None
-            )
             # The optimizer sharded state dict is built from the (hybrid) model sharded
             # state dict, so its entries carry the same ``decoder.layers.<i>.`` keys and
             # sharding; the same retargeting points them at the GPT checkpoint too.
@@ -2769,9 +2758,7 @@ def load_checkpoint(
                     sd_key == 'optimizer' or re.fullmatch(r'optimizer\d+', sd_key)
                 )
                 if is_model or is_optim:
-                    retarget_sharded_state_dict_to_gpt_checkpoint(
-                        sub_sd, gpt_compat_layer_maps, gpt_checkpoint_keys
-                    )
+                    retarget_sharded_state_dict_to_gpt_checkpoint(sub_sd, gpt_compat_layer_maps)
     elif args.ckpt_format == 'torch_dcp':
         model_sd = model[0].state_dict()
         optimizer_sd = optimizer.state_dict(is_loading=True)
