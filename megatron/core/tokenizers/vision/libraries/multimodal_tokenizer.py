@@ -223,18 +223,18 @@ class MegatronMultimodalTokenizer:
 
         return text
 
-    def tokenize(self, text: Union[str, List[Dict]]):
+    def tokenize(self, text: Union[str, List[Dict]], add_special_tokens: bool = True):
         """Tokenize conversation or string input."""
         if isinstance(text, list):
             # This code path is used by the inference code currently.
             return self.tokenize_conversation(text, False, True).tolist()
 
-        return self._encode(text)
+        return self._encode(text, add_special_tokens=add_special_tokens)
 
-    def _encode(self, text: str):
+    def _encode(self, text: str, add_special_tokens: bool = True):
         """Tokenize text input."""
         text = self._apply_image_tag(text)
-        return self.tokenizer.encode(text)
+        return self.tokenizer.encode(text, add_special_tokens=add_special_tokens)
 
     def tokenize_conversation(
         self,
@@ -300,7 +300,7 @@ class MegatronMultimodalTokenizer:
             tokens = tokens[0]
         else:
             # Tokenize conversation using gigatoken (when tokenize=False).
-            tokens = np.array(self.tokenize(tokens))
+            tokens = np.array(self.tokenize(tokens, add_special_tokens=False))
 
         if not return_target:
             return tokens
