@@ -116,6 +116,8 @@ class _RecordingChunk:
         self.pre_process = _RecordingNode(calls, "chunk.pre_process")
         self.post_process = None
         self.vp_stage = 0
+        # Match TransformerModelChunkSchedulePlan's optional release interface.
+        self.tensor_release = None
         # Read by run() only on the post_process path, which this chunk does not take.
         self.recompute_full = False
 

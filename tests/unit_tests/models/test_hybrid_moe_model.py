@@ -115,6 +115,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "enable_cuda_graph": False,
     "enable_hyper_connections": False,
     "ep_overlap_early_attn_memory_release": False,
+    "ep_overlap_use_scheduled_tensor_release": False,
     "experimental_attention_variant": None,
     "experimental_attention_variant_loss_scale_func": None,
     "expert_model_parallel_size": 4,
