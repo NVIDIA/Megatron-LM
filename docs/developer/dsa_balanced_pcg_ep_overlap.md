@@ -85,6 +85,12 @@ An entire pipeline rank with no graphable layers still participates in the
 cross-PP slot-capacity reduction, so eager-only stages cannot strand graphable
 stages in capture initialization.
 
+Non-final mHC chunks can end in an identity decoder boundary. When pipeline
+output deallocation is enabled, that boundary must return a tensor with an
+autograd edge to its input, rather than the input leaf itself. Otherwise reducing
+the sent tensor's storage to one element also changes the preceding node's
+gradient shape. Only this terminal identity case needs an output clone.
+
 ## Validation
 
 Focused tests cover logical-to-capture indexing, changing pack counts, distinct

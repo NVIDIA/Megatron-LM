@@ -9,6 +9,7 @@ from megatron.core.enums import Fp8Recipe
 from megatron.core.models.common.model_chunk_schedule_plan import TransformerModelChunkSchedulePlan
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_dsv4_stack_spec, hybrid_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel
+from megatron.core.pipeline_parallel.schedules import deallocate_output_tensor
 from megatron.core.pipeline_parallel.utils import set_streams
 from megatron.core.tensor_parallel.random import (
     _get_all_rng_states,
@@ -357,6 +358,88 @@ def test_hybrid_fp8_bf16_boundary_input_lifetime(mhc):
     finally:
         for hook in hooks:
             hook.remove()
+        model.zero_grad(set_to_none=True)
+        del model
+        destroy_moe_metrics_tracker()
+        Utils.destroy_model_parallel()
+        gc.collect()
+        torch.cuda.empty_cache()
+
+
+@pytest.mark.internal
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("terminal_layer", ["C", "-"])
+def test_hybrid_nonfinal_chunk_preserves_gradients_after_output_deallocation(terminal_layer):
+    """A non-MoE terminal node must survive the real pipeline pseudo-deallocation.
+
+    Non-final mHC chunks have an identity decoder boundary. Returning its input
+    leaf directly makes deallocation corrupt the gradient shape passed to the
+    preceding attention/dense compute node, even before CUDA graph capture.
+    """
+    if Utils.world_size < 2:
+        pytest.skip("requires torchrun with at least two GPUs for the EP configuration")
+    Utils.initialize_model_parallel(expert_model_parallel_size=2)
+    set_streams()
+    torch.manual_seed(123)
+    model_parallel_cuda_manual_seed(123)
+    config = _make_config(
+        num_layers=1,
+        csa_compress_ratios=[4 if terminal_layer == "C" else 0],
+        dsa_indexer_loss_coeff=0.1,
+        dsa_indexer_rotate_activation=False,
+        hidden_dropout=0.0,
+        attention_dropout=0.0,
+        ffn_hidden_size=256,
+        moe_ffn_hidden_size=128,
+        num_moe_experts=4,
+        expert_model_parallel_size=2,
+        moe_token_dispatcher_type="alltoall",
+        moe_grouped_gemm=True,
+        moe_router_topk=2,
+        moe_router_dtype="fp32",
+        overlap_moe_expert_parallel_comm=True,
+        enable_hyper_connections=True,
+        deallocate_pipeline_outputs=True,
+        normalization="RMSNorm",
+    )
+    model = HybridModel(
+        config=config,
+        hybrid_stack_spec=hybrid_dsv4_stack_spec(config),
+        vocab_size=256,
+        max_sequence_length=128,
+        hybrid_layer_pattern=terminal_layer,
+        pre_process=True,
+        post_process=False,
+    ).cuda()
+    batch = dict(
+        input_ids=torch.randint(0, 256, (2, 128), device="cuda"),
+        position_ids=torch.arange(128, device="cuda").expand(2, -1),
+        attention_mask=None,
+    )
+    try:
+        expected_output = model(**batch)
+        gradient = torch.randn_like(expected_output)
+        expected_output.backward(gradient)
+        expected_grads = {
+            name: None if parameter.grad is None else parameter.grad.detach().clone()
+            for name, parameter in model.named_parameters()
+        }
+        model.zero_grad(set_to_none=True)
+        plan = model.build_schedule_plan(**batch)
+        assert plan.post_process is None
+        output = TransformerModelChunkSchedulePlan.run(plan, None)
+        torch.testing.assert_close(output, expected_output, rtol=0, atol=0)
+        deallocate_output_tensor(output, deallocate_pipeline_outputs=True)
+        assert output.shape == (1,)
+        TransformerModelChunkSchedulePlan.run(None, plan, b_grad=gradient)
+        torch.cuda.synchronize()
+        for name, parameter in model.named_parameters():
+            reference = expected_grads[name]
+            assert (parameter.grad is None) == (reference is None), name
+            if reference is not None:
+                torch.testing.assert_close(parameter.grad, reference, rtol=0, atol=0, msg=name)
+        assert any(gradient is not None for gradient in expected_grads.values())
+    finally:
         model.zero_grad(set_to_none=True)
         del model
         destroy_moe_metrics_tracker()
