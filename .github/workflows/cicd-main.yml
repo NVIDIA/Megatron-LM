@@ -443,8 +443,10 @@ jobs:
         run: |
           BASE_REF="${BASE_REF#refs/heads/}"
           git fetch origin "$BASE_REF"
+          # Pure renames (-M100%) carry no new values and are skipped; a renamed and
+          # edited file shows up as an addition and is checked.
           mapfile -t GOLDEN_VALUES_FILES < <(
-            git diff --name-only --diff-filter=ACMR \
+            git diff --name-only --diff-filter=ACM -M100% \
               --merge-base "origin/$BASE_REF" -- \
               ':(glob)tests/functional_tests/test_cases/**/golden_values*.json'
           )
