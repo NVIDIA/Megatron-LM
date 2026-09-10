@@ -35,6 +35,7 @@ from megatron.core.transformer.moe.fused_a2a import (
 )
 from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
 from megatron.core.transformer.moe.moe_utils import fused_permute_and_pad_with_probs
+from megatron.core.transformer.moe.token_dispatcher import nccl_ep_release_context
 from megatron.core.transformer.spec_utils import get_submodules
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.initialize import _set_random_seed
@@ -112,16 +113,13 @@ def _dispatcher_options(dispatcher: str) -> Dict[str, object]:
             "moe_permute_fusion": True,
         }
     if dispatcher == "ncclep":
-        # NCCL-EP dispatch packs aligned expert segments, but the module grouped-tensor path is
-        # intentionally config-rejected until its end-to-end numerics and padding are validated.
+        # NCCL-EP dispatch packs aligned expert segments inside its fused dispatch. Eager mode
+        # (no moe_expert_rank_capacity_factor) returns exactly the received rows, which the
+        # lifecycle assertions compare against the padded expert counts.
         return {
             "moe_token_dispatcher_type": "flex",
             "moe_flex_dispatcher_backend": "ncclep",
             "moe_permute_fusion": True,
-            "moe_expert_rank_capacity_factor": 8.0,
-            # The lifecycle assertions inspect the dynamically narrowed expert buffer. Static
-            # NCCL-EP intentionally exposes the full receive-capacity buffer instead.
-            "moe_ncclep_static_shape": False,
         }
     raise ValueError(f"Unknown dispatcher {dispatcher!r}")
 
@@ -278,6 +276,11 @@ def _run_numerical_parity_case(
     grad_output = torch.randn_like(base_input)
 
     reference_result = _run_forward_backward(reference, base_input, grad_output)
+    if dispatcher == "ncclep":
+        # The NCCL-EP backend caches one per-expert alignment per process. The reference layer
+        # (no grouped tensor) uses 0 and the target uses 256, so release the context so the
+        # target re-bootstraps with its own alignment.
+        nccl_ep_release_context()
     target_result = _run_forward_backward(target, base_input, grad_output)
 
     assert target.experts._use_grouped_tensor
@@ -561,7 +564,6 @@ class TestGroupedTensorDispatcherNumerics:
             single_grouped_bias=single_grouped_bias,
         )
 
-    @pytest.mark.skip(reason=_NCCL_EP_GROUPED_TENSOR_UNSUPPORTED_REASON)
     @pytest.mark.parametrize(
         "single_grouped_weight,use_bias,single_grouped_bias", _PARAMETER_LAYOUTS
     )
@@ -592,7 +594,6 @@ class TestGroupedTensorDispatcherNumerics:
         """HybridEP fused dispatch pads, and fused combine returns the original token shape."""
         _run_padding_lifecycle_case("hybridep", monkeypatch)
 
-    @pytest.mark.skip(reason=_NCCL_EP_GROUPED_TENSOR_UNSUPPORTED_REASON)
     @pytest.mark.timeout(180)
     def test_ncclep_grouped_tensor_padding_lifecycle(self, monkeypatch):
         """NCCL-EP padding lifecycle coverage reserved for future enablement."""
