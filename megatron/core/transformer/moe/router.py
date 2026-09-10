@@ -207,6 +207,7 @@ class TopKRouter(Router):
             self.expert_bias = None
 
         # Initialize global tokens per expert for global aux loss
+        self.global_num_tokens: Optional[torch.Tensor]
         if self.get_aux_loss_coeff("global_aux_loss") > 0:
             self.register_buffer(
                 'global_tokens_per_expert',
@@ -222,9 +223,15 @@ class TopKRouter(Router):
                 torch.tensor(0, dtype=torch.float32, device=torch.cuda.current_device()),
                 persistent=False,
             )
+            self.register_buffer(
+                'global_num_tokens',
+                torch.tensor(0, dtype=torch.int64, device=torch.cuda.current_device()),
+                persistent=False,
+            )
         else:
             self.global_tokens_per_expert = None
             self.ga_steps = None
+            self.global_num_tokens = None
 
         # Quantile balancing replaces the aux loss with a per-expert bias `qb_beta`.
         # `qb_beta_accum`/`qb_beta_count` collect the per-microbatch quantile, reduced
@@ -521,6 +528,7 @@ class TopKRouter(Router):
         global_aux_loss_coeff = self.get_aux_loss_coeff("global_aux_loss")
         if global_aux_loss_coeff == 0:
             return probs
+        assert self.global_num_tokens is not None
 
         # Use unified function to compute tokens_per_expert and num_tokens
         global_tokens_per_expert, local_num_tokens, total_num_tokens = (
@@ -534,11 +542,18 @@ class TopKRouter(Router):
 
         self.global_tokens_per_expert += global_tokens_per_expert
         self.ga_steps += 1
-        averated_tokens_per_expert = self.global_tokens_per_expert / self.ga_steps
+        self.global_num_tokens += torch.as_tensor(
+            total_num_tokens, dtype=torch.int64, device=self.global_num_tokens.device
+        )
+        # The helper divides by the current token count. Rescale the cumulative counts
+        # so their effective denominator is the number of valid tokens seen so far.
+        normalized_tokens_per_expert = self.global_tokens_per_expert * (
+            total_num_tokens / self.global_num_tokens.clamp_min(1)
+        )
 
         global_aux_loss = switch_load_balancing_loss_func(
             probs=scores_for_aux_loss,
-            tokens_per_expert=averated_tokens_per_expert,
+            tokens_per_expert=normalized_tokens_per_expert,
             total_num_tokens=total_num_tokens,
             topk=self.topk,
             num_experts=self.config.num_moe_experts,
@@ -845,8 +860,10 @@ class TopKRouter(Router):
     def reset_global_aux_loss_tracker(self):
         """Reset the global aux loss tracker."""
         if self.global_tokens_per_expert is not None:
+            assert self.global_num_tokens is not None
             self.global_tokens_per_expert.zero_()
             self.ga_steps.zero_()
+            self.global_num_tokens.zero_()
 
     def forward(self, input: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
         """
