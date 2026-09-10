@@ -293,6 +293,34 @@ def _worker_warns_once(rank, world_size, port):
         ps.initialize_model_parallel()
 
 
+def _worker_auto_mode_forces_duplicated_for_split(rank, world_size, port):
+    """tp_mode="auto" must not let the shape/group_size cost model decide whether the
+    split happens: pinned to duplicated whenever qkv_split_shapes is set, so this must
+    match the TP1 reference and never hit the row-sharded fallback -- regardless of what
+    the cost model would otherwise pick for this shape."""
+    _init_model_parallel(1, world_size)
+    try:
+        pgc = ProcessGroupCollection.use_mpu_process_groups()
+        opt = _make_muon(pgc, tp_mode="auto")
+        w = _full_weight()
+        ref = _reference_split_orth(opt, w, pgc.tp)
+
+        gs = torch.distributed.get_world_size(group=pgc.gtp_remat)
+        gr = torch.distributed.get_rank(group=pgc.gtp_remat)
+        sp = _M // gs
+        local = w[gr * sp : (gr + 1) * sp, :].clone()
+        local.is_gtp_weight_remat = True
+
+        out = opt.scaled_orthogonalize_fn_with_gtp_remat(
+            local, local, pgc.tp, None, qkv_split_shapes=_SPLIT
+        )
+        assert not opt._warned_qkv_split_disabled, "auto must not hit the row-sharded fallback"
+        torch.testing.assert_close(out, ref[gr * sp : (gr + 1) * sp, :], atol=_ATOL, rtol=_RTOL)
+    finally:
+        ps.destroy_model_parallel()
+        ps.initialize_model_parallel()
+
+
 def _worker_partial_pg_collection(rank, world_size, port):
     """The tagging loop and the step must resolve the SAME GTP group.
 
@@ -355,6 +383,11 @@ class TestGTPMuonQKVSplit:
     def test_row_sharded_modes_fall_back_to_whole_matrix(self, mode, world_size):
         _requires_multi_gpu(world_size)
         _run_distributed(_worker_row_sharded_modes_fall_back, world_size, mode)
+
+    @pytest.mark.parametrize("world_size", _GTP_WORLD_SIZES)
+    def test_auto_mode_forces_duplicated_for_split(self, world_size):
+        _requires_multi_gpu(world_size)
+        _run_distributed(_worker_auto_mode_forces_duplicated_for_split, world_size)
 
     @pytest.mark.parametrize("world_size", _GTP_WORLD_SIZES)
     def test_fallback_warns_once(self, world_size):
