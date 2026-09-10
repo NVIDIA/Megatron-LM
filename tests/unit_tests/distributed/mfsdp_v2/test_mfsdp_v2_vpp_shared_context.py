@@ -3,12 +3,13 @@
 """VPP context-sharing test for MFSDP v2.
 
 ``virtual_pipeline_model_parallel_size > 1`` manifests as multiple model chunks
-on a rank. ``wrap_model_chunks_with_ddp`` wraps each chunk in its own
-``FullyShardedDataParallelV2``. With the shared-context feature, a single
-``fully_shard_context`` is opened around the per-chunk loop so every chunk joins
-ONE FSDP context, which is finalized exactly once after the loop. This test
-drives the helper directly and asserts that all wrapped chunks share the same
-``FsdpContext``.
+on a rank, and ``wrap_model_chunks_with_ddp`` wraps each chunk in its own
+``FullyShardedDataParallelV2``. For MFSDP v2 the helper opens one ambient
+``fully_shard_context`` around the whole per-chunk loop; each chunk's adapter
+joins it through ``current_fully_shard_context()`` instead of opening a second
+context, and the helper finalizes the shared context exactly once after the
+loop. This test drives the helper directly and asserts that all wrapped chunks
+share the same ``FsdpContext``.
 """
 
 import pytest
@@ -17,6 +18,9 @@ import torch.nn as nn
 
 from megatron.core.distributed import DistributedDataParallelConfig, FullyShardedDataParallel
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallelV2
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.fully_shard import (
+    current_fully_shard_context,
+)
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import TransformerConfig
@@ -70,8 +74,8 @@ class TestMfsdpV2VppSharedContext:
             pg_collection = ProcessGroupCollection.use_mpu_process_groups()
 
             # virtual_pipeline_model_parallel_size > 1 yields multiple chunks on this
-            # rank; model two VPP sub-stages here. The ambient shared
-            # fully_shard_context is only opened when more than one chunk is wrapped.
+            # rank; model two VPP sub-stages here. The ambient fully_shard_context is
+            # opened for every MFSDP v2 wrap, regardless of the chunk count.
             chunks = [
                 _VppChunk().to(device=device, dtype=torch.bfloat16) for _ in range(2)
             ]
@@ -98,5 +102,9 @@ class TestMfsdpV2VppSharedContext:
             # The shared context was finalized exactly once after the loop, so it is
             # ready to drive forward/backward without an extra finalize.
             contexts[0].ensure_finalized()
+
+            # The helper left no ambient context behind: the chunks joined its scope and
+            # that scope, which owned the only finalize call, has since exited.
+            assert current_fully_shard_context() is None
         finally:
             Utils.destroy_model_parallel()

@@ -12,6 +12,7 @@ from megatron.core.distributed import (
     DistributedDataParallelConfig,
     FullyShardedDataParallel,
 )
+from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallelV2
 from megatron.core.full_cuda_graph import get_shared_capture_stream
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 from megatron.core.optimizer.layer_wise_optimizer import (
@@ -32,17 +33,12 @@ from megatron.core.transformer import MegatronModule, TransformerConfig
 from megatron.core.transformer.module import Float16Module
 from megatron.core.utils import get_model_config, get_pg_rank
 
-
 try:
     from megatron.core.fp8_utils import correct_amax_history_if_needed
 except ImportError:
     correct_amax_history_if_needed = None
 
-try:
-    from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import fully_shard_context
-except ImportError:
-    fully_shard_context = None
-
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import fully_shard_context
 
 logger = logging.getLogger(__name__)
 
@@ -357,24 +353,6 @@ def _ddp_wrap(
         if not use_torch_fsdp2:
             dp_init_kwargs["pg_collection"] = pg_collection
 
-        # MFSDP v2 chunks each open their own ``fully_shard_context`` scope via
-        # ``reuse_existing=True``. When wrapping multiple VPP chunks, open one ambient
-        # context around the whole loop so every chunk joins the SAME FSDP context, which is
-        # then finalized once here. Mirrors wrap_model_chunks_with_ddp() in
-        # megatron/training/training.py.
-        share_fsdp_context = (
-            fully_shard_context is not None
-            and use_megatron_fsdp
-            and ddp_config.megatron_fsdp_version == 2
-            and len(model) > 1
-        )
-        shared_context = (
-            fully_shard_context(
-                reuse_existing=True, use_symmetric_memory=ddp_config.nccl_ub
-            )
-            if share_fsdp_context
-            else nullcontext()
-        )
         # MFSDP v2 rejects ``disable_bucketing=True`` (see
         # FullyShardedDataParallelV2._validate_config) and does not use the classic
         # per-chunk disabling that the DDP/distributed-optimizer path relies on to size
@@ -382,10 +360,22 @@ def _ddp_wrap(
         # independently over its own FsdpModule, so bucketing must stay enabled for every
         # chunk. Otherwise a multi-chunk (VPP) wrap sets ``disable_bucketing=True`` on
         # non-first chunks and fails validation.
-        is_mfsdp_v2 = use_megatron_fsdp and ddp_config.megatron_fsdp_version == 2
-
+        #
+        # For MFSDP v2 the adapter joins whatever FsdpContext is already active and only
+        # opens one when none is (see ``current_fully_shard_context``), so opening one
+        # ambient context around the loop below puts every chunk of this call on the same
+        # context, sharing communication streams and prefetch orders. Mirrors
+        # wrap_model_chunks_with_ddp() in megatron/training/training.py.
+        is_mfsdp_v2 = (
+            DP is FullyShardedDataParallel or DP is FullyShardedDataParallelV2
+        ) and ddp_config.megatron_fsdp_version == 2
+        construction_context = (
+            fully_shard_context(use_symmetric_memory=ddp_config.nccl_ub)
+            if is_mfsdp_v2
+            else nullcontext()
+        )
         wrapped_model = []
-        with shared_context:
+        with construction_context:
             for model_chunk_idx, model_chunk in enumerate(model):
                 chunk_kwargs = dict(dp_init_kwargs)
                 disable_bucketing = (

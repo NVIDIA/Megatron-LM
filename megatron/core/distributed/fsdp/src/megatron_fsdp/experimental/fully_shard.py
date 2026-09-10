@@ -59,13 +59,24 @@ class Placements:
                 raise ValueError(f"Expected {axis_count} {name} placements, got {len(placements)}.")
 
 
+def current_fully_shard_context() -> FsdpContext | None:
+    """Return the innermost active ``fully_shard_context``, or ``None``.
+
+    Read-only counterpart of :func:`fully_shard_context`: it never creates, joins, or
+    finalizes a context, and returns ``None`` whenever no ``fully_shard_context`` scope is
+    active. Callers that must share one context -- for example per-chunk wrappers built by
+    a single wrap call -- use it to join the caller's ambient context instead of opening a
+    second one.
+    """
+    return _FSDP_CONTEXT.get()
+
+
 @contextmanager
 def fully_shard_context(
     device: torch.device | None = None,
     *,
     use_symmetric_memory: bool = False,
     unify_communication_stream: bool = False,
-    reuse_existing: bool = False,
 ) -> Iterator[FsdpContext]:
     """Construct FSDP modules that share runtime streams and prefetch orders.
 
@@ -80,28 +91,9 @@ def fully_shard_context(
         unify_communication_stream: Whether all-gathers and reduce-scatters share one
             communication stream to reduce peak transient memory. See
             https://github.com/NVIDIA/Megatron-LM/issues/6471.
-        reuse_existing: Reuse an already-active context on the same ``device`` instead
-            of starting a nested scope. When set, only the context that actually created
-            the shared context (the outermost scope) calls :meth:`FsdpContext.finalize`;
-            reused scopes exit without finalizing. A context cannot be shared across
-            devices, so requesting reuse while a context is active on a different
-            ``device`` raises ``ValueError``.
     """
     existing = _FSDP_CONTEXT.get()
     if existing is not None:
-        if reuse_existing:
-            requested = device if device is not None else torch.device(
-                "cuda", torch.cuda.current_device()
-            )
-            if existing.allgather_stream.device != requested:
-                raise ValueError(
-                    "fully_shard_context cannot be shared across devices: active context "
-                    f"is on {existing.allgather_stream.device}, requested {requested}."
-                )
-            # Join the outermost scope's context. Only the scope that created the
-            # context finalizes it; reused scopes leave finalization to the creator.
-            yield existing
-            return
         raise RuntimeError("fully_shard_context does not support nesting.")
 
     device = device or torch.device("cuda", torch.cuda.current_device())
