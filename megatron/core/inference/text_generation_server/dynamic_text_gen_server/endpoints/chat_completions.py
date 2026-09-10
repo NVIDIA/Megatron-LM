@@ -765,14 +765,9 @@ try:
         parsers = current_app.config['parsers']
 
         req = await request.get_json()
-        ng_capture = req.get("ng_capture")
-        if ng_capture is not None and not isinstance(ng_capture, dict):
-            return Response("'ng_capture' must be an object", status=400)
-        capture_prefix_requested = bool(
-            ng_capture is not None and ng_capture.get("mode") == "token_in"
-        )
-        prompt_suffix_token_ids = None
-        prefix_boundary_token_id = None
+        request_metadata = req.get("request_metadata")
+        if request_metadata is not None and not isinstance(request_metadata, dict):
+            return Response("'request_metadata' must be an object", status=400)
         prevent_retokenization = req.get(
             "prevent_retokenization", not current_app.config.get('eval_mode', False)
         )
@@ -884,11 +879,7 @@ try:
                         ),
                     )
 
-                if (
-                    prevent_retokenization
-                    or required_prefix_token_ids is not None
-                    or capture_prefix_requested
-                ):
+                if prevent_retokenization or required_prefix_token_ids is not None:
                     # If we are avoiding retokenization, we need to replace some prompt tokens with the prompt/generation tokens from the previous generation
                     # This improves prefix cache hits and reduces logprob variation between training and inference.
 
@@ -904,9 +895,7 @@ try:
                         if last_assistant_message_idx is not None
                         else None
                     )
-                    if (
-                        required_prefix_token_ids is not None or capture_prefix_requested
-                    ) and last_assistant_message is None:
+                    if required_prefix_token_ids is not None and last_assistant_message is None:
                         raise ValueError(
                             "An exact token prefix was requested but the conversation has no "
                             "assistant message to anchor it."
@@ -916,7 +905,6 @@ try:
                     # Dataset-provided conversation history won't have these fields.
                     if last_assistant_message is not None and (
                         required_prefix_token_ids is not None
-                        or capture_prefix_requested
                         or (
                             isinstance(last_assistant_message.get("prompt_token_ids"), list)
                             and isinstance(last_assistant_message.get("generation_token_ids"), list)
@@ -931,10 +919,8 @@ try:
                         previous_prompt_token_ids = last_assistant_message.get(
                             "compact_prompt_token_ids"
                         )
-                        if (
-                            required_prefix_token_ids is None
-                            and not capture_prefix_requested
-                            and not isinstance(previous_prompt_token_ids, list)
+                        if required_prefix_token_ids is None and not isinstance(
+                            previous_prompt_token_ids, list
                         ):
                             raise ValueError(
                                 "Prefix stitching requires compact_prompt_token_ids "
@@ -981,36 +967,25 @@ try:
                                 )
                             )
 
-                        if capture_prefix_requested:
-                            suffix_start = _prefix_replacement_start(
-                                eos_token_id, retokenized_previous_turn_token_ids, prompt_tokens
-                            )
-                            if not 0 <= suffix_start < len(prompt_tokens):
-                                raise ValueError(
-                                    "could not locate the exact-prefix splice boundary"
-                                )
-                            prompt_suffix_token_ids = prompt_tokens[suffix_start:]
-                            prefix_boundary_token_id = eos_token_id
+                        if required_prefix_token_ids is not None:
+                            # Tokens for the previous turn are supplied by the user.
+                            previous_turn_token_ids = required_prefix_token_ids
                         else:
-                            if required_prefix_token_ids is not None:
-                                # Tokens for the previous turn are supplied by the user.
-                                previous_turn_token_ids = required_prefix_token_ids
-                            else:
-                                previous_turn_token_ids = (
-                                    previous_prompt_token_ids
-                                    + last_assistant_message["generation_token_ids"]
-                                )
-                            prompt_tokens = _replace_prefix_tokens(
-                                eos_token_id,
-                                previous_turn_token_ids,
-                                retokenized_previous_turn_token_ids,
-                                prompt_tokens,
+                            previous_turn_token_ids = (
+                                previous_prompt_token_ids
+                                + last_assistant_message["generation_token_ids"]
                             )
+                        prompt_tokens = _replace_prefix_tokens(
+                            eos_token_id,
+                            previous_turn_token_ids,
+                            retokenized_previous_turn_token_ids,
+                            prompt_tokens,
+                        )
 
             else:
                 if media_slots:
                     raise ValueError("Multimodal chat requests require a chat template.")
-                if required_prefix_token_ids is not None or capture_prefix_requested:
+                if required_prefix_token_ids is not None:
                     raise ValueError("exact token prefixes require a tokenizer chat template")
                 warnings.warn(
                     "Tokenizer does not support 'apply_chat_template'. Using tokenize instead."
@@ -1035,8 +1010,6 @@ try:
             top_p = float(_get_non_none(req, "top_p", current_app.config.get('default_top_p', 1.0)))
             top_k = int(_get_non_none(req, "top_k", current_app.config.get('default_top_k', 0)))
             n = int(_get_non_none(req, "n", 1))  # Number of choices to generate
-            if ng_capture is not None and n != 1:
-                raise ValueError("'ng_capture' requires n=1")
 
             if temperature == 0.0:
                 top_k = 1
@@ -1109,17 +1082,6 @@ try:
         # them as a serialized tensor dict on the wire, skip the encoder for
         # admissions 2..n). Kept as a known limitation for a follow-up so this
         # PR stays scoped.
-        request_metadata = None
-        if ng_capture is not None:
-            request_metadata = {"ng_capture": ng_capture}
-            if capture_prefix_requested:
-                request_metadata.update(
-                    ng_prompt_suffix_token_ids=prompt_suffix_token_ids,
-                    ng_prefix_boundary_token_id=prefix_boundary_token_id,
-                )
-        capture_request_kwargs = (
-            {"request_metadata": request_metadata} if request_metadata is not None else {}
-        )
         stream_requested = bool(req.get("stream", False))
         if stream_requested:
             # Streaming currently supports only Hugging Face fast tokenizers.
@@ -1136,7 +1098,7 @@ try:
                     prompt_tokens,
                     sampling_params,
                     multi_modal_data=multi_modal_data,
-                    **capture_request_kwargs,
+                    request_metadata=request_metadata,
                 )
                 for _ in range(n)
             ]
@@ -1207,7 +1169,7 @@ try:
                     prompt_tokens,
                     sampling_params,
                     multi_modal_data=multi_modal_data,
-                    **capture_request_kwargs,
+                    request_metadata=request_metadata,
                 )
                 request_ids.append(request_id)
                 tasks.append(future)
