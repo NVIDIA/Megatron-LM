@@ -113,41 +113,45 @@ def _assert_mxfp8_prefetch_exact(manager, plan, orientation):
             local = torch.stack(tuple(getattr(source, component) for source in fc_layer.parameters))
             gathered = [torch.empty_like(local) for _ in range(manager.ep_size)]
             torch.distributed.all_gather(gathered, local, group=manager.group)
-            for slot, expert in enumerate(plan.experts_to_copy[manager.ep_rank].tolist()):
+            for slot, expert in enumerate(
+                plan.experts_to_copy[manager.virtual_experts.rank].tolist()
+            ):
                 if expert < 0:
                     continue
                 owner, owned = divmod(expert, manager.num_owned_experts)
                 if not torch.equal(
-                    getattr(fc_layer.virtual_weights[slot], component), gathered[owner][owned]
+                    getattr(manager.virtual_experts.parameters[index][slot], component),
+                    gathered[owner][owned],
                 ):
                     errors.append(f"fc_layer={index} {component} slot={slot} expert={expert}")
     any_error = torch.tensor(int(bool(errors)), dtype=torch.int32, device=manager.device)
     torch.distributed.all_reduce(any_error, op=torch.distributed.ReduceOp.MAX, group=manager.group)
     assert (
         not any_error.item()
-    ), f"rank {manager.ep_rank} {orientation} MXFP8 prefetch mismatch: " + (
+    ), f"rank {manager.virtual_experts.rank} {orientation} MXFP8 prefetch mismatch: " + (
         ", ".join(errors) if errors else "reported by another rank"
     )
 
 
 def _assert_runtime_layout(manager, *, grad_dtype, mxfp8):
     """Check that the runtime weights and grads TE executes against alias the shared arenas."""
-    assert manager.workspace.grad_arena.dtype == grad_dtype
+    assert manager.virtual_experts.grad_arena.dtype == grad_dtype
     for index, fc_layer in enumerate(manager.fc_layers):
         runtime_weights = manager.runtime_weights(index)
         assert len(runtime_weights) == manager.num_runtime_experts
-        assert fc_layer.virtual_grad.dtype == grad_dtype
+        virtual_parameters = manager.virtual_experts.parameters[index]
+        assert all(slot.main_grad.dtype == grad_dtype for slot in virtual_parameters)
         for index, runtime_weight in enumerate(runtime_weights):
             if index < manager.num_owned_experts:
                 # A bare MoELayer has no DDP-time GTP wrapper, so natives alias the
                 # optimizer parameters directly.
                 assert fc_layer.gtp_leader is None
                 expected_weight = fc_layer.parameters[index]
-                expected_grad = fc_layer.native_grad[index]
+                expected_grad = fc_layer.native_grads[index]
             else:
                 slot = index - manager.num_owned_experts
-                expected_weight = fc_layer.virtual_weights[slot]
-                expected_grad = fc_layer.virtual_grad[slot]
+                expected_weight = virtual_parameters[slot]
+                expected_grad = virtual_parameters[slot].main_grad
                 if mxfp8:
                     # One arena serves both orientations; only one is live at a time.
                     assert (

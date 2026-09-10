@@ -1280,10 +1280,11 @@ class _VirtualExpertHybridEPManager(VirtualExpertLoadBalancer, _HybridEPManager)
             num_experts=num_experts,
             config=config,
         )
+        # HybridEP transports to the runtime experts: the natives plus the virtual-expert slots.
         super().__init__(
             group=group,
-            num_local_experts=2 * num_local_experts,
-            num_experts=2 * num_experts,
+            num_local_experts=self.num_runtime_experts,
+            num_experts=self.ep_size * self.num_runtime_experts,
             config=config,
         )
         # The planner's runtime ids feed HybridEP directly when it routes by dense top-k ids;
@@ -1297,6 +1298,9 @@ class _VirtualExpertHybridEPManager(VirtualExpertLoadBalancer, _HybridEPManager)
     def setup_metadata(self, top_indices: torch.Tensor, probs: torch.Tensor):
         """Plan the router's ``[num_tokens, topk]`` routes and start the weight push; HybridEP's
         own metadata is set up at dispatch, from the planner's runtime routes."""
+        # ``token_probs`` holds the router's probabilities until dispatch, where the dispatcher's
+        # preprocessing returns them; HybridEP's ``setup_metadata`` then replaces them with the
+        # dense runtime probabilities it transports (a CUDA-graph attribute, so one field).
         self.token_probs = probs
         self.plan_dispatch(top_indices, probs)
 
