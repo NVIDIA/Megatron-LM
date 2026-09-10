@@ -1363,13 +1363,12 @@ class DynamicInferenceEngine(AbstractEngine):
                 ), f"finished-request ledger: duplicate uid {merged.uid!r}"
                 self.local_metadata_ledger[merged.uid] = FinishedRequestRecord.from_request(merged)
             serialized.append(
-                self._serialize_finished_request_record(record) if completed else merged.serialize()
+                self._serialize_finished_request(merged) if completed else merged.serialize()
             )
         self.socket_for_receiving_requests.send_multipart(_engine_reply_frames(serialized))
 
-    def _serialize_finished_request_record(self, record: DynamicInferenceRequestRecord) -> Dict:
+    def _serialize_finished_request(self, merged: DynamicInferenceRequest) -> Dict:
         """Stage an accepted payload before constructing its coordinator reply."""
-        merged = record.merge()
         stage_result = None
         if self.payload_stager is not None:
             stage_result = self.payload_stager.stage(
