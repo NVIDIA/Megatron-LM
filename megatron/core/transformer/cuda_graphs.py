@@ -748,7 +748,7 @@ class _CudagraphGlobalRecord:
         )
 
         # Mark cuda graphs as created.
-        for g in cls.cudagraph_record:
+        for g in (*cls.cudagraph_record, *cls.cudagraph_val_record):
             runner = g[0]
             runner.cudagraph_created = True
 
@@ -905,9 +905,9 @@ class _CudagraphReplayNode(torch.autograd.Function):
 
             # Note that FP8GlobalStateManager.is_first_fp8_module() is inacccurate as each
             # layer may be in its own fp8 context, when the fp8 recipe != delayed_scaling
-            if runner.is_first_layer and (runner.fp8_param_cache_updated != is_first_microbatch):
+            if runner.is_first_layer and (runner.fp8_param_cache_updated[0] != is_first_microbatch):
                 _set_skip_fp8_weight_update_tensor(not is_first_microbatch)
-                runner.fp8_param_cache_updated = is_first_microbatch
+                runner.fp8_param_cache_updated[0] = is_first_microbatch
 
         if runner.use_stream:
             runner.stream.wait_stream(torch.cuda.current_stream())
@@ -1051,7 +1051,7 @@ class _CudaGraphRunner(torch.nn.Module):
         # replay so that way we only update the value of this flag in FP8GlobalStateManager when
         # it changes which incurs an HtoD sync
         if self.is_first_layer:
-            self.fp8_param_cache_updated = None
+            self.fp8_param_cache_updated: List[bool | None] = [None]
 
         if hasattr(self.base_module, "config") and isinstance(
             self.base_module.config, TransformerConfig
@@ -1234,6 +1234,10 @@ class _CudaGraphRunner(torch.nn.Module):
             runner.num_warmup_steps = self.num_warmup_steps
             runner.fp8_runtime_enabled = self.fp8_runtime_enabled
             runner.fp4_runtime_enabled = self.fp4_runtime_enabled
+            if self.fp8_enabled:
+                runner.fp8_recipe = self.fp8_recipe
+            if self.is_first_layer:
+                runner.fp8_param_cache_updated = self.fp8_param_cache_updated
 
             def capture_arg(value):
                 if torch.is_tensor(value):
@@ -1247,7 +1251,12 @@ class _CudaGraphRunner(torch.nn.Module):
                 if self.gtp_remat
                 else nullcontext()
             ):
-                runner.create_fwd_graph(*tree_map(capture_arg, (args, kwargs)))
+                # Validation warmup can mutate buffers and quantization state even without autograd.
+                # Set `preserve_model_state=True` to preserve those just as in training, without
+                # backing up unused training gradients.
+                runner.create_fwd_graph(
+                    *tree_map(capture_arg, (args, kwargs)), preserve_model_state=True
+                )
             # Keep output ownership, including aliases of inputs, while releasing input storage.
             outputs = tree_map(
                 lambda value: value.detach() if torch.is_tensor(value) else value,
@@ -1256,13 +1265,15 @@ class _CudaGraphRunner(torch.nn.Module):
             runner._weakref_forward_buffers(preserve_forward_to_backward_lifetimes=False)
             runner.fwd_graph_outputs = outputs
             runner.fwd_graph_output_surface = runner.get_tensors(outputs)
-            runner.fwd_graph_recorded = runner.cudagraph_created = True
+            runner.fwd_graph_recorded = True
             self.val_runner = runner
             _CudagraphGlobalRecord.cudagraph_val_record.append((runner, "fwd"))
         finally:
             module.train(was_training)
 
-    def create_fwd_graph(self, args, kwargs, outputs=None, clone_inputs=True):
+    def create_fwd_graph(
+        self, args, kwargs, outputs=None, clone_inputs=True, *, preserve_model_state: bool = False
+    ):
         """Create a fwd cudagraph for this runner. Should be called inside
         'create_cudagraphs()'."""
 
@@ -1280,12 +1291,12 @@ class _CudaGraphRunner(torch.nn.Module):
         # _fc2_weight) that misalign the positional restore.
 
         if self.training and torch.is_grad_enabled():
-            buffer_backup = []
-            for buf in self.base_module.buffers():
-                buffer_backup.append(buf.clone())
-
+            preserve_model_state = True
             grad_backup = _backup_grads_before_capture(self)
 
+        if preserve_model_state:
+            # Retain each original buffer: lazy registration can change buffers() ordering.
+            buffer_backup = [(buf, buf.clone()) for buf in self.base_module.buffers()]
             saved_fp8_tensors = None
             if self.fp8_enabled:
                 if is_te_min_version("1.13.0"):
@@ -1535,13 +1546,13 @@ class _CudaGraphRunner(torch.nn.Module):
             self.num_dgrads = len(self.fwd_graph_input_surface)
             self.fwd_graph_input_surface = self.fwd_graph_input_surface + self.params_to_backprop
 
-            if self.fp8_enabled:
-                restore_fp8_tensors([self.base_module], saved_fp8_tensors)
             # restore cached grads
             _restore_grads_after_capture(grad_backup)
 
-            # restore cached buffers
-            for buf_copy, buf in zip(buffer_backup, self.base_module.buffers()):
+        if preserve_model_state:
+            if self.fp8_enabled or self.fp4_enabled:
+                restore_fp8_tensors([self.base_module], saved_fp8_tensors)
+            for buf, buf_copy in buffer_backup:
                 buf.copy_(buf_copy)
 
         if is_moe:
@@ -1958,6 +1969,9 @@ class CudaGraphManager(torch.nn.Module):
             num_warmup_steps: If set, overrides the per-runner warmup step count.
         """
         self._inline_capture = inline_capture
+        # All first-layer runners update the same TE flag, including validation runners.
+        # Share its cached value so switching runners cannot leave a stale weight cache.
+        self.fp8_param_cache_updated: List[bool | None] = [None]
         self._num_warmup_steps = num_warmup_steps
         if pg_collection is None:
             pg_collection = ProcessGroupCollection.use_mpu_process_groups()
@@ -2099,6 +2113,8 @@ class CudaGraphManager(torch.nn.Module):
                 )
                 self.cudagraph_runners.append(runner)
 
+        if runner.is_first_layer:
+            runner.fp8_param_cache_updated = self.fp8_param_cache_updated
         return runner
 
     def __call__(self, megatron_module, args, kwargs, cache_key=None):
@@ -2133,6 +2149,7 @@ class CudaGraphManager(torch.nn.Module):
             and not getattr(megatron_module, "training", self.training)
         ):
             # module.eval() does not disable autograd; validation graphs have no backward.
+            runner = None
             if not torch.is_grad_enabled():
                 runner = next(
                     (
@@ -2144,17 +2161,16 @@ class CudaGraphManager(torch.nn.Module):
                     ),
                     None,
                 )
-                if runner is not None:
-                    out = runner.replay_graph_capture(self.is_first_microbatch, args, kwargs)
-                    self.is_first_microbatch = False
-                    return out
-            # Validation graphs cover training signatures only. Before capture, for other
-            # inputs, or with autograd enabled, run the original method or module eagerly.
-            if self.func is not None:
-                return self.func(*args, **kwargs)
-            return super(MegatronModule, megatron_module).__call__(*args, **kwargs)
+            if runner is None:
+                # Validation graphs cover training signatures only. Before capture, for other
+                # inputs, or with autograd enabled, run the original method or module eagerly.
+                if self.func is not None:
+                    return self.func(*args, **kwargs)
+                return super(MegatronModule, megatron_module).__call__(*args, **kwargs)
+            # Use the common replay epilogue to update status and the first-microbatch flag.
+            out = runner.replay_graph_capture(self.is_first_microbatch, args, kwargs)
 
-        if _CudagraphGlobalRecord.cudagraph_created:
+        elif _CudagraphGlobalRecord.cudagraph_created:
             if self.training and torch.is_grad_enabled():
                 # Trigger Mcore DDP pre-forward hooks
                 self.call_ddp_preforward_hook(megatron_module)
