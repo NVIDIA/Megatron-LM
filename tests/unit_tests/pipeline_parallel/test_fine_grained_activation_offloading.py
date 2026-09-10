@@ -14,6 +14,10 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import Chun
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
+from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+    FineGrainedOffloadingBackwardRecordFunction,
+    PipelineOffloadManager,
+)
 from megatron.core.tensor_parallel.random import (
     CheckpointWithoutOutput,
     is_checkpoint_without_output_tensor,
@@ -67,6 +71,61 @@ def test_chunk_offload_handler_skips_non_offloadable_tensor_types():
     assert not handler.tensor_need_offloading_checker(fake_tensor)
     assert handler.tensor_push(fake_tensor) is fake_tensor
     assert handler.tensor_pop(fake_tensor) is fake_tensor
+
+
+def test_cuda_graph_backward_completion_callback_is_per_graph_task(monkeypatch):
+    """Each TE-style GraphTask queues its own sync-back event after AccumulateGrad."""
+    calls = []
+    active_task = None
+
+    class RecordingStream:
+        def record_event(self, event):
+            calls.append((active_task, "record_event", event))
+
+        def wait_stream(self, stream):
+            calls.append((active_task, "wait_stream", stream))
+
+    recording_stream = RecordingStream()
+
+    def current_stream():
+        calls.append((active_task, "callback_boundary", recording_stream))
+        return recording_stream
+
+    monkeypatch.setattr(torch.cuda, "current_stream", current_stream)
+
+    for task_name in ("first", "second"):
+        active_task = task_name
+        graph_event = object()
+        h2d_stream = object()
+        monkeypatch.setattr(
+            PipelineOffloadManager,
+            "OFFLOAD_MGR",
+            type("Manager", (), {"cuda_graph_event": graph_event, "h2d_stream": h2d_stream})(),
+        )
+
+        hidden_states = torch.tensor(2.0, requires_grad=True)
+        weight = torch.nn.Parameter(torch.tensor(3.0))
+        hidden_states.register_post_accumulate_grad_hook(
+            lambda _tensor, name=task_name, tensor=hidden_states: calls.append(
+                (name, "input_grad", tensor)
+            )
+        )
+        weight.register_post_accumulate_grad_hook(
+            lambda _param, name=task_name, param=weight: calls.append((name, "param_grad", param))
+        )
+
+        task_start = len(calls)
+        recorded_input = FineGrainedOffloadingBackwardRecordFunction.apply(hidden_states)
+        (recorded_input * weight).backward()
+        task_calls = calls[task_start:]
+
+        assert [call[0] for call in task_calls] == [task_name] * 5
+        assert {call[1] for call in task_calls[:2]} == {"input_grad", "param_grad"}
+        assert task_calls[2:] == [
+            (task_name, "callback_boundary", recording_stream),
+            (task_name, "record_event", graph_event),
+            (task_name, "wait_stream", h2d_stream),
+        ]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offload check.")
