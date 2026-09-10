@@ -217,8 +217,13 @@ class MegatronMultimodalTokenizer:
         replacement = f"{self._image_tag[0]}{IMAGE_TOKEN}{self._image_tag[1]}"
 
         if isinstance(text, list):
-            for turn in text:
-                turn["content"] = turn["content"].replace(IMAGE_TOKEN, replacement)
+            # Build new dicts instead of mutating the caller's conversation in place. Since
+            # `replacement` itself contains IMAGE_TOKEN, mutating and re-tagging an
+            # already-tagged turn on a later call would wrap it again.
+            text = [
+                {**turn, "content": turn["content"].replace(IMAGE_TOKEN, replacement)}
+                for turn in text
+            ]
         else:
             text = text.replace(IMAGE_TOKEN, replacement)
 
