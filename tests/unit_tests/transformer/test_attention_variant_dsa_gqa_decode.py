@@ -96,6 +96,49 @@ def _dynamic_packed_seq_params(inference_context: DynamicInferenceContext) -> Pa
     )
 
 
+@pytest.mark.parametrize("head_dim", [128, 192, 256])
+@pytest.mark.parametrize("batch", [1, 3])
+def test_decode_indexer_reuses_compilation_when_score_width_changes(monkeypatch, head_dim, batch):
+    from megatron.core.transformer.experimental_attention_variant import (
+        dsa_gqa_decode_kernel as kernels,
+    )
+
+    monkeypatch.setattr(kernels, "_COMPILED", {})
+    monkeypatch.setattr(kernels, "_OPERATORS", {})
+    compile_calls = []
+    original_compile = kernels.cute.compile
+
+    def count_compile(*args, **kwargs):
+        compile_calls.append(1)
+        return original_compile(*args, **kwargs)
+
+    monkeypatch.setattr(kernels.cute, "compile", count_compile)
+    torch.manual_seed(79)
+    device = torch.device("cuda", torch.cuda.current_device())
+    page_size, pages_per_request = 64, 3
+    num_pages = batch * pages_per_request
+    keys = torch.randn(num_pages, page_size, head_dim, device=device, dtype=torch.bfloat16)
+    query = torch.randn(batch, head_dim, device=device, dtype=torch.bfloat16)
+    table = torch.randperm(num_pages, device=device).view(batch, pages_per_request).to(torch.int32)
+    logical_keys = keys[table.long()].reshape(batch, -1, head_dim)
+
+    # Start at width one (ambiguous strides), cross tile/page boundaries, then
+    # shrink. Different request lengths also exercise writes to invalid slots.
+    for width in (1, 2, 31, 32, 33, 63, 64, 65, 127, 128, 129, 191, 7):
+        lengths = torch.tensor(
+            [max(width - 2 * i, 0) for i in range(batch)], device=device, dtype=torch.int32
+        )
+        output = torch.full((batch, width), torch.nan, device=device, dtype=torch.float32)
+        kernels.dsa_gqa_decode_indexer_score(query, keys, table, lengths, out=output)
+        expected = torch.einsum("bd,bkd->bk", query.float(), logical_keys[:, :width].float())
+        expected.masked_fill_(
+            torch.arange(width, device=device)[None, :] >= lengths[:, None], -torch.inf
+        )
+        torch.testing.assert_close(output, expected, atol=2e-4, rtol=2e-4)
+    assert len(compile_calls) == 1
+    assert len(kernels._COMPILED) == 1
+
+
 class TestDSGQADynamicInference:
     @pytest.fixture(scope="function", autouse=True)
     def setup_method(self):
@@ -103,6 +146,90 @@ class TestDSGQADynamicInference:
         model_parallel_cuda_manual_seed(123)
         yield
         Utils.destroy_model_parallel()
+
+    def test_short_decode_reuses_both_kernels(self, monkeypatch):
+        from megatron.core.transformer.experimental_attention_variant import (
+            dsa_gqa_decode_kernel as kernels,
+        )
+
+        for name in ("_COMPILED", "_OPERATORS", "_ATTENTION_COMPILED", "_ATTENTION_OPERATORS"):
+            monkeypatch.setattr(kernels, name, {})
+        original_compile = kernels.cute.compile
+        compile_calls = []
+
+        def count_compile(*args, **kwargs):
+            compile_calls.append(1)
+            return original_compile(*args, **kwargs)
+
+        monkeypatch.setattr(kernels.cute, "compile", count_compile)
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=4096,
+            num_attention_heads=32,
+            num_query_groups=1,
+            kv_channels=192,
+            params_dtype=torch.bfloat16,
+            bf16=True,
+            normalization="RMSNorm",
+            add_bias_linear=False,
+            attention_dropout=0.0,
+            hidden_dropout=0.0,
+            experimental_attention_variant="dsa",
+            dsa_indexer_mode="simplified",
+            dsa_indexer_n_heads=1,
+            dsa_indexer_head_dim=192,
+            dsa_indexer_topk=512,
+        )
+        context = DynamicInferenceContext(
+            model_config=config,
+            inference_config=InferenceConfig(
+                max_sequence_length=128,
+                max_requests=1,
+                max_tokens=64,
+                block_size_tokens=64,
+                buffer_size_gb=0.05,
+                num_cuda_graphs=None,
+            ),
+        )
+        context.add_request(
+            DynamicInferenceRequest(
+                request_id=0,
+                prompt_tokens=torch.tensor([1]),
+                sampling_params=SamplingParams(num_tokens_to_generate=32),
+            )
+        )
+        context.initialize_attention_state()
+        attention = DSGroupedSelfAttention(
+            config=config,
+            submodules=SelfAttentionSubmodules(
+                linear_qkv=TELayerNormColumnParallelLinear,
+                core_attention=TEDotProductAttention,
+                linear_proj=TERowParallelLinear,
+            ),
+            layer_number=1,
+            attn_mask_type=AttnMaskType.causal,
+        ).eval()
+        history = []
+        for step in range(17):  # one prefill, then sixteen short decode steps
+            hidden = torch.randn(
+                context.padded_active_token_count, 1, 4096, device="cuda", dtype=torch.bfloat16
+            )
+            history.append(hidden[:1])
+            with torch.inference_mode(), InferenceMode.active():
+                actual, _ = attention(
+                    hidden_states=hidden, attention_mask=None, inference_context=context
+                )
+            with torch.inference_mode():
+                expected, _ = attention(hidden_states=torch.cat(history), attention_mask=None)
+            torch.testing.assert_close(actual[0], expected[-1], atol=2e-2, rtol=2e-2)
+            context.update_requests(
+                active_requests_mask=torch.ones(1, dtype=torch.int32),
+                new_tokens=torch.tensor([step + 2]),
+            )
+            context.initialize_attention_state()
+        assert len(compile_calls) == 2
+        assert len(kernels._COMPILED) == 1
+        assert len(kernels._ATTENTION_COMPILED) == 1
 
     @pytest.mark.parametrize("packed", [False, True])
     @pytest.mark.parametrize("fused", [False, True])
@@ -141,8 +268,9 @@ class TestDSGQADynamicInference:
     @pytest.mark.parametrize("learned_k", [False, True])
     @pytest.mark.parametrize("use_rope", [False, True])
     @pytest.mark.parametrize("provide_packed_metadata", [False, True])
+    @pytest.mark.parametrize("index_topk", [8, 32])
     def test_mixed_prefill_reuses_training_and_decode_uses_cute(
-        self, monkeypatch, learned_k, use_rope, provide_packed_metadata
+        self, monkeypatch, learned_k, use_rope, provide_packed_metadata, index_topk
     ):
         dtype = torch.bfloat16
         hidden_size = 4096
@@ -163,7 +291,7 @@ class TestDSGQADynamicInference:
             dsa_simplified_use_learned_k=learned_k,
             dsa_indexer_n_heads=1,
             dsa_indexer_head_dim=128 if learned_k else 256,
-            dsa_indexer_topk=8,
+            dsa_indexer_topk=index_topk,
             tensor_model_parallel_size=1,
             sequence_parallel=False,
         )
@@ -286,7 +414,7 @@ class TestDSGQADynamicInference:
         mixed_output, mixed_hidden_states = run_step()
 
         assert indexer_calls == [(2, 128 if learned_k else 256)]
-        assert attention_calls == [((2, 16, 256), (2, 8))]
+        assert attention_calls == [((2, 16, 256), (2, index_topk))]
         assert prefill_calls == [5]
         assert mixed_output.shape == (inference_context.padded_active_token_count, 1, hidden_size)
         assert mixed_output.dtype == dtype
@@ -325,7 +453,7 @@ class TestDSGQADynamicInference:
         decode_output, decode_hidden_states = run_step()
         assert prefill_calls == []
         assert indexer_calls[-1] == (3, 128 if learned_k else 256)
-        assert attention_calls[-1] == ((3, 16, 256), (3, 8))
+        assert attention_calls[-1] == ((3, 16, 256), (3, index_topk))
         monkeypatch.setattr(core_attention, "forward", training_forward)
         histories = [
             torch.cat((prompt_hidden_states[:13], mixed_hidden_states[:1])),

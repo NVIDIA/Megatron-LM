@@ -1191,6 +1191,12 @@ class DSGQACoreAttention(MegatronModule):
             decode_topk = decode_scores.topk(
                 min(self.indexer.index_topk, max_context_length), dim=-1
             ).indices.to(torch.int32)
+            # Keep the attention kernel's shared-memory capacity fixed even
+            # while short requests grow toward the configured routing top-k.
+            if decode_topk.size(1) < self.indexer.index_topk:
+                decode_topk = F.pad(
+                    decode_topk, (0, self.indexer.index_topk - decode_topk.size(1)), value=-1
+                )
             decode_output = value_cache.new_empty(
                 (num_decode_requests, num_query_heads, value_cache.size(-1))
             )
