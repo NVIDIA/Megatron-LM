@@ -12,12 +12,14 @@ import pretrain_gpt
 import pretrain_hybrid
 from megatron.core import mpu
 from megatron.core.num_microbatches_calculator import destroy_num_microbatches_calculator
+from megatron.core.transformer.experimental_attention_variant import cp_balanced_indexer
 from megatron.core.utils import (
     _get_batch_on_this_cp_rank_per_sequence_balancing,
     flatten_batch_for_packed_sequences,
 )
 from megatron.training.arguments import parse_args, validate_args
 from megatron.training.global_vars import destroy_global_vars, set_global_variables
+from megatron.training.utils import packed_seq_utils
 from pretrain_hybrid import get_batch
 from tests.unit_tests.test_utilities import Utils
 
@@ -182,7 +184,7 @@ def test_hybrid_scheduler_prebuilds_balanced_indexer_from_normalized_config(monk
         max_seqlen_per_dp_cp_rank=1024,
         context_parallel_size=4,
     )
-    packed_seq_params = object()
+    packed_seq_params = SimpleNamespace(cp_group=object())
     scheduler_batch = (
         object(),  # tokens
         object(),  # labels
@@ -198,11 +200,11 @@ def test_hybrid_scheduler_prebuilds_balanced_indexer_from_normalized_config(monk
     monkeypatch.setattr(pretrain_hybrid.mpu, "get_tensor_model_parallel_rank", lambda: 0)
     monkeypatch.setattr(pretrain_hybrid, "mtp_on_this_rank_func", lambda **_kwargs: False)
     scheduler = MagicMock(return_value=scheduler_batch)
-    finalize = MagicMock()
+    finalize = MagicMock(return_value=packed_seq_params)
     prebuild = MagicMock()
     monkeypatch.setattr(pretrain_hybrid, "get_batch_on_this_rank_for_sequence_packing", scheduler)
-    monkeypatch.setattr(pretrain_hybrid, "finalize_packed_seq_params", finalize)
-    monkeypatch.setattr(pretrain_hybrid, "prebuild_balanced_layouts", prebuild)
+    monkeypatch.setattr(packed_seq_utils, "finalize_packed_seq_params", finalize)
+    monkeypatch.setattr(cp_balanced_indexer, "prebuild_balanced_layouts", prebuild)
 
     result = pretrain_hybrid.get_batch(None)
 
@@ -212,6 +214,7 @@ def test_hybrid_scheduler_prebuilds_balanced_indexer_from_normalized_config(monk
     if enabled:
         prebuild.assert_called_once_with(
             packed_seq_params,
+            cp_group=packed_seq_params.cp_group,
             pad_alignment="max",
             capacity=4096,
             graphs_enabled=True,
@@ -243,7 +246,7 @@ def test_gpt_scheduler_prebuilds_balanced_indexer_from_normalized_config(monkeyp
         max_seqlen_per_dp_cp_rank=1024,
         context_parallel_size=4,
     )
-    packed_seq_params = object()
+    packed_seq_params = SimpleNamespace(cp_group=object())
     scheduler_batch = (
         object(),  # tokens
         object(),  # labels
@@ -258,11 +261,11 @@ def test_gpt_scheduler_prebuilds_balanced_indexer_from_normalized_config(monkeyp
     monkeypatch.setattr(pretrain_gpt, "core_transformer_config_from_args", lambda _args: config)
     monkeypatch.setattr(pretrain_gpt, "mtp_on_this_rank", lambda *_args, **_kwargs: False)
     scheduler = MagicMock(return_value=scheduler_batch)
-    finalize = MagicMock()
+    finalize = MagicMock(return_value=packed_seq_params)
     prebuild = MagicMock()
     monkeypatch.setattr(pretrain_gpt, "get_batch_on_this_rank_for_sequence_packing", scheduler)
-    monkeypatch.setattr(pretrain_gpt, "finalize_packed_seq_params", finalize)
-    monkeypatch.setattr(pretrain_gpt, "prebuild_balanced_layouts", prebuild)
+    monkeypatch.setattr(packed_seq_utils, "finalize_packed_seq_params", finalize)
+    monkeypatch.setattr(cp_balanced_indexer, "prebuild_balanced_layouts", prebuild)
 
     result = pretrain_gpt.get_batch(None)
 
@@ -272,6 +275,7 @@ def test_gpt_scheduler_prebuilds_balanced_indexer_from_normalized_config(monkeyp
     if enabled:
         prebuild.assert_called_once_with(
             packed_seq_params,
+            cp_group=packed_seq_params.cp_group,
             pad_alignment="max",
             capacity=4096,
             graphs_enabled=True,
@@ -305,7 +309,7 @@ def test_scheduler_prebuild_marks_attention_eager_graph_scope(monkeypatch, front
         max_seqlen_per_dp_cp_rank=1024,
         context_parallel_size=4,
     )
-    packed_seq_params = object()
+    packed_seq_params = SimpleNamespace(cp_group=object())
     scheduler_batch = (
         object(),
         object(),
@@ -323,9 +327,10 @@ def test_scheduler_prebuild_marks_attention_eager_graph_scope(monkeypatch, front
         "get_batch_on_this_rank_for_sequence_packing",
         MagicMock(return_value=scheduler_batch),
     )
-    monkeypatch.setattr(module, "finalize_packed_seq_params", MagicMock())
+    finalize = MagicMock(return_value=packed_seq_params)
+    monkeypatch.setattr(packed_seq_utils, "finalize_packed_seq_params", finalize)
     prebuild = MagicMock()
-    monkeypatch.setattr(module, "prebuild_balanced_layouts", prebuild)
+    monkeypatch.setattr(cp_balanced_indexer, "prebuild_balanced_layouts", prebuild)
     if frontend == "gpt":
         monkeypatch.setattr(module, "mtp_on_this_rank", lambda *_args, **_kwargs: False)
         result = module.get_batch(None)
@@ -336,8 +341,10 @@ def test_scheduler_prebuild_marks_attention_eager_graph_scope(monkeypatch, front
         result = module.get_batch(None)
         assert result[-1] is packed_seq_params
 
+    finalize.assert_called_once_with(packed_seq_params)
     prebuild.assert_called_once_with(
         packed_seq_params,
+        cp_group=packed_seq_params.cp_group,
         pad_alignment="max",
         capacity=None,
         graphs_enabled=False,
@@ -375,7 +382,8 @@ def test_hybrid_legacy_thd_prebuilds_after_forward_constructs_params(monkeypatch
     monkeypatch.setattr(pretrain_hybrid, "get_args", lambda: args)
     monkeypatch.setattr(pretrain_hybrid, "get_timers", MagicMock(return_value=MagicMock()))
     monkeypatch.setattr(pretrain_hybrid, "get_batch", MagicMock(return_value=batch))
-    monkeypatch.setattr(pretrain_hybrid, "finalize_packed_seq_params", MagicMock())
+    finalize = MagicMock(side_effect=lambda params: params)
+    monkeypatch.setattr(packed_seq_utils, "finalize_packed_seq_params", finalize)
     monkeypatch.setattr(pretrain_hybrid, "update_seqlen_stats_from_cu_seqlens", MagicMock())
     monkeypatch.setattr(pretrain_hybrid, "stimer", MagicMock())
 
@@ -384,14 +392,22 @@ def test_hybrid_legacy_thd_prebuilds_after_forward_constructs_params(monkeypatch
 
     monkeypatch.setattr(pretrain_hybrid, "get_attr_wrapped_model", get_model_attr)
     prebuild = MagicMock()
-    monkeypatch.setattr(pretrain_hybrid, "prebuild_balanced_layouts", prebuild)
+    monkeypatch.setattr(cp_balanced_indexer, "prebuild_balanced_layouts", prebuild)
     model = MagicMock(return_value=torch.zeros(4096))
 
     pretrain_hybrid.forward_step(None, model)
 
     (packed_seq_params,), kwargs = prebuild.call_args
+    finalize.assert_called_once_with(packed_seq_params)
+    prebuild.assert_called_once()
     assert packed_seq_params.cu_seqlens_q.tolist() == [0, 1024, 4096]
-    assert kwargs == {"pad_alignment": 12, "graphs_enabled": True, "graph_dynamic_packs": False}
+    assert kwargs == {
+        "cp_group": batch[3],
+        "pad_alignment": 12,
+        "capacity": None,
+        "graphs_enabled": True,
+        "graph_dynamic_packs": False,
+    }
 
 
 @pytest.mark.parametrize("tp_rank", [0, 1])
