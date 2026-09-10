@@ -98,6 +98,9 @@ class TestDotProductAttentionSoftcap:
             params_dtype=torch.float16,
             attn_logit_softcapping=cap,
             apply_query_key_layer_scaling=qk_layer_scaling,
+            # Dropout would give each forward a different mask, which both hides the cap
+            # difference and satisfies the separation check below on noise alone.
+            attention_dropout=0.0,
         )
         return DotProductAttention(
             config=config,

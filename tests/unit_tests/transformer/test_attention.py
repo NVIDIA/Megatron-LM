@@ -848,3 +848,56 @@ class TestFlashDecodeSoftcapPlumbing:
         kernel = mock.Mock(return_value=torch.zeros(2, 1, 4, 8))
         kwargs = self._call_flash_decode(None, kernel)
         assert "softcap" not in kwargs
+
+
+class TestFlashAttention3SoftcapWrapper:
+    """The FA3 wrapper filters kwargs against the runtime signature, which can drop the cap.
+
+    That filtering exists because FA3 build signatures vary, so a build without `softcap`
+    would discard it silently and run uncapped. Every other call site fails loudly instead,
+    so this one is asserted rather than left to the filter.
+    """
+
+    def _wrapper(self, softcap, fake_forward):
+        attn = mock.Mock()
+        attn.config.attn_logit_softcapping = softcap
+        attn.batch_invariant_mode = False
+        t = torch.zeros(2, 4, 8)
+        with mock.patch("megatron.core.transformer.attention._flash_attn_forward", fake_forward):
+            return Attention._flash_attention_3_forward_wrapper(
+                attn,
+                q=t,
+                k=t,
+                v=t,
+                max_seqlen_q=2,
+                max_seqlen_k=2,
+                cu_seqlens_q=None,
+                seqlens_k=None,
+                block_table=None,
+                softmax_scale=1.0,
+            )
+
+    def test_cap_reaches_a_softcap_capable_build(self):
+        seen = {}
+
+        def fake_forward(q, k, v, softmax_scale, causal, softcap):
+            seen["softcap"] = softcap
+            return torch.zeros_like(q)
+
+        self._wrapper(50.0, fake_forward)
+        assert seen["softcap"] == 50.0
+
+    def test_build_without_softcap_raises_instead_of_dropping_the_cap(self):
+        def fake_forward(q, k, v, softmax_scale, causal):
+            return torch.zeros_like(q)
+
+        with pytest.raises(AssertionError, match="does not accept softcap"):
+            self._wrapper(50.0, fake_forward)
+
+    def test_build_without_softcap_is_fine_when_no_cap_is_configured(self):
+        """Only the combination is rejected, so existing users are unaffected."""
+
+        def fake_forward(q, k, v, softmax_scale, causal):
+            return torch.zeros_like(q)
+
+        self._wrapper(None, fake_forward)
