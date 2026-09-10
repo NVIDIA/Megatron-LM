@@ -86,8 +86,12 @@ completes 35 iterations, including an eager-only pipeline stage. Hybrid VPP2
 also completes five iterations with attention-only capture and eager-only chunks.
 The H100 ordinary-attention PP2/PP4 regression passes loss/every-local-gradient
 comparisons for fixed and varying shapes, including N1 and steady-state schedules.
+Four GB200s also pass the six combined Hybrid regressions for sequence-parallel
+RNG behavior, FP8/BF16 input lifetimes and non-final pipeline output deallocation,
+with mHC enabled/disabled where applicable. The TP2/SP tests use ordinary E/dense
+stacks; DSv4 attention itself remains restricted to TP1.
 These results do not establish strict native DSv4 gradient parity. Native dump
-comparisons have differences under investigation. In fixed-weight GPT controls,
+comparisons have differences under investigation. In fixed-weight GPT BF16 controls,
 all parameter dumps are byte-identical and every parameter passes the L2 check;
 the strict elementwise check still reports differences before and after capture.
 
@@ -122,3 +126,30 @@ LR0/WD0 keeps weights fixed. Verify identical named parameter tensors first, the
 compare named gradients at each iteration, separating indexer, attention, router,
 experts and mHC parameters. Iteration 3 is the first PCG replay. Training completion
 and similar scalar losses are insufficient to declare this comparison passing.
+
+The diagnostic uses unchanged `rtol=0.02`, `atol=1e-6`, requiring both elementwise
+agreement and a per-parameter bound
+`||candidate-reference|| <= rtol*||reference|| + atol*sqrt(numel)`.
+Frozen runs have byte-identical parameter dumps at all three iterations.
+Independent repeats use the same eager configuration, inputs and unchanged weights.
+These TP1 runs, without BF16 exclusions inside FP8 models, used `7be9cfa79`.
+The later SP/BF16-boundary fixes are covered by the dedicated regressions above.
+
+| Model and precision | Step-3 overlap vs. PCG global relative L2 | Step-3 eager repeat global relative L2 |
+| --- | ---: | ---: |
+| GPT BF16, mHC off | 0.0010591 | 0.0010153 |
+| Hybrid BF16, mHC on | 0.0009042 | 0.0009260 |
+| GPT MXFP8, mHC on | 0.0046102 | 0.0046625 |
+| Hybrid MXFP8, mHC off | 0.0031514 | 0.0036473 |
+| Hybrid MXFP8, mHC on | 0.0028532 | Not measured |
+
+All these comparisons, including the independent eager repeats, fail the strict
+elementwise criterion. GPT BF16 and Hybrid MXFP8 without mHC pass every
+per-parameter L2 bound; near-zero mHC scalar gradients can also fail that bound
+in both execution modes. For
+example, Hybrid BF16's first-layer `alpha_pre` differs by `6.82e-6` between
+overlap and PCG, versus `1.88e-6` in one eager repeat. Identical initial residual
+streams followed by RMSNorm make this a cancellation-sensitive scaling direction;
+the experiment does not isolate the source of run variability or establish a
+statistical bound from one repeat. These diagnostic failures remain visible and
+must not be reported as strict numerical parity.
