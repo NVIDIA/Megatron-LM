@@ -5,6 +5,8 @@
 The kernel computes one FP32 score row per decode request. The indexer head
 dimension is specialized as a ``cutlass.Constexpr``. K is read directly from
 the paged cache through ``block_table``; TopK remains a separate caller operation.
+The score width and its row stride are runtime values, so growing a request's
+KV length does not require recompiling the indexer.
 
 The sparse-attention kernel consumes those TopK indices and fuses paged K/V
 gather, QK, FP32 softmax, and PV into one launch over all decode requests.
@@ -43,16 +45,8 @@ LOG2E = 1.4426950408889634
 if HAVE_CUTEDSL:
 
     class _DecodeIndexer:
-        def __init__(
-            self,
-            batch_size: int,
-            max_context_length: int,
-            page_size: int,
-            max_pages: int,
-            num_pages: int,
-        ) -> None:
+        def __init__(self, batch_size: int, page_size: int, max_pages: int, num_pages: int) -> None:
             self.batch_size = batch_size
-            self.max_context_length = max_context_length
             self.page_size = page_size
             self.max_pages = max_pages
             self.num_pages = num_pages
@@ -88,7 +82,7 @@ if HAVE_CUTEDSL:
             first_token = score_block * TOKENS_PER_BLOCK
             for token_in_warp in cutlass.range_constexpr(TOKENS_PER_WARP):
                 logical_token = first_token + token_in_warp * WARPS + warp_id
-                if logical_token < self.max_context_length:
+                if logical_token < output.shape[1]:
                     score = -cutlass.Float32.inf
                     if logical_token < context_length:
                         logical_page = logical_token // self.page_size
@@ -123,7 +117,7 @@ if HAVE_CUTEDSL:
                 query, key_cache, block_table, context_lengths, output, index_head_dim
             ).launch(
                 grid=(
-                    (self.max_context_length + TOKENS_PER_BLOCK - 1) // TOKENS_PER_BLOCK,
+                    (output.shape[1] + TOKENS_PER_BLOCK - 1) // TOKENS_PER_BLOCK,
                     self.batch_size,
                     1,
                 ),
@@ -400,27 +394,26 @@ def _compile(
     context_lengths: torch.Tensor,
     output: torch.Tensor,
 ):
-    key = (
-        tuple(query.shape),
-        tuple(key_cache.shape),
-        tuple(block_table.shape),
-        tuple(output.shape),
-        query.device.index,
-    )
+    key = (tuple(query.shape), tuple(key_cache.shape), tuple(block_table.shape), query.device.index)
     compiled = _COMPILED.get(key)
     if compiled is None:
         index_head_dim = query.size(1)
         operator = _DecodeIndexer(
-            query.size(0), output.size(1), key_cache.size(1), block_table.size(1), key_cache.size(0)
+            query.size(0), key_cache.size(1), block_table.size(1), key_cache.size(0)
         )
         _OPERATORS[key] = operator
+        # Both the width and the outer row stride change at every decode step.
+        # Keep the contiguous layout contract, but make its inner extent dynamic.
+        dynamic_output = from_dlpack(
+            output, assumed_align=4, enable_tvm_ffi=True
+        ).mark_compact_shape_dynamic(mode=1, stride_order=(0, 1), divisibility=1)
         compiled = cute.compile(
             operator,
             from_dlpack(query, assumed_align=16, enable_tvm_ffi=True),
             from_dlpack(key_cache, assumed_align=16, enable_tvm_ffi=True),
             from_dlpack(block_table, assumed_align=4, enable_tvm_ffi=True),
             from_dlpack(context_lengths, assumed_align=4, enable_tvm_ffi=True),
-            from_dlpack(output, assumed_align=4, enable_tvm_ffi=True),
+            dynamic_output,
             index_head_dim,
             options="--enable-tvm-ffi",
         )
