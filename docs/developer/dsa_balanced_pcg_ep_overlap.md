@@ -28,6 +28,13 @@ Capture capacity includes both the packing upper bound and the overlap schedule'
 liveness floor. PP1 overlap has two live forwards whenever multiple microbatches
 are available. Existing pointer, schema and stale-route checks remain active.
 
+Capture cleanup also zeros the indexer loss tracker in place. TE warmup executes
+synthetic forwards that accumulate logging values, which must not reach the first
+training replay's metrics. Cleanup preserves the captured tracker storage and
+reduction groups because replay updates those addresses without running the
+Python logging-registration code again. This cleanup does not change the
+indexer loss or its backward scale.
+
 ## Model scheduling
 
 GPTModel and HybridModel expose `build_schedule_plan` returning an
