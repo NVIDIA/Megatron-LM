@@ -20,7 +20,6 @@ from typing import Any, Dict, List
 import torch
 from torch.utils._pytree import tree_map as tree_map_pyt
 
-from megatron.core import parallel_state
 from megatron.core.num_microbatches_calculator import (
     get_current_running_global_batch_size,
     get_global_batch_size_upper_bound,
@@ -1836,6 +1835,17 @@ class TECudaGraphHelper:
         """Whether this capture needs block-owned, fixed-address DSA route metadata."""
         return bool(getattr(self.config, "dsa_cp_balance_indexer_graph_dynamic_packs", False))
 
+    def _get_graph_sample_index(self, chunk_idx, layer_idx, microbatch_idx):
+        """Map a logical model chunk/callable/slot to TE's flattened input order."""
+        layers_before_chunk = sum(len(layers) for layers in self.callables_per_chunk[:chunk_idx])
+        if self.config.overlap_moe_expert_parallel_comm:
+            return (layers_before_chunk + layer_idx) * self.num_microbatches + microbatch_idx
+        return (
+            layers_before_chunk * self.num_microbatches
+            + microbatch_idx * len(self.callables_per_chunk[chunk_idx])
+            + layer_idx
+        )
+
     @staticmethod
     def _validate_graph_dynamic_route_pair(layout_i32, route_i64, *, name):
         """Validate the two physical owners passed to a captured DSA route."""
@@ -1872,9 +1882,9 @@ class TECudaGraphHelper:
         """
         if not self._uses_graph_dynamic_dsa_route_arena():
             return {}
-        if self.config.overlap_moe_expert_parallel_comm or self.config.delay_wgrad_compute:
+        if self.config.delay_wgrad_compute:
             raise RuntimeError(
-                "Graph-dynamic DSA route arenas do not support overlap/delayed-wgrad capture"
+                "Graph-dynamic DSA route arenas do not support delayed-wgrad capture"
             )
         if not isinstance(sample_kwargs, list):
             raise TypeError("TE CUDA Graph sample_kwargs must be a list for DSA route capture")
@@ -1890,7 +1900,6 @@ class TECudaGraphHelper:
         used_ptrs = set()
         used_route_lengths = set()
         logical_route_numel_by_chunk = {}
-        layers_before_chunk = 0
         for chunk_idx, layers in enumerate(self.callables_per_chunk):
             layers_are_mtp = self.callables_per_chunk_is_mtp[chunk_idx]
             mtp_route_layer_numbers = [
@@ -1915,7 +1924,6 @@ class TECudaGraphHelper:
                 and layer._uses_graph_dynamic_dsa_route()
             ]
             if not route_layer_numbers:
-                layers_before_chunk += len(layers)
                 continue
 
             chunk_with_decoder = self.chunks_with_decoder[chunk_idx]
@@ -1930,7 +1938,7 @@ class TECudaGraphHelper:
 
             for slot in range(self.num_microbatches):
                 graph_indices = tuple(
-                    layers_before_chunk * self.num_microbatches + slot * len(layers) + layer_number
+                    self._get_graph_sample_index(chunk_idx, layer_number, slot)
                     for layer_number in route_layer_numbers
                 )
                 first_kwargs = sample_kwargs[graph_indices[0]]
@@ -2037,7 +2045,6 @@ class TECudaGraphHelper:
                     "logical_route_numel": source_route.numel(),
                     "route_padding": signature_padding,
                 }
-            layers_before_chunk += len(layers)
 
         return route_arenas
 
@@ -2339,9 +2346,15 @@ class TECudaGraphHelper:
             - sample_keys: Tuple of (shape, dtype, layout) for args + (key, shape, dtype, layout)
                 for kwargs, used to match compatible buffers for reuse.
         """
-        assert self.num_model_chunks == max(
+        capture_layers_per_unit = (
+            [1] * len(self.flattened_callables)
+            if chunk_id_list is not None
+            else self.num_layers_per_chunk
+        )
+        num_capture_units = len(capture_layers_per_unit)
+        assert num_capture_units == max(
             order
-        ), "num_model_chunks must match the max chunk id in order."
+        ), "capture units must match the max chunk id in order."
         if chunk_id_list is None:
             # check only if 1f1b overlap is disabled.
             assert (
@@ -2481,8 +2494,7 @@ class TECudaGraphHelper:
 
         # Calculate the starting index of each chunk in callables for future use.
         prefix_num_layers = [0]
-        for model_chunk_idx in range(self.num_model_chunks):
-            num_layers = self.num_layers_per_chunk[model_chunk_idx]
+        for num_layers in capture_layers_per_unit:
             prefix_num_layers.append(prefix_num_layers[-1] + num_layers)
 
         # Reorganize args and kwargs for input tensor reuse.
@@ -2502,7 +2514,7 @@ class TECudaGraphHelper:
         # bookkeeping no one consumes.
         track_mhc_intervals = self._uses_mhc_direct_write_arena()
         self._mhc_sample_order_intervals = {}
-        fwd_idx = [0] * self.num_model_chunks
+        fwd_idx = [0] * num_capture_units
         for idx, chunk_id in enumerate(order):
             model_chunk_idx = abs(ceil(chunk_id)) - 1
 
@@ -2511,7 +2523,7 @@ class TECudaGraphHelper:
                     fwd_sample_queues[model_chunk_idx] = []
 
                 sample_start_idx = (prefix_num_layers[model_chunk_idx] * self.num_microbatches) + (
-                    fwd_idx[model_chunk_idx] * self.num_layers_per_chunk[model_chunk_idx]
+                    fwd_idx[model_chunk_idx] * capture_layers_per_unit[model_chunk_idx]
                 )
                 if chunk_id_list:
                     model_chunk_idx = chunk_id_list[idx][0]
@@ -2593,7 +2605,7 @@ class TECudaGraphHelper:
             elif ceil(chunk_id) == chunk_id:
                 num_consumed_samples = min(
                     len(fwd_sample_queues[model_chunk_idx]),
-                    self.num_layers_per_chunk[model_chunk_idx],
+                    capture_layers_per_unit[model_chunk_idx],
                 )
                 last_retired_samples[model_chunk_idx] = []
                 for sample_keys, per_callable_fwd_idx in fwd_sample_queues[model_chunk_idx][
@@ -2692,7 +2704,7 @@ class TECudaGraphHelper:
 
     def _get_probe_num_microbatches_for_dynamic_slots(self):
         """Return a topology-only probe microbatch count for slot inference."""
-        pipeline_parallel_size = parallel_state.get_pipeline_model_parallel_world_size()
+        pipeline_parallel_size = self.pp_group.size()
         if pipeline_parallel_size == 1 and not self.config.overlap_moe_expert_parallel_comm:
             return 1
 
@@ -2844,9 +2856,7 @@ class TECudaGraphHelper:
 
         microbatch_group_size_per_vp_stage = self.config.microbatch_group_size_per_vp_stage
         if microbatch_group_size_per_vp_stage is None:
-            microbatch_group_size_per_vp_stage = (
-                parallel_state.get_pipeline_model_parallel_world_size()
-            )
+            microbatch_group_size_per_vp_stage = self.pp_group.size()
 
         # If PP is not enabled, we only need to capture one microbatch.
         if self.pp_group.size() == 1 and not self.config.overlap_moe_expert_parallel_comm:
@@ -2869,6 +2879,7 @@ class TECudaGraphHelper:
                 microbatch_group_size_per_vp_stage,
                 False,
                 overlap_moe_expert_parallel_comm=self.config.overlap_moe_expert_parallel_comm,
+                p2p_communicator=self.p2p_communicator,
             )
             _probe_st = _probe_get_st(
                 probe_num_microbatches, self.num_model_chunks, microbatch_group_size_per_vp_stage
@@ -2879,7 +2890,7 @@ class TECudaGraphHelper:
             auto_num_slots = self._get_required_num_microbatch_slots_from_order(
                 _probe_order, self.num_model_chunks
             )
-            pp_group = parallel_state.get_pipeline_model_parallel_group()
+            pp_group = self.pp_group
             if pp_group is not None and pp_group.size() > 1:
                 auto_num_slots_tensor = torch.tensor(
                     [auto_num_slots], dtype=torch.int32, device=torch.cuda.current_device()
@@ -2896,7 +2907,10 @@ class TECudaGraphHelper:
                 max_num_microbatches,
                 capture_mode,
             ) = self._get_dynamic_capture_plan(auto_num_slots, microbatch_group_size_per_vp_stage)
-            if self.config.overlap_moe_expert_parallel_comm or self.config.delay_wgrad_compute:
+            if self.config.delay_wgrad_compute or (
+                self.config.overlap_moe_expert_parallel_comm
+                and not self._uses_graph_dynamic_dsa_route_arena()
+            ):
                 self.num_microbatches = runtime_num_microbatches
                 capture_mode = "runtime"
                 fallback_reason = "overlap_moe_expert_parallel_comm/delay_wgrad_compute"
@@ -2946,6 +2960,22 @@ class TECudaGraphHelper:
         )
         chunk_id_list = None
         if self.config.overlap_moe_expert_parallel_comm:
+            # The runtime scheduler visits eager layers too. Retain those positions
+            # when interleaving forward/backward graph calls, especially for Hybrid
+            # attention/MoE patterns with an uncaptured trailing dense layer.
+            layer_to_callable = []
+            for chunk, callables in zip(self.chunks_with_decoder, self.callables_per_chunk):
+                if chunk is None:
+                    layer_to_callable.append([])
+                    continue
+                scheduled_layers = list(chunk.decoder.layers) + [
+                    layer.mtp_model_layer
+                    for layer in getattr(getattr(chunk, "mtp", None), "layers", [])
+                ]
+                callable_indices = {id(layer): index for index, layer in enumerate(callables)}
+                layer_to_callable.append(
+                    [callable_indices.get(id(layer)) for layer in scheduled_layers]
+                )
             wgrad_in_graph_scope = CudaGraphModule.attn in self.config.cuda_graph_modules or (
                 CudaGraphModule.moe_router in self.config.cuda_graph_modules
                 and self.config.moe_shared_expert_intermediate_size is not None
@@ -2953,16 +2983,16 @@ class TECudaGraphHelper:
             )
             capture_wgrad_graph = self.config.delay_wgrad_compute and wgrad_in_graph_scope
             order, chunk_id_list = get_overlap_moe_expert_parallel_comm_order(
-                order, self.num_layers_per_chunk, capture_wgrad_graph
+                order, self.num_layers_per_chunk, capture_wgrad_graph, layer_to_callable
             )
-            self.num_layers_per_chunk = [1] * sum(self.num_layers_per_chunk)
-            self.num_model_chunks = max(order)
             _order_without_wgrad = []
             for c_id in order:
                 if ceil(c_id) != c_id:
                     continue
                 _order_without_wgrad.append(c_id)
-            self.num_microbatches = len(_order_without_wgrad) // self.num_model_chunks // 2
+            assert len(_order_without_wgrad) == (
+                len(self.flattened_callables) * self.num_microbatches * 2
+            ), "Expanded overlap capture must preserve the microbatch count"
             log_on_each_pipeline_stage(
                 logger=logger,
                 tp_group=self.tp_group,
@@ -2999,7 +3029,11 @@ class TECudaGraphHelper:
             if is_te_min_version("2.6.0"):
                 # Starting from TE 2.6.0, make_graphed_callables() accepts different number
                 # of layers per chunk.
-                kwargs['_num_layers_per_chunk'] = self.num_layers_per_chunk
+                kwargs['_num_layers_per_chunk'] = (
+                    [1] * len(self.flattened_callables)
+                    if self.config.overlap_moe_expert_parallel_comm
+                    else self.num_layers_per_chunk
+                )
             if is_te_min_version("2.7.0"):
                 # Starting from TE 2.7.0, make_graphed_callables() optimizes the graph memory
                 # usage by reusing input/output data buffers between graphs. The reuse pass
@@ -3185,22 +3219,14 @@ class TECudaGraphHelper:
             # configuration would retain num_microbatches static input tensors
             # per layer for nothing. Config-level, so hoisted out of both loops.
             retain_static_inputs = self._uses_mhc_direct_write_arena()
-            num_layers_accumulated = 0
-            for layers in self.callables_per_chunk:
+            for chunk_idx, layers in enumerate(self.callables_per_chunk):
                 for layer_number, layer in enumerate(layers):
                     layer.cuda_graphs = []
                     static_hidden_inputs = []
                     for batch_number in range(self.num_microbatches):
-                        if self.config.overlap_moe_expert_parallel_comm:
-                            graph_idx = (
-                                num_layers_accumulated + layer_number
-                            ) * self.num_microbatches + batch_number
-                        else:
-                            graph_idx = (
-                                num_layers_accumulated * self.num_microbatches
-                                + batch_number * len(layers)
-                                + layer_number
-                            )
+                        graph_idx = self._get_graph_sample_index(
+                            chunk_idx, layer_number, batch_number
+                        )
                         layer.cuda_graphs.append(graphs[graph_idx])
                         # TE may rebind sample inputs while optimizing
                         # graph-buffer reuse, so retain the final fixed-address
@@ -3213,7 +3239,6 @@ class TECudaGraphHelper:
                             static_hidden_inputs.append(sample_args[graph_idx][0])
                     if retain_static_inputs:
                         layer.set_te_cuda_graph_static_hidden_inputs(static_hidden_inputs)
-                num_layers_accumulated += len(layers)
 
             # TE 2.7 may rebind general graph inputs after capture. Adopt the final common
             # pair for each chunk/slot, while rejecting a split pair or cross-slot alias,
@@ -3293,7 +3318,9 @@ def convert_schedule_table_to_order(num_warmup_microbatches, num_model_chunks, s
     return order
 
 
-def get_overlap_moe_expert_parallel_comm_order(order, num_layers_per_chunk, capture_wgrad_graph):
+def get_overlap_moe_expert_parallel_comm_order(
+    order, num_layers_per_chunk, capture_wgrad_graph, layer_to_callable=None
+):
     """
     This functions gets the order for overlap_moe_expert_parallel_comm schedule for the original
     chunk-wise order list. Each chunk is transformered to chunks with only 1 layer so that
@@ -3309,6 +3336,8 @@ def get_overlap_moe_expert_parallel_comm_order(order, num_layers_per_chunk, capt
             of this list equals the number of chunks.
         capture_wgrad_graph (bool): If True, weight gradient computation graphs are added to the
             order by appending entries with layer_id - 0.5.
+        layer_to_callable: Optional per-chunk map from runtime layer positions to local
+            graph callable indices. None entries represent eager layers at schedule yields.
 
     Returns:
         Tuple[List[float], List[Optional[List[int]]]]: A tuple containing:
@@ -3353,6 +3382,12 @@ def get_overlap_moe_expert_parallel_comm_order(order, num_layers_per_chunk, capt
     def get_layer_range(c_id):
         num_layers = num_layers_per_chunk[abs(c_id) - 1]
         num_layers_previous_chunks = sum(num_layers_per_chunk[: abs(c_id) - 1])
+        if layer_to_callable is not None:
+            mapped = [
+                num_layers_previous_chunks + index + 1 if index is not None else 0
+                for index in layer_to_callable[abs(c_id) - 1]
+            ]
+            return mapped if c_id > 0 else [-index for index in reversed(mapped)]
         if c_id > 0:
             return list(
                 range(num_layers_previous_chunks + 1, num_layers_previous_chunks + num_layers + 1)
@@ -3362,8 +3397,11 @@ def get_overlap_moe_expert_parallel_comm_order(order, num_layers_per_chunk, capt
     # warmup stage
     for c_id in order[:first_backward_idx]:
         layer_range = get_layer_range(c_id)
-        new_order += layer_range
-        chunk_id_list.extend([abs(c_id) - 1, i] for i in range(len(layer_range)))
+        offset = sum(num_layers_per_chunk[: c_id - 1])
+        new_order.extend(layer_id for layer_id in layer_range if layer_id != 0)
+        chunk_id_list.extend(
+            [c_id - 1, layer_id - offset - 1] for layer_id in layer_range if layer_id != 0
+        )
 
     # 1f1b overlap stage
     if first_backward_idx < last_forward_idx:
@@ -3373,23 +3411,25 @@ def get_overlap_moe_expert_parallel_comm_order(order, num_layers_per_chunk, capt
         ):
             layer_range_f = get_layer_range(c_id_f)
             layer_range_b = get_layer_range(c_id_b)
-            index = 0
+            backward_graphs = [layer_id for layer_id in layer_range_b if layer_id != 0]
             for l_b, l_f in zip_longest(layer_range_b, layer_range_f, fillvalue=0):
                 # always forward graph before backward graph
                 if l_f != 0:
-                    add_order(c_id_f, l_f, index=index)
+                    callable_idx = l_f - sum(num_layers_per_chunk[: c_id_f - 1]) - 1
+                    add_order(c_id_f, l_f, index=callable_idx)
                 if l_b != 0:
                     add_order(c_id_b, l_b)
-                    if capture_wgrad_graph and index < len(layer_range_b) - 1:
+                    if capture_wgrad_graph and l_b != backward_graphs[-1]:
                         add_order(c_id_b, l_b, is_wgrad=True)
-                index += 1
             # last wgrad backward
-            if capture_wgrad_graph and layer_range_b:
-                add_order(c_id_b, layer_range_b[-1], is_wgrad=True)
+            if capture_wgrad_graph and backward_graphs:
+                add_order(c_id_b, backward_graphs[-1], is_wgrad=True)
 
     # cool down stage, backward graphs only
     for c_id in order[last_forward_idx + 1 :]:
         for l_b in get_layer_range(c_id):
+            if l_b == 0:
+                continue
             add_order(c_id, l_b)
             if capture_wgrad_graph:
                 add_order(c_id, l_b, is_wgrad=True)

@@ -3809,18 +3809,25 @@ class TransformerConfig(ModelParallelConfig):
                 self.pipeline_model_parallel_size > 1
                 or (self.virtual_pipeline_model_parallel_size or 1) > 1
             )
-            if graph_dynamic_pp_vpp and not self.cuda_graph_dynamic_microbatches:
+            if (
+                graph_dynamic_pp_vpp or self.overlap_moe_expert_parallel_comm
+            ) and not self.cuda_graph_dynamic_microbatches:
                 raise ValueError(
-                    "CUDA-graphed balanced DSA dynamic-pack routing with PP/VPP requires "
+                    "CUDA-graphed balanced DSA dynamic-pack routing with PP/VPP or EP overlap "
+                    "requires "
                     "cuda_graph_dynamic_microbatches=True so each in-flight forward owns a "
                     "distinct CUDA graph input slot until its backward completes."
                 )
-            if self.overlap_moe_expert_parallel_comm or self.delay_wgrad_compute:
+            if self.delay_wgrad_compute:
                 raise ValueError(
                     "CUDA-graphed balanced DSA dynamic-pack routing does not yet support "
-                    "overlap_moe_expert_parallel_comm or delay_wgrad_compute: those modes force "
-                    "CUDA graph capture back to the runtime microbatch count instead of the THD "
-                    "packing upper bound, so a still-live graph input slot could be reused."
+                    "delay_wgrad_compute: route input slots must remain live until the "
+                    "separate weight-gradient graph has completed."
+                )
+            if graph_dynamic_pp_vpp and self.overlap_moe_expert_parallel_comm:
+                raise ValueError(
+                    "CUDA-graphed balanced DSA dynamic-pack routing with EP overlap "
+                    "currently requires PP1 without VPP."
                 )
         if (
             self.dsa_cp_balance_indexer

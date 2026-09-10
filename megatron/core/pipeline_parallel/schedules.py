@@ -919,8 +919,9 @@ def get_pp_rank_microbatches(
                 num_warmup_microbatches = num_warmup_microbatches + 1
     else:
         # forward_backward_no_pipelining
-        # This path is only used for cuda graph capturing compatibility for the PP=1 case.
-        num_warmup_microbatches = 0
+        # EP overlap retains the first forward before co-scheduling the next
+        # forward with its backward, even without pipeline parallelism.
+        num_warmup_microbatches = int(overlap_moe_expert_parallel_comm)
 
     if num_warmup_microbatches >= total_num_microbatches:
         num_warmup_microbatches = total_num_microbatches
@@ -1743,7 +1744,7 @@ def forward_backward_pipelining_with_interleaving(
                 recv_next = True
                 if is_pp_last_stage(p2p_communicator.pp_group):
                     recv_next = False
-                (input_tensor, output_tensor_grad) = (
+                input_tensor, output_tensor_grad = (
                     p2p_communicator.send_forward_backward_recv_forward_backward(
                         output_tensor,
                         input_tensor_grad,
@@ -1807,7 +1808,7 @@ def forward_backward_pipelining_with_interleaving(
                 if is_pp_last_stage(p2p_communicator.pp_group):
                     recv_next = False
 
-                (bwd_recv_buffer[-1], bwd_wait_handles) = (
+                bwd_recv_buffer[-1], bwd_wait_handles = (
                     p2p_communicator.send_backward_recv_backward(
                         input_tensor_grad,
                         recv_next=recv_next,
@@ -1960,7 +1961,7 @@ def forward_backward_pipelining_with_interleaving(
                     backward_k, forward=False
                 )
 
-                (bwd_recv_buffer[backward_k % bwd_recv_buffer_size], bwd_wait_handles) = (
+                bwd_recv_buffer[backward_k % bwd_recv_buffer_size], bwd_wait_handles = (
                     p2p_communicator.send_backward_recv_backward(
                         input_tensor_grad,
                         recv_next=recv_next,
@@ -2033,7 +2034,7 @@ def forward_backward_pipelining_with_interleaving(
                 recv_prev = False
 
             # Communicate tensors.
-            (input_tensor, output_tensor_grad) = (
+            input_tensor, output_tensor_grad = (
                 p2p_communicator.send_forward_backward_recv_forward_backward(
                     output_tensor,
                     input_tensor_grad,

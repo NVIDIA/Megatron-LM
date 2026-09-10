@@ -321,6 +321,9 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
         only when HybridStack executes its normal per-layer loop. Full/MHC-selective recompute
         use different layer scheduling and retain the existing per-layer graphs.
         """
+        if self.config.overlap_moe_expert_parallel_comm:
+            # The overlap scheduler yields between the attention and MoE layers.
+            return False
         if not isinstance(next_layer, HyperConnectionHybridLayer):
             return False
         if self.config.recompute_granularity == 'full' or (
@@ -1166,14 +1169,7 @@ class HybridStack(MegatronModule):
         if isinstance(hidden_states, WrappedTensor):
             hidden_states = hidden_states.unwrap()
 
-        # Skip input_expand inside MTP nested HybridStack: when mHC + MTP, the outer
-        # decoder hands in already-multi-stream hidden_states via mhc_multistream
-        # (see multi_token_prediction.py _concat_embeddings), so expanding again would
-        # produce [s, b, n*(n*h)] instead of [s, b, n*h] and break HC mapping_proj.
-        if self.config.enable_hyper_connections and self.pre_process and not self.is_mtp_layer:
-            hidden_states = HyperConnectionModule.input_expand(
-                hidden_states, self.config.num_residual_streams
-            )
+        hidden_states = self.preprocess_for_layer_schedule(hidden_states)
 
         if inference_context and inference_context.is_static_batching():
             # NOTE(bnorick): match BaseInferenceContext attributes for
@@ -1306,6 +1302,18 @@ class HybridStack(MegatronModule):
                         is_last_in_recompute_block=mhc_is_last_in_recompute_block[l_no],
                     )
 
+        return self.postprocess_for_layer_schedule(hidden_states)
+
+    def preprocess_for_layer_schedule(self, hidden_states):
+        """Apply the decoder input boundary in the fine-grained overlap schedule."""
+        if self.config.enable_hyper_connections and self.pre_process and not self.is_mtp_layer:
+            hidden_states = HyperConnectionModule.input_expand(
+                hidden_states, self.config.num_residual_streams
+            )
+        return hidden_states
+
+    def postprocess_for_layer_schedule(self, hidden_states, *, return_mhc_multistream=False):
+        """Apply the same output contraction and normalization as ordinary forward."""
         # When mHC + MTP, save the pre-contraction multi-stream tensor for MTP input.
         # MTP's _concat_embeddings mHC branch expects [s, b, n*h] (multi-stream), while
         # the contracted hidden_states is [s, b, h]. Mirrors transformer_block.py:948-988.
@@ -1341,7 +1349,7 @@ class HybridStack(MegatronModule):
             inp=hidden_states, requires_grad=hidden_states.requires_grad, keep_graph=True
         )
 
-        if mhc_multistream is not None:
+        if return_mhc_multistream or mhc_multistream is not None:
             return hidden_states, mhc_multistream
         return hidden_states
 
