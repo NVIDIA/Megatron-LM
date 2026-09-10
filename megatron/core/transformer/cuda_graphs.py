@@ -3064,6 +3064,9 @@ class TECudaGraphHelper:
         Reset the model and optimizer state after capturing CUDA Graphs.
         """
         from megatron.core.distributed.finalize_model_grads import reset_model_temporary_tensors
+        from megatron.core.transformer.experimental_attention_variant.dsa import (
+            DSAIndexerLossLoggingHelper,
+        )
         from megatron.core.transformer.moe.moe_logging import get_moe_metrics_tracker
 
         for model_chunk in self.model:
@@ -3071,6 +3074,10 @@ class TECudaGraphHelper:
         for optimizer in self.optimizers:
             optimizer.zero_grad()
         get_moe_metrics_tracker().clear()
+        # TE warmup also accumulates synthetic indexer losses. Replay writes
+        # through the captured tracker address without rerunning Python, so
+        # clear the values in place and retain the CP/TP reduction groups.
+        DSAIndexerLossLoggingHelper.clean_loss_in_tracker(preserve_groups=True)
         reset_model_temporary_tensors(self.config, self.model)
 
     def _finish_capturing(self, start_time):
