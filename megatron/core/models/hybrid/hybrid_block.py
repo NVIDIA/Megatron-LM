@@ -31,6 +31,7 @@ from megatron.core.models.hybrid.hybrid_layer_allocation import (
     get_layer_type_physical_count,
     is_layer_group,
     layer_type_list_to_str,
+    validate_layer_group,
     validate_segment_layers,
 )
 from megatron.core.models.hybrid.layers import utils as layer_utils
@@ -109,7 +110,7 @@ class HybridStack(MegatronModule):
             segment. Defaults to 0.
         logical_layer_offset (int, optional): the global logical layer offset for this
             pipeline segment; bracketed groups count as one logical layer. Used for
-            checkpoint keys. Defaults to 0.
+            checkpoint keys. Defaults to ``pp_layer_offset`` for legacy direct callers.
         is_layer_group_stack (bool, optional): whether this stack is the nested stack built
             for a bracketed group. Defaults to False.
         post_layer_norm (bool, optional): whether to include a final layer norm.
@@ -122,6 +123,9 @@ class HybridStack(MegatronModule):
             process groups to use.
         is_mtp_layer (bool, optional): whether this is an MTP layer. Defaults to False.
         boundary_layout (CPLayout, optional): CP layout at the stack boundary.
+        layer_number_offset (int, optional): global physical layer offset for this
+            stack's first layer. Defaults to ``pp_layer_offset``. Nested groups use
+            their own numbering offset while retaining the pipeline's cache offset.
     """
 
     def __init__(
@@ -131,7 +135,7 @@ class HybridStack(MegatronModule):
         pre_process: bool = True,
         layer_type_list: list[LayerPatternItem] | None = None,
         pp_layer_offset: int = 0,
-        logical_layer_offset: int = 0,
+        logical_layer_offset: int | None = None,
         is_layer_group_stack: bool = False,
         transformer_sharded_keys: bool = False,
         post_layer_norm: bool = True,
@@ -143,6 +147,7 @@ class HybridStack(MegatronModule):
         name: str | None = None,
         layer_config_list: Sequence[LayerConfigItem] | None = None,
         boundary_layout: CPLayout | None = None,
+        layer_number_offset: int | None = None,
     ) -> None:
         """
         Args:
@@ -170,6 +175,11 @@ class HybridStack(MegatronModule):
             )
             layer_config_list = validate_segment_layers(segment, config)
 
+        for layer_config in layer_config_list:
+            if is_layer_group(layer_config):
+                validate_layer_group(
+                    [layer_utils.get_layer_symbol_from_config(config) for config in layer_config]
+                )
         for layer_config in flatten_layer_type_list(layer_config_list):
             layer_utils.validate_tp_comm_overlap(
                 layer_config,
@@ -182,6 +192,9 @@ class HybridStack(MegatronModule):
         self.post_layer_norm = post_layer_norm
         self.post_process = post_process
         self.is_mtp_layer = is_mtp_layer
+        logical_layer_offset = (
+            pp_layer_offset if logical_layer_offset is None else logical_layer_offset
+        )
         self.logical_layer_offset = logical_layer_offset
         self.is_layer_group_stack = is_layer_group_stack
         boundary_layout = (
@@ -236,7 +249,9 @@ class HybridStack(MegatronModule):
         # ``name=...layers.{i}`` suffix). ``physical_layer_offset`` is the physical layer
         # counter used for ``layer_number`` and the FP8/FP4 contexts; it advances by more
         # than one for bracketed groups, which hold several physical layers.
-        physical_layer_offset = pp_layer_offset
+        physical_layer_offset = (
+            pp_layer_offset if layer_number_offset is None else layer_number_offset
+        )
         for i, layer_config in enumerate(self.layer_config_list):
             layer_number = physical_layer_offset + 1
             if is_layer_group(layer_config):
@@ -262,7 +277,8 @@ class HybridStack(MegatronModule):
                         submodules=submodules,
                         pre_process=True,
                         layer_config_list=list(layer_config),
-                        pp_layer_offset=physical_layer_offset,
+                        pp_layer_offset=pp_layer_offset,
+                        layer_number_offset=physical_layer_offset,
                         logical_layer_offset=logical_layer_offset + len(self.layers),
                         is_layer_group_stack=True,
                         transformer_sharded_keys=transformer_sharded_keys,

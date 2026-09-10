@@ -165,6 +165,69 @@ def test_cp_layouts_are_selected_by_layer_config_type(monkeypatch):
     assert layout_manager_kwargs["boundary_layout"] == "contiguous"
 
 
+@pytest.mark.parametrize("pp_layer_offset", [0, 5])
+@pytest.mark.parametrize("layer_pattern", ["[*-][*-]", "M[*]", "[M*E][M*E]", "[M+E][M+E]"])
+def test_group_inference_offsets_match_flat_layers(monkeypatch, layer_pattern, pp_layer_offset):
+    """Grouping keeps physical layer numbers and pipeline-local cache indices unchanged."""
+
+    class BuiltLayer(torch.nn.Module):
+
+        def __init__(self, config, layer_number):
+            super().__init__()
+            self.config = config
+            self.layer_number = layer_number
+
+    build_calls = []
+
+    def fake_build_module(module_spec, **kwargs):
+        build_calls.append(kwargs)
+        return BuiltLayer(kwargs["config"], kwargs["layer_number"])
+
+    monkeypatch.setattr(hybrid_block_module, "build_module", fake_build_module)
+    flat_pattern = layer_pattern.replace('[', '').replace(']', '')
+    config = MLATransformerConfig(
+        num_layers=pp_layer_offset + len(flat_pattern), hidden_size=64, num_attention_heads=4
+    )
+    offsets = []
+    for pattern in (flat_pattern, layer_pattern):
+        build_calls.clear()
+        HybridStack(
+            config,
+            hybrid_stack_spec.submodules,
+            layer_config_list=validate_segment_layers(pattern, config),
+            pp_layer_offset=pp_layer_offset,
+            post_process=False,
+            pg_collection=_make_pg_collection(),
+        )
+        assert [call["layer_number"] for call in build_calls] == list(
+            range(pp_layer_offset + 1, pp_layer_offset + len(flat_pattern) + 1)
+        )
+        offsets.append(
+            [
+                call["layer_number"] - call["pp_layer_offset"]
+                for call in build_calls
+                if "pp_layer_offset" in call
+            ]
+        )
+
+    assert offsets[1] == offsets[0]
+    assert len(set(offsets[1])) == len(offsets[1])
+
+
+@pytest.mark.parametrize("group", ["MM", "--", "**", "G*", "D+", "-E"])
+def test_explicit_group_configs_reject_checkpoint_namespace_collisions(group):
+    """Direct config tuples enforce the same checkpoint constraints as parsed patterns."""
+    config = MLATransformerConfig(num_layers=2, hidden_size=64, num_attention_heads=4)
+    group_configs = tuple(layer_utils.create_layer_config(config, symbol) for symbol in group)
+    with pytest.raises(ValueError, match="multiple layers in checkpoint namespace"):
+        HybridStack(
+            config,
+            hybrid_stack_spec.submodules,
+            layer_config_list=[group_configs],
+            pg_collection=_make_pg_collection(),
+        )
+
+
 def test_hybrid_stack_rejects_layer_config_subclasses(monkeypatch):
     """Layer config subclasses must be registered as distinct layer types."""
 
@@ -783,7 +846,8 @@ class TestHybridBlock:
         assert isinstance(block.layers[1], HybridStack)
         assert [layer.layer_number for layer in block.layers[1].layers] == [2, 3]
 
-    def test_group_sharded_state_dict_uses_logical_layer_keys(self):
+    @pytest.mark.parametrize("stack_spec", [hybrid_stack_spec, hybrid_inference_stack_spec])
+    def test_group_sharded_state_dict_uses_logical_layer_keys(self, stack_spec):
         """Grouped attention+MLP layers share one Transformer-compatible checkpoint key."""
         layer_pattern = "[*-]"
         transformer_config = TransformerConfig(
@@ -795,7 +859,7 @@ class TestHybridBlock:
         layer_config_list = validate_segment_layers(layer_pattern, transformer_config)
         block = HybridStack(
             transformer_config,
-            hybrid_stack_spec.submodules,
+            stack_spec.submodules,
             layer_config_list=layer_config_list,
             pp_layer_offset=0,
             logical_layer_offset=0,
@@ -814,12 +878,13 @@ class TestHybridBlock:
         assert "decoder.final_layernorm.weight" in sharded_keys
         assert "decoder.final_norm.weight" not in sharded_keys
 
-    def test_sharded_state_dict_keeps_final_norm_key_without_transformer_keys(self):
-        """Default (non-grouped) stacks keep the historical ``final_norm`` sharded key."""
+    @pytest.mark.parametrize("pp_layer_offset", [0, 5])
+    def test_sharded_state_dict_keeps_historical_keys(self, pp_layer_offset):
+        """Direct callers retain physical layer indices and the historical final norm key."""
         layer_pattern = "*-"
         transformer_config = TransformerConfig(
             hidden_size=256,
-            num_layers=_num_physical_layers(layer_pattern),
+            num_layers=pp_layer_offset + _num_physical_layers(layer_pattern),
             num_attention_heads=4,
             use_cpu_initialization=True,
         )
@@ -828,8 +893,7 @@ class TestHybridBlock:
             transformer_config,
             hybrid_stack_spec.submodules,
             layer_config_list=layer_config_list,
-            pp_layer_offset=0,
-            logical_layer_offset=0,
+            pp_layer_offset=pp_layer_offset,
             pg_collection=self.get_pg_collection(),
         )
 
@@ -838,6 +902,8 @@ class TestHybridBlock:
 
         assert "decoder.final_norm.weight" in sharded_keys
         assert "decoder.final_layernorm.weight" not in sharded_keys
+        assert f"decoder.layers.{pp_layer_offset}.self_attention.linear_qkv.weight" in sharded_keys
+        assert f"decoder.layers.{pp_layer_offset + 1}.mlp.linear_fc1.weight" in sharded_keys
 
     def test_group_forward_matches_equivalent_flat_layers(self):
         """A bracket group is only a scheduling/checkpoint boundary, not new math."""

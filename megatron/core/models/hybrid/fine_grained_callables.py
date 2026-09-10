@@ -15,50 +15,54 @@ from megatron.core.models.hybrid.hybrid_block import HybridStack
 from megatron.core.models.hybrid.hybrid_layer_allocation import LayerPatternItem
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols as LayerSymbols
 from megatron.core.models.hybrid.hybrid_layer_allocation import is_layer_group
-from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
-    FineGrainedActivationOffloadingInterface as off_interface,
+from megatron.core.pipeline_parallel.utils import (
+    ScheduleNode,
+    StageDispatchBwdGrad,
+    get_comm_stream,
 )
-from megatron.core.pipeline_parallel.utils import ScheduleNode
 from megatron.core.transformer.transformer_layer import make_viewless_tensor
 
 
-class _SharedExpertBackwardDWWrapper:
-    """Run MoE shared-experts wgrad as part of the ``pre_dispatch_computation`` slot.
+class _MoEBackwardDWWrapper:
+    """Run delayed MoE wgrad and expose only the parameters owned by its slot.
 
-    Why: shared-experts forward is part of ``_run_moe_preprocess`` (which runs in the
-    pre_dispatch slot), and TE's delay-wgrad model only ``put``s to the wgrad queue
-    inside the autograd backward (dgrad). So shared-experts' ``backward_dw`` must
-    fire *after* the pre_dispatch slot's autograd backward — registering it in the
-    ``mlp`` slot would call it before that dgrad and trigger
-    ``RuntimeError: Pop empty queue`` from TE.
+    Shared experts and the latent down projection run in pre-dispatch; routed
+    experts and the latent up projection run later. Their gradient-accumulation
+    hooks must run after their respective wgrad, even if a previous microbatch
+    has already populated ``param.grad``.
     """
 
-    def __init__(self, layer):
-        self.layer = layer
-        self.shared_expert_dw_callable = None
-        if layer.mlp.use_shared_expert and not layer.mlp.shared_expert_overlap:
-            self.shared_expert_dw_callable = partial(
-                layer.mlp.backward_dw, routed_experts=False, shared_experts=True
-            )
+    def __init__(self, mlp, routed_experts: bool):
+        self.dw_callable = partial(
+            mlp.backward_dw, routed_experts=routed_experts, shared_experts=not routed_experts
+        )
+        self.wgrad_on_comm_stream = False
+        self.submodules = []
+        if routed_experts:
+            self.submodules.append(mlp.experts)
+        elif mlp.use_shared_expert and not mlp.shared_expert_overlap:
+            self.submodules.append(mlp.shared_experts)
+        if mlp.config.moe_latent_size and mlp.config.overlap_moe_expert_parallel_comm:
+            self.submodules.append(mlp.fc2_latent_proj if routed_experts else mlp.fc1_latent_proj)
+            self.wgrad_on_comm_stream = routed_experts
 
     def backward_dw(self):
-        """Run shared-expert backward wgrad after pre-dispatch autograd backward."""
-        if self.shared_expert_dw_callable is not None:
-            self.shared_expert_dw_callable()
-        self.layer = None
-        self.shared_expert_dw_callable = None
+        """Run this slot's wgrad after its autograd backward."""
+        self.dw_callable()
+        if self.wgrad_on_comm_stream:
+            # MoELayer runs the latent up-projection wgrad on the communication
+            # stream. Its accumulation hooks run on this node's compute stream.
+            torch.cuda.current_stream().wait_stream(get_comm_stream())
+        self.dw_callable = None
 
     def parameters(self):
-        """Expose shared-expert params so post_wgrad_grad_acc_hook discovery works.
+        """Keep parameter owners alive until the node collects post-wgrad hooks.
 
-        The schedule node's backward_dw iterates module.parameters() looking for
-        post_wgrad_grad_acc_hook on each param. _SharedExpertBackwardDWWrapper is
-        a plain class (not nn.Module), so we forward to layer.mlp.shared_experts.
-        Returns an empty iterator after backward_dw has cleared the layer ref.
+        ``TransformerLayerNode.backward_dw`` enumerates these parameters after
+        calling ``backward_dw``, then releases the wrapper with the slot state.
         """
-        if self.layer is None or self.layer.mlp.shared_experts is None:
-            return iter([])
-        return self.layer.mlp.shared_experts.parameters()
+        for module in self.submodules:
+            yield from module.parameters()
 
 
 class HybridStackNode(TransformerLayerNode):
@@ -159,6 +163,9 @@ def _get_moe_padding_mask(node: ScheduleNode):
 
 def _run_moe_preprocess(layer, node: ScheduleNode, hidden_states: Tensor):
     pre_mlp_layernorm_output = layer._forward_pre_mlp_layernorm(hidden_states)
+    # A subsequent microbatch can reuse this layer before this node combines.
+    node.layer_state.mlp_norm_manager = layer.mlp_norm_manager
+    layer.mlp_norm_manager = None
     if isinstance(pre_mlp_layernorm_output, tuple):
         if len(pre_mlp_layernorm_output) != 2:
             raise ValueError(
@@ -193,13 +200,17 @@ def _run_moe_experts(layer, node: ScheduleNode, dispatched_tokens: Tensor):
         layer.config.moe_token_dispatcher_type == "flex"
         and layer.config.moe_flex_dispatcher_backend == "deepep"
     )
+    enable_ncclep = (
+        layer.config.moe_token_dispatcher_type == "flex"
+        and layer.config.moe_flex_dispatcher_backend == "ncclep"
+    )
     token_dispatcher = layer.mlp.token_dispatcher
-    if enable_deepep or enable_hybridep:
+    if enable_deepep or enable_hybridep or enable_ncclep:
         token_dispatcher._comm_manager.dispatched_probs = dispatched_probs
 
     expert_output, _ = layer.mlp.routed_experts_compute(dispatched_tokens, dispatched_probs)
 
-    if enable_hybridep:
+    if enable_hybridep or enable_ncclep:
         tokens_per_expert = token_dispatcher._comm_manager.get_number_of_tokens_per_expert()
         node.layer_state.tokens_per_expert = tokens_per_expert
 
@@ -229,10 +240,10 @@ def _run_moe_combine(layer, node: ScheduleNode, output: Tensor):
         output = layer.mlp_bda(layer.training, layer.config.bias_dropout_fusion)(
             mlp_output_with_bias, residual, layer.hidden_dropout
         )
-    if layer.offload_mlp_norm:
-        output = off_interface.group_commit(
-            output, name="mlp_norm", forced_released_tensors=[residual]
-        )
+    mlp_norm_manager = getattr(node.layer_state, "mlp_norm_manager", None)
+    if mlp_norm_manager is not None:
+        output = mlp_norm_manager.group_offload(output, forced_released_tensors=[residual])
+        node.layer_state.mlp_norm_manager = None
     output = make_viewless_tensor(inp=output, requires_grad=output.requires_grad, keep_graph=True)
 
     node.layer_state.residual.record_stream(torch.cuda.current_stream())
@@ -269,6 +280,7 @@ def build_hybrid_stack_callables(layer, layer_type: Optional[LayerPatternItem] =
                 elif item_type in (
                     LayerSymbols.ATTENTION,
                     LayerSymbols.DS_ATTENTION,
+                    LayerSymbols.MLA,
                     LayerSymbols.GDN,
                 ):
                     # Use _forward_attention rather than __call__: an attention half-layer has
@@ -327,11 +339,17 @@ def build_hybrid_stack_callables(layer, layer_type: Optional[LayerPatternItem] =
             terminal_layer.config.moe_token_dispatcher_type == "flex"
             and terminal_layer.config.moe_flex_dispatcher_backend == "deepep"
         )
+        enable_ncclep = (
+            terminal_layer.config.moe_token_dispatcher_type == "flex"
+            and terminal_layer.config.moe_flex_dispatcher_backend == "ncclep"
+        )
         token_dispatcher = terminal_layer.mlp.token_dispatcher
-        if enable_deepep or enable_hybridep:
+        if enable_deepep or enable_hybridep or enable_ncclep:
             token_dispatcher._comm_manager.token_probs = probs
         with _get_inner_quant_context(terminal_layer):
             dispatched_tokens, dispatched_probs = terminal_layer.mlp.dispatch(local_tokens, probs)
+        if enable_ncclep and terminal_layer.config.moe_ncclep_zero_copy:
+            dispatched_tokens = StageDispatchBwdGrad.apply(dispatched_tokens, token_dispatcher)
         node.layer_state.dispatched_probs = node.detach(dispatched_probs)
         return dispatched_tokens
 
@@ -357,7 +375,12 @@ def build_hybrid_stack_callables(layer, layer_type: Optional[LayerPatternItem] =
     backward_dw = {}
     pre_bwd_dw = []
     for item_type, item_layer in pre_layers:
-        if item_type in (LayerSymbols.ATTENTION, LayerSymbols.DS_ATTENTION, LayerSymbols.GDN):
+        if item_type in (
+            LayerSymbols.ATTENTION,
+            LayerSymbols.DS_ATTENTION,
+            LayerSymbols.MLA,
+            LayerSymbols.GDN,
+        ):
             # TransformerLayer-backed pre-layers go through the standard
             # _BackwardDWWrapper which coordinates attn / shared-expert wgrad
             # with cuda-graph replay scopes.
@@ -371,15 +394,12 @@ def build_hybrid_stack_callables(layer, layer_type: Optional[LayerPatternItem] =
             # registering the layer directly is sufficient.
             pre_bwd_dw.append(item_layer)
     if is_moe:
-        # MoELayer.backward_dw default kwargs (routed_experts=True, shared_experts=False)
-        # handle the routed-experts wgrad in the mlp slot. The shared-experts wgrad goes
-        # into the pre_dispatch_computation slot so it runs after that slot's autograd
-        # backward (where TE's wgrad_store.put fires); the wrapper is a no-op when
-        # shared_expert_overlap is enabled.
-        shared_expert_dw = _SharedExpertBackwardDWWrapper(terminal_layer)
-        if shared_expert_dw.shared_expert_dw_callable is not None:
-            pre_bwd_dw.append(shared_expert_dw)
-        backward_dw["mlp"] = terminal_layer.mlp
+        # Each slot owns the hooks for exactly the parameters whose delayed wgrad
+        # it computes. Shared-expert dgrad has not run yet in the routed MLP slot.
+        pre_dispatch_dw = _MoEBackwardDWWrapper(terminal_layer.mlp, routed_experts=False)
+        if pre_dispatch_dw.submodules:
+            pre_bwd_dw.append(pre_dispatch_dw)
+        backward_dw["mlp"] = _MoEBackwardDWWrapper(terminal_layer.mlp, routed_experts=True)
     elif terminal_type == LayerSymbols.MLP:
         backward_dw["mlp"] = terminal_layer.mlp
 

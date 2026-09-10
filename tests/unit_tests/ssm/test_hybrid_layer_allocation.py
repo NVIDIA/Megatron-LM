@@ -131,6 +131,15 @@ class TestValidateSegmentLayers:
         flat_configs = [result[0], *result[1], result[2]]
         assert len({id(config) for config in flat_configs}) == len(flat_configs)
 
+    @pytest.mark.parametrize("group", ["MM", "--", "**", "GG", "G*", "D+", "-E"])
+    def test_groups_reject_checkpoint_namespace_collisions(self, group):
+        with pytest.raises(ValueError, match="multiple layers in checkpoint namespace"):
+            validate_segment_layers(f"[{group}]", self.config)
+
+    @pytest.mark.parametrize("group", ["M*E", "M*-", "MGE", "M+E", "MD-", "*"])
+    def test_groups_with_distinct_checkpoint_namespaces(self, group):
+        assert parse_segment_layers(f"[{group}]") == [tuple(group)]
+
     def test_valid_patterns(self):
         """Test that valid segment patterns produce configs in the correct order."""
         for pattern in [

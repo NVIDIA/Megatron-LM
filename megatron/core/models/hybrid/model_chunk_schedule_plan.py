@@ -97,15 +97,13 @@ class HybridStackSchedulePlan(TransformerLayerSchedulePlan):
         # always a no-op here.
         self.mtp_post_process = NoopScheduleNode()
 
-    def get_fp8_context(self):
-        """Return an FP8 context only for plain transformer layers."""
-        # Grouped hybrid layers (and inferred-layer-type entries that point at
-        # a HybridStack rather than a plain TransformerLayer) don't have a
-        # ``layer_number`` we can hand to ``get_fp8_context``; the inner layers
-        # manage their own per-layer fp8 context inside the hybrid callables.
-        if self.layer_type is not None or not hasattr(self.layer, "layer_number"):
+    def get_low_precision_context(self):
+        """Let hybrid callables manage each physical layer's quantization context."""
+        # HybridStack and MambaLayer do not expose the TransformerLayer context
+        # hook. Their callables enter the appropriate context for each inner layer.
+        if self.layer_type is not None or not hasattr(self.layer, "get_inner_quantization_context"):
             return nullcontext()
-        return super().get_fp8_context()
+        return super().get_low_precision_context()
 
 
 class HybridStackModelChunkSchedulePlan(TransformerModelChunkSchedulePlan):
@@ -131,11 +129,14 @@ class HybridStackModelChunkSchedulePlan(TransformerModelChunkSchedulePlan):
         # The schedule plan calls the layer callables directly and bypasses
         # ``HybridStack.forward``, which is where per-layer context-parallel layout
         # conversion happens; mixed linear/attention CP layouts are therefore unsupported.
-        cp_layout_manager = getattr(model.decoder, "_cp_layout_manager", None)
-        assert cp_layout_manager is None or not cp_layout_manager.requires_conversion, (
-            "EP A2A overlap with HybridStack does not support mixed context-parallel layouts "
-            "(linear_cp_layout != attention_cp_layout with context_parallel_size > 1)."
-        )
+        # A group's outer layout is the boundary layout even when its inner
+        # layers need conversion, so inspect the nested stacks as well.
+        for module in model.modules():
+            cp_layout_manager = getattr(module, "_cp_layout_manager", None)
+            assert cp_layout_manager is None or not cp_layout_manager.requires_conversion, (
+                "EP A2A overlap with HybridStack does not support mixed context-parallel layouts "
+                "(linear_cp_layout != attention_cp_layout with context_parallel_size > 1)."
+            )
         super().__init__(model, *args, **kwargs)
 
     def _extra_args_for_layer(self, module, layer_idx, num_layers):

@@ -71,6 +71,36 @@ def layer_type_list_to_str(layer_type_list: Sequence[LayerPatternItem]) -> str:
     return ''.join(layer_type_item_to_str(layer_type) for layer_type in layer_type_list)
 
 
+def validate_layer_group(layer_types: Sequence[str]) -> None:
+    """Require group members to have distinct sharded checkpoint namespaces.
+
+    A group shares one logical checkpoint layer index, so it can contain at most
+    one mixer, one attention module (including GDN), and one MLP or MoE module.
+    """
+    if not layer_types:
+        raise ValueError("Layer groups cannot be empty.")
+    if Symbols.MOE in layer_types[:-1]:
+        raise ValueError(f"MoE layer '{Symbols.MOE}' must be the last symbol inside a layer group.")
+    namespaces = {
+        Symbols.MAMBA: "mixer",
+        Symbols.GDN: "self_attention",
+        Symbols.ATTENTION: "self_attention",
+        Symbols.DS_ATTENTION: "self_attention",
+        Symbols.MLA: "self_attention",
+        Symbols.MLP: "mlp",
+        Symbols.MOE: "mlp",
+    }
+    seen = set()
+    for layer_type in layer_types:
+        namespace = namespaces[layer_type]
+        if namespace in seen:
+            raise ValueError(
+                f"Layer group '{layer_type_list_to_str([tuple(layer_types)])}' contains "
+                f"multiple layers in checkpoint namespace '{namespace}'."
+            )
+        seen.add(namespace)
+
+
 @dataclass
 class ParsedHybridPattern:
     """Result of parsing a unified hybrid pattern string.
@@ -356,9 +386,10 @@ def parse_segment_layers(segment: str) -> List[LayerPatternItem]:
     """Parse a pipe-free pattern segment into layer symbols and bracketed groups.
 
     Bracketed groups such as ``[M*E]`` become tuples of symbols (``('M', '*', 'E')``); every
-    other valid symbol is returned as-is. Groups cannot be empty or nested, and an MoE
-    layer inside a group must be its last symbol so that EP-overlap scheduling can
-    split the group into pre-dispatch compute and the terminal MoE layer.
+    other valid symbol is returned as-is. Groups cannot be empty or nested, and
+    their layers must have distinct checkpoint namespaces. An MoE layer inside a
+    group must be its last symbol so that EP-overlap scheduling can split the
+    group into pre-dispatch compute and the terminal MoE layer.
 
     Args:
         segment: A single pipeline segment pattern string (e.g., "M[M*]-").
@@ -389,10 +420,7 @@ def parse_segment_layers(segment: str) -> List[LayerPatternItem]:
             for group_char in group:
                 if not layer_utils.is_valid_symbol(group_char):
                     raise ValueError(_invalid_symbol_message(group_char))
-            if Symbols.MOE in group[:-1]:
-                raise ValueError(
-                    f"MoE layer '{Symbols.MOE}' must be the last symbol inside a layer group."
-                )
+            validate_layer_group(group)
             group_tuple = tuple(group)
             layer_type_list.append(group_tuple)
             flat_layers.extend(group_tuple)
