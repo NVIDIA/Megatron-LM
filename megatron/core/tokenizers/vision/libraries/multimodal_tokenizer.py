@@ -291,8 +291,10 @@ class MegatronMultimodalTokenizer:
         if not self.use_gigatoken:
             tokens = tokens[0]
         else:
-            # Tokenize conversation using gigatoken (when tokenize=False).
-            tokens = np.array(self.tokenize(tokens, add_special_tokens=False))
+            # Tokenize the already-rendered string with gigatoken directly. Do not go through
+            # self.tokenize()/_encode(), which would re-apply _apply_image_tag() and double-wrap
+            # the image tag, since the rendered string already contains it.
+            tokens = np.array(self.tokenizer.encode(tokens, add_special_tokens=False))
 
         if not return_target:
             return tokens
