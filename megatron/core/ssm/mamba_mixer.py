@@ -21,7 +21,7 @@ from megatron.core.inference.contexts.attention_context.triton.tensor_ops import
     tensor_masked_update,
 )
 from megatron.core.inference.utils import InferenceMode
-from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.causal_conv1d import assert_causal_conv1d_deterministic
 from megatron.core.ssm.ops.common.causal_conv1d_triton import causal_conv1d_update
@@ -225,7 +225,9 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
         self.cached_batch_size = None
         assert pg_collection is not None, "pg_collection must be provided for MambaMixer"
         self.pg_collection = pg_collection
-        if self.config.linear_cp_mode == "chunkwise" and self.pg_collection.cp.size() > 1:
+        if self.config.linear_cp_mode == "chunkwise" and (
+            self.pg_collection.cp.size() > 1 or self.config.dynamic_context_parallel
+        ):
             raise NotImplementedError(
                 "linear_cp_mode='chunkwise' is supported only by GatedDeltaProductMixer."
             )
@@ -485,9 +487,11 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
         inference_mode=False,
     ):
         """Run Mamba through its normalized SSM output, before output projection."""
-        zxBCdt, _ = self.in_proj(hidden_states)
+        runtime_cp_group = resolve_cp_group(self.cp.cp_group, packed_seq_params)
+        runtime_cp = self.cp.for_context_parallel_group(runtime_cp_group)
 
-        zxBCdt = self.cp.pre_conv_ssm(zxBCdt, packed_seq_params)
+        zxBCdt, _ = self.in_proj(hidden_states)
+        zxBCdt = runtime_cp.pre_conv_ssm(zxBCdt, packed_seq_params)
 
         if inference_mode or not self.use_mem_eff_path:
             # TODO(ksanthanam): Consider deprecating this path for training
@@ -495,10 +499,12 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
                 "Training with packed sequences is not supported "
                 "in the non-memory-efficient code path."
             )
-            y = self._static_prefill(zxBCdt, conv_state=conv_state, ssm_state=ssm_state)
+            y = self._static_prefill(
+                zxBCdt, conv_state=conv_state, ssm_state=ssm_state, runtime_cp=runtime_cp
+            )
         else:
             assert ssm_state is None
-            y = self._ssm_training(zxBCdt, packed_seq_params)
+            y = self._ssm_training(zxBCdt, packed_seq_params, runtime_cp=runtime_cp)
 
         return y
 
@@ -594,6 +600,7 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
         zxBCdt: torch.Tensor,
         conv_state: Optional[torch.Tensor],
         ssm_state: Optional[torch.Tensor],
+        runtime_cp: Optional[MambaContextParallel] = None,
     ) -> torch.Tensor:
         """
         Performs single-sequence SSM prefill for static-batching inference and the
@@ -611,18 +618,20 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
         Returns:
             Output tensor of shape (l, b, d).
         """
+        runtime_cp = self.cp if runtime_cp is None else runtime_cp
+
         # transpose: l b pd --> b l pd
         zxBCdt = rearrange(zxBCdt, "l b d -> b l d").contiguous()
 
         # (nheads_local_tpcp)
-        A = -torch.exp(self.cp.get_A_log().float())
+        A = -torch.exp(runtime_cp.get_A_log().float())
 
         z, xBC, dt = torch.split(
             zxBCdt,
             [
-                self.cp.d_inner_local_tpcp,
-                self.cp.d_inner_local_tpcp + 2 * self.cp.ngroups_local_tpcp * self.d_state,
-                self.cp.nheads_local_tpcp,
+                runtime_cp.d_inner_local_tpcp,
+                runtime_cp.d_inner_local_tpcp + 2 * runtime_cp.ngroups_local_tpcp * self.d_state,
+                runtime_cp.nheads_local_tpcp,
             ],
             dim=-1,
         )
@@ -636,13 +645,13 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
 
         seqlen = xBC.size(2)
         if causal_conv1d_fn is None:
-            xBC = self.act(self.cp.conv1d(xBC)[..., :seqlen])
+            xBC = self.act(runtime_cp.conv1d(xBC)[..., :seqlen])
         else:
             assert self.activation in ["silu", "swish"]
             xBC = causal_conv1d_fn(
                 x=xBC,
-                weight=rearrange(self.cp.get_conv1d_weight(), "d 1 w -> d w"),
-                bias=self.cp.get_conv1d_bias(),
+                weight=rearrange(runtime_cp.get_conv1d_weight(), "d 1 w -> d w"),
+                bias=runtime_cp.get_conv1d_bias(),
                 activation=self.activation,
             )
         xBC = rearrange(xBC, "b d l -> b l d").contiguous()
@@ -650,9 +659,9 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
         x, B, C = torch.split(
             xBC,
             [
-                self.cp.d_inner_local_tpcp,
-                self.cp.ngroups_local_tpcp * self.d_state,
-                self.cp.ngroups_local_tpcp * self.d_state,
+                runtime_cp.d_inner_local_tpcp,
+                runtime_cp.ngroups_local_tpcp * self.d_state,
+                runtime_cp.ngroups_local_tpcp * self.d_state,
             ],
             dim=-1,
         )
@@ -669,7 +678,7 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
         # `cp_size == 1` (groups of heads can be sharded across CP ranks), which would be
         # mathematically incorrect, and potentially arithmetically unstable.
         assert (
-            self.cp.cp_size == 1 or self.rmsnorm
+            runtime_cp.cp_size == 1 or self.rmsnorm
         ), "Context parallel not supported for use_mem_eff_path==False and rmsnorm==False"
 
         initial_ssm_state = None
@@ -684,12 +693,12 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
             C,
             self.chunk_size,
             D=(
-                rearrange(self.cp.get_D().float(), "(h p) -> h p", p=self.headdim)
+                rearrange(runtime_cp.get_D().float(), "(h p) -> h p", p=self.headdim)
                 if self.D_has_hdim
-                else self.cp.get_D()
+                else runtime_cp.get_D()
             ),
             z=z if not self.rmsnorm else None,
-            dt_bias=self.cp.get_dt_bias().float(),
+            dt_bias=runtime_cp.get_dt_bias().float(),
             dt_softplus=True,
             return_final_states=ssm_state is not None,
             initial_states=initial_ssm_state,
@@ -701,17 +710,20 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
             ssm_state.copy_(last_state)
 
         y = rearrange(y, "b l h p -> l b (h p)").contiguous()
-        y = self.cp.post_conv_ssm(y)
+        y = runtime_cp.post_conv_ssm(y)
 
         if self.rmsnorm:
             z = rearrange(z, "b l h p -> l b (h p)").contiguous()
-            z = self.cp.post_conv_ssm(z)
+            z = runtime_cp.post_conv_ssm(z)
             y = self.norm(y, z)
 
         return y
 
     def _ssm_training(
-        self, zxBCdt: torch.Tensor, packed_seq_params: Optional[PackedSeqParams] = None
+        self,
+        zxBCdt: torch.Tensor,
+        packed_seq_params: Optional[PackedSeqParams] = None,
+        runtime_cp: Optional[MambaContextParallel] = None,
     ) -> torch.Tensor:
         """
         Performs SSM computation for training step.
@@ -721,11 +733,13 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
         training.
         """
 
+        runtime_cp = self.cp if runtime_cp is None else runtime_cp
+
         # transpose: l b pd --> b l pd
         zxBCdt = rearrange(zxBCdt, "l b d -> b l d").contiguous()
 
         # (nheads_local_tpcp)
-        A = -torch.exp(self.cp.get_A_log().float())
+        A = -torch.exp(runtime_cp.get_A_log().float())
 
         seq_idx = None
         if packed_seq_params is not None:
@@ -740,26 +754,26 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
         )
         y = mamba_split_conv1d_scan_combined(
             zxBCdt,
-            rearrange(self.cp.get_conv1d_weight(), "d 1 w -> d w"),
-            self.cp.get_conv1d_bias(),
-            self.cp.get_dt_bias().float(),
+            rearrange(runtime_cp.get_conv1d_weight(), "d 1 w -> d w"),
+            runtime_cp.get_conv1d_bias(),
+            runtime_cp.get_dt_bias().float(),
             A,
             D=(
-                rearrange(self.cp.get_D().float(), "(h p) -> h p", p=self.headdim)
+                rearrange(runtime_cp.get_D().float(), "(h p) -> h p", p=self.headdim)
                 if self.D_has_hdim
-                else self.cp.get_D()
+                else runtime_cp.get_D()
             ),
             chunk_size=self.chunk_size,
             activation=self.activation,
             headdim=None if self.D_has_hdim else self.headdim,
-            ngroups=self.cp.ngroups_local_tpcp,
+            ngroups=runtime_cp.ngroups_local_tpcp,
             norm_before_gate=self.norm_before_gate,
             seq_idx=seq_idx,
             **state_dtype_kwarg,
         )
 
         y = rearrange(y, "b l d -> l b d").contiguous()
-        y = self.cp.post_conv_ssm(y, packed_seq_params)
+        y = runtime_cp.post_conv_ssm(y, packed_seq_params)
 
         if self.rmsnorm:
             y = self.norm(y)

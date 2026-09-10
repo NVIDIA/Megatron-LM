@@ -3657,7 +3657,11 @@ def training_log(
 
     # Log MTP metrics.
     if args.mtp_num_layers is not None:
-        mtp_loss_scale = 1 / (num_microbatches or get_num_microbatches())
+        mtp_loss_scale = (
+            1.0
+            if args.calculate_per_token_loss
+            else 1 / (num_microbatches or get_num_microbatches())
+        )
         MTPLossLoggingHelper.track_mtp_metrics(
             mtp_loss_scale, iteration, writer, wandb_writer, total_loss_dict
         )
