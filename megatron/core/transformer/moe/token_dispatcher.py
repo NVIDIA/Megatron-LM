@@ -1693,6 +1693,18 @@ class _DeepepV2Manager(_DeepepManager):
         self.dispatched_probs = None
         return hidden_states
 
+    def get_permuted_hidden_states_by_experts(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return hidden_states, self.dispatched_probs
+
+    def get_number_of_tokens_per_expert(self) -> torch.Tensor:
+        """
+        Get the number of tokens per expert.
+        """
+        return self.tokens_per_expert
+
+    def get_restored_hidden_states_by_experts(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return hidden_states
+
 
 class _NCCLEPManager(_DispatchManager):
     """A manager class to handle dispatch/combine for MoE models using the NCCL Expert

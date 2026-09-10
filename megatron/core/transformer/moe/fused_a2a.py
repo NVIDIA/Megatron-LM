@@ -345,6 +345,7 @@ class DeepepV2Dispatch(torch.autograd.Function):
             num_sms=num_sms,
             previous_event=previous_event,
             async_with_compute_stream=async_finish,
+            do_expand=True,
             allocate_on_comm_stream=allocate_on_comm_stream,
         )
 
@@ -420,6 +421,7 @@ class DeepepV2Combine(torch.autograd.Function):
             num_sms=ctx.num_sms,
             previous_event=previous_event,
             async_with_compute_stream=ctx.async_finish,
+            do_expand=True,
             allocate_on_comm_stream=ctx.allocate_on_comm_stream,
         )
         if ctx.async_finish:
