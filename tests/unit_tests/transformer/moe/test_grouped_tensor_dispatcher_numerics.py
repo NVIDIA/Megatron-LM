@@ -39,7 +39,7 @@ from megatron.core.transformer.moe.token_dispatcher import nccl_ep_release_conte
 from megatron.core.transformer.spec_utils import get_submodules
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.initialize import _set_random_seed
-from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.test_utilities import Utils, is_nccl_ep_available
 
 pytestmark = [
     pytest.mark.internal,
@@ -77,6 +77,8 @@ def _require_test_environment(dispatcher: str) -> int:
         pytest.skip("DeepEP is not available")
     if dispatcher == "hybridep" and not HAVE_HYBRIDEP:
         pytest.skip("HybridEP is not available")
+    if dispatcher == "ncclep" and not is_nccl_ep_available():
+        pytest.skip("NCCL EP is not available")
     if dispatcher == "deepep" and fused_permute_and_pad_with_probs is None:
         pytest.skip("DeepEP grouped-tensor padding requires TE fused permute-and-pad")
 
