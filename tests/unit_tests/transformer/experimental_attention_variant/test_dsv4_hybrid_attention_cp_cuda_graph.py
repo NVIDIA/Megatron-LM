@@ -72,10 +72,11 @@ class TestDSv4HybridAttentionTHDCPCudaGraph:
         yield
         _clear_cuda_test_state()
 
-    def test_balanced_dynamic_pack_graph_replays_30_iterations(self):
+    @pytest.mark.parametrize("precision", ["bf16", "mxfp8"])
+    def test_balanced_dynamic_pack_graph_replays_30_iterations(self, precision):
         """Exercise raw graph route refresh for 30 A/B/C replays."""
         _DSv4HybridAttentionTHDCPGraphRunners.run_balanced_dynamic_pack_graph_replays_30_iterations(
-            self
+            self, precision=precision
         )
 
     def test_balanced_dynamic_pack_te_layer_graph_replays_30_iterations(self):

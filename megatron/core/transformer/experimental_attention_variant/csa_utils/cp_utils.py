@@ -398,6 +398,11 @@ def compute_cp_indexer_topk(
     if max_seqlen_kv == 0:
         return None, None, None
 
+    if precision == "mxfp8" and not use_fused:
+        raise ValueError(
+            "MXFP8 CP indexer requires fused compact scoring; BF16 fallback is invalid"
+        )
+
     if synthetic_layout and not use_fused:
         raise ValueError(
             "synthetic_layout=True requires use_fused=True because the unfused path "

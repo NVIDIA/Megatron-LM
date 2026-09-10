@@ -40,6 +40,14 @@ dynamic-pack mode is selected automatically. It validates every padded pack and 
 fixed-capacity, two-hop equal-split A2A route in that hook. The same fixed-shape route plan is
 supplied as CUDA-graph tensor inputs to every DSA layer, so replay can refresh metadata for a
 different pack without recapturing or repeating route sorts.
+
+Scoring uses the configured BF16/MXFP8 compact backend. Head and tail share
+packed full K and have distinct caller-owned workspaces. Sparse-loss training
+combines the compact FP32 prediction with its int32 top-k slots in the same
+collectives, preserving the prediction used by the ordinary CP loss path.
+Selection Q inherits the effective TE precision, except that delayed-scaling
+selection uses a stateless projection to leave the canonical local projection's
+amax history unchanged, including no-grad checkpoint forwards.
 """
 
 import logging
@@ -1401,6 +1409,23 @@ def _graph_dynamic_dispatch_chunks_async(
     }
 
 
+def _pack_selection_result(topk, predict):
+    """Send indices and their FP32 probabilities in the same integer collective."""
+    if predict is None:
+        return topk
+    if topk.dtype != torch.int32 or predict.dtype != torch.float32 or topk.shape != predict.shape:
+        raise ValueError("Compact selection requires matching int32 indices and FP32 softmax")
+    return torch.cat((topk, predict.contiguous().view(torch.int32)), dim=-1)
+
+
+def _unpack_selection_result(payload, has_predict):
+    """Restore the paired top-k slots without a lossy probability conversion."""
+    if not has_predict:
+        return payload, None
+    topk, predict = payload.chunk(2, dim=-1)
+    return topk.contiguous(), predict.contiguous().view(torch.float32)
+
+
 def balanced_compute_cp_indexer_topk(
     indexer_qr,  # [l_local, 1, q_lora]  detached indexer qr (pre-projection)
     weights_indexer_cp,  # [l_local, n_heads]    already-scaled indexer weights
@@ -1420,10 +1445,12 @@ def balanced_compute_cp_indexer_topk(
     dispatch_handle=None,
     layout_cache=None,
     graph_dynamic_packs=False,
+    workspace_provider=None,
+    return_softmax=False,
 ):
     """Balanced drop-in replacement for ``compute_cp_indexer_topk``.
 
-    Returns ``(compressed_topk, layout)`` in the same contiguous ``[l_local, topk]`` layout the
+    Returns ``(compressed_topk, layout, compact_predict)`` in the same contiguous ``[l_local, topk]`` layout the
     caller expects, so ``build_attention_indices`` / sparse attention are unchanged. Every
     sequence is tiled into ``2 * cp_size`` chunks; this rank scores chunk ``r`` (head) and chunk
     ``2 * cp_size - 1 - r`` (tail) of every sequence — one cheap and one expensive under
@@ -1503,19 +1530,9 @@ def balanced_compute_cp_indexer_topk(
 
     @torch.no_grad()
     def _chunk_topk(qr_rows, w_rows, gs, sz):
-        # Project -> per-chunk RoPE at the chunk's true global positions (the real ``cu_seqlens`` is
-        # passed, so multi-sequence packs get correct per-segment positions) -> rotate -> reference
-        # top-k. Delegating to ``compute_cp_indexer_topk`` reuses its multi-segment layout builder
-        # and fused scorer. A query's top-k depends only on its own position and K, so scoring a
-        # chunk matches the same rows of a full call (up to GEMM reduction order of the chunked
-        # projection: exact score ties may resolve differently; the output is integer indices
-        # with no gradient path).
         q = _project_selection_q(indexer.linear_wq_b, qr_rows.reshape(sz, 1, q_lora))
         q = q.reshape(sz, n_heads, head_dim)
         if config.apply_rope_fusion:
-            # cos/sin dtype from the projected q (post linear_wq_b), matching the reference path
-            # (csa.py uses q_indexer_cp.dtype) so the two stay bit-identical if linear_wq_b's output
-            # dtype ever diverges from the qr dtype (e.g. FP8). get_cached_cos_sin is cached.
             cos, sin = indexer.rotary_pos_emb.get_cached_cos_sin(
                 max_seqlen_q, dtype=q.dtype, packed_seq=True, mscale=1.0
             )
@@ -1527,55 +1544,49 @@ def balanced_compute_cp_indexer_topk(
                 q, rpe, nope_dim, pos_dim, cu_seqlens, gs, config
             )
         q = rotate_activation(q)
-        # Tight capacity bounds for this chunk. The fused scorer materializes an fp32
-        # ``(rows, max_seqlen_kv)`` buffer and masks its full width, so passing the global
-        # sequence bounds would make every chunk pay full-sequence bandwidth (and thrash the
-        # allocator). A chunk row at global offset ``< gs + sz`` has sequence-relative position
-        # ``<= gs + sz - 1``, so its causal visible width is ``<= (gs + sz) // ratio``; segment
-        # lengths inside the chunk are ``<= sz``.
-        mq = max(1, min(int(max_seqlen_q), sz))
-        gkv = max(1, int(max_seqlen_q) // int(ratio))
-        # Balanced-feature policy for its own ordinary-layout calls: inside a
-        # balanced run other fused calls have already been issued, so an
-        # above-limit fused call here is the verified-corrupt pattern -- take the
-        # unfused path instead (this layout is an ordinary cached
-        # _build_cp_indexer_layout result, so unfused masking is valid). Legacy
-        # callers of compute_cp_indexer_topk are NOT rerouted (see the policy note
-        # on FUSED_INDEXER_MAX_SAFE_ROWS).
         use_fused_here = sz <= _cu.FUSED_INDEXER_MAX_SAFE_ROWS
-        # Exact causal need for this chunk, rounded UP to the shared width quantum
-        # (see _KV_BOUND_QUANTUM/_KV_TIGHT_WIDTH_CEILING at module scope for the
-        # kernel contract). Rounding up is always safe: the kernel's block count is
-        # clamped by the true per-sequence KV length, so extra columns are never
-        # written or read.
-        bound = min(gkv, (gs + sz) // int(ratio))
-        q_ = _KV_BOUND_QUANTUM
-        bound_q = max(q_, (bound + q_ - 1) // q_ * q_)
-        # Full width with the real layout beyond the tight-width ceiling is always
-        # safe (width == declared per-sequence length, the reference call's
-        # contract shape).
-        k_pass = k_seq_major
-        layout_pass = _layout_at(gs, sz)
-        if bound_q <= _KV_TIGHT_WIDTH_CEILING:
-            mkv = bound_q
-        else:
-            mkv = gkv
-        tk, _, _ = _cu.compute_cp_indexer_topk(
+        logical_layout = _layout_at(gs, sz)
+        topk_layout, k_for_topk = logical_layout, k_seq_major
+        workspace = None
+        if use_fused_here:
+            topk_layout, source_map = _cu.build_cp_compact_indexer_layout(
+                logical_layout, cu_seqlens_compressed, comp, ratio
+            )
+            k_for_topk = _cu.pack_cp_compact_indexer_k(k_seq_major, source_map)
+            if workspace_provider is not None:
+                workspace = workspace_provider(
+                    q,
+                    k_for_topk,
+                    topk=topk,
+                    ratio=ratio,
+                    cu_seqlens_q=topk_layout[0],
+                    cu_seqlens_k=topk_layout[1],
+                    max_seqlen_q=int(max_seqlen_q),
+                    max_seqlen_k=int(max_seqlen_q) // ratio + 2,
+                    q_causal_offsets=topk_layout[2],
+                    return_softmax=return_softmax,
+                    workspace_slot="balanced_single",
+                )
+        tk, _, predict = _cu.compute_cp_indexer_topk(
             q,
             w_rows.reshape(sz, n_heads),
-            k_pass,
+            k_for_topk,
             cu_seqlens,
             cu_seqlens_compressed,
             gs,
             ratio,
             topk,
             softmax_scale,
-            max_seqlen_q=mq,
+            max_seqlen_q=int(max_seqlen_q),
             use_fused=use_fused_here,
-            max_seqlen_kv=mkv,
-            prebuilt_layout=layout_pass,
+            deterministic=getattr(config, "deterministic_mode", False),
+            precision=getattr(config, "dsa_indexer_precision", "bf16"),
+            compact_workspace=workspace,
+            return_softmax=return_softmax,
+            indexer_layout=topk_layout,
+            logical_indexer_layout=logical_layout,
         )
-        return tk
+        return tk, predict
 
     zero_width = int(max_seqlen_q) // int(ratio) == 0
     if cp_size <= 1 or comp == 0 or int(topk) == 0 or zero_width:
@@ -1592,10 +1603,9 @@ def balanced_compute_cp_indexer_topk(
             # ``use_indexer_loss`` off downstream. The chunk call below could not
             # reproduce that: it passes an explicit quantum-floored max_seqlen_kv,
             # so the kernel would run and return a dense all--1 top-k instead.
-            return None, None
-        tk = _chunk_topk(indexer_qr, weights_indexer_cp, int(global_start), l_local)
-        # Mirror the reference contract: (None, None) when nothing was selected.
-        return tk, (layout if tk is not None else None)
+            return None, None, None
+        tk, predict = _chunk_topk(indexer_qr, weights_indexer_cp, int(global_start), l_local)
+        return tk, (layout if tk is not None else None), predict
 
     # KNOWN KERNEL-PACKAGE DEFECT (verified on cudnn-frontend 1.26.0; no known-good
     # version demonstrated yet): a fused indexer call with more than 32768 query rows
@@ -1641,17 +1651,30 @@ def balanced_compute_cp_indexer_topk(
     gkv = max(1, int(max_seqlen_q) // int(ratio))
 
     @torch.no_grad()
-    def _packed_topk(qr_rows, w_rows, layout3, pos_ids, kv_rows, mkv):
-        # Integer top-k output only: no gradient flows through the balanced
-        # scoring, so skip autograd tracking for the per-chunk projection/RoPE.
+    def _packed_topk(qr_rows, w_rows, logical_layout, topk_layout, pos_ids, kv_rows, slot):
         sz = qr_rows.shape[0]
         q = _project_selection_q(indexer.linear_wq_b, qr_rows.reshape(sz, 1, q_lora))
         q = q.reshape(sz, n_heads, head_dim)
         q = _rope_positions(
-            q, pos_ids, layout3[0], nope_dim, pos_dim, indexer, config, int(max_seqlen_q)
+            q, pos_ids, logical_layout[0], nope_dim, pos_dim, indexer, config, int(max_seqlen_q)
         )
         q = rotate_activation(q)
-        tk, _, _ = _cu.compute_cp_indexer_topk(
+        workspace = None
+        if workspace_provider is not None:
+            workspace = workspace_provider(
+                q,
+                kv_rows,
+                topk=topk,
+                ratio=ratio,
+                cu_seqlens_q=topk_layout[0],
+                cu_seqlens_k=topk_layout[1],
+                max_seqlen_q=mq,
+                max_seqlen_k=gkv + 2,
+                q_causal_offsets=topk_layout[2],
+                return_softmax=return_softmax,
+                workspace_slot=slot,
+            )
+        tk, _, predict = _cu.compute_cp_indexer_topk(
             q,
             w_rows.reshape(sz, n_heads),
             kv_rows,
@@ -1662,23 +1685,18 @@ def balanced_compute_cp_indexer_topk(
             topk,
             softmax_scale,
             max_seqlen_q=mq,
+            max_seqlen_kv=gkv,
             use_fused=True,
-            max_seqlen_kv=mkv,
-            prebuilt_layout=layout3,
+            deterministic=getattr(config, "deterministic_mode", False),
+            precision=getattr(config, "dsa_indexer_precision", "bf16"),
+            compact_workspace=workspace,
+            return_softmax=return_softmax,
+            indexer_layout=topk_layout,
+            logical_indexer_layout=logical_layout,
             synthetic_layout=True,
         )
-        return tk
+        return tk, predict
 
-    # Per-call tight compressed-K score widths; the capture-safe fallback plan
-    # carries no bounds and keeps the full width.
-    # NOTE: this runtime fallback width (gkv = max_seqlen_q // ratio, the
-    # reference call's contract shape) is narrower than prebuild's
-    # _kv_bounds fallback (total // ratio): prebuild cannot trust
-    # max_seqlen_q (frontends may leave it unset/tensor-valued), so it stays
-    # conservative. Both exceed every row's causal need; only buffer size
-    # differs.
-    mkv_h = gkv if graph_dynamic_packs else int(plan.get("mkv_head", gkv))
-    mkv_t = gkv if graph_dynamic_packs else int(plan.get("mkv_tail", gkv))
     k_rows_total = int(k_seq_major.shape[0])
     expected_k_rows = (int(cp_size) * int(l_local)) // int(ratio)
     # Host-int invariants (free): the sequence-major K tensor is the full fixed-capacity
@@ -1779,18 +1797,36 @@ def balanced_compute_cp_indexer_topk(
     else:
         head_layout, tail_layout = plan["head_layout"], plan["tail_layout"]
 
+    # Both halves have identical per-sequence row counts and share full K.
+    # Only their RoPE positions and causal offsets differ. Pack K once.
+    head_topk_layout, source_map = _cu.build_cp_compact_indexer_layout(
+        head_layout, cu_seqlens_compressed, k_rows_total, ratio
+    )
+    tail_topk_layout = (tail_layout[0], head_topk_layout[1], tail_layout[2])
+    k_for_topk = _cu.pack_cp_compact_indexer_k(k_seq_major, source_map)
+
     nvtx_range_push("BalancedIndexerScore")
     nvtx_range_push("Bal_Head")
-    tk_head = _packed_topk(qr_h, w_h, head_layout, plan["pos_head"], k_seq_major, mkv_h)
+    tk_head, predict_head = _packed_topk(
+        qr_h, w_h, head_layout, head_topk_layout, plan["pos_head"], k_for_topk, "balanced_head"
+    )
     del qr_h, w_h
     nvtx_range_pop("Bal_Head")
     nvtx_range_push("Bal_Tail")
-    tk_tail = _packed_topk(qr_t, w_t, tail_layout, plan["pos_tail"], k_seq_major, mkv_t)
+    tk_tail, predict_tail = _packed_topk(
+        qr_t, w_t, tail_layout, tail_topk_layout, plan["pos_tail"], k_for_topk, "balanced_tail"
+    )
     del qr_t, w_t
     nvtx_range_pop("Bal_Tail")
     nvtx_range_pop("BalancedIndexerScore")
 
     nvtx_range_push("Bal_Combine")
+    has_predict = predict_head is not None
+    if has_predict != (predict_tail is not None):
+        raise RuntimeError("Balanced head/tail must return the same compact softmax contract")
+    tk_head = _pack_selection_result(tk_head, predict_head)
+    tk_tail = _pack_selection_result(tk_tail, predict_tail)
+    del predict_head, predict_tail
     tkw = tk_head.shape[-1]
     if graph_dynamic_packs:
         # Exact reverse of the two equal-split dispatch hops.
@@ -1834,7 +1870,8 @@ def balanced_compute_cp_indexer_topk(
         dist.all_gather_into_tensor(Z, ht, group=cp_group)
         compressed_topk = torch.index_select(Z, 0, plan["inv_idx"])
     nvtx_range_pop("Bal_Combine")
-    return compressed_topk, layout
+    compressed_topk, compact_predict = _unpack_selection_result(compressed_topk, has_predict)
+    return compressed_topk, layout, compact_predict
 
 
 def prebuild_balanced_layouts(

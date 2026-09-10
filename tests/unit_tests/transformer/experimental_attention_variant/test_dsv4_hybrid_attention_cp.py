@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import gc
+import inspect
 import os
 import statistics
 from contextlib import contextmanager, nullcontext
@@ -953,16 +954,22 @@ class TestDSv4HybridAttentionTHDCP:
         del cp_attn, ref_attn, full_hidden, local_hidden, ref_hidden, local_out, ref_out, grad
         _clear_cuda_test_state()
 
-    def test_thd_cp_mxfp8_matches_full_reference_forward_backward(self):
+    @pytest.mark.parametrize("balanced", [False, True], ids=["contiguous", "balanced"])
+    def test_thd_cp_mxfp8_matches_full_reference_forward_backward(self, balanced, monkeypatch):
         """MXFP8 CP top-k, loss, and gradients match the CP1 THD path."""
         if not _dsv4_cp_mxfp8_kernels_available():
             pytest.skip(_DSV4_CP_MXFP8_KERNELS_UNAVAILABLE_REASON)
 
-        packed, padded_tokens, local_idx = _make_ragged_cp_case(self.cp_size, self.cp_rank)
+        if balanced:
+            packed, padded_tokens, local_idx = self._balanced_reference_case(monkeypatch)
+        else:
+            packed, padded_tokens, local_idx = _make_ragged_cp_case(self.cp_size, self.cp_rank)
         torch.manual_seed(_SEED + 1600)
         model_parallel_cuda_manual_seed(_SEED + 1600)
         config_cp = _make_dsv4_cp_config(
-            context_parallel_size=self.cp_size, dsa_indexer_precision="mxfp8"
+            context_parallel_size=self.cp_size,
+            dsa_indexer_precision="mxfp8",
+            dsa_cp_balance_indexer=balanced,
         )
         config_ref = _make_dsv4_cp_config(context_parallel_size=1, dsa_indexer_precision="mxfp8")
         cp_attn = _build_attention(config_cp, layer_number=2, pg_collection=self.pg).cuda()
@@ -975,12 +982,22 @@ class TestDSv4HybridAttentionTHDCP:
         local_hidden = full_hidden.index_select(0, local_idx).detach().clone().requires_grad_(True)
         ref_hidden = full_hidden.detach().clone().requires_grad_(True)
 
+        DSAIndexerLossAutoScaler.set_loss_scale(torch.ones((), device="cuda"))
+        DSAIndexerLossLoggingHelper.clean_loss_in_tracker()
         local_out, _ = cp_attn(
             hidden_states=local_hidden, attention_mask=None, packed_seq_params=packed
         )
+        if balanced:
+            assert len(self._balanced_reference_calls) == 1
+        local_loss = DSAIndexerLossLoggingHelper.tracker["values"].detach().float().sum().clone()
+        DSAIndexerLossLoggingHelper.clean_loss_in_tracker()
         ref_out, _ = ref_attn(
             hidden_states=ref_hidden, attention_mask=None, packed_seq_params=packed
         )
+        ref_loss = DSAIndexerLossLoggingHelper.tracker["values"].detach().float().sum().clone()
+        DSAIndexerLossLoggingHelper.clean_loss_in_tracker()
+        dist.all_reduce(local_loss, group=self.pg.cp)
+        torch.testing.assert_close(local_loss, ref_loss, rtol=1e-3, atol=1e-4)
         _assert_cp_tensor_match(
             local_out.detach(), ref_out.detach().index_select(0, local_idx), "layer=2:mxfp8:output"
         )
@@ -1003,6 +1020,93 @@ class TestDSv4HybridAttentionTHDCP:
             dist.all_reduce(grad_sum, group=self.pg.cp)
             _assert_cp_tensor_match(grad_sum, ref_grad, f"layer=2:mxfp8:param_grad:{name}")
 
+        del cp_attn, ref_attn, full_hidden, local_hidden, ref_hidden, local_out, ref_out, grad
+        _clear_cuda_test_state()
+
+    def _balanced_reference_case(self, monkeypatch):
+        """Use an eligible pack with genuine Top-K selection and audit the real scorer."""
+        from megatron.core.transformer.experimental_attention_variant import cp_balanced_indexer
+
+        lengths = (8192, 2048, 1024, 1024)
+        assert all(length % (2 * self.cp_size) == 0 for length in lengths)
+        packed = _make_thd_packed_seq_params(lengths)
+        total = sum(lengths)
+        local_rows = total // self.cp_size
+        local_idx = torch.arange(
+            self.cp_rank * local_rows, (self.cp_rank + 1) * local_rows, device="cuda"
+        )
+        cp_balanced_indexer.prebuild_balanced_layouts(packed, cp_group=self.pg.cp)
+        assert packed._dsa_cp_balance_layout_cache["zz_pack_ok"] == (local_rows, True)
+        actual_compute = cp_balanced_indexer.balanced_compute_cp_indexer_topk
+        calls = []
+
+        def checked_compute(*args, **kwargs):
+            result = actual_compute(*args, **kwargs)
+            assert result[0] is not None
+            if kwargs.get("return_softmax") and args[6].dsa_indexer_precision == "mxfp8":
+                assert result[2] is not None, "MXFP8 training must return its compact prediction"
+                assert result[2].shape == result[0].shape
+            calls.append(True)
+            return result
+
+        monkeypatch.setattr(
+            cp_balanced_indexer, "balanced_compute_cp_indexer_topk", checked_compute
+        )
+        self._balanced_reference_calls = calls
+        return packed, total, local_idx
+
+    @pytest.mark.parametrize("sparse_loss", [True, False], ids=["sparse_loss", "dense_loss"])
+    def test_thd_balanced_cp_matches_cp1_forward_backward(self, sparse_loss, monkeypatch):
+        """Exercise real balanced CP2/CP4 scoring, output, loss and every gradient."""
+        if not self.fused_kernels_available:
+            pytest.skip(_DSV4_CP_FUSED_KERNELS_UNAVAILABLE_REASON)
+        if torch.cuda.get_device_capability()[0] == 9 and not sparse_loss:
+            pytest.skip("cuDNN Frontend SM90 dense DSA has offset, cache, and stream bugs")
+        packed, total, local_idx = self._balanced_reference_case(monkeypatch)
+        torch.manual_seed(_SEED + 1700)
+        model_parallel_cuda_manual_seed(_SEED + 1700)
+        config_cp = _make_dsv4_cp_config(
+            context_parallel_size=self.cp_size,
+            dsa_cp_balance_indexer=True,
+            dsa_indexer_use_sparse_loss=sparse_loss,
+        )
+        config_ref = _make_dsv4_cp_config(
+            context_parallel_size=1, dsa_indexer_use_sparse_loss=sparse_loss
+        )
+        cp_attn = _build_attention(config_cp, layer_number=2, pg_collection=self.pg).cuda()
+        ref_attn = _build_attention(config_ref, layer_number=2, pg_collection=self.ref_pg).cuda()
+        _copy_module_parameters(cp_attn, ref_attn)
+        full_hidden, grad = _make_hidden_and_grad(total, config_cp.hidden_size)
+        local_hidden = full_hidden.index_select(0, local_idx).detach().clone().requires_grad_(True)
+        ref_hidden = full_hidden.detach().clone().requires_grad_(True)
+        DSAIndexerLossAutoScaler.set_loss_scale(torch.ones((), device="cuda"))
+        DSAIndexerLossLoggingHelper.clean_loss_in_tracker()
+        local_out, _ = cp_attn(
+            hidden_states=local_hidden, attention_mask=None, packed_seq_params=packed
+        )
+        assert len(self._balanced_reference_calls) == 1
+        local_loss = DSAIndexerLossLoggingHelper.tracker["values"].detach().float().sum().clone()
+        DSAIndexerLossLoggingHelper.clean_loss_in_tracker()
+        ref_out, _ = ref_attn(
+            hidden_states=ref_hidden, attention_mask=None, packed_seq_params=packed
+        )
+        ref_loss = DSAIndexerLossLoggingHelper.tracker["values"].detach().float().sum().clone()
+        DSAIndexerLossLoggingHelper.clean_loss_in_tracker()
+        dist.all_reduce(local_loss, group=self.pg.cp)
+        torch.testing.assert_close(local_loss, ref_loss, rtol=1e-3, atol=1e-4)
+        _assert_cp_tensor_match(local_out, ref_out.index_select(0, local_idx), "balanced:output")
+        local_out.backward(grad.index_select(0, local_idx))
+        ref_out.backward(grad)
+        _assert_cp_tensor_match(
+            local_hidden.grad, ref_hidden.grad.index_select(0, local_idx), "balanced:hidden_grad"
+        )
+        ref_params = dict(ref_attn.named_parameters())
+        for name, param in cp_attn.named_parameters():
+            assert param.grad is not None, f"Missing balanced CP gradient: {name}"
+            assert ref_params[name].grad is not None, f"Missing CP1 gradient: {name}"
+            reduced = param.grad.detach().clone()
+            dist.all_reduce(reduced, group=self.pg.cp)
+            _assert_cp_tensor_match(reduced, ref_params[name].grad, f"balanced:param_grad:{name}")
         del cp_attn, ref_attn, full_hidden, local_hidden, ref_hidden, local_out, ref_out, grad
         _clear_cuda_test_state()
 
@@ -1445,10 +1549,12 @@ class TestDSv4HybridAttentionTHDCP:
         del graph_out, graph_hidden_grad, eager_hidden
         _clear_cuda_test_state()
 
-    def run_balanced_dynamic_pack_graph_replays_30_iterations(self):
+    def run_balanced_dynamic_pack_graph_replays_30_iterations(self, precision="bf16"):
         """The raw graph refreshes two fixed-shape route owners for 30 A/B/C replays."""
         if not self.fused_kernels_available:
             pytest.skip(_DSV4_CP_FUSED_KERNELS_UNAVAILABLE_REASON)
+        if precision == "mxfp8" and not _dsv4_cp_mxfp8_kernels_available():
+            pytest.skip(_DSV4_CP_MXFP8_KERNELS_UNAVAILABLE_REASON)
 
         from megatron.core.transformer.experimental_attention_variant import cp_balanced_indexer
 
@@ -1487,6 +1593,7 @@ class TestDSv4HybridAttentionTHDCP:
             use_fused_kernels=True,
             apply_rope_fusion=True,
             dsa_cp_balance_indexer=True,
+            dsa_indexer_precision=precision,
             cuda_graph_impl="transformer_engine",
             cuda_graph_modules=["attn"],
             max_seqlen_per_dp_cp_rank=total_rows // self.cp_size,
@@ -1807,8 +1914,10 @@ class TestDSv4HybridAttentionTHDCP:
         for owner_name in _DSV4_CP_GRAPH_DYNAMIC_OWNER_KWARGS:
             assert len({kwargs[owner_name].data_ptr() for kwargs in source_owner_kwargs}) == 3
 
-        def _run_layer(layer, packed, microbatch_idx, reset_parameter_grads):
-            hidden = local_hidden.detach().clone().requires_grad_(True)
+        def _run_layer(
+            layer, packed, hidden_values, output_grad, microbatch_idx, reset_parameter_grads
+        ):
+            hidden = hidden_values.detach().clone().requires_grad_(True)
             layer.current_microbatch = microbatch_idx
             if reset_parameter_grads:
                 _zero_existing_grads(layer, hidden)
@@ -1819,7 +1928,7 @@ class TestDSv4HybridAttentionTHDCP:
                 padding_mask=padding_mask,
             )
             assert context is None
-            output.backward(local_grad)
+            output.backward(output_grad)
             return (
                 output.detach().clone(),
                 hidden.grad.detach().clone(),
@@ -1857,13 +1966,23 @@ class TestDSv4HybridAttentionTHDCP:
                 )
 
             graph_result = _run_layer(
-                graph_layer, packed, replay_index, reset_parameter_grads=replay_index == 0
+                graph_layer,
+                packed,
+                local_hidden,
+                local_grad,
+                replay_index,
+                reset_parameter_grads=replay_index == 0,
             )
             assert (
                 tuple(owner.data_ptr() for owner in graph_static_owners) == graph_static_owner_ptrs
             )
             eager_result = _run_layer(
-                eager_layer, packed, replay_index, reset_parameter_grads=replay_index == 0
+                eager_layer,
+                packed,
+                local_hidden,
+                local_grad,
+                replay_index,
+                reset_parameter_grads=replay_index == 0,
             )
             label = f"te_replay_{replay_index:02d}_pack_{pack_index}"
             _assert_cp_graph_bitwise_match(
