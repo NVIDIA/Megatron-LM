@@ -15,7 +15,7 @@
 name: DCO gate publisher
 
 on:
-  check_suite:
+  check_run:
     types: [completed]
   workflow_dispatch:
     inputs:
@@ -25,7 +25,7 @@ on:
         type: string
 
 concurrency:
-  group: dco-gate-${{ github.event.check_suite.head_sha || inputs.sha }}
+  group: dco-gate-${{ github.event.check_run.head_sha || inputs.sha }}
   cancel-in-progress: false
 
 permissions:
@@ -39,7 +39,10 @@ jobs:
       github.repository == 'NVIDIA/Megatron-LM'
       && (
         github.event_name == 'workflow_dispatch'
-        || github.event.check_suite.app.slug == 'dco'
+        || (
+          github.event.check_run.name == 'DCO'
+          && github.event.check_run.app.slug == 'dco'
+        )
       )
     runs-on: ubuntu-latest
     steps:

@@ -21,6 +21,7 @@ import re
 import sys
 from datetime import datetime, timezone
 from urllib.error import HTTPError, URLError
+from urllib.parse import quote
 from urllib.request import Request, urlopen
 
 DCO_APP_SLUG = "dco"
@@ -40,22 +41,22 @@ def _validated_sha(value: object, source: str) -> str:
 
 
 def validate_trigger(payload: dict[str, object], requested_sha: str | None = None) -> str:
-    """Return the target SHA after validating the check-suite or manual trigger."""
+    """Return the target SHA after validating the check-run or manual trigger."""
 
     if requested_sha:
         return _validated_sha(requested_sha, "manual request")
 
-    check_suite = payload.get("check_suite")
-    if not isinstance(check_suite, dict):
-        raise GateError("trusted DCO check_suite payload is missing")
+    check_run = payload.get("check_run")
+    if not isinstance(check_run, dict):
+        raise GateError("trusted DCO check_run payload is missing")
 
-    app = check_suite.get("app")
+    app = check_run.get("app")
     app_slug = app.get("slug") if isinstance(app, dict) else None
-    if app_slug != DCO_APP_SLUG:
-        raise GateError("event did not originate from the trusted DCO App check suite")
-    if check_suite.get("status") != "completed":
-        raise GateError("DCO check suite is not completed")
-    return _validated_sha(check_suite.get("head_sha"), "DCO check suite")
+    if check_run.get("name") != DCO_CHECK_NAME or app_slug != DCO_APP_SLUG:
+        raise GateError("event did not originate from the trusted DCO App check")
+    if check_run.get("status") != "completed":
+        raise GateError("DCO check run is not completed")
+    return _validated_sha(check_run.get("head_sha"), "DCO check run")
 
 
 def select_latest_dco(check_runs: list[dict[str, object]], head_sha: str) -> dict[str, object]:
@@ -170,13 +171,13 @@ def _request_json(
 
 
 def _list_check_runs(
-    api_url: str, repository: str, head_sha: str, token: str
+    api_url: str, repository: str, head_sha: str, name: str, token: str
 ) -> list[dict[str, object]]:
     check_runs: list[dict[str, object]] = []
     for page in range(1, 11):
         url = (
             f"{api_url}/repos/{repository}/commits/{head_sha}/check-runs"
-            f"?filter=all&per_page=100&page={page}"
+            f"?check_name={quote(name)}&filter=all&per_page=100&page={page}"
         )
         response = _request_json("GET", url, token)
         batch = response.get("check_runs")
@@ -198,9 +199,10 @@ def publish_gate(
     """Re-read the current DCO result and publish its repository gate."""
 
     head_sha = validate_trigger(payload, requested_sha)
-    check_runs = _list_check_runs(api_url, repository, head_sha, token)
-    source = select_latest_dco(check_runs, head_sha)
-    existing_gate = select_existing_gate(check_runs, head_sha)
+    source_runs = _list_check_runs(api_url, repository, head_sha, DCO_CHECK_NAME, token)
+    source = select_latest_dco(source_runs, head_sha)
+    gate_runs = _list_check_runs(api_url, repository, head_sha, GATE_CHECK_NAME, token)
+    existing_gate = select_existing_gate(gate_runs, head_sha)
 
     if existing_gate is None:
         url = f"{api_url}/repos/{repository}/check-runs"

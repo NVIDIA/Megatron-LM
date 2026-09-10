@@ -33,18 +33,12 @@ def _dco(check_run_id: int, conclusion: str | None, *, app_slug: str = "dco", sh
 class TestDcoGate(unittest.TestCase):
     """Validate DCO event trust, mirroring, HTTP paths, and workflow topology."""
 
-    def test_validates_trusted_completed_dco_suite(self) -> None:
-        event = {"check_suite": {"app": {"slug": "dco"}, "status": "completed", "head_sha": SHA}}
+    def test_validates_trusted_completed_dco_run(self) -> None:
+        event = {"check_run": _dco(10, "success")}
         self.assertEqual(validate_trigger(event), SHA)
 
     def test_rejects_untrusted_app(self) -> None:
-        event = {
-            "check_suite": {
-                "app": {"slug": "github-actions"},
-                "status": "completed",
-                "head_sha": SHA,
-            }
-        }
+        event = {"check_run": _dco(10, "success", app_slug="github-actions")}
         with self.assertRaisesRegex(GateError, "trusted DCO App"):
             validate_trigger(event)
 
@@ -92,7 +86,7 @@ class TestDcoGate(unittest.TestCase):
         source = _dco(20, "success")
         post_result = {"id": 100}
         with (
-            mock.patch.object(dco_gate, "_list_check_runs", return_value=[source]),
+            mock.patch.object(dco_gate, "_list_check_runs", side_effect=[[source], []]),
             mock.patch.object(dco_gate, "_request_json", return_value=post_result) as request,
         ):
             self.assertEqual(
@@ -107,7 +101,7 @@ class TestDcoGate(unittest.TestCase):
 
         gate = {"id": 100, "name": "DCO gate", "head_sha": SHA, "external_id": f"dco-gate:{SHA}"}
         with (
-            mock.patch.object(dco_gate, "_list_check_runs", return_value=[source, gate]),
+            mock.patch.object(dco_gate, "_list_check_runs", side_effect=[[source], [gate]]),
             mock.patch.object(dco_gate, "_request_json", return_value={"id": 100}) as request,
         ):
             dco_gate.publish_gate({}, "NVIDIA/Megatron-LM", "https://api", "token", SHA)
@@ -121,11 +115,10 @@ class TestDcoGate(unittest.TestCase):
         publisher = Path(".github/workflows/dco-gate.yml").read_text()
         merge_group = Path(".github/workflows/dco-gate-merge-group.yml").read_text()
         main = Path(".github/workflows/cicd-main.yml").read_text()
-        self.assertIn("check_suite:", publisher)
+        self.assertIn("check_run:", publisher)
         self.assertIn("workflow_dispatch:", publisher)
-        self.assertIn("github.event.check_suite.app.slug == 'dco'", publisher)
+        self.assertIn("github.event.check_run.app.slug == 'dco'", publisher)
         self.assertIn("ref: ${{ github.event.repository.default_branch }}", publisher)
-        self.assertNotIn("check_run:", publisher)
         self.assertIn("on:\n  merge_group:", merge_group)
         self.assertNotIn("push:", merge_group)
         self.assertIn("name: DCO gate", merge_group)
