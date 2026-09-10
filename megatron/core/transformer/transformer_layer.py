@@ -1746,9 +1746,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                     hidden_states, residual = hidden_states
 
                 shared_expert_output = self.mlp.shared_experts_compute(hidden_states)
-                probs, routing_map = self.mlp.route(
-                    hidden_states, padding_mask=kwargs.get("padding_mask")
+                padding_mask = self.mlp._normalize_padding_mask(
+                    hidden_states, kwargs.get("padding_mask")
                 )
+                probs, routing_map = self.mlp.route(hidden_states, padding_mask=padding_mask)
                 hidden_states, probs = self.mlp.preprocess(hidden_states, probs, routing_map)
                 return residual, hidden_states, probs, shared_expert_output
 
@@ -2744,9 +2745,10 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         # batches without failing anything. input_ids and packed_seq_params are
         # deliberately not forwarded: the eager callable does not pass them
         # either, and parity with eager is this method's contract.
-        probs, routing_map = self.mlp.route(
-            pre_mlp_layernorm_output, padding_mask=kwargs.get("padding_mask")
+        padding_mask = self.mlp._normalize_padding_mask(
+            pre_mlp_layernorm_output, kwargs.get("padding_mask")
         )
+        probs, routing_map = self.mlp.route(pre_mlp_layernorm_output, padding_mask=padding_mask)
         local_tokens, probs = self.mlp.preprocess(pre_mlp_layernorm_output, probs, routing_map)
         return (residual, local_tokens, probs, shared_expert_output, mlp_h_res, mlp_hc_h_post)
 
@@ -2907,6 +2909,7 @@ class HyperConnectionTransformerLayer(TransformerLayer):
                 # tail: the router consumes it in the z-loss mean, dropless
                 # gating, and the expert-load counters, so dropping it makes the
                 # graphed path drift from eager on padded batches.
+                padding_mask = self.mlp._normalize_padding_mask(hidden_states, padding_mask)
                 probs, routing_map = self.mlp.route(hidden_states, padding_mask=padding_mask)
                 hidden_states, probs = self.mlp.preprocess(hidden_states, probs, routing_map)
                 return (

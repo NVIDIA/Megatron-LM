@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from __future__ import annotations
 
@@ -703,6 +703,38 @@ class MoELayer(BaseMoELayer):
         hidden_states, probs, residual = self.preprocess(hidden_states, probs, routing_map)
         return hidden_states, probs, residual
 
+    def _normalize_padding_mask(
+        self, hidden_states: torch.Tensor, padding_mask: Optional[torch.Tensor]
+    ) -> Optional[torch.Tensor]:
+        """Convert a model's [batch, sequence] mask to the router's local [sequence, batch].
+
+        The embedding stage may already have scattered the sequence dimension.
+        Later pipeline chunks receive the unscattered mask, so scatter only when
+        the mask is larger than the local hidden states by the attention TP size.
+        Keep the caller's mask unchanged: graph inputs retain the model layout.
+        """
+        if padding_mask is None:
+            return None
+        if padding_mask.ndim != 2:
+            raise AssertionError(
+                f"padding_mask must have shape [batch, sequence], got {padding_mask.shape}"
+            )
+        if padding_mask.shape[1] != hidden_states.shape[0]:
+            tp_size = self.attn_tp_group.size()
+            if (
+                self.config.sequence_parallel
+                and padding_mask.shape[1] % tp_size == 0
+                and padding_mask.shape[1] // tp_size == hidden_states.shape[0]
+            ):
+                return tensor_parallel.scatter_to_sequence_parallel_region(
+                    padding_mask.transpose(0, 1).contiguous(), group=self.attn_tp_group
+                ).bool()
+            raise AssertionError(
+                f"padding_mask shape {padding_mask.shape} cannot be aligned to "
+                f"hidden_states sequence length {hidden_states.shape[0]}"
+            )
+        return padding_mask.transpose(0, 1).bool()
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -722,7 +754,7 @@ class MoELayer(BaseMoELayer):
         Args:
             hidden_states (torch.Tensor): The input tensor shape [seq_length, bsz, hidden_size].
             padding_mask (torch.Tensor, optional): Boolean mask indicating padding positions.
-                                                   Shape [seq_length, bsz]. True = padding,
+                                                   Shape [bsz, seq_length]. True = padding,
                                                    False = valid. Defaults to None.
             input_ids (torch.Tensor, optional): The input IDs tensor. Shape [seq_length, bsz].
                                                 Defaults to None.
@@ -747,31 +779,7 @@ class MoELayer(BaseMoELayer):
                 self.token_dispatcher = self._training_token_dispatcher
                 self.shared_expert_overlap = self.config.moe_shared_expert_overlap
 
-        # Align padding_mask to hidden_states sequence dimension before transpose.
-        # padding_mask arrives as [bsz, seq_length] but may need SP scatter when
-        # hidden_states is already TP-scattered (seq_length / TP).
-        if padding_mask is not None and padding_mask.shape[1] != hidden_states.shape[0]:
-            if (
-                self.config.sequence_parallel
-                and padding_mask.shape[1] % self.config.tensor_model_parallel_size == 0
-                and padding_mask.shape[1] // self.config.tensor_model_parallel_size
-                == hidden_states.shape[0]
-            ):
-                padding_mask = (
-                    tensor_parallel.scatter_to_sequence_parallel_region(
-                        padding_mask.transpose(0, 1).contiguous()
-                    )
-                    .transpose(0, 1)
-                    .contiguous()
-                )
-            else:
-                raise AssertionError(
-                    f"padding_mask shape {padding_mask.shape} cannot be aligned to "
-                    f"hidden_states sequence length {hidden_states.shape[0]}"
-                )
-        # Transpose from [bsz, seq_length] to [seq_length, bsz] to align with hidden_states
-        if padding_mask is not None:
-            padding_mask = padding_mask.transpose(0, 1).bool()
+        padding_mask = self._normalize_padding_mask(hidden_states, padding_mask)
 
         # MoE forward: route -> dispatch -> compute -> combine
         def custom_forward(hidden_states, intermediate_tensors=None, padding_mask=None):
