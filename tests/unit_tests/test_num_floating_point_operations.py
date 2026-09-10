@@ -27,6 +27,8 @@ from megatron.training.training import (
     validate_vision_flops_metadata,
 )
 
+pytestmark = pytest.mark.launch_on_gb200
+
 
 def _reset_seqlen_accumulator():
     """Tear down the per-iteration accumulator between tests."""
