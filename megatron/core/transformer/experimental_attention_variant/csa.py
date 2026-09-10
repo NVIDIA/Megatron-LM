@@ -1818,9 +1818,7 @@ class _OutputInverseRope:
                 remove_interleaving=True,
             )
 
-        content_part, rot_part = torch.split(
-            x, [x.size(-1) - self.pos_dim, self.pos_dim], dim=-1
-        )
+        content_part, rot_part = torch.split(x, [x.size(-1) - self.pos_dim, self.pos_dim], dim=-1)
         rot_part = apply_rotary_pos_emb(
             rot_part,
             self.freqs,
@@ -2106,12 +2104,7 @@ class CompressedSparseAttention(MegatronModule):
 
         nvtx_range_push("sparse_attn_kernel")
         output = csa_sparse_attn(
-            query,
-            kv_full,
-            self.attn_sink.float(),
-            flat_idxs,
-            self.softmax_scale,
-            out_rope=out_rope,
+            query, kv_full, self.attn_sink.float(), flat_idxs, self.softmax_scale, out_rope=out_rope
         )
         nvtx_range_pop("sparse_attn_kernel")
         return output
@@ -3086,9 +3079,7 @@ class CompressedSparseAttention(MegatronModule):
                 )
             else:
                 output, indexer_loss = _unfused_indexer_sparse_attn_from_topk(
-                    *indexer_loss_args,
-                    out_rope=fused_out_rope,
-                    tp_group=indexer.pg_collection.tp,
+                    *indexer_loss_args, out_rope=fused_out_rope, tp_group=indexer.pg_collection.tp
                 )
             if fused_out_rope is None:
                 flat_shape = output.shape
@@ -3213,11 +3204,7 @@ class CompressedSparseAttention(MegatronModule):
 
         indexer_loss = None
         out_rope = _OutputInverseRope(
-            self,
-            x.dtype,
-            rope_seqlen=max_seqlen_kv,
-            packed_seq=True,
-            cu_seqlens_q=cu_seqlens_kv,
+            self, x.dtype, rope_seqlen=max_seqlen_kv, packed_seq=True, cu_seqlens_q=cu_seqlens_kv
         )
         # See :meth:`forward`: every fused path rotates in place inside its
         # Function, only the unfused reference path rotates out of place.

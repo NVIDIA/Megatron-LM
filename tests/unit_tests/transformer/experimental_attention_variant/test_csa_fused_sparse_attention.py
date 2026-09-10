@@ -4293,9 +4293,7 @@ class TestFusedOutputInverseRope:
             attn_sink=torch.zeros(s['np_'], dtype=torch.float32, device='cuda').requires_grad_(
                 True
             ),
-            window_idxs=torch.zeros(
-                s['b'], s['sq'], win_topk, dtype=torch.int32, device='cuda'
-            ),
+            window_idxs=torch.zeros(s['b'], s['sq'], win_topk, dtype=torch.int32, device='cuda'),
             q_indexer=leaf(s['sq'], s['b'], s['idx_nh'], s['idx_hd']),
             k_indexer=leaf(s['n_comp'], s['b'], s['idx_hd']),
             weights=leaf(s['sq'], s['b'], s['idx_nh']),
@@ -4307,12 +4305,7 @@ class TestFusedOutputInverseRope:
         """
         s = self.SHAPES
         fake_dsa, _ = _install_full_dsa_mock(
-            b=s['b'],
-            sq=s['sq'],
-            np_=s['np_'],
-            d=s['d'],
-            n_comp=s['n_comp'],
-            idx_nh=s['idx_nh'],
+            b=s['b'], sq=s['sq'], np_=s['np_'], d=s['d'], n_comp=s['n_comp'], idx_nh=s['idx_nh']
         )
 
         def recording_backward(q, kv, out, dout, lse, attn_sink, topk_idxs, **kwargs):
@@ -4346,9 +4339,7 @@ class TestFusedOutputInverseRope:
         )
 
         torch.manual_seed(7)
-        grad_out = torch.randn(
-            s['sq'], s['b'], s['np_'] * s['d'], dtype=torch.bfloat16, device=dev
-        )
+        grad_out = torch.randn(s['sq'], s['b'], s['np_'] * s['d'], dtype=torch.bfloat16, device=dev)
         grad_loss = torch.tensor(1.0, device=dev)
 
         runs = {}

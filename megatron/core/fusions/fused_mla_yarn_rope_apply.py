@@ -285,11 +285,7 @@ def _mla_rope_bwd_kernel(
         nope_idx = tl.arange(0, BLOCK_NOPE)[None, :]
         nope_off = head_off + (emb_dim if ROPE_FIRST else 0) + nope_idx
         nope_mask = mask & (nope_idx < nope_dim)
-        tl.store(
-            DO_OUT + nope_off,
-            tl.load(DO_IN + nope_off, mask=nope_mask),
-            mask=nope_mask,
-        )
+        tl.store(DO_OUT + nope_off, tl.load(DO_IN + nope_off, mask=nope_mask), mask=nope_mask)
 
 
 def _flatten_rope_input(x, cu_seqlens_q, position_ids):
