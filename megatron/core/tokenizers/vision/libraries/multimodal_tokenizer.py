@@ -299,7 +299,8 @@ class MegatronMultimodalTokenizer:
         if tokenize:
             tokens = tokens[0]
         else:
-            tokens = self.tokenize(tokens)
+            # Tokenize conversation using gigatoken (when tokenize=False).
+            tokens = np.array(self.tokenize(tokens))
 
         if not return_target:
             return tokens
