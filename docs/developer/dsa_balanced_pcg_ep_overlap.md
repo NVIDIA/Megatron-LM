@@ -67,8 +67,12 @@ expert eliminate the intermediate copies that otherwise protect that storage.
 Non-interleaved EP overlap warms up `min(PP - pp_rank, num_microbatches)`
 forwards, one more than the ordinary 1F1B schedule. Steady state receives the
 oldest output gradient, co-schedules its backward with a new forward, sends
-the new activation, then sends the input gradient while receiving the next
-activation. The extra warmup breaks the circular P2P dependency. Cooldown drains
+the new activation, then sends the input gradient and receives the next
+activation. Fixed-shape P2P fuses this final send/receive. When P2P negotiates
+shapes (`variable_seq_lengths` or `mtp_standalone`), the backward send completes
+before receiving the next forward: otherwise the combined shape exchange waits
+for a forward whose producer is still waiting for the backward payload. The
+extra warmup breaks the circular P2P dependency. Cooldown drains
 the retained plans in FIFO order; a short batch can consist entirely of warmup
 and cooldown. Grad reduction, embedding gradient finalization and token-based
 loss scaling retain the ordinary pipeline's process-group boundaries.
@@ -94,7 +98,9 @@ Performance evidence must confirm graph replay and communication overlap.
 PP2/PP4 and EP2 collectives with ordinary attention, independently of the DSv4
 kernels. It compares loss and every rank-local parameter gradient against the
 existing pipeline schedule for one-microbatch and steady-state batches, including
-shared experts and pipeline output deallocation. Eight GPUs cover both PP sizes;
+shared experts and pipeline output deallocation. Fixed lengths exercise the
+fused P2P path; changing 32/64/48-token lengths exercise shape negotiation and
+different live forward/backward tensor sizes. Eight GPUs cover both PP sizes;
 four GPUs cover PP2.
 
 The PP1 validation uses four GB200 GPUs, CP2/EP2, BF16, fixed 512-token local
