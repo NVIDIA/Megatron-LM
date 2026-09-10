@@ -21,13 +21,11 @@ import re
 import sys
 from datetime import datetime, timezone
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote
 from urllib.request import Request, urlopen
 
 DCO_APP_SLUG = "dco"
 DCO_CHECK_NAME = "DCO"
 GATE_CHECK_NAME = "DCO gate"
-_ALLOWED_DCO_CONCLUSIONS = {"action_required", "failure", "neutral", "success"}
 _SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 
 
@@ -35,24 +33,29 @@ class GateError(RuntimeError):
     """Raised when the event or GitHub response cannot be trusted."""
 
 
-def validate_trigger(payload: dict[str, object]) -> str:
-    """Return the DCO check SHA after validating the webhook identity."""
+def _validated_sha(value: object, source: str) -> str:
+    if not isinstance(value, str) or not _SHA_PATTERN.fullmatch(value):
+        raise GateError(f"{source} has an invalid head SHA")
+    return value
 
-    check_run = payload.get("check_run")
-    if not isinstance(check_run, dict):
-        raise GateError("check_run payload is missing")
 
-    app = check_run.get("app")
+def validate_trigger(payload: dict[str, object], requested_sha: str | None = None) -> str:
+    """Return the target SHA after validating the check-suite or manual trigger."""
+
+    if requested_sha:
+        return _validated_sha(requested_sha, "manual request")
+
+    check_suite = payload.get("check_suite")
+    if not isinstance(check_suite, dict):
+        raise GateError("trusted DCO check_suite payload is missing")
+
+    app = check_suite.get("app")
     app_slug = app.get("slug") if isinstance(app, dict) else None
-    if check_run.get("name") != DCO_CHECK_NAME or app_slug != DCO_APP_SLUG:
-        raise GateError("event did not originate from the trusted DCO App check")
-    if check_run.get("status") != "completed":
-        raise GateError("DCO check is not completed")
-
-    head_sha = check_run.get("head_sha")
-    if not isinstance(head_sha, str) or not _SHA_PATTERN.fullmatch(head_sha):
-        raise GateError("DCO check has an invalid head SHA")
-    return head_sha
+    if app_slug != DCO_APP_SLUG:
+        raise GateError("event did not originate from the trusted DCO App check suite")
+    if check_suite.get("status") != "completed":
+        raise GateError("DCO check suite is not completed")
+    return _validated_sha(check_suite.get("head_sha"), "DCO check suite")
 
 
 def select_latest_dco(check_runs: list[dict[str, object]], head_sha: str) -> dict[str, object]:
@@ -71,13 +74,8 @@ def select_latest_dco(check_runs: list[dict[str, object]], head_sha: str) -> dic
             trusted.append(check_run)
 
     if not trusted:
-        raise GateError("no completed DCO App check exists for the event SHA")
-
-    latest = max(trusted, key=_check_run_id)
-    conclusion = latest.get("conclusion")
-    if conclusion not in _ALLOWED_DCO_CONCLUSIONS:
-        raise GateError(f"unsupported DCO conclusion: {conclusion!r}")
-    return latest
+        raise GateError("no completed DCO App check exists for the requested SHA")
+    return max(trusted, key=_check_run_id)
 
 
 def select_existing_gate(
@@ -86,23 +84,22 @@ def select_existing_gate(
     """Find the newest externally identified DCO gate for this SHA."""
 
     external_id = _gate_external_id(head_sha)
-    matching = []
-    for check_run in check_runs:
-        if (
-            check_run.get("name") == GATE_CHECK_NAME
-            and check_run.get("external_id") == external_id
-            and check_run.get("head_sha") == head_sha
-        ):
-            matching.append(check_run)
+    matching = [
+        check_run
+        for check_run in check_runs
+        if check_run.get("name") == GATE_CHECK_NAME
+        and check_run.get("external_id") == external_id
+        and check_run.get("head_sha") == head_sha
+    ]
     return max(matching, key=_check_run_id) if matching else None
 
 
 def gate_payload(
     source: dict[str, object], head_sha: str, *, include_head: bool
 ) -> dict[str, object]:
-    """Build a create or update request for the mirrored gate."""
+    """Build a fail-closed create or update request for the mirrored gate."""
 
-    source_conclusion = source["conclusion"]
+    source_conclusion = source.get("conclusion")
     conclusion = "success" if source_conclusion == "success" else "failure"
     source_id = _check_run_id(source)
     source_url = source.get("html_url")
@@ -173,13 +170,13 @@ def _request_json(
 
 
 def _list_check_runs(
-    api_url: str, repository: str, head_sha: str, name: str, token: str
+    api_url: str, repository: str, head_sha: str, token: str
 ) -> list[dict[str, object]]:
     check_runs: list[dict[str, object]] = []
     for page in range(1, 11):
         url = (
             f"{api_url}/repos/{repository}/commits/{head_sha}/check-runs"
-            f"?check_name={quote(name)}&filter=all&per_page=100&page={page}"
+            f"?filter=all&per_page=100&page={page}"
         )
         response = _request_json("GET", url, token)
         batch = response.get("check_runs")
@@ -192,25 +189,26 @@ def _list_check_runs(
 
 
 def publish_gate(
-    payload: dict[str, object], repository: str, api_url: str, token: str
+    payload: dict[str, object],
+    repository: str,
+    api_url: str,
+    token: str,
+    requested_sha: str | None = None,
 ) -> dict[str, object]:
     """Re-read the current DCO result and publish its repository gate."""
 
-    head_sha = validate_trigger(payload)
-    source_runs = _list_check_runs(api_url, repository, head_sha, DCO_CHECK_NAME, token)
-    source = select_latest_dco(source_runs, head_sha)
-    gate_runs = _list_check_runs(api_url, repository, head_sha, GATE_CHECK_NAME, token)
-    existing_gate = select_existing_gate(gate_runs, head_sha)
+    head_sha = validate_trigger(payload, requested_sha)
+    check_runs = _list_check_runs(api_url, repository, head_sha, token)
+    source = select_latest_dco(check_runs, head_sha)
+    existing_gate = select_existing_gate(check_runs, head_sha)
 
     if existing_gate is None:
         url = f"{api_url}/repos/{repository}/check-runs"
-        request_payload = gate_payload(source, head_sha, include_head=True)
-        return _request_json("POST", url, token, request_payload)
+        return _request_json("POST", url, token, gate_payload(source, head_sha, include_head=True))
 
     gate_id = _check_run_id(existing_gate)
     url = f"{api_url}/repos/{repository}/check-runs/{gate_id}"
-    request_payload = gate_payload(source, head_sha, include_head=False)
-    return _request_json("PATCH", url, token, request_payload)
+    return _request_json("PATCH", url, token, gate_payload(source, head_sha, include_head=False))
 
 
 def main() -> int:
@@ -221,11 +219,12 @@ def main() -> int:
         repository = os.environ["GITHUB_REPOSITORY"]
         token = os.environ["GITHUB_TOKEN"]
         api_url = os.environ.get("GITHUB_API_URL", "https://api.github.com").rstrip("/")
+        requested_sha = os.environ.get("DCO_GATE_SHA") or None
         with open(event_path, encoding="utf-8") as event_file:
             payload = json.load(event_file)
         if not isinstance(payload, dict):
             raise GateError("event payload is not an object")
-        result = publish_gate(payload, repository, api_url, token)
+        result = publish_gate(payload, repository, api_url, token, requested_sha)
         sys.stdout.write(f"Published {GATE_CHECK_NAME} check run {result.get('id')}\n")
     except (GateError, KeyError, OSError, json.JSONDecodeError) as error:
         sys.stderr.write(f"DCO gate failed: {error}\n")

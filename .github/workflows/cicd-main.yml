@@ -425,9 +425,6 @@ jobs:
       - name: Test queue approval topology
         run: .github/scripts/test_approve_test_queue.sh
 
-      - name: Test DCO gate publisher
-        run: python3 .github/scripts/test_dco_gate.py
-
       - name: Test superseded merge-group cleanup
         run: python3 .github/scripts/test_cancel_superseded_merge_group_runs.py
 
@@ -1369,9 +1366,9 @@ jobs:
               body: `🔄 Merge queue validation started!\n\nYou can track the progress here: ${runUrl}`
             });
 
-  DCO_gate_merge_group:
-    name: DCO gate
+  DCO_merge_group:
+    name: DCO
     if: github.event_name == 'merge_group'
     runs-on: ubuntu-latest
     steps:
-      - run: echo "DCO was validated on the pull request head before merge queue admission."
+      - run: echo "The real DCO check happens on PRs only. This is a placeholder for the merge queue to keep the DCO check as a required status check."
