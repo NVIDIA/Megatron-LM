@@ -1529,6 +1529,7 @@ def test_fused_row_limit_warning_is_shared_and_once(layout, caplog, reset_lazy_k
                     cu_seqlens_kv=cu_k,
                     max_seqlen_q=rows,
                     max_seqlen_kv=1,
+                    use_compact=False,
                 )
             else:
                 indexer_topk(
@@ -1536,6 +1537,7 @@ def test_fused_row_limit_warning_is_shared_and_once(layout, caplog, reset_lazy_k
                     torch.zeros(1, 1, 1, dtype=torch.bfloat16),
                     torch.ones(rows, 1, 1, dtype=torch.bfloat16),
                     topk=1,
+                    use_compact=False,
                 )
 
     warnings = [record for record in caplog.records if "CORRECTNESS WARNING" in record.message]
@@ -1560,6 +1562,7 @@ def test_fused_row_limit_does_not_warn_at_boundary(layout, caplog, reset_lazy_ke
                 cu_seqlens_kv=torch.tensor([0, 1], dtype=torch.int32),
                 max_seqlen_q=rows,
                 max_seqlen_kv=1,
+                use_compact=False,
             )
         else:
             indexer_topk(
@@ -1567,6 +1570,7 @@ def test_fused_row_limit_does_not_warn_at_boundary(layout, caplog, reset_lazy_ke
                 torch.zeros(1, 1, 1, dtype=torch.bfloat16),
                 torch.ones(rows, 1, 1, dtype=torch.bfloat16),
                 topk=1,
+                use_compact=False,
             )
 
     assert not [record for record in caplog.records if "CORRECTNESS WARNING" in record.message]

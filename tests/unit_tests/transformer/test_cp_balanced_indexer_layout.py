@@ -921,7 +921,7 @@ def test_chunk_scoring_matches_full_call():
     scale = dim**-0.5
 
     def _call(rows_q, rows_w, gs, mq):
-        tk, _ = _cu.compute_cp_indexer_topk(
+        tk, _, _ = _cu.compute_cp_indexer_topk(
             rows_q,
             rows_w,
             k,
@@ -1068,7 +1068,7 @@ def test_balanced_compute_smoke_runs_production_path(monkeypatch):
     q_ref = apply_thd_cp_local_rope_unfused(
         q_ref, idx.rotary_pos_emb(rows), dim - pos_dim, pos_dim, cu, 0, _Cfg()
     )
-    ref, _ = real_compute_topk(
+    ref, _, _ = real_compute_topk(
         q_ref, w, k, cu, cu_comp, 0, ratio, topk, dim**-0.5, max_seqlen_q=rows, use_fused=False
     )
     fs, _ = torch.sort(tk, dim=-1)
@@ -1126,7 +1126,11 @@ def test_balanced_compute_uses_fused_full_k_with_tight_widths(monkeypatch):
 
     def _score_spy(*args, **kwargs):
         score_calls.append((args[2], kwargs))
-        return torch.zeros((args[0].shape[0], topk), dtype=torch.int32), kwargs["prebuilt_layout"]
+        return (
+            torch.zeros((args[0].shape[0], topk), dtype=torch.int32),
+            kwargs["prebuilt_layout"],
+            None,
+        )
 
     monkeypatch.setattr(cp_utils, "compute_cp_indexer_topk", _score_spy)
 
@@ -1280,7 +1284,7 @@ def test_synthetic_unfused_zero_work_returns_none(zero_case):
     k_arg = k[:0] if zero_case == "k" else k
     max_seqlen_kv = 0 if zero_case == "max_seqlen_kv" else None
 
-    tk, layout = cp_utils.compute_cp_indexer_topk(
+    tk, layout, _ = cp_utils.compute_cp_indexer_topk(
         q,
         w,
         k_arg,
@@ -1405,7 +1409,7 @@ def test_fused_multi_offset_packed_layout():
     q, w, k, _sig_perm = _signature_qkw(cap, comp, heads, dim, dev)
     scale = dim**-0.5
 
-    tk_ref, _ = _cu.compute_cp_indexer_topk(
+    tk_ref, _, _ = _cu.compute_cp_indexer_topk(
         q, w, k, cu, cu_comp, 0, ratio, topk, scale, max_seqlen_q=cap, use_fused=True
     )
 
@@ -1433,7 +1437,7 @@ def test_fused_multi_offset_packed_layout():
             (slice(0, half), "head_layout", "mkv_head"),
             (slice(half, None), "tail_layout", "mkv_tail"),
         ):
-            tk, _ = _cu.compute_cp_indexer_topk(
+            tk, _, _ = _cu.compute_cp_indexer_topk(
                 rows_q[sl],
                 rows_w[sl],
                 k,
@@ -1491,7 +1495,7 @@ def test_fused_tight_width_smoke():
     q = torch.randn(sz, heads, dim, dtype=torch.bfloat16, device=dev)
     w = (torch.rand(sz, heads, dtype=torch.float32, device=dev) + 0.5).to(torch.bfloat16)
     k = torch.randn(int(cu_comp[-1]), dim, dtype=torch.bfloat16, device=dev)
-    tk, _ = _cu.compute_cp_indexer_topk(
+    tk, _, _ = _cu.compute_cp_indexer_topk(
         q,
         w,
         k,
@@ -1530,7 +1534,7 @@ def test_fused_tight_width_ceiling_smoke():
     k = torch.randn(int(cu_comp[-1]), dim, dtype=torch.bfloat16, device=dev)
     q = torch.randn(sz, heads, dim, dtype=torch.bfloat16, device=dev)
     w = (torch.rand(sz, heads, dtype=torch.float32, device=dev) + 0.5).to(torch.bfloat16)
-    tk, _ = _cu.compute_cp_indexer_topk(
+    tk, _, _ = _cu.compute_cp_indexer_topk(
         q,
         w,
         k,
@@ -1800,7 +1804,7 @@ def test_zigzag_scoring_matches_reference():
         return rotate_activation(q)
 
     q_ref = _project_rope(qr, None, None)
-    tk_ref, _ = _cu.compute_cp_indexer_topk(
+    tk_ref, _, _ = _cu.compute_cp_indexer_topk(
         q_ref,
         w.reshape(-1, heads),
         k,
@@ -1863,7 +1867,7 @@ def test_fused_reduced_mq_matches_full_mq():
     q, w, k, sig_perm = _signature_qkw(sz, int(cu_comp[-1]), heads, dim, dev)
 
     def _call(mq):
-        tk, _ = _cu.compute_cp_indexer_topk(
+        tk, _, _ = _cu.compute_cp_indexer_topk(
             q,
             w,
             k,
