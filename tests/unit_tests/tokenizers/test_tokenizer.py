@@ -503,6 +503,9 @@ def test_multimodal_gigatoken_tokenizer():
         image_tag_type=image_tag_type,
         use_gigatoken=True,
     )
+
+    assert tokenizer.use_gigatoken == True, "use_gigatoken is not set to True."
+
     # Simple encode - decode roundtrip.
     assert (
         tokenizer.detokenize(tokenizer.tokenize("abc")) == "abc"
@@ -662,6 +665,8 @@ def test_sft_gigatoken_tokenizer():
         prompt_format=prompt_format,
         use_gigatoken=True,
     )
+
+    assert tokenizer.use_gigatoken == True, "use_gigatoken is not set to True."
 
     # Simple encode - decode roundtrip.
     assert (
