@@ -210,6 +210,26 @@ def setup_model_and_optimizer(
     mock_args = parse_args(ignore_unknown_args=True)
     with mock.patch('megatron.training.training.get_args', new=lambda: mock_args):
         init_basic_mock_args(mock_args, tp, pp, bf16=bf16)
+        if ddp_num_buckets is not None:
+            # resolve_ddp_bucket_size() forces a single bucket unless grad reduction
+            # overlaps, so both knobs are needed to actually split the grad buffer.
+            mock_args.ddp_num_buckets = ddp_num_buckets
+            mock_args.overlap_grad_reduce = True
+        mock_args.ddp_pad_buckets_for_high_nccl_busbw = ddp_pad_buckets_for_high_nccl_busbw
+        mock_args.context_parallel_size = cp
+        mock_args.expert_model_parallel_size = ep
+        mock_args.expert_tensor_parallel_size = etp
+        mock_args.use_megatron_fsdp = use_megatron_fsdp
+        mock_args.data_parallel_sharding_strategy = (
+            'optim_grads_params' if use_megatron_fsdp else 'no_shard'
+        )
+        if use_megatron_fsdp:
+            # parse_args() leaves these as CLI strings until validate_args()
+            # maps them to the torch.dtype values expected by Megatron-FSDP.
+            mock_args.megatron_fsdp_main_params_dtype = torch.float32
+            mock_args.megatron_fsdp_main_grads_dtype = None
+            mock_args.megatron_fsdp_grad_comm_dtype = None
+        mock_args.gradient_accumulation_fusion = False
         mock_args.use_distributed_optimizer = ddp_use_dist_opt
         mock_args.use_layer_wise_distributed_optimizer = ddp_use_layer_wise
         if ddp_use_layer_wise:
@@ -221,6 +241,9 @@ def setup_model_and_optimizer(
                 tensor_model_parallel_size=tp,
                 pipeline_model_parallel_size=pp,
                 pipeline_dtype=torch.bfloat16,
+                context_parallel_size=cp,
+                expert_model_parallel_size=ep,
+                expert_tensor_parallel_size=etp,
                 bf16=bf16,
             )
         )
@@ -236,6 +259,10 @@ def setup_model_and_optimizer(
         optimizer_state_offload_fraction=optimizer_state_offload_fraction,
         use_precision_aware_optimizer=use_precision_aware_optimizer,
     )
+    if use_megatron_fsdp:
+        # The FSDP DTensor sharded-state path may materialize missing optimizer
+        # slots with a dummy step, which requires a concrete learning rate.
+        config.lr = 1.0e-3
 
     if optimizer_type in ('muon', 'dist_muon'):
         config.lr = 0.0

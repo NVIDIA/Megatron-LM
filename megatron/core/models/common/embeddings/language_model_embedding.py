@@ -6,6 +6,7 @@ import torch
 from torch import Tensor
 
 from megatron.core import tensor_parallel
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import get_tensor_model_parallel_group_if_none, nvtx_decorator
@@ -24,6 +25,7 @@ class LanguageModelEmbedding(MegatronModule):
         num_tokentypes (int): Set to 0 without binary head, and 2 with a binary head. Defaults to 0.
         scatter_to_sequence_parallel (bool): Set to False to disable scatter of embedding
             across sequence parallel region. Defaults to True.
+        pg_collection (ProcessGroupCollection, optional): Process groups used by the embedding.
     """
 
     def __init__(
@@ -35,6 +37,7 @@ class LanguageModelEmbedding(MegatronModule):
         num_tokentypes: int = 0,
         scatter_to_sequence_parallel: bool = True,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        pg_collection: Optional[ProcessGroupCollection] = None,
     ):
         super().__init__(config=config)
 
@@ -60,6 +63,7 @@ class LanguageModelEmbedding(MegatronModule):
             reduce_scatter_embeddings=self.reduce_scatter_embeddings,
             config=self.config,
             tp_group=self.tp_group,
+            pg_collection=pg_collection,
         )
 
         # Position embedding (serial).

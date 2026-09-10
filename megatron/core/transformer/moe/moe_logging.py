@@ -503,6 +503,7 @@ class MoEMetricsTracker:
         force_initialize: bool = False,
         track_names: Optional[Union[str, List[str]]] = None,
         num_layers: Optional[int] = None,
+        num_moe_layers: Optional[int] = None,
         moe_layer_freq: Optional[Union[int, List[int]]] = None,
         mtp_num_layers: Optional[int] = None,
         total_loss_dict: Optional[dict[str, torch.Tensor]] = None,
@@ -527,6 +528,8 @@ class MoEMetricsTracker:
                 whose tensor sizes must match ranks that do have MoE layers.
             track_names: Metric name(s) to report.  ``None`` reports all.
             num_layers: Total transformer layers (required when *force_initialize*).
+            num_moe_layers: Number of MoE aux-loss contributors to average over.
+                When set, this overrides ``moe_layer_freq`` and ``mtp_num_layers``.
             moe_layer_freq: MoE layer frequency or binary pattern list.
             mtp_num_layers: Extra layers from Multi-Token Prediction.
             total_loss_dict: Megatron training-loop accumulator.  Metrics
@@ -553,7 +556,10 @@ class MoEMetricsTracker:
 
         self._sync_metrics(metric_names, pg_collection)
 
-        num_moe_layers = self._count_moe_layers(num_layers, moe_layer_freq, mtp_num_layers)
+        if num_moe_layers is None:
+            num_moe_layers = self._count_moe_layers(num_layers, moe_layer_freq, mtp_num_layers)
+        if num_moe_layers <= 0:
+            raise ValueError("MoE metrics require at least one MoE layer.")
         scalars = self._aggregate(loss_scale, num_moe_layers, metric_names, percentiles)
 
         # Megatron integration: accumulate loss metrics into total_loss_dict
@@ -621,12 +627,17 @@ class MoEMetricsTracker:
         """
         if pg_collection is None:
             pp_group = parallel_state.get_pipeline_model_parallel_group()
+            dp_group = None
+        else:
+            pp_group = pg_collection.pp
+            dp_group = getattr(pg_collection, 'dp_cp_gtp_remat', None)
+        # The metric DP-average must span gtp_remat peers (they hold distinct tokens), else the
+        # displayed value is a 1/gtp_remat subsample and looks noisy. Use the gtp_remat-inclusive
+        # group; CP ranks (already summed in reduce_group) average as a no-op.
+        if dp_group is None:
             dp_group = parallel_state.get_data_parallel_group(
                 with_context_parallel=False, partial_data_parallel=False
             )
-        else:
-            pp_group = pg_collection.pp
-            dp_group = pg_collection.dp
 
         for name in metric_names:
             if name not in self._metrics:

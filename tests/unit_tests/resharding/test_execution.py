@@ -6,7 +6,7 @@ These test the send/recv submission logic, writeback paths, and
 non-collocated mode handling.  Requires CUDA (uses torch.cuda.synchronize).
 """
 
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
@@ -33,6 +33,12 @@ class MockCopyService(CopyService):
     def __init__(self):
         self.sends = []  # [(tensor, dest_rank, task_id)]
         self.recvs = []  # [(tensor, src_rank, task_id)]
+        self.plan = None
+        self.transform = None
+
+    def set_plan(self, plan, *, transform=None):
+        self.plan = plan
+        self.transform = transform
 
     def submit_send(self, src_tensor, dest_rank, task_id=None):
         self.sends.append((src_tensor.clone(), dest_rank, task_id))
@@ -49,6 +55,21 @@ class MockCopyService(CopyService):
                 recv_tensor.copy_(src[: recv_tensor.numel()].reshape(recv_tensor.shape))
         self.sends.clear()
         self.recvs.clear()
+
+
+class NativeMockCopyService(MockCopyService):
+    """Service that consumes the whole plan before slice submission."""
+
+    def __init__(self):
+        super().__init__()
+        self.native_calls = []
+
+    def execute_plan(self, plan, src_tensors, dst_tensors, *, transform=None):
+        self.native_calls.append((plan, src_tensors, dst_tensors, transform))
+        return True
+
+    def run(self):
+        raise AssertionError("native plan execution must bypass submit/run")
 
 
 # ---------------------------------------------------------------------------
@@ -124,6 +145,8 @@ class TestExecuteReshard:
         service = MockCopyService()
         _run(plan, src_module, dst_module, service)
 
+        assert service.plan is plan
+        assert service.transform is None
         assert torch.equal(
             dict(dst_module.named_parameters())["weight"].data,
             dict(src_module.named_parameters())["weight"].data,
@@ -262,11 +285,38 @@ class TestTransformPath:
 class TestEdgeCases:
     """Test edge cases in execute_reshard_plan."""
 
+    def test_service_can_skip_process_group_barrier(self):
+        """A self-synchronizing backend does not use the executor's barrier."""
+        Utils.initialize_distributed()
+        service = MockCopyService()
+        service.requires_process_group_barrier = False
+
+        with patch("megatron.core.resharding.execution.dist.barrier") as barrier:
+            execute_reshard_plan(ReshardPlan(send_ops=[], recv_ops=[]), None, None, service)
+
+        barrier.assert_not_called()
+
     def test_empty_plan(self):
         """Empty plan (no ops) should complete without error."""
         plan = ReshardPlan(send_ops=[], recv_ops=[])
         service = MockCopyService()
         _run(plan, None, None, service)
+
+    def test_native_service_bypasses_slice_submission(self):
+        src_module = _make_module_with_params({"weight": torch.ones(2, device="cuda")})
+        dst_module = _make_module_with_params({"weight": torch.zeros(2, device="cuda")})
+        full_slice = _full_slice(1)
+        plan = ReshardPlan(
+            send_ops=[_make_transfer_op("weight", 1, True, full_slice, full_slice, task_id=0)],
+            recv_ops=[_make_transfer_op("weight", 0, False, full_slice, full_slice, task_id=0)],
+        )
+        service = NativeMockCopyService()
+
+        _run(plan, src_module, dst_module, service)
+
+        assert len(service.native_calls) == 1
+        assert service.sends == []
+        assert service.recvs == []
 
     def test_missing_param_in_src(self):
         """Send op referencing nonexistent param should be silently skipped."""

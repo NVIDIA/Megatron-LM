@@ -211,15 +211,28 @@ class TestMimoModel:
         assert mimo_model.special_token_ids == self.special_token_ids
 
     def test_get_text_embeddings(self):
-        """Test getting text embeddings."""
-        mimo_model = self._make_avlm()
+        """Precomputed text positions must match the mask-based embedding lookup."""
+        mimo_model = self._make_avlm().eval()
         input_ids = self._make_input_ids()
         position_ids = self._make_position_ids()
+        input_ids[0, 3] = self.special_token_ids["images"]
+        input_ids[1, 5] = self.special_token_ids["audio"]
 
-        text_embeddings = mimo_model.get_text_embeddings(
+        text_mask = torch.ones_like(input_ids, dtype=torch.bool)
+        for special_token_id in self.special_token_ids.values():
+            text_mask &= input_ids != special_token_id
+        text_token_indices = text_mask.reshape(-1).nonzero(as_tuple=False).flatten()
+
+        mask_embeddings = mimo_model.get_text_embeddings(
             input_ids, position_ids, self.special_token_ids
         )
-        assert text_embeddings.shape == (self.batch_size * self.seq_len, self.hidden_size)
+        indexed_embeddings = mimo_model.get_text_embeddings(
+            input_ids, position_ids, self.special_token_ids, text_token_indices=text_token_indices
+        )
+
+        expected_text_tokens = self.batch_size * self.seq_len - 2
+        assert indexed_embeddings.shape == (expected_text_tokens, self.hidden_size)
+        torch.testing.assert_close(indexed_embeddings, mask_embeddings, rtol=0, atol=0)
 
     def test_get_text_embeddings_handles_3d_position_ids(self):
         """3D mRoPE position_ids ``[rope_dim, B, S]`` must produce the same text
@@ -270,6 +283,7 @@ class TestMimoModel:
         mimo_model = self._make_vlm()
         input_ids = self._make_input_ids()
         position_ids = self._make_position_ids()
+        loss_mask = torch.ones(self.batch_size, self.seq_len, device=self.device)
 
         captured = {}
 
@@ -277,10 +291,16 @@ class TestMimoModel:
             captured['input_ids'] = kwargs.get('input_ids')
             captured['position_ids'] = kwargs.get('position_ids')
             captured['decoder_input'] = kwargs.get('decoder_input')
+            captured['loss_mask'] = kwargs.get('loss_mask')
             return torch.zeros(self.batch_size, self.seq_len, self.vocab_size, device=self.device)
 
         with patch.object(mimo_model.language_model, 'forward', side_effect=capture_lm_forward):
-            mimo_model(input_ids=input_ids, position_ids=position_ids, modality_inputs=None)
+            mimo_model(
+                input_ids=input_ids,
+                position_ids=position_ids,
+                loss_mask=loss_mask,
+                modality_inputs=None,
+            )
 
         assert (
             captured['decoder_input'] is not None
@@ -292,6 +312,7 @@ class TestMimoModel:
             captured['position_ids'] is not None
         ), "MimoModel.forward must pass position_ids to the language model (got None)"
         torch.testing.assert_close(captured['position_ids'], position_ids)
+        assert captured['loss_mask'] is loss_mask
 
     def test_forward_with_image_modality(self):
         """Test forward pass with text and image input."""
@@ -479,6 +500,7 @@ class TestMimoModel:
 
         def capture_lm_forward(*args, **kwargs):
             captured['decoder_input'] = kwargs.get('decoder_input')
+            captured['loss_mask'] = kwargs.get('loss_mask')
             return torch.zeros(
                 self.batch_size, sharded_seq_len, self.vocab_size, device=self.device
             )
@@ -508,6 +530,7 @@ class TestMimoModel:
             self.batch_size,
             self.hidden_size,
         )
+        assert captured['loss_mask'] is sharded_loss_mask
         # forward() returns the (possibly sharded) loss mask from shard().
         assert out_loss_mask is sharded_loss_mask
 
@@ -752,6 +775,8 @@ class TestMimoModelNonColocated:
             0, self.vocab_size, (self.batch_size, self.seq_len), device=self.device
         )
         input_ids[:, 5 : 5 + img_seq_len] = 50257
+        loss_mask = torch.ones(self.batch_size, self.seq_len, device=self.device)
+        loss_mask[input_ids == 50257] = 0
         position_ids = (
             torch.arange(self.seq_len, device=self.device).unsqueeze(0).expand(self.batch_size, -1)
         )
@@ -761,9 +786,28 @@ class TestMimoModelNonColocated:
         )
         model.set_input_tensor({"images": encoder_embeddings})
 
-        outputs, _ = model(input_ids=input_ids, position_ids=position_ids, modality_inputs=None)
+        captured = {}
+
+        def capture_language_inputs(module, args, kwargs):
+            captured['loss_mask'] = kwargs.get('loss_mask')
+
+        hook = model.language_model.register_forward_pre_hook(
+            capture_language_inputs, with_kwargs=True
+        )
+        try:
+            outputs, out_loss_mask = model(
+                input_ids=input_ids,
+                position_ids=position_ids,
+                loss_mask=loss_mask,
+                modality_inputs=None,
+            )
+        finally:
+            hook.remove()
+
         assert isinstance(outputs, torch.Tensor)
         assert outputs.shape == (self.batch_size, self.seq_len, self.vocab_size)
+        assert captured['loss_mask'] is loss_mask
+        assert out_loss_mask is loss_mask
 
     def test_forward_language_module_non_first_stage_drops_input_ids(self):
         """Non-first PP stage in ``_forward_language_module`` must call the LM
@@ -782,6 +826,8 @@ class TestMimoModelNonColocated:
         hidden_states = torch.randn(
             self.seq_len, self.batch_size, self.hidden_size, device=self.device
         )
+        loss_mask = torch.ones(self.batch_size, self.seq_len, device=self.device)
+        loss_mask[:, : self.seq_len // 2] = 0
 
         captured = {}
 
@@ -798,13 +844,14 @@ class TestMimoModelNonColocated:
                 input_ids=input_ids,
                 position_ids=position_ids,
                 attention_mask=None,
-                loss_mask=None,
+                loss_mask=loss_mask,
                 labels=None,
                 input_tensors={MIMO_LANGUAGE_MODULE_KEY: hidden_states},
             )
 
         assert captured['input_ids'] is None
         assert captured['decoder_input'] is None
+        assert captured['loss_mask'] is loss_mask
         torch.testing.assert_close(captured['position_ids'], position_ids)
 
 

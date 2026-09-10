@@ -53,6 +53,7 @@ def make_coordinator_direct(
     coordinator.identities_of_data_parallel_ranks = deque(
         [rank_name_template.format(i).encode() for i in range(data_parallel_size)]
     )
+    coordinator.removed_engine_identities = set()
     if deterministic_mode:
         coordinator.identities_of_data_parallel_ranks = deque(
             sorted(coordinator.identities_of_data_parallel_ranks)

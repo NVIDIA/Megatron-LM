@@ -9,7 +9,6 @@ import torch
 
 from gpt_builders import gpt_builder
 from hybrid_builders import hybrid_builder
-from megatron.core import mpu
 from megatron.core.enums import ModelType
 from megatron.core.models.gpt import GPTModel
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -144,9 +143,6 @@ def loss_func(
     masked_truncated_from_above = torch.sum(loss_mask_flat * truncated_from_above_flat)
     masked_truncated_from_below = torch.sum(loss_mask_flat * truncated_from_below_flat)
 
-    if args.context_parallel_size > 1:
-        torch.distributed.all_reduce(loss, group=mpu.get_context_parallel_group())
-
     # Check individual rank losses are not NaN prior to DP all-reduce.
     rerun_state_machine = get_rerun_state_machine()
     if args.check_for_nan_in_loss_and_grad:
@@ -192,7 +188,7 @@ def loss_func(
     # Note: This information needs to be determined in forward_step where we have access to the batch data
     # The loss_func doesn't have direct access to this information
 
-    return (loss[0] * args.context_parallel_size, total_tokens.int(), output_dict)
+    return (loss[0].clone(), total_tokens.int(), output_dict)
 
 
 def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
@@ -276,13 +272,15 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
             )
         else:
             cu_seqlens = torch.tensor([0, tokens.shape[1]], dtype=torch.int32, device=tokens.device)
+            # Make sure to omit `total_tokens` to prevent `seq_idx` from being auto-computed.
+            # That would cause a sequence packing kernel to be incorrectly used.
             packed_seq_params = PackedSeqParams(
                 qkv_format='thd',
                 cu_seqlens_q=cu_seqlens,
                 cu_seqlens_kv=cu_seqlens,
                 max_seqlen_q=tokens.shape[1],
                 max_seqlen_kv=tokens.shape[1],
-                total_tokens=tokens.shape[1],
+                pad_between_seqs=False,
             )
 
     # Clear RoPE cache to avoid inference tensor errors

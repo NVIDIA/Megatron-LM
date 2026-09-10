@@ -3,6 +3,9 @@
 import contextlib
 import gc
 
+import warnings
+from unittest.mock import Mock, patch
+
 import pytest
 import torch
 from pytest_mock import mocker
@@ -23,6 +26,7 @@ from megatron.core.tensor_parallel.random import (
 from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_te_min_version
+from megatron.training.models.dist_utils import _ddp_wrap
 from tests.unit_tests.test_utilities import Utils
 
 rank = Utils.rank

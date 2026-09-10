@@ -12,7 +12,10 @@ from megatron.core.inference.engines import DynamicInferenceEngine
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
     GPTInferenceWrapper,
 )
-from megatron.core.inference.quantization.utils import quantize_model_to_mxfp8
+from megatron.core.inference.quantization.utils import (
+    quantize_model_to_mxfp8,
+    resolve_mxfp8_backend,
+)
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )

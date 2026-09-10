@@ -49,6 +49,7 @@ async def _run_text_gen_server(
     verbose: bool = False,
     fd: Optional[int] = None,
     hostname: Optional[str] = None,
+    chat_template: Optional[str] = None,
 ):
     """
     Initializes and runs the async web server. Automatically starts and
@@ -80,6 +81,7 @@ async def _run_text_gen_server(
         app.config['tokenizer'] = tokenizer
         app.config['parsers'] = parsers
         app.config['verbose'] = verbose
+        app.config['chat_template'] = chat_template
 
         # Register all blueprints from the 'endpoints' package
         for endpoint in endpoints.__all__:
@@ -120,6 +122,7 @@ def _server_process_worker(
     verbose: bool = False,
     fd: Optional[int] = None,
     hostname: Optional[str] = None,
+    chat_template: Optional[str] = None,
 ):
     """Synchronous worker function that sets up a new event loop for the separate process."""
     loop = asyncio.new_event_loop()
@@ -127,7 +130,15 @@ def _server_process_worker(
     try:
         loop.run_until_complete(
             _run_text_gen_server(
-                coordinator_addr, tokenizer, rank, server_port, parsers, verbose, fd, hostname
+                coordinator_addr,
+                tokenizer,
+                rank,
+                server_port,
+                parsers,
+                verbose,
+                fd,
+                hostname,
+                chat_template,
             )
         )
     except KeyboardInterrupt:
@@ -178,7 +189,17 @@ def start_text_gen_server(
     for i in range(num_replicas):
         p = mp.Process(
             target=_server_process_worker,
-            args=(coordinator_addr, tokenizer, rank, server_port, parsers, verbose, fd, hostname),
+            args=(
+                coordinator_addr,
+                tokenizer,
+                rank,
+                server_port,
+                parsers,
+                verbose,
+                fd,
+                hostname,
+                chat_template,
+            ),
             daemon=True,
         )
         p.start()

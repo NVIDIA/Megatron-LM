@@ -66,6 +66,27 @@ def create_file_prefixes(tokenizer, number_of_files, maximum_number_of_documents
     return file_prefixes
 
 
+def test_multimodal_builder_add_document_default_modes():
+    # add_document documents modes as defaulting to None. On a multimodal builder
+    # that default must assign one mode (0) per item, matching the sequence
+    # lengths - not crash. Regression test for `[0] * lengths` (list * list).
+    with tempfile.TemporaryDirectory() as temp_dir:
+        builder = IndexedDatasetBuilder(
+            os.path.join(temp_dir, "mm.bin"), dtype=numpy.int32, multimodal=True
+        )
+
+        builder.add_document(numpy.array([1, 2, 3, 4, 5], dtype=numpy.int32), [3, 2])
+        builder.add_document(numpy.array([6, 7], dtype=numpy.int32), [2])
+
+        assert builder.sequence_lengths == [3, 2, 2]
+        assert builder.sequence_modes == [0, 0, 0]
+        assert len(builder.sequence_modes) == len(builder.sequence_lengths)
+
+        # Explicit modes are still honored.
+        builder.add_document(numpy.array([8], dtype=numpy.int32), [1], modes=[4])
+        assert builder.sequence_modes == [0, 0, 0, 4]
+
+
 def do_setup(odir):
     paths = defaultdict(list)
 

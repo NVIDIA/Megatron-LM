@@ -136,3 +136,4 @@ METRICS:
   - "mem-allocated-bytes"
   - "mem-max-allocated-bytes"
   - "mtp_1 loss"
+LAUNCHER: ft_launcher

@@ -14,6 +14,7 @@ from megatron.training.utils.common_utils import (
     has_nvrx_checkpointing_async_support,
     has_nvrx_installed,
     is_first_or_last_pipeline_stage,
+    is_gtp_remat_active,
     is_hybrid_model,
     is_last_rank,
     is_rank0,

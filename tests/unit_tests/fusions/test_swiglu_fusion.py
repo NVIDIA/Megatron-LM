@@ -5,6 +5,47 @@ import torch
 import torch.nn.functional as F
 
 from megatron.core.fusions.fused_bias_swiglu import bias_swiglu_impl, weighted_bias_swiglu_impl
+from megatron.core.transformer.transformer_config import TransformerConfig
+
+
+def _clamped_swiglu_config(**kwargs):
+    defaults = dict(
+        num_layers=1,
+        hidden_size=16,
+        num_attention_heads=4,
+        num_moe_experts=4,
+        gated_linear_unit=True,
+        activation_func=F.silu,
+        activation_func_clamp_value=10.0,
+    )
+    return TransformerConfig(**(defaults | kwargs))
+
+
+def test_clamped_swiglu_config_accepts_positive_moe_clamp():
+    assert _clamped_swiglu_config().activation_func_clamp_value == 10.0
+
+
+@pytest.mark.parametrize("clamp_value", [0.0, -1.0, float("nan"), float("inf"), float("-inf")])
+def test_clamped_swiglu_config_requires_positive_clamp(clamp_value):
+    with pytest.raises(ValueError, match="greater than zero"):
+        _clamped_swiglu_config(activation_func_clamp_value=clamp_value)
+
+
+def test_clamped_swiglu_config_rejects_linear_offset():
+    with pytest.raises(ValueError, match="glu_linear_offset must be zero"):
+        _clamped_swiglu_config(glu_linear_offset=1.0)
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "match"),
+    [
+        ({"num_moe_experts": None}, "only supported with MoE"),
+        ({"use_te_activation_func": True}, "use_te_activation_func must be False"),
+    ],
+)
+def test_clamped_swiglu_config_rejects_unsupported_paths(kwargs, match):
+    with pytest.raises(ValueError, match=match):
+        _clamped_swiglu_config(**kwargs)
 
 
 @pytest.mark.parametrize("input_dtype", [torch.bfloat16, torch.float32])

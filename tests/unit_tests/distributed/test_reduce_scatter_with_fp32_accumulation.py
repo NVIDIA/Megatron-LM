@@ -76,3 +76,54 @@ class TestReduceScatterWithFP32Accumulation:
             assert (
                 torch.allclose(tensor1_shard, tensor2_shard) == baseline_reduce_scatter_in_fp32
             ), f"{get_non_matching_values(tensor1_shard, tensor2_shard)}"
+
+    @pytest.mark.parametrize("axis_size", [2, 4, 8, 16])
+    def test_power_of_two_prescale_equals_scaling_the_fp32_sum(self, axis_size: int):
+        """Pre-scaling BF16 by 1/2^k is exact, which is why GTP pre-scales its 1/gtp_remat mean
+        onto the wgrad instead of accumulating it here. Local arithmetic only, no collective."""
+        scale = 1.0 / axis_size
+        contributions = (torch.randn(axis_size, 100000, device='cuda') * 1e-3).bfloat16()
+
+        prescaled = (contributions * scale).sum(dim=0, dtype=torch.float32).bfloat16()
+        scaled_sum = (contributions.sum(dim=0, dtype=torch.float32) * scale).bfloat16()
+
+        assert torch.equal(prescaled, scaled_sum), (
+            f"1/{axis_size} pre-scale is not exact: "
+            f"{(prescaled != scaled_sum).sum().item()} elements differ"
+        )
+
+    def test_caller_provided_all_to_all_output_tensor(self):
+        """A caller-supplied scratch (GTP passes one from its wgrad pool) must be honored.
+
+        A mis-sized one must be rejected before the all-to-all: bailing out mid-flight
+        desynchronizes the group.
+        """
+        rank, world_size = Utils.rank, Utils.world_size
+        kwargs = {"op": torch.distributed.ReduceOp.SUM, "group": None, "async_op": False}
+        tensor = torch.rand(100000, device='cuda', dtype=torch.bfloat16)
+
+        internal = tensor.clone()
+        reduce_scatter_with_fp32_accumulation(
+            shard_buffer(internal, world_size)[rank], internal, **kwargs
+        )
+        provided = tensor.clone()
+        reduce_scatter_with_fp32_accumulation(
+            shard_buffer(provided, world_size)[rank],
+            provided,
+            all_to_all_output_tensor=torch.empty_like(tensor),
+            **kwargs,
+        )
+        torch.testing.assert_close(
+            shard_buffer(provided, world_size)[rank],
+            shard_buffer(internal, world_size)[rank],
+            rtol=0,
+            atol=0,
+        )
+
+        with pytest.raises(AssertionError):
+            reduce_scatter_with_fp32_accumulation(
+                shard_buffer(tensor, world_size)[rank],
+                tensor,
+                all_to_all_output_tensor=torch.empty_like(tensor)[:-world_size],
+                **kwargs,
+            )

@@ -332,11 +332,9 @@ def _get_custom_recipe(quantizer_factory_python_path: str) -> Union[Fp8Recipe, F
     try:
         custom_recipe = transformer_engine.common.recipe.CustomRecipe(qfactory=quantizer_factory)
     except AttributeError:
-        raise ValueError(
-            """CustomRecipe recipe is not available in this version of 
+        raise ValueError("""CustomRecipe recipe is not available in this version of 
             Transformer Engine. Please make sure you are using TE version 
-            >= 2.9.0.dev0."""
-        )
+            >= 2.9.0.dev0.""")
     return custom_recipe
 
 
@@ -796,6 +794,26 @@ if HAVE_TE:
             )
         return fp8_recipe
 
+    def get_fp8_recipe_for_a2a(a2a_dtype: str):
+        """Return the fp8 recipe for quantizing an MoE dispatch/combine (a2a) payload over
+        the wire, or None for a high-precision wire.
+
+        Dedicated helper rather than get_fp8_recipe: the wire payload is E4M3
+        activations/activation-grads in both directions, independent of the compute recipe
+        (whose format selection and compute-only knobs like fp8_dpa do not apply to a
+        communication payload).
+
+        Arguments:
+            a2a_dtype (str): Wire dtype, 'bf16' (returns None) or 'mxfp8'.
+        """
+        if a2a_dtype == 'bf16':
+            return None
+        if a2a_dtype == 'mxfp8':
+            return transformer_engine.common.recipe.MXFP8BlockScaling(
+                fp8_format=transformer_engine.common.recipe.Format.E4M3
+            )
+        raise ValueError(f"Unsupported a2a wire dtype: {a2a_dtype!r}.")
+
     def get_fp8_context(config: TransformerConfig, layer_no: int = -1, is_init: bool = False):
         """Return fp8 context manager.
 
@@ -885,6 +903,14 @@ else:
     def get_fp8_recipe(config: TransformerConfig):
         """Returns None since TE is not available."""
         return None
+
+    def get_fp8_recipe_for_a2a(a2a_dtype: str):
+        """Raises for a quantized wire dtype since TE is not available."""
+        if a2a_dtype == 'bf16':
+            return None
+        raise RuntimeError(
+            f"a2a wire dtype {a2a_dtype!r} requires TransformerEngine, which is not available."
+        )
 
     def get_fp8_context(config: TransformerConfig, layer_no: int = -1, is_init: bool = False):
         """Returns dummy fp8 context manager since TE is not available."""

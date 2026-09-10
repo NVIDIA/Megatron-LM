@@ -17,20 +17,23 @@ from megatron.core import parallel_state
 from megatron.core.inference.quantization.utils import (
     _should_quantize_param,
     quantize_params_to_mxfp8,
+    resolve_mxfp8_backend,
 )
 from megatron.core.models.common.language_module.language_module import LanguageModule
 from megatron.core.utils import unwrap_model
 
-from . import build_centralized_reshard_plan, execute_reshard_plan
+from . import build_local_reshard_plan, execute_reshard_plan
 from .copy_services.base import CopyService
 from .copy_services.gloo_copy_service import GlooCopyService
 from .copy_services.nccl_copy_service import NCCLCopyService
+from .copy_services.nccl_m2n_copy_service import NCCLM2NCopyService
+from .copy_services.nixl_copy_service import NixlCopyService
 from .copy_services.nvshmem_copy_service import NVSHMEMCopyService
 from .transforms import MXFP8ReshardTransform, ReshardTransform
 from .utils import invalidate_refit_tensor_cache, named_persistent_buffers
 
 # Supported refit backend names
-RefitBackendName = Literal["nccl", "gloo", "nvshmem"]
+RefitBackendName = Literal["nccl", "nccl_m2n", "gloo", "nvshmem", "nixl"]
 
 
 @dataclass(frozen=True)
@@ -44,6 +47,9 @@ class _PlanCacheKey:
     src_config: Optional[Tuple[int, int, int, int, int]]
     dst_config: Optional[Tuple[int, int, int, int, int]]
     num_experts: Optional[int]
+    # Adding inference nodes leaves the configs and offsets unchanged, so without
+    # world_size the stale pre-growth plan would be reused.
+    world_size: int = 0
     # Rank offsets distinguish non-collocated configurations that would otherwise
     # share the same (rank, sizes, num_experts) tuple but route to different
     # global ranks.
@@ -85,20 +91,26 @@ def _build_plan_cache_key(
     dst_rank_offset: int = 0,
 ) -> _PlanCacheKey:
     """Build cache key for reshard plan."""
-    # group.rank() supports cross-cluster ProcessGroups.
+    # group.rank()/size() support cross-cluster ProcessGroups where members
+    # have independent default PGs.
     rank = group.rank() if group is not None else torch.distributed.get_rank()
+    world_size = group.size() if group is not None else torch.distributed.get_world_size()
     return _PlanCacheKey(
         rank=rank,
         src_config=_get_config_tuple(src_core),
         dst_config=_get_config_tuple(tgt_core),
         num_experts=num_experts,
+        world_size=world_size,
         src_rank_offset=src_rank_offset,
         dst_rank_offset=dst_rank_offset,
     )
 
 
-# Module-level cache for refit services to avoid repeated allocations
-_service_cache: dict[str, CopyService] = {}
+# Module-level cache for refit services to avoid repeated allocations. Services
+# own process-group-specific communicators, so the group identity is part of the
+# key. ``id(group)`` is safe because the cached service retains the group object,
+# preventing its address from being reused while the cache entry exists.
+_service_cache: dict[tuple[str, int | None], CopyService] = {}
 _plan_cache: dict[_PlanCacheKey, Any] = {}
 
 
@@ -109,22 +121,27 @@ def get_or_create_service(backend: RefitBackendName, group=None) -> CopyService:
     when swap_model_weights is called multiple times with the same backend.
 
     Args:
-        backend: Backend name ("nccl", "gloo", or "nvshmem").
-        group: Optional process group for NCCL backend.
+        backend: Backend name ("nccl", "nccl_m2n", "gloo", "nvshmem", or "nixl").
+        group: Optional process group for the backend.
     """
-    if backend in _service_cache:
-        return _service_cache[backend]
+    cache_key = (backend, id(group) if group is not None else None)
+    if cache_key in _service_cache:
+        return _service_cache[cache_key]
 
     if backend == "nccl":
         service = NCCLCopyService(group=group)
+    elif backend == "nccl_m2n":
+        service = NCCLM2NCopyService(group=group)
     elif backend == "gloo":
         service = GlooCopyService(group=group)
     elif backend == "nvshmem":
         service = NVSHMEMCopyService(group=group)
+    elif backend == "nixl":
+        service = NixlCopyService(group=group)
     else:
         raise ValueError(f"Unknown backend '{backend}'")
 
-    _service_cache[backend] = service
+    _service_cache[cache_key] = service
     return service
 
 
@@ -195,7 +212,8 @@ def _build_or_get_plan(src_core, tgt_core, num_experts, group, src_rank_offset, 
     """Return the cached reshard plan, building it (collectively) if not yet cached.
 
     All participating ranks must call this simultaneously when the plan is not
-    yet cached, because build_centralized_reshard_plan uses collective communication.
+    yet cached, because build_local_reshard_plan uses collective communication
+    (an all_gather of parameter metadata).
     """
     global _plan_cache
     cache_key = _build_plan_cache_key(
@@ -207,7 +225,7 @@ def _build_or_get_plan(src_core, tgt_core, num_experts, group, src_rank_offset, 
         dst_rank_offset=dst_rank_offset,
     )
     if cache_key not in _plan_cache:
-        _plan_cache[cache_key] = build_centralized_reshard_plan(
+        _plan_cache[cache_key] = build_local_reshard_plan(
             src_core,
             tgt_core,
             num_experts=num_experts,
@@ -219,7 +237,7 @@ def _build_or_get_plan(src_core, tgt_core, num_experts, group, src_rank_offset, 
 
 
 def _needs_mxfp8_conversion(model) -> bool:
-    """Check if a model uses FlashInfer MXFP8 inference and needs weight conversion."""
+    """Check if a model uses optimized MXFP8 inference and needs weight conversion."""
     if model is None:
         return False
     lm = model[0] if isinstance(model, (list, tuple)) else model
@@ -236,7 +254,7 @@ def _setup_mxfp8_transform_on_plan(plan, target_model) -> None:
     If the *target_model* uses an inference-optimized layer spec with MXFP8,
     this function:
       1. Computes which params are eligible for MXFP8 conversion.
-      2. Quantizes the target model's decoder weights to FlashInfer MXFP8Tensor
+      2. Quantizes the target model's decoder weights to MXFP8Tensor
          (creating persistent buffers whose addresses are later captured by
          CUDA graphs).
       3. Builds an ``MXFP8ReshardTransform`` and attaches it to ``plan.transform``.
@@ -261,13 +279,15 @@ def _setup_mxfp8_transform_on_plan(plan, target_model) -> None:
             convertible.add(f"decoder.{name}")
 
     # 2. Quantize decoder weights → persistent MXFP8Tensor buffers.
-    persistent_buffers = quantize_params_to_mxfp8(decoder)
+    backend = resolve_mxfp8_backend(lm.config.inference_grouped_gemm_backend)
+    persistent_buffers = quantize_params_to_mxfp8(decoder, backend=backend)
 
     # 3. Build the transform and attach it to the plan.
     plan.transform = MXFP8ReshardTransform(
         convertible_params=convertible,
         persistent_buffers=persistent_buffers,
         buffer_key_prefix="decoder.",
+        backend=backend,
     )
 
 
@@ -289,8 +309,8 @@ def prepare_swap_model_weights(
     (``config.transformer_impl == 'inference_optimized'`` and
     ``config.fp8_recipe == 'mxfp8'``), this function also:
       - computes which parameters are eligible for MXFP8 conversion,
-      - quantizes the target decoder weights to persistent FlashInfer
-        MXFP8Tensor buffers (whose addresses are later baked into CUDA graphs),
+      - quantizes the target decoder weights to persistent MXFP8Tensor buffers
+        (whose addresses are later baked into CUDA graphs),
       - creates an ``MXFP8ReshardTransform`` that subsequent
         ``swap_model_weights`` calls use automatically.
 
@@ -451,6 +471,7 @@ def reshard_model_weights(
         src_core, tgt_core, num_experts, group, src_rank_offset, dst_rank_offset
     )
     _harmonize_buffer_dtypes(plan, src_core, tgt_core, group=group)
+    service.set_model_roles(is_source=src_core is not None, is_destination=tgt_core is not None)
     execute_reshard_plan(
         plan, src_core, tgt_core, service=service, group=group, transform=transform
     )

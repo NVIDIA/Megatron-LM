@@ -1,5 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import socket
 from dataclasses import dataclass, field
 
 
@@ -41,4 +42,10 @@ class ServeConfig:
 
     The default of 4 matches the existing ``start_text_gen_server`` default of
     ``num_replicas=4``.
+    """
+
+    sock: socket.socket | None = None
+    """Pre-bound listening socket to serve on instead of binding `host:port`.
+
+    Must already be bound to a real port; when set, `host` / `port` are not used for binding.
     """

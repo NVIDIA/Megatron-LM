@@ -92,6 +92,58 @@ The most optimal num of workers is 16 with avg. preprocessed docs/s: 9606.6476.
 -----------------------------------
 ```
 
+## Fast Preprocessing with GigaToken
+
+For large corpora, `tools/preprocess_data_fast.py` offers a faster alternative to
+`preprocess_data.py`. Instead of splitting documents across `--workers` processes and adding
+them one at a time, it tokenizes whole JSONL files at once with
+[GigaToken](https://pypi.org/project/gigatoken/) and writes the result in a single batched
+call via `IndexedDatasetBuilder.add_documents()`.
+
+Requires the `gigatoken` package (`pip install gigatoken`).
+
+```bash
+python tools/preprocess_data_fast.py \
+    --input data.jsonl \
+    --output-prefix processed_data \
+    --json-keys text \
+    --tokenizer-type HuggingFaceTokenizer \
+    --tokenizer-model /path/to/tokenizer.model \
+    --use-gigatoken \
+    --append-eod
+```
+
+**Key Differences** from `preprocess_data.py`
+
+| | `preprocess_data.py` | `preprocess_data_fast.py` |
+|---|---|---|
+| Tokenization | Per-document, split across `--workers` processes | Whole-file, parallelized internally by `gigatoken` |
+| Dataset writing | `add_document()` per document | Batched `add_documents()` for the whole file |
+| Requires | — | `gigatoken` package, `--use-gigatoken` |
+
+**Key Arguments**
+
+| Argument | Description |
+|----------|-------------|
+| `--input` | Path to input **JSONL** file |
+| `--output-prefix` | Prefix for output binary files (`.bin` and `.idx`) |
+| `--json-keys` | Space-separated list of **JSON** fields to tokenize; each gets its own process and output shard |
+| `--tokenizer-type` / `--tokenizer-model` | Same as `preprocess_data.py` |
+| `--use-gigatoken` | Enable GigaToken-accelerated tokenization (required) |
+| `--append-eod` | Append an end-of-document token to each document |
+
+**Performance**
+
+Benchmarked with the `Qwen/Qwen3-8B` HuggingFace tokenizer, preprocessing whole **JSONL** files:
+
+| Input size | `preprocess_data.py` | `preprocess_data_fast.py` | Speedup |
+|---|---|---|---|
+| 10M lines | 23 min (~7,246 docs/s) | 2.7 min (~61,728 docs/s) | ~8.5x |
+| 80M lines | 214.3 min (~6,222 docs/s) | 25.3 min (~52,701 docs/s) | ~8.5x |
+
+`preprocess_data_fast.py` was consistently **~8.5x faster** across both input sizes, driven by
+whole-file GigaToken tokenization and `IndexedDatasetBuilder.add_documents()`.
+
 ## Output Files
 
 The preprocessing tool generates two files:

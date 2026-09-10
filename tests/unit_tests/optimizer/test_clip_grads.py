@@ -4,6 +4,7 @@ import torch
 
 from megatron.core.optimizer import ChainedOptimizer
 from megatron.core.optimizer.optimizer_config import OptimizerConfig
+from tests.unit_tests.test_utilities import Utils
 
 
 def test_grad_norm_skip_threshold_config():

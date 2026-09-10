@@ -8,7 +8,7 @@ import os
 from dataclasses import asdict, dataclass
 from typing import Optional
 
-from megatron.core.msc_utils import MultiStorageClientFeature
+from megatron.core.msc_utils import maybe_msc
 
 CONFIG_FNAME = 'metadata.json'
 
@@ -57,17 +57,10 @@ def maybe_load_config(checkpoint_dir: str) -> Optional[CheckpointingConfig]:
     """
     config_path = os.path.join(checkpoint_dir, CONFIG_FNAME)
     if checkpoint_dir:
-        if MultiStorageClientFeature.is_enabled():
-            msc = MultiStorageClientFeature.import_package()
-            if not msc.os.path.exists(config_path):
-                return None
-            with msc.open(config_path) as f:
-                config_dict = json.load(f)
-        else:
-            if not os.path.exists(config_path):
-                return None
-            with open(config_path) as f:
-                config_dict = json.load(f)
+        if not maybe_msc.os.path.exists(config_path):
+            return None
+        with maybe_msc.open(config_path) as f:
+            config_dict = json.load(f)
         known_fields = {f.name for f in dataclasses.fields(CheckpointingConfig)}
         return CheckpointingConfig(**{k: v for k, v in config_dict.items() if k in known_fields})
     return None
@@ -84,10 +77,5 @@ def save_config(config: CheckpointingConfig, checkpoint_dir: str):
         None
     """
     config_path = os.path.join(checkpoint_dir, CONFIG_FNAME)
-    if MultiStorageClientFeature.is_enabled():
-        msc = MultiStorageClientFeature.import_package()
-        with msc.open(config_path, 'w') as f:
-            json.dump(asdict(config), f)
-    else:
-        with open(config_path, 'w') as f:
-            json.dump(asdict(config), f)
+    with maybe_msc.open(config_path, 'w') as f:
+        json.dump(asdict(config), f)
