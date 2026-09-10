@@ -271,12 +271,12 @@ def dequantize_fp8_tensor(fp8_tensor: torch.Tensor) -> torch.Tensor:
 def copy_back_gathered_bf16_into_fp8_param(model_p: torch.Tensor, src_bf16: torch.Tensor) -> None:
     """Requantize a gathered bf16 whole-param into an fp8 (Float8/MXFP8) model param in place.
 
-    mxfp8 columnwise can't be derived from rowwise, so force columnwise before copy_ (TE rebuilds
-    both directions from the bf16); blockwise/Float8 columnwise is a lossless transpose.
+    Preserve MXFP8 primary storage directions. A row-only primary (backward override) must
+    not acquire a columnwise copy during parameter synchronization.
     """
     if is_mxfp8tensor(model_p):
         quantizer = model_p.data._get_quantizer()
-        quantizer.set_usage(rowwise=True, columnwise=True)
+        quantizer.set_usage(rowwise=True, columnwise=model_p.data._columnwise_data is not None)
     model_p.data.copy_(src_bf16)
 
 
