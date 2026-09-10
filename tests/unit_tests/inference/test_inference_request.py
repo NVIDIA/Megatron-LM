@@ -385,14 +385,15 @@ def test_dynamic_inference_request_serialize_strips_event_add_engine():
 
 
 @pytest.mark.parametrize(
-    ("return_prompt_tokens", "expected_prompt_field"),
+    ("return_prompt_tokens", "payload_offloaded", "expected_prompt_field"),
     [
-        (False, None),  # default: prompt_tokens dropped from payload
-        (True, ("tensor", [1, 2, 3, 4])),  # opt-in: prompt_tokens preserved
+        (False, False, None),  # default: prompt_tokens dropped from payload
+        (True, False, ("tensor", [1, 2, 3, 4])),  # opt-in: prompt_tokens preserved
+        (True, True, ("tensor", [1, 2, 3, 4])),  # offload preserves explicit prompt
     ],
 )
 def test_dynamic_inference_request_serialize_return_prompt_tokens(
-    return_prompt_tokens, expected_prompt_field
+    return_prompt_tokens, payload_offloaded, expected_prompt_field
 ):
     """DynamicInferenceRequest.serialize() reports prompt_length unconditionally
     (the API uses it for `usage.prompt_tokens` on the response) and drops the
@@ -413,17 +414,22 @@ def test_dynamic_inference_request_serialize_return_prompt_tokens(
         prompt_tokens=prompt, sampling_params=sp, generated_tokens=[10], routing_indices=routing
     )
 
-    obj = req.serialize()
+    obj = req.serialize(payload_offloaded=payload_offloaded)
 
     # prompt_length is always populated (independent of the drop).
     assert obj["prompt_length"] == 4
     # Payload either preserves the tensor wrapper or drops it (present but None).
     assert obj["prompt_tokens"] == expected_prompt_field
+    assert obj["payload_offloaded"] is payload_offloaded
     # Local instance is unaffected — the drop is wire-only.
     assert torch.equal(req.prompt_tokens, prompt)
-    # routing_indices survives the drop path (shape check would have crashed on
-    # the temporarily-None self.prompt_tokens if the fix used self.prompt_tokens).
-    assert isinstance(obj["routing_indices"], tuple) and obj["routing_indices"][0] == "ndarray"
+    # routing_indices survives the prompt-only drop path, but payload offload strips it.
+    # The former's shape check would crash if it used temporarily-None self.prompt_tokens.
+    if payload_offloaded:
+        assert obj["routing_indices"] is None
+    else:
+        assert isinstance(obj["routing_indices"], tuple)
+        assert obj["routing_indices"][0] == "ndarray"
 
 
 def test_dynamic_inference_request_serialize_prompt_length_absent():

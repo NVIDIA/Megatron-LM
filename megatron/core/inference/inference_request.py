@@ -833,13 +833,14 @@ class DynamicInferenceRequest(InferenceRequest):
 
         sampling_params = self.sampling_params
         dropped_fields = {}
-        if self.prompt_tokens is not None and (
+        # Payload offload must not override an explicit request to return prompt
+        # tokens. Some endpoints include those tokens in their response contract.
+        should_drop_prompt_tokens = (
             payload_offloaded
-            or (
-                sampling_params is not None
-                and not getattr(sampling_params, "return_prompt_tokens", False)
-            )
-        ):
+            if sampling_params is None
+            else not getattr(sampling_params, "return_prompt_tokens", False)
+        )
+        if self.prompt_tokens is not None and should_drop_prompt_tokens:
             dropped_fields["prompt_tokens"] = self.prompt_tokens
         if payload_offloaded:
             dropped_fields["generated_log_probs"] = self.generated_log_probs

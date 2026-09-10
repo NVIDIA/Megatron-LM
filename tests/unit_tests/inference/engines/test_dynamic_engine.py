@@ -1201,13 +1201,13 @@ class _RecordingStager:
         return RequestPayloadStageResult()
 
 
-def _reply_request(uid, status, log_probs):
+def _reply_request(uid, status, log_probs, *, streaming=False):
     request = DynamicInferenceRequest(
         request_id=1,
         uid=uid,
         prompt_tokens=torch.tensor([1, 2, 3]),
         sampling_params=SamplingParams(
-            num_tokens_to_generate=2, termination_id=0, return_log_probs=True
+            num_tokens_to_generate=2, termination_id=0, return_log_probs=True, streaming=streaming
         ),
         generated_tokens=[10, 11],
     )
@@ -1216,17 +1216,24 @@ def _reply_request(uid, status, log_probs):
     return request
 
 
-@pytest.mark.parametrize("with_stager", [False, True])
-def test_payload_offload_stages_and_strips_completed_replies(with_stager):
-    """With a stager attached, each completed request's payload is staged once and its reply
-    is stripped and marked; failed requests are neither staged nor stripped. Without a stager
-    the reply is untouched. The ledger is a separate mechanism and stays off here."""
+@pytest.mark.parametrize(
+    ("with_stager", "streaming", "expected_offloaded"),
+    [(False, False, False), (True, False, True), (True, True, False)],
+)
+def test_payload_offload_stages_only_eligible_completed_replies(
+    with_stager, streaming, expected_offloaded
+):
+    """A stager offloads completed non-streaming replies only.
+
+    Failed and streaming requests are neither staged nor stripped, and replies are untouched
+    without a stager. The ledger is a separate mechanism and stays off here.
+    """
     engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
     engine.local_metadata_ledger_enabled = False
     engine.local_metadata_ledger = {}
     engine.payload_stager = _RecordingStager() if with_stager else None
     engine.socket_for_receiving_requests = mock.Mock()
-    completed = _reply_request("chatcmpl-ok", Status.COMPLETED, [-0.5, -0.25])
+    completed = _reply_request("chatcmpl-ok", Status.COMPLETED, [-0.5, -0.25], streaming=streaming)
     failed = _reply_request("chatcmpl-failed", Status.FAILED, None)
     records = [types.SimpleNamespace(merge=lambda r=r: r) for r in (completed, failed)]
 
@@ -1239,7 +1246,8 @@ def test_payload_offload_stages_and_strips_completed_replies(with_stager):
     assert header == Headers.ENGINE_REPLY.value
     assert failed_wire["payload_offloaded"] is False
     assert engine.local_metadata_ledger == {}
-    if with_stager:
+    assert ok_wire["payload_offloaded"] is expected_offloaded
+    if expected_offloaded:
         ((uid, payload),) = engine.payload_stager.staged
         assert uid == "chatcmpl-ok"
         assert payload.prompt_token_ids == [1, 2, 3]
@@ -1247,8 +1255,9 @@ def test_payload_offload_stages_and_strips_completed_replies(with_stager):
         assert payload.generated_log_probs == [-0.5, -0.25]
         assert ok_wire["payload_offloaded"] is True and ok_wire["generated_log_probs"] is None
     else:
-        assert ok_wire["payload_offloaded"] is False
+        assert not getattr(engine.payload_stager, "staged", [])
         assert ok_wire["generated_log_probs"] == [-0.5, -0.25]
+        assert ok_wire["payload_stage_metadata"] == {}
     # Token ids stay on the wire, and the drop is wire-only: the request keeps its log probs.
     assert ok_wire["generated_tokens"] == [10, 11]
     assert completed.generated_log_probs == [-0.5, -0.25]

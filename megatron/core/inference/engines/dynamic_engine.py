@@ -1368,9 +1368,11 @@ class DynamicInferenceEngine(AbstractEngine):
         self.socket_for_receiving_requests.send_multipart(_engine_reply_frames(serialized))
 
     def _serialize_finished_request(self, merged: DynamicInferenceRequest) -> Dict:
-        """Stage an accepted payload before constructing its coordinator reply."""
+        """Stage a non-streaming accepted payload before constructing its coordinator reply."""
         stage_result = None
-        if self.payload_stager is not None:
+        if self.payload_stager is not None and not getattr(
+            merged.sampling_params, "streaming", False
+        ):
             stage_result = self.payload_stager.stage(
                 merged.uid,
                 OffloadedRequestPayload.from_request(merged),

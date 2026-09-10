@@ -297,7 +297,10 @@ try:
             generated_tokens = result.get("generated_tokens") or []
             prompt_tokens_list = result.get("prompt_tokens") or []
             total_completion_tokens += len(generated_tokens)
-            prompt_tokens_counts.append(len(prompt_tokens_list))
+            prompt_token_count = result.get("prompt_length")
+            if prompt_token_count is None:
+                prompt_token_count = len(prompt_tokens_list)
+            prompt_tokens_counts.append(prompt_token_count)
 
             finish_reason = "length"
             sampling_params_result = result.get("sampling_params") or {}
