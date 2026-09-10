@@ -234,7 +234,7 @@ class MegatronModule(torch.nn.Module):
         self._te_cuda_graph_logical_route_numel = None
         self._te_cuda_graph_cp_rank = None
 
-    def _stage_te_cuda_graph_route_metadata(self, packed_seq_params):
+    def _stage_te_cuda_graph_route_metadata(self, packed_seq_params, microbatch_idx=None):
         """Copy two eager owners into this chunk's selected graph arena exactly once."""
         if not getattr(self, "_te_cuda_graph_route_metadata_arenas", ()):
             return packed_seq_params
@@ -277,7 +277,9 @@ class MegatronModule(torch.nn.Module):
         self._validate_route_metadata_pair(
             source_layout, source_route, name="runtime graph-route metadata"
         )
-        arena_layout, arena_route = self.get_te_cuda_graph_route_metadata_arena()
+        if microbatch_idx is None:
+            microbatch_idx = getattr(self, "current_microbatch", 0)
+        arena_layout, arena_route = self.get_te_cuda_graph_route_metadata_arena(microbatch_idx)
         logical_route_numel = getattr(self, "_te_cuda_graph_logical_route_numel", None)
         if not isinstance(logical_route_numel, int) or logical_route_numel <= 0:
             raise RuntimeError("TE CUDA Graph logical route length bookkeeping is malformed")
@@ -301,7 +303,6 @@ class MegatronModule(torch.nn.Module):
         arena_route.narrow(0, 0, logical_route_numel).copy_(source_route)
 
         staged_params = shallow_copy(packed_seq_params)
-        microbatch_idx = getattr(self, "current_microbatch", 0)
         if (
             not isinstance(microbatch_idx, int)
             or isinstance(microbatch_idx, bool)

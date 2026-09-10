@@ -1600,6 +1600,19 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             "HyperConnectionHybridLayer MoE CUDA-graph capture requires "
             "overlap_moe_expert_parallel_comm=False."
         )
+        hidden_states, _, _, _ = self.restore_moe_prefix_after_partial_cudagraph(cuda_graph_output)
+        nvtx_range_push(suffix="mlp")
+        mlp_output_with_bias = self.mlp(hidden_states)
+        self.mlp.cudagraph_tensor_store.clear()
+        nvtx_range_pop(suffix="mlp")
+        return mlp_output_with_bias
+
+    def restore_moe_prefix_after_partial_cudagraph(self, cuda_graph_output):
+        """Restore graph-produced router state without executing dispatch or experts.
+
+        Both the ordinary Hybrid wrapper and its overlap schedule consume this
+        prefix. The latter retains ownership of communication and residual nodes.
+        """
         shared_expert_output, routing_map = None, None
         # The inner residual is the last captured element; the mHC wrapper does not use it
         # (the n-stream BDA combines residual), so drop it.
@@ -1625,17 +1638,13 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             )
             hidden_states, probs, routing_map = cuda_graph_output
 
-        nvtx_range_push(suffix="mlp")
         self.mlp.cudagraph_tensor_store.set(
             hidden_states=hidden_states,
             probs=probs,
             routing_map=routing_map,
             shared_expert_output=shared_expert_output,
         )
-        mlp_output_with_bias = self.mlp(hidden_states)
-        self.mlp.cudagraph_tensor_store.clear()
-        nvtx_range_pop(suffix="mlp")
-        return mlp_output_with_bias
+        return hidden_states, probs, routing_map, shared_expert_output
 
     def _te_cuda_graph_replay_impl(self, args, kwargs, context):
         """Implementation of _te_cuda_graph_replay, separated for replay mode cleanup."""
@@ -1703,7 +1712,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             # If EP overlap is enabled, remaining of mlp will be called as fine_grained_callables
             # and should be skipped here.
             if self.config.overlap_moe_expert_parallel_comm:
-                probs, routing_map = self.mlp.route(hidden_states)
+                probs, routing_map = self.mlp.route(
+                    hidden_states, padding_mask=kwargs.get("padding_mask")
+                )
                 hidden_states, probs = self.mlp.preprocess(hidden_states, probs, routing_map)
                 nvtx_range_pop(suffix="mlp")
                 return residual, hidden_states, probs, shared_expert_output
@@ -1735,7 +1746,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                     hidden_states, residual = hidden_states
 
                 shared_expert_output = self.mlp.shared_experts_compute(hidden_states)
-                probs, routing_map = self.mlp.route(hidden_states)
+                probs, routing_map = self.mlp.route(
+                    hidden_states, padding_mask=kwargs.get("padding_mask")
+                )
                 hidden_states, probs = self.mlp.preprocess(hidden_states, probs, routing_map)
                 return residual, hidden_states, probs, shared_expert_output
 
