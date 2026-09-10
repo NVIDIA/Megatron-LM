@@ -5,7 +5,9 @@
 Add the **`Run selective unit tests`** label to a PR to select H100 unit-test
 **files** affected by the whole PR diff using `pytest-impacted`, including
 transitive import dependencies. PRs without this label run the full unit-test
-suite, including documentation-only PRs. CI adds the 10 baseline files in
+suite, including documentation-only PRs, while recording the tests that would
+be selected. CI runs the `impacted-tests` command on every PR with a valid merge
+comparison, independently of the label. CI adds the 10 baseline files in
 [`unit_tests/always_run_tests.json`](unit_tests/always_run_tests.json)
 to every selection, maps the union to the existing buckets, and launches only
 buckets with selected files. Each file can contain multiple parametrized test
@@ -24,14 +26,15 @@ configuration, GPT construction, and checkpoint mappings. Edit the JSON list to
 change the baseline; entries must be unique, existing unit-test files owned by a
 CI bucket. Changes to the baseline itself run the full suite for validation.
 
-| Build or change | H100 unit tests |
-| --- | --- |
-| PR without `Run selective unit tests`, including documentation-only PRs | Full suite |
-| PR labeled `Run selective unit tests`, source or test changes | Affected files plus the baseline |
-| Documentation-only PR labeled `Run selective unit tests` | Baseline only |
-| PR labeled `Run full unit tests`, including when both labels are present | Full suite |
-| Merge queue, nightly/CI workload, manual dispatch | Full suite |
-| Unsupported change or failed/ambiguous analysis | Full suite |
+| Build or change | Impact analysis | H100 unit tests executed |
+| --- | --- | --- |
+| PR without `Run selective unit tests`, including documentation-only PRs | Record proposed selection | Full suite |
+| PR labeled `Run selective unit tests`, source or test changes | Record proposed selection | Affected files plus the baseline |
+| Documentation-only PR labeled `Run selective unit tests` | Record proposed selection | Baseline only |
+| PR labeled `Run full unit tests`, including when both labels are present | Record proposed selection | Full suite |
+| Merge queue, nightly/CI workload, manual dispatch | No PR analysis | Full suite |
+| High-impact or unsupported PR change | Record command result and full-suite policy reason | Full suite |
+| Missing merge history or failed/ambiguous analysis | Record unavailability or failure | Full suite |
 
 `Run tests` and `Run functional tests` retain their functional-test behavior;
 they do not enable or disable unit-test selection. The older
@@ -39,14 +42,14 @@ they do not enable or disable unit-test selection. The older
 Use `Run selective unit tests`; analysis always covers the entire PR, including
 changes in earlier commits. The full-suite override takes precedence.
 
-For labeled PRs, CI compares the exact synthetic merge commit being built and
+For every PR, CI compares the exact synthetic merge commit being built and
 tested with its first parent (`git diff HEAD^1 HEAD`). That parent is the
 revision of `main` used to create the merge, so the comparison includes all PR
 changes without including unrelated changes already on `main`. It does not
 depend on the base SHA reported separately in PR metadata. The selection
 artifact records `tested_sha` and `diff_base_sha`, and the job summary shows
-the comparison. `diff_base_sha` is null when selection is bypassed before a
-comparison base is established, such as for an unlabeled PR.
+the comparison. `diff_base_sha` is null when no PR comparison base can be
+established, such as for non-PR runs or missing merge history.
 
 Selection is conservative: missing/invalid base commits, selector errors,
 timeouts, deleted or renamed files, shared fixtures, test runners, dependency
@@ -58,9 +61,9 @@ analyzed base must be an exact ancestor of the same commit used by test jobs.
 Static imports cannot prove complete runtime coverage of dynamic imports,
 plugins, or monkeypatching; the full merge-queue suite remains the final check.
 
-The selection summary reports the mode, fallback reason, affected and baseline
-file counts, total selected files, buckets, and selector overhead. The dependency
-graph is rebuilt on each selective run, so there is no persistent impact cache. Invalid
+The selection summary reports execution mode alongside the proposed selection,
+fallback reason, affected and baseline file counts, buckets, and selector
+overhead. The dependency graph is rebuilt for each PR, so there is no persistent impact cache. Invalid
 per-job payloads and selections that collect no runnable tests fail the job.
 
 ### Compare runs with and without selection
@@ -73,6 +76,24 @@ It contains `unit-test-metrics.json`, `unit-test-metrics.csv`, and
 manifest. Compare `selective_label_present` and `mode` together:
 a labeled PR can still fall back to the full suite, with the reason recorded in
 `selection_reason`.
+
+The selection manifest separates three results:
+
+- Top-level `mode`, `selected_count`, and `matrix` describe what CI schedules.
+- `candidate_selection` records the plan that selective execution would use,
+  including the baseline and full-suite safety rules. Its `selected_files`
+  lists exact files in selective mode; full mode uses the complete bucket matrix.
+- `impact_analysis` records whether `impacted-tests` succeeded, failed, or was
+  not run, plus its validated suggestions and raw output paths. These suggestions
+  do not include the baseline and cannot override full-suite safety rules.
+
+An unlabeled PR can therefore have `mode: full` and
+`candidate_selection.mode: selective`. A CI-infrastructure change can have a
+full candidate even when the command returns fewer files. Missing candidate
+data is null, and failed analysis never appears as a successful zero-test plan.
+The comparison metrics expose `candidate_mode`, `candidate_file_count`,
+`candidate_bucket_count`, and `impact_analysis_status` in JSON, CSV, and Markdown.
+Job durations and outcomes always describe the execution matrix.
 
 Download a run's metrics with:
 
@@ -130,6 +151,12 @@ uv run --locked --project .github/test-selection \
 fallback. For committed changes, replace `--git-mode unstaged` with
 `--git-mode branch --base-ref "$(git merge-base <base-branch> HEAD)"`, using your
 current target branch. The report contains the selected files and CI matrix.
+
+Add `--record-impact` to record the command's output even when a policy requires
+the full suite. Add `--execute-full 'comparison data only'` with it to reproduce
+an unlabeled PR: compute the candidate selection while producing a full execution
+matrix. `--force-full` bypasses analysis and is reserved for runs without a valid
+PR comparison or for hard failures.
 
 To execute the selection, use the **GPU development environment** rather than
 the selector environment, which only contains analysis dependencies:

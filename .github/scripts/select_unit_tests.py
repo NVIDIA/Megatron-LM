@@ -482,25 +482,25 @@ def _full_report(
     }
 
 
-def select_unit_tests(
+def _select_candidate(
     repo_root: Path,
     buckets: Sequence[str],
+    ownership: dict[str, set[str]],
     changes: Sequence[Change],
     git_mode: str,
     base_ref: str | None,
-    force_full: str | None = None,
     runner: SelectorRunner = _run_command,
     always_run_file: Path | None = None,
+    analysis_result: CommandResult | None = None,
+    analysis_error: str | None = None,
 ) -> dict[str, object]:
-    """Return a deterministic selective/full report for CI and local use."""
-
-    ownership = build_bucket_ownership(repo_root, buckets)
-    if force_full:
-        return _full_report(force_full, buckets, ownership, changes)
+    """Apply conservative selection policy to optional, already recorded analysis."""
 
     policy_reason = full_run_reason(repo_root, changes)
     if policy_reason:
         return _full_report(policy_reason, buckets, ownership, changes)
+    if analysis_error:
+        return _full_report(analysis_error, buckets, ownership, changes)
 
     baseline_path = always_run_file or ALWAYS_RUN_FILE
     if not baseline_path.is_absolute():
@@ -517,11 +517,15 @@ def select_unit_tests(
     )
     impacted: set[str] = set()
     if not documentation_only:
-        input_error = analysis_input_error(repo_root)
+        input_error = None if analysis_result is not None else analysis_input_error(repo_root)
         if input_error:
             return _full_report(input_error, buckets, ownership, changes)
         try:
-            result = run_pytest_impacted(repo_root, git_mode, base_ref, runner=runner)
+            result = (
+                analysis_result
+                if analysis_result is not None
+                else run_pytest_impacted(repo_root, git_mode, base_ref, runner=runner)
+            )
         except (OSError, subprocess.SubprocessError, ValueError) as error:
             return _full_report(
                 f"pytest-impacted could not run: {error}", buckets, ownership, changes
@@ -599,6 +603,115 @@ def select_unit_tests(
     }
 
 
+def select_unit_tests(
+    repo_root: Path,
+    buckets: Sequence[str],
+    changes: Sequence[Change],
+    git_mode: str,
+    base_ref: str | None,
+    force_full: str | None = None,
+    runner: SelectorRunner = _run_command,
+    always_run_file: Path | None = None,
+    record_impact: bool = False,
+    execute_full: str | None = None,
+) -> dict[str, object]:
+    """Record one analysis, its safe candidate plan, and the actual execution plan.
+
+    ``record_impact`` measures the analyzer even for changes whose candidate
+    policy requires the full suite. ``execute_full`` preserves that candidate
+    while executing all tests. ``force_full`` skips analysis entirely when no
+    valid comparison is available or the workflow is outside PR analysis.
+    """
+
+    if force_full and execute_full:
+        raise ValueError("force_full and execute_full are mutually exclusive")
+    ownership = build_bucket_ownership(repo_root, buckets)
+    analysis: dict[str, object] = {
+        "status": "not_run",
+        "reason": force_full or "selection policy did not require impact analysis",
+        "selected_files": None,
+        "selected_count": None,
+        "raw_selected_files": [],
+        "returncode": None,
+        "duration_seconds": None,
+    }
+
+    def recording_runner(command: Sequence[str], cwd: Path) -> CommandResult:
+        started_at = time.monotonic()
+        sys.stderr.write(f"Running impact analysis: {' '.join(command)}\n")
+        try:
+            result = runner(command, cwd)
+        except (OSError, subprocess.SubprocessError, ValueError) as error:
+            analysis.update(
+                status="failed",
+                reason=f"pytest-impacted could not run: {error}",
+                duration_seconds=round(time.monotonic() - started_at, 3),
+            )
+            raise
+        analysis.update(
+            returncode=result.returncode,
+            duration_seconds=round(time.monotonic() - started_at, 3),
+            raw_selected_files=[
+                line.strip() for line in result.stdout.splitlines() if line.strip()
+            ],
+        )
+        files, output_error = _normalize_selector_output(repo_root, result.stdout)
+        if result.returncode != 0:
+            error_reason = f"pytest-impacted failed with exit code {result.returncode}"
+        elif UNSAFE_SELECTOR_OUTPUT.search(" ".join(result.stderr.split())):
+            error_reason = "pytest-impacted reported an analysis error"
+        else:
+            error_reason = output_error
+            if error_reason is None and record_impact:
+                error_reason = analysis_input_error(repo_root)
+        if error_reason:
+            analysis.update(status="failed", reason=error_reason)
+        else:
+            analysis.update(
+                status="succeeded",
+                reason="pytest-impacted completed successfully",
+                selected_files=sorted(files),
+                selected_count=len(files),
+            )
+        return result
+
+    if force_full:
+        candidate = None
+        report = _full_report(force_full, buckets, ownership, changes)
+    else:
+        recorded_result = None
+        if record_impact:
+            try:
+                recorded_result = run_pytest_impacted(
+                    repo_root, git_mode, base_ref, runner=recording_runner
+                )
+            except (OSError, subprocess.SubprocessError, ValueError) as error:
+                # This also covers setup failures before the subprocess runner.
+                analysis.update(status="failed", reason=f"pytest-impacted could not run: {error}")
+        candidate = _select_candidate(
+            repo_root=repo_root,
+            buckets=buckets,
+            ownership=ownership,
+            changes=changes,
+            git_mode=git_mode,
+            base_ref=base_ref,
+            runner=recording_runner,
+            always_run_file=always_run_file,
+            analysis_result=recorded_result,
+            analysis_error=(str(analysis["reason"]) if analysis["status"] == "failed" else None),
+        )
+        if analysis["status"] == "not_run":
+            analysis["reason"] = candidate["reason"]
+        report = (
+            _full_report(execute_full, buckets, ownership, changes)
+            if execute_full
+            else dict(candidate)
+        )
+    report["candidate_selection"] = candidate
+    report["impact_analysis"] = analysis
+    return report
+
+
 def write_summary(report: dict[str, object], destination: Path) -> None:
     """Write a human-readable GitHub step summary for a selection report."""
 
@@ -625,6 +738,23 @@ def write_summary(report: dict[str, object], destination: Path) -> None:
             [
                 f"| Impacted test files | `{report['impacted_count']}` |",
                 f"| Always-run test files | `{report['always_run_count']}` |",
+            ]
+        )
+    analysis = report.get("impact_analysis")
+    if isinstance(analysis, dict):
+        lines.extend(
+            [
+                f"| Impact analysis status | `{analysis['status']}` |",
+                f"| Analyzer unit-test suggestions | `{analysis['selected_count']}` |",
+            ]
+        )
+    candidate = report.get("candidate_selection")
+    if isinstance(candidate, dict):
+        lines.extend(
+            [
+                f"| Candidate selection mode | `{candidate['mode']}` |",
+                f"| Candidate test files | `{candidate['selected_count']}` / `{total_count}` |",
+                f"| Candidate reason | {candidate['reason']} |",
             ]
         )
     selected_files = report.get("selected_files")
@@ -671,7 +801,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--always-run-file", type=Path, default=ALWAYS_RUN_FILE)
     parser.add_argument("--git-mode", choices=("branch", "unstaged"), default="branch")
     parser.add_argument("--base-ref")
-    parser.add_argument("--force-full", metavar="REASON")
+    execution = parser.add_mutually_exclusive_group()
+    execution.add_argument("--force-full", metavar="REASON", help="Skip analysis and run all tests")
+    execution.add_argument(
+        "--execute-full", metavar="REASON", help="Record a candidate plan but run all tests"
+    )
+    parser.add_argument(
+        "--record-impact",
+        action="store_true",
+        help="Run impact analysis once even when selection policy requires the full suite",
+    )
     parser.add_argument("--output", type=Path, default=Path("unit-test-selection.json"))
     parser.add_argument("--summary", type=Path)
     parser.add_argument("--run", action="store_true", help="Run the selected tests locally")
@@ -703,10 +842,14 @@ def main() -> int:
             base_ref=args.base_ref,
             force_full=args.force_full,
             always_run_file=args.always_run_file,
+            record_impact=args.record_impact,
+            execute_full=args.execute_full,
         )
     except (OSError, subprocess.SubprocessError, ValueError) as error:
-        ownership = build_bucket_ownership(repo_root, buckets)
-        report = _full_report(f"selector setup failed: {error}", buckets, ownership, [])
+        reason = f"selector setup failed: {error}"
+        report = select_unit_tests(
+            repo_root, buckets, [], args.git_mode, args.base_ref, force_full=reason
+        )
     report["selector_duration_seconds"] = round(time.monotonic() - started_at, 3)
 
     output = args.output

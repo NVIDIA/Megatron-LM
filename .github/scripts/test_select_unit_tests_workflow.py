@@ -25,6 +25,9 @@ class TestUnitTestWorkflow(unittest.TestCase):
         self.root = Path(temporary_directory.name)
         self.bin = self.root / "bin"
         self.bin.mkdir()
+        selector = self.root / ".github/scripts/select_unit_tests.py"
+        selector.parent.mkdir(parents=True)
+        shutil.copyfile(WORKFLOW.parents[1] / "scripts/select_unit_tests.py", selector)
         self.workflow = yaml.safe_load(WORKFLOW.read_text())
         self.environment = {
             **os.environ,
@@ -57,7 +60,9 @@ print(os.environ['TEST_LABELS'] if sys.argv[1] == 'pr' else '0')
         self._command(
             "uv",
             """
-import os, sys
+import json, os, sys
+from pathlib import Path
+Path('uv-args.json').write_text(json.dumps(sys.argv[1:]))
 if os.environ.get('TEST_SELECTOR_FAILURE'):
     sys.exit(1)
 args = sys.argv[sys.argv.index('python'):]
@@ -69,13 +74,29 @@ os.execvp(args[0], args)
             """
 import json, os, sys
 from pathlib import Path
+if sys.argv[1] == '-c':
+    os.execv(sys.executable, [sys.executable, *sys.argv[1:]])
 args = sys.argv[2:]
 Path('selector-args.json').write_text(json.dumps(args))
-full = '--force-full' in args
+hard_full = '--force-full' in args
+full = hard_full or '--execute-full' in args
+candidate = {
+    'mode': 'selective', 'reason': 'impacted plus baseline',
+    'selected_files': ['tests/unit_tests/test_example.py'], 'selected_count': 1,
+    'total_count': 4,
+    'matrix': [{'bucket': 'tests/unit_tests/**/*.py', 'unit_test_files': 'selected'}],
+}
 matrix = [{'bucket': 'tests/unit_tests/**/*.py', 'unit_test_files': '' if full else 'selected'}]
-if os.environ.get('TEST_INVALID_MATRIX') and not full:
+if os.environ.get('TEST_INVALID_MATRIX') and not hard_full:
     matrix = []
-Path(args[args.index('--output') + 1]).write_text(json.dumps({'matrix': matrix}))
+report = {
+    'mode': 'full' if full else 'selective', 'matrix': matrix,
+    'reason': 'workflow regression fixture',
+    'selected_count': 4 if full else 1, 'total_count': 4,
+    'candidate_selection': None if hard_full else candidate,
+    'impact_analysis': {'status': 'not_run' if hard_full else 'succeeded'},
+}
+Path(args[args.index('--output') + 1]).write_text(json.dumps(report))
 Path(args[args.index('--summary') + 1]).write_text('Full suite' if full else 'Selected tests')
 """,
         )
@@ -95,6 +116,7 @@ Path(args[args.index('--summary') + 1]).write_text('Full suite' if full else 'Se
     def _run(self, job, name, **environment):
         output_path = self.root / "output"
         output_path.write_text("")
+        (self.root / "uv-args.json").unlink(missing_ok=True)
         result = subprocess.run(
             ["bash", "-e", "-u", "-o", "pipefail", "-c", self._step(job, name)["run"]],
             cwd=self.root,
@@ -248,25 +270,82 @@ Path(args[args.index('--summary') + 1]).write_text('Full suite' if full else 'Se
                 self.assertIn(tested_merge, summary)
                 self.assertIn(base, summary)
 
-    def test_selector_failure_or_disabled_selection_falls_back_to_full_matrix(self):
+    def test_selector_failure_falls_back_to_full_without_fake_candidate_data(self):
         self._merge_commit()
-        cases = [
-            {"TEST_SELECTOR_FAILURE": "true"},
-            {"TEST_INVALID_MATRIX": "true"},
-            {"SELECTIVE_TESTS": "false", "UNIT_TEST_REASON": "full suite requested"},
-        ]
+        cases = [{"TEST_SELECTOR_FAILURE": "true"}, {"TEST_INVALID_MATRIX": "true"}]
         for environment in cases:
-            with self.subTest(environment=environment):
+            for selective in ("true", "false"):
+                with self.subTest(environment=environment, selective=selective):
+                    result, outputs = self._run(
+                        "cicd-parse-unit-tests",
+                        "Parse unit tests",
+                        SELECTIVE_TESTS=selective,
+                        **environment,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(json.loads(outputs["unit-tests"])[0]["unit_test_files"], "")
+                    args = json.loads((self.root / "selector-args.json").read_text())
+                    self.assertIn("--force-full", args)
+                    manifest = json.loads((self.root / "unit-test-selection.json").read_text())
+                    self.assertIsNone(manifest["candidate_selection"])
+                    self.assertEqual(manifest["impact_analysis"]["status"], "failed")
+                    self.assertIsNone(manifest["impact_analysis"]["selected_count"])
+                    summary = (self.root / "unit-test-selection-summary.md").read_text()
+                    self.assertIn("| Impact analysis status | `failed` |", summary)
+                    self.assertNotIn("`not_run`", summary)
+
+    def test_every_pr_records_a_candidate_but_labels_control_execution(self):
+        base = self._merge_commit()
+        setup_uv = self._step("cicd-parse-unit-tests", "Setup uv")
+        self.assertNotIn("selective_tests", setup_uv["if"])
+        cases = [
+            ([], {}, "full"),
+            (["Run selective unit tests"], {}, "selective"),
+            (["Run selective unit tests", "Run full unit tests"], {}, "full"),
+            (["Run selective unit tests"], {"FORCE_RUN_ALL": "true"}, "full"),
+        ]
+        for labels, environment, expected_mode in cases:
+            with self.subTest(labels=labels, environment=environment):
+                config = self._configure(labels, **environment)
                 result, outputs = self._run(
-                    "cicd-parse-unit-tests", "Parse unit tests", **environment
+                    "cicd-parse-unit-tests",
+                    "Parse unit tests",
+                    SELECTIVE_TESTS=config["selective_tests"],
+                    UNIT_TEST_REASON=config["unit_test_reason"],
+                    **environment,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                uv_args = json.loads((self.root / "uv-args.json").read_text())
+                self.assertIn("--record-impact", uv_args)
+                self.assertNotIn("--force-full", uv_args)
+                self.assertEqual(uv_args[uv_args.index("--base-ref") + 1], base)
+                self.assertEqual("--execute-full" in uv_args, expected_mode == "full")
+                manifest = json.loads((self.root / "unit-test-selection.json").read_text())
+                self.assertEqual(manifest["mode"], expected_mode)
+                self.assertEqual(manifest["diff_base_sha"], base)
+                self.assertEqual(manifest["impact_analysis"]["status"], "succeeded")
+                candidate = manifest["candidate_selection"]
+                self.assertEqual(candidate["mode"], "selective")
+                self.assertEqual(candidate["selected_files"], ["tests/unit_tests/test_example.py"])
+                actual_matrix = json.loads(outputs["unit-tests"])
+                if expected_mode == "selective":
+                    self.assertEqual(actual_matrix, candidate["matrix"])
+                else:
+                    self.assertEqual(actual_matrix[0]["unit_test_files"], "")
+
+    def test_non_pr_triggers_do_not_run_pr_impact_analysis(self):
+        self._merge_commit()
+        for event in ("merge_group", "workflow_dispatch", "schedule"):
+            with self.subTest(event=event):
+                result, outputs = self._run(
+                    "cicd-parse-unit-tests", "Parse unit tests", IS_PR="false", EVENT_NAME=event
                 )
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(json.loads(outputs["unit-tests"])[0]["unit_test_files"], "")
-                args = json.loads((self.root / "selector-args.json").read_text())
-                self.assertIn("--force-full", args)
-                if environment.get("SELECTIVE_TESTS") == "false":
-                    manifest = json.loads((self.root / "unit-test-selection.json").read_text())
-                    self.assertIsNone(manifest["diff_base_sha"])
+                self.assertFalse((self.root / "uv-args.json").exists())
+                manifest = json.loads((self.root / "unit-test-selection.json").read_text())
+                self.assertIsNone(manifest["candidate_selection"])
+                self.assertEqual(manifest["impact_analysis"]["status"], "not_run")
 
     def test_non_merge_commit_falls_back_to_full_matrix_without_comparison_base(self):
         base = self._merge_commit()
@@ -282,6 +361,7 @@ Path(args[args.index('--summary') + 1]).write_text('Full suite' if full else 'Se
                 manifest = json.loads((self.root / "unit-test-selection.json").read_text())
                 self.assertEqual(manifest["tested_sha"], ref)
                 self.assertIsNone(manifest["diff_base_sha"])
+                self.assertFalse((self.root / "uv-args.json").exists())
                 self.assertEqual(self._git("rev-parse", "HEAD"), ref)
 
     def test_missing_merge_base_object_falls_back_to_full_matrix(self):
@@ -327,7 +407,7 @@ Path(args[args.index('--summary') + 1]).write_text('Full suite' if full else 'Se
     def test_collection_step_records_data_with_and_without_label(self):
         reporter = WORKFLOW.parents[1] / "scripts/report_unit_test_selection.py"
         destination = self.root / ".github/scripts/report_unit_test_selection.py"
-        destination.parent.mkdir(parents=True)
+        destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(reporter, destination)
         plan_dir = self.root / "unit-test-plan"
         plan_dir.mkdir()
@@ -356,6 +436,18 @@ Path(args[args.index('--summary') + 1]).write_text('Full suite' if full else 'Se
                     "matrix": [{"bucket": bucket, "unit_test_files": ""}],
                     "selector_duration_seconds": 0.1,
                     "planning_duration_seconds": 2,
+                    "candidate_selection": {
+                        "mode": "selective",
+                        "reason": "impacted plus baseline",
+                        "selected_count": 11,
+                        "matrix": [{"bucket": bucket, "unit_test_files": "selected"}],
+                    },
+                    "impact_analysis": {
+                        "status": "succeeded",
+                        "selected_count": 1,
+                        "duration_seconds": 0.05,
+                        "selected_files": ["tests/unit_tests/test_example.py"],
+                    },
                 }
                 (plan_dir / "unit-test-selection.json").write_text(json.dumps(plan))
                 result, _ = self._run(
@@ -372,6 +464,9 @@ Path(args[args.index('--summary') + 1]).write_text('Full suite' if full else 'Se
                 self.assertEqual(report["selective_label_present"], label == "true")
                 self.assertEqual(report["mode"], mode)
                 self.assertEqual(report["selected_file_count"], selected)
+                self.assertEqual(report["candidate_mode"], "selective")
+                self.assertEqual(report["candidate_file_count"], 11)
+                self.assertEqual(report["impact_analysis_status"], "succeeded")
                 self.assertEqual(report["sum_job_execution_seconds"], 20)
                 self.assertTrue(report["timing_complete"])
                 self.assertTrue((metrics / "unit-test-metrics.csv").is_file())

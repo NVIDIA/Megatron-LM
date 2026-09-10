@@ -42,6 +42,27 @@ class TestUnitTestSelectionReport(unittest.TestCase):
             self._job(0, "2026-09-09T12:00:00Z", "2026-09-09T12:01:00Z"),
             self._job(1, "2026-09-09T12:00:30Z", "2026-09-09T12:02:30Z"),
         ]
+        self.candidate = {
+            "mode": "selective",
+            "reason": "impacted files plus baseline",
+            "selected_count": 2,
+            "total_count": 500,
+            "matrix": self.selection["matrix"][:1],
+            "selected_files": [
+                "tests/unit_tests/models/test_gpt_model.py",
+                "tests/unit_tests/models/test_baseline.py",
+            ],
+            "impacted_count": 1,
+            "always_run_count": 1,
+        }
+        self.analysis = {
+            "status": "succeeded",
+            "reason": "impacted-tests completed successfully",
+            "selected_files": self.candidate["selected_files"][:1],
+            "selected_count": 1,
+            "returncode": 0,
+            "duration_seconds": 0.5,
+        }
 
     def _job(self, index: int, start: str, end: str) -> dict:
         return {
@@ -99,6 +120,120 @@ class TestUnitTestSelectionReport(unittest.TestCase):
                 self.assertEqual(report["selection_reason"], "safe full fallback")
                 self.assertEqual(report["selected_file_count"], 500)
                 self.assertTrue(report["timing_complete"])
+
+    def test_unlabelled_full_run_records_smaller_candidate_without_reducing_actual_timings(
+        self,
+    ) -> None:
+        self.metadata["selective_label_present"] = False
+        self.selection.update(
+            mode="full",
+            reason="selective label is absent",
+            selected_count=500,
+            total_bucket_count=2,
+            candidate_selection=self.candidate,
+            impact_analysis=self.analysis,
+        )
+        report = self._report()
+        self.assertEqual(report["mode"], "full")
+        self.assertEqual(report["selected_file_count"], 500)
+        self.assertEqual(report["selected_bucket_count"], 2)
+        self.assertEqual(report["expected_job_count"], 2)
+        self.assertEqual(report["observed_job_count"], 2)
+        self.assertEqual(report["sum_job_execution_seconds"], 180)
+        self.assertEqual(report["job_execution_span_seconds"], 150)
+        self.assertTrue(report["timing_complete"])
+        self.assertEqual(report["candidate_mode"], "selective")
+        self.assertEqual(report["candidate_reason"], self.candidate["reason"])
+        self.assertEqual(report["candidate_file_count"], 2)
+        self.assertEqual(report["candidate_bucket_count"], 1)
+        self.assertEqual(report["candidate_selected_files"], self.candidate["selected_files"])
+        self.assertEqual(report["impact_analysis_status"], "succeeded")
+        self.assertEqual(report["impact_analysis_selected_count"], 1)
+        self.assertEqual(report["impact_analysis_selected_files"], self.analysis["selected_files"])
+        self.assertEqual(report["impact_analysis_duration_seconds"], 0.5)
+        summary = render_summary(report)
+        self.assertIn("Candidate test files / H100 buckets | 2 / 1", summary)
+        self.assertIn("Candidate counts do not change the actual jobs measured here", summary)
+
+    def test_labelled_run_measures_executed_candidate_jobs(self) -> None:
+        self.selection.update(
+            self.candidate, candidate_selection=self.candidate, impact_analysis=self.analysis
+        )
+        report = self._report(self.jobs[:1])
+        self.assertTrue(report["selective_label_present"])
+        self.assertEqual(report["mode"], "selective")
+        self.assertEqual(report["selected_file_count"], report["candidate_file_count"])
+        self.assertEqual(report["selected_bucket_count"], report["candidate_bucket_count"])
+        self.assertEqual(report["expected_job_count"], 1)
+        self.assertEqual(report["sum_job_execution_seconds"], 60)
+        self.assertTrue(report["timing_complete"])
+
+    def test_failed_analysis_keeps_full_fallback_and_actual_job_timings(self) -> None:
+        self.selection.update(mode="full", selected_count=500)
+        self.selection["candidate_selection"] = {
+            **self.selection,
+            "reason": "impact analysis failed",
+        }
+        self.selection["impact_analysis"] = {
+            "status": "failed",
+            "reason": "impacted-tests exited with status 1",
+            "selected_files": None,
+            "selected_count": None,
+            "raw_selected_files": ["an invalid command result"],
+            "returncode": 1,
+            "duration_seconds": 0.3,
+        }
+        report = self._report()
+        self.assertEqual(report["candidate_mode"], "full")
+        self.assertEqual(report["candidate_file_count"], 500)
+        self.assertEqual(report["impact_analysis_status"], "failed")
+        self.assertIn("status 1", report["impact_analysis_reason"])
+        self.assertIsNone(report["impact_analysis_selected_count"])
+        self.assertIsNone(report["impact_analysis_selected_files"])
+        self.assertEqual(
+            report["impact_analysis_raw_selected_files"], ["an invalid command result"]
+        )
+        self.assertEqual(report["impact_analysis_duration_seconds"], 0.3)
+        self.assertTrue(report["timing_complete"])
+        self.assertEqual(report["sum_job_execution_seconds"], 180)
+
+    def test_old_manifest_and_unavailable_analysis_preserve_null_observations(self) -> None:
+        for observation in (
+            {},
+            {"candidate_selection": None, "impact_analysis": None},
+            {
+                "candidate_selection": None,
+                "impact_analysis": {"status": "not_run", "reason": "not a PR"},
+            },
+        ):
+            with self.subTest(observation=observation):
+                report = build_report(
+                    {**self.selection, **observation}, {"jobs": self.jobs}, self.metadata
+                )
+                for field in (
+                    "candidate_mode",
+                    "candidate_file_count",
+                    "candidate_bucket_count",
+                    "candidate_selected_files",
+                    "impact_analysis_selected_count",
+                    "impact_analysis_selected_files",
+                    "impact_analysis_duration_seconds",
+                ):
+                    self.assertIsNone(report[field], field)
+                self.assertTrue(report["timing_complete"])
+                self.assertEqual(report["sum_job_execution_seconds"], 180)
+
+    def test_successful_empty_analysis_is_distinct_from_unavailable(self) -> None:
+        self.selection["impact_analysis"] = {
+            **self.analysis,
+            "selected_files": [],
+            "selected_count": 0,
+        }
+        report = self._report()
+        self.assertEqual(report["impact_analysis_status"], "succeeded")
+        self.assertEqual(report["impact_analysis_selected_count"], 0)
+        self.assertEqual(report["impact_analysis_selected_files"], [])
+        self.assertTrue(report["timing_complete"])
 
     def test_missing_job_preserves_partial_measurements_without_complete_totals(self) -> None:
         report = self._report(self.jobs[:1])
@@ -205,6 +340,7 @@ class TestUnitTestSelectionReport(unittest.TestCase):
 
     def test_cli_writes_json_csv_markdown_and_preserves_unknown_label(self) -> None:
         script = Path(__file__).with_name("report_unit_test_selection.py")
+        self.selection.update(candidate_selection=self.candidate, impact_analysis=self.analysis)
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             selection = root / "selection.json"
@@ -250,6 +386,15 @@ class TestUnitTestSelectionReport(unittest.TestCase):
                     self.assertEqual(
                         records[0]["sum_job_execution_seconds"], "" if missing_inputs else "180.0"
                     )
+                    for field, expected in (
+                        ("candidate_mode", "selective"),
+                        ("candidate_file_count", "2"),
+                        ("candidate_bucket_count", "1"),
+                        ("impact_analysis_status", "succeeded"),
+                        ("impact_analysis_selected_count", "1"),
+                        ("impact_analysis_duration_seconds", "0.5"),
+                    ):
+                        self.assertEqual(records[0][field], "" if missing_inputs else expected)
                     self.assertTrue((root / "metrics/unit-test-metrics.md").is_file())
 
 

@@ -34,6 +34,14 @@ CSV_FIELDS = (
     "total_file_count",
     "selected_bucket_count",
     "total_bucket_count",
+    "candidate_mode",
+    "candidate_reason",
+    "candidate_file_count",
+    "candidate_bucket_count",
+    "impact_analysis_status",
+    "impact_analysis_reason",
+    "impact_analysis_selected_count",
+    "impact_analysis_duration_seconds",
     "selector_duration_seconds",
     "planning_duration_seconds",
     "expected_job_count",
@@ -75,6 +83,68 @@ def _timestamp(value: object) -> datetime | None:
     if timestamp.tzinfo is None or timestamp.year < 2000:
         return None
     return timestamp
+
+
+def _selection_observation(selection: dict[str, Any]) -> dict[str, Any]:
+    """Read hypothetical selections without changing actual execution measurements."""
+
+    candidate = selection.get("candidate_selection")
+    candidate = candidate if isinstance(candidate, dict) else {}
+    candidate_mode = candidate.get("mode")
+    if not isinstance(candidate_mode, str) or candidate_mode not in {"full", "selective"}:
+        candidate_mode = None
+    matrix = candidate.get("matrix")
+    candidate_buckets = (
+        [entry.get("bucket") if isinstance(entry, dict) else None for entry in matrix]
+        if isinstance(matrix, list) and matrix
+        else None
+    )
+    if candidate_buckets is not None and (
+        any(
+            not isinstance(bucket, str) or not bucket.startswith("tests/unit_tests/")
+            for bucket in candidate_buckets
+        )
+        or len(set(candidate_buckets)) != len(candidate_buckets)
+    ):
+        candidate_buckets = None
+    candidate_files = candidate.get("selected_files")
+    if not isinstance(candidate_files, list) or not all(
+        isinstance(path, str) for path in candidate_files
+    ):
+        candidate_files = None
+
+    analysis = selection.get("impact_analysis")
+    analysis = analysis if isinstance(analysis, dict) else {}
+    status = analysis.get("status")
+    if not isinstance(status, str) or status not in {"succeeded", "failed", "not_run"}:
+        status = None
+    impacted_files = analysis.get("selected_files")
+    if (
+        status != "succeeded"
+        or not isinstance(impacted_files, list)
+        or not all(isinstance(path, str) for path in impacted_files)
+    ):
+        impacted_files = None
+    raw_impacted_files = analysis.get("raw_selected_files")
+    if not isinstance(raw_impacted_files, list) or not all(
+        isinstance(path, str) for path in raw_impacted_files
+    ):
+        raw_impacted_files = None
+    return {
+        "candidate_mode": candidate_mode,
+        "candidate_reason": candidate.get("reason"),
+        "candidate_file_count": _number(candidate.get("selected_count"), integer=True),
+        "candidate_bucket_count": len(candidate_buckets) if candidate_buckets else None,
+        "candidate_selected_files": candidate_files,
+        "impact_analysis_status": status,
+        "impact_analysis_reason": analysis.get("reason"),
+        "impact_analysis_selected_count": (
+            _number(analysis.get("selected_count"), integer=True) if status == "succeeded" else None
+        ),
+        "impact_analysis_selected_files": impacted_files,
+        "impact_analysis_raw_selected_files": raw_impacted_files,
+        "impact_analysis_duration_seconds": _number(analysis.get("duration_seconds")),
+    }
 
 
 def _job_measurement(job: dict[str, Any], bucket: str) -> dict[str, Any]:
@@ -205,7 +275,7 @@ def build_report(
         span_seconds = round((max(ends) - min(starts)).total_seconds(), 3)
 
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         **metadata,
         "mode": mode,
         "selection_reason": selection.get("reason"),
@@ -213,6 +283,7 @@ def build_report(
         "total_file_count": total_count,
         "selected_bucket_count": len(buckets) if buckets else None,
         "total_bucket_count": _number(selection.get("total_bucket_count"), integer=True),
+        **_selection_observation(selection),
         "selector_duration_seconds": _number(selection.get("selector_duration_seconds")),
         "planning_duration_seconds": _number(selection.get("planning_duration_seconds")),
         "expected_job_count": len(buckets) if buckets else None,
@@ -259,6 +330,14 @@ def render_summary(report: dict[str, Any]) -> str:
         f"{value('selected_file_count')} / {value('total_file_count')} |",
         "| Planned H100 buckets / observed jobs | "
         f"{value('selected_bucket_count')} / {value('observed_job_count')} |",
+        f"| Candidate selection mode | {value('candidate_mode')} |",
+        f"| Candidate selection reason | {value('candidate_reason')} |",
+        "| Candidate test files / H100 buckets | "
+        f"{value('candidate_file_count')} / {value('candidate_bucket_count')} |",
+        f"| Impact analysis status | {value('impact_analysis_status')} |",
+        f"| Impact analysis reason | {value('impact_analysis_reason')} |",
+        f"| Validated impacted test files | {value('impact_analysis_selected_count')} |",
+        f"| Impact analysis duration (seconds) | {value('impact_analysis_duration_seconds')} |",
         f"| Selector overhead (seconds) | {value('selector_duration_seconds')} |",
         f"| Planning incl. dependency sync (seconds) | {value('planning_duration_seconds')} |",
         f"| H100 outcome | {value('unit_test_outcome')} |",
@@ -272,6 +351,9 @@ def render_summary(report: dict[str, Any]) -> str:
         "neither metric measures queue time. Missing or incomplete timings remain unavailable. "
         "Planning time excludes setup-uv and runner provisioning. "
         "File counts describe the selection plan, not collected pytest cases. "
+        "The candidate plan includes baseline tests and safety fallbacks; impacted file counts "
+        "include validated command results before these rules. Candidate counts do not change the actual "
+        "jobs measured here. "
         "These are observed runs, not an estimate of what the other mode would have cost.",
     ]
     if report["issues"]:

@@ -93,6 +93,8 @@ class TestSelectUnitTests(unittest.TestCase):
         result: CommandResult,
         changes: Sequence[Change] | None = None,
         force_full: str | None = None,
+        record_impact: bool = False,
+        execute_full: str | None = None,
     ) -> dict[str, object]:
         return select_unit_tests(
             repo_root=self.repo_root,
@@ -104,6 +106,8 @@ class TestSelectUnitTests(unittest.TestCase):
             base_ref="base-sha",
             force_full=force_full,
             runner=self._runner(result),
+            record_impact=record_impact,
+            execute_full=execute_full,
         )
 
     def test_policy_allows_discoverable_source_tests_and_documentation(self) -> None:
@@ -485,6 +489,11 @@ class TestSelectUnitTests(unittest.TestCase):
             "from tests.unit_tests.models.helpers import VALUE\n",
         )
         base_sha = self._initialize_git_repository()
+        real_calls: list[list[str]] = []
+
+        def real_runner(command: Sequence[str], cwd: Path) -> CommandResult:
+            real_calls.append(list(command))
+            return _run_command(command, cwd)
 
         for changed_path, contents in (
             ("megatron/core/leaf.py", "VALUE = 2\n"),
@@ -494,6 +503,7 @@ class TestSelectUnitTests(unittest.TestCase):
             ),
         ):
             with self.subTest(changed_path=changed_path):
+                calls_before = len(real_calls)
                 self._write(changed_path, contents)
                 subprocess.run(["git", "add", "."], cwd=self.repo_root, check=True)
                 subprocess.run(
@@ -505,8 +515,12 @@ class TestSelectUnitTests(unittest.TestCase):
                     find_changes(self.repo_root, "branch", base_sha),
                     "branch",
                     base_sha,
+                    runner=real_runner,
+                    record_impact=True,
                 )
                 self.assertEqual(report["mode"], "selective", report["reason"])
+                self.assertEqual(len(real_calls), calls_before + 1)
+                self.assertEqual(report["impact_analysis"]["status"], "succeeded")
                 self.assertEqual(
                     report["impacted_files"], ["tests/unit_tests/models/test_model.py"]
                 )
@@ -601,6 +615,133 @@ class TestSelectUnitTests(unittest.TestCase):
         )
 
         self._assert_full_report(report, "Run tests label requested the complete suite")
+        self.assertEqual(self.runner_calls, [])
+
+    def test_recorded_candidate_is_preserved_when_execution_remains_full(self) -> None:
+        path = "tests/unit_tests/models/test_model.py"
+        report = self._select(
+            CommandResult(returncode=0, stdout=f"{path}\n", stderr=""),
+            record_impact=True,
+            execute_full="no selective-testing label",
+        )
+
+        self._assert_full_report(report, "no selective-testing label")
+        candidate = report["candidate_selection"]
+        self.assertEqual(candidate["mode"], "selective")
+        self.assertEqual(candidate["selected_files"], [path, "tests/unit_tests/test_root.py"])
+        self.assertEqual(candidate["selected_count"], 2)
+        self.assertEqual(len(candidate["matrix"]), 2)
+        analysis = report["impact_analysis"]
+        self.assertEqual(analysis["status"], "succeeded")
+        self.assertEqual(analysis["selected_files"], [path])
+        self.assertEqual(analysis["raw_selected_files"], [path])
+        self.assertEqual(analysis["selected_count"], 1)
+        self.assertEqual(analysis["returncode"], 0)
+        self.assertGreaterEqual(analysis["duration_seconds"], 0)
+        self.assertEqual(len(self.runner_calls), 1)
+
+    def test_recording_runs_analyzer_even_for_high_impact_changes(self) -> None:
+        path = "tests/unit_tests/models/test_model.py"
+        report = self._select(
+            CommandResult(returncode=0, stdout=f"{path}\n", stderr=""),
+            changes=[Change(status="M", path=".github/workflows/cicd-main.yml")],
+            record_impact=True,
+        )
+
+        self._assert_full_report(report, "high-impact file changed")
+        self.assertEqual(report["candidate_selection"]["mode"], "full")
+        self.assertEqual(report["impact_analysis"]["selected_files"], [path])
+        self.assertEqual(len(self.runner_calls), 1)
+
+    def test_recording_documentation_analysis_keeps_baseline_candidate(self) -> None:
+        report = self._select(
+            CommandResult(returncode=0, stdout="", stderr=""),
+            changes=[Change(status="M", path="docs/guide.md")],
+            record_impact=True,
+            execute_full="no selective-testing label",
+        )
+
+        self._assert_full_report(report, "no selective-testing label")
+        self.assertEqual(report["candidate_selection"]["selected_count"], 1)
+        self.assertEqual(report["candidate_selection"]["mode"], "selective")
+        self.assertEqual(report["impact_analysis"]["status"], "succeeded")
+        self.assertEqual(report["impact_analysis"]["selected_count"], 0)
+        self.assertEqual(len(self.runner_calls), 1)
+
+    def test_recording_failures_preserve_raw_output_without_claiming_empty_success(self) -> None:
+        path = "tests/unit_tests/models/test_model.py"
+        for result in (
+            CommandResult(returncode=7, stdout=f"{path}\n", stderr="analysis failed"),
+            CommandResult(returncode=0, stdout=f"{path}\n", stderr="ERROR: incomplete analysis"),
+            CommandResult(returncode=124, stdout="", stderr="timed out"),
+            CommandResult(
+                returncode=0, stdout=f"{path}\ntests/unit_tests/conftest.py\n", stderr=""
+            ),
+        ):
+            with self.subTest(result=result):
+                before = len(self.runner_calls)
+                report = self._select(result, record_impact=True)
+                self.assertEqual(report["candidate_selection"]["mode"], "full")
+                analysis = report["impact_analysis"]
+                self.assertEqual(analysis["status"], "failed")
+                self.assertIsNone(analysis["selected_files"])
+                self.assertIsNone(analysis["selected_count"])
+                self.assertEqual(analysis["raw_selected_files"], result.stdout.splitlines())
+                self.assertEqual(len(self.runner_calls), before + 1)
+
+    def test_failed_documentation_analysis_produces_full_candidate(self) -> None:
+        report = self._select(
+            CommandResult(returncode=7, stdout="", stderr="failed"),
+            changes=[Change(status="M", path="docs/guide.md")],
+            record_impact=True,
+        )
+
+        self._assert_full_report(report, "pytest-impacted failed with exit code 7")
+        self.assertEqual(report["impact_analysis"]["status"], "failed")
+        self.assertEqual(report["candidate_selection"]["mode"], "full")
+
+    def test_recording_attempts_analysis_even_for_invalid_python_inputs(self) -> None:
+        self._write("tests/unit_tests/models/helpers.py", "def broken(:\n")
+        report = self._select(
+            CommandResult(
+                returncode=0, stdout="tests/unit_tests/models/test_model.py\n", stderr=""
+            ),
+            record_impact=True,
+        )
+
+        self._assert_full_report(report, "cannot analyze Python dependency input")
+        self.assertEqual(report["impact_analysis"]["status"], "failed")
+        self.assertIsNone(report["impact_analysis"]["selected_count"])
+        self.assertEqual(len(self.runner_calls), 1)
+
+    def test_recording_launch_failure_is_not_retried(self) -> None:
+        runner = mock.Mock(side_effect=FileNotFoundError("impacted-tests unavailable"))
+        report = select_unit_tests(
+            self.repo_root,
+            self.buckets,
+            [Change(status="M", path="megatron/core/layers.py")],
+            "branch",
+            "base-sha",
+            runner=runner,
+            record_impact=True,
+        )
+
+        self._assert_full_report(report, "pytest-impacted could not run")
+        self.assertEqual(report["impact_analysis"]["status"], "failed")
+        self.assertIsNone(report["impact_analysis"]["selected_count"])
+        runner.assert_called_once()
+
+    def test_hard_full_fallback_skips_analysis_and_has_no_candidate(self) -> None:
+        report = self._select(
+            CommandResult(returncode=0, stdout="", stderr=""),
+            force_full="no valid merge comparison",
+            record_impact=True,
+        )
+
+        self._assert_full_report(report, "no valid merge comparison")
+        self.assertIsNone(report["candidate_selection"])
+        self.assertEqual(report["impact_analysis"]["status"], "not_run")
+        self.assertIsNone(report["impact_analysis"]["selected_count"])
         self.assertEqual(self.runner_calls, [])
 
     def _assert_full_report(self, report: dict[str, object], reason: str) -> None:

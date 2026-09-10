@@ -758,7 +758,7 @@ jobs:
         with:
           python-version: '3.12'
       - name: Setup uv
-        if: needs.configure.outputs.selective_tests == 'true'
+        if: startsWith(github.ref, 'refs/heads/pull-request/') && github.event_name == 'push'
         uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
         continue-on-error: true
         timeout-minutes: 2
@@ -779,26 +779,31 @@ jobs:
           PLANNING_STARTED=$SECONDS
           TESTED_SHA=$(git rev-parse --verify HEAD)
           BASE_SHA=''
-          FORCE_FULL_REASON=''
+          EXECUTION_FULL_REASON=''
+          ANALYSIS_FAILURE=''
           if [[ "$IS_MERGE_GROUP" == "true" ]]; then
-            FORCE_FULL_REASON='merge queue validation always runs the full unit-test suite'
+            EXECUTION_FULL_REASON='merge queue validation always runs the full unit-test suite'
           elif [[ "$IS_CI_WORKLOAD" == "true" ]]; then
-            FORCE_FULL_REASON='scheduled and CI workloads always run the full unit-test suite'
+            EXECUTION_FULL_REASON='scheduled and CI workloads always run the full unit-test suite'
           elif [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
-            FORCE_FULL_REASON='manually dispatched workflows always run the full unit-test suite'
+            EXECUTION_FULL_REASON='manually dispatched workflows always run the full unit-test suite'
           elif [[ "$FORCE_RUN_ALL" == "true" ]]; then
-            FORCE_FULL_REASON='pre-flight requested the full test suite'
+            EXECUTION_FULL_REASON='pre-flight requested the full test suite'
           elif [[ "$IS_PR" != "true" ]]; then
-            FORCE_FULL_REASON='selective testing is limited to pull-request pushes'
+            EXECUTION_FULL_REASON='selective testing is limited to pull-request pushes'
           elif [[ "$SELECTIVE_TESTS" != "true" ]]; then
-            FORCE_FULL_REASON="${UNIT_TEST_REASON:-unit-test selection is disabled}"
+            EXECUTION_FULL_REASON="${UNIT_TEST_REASON:-unit-test selection is disabled}"
           fi
 
+          # Every PR records an impact plan. Labels control which plan executes.
+          # Non-PR triggers and invalid merge history cannot produce a PR plan.
+          FORCE_FULL_REASON="$EXECUTION_FULL_REASON"
           # The checked-out synthetic merge is the same commit built and tested
           # downstream. Compare it with its own first parent: the exact main
           # revision used for this merge. PR metadata can report an older base.
           # This diff includes every PR commit and excludes main-only changes.
-          if [[ -z "$FORCE_FULL_REASON" ]]; then
+          if [[ "$IS_PR" == "true" && "$EVENT_NAME" == "push" ]]; then
+            FORCE_FULL_REASON=''
             if ! git rev-parse --verify 'HEAD^2^{commit}' >/dev/null 2>&1; then
               FORCE_FULL_REASON='the tested commit is not a pull-request merge'
             elif ! BASE_SHA=$(git rev-parse --verify 'HEAD^1^{commit}' 2>/dev/null); then
@@ -819,7 +824,10 @@ jobs:
           if [[ -n "$FORCE_FULL_REASON" ]]; then
             SELECTOR_ARGS+=(--force-full "$FORCE_FULL_REASON")
           else
-            SELECTOR_ARGS+=(--base-ref "$BASE_SHA")
+            SELECTOR_ARGS+=(--base-ref "$BASE_SHA" --record-impact)
+            if [[ -n "$EXECUTION_FULL_REASON" ]]; then
+              SELECTOR_ARGS+=(--execute-full "$EXECUTION_FULL_REASON")
+            fi
           fi
 
           if [[ -n "$FORCE_FULL_REASON" ]]; then
@@ -827,9 +835,10 @@ jobs:
           elif ! timeout --signal=TERM --kill-after=30s 7m \
             uv run --locked --project .github/test-selection \
             python .github/scripts/select_unit_tests.py "${SELECTOR_ARGS[@]}"; then
+            ANALYSIS_FAILURE='the impact selector could not be installed, completed, or started'
             python .github/scripts/select_unit_tests.py \
               --buckets-file unit-test-buckets.json \
-              --force-full 'the impact selector could not be installed, completed, or started' \
+              --force-full "$ANALYSIS_FAILURE" \
               --output unit-test-selection.json \
               --summary unit-test-selection-summary.md
           fi
@@ -840,9 +849,10 @@ jobs:
               (.bucket | type == "string" and length > 0)
               and (.unit_test_files | type == "string"))
           ' unit-test-selection.json >/dev/null; then
+            ANALYSIS_FAILURE='the impact selector returned an invalid or empty matrix'
             python .github/scripts/select_unit_tests.py \
               --buckets-file unit-test-buckets.json \
-              --force-full 'the impact selector returned an invalid or empty matrix' \
+              --force-full "$ANALYSIS_FAILURE" \
               --output unit-test-selection.json \
               --summary unit-test-selection-summary.md
           fi
@@ -852,10 +862,29 @@ jobs:
           jq --slurpfile buckets unit-test-buckets.json \
             --argjson elapsed "$((SECONDS - PLANNING_STARTED))" \
             --arg tested_sha "$TESTED_SHA" --arg diff_base_sha "$BASE_SHA" \
+            --arg analysis_failure "$ANALYSIS_FAILURE" \
             '. + {total_bucket_count: ($buckets[0] | length), planning_duration_seconds: $elapsed,
-                  tested_sha: $tested_sha, diff_base_sha: (if $diff_base_sha == "" then null else $diff_base_sha end)}' \
+                  tested_sha: $tested_sha, diff_base_sha: (if $diff_base_sha == "" then null else $diff_base_sha end)}
+             | if $analysis_failure != "" then
+                 .candidate_selection = null
+                 | .impact_analysis = {status: "failed", reason: $analysis_failure,
+                                       selected_files: null, selected_count: null, duration_seconds: null}
+               else . end' \
             unit-test-selection.json > unit-test-selection.tmp
           mv unit-test-selection.tmp unit-test-selection.json
+
+          if [[ -n "$ANALYSIS_FAILURE" ]]; then
+            # Render the final failure status after enriching the fallback plan.
+            python -c '
+          import json
+          import sys
+          from pathlib import Path
+          sys.path.insert(0, ".github/scripts")
+          from select_unit_tests import write_summary
+          write_summary(json.loads(Path("unit-test-selection.json").read_text()),
+                        Path("unit-test-selection-summary.md"))
+          '
+          fi
 
           printf '\nTested commit: `%s`\n' "$TESTED_SHA" >> unit-test-selection-summary.md
           if [[ -n "$BASE_SHA" ]]; then
