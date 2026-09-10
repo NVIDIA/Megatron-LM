@@ -1147,10 +1147,12 @@ def test_balanced_dynamic_packs_allows_verified_safe_row_limit_boundary(monkeypa
 
 @pytest.mark.internal
 @pytest.mark.parametrize("capture_modules", [["attn"], ["attn", "moe_router", "moe_preprocess"]])
-def test_balanced_dynamic_packs_allows_pp1_ep_overlap(monkeypatch, capture_modules):
+@pytest.mark.parametrize("pp_size,vp_size", [(1, None), (2, None), (4, None), (2, 2)])
+def test_balanced_dynamic_packs_allows_ep_overlap(monkeypatch, capture_modules, pp_size, vp_size):
     config = _make_balanced_dynamic_pack_config(
         monkeypatch,
-        pipeline_model_parallel_size=1,
+        pipeline_model_parallel_size=pp_size,
+        virtual_pipeline_model_parallel_size=vp_size,
         overlap_moe_expert_parallel_comm=True,
         expert_model_parallel_size=2,
         num_moe_experts=4,
@@ -1223,7 +1225,6 @@ def test_balanced_dynamic_packs_cannot_be_set_as_a_constructor_option(monkeypatc
         ({"max_seqlen_per_dp_cp_rank": 0}, "requires a positive max_seqlen_per_dp_cp_rank"),
         ({"max_seqlen_per_dp_cp_rank": -2}, "requires a positive max_seqlen_per_dp_cp_rank"),
         ({"max_seqlen_per_dp_cp_rank": 65538}, "above the verified-safe limit"),
-        ({"overlap_moe_expert_parallel_comm": True}, "currently requires PP1 without VPP"),
         ({"delay_wgrad_compute": True}, "does not yet support delay_wgrad_compute"),
     ],
 )
@@ -2069,6 +2070,23 @@ class TestCaptureReset:
 class TestDynamicMicrobatchSlots:
 
     @pytest.mark.internal
+    def test_eager_only_rank_participates_in_dynamic_capture_sizing(self, monkeypatch):
+        from megatron.core.transformer import cuda_graphs
+
+        helper = object.__new__(cuda_graphs.TECudaGraphHelper)
+        helper.config = SimpleNamespace(cuda_graph_dynamic_microbatches=True)
+        helper.flattened_callables = []
+        phases = []
+        monkeypatch.setattr(cuda_graphs, "validate_moe_cuda_graph_support", lambda config: None)
+        monkeypatch.setattr(helper, "_start_capturing", lambda: phases.append("start"))
+        monkeypatch.setattr(
+            helper, "_set_capture_num_microbatches", lambda: phases.append("size_slots")
+        )
+        monkeypatch.setattr(helper, "_finish_capturing", lambda start: phases.append("finish"))
+        helper.create_cudagraphs()
+        assert phases == ["start", "size_slots", "finish"]
+
+    @pytest.mark.internal
     def test_overlap_capture_preserves_eager_layer_schedule_positions(self):
         from megatron.core.transformer.cuda_graphs import get_overlap_moe_expert_parallel_comm_order
 
@@ -2100,6 +2118,50 @@ class TestDynamicMicrobatchSlots:
         )
         assert warmup == 1
         assert remaining == num_microbatches - 1
+
+    @pytest.mark.internal
+    @pytest.mark.parametrize("pp_size", [2, 4])
+    @pytest.mark.parametrize("num_microbatches", [1, 2, 3, 9])
+    def test_noninterleaved_overlap_capture_covers_live_forwards(self, pp_size, num_microbatches):
+        from megatron.core.pipeline_parallel.schedules import (
+            get_pp_rank_microbatches,
+            get_schedule_table,
+        )
+        from megatron.core.transformer.cuda_graphs import (
+            TECudaGraphHelper,
+            convert_schedule_table_to_order,
+            get_overlap_moe_expert_parallel_comm_order,
+        )
+
+        for pp_rank in range(pp_size):
+            communicator = SimpleNamespace(
+                pp_group=SimpleNamespace(size=lambda: pp_size, rank=lambda: pp_rank),
+                virtual_pipeline_model_parallel_size=None,
+            )
+            _, _, warmup, remaining = get_pp_rank_microbatches(
+                num_microbatches,
+                1,
+                pp_size,
+                forward_only=False,
+                overlap_moe_expert_parallel_comm=True,
+                p2p_communicator=communicator,
+            )
+            assert warmup == min(pp_size - pp_rank, num_microbatches)
+            assert warmup + remaining == num_microbatches
+            # Capture starts from ordinary PP ordering, then moves the next
+            # forward ahead of backward for overlap. Its peak must match the
+            # runtime warmup plus one live steady-state forward.
+            ordinary_warmup = min(pp_size - pp_rank - 1, num_microbatches)
+            ordinary_order = convert_schedule_table_to_order(
+                ordinary_warmup, 1, get_schedule_table(num_microbatches, 1, pp_size)
+            )
+            capture_order, _ = get_overlap_moe_expert_parallel_comm_order(
+                ordinary_order, [1], False
+            )
+            live_slots = TECudaGraphHelper._get_required_num_microbatch_slots_from_order(
+                capture_order, 1
+            )
+            assert live_slots == min(warmup + 1, num_microbatches)
 
     @pytest.mark.internal
     def test_capture_count_includes_topology_liveness_floor(self):

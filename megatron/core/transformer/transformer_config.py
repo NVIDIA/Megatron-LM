@@ -3824,11 +3824,6 @@ class TransformerConfig(ModelParallelConfig):
                     "delay_wgrad_compute: route input slots must remain live until the "
                     "separate weight-gradient graph has completed."
                 )
-            if graph_dynamic_pp_vpp and self.overlap_moe_expert_parallel_comm:
-                raise ValueError(
-                    "CUDA-graphed balanced DSA dynamic-pack routing with EP overlap "
-                    "currently requires PP1 without VPP."
-                )
         if (
             self.dsa_cp_balance_indexer
             and not self.dsa_cp_balance_indexer_graph_dynamic_packs
@@ -4079,10 +4074,16 @@ class TransformerConfig(ModelParallelConfig):
             assert is_torch_min_version(
                 "2.6.0"
             ), "A2A Overlap encounters hang issue with torch version < 2.6.0"
-            if self.pipeline_model_parallel_size > 1:
-                assert self.virtual_pipeline_model_parallel_size is not None, (
-                    "If enabling EP A2A overlap, virtual_pipeline_model_parallel_size "
-                    "must be specified when pipeline_model_parallel_size > 1"
+            if (
+                self.pipeline_model_parallel_size > 1
+                and self.virtual_pipeline_model_parallel_size is None
+            ):
+                assert (
+                    not self.delay_wgrad_compute
+                ), "Non-interleaved PP with EP overlap does not support delayed weight gradients"
+                assert self.num_microbatches_with_partial_activation_checkpoints is None, (
+                    "Non-interleaved PP with EP overlap does not support per-microbatch "
+                    "activation checkpoint selection"
                 )
             # Expert model parallelism requirements
             assert (

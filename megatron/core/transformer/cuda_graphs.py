@@ -2842,18 +2842,8 @@ class TECudaGraphHelper:
             capture_mode,
         )
 
-    def _get_cuda_graph_input_data(self):
-        """
-        Create the CUDA Graph capturing input data.
-        The data is organized per-chunk per-microbatch per-layer.
-        """
-
-        # Get the PP and VPP scheduling order.
-        from megatron.core.pipeline_parallel.schedules import (
-            get_pp_rank_microbatches,
-            get_schedule_table,
-        )
-
+    def _set_capture_num_microbatches(self):
+        """Agree on capture capacity, including pipeline ranks with no graphable layers."""
         microbatch_group_size_per_vp_stage = self.config.microbatch_group_size_per_vp_stage
         if microbatch_group_size_per_vp_stage is None:
             microbatch_group_size_per_vp_stage = self.pp_group.size()
@@ -2937,6 +2927,18 @@ class TECudaGraphHelper:
             )
         else:
             self.num_microbatches = get_num_microbatches()
+
+    def _get_cuda_graph_input_data(self):
+        """Create sample inputs in chunk/microbatch/layer capture order."""
+        from megatron.core.pipeline_parallel.schedules import (
+            get_pp_rank_microbatches,
+            get_schedule_table,
+        )
+
+        self._set_capture_num_microbatches()
+        microbatch_group_size_per_vp_stage = self.config.microbatch_group_size_per_vp_stage
+        if microbatch_group_size_per_vp_stage is None:
+            microbatch_group_size_per_vp_stage = self.pp_group.size()
 
         _, _, num_warmup_microbatches, _ = get_pp_rank_microbatches(
             self.num_microbatches,
@@ -3192,6 +3194,10 @@ class TECudaGraphHelper:
         start_time = self._start_capturing()
 
         if not self.flattened_callables:
+            if self._should_use_dynamic_microbatch_slots():
+                # Other PP ranks reduce their topology liveness bound here.
+                # An eager-only rank must participate in the same collective.
+                self._set_capture_num_microbatches()
             # Check if there are any graphable layers. If not, log a warning and skip capture,
             # but still call _finish_capturing to ensure all ranks complete the capture phase.
             logger.warning(

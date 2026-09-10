@@ -301,6 +301,8 @@ def combined_forward_backward_step(
     current_microbatch=None,
     encoder_decoder_xattn=False,
     fsdp_wrapper=None,
+    cp_group_size=None,
+    is_last_stage=None,
 ):
     """Merged forward and backward step for combined 1f1b scheduler.
 
@@ -381,6 +383,9 @@ def combined_forward_backward_step(
             unwrapped_model = get_attr_wrapped_model(
                 f_model, "build_schedule_plan", return_model_obj=True
             )
+            if cp_group_size is None and is_last_stage is None:
+                cp_group_size = unwrapped_model.pg_collection.cp.size()
+                is_last_stage = unwrapped_model.post_process
             f_schedule_plan, loss_func = forward_step_func(
                 data_iterator, unwrapped_model, return_schedule_plan=True
             )
@@ -491,6 +496,8 @@ def combined_forward_backward_step(
             collect_non_loss_data,
             num_microbatches,
             forward_data_store,
+            cp_group_size=cp_group_size,
+            is_last_stage=is_last_stage,
         )
         # Set the schedule plan and loss function to the output tensor
         # This is used to get the schedule plan and loss function in the backward pass

@@ -8,8 +8,8 @@ This follow-up to #6058 supports fixed-CP, fixed-capacity `dp_balanced` THD inpu
 with Transformer Engine partial CUDA graphs and EP 1F1B overlap. Dynamic pack
 composition and physical microbatch counts may change within the captured
 packing bound. Delayed weight gradients and full-iteration graphs are outside
-this change. The first implementation admits PP1; a subsequent change adds
-non-interleaved PP and VPP.
+this change. PP1, ordinary non-interleaved PP and interleaved VPP use the same
+graph input ownership contract.
 
 ## Capture and input ownership
 
@@ -63,6 +63,23 @@ GPT's TransformerBlock. Under FP8, Hybrid layers selected for BF16 by
 `first_last_layers_bf16` retain their MLP node inputs until backward: a BF16
 expert can save the original dispatch buffer when router padding and one local
 expert eliminate the intermediate copies that otherwise protect that storage.
+
+Non-interleaved EP overlap warms up `min(PP - pp_rank, num_microbatches)`
+forwards, one more than the ordinary 1F1B schedule. Steady state receives the
+oldest output gradient, co-schedules its backward with a new forward, sends
+the new activation, then sends the input gradient while receiving the next
+activation. The extra warmup breaks the circular P2P dependency. Cooldown drains
+the retained plans in FIFO order; a short batch can consist entirely of warmup
+and cooldown. Grad reduction, embedding gradient finalization and token-based
+loss scaling retain the ordinary pipeline's process-group boundaries.
+
+VPP retains its existing interleaved communication schedule. Capture samples
+remain indexed by real model chunks even when a chunk has fewer graphable layers
+or no DSA graph at all. Each chunk's forward invocation owns its route slot until
+that invocation's backward has completed.
+An entire pipeline rank with no graphable layers still participates in the
+cross-PP slot-capacity reduction, so eager-only stages cannot strand graphable
+stages in capture initialization.
 
 ## Validation
 
