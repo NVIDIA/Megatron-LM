@@ -4,6 +4,7 @@ from __future__ import annotations
 import copy
 import dataclasses
 import enum
+import functools
 import inspect
 import io
 import os
@@ -36,7 +37,7 @@ from megatron.core.parallel_state import (
 from megatron.core.process_groups_config import ProcessGroupCollection, resolve_gtp_remat_group
 from megatron.core.quantization.custom_recipe import get_cached_custom_recipe
 from megatron.core.quantization.quant_config import QuantizationConfig
-from megatron.core.quantization.utils import get_quant_config_or_none
+from megatron.core.quantization.utils import get_quant_config_or_none, is_custom_recipe_selected
 from megatron.core.tensor_parallel.layers import (
     _initialize_affine_weight_cpu,
     set_tensor_model_parallel_attributes,
@@ -265,6 +266,32 @@ def _is_te_custom_recipe(recipe) -> bool:
     return custom_recipe_cls is not None and isinstance(recipe, custom_recipe_cls)
 
 
+def _te_custom_recipe_has_delayed_state(fp8_meta) -> bool:
+    """Whether a custom recipe's factory actually produced delayed-scaling quantizer state."""
+    try:
+        from transformer_engine.pytorch.module.base import _has_delayed_scaling_state
+    except ImportError:
+        # Older TE cannot report this; assume stateless rather than warn on every save.
+        return False
+    try:
+        return bool(_has_delayed_scaling_state(fp8_meta))
+    except Exception:  # pylint: disable=broad-except
+        return False
+
+
+@functools.lru_cache(maxsize=None)
+def _warn_custom_recipe_extra_state_dropped() -> None:
+    """Warn once per process that custom delayed-scaling state is not checkpointed."""
+    warnings.warn(
+        "The custom recipe's quantizer factory produced delayed-scaling state for a grouped "
+        "linear, but Megatron cannot serialize it per GEMM and is dropping it from the "
+        "checkpoint. Resuming from this checkpoint will restart the amax history rather than "
+        "continue it. Use a stateless quantizer factory for grouped/MoE layers to avoid this.",
+        UserWarning,
+        stacklevel=2,
+    )
+
+
 def _get_fp8_model_init_for_quant_recipe(qrecipe: TEQuantizationRecipe):
     custom_recipe = False
     if qrecipe.fp8_quantization_recipe is None and qrecipe.fp4_quantization_recipe is None:
@@ -427,6 +454,40 @@ def _get_extra_te_kwargs(config: TransformerConfig):
         else:
             extra_transformer_engine_kwargs["device"] = torch.cuda.current_device()
     return extra_transformer_engine_kwargs
+
+
+@functools.lru_cache(maxsize=None)
+def _te_constructor_accepts_name(te_class: type) -> bool:
+    """Whether a Transformer Engine module constructor accepts a ``name`` argument."""
+    try:
+        return "name" in inspect.signature(te_class.__init__).parameters
+    except (TypeError, ValueError):
+        return False
+
+
+def _te_name_kwarg(
+    te_class: type, name: Optional[str], config: TransformerConfig
+) -> Dict[str, str]:
+    """Return the ``name`` kwarg for a TE constructor when the installed TE accepts it.
+
+    MCore uses ``name`` for its own per-module quantization matcher on every supported TE
+    version, but only recent TE takes it as a constructor argument and exposes it to a custom
+    recipe's quantizer factory as ``QuantizerRole.name``. Older TE raises ``TypeError`` on the
+    keyword, so BF16 and built-in FP8/FP4 runs simply omit it. A custom recipe may select
+    quantizers by module name, so dropping the name there would silently apply the wrong
+    policy; raise instead.
+    """
+    if name is None:
+        return {}
+    if _te_constructor_accepts_name(te_class):
+        return {"name": name}
+    if is_custom_recipe_selected(config):
+        raise RuntimeError(
+            f"Transformer Engine {get_te_version()} does not accept a 'name' argument in "
+            f"{te_class.__name__}, so a custom recipe's quantizer factory cannot select "
+            "quantizers by module name. Upgrade Transformer Engine to use a custom recipe."
+        )
+    return {}
 
 
 def condition_init_method(config, init_method):
@@ -1359,7 +1420,7 @@ class TELinear(te.pytorch.Linear):
                 bias=bias,
                 return_bias=self.te_return_bias,
                 parallel_mode=te_parallel_mode,
-                name=name,
+                **_te_name_kwarg(te.pytorch.Linear, name, config),
                 **extra_kwargs,
             )
 
@@ -1596,7 +1657,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
                 parallel_mode="column",
                 return_layernorm_output=False,
                 zero_centered_gamma=self.config.layernorm_zero_centered_gamma,
-                name=name,
+                **_te_name_kwarg(te.pytorch.LayerNormLinear, name, config),
                 **extra_kwargs,
             )
 
@@ -2299,7 +2360,7 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             ),
             tp_group=pg_collection.tp,
             layer_number=layer_number,
-            name=name,
+            **_te_name_kwarg(te.pytorch.DotProductAttention, name, config),
             **extra_kwargs,
         )
 
@@ -2607,7 +2668,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                     bias=bias,
                     return_bias=self.te_return_bias,
                     parallel_mode=parallel_mode,
-                    name=name,
+                    **_te_name_kwarg(te.pytorch.GroupedLinear, name, config),
                     **extra_kwargs,
                 )
 
@@ -2840,11 +2901,20 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 return [state] * self.num_gemms
 
             if _is_te_custom_recipe(self.fp8_meta.get("recipe")):
-                # TE serializes the CustomRecipe object itself, including its quantizer
-                # factory, into the extra state. The restricted unpickler used for
-                # checkpoints cannot decode an arbitrary factory, and TE ignores this
-                # payload when loading. Store an empty per-GEMM extra state instead; any
-                # delayed-scaling state produced by a custom factory is not persisted.
+                # TE serializes the recipe object itself into the extra state, exactly as it
+                # does for the built-in recipes. Splitting that payload per GEMM requires
+                # decoding it, and MCore's own ``SafeUnpickler`` (megatron/core/safe_globals.py)
+                # allowlists the five built-in TE recipe classes but not ``CustomRecipe``,
+                # because decoding one would also have to resolve its arbitrary quantizer
+                # factory callable. Store an empty per-GEMM extra state instead.
+                #
+                # An empty payload is the correct, lossless result for a stateless factory
+                # (mxfp8, current scaling, block scaling, nvfp4), which is what TE itself
+                # stores for the equivalent built-in recipes. A factory that produces
+                # delayed-scaling quantizers does have state, and it is dropped here --
+                # warn rather than lose amax history silently.
+                if _te_custom_recipe_has_delayed_state(self.fp8_meta):
+                    _warn_custom_recipe_extra_state_dropped()
                 return [torch.empty(0, dtype=torch.uint8)] * self.num_gemms
 
             state = self._decode_extra_state(state)

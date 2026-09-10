@@ -621,7 +621,19 @@ class TransformerConfig(ModelParallelConfig):
     custom_recipe: str | None = None
     """Python import path to a callable quantizer factory for a format-neutral Transformer Engine
     custom recipe. Providing this path enables custom quantization and cannot be combined with FP8
-    or FP4 mode."""
+    or FP4 mode.
+
+    The factory receives a ``QuantizerRole`` whose ``name`` is the module's global path, for
+    example ``decoder.layers.3.mlp.linear_fc1``. The layer index is global, so a name-selective
+    factory picks the same layers regardless of the pipeline/virtual-pipeline split.
+
+    Known limitation: a factory that returns *stateful* (delayed-scaling) quantizers is not yet
+    supported with ``recompute_granularity="full"``; Transformer Engine raises a ``KeyError`` for
+    ``global_fp8_buffer_pos_fwd_recompute`` on the first backward pass, because custom recipes
+    enter their quantization context per layer rather than around the whole block. Stateless
+    factories (current scaling, MXFP8, block scaling, NVFP4) are unaffected. Such a factory also
+    cannot persist its quantizer state through a grouped/MoE checkpoint; Megatron warns when it
+    drops that state."""
 
     ####################
     # fp8 related

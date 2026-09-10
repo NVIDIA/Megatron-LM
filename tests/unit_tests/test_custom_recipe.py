@@ -416,8 +416,10 @@ def test_custom_recipe_grouped_moe_checkpoint_extra_state_is_stateless():
     """Grouped experts must checkpoint without unpickling the CustomRecipe factory.
 
     TE stores the CustomRecipe object, including its quantizer factory, in the TE extra
-    state. The restricted checkpoint unpickler cannot decode an arbitrary factory, so the
-    per-GEMM split used by distributed checkpointing must treat the recipe as stateless.
+    state, exactly as it does for the built-in recipes. MCore's own ``SafeUnpickler`` cannot
+    decode an arbitrary factory, so the per-GEMM split used by distributed checkpointing
+    stores an empty extra state. That is lossless for a stateless factory; this test uses a
+    delayed-scaling factory, so it must also warn that amax history is being dropped.
     """
     _skip_unless_fp8_available()
 
@@ -452,8 +454,12 @@ def test_custom_recipe_grouped_moe_checkpoint_extra_state_is_stateless():
         output = block(hidden_states=hidden_states, attention_mask=None)
         output.float().square().mean().backward()
 
-        # Distributed-checkpoint save path: one extra state per expert GEMM.
-        sharded_state_dict = block.sharded_state_dict()
+        # Distributed-checkpoint save path: one extra state per expert GEMM. This factory
+        # produces delayed-scaling quantizers, whose state cannot be split per GEMM, so the
+        # save must say so rather than drop amax history silently.
+        te_extension._warn_custom_recipe_extra_state_dropped.cache_clear()
+        with pytest.warns(UserWarning, match="delayed-scaling state"):
+            sharded_state_dict = block.sharded_state_dict()
         grouped_extra_states = {
             key: value
             for key, value in sharded_state_dict.items()
@@ -471,5 +477,175 @@ def test_custom_recipe_grouped_moe_checkpoint_extra_state_is_stateless():
         for gemm_idx in range(1, grouped_linear.num_gemms):
             grouped_state_dict[f"_extra_state{gemm_idx}"] = torch.empty(0, dtype=torch.uint8)
         grouped_linear.load_state_dict(grouped_state_dict)
+    finally:
+        Utils.destroy_model_parallel()
+
+
+class _NameLessTELinear:
+    """Stand-in for a Transformer Engine constructor that predates the ``name`` argument."""
+
+    def __init__(self, in_features, out_features, bias=True):
+        pass
+
+
+@pytest.mark.skipif(not te_extension.HAVE_TE, reason="Transformer Engine is not installed")
+@pytest.mark.parametrize(
+    "config_kwargs",
+    [
+        pytest.param({}, id="bf16"),
+        pytest.param({"fp8": "hybrid", "fp8_recipe": Fp8Recipe.mxfp8}, id="builtin_fp8"),
+    ],
+)
+def test_te_name_kwarg_is_omitted_on_older_te_without_custom_recipe(config_kwargs):
+    """``name`` must not be forwarded to a TE constructor that cannot accept it.
+
+    MCore supports a wide range of TE versions and uses ``name`` for its own per-module
+    matcher regardless of TE support. Forwarding it unconditionally raises TypeError on
+    every BF16 and built-in FP8 run against a TE release without the keyword.
+    """
+    config = TransformerConfig(
+        num_layers=1, hidden_size=128, num_attention_heads=4, **config_kwargs
+    )
+    assert (
+        te_extension._te_name_kwarg(_NameLessTELinear, "decoder.layers.0.mlp.linear_fc1", config)
+        == {}
+    )
+    # The stand-in constructor must actually reject the keyword we just declined to pass.
+    with pytest.raises(TypeError):
+        _NameLessTELinear(128, 128, name="decoder.layers.0.mlp.linear_fc1")
+
+
+@pytest.mark.skipif(not te_extension.HAVE_TE, reason="Transformer Engine is not installed")
+def test_te_name_kwarg_raises_for_custom_recipe_on_older_te():
+    """A custom recipe may select quantizers by name, so a dropped name must not be silent."""
+    config = TransformerConfig(
+        num_layers=1, hidden_size=128, num_attention_heads=4, custom_recipe=TEST_FACTORY_PATH
+    )
+    with pytest.raises(RuntimeError, match="does not accept a 'name' argument"):
+        te_extension._te_name_kwarg(_NameLessTELinear, "decoder.layers.0.mlp.linear_fc1", config)
+
+
+@pytest.mark.skipif(not te_extension.HAVE_TE, reason="Transformer Engine is not installed")
+def test_te_name_kwarg_is_forwarded_when_supported():
+    config = TransformerConfig(
+        num_layers=1, hidden_size=128, num_attention_heads=4, custom_recipe=TEST_FACTORY_PATH
+    )
+    name = "decoder.layers.0.mlp.linear_fc1"
+    for te_class in (
+        te_extension.te.pytorch.Linear,
+        te_extension.te.pytorch.LayerNormLinear,
+        te_extension.te.pytorch.GroupedLinear,
+        te_extension.te.pytorch.DotProductAttention,
+    ):
+        if te_extension._te_constructor_accepts_name(te_class):
+            assert te_extension._te_name_kwarg(te_class, name, config) == {"name": name}
+    # A module with no semantic name never contributes the keyword.
+    assert te_extension._te_name_kwarg(te_extension.te.pytorch.Linear, None, config) == {}
+
+
+@pytest.mark.skipif(not te_extension.HAVE_TE, reason="Transformer Engine is not installed")
+def test_safe_unpickler_allowlists_builtin_recipes_but_not_custom_recipe():
+    """Pin why grouped custom-recipe extra state cannot be split per GEMM.
+
+    This is a Megatron-side constraint, not a Transformer Engine one: TE serializes a
+    ``CustomRecipe`` into the extra state exactly as it does the built-in recipes, but
+    decoding one here would also have to resolve the factory's arbitrary callable, which is
+    precisely what ``SafeUnpickler`` exists to prevent. If ``CustomRecipe`` is ever added to
+    the allowlist, ``_split_extra_state`` can preserve delayed-scaling state instead of
+    dropping it, and this test should be updated together with that change.
+    """
+    from megatron.core.safe_globals import SafeUnpickler
+
+    recipe_module = "transformer_engine.common.recipe"
+    for builtin in (
+        "DelayedScaling",
+        "Float8CurrentScaling",
+        "Float8BlockScaling",
+        "MXFP8BlockScaling",
+        "NVFP4BlockScaling",
+    ):
+        assert (recipe_module, builtin) in SafeUnpickler._SAFE_CLASSES
+    assert (recipe_module, "CustomRecipe") not in SafeUnpickler._SAFE_CLASSES
+
+
+def _te_module_names(block):
+    """Collect the semantic names Megatron actually handed to Transformer Engine."""
+    return {
+        module.name
+        for module in block.modules()
+        if isinstance(getattr(module, "name", None), str) and ".layers." in module.name
+    }
+
+
+def _layer_indices_in_names(names, suffix="self_attention.linear_qkv"):
+    return sorted(
+        int(name.split(".layers.")[1].split(".")[0]) for name in names if name.endswith(suffix)
+    )
+
+
+def _pp_naming_config(**kwargs):
+    return TransformerConfig(
+        num_layers=4,
+        hidden_size=128,
+        ffn_hidden_size=256,
+        num_attention_heads=4,
+        attention_dropout=0.0,
+        hidden_dropout=0.0,
+        params_dtype=torch.bfloat16,
+        pipeline_dtype=torch.bfloat16,
+        **kwargs,
+    )
+
+
+@pytest.mark.skipif(not te_extension.HAVE_TE, reason="Transformer Engine is not installed")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_layer_names_are_global_across_pipeline_stages():
+    """A layer's semantic name must identify the same layer regardless of the PP split.
+
+    With stage-local indices, stage 1 of a 4-layer PP=2 model also emits ``decoder.layers.0``,
+    so a factory selecting on ``.layers.0.`` silently keeps one layer per stage in a different
+    precision instead of only the model's first layer.
+    """
+    Utils.initialize_model_parallel(1, 2)
+    try:
+        model_parallel_cuda_manual_seed(123)
+        config = _pp_naming_config(pipeline_model_parallel_size=2)
+        block = TransformerBlock(
+            config, get_gpt_layer_with_transformer_engine_spec(), name="decoder"
+        )
+        indices = _layer_indices_in_names(_te_module_names(block))
+        pp_rank = torch.distributed.get_rank()
+        expected = [0, 1] if pp_rank == 0 else [2, 3]
+        assert indices == expected, f"pp_rank={pp_rank} got {indices}, expected {expected}"
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.skipif(not te_extension.HAVE_TE, reason="Transformer Engine is not installed")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_layer_names_are_global_across_virtual_pipeline_stages():
+    """Virtual pipeline stages must not restart layer numbering either."""
+    Utils.initialize_model_parallel(1, 2)
+    try:
+        model_parallel_cuda_manual_seed(123)
+        config = _pp_naming_config(
+            pipeline_model_parallel_size=2, virtual_pipeline_model_parallel_size=2
+        )
+        pp_rank = torch.distributed.get_rank()
+        seen = {}
+        for vp_stage in range(2):
+            block = TransformerBlock(
+                config,
+                get_gpt_layer_with_transformer_engine_spec(),
+                name="decoder",
+                vp_stage=vp_stage,
+            )
+            seen[vp_stage] = _layer_indices_in_names(_te_module_names(block))
+        # 4 layers over PP=2 x VPP=2 is one layer per (pp_rank, vp_stage) chunk, interleaved.
+        assert seen[0] == [pp_rank], seen
+        assert seen[1] == [2 + pp_rank], seen
+        # Every emitted index is unique model-wide, which is the property factories rely on.
+        flat = seen[0] + seen[1]
+        assert len(set(flat)) == len(flat), seen
     finally:
         Utils.destroy_model_parallel()

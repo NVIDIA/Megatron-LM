@@ -362,7 +362,11 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     layer_number=layer_number,
                     pg_collection=self.pg_collection,
                     vp_stage=self.vp_stage,
-                    name=(f"{self.name}.layers.{layer_number - 1}" if self.name else None),
+                    # Global index: a layer's semantic name must not depend on how the
+                    # model is split across pipeline/virtual-pipeline stages, otherwise a
+                    # layer-selective quantizer factory (or a `*layers.N*` quant_recipe
+                    # matcher) silently applies stage 0's policy on every stage.
+                    name=(f"{self.name}.layers.{global_layer_number - 1}" if self.name else None),
                 )
             if layer_config.enable_mhc_connections and not getattr(
                 module, "supports_mhc_connections", False
