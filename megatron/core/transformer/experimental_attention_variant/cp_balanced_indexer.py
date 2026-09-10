@@ -355,10 +355,15 @@ def _project_selection_q(linear, qr):
         from megatron.core.fp8_utils import dequantize_fp8_tensor, is_float8tensor
 
         weight = linear.weight
-        ensure_params_ready([weight])
+        # TE represents a disabled bias with an empty tensor, whereas F.linear
+        # expects None. This is static metadata and remains capture-safe.
+        bias = linear.bias
+        if bias is not None and bias.numel() == 0:
+            bias = None
+        ensure_params_ready([weight] if bias is None else [weight, bias])
         if is_float8tensor(weight):
             weight = dequantize_fp8_tensor(weight)
-        return torch.nn.functional.linear(qr, weight, linear.bias)
+        return torch.nn.functional.linear(qr, weight, bias)
     return linear(qr)[0]
 
 
