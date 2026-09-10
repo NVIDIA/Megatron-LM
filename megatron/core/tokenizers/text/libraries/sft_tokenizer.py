@@ -161,22 +161,18 @@ class SFTTokenizer:
             # Tokenize conversation with separately gigatoken to get better performance.
             tokenize = False
 
-        tokens = self._extract_token_ids(
-            self._hf_tokenizer.apply_chat_template(
-                conversation,
-                tokenize=tokenize,
-                add_generation_prompt=add_generation_prompt,
-                return_assistant_token_mask=False,
-                return_tensors="np",
-                chat_template=self._prompt_config.custom_chat_template,
-            )
+        tokens = self._hf_tokenizer.apply_chat_template(
+            conversation,
+            tokenize=tokenize,
+            add_generation_prompt=add_generation_prompt,
+            return_assistant_token_mask=False,
+            return_tensors="np",
+            chat_template=self._prompt_config.custom_chat_template,
         )
 
-        if not self.use_gigatoken:
-            tokens = tokens[0]
-        else:
-            # Tokenize conversation using gigatoken (when tokenize=False).
+        if self.use_gigatoken:
             tokens = np.array(self.text_to_ids(tokens, add_special_tokens=False))
+        tokens = self._extract_token_ids(tokens)
 
         if not return_target:
             return tokens
