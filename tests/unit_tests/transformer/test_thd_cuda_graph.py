@@ -2022,6 +2022,50 @@ class TestGraphDynamicRouteMetadataArena:
             block.clear_te_cuda_graph_route_metadata_arenas()
 
 
+class TestCaptureReset:
+
+    @pytest.mark.internal
+    def test_reset_clears_indexer_metrics_and_preserves_graph_storage(self, monkeypatch):
+        from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
+        from megatron.core.transformer.experimental_attention_variant.dsa import (
+            DSAIndexerLossAutoScaler,
+            DSAIndexerLossLoggingHelper,
+        )
+
+        values = torch.tensor([1.5, 0.0, 2.5, 0.0])
+        captured_values = values.view_as(values)
+        captured_pointer = values.data_ptr()
+        reduce_group, avg_group = object(), object()
+        tracker = {
+            "values": values,
+            "reduce_group": reduce_group,
+            "avg_group": avg_group,
+            "agreed_size": 4,
+        }
+        monkeypatch.setattr(DSAIndexerLossLoggingHelper, "tracker", tracker)
+        backward_scale = torch.tensor(0.125)
+        monkeypatch.setattr(DSAIndexerLossAutoScaler, "main_loss_backward_scale", backward_scale)
+        helper = object.__new__(TECudaGraphHelper)
+        helper.model = []
+        helper.optimizers = []
+        helper.config = SimpleNamespace()
+
+        helper._reset_after_capture()
+
+        assert tracker["values"] is values
+        assert tracker["values"].data_ptr() == captured_pointer
+        assert tracker["reduce_group"] is reduce_group
+        assert tracker["avg_group"] is avg_group
+        assert tracker["agreed_size"] == 4
+        assert DSAIndexerLossAutoScaler.main_loss_backward_scale is backward_scale
+        torch.testing.assert_close(backward_scale, torch.tensor(0.125))
+        torch.testing.assert_close(values, torch.zeros_like(values))
+        # Replay updates the original captured storage. Only the real replay
+        # contribution should remain, with none of the synthetic warmup loss.
+        captured_values[0].add_(0.75)
+        torch.testing.assert_close(tracker["values"], torch.tensor([0.75, 0.0, 0.0, 0.0]))
+
+
 class TestDynamicMicrobatchSlots:
 
     @pytest.mark.internal
