@@ -584,6 +584,23 @@ The DP collective only covers the replicate axis; the gtp_remat axis is complete
 
 ### 3.3 Distributed checkpointing (DCP)
 
+**Fused projection sections.** Mamba, GDN, and GDP share
+`ssm.utils._split_in_proj_factory`. It gathers GTP row shards under `torch.no_grad()`,
+removes alignment padding, and checkpoints each semantic section in its TP-local
+layout. Loading restores the physical row shard and zero padding. Gated MLPs use the
+same low-level GTP helpers around their SwiGLU section factory.
+
+These gathered factories carry an `optimizer_factory` companion bound to the live
+parameter. Both distributed optimizer model-space paths use it through
+`ShardedTensorFactory.for_optimizer()`, which propagates outer key and replica
+ownership changes while retaining the physical GTP shard coordinate. It maps each physical
+optimizer tensor or flat DP fragment into the same semantic keys without GTP
+collectives. Partial boundary rows become rectangular DCP shards; no unsupported
+`ShardedTensor.flattened_range` leaves are emitted. The mapping also handles DP-owner-only construction; the training CLI restriction
+on memory-efficient fully reshardable GTP checkpoints remains in place.
+The companion is opt-in: the regular/Muon optimizer keeps its existing checkpoint
+mapping and on-disk keys.
+
 ![GTP_remat + DCP save/load reshard for a TP2×GTP2 weight](../../images/generalized_tensor_parallel/0612_gtp_dcp_tp2gtp2_save_load.png)
 
 GTP_remat supports **PyTorch / Mcore sharded distributed checkpointing** (`--ckpt-format torch_dist`, the `megatron.core.dist_checkpointing` `ShardedTensor` / `ShardedObject` format) for **both model weights and distributed-optimizer state**. Checkpoints are **fully resharding-capable**: a checkpoint saved at one `(TP, GTP_remat, EGTP_remat, DP, PP)` topology can be loaded at a *different* one — including a different GTP_remat/EGTP_remat size — without an offline conversion step.

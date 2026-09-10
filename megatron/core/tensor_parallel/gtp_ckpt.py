@@ -18,7 +18,7 @@ from dataclasses import replace
 import torch
 
 from megatron.core.dist_checkpointing import ShardedTensor
-from megatron.core.dist_checkpointing.mapping import ShardedTensorFactory
+from megatron.core.dist_checkpointing.mapping import LocalNonpersistentObject, ShardedTensorFactory
 from megatron.core.utils import make_tp_sharded_tensor_for_checkpoint
 
 
@@ -90,8 +90,8 @@ def _gtp_slice_rows_on_load(factory: ShardedTensorFactory, weight) -> ShardedTen
         full = original_merge_fn(sub_state_dict)
         if full.dim() != 2:
             # Fail loudly instead of padding/slicing a flattened buffer: only the
-            # unflattened 2-D model-weight factory is supported (optimizer state resolves
-            # through the per-shard rebuild, never through this merge).
+            # unflattened 2-D model-weight factory is supported. Optimizer state uses
+            # the physical-parameter companion rather than this model merge.
             raise NotImplementedError(
                 "GTP fused-projection merge expects the unflattened 2-D projection; got "
                 f"a {full.dim()}-D tensor (flattened factories are unsupported)"
@@ -102,4 +102,122 @@ def _gtp_slice_rows_on_load(factory: ShardedTensorFactory, weight) -> ShardedTen
         start = gtp_rank * gtp_local_size
         return full[start : start + gtp_local_size].contiguous()
 
-    return replace(factory, merge_fn=_gtp_slice_after_cat)
+    return replace(
+        factory,
+        merge_fn=_gtp_slice_after_cat,
+        # Physical optimizer shards cover distinct offsets, so only DP replicas
+        # remain; the model factory's middle coordinate elects gathered GTP copies.
+        optimizer_factory=_fused_projection_optimizer_factory(
+            factory,
+            weight,
+            shard_offset=gtp_rank * weight.numel(),
+            replica_id=(factory.replica_id[0], 0, factory.replica_id[2]),
+        ),
+    )
+
+
+def _fused_projection_optimizer_factory(
+    factory: ShardedTensorFactory, weight: torch.Tensor, *, shard_offset: int = 0, replica_id=None
+) -> ShardedTensorFactory:
+    """Map physical optimizer slices into a fused projection's semantic checkpoint keys.
+
+    Model checkpoint factories may hold a gathered/dequantized tensor instead of the
+    live parameter. Optimizers need the parameter identity and must transform their own
+    data, including arbitrary flat DP fragments, without requiring GTP collectives.
+    Capture only the logical section metadata; intersect each physical input slice with
+    those sections at build time. Padding is omitted on save and restored as zeros.
+
+    Flat fragments are represented as ordinary rectangular shards (partial boundary
+    rows and complete interior rows), since DCP no longer accepts flattened tensors.
+    This helper supports the 1-D biases and 2-D weights of row-split projections.
+    """
+    physical_shape = tuple(weight.shape)
+    physical_numel = weight.numel()
+    if len(physical_shape) not in (1, 2):
+        raise ValueError("Fused projection optimizer factory expects a 1-D or 2-D parameter")
+    templates = [part.without_data() for part in factory.build()]
+    base_key = factory.key
+    for part in templates:
+        if len(part.local_shape) != len(physical_shape) or not part.key.startswith(base_key):
+            raise ValueError("Expected row-ordered fused projection section metadata")
+    if replica_id is None:
+        replica_id = factory.replica_id
+
+    @torch.no_grad()
+    def build(key, data, replica_id, flattened_range):
+        if flattened_range is None:
+            start, stop = 0, physical_numel
+        else:
+            start, stop = flattened_range.start, flattened_range.stop
+            if (
+                flattened_range.step not in (None, 1)
+                or start is None
+                or stop is None
+                or not 0 <= start <= stop <= physical_numel
+            ):
+                raise ValueError(f"Invalid optimizer fragment: {flattened_range}")
+        if data.numel() != stop - start:
+            raise ValueError("Optimizer data size does not match the physical parameter slice")
+        flat = data.detach().reshape(-1)
+        logical_start, logical_stop = shard_offset + start, shard_offset + stop
+        section_start = 0
+        chunks = []
+        saved_numel = 0
+        for template in templates:
+            section_numel = template.local_shape[0]
+            columns = template.local_shape[1] if len(physical_shape) == 2 else 1
+            section_numel *= columns
+            begin = max(logical_start, section_start)
+            end = min(logical_stop, section_start + section_numel)
+            cursor = begin
+            while cursor < end:
+                row, col = divmod(cursor - section_start, columns)
+                remaining = end - cursor
+                if col or remaining < columns:
+                    rows, width = 1, min(columns - col, remaining)
+                else:
+                    rows, width = remaining // columns, columns
+                count = rows * width
+                shape = (rows, width) if len(physical_shape) == 2 else (rows,)
+                offset = list(template.global_offset)
+                offset[template.prepend_axis_num] += row
+                if len(physical_shape) == 2:
+                    offset[template.prepend_axis_num + 1] += col
+                # Materialize prepended singleton axes for irregular DCP chunks:
+                # the storage adapter then sees equal size/offset dimensionality.
+                shape = (1,) * template.prepend_axis_num + shape
+                chunk = flat[cursor - logical_start : cursor - logical_start + count].view(shape)
+                chunks.append(
+                    replace(
+                        template,
+                        key=key + template.key[len(base_key) :],
+                        data=chunk,
+                        dtype=data.dtype,
+                        local_shape=shape,
+                        global_offset=tuple(offset),
+                        axis_fragmentations=None,
+                        prepend_axis_num=0,
+                        flattened_range=None,
+                        replica_id=replica_id,
+                    )
+                )
+                saved_numel += count
+                cursor += count
+            section_start += section_numel
+        return {
+            "chunks": chunks,
+            "layout": LocalNonpersistentObject(
+                (tuple(data.shape), data.numel() - saved_numel, data.new_empty(0))
+            ),
+        }
+
+    @torch.no_grad()
+    def merge(state):
+        shape, padding, prototype = state["layout"]
+        chunks = state["chunks"]
+        flat = torch.cat([chunk.reshape(-1) for chunk in chunks]) if chunks else prototype
+        if padding:
+            flat = torch.cat((flat, flat.new_zeros(padding)))
+        return flat.reshape(shape)
+
+    return ShardedTensorFactory(factory.key, weight, build, merge, replica_id)

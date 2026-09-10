@@ -1756,6 +1756,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             model_sharded_state_dict
         )
         for sh_base in nested_values(model_sharded_state_dict):
+            if isinstance(sh_base, ShardedTensorFactory):
+                sh_base = sh_base.for_optimizer()
             param_to_sharded_metadata[sh_base.data] = sh_base
 
         prefix = 'optimizer.state'
@@ -2014,6 +2016,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             model_sharded_state_dict
         )
         for sh_base in nested_values(model_sharded_state_dict):
+            if isinstance(sh_base, ShardedTensorFactory):
+                sh_base = sh_base.for_optimizer()
             param_to_sharded_metadata[sh_base.data] = sh_base
 
         prefix = 'optimizer.state'

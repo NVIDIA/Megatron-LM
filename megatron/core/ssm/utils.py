@@ -9,6 +9,7 @@ from megatron.core.dist_checkpointing import ShardedTensor
 from megatron.core.dist_checkpointing.mapping import ReplicaId, ShardedTensorFactory
 from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
 from megatron.core.tensor_parallel.gtp_ckpt import (
+    _fused_projection_optimizer_factory,
     _gtp_gather_rows_for_save,
     _gtp_slice_rows_on_load,
 )
@@ -44,8 +45,9 @@ def _split_in_proj_factory(
     Ordinary weights and replicated biases use the section factory directly.
 
     All GTP ranks must call this together when constructing the checkpoint dict.
-    The returned GTP factory merges unflattened model weights; optimizer states
-    continue to use their existing per-shard checkpoint reconstruction.
+    Model weights merge to physical GTP shards. A source-parameter companion
+    maps optimizer tensors and flat DP fragments to the same semantic keys
+    without additional collectives.
     """
     uses_gtp = getattr(weight, "gtp_remat_size", 1) > 1 and HAVE_GTP and is_gtp_param(weight)
     if uses_gtp:
@@ -65,6 +67,8 @@ def _split_in_proj_factory(
     factory = _split_tensor_factory(orig_sh_ten, split_sections, split_names, split_dim=0)
     if uses_gtp:
         factory = _gtp_slice_rows_on_load(factory, weight)
+    else:
+        factory.optimizer_factory = _fused_projection_optimizer_factory(factory, weight)
     return factory
 
 
