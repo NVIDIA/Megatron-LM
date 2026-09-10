@@ -991,15 +991,15 @@ try:
                                 )
                             prompt_suffix_token_ids = prompt_tokens[suffix_start:]
                             prefix_boundary_token_id = eos_token_id
-                        elif required_prefix_token_ids is not None:
-                            # Tokens for the previous turn are supplied by the user.
-                            previous_turn_token_ids = required_prefix_token_ids
                         else:
-                            previous_turn_token_ids = (
-                                previous_prompt_token_ids
-                                + last_assistant_message["generation_token_ids"]
-                            )
-                        if not capture_prefix_requested:
+                            if required_prefix_token_ids is not None:
+                                # Tokens for the previous turn are supplied by the user.
+                                previous_turn_token_ids = required_prefix_token_ids
+                            else:
+                                previous_turn_token_ids = (
+                                    previous_prompt_token_ids
+                                    + last_assistant_message["generation_token_ids"]
+                                )
                             prompt_tokens = _replace_prefix_tokens(
                                 eos_token_id,
                                 previous_turn_token_ids,
