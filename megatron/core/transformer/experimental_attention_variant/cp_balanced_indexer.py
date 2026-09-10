@@ -1450,12 +1450,13 @@ def balanced_compute_cp_indexer_topk(
 ):
     """Balanced drop-in replacement for ``compute_cp_indexer_topk``.
 
-    Returns ``(compressed_topk, layout, compact_predict)`` in the same contiguous ``[l_local, topk]`` layout the
-    caller expects, so ``build_attention_indices`` / sparse attention are unchanged. Every
+    Returns ``(compressed_topk, layout, compact_predict)`` with indices and optional
+    probabilities in contiguous ``[l_local, topk]`` layout, so
+    ``build_attention_indices`` / sparse attention are unchanged. Every
     sequence is tiled into ``2 * cp_size`` chunks; this rank scores chunk ``r`` (head) and chunk
     ``2 * cp_size - 1 - r`` (tail) of every sequence — one cheap and one expensive under
     the causal mask — via per-chunk calls that follow the reference (RoPE positions,
-    causal offsets, packing, tight KV bounds), then combines the top-k back to contiguous
+    causal offsets and compact K packing), then combines the top-k back to contiguous
     order. Eligibility is decided independently for every pack. The CSA integration
     routes a pack with a sequence length not divisible by ``2 * cp_size`` to the
     contiguous reference path before dispatch; the internal check here still raises if

@@ -53,9 +53,9 @@ def _projection(recipe, fp8_param=False):
             init_method=torch.nn.init.normal_,
             bias=False,
             skip_bias_add=False,
+            skip_weight_param_allocation=False,
             parallel_mode="duplicated",
         ).cuda()
-    linear.finish_init(None)
     return config, linear
 
 
