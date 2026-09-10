@@ -115,3 +115,28 @@ for single-GPU MTP1/MTP2 and TP2 with sequence parallelism. PP2 validation was
 interrupted by cluster SSH loss; K3 end-to-end selective-recompute, compile, and
 checkpoint-resume runs remain pending. This is not a complete distributed
 training support matrix.
+
+### Attention Residual FLOPs accounting
+
+The training FLOPs estimator includes the two AttnRes hidden-width contractions
+(depth scoring and weighted-value aggregation). With `T` real tokens, hidden
+width `H`, and `A` total source visits across aggregations, their forward cost
+is `4 * T * H * A`; the existing global forward/backward factor is applied once
+to give `12 * T * H * A`. RMSNorm and depth softmax are excluded by convention.
+This is nominal model work, not measured GPU-kernel work: fusion, recomputation,
+offloading, and the single-source identity shortcut do not change this estimate.
+
+Only trunk layers grow the depth-source history. The trunk output has
+`F = floor((L - 1) / B) + 2` sources, where `L` and block size `B` use the same
+units: Transformer layers for GPT, pattern entries for hybrid. Pipeline `|`
+separators do not count as entries or reset this history. Each MTP depth reads
+those `F` trunk sources plus its fresh partial. GPT adds three aggregations per
+depth (attention, MLP, output); a hybrid MTP pattern of `m` entries adds `m + 1`.
+Thus each depth contributes `(m + 1) * (F + 1)` source visits, with `m = 2` for
+GPT. Reusing MTP parameters does not eliminate any depth's computation.
+
+For example, `K-+E/+E/+E` with `B = 2` has 11 trunk source visits and
+`2 * 3 * 4 = 24` MTP source visits, for 35 total. Concatenating MTP entries onto
+the trunk incorrectly gives 29. Packed-sequence estimates scale this work by
+the real token count, independently of the attention `sum(sequence_length^2)`
+term.

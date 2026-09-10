@@ -864,19 +864,23 @@ def num_floating_point_operations(
         block_layers,
         transformer_layer_layout=False,
         mtp_num_layers=0,
+        mtp_num_sublayers=2,
     ):
         """Calculate forward-equivalent FLOPs for Attention Residual aggregations.
 
         The FLOPs estimator follows the same convention as core attention: it
-        counts the two dominant hidden-width contractions for every depth
+        counts the two hidden-width contractions for every depth
         source (query-key scoring and weighted value accumulation), with the
-        FMA factor baked in. RMSNorm and depth softmax are lower-order terms and
-        are omitted, like the softmax in ``attn_layer_flops``. The caller adds
-        the global forward/backward factor.
+        FMA factor baked in. RMSNorm and depth softmax are omitted by convention,
+        like the softmax in ``attn_layer_flops``. This is a nominal model-FLOPs
+        estimate, independent of backend fusion or the single-source identity
+        shortcut. The caller adds the global forward/backward factor.
 
         ``block_layers`` counts Transformer layers in the standard GPT layout,
         where each layer has attention and MLP aggregations. In the hybrid
         layout it counts pattern entries, each of which has one aggregation.
+        ``num_layers`` counts only the trunk. Each MTP depth has
+        ``mtp_num_sublayers`` aggregations plus its own output aggregation.
         """
         if not isinstance(block_layers, int) or isinstance(block_layers, bool) or block_layers < 1:
             raise ValueError(
@@ -902,11 +906,11 @@ def num_floating_point_operations(
         final_source_arity = (num_layers - 1) // block_layers + 2
         total_source_arity += final_source_arity
 
-        if transformer_layer_layout:
-            # Each GPT MTP depth has attention, MLP, and output aggregations.
-            # All three see the completed trunk history plus that depth's fresh
-            # partial block. Hybrid MTP is rejected by config validation.
-            total_source_arity += 3 * mtp_num_layers * (final_source_arity + 1)
+        # Every MTP aggregation sees the fixed trunk history plus that depth's
+        # fresh partial. MTP entries never open new residual blocks, even when
+        # their count exceeds block_layers. GPT has two sublayers per depth;
+        # hybrid MTP has one per nested pattern entry. Both add an output head.
+        total_source_arity += mtp_num_layers * (mtp_num_sublayers + 1) * (final_source_arity + 1)
 
         # Two contractions per source, each counted as one multiply-add.
         return 4 * total_tokens * hidden_size * total_source_arity
@@ -968,6 +972,7 @@ def num_floating_point_operations(
         dsa_indexer_topk=None,
         enable_attention_residuals=False,
         attn_res_block_layers=None,
+        hybrid_layer_pattern=None,
     ):
         """Calculate total FLOPs for the hybrid model."""
         # Self-attention (already summed over all attention layers, fwd-equivalent
@@ -1038,17 +1043,18 @@ def num_floating_point_operations(
 
         attn_res_flops_total = 0
         if enable_attention_residuals:
-            num_hybrid_layers = (
-                num_attn_layers
-                + num_mla_layers
-                + num_kda_layers
-                + num_mamba_layers
-                + num_mlp_layers
-                + num_moe_layers
-                + num_gdn_layers
-            )
+            from megatron.core.models.hybrid.hybrid_layer_allocation import parse_hybrid_pattern
+
+            # The per-type counts above include MTP entries. Only trunk entries
+            # grow the depth history, so preserve the pattern's trunk/MTP split.
+            parsed_pattern = parse_hybrid_pattern(hybrid_layer_pattern)
             attn_res_flops_total = attention_residual_flops(
-                total_tokens, hidden_size, num_hybrid_layers, attn_res_block_layers
+                total_tokens=total_tokens,
+                hidden_size=hidden_size,
+                num_layers=len((parsed_pattern.main_pattern or "").replace("|", "")),
+                block_layers=attn_res_block_layers,
+                mtp_num_layers=parsed_pattern.mtp_num_depths,
+                mtp_num_sublayers=len(parsed_pattern.mtp_pattern or ""),
             )
 
         flops_fwd = (
@@ -1652,6 +1658,7 @@ def num_floating_point_operations(
             dsa_indexer_topk=getattr(args, "dsa_indexer_topk", None),
             enable_attention_residuals=getattr(args, "enable_attention_residuals", False),
             attn_res_block_layers=getattr(args, "attn_res_block_layers", None),
+            hybrid_layer_pattern=args.hybrid_layer_pattern,
         )
     else:
         # Compute standard Transformer model FLOPs.
