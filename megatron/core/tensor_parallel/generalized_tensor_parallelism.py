@@ -510,6 +510,7 @@ def configure_gtp_remat_from_recipe(
     fp8=False,
     calculate_per_token_loss=False,
     reduce_scatter_with_fp32_accumulation=False,
+    pad_for_alignment=None,
 ):
     """
     Configure GTP weight-remat (padding + loss reduction) from the training recipe.
@@ -523,7 +524,11 @@ def configure_gtp_remat_from_recipe(
         check_param_states=False,
         reduce_scatter_with_fp32_accumulation=reduce_scatter_with_fp32_accumulation,
     )
-    if fp4:
+    # An explicit value wins over the recipe defaults: 32 for MXFP8, 16 for other
+    # quantized recipes, and 1 for BF16 (the minimum needed for even GTP sharding).
+    if pad_for_alignment is not None:
+        update_gtp_config(pad_for_alignment=pad_for_alignment)
+    elif fp4:
         update_gtp_config(pad_for_alignment=16)
     elif fp8_recipe == "mxfp8":
         update_gtp_config(pad_for_alignment=32)
