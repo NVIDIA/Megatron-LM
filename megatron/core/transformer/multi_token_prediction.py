@@ -15,10 +15,9 @@ from megatron.core.context_parallel import ContextParallelBatch, convert_cp_layo
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping, replace_prefix_for_sharding
 from megatron.core.enums import Fp8Recipe
-from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.inference.utils import InferenceMode
-from megatron.core.models.backends import BackendSpecProvider, LocalSpecProvider
+from megatron.core.models.backends import BackendSpecProvider, get_backend
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.utils import is_vp_last_stage
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -61,11 +60,6 @@ SUPPORTED_ATTN_MASK = [
     AttnMaskType.no_mask,
     AttnMaskType.padding_causal,
 ]
-
-if HAVE_TE:
-    from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
-else:
-    TESpecProvider = None
 
 from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
 
@@ -761,7 +755,7 @@ class MultiTokenPredictionLayerSubmodules:
 
 
 def get_mtp_layer_spec(
-    mtp_model_layer_spec: ModuleSpec, use_transformer_engine: bool
+    mtp_model_layer_spec: ModuleSpec, use_transformer_engine: bool, rms_norm: bool = False
 ) -> ModuleSpec:
     """Get the MTP layer spec.
 
@@ -770,20 +764,25 @@ def get_mtp_layer_spec(
     """
     return get_mtp_layer_spec_for_backend(
         mtp_model_layer_spec,
-        backend=TESpecProvider() if use_transformer_engine else LocalSpecProvider(),
+        backend=get_backend("transformer_engine" if use_transformer_engine else "local"),
+        rms_norm=rms_norm,
     )
 
 
 def get_mtp_layer_spec_for_backend(
-    mtp_model_layer_spec: ModuleSpec, backend: BackendSpecProvider
+    mtp_model_layer_spec: ModuleSpec, backend: BackendSpecProvider, rms_norm: bool = False
 ) -> ModuleSpec:
     """Get the MTP layer spec.
+
+    Args:
+        rms_norm: whether the model uses RMSNorm. Must match ``config.normalization``: a
+            backend may answer with a LayerNorm-only kernel that refuses an RMSNorm config.
 
     Returns:
         ModuleSpec: Module specification with modules from the backend.
     """
     column_parallel_linear_impl: type = backend.column_parallel_linear()
-    layer_norm_impl = backend.layer_norm()
+    layer_norm_impl = backend.layer_norm(rms_norm=rms_norm)
     mtp_layer_spec = ModuleSpec(
         module=MultiTokenPredictionLayer,
         submodules=MultiTokenPredictionLayerSubmodules(

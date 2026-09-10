@@ -3713,6 +3713,21 @@ try:
 except ImportError:
     te_parallel_cross_entropy = None  # type: ignore[assignment, misc]
 
+
+def te_cross_entropy(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    tp_group: torch.distributed.ProcessGroup | None = None,
+    *,
+    cuda_graph_capturable: bool = False,
+) -> torch.Tensor:
+    """Adapt TE cross entropy to the backend target signature and required label stride."""
+    if te_parallel_cross_entropy is None:
+        raise RuntimeError("Trying to use a TE block when it's not present.")
+    labels = torch.as_strided(labels, labels.size(), (labels.size()[1], 1))
+    return te_parallel_cross_entropy(logits, labels, tp_group, cuda_graph_capturable)
+
+
 try:
     from transformer_engine.pytorch.cpp_extensions import general_gemm
 
