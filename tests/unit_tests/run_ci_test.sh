@@ -134,6 +134,12 @@ MASTER_PORT=${MASTER_PORT:-29500}
 NUM_NODES=${NUM_NODES:-${SLURM_NNODES:-1}}
 GPUS_PER_NODE=${GPUS_PER_NODE:-8}
 NODE_RANK=${SLURM_NODEID:-${SLURM_NODEID:-0}}
+# Nodes can share the checkout. Keep their coverage inputs and combined files
+# separate so one node cannot consume or overwrite another node's results.
+export COVERAGE_FILE=${COVERAGE_FILE:-.coverage}
+if [[ "$NUM_NODES" -gt 1 ]]; then
+    COVERAGE_FILE="${COVERAGE_FILE}.node${NODE_RANK}"
+fi
 DISTRIBUTED_ARGS=(
     --nproc_per_node $GPUS_PER_NODE
     --nnodes $NUM_NODES
@@ -168,7 +174,7 @@ for i in $(seq $UNIT_TEST_REPEAT); do
     echo "Running prod test suite."
     CMD=$(echo uv run --no-sync python -m torch.distributed.run ${DISTRIBUTED_ARGS[@]} \
         -m coverage run \
-        --data-file=.coverage.unit_tests \
+        --data-file=${COVERAGE_FILE}.unit_tests \
         --source=megatron/core \
         -m pytest \
         -vs \

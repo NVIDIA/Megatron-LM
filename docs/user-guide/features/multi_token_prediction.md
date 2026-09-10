@@ -147,3 +147,6 @@ requires eight global ranks (for example, two four-GPU GB200 nodes); the file
 is selected by the `launch_on_gb200` CI marker. Multi-node tests must use
 torchrun's global `RANK` for process-group membership, not the per-node
 `LOCAL_RANK`. The launcher must supply the same master address to both nodes.
+On a shared checkout, the CI runner writes and combines node-specific coverage
+files (`.coverage.node0`, `.coverage.node1`, and so on) to avoid concurrent
+mergers consuming each other's inputs; single-node output stays `.coverage`.
