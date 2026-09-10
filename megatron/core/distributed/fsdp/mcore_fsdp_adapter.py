@@ -887,7 +887,7 @@ def _build_expert_mesh_and_placements(
     ddp_config: DistributedDataParallelConfig,
     pg_collection: ProcessGroupCollection,
     device_type: str,
-) -> "tuple[DeviceMesh | None, Placements | None]":
+) -> Tuple[DeviceMesh | None, Placements | None]:
     """Build the expert-DP mesh and placements, or return neither when EP is disabled."""
     if config.expert_model_parallel_size <= 1:
         return None, None
