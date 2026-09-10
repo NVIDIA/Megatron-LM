@@ -15,6 +15,13 @@ H100 DSA PP4 training also used Frontend `1.26.0`, CUTLASS DSL `4.5.0`,
 FlashMLA revision `b7643bd54521f563b839b98289b5cd048c062ba2`, and Hadamard `1.1.0`.
 Use GB200 for MXFP8 coverage. Completed training and numerical parity are recorded separately.
 
+The GPU runs and frozen-weight comparisons below were collected on the follow-up
+history ending at `d0ce976bf`, before rebasing onto #6058 at `61475056e`. That
+dependency update changes compact indexer scoring and sparse-loss prediction
+precision. The rebase includes local protocol/liveness checks and a regression
+for the relocated shared backward-weight wrapper; GPU training and numerical
+comparisons have not been rerun on the rebased code.
+
 ## Four-GPU ordinary PP2 training
 
 ```bash

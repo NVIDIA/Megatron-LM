@@ -1,4 +1,4 @@
-# Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Schedule-plan helpers shared by GPTModel and HybridModel.
 
@@ -18,6 +18,7 @@ import torch
 
 from megatron.core.pipeline_parallel.utils import ScheduleNode, make_viewless
 from megatron.core.transformer.enums import CudaGraphModule
+from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import GraphableMegatronModule, float16_to_fp32
 from megatron.core.transformer.transformer_layer import TransformerLayer, make_viewless_tensor
 from megatron.core.utils import internal_api, nvtx_range_pop, nvtx_range_push
@@ -395,7 +396,13 @@ class _BackwardDWWrapper:
         ), "cuda graphed ep overlap only supports TransformerLayer for now."
         self.layer = layer
         self.graphed_backward_dw_callable = None
-        self.attn_dw_callable = layer.self_attention.backward_dw
+        # Hybrid E/dense layers use IdentityOp for their absent attention. They
+        # still construct this wrapper when building their overlap schedule.
+        self.attn_dw_callable = (
+            None
+            if isinstance(layer.self_attention, IdentityOp)
+            else layer.self_attention.backward_dw
+        )
         self.submodules = [layer.self_attention]
         if layer.is_moe_layer:
             self.shared_expert_dw_callable = partial(
@@ -414,7 +421,9 @@ class _BackwardDWWrapper:
             not is_replay or CudaGraphModule.moe_router not in self.cuda_graph_modules
         ):
             self.shared_expert_dw_callable()
-        if not is_replay or CudaGraphModule.attn not in self.cuda_graph_modules:
+        if self.attn_dw_callable is not None and (
+            not is_replay or CudaGraphModule.attn not in self.cuda_graph_modules
+        ):
             self.attn_dw_callable()
         if is_replay and self.graphed_backward_dw_callable is not None:
             self.graphed_backward_dw_callable()
