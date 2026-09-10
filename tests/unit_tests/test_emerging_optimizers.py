@@ -24,9 +24,9 @@ from megatron.core.optimizer.emerging_optimizers import (
     TensorParallelAdaptiveMuon,
     TensorParallelMuon,
     _get_qkv_split_shapes,
-    _select_tp_mode,
     _localize_qkv_split_shapes,
     _qkv_split_groups_are_complete,
+    _select_tp_mode,
     get_supported_coefficient_types,
     validate_coefficient_type,
 )

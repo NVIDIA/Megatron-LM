@@ -55,6 +55,7 @@ logger = logging.getLogger(__name__)
 # elsewhere in the tree are written.
 _SYRK_MIN_EO_VERSION = "0.4.0.dev0"
 
+
 def get_supported_coefficient_types() -> tuple[str, ...]:
     """Return the coefficient types supported by the installed emerging_optimizers.
 

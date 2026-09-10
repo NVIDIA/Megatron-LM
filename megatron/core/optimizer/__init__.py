@@ -745,8 +745,9 @@ def qkv_rows_after_gtp_gather(
     shard-local test switches the split off on GTP ranks while TP1 keeps it, and one
     weight gets two different Muon rules.
 
-    The count is still TP-local, which is enough to decide because TP splits whole query
-    groups -- but it is not model-global, so do not reuse it for checkpoint shapes.
+    The count is still TP-local. ``splittable`` therefore describes only the tensor after
+    its GTP gather; callers that support query groups fragmented across TP ranks must make
+    the final decision from the full layer layout and the combined TP/GTP row count.
 
     Args:
         param: Fused QKV weight; reads ``is_gtp_weight_remat`` and ``pad_length``.
