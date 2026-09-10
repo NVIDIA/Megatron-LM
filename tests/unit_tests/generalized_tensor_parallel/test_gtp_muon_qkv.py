@@ -355,6 +355,38 @@ def _worker_auto_mode_forces_duplicated_for_split(rank, world_size, port):
         torch.testing.assert_close(out, ref[gr * sp : (gr + 1) * sp, :], atol=_ATOL, rtol=_RTOL)
 
 
+def _worker_auto_mode_forces_duplicated_for_split(rank, world_size, port):
+    """Reconstructed QKV under ``auto`` must use duplicated, non-TP NS."""
+    _init_model_parallel(1, world_size)
+    try:
+        pgc = ProcessGroupCollection.use_mpu_process_groups()
+        opt = _make_muon(pgc, tp_mode="auto")
+        opt.split_qkv = True
+        opt.is_qkv_fn = lambda p: getattr(p, "is_qkv", False)
+        opt.qkv_split_shapes = _SPLIT
+        w = _full_weight()
+        ref = _reference_split_orth(_make_muon(pgc), w, pgc.tp)
+
+        gs = torch.distributed.get_world_size(group=pgc.gtp_remat)
+        gr = torch.distributed.get_rank(group=pgc.gtp_remat)
+        sp = _M // gs
+        local = w[gr * sp : (gr + 1) * sp, :].clone()
+        local.is_qkv = True
+        local.is_gtp_weight_remat = True
+        local.qkv_split_shapes = _SPLIT
+        local.qkv_split_shapes_global = _SPLIT * _GROUPS
+        local.qkv_split_groups_are_complete = False
+        local.qkv_gtp_pad_length = 0
+        local.partition_dim = 0
+
+        out = opt.orthogonalize(local, local.clone())
+        assert not opt._warned_distributed_qkv_fallback
+        torch.testing.assert_close(out, ref[gr * sp : (gr + 1) * sp, :], atol=_ATOL, rtol=_RTOL)
+    finally:
+        ps.destroy_model_parallel()
+        ps.initialize_model_parallel()
+
+
 def _worker_partial_pg_collection(rank, world_size, port):
     """The tagging loop and the step must resolve the SAME GTP group.
 
