@@ -20,7 +20,7 @@ from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
-from megatron.core.transformer.attention import SelfAttention
+from megatron.core.transformer.attention import Attention, SelfAttention
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.utils import is_te_min_version, unwrap_model
 from megatron.training.arguments import parse_args
@@ -806,3 +806,45 @@ def test_qk_layernorm_spec_config_mismatch_raises():
             SelfAttention(config, submodules, layer_number=1)
     finally:
         Utils.destroy_model_parallel()
+
+
+class TestFlashDecodeSoftcapPlumbing:
+    """The direct flash-attention paths bypass core_attention, so the cap must be passed there.
+
+    Asserted by interception rather than by numerics: what matters is that the kwarg carries the
+    configured value, and that it is absent entirely when softcapping is off, so runs that do not
+    use it keep working against flash-attn builds that predate the kwarg.
+    """
+
+    def _call_flash_decode(self, softcap, kernel):
+        """Invoke Attention.flash_decode with a stub self, returning the kernel's kwargs."""
+        attn = mock.Mock()
+        attn.config.attn_logit_softcapping = softcap
+        attn._get_inference_softmax_offset.return_value = None
+        t = torch.zeros(2, 1, 4, 8)
+        with mock.patch(
+            "megatron.core.transformer.attention.flash_attn_with_kvcache", kernel
+        ), mock.patch("megatron.core.transformer.attention.is_fa_min_version", return_value=True):
+            Attention.flash_decode(
+                attn,
+                sequence_len_offset=torch.tensor([1]),
+                query_layer=t,
+                key_layer=t,
+                value_layer=t,
+                inference_key_memory=t,
+                inference_value_memory=t,
+                rotary_cos=None,
+                rotary_sin=None,
+            )
+        return kernel.call_args.kwargs
+
+    def test_softcap_is_passed_when_configured(self):
+        kernel = mock.Mock(return_value=torch.zeros(2, 1, 4, 8))
+        kwargs = self._call_flash_decode(50.0, kernel)
+        assert kwargs["softcap"] == 50.0
+
+    def test_softcap_kwarg_is_absent_when_disabled(self):
+        """Omitted, not passed as 0.0, so older flash-attn builds are unaffected."""
+        kernel = mock.Mock(return_value=torch.zeros(2, 1, 4, 8))
+        kwargs = self._call_flash_decode(None, kernel)
+        assert "softcap" not in kwargs
