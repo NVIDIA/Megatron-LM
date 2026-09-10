@@ -12,6 +12,7 @@ import torch
 
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.gpt_dataset import GPTDatasetConfig, MockGPTDataset
+from megatron.core.datasets.megatron_dataset import is_out_of_vocab_token_id
 from megatron.core.datasets.utils import compile_helpers
 from megatron.core.tokenizers import MegatronTokenizer
 from megatron.core.utils import _merge_cu_seqlens_across_micro_batch
@@ -188,6 +189,79 @@ def test_inter_document_masking():
     sample = datasets[0][None]
     assert not torch.any(sample["loss_mask"])
     assert "cu_seqlens" in sample
+
+
+def test_is_out_of_vocab_token_id():
+    assert is_out_of_vocab_token_id(-1) is True
+    assert is_out_of_vocab_token_id(-1, vocab_size=8192) is True
+    assert is_out_of_vocab_token_id(0) is False
+    assert is_out_of_vocab_token_id(0, vocab_size=8192) is False
+    assert is_out_of_vocab_token_id(7, vocab_size=8192) is False
+    assert is_out_of_vocab_token_id(8191, vocab_size=8192) is False
+    assert is_out_of_vocab_token_id(8192, vocab_size=8192) is True
+    assert is_out_of_vocab_token_id(100, vocab_size=None) is False
+
+
+def test_pad_token_id_preservation():
+    if torch.distributed.is_available():
+        Utils.initialize_distributed()
+        if torch.distributed.get_rank() == 0:
+            compile_helpers()
+        torch.distributed.barrier()
+    else:
+        compile_helpers()
+
+    # A valid, non-zero pad token id is in [0, vocab_size), so it must be
+    # preserved in both `tokens` and `labels`. The -1 sentinel is out of
+    # vocabulary and must be remapped to 0 so embedding lookups do not crash.
+    valid_pad_id = 7
+    for pad_id, expected_pad_value in [(valid_pad_id, valid_pad_id), (-1, 0)]:
+        tokenizer = MegatronTokenizer.from_pretrained(
+            metadata_path={"library": "null-text"}, vocab_size=_MOCK_VOCAB_SIZE, pad_id=pad_id
+        )
+
+        config = GPTDatasetConfig(
+            random_seed=1234,
+            sequence_length=1024,
+            split="990,10,0",
+            reset_position_ids=True,
+            reset_attention_mask=True,
+            eod_mask_loss=True,
+            drop_last_partial_validation_sequence=False,
+            add_extra_token_to_sequence=False,
+            tokenizer=tokenizer,
+            mid_level_dataset_surplus=0.005,
+        )
+
+        datasets = BlendedMegatronDatasetBuilder(
+            MockGPTDataset, [0, None, 0], lambda: True, config
+        ).build()
+
+        dataset = datasets[1]
+        assert dataset._pad_token_id == pad_id
+
+        # For the -1 sentinel, no out-of-vocabulary value may survive.
+        # For a valid pad id, no token may be forced to 0.
+        for idx in range(10):
+            sample = dataset[idx]
+            if pad_id == -1:
+                assert torch.all(sample["tokens"] >= 0)
+                assert torch.all(sample["labels"] >= 0)
+            else:
+                assert torch.all(sample["tokens"] != 0)
+                assert torch.all(sample["labels"] != 0)
+
+        # Everything after the last EOD token is padding, so the final partial
+        # sample (with drop_last_partial_validation_sequence=False) exposes
+        # trailing padded positions we can inspect deterministically.
+        sample = dataset[dataset.shuffle_index.argmax()]
+        argmax = sample["labels"].shape[0] - torch.flip(sample["labels"], [0]).argmax() - 1
+        assert argmax < sample["labels"].shape[0] - 1
+
+        # Padded positions must keep the in-vocab pad id (or be remapped to 0
+        # for the sentinel), and the loss mask must be zeroed there in all cases.
+        assert torch.all(sample["labels"][argmax + 1 :] == expected_pad_value)
+        assert torch.all(sample["loss_mask"][argmax + 1 :] == 0.0)
 
 
 if __name__ == "__main__":

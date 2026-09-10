@@ -20,6 +20,23 @@ LowLevelDataset = Union[IndexedDataset, Iterable]
 _PAD_TOKEN_ID = -1
 
 
+def is_out_of_vocab_token_id(token_id: int, vocab_size: int | None = None) -> bool:
+    """Check whether a token id cannot be used directly as an embedding index.
+
+    Args:
+        token_id (int): The token id to validate.
+        vocab_size (int | None, optional): The tokenizer vocabulary size, if known.
+
+    Returns:
+        bool: True if token_id is negative or greater than or equal to vocab_size.
+    """
+    if token_id < 0:
+        return True
+    if vocab_size is not None and token_id >= vocab_size:
+        return True
+    return False
+
+
 class MegatronDataset(ABC, torch.utils.data.Dataset):
     """The highest level wrapper class from which all dataset classes should inherit
 
