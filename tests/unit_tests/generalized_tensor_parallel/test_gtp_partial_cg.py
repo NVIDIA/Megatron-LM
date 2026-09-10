@@ -6,6 +6,7 @@ This is the local-CUDA-graph counterpart of ``test_gtp_loss_correctness.py``. It
 execution with attention-only local CUDA graphs under the same GTP2 x DP2 topology, with and
 without cross-graph RS overlap. It verifies the complete loss trajectory and global gradient norm,
 including repeated replays of one backward.
+Validation between optimizer steps also checks separate forward-only graphs and resumed training.
 """
 
 import copy
@@ -191,6 +192,14 @@ def _worker_gtp_partial_cg_correctness(rank, world_size, port, partial_cg_module
         torch.manual_seed(seed + replica_rank)
         return torch.randn(sequence_length, batch_size, hidden, dtype=dtype, device="cuda")
 
+    def evaluate(layers, step, replica_rank):
+        layers.eval()
+        try:
+            with torch.no_grad():
+                return run_step(layers, make_replica_input(12000 + step, replica_rank)).item()
+        finally:
+            layers.train()
+
     def global_grad_norm(layers, grad_stats_group):
         """Mirror Megatron's GTP duplicate filtering and global L2-norm reduction."""
         grads = []
@@ -239,6 +248,7 @@ def _worker_gtp_partial_cg_correctness(rank, world_size, port, partial_cg_module
 
     eager_losses = []
     eager_grad_norms = []
+    eager_eval_losses = []
     for step in range(steps):
         reset_grad_state(eager)
         x = make_replica_input(step * world_size, eager_dp_rank)
@@ -249,6 +259,8 @@ def _worker_gtp_partial_cg_correctness(rank, world_size, port, partial_cg_module
         wait_for_gtp_grad_reduction_on_current_stream()
         eager_grad_norms.append(global_grad_norm(eager, eager_gtp_group))
         apply_sgd_step(eager, eager_gtp_group.size())
+        if step in (0, steps // 2, steps - 1):
+            eager_eval_losses.append(evaluate(eager, step, eager_dp_rank))
 
     del eager, loss, x
     torch.cuda.synchronize()
@@ -292,6 +304,7 @@ def _worker_gtp_partial_cg_correctness(rank, world_size, port, partial_cg_module
 
     partial_cg_losses = []
     partial_cg_grad_norms = []
+    partial_cg_eval_losses = []
     try:
         # Record one eager backward, then replay the same input and weights. This isolates the
         # graph execution path: model state, GTP topology, and reduction order are unchanged.
@@ -357,6 +370,14 @@ def _worker_gtp_partial_cg_correctness(rank, world_size, port, partial_cg_module
             wait_for_gtp_grad_reduction_on_current_stream()
             partial_cg_grad_norms.append(global_grad_norm(partial_cg, gtp_group))
             apply_sgd_step(partial_cg, gtp_size)
+            if step in (0, steps // 2, steps - 1):
+                partial_cg_eval_losses.append(evaluate(partial_cg, step, dp_rank))
+                for manager in managers:
+                    val_runner = manager.cudagraph_runners[0].val_runner
+                    assert val_runner is not None
+                    assert not val_runner.grad_enabled
+                    assert val_runner.bwd_graph is None
+                    assert val_runner.mempool == manager.cudagraph_runners[0].mempool
         del loss, x
     finally:
         torch.cuda.synchronize()
@@ -387,6 +408,9 @@ def _worker_gtp_partial_cg_correctness(rank, world_size, port, partial_cg_module
     )
     torch.testing.assert_close(
         torch.tensor(partial_cg_grad_norms), torch.tensor(eager_grad_norms), atol=1e-6, rtol=5e-3
+    )
+    torch.testing.assert_close(
+        torch.tensor(partial_cg_eval_losses), torch.tensor(eager_eval_losses), atol=1e-6, rtol=5e-3
     )
 
 
