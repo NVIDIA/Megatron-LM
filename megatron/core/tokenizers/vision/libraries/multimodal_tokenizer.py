@@ -257,6 +257,7 @@ class MegatronMultimodalTokenizer:
         """
         tokenize = True
         if self.use_gigatoken:
+            # Tokenize conversation with separately gigatoken to get better performance.
             tokenize = False
         if return_target and not tokenize:
             raise ValueError(
