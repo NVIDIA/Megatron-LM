@@ -12,6 +12,8 @@ from transformer_engine.pytorch.fp8 import check_fp8_support
 import megatron.core.transformer.cuda_graphs as cuda_graphs_module
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.enums import ModelType
+from megatron.core.fp4_utils import get_fp4_context
+from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_decoder_block_spec,
     get_gpt_layer_with_transformer_engine_spec,
@@ -1957,6 +1959,7 @@ class TestLocalCudaGraphEvaluation:
         for runner in val_runners:
             assert not runner.grad_enabled
             assert not runner.training
+            assert runner.status == cuda_graphs_module._GraphStatus.FWD_READY
             assert runner.fwd_graph is not None
             assert runner.bwd_graph is None
             assert runner.mempool == CudaGraphManager.global_mempool
@@ -1993,6 +1996,106 @@ class TestLocalCudaGraphEvaluation:
         with torch.no_grad():
             eval_output = first_output(ddp_model(test_input.detach()))
             torch.testing.assert_close(eval_output, reference_output)
+
+    @pytest.mark.skipif(not fp8_available, reason="FP8 requires supported hardware")
+    @pytest.mark.parametrize("recipe", ["delayed", "mxfp8", "nvfp4"])
+    @pytest.mark.parametrize("pp_size", [1, 2])
+    def test_validation_capture_preserves_quantization_state(self, recipe, pp_size, monkeypatch):
+        Utils.destroy_model_parallel()
+        Utils.initialize_model_parallel(pipeline_model_parallel_size=pp_size)
+        model_parallel_cuda_manual_seed(123)
+        if recipe == "mxfp8":
+            from transformer_engine.pytorch.fp8 import check_mxfp8_support
+
+            supported, reason = check_mxfp8_support()
+            if not supported:
+                pytest.skip(reason)
+        elif recipe == "nvfp4":
+            if not is_te_min_version("2.7.0.dev0"):
+                pytest.skip("NVFP4 requires TE >= 2.7")
+            from transformer_engine.pytorch.fp8 import check_nvfp4_support
+
+            supported, reason = check_nvfp4_support()
+            if not supported:
+                pytest.skip(reason)
+
+        config = _base_cuda_graph_config(
+            cuda_graph_impl="local",
+            cuda_graph_warmup_steps=2,
+            fp8="e4m3" if recipe != "nvfp4" else None,
+            fp8_recipe=recipe if recipe != "nvfp4" else "delayed",
+            fp4="e2m1" if recipe == "nvfp4" else None,
+        )
+
+        class QuantizedModule(MegatronModule):
+            def __init__(self):
+                super().__init__(config)
+                self.layer_number = 1
+                self.is_first_microbatch = True
+                self.projection = TELinear(64, 64, bias=False, params_dtype=torch.bfloat16)
+                self.register_buffer("forward_steps", torch.zeros(1, device="cuda"))
+
+            def forward(self, x):
+                self.forward_steps.add_(1)
+                output = self.projection(x, is_first_microbatch=self.is_first_microbatch)
+                self.is_first_microbatch = False
+                return output
+
+        module = QuantizedModule()
+        with torch.no_grad():
+            module.projection.weight.fill_(0.125)
+        manager = CudaGraphManager(config, base_module=module, function_name="forward")
+        module.cudagraph_manager = manager
+        ddp_model = DistributedDataParallel(config, DistributedDataParallelConfig(), module)
+        context = get_fp4_context if recipe == "nvfp4" else get_fp8_context
+        x = torch.ones(64, 64, device="cuda", dtype=torch.bfloat16)
+
+        def train_step():
+            ddp_model.zero_grad_buffer()
+            module.set_is_first_microbatch()
+            for _ in range(pp_size):
+                with context(config):
+                    output = ddp_model(x.detach().requires_grad_())
+                output.sum().backward()
+            ddp_model.finish_grad_sync()
+            return output.detach().clone()
+
+        train_step()
+        create_val_graph = _CudaGraphRunner.create_val_graph
+        checked_state = []
+
+        def capture_val(runner):
+            buffers = {name: buf.clone() for name, buf in module.named_buffers()}
+            quant_recipe = runner.fp4_recipe if recipe == "nvfp4" else runner.fp8_recipe
+            quant_state = cuda_graphs_module.save_fp8_tensors([module], quant_recipe)
+            create_val_graph(runner)
+            torch.testing.assert_close(dict(module.named_buffers()), buffers)
+            torch.testing.assert_close(
+                cuda_graphs_module.save_fp8_tensors([module], quant_recipe), quant_state
+            )
+            checked_state.append(True)
+
+        monkeypatch.setattr(_CudaGraphRunner, "create_val_graph", capture_val)
+        create_cudagraphs()
+        assert checked_state == [True] * len(manager.cudagraph_runners)
+        reference = train_step()
+        module.eval()
+        module.set_is_first_microbatch()
+        with torch.no_grad(), context(config):
+            for _ in range(2):
+                torch.testing.assert_close(module(x), reference)
+                assert not manager.is_first_microbatch
+            # Preserve the calibrated range: increasing magnitude saturates delayed FP8.
+            module.projection.weight.neg_()
+        # The first training microbatch must refresh weights after validation's second
+        # microbatch disabled the shared FP8/FP4 parameter-cache update flag.
+        module.train()
+        torch.testing.assert_close(train_step(), -reference, rtol=0, atol=0)
+        module.eval()
+        module.set_is_first_microbatch()
+        with torch.no_grad(), context(config):
+            module.projection.weight.neg_()
+            torch.testing.assert_close(module(x), reference, rtol=0, atol=0)
 
     def test_shared_pool_preserves_live_output_aliases(self):
         class InplaceModule(MegatronModule):
