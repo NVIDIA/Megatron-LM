@@ -138,6 +138,14 @@ class TestSelectUnitTests(unittest.TestCase):
                 [Change(status="M", path="tests/unit_tests/always_run_tests.json")],
                 "high-impact file changed",
             ),
+            "root shared fixture": (
+                [Change(status="M", path="tests/unit_tests/conftest.py")],
+                "high-impact file changed",
+            ),
+            "nested shared fixture": (
+                [Change(status="M", path="tests/unit_tests/models/conftest.py")],
+                "high-impact file changed",
+            ),
             "dynamically loaded tokenizer backend": (
                 [
                     Change(
@@ -473,7 +481,9 @@ class TestSelectUnitTests(unittest.TestCase):
     @unittest.skipUnless(
         shutil.which("impacted-tests"), "requires the selective-testing environment"
     )
-    def test_real_analysis_follows_relative_imports_and_transitive_test_helpers(self) -> None:
+    def test_real_analysis_follows_transitive_imports_without_expanding_unchanged_fixtures(
+        self,
+    ) -> None:
         from pytest_impacted._rust import RUST_AVAILABLE
 
         if not RUST_AVAILABLE:
@@ -488,6 +498,9 @@ class TestSelectUnitTests(unittest.TestCase):
             "tests/unit_tests/models/test_model.py",
             "from tests.unit_tests.models.helpers import VALUE\n",
         )
+        fixtures = ["tests/unit_tests/conftest.py", "tests/unit_tests/models/conftest.py"]
+        for fixture in fixtures:
+            self._write(fixture, "from tests.unit_tests.models.helpers import VALUE\n")
         base_sha = self._initialize_git_repository()
         real_calls: list[list[str]] = []
 
@@ -509,10 +522,12 @@ class TestSelectUnitTests(unittest.TestCase):
                 subprocess.run(
                     ["git", "commit", "--quiet", "-m", "change"], cwd=self.repo_root, check=True
                 )
+                changes = find_changes(self.repo_root, "branch", base_sha)
+                self.assertEqual(changes, [Change(status="M", path=changed_path)])
                 report = select_unit_tests(
                     self.repo_root,
                     self.buckets,
-                    find_changes(self.repo_root, "branch", base_sha),
+                    changes,
                     "branch",
                     base_sha,
                     runner=real_runner,
@@ -521,6 +536,12 @@ class TestSelectUnitTests(unittest.TestCase):
                 self.assertEqual(report["mode"], "selective", report["reason"])
                 self.assertEqual(len(real_calls), calls_before + 1)
                 self.assertEqual(report["impact_analysis"]["status"], "succeeded")
+                raw_files = {
+                    (self.repo_root / path).resolve().relative_to(self.repo_root).as_posix()
+                    for path in report["impact_analysis"]["raw_selected_files"]
+                }
+                self.assertTrue(set(fixtures).issubset(raw_files), raw_files)
+                self.assertIn("tests/unit_tests/models/test_model.py", raw_files)
                 self.assertEqual(
                     report["impacted_files"], ["tests/unit_tests/models/test_model.py"]
                 )
@@ -545,12 +566,67 @@ class TestSelectUnitTests(unittest.TestCase):
             report, "pytest-impacted returned no unit tests for an analyzable change"
         )
 
-    def test_impacted_conftest_falls_back_to_all_buckets(self) -> None:
-        report = self._select(
-            CommandResult(returncode=0, stdout="tests/unit_tests/conftest.py\n", stderr="")
-        )
+    def test_impacted_unchanged_conftest_preserves_analyzer_test_selection(self) -> None:
+        test_path = "tests/unit_tests/models/test_model.py"
+        for fixture_path in ("tests/unit_tests/conftest.py", "tests/unit_tests/models/conftest.py"):
+            self._write(fixture_path)
+            for record_impact in (False, True):
+                with self.subTest(fixture_path=fixture_path, record_impact=record_impact):
+                    report = self._select(
+                        CommandResult(
+                            returncode=0, stdout=f"{fixture_path}\n{test_path}\n", stderr=""
+                        ),
+                        record_impact=record_impact,
+                    )
 
-        self._assert_full_report(report, "pytest-impacted reported an impacted shared fixture")
+                    self.assertEqual(report["mode"], "selective", report["reason"])
+                    self.assertEqual(report["candidate_selection"]["mode"], "selective")
+                    self.assertEqual(report["impacted_files"], [test_path])
+                    self.assertEqual(
+                        report["selected_files"], [test_path, "tests/unit_tests/test_root.py"]
+                    )
+                    self.assertEqual(
+                        [entry["bucket"] for entry in report["matrix"]], self.buckets[:2]
+                    )
+                    self.assertEqual(
+                        _decode_test_files(report["matrix"][1]["unit_test_files"]), [test_path]
+                    )
+                    analysis = report["impact_analysis"]
+                    self.assertEqual(analysis["status"], "succeeded")
+                    self.assertEqual(analysis["selected_files"], [test_path])
+                    self.assertEqual(analysis["selected_count"], 1)
+                    self.assertEqual(analysis["raw_selected_files"], [fixture_path, test_path])
+
+    def test_impacted_conftest_without_runnable_tests_falls_back_to_all_buckets(self) -> None:
+        fixture_path = "tests/unit_tests/conftest.py"
+        self._write(fixture_path)
+        for record_impact in (False, True):
+            with self.subTest(record_impact=record_impact):
+                report = self._select(
+                    CommandResult(returncode=0, stdout=f"{fixture_path}\n", stderr=""),
+                    record_impact=record_impact,
+                )
+
+                self._assert_full_report(
+                    report, "pytest-impacted returned no unit tests for an analyzable change"
+                )
+                self.assertEqual(report["impact_analysis"]["status"], "succeeded")
+                self.assertEqual(report["impact_analysis"]["selected_files"], [])
+                self.assertEqual(report["impact_analysis"]["raw_selected_files"], [fixture_path])
+
+    def test_missing_impacted_conftest_falls_back_to_all_buckets(self) -> None:
+        output = "tests/unit_tests/conftest.py\ntests/unit_tests/models/test_model.py\n"
+        for record_impact in (False, True):
+            with self.subTest(record_impact=record_impact):
+                report = self._select(
+                    CommandResult(returncode=0, stdout=output, stderr=""),
+                    record_impact=record_impact,
+                )
+
+                self._assert_full_report(
+                    report, "selector returned a missing test file: tests/unit_tests/conftest.py"
+                )
+                self.assertEqual(report["impact_analysis"]["status"], "failed")
 
     def test_tool_failure_falls_back_to_all_buckets(self) -> None:
         report = self._select(CommandResult(returncode=7, stdout="", stderr="analysis failed"))
@@ -675,7 +751,7 @@ class TestSelectUnitTests(unittest.TestCase):
             CommandResult(returncode=0, stdout=f"{path}\n", stderr="ERROR: incomplete analysis"),
             CommandResult(returncode=124, stdout="", stderr="timed out"),
             CommandResult(
-                returncode=0, stdout=f"{path}\ntests/unit_tests/conftest.py\n", stderr=""
+                returncode=0, stdout=f"{path}\ntests/unit_tests/test_missing.py\n", stderr=""
             ),
         ):
             with self.subTest(result=result):

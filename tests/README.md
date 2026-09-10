@@ -52,14 +52,22 @@ the comparison. `diff_base_sha` is null when no PR comparison base can be
 established, such as for non-PR runs or missing merge history.
 
 Selection is conservative: missing/invalid base commits, selector errors,
-timeouts, deleted or renamed files, shared fixtures, test runners, dependency
-and CI configuration changes, package `__init__.py` changes, and unsupported
-files request the full matrix. Tokenizer changes also run the full suite because
+timeouts, deleted or renamed files, directly changed shared fixtures, test
+runners, dependency and CI configuration changes, package `__init__.py` changes,
+and unsupported files request the full matrix. Tokenizer changes also run the full suite because
 their dynamic imports hide consumers from static analysis. Empty impact results for source changes also
 request the full suite; the baseline cannot hide an analysis failure. The
 analyzed base must be an exact ancestor of the same commit used by test jobs.
 Static imports cannot prove complete runtime coverage of dynamic imports,
 plugins, or monkeypatching; the full merge-queue suite remains the final check.
+
+When `pytest-impacted` reports an unchanged `conftest.py` through transitive
+imports, CI uses the test files selected by the analyzer plus the baseline.
+Reported fixture and helper files are not explicit test targets; pytest loads
+fixtures normally for the selected tests. An unchanged fixture appearing in
+the analysis output does not itself request the full suite. Direct changes to
+`conftest.py` still request the full suite, and analysis that returns no unit-test
+files for a source change still falls back to the full suite.
 
 The selection summary reports execution mode alongside the proposed selection,
 fallback reason, affected and baseline file counts, buckets, and selector

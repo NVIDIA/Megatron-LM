@@ -395,11 +395,12 @@ def _normalize_selector_output(repo_root: Path, stdout: str) -> tuple[set[str], 
             # as tests. Those are valid tool output but outside this CI suite.
             continue
         relative = resolved.relative_to(repo_root).as_posix()
-        if resolved.name == "conftest.py":
-            return set(), f"pytest-impacted reported an impacted shared fixture: {relative}"
         if not resolved.is_file():
             return set(), f"selector returned a missing test file: {relative}"
         if not resolved.name.startswith("test_") or resolved.suffix != ".py":
+            # Trust pytest-impacted's test selection when it also reports an
+            # unchanged conftest.py or helper. Pytest loads fixtures normally;
+            # directly changed conftest.py files still trigger full_run_reason.
             continue
         selected.add(relative)
     return selected, None
