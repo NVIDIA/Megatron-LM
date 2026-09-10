@@ -203,7 +203,7 @@ class FsdpModule:
             parameter_groups.append(
                 FsdpParameterGroup(
                     owning_module=self,
-                    parameters=group_parameters,
+                    fqn_to_parameter=group_parameters,
                     mesh=mesh,
                     model_weight_placements=_specialize_placements(
                         model_weight_placements, group_dtype
