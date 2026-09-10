@@ -27,7 +27,7 @@ from __future__ import annotations
 import logging
 import math
 import re
-from collections import defaultdict
+from collections import defaultdict, deque
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from enum import Enum
@@ -295,6 +295,11 @@ _GTP_PARAMS = []
 _inflight_comm_params: set = set()
 _AG_STREAMS: Dict[str, torch.cuda.Stream] = {}
 _RS_STREAMS: Dict[str, torch.cuda.Stream] = {}
+# Leader params whose async wgrad reduce-scatter has been issued but not yet accumulated into
+# main_grad, oldest first, per (chain, group). GTP_CONFIG.wgrad_finalize_depth bounds the length:
+# the oldest is finalized once a newer RS pushes the queue over it, so the fence in the finalize
+# waits on a collective issued that many weights ago instead of the immediately preceding one.
+_PENDING_WGRAD_RS: Dict[tuple, deque] = {}
 
 
 # Wgrad input buffer pool, keyed by (shape, dtype). UNGRAPHED-only: GRAPHED
@@ -389,6 +394,71 @@ def get_rs_stream(chain_id: str = GTPChain.GRAPHED.value, group=None) -> torch.c
     return _RS_STREAMS[key]
 
 
+_DRAIN_CALLBACK_SCHEDULED = False
+
+
+def _clear_drain_callback_if_idle() -> None:
+    """Clear a stale flag left by a backward that raised before autograd ran its callbacks.
+
+    Only safe while every queue is empty, since then no drain is owed.
+    """
+    global _DRAIN_CALLBACK_SCHEDULED
+    if not any(_PENDING_WGRAD_RS.values()):
+        _DRAIN_CALLBACK_SCHEDULED = False
+
+
+def _drain_pending_wgrad_rs_at_backward_end() -> None:
+    """Settle every queued reduce-scatter. Runs from autograd, at the end of the backward."""
+    global _DRAIN_CALLBACK_SCHEDULED
+    try:
+        finalize_pending_wgrad_reduce_scatters()
+    finally:
+        _DRAIN_CALLBACK_SCHEDULED = False
+
+
+def _ensure_drain_at_backward_end() -> None:
+    """Schedule the queue drain to run when this backward pass ends.
+
+    THE QUEUE MUST NOT OUTLIVE A BACKWARD: a leftover entry accumulates during the next one and
+    fires its DDP grad-ready there, reducing the bucket before all its gradients have landed.
+
+    Hooking autograd covers every caller for free -- pipeline schedules, combined 1F1B, a bare
+    loss.backward() in a test. Graph capture is the sole exception: it cannot take a callback,
+    but it discards its grads, so the end-of-iteration drain is enough there.
+    """
+    global _DRAIN_CALLBACK_SCHEDULED
+    if _DRAIN_CALLBACK_SCHEDULED or torch.cuda.is_current_stream_capturing():
+        return
+    torch.autograd.Variable._execution_engine.queue_callback(
+        _drain_pending_wgrad_rs_at_backward_end
+    )
+    _DRAIN_CALLBACK_SCHEDULED = True
+
+
+def _pending_wgrad_rs_queue(chain_id: str, group) -> deque:
+    """Return the in-flight wgrad-RS queue for (chain_id, group), creating it on first use.
+
+    One queue per scheduling domain, so the FIFO order matches the order the collectives were
+    issued on that domain.
+    """
+    key = (chain_id, id(group) if group is not None else 0)
+    queue = _PENDING_WGRAD_RS.get(key)
+    if queue is None:
+        queue = deque()
+        _PENDING_WGRAD_RS[key] = queue
+    return queue
+
+
+def finalize_pending_wgrad_reduce_scatters() -> None:
+    """Finalize every queued wgrad reduce-scatter; without this the last N are never accumulated.
+
+    Accumulates on the caller's stream, exactly as the depth pop does.
+    """
+    for queue in _PENDING_WGRAD_RS.values():
+        while queue:
+            queue.popleft()._finalize_wgrad_rs_on_caller_stream()
+
+
 def initialize_graph_wgrad_rings() -> None:
     """Allocate persistent wgrad inputs before local CUDA-graph capture."""
     allocate_graph_wgrad_rings(
@@ -408,6 +478,10 @@ def wait_for_gtp_grad_reduction_on_current_stream() -> None:
     runner's replay stream (its tail = captured Phase 2 main_grad.add_). Under whole-step capture
     there are no per-layer runners, so that second wait is skipped. No-op when GTP is inactive.
     """
+    # MUST precede wait_async_comms(): it consumes RS handles without accumulating, so an entry
+    # it reaches first loses its gradient. Usually a no-op, since the end-of-backward callback
+    # already emptied the queue -- but graph capture cannot install one, so this is its drain.
+    finalize_pending_wgrad_reduce_scatters()
     wait_async_comms()
     cur = torch.cuda.current_stream()
     # Join the async AG/RS side streams for both the eager and CUDA-graph capture paths.
@@ -453,6 +527,12 @@ class GTPRematConfig:
     # same-key writers may need more slots to keep all in-flight RS inputs distinct.
     # TODO: Infer each domain's ring size automatically.
     graph_wgrad_ring_size: int = 2
+    # Max length of the FIFO of in-flight wgrad reduce-scatters: pushing past it pops the oldest
+    # and finalizes it, so at most this many are ever outstanding. Deeper puts more compute
+    # between issuing a collective and fencing on it, but pins two unsharded buffers per level
+    # and delays DDP grad-ready, so the curve turns over. UNGRAPHED only, and only meaningful
+    # with async_reduction=True -- a synchronous RS completes inline, so nothing is ever queued.
+    wgrad_finalize_depth: int = 2
 
 
 GTP_CONFIG = GTPRematConfig()
@@ -1942,9 +2022,17 @@ class GTPShardedParam(torch.nn.Parameter):
                 self.rs_event.record()
                 if finalize_grad:
                     cache = get_global_GTP_cache()
+                    # Only batch with _foreach_add_ when finalizing multiple (routed) weights;
+                    # a routed leader owns every local expert, so this is N launches otherwise.
+                    if len(self._weights) == 1:
+                        w = self._weights[0]
+                        w.main_grad.add_(cache.get(w._rs_ticket))
+                    else:
+                        torch._foreach_add_(
+                            [w.main_grad for w in self._weights],
+                            [cache.get(w._rs_ticket) for w in self._weights],
+                        )
                     for w in self._weights:
-                        wgrad_rs = cache.get(w._rs_ticket)
-                        w.main_grad.add_(wgrad_rs)
                         cache.release(w._rs_ticket)
                     # Fire grad-ready AFTER all adds (separate loop so a bucket-completing
                     # grad-ready can't dispatch the RS before a sibling's add). With autograd
@@ -2213,10 +2301,18 @@ class GTPShardedParam(torch.nn.Parameter):
         # the one handle we track -- discarding that gradient with no error. Finish it first.
         if GTP_CONFIG.async_reduction and self._wgrad_rs_handle is not None:
             self._wait_reduce_scatter(finalize_grad=True)
-            # Accounted for here, so the cascade below must not skip the next one.
-            self._already_finalized = False
+            # This weight is still queued for the reduce-scatter we just finalized. Drop that
+            # dead entry, or it occupies a slot against the depth and the fresh RS issued below
+            # gets finalized earlier than the depth intends.
+            # (Identity scan: `in`/`remove` compare Parameters elementwise and raise.)
+            pending = _pending_wgrad_rs_queue(self.chain_id, self.group)
+            for idx, queued in enumerate(pending):
+                if queued is self:
+                    del pending[idx]
+                    break
 
-        if GTP_CONFIG.async_reduction and self.prev_w is not None:
+        issued_async_rs = GTP_CONFIG.async_reduction and self.prev_w is not None
+        if issued_async_rs:
             # Async RS (not last weight — deferred finish). Pre-RS work on caller; NCCL wrap
             # lives at the collective site inside _reduce_scatter (mirrors the AG prefetch sites).
             _, rs_handle, release_bufs = self._reduce_scatter(
@@ -2244,41 +2340,73 @@ class GTPShardedParam(torch.nn.Parameter):
             self._release_wgrad_scratch()
             ret = result if batched else result[0]
 
-        # Wait for last reduce scatter if it was async
-        # Currently only support reduce scattering in reverse order
-        if GTP_CONFIG.async_reduction and self.next_w is not None:
-            # Backward normally walks the chain in reverse, so next_w has already started its
-            # reduce-scatter by now. That only holds while each weight is used once per forward.
-            # MTP's second embedding lookup sits late in the forward, so the embedding's backward
-            # runs before decoder layer 0 has reduce-scattered anything -- check first.
-            waited = self.next_w._wait_reduce_scatter()
-
-            if not waited:
-                pass  # next_w has not reduce-scattered yet, or something already finalized it
-            elif getattr(self.next_w, "_already_finalized", False):
-                self.next_w._already_finalized = False
-                # No compute-stream fence needed: only MTP's double-RS weights
-                # (embedding/output) reach the force-finalize path, no other weight
-                # shares their vocab-sized LIFO bucket, and their next pop is behind
-                # the end-of-backward flush fence -- the buffers freed there cannot
-                # be re-popped within this backward.
-            else:
-                self.next_w.rs_event.wait()
-                cache = get_global_GTP_cache()
-                next_weights = self.next_w._weights
-                wgrads = [cache.get(w._rs_ticket) for w in next_weights]
-                nvtx_range_push(f"{self.next_w._debug_name}.gtp_wgrad_accum_deferred")
-                # Only batch with _foreach_add_ when finalizing multiple (routed) weights.
-                if len(next_weights) == 1:
-                    next_weights[0].main_grad.add_(wgrads[0])
-                else:
-                    torch._foreach_add_([w.main_grad for w in next_weights], wgrads)
-                nvtx_range_pop(f"{self.next_w._debug_name}.gtp_wgrad_accum_deferred")
-                for w in next_weights:
-                    self._handle_megatron_grad_accum(w)
-                    cache.release(w._rs_ticket)
+        # Finalize the oldest reduce-scatter once this one pushes the queue past the configured
+        # depth. Everything stays on the caller's stream -- the fence, the accumulation, the
+        # grad-ready -- so DDP still sees a single writer per bucket. Depth is what makes the
+        # fence cheap: at depth N it waits on a collective issued N weights ago, which by then
+        # has had N weights' worth of dgrad/wgrad GEMMs to complete in.
+        #
+        # A queue rather than following next_w: backward walks the chain in reverse, but MTP
+        # consumes the embedding twice per forward, so its backward runs before decoder layer 0
+        # has reduce-scattered anything. Popping the oldest *actually pending* RS is well defined
+        # under that reordering; "the weight N links away" is not.
+        #
+        # GRAPHED chains stay at depth 1. Their persistent ring slots are published as reusable
+        # only when the RS is waited (_record_graph_wgrad_ring_slots_ready), and the replay-side
+        # guard is a stream wait on slot.ready_event, which resolves against the event's most
+        # recent record: deferring the wait past graph_wgrad_ring_size same-key weights lets that
+        # wait pass on a stale record and the graph overwrite a slot its RS is still reading.
+        # cuda_graphs._compute_finalized_during_bwd_capture also still assumes the next_w cascade.
+        if issued_async_rs:
+            # A fresh result is now in flight and unaccumulated.
+            self._already_finalized = False
+            # Must precede the append below: the flag can only be cleared while idle.
+            _clear_drain_callback_if_idle()
+            pending = _pending_wgrad_rs_queue(self.chain_id, self.group)
+            pending.append(self)
+            _ensure_drain_at_backward_end()
+            while len(pending) > self._effective_finalize_depth():
+                pending.popleft()._finalize_wgrad_rs_on_caller_stream()
 
         return ret
+
+    def _effective_finalize_depth(self) -> int:
+        """Finalize depth for this chain (GRAPHED is pinned to 1; see wgrad_reduce_scatter)."""
+        if _chain_is_graphed(self.chain_id):
+            return 1
+        return max(1, GTP_CONFIG.wgrad_finalize_depth)
+
+    def _finalize_wgrad_rs_on_caller_stream(self):
+        """Wait this weight's async wgrad RS and accumulate it into main_grad.
+
+        Runs entirely on the caller's stream: rs_event.wait() fences it behind the collective,
+        which also orders the wgrad-pool buffers the RS was reading against the next borrower.
+        """
+        # _already_finalized tracks one reduce-scatter's lifecycle: cleared where the RS is
+        # issued, set once its result has landed in main_grad. That is what the wait_async_comms
+        # fallback needs to know, and _rs_ticket cannot tell it -- the ticket is never reset, so
+        # "has a ticket" stays true for any weight that ever reduce-scattered.
+        waited = self._wait_reduce_scatter()
+        if not waited:
+            # Someone else consumed the handle. If they accumulated (MTP force-finalize,
+            # wait_async_comms) the flag is already set and the fallback will skip this weight.
+            return
+
+        self.rs_event.wait()
+        cache = get_global_GTP_cache()
+        weights = self._weights
+        wgrads = [cache.get(w._rs_ticket) for w in weights]
+        nvtx_range_push(f"{self._debug_name}.gtp_wgrad_accum_deferred")
+        # Only batch with _foreach_add_ when finalizing multiple (routed) weights.
+        if len(weights) == 1:
+            weights[0].main_grad.add_(wgrads[0])
+        else:
+            torch._foreach_add_([w.main_grad for w in weights], wgrads)
+        nvtx_range_pop(f"{self._debug_name}.gtp_wgrad_accum_deferred")
+        for w in weights:
+            self._handle_megatron_grad_accum(w)
+            cache.release(w._rs_ticket)
+        self._already_finalized = True
 
     def batched_wgrad_reduce_scatter(self, wgrad_list, nvtx_label=None):
         """Batched version of wgrad_reduce_scatter."""
@@ -2692,6 +2820,9 @@ def reset_gtp_state():
     GTPShardedParam._link_tables_flushed = False
     GTPShardedParam._recompute_link_tables_flushed = False
     _GTP_GROUPED_BUF_PARITY_COUNTER.clear()
+    _PENDING_WGRAD_RS.clear()
+    global _DRAIN_CALLBACK_SCHEDULED
+    _DRAIN_CALLBACK_SCHEDULED = False
     clear_graph_wgrad_rings()
 
 
