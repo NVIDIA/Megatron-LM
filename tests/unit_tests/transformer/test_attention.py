@@ -863,7 +863,9 @@ class TestFlashAttention3SoftcapWrapper:
         attn.config.attn_logit_softcapping = softcap
         attn.batch_invariant_mode = False
         t = torch.zeros(2, 4, 8)
-        with mock.patch("megatron.core.transformer.attention._flash_attn_forward", fake_forward):
+        with mock.patch(
+            "megatron.core.transformer.attention._flash_attn_forward", fake_forward, create=True
+        ):
             return Attention._flash_attention_3_forward_wrapper(
                 attn,
                 q=t,
@@ -954,7 +956,7 @@ class TestFlashDecodeAndPrefillSoftcap:
                 cu_seqlens_q=torch.tensor([0, 1, 2], dtype=torch.int32),
                 cu_seqlens_k=torch.tensor([0, 2, 4], dtype=torch.int32),
                 seqlens_k=torch.tensor([2, 2], dtype=torch.int32),
-                block_table=None,
+                block_table=torch.zeros(2, 4, dtype=torch.int32),
                 is_decode_only=is_decode_only,
             )
         return kernel.call_args.kwargs
@@ -1000,6 +1002,6 @@ class TestFlashMLASoftcapRejected:
                 cu_seqlens_q=torch.tensor([0, 1, 2], dtype=torch.int32),
                 cu_seqlens_k=torch.tensor([0, 2, 4], dtype=torch.int32),
                 seqlens_k=torch.tensor([2, 2], dtype=torch.int32),
-                block_table=None,
+                block_table=torch.zeros(2, 4, dtype=torch.int32),
                 is_decode_only=True,
             )
