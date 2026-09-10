@@ -295,7 +295,7 @@ class MegatronMultimodalTokenizer:
         if not self.use_gigatoken:
             tokens = tokens[0]
         else:
-            tokens = np.array(self.tokenize(tokens, add_special_tokens=False))
+            tokens = np.array(self.tokenizer.encode(tokens, add_special_tokens=False))
 
         if not return_target:
             return tokens
