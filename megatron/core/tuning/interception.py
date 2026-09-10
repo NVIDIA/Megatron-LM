@@ -14,6 +14,7 @@ import atexit
 import json
 import os
 import warnings
+from functools import wraps
 
 from megatron.core.tuning import selection
 from megatron.core.tuning import table as table_mod
@@ -21,7 +22,8 @@ from megatron.core.tuning.policy import AutotunePolicy, use_deterministic_mode
 
 _installed = False
 _policy: AutotunePolicy | None = None
-_table = None
+_explicit_policy = False
+_tables: dict = {}
 
 # (kernel, shape) -> chosen config. Which config a kernel runs is the *cause* of
 # reduction-order nondeterminism; diverging tensors are the effect. Recording it
@@ -49,11 +51,10 @@ def _enumerate(module: str, name: str, count: int, pinned: bool) -> None:
 
 def _record_choice(autotuner, args, kwargs, config, pinned: bool) -> None:
     key = (
-        f"{selection.arch_tag()}|{selection.kernel_name(autotuner)}"
+        f"{selection.arch_tag()}|{selection.kernel_module(autotuner)}."
+        f"{selection.kernel_name(autotuner)}"
         f"|{selection.tuning_key(autotuner, args, kwargs)}"
     )
-    if key in _choice_log:
-        return
     _choice_log[key] = f"{selection.config_signature(config)};{'pinned' if pinned else 'timed'}"
 
 
@@ -64,11 +65,7 @@ def _record_winner(autotuner, args, kwargs) -> None:
     kernels = _tune_records.setdefault(selection.arch_tag(), {}).setdefault(
         selection.kernel_name(autotuner), {}
     )
-    kernels[selection.tuning_key(autotuner, args, kwargs)] = {
-        "kwargs": dict(config.kwargs),
-        "num_warps": getattr(config, "num_warps", None),
-        "num_stages": getattr(config, "num_stages", None),
-    }
+    kernels[selection.tuning_key(autotuner, args, kwargs)] = selection.config_data(config)
 
 
 def _dump_records() -> None:
@@ -95,14 +92,15 @@ def choice_log() -> dict:
 
 
 def verify_choices(group=None) -> bool:
-    """Assert every rank picked the same config for every kernel and shape.
+    """Compare configs for kernel/shape keys observed on multiple ranks.
 
     Call where all ranks arrive, such as a step boundary. Calling it at the
     moment of choice would deadlock: ranks reach a given kernel at different
     times, so they would not agree on whether to take part in the collective.
 
-    A mismatch is the reduction-order bug caught at its cause, before it has
-    become diverging tensors.
+    Pipeline stages and expert ranks can execute different kernels or shapes.
+    An absent key is not a conflicting choice. Agreement only covers observed
+    choices; it does not establish numerical determinism or equal coverage.
     """
     import torch
 
@@ -120,14 +118,16 @@ def verify_choices(group=None) -> bool:
     torch.distributed.all_gather_object(maps, dict(_choice_log), group=group)
     offenders: dict = {}
     for key in {k for m in maps if m for k in m}:
-        seen = {m.get(key) for m in maps if m}
+        seen = {m[key] for m in maps if m and key in m}
         if len(seen) > 1:
             offenders[key] = sorted(str(v) for v in seen)
+    if not offenders:
+        return True
     lines = [f"  {k}\n    " + "\n    ".join(v) for k, v in sorted(offenders.items())[:10]]
     message = (
         f"Ranks disagree on {len(offenders)} autotune choice(s); the same kernel is "
-        "running different tilings on different ranks, so results cannot be "
-        "bit-reproducible.\n" + "\n".join(lines)
+        "running different configurations on different ranks, which may change "
+        "floating-point results.\n" + "\n".join(lines)
     )
     if _policy is not None and _policy.verify_strict:
         raise RuntimeError(message)
@@ -150,17 +150,31 @@ def maybe_verify_choices(iteration: int, group=None) -> bool | None:
 
 
 def install(policy: AutotunePolicy | None = None) -> bool:
-    """Apply ``policy`` to Triton's autotuner. Idempotent.
+    """Apply a process-wide policy, replacing any previously selected policy.
 
-    Returns whether an interception is active. A no-op when the policy does not
-    need one, or when triton is unavailable.
+    Install once during initialization, before kernels execute. An explicit
+    policy takes precedence over subsequent framework ``install_from_env``
+    calls. Repeated calls reuse the same adapter rather than nesting patches.
     """
-    global _installed, _policy, _table
+    global _explicit_policy
 
-    policy = policy or AutotunePolicy.from_env()
+    _explicit_policy = policy is not None
+    return _install(policy or AutotunePolicy.from_env())
+
+
+def _install(policy: AutotunePolicy) -> bool:
+    global _installed, _policy
+
+    if policy != _policy:
+        _dump_records()
+        _policy = policy
+        _tables.clear()
+        _choice_log.clear()
+        _tune_records.clear()
+        _enumerated.clear()
+
     if _installed:
         return True
-    _policy = policy
     if not policy.intercepts:
         return False
     try:
@@ -168,60 +182,78 @@ def install(policy: AutotunePolicy | None = None) -> bool:
     except ImportError:
         return False
 
-    _table = table_mod.load(selection.arch_tag(), policy.table_path)
     original_run = Autotuner.run
 
+    @wraps(original_run)
     def policy_run(self, *args, **kwargs):
+        policy = _policy
+        if not policy.intercepts:
+            return original_run(self, *args, **kwargs)
         count = len(getattr(self, "configs", ()))
         module = selection.kernel_module(self)
-        in_scope = module.startswith(policy.modules) if policy.modules else False
+        in_scope = any(
+            module == prefix or module.startswith(prefix + ".") for prefix in policy.modules
+        )
+        pinned = in_scope and policy.mode == "pinned"
 
         if policy.enumerate_autotuners and count > 1:
-            _enumerate(module, selection.kernel_name(self), count, in_scope)
+            _enumerate(module, selection.kernel_name(self), count, pinned)
 
-        if count <= 1 or not in_scope or policy.mode == "auto":
+        if count <= 1 or not pinned:
             result = original_run(self, *args, **kwargs)
-            if count > 1:
-                # Timed selection: read back what Triton picked. This is the case
-                # that can differ between ranks, so it is the one worth logging.
-                _record_choice(self, args, kwargs, getattr(self, "best_config", None), False)
-            return result
-
-        if policy.mode == "record":
-            # Let Triton benchmark as usual and capture its winner. A recording
-            # run is deliberately not reproducible; its output is the table.
-            result = original_run(self, *args, **kwargs)
-            _record_winner(self, args, kwargs)
-            _record_choice(self, args, kwargs, getattr(self, "best_config", None), False)
+            if in_scope and policy.mode == "record":
+                _record_winner(self, args, kwargs)
+            if count > 1 or in_scope:
+                _record_choice(self, args, kwargs, getattr(self, "best_config", None), pinned)
             return result
 
         candidates = self.configs
+        nargs = getattr(self, "nargs", None)
         try:
-            if policy.chaos:
-                chosen = selection.chaos_choice(self, candidates, args, kwargs)
-            else:
-                chosen = selection.deterministic_choice(
-                    self, candidates, args, kwargs, table=_table, on_miss=policy.on_miss
+            # Preserve Triton's shape-dependent validity/performance pruning.
+            # It expects positional arguments in self.nargs, as in Autotuner.run.
+            self.nargs = dict(zip(self.arg_names, args))
+            valid_configs = self.prune_configs(kwargs)
+            if not valid_configs:
+                raise RuntimeError(
+                    f"No valid configs for Triton kernel {selection.kernel_name(self)!r}"
                 )
-            _record_choice(self, args, kwargs, chosen, True)
+            if policy.chaos:
+                chosen = selection.chaos_choice(self, valid_configs, args, kwargs)
+            else:
+                # Framework configuration can precede CUDA device selection.
+                # Load tables only at kernel execution, for the current device.
+                arch = selection.arch_tag()
+                if arch not in _tables:
+                    _tables[arch] = table_mod.load(arch, policy.table_path)
+                chosen = selection.deterministic_choice(
+                    self, valid_configs, args, kwargs, table=_tables[arch], on_miss=policy.on_miss
+                )
             # Triton only benchmarks when more than one candidate remains, so a
             # single-entry list skips the timing loop entirely.
             self.configs = [chosen]
-            return original_run(self, *args, **kwargs)
+            result = original_run(self, *args, **kwargs)
+            _record_choice(self, args, kwargs, chosen, True)
+            return result
         finally:
             # The choice is per shape: a later call must see every candidate again.
             self.configs = candidates
+            self.nargs = nargs
 
     Autotuner.run = policy_run
-    if policy.mode == "record":
-        atexit.register(_dump_records)
+    atexit.register(_dump_records)
     _installed = True
     return True
 
 
-def install_from_env() -> bool:
-    """Convenience wrapper used by framework initialization."""
-    return install(AutotunePolicy.from_env())
+def install_from_env(*, deterministic: bool = False) -> bool:
+    """Resolve framework defaults unless a caller supplied an explicit policy."""
+    if _explicit_policy:
+        return _installed
+    # A later component's default False must not undo another model's request.
+    # An explicit MCORE_AUTOTUNE_MODE still takes precedence in from_env().
+    deterministic = deterministic or (_policy is not None and _policy.mode == "pinned")
+    return _install(AutotunePolicy.from_env(deterministic=deterministic))
 
 
 __all__ = [

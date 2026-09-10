@@ -9,6 +9,7 @@ fastest one, it is just slower.
 """
 
 import hashlib
+import json
 import os
 import warnings
 
@@ -69,11 +70,19 @@ def config_signature(config) -> str:
     """Stable text form of one Triton config, for logs and cross-rank compare."""
     if config is None:
         return "none"
-    kwargs = ",".join(f"{k}={v}" for k, v in sorted(getattr(config, "kwargs", {}).items()))
-    return (
-        f"{kwargs};warps={getattr(config, 'num_warps', None)}"
-        f";stages={getattr(config, 'num_stages', None)}"
-    )
+    return json.dumps(config_data(config), sort_keys=True)
+
+
+def config_data(config) -> dict:
+    """Serializable launch options; hooks remain on the live Config object."""
+    return {
+        "kwargs": dict(config.kwargs),
+        "num_warps": getattr(config, "num_warps", None),
+        "num_stages": getattr(config, "num_stages", None),
+        "num_ctas": getattr(config, "num_ctas", 1),
+        "maxnreg": getattr(config, "maxnreg", None),
+        "ir_override": getattr(config, "ir_override", None),
+    }
 
 
 def estimate_config_cost(cfg):
@@ -127,6 +136,9 @@ def deterministic_choice(autotuner, candidates, args, kwargs, *, table=None, on_
         tuned = table.lookup(name, tuning_key(autotuner, args, kwargs), candidates)
         if tuned is not None:
             return tuned
+    filtered = filter_configs_by_block_sizes(candidates)
+    if filtered:
+        return filtered[0]
     if on_miss == "error":
         raise RuntimeError(
             f"No tuned config for triton kernel {name!r} on {arch_tag()} and "
@@ -140,8 +152,7 @@ def deterministic_choice(autotuner, candidates, args, kwargs, *, table=None, on_
             "cheapest config, which is deterministic but may be slower. Record a table "
             "with MCORE_AUTOTUNE_RECORD to recover the throughput."
         )
-    filtered = filter_configs_by_block_sizes(candidates)
-    return (filtered or [cheapest(candidates)])[0]
+    return cheapest(candidates)
 
 
 def chaos_choice(autotuner, candidates, args, kwargs):

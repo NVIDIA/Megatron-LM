@@ -21,13 +21,13 @@ Typical use::
 Recording a table for a new architecture::
 
     MCORE_AUTOTUNE_RECORD=/tmp/rec  torchrun ... pretrain.py ...
-    python -m megatron.core.tuning merge /tmp/rec/*.json -o ~/.mcore/tuning/sm103.json
-    MCORE_AUTOTUNE_TABLE_PATH=~/.mcore/tuning  torchrun ... pretrain.py ...
+    python -m megatron.core.tuning merge /tmp/rec.rank*.json -o ~/.mcore/tuning/sm103.json
+    MCORE_AUTOTUNE_MODE=pinned MCORE_AUTOTUNE_TABLE_PATH=~/.mcore/tuning torchrun ...
 
 Seeing what a run actually did::
 
     MCORE_AUTOTUNE_ENUMERATE=1 ...     # every multi-config autotuner reached
-    MCORE_AUTOTUNE_VERIFY=1 ...        # assert all ranks chose alike, each step
+    MCORE_AUTOTUNE_VERIFY=1 ...        # compare observed choices at each step
 """
 
 from megatron.core.tuning.interception import (

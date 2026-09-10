@@ -1565,7 +1565,7 @@ class TransformerConfig(ModelParallelConfig):
         # a config, and install() is idempotent.
         from megatron.core.tuning import install_from_env
 
-        install_from_env()
+        install_from_env(deterministic=self.deterministic_mode)
 
         # When fp32 residual connections are enabled, pipeline parallel communication must
         # use fp32 to match the dtype of the residual stream between pipeline stages.

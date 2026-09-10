@@ -157,6 +157,20 @@ def test_policy_accepts_legacy_env_names(monkeypatch):
     assert policy.intercepts
 
 
+@pytest.mark.parametrize(
+    "options", [{"mode": "typo"}, {"on_miss": "typo"}, {"verify_every": -1}, {"mode": "record"}]
+)
+def test_policy_rejects_invalid_options(options):
+    with pytest.raises(ValueError):
+        AutotunePolicy(**options)
+
+
+def test_explicit_block_override_satisfies_strict_selection(monkeypatch):
+    monkeypatch.setenv("TRITON_AUTOTUNE_BLOCK_SIZE_M", "128")
+    tuner = _Autotuner([CHEAP, FAST])
+    assert selection.deterministic_choice(tuner, tuner.configs, (), {}, on_miss="error") is FAST
+
+
 def test_merge_records_uses_majority_vote(tmp_path):
     """Ranks disagree; that disagreement is the variance the table removes."""
     entry = {"kwargs": {"BLOCK_SIZE_M": 128}, "num_warps": 8, "num_stages": 2}

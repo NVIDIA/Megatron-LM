@@ -87,8 +87,18 @@ class AutotunePolicy:
     enumerate_autotuners: bool = False
     chaos: bool = False
 
+    def __post_init__(self):
+        if self.mode not in ("auto", "pinned", "record"):
+            raise ValueError(f"Unknown autotune mode: {self.mode!r}")
+        if self.on_miss not in ("min_cost", "error"):
+            raise ValueError(f"Unknown autotune miss policy: {self.on_miss!r}")
+        if self.verify_every < 0:
+            raise ValueError("Autotune verification cadence must be nonnegative")
+        if self.mode == "record" and not self.record_path:
+            raise ValueError("Record mode requires MCORE_AUTOTUNE_RECORD or record_path")
+
     @classmethod
-    def from_env(cls) -> "AutotunePolicy":
+    def from_env(cls, *, deterministic: bool = False) -> "AutotunePolicy":
         """Build a policy from the environment.
 
         Deterministic mode implies ``pinned``; an explicit ``MCORE_AUTOTUNE_MODE``
@@ -100,7 +110,7 @@ class AutotunePolicy:
             mode = explicit
         elif record_path:
             mode = "record"
-        elif use_deterministic_mode():
+        elif deterministic or use_deterministic_mode():
             mode = "pinned"
         else:
             mode = "auto"
@@ -115,7 +125,7 @@ class AutotunePolicy:
             if prefix.strip()
         )
         table_path = tuple(
-            Path(p) for p in _env("MCORE_AUTOTUNE_TABLE_PATH").split(os.pathsep) if p
+            Path(p).expanduser() for p in _env("MCORE_AUTOTUNE_TABLE_PATH").split(os.pathsep) if p
         )
         return cls(
             mode=mode,

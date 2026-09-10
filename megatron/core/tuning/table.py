@@ -7,8 +7,8 @@ one while staying a pure function of its inputs. Tables live as JSON so adding
 an architecture is a file drop, not a source edit and a rebuild:
 
     MCORE_AUTOTUNE_RECORD=/tmp/rec  torchrun ... pretrain.py ...
-    python -m megatron.core.tuning merge /tmp/rec/*.json -o ~/.mcore/tuning/sm103.json
-    MCORE_AUTOTUNE_TABLE_PATH=~/.mcore/tuning  torchrun ... pretrain.py ...
+    python -m megatron.core.tuning merge /tmp/rec.rank*.json -o ~/.mcore/tuning/sm103.json
+    MCORE_AUTOTUNE_MODE=pinned MCORE_AUTOTUNE_TABLE_PATH=~/.mcore/tuning torchrun ...
 
 Each file records one architecture plus the provenance needed to notice when it
 has gone stale::
@@ -31,6 +31,8 @@ import json
 import os
 import warnings
 from pathlib import Path
+
+from megatron.core.tuning.selection import config_data
 
 _PACKAGED = Path(__file__).parent / "tables"
 
@@ -71,8 +73,7 @@ class TunedTable:
         """Return the tuned config for this kernel and shape, or ``None``.
 
         The stored entry is matched back against the kernel's own candidate list
-        rather than rebuilt, so fields the table does not carry (``pre_hook``,
-        ``num_ctas``, ``maxnreg``) survive, and a stale entry that no longer
+        rather than rebuilt, so its ``pre_hook`` survives, and a stale entry that no longer
         names a real candidate degrades to a miss instead of an invalid launch.
         """
         entries = self.kernels.get(kernel)
@@ -81,20 +82,18 @@ class TunedTable:
         wanted = entries.get(key) or entries.get("*")
         if not wanted:
             return None
+        # Older tables omitted these launch options; they used Triton's defaults.
+        wanted = {"num_ctas": 1, "maxnreg": None, "ir_override": None, **wanted}
         for config in candidates:
-            if (
-                config.kwargs == wanted.get("kwargs")
-                and getattr(config, "num_warps", None) == wanted.get("num_warps")
-                and getattr(config, "num_stages", None) == wanted.get("num_stages")
-            ):
+            if config_data(config) == wanted:
                 return config
         return None
 
 
 def _search_dirs(extra) -> list:
-    dirs = [Path(p) for p in (extra or ())]
+    dirs = [Path(p).expanduser() for p in (extra or ())]
     env = os.environ.get("MCORE_AUTOTUNE_TABLE_PATH", "")
-    dirs += [Path(p) for p in env.split(os.pathsep) if p]
+    dirs += [Path(p).expanduser() for p in env.split(os.pathsep) if p]
     dirs.append(_PACKAGED)
     return dirs
 
