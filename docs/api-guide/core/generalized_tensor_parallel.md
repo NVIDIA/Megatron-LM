@@ -419,6 +419,13 @@ it** — a different collective over a different process group, so enable either
 
 ### 3.1 GTP_remat architecture (Mcore ↔ TE integration)
 
+GDN now splits `in_proj.bias` into the same sections as its weight. New training
+checkpoints record `gdn_in_proj_bias_split=True`. Training detects legacy global and local checkpoints
+without this flag and loads their unsplit bias at the saved TP degree. Resave at that
+degree to migrate before changing TP. Direct MCore callers loading the old layout
+must supply `gdn_in_proj_bias_split=False` and `gdn_legacy_in_proj_bias_tp_size` in
+checkpoint metadata. Bias-free GDN checkpoints are unaffected by this migration.
+
 ![GTP_remat / Mcore-TE integration architecture](../../images/generalized_tensor_parallel/0712_gtp_te_protocol_redesign.png)
 
 **Ownership.** TE owns the linear primitives (`Linear` / `LayerNormLinear` / `LayerNormMLP` / `GroupedLinear`), the low-precision tensor types (FP8 / MXFP8 / NVFP4), and a generic **`DistributedWeight` protocol** (`transformer_engine/pytorch/distributed_weight.py`). Megatron owns **all** GTP_remat logic — sharding, the prefetch chain, the buffer cache, the AG/RS state machines, and DDP integration. **TE never names GTP.**
