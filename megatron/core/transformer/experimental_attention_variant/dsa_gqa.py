@@ -1097,7 +1097,7 @@ class DSGQACoreAttention(MegatronModule):
         value_cache: torch.Tensor,
         hidden_states: torch.Tensor,
         inference_context: DynamicInferenceContext,
-        packed_seq_params: PackedSeqParams,
+        packed_seq_params: Optional[PackedSeqParams],
         provider_layer_number: int,
         block_table: torch.Tensor,
         use_indexer_rope: bool = False,
@@ -1132,7 +1132,13 @@ class DSGQACoreAttention(MegatronModule):
         query_offsets, _ = inference_context.cu_query_lengths()
         query_offsets = query_offsets[: request_count + 1].to(torch.long)
         active_tokens = inference_context.active_token_count
-        if packed_seq_params.total_tokens != active_tokens:
+        # The inference engine carries packing metadata in its dynamic context;
+        # ordinary model wrappers need not also construct PackedSeqParams.
+        if (
+            packed_seq_params is not None
+            and packed_seq_params.total_tokens is not None
+            and packed_seq_params.total_tokens != active_tokens
+        ):
             raise RuntimeError(
                 f"Dynamic DSA-GQA received {packed_seq_params.total_tokens} packed tokens, "
                 f"but the inference context has {active_tokens}."
@@ -1615,8 +1621,6 @@ class DSGroupedSelfAttention(SelfAttention):
         indexer_input_norm: Optional[_DSAIndexerInputNormSpec] = None,
     ) -> torch.Tensor:
         """Dispatch dynamic batching to the mixed prefill/decode DSA path."""
-        if packed_seq_params is None:
-            raise NotImplementedError("Dynamic DSA-GQA requires packed sequence metadata.")
         if inference_context.using_cuda_graph_this_step():
             raise NotImplementedError("Dynamic DSA-GQA does not yet support CUDA graphs.")
 

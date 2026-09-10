@@ -140,8 +140,9 @@ class TestDSGQADynamicInference:
 
     @pytest.mark.parametrize("learned_k", [False, True])
     @pytest.mark.parametrize("use_rope", [False, True])
+    @pytest.mark.parametrize("provide_packed_metadata", [False, True])
     def test_mixed_prefill_reuses_training_and_decode_uses_cute(
-        self, monkeypatch, learned_k, use_rope
+        self, monkeypatch, learned_k, use_rope, provide_packed_metadata
     ):
         dtype = torch.bfloat16
         hidden_size = 4096
@@ -226,7 +227,11 @@ class TestDSGQADynamicInference:
                     hidden_states=hidden_states,
                     attention_mask=None,
                     inference_context=inference_context,
-                    packed_seq_params=_dynamic_packed_seq_params(inference_context),
+                    packed_seq_params=(
+                        _dynamic_packed_seq_params(inference_context)
+                        if provide_packed_metadata
+                        else None
+                    ),
                     rotary_pos_emb=rotary(128),
                 )
             assert bias is None
