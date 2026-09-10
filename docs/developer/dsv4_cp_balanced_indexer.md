@@ -40,6 +40,9 @@ FP8 state or contributes parameter gradients.
 Both balanced calls use the existing compact scorer and configured
 dsa_indexer_precision. Compact K padding is built once because the two halves
 have identical segment lengths; their RoPE positions and causal offsets differ.
+The stateless projection waits for parameter publication before reading shared
+weights or bias, and normalizes TE's empty disabled-bias tensor to `None`.
+
 Head and tail retain separate warmed-up workspace slots on their CSA module.
 Candidate/output scratch follows the existing capture-pool allocation model.
 Existing fused row-limit guards remain in force.
