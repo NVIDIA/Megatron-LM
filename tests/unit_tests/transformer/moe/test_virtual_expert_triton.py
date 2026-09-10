@@ -20,12 +20,10 @@ import pytest
 import torch
 import torch.distributed as dist
 
-from megatron.core.transformer.moe.virtual_expert_load_balancer import (
-    VirtualExpertPlannerWorkspace,
-    plan_virtual_expert_routes,
-)
+from megatron.core.transformer.moe.virtual_expert_load_balancer import plan_virtual_expert_routes
 from megatron.core.transformer.moe.virtual_expert_triton import (
     MAX_VIRTUAL_EXPERT_WEIGHT_SMS,
+    VirtualExpertPlannerWorkspace,
     _transport_tile,
     _validate_transport_shape,
     launch_virtual_expert_grad_reduce,
@@ -412,9 +410,7 @@ def test_virtual_expert_histogram_exchange_matches_all_gather():
     rank, world_size = dist.get_rank(group), dist.get_world_size(group)
     device = torch.device("cuda", torch.cuda.current_device())
     num_tokens, topk, num_experts = 512, 3, 4 * world_size
-    workspace = VirtualExpertPlannerWorkspace.allocate(
-        num_experts=num_experts, device=device, group=group
-    )
+    workspace = VirtualExpertPlannerWorkspace(num_experts=num_experts, device=device, group=group)
     generator = torch.Generator(device=device).manual_seed(77 + rank)
     try:
         for launch in range(3):
@@ -501,10 +497,11 @@ def _reference_map_routes(
 ) -> torch.Tensor:
     """Torch oracle for the planner's route mapping: stable sort by expert, one global array of
     segment ends, then the runtime id of every route."""
-    num_local_experts, ep_size = workspace.num_local_experts, workspace.ep_size
+    ep_size, num_experts = workspace.gathered_counts.shape
+    num_local_experts = num_experts // ep_size
     flat = routes.reshape(-1)
     experts, order = torch.sort(flat, stable=True)
-    tokens_per_expert = torch.bincount(flat, minlength=workspace.num_experts)
+    tokens_per_expert = torch.bincount(flat, minlength=num_experts)
     bucket_start = torch.cumsum(tokens_per_expert, 0) - tokens_per_expert
     boundaries = (
         workspace.field("destination_boundaries")[:, :ep_size]
@@ -534,9 +531,7 @@ def _plan_on_this_rank(routes, probs=None):
     assert dist.get_world_size(group) == EP_SIZE
     rank = dist.get_rank(group)
     device = torch.device("cuda", torch.cuda.current_device())
-    workspace = VirtualExpertPlannerWorkspace.allocate(
-        num_experts=NUM_EXPERTS, device=device, group=group
-    )
+    workspace = VirtualExpertPlannerWorkspace(num_experts=NUM_EXPERTS, device=device, group=group)
     own = routes[rank].to(device=device, dtype=torch.int64)
     if probs is None:
         probs = torch.rand(own.shape, device=device)

@@ -18,6 +18,7 @@ import functools
 import math
 
 import torch
+import torch.distributed as dist
 import triton
 import triton.language as tl
 
@@ -132,7 +133,7 @@ def _plan_virtual_expert_routes_kernel(
     BLOCK_TOKENS: tl.constexpr = 128 // BLOCK_TOPK
     BLOCK_RUNTIME_EXPERTS: tl.constexpr = min(256, 2 * BLOCK_NUM_EXPERTS)
     HISTOGRAM_TILE: tl.constexpr = min(16, 8192 // BLOCK_NUM_EXPERTS)
-    # Scratch arena fields, mirroring ``_scratch_layout`` on the host. The two flag words lead,
+    # Scratch arena fields, mirroring ``_scratch_layout`` below. The two flag words lead,
     # each on its own 128-byte line, so the programs spinning on the grid barrier do not contend
     # with the placing programs' barrier and data.
     placement_sync = scratch
@@ -364,6 +365,73 @@ def _plan_virtual_expert_routes_kernel(
         running += tl.histogram(ids, BLOCK_NUM_EXPERTS, mask=valid)
 
 
+def _scratch_layout(num_experts: int, ep_size: int) -> tuple[dict, int]:
+    """Fields of the planner's int32 scratch arena as ``name -> (offset, shape)`` plus its total
+    size; mirrors the field offsets in ``_plan_virtual_expert_routes_kernel``."""
+    block_ep = 1 << (ep_size - 1).bit_length()
+    # Each flag word gets its own 128-byte line (the kernel's _FLAG_STRIDE).
+    fields = (
+        ("placement_grid_sync", (1,)),
+        ("_pad0", (31,)),
+        ("grid_sync", (1,)),
+        ("_pad1", (31,)),
+        ("balance", (ep_size,)),  # native load minus rank capacity
+        ("allocation", (num_experts, ep_size)),  # routes of each expert per destination
+        ("destination_boundaries", (num_experts, block_ep)),  # segment ends, local ordinals
+        ("virtual_expert_slots", (num_experts, ep_size)),  # slot holding an expert on a rank
+        ("program_histogram", (PLANNER_PROGRAMS, num_experts)),
+        ("running_counts", (PLANNER_PROGRAMS, num_experts)),
+        ("tokens_per_expert", (num_experts,)),  # atomic histogram target, zeroed after use
+    )
+    layout, offset = {}, 0
+    for name, shape in fields:
+        layout[name] = (offset, shape)
+        offset += math.prod(shape)
+    return layout, offset
+
+
+class VirtualExpertPlannerWorkspace:
+    """Planner scratch for one expert layout and EP group; every plan overwrites it.
+    ``gathered_counts`` is this rank's ``[ep_size, num_experts]`` NCCL symmetric-memory window:
+    the kernel publishes the local histogram into every peer's window and reads the peers' rows
+    from its own, so planning needs no collective. ``scratch`` is the int32 field arena of
+    :func:`_scratch_layout`; :meth:`field` views one field for inspection."""
+
+    def __init__(self, *, num_experts: int, device: torch.device, group: dist.ProcessGroup) -> None:
+        import torch.distributed._symmetric_memory as symm_mem
+
+        ep_size = dist.get_world_size(group=group)
+        self.rank = dist.get_rank(group=group)
+        # The window needs the group's communicator (created by a first collective).
+        dist.all_reduce(torch.zeros(1, device=device), group=group)
+        if symm_mem.get_backend(device) != "NCCL":
+            symm_mem.set_backend("NCCL")
+        window = symm_mem.empty(ep_size * num_experts, dtype=torch.int32, device=device)
+        self.histogram_handle = symm_mem.rendezvous(window, group)
+        if self.histogram_handle.signal_pad_size < ep_size * 4:
+            raise RuntimeError(
+                "Virtual-expert planner needs one signal word per EP rank; the symmetric memory "
+                f"signal pad holds {self.histogram_handle.signal_pad_size} bytes for {ep_size} "
+                "ranks."
+            )
+        self.gathered_counts = window.view(ep_size, num_experts)
+        self.scratch = torch.zeros(
+            _scratch_layout(num_experts, ep_size)[1], dtype=torch.int32, device=device
+        )
+
+    def field(self, name: str) -> torch.Tensor:
+        """View one field of the scratch arena."""
+        ep_size, num_experts = self.gathered_counts.shape
+        offset, shape = _scratch_layout(num_experts, ep_size)[0][name]
+        return self.scratch[offset : offset + math.prod(shape)].view(shape)
+
+    def destroy(self) -> None:
+        """Drop the symmetric window while its process group is still alive."""
+        if self.histogram_handle is not None:
+            torch.cuda.synchronize(self.gathered_counts.device)
+        self.histogram_handle = self.gathered_counts = None
+
+
 def launch_virtual_expert_planner(
     top_indices: torch.Tensor, probs: torch.Tensor, workspace
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -376,7 +444,7 @@ def launch_virtual_expert_planner(
     runtime probabilities and the int32 ``[ep_size, num_local_experts]`` slot table.
     """
     num_tokens, router_topk = top_indices.shape
-    ep_size, num_experts = workspace.ep_size, workspace.num_experts
+    ep_size, num_experts = workspace.gathered_counts.shape
     if ep_size > PLANNER_PROGRAMS or num_experts > 8192:
         raise ValueError(
             f"Virtual-expert planner supports at most {PLANNER_PROGRAMS} EP ranks and 8192 experts."
