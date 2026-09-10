@@ -504,7 +504,7 @@ def test_multimodal_gigatoken_tokenizer():
         use_gigatoken=True,
     )
 
-    assert tokenizer.use_gigatoken == True, "use_gigatoken is not set to True."
+    assert tokenizer._tokenizer.use_gigatoken == True, "use_gigatoken is not set to True."
 
     # Simple encode - decode roundtrip.
     assert (
@@ -666,7 +666,7 @@ def test_sft_gigatoken_tokenizer():
         use_gigatoken=True,
     )
 
-    assert tokenizer.use_gigatoken == True, "use_gigatoken is not set to True."
+    assert tokenizer._tokenizer.use_gigatoken == True, "use_gigatoken is not set to True."
 
     # Simple encode - decode roundtrip.
     assert (
