@@ -1862,7 +1862,9 @@ class DSAttention(MegatronModule):
                 )
         packed_thd = packed_seq_params is not None and packed_seq_params.qkv_format == "thd"
         cp_partition_mode = (
-            packed_seq_params.cp_partition_mode if packed_thd else self.config.cp_partition_mode
+            packed_seq_params.cp_partition_mode
+            if packed_thd
+            else getattr(self, "_cp_input_partition_mode", self.config.cp_partition_mode)
         )
         if cp_size > 1 and cp_partition_mode != "zigzag":
             raise ValueError(

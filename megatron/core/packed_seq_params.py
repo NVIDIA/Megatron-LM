@@ -91,8 +91,8 @@ def resolve_cp_group(
     """Return the dynamic CP group from packed_seq_params when available, else the static one.
 
     Dynamic CP assigns a per-microbatch CP group that may differ from the
-    process-group stored at model construction time.  This helper centralises
-    process-group stored at model construction time.
+    process-group stored at model construction time. This helper centralises
+    the resolution logic used by model layers that support dynamic CP.
     """
     if packed_seq_params is not None and packed_seq_params.cp_group is not None:
         return packed_seq_params.cp_group

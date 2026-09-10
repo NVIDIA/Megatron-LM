@@ -38,12 +38,13 @@ import torch
 
 from gpt_builders import gpt_builder
 from megatron.core import mpu
+from megatron.core.context_parallel_layout import finalize_packed_seq_params
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.data_schedule import get_batch_on_this_rank_for_sequence_packing
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
 from megatron.core.enums import ModelType
-from megatron.core.package_info import __version__ as mcore_version
 from megatron.core.models.gpt import GPTModel
+from megatron.core.package_info import __version__ as mcore_version
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import (
     get_context_parallel_group,
@@ -117,7 +118,7 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
 
     if args.sequence_packing_scheduler is not None:
         return get_batch_on_this_rank_for_sequence_packing(
-            data_iterator,
+            data_iterator=data_iterator,
             vpp_size=config.virtual_pipeline_model_parallel_size,
             mtp_on_this_rank=mtp_on_this_rank_func(
                 layout=config.pipeline_model_parallel_layout,
@@ -126,6 +127,7 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
                 vp_stage=vp_stage,
             ),
             vp_stage=vp_stage,
+            config=config,
         )
 
     cp_size = args.context_parallel_size
@@ -198,6 +200,7 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
         cp_group=get_context_parallel_group(),
         hybrid_cp_group_func=get_hybrid_data_context_parallel_groups,
         use_per_sequence_balancing=args.dataloader_inter_document_masking and not is_sft,
+        cp_partition_mode=config.cp_partition_mode,
     )
 
     # Return values in BATCH_KEYS order so callers can unpack into the fixed
@@ -373,10 +376,14 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
                     cu_seqlens_kv_padded=cu_seqlens_padded,
                     max_seqlen_q=int(max_seqlen.item()),
                     max_seqlen_kv=int(max_seqlen.item()),
+                    cp_partition_mode=get_attr_wrapped_model(model, "config").cp_partition_mode,
                     local_cp_size=int(local_cp_size.item()) if local_cp_size is not None else None,
                     cp_group=hybrid_cp_group,
                     tokens_per_sample=args.seq_length,
                 )
+        finalize_packed_seq_params(
+            packed_seq_params=packed_seq_params, cp_group=get_context_parallel_group()
+        )
 
     timers('batch-generator').stop()
 

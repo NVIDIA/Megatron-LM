@@ -2665,6 +2665,7 @@ def get_batch_on_this_cp_rank(
     hybrid_cp_group_func: Optional[Callable[[int], torch.distributed.ProcessGroup]] = None,
     use_per_sequence_balancing: bool = False,
     use_contiguous_cp: bool = False,
+    cp_partition_mode: Optional[str] = None,
 ):
     """Dispatch batch partitioning across context-parallel ranks.
 
@@ -2695,11 +2696,23 @@ def get_batch_on_this_cp_rank(
             masking where document lengths are not divisible by
             ``2 * cp_size``).
         use_contiguous_cp (bool): Use contiguous sequence shards for the linear CP layout.
+        cp_partition_mode (Optional[str]): Compatibility spelling for the requested model-boundary
+            layout. When provided, ``"contiguous"`` selects contiguous shards and ``"zigzag"``
+            selects the standard balancing path.
 
     Returns:
         Dict[str, Any]: The batch with sequence-dimension tensors partitioned
         to this CP rank.
     """
+
+    if cp_partition_mode is not None:
+        if cp_partition_mode not in ("zigzag", "contiguous"):
+            raise ValueError(f"Unsupported cp_partition_mode: {cp_partition_mode}")
+        if use_contiguous_cp and cp_partition_mode != "contiguous":
+            raise ValueError(
+                "use_contiguous_cp=True conflicts with cp_partition_mode=" f"{cp_partition_mode!r}."
+            )
+        use_contiguous_cp = cp_partition_mode == "contiguous"
 
     if use_contiguous_cp:
         from megatron.core.context_parallel.utils import _get_batch_on_this_cp_rank_contiguous

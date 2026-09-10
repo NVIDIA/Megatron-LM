@@ -119,9 +119,10 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
             packed_seq_params=packed_seq_params,
             cp_group=cp_group,
             tp_group=self.pg_collection.tp,
-            tp_cp_group=self.pg_collection.tp_cp,
+            tp_cp_group=getattr(self.pg_collection, "tp_cp", None),
             target_partition_mode="zigzag",
             sequence_parallel=self.config.sequence_parallel,
+            source_partition_mode=getattr(self, "_cp_input_partition_mode", None),
             config=self.config,
         )
 
@@ -129,7 +130,9 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
             packed_seq_params.cp_partition_mode
             if packed_seq_params is not None and packed_seq_params.qkv_format == "thd"
             else (
-                "zigzag" if back_to_input_converter is not None else self.config.cp_partition_mode
+                "zigzag"
+                if back_to_input_converter is not None
+                else getattr(self, "_cp_input_partition_mode", self.config.cp_partition_mode)
             )
         )
         if cp_group is not None and cp_group.size() > 1 and internal_partition_mode != "zigzag":

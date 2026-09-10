@@ -504,10 +504,16 @@ def test_cp_partition_mode_converter_recurses_over_tensor_containers(monkeypatch
     assert packed_seq_params.cp_partition_route is route
 
 
-def test_cp_partition_mode_converter_rejects_thd_full_iteration_cuda_graph_conversion():
+@pytest.mark.parametrize(
+    ("cuda_graph_impl", "cuda_graph_modules"),
+    [("full_iteration", []), ("local", []), ("local", ["attn"]), ("transformer_engine", ["attn"])],
+)
+def test_cp_partition_mode_converter_rejects_thd_attention_cuda_graph_conversion(
+    cuda_graph_impl, cuda_graph_modules
+):
     cp_group = SimpleNamespace(size=lambda: 2)
     packed_seq_params = SimpleNamespace(qkv_format="thd")
-    config = SimpleNamespace(cuda_graph_impl="full_iteration")
+    config = SimpleNamespace(cuda_graph_impl=cuda_graph_impl, cuda_graph_modules=cuda_graph_modules)
 
     CpPartitionModeConverter(
         cp_group=cp_group,
@@ -517,7 +523,7 @@ def test_cp_partition_mode_converter_rejects_thd_full_iteration_cuda_graph_conve
         config=config,
     )
 
-    with pytest.raises(ValueError, match="Full-iteration CUDA graph"):
+    with pytest.raises(ValueError, match="CUDA graph capture that includes attention"):
         CpPartitionModeConverter(
             cp_group=cp_group,
             packed_seq_params=packed_seq_params,
@@ -525,6 +531,22 @@ def test_cp_partition_mode_converter_rejects_thd_full_iteration_cuda_graph_conve
             target_partition_mode="contiguous",
             config=config,
         )
+
+
+def test_cp_partition_mode_converter_allows_thd_conversion_outside_attention_graph():
+    cp_group = SimpleNamespace(size=lambda: 2)
+    packed_seq_params = SimpleNamespace(qkv_format="thd")
+    config = SimpleNamespace(cuda_graph_impl="local", cuda_graph_modules=["mlp"])
+
+    converter = CpPartitionModeConverter(
+        cp_group=cp_group,
+        packed_seq_params=packed_seq_params,
+        source_partition_mode="zigzag",
+        target_partition_mode="contiguous",
+        config=config,
+    )
+
+    assert converter.conversion_needed
 
 
 def test_module_input_conversion_treats_missing_packed_seq_params_as_sbhd(monkeypatch):
@@ -559,6 +581,43 @@ def test_module_input_conversion_treats_missing_packed_seq_params_as_sbhd(monkey
     assert calls[0][2]["cu_seqlens"] is None
     assert calls[0][2]["tp_cp_group"] is tp_cp_group
     assert converter.tp_cp_group is tp_cp_group
+
+
+def test_module_input_conversion_uses_manager_supplied_sbhd_layout():
+    hidden_states = torch.ones(8, 1, 4)
+    cp_group = SimpleNamespace(size=lambda: 2)
+
+    converted, back_to_input_converter = convert_module_input_tensors_cp_partition_mode(
+        hidden_states=hidden_states,
+        packed_seq_params=None,
+        source_partition_mode="zigzag",
+        target_partition_mode="zigzag",
+        sequence_parallel=False,
+        config=SimpleNamespace(cp_partition_mode="contiguous", cuda_graph_impl="none"),
+        cp_group=cp_group,
+    )
+
+    assert converted is hidden_states
+    assert back_to_input_converter is None
+
+
+def test_module_input_conversion_prefers_thd_metadata_over_static_layout_marker():
+    hidden_states = torch.ones(8, 1, 4)
+    cp_group = SimpleNamespace(size=lambda: 2)
+    packed_seq_params = SimpleNamespace(qkv_format="thd", cp_partition_mode="zigzag")
+
+    converted, back_to_input_converter = convert_module_input_tensors_cp_partition_mode(
+        hidden_states=hidden_states,
+        packed_seq_params=packed_seq_params,
+        source_partition_mode="contiguous",
+        target_partition_mode="zigzag",
+        sequence_parallel=False,
+        config=SimpleNamespace(cp_partition_mode="contiguous", cuda_graph_impl="none"),
+        cp_group=cp_group,
+    )
+
+    assert converted is hidden_states
+    assert back_to_input_converter is None
 
 
 def test_public_conversion_apis_default_to_no_cp_group():
