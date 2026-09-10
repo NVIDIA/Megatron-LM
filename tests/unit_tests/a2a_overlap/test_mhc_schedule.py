@@ -228,7 +228,9 @@ def test_model_chunk_builds_independent_two_layer_recompute_groups(monkeypatch):
     captured_extra_args = []
 
     class _CapturedLayerPlan:
-        def __init__(self, layer, event, state, comp_stream, comm_stream, extra_args):
+        def __init__(
+            self, layer, event, state, comp_stream, comm_stream, extra_args, tensor_release=None
+        ):
             captured_extra_args.append(dict(extra_args))
 
     monkeypatch.setattr(
@@ -239,6 +241,7 @@ def test_model_chunk_builds_independent_two_layer_recompute_groups(monkeypatch):
     plan._event = object()
     plan._model_chunk_state = object()
     plan._transformer_layers = []
+    plan._tensor_release = None
     config = SimpleNamespace(
         enable_hyper_connections=True,
         recompute_granularity="selective",
