@@ -397,12 +397,31 @@ class TransformerConfig(ModelParallelConfig):
     ####################
     # DeepSeek-v4 hybrid attention
     ####################
+    dsv4_version: Literal["v4", "v4.1"] = "v4"
+    """Architecture selected by ``dsv4_hybrid``. V4.1 uses CSA2 and Single-Pass mHC."""
+
     csa_window_size: int = 128
     """Sliding window size for compressed sparse attention."""
 
     csa_compress_ratios: Optional[List[int]] = None
     """Per-layer compress ratios, e.g. [0, 0, 4, 128, 4, 128, ...]. A value of 0 is a
-    sliding-window-only layer (no compressor / no top-k indexer; the 'W' hybrid layer symbol)."""
+    sliding-window-only layer (no compressor / no top-k indexer; the 'W' hybrid layer symbol).
+    V4.1 instead uses 0/1/2, with exactly one entry per backbone layer."""
+
+    csa2_kv_source_layers: list[int] | None = None
+    """Zero-based Full layers owning CSA2 main KV and indexer K, in increasing order."""
+
+    csa2_index_source_layers: list[int] | None = None
+    """Zero-based Full/Reindex layers producing fresh Top-K indices, in increasing order."""
+
+    csa2_candidate_source_layer: int | None = None
+    """Full layer producing hierarchical candidates. None disables candidate restriction."""
+
+    csa2_candidate_topk_blocks: int = 0
+    """Maximum number of blocks selected by the hierarchical CSA2 indexer."""
+
+    csa2_candidate_block_size: int = 0
+    """Number of global KV positions per hierarchical candidate block."""
 
     csa_compress_rotary_base: float = 40000.0
     """RoPE base for compressed KV positions in compressed sparse attention."""
@@ -1296,6 +1315,9 @@ class TransformerConfig(ModelParallelConfig):
     mhc_sinkhorn_iterations: int = 20
     """Number of Sinkhorn-Knopp iterations for doubly stochastic projection."""
 
+    mhc_epsilon: float = 1e-6
+    """V4.1 mHC mixing/Sinkhorn epsilon; RMS statistics use layernorm_epsilon instead."""
+
     mhc_init_gating_factor: float = 0.01
     """Initial value of Gating Factor (alpha in paper)."""
 
@@ -1687,6 +1709,21 @@ class TransformerConfig(ModelParallelConfig):
                 self.experimental_attention_variant
             )
 
+        if self.dsv4_version not in ("v4", "v4.1"):
+            raise ValueError(f"Unsupported dsv4_version: {self.dsv4_version}")
+        if self.dsv4_version == "v4.1" and self.experimental_attention_variant != "dsv4_hybrid":
+            raise ValueError(
+                "dsv4_version='v4.1' requires experimental_attention_variant='dsv4_hybrid'"
+            )
+        if self.dsv4_version != "v4.1" and (
+            self.csa2_kv_source_layers is not None
+            or self.csa2_index_source_layers is not None
+            or self.csa2_candidate_source_layer is not None
+            or self.csa2_candidate_topk_blocks != 0
+            or self.csa2_candidate_block_size != 0
+        ):
+            raise ValueError("CSA2 source/candidate configuration requires dsv4_version='v4.1'")
+
         if self.use_transformer_engine_op_fuser and self.moe_grouped_gemm:
             self.moe_use_grouped_tensor = True
 
@@ -1915,6 +1952,11 @@ class TransformerConfig(ModelParallelConfig):
                     "DSAttention context parallelism currently supports "
                     "cp_comm_type=allgather only."
                 )
+        elif self.experimental_attention_variant == "dsv4_hybrid" and self.dsv4_version == "v4.1":
+            if not isinstance(self, MLATransformerConfig) or not self.multi_latent_attention:
+                raise ValueError("V4.1 requires MLATransformerConfig with multi_latent_attention")
+            self._validate_dsv41_config()
+            self.hetereogenous_dist_checkpoint = True
         elif self.experimental_attention_variant == "dsv4_hybrid":
             if self.dsa_indexer_precision not in ("bf16", "mxfp8"):
                 raise ValueError(
@@ -4352,3 +4394,150 @@ class MLATransformerConfig(TransformerConfig):
             assert (
                 self.apply_rope_fusion is False
             ), "Rope Fusion is not compatible with caching latents"
+
+    def _validate_dsv41_config(self) -> None:
+        """Validate V4.1 fields on the existing DSv4 configuration path.
+
+        Only validate source relationships here. CSA2 construction will resolve each
+        layer's mode and owners when the attention implementation is added.
+        """
+        if self.transformer_impl != "local":
+            raise ValueError("Native V4.1 requires transformer_impl='local'")
+        for name in (
+            "tensor_model_parallel_size",
+            "pipeline_model_parallel_size",
+            "context_parallel_size",
+            "expert_model_parallel_size",
+            "expert_tensor_parallel_size",
+        ):
+            if getattr(self, name) != 1:
+                raise ValueError(f"Native V4.1 currently requires {name}=1")
+        if self.virtual_pipeline_model_parallel_size is not None or self.sequence_parallel:
+            raise ValueError("Native V4.1 does not yet support VPP or sequence parallelism")
+        if self.dynamic_context_parallel or self.recompute_granularity is not None:
+            raise ValueError(
+                "Native V4.1 does not yet support dynamic CP or activation recomputation"
+            )
+        if self.mtp_num_layers:
+            raise ValueError("V4.1 backbone configuration must not include MTP/DSpark layers")
+        if self.fp16 or self.params_dtype not in (torch.float32, torch.bfloat16):
+            raise ValueError("Native V4.1 requires FP32 or BF16 parameters")
+        if self.fp8 or self.fp4 or self.quant_recipe is not None:
+            raise ValueError("Native V4.1 does not yet support quantization")
+        if self.dsa_kernel_backend != "none" or self.dsa_indexer_precision != "bf16":
+            raise ValueError(
+                "Native V4.1 requires dsa_kernel_backend='none' and unquantized indexers"
+            )
+        for name in (
+            "apply_rope_fusion",
+            "mla_down_proj_fusion",
+            "use_fused_mhc",
+            "bias_activation_fusion",
+            "bias_dropout_fusion",
+            "masked_softmax_fusion",
+            "moe_router_fusion",
+            "moe_permute_fusion",
+            "moe_grouped_gemm",
+            "use_te_activation_func",
+            "use_transformer_engine_op_fuser",
+            "gradient_accumulation_fusion",
+        ):
+            if getattr(self, name):
+                raise ValueError(f"Native V4.1 requires {name}=False")
+        if self.cuda_graph_impl != "none" or self.enable_cuda_graph:
+            raise ValueError("Native V4.1 does not yet support CUDA Graphs")
+        if self.csa_dense_mode or self.dsa_indexer_rotate_activation or self.qk_clip:
+            raise ValueError(
+                "V4.1 does not use dense CSA, indexer Hadamard rotation, or QK clipping"
+            )
+        if self.normalization != "RMSNorm" or not self.qk_layernorm or self.qk_l2_norm:
+            raise ValueError("V4.1 requires learned RMSNorm on query/KV latents")
+        if self.layernorm_zero_centered_gamma:
+            raise ValueError("V4.1 RMSNorm does not use zero-centered gamma")
+        for name in (
+            "csa_window_size",
+            "dsa_indexer_n_heads",
+            "dsa_indexer_head_dim",
+            "dsa_indexer_topk",
+            "q_lora_rank",
+            "v_head_dim",
+            "o_groups",
+            "o_lora_rank",
+        ):
+            value = getattr(self, name)
+            if type(value) is not int or value <= 0:
+                raise ValueError(f"V4.1 requires a positive integer {name}")
+        rotary_dim = self.qk_pos_emb_head_dim
+        if (
+            type(rotary_dim) is not int
+            or rotary_dim <= 0
+            or rotary_dim % 2
+            or rotary_dim > min(self.v_head_dim, self.dsa_indexer_head_dim)
+        ):
+            raise ValueError(
+                "V4.1 rotary dimension must be positive, even, and fit main/indexer heads"
+            )
+        if self.num_attention_heads * self.v_head_dim % self.o_groups:
+            raise ValueError("V4.1 num_attention_heads * v_head_dim must be divisible by o_groups")
+        if self.rotary_percent != 1:
+            raise ValueError("V4.1 requires RoPE over the complete rotary tail")
+        # DSv4 already handles adjacent pairs through mla_rotary_interleaved and
+        # mla_output_remove_interleaving. The generic rotary_interleaved flag stays off.
+        if self.mscale != 0 or self.mscale_all_dim != 0:
+            raise ValueError(
+                "V4.1 YaRN does not use amplitude scaling; set both mscale fields to zero"
+            )
+        for name in ("layernorm_epsilon", "mhc_epsilon", "csa_compress_rotary_base"):
+            value = getattr(self, name)
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(f"V4.1 requires positive finite {name}")
+
+        ratios = self.csa_compress_ratios
+        if ratios is None or len(ratios) != self.num_layers:
+            raise ValueError("V4.1 csa_compress_ratios must have exactly num_layers entries")
+        if any(type(ratio) is not int or ratio not in (0, 1, 2) for ratio in ratios):
+            raise ValueError("V4.1 csa_compress_ratios must contain only 0, 1, or 2")
+        for name in ("csa2_kv_source_layers", "csa2_index_source_layers"):
+            sources = getattr(self, name)
+            if sources is None:
+                raise ValueError(f"V4.1 requires explicit {name}")
+            if any(type(layer) is not int or not 0 <= layer < self.num_layers for layer in sources):
+                raise ValueError(f"{name} must contain zero-based backbone layer IDs")
+            if sources != sorted(set(sources)):
+                raise ValueError(f"{name} must be strictly increasing without duplicates")
+            if any(ratios[layer] == 0 for layer in sources):
+                raise ValueError(f"{name} cannot contain a SWA-only layer")
+        if not set(self.csa2_kv_source_layers).issubset(self.csa2_index_source_layers):
+            raise ValueError("Every CSA2 KV source must also be an index source (Full mode)")
+
+        candidate = self.csa2_candidate_source_layer
+        blocks, block_size = self.csa2_candidate_topk_blocks, self.csa2_candidate_block_size
+        if candidate is None:
+            if blocks != 0 or block_size != 0:
+                raise ValueError("Disabled CSA2 candidates require zero block count and block size")
+        else:
+            if type(candidate) is not int or candidate not in self.csa2_kv_source_layers:
+                raise ValueError("csa2_candidate_source_layer must be a Full layer")
+            if any(layer > candidate for layer in self.csa2_kv_source_layers):
+                raise ValueError("CSA2 candidates cannot cross a later KV source")
+            if (
+                type(blocks) is not int
+                or type(block_size) is not int
+                or min(blocks, block_size) <= 0
+            ):
+                raise ValueError(
+                    "Enabled CSA2 candidates require positive integer block count and size"
+                )
+            if blocks * block_size < self.dsa_indexer_topk:
+                raise ValueError("CSA2 candidate capacity must be at least dsa_indexer_topk")
+
+        source_ratio = None
+        for layer, ratio in enumerate(ratios):
+            if ratio == 0:
+                continue
+            if layer in self.csa2_kv_source_layers:
+                source_ratio = ratio
+            elif source_ratio is None:
+                raise ValueError(f"CSA2 layer {layer} has no preceding Full layer")
+            elif ratio != source_ratio:
+                raise ValueError(f"CSA2 layer {layer} must use its KV source's compression ratio")

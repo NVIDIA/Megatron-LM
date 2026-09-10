@@ -177,6 +177,12 @@ def get_dsv4_hybrid_module_spec_for_backend(
     config: TransformerConfig, backend: BackendSpecProvider = None
 ) -> ModuleSpec:
     """Helper function to get module spec for DSv4 Hybrid Sparse Attention."""
+    if config.dsv4_version == "v4.1":
+        # Step 1 supplies configuration and extends the existing DSv4 components. Do not
+        # silently instantiate V4's independent CSA/HCA layers for a CSA2 configuration.
+        raise NotImplementedError(
+            "V4.1 configuration is available, but the CSA2 attention ModuleSpec is not implemented yet."
+        )
     assert config.multi_latent_attention, "Currently only MLA supports sparse attention."
     assert config.qk_l2_norm is False, "qk_l2_norm is not supported with MLA."
 

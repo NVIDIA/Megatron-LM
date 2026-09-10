@@ -121,7 +121,9 @@ class DSv4HybridAttention(Attention):
             compress_ratio = self.config.csa_compress_ratios[_ratio_idx]
         # compress_ratio == 0 is a sliding-window-only layer (the 'W' symbol): no compressor /
         # no top-k indexer (see CompressedSparseAttention) AND standard (non-YARN) rope.
-        use_compressed_yarn = compress_ratio > 1
+        use_compressed_yarn = compress_ratio > 1 or (
+            self.config.dsv4_version == "v4.1" and compress_ratio == 1
+        )
         rope_base = (
             self.config.csa_compress_rotary_base if use_compressed_yarn else self.config.rotary_base
         )
@@ -133,6 +135,7 @@ class DSv4HybridAttention(Attention):
                 self.config.qk_pos_emb_head_dim,
                 rotary_percent=self.config.rotary_percent,
                 rotary_base=rope_base,
+                use_cpu_initialization=self.config.use_cpu_initialization,
                 cp_group=self.pg_collection.cp,
             )
         else:
@@ -145,6 +148,7 @@ class DSv4HybridAttention(Attention):
                 beta_slow=self.config.beta_slow,
                 mscale=self.config.mscale,
                 mscale_all_dim=self.config.mscale_all_dim,
+                use_cpu_initialization=self.config.use_cpu_initialization,
                 cp_group=self.pg_collection.cp,
             )
 
