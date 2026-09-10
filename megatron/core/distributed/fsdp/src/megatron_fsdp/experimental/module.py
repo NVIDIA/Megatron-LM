@@ -154,7 +154,8 @@ class FsdpContext:
         self._post_backward_hook_registered = True
 
         # TODO(wujingyue): Switch to torch.autograd.graph.queue_callback() when Megatron-LM
-        # requires a PyTorch version that includes it: https://github.com/pytorch/pytorch/pull/193958
+        # requires a PyTorch version that includes it:
+        # https://github.com/pytorch/pytorch/pull/193958
         torch.autograd.Variable._execution_engine.queue_callback(self.post_backward)
 
 
@@ -216,7 +217,7 @@ class FsdpModule:
             parameter_groups.append(
                 FsdpParameterGroup(
                     owning_module=self,
-                    parameters=group_parameters,
+                    fqn_to_parameter=group_parameters,
                     mesh=mesh,
                     model_weight_placements=_specialize_placements(
                         model_weight_placements, group_dtype
