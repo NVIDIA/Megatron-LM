@@ -414,8 +414,11 @@ class TransformerConfig(ModelParallelConfig):
     implementation, and pre-existing paths keep their behavior with a once-per-process
     correctness warning. Whether balancing is worthwhile for a workload is decided once,
     at recipe level, by this flag.
-    Under FP8 recipes, eval/no-grad forwards skip the indexer's loss-path projection, so its amax
-    history sees fewer recordings than the reference during eval (training forwards identical).
+    Selection Q inherits the effective per-layer precision. Only delayed-scaling selection
+    uses a stateless nonquantized projection; its canonical local projection still records once
+    in eval/no-grad checkpoint forwards so amax and recompute metadata remain consistent.
+    Compact BF16/MXFP8 scoring returns its sparse-loss prediction with the selected indices in
+    the existing combine collectives. MXFP8 never takes an unfused BF16 fallback.
     For Transformer Engine CUDA graphs that capture attention, fixed-capacity dynamic-pack routing
     is enabled automatically when ``sequence_packing_scheduler="dp_balanced"``. Data preparation
     then builds one fixed-shape source plan from each microbatch's ``cu_seqlens``. The decoder stack
