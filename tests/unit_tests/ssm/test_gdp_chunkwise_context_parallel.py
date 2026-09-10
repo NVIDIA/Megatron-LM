@@ -20,6 +20,7 @@ from megatron.core.ssm.gated_delta_product import (
     HAVE_FLA_GDP_CP,
     GatedDeltaProductMixer,
 )
+from megatron.core.ssm.gdp_context_parallel import GDPContextParallel
 
 pytestmark = pytest.mark.launch_on_gb200
 
@@ -44,6 +45,50 @@ class _FakeGroup:
 
     def size(self) -> int:
         return self._size
+
+
+@pytest.mark.parametrize("linear_cp_mode", ["headwise", "chunkwise"])
+def test_runtime_cp_resolution_is_forward_local(linear_cp_mode):
+    """Sequential CP1/2/4 resolution must not alter the mixer or base helper."""
+    static_group = _FakeGroup(rank=0, size=1)
+    runtime_groups = {size: _FakeGroup(rank=0, size=size) for size in (1, 2, 4)}
+    conv = torch.nn.Conv1d(128, 128, kernel_size=4, groups=128)
+    helper = GDPContextParallel(
+        cp_group=static_group,
+        d_inner_local_tp=64,
+        nheads_local_tp=4,
+        ngroups_local_tp=4,
+        d_state=16,
+        num_householder=1,
+        headdim=16,
+        conv1d_cp1=conv,
+        dt_bias_cp1=torch.randn(4),
+        A_log_cp1=torch.randn(4),
+        D_cp1=None,
+        D_has_hdim=False,
+    )
+    mixer = GatedDeltaProductMixer.__new__(GatedDeltaProductMixer)
+    mixer.pg_collection = SimpleNamespace(cp=static_group)
+    mixer.cp = helper
+    mixer.config = SimpleNamespace(linear_cp_mode=linear_cp_mode)
+    mixer.chunkwise_cp_backend = object() if linear_cp_mode == "chunkwise" else None
+    mixer.d_inner_local_tp = 64
+    mixer.nheads_local_tp = 4
+    mixer.ngroups_local_tp = 4
+
+    for cp_size in (1, 2, 4, 2, 1):
+        runtime = mixer._resolve_runtime_cp(
+            PackedSeqParams(local_cp_size=cp_size, cp_group=runtime_groups[cp_size])
+        )
+        assert runtime.group is runtime_groups[cp_size]
+        assert runtime.helper.cp_size == cp_size
+        assert runtime.chunkwise is (linear_cp_mode == "chunkwise" and cp_size > 1)
+        expected_heads = 4 if runtime.chunkwise else 4 // cp_size
+        assert runtime.nheads == expected_heads
+
+        assert mixer.cp is helper
+        assert helper.cp_group is static_group
+        assert helper.cp_size == 1
 
 
 def test_shared_autograd_adapter(monkeypatch):
