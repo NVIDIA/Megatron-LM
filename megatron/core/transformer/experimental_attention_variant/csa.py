@@ -2990,6 +2990,15 @@ class CompressedSparseAttention(MegatronModule):
                 # indexer_loss_coeff); the balanced path re-projects per chunk. Skip this
                 # projection only when neither consumer runs: balanced path in eval/no-grad.
                 if use_balance and not training_with_grad:
+                    from megatron.core.transformer.experimental_attention_variant import (
+                        cp_balanced_indexer,
+                    )
+
+                    if cp_balanced_indexer._selection_uses_delayed_scaling(indexer.linear_wq_b):
+                        # The reference records one local projection even in a
+                        # no-grad checkpoint forward. Preserve its amax/recompute
+                        # metadata; head/tail selection must not add recordings.
+                        indexer.linear_wq_b(indexer_qr)
                     q_indexer_cp = None
                 else:
                     q_indexer_cp, _ = indexer.linear_wq_b(indexer_qr)

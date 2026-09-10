@@ -53,7 +53,7 @@ from megatron.core.transformer.experimental_attention_variant.dsa import rotate_
 from megatron.core.transformer.experimental_attention_variant.dsa_fused_safety import (
     FUSED_INDEXER_MAX_SAFE_ROWS,
 )
-from megatron.core.utils import nvtx_range_pop, nvtx_range_push
+from megatron.core.utils import ensure_params_ready, nvtx_range_pop, nvtx_range_push
 
 logger = logging.getLogger(__name__)
 
@@ -311,46 +311,47 @@ def dispatch_chunks_async(
     return {"kind": "ag2", "works": [wq, ww], "gq": gq, "gw": gw, "q_lora": q_lora}
 
 
-_FP8_AUTOCAST = None  # resolved once by _no_fp8_ctx: TE fp8_autocast, or False when TE absent
+def _selection_uses_delayed_scaling(linear):
+    """Resolve the effective recipe, including TELinear's per-layer override."""
+    from megatron.core.extensions.transformer_engine import HAVE_TE
+
+    if not HAVE_TE:
+        return False
+
+    from transformer_engine.pytorch.fp8 import FP8GlobalStateManager
+
+    from megatron.core.extensions.transformer_engine import (
+        TELinear,
+        _get_fp8_autocast_for_quant_params,
+    )
+
+    if not isinstance(linear, TELinear):
+        return False
+    with _get_fp8_autocast_for_quant_params(linear.te_quant_params, linear.training):
+        return (
+            FP8GlobalStateManager.is_fp8_enabled()
+            and FP8GlobalStateManager.get_fp8_recipe().delayed()
+        )
 
 
-def _no_fp8_ctx():
-    """FP8-disabled context for the no-grad chunk projections.
+@torch.no_grad()
+def _project_selection_q(linear, qr):
+    """Inherit Q precision; only delayed-scaling selection uses stateless projection.
 
-    The balanced path projects each chunk through ``linear_wq_b`` IN ADDITION to the
-    loss path's grad-tracked projection. Under an FP8 delayed-scaling recipe covering
-    that TE linear, letting these extra forwards run in FP8 would append to its amax
-    history — the quantization-scale trajectory (and hence loss-path numerics) would
-    depend on the balanced indexer. Running them in the ambient non-FP8 dtype keeps
-    the loss path's amax stream identical to the reference during TRAINING forwards
-    (one recording per step) and scores the top-k at bf16-or-better precision.
-
-    Known, accepted divergences under FP8: (a) eval/no-grad forwards skip the loss
-    projection entirely (csa.py), so the flag removes eval-time amax recordings the
-    reference would have made — eval steps no longer perturb training scales, which
-    differs from the reference trajectory by design; (b) the sparse-attention
-    SELECTION uses these non-FP8 chunk scores while the indexer LOSS trains against
-    the FP8-projected loss-path scores — the selection is at least as precise as the
-    reference's.
-
-    NOTE(fp8_model_init): with FP8-only parameters (--fp8-param-gather /
-    fp8_model_init), running a TE linear outside fp8_autocast is TE-version
-    dependent (dequantize-on-the-fly vs error). Any failure is loud, not silent;
-    validate on the target TE build before enabling the flag under FP8 params.
+    A disabled autocast alone cannot reset TE Linear's cached FP8 state during
+    recompute. The delayed branch reads the duplicated projection's shared weight
+    without entering TE Linear or changing its amax history. Other recipes and
+    explicit nonquantized layer overrides retain the normal module forward.
     """
-    global _FP8_AUTOCAST
-    if _FP8_AUTOCAST is None:
-        try:
-            from transformer_engine.pytorch import fp8_autocast
+    if _selection_uses_delayed_scaling(linear):
+        from megatron.core.fp8_utils import dequantize_fp8_tensor, is_float8tensor
 
-            _FP8_AUTOCAST = fp8_autocast
-        except ImportError:
-            _FP8_AUTOCAST = False
-    if _FP8_AUTOCAST is False:
-        import contextlib
-
-        return contextlib.nullcontext()
-    return _FP8_AUTOCAST(enabled=False)
+        weight = linear.weight
+        ensure_params_ready([weight])
+        if is_float8tensor(weight):
+            weight = dequantize_fp8_tensor(weight)
+        return torch.nn.functional.linear(qr, weight, linear.bias)
+    return linear(qr)[0]
 
 
 _AG_FALLBACK_WARNED: set = set()
@@ -1509,8 +1510,7 @@ def balanced_compute_cp_indexer_topk(
         # chunk matches the same rows of a full call (up to GEMM reduction order of the chunked
         # projection: exact score ties may resolve differently; the output is integer indices
         # with no gradient path).
-        with _no_fp8_ctx():  # keep the loss path's FP8 amax stream reference-identical
-            q, _ = indexer.linear_wq_b(qr_rows.reshape(sz, 1, q_lora))
+        q = _project_selection_q(indexer.linear_wq_b, qr_rows.reshape(sz, 1, q_lora))
         q = q.reshape(sz, n_heads, head_dim)
         if config.apply_rope_fusion:
             # cos/sin dtype from the projected q (post linear_wq_b), matching the reference path
@@ -1645,8 +1645,7 @@ def balanced_compute_cp_indexer_topk(
         # Integer top-k output only: no gradient flows through the balanced
         # scoring, so skip autograd tracking for the per-chunk projection/RoPE.
         sz = qr_rows.shape[0]
-        with _no_fp8_ctx():  # see _chunk_topk: keep the FP8 amax stream untouched
-            q, _ = indexer.linear_wq_b(qr_rows.reshape(sz, 1, q_lora))
+        q = _project_selection_q(indexer.linear_wq_b, qr_rows.reshape(sz, 1, q_lora))
         q = q.reshape(sz, n_heads, head_dim)
         q = _rope_positions(
             q, pos_ids, layout3[0], nope_dim, pos_dim, indexer, config, int(max_seqlen_q)
