@@ -6,6 +6,7 @@ Covers:
 - ``_PlanCacheKey`` separation across configurations that route to different
   global ranks (the rank-offset bug — two non-collocated configs with identical
   parallel sizes used to silently share a plan).
+- ``_PlanCacheKey`` separation across execution batch limits.
 - ``get_refit_tensor_dict`` / ``invalidate_refit_tensor_cache`` (module-level
   named_refit_tensors cache + invalidation when ``_harmonize_buffer_dtypes``
   replaces a buffer).
@@ -17,20 +18,32 @@ import torch.nn as nn
 
 import megatron.core.resharding.refit as refit
 from megatron.core.resharding.copy_services.base import CopyService
-from megatron.core.resharding.refit import _PlanCacheKey
-from megatron.core.resharding.utils import get_refit_tensor_dict, invalidate_refit_tensor_cache
+from megatron.core.resharding.refit import _get_parallel_config, _ParallelConfig, _PlanCacheKey
+from megatron.core.resharding.utils import (
+    ReshardPlan,
+    get_refit_tensor_dict,
+    invalidate_refit_tensor_cache,
+)
+
+
+def _config(tp=1, pp=1, ep=1, dp=1, expert_tp=1, gtp_remat=1, expert_gtp_remat=1):
+    return _ParallelConfig(
+        tp_size=tp,
+        pp_size=pp,
+        ep_size=ep,
+        dp_size=dp,
+        expert_tp_size=expert_tp,
+        gtp_remat_size=gtp_remat,
+        expert_gtp_remat_size=expert_gtp_remat,
+    )
 
 
 class TestPlanCacheKey:
     """Plan cache must distinguish configs that route to different global ranks."""
 
     def test_equality_with_same_inputs(self):
-        k1 = _PlanCacheKey(
-            rank=0, src_config=(1, 1, 1, 1, 1), dst_config=(1, 1, 1, 1, 1), num_experts=None
-        )
-        k2 = _PlanCacheKey(
-            rank=0, src_config=(1, 1, 1, 1, 1), dst_config=(1, 1, 1, 1, 1), num_experts=None
-        )
+        k1 = _PlanCacheKey(rank=0, src_config=_config(), dst_config=_config(), num_experts=None)
+        k2 = _PlanCacheKey(rank=0, src_config=_config(), dst_config=_config(), num_experts=None)
         assert k1 == k2
         assert hash(k1) == hash(k2)
 
@@ -38,16 +51,16 @@ class TestPlanCacheKey:
         """Same sizes + rank, different src_rank_offset → different cache key."""
         k1 = _PlanCacheKey(
             rank=0,
-            src_config=(2, 1, 1, 2, 1),
-            dst_config=(2, 1, 1, 2, 1),
+            src_config=_config(tp=2, dp=2),
+            dst_config=_config(tp=2, dp=2),
             num_experts=None,
             src_rank_offset=0,
             dst_rank_offset=4,
         )
         k2 = _PlanCacheKey(
             rank=0,
-            src_config=(2, 1, 1, 2, 1),
-            dst_config=(2, 1, 1, 2, 1),
+            src_config=_config(tp=2, dp=2),
+            dst_config=_config(tp=2, dp=2),
             num_experts=None,
             src_rank_offset=8,
             dst_rank_offset=12,
@@ -58,16 +71,16 @@ class TestPlanCacheKey:
     def test_different_dst_rank_offset_distinguishes(self):
         k1 = _PlanCacheKey(
             rank=0,
-            src_config=(2, 1, 1, 2, 1),
-            dst_config=(2, 1, 1, 2, 1),
+            src_config=_config(tp=2, dp=2),
+            dst_config=_config(tp=2, dp=2),
             num_experts=None,
             src_rank_offset=0,
             dst_rank_offset=4,
         )
         k2 = _PlanCacheKey(
             rank=0,
-            src_config=(2, 1, 1, 2, 1),
-            dst_config=(2, 1, 1, 2, 1),
+            src_config=_config(tp=2, dp=2),
+            dst_config=_config(tp=2, dp=2),
             num_experts=None,
             src_rank_offset=0,
             dst_rank_offset=8,
@@ -77,12 +90,12 @@ class TestPlanCacheKey:
     def test_default_offsets_match_collocated(self):
         """Collocated callers (no offsets specified) reuse the same plan."""
         k1 = _PlanCacheKey(
-            rank=3, src_config=(2, 1, 1, 4, 1), dst_config=(2, 1, 1, 4, 1), num_experts=None
+            rank=3, src_config=_config(tp=2, dp=4), dst_config=_config(tp=2, dp=4), num_experts=None
         )
         k2 = _PlanCacheKey(
             rank=3,
-            src_config=(2, 1, 1, 4, 1),
-            dst_config=(2, 1, 1, 4, 1),
+            src_config=_config(tp=2, dp=4),
+            dst_config=_config(tp=2, dp=4),
             num_experts=None,
             src_rank_offset=0,
             dst_rank_offset=0,
@@ -93,6 +106,52 @@ class TestPlanCacheKey:
         k1 = _PlanCacheKey(rank=0, src_config=None, dst_config=None, num_experts=8)
         k2 = _PlanCacheKey(rank=0, src_config=None, dst_config=None, num_experts=16)
         assert k1 != k2
+
+    def test_execution_batch_bytes_distinguishes(self):
+        k1 = _PlanCacheKey(
+            rank=0, src_config=None, dst_config=None, num_experts=None, execution_batch_bytes=128
+        )
+        k2 = _PlanCacheKey(
+            rank=0, src_config=None, dst_config=None, num_experts=None, execution_batch_bytes=256
+        )
+        assert k1 != k2
+
+    def test_gtp_remat_sizes_distinguish(self):
+        base = _config(tp=2, dp=2)
+        plain = _PlanCacheKey(rank=0, src_config=base, dst_config=base, num_experts=None)
+
+        for config in (_config(tp=2, dp=2, gtp_remat=4), _config(tp=2, dp=2, expert_gtp_remat=2)):
+            assert plain != _PlanCacheKey(
+                rank=0, src_config=config, dst_config=config, num_experts=None
+            )
+
+
+def test_parallel_config_includes_gtp_remat_sizes():
+    class Group:
+        def __init__(self, size):
+            self._size = size
+
+        def size(self):
+            return self._size
+
+    class Core:
+        pg_collection = type(
+            "PG",
+            (),
+            {
+                "tp": Group(2),
+                "pp": Group(3),
+                "ep": Group(4),
+                "dp": Group(5),
+                "expt_tp": Group(6),
+                "gtp_remat": Group(7),
+                "expt_gtp_remat": Group(8),
+            },
+        )()
+
+    assert _get_parallel_config(Core()) == _config(
+        tp=2, pp=3, ep=4, dp=5, expert_tp=6, gtp_remat=7, expert_gtp_remat=8
+    )
 
 
 class TestPlanCacheKeyNonCollocated:
@@ -105,20 +164,16 @@ class TestPlanCacheKeyNonCollocated:
     def test_source_only_vs_dest_only_distinguish(self):
         """Source-only (dst_config=None) and dest-only (src_config=None) on the
         same global rank must produce different plans."""
-        sizes = (2, 1, 1, 2, 1)
-        src_only = _PlanCacheKey(rank=0, src_config=sizes, dst_config=None, num_experts=None)
-        dst_only = _PlanCacheKey(rank=0, src_config=None, dst_config=sizes, num_experts=None)
+        config = _config(tp=2, dp=2)
+        src_only = _PlanCacheKey(rank=0, src_config=config, dst_config=None, num_experts=None)
+        dst_only = _PlanCacheKey(rank=0, src_config=None, dst_config=config, num_experts=None)
         assert src_only != dst_only
 
     def test_idle_rank_distinguishes_from_active(self):
         """Idle rank (both configs None) is distinct from a rank with either model."""
         idle = _PlanCacheKey(rank=5, src_config=None, dst_config=None, num_experts=None)
-        with_src = _PlanCacheKey(
-            rank=5, src_config=(1, 1, 1, 1, 1), dst_config=None, num_experts=None
-        )
-        with_dst = _PlanCacheKey(
-            rank=5, src_config=None, dst_config=(1, 1, 1, 1, 1), num_experts=None
-        )
+        with_src = _PlanCacheKey(rank=5, src_config=_config(), dst_config=None, num_experts=None)
+        with_dst = _PlanCacheKey(rank=5, src_config=None, dst_config=_config(), num_experts=None)
         assert idle != with_src
         assert idle != with_dst
         assert with_src != with_dst
@@ -126,20 +181,20 @@ class TestPlanCacheKeyNonCollocated:
     def test_non_collocated_offset_combinations(self):
         """src_rank_offset and dst_rank_offset together distinguish non-collocated
         layouts that share parallel sizes."""
-        sizes = (2, 1, 1, 2, 1)
+        config = _config(tp=2, dp=2)
         # Two non-collocated layouts: world=[src 0-3, dst 4-7] vs [src 0-3, dst 8-11].
         layout_a = _PlanCacheKey(
             rank=0,
-            src_config=sizes,
-            dst_config=sizes,
+            src_config=config,
+            dst_config=config,
             num_experts=None,
             src_rank_offset=0,
             dst_rank_offset=4,
         )
         layout_b = _PlanCacheKey(
             rank=0,
-            src_config=sizes,
-            dst_config=sizes,
+            src_config=config,
+            dst_config=config,
             num_experts=None,
             src_rank_offset=0,
             dst_rank_offset=8,
@@ -147,12 +202,32 @@ class TestPlanCacheKeyNonCollocated:
         assert layout_a != layout_b
 
 
+def test_prepare_swap_threads_execution_batch_bytes(monkeypatch):
+    """The public preparation API must include the configured limit in planning."""
+    plan = ReshardPlan(send_ops=[], recv_ops=[])
+    forwarded = {}
+
+    monkeypatch.setattr(refit, "_unwrap_model_cores", lambda *_args: (None, None, None))
+
+    def fake_build(*args, **kwargs):
+        forwarded["args"] = args
+        forwarded["kwargs"] = kwargs
+        return plan
+
+    monkeypatch.setattr(refit, "_build_or_get_plan", fake_build)
+
+    refit.prepare_swap_model_weights(None, None, execution_batch_bytes=123)
+
+    assert forwarded["kwargs"] == {"execution_batch_bytes": 123}
+
+
 def test_service_cache_distinguishes_process_groups(monkeypatch):
     """A backend service must never reuse a communicator from another group."""
 
     class StubService:
-        def __init__(self, group=None):
+        def __init__(self, group=None, *, max_group_bytes=None):
             self.group = group
+            self.max_group_bytes = max_group_bytes
 
         def close(self):
             pass
@@ -169,6 +244,78 @@ def test_service_cache_distinguishes_process_groups(monkeypatch):
     assert first_again is first
     assert second is not first
     assert second.group is second_group
+
+
+def test_service_cache_distinguishes_m2n_execution_limits(monkeypatch):
+    """The first cached M2N service must not silently fix later calls to its limit."""
+
+    class StubService:
+        def __init__(self, group=None, *, max_group_bytes=None):
+            self.group = group
+            self.max_group_bytes = max_group_bytes
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(refit, "NCCLM2NCopyService", StubService)
+    monkeypatch.setattr(refit, "_service_cache", {})
+
+    default = refit.get_or_create_service("nccl_m2n")
+    limited = refit.get_or_create_service("nccl_m2n", execution_batch_bytes=128)
+    limited_again = refit.get_or_create_service("nccl_m2n", execution_batch_bytes=128)
+    other_limit = refit.get_or_create_service("nccl_m2n", execution_batch_bytes=256)
+
+    assert default.max_group_bytes is None
+    assert limited.max_group_bytes == 128
+    assert limited_again is limited
+    assert other_limit is not limited
+
+
+def test_non_m2n_service_cache_ignores_execution_limit(monkeypatch):
+    """Generic batching is plan state and must not duplicate non-M2N services."""
+
+    class StubService:
+        def __init__(self, group=None):
+            self.group = group
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(refit, "NCCLCopyService", StubService)
+    monkeypatch.setattr(refit, "_service_cache", {})
+
+    first = refit.get_or_create_service("nccl", execution_batch_bytes=128)
+    second = refit.get_or_create_service("nccl", execution_batch_bytes=256)
+
+    assert second is first
+
+
+def test_swap_threads_execution_limit_to_named_service(monkeypatch):
+    """The public API must use the configured limit when it creates an M2N service."""
+
+    class StubService:
+        supports_idle_ranks = True
+
+    forwarded = {}
+
+    def fake_get_or_create_service(backend, group=None, execution_batch_bytes=None):
+        forwarded.update(backend=backend, group=group, execution_batch_bytes=execution_batch_bytes)
+        return StubService()
+
+    monkeypatch.setattr(refit, "get_or_create_service", fake_get_or_create_service)
+    monkeypatch.setattr(refit, "reshard_model_weights", lambda *_args, **_kwargs: None)
+
+    group = object()
+    refit.swap_model_weights(
+        None,
+        None,
+        refit_method="nccl_m2n",
+        group=group,
+        transform=refit.ReshardTransform(),
+        execution_batch_bytes=123,
+    )
+
+    assert forwarded == {"backend": "nccl_m2n", "group": group, "execution_batch_bytes": 123}
 
 
 def test_swap_rejects_multiple_pools_for_service_without_idle_ranks():
@@ -207,6 +354,7 @@ class TestNeedsMxfp8Conversion:
 
         class _Cfg:
             transformer_impl = "inference_optimized"
+            fp8 = "hybrid"
             fp8_recipe = "mxfp8"
 
         class _Model:
@@ -219,6 +367,7 @@ class TestNeedsMxfp8Conversion:
 
         class _Cfg:
             transformer_impl = "transformer_engine"
+            fp8 = "hybrid"
             fp8_recipe = "mxfp8"
 
         class _Model:
@@ -231,7 +380,21 @@ class TestNeedsMxfp8Conversion:
 
         class _Cfg:
             transformer_impl = "inference_optimized"
+            fp8 = "hybrid"
             fp8_recipe = "delayed"
+
+        class _Model:
+            config = _Cfg()
+
+        assert _needs_mxfp8_conversion(_Model()) is False
+
+    def test_inactive_mxfp8_recipe_returns_false(self):
+        from megatron.core.resharding.refit import _needs_mxfp8_conversion
+
+        class _Cfg:
+            transformer_impl = "inference_optimized"
+            fp8 = None
+            fp8_recipe = "mxfp8"
 
         class _Model:
             config = _Cfg()
@@ -244,6 +407,7 @@ class TestNeedsMxfp8Conversion:
 
         class _Cfg:
             transformer_impl = "inference_optimized"
+            fp8 = "hybrid"
             fp8_recipe = "mxfp8"
 
         class _Model:
@@ -298,6 +462,36 @@ class TestSetupMxfp8TransformOnPlan:
 
         _setup_mxfp8_transform_on_plan(plan, _Model())
         assert plan.transform is sentinel
+
+    def test_flashinfer_uses_canonical_triton_buffers(self, monkeypatch):
+        """FlashInfer refit derives Major-K weights from canonical Triton storage."""
+        from megatron.core.resharding import refit
+        from megatron.core.resharding.utils import ReshardPlan
+
+        class _Config:
+            transformer_impl = "inference_optimized"
+            fp8 = "hybrid"
+            fp8_recipe = "mxfp8"
+            inference_grouped_gemm_backend = "flashinfer"
+
+        class _Model(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.config = _Config()
+                self.decoder = nn.Linear(4, 4, bias=False)
+
+        captured = {}
+
+        def _quantize(_decoder, *, backend):
+            captured["backend"] = backend
+            return {}
+
+        monkeypatch.setattr(refit, "_should_quantize_param", lambda _param: True)
+        monkeypatch.setattr(refit, "quantize_params_to_mxfp8", _quantize)
+
+        plan = ReshardPlan(send_ops=[], recv_ops=[])
+        refit._setup_mxfp8_transform_on_plan(plan, _Model())
+        assert captured["backend"] == plan.transform.backend == "triton"
 
 
 class TestRefitTensorCache:

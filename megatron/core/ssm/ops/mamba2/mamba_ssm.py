@@ -366,7 +366,6 @@ def selective_state_update(
             intermediate_ssm_states.stride(4),
         )
     else:
-        intermediate_ssm_states = x  # Dummy pointer
         int_state_strides = (0, 0, 0, 0, 0)
 
     batch, seq_len, nheads, dim = x.shape

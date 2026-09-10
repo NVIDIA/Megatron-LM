@@ -44,9 +44,8 @@ from tests.unit_tests.test_utilities import Utils
 def _make_mhc_layer_spec(**kwargs):
     """Build a layer spec with HyperConnectionModule submodules.
 
-    The ``enable_hyper_connection`` kwarg on ``gpt_layer_specs`` is added by
-    the GPT-wiring follow-up split, so this helper patches the mHC submodules
-    directly to keep the unit tests self-contained for this split.
+    This helper patches the mHC submodules directly so these layer tests do not
+    depend on GPT-spec wiring.
     """
     from megatron.core.transformer.hyper_connection import HyperConnectionModule
 
@@ -101,6 +100,29 @@ class TestParallelTransformerLayer:
 
         num_weights = sum([p.numel() for p in parallel_transformer_layer.parameters()])
         assert num_weights == 1884
+
+    def test_mtp_flag_is_forwarded_to_attention(self):
+        """All attention builders receive the MTP-layer flag."""
+        config = TransformerConfig(
+            num_layers=2, hidden_size=12, num_attention_heads=4, use_cpu_initialization=True
+        )
+        config.experimental_attention_variant = "gdn"
+        strict_attention_spec = object()
+        submodules = TransformerLayerSubmodules(self_attention=strict_attention_spec)
+        attention_kwargs = {}
+
+        def fake_build_module(spec, *args, **kwargs):
+            if spec is strict_attention_spec:
+                attention_kwargs.update(kwargs)
+            return torch.nn.Identity()
+
+        with patch(
+            "megatron.core.transformer.transformer_layer.build_module",
+            side_effect=fake_build_module,
+        ):
+            TransformerLayer(config, submodules, is_mtp_layer=True)
+
+        assert attention_kwargs["is_mtp_layer"] is True
 
     def test_gpu_forward(self):
         parallel_transformer_layer = self.parallel_transformer_layer
@@ -959,14 +981,14 @@ class TestMHCWithCudaGraph:
         )
 
     def test_cuda_graph_fwd_bwd_with_hyper_connection(self):
-        """End-to-end CUDA graph capture and replay for forward+backward with mHC.
+        """End-to-end CUDA graph capture and replay for fused mHC.
 
         Captures both the forward and backward pass of HyperConnectionTransformerLayer
         into a torch.cuda.CUDAGraph and replays it with fresh input data, verifying
-        that the computation graph is fully static (capturable) and produces correct
-        output shapes and non-trivial gradients.
+        that the configuration-bound backend policy is capturable and produces
+        correct output shapes and non-trivial gradients.
         """
-        layer, config = self._create_mhc_layer()
+        layer, config = self._create_mhc_layer(use_fused_mhc=True)
         layer.train()
 
         seq_len = 8

@@ -48,6 +48,7 @@ import pytest
 import torch
 
 from megatron.core import parallel_state
+from megatron.core.inference.batch_dimensions_utils import InferenceBatchDimensions
 from megatron.core.inference.config import InferenceConfig, MambaInferenceStateConfig
 from megatron.core.inference.contexts import StaticInferenceContext
 from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
@@ -68,6 +69,7 @@ from megatron.core.ssm.ops.gdp.chunk import chunk_gated_delta_product_varlen
 from megatron.core.ssm.ops.gdp.fused_recurrent import fused_recurrent_gated_delta_rule_update
 from megatron.core.ssm.ops.gdp.metadata import build_gdp_chunk_descriptors, max_gdp_chunk_counts
 from megatron.core.ssm.packed_seq_helpers import check_fla_sequence_packing_support
+from megatron.core.ssm.ssm_inference import SSMDynamicInferenceMixin
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
@@ -185,6 +187,81 @@ def _build_model(tp: int = 1) -> HybridModel:
         hybrid_layer_pattern=_LAYER_PATTERN,
     )
     return model.cuda().eval()
+
+
+class _FakeSSM(SSMDynamicInferenceMixin):
+    def __init__(self, projected):
+        self.projected = projected
+        self.layer_number = 1
+        self.pp_layer_offset = 0
+        self.config = types.SimpleNamespace(fp8=False, fp4=False)
+        self.decode_inputs = []
+
+    def in_proj(self, _hidden_states):
+        return self.projected, None
+
+    def ssm_decode(
+        self,
+        zxBCdt,
+        _conv_state,
+        _ssm_state,
+        batch_indices,
+        intermediate_conv_state=None,
+        intermediate_ssm_state=None,
+    ):
+        self.decode_inputs.append((zxBCdt.clone(), batch_indices.clone()))
+        return zxBCdt[..., :2]
+
+    def out_proj(self, y):
+        return y, None
+
+
+@pytest.mark.parametrize(
+    ("batch_invariant_mode", "num_requests", "tokens_per_request", "padded_token_count"),
+    [
+        (False, 40, 1, 40),
+        (True, 40, 1, 40),
+        (True, 40, 1, 64),
+        (False, 20, 3, 60),
+        (True, 20, 3, 64),
+    ],
+)
+def test_decode_ssm_preserves_batch_invariant_token_padding(
+    batch_invariant_mode, num_requests, tokens_per_request, padded_token_count
+):
+    """Only batch-invariant token-only rows bypass SSM decode."""
+    metadata_token_count = num_requests * tokens_per_request
+    projected = torch.arange(padded_token_count * 4, dtype=torch.float32).reshape(
+        padded_token_count, 1, 4
+    )
+    mixer = _FakeSSM(projected)
+
+    batch_indices = torch.cat(
+        (torch.arange(4, dtype=torch.int32), torch.full((num_requests - 4,), -1, dtype=torch.int32))
+    )
+    context = types.SimpleNamespace(
+        batch_invariant_mode=batch_invariant_mode,
+        mamba_states_cache=lambda _layer, intermediate=False: (torch.empty(0), torch.empty(0)),
+        num_speculative_tokens=tokens_per_request - 1,
+        padded_batch_dimensions=InferenceBatchDimensions(
+            token_count=padded_token_count, prefill_req_count=0, decode_req_count=num_requests
+        ),
+        mamba_metadata=types.SimpleNamespace(batch_indices_decode=batch_indices),
+        padding_slice=slice(metadata_token_count, padded_token_count),
+    )
+
+    output, bias = mixer.ssm_dynamic_inference(torch.empty(0), context)
+
+    decode_input, received_indices = mixer.decode_inputs[0]
+    assert decode_input.shape == (num_requests, tokens_per_request, 4)
+    assert torch.equal(
+        decode_input, projected[:metadata_token_count, 0].view(num_requests, tokens_per_request, 4)
+    )
+    assert torch.equal(received_indices, batch_indices)
+    assert output.shape == (padded_token_count, 1, 2)
+    assert torch.equal(output[:metadata_token_count], projected[:metadata_token_count, :, :2])
+    assert torch.count_nonzero(output[metadata_token_count:]) == 0
+    assert bias is None
 
 
 class TestGDPDynamicInference:

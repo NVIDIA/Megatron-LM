@@ -147,6 +147,17 @@ class TestLatentMoELayer:
     def setup_method(self, method):
         pass
 
+    def test_norm_before_up_proj_requires_latent_moe(self):
+        with pytest.raises(
+            ValueError, match="moe_use_norm_before_up_proj requires moe_latent_size"
+        ):
+            TransformerConfig(
+                num_layers=1,
+                hidden_size=32,
+                num_attention_heads=4,
+                moe_use_norm_before_up_proj=True,
+            )
+
     @pytest.mark.skipif(
         not is_te_min_version("1.7.0.dev0"),
         reason="Expert with TE Linear is only supported in TE 1.7.0 and later.",
@@ -191,6 +202,8 @@ class TestLatentMoELayer:
         moe_layer.cuda()
         config = moe_layer.config
 
+        assert not hasattr(moe_layer, "fc2_norm")
+
         assert (
             moe_layer.shared_experts.linear_fc1.weight.shape[1] == config.hidden_size
         ), "Shared expert computation has to happen in hidden dimension."
@@ -226,4 +239,57 @@ class TestLatentMoELayer:
         output, _ = moe_layer(hidden_states)
         assert output.shape[2] == config.hidden_size
 
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.skipif(
+        not is_te_min_version("1.7.0.dev0"),
+        reason="Expert with TE Linear is only supported in TE 1.7.0 and later.",
+    )
+    def test_norm_before_latent_up_projection(self):
+        Utils.initialize_model_parallel(1, 1)
+        _set_random_seed(seed_=123, data_parallel_random_init=False)
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=32,
+            num_attention_heads=4,
+            num_moe_experts=4,
+            use_cpu_initialization=True,
+            moe_token_dispatcher_type="alltoall",
+            moe_router_topk=2,
+            moe_aux_loss_coeff=0.01,
+            moe_grouped_gemm=True,
+            moe_ffn_hidden_size=128,
+            activation_func=torch.nn.functional.silu,
+            gated_linear_unit=True,
+            add_bias_linear=False,
+            moe_latent_size=8,
+            moe_use_norm_before_up_proj=True,
+        )
+        transformer_layer_submodules = get_gpt_layer_with_transformer_engine_submodules(
+            num_experts=config.num_moe_experts, moe_grouped_gemm=True
+        )
+        submodules = get_submodules(transformer_layer_submodules.mlp)
+        assert isinstance(submodules, MoESubmodules)
+        moe_layer = MoELayer(config, submodules).cuda()
+
+        assert moe_layer.fc2_norm.weight.shape == (config.moe_latent_size,)
+        norm_output = []
+        fc2_input = []
+        moe_layer.fc2_norm.register_forward_hook(
+            lambda _module, _inputs, output: norm_output.append(output.detach())
+        )
+        moe_layer.fc2_latent_proj.register_forward_pre_hook(
+            lambda _module, inputs: fc2_input.append(inputs[0].detach())
+        )
+
+        hidden_states = torch.randn(32, 2, config.hidden_size, device="cuda")
+        output, _ = moe_layer(hidden_states)
+
+        assert output.shape == hidden_states.shape
+        assert len(norm_output) == 1
+        assert len(fc2_input) == 1
+        torch.testing.assert_close(fc2_input[0], norm_output[0])
+
+        output.sum().backward()
+        assert moe_layer.fc2_norm.weight.grad is not None
         Utils.destroy_model_parallel()

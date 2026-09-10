@@ -128,7 +128,7 @@ def wrap_active_modules_with_ddp(
                 enc_config,
                 topology.module_pgs[name],
                 ddp_config=_ddp_config_for_role(
-                    ddp_config, enable_overlap=getattr(args, "encoder_ddp_overlap", False)
+                    ddp_config, enable_overlap=getattr(args, "mimo_encoder_ddp_overlap", False)
                 ),
                 data_parallel_random_init=data_parallel_random_init,
                 mixed_precision_wrapper=_EncoderFloat16Module,

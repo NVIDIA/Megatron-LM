@@ -657,8 +657,19 @@ class TestNVLSAllGatherVDispatcher:
         assert graph_output.shape == hidden_states.shape
         assert graph_output.dtype == torch.bfloat16
 
-    def test_batch_invariant_moe_matches_training(self):
-        """The NVLS inference MoE path should exactly match training AllToAll."""
+    @pytest.mark.parametrize("activation_clamp_scale", [None, 0.5])
+    @pytest.mark.parametrize("inference_grouped_gemm_backend", ["torch", "vllm"])
+    def test_batch_invariant_moe_matches_training(
+        self, inference_grouped_gemm_backend, activation_clamp_scale
+    ):
+        """The NVLS inference MoE path should exactly match training AllToAll.
+
+        With activation_func_tanh_clamp_scale set, this is the only check that the
+        inference clamp kernels reproduce training's ``weighted_clamped_squared_relu``
+        through a whole layer rather than one kernel in isolation. The scale is small
+        relative to this layer's pre-activations so the tanh saturates rather than
+        staying in its near-linear region, where the two paths agree more easily.
+        """
         from megatron.core.models.gpt.moe_module_specs import get_inference_optimized_moe_spec
         from megatron.core.parallel_state import get_expert_model_parallel_group
         from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
@@ -673,7 +684,7 @@ class TestNVLSAllGatherVDispatcher:
             pytest.skip("Training-to-inference MoE parity requires expert parallelism.")
         if Utils.world_size & (Utils.world_size - 1):
             pytest.skip("NVLS Triton symmetric-memory barrier requires power-of-two EP size.")
-        if not HAVE_DEEPGEMM_BF16:
+        if inference_grouped_gemm_backend == "torch" and not HAVE_DEEPGEMM_BF16:
             pytest.skip("Batch-invariant torch MoE path requires DeepGEMM bf16 grouped kernels.")
 
         torch.manual_seed(2028)
@@ -681,13 +692,20 @@ class TestNVLSAllGatherVDispatcher:
 
         config = _make_base_config(
             expert_model_parallel_size=Utils.world_size,
-            inference_grouped_gemm_backend="torch",
+            inference_grouped_gemm_backend=inference_grouped_gemm_backend,
             inference_moe_token_dispatcher_type="nvls",
             batch_invariant_mode=True,
             attention_backend=AttnBackend.flash,
             flash_attention_version=4,
             attention_dropout=0.0,
             moe_shared_expert_intermediate_size=None,
+            activation_func_tanh_clamp_scale=activation_clamp_scale,
+            # The inference clamp kernels target the fused weighted_clamped_squared_relu.
+            # use_fused_weighted_squared_relu defaults to False, which would route the
+            # training branch through tanh_soft_clamp instead — that rounds the clamp to
+            # BF16 and is one ULP away. Only enabled for the clamped case so the unclamped
+            # parametrization keeps its existing coverage.
+            use_fused_weighted_squared_relu=activation_clamp_scale is not None,
         )
         NVLSAllGatherVDispatcher.allocate_buffers(
             per_rank_worst_case_token_count=_NVLS_ENGINE_MAX_TOKENS,
@@ -702,7 +720,8 @@ class TestNVLSAllGatherVDispatcher:
             local_tokens, 1, config.hidden_size, device="cuda", dtype=torch.bfloat16
         )
 
-        with torch.no_grad(), set_batch_invariant_mode(True):
+        backend = "te_native" if inference_grouped_gemm_backend == "vllm" else None
+        with torch.no_grad(), set_batch_invariant_mode(True, backend=backend):
             training_output, _ = layer(hidden_states.clone())
             with InferenceMode.active():
                 inference_output, _ = layer(hidden_states.clone())
