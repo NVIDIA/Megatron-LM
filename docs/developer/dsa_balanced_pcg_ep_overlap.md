@@ -41,6 +41,14 @@ capture order: dropping a trailing dense layer changes the pairing of forward
 and backward graphs and invalidates TE's shared-memory-pool lifetimes. Process
 groups come from the model's collection.
 
+Eager MoE routing normalizes the model's `[batch, sequence]` padding mask to
+the router's local `[sequence, batch]` layout. Sequence-parallel chunks scatter
+only unscattered masks, using the attention TP group supplied by the model.
+Captured router outputs already include this normalization and must not repeat
+it on replay. This preserves padding-dependent router losses and expert counts
+without changing graph input tensors. Hybrid overlap rejects FP4 until its
+separate quantization contexts are supported.
+
 ## Validation
 
 Focused tests cover logical-to-capture indexing, changing pack counts, distinct

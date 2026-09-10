@@ -723,8 +723,11 @@ def build_transformer_layer_callables(layer: TransformerLayer):
                         residual = hidden_states
 
                 shared_expert_output = layer.mlp.shared_experts_compute(pre_mlp_layernorm_output)
+                padding_mask = layer.mlp._normalize_padding_mask(
+                    pre_mlp_layernorm_output, node.chunk_state.padding_mask
+                )
                 probs, routing_map = layer.mlp.route(
-                    pre_mlp_layernorm_output, padding_mask=node.chunk_state.padding_mask
+                    pre_mlp_layernorm_output, padding_mask=padding_mask
                 )
                 local_tokens, probs = layer.mlp.preprocess(
                     pre_mlp_layernorm_output, probs, routing_map
