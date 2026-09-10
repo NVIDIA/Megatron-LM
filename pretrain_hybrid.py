@@ -24,7 +24,6 @@ import torch
 
 from hybrid_builders import hybrid_builder
 from megatron.core import mpu
-from megatron.core.context_parallel_layout import finalize_packed_seq_params
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.data_schedule import get_batch_on_this_rank_for_sequence_packing
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
@@ -38,10 +37,6 @@ from megatron.core.parallel_state import (
 )
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
-from megatron.core.transformer.cuda_graph_config import cuda_graph_captures_attention
-from megatron.core.transformer.experimental_attention_variant.cp_balanced_indexer import (
-    prebuild_balanced_layouts,
-)
 from megatron.core.transformer.multi_token_prediction import (
     mtp_on_this_rank as mtp_on_this_rank_func,
 )
@@ -70,7 +65,11 @@ from megatron.training.arguments import core_transformer_config_from_args, parse
 from megatron.training.datasets.sft_dataset import MockSFTDataset, SFTDataset
 from megatron.training.datasets.varlen_dataset import MockVarlenDataset, VarlenDataset
 from megatron.training.training import update_seqlen_stats_from_cu_seqlens
-from megatron.training.utils import get_blend_and_blend_per_split, is_first_or_last_pipeline_stage
+from megatron.training.utils import (
+    get_blend_and_blend_per_split,
+    is_first_or_last_pipeline_stage,
+    prepare_packed_seq_params,
+)
 from model_provider import model_provider
 
 try:
@@ -107,8 +106,6 @@ def get_batch(data_iterator, vp_stage=None):
 
     args = get_args()
     config = core_transformer_config_from_args(args)
-    balance_indexer = getattr(config, "dsa_cp_balance_indexer", False)
-    graph_dynamic_packs = getattr(config, "dsa_cp_balance_indexer_graph_dynamic_packs", False)
 
     cp_size = args.context_parallel_size
     tp_rank = mpu.get_tensor_model_parallel_rank()
@@ -140,24 +137,7 @@ def get_batch(data_iterator, vp_stage=None):
             dynamic_cp=is_dynamic_cp,
             config=config,
         )
-        finalize_packed_seq_params(packed_seq_params)
-        if balance_indexer:
-            # Same data-prep hook as pretrain_gpt.get_batch: prebuild the balanced
-            # indexer's zigzag plan/routes where host syncs are free, and record the
-            # composition observation the CUDA-graph static-composition gate compares
-            # against (skipping it would silently lose the routed A2A path in eager
-            # and bypass the composition-change raise under graphs).
-            prebuild_balanced_layouts(
-                packed_seq_params,
-                pad_alignment=config.pad_packed_seq_alignment,
-                capacity=(
-                    config.max_seqlen_per_dp_cp_rank * config.context_parallel_size
-                    if graph_dynamic_packs
-                    else None
-                ),
-                graphs_enabled=cuda_graph_captures_attention(config),
-                graph_dynamic_packs=graph_dynamic_packs,
-            )
+        prepare_packed_seq_params(packed_seq_params, config)
         return (
             attention_mask,
             None,
@@ -335,7 +315,6 @@ def forward_step(data_iterator, model: HybridModel):
             packed_seq_params,
         ) = get_batch(data_iterator, vp_stage)
 
-    build_packed_seq_params_in_forward = packed_seq_params is None and cu_seqlens is not None
     if packed_seq_params is not None:
         if packed_seq_params.cu_seqlens_q is not None:
             update_seqlen_stats_from_cu_seqlens(packed_seq_params.cu_seqlens_q)
@@ -362,23 +341,7 @@ def forward_step(data_iterator, model: HybridModel):
             total_tokens=int(cu_seqlens_for_params[-1].item()),
             tokens_per_sample=args.seq_length,
         )
-        finalize_packed_seq_params(packed_seq_params)
-
-    if build_packed_seq_params_in_forward:
-        # The sequence-packing scheduler prebuilds in get_batch(), where its
-        # PackedSeqParams already exists. Legacy SFT/inter-document-mask paths
-        # expose raw cu_seqlens instead, so their params are first constructed
-        # here and need the same hook exactly once.
-        config = get_attr_wrapped_model(model, "config")
-        if getattr(config, "dsa_cp_balance_indexer", False):
-            prebuild_balanced_layouts(
-                packed_seq_params,
-                pad_alignment=config.pad_packed_seq_alignment,
-                graphs_enabled=cuda_graph_captures_attention(config),
-                graph_dynamic_packs=getattr(
-                    config, "dsa_cp_balance_indexer_graph_dynamic_packs", False
-                ),
-            )
+        prepare_packed_seq_params(packed_seq_params, get_attr_wrapped_model(model, "config"))
 
     timers('batch-generator').stop()
 

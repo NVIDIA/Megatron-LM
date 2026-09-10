@@ -25,7 +25,6 @@ import torch
 
 from gpt_builders import gpt_builder
 from megatron.core import mpu
-from megatron.core.context_parallel_layout import finalize_packed_seq_params
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.data_schedule import get_batch_on_this_rank_for_sequence_packing
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
@@ -39,10 +38,6 @@ from megatron.core.packed_seq_params import (
 )
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
-from megatron.core.transformer.cuda_graph_config import cuda_graph_captures_attention
-from megatron.core.transformer.experimental_attention_variant.cp_balanced_indexer import (
-    prebuild_balanced_layouts,
-)
 from megatron.core.transformer.multi_token_prediction import get_mtp_ranks, mtp_on_this_rank
 from megatron.core.utils import (
     StragglerDetector,
@@ -67,6 +62,7 @@ from megatron.training.utils import (
     get_batch_on_this_tp_rank,
     get_blend_and_blend_per_split,
     is_first_or_last_pipeline_stage,
+    prepare_packed_seq_params,
 )
 from model_provider import model_provider
 
@@ -138,8 +134,6 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
     """
     args = get_args()
     config = core_transformer_config_from_args(args)
-    balance_indexer = getattr(config, "dsa_cp_balance_indexer", False)
-    graph_dynamic_packs = getattr(config, "dsa_cp_balance_indexer_graph_dynamic_packs", False)
 
     if args.sequence_packing_scheduler is not None:
         # `get_batch_on_this_rank_for_sequence_packing` owns scheduler THD metadata
@@ -152,19 +146,7 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
             dynamic_cp=args.dynamic_context_parallel,
             config=config,
         )
-        finalize_packed_seq_params(batch[5])
-        if balance_indexer:
-            prebuild_balanced_layouts(
-                batch[5],
-                pad_alignment=config.pad_packed_seq_alignment,
-                capacity=(
-                    config.max_seqlen_per_dp_cp_rank * config.context_parallel_size
-                    if graph_dynamic_packs
-                    else None
-                ),
-                graphs_enabled=cuda_graph_captures_attention(config),
-                graph_dynamic_packs=graph_dynamic_packs,
-            )
+        prepare_packed_seq_params(batch[5], config)
         return batch
 
     # TODO: this is pretty hacky, find a better way
@@ -207,19 +189,8 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
             max_seqlen_kv=int(max_seqlen[0].item()),
             qkv_format='thd',
         )
-        finalize_packed_seq_params(packed_seq_params)
-        if balance_indexer:
-            # Middle-stage PackedSeqParams carry the raw cu; the hidden states are
-            # padded, so probe/build at the physical capacity. Eligibility still
-            # comes from the actual sequence boundaries plus that capacity tail;
-            # an unrepresentable pack records False and uses the reference path.
-            prebuild_balanced_layouts(
-                packed_seq_params,
-                pad_alignment=config.pad_packed_seq_alignment,
-                capacity=args.seq_length,
-                graphs_enabled=cuda_graph_captures_attention(config),
-                graph_dynamic_packs=graph_dynamic_packs,
-            )
+        # Middle stages receive raw boundaries for physically padded hidden states.
+        prepare_packed_seq_params(packed_seq_params, config, capacity=args.seq_length)
         return (None, None, None, None, None, packed_seq_params, None)
 
     thd_tail_padding_policy = resolve_thd_tail_padding_policy(config)
@@ -271,14 +242,7 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
         if 'position_ids' in batch:
             batch['position_ids'] = position_ids
 
-    finalize_packed_seq_params(packed_seq_params)
-    if balance_indexer:
-        prebuild_balanced_layouts(
-            packed_seq_params,
-            pad_alignment=config.pad_packed_seq_alignment,
-            graphs_enabled=cuda_graph_captures_attention(config),
-            graph_dynamic_packs=graph_dynamic_packs,
-        )
+    prepare_packed_seq_params(packed_seq_params, config)
 
     # Unpack explicitly to avoid relying on dict insertion order.
     return (
