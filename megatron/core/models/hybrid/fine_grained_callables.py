@@ -112,7 +112,18 @@ def build_hybrid_layer_callables(layer):
             return hidden_states
 
         def finish(node, hidden_states):
-            return finalize_decoder_layer_output(node, hidden_states)
+            output = finalize_decoder_layer_output(node, hidden_states)
+            if (
+                node.is_last_layer
+                and layer.config.deallocate_pipeline_outputs
+                and output is hidden_states
+            ):
+                # A non-final pipeline chunk has no output contraction or norm.
+                # Its boundary would return this node's detached input leaf.
+                # Pseudo-deallocating that leaf changes its gradient shape to
+                # [1]; retain an autograd edge to the original-shaped input.
+                output = output.clone()
+            return output
 
         return [compute, None, finish, None, None, None], {}
 
