@@ -164,15 +164,13 @@ def _get_layout_parallel_context(
     communication_group = cp_group
     group_rank_by_logical_rank = tuple(range(cp_size))
 
-    if sequence_parallel and tp_group is None:
-        raise ValueError("tp_group is required for sequence-parallel CP layout conversion")
-    if sequence_parallel and tp_group.size() > 1:
+    if sequence_parallel and tp_group is not None and tp_group.size() > 1:
         if tp_cp_group is None:
             raise ValueError("tp_cp_group is required for sequence-parallel CP layout conversion")
         tp_size, tp_rank = tp_group.size(), tp_group.rank()
         communication_group = tp_cp_group
         group_rank_by_logical_rank = _get_group_rank_by_logical_rank(
-            cp_group, tp_group, tp_cp_group
+            cp_group=cp_group, tp_group=tp_group, tp_cp_group=tp_cp_group
         )
 
     return _LayoutParallelContext(
@@ -450,15 +448,20 @@ def build_thd_cp_layout_plan(
         source_token_count: Global token count in the contiguous layout.
         cp_group: Context-parallel process group.
         sequence_parallel: Whether the contiguous input is also sharded over TP ranks.
-        tp_group: Tensor-parallel process group, required with sequence parallelism.
+        tp_group: Tensor-parallel process group, used when sequence parallelism spans TP ranks.
         tp_cp_group: Combined TP x CP process group, required when TP size is greater than one.
 
     Returns:
         A rank-local plan reusable for both directions of the layout conversion.
     """
-    context = _get_layout_parallel_context(cp_group, sequence_parallel, tp_group, tp_cp_group)
+    context = _get_layout_parallel_context(
+        cp_group=cp_group,
+        sequence_parallel=sequence_parallel,
+        tp_group=tp_group,
+        tp_cp_group=tp_cp_group,
+    )
     return _build_thd_cp_layout_plan_from_rank_order_indices(
-        rank_order_indices,
+        rank_order_indices=rank_order_indices,
         source_token_count=source_token_count,
         cp_size=context.cp_size,
         cp_rank=context.cp_rank,
@@ -480,7 +483,12 @@ def _redistribute_layout(
     """Redistribute local sequence segments with a differentiable all-to-all-v."""
     if cp_group.size() == 1 or source_layout == target_layout:
         return input_
-    context = _get_layout_parallel_context(cp_group, sequence_parallel, tp_group, tp_cp_group)
+    context = _get_layout_parallel_context(
+        cp_group=cp_group,
+        sequence_parallel=sequence_parallel,
+        tp_group=tp_group,
+        tp_cp_group=tp_cp_group,
+    )
 
     plan = _build_layout_redistribution_plan(
         source_layout=source_layout,
@@ -511,8 +519,8 @@ def _redistribute_layout(
     input_split_sizes = [count * segment_len for count in plan.input_segment_counts]
     output_split_sizes = [count * segment_len for count in plan.output_segment_counts]
     received = all_to_all(
-        context.communication_group,
-        send_buffer,
+        group=context.communication_group,
+        input_=send_buffer,
         output_split_sizes_=output_split_sizes,
         input_split_sizes=input_split_sizes,
     )
@@ -538,7 +546,12 @@ def _redistribute_thd_layout(
     """Apply a packed sequence layout plan with a differentiable all-to-all-v."""
     if source_layout == target_layout:
         return input_
-    context = _get_layout_parallel_context(cp_group, sequence_parallel, tp_group, tp_cp_group)
+    context = _get_layout_parallel_context(
+        cp_group=cp_group,
+        sequence_parallel=sequence_parallel,
+        tp_group=tp_group,
+        tp_cp_group=tp_cp_group,
+    )
     expected_token_count = (
         plan.contiguous_local_token_count
         if source_layout == "contiguous"
@@ -567,8 +580,8 @@ def _redistribute_thd_layout(
 
     send_buffer = input_.index_select(0, send_indices)
     received = all_to_all(
-        context.communication_group,
-        send_buffer,
+        group=context.communication_group,
+        input_=send_buffer,
         output_split_sizes_=list(output_split_sizes),
         input_split_sizes=list(input_split_sizes),
     )
@@ -581,51 +594,67 @@ def _redistribute_thd_layout(
 
 def contiguous_to_zigzag(
     input_: torch.Tensor,
-    cp_group: torch.distributed.ProcessGroup,
+    cp_group: torch.distributed.ProcessGroup | None = None,
     sequence_parallel: bool = False,
     tp_group: torch.distributed.ProcessGroup | None = None,
     tp_cp_group: torch.distributed.ProcessGroup | None = None,
     thd_plan: THDCPLayoutPlan | None = None,
 ) -> torch.Tensor:
     """Convert contiguous CP sequence shards to Megatron's zigzag attention layout."""
+    if cp_group is None or cp_group.size() == 1:
+        return input_
     if thd_plan is not None:
         return _redistribute_thd_layout(
-            input_,
-            cp_group,
-            thd_plan,
-            "contiguous",
-            "zigzag",
-            sequence_parallel,
-            tp_group,
-            tp_cp_group,
+            input_=input_,
+            cp_group=cp_group,
+            plan=thd_plan,
+            source_layout="contiguous",
+            target_layout="zigzag",
+            sequence_parallel=sequence_parallel,
+            tp_group=tp_group,
+            tp_cp_group=tp_cp_group,
         )
     return _redistribute_layout(
-        input_, cp_group, "contiguous", "zigzag", sequence_parallel, tp_group, tp_cp_group
+        input_=input_,
+        cp_group=cp_group,
+        source_layout="contiguous",
+        target_layout="zigzag",
+        sequence_parallel=sequence_parallel,
+        tp_group=tp_group,
+        tp_cp_group=tp_cp_group,
     )
 
 
 def zigzag_to_contiguous(
     input_: torch.Tensor,
-    cp_group: torch.distributed.ProcessGroup,
+    cp_group: torch.distributed.ProcessGroup | None = None,
     sequence_parallel: bool = False,
     tp_group: torch.distributed.ProcessGroup | None = None,
     tp_cp_group: torch.distributed.ProcessGroup | None = None,
     thd_plan: THDCPLayoutPlan | None = None,
 ) -> torch.Tensor:
     """Convert Megatron's zigzag attention shards back to contiguous CP shards."""
+    if cp_group is None or cp_group.size() == 1:
+        return input_
     if thd_plan is not None:
         return _redistribute_thd_layout(
-            input_,
-            cp_group,
-            thd_plan,
-            "zigzag",
-            "contiguous",
-            sequence_parallel,
-            tp_group,
-            tp_cp_group,
+            input_=input_,
+            cp_group=cp_group,
+            plan=thd_plan,
+            source_layout="zigzag",
+            target_layout="contiguous",
+            sequence_parallel=sequence_parallel,
+            tp_group=tp_group,
+            tp_cp_group=tp_cp_group,
         )
     return _redistribute_layout(
-        input_, cp_group, "zigzag", "contiguous", sequence_parallel, tp_group, tp_cp_group
+        input_=input_,
+        cp_group=cp_group,
+        source_layout="zigzag",
+        target_layout="contiguous",
+        sequence_parallel=sequence_parallel,
+        tp_group=tp_group,
+        tp_cp_group=tp_cp_group,
     )
 
 
@@ -633,22 +662,32 @@ def convert_cp_layout(
     input_: torch.Tensor,
     source_layout: CPLayout,
     target_layout: CPLayout,
-    cp_group: torch.distributed.ProcessGroup,
+    cp_group: torch.distributed.ProcessGroup | None = None,
     sequence_parallel: bool = False,
     tp_group: torch.distributed.ProcessGroup | None = None,
     tp_cp_group: torch.distributed.ProcessGroup | None = None,
     thd_plan: THDCPLayoutPlan | None = None,
 ) -> torch.Tensor:
     """Convert a tensor between physical CP layouts."""
-    if source_layout == target_layout or cp_group.size() == 1:
+    if source_layout == target_layout or cp_group is None or cp_group.size() == 1:
         return input_
     if source_layout == "contiguous" and target_layout == "zigzag":
         return contiguous_to_zigzag(
-            input_, cp_group, sequence_parallel, tp_group, tp_cp_group, thd_plan
+            input_=input_,
+            cp_group=cp_group,
+            sequence_parallel=sequence_parallel,
+            tp_group=tp_group,
+            tp_cp_group=tp_cp_group,
+            thd_plan=thd_plan,
         )
     if source_layout == "zigzag" and target_layout == "contiguous":
         return zigzag_to_contiguous(
-            input_, cp_group, sequence_parallel, tp_group, tp_cp_group, thd_plan
+            input_=input_,
+            cp_group=cp_group,
+            sequence_parallel=sequence_parallel,
+            tp_group=tp_group,
+            tp_cp_group=tp_cp_group,
+            thd_plan=thd_plan,
         )
     raise ValueError(f"Unsupported CP layout conversion: {source_layout} to {target_layout}")
 
@@ -663,6 +702,7 @@ class ContextParallelLayoutManager:
     cp_group: torch.distributed.ProcessGroup
     tp_group: torch.distributed.ProcessGroup | None
     tp_cp_group: torch.distributed.ProcessGroup | None
+    cuda_graph_impl: str = "none"
     requires_conversion: bool = field(init=False)
 
     def __post_init__(self) -> None:
@@ -681,14 +721,14 @@ class ContextParallelLayoutManager:
         if not self.requires_conversion:
             return hidden_states
         return convert_cp_layout(
-            hidden_states,
-            source_layout,
-            target_layout,
-            self.cp_group,
-            self.sequence_parallel,
-            self.tp_group,
-            self.tp_cp_group,
-            thd_plan,
+            input_=hidden_states,
+            source_layout=source_layout,
+            target_layout=target_layout,
+            cp_group=self.cp_group,
+            sequence_parallel=self.sequence_parallel,
+            tp_group=self.tp_group,
+            tp_cp_group=self.tp_cp_group,
+            thd_plan=thd_plan,
         )
 
     def prepare_layer_input(
@@ -699,7 +739,10 @@ class ContextParallelLayoutManager:
             self.boundary_layout if layer_index == 0 else self.layer_layouts[layer_index - 1]
         )
         return self._convert_cp_layout(
-            hidden_states, source_layout, self.layer_layouts[layer_index], thd_plan
+            hidden_states=hidden_states,
+            source_layout=source_layout,
+            target_layout=self.layer_layouts[layer_index],
+            thd_plan=thd_plan,
         )
 
     def finalize_layer_output(
@@ -709,7 +752,10 @@ class ContextParallelLayoutManager:
         if layer_index != len(self.layer_layouts) - 1:
             return hidden_states
         return self._convert_cp_layout(
-            hidden_states, self.layer_layouts[layer_index], self.boundary_layout, thd_plan
+            hidden_states=hidden_states,
+            source_layout=self.layer_layouts[layer_index],
+            target_layout=self.boundary_layout,
+            thd_plan=thd_plan,
         )
 
     def build_forward_state(
@@ -727,6 +773,13 @@ class ContextParallelLayoutManager:
         """
         if not self.requires_conversion:
             return None
+
+        if thd_plan is not None and self.cuda_graph_impl == "full_iteration":
+            # TODO(yuzhongw): use GIN to make variable NCCL all-to-all split sizes replayable
+            # under full-iteration CUDA graphs.
+            raise ValueError(
+                "Full-iteration CUDA graph is not supported for THD CP layout conversion"
+            )
 
         if thd_plan is not None and packed_seq_params_by_layout is not None:
             return ContextParallelLayoutState(
@@ -762,7 +815,9 @@ class ContextParallelLayoutState:
         self, layer_index: int, hidden_states: torch.Tensor
     ) -> tuple[torch.Tensor, PackedSeqParams | None]:
         """Prepare a layer's input and matching packed metadata."""
-        hidden_states = self.manager.prepare_layer_input(layer_index, hidden_states, self.thd_plan)
+        hidden_states = self.manager.prepare_layer_input(
+            layer_index=layer_index, hidden_states=hidden_states, thd_plan=self.thd_plan
+        )
         packed_seq_params = (
             self.zigzag_packed_seq_params
             if self.manager.layer_layouts[layer_index] == "zigzag"
@@ -772,4 +827,6 @@ class ContextParallelLayoutState:
 
     def finalize_layer(self, layer_index: int, hidden_states: torch.Tensor) -> torch.Tensor:
         """Finalize a layer's output layout."""
-        return self.manager.finalize_layer_output(layer_index, hidden_states, self.thd_plan)
+        return self.manager.finalize_layer_output(
+            layer_index=layer_index, hidden_states=hidden_states, thd_plan=self.thd_plan
+        )

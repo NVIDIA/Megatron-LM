@@ -8,9 +8,9 @@ helpers remain in their respective submodules rather than being re-exported here
 Ownership summary:
 
 - model builders choose the pipeline-stage input CP layout;
-- blocks convert rank-local sequence tensors between layer preferences;
-- model postprocess restores the public output boundary to the input layout;
-- MTP validates its inner-layer layout preference but does not own outer conversion.
+- Attention and recurrent modules convert to their required layout and restore their input layout;
+- hybrid blocks may coalesce compatible transitions with main's cross-layer layout manager;
+- model postprocess and MTP preserve the public model-boundary layout.
 """
 
 from megatron.core.context_parallel_layout.conversion import (

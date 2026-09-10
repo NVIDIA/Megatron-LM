@@ -13,6 +13,8 @@ import torch
 import torch.nn.functional as F
 
 from megatron.core import tensor_parallel
+from megatron.core.context_parallel_layout import convert_module_input_tensors_cp_partition_mode
+from megatron.core.context_parallel_layout.conversion import CpPartitionModeConverter
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.jit import jit_fuser
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -157,18 +159,36 @@ class GatedDeltaNet2(_GDNBase):
         inference_params: BaseInferenceContext | None = None,
         packed_sequence_cp_metadata=None,
         **kwargs,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | tuple[torch.Tensor, CpPartitionModeConverter]:
         """
         Run GDN2 through its normalized recurrence output, before output projection.
 
         Return:
-            torch.Tensor: Normalized recurrence output.
+            Normalized recurrence output, optionally paired with the converter that
+            restores this call's input CP layout after projection.
         """
         assert (
             packed_sequence_cp_metadata is None
         ), "GDN2 does not support packed-sequence chunkwise CP metadata."
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
+
+        cp_group = (
+            packed_seq_params.cp_group
+            if packed_seq_params is not None and packed_seq_params.cp_group is not None
+            else self.pg_collection.cp
+        )
+        hidden_states, back_to_input_converter = convert_module_input_tensors_cp_partition_mode(
+            hidden_states=hidden_states,
+            packed_seq_params=packed_seq_params,
+            cp_group=cp_group,
+            tp_group=self.pg_collection.tp,
+            tp_cp_group=getattr(self.pg_collection, "tp_cp", None),
+            target_partition_mode="zigzag",
+            sequence_parallel=self.config.sequence_parallel,
+            source_partition_mode=getattr(self, "_cp_input_partition_mode", None),
+            config=self.config,
+        )
 
         seq_len, batch, _ = hidden_states.shape
         seq_len = seq_len * self.sp_size * self.cp_size
@@ -326,6 +346,8 @@ class GatedDeltaNet2(_GDNBase):
                 core_attn_out, gate, thd_cp_a2a_inv, batch, seq_len, packed_seq_params
             )
 
+        if back_to_input_converter is not None:
+            return norm_out, back_to_input_converter
         return norm_out
 
 

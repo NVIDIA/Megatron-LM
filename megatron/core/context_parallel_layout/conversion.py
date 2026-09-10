@@ -24,6 +24,21 @@ if TYPE_CHECKING:
     from megatron.core.packed_seq_params import PackedSeqParams
 
 
+def _cuda_graph_captures_attention(config: Any) -> bool:
+    """Return whether the configured training graph includes the attention module."""
+    cuda_graph_impl = getattr(config, "cuda_graph_impl", "none")
+    if cuda_graph_impl == "full_iteration":
+        return True
+    if cuda_graph_impl not in ("local", "transformer_engine"):
+        return False
+    cuda_graph_modules = getattr(config, "cuda_graph_modules", ())
+    if isinstance(cuda_graph_modules, str):
+        cuda_graph_modules = (cuda_graph_modules,)
+    return not cuda_graph_modules or any(
+        getattr(module, "name", module) == "attn" for module in cuda_graph_modules
+    )
+
+
 class CpPartitionModeConverter:
     """Convert tensors across one CP layout edge."""
 
@@ -48,11 +63,14 @@ class CpPartitionModeConverter:
         if (
             self.conversion_needed
             and getattr(self.packed_seq_params, "qkv_format", None) == "thd"
-            and self.config.cuda_graph_impl == "full_iteration"
+            and _cuda_graph_captures_attention(self.config)
         ):
+            # TODO(yuzhongw): use GIN to make native NCCL all-to-all split sizes replayable
+            # before allowing THD CP layout routes inside CUDA graph capture.
             raise ValueError(
-                "Full-iteration CUDA graph is not supported for THD CP layout conversion: "
-                f"source={self.source_partition_mode!r}, target={self.target_partition_mode!r}."
+                "CUDA graph capture that includes attention is not supported for THD CP layout "
+                f"conversion: source={self.source_partition_mode!r}, "
+                f"target={self.target_partition_mode!r}."
             )
 
     @property
@@ -146,6 +164,7 @@ def convert_module_input_tensors_cp_partition_mode(
     target_partition_mode: CpPartitionMode,
     sequence_parallel: bool,
     config: Any,
+    source_partition_mode: Optional[CpPartitionMode] = None,
     cp_group: Optional[torch.distributed.ProcessGroup] = None,
     tp_group: Optional[torch.distributed.ProcessGroup] = None,
     tp_cp_group: Optional[torch.distributed.ProcessGroup] = None,
@@ -163,11 +182,15 @@ def convert_module_input_tensors_cp_partition_mode(
     if cp_group is None or cp_group.size() <= 1:
         return hidden_states, None
 
-    source_partition_mode = getattr(config, "cp_partition_mode", None)
+    if packed_seq_params is not None and packed_seq_params.qkv_format == "thd":
+        source_partition_mode = packed_seq_params.cp_partition_mode
+    elif source_partition_mode is None:
+        source_partition_mode = getattr(config, "cp_partition_mode", None)
     if source_partition_mode is None:
         raise ValueError(
-            "config.cp_partition_mode is required before module input CP layout conversion when "
-            "context parallelism is active."
+            "The module input CP partition mode is required before layout conversion when "
+            "context parallelism is active. Pass source_partition_mode or set "
+            "config.cp_partition_mode."
         )
     if source_partition_mode == target_partition_mode:
         return hidden_states, None
