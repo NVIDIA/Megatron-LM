@@ -1860,6 +1860,12 @@ class CompressedSparseAttention(MegatronModule):
         self._active_bshd_compact_indexer_workspace: BSHDCompactIndexerWorkspace | None = None
         self._thd_compact_indexer_workspaces: list[THDCompactIndexerWorkspace] = []
         self._active_thd_compact_indexer_workspace: THDCompactIndexerWorkspace | None = None
+        self._balanced_thd_compact_indexer_workspaces: dict[
+            str, list[THDCompactIndexerWorkspace]
+        ] = {}
+        self._active_balanced_thd_compact_indexer_workspaces: dict[
+            str, THDCompactIndexerWorkspace
+        ] = {}
 
     def backward_dw(self):
         """Compute the deferred weight gradients of the optional compressor/indexer submodules.
@@ -1953,6 +1959,7 @@ class CompressedSparseAttention(MegatronModule):
         max_seqlen_k: int,
         q_causal_offsets: torch.Tensor | None = None,
         return_softmax: bool = False,
+        workspace_slot: str = "default",
     ) -> THDCompactIndexerWorkspace | None:
         """Return persistent compact storage for a warmed-up THD graph geometry.
 
@@ -1968,7 +1975,15 @@ class CompressedSparseAttention(MegatronModule):
             return None
 
         capturing = torch.cuda.is_current_stream_capturing()
-        workspace = self._active_thd_compact_indexer_workspace
+        # Head and tail have different causal offsets and may have different
+        # geometry. Keep their quantization/candidate metadata separate, just as
+        # each attention module owns storage independently of the other layers.
+        balanced = workspace_slot != "default"
+        workspace = (
+            self._active_balanced_thd_compact_indexer_workspaces.get(workspace_slot)
+            if balanced
+            else self._active_thd_compact_indexer_workspace
+        )
         if capturing:
             if workspace is not None and workspace.matches(
                 q=q,
@@ -1989,7 +2004,12 @@ class CompressedSparseAttention(MegatronModule):
                 "workspace for the active packed geometry. Run eager warmup before capture."
             )
 
-        for workspace in self._thd_compact_indexer_workspaces:
+        workspaces = (
+            self._balanced_thd_compact_indexer_workspaces.setdefault(workspace_slot, [])
+            if balanced
+            else self._thd_compact_indexer_workspaces
+        )
+        for workspace in workspaces:
             if workspace.matches(
                 q=q,
                 k=k,
@@ -2003,7 +2023,10 @@ class CompressedSparseAttention(MegatronModule):
                 return_softmax=return_softmax,
                 precision=precision,
             ):
-                self._active_thd_compact_indexer_workspace = workspace
+                if balanced:
+                    self._active_balanced_thd_compact_indexer_workspaces[workspace_slot] = workspace
+                else:
+                    self._active_thd_compact_indexer_workspace = workspace
                 return workspace
 
         workspace = prepare_thd_compact_indexer_workspace(
@@ -2019,9 +2042,12 @@ class CompressedSparseAttention(MegatronModule):
             return_softmax=return_softmax,
             precision=precision,
         )
-        self._active_thd_compact_indexer_workspace = workspace
+        if balanced:
+            self._active_balanced_thd_compact_indexer_workspaces[workspace_slot] = workspace
+        else:
+            self._active_thd_compact_indexer_workspace = workspace
         if workspace is not None:
-            self._thd_compact_indexer_workspaces.append(workspace)
+            workspaces.append(workspace)
         return workspace
 
     def _build_kv_full(
@@ -3103,7 +3129,7 @@ class CompressedSparseAttention(MegatronModule):
                     if bal_layout_cache is None and not graph_dynamic_packs:
                         bal_layout_cache = {}
                         packed_seq_params._dsa_cp_balance_layout_cache = bal_layout_cache
-                    compressed_topk, indexer_layout = (
+                    compressed_topk, indexer_layout, compact_indexer_predict = (
                         cp_balanced_indexer.balanced_compute_cp_indexer_topk(
                             indexer_qr,
                             weights_indexer_cp,
@@ -3123,6 +3149,12 @@ class CompressedSparseAttention(MegatronModule):
                             dispatch_handle=bal_dispatch_handle,
                             layout_cache=bal_layout_cache,
                             graph_dynamic_packs=graph_dynamic_packs,
+                            workspace_provider=self._get_thd_compact_indexer_workspace,
+                            return_softmax=(
+                                training_with_grad
+                                and sparse_indexer_loss
+                                and indexer_loss_coeff > 0
+                            ),
                         )
                     )
                 else:

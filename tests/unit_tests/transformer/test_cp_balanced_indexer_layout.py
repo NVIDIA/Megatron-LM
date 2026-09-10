@@ -988,7 +988,7 @@ def test_balanced_compute_smoke_runs_production_path(monkeypatch):
     The public helper no longer exposes a fused/unfused override: it requests
     fused scoring for a safe-sized ordinary layout. A test proxy records that
     request and delegates to the unfused implementation so the projection ->
-    _no_fp8_ctx -> RoPE -> scorer integration can still run on CPU and be
+    precision policy -> RoPE -> scorer integration can still run on CPU and be
     compared exactly with the reference.
     """
     from megatron.core.transformer.experimental_attention_variant import cp_balanced_indexer as M
@@ -1021,7 +1021,7 @@ def test_balanced_compute_smoke_runs_production_path(monkeypatch):
         rotary_interleaved = False
 
     # fast_hadamard_transform is GPU-only; the smoke targets the integration
-    # wiring (projection/_no_fp8_ctx/RoPE/delegation), so make rotation identity
+    # wiring (projection/precision/RoPE/delegation), so make rotation identity
     # on BOTH the production call and the reference reproduction below.
     monkeypatch.setattr(M, "rotate_activation", lambda x: x)
     real_compute_topk = cp_utils.compute_cp_indexer_topk
@@ -1039,7 +1039,7 @@ def test_balanced_compute_smoke_runs_production_path(monkeypatch):
     cu_comp = torch.tensor([0, rows // ratio], dtype=torch.int32)
     k = torch.randn(rows // ratio, dim).to(torch.bfloat16)
 
-    tk, layout = M.balanced_compute_cp_indexer_topk(
+    tk, layout, predict = M.balanced_compute_cp_indexer_topk(
         qr,
         w,
         idx,
@@ -1057,6 +1057,7 @@ def test_balanced_compute_smoke_runs_production_path(monkeypatch):
         rows,
     )
     assert tk is not None and tk.shape == (rows, topk)
+    assert predict is None
     assert fused_requests == [True]
     # The cp1 exit is the reference call over own rows: reproduce it directly.
     from megatron.core.transformer.experimental_attention_variant.csa_utils.cp_utils import (
@@ -1076,8 +1077,8 @@ def test_balanced_compute_smoke_runs_production_path(monkeypatch):
     assert torch.equal(fs, rs)
 
 
-def test_balanced_compute_uses_fused_full_k_with_tight_widths(monkeypatch):
-    """The production zigzag consumer passes full K plus a tight score width.
+def test_balanced_compute_shares_compact_full_k(monkeypatch):
+    """The production zigzag consumer packs full K once for both compact calls.
 
     This directly guards both API invariants behind the balanced helper: callers
     cannot select an unfused synthetic-layout scorer, and neither head nor tail
@@ -1128,7 +1129,7 @@ def test_balanced_compute_uses_fused_full_k_with_tight_widths(monkeypatch):
         score_calls.append((args[2], kwargs))
         return (
             torch.zeros((args[0].shape[0], topk), dtype=torch.int32),
-            kwargs["prebuilt_layout"],
+            kwargs["logical_indexer_layout"],
             None,
         )
 
@@ -1142,7 +1143,7 @@ def test_balanced_compute_uses_fused_full_k_with_tight_widths(monkeypatch):
     cu = torch.tensor(cu_list, dtype=torch.int32)
     cu_comp = _comp_cu(cu)
 
-    result, _ = M.balanced_compute_cp_indexer_topk(
+    result, _, predict = M.balanced_compute_cp_indexer_topk(
         qr,
         weights,
         _Indexer(),
@@ -1163,14 +1164,30 @@ def test_balanced_compute_uses_fused_full_k_with_tight_widths(monkeypatch):
     )
 
     assert result.shape == (l_local, topk)
+    assert predict is None
     assert len(score_calls) == 2
-    expected_widths = [plan["mkv_head"], plan["mkv_tail"]]
-    for (k_arg, kwargs), expected_width in zip(score_calls, expected_widths):
-        assert k_arg is k_full
+    assert score_calls[0][0] is score_calls[1][0]
+    for k_arg, kwargs in score_calls:
+        assert k_arg.shape == (k_full.shape[0] + len(cu_list) - 1, dim)
+        assert int(kwargs["indexer_layout"][1][-1]) == k_arg.shape[0]
         assert kwargs["synthetic_layout"] is True
         assert kwargs["use_fused"] is True
-        assert kwargs["max_seqlen_kv"] == expected_width
-    assert min(expected_widths) < k_full.shape[0]
+        assert kwargs["max_seqlen_kv"] == capacity // ratio
+        assert kwargs["precision"] == "bf16"
+
+
+def test_selection_payload_preserves_probability_bits_and_topk_slots():
+    from megatron.core.transformer.experimental_attention_variant import cp_balanced_indexer as M
+
+    indices = torch.tensor([[7, 2, -1], [4, 0, -1]], dtype=torch.int32)
+    probabilities = torch.tensor([[0.7, 0.3, 0.0], [0.25, 0.75, 0.0]], dtype=torch.float32)
+    # Model the same arbitrary row permutation applied to an integer A2A payload.
+    route = torch.tensor([1, 0])
+    wire = M._pack_selection_result(indices, probabilities).index_select(0, route)
+    restored_ids, restored_probs = M._unpack_selection_result(wire.index_select(0, route), True)
+    assert torch.equal(restored_ids, indices)
+    assert torch.equal(restored_probs.view(torch.int32), probabilities.view(torch.int32))
+    assert restored_ids.is_contiguous() and restored_probs.is_contiguous()
 
 
 def test_prebuild_routes_ineligible_above_limit_pack():
