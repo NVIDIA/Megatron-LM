@@ -1,6 +1,8 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
+import json
 import logging
+import os
 from typing import List, Optional
 
 try:
@@ -101,6 +103,25 @@ class HuggingFaceTokenizer(MegatronTokenizerTextAbstract):
                 'Unable to instantiate HuggingFace AutoTokenizer '
                 f'for {tokenizer_path}. Exception: {e}'
             )
+
+        # Attach the model's generation_config (if present in the tokenizer directory).
+        # HF tokenizers do not load generation_config.json themselves -- it is a
+        # model-level file -- but it holds `eos_token_id`, which may be a LIST of stop
+        # tokens (e.g. [2, 11]). Reading it here lets termination honor every declared
+        # eos token. Missing or unreadable file -> None (graceful).
+        self.generation_config = None
+        try:
+            gc_path = os.path.join(tokenizer_path, "generation_config.json")
+            if os.path.isfile(gc_path):
+                with open(gc_path) as gc_file:
+                    self.generation_config = json.load(gc_file)
+        except Exception as gc_e:
+            log_single_rank(
+                logger,
+                logging.WARNING,
+                f"Could not read generation_config.json from {tokenizer_path}: {gc_e}",
+            )
+            self.generation_config = None
 
         # Store the tokenizer's existing chat template if the user does not provide
         # a custom chat template. Otherwise, override the default chat template with
