@@ -22,15 +22,17 @@ import torch
 
 from gpt_builders import gpt_builder
 from megatron.core import mpu
+from megatron.core.context_parallel import ContextParallelBatch, get_batches_on_this_cp_rank
 from megatron.core.datasets.data_schedule import get_batch_on_this_rank_for_sequence_packing
 from megatron.core.enums import ModelType
 from megatron.core.models.gpt import GPTModel
 from megatron.core.package_info import __version__ as mcore_version
-from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import get_context_parallel_group
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.rerun_state_machine import get_rerun_state_machine
-from megatron.core.transformer.multi_token_prediction import get_mtp_ranks
+from megatron.core.transformer.multi_token_prediction import (
+    get_mtp_ranks,
+)
 from megatron.core.transformer.multi_token_prediction import (
     mtp_on_this_rank as mtp_on_this_rank_func,
 )
@@ -38,7 +40,6 @@ from megatron.core.utils import (
     StragglerDetector,
     flatten_batch_for_packed_sequences,
     get_attr_wrapped_model,
-    get_batch_on_this_cp_rank,
     get_batch_on_this_tp_rank,
     get_te_version,
     get_torch_version,
@@ -140,6 +141,7 @@ def get_batch(
             dynamic_cp=args.dynamic_context_parallel,
             pg_collection=pg_collection,
             config=config,
+            return_context_parallel_batch=True,
         )
 
     cp_size = args.context_parallel_size
@@ -161,7 +163,11 @@ def get_batch(
         and not mtp_on_this_rank
         and not has_cu_seqlens
     ):
-        return [None for _ in BATCH_KEYS]
+        return ContextParallelBatch(
+            boundary_layout=config.attention_cp_layout,
+            batches_by_layout={config.attention_cp_layout: dict.fromkeys(BATCH_KEYS)},
+            packed_seq_params_by_layout={config.attention_cp_layout: None},
+        )
 
     batch = {}
     if tp_rank == 0:
@@ -194,33 +200,28 @@ def get_batch(
 
     if not is_first_or_last_pipeline_stage(vp_stage) and not mtp_on_this_rank:
         assert has_cu_seqlens
-        return (
-            None,
-            batch['cu_seqlens'],
-            batch['cu_seqlens_padded'],
-            None,
-            None,
-            None,
-            None,
-            batch['max_seqlen'],
-            None,
-            None,
-        )
+        batch = {
+            **dict.fromkeys(BATCH_KEYS),
+            'cu_seqlens': batch['cu_seqlens'],
+            'cu_seqlens_padded': batch['cu_seqlens_padded'],
+            'max_seqlen': batch['max_seqlen'],
+        }
 
-    batch = get_batch_on_this_cp_rank(
+    return get_batches_on_this_cp_rank(
         batch,
+        boundary_layout=config.attention_cp_layout,
         dynamic_cp=False,
         cp_group=get_context_parallel_group(),
-        use_per_sequence_balancing=args.dataloader_inter_document_masking and not is_sft,
+        use_per_sequence_balancing=(batch.get('cu_seqlens') is not None),
+        sequence_parallel=config.sequence_parallel,
+        tp_group=mpu.get_tensor_model_parallel_group(),
+        tp_cp_group=(
+            mpu.get_tensor_and_context_parallel_group()
+            if config.sequence_parallel and config.tensor_model_parallel_size > 1
+            else None
+        ),
+        tokens_per_sample=args.seq_length,
     )
-
-    # Return values in BATCH_KEYS order so callers can unpack into the fixed
-    # names regardless of any provenance fields wrappers like BlendedDataset
-    # add (e.g. "dataset_id"). The for-loop above already populates every
-    # BATCH_KEYS entry on tp_rank 0; other tp_ranks receive a fresh dict from
-    # get_batch_on_this_tp_rank. BATCH_KEYS is already alphabetical, matching
-    # the historical sorted(batch.keys()) order.
-    return [batch[key] for key in BATCH_KEYS]
 
 
 # define spiky loss as a loss that's 10x the max loss observed
@@ -335,74 +336,33 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
         return_schedule_plan (bool): Whether to return the schedule plan instead of the output tensor
     """
     args = get_args()
+    config = core_transformer_config_from_args(args)
     timers = get_timers()
 
     # Get the batch.
     timers('batch-generator', log_level=2).start()
     with stimer(bdata=True):
         vp_stage = get_attr_wrapped_model(model, "vp_stage")
-        batch = get_batch(
+        cp_batch = get_batch(
             data_iterator, vp_stage, pg_collection=get_attr_wrapped_model(model, "pg_collection")
         )
-
-        # Only populated by the has_cu_seqlens (--sft) 10-tuple branch below;
-        # stays None for the 6-/7-tuple (unpacked) batch shapes.
-        cu_seqlens = None
-        cu_seqlens_padded = None
-
-        if len(batch) == 7:
-            (
-                tokens,
-                labels,
-                loss_mask,
-                attention_mask,
-                position_ids,
-                packed_seq_params,
-                padding_mask,
-            ) = batch
-        elif len(batch) == 6:
-            tokens, labels, loss_mask, attention_mask, position_ids, packed_seq_params = batch
-            padding_mask = None
-        else:
-            (
-                attention_mask,
-                cu_seqlens,
-                cu_seqlens_padded,
-                hybrid_cp_group,
-                labels,
-                local_cp_size,
-                loss_mask,
-                max_seqlen,
-                position_ids,
-                tokens,
-            ) = batch
-
-            padding_mask = None
-            packed_seq_params = None
-            if cu_seqlens is not None:
-                # Squeeze the batch dim: the batch dict keeps cu_seqlens as (1, N)
-                # for consistency, but PackedSeqParams and TE expect 1-D.
-                cu_seqlens = cu_seqlens.squeeze(0)
-                if cu_seqlens_padded is not None:
-                    cu_seqlens_padded = cu_seqlens_padded.squeeze(0)
-                # Use real (unpadded) cu_seqlens to feed the FLOPs accounting: varlen
-                # attention only computes work for real tokens within each chunk.
-                update_seqlen_stats_from_cu_seqlens(cu_seqlens)
-                cu_seqlens_for_params = (
-                    cu_seqlens_padded if cu_seqlens_padded is not None else cu_seqlens
-                )  # TODO(asolergi-nv): Currently there is a bug forcing cu_seqlens to be cu_seqlens_padded
-                packed_seq_params = PackedSeqParams(
-                    qkv_format="thd",
-                    cu_seqlens_q=cu_seqlens_for_params,
-                    cu_seqlens_kv=cu_seqlens_for_params,
-                    cu_seqlens_q_padded=cu_seqlens_padded,
-                    cu_seqlens_kv_padded=cu_seqlens_padded,
-                    max_seqlen_q=int(max_seqlen.item()),
-                    max_seqlen_kv=int(max_seqlen.item()),
-                    local_cp_size=int(local_cp_size.item()) if local_cp_size is not None else None,
-                    cp_group=hybrid_cp_group,
-                    tokens_per_sample=args.seq_length,
-                )
+        attention_layout = (
+            config.attention_cp_layout
+            if config.attention_cp_layout in cp_batch.batches_by_layout
+            else None
+        )
+        batch = cp_batch.get_batch(attention_layout)
+        attention_mask = batch.get("attention_mask")
+        cu_seqlens = batch.get("cu_seqlens")
+        cu_seqlens_padded = batch.get("cu_seqlens_padded")
+        labels = batch.get("labels")
+        loss_mask = batch.get("loss_mask")
+        position_ids = batch.get("position_ids")
+        tokens = batch.get("tokens")
+        packed_seq_params = cp_batch.get_packed_seq_params(attention_layout)
+        padding_mask = batch.get("padding_mask")
+        if cu_seqlens is not None:
+            update_seqlen_stats_from_cu_seqlens(cu_seqlens.squeeze(0))
 
         # Offline logits KD: record this microbatch's global (un-CP-sharded)
         # document boundaries so the saver can persist them alongside the
