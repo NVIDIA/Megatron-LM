@@ -222,6 +222,14 @@ class PreProcessNode(ScheduleNode):
         Returns:
             The processed decoder input tensor.
         """
+        # The overlap schedule bypasses TransformerBlock.forward. Stage once for
+        # this invocation and keep its fixed-address route owners until backward.
+        self.chunk_state.packed_seq_params = (
+            self.gpt_model.decoder._stage_te_cuda_graph_route_metadata(
+                self.chunk_state.packed_seq_params,
+                microbatch_idx=self.chunk_state.current_microbatch,
+            )
+        )
         # Get decoder input
         if not self.gpt_model.pre_process:
             self.chunk_state.decoder_input = self.gpt_model.decoder.input_tensor
@@ -518,7 +526,13 @@ class _BackwardDWWrapper:
         ), "cuda graphed ep overlap only supports TransformerLayer for now."
         self.layer = layer
         self.graphed_backward_dw_callable = None
-        self.attn_dw_callable = layer.self_attention.backward_dw
+        from megatron.core.transformer.identity_op import IdentityOp
+
+        self.attn_dw_callable = (
+            None
+            if isinstance(layer.self_attention, IdentityOp)
+            else layer.self_attention.backward_dw
+        )
         self.submodules = [layer.self_attention]
         if layer.is_moe_layer:
             self.shared_expert_dw_callable = partial(
@@ -537,7 +551,9 @@ class _BackwardDWWrapper:
             not is_replay or CudaGraphModule.moe_router not in self.cuda_graph_modules
         ):
             self.shared_expert_dw_callable()
-        if not is_replay or CudaGraphModule.attn not in self.cuda_graph_modules:
+        if self.attn_dw_callable is not None and (
+            not is_replay or CudaGraphModule.attn not in self.cuda_graph_modules
+        ):
             self.attn_dw_callable()
         if is_replay and self.graphed_backward_dw_callable is not None:
             self.graphed_backward_dw_callable()
@@ -738,7 +754,7 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             or CudaGraphModule.attn not in layer.config.cuda_graph_modules
         ):
             forward_kwargs["mhc_recompute_manager"] = mhc_recompute_manager
-        elif is_hyper_connection_layer:
+        if using_cuda_graph_replay:
             # Replay paths that run the MoE routing tail themselves -- the split
             # (dense and overlap variants) and the non-split overlap branch --
             # need the padding_mask the eager branch above reads straight off
@@ -1106,6 +1122,12 @@ def build_layer_callables(layer):
         forward_funcs: list of callable functions for the layer.
         backward_dw: dict of weight gradient functions for the layer.
     """
+    from megatron.core.models.hybrid.hybrid_block import HyperConnectionHybridLayer
+
+    if isinstance(layer, HyperConnectionHybridLayer):
+        from megatron.core.models.hybrid.fine_grained_callables import build_hybrid_layer_callables
+
+        return build_hybrid_layer_callables(layer)
     if isinstance(layer, TransformerLayer):
         return build_transformer_layer_callables(layer)
     elif isinstance(layer, MultiTokenPredictionLayer):
