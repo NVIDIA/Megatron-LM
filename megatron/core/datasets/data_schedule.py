@@ -14,6 +14,7 @@ from megatron.core.datasets.data_schedule_utils import (
     get_batch_and_global_seqlens,
     get_cp_slice_for_thd,
     next_hdp_group_packing_aware,
+    reorder_dcp_groups,
     reroute_samples_to_dcp_ranks,
 )
 from megatron.core.packed_seq_params import (
@@ -432,6 +433,9 @@ class DefaultDynamicCPScheduler(DpBalancedScheduler):
         min_cp_size=1,
         allow_arbitrary_group_starts=False,
         sequence_parallel_size=1,
+        nvlink_domains=None,
+        communication_cost=(1024.0, 2304.0),
+        padding_alignment=None,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -441,6 +445,9 @@ class DefaultDynamicCPScheduler(DpBalancedScheduler):
         self.min_cp_size = min_cp_size
         self.allow_arbitrary_group_starts = allow_arbitrary_group_starts
         self.sequence_parallel_size = sequence_parallel_size
+        self.nvlink_domains = nvlink_domains
+        self.communication_cost = communication_cost
+        self.padding_alignment = padding_alignment
 
     def get_groups_and_subsamples(self, sample_id_seqlens):
         """
@@ -449,6 +456,7 @@ class DefaultDynamicCPScheduler(DpBalancedScheduler):
         """
         mslpr = self.max_seq_len_per_rank
         min_cp = self.min_cp_size
+        sample_lengths = dict(sample_id_seqlens) if self.nvlink_domains is not None else None
 
         sample_id_groups = []
         sample_id_seqlens = sorted(sample_id_seqlens, key=lambda x: x[1], reverse=True)
@@ -461,6 +469,9 @@ class DefaultDynamicCPScheduler(DpBalancedScheduler):
                 min_cp_size=min_cp,
                 allow_arbitrary_group_starts=self.allow_arbitrary_group_starts,
                 sequence_parallel_size=self.sequence_parallel_size,
+                nvlink_domains=self.nvlink_domains,
+                communication_cost=self.communication_cost,
+                padding_alignment=self.padding_alignment,
             )
             sample_id_groups.append(sample_ids)
 
@@ -473,6 +484,20 @@ class DefaultDynamicCPScheduler(DpBalancedScheduler):
                 self.microbatch_group_size_per_vp_stage,
                 allow_arbitrary_group_starts=self.allow_arbitrary_group_starts,
             )
+
+            if self.nvlink_domains is not None:
+                sample_id_groups = [
+                    reorder_dcp_groups(
+                        group,
+                        sample_lengths,
+                        self.nvlink_domains,
+                        self.communication_cost,
+                        self.sequence_parallel_size,
+                        self.max_seq_len_per_rank,
+                        self.padding_alignment,
+                    )
+                    for group in sample_id_groups
+                ]
 
         return sample_id_groups
 
@@ -511,6 +536,48 @@ def _get_scheduler_max_real_num_seqs(config) -> Optional[int]:
         return max_num_seqs - 1
 
     return max_num_seqs
+
+
+def _get_dynamic_cp_nvlink_domains(
+    dp_cp_ranks: List[int],
+    tp_ranks: List[int],
+    pp_ranks: List[int],
+    rank: int,
+    world_size: int,
+    domain_size: int,
+) -> List[int]:
+    """Return a common contiguous NVLink partition for all Cartesian TP/PP planes.
+
+    Physical domains are declared consecutive global-rank blocks. Megatron's rank
+    generator uses additive Cartesian strides, so translating explicit group ranks
+    enumerates all planes without communication. A boundary in any plane becomes a
+    shared boundary, ensuring independently scheduled PP stages use the same costs.
+    """
+    if domain_size < 1 or any(
+        not ranks or ranks != sorted(set(ranks)) or rank not in ranks
+        for ranks in (dp_cp_ranks, tp_ranks, pp_ranks)
+    ):
+        raise ValueError(
+            "NVLink scheduling requires positive domain size and valid Cartesian rank lists."
+        )
+    boundaries = set()
+    visited = set()
+    for tp_rank in tp_ranks:
+        for pp_rank in pp_ranks:
+            plane = [r + tp_rank + pp_rank - 2 * rank for r in dp_cp_ranks]
+            if plane[0] < 0 or plane[-1] >= world_size or visited.intersection(plane):
+                raise ValueError(
+                    "NVLink scheduling requires disjoint Cartesian TP/PP rank planes within WORLD."
+                )
+            visited.update(plane)
+            domains = [r // domain_size for r in plane]
+            boundaries.update(i for i in range(1, len(domains)) if domains[i] != domains[i - 1])
+    domain = 0
+    result = []
+    for i in range(len(dp_cp_ranks)):
+        domain += i in boundaries
+        result.append(domain)
+    return result
 
 
 def wrap_data_iterator(
@@ -559,6 +626,31 @@ def wrap_data_iterator(
         )
         if scheduler_kwargs['allow_arbitrary_group_starts'] and config.sequence_parallel:
             scheduler_kwargs['sequence_parallel_size'] = config.tensor_model_parallel_size
+        domain_size = getattr(config, 'dynamic_cp_nvlink_domain_size', None)
+        if scheduler_kwargs['allow_arbitrary_group_starts'] and domain_size is not None:
+            ranks = torch.distributed.get_process_group_ranks
+            scheduler_kwargs['nvlink_domains'] = _get_dynamic_cp_nvlink_domains(
+                ranks(dp_cp_group),
+                ranks(tp_group),
+                ranks(pp_group),
+                torch.distributed.get_global_rank(dp_cp_group, dp_cp_group.rank()),
+                torch.distributed.get_world_size(),
+                domain_size,
+            )
+            scheduler_kwargs['communication_cost'] = getattr(
+                config, 'dynamic_cp_communication_cost', None
+            ) or (1024.0, 2304.0)
+            padding_alignment = getattr(config, 'pad_packed_seq_alignment', None)
+            if padding_alignment is not None:
+                alignment, target_len, _ = get_thd_padding_kwargs(
+                    padding_alignment,
+                    config.max_seqlen_per_dp_cp_rank,
+                    getattr(config, 'thd_max_packed_sequences', None),
+                    getattr(config, 'cuda_graph_impl', 'none') != 'none',
+                )
+                scheduler_kwargs['padding_alignment'] = (
+                    'max' if target_len is not None else alignment
+                )
 
     scheduler_max_num_seqs = (
         _get_scheduler_max_real_num_seqs(config)

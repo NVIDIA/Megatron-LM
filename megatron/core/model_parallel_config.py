@@ -2,6 +2,7 @@
 
 import warnings
 from dataclasses import dataclass, field
+from math import isfinite
 from typing import Callable, ContextManager, Literal, Optional, Union
 
 import torch
@@ -94,6 +95,18 @@ class ModelParallelConfig:
 
     use_native_cp_transport: bool = False
     """Use TE's NCCL Device API kernel instead of ProcessGroupNCCL for dynamic-CP rings."""
+
+    dynamic_cp_nvlink_domain_size: Optional[int] = None
+    """Enable topology-aware native DCP scheduling with this many consecutive global ranks
+    per NVLink domain. This is a user-declared physical layout, not topology discovery;
+    it requires Megatron's Cartesian TP/PP/DP/CP rank mapping. None keeps compute-only scoring.
+    """
+
+    dynamic_cp_communication_cost: Optional[list[float]] = None
+    """Intra-domain and cross-domain communication cost coefficients, in equivalent tokens.
+    Requires dynamic_cp_nvlink_domain_size. Values must be finite, nonnegative, and ordered.
+    None uses [1024, 2304], a configurable H100/Qwen attention reference, not a native calibration.
+    """
 
     hybrid_context_parallel: bool = False
     """Deprecated. Use ``dynamic_context_parallel`` instead."""
@@ -523,6 +536,28 @@ class ModelParallelConfig:
                 raise ValueError(
                     f"min_dynamic_context_parallel_size must be >= 1, "
                     f"got {self.min_dynamic_context_parallel_size}"
+                )
+
+        if self.dynamic_cp_nvlink_domain_size is not None:
+            if (
+                not isinstance(self.dynamic_cp_nvlink_domain_size, int)
+                or self.dynamic_cp_nvlink_domain_size < 1
+            ):
+                raise ValueError("dynamic_cp_nvlink_domain_size must be a positive integer.")
+            if not (self.dynamic_context_parallel and self.use_native_cp_transport):
+                raise ValueError(
+                    "dynamic_cp_nvlink_domain_size requires native dynamic context parallelism."
+                )
+        if self.dynamic_cp_communication_cost is not None:
+            cost = self.dynamic_cp_communication_cost
+            if self.dynamic_cp_nvlink_domain_size is None:
+                raise ValueError(
+                    "dynamic_cp_communication_cost requires dynamic_cp_nvlink_domain_size."
+                )
+            if len(cost) != 2 or not all(isfinite(c) for c in cost) or not 0 <= cost[0] <= cost[1]:
+                raise ValueError(
+                    "dynamic_cp_communication_cost must contain two finite coefficients "
+                    "with 0 <= intra-domain <= cross-domain."
                 )
 
         if self.thd_tail_padding_policy not in (None, "append_dummy_seq", "extend_last"):

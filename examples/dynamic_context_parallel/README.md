@@ -71,6 +71,52 @@ The baseline keeps the full fixed CP size for the packed workload. DCP can
 spread short samples over the DPxCP domain instead of making every sample occupy
 the full CP group.
 
+## NVLink-aware native DCP scheduling
+
+For a Cartesian rank layout with each consecutive eight global GPU ranks in
+one NVLink domain, add these arguments to a native DCP training command:
+
+```text
+--dynamic-context-parallel --use-native-cp-transport
+--dynamic-cp-nvlink-domain-size 8
+--dynamic-cp-communication-cost 1024 2304
+```
+
+The domain size is an explicit placement contract, **not** GPUs per Slurm host
+or automatic topology discovery. Use 72 only when consecutive 72-rank blocks
+really describe NVL72 domains. The scheduler maps global ranks to DP×CP
+positions and takes the common boundaries across TP/PP planes so all stages
+choose the same schedule. Custom non-Cartesian process-group layouts are not
+supported by this option. Omitting the domain size preserves compute-only
+scheduling; legacy multi-ProcessGroup DCP is unchanged.
+
+The lightweight score retains the padded compute proxy `Q = sum(L_i²) / CP`.
+For a group crossing a domain boundary, it adds only the extra exposed ring
+communication, using `CP - 1` overlapping exchanges:
+
+```text
+q = Q / CP
+u_local, u_cross = communication_cost * payload_tokens_per_rank
+score = Q + (CP - 1) * (max(q, u_cross) - max(q, u_local))
+```
+
+Both terms use the same token-squared units; the communication coefficients
+are equivalent-token weights, not milliseconds or bandwidths. They apply to
+the complete pack, not separately to each sequence. Fully hidden traffic is
+only a tie-break. Payload size follows the existing `pad_packed_seq_alignment`
+setting (including full-capacity `max` padding), not just the valid tokens.
+The two default weights are a rounded H100/Qwen3 attention
+reference, not native-transport calibration; override them for a different
+model, payload or interconnect. Setting equal weights disables the adjustment.
+
+All integer CP sizes remain eligible, including groups that must cross a
+domain. Whole-group placement and capacity-checked filling avoid gratuitous
+crossings without leaving empty ranks; VPP-aligned groups are rechecked.
+The training path loads no predictor, runs no solver, and creates no process
+groups or topology-probing collectives. This heuristic does not guarantee an
+E2E improvement: EP imbalance, communication overlap and native timings still
+need offline prediction or measurement for the workload of interest.
+
 ## Output
 
 At the end, the script prints:
