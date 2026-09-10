@@ -1,4 +1,4 @@
-# Copyright (c) 2024-2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import dataclasses
 import functools
@@ -104,11 +104,14 @@ def _assert_equal_with_partial_contents(left, right, path="root"):
 class _DummyHybridLayer(MegatronModule):
     """Minimal same-shape layer used to test HybridModel/mHC plumbing."""
 
+    supports_strict_runtime_validation = True
+
     def __init__(self, config: TransformerConfig, layer_number: int, **_kwargs):
         super().__init__(config=config)
         self.layer_number = layer_number
         self.proj = torch.nn.Linear(config.hidden_size, config.hidden_size, bias=False)
         self.seen_hidden_shapes = []
+        self.seen_strict_runtime_validation = []
 
     def forward(
         self,
@@ -119,6 +122,9 @@ class _DummyHybridLayer(MegatronModule):
         **_kwargs,
     ):
         self.seen_hidden_shapes.append(tuple(hidden_states.shape))
+        if "strict_runtime_validation" in _kwargs:
+            self.seen_strict_runtime_validation.append(_kwargs["strict_runtime_validation"])
+
         return hidden_states + 0.125 * self.proj(hidden_states)
 
 
@@ -131,6 +137,7 @@ def _get_dummy_hybrid_stack_spec() -> ModuleSpec:
         submodules=HybridStackSubmodules(
             mamba_layer=dummy_layer_spec,
             gdn_layer=dummy_layer_spec,
+            kda_layer=dummy_layer_spec,
             attention_layer=dummy_layer_spec,
             dsa_layer=dummy_layer_spec,
             mlp_layer=dummy_layer_spec,
@@ -460,6 +467,78 @@ class TestHybridModel:
             assert layer.hyper_connection.mapping_proj.weight.grad is not None
             assert torch.isfinite(layer.inner_layer.proj.weight.grad).all()
             assert torch.isfinite(layer.hyper_connection.mapping_proj.weight.grad).all()
+
+    @pytest.mark.parametrize(
+        "frequency, expected",
+        [
+            ("always", [True, True, True, True]),
+            ("once_per_microbatch", [True, False, True, False]),
+            ("never", [False, False, False, False]),
+        ],
+    )
+    def test_hybrid_runtime_validation_frequency(self, frequency, expected):
+        config_kwargs = dict(
+            num_layers=4,
+            hidden_size=32,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            strict_runtime_validation_frequency=frequency,
+        )
+        if frequency == "never":
+            with pytest.warns(UserWarning, match="Strict runtime validation is disabled"):
+                model_config = TransformerConfig(**config_kwargs)
+        else:
+            model_config = TransformerConfig(**config_kwargs)
+
+        model = HybridModel(
+            config=model_config,
+            hybrid_stack_spec=_get_dummy_hybrid_stack_spec(),
+            vocab_size=64,
+            max_sequence_length=8,
+            hybrid_layer_pattern="GGKK",
+            parallel_output=False,
+        )
+        decoder = model.decoder.cuda()
+        hidden_states = torch.randn(8, 2, model_config.hidden_size, device="cuda")
+
+        decoder(hidden_states, attention_mask=None)
+        decoder(hidden_states, attention_mask=None)
+
+        assert [layer.seen_strict_runtime_validation[0] for layer in decoder.layers] == expected
+        assert [layer.seen_strict_runtime_validation[1] for layer in decoder.layers] == expected
+
+    def test_hybrid_runtime_validation_is_not_repeated_during_recompute(self):
+        model_config = TransformerConfig(
+            num_layers=4,
+            hidden_size=32,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            strict_runtime_validation_frequency="once_per_microbatch",
+            recompute_granularity="full",
+            recompute_method="uniform",
+            recompute_num_layers=4,
+        )
+        model = HybridModel(
+            config=model_config,
+            hybrid_stack_spec=_get_dummy_hybrid_stack_spec(),
+            vocab_size=64,
+            max_sequence_length=8,
+            hybrid_layer_pattern="GGKK",
+            parallel_output=False,
+        )
+        decoder = model.decoder.cuda()
+        hidden_states = torch.randn(
+            8, 2, model_config.hidden_size, device="cuda", requires_grad=True
+        )
+
+        decoder(hidden_states, attention_mask=None).sum().backward()
+
+        assert [layer.seen_strict_runtime_validation for layer in decoder.layers] == [
+            [True, False],
+            [False, False],
+            [True, False],
+            [False, False],
+        ]
 
     def test_set_input_tensor(self):
         config: TransformerConfig = self.model.config

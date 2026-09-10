@@ -114,6 +114,7 @@ class GatedDeltaNet(_GDNBase):
         *,
         pg_collection: Optional[ProcessGroupCollection] = None,
         inference_params: Optional[BaseInferenceContext] = None,
+        strict_runtime_validation: bool = True,
         **kwargs,
     ):
         """
@@ -199,6 +200,7 @@ class GatedDeltaNet(_GDNBase):
                 seq_len_global,
                 "cu_seqlens_q",
                 cp_size=cp_size_runtime,
+                strict_runtime_validation=strict_runtime_validation,
             )
             cu_seqlens_kv = self._resolve_cu_seqlens(
                 packed_seq_params.cu_seqlens_kv_padded,
@@ -206,16 +208,18 @@ class GatedDeltaNet(_GDNBase):
                 seq_len_global,
                 "cu_seqlens_kv",
                 cp_size=cp_size_runtime,
+                strict_runtime_validation=strict_runtime_validation,
             )
-            assert torch.equal(cu_seqlens_q, cu_seqlens_kv), (
-                "Currently only support cu_seqlens_q equals to cu_seqlens_kv, "
-                f"but got {cu_seqlens_q=} and {cu_seqlens_kv=}"
-            )
-            num_packed_seqs = cu_seqlens_q.shape[0] - 1
-            assert num_packed_seqs > 0, (
-                "Number of packed sequences must be greater than 0, "
-                f"but got {cu_seqlens_q=} and {cu_seqlens_kv=}"
-            )
+            if strict_runtime_validation:
+                assert torch.equal(cu_seqlens_q, cu_seqlens_kv), (
+                    "Currently only support cu_seqlens_q equals to cu_seqlens_kv, "
+                    f"but got {cu_seqlens_q=} and {cu_seqlens_kv=}"
+                )
+                num_packed_seqs = cu_seqlens_q.shape[0] - 1
+                assert num_packed_seqs > 0, (
+                    "Number of packed sequences must be greater than 0, "
+                    f"but got {cu_seqlens_q=} and {cu_seqlens_kv=}"
+                )
         else:
             cu_seqlens_q = None
             cu_seqlens_kv = None

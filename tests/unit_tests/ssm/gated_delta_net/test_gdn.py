@@ -841,3 +841,12 @@ class TestGDNCuSeqlensResolve:
         actual = torch.tensor([0, 500, 1000], dtype=torch.int32)
         with pytest.raises(ValueError, match="does not match"):
             mock_gdn._resolve_cu_seqlens(None, actual, 1008, "cu_seqlens_q", cp_size=1)
+
+    def test_strict_runtime_validation_can_be_skipped(self, mock_gdn):
+        invalid = torch.tensor([0, 505, 1000], dtype=torch.int32)
+
+        result = mock_gdn._resolve_cu_seqlens(
+            None, invalid, 1008, "cu_seqlens_q", cp_size=2, strict_runtime_validation=False
+        )
+
+        assert result is invalid

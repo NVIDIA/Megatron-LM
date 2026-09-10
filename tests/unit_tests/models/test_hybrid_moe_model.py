@@ -378,6 +378,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "moe_mlp_glu_interleave_size": None,
     "moe_router_force_biased": None,
     "sequence_packing_scheduler": None,
+    "strict_runtime_validation_frequency": "always",
     "use_transformer_engine_op_fuser": False,
     "moe_single_grouped_weight": False,
     "moe_single_grouped_bias": False,

@@ -201,6 +201,7 @@ class KimiDeltaAttention(_GDNBase):
         *,
         pg_collection: Optional[ProcessGroupCollection] = None,
         inference_params: Optional[BaseInferenceContext] = None,
+        strict_runtime_validation: bool = True,
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Run the direct-projection KDA training path."""
@@ -278,6 +279,7 @@ class KimiDeltaAttention(_GDNBase):
                 seq_len_global,
                 "cu_seqlens_q",
                 cp_size=cp_size_runtime,
+                strict_runtime_validation=strict_runtime_validation,
             )
             cu_seqlens_kv = self._resolve_cu_seqlens(
                 packed_seq_params.cu_seqlens_kv_padded,
@@ -285,8 +287,10 @@ class KimiDeltaAttention(_GDNBase):
                 seq_len_global,
                 "cu_seqlens_kv",
                 cp_size=cp_size_runtime,
+                strict_runtime_validation=strict_runtime_validation,
             )
-            self._validate_packed_cu_seqlens(cu_seqlens_q, cu_seqlens_kv)
+            if strict_runtime_validation:
+                self._validate_packed_cu_seqlens(cu_seqlens_q, cu_seqlens_kv)
         else:
             cu_seqlens_q = None
 

@@ -446,6 +446,7 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
         packed_seq_params: Optional[PackedSeqParams],
         padding_mask: Optional[Tensor],
         input_ids: Optional[Tensor] = None,
+        strict_runtime_validation: Optional[bool] = None,
     ) -> Tuple[Tensor, Optional[Tensor]]:
         # When this wrapper is itself being CUDA-graph captured, the inner layer
         # must run as a plain forward: routing through its ``__call__`` would
@@ -468,6 +469,7 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
                 padding_mask=padding_mask,
                 input_ids=input_ids,
                 _called_from_hybrid_mhc_wrapper=True,
+                strict_runtime_validation=strict_runtime_validation,
             )
         else:
             # Non-transformer layers (e.g. MambaLayer; GatedDeltaNet which does
@@ -476,12 +478,17 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
             # rotary_pos_emb / sequence_len_offset / padding_mask — pass only
             # the common arguments. New layer types that consume any of these
             # must add explicit handling here.
-            output = inner(
+            inner_kwargs = dict(
                 hidden_states=hidden_states,
                 attention_mask=attention_mask,
                 inference_context=inference_context,
                 packed_seq_params=packed_seq_params,
             )
+            if strict_runtime_validation is not None and getattr(
+                self.inner_layer, "supports_strict_runtime_validation", False
+            ):
+                inner_kwargs["strict_runtime_validation"] = strict_runtime_validation
+            output = inner(**inner_kwargs)
 
         if isinstance(output, tuple):
             context = output[1] if len(output) > 1 else None
@@ -499,6 +506,7 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
         padding_mask: Optional[Tensor],
         input_ids: Optional[Tensor] = None,
         mhc_recompute_manager: Optional[MHCCheckpointManager] = None,
+        strict_runtime_validation: Optional[bool] = None,
     ) -> Optional[Tuple[Tuple[Tensor, Optional[Tensor]], Optional[Tensor], float, bool]]:
         """Return a raw TransformerLayer branch output when the wrapped layer is split.
 
@@ -531,6 +539,7 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
                     packed_seq_params=packed_seq_params,
                     sequence_len_offset=sequence_len_offset,
                     mhc_recompute_manager=mhc_recompute_manager,
+                    strict_runtime_validation=strict_runtime_validation,
                 )
             )
             output_with_bias = layer._group_offload_output_with_bias(
@@ -570,6 +579,7 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
         padding_mask: Optional[Tensor] = None,
         input_ids: Optional[Tensor] = None,
         mhc_recompute_manager=None,
+        strict_runtime_validation: Optional[bool] = None,
     ) -> Tuple[Tensor, Optional[Tensor]]:
         """Run the wrapped hybrid layer through one layer-boundary mHC update.
 
@@ -595,6 +605,7 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
             padding_mask,
             input_ids,
             mhc_recompute_manager=mhc_recompute_manager,
+            strict_runtime_validation=strict_runtime_validation,
         )
 
         if fast_path_result is None:
@@ -607,6 +618,7 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
                 packed_seq_params,
                 padding_mask,
                 input_ids,
+                strict_runtime_validation,
             )
             # The inner hybrid layer already applied its own local residual/dropout, so
             # it returns `aggregated + f(aggregated)`. We feed only the function
@@ -1131,13 +1143,25 @@ class HybridStack(MegatronModule):
                     padding_mask=padding_mask,
                     input_ids=input_ids,
                     use_inner_quantization_context=(use_inner_fp8_context or use_fp4_context),
+                    strict_runtime_validation_frequency=(
+                        self.config.strict_runtime_validation_frequency
+                    ),
                 )
             else:
+                strictly_validated_layer_types = set()
                 grouped_tail_to_skip = None
                 for l_no, layer in enumerate(self.layers):
                     if layer is grouped_tail_to_skip:
                         grouped_tail_to_skip = None
                         continue
+
+                    layer_type = self.layer_type_list[l_no]
+                    frequency = self.config.strict_runtime_validation_frequency
+                    strict_runtime_validation = frequency == "always" or (
+                        frequency == "once_per_microbatch"
+                        and layer_type not in strictly_validated_layer_types
+                    )
+                    strictly_validated_layer_types.add(layer_type)
 
                     # Layers have 1-indexed layer numbers attribute.
                     inner_quant_context = get_inner_quant_context(
@@ -1167,14 +1191,20 @@ class HybridStack(MegatronModule):
                                 layer, HyperConnectionHybridLayer
                             ):
                                 layer_kwargs["mhc_recompute_manager"] = mhc_manager
+                            layer_kwargs["strict_runtime_validation"] = strict_runtime_validation
                             hidden_states, _ = layer(**layer_kwargs)
                         else:  # MambaLayer, Expert, or MLP
-                            hidden_states = layer(
+                            layer_kwargs = dict(
                                 hidden_states=hidden_states,
                                 attention_mask=attention_mask,
                                 inference_context=inference_context,
                                 packed_seq_params=packed_seq_params,
                             )
+                            if getattr(layer, "supports_strict_runtime_validation", False):
+                                layer_kwargs["strict_runtime_validation"] = (
+                                    strict_runtime_validation
+                                )
+                            hidden_states = layer(**layer_kwargs)
 
                     if isinstance(layer, HyperConnectionHybridLayer):
                         grouped_tail_to_skip = layer._get_active_te_cuda_graph_group_tail()

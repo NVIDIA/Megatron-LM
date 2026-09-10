@@ -29,6 +29,18 @@ def test_invalid_thd_tail_padding_policy_is_rejected_during_config_initializatio
         ModelParallelConfig(thd_tail_padding_policy="bogus")
 
 
+def test_invalid_strict_runtime_validation_frequency_is_rejected():
+    with pytest.raises(ValueError, match="strict_runtime_validation_frequency must be"):
+        ModelParallelConfig(strict_runtime_validation_frequency="sometimes")
+
+
+def test_disabling_strict_runtime_validation_warns():
+    with pytest.warns(UserWarning, match="Strict runtime validation is disabled"):
+        config = ModelParallelConfig(strict_runtime_validation_frequency="never")
+
+    assert config.strict_runtime_validation_frequency == "never"
+
+
 def test_contiguous_context_parallel_rejects_bshd_inputs():
     with pytest.raises(
         ValueError,

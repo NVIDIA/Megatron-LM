@@ -32,6 +32,7 @@ def checkpointed_forward(
     extract_layer_indices: Optional[Set[int]] = None,
     layer_offset: int = 0,
     input_ids: Optional[Tensor] = None,
+    strict_runtime_validation_frequency: Optional[str] = None,
 ) -> Union[Tensor, Tuple[Tensor, Tensor]]:
     """Forward method with activation checkpointing.
 
@@ -50,6 +51,7 @@ def checkpointed_forward(
     if extract_layer_indices is None:
         extract_layer_indices = set()
     intermediate_hidden_states: List[Tensor] = []
+    strictly_validated_layer_types: Set[str] = set()
 
     # Wrap non-dual RoPE to tuple to unify custom_forward interface.
     is_dual_rope = isinstance(rotary_pos_emb, (tuple, list))
@@ -76,6 +78,15 @@ def checkpointed_forward(
                 # Use self.layers[index] (not self._get_layer) so this
                 # function works for both TransformerBlock and HybridStack.
                 layer = self.layers[index]
+
+                strict_runtime_validation = None
+                if strict_runtime_validation_frequency is not None:
+                    layer_type = self.layer_type_list[index]
+                    strict_runtime_validation = strict_runtime_validation_frequency == "always" or (
+                        strict_runtime_validation_frequency == "once_per_microbatch"
+                        and layer_type not in strictly_validated_layer_types
+                    )
+                    strictly_validated_layer_types.add(layer_type)
 
                 # Get appropriate inner quantization context
                 if use_inner_quantization_context:
@@ -108,6 +119,12 @@ def checkpointed_forward(
                     padding_mask=padding_mask,
                     input_ids=input_ids,
                 )
+                if strict_runtime_validation is not None and (
+                    isinstance(layer, TransformerLayer)
+                    or getattr(layer, "supports_hybrid_recompute_kwargs", False)
+                    or getattr(layer, "supports_strict_runtime_validation", False)
+                ):
+                    layer_kwargs["strict_runtime_validation"] = strict_runtime_validation
                 with inner_quantization_context:
                     if isinstance(layer, TransformerLayer):
                         hidden_states, context = layer(**layer_kwargs)
