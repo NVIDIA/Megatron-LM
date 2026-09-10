@@ -76,6 +76,25 @@ from .param_layout import FullParamLayout, PerBufferParamLayout, pad_bucket_end,
 logger = getLogger(__name__)
 
 
+def _resolve_gtp_sharded_metadata(
+    model_param: torch.Tensor, model_sharded_state_dict: ShardedStateDict
+) -> ShardedTensor | ShardedTensorFactory | None:
+    """Resolve checkpoint views through exact source identity.
+
+    Fused projections expose an explicit physical-parameter companion. Ordinary
+    native-FP8 entries retain the original parameter on their dequantized data.
+    Reuse the original metadata, including expert offsets and replica IDs; never
+    infer checkpoint keys from debug names or reconstruct an EP-unaware shard.
+    """
+    for entry in nested_values(model_sharded_state_dict):
+        if isinstance(entry, ShardedTensorFactory):
+            entry = entry.for_optimizer()
+        data = getattr(entry, 'data', None)
+        if data is model_param or getattr(data, '_gtp_dequant_src', None) is model_param:
+            return entry
+    return None
+
+
 class Range:
     """
     A range represents a start and end points for indexing a shard
@@ -1793,13 +1812,18 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     param_world_end,
                     bucket_id,
                 ) in buffer.param_index_map.items():
-                    try:
-                        sharded_metadata = param_to_sharded_metadata[model_param]
-                    except KeyError as e:
+                    sharded_metadata = param_to_sharded_metadata.get(model_param)
+                    if sharded_metadata is None:
+                        sharded_metadata = _resolve_gtp_sharded_metadata(
+                            model_param, model_sharded_state_dict
+                        )
+                    if sharded_metadata is None:
+                        name = getattr(model_param, '_debug_name', None) or '<unnamed>'
                         raise ValueError(
-                            f"Model param {model_param} not in model_sharded_state_dict."
+                            f"Model param {name} (shape={tuple(model_param.shape)})"
+                            f" has no source-bound metadata in model_sharded_state_dict."
                             f" Hint: {KEEP_VARS_HINT}"
-                        ) from e
+                        )
                     assert (
                         sharded_metadata.flattened_range is None
                     ), f"Flattened model tensor not supported ({sharded_metadata})"
@@ -2033,13 +2057,18 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
             # Match optimizer parameter with model ShardedTensor (or
             # ShardedTensorFactory).
-            try:
-                sharded_metadata = param_to_sharded_metadata[model_param]
-            except KeyError as e:
+            sharded_metadata = param_to_sharded_metadata.get(model_param)
+            if sharded_metadata is None:
+                sharded_metadata = _resolve_gtp_sharded_metadata(
+                    model_param, model_sharded_state_dict
+                )
+            if sharded_metadata is None:
+                name = getattr(model_param, '_debug_name', None) or '<unnamed>'
                 raise ValueError(
-                    f"Model param {model_param} not in model_sharded_state_dict"
+                    f"Model param {name} (shape={tuple(model_param.shape)})"
+                    f" has no source-bound metadata in model_sharded_state_dict."
                     f" Hint: {KEEP_VARS_HINT}"
-                ) from e
+                )
 
             # Set DP corresponding replica_id coordinate to 0.
             assert (
