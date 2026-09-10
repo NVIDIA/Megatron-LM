@@ -13,6 +13,7 @@ support multimodal checkpoints:
   * :func:`get_model` — build and load either a GPT or LLaVA model
 """
 
+import copy
 import json
 import os
 import re
@@ -372,7 +373,10 @@ def _detect_vlm_from_checkpoint(args, user_passed_attrs=None):
     actually typed on the command line; those values are left alone.
     """
     user_passed_attrs = user_passed_attrs or set()
-    result = load_args_from_checkpoint(args)
+    # The loader mutates its namespace, including spec and tokenizer paths.
+    # Detection must not overwrite the caller's resolved text-model config or
+    # erase explicit VLM CLI values before the precedence rules below run.
+    result = load_args_from_checkpoint(copy.copy(args))
     if not isinstance(result, tuple):
         if 'vision_model_type' not in user_passed_attrs:
             return False
