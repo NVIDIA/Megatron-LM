@@ -639,14 +639,22 @@ class TestLayerWiseOptimizer:
             for sh_base in nested_values(sharded_state_dict)
             if isinstance(sh_base, ShardedTensor)
         ]
-        for replica_id in replica_ids:
-            if isinstance(replica_id, int):
-                assert replica_id == 0, f'Expected replica_id to be 0, got: {replica_id}'
-            else:
-                assert (
-                    len(replica_id) == 3
-                ), f'Expected replica_id format (PP, TP, DP), got: {replica_id}'
-                assert replica_id[2] == 0, f'Expected DP replica_id to be 0, got: {replica_id[2]}'
+        gathered_replica_ids = [None for _ in range(torch.distributed.get_world_size())]
+        torch.distributed.all_gather_object(gathered_replica_ids, replica_ids)
+        for rank, rank_replica_ids in enumerate(gathered_replica_ids):
+            for replica_id in rank_replica_ids:
+                if isinstance(replica_id, int):
+                    assert replica_id == 0, (
+                        f'Expected replica_id to be 0 on rank {rank}, got: {replica_id}'
+                    )
+                else:
+                    assert len(replica_id) == 3, (
+                        'Expected replica_id format (PP, TP, DP) '
+                        f'on rank {rank}, got: {replica_id}'
+                    )
+                    assert replica_id[2] == 0, (
+                        f'Expected DP replica_id to be 0 on rank {rank}, got: {replica_id[2]}'
+                    )
 
     @pytest.mark.parametrize('use_param_layout', [False, True])
     def test_multiple_optimizers(self, use_param_layout):
@@ -700,10 +708,16 @@ class TestLayerWiseOptimizer:
         """Test LayerWiseDistributedOptimizer automatically wraps optimizer with bf16."""
         model, optimizer, pg_collection = self.create_model_and_optimizer()
 
-        # Verify bf16 wrapping happened
+        # The public optimizer is an outer chain when scalar parameters use a separate
+        # DistributedOptimizer. Verify the Muon child inside its LayerWise branch is bf16-wrapped.
+        layerwise_optimizer = next(
+            child
+            for child in optimizer.chained_optimizers
+            if isinstance(child, LayerWiseDistributedOptimizer)
+        )
         assert isinstance(
-            optimizer.chained_optimizers[0], Float16OptimizerWithFloat16Params
-        ), "Optimizer should be wrapped in Float16OptimizerWithFloat16Params"
+            layerwise_optimizer.chained_optimizers[0], Float16OptimizerWithFloat16Params
+        ), "LayerWise child should be wrapped in Float16OptimizerWithFloat16Params"
 
         for param in model.parameters():
             param.grad = torch.randn_like(param)
@@ -837,8 +851,16 @@ class TestLayerWiseOptimizer:
 
         assert params_updated > 0, "At least some parameters should be updated"
 
-        # step() internal call allgather_params. replace reference object with bcast
-        reference_optimizer.allgather_params = reference_optimizer.broadcast_params
+        # step() internally calls the LayerWise all-gather. Replace it with broadcast on
+        # the LayerWise child when the public optimizer also chains a scalar DistOpt.
+        reference_layerwise_optimizer = next(
+            child
+            for child in reference_optimizer.chained_optimizers
+            if isinstance(child, LayerWiseDistributedOptimizer)
+        )
+        reference_layerwise_optimizer.allgather_params = (
+            reference_layerwise_optimizer.broadcast_params
+        )
         reference_optimizer.step()
 
         # Verify updated values match reference optimizer
@@ -993,13 +1015,29 @@ class TestLayerWiseOptimizer:
         )
 
         dp_size = get_pg_size(pg_collection.dp_cp)
+        layerwise_optimizer = next(
+            child
+            for child in optimizer.chained_optimizers
+            if isinstance(child, LayerWiseDistributedOptimizer)
+        )
 
         for bucket_group in model.bucket_groups:
             for bucket in bucket_group.buckets:
-                # layerwise_params_list should be populated by set_bucket_layerwise_params_list
+                if not any(
+                    getattr(param, 'is_managed_by_layer_wise_optimizer', True)
+                    for param in bucket.params_list
+                ):
+                    # Scalar DistOpt buckets use the standard buffer all-gather and do not
+                    # need the LayerWise variable-size metadata checked below.
+                    assert bucket.layerwise_params_list is None
+                    continue
+                if layerwise_optimizer.use_buffer_param_sync:
+                    # Full-layout LayerWise buckets also use the standard buffer all-gather.
+                    assert bucket.layerwise_params_list is None
+                    continue
                 assert (
                     bucket.layerwise_params_list is not None
-                ), "bucket.layerwise_params_list should be populated"
+                ), "LayerWise bucket metadata should be populated for variable-size all-gather"
                 assert (
                     len(bucket.layerwise_params_list) == dp_size
                 ), f"Expected {dp_size} per-rank lists, got {len(bucket.layerwise_params_list)}"
@@ -1128,8 +1166,16 @@ class TestLayerWiseOptimizer:
 
         assert params_updated > 0, "At least some parameters should be updated"
 
-        # step() internally calls allgather_params. Replace reference with broadcast.
-        reference_optimizer.allgather_params = reference_optimizer.broadcast_params
+        # step() internally calls the LayerWise all-gather. Replace it with broadcast on
+        # the LayerWise child when the public optimizer also chains a scalar DistOpt.
+        reference_layerwise_optimizer = next(
+            child
+            for child in reference_optimizer.chained_optimizers
+            if isinstance(child, LayerWiseDistributedOptimizer)
+        )
+        reference_layerwise_optimizer.allgather_params = (
+            reference_layerwise_optimizer.broadcast_params
+        )
         reference_optimizer.step()
 
         # Verify updated values match reference optimizer

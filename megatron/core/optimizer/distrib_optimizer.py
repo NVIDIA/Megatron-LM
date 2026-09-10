@@ -1994,9 +1994,41 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         f'.gbuf_idx_{gbuf_idx}.dtype_{dtype}.bucket_idx_{bucket_idx}'
                     )
 
-                    # The global ckpt tensors must be fully covered.
-                    # We add extra empty padding if necessary
-                    assert bucket_state, 'empty bucket encountered'
+                    # A filtered DistributedOptimizer can own no parameters in this rank's
+                    # bucket shard (for example, scalar params split from a LayerWise optimizer).
+                    # Emit the in-range portion as padding so all ranks collectively cover the
+                    # checkpoint tensor. Ranks beyond its unpadded end contribute no shard.
+                    if not bucket_state:
+                        local_unpadded_end = min(
+                            gbuf_local_numel,
+                            gbuf_world_numel_unpadded - data_parallel_rank * gbuf_local_numel,
+                        )
+                        if local_unpadded_end <= 0:
+                            continue
+                        param_dtype = (
+                            torch.int16
+                            if self.config.store_param_remainders and self.config.bf16
+                            else self.config.main_params_dtype
+                        )
+                        bucket_state.append(
+                            {
+                                **{
+                                    key: torch.empty(
+                                        local_unpadded_end,
+                                        dtype=(
+                                            param_dtype
+                                            if key == "param"
+                                            else self._get_state_key_dtype(key)
+                                        ),
+                                        device=torch.cuda.current_device(),
+                                    )
+                                    for key in ("param",) + self.optimizer_state_keys
+                                },
+                                "gbuf_local_start": 0,
+                                "gbuf_local_end": local_unpadded_end,
+                                "padding": True,
+                            }
+                        )
 
                     # Insert padding between parameter tensors to ensure full coverage as needed.
                     all_pad_tensors = {}

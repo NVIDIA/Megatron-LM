@@ -3567,6 +3567,11 @@ def training_log(
     if args.perform_rl_step:
         timers_to_log.extend(RL_LOGGABLE_TIMER_NAMES)
 
+    # Direct callers may omit the per-step override; use the current global
+    # microbatch count in that case, matching the pre-override behavior.
+    if num_microbatches is None:
+        num_microbatches = get_num_microbatches()
+
     # Calculate batch size.
     batch_size = (
         args.micro_batch_size
