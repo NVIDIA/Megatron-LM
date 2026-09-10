@@ -2,20 +2,25 @@
 
 
 import dataclasses
+from types import SimpleNamespace
 from typing import cast
 
 import pytest
 import torch
 
+import megatron.core.parallel_state as parallel_state
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_submodules
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
 from megatron.core.transformer.moe.moe_utils import (
+    MoEAuxLossAutoScaler,
+    get_tokens_per_expert_and_token_count,
     get_updated_expert_bias,
     router_gating_linear,
     topk_routing_with_score_function,
 )
-from megatron.core.transformer.moe.router import Router
+from megatron.core.transformer.moe.router import Router, TopKRouter
 from megatron.core.transformer.spec_utils import get_submodules
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.initialize import _set_random_seed
@@ -30,6 +35,237 @@ try:
     HAVE_ROUTER_FUSION = _fused_topk_with_score_function is not None
 except Exception:  # pragma: no cover - defensive
     HAVE_ROUTER_FUSION = False
+
+
+def test_dynamic_cp_aux_loss_uses_runtime_cp_then_tp_groups():
+    router = TopKRouter.__new__(TopKRouter)
+    static_tp = object()
+    static_tp_cp = object()
+    static_tp_dp_cp = object()
+    runtime_cp = SimpleNamespace(size=lambda: 2)
+    object.__setattr__(router, "tp_group", static_tp)
+    object.__setattr__(router, "cp_group", None)
+    object.__setattr__(router, "tp_cp_group", static_tp_cp)
+    object.__setattr__(router, "tp_dp_cp_group", static_tp_dp_cp)
+
+    packed = PackedSeqParams(qkv_format="thd", local_cp_size=2, cp_group=runtime_cp)
+    groups = router._get_aux_loss_groups(packed)
+
+    assert groups.loss_reduce_groups == (runtime_cp, static_tp)
+    assert groups.metric_reduce_group is None
+    assert groups.metric_avg_group is static_tp_dp_cp
+    assert groups.metric_needs_dp_avg is False
+
+
+def test_dynamic_cp_size_one_aux_loss_uses_tp_group_only():
+    router = TopKRouter.__new__(TopKRouter)
+    static_tp = object()
+    static_tp_cp = object()
+    static_tp_dp_cp = object()
+    object.__setattr__(router, "tp_group", static_tp)
+    object.__setattr__(router, "cp_group", None)
+    object.__setattr__(router, "tp_cp_group", static_tp_cp)
+    object.__setattr__(router, "tp_dp_cp_group", static_tp_dp_cp)
+
+    runtime_cp = SimpleNamespace(size=lambda: 1)
+    packed = PackedSeqParams(qkv_format="thd", local_cp_size=1, cp_group=runtime_cp)
+    groups = router._get_aux_loss_groups(packed)
+
+    assert groups.loss_reduce_groups == (static_tp,)
+    assert groups.metric_reduce_group is None
+    assert groups.metric_avg_group is static_tp_dp_cp
+    assert groups.metric_needs_dp_avg is False
+
+
+def test_static_aux_loss_keeps_tp_cp_group():
+    router = TopKRouter.__new__(TopKRouter)
+    static_tp_cp = object()
+    object.__setattr__(router, "tp_cp_group", static_tp_cp)
+
+    groups = router._get_aux_loss_groups()
+
+    assert groups.loss_reduce_groups == (static_tp_cp,)
+    assert groups.metric_reduce_group is static_tp_cp
+    assert groups.metric_avg_group is None
+    assert groups.metric_needs_dp_avg is True
+
+
+def test_token_count_reduction_composes_runtime_cp_and_tp(monkeypatch):
+    class _Group:
+        def __init__(self, size):
+            self._size = size
+
+        def size(self):
+            return self._size
+
+    cp_group = _Group(2)
+    tp_group = _Group(3)
+    calls = []
+
+    def _reduce(value, group):
+        calls.append(group)
+        return value * group.size()
+
+    monkeypatch.setattr(
+        "megatron.core.transformer.moe.moe_utils.reduce_from_tensor_model_parallel_region", _reduce
+    )
+    routing_map = torch.tensor([[True, False], [False, True]])
+
+    tokens_per_expert, local_tokens, total_tokens = get_tokens_per_expert_and_token_count(
+        routing_map, reduce_group=cp_group, reduce_groups=(cp_group, tp_group), topk=1
+    )
+
+    assert calls == [cp_group, tp_group]
+    assert torch.equal(tokens_per_expert, torch.tensor([6, 6]))
+    assert local_tokens == 2
+    assert total_tokens == 12
+
+
+def test_seq_aux_loss_restores_batch_size_for_per_token_scaling(monkeypatch):
+    router = TopKRouter.__new__(TopKRouter)
+    object.__setattr__(router, "topk", 2)
+    object.__setattr__(
+        router, "config", SimpleNamespace(num_moe_experts=2, moe_router_fusion=False)
+    )
+    object.__setattr__(router, "get_aux_loss_coeff", lambda _name: 1.0)
+    object.__setattr__(
+        router,
+        "_get_aux_loss_groups",
+        lambda _packed=None: SimpleNamespace(
+            loss_reduce_groups=(object(),),
+            metric_reduce_group=None,
+            metric_avg_group=None,
+            metric_needs_dp_avg=False,
+            metric_pre_reduce_groups=(),
+        ),
+    )
+
+    monkeypatch.setattr(
+        "megatron.core.transformer.moe.router.get_tokens_per_expert_and_token_count",
+        lambda **_kwargs: (torch.tensor([4, 6]), 5, 10),
+    )
+    monkeypatch.setattr(
+        "megatron.core.transformer.moe.router.switch_load_balancing_loss_func",
+        lambda **_kwargs: torch.tensor(4.0),
+    )
+
+    captured = {}
+
+    def _capture_attach(probs, *_args, **kwargs):
+        captured.update(kwargs)
+        return probs
+
+    object.__setattr__(router, "attach_and_log_load_balancing_loss", _capture_attach)
+
+    seq_length = 5
+    batch_size = 2
+    probs = torch.zeros(seq_length * batch_size, 2)
+    routing_map = torch.zeros(seq_length * batch_size, 2, dtype=torch.bool)
+    router._apply_seq_aux_loss(probs, probs, routing_map, seq_length=seq_length, bsz=batch_size)
+
+    assert captured["valid_token_count"] == 10
+    assert "aux_loss_scale_num_tokens" not in captured
+
+
+class TestDynamicCPRouterDistributed:
+    """Numerical and gradient coverage using real runtime process groups."""
+
+    def setup_method(self, method):
+        Utils.initialize_model_parallel(1, 1, dynamic_context_parallel=True)
+        _set_random_seed(seed_=123, data_parallel_random_init=False)
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=12,
+            num_attention_heads=4,
+            num_moe_experts=4,
+            use_cpu_initialization=True,
+            moe_router_load_balancing_type="aux_loss",
+            moe_router_topk=2,
+            moe_aux_loss_coeff=1.0,
+            calculate_per_token_loss=True,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            add_bias_linear=False,
+        )
+        submodules = get_submodules(
+            get_gpt_layer_local_submodules(num_experts=4, moe_grouped_gemm=False).mlp
+        )
+        assert isinstance(submodules, MoESubmodules)
+        self.router = cast(TopKRouter, MoELayer(config, submodules).router).cuda().train()
+
+    def teardown_method(self, method):
+        MoEAuxLossAutoScaler.main_loss_backward_scale = None
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.parametrize("runtime_cp_size", [1, 2, 4])
+    def test_runtime_group_token_counts(self, runtime_cp_size):
+        world_size = torch.distributed.get_world_size()
+        if world_size < runtime_cp_size or world_size % runtime_cp_size != 0:
+            pytest.skip(f"world size {world_size} cannot form CP{runtime_cp_size} groups")
+
+        runtime_cp_group = parallel_state.get_dynamic_data_context_parallel_groups(
+            group_size=runtime_cp_size
+        )
+        runtime_cp_rank = runtime_cp_group.rank()
+        local_valid_tokens = runtime_cp_rank + 1
+        routing_map = torch.zeros((runtime_cp_size, 2), dtype=torch.bool, device="cuda")
+        routing_map[:local_valid_tokens, runtime_cp_rank % 2] = True
+
+        tokens_per_expert, local_tokens, total_tokens = get_tokens_per_expert_and_token_count(
+            routing_map,
+            reduce_group=runtime_cp_group,
+            reduce_groups=(runtime_cp_group, self.router.tp_group),
+            topk=1,
+            with_padding_mask=True,
+        )
+
+        expected_per_expert = [0, 0]
+        for cp_rank in range(runtime_cp_size):
+            expected_per_expert[cp_rank % 2] += cp_rank + 1
+        torch.testing.assert_close(
+            tokens_per_expert,
+            torch.tensor(expected_per_expert, dtype=tokens_per_expert.dtype, device="cuda"),
+        )
+        assert local_tokens.item() == local_valid_tokens
+        assert total_tokens.item() == runtime_cp_size * (runtime_cp_size + 1) // 2
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.parametrize("runtime_cp_size", [1, 2, 4])
+    def test_runtime_group_aux_loss_gradient_scaling(self, runtime_cp_size):
+        world_size = torch.distributed.get_world_size()
+        if world_size < runtime_cp_size or world_size % runtime_cp_size != 0:
+            pytest.skip(f"world size {world_size} cannot form CP{runtime_cp_size} groups")
+
+        runtime_cp_group = parallel_state.get_dynamic_data_context_parallel_groups(
+            group_size=runtime_cp_size
+        )
+        runtime_cp_rank = runtime_cp_group.rank()
+        packed_seq_params = PackedSeqParams(
+            qkv_format="thd", local_cp_size=runtime_cp_size, cp_group=runtime_cp_group
+        )
+        loss_groups = self.router._get_aux_loss_groups(packed_seq_params).loss_reduce_groups
+
+        activation = torch.zeros(1, device="cuda", requires_grad=True)
+        aux_source = torch.tensor(float(runtime_cp_rank + 1), device="cuda", requires_grad=True)
+        MoEAuxLossAutoScaler.set_loss_scale(torch.tensor(1.0, device="cuda"))
+        output = self.router.attach_and_log_load_balancing_loss(
+            activation,
+            aux_loss_coeff=1.0,
+            aux_loss=aux_source.square(),
+            aux_loss_name="dynamic_cp_gradient_test",
+            reduce_group=None,
+            needs_dp_avg=False,
+            valid_token_count=runtime_cp_rank + 1,
+            aux_loss_scale_reduce_groups=loss_groups,
+        )
+        output.sum().mul_(0).backward()
+
+        group_token_count = runtime_cp_size * (runtime_cp_size + 1) // 2
+        expected_grad = 2 * aux_source.detach() * group_token_count
+        torch.testing.assert_close(aux_source.grad, expected_grad)
 
 
 class TestTop2Router:

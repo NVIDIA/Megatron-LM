@@ -17,7 +17,7 @@ from megatron.core.inference.contexts.attention_context.triton.tensor_ops import
     tensor_masked_update,
 )
 from megatron.core.jit import jit_fuser
-from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
 from megatron.core.ssm.gated_delta_net.common import (
     _GDNBase,
     a2a_cp_to_hp,
@@ -27,7 +27,12 @@ from megatron.core.ssm.gated_delta_net.common import (
     l2norm,
 )
 from megatron.core.ssm.ssm_inference import SSMDynamicInferenceMixin
-from megatron.core.utils import deprecate_inference_params, nvtx_range_pop, nvtx_range_push
+from megatron.core.utils import (
+    deprecate_inference_params,
+    get_pg_size,
+    nvtx_range_pop,
+    nvtx_range_push,
+)
 
 try:
     from fla.modules.convolution import causal_conv1d_update
@@ -56,12 +61,7 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
             self.num_value_heads // self.tp_size,  # beta
             self.num_value_heads // self.tp_size,  # alpha
         )
-        self.feat_dim_split = (
-            (self.qk_dim_local_tp * 2 + self.v_dim_local_tp) // self.cp_size,  # qkv
-            self.v_dim_local_tp // self.cp_size,  # gate (z)
-            self.num_value_heads // self.tp_size // self.cp_size,  # beta
-            self.num_value_heads // self.tp_size // self.cp_size,  # alpha
-        )
+        self.feat_dim_split = self._get_feat_dim_split(self.cp_size)
 
         self.dt_bias_dim = self.num_v_heads_local_tp
         self.a_log_dim = self.num_v_heads_local_tp
@@ -71,6 +71,15 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
         else:
             self.gated_delta_rule = chunk_gated_delta_rule
         self.chunk_size = 64
+
+    def _get_feat_dim_split(self, cp_size: int) -> tuple[int, int, int, int]:
+        """Return projection split sizes for the runtime head-parallel CP size."""
+        return (
+            (self.qk_dim_local_tp * 2 + self.v_dim_local_tp) // cp_size,
+            self.v_dim_local_tp // cp_size,
+            self.num_value_heads // self.tp_size // cp_size,
+            self.num_value_heads // self.tp_size // cp_size,
+        )
 
     @jit_fuser
     def _compute_gates(
@@ -108,8 +117,11 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
+        cp_group = resolve_cp_group(self.pg_collection.cp, packed_seq_params)
+        cp_size = get_pg_size(cp_group)
+
         seq_len, batch, _ = hidden_states.shape
-        seq_len = seq_len * self.sp_size * self.cp_size
+        seq_len = seq_len * self.sp_size * cp_size
 
         if inference_context is not None:
             if inference_context.is_dynamic_batching():
@@ -120,7 +132,7 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
                     not self.config.batch_invariant_mode
                 ), "GDN dynamic inference does not support batch-invariant mode."
                 assert (
-                    self.cp_size == 1
+                    cp_size == 1
                 ), "Context parallelism is not supported for GDN dynamic inference."
                 assert (
                     inference_context.num_speculative_tokens == 0
@@ -145,14 +157,14 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
                 packed_seq_params.cu_seqlens_q,
                 seq_len,
                 "cu_seqlens_q",
-                cp_size=self.cp_size,
+                cp_size=cp_size,
             )
             cu_seqlens_kv = self._resolve_cu_seqlens(
                 packed_seq_params.cu_seqlens_kv_padded,
                 packed_seq_params.cu_seqlens_kv,
                 seq_len,
                 "cu_seqlens_kv",
-                cp_size=self.cp_size,
+                cp_size=cp_size,
             )
             assert torch.equal(cu_seqlens_q, cu_seqlens_kv), (
                 "Currently only support cu_seqlens_q equals to cu_seqlens_kv, "
@@ -175,8 +187,8 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
         qkvzba, thd_cp_a2a_inv = a2a_cp_to_hp(
             qkvzba,
             self.in_proj_split_sections,
-            self.cp_size,
-            self.pg_collection.cp,
+            cp_size,
+            cp_group,
             cu_seqlens_q,
             seq_len,
             packed_seq_params,
@@ -188,7 +200,7 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
 
         # Split the tensor into q, k, v, gate (z), and the variant-specific gate features
         # (beta, alpha for GDN; f, b, w for GDN2)
-        qkv, gate, beta, alpha = self._split_projection(qkvzba, batch, seq_len)
+        qkv, gate, beta, alpha = self._split_projection(qkvzba, batch, seq_len, cp_size)
 
         # Convolution on qkv
         nvtx_range_push(suffix="conv1d")
@@ -199,16 +211,13 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
             self.v_dim_local_tp,
         ]
         conv1d_weight = get_parameter_local_cp(
-            self.conv1d.weight,
-            dim=0,
-            cp_group=self.pg_collection.cp,
-            split_sections=qkv_channels_split_sections,
+            self.conv1d.weight, dim=0, cp_group=cp_group, split_sections=qkv_channels_split_sections
         )
         conv1d_bias = (
             get_parameter_local_cp(
                 self.conv1d.bias,
                 dim=0,
-                cp_group=self.pg_collection.cp,
+                cp_group=cp_group,
                 split_sections=qkv_channels_split_sections,
             )
             if self.conv_bias
@@ -223,7 +232,7 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
                 stride=self.conv1d.stride,
                 padding=self.conv1d.padding,
                 dilation=self.conv1d.dilation,
-                groups=self.conv_dim_local_tp // self.cp_size,
+                groups=self.conv_dim_local_tp // cp_size,
             )
             qkv = self.act_fn(conv_out[..., :seq_len])
             qkv = qkv.transpose(1, 2)  # b, d, s -> b, s, d
@@ -240,15 +249,13 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
             )
         nvtx_range_pop(suffix="conv1d")
 
-        A_log_local_cp = get_parameter_local_cp(self.A_log, dim=0, cp_group=self.pg_collection.cp)
-        dt_bias_local_cp = get_parameter_local_cp(
-            self.dt_bias, dim=0, cp_group=self.pg_collection.cp
-        )
+        A_log_local_cp = get_parameter_local_cp(self.A_log, dim=0, cp_group=cp_group)
+        dt_bias_local_cp = get_parameter_local_cp(self.dt_bias, dim=0, cp_group=cp_group)
 
         # Prepare all kernel inputs (split, reshape, L2 norm, gates, contiguous)
         nvtx_range_push(suffix="prepare_input_for_gated_delta_rule")
         kernel_inputs = self._prepare_input_for_gated_delta_rule(
-            qkv, gate, A_log_local_cp, dt_bias_local_cp, batch, seq_len, beta, alpha
+            qkv, gate, A_log_local_cp, dt_bias_local_cp, batch, seq_len, cp_size, beta, alpha
         )
         gate = kernel_inputs.pop("gate")
         nvtx_range_pop(suffix="prepare_input_for_gated_delta_rule")
@@ -270,12 +277,21 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
                 thd_cp_a2a_inv=thd_cp_a2a_inv,
                 batch=batch,
                 seq_len=seq_len,
+                cp_size=cp_size,
+                cp_group=cp_group,
                 packed_seq_params=packed_seq_params,
             )
             norm_out = self.norm_out_checkpoint.checkpoint(norm_func, core_attn_out, gate)
         else:
             norm_out = self._gated_norm_and_a2a(
-                core_attn_out, gate, thd_cp_a2a_inv, batch, seq_len, packed_seq_params
+                core_attn_out,
+                gate,
+                thd_cp_a2a_inv,
+                batch,
+                seq_len,
+                cp_size,
+                cp_group,
+                packed_seq_params,
             )
 
         # Output projection
@@ -289,10 +305,10 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
         return out, out_bias
 
     def _split_projection(
-        self, projected: torch.Tensor, batch: int, seq_len: int
+        self, projected: torch.Tensor, batch: int, seq_len: int, cp_size: int
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Split the fused projection into qkv, output gate, beta, and alpha."""
-        qkv, gate, beta, alpha = torch.split(projected, self.feat_dim_split, dim=-1)
+        qkv, gate, beta, alpha = torch.split(projected, self._get_feat_dim_split(cp_size), dim=-1)
         gate = gate.reshape(batch, seq_len, -1, self.value_head_dim)
         return qkv, gate, beta, alpha
 
@@ -336,7 +352,7 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
         ), "GDN speculative decoding state capture is not supported."
         assert causal_conv1d_update is not None and fused_recurrent_gated_delta_rule is not None
 
-        qkv, gate, beta, alpha = self._split_projection(projected, batch, seq_len)
+        qkv, gate, beta, alpha = self._split_projection(projected, batch, seq_len, cp_size=1)
         read_indices = batch_indices.clamp(min=0)
 
         active_conv_state = conv_state[read_indices].contiguous()
@@ -383,7 +399,7 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
         token_count = projected.shape[0]
 
         projected = projected.transpose(0, 1).contiguous()
-        qkv, gate, beta, alpha = self._split_projection(projected, 1, token_count)
+        qkv, gate, beta, alpha = self._split_projection(projected, 1, token_count, cp_size=1)
         read_indices = batch_indices.clamp(min=0)
 
         qkv_dtype = qkv.dtype

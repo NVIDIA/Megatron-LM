@@ -26,6 +26,7 @@ from megatron.core.models.common.embeddings import (
     _yarn_get_mscale,
     apply_rotary_pos_emb,
 )
+from megatron.core.packed_seq_params import resolve_cp_group
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear
 from megatron.core.tensor_parallel.mappings import (
@@ -405,13 +406,9 @@ class AbsorbedMLASelfAttention(Attention):
         assert (
             hidden_states.ndim == 3
         ), f"hidden_states should be 3D, [s, b, h], got {hidden_states.ndim}D"
-        if packed_seq_params is not None:
-            assert (
-                packed_seq_params.local_cp_size is None
-            ), "dynamic context parallel is not supported with MLA yet and is planned for future. \
-            Please disable dynamic context parallel."
-
         inference_context = deprecate_inference_params(inference_context, inference_params)
+        runtime_cp_group = resolve_cp_group(self.pg_collection.cp, packed_seq_params)
+        assert runtime_cp_group is not None, "Absorbed MLA requires a context-parallel group"
 
         # =========================================
         # Prepare RoPE and seqlen related params
@@ -583,8 +580,8 @@ class AbsorbedMLASelfAttention(Attention):
                 # kv_compressed: [num_tokens, 1, (kv_lora_rank + qk_pos_emb_head_dim)]
                 kv_compressed = torch.cat([kv_compressed, k_pos_emb], dim=-1)
 
-                cp_rank = self.pg_collection.cp.rank()
-                cp_size = self.pg_collection.cp.size()
+                cp_rank = runtime_cp_group.rank()
+                cp_size = runtime_cp_group.size()
                 q_absorbed = fused_apply_mla_rope_for_q(
                     q_absorbed,
                     rotary_pos_cos,
@@ -612,7 +609,7 @@ class AbsorbedMLASelfAttention(Attention):
                     sequence_start = inference_context.sequence_len_offset
                     sequence_end = sequence_start + q_len
                     rotary_pos_emb = rotary_pos_emb[sequence_start:sequence_end]
-                elif packed_seq_params is None or self.config.context_parallel_size == 1:
+                elif packed_seq_params is None or runtime_cp_group.size() == 1:
                     # Shorten rotary_pos_emb to the sequence length when inference_params
                     # is not provided. This makes sure we can run forward directly with
                     # any sequence length. During training, the sequence length is always
@@ -644,7 +641,7 @@ class AbsorbedMLASelfAttention(Attention):
                     config=self.config,
                     cu_seqlens=cu_seqlens_q,
                     mscale=mscale,
-                    cp_group=self.pg_collection.cp,
+                    cp_group=runtime_cp_group,
                     mla_rotary_interleaved=True,
                     max_seqlen=rope_freqs_max_seqlen,
                 )
@@ -655,7 +652,7 @@ class AbsorbedMLASelfAttention(Attention):
                     config=self.config,
                     cu_seqlens=cu_seqlens_kv,
                     mscale=mscale,
-                    cp_group=self.pg_collection.cp,
+                    cp_group=runtime_cp_group,
                     mla_rotary_interleaved=True,
                     max_seqlen=rope_freqs_max_seqlen,
                 )
