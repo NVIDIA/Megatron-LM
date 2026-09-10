@@ -65,6 +65,9 @@ index-only payload.
 Coverage includes eligible multi-sequence CP2/CP4 versus CP1 output, indexer
 loss and full gradients; actual selection precision and delayed amax across
 recompute; and isolated dynamic-pack graph replay for BF16 and MXFP8.
+Batch-entrypoint tests exercise the shared metadata helper with normalized
+configuration and verify explicit CP-group propagation, attention-eager graph
+scopes, legacy Hybrid THD construction, and unpacked SBHD behavior.
 
 The E2E comparison uses the standard Hybrid entrypoint with mixed-length THD
 packs, MXFP8, and TE attention partial graphs. Its two arms differ only in
