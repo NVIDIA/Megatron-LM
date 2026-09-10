@@ -644,17 +644,17 @@ class TestLayerWiseOptimizer:
         for rank, rank_replica_ids in enumerate(gathered_replica_ids):
             for replica_id in rank_replica_ids:
                 if isinstance(replica_id, int):
-                    assert replica_id == 0, (
-                        f'Expected replica_id to be 0 on rank {rank}, got: {replica_id}'
-                    )
+                    assert (
+                        replica_id == 0
+                    ), f'Expected replica_id to be 0 on rank {rank}, got: {replica_id}'
                 else:
                     assert len(replica_id) == 3, (
                         'Expected replica_id format (PP, TP, DP) '
                         f'on rank {rank}, got: {replica_id}'
                     )
-                    assert replica_id[2] == 0, (
-                        f'Expected DP replica_id to be 0 on rank {rank}, got: {replica_id[2]}'
-                    )
+                    assert (
+                        replica_id[2] == 0
+                    ), f'Expected DP replica_id to be 0 on rank {rank}, got: {replica_id[2]}'
 
     @pytest.mark.parametrize('use_param_layout', [False, True])
     def test_multiple_optimizers(self, use_param_layout):
