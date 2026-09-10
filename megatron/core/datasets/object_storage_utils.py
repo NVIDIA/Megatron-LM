@@ -141,17 +141,19 @@ def _s3_object_exists(client: S3Client, path: str) -> bool:
         path (str): The S3 path
 
     Raises:
-        botocore.exceptions.ClientError: The error code is 404
+        botocore.exceptions.ClientError: If the metadata request fails for a reason other than
+            the object not existing.
 
     Returns:
         bool: True if the object exists in S3, False otherwise
     """
     parsed_s3_path = parse_s3_path(path)
     try:
-        _ = client.head_object(bucket=parsed_s3_path[0], key=parsed_s3_path[1])
+        _ = client.head_object(Bucket=parsed_s3_path[0], Key=parsed_s3_path[1])
     except exceptions.ClientError as e:
-        if e.response["Error"]["Code"] != "404":
-            raise e
+        if e.response["Error"]["Code"] == "404":
+            return False
+        raise
     return True
 
 
