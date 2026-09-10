@@ -1129,8 +1129,8 @@ def get_megatron_optimizer(
                 # group ends in an empty tensor:
                 # https://github.com/NVIDIA/TransformerEngine/issues/3207.
                 # Empty local shards have no optimizer state or data to update, so omit
-                # them (this MFSDP v2 build is used with TE 2.17.1 in nemo:26.08 and
-                # h100-torch2603, where the empty-param behavior is NOT yet fixed).
+                # them (this MFSDP v2 build is used with TE 2.17.1 in nemo:26.08
+                # where the empty-param behavior is NOT yet fixed).
                 for param_group in param_groups:
                     param_group['params'] = [
                         parameter

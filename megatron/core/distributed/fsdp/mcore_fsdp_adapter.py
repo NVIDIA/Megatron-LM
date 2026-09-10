@@ -823,10 +823,11 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
 
     def finish_grad_sync(self, *unused, **unused_kwargs) -> None:
         """MFSDP v2 gradient reduction is complete when backward returns."""
-        # Under the custom schedule like 1F1B, post_backward_final_callback is not invoked.
-        # Synchronize gradients here to ensure it is safe to call optimizer.step().
-        context = self.module.context
-        context.current_stream().wait_stream(context.reduce_scatter_stream)
+        if self.config.overlap_moe_expert_parallel_comm:
+            # Under the custom schedule like 1F1B, post_backward_final_callback is not invoked.
+            # Synchronize gradients here to ensure it is safe to call optimizer.step().
+            context = self.module.context
+            context.current_stream().wait_stream(context.reduce_scatter_stream)
 
     def synchronize_param_gather(self, *unused, **unused_kwargs) -> None:
         """MFSDP v2 parameter gathers complete inside module hooks."""
