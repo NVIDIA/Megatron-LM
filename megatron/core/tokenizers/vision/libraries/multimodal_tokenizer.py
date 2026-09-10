@@ -241,7 +241,6 @@ class MegatronMultimodalTokenizer:
         conversation: List[Dict],
         return_target: bool,
         add_generation_prompt: bool,
-        tokenize: bool = True,
     ):
         """Convert a conversation to tokens, or to a rendered string.
 
@@ -255,9 +254,10 @@ class MegatronMultimodalTokenizer:
             return_target (bool): Return target tokens with system and assistant masked.
                 Only supported when tokenize=True, since masking relies on token indices.
             add_generation_prompt (bool): Add assistant prefix to the end.
-            tokenize (bool): If False, return the rendered conversation string(s) instead
-                of token ids. Mirrors tokenizer.apply_chat_template's tokenize flag.
         """
+        tokenize = True
+        if self.use_gigatoken:
+            tokenize = False
         if return_target and not tokenize:
             raise ValueError(
                 "return_target=True requires tokenize=True: target masking is computed "
@@ -297,6 +297,8 @@ class MegatronMultimodalTokenizer:
 
         if tokenize:
             tokens = tokens[0]
+        else:
+            tokens = self.tokenize(tokens)
 
         if not return_target:
             return tokens

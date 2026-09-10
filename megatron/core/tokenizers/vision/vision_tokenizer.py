@@ -73,7 +73,6 @@ class MegatronTokenizerVision(MegatronTokenizerBase):
         conversation: List[Dict],
         return_target: bool,
         add_generation_prompt: bool,
-        tokenize: Optional[bool] = True
     ):
         """Convert a conversation to tokens.
 
@@ -86,15 +85,12 @@ class MegatronTokenizerVision(MegatronTokenizerBase):
                 ]
             return_target (bool): Return target tokens with system and assistant masked.
             add_generation_prompt (bool): Add assistant prefix to the end.
-            tokenize (bool): If False, return the rendered conversation string(s) instead
-                of token ids. Mirrors tokenizer.apply_chat_template's tokenize flag.
         """
 
         return self._tokenizer.tokenize_conversation(
             conversation=conversation,
             return_target=return_target,
             add_generation_prompt=add_generation_prompt,
-            tokenize=tokenize,
         )
 
     def add_special_tokens(self, special_tokens: Union[list, dict]) -> None:
