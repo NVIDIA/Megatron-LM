@@ -230,6 +230,7 @@ class FsdpParameterGroup:
                 tensor_shapes=self.main_weight.layout.tensor_shapes,
                 dtype=grad_dtype,
                 device=self.main_weight.device,
+                subgroup_size=self.subgroup_size,
             )
             self.pre_optimizer_main_grad = self.main_grad.view(main_weight_placements)
             assert self.main_grad.layout == self.main_weight.layout, (
@@ -583,6 +584,7 @@ class Fp8ParameterGroup(FsdpParameterGroup):
             tensor_shapes=tensor_shapes,
             dtype=torch.uint8,
             device=device,
+            subgroup_size=self.subgroup_size,
         )
         self._colwise_buffer = DBuffer(
             mesh=self.mesh,
@@ -590,6 +592,7 @@ class Fp8ParameterGroup(FsdpParameterGroup):
             tensor_shapes=tensor_shapes,
             dtype=torch.uint8,
             device=device,
+            subgroup_size=self.subgroup_size,
         )
         self._unsharded_rowwise = DBuffer(
             mesh=self.mesh,
@@ -597,6 +600,7 @@ class Fp8ParameterGroup(FsdpParameterGroup):
             tensor_shapes=tensor_shapes,
             dtype=torch.uint8,
             device=device,
+            subgroup_size=self.subgroup_size,
         )
         self._unsharded_colwise = DBuffer(
             mesh=self.mesh,
@@ -604,6 +608,7 @@ class Fp8ParameterGroup(FsdpParameterGroup):
             tensor_shapes=tensor_shapes,
             dtype=torch.uint8,
             device=device,
+            subgroup_size=self.subgroup_size,
         )
         for index, shape in enumerate(tensor_shapes):
             if (
