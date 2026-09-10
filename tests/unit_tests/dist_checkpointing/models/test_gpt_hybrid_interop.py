@@ -20,7 +20,7 @@ import pytest
 import torch
 
 from megatron.core import parallel_state as ps
-from megatron.core.dist_checkpointing import load, load_plain_tensors, save
+from megatron.core.dist_checkpointing import load, load_plain_tensors, load_tensors_metadata, save
 from megatron.core.dist_checkpointing.dict_utils import diff
 from megatron.core.dist_checkpointing.gpt_checkpoint_interop import (
     gpt_compatible_layer_maps,
@@ -39,6 +39,8 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_spec,
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
+from megatron.core.models.hybrid.hybrid_block import HybridStack
+from megatron.core.models.hybrid.hybrid_layer_allocation import get_hybrid_total_layer_count
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.num_microbatches_calculator import (
@@ -81,6 +83,20 @@ class TestGPTCompatLayerMaps:
         assert maps.mlp_to_gpt == {2: 0, 3: 1}
         assert maps.fresh_init == frozenset()
 
+    def test_groups_preserve_physical_pairing_and_logical_membership(self):
+        maps = gpt_compatible_layer_maps('M[*-]|*[-*]-')
+        assert maps.attention_to_gpt == {1: 0, 3: 1, 5: 2}
+        assert maps.mlp_to_gpt == {2: 0, 4: 1, 6: 2}
+        assert maps.fresh_init == frozenset({0})
+        assert maps.logical_to_physical == (0, (1, 2), 3, (4, 5), 6)
+        assert maps.num_gpt_layers == 3
+
+    def test_grouped_moe_and_singleton_groups(self):
+        maps = gpt_compatible_layer_maps('[M][*E]|[M*E]')
+        assert maps.logical_to_physical == ((0,), (1, 2), (3, 4, 5))
+        assert maps.attention_to_gpt == {1: 0, 4: 1}
+        assert maps.mlp_to_gpt == {2: 0, 5: 1}
+
     def test_rejects_empty_pattern(self):
         with pytest.raises(ValueError, match='empty'):
             gpt_compatible_layer_maps(None)
@@ -113,6 +129,106 @@ def _sharded_tensor(key):
 
 
 class TestRetargetShardedStateDict:
+    @pytest.mark.parametrize('heterogeneous', [False, True])
+    def test_grouped_storage_keys_resolve_each_component_and_its_norm(self, heterogeneous):
+        maps = gpt_compatible_layer_maps('M[*-]*[-*]-')
+        checkpoint_keys = (
+            ['decoder.layers.0.self_attention.linear_qkv.weight'] if heterogeneous else None
+        )
+        cases = {
+            'decoder.layers.1.self_attention.linear_qkv.weight': 0,
+            'decoder.layers.1.mlp.linear_fc1.weight': 0,
+            'decoder.layers.2.self_attention.linear_proj.weight': 1,
+            'decoder.layers.3.input_layernorm.weight': 2,
+            'decoder.layers.3.pre_mlp_layernorm.weight': 1,
+            'decoder.layers.4.mlp.linear_fc2.weight': 2,
+            'optimizer.state.exp_avg.decoder.layers.3.mlp.linear_fc1.weight': 1,
+            'optimizer.state.fp32_param.decoder.layers.3.self_attention.linear_qkv.weight': 2,
+        }
+        sharded_sd = {key: _sharded_tensor(key) for key in cases}
+        sharded_sd['decoder.final_norm.weight'] = _sharded_tensor('decoder.final_layernorm.weight')
+        retarget_sharded_state_dict_to_gpt_checkpoint(sharded_sd, maps, checkpoint_keys)
+        # Local module/state-dict keys stay intact; only storage metadata changes.
+        assert set(sharded_sd) == set(cases) | {'decoder.final_norm.weight'}
+        for source_key, gpt_idx in cases.items():
+            prefix, layer_key = source_key.split('decoder.layers.')
+            suffix = layer_key.split('.', 1)[1]
+            entry = sharded_sd[source_key]
+            assert entry.key == f'{prefix}decoder.layers.' + (
+                f'{gpt_idx}.{suffix}' if heterogeneous else suffix
+            )
+            assert entry.prepend_axis_num == (0 if heterogeneous else 1)
+            assert entry.global_shape == ((4,) if heterogeneous else (3, 4))
+            assert entry.global_offset == ((0,) if heterogeneous else (gpt_idx, 0))
+        assert sharded_sd['decoder.final_norm.weight'].key == 'decoder.final_layernorm.weight'
+
+    @pytest.mark.parametrize('heterogeneous', [False, True])
+    def test_grouped_factories_extra_state_and_fresh_optimizer_state(self, heterogeneous):
+        maps = gpt_compatible_layer_maps('[M*E][M*E]')
+        checkpoint_keys = ['decoder.layers.0.mlp.router.weight'] if heterogeneous else None
+
+        def build_fn(key, data, replica_id, flattened_range):
+            return {'chunk': ShardedTensor.from_rank_offsets(key, data, replica_id=replica_id)}
+
+        factory = ShardedTensorFactory(
+            'optimizer.state.exp_avg.decoder.layers.1.mlp.experts.linear_fc1.weight',
+            torch.ones(4),
+            build_fn,
+            lambda sd: sd['chunk'],
+        )
+        extra_state = ShardedObject(
+            'decoder.layers.1.mlp.experts.linear_fc1._extra_state', None, (3,), (1,)
+        )
+        fresh_tensor = torch.ones(4)
+        sharded_sd = {
+            'factory': factory,
+            'extra_state': extra_state,
+            'fresh': ShardedTensor.from_rank_offsets(
+                'optimizer.state.exp_avg.decoder.layers.1.mixer.in_proj.weight', fresh_tensor
+            ),
+            'fresh_norm': _sharded_tensor('decoder.layers.1.norm.weight'),
+        }
+        retarget_sharded_state_dict_to_gpt_checkpoint(sharded_sd, maps, checkpoint_keys)
+        assert isinstance(sharded_sd['fresh'], LocalNonpersistentObject)
+        assert sharded_sd['fresh'].unwrap() is fresh_tensor
+        assert isinstance(sharded_sd['fresh_norm'], LocalNonpersistentObject)
+        built = factory.build()['chunk']
+        layer_prefix = 'decoder.layers.1.' if heterogeneous else 'decoder.layers.'
+        assert built.key == f'optimizer.state.exp_avg.{layer_prefix}mlp.experts.linear_fc1.weight'
+        assert built.prepend_axis_num == (0 if heterogeneous else 1)
+        assert built.global_offset == ((0,) if heterogeneous else (1, 0))
+        assert extra_state.global_shape == ((3,) if heterogeneous else (2, 3))
+        assert extra_state.global_offset == ((1,) if heterogeneous else (1, 1))
+
+    def test_fsdp_grouped_module_paths_and_optimizer_names(self):
+        maps = gpt_compatible_layer_maps('[M*-][M*-]')
+        tensor = torch.ones(4)
+        source = {
+            'model': {
+                'decoder.layers.1.layers.1.self_attention.linear_qkv.weight': tensor,
+                'decoder.layers.1.layers.2.pre_mlp_layernorm.weight': tensor,
+                'decoder.layers.1.layers.0.mixer.in_proj.weight': tensor,
+            },
+            'optimizer': {
+                'state': {
+                    'module.module.decoder.layers.1.layers.2.mlp.linear_fc1.weight': {
+                        'exp_avg': tensor
+                    },
+                    'module.module.decoder.layers.1.layers.0.mixer.in_proj.weight': {
+                        'exp_avg': tensor
+                    },
+                }
+            },
+        }
+        translated = retarget_fsdp_state_dict_to_gpt_checkpoint(source, maps)
+        assert set(translated['model']) == {
+            'decoder.layers.1.self_attention.linear_qkv.weight',
+            'decoder.layers.1.pre_mlp_layernorm.weight',
+        }
+        assert translated['optimizer']['state'] == {
+            'module.module.decoder.layers.1.mlp.linear_fc1.weight': {'exp_avg': tensor}
+        }
+
     def test_keys_point_at_gpt_layout_and_fresh_layers_stay_local(self):
         # GPT checkpoints use the homogeneous layer format: numberless keys
         # with the layer index as the leading sharding axis.
@@ -360,7 +476,7 @@ def initialize_hybrid_model(seed, pattern, parallel, moe, glu=False):
     torch.manual_seed(seed)
     model_parallel_cuda_manual_seed(seed)
 
-    num_layers = len(pattern.replace('|', ''))
+    num_layers = get_hybrid_total_layer_count(pattern)
     config = TransformerConfig(num_layers=num_layers, **_base_config_kwargs(parallel, moe, glu))
     return HybridModel(
         config=config,
@@ -378,7 +494,7 @@ def initialize_hybrid_model(seed, pattern, parallel, moe, glu=False):
 def _snapshot_fresh_layers(hybrid_model, layer_maps):
     """Clone all tensors of layers that must keep their fresh initialization."""
     snapshot = {}
-    for layer in hybrid_model.decoder.layers:
+    for layer in _physical_layers(hybrid_model.decoder):
         global_idx = layer.layer_number - 1
         if global_idx in layer_maps.fresh_init:
             snapshot[global_idx] = {
@@ -390,7 +506,7 @@ def _snapshot_fresh_layers(hybrid_model, layer_maps):
 
 
 def _assert_fresh_layers_untouched(hybrid_model, layer_maps, snapshot):
-    for layer in hybrid_model.decoder.layers:
+    for layer in _physical_layers(hybrid_model.decoder):
         global_idx = layer.layer_number - 1
         if global_idx not in layer_maps.fresh_init:
             continue
@@ -400,6 +516,14 @@ def _assert_fresh_layers_untouched(hybrid_model, layer_maps, snapshot):
             assert torch.equal(
                 tensor, snapshot[global_idx][name]
             ), f'fresh layer {global_idx} tensor {name} was overwritten by the GPT load'
+
+
+def _physical_layers(stack):
+    for layer in stack.layers:
+        if isinstance(layer, HybridStack):
+            yield from _physical_layers(layer)
+        else:
+            yield layer
 
 
 def _drop_extra_state(plain_state_dict):
@@ -435,7 +559,14 @@ class TestGPTToHybridLoad:
         ],
     )
     def test_gpt_checkpoint_loads_into_hybrid_across_parallel_layouts(
-        self, tmp_path_dist_ckpt, src_parallel, dest_parallel, pattern, moe, glu
+        self,
+        tmp_path_dist_ckpt,
+        src_parallel,
+        dest_parallel,
+        pattern,
+        moe,
+        glu,
+        non_homogeneous_layers=False,
     ):
         layer_maps = gpt_compatible_layer_maps(pattern)
         src_tp, src_pp, src_ep, src_etp = src_parallel
@@ -450,7 +581,13 @@ class TestGPTToHybridLoad:
         ):
             # Save a GPT checkpoint under the source parallel layout.
             gpt_model = initialize_gpt_model(1, layer_maps.num_gpt_layers, src_parallel, moe, glu)
-            save(gpt_model.sharded_state_dict(), ckpt_dir_gpt)
+            save(
+                gpt_model.sharded_state_dict(
+                    metadata={'non_homogeneous_layers': non_homogeneous_layers}
+                ),
+                ckpt_dir_gpt,
+            )
+            checkpoint_keys = load_tensors_metadata(ckpt_dir_gpt)
             Utils.destroy_model_parallel()
 
             # Load it into a hybrid model under the destination layout by
@@ -466,7 +603,7 @@ class TestGPTToHybridLoad:
             fresh_snapshot = _snapshot_fresh_layers(hybrid_model, layer_maps)
 
             sharded_sd = hybrid_model.sharded_state_dict()
-            retarget_sharded_state_dict_to_gpt_checkpoint(sharded_sd, layer_maps)
+            retarget_sharded_state_dict_to_gpt_checkpoint(sharded_sd, layer_maps, checkpoint_keys)
             state_dict, missing_keys, unexpected_keys = load(
                 sharded_sd, ckpt_dir_gpt, strict=StrictHandling.RETURN_ALL
             )
@@ -480,7 +617,9 @@ class TestGPTToHybridLoad:
             # Save the hybrid model back under GPT keys (fresh layers stay
             # local and are skipped) and compare both checkpoints tensorwise.
             sharded_sd_back = hybrid_model.sharded_state_dict()
-            retarget_sharded_state_dict_to_gpt_checkpoint(sharded_sd_back, layer_maps)
+            retarget_sharded_state_dict_to_gpt_checkpoint(
+                sharded_sd_back, layer_maps, checkpoint_keys
+            )
             save(sharded_sd_back, ckpt_dir_back)
             Utils.destroy_model_parallel()
 
@@ -491,6 +630,29 @@ class TestGPTToHybridLoad:
             assert not only_back, f'roundtrip produced keys missing from the GPT ckpt: {only_back}'
             assert not only_gpt, f'GPT ckpt keys not covered by the hybrid load: {only_gpt}'
             assert not mismatch, f'weights changed by the GPT->hybrid->GPT roundtrip: {mismatch}'
+
+    @pytest.mark.internal
+    @pytest.mark.parametrize('non_homogeneous_layers', [False, True])
+    @pytest.mark.parametrize(
+        ('pattern', 'dest_parallel', 'moe', 'glu'),
+        [
+            ('[*-][*-]', (1, 1, 1, 1), False, False),
+            ('M[*-]|M[*-]', (1, 2, 1, 1), False, True),
+            ('[M*E][M*E]', (1, 1, 2, 1), True, False),
+        ],
+    )
+    def test_grouped_gpt_checkpoint_roundtrip(
+        self, tmp_path_dist_ckpt, non_homogeneous_layers, pattern, dest_parallel, moe, glu
+    ):
+        self.test_gpt_checkpoint_loads_into_hybrid_across_parallel_layouts(
+            tmp_path_dist_ckpt,
+            (1, 1, 1, 1),
+            dest_parallel,
+            pattern,
+            moe,
+            glu,
+            non_homogeneous_layers=non_homogeneous_layers,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -554,7 +716,7 @@ def hybrid_provider_for_opt(
 ):
     torch.manual_seed(seed)
     model_parallel_cuda_manual_seed(seed)
-    num_layers = len(pattern.replace('|', ''))
+    num_layers = get_hybrid_total_layer_count(pattern)
     return HybridModel(
         config=_opt_provider_config(num_layers, moe=moe, **kw),
         hybrid_stack_spec=hybrid_stack_spec,
@@ -641,6 +803,7 @@ def _run_gpt_to_hybrid_optimizer_load(
     *,
     finetune=True,
     use_megatron_fsdp=False,
+    non_homogeneous_layers=False,
 ):
     layer_maps = gpt_compatible_layer_maps(pattern)
     num_gpt_layers = layer_maps.num_gpt_layers
@@ -672,6 +835,9 @@ def _run_gpt_to_hybrid_optimizer_load(
                 initialize_fn=partial(gpt_provider_for_opt, num_gpt_layers=num_gpt_layers, moe=moe),
             )
             _seed_optimizer_moments(gpt_optimizer, seed=3)
+            _unwrap_interop_model(gpt_model[0]).config.hetereogenous_dist_checkpoint = (
+                non_homogeneous_layers
+            )
             _configure_checkpoint_args(mock_args, ckpt_dir, src_parallel, moe, use_megatron_fsdp)
             mock_args.num_layers = num_gpt_layers
             save_checkpoint(10, gpt_model, gpt_optimizer, None, 0)
@@ -705,7 +871,7 @@ def _run_gpt_to_hybrid_optimizer_load(
             _configure_checkpoint_args(mock_args, ckpt_dir, dest_parallel, moe, use_megatron_fsdp)
             mock_args.finetune = finetune
             mock_args.hybrid_layer_pattern = pattern
-            mock_args.num_layers = len(pattern.replace('|', ''))
+            mock_args.num_layers = get_hybrid_total_layer_count(pattern)
 
             if not finetune:
                 data_parallel_size = ps.get_data_parallel_world_size()
@@ -741,6 +907,18 @@ def _run_gpt_to_hybrid_optimizer_load(
 class TestGPTToHybridOptimizerLoad:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
+
+    @pytest.mark.internal
+    @pytest.mark.parametrize('non_homogeneous_layers', [False, True])
+    def test_grouped_model_and_optimizer_load(self, tmp_path_dist_ckpt, non_homogeneous_layers):
+        _run_gpt_to_hybrid_optimizer_load(
+            tmp_path_dist_ckpt,
+            (1, 1, 1, 1, 1),
+            (1, 1, 1, 1, 1),
+            '[M*-][M*-]',
+            False,
+            non_homogeneous_layers=non_homogeneous_layers,
+        )
 
     @pytest.mark.internal
     @pytest.mark.parametrize(
@@ -798,6 +976,9 @@ class TestGPTToHybridFSDPLoad:
                 id='resume-without-finetune',
             ),
             pytest.param((1, 1, 1, 1, 1), (1, 1, 1, 1, 1), '*-*-', False, True, id='fsdp4-dense'),
+            pytest.param(
+                (1, 1, 1, 1, 1), (1, 1, 1, 1, 1), '[M*-][M*-]', False, True, id='fsdp-grouped'
+            ),
             pytest.param(
                 (2, 1, 1, 1, 1), (1, 1, 1, 1, 1), 'M*-M*-', False, True, id='tp2-fsdp2-to-fsdp4'
             ),
