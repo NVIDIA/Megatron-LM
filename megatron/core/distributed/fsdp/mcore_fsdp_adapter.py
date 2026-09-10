@@ -15,6 +15,7 @@
 import contextlib
 import logging
 import random
+from contextlib import nullcontext
 from typing import Dict, List, NamedTuple, Optional, Tuple, Type
 
 __all__ = ["FullyShardedDataParallel"]
@@ -58,6 +59,9 @@ try:
         fully_shard,
         fully_shard_context,
         microbatch,
+    )
+    from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.fully_shard import (
+        current_fully_shard_context,
     )
     from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module_utils import (
         copy_parameter_attributes,
@@ -570,8 +574,11 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                 unspecified, transformer, MoE transformer, and Mamba layers are used.
             disable_bucketing: Compatibility argument that must remain ``False`` for
                 MFSDP v2.
-            device: Device whose type is used to construct the data-parallel mesh.
-                Defaults to CUDA.
+            device: Device used to construct the data-parallel mesh and, when this wrapper
+                opens its own ``fully_shard_context``, that context's device. Defaults to
+                CUDA. When the caller has already opened an ambient context (multi-chunk
+                wrapping), this wrapper joins it and the ambient context's device and
+                ``use_symmetric_memory`` settings apply instead.
             pg_collection: Explicit process groups. The ``dp_cp`` group defines the
                 data-parallel mesh.
 
@@ -657,9 +664,15 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             schedule_policy=schedule_policy,
             register_hooks=not config.overlap_moe_expert_parallel_comm,
         )
-        with fully_shard_context(
-            device=device, use_symmetric_memory=ddp_config.nccl_ub, reuse_existing=True
-        ):
+        # Join the caller's ambient context when one is active (VPP chunks); otherwise
+        # open and finalize our own.
+        active_context = current_fully_shard_context()
+        construction_context = (
+            nullcontext(active_context)
+            if active_context is not None
+            else fully_shard_context(device=device, use_symmetric_memory=ddp_config.nccl_ub)
+        )
+        with construction_context:
             if expert_dp_mesh is not None:
                 # Expert parameters use expert-DP rather than the full dense-DP group.
                 # Their gradients need the EP divisor because the same expert receives
