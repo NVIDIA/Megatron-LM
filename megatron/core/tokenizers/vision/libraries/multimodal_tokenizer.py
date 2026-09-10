@@ -237,10 +237,7 @@ class MegatronMultimodalTokenizer:
         return self.tokenizer.encode(text, add_special_tokens=add_special_tokens)
 
     def tokenize_conversation(
-        self,
-        conversation: List[Dict],
-        return_target: bool,
-        add_generation_prompt: bool,
+        self, conversation: List[Dict], return_target: bool, add_generation_prompt: bool
     ):
         """Convert a conversation to tokens, or to a rendered string.
 
@@ -252,7 +249,6 @@ class MegatronMultimodalTokenizer:
                     {"role": "assistant", "content": "something2"},
                 ]
             return_target (bool): Return target tokens with system and assistant masked.
-                Only supported when tokenize=True, since masking relies on token indices.
             add_generation_prompt (bool): Add assistant prefix to the end.
         """
         tokenize = True
