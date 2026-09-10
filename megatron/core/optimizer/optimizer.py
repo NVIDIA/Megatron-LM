@@ -864,8 +864,9 @@ def _backfill_gtp_sharded_param_map(
       2. Gathered+split factory params (Mamba ``in_proj``): the model entry exposes the *gathered*
          tensor, so nothing matches the per-shard GTP param. Rebuild the same per-shard
          ShardedTensor every other GTP_remat weight gets. The rebuild is NOT expert-parallel
-         aware (no expert offsets/replica), so expert params must resolve via case 1; refuse
-         loudly instead of writing colliding shards across EP groups.
+         aware (no expert offsets/replica). Grouped factories retain their original physical
+         ShardedTensor for exact identity resolution; other expert params must resolve via
+         case 1. Refuse loudly instead of writing colliding shards across EP groups.
 
     WHEN: only the distributed-Muon path reaches here. ``LayerWiseDistributedOptimizer`` keeps such
     matrix params whole and routes them through this ``Float16OptimizerWithFloat16Params``.
@@ -905,6 +906,15 @@ def _backfill_gtp_sharded_param_map(
             src = gtp_entry_backlink(entry)
             if src is not None:
                 src_id_to_entry[id(src)] = entry
+            source_entry = getattr(entry, 'gtp_source_sharded_tensor', None)
+            source_param = getattr(entry, 'gtp_source_param', None)
+            if isinstance(source_entry, ShardedTensor) and source_param is not None:
+                # A gathered grouped-expert factory retains its physical, unsplit metadata.
+                # Copy all attributes, including padding backlinks, and apply the current
+                # checkpoint key after the caller's prefix replacement.
+                physical_entry = copy.copy(source_entry)
+                physical_entry.key = entry.key
+                src_id_to_entry[id(source_param)] = physical_entry
             key = getattr(entry, 'key', None)
             if key is not None:
                 # Grouped-expert entries share one key (offsets differ) -> ambiguous, drop.

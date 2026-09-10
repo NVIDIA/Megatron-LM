@@ -655,6 +655,15 @@ alignment (MXFP8: 32; other quantized recipes: 16; BF16: 1).
 >
 > On **load**, the factory concatenates the sections into the unpadded TP-local tensor, restores zero padding, and selects this GTP rank's physical rows. Ordinary parameters and GDP's replicated input-projection bias use the section splitter directly; `gtp_remat_size == 1` skips gather and pad/slice. GDP keeps separate keys for every householder copy, including in its convolution parameters, which also reuse the shared splitter. The GTP merge accepts unflattened model weights; optimizer state continues through the existing per-shard reconstruction path.
 
+**Grouped gated experts.** EGTP-sharded grouped `linear_fc1` gathers and splits
+`gate|up` with the same logical factory used by dense MLPs. It uses the checkpoint
+key carried by TEGroupedLinear, preserves the prepended expert axis, and elects
+writers over expert DP. Distributed Adam obtains its physical companion through
+`for_optimizer()`. Muon retains its unsplit physical schema: the grouped factory
+keeps its original `ShardedTensor`, and its mapper reuses that metadata with the
+current checkpoint prefix. A raw gathered factory cannot describe the smaller
+Muon state tensor.
+
 **Optimizer state.** The distributed optimizer's master/moment `ShardedObject`s are keyed by `dp_group_idx`. Under GTP_remat/EGTP_remat each peer owns a *different* master shard (the optimizer shards over the gtp_remat/egtp_remat-**excluded** replicate group), so the index is taken from the gtp_remat/egtp_remat-**merged** model-parallel group (`mp_group` for dense, `expt_tp_pp_with_egtp_remat_group` for expert) — giving every peer a distinct key while replicate-group ranks remain true replicas under that key.
 
 **Pre-save forced param-sync.** Before a save (and around any `disable_forward_pre_hook(param_sync=True)`, e.g. pre-eval), the training loop force-syncs DDP params. `force_param_sync` / `disable_forward_pre_hook` first call `optimizer.prepare_model_params_for_param_sync()`, which copies the FP32 masters into the DDP param buffer, so the sync's `_post_param_sync` copy-back re-quantizes each native-FP8 weight — GTP_remat shards included — from up-to-date masters instead of stale grad scratch under `--reuse-grad-buf-for-mxfp8-param-ag`. The copy-back therefore writes the correct MXFP8 shard, so the forced sync leaves GTP_remat's self-gathered weight intact and does not perturb the next iteration's loss — no GTP-specific preservation is needed.
