@@ -1,6 +1,7 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 import copy
+import os
 from unittest import mock
 
 import pytest
@@ -486,7 +487,15 @@ def _test_parallel_attention_correctness(
     cp_partition_mode="zigzag",
     input_grad_atol=None,
     input_grad_rtol=None,
+    dynamic_cp=False,
+    check_parameter_gradients=False,
 ):
+    if dynamic_cp:
+        assert cp > 1, "Runtime Dynamic CP parity requires cp > 1"
+        assert sequence_packing, "Runtime Dynamic CP parity requires packed THD input"
+        if int(os.environ.get("WORLD_SIZE", "1")) < cp:
+            pytest.skip(f"Runtime CP={cp} parity requires at least {cp} distributed ranks")
+
     # Model initialization function
     def initialize_gpt_model(
         config, pre_process=True, post_process=True, vp_stage=None, pg_collection=None
@@ -544,6 +553,13 @@ def _test_parallel_attention_correctness(
             input_hidden_states, attention_mask=None
         )
         output_hidden_states_baseline.sum().backward()
+        parameter_grads_baseline = None
+        if check_parameter_gradients:
+            parameter_grads_baseline = {
+                name: param.grad.detach().clone()
+                for name, param in attention.named_parameters()
+                if param.grad is not None
+            }
 
         # Save baseline output
         input_grad_baseline = input_hidden_states.grad.detach()
@@ -557,23 +573,32 @@ def _test_parallel_attention_correctness(
 
         # Initialize parallel model
         Utils.destroy_model_parallel()
+        build_time_cp = 1 if dynamic_cp else cp
         Utils.initialize_model_parallel(
-            tensor_model_parallel_size=tp, pipeline_model_parallel_size=1, context_parallel_size=cp
+            tensor_model_parallel_size=tp,
+            pipeline_model_parallel_size=1,
+            context_parallel_size=build_time_cp,
+            dynamic_context_parallel=dynamic_cp,
+            min_dynamic_context_parallel_size=1,
         )
         torch.manual_seed(seed)
         model_parallel_cuda_manual_seed(seed)
-        transformer_config.context_parallel_size = cp
+        transformer_config.context_parallel_size = build_time_cp
         transformer_config.tensor_model_parallel_size = tp
         transformer_config.sequence_parallel = sp
         init_basic_mock_args(mock_args, tp, 1, bf16=True)
-        mock_args.context_parallel_size = cp
+        mock_args.context_parallel_size = build_time_cp
         mock_args.sequence_parallel = sp
         gpt_model = unwrap_model(get_model(initialize_gpt_model, config=transformer_config))
         with mock.patch('megatron.training.checkpointing.check_checkpoint_args'):
             load_checkpoint(gpt_model, None, None)
 
         # Function to get tensor on this tp and cp rank
-        cp_group = parallel_state.get_context_parallel_group()
+        cp_group = (
+            parallel_state.get_dynamic_data_context_parallel_groups(group_size=cp)
+            if dynamic_cp
+            else parallel_state.get_context_parallel_group()
+        )
         tp_rank = parallel_state.get_tensor_model_parallel_rank()
 
         def get_tensor_on_this_rank(tensor):
@@ -594,6 +619,9 @@ def _test_parallel_attention_correctness(
             cu_seqlens = [i * sequence_length for i in range(micro_batch_size + 1)]
             packed_seq_params = make_test_packed_seq_params(cu_seqlens=cu_seqlens)
             packed_seq_params.cp_partition_mode = cp_partition_mode
+            if dynamic_cp:
+                packed_seq_params.local_cp_size = cp
+                packed_seq_params.cp_group = cp_group
         else:
             packed_seq_params = None
         input_hidden_states = get_tensor_on_this_rank(input_hidden_states)
@@ -604,6 +632,25 @@ def _test_parallel_attention_correctness(
         )
         output_hidden_states_parallel.sum().backward()
         input_grad_parallel = input_hidden_states.grad.detach()
+
+        if check_parameter_gradients:
+            assert parameter_grads_baseline is not None
+            for name, param in parallel_attention.named_parameters():
+                if name not in parameter_grads_baseline:
+                    continue
+                assert param.grad is not None, f"Missing parallel gradient for {name}"
+                parallel_grad = param.grad.detach().clone()
+                if dynamic_cp:
+                    torch.distributed.all_reduce(parallel_grad, group=cp_group)
+                torch.testing.assert_close(
+                    parameter_grads_baseline[name],
+                    parallel_grad,
+                    atol=atol,
+                    rtol=rtol,
+                    msg=lambda msg, param_name=name: (
+                        f"Mismatch in parameter gradient {param_name}: {msg}"
+                    ),
+                )
 
         # Check if the output is close
         output_hidden_states_baseline = get_tensor_on_this_rank(output_hidden_states_baseline)
