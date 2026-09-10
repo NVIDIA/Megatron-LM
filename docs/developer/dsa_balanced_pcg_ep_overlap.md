@@ -90,6 +90,13 @@ from identical inputs and parameters, including indexer and mHC gradients. PP
 coverage includes short schedules, warmup, steady state, cooldown and evaluation.
 Performance evidence must confirm graph replay and communication overlap.
 
+`tests/unit_tests/a2a_overlap/test_pipeline_schedule.py` runs real non-interleaved
+PP2/PP4 and EP2 collectives with ordinary attention, independently of the DSv4
+kernels. It compares loss and every rank-local parameter gradient against the
+existing pipeline schedule for one-microbatch and steady-state batches, including
+shared experts and pipeline output deallocation. Eight GPUs cover both PP sizes;
+four GPUs cover PP2.
+
 The PP1 validation uses four GB200 GPUs, CP2/EP2, BF16, fixed 512-token local
 capacity and variable THD packs. GPT attention-only capture completes training.
 Hybrid `CEHEW-` with mHC and attention/router/preprocess capture completes 35
