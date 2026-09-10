@@ -5006,6 +5006,13 @@ def _add_mla_args(parser):
         help="Mscale all dimensions for YaRN RoPE in multi-latent attention.",
     )
     group.add_argument(
+        '--share-rotary-pos-emb',
+        action='store_true',
+        help="Share one rotary embedding module across multi-latent-attention layers that have "
+        "an identical rotary configuration, removing per-layer rotary buffer duplication (no "
+        "numerical change).",
+    )
+    group.add_argument(
         '--o-groups',
         type=int,
         default=8,

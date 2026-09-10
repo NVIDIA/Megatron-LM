@@ -25,6 +25,7 @@ from megatron.core.models.common.embeddings import (
     YarnRotaryEmbedding,
     _yarn_get_mscale,
     apply_rotary_pos_emb,
+    maybe_share_rotary_pos_emb,
     should_use_fused_mla_rope,
 )
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
@@ -213,6 +214,10 @@ class MultiLatentAttention(Attention):
                 f"Unsupported RoPE type: {self.config.rope_type}, supported types are "
                 "'rope' and 'yarn'"
             )
+        # Share one rotary instance across layers with the same configuration when enabled.
+        self.rotary_pos_emb = maybe_share_rotary_pos_emb(
+            self.config, (self.config.rope_type, self.config.rotary_base), self.rotary_pos_emb
+        )
 
         if self.config.experimental_attention_variant == "dsa":
             core_attn_extra_kwargs = {"is_mtp_layer": is_mtp_layer}

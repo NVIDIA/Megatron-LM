@@ -16,6 +16,7 @@ from megatron.core.models.common.embeddings import (
     RotaryEmbedding,
     YarnRotaryEmbedding,
     apply_rotary_pos_emb,
+    maybe_share_rotary_pos_emb,
 )
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
@@ -147,6 +148,10 @@ class DSv4HybridAttention(Attention):
                 mscale_all_dim=self.config.mscale_all_dim,
                 cp_group=self.pg_collection.cp,
             )
+        # Share one rotary instance across layers with the same configuration when enabled.
+        self.rotary_pos_emb = maybe_share_rotary_pos_emb(
+            self.config, (use_compressed_yarn, rope_base), self.rotary_pos_emb
+        )
 
         core_attn_extra_kwargs = {
             "rotary_pos_emb": self.rotary_pos_emb,

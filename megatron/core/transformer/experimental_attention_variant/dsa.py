@@ -18,6 +18,7 @@ from megatron.core.models.common.embeddings import (
     RotaryEmbedding,
     YarnRotaryEmbedding,
     apply_rotary_pos_emb,
+    maybe_share_rotary_pos_emb,
     should_use_fused_mla_rope,
 )
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -1467,6 +1468,10 @@ class DSAIndexer(MegatronModule):
                 f'Unsupported RoPE type: {self.config.rope_type}, supported types are "rope" and '
                 f'"yarn"'
             )
+        # Share one rotary instance across layers with the same configuration when enabled.
+        self.rotary_pos_emb = maybe_share_rotary_pos_emb(
+            self.config, (self.config.rope_type, self.config.rotary_base), self.rotary_pos_emb
+        )
 
         self.linear_wq_b = build_module(
             submodules.linear_wq_b,
