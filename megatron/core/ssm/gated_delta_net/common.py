@@ -29,6 +29,11 @@ from megatron.core.ssm.mamba_context_parallel import (
 )
 from megatron.core.ssm.utils import _split_tensor_factory
 from megatron.core.tensor_parallel import get_cuda_rng_tracker
+from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
+from megatron.core.tensor_parallel.gtp_ckpt import (
+    _gtp_gather_rows_for_save,
+    _gtp_slice_rows_on_load,
+)
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule
@@ -54,6 +59,11 @@ except ImportError:
     HAVE_FLA = False
 
 logger = logging.getLogger(__name__)
+
+if HAVE_GTP:
+    from megatron.core.tensor_parallel.gtp_api import is_gtp_param
+else:
+    is_gtp_param = None
 
 
 @dataclass
@@ -542,6 +552,26 @@ class _GDNBase(MegatronModule):
         # At this point the TP sharding is correctly defined for each tensor, but some of the
         # tensors must be additionally split into separate parts
         in_proj_dim_local_tp = self.in_proj_dim // self.tp_size
+        # The semantic [q|k|v|z|beta|alpha] boundaries can cross GTP shard boundaries. Gather the
+        # physical GTP shards back to the logical TP-local projection before splitting so the
+        # checkpoint layout stays identical to non-GTP and independent of the save-time topology.
+        # The submodule checkpoint helper has already converted native-FP8 GTP data to BF16.
+        in_proj_uses_gtp = (
+            getattr(self.in_proj.weight, "gtp_remat_size", 1) > 1
+            and HAVE_GTP
+            and is_gtp_param(self.in_proj.weight)
+        )
+        if in_proj_uses_gtp:
+            sharded_state_dict[f"{prefix}in_proj.weight"] = _gtp_gather_rows_for_save(
+                sharded_state_dict[f"{prefix}in_proj.weight"],
+                f"{prefix}in_proj.weight",
+                self.in_proj.weight,
+                in_proj_dim_local_tp,
+                tp_group,
+                metadata['dp_cp_group'],
+                sharded_offsets,
+            )
+
         assert sharded_state_dict[f"{prefix}in_proj.weight"].data.size(0) == in_proj_dim_local_tp, (
             in_proj_dim_local_tp,
             sharded_state_dict[f"{prefix}in_proj.weight"],
@@ -553,6 +583,13 @@ class _GDNBase(MegatronModule):
             self.in_proj_split_names,
             0,
         )
+
+        # Load-side inverse of the save-time gather above: re-pad the merged TP-local
+        # projection and slice this rank's physical GTP shard.
+        if in_proj_uses_gtp:
+            sharded_state_dict[f"{prefix}in_proj.weight"] = _gtp_slice_rows_on_load(
+                sharded_state_dict[f"{prefix}in_proj.weight"], self.in_proj.weight
+            )
 
         conv_layer_name_list = ["conv1d.weight"]
         assert (
