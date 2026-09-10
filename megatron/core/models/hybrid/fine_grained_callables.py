@@ -64,6 +64,8 @@ class HybridModelChunkSchedulePlan(TransformerModelChunkSchedulePlan):
             )
         if config.fp8 and config.fp8_recipe == Fp8Recipe.delayed:
             raise ValueError("Hybrid EP overlap requires a current-scaling FP8 recipe")
+        if config.fp4:
+            raise ValueError("Hybrid EP overlap does not support FP4")
         super().__init__(model, *args, **kwargs)
 
     @staticmethod
@@ -134,7 +136,8 @@ def build_hybrid_layer_callables(layer):
             if isinstance(normalized, tuple):
                 normalized, _ = normalized
             shared_output = moe.shared_experts_compute(normalized)
-            probs, routing_map = moe.route(normalized, padding_mask=node.chunk_state.padding_mask)
+            padding_mask = moe._normalize_padding_mask(normalized, node.chunk_state.padding_mask)
+            probs, routing_map = moe.route(normalized, padding_mask=padding_mask)
             local_tokens, probs = moe.preprocess(normalized, probs, routing_map)
 
         node.layer_state.residual = node.detach(residual)
