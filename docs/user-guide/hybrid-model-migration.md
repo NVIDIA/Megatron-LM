@@ -120,8 +120,9 @@ Load-time translation is handled by
 [`megatron/core/dist_checkpointing/gpt_checkpoint_interop.py`](https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/core/dist_checkpointing/gpt_checkpoint_interop.py).
 It triggers automatically when a non-hybrid (GPT) checkpoint is loaded into a
 `HybridModel` run: for `torch_dist`, the run's model and optimizer sharded
-state dicts are rewritten into the GPT checkpoint's homogeneous-layer format;
-for `fsdp_dtensor`, their explicit parameter-name mappings are rewritten onto
+state dicts are rewritten onto the GPT checkpoint's layer keys, in either the
+homogeneous-layer format or the indexed format GPT saves for non-homogeneous
+layers; for `fsdp_dtensor`, their explicit parameter-name mappings are rewritten onto
 the GPT keys before Torch DCP planning. The checkpoint is read directly, and
 the weights and optimizer state are resharded to the current
 TP/PP/EP/ETP/FSDP layout. No conversion tool is run, and the GPT checkpoint on
@@ -188,6 +189,7 @@ separators ignored) may contain:
 
 Parameters are paired by occurrence: the *i*-th `*` position takes GPT layer
 *i*'s attention, and the *i*-th `-`/`E` position takes GPT layer *i*'s MLP.
+Bracketed groups do not change the pairing: `[M*-][M*-]` loads like `M*-M*-`.
 `decoder.final_norm` is loaded from GPT's `decoder.final_layernorm`, and
 embedding and output weights are copied unchanged.
 
