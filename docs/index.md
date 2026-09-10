@@ -80,6 +80,14 @@ user-guide/features/tokenizers
 ```{toctree}
 :maxdepth: 2
 :hidden:
+:caption: Inference
+
+mcore-inference-user-guide
+```
+
+```{toctree}
+:maxdepth: 2
+:hidden:
 :caption: Observability
 
 user-guide/observability/index
