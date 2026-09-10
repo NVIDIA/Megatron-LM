@@ -927,6 +927,35 @@ class TestAccumulatorDistributed:
         _reset_seqlen_accumulator()
         Utils.destroy_model_parallel()
 
+    def test_distributed_rank_is_global(self):
+        """Multi-node runs must not reuse node-local ranks in the world group."""
+        import os
+
+        from tests.unit_tests.test_utilities import Utils
+
+        assert Utils.rank == int(os.environ.get('RANK', os.environ.get('LOCAL_RANK', '0')))
+
+    @pytest.mark.parametrize(
+        "global_rank,local_rank,world_size,expected_rank",
+        [(6, 2, 8, 6), (6, 2, 4, -1), (6, None, 8, 6), (None, 2, 8, 2)],
+    )
+    def test_resize_uses_global_rank(
+        self, monkeypatch, global_rank, local_rank, world_size, expected_rank
+    ):
+        """Resizing a test world must select global, not per-node, participants."""
+        from tests.unit_tests.test_utilities import Utils
+
+        monkeypatch.setattr(Utils, 'rank', Utils.rank)
+        monkeypatch.setattr(Utils, 'world_size', Utils.world_size)
+        monkeypatch.setattr(torch.distributed, 'is_initialized', lambda: False)
+        for name, value in [('RANK', global_rank), ('LOCAL_RANK', local_rank)]:
+            if value is None:
+                monkeypatch.delenv(name, raising=False)
+            else:
+                monkeypatch.setenv(name, str(value))
+        Utils.set_world_size(world_size=world_size)
+        assert Utils.rank == expected_rank
+
     def test_pure_dp_sums_across_ranks(self):
         from tests.unit_tests.test_utilities import Utils
 

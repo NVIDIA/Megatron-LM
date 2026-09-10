@@ -140,3 +140,10 @@ For example, `K-+E/+E/+E` with `B = 2` has 11 trunk source visits and
 the trunk incorrectly gives 29. Packed-sequence estimates scale this work by
 the real token count, independently of the attention `sum(sequence_length^2)`
 term.
+
+`tests/unit_tests/test_num_floating_point_operations.py` covers the scalar
+formula and CUDA/NCCL sequence-statistics accumulation. Its topology matrix
+requires eight global ranks (for example, two four-GPU GB200 nodes); the file
+is selected by the `launch_on_gb200` CI marker. Multi-node tests must use
+torchrun's global `RANK` for process-group membership, not the per-node
+`LOCAL_RANK`. The launcher must supply the same master address to both nodes.
