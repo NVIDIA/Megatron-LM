@@ -7,7 +7,65 @@ import torch
 
 from megatron.core.dist_checkpointing import ShardedTensor
 from megatron.core.dist_checkpointing.mapping import ReplicaId, ShardedTensorFactory
+from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
+from megatron.core.tensor_parallel.gtp_ckpt import (
+    _gtp_gather_rows_for_save,
+    _gtp_slice_rows_on_load,
+)
 from megatron.core.transformer.utils import cat_with_oom_fallback
+
+if HAVE_GTP:
+    from megatron.core.tensor_parallel.gtp_api import is_gtp_param
+else:
+    is_gtp_param = None
+
+
+def _split_in_proj_factory(
+    orig_sh_ten: ShardedTensor,
+    split_sections: list[int],
+    split_names: list[str],
+    *,
+    weight: torch.Tensor,
+    tp_group: torch.distributed.ProcessGroup,
+    dp_cp_group: torch.distributed.ProcessGroup,
+    sharded_offsets: tuple[tuple[int, int, int], ...] = (),
+) -> ShardedTensorFactory:
+    """Checkpoint an SSM input projection in its logical, TP-local section layout.
+
+    Mamba, GDN, and GDP concatenate different semantic sections along dimension 0.
+    GTP row-shard boundaries can cross those sections, so gather before splitting
+    and slice back to the physical shard after merging on load. The shared GTP
+    helpers handle alignment padding and elect one checkpoint writer per replica.
+
+    ``split_sections`` contains TP-local sizes; ``split_names`` preserves the
+    module's checkpoint keys (including GDP's individual householder copies).
+    ``orig_sh_ten.data`` is the checkpoint representation, already dequantized
+    for native-FP8 weights. ``weight`` supplies the live GTP group and shard shape.
+    Ordinary weights and replicated biases use the section factory directly.
+
+    All GTP ranks must call this together when constructing the checkpoint dict.
+    The returned GTP factory merges unflattened model weights; optimizer states
+    continue to use their existing per-shard checkpoint reconstruction.
+    """
+    uses_gtp = getattr(weight, "gtp_remat_size", 1) > 1 and HAVE_GTP and is_gtp_param(weight)
+    if uses_gtp:
+        # Derive the logical width from the physical parameter, independently of
+        # the requested sections, so the split factory still rejects wrong totals.
+        target_rows = weight.data.size(0) * weight.gtp_remat_size - getattr(weight, "pad_length", 0)
+        orig_sh_ten = _gtp_gather_rows_for_save(
+            orig_sh_ten,
+            orig_sh_ten.key,
+            weight,
+            target_rows,
+            tp_group,
+            dp_cp_group,
+            sharded_offsets,
+        )
+
+    factory = _split_tensor_factory(orig_sh_ten, split_sections, split_names, split_dim=0)
+    if uses_gtp:
+        factory = _gtp_slice_rows_on_load(factory, weight)
+    return factory
 
 
 def _split_tensor_factory(
@@ -68,12 +126,3 @@ def _split_tensor_factory(
         cat_with_oom_fallback,
         orig_sh_ten.replica_id,
     )
-
-
-# The GTP fused-projection checkpoint helpers moved to tensor_parallel.gtp_ckpt so
-# non-SSM fused projections (the gated MLP fc1) can use them without importing ssm.
-# Re-exported here to keep the existing call sites and tests stable.
-from megatron.core.tensor_parallel.gtp_ckpt import (  # noqa: F401,E402  pylint: disable=C0413
-    _gtp_gather_rows_for_save,
-    _gtp_slice_rows_on_load,
-)

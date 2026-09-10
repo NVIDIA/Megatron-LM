@@ -33,13 +33,8 @@ from megatron.core.ssm.ops.common.intermediate_extraction import (
 from megatron.core.ssm.ops.mamba2.batch_invariant_decode import MambaBatchInvariantDecode
 from megatron.core.ssm.ops.mamba2.mamba_ssm import selective_state_update
 from megatron.core.ssm.ssm_inference import SSMDynamicInferenceMixin
-from megatron.core.ssm.utils import _split_tensor_factory
+from megatron.core.ssm.utils import _split_in_proj_factory, _split_tensor_factory
 from megatron.core.tensor_parallel import get_cuda_rng_tracker
-from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
-from megatron.core.tensor_parallel.gtp_ckpt import (
-    _gtp_gather_rows_for_save,
-    _gtp_slice_rows_on_load,
-)
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
@@ -54,11 +49,6 @@ from megatron.core.utils import (
     is_mamba_min_version,
     log_single_rank,
 )
-
-if HAVE_GTP:
-    from megatron.core.tensor_parallel.gtp_api import is_gtp_param
-else:
-    is_gtp_param = None
 
 from .mamba_context_parallel import MambaContextParallel
 
@@ -1369,40 +1359,7 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule):
 
         # At this point the TP sharding is correctly defined for each tensor, but some of the
         # tensors must be additionally split into separate parts
-        in_proj_dim = (
-            self.d_inner_local_tp * 2
-            + 2 * self.ngroups_local_tp * self.d_state
-            + self.nheads_local_tp
-        )
-        # Under GTP, in_proj.weight is GTP-sliced along axis 0. The [z|x|B|C|dt] split boundaries
-        # don't line up with GTP slice boundaries, so gather the shards back to TP-local size
-        # (strip the trailing pad rows from the gathered tail) and fall through to the same
-        # split path the non-GTP run uses — saved ckpt format matches a non-GTP run.
-        # in_proj.weight was already built at the sharded size by the submodule
-        # sharded_state_dict above — and, for native-FP8 GTP, dequantized to BF16 there
-        # (make_tp_sharded_tensor_for_checkpoint).
-        in_proj_uses_gtp = (
-            getattr(self.in_proj.weight, "gtp_remat_size", 1) > 1
-            and HAVE_GTP
-            and is_gtp_param(self.in_proj.weight)
-        )
-        if in_proj_uses_gtp:
-            sharded_state_dict[f"{prefix}in_proj.weight"] = _gtp_gather_rows_for_save(
-                sharded_state_dict[f"{prefix}in_proj.weight"],
-                f"{prefix}in_proj.weight",
-                self.in_proj.weight,
-                in_proj_dim,
-                self.tp_group,
-                metadata['dp_cp_group'],
-                sharded_offsets,
-            )
-
-        assert sharded_state_dict[f"{prefix}in_proj.weight"].data.size(0) == in_proj_dim, (
-            in_proj_dim,
-            sharded_state_dict[f"{prefix}in_proj.weight"],
-        )
-
-        sharded_state_dict[f"{prefix}in_proj.weight"] = _split_tensor_factory(
+        sharded_state_dict[f"{prefix}in_proj.weight"] = _split_in_proj_factory(
             sharded_state_dict[f"{prefix}in_proj.weight"],
             [
                 self.d_inner_local_tp,
@@ -1412,15 +1369,11 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule):
                 self.nheads_local_tp,
             ],
             ["z", "x", "B", "C", "dt"],
-            0,
+            weight=self.in_proj.weight,
+            tp_group=self.tp_group,
+            dp_cp_group=metadata['dp_cp_group'],
+            sharded_offsets=sharded_offsets,
         )
-
-        # GTP load-side inverse of the save-time all-gather (see
-        # docs/api-guide/core/generalized_tensor_parallel.md §3.3, in_proj note).
-        if in_proj_uses_gtp:
-            sharded_state_dict[f"{prefix}in_proj.weight"] = _gtp_slice_rows_on_load(
-                sharded_state_dict[f"{prefix}in_proj.weight"], self.in_proj.weight
-            )
 
         conv_dim = self.d_inner_local_tp + 2 * self.ngroups_local_tp * self.d_state
         assert sharded_state_dict[f"{prefix}conv1d_weight"].data.size(0) == conv_dim, (
