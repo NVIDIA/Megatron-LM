@@ -1250,10 +1250,12 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             for k, v in optim_state.items():
                 if isinstance(v, torch.Tensor):
                     dst_tensors[k] = v
-            for key in dst_tensors:
-                if not isinstance(tensors[key], torch.Tensor):
-                    continue
-                dst_tensors[key].copy_(tensors[key])
+            # FP32 main params can be live views of leaf model Parameters.
+            with torch.no_grad():
+                for key in dst_tensors:
+                    if not isinstance(tensors[key], torch.Tensor):
+                        continue
+                    dst_tensors[key].copy_(tensors[key])
 
     def get_parameter_state_dp_reshardable(self):
         """Get internal representation of parameter state without any copies and modifications.
