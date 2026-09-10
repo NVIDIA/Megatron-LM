@@ -254,6 +254,20 @@ class KimiDeltaAttention(_GDNBase):
             assert not self.config.sequence_parallel
             raise NotImplementedError("KimiDeltaAttention does not support inference for now.")
 
+        if strict_runtime_validation:
+            if cp_size_chunkwise > 1:
+                if batch > 1:
+                    raise ValueError(
+                        "KDA chunkwise CP with SBHD inputs currently requires "
+                        "micro_batch_size == 1 when cp_context is used. Use packed THD input "
+                        "or micro_batch_size=1."
+                    )
+                if self.config.gdn_conv_pad_alignment is not None:
+                    raise ValueError(
+                        "gdn_conv_pad_alignment is incompatible with KDA chunkwise CP. "
+                        "Padding chunk-local causal-conv inputs can change later chunk numerics."
+                    )
+
         if cp_size_headwise > 1 and (
             (
                 packed_seq_params is not None
@@ -403,17 +417,6 @@ class KimiDeltaAttention(_GDNBase):
         if self.gdn_pre_gated_delta_rule_fusion:
             raise NotImplementedError(
                 "gdn_pre_gated_delta_rule_fusion is not implemented for KDA yet."
-            )
-
-        if cp_size_chunkwise > 1 and packed_seq_params is None and batch > 1:
-            raise ValueError(
-                "KDA chunkwise CP with SBHD inputs currently requires micro_batch_size == 1 "
-                "when cp_context is used. Use packed THD input or micro_batch_size=1."
-            )
-        if cp_size_chunkwise > 1 and self.config.gdn_conv_pad_alignment is not None:
-            raise ValueError(
-                "gdn_conv_pad_alignment is incompatible with KDA chunkwise CP. Padding "
-                "chunk-local causal-conv inputs can change later chunk numerics."
             )
 
         nvtx_range_push(suffix="pre_gated_delta_rule")
@@ -588,11 +591,6 @@ class KimiDeltaAttention(_GDNBase):
                     raise ValueError(
                         "gdn_conv_pad_alignment is only supported with packed sequence "
                         "parameters in THD format. SBHD inputs do not need causal-conv padding."
-                    )
-                if chunkwise_cp_context is not None:
-                    raise ValueError(
-                        "gdn_conv_pad_alignment is incompatible with KDA chunkwise CP. Padding "
-                        "chunk-local causal-conv inputs can change later chunk numerics."
                     )
                 pad_n = -orig_seq % self.config.gdn_conv_pad_alignment
             if pad_n > 0:
