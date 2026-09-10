@@ -68,3 +68,12 @@ def _split_tensor_factory(
         cat_with_oom_fallback,
         orig_sh_ten.replica_id,
     )
+
+
+# The GTP fused-projection checkpoint helpers moved to tensor_parallel.gtp_ckpt so
+# non-SSM fused projections (the gated MLP fc1) can use them without importing ssm.
+# Re-exported here to keep the existing call sites and tests stable.
+from megatron.core.tensor_parallel.gtp_ckpt import (  # noqa: F401,E402  pylint: disable=C0413
+    _gtp_gather_rows_for_save,
+    _gtp_slice_rows_on_load,
+)

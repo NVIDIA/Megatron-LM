@@ -35,6 +35,10 @@ from megatron.core.ssm.packed_seq_helpers import check_fla_sequence_packing_supp
 from megatron.core.ssm.ssm_inference import SSMDynamicInferenceMixin
 from megatron.core.tensor_parallel import get_cuda_rng_tracker
 from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
+from megatron.core.tensor_parallel.gtp_ckpt import (
+    _gtp_gather_rows_for_save,
+    _gtp_slice_rows_on_load,
+)
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
@@ -43,7 +47,7 @@ from megatron.core.transformer.utils import (
     make_sharded_tensors_for_checkpoint,
     sharded_state_dict_default,
 )
-from megatron.core.utils import deprecate_inference_params, make_tp_sharded_tensor_for_checkpoint
+from megatron.core.utils import deprecate_inference_params
 
 if HAVE_GTP:
     from megatron.core.tensor_parallel.gtp_api import is_gtp_param
@@ -1481,30 +1485,17 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
             in_proj_gtp_remat_size > 1 and HAVE_GTP and is_gtp_param(self.in_proj.weight)
         )
         if in_proj_is_gtp:
-            gtp_remat_group = self.in_proj.weight.group
-            # in_proj.weight was already built at the sharded size by the submodule
-            # sharded_state_dict above — and, for native-FP8 GTP, dequantized to BF16 there
-            # (make_tp_sharded_tensor_for_checkpoint). Gather those (BF16) shards back to the
-            # full TP-local size so the [z|V*|K*|Q|b*|a] split below matches a non-GTP run.
-            local = sharded_state_dict[f"{prefix}in_proj.weight"].data.contiguous()
-            gathered = torch.empty(
-                (local.shape[0] * in_proj_gtp_remat_size,) + local.shape[1:],
-                dtype=local.dtype,
-                device=local.device,
-            )
-            torch.distributed.all_gather_into_tensor(gathered, local, group=gtp_remat_group)
-            if gathered.shape[0] != in_proj_dim:
-                gathered = gathered[:in_proj_dim].contiguous()
-            # Gathered weight is replicated across full dp_cp; replica_id needs only the DP slot.
-            dp_cp_rank = torch.distributed.get_rank(metadata["dp_cp_group"])
-            sharded_state_dict[f"{prefix}in_proj.weight"] = make_tp_sharded_tensor_for_checkpoint(
-                gathered,
+            # Same gather/split contract MambaMixer and GatedDeltaNet go through; the helper
+            # also folds gtp_rank into replica_id, which a per-module copy of this block kept
+            # getting wrong (two GTP peers electing themselves DCP writer for one chunk).
+            sharded_state_dict[f"{prefix}in_proj.weight"] = _gtp_gather_rows_for_save(
+                sharded_state_dict[f"{prefix}in_proj.weight"],
                 f"{prefix}in_proj.weight",
-                tp_axis=0,
-                replica_id=(0, 0, dp_cp_rank),
-                prepend_offsets=sharded_offsets,
-                tp_group=self.pg_collection.tp,
-                dp_cp_group=metadata["dp_cp_group"],
+                self.in_proj.weight,
+                in_proj_dim,
+                self.pg_collection.tp,
+                metadata["dp_cp_group"],
+                sharded_offsets,
             )
 
         assert sharded_state_dict[f"{prefix}in_proj.weight"].data.size(0) == in_proj_dim, (
@@ -1547,29 +1538,8 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
         # ``gtp_remat_local_size * gtp_remat_size``, then slice by ``gtp_remat_local_rank``.
         # gtp_remat_size=1 has no pad/slice.
         if in_proj_is_gtp:
-            factory = sharded_state_dict[f"{prefix}in_proj.weight"]
-            gtp_remat_local_rank = torch.distributed.get_rank(self.in_proj.weight.group)
-            gtp_remat_local_size = self.in_proj.weight.data.size(0)
-            original_merge_fn = factory.merge_fn
-
-            @torch.no_grad()
-            def _gtp_slice_after_cat(
-                sub_state_dict,
-                _orig=original_merge_fn,
-                _rank=gtp_remat_local_rank,
-                _size=gtp_remat_local_size,
-                _gtp_remat_size=in_proj_gtp_remat_size,
-            ):
-                full = _orig(sub_state_dict)
-                aligned_total = _size * _gtp_remat_size
-                pad_rows = aligned_total - full.shape[0]
-                if pad_rows > 0:
-                    full = torch.nn.functional.pad(full, (0, 0, 0, pad_rows))
-                start = _rank * _size
-                return full[start : start + _size].contiguous()
-
-            sharded_state_dict[f"{prefix}in_proj.weight"] = replace(
-                factory, merge_fn=_gtp_slice_after_cat
+            sharded_state_dict[f"{prefix}in_proj.weight"] = _gtp_slice_rows_on_load(
+                sharded_state_dict[f"{prefix}in_proj.weight"], self.in_proj.weight
             )
 
         conv_dim = (
