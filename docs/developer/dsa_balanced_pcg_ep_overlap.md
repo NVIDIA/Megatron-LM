@@ -38,7 +38,9 @@ indexer loss or its backward scale.
 ## Model scheduling
 
 GPTModel and HybridModel expose `build_schedule_plan` returning an
-AbstractSchedulePlan. Hybrid scheduling shares the ordinary forward's embedding,
+AbstractSchedulePlan. The combined scheduler validates this returned interface
+without restricting providers to concrete model classes. Hybrid scheduling shares
+the ordinary forward's embedding,
 decoder boundary and output processing, and preserves checkpoint parameter names.
 DSv4 attention, dense MLP and MoE layers expose their actual compute and
 communication boundaries, including mHC aggregation and residual gradients.
@@ -47,6 +49,14 @@ to another microbatch. Eager layers retain their positions when expanding the
 capture order: dropping a trailing dense layer changes the pairing of forward
 and backward graphs and invalidates TE's shared-memory-pool lifetimes. Process
 groups come from the model's collection.
+
+Schedule construction initializes the backward-weight wrapper through
+`GraphableMegatronModule.init_backward_dw_wrapper`. Its shared implementation in
+`models/common/utils.py` accepts Hybrid layers whose attention is `IdentityOp`:
+these layers have no attention weight-gradient callable. Real attention and
+shared-expert callables retain their normal eager/graph dispatch. The wrapper is
+constructed even when delayed weight gradients are disabled, so this handling is
+required for the supported Hybrid overlap path.
 
 Eager MoE routing normalizes the model's `[batch, sequence]` padding mask to
 the router's local `[sequence, batch]` layout. Sequence-parallel chunks scatter
