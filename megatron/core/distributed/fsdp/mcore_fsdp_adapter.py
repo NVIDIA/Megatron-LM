@@ -259,6 +259,9 @@ class FullyShardedDataParallel(_BaseDataParallel):
         self.zero_grad_buffer = self.module.zero_grad_buffer
         self.broadcast_params = self.module.broadcast_params
         self.synchronize_param_gather = self.module.synchronize_param_gather
+        self.prefetch_recompute_forward_parameters = (
+            self.module.prefetch_recompute_forward_parameters
+        )
         self.module.state_dict_for_save_checkpoint = self.module.state_dict
         self.state_dict_for_save_checkpoint = self.state_dict
         self.module.config = config

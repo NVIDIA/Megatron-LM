@@ -738,6 +738,18 @@ class MLASelfAttention(MultiLatentAttention):
             name=(name + ".linear_kv_up_proj") if name is not None else None,
         )
 
+        if self.recompute_up_proj:
+            # These are the only parameterized modules replayed by the
+            # ``mla_up_proj`` selective-recompute region. Megatron-FSDP uses
+            # this marker to launch their rowwise weight all-gather early in
+            # the 1F1B EP-overlap schedule, then waits at the regular
+            # pre-forward hook immediately before the replay consumes them.
+            if self.config.q_lora_rank is not None:
+                self.linear_q_up_proj._fsdp_recompute_forward_weight = True
+            else:
+                self.linear_q_proj._fsdp_recompute_forward_weight = True
+            self.linear_kv_up_proj._fsdp_recompute_forward_weight = True
+
         if self.config.q_lora_rank is not None:
             self.q_layernorm = layer_classes["q_layernorm"](
                 hidden_size=self.config.q_lora_rank,

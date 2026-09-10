@@ -221,6 +221,7 @@ class TransformerLayerSchedulePlan:
         self.event = event
         self.comp_stream = comp_stream
         self.comm_stream = comm_stream
+        self._fsdp_prefetch_recompute_forward_parameters = None
 
         # Set by _build_recompute_segments(); None means this layer keeps its graph.
         self.recompute_segment = None
@@ -274,6 +275,7 @@ class TransformerLayerSchedulePlan:
             else:
                 self.layer._mhc_recompute_manager = None
             del self.layer
+        self._fsdp_prefetch_recompute_forward_parameters = None
 
     def _build_callable_nodes(self, event, comp_stream, comm_stream, extra_args):
         """
@@ -488,6 +490,30 @@ class TransformerLayerSchedulePlan:
         if dispatcher is not None:
             dispatcher.reset_transient_forward_state()
 
+    def set_fsdp_recompute_prefetch_hook(
+        self, prefetch_recompute_forward_parameters: Callable[[torch.nn.Module], None]
+    ) -> None:
+        """Wire selective-recompute weight prefetch for the overlap schedule.
+
+        Args:
+            prefetch_recompute_forward_parameters: Callable that starts an asynchronous
+                rowwise all-gather for marked selective-recompute weights in this layer.
+        """
+        from megatron.core.transformer.multi_token_prediction import MultiTokenPredictionLayer
+        from megatron.core.transformer.transformer_layer import TransformerLayer
+
+        assert isinstance(self.layer, (TransformerLayer, MultiTokenPredictionLayer)), (
+            f"Megatron FSDP with EP Overlap only supports TransformerLayer, "
+            f"but got {type(self.layer).__name__}."
+        )
+
+        hook_module = (
+            self.layer if isinstance(self.layer, TransformerLayer) else self.layer.mtp_model_layer
+        )
+        self._fsdp_prefetch_recompute_forward_parameters = lambda: (
+            prefetch_recompute_forward_parameters(hook_module)
+        )
+
     def get_fp8_context(self):
         """
         Get the fp8 context for the transformer layer.
@@ -541,6 +567,8 @@ class TransformerLayerSchedulePlan:
                 b_layer.mhc_recompute.forward()
             b_grad = b_layer.mhc_post.backward(b_grad)
             b_grad = b_layer.moe_combine.backward(b_grad)
+            if b_layer._fsdp_prefetch_recompute_forward_parameters is not None:
+                b_layer._fsdp_prefetch_recompute_forward_parameters()
 
         if f_layer is not None:
             # Full recompute: retain this segment's input for the backward-time replay.

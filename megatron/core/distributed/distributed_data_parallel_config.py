@@ -237,7 +237,9 @@ class DistributedDataParallelConfig:
 
     megatron_fsdp_prefetch_recompute_forward_weights: bool = False
     """If set to True, Megatron-FSDP prefetches rowwise weights needed by activation
-      recomputation during backward before prefetching backward transpose weights.
+      recomputation during backward. Full-layer recomputation prefetches them from
+      the unit pre-backward hook; selective ``mla_up_proj`` recomputation prefetches
+      only the marked up-projection modules.
     """
 
     megatron_fsdp_cache_param_bucket_views: bool = False
