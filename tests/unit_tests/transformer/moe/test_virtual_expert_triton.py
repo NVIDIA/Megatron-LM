@@ -419,8 +419,7 @@ def test_virtual_expert_histogram_exchange_matches_all_gather():
             indices = torch.multinomial(
                 weights.expand(num_tokens, num_experts), topk, generator=generator
             )
-            probs = torch.rand((num_tokens, topk), device=device, generator=generator)
-            plan, runtime_probs = plan_virtual_expert_routes(indices, probs, workspace)
+            plan = plan_virtual_expert_routes(indices, workspace)
             # Snapshot the window in stream order: a peer may publish its next histogram into
             # it as soon as this rank's placement has read it (the all-gather below is what
             # keeps the peers from getting further ahead than that).
@@ -437,7 +436,6 @@ def test_virtual_expert_histogram_exchange_matches_all_gather():
                 0 <= int(plan.virtual_experts.min())
                 and int(plan.virtual_experts.max()) < 2 * num_experts
             )
-            assert torch.equal(runtime_probs.gather(1, plan.virtual_experts.long()), probs)
     finally:
         workspace.destroy()
         dist.barrier(group=group, device_ids=[device.index])
@@ -522,7 +520,7 @@ def _reference_map_routes(
     return virtual.view(routes.shape)
 
 
-def _plan_on_this_rank(routes, probs=None):
+def _plan_on_this_rank(routes):
     """Plan this rank's routes of a complete four-rank group through the real histogram
     exchange, and check what a torch oracle can reproduce: the local histogram, the exchanged
     window and the route mapping. The caller destroys the returned workspace."""
@@ -533,14 +531,12 @@ def _plan_on_this_rank(routes, probs=None):
     device = torch.device("cuda", torch.cuda.current_device())
     workspace = VirtualExpertPlannerWorkspace(num_experts=NUM_EXPERTS, device=device, group=group)
     own = routes[rank].to(device=device, dtype=torch.int64)
-    if probs is None:
-        probs = torch.rand(own.shape, device=device)
-    plan, runtime_probs = plan_virtual_expert_routes(own, probs, workspace)
+    plan = plan_virtual_expert_routes(own, workspace)
     torch.cuda.synchronize(device)
     counts = _histogram(routes).to(device)
     assert torch.equal(workspace.gathered_counts, counts)
     assert torch.equal(plan.virtual_experts.long(), _reference_map_routes(own, workspace))
-    return workspace, plan, runtime_probs, rank, group
+    return workspace, plan, rank, group
 
 
 def _release(workspace, group):
@@ -555,7 +551,7 @@ def test_virtual_expert_placement_balances_every_destination(skew):
     """Equalize route load across ranks without over-subscribing virtual-expert slots."""
     routes = _routes_for_skew(skew)
     counts = _histogram(routes)
-    workspace, plan, _, _, group = _plan_on_this_rank(routes)
+    workspace, plan, _, group = _plan_on_this_rank(routes)
     try:
         allocation = workspace.field("allocation").cpu()
         experts_to_copy = plan.experts_to_copy.cpu()
@@ -623,7 +619,7 @@ def test_virtual_expert_placement_balances_every_destination(skew):
 def test_virtual_expert_planner_maps_every_route_to_the_expert_it_selected(skew):
     """Decode each virtual route back to the semantic expert and destination it was given."""
     routes = _routes_for_skew(skew)
-    workspace, plan, _, rank, group = _plan_on_this_rank(routes)
+    workspace, plan, rank, group = _plan_on_this_rank(routes)
     try:
         allocation = workspace.field("allocation").cpu()
         experts_to_copy = plan.experts_to_copy.cpu()
@@ -649,33 +645,5 @@ def test_virtual_expert_planner_maps_every_route_to_the_expert_it_selected(skew)
         observed = observed.cuda()
         dist.all_reduce(observed, group=group)
         torch.testing.assert_close(observed.cpu(), allocation, rtol=0, atol=0)
-    finally:
-        _release(workspace, group)
-
-
-@pytest.mark.internal
-@requires_four_ranks
-@pytest.mark.parametrize("skew", ["balanced", "hot_expert", "two_ranks_own_everything"])
-@pytest.mark.parametrize("num_tokens", [NUM_TOKENS, 1000])
-def test_virtual_expert_planner_writes_hybridep_inputs_with_probability_gradients(skew, num_tokens):
-    """The planner's dense runtime probabilities match a torch scatter of the router's compact
-    probabilities at the mapped runtime ids, and their gradient flows back to those entries."""
-    device = torch.device("cuda", torch.cuda.current_device())
-    generator = torch.Generator(device="cuda").manual_seed(4321)
-    routes = _routes_for_skew(skew, num_tokens)
-    probs = torch.rand((num_tokens, ROUTER_TOPK), device=device, generator=generator)
-    probs = probs.requires_grad_(True)
-    workspace, plan, runtime_probs, _, group = _plan_on_this_rank(routes, probs)
-    try:
-        expected = torch.zeros((num_tokens, 2 * NUM_EXPERTS), device=device)
-        expected = expected.scatter(1, plan.virtual_experts.long(), probs)
-        torch.testing.assert_close(runtime_probs, expected, rtol=0, atol=0)
-        assert runtime_probs.requires_grad and not plan.virtual_experts.requires_grad
-        assert plan.virtual_experts.dtype == torch.int16
-
-        grad = torch.rand(runtime_probs.shape, device=device, generator=generator)
-        (actual_grad,) = torch.autograd.grad(runtime_probs, probs, grad)
-        (expected_grad,) = torch.autograd.grad(expected, probs, grad)
-        torch.testing.assert_close(actual_grad, expected_grad, rtol=0, atol=0)
     finally:
         _release(workspace, group)

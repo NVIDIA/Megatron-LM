@@ -32,12 +32,10 @@ try:
 
     _TRITON_AVAILABLE = True
 except ImportError:
-    MAX_VIRTUAL_EXPERT_WEIGHT_SMS = 32
-    VirtualExpertPlannerWorkspace = None
-    launch_virtual_expert_grad_reduce = None
-    launch_virtual_expert_planner = None
-    launch_virtual_expert_weight_prefetch = None
     _TRITON_AVAILABLE = False
+    MAX_VIRTUAL_EXPERT_WEIGHT_SMS = VirtualExpertPlannerWorkspace = None
+    launch_virtual_expert_planner = launch_virtual_expert_weight_prefetch = None
+    launch_virtual_expert_grad_reduce = None
 from megatron.core.utils import ensure_params_ready, nvtx_decorator
 
 if TYPE_CHECKING:
@@ -53,158 +51,47 @@ _MXFP8_COMPONENTS = (
 )
 
 
+def _is_gtp(parameter) -> bool:
+    """Whether ``parameter`` is a GTP-sharded expert weight, gathered per forward."""
+    return getattr(parameter, "is_gtp_weight_remat", False)
+
+
 # ---- Planning --------------------------------------------------------------------------------
 
 
 @dataclass(slots=True)
 class VirtualExpertPlan:
-    """``virtual_experts``: int16 ``[num_tokens, router_topk]`` runtime ids (HybridEP's dense
-    top-k routing); ``experts_to_copy``: int32 ``[ep_size, num_local_experts]`` semantic ids per
-    virtual-expert slot, ``-1`` if unused.
+    """One pass's plan and what it holds in flight, from the planner to the end of its backward.
 
-    Plain data only. The backward hooks capture the plan inside autograd contexts, so a plan
-    holding a differentiable tensor (the runtime probabilities) would close a reference cycle
-    through the graph that Python's collector cannot see, leaking every layer's graph.
+    ``virtual_experts``: int16 ``[num_tokens, router_topk]`` runtime expert ids, the compact routes
+    the transport dispatches; ``experts_to_copy``: int32 ``[ep_size, num_local_experts]`` semantic
+    ids per virtual-expert slot, ``-1`` if unused. The manager owns the plan during its forward and
+    again during its backward, taking it back at the layer-output hook (a repeated MTP layer has
+    several forwards outstanding, so that hook carries the plan). Plain data and scalars only: the
+    backward hooks capture the plan inside autograd contexts.
     """
 
     virtual_experts: torch.Tensor
     experts_to_copy: torch.Tensor
+    # The plan's weight push was started and not yet waited for (one wait per push).
+    push_in_flight: bool = False
+    # The FC layers whose reduction was launched in the backward.
+    started: set = field(default_factory=set)
 
 
-class _PlanRoutes(torch.autograd.Function):
-    """One planner launch. The dense runtime probabilities it writes carry the gradient back to
-    the router's ``[num_tokens, topk]`` probabilities through a gather at the runtime ids."""
-
-    @staticmethod
-    def forward(ctx, probs, top_indices, workspace):
-        virtual_experts, runtime_probs, experts_to_copy = launch_virtual_expert_planner(
-            top_indices, probs, workspace
-        )
-        ctx.save_for_backward(virtual_experts)
-        ctx.probs_dtype = probs.dtype
-        ctx.mark_non_differentiable(virtual_experts, experts_to_copy)
-        # Autograd would otherwise zero-fill gradients for the two non-differentiable outputs.
-        ctx.set_materialize_grads(False)
-        return virtual_experts, runtime_probs, experts_to_copy
-
-    @staticmethod
-    def backward(ctx, grad_virtual_experts, grad_runtime_probs, grad_experts_to_copy):
-        if grad_runtime_probs is None:
-            return None, None, None
-        (virtual_experts,) = ctx.saved_tensors
-        grad_probs = grad_runtime_probs.gather(1, virtual_experts.long()).to(ctx.probs_dtype)
-        return grad_probs, None, None
-
-
-def plan_virtual_expert_routes(
-    top_indices: torch.Tensor, probs: torch.Tensor, workspace: VirtualExpertPlannerWorkspace
-) -> tuple[VirtualExpertPlan, torch.Tensor]:
+def plan_virtual_expert_routes(top_indices: torch.Tensor, workspace) -> VirtualExpertPlan:
     """Plan deterministic virtual-expert placement for one EP group and map this rank's routes.
 
-    ``top_indices`` / ``probs`` are the router's ``[num_tokens, topk]`` expert ids and
-    probabilities; every rank must route the same number of tokens. The histograms are the only
-    cross-rank input and the planner kernel exchanges them itself, so every rank computes the
-    same placement. Returns the plan and the dense float32 ``[num_tokens, 2 * num_experts]`` runtime
-    probabilities HybridEP consumes, which carry the gradient back to ``probs``.
+    ``top_indices`` are the router's ``[num_tokens, topk]`` expert ids; every rank must route the
+    same number of tokens. The histograms are the only cross-rank input and the planner kernel
+    exchanges them itself, so every rank computes the same placement.
     """
-    if top_indices.shape != probs.shape or top_indices.dtype not in (torch.int32, torch.int64):
-        raise ValueError("Virtual-expert planner takes matching [num_tokens, topk] ids and probs.")
-    top_indices, probs = top_indices.contiguous(), probs.contiguous()
-    virtual_experts, runtime_probs, experts_to_copy = _PlanRoutes.apply(
-        probs, top_indices, workspace
-    )
-    return VirtualExpertPlan(virtual_experts, experts_to_copy), runtime_probs
+    if top_indices.dim() != 2 or top_indices.dtype not in (torch.int32, torch.int64):
+        raise ValueError("Virtual-expert planner takes int32/int64 [num_tokens, topk] expert ids.")
+    return VirtualExpertPlan(*launch_virtual_expert_planner(top_indices.contiguous(), workspace))
 
 
 # ---- Virtual-expert slots: arenas and runtime parameters shared by every layer ---------------
-
-
-def _wrap_mxfp8(template, shape, views, device) -> tuple[torch.Tensor, ...]:
-    """Wrap ``(rowwise, rowwise_scale, columnwise, columnwise_scale)`` views as MXFP8 tensors
-    with ``template``'s quantization metadata."""
-    from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Tensor
-
-    return tuple(
-        MXFP8Tensor(
-            shape=shape,
-            dtype=template.dtype,
-            rowwise_data=rowwise,
-            rowwise_scale_inv=rowwise_scale,
-            columnwise_data=columnwise,
-            columnwise_scale_inv=columnwise_scale,
-            fp8_dtype=template._fp8_dtype,
-            quantizer=template._quantizer,
-            with_gemm_swizzled_scales=template._with_gemm_swizzled_scales,
-            requires_grad=False,
-            device=device,
-        )
-        for rowwise, rowwise_scale, columnwise, columnwise_scale in views
-    )
-
-
-def _runtime_parameter(weight: torch.Tensor, main_grad: torch.Tensor) -> torch.nn.Parameter:
-    """A parameter whose fused wgrad GEMM overwrites ``main_grad`` on every backward."""
-    parameter = torch.nn.Parameter(weight)
-    parameter.main_grad = main_grad
-    parameter.grad_added_to_main_grad = True
-    parameter.overwrite_main_grad = True
-    # TE returns a dummy leaf grad once the fused wgrad is in main_grad; drop it.
-    parameter.register_post_accumulate_grad_hook(lambda p: setattr(p, "grad", None))
-    return parameter
-
-
-def _make_virtual_parameters(data, scales, grads, template) -> tuple[torch.nn.Parameter, ...]:
-    """One runtime parameter per slot of ``data`` (``[L, *shape]``; MXFP8-wrapped with the
-    ``[L, numel // 32]`` ``scales`` and ``template``'s metadata when given), its ``main_grad`` the
-    matching slot of ``grads``."""
-    if scales is None:
-        weights = tuple(data)
-    else:
-        shape = tuple(data.shape[1:])
-        if getattr(template, "is_gtp_weight_remat", False):
-            rowwise, columnwise = (
-                template._gtp_gather_quantizer.get_scale_shape(shape, columnwise=c)
-                for c in (False, True)
-            )
-        else:
-            rowwise, columnwise = (
-                template._rowwise_scale_inv.shape,
-                template._columnwise_scale_inv.shape,
-            )
-        views = tuple(
-            (data[i], scales[i].view(rowwise), data[i], scales[i].view(columnwise))
-            for i in range(len(data))
-        )
-        weights = _wrap_mxfp8(template, shape, views, data.device)
-    return tuple(_runtime_parameter(weight, grad) for weight, grad in zip(weights, grads))
-
-
-def _make_native_parameters(
-    parameters, virtual_parameters, staging
-) -> tuple[torch.nn.Parameter, ...]:
-    """The natives' runtime parameters. Plain parameters are aliased and their wgrads land in
-    ``staging``. GTP parameters get shells that the first weight table points at the gathered
-    buffers (MXFP8 shells borrow the slots' storage until then, so TE sees complete tensors) and an
-    empty ``main_grad`` placeholder until a backward binds its scratch: TE's forward only checks
-    that a fused-accumulation weight has *a* main_grad, and the placeholder fails loudly if a
-    backward ever ran without one."""
-    if not getattr(parameters[0], "is_gtp_weight_remat", False):
-        return tuple(_runtime_parameter(p, grad) for p, grad in zip(parameters, staging))
-    slot = virtual_parameters[0]
-    placeholder = torch.empty(0, dtype=slot.main_grad.dtype, device=slot.device)
-    if is_mxfp8tensor(slot):
-        shells = _wrap_mxfp8(
-            parameters[0],
-            tuple(slot.shape),
-            tuple(
-                tuple(getattr(slot, name) for name in _MXFP8_COMPONENTS)
-                for slot in virtual_parameters
-            ),
-            slot.device,
-        )
-    else:
-        shells = (torch.empty(0, dtype=torch.bfloat16, device=slot.device),) * len(parameters)
-    return tuple(_runtime_parameter(shell, placeholder) for shell in shells)
 
 
 @dataclass(frozen=True, slots=True)
@@ -246,19 +133,21 @@ class _VirtualExperts:
         # One E8M0 scale byte per 32 MXFP8 weight bytes, unpadded (the config requires 128-aligned
         # FC layers so TE's padded scale layout has this exact size).
         scale_numels = tuple(numel // 32 if mxfp8 else 0 for numel in self.member_numels)
-        weight_sections = [
+        self._weight_sections = [
             count * n for pair in zip(self.member_numels, scale_numels) for n in pair
         ]
-        grad_sections = [count * numel for numel in self.member_numels]
+        self._grad_sections = [count * numel for numel in self.member_numels]
         try:
             if symm_mem.get_backend(device) != "NCCL":
                 symm_mem.set_backend("NCCL")
             self.weight_arena = symm_mem.empty(
-                sum(weight_sections), dtype=torch.uint8 if mxfp8 else torch.bfloat16, device=device
+                sum(self._weight_sections),
+                dtype=torch.uint8 if mxfp8 else torch.bfloat16,
+                device=device,
             )
             self.weight_handle = symm_mem.rendezvous(self.weight_arena, group)
             self.grad_arena = symm_mem.empty(
-                sum(grad_sections), dtype=config.grad_dtype, device=device
+                sum(self._grad_sections), dtype=config.grad_dtype, device=device
             )
             self.grad_handle = symm_mem.rendezvous(self.grad_arena, group)
         except RuntimeError as exc:
@@ -280,59 +169,120 @@ class _VirtualExperts:
         self.grad_arena.zero_()
         self.weight_grid_barrier = torch.zeros(1, dtype=torch.int32, device=device)
         self.grad_grid_barrier = torch.zeros(1, dtype=torch.int32, device=device)
-        weights = self.weight_arena.split(weight_sections)
-        grads = self.grad_arena.split(grad_sections)
         self.parameters = tuple(
-            _make_virtual_parameters(
-                weights[2 * i].view(count, *shape),
-                weights[2 * i + 1].view(count, -1) if mxfp8 else None,
-                grads[i].view(count, *shape),
-                template,
-            )
-            for i, (shape, template) in enumerate(zip(config.member_shapes, templates))
+            self._slot_parameters(i, template) for i, template in enumerate(templates)
         )
         # Plain natives' wgrad staging per FC layer: TE's GEMM overwrites it, the reduction adds the
         # virtual-expert partials, autograd hands it on. GTP natives write per-backward scratch.
         self.native_staging = tuple(
-            (
-                None
-                if getattr(template, "is_gtp_weight_remat", False)
-                else torch.empty((count, *shape), dtype=config.grad_dtype, device=device)
-            )
-            for template, shape in zip(templates, config.member_shapes)
+            None if _is_gtp(t) else torch.empty((count, *s), dtype=config.grad_dtype, device=device)
+            for t, s in zip(templates, config.member_shapes)
         )
 
+    @staticmethod
+    def _wrap_mxfp8(template, shape, views, device) -> tuple[torch.Tensor, ...]:
+        """Wrap ``(rowwise, rowwise_scale, columnwise, columnwise_scale)`` views as MXFP8 tensors
+        with ``template``'s quantization metadata."""
+        from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Tensor
+
+        return tuple(
+            MXFP8Tensor(
+                shape=shape,
+                dtype=template.dtype,
+                rowwise_data=rowwise,
+                rowwise_scale_inv=rowwise_scale,
+                columnwise_data=columnwise,
+                columnwise_scale_inv=columnwise_scale,
+                fp8_dtype=template._fp8_dtype,
+                quantizer=template._quantizer,
+                with_gemm_swizzled_scales=template._with_gemm_swizzled_scales,
+                requires_grad=False,
+                device=device,
+            )
+            for rowwise, rowwise_scale, columnwise, columnwise_scale in views
+        )
+
+    @staticmethod
+    def _runtime_parameter(weight: torch.Tensor, main_grad: torch.Tensor) -> torch.nn.Parameter:
+        """A parameter whose fused wgrad GEMM overwrites ``main_grad`` on every backward."""
+        parameter = torch.nn.Parameter(weight)
+        parameter.main_grad = main_grad
+        parameter.grad_added_to_main_grad = True
+        parameter.overwrite_main_grad = True
+        # TE returns a dummy leaf grad once the fused wgrad is in main_grad; drop it.
+        parameter.register_post_accumulate_grad_hook(lambda p: setattr(p, "grad", None))
+        return parameter
+
+    def _slot_parameters(self, fc_layer: int, template) -> tuple[torch.nn.Parameter, ...]:
+        """One runtime parameter per slot of ``fc_layer`` over its arena sections (MXFP8-wrapped
+        with ``template``'s quantization metadata), its ``main_grad`` the matching gradient slot."""
+        count, shape = self.num_local_experts, self.config.member_shapes[fc_layer]
+        weights = self.weight_arena.split(self._weight_sections)
+        data = weights[2 * fc_layer].view(count, *shape)
+        grads = self.grad_arena.split(self._grad_sections)[fc_layer].view(count, *shape)
+        if not self.config.mxfp8:
+            return tuple(self._runtime_parameter(w, g) for w, g in zip(data, grads))
+        scales = weights[2 * fc_layer + 1].view(count, -1)
+        if _is_gtp(template):
+            rowwise, columnwise = (
+                template._gtp_gather_quantizer.get_scale_shape(shape, columnwise=c)
+                for c in (False, True)
+            )
+        else:
+            rowwise, columnwise = (
+                template._rowwise_scale_inv.shape,
+                template._columnwise_scale_inv.shape,
+            )
+        views = tuple(
+            (data[i], scales[i].view(rowwise), data[i], scales[i].view(columnwise))
+            for i in range(count)
+        )
+        weights = self._wrap_mxfp8(template, shape, views, data.device)
+        return tuple(self._runtime_parameter(w, g) for w, g in zip(weights, grads))
+
+    def runtime_parameters(self, fc_layer: int, parameters) -> tuple[torch.nn.Parameter, ...]:
+        """The ``2L`` runtime parameters TE runs over for one layer's ``fc_layer``: its natives,
+        then the shared slots. Plain natives alias ``parameters`` and their wgrads land in the
+        staging. GTP natives are shells that the first weight table points at the gathered buffers
+        (MXFP8 shells borrow the slots' storage until then, so TE sees complete tensors) with an
+        empty ``main_grad`` placeholder until a backward binds its scratch: TE's forward only
+        checks that a fused-accumulation weight has *a* main_grad, and the placeholder fails
+        loudly if a backward ever ran without one."""
+        slots = self.parameters[fc_layer]
+        if not _is_gtp(parameters[0]):
+            staging = self.native_staging[fc_layer]
+            return (*(self._runtime_parameter(p, g) for p, g in zip(parameters, staging)), *slots)
+        device = self.config.device
+        placeholder = torch.empty(0, dtype=self.config.grad_dtype, device=device)
+        if self.config.mxfp8:
+            shells = self._wrap_mxfp8(
+                parameters[0],
+                self.config.member_shapes[fc_layer],
+                tuple(tuple(getattr(slot, name) for name in _MXFP8_COMPONENTS) for slot in slots),
+                device,
+            )
+        else:
+            shells = (torch.empty(0, dtype=torch.bfloat16, device=device),) * len(parameters)
+        return (*(self._runtime_parameter(shell, placeholder) for shell in shells), *slots)
+
     def destroy(self) -> None:
-        """Drop the NCCL window registrations while the process group is still alive, and the
-        slot parameters' hold on the gradient arena."""
-        if self.weight_arena is not None:
-            torch.cuda.synchronize(self.config.device)
-        for fc_layer in self.parameters:
-            for parameter in fc_layer:
-                parameter.main_grad = None
+        """Release the arenas from every runtime parameter that views them and drop the NCCL
+        window registrations, while the process group is still alive. The slot parameters are the
+        shared objects every layer and every TE op hold, so emptying their storage in place frees
+        the arenas without visiting the layers; a forward after this fails."""
+        if self.weight_arena is None:
+            return
+        torch.cuda.synchronize(self.config.device)
+        with torch.no_grad():
+            for slots in self.parameters:
+                for slot in slots:
+                    slot.main_grad = None
+                    if self.config.mxfp8:
+                        for name in _MXFP8_COMPONENTS:
+                            getattr(slot, name).set_()
+                    else:
+                        slot.set_()
         self.weight_handle = self.grad_handle = self.weight_arena = self.grad_arena = None
-
-
-_load_balancers = weakref.WeakSet()
-
-
-def finalize_virtual_experts() -> None:
-    """Release every layer's runtime parameters and the shared slots; idempotent. A normal exit
-    needs no call; callers that destroy their process groups while a model is still alive (tests,
-    an orderly shutdown) call it first so the NCCL windows are deregistered while their
-    communicator exists."""
-    cls = VirtualExpertLoadBalancer
-    try:
-        for load_balancer in list(_load_balancers):
-            load_balancer.release()
-        if cls.virtual_experts is not None:
-            cls.virtual_experts.destroy()
-        if cls.planner is not None:
-            cls.planner.destroy()
-    finally:
-        cls.virtual_experts = cls.planner = cls.weight_streams = cls.grad_stream = None
-        # The runtime parameters and their TE ops sit in reference cycles; free the arenas now.
-        gc.collect()
 
 
 # ---- Pointer tables --------------------------------------------------------------------------
@@ -347,29 +297,24 @@ class _FCLayerPointerTables:
     follows :meth:`bind_native_grads`, rewritten in place only when GTP hands out other scratch.
     """
 
-    def __init__(self, name, parameters, runtime_parameters, staging, index: int) -> None:
-        self.name = name
-        self.parameters = parameters
-        self.runtime_parameters = runtime_parameters
-        self.index = index
-        self.gtp_leader = (
-            parameters[0] if getattr(parameters[0], "is_gtp_weight_remat", False) else None
-        )
-        slot = runtime_parameters[-1]  # the slot parameters define the member layout
-        self.mxfp8 = is_mxfp8tensor(slot)
-        self.numel = slot.numel()
-        self.device = slot.device
-        self.grad_dtype = slot.main_grad.dtype
+    def __init__(self, virtual_experts: _VirtualExperts, index: int, parameters) -> None:
+        self.config, self.index, self.parameters = virtual_experts.config, index, parameters
+        self.name = f"FC{index + 1}"
+        self.numel = math.prod(self.config.member_shapes[index])
+        self.runtime_parameters = virtual_experts.runtime_parameters(index, parameters)
+        self.gtp_leader = parameters[0] if _is_gtp(parameters[0]) else None
         # What the natives' main_grad points at: the fixed staging (plain), or the GTP scratch
         # bound for the current backward, None in between while they sit on the empty placeholder.
-        self.placeholder = None if self.gtp_leader is None else runtime_parameters[0].main_grad
+        self.placeholder = None if self.gtp_leader is None else self.runtime_parameters[0].main_grad
         self.native_grads = None
         self._tables: dict[str, tuple[torch.Tensor, list[list[int]]]] = {}
-        if staging is not None:
-            self.bind_native_grads(staging)
+        if virtual_experts.native_staging[index] is not None:
+            self.bind_native_grads(virtual_experts.native_staging[index])
 
     def _components(self, direction: int) -> tuple[str, ...]:
-        return _MXFP8_COMPONENTS[2 * direction : 2 * direction + 2] if self.mxfp8 else ("data",)
+        if self.config.mxfp8:
+            return _MXFP8_COMPONENTS[2 * direction : 2 * direction + 2]
+        return ("data",)
 
     def _ptrs(self, direction: int, sources) -> list[list[int]]:
         return [
@@ -382,7 +327,7 @@ class _FCLayerPointerTables:
         place."""
         table = self._tables.get(key)
         if table is None:
-            table = (torch.tensor(rows, dtype=torch.int64, device=self.device), rows)
+            table = (torch.tensor(rows, dtype=torch.int64, device=self.config.device), rows)
         elif rows != table[1]:
             table[0].copy_(torch.tensor(rows, dtype=torch.int64))
             table = (table[0], rows)
@@ -404,7 +349,7 @@ class _FCLayerPointerTables:
         components = self._components(direction)
         expected = (
             ((self.numel, torch.uint8), (self.numel // 32, torch.uint8))
-            if self.mxfp8
+            if self.config.mxfp8
             else ((self.numel, torch.bfloat16),)
         )
         if not all(
@@ -416,12 +361,13 @@ class _FCLayerPointerTables:
                 f"{self.name}: virtual-expert weight sources must be contiguous {expected} per "
                 "expert."
             )
-        for parameter, source in zip(self.runtime_parameters, sources):
-            if self.mxfp8:
-                for name in components:
-                    setattr(parameter, name, getattr(source, name))
-            else:
-                parameter.data = source
+        if self.gtp_leader is not None:  # point the GTP shells at the gathers
+            for parameter, source in zip(self.runtime_parameters, sources):
+                if self.config.mxfp8:
+                    for name in components:
+                        setattr(parameter, name, getattr(source, name))
+                else:
+                    parameter.data = source
         return self._set_table(key, rows)
 
     def bind_native_grads(self, grads) -> None:
@@ -435,7 +381,7 @@ class _FCLayerPointerTables:
             if self.native_grads is not None:
                 raise RuntimeError(f"{self.name}: native wgrads bound twice in one backward.")
             if len(grads) != len(self.parameters) or not all(
-                g.dtype == self.grad_dtype
+                g.dtype == self.config.grad_dtype
                 and g.numel() == self.numel
                 and g.is_contiguous()
                 and g.data_ptr() % 16 == 0
@@ -443,7 +389,7 @@ class _FCLayerPointerTables:
             ):
                 raise ValueError(
                     f"{self.name}: native wgrads must be {len(self.parameters)} contiguous 16-byte "
-                    f"aligned {self.grad_dtype} buffers of {self.numel} elements."
+                    f"aligned {self.config.grad_dtype} buffers of {self.numel} elements."
                 )
             self._set_table("grad", [[g.data_ptr() for g in grads]])
             targets = grads
@@ -455,74 +401,31 @@ class _FCLayerPointerTables:
         """The ``[L]`` table of the natives' wgrad bases the reduction accumulates into."""
         return self._tables["grad"][0][0]
 
-    def release(self) -> None:
-        """Drop the natives' gradient targets so the staging and scratch they alias can go."""
-        for parameter in self.runtime_parameters[: len(self.parameters)]:
-            parameter.main_grad = None
-        self.native_grads = None
-
 
 # ---- Load balancer ---------------------------------------------------------------------------
 
 
-@dataclass(slots=True)
-class _PassTemporaries:
-    """What one pass of the layer holds in flight, from its layer input to the end of its backward.
-    The manager owns the pass in its forward and again in its backward, taking it back at the
-    layer-output hook (a repeated MTP layer has several forwards outstanding, so that hook carries
-    the pass). Only the plan and the flags outlive the forward, so an autograd context holding
-    this object closes no cycle through the graph."""
-
-    plan: VirtualExpertPlan | None = None
-    # The dense runtime probabilities HybridEP consumes, from the plan to dispatch.
-    runtime_probs: torch.Tensor | None = None
-    # The pass's weight push was started and not yet waited for (one wait per push).
-    push_in_flight: bool = False
-    # The FC layers whose reduction was launched in the backward.
-    started: set = field(default_factory=set)
-
-
-def _weak_hook(method, *args):
-    """Bind ``method(*args)`` for an autograd hook without keeping its owner alive. The owner, the
-    dispatcher's manager, holds differentiable tensors across a forward, so a strong reference from
-    an autograd context would close a reference cycle through the graph that Python's collector
-    cannot see, leaking every layer's graph. The model keeps the owner alive while hooks can fire.
-    """
-    bound = weakref.WeakMethod(method)
-
-    def hook():
-        return bound()(*args)
-
-    return hook
-
-
 class _VirtualExpertHook(torch.autograd.Function):
-    """Run ``hook()`` when the gradient passes this point. The tensor's gradient is unchanged;
-    whatever the hook returns becomes the gradients of ``inputs`` (the source parameters, at the
-    layer input)."""
+    """Call ``method(*args)`` when the gradient passes this point. The tensor's gradient is
+    unchanged; whatever the method returns becomes the gradients of ``inputs`` (the source
+    parameters, at the layer input). The method is held through a weak reference: its owner, the
+    dispatcher's manager, holds differentiable tensors across a forward, so a strong reference
+    from an autograd context would close a reference cycle through the graph that Python's
+    collector cannot see, leaking every layer's graph. The model keeps the owner alive while
+    hooks can fire."""
 
     @staticmethod
-    def forward(ctx, tensor, hook, *inputs):
-        ctx.hook = hook
+    def forward(ctx, tensor, method, args, *inputs):
+        ctx.method, ctx.args = weakref.WeakMethod(method), args
         return tensor
 
     @staticmethod
     def backward(ctx, grad):
-        return (grad, None, *(ctx.hook() or ()))
+        return (grad, None, None, *(ctx.method()(*ctx.args) or ()))
 
 
 def _as_tuple(value) -> tuple:
     return tuple(value) if isinstance(value, (list, tuple)) else (value,)
-
-
-# GTP's protocol calls on a group leader: a peek reads the gathered buffers without touching the
-# prefetch chain; a consume (materialize) is the chain step TE would take right before the GEMMs.
-_GTP_GATHER = {
-    (FORWARD, True): "peek_group_for_forward",
-    (FORWARD, False): "materialize_group_for_forward",
-    (BACKWARD, True): "peek_group_for_backward",
-    (BACKWARD, False): "materialize_group_for_backward",
-}
 
 
 class VirtualExpertLoadBalancer:
@@ -565,7 +468,6 @@ class VirtualExpertLoadBalancer:
         self.group = group
         self.config = config
         self.router_topk = router_topk
-        self.semantic_num_experts = num_experts
         self.num_owned_experts = num_local_experts
         # HybridEP pads every runtime expert's segment to the quantization block.
         self._alignment = get_align_size_for_quantization(config)
@@ -574,8 +476,8 @@ class VirtualExpertLoadBalancer:
         self.num_tokens: int | None = None
         self.rank_capacity: int | None = None
         self._experts_ref = None
-        # The pass this manager currently owns (see _PassTemporaries).
-        self._temporaries: _PassTemporaries | None = None
+        # The plan of the pass this manager currently owns (see VirtualExpertPlan).
+        self._plan: VirtualExpertPlan | None = None
         self.device = torch.device("cuda", torch.cuda.current_device())
         # CUDA events are created lazily on first record; materialize them before training or
         # graph capture.
@@ -597,7 +499,7 @@ class VirtualExpertLoadBalancer:
         """The start of a layer forward: check that the previous pass unwound completely, size
         this rank's transport capacity for the layer's token count (re-sized only if it changes)
         and, once per process, build the runtime parameters over the shared slots."""
-        if self._temporaries is not None:
+        if self._plan is not None:
             raise RuntimeError(
                 "Virtual-expert layer input wrapped while the previous pass is still in flight: "
                 "its forward was not finalized or its backward did not finish."
@@ -649,7 +551,9 @@ class VirtualExpertLoadBalancer:
             # The planner's allocation runs the first collective on the group, which creates the
             # device communicator the slots' NCCL window registrations need.
             cls.planner = VirtualExpertPlannerWorkspace(
-                num_experts=self.semantic_num_experts, device=self.device, group=self.group
+                num_experts=self.ep_size * self.num_owned_experts,
+                device=self.device,
+                group=self.group,
             )
             cls.virtual_experts = _VirtualExperts(
                 self.group, config, templates=tuple(group[0] for group in parameters)
@@ -663,34 +567,28 @@ class VirtualExpertLoadBalancer:
             raise ValueError(
                 "All virtual-expert MoE layers of a process run over one set of slots; the first "
                 f"layer bound {cls.virtual_experts.config}, this layer needs {config}. Callers "
-                "that rebuild their process groups must call finalize_virtual_experts() first."
+                "that rebuild their process groups must call VirtualExpertLoadBalancer.finalize() "
+                "first."
             )
-        virtual_experts = cls.virtual_experts
         self.fc_layers = [
-            _FCLayerPointerTables(
-                f"FC{i + 1}",
-                parameters[i],
-                (*_make_native_parameters(parameters[i], slots, staging), *slots),
-                staging,
-                i,
-            )
-            for i, (slots, staging) in enumerate(
-                zip(virtual_experts.parameters, virtual_experts.native_staging)
-            )
+            _FCLayerPointerTables(cls.virtual_experts, i, p) for i, p in enumerate(parameters)
         ]
         experts.bind_virtual_experts(self)
-        _load_balancers.add(self)
 
-    def release(self) -> None:
-        """Drop the runtime parameters so the slots they alias can be freed."""
-        experts = self._experts_ref() if self._experts_ref is not None else None
-        if experts is not None:
-            experts.unbind_virtual_experts()
-        for fc_layer in self.fc_layers:
-            fc_layer.release()
-        self.fc_layers = []
-        self._temporaries = None
-        _load_balancers.discard(self)
+    @classmethod
+    def finalize(cls) -> None:
+        """Release the shared slots and planner scratch; idempotent. A normal exit needs no call;
+        callers that destroy their process groups while a model is still alive (tests, an orderly
+        shutdown) call it first so the NCCL windows are deregistered while their communicator
+        exists."""
+        if cls.virtual_experts is not None:
+            cls.virtual_experts.destroy()
+        if cls.planner is not None:
+            cls.planner.destroy()
+        cls.virtual_experts = cls.planner = cls.weight_streams = cls.grad_stream = None
+        # TE's op contexts and autograd graphs hold the runtime parameters in reference cycles;
+        # collect now so anything still viewing the arenas is freed while the group is alive.
+        gc.collect()
 
     @property
     def num_runtime_experts(self) -> int:
@@ -738,7 +636,19 @@ class VirtualExpertLoadBalancer:
             if direction == FORWARD:
                 ensure_params_ready(fc_layer.parameters)
             return fc_layer.parameters
-        return _as_tuple(getattr(fc_layer.gtp_leader, _GTP_GATHER[direction, peek])())
+
+        leader = fc_layer.gtp_leader
+        if direction == FORWARD:
+            gathered = (
+                leader.peek_group_for_forward() if peek else leader.materialize_group_for_forward()
+            )
+        else:
+            gathered = (
+                leader.peek_group_for_backward()
+                if peek
+                else leader.materialize_group_for_backward()
+            )
+        return _as_tuple(gathered)
 
     def _consume_gtp_weights(self, fc_layer, direction: int) -> None:
         """GTP's real chain step for one FC layer. The buffers must be the ones the push peeked at;
@@ -782,14 +692,13 @@ class VirtualExpertLoadBalancer:
     # ---- forward: dispatcher hooks -----------------------------------------------------------
 
     def wrap_layer_input(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Open a pass and attach its gradient completion hook to the whole MoE layer input; the
-        hook returns the source parameters' gradients. It needs the router's input gradient, hence
-        the dispatch backward; the FC1 reduction start sits on the dispatch input, is created later
-        in the forward and so runs first under autograd's ordering."""
+        """Start a layer forward and attach its gradient completion hook to the whole MoE layer
+        input; the hook returns the source parameters' gradients. It needs the router's input
+        gradient, hence the dispatch backward; the FC1 reduction start sits on the dispatch input,
+        is created later in the forward and so runs first under autograd's ordering."""
         self._runtime_init(hidden_states)
-        self._temporaries = _PassTemporaries()
         return _VirtualExpertHook.apply(
-            hidden_states, _weak_hook(self._finish_grad_reduce), *self.source_parameters
+            hidden_states, self._finish_grad_reduce, (), *self.source_parameters
         )
 
     # Called from the dispatcher's jit-fused preprocessing: the planner must launch eagerly
@@ -797,35 +706,32 @@ class VirtualExpertLoadBalancer:
     # the graph around this call instead of tracing into it.
     @torch.compiler.disable
     @nvtx_decorator(message="virtual_expert_plan")
-    def plan_dispatch(self, top_indices: torch.Tensor, probs: torch.Tensor) -> None:
+    def plan_dispatch(self, top_indices: torch.Tensor) -> None:
         """Plan the router's ``[num_tokens, topk]`` routes and begin the weight push, before
         shared-expert compute."""
-        self._temporaries.plan, self._temporaries.runtime_probs = plan_virtual_expert_routes(
-            top_indices, probs, self.planner
-        )
+        self._plan = plan_virtual_expert_routes(top_indices, self.planner)
         self._start_weight_push(FORWARD)
 
     def prepare_virtual_expert_dispatch(
         self, hidden_states: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Attach dispatch-backward work and return what the transport dispatches: the hidden
-        states, the int16 ``[num_tokens, topk]`` runtime expert ids and the dense runtime
-        probabilities, which carry the gradient."""
+        states and the int16 ``[num_tokens, topk]`` runtime expert ids (the router's
+        probabilities are unchanged by the remap)."""
         hidden_states = _VirtualExpertHook.apply(
-            hidden_states, _weak_hook(self._start_pending_grad_reduces)
+            hidden_states, self._start_pending_grad_reduces, ()
         )
-        runtime_probs, self._temporaries.runtime_probs = self._temporaries.runtime_probs, None
-        return hidden_states, self._temporaries.plan.virtual_experts, runtime_probs
+        return hidden_states, self._plan.virtual_experts
 
     def prepare_virtual_expert_combine(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Attach the backward weight-push wait before transport combine."""
-        return _VirtualExpertHook.apply(hidden_states, _weak_hook(self._prepare_expert_backward))
+        return _VirtualExpertHook.apply(hidden_states, self._prepare_expert_backward, ())
 
     def finalize_output(self, output: torch.Tensor) -> torch.Tensor:
-        """Close the forward; the layer output's backward hook hands the pass back for its
+        """Close the forward; the layer output's backward hook hands the plan back for its
         backward and starts the backward weight push."""
-        temporaries, self._temporaries = self._temporaries, None
-        return _VirtualExpertHook.apply(output, _weak_hook(self._start_backward, temporaries))
+        plan, self._plan = self._plan, None
+        return _VirtualExpertHook.apply(output, self._start_backward, (plan,))
 
     # ---- weight push -------------------------------------------------------------------------
 
@@ -834,7 +740,7 @@ class VirtualExpertLoadBalancer:
     def _start_weight_push(self, direction: int) -> None:
         """Enqueue the owner push of the pass's FC1/FC2 weights on the weight stream. Only reads
         the weights: GTP consumes them, and issues its next prefetch, at the expert GEMMs."""
-        if self._temporaries.push_in_flight:
+        if self._plan.push_in_flight:
             raise RuntimeError("Virtual-expert weight prefetch is already outstanding.")
         # Peeks need no GEMM order: both precede this direction's consumes, and neither gather
         # depends on the other.
@@ -853,19 +759,19 @@ class VirtualExpertLoadBalancer:
                 scale_sources=(
                     tuple(table[1] for table in tables) if virtual_experts.config.mxfp8 else None
                 ),
-                experts_to_copy=self._temporaries.plan.experts_to_copy,
+                experts_to_copy=self._plan.experts_to_copy,
             )
             self.prefetch_done.record(weight_stream)
-        self._temporaries.push_in_flight = True
+        self._plan.push_in_flight = True
 
     @torch.no_grad()
     @nvtx_decorator(message="virtual_expert_weight_push_wait")
     def _wait_weight_push(self) -> None:
         """Make the current stream wait for the pass's push; exactly once per push."""
-        if not self._temporaries.push_in_flight:
+        if not self._plan.push_in_flight:
             raise RuntimeError("Virtual-expert weights require a started, unwaited prefetch.")
         torch.cuda.current_stream(self.device).wait_event(self.prefetch_done)
-        self._temporaries.push_in_flight = False
+        self._plan.push_in_flight = False
 
     @torch.no_grad()
     def prepare_expert_forward(self) -> None:
@@ -875,11 +781,11 @@ class VirtualExpertLoadBalancer:
             self._consume_gtp_weights(fc_layer, FORWARD)
 
     @torch.no_grad()
-    def _start_backward(self, temporaries: _PassTemporaries) -> None:
-        """At the layer output's backward: take the pass back and start its backward push."""
-        if self._temporaries is not None:
+    def _start_backward(self, plan: VirtualExpertPlan) -> None:
+        """At the layer output's backward: take the plan back and start its backward push."""
+        if self._plan is not None:
             raise RuntimeError("Virtual-expert backward started while another pass is outstanding.")
-        self._temporaries = temporaries
+        self._plan = plan
         self._start_weight_push(BACKWARD)
 
     @torch.no_grad()
@@ -904,10 +810,10 @@ class VirtualExpertLoadBalancer:
     def _start_grad_reduce(self, fc_layer: int) -> None:
         """Enqueue the virtual-expert-gradient reduction of one FC layer (0 = FC1, 1 = FC2)
         on the reduction stream, behind everything the compute stream has issued."""
-        temporaries = self._temporaries
-        if temporaries is None or temporaries.push_in_flight:
+        plan = self._plan
+        if plan is None or plan.push_in_flight:
             raise RuntimeError("Virtual-expert gradient reduction needs the prepared backward.")
-        if fc_layer in temporaries.started:
+        if fc_layer in plan.started:
             raise RuntimeError(
                 f"Virtual-expert gradient reduction of FC{fc_layer + 1} started twice."
             )
@@ -916,13 +822,13 @@ class VirtualExpertLoadBalancer:
             launch_virtual_expert_grad_reduce(
                 self.virtual_experts,
                 native_grads=tuple(fc_layer.grad_table() for fc_layer in self.fc_layers),
-                experts_to_copy=temporaries.plan.experts_to_copy,
+                experts_to_copy=plan.experts_to_copy,
                 fc_layers=(fc_layer,),
             )
             # Both reductions run in order on the reduction stream, FC2 first, so the event
             # recorded after the last launch covers both.
             self.grad_reduce_done.record(self.grad_stream)
-        temporaries.started.add(fc_layer)
+        plan.started.add(fc_layer)
 
     def start_fc2_grad_reduce(self) -> None:
         """Start FC2's reduction from the expert backward, right behind FC2's wgrad GEMM."""
@@ -933,7 +839,7 @@ class VirtualExpertLoadBalancer:
         normally starts from the FC2 op's wgrad store; FC1 starts here and hides behind the
         latent, shared-expert and router backward."""
         for fc_layer in (1, 0):
-            if fc_layer not in self._temporaries.started:
+            if fc_layer not in self._plan.started:
                 self._start_grad_reduce(fc_layer)
 
     @torch.no_grad()
@@ -950,8 +856,8 @@ class VirtualExpertLoadBalancer:
         the earliest compute-stream point after both reductions: FC2's started at its wgrad GEMM
         and FC1's at the dispatch backward, so the waits are normally free.
         """
-        temporaries, self._temporaries = self._temporaries, None
-        if temporaries is None or temporaries.started != {0, 1}:
+        plan, self._plan = self._plan, None
+        if plan is None or plan.started != {0, 1}:
             raise RuntimeError(
                 "Virtual-expert gradient reduction of both fc_layers must be started."
             )

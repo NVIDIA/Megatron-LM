@@ -26,7 +26,7 @@ import torch.nn.functional as F
 
 from megatron.core.activations import squared_relu
 from megatron.core.transformer.moe import fused_a2a
-from megatron.core.transformer.moe.virtual_expert_load_balancer import finalize_virtual_experts
+from megatron.core.transformer.moe.virtual_expert_load_balancer import VirtualExpertLoadBalancer
 
 MXFP8_COMPONENTS = (
     "_rowwise_data",
@@ -290,7 +290,7 @@ def _run_full_layer_parity(
 
         def record_plan(*routes):
             plan_dispatch(*routes)
-            plans.append(manager._temporaries.plan)
+            plans.append(manager._plan)
 
         manager.plan_dispatch = record_plan
         if mxfp8:
@@ -402,7 +402,7 @@ def _run_full_layer_parity(
     finally:
         # Release the arenas while their communicator is alive, then destroy the
         # process-global HybridEP buffer in lockstep across ranks.
-        finalize_virtual_experts()
+        VirtualExpertLoadBalancer.finalize()
         Utils.destroy_model_parallel()
         torch.cuda.synchronize()
         torch.distributed.barrier()
@@ -546,7 +546,7 @@ def _run_repeated_mtp_parity(monkeypatch):
 
         def record_plan(*routes):
             plan_dispatch(*routes)
-            plans.append(manager._temporaries.plan)
+            plans.append(manager._plan)
 
         manager.plan_dispatch = record_plan
         virtual_expert_loss = forward(virtual_expert_model)
@@ -562,7 +562,7 @@ def _run_repeated_mtp_parity(monkeypatch):
 
         virtual_expert_loss.sum().backward()
         virtual_expert_gradients = snapshot(virtual_expert_model)
-        assert manager._temporaries is None
+        assert manager._plan is None
 
         torch.testing.assert_close(
             virtual_expert_loss,
@@ -603,7 +603,7 @@ def _run_repeated_mtp_parity(monkeypatch):
         # aliasing the symmetric arenas; drop them so the arenas are released with the group.
         reference_loss = virtual_expert_loss = None
         del reference_model, virtual_expert_model
-        finalize_virtual_experts()
+        VirtualExpertLoadBalancer.finalize()
         Utils.destroy_model_parallel()
         torch.cuda.synchronize()
         torch.distributed.barrier()
