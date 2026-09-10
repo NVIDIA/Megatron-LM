@@ -136,7 +136,7 @@ class _VocabParallelCrossEntropy(torch.autograd.Function):
         world_size = get_pg_size(tp_group)
         vocab_start_index, vocab_end_index = get_vocab_range(partition_vocab_size, rank, world_size)
 
-        (target_mask, masked_target_1d, predicted_logits, sum_exp_logits, exp_logits) = (
+        target_mask, masked_target_1d, predicted_logits, sum_exp_logits, exp_logits = (
             VocabParallelCrossEntropy.calculate_predicted_logits(
                 vocab_parallel_logits, target, logits_max, vocab_start_index, vocab_end_index
             )
@@ -190,7 +190,7 @@ class _VocabParallelCrossEntropy(torch.autograd.Function):
         softmax, target_mask, masked_target_1d = ctx.saved_tensors
         label_smoothing, vocab_size = ctx.label_smoothing, ctx.vocab_size
 
-        (grad_2d, arange_1d, softmax_update, grad_input) = (
+        grad_2d, arange_1d, softmax_update, grad_input = (
             VocabParallelCrossEntropy.prepare_gradient_calculation_operands(softmax, target_mask)
         )
 
