@@ -249,13 +249,13 @@ def get_valid_flex_dispatcher_backends():
     its TransformerEngine NCCL EP build is present, so each overlap test exercises ncclep alongside
     the existing reference backend.
     """
-    from megatron.core.transformer.moe.fused_a2a import HAVE_TE_EP
+    from tests.unit_tests.test_utilities import is_nccl_ep_available
 
     backends = []
     primary = get_valid_flex_dispatcher_backend()
     if primary is not None:
         backends.append(primary)
-    if HAVE_TE_EP and "ncclep" not in backends:
+    if is_nccl_ep_available() and "ncclep" not in backends:
         backends.append("ncclep")
     return backends
 
