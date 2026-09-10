@@ -3,13 +3,13 @@
 import torch
 
 from megatron.core.enums import Fp8Recipe
+from megatron.core.fp8_utils import is_first_last_bf16_layer
 from megatron.core.models.common.model_chunk_schedule_plan import TransformerModelChunkSchedulePlan
 from megatron.core.models.gpt.fine_grained_callables import (
     PostProcessNode,
     PreProcessNode,
     build_transformer_layer_callables,
     finalize_decoder_layer_output,
-    with_sequence_parallel_rng,
 )
 from megatron.core.transformer.module import GraphableMegatronModule, float16_to_fp32
 from megatron.core.transformer.moe.moe_layer import MoELayer
@@ -67,6 +67,14 @@ class HybridModelChunkSchedulePlan(TransformerModelChunkSchedulePlan):
         if config.fp4:
             raise ValueError("Hybrid EP overlap does not support FP4")
         super().__init__(model, *args, **kwargs)
+        if config.fp8 and config.first_last_layers_bf16:
+            for index in range(self.num_layers()):
+                layer_plan = self.get_layer(index)
+                if is_first_last_bf16_layer(config, layer_plan.layer.layer_number - 1):
+                    # The shared schedule assumes FP8 experts save quantized inputs.
+                    # BF16 boundary layers can instead save the dispatch buffer
+                    # directly, so keep its storage until their backward completes.
+                    layer_plan.mlp.free_input = False
 
     @staticmethod
     def _get_pre_post_process_nodes():
@@ -79,7 +87,9 @@ def build_hybrid_layer_callables(layer):
     Attention/dense wrappers execute in one compute node. A MoE wrapper retains
     its mHC state across routing, dispatch, experts, combine and the final compute
     node. The latter owns the n-stream residual; the inner layer's local BDA must
-    not run a second time.
+    not run a second time. Unlike TransformerBlock, ordinary HybridStack does not
+    fork the TP RNG around its layers. Preserve that default RNG stream here,
+    including sequence-parallel dropout and router jitter.
     """
     inner = layer.inner_layer
     if not isinstance(inner, TransformerLayer):
@@ -104,14 +114,7 @@ def build_hybrid_layer_callables(layer):
         def finish(node, hidden_states):
             return finalize_decoder_layer_output(node, hidden_states)
 
-        return [
-            with_sequence_parallel_rng(compute, layer.config),
-            None,
-            finish,
-            None,
-            None,
-            None,
-        ], {}
+        return [compute, None, finish, None, None, None], {}
 
     moe = inner.mlp
     inner_callables, _ = build_transformer_layer_callables(inner)
@@ -177,11 +180,4 @@ def build_hybrid_layer_callables(layer):
             setattr(state, name, None)
         return hidden_states
 
-    return [
-        with_sequence_parallel_rng(prefix, layer.config),
-        dispatch,
-        experts,
-        combine,
-        None,
-        with_sequence_parallel_rng(post, layer.config),
-    ], {}
+    return [prefix, dispatch, experts, combine, None, post], {}

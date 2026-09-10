@@ -56,6 +56,14 @@ it on replay. This preserves padding-dependent router losses and expert counts
 without changing graph input tensors. Hybrid overlap rejects FP4 until its
 separate quantization contexts are supported.
 
+Hybrid-owned schedule nodes preserve HybridStack's default RNG stream, including
+sequence-parallel dropout and router jitter in non-attention `E`/dense stacks;
+DSv4 attention itself requires TP1. They do not inherit the TP RNG fork used by
+GPT's TransformerBlock. Under FP8, Hybrid layers selected for BF16 by
+`first_last_layers_bf16` retain their MLP node inputs until backward: a BF16
+expert can save the original dispatch buffer when router padding and one local
+expert eliminate the intermediate copies that otherwise protect that storage.
+
 ## Validation
 
 Focused tests cover logical-to-capture indexing, changing pack counts, distinct
@@ -72,3 +80,8 @@ iterations with changing physical microbatch counts and evaluation after
 iterations 10, 20 and 30. Separate real-EP2 tests compare every parameter's
 gradient with ordinary Hybrid forward for mHC disabled and enabled. The route
 arena and slot regression includes real TE graphs and 30 changing route replays.
+
+The Hybrid schedule tests also compare three overlapping invocations after
+restoring both default and tracked RNG states: TP2/SP/EP2 with dropout and router
+jitter, and MXFP8 with BF16 boundary experts and router padding. Both exercise
+mHC disabled/enabled and check forward outputs plus every parameter gradient.
