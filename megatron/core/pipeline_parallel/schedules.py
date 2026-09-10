@@ -2631,6 +2631,17 @@ def forward_backward_pipelining_without_interleaving(
                 p2p_communicator.send_backward(
                     input_tensor_grad, p2p_communicator.is_pp_first_stage
                 )
+            elif config.variable_seq_lengths or config.mtp_standalone:
+                # Shape negotiation completes before either payload is sent.
+                # The upstream rank needs this gradient payload to compute the
+                # next forward, so waiting for its forward shape in a combined
+                # exchange would deadlock. Finish the backward send first.
+                p2p_communicator.send_backward(
+                    input_tensor_grad, p2p_communicator.is_pp_first_stage
+                )
+                input_tensor = p2p_communicator.recv_forward(
+                    recv_tensor_shapes, p2p_communicator.is_pp_first_stage
+                )
             else:
                 input_tensor = p2p_communicator.send_backward_recv_forward(
                     input_tensor_grad, recv_tensor_shapes, p2p_communicator.is_pp_first_stage

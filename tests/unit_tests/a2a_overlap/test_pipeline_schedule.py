@@ -8,8 +8,9 @@ Run on eight GPUs to cover PP2 and PP4, both with EP2::
         -m pytest tests/unit_tests/a2a_overlap/test_pipeline_schedule.py \
         --experimental -q --disable-warnings --tb=short
 
-Four GPUs also run the PP2 cases. Regular unfused attention keeps this protocol
-test independent of the DSv4 kernels' device requirements.
+Four GPUs also run the PP2 cases. Fixed and changing sequence lengths exercise
+both P2P payload-only and shape-negotiation protocols. Regular unfused attention
+keeps this test independent of the DSv4 kernels' device requirements.
 """
 
 import gc
@@ -32,7 +33,7 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
 
-def _build_pipeline_model(pp_size, pg_collection, overlap):
+def _build_pipeline_model(pp_size, pg_collection, overlap, variable_seq_lengths):
     config = TransformerConfig(
         num_layers=2 * pp_size,
         hidden_size=128,
@@ -59,6 +60,7 @@ def _build_pipeline_model(pp_size, pg_collection, overlap):
         normalization="RMSNorm",
         overlap_moe_expert_parallel_comm=overlap,
         deallocate_pipeline_outputs=True,
+        variable_seq_lengths=variable_seq_lengths,
         # Compare local parameter gradients directly; no DDP main_grad buffers
         # or optimizer step should obscure missing/wrong pipeline backwards.
         gradient_accumulation_fusion=False,
@@ -115,7 +117,10 @@ def _run_pipeline(model, data, pg_collection):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("pp_size", [2, 4], ids=["pp2", "pp4"])
 @pytest.mark.parametrize("short", [True, False], ids=["short", "steady"])
-def test_noninterleaved_pipeline_ep_overlap_loss_and_grad_parity(pp_size, short):
+@pytest.mark.parametrize("variable_seq_lengths", [False, True], ids=["fixed", "variable"])
+def test_noninterleaved_pipeline_ep_overlap_loss_and_grad_parity(
+    pp_size, short, variable_seq_lengths
+):
     """Compare actual P2P and EP collectives for short and steady-state batches.
 
     Every rank compares all its local parameters, including attention, router,
@@ -125,16 +130,22 @@ def test_noninterleaved_pipeline_ep_overlap_loss_and_grad_parity(pp_size, short)
     if Utils.world_size < 2 * pp_size or Utils.world_size % (2 * pp_size):
         pytest.skip(f"PP{pp_size}/EP2 requires a world size divisible by {2 * pp_size}")
     Utils.initialize_model_parallel(
-        pipeline_model_parallel_size=pp_size, expert_model_parallel_size=2
+        pipeline_model_parallel_size=pp_size,
+        expert_model_parallel_size=2,
+        distributed_timeout_minutes=2,
     )
     models = []
     try:
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         torch.manual_seed(123)
         model_parallel_cuda_manual_seed(123)
-        reference = _build_pipeline_model(pp_size, pg_collection, overlap=False)
+        reference = _build_pipeline_model(
+            pp_size, pg_collection, overlap=False, variable_seq_lengths=variable_seq_lengths
+        )
         models.append(reference)
-        overlapped = _build_pipeline_model(pp_size, pg_collection, overlap=True)
+        overlapped = _build_pipeline_model(
+            pp_size, pg_collection, overlap=True, variable_seq_lengths=variable_seq_lengths
+        )
         models.append(overlapped)
         overlapped.load_state_dict(reference.state_dict())
 
@@ -142,14 +153,18 @@ def test_noninterleaved_pipeline_ep_overlap_loss_and_grad_parity(pp_size, short)
         # Distinct DP inputs exercise real EP exchange. Each corresponding PP
         # rank uses the same generator seed, so tokens and labels stay aligned.
         generator = torch.Generator(device="cuda").manual_seed(765 + pg_collection.dp_cp.rank())
+        lengths = [
+            (32, 64, 48)[microbatch % 3] if variable_seq_lengths else 64
+            for microbatch in range(num_microbatches)
+        ]
         data = [
             {
-                "input_ids": torch.randint(0, 256, (2, 64), device="cuda", generator=generator),
-                "labels": torch.randint(0, 256, (2, 64), device="cuda", generator=generator),
-                "position_ids": torch.arange(64, device="cuda").expand(2, -1),
+                "input_ids": torch.randint(0, 256, (2, length), device="cuda", generator=generator),
+                "labels": torch.randint(0, 256, (2, length), device="cuda", generator=generator),
+                "position_ids": torch.arange(length, device="cuda").expand(2, -1),
                 "attention_mask": None,
             }
-            for _ in range(num_microbatches)
+            for length in lengths
         ]
 
         expected_losses, expected_grads = _run_pipeline(reference, data, pg_collection)
