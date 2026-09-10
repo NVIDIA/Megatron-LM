@@ -75,8 +75,6 @@ class MegatronMultimodalTokenizer:
             special_tokens (List[str]): Non-text tokens.
             image_tag_type (str): Image tag to apply, if any. For example <img><image></img>.
         """
-        self.use_gigatoken = use_gigatoken
-
         if not HAVE_TRANSFORMERS:
             raise ImportError(
                 "MegatronMultimodalTokenizer currently requires "
@@ -202,11 +200,13 @@ class MegatronMultimodalTokenizer:
         self._prompt_format = prompt_format
         self._image_tag = IMAGE_TAGS[image_tag_type]
 
+        self.use_gigatoken = use_gigatoken
         self._hf_tokenizer = self.tokenizer
         if self.use_gigatoken:
-            import gigatoken as gt
+            # restore tokenizer with gigatoken
+            from megatron.core.tokenizers.utils import init_gigatoken_from_hf
 
-            self.tokenizer = gt.Tokenizer(self.tokenizer).as_hf()
+            self.tokenizer = init_gigatoken_from_hf(self.tokenizer, tokenizer_path)
 
     def _apply_image_tag(self, text: Union[str, List[Dict]]):
         """Surround <image> with image tags such as <img> and </img>."""
@@ -251,11 +251,6 @@ class MegatronMultimodalTokenizer:
             return_target (bool): Return target tokens with system and assistant masked.
             add_generation_prompt (bool): Add assistant prefix to the end.
         """
-        tokenize = True
-        if self.use_gigatoken:
-            # Tokenize conversation with separately gigatoken to get better performance.
-            tokenize = False
-
         # Skip system message if the tokenizer doesn't have a system role.
         if not self._prompt_config.has_system_role and conversation[0]["role"] == "system":
             conversation = conversation[1:]
@@ -276,6 +271,11 @@ class MegatronMultimodalTokenizer:
 
         # Apply possible image tag.
         conversation = self._apply_image_tag(conversation)
+
+        tokenize = True
+        if self.use_gigatoken:
+            # Tokenize conversation with separately gigatoken to get better performance.
+            tokenize = False
 
         tokens = self._hf_tokenizer.apply_chat_template(
             conversation,

@@ -46,13 +46,14 @@ class PromptConfig:
 class SFTTokenizer:
     """SFT Tokenizer."""
 
-    def __init__(self, tokenizer_path: str, prompt_format: str):
+    def __init__(self, tokenizer_path: str, prompt_format: str, use_gigatoken: bool = False):
         """
         Note: Currently, only HuggingFaceTokenizer is supported as the underlying text tokenizer.
 
         Args:
             tokenizer_path (str): Underlying tokenizer path.
             prompt_format (str): Prompt format for the tokenizer.
+            use_gigatoken (bool): Whether to use gigatoken for tokenization.
         """
         if HAVE_TRANSFORMERS:
             # Currently, only HuggingFace tokenizers are supported.
@@ -108,6 +109,14 @@ class SFTTokenizer:
 
         self._prompt_format = prompt_format
 
+        self.use_gigatoken = use_gigatoken
+        self._hf_tokenizer = self._tokenizer
+        if self.use_gigatoken:
+            # restore tokenizer with gigatoken
+            from megatron.core.tokenizers.utils import init_gigatoken_from_hf
+
+            self._tokenizer = init_gigatoken_from_hf(self._tokenizer, tokenizer_path)
+
     @staticmethod
     def _extract_token_ids(result) -> np.ndarray:
         if isinstance(result, dict) or hasattr(result, "input_ids"):
@@ -147,16 +156,27 @@ class SFTTokenizer:
         if not self._prompt_config.has_system_role and conversation[0]["role"] == "system":
             conversation = conversation[1:]
 
+        tokenize = True
+        if self.use_gigatoken:
+            # Tokenize conversation with separately gigatoken to get better performance.
+            tokenize = False
+
         tokens = self._extract_token_ids(
-            self._tokenizer.apply_chat_template(
+            self._hf_tokenizer.apply_chat_template(
                 conversation,
-                tokenize=True,
+                tokenize=tokenize,
                 add_generation_prompt=add_generation_prompt,
                 return_assistant_token_mask=False,
                 return_tensors="np",
                 chat_template=self._prompt_config.custom_chat_template,
             )
         )
+
+        if not self.use_gigatoken:
+            tokens = tokens[0]
+        else:
+            # Tokenize conversation using gigatoken (when tokenize=False).
+            tokens = np.array(self.text_to_ids(tokens, add_special_tokens=False))
 
         if not return_target:
             return tokens
@@ -178,7 +198,7 @@ class SFTTokenizer:
                 assert conversation[turn_idx - 1]["role"].lower() in ("user", "tool")
 
             turn_tokens = self._extract_token_ids(
-                self._tokenizer.apply_chat_template(
+                self._hf_tokenizer.apply_chat_template(
                     [turn], tokenize=True, chat_template=self._prompt_config.custom_chat_template
                 )
             )
@@ -208,7 +228,7 @@ class SFTTokenizer:
 
         return tokens, target
 
-    def text_to_ids(self, text: Union[str, List[Dict]]):
+    def text_to_ids(self, text: Union[str, List[Dict]], add_special_tokens: bool = True):
         """Tokenize conversation or string input."""
         if isinstance(text, list):
             # This code path is used by the inference code currently.
@@ -216,7 +236,7 @@ class SFTTokenizer:
                 text, return_target=False, add_generation_prompt=True
             ).tolist()
 
-        return self._tokenizer.encode(text)
+        return self._tokenizer.encode(text, add_special_tokens=add_special_tokens)
 
     def tokens_to_ids(self, tokens: List[str]):
         """Convert tokens to IDs."""
