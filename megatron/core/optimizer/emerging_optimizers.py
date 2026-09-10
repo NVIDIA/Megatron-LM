@@ -430,12 +430,17 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
 
         mode = self.tp_mode
         if mode == "auto":
-            # Scoped to dense (GTP) weights for now; expert weights keep today's default.
-            mode = (
-                self._resolve_tp_mode(p.shape[0] * gtp_remat_size, p.shape[1], gtp_remat_size)
-                if gtp_active and not is_expert
-                else "duplicated"
-            )
+            if qkv_split_shapes is not None:
+                # Only duplicated can honor a split; the cost model below doesn't know
+                # that, so pin it here instead of letting the shape decide.
+                mode = "duplicated"
+            else:
+                # Scoped to dense (GTP) weights for now; expert weights keep today's default.
+                mode = (
+                    self._resolve_tp_mode(p.shape[0] * gtp_remat_size, p.shape[1], gtp_remat_size)
+                    if gtp_active and not is_expert
+                    else "duplicated"
+                )
 
         def orthogonalize_whole_matrix(whole_grad):
             """Orthogonalize `whole_grad`, splitting [q|k|v] first when asked.
