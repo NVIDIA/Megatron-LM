@@ -722,3 +722,9 @@ def test_moe_router_aux_loss_fusion_defaults_to_router_fusion():
             moe_router_fusion=routing, moe_router_aux_loss_fusion=aux, **kwargs
         )
         assert config.moe_router_aux_loss_fusion is aux
+
+    # Resolving at construction means the value is concrete afterwards, so a child built
+    # by dataclasses.replace inherits it rather than re-deriving from its own flag.
+    parent = TransformerConfig(moe_router_fusion=False, **kwargs)
+    child = dataclasses.replace(parent, moe_router_fusion=True)
+    assert child.moe_router_aux_loss_fusion is False
