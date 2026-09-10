@@ -32,6 +32,17 @@ from megatron.core.transformer.utils import (
     ensure_metadata_has_dp_cp_group,
     sharded_state_dict_default,
 )
+
+try:
+    from megatron.core.tensor_parallel.gtp_api import HAVE_GTP, is_gtp_param
+except ImportError:  # pragma: no cover - TE-less environments have no GTP
+    HAVE_GTP = False
+
+    def is_gtp_param(_param):
+        """Return False when the optional GTP imports are unavailable."""
+        return False
+
+
 from megatron.core.typed_torch import apply_module, not_none
 from megatron.core.utils import (
     get_pg_rank,
@@ -388,13 +399,47 @@ class MLP(MegatronModule):
             if self.config.gated_linear_unit and name == "linear_fc1":
                 for k, v in sub_sd.items():
                     if k in (f"{prefix}{name}.weight", f"{prefix}{name}.bias"):
-                        sub_sd[k] = apply_swiglu_sharded_factory(
-                            v,
-                            sharded_offsets,
-                            singleton_local_shards,
-                            tp_group=self.tp_group,
-                            dp_group=metadata['dp_cp_group'],
-                        )
+                        weight = getattr(module, "weight", None)
+                        if k == f"{prefix}{name}.weight" and HAVE_GTP and is_gtp_param(weight):
+                            # GTP shards dim0 of the fused [gate|up] weight, and the gate/up
+                            # boundary does not line up with the shard boundaries. Checkpoint
+                            # in the LOGICAL layout instead: gather the shards back to the
+                            # TP-local tensor (pad stripped), run the SAME swiglu split a
+                            # non-GTP run uses, and slice this rank's contiguous rows back
+                            # out on load. This also pins the storage mapping — a shard is a
+                            # contiguous row slice of [gate|up] — so the runtime all-gather
+                            # is already in logical order and needs no permutation.
+                            from megatron.core.tensor_parallel.gtp_ckpt import (
+                                _gtp_gather_rows_for_save,
+                                _gtp_slice_rows_on_load,
+                            )
+
+                            target_rows = weight.shape[0] * weight.group.size() - weight.pad_length
+                            v = _gtp_gather_rows_for_save(
+                                v,
+                                k,
+                                weight,
+                                target_rows,
+                                self.tp_group,
+                                metadata['dp_cp_group'],
+                                sharded_offsets,
+                            )
+                            v = apply_swiglu_sharded_factory(
+                                v,
+                                sharded_offsets,
+                                singleton_local_shards,
+                                tp_group=self.tp_group,
+                                dp_group=metadata['dp_cp_group'],
+                            )
+                            sub_sd[k] = _gtp_slice_rows_on_load(v, weight)
+                        else:
+                            sub_sd[k] = apply_swiglu_sharded_factory(
+                                v,
+                                sharded_offsets,
+                                singleton_local_shards,
+                                tp_group=self.tp_group,
+                                dp_group=metadata['dp_cp_group'],
+                            )
             sharded_state_dict.update(sub_sd)
         return sharded_state_dict
 
