@@ -206,6 +206,7 @@ class MegatronMultimodalTokenizer:
             # restore tokenizer with gigatoken
             from megatron.core.tokenizers.utils import init_gigatoken_from_hf
 
+            self.add_special_tokens(special_tokens)
             self.tokenizer = init_gigatoken_from_hf(self.tokenizer, path)
 
     def _apply_image_tag(self, text: Union[str, List[Dict]]):
