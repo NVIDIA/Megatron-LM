@@ -46,6 +46,7 @@ from ..dist_checkpointing.mapping import (
     ShardedStateDict,
     ShardedTensorFactory,
 )
+from ..dist_checkpointing.optimizer import make_sharded_optimizer_fragment
 from ..dist_checkpointing.utils import extract_sharded_tensors_and_factories
 from ..distributed.param_and_grad_buffer import (
     _ParamAndGradBuffer,
@@ -2064,7 +2065,15 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 )
                 if isinstance(sharded_metadata, ShardedTensorFactory):
                     replace_kwargs.pop('dtype')
-                tensors[state_key] = replace(sharded_metadata, **replace_kwargs)
+                    tensors[state_key] = replace(sharded_metadata, **replace_kwargs)
+                else:
+                    tensors[state_key] = make_sharded_optimizer_fragment(
+                        sharded_metadata,
+                        state_ten,
+                        f'{prefix}.{state_key}',
+                        item_slice,
+                        replica_id=replica_id,
+                    )
                 tensors[state_key].validate_metadata_integrity()
             return tensors
 

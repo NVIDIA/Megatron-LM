@@ -598,6 +598,9 @@ optimizer tensor or flat DP fragment into the same semantic keys without GTP
 collectives. Partial boundary rows become rectangular DCP shards; no unsupported
 `ShardedTensor.flattened_range` leaves are emitted. The mapping also handles DP-owner-only construction; the training CLI restriction
 on memory-efficient fully reshardable GTP checkpoints remains in place.
+Ordinary model-space optimizer fragments use the same rectangular representation,
+including higher-dimensional weights and prepended expert or layer axes. The fragment
+factory preserves the original unsplit key and restores the local flat state on load.
 The companion is opt-in: the regular/Muon optimizer keeps its existing checkpoint
 mapping and on-disk keys.
 
