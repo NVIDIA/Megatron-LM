@@ -728,6 +728,18 @@ class TestGDNCuSeqlensResolve:
             mock_gdn._resolve_cu_seqlens(None, actual, 1008, "cu_seqlens_q", cp_size=1)
 
 
+def _have_cudnn_frontend_min_version(min_version: str = "1.29.0") -> bool:
+    """Check whether the installed nvidia-cudnn-frontend package meets a minimum version."""
+    try:
+        from importlib.metadata import version as pkg_version
+
+        from packaging.version import Version
+
+        return Version(pkg_version("nvidia-cudnn-frontend")) >= Version(min_version)
+    except Exception:
+        return False
+
+
 @pytest.mark.parametrize("sequence_packing", [False, True])
 @pytest.mark.parametrize(
     ("tp", "sp", "cp"),
@@ -743,19 +755,26 @@ class TestGDNCuSeqlensResolve:
     "gdn_kernel_backend",
     ["fla", pytest.param("transformer_engine", marks=pytest.mark.internal)],
 )
+@pytest.mark.parametrize("head_dim", [32, 128])
 def test_parallel_gated_delta_net_correctness(
-    tmp_path_dist_ckpt, sequence_packing, tp, sp, cp, gdn_kernel_backend
+    tmp_path_dist_ckpt, sequence_packing, tp, sp, cp, gdn_kernel_backend, head_dim
 ):
     if gdn_kernel_backend == "fla" and not HAVE_FLA:
         pytest.skip("FLA is not installed.")
     if gdn_kernel_backend == "transformer_engine" and not HAVE_TE_GDN:
         pytest.skip("TransformerEngine GDN is not available.")
+    if (
+        head_dim == 32
+        and gdn_kernel_backend == "transformer_engine"
+        and not _have_cudnn_frontend_min_version("1.29.0")
+    ):
+        pytest.skip("nvidia-cudnn-frontend >= 1.29.0 is required for head dim 32.")
 
     transformer_config = TransformerConfig(
         hidden_size=128,
         linear_conv_kernel_dim=2,
-        linear_key_head_dim=32,
-        linear_value_head_dim=32,
+        linear_key_head_dim=head_dim,
+        linear_value_head_dim=head_dim,
         linear_num_key_heads=4,
         linear_num_value_heads=8,
         num_layers=1,
