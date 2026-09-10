@@ -48,9 +48,7 @@ def test_guard_agrees_with_config_resolution(router_fusion, aux_loss_fusion):
     Unset is the case that matters: it inherits ``moe_router_fusion``, so dropping the
     fallback here would let ``--moe-router-fusion --deterministic-mode`` through.
     """
-    fusion_flags = dict(
-        moe_router_fusion=router_fusion, moe_router_aux_loss_fusion=aux_loss_fusion
-    )
+    fusion_flags = dict(moe_router_fusion=router_fusion, moe_router_aux_loss_fusion=aux_loss_fusion)
     config = TransformerConfig(
         num_layers=1, hidden_size=8, num_attention_heads=1, num_moe_experts=4, **fusion_flags
     )
