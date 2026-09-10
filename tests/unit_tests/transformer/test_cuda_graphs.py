@@ -6,6 +6,7 @@ import sys
 
 import pytest
 import torch
+from transformer_engine.pytorch import Linear as TELinear
 from transformer_engine.pytorch.fp8 import check_fp8_support
 
 import megatron.core.transformer.cuda_graphs as cuda_graphs_module
@@ -1778,37 +1779,29 @@ class _RepeatedParameterModule(MegatronModule):
         return x + self.weight
 
 
-class _TemporaryBufferModule(MegatronModule):
-    """Mimic the expert-bias token accumulator updated by a captured training graph."""
+def _make_evaluation_module(config, whole_module):
+    """Mimic the expert-bias token accumulator for method and whole-module capture."""
 
-    def __init__(self, config):
-        super().__init__(config)
-        self.projection = torch.nn.Linear(config.hidden_size, config.hidden_size, bias=False)
-        self.register_buffer("expert_bias", torch.zeros(1))
-        self.register_buffer("local_tokens_per_expert", torch.zeros(1))
+    class EvaluationModule(GraphableMegatronModule if whole_module else MegatronModule):
+        def __init__(self, config):
+            super().__init__(config)
+            self.projection = TELinear(
+                config.hidden_size, config.hidden_size, bias=False, device="cpu"
+            )
+            self.register_buffer("expert_bias", torch.zeros(1))
+            self.register_buffer("local_tokens_per_expert", torch.zeros(1))
+            self.forward_calls = 0
 
-    def forward(self, x):
-        return self.project(x)
+        def forward(self, x):
+            return self.project(x)
 
-    def project(self, x):
-        if torch.is_grad_enabled():
-            self.local_tokens_per_expert.add_(1)
-        return self.projection(x)
+        def project(self, x):
+            self.forward_calls += 1
+            if torch.is_grad_enabled():
+                self.local_tokens_per_expert.add_(1)
+            return self.projection(x) * (2 if self.training else 3)
 
-
-class _WholeGraphTemporaryBufferModule(GraphableMegatronModule):
-    """Whole-module variant of the temporary-buffer test module."""
-
-    def __init__(self, config):
-        super().__init__(config)
-        self.projection = torch.nn.Linear(config.hidden_size, config.hidden_size, bias=False)
-        self.register_buffer("expert_bias", torch.zeros(1))
-        self.register_buffer("local_tokens_per_expert", torch.zeros(1))
-
-    def forward(self, x):
-        if torch.is_grad_enabled():
-            self.local_tokens_per_expert.add_(1)
-        return self.projection(x)
+    return EvaluationModule(config).cuda()
 
 
 class _SimpleNonModule:
@@ -1836,12 +1829,7 @@ class TestLocalCudaGraphEvaluation:
         model_parallel_cuda_manual_seed(123)
 
     def teardown_method(self, method):
-        if _CudagraphGlobalRecord.cudagraph_created:
-            delete_cuda_graphs()
-        else:
-            _CudagraphGlobalRecord.cudagraph_record = []
-            _CudagraphGlobalRecord.cudagraph_inference_record = []
-            CudaGraphManager.global_mempool = None
+        delete_cuda_graphs()
         torch.cuda.set_stream(torch.cuda.default_stream())
         Utils.destroy_model_parallel()
 
@@ -1850,9 +1838,17 @@ class TestLocalCudaGraphEvaluation:
         reason="use_te_rng_tracker requires TransformerEngine version >= 1.5",
     )
     @pytest.mark.parametrize("whole_module", [False, True], ids=["wrapped_method", "whole_module"])
-    def test_training_graph_temporary_state_is_reset_when_training_resumes(self, whole_module):
+    @pytest.mark.parametrize("pp_size", [1, 2])
+    @pytest.mark.parametrize("eval_before_training", [False, True])
+    def test_separate_evaluation_graphs(
+        self, whole_module, pp_size, eval_before_training, monkeypatch
+    ):
         def first_output(output):
             return output[0] if isinstance(output, tuple) else output
+
+        Utils.destroy_model_parallel()
+        Utils.initialize_model_parallel(pipeline_model_parallel_size=pp_size)
+        model_parallel_cuda_manual_seed(123)
 
         config = TransformerConfig(
             num_layers=1,
@@ -1864,11 +1860,10 @@ class TestLocalCudaGraphEvaluation:
             moe_router_enable_expert_bias=True,
             moe_router_score_function="sigmoid",
         )
+        module = _make_evaluation_module(config, whole_module)
         if whole_module:
-            module = _WholeGraphTemporaryBufferModule(config).cuda()
             manager = module.cudagraph_manager
         else:
-            module = _TemporaryBufferModule(config).cuda()
             manager = CudaGraphManager(
                 config, base_module=module, function_name="project", need_backward=True
             )
@@ -1880,44 +1875,157 @@ class TestLocalCudaGraphEvaluation:
         )
         test_input = torch.randn(4, config.hidden_size, device="cuda", requires_grad=True)
 
-        ddp_model.zero_grad_buffer()
-        first_output(ddp_model(test_input)).sum().backward()
-        ddp_model.finish_grad_sync()
-        assert module.local_tokens_per_expert.item() == 1
+        def eager_forward(x):
+            return module.forward(x) if whole_module else module.project(x, eager=True)
 
+        def train_step():
+            ddp_model.zero_grad_buffer()
+            x = test_input.detach().clone().requires_grad_()
+            output = first_output(ddp_model(x))
+            output.sum().backward()
+            ddp_model.finish_grad_sync()
+            return (
+                output.detach().clone(),
+                x.grad.clone(),
+                module.projection.weight.main_grad.clone(),
+            )
+
+        if eval_before_training:
+            ddp_model.eval()
+            with torch.no_grad():
+                reference = eager_forward(test_input.detach())
+                output = first_output(ddp_model(test_input.detach()))
+                torch.testing.assert_close(output, reference)
+            assert module.local_tokens_per_expert.item() == 0
+            assert manager.cudagraph_runners == []
+            assert _CudagraphGlobalRecord.cudagraph_record == []
+            assert not _CudagraphGlobalRecord.cudagraph_created
+            ddp_model.train()
+
+        # PP creates one runner per microbatch. Validation must not rotate this list even when
+        # it runs a different number of microbatches, while PP=1 reuses its training runner.
+        for _ in range(2):
+            training_reference = train_step()
+        assert module.local_tokens_per_expert.item() == 2
+
+        training_pool_segments = []
+        create_val_graph = _CudaGraphRunner.create_val_graph
+
+        def capture_val(runner):
+            if not training_pool_segments:
+                training_pool_segments.extend(
+                    (s["address"], s["address"] + s["total_size"])
+                    for s in torch.cuda.memory_snapshot()
+                    if tuple(s["segment_pool_id"]) == runner.mempool
+                )
+            create_val_graph(runner)
+
+        monkeypatch.setattr(_CudaGraphRunner, "create_val_graph", capture_val)
         create_cudagraphs()
-        assert module.local_tokens_per_expert.item() == 1
-        runner = manager.cudagraph_runners[0]
-        runner_status = runner.status
+        assert module.local_tokens_per_expert.item() == 2
+        training_runners = list(manager.cudagraph_runners)
+        val_runners = [r.val_runner for r in training_runners]
+        training_statuses = [r.status for r in training_runners]
+        assert len(training_runners) == (1 if pp_size == 1 else 2)
 
-        # Match the end-of-training-step reset before validation begins.
-        module.local_tokens_per_expert.zero_()
+        # Establish the replay baseline before validation can affect any training state.
+        for _ in training_runners:
+            torch.testing.assert_close(train_step(), training_reference)
+
+        # Preserve outstanding training state, rather than relying on a reset after validation.
+        module.local_tokens_per_expert.fill_(5)
         module.expert_bias.fill_(2)
+        assert training_pool_segments
 
         ddp_model.eval()
         with torch.no_grad():
-            eval_output = ddp_model(test_input.detach())
-            if whole_module:
-                reference_output = module.forward(test_input.detach())
-            else:
-                reference_output = module.project(test_input.detach(), eager=True)
+            for batch_size in [4, 4, 2, 4, 2]:
+                eval_input = torch.randn(batch_size, config.hidden_size, device="cuda")
+                input_copy = eval_input.clone()
+                reference_output = eager_forward(eval_input)
+                forward_calls = module.forward_calls
+                eval_output = first_output(ddp_model(eval_input))
+                assert module.forward_calls == forward_calls + (batch_size != 4)
+                torch.testing.assert_close(eval_output, reference_output)
+                torch.testing.assert_close(eval_input, input_copy)
+                assert not eval_output.requires_grad
 
-        torch.testing.assert_close(first_output(eval_output), first_output(reference_output))
-        # no_grad does not change the operations already captured in the training graph.
-        assert module.local_tokens_per_expert.item() == 1
-        assert manager.cudagraph_runners == [runner]
-        assert runner.status is runner_status
+        assert module.local_tokens_per_expert.item() == 5
+        assert manager.cudagraph_runners == training_runners
+        assert [r.status for r in training_runners] == training_statuses
+        torch.testing.assert_close(module.projection.weight.main_grad, training_reference[2])
+        for runner in val_runners:
+            assert not runner.grad_enabled
+            assert not runner.training
+            assert runner.fwd_graph is not None
+            assert runner.bwd_graph is None
+            assert runner.mempool == CudaGraphManager.global_mempool
+            # Validation fits the already-reserved training activation storage.
+            # Verify actual buffer addresses, not just the pool handle used during capture.
+            for tensor in (*runner.fwd_graph_input_surface, *runner.fwd_graph_output_surface):
+                assert any(
+                    start <= tensor.data_ptr() < end for start, end in training_pool_segments
+                )
+        assert all(r.mempool == val_runners[0].mempool for r in training_runners)
 
         ddp_model.train()
-        assert module.local_tokens_per_expert.item() == 0
+        assert module.local_tokens_per_expert.item() == 5
         assert module.expert_bias.item() == 2
 
-        ddp_model.zero_grad_buffer()
-        replay_input = test_input.detach().clone().requires_grad_()
-        first_output(ddp_model(replay_input)).sum().backward()
-        ddp_model.finish_grad_sync()
+        torch.testing.assert_close(train_step(), training_reference)
+        assert module.local_tokens_per_expert.item() == 6
 
-        assert module.local_tokens_per_expert.item() == 1
+        # Later validation reuses its graphs and reads the updated model weights.
+        ddp_model.eval()
+        with torch.no_grad():
+            module.projection.weight.add_(0.1)
+            reference_output = eager_forward(test_input.detach())
+            forward_calls = module.forward_calls
+            eval_output = first_output(ddp_model(test_input.detach()))
+            assert module.forward_calls == forward_calls
+            torch.testing.assert_close(eval_output, reference_output)
+        assert [r.val_runner for r in training_runners] == val_runners
+        assert module.local_tokens_per_expert.item() == 6
+
+        delete_cuda_graphs()
+        assert _CudagraphGlobalRecord.cudagraph_val_record == []
+        assert all(r.fwd_graph is None and r.mempool is None for r in val_runners)
+        with torch.no_grad():
+            eval_output = first_output(ddp_model(test_input.detach()))
+            torch.testing.assert_close(eval_output, reference_output)
+
+    def test_shared_pool_preserves_live_output_aliases(self):
+        class InplaceModule(MegatronModule):
+            def project(self, x):
+                return x * 3 if self.training else x.mul_(3)
+
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=32,
+            num_attention_heads=1,
+            cuda_graph_impl="local",
+            cuda_graph_warmup_steps=1,
+        )
+        modules = [InplaceModule(config) for _ in range(2)]
+        managers = [
+            CudaGraphManager(config, base_module=m, function_name="project") for m in modules
+        ]
+        x = torch.randn(4, config.hidden_size, device="cuda", requires_grad=True)
+        modules[1].project(modules[0].project(x)).sum().backward()
+        create_cudagraphs()
+        for module in modules:
+            module.eval()
+        with torch.no_grad():
+            for _ in range(3):
+                x = torch.randn(4, config.hidden_size, device="cuda")
+                saved_x = x.clone()
+                first = modules[0].project(x)
+                expected_first = saved_x * 3
+                second = modules[1].project(first)
+                torch.testing.assert_close(x, saved_x)
+                torch.testing.assert_close(first, expected_first)
+                torch.testing.assert_close(second, expected_first * 3)
+        assert all(m.cudagraph_runners[0].val_runner is not None for m in managers)
 
 
 class TestCheckpointParameterDiscovery:
