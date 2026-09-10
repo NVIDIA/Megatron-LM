@@ -879,6 +879,7 @@ def _backfill_gtp_sharded_param_map(
             is_gtp_param,
             make_sharded_tensors_for_checkpoint_with_gtp_remat,
         )
+        from megatron.core.tensor_parallel.gtp_ckpt import gtp_entry_backlink
     except ImportError:
         return  # GTP not built in -- nothing to backfill.
 
@@ -899,7 +900,9 @@ def _backfill_gtp_sharded_param_map(
     key_to_entry = {}
     if model_sharded_state_dict is not None:
         for entry in nested_values(model_sharded_state_dict):
-            src = getattr(getattr(entry, 'data', None), '_gtp_dequant_src', None)
+            # See gtp_entry_backlink: the native-FP8 dequantized copy and the pad-trimmed shard
+            # both break the id() match, and each tags the live param a different way.
+            src = gtp_entry_backlink(entry)
             if src is not None:
                 src_id_to_entry[id(src)] = entry
             key = getattr(entry, 'key', None)
