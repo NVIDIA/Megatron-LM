@@ -92,9 +92,7 @@ def _argmax_highest(values, ids, valid):
 @triton.jit(do_not_specialize=["source_rank", "num_tokens"])
 def _plan_virtual_expert_routes_kernel(
     top_indices,
-    probs,
     virtual_experts,
-    runtime_probs,
     experts_to_copy,
     scratch,
     counts_sym_mem,
@@ -125,13 +123,11 @@ def _plan_virtual_expert_routes_kernel(
     ``[num_tokens, 2 * num_experts]`` runtime probabilities HybridEP consumes.
     """
     NUM_EXPERTS_PER_GPU: tl.constexpr = NUM_EXPERTS // EP_SIZE
-    NUM_RUNTIME_EXPERTS: tl.constexpr = 2 * NUM_EXPERTS
     BLOCK_EP_SIZE: tl.constexpr = 1 << (EP_SIZE - 1).bit_length()
     BLOCK_NUM_EXPERTS_PER_GPU: tl.constexpr = 1 << (NUM_EXPERTS_PER_GPU - 1).bit_length()
     BLOCK_NUM_EXPERTS: tl.constexpr = 1 << (NUM_EXPERTS - 1).bit_length()
     BLOCK_TOPK: tl.constexpr = 1 << (ROUTER_TOPK - 1).bit_length()
     BLOCK_TOKENS: tl.constexpr = 128 // BLOCK_TOPK
-    BLOCK_RUNTIME_EXPERTS: tl.constexpr = min(256, 2 * BLOCK_NUM_EXPERTS)
     HISTOGRAM_TILE: tl.constexpr = min(16, 8192 // BLOCK_NUM_EXPERTS)
     # Scratch arena fields, mirroring ``_scratch_layout`` below. The two flag words lead,
     # each on its own 128-byte line, so the programs spinning on the grid barrier do not contend
@@ -308,8 +304,6 @@ def _plan_virtual_expert_routes_kernel(
             ),
             axis=0,
         )
-    tile_rows = tl.arange(0, BLOCK_TOKENS)
-    runtime_columns = tl.arange(0, BLOCK_RUNTIME_EXPERTS)
     for token_start in tl.range(program_start, program_end, BLOCK_TOKENS, loop_unroll_factor=1):
         # The running counts go through memory so every route can gather its expert's count.
         tl.store(running_counts + program * NUM_EXPERTS + experts, running, mask=valid_experts)
@@ -347,21 +341,6 @@ def _plan_virtual_expert_routes_kernel(
             remote, NUM_EXPERTS_PER_GPU + slot, ids % NUM_EXPERTS_PER_GPU
         )
         tl.store(virtual_experts + route_offsets, runtime.to(tl.int16), mask=valid)
-        # Dense runtime probabilities: clear the tile's rows, then scatter the routes into them.
-        rows = token_start + tile_rows
-        valid_rows = rows < program_end
-        for column_start in tl.range(0, NUM_RUNTIME_EXPERTS, BLOCK_RUNTIME_EXPERTS):
-            columns = column_start + runtime_columns
-            tl.store(
-                runtime_probs + rows[:, None] * NUM_RUNTIME_EXPERTS + columns[None, :],
-                tl.zeros((BLOCK_TOKENS, BLOCK_RUNTIME_EXPERTS), dtype=tl.float32),
-                mask=valid_rows[:, None] & (columns[None, :] < NUM_RUNTIME_EXPERTS),
-            )
-        tl.debug_barrier()
-        prob = tl.load(probs + route_offsets, mask=valid, other=0.0)
-        tl.store(
-            runtime_probs + tokens * NUM_RUNTIME_EXPERTS + runtime, prob.to(tl.float32), mask=valid
-        )
         running += tl.histogram(ids, BLOCK_NUM_EXPERTS, mask=valid)
 
 
@@ -433,15 +412,14 @@ class VirtualExpertPlannerWorkspace:
 
 
 def launch_virtual_expert_planner(
-    top_indices: torch.Tensor, probs: torch.Tensor, workspace
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    top_indices: torch.Tensor, workspace
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Plan one layer's routes in one cooperative launch.
 
-    ``top_indices`` / ``probs`` are the router's ``[num_tokens, topk]`` expert ids and
-    probabilities, ``workspace`` the planner scratch (``VirtualExpertPlannerWorkspace``) whose
-    ``gathered_counts`` is this rank's symmetric buffer of every rank's histogram. Returns the
-    int16 ``[num_tokens, topk]`` runtime ids, the float32 ``[num_tokens, 2 * num_experts]``
-    runtime probabilities and the int32 ``[ep_size, num_local_experts]`` slot table.
+    ``top_indices`` are the router's ``[num_tokens, topk]`` expert ids, ``workspace`` the planner
+    scratch (``VirtualExpertPlannerWorkspace``) whose ``gathered_counts`` is this rank's symmetric
+    buffer of every rank's histogram. Returns the int16 ``[num_tokens, topk]`` runtime ids and
+    the int32 ``[ep_size, num_local_experts]`` slot table.
     """
     num_tokens, router_topk = top_indices.shape
     ep_size, num_experts = workspace.gathered_counts.shape
@@ -451,13 +429,10 @@ def launch_virtual_expert_planner(
         )
     empty = functools.partial(torch.empty, device=top_indices.device)
     virtual_experts = empty((num_tokens, router_topk), dtype=torch.int16)
-    runtime_probs = empty((num_tokens, 2 * num_experts), dtype=torch.float32)
     experts_to_copy = empty((ep_size, num_experts // ep_size), dtype=torch.int32)
     _plan_virtual_expert_routes_kernel[(PLANNER_PROGRAMS,)](
         top_indices,
-        probs,
         virtual_experts,
-        runtime_probs,
         experts_to_copy,
         workspace.scratch,
         workspace.gathered_counts,
@@ -471,7 +446,7 @@ def launch_virtual_expert_planner(
         launch_cooperative_grid=True,
         num_warps=4,
     )
-    return virtual_experts, runtime_probs, experts_to_copy
+    return virtual_experts, experts_to_copy
 
 
 @triton.jit

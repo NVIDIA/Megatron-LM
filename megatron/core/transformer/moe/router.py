@@ -19,13 +19,13 @@ from megatron.core.transformer.moe.moe_utils import (
     apply_random_logits,
     apply_router_token_dropping,
     compute_routing_scores_for_aux_loss,
-    dense_routing_from_topk,
     get_tokens_per_expert_and_token_count,
     qb_dual_update,
     router_gating_linear,
     sinkhorn,
     switch_load_balancing_loss_func,
     topk_routing_with_score_function,
+    uses_compact_routes,
     z_loss_func,
 )
 from megatron.core.transformer.moe.router_replay import RouterReplay
@@ -785,8 +785,9 @@ class TopKRouter(Router):
         # Apply Z-Loss
         logits = self.apply_z_loss(logits, padding_mask=padding_mask)
 
-        # Virtual-expert planning consumes the [num_tokens, topk] ids and probabilities directly.
-        compact_routes = self.config.moe_virtual_expert_load_balance
+        # HybridEP and virtual-expert planning consume the compact [num_tokens, topk] ids and
+        # probabilities directly (see uses_compact_routes); the dispatcher expects the same format.
+        compact_routes = uses_compact_routes(self.config)
         if compact_routes and self.routing_type in ("sinkhorn", "quantile_balancing"):
             raise NotImplementedError(
                 f"Virtual-expert load balancing does not support {self.routing_type} routing."

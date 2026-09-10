@@ -350,11 +350,6 @@ class TEGroupedMLP(MegatronModule):
             )
         self._virtual_experts = load_balancer
 
-    def unbind_virtual_experts(self) -> None:
-        """Drop the load balancer and the fused ops built over its runtime weights."""
-        self._fused_ops = None
-        self._virtual_experts = None
-
     @staticmethod
     def _apply_packed_bias(intermediate_parallel, packed_bias, tokens_per_expert, permuted_probs):
         """Apply a packed expert bias without reading token counts on the host."""

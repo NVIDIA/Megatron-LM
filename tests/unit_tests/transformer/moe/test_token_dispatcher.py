@@ -1,6 +1,7 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 import dataclasses
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -14,7 +15,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 )
 from megatron.core.transformer.moe.fused_a2a import HYBRIDEP_TOKEN_ALIGNMENT, reset_hybrid_ep_buffer
 from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
-from megatron.core.transformer.moe.moe_utils import get_capacity
+from megatron.core.transformer.moe.moe_utils import get_capacity, uses_compact_routes
 from megatron.core.transformer.moe.token_dispatcher import _HybridEPManager
 from megatron.core.transformer.spec_utils import get_submodules
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -553,6 +554,73 @@ def is_nccl_ep_fp8_dispatch_available():
     if not hasattr(te_ep, "mxfp8_carrier_to_grouped"):
         return False
     return check_mxfp8_support()[0]
+
+
+@pytest.mark.parametrize("dense_topk_routing", [True, False])
+def test_hybridep_compact_routes_metadata(dense_topk_routing):
+    """Compact routes expand once, for the plain and the virtual-expert path alike: the
+    probabilities are scattered dense and carry the gradient; the ids go in as int16 dense top-k
+    routing or, on a build without it, as the bool routing map rebuilt from them."""
+    manager = _HybridEPManager.__new__(_HybridEPManager)
+    manager.num_experts, manager.num_local_experts = 8, 2
+    manager.config = TransformerConfig(
+        num_layers=1, hidden_size=16, num_attention_heads=4, num_moe_experts=8, moe_router_topk=2
+    )
+    manager.moe_expert_rank_capacity_factor = None
+    manager.drop_and_pad = False
+    manager.dense_routing_metadata = False
+    manager._dense_topk_routing = dense_topk_routing
+
+    top_indices = torch.tensor([[0, 5], [7, 2], [3, 4]])
+    probs = torch.tensor([[0.6, 0.4], [0.5, 0.5], [0.9, 0.1]], requires_grad=True)
+    manager.setup_metadata(top_indices, probs)
+    expected = torch.zeros(3, 8).scatter(1, top_indices, probs.detach())
+    torch.testing.assert_close(manager.token_probs, expected, rtol=0, atol=0)
+    (manager.token_probs * torch.arange(8.0)).sum().backward()
+    torch.testing.assert_close(probs.grad, top_indices.float(), rtol=0, atol=0)
+    if dense_topk_routing:
+        assert manager.routing_map is None and manager.topk_idx.dtype == torch.int16
+        assert torch.equal(manager.topk_idx.long(), top_indices)
+    else:
+        assert manager.topk_idx is None and torch.equal(manager.routing_map, expected != 0)
+
+
+def test_uses_compact_routes_covers_hybridep_without_dense_map_consumers():
+    """Plain HybridEP takes compact routes unless something downstream needs the dense map;
+    virtual experts always do."""
+    plain = dict(
+        moe_virtual_expert_load_balance=False,
+        moe_token_dispatcher_type="flex",
+        moe_flex_dispatcher_backend="hybridep",
+        moe_router_fusion=False,
+        moe_router_load_balancing_type="aux_loss",
+        moe_expert_capacity_factor=None,
+        moe_pad_expert_input_to_capacity=False,
+        moe_token_dropping=False,
+        expert_tensor_parallel_size=1,
+        moe_hybridep_pad_uneven_dispatch_inputs=False,
+    )
+    assert uses_compact_routes(SimpleNamespace(**plain))
+    assert uses_compact_routes(
+        SimpleNamespace(**{**plain, "moe_router_load_balancing_type": ["aux_loss", "seq_aux_loss"]})
+    )
+    for name, value in (
+        ("moe_flex_dispatcher_backend", "deepep"),
+        ("moe_token_dispatcher_type", "alltoall"),
+        ("moe_router_fusion", True),
+        ("moe_router_load_balancing_type", "sinkhorn"),
+        ("moe_expert_capacity_factor", 1.0),
+        ("moe_pad_expert_input_to_capacity", True),
+        ("moe_token_dropping", True),
+        ("expert_tensor_parallel_size", 2),
+        ("moe_hybridep_pad_uneven_dispatch_inputs", True),
+    ):
+        assert not uses_compact_routes(SimpleNamespace(**{**plain, name: value})), name
+    assert uses_compact_routes(
+        SimpleNamespace(
+            **{**plain, "moe_virtual_expert_load_balance": True, "moe_router_fusion": True}
+        )
+    )
 
 
 def test_hybridep_pad_uneven_dispatch_inputs_metadata(monkeypatch):
