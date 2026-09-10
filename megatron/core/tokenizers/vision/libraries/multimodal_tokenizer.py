@@ -255,11 +255,6 @@ class MegatronMultimodalTokenizer:
         if self.use_gigatoken:
             # Tokenize conversation with separately gigatoken to get better performance.
             tokenize = False
-        if return_target and not tokenize:
-            raise ValueError(
-                "return_target=True requires tokenize=True: target masking is computed "
-                "over token indices and has no meaning on untokenized text."
-            )
 
         # Skip system message if the tokenizer doesn't have a system role.
         if not self._prompt_config.has_system_role and conversation[0]["role"] == "system":
