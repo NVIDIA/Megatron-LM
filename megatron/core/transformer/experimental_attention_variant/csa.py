@@ -3140,8 +3140,13 @@ class CompressedSparseAttention(MegatronModule):
                     topk_indexer_layout = indexer_layout
                     k_indexer_for_topk = k_indexer_seq_major
                     if ref_use_fused:
-                        topk_indexer_layout, source_row_map = cp_utils.build_cp_compact_indexer_layout(
-                            indexer_layout, cu_seqlens_compressed, k_indexer_seq_major.shape[0], ratio
+                        topk_indexer_layout, source_row_map = (
+                            cp_utils.build_cp_compact_indexer_layout(
+                                indexer_layout,
+                                cu_seqlens_compressed,
+                                k_indexer_seq_major.shape[0],
+                                ratio,
+                            )
                         )
                         k_indexer_for_topk = cp_utils.pack_cp_compact_indexer_k(
                             k_indexer_seq_major, source_row_map

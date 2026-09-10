@@ -1652,7 +1652,7 @@ def balanced_compute_cp_indexer_topk(
             q, pos_ids, layout3[0], nope_dim, pos_dim, indexer, config, int(max_seqlen_q)
         )
         q = rotate_activation(q)
-        tk, _ = _cu.compute_cp_indexer_topk(
+        tk, _, _ = _cu.compute_cp_indexer_topk(
             q,
             w_rows.reshape(sz, n_heads),
             kv_rows,

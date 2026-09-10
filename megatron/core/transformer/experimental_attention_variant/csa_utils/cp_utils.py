@@ -370,6 +370,10 @@ def compute_cp_indexer_topk(
 ) -> Tuple[Optional[torch.Tensor], Optional[CPIndexerLayout], Optional[torch.Tensor]]:
     """Return local top-k, packed layout, and optional compact Top-K softmax.
 
+    Ordinary calls retain the compact scorer and workspace contract from dev.
+    Calls with prebuilt_layout retain the balanced path's dense scorer and
+    unpadded K layout; they return None as the third (compact softmax) result.
+
     ``max_seqlen_kv`` optionally overrides the score-matrix width capacity (default
     ``max_seqlen_q // ratio``). The fused kernel materializes an fp32 ``(rows, max_seqlen_kv)``
     score buffer, so callers whose rows can only see a bounded causal prefix (e.g. the balanced
@@ -436,7 +440,11 @@ def compute_cp_indexer_topk(
     else:
         if logical_indexer_layout is None:
             logical_indexer_layout = build_cp_indexer_layout(
-                cu_seqlens_q, cu_seqlens_compressed, global_start, l_local, k_indexer_seq_major.shape[0]
+                cu_seqlens_q,
+                cu_seqlens_compressed,
+                global_start,
+                l_local,
+                k_indexer_seq_major.shape[0],
             )
         if not use_fused:
             indexer_layout = logical_indexer_layout

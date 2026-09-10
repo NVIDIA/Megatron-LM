@@ -1919,6 +1919,9 @@ def indexer_topk(
             storage prepared during eager warmup. Candidate scratch and compact
             outputs are allocated by each dispatch. A matching workspace is
             required while capturing the compact path.
+        use_compact: select the compact forward plus Top-K backend when
+            available. False retains dense scoring for the balanced indexer's
+            existing unpadded synthetic layouts.
         deterministic: resolve exact-value ties at the K-th boundary toward
             the smallest local KV indices. The output slot order remains
             unspecified.
