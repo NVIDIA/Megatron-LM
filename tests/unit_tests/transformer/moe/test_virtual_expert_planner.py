@@ -22,12 +22,10 @@ from megatron.core.transformer.moe.virtual_expert_load_balancer import (
     BACKWARD,
     FORWARD,
     VirtualExpertLoadBalancer,
+    VirtualExpertPlan,
     _FCLayerPointerTables,
-    _make_native_parameters,
-    _make_virtual_parameters,
-    _PassTemporaries,
     _VirtualExpertHook,
-    _weak_hook,
+    _VirtualExperts,
 )
 
 # The GB200 CI bucket launches marked files with four ranks, which these tests need.
@@ -40,7 +38,7 @@ def _load_balancer(fc_layers=()):
     """A balancer with only the state the process-local paths read; no transport, no arenas."""
     load_balancer = VirtualExpertLoadBalancer.__new__(VirtualExpertLoadBalancer)
     load_balancer.fc_layers = list(fc_layers)
-    load_balancer._temporaries = None
+    load_balancer._plan = None
     return load_balancer
 
 
@@ -59,25 +57,31 @@ def test_virtual_expert_rank_capacity_includes_per_expert_padding():
 
 
 def test_virtual_expert_hooks_do_not_keep_their_owner_alive():
-    """A hook captured by an autograd context must not close a cycle through the owner."""
+    """A method captured by an autograd context must not close a cycle through its owner, and
+    is called with its arguments when the gradient passes."""
 
     class Owner:
+        def __init__(self):
+            self.calls = []
+
         def method(self, value):
-            return value
+            self.calls.append(value)
 
     owner = Owner()
-    hook = _weak_hook(owner.method, 7)
-    assert hook() == 7
+    hidden = torch.ones((), requires_grad=True)
+    _VirtualExpertHook.apply(hidden, owner.method, (7,)).backward()
+    assert owner.calls == [7]
+    kept = _VirtualExpertHook.apply(hidden, owner.method, (8,))
     alive = weakref.ref(owner)
     del owner
-    assert alive() is None
+    assert alive() is None and kept.requires_grad
 
 
 def test_virtual_expert_backward_hooks_span_the_transport_window():
     """Order the four transport hooks across one layer's backward, as the dispatcher places them,
     and deliver what the finish returns as the source parameters' gradients."""
     events = []
-    temporaries = _PassTemporaries()
+    plan = VirtualExpertPlan(None, None)
 
     class FakeLoadBalancer:
         source_parameters = (torch.nn.Parameter(torch.ones(())), torch.nn.Parameter(torch.ones(())))
@@ -89,7 +93,7 @@ def test_virtual_expert_backward_hooks_span_the_transport_window():
             )
 
         def _start_backward(self, current):
-            assert current is temporaries
+            assert current is plan
             events.append("start_weight_push")
 
         def _prepare_expert_backward(self):
@@ -116,18 +120,16 @@ def test_virtual_expert_backward_hooks_span_the_transport_window():
     load_balancer = FakeLoadBalancer()
     hidden = torch.ones((), requires_grad=True)
     hidden = _VirtualExpertHook.apply(
-        hidden, _weak_hook(load_balancer._finish_grad_reduce), *load_balancer.source_parameters
+        hidden, load_balancer._finish_grad_reduce, (), *load_balancer.source_parameters
     )
     hidden = BackwardMarker.apply(hidden, "router_and_shared_expert_backward")
-    hidden = _VirtualExpertHook.apply(hidden, _weak_hook(load_balancer._start_pending_grad_reduces))
+    hidden = _VirtualExpertHook.apply(hidden, load_balancer._start_pending_grad_reduces, ())
     hidden = BackwardMarker.apply(hidden, "dispatch_backward")
     hidden = BackwardMarker.apply(hidden, "expert_backward")
-    hidden = _VirtualExpertHook.apply(hidden, _weak_hook(load_balancer._prepare_expert_backward))
+    hidden = _VirtualExpertHook.apply(hidden, load_balancer._prepare_expert_backward, ())
     hidden = BackwardMarker.apply(hidden, "combine_backward")
     hidden = BackwardMarker.apply(hidden, "latent_up_fc_layer_backward")
-    hidden = _VirtualExpertHook.apply(
-        hidden, _weak_hook(load_balancer._start_backward, temporaries)
-    )
+    hidden = _VirtualExpertHook.apply(hidden, load_balancer._start_backward, (plan,))
     hidden.backward()
 
     assert events == [
@@ -151,11 +153,11 @@ def test_virtual_expert_fc2_reduction_starts_from_the_wgrad_store_and_fc1_after_
     """FC2 reduces behind its own wgrad GEMM; only FC1 waits for dispatch backward."""
     started = []
     load_balancer = _load_balancer()
-    load_balancer._temporaries = _PassTemporaries(plan=object())
+    load_balancer._plan = VirtualExpertPlan(None, None)
 
     def record(fc_layer):
         started.append(fc_layer)
-        load_balancer._temporaries.started.add(fc_layer)
+        load_balancer._plan.started.add(fc_layer)
 
     load_balancer._start_grad_reduce = record
 
@@ -173,10 +175,10 @@ def test_virtual_expert_fc2_reduction_starts_from_the_wgrad_store_and_fc1_after_
 
     # A reduction cannot start before the backward push was waited for (the expert backward's
     # preparation), nor outside a backward pass.
-    load_balancer._temporaries = _PassTemporaries(plan=object(), push_in_flight=True)
+    load_balancer._plan = VirtualExpertPlan(None, None, push_in_flight=True)
     with pytest.raises(RuntimeError, match="prepared backward"):
         VirtualExpertLoadBalancer._start_grad_reduce(load_balancer, 1)
-    load_balancer._temporaries = None
+    load_balancer._plan = None
     with pytest.raises(RuntimeError, match="prepared backward"):
         VirtualExpertLoadBalancer._start_grad_reduce(load_balancer, 1)
 
@@ -192,29 +194,39 @@ def _mxfp8(tensor):
     return MXFP8Quantizer(DType.kFloat8E4M3)(tensor)
 
 
-def _slot_parameters(mxfp8, device, num_local_experts, template):
-    """Virtual-expert slot parameters over plain tensors, without symmetric memory or a group."""
+def _fake_virtual_experts(mxfp8, device, num_local_experts, template, staging):
+    """The slots object over plain tensors: no symmetric memory, no group."""
     numel = MEMBER_SHAPE[0] * MEMBER_SHAPE[1]
-    data = torch.zeros(
-        (num_local_experts, *MEMBER_SHAPE),
+    virtual_experts = _VirtualExperts.__new__(_VirtualExperts)
+    virtual_experts.config = SimpleNamespace(
+        mxfp8=mxfp8, member_shapes=(MEMBER_SHAPE,), grad_dtype=torch.float32, device=device
+    )
+    virtual_experts.num_local_experts = num_local_experts
+    virtual_experts._weight_sections = [
+        num_local_experts * numel,
+        num_local_experts * (numel // 32 if mxfp8 else 0),
+    ]
+    virtual_experts._grad_sections = [num_local_experts * numel]
+    virtual_experts.weight_arena = torch.zeros(
+        sum(virtual_experts._weight_sections),
         dtype=torch.uint8 if mxfp8 else torch.bfloat16,
         device=device,
     )
-    scales = (
-        torch.zeros((num_local_experts, numel // 32), dtype=torch.uint8, device=device)
-        if mxfp8
-        else None
+    virtual_experts.grad_arena = torch.zeros(
+        sum(virtual_experts._grad_sections), dtype=torch.float32, device=device
     )
-    grads = torch.zeros((num_local_experts, *MEMBER_SHAPE), dtype=torch.float32, device=device)
-    return _make_virtual_parameters(data, scales, grads, template)
+    virtual_experts.parameters = (virtual_experts._slot_parameters(0, template),)
+    virtual_experts.native_staging = (staging,)
+    return virtual_experts
 
 
-def _build_fc_layer(name, parameters, template, staging, *, mxfp8=False):
-    """Build a FC layer with its native and virtual runtime parameters; ``staging`` is the plain
-    natives' wgrad staging (None under GTP)."""
-    slots = _slot_parameters(mxfp8, parameters[0].device, len(parameters), template)
-    natives = _make_native_parameters(parameters, slots, staging)
-    return _FCLayerPointerTables(name, parameters, (*natives, *slots), staging, 0)
+def _build_fc_layer(parameters, template, staging, *, mxfp8=False):
+    """Build a FC layer over a slots object; ``staging`` is the plain natives' wgrad staging
+    (None under GTP)."""
+    virtual_experts = _fake_virtual_experts(
+        mxfp8, parameters[0].device, len(parameters), template, staging
+    )
+    return _FCLayerPointerTables(virtual_experts, 0, parameters)
 
 
 def _gtp_fc_layer(weight_format, device, num_local_experts=2):
@@ -256,7 +268,7 @@ def _gtp_fc_layer(weight_format, device, num_local_experts=2):
     for weight in leader._weights:
         weight.get_wgrad_tensor = lambda weight=weight: weight.scratch
 
-    fc_layer = _build_fc_layer("test fc_layer", parameters, leader, None, mxfp8=mxfp8)
+    fc_layer = _build_fc_layer(parameters, leader, None, mxfp8=mxfp8)
     assert fc_layer.native_grads is None  # GTP natives write per-backward scratch, not staging
     return fc_layer, gathers
 
@@ -279,7 +291,7 @@ def test_virtual_expert_plain_fc_layer_binds_its_tables_once():
         for _ in range(3)
     )
     staging = torch.zeros((3, *MEMBER_SHAPE), dtype=torch.float32, device=device)
-    fc_layer = _build_fc_layer("plain fc_layer", parameters, parameters[0], staging)
+    fc_layer = _build_fc_layer(parameters, parameters[0], staging)
     load_balancer = _load_balancer([fc_layer])
     torch.cuda.synchronize(device)
     assert fc_layer.gtp_leader is None and fc_layer.native_grads is staging
@@ -322,7 +334,7 @@ def test_virtual_expert_plain_fc_layer_hands_wgrads_to_the_source_parameters():
     parameters[0].main_grad = torch.zeros(MEMBER_SHAPE, dtype=torch.float32, device=device)
     parameters[0].grad_added_to_main_grad = False
     staging = torch.full((2, *MEMBER_SHAPE), 1.0001, dtype=torch.float32, device=device)
-    fc_layer = _build_fc_layer("plain fc_layer", parameters, parameters[0], staging)
+    fc_layer = _build_fc_layer(parameters, parameters[0], staging)
 
     grads = _load_balancer([fc_layer])._hand_off_wgrads(fc_layer)
     torch.testing.assert_close(parameters[0].main_grad, staging[0], rtol=0, atol=0)
@@ -436,7 +448,7 @@ def test_virtual_expert_backward_consumes_gtp_weights_in_gemm_order():
     load_balancer._weight_sources = lambda fc_layer, direction, peek=True: (
         "consumed" if not peek else "peeked"
     )
-    temporaries = load_balancer._temporaries = _PassTemporaries(plan=object())
+    plan = load_balancer._plan = VirtualExpertPlan(None, None)
 
     load_balancer.prepare_expert_forward()
     assert events == [
@@ -447,11 +459,11 @@ def test_virtual_expert_backward_consumes_gtp_weights_in_gemm_order():
 
     # The layer output closes the forward; its backward hook hands the pass back.
     events.clear()
-    load_balancer._temporaries = None
-    load_balancer._start_backward(temporaries)
-    assert load_balancer._temporaries is temporaries and events == [("push", BACKWARD)]
+    load_balancer._plan = None
+    load_balancer._start_backward(plan)
+    assert load_balancer._plan is plan and events == [("push", BACKWARD)]
     with pytest.raises(RuntimeError, match="outstanding"):
-        load_balancer._start_backward(_PassTemporaries())
+        load_balancer._start_backward(VirtualExpertPlan(None, None))
 
     events.clear()
     load_balancer._prepare_expert_backward()
@@ -462,10 +474,10 @@ def test_virtual_expert_backward_consumes_gtp_weights_in_gemm_order():
         ("consume", "FC1", BACKWARD, "consumed"),
         ("bind", "FC1", ("FC1 scratch",)),
     ]
-    assert temporaries.started == set()
+    assert plan.started == set()
 
     # One wait per push: waiting for a push that was never started, or twice, is an error.
-    assert not temporaries.push_in_flight
+    assert not plan.push_in_flight
     with pytest.raises(RuntimeError, match="unwaited"):
         VirtualExpertLoadBalancer._wait_weight_push(load_balancer)
 

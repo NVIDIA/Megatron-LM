@@ -965,6 +965,37 @@ def dense_routing_from_topk(
     return routing_probs, routing_map
 
 
+def uses_compact_routes(config) -> bool:
+    """Whether the router hands the token dispatcher its compact ``[num_tokens, topk]`` expert ids
+    and probabilities instead of the dense ``[num_tokens, num_experts]`` map and probabilities.
+
+    HybridEP's fastest path takes the ids as dense top-k routing and needs only the probabilities
+    dense, so the flex dispatcher's HybridEP backend consumes compact routes whenever nothing
+    downstream needs the dense map: top-k routing (sinkhorn and quantile balancing produce only
+    the map), no fused router (TE's router produces only the map), no token dropping or capacity
+    padding (they act on the map), expert tensor parallelism 1 (the dense path replicates routes
+    across TP ranks) and no uneven-dispatch padding. Virtual-expert load balancing plans from
+    compact routes and always requires them. The router and the dispatcher both read this, so
+    the formats agree by construction.
+    """
+    if config.moe_virtual_expert_load_balance:
+        return True
+    routing_types = config.moe_router_load_balancing_type
+    if isinstance(routing_types, str):
+        routing_types = [routing_types]
+    return (
+        config.moe_token_dispatcher_type == "flex"
+        and config.moe_flex_dispatcher_backend == "hybridep"
+        and not config.moe_router_fusion
+        and not any(t in ("sinkhorn", "quantile_balancing") for t in routing_types)
+        and config.moe_expert_capacity_factor is None
+        and not config.moe_pad_expert_input_to_capacity
+        and not config.moe_token_dropping
+        and config.expert_tensor_parallel_size == 1
+        and not config.moe_hybridep_pad_uneven_dispatch_inputs
+    )
+
+
 def compute_routing_scores_for_aux_loss(
     logits: torch.Tensor,
     topk: int,
