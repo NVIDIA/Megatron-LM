@@ -16,6 +16,7 @@ from megatron.core.models.hybrid.hybrid_layer_specs import (
 )
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.models.hybrid.layers import utils as layer_utils
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.gated_delta_net import GatedDeltaNet
 from megatron.core.ssm.mamba_layer import MambaLayer
@@ -157,6 +158,52 @@ def test_cp_layouts_are_selected_by_layer_config_type(monkeypatch):
         "zigzag",
     )
     assert layout_manager_kwargs["boundary_layout"] == "contiguous"
+
+
+def test_runtime_cp_layout_uses_microbatch_groups_without_mutating_stack(monkeypatch):
+    """CP1/2/4 microbatches get independent layout managers and TPxCP groups."""
+
+    class FakeGroup:
+        def __init__(self, size):
+            self._size = size
+
+        def size(self):
+            return self._size
+
+    static_cp_group = FakeGroup(1)
+    tp_group = FakeGroup(2)
+    runtime_groups = {size: FakeGroup(size) for size in (1, 2, 4)}
+    runtime_tp_cp_groups = {size: object() for size in (2, 4)}
+    monkeypatch.setattr(
+        hybrid_block_module.parallel_state,
+        "get_dynamic_tensor_data_context_parallel_group",
+        lambda *, group_size: runtime_tp_cp_groups[group_size],
+    )
+
+    stack = SimpleNamespace(
+        cp_group=static_cp_group,
+        tp_group=tp_group,
+        tp_cp_group=None,
+        _cp_layout_manager=None,
+        layer_cp_layouts=("contiguous", "zigzag"),
+        boundary_layout="contiguous",
+        config=SimpleNamespace(sequence_parallel=True),
+    )
+
+    for cp_size in (1, 2, 4, 1):
+        packed_seq_params = PackedSeqParams(local_cp_size=cp_size, cp_group=runtime_groups[cp_size])
+        runtime_group, manager = HybridStack._resolve_runtime_cp_layout(stack, packed_seq_params)
+
+        assert runtime_group is runtime_groups[cp_size]
+        if cp_size == 1:
+            assert manager is None
+        else:
+            assert manager.cp_group is runtime_groups[cp_size]
+            assert manager.tp_cp_group is runtime_tp_cp_groups[cp_size]
+            assert manager.layer_layouts == stack.layer_cp_layouts
+
+        assert stack.cp_group is static_cp_group
+        assert stack.tp_cp_group is None
 
 
 def test_hybrid_stack_rejects_layer_config_subclasses(monkeypatch):

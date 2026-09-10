@@ -17,7 +17,7 @@ from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEm
 from megatron.core.models.common.embeddings.yarn_rotary_pos_embedding import YarnRotaryEmbedding
 from megatron.core.models.common.language_module.language_module import LanguageModule
 from megatron.core.models.hybrid.layers import utils as layer_utils
-from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
@@ -608,6 +608,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 mhc_multistream=mhc_multistream,
                 labels=labels,
                 loss_mask=loss_mask,
+                padding_mask=padding_mask,
                 mtp_input_mask=mtp_input_mask,
                 packed_seq_params=packed_seq_params,
                 cp_batch=cp_batch,
@@ -623,6 +624,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 rotary_pos_emb=rotary_pos_emb,
                 packed_seq_params=mtp_inputs.packed_seq_params,
                 embedding=self.embedding,
+                padding_mask=mtp_inputs.padding_mask,
                 mtp_input_mask=mtp_inputs.mtp_input_mask,
                 packed_seq_params_by_layout=packed_seq_params_by_layout,
                 cp_layout_plan=cp_layout_plan,
@@ -651,6 +653,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 assert mtp_inputs is not None
                 # For RL (labels is None), process_mtp_loss derives labels from
                 # input_ids to match the SFT label format.
+                mtp_cp_group = resolve_cp_group(self.pg_collection.cp, mtp_inputs.packed_seq_params)
                 hidden_states = process_mtp_loss(
                     hidden_states=mtp_hidden_states,
                     labels=mtp_inputs.labels,
@@ -661,7 +664,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                     is_training=self.training,
                     compute_language_model_loss=self.compute_language_model_loss,
                     config=self.config,
-                    cp_group=self.pg_collection.cp,
+                    cp_group=mtp_cp_group,
                     tp_group=self.tp_group,
                     packed_seq_params=mtp_inputs.packed_seq_params,
                     scale_logits_fn=self._scale_logits if self.config.use_mup else None,

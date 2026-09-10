@@ -24,6 +24,7 @@ from megatron.core.models.common.embeddings import (
     _yarn_get_mscale,
     apply_rotary_pos_emb,
 )
+from megatron.core.packed_seq_params import resolve_cp_group
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
@@ -762,13 +763,9 @@ class MLASelfAttention(MultiLatentAttention):
         assert (
             hidden_states.ndim == 3
         ), f"hidden_states should be 3D, [s, b, n*h], got {hidden_states.ndim}D"
-        if packed_seq_params is not None:
-            assert (
-                packed_seq_params.local_cp_size is None
-            ), "hybrid_context_parallel is not supported with MLA yet and is planned for future. \
-            Please disable hybrid_context_parallel."
-
         inference_context = deprecate_inference_params(inference_context, inference_params)
+        runtime_cp_group = resolve_cp_group(self.pg_collection.cp, packed_seq_params)
+        assert runtime_cp_group is not None, "MLA requires a context-parallel group"
 
         # =========================================
         # Prepare RoPE and seqlen related params
@@ -893,7 +890,7 @@ class MLASelfAttention(MultiLatentAttention):
                 rotary_pos_emb,
                 config=self.config,
                 cu_seqlens_q=cu_seqlens_q,
-                cp_group=self.pg_collection.cp,
+                cp_group=runtime_cp_group,
                 mscale=mscale,
             )
             # k_pos_emb:[num_tokens, 1, qk_pos_emb_head_dim]
@@ -901,7 +898,7 @@ class MLASelfAttention(MultiLatentAttention):
                 k_pos_emb,
                 rotary_pos_emb,
                 config=self.config,
-                cp_group=self.pg_collection.cp,
+                cp_group=runtime_cp_group,
                 mscale=mscale,
             )
 
@@ -945,7 +942,7 @@ class MLASelfAttention(MultiLatentAttention):
                 and self.config.apply_rope_fusion
                 and self.config.q_lora_rank is not None
                 and q_compressed.ndim == 3
-                and self.pg_collection.cp.size() == 1
+                and runtime_cp_group.size() == 1
             )
 
             if use_fused_q_uproj:
@@ -1007,8 +1004,8 @@ class MLASelfAttention(MultiLatentAttention):
 
             # todo add assert about fusions and caching
             if self.config.apply_rope_fusion:
-                cp_rank = self.pg_collection.cp.rank()
-                cp_size = self.pg_collection.cp.size()
+                cp_rank = runtime_cp_group.rank()
+                cp_size = runtime_cp_group.size()
                 if not use_fused_q_uproj:
                     query = fused_apply_mla_rope_for_q(
                         q,
@@ -1043,7 +1040,7 @@ class MLASelfAttention(MultiLatentAttention):
                     sequence_start = inference_context.sequence_len_offset
                     sequence_end = sequence_start + q_len
                     rotary_pos_emb = rotary_pos_emb[sequence_start:sequence_end]
-                elif packed_seq_params is None or self.config.context_parallel_size == 1:
+                elif packed_seq_params is None or runtime_cp_group.size() == 1:
                     # Shorten rotary_pos_emb to the sequence length when inference_params
                     # is not provided. This makes sure we can run forward directly with
                     # any sequence length. During training, the sequence length is always
@@ -1073,7 +1070,7 @@ class MLASelfAttention(MultiLatentAttention):
                     config=self.config,
                     cu_seqlens=cu_seqlens_q,
                     mscale=mscale,
-                    cp_group=self.pg_collection.cp,
+                    cp_group=runtime_cp_group,
                     mla_rotary_interleaved=True,
                     max_seqlen=rope_freqs_max_seqlen,
                 )
@@ -1084,7 +1081,7 @@ class MLASelfAttention(MultiLatentAttention):
                     config=self.config,
                     cu_seqlens=cu_seqlens_kv,
                     mscale=mscale,
-                    cp_group=self.pg_collection.cp,
+                    cp_group=runtime_cp_group,
                     mla_rotary_interleaved=True,
                     max_seqlen=rope_freqs_max_seqlen,
                 )
