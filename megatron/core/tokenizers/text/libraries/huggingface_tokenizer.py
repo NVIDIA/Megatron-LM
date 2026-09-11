@@ -14,13 +14,6 @@ from megatron.core.utils import log_single_rank
 
 from .abstract_tokenizer import MegatronTokenizerTextAbstract
 
-try:
-    import gigatoken as gt
-
-    HAVE_GIGATOKEN = True
-except ModuleNotFoundError:
-    HAVE_GIGATOKEN = False
-
 logger = logging.getLogger(__name__)
 
 
@@ -195,19 +188,12 @@ class HuggingFaceTokenizer(MegatronTokenizerTextAbstract):
         ) + self.text_to_tokens('y')
         self._inv_vocab_dict = {}
 
+        self._hf_tokenizer = self.tokenizer
         if self.use_gigatoken:
             # restore tokenizer with gigatoken
-            if HAVE_GIGATOKEN:
-                self._hf_tokenizer = self.tokenizer
-                logger.info(f"Restoring {tokenizer_path} tokenizer with gigatoken.")
-                self.tokenizer = gt.Tokenizer(self.tokenizer).as_hf()
-            else:
-                raise ModuleNotFoundError(
-                    "gigatoken library is not installed. "
-                    "Please, install gigatoken to use fast tokenizers: `pip install gigatoken`."
-                )
-        else:
-            self._hf_tokenizer = self.tokenizer
+            from megatron.core.tokenizers.utils import init_gigatoken_from_hf
+
+            self.tokenizer = init_gigatoken_from_hf(self.tokenizer, tokenizer_path)
 
     def add_special_tokens(self, special_tokens_dict: dict) -> int:
         """
