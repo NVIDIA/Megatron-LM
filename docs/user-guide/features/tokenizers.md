@@ -208,6 +208,40 @@ torchrun --nproc_per_node=8 pretrain_gpt.py \
     ...
 ```
 
+### SFTTokenizer Prompt Formats
+
+`SFTTokenizer` is used with role-tagged SFT JSONL data. Each JSONL line must contain
+a `messages` field with entries such as `system`, `user`, `tool`, and `assistant`.
+The prompt format controls both the rendered token sequence and which tokens are
+included in the loss target.
+
+Use `identity_with_prompt_masking` when the input text is already formatted and
+should be tokenized exactly as provided, but only assistant tokens should contribute
+to the SFT loss:
+
+```bash
+torchrun --nproc_per_node=8 pretrain_gpt.py \
+    --tokenizer-type SFTTokenizer \
+    --tokenizer-model /path/to/tokenizer \
+    --sft-tokenizer-prompt-format identity_with_prompt_masking \
+    ...
+```
+
+| Prompt format | Token template | Loss masking |
+|---------------|----------------|--------------|
+| `identity` | Concatenates raw message content | Uses all non-padding tokens |
+| `identity_with_prompt_masking` | Concatenates raw message content | Masks system, user, and tool turns |
+| `nemotron-h-aligned` | Adds Nemotron-H role markers | Masks system, user, and tool turns |
+| `nemotron-nano-v2` | Adds Nano-v2 role markers and strips `/think` and `/no_think` from prompts | Masks system, user, and tool turns |
+| `default` | Uses the tokenizer's Hugging Face chat template | Uses all non-padding tokens |
+
+`identity_with_prompt_masking` preserves the same token template as `identity`, but
+it applies the standard role-based target masking used by the aligned SFT formats.
+Because this masking path tokenizes each turn separately and aligns those tokens
+against the full concatenated conversation, preserve clear turn-boundary text in
+the data. If a tokenizer can merge tokens across message boundaries, use a
+delimiter-based format such as `nemotron-h-aligned`.
+
 ### Auto-Generated Metadata
 
 If `--tokenizer-metadata` is not specified, a default metadata file is generated automatically based on the tokenizer type.
