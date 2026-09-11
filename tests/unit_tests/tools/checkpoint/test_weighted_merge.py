@@ -139,10 +139,19 @@ def _template(
 
 
 def _write_checkpoint(
-    path, value, *, dtype=torch.float32, extra_value=0.0, iteration=0, shape=(2, 2)
+    path,
+    value,
+    *,
+    dtype=torch.float32,
+    extra_value=0.0,
+    iteration=0,
+    shape=(2, 2),
+    consumed_train_samples=0,
 ):
     state_dict = _template(value, dtype=dtype, extra_value=extra_value, shape=shape)
-    state_dict["args"] = SimpleNamespace(iteration=iteration, hidden_size=2)
+    state_dict["args"] = SimpleNamespace(
+        iteration=iteration, hidden_size=2, consumed_train_samples=consumed_train_samples
+    )
     state_dict["checkpoint_version"] = 3.0
     state_dict["iteration"] = iteration
     dist_checkpointing.save(state_dict, str(path))
@@ -655,15 +664,15 @@ def test_metadata_same_layout_merge_round_trip_without_model_builder_path(
             [ckpt_a, ckpt_b],
             [0.25, 0.75],
             output_root,
-            output_iteration=30,
+            output_iteration=2,
             extra_state_source_index=1,
         )
 
-        assert result.output_dir == output_root / "iter_0000030"
+        assert result.output_dir == output_root / "iter_0000002"
         assert result.implementation_mode == weighted_merge_module.METADATA_SAME_LAYOUT_MODE
         assert result.averaged_tensors == 2
         assert result.copied_extra_states == 1
-        assert (output_root / "latest_checkpointed_iteration.txt").read_text().strip() == "30"
+        assert (output_root / "latest_checkpointed_iteration.txt").read_text().strip() == "2"
 
         loaded = _load_checkpoint(result.output_dir, shape=shape)
         assert torch.equal(loaded["model"]["weight"], torch.full(shape, 4.0))
@@ -699,6 +708,46 @@ def test_metadata_same_layout_merge_round_trip_without_model_builder_path(
         assert provenance["extra_state_source_index"] == 1
 
 
+def test_metadata_same_layout_uses_output_checkpoint_progress_state(
+    tmp_path_dist_ckpt, process_group
+):
+    with (
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_progress_a") as ckpt_a,
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_progress_b") as ckpt_b,
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_progress_out") as output_root,
+    ):
+        _write_checkpoint(ckpt_a, 1.0, iteration=1000, consumed_train_samples=128_000)
+        _write_checkpoint(ckpt_b, 5.0, iteration=2000, consumed_train_samples=256_000)
+
+        result = merge_same_layout_dcp_metadata_checkpoints(
+            [ckpt_a, ckpt_b], [0.25, 0.75], output_root, output_iteration=2000
+        )
+
+        common_state = dist_checkpointing.load_common_state_dict(str(result.output_dir))
+        assert common_state["iteration"] == 2000
+        assert common_state["args"].iteration == 2000
+        assert common_state["args"].consumed_train_samples == 256_000
+
+
+def test_metadata_same_layout_rejects_output_iteration_without_matching_progress_state(
+    tmp_path_dist_ckpt, process_group
+):
+    with (
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_progress_mismatch_a") as ckpt_a,
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_progress_mismatch_b") as ckpt_b,
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_progress_mismatch_out") as output_root,
+    ):
+        _write_checkpoint(ckpt_a, 1.0, iteration=1000)
+        _write_checkpoint(ckpt_b, 5.0, iteration=2000)
+
+        with pytest.raises(WeightedMergeError, match="does not match an input checkpoint"):
+            merge_same_layout_dcp_metadata_checkpoints(
+                [ckpt_a, ckpt_b], [0.25, 0.75], output_root, output_iteration=1500
+            )
+
+        assert not (output_root / "iter_0001500").exists()
+
+
 def test_metadata_same_layout_factory_checkpoint_round_trip(tmp_path_dist_ckpt, process_group):
     with (
         TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_factory_a") as ckpt_a,
@@ -709,7 +758,7 @@ def test_metadata_same_layout_factory_checkpoint_round_trip(tmp_path_dist_ckpt, 
         _write_factory_checkpoint(ckpt_b, 5.0, iteration=2)
 
         result = merge_same_layout_dcp_metadata_checkpoints(
-            [ckpt_a, ckpt_b], [0.25, 0.75], output_root, output_iteration=32
+            [ckpt_a, ckpt_b], [0.25, 0.75], output_root, output_iteration=2
         )
 
         loaded = dist_checkpointing.load(_factory_template(), str(result.output_dir))
@@ -754,7 +803,7 @@ def test_metadata_same_layout_balance_rank_work_preserves_source_chunks(
             [ckpt_a, ckpt_b],
             [0.25, 0.75],
             output_root,
-            output_iteration=30,
+            output_iteration=2,
             extra_state_source_index=1,
             balance_rank_work=True,
         )
@@ -1309,10 +1358,10 @@ def test_metadata_same_layout_sidecar_failure_does_not_publish_output_or_latest(
 
         with pytest.raises((RuntimeError, WeightedMergeError), match="sidecar boom"):
             merge_same_layout_dcp_metadata_checkpoints(
-                [ckpt_a, ckpt_b], [0.25, 0.75], output_root, output_iteration=55
+                [ckpt_a, ckpt_b], [0.25, 0.75], output_root, output_iteration=2
             )
 
-        assert not (output_root / "iter_0000055").exists()
+        assert not (output_root / "iter_0000002").exists()
         assert not (output_root / "latest_checkpointed_iteration.txt").exists()
 
 
@@ -1345,12 +1394,12 @@ def test_metadata_same_layout_multi_rank_product_round_trip_public_metadata(
             [ckpt_a, ckpt_b],
             [0.25, 0.75],
             output_root,
-            output_iteration=30,
+            output_iteration=2,
             extra_state_source_index=1,
         )
 
         loaded = _load_checkpoint(result.output_dir)
-        assert result.output_dir == output_root / "iter_0000030"
+        assert result.output_dir == output_root / "iter_0000002"
         assert result.implementation_mode == weighted_merge_module.METADATA_SAME_LAYOUT_MODE
         assert result.world_size == distributed_checkpoint_world
         assert result.averaged_tensors == 2
@@ -1411,7 +1460,7 @@ def test_metadata_same_layout_multi_rank_product_round_trip_public_metadata(
                 provenance["implementation_mode"] == weighted_merge_module.METADATA_SAME_LAYOUT_MODE
             )
             assert provenance["extra_state_source_index"] == 1
-            assert (output_root / "latest_checkpointed_iteration.txt").read_text().strip() == "30"
+            assert (output_root / "latest_checkpointed_iteration.txt").read_text().strip() == "2"
             assert len(list(result.output_dir.glob("*.distcp"))) == distributed_checkpoint_world
 
 
@@ -1840,7 +1889,7 @@ def test_cli_argparse_surface_merges_checkpoint(tmp_path_dist_ckpt, process_grou
                 "--merge-output",
                 str(output_root),
                 "--output-iteration",
-                "30",
+                "20",
             ]
         )
 
@@ -1848,10 +1897,10 @@ def test_cli_argparse_surface_merges_checkpoint(tmp_path_dist_ckpt, process_grou
 
         result = weighted_merge_module._run_metadata_same_layout_cli(args)
 
-        assert result.output_dir == output_root / "iter_0000030"
+        assert result.output_dir == output_root / "iter_0000020"
         assert result.implementation_mode == weighted_merge_module.METADATA_SAME_LAYOUT_MODE
         loaded = _load_checkpoint(result.output_dir)
         assert torch.allclose(loaded["model"]["weight"], torch.full((2, 2), 4.0))
         assert torch.allclose(loaded["model"]["bias"], torch.full((2,), 5.0))
         assert torch.equal(loaded["model"]["decoder.layers.0._extra_state"], torch.tensor([111.0]))
-        assert (output_root / "latest_checkpointed_iteration.txt").read_text().strip() == "30"
+        assert (output_root / "latest_checkpointed_iteration.txt").read_text().strip() == "20"

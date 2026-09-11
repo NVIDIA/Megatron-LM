@@ -1098,6 +1098,50 @@ def _prepare_common_state(
     return common_state
 
 
+def _common_state_iteration(common_state: dict[str, Any]) -> int | None:
+    iterations = []
+    if "iteration" in common_state:
+        iterations.append(common_state["iteration"])
+    checkpoint_args = common_state.get("args")
+    if checkpoint_args is not None and hasattr(checkpoint_args, "iteration"):
+        iterations.append(checkpoint_args.iteration)
+
+    if not iterations:
+        return None
+    if any(not isinstance(iteration, int) for iteration in iterations):
+        raise WeightedMergeError("Checkpoint common state contains a non-integer iteration.")
+    if len(set(iterations)) != 1:
+        raise WeightedMergeError(
+            "Checkpoint common state has inconsistent top-level and args iterations: "
+            f"{iterations}."
+        )
+    return iterations[0]
+
+
+def _load_output_common_state(
+    resolved_input_dirs: list[Path], output_iteration: int | None
+) -> dict[str, Any]:
+    common_states = [
+        dist_checkpointing.load_common_state_dict(str(checkpoint_dir))
+        for checkpoint_dir in resolved_input_dirs
+    ]
+    if output_iteration is None:
+        return common_states[0]
+
+    input_iterations = [_common_state_iteration(common_state) for common_state in common_states]
+    for common_state, input_iteration in zip(common_states, input_iterations):
+        if input_iteration == output_iteration:
+            return common_state
+
+    known_iterations = [iteration for iteration in input_iterations if iteration is not None]
+    if known_iterations:
+        raise WeightedMergeError(
+            f"Output iteration {output_iteration} does not match an input checkpoint's "
+            f"common-state iteration: {known_iterations}."
+        )
+    return common_states[0]
+
+
 def _load_path_group(
     checkpoint_dir: Path,
     path_leaves: list[tuple[tuple[str | int, ...], Any]],
@@ -1636,9 +1680,9 @@ def merge_same_layout_dcp_metadata_checkpoints(
             flush=True,
         )
 
+    base_common_state = _load_output_common_state(resolved_input_dirs, output_iteration)
     temporary_output_dir = _prepare_temporary_output_dir(output_dir)
 
-    base_common_state = dist_checkpointing.load_common_state_dict(str(resolved_input_dirs[0]))
     common_state = _prepare_common_state(base_common_state, output_iteration)
     strict = StrictHandling.ASSUME_OK_UNEXPECTED
     _add_merge_provenance(
