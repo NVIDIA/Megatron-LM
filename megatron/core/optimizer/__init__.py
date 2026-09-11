@@ -546,6 +546,7 @@ def _get_megatron_optimizer_based_on_param_groups(
                 pin_cpu_grads=config.pin_cpu_grads,
                 pin_cpu_params=config.pin_cpu_params,
                 param_update_in_fp32=True,
+                defer_sub_optimizer_init=config.use_distributed_optimizer,
                 **optimizer_defaults,
             )
             init_state_fn = None
