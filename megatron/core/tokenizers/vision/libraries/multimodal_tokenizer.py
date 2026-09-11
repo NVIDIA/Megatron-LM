@@ -277,11 +277,7 @@ class MegatronMultimodalTokenizer:
         # Apply possible image tag.
         conversation = self._apply_image_tag(conversation)
 
-        tokenize = True
-        if self.use_gigatoken:
-            # Tokenize conversation with separately gigatoken to get better performance.
-            tokenize = False
-
+        tokenize = not self.use_gigatoken
         tokens = self._hf_tokenizer.apply_chat_template(
             conversation,
             tokenize=tokenize,

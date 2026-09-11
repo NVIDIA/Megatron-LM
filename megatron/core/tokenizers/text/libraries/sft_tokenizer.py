@@ -156,11 +156,7 @@ class SFTTokenizer:
         if not self._prompt_config.has_system_role and conversation[0]["role"] == "system":
             conversation = conversation[1:]
 
-        tokenize = True
-        if self.use_gigatoken:
-            # Tokenize conversation with separately gigatoken to get better performance.
-            tokenize = False
-
+        tokenize = not self.use_gigatoken
         tokens = self._hf_tokenizer.apply_chat_template(
             conversation,
             tokenize=tokenize,
