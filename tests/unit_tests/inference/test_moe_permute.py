@@ -423,6 +423,40 @@ class TestPermuteTokens:
         assert first_dims.tolist() == [chunk_size] * num_local_experts
         assert n_used.item() == output_rows
 
+    @pytest.mark.launch_on_gb200
+    def test_te_mxfp8_batch_invariant_layout_uses_64_bit_offsets(self):
+        """Qwen3-30B's 16K-token buffer crosses the 32-bit flat-offset boundary."""
+        from megatron.core.inference.moe.permute import permute_tokens_for_te_mxfp8_batch_invariant
+
+        # This is the per-GPU layout for a 4-way EP reproduction of Qwen3-30B's
+        # 16K-token inference buffer. The output contains exactly 2**32 BF16
+        # elements; 32-bit ``output_row * hidden_dim`` arithmetic wraps here.
+        max_tokens, hidden_dim, num_local_experts = 65536, 2048, 32
+        num_chunks, chunk_size = 256, 256
+        hidden = torch.zeros(max_tokens, hidden_dim, device="cuda", dtype=torch.bfloat16)
+        hidden[0].fill_(1.0)
+        probs = torch.ones(max_tokens, 1, device="cuda", dtype=torch.float32)
+        routing_map = torch.full((max_tokens, 1), -1, device="cuda", dtype=torch.int64)
+        routing_map[0, 0] = 0
+
+        actual = permute_tokens_for_te_mxfp8_batch_invariant(
+            hidden, probs, routing_map, 0, num_local_experts, _vt(1), num_chunks, chunk_size
+        )
+        output_hidden, output_probs, output_map, inverse_map, first_dims, n_used = actual
+        torch.cuda.synchronize()
+
+        assert output_hidden.numel() == 2**32
+        assert torch.equal(output_hidden[0], hidden[0])
+        assert torch.count_nonzero(output_hidden[-1]).item() == 0
+        assert output_probs[0].item() == 1.0
+        assert output_map[0].item() == 0
+        assert inverse_map[0, 0].item() == 0
+        assert first_dims.tolist() == [chunk_size] * num_local_experts
+        assert n_used.item() == num_chunks * num_local_experts * chunk_size
+
+        del actual, output_hidden, output_probs, output_map, inverse_map, first_dims, n_used
+        torch.cuda.empty_cache()
+
     @pytest.mark.parametrize("activation", ["squared_relu", "swiglu"])
     def test_activation_zeroes_te_grouped_gemm_padding(self, activation):
         """FC2 quantization sees zeros for every aligned padding row."""

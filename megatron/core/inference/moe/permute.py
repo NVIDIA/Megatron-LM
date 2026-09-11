@@ -474,11 +474,16 @@ def _permute_tokens_for_te_mxfp8_batch_invariant_kernel(
 ):
     """Permute directly from token order into deterministic chunk-major rows."""
     output_row = tl.program_id(0)
+    # Qwen3-30B with the inference engine's default 16K-token budget has
+    # output_rows * hidden_dim == 2**32. Triton program ids and runtime shape
+    # scalars otherwise produce 32-bit products, wrapping the flat tensor offset.
+    output_row_i64 = output_row.to(tl.int64)
     rows_per_chunk = num_local_experts * chunk_size
     chunk = output_row // rows_per_chunk
     row_in_chunk = output_row % rows_per_chunk
     local_expert = row_in_chunk // chunk_size
     token = chunk * chunk_size + row_in_chunk % chunk_size
+    token_i64 = token.to(tl.int64)
 
     token_in_buffer = token < max_tokens
     token_is_valid = token_in_buffer & (token < tl.load(valid_tokens_ptr))
@@ -486,7 +491,7 @@ def _permute_tokens_for_te_mxfp8_batch_invariant_kernel(
     route_index = -1
     for route in tl.static_range(0, topk):
         routed_expert = tl.load(
-            routing_map_ptr + token * topk + route, mask=token_is_valid, other=-1
+            routing_map_ptr + token_i64 * topk + route, mask=token_is_valid, other=-1
         )
         route_index = tl.where(routed_expert == global_expert, route, route_index)
     valid_row = token_is_valid & (route_index >= 0)
@@ -495,24 +500,24 @@ def _permute_tokens_for_te_mxfp8_batch_invariant_kernel(
         hidden_offsets = hidden_start + tl.arange(0, BLOCK_H)
         hidden_mask = hidden_offsets < hidden_dim
         values = tl.load(
-            hidden_ptr + token * hidden_dim + hidden_offsets,
+            hidden_ptr + token_i64 * hidden_dim + hidden_offsets,
             mask=valid_row & hidden_mask,
             other=0.0,
         )
         tl.store(
-            out_hidden_ptr + output_row * hidden_dim + hidden_offsets, values, mask=hidden_mask
+            out_hidden_ptr + output_row_i64 * hidden_dim + hidden_offsets, values, mask=hidden_mask
         )
 
-    probability = tl.load(probs_ptr + token * topk + route_index, mask=valid_row, other=0.0)
-    tl.store(out_probs_ptr + output_row, probability)
-    tl.store(out_map_ptr + output_row, tl.where(valid_row, token, -1))
+    probability = tl.load(probs_ptr + token_i64 * topk + route_index, mask=valid_row, other=0.0)
+    tl.store(out_probs_ptr + output_row_i64, probability)
+    tl.store(out_map_ptr + output_row_i64, tl.where(valid_row, token, -1))
     tl.store(
-        out_inverse_map_ptr + token * num_local_experts + local_expert,
+        out_inverse_map_ptr + token_i64 * num_local_experts + local_expert,
         tl.where(valid_row, output_row, -1),
         mask=token_in_buffer,
     )
     if output_row < num_local_experts:
-        tl.store(first_dims_ptr + output_row, chunk_size)
+        tl.store(first_dims_ptr + output_row_i64, chunk_size)
     if output_row == 0:
         tl.store(n_used_ptr, output_rows)
 
