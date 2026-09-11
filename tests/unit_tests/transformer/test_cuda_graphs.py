@@ -93,6 +93,8 @@ def test_cuda_graph_runner_stream_pool_is_bounded(monkeypatch):
     assert assigned[:pool_size] == assigned[pool_size:]
 
 
+@pytest.mark.internal
+@pytest.mark.launch_on_gb200
 def test_delete_cuda_graphs_releases_runner_without_capture_records(monkeypatch):
     class Graph:
         pass

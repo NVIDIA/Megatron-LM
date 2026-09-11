@@ -46,15 +46,12 @@ else:
     dot_product_attention = MagicMock()
 
 
-# Create custom process groups
-Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=1)
-model_parallel_cuda_manual_seed(123)
-
-# Get TP and CP process groups from device mesh
-tp_group = parallel_state.get_tensor_model_parallel_group()
-cp_group = parallel_state.get_context_parallel_group()
-
-pg_collection = ProcessGroupCollection(tp=tp_group, cp=cp_group)
+@pytest.fixture(autouse=True)
+def model_parallel_groups():
+    Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=1)
+    model_parallel_cuda_manual_seed(123)
+    yield
+    Utils.destroy_model_parallel()
 
 
 def get_attention_implementation(
@@ -67,6 +64,10 @@ def get_attention_implementation(
     softmax_scale: float,
     cp_comm_type: str = "a2a",
 ) -> MegatronModule:
+    pg_collection = ProcessGroupCollection(
+        tp=parallel_state.get_tensor_model_parallel_group(),
+        cp=parallel_state.get_context_parallel_group(),
+    )
     if impl == "megatron":
         return DotProductAttention(
             config,
