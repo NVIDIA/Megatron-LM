@@ -1296,6 +1296,12 @@ def test_metadata_same_layout_explicit_roots_ignore_mixed_state(
         output_metadata = torch_dcp.FileSystemReader(result.output_dir).read_metadata()
         assert "optimizer.param_groups.0.lr" not in output_metadata.state_dict_metadata
         assert "rng_state._extra_state" not in output_metadata.state_dict_metadata
+        provenance = dist_checkpointing.load_common_state_dict(str(result.output_dir))[
+            "weighted_merge_provenance"
+        ]
+        assert provenance["model_key_prefixes"] == list(prefixes)
+        assert provenance["include_default_model_roots"] is False
+        assert provenance["ignore_non_model_state"] is True
 
 
 def test_metadata_same_layout_dry_run_validates_without_output(

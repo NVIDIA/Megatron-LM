@@ -989,6 +989,9 @@ def _add_merge_provenance(
     merge_style: str | None,
     execution_mode: str = METADATA_SAME_LAYOUT_MODE,
     balance_rank_work: bool = False,
+    model_key_prefixes: tuple[str, ...] = METADATA_SAME_LAYOUT_MODEL_PREFIXES,
+    include_default_model_roots: bool = True,
+    ignore_non_model_state: bool = False,
 ) -> None:
     common_state["weighted_merge_provenance"] = {
         "format_version": 1,
@@ -1003,6 +1006,9 @@ def _add_merge_provenance(
         "extra_state_source_path": str(input_dirs[extra_state_source_index]),
         "implementation_mode": execution_mode,
         "balance_rank_work": bool(balance_rank_work),
+        "model_key_prefixes": list(model_key_prefixes),
+        "include_default_model_roots": bool(include_default_model_roots),
+        "ignore_non_model_state": bool(ignore_non_model_state),
         "strict": strict.value,
         "code_revision": _git_revision(),
         "optimizer_merged": False,
@@ -1786,6 +1792,9 @@ def merge_same_layout_dcp_metadata_checkpoints(
         merge_style=merge_style,
         execution_mode=METADATA_SAME_LAYOUT_MODE,
         balance_rank_work=balance_rank_work,
+        model_key_prefixes=model_key_prefixes,
+        include_default_model_roots=include_default_model_roots,
+        ignore_non_model_state=ignore_non_model_state,
     )
 
     from megatron.core.dist_checkpointing.core import CheckpointingConfig, save_config
