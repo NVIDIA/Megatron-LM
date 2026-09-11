@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Optional, Tuple
 from torch import Tensor
 
 from megatron.core.transformer.enums import AttnBackend, AttnMaskType
+from megatron.core.utils import _UNFUSED_DSA_KERNEL_BACKENDS
 
 if TYPE_CHECKING:
     from megatron.core.packed_seq_params import PackedSeqParams
@@ -30,8 +31,15 @@ _LOGGER = logging.getLogger(__name__)
 def _get_dsa_kernel_backend(config: TransformerConfig) -> str:
     """Return the configured DSA kernel backend."""
     backend = config.dsa_kernel_backend
-    if backend != "none" and backend not in _BACKEND_MODULE_NAME_BY_BACKEND:
-        raise ValueError("dsa_kernel_backend must be one of: none, tilelang, cudnn")
+    # The DSA-over-GQA values select implementations that load no fused backend module, so
+    # they are treated like "none" here; TransformerConfig validates the value itself.
+    if backend not in _UNFUSED_DSA_KERNEL_BACKENDS and backend not in (
+        _BACKEND_MODULE_NAME_BY_BACKEND
+    ):
+        raise ValueError(
+            "dsa_kernel_backend must be one of: "
+            f"{', '.join(_UNFUSED_DSA_KERNEL_BACKENDS + tuple(_BACKEND_MODULE_NAME_BY_BACKEND))}."
+        )
     return backend
 
 

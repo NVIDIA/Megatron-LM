@@ -812,10 +812,10 @@ class DSGQACoreAttention(MegatronModule):
 
         sq, b, _, _ = query.size()
         skv = key.size(0)
-        dsa_min_memory_backend = getattr(self.config, "dsa_min_memory_backend", "reference")
-        if getattr(self.config, "dsa_fwd_skip_dsa", False) or dsa_min_memory_backend in (
-            "triton-min-memory",
-            "torch-min-memory",
+        dsa_kernel_backend = getattr(self.config, "dsa_kernel_backend", "reference")
+        if getattr(self.config, "dsa_fwd_skip_dsa", False) or dsa_kernel_backend in (
+            "min-memory-triton",
+            "min-memory-torch",
         ):
             return self._forward_min_memory(
                 query=query,
@@ -1055,7 +1055,7 @@ class DSGQACoreAttention(MegatronModule):
         packed_seq_params: PackedSeqParams = None,
     ) -> torch.Tensor:
         """Minimum-activation DSA-GQA path for training and no-grad validation."""
-        dsa_min_memory_backend = getattr(self.config, "dsa_min_memory_backend", "reference")
+        dsa_kernel_backend = getattr(self.config, "dsa_kernel_backend", "reference")
         skip_dsa = getattr(self.config, "dsa_fwd_skip_dsa", False)
         dense_warmup = getattr(self.config, "dsa_fwd_use_dense_attn", False)
         train_main_only = getattr(self.config, "dsa_train_main_only", False)
@@ -1070,12 +1070,12 @@ class DSGQACoreAttention(MegatronModule):
         assert packed_seq_params is None, "Packed sequence is not supported for DSA-GQA."
         if attn_mask_type != AttnMaskType.causal:
             raise NotImplementedError(
-                f"dsa_min_memory_backend='{dsa_min_memory_backend}' only supports causal "
+                f"dsa_kernel_backend='{dsa_kernel_backend}' only supports causal "
                 "fixed-length batches."
             )
         if query.size(0) != key.size(0) or key.size(0) != hidden_states.size(0):
             raise NotImplementedError(
-                f"dsa_min_memory_backend='{dsa_min_memory_backend}' requires full-sequence self "
+                f"dsa_kernel_backend='{dsa_kernel_backend}' requires full-sequence self "
                 "attention."
             )
         if skip_dsa:
@@ -1113,7 +1113,7 @@ class DSGQACoreAttention(MegatronModule):
             return _DSAZeroParamDependency.apply(output, *trainable_indexer_params)
         if getattr(self.config, "dsa_sparse_attention_use_gather", False):
             raise NotImplementedError(
-                f"dsa_min_memory_backend='{dsa_min_memory_backend}' bypasses the reference gather "
+                f"dsa_kernel_backend='{dsa_kernel_backend}' bypasses the reference gather "
                 "backend; "
                 "do not set dsa_sparse_attention_use_gather."
             )
@@ -1144,8 +1144,7 @@ class DSGQACoreAttention(MegatronModule):
             raise NotImplementedError("dsa_train_main_only requires sparse DSA forward attention.")
         if not simplified_indexer and not getattr(self.config, "dsa_indexer_use_hadamard", False):
             raise NotImplementedError(
-                f"dsa_min_memory_backend='{dsa_min_memory_backend}' requires "
-                "dsa_indexer_use_hadamard."
+                f"dsa_kernel_backend='{dsa_kernel_backend}' requires " "dsa_indexer_use_hadamard."
             )
         if (
             self.config.fp8 is not None
@@ -1153,13 +1152,13 @@ class DSGQACoreAttention(MegatronModule):
             or is_using_quantization_scales(self.config)
         ):
             raise NotImplementedError(
-                f"dsa_min_memory_backend='{dsa_min_memory_backend}' does not yet support "
+                f"dsa_kernel_backend='{dsa_kernel_backend}' does not yet support "
                 "quantized/FP8 "
                 "indexer projections."
             )
         if not simplified_indexer and self.config.layernorm_zero_centered_gamma:
             raise NotImplementedError(
-                f"dsa_min_memory_backend='{dsa_min_memory_backend}' does not yet support "
+                f"dsa_kernel_backend='{dsa_kernel_backend}' does not yet support "
                 "layernorm_zero_centered_gamma in the DSA indexer norm."
             )
         if dense_warmup:
@@ -1179,14 +1178,14 @@ class DSGQACoreAttention(MegatronModule):
                 )
             if not self.training:
                 raise NotImplementedError(
-                    f"dsa_min_memory_backend='{dsa_min_memory_backend}' currently supports "
+                    f"dsa_kernel_backend='{dsa_kernel_backend}' currently supports "
                     "training only."
                 )
 
             indexer_loss_coeff = getattr(self.config, "dsa_indexer_loss_coeff", 0.0) or 0.0
             if indexer_loss_coeff <= 0:
                 raise NotImplementedError(
-                    f"dsa_min_memory_backend='{dsa_min_memory_backend}' expects "
+                    f"dsa_kernel_backend='{dsa_kernel_backend}' expects "
                     "dsa_indexer_loss_coeff > 0 "
                     "for dense indexer warmup."
                 )
@@ -1214,7 +1213,7 @@ class DSGQACoreAttention(MegatronModule):
                 profile_enabled=getattr(self.config, "dsa_min_memory_profile", False),
                 profile_rank=getattr(self.config, "dsa_min_memory_profile_rank", 0),
                 profile_label=f"layer={self.layer_number}",
-                use_triton=dsa_min_memory_backend == "triton-min-memory",
+                use_triton=dsa_kernel_backend == "min-memory-triton",
             )
             DSAIndexerLossLoggingHelper.save_loss_to_tracker(
                 loss=indexer_loss,
@@ -1241,19 +1240,17 @@ class DSGQACoreAttention(MegatronModule):
                 profile_enabled=getattr(self.config, "dsa_min_memory_profile", False),
                 profile_rank=getattr(self.config, "dsa_min_memory_profile_rank", 0),
                 profile_label=f"layer={self.layer_number}",
-                use_triton=dsa_min_memory_backend == "triton-min-memory",
-                use_cudnn=getattr(self.config, "dsa_use_cudnn", False),
+                use_triton=dsa_kernel_backend == "min-memory-triton",
             )
         if not self.training:
             raise NotImplementedError(
-                f"dsa_min_memory_backend='{dsa_min_memory_backend}' currently supports training "
-                "only."
+                f"dsa_kernel_backend='{dsa_kernel_backend}' currently supports training " "only."
             )
 
         configured_indexer_loss_coeff = getattr(self.config, "dsa_indexer_loss_coeff", 0.0) or 0.0
         if not train_main_only and configured_indexer_loss_coeff <= 0:
             raise NotImplementedError(
-                f"dsa_min_memory_backend='{dsa_min_memory_backend}' expects dsa_indexer_loss_coeff "
+                f"dsa_kernel_backend='{dsa_kernel_backend}' expects dsa_indexer_loss_coeff "
                 "> 0 "
                 "for indexer training."
             )
@@ -1278,8 +1275,7 @@ class DSGQACoreAttention(MegatronModule):
             profile_enabled=getattr(self.config, "dsa_min_memory_profile", False),
             profile_rank=getattr(self.config, "dsa_min_memory_profile_rank", 0),
             profile_label=f"layer={self.layer_number}",
-            use_triton=dsa_min_memory_backend == "triton-min-memory",
-            use_cudnn=getattr(self.config, "dsa_use_cudnn", False),
+            use_triton=dsa_kernel_backend == "min-memory-triton",
         )
         if sparse_fwd_dense_loss:
             indexer_loss = dsa_dense_indexer_loss(
@@ -1296,7 +1292,7 @@ class DSGQACoreAttention(MegatronModule):
                 profile_enabled=getattr(self.config, "dsa_min_memory_profile", False),
                 profile_rank=getattr(self.config, "dsa_min_memory_profile_rank", 0),
                 profile_label=f"layer={self.layer_number}",
-                use_triton=dsa_min_memory_backend == "triton-min-memory",
+                use_triton=dsa_kernel_backend == "min-memory-triton",
             )
         if not train_main_only:
             DSAIndexerLossLoggingHelper.save_loss_to_tracker(
