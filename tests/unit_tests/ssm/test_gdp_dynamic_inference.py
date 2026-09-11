@@ -678,7 +678,11 @@ class TestGDPSpeculativeDecode:
         conv_cache, ssm_cache = self._caches()
 
         eager_conv, eager_ssm = conv_cache.clone(), ssm_cache.clone()
-        eager_int_conv, eager_int_ssm = self._snapshot_buffers(seq_len)
+        # Zero-filled, not `empty`: slots no request names are written by
+        # neither run, so the comparison below only means something if both
+        # sides start from the same value there. It then doubles as a check
+        # that a replay leaves unnamed slots alone.
+        eager_int_conv, eager_int_ssm = self._snapshot_buffers(seq_len, fill=0.0)
         eager_out = self.mixer.ssm_decode(
             projected,
             eager_conv,
@@ -692,7 +696,7 @@ class TestGDPSpeculativeDecode:
         # its inputs here and will write its outputs here.
         static_projected = projected.clone()
         graph_conv, graph_ssm = conv_cache.clone(), ssm_cache.clone()
-        graph_int_conv, graph_int_ssm = self._snapshot_buffers(seq_len)
+        graph_int_conv, graph_int_ssm = self._snapshot_buffers(seq_len, fill=0.0)
 
         def step():
             return self.mixer.ssm_decode(
