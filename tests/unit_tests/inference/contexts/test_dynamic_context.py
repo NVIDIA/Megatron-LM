@@ -4447,3 +4447,26 @@ def test_flashinfer_mixed_batch_repairs_greedy_ties(monkeypatch):
 
     assert torch.equal(sampled, torch.tensor([1, 2]))
     fake.sampling.top_k_top_p_sampling_from_logits.assert_called_once()
+
+
+def test_torch_processed_log_probs_match_top_k_one_greedy_tie_breaking():
+    """Torch processed log-probs match deterministic top_k=1 sampling on ties."""
+    logits = torch.tensor([[0.0, 3.0, 1.0, 3.0], [2.0, 2.0, 1.0, 0.0]])
+    top_k = torch.ones(2, dtype=torch.int32)
+    context = SimpleNamespace(
+        total_request_count=2,
+        paused_request_count=0,
+        active_request_metadata={
+            "temperature": torch.ones(2),
+            "top_k": top_k,
+            "top_p": torch.zeros(2),
+        },
+    )
+
+    backend = TorchSampling(torch.Generator(), vocab_size=logits.size(1))
+    log_probs = backend.log_probs_kernel(logits, context)
+
+    expected = torch.full_like(logits, float("-inf"))
+    expected[0, 1] = 0.0
+    expected[1, 0] = 0.0
+    assert torch.equal(log_probs, expected)
