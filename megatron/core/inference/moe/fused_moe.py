@@ -20,6 +20,7 @@ from megatron.core.inference.moe.activations import (
 from megatron.core.inference.moe.permute import (
     permute_and_quantize_mxfp8,
     permute_tokens,
+    permute_tokens_for_te_mxfp8_batch_invariant,
     unpermute_tokens,
 )
 from megatron.core.inference.quantization.mxfp8_quantize import MXFP8_SCALE_ROW_BLOCK
@@ -432,56 +433,6 @@ def _te_mxfp8_batch_invariant_grouped_mm(
     return output_data.view(x_bf16.shape[0], out_features)
 
 
-def _te_mxfp8_batch_invariant_reorder(
-    hidden_states: torch.Tensor,
-    permuted_probs: torch.Tensor,
-    inverse_map: torch.Tensor,
-    num_chunks: int,
-):
-    """Place each token/expert pair in a deterministic chunk-major row.
-
-    The regular permutation compacts rows with atomics. Although its inverse map
-    restores token order, a token can land at a different row inside the FC2
-    matrix when the co-batch changes, and the MXFP8 kernel's reduction can then
-    change bits. Assign row ``token % 256`` in chunk ``token // 256`` instead.
-    """
-    num_tokens, num_experts = inverse_map.shape
-    chunk_size = _TE_MXFP8_BATCH_INVARIANT_CHUNK_SIZE
-    rows = torch.arange(chunk_size, dtype=torch.int64, device=inverse_map.device)
-    hidden_chunks = []
-    prob_chunks = []
-    map_chunks = []
-    for chunk in range(num_chunks):
-        token_rows = chunk * chunk_size + rows
-        in_token_buffer = token_rows < num_tokens
-        safe_token_rows = torch.where(in_token_buffer, token_rows, 0)
-        source_rows = inverse_map[safe_token_rows].transpose(0, 1)
-        valid_rows = in_token_buffer[None, :] & (source_rows >= 0)
-        safe_source_rows = torch.where(valid_rows, source_rows, 0).to(torch.int64)
-        hidden_chunks.append(
-            torch.where(valid_rows[..., None], hidden_states[safe_source_rows], 0.0).flatten(0, 1)
-        )
-        prob_chunks.append(torch.where(valid_rows, permuted_probs[safe_source_rows], 0.0).flatten())
-        map_chunks.append(
-            torch.where(valid_rows, safe_token_rows.to(inverse_map.dtype)[None, :], -1).flatten()
-        )
-
-    expert_ids = torch.arange(num_experts, dtype=inverse_map.dtype, device=inverse_map.device)
-    token_ids = torch.arange(num_tokens, dtype=inverse_map.dtype, device=inverse_map.device)[
-        :, None
-    ]
-    chunked_inverse_map = (
-        torch.div(token_ids, chunk_size, rounding_mode="floor") * num_experts + expert_ids
-    ) * chunk_size + torch.remainder(token_ids, chunk_size)
-    chunked_inverse_map = torch.where(inverse_map >= 0, chunked_inverse_map, -1)
-    return (
-        torch.cat(hidden_chunks),
-        torch.cat(prob_chunks),
-        torch.cat(map_chunks),
-        chunked_inverse_map,
-    )
-
-
 def _get_activation_func(
     activation_type: ActivationType,
     fused_quant: bool = False,
@@ -578,8 +529,9 @@ def mcore_fused_moe(
     # Fused Triton quant kernels only apply to the MCore MXFP8 path.
     use_fused_quant = use_mcore_mxfp8 and not disable_fused_quant_kernels
     batch_invariant_mode = batch_invariant.enabled()
+    use_te_mxfp8_batch_invariant = batch_invariant_mode and use_te_mxfp8
 
-    if batch_invariant_mode and use_te_mxfp8:
+    if use_te_mxfp8_batch_invariant:
         # Launch each 256-row token chunk separately so an expert always has the same
         # grouped-GEMM index and M, independent of routing counts and graph bucket size.
         num_te_chunks = max(
@@ -628,7 +580,28 @@ def mcore_fused_moe(
     )
 
     # --- Pre-processing: permute ---
-    if use_fused_quant:
+    offs = None
+    first_dims = None
+    n_used = None
+    if use_te_mxfp8_batch_invariant:
+        (
+            hidden_states,
+            permuted_probs,
+            permutation_map,
+            batch_invariant_inverse_map,
+            first_dims,
+            n_used,
+        ) = permute_tokens_for_te_mxfp8_batch_invariant(
+            hidden_states,
+            probs,
+            routing_map,
+            local_expert_start,
+            num_local_experts,
+            valid_tokens,
+            num_te_chunks,
+            chunk_size=_TE_MXFP8_BATCH_INVARIANT_CHUNK_SIZE,
+        )
+    elif use_fused_quant:
         # Fused permute + MXFP8 quantize: single kernel produces MXFP8Tensor
         batch_invariant_inverse_map = None
         hidden_states, permuted_probs, permutation_map, offs = permute_and_quantize_mxfp8(
@@ -663,25 +636,20 @@ def mcore_fused_moe(
     # produces MXFP8Tensor directly).
     if use_mcore_mxfp8 and not isinstance(hidden_states, MXFP8Tensor):
         hidden_states = MXFP8Tensor.from_bf16(hidden_states, backend="triton")
-    # offs[-1:] normally points to the dynamic used prefix. The fixed-chunk TE path
-    # replaces it below with the complete chunk-major row count.
-    n_used = offs[-1:]
+    if not use_te_mxfp8_batch_invariant:
+        assert offs is not None
+        n_used = offs[-1:]
     if use_te_mxfp8:
-        first_dims = torch.cat((offs[:1], offs[1:] - offs[:-1])).to(torch.int64)
-        if batch_invariant_mode:
-            hidden_states, permuted_probs, permutation_map, batch_invariant_inverse_map = (
-                _te_mxfp8_batch_invariant_reorder(
-                    hidden_states, permuted_probs, batch_invariant_inverse_map, num_te_chunks
-                )
-            )
-            first_dims = first_dims.new_full(
-                (num_local_experts,), _TE_MXFP8_BATCH_INVARIANT_CHUNK_SIZE
-            )
-            n_used = offs.new_full((1,), hidden_states.shape[0])
+        if not use_te_mxfp8_batch_invariant:
+            assert offs is not None
+            first_dims = torch.cat((offs[:1], offs[1:] - offs[:-1])).to(torch.int64)
+        assert first_dims is not None
         fc1_output = mm_fn(hidden_states, fc1_weight, first_dims)
     else:
+        assert offs is not None
         fc1_output = mm_fn(hidden_states, fc1_weight, offs)
 
+    assert n_used is not None
     if batch_invariant_mode:
         # Match training: BF16 activation, FP32 probability multiply, then BF16 before FC2.
         if activation_type == ActivationType.SWIGLU:

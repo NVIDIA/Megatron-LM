@@ -373,6 +373,56 @@ class TestPermuteTokens:
         splits = torch.cat((offsets[:1], offsets[1:] - offsets[:-1]))
         assert splits.tolist() == [256, 256, 256, 0]
 
+    def test_te_mxfp8_batch_invariant_layout(self):
+        """The direct TE permutation fixes rows and zeroes non-local, invalid, and tail rows."""
+        from megatron.core.inference.moe.permute import permute_tokens_for_te_mxfp8_batch_invariant
+
+        max_tokens, valid_token_count, hidden_dim = 270, 263, 70
+        topk, local_expert_start, num_local_experts = 3, 4, 3
+        chunk_size, num_chunks = 256, 2
+        generator = torch.Generator().manual_seed(123)
+        hidden_cpu = torch.randn(max_tokens, hidden_dim, generator=generator, dtype=torch.bfloat16)
+        probs_cpu = torch.rand(max_tokens, topk, generator=generator, dtype=torch.float32)
+        tokens = torch.arange(max_tokens, dtype=torch.int64)[:, None]
+        route_offsets = torch.tensor([0, 3, 5], dtype=torch.int64)[None, :]
+        routing_cpu = (tokens + route_offsets) % 8
+
+        actual = permute_tokens_for_te_mxfp8_batch_invariant(
+            hidden_cpu.cuda(),
+            probs_cpu.cuda(),
+            routing_cpu.cuda(),
+            local_expert_start,
+            num_local_experts,
+            _vt(valid_token_count),
+            num_chunks,
+            chunk_size,
+        )
+
+        output_rows = num_chunks * num_local_experts * chunk_size
+        expected_hidden = torch.zeros(output_rows, hidden_dim, dtype=torch.bfloat16)
+        expected_probs = torch.zeros(output_rows, dtype=torch.float32)
+        expected_map = torch.full((output_rows,), -1, dtype=torch.int32)
+        expected_inverse = torch.full((max_tokens, num_local_experts), -1, dtype=torch.int32)
+        for token in range(valid_token_count):
+            for route in range(topk):
+                local_expert = routing_cpu[token, route].item() - local_expert_start
+                if 0 <= local_expert < num_local_experts:
+                    output_row = (
+                        (token // chunk_size) * num_local_experts + local_expert
+                    ) * chunk_size + token % chunk_size
+                    expected_hidden[output_row] = hidden_cpu[token]
+                    expected_probs[output_row] = probs_cpu[token, route]
+                    expected_map[output_row] = token
+                    expected_inverse[token, local_expert] = output_row
+
+        output_hidden, output_probs, output_map, inverse_map, first_dims, n_used = actual
+        assert torch.equal(output_hidden.cpu(), expected_hidden)
+        assert torch.equal(output_probs.cpu(), expected_probs)
+        assert torch.equal(output_map.cpu(), expected_map)
+        assert torch.equal(inverse_map.cpu(), expected_inverse)
+        assert first_dims.tolist() == [chunk_size] * num_local_experts
+        assert n_used.item() == output_rows
+
     @pytest.mark.parametrize("activation", ["squared_relu", "swiglu"])
     def test_activation_zeroes_te_grouped_gemm_padding(self, activation):
         """FC2 quantization sees zeros for every aligned padding row."""

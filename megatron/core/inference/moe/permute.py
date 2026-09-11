@@ -452,6 +452,155 @@ def permute_tokens(
 
 
 @triton.jit
+def _permute_tokens_for_te_mxfp8_batch_invariant_kernel(
+    hidden_ptr,  # [max_tokens, hidden_dim] input hidden states
+    probs_ptr,  # [max_tokens, topk] routing probabilities
+    routing_map_ptr,  # [max_tokens, topk] global expert assignments
+    out_hidden_ptr,  # [num_chunks * num_local_experts * chunk_size, hidden_dim]
+    out_probs_ptr,  # [num_chunks * num_local_experts * chunk_size]
+    out_map_ptr,  # [num_chunks * num_local_experts * chunk_size]
+    out_inverse_map_ptr,  # [num_tokens, num_local_experts]
+    first_dims_ptr,  # [num_local_experts] fixed grouped-GEMM split sizes
+    n_used_ptr,  # [1] complete fixed output row count
+    valid_tokens_ptr,  # [1] number of valid input tokens
+    max_tokens,
+    hidden_dim,
+    topk: tl.constexpr,
+    local_expert_start,
+    num_local_experts: tl.constexpr,
+    chunk_size: tl.constexpr,
+    output_rows: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+):
+    """Permute directly from token order into deterministic chunk-major rows."""
+    output_row = tl.program_id(0)
+    rows_per_chunk = num_local_experts * chunk_size
+    chunk = output_row // rows_per_chunk
+    row_in_chunk = output_row % rows_per_chunk
+    local_expert = row_in_chunk // chunk_size
+    token = chunk * chunk_size + row_in_chunk % chunk_size
+
+    token_in_buffer = token < max_tokens
+    token_is_valid = token_in_buffer & (token < tl.load(valid_tokens_ptr))
+    global_expert = local_expert_start + local_expert
+    route_index = -1
+    for route in tl.static_range(0, topk):
+        routed_expert = tl.load(
+            routing_map_ptr + token * topk + route, mask=token_is_valid, other=-1
+        )
+        route_index = tl.where(routed_expert == global_expert, route, route_index)
+    valid_row = token_is_valid & (route_index >= 0)
+
+    for hidden_start in tl.range(0, hidden_dim, BLOCK_H):
+        hidden_offsets = hidden_start + tl.arange(0, BLOCK_H)
+        hidden_mask = hidden_offsets < hidden_dim
+        values = tl.load(
+            hidden_ptr + token * hidden_dim + hidden_offsets,
+            mask=valid_row & hidden_mask,
+            other=0.0,
+        )
+        tl.store(
+            out_hidden_ptr + output_row * hidden_dim + hidden_offsets, values, mask=hidden_mask
+        )
+
+    probability = tl.load(probs_ptr + token * topk + route_index, mask=valid_row, other=0.0)
+    tl.store(out_probs_ptr + output_row, probability)
+    tl.store(out_map_ptr + output_row, tl.where(valid_row, token, -1))
+    tl.store(
+        out_inverse_map_ptr + token * num_local_experts + local_expert,
+        tl.where(valid_row, output_row, -1),
+        mask=token_in_buffer,
+    )
+    if output_row < num_local_experts:
+        tl.store(first_dims_ptr + output_row, chunk_size)
+    if output_row == 0:
+        tl.store(n_used_ptr, output_rows)
+
+
+def permute_tokens_for_te_mxfp8_batch_invariant(
+    hidden_states: torch.Tensor,
+    probs: torch.Tensor,
+    routing_map: torch.Tensor,
+    local_expert_start: int,
+    num_local_experts: int,
+    valid_tokens: torch.Tensor,
+    num_chunks: int,
+    chunk_size: int = 256,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Permute into fixed token/expert rows for batch-invariant TE MXFP8 GEMMs.
+
+    Args:
+        hidden_states: Input hidden states of shape ``[max_tokens, hidden_dim]``.
+        probs: Routing probabilities of shape ``[max_tokens, topk]``.
+        routing_map: Global expert assignments parallel to ``probs``.
+        local_expert_start: First global expert index owned by this rank.
+        num_local_experts: Number of experts owned by this rank.
+        valid_tokens: Scalar device tensor with the valid input prefix length.
+        num_chunks: Number of fixed token chunks in the output buffer.
+        chunk_size: Fixed rows per expert in each chunk.
+
+    Returns:
+        Chunk-major hidden states, probabilities, token map, inverse map, fixed
+        per-expert split sizes, and the fixed used-row count. The output row for a
+        routed pair is ``((token // chunk_size) * num_experts + expert) *
+        chunk_size + token % chunk_size``. Unrouted and tail-padding rows contain
+        zero hidden states/probabilities and a ``-1`` token map.
+    """
+    if not HAVE_TRITON:
+        raise RuntimeError("Batch-invariant TE MXFP8 permutation requires Triton.")
+    if hidden_states.ndim != 2 or probs.ndim != 2 or routing_map.ndim != 2:
+        raise ValueError("Expected 2-D hidden-state, probability, and routing tensors.")
+    if probs.shape != routing_map.shape or probs.shape[0] != hidden_states.shape[0]:
+        raise ValueError("Probability and routing shapes must match the hidden-state token count.")
+    if num_local_experts <= 0 or num_chunks <= 0 or chunk_size <= 0:
+        raise ValueError("num_local_experts, num_chunks, and chunk_size must be positive.")
+
+    max_tokens, hidden_dim = hidden_states.shape
+    topk = probs.shape[1]
+    if max_tokens <= 0 or hidden_dim <= 0 or topk <= 0:
+        raise ValueError("Token count, hidden dimension, and top-k must be positive.")
+    required_chunks = _ceil_div(max_tokens, chunk_size)
+    if num_chunks < required_chunks:
+        raise ValueError(
+            f"num_chunks={num_chunks} cannot hold {max_tokens} tokens with chunk_size={chunk_size}."
+        )
+
+    output_rows = num_chunks * num_local_experts * chunk_size
+    output_hidden = torch.empty(
+        (output_rows, hidden_dim), dtype=hidden_states.dtype, device=hidden_states.device
+    )
+    output_probs = torch.empty(output_rows, dtype=probs.dtype, device=probs.device)
+    output_map = torch.empty(output_rows, dtype=torch.int32, device=probs.device)
+    output_inverse_map = torch.empty(
+        (max_tokens, num_local_experts), dtype=torch.int32, device=probs.device
+    )
+    first_dims = torch.empty(num_local_experts, dtype=torch.int64, device=probs.device)
+    n_used = torch.empty(1, dtype=torch.int32, device=probs.device)
+    block_h = min(triton.next_power_of_2(hidden_dim), 1024)
+    _permute_tokens_for_te_mxfp8_batch_invariant_kernel[(output_rows,)](
+        hidden_states,
+        probs,
+        routing_map,
+        output_hidden,
+        output_probs,
+        output_map,
+        output_inverse_map,
+        first_dims,
+        n_used,
+        valid_tokens,
+        max_tokens,
+        hidden_dim,
+        topk,
+        local_expert_start,
+        num_local_experts,
+        chunk_size,
+        output_rows,
+        BLOCK_H=block_h,
+    )
+    return output_hidden, output_probs, output_map, output_inverse_map, first_dims, n_used
+
+
+@triton.jit
 def _zero_output_rows_kernel(
     output_ptr,  # [num_tokens, hidden_dim] fp32 buffer to partially zero
     valid_tokens_ptr,  # scalar int32 CUDA tensor: number of rows to zero
