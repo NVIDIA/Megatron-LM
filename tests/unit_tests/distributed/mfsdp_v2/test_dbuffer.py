@@ -24,7 +24,7 @@ def _same_tensors_on_all_ranks(device: torch.device) -> list[torch.Tensor]:
 
 def _assert_dbuffer_local_tensors_close(buffer: DBuffer, expected: Iterable[torch.Tensor]) -> None:
     for index, tensor in enumerate(expected):
-        torch.testing.assert_close(buffer.get_local_tensor(index), tensor)
+        torch.testing.assert_close(buffer.get_tensor_view(index), tensor)
 
 
 def test_dbuffer_layout_pads_to_lcm_times_dp_size_and_fills_gaps(distributed_setup):
@@ -107,7 +107,7 @@ def test_compute_layout_fills_lcm_padding_gaps(distributed_setup):
     assert layout.size == 60
     expected_local_shapes = expected_local_shapes_by_rank[mesh.get_local_rank(0)]
     for index, expected_shape in enumerate(expected_local_shapes):
-        assert buffer.get_local_tensor(index).shape == torch.Size(expected_shape)
+        assert buffer.get_tensor_view(index).shape == torch.Size(expected_shape)
         assert buffer.get_dtensor(index).shape == shapes[index]
 
 
@@ -208,7 +208,7 @@ def test_release_and_reallocate_storage_preserves_buffer_views(distributed_setup
         dtype=torch.float32,
         device=distributed_setup.device,
     )
-    tensor_view = buffer.get_local_tensor(0)
+    tensor_view = buffer.get_tensor_view(0)
 
     buffer.release_storage()
     assert buffer.local_buffer.untyped_storage().nbytes() == 0
@@ -256,7 +256,7 @@ def test_view_rejects_non_aliasing_placement_change(distributed_setup):
         buffer.view([Replicate()])
 
 
-def test_replicate_get_local_tensor_and_dtensor(distributed_setup):
+def test_replicate_get_tensor_view_and_dtensor(distributed_setup):
     """Replicated DBuffer returns full local tensors and replicated DTensors."""
     mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
     tensors = _same_tensors_on_all_ranks(distributed_setup.device)
@@ -291,10 +291,10 @@ def test_distribute_tensors_detaches_and_contiguizes_inputs(distributed_setup):
     buffer = DBuffer.distribute_tensors([parameter], mesh, [Replicate()])
 
     assert not parameter.is_contiguous()
-    assert buffer.get_local_tensor(0).is_contiguous()
+    assert buffer.get_tensor_view(0).is_contiguous()
     assert not buffer.local_buffer.requires_grad
     torch.testing.assert_close(
-        buffer.get_local_tensor(0), parameter.detach().contiguous(), rtol=0, atol=0
+        buffer.get_tensor_view(0), parameter.detach().contiguous(), rtol=0, atol=0
     )
 
 
@@ -306,7 +306,7 @@ def test_sharded_allgather_round_trip(distributed_setup):
     sharded_buffer = DBuffer.distribute_tensors(tensors, mesh, [Flat()])
     layout = sharded_buffer.layout
     for index, tensor in enumerate(tensors):
-        local_tensor = sharded_buffer.get_local_tensor(index)
+        local_tensor = sharded_buffer.get_tensor_view(index)
         assert local_tensor.shape[1:] == tensor.shape[1:]
         assert local_tensor.is_contiguous()
 
@@ -555,7 +555,7 @@ def test_get_dtensor_from_sharded_buffer(distributed_setup):
     dtensor = sharded_buffer.get_dtensor(0)
 
     torch.testing.assert_close(
-        dtensor.to_local(), sharded_buffer.get_local_tensor(0), rtol=0, atol=0
+        dtensor.to_local(), sharded_buffer.get_tensor_view(0), rtol=0, atol=0
     )
     assert dtensor.shape == tensors[0].shape
     assert dtensor.placements == (Flat(),)
@@ -625,7 +625,7 @@ def test_2d_mesh_shards_across_all_ranks(distributed_setup):
         fully_sharded_buffer.local_buffer.numel() == fully_sharded_buffer.layout.size // mesh.size()
     )
     for index, _ in enumerate(tensors):
-        assert fully_sharded_buffer.get_local_tensor(index).is_contiguous()
+        assert fully_sharded_buffer.get_tensor_view(index).is_contiguous()
 
 
 def test_2d_mesh_partial_flat_reduce_scatter_to_flat_flat(distributed_setup):
