@@ -14,6 +14,33 @@ world_size = Utils.world_size
 test_parallel_order = ['tp-cp-ep-dp-pp', 'tp-cp-pp-ep-dp']
 
 
+def test_destroy_model_parallel_clears_cached_topology_state():
+    """Destroying a topology must invalidate every cached group/rank descriptor."""
+    cached_state = {
+        '_HIERARCHICAL_CONTEXT_PARALLEL_GROUPS': [object()],
+        '_HYBRID_DP_CP_GROUPS': {2: object()},
+        '_DATA_PARALLEL_GLOBAL_RANKS': [0, 1],
+        '_DATA_PARALLEL_GLOBAL_RANKS_WITH_CP': [0, 1],
+        '_MODEL_PARALLEL_GLOBAL_RANKS': [0],
+        '_TENSOR_MODEL_PARALLEL_GLOBAL_RANKS': [0],
+        '_PIPELINE_GLOBAL_RANKS': [0],
+        '_EMBEDDING_GLOBAL_RANKS': [0],
+        '_EXPERT_MODEL_PARALLEL_RANKS': [0],
+        '_MPU_DATA_PARALLEL_WORLD_SIZE': 2,
+        '_MPU_DATA_PARALLEL_RANK': 1,
+    }
+    for name, value in cached_state.items():
+        setattr(ps, name, value)
+
+    ps.destroy_model_parallel()
+
+    assert ps._HIERARCHICAL_CONTEXT_PARALLEL_GROUPS is None
+    assert ps._HYBRID_DP_CP_GROUPS == {}
+    for name in cached_state:
+        if name != '_HYBRID_DP_CP_GROUPS':
+            assert getattr(ps, name) is None, name
+
+
 def test_inject_gtp_remat_axis():
     # Decoder/dense axis: GTP_remat is injected after 'cp', so CP keeps the more-local
     # (smaller-stride) placement and GTP_remat sits one step further out.
