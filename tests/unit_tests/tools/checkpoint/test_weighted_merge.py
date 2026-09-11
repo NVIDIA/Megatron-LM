@@ -283,11 +283,7 @@ def _write_unprefixed_gpt_like_checkpoint_with_byte_extra_state(
 def _write_unprefixed_gpt_like_checkpoint_with_raw_byte_extra_state(path, value, extra_value):
     state = _unprefixed_gpt_like_model_state(value)
     state[UNPREFIXED_GPT_BYTE_EXTRA_STATE_KEY] = ShardedObject(
-        UNPREFIXED_GPT_BYTE_EXTRA_STATE_KEY,
-        extra_value,
-        (_world_size(),),
-        (_rank(),),
-        replica_id=0,
+        UNPREFIXED_GPT_BYTE_EXTRA_STATE_KEY, extra_value, (_world_size(),), (_rank(),), replica_id=0
     )
     dist_checkpointing.save(state, str(path))
 
@@ -756,6 +752,38 @@ def test_metadata_same_layout_uses_output_checkpoint_progress_state(
         assert common_state["args"].consumed_train_samples == 256_000
 
 
+def test_metadata_same_layout_uses_explicit_common_state_checkpoint(
+    tmp_path_dist_ckpt, process_group
+):
+    with (
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_model_only_a") as ckpt_a,
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_model_only_b") as ckpt_b,
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_common_source") as common_source,
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_model_only_out") as output_root,
+    ):
+        _write_checkpoint(ckpt_a, 1.0, iteration=1000)
+        _write_checkpoint(ckpt_b, 5.0, iteration=2000)
+        _write_checkpoint(common_source, 9.0, iteration=2000, consumed_train_samples=256_000)
+        (ckpt_a / "common.pt").unlink()
+        (ckpt_b / "common.pt").unlink()
+
+        result = merge_same_layout_dcp_metadata_checkpoints(
+            [ckpt_a, ckpt_b],
+            [0.25, 0.75],
+            output_root,
+            output_iteration=2000,
+            common_state_checkpoint=common_source,
+            ignore_non_model_state=True,
+        )
+
+        common_state = dist_checkpointing.load_common_state_dict(str(result.output_dir))
+        assert common_state["iteration"] == 2000
+        assert common_state["args"].consumed_train_samples == 256_000
+        provenance = common_state["weighted_merge_provenance"]
+        assert provenance["common_state_source_path"] == str(common_source.resolve())
+        assert provenance["extra_state_source_path"] == str(common_source.resolve())
+
+
 def test_metadata_same_layout_rejects_output_iteration_without_matching_progress_state(
     tmp_path_dist_ckpt, process_group
 ):
@@ -1137,9 +1165,7 @@ def test_metadata_same_layout_preserves_raw_byte_extra_state_type(
         _write_unprefixed_gpt_like_checkpoint_with_raw_byte_extra_state(
             ckpt_a, 1.0, type(extra_value)(b"other")
         )
-        _write_unprefixed_gpt_like_checkpoint_with_raw_byte_extra_state(
-            ckpt_b, 5.0, extra_value
-        )
+        _write_unprefixed_gpt_like_checkpoint_with_raw_byte_extra_state(ckpt_b, 5.0, extra_value)
 
         result = merge_same_layout_dcp_metadata_checkpoints(
             [ckpt_a, ckpt_b],
@@ -1270,9 +1296,7 @@ def test_metadata_same_layout_requires_every_explicit_model_prefix(
             )
 
 
-def test_metadata_same_layout_explicit_roots_ignore_mixed_state(
-    tmp_path_dist_ckpt, process_group
-):
+def test_metadata_same_layout_explicit_roots_ignore_mixed_state(tmp_path_dist_ckpt, process_group):
     with (
         TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_mixed_a") as ckpt_a,
         TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_mixed_b") as ckpt_b,
@@ -1304,9 +1328,7 @@ def test_metadata_same_layout_explicit_roots_ignore_mixed_state(
         assert provenance["ignore_non_model_state"] is True
 
 
-def test_metadata_same_layout_dry_run_validates_without_output(
-    tmp_path_dist_ckpt, process_group
-):
+def test_metadata_same_layout_dry_run_validates_without_output(tmp_path_dist_ckpt, process_group):
     with (
         TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_dry_run_a") as ckpt_a,
         TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_dry_run_b") as ckpt_b,
@@ -1374,6 +1396,8 @@ def test_metadata_same_layout_cli_dispatch_skips_megatron_parser(tmp_path, monke
             "30",
             "--extra-state-source-index",
             "1",
+            "--common-state-checkpoint",
+            str(ckpt_b),
             "--merge-model-prefix",
             "language_model.",
             "--merge-model-prefix",
@@ -1393,10 +1417,8 @@ def test_metadata_same_layout_cli_dispatch_skips_megatron_parser(tmp_path, monke
     assert calls["output_root"] == str(output_root)
     assert calls["kwargs"]["output_iteration"] == 30
     assert calls["kwargs"]["extra_state_source_index"] == 1
-    assert calls["kwargs"]["model_key_prefixes"] == (
-        "language_model.",
-        "modality_submodules.",
-    )
+    assert calls["kwargs"]["common_state_checkpoint"] == str(ckpt_b)
+    assert calls["kwargs"]["model_key_prefixes"] == ("language_model.", "modality_submodules.")
     assert calls["kwargs"]["include_default_model_roots"] is False
     assert calls["kwargs"]["ignore_non_model_state"] is True
     assert calls["kwargs"]["dry_run"] is True
@@ -1503,14 +1525,12 @@ def test_metadata_same_layout_accepts_reordered_chunks():
         tensor_metadata_by_checkpoint=[
             {
                 "model.weight": _fake_tensor_metadata(
-                    shape=(4, 2),
-                    chunks=(((0, 0), (2, 2)), ((2, 0), (2, 2))),
+                    shape=(4, 2), chunks=(((0, 0), (2, 2)), ((2, 0), (2, 2)))
                 )
             },
             {
                 "model.weight": _fake_tensor_metadata(
-                    shape=(4, 2),
-                    chunks=(((2, 0), (2, 2)), ((0, 0), (2, 2))),
+                    shape=(4, 2), chunks=(((2, 0), (2, 2)), ((0, 0), (2, 2)))
                 )
             },
         ],
