@@ -339,6 +339,61 @@ def test_forward_thd_packed_builds_layout_and_is_differentiable(monkeypatch):
 
 
 @pytest.mark.gpus(1)
+def test_forward_thd_uses_contiguous_rope_offsets(monkeypatch):
+    csa = _csa()
+    config = _tiny_config()
+    device = torch.device("cuda")
+    ps = _ps(cp_size=2, cp_rank=1)
+    try:
+        module = csa.CompressedSparseAttention(config, layer_idx=0, ps=ps).to(device)
+    except RuntimeError as exc:
+        pytest.skip(f"real Transformer Engine required to build CSA: {exc}")
+
+    local_rows = 8
+    global_rows = local_rows * ps.cp_size
+    x = torch.randn(1, local_rows, config.hidden_size, device=device)
+    position_ids = torch.arange(local_rows, global_rows, device=device).unsqueeze(0)
+    cu_seqlens = torch.tensor([0, global_rows], dtype=torch.int32, device=device)
+    packed = SimpleNamespace(
+        qkv_format="thd",
+        cu_seqlens_q=cu_seqlens,
+        cu_seqlens_q_padded=None,
+        cu_seqlens_kv=cu_seqlens,
+        cu_seqlens_kv_padded=None,
+        max_seqlen_q=global_rows,
+        max_seqlen_kv=global_rows,
+    )
+    rope_starts = []
+
+    def fake_rope(tensor, _cos, _sin, _nope_dim, _rope_dim, _cu, global_start, **_kwargs):
+        rope_starts.append(global_start)
+        return tensor
+
+    monkeypatch.setattr(csa.cp_utils, "apply_thd_cp_local_rope_fused", fake_rope)
+    monkeypatch.setattr(
+        csa.cp_utils,
+        "exchange_cp_boundary_hidden",
+        lambda tensor, *_args: tensor.new_zeros((_d_window(config), 1, config.hidden_size)),
+    )
+    monkeypatch.setattr(
+        module,
+        "_project_boundary_kv",
+        lambda *_args: x.new_zeros((_d_window(config), 1, 1, config.head_dim)),
+    )
+    monkeypatch.setattr(
+        module,
+        "_forward_thd_cp",
+        lambda query, *_args: query.reshape(
+            local_rows, 1, config.num_attention_heads * config.head_dim
+        ),
+    )
+
+    module(x, position_ids=position_ids, packed_seq_params=packed)
+
+    assert rope_starts == [local_rows, local_rows, local_rows]
+
+
+@pytest.mark.gpus(1)
 def test_project_boundary_kv_shape(monkeypatch):
     csa = _csa()
     torch.manual_seed(0)
