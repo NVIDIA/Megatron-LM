@@ -391,6 +391,36 @@ class TestMuonDecoupleFP8ParamGather:
         # iterations (PR #5470 review), so a handful of steps can miss a real divergence.
         self._check_on_vs_off(fp8_recipe, overlap, n=30)
 
+    @pytest.mark.launch_on_gb200
+    @pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8)
+    @pytest.mark.skipif(not is_te_min_version("2.3.0.dev0"), reason="TE 2.3.0.dev0 is required")
+    def test_mxfp8_nonoverlap_reuses_grad_buffer_for_param_sync(self, monkeypatch):
+        """The compact no-overlap path must not fall back to allocating receive tensors."""
+
+        if torch.distributed.get_world_size() < 2:
+            pytest.skip("Requires at least two data-parallel ranks")
+        if get_device_arch_version() < 10:
+            pytest.skip("MXFP8 requires Blackwell architecture or newer")
+
+        args, model, optimizer = self._build(True, "mxfp8", False)
+        layerwise = next(
+            child
+            for child in optimizer.chained_optimizers
+            if isinstance(child, LayerWiseDistributedOptimizer)
+        )
+        assert layerwise.use_grad_buffer_param_sync
+        monkeypatch.setattr(
+            layerwise,
+            "allgather_params",
+            lambda: pytest.fail("legacy allocating parameter all-gather was called"),
+        )
+
+        self._run_steps(args, model, optimizer, 2)
+
+        grad_buffers = _snapshot_layerwise_grad_data(model[0])
+        assert grad_buffers
+        assert all(torch.count_nonzero(buffer).item() == 0 for buffer in grad_buffers)
+
     @pytest.mark.parametrize("fp8_recipe", ["blockwise", "mxfp8"])
     @pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8)
     @pytest.mark.skipif(not is_te_min_version("2.3.0.dev0"), reason="TE 2.3.0.dev0 is required")

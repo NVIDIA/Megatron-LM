@@ -444,15 +444,32 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         # non-DistOpt and own whole params via ping-pong, so we use the legacy allgather_params.
         self.use_buffer_param_sync = full_param_layouts is not None
 
-        # Set up overlap param gather using DDP bucket infrastructure.
+        # Compact MXFP8 LayerWise buffers do not own a distributed-optimizer param
+        # buffer, but their DDP grad buffer is idle after the optimizer consumes the
+        # reduced gradients. Reuse that fixed storage for synchronous parameter
+        # all-gather instead of allocating one bf16 receive tensor per rank. Besides
+        # lowering the transient peak, fixed storage is important when a full-iteration
+        # CUDA Graph owns a large private allocator pool.
+        self.use_grad_buffer_param_sync = bool(
+            self.decouple_ddp_layout
+            and self.use_fp8_param_sync
+            and getattr(config, 'fp8_recipe', None) == 'mxfp8'
+            and getattr(config, 'reuse_grad_buf_for_mxfp8_param_ag', False)
+            and model_chunks is not None
+        )
+
+        # Set up DDP bucket metadata for either asynchronous overlap or synchronous
+        # grad-buffer reuse.
         self.overlap_param_gather = config.overlap_param_gather
-        if self.overlap_param_gather and not self.use_buffer_param_sync:
-            # Legacy path: set up per-bucket param lists for variable-size all-gather.
-            # When use_buffer_param_sync is True, the standard distributed optimizer
+        if (
+            self.overlap_param_gather or self.use_grad_buffer_param_sync
+        ) and not self.use_buffer_param_sync:
+            # Set up per-bucket param lists for variable-size all-gather. When
+            # use_buffer_param_sync is True, the standard distributed optimizer
             # all-gather path is used and this setup is not needed.
             assert (
                 model_chunks is not None
-            ), "model_chunks must be provided if overlap_param_gather is True"
+            ), "model_chunks must be provided for DDP bucket parameter synchronization"
             self.set_bucket_layerwise_params_list(model_chunks)
 
         if init_state_fn_list:
@@ -761,13 +778,11 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             self.expt_dp_params_list = None
 
     def set_bucket_layerwise_params_list(self, model_chunks):
-        """Map sharded params to DDP buckets for async all-gather.
+        """Map sharded params to DDP buckets for LayerWise parameter all-gather.
 
-        Legacy: only used by the variable-size all-gather path
-        (``use_buffer_param_sync=False``).  Once all call sites supply a
-        ``full_param_layout``, this can be removed — the standard distributed
-        optimizer buffer all-gather handles param sync without per-bucket
-        param lists.
+        This metadata is needed whenever LayerWise parameters are not views into
+        the standard distributed-optimizer parameter buffer. It supports both
+        overlapped all-gather and synchronous MXFP8 grad-buffer reuse.
 
         For each bucket in each model chunk's bucket groups, build per-rank param lists
         by cross-referencing the layer-wise sharded param lists with the bucket's params.
@@ -1099,6 +1114,10 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                 # so a sibling DistributedOptimizer's own ``start_param_sync`` call
                 # is not duplicated for the same buckets.
                 self.start_param_sync_for_bucket_group_subset()
+            elif self.use_grad_buffer_param_sync:
+                # The optimizer has finished reading reduced gradients, so the LayerWise
+                # buckets may synchronously reuse grad_data for uneven bf16 all-gather.
+                self.start_param_sync_for_bucket_group_subset(force_sync=True)
             else:
                 self.allgather_params()
 
