@@ -12,7 +12,6 @@ only non-elementwise math, so shapes are sized to make those reductions wide.
 
 import pytest
 import torch
-import torch.nn.functional as F
 
 from megatron.core import activations, parallel_state
 from megatron.core.fusions.fused_bias_dropout import (
@@ -30,6 +29,7 @@ from megatron.core.transformer.utils import erf_gelu, gelu_impl
 from tests.unit_tests.determinism.kernels.harness import (
     CONTENTION_TOKENS,
     assert_replays_bit_exact,
+    deterministic_algorithms,
     seeded,
 )
 from tests.unit_tests.test_utilities import Utils
@@ -39,6 +39,12 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a G
 TOKENS = CONTENTION_TOKENS
 FFN = 8192
 DTYPE = torch.bfloat16
+
+
+@pytest.fixture(autouse=True)
+def _deterministic_mode():
+    with deterministic_algorithms(True):
+        yield
 
 
 def _act(shape, dtype=DTYPE, grad=True):
@@ -98,7 +104,36 @@ GATED_CASES = {
 }
 
 
-@pytest.mark.parametrize("case", sorted(GATED_CASES))
+GATED_OP_IDS = {
+    "bias_swiglu": "fused_bias_swiglu",
+    "swiglu_no_bias": "fused_bias_swiglu",
+    "clamped_swiglu": "fused_bias_swiglu",
+    "situ_glu": "fused_bias_swiglu",
+    "weighted_swiglu": "fused_bias_swiglu",
+    "weighted_clamped_swiglu": "fused_bias_swiglu",
+    "weighted_situ_glu": "fused_bias_swiglu",
+    "bias_geglu": "fused_bias_geglu",
+    "geglu_no_bias": "fused_bias_geglu",
+    "weighted_quick_geglu": "fused_bias_geglu",
+    "weighted_clamped_quick_geglu": "fused_bias_geglu",
+    "bias_gelu": "fused_bias_gelu",
+    "weighted_squared_relu": "fused_weighted_squared_relu",
+    "weighted_clamped_squared_relu": "fused_weighted_squared_relu",
+}
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        pytest.param(
+            case,
+            marks=pytest.mark.determinism_case(
+                op_id=GATED_OP_IDS[case], implementation="torch.compile:" + case
+            ),
+        )
+        for case in sorted(GATED_CASES)
+    ],
+)
 def test_mlp_activation_fusions_replay_bit_exactly(case):
     seeded()
     fn, inputs = GATED_CASES[case]()
@@ -119,7 +154,18 @@ ACTIVATION_CASES = {
 }
 
 
-@pytest.mark.parametrize("case", sorted(ACTIVATION_CASES))
+@pytest.mark.parametrize(
+    "case",
+    [
+        pytest.param(
+            case,
+            marks=pytest.mark.determinism_case(
+                op_id="compiled_activations", implementation="torch.compile:" + case
+            ),
+        )
+        for case in sorted(ACTIVATION_CASES)
+    ],
+)
 def test_compiled_activations_replay_bit_exactly(case):
     seeded()
     x = _act((TOKENS, FFN)) * 5.0
@@ -127,6 +173,9 @@ def test_compiled_activations_replay_bit_exactly(case):
     assert_replays_bit_exact(ACTIVATION_CASES[case], (x,), replays=3, what=case)
 
 
+@pytest.mark.determinism_case(
+    op_id="compiled_activations", implementation="torch.compile:attention_output_gate"
+)
 def test_attention_output_gate_replays_bit_exactly():
     """``Attention._apply_output_gate`` is a compiled method; ``self`` is unused."""
     seeded()
@@ -140,6 +189,7 @@ def test_attention_output_gate_replays_bit_exactly():
     )
 
 
+@pytest.mark.determinism_case(op_id="compiled_activations", implementation="torch.compile:L2Norm")
 def test_l2norm_replays_bit_exactly():
     """QK L2 norm: compiled row reduction (``pow(2).mean(-1)``) over head_dim."""
     seeded()
@@ -152,6 +202,9 @@ def test_l2norm_replays_bit_exactly():
 
 
 @pytest.mark.parametrize("residual_dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.determinism_case(
+    op_id="fused_bias_dropout_add", implementation="torch.compile:bias_dropout_add_train"
+)
 def test_bias_dropout_add_fused_train_replays_under_restored_rng(residual_dtype):
     """Dropout consumes the CUDA RNG: identical mask, output and grads when the RNG is restored."""
     seeded()
@@ -167,6 +220,9 @@ def test_bias_dropout_add_fused_train_replays_under_restored_rng(residual_dtype)
     )
 
 
+@pytest.mark.determinism_case(
+    op_id="fused_bias_dropout_add", implementation="torch.compile:bias_dropout_add_inference"
+)
 def test_bias_dropout_add_fused_inference_replays_bit_exactly():
     seeded()
     x = _act((2048, 4, 4096), grad=False)
@@ -216,6 +272,9 @@ class TestFusedCrossEntropy:
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32], ids=["bf16", "fp32"])
 @pytest.mark.parametrize("layout", ["contiguous", "transposed"])
+@pytest.mark.determinism_case(
+    op_id="dsv4_q_rms_norm", implementation="torch.compile:dsv4_q_rms_norm"
+)
 def test_dsv4_q_rms_norm_replays(dtype, layout):
     """``_q_rms_norm`` (weightless RMS norm, ``torch.compile``) on a [s, b, heads, dim] query.
 
