@@ -7,9 +7,8 @@ Run on one four-GPU NVLink node::
     uv run python -m torch.distributed.run --nproc-per-node 4 -m pytest -q \
       tests/unit_tests/transformer/moe/test_virtual_expert_triton.py
 
-These tests cover what the kernels put on the wire. Wire *bandwidth* is not measured here;
-``bench_virtual_expert_weight_sol.py`` is the benchmark of record and sweeps plan occupancy,
-which is what actually moves the number.
+These tests cover transport correctness; they do not impose hardware-dependent bandwidth
+thresholds or depend on external benchmark scripts.
 """
 
 import gc
@@ -22,10 +21,8 @@ import torch.distributed as dist
 
 from megatron.core.transformer.moe.virtual_expert_load_balancer import plan_virtual_expert_routes
 from megatron.core.transformer.moe.virtual_expert_triton import (
-    MAX_VIRTUAL_EXPERT_WEIGHT_SMS,
     VirtualExpertPlannerWorkspace,
     _transport_tile,
-    _validate_transport_shape,
     launch_virtual_expert_grad_reduce,
     launch_virtual_expert_weight_prefetch,
 )
@@ -41,12 +38,8 @@ requires_four_ranks = pytest.mark.skipif(
 )
 
 
-def test_virtual_expert_transport_shape_guards():
-    """Reject launches the transport kernels cannot serve."""
-    with pytest.raises(ValueError, match="limited to 32 SMs"):
-        _validate_transport_shape(
-            world_size=4, num_local_experts=32, num_sms=MAX_VIRTUAL_EXPERT_WEIGHT_SMS + 1
-        )
+def test_virtual_expert_transport_tile_alignment():
+    """Both FC layers must support the same TMA row-aligned tile."""
     # Both FC layers share one row-aligned tile, so an odd member breaks it.
     with pytest.raises(ValueError, match="256-aligned"):
         _transport_tile(32768 // torch.bfloat16.itemsize, 16384, 16385)

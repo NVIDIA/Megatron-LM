@@ -320,9 +320,37 @@ using a deterministic planner to map routes to native or virtual-expert slots; v
 populated asynchronously from the optimizer-owned weights and reduced back into their owners
 after expert backward. Virtual-expert gradients use FP32 transport and storage by default. With
 `--grad-reduce-in-bf16`, they remain BF16 in their symmetric-memory transport arena, are summed
-with the owner's BF16 gradient locally in FP32, and are downcast to BF16 once. This mode requires
+with the owner's BF16 gradient locally in FP32, and are downcast to BF16 once. To retain FP32
+accumulation in subsequent reductions, also enable
 `--ddp-reduce-scatter-with-fp32-accumulation` and, when expert GTP is enabled,
-`--gtp-remat-reduce-scatter-with-fp32-accumulation` for the subsequent reductions.
+`--gtp-remat-reduce-scatter-with-fp32-accumulation`.
+
+Virtual-expert load balancing supports EP sizes 2–64, up to 8,192 experts evenly divided
+across EP ranks, and top-k from 1 to min(32, number of experts). It does not support
+Sinkhorn/quantile routing or full/whole-MoE recomputation. The load-balancer initializer checks
+the EP/expert layout, dispatcher SM budget and normalized routing/recompute settings before
+allocating resources.
+
+With expert GTP, virtual experts request GTP's persistent wgrad rings automatically during eager
+training. Eager execution and CUDA graphs share the ring allocator and reduce-scatter storage.
+Same-shaped layers share two buffers per FC role and local expert, guarded by the
+previous reduce-scatter's completion. Gradient targets bind before the backward GEMMs; their
+pointer tables are created at the first reduction and reused without CPU-to-GPU pointer updates.
+Without GTP, native weights alias model storage and native gradients use fixed staging.
+With GTP, weight push peeks at the actual gather: it launches a missing gather, drains one in
+flight, or waits on an already-ready gather's completion event. It then binds the runtime
+parameters to the returned buffers. The GEMM consumes those same buffers and advances prefetch.
+Forward and backward keep separate pointer tables, including BF16. GTP's first consume may change
+its forward ticket while building the chain, so the bridge discards that startup table and binds
+again on the next push. Once the deterministic host schedule is established, table lookups check
+fixed addresses and reuse the existing device tables without uploads. Virtual slots use the
+shared symmetric weight and gradient arenas.
+
+Each MoE layer has one runtime owner for both FC layers' native parameters, runtime weights,
+GTP bindings and pointer tables. Its class owns the shared arenas, NCCL registrations and virtual
+slot parameters, allocated at the first layer's late initialization. Later layers validate the
+same layout and create only their own native runtime parameters and tables. Finalization releases
+the shared slots and registrations before the EP process group is destroyed.
 
 ### Upcycling
 Use `--moe-use-upcycling` to enable upcycling, which loads the dense model from the `--load` directory, converts it to an MoE model at runtime, and starts training. The converted model is saved to the `--save` path before training begins. Upcycling is built on distributed checkpointing, supporting parallel modes different from existing dense checkpoints, such as arbitrary expert parallelism during upcycling.
