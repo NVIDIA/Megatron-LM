@@ -1,6 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Unit tests for the minimal Megatron-FSDP path."""
+"""Unit tests for MFSDP v2 hybrid sharding."""
 
 import logging
 
