@@ -2296,6 +2296,13 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         if packed_seq_params is not None:
             # If Dynamic CP group is provided, update TE DPA CP group
             if packed_seq_params.cp_group is not None:
+                # Converse of the assert below: a CP-off (local_cp_size == 1)
+                # sub-sample must not carry a CP group, otherwise it would be
+                # routed through the CP attention path. Producers must only
+                # bind cp_group when local_cp_size > 1.
+                assert (
+                    packed_seq_params.local_cp_size is None or packed_seq_params.local_cp_size > 1
+                ), "cp_group must not be set when local_cp_size == 1 (CP-off convention)"
                 # Hybrid/dynamic CP can enable CP at runtime on a model built
                 # with context_parallel_size == 1, where the constructor never
                 # allocated the auxiliary CP stream. Create it lazily; TE's
@@ -3705,6 +3712,21 @@ try:
 
 except ImportError:
     te_parallel_cross_entropy = None  # type: ignore[assignment, misc]
+
+
+def te_cross_entropy(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    tp_group: torch.distributed.ProcessGroup | None = None,
+    *,
+    cuda_graph_capturable: bool = False,
+) -> torch.Tensor:
+    """Adapt TE cross entropy to the backend target signature and required label stride."""
+    if te_parallel_cross_entropy is None:
+        raise RuntimeError("Trying to use a TE block when it's not present.")
+    labels = torch.as_strided(labels, labels.size(), (labels.size()[1], 1))
+    return te_parallel_cross_entropy(logits, labels, tp_group, cuda_graph_capturable)
+
 
 try:
     from transformer_engine.pytorch.cpp_extensions import general_gemm

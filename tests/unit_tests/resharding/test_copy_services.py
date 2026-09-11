@@ -9,8 +9,11 @@ Covers:
 - NCCL communicator initialization on ranks with no local operations.
 """
 
+from unittest.mock import Mock
+
 import pytest
 import torch
+import torch.distributed as dist
 
 from megatron.core.resharding.copy_services.base import (
     CopyService,
@@ -22,6 +25,8 @@ from megatron.core.resharding.copy_services.gloo_copy_service import GlooCopySer
 from megatron.core.resharding.copy_services.nccl_copy_service import NCCLCopyService
 from megatron.core.resharding.copy_services.nixl_copy_service import NixlCopyService
 from megatron.core.resharding.copy_services.nvshmem_copy_service import NVSHMEMCopyService
+from tests.unit_tests.determinism.utils import get_cycles_per_ms
+from tests.unit_tests.test_utilities import Utils
 
 
 def _t():
@@ -175,6 +180,68 @@ class TestCopyServiceClose:
 def test_nixl_service_skips_redundant_process_group_barrier():
     """NIXL's ready/data protocol provides its own peer completion."""
     assert NixlCopyService.requires_process_group_barrier is False
+
+
+@pytest.mark.parametrize("service_cls", [NCCLCopyService, GlooCopyService])
+def test_local_copy_waits_for_current_stream(service_cls):
+    """A local copy must observe writes already queued on the caller's stream."""
+    Utils.initialize_distributed()
+    service = service_cls()
+    source = torch.zeros(1, device="cuda")
+    destination = torch.zeros_like(source)
+    torch.cuda.synchronize()
+
+    producer_gate = torch.cuda.Event()
+    release_stream = torch.cuda.Stream()
+    with torch.cuda.stream(release_stream):
+        torch.cuda._sleep(int(50 * get_cycles_per_ms()))
+        producer_gate.record()
+
+    torch.cuda.current_stream().wait_event(producer_gate)
+    source.fill_(1)
+
+    service.submit_send(source, dist.get_rank(), task_id=0)
+    service.submit_recv(destination, dist.get_rank(), task_id=0)
+    service.run()
+
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(destination, torch.ones_like(destination))
+
+
+@pytest.mark.parametrize(
+    ("service_cls", "run_method"),
+    [(NixlCopyService, "_do_local_copies"), (NVSHMEMCopyService, "run")],
+    ids=("nixl", "nvshmem"),
+)
+def test_optional_backend_local_copy_waits_for_current_stream(service_cls, run_method):
+    service = object.__new__(service_cls)
+    service.rank = 0
+    source = torch.zeros(1, device="cuda")
+    destination = torch.zeros_like(source)
+    torch.cuda.synchronize()
+
+    producer_gate = torch.cuda.Event()
+    release_stream = torch.cuda.Stream()
+    with torch.cuda.stream(release_stream):
+        torch.cuda._sleep(int(50 * get_cycles_per_ms()))
+        producer_gate.record()
+
+    torch.cuda.current_stream().wait_event(producer_gate)
+    source.fill_(1)
+
+    service.send_ops = [SendOp(task_id=0, tensor=source, dest_rank=0)]
+    service.recv_ops = [RecvOp(task_id=0, tensor=destination, src_rank=0)]
+    service._local_send_ops = {0: source}
+    service._local_recv_ops = {0: destination}
+    service._copy_stream = service._local_copy_stream = torch.cuda.Stream()
+    service._initialized = True
+    service._remote = Mock()
+
+    getattr(service, run_method)()
+
+    torch.cuda.synchronize()
+    torch.testing.assert_close(destination, torch.ones_like(destination))
 
 
 def test_multiple_runs_per_plan_require_explicit_backend_support():
