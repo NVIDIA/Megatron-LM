@@ -17,10 +17,12 @@ from tests.unit_tests.inference.engines.test_dynamic_engine_async_sched import _
 
 REQUEST_FIELD_POLICY = {
     "request_id": "checkpoint:preserve / merge:first",
+    "uid": "checkpoint:regenerate-segment / merge:first",
     "prompt": "checkpoint:reset / merge:first",
     "sampling_params": "checkpoint:copy-and-reduce-budget / merge:first",
     "inference_parameters": "checkpoint:drop-deprecated-alias / merge:drop",
     "prompt_tokens": "checkpoint:append-output / merge:first / wire:opt-in",
+    "compact_prompt_tokens": "checkpoint:preserve / merge:first / wire:opt-in",
     "prompt_length": "checkpoint:reset / merge:reset / wire:derive",
     "arrival_time": "checkpoint:reset / merge:reset",
     "status": "checkpoint:preserve / merge:last",
@@ -37,8 +39,8 @@ REQUEST_FIELD_POLICY = {
     "generated_length": "checkpoint:reset / merge:derive-from-output",
     "tpot": "checkpoint:reset / merge:concatenate",
     "remaining_prompt_tokens": "checkpoint:cumulative-prompt / merge:reinitialize",
-    "policy_epoch": "checkpoint:deep-copy / merge:last-deep-copy",
-    "kv_cache_epoch": "checkpoint:reset-for-recompute / merge:last-deep-copy",
+    "policy_epoch": "checkpoint:list-copy / merge:last-list-copy",
+    "kv_cache_epoch": "checkpoint:reset-for-recompute / merge:last-list-copy",
     "latency": "checkpoint:record-owned / merge:record",
     "routing_indices": "checkpoint:reset / merge:concatenate",
     "finished_chunk_token_count": "checkpoint:reset / merge:reset",
@@ -47,7 +49,10 @@ REQUEST_FIELD_POLICY = {
     "block_size_tokens": "checkpoint:preserve / merge:first",
     "enable_prefix_caching": "checkpoint:preserve / merge:first",
     "num_cached_tokens": "checkpoint:reset / merge:first-observation",
+    "num_matched_prefix_blocks": "checkpoint:reset / merge:reset",
+    "block_hash_salt": "checkpoint:preserve / merge:first",
     "precomputed_block_hashes": "checkpoint:recompute / merge:first",
+    "disaggregated_params": "checkpoint:reset / merge:last",
     "ttft": "checkpoint:reset / merge:first-populated",
     "events": "checkpoint:new-segment / merge:concatenate",
     "event_add_engine": "checkpoint:preserve-original / merge:drop / wire:drop",
@@ -68,9 +73,11 @@ SAMPLING_FIELD_POLICY = {
     "add_BOS": "preserve",
     "stop_words": "deep-copy-preserve",
     "detokenize_stop_sequence": "preserve",
+    "detokenize_generations": "preserve",
     "return_prompt_tokens": "preserve",
     "streaming": "preserve",
     "streaming_interval": "preserve",
+    "do_kv_handoff": "preserve",
 }
 
 
@@ -90,12 +97,11 @@ def test_checkpoint_field_policy_tables_are_exhaustive():
 REQUEST_LIFECYCLE_MATRIX = {
     "persist-te-swa-stochastic": "test_persist_te_swa_stochastic",
     "offload-dynamic-fp8": "test_offload_dynamic_fp8",
-    "uvm-offload-static-managed-capacity": "test_uvm_offload_static_managed_capacity",
 }
 
 
 def test_matrix_manifest_has_one_runtime_owner_per_row():
-    assert len(REQUEST_LIFECYCLE_MATRIX) == 3
+    assert len(REQUEST_LIFECYCLE_MATRIX) == 2
     assert all(
         hasattr(TestRequestLifecycleCorePairwise, owner)
         for owner in REQUEST_LIFECYCLE_MATRIX.values()
@@ -135,19 +141,6 @@ _OFFLOAD_FP8 = _AsyncPairScenario(
     atol=5.0e-3,
 )
 
-_UVM_OFFLOAD = _AsyncPairScenario(
-    name="uvm-offload-static-managed-capacity",
-    pairs=("kv:offload", "memory:uvm-capacity"),
-    config={
-        "kv_cache_management_mode": "offload",
-        "static_kv_memory_pointers": True,
-        "unified_memory_level": 1,
-        "context_buffer_size_gb": 0.002,
-        "context_paused_buffer_size_gb": 0.002,
-    },
-    signals=("gpt",),
-)
-
 
 @pytest.mark.internal
 @pytest.mark.skipif(
@@ -175,13 +168,3 @@ class TestRequestLifecycleCorePairwise(RequestLifecyclePairwiseBase):
                 > result.witness["feature_counts_before"][key]
                 > 0
             )
-
-    @torch.inference_mode()
-    def test_uvm_offload_static_managed_capacity(self):
-        result = self._assert_pair(_UVM_OFFLOAD)
-        assert result.witness["prefetch_succeeded"]
-        assert max(result.witness["block_ids"]) >= result.witness["cuda_only_usable_blocks"]
-        key = _request_feature_key(result.witness["request_id"], "module-forward:gpt")
-        assert (
-            result.runtime[key] > result.witness["feature_counts_before"]["module-forward:gpt"] > 0
-        )

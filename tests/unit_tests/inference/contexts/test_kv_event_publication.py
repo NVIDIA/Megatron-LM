@@ -193,7 +193,6 @@ async def test_async_forward_discards_before_scheduling_and_publishes_after_forw
     engine = object.__new__(DynamicInferenceEngine)
     engine.state = EngineState.RUNNING
     engine.context = context
-    engine._cuda_graph_rebuild_pending = False
     engine.logging_step_interval = 0
     engine.schedule_waiting_requests = schedule
     engine.controller = SimpleNamespace(async_generate_output_tokens_dynamic_batch=forward)

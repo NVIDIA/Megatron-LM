@@ -19,7 +19,6 @@ from megatron.core.inference.inference_request import (
     unwrap_serialized_tensors,
 )
 from megatron.core.inference.sampling_params import SamplingParams
-from megatron.core.inference.unified_memory import prefetch_managed_tensor
 from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
 from tests.unit_tests.inference.engines.test_dynamic_engine import (
     DynamicEngineTestConfig as _DynamicEngineTestConfig,
@@ -307,7 +306,6 @@ def _feature_keys(scenario):
             "fp8-quantized-forwards",
             "fp8-recipe-forwards",
         ),
-        "uvm-offload-static-managed-capacity": ("module-forward:gpt",),
     }[scenario.name]
 
 
@@ -510,22 +508,6 @@ class RequestLifecyclePairwiseBase(_DynamicInferenceEngineTestBase):
                 assert context.static_kv_memory_pointers
                 assert context.memory_buffer.data_ptr() == pointer_before
                 assert torch.equal(context.memory_buffer.index_select(2, block_ids), kv_before)
-            elif scenario.name == "uvm-offload-static-managed-capacity":
-                allocator = context.kv_block_allocator
-                cuda_only_usable_blocks = allocator.pool_size - allocator.paused_limit - 1
-                assert context.unified_memory_level == 1
-                assert context.unified_memory_mempool is not None
-                assert context.kv_cache_management_mode == KVCacheManagementMode.OFFLOAD
-                assert context.static_kv_memory_pointers
-                assert any(block_id >= cuda_only_usable_blocks for block_id in block_ids.tolist())
-                prefetch_managed_tensor(context.memory_buffer, device=-1)
-                torch.cuda.current_stream().synchronize()
-                prefetch_managed_tensor(context.memory_buffer, device=torch.cuda.current_device())
-                torch.cuda.current_stream().synchronize()
-                assert context.memory_buffer.data_ptr() == pointer_before
-                assert torch.equal(context.memory_buffer.index_select(2, block_ids), kv_before)
-                witness["cuda_only_usable_blocks"] = cuda_only_usable_blocks
-                witness["prefetch_succeeded"] = True
             else:
                 assert scenario.name == "offload-dynamic-fp8"
                 assert context.kv_cache_management_mode == KVCacheManagementMode.OFFLOAD
@@ -537,10 +519,7 @@ class RequestLifecyclePairwiseBase(_DynamicInferenceEngineTestBase):
             resumed_row = _active_request_row(context, target_id)
             assert resumed_row == row
             assert torch.equal(context.memory_buffer.index_select(2, block_ids), kv_before)
-            if scenario.name in (
-                "persist-te-swa-stochastic",
-                "uvm-offload-static-managed-capacity",
-            ):
+            if scenario.name == "persist-te-swa-stochastic":
                 assert context.memory_buffer.data_ptr() == pointer_before
             else:
                 assert context.memory_buffer.untyped_storage().nbytes() == storage_bytes_before
@@ -555,17 +534,9 @@ class RequestLifecyclePairwiseBase(_DynamicInferenceEngineTestBase):
         config_values.update(scenario.config)
         config_values.update(num_requests=0, async_sched_mode=AsyncScheduleMode.LEGACY)
         test_config = _DynamicEngineTestConfig(**config_values)
-        if test_config.unified_memory_level:
-            test_config.inference_config_overrides["unified_memory_level"] = (
-                test_config.unified_memory_level
-            )
         test_config.use_flashinfer_fused_rope = False
         env = cls._build_test_env(test_config)
         engine = env.engine
-        if scenario.name == "uvm-offload-static-managed-capacity":
-            assert (
-                engine.context.unified_memory_level == 1
-            ), "the designated UVM owner must use managed allocation"
         all_requests = _make_scenario_requests(env, scenario)
         engine.controller.tokenizer.detokenize = lambda tokens, **_kwargs: "".join(
             f"<{token}>" for token in tokens

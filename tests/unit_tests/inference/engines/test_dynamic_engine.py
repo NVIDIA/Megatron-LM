@@ -1188,7 +1188,7 @@ def test_add_request_rejects_duplicate_id_before_mutation():
 def test_drained_reset_preserves_coordinator_runtime_state():
     """A drained reset clears batch data without rebinding coordinator-loop state."""
     engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
-    engine.context = types.SimpleNamespace(reset=mock.Mock(), cuda_graphs_available=True)
+    engine.context = types.SimpleNamespace(reset=mock.Mock())
     engine.controller = types.SimpleNamespace(
         _async_sched_logits=types.SimpleNamespace(clear=mock.Mock())
     )
