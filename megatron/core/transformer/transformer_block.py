@@ -925,6 +925,16 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
 
         hidden_states = self.preprocess_for_layer_schedule(hidden_states)
 
+        # CSA2 shares activations within this forward, never through persistent module state.
+        csa2_kwargs = {}
+        if (
+            self.config.experimental_attention_variant == "dsv4_hybrid"
+            and self.config.dsv4_version == "v4.1"
+        ):
+            from megatron.core.transformer.experimental_attention_variant.csa2 import CSA2State
+
+            csa2_kwargs["csa2_state"] = CSA2State()
+
         if self.config.sequence_parallel:
             rng_context = tensor_parallel.get_cuda_rng_tracker().fork()
         else:
@@ -1028,6 +1038,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                             padding_mask=padding_mask,
                             mhc_recompute_manager=mhc_manager,
                             input_ids=input_ids,
+                            **csa2_kwargs,
                         )
                     self._finalize_mhc_recompute_layer(
                         mhc_manager=mhc_manager,

@@ -9,7 +9,7 @@ import copy
 import warnings
 from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 import torch
 from torch import Tensor, nn
@@ -50,6 +50,9 @@ from megatron.core.transformer.utils import (
     sharded_state_dict_default,
 )
 from megatron.core.utils import WrappedTensor, deprecate_inference_params, make_viewless_tensor
+
+if TYPE_CHECKING:
+    from megatron.core.transformer.experimental_attention_variant.csa2 import CSA2State
 
 
 @dataclass
@@ -526,6 +529,7 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
         packed_seq_params: Optional[PackedSeqParams],
         padding_mask: Optional[Tensor],
         input_ids: Optional[Tensor] = None,
+        csa2_state: "CSA2State | None" = None,
     ) -> Tuple[Tensor, Optional[Tensor]]:
         # When this wrapper is itself being CUDA-graph captured, the inner layer
         # must run as a plain forward: routing through its ``__call__`` would
@@ -548,6 +552,7 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
                 padding_mask=padding_mask,
                 input_ids=input_ids,
                 _called_from_hybrid_mhc_wrapper=True,
+                **({"csa2_state": csa2_state} if csa2_state is not None else {}),
             )
         else:
             # Non-transformer layers (e.g. MambaLayer; GatedDeltaNet which does
@@ -579,6 +584,7 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
         padding_mask: Optional[Tensor],
         input_ids: Optional[Tensor] = None,
         mhc_recompute_manager: Optional[MHCCheckpointManager] = None,
+        csa2_state: "CSA2State | None" = None,
     ) -> Optional[Tuple[Tuple[Tensor, Optional[Tensor]], Optional[Tensor], float, bool]]:
         """Return a raw TransformerLayer branch output when the wrapped layer is split.
 
@@ -611,6 +617,7 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
                     packed_seq_params=packed_seq_params,
                     sequence_len_offset=sequence_len_offset,
                     mhc_recompute_manager=mhc_recompute_manager,
+                    **({"csa2_state": csa2_state} if csa2_state is not None else {}),
                 )
             )
             output_with_bias = layer._group_offload_output_with_bias(
@@ -650,6 +657,7 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
         padding_mask: Optional[Tensor] = None,
         input_ids: Optional[Tensor] = None,
         mhc_recompute_manager=None,
+        csa2_state: "CSA2State | None" = None,
     ) -> Tuple[Tensor, Optional[Tensor]]:
         """Run the wrapped hybrid layer through one layer-boundary mHC update.
 
@@ -675,6 +683,7 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
             padding_mask,
             input_ids,
             mhc_recompute_manager=mhc_recompute_manager,
+            csa2_state=csa2_state,
         )
 
         if fast_path_result is None:
@@ -687,6 +696,7 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
                 packed_seq_params,
                 padding_mask,
                 input_ids,
+                csa2_state=csa2_state,
             )
             # The inner hybrid layer already applied its own local residual/dropout, so
             # it returns `aggregated + f(aggregated)`. We feed only the function
@@ -1140,6 +1150,15 @@ class HybridStack(MegatronModule):
                 hidden_states, self.config.num_residual_streams
             )
 
+        csa2_kwargs = {}
+        if (
+            self.config.experimental_attention_variant == "dsv4_hybrid"
+            and self.config.dsv4_version == "v4.1"
+        ):
+            from megatron.core.transformer.experimental_attention_variant.csa2 import CSA2State
+
+            csa2_kwargs["csa2_state"] = CSA2State()
+
         if inference_context and inference_context.is_static_batching():
             # NOTE(bnorick): match BaseInferenceContext attributes for
             # mamba_ssm.utils.generation.BaseInferenceContext,
@@ -1240,6 +1259,7 @@ class HybridStack(MegatronModule):
                                 sequence_len_offset=sequence_len_offset,
                                 packed_seq_params=packed_seq_params,
                                 padding_mask=padding_mask,
+                                **csa2_kwargs,
                             )
                             if input_ids is not None:
                                 layer_kwargs["input_ids"] = input_ids

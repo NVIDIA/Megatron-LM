@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any, Dict, Optional, Protocol, Union
 
 if TYPE_CHECKING:
     from megatron.core.tensor_parallel.random import MHCCheckpointManager
+    from megatron.core.transformer.experimental_attention_variant.csa2 import CSA2State
 
 import torch
 import torch.distributed
@@ -633,6 +634,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         mhc_recompute_manager: Optional['MHCCheckpointManager'] = None,
         *,
         inference_params: Optional[Any] = None,
+        csa2_state: CSA2State | None = None,
     ):
         """Run input norm + self-attention and return the raw output before BDA."""
         inference_context = deprecate_inference_params(inference_context, inference_params)
@@ -685,6 +687,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             attention_bias=attention_bias,
             packed_seq_params=packed_seq_params,
             sequence_len_offset=sequence_len_offset,
+            **({"csa2_state": csa2_state} if csa2_state is not None else {}),
         )
         nvtx_range_pop(suffix="self_attention")
 
@@ -713,6 +716,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         input_ids: Optional[Tensor] = None,
         *,
         inference_params: Optional[Any] = None,
+        csa2_state: CSA2State | None = None,
     ):
         """
         Perform a forward pass through the attention layer and the layernorms before and after
@@ -789,6 +793,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             attention_bias=attention_bias,
             packed_seq_params=packed_seq_params,
             sequence_len_offset=sequence_len_offset,
+            **({"csa2_state": csa2_state} if csa2_state is not None else {}),
         )
         nvtx_range_pop(suffix="self_attention")
 
@@ -2288,6 +2293,7 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         mhc_recompute_manager: Optional['MHCCheckpointManager'] = None,
         *,
         inference_params: Optional[Any] = None,
+        csa2_state: CSA2State | None = None,
     ):
         """Forward attention with hyper connection pre/post processing on self-attention."""
         inference_context = deprecate_inference_params(inference_context, inference_params)
@@ -2330,6 +2336,7 @@ class HyperConnectionTransformerLayer(TransformerLayer):
             attention_bias=attention_bias,
             packed_seq_params=packed_seq_params,
             sequence_len_offset=sequence_len_offset,
+            **({"csa2_state": csa2_state} if csa2_state is not None else {}),
         )
         nvtx_range_pop(suffix="self_attention")
 
