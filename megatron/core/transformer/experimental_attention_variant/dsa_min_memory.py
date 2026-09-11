@@ -45,17 +45,6 @@ from megatron.core.transformer.experimental_attention_variant.dsa_min_memory_tri
     triton_topk_index_block,
 )
 
-# Optional cuDNN DSA kernels, used to A/B the indexer (scores + top-k) against
-# the Triton min-memory kernels. Gated at runtime by `use_cudnn`.
-try:
-    from cudnn import DSA as _DSA
-except ImportError:
-    try:
-        from cudnn.deepseek_sparse_attention import DSA as _DSA
-    except ImportError:
-        _DSA = None
-
-
 _SIMPLIFIED_LEARNED_K_SUPPORT_CHUNK_SIZE = 64
 
 
@@ -2136,7 +2125,6 @@ def dsa_min_memory_gqa_forward_only(
     profile_rank: int = 0,
     profile_label: str = "",
     use_triton: bool = True,
-    use_cudnn: bool = False,
     simplified_input_norm=None,
 ) -> torch.Tensor:
     """Run min-memory DSA-GQA for no-grad validation/eval forward passes."""
@@ -2337,7 +2325,6 @@ def dsa_min_memory_gqa(
     profile_rank: int = 0,
     profile_label: str = "",
     use_triton: bool = True,
-    use_cudnn: bool = False,
     simplified_input_norm=None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Run the minimum-activation DSA-GQA training backend."""
