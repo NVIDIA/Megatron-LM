@@ -13,8 +13,10 @@ from torch.distributed.tensor import DTensor, Replicate, Shard
 
 import megatron.core.distributed.fsdp.mcore_fsdp_adapter as mcore_fsdp_adapter
 from megatron.core.distributed import DistributedDataParallelConfig
+from megatron.core.distributed.finalize_model_grads import finalize_model_grads
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
+from megatron.core.models.common.language_module.language_module import LanguageModule
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_spec,
     get_gpt_layer_with_transformer_engine_spec,
@@ -61,6 +63,78 @@ def _destroy_model_parallel():
     for group in list(_world.pg_map):
         if group is not torch.distributed.group.WORLD:
             torch.distributed.destroy_process_group(group)
+
+
+class TinySharedParameterModule(LanguageModule):
+    """Small Megatron module with canonical and duplicate output parameters."""
+
+    def __init__(self, config: TransformerConfig, pg_collection: ProcessGroupCollection) -> None:
+        super().__init__(config, pg_collection)
+        self.pre_process = self.pp_group.rank() == 0
+        self.post_process = not self.pre_process
+        self.share_embeddings_and_output_weights = True
+        if self.pre_process:
+            self.embedding = torch.nn.Module()
+            self.embedding.word_embeddings = torch.nn.Embedding(8, 4, device="cuda")
+        else:
+            self.output_layer = torch.nn.Linear(4, 8, bias=False, device="cuda")
+        self.setup_embeddings_and_output_layer()
+
+    def forward(self) -> torch.Tensor:
+        """Produce known canonical and duplicate-output gradients."""
+        if self.pre_process:
+            return self.embedding.word_embeddings(torch.arange(8, device="cuda")).sum()
+        return self.output_layer(torch.full((1, 4), 4.0, device="cuda")).sum()
+
+
+class TestMcoreAdapterSharedParameters:
+    """Exercise real shared embedding initialization across two pipeline stages."""
+
+    def setup_method(self):
+        Utils.initialize_model_parallel(1, 2)
+        self.pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        model_parallel_cuda_manual_seed(1234)
+
+    def teardown_method(self):
+        _destroy_model_parallel()
+
+    def test_shared_parameters_are_excluded_from_grad_norm(self):
+        """MFSDP v2 should apply MCore's shared-parameter grad-norm rule."""
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=4,
+            num_attention_heads=1,
+            pipeline_model_parallel_size=2,
+            pipeline_dtype=torch.float32,
+        )
+        model = FullyShardedDataParallel(
+            config=config,
+            ddp_config=DistributedDataParallelConfig(
+                use_megatron_fsdp=True,
+                megatron_fsdp_version=2,
+                use_distributed_optimizer=False,
+                data_parallel_sharding_strategy="optim_grads_params",
+            ),
+            module=TinySharedParameterModule(config, self.pg_collection),
+            pg_collection=self.pg_collection,
+        )
+        optimizer = get_megatron_optimizer(
+            OptimizerConfig(optimizer="sgd", lr=1.0e-3, use_distributed_optimizer=False), [model]
+        )
+        assert isinstance(optimizer, FullyShardedOptimizer)
+
+        # MFSDP replaces Parameters with DTensor Parameters, so the production marker
+        # on the duplicate pipeline-output copy must survive that replacement.
+        if model.module.post_process:
+            assert model.module.output_layer.weight.shared
+        model().backward()
+        finalize_model_grads([model], pg_collection=self.pg_collection)
+
+        # Embedding-gradient synchronization sums the two stages' contributions
+        # (1 + 4). Count these 32 values of 5 once, despite the pipeline replica.
+        torch.testing.assert_close(
+            optimizer.get_grad_norm(), torch.tensor(800.0, device="cuda").sqrt()
+        )
 
 
 class TestMcoreAdapterDense:
