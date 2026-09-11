@@ -30,6 +30,10 @@ from megatron.core.tensor_parallel.random import (
     get_cuda_rng_tracker,
     is_checkpointing,
 )
+from megatron.core.transformer.cuda_graph_config import (
+    is_whole_moe_cuda_graph_scope,
+    validate_moe_cuda_graph_support,
+)
 from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.module import GraphableMegatronModule, MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -1701,6 +1705,55 @@ def _layer_is_graphable(layer, config):
     return False
 
 
+def _get_graphable_te_callables(layers, config):
+    """Return graphable layers, grouping a supported adjacent hybrid attention/MoE pair."""
+    graphable_layers = []
+    layer_number = 0
+    while layer_number < len(layers):
+        layer = layers[layer_number]
+        if not _layer_is_graphable(layer, config):
+            layer_number += 1
+            continue
+
+        if layer_number + 1 < len(layers):
+            next_layer = layers[layer_number + 1]
+            can_group = getattr(layer, '_can_group_te_cuda_graph_with', None)
+            if (
+                can_group is not None
+                and _layer_is_graphable(next_layer, config)
+                and can_group(next_layer)
+            ):
+                layer._set_te_cuda_graph_group_tail(next_layer)
+                graphable_layers.append(layer)
+                layer_number += 2
+                continue
+
+        graphable_layers.append(layer)
+        layer_number += 1
+    return graphable_layers
+
+
+def _get_mtp_te_callables(mtp_model_layer, config):
+    """Expose graphable layers inside a hybrid MTP stack; GPT MTP remains one callable."""
+    from megatron.core.models.hybrid.hybrid_block import HybridStack
+
+    layers = (
+        mtp_model_layer.layers if isinstance(mtp_model_layer, HybridStack) else [mtp_model_layer]
+    )
+    return _get_graphable_te_callables(layers, config)
+
+
+def _is_mtp_te_callable(layer, chunk_with_decoder):
+    """Whether a callable is an MTP wrapper or a layer nested in a hybrid MTP stack."""
+    for mtp_layer in getattr(getattr(chunk_with_decoder, 'mtp', None), 'layers', []):
+        mtp_model_layer = mtp_layer.mtp_model_layer
+        if layer is mtp_model_layer or any(
+            layer is inner_layer for inner_layer in getattr(mtp_model_layer, 'layers', [])
+        ):
+            return True
+    return False
+
+
 class TECudaGraphHelper:
     """
     Helper class to capture CUDA Graphs using TE make_graphed_callables().
@@ -1846,20 +1899,16 @@ class TECudaGraphHelper:
                     num_mtp_layers = len(chunk_with_decoder.mtp.layers)
                 else:
                     num_mtp_layers = 0
-                num_graphable_layers = 0
-                callables, callables_is_mtp = [], []
-                for layer_number in range(num_decoder_layers):
-                    layer = chunk_with_decoder.decoder.layers[layer_number]
-                    if _layer_is_graphable(layer, self.config):
-                        num_graphable_layers += 1
-                        callables.append(layer)
-                        callables_is_mtp.append(False)
+                callables = _get_graphable_te_callables(
+                    chunk_with_decoder.decoder.layers, self.config
+                )
+                callables_is_mtp = [False] * len(callables)
                 for layer_number in range(num_mtp_layers):
-                    layer = chunk_with_decoder.mtp.layers[layer_number].mtp_model_layer
-                    if _layer_is_graphable(layer, self.config):
-                        num_graphable_layers += 1
-                        callables.append(layer)
-                        callables_is_mtp.append(True)
+                    mtp_model_layer = chunk_with_decoder.mtp.layers[layer_number].mtp_model_layer
+                    mtp_callables = _get_mtp_te_callables(mtp_model_layer, self.config)
+                    callables.extend(mtp_callables)
+                    callables_is_mtp.extend([True] * len(mtp_callables))
+                num_graphable_layers = len(callables)
                 log_on_each_pipeline_stage(
                     logger=logger,
                     tp_group=self.tp_group,
@@ -1970,21 +2019,34 @@ class TECudaGraphHelper:
                 self.num_microbatches == len(order) // self.num_model_chunks // 2
             ), "num_microbatches must match the number of microbatches in order."
 
+        # Import once per sample-building pass to avoid module-load cycles without
+        # repeating the imports for every layer and microbatch.
+        from megatron.core.models.hybrid.hybrid_block import HyperConnectionHybridLayer
+        from megatron.core.transformer.identity_op import IdentityOp
+        from megatron.core.transformer.transformer_layer import TransformerLayer
+
         # Generate sample arguments and keyword arguments for capturing.
         sample_args = [None] * (len(self.flattened_callables) * self.num_microbatches)
         sample_kwargs = [None] * (len(self.flattened_callables) * self.num_microbatches)
 
         rotary_pos_emb_cache = {}
+        # Avoid repeating the same message across layers within this capture setup.
+        warned_rotary_sample_contracts = set()
 
         def _get_layer_static_inputs(layer, chunk_of_the_layer):
             """
             Get the static inputs for a layer.
             """
-            assert layer in chunk_of_the_layer.decoder.layers or any(
-                layer is mtp_layer.mtp_model_layer for mtp_layer in chunk_of_the_layer.mtp.layers
+            assert layer in chunk_of_the_layer.decoder.layers or _is_mtp_te_callable(
+                layer, chunk_of_the_layer
             ), "Layer is not in the chunk"
 
             def get_rotary_pos_emb(transformer_module, transformer_input):
+                # The TE sample builder currently materializes only the regular RoPE
+                # contract. Yarn and mRoPE need different runtime inputs, while packed
+                # THD with CP>1 needs a full (not CP-sliced) RoPE table. Keep the legacy
+                # sample behavior unchanged here and warn below when one of those
+                # unsupported contracts is actually captured.
                 if (
                     transformer_module.position_embedding_type == 'rope'
                     and not self.config.multi_latent_attention
@@ -2008,17 +2070,66 @@ class TECudaGraphHelper:
                     1, local_slen, dtype=torch.bool, device=torch.cuda.current_device()
                 )
 
-            from megatron.core.transformer.identity_op import IdentityOp
-            from megatron.core.transformer.transformer_layer import TransformerLayer
-
+            # Hybrid mHC wraps the concrete TransformerLayer, but the wrapper is the
+            # callable passed to TE. Inspect the inner layer when deciding whether
+            # rotary embeddings belong to the graph's static keyword inputs.
+            attention_layer = (
+                layer.inner_layer if isinstance(layer, HyperConnectionHybridLayer) else layer
+            )
             contains_self_attn = (
-                isinstance(layer, TransformerLayer)
-                and not isinstance(layer.self_attention, IdentityOp)
+                isinstance(attention_layer, TransformerLayer)
+                and not isinstance(attention_layer.self_attention, IdentityOp)
                 and (
                     not self.config.cuda_graph_modules
                     or CudaGraphModule.attn in self.config.cuda_graph_modules
                 )
             )
+
+            if contains_self_attn and not self.config.multi_latent_attention:
+                position_embedding_type = getattr(
+                    chunk_of_the_layer, 'position_embedding_type', None
+                )
+                is_thd = 'cu_seqlens_q' in static_inputs
+                context_parallel_size = self.config.context_parallel_size
+                unsupported_reasons = []
+                if position_embedding_type == 'yarn':
+                    unsupported_reasons.append(
+                        'Yarn rotary embeddings are not represented in the capture sample inputs'
+                    )
+                elif position_embedding_type == 'mrope':
+                    unsupported_reasons.append(
+                        'mRoPE rotary embeddings are not represented in the capture sample inputs'
+                    )
+                if position_embedding_type == 'rope' and is_thd and context_parallel_size > 1:
+                    unsupported_reasons.append(
+                        'THD with context parallelism captures a CP-sliced RoPE table, while '
+                        'runtime packed sequences use the full table'
+                    )
+
+                warning_key = (position_embedding_type, is_thd, context_parallel_size)
+                if unsupported_reasons and warning_key not in warned_rotary_sample_contracts:
+                    warned_rotary_sample_contracts.add(warning_key)
+                    reasons = '; '.join(unsupported_reasons)
+                    if position_embedding_type == 'mrope':
+                        affected_models = 'GPTModel'
+                    else:
+                        affected_models = 'GPTModel and HybridModel'
+                    log_on_each_pipeline_stage(
+                        logger=logger,
+                        tp_group=self.tp_group,
+                        dp_cp_group=self.dp_cp_group,
+                        level=logging.WARNING,
+                        msg='TE CUDA Graph self-attention capture does not preserve the runtime '
+                        f'rotary embedding contract for position_embedding_type='
+                        f'{position_embedding_type!r}, input_format='
+                        f'{"THD" if is_thd else "SBHD"}, context_parallel_size='
+                        f'{context_parallel_size}: {reasons}. CUDA Graph replay may omit or '
+                        'mis-shape rotary_pos_emb, so numerical results are not reliable. '
+                        'This is a pre-existing limitation in the sample-input path affecting '
+                        f'{affected_models}. Disable TE attention capture, or use regular '
+                        'RoPE with SBHD (any supported CP) or THD with CP=1, until the shared '
+                        'sample-input path is fixed.',
+                    )
 
             _sample_kwargs = {}
             if is_te_min_version("1.10.0"):
@@ -2647,10 +2758,25 @@ class TECudaGraphHelper:
 
         self._capture_finished = True
 
+    def _should_enable_paged_stash_capture(self) -> bool:
+        """Whether this rank captures a complete local MoE with paged stash."""
+
+        has_local_moe_layer = any(
+            getattr(module, "is_moe_layer", False)
+            for layer in self.flattened_callables
+            for module in layer.modules()
+        )
+        return (
+            self.config.moe_paged_stash
+            and is_whole_moe_cuda_graph_scope(self.config.cuda_graph_modules)
+            and has_local_moe_layer
+        )
+
     def create_cudagraphs(self):
         """
         Capture CUDA Graphs per TransformerLayer per microbatch.
         """
+        validate_moe_cuda_graph_support(self.config)
         start_time = self._start_capturing()
 
         if not self.flattened_callables:
@@ -2666,7 +2792,16 @@ class TECudaGraphHelper:
                 rng_context = get_cuda_rng_tracker().fork()
             else:
                 rng_context = nullcontext()
-            with rng_context:
+            from megatron.core.transformer.moe.paged_stash import paged_stash_te_graph_capture
+
+            with (
+                rng_context,
+                paged_stash_te_graph_capture(
+                    self._should_enable_paged_stash_capture(),
+                    order=kwargs['_order'],
+                    config=self.config,
+                ),
+            ):
                 graphs = make_graphed_callables(
                     tuple(self.flattened_callables), sample_args, **kwargs
                 )
@@ -2911,7 +3046,10 @@ def set_current_microbatch(model, microbatch_id):
                 assert hasattr(
                     layer, 'mtp_model_layer'
                 ), f"MTP layer {layer} must have 'mtp_model_layer' attribute"
-                layer.mtp_model_layer.current_microbatch = microbatch_id
+                mtp_model_layer = layer.mtp_model_layer
+                mtp_model_layer.current_microbatch = microbatch_id
+                for inner_layer in getattr(mtp_model_layer, 'layers', []):
+                    inner_layer.current_microbatch = microbatch_id
 
     # Also set current_microbatch on vision encoder layers so that
     # _te_cuda_graph_replay selects the correct graph index. Without this,

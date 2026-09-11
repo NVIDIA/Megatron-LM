@@ -7,8 +7,8 @@ from collections.abc import Callable
 
 import torch
 import torch.nn as nn
-import transformer_engine.pytorch as te
 
+from megatron.lite.primitive import transformer_engine as te
 from megatron.lite.primitive.parallel import (
     ParallelState,
     VanillaColumnParallelLinear,

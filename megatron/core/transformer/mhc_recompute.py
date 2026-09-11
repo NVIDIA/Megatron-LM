@@ -34,7 +34,12 @@ def uses_mhc_recompute_attn_cuda_graph_split(config) -> bool:
     from megatron.core.transformer.enums import CudaGraphModule
 
     return (
-        config.cuda_graph_impl == "transformer_engine"
+        config.mhc_recompute_attn_cuda_graph_split
+        # HybridStack has no split implementation; the config validator
+        # rejects the combination, and this keeps the capture-side arena
+        # validation from engaging on heterogeneous configs regardless.
+        and not getattr(config, "is_hybrid_model", False)
+        and config.cuda_graph_impl == "transformer_engine"
         and list(config.cuda_graph_modules or []) == [CudaGraphModule.attn]
         and config.recompute_granularity == "selective"
         and list(config.recompute_modules or []) == ["mhc"]

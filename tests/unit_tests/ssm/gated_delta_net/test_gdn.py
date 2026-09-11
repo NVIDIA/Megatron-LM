@@ -58,7 +58,7 @@ def _make_gdn_config(**overrides):
         "num_attention_heads": 8,
         "activation_func": F.silu,
         "bf16": True,
-        "experimental_attention_variant": "gated_delta_net",
+        "experimental_attention_variant": "gdn",
         "linear_attention_freq": [1],
         "transformer_impl": "transformer_engine",
     }
@@ -89,7 +89,7 @@ def test_gdn_pre_gated_delta_rule_fusion_accepts_gdn_variant():
 
 
 def test_gdn_pre_gated_delta_rule_fusion_requires_gdn_variant():
-    with pytest.raises(ValueError, match="experimental_attention_variant='gated_delta_net'"):
+    with pytest.raises(ValueError, match="experimental_attention_variant='gdn'"):
         _make_gdn_config(
             experimental_attention_variant=None,
             linear_attention_freq=None,
@@ -102,6 +102,16 @@ def test_gdn_norm_out_recompute_accepts_gdn_variant():
     assert "gdn_norm_out" in config.recompute_modules
 
 
+def test_gdn_norm_out_recompute_rejects_non_hybrid_non_gdn_config():
+    with pytest.raises(ValueError, match="gdn_norm_out in recompute_modules"):
+        _make_gdn_config(
+            experimental_attention_variant=None,
+            linear_attention_freq=None,
+            recompute_granularity="selective",
+            recompute_modules=["gdn_norm_out"],
+        )
+
+
 def test_gdn_and_norm_out_recompute_are_mutually_exclusive():
     with pytest.raises(ValueError, match="'gdn' and 'gdn_norm_out'"):
         _make_gdn_config(
@@ -109,14 +119,18 @@ def test_gdn_and_norm_out_recompute_are_mutually_exclusive():
         )
 
 
-def test_gdn_norm_out_recompute_requires_gdn_variant():
-    with pytest.raises(ValueError, match="experimental_attention_variant='gated_delta_net'"):
-        _make_gdn_config(
-            experimental_attention_variant=None,
-            linear_attention_freq=None,
-            recompute_granularity="selective",
-            recompute_modules=["gdn_norm_out"],
-        )
+def test_gdn_norm_out_recompute_accepts_non_experimental_hybrid_config():
+    # Hybrid specs select GDN/KDA per layer without setting a global
+    # experimental_attention_variant, so the selector must remain valid here.
+    config = _make_gdn_config(
+        experimental_attention_variant=None,
+        is_hybrid_model=True,
+        linear_attention_freq=None,
+        recompute_granularity="selective",
+        recompute_modules=["gdn_norm_out"],
+    )
+
+    assert config.recompute_modules == ["gdn_norm_out"]
 
 
 def test_gdn_conv_pad_alignment_rejects_chunkwise_cp():

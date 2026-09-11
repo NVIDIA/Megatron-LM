@@ -76,6 +76,8 @@ def _hash_tensor(tensor: torch.Tensor | None) -> dict[str, Any] | None:
         result["sha256_as_bf16"] = hashlib.sha256(
             as_bf16.view(torch.uint8).numpy().tobytes()
         ).hexdigest()
+        if os.environ.get("MLITE_CORRECTNESS_INCLUDE_VALUES") == "1":
+            result["values"] = [float(x) for x in t.float().reshape(-1).tolist()]
     if summary is not None:
         flat = summary.reshape(-1)
         result["summary"] = {
@@ -455,6 +457,12 @@ def _parser() -> argparse.ArgumentParser:
     cmp_p.add_argument("candidate")
     cmp_p.add_argument("--output-json", default=None)
     cmp_p.add_argument("--fail-on-mismatch", action="store_true")
+    cmp_p.add_argument("--loss-atol", type=float, default=0.0)
+    cmp_p.add_argument("--loss-rtol", type=float, default=0.0)
+    cmp_p.add_argument("--grad-atol", type=float, default=0.0)
+    cmp_p.add_argument("--grad-rtol", type=float, default=0.0)
+    cmp_p.add_argument("--tensor-atol", type=float, default=0.0)
+    cmp_p.add_argument("--tensor-rtol", type=float, default=0.0)
     return parser
 
 
@@ -462,7 +470,14 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
     ns = _parser().parse_args(argv)
     if ns.command == "compare":
         result = compare_correctness_artifacts(
-            load_result_artifact(ns.baseline), load_result_artifact(ns.candidate)
+            load_result_artifact(ns.baseline),
+            load_result_artifact(ns.candidate),
+            loss_atol=ns.loss_atol,
+            loss_rtol=ns.loss_rtol,
+            grad_atol=ns.grad_atol,
+            grad_rtol=ns.grad_rtol,
+            tensor_atol=ns.tensor_atol,
+            tensor_rtol=ns.tensor_rtol,
         )
         text = json.dumps(result, indent=2, sort_keys=True)
         print(text, flush=True)

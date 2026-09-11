@@ -10,6 +10,7 @@ from megatron.core.inference.utils import InferenceMode
 from megatron.core.jit import jit_fuser
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.moe.fused_a2a import HAVE_HYBRIDEP_DENSE_ROUTING
 from megatron.core.transformer.moe.moe_logging import get_moe_metrics_tracker
 from megatron.core.transformer.moe.moe_utils import (
     MoEAuxLossAutoScaler,
@@ -18,6 +19,7 @@ from megatron.core.transformer.moe.moe_utils import (
     apply_random_logits,
     apply_router_token_dropping,
     compute_routing_scores_for_aux_loss,
+    fused_topk_with_score_function_supports_topk_indices,
     get_tokens_per_expert_and_token_count,
     router_gating_linear,
     sinkhorn,
@@ -26,6 +28,8 @@ from megatron.core.transformer.moe.moe_utils import (
 )
 from megatron.core.transformer.moe.router_replay import RouterReplay
 from megatron.core.transformer.transformer_config import TransformerConfig
+
+_HYBRIDEP_INT16_EXPERT_LIMIT = 1 << 15
 
 
 @dataclass(frozen=True)
@@ -52,6 +56,7 @@ class Router(ABC, MegatronModule):
         pg_collection: Optional[ProcessGroupCollection] = None,
         is_mtp_layer: bool = False,
         layer_number: Optional[int] = None,
+        hash_moe_layer_threshold: Optional[int] = None,
     ) -> None:
         """
         Initialize the Router module.
@@ -60,6 +65,8 @@ class Router(ABC, MegatronModule):
             config (TransformerConfig): Configuration object for the Transformer model.
             pg_collection (ProcessGroupCollection, optional): Process groups for MoE operations.
             is_mtp_layer (bool): Flag indicating if this router is part of an MTP layer.
+            hash_moe_layer_threshold (int, optional): Explicit layer-number threshold for
+                hash routing. When omitted, use config.moe_n_hash_layers.
         """
         super().__init__(config)
         self.config = config
@@ -67,7 +74,13 @@ class Router(ABC, MegatronModule):
         self.moe_aux_loss_func = None
         self.layer_number = layer_number
         self.is_mtp_layer = is_mtp_layer
+        self.hash_moe_layer_threshold = (
+            self.config.moe_n_hash_layers
+            if hash_moe_layer_threshold is None
+            else hash_moe_layer_threshold
+        )
         self.tp_group = pg_collection.tp
+        self.expt_tp_group = pg_collection.expt_tp
         self.cp_group = pg_collection.cp
         self.tp_cp_group = pg_collection.tp_cp
         self.tp_dp_cp_group = pg_collection.tp_dp_cp
@@ -176,6 +189,7 @@ class TopKRouter(Router):
         pg_collection: Optional[ProcessGroupCollection] = None,
         is_mtp_layer: bool = False,
         layer_number: Optional[int] = None,
+        hash_moe_layer_threshold: Optional[int] = None,
     ) -> None:
         """Initialize the zero token dropping router.
 
@@ -183,12 +197,15 @@ class TopKRouter(Router):
             config (TransformerConfig): The configuration for the transformer model.
             pg_collection (ProcessGroupCollection, optional): Process groups for MoE operations.
             is_mtp_layer (bool): Flag indicating if this router is part of an MTP layer.
+            hash_moe_layer_threshold (int, optional): Explicit layer-number threshold for
+                hash routing. Hybrid models use this to translate a MoE-position count.
         """
         super().__init__(
             config=config,
             pg_collection=pg_collection,
             is_mtp_layer=is_mtp_layer,
             layer_number=layer_number,
+            hash_moe_layer_threshold=hash_moe_layer_threshold,
         )
         self.topk = self.config.moe_router_topk
         self.routing_type = self.config.moe_router_load_balancing_type
@@ -197,12 +214,12 @@ class TopKRouter(Router):
         self.mtp_layer_number: Optional[int] = None
         self.frozen_expert_bias = False
 
-        if self.config.moe_n_hash_layers > 0:
+        if self.hash_moe_layer_threshold > 0:
             assert layer_number is not None, "layer_number is required for the hash-based router."
         self.is_hash_layer = (
             not self.is_mtp_layer
-            and self.config.moe_n_hash_layers > 0
-            and layer_number <= self.config.moe_n_hash_layers
+            and self.hash_moe_layer_threshold > 0
+            and layer_number <= self.hash_moe_layer_threshold
         )
         if self.is_hash_layer:
             # DSv4-Pro ships a pre-trained tid2eid table in its inference checkpoint;
@@ -218,6 +235,9 @@ class TopKRouter(Router):
         else:
             self.tid2eid = None
 
+        self.use_quantile_balancing = (
+            self.routing_type == "quantile_balancing" and not self.is_hash_layer
+        )
         self.enable_expert_bias = (
             self.config.moe_router_enable_expert_bias and not self.is_hash_layer
         )
@@ -231,6 +251,10 @@ class TopKRouter(Router):
                 ),
                 persistent=False,
             )
+        else:
+            self.local_tokens_per_expert = None
+
+        if self.enable_expert_bias or self.use_quantile_balancing:
             self.register_buffer(
                 'expert_bias',
                 torch.zeros(
@@ -240,8 +264,26 @@ class TopKRouter(Router):
                 ),
             )
         else:
-            self.local_tokens_per_expert = None
             self.expert_bias = None
+
+        if self.use_quantile_balancing:
+            self.register_buffer(
+                'qb_histogram',
+                torch.zeros(
+                    self.config.num_moe_experts,
+                    self.config.moe_router_qb_num_bins,
+                    dtype=torch.int32,
+                    device=torch.cuda.current_device(),
+                ),
+                persistent=False,
+            )
+            self.register_buffer(
+                'qb_bin_bounds',
+                torch.tensor([-1.0, 1.0], dtype=torch.float32, device=torch.cuda.current_device()),
+            )
+        else:
+            self.qb_histogram = None
+            self.qb_bin_bounds = None
 
         # Initialize global tokens per expert for global aux loss
         if self.get_aux_loss_coeff("global_aux_loss") > 0:
@@ -277,6 +319,9 @@ class TopKRouter(Router):
         if hasattr(self, 'expert_bias') and self.expert_bias is not None:
             if self.expert_bias.dtype != torch.float32:
                 self.expert_bias.data = self.expert_bias.data.to(torch.float32)
+        if hasattr(self, 'qb_bin_bounds') and self.qb_bin_bounds is not None:
+            if self.qb_bin_bounds.dtype != torch.float32:
+                self.qb_bin_bounds.data = self.qb_bin_bounds.data.to(torch.float32)
 
     def sinkhorn_load_balancing(self, logits: torch.Tensor):
         """Apply sinkhorn routing to the logits tensor.
@@ -332,6 +377,32 @@ class TopKRouter(Router):
             if self.get_aux_loss_coeff(aux_loss_type) > 0:
                 return True
         return False
+
+    def _dense_route_indices_dtype(self) -> Optional[torch.dtype]:
+        """Return the route-index dtype for Flex backends that consume dense top-k indices."""
+        if not self.config.moe_router_fusion:
+            return None
+        if self.config.moe_token_dispatcher_type != "flex":
+            return None
+        if self.config.moe_expert_capacity_factor is not None:
+            return None
+        if not fused_topk_with_score_function_supports_topk_indices:
+            return None
+
+        backend = self.config.moe_flex_dispatcher_backend
+        if backend in ("deepep", "deepepv2", "ncclep"):
+            return torch.int64
+        if backend != "hybridep":
+            return None
+        if self.config.moe_hybridep_routing_map_mode != "indices":
+            return None
+        if not HAVE_HYBRIDEP_DENSE_ROUTING:
+            return None
+
+        num_experts = self.expt_tp_group.size() * self.config.num_moe_experts
+        if num_experts <= _HYBRIDEP_INT16_EXPERT_LIMIT:
+            return torch.int16
+        return None
 
     def _apply_aux_loss(
         self,
@@ -438,10 +509,11 @@ class TopKRouter(Router):
             aux_loss_groups.metric_reduce_group,
             avg_group=aux_loss_groups.metric_avg_group,
             needs_dp_avg=aux_loss_groups.metric_needs_dp_avg,
-            valid_token_count=local_num_tokens,
+            # local_num_tokens is per-sequence (bsz is folded into the expert dimension);
+            # restore the micro-batch total for per-token-loss gradient scaling.
+            valid_token_count=local_num_tokens * bsz,
             aux_loss_logging_reduce_groups=aux_loss_groups.metric_pre_reduce_groups,
             aux_loss_scale_reduce_groups=aux_loss_groups.loss_reduce_groups,
-            aux_loss_scale_num_tokens=total_num_tokens,
         )
         return probs
 
@@ -521,6 +593,19 @@ class TopKRouter(Router):
             metric_needs_dp_avg=True,
         )
 
+    def _get_metric_layer_number(self) -> tuple[int, int]:
+        """Return the 1-based metric index and the total number of metric slots."""
+        num_layers = self.config.num_layers + (self.config.mtp_num_layers or 0)
+        if not self.is_mtp_layer:
+            return self.layer_number, num_layers
+
+        # Hybrid MTP depths can contain multiple internal sublayers (for example `/WE`).
+        # Metrics are allocated per MTP depth, not per internal hybrid sublayer.
+        mtp_layer_number = self.mtp_layer_number or self.layer_number
+        if self.config.mtp_num_layers is not None:
+            mtp_layer_number = min(mtp_layer_number, self.config.mtp_num_layers)
+        return self.config.num_layers + mtp_layer_number, num_layers
+
     def attach_and_log_load_balancing_loss(
         self,
         activation: torch.Tensor,
@@ -565,19 +650,7 @@ class TopKRouter(Router):
         # add the aux loss logging value to other layer's since it is difficult to get the
         # correct layer_number for MTP. It does not affect the correctness of the calculation
         # results and the reduced load_balancing_loss logging value.
-        num_layers = self.config.num_layers
-        if self.config.mtp_num_layers is not None:
-            num_layers += self.config.mtp_num_layers
-
-        if self.is_mtp_layer:
-            # Hybrid MTP depths can contain multiple internal sublayers (for example `/WE`).
-            # Metrics are allocated per MTP depth, not per internal hybrid sublayer.
-            mtp_layer_number = self.mtp_layer_number or self.layer_number
-            if self.config.mtp_num_layers is not None:
-                mtp_layer_number = min(mtp_layer_number, self.config.mtp_num_layers)
-            layer_number = mtp_layer_number + self.config.num_layers
-        else:
-            layer_number = self.layer_number
+        layer_number, num_layers = self._get_metric_layer_number()
 
         metric_value = aux_loss / aux_loss_coeff
         if aux_loss_logging_reduce_groups is not None:
@@ -673,14 +746,7 @@ class TopKRouter(Router):
                 z_loss = z_loss_mean * moe_z_loss_coeff / mtp_loss_scale
                 logits = MoEAuxLossAutoScaler.apply(logits, z_loss)
 
-            num_layers = self.config.num_layers
-            if self.config.mtp_num_layers is not None:
-                num_layers += self.config.mtp_num_layers
-
-            if self.is_mtp_layer:
-                layer_number = self.layer_number + self.config.num_layers
-            else:
-                layer_number = self.layer_number
+            layer_number, num_layers = self._get_metric_layer_number()
 
             get_moe_metrics_tracker().record(
                 "z_loss", z_loss_mean / mtp_loss_scale, layer_number, num_layers
@@ -718,13 +784,27 @@ class TopKRouter(Router):
         """
         if self.enable_expert_bias and torch.is_grad_enabled():
             with torch.no_grad():
+                use_dense_indices = routing_map.dtype != torch.bool
                 if padding_mask is not None:
                     flat_mask = padding_mask.reshape(-1)
                     assert (
                         flat_mask.shape[0] == routing_map.shape[0]
                     ), f"padding_mask flat {flat_mask.shape} vs routing_map {routing_map.shape}"
-                    routing_map = routing_map & (~flat_mask).unsqueeze(-1)
-                self.local_tokens_per_expert += routing_map.sum(dim=0)
+                    if use_dense_indices:
+                        routing_map = routing_map[~flat_mask]
+                    else:
+                        routing_map = routing_map & (~flat_mask).unsqueeze(-1)
+                if use_dense_indices:
+                    expert_indices = routing_map.reshape(-1).to(torch.long)
+                    token_counts = torch.ones_like(
+                        expert_indices, dtype=self.local_tokens_per_expert.dtype
+                    )
+                    if torch.are_deterministic_algorithms_enabled():
+                        self.local_tokens_per_expert.index_add_(0, expert_indices, token_counts)
+                    else:
+                        self.local_tokens_per_expert.scatter_add_(0, expert_indices, token_counts)
+                else:
+                    self.local_tokens_per_expert += routing_map.sum(dim=0)
 
     def _hash_routing(self, logits: torch.Tensor, input_ids: torch.Tensor):
         """Hash-based routing: expert indices come from the tid2eid lookup table.
@@ -794,7 +874,8 @@ class TopKRouter(Router):
         Returns:
             probs (torch.Tensor): The probabilities of token to experts assignment.
             routing_map (torch.Tensor): The mapping of token to experts assignment,
-                with shape [num_tokens, num_experts].
+                with shape [num_tokens, num_experts], or dense top-k indices with shape
+                [num_tokens, topk] for supported Flex backends.
         """
         seq_length, bsz = logits.shape[:2]
         logits = logits.view(-1, self.config.num_moe_experts)
@@ -816,6 +897,27 @@ class TopKRouter(Router):
         elif self.routing_type == "sinkhorn":
             probs, routing_map = self.sinkhorn_load_balancing(logits)
         else:
+            # Activation checkpointing runs the original forward under no-grad and its
+            # recompute under enable-grad, so this gate records each token exactly once.
+            accumulate_qb_histogram = (
+                self.use_quantile_balancing
+                and self.training
+                and torch.is_grad_enabled()
+                and not self.frozen_expert_bias
+            )
+            if accumulate_qb_histogram and padding_mask is not None:
+                raise RuntimeError(
+                    "Quantile Balancing does not yet support padding masks because the "
+                    "histogram APIs do not accept a valid-token mask."
+                )
+            topk_indices_dtype = self._dense_route_indices_dtype()
+            topk_indices = (
+                torch.empty(
+                    (logits.shape[0], self.topk), dtype=topk_indices_dtype, device=logits.device
+                )
+                if topk_indices_dtype is not None
+                else None
+            )
             probs, routing_map = topk_routing_with_score_function(
                 logits,
                 self.topk,
@@ -827,6 +929,9 @@ class TopKRouter(Router):
                 expert_bias=self.expert_bias,
                 fused=self.config.moe_router_fusion,
                 router_replay=self.router_replay,
+                qb_histogram=self.qb_histogram if accumulate_qb_histogram else None,
+                qb_bin_bounds=self.qb_bin_bounds if accumulate_qb_histogram else None,
+                topk_indices=topk_indices,
             )
 
         # Dropless HybridEP consumes the sparse routing map directly, so exclude padding
@@ -841,7 +946,10 @@ class TopKRouter(Router):
         if padding_mask is not None and use_dropless_hybridep:
             valid_tokens = (~padding_mask).unsqueeze(-1)
             probs = probs * valid_tokens
-            routing_map = routing_map & valid_tokens
+            if routing_map.dtype == torch.bool:
+                routing_map = routing_map & valid_tokens
+            else:
+                routing_map = routing_map.masked_fill(padding_mask.unsqueeze(-1), -1)
 
         # Apply token dropping to probs and routing_map.
         if self.config.moe_expert_capacity_factor is not None:
@@ -854,8 +962,15 @@ class TopKRouter(Router):
                 pad_to_capacity=self.config.moe_pad_expert_input_to_capacity,
             )
 
-        # Apply each aux loss type and attach aux loss autograd function to probs
-        if self.training and torch.is_grad_enabled() and self.is_aux_loss_enabled():
+        # Hash routing assignments come from tid2eid rather than the learned logits, so a
+        # learned top-k aux loss would optimize routing decisions that were never dispatched.
+        # Keep aux loss enabled for the non-hash MoE layers that share this configuration.
+        if (
+            not self.is_hash_layer
+            and self.training
+            and torch.is_grad_enabled()
+            and self.is_aux_loss_enabled()
+        ):
             # Calculate scores and routing_map for aux loss
             routing_map_for_aux_loss, scores_for_aux_loss = compute_routing_scores_for_aux_loss(
                 logits,
@@ -970,6 +1085,7 @@ class InferenceTopKRouter(TopKRouter):
         pg_collection: Optional[ProcessGroupCollection] = None,
         is_mtp_layer: bool = False,
         layer_number: Optional[int] = None,
+        hash_moe_layer_threshold: Optional[int] = None,
     ) -> None:
         """Initialize the specialized inference top-k router.
 
@@ -992,6 +1108,7 @@ class InferenceTopKRouter(TopKRouter):
             pg_collection=pg_collection,
             is_mtp_layer=is_mtp_layer,
             layer_number=layer_number,
+            hash_moe_layer_threshold=hash_moe_layer_threshold,
         )
 
     @staticmethod

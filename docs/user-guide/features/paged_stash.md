@@ -19,6 +19,32 @@
 
 Whenever `moe_expert_rank_capacity_factor` is set, a **runner** wraps forward-backward: after each pass it checks **stash overflow** (only with `--moe-paged-stash`) and **token over-budget**. If either hits any rank, the step **reruns once** without capacity padding and without paged stashing.
 
+For Transformer Engine per-layer CUDA graphs, the whole MoE scope (either
+`--cuda-graph-modules moe` or the default whole-layer scope) is supported by the sync-free
+HybridEP + paged-stash configuration above. Its captured graph is tied to the static expert-rank
+and stash capacities. Before graph capture, and during eager evaluation, capacity overflow can
+still use the dynamic rerun. After graph capture, training fails immediately instead of attempting
+an invalid rerun; increase the corresponding capacity factor and restart the job.
+
+Transformer Engine warmup and graph capture both replay the previously recorded paged-stash
+layer templates, preserving the training layer, microbatch, and virtual-pipeline coordinates. The
+runtime paged-stash schedule remains unchanged. This mode requires a fixed runtime microbatch
+schedule: `--cuda-graph-dynamic-microbatches` is not supported, the microbatch count may not change
+after capture, and at least two CUDA graph warmup steps are required to record the pipeline
+schedule. Graph capture temporarily expands Transformer Engine's final `_order` into a
+capture-only schedule and restores the recorded runtime schedule afterward. This mode requires
+Transformer Engine 2.19.0 or later, which includes
+[Transformer Engine #2831](https://github.com/NVIDIA/TransformerEngine/pull/2831) and makes
+ordered warmup follow `_order`; older installs fail configuration validation. It does not use
+per-callable cursor hooks. The stash/reload kernels remain inside their corresponding CUDA graphs.
+
+Because Transformer Engine captures each MoE layer as an independent graph, the auxiliary
+pack/unpack stream must rejoin the graph's capture stream before that graph ends. These joins are
+captured graph nodes and therefore execute on every replay. Stash/reload work launched by one MoE
+graph consequently cannot overlap eager work or another graph beyond that graph boundary, although
+work inside the same graph may still overlap before the join. This correctness constraint can
+reduce paged-stash overlap and throughput; benchmark the target PP/VPP configuration.
+
 ## Prerequisites
 
 HybridEP + TE fused grouped experts are required whenever `moe_expert_rank_capacity_factor` is set. With `moe_paged_stash` enabled: capacity factor must be set; no `cpu_offloading`; `offload_modules` must not include `expert_fc1`, `moe_act`, or `fused_group_mlp`. The runner is active whenever capacity factor is set (even without `--moe-paged-stash`) for over-budget reruns; stash overflow is checked only when paged stashing is on.

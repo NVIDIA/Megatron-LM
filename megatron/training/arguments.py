@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Megatron arguments."""
 
@@ -14,7 +14,7 @@ import torch
 import torch.nn.functional as F
 from packaging.version import Version as PkgVersion
 
-from megatron.core.activations import squared_relu
+from megatron.core.activations import situlu, squared_relu
 from megatron.core.dist_checkpointing.validation import StrictHandling
 from megatron.core.fusions.fused_bias_geglu import quick_gelu
 from megatron.core.model_parallel_config import _parse_pad_packed_seq_alignment
@@ -820,6 +820,8 @@ def validate_args(args, defaults={}):
         args.mtp_hybrid_override_pattern = None
         print_rank_0(f"Converted legacy MTP pattern to unified: {args.hybrid_layer_pattern}")
 
+    parsed_hybrid_pattern = parse_hybrid_pattern(args.hybrid_layer_pattern)
+
     if args.hybrid_layer_pattern is not None:
         # Derive num_layers from pattern; hybrid_layer_pattern always overrides --num-layers when
         # both are present (e.g. when loading from checkpoint with --use-checkpoint-args).
@@ -899,9 +901,8 @@ def validate_args(args, defaults={}):
 
     # Infer mtp_num_layers from unified pattern
     if args.hybrid_layer_pattern and sep in args.hybrid_layer_pattern:
-        parsed = parse_hybrid_pattern(args.hybrid_layer_pattern)
-        if parsed.mtp_pattern and parsed.mtp_num_depths > 0:
-            inferred_mtp_num_layers = parsed.mtp_num_depths
+        if parsed_hybrid_pattern.mtp_pattern and parsed_hybrid_pattern.mtp_num_depths > 0:
+            inferred_mtp_num_layers = parsed_hybrid_pattern.mtp_num_depths
             if args.mtp_num_layers is None:
                 args.mtp_num_layers = inferred_mtp_num_layers
             elif args.mtp_num_layers != inferred_mtp_num_layers:
@@ -914,12 +915,10 @@ def validate_args(args, defaults={}):
                 )
                 args.mtp_num_layers = inferred_mtp_num_layers
 
-    # MTP validation
-    if args.mtp_num_layers:
-        assert args.position_embedding_type == "rope" or args.position_embedding_type == "none", (
-            f"Multi-Token Prediction (MTP) is not supported with {args.position_embedding_type} position embedding type."
-            + f"The supported position embedding types are rope and none."
-        )
+    # NOTE: the MTP position-embedding-type check lives with the other MTP
+    # validation further down (search for `supported_position_types`). Keeping a
+    # second, narrower copy here caused 'mrope' to be rejected before the
+    # authoritative check ever ran.
 
     # Validate MTP args for hybrid vs non-hybrid models
     if args.hybrid_layer_pattern is not None:
@@ -945,8 +944,13 @@ def validate_args(args, defaults={}):
                 args.rank,
             )
 
-    # Infer use of MLA from unified pattern
-    if args.hybrid_layer_pattern and Symbols.DS_ATTENTION in args.hybrid_layer_pattern:
+    # Infer use of MLA from the parsed main and MTP patterns before config-class selection.
+    if any(
+        symbol in pattern
+        for pattern in (parsed_hybrid_pattern.main_pattern, parsed_hybrid_pattern.mtp_pattern)
+        if pattern is not None
+        for symbol in Symbols.MLA_ATTENTION
+    ):
         args.multi_latent_attention = True
 
     # === End of hybrid layer pattern: deprecation handling and validation ===
@@ -1197,6 +1201,11 @@ def validate_args(args, defaults={}):
                 "--inference-dynamic-batching-sampling-backend=torch."
             ) from e
 
+    if args.moe_megakernel_backend == "mok" and (
+        args.use_megatron_fsdp or args.use_torch_fsdp2
+    ):
+        raise ValueError("MOK has not been validated with Megatron-FSDP or Torch FSDP2")
+
     if args.use_megatron_fsdp:
         # NOTE: The flag `use_custom_fsdp` is deprecated and will be removed in future versions.
         #       Please use `use_megatron_fsdp` instead, as all functionality will be migrated there.
@@ -1406,8 +1415,16 @@ def validate_args(args, defaults={}):
         _check_arg_is_not_none(args, req_arg)
 
     # Checks.
+    use_situ_glu = getattr(args, 'situ_glu', False)
+    if use_situ_glu:
+        if args.swiglu or args.quick_geglu or args.squared_relu:
+            raise ValueError(
+                "--situ-glu is mutually exclusive with --swiglu, --quick-geglu, "
+                "and --squared-relu."
+            )
+
     if args.ffn_hidden_size is None:
-        if args.swiglu:
+        if args.swiglu or use_situ_glu:
             # reduce the dimnesion for MLP since projections happens on
             # two linear layers. this keeps the number of paramters in
             # the same ballpark as the counterpart with 4*h size
@@ -2134,7 +2151,11 @@ def validate_args(args, defaults={}):
 
     if args.mtp_num_layers:
         # MTP is compatible with position embedding types that use position_ids.
-        supported_position_types = ["learned_absolute", "rope", "mrope", "none"]
+        # 'learned_absolute' is excluded: MTP's sequence roll shifts position_ids,
+        # but learned_absolute adds embeddings from the unshifted embedding-side
+        # positions, and that combination has no test coverage. It was already
+        # unreachable before the duplicate check above was removed.
+        supported_position_types = ["rope", "mrope", "none"]
         assert args.position_embedding_type in supported_position_types, (
             f"Multi-Token Prediction (MTP) is not supported with '{args.position_embedding_type}' position embedding type. "
             f"The supported position embedding types are: {', '.join(supported_position_types)}."
@@ -2237,17 +2258,23 @@ def core_transformer_config_from_args(args, config_class=None):
     kw_args['num_layers_in_last_pipeline_stage'] = args.decoder_last_pipeline_num_layers
     kw_args['fp8_param'] = args.fp8_param_gather
     kw_args['fp4_param'] = args.fp4_param_gather
-    if args.swiglu:
+    use_situ_glu = getattr(args, 'situ_glu', False)
+    if use_situ_glu:
+        kw_args['activation_func'] = situlu
+        kw_args['gated_linear_unit'] = True
+        kw_args['use_te_activation_func'] = True
+        kw_args['bias_activation_fusion'] = False
+    elif args.swiglu:
         kw_args['activation_func'] = F.silu
         kw_args['gated_linear_unit'] = True
         kw_args['bias_activation_fusion'] = args.bias_swiglu_fusion
     else:
         kw_args['bias_activation_fusion'] = args.bias_gelu_fusion
     if args.squared_relu:
-        assert not args.swiglu
+        assert not args.swiglu and not use_situ_glu
         kw_args['activation_func'] = squared_relu
     elif args.quick_geglu:
-        assert not args.swiglu
+        assert not args.swiglu and not use_situ_glu
         kw_args['gated_linear_unit'] = True
         kw_args['activation_func'] = quick_gelu
     if args.init_method_xavier_uniform:
@@ -2273,6 +2300,7 @@ def core_transformer_config_from_args(args, config_class=None):
         from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
 
         _pat = args.hybrid_layer_pattern
+        _has_kda = Symbols.KDA in _pat
         _has_dsv4_csa = (Symbols.CSA in _pat) or (Symbols.HCA in _pat) or (Symbols.WINDOW in _pat)
         _has_dsa = Symbols.DS_ATTENTION in _pat
         if getattr(args, 'experimental_attention_variant', None) is None:
@@ -2285,6 +2313,8 @@ def core_transformer_config_from_args(args, config_class=None):
                 kw_args['experimental_attention_variant'] = 'dsv4_hybrid'
             elif _has_dsa:
                 kw_args['experimental_attention_variant'] = 'dsa'
+            elif _has_kda:
+                kw_args['experimental_attention_variant'] = 'kda'
         # Normalize compact and legacy-padded ratios through the shared migration helper.
         _normalize_dsv4_hybrid_csa_compress_ratios(args, kw_args, _pat)
 
@@ -2619,11 +2649,13 @@ def _add_inference_args(parser):
         '--inference-dynamic-batching-async-sched-mode',
         type=str,
         default='legacy',
-        choices=['legacy', 'serial'],
+        choices=['legacy', 'serial', 'overlap'],
         help='Async scheduling mode for dynamic batching. '
         '"legacy" (default) preserves the existing resolve-before-prepare '
         'path. "serial" speculatively prepares and forwards decode-only '
-        'steps before resolving finished requests.',
+        'steps before resolving finished requests. "overlap" uses the same '
+        'async scheduling path while overlapping prepare/sample and '
+        'forward/resolve phases.',
     )
     group.add_argument(
         '--inference-dynamic-batching-logprobs-mode',
@@ -2752,6 +2784,8 @@ def _add_network_size_args(parser):
         "csa_compress_ratios",
         "moe_router_load_balancing_type",
         "moe_aux_loss_coeff",
+        "moe_router_quantile_balancing_estimation_scope",
+        "moe_router_qb_num_bins",
         "cp_comm_type",
         "cuda_graph_modules",
         "cuda_graph_scope",  # deprecated alias; handled manually by --cuda-graph-scope flag
@@ -2821,9 +2855,18 @@ def _add_network_size_args(parser):
         "apply_dsa_kernel_fusion",
         "dsa_kernel_backend",
         "mamba_training_ssm_states_dtype",
+        # Parsed manually as a JSON object below.
+        "moe_megakernel_backend_config",
     ]
     transformer_factory = ArgumentGroupFactory(TransformerConfig, exclude=exclude)
     transformer_group = transformer_factory.build_group(parser, "transformer configuration")
+    transformer_group.add_argument(
+        '--moe-megakernel-backend-config',
+        type=json.loads,
+        default=None,
+        metavar='JSON',
+        help='Backend-specific MoE megakernel options as a JSON object.',
+    )
 
     group = parser.add_argument_group(title='network size')
 
@@ -2984,6 +3027,15 @@ def _add_network_size_args(parser):
         '--swiglu',
         action='store_true',
         help='Use gated linear units and SiLU activation instead of default gelu',
+    )
+    group.add_argument(
+        '--situ-glu',
+        '--moe-use-situ-glu',
+        action='store_true',
+        help=(
+            'Use SiTU-GLU in all dense and MoE FFNs. TE-backed paths select SiTUGLU '
+            'or ScaledSiTUGLU; other paths use the PyTorch reference.'
+        ),
     )
     group.add_argument(
         '--quick-geglu',
@@ -4260,10 +4312,20 @@ def _add_distributed_args(parser):
     group.add_argument(
         '--fsdp-double-buffer',
         action='store_true',
-        help="Enable double buffering for temporary memory needed for Megatron FSDP communications. "
-        "Double-buffering the communication memory improves memory management efficiency by "
-        "reusing previously allocated buffers, rather than creating new buffers for each FSDP communication. "
-        "This is required for user buffer registration and is enabled by default when using NCCL user buffers.",
+        help="Enable persistent buffer pools for temporary memory needed for Megatron FSDP "
+        "communications. The legacy option name does not fix the pool capacity at two; use "
+        "--fsdp-buffer-count to control it. Persistent communication memory improves memory "
+        "management efficiency by reusing previously allocated buffers. This is required for "
+        "user buffer registration and is enabled automatically when using NCCL user buffers.",
+    )
+    group.add_argument(
+        '--fsdp-buffer-count',
+        type=int,
+        default=2,
+        help="Number of persistent buffers in each Megatron FSDP communication pool. "
+        "The default of two provides conventional double buffering; combined 1F1B "
+        "overlap with forward prefetch requires at least three. A non-default value requires "
+        "--fsdp-double-buffer, --use-nccl-ub, or --megatron-fsdp-max-pool-double-buffer.",
     )
     group.add_argument(
         '--suggested-communication-unit-size',
@@ -4839,9 +4901,16 @@ def _add_moe_args(parser):
         '--moe-router-load-balancing-type',
         nargs='+',
         type=str,
-        choices=['aux_loss', 'seq_aux_loss', 'global_aux_loss', 'sinkhorn', 'none'],
+        choices=[
+            'aux_loss',
+            'seq_aux_loss',
+            'global_aux_loss',
+            'sinkhorn',
+            'quantile_balancing',
+            'none',
+        ],
         default='aux_loss',
-        help='Determines the load balancing strategy for the router. "aux_loss" corresponds to the load balancing loss used in GShard and SwitchTransformer; "seq_aux_loss" corresponds to the load balancing loss used in DeepSeekV2, which computes the loss for each individual sample; "sinkhorn" corresponds to the balancing algorithm used in S-BASE, and "none" implies no load balancing. The default is "aux_loss".',
+        help='Determines the load balancing strategy for the router. "aux_loss" corresponds to the load balancing loss used in GShard and SwitchTransformer; "seq_aux_loss" corresponds to the load balancing loss used in DeepSeekV2, which computes the loss for each individual sample; "sinkhorn" corresponds to the balancing algorithm used in S-BASE; "quantile_balancing" uses Kimi K3 global-batch histogram bias updates; and "none" implies no load balancing. The default is "aux_loss".',
     )
     group.add_argument(
         '--moe-aux-loss-coeff',
@@ -4849,6 +4918,22 @@ def _add_moe_args(parser):
         nargs='+',
         default=0.0,
         help='Scaling coefficient for the aux loss: a starting value of 1e-2 is recommended.',
+    )
+    group.add_argument(
+        '--moe-router-quantile-balancing-estimation-scope',
+        type=str,
+        choices=['global_batch'],
+        default='global_batch',
+        help=(
+            'Population used to estimate quantile-balancing biases. The dev branch supports '
+            'Kimi K3 global-batch histogram estimation.'
+        ),
+    )
+    group.add_argument(
+        '--moe-router-qb-num-bins',
+        type=int,
+        default=1000,
+        help='Number of uniform histogram bins per expert for global-batch quantile balancing.',
     )
     # Token dispatcher arguments
     # MoE communication overlap arguments
@@ -4876,6 +4961,13 @@ def _add_mla_args(parser):
         type=int,
         default=32,
         help="Rank of Key and Value tensors' low rank representation.",
+    )
+    group.add_argument(
+        '--attention-latent-norm-epsilon',
+        type=float,
+        default=None,
+        help="Epsilon for the primary query and key-value latent norms in attention. "
+        "Defaults to --norm-epsilon when unset.",
     )
     group.add_argument(
         '--qk-head-dim',
@@ -4993,7 +5085,9 @@ def _add_experimental_attention_variant_args(parser):
         'experimental_attention_variant="dsv4_hybrid" launches and to "none" '
         'otherwise.',
     )
-    # Note: --dsa-indexer-{n-heads,head-dim,topk,loss-coeff,use-sparse-loss},
+    # Note: --dsa-indexer-{n-heads,head-dim,topk,loss-coeff,use-sparse-loss,
+    # precision,weights-proj-output-dtype},
+    # --no-dsa-indexer-weights-proj-use-quantization,
     # --csa-window-size, --csa-compress-rotary-base, --csa-dense-mode are
     # auto-generated by ArgumentGroupFactory from TransformerConfig fields
     # (none of them are in the exclude list at line 2500-2576).
@@ -5081,8 +5175,8 @@ def _add_experimental_args(parser):
         '--hybrid-layer-pattern',
         type=str,
         default=None,
-        help='Specify a hybrid layer pattern using M (mamba), G (gdn), '
-        '* (attention), D (dsa), - (mlp), E (moe). Use | to define pipeline '
+        help='Specify a hybrid layer pattern using M (mamba), G (gdn), K (kda), '
+        '* (attention), D (dsa), + (mla), - (mlp), E (moe). Use | to define pipeline '
         'stage boundaries for flexible virtual pipeline parallel (fVPP). '
         'Use / to separate MTP patterns. '
         'Example: "M-M-|M-M*-|M-M-|M-M*-" or "M-M-|M-M*-/MM/MM". '

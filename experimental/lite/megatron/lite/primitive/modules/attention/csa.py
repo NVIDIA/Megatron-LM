@@ -1,24 +1,23 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 import math
+from collections.abc import Hashable
 from typing import Any
 
 import torch
 import torch.nn as nn
-import transformer_engine.pytorch as te
-# Zero-copy imports of the DSv4 THD-CP helpers that live in Megatron Core. The
-# lite CSA module reuses Core's differentiable kernels, CP row-mapping utilities,
-# and CuTeDSL layout kernels rather than vendoring them; see the module docstring
-# of ``csa_cp_utils`` / ``csa_cp_layout_kernels`` for the exact contracts.
+
+# Zero-copy imports of the DSv4 THD-CP helpers that live in Megatron Core.
+# The development branch groups them under the csa_utils package.
 from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
-from megatron.core.transformer.experimental_attention_variant import (
-    csa_cp_layout_kernels,
-    csa_cp_utils as cp_utils,
-)
 from megatron.core.transformer.experimental_attention_variant.csa import (
     _unfused_indexer_sparse_attn_from_topk,
     unfused_compressed_sparse_attn,
 )
-from megatron.core.transformer.experimental_attention_variant.csa_kernels import (
+from megatron.core.transformer.experimental_attention_variant.csa_utils import (
+    cp_utils,
+    thd_layout_kernels,
+)
+from megatron.core.transformer.experimental_attention_variant.csa_utils.fused_sparse_attention import (
     FusedCSAIndexerSparseAttnFromTopkFunc,
     csa_sparse_attn,
 )
@@ -26,12 +25,21 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
     DSAIndexerLossAutoScaler,
     DSAIndexerLossLoggingHelper,
 )
+from megatron.lite.primitive import transformer_engine as te
+from megatron.lite.primitive.kernels.jit import jit_fuser
 from megatron.lite.primitive.modules.attention.dsa import rotate_activation
+from megatron.lite.primitive.parallel.linear import AccumulatingLinear
 from megatron.lite.primitive.parallel.state import ParallelState
-from megatron.lite.primitive.utils.rotary import (
-    _yarn_find_correction_range,
-    _yarn_linear_ramp_mask,
-)
+from megatron.lite.primitive.utils.rotary import _yarn_find_correction_range, _yarn_linear_ramp_mask
+
+
+@jit_fuser
+def _per_head_rms(q: torch.Tensor, eps: float) -> torch.Tensor:
+    """Weightless per-head RMS normalisation of the query."""
+    # ``q.float()`` materialised a full fp32 copy of the query purely to
+    # reduce over it -- 77k Melem per step in the op census.
+    inv = torch.rsqrt(q.pow(2).mean(dim=-1, keepdim=True, dtype=torch.float32) + eps)
+    return q * inv.to(dtype=q.dtype)
 
 
 class GroupedLinear(nn.Module):
@@ -41,6 +49,9 @@ class GroupedLinear(nn.Module):
         self.out_features = out_features
         self.n_groups = n_groups
         self.weight = nn.Parameter(torch.empty(out_features, in_features_per_group))
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
         nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -97,7 +108,90 @@ def build_yarn_rope_cos_sin(
     return emb.cos().to(dtype=dtype), emb.sin().to(dtype=dtype)
 
 
+# The rotary tables depend only on the positions and the rope parameters,
+# but were rebuilt on every layer, every microbatch, and again under activation recompute.
+
+
+# Keyed on the rope parameters alone, never on which tensor carries the
+# positions: the caching allocator reuses addresses, so tensor identity is not
+# a key. Callers index the table; Core does the same.
+_ROPE_TABLES: dict[Hashable, tuple[int, torch.Tensor, torch.Tensor]] = {}
+
+
+def rope_table(
+    max_positions: int,
+    rope_head_dim: int,
+    rope_theta: float,
+    *,
+    config: Any,
+    use_yarn: bool,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Cos/sin over ``[0, max_positions)``, grown on demand and shared.
+
+    Mirrors Core's ``get_cached_cos_sin``: rebuild only when asked for a longer
+    span than is held. Sizing to ``max_position_embeddings`` would be a 134 MB
+    pair for a model declaring a million positions and using four thousand.
+    """
+    yarn = (
+        float(config.rotary_scaling_factor),
+        float(config.beta_fast),
+        float(config.beta_slow),
+        int(config.original_max_position_embeddings),
+    ) if use_yarn else None
+    key = (int(rope_head_dim), float(rope_theta), bool(use_yarn), yarn, str(device), str(dtype))
+    hit = _ROPE_TABLES.get(key)
+    if hit is not None and hit[0] >= max_positions:
+        return hit[1], hit[2]
+    grown = max(max_positions, hit[0] * 2 if hit is not None else 0)
+    positions = torch.arange(grown, device=device).view(1, grown)
+    cos, sin = build_compressed_rope_cos_sin(
+        positions,
+        rope_head_dim,
+        rope_theta,
+        config=config,
+        use_yarn=use_yarn,
+        device=device,
+        dtype=dtype,
+    )
+    _ROPE_TABLES[key] = (grown, cos, sin)
+    return cos, sin
+
+
+def rope_rows_for(
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    global_start: int,
+    length: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    rows = cp_utils._thd_cp_position_ids(cu_seqlens, global_start, length).long().view(-1)
+    return cos[0].index_select(0, rows).unsqueeze(0), sin[0].index_select(0, rows).unsqueeze(0)
+
+
 def build_compressed_rope_cos_sin(
+    position_ids: torch.Tensor,
+    rope_head_dim: int,
+    rope_theta: float,
+    *,
+    config: Any,
+    use_yarn: bool,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return _build_compressed_rope_cos_sin_uncached(
+        position_ids,
+        rope_head_dim,
+        rope_theta,
+        config=config,
+        use_yarn=use_yarn,
+        device=device,
+        dtype=dtype,
+    )
+
+
+def _build_compressed_rope_cos_sin_uncached(
     position_ids: torch.Tensor,
     rope_head_dim: int,
     rope_theta: float,
@@ -149,13 +243,17 @@ class CompressedSequenceCompressor(nn.Module):
         self.overlap = compress_ratio == 4
         self.coff = 2 if self.overlap else 1
         self.rotate = rotate
-        self.wkv = nn.Linear(config.hidden_size, self.coff * head_dim, bias=False)
-        self.wgate = nn.Linear(config.hidden_size, self.coff * head_dim, bias=False)
+        self.initializer_range = config.initializer_range
+        self.wkv = AccumulatingLinear(config.hidden_size, self.coff * head_dim, bias=False)
+        self.wgate = AccumulatingLinear(config.hidden_size, self.coff * head_dim, bias=False)
         self.ape = nn.Parameter(
             torch.empty(compress_ratio, self.coff * head_dim, dtype=torch.float32)
         )
         self.norm = te.RMSNorm(head_dim, eps=config.rms_norm_eps)
-        nn.init.normal_(self.ape, mean=0.0, std=config.initializer_range)
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        nn.init.normal_(self.ape, mean=0.0, std=self.initializer_range)
 
     def _overlap_transform(self, tensor: torch.Tensor, fill_value: float) -> torch.Tensor:
         bsz, n_blocks, ratio, _, head_dim = tensor.shape
@@ -202,14 +300,7 @@ class CompressedSequenceCompressor(nn.Module):
     def _overlap_transform_thd(
         self, tensor: torch.Tensor, is_first_in_seg: torch.Tensor, fill_value: float
     ) -> torch.Tensor:
-        """Batched overlapping-window transform for the THD (pre-grouped) layout.
-
-        Mirrors Core ``Compressor._overlap_transform_thd``: operates on the flat
-        ``(total_comp, ratio, 1, coff * head_dim)`` tensor from all segments at
-        once. ``is_first_in_seg`` is a ``(total_comp,)`` bool mask, ``True`` for
-        each compressed entry that starts a new segment (no predecessor group).
-        Output shape ``(total_comp, 2 * ratio, 1, head_dim)``.
-        """
+        """Batched overlapping-window transform for the THD (pre-grouped) layout."""
         n, ratio, b_dim, _ = tensor.size()
         d = self.head_dim
         out = tensor.new_full((n, 2 * ratio, b_dim, d), fill_value)
@@ -226,6 +317,7 @@ class CompressedSequenceCompressor(nn.Module):
         *,
         max_seqlen_q: int,
         compressed_group_ids: torch.Tensor,
+        compressed_position_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor | None, None]:
         """Pre-grouped THD compression for the DSv4 CP path.
 
@@ -233,7 +325,9 @@ class CompressedSequenceCompressor(nn.Module):
         already packed into ratio-sized groups by
         ``cp_utils.prepare_cp_compressor_input``; ``compressed_group_ids`` is
         ``(compact_group_capacity,)`` int32 giving each compressed group's
-        per-sequence compressed id (its RoPE position is ``id * ratio``).
+        per-sequence compressed id. ``compressed_position_ids`` optionally
+        supplies the graph-safe RoPE positions emitted by Core's compaction
+        kernel.
 
         Reproduces Core ``Compressor._forward_thd`` pre-grouped semantics using
         lite's compressor params (``wkv``/``wgate``/``ape``/``norm``) and lite's
@@ -263,7 +357,11 @@ class CompressedSequenceCompressor(nn.Module):
         weights = torch.softmax(gate_grouped.float(), dim=1).to(kv_grouped.dtype)
         compressed = (kv_grouped * weights).sum(dim=1)  # (total_comp, 1, head_dim)
         compressed = self.norm(compressed)
-        positions = compressed_group_ids[:total_comp].clamp_min(0).to(torch.long) * ratio
+        positions = (
+            compressed_position_ids[:total_comp]
+            if compressed_position_ids is not None
+            else compressed_group_ids[:total_comp].clamp_min(0) * ratio
+        ).to(torch.long)
         cos, sin = build_compressed_rope_cos_sin(
             positions.view(1, total_comp),
             self.rope_head_dim,
@@ -308,10 +406,10 @@ class CompressedSparseAttentionIndexer(nn.Module):
         self.index_topk = config.index_topk
         self.rope_head_dim = min(config.qk_rope_head_dim, config.index_head_dim)
         self.softmax_scale = self.index_head_dim**-0.5
-        self.wq_b = nn.Linear(
+        self.wq_b = AccumulatingLinear(
             config.q_lora_rank, config.index_n_heads * config.index_head_dim, bias=False
         )
-        self.weights_proj = nn.Linear(config.hidden_size, config.index_n_heads, bias=False)
+        self.weights_proj = AccumulatingLinear(config.hidden_size, config.index_n_heads, bias=False)
         self.compressor = CompressedSequenceCompressor(
             config, compress_ratio, config.index_head_dim, rotate=True
         )
@@ -344,6 +442,7 @@ class CompressedSparseAttention(nn.Module):
         # Fused DSA kernels are the production default; the unfused sparse-attn /
         # indexer-loss path (Core's ``_unfused_indexer_sparse_attn_from_topk``) is
         # a debug fallback selected via ``apply_dsa_kernel_fusion=False``.
+        # the HF model config), threaded as constructor arguments like GLM-5's DSA.
         self.apply_dsa_kernel_fusion = apply_dsa_kernel_fusion
         self.dsa_indexer_loss_coeff = dsa_indexer_loss_coeff
         self.dsa_indexer_use_sparse_loss = dsa_indexer_use_sparse_loss
@@ -356,17 +455,17 @@ class CompressedSparseAttention(nn.Module):
             self.compress_ratio = config.compress_ratios[_cr_idx]
         else:
             self.compress_ratio = 0
-        self.wq_a = nn.Linear(config.hidden_size, config.q_lora_rank, bias=False)
+        self.wq_a = AccumulatingLinear(config.hidden_size, config.q_lora_rank, bias=False)
         self.q_norm = te.RMSNorm(config.q_lora_rank, eps=config.rms_norm_eps)
-        self.wq_b = nn.Linear(config.q_lora_rank, self.num_heads * self.head_dim, bias=False)
-        self.wkv = nn.Linear(config.hidden_size, self.head_dim, bias=False)
+        self.wq_b = AccumulatingLinear(config.q_lora_rank, self.num_heads * self.head_dim, bias=False)
+        self.wkv = AccumulatingLinear(config.hidden_size, self.head_dim, bias=False)
         self.kv_norm = te.RMSNorm(config.head_dim, eps=config.rms_norm_eps)
         self.wo_a = GroupedLinear(
             self.num_heads_per_group * self.head_dim,
             config.o_groups * config.o_lora_rank,
             config.o_groups,
         )
-        self.wo_b = nn.Linear(config.o_groups * config.o_lora_rank, config.hidden_size, bias=False)
+        self.wo_b = AccumulatingLinear(config.o_groups * config.o_lora_rank, config.hidden_size, bias=False)
         self.sinks = nn.Parameter(torch.zeros(self.num_heads))
         self.compressor = (
             CompressedSequenceCompressor(config, self.compress_ratio, self.head_dim)
@@ -378,6 +477,11 @@ class CompressedSparseAttention(nn.Module):
             if self.compress_ratio == 4
             else None
         )
+        # The indexer runs on detached inputs and only picks top-k, which is not
+        # differentiable, so its weights are trained by the indexer loss and by nothing else.
+        if self.indexer is not None and not self.dsa_indexer_loss_coeff:
+            for parameter in self.indexer.parameters():
+                parameter.requires_grad_(False)
 
     def forward(
         self,
@@ -413,9 +517,7 @@ class CompressedSparseAttention(nn.Module):
         )
         q_low = self.q_norm(self.wq_a(x))
         q = self.wq_b(q_low).view(batch, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-        q = q * torch.rsqrt(
-            q.float().pow(2).mean(dim=-1, keepdim=True) + self.config.rms_norm_eps
-        ).to(dtype=q.dtype)
+        q = _per_head_rms(q, self.config.rms_norm_eps)
         kv = self.kv_norm(self.wkv(x)).view(batch, seq_len, 1, self.head_dim).transpose(1, 2)
         q = apply_partial_rope(q, cos, sin, self.rope_head_dim)
         kv = apply_partial_rope(kv, cos, sin, self.rope_head_dim)
@@ -451,10 +553,12 @@ class CompressedSparseAttention(nn.Module):
         # removed: DSv4 sequence parallelism now goes exclusively through the THD
         # packed CP path (``packed_seq_params is not None`` above), and the only
         # supported BSHD routes are the CP=1 fused sparse kernels dispatched above.
+        # packed CP path (``packed_seq_params is not None`` above), and the only supported BSHD routes are the CP=1 fused sparse kernels dispatched above.
         raise NotImplementedError(
-            "DSv4 CSA BSHD path supports only the CP=1 fused sparse backends; pass "
-            "packed_seq_params for the THD context-parallel path. The dense BSHD "
-            "fallback was removed."
+            f"DSv4 CSA has no dense BSHD path: it supports the CP=1 fused sparse "
+            f"backends, or THD with packed_seq_params. This call had neither, with "
+            f"input {tuple(x.shape)}. Pack the batch (1-D values, or a single "
+            f"[1, S] row with cu_seqlens) so it takes the THD route."
         )
 
     def _project_context(
@@ -563,6 +667,7 @@ class CompressedSparseAttention(nn.Module):
         # multiple of ratio leaves the last query token(s) without a compressed key
         # block. Right-pad to a multiple of ratio (the causal tail attends only real
         # tokens and is sliced off the output) so seqlen_k * ratio == seqlen_q.
+        # so a seq_len that is not a multiple of ratio leaves the last query token(s) without a compressed key block.
         orig_seq_len = x.shape[1]
         ratio = self.compress_ratio
         pad = (-orig_seq_len) % ratio
@@ -700,15 +805,7 @@ class CompressedSparseAttention(nn.Module):
         global_start: int,
         rope_theta: float,
     ) -> torch.Tensor:
-        """Project the exchanged left-boundary hidden rows into MQA KV rows.
-
-        Faithful to the DSv4 hybrid-attention boundary-KV path: the boundary rows
-        sit immediately left of this rank's block, so they are KV-projected
-        (``wkv`` -> ``kv_norm``) and RoPE'd at their own within-sequence positions
-        (``global_start - d_window .. global_start - 1``) using lite's RoPE
-        convention. Returns ``(d_window, 1, 1, head_dim)`` matching Core's
-        ``boundary_kv.squeeze(-2).squeeze(1)`` contract in ``_forward_thd_cp``.
-        """
+        """Project the exchanged left-boundary hidden rows into MQA KV rows."""
         d_window = boundary_hidden.shape[0]
         bkv = self.kv_norm(self.wkv(boundary_hidden.reshape(d_window, -1)))  # (d_window, head_dim)
         b_pos = cp_utils._thd_cp_position_ids(cu_seqlens, int(global_start) - d_window, d_window)
@@ -731,13 +828,7 @@ class CompressedSparseAttention(nn.Module):
         position_ids: torch.Tensor,
         packed_seq_params: Any,
     ) -> torch.Tensor:
-        """Build THD-packed q/key/x/qr, exchange boundaries, and run CP attention.
-
-        ``x`` is ``[1, total, hidden]`` (batch-first, packed). Produces the
-        TE-THD-convention tensors consumed by :meth:`_forward_thd_cp`, then applies
-        the output projection (inverse RoPE + ``wo``) via :meth:`_project_context`.
-        Returns ``[1, total, hidden]`` for the SBHD shim.
-        """
+        """Build THD-packed q/key/x/qr, exchange boundaries, and run CP attention."""
         batch, seq_len, _ = x.shape
         if batch != 1:
             raise RuntimeError(
@@ -755,9 +846,10 @@ class CompressedSparseAttention(nn.Module):
         # within-sequence positions), not the raw position_ids tensor, so the
         # mapping is identical to the unsharded reference at cp_size == 1.
         del position_ids
-        local_pos = cp_utils._thd_cp_position_ids(cu_seqlens, global_start, seq_len).view(1, seq_len)
-        cos, sin = build_compressed_rope_cos_sin(
-            local_pos.long(),
+        # Every layer derives the same positions from the same cu_seqlens and rank
+        # offset; the fused kernels index the shared table themselves.
+        cos, sin = rope_table(
+            int(packed_seq_params.max_seqlen_q),
             self.rope_head_dim,
             attention_rope_theta,
             config=self.config,
@@ -766,17 +858,29 @@ class CompressedSparseAttention(nn.Module):
             dtype=x.dtype,
         )
         q_low = self.q_norm(self.wq_a(x))
-        q = self.wq_b(q_low).view(batch, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-        q = q * torch.rsqrt(
-            q.float().pow(2).mean(dim=-1, keepdim=True) + self.config.rms_norm_eps
-        ).to(dtype=q.dtype)
-        kv = self.kv_norm(self.wkv(x)).view(batch, seq_len, 1, self.head_dim).transpose(1, 2)
-        q = apply_partial_rope(q, cos, sin, self.rope_head_dim)
-        kv = apply_partial_rope(kv, cos, sin, self.rope_head_dim)
+        # Build q/kv directly in the SBHD/THD layout the TE kernels consume, rather
+        # than transposing into [b, h, s, d] for RoPE and transposing back.
+        q = self.wq_b(q_low).view(batch, seq_len, self.num_heads, self.head_dim)
+        q = _per_head_rms(q, self.config.rms_norm_eps)
+        kv = self.kv_norm(self.wkv(x)).view(batch, seq_len, 1, self.head_dim)
 
         # TE-THD convention: query (total, np, hn); key (total, 1, 1, hn); x/qr (total, 1, *).
-        query_thd = q.squeeze(0).transpose(0, 1).contiguous()  # (total, np, hn)
-        key_thd = kv.permute(2, 0, 1, 3).contiguous()  # (total, 1, 1, hn)
+        query_thd = q.squeeze(0)  # (total, np, hn) -- already contiguous
+        key_thd = kv.squeeze(0).unsqueeze(1)  # (total, 1, 1, hn)
+        # Core's fused MLA RoPE, adjudicated against the expression it replaces on this exact THD path: full-length cos/sin (``cat(freqs, freqs)``,
+        # which is what the builders above already return), rope on the trailing ``rope_head_dim`` channels, positions restarting per packed sequence.
+        cos_thd = cos.squeeze(0)
+        sin_thd = sin.squeeze(0)
+        nope_dim = self.head_dim - self.rope_head_dim
+        # DS4 uses contiguous CP shards. The generic Core helper interprets
+        # cp_rank/cp_size as a zigzag shard, so pass the explicit global row
+        # offset through the contiguous-THD helper instead.
+        query_thd = cp_utils.apply_thd_cp_local_rope_fused(
+            query_thd, cos_thd, sin_thd, nope_dim, self.rope_head_dim, cu_seqlens, global_start
+        )
+        key_thd = cp_utils.apply_thd_cp_local_rope_fused(
+            key_thd, cos_thd, sin_thd, nope_dim, self.rope_head_dim, cu_seqlens, global_start
+        )
         x_thd = x.transpose(0, 1).contiguous()  # (total, 1, hidden)
         qr_thd = q_low.transpose(0, 1).contiguous()  # (total, 1, q_lora_rank)
 
@@ -802,16 +906,22 @@ class CompressedSparseAttention(nn.Module):
         context = self._forward_thd_cp(
             query_thd, key_thd, x_thd, qr_thd, boundary_hidden, boundary_kv, packed_seq_params
         )
-        # context: (total, 1, np * hn). Reshape to (1, np, total, hn) for the shared
-        # output projection (inverse RoPE + wo), then return (1, total, hidden).
-        context = (
-            context.squeeze(1)
-            .view(seq_len, self.num_heads, self.head_dim)
-            .permute(1, 0, 2)
-            .unsqueeze(0)
-            .contiguous()
+        # context: (total, 1, np * hn).
+        context = context.squeeze(1).view(seq_len, self.num_heads, self.head_dim)
+        context = cp_utils.apply_thd_cp_local_rope_fused(
+            context,
+            cos_thd,
+            sin_thd,
+            nope_dim,
+            self.rope_head_dim,
+            cu_seqlens,
+            global_start,
+            inverse=True,
         )
-        return self._project_context(context, cos, sin)
+        grouped = context.view(
+            1, seq_len, self.config.o_groups, self.num_heads_per_group * self.head_dim
+        )
+        return self.wo_b(self.wo_a(grouped).flatten(2))
 
     def _forward_thd_cp(
         self,
@@ -823,16 +933,7 @@ class CompressedSparseAttention(nn.Module):
         boundary_kv: torch.Tensor | None,
         packed_seq_params: Any,
     ) -> torch.Tensor:
-        """THD-packed context-parallel branch (faithful port of Core
-        ``CompressedSparseAttention._forward_thd_cp``).
-
-        Builds this rank's local KV context from boundary rows and fixed-capacity
-        compressed KV, then runs sparse attention with an optional indexer loss.
-        RoPE is applied to the indexer query with lite's convention (deviating from
-        Core's ``cp_utils.apply_thd_cp_local_rope_*``) so the CP path stays
-        identical to lite's BSHD path; ``apply_dsa_kernel_fusion`` gates the
-        fused vs. differentiable-unfused kernels exactly as Core does.
-        """
+        """THD-packed context-parallel branch (faithful port of Core ``CompressedSparseAttention._forward_thd_cp``)."""
         cp_group = self.ps.cp_group
         cp_size = self.ps.cp_size
         cp_rank = self.ps.cp_rank
@@ -866,26 +967,20 @@ class CompressedSparseAttention(nn.Module):
         calculate_per_token_loss = self.calculate_per_token_loss
 
         if self.compressor is not None and ratio > 1:
-            compressed_lens = torch.div(
-                cu_seqlens[1:] - cu_seqlens[:-1], ratio, rounding_mode="floor"
+            (
+                hidden_compact,
+                compressed_group_ids,
+                compressed_position_ids,
+                _local_cu_seqlens,
+                _local_cu_seqlens_compressed,
+                cu_seqlens_compressed,
+                seq_to_rank_row,
+            ) = cp_utils.prepare_cp_compressor_input(
+                x, boundary_hidden, cu_seqlens, global_start, cp_size, ratio
             )
-            cu_seqlens_compressed = torch.cat(
-                (
-                    torch.zeros_like(cu_seqlens[:1]),
-                    torch.cumsum(compressed_lens, dim=0, dtype=torch.int32),
-                )
-            )
-            hidden_compact, compressed_group_ids, seq_to_rank_row = (
-                cp_utils.prepare_cp_compressor_input(
-                    x,
-                    boundary_hidden,
-                    cu_seqlens,
-                    cu_seqlens_compressed,
-                    global_start,
-                    cp_size,
-                    ratio,
-                )
-            )
+            # TODO(lite): Thread the local prefixes through once Lite adopts Core's
+            # fused-compressor dispatch. Lite currently owns a separate eager
+            # ``_forward_thd`` implementation, so passing them alone has no effect.
 
             if indexer is not None:
                 indexer_x, indexer_qr = x.detach(), qr.detach()
@@ -896,15 +991,23 @@ class CompressedSparseAttention(nn.Module):
                 q_indexer_cp = indexer.wq_b(indexer_qr.squeeze(1)).view(
                     l_local, indexer.index_n_heads, indexer.index_head_dim
                 )
-                idx_pos = cp_utils._thd_cp_position_ids(cu_seqlens, global_start, l_local)
-                idx_cos, idx_sin = build_compressed_rope_cos_sin(
-                    idx_pos.view(1, l_local).long(),
-                    indexer.rope_head_dim,
-                    self.config.compress_rope_theta,
-                    config=self.config,
-                    use_yarn=ratio > 1,
-                    device=q_indexer_cp.device,
-                    dtype=q_indexer_cp.dtype,
+                # ``apply_partial_rope`` below wants per-row tables, so this is
+                # the one caller that gathers rather than handing off cu_seqlens.
+                # apply_partial_rope below wants per-row tables, so this is the
+                # one caller that gathers rather than handing off cu_seqlens.
+                idx_cos, idx_sin = rope_rows_for(
+                    *rope_table(
+                        int(packed_seq_params.max_seqlen_q),
+                        indexer.rope_head_dim,
+                        self.config.compress_rope_theta,
+                        config=self.config,
+                        use_yarn=ratio > 1,
+                        device=q_indexer_cp.device,
+                        dtype=q_indexer_cp.dtype,
+                    ),
+                    cu_seqlens,
+                    global_start,
+                    l_local,
                 )
                 # lite RoPE wants the sequence axis at dim -2: (1, n_heads, l_local, hd).
                 q_rope = q_indexer_cp.permute(1, 0, 2).unsqueeze(0)
@@ -920,6 +1023,7 @@ class CompressedSparseAttention(nn.Module):
                     cu_seqlens,
                     max_seqlen_q=max_seqlen_q,
                     compressed_group_ids=compressed_group_ids,
+                    compressed_position_ids=compressed_position_ids,
                 )
                 k_indexer_rank_major = gather_from_sequence_parallel_region(
                     indexer_compressed_local.squeeze(1), group=cp_group
@@ -927,7 +1031,9 @@ class CompressedSparseAttention(nn.Module):
                 k_indexer_seq_major = torch.index_select(
                     k_indexer_rank_major, 0, seq_to_rank_row.clamp_min(0)
                 )
-                compressed_topk, indexer_layout = cp_utils.compute_cp_indexer_topk(
+                # The third value is the compact top-k softmax, returned only when
+                # ``return_softmax=True``; lite does not ask for it.
+                compressed_topk, indexer_layout, _ = cp_utils.compute_cp_indexer_topk(
                     q_indexer_cp,
                     weights_indexer_cp,
                     k_indexer_seq_major,
@@ -946,6 +1052,7 @@ class CompressedSparseAttention(nn.Module):
                 cu_seqlens,
                 max_seqlen_q=max_seqlen_q,
                 compressed_group_ids=compressed_group_ids,
+                compressed_position_ids=compressed_position_ids,
             )
             compressed_kv_rank_major = gather_from_sequence_parallel_region(
                 compressed_kv_local.squeeze(1), group=cp_group
@@ -960,8 +1067,8 @@ class CompressedSparseAttention(nn.Module):
             if compressed_topk is not None
             else (max_seqlen_q // ratio if ratio > 1 else 0)
         )
-        topk_idxs, topk_length, indexer_topk_rank_major = (
-            csa_cp_layout_kernels.build_attention_indices(
+        topk_idxs, topk_length, indexer_topk_rank_major, _ = (
+            thd_layout_kernels.build_attention_indices(
                 cu_seqlens,
                 global_start,
                 l_local,
@@ -973,6 +1080,7 @@ class CompressedSparseAttention(nn.Module):
                 cu_seqlens_compressed=cu_seqlens_compressed,
                 seq_to_rank_row=seq_to_rank_row,
                 for_indexer_loss=use_indexer_loss,
+                compressed_rows=compressed_kv_rank_major.shape[0],
             )
         )
 

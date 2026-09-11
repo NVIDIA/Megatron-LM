@@ -244,7 +244,10 @@ def _sanitized_environment(environ: dict[str, str] | None = None) -> dict[str, s
             base.pop(key)
     base.pop("PYTEST_ADDOPTS", None)
     base.pop("PYTEST_PLUGINS", None)
-    base["PYTHONPATH"] = os.pathsep.join((str(REPO_ROOT), str(LITE_ROOT)))
+    # LITE_ROOT first: the worker is launched as a script, so sys.path[0] is the
+    # harness directory and cwd never participates. Megatron-LM's repository root
+    # also ships an `examples/` package, and it would otherwise shadow lite's.
+    base["PYTHONPATH"] = os.pathsep.join((str(LITE_ROOT), str(REPO_ROOT)))
     base["PYTHONDONTWRITEBYTECODE"] = "1"
     base["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
     base["PYTHONHASHSEED"] = "0"

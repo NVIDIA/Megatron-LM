@@ -1,13 +1,19 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import gc
+import logging
 import os
 import sys
+from contextlib import nullcontext
+from types import SimpleNamespace
 
 import pytest
 import torch
 from transformer_engine.pytorch.fp8 import check_fp8_support
 
+import megatron.core.transformer.cuda_graphs as cuda_graphs_module
+import megatron.core.transformer.moe.paged_stash as paged_stash_module
+import megatron.core.transformer.transformer_config as transformer_config_module
 from megatron.core.enums import ModelType
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_decoder_block_spec,
@@ -30,6 +36,7 @@ from megatron.core.tensor_parallel.random import (
     initialize_rng_tracker,
     model_parallel_cuda_manual_seed,
 )
+from megatron.core.transformer.cuda_graph_config import validate_moe_cuda_graph_support
 from megatron.core.transformer.cuda_graphs import (
     CudaGraphManager,
     TECudaGraphHelper,
@@ -61,6 +68,21 @@ fp8_available, _ = check_fp8_support()
 
 def _base_cuda_graph_config(**kwargs) -> TransformerConfig:
     return TransformerConfig(num_layers=2, hidden_size=64, num_attention_heads=4, **kwargs)
+
+
+def _te_whole_moe_paged_stash_config(**overrides) -> TransformerConfig:
+    kwargs = {
+        "cuda_graph_impl": "transformer_engine",
+        "cuda_graph_modules": [CudaGraphModule.moe],
+        "num_moe_experts": 4,
+        "moe_token_dispatcher_type": "flex",
+        "moe_flex_dispatcher_backend": "hybridep",
+        "moe_expert_rank_capacity_factor": 1.2,
+        "moe_paged_stash": True,
+        "use_transformer_engine_op_fuser": True,
+    }
+    kwargs.update(overrides)
+    return _base_cuda_graph_config(**kwargs)
 
 
 def _validated_cuda_graph_cli_args(monkeypatch, cli_args=None, **overrides):
@@ -139,6 +161,66 @@ class TestCudaGraphConfigAndArguments:
                 offload_modules=['expert_fc1'],
             )
 
+    def test_te_whole_layer_graph_with_activation_offload_warns(self):
+        with pytest.warns(UserWarning, match="does not currently install.*offload event boundary"):
+            cfg = _base_cuda_graph_config(
+                cuda_graph_impl='transformer_engine',
+                cuda_graph_modules=[],
+                fine_grained_activation_offloading=True,
+                offload_modules=['core_attn'],
+            )
+
+        assert cfg.cuda_graph_modules == []
+
+    @pytest.mark.parametrize(
+        ('expert_module', 'use_transformer_engine_op_fuser'),
+        [('expert_fc1', False), ('moe_act', False), ('fused_group_mlp', True)],
+    )
+    def test_hybrid_mhc_delayed_expert_offload_warns(
+        self, expert_module, use_transformer_engine_op_fuser
+    ):
+        with pytest.warns(
+            UserWarning, match="HybridModel mHC wrappers do not currently support"
+        ) as warning_records:
+            cfg = _base_cuda_graph_config(
+                cuda_graph_impl='transformer_engine',
+                cuda_graph_modules=[CudaGraphModule.attn, CudaGraphModule.moe_router],
+                fine_grained_activation_offloading=True,
+                offload_modules=[expert_module],
+                delay_offload_until_cuda_graph=True,
+                is_hybrid_model=True,
+                enable_hyper_connections=True,
+                num_residual_streams=2,
+                num_moe_experts=4,
+                use_transformer_engine_op_fuser=use_transformer_engine_op_fuser,
+            )
+
+        assert cfg.delay_offload_until_cuda_graph
+        assert any(expert_module in str(record.message) for record in warning_records)
+
+    def test_delayed_expert_offload_logs_about_final_queue_drain(self, monkeypatch):
+        log_records = []
+        monkeypatch.setattr(
+            transformer_config_module,
+            'log_single_rank',
+            lambda logger, level, message: log_records.append((logger, level, message)),
+        )
+
+        cfg = _base_cuda_graph_config(
+            cuda_graph_impl='transformer_engine',
+            cuda_graph_modules=[CudaGraphModule.moe_router],
+            fine_grained_activation_offloading=True,
+            offload_modules=['expert_fc1'],
+            delay_offload_until_cuda_graph=True,
+            num_moe_experts=4,
+        )
+
+        assert cfg.delay_offload_until_cuda_graph
+        assert len(log_records) == 1
+        assert log_records[0][0] is transformer_config_module.logger
+        assert log_records[0][1] == logging.WARNING
+        assert "final eager expert group can remain queued" in log_records[0][2]
+
     def test_local_impl_rejects_moe_router_graph_with_mlp_norm_offload(self):
         with pytest.raises(
             AssertionError,
@@ -154,6 +236,103 @@ class TestCudaGraphConfigAndArguments:
                 offload_modules=['mlp_norm'],
                 num_moe_experts=4,
             )
+
+    def test_local_explicit_moe_graph_rejects_dropless_moe(self):
+        with pytest.raises(
+            AssertionError, match="moe cuda graph is only supported with drop-padding MoE"
+        ):
+            _base_cuda_graph_config(
+                cuda_graph_impl='local', cuda_graph_modules=[CudaGraphModule.moe], num_moe_experts=4
+            )
+
+    def test_local_inference_full_layer_graph_allows_dropless_moe(self):
+        cfg = _base_cuda_graph_config(
+            cuda_graph_impl='local',
+            cuda_graph_modules=[],
+            inference_cuda_graph_scope=InferenceCudaGraphScope.block,
+            num_moe_experts=4,
+        )
+
+        assert cfg.inference_cuda_graph_scope == InferenceCudaGraphScope.block
+
+    @pytest.mark.parametrize(
+        "cuda_graph_modules", [[CudaGraphModule.moe], []], ids=["explicit-moe", "full-layer"]
+    )
+    def test_te_whole_moe_graph_allows_sync_free_hybridep_paged_stash(
+        self, monkeypatch, cuda_graph_modules
+    ):
+        monkeypatch.setattr(transformer_config_module, "is_te_min_version", lambda _version: True)
+        cfg = _te_whole_moe_paged_stash_config(
+            cuda_graph_modules=cuda_graph_modules, cuda_graph_warmup_steps=2
+        )
+        validate_moe_cuda_graph_support(cfg)
+
+        assert cfg.cuda_graph_modules == cuda_graph_modules
+
+    @pytest.mark.parametrize(
+        "cuda_graph_modules", [[CudaGraphModule.moe], []], ids=["explicit-moe", "full-layer"]
+    )
+    def test_te_whole_moe_paged_stash_rejects_dynamic_microbatches(
+        self, monkeypatch, cuda_graph_modules
+    ):
+        monkeypatch.setattr(transformer_config_module, "is_te_min_version", lambda _version: True)
+        with pytest.raises(AssertionError, match="require a fixed runtime microbatch schedule"):
+            _te_whole_moe_paged_stash_config(
+                cuda_graph_modules=cuda_graph_modules, cuda_graph_dynamic_microbatches=True
+            )
+
+    @pytest.mark.parametrize(
+        "cuda_graph_modules", [[CudaGraphModule.moe], []], ids=["explicit-moe", "full-layer"]
+    )
+    @pytest.mark.parametrize("warmup_steps", [0, 1])
+    def test_te_whole_moe_paged_stash_requires_two_warmup_steps(
+        self, monkeypatch, cuda_graph_modules, warmup_steps
+    ):
+        monkeypatch.setattr(transformer_config_module, "is_te_min_version", lambda _version: True)
+        with pytest.raises(AssertionError, match="require at least 2 cuda_graph_warmup_steps"):
+            _te_whole_moe_paged_stash_config(
+                cuda_graph_modules=cuda_graph_modules, cuda_graph_warmup_steps=warmup_steps
+            )
+
+    @pytest.mark.parametrize(
+        "cuda_graph_modules", [[CudaGraphModule.moe], []], ids=["explicit-moe", "full-layer"]
+    )
+    def test_te_whole_moe_paged_stash_requires_minimum_te_version(
+        self, monkeypatch, cuda_graph_modules
+    ):
+        monkeypatch.setattr(transformer_config_module, "is_te_min_version", lambda _version: False)
+
+        with pytest.raises(ValueError, match=r"Transformer Engine >= 2\.19\.0"):
+            _te_whole_moe_paged_stash_config(
+                cuda_graph_modules=cuda_graph_modules, cuda_graph_warmup_steps=2
+            )
+
+    def test_te_moe_router_paged_stash_still_allows_dynamic_microbatches(self):
+        cfg = _te_whole_moe_paged_stash_config(
+            cuda_graph_modules=[CudaGraphModule.moe_router], cuda_graph_dynamic_microbatches=True
+        )
+
+        assert cfg.cuda_graph_dynamic_microbatches
+
+    @pytest.mark.parametrize(
+        "cuda_graph_modules", [[CudaGraphModule.moe], []], ids=["explicit-moe", "full-layer"]
+    )
+    def test_te_whole_moe_graph_rejects_sync_free_hybridep_without_paged_stash(
+        self, cuda_graph_modules
+    ):
+        with pytest.raises(
+            AssertionError, match="sync-free HybridEP with rank capacity and paged stash"
+        ):
+            cfg = _base_cuda_graph_config(
+                cuda_graph_impl="transformer_engine",
+                cuda_graph_modules=cuda_graph_modules,
+                num_moe_experts=4,
+                moe_token_dispatcher_type="flex",
+                moe_flex_dispatcher_backend="hybridep",
+                moe_expert_rank_capacity_factor=1.2,
+                use_transformer_engine_op_fuser=True,
+            )
+            validate_moe_cuda_graph_support(cfg)
 
     def test_full_iteration_impl_requires_empty_scope(self):
         with pytest.raises(
@@ -911,6 +1090,576 @@ class TestParallelHybridBlockCudagraphs:
         )
 
 
+class TestHybridTECudaGraphDiscovery:
+    @staticmethod
+    def _bare_hybrid_wrapper(*, offload_in_graph=None):
+        wrapper = HyperConnectionHybridLayer.__new__(HyperConnectionHybridLayer)
+        torch.nn.Module.__init__(wrapper)
+        # Intentionally minimal: individual CPU mocks provide only the state they exercise.
+        wrapper.config = SimpleNamespace(
+            cuda_graph_modules=[CudaGraphModule.attn], fine_grained_activation_offloading=True
+        )
+        object.__setattr__(wrapper, '_offload_module_in_cuda_graph_cached', None)
+        if offload_in_graph is not None:
+            object.__setattr__(
+                wrapper, '_compute_offload_module_in_cuda_graph', lambda: offload_in_graph
+            )
+        return wrapper
+
+    @staticmethod
+    def _bare_transformer_inner(*, has_attention, offload_core_attn, is_moe=False):
+        from megatron.core.transformer.identity_op import IdentityOp
+
+        inner = TransformerLayer.__new__(TransformerLayer)
+        torch.nn.Module.__init__(inner)
+        inner.self_attention = torch.nn.Linear(2, 2) if has_attention else IdentityOp()
+        inner.cross_attention = IdentityOp()
+        inner.mlp = IdentityOp()
+        inner.offload_attn_norm = False
+        inner.offload_qkv_linear = False
+        inner.offload_core_attn = offload_core_attn
+        inner.offload_attn_proj = False
+        inner.offload_mlp_norm = False
+        inner.is_moe_layer = is_moe
+        inner.offload_module_in_cuda_graph = offload_core_attn
+        inner.config = SimpleNamespace(
+            cuda_graph_modules=[CudaGraphModule.attn], fine_grained_activation_offloading=True
+        )
+        return inner
+
+    @staticmethod
+    def _recording_offload_interface(calls):
+        class RecordingOffloadInterface:
+            @staticmethod
+            def backward_record(hidden_states):
+                calls.append('backward_record')
+                return hidden_states + 1
+
+            @staticmethod
+            def forward_record():
+                calls.append('forward_record')
+
+        return RecordingOffloadInterface
+
+    @staticmethod
+    def _rotary_sample_helper(
+        monkeypatch,
+        *,
+        layer_kind,
+        position_embedding_type,
+        has_attention=True,
+        multi_latent_attention=False,
+        is_thd=False,
+        context_parallel_size=1,
+        cuda_graph_modules=None,
+        num_layers=1,
+    ):
+        """Build a CPU-only TE sample-input helper for rotary contract tests."""
+        from megatron.core.transformer.identity_op import IdentityOp
+
+        if cuda_graph_modules is None:
+            cuda_graph_modules = [CudaGraphModule.attn]
+
+        layers = []
+        for _ in range(num_layers):
+            inner = TransformerLayer.__new__(TransformerLayer)
+            torch.nn.Module.__init__(inner)
+            inner.self_attention = torch.nn.Linear(2, 2) if has_attention else IdentityOp()
+            inner.cross_attention = IdentityOp()
+
+            if layer_kind == 'hybrid':
+                layer = HyperConnectionHybridLayer.__new__(HyperConnectionHybridLayer)
+                torch.nn.Module.__init__(layer)
+                layer.inner_layer = inner
+            else:
+                assert layer_kind == 'transformer'
+                layer = inner
+
+            def get_layer_static_inputs(_seq_length, _micro_batch_size):
+                static_inputs = {'hidden_states': torch.ones(8, 1, 8, requires_grad=True)}
+                if is_thd:
+                    static_inputs['cu_seqlens_q'] = torch.tensor([0, 8], dtype=torch.int32)
+                return static_inputs
+
+            object.__setattr__(layer, 'get_layer_static_inputs', get_layer_static_inputs)
+            layers.append(layer)
+
+        rotary_pos_emb = torch.ones(8, 1, 1, 2)
+
+        class RotaryEmbedding:
+            @staticmethod
+            def get_rotary_seq_len(*_args):
+                return 8
+
+            @staticmethod
+            def __call__(_seq_length):
+                return rotary_pos_emb
+
+        chunk = SimpleNamespace(
+            decoder=SimpleNamespace(layers=layers),
+            position_embedding_type=position_embedding_type,
+            rotary_pos_emb=RotaryEmbedding(),
+        )
+        helper = object.__new__(TECudaGraphHelper)
+        helper.config = SimpleNamespace(
+            multi_latent_attention=multi_latent_attention,
+            cuda_graph_modules=cuda_graph_modules,
+            context_parallel_size=context_parallel_size,
+        )
+        helper.seq_length = 8
+        helper.micro_batch_size = 1
+        helper.num_model_chunks = 1
+        helper.num_microbatches = 1
+        helper.flattened_callables = layers
+        helper.num_layers_per_chunk = [len(layers)]
+        helper.callables_per_chunk = [layers]
+        helper.chunks_with_decoder = [chunk]
+        helper.tp_group = None
+        helper.dp_cp_group = None
+        helper._needs_full_local_padding_mask = lambda *_args: False
+        helper._uses_mhc_direct_write_arena = lambda: False
+        monkeypatch.setattr(cuda_graphs_module, 'is_te_min_version', lambda _version: True)
+        return helper, rotary_pos_emb
+
+    @pytest.mark.parametrize(
+        ('has_attention', 'position_embedding_type', 'multi_latent_attention', 'expects_rotary'),
+        [
+            (True, 'rope', False, True),
+            (False, 'rope', False, False),
+            (True, 'learned_absolute', False, False),
+            (True, 'rope', True, False),
+        ],
+    )
+    def test_hybrid_wrapper_sample_inputs_include_rotary_embeddings(
+        self,
+        monkeypatch,
+        has_attention,
+        position_embedding_type,
+        multi_latent_attention,
+        expects_rotary,
+    ):
+        """The TE sample signature must match the wrapped attention replay signature."""
+        helper, rotary_pos_emb = self._rotary_sample_helper(
+            monkeypatch,
+            layer_kind='hybrid',
+            position_embedding_type=position_embedding_type,
+            has_attention=has_attention,
+            multi_latent_attention=multi_latent_attention,
+        )
+
+        _sample_args, sample_kwargs = helper._get_sample_arguments([1, -1])
+
+        if expects_rotary:
+            assert sample_kwargs[0]['rotary_pos_emb'] is rotary_pos_emb
+        else:
+            assert 'rotary_pos_emb' not in sample_kwargs[0]
+
+    @pytest.mark.parametrize(
+        (
+            'layer_kind',
+            'position_embedding_type',
+            'has_attention',
+            'multi_latent_attention',
+            'is_thd',
+            'context_parallel_size',
+            'cuda_graph_modules',
+            'expected_fragment',
+        ),
+        [
+            ('transformer', 'yarn', True, False, False, 1, [CudaGraphModule.attn], 'Yarn'),
+            ('hybrid', 'yarn', True, False, False, 1, [CudaGraphModule.attn], 'Yarn'),
+            ('transformer', 'mrope', True, False, False, 1, [CudaGraphModule.attn], 'mRoPE'),
+            ('transformer', 'rope', True, False, True, 2, [CudaGraphModule.attn], 'THD'),
+            ('hybrid', 'rope', True, False, True, 2, [CudaGraphModule.attn], 'THD'),
+            ('transformer', 'yarn', True, False, False, 1, [], 'Yarn'),
+            ('hybrid', 'rope', True, False, True, 1, [CudaGraphModule.attn], None),
+            ('transformer', 'rope', True, False, False, 2, [CudaGraphModule.attn], None),
+            ('transformer', 'yarn', True, True, True, 2, [CudaGraphModule.attn], None),
+            ('hybrid', 'rope', True, True, True, 2, [CudaGraphModule.attn], None),
+            ('hybrid', 'yarn', False, False, True, 2, [CudaGraphModule.attn], None),
+            ('transformer', 'yarn', True, False, True, 2, [CudaGraphModule.mlp], None),
+        ],
+    )
+    def test_rotary_sample_contract_warning_matrix(
+        self,
+        monkeypatch,
+        layer_kind,
+        position_embedding_type,
+        has_attention,
+        multi_latent_attention,
+        is_thd,
+        context_parallel_size,
+        cuda_graph_modules,
+        expected_fragment,
+    ):
+        records = []
+        monkeypatch.setattr(
+            cuda_graphs_module,
+            'log_on_each_pipeline_stage',
+            lambda **kwargs: records.append((kwargs['level'], kwargs['msg'])),
+        )
+        helper, _rotary_pos_emb = self._rotary_sample_helper(
+            monkeypatch,
+            layer_kind=layer_kind,
+            position_embedding_type=position_embedding_type,
+            has_attention=has_attention,
+            multi_latent_attention=multi_latent_attention,
+            is_thd=is_thd,
+            context_parallel_size=context_parallel_size,
+            cuda_graph_modules=cuda_graph_modules,
+        )
+
+        helper._get_sample_arguments([1, -1])
+
+        if expected_fragment is None:
+            assert records == []
+        else:
+            assert len(records) == 1
+            assert records[0][0] == logging.WARNING
+            assert expected_fragment in records[0][1]
+            assert f"position_embedding_type={position_embedding_type!r}" in records[0][1]
+            assert f'input_format={"THD" if is_thd else "SBHD"}' in records[0][1]
+            assert f'context_parallel_size={context_parallel_size}' in records[0][1]
+            assert 'numerical results are not reliable' in records[0][1]
+            if position_embedding_type == 'mrope':
+                assert 'affecting GPTModel.' in records[0][1]
+                assert 'GPTModel and HybridModel' not in records[0][1]
+
+    def test_rotary_sample_contract_warning_is_deduplicated_for_yarn_thd_cp2(self, monkeypatch):
+        records = []
+        monkeypatch.setattr(
+            cuda_graphs_module,
+            'log_on_each_pipeline_stage',
+            lambda **kwargs: records.append((kwargs['level'], kwargs['msg'])),
+        )
+        helper, _rotary_pos_emb = self._rotary_sample_helper(
+            monkeypatch,
+            layer_kind='hybrid',
+            position_embedding_type='yarn',
+            is_thd=True,
+            context_parallel_size=2,
+            num_layers=2,
+        )
+
+        helper._get_sample_arguments([1, -1])
+
+        assert len(records) == 1
+        assert records[0][0] == logging.WARNING
+        assert "position_embedding_type='yarn'" in records[0][1]
+        assert 'input_format=THD' in records[0][1]
+        assert 'context_parallel_size=2' in records[0][1]
+
+    def test_hybrid_mtp_layers_are_flattened_and_adjacent_layers_are_grouped(self, monkeypatch):
+        from megatron.core.transformer import cuda_graphs
+
+        class FakeGraphLayer(torch.nn.Module):
+            def __init__(self, group_with_next=False, graphable=True):
+                super().__init__()
+                self.group_with_next = group_with_next
+                self.graphable = graphable
+                self.group_tail = None
+
+            def _can_group_te_cuda_graph_with(self, next_layer):
+                return self.group_with_next and next_layer.graphable
+
+            def _set_te_cuda_graph_group_tail(self, next_layer):
+                self.group_tail = next_layer
+
+        head = FakeGraphLayer(group_with_next=True)
+        tail = FakeGraphLayer()
+        eager = FakeGraphLayer(graphable=False)
+        mtp_stack = HybridStack.__new__(HybridStack)
+        torch.nn.Module.__init__(mtp_stack)
+        mtp_stack.layers = torch.nn.ModuleList([head, tail, eager])
+
+        monkeypatch.setattr(
+            cuda_graphs, '_layer_is_graphable', lambda layer, config: layer.graphable
+        )
+        callables = cuda_graphs._get_mtp_te_callables(mtp_stack, object())
+
+        assert callables == [head]
+        assert head.group_tail is tail
+
+        gpt_mtp_layer = FakeGraphLayer()
+        assert cuda_graphs._get_mtp_te_callables(gpt_mtp_layer, object()) == [gpt_mtp_layer]
+
+        class Holder:
+            pass
+
+        mtp_layer = Holder()
+        mtp_layer.mtp_model_layer = mtp_stack
+        chunk = Holder()
+        chunk.mtp = Holder()
+        chunk.mtp.layers = [mtp_layer]
+        assert cuda_graphs._is_mtp_te_callable(head, chunk)
+        assert cuda_graphs._is_mtp_te_callable(tail, chunk)
+        assert not cuda_graphs._is_mtp_te_callable(eager, Holder())
+
+    def test_capture_group_tail_does_not_change_module_registration(self):
+        from megatron.core.transformer.identity_op import IdentityOp
+
+        class Config:
+            recompute_granularity = None
+            recompute_modules = []
+            fp8 = False
+            first_last_layers_bf16 = False
+
+        inner = TransformerLayer.__new__(TransformerLayer)
+        torch.nn.Module.__init__(inner)
+        inner.self_attention = torch.nn.Linear(2, 2)
+        inner.cross_attention = IdentityOp()
+        inner.mlp = IdentityOp()
+
+        head = HyperConnectionHybridLayer.__new__(HyperConnectionHybridLayer)
+        torch.nn.Module.__init__(head)
+        head.config = Config()
+        head.inner_layer = inner
+
+        tail = HyperConnectionHybridLayer.__new__(HyperConnectionHybridLayer)
+        torch.nn.Module.__init__(tail)
+        tail.capture_weight = torch.nn.Parameter(torch.ones(1))
+        object.__setattr__(tail, '_inner_is_partial_moe_capture', lambda: True)
+        object.__setattr__(tail, '_get_submodules_under_cudagraphs', lambda: [tail])
+
+        state_dict_keys = tuple(head.state_dict())
+        head._set_te_cuda_graph_group_tail(tail)
+
+        assert head._get_te_cuda_graph_group_tail() is tail
+        assert '_te_cuda_graph_group_tail' not in head._modules
+        assert tuple(head.state_dict()) == state_dict_keys
+        assert any(param is tail.capture_weight for param in head.parameters())
+
+        head.cuda_graphs = [object()]
+        head.train()
+        assert head._get_active_te_cuda_graph_group_tail() is tail
+        head.eval()
+        assert head._get_active_te_cuda_graph_group_tail() is None
+
+    def test_capture_group_does_not_cross_first_last_bf16_boundary(self):
+        from megatron.core.transformer.identity_op import IdentityOp
+
+        class Config:
+            recompute_granularity = None
+            recompute_modules = []
+            fp8 = True
+            first_last_layers_bf16 = True
+            num_layers_at_start_in_bf16 = 1
+            num_layers_at_end_in_bf16 = 1
+            num_layers = 4
+
+        inner = TransformerLayer.__new__(TransformerLayer)
+        torch.nn.Module.__init__(inner)
+        inner.self_attention = torch.nn.Linear(2, 2)
+        inner.cross_attention = IdentityOp()
+        inner.mlp = IdentityOp()
+        inner.is_mtp_layer = False
+
+        head = HyperConnectionHybridLayer.__new__(HyperConnectionHybridLayer)
+        torch.nn.Module.__init__(head)
+        head.config = Config()
+        head.inner_layer = inner
+
+        tail = HyperConnectionHybridLayer.__new__(HyperConnectionHybridLayer)
+        torch.nn.Module.__init__(tail)
+        object.__setattr__(tail, '_inner_is_partial_moe_capture', lambda: True)
+
+        head.layer_number, tail.layer_number = 1, 2
+        assert not head._can_group_te_cuda_graph_with(tail)
+
+        head.layer_number, tail.layer_number = 2, 3
+        assert head._can_group_te_cuda_graph_with(tail)
+
+        head.layer_number, tail.layer_number = 3, 4
+        assert not head._can_group_te_cuda_graph_with(tail)
+
+        inner.is_mtp_layer = True
+        head.layer_number, tail.layer_number = 1, 2
+        assert head._can_group_te_cuda_graph_with(tail)
+
+    @pytest.mark.parametrize('offload_in_graph', [False, True])
+    def test_hybrid_offload_graph_replay_args_include_te_stream_and_event(
+        self, monkeypatch, offload_in_graph
+    ):
+        from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+            FineGrainedActivationOffloadingInterface,
+        )
+
+        wrapper = self._bare_hybrid_wrapper(offload_in_graph=offload_in_graph)
+        graph_stream = object()
+        graph_event = object()
+        monkeypatch.setattr(
+            FineGrainedActivationOffloadingInterface, 'cuda_graph_stream', lambda: graph_stream
+        )
+        monkeypatch.setattr(
+            FineGrainedActivationOffloadingInterface, 'cuda_graph_event', lambda: graph_event
+        )
+
+        cudagraph_args, cudagraph_kwargs = wrapper._get_te_cuda_graph_replay_args(
+            torch.ones(2, 1, 4)
+        )
+
+        assert len(cudagraph_args) == 1
+        if offload_in_graph:
+            assert cudagraph_kwargs['cuda_graph_stream'] is graph_stream
+            assert cudagraph_kwargs['cuda_graph_event'] is graph_event
+        else:
+            assert 'cuda_graph_stream' not in cudagraph_kwargs
+            assert 'cuda_graph_event' not in cudagraph_kwargs
+
+    def test_hybrid_capture_records_offload_boundary_exactly_once(self):
+        calls = []
+        wrapper = self._bare_hybrid_wrapper(offload_in_graph=True)
+        object.__setattr__(wrapper, 'off_interface', self._recording_offload_interface(calls))
+        object.__setattr__(wrapper, '_get_te_cuda_graph_group_tail', lambda: None)
+        object.__setattr__(wrapper, '_inner_is_partial_moe_capture', lambda: False)
+
+        def forward(hidden_states, **_kwargs):
+            calls.append('body')
+            assert torch.equal(hidden_states, torch.full_like(hidden_states, 2))
+            return hidden_states * 2, None
+
+        object.__setattr__(wrapper, 'forward', forward)
+        output = wrapper._te_cuda_graph_capture(torch.ones(2, 1, 4))
+
+        assert calls == ['backward_record', 'body', 'forward_record']
+        assert torch.equal(output[0], torch.full((2, 1, 4), 4.0))
+
+    def test_hybrid_capture_requires_offload_interface_for_enabled_boundary(self):
+        wrapper = self._bare_hybrid_wrapper(offload_in_graph=True)
+        object.__setattr__(wrapper, 'off_interface', None)
+
+        with pytest.raises(AssertionError, match='offload[ _]interface'):
+            wrapper._te_cuda_graph_capture(torch.ones(2, 1, 4))
+
+    def test_hybrid_capture_impl_rejects_raw_packed_sequence_kwargs(self):
+        wrapper = self._bare_hybrid_wrapper(offload_in_graph=False)
+
+        with pytest.raises(AssertionError):
+            wrapper._te_cuda_graph_capture_impl(
+                torch.ones(2, 1, 4), cu_seqlens_q=torch.tensor([0, 2], dtype=torch.int32)
+            )
+
+    def test_transformer_capture_impl_rejects_raw_packed_sequence_kwargs(self):
+        layer = TransformerLayer.__new__(TransformerLayer)
+        torch.nn.Module.__init__(layer)
+
+        with pytest.raises(AssertionError):
+            layer._te_cuda_graph_capture_impl(
+                torch.ones(2, 1, 4), cu_seqlens_q=torch.tensor([0, 2], dtype=torch.int32)
+            )
+
+    def test_grouped_hybrid_capture_has_one_outer_offload_boundary(self):
+        calls = []
+        head = self._bare_hybrid_wrapper(offload_in_graph=True)
+        tail = self._bare_hybrid_wrapper(offload_in_graph=True)
+        off_interface = self._recording_offload_interface(calls)
+        object.__setattr__(head, 'off_interface', off_interface)
+        object.__setattr__(tail, 'off_interface', off_interface)
+        object.__setattr__(head, '_get_te_cuda_graph_group_tail', lambda: tail)
+
+        def head_forward(hidden_states, **_kwargs):
+            calls.append('attention_body')
+            return hidden_states + 1, None
+
+        def tail_capture_impl(hidden_states, **_kwargs):
+            calls.append('moe_prefix_body')
+            return (hidden_states + 1,)
+
+        object.__setattr__(head, 'forward', head_forward)
+        object.__setattr__(tail, '_te_cuda_graph_capture_impl', tail_capture_impl)
+
+        output = head._te_cuda_graph_capture(torch.ones(2, 1, 4))
+
+        assert calls == ['backward_record', 'attention_body', 'moe_prefix_body', 'forward_record']
+        assert torch.equal(output[0], torch.full((2, 1, 4), 4.0))
+
+    def test_moe_only_tail_does_not_claim_attention_offload(self):
+        # Reproduce the stale inner-layer flag: cuda_graph_modules contains ``attn``
+        # globally even though this split Hybrid layer has no attention body.
+        inner = self._bare_transformer_inner(
+            has_attention=False, offload_core_attn=True, is_moe=True
+        )
+
+        tail = self._bare_hybrid_wrapper()
+        tail.inner_layer = inner
+
+        assert not tail._compute_offload_module_in_cuda_graph()
+        assert not tail.offload_module_in_cuda_graph
+
+    def test_hybrid_explicit_attn_scope_claims_inner_offload(self):
+        attention_inner = self._bare_transformer_inner(has_attention=True, offload_core_attn=True)
+
+        attention_wrapper = self._bare_hybrid_wrapper()
+        attention_wrapper.inner_layer = attention_inner
+        assert attention_wrapper.offload_module_in_cuda_graph
+
+    def test_hybrid_offload_property_caches_and_grouping_invalidates(self):
+        calls = []
+        head = self._bare_hybrid_wrapper()
+        tail = self._bare_hybrid_wrapper()
+        object.__setattr__(
+            head,
+            '_compute_inner_offload_module_in_cuda_graph',
+            lambda: calls.append('head') or False,
+        )
+        object.__setattr__(
+            tail,
+            '_compute_inner_offload_module_in_cuda_graph',
+            lambda: calls.append('tail') or True,
+        )
+        object.__setattr__(head, '_can_group_te_cuda_graph_with', lambda _tail: True)
+
+        assert not head.offload_module_in_cuda_graph
+        assert not head.offload_module_in_cuda_graph
+        assert calls == ['head']
+
+        head._set_te_cuda_graph_group_tail(tail)
+        assert head._offload_module_in_cuda_graph_cached is None
+        assert head.offload_module_in_cuda_graph
+        assert head.offload_module_in_cuda_graph
+        assert calls == ['head', 'head', 'tail']
+        assert head._offload_module_in_cuda_graph_cached is True
+
+    @pytest.mark.parametrize('tail_raises', [False, True])
+    @pytest.mark.parametrize('grouped', [False, True])
+    def test_hybrid_partial_replay_runs_eager_tail_and_propagates_errors(
+        self, monkeypatch, tail_raises, grouped
+    ):
+        calls = []
+        head = self._bare_hybrid_wrapper()
+
+        class Tail:
+            @staticmethod
+            def _resume_partial_moe_cuda_graph(_outputs):
+                calls.append('eager_tail')
+                if tail_raises:
+                    raise RuntimeError('eager tail failed')
+                return torch.full((2, 1, 4), 3.0), None
+
+        object.__setattr__(
+            head, '_get_te_cuda_graph_group_tail', lambda: Tail() if grouped else None
+        )
+        object.__setattr__(head, '_inner_is_partial_moe_capture', lambda: not grouped)
+        object.__setattr__(
+            head, '_resume_partial_moe_cuda_graph', Tail._resume_partial_moe_cuda_graph
+        )
+
+        def graph_replay(_self, *_args, **_kwargs):
+            calls.append('graph_replay')
+            return (torch.ones(2, 1, 4),)
+
+        monkeypatch.setattr(GraphableMegatronModule, '_te_cuda_graph_replay', graph_replay)
+
+        if tail_raises:
+            with pytest.raises(RuntimeError, match='eager tail failed'):
+                head._te_cuda_graph_replay(torch.ones(2, 1, 4))
+        else:
+            output = head._te_cuda_graph_replay(torch.ones(2, 1, 4))
+            assert torch.equal(output[0], torch.full((2, 1, 4), 3.0))
+
+        assert calls == ['graph_replay', 'eager_tail']
+
+
 # Global storage for comparing unique buffer counts across different num_microbatches,
 # keyed by (pp_size, vpp_size)
 _unique_buffer_counts = {}
@@ -928,6 +1677,56 @@ class TestTECudaGraphHelper:
         # Note: _unique_buffer_counts is intentionally NOT cleared here so we can
         # compare values across parametrized test runs
 
+    @pytest.mark.parametrize(
+        ("local_layout", "cuda_graph_modules", "expected"),
+        [
+            ("dense", [CudaGraphModule.attn, CudaGraphModule.moe], False),
+            ("dense", [], False),
+            ("direct-moe", [CudaGraphModule.attn, CudaGraphModule.moe], True),
+            ("nested-moe", [], True),
+            ("direct-moe", [CudaGraphModule.moe_router], False),
+        ],
+    )
+    def test_paged_stash_te_capture_context_requires_rank_local_whole_moe(
+        self, monkeypatch, local_layout, cuda_graph_modules, expected
+    ):
+        layer = torch.nn.Module()
+        layer.is_moe_layer = local_layout == "direct-moe"
+        if local_layout == "nested-moe":
+            inner_layer = torch.nn.Module()
+            inner_layer.is_moe_layer = True
+            layer.inner_layer = inner_layer
+
+        monkeypatch.setattr(transformer_config_module, "is_te_min_version", lambda _version: True)
+
+        helper = object.__new__(TECudaGraphHelper)
+        helper.config = _te_whole_moe_paged_stash_config(cuda_graph_modules=cuda_graph_modules)
+        helper.flattened_callables = [layer]
+        helper.callables_per_chunk = []
+        helper.num_microbatches = 1
+        helper._start_capturing = lambda: 0.0
+        helper._finish_capturing = lambda _start_time: None
+        helper._get_cuda_graph_input_data = lambda: ([()], {'_order': [1, -1]})
+        helper._validate_mhc_static_hidden_inputs = lambda _sample_args: None
+        helper._uses_mhc_direct_write_arena = lambda: False
+
+        capture_enabled = []
+
+        def record_capture_context(enabled, order=None, config=None):
+            capture_enabled.append(enabled)
+            return nullcontext()
+
+        monkeypatch.setattr(
+            paged_stash_module, "paged_stash_te_graph_capture", record_capture_context
+        )
+        monkeypatch.setattr(
+            cuda_graphs_module, "make_graphed_callables", lambda *args, **kwargs: ()
+        )
+
+        helper.create_cudagraphs()
+
+        assert capture_enabled == [expected]
+
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_mhc_static_input_aliasing_requires_disjoint_liveness_windows(self):
         config = _base_cuda_graph_config(
@@ -941,6 +1740,10 @@ class TestTECudaGraphHelper:
             moe_token_dispatcher_type="alltoall",
             cuda_graph_impl="transformer_engine",
             cuda_graph_modules=[CudaGraphModule.attn],
+            # The aliasing check only runs for the direct-write arena, which is
+            # opt-in: without the switch this shape captures the whole attention
+            # range and has no arena slot to alias.
+            mhc_recompute_attn_cuda_graph_split=True,
             bf16=True,
         )
         helper = object.__new__(TECudaGraphHelper)
@@ -1500,6 +2303,10 @@ class TestPartialCudaGraph:
             loss_list.append(loss.item())
 
         if self.cuda_graph_helper is not None and self.cuda_graph_helper.graphs_created():
+            # Keep the layer handles for post-run assertions: the helper is
+            # nulled below, but the layer objects (and attributes the replay
+            # tail set on them) outlive graph teardown.
+            self.last_flattened_callables = self.cuda_graph_helper.flattened_callables
             self.cuda_graph_helper.delete_cuda_graphs()
             self.cuda_graph_helper = None
 
@@ -1644,6 +2451,62 @@ class TestPartialCudaGraph:
                 f"mHC loss mismatch with cuda_graph_modules={cuda_graph_modules}, ep_size={ep_size}. "
                 f"Max diff: {torch.max(torch.abs(loss_list - loss_list_ref))}"
             )
+
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.skipif(
+        not (HAVE_TE and is_te_min_version("2.10.0")),
+        reason="Partial CUDA graph UT support requires TransformerEngine version >= 2.10.0",
+    )
+    def test_mhc_recompute_whole_attention_cudagraph(self):
+        """mHC selective recompute under whole-attention capture matches eager.
+
+        With mhc_recompute_attn_cuda_graph_split off (the default), an attn-scope
+        graph captures the whole attention range and the replay's non-split tail
+        runs the MLP-side mHC group eagerly: mlp_hyper_connection registers its
+        checkpoints against the manager __call__ stashed on the layer, the block
+        discards at group end, and the unified hook replays them in backward. A
+        graphed run must therefore reproduce the eager loss curve bit for bit --
+        this is the executing coverage for that tail, with a live manager rather
+        than a mocked boundary.
+        """
+        initialize_rng_tracker(use_te_rng_tracker=True, force_reset=True)
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=self.tp_size,
+            context_parallel_size=self.cp_size,
+            pipeline_model_parallel_size=1,
+            expert_tensor_parallel_size=self.tp_size,
+            expert_model_parallel_size=1,
+        )
+
+        extra_kwargs = {
+            "enable_hyper_connections": True,
+            "num_residual_streams": 4,
+            "mtp_num_layers": None,  # mHC is incompatible with MTP
+            "recompute_granularity": "selective",
+            "recompute_modules": ["mhc"],
+            "mhc_recompute_layer_num": 2,
+        }
+
+        loss_list_ref = self._run_test_helper(1, "none", None, 0, **extra_kwargs)
+        loss_list = self._run_test_helper(
+            1, "transformer_engine", [CudaGraphModule.attn], 3, **extra_kwargs
+        )
+        assert torch.equal(loss_list, loss_list_ref), (
+            "mHC recompute under whole-attention capture diverged from eager. "
+            f"Max diff: {torch.max(torch.abs(loss_list - loss_list_ref))}"
+        )
+        # Loss parity alone is blind to an inert manager (an empty recompute
+        # group discards and replays nothing, bit-identically), so pin the
+        # layer-side threading directly: the graphed replay tail must have
+        # created the pre-MLP checkpoint against a live manager.
+        layers = self.last_flattened_callables
+        assert any(
+            getattr(layer, "pre_mlp_norm_checkpoint", None) is not None for layer in layers
+        ), (
+            "no layer created pre_mlp_norm_checkpoint during graphed replay: the "
+            "whole-attention tail is not threading the recompute manager"
+        )
 
         Utils.destroy_model_parallel()
 

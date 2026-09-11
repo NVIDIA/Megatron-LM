@@ -26,6 +26,7 @@ from megatron.core.tensor_parallel.random import (
 )
 from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.hyper_connection import HyperConnectionModule
+from megatron.core.transformer.mhc_recompute import uses_mhc_recompute_attn_cuda_graph_split
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_torch_min_version
 from tests.unit_tests.test_utilities import Utils
@@ -466,21 +467,34 @@ class TestTransformerConfigRecomputeMhc:
             ([CudaGraphModule.attn], ["core_attn", "mhc"]),
         ],
     )
-    def test_config_rejects_unimplemented_te_graph_splits(
+    def test_config_accepts_other_shapes_without_the_split_switch(
         self, cuda_graph_modules, recompute_modules
     ):
-        with pytest.raises(ValueError, match="initial attention-only split"):
-            TransformerConfig(
-                num_layers=2,
-                hidden_size=64,
-                num_attention_heads=4,
-                enable_hyper_connections=True,
-                num_residual_streams=4,
-                recompute_modules=recompute_modules,
-                recompute_granularity="selective",
-                cuda_graph_impl="transformer_engine",
-                cuda_graph_modules=cuda_graph_modules,
-            )
+        """Without the opt-in switch, no shape is rejected on the split's behalf.
+
+        Extra graph scopes and extra recompute modules are orthogonal to the split
+        and were running before it existed, so the default path must leave them
+        alone. Only opting in narrows the configuration. The exact [attn]+[mhc]
+        shape additionally warns that the captured producer's checkpoint no longer
+        pays; the shapes here are broader than that, so this asserts the predicate
+        rather than anything about warnings.
+        """
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=64,
+            num_attention_heads=4,
+            enable_hyper_connections=True,
+            num_residual_streams=4,
+            recompute_modules=recompute_modules,
+            recompute_granularity="selective",
+            cuda_graph_impl="transformer_engine",
+            cuda_graph_modules=cuda_graph_modules,
+            # core_attn recompute under a graphed attention asserts on nonzero
+            # dropout, which would fail these cases before they reach the gate.
+            hidden_dropout=0.0,
+            attention_dropout=0.0,
+        )
+        assert not uses_mhc_recompute_attn_cuda_graph_split(config)
 
     @staticmethod
     def _mhc_recompute_config_kwargs(**extra):
@@ -521,46 +535,53 @@ class TestTransformerConfigRecomputeMhc:
         """mHC recompute + attn TE CUDA graph composes with EP a2a overlap."""
         if not is_torch_min_version("2.6.0"):
             pytest.skip("EP a2a overlap requires torch >= 2.6.0")
-        config = TransformerConfig(
-            **self._mhc_overlap_config_kwargs(
-                cuda_graph_impl="transformer_engine", cuda_graph_modules=[CudaGraphModule.attn]
-            )
-        )
-        assert config.cuda_graph_modules == [CudaGraphModule.attn]
-        assert config.overlap_moe_expert_parallel_comm is True
-
-    def test_config_rejects_ep_overlap_with_local_cuda_graph(self):
-        """Only the TE attention-only split is exempt; local impl stays rejected."""
-        if not is_torch_min_version("2.6.0"):
-            pytest.skip("EP a2a overlap requires torch >= 2.6.0")
-        with pytest.raises(ValueError, match="overlap_moe_expert_parallel_comm requires"):
-            TransformerConfig(
+        with pytest.warns(UserWarning, match="capturing the whole attention range"):
+            config = TransformerConfig(
                 **self._mhc_overlap_config_kwargs(
-                    cuda_graph_impl="local", cuda_graph_modules=[CudaGraphModule.attn]
+                    cuda_graph_impl="transformer_engine", cuda_graph_modules=[CudaGraphModule.attn]
                 )
             )
+        assert config.cuda_graph_modules == [CudaGraphModule.attn]
+        assert config.overlap_moe_expert_parallel_comm is True
 
     @pytest.mark.parametrize("modules", ["attn", ["attn"]])
     def test_config_accepts_string_module_forms_for_attention_split(self, modules):
         """The gate must compare cuda_graph_modules after string->enum normalization."""
-        config = TransformerConfig(
-            **self._mhc_recompute_config_kwargs(
-                cuda_graph_impl="transformer_engine", cuda_graph_modules=modules
+        with pytest.warns(UserWarning, match="capturing the whole attention range"):
+            config = TransformerConfig(
+                **self._mhc_recompute_config_kwargs(
+                    cuda_graph_impl="transformer_engine", cuda_graph_modules=modules
+                )
             )
-        )
         assert config.cuda_graph_modules == [CudaGraphModule.attn]
 
-    def test_config_rejects_deprecated_external_cuda_graph_with_mhc_recompute(self):
-        """The legacy flag migrates to the TE impl and must reach the same gate."""
-        with pytest.raises(ValueError, match="initial attention-only split"):
-            TransformerConfig(**self._mhc_recompute_config_kwargs(external_cuda_graph=True))
+    def test_config_deprecated_external_cuda_graph_reaches_the_gate(self):
+        """The legacy flag migrates to the TE impl, and the gate sees the result.
+
+        It carries no cuda_graph_modules, so with the split switched on it lands
+        outside the split's required shape -- which is only observable if the gate
+        reads the migrated impl rather than the raw legacy flag.
+        """
+        with pytest.raises(ValueError, match="requires cuda_graph_modules"):
+            TransformerConfig(
+                **self._mhc_recompute_config_kwargs(
+                    external_cuda_graph=True, mhc_recompute_attn_cuda_graph_split=True
+                )
+            )
+        # Without the switch the same config is simply accepted.
+        config = TransformerConfig(**self._mhc_recompute_config_kwargs(external_cuda_graph=True))
+        assert config.cuda_graph_impl == "transformer_engine"
 
     def test_config_rejects_deprecated_enable_cuda_graph_with_mhc_recompute(self):
-        """The legacy flag migrates to the local impl, which has no split support."""
+        """The legacy flag migrates to the local impl, which the gate rejects."""
         with pytest.raises(ValueError, match="cuda_graph_impl='local'"):
             TransformerConfig(**self._mhc_recompute_config_kwargs(enable_cuda_graph=True))
 
     def test_config_rejects_local_impl_with_mhc_recompute(self):
+        """Local capture records the mHC checkpoints and their recompute hooks into
+        the layer graphs, where the backward-time RNG rewind cannot run -- the same
+        wrong-result mechanism full_iteration+dropout fails closed on. Rejecting
+        forfeits nothing: a captured checkpoint recovers no memory either way."""
         with pytest.raises(ValueError, match="cuda_graph_impl='local'"):
             TransformerConfig(
                 **self._mhc_recompute_config_kwargs(
@@ -596,24 +617,16 @@ class TestTransformerConfigRecomputeMhc:
                 )
             )
 
-    def test_config_rejects_full_iteration_mhc_recompute_with_vpp(self):
-        with pytest.raises(ValueError, match="interleaved pipeline"):
-            TransformerConfig(
-                **self._mhc_recompute_config_kwargs(
-                    num_layers=4,
-                    cuda_graph_impl="full_iteration",
-                    cuda_graph_modules=[],
-                    hidden_dropout=0.0,
-                    attention_dropout=0.0,
-                    pipeline_model_parallel_size=2,
-                    virtual_pipeline_model_parallel_size=2,
-                    pipeline_dtype=torch.bfloat16,
-                )
-            )
-
-    def test_config_rejects_interleaved_pipeline_with_attention_split(self):
-        with pytest.raises(ValueError, match="interleaved pipeline"):
-            TransformerConfig(
+    def test_config_accepts_vpp_whole_attention_capture_with_ep_overlap(self):
+        """VPP + attn-scope graph (switch off: whole-attention capture) + EP
+        overlap is admitted. The PP4/VPP2
+        divergence (grad norm ~1e8, reproduced on pure upstream dev) was a
+        caching-allocator use-after-free: mHC post-processing ran inside the
+        communication-stream combine node, so the recompute subgraph was
+        allocated on one stream and read from another. It is fixed by giving
+        the post-processing its own compute-stream schedule node."""
+        with pytest.warns(UserWarning, match="capturing the whole attention range"):
+            config = TransformerConfig(
                 **self._mhc_recompute_config_kwargs(
                     num_layers=4,
                     cuda_graph_impl="transformer_engine",
@@ -621,37 +634,44 @@ class TestTransformerConfigRecomputeMhc:
                     pipeline_model_parallel_size=2,
                     virtual_pipeline_model_parallel_size=2,
                     pipeline_dtype=torch.bfloat16,
+                    overlap_moe_expert_parallel_comm=True,
+                    expert_model_parallel_size=2,
+                    num_moe_experts=4,
+                    moe_token_dispatcher_type="alltoall",
+                    bf16=True,
+                )
+            )
+        assert config.virtual_pipeline_model_parallel_size == 2
+
+    def test_config_rejects_te_whole_layer_capture_with_ep_overlap(self):
+        """Empty cuda_graph_modules means whole-layer TE capture, which covers
+        the MoE/MLP part; the generic overlap gate must reject it at config
+        time exactly like an explicit moe/mlp scope, mirroring the runtime
+        assert ("EP overlap must be disabled when CUDA graph captures the
+        whole MLP/MoE part"). This is a generic (non-mHC) gate; it lives here
+        with the rest of the overlap-config matrix."""
+        with pytest.raises(AssertionError, match="whole-layer"):
+            TransformerConfig(
+                **self._mhc_recompute_config_kwargs(
+                    num_layers=4,
+                    cuda_graph_impl="transformer_engine",
+                    cuda_graph_modules=[],
+                    pipeline_model_parallel_size=2,
+                    virtual_pipeline_model_parallel_size=2,
+                    pipeline_dtype=torch.bfloat16,
+                    overlap_moe_expert_parallel_comm=True,
+                    expert_model_parallel_size=2,
+                    num_moe_experts=4,
+                    moe_token_dispatcher_type="alltoall",
+                    bf16=True,
                 )
             )
 
-    def test_config_accepts_vpp_attention_split_with_ep_overlap(self):
-        """VPP + attn-only split + EP overlap is admitted. The PP4/VPP2
-        divergence (grad norm ~1e8, reproduced on pure upstream dev) was a
-        caching-allocator use-after-free: mHC post-processing ran inside the
-        communication-stream combine node, so the recompute subgraph was
-        allocated on one stream and read from another. It is fixed by giving
-        the post-processing its own compute-stream schedule node."""
-        config = TransformerConfig(
-            **self._mhc_recompute_config_kwargs(
-                num_layers=4,
-                cuda_graph_impl="transformer_engine",
-                cuda_graph_modules=[CudaGraphModule.attn],
-                pipeline_model_parallel_size=2,
-                virtual_pipeline_model_parallel_size=2,
-                pipeline_dtype=torch.bfloat16,
-                overlap_moe_expert_parallel_comm=True,
-                expert_model_parallel_size=2,
-                num_moe_experts=4,
-                moe_token_dispatcher_type="alltoall",
-                bf16=True,
-            )
-        )
-        assert config.virtual_pipeline_model_parallel_size == 2
-
     def test_config_accepts_full_iteration_vpp_with_ep_overlap(self):
-        """full_iteration + VPP is admitted once EP overlap is on: the
-        divergence that used to block it came from mHC post-processing running
-        on the communication stream, and StaticBufferLoader is VPP-safe."""
+        """full_iteration + VPP + EP overlap is admitted (overlap is exercised
+        here but no longer required): the divergence that used to gate this came
+        from mHC post-processing running on the communication stream, and
+        StaticBufferLoader is VPP-safe."""
         config = TransformerConfig(
             **self._mhc_recompute_config_kwargs(
                 num_layers=4,
@@ -672,7 +692,8 @@ class TestTransformerConfigRecomputeMhc:
         assert config.virtual_pipeline_model_parallel_size == 2
 
     def test_config_allows_vpp_with_mhc_recompute_without_cuda_graphs(self):
-        """The VPP rejection is scoped to CUDA graphs; eager recompute + VPP stays legal."""
+        """Eager recompute + VPP is legal, as it is with graphs. Kept as the
+        no-graph corner of the VPP matrix."""
         config = TransformerConfig(
             **self._mhc_recompute_config_kwargs(
                 num_layers=4,
@@ -705,14 +726,16 @@ class TestTransformerConfigRecomputeMhc:
             # exemption here the hybrid path would construct silently.
             {"cuda_graph_impl": "full_iteration", "hidden_dropout": 0.0, "attention_dropout": 0.0},
         ),
-        ids=("attention-split", "full-iteration"),
+        ids=("te-attn-scope", "full-iteration"),
     )
-    def test_hybrid_mhc_layer_rejects_cuda_graphs_at_construction(self, graph_kwargs):
-        """HybridStack mHC layers capture the mHC producer and must fail closed."""
+    def test_hybrid_mhc_layer_warns_on_cuda_graphs_at_construction(self, graph_kwargs):
+        """HybridStack mHC layers capture the mHC producer, so that one checkpoint
+        does not pay -- but the combination was constructible before the split
+        existed and nothing about it is known to be wrong, so it warns."""
         from megatron.core.models.hybrid.hybrid_block import HyperConnectionHybridLayer
 
         config = TransformerConfig(**self._mhc_recompute_config_kwargs(**graph_kwargs))
-        with pytest.raises(ValueError, match="HybridStack"):
+        with pytest.warns(UserWarning, match="HybridStack"):
             HyperConnectionHybridLayer(config, types.SimpleNamespace(layer_number=1))
 
 

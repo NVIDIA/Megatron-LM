@@ -1,10 +1,10 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Bit-exact parity for the Kimi K2 INT4 load-path dequant.
+"""Bit-exact parity for the primitive HF reader's INT4 dequant.
 
 Kimi ships INT4-packed release weights (eight offset-binary INT4 values per
 int32 slot + per-group scales).  The MLite load path dequantizes them in
-``kimi_k2/lite/checkpoint.py`` without any ``transformers`` / external-bridge
-dependency.  This test pins that dequant to be bit-exact against the reference
+``primitive/ckpt/hf_weights.py`` without any ``transformers`` / external-bridge
+dependency. This test pins that dequant to be bit-exact against the reference
 algorithm in ``megatron.bridge`` (``conversion/quantization_utils.py``:
 ``quantize_to_int4`` / ``dequantize_int4``), which the load path was written to
 match.  The reference is vendored here (CPU-only, no GPU) so the guard runs in
@@ -23,7 +23,9 @@ import torch
 # MLite load path must reproduce exactly.
 # ---------------------------------------------------------------------------
 def _bridge_quantize_to_int4(
-    weight: torch.Tensor, group_size: int = 32, scale_dtype: torch.dtype = torch.bfloat16
+    weight: torch.Tensor,
+    group_size: int = 32,
+    scale_dtype: torch.dtype = torch.bfloat16,
 ):
     out_features, in_features = weight.shape
     weight_shape = torch.tensor([out_features, in_features], dtype=torch.int32)
@@ -71,23 +73,22 @@ def _bridge_dequantize_int4(
     return (unpacked * scale_expanded).to(torch.bfloat16)
 
 
-class _StubReader:
-    """Minimal ``SafeTensorReader`` stand-in for the dequant helpers.
+def _reader_for(tensors: dict[str, torch.Tensor]):
+    from megatron.lite.primitive.ckpt.hf_weights import SafeTensorReader
 
-    The load helpers only call ``.get_tensor(name)`` and consult ``.index`` (via
-    ``_has``); a dict + key set is enough.
-    """
-
-    def __init__(self, tensors: dict[str, torch.Tensor]):
-        self._tensors = dict(tensors)
-        self.index = set(self._tensors)
-
-    def get_tensor(self, name: str) -> torch.Tensor:
-        return self._tensors[name]
+    reader = object.__new__(SafeTensorReader)
+    reader.device = torch.device("cpu")
+    reader._cached_request = None
+    reader._cached_tensor = None
+    reader.has_tensor = lambda name: name in tensors
+    reader._get_raw_tensor = lambda name, device: tensors[name].to(device)
+    return reader
 
 
 def test_kimi_int4_dequant_bit_exact_to_bridge():
-    from megatron.lite.model.kimi_k2.lite.checkpoint import _dequant_int4_weight
+    from megatron.lite.primitive.ckpt.hf_weights import (  # isort: skip
+        _dequantize_groupwise_int4,
+    )
 
     torch.manual_seed(2026)
     # out_features arbitrary; in_features divisible by both 8 (pack factor) and 32
@@ -97,10 +98,7 @@ def test_kimi_int4_dequant_bit_exact_to_bridge():
     packed, scale, shape = _bridge_quantize_to_int4(weight)
     reference = _bridge_dequantize_int4(packed, scale, shape)
 
-    reader = _StubReader(
-        {"w_packed": packed, "w_scale": scale, "w_shape": shape}
-    )
-    got = _dequant_int4_weight(reader, "w")
+    got = _dequantize_groupwise_int4(packed, scale, shape)
 
     assert got.dtype == torch.bfloat16
     assert got.shape == reference.shape
@@ -110,32 +108,29 @@ def test_kimi_int4_dequant_bit_exact_to_bridge():
     )
 
 
-def test_kimi_get_passes_through_bf16_when_unquantized():
-    """``_get`` must load a plain bf16 tensor unchanged (no scale, no packing).
+def test_reader_passes_through_bf16_when_unquantized():
+    """The primitive reader loads plain bf16 unchanged (no scale, no packing).
 
     MLite export/save emits bf16, so reloading an exported (or already bf16)
     checkpoint must hit the no-dequant path — the third load case alongside
     FP8 (``*_scale_inv``) and INT4 (``*_packed``).
     """
-    from megatron.lite.model.kimi_k2.lite.checkpoint import _get
-
     torch.manual_seed(7)
     weight = torch.randn(16, 24, dtype=torch.bfloat16)
-    reader = _StubReader({"layer.weight": weight})
+    reader = _reader_for({"layer.weight": weight})
 
-    got = _get(reader, "layer.weight")
+    got = reader.get_tensor("layer.weight")
     assert got.dtype == torch.bfloat16
     assert torch.equal(got, weight)
 
 
-def test_kimi_get_dispatches_to_int4_when_packed_present():
-    """When only ``*_packed`` exists (no plain tensor), ``_get`` dequantizes INT4."""
-    from megatron.lite.model.kimi_k2.lite.checkpoint import _get
+def test_reader_dispatches_to_int4_when_packed_present():
+    """When only ``*_packed`` exists, the primitive reader dequantizes INT4."""
 
     torch.manual_seed(11)
     weight = torch.randn(8, 64, dtype=torch.bfloat16)
     packed, scale, shape = _bridge_quantize_to_int4(weight)
-    reader = _StubReader({"w_packed": packed, "w_scale": scale, "w_shape": shape})
+    reader = _reader_for({"w_packed": packed, "w_scale": scale, "w_shape": shape})
 
-    got = _get(reader, "w")
+    got = reader.get_tensor("w")
     assert torch.equal(got, _bridge_dequantize_int4(packed, scale, shape))
