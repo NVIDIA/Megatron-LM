@@ -584,9 +584,16 @@ def mcore_fused_moe(
     use_te_bf16 = weight_format == "te_bf16"
     use_mxfp8 = use_mcore_mxfp8 or use_te_mxfp8
     use_te_grouped = use_te_bf16 or use_te_mxfp8
-    # Fused Triton quant kernels only apply to the MCore MXFP8 path.
-    use_fused_quant = use_mcore_mxfp8 and not disable_fused_quant_kernels
     batch_invariant_mode = batch_invariant.enabled()
+    # Batch-invariant unpermute needs the inverse map produced by the ordinary
+    # permutation path. Quantization remains row-local, so doing it immediately
+    # afterwards preserves the MXFP8 values without tying them to batch layout.
+    use_fused_quant = (
+        use_mcore_mxfp8
+        and activation_type == ActivationType.SQUARED_RELU
+        and not disable_fused_quant_kernels
+        and not batch_invariant_mode
+    )
     use_te_batch_invariant = batch_invariant_mode and use_te_grouped
 
     if use_te_batch_invariant:
@@ -598,12 +605,16 @@ def mcore_fused_moe(
         mm_fn = partial(_te_batch_invariant_grouped_mm, num_chunks=num_te_chunks)
         expert_alignment = _TE_BATCH_INVARIANT_CHUNK_SIZE
     elif batch_invariant_mode:
-        assert not use_mcore_mxfp8, (
-            "batch_invariant_mode does not support MCore MXFP8 weights. Use native "
-            "TE MXFP8 weights or disable mxfp8."
-        )
-        mm_fn = batch_invariant.grouped_mm
-        expert_alignment = batch_invariant.grouped_mm_alignment()
+        if use_mcore_mxfp8:
+            assert (
+                HAVE_SCALED_GMM
+            ), "Torch MXFP8 inference requires torch.nn.functional.scaled_grouped_mm."
+            mm_fn = _mxfp8_grouped_mm
+            # Keep every expert boundary aligned to the 128-row MXFP8 scale swizzle.
+            expert_alignment = MXFP8_SCALE_ROW_BLOCK
+        else:
+            mm_fn = batch_invariant.grouped_mm
+            expert_alignment = batch_invariant.grouped_mm_alignment()
     elif use_te_grouped:
         assert (
             HAVE_TE_GROUPED_MXFP8
@@ -678,7 +689,7 @@ def mcore_fused_moe(
             valid_tokens,
             alignment=expert_alignment,
             row_alignment=MXFP8_SCALE_ROW_BLOCK if use_mxfp8 else 1,
-            zero_padding=use_te_grouped,
+            zero_padding=use_te_grouped or (batch_invariant_mode and use_mcore_mxfp8),
             return_batch_invariant_inverse_map=batch_invariant_mode,
         )
         hidden_states, permuted_probs, permutation_map, offs = permuted[:4]
@@ -713,7 +724,11 @@ def mcore_fused_moe(
                 "the gated form (SiTU-GLU) has no inference kernel yet."
             )
             activation_out = batch_invariant.swiglu_with_probs(
-                fc1_output, permutation_map, n_used, permuted_probs, zero_padding=use_te_grouped
+                fc1_output,
+                permutation_map,
+                n_used,
+                permuted_probs,
+                zero_padding=use_te_grouped or use_mcore_mxfp8,
             )
         else:
             activation_out = batch_invariant.squared_relu_with_probs(
@@ -722,7 +737,7 @@ def mcore_fused_moe(
                 n_used,
                 permuted_probs,
                 activation_clamp_scale,
-                zero_padding=use_te_grouped,
+                zero_padding=use_te_grouped or use_mcore_mxfp8,
             )
     else:
         if use_te_grouped:

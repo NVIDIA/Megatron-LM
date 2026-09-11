@@ -1319,8 +1319,9 @@ class TransformerConfig(ModelParallelConfig):
       expert token segments are zero-padded to 256 rows. Requires fp8_recipe='mxfp8'.
     - 'torch': Uses torch.nn.functional.grouped_mm (mcore_fused_moe with Triton kernels).
       Supports both BF16 and MXFP8.
-    - 'vllm': Uses vLLM's Triton fused MoE kernel (BF16). Avoids physical token
-      permutation via indirect addressing.
+    - 'vllm': Uses vLLM's Triton fused MoE kernel for BF16. Avoids physical token
+      permutation via indirect addressing. MXFP8 expert layers use MCore's scaled
+      grouped-GEMM path, allowing per-layer mixed BF16/MXFP8 policies.
     """
 
     inference_mxfp8_include_parameters: str | None = None
@@ -1892,15 +1893,6 @@ class TransformerConfig(ModelParallelConfig):
                 )
 
             if (
-                self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.VLLM
-                and mxfp8_enabled
-            ):
-                raise ValueError(
-                    "vLLM Triton fused MoE only supports BF16. "
-                    "Set inference_grouped_gemm_backend to 'te' or 'torch' for MXFP8."
-                )
-
-            if (
                 self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.FLASHINFER
                 and mxfp8_enabled
                 and (self.gated_linear_unit or self.activation_func != squared_relu)
@@ -1934,13 +1926,23 @@ class TransformerConfig(ModelParallelConfig):
 
             if self.batch_invariant_mode:
                 if self.inference_grouped_gemm_backend not in (
+                    InferenceGroupedGemmBackend.FLASHINFER,
                     InferenceGroupedGemmBackend.TE,
                     InferenceGroupedGemmBackend.TORCH,
                     InferenceGroupedGemmBackend.VLLM,
                 ):
                     raise ValueError(
                         "batch_invariant_mode requires inference_grouped_gemm_backend "
-                        "'te', 'torch', or 'vllm'."
+                        "'flashinfer', 'te', 'torch', or 'vllm'."
+                    )
+                if (
+                    self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.FLASHINFER
+                    and not mxfp8_enabled
+                ):
+                    raise ValueError(
+                        "batch_invariant_mode currently supports the FlashInfer grouped-GEMM "
+                        "backend only for an MXFP8 model configuration. Selectively BF16 "
+                        "expert layers within that configuration remain supported."
                     )
                 if (
                     self.expert_model_parallel_size > 1
@@ -3567,13 +3569,17 @@ class TransformerConfig(ModelParallelConfig):
                         "moe_token_dispatcher_type='alltoall'."
                     )
                 # DeepGEMM is used by the "deepgemm"/"triton" backends, and by
-                # the torch inference grouped-GEMM path under any backend. The
-                # "te_native" backend with the vLLM inference backend (or the
-                # training path, where TE grouped GEMM stays native) does not
-                # need it.
+                # the torch inference path for BF16 experts. MXFP8 experts use
+                # torch scaled_grouped_mm directly and do not need DeepGEMM.
                 needs_deepgemm = self.batch_invariant_backend in ("deepgemm", "triton") or (
                     self.transformer_impl == "inference_optimized"
                     and self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.TORCH
+                    and not (
+                        bool(self.fp8)
+                        and self.fp8_recipe == Fp8Recipe.mxfp8
+                        and self.fp8_param
+                        and not self.fp4
+                    )
                 )
                 assert not needs_deepgemm or HAVE_DEEPGEMM_BF16, (
                     "batch_invariant_mode=True with MoE requires DeepGEMM with bf16 "
@@ -3594,10 +3600,39 @@ class TransformerConfig(ModelParallelConfig):
                         or (self.gated_linear_unit and self.activation_func == F.silu)
                     )
                 )
-                assert te_mxfp8_inference or not (self.fp8 or self.fp4), (
-                    "Batch-invariant MoE supports bf16, or native TE MXFP8 squared-ReLU/"
-                    "SwiGLU experts with the inference-optimized TE grouped-GEMM and "
-                    "te_native batch-invariant backends."
+                flashinfer_mxfp8_inference = (
+                    self.transformer_impl == "inference_optimized"
+                    and self.inference_grouped_gemm_backend
+                    == InferenceGroupedGemmBackend.FLASHINFER
+                    and bool(self.fp8)
+                    and self.fp8_recipe == Fp8Recipe.mxfp8
+                    and self.fp8_param
+                    and not self.fp4
+                    and not self.gated_linear_unit
+                    and self.activation_func == squared_relu
+                )
+                torch_mxfp8_inference = (
+                    self.transformer_impl == "inference_optimized"
+                    and self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.TORCH
+                    and bool(self.fp8)
+                    and self.fp8_recipe == Fp8Recipe.mxfp8
+                    and self.fp8_param
+                    and not self.fp4
+                    and (
+                        (not self.gated_linear_unit and self.activation_func == squared_relu)
+                        or (self.gated_linear_unit and self.activation_func == F.silu)
+                    )
+                )
+                assert (
+                    te_mxfp8_inference
+                    or flashinfer_mxfp8_inference
+                    or torch_mxfp8_inference
+                    or not (self.fp8 or self.fp4)
+                ), (
+                    "Batch-invariant MoE supports bf16, native TE MXFP8 squared-ReLU/"
+                    "SwiGLU experts, Torch MXFP8 squared-ReLU/SwiGLU experts, or FlashInfer "
+                    "MXFP8 squared-ReLU experts with the inference-optimized transformer "
+                    "implementation."
                 )
                 assert not (self.moe_permute_fusion or self.moe_permute_fusion_into_hybridep), (
                     "Batch-invariant MoE requires the unfused permute/unpermute path so "

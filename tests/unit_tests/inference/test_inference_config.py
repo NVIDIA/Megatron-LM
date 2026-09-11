@@ -62,15 +62,16 @@ class TestInferenceConfig:
             (InferenceGroupedGemmBackend.TE, "triton"),
             ("flashinfer", "triton"),
             (InferenceGroupedGemmBackend.FLASHINFER, "triton"),
+            ("vllm", "triton"),
+            (InferenceGroupedGemmBackend.VLLM, "triton"),
         ],
     )
     def test_resolve_mxfp8_backend(self, grouped_gemm_backend, expected_backend):
         assert resolve_mxfp8_backend(grouped_gemm_backend) == expected_backend
 
-    @pytest.mark.parametrize("grouped_gemm_backend", ["vllm", InferenceGroupedGemmBackend.VLLM])
-    def test_resolve_mxfp8_backend_rejects_unsupported_backend(self, grouped_gemm_backend):
+    def test_resolve_mxfp8_backend_rejects_unsupported_backend(self):
         with pytest.raises(ValueError, match="does not support inference_grouped_gemm_backend"):
-            resolve_mxfp8_backend(grouped_gemm_backend)
+            resolve_mxfp8_backend("unknown")
 
     def test_te_grouped_moe_parameter_ids_exclude_only_expert_weights(self):
         from megatron.core.inference.quantization.utils import get_te_grouped_moe_parameter_ids
