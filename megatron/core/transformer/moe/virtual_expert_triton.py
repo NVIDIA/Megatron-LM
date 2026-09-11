@@ -23,7 +23,7 @@ import triton
 import triton.language as tl
 
 MAX_VIRTUAL_EXPERT_WEIGHT_SMS = 32
-MAX_VIRTUAL_EXPERT_EP_RANKS = 64
+
 
 # Constants a kernel reads must be ``tl.constexpr`` objects (``.value`` on the host).
 # A tiled TMA descriptor caps its innermost box at 256 elements, so a flat stream is
@@ -119,8 +119,8 @@ def _plan_virtual_expert_routes_kernel(
     Phase 3: every program maps its routes: the stable ordinal among this rank's routes to the
     same expert (earlier rows + running count + rank in the tile) against the placement's
     segment ends picks the destination, remote destinations take the slot the placement
-    assigned, and the pass writes the int16 runtime ids and the dense
-    ``[num_tokens, 2 * num_experts]`` runtime probabilities HybridEP consumes.
+    assigned, and the pass writes the compact int16 runtime ids. HybridEP consumes these
+    with the original top-k probabilities; the planner does not change the router scores.
     """
     NUM_EXPERTS_PER_GPU: tl.constexpr = NUM_EXPERTS // EP_SIZE
     BLOCK_EP_SIZE: tl.constexpr = 1 << (EP_SIZE - 1).bit_length()
@@ -423,10 +423,6 @@ def launch_virtual_expert_planner(
     """
     num_tokens, router_topk = top_indices.shape
     ep_size, num_experts = workspace.gathered_counts.shape
-    if ep_size > PLANNER_PROGRAMS or num_experts > 8192:
-        raise ValueError(
-            f"Virtual-expert planner supports at most {PLANNER_PROGRAMS} EP ranks and 8192 experts."
-        )
     empty = functools.partial(torch.empty, device=top_indices.device)
     virtual_experts = empty((num_tokens, router_topk), dtype=torch.int16)
     experts_to_copy = empty((ep_size, num_experts // ep_size), dtype=torch.int32)
@@ -828,20 +824,6 @@ def _transport_tile(limit: int, *components: int) -> int:
     return tile
 
 
-def _validate_transport_shape(world_size: int, num_local_experts: int, num_sms: int) -> None:
-    if not 0 < num_sms <= MAX_VIRTUAL_EXPERT_WEIGHT_SMS:
-        raise ValueError(
-            f"Virtual-expert weight kernels are limited to {MAX_VIRTUAL_EXPERT_WEIGHT_SMS} SMs, "
-            f"got {num_sms}."
-        )
-    if not 0 < world_size <= MAX_VIRTUAL_EXPERT_EP_RANKS or num_local_experts <= 0:
-        raise ValueError(
-            f"Virtual-expert transport supports 1..{MAX_VIRTUAL_EXPERT_EP_RANKS} EP ranks with a "
-            f"positive expert count, got world_size={world_size}, "
-            f"num_local_experts={num_local_experts}."
-        )
-
-
 def _check_table(tensor: torch.Tensor, dtype: torch.dtype, shape: tuple, what: str):
     """Validate a kernel input table (pointer tables are int64 ``[L]``, plans int32 ``[W, L]``)."""
     if tensor.dtype != dtype or tuple(tensor.shape) != shape or not tensor.is_contiguous():
@@ -860,8 +842,8 @@ def _barrier_scratch(device_index: int) -> torch.Tensor:
 @functools.lru_cache(maxsize=None)
 def _source_scratch(device_index: int, entries: int) -> torch.Tensor:
     """The table the reduction compacts each expert's sources into; one per device and
-    shape so its address is stable under CUDA-graph capture. The kernel fills it before
-    its own rendezvous, so concurrent launches on one device never read a half-written table."""
+    shape so its address is stable under CUDA-graph capture. Launches sharing this storage
+    must be serialized, as the bridge does on its shared gradient stream."""
     return torch.empty(entries, dtype=torch.int32, device=torch.device("cuda", device_index))
 
 
@@ -888,7 +870,6 @@ def launch_virtual_expert_weight_prefetch(
     world_size, num_local_experts = workspace.world_size, workspace.num_local_experts
     member_numels, num_sms = workspace.member_numels, workspace.num_sms
     arena = workspace.weight_arena
-    _validate_transport_shape(world_size, num_local_experts, num_sms)
     mxfp8 = arena.dtype == torch.uint8
     if arena.dtype not in (torch.uint8, torch.bfloat16) or mxfp8 != (scale_sources is not None):
         raise ValueError(
@@ -948,7 +929,6 @@ def launch_virtual_expert_grad_reduce(
     world_size, num_local_experts = workspace.world_size, workspace.num_local_experts
     member_numels, num_sms = workspace.member_numels, workspace.num_sms
     arena = workspace.grad_arena
-    _validate_transport_shape(world_size, num_local_experts, num_sms)
     if arena.dtype not in (torch.float32, torch.bfloat16):
         raise ValueError(
             f"Virtual-expert gradients must use torch.float32 or torch.bfloat16, got {arena.dtype}."

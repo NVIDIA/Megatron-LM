@@ -13,9 +13,8 @@ and every training gradient. Planner and bridge internals are covered
 process-locally in ``test_virtual_expert_planner.py``; the transport kernels in
 ``test_virtual_expert_triton.py``.
 
-A bare ``MoELayer`` carries no DDP-time GTP wrapper, so the bridge's GTP gather and
-reduce-scatter path is exercised only by the training recipe with
-``--expert-tensor-parallel-num-weight-shards > 1``, not here.
+A bare ``MoELayer`` carries no DDP-time GTP wrapper. These cases do not cover the
+bridge's GTP weight-gather and gradient reduce-scatter integration.
 """
 
 import os
@@ -108,9 +107,9 @@ def _assert_mxfp8_prefetch_exact(manager, plan, orientation):
     """Check every active virtual MXFP8 component byte-for-byte against its owning rank."""
     components = MXFP8_COMPONENTS[:2] if orientation == "rowwise" else MXFP8_COMPONENTS[2:]
     errors = []
-    for index, fc_layer in enumerate(manager.fc_layers):
+    for index, parameters in enumerate(manager.virtual_experts.parameters):
         for component in components:
-            local = torch.stack(tuple(getattr(source, component) for source in fc_layer.parameters))
+            local = torch.stack(tuple(getattr(source, component) for source in parameters))
             gathered = [torch.empty_like(local) for _ in range(manager.ep_size)]
             torch.distributed.all_gather(gathered, local, group=manager.group)
             for slot, expert in enumerate(
@@ -120,7 +119,7 @@ def _assert_mxfp8_prefetch_exact(manager, plan, orientation):
                     continue
                 owner, owned = divmod(expert, manager.num_owned_experts)
                 if not torch.equal(
-                    getattr(manager.virtual_experts.parameters[index][slot], component),
+                    getattr(manager.virtual_experts.slot_weights[index][slot], component),
                     gathered[owner][owned],
                 ):
                     errors.append(f"fc_layer={index} {component} slot={slot} expert={expert}")
@@ -136,18 +135,18 @@ def _assert_mxfp8_prefetch_exact(manager, plan, orientation):
 def _assert_runtime_layout(manager, *, grad_dtype, mxfp8):
     """Check that the runtime weights and grads TE executes against alias the shared arenas."""
     assert manager.virtual_experts.grad_arena.dtype == grad_dtype
-    for index, fc_layer in enumerate(manager.fc_layers):
-        runtime_weights = manager.runtime_weights(index)
+    for fc_layer, parameters in enumerate(manager.virtual_experts.parameters):
+        runtime_weights = manager.runtime_weights(fc_layer)
         assert len(runtime_weights) == manager.num_runtime_experts
-        virtual_parameters = manager.virtual_experts.parameters[index]
+        virtual_parameters = manager.virtual_experts.slot_weights[fc_layer]
         assert all(slot.main_grad.dtype == grad_dtype for slot in virtual_parameters)
         for index, runtime_weight in enumerate(runtime_weights):
             if index < manager.num_owned_experts:
                 # A bare MoELayer has no DDP-time GTP wrapper, so natives alias the
                 # optimizer parameters directly.
-                assert fc_layer.gtp_leader is None
-                expected_weight = fc_layer.parameters[index]
-                expected_grad = fc_layer.native_grads[index]
+                assert manager.virtual_experts.gtp_leaders[fc_layer] is None
+                expected_weight = parameters[index]
+                expected_grad = manager.virtual_experts.native_grads[fc_layer][index]
             else:
                 slot = index - manager.num_owned_experts
                 expected_weight = virtual_parameters[slot]
@@ -296,10 +295,11 @@ def _run_full_layer_parity(
         if mxfp8:
             # A state_dict load does not carry the quantized component storage,
             # so mirror it explicitly before comparing the two layers.
-            for linear, virtual_expert in zip(
-                (ref_layer.experts.linear_fc1, ref_layer.experts.linear_fc2), manager.fc_layers
+            for linear, parameters in zip(
+                (ref_layer.experts.linear_fc1, ref_layer.experts.linear_fc2),
+                manager.virtual_experts.parameters,
             ):
-                for index, destination in enumerate(virtual_expert.parameters):
+                for index, destination in enumerate(parameters):
                     source = linear.get_parameter(f"weight{index}")
                     for component in MXFP8_COMPONENTS:
                         getattr(destination, component).copy_(getattr(source, component))
@@ -311,9 +311,9 @@ def _run_full_layer_parity(
                 _assert_mxfp8_prefetch_exact(virtual_experts, plans[-1], "rowwise")
             output.float().sum().backward()
             if virtual_experts is not None:
-                for fc_layer in virtual_experts.fc_layers:
-                    for parameter in fc_layer.parameters:
-                        if fc_layer.gtp_leader is None:
+                for fc_layer, parameters in enumerate(virtual_experts.virtual_experts.parameters):
+                    for parameter in parameters:
+                        if virtual_experts.virtual_experts.gtp_leaders[fc_layer] is None:
                             # The bridge hands the reduced wgrad to the optimizer
                             # parameter through autograd's main-grad protocol.
                             assert parameter.grad is not None
@@ -321,8 +321,8 @@ def _run_full_layer_parity(
                         parameter.grad = None
                 assert all(
                     runtime_parameter.grad is None
-                    for fc_layer in virtual_experts.fc_layers
-                    for runtime_parameter in fc_layer.runtime_parameters
+                    for weights in virtual_experts.virtual_experts.runtime_weights
+                    for runtime_parameter in weights
                 )
                 if mxfp8:
                     _assert_mxfp8_prefetch_exact(virtual_experts, plans[-1], "columnwise")
