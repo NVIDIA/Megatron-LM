@@ -36,7 +36,7 @@ from megatron.core.ssm.ssm_inference import SSMDynamicInferenceMixin
 from megatron.core.tensor_parallel import get_cuda_rng_tracker
 from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
 from megatron.core.transformer import TransformerConfig
-from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.module import MegatronModule, TwoStageAttentionLayer
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.utils import (
     ensure_metadata_has_dp_cp_group,
@@ -167,7 +167,7 @@ class GatedDeltaProductMixerSubmodules:
     out_proj: Union[ModuleSpec, type] = None
 
 
-class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
+class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLayer):
     """Gated Delta Product (GDP) sequence mixer for hybrid models.
 
     The mixer accepts hidden states with shape ``[sequence, batch, hidden]`` and returns
@@ -509,6 +509,24 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
             self.nheads_local_cp = self.nheads_local_tp
             self.ngroups_local_cp = self.ngroups_local_tp
 
+    def forward_pre_attn_and_core_attn(
+        self,
+        hidden_states,
+        *,
+        packed_seq_params=None,
+        packed_sequence_cp_metadata: PackedSequenceCPMetadata | None = None,
+    ):
+        """Run the training pre-attention and core-attention stage."""
+        return self._gdp_chunk_forward(
+            hidden_states,
+            packed_seq_params=packed_seq_params,
+            packed_sequence_cp_metadata=packed_sequence_cp_metadata,
+        )
+
+    def forward_post_core_attn(self, y):
+        """Apply GDP's output projection to a recurrence output."""
+        return self.out_proj(y)
+
     def forward(
         self,
         hidden_states,
@@ -518,7 +536,7 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
         packed_seq_params=None,
         packed_sequence_cp_metadata: PackedSequenceCPMetadata | None = None,
     ):
-        """Run the gated delta product mixer on hidden states."""
+        """Run GDP's recurrence followed by its output projection."""
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
         if self.chunkwise_context_parallel and inference_context is not None:
@@ -566,10 +584,6 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
                 # The states are updated in place.
                 return self._static_decode(hidden_states, conv_state, ssm_state)
 
-        if packed_seq_params is not None:
-            # ``hidden_states`` is [seq_len, batch, dim]; THD requires batch=1.
-            assert batch_size == 1, "Packed sequences require batch=1 (THD/varlen format)."
-
         y = self._gdp_chunk_forward(
             hidden_states,
             conv_state=conv_state,
@@ -577,10 +591,7 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
             packed_seq_params=packed_seq_params,
             packed_sequence_cp_metadata=packed_sequence_cp_metadata,
         )
-
-        out, out_bias = self.out_proj(y)
-
-        return out, out_bias
+        return self.out_proj(y)
 
     def _packed_metadata(
         self, packed_seq_params: PackedSeqParams | None
@@ -627,6 +638,11 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
         Prefill passes conv_state and ssm_state so the trailing conv window and the final
         recurrent state are cached for the decode steps.
         """
+        if packed_seq_params is not None:
+            # ``hidden_states`` is [seq_len, batch, dim]; THD requires batch=1.
+            _, batch_size, _ = hidden_states.shape
+            assert batch_size == 1, "Packed sequences require batch=1 (THD/varlen format)."
+
         if self.recompute_in_proj:
             # Checkpoint the input projection and its preprocessing, discard the z, VKQ,
             # and ba outputs after the forward pass, and recompute them in the backward

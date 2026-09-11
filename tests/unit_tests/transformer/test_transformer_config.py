@@ -124,6 +124,154 @@ def test_from_config_creates_independent_target_config_without_reinitializing():
     assert config.dynamic_value == {"items": []}
 
 
+@pytest.mark.parametrize(
+    ("overrides", "error", "message"),
+    [
+        pytest.param(
+            {"moe_shortcut_connection": True},
+            AssertionError,
+            "requires MoE to be enabled",
+            id="requires-moe",
+        ),
+        pytest.param(
+            {"num_moe_experts": 2, "moe_shortcut_parallel": True},
+            AssertionError,
+            "requires moe_shortcut_connection",
+            id="parallel-requires-shortcut",
+        ),
+        pytest.param(
+            {
+                "num_moe_experts": 2,
+                "moe_shortcut_connection": True,
+                "recompute_granularity": "full",
+            },
+            ValueError,
+            "not supported with full activation recomputation",
+            id="full-recompute",
+        ),
+        pytest.param(
+            {
+                "num_moe_experts": 2,
+                "moe_shortcut_connection": True,
+                "moe_shared_expert_overlap": True,
+            },
+            ValueError,
+            "mutually exclusive",
+            id="shared-expert-overlap",
+        ),
+        pytest.param(
+            {"num_moe_experts": 2, "moe_shortcut_connection": True, "cuda_graph_impl": "local"},
+            AssertionError,
+            "CUDA graphs are not supported",
+            id="cuda-graphs",
+        ),
+    ],
+)
+def test_shortcut_rejects_incompatible_configurations(overrides, error, message):
+    with pytest.raises(error, match=message):
+        TransformerConfig(
+            num_layers=2,
+            hidden_size=128,
+            num_attention_heads=4,
+            moe_router_topk=1,
+            moe_router_pre_softmax=True,
+            **overrides,
+        )
+
+
+def _make_shortcut_memory_config(**overrides):
+    kwargs = dict(
+        num_layers=2,
+        hidden_size=128,
+        num_attention_heads=4,
+        num_moe_experts=2,
+        moe_router_topk=1,
+        moe_router_pre_softmax=True,
+        moe_shortcut_connection=True,
+        moe_shortcut_post_norm=True,
+        recompute_modules=[],
+        offload_modules=[],
+    )
+    kwargs.update(overrides)
+    return TransformerConfig(**kwargs)
+
+
+@pytest.mark.parametrize(
+    ("recompute_pre_norm", "offload_post_norm"),
+    [
+        pytest.param(True, False, id="pre-recompute"),
+        pytest.param(False, True, id="post-offload"),
+        pytest.param(True, True, id="combined"),
+    ],
+)
+def test_shortcut_memory_controls_accept_independent_and_combined_selection(
+    recompute_pre_norm, offload_post_norm
+):
+    config = _make_shortcut_memory_config(
+        recompute_granularity="selective" if recompute_pre_norm else None,
+        recompute_modules=["shortcut_pre_mlp_layernorm"] if recompute_pre_norm else [],
+        fine_grained_activation_offloading=offload_post_norm,
+        offload_modules=["shortcut_post_norm"] if offload_post_norm else [],
+    )
+
+    assert ("shortcut_pre_mlp_layernorm" in config.recompute_modules) is recompute_pre_norm
+    assert ("shortcut_post_norm" in config.offload_modules) is offload_post_norm
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        pytest.param(
+            {
+                "recompute_granularity": "selective",
+                "recompute_modules": ["shortcut_pre_mlp_layernorm"],
+            },
+            id="pre-recompute",
+        ),
+        pytest.param(
+            {"fine_grained_activation_offloading": True, "offload_modules": ["shortcut_post_norm"]},
+            id="post-offload",
+        ),
+    ],
+)
+def test_shortcut_memory_controls_require_shortcut_connection(overrides):
+    with pytest.raises(ValueError, match="require moe_shortcut_connection"):
+        _make_shortcut_memory_config(moe_shortcut_connection=False, **overrides)
+
+
+@pytest.mark.parametrize("recompute_granularity", [None, "full"])
+def test_shortcut_pre_norm_recompute_requires_selective_granularity(recompute_granularity):
+    with pytest.raises(ValueError, match="requires recompute_granularity='selective'"):
+        _make_shortcut_memory_config(
+            recompute_granularity=recompute_granularity,
+            recompute_modules=["shortcut_pre_mlp_layernorm"],
+        )
+
+
+def test_shortcut_pre_norm_recompute_rejects_fp8_delayed_scaling():
+    with pytest.raises(ValueError, match="Delayed scaling does not support"):
+        _make_shortcut_memory_config(
+            recompute_granularity="selective",
+            recompute_modules=["shortcut_pre_mlp_layernorm"],
+            fp8="e4m3",
+            fp8_recipe="delayed",
+        )
+
+
+def test_shortcut_pre_norm_recompute_applies_fp8_te_version_requirement(monkeypatch):
+    from megatron.core.transformer import transformer_config as transformer_config_module
+
+    monkeypatch.setattr(transformer_config_module, "is_te_min_version", lambda _version: False)
+    monkeypatch.setattr(transformer_config_module, "get_te_version", lambda: "2.5.0")
+    with pytest.raises(ValueError, match="transformer-engine>=2.6.0dev0"):
+        _make_shortcut_memory_config(
+            recompute_granularity="selective",
+            recompute_modules=["shortcut_pre_mlp_layernorm"],
+            fp8="e4m3",
+            fp8_recipe="tensorwise",
+        )
+
+
 @pytest.mark.parametrize("num_householder", [0, -1])
 def test_gdp_num_householder_rejects_non_positive_values(num_householder: int):
     with pytest.raises(ValueError, match="gdp_num_householder must be positive"):
