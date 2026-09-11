@@ -237,6 +237,7 @@ class DSv4HybridAttention(Attention):
         sequence_len_offset=None,
         *,
         inference_params=None,
+        csa2_state=None,
     ):
         """Forward pass for DeepSeek-v4 Hybrid Attention"""
         assert (
@@ -329,6 +330,7 @@ class DSv4HybridAttention(Attention):
                 qr=q_compressed,
                 boundary_hidden=boundary_hidden,
                 boundary_kv=boundary_kv,
+                **({"csa2_state": csa2_state} if csa2_state is not None else {}),
             )
         forced_released_tensors = [query, key, value]
         if boundary_kv is not None:
