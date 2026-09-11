@@ -3166,54 +3166,6 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         unwrapped_model = unwrap_model(model[0])
         unwrapped_model.cancel_gradients_last_layer(args.curr_iteration)
 
-    if os.environ.get("MEGATRON_DEBUG_NONFINITE_GRADS", "0") == "1":
-        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-        checked = 0
-        bad = 0
-        seen = set()
-        for model_chunk_id, model_chunk in enumerate(model):
-            unwrapped_model_chunk = unwrap_model(model_chunk)
-            for param_name, param in unwrapped_model_chunk.named_parameters():
-                if id(param) in seen:
-                    continue
-                seen.add(id(param))
-                grad = getattr(param, "main_grad", None)
-                grad_source = "main_grad"
-                if grad is None:
-                    grad = param.grad
-                    grad_source = "grad"
-                if not isinstance(grad, torch.Tensor):
-                    continue
-                checked += 1
-                finite = torch.isfinite(grad)
-                if bool(finite.all().item()):
-                    continue
-                bad += 1
-                nan_count = int(torch.isnan(grad).sum().item())
-                inf_count = int(torch.isinf(grad).sum().item())
-                finite_values = grad.detach()[finite]
-                finite_abs_max = (
-                    float(finite_values.abs().max().item())
-                    if finite_values.numel() > 0
-                    else float("nan")
-                )
-                print(
-                    "[DSV3_NUMERICS] "
-                    f"rank={rank} iteration={iteration} chunk={model_chunk_id} "
-                    f"BAD_GRAD name={param_name} source={grad_source} "
-                    f"param_type={type(param).__name__} shape={tuple(grad.shape)} "
-                    f"dtype={grad.dtype} nan={nan_count} inf={inf_count} "
-                    f"finite_abs_max={finite_abs_max}",
-                    flush=True,
-                )
-        if rank == 0 or bad:
-            print(
-                "[DSV3_NUMERICS] "
-                f"rank={rank} iteration={iteration} grad_scan_complete "
-                f"checked={checked} bad={bad}",
-                flush=True,
-            )
-
     # Update parameters.
 
     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)

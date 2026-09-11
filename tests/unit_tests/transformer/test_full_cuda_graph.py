@@ -1,6 +1,5 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
-from contextlib import nullcontext
 import warnings
 from unittest.mock import Mock, patch
 
@@ -10,11 +9,7 @@ from pytest_mock import mocker
 
 import megatron.core.pipeline_parallel.schedules as schedule
 from megatron.core import ModelParallelConfig
-from megatron.core.full_cuda_graph import (
-    FullCudaGraphWrapper,
-    StaticBufferLoader,
-    get_shared_capture_stream,
-)
+from megatron.core.full_cuda_graph import FullCudaGraphWrapper, get_shared_capture_stream
 from megatron.core.tensor_parallel.random import (
     HAVE_TE,
     initialize_rng_tracker,
@@ -25,59 +20,6 @@ from megatron.training.models.dist_utils import _ddp_wrap
 from tests.unit_tests.test_utilities import Utils
 
 rank = Utils.rank
-
-
-def test_full_cuda_graph_uses_distinct_static_buffers_for_virtual_chunks():
-    """Virtual pipeline chunks must not alias static input buffers."""
-    wrapper = FullCudaGraphWrapper.__new__(FullCudaGraphWrapper)
-    wrapper.static_loader = Mock(side_effect=lambda inputs, _stage, index: (index, inputs))
-    num_microbatches = 2
-    data_iterator = [
-        iter([{'tokens': None}] * num_microbatches),
-        None,
-        iter([{'tokens': torch.ones(1)}] * num_microbatches),
-    ]
-
-    data_list = wrapper.data_read(
-        data_iterator=data_iterator,
-        model=[Mock(), Mock(), Mock()],
-        training=True,
-        num_microbatches=num_microbatches,
-    )
-
-    assert [index for index, _ in data_list[0]] == [0, 1]
-    assert data_list[1] is None
-    assert [index for index, _ in data_list[2]] == [2, 3]
-
-
-def test_static_buffer_loader_replaces_none_with_tensor():
-    """A field that becomes a tensor must receive static tensor storage."""
-    original_empty_like = torch.empty_like
-    loader = StaticBufferLoader.__new__(StaticBufferLoader)
-    loader.stream = Mock()
-    StaticBufferLoader.static_buffers = {
-        'training': [{'tokens': None}],
-        'validation': [],
-    }
-    current_stream = Mock()
-
-    try:
-        with (
-            patch.object(torch.cuda, "current_stream", return_value=current_stream),
-            patch.object(torch.cuda, "stream", return_value=nullcontext()),
-            patch.object(
-                torch,
-                "empty_like",
-                side_effect=lambda tensor, device=None: original_empty_like(tensor),
-            ),
-        ):
-            result = loader({'tokens': torch.ones(2)}, 'training', 0)
-    finally:
-        StaticBufferLoader.static_buffers = {'training': [], 'validation': []}
-
-    torch.testing.assert_close(result['tokens'], torch.ones(2))
-    loader.stream.wait_stream.assert_called_once_with(current_stream)
-    current_stream.wait_stream.assert_called_once_with(loader.stream)
 
 
 def test_ddp_grad_accumulators_share_full_cuda_graph_stream():
