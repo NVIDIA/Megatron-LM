@@ -564,11 +564,12 @@ class TestDynamicInferenceEngineParallel(DynamicInferenceEngineTestBase):
     def test_mtp_kv_cache_prefix_caching_matches_across_schedulers(self, enable_chunked_prefill):
         """Prefix caching (and optionally chunked prefill) under EP, async vs legacy.
 
-        With BOTH features on, a request can reach the commit pass with `off > 0` for two
-        different reasons -- it resumed its own previous chunk, or it inherited a cached
-        prefix produced by a DIFFERENT request. `_mtp_commit_pass` must tell them apart
-        (`own_prior_chunk`): the first seeds the straddling entry at `off-1` from the carried
-        boundary hidden, the second must leave that shared entry alone. This combination is
+        With BOTH features on, a request reaches the commit pass with `off > 0` for two
+        different reasons: it resumed its own previous chunk, or it inherited a cached prefix
+        produced by a DIFFERENT request. `take_chunk_boundary` tells them apart on request id
+        AND recorded position, and only the first writes the straddling entry at `off-1` from
+        the carried hidden. The second needs no write -- `_compute_prefix_match` drops the last
+        matched block, so `off-1` is already correct in the inherited one. This combination is
         the only way to exercise that disambiguation end to end.
 
         The draft KV affects acceptance rate, never verified output, so the two scheduling
