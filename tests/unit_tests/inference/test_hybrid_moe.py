@@ -273,6 +273,37 @@ class _TestDynamicInferenceBase:
 class TestDynamicInferenceNVLS(_TestDynamicInferenceBase):
     """NVLS dispatcher: combinatorial sweep of EP request states."""
 
+    @pytest.mark.internal
+    @torch.inference_mode()
+    def test_bounded_flashinfer_graph_admission_uses_ep_wide_mode(self):
+        """A local decode graph must reject bounded rows when an EP peer has prefill."""
+        ep_rank = parallel_state.get_expert_model_parallel_rank()
+
+        model = self._build_model()
+        # This test exercises context graph admission, not the grouped-GEMM
+        # implementation. Mutate after construction to avoid requiring FlashInfer
+        # in this otherwise backend-independent distributed test.
+        model.config.inference_flashinfer_bounded_rows = True
+        ctx = self._build_context(model, max_requests=64, max_tokens=512)
+
+        ctx.add_dummy_requests_for_cudagraph_capture(_STATE_DIMS[DECODE])
+        ctx.initialize_attention_state()
+
+        assert ctx.can_use_bounded_flashinfer_rows()
+        assert ctx.using_cuda_graph_this_step()
+
+        ctx.reset()
+        local_state = PREFILL if ep_rank == 0 else DECODE
+        ctx.add_dummy_requests_for_cudagraph_capture(_STATE_DIMS[local_state])
+
+        ctx.initialize_attention_state()
+
+        assert not ctx.can_use_bounded_flashinfer_rows()
+        if local_state == DECODE:
+            assert not ctx.using_cuda_graph_this_step()
+        else:
+            assert ctx.using_cuda_graph_this_step()
+
     @requires_te_batch_invariant_attention
     @torch.inference_mode()
     def test_batch_invariant_prefill_matches_full_forward(self):

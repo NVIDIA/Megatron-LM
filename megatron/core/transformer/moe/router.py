@@ -940,8 +940,9 @@ class InferenceTopKRouter(TopKRouter):
         router_replay,
         dense_output,
         precomputed_indices,
+        use_int32_indices,
     ):
-        return topk_routing_with_score_function(
+        probs, top_indices = topk_routing_with_score_function(
             logits,
             topk,
             use_pre_softmax=use_pre_softmax,
@@ -955,6 +956,9 @@ class InferenceTopKRouter(TopKRouter):
             dense_output=dense_output,
             precomputed_indices=precomputed_indices,
         )
+        if use_int32_indices:
+            top_indices = top_indices.to(torch.int32)
+        return probs, top_indices
 
     def _forward(self, input: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
         logits = self.gating(input).squeeze(1)  # [num_tokens, num_experts]
@@ -964,25 +968,26 @@ class InferenceTopKRouter(TopKRouter):
         if self.qb_beta is not None:
             precomputed_indices = (logits - self.qb_beta).topk(self.topk, dim=1).indices
 
+        batch_invariant = is_batch_invariant_mode_enabled()
         routing = (
-            topk_routing_with_score_function
-            if is_batch_invariant_mode_enabled()
-            else self._compiled_topk_routing
+            topk_routing_with_score_function if batch_invariant else self._compiled_topk_routing
         )
-        probs, top_indices = routing(
-            logits,
-            self.topk,
-            use_pre_softmax=self.config.moe_router_pre_softmax,
-            num_groups=self.config.moe_router_num_groups,
-            group_topk=self.config.moe_router_group_topk,
-            scaling_factor=self.config.moe_router_topk_scaling_factor,
-            score_function=self.score_function,
-            expert_bias=self.expert_bias,
-            fused=self.config.moe_router_fusion,
-            router_replay=self.router_replay,
-            dense_output=True,
-            precomputed_indices=precomputed_indices,
-        )
+        routing_kwargs = {
+            "use_pre_softmax": self.config.moe_router_pre_softmax,
+            "num_groups": self.config.moe_router_num_groups,
+            "group_topk": self.config.moe_router_group_topk,
+            "scaling_factor": self.config.moe_router_topk_scaling_factor,
+            "score_function": self.score_function,
+            "expert_bias": self.expert_bias,
+            "fused": self.config.moe_router_fusion,
+            "router_replay": self.router_replay,
+            "dense_output": True,
+            "precomputed_indices": precomputed_indices,
+        }
+        if not batch_invariant:
+            backend = self.config.inference_grouped_gemm_backend
+            routing_kwargs["use_int32_indices"] = getattr(backend, "value", backend) == "flashinfer"
+        probs, top_indices = routing(logits, self.topk, **routing_kwargs)
         return probs.squeeze(1), top_indices.squeeze(1)
 
     def forward(self, input: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):

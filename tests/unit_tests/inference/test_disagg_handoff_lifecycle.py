@@ -348,6 +348,7 @@ def test_setup_pins_handoff_outputs_only_on_prefill():
     allocator = SimpleNamespace(
         enable_prefix_caching=True, enable_handoff_pinning=False, pool_size=8
     )
+    published_roles = []
     engine.context = SimpleNamespace(
         kv_block_allocator=allocator,
         memory_buffer=torch.empty(2, 1, 8, 4, 1, 1),
@@ -357,6 +358,7 @@ def test_setup_pins_handoff_outputs_only_on_prefill():
         hidden_size_per_attention_head=1,
         block_size_tokens=4,
         num_mamba_layers=0,
+        set_disaggregated_inference_role=published_roles.append,
     )
     model_config = SimpleNamespace(num_query_groups=1, num_attention_heads=1)
     engine.controller = SimpleNamespace(
@@ -379,6 +381,8 @@ def test_setup_pins_handoff_outputs_only_on_prefill():
         assert not allocator.enable_handoff_pinning
         engine.setup_kv_transfer("prefill")
         assert allocator.enable_handoff_pinning
+
+    assert published_roles == ["decode", "prefill"]
 
 
 def test_handoff_roles_use_live_ssm_buffers_and_decode_rejects_durable_cache():
@@ -409,6 +413,7 @@ def test_handoff_roles_use_live_ssm_buffers_and_decode_rejects_durable_cache():
         hidden_size_per_attention_head=1,
         block_size_tokens=4,
         mamba_slot_allocator=object(),
+        set_disaggregated_inference_role=lambda role: None,
     )
     model_config = SimpleNamespace(
         num_query_groups=1, num_attention_heads=1, mamba_num_heads=2, mamba_num_groups=1

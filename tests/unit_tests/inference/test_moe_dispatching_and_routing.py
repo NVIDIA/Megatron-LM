@@ -184,6 +184,21 @@ class TestInferenceTopKRouter:
         # Same expert selections
         assert training_experts == inference_experts
 
+    @pytest.mark.parametrize(
+        ("backend", "expected_dtype"), [("flashinfer", torch.int32), ("vllm", torch.int64)]
+    )
+    def test_inference_routing_index_dtype_matches_backend(self, backend, expected_dtype):
+        """FlashInfer avoids an int64 AGV and post-AGV cast; vLLM retains int64."""
+        router = self._make_router(inference_grouped_gemm_backend=backend)
+        input_tensor = torch.randn(
+            16, NANOV3_BASE["hidden_size"], device="cuda", dtype=torch.bfloat16
+        )
+
+        with InferenceMode.active():
+            _, top_indices = router(input_tensor)
+
+        assert top_indices.dtype == expected_dtype
+
 
 # ──────────────────────────────────────────────────────────────────────
 # NCCLAllGatherDispatcher
@@ -892,17 +907,26 @@ class TestMaskRoutingPadding:
 
     TOPK = 6
 
-    def _routing_map(self, n_rows, fill=3):
+    def _routing_map(self, n_rows, fill=3, dtype=torch.int64):
         # All entries non-negative so masked (-1) slots are unambiguous.
-        return torch.full((n_rows, self.TOPK), fill, dtype=torch.int64, device="cuda")
+        return torch.full((n_rows, self.TOPK), fill, dtype=dtype, device="cuda")
 
     def _real_token_count(self, count):
         return torch.tensor([count], dtype=torch.int32, device="cuda")
 
-    @pytest.mark.parametrize("n_rows, real_count", [(16, 10), (128, 1), (7, 7), (64, 0)])
-    def test_masks_rows_past_real_count(self, n_rows, real_count):
+    @pytest.mark.parametrize(
+        ("n_rows", "real_count", "dtype"),
+        [
+            (16, 10, torch.int64),
+            (128, 1, torch.int64),
+            (7, 7, torch.int64),
+            (64, 0, torch.int64),
+            (16, 10, torch.int32),
+        ],
+    )
+    def test_masks_rows_past_real_count(self, n_rows, real_count, dtype):
         """Rows >= real_count become -1; rows < real_count are untouched (tp_rank=0)."""
-        routing_map = self._routing_map(n_rows)
+        routing_map = self._routing_map(n_rows, dtype=dtype)
         original = routing_map.clone()
 
         mask_routing_padding(routing_map, self._real_token_count(real_count), tp_rank=0)

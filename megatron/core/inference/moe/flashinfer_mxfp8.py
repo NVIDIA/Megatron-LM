@@ -27,6 +27,8 @@ except ImportError as exc:
 from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
 
 logger = logging.getLogger(__name__)
+# 512 is the smallest capacity available in the TRTLLM block-scale runner.
+FLASHINFER_MXFP8_MIN_ACTIVE_ROWS = 512
 _LOGGED_TOKEN_POLICIES: set[tuple[str, int, int]] = set()
 
 
@@ -229,14 +231,12 @@ def quantize_routed_mxfp8_input(
     return quantized_hidden, hidden_scale
 
 
-def select_routed_mxfp8_active_rows(
-    full_rows: int, *, token_capacity: int | None, use_bounded_rows: bool
-) -> tuple[int, str]:
-    """Select the graph-stable row count for one routed-MoE invocation.
+def select_flashinfer_active_rows(full_rows: int, *, token_capacity: int | None) -> tuple[int, str]:
+    """Select the graph-stable row count for one FlashInfer MoE invocation.
 
-    The controller enables a bounded prefix only for a decode-only graph whose
-    static EP-wide token bound fits the configured capacity. All other graphs
-    retain the full dispatcher buffer so prompt tokens are never truncated.
+    The controller provides the inferred capacity only when every EP rank is
+    decode-only. All other steps retain the full dispatcher buffer so prompt
+    tokens are never truncated.
     """
     if full_rows <= 0:
         raise ValueError(f"full_rows must be positive; got {full_rows}")
@@ -244,9 +244,30 @@ def select_routed_mxfp8_active_rows(
         return full_rows, "full"
     if token_capacity <= 0:
         raise ValueError(f"token_capacity must be positive; got {token_capacity}")
-    if use_bounded_rows:
-        return min(token_capacity, full_rows), "bounded-decode"
-    return full_rows, "full"
+    return min(token_capacity, full_rows), "bounded-decode"
+
+
+def enforce_flashinfer_mxfp8_min_token_capacity(token_capacity: int | None) -> int | None:
+    """Floor bounded MXFP8 rows at the minimum verified kernel-covered capacity."""
+    if token_capacity is None:
+        return None
+    if token_capacity <= 0:
+        raise ValueError(f"token_capacity must be positive; got {token_capacity}")
+    return max(token_capacity, FLASHINFER_MXFP8_MIN_ACTIVE_ROWS)
+
+
+def select_flashinfer_mxfp8_active_rows(
+    full_rows: int, *, token_capacity: int | None
+) -> tuple[int, str]:
+    """Validate and select routed MXFP8 rows for a kernel-covered shape."""
+    active_rows, policy = select_flashinfer_active_rows(full_rows, token_capacity=token_capacity)
+    if active_rows < FLASHINFER_MXFP8_MIN_ACTIVE_ROWS:
+        raise ValueError(
+            "FlashInfer MXFP8 requires at least "
+            f"{FLASHINFER_MXFP8_MIN_ACTIVE_ROWS} active rows to avoid an unsupported "
+            f"kernel shape; got {active_rows}"
+        )
+    return active_rows, policy
 
 
 def flashinfer_routed_mxfp8_moe_prequantized(
@@ -305,13 +326,12 @@ def flashinfer_routed_mxfp8_moe(
     activation_type: int,
     out: torch.Tensor | None = None,
     token_capacity: int | None = None,
-    use_bounded_rows: bool = False,
 ) -> torch.Tensor:
     """Run the FlashInfer TRT-LLM routed MXFP8 MoE kernel.
 
-    When token_capacity is set and the controller marks the current graph safe,
-    only that fixed prefix is processed. Prefill, mixed steps, and too-large decode
-    configurations process the full input.
+    When token_capacity is set, only that fixed prefix is processed. The controller
+    provides a capacity only when every EP rank is decode-only; prefill and mixed
+    steps process the full input.
     Invalid rows in the bounded prefix must already have expert ID -1.
 
     The row choice is made when each CUDA graph is built, so graph replay sees fixed
@@ -332,8 +352,8 @@ def flashinfer_routed_mxfp8_moe(
         )
 
     full_rows = hidden_states.shape[0]
-    active_rows, policy = select_routed_mxfp8_active_rows(
-        full_rows, token_capacity=token_capacity, use_bounded_rows=use_bounded_rows
+    active_rows, policy = select_flashinfer_mxfp8_active_rows(
+        full_rows, token_capacity=token_capacity
     )
     if token_capacity is not None:
         policy_key = (policy, token_capacity, full_rows)
@@ -341,7 +361,7 @@ def flashinfer_routed_mxfp8_moe(
             _LOGGED_TOKEN_POLICIES.add(policy_key)
             logger.info(
                 "FlashInfer MXFP8 token policy: %s active_rows=%d full_rows=%d "
-                "configured_capacity=%d",
+                "inferred_capacity=%d",
                 policy,
                 active_rows,
                 full_rows,
