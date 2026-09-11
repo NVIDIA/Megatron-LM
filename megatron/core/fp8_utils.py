@@ -797,8 +797,15 @@ if HAVE_TE:
                     fp8_format=fp8_format, fp8_dpa=config.fp8_dot_product_attention
                 )
             elif config.fp8_recipe == Fp8Recipe.blockwise and is_te_min_version("2.3.0.dev0"):
-                fp8_recipe = transformer_engine.common.recipe.Float8BlockScaling(
-                    fp8_format=fp8_format
+                # Guard backward (E5M2) wgrad against all-zero gradient blocks:
+                # amax=0 → scale=inf → NaN.
+                block_scaling_recipe_cls = transformer_engine.common.recipe.Float8BlockScaling
+                fp8_recipe = block_scaling_recipe_cls(
+                    fp8_format=fp8_format,
+                    fp8_quant_bwd_grad=transformer_engine.common.recipe.QParams(
+                        power_2_scale=block_scaling_recipe_cls.fp8_quant_bwd_grad.power_2_scale,
+                        amax_epsilon=1e-12,
+                    ),
                 )
             elif config.fp8_recipe == Fp8Recipe.mxfp8:
                 fp8_recipe = transformer_engine.common.recipe.MXFP8BlockScaling(
