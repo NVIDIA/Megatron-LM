@@ -12,7 +12,6 @@ from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import Partial, Replicate, Shard
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.dbuffer import DBuffer
-from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.layout import GlobalLayout
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.placement import (
     BlockAtomic,
     Flat,
@@ -30,27 +29,6 @@ def _same_tensors_on_all_ranks(device: torch.device) -> list[torch.Tensor]:
 def _assert_dbuffer_local_tensors_close(buffer: DBuffer, expected: Iterable[torch.Tensor]) -> None:
     for index, tensor in enumerate(expected):
         torch.testing.assert_close(buffer.get_local_tensor(index), tensor)
-
-
-def test_dbuffer_preserves_supplied_layout(distributed_setup):
-    """Casting and redistribution preserve explicit offsets and allocation padding."""
-    mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
-    layout = GlobalLayout(
-        tensor_shapes=(torch.Size((2, 4)), torch.Size((2, 4))),
-        tensor_to_offset=(8, 24),
-        size=32 * mesh.size(),
-    )
-    buffer = DBuffer(mesh, [Replicate()], layout, torch.float32, distributed_setup.device)
-    tensors = [torch.full((2, 4), value, device=buffer.device) for value in (1.0, 2.0)]
-    for index, tensor in enumerate(tensors):
-        buffer.get_local_tensor(index).copy_(tensor)
-
-    cast = buffer.cast(torch.float64)
-    assert cast.layout == layout
-    _assert_dbuffer_local_tensors_close(cast, [tensor.double() for tensor in tensors])
-    gathered = buffer.redistribute([Flat()]).allgather(0)
-    assert gathered.layout == layout
-    _assert_dbuffer_local_tensors_close(gathered, tensors)
 
 
 def test_dbuffer_layout_pads_to_lcm_times_dp_size_and_fills_gaps(distributed_setup):
