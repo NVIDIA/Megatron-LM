@@ -12,7 +12,7 @@ from ..dist_checkpointing.mapping import ShardedStateDict
 from ..distributed.fsdp.src.megatron_fsdp.experimental.parameter_group import (
     sync_model_weights_from_main_weights,
 )
-from ..transformer.module import MegatronModule
+from ..transformer.module import MegatronModule, param_is_not_shared
 from .grad_scaler import MegatronGradScaler
 from .optimizer import MixedPrecisionOptimizer
 from .optimizer_config import OptimizerConfig
@@ -157,6 +157,10 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
             (), dtype=torch.float32, device=torch.cuda.current_device()
         )
         for parameter in self.get_parameters():
+            # Match MegatronOptimizer's shared-parameter filtering so pipeline-shared
+            # weights are not counted more than once.
+            if not param_is_not_shared(parameter):
+                continue
             # MFSDP v2 reduces into parameter.grad; it never populates decoupled_grad,
             # which is a v1 param-and-grad-buffer concept.
             grad = parameter.grad
