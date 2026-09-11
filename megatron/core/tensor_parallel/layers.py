@@ -335,8 +335,8 @@ class VocabParallelEmbedding(torch.nn.Module):
             )
         )
         self.num_embeddings_per_partition = self.vocab_end_index - self.vocab_start_index
-        self.deterministic_mode = config.deterministic_mode
         self.config = config
+        self._deterministic_flag_checked = False
 
         self.use_inference_optimized_reduce_scatter = (
             getattr(config, 'transformer_impl', None) == 'inference_optimized'
@@ -419,12 +419,21 @@ class VocabParallelEmbedding(torch.nn.Module):
 
             weight = GTPEmbeddingWeight.apply(self.weight)
 
-        # Get the embeddings.
-        if self.deterministic_mode:
-            output_parallel = weight[masked_input]
-        else:
-            # F.embedding currently has a non-deterministic backward function
-            output_parallel = F.embedding(masked_input, weight)
+        # F.embedding provides a deterministic CUDA backward under the PyTorch flag set by
+        # --deterministic-mode. Use it in both modes to avoid the serial accumulation of
+        # repeated ids in the weight-indexing backward path.
+        if self.config.deterministic_mode and not self._deterministic_flag_checked:
+            self._deterministic_flag_checked = True
+            if not torch.are_deterministic_algorithms_enabled():
+                warnings.warn(
+                    "VocabParallelEmbedding: config.deterministic_mode is set but "
+                    "torch.use_deterministic_algorithms(True) is not. Enable the PyTorch flag "
+                    "to ensure a deterministic F.embedding backward. --deterministic-mode sets "
+                    "the flag; library callers must set it themselves.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+        output_parallel = F.embedding(masked_input, weight)
         # Mask the output embedding.
         if self.tp_group.size() > 1:
             output_parallel[input_mask, :] = 0.0

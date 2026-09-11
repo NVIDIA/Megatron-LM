@@ -1,15 +1,22 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+import warnings
+
 import pytest
 import torch
 
 from megatron.core.extensions.transformer_engine import te_general_gemm
+from megatron.core.model_parallel_config import ModelParallelConfig
 from megatron.core.tensor_parallel.layers import (
+    VocabParallelEmbedding,
     copy_gtp_attributes,
     gtp_local_pad_zero_count,
     linear_with_frozen_weight,
     linear_with_grad_accumulation_and_async_allreduce,
 )
 from megatron.core.tensor_parallel.mappings import gather_from_tensor_model_parallel_region
+from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.utils import init_method_normal
+from tests.unit_tests.stream_contention import SideStreamContention, bit_equal, replay_count
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -303,3 +310,103 @@ def test_linear_fp32_output_matches_plain_te_general_gemm():
     )
 
     Utils.destroy_model_parallel()
+
+
+class TestVocabParallelEmbeddingDeterminism:
+    """The embedding lookup is a single code path whose backward is bit-reproducible.
+
+    ``F.embedding``'s CUDA backward sorts the ids and reduces each row's duplicates in a fixed
+    order, so ``VocabParallelEmbedding`` needs no ``deterministic_mode`` special case. The ids
+    are heavily duplicated (64 distinct ids over 32k positions plus one fully padded sequence),
+    so thousands of rows accumulate into the same embedding row -- where an atomic reduction
+    would show up as bit differences between replays.
+
+    torch >= 2.11 adds a fused atomic path for tables with few segments
+    (``min(num_ids, num_rows) * ceil(hidden / 1024) < 4 * num_SMs``); it is disabled under
+    ``torch.use_deterministic_algorithms(True)`` and out of reach for these shapes (8192 rows,
+    32k ids, hidden 1024), so both flag settings are expected to replay bit-exactly here.
+
+    Replays run under side-stream contention when the process has more than one hardware queue;
+    the unit-test bucket pins ``CUDA_DEVICE_MAX_CONNECTIONS=1``, where contention is a no-op and
+    more replays are taken instead (see ``tests/unit_tests/stream_contention.py``).
+    """
+
+    @staticmethod
+    def _module_and_inputs(deterministic_mode):
+        model_parallel_cuda_manual_seed(123)
+        config = ModelParallelConfig(
+            params_dtype=torch.bfloat16, bf16=True, deterministic_mode=deterministic_mode
+        )
+        module = VocabParallelEmbedding(
+            8192, 1024, init_method=init_method_normal(0.02), config=config
+        ).cuda()
+        torch.manual_seed(0)
+        ids = torch.randint(0, 64, (8, 4096), device="cuda") * 100
+        ids[0] = 3  # a fully padded sequence: 4096 copies of one id
+        grad_output = torch.randn(8, 4096, 1024, device="cuda", dtype=torch.bfloat16)
+        return module, ids, grad_output
+
+    @staticmethod
+    def _forward_backward(module, ids, grad_output):
+        module.weight.grad = None
+        out = module(ids)
+        out.backward(grad_output)
+        torch.cuda.synchronize()
+        return out.detach().clone(), module.weight.grad.detach().clone()
+
+    @pytest.mark.parametrize("deterministic_algorithms", [False, True])
+    def test_backward_replays_bit_exact(self, deterministic_algorithms):
+        Utils.initialize_model_parallel(1, 1)
+        prev = torch.are_deterministic_algorithms_enabled()
+        prev_warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+        torch.use_deterministic_algorithms(deterministic_algorithms, warn_only=True)
+        try:
+            module, ids, grad_output = self._module_and_inputs(deterministic_algorithms)
+            ref_out, ref_grad = self._forward_backward(module, ids, grad_output)
+            for _ in range(replay_count() - 1):
+                with SideStreamContention():
+                    out, grad = self._forward_backward(module, ids, grad_output)
+                assert bit_equal(out, ref_out)
+                assert bit_equal(grad, ref_grad)
+        finally:
+            torch.use_deterministic_algorithms(prev, warn_only=prev_warn_only)
+            Utils.destroy_model_parallel()
+
+    def test_deterministic_mode_does_not_change_the_lookup(self):
+        """Both config settings run the same kernel: outputs and weight grads are bit-identical."""
+        Utils.initialize_model_parallel(1, 1)
+        try:
+            results = []
+            for deterministic_mode in (False, True):
+                module, ids, grad_output = self._module_and_inputs(deterministic_mode)
+                with warnings.catch_warnings():
+                    # deterministic_mode without the torch flag warns once; not what is under test.
+                    warnings.simplefilter("ignore", RuntimeWarning)
+                    results.append(self._forward_backward(module, ids, grad_output))
+            (out_a, grad_a), (out_b, grad_b) = results
+            assert bit_equal(out_a, out_b)
+            assert bit_equal(grad_a, grad_b)
+        finally:
+            Utils.destroy_model_parallel()
+
+    def test_warns_once_when_deterministic_mode_lacks_the_torch_flag(self):
+        """config.deterministic_mode relies on torch.use_deterministic_algorithms(True); say so."""
+        Utils.initialize_model_parallel(1, 1)
+        prev = torch.are_deterministic_algorithms_enabled()
+        prev_warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+        torch.use_deterministic_algorithms(False)
+        try:
+            module, ids, _ = self._module_and_inputs(deterministic_mode=True)
+            with pytest.warns(RuntimeWarning, match="use_deterministic_algorithms"):
+                module(ids)
+            with warnings.catch_warnings():
+                warnings.simplefilter("error", RuntimeWarning)
+                module(ids)  # second forward: no repeat
+            torch.use_deterministic_algorithms(True, warn_only=True)
+            module, ids, _ = self._module_and_inputs(deterministic_mode=True)
+            with warnings.catch_warnings():
+                warnings.simplefilter("error", RuntimeWarning)
+                module(ids)  # flag set: nothing to warn about
+        finally:
+            torch.use_deterministic_algorithms(prev, warn_only=prev_warn_only)
+            Utils.destroy_model_parallel()
