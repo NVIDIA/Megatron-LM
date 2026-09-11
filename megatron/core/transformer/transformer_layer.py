@@ -1769,15 +1769,18 @@ class HyperConnectionTransformerLayer(TransformerLayer):
             "Use TransformerLayer instead if hyper connections are not needed."
         )
 
-        # mHC over a single MoE-MLP layer is not supported in this implementation;
-        # compose mHC with MoE by wrapping MoE inside a HyperConnectionHybridLayer
-        # (HybridStack path) instead. This guard fires at setup so misconfigured
-        # specs fail fast rather than producing silently-wrong shapes at runtime.
-        if self.is_moe_layer:
+        unsupported_moe_cuda_graph_modules = {
+            CudaGraphModule.moe,
+            CudaGraphModule.moe_router,
+            CudaGraphModule.moe_preprocess,
+        }
+        if self.is_moe_layer and unsupported_moe_cuda_graph_modules.intersection(
+            self.config.cuda_graph_modules
+        ):
             raise NotImplementedError(
-                "HyperConnectionTransformerLayer does not support MoE MLP submodules. "
-                "To combine mHC with MoE, wrap the MoE block as a HybridStack layer "
-                "via HyperConnectionHybridLayer instead."
+                "HyperConnectionTransformerLayer does not support MoE CUDA graph "
+                "scopes. Disable the moe, moe_router, and moe_preprocess CUDA graph modules "
+                "when combining mHC with a MoE MLP submodule."
             )
 
         self.self_attention_hyper_connection = build_module(
@@ -1842,7 +1845,6 @@ class HyperConnectionTransformerLayer(TransformerLayer):
 
         if CudaGraphModule.attn in self.config.cuda_graph_modules:
             submodules.append(self.self_attention_hyper_connection)
-        # HC layer rejects MoE MLPs in __init__, so only the dense (mlp) scope applies.
         if CudaGraphModule.mlp in self.config.cuda_graph_modules:
             submodules.append(self.mlp_hyper_connection)
         return submodules
