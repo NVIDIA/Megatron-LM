@@ -472,7 +472,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
                 # fp32 params.
                 elif model_param.type() == 'torch.cuda.FloatTensor':
-                    shard_model_param = model_param.view(-1)[param_range.start : param_range.end]
+                    shard_model_param = model_param.detach().view(-1)[
+                        param_range.start : param_range.end
+                    ]
                     model_fp32_params_this_group.append(model_param)
                     shard_fp32_params_this_group.append(shard_model_param)
                     tensor_parallel.copy_tensor_model_parallel_attributes(
@@ -2916,6 +2918,29 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         for model_chunk in self.model_chunks:
             model_chunk.zero_grad_buffer()
         self._copy_main_params_to_param_buffer()
+
+    @torch.no_grad()
+    def _stage_model_params_from_main_params(self) -> None:
+        if self.is_stub_optimizer:
+            return
+        if self.config.reuse_grad_buf_for_mxfp8_param_ag:
+            # MXFP8 reuses the grad buffer for the param all-gather; the quantization
+            # happens after the all-gather, in _post_param_sync.
+            self._copy_main_params_to_param_buffer()
+        else:
+            self._copy_main_params_to_model_params()
+
+    @torch.no_grad()
+    def quantize_and_sync_model_params_from_main_params(self) -> None:
+        """Re-derive and all-gather the model params (see MegatronOptimizer)."""
+        if self.is_stub_optimizer:
+            return
+        self._stage_model_params_from_main_params()
+        # Each rank only owns a shard of the main params, so the full params have to be
+        # gathered. The caller is outside the training loop, so gather synchronously
+        # instead of relying on the next step's overlapped gather.
+        for model_chunk in self.model_chunks:
+            model_chunk.start_param_sync(force_sync=True)
 
     def _copy_main_params_to_param_buffer(self):
         """

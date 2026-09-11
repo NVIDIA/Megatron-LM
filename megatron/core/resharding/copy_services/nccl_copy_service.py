@@ -18,6 +18,8 @@ class NCCLCopyService(CopyService):
     a batch of point-to-point sends and recvs.
     """
 
+    supports_multiple_runs_per_plan = True
+
     def __init__(self, group=None):
         super().__init__(group=group)
         self.send_ops: List[SendOp] = []
@@ -25,8 +27,20 @@ class NCCLCopyService(CopyService):
         # Dedicated stream for local (same-rank) copies to avoid unnecessary
         # serialization with work on the default stream.
         self._copy_stream = torch.cuda.Stream()
+        self._nccl_connected = False
         if self.rank == 0:
             logger.info(f"NCCLCopyService initialized with {self.world_size} ranks")
+
+    def _ensure_nccl_connected(self) -> None:
+        """Collectively initialize the NCCL communicator on the current device."""
+        if self._nccl_connected:
+            return
+        group = self.group if self.group is not None else dist.group.WORLD
+        if group is None:
+            raise RuntimeError("NCCLCopyService requires an initialized process group")
+        device = torch.device("cuda", torch.cuda.current_device())
+        group._get_backend(device).eager_connect_single_device(device)
+        self._nccl_connected = True
 
     def submit_send(self, src_tensor: torch.Tensor, dest_rank: int, task_id: Optional[int] = None):
         self.send_ops.append(SendOp(task_id=task_id, tensor=src_tensor, dest_rank=dest_rank))
@@ -35,6 +49,11 @@ class NCCLCopyService(CopyService):
         self.recv_ops.append(RecvOp(task_id=task_id, tensor=dest_tensor, src_rank=src_rank))
 
     def run(self):
+        # The first NCCL P2P operation lazily initializes a group-wide
+        # communicator. Connect before inspecting local queues because valid
+        # reshard plans may leave some ranks with no operations.
+        self._ensure_nccl_connected()
+
         total_ops = len(self.send_ops) + len(self.recv_ops)
         if self.rank == 0:
             logger.info(
@@ -53,6 +72,7 @@ class NCCLCopyService(CopyService):
             pairs = match_local_ops_by_task_id(
                 local_sends, local_recvs, "NCCLCopyService", self.rank
             )
+            self._copy_stream.wait_stream(torch.cuda.current_stream())
             with torch.no_grad(), torch.cuda.stream(self._copy_stream):
                 for send_op, recv_op in pairs:
                     recv_op.tensor.copy_(send_op.tensor)

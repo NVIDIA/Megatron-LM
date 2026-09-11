@@ -98,6 +98,32 @@ def test_gdp_num_householder_accepts_positive_values():
     assert config.gdp_num_householder == 5
 
 
+def test_from_config_creates_independent_target_config_without_reinitializing():
+    class LayerConfig(TransformerConfig):
+
+        def __post_init__(self):
+            raise AssertionError("from_config must not reinitialize the target config")
+
+    config = TransformerConfig(num_layers=1, hidden_size=128, num_attention_heads=4)
+    config.dynamic_value = {"items": []}
+    config.dynamic_alias = config.dynamic_value
+    config.self_reference = config
+    config.state_reference = config.__dict__
+
+    layer_config = LayerConfig.from_config(config)
+
+    assert type(layer_config) is LayerConfig
+    assert vars(layer_config).keys() == vars(config).keys()
+    assert layer_config.dynamic_value == config.dynamic_value
+    assert layer_config.dynamic_value is not config.dynamic_value
+    assert layer_config.dynamic_alias is layer_config.dynamic_value
+    assert layer_config.self_reference is layer_config
+    assert layer_config.state_reference is layer_config.__dict__
+
+    layer_config.dynamic_value["items"].append("changed")
+    assert config.dynamic_value == {"items": []}
+
+
 @pytest.mark.parametrize("num_householder", [0, -1])
 def test_gdp_num_householder_rejects_non_positive_values(num_householder: int):
     with pytest.raises(ValueError, match="gdp_num_householder must be positive"):
@@ -211,3 +237,33 @@ def test_sequence_packing_rejects_unknown_scheduler():
 def test_sequence_packing_requires_max_seqlen_per_dp_cp_rank():
     with pytest.raises(ValueError, match="max_seqlen_per_dp_cp_rank"):
         _make_packing_config(max_seqlen_per_dp_cp_rank=None)
+
+
+class TestTransformerConfig:
+    def test_num_query_groups_divides_num_attention_heads(self):
+        config = TransformerConfig(
+            num_layers=2, hidden_size=128, num_attention_heads=32, num_query_groups=8
+        )
+        assert config.num_query_groups == 8
+
+    def test_num_query_groups_defaults_to_num_attention_heads(self):
+        config = TransformerConfig(num_layers=2, hidden_size=128, num_attention_heads=32)
+        assert config.num_query_groups == 32
+
+    def test_num_query_groups_not_dividing_num_attention_heads_raises(self):
+        with pytest.raises(ValueError, match="must be a divisor of num_attention_heads"):
+            TransformerConfig(
+                num_layers=2, hidden_size=128, num_attention_heads=32, num_query_groups=5
+            )
+
+    def test_num_query_groups_larger_than_num_attention_heads_raises(self):
+        with pytest.raises(ValueError, match="must be a divisor of num_attention_heads"):
+            TransformerConfig(
+                num_layers=2, hidden_size=128, num_attention_heads=4, num_query_groups=8
+            )
+
+    def test_minimal_config_without_attention_heads_is_allowed(self):
+        # num_attention_heads defaults to 0 in minimal configs used by many non-attention tests;
+        # num_query_groups then defaults to 0 and the check is skipped.
+        config = TransformerConfig(num_layers=1, kv_channels=1)
+        assert config.num_query_groups == 0

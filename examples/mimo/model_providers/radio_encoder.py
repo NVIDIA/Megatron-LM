@@ -71,7 +71,9 @@ def _base_config(args: argparse.Namespace) -> TransformerConfig:
 
 
 def _make_dense_non_hybrid(config: TransformerConfig) -> None:
-    """Strip language-only MoE/Mamba/hybrid settings inherited from the base config."""
+    """Strip language-only MoE/Mamba/hybrid and activation-clamp settings from the base config."""
+    config.activation_func_tanh_clamp_scale = None
+    config.activation_func_tanh_clamp_scale_linear = None
     config.num_moe_experts = None
     config.moe_ffn_hidden_size = None
     config.moe_shared_expert_intermediate_size = None

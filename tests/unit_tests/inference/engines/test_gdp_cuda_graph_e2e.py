@@ -15,9 +15,11 @@ that a well-defined comparison. Both decode-only and mixed prefill+decode steps
 are covered, since `use_cuda_graphs_for_non_decode_steps` captures both and
 they take different paths through the mixer.
 
-Both engines run under `batch_invariant_mode`, since a graphed step pads the
-token count and so would otherwise pick different GEMM and attention reduction
-orders than the eager step running the same requests.
+Both engines run with batch-invariant GEMM and attention reductions, since a
+graphed step pads the token count and so would otherwise pick different
+reduction orders than the eager step running the same requests. That is the
+kernel-level half only; GDP has no batch-invariant mixer path, so
+`config.batch_invariant_mode` stays off.
 """
 
 import random
@@ -27,6 +29,7 @@ import pytest
 import torch
 
 from megatron.core import parallel_state
+from megatron.core.inference import batch_dimensions_utils
 from megatron.core.inference.config import InferenceConfig, MambaInferenceStateConfig
 from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
 from megatron.core.inference.engines import DynamicInferenceEngine
@@ -48,16 +51,8 @@ from megatron.core.transformer.custom_layers.batch_invariant_kernels import set_
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_fa_min_version
+from tests.unit_tests.inference.engines.ssm_test_helpers import HAVE_GDP_DEPS
 from tests.unit_tests.test_utilities import Utils, clear_nvte_env_vars
-
-try:
-    import einops  # noqa: F401
-    import fla  # noqa: F401
-    import mamba_ssm  # noqa: F401
-
-    HAVE_GDP_DEPS = True
-except ImportError:
-    HAVE_GDP_DEPS = False
 
 VOCAB_SIZE = 4000
 MAX_SEQ_LEN = 1024
@@ -69,11 +64,9 @@ NUM_CUDA_GRAPHS = 2
 FLASH_ATTENTION_VERSION = 4 if HAVE_FA4 else (3 if HAVE_FA3 else None)
 
 
-def set_rounder(value):
-    """Shrink the batch rounding so small test batches still hit padded shapes."""
-    DynamicInferenceContext.ROUNDER = value
-    DynamicInferenceContext.TOKEN_ROUNDER = value
-    DynamicInferenceContext.REQUEST_ROUNDER = value
+# Batch rounding for this module's tests, small enough that the tiny test
+# batches still hit padded shapes.
+ROUNDER = 4
 
 
 @pytest.mark.internal
@@ -88,12 +81,33 @@ class TestGDPCudaGraphE2E:
     @classmethod
     def setup_class(cls):
         Utils.initialize_model_parallel()
-        set_rounder(4)
 
     @classmethod
     def teardown_class(cls):
-        set_rounder(64)
         Utils.destroy_model_parallel()
+
+    @pytest.fixture(autouse=True)
+    def rounders(self, monkeypatch):
+        """Shrink the batch rounding for the duration of each test.
+
+        monkeypatch rather than plain assignment: `batch_dimensions_utils`'
+        TOKEN_ROUNDER is a module-level global in production code, so restoring
+        it by hand would both restate a constant its own module asks callers not
+        to restate and leak into other test modules if a test raised partway.
+        """
+        monkeypatch.setattr(DynamicInferenceContext, "ROUNDER", ROUNDER, raising=False)
+        monkeypatch.setattr(DynamicInferenceContext, "TOKEN_ROUNDER", ROUNDER)
+        monkeypatch.setattr(DynamicInferenceContext, "REQUEST_ROUNDER", ROUNDER)
+        # Batch-invariant CUDA-graph buckets align their token counts to the
+        # module-level TOKEN_ROUNDER via _batch_invariant_token_align, which the
+        # context class attributes above do not reach. Left at its default while
+        # the eager path rounds to ROUNDER, a decode-only bucket's token_count
+        # rounds up but its decode_req_count does not, producing an inconsistent
+        # (token_count != decode_req_count) shape that breaks the decode reshape;
+        # it also puts graph steps in a different norm/GEMM M-alignment class
+        # than eager. Keep the two rounders in lockstep so decode buckets stay
+        # square and both paths match.
+        monkeypatch.setattr(batch_dimensions_utils, "TOKEN_ROUNDER", ROUNDER)
 
     def setup_method(self, method):
         # conftest's set_env fixture pins the NVTE backend selection; clear it so
@@ -149,11 +163,13 @@ class TestGDPCudaGraphE2E:
         for param in model.parameters():
             param.data = param.data.to(config.params_dtype)
         model.eval()
-        # Set after construction, not on the config: `_set_attention_backend`
-        # gates `batch_invariant_mode` on a TE version that only matters for TE's
-        # own attention, which dynamic inference does not use. `Attention` reads
-        # the flag off the config once in __init__, so flip it on the modules.
-        model.config.batch_invariant_mode = True
+        # Set on the modules, not the config. `_set_attention_backend` gates
+        # `batch_invariant_mode` on a TE version that only matters for TE's own
+        # attention, which dynamic inference does not use, and the config flag
+        # would also trip GatedDeltaProductMixer's assert that GDP has no
+        # batch-invariant path. `Attention` reads the flag off the config once in
+        # __init__, so flipping it on the modules is what this test needs; GEMM
+        # and CUDA-graph bucket alignment come from `set_batch_invariant_mode`.
         for module in model.modules():
             if isinstance(module, Attention):
                 module.batch_invariant_mode = True
