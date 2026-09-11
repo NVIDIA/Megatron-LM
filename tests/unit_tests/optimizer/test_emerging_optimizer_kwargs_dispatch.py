@@ -88,7 +88,9 @@ def test_muon_entry_dispatches_on_layer_sharding_flag():
     assert "gtp_remat_group" in lsh_kwargs
     assert eo_mod._muon_config_to_cls(_Cfg(True)) is LayerShardedMuon
 
-    plain_kwargs = eo_mod._muon_registry_config_to_kwargs(_Cfg(False), [_Chunk()], pg_collection=None)
+    plain_kwargs = eo_mod._muon_registry_config_to_kwargs(
+        _Cfg(False), [_Chunk()], pg_collection=None
+    )
     assert "gtp_remat_group" not in plain_kwargs
     assert "is_qkv_fn" in plain_kwargs
     assert eo_mod._muon_config_to_cls(_Cfg(False)) is eo_mod.TensorParallelMuon
