@@ -113,7 +113,8 @@ def test_tiny_config_accepts_source_reuse_and_ratio_transition():
         ({"csa2_candidate_source_layer": 1}, "cannot cross a later KV source"),
         ({"csa2_candidate_topk_blocks": 1}, "capacity"),
         ({"csa2_candidate_source_layer": None}, "Disabled CSA2 candidates"),
-        ({"dsa_kernel_backend": "cudnn"}, "dsa_kernel_backend='none'"),
+        ({"dsa_kernel_backend": "tilelang"}, "dsa_kernel_backend='none' or 'cudnn'"),
+        ({"dsa_indexer_precision": "mxfp8"}, "MXFP8 indexers require"),
         ({"gradient_accumulation_fusion": True}, "gradient_accumulation_fusion=False"),
         ({"use_fused_mhc": True}, "use_fused_mhc=False"),
         ({"dsa_indexer_rotate_activation": True}, "Hadamard"),
@@ -137,6 +138,112 @@ def test_candidates_can_be_disabled():
         csa2_candidate_source_layer=None, csa2_candidate_topk_blocks=0, csa2_candidate_block_size=0
     )
     assert config.csa2_candidate_source_layer is None
+
+
+@pytest.mark.parametrize("fused_rope", [False, True])
+@pytest.mark.parametrize("sm", [(9, 0), (10, 0)])
+def test_v41_fused_attention_accepts_dense_indexer_loss(monkeypatch, fused_rope, sm):
+    validated = []
+    monkeypatch.setattr(
+        "megatron.core.transformer.transformer_config._validate_dsa_kernel_backend_dependencies",
+        validated.append,
+    )
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: sm)
+    config = _make_config(
+        params_dtype=torch.bfloat16,
+        v_head_dim=512,
+        dsa_kernel_backend="cudnn",
+        apply_rope_fusion=fused_rope,
+        dsa_indexer_loss_coeff=0.3,
+        dsa_indexer_use_sparse_loss=False,
+        dsa_indexer_n_heads=32,
+        dsa_indexer_head_dim=128,
+    )
+    assert validated == ["cudnn"]
+    assert config.dsa_kernel_backend == "cudnn"
+    assert config.apply_rope_fusion == fused_rope
+
+
+@pytest.mark.parametrize(
+    "overrides, message",
+    [
+        ({"params_dtype": torch.float32}, "BF16 parameters"),
+        ({"v_head_dim": 16}, "v_head_dim=512"),
+        ({}, "SM90"),
+    ],
+)
+def test_v41_fused_attention_validates_kernel_requirements(monkeypatch, overrides, message):
+    monkeypatch.setattr(
+        "megatron.core.transformer.transformer_config._validate_dsa_kernel_backend_dependencies",
+        lambda backend: None,
+    )
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (8, 0))
+    values = dict(params_dtype=torch.bfloat16, v_head_dim=512, dsa_kernel_backend="cudnn")
+    values.update(overrides)
+    with pytest.raises(ValueError, match=message):
+        _make_config(**values)
+
+
+def test_v41_rope_fusion_is_independent_of_sparse_attention():
+    config = _make_config(apply_rope_fusion=True)
+    assert config.dsa_kernel_backend == "none"
+    with pytest.raises(ValueError, match="divisible by 4"):
+        _make_config(apply_rope_fusion=True, qk_pos_emb_head_dim=6)
+
+
+@pytest.mark.parametrize("heads", [32, 64])
+@pytest.mark.parametrize("sparse", [False, True])
+def test_v41_mxfp8_selection_accepts_indexer_loss(monkeypatch, heads, sparse):
+    monkeypatch.setattr(
+        "megatron.core.transformer.transformer_config._validate_dsa_kernel_backend_dependencies",
+        lambda backend: None,
+    )
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (10, 0))
+    config = _make_config(
+        params_dtype=torch.bfloat16,
+        v_head_dim=512,
+        dsa_kernel_backend="cudnn",
+        dsa_indexer_n_heads=heads,
+        dsa_indexer_head_dim=128,
+        dsa_indexer_precision="mxfp8",
+        dsa_indexer_loss_coeff=0.3,
+        dsa_indexer_use_sparse_loss=sparse,
+    )
+    assert config.dsa_indexer_precision == "mxfp8"
+    assert config.dsa_indexer_n_heads == heads
+    assert config.csa2_candidate_source_layer == 3
+    assert config.fp8 is None
+
+
+@pytest.mark.parametrize(
+    "overrides, sm, message",
+    [
+        ({"dsa_indexer_n_heads": 16}, (10, 0), "n_heads=32 or 64"),
+        ({"dsa_indexer_head_dim": 64}, (10, 0), "head_dim=128"),
+        ({"dsa_indexer_precision": "mxfp8"}, (9, 0), "SM100"),
+        (
+            {"dsa_indexer_precision": "mxfp8", "attention_backend": "unfused"},
+            (10, 0),
+            "fused attention",
+        ),
+    ],
+)
+def test_v41_fused_indexer_validates_requirements(monkeypatch, overrides, sm, message):
+    monkeypatch.setattr(
+        "megatron.core.transformer.transformer_config._validate_dsa_kernel_backend_dependencies",
+        lambda backend: None,
+    )
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: sm)
+    values = dict(
+        params_dtype=torch.bfloat16,
+        v_head_dim=512,
+        dsa_kernel_backend="cudnn",
+        dsa_indexer_n_heads=32,
+        dsa_indexer_head_dim=128,
+    )
+    values.update(overrides)
+    with pytest.raises(ValueError, match=message):
+        _make_config(**values)
 
 
 @pytest.mark.parametrize(
