@@ -14,6 +14,7 @@ from megatron.core.quantization.indexer_quantization import (
     indexer_mxfp8_thd_scale_shape,
     make_indexer_mxfp8_scale_cu_seqlens,
     quantize_indexer_mxfp8,
+    quantize_indexer_mxfp8_logical,
     refresh_indexer_mxfp8_scale_cu_seqlens,
 )
 
@@ -72,6 +73,44 @@ def test_bshd_quantization_matches_reference():
     assert packed_scale.shape == indexer_mxfp8_scale_shape(batch_size, seqlen, num_heads, head_dim)
     assert torch.equal(data.float(), ref_data.float())
     torch.testing.assert_close(unpacked_scale, ref_scale, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("shape", [(2, 3, 32, 128), (5, 128), (0, 32, 128)])
+def test_logical_quantization_matches_reference(shape):
+    torch.manual_seed(414)
+    x = torch.randn(shape, dtype=torch.bfloat16, device="cuda")
+    if x.numel():
+        x.reshape(-1, 128)[0, :32] = 0
+    x.requires_grad_()
+    before = x.detach().clone()
+    actual_data, actual_scale = quantize_indexer_mxfp8_logical(x)
+    data, scale = _reference_quantize(x)
+    assert actual_data.dtype == torch.float8_e4m3fn and not actual_data.requires_grad
+    assert actual_scale.dtype == torch.uint8 and not actual_scale.requires_grad
+    torch.testing.assert_close(actual_data.float(), data.float(), rtol=0, atol=0)
+    torch.testing.assert_close(
+        actual_scale.contiguous().view(torch.float8_e8m0fnu).float(),
+        # E8M0 has no zero; TE stores its smallest scale for all-zero groups.
+        scale.reshape(-1, shape[-1] // 32).clamp_min(2.0**-127),
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(x, before, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("heads", [1, 32, 64])
+def test_thd_quantization_all_unassigned_capacity(heads):
+    shape = (5, heads, 128) if heads > 1 else (5, 128)
+    x = torch.zeros(shape, dtype=torch.bfloat16, device="cuda")
+    prefixes = torch.zeros(3, dtype=torch.int32, device="cuda")
+    scale_prefixes = make_indexer_mxfp8_scale_cu_seqlens(prefixes, heads)
+    data, packed_scale = quantize_indexer_mxfp8(
+        x, cu_seqlens=prefixes, cu_seqlens_scale_padded=scale_prefixes
+    )
+    assert data.shape == shape
+    assert packed_scale.shape == (1, 128, 4)
+    assert torch.count_nonzero(data.float()) == 0
+    assert torch.count_nonzero(packed_scale.view(torch.uint8)) == 0
 
 
 def test_thd_quantization_uses_concatenated_padded_scale_spans():

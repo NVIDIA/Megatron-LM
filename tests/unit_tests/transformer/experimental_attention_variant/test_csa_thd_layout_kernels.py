@@ -14,7 +14,7 @@ from megatron.core.transformer.experimental_attention_variant.csa_utils.cp_utils
     prepare_cp_compressor_input,
 )
 
-# This file guards only DSv4 THD layout/metadata kernels. Layer-level CUDA graph
+# This file guards DSv4/CSA2 THD layout/metadata kernels. Layer-level CUDA graph
 # tests guard graph capture/replay behavior.
 
 _E2E_RAGGED_PADDED_SEG_LENS = (1, 127, 1000, 23, 129, 900, 55, 257, 800, 95, 509, 200)
@@ -421,6 +421,76 @@ def test_compressor_input_compact_matches_native_forward_backward():
         assert torch.equal(actual, expected)
     assert torch.equal(hidden.grad, ref_hidden_grad)
     assert torch.equal(boundary.grad, ref_boundary_grad)
+
+
+@pytest.mark.parametrize("ratio", [0, 1, 2])
+@pytest.mark.parametrize("metadata_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("emit_window", [False, True])
+def test_build_attention_indices_csa2_physical_topk(ratio, metadata_dtype, emit_window):
+    """Packed physical IDs, holes, odd groups, empty segments and orphan padding."""
+    _require_cute_cuda()
+    real, physical = [0, 0, 1, 5, 3], [0, 2, 3, 8, 4]
+    rows, window_size, alignment = sum(physical) + 3, 4, 64
+    width = 5 if ratio else 0
+    cu, cu_real, cu_comp = [0], [0], [0]
+    for real_len, physical_len in zip(real, physical):
+        cu.append(cu[-1] + physical_len)
+        cu_real.append(cu_real[-1] + real_len)
+        cu_comp.append(cu_comp[-1] + (physical_len // ratio if ratio else 0))
+    selected = torch.zeros((rows, width), dtype=torch.int32)
+    expected = torch.full((rows, alignment), -1, dtype=torch.int32)
+    expected_window = torch.full((rows, window_size), -1, dtype=torch.int32)
+    expected_length = torch.zeros(rows, dtype=torch.int32)
+    expected_padding = torch.ones(rows, dtype=torch.bool)
+    for seq, real_len in enumerate(real):
+        for pos in range(real_len):
+            row = cu[seq] + pos
+            window = list(range(max(cu[seq], row - window_size + 1), row + 1))
+            expected_window[row, : len(window)] = torch.tensor(window)
+            global_ids = []
+            if ratio:
+                start = cu_comp[seq]
+                visible = (pos + 1) // ratio
+                # Include a hole, a future group and a preceding-sequence ID.
+                # Valid selected IDs must retain their order during compaction.
+                ids = [start + visible - 1, -1, start, start + visible, start - 1]
+                selected[row] = torch.tensor(ids)
+                global_ids = [rows + idx for idx in ids if start <= idx < start + visible]
+            values = window + global_ids
+            expected[row, : len(values)] = torch.tensor(values)
+            expected_length[row] = len(values)
+            expected_padding[row] = False
+
+    window_out = (
+        torch.full((rows, window_size), -99, dtype=torch.int32, device="cuda")
+        if emit_window
+        else None
+    )
+    indices, lengths, physical_rows, padding = thd_layout_kernels.build_attention_indices(
+        torch.tensor(cu, dtype=metadata_dtype, device="cuda"),
+        global_start=0,
+        l_local=rows,
+        d_window=0,
+        window_size=window_size,
+        ratio=ratio,
+        compressed_width=width,
+        compressed_topk=selected.cuda() if width else None,
+        cu_seqlens_compressed=torch.tensor(cu_comp, dtype=metadata_dtype, device="cuda"),
+        compressed_base=rows,
+        compressed_rows=cu_comp[-1] + 2 if ratio else 0,
+        compressed_is_sequence_major=True,
+        cu_seqlens_unpadded=torch.tensor(cu_real, dtype=metadata_dtype, device="cuda"),
+        output_alignment=alignment,
+        compressed_topk_is_physical=True,
+        mask_padding_rows=True,
+        window_indices_out=window_out,
+    )
+    torch.testing.assert_close(indices.cpu(), expected, rtol=0, atol=0)
+    torch.testing.assert_close(lengths.cpu(), expected_length, rtol=0, atol=0)
+    torch.testing.assert_close(padding.cpu(), expected_padding, rtol=0, atol=0)
+    assert physical_rows is None
+    if emit_window:
+        torch.testing.assert_close(window_out.cpu(), expected_window, rtol=0, atol=0)
 
 
 def test_build_attention_indices_matches_native():

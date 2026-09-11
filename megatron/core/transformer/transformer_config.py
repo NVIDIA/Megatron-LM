@@ -362,10 +362,23 @@ class TransformerConfig(ModelParallelConfig):
     top-k indices."""
 
     dsa_indexer_precision: Literal["bf16", "mxfp8"] = "bf16"
-    """Precision used only by the fused compact DSA indexer forward and Top-K."""
+    """Precision of indexer selection, independent of the model's linear precision.
+
+    V4.1 uses MXFP8 kernels for ordinary and candidate-aware Reindex selection;
+    its auxiliary objective uses the original unquantized projections.
+    """
 
     dsa_kernel_backend: Literal["none", "tilelang", "cudnn"] = "none"
-    """Optional fused ordinary-DSA kernel backend. Unsupported layouts use PyTorch fallback."""
+    """Optional fused DSA/CSA kernel backend. Ordinary DSA falls back for unsupported layouts.
+
+    V4.1 uses ``cudnn`` for main sparse attention (BF16, head dimension 512, SM90+)
+    and ordinary indexer Top-K (32/64 heads, head dimension 128). MXFP8 selection
+    requires SM100+. Candidate generation reuses chunked indexer scoring and radix Top-K;
+    candidate-aware Reindex and auxiliary loss use indexed kernels with bounded
+    score tiles. The r2 compressor uses BF16 projections and cuDNN gated pooling
+    (FP32 accumulation), with the existing Linear and RMSNorm modules outside the fused region.
+    RoPE fusion is selected separately by ``apply_rope_fusion``.
+    """
 
     dsa_indexer_rope_interleaved: bool = False
     """Whether DSA indexer RoPE should use MLA-style interleaving."""
@@ -4440,11 +4453,7 @@ class MLATransformerConfig(TransformerConfig):
             ), "Rope Fusion is not compatible with caching latents"
 
     def _validate_dsv41_config(self) -> None:
-        """Validate V4.1 fields on the existing DSv4 configuration path.
-
-        Only validate source relationships here. CSA2 construction will resolve each
-        layer's mode and owners when the attention implementation is added.
-        """
+        """Validate V4.1 training relationships and supported kernels on the DSv4 path."""
         for name in (
             "tensor_model_parallel_size",
             "pipeline_model_parallel_size",
@@ -4466,12 +4475,41 @@ class MLATransformerConfig(TransformerConfig):
             raise ValueError("Native V4.1 requires FP32 or BF16 parameters")
         if self.fp8 or self.fp4 or self.quant_recipe is not None:
             raise ValueError("Native V4.1 does not yet support quantization")
-        if self.dsa_kernel_backend != "none" or self.dsa_indexer_precision != "bf16":
+        if self.dsa_indexer_precision not in ("bf16", "mxfp8"):
+            raise ValueError("V4.1 indexer precision must be 'bf16' or 'mxfp8'")
+        if self.dsa_indexer_precision == "mxfp8" and (
+            self.dsa_kernel_backend != "cudnn"
+            or self.attention_backend in (AttnBackend.unfused, "unfused")
+        ):
             raise ValueError(
-                "Native V4.1 requires dsa_kernel_backend='none' and unquantized indexers"
+                "V4.1 MXFP8 indexers require dsa_kernel_backend='cudnn' and fused attention"
             )
+        if self.dsa_kernel_backend not in ("none", "cudnn"):
+            raise ValueError("V4.1 requires dsa_kernel_backend='none' or 'cudnn'")
+        if self.dsa_kernel_backend == "cudnn":
+            if self.params_dtype != torch.bfloat16:
+                raise ValueError("V4.1 fused sparse attention requires BF16 parameters")
+            if self.v_head_dim != 512:
+                raise ValueError("V4.1 fused sparse attention requires v_head_dim=512")
+            _validate_dsa_kernel_backend_dependencies(self.dsa_kernel_backend)
+            sm = torch.cuda.get_device_capability()
+            if sm[0] < 9:
+                raise ValueError(
+                    "V4.1 fused sparse attention requires SM90+ (Hopper or later), "
+                    f"but current device has compute capability {sm[0]}.{sm[1]}."
+                )
+            if self.csa2_index_source_layers and (
+                self.dsa_indexer_n_heads not in (32, 64) or self.dsa_indexer_head_dim != 128
+            ):
+                raise ValueError(
+                    "V4.1 fused indexer requires dsa_indexer_n_heads=32 or 64 and "
+                    "dsa_indexer_head_dim=128"
+                )
+            if self.dsa_indexer_precision == "mxfp8" and sm[0] < 10:
+                raise ValueError("V4.1 MXFP8 indexers require SM100 or later")
+            # V4.1's indexed loss kernel uses the original BF16 projections.
+            # V4's backward restrictions (dense loss on SM90 / MXFP8) do not apply.
         for name in (
-            "apply_rope_fusion",
             "mla_down_proj_fusion",
             "use_fused_mhc",
             "bias_activation_fusion",
@@ -4521,6 +4559,8 @@ class MLATransformerConfig(TransformerConfig):
             )
         if self.num_attention_heads * self.v_head_dim % self.o_groups:
             raise ValueError("V4.1 num_attention_heads * v_head_dim must be divisible by o_groups")
+        if self.apply_rope_fusion and rotary_dim % 4:
+            raise ValueError("V4.1 fused RoPE requires a rotary dimension divisible by 4")
         if self.rotary_percent != 1:
             raise ValueError("V4.1 requires RoPE over the complete rotary tail")
         # DSv4 already handles adjacent pairs through mla_rotary_interleaved and

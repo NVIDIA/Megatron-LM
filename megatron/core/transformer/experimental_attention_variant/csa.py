@@ -9,7 +9,10 @@ import torch
 import torch.nn as nn
 
 from megatron.core.fp8_utils import get_fp8_disabled_context
-from megatron.core.fusions.fused_mla_yarn_rope_apply import fused_mla_rope_inplace
+from megatron.core.fusions.fused_mla_yarn_rope_apply import (
+    fused_mla_rope_inplace,
+    fused_mla_rope_out_of_place,
+)
 from megatron.core.models.common.embeddings import RotaryEmbedding, apply_rotary_pos_emb
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -457,6 +460,8 @@ def _apply_fused_rope(
     pos_dim: int,
     cu_seqlens: Optional[torch.Tensor],
     cp_group: torch.distributed.ProcessGroup,
+    *,
+    inplace: bool = True,
 ) -> torch.Tensor:
     """Apply the fused MLA RoPE kernel with automatic 3-D / 4-D handling."""
     packed_seq = cu_seqlens is not None
@@ -471,7 +476,8 @@ def _apply_fused_rope(
     if squeeze_head:
         x = x.unsqueeze(-2)
 
-    out = fused_mla_rope_inplace(
+    apply = fused_mla_rope_inplace if inplace else fused_mla_rope_out_of_place
+    out = apply(
         x,
         cos,
         sin,
@@ -555,6 +561,8 @@ def _apply_rope(
     cp_group: torch.distributed.ProcessGroup = None,
     cu_seqlens: Optional[torch.Tensor] = None,
     max_seqlen_rope: Optional[int] = None,
+    *,
+    inplace: bool = True,
 ) -> torch.Tensor:
     """Apply RoPE to the last ``pos_dim`` dims, leaving the rest unchanged.
 
@@ -570,10 +578,14 @@ def _apply_rope(
       (``table[:max_total:ratio]``), matching the SBHD approach.
 
     Args:
+        inplace: allow fused RoPE to overwrite its input. Disable when another
+            branch or normalization backward retains the pre-RoPE tensor.
         max_seqlen_rope: pre-computed ``max(seg_lens) * ratio`` for the
             THD + ``ratio > 1`` path (avoids a GPU→CPU sync when the
             caller already knows the max original sequence length).
     """
+    if x.shape[0] == 0:
+        return x
     packed_seq = cu_seqlens is not None
 
     if packed_seq:
@@ -607,7 +619,9 @@ def _apply_rope(
             if ratio > 1:
                 cos = cos[:total:ratio][:rotary_seq_len]
                 sin = sin[:total:ratio][:rotary_seq_len]
-        return _apply_fused_rope(x, cos, sin, nope_dim, pos_dim, cu_seqlens, cp_group)
+        return _apply_fused_rope(
+            x, cos, sin, nope_dim, pos_dim, cu_seqlens, cp_group, inplace=inplace
+        )
 
     # ---- Unfused path: build rotary_pos_emb tensor ----------------------
     if packed_seq:

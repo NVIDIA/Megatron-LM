@@ -812,7 +812,14 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
                         remove_interleaving=True,
                     )
                     kv = kv.unsqueeze(-2)
-                    kv = fused_mla_rope_inplace(
+                    # V4.1 uses a learned KV RMSNorm whose backward may retain
+                    # its output. Preserve that pre-RoPE storage.
+                    apply_kv_rope = (
+                        fused_mla_rope_out_of_place
+                        if self.config.dsv4_version == "v4.1"
+                        else fused_mla_rope_inplace
+                    )
+                    kv = apply_kv_rope(
                         kv,
                         rotary_pos_cos,
                         rotary_pos_sin,
