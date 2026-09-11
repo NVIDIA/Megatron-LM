@@ -435,16 +435,8 @@ def torch_chunk_gated_delta_rule(
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     # pylint: disable=line-too-long
     '''
-    Torch-native implementation of the chunked gated delta rule, selected by ``deterministic_mode``.
-
-    It is bit-reproducible by construction (dense matmuls and cumsums only, no autotuning), at
-    roughly 100x the cost of FLA's Triton ``chunk_gated_delta_rule`` (110 ms vs 1.1 ms fwd+bwd for
-    B=2, T=4096, H=8, K=V=128 on GB300). FLA's kernel has no order-dependent reduction: its
-    forward/backward call graph has no atomics, and on fla 0.4.2 it replayed bit-exactly under
-    stream contention and across four independent processes. Its backward bits do depend on the
-    Triton autotuner's config choice (dk/dv/dg/dbeta changed when the configs were pinned), so
-    cross-run agreement needs the autotune configs pinned or the autotune cache shared; with that
-    in place deterministic runs could use the FLA kernel instead of this fallback.
+    Torch-native implementation of chunked gated delta rule for deterministic mode.
+    Need this because FLA is not deterministic.
 
     ``scale`` defaults to ``1 / sqrt(K)``, matching the FLA kernel. Extra keyword
     arguments are accepted and ignored so this stays interchangeable with the FLA
@@ -460,10 +452,8 @@ def torch_chunk_gated_delta_rule(
     query, key, value = q, k, v
     initial_dtype = query.dtype
     if use_qk_l2norm_in_kernel:
-        # FLA's l2norm normalises the last dim with eps=1e-6; its signature has no ``dim``
-        # argument since fla 0.4 (the kernel path calls it the same way).
-        query = l2norm(query)
-        key = l2norm(key)
+        query = l2norm(query, dim=-1, eps=1e-6)
+        key = l2norm(key, dim=-1, eps=1e-6)
     query, key, value, beta, g = [
         x.transpose(1, 2).contiguous().to(torch.float32) for x in (query, key, value, beta, g)
     ]

@@ -38,7 +38,7 @@ def make_coordinator_direct(
         data_parallel_size: Number of DP ranks.
         block_size_tokens: Block size in tokens.
         enable_prefix_caching: Whether prefix caching is enabled.
-        deterministic_mode: Deprecated and ignored; identities are always sorted.
+        deterministic_mode: If True, sort identities for deterministic ordering.
         prefix_caching_routing_alpha: Alpha for prefix-aware scoring.
         prefix_cache_ttl_seconds: How long a routed block is assumed still held.
         max_requests: Max requests per rank (None disables vectorized scoring).
@@ -63,12 +63,15 @@ def make_coordinator_direct(
     coordinator.vision_embedding_cache_enabled = vision_embedding_cache_enabled
     coordinator.max_requests = max_requests
 
-    # Create fake rank identities, ordered by identity exactly like the real coordinator does
-    # regardless of connection order (``deterministic_mode`` no longer changes the order).
+    # Create fake rank identities.
     coordinator.identities_of_data_parallel_ranks = deque(
-        sorted(rank_name_template.format(i).encode() for i in range(data_parallel_size))
+        [rank_name_template.format(i).encode() for i in range(data_parallel_size)]
     )
     coordinator.removed_engine_identities = set()
+    if deterministic_mode:
+        coordinator.identities_of_data_parallel_ranks = deque(
+            sorted(coordinator.identities_of_data_parallel_ranks)
+        )
     coordinator.data_parallel_rank_iterator = itertools.cycle(
         coordinator.identities_of_data_parallel_ranks
     )

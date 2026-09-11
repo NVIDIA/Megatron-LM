@@ -338,18 +338,6 @@ def permute_tokens(
         - inclusive_offsets: [num_local_experts] int32 cumulative offsets for grouped_mm
         - inverse map: [max_tokens, num_local_experts] int32 map from token/local-expert
           to permuted row, only present when requested.
-
-    Notes:
-        Rows in ``[inclusive_offsets[-1], output_size)`` and the alignment-padding rows inside
-        each expert block are left uninitialised on purpose: every consumer (grouped_mm through
-        ``offs``, the activation kernels and ``unpermute_tokens`` through ``permutation_map`` /
-        ``n_used``) skips them, so even when ``torch.utils.deterministic.fill_uninitialized_memory``
-        turns them into NaN no valid output reads them. The ``tl.atomic_add`` that claims a row
-        for each (token, expert) pair makes the row order inside an expert block
-        scheduling-dependent; the grouped GEMM computes every row independently, so no value
-        changes. The order-dependent step is the fp32 ``tl.atomic_add`` accumulation in
-        ``unpermute_tokens``, which batch-invariant mode replaces with
-        ``batch_invariant.unpermute_tokens_in_expert_order``.
     """
     max_tokens, hidden_dim = hidden_states.shape
     topk = probs.shape[1]

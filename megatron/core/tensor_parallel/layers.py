@@ -419,22 +419,17 @@ class VocabParallelEmbedding(torch.nn.Module):
 
             weight = GTPEmbeddingWeight.apply(self.weight)
 
-        # Get the embeddings. F.embedding's CUDA backward (embedding_dense_backward) is
-        # bit-reproducible under torch.use_deterministic_algorithms(True), which
-        # --deterministic-mode sets: its <=3072-id kernel and its sort-then-segment-reduce path
-        # accumulate in a fixed order, and the fused atomic path torch >= 2.11 added for tables
-        # with few segments is disabled under that flag. It needs no deterministic-mode special
-        # case. Indexing the weight instead (index_put_ with accumulate=True) is reproducible too
-        # but reduces duplicate ids serially, which is 10-30x slower on padding-heavy batches.
+        # F.embedding provides a deterministic CUDA backward under the PyTorch flag set by
+        # --deterministic-mode. Use it in both modes to avoid the serial accumulation of
+        # repeated ids in the weight-indexing backward path.
         if self.config.deterministic_mode and not self._deterministic_flag_checked:
             self._deterministic_flag_checked = True
             if not torch.are_deterministic_algorithms_enabled():
                 warnings.warn(
                     "VocabParallelEmbedding: config.deterministic_mode is set but "
-                    "torch.use_deterministic_algorithms(True) is not. F.embedding's backward is "
-                    "bit-reproducible only under that flag (torch >= 2.11 may take an atomic path "
-                    "for tables under ~600 rows without it). --deterministic-mode sets the flag; "
-                    "library callers must set it themselves.",
+                    "torch.use_deterministic_algorithms(True) is not. Enable the PyTorch flag "
+                    "to ensure a deterministic F.embedding backward. --deterministic-mode sets "
+                    "the flag; library callers must set it themselves.",
                     RuntimeWarning,
                     stacklevel=2,
                 )

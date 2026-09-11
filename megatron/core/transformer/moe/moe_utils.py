@@ -603,14 +603,9 @@ def unpermute(
         permuted_tokens = permuted_tokens * permuted_probs.unsqueeze(-1)
 
     # Accumulate the (possibly probability-weighted) rows back into a zeroed output.
-    # scatter_add_ serves both modes: under torch.use_deterministic_algorithms(True)
-    # (--deterministic-mode) torch >= 2.9 routes it to the same sort-based index_put_ that
-    # index_add_ would use -- bit-identical, CUDA-graph capturable and 7-17% faster, because
-    # index_add_'s deterministic path first materialises `source * alpha` (GB300 / torch 2.13,
-    # 131k rows x 4096: 2.94 vs 3.24 ms bf16, 2.98 vs 3.59 ms fp32); without the flag its atomic
-    # kernel is as fast as index_add_'s for bf16 and faster for fp32 (3.37 vs 4.08 ms). Older
-    # torch lacks the broadcast fast path of the deterministic scatter_add_ (pytorch#156744) and
-    # would materialise a [rows, hidden] index, so index_add_ stays as the fallback there.
+    # Under deterministic algorithms, scatter_add_ and index_add_ use sort-based index_put_.
+    # Prefer scatter_add_ to avoid index_add_'s source * alpha temporary. Before torch 2.9,
+    # deterministic scatter_add_ materialises a [rows, hidden] index, so keep index_add_ there.
     output_tokens = torch.zeros(
         restore_shape, dtype=permuted_tokens.dtype, device=permuted_tokens.device
     )

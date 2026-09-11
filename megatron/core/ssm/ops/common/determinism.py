@@ -101,3 +101,23 @@ def autotune_configs(configs):
     if filtered:
         return filtered
     return [min(configs, key=_estimate_config_cost)]
+
+
+def alloc_tile_workspace(base_shape, tile_dim, dtype, device, deterministic, *, zero_init=True):
+    """Allocate buffer for deterministic per-program reductions."""
+    if base_shape is None:
+        return None, 0
+    if deterministic:
+        factory = torch.zeros if zero_init else torch.empty
+        tensor = factory(*base_shape, tile_dim, device=device, dtype=dtype)
+        return tensor, tensor.stride(-1)
+    return torch.empty(*base_shape, device=device, dtype=dtype), 0
+
+
+def finalize_tile_workspace(tensor, deterministic):
+    """Finalize tile workspace."""
+    if tensor is None:
+        return None
+    if deterministic:
+        tensor = tensor.sum(dim=-1)
+    return tensor
