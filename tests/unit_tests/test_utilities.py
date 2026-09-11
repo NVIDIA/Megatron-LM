@@ -114,6 +114,22 @@ class Utils:
         except Exception:
             Utils.inited = False
             return
+        # Communication helpers retain state keyed by Megatron process groups. Clear
+        # them before destroying those groups so later tests cannot reuse an object
+        # backed by a torn-down NCCL communicator.
+        from megatron.core.transformer.moe.fused_a2a import reset_hybrid_ep_buffer
+
+        reset_hybrid_ep_buffer()
+
+        # Transformer Engine caches the FP8 reduction group across contexts. Reset
+        # that state before destroying Megatron process groups so a later test
+        # cannot issue a collective on a group removed from PyTorch's registry.
+        try:
+            from transformer_engine.pytorch.quantization import FP8GlobalStateManager
+
+            FP8GlobalStateManager.reset()
+        except ImportError:
+            pass
         ps.destroy_model_parallel()
         Utils.inited = False
         torch.cuda.memory.empty_cache()

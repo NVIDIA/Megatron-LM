@@ -52,6 +52,19 @@ def test_initialize_and_destroy_model_parallel(order):
     assert ps._MODEL_PARALLEL_GROUP is None
 
 
+def test_destroy_model_parallel_destroys_tracked_process_groups():
+    Utils.initialize_model_parallel()
+    groups = [group for group in ps._global_process_group_list if group is not None]
+    pg_map = torch.distributed.distributed_c10d._world.pg_map
+    assert groups
+    assert all(group in pg_map for group in groups)
+
+    Utils.destroy_model_parallel()
+
+    assert ps._global_process_group_list is None
+    assert all(group not in pg_map for group in groups)
+
+
 @pytest.mark.parametrize('order', test_parallel_order)
 def test_pipeline_parallel_initializations(order):
     Utils.initialize_model_parallel(

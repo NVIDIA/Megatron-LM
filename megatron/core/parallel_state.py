@@ -2702,6 +2702,18 @@ def destroy_model_parallel():
     _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP = None
 
     global _global_process_group_list
+    if _global_process_group_list is not None:
+        # ``new_group`` keeps every process group registered in PyTorch's global
+        # process-group map. Dropping Megatron's references alone does not tear
+        # down the NCCL communicators, so repeated test initialization eventually
+        # exhausts the process' thread resources. Destroy every group created by
+        # ``create_group`` in reverse creation order before clearing the registry.
+        for group in reversed(_global_process_group_list):
+            if (
+                group is not None
+                and torch.distributed.distributed_c10d._world.pg_map.get(group) is not None
+            ):
+                torch.distributed.destroy_process_group(group)
     _global_process_group_list = None
 
     SymmetricMemoryManager.destroy()
