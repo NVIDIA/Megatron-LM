@@ -16,6 +16,7 @@ from typing import Any, Callable, Optional
 import torch
 import torch.nn.functional as F
 
+from megatron.core.models.engram import EngramConfig
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.spec_utils import ModuleSpec, import_module
 from megatron.training.config import (
@@ -590,6 +591,9 @@ def gpt_config_from_args(
     else:
         transformer_cfg = config
     kwargs["transformer"] = transformer_cfg
+    # Built here so the CLI/YAML validation runs once; the padded vocabulary is checked later
+    # by the model builder, which is the first place that knows it.
+    kwargs["engram_config"] = EngramConfig.from_args(args, transformer_cfg)
 
     if args.spec is not None:
         kwargs["transformer_layer_spec"] = import_module(args.spec)

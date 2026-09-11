@@ -5,6 +5,7 @@ from typing import Callable, Dict, List, Optional, Union
 
 import torch
 from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
+from torch.distributed import _coalescing_manager
 
 try:
     from torch.distributed._tensor import DTensor, distribute_tensor
@@ -437,6 +438,7 @@ def _allreduce_non_tensor_model_parallel_grads(
     grads_sum = []
     params_avg = []
     grads_avg = []
+    grads_engram = []
 
     for model_chunk in model:
         ddp_config = model_chunk.ddp_config
@@ -462,12 +464,27 @@ def _allreduce_non_tensor_model_parallel_grads(
                     grad = getattr(param, grad_attr)
                     if grad is None:
                         continue
+                    if getattr(param, "is_engram_embedding", False):
+                        # EP-sharded Engram tables are orders of magnitude larger than
+                        # layernorm weights; reduce them in place instead of paying a
+                        # flatten/unflatten copy of the whole table.
+                        grads_engram.append(grad.data)
+                        continue
                     params_sum.append(param)
                     if ddp_config.use_megatron_fsdp:
                         grads_sum.append(grad._local_tensor.data)
                     else:
                         grad = _unshard_if_dtensor(grad)
                         grads_sum.append(grad.data)
+
+    if grads_engram:
+        # In-place coalesced sum over TP for the large Engram table gradients — no
+        # flatten/unflatten copies (same pattern as param_and_grad_buffer.py).
+        with _coalescing_manager(tp_group):
+            for grad in grads_engram:
+                torch.distributed.all_reduce(
+                    grad, op=torch.distributed.ReduceOp.SUM, group=tp_group
+                )
 
     # Loop grads and perform correct all-reduce
     for params, grads, all_reduce_op in zip(
