@@ -39,6 +39,8 @@ from tests.unit_tests.generalized_tensor_parallel.test_gtp_grad_correctness impo
     dtype,
 )
 
+pytestmark = pytest.mark.launch_on_gb200
+
 
 def _chain(stack):
     """The stack's GTP weights in prefetch-chain order, head first."""
@@ -144,3 +146,128 @@ def _worker(rank, world_size, port):
 
 def test_peek_hands_out_the_buffer_the_consume_hands_out():
     _run_distributed(_worker, 4)
+
+
+@pytest.mark.parametrize("check_states", [False, True], ids=["states_off", "states_on"])
+@pytest.mark.parametrize("fwd", [True, False], ids=["forward", "backward"])
+@pytest.mark.parametrize("readiness", ["missing", "in_flight", "ready"])
+def test_peek_returns_ready_current_data(monkeypatch, check_states, fwd, readiness):
+    """Every readiness path exposes current bytes before consume, with exactly one gather.
+
+    Two same-key cache buffers prevent a key-only lookup from identifying the actual AG output.
+    The first consume can replace its ticket; subsequent peeks must follow the actual gather.
+    """
+    if dist.get_world_size() != 4:
+        pytest.skip("requires four ranks")
+    cache = gtp.GTPWeightCache()
+    monkeypatch.setattr(gtp, "_GTP_CACHE", cache)
+    monkeypatch.setattr(gtp, "_GTP_GROUPED_BUF_PARITY_COUNTER", {})
+    monkeypatch.setattr(gtp.GTP_CONFIG, "check_param_states", check_states)
+    monkeypatch.setattr(gtp.GTP_CONFIG, "weight_prefetch", True)
+    p = GTPShardedParam(torch.zeros(8, 16, dtype=torch.bfloat16, device="cuda"))
+    p.group = dist.group.WORLD
+    p.chain_id = "GTP_remat_grouped_fc1_ungraphed"
+    held = [cache.reserve(p, p.dtype, fwd=fwd) for _ in range(2)]
+    buffers = [cache.get(ticket) for ticket in held]
+    for ticket in held:
+        cache.release(ticket)
+    assert buffers[0].data_ptr() != buffers[1].data_ptr()
+
+    calls = []
+    gather = p._all_gather_weight
+
+    def counted_gather(*args, **kwargs):
+        calls.append(kwargs["fwd"])
+        return gather(*args, **kwargs)
+
+    monkeypatch.setattr(p, "_all_gather_weight", counted_gather)
+    peek = p.peek_group_for_forward if fwd else p.peek_group_for_backward
+    consume = p.materialize_group_for_forward if fwd else p.materialize_group_for_backward
+    pointers = []
+    for step in range(3):
+        p.data.fill_(16 * step + dist.get_rank())
+        expected = _full_weight(p)
+        if readiness != "missing":
+            _, p._prefetch_handle = p._all_gather_weight(async_op=True, fwd=fwd)
+            assert p._prefetch_handle is not None
+            if check_states:
+                assert p.state == gtp.GTPWeightState.ASYNC_WAIT
+        if readiness == "ready":
+            # An external drain (or another peek) has finished the gather's host-side work.
+            p._wait_param_gather()
+            p._already_ag_drained = True
+        initialized, previous, following = p.prefetch_initialized, p.prev_w, p.next_w
+        peeked = peek()
+        # Read immediately: a later consume must not supply the missing completion wait.
+        torch.testing.assert_close(peeked, expected, rtol=0, atol=0)
+        assert p._prefetch_handle is None and p._already_ag_drained
+        if check_states:
+            assert p.state == gtp.GTPWeightState.DATA_READY
+        assert (p.prefetch_initialized, p.prev_w, p.next_w) == (initialized, previous, following)
+        # A second peek on a different stream still observes completion and issues no gather.
+        with torch.cuda.stream(torch.cuda.Stream()):
+            again = peek()
+            torch.testing.assert_close(again, expected, rtol=0, atol=0)
+        assert again.data_ptr() == peeked.data_ptr()
+        gathered = consume()
+        assert gathered.data_ptr() == peeked.data_ptr()
+        torch.testing.assert_close(gathered, expected, rtol=0, atol=0)
+        assert len(calls) == step + 1
+        _assert_clean(p)
+        pointers.append(peeked.data_ptr())
+    assert pointers[1] == pointers[2], "the established deterministic schedule must reuse storage"
+
+
+def test_weight_push_rebinds_after_first_consume_changes_gather_ticket(monkeypatch):
+    """Follow the actual AG allocation even if chain initialization chooses another buffer."""
+    from megatron.core.transformer.moe.virtual_expert_load_balancer import WeightDirection
+    from tests.unit_tests.transformer.moe.test_virtual_expert_planner import (
+        _build_fc_layer,
+        _weight_push,
+    )
+
+    if dist.get_world_size() != 4:
+        pytest.skip("requires four ranks")
+    cache = gtp.GTPWeightCache()
+    monkeypatch.setattr(gtp, "_GTP_CACHE", cache)
+    monkeypatch.setattr(gtp, "_GTP_GROUPED_BUF_PARITY_COUNTER", {})
+    p = GTPShardedParam(torch.ones(32, 128, dtype=torch.bfloat16, device="cuda"))
+    p.main_grad = torch.zeros_like(p, dtype=torch.float32)
+    p.group = dist.group.WORLD
+    p.chain_id = "GTP_remat_grouped_fc1_ungraphed"
+    fc_layer = _build_fc_layer((p,), p, None)
+    _, push = _weight_push(monkeypatch, fc_layer)
+    assert p._ag_ticket_fwd is None and not fc_layer._tables[0]
+    first_table = push(WeightDirection.FORWARD)
+    first_pointer = p.peek_group_for_forward().data_ptr()
+    # Another cache user checks out the pooled gather buffer and returns two choices. The
+    # active gather still owns its ticket; first-consume setup can pick the other pooled buffer.
+    held = [cache.reserve(p, p.dtype, fwd=True) for _ in range(2)]
+    buffers = [cache.get(ticket) for ticket in held]
+    assert buffers[0].data_ptr() == first_pointer
+    assert buffers[1].data_ptr() != first_pointer
+    for ticket in held:
+        cache.release(ticket)
+    fc_layer.consume(WeightDirection.FORWARD)
+    assert cache.get(p._ag_ticket_fwd).data_ptr() != first_pointer
+    assert fc_layer.runtime_weights[0][0].data_ptr() == first_pointer
+    assert first_table[0].tolist() == [first_pointer]
+
+    tables = {}
+    for step in range(3):
+        p.data.fill_(step + 2)
+        for direction in WeightDirection:
+            table = push(direction)
+            torch.testing.assert_close(
+                fc_layer.runtime_weights[0][0],
+                torch.full_like(buffers[0], step + 2),
+                rtol=0,
+                atol=0,
+            )
+            fc_layer.consume(direction)
+            if direction in tables:
+                assert table is tables[direction]
+            tables[direction] = table
+            if direction == WeightDirection.BACKWARD:
+                fc_layer.bind_native_grads(0, None)
+    assert tables[WeightDirection.FORWARD] is not first_table
