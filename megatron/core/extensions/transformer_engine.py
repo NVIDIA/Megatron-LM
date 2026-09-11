@@ -50,6 +50,7 @@ from megatron.core.tensor_parallel.random import (
 from megatron.core.tensor_parallel.utils import divide
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
+from megatron.core.transformer.module import is_first_microbatch_tracked
 from megatron.core.transformer.torch_norm import LayerNormInterface
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import (
@@ -414,6 +415,21 @@ def _get_should_context_be_quantized_params(
         return _get_should_context_be_quantized_recipe(
             qparams.training_recipe, is_context_quantized
         )
+
+
+def _resolve_is_first_microbatch(module) -> Optional[bool]:
+    """The value to pass TE, or ``None`` meaning "no opinion, just accumulate".
+
+    A ``True`` tells TE the gradient is fresh, so backward writes over ``main_grad`` instead of
+    adding into it. Pass the flag on only when it can be trusted.
+    """
+    if (
+        module.disable_parameter_transpose_cache
+        or not is_first_microbatch_tracked(module.config)
+        or getattr(module, 'is_repeated_layer', False)
+    ):
+        return None
+    return module.is_first_microbatch
 
 
 def _get_extra_te_kwargs(config: TransformerConfig):
@@ -1390,9 +1406,7 @@ class TELinear(te.pytorch.Linear):
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Forward."""
-        _is_first_microbatch = (
-            None if self.disable_parameter_transpose_cache else self.is_first_microbatch
-        )
+        _is_first_microbatch = _resolve_is_first_microbatch(self)
         quant_context = _get_fp8_autocast_for_quant_params(self.te_quant_params, self.training)
 
         with quant_context:
@@ -1639,9 +1653,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
 
     def forward(self, x):
         """Forward."""
-        _is_first_microbatch = (
-            None if self.disable_parameter_transpose_cache else self.is_first_microbatch
-        )
+        _is_first_microbatch = _resolve_is_first_microbatch(self)
         quant_context = _get_fp8_autocast_for_quant_params(self.te_quant_params, self.training)
 
         # FP32 residual connections pass the FP32 residual stream into this fused module, but
@@ -2858,9 +2870,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
 
         def forward(self, x, m_splits):
             """Forward."""
-            _is_first_microbatch = (
-                None if self.disable_parameter_transpose_cache else self.is_first_microbatch
-            )
+            _is_first_microbatch = _resolve_is_first_microbatch(self)
             quant_context = _get_fp8_autocast_for_quant_params(self.te_quant_params, self.training)
 
             with quant_context:
@@ -3795,6 +3805,21 @@ try:
 
 except ImportError:
     te_parallel_cross_entropy = None  # type: ignore[assignment, misc]
+
+
+def te_cross_entropy(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    tp_group: torch.distributed.ProcessGroup | None = None,
+    *,
+    cuda_graph_capturable: bool = False,
+) -> torch.Tensor:
+    """Adapt TE cross entropy to the backend target signature and required label stride."""
+    if te_parallel_cross_entropy is None:
+        raise RuntimeError("Trying to use a TE block when it's not present.")
+    labels = torch.as_strided(labels, labels.size(), (labels.size()[1], 1))
+    return te_parallel_cross_entropy(logits, labels, tp_group, cuda_graph_capturable)
+
 
 try:
     from transformer_engine.pytorch.cpp_extensions import general_gemm
