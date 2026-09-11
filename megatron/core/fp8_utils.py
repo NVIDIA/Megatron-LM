@@ -5,7 +5,7 @@
 import importlib
 import weakref
 from contextlib import nullcontext
-from functools import wraps
+from functools import lru_cache, wraps
 from typing import List, Optional, Union
 
 import torch
@@ -99,6 +99,52 @@ try:
     )
 except ImportError:
     te_post_all_gather_processing = None
+
+
+@lru_cache(maxsize=None)
+def _make_te_calibration_config(transformer_engine_calibration_decay: float = 0.0):
+    """Construct an immutable TE calibration config once per decay value."""
+    if not HAVE_TE:
+        raise RuntimeError(
+            "buffer_transformer_engine_calibration_metadata requires Transformer Engine "
+            "to be installed"
+        )
+    calibration_config_cls = getattr(
+        transformer_engine.pytorch, "QuantizationCalibrationConfig", None
+    )
+    if calibration_config_cls is None:
+        raise RuntimeError(
+            "buffer_transformer_engine_calibration_metadata requires a Transformer Engine "
+            "version with QuantizationCalibrationConfig support"
+        )
+    return calibration_config_cls(
+        transformer_engine_calibration_decay=transformer_engine_calibration_decay
+    )
+
+
+def get_te_calibration_config(config: TransformerConfig):
+    """Translate Megatron calibration options to a Transformer Engine config."""
+    if not config.buffer_transformer_engine_calibration_metadata:
+        return None
+    return _make_te_calibration_config(config.transformer_engine_calibration_decay)
+
+
+def _fp8_autocast_with_calibration_config(
+    fp8_autocast, *, calibration_config=None, **kwargs
+):
+    """Enter TE autocast with a clear error when calibration is unsupported."""
+    if calibration_config is None:
+        return fp8_autocast(**kwargs)
+    try:
+        return fp8_autocast(calibration_config=calibration_config, **kwargs)
+    except TypeError as exc:
+        if "calibration_config" not in str(exc):
+            raise   # the exc
+        raise RuntimeError(
+            "--buffer-transformer-engine-calibration-metadata requires a Transformer Engine "
+            "version whose autocast API accepts calibration_config; upgrade Transformer Engine "
+            "or disable this option"
+        ) from exc
 
 
 def _unwrap_parameter_data(tensor: torch.Tensor) -> torch.Tensor:
@@ -853,6 +899,7 @@ if HAVE_TE:
         else:
             # fp8 training and this layer_no is in fp8
             fp8_recipe = get_fp8_recipe(config)
+            calibration_config = None if is_init else get_te_calibration_config(config)
 
             fp8_group = None
             if parallel_state.model_parallel_is_initialized():
@@ -861,8 +908,11 @@ if HAVE_TE:
                 )
 
             if not is_init:
-                fp8_context = transformer_engine.pytorch.fp8_autocast(
-                    enabled=True, fp8_recipe=fp8_recipe, fp8_group=fp8_group
+                context_args = {"enabled": True, "fp8_recipe": fp8_recipe, "fp8_group": fp8_group}
+                fp8_context = _fp8_autocast_with_calibration_config(
+                    transformer_engine.pytorch.fp8_autocast,
+                    calibration_config=calibration_config,
+                    **context_args,
                 )
             else:
                 import inspect

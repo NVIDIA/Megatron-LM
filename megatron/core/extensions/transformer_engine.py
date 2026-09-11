@@ -269,6 +269,9 @@ def add_ptq_calibration_metadata_to_state_dict(
 ) -> None:
     """
     Add buffered TE post-training calibration metadata to a checkpoint state dictionary.
+    Reduce across tensor-sharded parallelisms (TP, CP, DP) and gather across parameter-
+    distributed parallelisms (PP, EP) so we store all the metadata as common state
+    for ease of access (i.e. one FP32 scaling factor per Tensor is globally checkpointable).
 
     Currently, only supports FP32 global / per-Tensor scaling factors. Blockwise
     scaling factors are not exported or checkpointed.
@@ -279,6 +282,7 @@ def add_ptq_calibration_metadata_to_state_dict(
         local_calibration_state = {}
         named_modules = dict(model[model_idx].named_modules())
         for name, module in named_modules.items():
+            # Calibration metadata is stored as a non-persistent buffer on the Module.
             export_name = _get_global_layer_fqn(name, named_modules)
             calibration_buffers = [
                 (key, data)
@@ -297,9 +301,10 @@ def add_ptq_calibration_metadata_to_state_dict(
                     metadata = metadata.amax().reshape(1)
 
                 if "_scale_inv_" in key:
+                    # Inverted scaling factor, i.e. absmax / quantmax.
                     scale_inv = metadata
                 else:
-                    # Convert amax to a dequantization scaling factor.
+                    # Convert absmax to a dequantization scaling factor.
                     if "nvfp4" in key:
                         # E2M1_MAX * E4M3_MAX
                         quant_max = 6.0 * 448.0
@@ -344,6 +349,7 @@ def add_ptq_calibration_metadata_to_state_dict(
                 gathered_scales = torch.empty(
                     ep_size * num_local_scales, dtype=local_scales.dtype, device=local_scales.device
                 )
+                # All-gather calibration state across all expert ranks as common state.
                 torch.distributed.all_gather_into_tensor(
                     gathered_scales, local_scales, group=ep_group
                 )
@@ -355,6 +361,8 @@ def add_ptq_calibration_metadata_to_state_dict(
                         local_gemm_idx = int(gemm_match.group(2))
                         global_expert_idx = ep_rank * module.num_gemms + local_gemm_idx
                         expert_fqn = _get_grouped_linear_expert_fqn(export_name, global_expert_idx)
+                        # Rename dense keys to match vLLM, TensorRT-LLM, and other PTQ formats.
+                        # NOTE(@cspades): I don't like this but these are the conventional names.
                         scale_suffix = "_2" if tensor_kind == "weight" and "nvfp4" in key else ""
                         local_calibration_state[
                             f"{expert_fqn}.{tensor_kind}_scale{scale_suffix}"
@@ -362,6 +370,7 @@ def add_ptq_calibration_metadata_to_state_dict(
 
             for key, scale_inv, _ in non_expert_buffers:
                 # Rename dense keys to match vLLM, TensorRT-LLM, and other PTQ formats.
+                # NOTE(@cspades): I don't like this but these are the conventional names.
                 scale_prefix = "input_" if "input" in key else "weight_"
                 scale_suffix = "_2" if "weight" in key and "nvfp4" in key else ""
                 local_calibration_state[f"{export_name}.{scale_prefix}scale{scale_suffix}"] = (
@@ -370,6 +379,7 @@ def add_ptq_calibration_metadata_to_state_dict(
 
         calibration_states = [local_calibration_state]
         if get_pipeline_model_parallel_world_size() > 1:
+            # All-gather calibration state across all pipeline chunks.
             pg_collection = getattr(model[model_idx], "pg_collection", None)
             pp_group = (
                 pg_collection.pp
@@ -494,7 +504,7 @@ def _get_fp8_model_init_for_quant_params(qparams: TEQuantizationParams | None, t
         return _get_fp8_model_init_for_quant_recipe(qparams.training_recipe)
 
 
-def _get_fp8_autocast_for_quant_recipe(qrecipe: TEQuantizationRecipe):
+def _get_fp8_autocast_for_quant_recipe(qrecipe: TEQuantizationRecipe, calibration_config=None):
     if FP8GlobalStateManager.is_fp8_enabled():
         if not qrecipe.override_quantized_autocast:
             return nullcontext()
@@ -542,16 +552,36 @@ def _get_fp8_autocast_for_quant_recipe(qrecipe: TEQuantizationRecipe):
             else:
                 raise ValueError(f"Unhandled fp4 recipe: {qrecipe.fp8_quantization_recipe}")
 
-        return fp8_autocast(enabled=True, fp8_recipe=quant_recipe, fp8_group=amax_group)
+        context_args = {"enabled": True, "fp8_recipe": quant_recipe, "fp8_group": amax_group}
+        from megatron.core.fp8_utils import _fp8_autocast_with_calibration_config
+
+        return _fp8_autocast_with_calibration_config(
+            fp8_autocast,
+            calibration_config=calibration_config,
+            **context_args,
+        )
 
 
-def _get_fp8_autocast_for_quant_params(qparams: TEQuantizationParams | None, training: bool):
+def _get_fp8_autocast_for_quant_params(
+    qparams: TEQuantizationParams | None, training: bool, calibration_config=None
+):
     if qparams is None:
         return nullcontext()
     elif not training and qparams.evaluation_recipe is not None:
-        return _get_fp8_autocast_for_quant_recipe(qparams.evaluation_recipe)
+        return _get_fp8_autocast_for_quant_recipe(
+            qparams.evaluation_recipe, calibration_config=calibration_config
+        )
     else:
-        return _get_fp8_autocast_for_quant_recipe(qparams.training_recipe)
+        return _get_fp8_autocast_for_quant_recipe(
+            qparams.training_recipe, calibration_config=calibration_config
+        )
+
+
+def _get_te_calibration_config(config: TransformerConfig):
+    """Get the TE calibration config without introducing an import cycle."""
+    from megatron.core.fp8_utils import get_te_calibration_config
+
+    return get_te_calibration_config(config)
 
 
 def _get_should_context_be_quantized_recipe(
@@ -1540,10 +1570,6 @@ class TELinear(te.pytorch.Linear):
                 bias=bias,
                 return_bias=self.te_return_bias,
                 parallel_mode=te_parallel_mode,
-                buffer_quantized_scaling_factors=self.config.buffer_quantized_scaling_factors,
-                quantized_scaling_factor_buffering_decay=(
-                    self.config.quantized_scaling_factor_buffering_decay
-                ),
                 **extra_kwargs,
             )
 
@@ -1579,7 +1605,11 @@ class TELinear(te.pytorch.Linear):
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Forward."""
         _is_first_microbatch = _resolve_is_first_microbatch(self)
-        quant_context = _get_fp8_autocast_for_quant_params(self.te_quant_params, self.training)
+        quant_context = _get_fp8_autocast_for_quant_params(
+            self.te_quant_params,
+            self.training,
+            calibration_config=_get_te_calibration_config(self.config),
+        )
 
         with quant_context:
             out = super().forward(x, is_first_microbatch=_is_first_microbatch)
@@ -1778,10 +1808,6 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
                 parallel_mode="column",
                 return_layernorm_output=False,
                 zero_centered_gamma=self.config.layernorm_zero_centered_gamma,
-                buffer_quantized_scaling_factors=self.config.buffer_quantized_scaling_factors,
-                quantized_scaling_factor_buffering_decay=(
-                    self.config.quantized_scaling_factor_buffering_decay
-                ),
                 **extra_kwargs,
             )
 
@@ -1830,7 +1856,11 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
     def forward(self, x):
         """Forward."""
         _is_first_microbatch = _resolve_is_first_microbatch(self)
-        quant_context = _get_fp8_autocast_for_quant_params(self.te_quant_params, self.training)
+        quant_context = _get_fp8_autocast_for_quant_params(
+            self.te_quant_params,
+            self.training,
+            calibration_config=_get_te_calibration_config(self.config),
+        )
 
         # FP32 residual connections pass the FP32 residual stream into this fused module, but
         # TE LayerNormLinear requires its input dtype to match its BF16/FP16 parameters outside
@@ -2810,10 +2840,6 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                     bias=bias,
                     return_bias=self.te_return_bias,
                     parallel_mode=parallel_mode,
-                    buffer_quantized_scaling_factors=self.config.buffer_quantized_scaling_factors,
-                    quantized_scaling_factor_buffering_decay=(
-                        self.config.quantized_scaling_factor_buffering_decay
-                    ),
                     **extra_kwargs,
                 )
 
@@ -2999,7 +3025,11 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
         def forward(self, x, m_splits):
             """Forward."""
             _is_first_microbatch = _resolve_is_first_microbatch(self)
-            quant_context = _get_fp8_autocast_for_quant_params(self.te_quant_params, self.training)
+            quant_context = _get_fp8_autocast_for_quant_params(
+                self.te_quant_params,
+                self.training,
+                calibration_config=_get_te_calibration_config(self.config),
+            )
 
             with quant_context:
                 out = super().forward(x, m_splits, is_first_microbatch=_is_first_microbatch)
