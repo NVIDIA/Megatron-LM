@@ -1071,6 +1071,7 @@ def process_mtp_loss(
     Returns:
         Tensor: Main-model hidden states with the MTP loss attached.
     """
+    cp_group = resolve_cp_group(cp_group, packed_seq_params)
     hidden_states_list = torch.chunk(hidden_states, 1 + config.mtp_num_layers, dim=0)
     hidden_states = hidden_states_list[0] if main_hidden_states is None else main_hidden_states
 
@@ -1211,17 +1212,22 @@ def process_mtp_loss(
             )
         mtp_loss_scale = config.mtp_loss_scaling_factor / config.mtp_num_layers
         if config.calculate_per_token_loss:
-            # This uses local counts; exact parity for packed or uneven valid-token
-            # distributions across DP/CP ranks would require all-reduced counts.
-            # When calculate_per_token_loss is enabled, finalize_model_grads will
-            # divide all gradients by total_num_tokens (from main loss).
-            # However, MTP has fewer valid tokens due to rolling. To ensure correct
-            # per-token gradient weighting, we normalize by the rolled token count
-            # and re-scale by the original token count.
-            # Avoid division by zero
-            num_tokens_safe = torch.clamp(num_tokens, min=1)
+            # finalize_model_grads divides by the global main-loss token count.
+            # Use one main/MTP token ratio for this logical microbatch, independent
+            # of its CP partition. Rolling and masking can leave different ratios
+            # (or no valid tokens) on individual ranks. Keep the local counts above
+            # unchanged for logging, which reduces them separately over DP+CP.
+            normalization_tokens = torch.stack((original_num_tokens, num_tokens))
+            if cp_group is not None and cp_group.size() > 1:
+                torch.distributed.all_reduce(
+                    normalization_tokens, op=torch.distributed.ReduceOp.SUM, group=cp_group
+                )
+            main_num_tokens, mtp_num_tokens = normalization_tokens.unbind()
+            # Clamp only after the collective; empty ranks must participate too.
+            # This preserves CP partition invariance, not a global MTP-token mean
+            # across different DP microbatches with different main/MTP ratios.
             mtp_loss_normalized = (
-                mtp_loss_scale * mtp_loss * (original_num_tokens / num_tokens_safe)
+                mtp_loss_scale * mtp_loss * (main_num_tokens / mtp_num_tokens.clamp(min=1))
             )
             hidden_states = MTPLossAutoScaler.apply(hidden_states, mtp_loss_normalized)
         else:
