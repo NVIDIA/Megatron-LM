@@ -373,7 +373,10 @@ class TestPixelShuffleNonSquare:
 
     @pytest.mark.internal
     def test_temporal_token_counts_group_one_placeholder_per_media(self):
-        from megatron.core.models.multimodal.llava_model import _group_temporal_token_counts_tensor
+        from megatron.core.models.multimodal.llava_model import (
+            _align_temporal_token_counts_to_placeholders,
+            _group_temporal_token_counts_tensor,
+        )
 
         tubelet_counts = torch.tensor([252, 252, 128], dtype=torch.int32, device="cuda")
         media_tubelet_counts = [2, 1]
@@ -381,6 +384,24 @@ class TestPixelShuffleNonSquare:
         assert torch.equal(
             grouped_counts, torch.tensor([504, 128], dtype=torch.int32, device="cuda")
         )
+
+        compact_input_ids = torch.tensor([[-200, 1, -200]], device="cuda")
+        aligned_counts = _align_temporal_token_counts_to_placeholders(
+            tubelet_counts, media_tubelet_counts, compact_input_ids, -200
+        )
+        assert torch.equal(aligned_counts, grouped_counts)
+
+        expanded_input_ids = torch.tensor([[-200, -200, 1, -200]], device="cuda")
+        aligned_counts = _align_temporal_token_counts_to_placeholders(
+            tubelet_counts, media_tubelet_counts, expanded_input_ids, -200
+        )
+        assert torch.equal(aligned_counts, tubelet_counts)
+
+        invalid_input_ids = torch.tensor([[-200]], device="cuda")
+        with pytest.raises(ValueError, match="must align"):
+            _align_temporal_token_counts_to_placeholders(
+                tubelet_counts, media_tubelet_counts, invalid_input_ids, -200
+            )
 
         # temporal_patch_dim=1 makes every frame one tubelet. A per-video
         # placeholder therefore receives the sum of all frame embeddings.

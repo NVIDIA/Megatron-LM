@@ -14,7 +14,7 @@ def _minimal_llava_forward(model, **kwargs):
     return LLaVAModel.forward(
         model,
         images=kwargs.pop("images", torch.ones(2, 3, 2, 2)),
-        input_ids=torch.tensor([[1, 2]], dtype=torch.long),
+        input_ids=kwargs.pop("input_ids", torch.tensor([[1, 2]], dtype=torch.long)),
         position_ids=torch.tensor([[0, 1]], dtype=torch.long),
         attention_mask=None,
         **kwargs,
@@ -90,6 +90,7 @@ def test_forward_temporal_video_groups_tubelet_counts_per_placeholder():
 
     output, loss_mask = _minimal_llava_forward(
         model,
+        input_ids=torch.tensor([[1, model.image_token_index]], dtype=torch.long),
         images=torch.ones(4, 3, 4, 4),
         imgs_sizes=torch.tensor([[4, 4]] * 4, dtype=torch.int32),
         num_frames=[4],

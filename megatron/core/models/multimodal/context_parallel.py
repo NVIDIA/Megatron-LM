@@ -10,6 +10,7 @@ from megatron.core.parallel_state import (
     get_context_parallel_group,
     get_context_parallel_rank,
     get_context_parallel_world_size,
+    get_tensor_model_parallel_rank,
 )
 
 
@@ -236,52 +237,48 @@ def _compute_tubelet_aware_split_points(num_frames, temporal_patch_size, cp_size
     Returns ``cp_size + 1`` split points in **frame** indices (not tubelet indices),
     since callers slice per-frame ``cu_seqlens`` and ``imgs_sizes`` with these bounds.
     Splits land on either media boundaries or tubelet boundaries inside a media so
-    that no rank receives a partial tubelet.
+    that no rank receives a partial tubelet. The caller must first add enough dummy
+    media to provide at least one indivisible image or tubelet per CP rank.
     """
     T = temporal_patch_size
-    target_per_rank = total_frames / cp_size
-
-    media_boundaries = [0]
+    unit_lengths = []
     for nf in num_frames:
-        media_boundaries.append(media_boundaries[-1] + nf)
-    boundary_set = set(media_boundaries)
+        num_tubelets = math.ceil(nf / T)
+        if num_tubelets <= 1:
+            unit_lengths.append(nf)
+            continue
+        for start in range(0, nf, T):
+            unit_lengths.append(min(T, nf - start))
+
+    derived_total_frames = sum(unit_lengths)
+    if derived_total_frames != total_frames:
+        total_frames = derived_total_frames
+
+    if len(unit_lengths) < cp_size:
+        raise ValueError(
+            f"Expected at least {cp_size} image/tubelet units after padding, got "
+            f"{len(unit_lengths)} for num_frames={num_frames} and "
+            f"temporal_patch_size={temporal_patch_size}."
+        )
+
+    unit_boundaries = [0]
+    for unit_length in unit_lengths:
+        unit_boundaries.append(unit_boundaries[-1] + unit_length)
 
     split_points = [0]
+    previous_unit_index = 0
     for rank in range(1, cp_size):
-        target_split = int(rank * target_per_rank)
+        remaining_ranks = cp_size - rank
+        minimum_unit_index = previous_unit_index + 1
+        maximum_unit_index = len(unit_lengths) - remaining_ranks
+        target_split = rank * total_frames / cp_size
 
-        # If the target lands exactly on a media boundary, split there cleanly
-        # without forcing a cut into the next media.
-        if target_split in boundary_set:
-            split_point = target_split
-        else:
-            media_idx = 0
-            for i, boundary in enumerate(media_boundaries[1:], 1):
-                if boundary > target_split:
-                    media_idx = i - 1
-                    break
-            else:
-                media_idx = len(num_frames) - 1
-
-            media_start = media_boundaries[media_idx]
-            media_end = media_boundaries[media_idx + 1]
-            nf = num_frames[media_idx]
-            num_tubelets = math.ceil(nf / T)
-
-            if num_tubelets <= 1:
-                if target_split - media_start < media_end - target_split:
-                    split_point = media_start
-                else:
-                    split_point = media_end
-            else:
-                offset_in_media = target_split - media_start
-                tubelet_idx = round(offset_in_media / T)
-                tubelet_idx = max(1, min(tubelet_idx, num_tubelets - 1))
-                split_point = media_start + tubelet_idx * T
-                split_point = min(split_point, media_end)
-
-        split_point = max(split_point, split_points[-1])
-        split_points.append(split_point)
+        best_unit_index = min(
+            range(minimum_unit_index, maximum_unit_index + 1),
+            key=lambda unit_index: abs(unit_boundaries[unit_index] - target_split),
+        )
+        split_points.append(unit_boundaries[best_unit_index])
+        previous_unit_index = best_unit_index
 
     split_points.append(total_frames)
     return split_points
@@ -310,16 +307,122 @@ def _split_num_frames(num_frames, lb, ub):
     return new_num_frames
 
 
+def _partition_contiguous_weights(weights, num_parts):
+    """Partition positive weights into non-empty contiguous parts.
+
+    Return boundaries for a partition that minimizes the maximum part sum.
+    """
+    weights = [int(weight) for weight in weights]
+    if num_parts <= 0:
+        raise ValueError(f"num_parts must be positive, got {num_parts}")
+    if len(weights) < num_parts:
+        raise ValueError(f"cannot create {num_parts} non-empty parts from {len(weights)} weights")
+    if any(weight <= 0 for weight in weights):
+        raise ValueError(f"weights must be positive, got {weights}")
+
+    def required_parts(max_part_sum):
+        parts = 1
+        part_sum = 0
+        for weight in weights:
+            if part_sum + weight > max_part_sum:
+                parts += 1
+                part_sum = weight
+            else:
+                part_sum += weight
+        return parts
+
+    lower = max(max(weights), math.ceil(sum(weights) / num_parts))
+    upper = sum(weights)
+    while lower < upper:
+        candidate = (lower + upper) // 2
+        if required_parts(candidate) <= num_parts:
+            upper = candidate
+        else:
+            lower = candidate + 1
+
+    boundaries = [len(weights)]
+    end = len(weights)
+    for part in range(num_parts - 1, 0, -1):
+        start = end - 1
+        part_sum = weights[start]
+        while start > part and part_sum + weights[start - 1] <= lower:
+            start -= 1
+            part_sum += weights[start]
+        boundaries.append(start)
+        end = start
+    boundaries.append(0)
+    boundaries.reverse()
+    return boundaries
+
+
+def _build_vision_partition_units(seqlens, num_frames=None, temporal_patch_size=1):
+    """Build frame boundaries and post-compression token weights for vision units."""
+    frame_weights = seqlens.tolist() if hasattr(seqlens, "tolist") else list(seqlens)
+    frame_weights = [int(weight) for weight in frame_weights]
+    if num_frames is None or temporal_patch_size <= 1:
+        unit_boundaries = list(range(len(frame_weights) + 1))
+    else:
+        num_frames_list = num_frames.tolist() if hasattr(num_frames, "tolist") else list(num_frames)
+        unit_boundaries = [0]
+        frame_offset = 0
+        for media_num_frames in num_frames_list:
+            media_num_frames = int(media_num_frames)
+            step = 1 if media_num_frames == 1 else temporal_patch_size
+            for unit_start in range(0, media_num_frames, step):
+                unit_boundaries.append(frame_offset + min(unit_start + step, media_num_frames))
+            frame_offset += media_num_frames
+        if frame_offset != len(frame_weights):
+            raise ValueError(
+                f"sum(num_frames)={frame_offset} does not match "
+                f"{len(frame_weights)} frame weights"
+            )
+
+    unit_weights = [
+        frame_weights[unit_boundaries[index]] for index in range(len(unit_boundaries) - 1)
+    ]
+    return unit_boundaries, unit_weights
+
+
+def _compute_token_balanced_split_points(seqlens, cp_size, num_frames=None, temporal_patch_size=1):
+    """Compute contiguous frame boundaries balanced by post-compression token count."""
+    unit_boundaries, unit_weights = _build_vision_partition_units(
+        seqlens, num_frames=num_frames, temporal_patch_size=temporal_patch_size
+    )
+    unit_split_points = _partition_contiguous_weights(unit_weights, cp_size)
+    return [unit_boundaries[index] for index in unit_split_points]
+
+
+def _vision_cp_partition_loads(seqlens, split_points, num_frames=None, temporal_patch_size=1):
+    """Return the vision-token load assigned to each CP partition."""
+    unit_boundaries, unit_weights = _build_vision_partition_units(
+        seqlens, num_frames=num_frames, temporal_patch_size=temporal_patch_size
+    )
+    boundary_to_unit = {
+        frame_boundary: unit_index for unit_index, frame_boundary in enumerate(unit_boundaries)
+    }
+    return [
+        sum(
+            unit_weights[
+                boundary_to_unit[split_points[index]] : boundary_to_unit[split_points[index + 1]]
+            ]
+        )
+        for index in range(len(split_points) - 1)
+    ]
+
+
 def split_to_context_parallel_ranks_dynamic_res(
     global_t,
     global_imgs_sizes,
     global_packed_seq_params,
     *,
     patch_dim,
+    dummy_image_size=None,
     fp8_enabled=False,
     fp8_recipe=None,
     num_frames=None,
     temporal_patch_size=1,
+    balance_by_tokens=False,
+    profile_partition=False,
 ):
     """Split patched vision input across CP ranks.
 
@@ -335,12 +438,17 @@ def split_to_context_parallel_ranks_dynamic_res(
         patch_dim: Patch size of the vision backbone (e.g. 14 for SigLIP, 16 for
             many ViTs). Required because dummy padding tensors are sized in patch
             units and the default would silently mismatch some backbones.
+        dummy_image_size: Side length in pixels for context-parallel dummy images.
+            Defaults to one patch. Increase this when downstream compression (for
+            example pixel shuffle) requires a larger spatial grid.
         fp8_enabled: If True, pad each rank's local sequence to the FP8 multiple
             (16 by default; 32 for ``mxfp8``).
         fp8_recipe: Forwarded to :func:`get_padding` so the FP8 padding multiple
             matches the active recipe.
         num_frames: Per-media frame count, required when ``temporal_patch_size > 1``.
         temporal_patch_size: Tubelet size for temporal compression.
+        balance_by_tokens: Balance contiguous shards by post-compression vision tokens.
+        profile_partition: Log the selected per-rank token loads from TP=0/CP=0.
 
     Returns:
         (local_t, local_imgs_sizes, local_packed_seq_params, has_padding,
@@ -377,11 +485,22 @@ def split_to_context_parallel_ranks_dynamic_res(
         f"{int(global_t.shape[2])} (patch_dim={patch_dim})."
     )
 
+    if dummy_image_size is None:
+        dummy_image_size = patch_dim
+    dummy_image_size = int(dummy_image_size)
+    if dummy_image_size <= 0 or dummy_image_size % patch_dim != 0:
+        raise ValueError(
+            f"dummy_image_size must be a positive multiple of patch_dim={patch_dim}, "
+            f"got {dummy_image_size}."
+        )
+    dummy_patches_per_side = dummy_image_size // patch_dim
     dummy_img_size = torch.tensor(
-        [[patch_dim, patch_dim]], device=global_imgs_sizes.device, dtype=global_imgs_sizes.dtype
+        [[dummy_image_size, dummy_image_size]],
+        device=global_imgs_sizes.device,
+        dtype=global_imgs_sizes.dtype,
     )
     hidden_dim = expected_hidden
-    dummy_seqlen = 1
+    dummy_seqlen = dummy_patches_per_side * dummy_patches_per_side
     dummy_img = torch.zeros(
         [1, dummy_seqlen, hidden_dim], device=global_t.device, dtype=global_t.dtype
     )
@@ -418,19 +537,29 @@ def split_to_context_parallel_ranks_dynamic_res(
     num_padded_ranks = num_padded_imgs
 
     if use_tubelet_aware_split:
-        for _retry in range(cp_size):
-            total_frames = len(global_imgs_sizes)
-            split_points = _compute_tubelet_aware_split_points(
-                num_frames_list, temporal_patch_size, cp_size, total_frames
+        if balance_by_tokens:
+            split_points = _compute_token_balanced_split_points(
+                seqlens,
+                cp_size,
+                num_frames=num_frames_list,
+                temporal_patch_size=temporal_patch_size,
             )
-            num_empty = sum(1 for k in range(cp_size) if split_points[k] == split_points[k + 1])
-            if num_empty == 0:
-                break
-            global_t, global_imgs_sizes, cu_seqlens, num_frames_list = _add_dummies(
-                num_empty, global_t, global_imgs_sizes, cu_seqlens, num_frames_list
-            )
-            num_padded_imgs += num_empty
-            seqlens = cu_seqlens[1:] - cu_seqlens[:-1]
+        else:
+            for _retry in range(cp_size):
+                total_frames = len(global_imgs_sizes)
+                split_points = _compute_tubelet_aware_split_points(
+                    num_frames_list, temporal_patch_size, cp_size, total_frames
+                )
+                num_empty = sum(
+                    1 for rank in range(cp_size) if split_points[rank] == split_points[rank + 1]
+                )
+                if num_empty == 0:
+                    break
+                global_t, global_imgs_sizes, cu_seqlens, num_frames_list = _add_dummies(
+                    num_empty, global_t, global_imgs_sizes, cu_seqlens, num_frames_list
+                )
+                num_padded_imgs += num_empty
+                seqlens = cu_seqlens[1:] - cu_seqlens[:-1]
 
         original_total_frames = total_frames - num_padded_imgs
         if num_padded_imgs > 0 and original_total_frames not in split_points:
@@ -451,12 +580,39 @@ def split_to_context_parallel_ranks_dynamic_res(
         ub = split_points[cp_rank + 1]
         local_num_frames = _split_num_frames(num_frames_list, lb, ub)
     else:
-        seq_per_rank = total_frames // cp_size
-        lb = cp_rank * seq_per_rank
-        # The last rank absorbs the remainder so the union of [lb, ub) ranges
-        # exactly covers the [0, total_frames) image set.
-        ub = (cp_rank + 1) * seq_per_rank if cp_rank < cp_size - 1 else total_frames
+        if balance_by_tokens:
+            split_points = _compute_token_balanced_split_points(seqlens, cp_size)
+            lb = split_points[cp_rank]
+            ub = split_points[cp_rank + 1]
+        else:
+            seq_per_rank = total_frames // cp_size
+            lb = cp_rank * seq_per_rank
+            # The last rank absorbs the remainder so the union of [lb, ub) ranges
+            # exactly covers the [0, total_frames) image set.
+            ub = (cp_rank + 1) * seq_per_rank if cp_rank < cp_size - 1 else total_frames
+            split_points = [rank * seq_per_rank for rank in range(cp_size)] + [total_frames]
         local_num_frames = None
+
+    if profile_partition and cp_rank == 0 and get_tensor_model_parallel_rank() == 0:
+        partition_loads = _vision_cp_partition_loads(
+            seqlens,
+            split_points,
+            num_frames=num_frames_list if use_tubelet_aware_split else None,
+            temporal_patch_size=temporal_patch_size,
+        )
+        mean_load = sum(partition_loads) / len(partition_loads)
+        # Keep this opt-in profile output visible independently of logging configuration.
+        print(  # pylint: disable=bad-builtin
+            "VISION_CP_PARTITION_PROFILE "
+            f"mode={'token_balanced' if balance_by_tokens else 'legacy'} "
+            f"global_rank={torch.distributed.get_rank()} "
+            f"min_tokens={min(partition_loads)} "
+            f"max_tokens={max(partition_loads)} "
+            f"mean_tokens={mean_load:.3f} "
+            f"max_over_mean={max(partition_loads) / mean_load:.6f} "
+            f"loads={','.join(str(load) for load in partition_loads)}",
+            flush=True,
+        )
 
     seqlens_local = torch.cat([torch.tensor([0], device=seqlens.device), seqlens[lb:ub]])
     cu_seqlens_local = torch.cumsum(seqlens_local, dim=0).to(torch.int32)
@@ -525,6 +681,13 @@ def split_to_context_parallel_ranks_dynamic_res(
         local_num_frames = torch.tensor(
             local_num_frames, dtype=torch.int32, device=global_imgs_sizes.device
         )
+
+    assert lb < ub and local_imgs_sizes.numel() > 0, (
+        "Context-parallel split produced an empty local shard: "
+        f"cp_rank={cp_rank}, cp_size={cp_size}, lb={lb}, ub={ub}, "
+        f"num_padded_imgs={num_padded_imgs}, split_points={split_points}, "
+        f"temporal_patch_size={temporal_patch_size}"
+    )
 
     return (
         local_t,
