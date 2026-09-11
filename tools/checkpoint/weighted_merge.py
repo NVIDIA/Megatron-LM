@@ -1246,6 +1246,7 @@ def _read_public_dcp_metadata(
     *,
     model_key_prefixes: tuple[str, ...],
     include_default_model_roots: bool = True,
+    ignore_non_model_state: bool = False,
     required_model_key_prefixes: tuple[str, ...] = (),
 ) -> _DcpMetadataSnapshot:
     try:
@@ -1262,13 +1263,15 @@ def _read_public_dcp_metadata(
     non_model_byte_keys: list[str] = []
     for fqn, metadata_entry in metadata.state_dict_metadata.items():
         fqn = str(fqn)
-        if isinstance(metadata_entry, TensorStorageMetadata):
-            tensor_metadata[fqn] = metadata_entry
-        elif _metadata_same_layout_is_model_key(
+        is_model_key = _metadata_same_layout_is_model_key(
             fqn,
             model_key_prefixes,
             include_default_model_roots=include_default_model_roots,
-        ):
+        )
+        if isinstance(metadata_entry, TensorStorageMetadata):
+            if is_model_key or not ignore_non_model_state:
+                tensor_metadata[fqn] = metadata_entry
+        elif is_model_key:
             if isinstance(metadata_entry, BytesStorageMetadata) and (
                 _metadata_same_layout_is_extra_state_key(fqn)
             ):
@@ -1276,7 +1279,8 @@ def _read_public_dcp_metadata(
             else:
                 non_tensor_model_keys.append(fqn)
         elif isinstance(metadata_entry, BytesStorageMetadata):
-            non_model_byte_keys.append(fqn)
+            if not ignore_non_model_state:
+                non_model_byte_keys.append(fqn)
 
     if non_model_byte_keys:
         sample = ", ".join(sorted(non_model_byte_keys)[:5])
@@ -1621,6 +1625,7 @@ def merge_same_layout_dcp_metadata_checkpoints(
     merge_style: str | None = None,
     model_key_prefixes: tuple[str, ...] = METADATA_SAME_LAYOUT_MODEL_PREFIXES,
     include_default_model_roots: bool = True,
+    ignore_non_model_state: bool = False,
     required_model_key_prefixes: tuple[str, ...] = (),
     balance_rank_work: bool = False,
 ) -> MergeResult:
@@ -1690,6 +1695,7 @@ def merge_same_layout_dcp_metadata_checkpoints(
             checkpoint_dir,
             model_key_prefixes=model_key_prefixes,
             include_default_model_roots=include_default_model_roots,
+            ignore_non_model_state=ignore_non_model_state,
             required_model_key_prefixes=required_model_key_prefixes,
         )
         for checkpoint_dir in resolved_input_dirs
@@ -1950,6 +1956,14 @@ def _add_merge_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
             "listed prefix must match tensors in every input checkpoint."
         ),
     )
+    group.add_argument(
+        "--merge-ignore-non-model-state",
+        action="store_true",
+        help=(
+            "Explicitly ignore tensors and byte/object entries outside the selected "
+            "model roots. The default remains fail-closed."
+        ),
+    )
     return parser
 
 
@@ -2029,6 +2043,7 @@ def _run_metadata_same_layout_cli(args: argparse.Namespace) -> MergeResult:
         merge_style=merge_style,
         model_key_prefixes=model_key_prefixes,
         include_default_model_roots=not explicit_model_prefixes,
+        ignore_non_model_state=args.merge_ignore_non_model_state,
         required_model_key_prefixes=(model_key_prefixes if explicit_model_prefixes else ()),
         balance_rank_work=args.merge_balance_rank_work,
     )

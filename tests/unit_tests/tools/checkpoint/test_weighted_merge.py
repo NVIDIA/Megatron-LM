@@ -325,6 +325,21 @@ def _write_unprefixed_gpt_like_checkpoint_with_optimizer_tensor(path, value):
     dist_checkpointing.save(state, str(path))
 
 
+def _write_unprefixed_gpt_like_checkpoint_with_mixed_state(path, value):
+    state = _unprefixed_gpt_like_model_state(value)
+    state["optimizer.param_groups.0.lr"] = ShardedTensor.from_rank_offsets(
+        "optimizer.param_groups.0.lr", torch.tensor([value], dtype=torch.float32), replica_id=0
+    )
+    state["rng_state._extra_state"] = ShardedObject(
+        "rng_state._extra_state",
+        _bytesio_state(int(value)),
+        (_world_size(),),
+        (_rank(),),
+        replica_id=0,
+    )
+    dist_checkpointing.save(state, str(path))
+
+
 def _split_weight_factory(sharded_tensor):
     sharded_tensor_without_data = sharded_tensor.without_data()
     split_point = sharded_tensor.data.shape[0] // 2
@@ -1255,6 +1270,34 @@ def test_metadata_same_layout_requires_every_explicit_model_prefix(
             )
 
 
+def test_metadata_same_layout_explicit_roots_ignore_mixed_state(
+    tmp_path_dist_ckpt, process_group
+):
+    with (
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_mixed_a") as ckpt_a,
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_mixed_b") as ckpt_b,
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_mixed_out") as output_root,
+    ):
+        _write_unprefixed_gpt_like_checkpoint_with_mixed_state(ckpt_a, 1.0)
+        _write_unprefixed_gpt_like_checkpoint_with_mixed_state(ckpt_b, 5.0)
+        prefixes = ("decoder.", "embedding.", "output_layer.")
+
+        result = merge_same_layout_dcp_metadata_checkpoints(
+            [ckpt_a, ckpt_b],
+            [0.25, 0.75],
+            output_root,
+            output_iteration=60,
+            model_key_prefixes=prefixes,
+            include_default_model_roots=False,
+            ignore_non_model_state=True,
+            required_model_key_prefixes=prefixes,
+        )
+
+        output_metadata = torch_dcp.FileSystemReader(result.output_dir).read_metadata()
+        assert "optimizer.param_groups.0.lr" not in output_metadata.state_dict_metadata
+        assert "rng_state._extra_state" not in output_metadata.state_dict_metadata
+
+
 def test_metadata_same_layout_cli_dispatch_skips_megatron_parser(tmp_path, monkeypatch):
     ckpt_a = tmp_path / "iter_0000001"
     ckpt_b = tmp_path / "iter_0000002"
@@ -1300,6 +1343,7 @@ def test_metadata_same_layout_cli_dispatch_skips_megatron_parser(tmp_path, monke
             "language_model.",
             "--merge-model-prefix",
             "modality_submodules.",
+            "--merge-ignore-non-model-state",
             "--merge-balance-rank-work",
             "--ckpt-format",
             "torch_dist",
@@ -1318,6 +1362,7 @@ def test_metadata_same_layout_cli_dispatch_skips_megatron_parser(tmp_path, monke
         "modality_submodules.",
     )
     assert calls["kwargs"]["include_default_model_roots"] is False
+    assert calls["kwargs"]["ignore_non_model_state"] is True
     assert calls["kwargs"]["required_model_key_prefixes"] == (
         "language_model.",
         "modality_submodules.",
