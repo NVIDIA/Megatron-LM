@@ -12,6 +12,7 @@ import torch
 from megatron.core.models.mimo.config import MimoModelConfig
 from megatron.core.models.mimo.model.base import MimoModel
 from megatron.core.transformer.spec_utils import ModuleSpec
+from megatron.core.transformer.transformer_config import TransformerConfig
 
 
 class TestEmbeddingAlignment:
@@ -23,9 +24,7 @@ class TestEmbeddingAlignment:
         language_model_spec = ModuleSpec(
             module=MagicMock,
             params={
-                'config': MagicMock(
-                    context_parallel_size=1, sequence_parallel=False, pipeline_model_parallel_size=1
-                )
+                'config': TransformerConfig(num_layers=1, hidden_size=64, num_attention_heads=4)
             },
         )
         self.mimo_config = MimoModelConfig(

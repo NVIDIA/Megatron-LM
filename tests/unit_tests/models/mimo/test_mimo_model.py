@@ -16,6 +16,7 @@ import torch.nn as nn
 from transformers import WhisperConfig, WhisperModel
 
 from megatron.core import parallel_state
+from megatron.core.context_parallel import ContextParallelBatch
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_spec,
     get_gpt_mtp_block_spec,
@@ -331,7 +332,7 @@ class TestMimoModel:
             expected_mtp_input_mask &= input_ids != special_token_id
         torch.testing.assert_close(captured['mtp_input_mask'], expected_mtp_input_mask)
 
-    def test_prepare_mtp_inputs_uses_optional_text_indices(self):
+    def test_prepare_language_inputs_uses_optional_text_indices(self):
         """Precomputed text positions and the fallback scan must produce the same MTP mask."""
         mimo_model = self._make_vlm()
         input_ids = self._make_input_ids()
@@ -344,21 +345,38 @@ class TestMimoModel:
             expected_mask &= input_ids != special_token_id
         text_token_indices = expected_mask.reshape(-1).nonzero(as_tuple=False).flatten()
 
-        indexed_ids, indexed_positions, indexed_mask = mimo_model._prepare_mtp_inputs(
+        indexed = mimo_model._prepare_language_inputs(
+            embeddings=None,
             input_ids=input_ids,
             position_ids=position_ids,
-            packed_seq_params=None,
+            labels=None,
+            loss_mask=None,
+            cu_seqlens=None,
+            cu_seqlens_padded=None,
+            max_seqlen=None,
             owns_mtp=True,
             text_token_indices=text_token_indices,
         )
-        fallback_ids, fallback_positions, fallback_mask = mimo_model._prepare_mtp_inputs(
-            input_ids=input_ids, position_ids=position_ids, packed_seq_params=None, owns_mtp=True
+        fallback = mimo_model._prepare_language_inputs(
+            embeddings=None,
+            input_ids=input_ids,
+            position_ids=position_ids,
+            labels=None,
+            loss_mask=None,
+            cu_seqlens=None,
+            cu_seqlens_padded=None,
+            max_seqlen=None,
+            owns_mtp=True,
         )
 
-        assert indexed_ids is fallback_ids is input_ids
-        assert indexed_positions is fallback_positions is position_ids
-        torch.testing.assert_close(indexed_mask, expected_mask)
-        torch.testing.assert_close(indexed_mask, fallback_mask)
+        indexed_batch = indexed.get_batch()
+        fallback_batch = fallback.get_batch()
+        assert indexed_batch["tokens"] is fallback_batch["tokens"] is input_ids
+        assert indexed_batch["position_ids"] is fallback_batch["position_ids"] is position_ids
+        torch.testing.assert_close(indexed_batch["mtp_input_mask"], expected_mask)
+        torch.testing.assert_close(
+            indexed_batch["mtp_input_mask"], fallback_batch["mtp_input_mask"]
+        )
 
     def test_forward_with_image_modality(self):
         """Test forward pass with text and image input."""
@@ -466,13 +484,13 @@ class TestMimoModel:
         model = MimoModel(mimo_config)
         assert model is not None
 
-    def test_partition_adapter_none_by_default(self):
-        """Test that partition_adapter is None with default config (no CP/SP)."""
+    def test_partition_adapter_created_by_default(self):
+        """Language inputs use the same batch preparation path when CP and SP are disabled."""
         mimo_model = self._make_vlm()
-        assert mimo_model.partition_adapter is None
+        assert mimo_model.partition_adapter is not None
 
-    def test_forward_with_packing_kwargs(self):
-        """Test that packing_kwargs builds PackedSeqParams with qkv_format='thd' and int32 seqlens."""
+    def test_forward_with_packed_sequence_metadata(self):
+        """Canonical MIMO metadata builds the language model's THD parameters."""
         from megatron.core.packed_seq_params import PackedSeqParams
 
         mimo_model = self._make_vlm()
@@ -480,10 +498,9 @@ class TestMimoModel:
         position_ids = self._make_position_ids()
 
         cu_seqlens = torch.tensor(
-            [0, self.seq_len, 2 * self.seq_len], dtype=torch.int64, device=self.device
+            [[0, self.seq_len, 2 * self.seq_len]], dtype=torch.int32, device=self.device
         )
-        packing_kwargs = {"cu_seqlens_q": cu_seqlens.clone(), "cu_seqlens_kv": cu_seqlens.clone()}
-
+        max_seqlen = torch.tensor([self.seq_len], dtype=torch.int32, device=self.device)
         text_emb = torch.zeros(self.batch_size * self.seq_len, self.hidden_size, device=self.device)
         combined_emb = torch.zeros(
             self.seq_len, self.batch_size, self.hidden_size, device=self.device
@@ -506,7 +523,8 @@ class TestMimoModel:
                 input_ids=input_ids,
                 position_ids=position_ids,
                 modality_inputs=None,
-                packing_kwargs=packing_kwargs,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
             )
 
         packed_seq_params = captured['packed_seq_params']
@@ -514,12 +532,14 @@ class TestMimoModel:
         assert packed_seq_params.qkv_format == 'thd'
         assert packed_seq_params.cu_seqlens_q.dtype == torch.int32
         assert packed_seq_params.cu_seqlens_kv.dtype == torch.int32
+        torch.testing.assert_close(packed_seq_params.cu_seqlens_q, cu_seqlens.squeeze(0))
+        assert packed_seq_params.max_seqlen_q == self.seq_len
 
     def test_forward_with_partition_adapter(self):
         """MTP token metadata must use the same CP-local sequence as hidden states.
 
-        The caller no longer transposes around shard(): it passes the sequence-first
-        ``(S, B, H)`` combined embeddings straight in, and shard()'s LM-layout output
+        The caller passes the sequence-first ``(S, B, H)`` combined embeddings into one
+        partition operation, and the adapter's LM-layout output
         flows straight into the language model as ``decoder_input``. Token and position
         IDs used by MTP must be partitioned to that same local sequence.
         """
@@ -536,21 +556,28 @@ class TestMimoModel:
         modality_token_indices = {"text": text_token_indices}
 
         sharded_seq_len = self.seq_len // 2
-        # shard() returns LM-layout [S/cp, B, H] and a (CP-sharded) loss mask.
+        # The adapter returns LM-layout [S/cp, B, H] and a CP-sharded loss mask.
         sharded_emb = torch.zeros(
             sharded_seq_len, self.batch_size, self.hidden_size, device=self.device
         )
         sharded_loss_mask = torch.ones(self.batch_size, sharded_seq_len, device=self.device)
         sharded_input_ids = input_ids[:, :sharded_seq_len].clone()
         sharded_position_ids = position_ids[:, :sharded_seq_len].clone()
-        sharded_token_metadata = torch.cat(
-            (sharded_input_ids, text_mask[:, :sharded_seq_len].to(dtype=input_ids.dtype)), dim=0
+        boundary_batch = {
+            "tokens": sharded_input_ids,
+            "position_ids": sharded_position_ids,
+            "decoder_input": sharded_emb,
+            "labels": None,
+            "loss_mask": sharded_loss_mask,
+            "mtp_input_mask": text_mask[:, :sharded_seq_len],
+        }
+        cp_batch = ContextParallelBatch(
+            boundary_layout="contiguous",
+            batches_by_layout={"contiguous": boundary_batch, "zigzag": {}},
+            packed_seq_params_by_layout={"contiguous": None, "zigzag": None},
         )
         mock_adapter = MagicMock()
-        mock_adapter.shard.side_effect = [
-            (sharded_emb, None, sharded_loss_mask, None),
-            (None, sharded_position_ids, sharded_token_metadata, None),
-        ]
+        mock_adapter.partition.return_value = cp_batch
         mimo_model.partition_adapter = mock_adapter
 
         text_emb = torch.zeros(self.batch_size * self.seq_len, self.hidden_size, device=self.device)
@@ -566,6 +593,7 @@ class TestMimoModel:
             captured['decoder_input'] = kwargs.get('decoder_input')
             captured['loss_mask'] = kwargs.get('loss_mask')
             captured['mtp_input_mask'] = kwargs.get('mtp_input_mask')
+            captured['cp_batch'] = kwargs.get('cp_batch')
             return torch.zeros(
                 self.batch_size, sharded_seq_len, self.vocab_size, device=self.device
             )
@@ -585,17 +613,21 @@ class TestMimoModel:
                 modality_token_indices=modality_token_indices,
             )
 
-        assert mock_adapter.shard.call_count == 2
-        shard_kwargs = mock_adapter.shard.call_args_list[0].kwargs
-        # The helper passes sequence-first [S, B, H] embeddings straight to shard().
-        assert shard_kwargs['embeddings'].shape == (self.seq_len, self.batch_size, self.hidden_size)
-        assert shard_kwargs['loss_mask'] is loss_mask
-        mtp_shard_kwargs = mock_adapter.shard.call_args_list[1].kwargs
-        assert mtp_shard_kwargs['embeddings'] is None
-        assert mtp_shard_kwargs['labels'] is position_ids
-        expected_token_metadata = torch.cat((input_ids, text_mask.to(dtype=input_ids.dtype)), dim=0)
-        torch.testing.assert_close(mtp_shard_kwargs['loss_mask'], expected_token_metadata)
-        # shard()'s LM-layout output flows straight into the LM (no extra transpose).
+        mock_adapter.partition.assert_called_once()
+        partition_kwargs = mock_adapter.partition.call_args.kwargs
+        assert partition_kwargs['embeddings'].shape == (
+            self.seq_len,
+            self.batch_size,
+            self.hidden_size,
+        )
+        assert partition_kwargs['input_ids'] is input_ids
+        assert partition_kwargs['position_ids'] is position_ids
+        assert partition_kwargs['loss_mask'] is loss_mask
+        assert partition_kwargs['cu_seqlens'] is None
+        assert partition_kwargs['cu_seqlens_padded'] is None
+        assert partition_kwargs['max_seqlen'] is None
+        torch.testing.assert_close(partition_kwargs['mtp_input_mask'], text_mask)
+        # The adapter's LM-layout output and dual-layout CP batch flow straight into the LM.
         assert captured['decoder_input'].shape == (
             sharded_seq_len,
             self.batch_size,
@@ -606,7 +638,8 @@ class TestMimoModel:
         assert captured['position_ids'] is sharded_position_ids
         assert captured['mtp_input_mask'].dtype == torch.bool
         assert torch.equal(captured['mtp_input_mask'], text_mask[:, :sharded_seq_len])
-        # forward() returns the (possibly sharded) loss mask from shard().
+        assert captured['cp_batch'] is cp_batch
+        # forward() returns the adapter's possibly sharded loss mask.
         assert out_loss_mask is sharded_loss_mask
 
     def test_get_text_embeddings_raises_when_sp_and_embedding_scatter_enabled(self):
