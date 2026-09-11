@@ -355,12 +355,12 @@ def reset_hybrid_ep_buffer():
     _hybrid_ep_buffer = None
 
 
-def reset_fused_a2a_buffers():
+def reset_fused_a2a_buffers() -> None:
     """Drop every module-global buffer bound to a process group (DeepEP and HybridEP).
 
-    Buffer destructors release communicator-backed resources, so this must run while
-    the underlying process groups are still alive; destroy_model_parallel() calls it
-    before destroying the groups it created.
+    Destructors can synchronize CUDA work and rendezvous with expert-parallel peers.
+    All participating ranks must finish their communication and release the buffers
+    together. Aborting torch process groups does not abort these libraries' transports.
     """
     global _buffer
     _buffer = None
@@ -409,7 +409,7 @@ class HybridEPDispatch(torch.autograd.Function):
                 num_blocks_permute = None
                 num_blocks_unpermute = None
 
-        if _hybrid_ep_buffer is None:
+        if _hybrid_ep_buffer is None or _hybrid_ep_buffer.group != group:
             num_tokens, hidden_dim = x.shape[-2:]
             fp8_dispatch = False  # Currently, we do not support fp8 dispatch
             init_hybrid_ep_buffer(
