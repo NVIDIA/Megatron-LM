@@ -17,7 +17,7 @@ import torch
 from torch.optim.optimizer import ParamsT
 
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.utils import get_pg_size, log_single_rank
+from megatron.core.utils import get_pg_rank, get_pg_size, log_single_rank
 
 from .optimizer_config import ParamKey, ParamPredicate
 
@@ -130,11 +130,29 @@ def _is_nonlinear_or_embedding(param):
     return getattr(param, 'is_embedding_or_output_parameter', False) or len(param.shape) != 2
 
 
-def _get_qkv_split_shapes(model_cfg) -> list[int]:
-    """Compute QKV split shapes from model config."""
+def _get_qkv_split_shapes(model_cfg, split_qkv_per_head: bool = False) -> list[int]:
+    """Compute fused QKV split shapes from logical attention layout metadata.
+
+    Args:
+        model_cfg: Transformer config or an owning attention layer's ``QKVLayout`` metadata.
+        split_qkv_per_head: Return one split size per physical attention head. When false,
+            return the per-query-group Q, gate (if present), K, and V projection widths.
+    """
+    if hasattr(model_cfg, 'projection_split_shapes'):
+        if split_qkv_per_head:
+            return list(model_cfg.per_head_split_shapes) * model_cfg.num_groups
+        return list(model_cfg.projection_split_shapes)
+
     query_projection_size = (
         model_cfg.num_attention_heads // model_cfg.num_query_groups * model_cfg.kv_channels
     )
+    if split_qkv_per_head:
+        num_query_heads_per_group = model_cfg.num_attention_heads // model_cfg.num_query_groups
+        per_group_shapes = [model_cfg.kv_channels] * num_query_heads_per_group
+        if getattr(model_cfg, 'attention_output_gate', False):
+            per_group_shapes += [model_cfg.kv_channels] * num_query_heads_per_group
+        per_group_shapes += [model_cfg.kv_channels, model_cfg.kv_channels]
+        return per_group_shapes * model_cfg.num_query_groups
     if getattr(model_cfg, 'attention_output_gate', False):
         return [
             query_projection_size,
@@ -143,6 +161,46 @@ def _get_qkv_split_shapes(model_cfg) -> list[int]:
             model_cfg.kv_channels,
         ]
     return [query_projection_size, model_cfg.kv_channels, model_cfg.kv_channels]
+
+
+def _localize_qkv_split_shapes(
+    global_split_shapes: list[int], local_start: int, local_rows: int
+) -> tuple[list[int], bool]:
+    """Intersect global per-head split sizes with a rank-local contiguous row range.
+
+    Returns:
+        The physical rank-local split sizes and whether every intersected head is complete.
+    """
+    local_stop = local_start + local_rows
+    local_split_shapes = []
+    all_heads_complete = True
+    head_start = 0
+    for head_rows in global_split_shapes:
+        head_stop = head_start + head_rows
+        overlap_start = max(head_start, local_start)
+        overlap_stop = min(head_stop, local_stop)
+        if overlap_start < overlap_stop:
+            overlap_rows = overlap_stop - overlap_start
+            local_split_shapes.append(overlap_rows)
+            all_heads_complete &= overlap_rows == head_rows
+        head_start = head_stop
+
+    if sum(local_split_shapes) != local_rows:
+        raise RuntimeError(
+            f"Muon per-head QKV local range [{local_start}, {local_stop}) is outside "
+            f"the global split shape with {sum(global_split_shapes)} rows"
+        )
+    return local_split_shapes, all_heads_complete
+
+
+def _qkv_split_groups_are_complete(
+    split_shapes: list[int], local_start: int, local_rows: int
+) -> bool:
+    """Return whether a local row range contains only complete fused QKV groups."""
+    split_width = sum(split_shapes)
+    if split_width <= 0:
+        raise ValueError(f"Muon QKV split shapes must sum to a positive size: {split_shapes}")
+    return local_start % split_width == 0 and local_rows % split_width == 0
 
 
 # ===========================================================================
@@ -169,6 +227,7 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         weight_decay: float = 0.01,
         use_decoupled_weight_decay: bool = True,
         split_qkv: bool = False,
+        split_qkv_per_head: bool = False,
         is_qkv_fn: Callable[[torch.Tensor], bool] | None = None,
         qkv_split_shapes: list[int] | None = None,
         fp32_matmul_prec: str = "medium",
@@ -181,6 +240,8 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
     ) -> None:
         if num_ns_steps < 1:
             raise ValueError(f"num_ns_steps must be at least 1, got {num_ns_steps}")
+        if split_qkv_per_head and not split_qkv:
+            raise ValueError("split_qkv_per_head requires split_qkv=True")
 
         def scaled_orthogonalize_fn(
             grad: torch.Tensor,
@@ -211,8 +272,10 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         self.pg_collection = pg_collection
         self.tp_mode = tp_mode
         self.split_qkv = split_qkv
+        self.split_qkv_per_head = split_qkv_per_head
         self.is_qkv_fn = is_qkv_fn
         self.qkv_split_shapes = qkv_split_shapes
+        self._warned_distributed_qkv_fallback = False
 
         weight_decay_method = "decoupled" if use_decoupled_weight_decay else "l2"
         # Use explicit class call instead of super() so that subclasses with
@@ -229,6 +292,160 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
             fp32_matmul_prec=fp32_matmul_prec,
             scaled_orthogonalize_fn=scaled_orthogonalize_fn,
         )
+
+    def _warn_distributed_qkv_fallback(self):
+        """Warn once when a QKV layout cannot use distributed Newton-Schulz."""
+        if self.tp_mode != "distributed" or self._warned_distributed_qkv_fallback:
+            return
+        log_single_rank(
+            logger,
+            logging.WARNING,
+            "muon_tp_mode='distributed' is not supported for per-head or fragmented "
+            "QKV splitting; falling back to non-TP Newton-Schulz.",
+        )
+        self._warned_distributed_qkv_fallback = True
+
+    def _gather_qkv_grad(self, p, grad, tp_group, expected_rows):
+        """Reconstruct a fused QKV gradient and record how to restore its local shard."""
+        gathered_grad = grad
+        tp_slice = None
+        if gathered_grad.shape[0] != expected_rows:
+            partition_dim = getattr(p, "partition_dim", None)
+            if partition_dim != 0 or tp_group is None:
+                raise RuntimeError(
+                    f"Muon QKV split shape mismatch: grad_shape={tuple(gathered_grad.shape)}, "
+                    f"expected_rows={expected_rows}, partition_dim={partition_dim}"
+                )
+            tp_size = get_pg_size(tp_group)
+            if gathered_grad.shape[0] * tp_size != expected_rows:
+                raise RuntimeError(
+                    "Muon QKV split cannot reconstruct the global tensor: "
+                    f"local_grad_shape={tuple(gathered_grad.shape)}, tp_size={tp_size}, "
+                    f"expected_rows={expected_rows}"
+                )
+            tp_rank = get_pg_rank(tp_group)
+            tp_local_rows = gathered_grad.shape[0]
+            shards = [torch.empty_like(gathered_grad) for _ in range(tp_size)]
+            torch.distributed.all_gather(shards, gathered_grad, tp_group)
+            gathered_grad = torch.cat(shards, dim=0)
+            tp_slice = (tp_rank, tp_local_rows)
+
+        if gathered_grad.shape[0] != expected_rows:
+            raise RuntimeError(
+                "Muon QKV split shape mismatch after gathering: "
+                f"grad_shape={tuple(gathered_grad.shape)}, expected_rows={expected_rows}"
+            )
+        return gathered_grad, tp_slice
+
+    @staticmethod
+    def _restore_local_qkv_grad(gathered_grad, tp_slice):
+        """Restore the TP dim-0 shard recorded by ``_gather_qkv_grad``."""
+        if tp_slice is not None:
+            tp_rank, tp_local_rows = tp_slice
+            gathered_grad = gathered_grad[tp_rank * tp_local_rows : (tp_rank + 1) * tp_local_rows]
+        return gathered_grad.contiguous()
+
+    def _orthogonalize_split_qkv(self, grad, split_shapes, orthogonalize_fn):
+        """Split and reconstruct Megatron's interleaved fused QKV update."""
+        if grad.ndim != 2:
+            raise RuntimeError(f"Muon QKV gradient must be 2D, got {grad.ndim}D")
+        if not split_shapes or any(size <= 0 for size in split_shapes):
+            raise RuntimeError(f"Muon QKV split shapes must be positive: {split_shapes}")
+        split_width = sum(split_shapes)
+        if self.split_qkv_per_head:
+            if grad.shape[0] != split_width:
+                raise RuntimeError(
+                    f"Muon per-head QKV split shape mismatch: grad_shape={tuple(grad.shape)}, "
+                    f"split_shapes={split_shapes}"
+                )
+            if len(set(split_shapes)) == 1:
+                # A 3D input selects Emerging-Optimizers' batched Newton-Schulz path.
+                head_rows = split_shapes[0]
+                return orthogonalize_fn(grad.view(len(split_shapes), head_rows, -1)).view_as(grad)
+            return torch.cat(
+                [orthogonalize_fn(head) for head in torch.split(grad, split_shapes, dim=0)], dim=0
+            )
+
+        if grad.shape[0] % split_width != 0:
+            raise RuntimeError(
+                f"Muon QKV split shape mismatch: grad_shape={tuple(grad.shape)}, "
+                f"split_shapes={split_shapes}"
+            )
+        num_query_groups = grad.shape[0] // split_width
+        grouped_grad = grad.view(num_query_groups, split_width, -1)
+        projection_grads = torch.split(grouped_grad, split_shapes, dim=1)
+        projection_grads = [
+            projection.reshape(-1, grad.shape[-1]) for projection in projection_grads
+        ]
+        projection_grads = [
+            orthogonalize_fn(projection).view(num_query_groups, -1, grad.shape[-1])
+            for projection in projection_grads
+        ]
+        return torch.cat(projection_grads, dim=1).view_as(grad)
+
+    def _orthogonalize_qkv_per_head(self, p, grad, tp_group):
+        """Orthogonalize every Q, gate, K, and V head independently.
+
+        Split sizes may describe complete heads in the local tensor or the global fused
+        QKV tensor. For a global layout, reconstruct TP dimension 0 before splitting so
+        heads crossing rank boundaries remain complete.
+        """
+        self._warn_distributed_qkv_fallback()
+        local_split_shapes = getattr(p, "qkv_split_shapes", None)
+        heads_are_complete = getattr(p, "qkv_split_heads_are_complete", None)
+        use_local_layout = heads_are_complete is True or (
+            heads_are_complete is None
+            and local_split_shapes is not None
+            and sum(local_split_shapes) == grad.shape[0]
+        )
+        if use_local_layout:
+            qkv_split_shapes = local_split_shapes
+        else:
+            qkv_split_shapes = getattr(p, "qkv_split_shapes_global", None)
+            if qkv_split_shapes is None:
+                qkv_split_shapes = self.qkv_split_shapes
+        if qkv_split_shapes is None:
+            raise RuntimeError("Muon per-head QKV split requested but qkv_split_shapes is not set")
+        if not qkv_split_shapes or any(size <= 0 for size in qkv_split_shapes):
+            raise RuntimeError(
+                f"Muon per-head QKV split shapes must be positive: {qkv_split_shapes}"
+            )
+
+        expected_rows = sum(qkv_split_shapes)
+        gathered_grad, tp_slice = self._gather_qkv_grad(p, grad, tp_group, expected_rows)
+
+        gathered_grad = self._orthogonalize_split_qkv(
+            gathered_grad,
+            qkv_split_shapes,
+            lambda head_grad: self.scaled_orthogonalize_fn(
+                head_grad, tp_group=None, partition_dim=None
+            ),
+        )
+
+        return self._restore_local_qkv_grad(gathered_grad, tp_slice)
+
+    def _orthogonalize_global_qkv(self, p, grad, tp_group, split_shapes):
+        """Orthogonalize projections after reconstructing their global QKV layout."""
+        self._warn_distributed_qkv_fallback()
+        global_split_shapes = getattr(p, "qkv_split_shapes_global", None)
+        if global_split_shapes is None:
+            raise RuntimeError("Muon global QKV split requires global split shapes")
+        expected_rows = sum(global_split_shapes)
+        if expected_rows % sum(split_shapes) != 0:
+            raise RuntimeError(
+                f"Muon global QKV layout does not contain complete query groups: "
+                f"global_split_shapes={global_split_shapes}, split_shapes={split_shapes}"
+            )
+
+        gathered_grad, tp_slice = self._gather_qkv_grad(p, grad, tp_group, expected_rows)
+        gathered_grad = self._orthogonalize_split_qkv(
+            gathered_grad,
+            split_shapes,
+            lambda projection_grad: self.scaled_orthogonalize_fn(
+                projection_grad, tp_group=None, partition_dim=None
+            ),
+        )
+        return self._restore_local_qkv_grad(gathered_grad, tp_slice)
 
     def orthogonalize(self, p: torch.Tensor, grad: torch.Tensor, **kwargs: Any) -> torch.Tensor:
         """Orthogonalize the momentum.
@@ -256,36 +473,28 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
             partition_dim = None
 
         if self.split_qkv and self.is_qkv_fn(p):  # type: ignore[misc]
-            grad_shape = grad.shape
+            if self.split_qkv_per_head:
+                return self._orthogonalize_qkv_per_head(p, grad, tp_group)
+
             qkv_split_shapes = getattr(p, "qkv_split_shapes", None)
             if qkv_split_shapes is None:
                 qkv_split_shapes = self.qkv_split_shapes
             if qkv_split_shapes is None:
                 raise RuntimeError("Muon QKV split requested but qkv_split_shapes is not set")
-            qkv_split_dim = sum(qkv_split_shapes)
-            if grad_shape[0] % qkv_split_dim != 0:
-                raise RuntimeError(
-                    f"Muon QKV split shape mismatch: grad_shape={tuple(grad_shape)}, "
-                    f"split_shapes={qkv_split_shapes}"
-                )
+            if getattr(p, "qkv_split_groups_are_complete", None) is False:
+                return self._orthogonalize_global_qkv(p, grad, tp_group, qkv_split_shapes)
             log_single_rank(
                 logger,
                 logging.DEBUG,
-                f'qkv split grad shape {grad_shape}, split shapes {qkv_split_shapes}',
+                f'qkv split grad shape {grad.shape}, split shapes {qkv_split_shapes}',
             )
-            num_query_groups = grad_shape[0] // qkv_split_dim
-            qkv_grads = torch.split(
-                grad.view(num_query_groups, qkv_split_dim, -1), qkv_split_shapes, dim=1
+            grad = self._orthogonalize_split_qkv(
+                grad,
+                qkv_split_shapes,
+                lambda projection_grad: self.scaled_orthogonalize_fn(
+                    projection_grad, tp_group, partition_dim
+                ),
             )
-            qkv_grads = [g.reshape(-1, grad_shape[-1]) for g in qkv_grads]
-
-            qkv_grads = [
-                self.scaled_orthogonalize_fn(g, tp_group, partition_dim).view(
-                    num_query_groups, -1, grad_shape[-1]
-                )
-                for g in qkv_grads
-            ]
-            grad = torch.cat(qkv_grads, dim=1).view(grad_shape)
         else:
             grad = self.scaled_orthogonalize_fn(grad, tp_group, partition_dim)
         return grad
@@ -308,6 +517,7 @@ class TensorParallelAdaptiveMuon(TensorParallelMuon, AdaptiveMuon):
         weight_decay: Weight decay coefficient.
         use_decoupled_weight_decay: Whether to use decoupled weight decay.
         split_qkv: Whether to split QKV weights for orthogonalization.
+        split_qkv_per_head: Whether to orthogonalize individual Q, gate, K, and V heads.
         is_qkv_fn: Function to determine if a tensor is a QKV weight.
         qkv_split_shapes: Shapes for splitting QKV weights.
         fp32_matmul_prec: Precision for FP32 matrix multiplication.
@@ -331,6 +541,7 @@ class TensorParallelAdaptiveMuon(TensorParallelMuon, AdaptiveMuon):
         weight_decay: float = 0.01,
         use_decoupled_weight_decay: bool = True,
         split_qkv: bool = False,
+        split_qkv_per_head: bool = False,
         is_qkv_fn: Callable[[torch.Tensor], bool] | None = None,
         qkv_split_shapes: list[int] | None = None,
         fp32_matmul_prec: str = "medium",
@@ -353,6 +564,7 @@ class TensorParallelAdaptiveMuon(TensorParallelMuon, AdaptiveMuon):
             weight_decay=weight_decay,
             use_decoupled_weight_decay=use_decoupled_weight_decay,
             split_qkv=split_qkv,
+            split_qkv_per_head=split_qkv_per_head,
             is_qkv_fn=is_qkv_fn,
             qkv_split_shapes=qkv_split_shapes,
             fp32_matmul_prec=fp32_matmul_prec,
@@ -402,7 +614,9 @@ def _muon_config_to_kwargs(config, model_chunks, pg_collection) -> Dict[str, Any
     """Convert OptimizerConfig to TensorParallelMuon constructor kwargs."""
     kwargs = _kwargs_from_config(TensorParallelMuon, "muon", config)
     kwargs["is_qkv_fn"] = lambda p: getattr(p, "is_qkv", False)
-    kwargs["qkv_split_shapes"] = _get_qkv_split_shapes(model_chunks[0].config)
+    kwargs["qkv_split_shapes"] = _get_qkv_split_shapes(
+        model_chunks[0].config, split_qkv_per_head=kwargs.get("split_qkv_per_head", False)
+    )
     kwargs["pg_collection"] = pg_collection
     return kwargs
 
