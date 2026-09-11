@@ -40,6 +40,22 @@ See [examples/mimo](https://github.com/NVIDIA/Megatron-LM/tree/main/examples/mim
 | **CLIP ViT** | OpenAI's CLIP Vision Transformer | Image-text alignment, multiple scales (L/14@336px) |
 | **RADIO** | Resolution-Agnostic Dynamic Image Optimization | Flexible resolution handling, efficient vision encoding |
 
+## Training FLOPs Accounting
+
+Multimodal training entry points can add encoder work to Megatron's model FLOPs
+and throughput metrics by attaching a supported vision FLOPs variant and its
+architecture metadata to the training args. Qwen3.5-VL accounts for its patch
+projection, vision Transformer attention and MLP projections, and patch merger
+on top of the language decoder estimate.
+
+The `examples/multimodal_dev` path also accumulates the actual
+`image_grid_thw` shapes used in each training iteration. Variable-resolution
+inputs therefore scale the vision attention term with the packed
+per-temporal-frame sequence lengths and scale token-linear operations with the
+real number of patches and merged tokens. See
+`examples/multimodal_dev/README.md` for the registry contract and exact
+accounting behavior.
+
 ## Diffusion Models
 
 For multimodal diffusion models (image generation, text-to-image). Refer to [Nvidia Diffusion Models](https://github.com/NVIDIA-NeMo/DFM/ ). The Developer Program, NIM, and NeMo can offer production-ready implementations of:
