@@ -1783,6 +1783,11 @@ class HyperConnectionTransformerLayer(TransformerLayer):
                 "when combining mHC with a MoE MLP submodule."
             )
 
+        # GraphableMegatronModule calls create_mcore_cudagraph_manager before the MLP is
+        # built, so repeat the local-graph decision now that self.is_moe_layer is authoritative.
+        if self.config.cuda_graph_impl == "local":
+            self.create_mcore_cudagraph_manager(self.config)
+
         self.self_attention_hyper_connection = build_module(
             submodules.self_attention_hyper_connection,
             config=self.config,
@@ -1830,6 +1835,24 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         )
         return static_inputs
 
+    def create_mcore_cudagraph_manager(self, config):
+        """Create only CUDA graph managers compatible with this mHC layer."""
+        # The first call comes from GraphableMegatronModule before TransformerLayer has
+        # constructed self.mlp and set self.is_moe_layer.
+        if not hasattr(self, "mlp"):
+            return
+
+        if self.is_moe_layer:
+            # Whole-layer and MLP-scope graphs would capture dynamic MoE dispatch. Mixed
+            # models may still request MLP graphs globally, so leave only this MoE layer eager.
+            if not config.cuda_graph_modules or (
+                CudaGraphModule.mlp in config.cuda_graph_modules
+                and CudaGraphModule.attn not in config.cuda_graph_modules
+            ):
+                return
+
+        super().create_mcore_cudagraph_manager(config)
+
     def _get_submodules_under_cudagraphs(self):
         """Override to include hyper connection modules.
 
@@ -1845,7 +1868,7 @@ class HyperConnectionTransformerLayer(TransformerLayer):
 
         if CudaGraphModule.attn in self.config.cuda_graph_modules:
             submodules.append(self.self_attention_hyper_connection)
-        if CudaGraphModule.mlp in self.config.cuda_graph_modules:
+        if CudaGraphModule.mlp in self.config.cuda_graph_modules and not self.is_moe_layer:
             submodules.append(self.mlp_hyper_connection)
         return submodules
 

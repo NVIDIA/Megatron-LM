@@ -781,6 +781,33 @@ class TestTransformerLayerWithHyperConnectionRecompute:
         assert torch.isfinite(output).all()
         assert hidden_states.grad is not None
 
+    def test_moe_layer_skips_mlp_cuda_graph(self):
+        """A global MLP graph request must leave the mHC MoE layer eager."""
+        config = _make_mhc_config(
+            hidden_size=32,
+            num_streams=4,
+            num_layers=1,
+            ffn_hidden_size=64,
+            moe_ffn_hidden_size=64,
+            num_moe_experts=4,
+            moe_router_topk=2,
+            moe_router_load_balancing_type="none",
+            moe_token_dispatcher_type="allgather",
+        )
+        config.cuda_graph_impl = "local"
+        config.cuda_graph_modules = [CudaGraphModule.mlp]
+
+        layer = HyperConnectionTransformerLayer(
+            config,
+            _make_mhc_layer_spec(
+                num_experts=4, moe_grouped_gemm=False, use_te_op_fuser=False
+            ).submodules,
+        )
+
+        assert layer.is_moe_layer
+        assert not hasattr(layer, "cudagraph_manager")
+        assert layer.mlp_hyper_connection not in layer._get_submodules_under_cudagraphs()
+
     @pytest.mark.parametrize(
         "cuda_graph_module",
         [CudaGraphModule.moe, CudaGraphModule.moe_router, CudaGraphModule.moe_preprocess],
