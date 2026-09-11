@@ -61,6 +61,7 @@ from megatron.core.inference.utils import Counter, InferenceMode, await_process_
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.cuda_graphs import CudaGraphManager, delete_cuda_graphs
 from megatron.core.transformer.enums import InferenceCudaGraphScope
+from megatron.core.transformer.moe.experts import InferenceGroupedMLP
 from megatron.core.transformer.moe.router_replay import RouterReplay, RouterReplayAction
 from megatron.core.utils import (
     deprecate_args,
@@ -419,6 +420,10 @@ class DynamicInferenceEngine(AbstractEngine):
                         if isinstance(val, (int, float)) and int(val) > max_step:
                             max_step = int(val)
                     self.inference_step_offset = int(max_step)
+
+        # Repair expert aliases detached by conversion/load before the first capture;
+        # a new engine is already RUNNING, so resume() skips the refresh.
+        self._refresh_inference_grouped_mlp_weights()
 
         # Mark the inference engine as active. Cleared in `suspend()` and re-set in `resume()`.
         InferenceMode.set_active()
@@ -1238,6 +1243,14 @@ class DynamicInferenceEngine(AbstractEngine):
         if not self.use_coordinator:
             self.state = EngineState.SUSPENDED
 
+    @torch.no_grad()
+    def _refresh_inference_grouped_mlp_weights(self) -> None:
+        """Refresh materialized serving buffers after the caller has synchronized weights."""
+        model = unwrap_model(self.controller.inference_wrapped_model.model)
+        for module in model.modules():
+            if isinstance(module, InferenceGroupedMLP):
+                module.refresh_inference_weights()
+
     def resume(self):
         """Resume engine by reallocating context's GPU state."""
 
@@ -1253,6 +1266,7 @@ class DynamicInferenceEngine(AbstractEngine):
         # that spans the refit republishes under its original generation and is
         # unmatchable by new arrivals.
         self._weight_epoch += 1
+        self._refresh_inference_grouped_mlp_weights()
 
         InferenceMode.set_active()
 
