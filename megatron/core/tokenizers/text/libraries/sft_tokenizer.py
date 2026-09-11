@@ -163,7 +163,8 @@ class SFTTokenizer:
 
         target = tokens.copy()
 
-        # When using the default or identity prompt format, we do not replace any tokens with IGNORE_INDEX.
+        # When using the default or identity prompt format, we do not replace any tokens with
+        # IGNORE_INDEX.
         # Instead, all token losses will be used for simplicity.
         if self._prompt_format in ["default", "identity"]:
             return tokens, target
