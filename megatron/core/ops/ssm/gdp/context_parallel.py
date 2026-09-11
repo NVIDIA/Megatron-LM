@@ -26,15 +26,7 @@ from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-from megatron.core.packed_seq_params import PackedSeqParams
-
-try:
-    from einops import repeat
-
-    HAVE_EINOPS = True
-except ImportError:
-    HAVE_EINOPS = False
+from einops import repeat
 
 # Re-use the load balancing and all-to-all helpers from the existing module.
 # The load-balancing helpers already handle packed (THD) input via their
@@ -45,6 +37,7 @@ from megatron.core.ops.ssm.mamba2.context_parallel import (
     _redo_attention_load_balancing,
     _undo_attention_load_balancing,
 )
+from megatron.core.packed_seq_params import PackedSeqParams
 
 
 class GDPContextParallel:
@@ -87,9 +80,6 @@ class GDPContextParallel:
         D_has_hdim: bool,
         sequence_is_contiguous: bool = False,
     ) -> None:
-        if not HAVE_EINOPS:
-            raise ImportError("einops is required but cannot be imported")
-
         self.cp_group = cp_group
         self.d_inner_local_tp = d_inner_local_tp
         self.nheads_local_tp = nheads_local_tp

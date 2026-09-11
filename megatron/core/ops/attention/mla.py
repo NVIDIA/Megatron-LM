@@ -26,6 +26,8 @@ from megatron.core.models.common.embeddings import (
     _yarn_get_mscale,
     apply_rotary_pos_emb,
 )
+from megatron.core.ops.attention.kernel_metadata import MLA_ROPE
+from megatron.core.ops.kernel_metadata import DeterminismPolicy, validate_kernel
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear
 from megatron.core.tensor_parallel.mappings import (
@@ -39,15 +41,6 @@ from megatron.core.transformer.mla_qk_norm_config import QKNormConfigResolver
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 from megatron.core.utils import deprecate_inference_params, get_pg_size, is_te_min_version
-
-try:
-    from megatron.core.fusions.fused_mla_yarn_rope_apply import (
-        fused_apply_mla_rope_for_kv,
-        fused_apply_mla_rope_for_q,
-    )
-except ImportError:
-    fused_apply_mla_rope_for_kv = None
-    fused_apply_mla_rope_for_q = None
 
 if HAVE_TE:
     from megatron.core.extensions.transformer_engine import (
@@ -149,6 +142,18 @@ class AbsorbedMLASelfAttention(Attention):
         name: str | None = None,
         is_mtp_layer: bool = False,
     ):
+        if config.apply_rope_fusion:
+            validate_kernel(
+                MLA_ROPE,
+                determinism=(
+                    DeterminismPolicy.WARN
+                    if config.deterministic_mode
+                    else DeterminismPolicy.IGNORE
+                ),
+            )
+            from megatron.core.fusions.fused_mla_yarn_rope_apply import fused_apply_mla_rope_for_q
+
+            self.fused_apply_mla_rope_for_q = fused_apply_mla_rope_for_q
         if pg_collection is None:
             pg_collection = ProcessGroupCollection.use_mpu_process_groups()
 
@@ -433,10 +438,6 @@ class AbsorbedMLASelfAttention(Attention):
                 )
                 rotary_pos_emb = None
                 assert inference_context is None, "Inference with MLA RoPE fusion is not supported"
-                assert (
-                    fused_apply_mla_rope_for_q is not None
-                    and fused_apply_mla_rope_for_kv is not None
-                ), "Fused MLA RoPE apply is not imported successfully"
             else:
                 rotary_pos_emb, mscale = self.rotary_pos_emb(rotary_seq_len, packed_seq=packed_seq)
 
@@ -585,7 +586,7 @@ class AbsorbedMLASelfAttention(Attention):
 
                 cp_rank = self.pg_collection.cp.rank()
                 cp_size = self.pg_collection.cp.size()
-                q_absorbed = fused_apply_mla_rope_for_q(
+                q_absorbed = self.fused_apply_mla_rope_for_q(
                     q_absorbed,
                     rotary_pos_cos,
                     rotary_pos_sin,
@@ -595,7 +596,7 @@ class AbsorbedMLASelfAttention(Attention):
                     cp_rank,
                     cp_size,
                 )
-                kv_compressed = fused_apply_mla_rope_for_q(
+                kv_compressed = self.fused_apply_mla_rope_for_q(
                     kv_compressed,
                     rotary_pos_cos,
                     rotary_pos_sin,

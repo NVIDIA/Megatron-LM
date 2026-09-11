@@ -1,6 +1,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
 from functools import partial
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -74,9 +75,13 @@ def patch_hadamard_if_needed():
     """Automatically patch hadamard_transform in both dsa and csa modules if not installed."""
     if not HAVE_HADAMARD:
         with (
-            patch(
-                'megatron.core.ops.attention.dsa.rotation.hadamard_transform',
-                mock_hadamard_transform,
+            patch.dict(
+                'sys.modules',
+                {
+                    'fast_hadamard_transform': SimpleNamespace(
+                        hadamard_transform=mock_hadamard_transform
+                    )
+                },
             ),
             patch(
                 'megatron.core.ops.attention.csa.modules.rotate_activation',

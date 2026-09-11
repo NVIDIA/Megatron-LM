@@ -72,14 +72,14 @@ def select_dsa_kernels(config: TransformerConfig) -> DSAKernels:
     module_name = dsa_kernels._get_backend_module_name(config)
     assert module_name is not None
     try:
-        # Python caches modules; the legacy mutable backend-selection cache is not needed.
-        backend = import_module(module_name)
         declarations = (
             (TILELANG_TOPK, TILELANG_LOSS, TILELANG_ATTENTION)
             if config.dsa_kernel_backend == "tilelang"
             else (CUDNN_TOPK, CUDNN_LOSS, CUDNN_ATTENTION, CUDNN_FULL)
         )
         validate_kernels(declarations, determinism=policy)
+        # Validate native requirements before loading the selected adapter.
+        backend = import_module(module_name)
     except (ImportError, OSError) as exc:
         raise RuntimeError(f"Failed to import DSA kernel backend {module_name}: {exc}") from exc
     return DSAKernels(

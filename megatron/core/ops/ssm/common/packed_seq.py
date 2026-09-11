@@ -8,12 +8,9 @@ share a single reference implementation (avoids drift across mixers).
 
 from __future__ import annotations
 
-from typing import Optional, Tuple
-
 import torch
 
 from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.core.utils import is_causal_conv1d_min_version
 
 
 def get_cu_seqlens(packed_seq_params: PackedSeqParams) -> torch.Tensor:
@@ -56,21 +53,3 @@ def build_packed_seq_idx(packed_seq_params: PackedSeqParams, total_tokens: int) 
         output_size=total_tokens,
     )
     return seq_idx.to(torch.int32).unsqueeze(0)
-
-
-def check_fla_sequence_packing_support() -> Tuple[bool, Optional[str]]:
-    """Lighter sibling of `_check_mamba_sequence_packing_support` for FLA-backed mixers.
-
-    GDP/KDA/DPv2/GDN reach into FLA's chunk_kda / chunk_gated_delta_product /
-    chunk_gated_delta_rule, all of which manage their own variable-length
-    state internally. The only shared external dependency is the causal
-    conv1d kernel — `causal_conv1d_fn(seq_idx=...)` was added in 1.4.0 and
-    is required to reset the conv state at packed-document boundaries.
-
-    Mamba2's stricter `mamba_ssm` minimums (used by `mamba_split_conv1d_scan_combined`)
-    do not apply.
-    """
-    conv1d_min = "1.4.0"
-    if not is_causal_conv1d_min_version(conv1d_min):
-        return False, f"causal_conv1d >= {conv1d_min} is required for packed sequences"
-    return True, None

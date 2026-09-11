@@ -29,13 +29,9 @@ def select_gated_delta_rule(
 
             # The shared protocol cannot express the variant's required gate keywords.
             return cast(GatedDeltaRuleInterface, torch_chunk_gated_delta_rule)
-        from megatron.core.ops.ssm.gated_delta.fla import chunk_gated_delta_rule
-
-        if chunk_gated_delta_rule is None:
-            raise ImportError(
-                "GDN requires flash-linear-attention with the gated_delta_rule kernel."
-            )
         validate_kernel(GDN_FLA)
+        from fla.ops.gated_delta_rule import chunk_gated_delta_rule
+
         return chunk_gated_delta_rule
     if variant == "gdn2":
         if deterministic:
@@ -43,10 +39,8 @@ def select_gated_delta_rule(
             from megatron.core.ops.ssm.gated_delta.reference_gdn2 import torch_chunk_gdn2
 
             return cast(GatedDeltaRuleInterface, torch_chunk_gdn2)
-        from megatron.core.ops.ssm.gated_delta.fla import chunk_gdn2
-
-        if chunk_gdn2 is None:
-            raise ImportError("GDN2 requires flash-linear-attention >= 0.5.1 with the gdn2 kernel.")
         validate_kernel(GDN2_FLA)
+        from fla.ops.gdn2.chunk import chunk_gdn2
+
         return chunk_gdn2
     raise ValueError(f"Unknown gated delta variant: {variant!r}")

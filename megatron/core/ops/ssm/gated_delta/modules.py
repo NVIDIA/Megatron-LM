@@ -7,34 +7,19 @@ stays lightweight and does not eagerly load these implementations.
 """
 
 from megatron.core.ops.ssm.gated_delta.common import (
-    HAVE_FLA,
     GatedDeltaNetSubmodules,
-    causal_conv1d,
-    chunk_gated_delta_rule,
     get_parameter_local_cp,
-    l2norm,
     tensor_a2a_cp2hp,
     tensor_a2a_hp2cp,
 )
 from megatron.core.ops.ssm.gated_delta.gdn import GatedDeltaNet, torch_chunk_gated_delta_rule
-from megatron.core.ops.ssm.gated_delta.gdn2 import (
-    HAVE_FLA_GDN2,
-    GatedDeltaNet2,
-    chunk_gdn2,
-    torch_chunk_gdn2,
-)
+from megatron.core.ops.ssm.gated_delta.gdn2 import GatedDeltaNet2, torch_chunk_gdn2
 
 __all__ = [
-    "HAVE_FLA",
-    "HAVE_FLA_GDN2",
     "GatedDeltaNet",
     "GatedDeltaNet2",
     "GatedDeltaNetSubmodules",
-    "causal_conv1d",
-    "chunk_gated_delta_rule",
-    "chunk_gdn2",
     "get_parameter_local_cp",
-    "l2norm",
     "tensor_a2a_cp2hp",
     "tensor_a2a_hp2cp",
     "torch_chunk_gated_delta_rule",

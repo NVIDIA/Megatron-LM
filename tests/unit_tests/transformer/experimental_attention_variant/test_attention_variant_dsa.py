@@ -330,8 +330,13 @@ class _FakeCPGroup:
 def patch_hadamard_if_needed():
     """Automatically patch hadamard_transform in dsa module if not installed."""
     if not HAVE_HADAMARD:
-        with patch(
-            'megatron.core.ops.attention.dsa.rotation.hadamard_transform', mock_hadamard_transform
+        with patch.dict(
+            'sys.modules',
+            {
+                'fast_hadamard_transform': SimpleNamespace(
+                    hadamard_transform=mock_hadamard_transform
+                )
+            },
         ):
             yield
     else:

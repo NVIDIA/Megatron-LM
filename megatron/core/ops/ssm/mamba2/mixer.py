@@ -13,16 +13,14 @@ from typing import Optional, Tuple, Union
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from einops import rearrange, repeat
 
-from megatron.core import parallel_state
 from megatron.core.inference.contexts import BaseInferenceContext, DynamicInferenceContext
 from megatron.core.inference.contexts.attention_context.triton.tensor_ops import (
     tensor_masked_update,
 )
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.ops.kernel_metadata import DeterminismPolicy, KernelMetadata, validate_kernels
-from megatron.core.ops.ssm.common.causal_conv1d import causal_conv1d_fn, causal_conv1d_update_cuda
-from megatron.core.ops.ssm.common.causal_conv1d_cp import assert_causal_conv1d_deterministic
 from megatron.core.ops.ssm.common.causal_conv1d_triton import causal_conv1d_update
 from megatron.core.ops.ssm.common.causal_conv1d_varlen import causal_conv1d_varlen_carry_states
 from megatron.core.ops.ssm.common.checkpointing import _split_tensor_factory
@@ -32,7 +30,6 @@ from megatron.core.ops.ssm.common.intermediate_extraction import (
     scatter_intermediate_ssm,
 )
 from megatron.core.ops.ssm.common.kernel_metadata import (
-    CAUSAL_CONV,
     CAUSAL_CONV_CARRY,
     CAUSAL_CONV_CUDA_UPDATE,
     CAUSAL_CONV_TRITON_UPDATE,
@@ -40,21 +37,13 @@ from megatron.core.ops.ssm.common.kernel_metadata import (
     SCATTER_CONV,
     SCATTER_SSM,
 )
-from megatron.core.ops.ssm.mamba2.backends import (
-    HAVE_MAMBA_SSM,
-    MAMBA_HAS_STATE_DTYPE,
-    RMSNormGated,
-    mamba_chunk_scan_combined,
-    mamba_split_conv1d_scan_combined,
-)
+from megatron.core.ops.ssm.mamba2.backends import select_mamba_kernels
 from megatron.core.ops.ssm.mamba2.batch_invariant_decode import MambaBatchInvariantDecode
 from megatron.core.ops.ssm.mamba2.kernel_metadata import (
     MAMBA_BATCH_INVARIANT,
     MAMBA_DECODE,
     MAMBA_NORM,
     MAMBA_PREFILL,
-    MAMBA_SCAN,
-    MAMBA_SPLIT_SCAN,
 )
 from megatron.core.ops.ssm.mamba2.mamba_ssm import selective_state_update
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -83,44 +72,9 @@ else:
     is_gtp_param = None
 
 from megatron.core.ops.ssm.mamba2.context_parallel import MambaContextParallel
-
-try:
-    from megatron.core.ops.ssm.mamba2.ssd_combined import mamba_chunk_scan_combined_varlen
-
-    HAVE_SSM_OPS_VARLEN = True
-except ImportError:
-    mamba_chunk_scan_combined_varlen = None
-    HAVE_SSM_OPS_VARLEN = False
-
-try:
-    from einops import rearrange, repeat
-
-    HAVE_EINOPS = True
-except ImportError:
-    HAVE_EINOPS = False
+from megatron.core.ops.ssm.mamba2.ssd_combined import mamba_chunk_scan_combined_varlen
 
 logger = logging.getLogger(__name__)
-
-
-class ExtendedRMSNorm(RMSNormGated):
-    """
-    RMSNormGated with sharded state dict.
-    """
-
-    def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
-        """Sharding along axis 0, bias not sharded"""
-        if not hasattr(self, 'tp_group'):
-            # Preserve the legacy fallback for callers that did not supply a TP group.
-            self.tp_group = parallel_state.get_tensor_model_parallel_group()
-        state_dict = self.state_dict(prefix="", keep_vars=True)
-        return make_sharded_tensors_for_checkpoint(
-            state_dict,
-            prefix,
-            {"weight": 0},
-            sharded_offsets,
-            tp_group=self.tp_group,
-            dp_cp_group=metadata["dp_cp_group"],
-        )
 
 
 @dataclass
@@ -194,15 +148,13 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule):
         Args:
             name (str | None): module instance name passed top-down from its paranet module
         """
-        if not HAVE_MAMBA_SSM:
-            raise ImportError(
-                "MambaSSM is not installed. Please install it with `pip install mamba-ssm`."
-            )
-
-        if not HAVE_EINOPS:
-            raise ImportError("einops is required by the Mamba model but cannot be imported")
-
         super().__init__(config)
+        self.mamba_kernels = select_mamba_kernels(
+            config.use_mamba_mem_eff_path, config.deterministic_mode
+        )
+        policy = DeterminismPolicy.WARN if config.deterministic_mode else DeterminismPolicy.IGNORE
+        kernels = [MAMBA_NORM] if rmsnorm else []
+        validate_kernels(kernels, determinism=policy)
         self.config = config
         self.d_model = d_model
         self.d_conv = d_conv
@@ -226,7 +178,10 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule):
         self.mamba_training_ssm_states_dtype = (
             config.mamba_training_ssm_states_dtype or config.params_dtype
         )
-        if config.mamba_training_ssm_states_dtype is not None and not MAMBA_HAS_STATE_DTYPE:
+        if (
+            config.mamba_training_ssm_states_dtype is not None
+            and not self.mamba_kernels.has_state_dtype
+        ):
             raise RuntimeError(
                 "mamba_training_ssm_states_dtype is set, but the installed mamba_ssm does "
                 "not accept the `state_dtype` argument. Upgrade mamba_ssm or unset the option."
@@ -365,16 +320,6 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule):
                 else:
                     nn.init.kaiming_uniform_(self.conv1d_weight, a=math.sqrt(5))
 
-        # Both of this mixer's conv layouts need it; see assert_causal_conv1d_deterministic.
-        assert_causal_conv1d_deterministic(config.deterministic_mode)
-        policy = DeterminismPolicy.WARN if config.deterministic_mode else DeterminismPolicy.IGNORE
-        kernels = [MAMBA_SPLIT_SCAN if self.use_mem_eff_path else MAMBA_SCAN]
-        if self.rmsnorm:
-            kernels.append(MAMBA_NORM)
-        if causal_conv1d_fn is not None:
-            kernels.append(CAUSAL_CONV)
-        validate_kernels(kernels, determinism=policy)
-
         self.activation = "silu"
         self.act = nn.SiLU()
 
@@ -424,7 +369,8 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule):
         setattr(self.D, "tensor_model_parallel", True)
         setattr(self.D, "partition_dim", 0)
         if self.rmsnorm:
-            assert RMSNormGated is not None
+            from megatron.core.ops.ssm.mamba2.norm import ExtendedRMSNorm
+
             self.norm = ExtendedRMSNorm(
                 self.d_inner_local_tp,
                 eps=1e-5,
@@ -606,11 +552,11 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule):
             conv_state.copy_(F.pad(xBC, (self.d_conv - xBC.shape[-1], 0)))  # Update state (B D W)
 
         seqlen = xBC.size(2)
-        if causal_conv1d_fn is None:
+        if self.mamba_kernels.causal_conv1d is None:
             xBC = self.act(self.cp.conv1d(xBC)[..., :seqlen])
         else:
             assert self.activation in ["silu", "swish"]
-            xBC = causal_conv1d_fn(
+            xBC = self.mamba_kernels.causal_conv1d(
                 x=xBC,
                 weight=rearrange(self.cp.get_conv1d_weight(), "d 1 w -> d w"),
                 bias=self.cp.get_conv1d_bias(),
@@ -645,9 +591,11 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule):
 
         initial_ssm_state = None
         state_dtype_kwarg = (
-            {"state_dtype": self.mamba_training_ssm_states_dtype} if MAMBA_HAS_STATE_DTYPE else {}
+            {"state_dtype": self.mamba_training_ssm_states_dtype}
+            if self.mamba_kernels.has_state_dtype
+            else {}
         )
-        y = mamba_chunk_scan_combined(
+        y = self.mamba_kernels.scan(
             x,
             dt,
             A,
@@ -707,9 +655,11 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule):
             seq_idx = packed_seq_params.seq_idx
 
         state_dtype_kwarg = (
-            {"state_dtype": self.mamba_training_ssm_states_dtype} if MAMBA_HAS_STATE_DTYPE else {}
+            {"state_dtype": self.mamba_training_ssm_states_dtype}
+            if self.mamba_kernels.has_state_dtype
+            else {}
         )
-        y = mamba_split_conv1d_scan_combined(
+        y = self.mamba_kernels.split_scan(
             zxBCdt,
             rearrange(self.cp.get_conv1d_weight(), "d 1 w -> d w"),
             self.cp.get_conv1d_bias(),
@@ -743,9 +693,7 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule):
         if self.config.batch_invariant_mode:
             kernels.extend((MAMBA_BATCH_INVARIANT, CAUSAL_CONV_CUDA_UPDATE))
         else:
-            kernels.append(MAMBA_DECODE)
-            if causal_conv1d_update is not None:
-                kernels.append(CAUSAL_CONV_TRITON_UPDATE)
+            kernels.extend((MAMBA_DECODE, CAUSAL_CONV_TRITON_UPDATE))
         return tuple(kernels)
 
     def ssm_prefill(
@@ -1113,7 +1061,6 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule):
             The output tensor of shape (b, s, d).
         """
         batch_size, seq_len, _ = zxBCdt.shape
-        dtype = zxBCdt.dtype
 
         z, xBC, dt = torch.split(
             zxBCdt,
@@ -1128,9 +1075,8 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule):
         # Conv step
         if self.config.batch_invariant_mode:
             # Match the causal-conv1d arithmetic used by the training forward.
-            assert (
-                causal_conv1d_update_cuda is not None
-            ), "Batch-invariant Mamba decode requires causal-conv1d"
+            from causal_conv1d import causal_conv1d_update as causal_conv1d_update_cuda
+
             assert seq_len == 1, "Batch-invariant Mamba decode supports one token per request"
             assert (
                 intermediate_conv_state is None
@@ -1149,17 +1095,6 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule):
                 conv_state_indices=batch_indices,
             ).unsqueeze(1)
             xBC = xBC.to(xBC_dtype)
-        elif causal_conv1d_update is None:
-            # TODO(ksanthanam): Consider deprecating this path
-            assert seq_len == 1, "Native PyTorch fallback only supports 1 token at a time"
-            xBC_squeeze = xBC.squeeze(1)
-            conv_state.copy_(torch.roll(conv_state, shifts=-1, dims=-1))  # Update state (B D W)
-            conv_state[:, :, -1] = xBC_squeeze
-            xBC_squeeze = torch.sum(
-                conv_state * rearrange(self.conv1d_weight, "d 1 w -> d w"), dim=-1
-            )  # (B D)
-            xBC_squeeze = xBC_squeeze + self.conv1d_bias
-            xBC = self.act(xBC_squeeze).to(dtype=xBC.dtype).unsqueeze(1)
         else:
             # Conv state dtype might differ from params dtype, so cast xBC and weight / bias
             # tensors to the conv state dtype for causal_conv1d_update and then cast xBC
@@ -1190,65 +1125,6 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule):
                 batch_indices is not None
             ), "batch_invariant_mode for Mamba decode requires batch_indices from dynamic batching."
             y = self._get_batch_invariant_decoder().step(x, z, dt, B, C, batch_indices, ssm_state)
-        elif selective_state_update is None:
-            # Fallback uses 1D A; the decode cache is pre-expanded for Triton.
-            A = -torch.exp(self.A_log.float())
-            # TODO(ksanthanam): Consider deprecating this path
-            assert seq_len == 1, "Native PyTorch fallback only supports 1 token at a time"
-
-            x = x.squeeze(1)
-            B = B.squeeze(1)
-            C = C.squeeze(1)
-            dt = dt.squeeze(1)
-            if z is not None:
-                z = z.squeeze(1)
-
-            if self.ngroups_local_tp > 1:
-                B = rearrange(B, "b (g n) -> b g n", n=self.d_state)
-                C = rearrange(C, "b (g n) -> b g n", n=self.d_state)
-                B = repeat(
-                    B, "b g n -> b (g h) n", h=self.d_inner_local_tp // self.ngroups_local_tp
-                )
-                C = repeat(
-                    C, "b g n -> b (g h) n", h=self.d_inner_local_tp // self.ngroups_local_tp
-                )
-
-                dt = repeat(dt, "b h -> b (h p)", p=self.headdim)
-                dt_bias = repeat(self.dt_bias, "h -> (h p)", p=self.headdim)
-                A = repeat(A, "h -> (h p) n", p=self.headdim, n=self.d_state)
-                D = repeat(self.D, "h -> (h p)", p=self.headdim)
-
-                dt = F.softplus(dt + dt_bias.to(dtype=dt.dtype))
-                dA = torch.exp(torch.einsum("bd,dn->bdn", dt, A))
-
-                dB_x = torch.einsum("bd,bdn,bd->bdn", dt, B, x)
-                ssm_state.copy_(
-                    ssm_state * rearrange(dA, "b (h p) n -> b h p n", p=self.headdim)
-                    + rearrange(dB_x, "b (h p) n -> b h p n", p=self.headdim)
-                )
-
-                y = torch.einsum(
-                    "bdn,bdn->bd",
-                    rearrange(ssm_state.to(dtype), "b h p n -> b (h p) n", p=self.headdim),
-                    C,
-                )
-                y = y + D.to(dtype) * x
-                if not self.rmsnorm:
-                    y = y * self.act(z)  # (B D)
-            else:
-                # Discretize A and B (b (g n))
-                dt = F.softplus(dt + self.dt_bias.to(dtype=dt.dtype))  # (batch, nheads)
-                dA = torch.exp(dt * A)
-                x = rearrange(x, "b (h p) -> b h p", p=self.headdim)
-                dBx = torch.einsum("bh,bn,bhp->bhpn", dt, B, x)
-                ssm_state.copy_(ssm_state * rearrange(dA, "b h -> b h 1 1") + dBx)
-                y = torch.einsum("bhpn,bn->bhp", ssm_state.to(dtype), C)
-                y = y + rearrange(self.D.to(dtype), "h -> h 1") * x
-                y = rearrange(y, "b h p -> b (h p)")
-                if not self.rmsnorm:
-                    y = y * self.act(z)  # (B D)
-
-            y = y.unsqueeze(1)  # Restore seq dimension
         else:
             A = self._get_decode_A_neg_exp()
 

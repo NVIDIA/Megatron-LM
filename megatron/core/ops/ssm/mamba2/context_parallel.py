@@ -4,27 +4,12 @@ from typing import Optional
 
 import torch
 import torch.nn.functional as F
+from einops import repeat
 
+from megatron.core.ops.kernel_metadata import validate_kernel
+from megatron.core.ops.ssm.common.kernel_metadata import THD_PARTITION
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.tensor_parallel.mappings import all_to_all_hp2sp, all_to_all_sp2hp
-from megatron.core.utils import is_te_min_version
-
-try:
-    from einops import repeat
-
-    HAVE_EINOPS = True
-except ImportError:
-    HAVE_EINOPS = False
-
-try:
-    # Register the TE CUDA kernels
-    import transformer_engine  # pylint: disable=unused-import
-
-    # Alias the PyTorch wrapper so we can call tex.* APIs
-    import transformer_engine_torch as tex
-except ImportError:
-    # TE isn’t installed or the torch wrapper is missing
-    tex = None
 
 
 class MambaContextParallel:
@@ -78,9 +63,6 @@ class MambaContextParallel:
         D_has_hdim: bool,
         sequence_is_contiguous: bool = False,
     ) -> None:
-        if not HAVE_EINOPS:
-            raise ImportError("einops is required by the Mamba model but cannot be imported")
-
         self.cp_group = cp_group
         self.d_inner_local_tp = d_inner_local_tp
         self.nheads_local_tp = nheads_local_tp
@@ -375,10 +357,10 @@ def _undo_attention_load_balancing(
         reordered_chunks = [chunks[i] for i in order]
         return torch.cat(reordered_chunks, dim=0)
     else:
-        assert tex is not None and is_te_min_version("1.10.0"), (
-            "Please update Transformer Engine to >= 1.10 to use "
-            "Context Parallel with THD format data"
-        )
+        # Packing is supplied at execution, so this conditional requirement is checked here.
+        validate_kernel(THD_PARTITION)
+        import transformer_engine_torch as tex
+
         if packed_seq_params.cu_seqlens_q_padded is not None:
             cu_seqlens = packed_seq_params.cu_seqlens_q_padded
         else:
@@ -413,10 +395,9 @@ def _redo_attention_load_balancing(
         reordered_chunks = [chunks[i] for i in order]
         return torch.cat(reordered_chunks, dim=0)
     else:
-        assert tex is not None and is_te_min_version("1.10.0"), (
-            "Please update Transformer Engine to >= 1.10 to use "
-            "Context Parallel with THD format data"
-        )
+        validate_kernel(THD_PARTITION)
+        import transformer_engine_torch as tex
+
         if packed_seq_params.cu_seqlens_q_padded is not None:
             cu_seqlens = packed_seq_params.cu_seqlens_q_padded
         else:

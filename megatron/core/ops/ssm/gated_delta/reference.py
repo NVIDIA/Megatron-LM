@@ -8,7 +8,8 @@
 import torch
 import torch.nn.functional as F
 
-from megatron.core.ops.ssm.gated_delta.fla import l2norm
+from megatron.core.ops.kernel_metadata import validate_kernel
+from megatron.core.ops.ssm.gated_delta.kernel_metadata import FLA_L2NORM
 
 
 def torch_chunk_gated_delta_rule(
@@ -44,10 +45,9 @@ def torch_chunk_gated_delta_rule(
     query, key, value = q, k, v
     initial_dtype = query.dtype
     if use_qk_l2norm_in_kernel:
-        if l2norm is None:
-            raise ImportError(
-                "GDN reference Q/K normalization requires flash-linear-attention's l2norm."
-            )
+        validate_kernel(FLA_L2NORM)
+        from fla.modules.l2norm import l2norm
+
         query = l2norm(query, dim=-1, eps=1e-6)
         key = l2norm(key, dim=-1, eps=1e-6)
     query, key, value, beta, g = [

@@ -14,10 +14,10 @@ from megatron.core.ops.ssm.gated_delta.common import (
     tensor_a2a_cp2hp,
     tensor_a2a_hp2cp,
 )
-from megatron.core.ops.ssm.gated_delta.modules import HAVE_FLA
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from tests.unit_tests.ssm.gated_delta_net_test_utils import _unpack_sequence
+from tests.unit_tests.ssm.kernel_test_utils import HAVE_FLA
 from tests.unit_tests.test_utilities import Utils
 from tests.unit_tests.transformer.test_attention import _test_parallel_attention_correctness
 

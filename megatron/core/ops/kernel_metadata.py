@@ -13,6 +13,7 @@ import warnings
 from dataclasses import dataclass
 from enum import Enum
 from importlib import import_module, metadata
+from operator import attrgetter
 from typing import Callable, Collection
 
 from packaging.requirements import Requirement
@@ -43,7 +44,8 @@ class Dependency:
     """An import requirement, optionally versioned or conditional on a feature.
 
     ``requirement`` is a distribution name with an optional PEP 440 specifier;
-    ``module`` is its actual Python import path. ``symbols`` are required exports.
+    ``module`` is its actual Python import path. ``symbols`` are required exports,
+    optionally dotted for lazy namespaces such as ``cudnn.DSA``.
     ``feature`` limits the check to a caller-selected feature such as qk_l2norm.
     Source installs without distribution metadata work for unversioned imports;
     version constraints require installed metadata rather than guessing a version.
@@ -72,7 +74,11 @@ class Dependency:
         try:
             module = import_module(self.module)
             for symbol in self.symbols:
-                if getattr(module, symbol, None) is None:
+                try:
+                    value = attrgetter(symbol)(module)
+                except AttributeError as exc:
+                    raise ImportError(f"missing export {self.module}.{symbol}") from exc
+                if value is None:
                     raise ImportError(f"missing export {self.module}.{symbol}")
         except (ImportError, OSError) as exc:
             raise ImportError(f"{description}: {exc}") from exc

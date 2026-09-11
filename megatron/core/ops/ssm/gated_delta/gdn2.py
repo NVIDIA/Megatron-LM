@@ -15,21 +15,14 @@ import torch.nn.functional as F
 from megatron.core import tensor_parallel
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.jit import jit_fuser
-from megatron.core.ops.ssm.gated_delta.common import (
-    _GDNBase,
-    a2a_cp_to_hp,
-    causal_conv1d,
-    get_parameter_local_cp,
-)
-from megatron.core.ops.ssm.gated_delta.fla import HAVE_FLA_GDN2 as HAVE_FLA_GDN2
-from megatron.core.ops.ssm.gated_delta.fla import chunk_gdn2
+from megatron.core.ops.ssm.gated_delta.common import _GDNBase, a2a_cp_to_hp, get_parameter_local_cp
 from megatron.core.ops.ssm.gated_delta.reference_gdn2 import torch_chunk_gdn2 as torch_chunk_gdn2
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.utils import deprecate_inference_params, nvtx_range_pop, nvtx_range_push
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["GatedDeltaNet2", "HAVE_FLA_GDN2", "torch_chunk_gdn2"]
+__all__ = ["GatedDeltaNet2", "torch_chunk_gdn2"]
 
 
 class GatedDeltaNet2(_GDNBase):
@@ -56,10 +49,6 @@ class GatedDeltaNet2(_GDNBase):
         """Set the GDN2 in_proj sizing, split tables, gate parameter dims, and kernel."""
         from megatron.core.models.backends import backend_slot, get_backend_from_config
         from megatron.core.ops.ssm.gated_delta.backends import select_gated_delta_rule
-
-        assert (
-            chunk_gdn2 is not None or self.config.deterministic_mode
-        ), "GDN2 requires flash-linear-attention >= 0.5.1 with the fla.ops.gdn2 kernel."
 
         # f (decay pre-activation), b (erase gate), w (write gate), on top of the
         # q/k/v/z sections the base class already accounts for.
@@ -278,7 +267,7 @@ class GatedDeltaNet2(_GDNBase):
             qkv = qkv.transpose(1, 2)  # b, d, s -> b, s, d
         else:
             assert self.activation in ["silu", "swish"]
-            qkv, _ = causal_conv1d(
+            qkv, _ = self.causal_conv1d(
                 x=qkv,  # FLA conv1d accepts [b, s, d] format input
                 weight=conv1d_weight.squeeze(1),  # d, 1, w -> d, w
                 bias=conv1d_bias,

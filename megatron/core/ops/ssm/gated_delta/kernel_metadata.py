@@ -16,9 +16,9 @@ _REFERENCE = DeterminismResult(
     "has not been audited across dtypes and devices; optional Q/K normalization uses FLA.",
 )
 _FLA_TRAINING = DeterminismResult(
-    Determinism.NONDETERMINISTIC,
-    "The GDN/GDN2 training paths use the Torch reference when deterministic_mode is requested; "
-    "the FLA chunk recurrence is not the deterministic-mode implementation.",
+    Determinism.UNKNOWN,
+    "FLA chunk recurrence repeatability has not been audited here. GDN/GDN2 select the Torch "
+    "reference for deterministic_mode; that selection alone does not classify the FLA kernel.",
 )
 _FLA_OTHER = DeterminismResult(
     Determinism.UNKNOWN, "FLA auxiliary and recurrent entry points have not been audited."

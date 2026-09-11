@@ -14,6 +14,8 @@ from megatron.core.models.common.embeddings import (
     apply_rotary_pos_emb,
 )
 from megatron.core.ops.attention.csa.modules import CompressedSparseAttentionBuilder
+from megatron.core.ops.attention.kernel_metadata import DSV4_ROPE
+from megatron.core.ops.kernel_metadata import DeterminismPolicy, validate_kernel
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
@@ -25,16 +27,6 @@ from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 from megatron.core.typed_torch import apply_module, not_none
 from megatron.core.utils import get_pg_size, is_te_min_version
-
-try:
-    from megatron.core.fusions.fused_mla_yarn_rope_apply import (
-        fused_mla_rope_inplace,
-        fused_mla_rope_out_of_place,
-    )
-except Exception:
-    fused_mla_rope_inplace = None
-    fused_mla_rope_out_of_place = None
-
 
 if HAVE_TE:
     from megatron.core.extensions.transformer_engine import TELinear, set_save_original_input
@@ -79,10 +71,24 @@ class DSv4HybridAttention(Attention):
         compress_ratio: Optional[int] = None,
         name: str | None = None,
     ) -> None:
-
         if pg_collection is None:
             raise ValueError("DSv4 hybrid attention requires an explicit ProcessGroupCollection.")
+        if config.apply_rope_fusion:
+            validate_kernel(
+                DSV4_ROPE,
+                determinism=(
+                    DeterminismPolicy.WARN
+                    if config.deterministic_mode
+                    else DeterminismPolicy.IGNORE
+                ),
+            )
+            from megatron.core.fusions.fused_mla_yarn_rope_apply import (
+                fused_mla_rope_inplace,
+                fused_mla_rope_out_of_place,
+            )
 
+            self.fused_mla_rope_inplace = fused_mla_rope_inplace
+            self.fused_mla_rope_out_of_place = fused_mla_rope_out_of_place
         super().__init__(
             config=config,
             submodules=submodules,
@@ -335,9 +341,6 @@ class DSv4HybridAttention(Attention):
             )
             rotary_pos_emb = None
             assert inference_context is None, "Inference with MLA RoPE fusion is not supported"
-            assert (
-                fused_mla_rope_inplace is not None
-            ), "Fused MLA RoPE apply is not imported successfully"
         elif self._dsv4_uses_yarn_rope:
             rotary_pos_emb, _ = self.rotary_pos_emb(rope_seqlen, packed_seq=False)
         else:
@@ -346,8 +349,7 @@ class DSv4HybridAttention(Attention):
             # Fused DSA backward retains the raw attention output O. Applying
             # inverse RoPE to its view in-place corrupts the retained O used by
             # the softmax backward, so this call needs private storage.
-            assert fused_mla_rope_out_of_place is not None
-            core_attn_out = fused_mla_rope_out_of_place(
+            core_attn_out = self.fused_mla_rope_out_of_place(
                 core_attn_out,
                 rotary_pos_cos,
                 rotary_pos_sin,
@@ -546,9 +548,6 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
             )
             rotary_pos_emb = None
             assert inference_context is None, "Inference with MLA RoPE fusion is not supported"
-            assert (
-                fused_mla_rope_inplace is not None
-            ), "Fused MLA RoPE apply is not imported successfully"
         elif self._dsv4_uses_yarn_rope:
             rotary_pos_emb, _ = self.rotary_pos_emb(rotary_seq_len, packed_seq=False)
         else:
@@ -595,7 +594,7 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
             if self.config.apply_rope_fusion:
                 cp_rank = self.pg_collection.cp.rank()
                 cp_size = self.pg_collection.cp.size()
-                query = fused_mla_rope_inplace(
+                query = self.fused_mla_rope_inplace(
                     q,
                     rotary_pos_cos,
                     rotary_pos_sin,
@@ -607,7 +606,7 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
                     remove_interleaving=True,
                 )
                 kv = kv.unsqueeze(-2)
-                kv = fused_mla_rope_inplace(
+                kv = self.fused_mla_rope_inplace(
                     kv,
                     rotary_pos_cos,
                     rotary_pos_sin,

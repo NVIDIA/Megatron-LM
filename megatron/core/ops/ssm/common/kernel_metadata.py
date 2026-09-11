@@ -2,7 +2,7 @@
 
 """Declarations for shared convolution and state-extraction entry points."""
 
-import os
+from dataclasses import replace
 
 from megatron.core.ops.kernel_metadata import (
     Dependency,
@@ -25,26 +25,12 @@ _INFERENCE = DeterminismResult(
 
 
 def _conv_determinism() -> DeterminismResult:
-    import torch
+    from megatron.core.ops.ssm.common.causal_conv1d_cp import assert_causal_conv1d_deterministic
 
-    from megatron.core.utils import is_causal_conv1d_min_version
-
-    env = os.environ.get("CAUSAL_CONV1D_DETERMINISTIC", "")
-    enabled = (
-        env.startswith("1")
-        if env[:1] in ("0", "1")
-        else torch.are_deterministic_algorithms_enabled()
-    )
-    if not enabled:
-        return DeterminismResult(
-            Determinism.NONDETERMINISTIC,
-            "causal-conv1d's deterministic backward reduction is disabled.",
-        )
-    if not is_causal_conv1d_min_version("1.6.0"):
-        return DeterminismResult(
-            Determinism.NONDETERMINISTIC,
-            "causal-conv1d < 1.6.0 lacks the deterministic backward reduction.",
-        )
+    try:
+        assert_causal_conv1d_deterministic(deterministic_mode=True)
+    except AssertionError as exc:
+        return DeterminismResult(Determinism.NONDETERMINISTIC, str(exc))
     return _CONV
 
 
@@ -54,6 +40,15 @@ CAUSAL_CONV = KernelMetadata(
     determinism=_CONV,
     contract=_CONTRACT,
     determinism_check=_conv_determinism,
+)
+CAUSAL_CONV_CP = replace(
+    CAUSAL_CONV,
+    name="ssm.causal_conv1d_cp",
+    requires=(
+        *CAUSAL_CONV.requires,
+        # Combining seq_idx with initial_states requires the packed-CP implementation.
+        Dependency("causal-conv1d>=1.7.0", "causal_conv1d", feature="packed"),
+    ),
 )
 CAUSAL_CONV_CUDA_UPDATE = KernelMetadata(
     name="ssm.causal_conv1d_update_cuda",
@@ -85,6 +80,20 @@ SCATTER_SSM = KernelMetadata(
     determinism=_INFERENCE,
     contract=_CONTRACT,
 )
+THD_PARTITION = KernelMetadata(
+    name="ssm.te.thd_get_partitioned_indices",
+    requires=(
+        Dependency("transformer-engine>=1.10.0", "transformer_engine"),
+        Dependency(
+            "transformer-engine", "transformer_engine_torch", ("thd_get_partitioned_indices",)
+        ),
+    ),
+    determinism=DeterminismResult(
+        Determinism.UNKNOWN,
+        "Packed-sequence CP index generation has not been audited for repeatability.",
+    ),
+    contract=_CONTRACT,
+)
 SCATTER_CONV = KernelMetadata(
     name="ssm.triton.scatter_intermediate_conv",
     requires=CAUSAL_CONV_TRITON_UPDATE.requires,
@@ -93,7 +102,9 @@ SCATTER_CONV = KernelMetadata(
 )
 
 KERNELS = (
+    THD_PARTITION,
     CAUSAL_CONV,
+    CAUSAL_CONV_CP,
     CAUSAL_CONV_CUDA_UPDATE,
     CAUSAL_CONV_TRITON_UPDATE,
     CAUSAL_CONV_VARLEN,

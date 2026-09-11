@@ -40,7 +40,6 @@ from megatron.core.ops.attention.dsa.reference import (
     fwd_fused_indexer_loss_naive as fwd_fused_indexer_loss_naive,
 )
 from megatron.core.ops.attention.dsa.reference import unfused_dsa_fn as unfused_dsa_fn
-from megatron.core.ops.attention.dsa.rotation import hadamard_transform as hadamard_transform
 from megatron.core.ops.attention.dsa.rotation import rotate_activation as rotate_activation
 from megatron.core.ops.kernel_metadata import DeterminismPolicy, validate_kernel
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -71,7 +70,6 @@ __all__ = [
     "compute_dsa_indexer_loss",
     "fused_qk_topk_naive",
     "fwd_fused_indexer_loss_naive",
-    "hadamard_transform",
     "is_dsa_skip_topk_layer",
     "rotate_activation",
     "source_dsa_compute_layer",

@@ -181,15 +181,19 @@ def test_missing_selected_dsa_backend_fails_at_construction(monkeypatch, error):
 
 @pytest.mark.parametrize("variant", ["gdn", "gdn2"])
 def test_gated_delta_reference_and_missing_selected_kernel(monkeypatch, variant):
-    from megatron.core.ops.ssm.gated_delta import fla
+    from megatron.core.ops import kernel_metadata
     from megatron.core.ops.ssm.gated_delta.reference import torch_chunk_gated_delta_rule
     from megatron.core.ops.ssm.gated_delta.reference_gdn2 import torch_chunk_gdn2
 
     reference = torch_chunk_gated_delta_rule if variant == "gdn" else torch_chunk_gdn2
     assert select_gated_delta_rule(variant, deterministic=True) is reference
-    name = "chunk_gated_delta_rule" if variant == "gdn" else "chunk_gdn2"
-    monkeypatch.setattr(fla, name, None)
-    with pytest.raises(ImportError, match="flash-linear-attention"):
+
+    def missing(_name):
+        raise ImportError("missing selected kernel")
+
+    monkeypatch.setattr(kernel_metadata, "import_module", missing)
+    requirement = "flash-linear-attention" if variant == "gdn" else "fla-core>=0.5.1"
+    with pytest.raises(ImportError, match=requirement):
         select_gated_delta_rule(variant)
 
 

@@ -6,13 +6,13 @@ import importlib.util
 import inspect
 import sys
 from collections import defaultdict
+from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
 import torch
 
 from megatron.core.dist_checkpointing import ShardedTensor
-from megatron.core.ops.ssm.gdp import backends as gdp_backends
 from megatron.core.ops.ssm.gdp import mixer as gdp_module
 from megatron.core.ops.ssm.gdp.mixer import (
     GatedDeltaProductMixer,
@@ -34,7 +34,7 @@ class _FakeProcessGroup:
 
 
 def _load_gdp_module_with_fake_rmsnorm(monkeypatch):
-    """Load GDP with a concrete RMSNorm base when mamba-ssm is unavailable."""
+    """Load the isolated norm adapter with a concrete base for this sharding-only test."""
     for package_name in ("mamba_ssm", "mamba_ssm.ops", "mamba_ssm.ops.triton"):
         package = ModuleType(package_name)
         package.__path__ = []
@@ -43,10 +43,10 @@ def _load_gdp_module_with_fake_rmsnorm(monkeypatch):
     layernorm_gated = ModuleType("mamba_ssm.ops.triton.layernorm_gated")
     layernorm_gated.RMSNorm = torch.nn.Module
     monkeypatch.setitem(sys.modules, layernorm_gated.__name__, layernorm_gated)
-    monkeypatch.setattr(gdp_backends, "RMSNormGated", torch.nn.Module)
-
-    module_name = "megatron.core.ops.ssm.gdp._mixer_with_fake_rmsnorm"
-    spec = importlib.util.spec_from_file_location(module_name, gdp_module.__file__)
+    module_name = "megatron.core.ops.ssm.gdp._norm_with_fake_rmsnorm"
+    spec = importlib.util.spec_from_file_location(
+        module_name, Path(gdp_module.__file__).with_name("norm.py")
+    )
     module = importlib.util.module_from_spec(spec)
     monkeypatch.setitem(sys.modules, module_name, module)
     spec.loader.exec_module(module)

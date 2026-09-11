@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from einops import rearrange
 
 if TYPE_CHECKING:
     from megatron.core.models.backends import BackendSpecProvider
@@ -25,50 +26,24 @@ from megatron.core.inference.contexts import BaseInferenceContext, DynamicInfere
 from megatron.core.inference.contexts.attention_context.triton.tensor_ops import (
     tensor_masked_update,
 )
-from megatron.core.ops.kernel_metadata import (
-    DeterminismPolicy,
-    KernelMetadata,
-    validate_determinism,
-    validate_kernels,
-)
-from megatron.core.ops.ssm.common.causal_conv1d import causal_conv1d_fn
-from megatron.core.ops.ssm.common.causal_conv1d_cp import (
-    assert_causal_conv1d_deterministic,
-    causal_conv1d_cp,
-)
+from megatron.core.ops.kernel_metadata import DeterminismPolicy, KernelMetadata, validate_kernels
+from megatron.core.ops.ssm.common.causal_conv1d_cp import causal_conv1d_cp
 from megatron.core.ops.ssm.common.inference import SSMDynamicInferenceMixin
 from megatron.core.ops.ssm.common.kernel_metadata import (
-    CAUSAL_CONV,
     CAUSAL_CONV_CARRY,
     CAUSAL_CONV_TRITON_UPDATE,
     CAUSAL_CONV_VARLEN,
     SCATTER_CONV,
     SCATTER_SSM,
 )
-from megatron.core.ops.ssm.common.packed_seq import (
-    check_fla_sequence_packing_support,
-    get_cu_seqlens,
-)
+from megatron.core.ops.ssm.common.packed_seq import get_cu_seqlens
 from megatron.core.ops.ssm.context_parallel.chunkwise import PackedSequenceCPMetadata
 from megatron.core.ops.ssm.context_parallel.gdp_common import gdp_chunkwise_context_parallel
-from megatron.core.ops.ssm.gdp.backends import (
-    HAVE_CUTEDSL_GDP,
-    HAVE_FLA,
-    HAVE_MAMBA_SSM,
-    RMSNormGated,
-)
-from megatron.core.ops.ssm.gdp.backends import (
-    chunk_gated_delta_product as chunk_gated_delta_product,
-)
-from megatron.core.ops.ssm.gdp.backends import (
-    cutedsl_chunk_gated_delta_product as cutedsl_chunk_gated_delta_product,
-)
-from megatron.core.ops.ssm.gdp.backends import l2_norm, select_gated_delta_product
+from megatron.core.ops.ssm.gdp.backends import select_gated_delta_product, select_gdp_cp_backend
 from megatron.core.ops.ssm.gdp.context_parallel import GDPContextParallel
 from megatron.core.ops.ssm.gdp.kernel_metadata import (
-    GDP_CUTEDSL,
+    GDP_CONV,
     GDP_DECODE,
-    GDP_FLA,
     GDP_L2NORM,
     GDP_PREFILL,
     GDP_PREPARE,
@@ -96,29 +71,6 @@ if HAVE_GTP:
 else:
     is_gtp_param = None
 
-try:
-    from einops import rearrange
-
-    HAVE_EINOPS = True
-except ImportError:
-    HAVE_EINOPS = False
-
-try:
-    from megatron.core.ops.ssm.context_parallel.gdp import FLAGatedDeltaProductCPBackend
-
-    HAVE_FLA_GDP_CP = True
-except ImportError:
-    FLAGatedDeltaProductCPBackend = None
-    HAVE_FLA_GDP_CP = False
-
-try:
-    from megatron.core.ops.ssm.context_parallel.gdp_cutedsl import CuTeDSLGatedDeltaProductCPBackend
-
-    HAVE_CUTEDSL_GDP_CP = True
-except ImportError:
-    CuTeDSLGatedDeltaProductCPBackend = None
-    HAVE_CUTEDSL_GDP_CP = False
-
 # Dynamic-batching inference runs the in-tree fork of these kernels rather than
 # the pip `flash-linear-attention` / `causal_conv1d` ones. The fork is
 # forward-only and CUDA-graph safe, so training (which owns the backward pass)
@@ -142,13 +94,7 @@ from megatron.core.ops.ssm.gdp.common import CHUNK_SIZE as GDP_INFERENCE_CHUNK_S
 logger = logging.getLogger(__name__)
 
 
-__all__ = [
-    "ExtendedRMSNorm",
-    "GatedDeltaProductMixer",
-    "GatedDeltaProductMixerSubmodules",
-    "chunk_gated_delta_product",
-    "cutedsl_chunk_gated_delta_product",
-]
+__all__ = ["GatedDeltaProductMixer", "GatedDeltaProductMixerSubmodules"]
 
 
 def _kernel_accepts_kwarg(kernel, name: str) -> bool:
@@ -163,25 +109,6 @@ def _kernel_accepts_kwarg(kernel, name: str) -> bool:
         inspect.Parameter.POSITIONAL_OR_KEYWORD,
         inspect.Parameter.KEYWORD_ONLY,
     )
-
-
-class ExtendedRMSNorm(RMSNormGated):
-    """
-    RMSNormGated with sharded state dict.
-    """
-
-    def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
-        """Sharding along axis 0, bias not sharded"""
-        metadata = ensure_metadata_has_dp_cp_group(metadata)
-        state_dict = self.state_dict(prefix="", keep_vars=True)
-        return make_sharded_tensors_for_checkpoint(
-            state_dict,
-            prefix,
-            {"weight": 0},
-            sharded_offsets,
-            tp_group=self.tp_group,
-            dp_cp_group=metadata["dp_cp_group"],
-        )
 
 
 @dataclass
@@ -259,27 +186,12 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
         name: str | None = None,
         kernel_backend: "BackendSpecProvider | None" = None,
     ):
-        if not HAVE_MAMBA_SSM:
-            raise ImportError(
-                "MambaSSM is not installed. Please install it with `pip install mamba-ssm`."
-            )
-
-        if config.gdp_cutedsl_kernel:
-            if not HAVE_CUTEDSL_GDP:
-                raise ImportError("gdp_attn (CuTeDSL GatedDeltaProduct) is not installed")
-        elif not HAVE_FLA:
-            raise ImportError("FLA is not installed")
-
         super().__init__(config)
 
         # Training-path chunk size, handed to the pip FLA kernels. The dynamic
         # inference path does NOT run at this size: the forked prefill kernels
         # chunk at a fixed 64, which `ssm_inference_chunk_size` reports.
         self.chunk_size = chunk_size
-
-        # Check that the causal_conv1d version is new enough or fail
-        ok, reason = check_fla_sequence_packing_support()
-        assert ok, reason
 
         self.num_householder = config.gdp_num_householder
 
@@ -293,15 +205,27 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
                 kernel_backend if kernel_backend is not None else get_backend_from_config(config)
             ),
             name="gated_delta_product",
-            default=lambda: select_gated_delta_product(config.gdp_cutedsl_kernel),
+            default=lambda: select_gated_delta_product(
+                config.gdp_cutedsl_kernel, config.deterministic_mode
+            ),
             use_cutedsl=config.gdp_cutedsl_kernel,
+            deterministic=config.deterministic_mode,
         )
         policy = DeterminismPolicy.WARN if config.deterministic_mode else DeterminismPolicy.IGNORE
-        # Custom providers own their declarations; do not label them as the default backend.
-        if self.gdp_kernel is chunk_gated_delta_product:
-            validate_determinism(GDP_FLA, policy)
-        elif self.gdp_kernel is cutedsl_chunk_gated_delta_product:
-            validate_determinism(GDP_CUTEDSL, policy)
+        # Auxiliary kernels belong to the mixer, independently of a custom recurrence.
+        kernels = [GDP_CONV]
+        if not config.gdp_cutedsl_kernel:
+            kernels.append(GDP_L2NORM)
+        if rmsnorm:
+            kernels.append(MAMBA_NORM)
+        validate_kernels(kernels, determinism=policy)
+        from causal_conv1d import causal_conv1d_fn
+
+        self.causal_conv1d = causal_conv1d_fn
+        if not config.gdp_cutedsl_kernel:
+            from fla.modules.l2norm import l2_norm
+
+            self.l2_norm = l2_norm
 
         # CuTeDSL releases have used two names for checkpoint coarsening. Probe once and
         # prefer the current API spelling while retaining compatibility with older releases.
@@ -328,23 +252,11 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
         )
         self.chunkwise_cp_backend = None
         if self.chunkwise_context_parallel:
-            if self.config.gdp_cutedsl_kernel:
-                if not HAVE_CUTEDSL_GDP_CP:
-                    raise ImportError(
-                        "CuTeDSL GDP chunkwise CP requires a gdp_attn build exposing "
-                        "cp_forward_prepare/apply and cp_backward_prepare/apply"
-                    )
-                self.chunkwise_cp_backend = build_module(
-                    CuTeDSLGatedDeltaProductCPBackend,
-                    recompute_chunk_num=config.gdp_num_chunk_states_to_recompute,
-                )
-            else:
-                if not HAVE_FLA_GDP_CP:
-                    raise ImportError(
-                        "GDP chunkwise CP requires Triton and an FLA build with "
-                        "fla.ops.cp.chunk_delta_h"
-                    )
-                self.chunkwise_cp_backend = build_module(FLAGatedDeltaProductCPBackend)
+            self.chunkwise_cp_backend = select_gdp_cp_backend(
+                self.config.gdp_cutedsl_kernel,
+                recompute_chunk_num=config.gdp_num_chunk_states_to_recompute,
+                deterministic=config.deterministic_mode,
+            )
 
         self.d_state = self.config.mamba_state_dim
         self.headdim = self.config.mamba_head_dim
@@ -445,15 +357,6 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
             if self.conv_init is not None:
                 nn.init.uniform_(self.conv1d.weight, -self.conv_init, self.conv_init)
 
-        # _prepare_qkv feeds the conv channel-last; see assert_causal_conv1d_deterministic.
-        assert_causal_conv1d_deterministic(config.deterministic_mode)
-        kernels = [] if config.gdp_cutedsl_kernel else [GDP_L2NORM]
-        if self.rmsnorm:
-            kernels.append(MAMBA_NORM)
-        if causal_conv1d_fn is not None:
-            kernels.append(CAUSAL_CONV)
-        validate_kernels(kernels, determinism=policy)
-
         self.activation = "silu"
         self.act = nn.SiLU()
 
@@ -496,7 +399,8 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
         self.D = None
 
         if self.rmsnorm:
-            assert RMSNormGated is not None
+            from megatron.core.ops.ssm.gdp.norm import ExtendedRMSNorm
+
             self.norm = ExtendedRMSNorm(
                 self.d_inner_local_tp,
                 eps=1e-5,
@@ -591,8 +495,6 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
                 not self.config.batch_invariant_mode
             ), "batch_invariant_mode is not supported for Gated Delta Product layers."
             if inference_context.is_dynamic_batching():
-                ok, reason = check_fla_sequence_packing_support()
-                assert ok, reason
                 assert (
                     self.cp.cp_size == 1
                 ), "Context parallel is not supported for GDP dynamic inference"
@@ -973,18 +875,14 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
                     # If we just take x[:, :, -self.d_conv :], it errors if seqlen < d_conv.
                     # Instead F.pad pads with zeros if seqlen < d_conv, and truncates otherwise.
                     conv_state.copy_(F.pad(x, (self.d_conv - x.shape[-1], 0)))  # state (B D W)
-                if causal_conv1d_fn is None:
-                    seqlen = x.size(2)
-                    x = self.act(self.cp.conv1d(x)[..., :seqlen])
-                else:
-                    # causal_conv1d uses seq_idx to reset the convolution boundaries
-                    x = causal_conv1d_fn(
-                        x=x,
-                        weight=rearrange(self.cp.get_conv1d_weight(), "d 1 w -> d w"),
-                        bias=self.cp.get_conv1d_bias(),
-                        activation=self.activation,
-                        seq_idx=seq_idx,
-                    )
+                # causal_conv1d uses seq_idx to reset the convolution boundaries
+                x = self.causal_conv1d(
+                    x=x,
+                    weight=rearrange(self.cp.get_conv1d_weight(), "d 1 w -> d w"),
+                    bias=self.cp.get_conv1d_bias(),
+                    activation=self.activation,
+                    seq_idx=seq_idx,
+                )
                 x = rearrange(x, "b d l ->  b l d")
 
         value, key, query = torch.split(
@@ -1021,8 +919,8 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
 
         if not l2_norm_in_kernel:
             # Apply the L2 norm here so that it falls inside the QKV recompute boundary.
-            query = l2_norm(query)
-            key = l2_norm(key)
+            query = self.l2_norm(query)
+            key = self.l2_norm(key)
 
         if self.nheads_local_cp // self.ngroups_local_cp > 1:
             query = query.repeat_interleave(self.nheads_local_cp // self.ngroups_local_cp, dim=-2)

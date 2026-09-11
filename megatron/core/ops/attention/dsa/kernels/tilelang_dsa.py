@@ -12,39 +12,23 @@ from typing import TYPE_CHECKING, Optional, Tuple
 import torch
 
 from megatron.core.ops.attention.dsa import dsa_indexer_loss, dsa_layout, dsa_masking
+from megatron.core.ops.attention.dsa.kernels.indexer import (
+    lighting_indexer,
+    lighting_indexer_indices,
+)
+from megatron.core.ops.attention.dsa.kernels.sparse_mla import SparseMLA
+from megatron.core.ops.attention.dsa.kernels.tilelang_indexer_bwd import (
+    is_supported_indexer_bwd_head_count,
+)
+from megatron.core.ops.attention.dsa.kernels.tilelang_indexer_loss import (
+    SparseIndexerKLLoss,
+    sparse_indexer_target_interface,
+)
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.utils import get_pg_size
 
 if TYPE_CHECKING:
     from megatron.core.packed_seq_params import PackedSeqParams
-
-try:
-    from megatron.core.ops.attention.dsa.kernels.indexer import (
-        lighting_indexer,
-        lighting_indexer_indices,
-    )
-    from megatron.core.ops.attention.dsa.kernels.tilelang_indexer_bwd import (
-        is_supported_indexer_bwd_head_count,
-    )
-except (ImportError, OSError):
-    is_supported_indexer_bwd_head_count = None
-    lighting_indexer = None
-    lighting_indexer_indices = None
-
-try:
-    from megatron.core.ops.attention.dsa.kernels.sparse_mla import SparseMLA
-except (ImportError, OSError):
-    SparseMLA = None
-
-try:
-    from megatron.core.ops.attention.dsa.kernels.tilelang_indexer_loss import (
-        SparseIndexerKLLoss,
-        sparse_indexer_target_interface,
-    )
-except (ImportError, OSError):
-    SparseIndexerKLLoss = None
-    sparse_indexer_target_interface = None
-
 
 # Reusable no-grad scratch buffers keyed by (name, shape, dtype, device).
 _DSA_SCRATCH_CACHE_MAX_ENTRIES = 128

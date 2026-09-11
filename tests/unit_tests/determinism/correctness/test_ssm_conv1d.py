@@ -200,9 +200,9 @@ class TestMambaMixerDeterminism:
 
     @pytest.mark.skipif(not HAVE_CAUSAL_CONV1D, reason="causal_conv1d is not installed")
     def test_deterministic_mode_requires_a_deterministic_conv(self, monkeypatch):
-        """``MambaMixer.__init__`` actually calls the guard, so a disabled reduction raises."""
+        """Mamba initialization validates the selected convolution's determinism."""
         monkeypatch.setenv("CAUSAL_CONV1D_DETERMINISTIC", "0")
-        with pytest.raises(AssertionError, match="deterministic causal_conv1d backward"):
+        with pytest.raises(RuntimeError, match="deterministic causal_conv1d backward"):
             _build_mixer(deterministic_mode=True)
 
 

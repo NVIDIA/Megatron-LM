@@ -8,7 +8,6 @@ import torch
 import torch.nn as nn
 
 from megatron.core.fp8_utils import get_fp8_disabled_context
-from megatron.core.fusions.fused_mla_yarn_rope_apply import fused_mla_rope_inplace
 from megatron.core.models.common.embeddings import RotaryEmbedding, apply_rotary_pos_emb
 from megatron.core.ops.attention.csa import kernel_metadata as csa_metadata
 from megatron.core.ops.attention.csa.reference import (
@@ -37,6 +36,7 @@ from megatron.core.ops.attention.csa.reference import (
 from megatron.core.ops.attention.dsa.kernel_metadata import HADAMARD_ROTATION
 from megatron.core.ops.attention.dsa.reference import FusedDSAIndexerLoss, fused_qk_topk_naive
 from megatron.core.ops.attention.dsa.rotation import rotate_activation
+from megatron.core.ops.attention.kernel_metadata import DSV4_ROPE
 from megatron.core.ops.kernel_metadata import DeterminismPolicy, validate_kernel
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.dsa_loss import DSAIndexerLossAutoScaler, DSAIndexerLossLoggingHelper
@@ -90,9 +90,6 @@ def _apply_rope(
             total_seq_len, dtype=x.dtype, packed_seq=False, mscale=mscale
         )
         rotary_pos_emb = None
-        assert (
-            fused_mla_rope_inplace is not None
-        ), "Fused MLA RoPE apply is not imported successfully"
     else:
         # Compressed-attention callers instantiate ``YarnRotaryEmbedding``
         # whenever ``compress_ratio > 1`` (regardless of ``config.rope_type``);
@@ -116,6 +113,8 @@ def _apply_rope(
     if squeeze_head:
         x = x.unsqueeze(-2)
     if config.apply_rope_fusion:
+        from megatron.core.fusions.fused_mla_yarn_rope_apply import fused_mla_rope_inplace
+
         out = fused_mla_rope_inplace(
             x,
             rotary_pos_cos,
@@ -220,6 +219,8 @@ class Compressor(MegatronModule):
             raise ValueError("Compressor requires an explicit ProcessGroupCollection")
         policy = DeterminismPolicy.WARN if config.deterministic_mode else DeterminismPolicy.IGNORE
         validate_kernel(csa_metadata.CSA_POOLING, determinism=policy)
+        if config.apply_rope_fusion:
+            validate_kernel(DSV4_ROPE, determinism=policy)
         if rotate:
             validate_kernel(HADAMARD_ROTATION, determinism=policy)
         self.pg_collection = pg_collection
@@ -442,6 +443,15 @@ class CSAIndexer(MegatronModule):
 
         if pg_collection is None:
             raise ValueError("CSAIndexer requires an explicit ProcessGroupCollection")
+        if config.apply_rope_fusion:
+            validate_kernel(
+                DSV4_ROPE,
+                determinism=(
+                    DeterminismPolicy.WARN
+                    if config.deterministic_mode
+                    else DeterminismPolicy.IGNORE
+                ),
+            )
         validate_kernel(
             HADAMARD_ROTATION,
             determinism=(

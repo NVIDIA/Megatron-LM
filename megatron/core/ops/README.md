@@ -62,8 +62,9 @@ Every declaration uses the same template:
 
 - `name`: operation and implementation identifier.
 - `requires`: direct optional dependencies, their actual Python import paths,
-  required exports, and version bounds where known. Core project dependencies
-  such as PyTorch remain in `pyproject.toml`; this is not another lockfile.
+  required exports (including dotted lazy-namespace attributes), and version bounds
+  where known. Core project dependencies such as PyTorch remain in `pyproject.toml`;
+  this is not another lockfile.
 - `determinism`: an explicit tri-state assessment and its scope/reason.
 - `contract`: the family docstring describing layouts, modes and ownership.
 - `determinism_check`: an optional construction-time environment assessment.
@@ -89,13 +90,41 @@ distribution metadata. Import and native-library loading failures retain their
 cause and identify the kernel. Checks do not install packages, compile kernels,
 allocate model state or create process groups.
 
-DSA/GDN/GDP selectors check their chosen recurrence/hooks. SSM constructors check
-their selected auxiliary kernels. `MambaInferenceStateConfig.from_model` checks
+For example, DSA validates concrete TileLang entry points and cuDNN's lazy
+`DSA` wrapper exports, not just importable `tilelang` or `cudnn` packages. A
+missing implementation is an initialization error; runtime shape/layout refusal
+remains the documented reference-fallback case.
+
+DSA/GDN/GDP selectors check their chosen recurrence/hooks before importing the
+concrete target. Mamba binds its scan targets and their supported arguments once
+at construction. GDP validates its chunkwise-CP adapter only when that CP path is
+selected. SSM constructors check convolution, normalization, and other selected
+auxiliary kernels before allocating parameters. Optional normalization must not
+require its dependency when disabled, and a custom recurrence must not be gated
+by the default recurrence's dependency or determinism declarations.
+
+`MambaInferenceStateConfig.from_model` checks
 additional prefill/decode targets when dynamic inference is initialized, so a
 training-only GDN does not need recurrent-inference exports. Older/custom mixers
 without `get_inference_kernel_metadata` retain their existing initialization;
 their dependencies are not certified by these checks. Custom providers likewise
-own validation for their custom targets.
+own validation for their custom targets. The `gated_delta_product` provider slot
+accepts `deterministic` as well as `use_cutedsl`, so the selector applies the
+requested policy to its own target.
+
+Do not duplicate these checks with module-level `HAVE_*` flags, placeholder
+implementations, or constructor assertions. Concrete optional implementations,
+including the Mamba/GDP normalization modules, are imported after validation.
+Mamba's ordinary scan preserves its historical Torch-convolution fallback when
+`causal-conv1d` is absent. A broken installation or missing export fails instead;
+the memory-efficient path and GDP require the external convolution. Training
+does not require the separate CUDA decode-update export. Convolution determinism
+uses the existing reduction guard through metadata rather than a second copy of
+the environment and version checks in each mixer.
+Low-level JIT import scaffolding and TE/GTP class checks are distinct from
+operation backend selection; runtime-only requirements, such as TE's packed
+THD partition helper, are checked when the packed input is first known. See the
+[contribution rules](../../../docs/developer/contribute.md#kernel-backend-selection).
 
 Ordinary execution uses `IGNORE`. Existing deterministic-mode paths use `WARN`:
 unknown implementations warn, known nondeterministic ones fail, and existing
@@ -134,7 +163,7 @@ runtime inputs; reference fallback remains the caller's responsibility. Changing
 the backend setting after construction requires rebuilding the module.
 
 GDN/GDN2 and GDP likewise bind the existing selected recurrence once. Mamba's
-phase-specific entry points remain direct calls; a provider is not needed for
+bound phase-specific entry points remain direct calls; a provider is not needed for
 every helper. No extra callable wrapper is inserted into these kernel calls.
 
 ## Import Migration

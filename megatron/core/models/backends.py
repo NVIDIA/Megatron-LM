@@ -182,7 +182,9 @@ class BackendSpecProvider(Protocol):
         """Which GDN-family recurrence to bind during construction."""
         ...
 
-    def gated_delta_product(self, use_cutedsl: bool = False) -> Callable:
+    def gated_delta_product(
+        self, use_cutedsl: bool = False, deterministic: bool = False
+    ) -> Callable:
         """Which GDP training callable to bind during construction."""
         ...
 
@@ -293,11 +295,13 @@ class LocalSpecProvider(BackendSpecProvider):
 
         return select_gated_delta_rule(variant, deterministic)
 
-    def gated_delta_product(self, use_cutedsl: bool = False) -> Callable:
+    def gated_delta_product(
+        self, use_cutedsl: bool = False, deterministic: bool = False
+    ) -> Callable:
         """Select the existing GDP training kernel."""
         from megatron.core.ops.ssm.gdp.backends import select_gated_delta_product
 
-        return select_gated_delta_product(use_cutedsl)
+        return select_gated_delta_product(use_cutedsl, deterministic)
 
 
 class InferenceSpecProvider(LocalSpecProvider):

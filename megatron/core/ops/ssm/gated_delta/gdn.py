@@ -19,17 +19,7 @@ from megatron.core.inference.contexts.attention_context.triton.tensor_ops import
 from megatron.core.jit import jit_fuser
 from megatron.core.ops.kernel_metadata import KernelMetadata
 from megatron.core.ops.ssm.common.inference import SSMDynamicInferenceMixin
-from megatron.core.ops.ssm.gated_delta.common import (
-    _GDNBase,
-    a2a_cp_to_hp,
-    causal_conv1d,
-    chunk_gated_delta_rule,
-    get_parameter_local_cp,
-)
-from megatron.core.ops.ssm.gated_delta.fla import (
-    causal_conv1d_update,
-    fused_recurrent_gated_delta_rule,
-)
+from megatron.core.ops.ssm.gated_delta.common import _GDNBase, a2a_cp_to_hp, get_parameter_local_cp
 from megatron.core.ops.ssm.gated_delta.kernel_metadata import (
     FLA_CONV_UPDATE,
     GDN_FLA,
@@ -250,7 +240,7 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
             qkv = qkv.transpose(1, 2)  # b, d, s -> b, s, d
         else:
             assert self.activation in ["silu", "swish"]
-            qkv, _ = causal_conv1d(
+            qkv, _ = self.causal_conv1d(
                 x=qkv,  # FLA conv1d accepts [b, s, d] format input
                 weight=conv1d_weight.squeeze(1),  # d, 1, w -> d, w
                 bias=conv1d_bias,
@@ -355,7 +345,8 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
         assert (
             intermediate_conv_state is None and intermediate_ssm_state is None
         ), "GDN speculative decoding state capture is not supported."
-        assert causal_conv1d_update is not None and fused_recurrent_gated_delta_rule is not None
+        from fla.modules.convolution import causal_conv1d_update
+        from fla.ops.gated_delta_rule import fused_recurrent_gated_delta_rule
 
         qkv, gate, beta, alpha = self._split_projection(projected, batch, seq_len)
         read_indices = batch_indices.clamp(min=0)
@@ -408,7 +399,9 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
         read_indices = batch_indices.clamp(min=0)
 
         qkv_dtype = qkv.dtype
-        qkv, final_conv_state = causal_conv1d(
+        from fla.ops.gated_delta_rule import chunk_gated_delta_rule
+
+        qkv, final_conv_state = self.causal_conv1d(
             x=qkv.to(conv_state.dtype),
             weight=self.conv1d.weight.squeeze(1).to(conv_state.dtype),
             bias=self.conv1d.bias.to(conv_state.dtype) if self.conv1d.bias is not None else None,

@@ -7,7 +7,6 @@ import os
 
 import torch
 
-from megatron.core.ops.ssm.common.causal_conv1d import causal_conv1d_fn
 from megatron.core.tensor_parallel.mappings import all_to_all
 from megatron.core.utils import is_causal_conv1d_min_version
 
@@ -39,7 +38,7 @@ def assert_causal_conv1d_deterministic(deterministic_mode):
     Call once at construction. Keyed on ``deterministic_mode``, not torch's global flag, which
     unrelated tests set and never restore.
     """
-    if not deterministic_mode or causal_conv1d_fn is None:
+    if not deterministic_mode:
         return
 
     assert _use_causal_conv1d_deterministic_mode(), (
@@ -121,11 +120,15 @@ def causal_conv1d_cp(
         Output tensor of shape ``[B, T, D]``.
 
     Raises:
-        ImportError: If the optional ``causal-conv1d`` dependency is unavailable.
+        ImportError: If ``causal-conv1d`` is unavailable or too old for packed CP.
         ValueError: If ``global_seq_idx`` has an invalid shape, dtype, or device.
     """
-    if causal_conv1d_fn is None:
-        raise ImportError("causal_conv1d_cp requires the optional causal-conv1d dependency")
+    from megatron.core.ops.kernel_metadata import validate_kernel
+    from megatron.core.ops.ssm.common.kernel_metadata import CAUSAL_CONV_CP
+
+    validate_kernel(CAUSAL_CONV_CP, features=("packed",) if global_seq_idx is not None else ())
+    from causal_conv1d import causal_conv1d_fn
+
     state_len = weight.shape[-1] - 1
     if state_len < 0:
         raise ValueError(f"state_len must be non-negative, got {state_len}")

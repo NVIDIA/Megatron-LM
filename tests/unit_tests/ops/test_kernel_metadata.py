@@ -6,7 +6,7 @@ import importlib
 import subprocess
 import sys
 from dataclasses import FrozenInstanceError, replace
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
@@ -24,6 +24,7 @@ from megatron.core.ops.kernel_metadata import (
 )
 
 FAMILIES = (
+    "attention",
     "ssm.common",
     "ssm.mamba2",
     "ssm.gated_delta",
@@ -134,6 +135,29 @@ def test_source_import_requires_metadata_only_when_versioned(monkeypatch):
         Dependency("example-dist>=1", "example_module").validate("selected")
 
 
+def test_dependency_checks_exports_inside_a_lazy_namespace(monkeypatch):
+    target = object()
+    monkeypatch.setattr(
+        metadata, "import_module", lambda name: SimpleNamespace(DSA=SimpleNamespace(kernel=target))
+    )
+    Dependency("example-dist", "example", ("DSA.kernel",)).validate("selected")
+    with pytest.raises(ImportError, match="missing export example.DSA.missing"):
+        Dependency("example-dist", "example", ("DSA.missing",)).validate("selected")
+
+
+def test_lazy_namespace_native_loading_error_preserves_cause(monkeypatch):
+    cause = OSError("lazy native library cannot load")
+
+    class Namespace:
+        def __getattr__(self, name):
+            raise cause
+
+    monkeypatch.setattr(metadata, "import_module", lambda name: SimpleNamespace(DSA=Namespace()))
+    with pytest.raises(ImportError, match="Kernel selected requires") as caught:
+        Dependency("example-dist", "example", ("DSA.kernel",)).validate("selected")
+    assert caught.value.__cause__ is cause
+
+
 def test_conditional_dependency_is_checked_only_for_selected_feature(monkeypatch):
     seen = []
     monkeypatch.setattr(
@@ -199,23 +223,23 @@ def test_invalid_declarations_and_policy_are_rejected():
     [("1", False, True), ("0", True, False), ("", True, True), ("other", False, False)],
 )
 def test_causal_conv_assessment_respects_environment(monkeypatch, env, torch_enabled, enabled):
-    from megatron.core import utils
+    from megatron.core.ops.ssm.common import causal_conv1d_cp
     from megatron.core.ops.ssm.common.kernel_metadata import CAUSAL_CONV
 
     monkeypatch.setenv("CAUSAL_CONV1D_DETERMINISTIC", env)
     monkeypatch.setattr(torch, "are_deterministic_algorithms_enabled", lambda: torch_enabled)
-    monkeypatch.setattr(utils, "is_causal_conv1d_min_version", lambda _version: True)
+    monkeypatch.setattr(causal_conv1d_cp, "is_causal_conv1d_min_version", lambda _version: True)
     expected = Determinism.UNKNOWN if enabled else Determinism.NONDETERMINISTIC
     assert CAUSAL_CONV.determinism_check().status is expected
 
 
 def test_causal_conv_old_version_is_not_marked_deterministic(monkeypatch):
-    from megatron.core import utils
+    from megatron.core.ops.ssm.common import causal_conv1d_cp
     from megatron.core.ops.ssm.common.kernel_metadata import CAUSAL_CONV
 
     monkeypatch.setenv("CAUSAL_CONV1D_DETERMINISTIC", "1")
-    monkeypatch.setattr(utils, "is_causal_conv1d_min_version", lambda _version: False)
-    with pytest.raises(RuntimeError, match="< 1.6.0"):
+    monkeypatch.setattr(causal_conv1d_cp, "is_causal_conv1d_min_version", lambda _version: False)
+    with pytest.raises(RuntimeError, match="causal_conv1d >= 1.6.0"):
         validate_determinism(CAUSAL_CONV, DeterminismPolicy.WARN)
 
 
@@ -252,10 +276,12 @@ def test_gdp_validates_selected_implementation_and_preserves_identity(monkeypatc
     from megatron.core.ops.ssm.gdp.kernel_metadata import GDP_CUTEDSL, GDP_FLA
 
     target = lambda **kwargs: kwargs
-    name = "cutedsl_chunk_gated_delta_product" if use_cutedsl else "chunk_gated_delta_product"
-    monkeypatch.setattr(backends, name, target)
+    module_name = "gdp_attn" if use_cutedsl else "fla.ops.gated_delta_product"
+    module = ModuleType(module_name)
+    module.chunk_gated_delta_product = target
+    monkeypatch.setitem(sys.modules, module_name, module)
     seen = []
-    monkeypatch.setattr(backends, "validate_kernel", lambda kernel: seen.append(kernel))
+    monkeypatch.setattr(backends, "validate_kernel", lambda kernel, **kwargs: seen.append(kernel))
     assert backends.select_gated_delta_product(use_cutedsl) is target
     assert seen == [GDP_CUTEDSL if use_cutedsl else GDP_FLA]
 
@@ -362,16 +388,23 @@ def test_gdp_dynamic_inference_does_not_require_training_backends():
 
     kernels = GatedDeltaProductMixer.get_inference_kernel_metadata(None)
     assert kernels
-    assert {dependency.module for kernel in kernels for dependency in kernel.requires} == {"triton"}
+    assert {dependency.module for kernel in kernels for dependency in kernel.requires} == {
+        "triton",
+        "triton.language.extra.libdevice",
+    }
 
 
 @pytest.mark.parametrize("variant", ["gdn", "gdn2"])
 def test_reference_missing_runtime_normalization_has_useful_error(monkeypatch, variant):
     suffix = "reference" if variant == "gdn" else "reference_gdn2"
     module = importlib.import_module("megatron.core.ops.ssm.gated_delta." + suffix)
-    monkeypatch.setattr(module, "l2norm", None)
+
+    def missing(_name):
+        raise ImportError("missing l2norm")
+
+    monkeypatch.setattr(metadata, "import_module", missing)
     value = torch.zeros(1, 1, 1, 1)
-    with pytest.raises(ImportError, match="Q/K normalization requires flash-linear-attention"):
+    with pytest.raises(ImportError, match="gdn.fla.l2norm requires flash-linear-attention"):
         if variant == "gdn":
             module.torch_chunk_gated_delta_rule(
                 value, value, value, value, value, use_qk_l2norm_in_kernel=True
@@ -393,7 +426,10 @@ def test_selected_hadamard_dependency_is_checked_before_parameters(monkeypatch, 
 
     monkeypatch.setattr(Dependency, "validate", missing)
     config = SimpleNamespace(
-        hidden_size=16, deterministic_mode=False, dsa_indexer_rotate_activation=True
+        hidden_size=16,
+        deterministic_mode=False,
+        dsa_indexer_rotate_activation=True,
+        apply_rope_fusion=False,
     )
     with pytest.raises(ImportError, match="dsa.hadamard.rotate_activation: missing"):
         if owner == "indexer":

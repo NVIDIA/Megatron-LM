@@ -22,12 +22,6 @@ from megatron.core.jit import jit_fuser
 from megatron.core.ops.kernel_metadata import DeterminismPolicy, validate_kernels
 from megatron.core.ops.ssm.common.checkpointing import _split_tensor_factory
 from megatron.core.ops.ssm.gated_delta import GatedDeltaRuleInterface
-from megatron.core.ops.ssm.gated_delta.fla import (
-    HAVE_FLA,
-    causal_conv1d,
-    chunk_gated_delta_rule,
-    l2norm,
-)
 from megatron.core.ops.ssm.gated_delta.kernel_metadata import FLA_CONV, FLA_L2NORM
 from megatron.core.ops.ssm.mamba2.context_parallel import (
     _all_to_all_cp2hp,
@@ -125,11 +119,6 @@ class _GDNBase(MegatronModule):
             kernel_backend: Optional provider supplied by the module spec.
         """
         del is_mtp_layer
-        if not HAVE_FLA:
-            raise ImportError(
-                "FLA is not installed. Please install it with "
-                "`pip install flash-linear-attention[cuda]`."
-            )
         validate_kernels(
             (FLA_CONV, FLA_L2NORM) if use_qk_l2norm else (FLA_CONV,),
             determinism=(
@@ -138,6 +127,13 @@ class _GDNBase(MegatronModule):
         )
 
         super().__init__(config)
+        from fla.modules.convolution import causal_conv1d
+
+        self.causal_conv1d = causal_conv1d
+        if use_qk_l2norm:
+            from fla.modules.l2norm import l2norm
+
+            self.l2norm = l2norm
 
         # Attributes from arguments
         self.layer_number = layer_number
@@ -402,7 +398,7 @@ class _GDNBase(MegatronModule):
 
         # Apply L2 norm to query and key
         if self.use_qk_l2norm:
-            query_key = l2norm(query_key.contiguous())
+            query_key = self.l2norm(query_key.contiguous())
 
         # Split query and key
         split_size = self.qk_dim_local_tp // self.key_head_dim // self.cp_size
