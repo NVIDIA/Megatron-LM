@@ -86,13 +86,12 @@ def _arena_view(arena, member_numels, scale_numels, fc_layer, num_local_experts)
     return data, scale
 
 
-def _check_ends(view, expected_per_slot, label, errors):
-    """Compare the first and last element of every slot row against its expectation."""
-    for slot, expected in enumerate(expected_per_slot):
-        for column, end in ((0, "head"), (-1, "tail")):
-            actual = view[slot, column].item()
-            if actual != expected:
-                errors.append(f"{label} slot={slot} {end}: got {actual}, expected {expected}")
+def _check_equal(actual, expected, label, errors):
+    """Keep comparisons collective-safe while checking every element, including canaries."""
+    try:
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    except AssertionError as exc:
+        errors.append(f"{label}: {exc}")
 
 
 def _report(errors, group):
@@ -126,38 +125,43 @@ def _make_plan(placement, slots, world_size, num_local_experts, device):
 @pytest.mark.internal
 @requires_four_ranks
 @pytest.mark.parametrize(
-    "grad_dtype", [torch.float32, torch.bfloat16], ids=["fp32-grad", "bf16-grad"]
+    "grad_dtype,num_sms",
+    [(torch.float32, 1), (torch.bfloat16, 32)],
+    ids=["fp32-grad-1sm", "bf16-grad-32sm"],
 )
-def test_virtual_expert_weight_transport(grad_dtype):
-    """Push BF16 weights and reduce virtual-expert gradients over full, sparse and empty plans."""
+def test_virtual_expert_weight_transport(grad_dtype, num_sms):
+    """Check all transport tiles, signed reduction, split FC scheduling and untouched storage."""
     Utils.initialize_distributed()
     group = dist.group.WORLD
-    rank = dist.get_rank(group)
-    world_size = dist.get_world_size(group)
+    rank, world_size = dist.get_rank(group), dist.get_world_size(group)
     device = torch.device("cuda", torch.cuda.current_device())
     num_local_experts = 8
-    # Keep the test compact while using the same 8-KiB-aligned transactions as
-    # the production 2048x640 expert FC layers.
-    member_numels = (262144, 524288)
+    # Two/four BF16 transport tiles per member; smaller than the old endpoint-only fixture.
+    member_numels = (32768, 65536)
     arena_numel = num_local_experts * sum(member_numels)
-    weight_arena, weight_handle = _allocate_symmetric(arena_numel, torch.bfloat16, group)
-    grad_arena, grad_handle = _allocate_symmetric(arena_numel, grad_dtype, group)
+    guard = 256
+    weight_arena, weight_handle = _allocate_symmetric(arena_numel + guard, torch.bfloat16, group)
+    grad_arena, grad_handle = _allocate_symmetric(arena_numel + guard, grad_dtype, group)
+    rng = torch.Generator(device=device).manual_seed(900 + rank)
     sources = tuple(
-        torch.empty(num_local_experts, member, dtype=torch.bfloat16, device=device)
-        for member in member_numels
-    )
-    for fc_layer, source in enumerate(sources):
-        source.copy_(
-            (
-                torch.arange(num_local_experts, dtype=torch.bfloat16, device=device)
-                + rank * num_local_experts
-                + fc_layer * 1000
-            )[:, None]
+        (torch.randint(-128, 128, (num_local_experts, n), device=device, generator=rng) / 32).to(
+            torch.bfloat16
         )
-    main_grads = tuple(
-        torch.empty(num_local_experts, member, dtype=grad_dtype, device=device)
-        for member in member_numels
+        for n in member_numels
     )
+    # Each row has a guard after its last tile, including the final native expert.
+    native_storage = tuple(
+        torch.empty(num_local_experts, n + guard, dtype=grad_dtype, device=device)
+        for n in member_numels
+    )
+    main_grads = tuple(storage[:, :n] for storage, n in zip(native_storage, member_numels))
+    weight_tables = tuple(_pointer_table(source) for source in sources)
+    grad_tables = tuple(_pointer_table(grad) for grad in main_grads)
+    all_weights = []
+    for source in sources:
+        gathered = [torch.empty_like(source) for _ in range(world_size)]
+        dist.all_gather(gathered, source, group=group)
+        all_weights.append(torch.cat(gathered))
     workspace = SimpleNamespace(
         weight_arena=weight_arena,
         weight_handle=weight_handle,
@@ -169,9 +173,10 @@ def test_virtual_expert_weight_transport(grad_dtype):
         world_size=world_size,
         num_local_experts=num_local_experts,
         member_numels=member_numels,
-        num_sms=NUM_SMS,
+        num_sms=num_sms,
     )
-
+    communication = torch.cuda.Stream()
+    compute = torch.cuda.current_stream()
     cases = (
         ("all-peers", tuple(range(num_local_experts))),
         ("ring", tuple(range(num_local_experts))),
@@ -180,98 +185,85 @@ def test_virtual_expert_weight_transport(grad_dtype):
         ("asymmetric", (0,)),
     )
     errors = []
-
-    def scalar(value):
-        """Round a reference value the same way the kernel's store does."""
-        return torch.tensor(value, dtype=grad_dtype).item()
-
     try:
         for placement, slots in cases:
             case = f"{placement}/{slots}"
             plan = _make_plan(placement, slots, world_size, num_local_experts, device)
             rows = plan.tolist()
-            local_slots = tuple(slot for slot in range(num_local_experts) if rows[rank][slot] >= 0)
-
             weight_arena.fill_(-123)
+            expected_weights = weight_arena.clone()
+            for fc, weights in enumerate(all_weights):
+                view, _ = _arena_view(expected_weights, member_numels, None, fc, num_local_experts)
+                for slot, expert in enumerate(rows[rank]):
+                    if expert >= 0:
+                        view[slot].copy_(weights[expert])
+            # Push has an exit barrier only: all destinations must finish their canary fill.
             torch.cuda.synchronize(device)
             dist.barrier(group=group, device_ids=[device.index])
-            launch_virtual_expert_weight_prefetch(
-                workspace,
-                sources=tuple(_pointer_table(source) for source in sources),
-                experts_to_copy=plan,
-            )
-            torch.cuda.synchronize(device)
-
-            for fc_layer in range(len(member_numels)):
-                view, _ = _arena_view(
-                    weight_arena, member_numels, None, fc_layer, num_local_experts
+            communication.wait_stream(compute)
+            with torch.cuda.stream(communication):
+                launch_virtual_expert_weight_prefetch(
+                    workspace, sources=weight_tables, experts_to_copy=plan
                 )
-                _check_ends(
-                    view,
-                    [
-                        torch.tensor(
-                            -123 if rows[rank][slot] < 0 else fc_layer * 1000 + rows[rank][slot],
-                            dtype=torch.bfloat16,
-                        ).item()
-                        for slot in range(num_local_experts)
-                    ],
-                    f"{case} p{fc_layer} weight",
-                    errors,
-                )
+            compute.wait_stream(communication)
+            _check_equal(weight_arena, expected_weights, f"{case} weights", errors)
 
             grad_arena.fill_(-77)
-            for fc_layer in range(len(member_numels)):
-                view, _ = _arena_view(grad_arena, member_numels, None, fc_layer, num_local_experts)
-                for slot in local_slots:
-                    view[slot].fill_(fc_layer * 1000 + rank * 100 + slot + 1)
-                main_grads[fc_layer].fill_(fc_layer + 5)
-            torch.cuda.synchronize(device)
-            dist.barrier(group=group, device_ids=[device.index])
-            launch_virtual_expert_grad_reduce(
-                workspace,
-                native_grads=tuple(_pointer_table(grad) for grad in main_grads),
-                experts_to_copy=plan,
-            )
-            torch.cuda.synchronize(device)
-
-            for fc_layer in range(len(member_numels)):
-                # BF16 partials accumulate in FP32 registers and round once on
-                # the final store, so build the reference the same way.
-                expected = torch.full(
-                    (num_local_experts,), scalar(fc_layer + 5), dtype=torch.float32, device=device
-                )
-                for destination in range(world_size):
-                    for slot in range(num_local_experts):
-                        expert = rows[destination][slot]
-                        if expert // num_local_experts == rank and expert >= 0:
-                            expected[expert % num_local_experts] += scalar(
-                                fc_layer * 1000 + destination * 100 + slot + 1
-                            )
-                try:
-                    torch.testing.assert_close(
-                        main_grads[fc_layer][:, 0], expected.to(grad_dtype), rtol=0, atol=0
-                    )
-                except AssertionError as exc:
-                    errors.append(f"{case} p{fc_layer} main_grad: {exc}")
-
-                # The reduction reads the slots and leaves them as they were;
-                # TE's overwriting wgrad GEMM refreshes them next backward.
-                view, _ = _arena_view(grad_arena, member_numels, None, fc_layer, num_local_experts)
-                _check_ends(
-                    view,
-                    [
-                        scalar(
-                            fc_layer * 1000 + rank * 100 + slot + 1 if slot in local_slots else -77
+            initials = []
+            for fc, n in enumerate(member_numels):
+                view, _ = _arena_view(grad_arena, member_numels, None, fc, num_local_experts)
+                for slot, expert in enumerate(rows[rank]):
+                    if expert >= 0:
+                        view[slot].copy_(
+                            torch.randint(-64, 65, (n,), device=device, generator=rng) / 8
                         )
-                        for slot in range(num_local_experts)
-                    ],
-                    f"{case} p{fc_layer} grad",
-                    errors,
-                )
+                        # Rank 0/expert 0 receives 256 + 1 - 256 in the all-peer plan.
+                        # With native 0.5 the answer is 1.5; intermediate BF16 rounding loses it.
+                        view[slot, 0] = (0, 256, 1, -256)[rank]
+                initial = (
+                    torch.randint(-16, 17, (num_local_experts, n), device=device, generator=rng) / 8
+                ).to(grad_dtype)
+                initial[:, 0] = 0.5
+                initials.append(initial)
+            slot_snapshot = grad_arena.clone()
+            partials = [torch.empty_like(grad_arena) for _ in range(world_size)]
+            dist.all_gather(partials, grad_arena, group=group)
+            expected = [initial.float().clone() for initial in initials]
+            for peer, row in enumerate(rows):
+                for slot, expert in enumerate(row):
+                    if expert >= 0 and expert // num_local_experts == rank:
+                        for fc in range(2):
+                            view, _ = _arena_view(
+                                partials[peer], member_numels, None, fc, num_local_experts
+                            )
+                            expected[fc][expert % num_local_experts].add_(view[slot].float())
+            expected = [value.to(grad_dtype) for value in expected]
+            for schedule in (((0, 1),), ((1,), (0,))):
+                for storage, grad, initial in zip(native_storage, main_grads, initials):
+                    storage.fill_(-99)
+                    grad.copy_(initial)
+                completed = set()
+                for fc_layers in schedule:
+                    communication.wait_stream(compute)
+                    with torch.cuda.stream(communication):
+                        launch_virtual_expert_grad_reduce(
+                            workspace,
+                            native_grads=grad_tables,
+                            experts_to_copy=plan,
+                            fc_layers=fc_layers,
+                        )
+                    compute.wait_stream(communication)
+                    completed.update(fc_layers)
+                    for fc, (storage, n) in enumerate(zip(native_storage, member_numels)):
+                        target = torch.full_like(storage, -99)
+                        target[:, :n] = expected[fc] if fc in completed else initials[fc]
+                        _check_equal(storage, target, f"{case} {schedule} FC{fc + 1}", errors)
+                    _check_equal(grad_arena, slot_snapshot, f"{case} unchanged partials", errors)
         _report(errors, group)
     finally:
+        torch.cuda.synchronize(device)
         dist.barrier(group=group, device_ids=[device.index])
-        del weight_arena, grad_arena, weight_handle, grad_handle
+        del workspace, weight_arena, grad_arena, weight_handle, grad_handle
         gc.collect()
         Utils.destroy_model_parallel()
 
@@ -279,117 +271,89 @@ def test_virtual_expert_weight_transport(grad_dtype):
 @pytest.mark.internal
 @requires_four_ranks
 def test_virtual_expert_mxfp8_transport_moves_one_orientation_at_a_time():
-    """Copy MXFP8 bytes and scales exactly without touching the other GEMM orientation."""
+    """Overwrite one shared arena with each orientation, checking all bytes and inactive slots."""
     Utils.initialize_distributed()
     group = dist.group.WORLD
-    rank = dist.get_rank(group)
-    world_size = dist.get_world_size(group)
+    rank, world_size = dist.get_rank(group), dist.get_world_size(group)
     device = torch.device("cuda", torch.cuda.current_device())
     num_local_experts = 4
-    member_numels = (16384, 32768)
+    member_numels = (65536, 131072)
     scale_numels = tuple(member // 32 for member in member_numels)
     arena_numel = num_local_experts * sum(
         member + scale for member, scale in zip(member_numels, scale_numels)
     )
-
-    arenas = {}
-    handles = {}
+    arena, handle = _allocate_symmetric(arena_numel + 256, torch.uint8, group)
+    workspace = SimpleNamespace(
+        weight_arena=arena,
+        weight_handle=handle,
+        weight_grid_barrier=torch.zeros(1, dtype=torch.int32, device=device),
+        rank=rank,
+        world_size=world_size,
+        num_local_experts=num_local_experts,
+        member_numels=member_numels,
+        num_sms=NUM_SMS,
+    )
+    # Seeded bytes vary across experts, components, orientations, tiles and offsets.
+    rng = torch.Generator(device=device).manual_seed(1500 + rank)
+    sources, tables, gathered_sources = {}, {}, {}
     for orientation in ("rowwise", "columnwise"):
-        arenas[orientation], handles[orientation] = _allocate_symmetric(
-            arena_numel, torch.uint8, group
-        )
-    # Distinct byte ranges per orientation and component: any crossed wire shows
-    # up as a wrong value rather than a coincidental match.
-    bases = {("rowwise", "data"): 1, ("rowwise", "scale"): 65}
-    bases.update({("columnwise", "data"): 129, ("columnwise", "scale"): 193})
-    sources = {}
-    for (orientation, kind), base in bases.items():
-        numels = member_numels if kind == "data" else scale_numels
-        tensors = tuple(
-            torch.empty(num_local_experts, numel, dtype=torch.uint8, device=device)
-            for numel in numels
-        )
-        for fc_layer, tensor in enumerate(tensors):
-            for expert in range(num_local_experts):
-                tensor[expert].fill_(base + rank * num_local_experts + expert + 20 * fc_layer)
-        sources[(orientation, kind)] = tensors
-
-    # Every rank materializes its right-hand neighbour's whole expert set.
-    plan = torch.empty((world_size, num_local_experts), dtype=torch.int32, device=device)
-    for destination in range(world_size):
-        owner = (destination + 1) % world_size
-        plan[destination] = torch.arange(
-            owner * num_local_experts,
-            (owner + 1) * num_local_experts,
-            dtype=torch.int32,
-            device=device,
-        )
-    workspaces = {
-        orientation: SimpleNamespace(
-            weight_arena=arenas[orientation],
-            weight_handle=handles[orientation],
-            weight_grid_barrier=torch.zeros(1, dtype=torch.int32, device=device),
-            rank=rank,
-            world_size=world_size,
-            num_local_experts=num_local_experts,
-            member_numels=member_numels,
-            num_sms=NUM_SMS,
-        )
-        for orientation in arenas
-    }
-
-    def launch(orientation):
-        dist.barrier(group=group, device_ids=[device.index])
-        launch_virtual_expert_weight_prefetch(
-            workspaces[orientation],
-            sources=tuple(_pointer_table(s) for s in sources[(orientation, "data")]),
-            scale_sources=tuple(_pointer_table(s) for s in sources[(orientation, "scale")]),
-            experts_to_copy=plan,
-        )
-        torch.cuda.synchronize(device)
-
-    def verify(orientation):
-        owner = (rank + 1) % world_size
-        for fc_layer in range(len(member_numels)):
-            data, scale = _arena_view(
-                arenas[orientation], member_numels, scale_numels, fc_layer, num_local_experts
+        for kind, numels in (("data", member_numels), ("scale", scale_numels)):
+            key = (orientation, kind)
+            sources[key] = tuple(
+                torch.randint(
+                    0, 256, (num_local_experts, n), dtype=torch.uint8, device=device, generator=rng
+                )
+                for n in numels
             )
-            experts = torch.arange(
-                owner * num_local_experts,
-                (owner + 1) * num_local_experts,
-                dtype=torch.int64,
-                device=device,
-            )
-            for view, kind in ((data, "data"), (scale, "scale")):
-                expected = (experts + bases[(orientation, kind)] + 20 * fc_layer).to(torch.uint8)
-                for column, label in ((0, "head"), (-1, "tail")):
-                    torch.testing.assert_close(
-                        view[:, column],
-                        expected,
-                        rtol=0,
-                        atol=0,
-                        msg=lambda msg: f"{orientation} p{fc_layer} {kind} {label}: {msg}",
-                    )
-
+            tables[key] = tuple(_pointer_table(source) for source in sources[key])
+            gathered_sources[key] = []
+            for source in sources[key]:
+                gathered = [torch.empty_like(source) for _ in range(world_size)]
+                dist.all_gather(gathered, source, group=group)
+                gathered_sources[key].append(torch.cat(gathered))
+    streams = (torch.cuda.Stream(), torch.cuda.Stream())
+    compute = torch.cuda.current_stream()
+    errors = []
     try:
-        arenas["rowwise"].fill_(17)
-        arenas["columnwise"].fill_(23)
-        launch("rowwise")
-        verify("rowwise")
-        # Forward pushes the rowwise orientation only; the backward arena must
-        # still hold its fill.
-        torch.testing.assert_close(
-            arenas["columnwise"], torch.full_like(arenas["columnwise"], 23), rtol=0, atol=0
-        )
-
-        rowwise_snapshot = arenas["rowwise"].clone()
-        launch("columnwise")
-        verify("columnwise")
-        torch.testing.assert_close(arenas["rowwise"], rowwise_snapshot, rtol=0, atol=0)
+        arena.fill_(17)
+        expected = arena.clone()
+        # Sparse and empty pushes must preserve the preceding orientation in untouched slots.
+        for index, (orientation, slots) in enumerate(
+            (
+                ("rowwise", (0, 1, 2, 3)),
+                ("columnwise", (0, 2)),
+                ("rowwise", ()),
+                ("rowwise", (1, 3)),
+                ("columnwise", (0, 1, 2, 3)),
+            )
+        ):
+            plan = _make_plan("ring", slots, world_size, num_local_experts, device)
+            for fc in range(2):
+                data, scale = _arena_view(
+                    expected, member_numels, scale_numels, fc, num_local_experts
+                )
+                for slot, expert in enumerate(plan[rank].tolist()):
+                    if expert >= 0:
+                        for view, kind in ((data, "data"), (scale, "scale")):
+                            view[slot].copy_(gathered_sources[(orientation, kind)][fc][expert])
+            torch.cuda.synchronize(device)
+            dist.barrier(group=group, device_ids=[device.index])
+            stream = streams[index % 2]
+            stream.wait_stream(compute)
+            with torch.cuda.stream(stream):
+                launch_virtual_expert_weight_prefetch(
+                    workspace,
+                    sources=tables[(orientation, "data")],
+                    scale_sources=tables[(orientation, "scale")],
+                    experts_to_copy=plan,
+                )
+            compute.wait_stream(stream)
+            _check_equal(arena, expected, f"{orientation}/{slots}", errors)
+        _report(errors, group)
     finally:
+        torch.cuda.synchronize(device)
         dist.barrier(group=group, device_ids=[device.index])
-        arenas.clear()
-        handles.clear()
+        del workspace, arena, handle
         gc.collect()
         Utils.destroy_model_parallel()
 
