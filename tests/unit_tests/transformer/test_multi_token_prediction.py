@@ -3771,22 +3771,26 @@ class TestMultiTokenPredictionHybrid:
         position_ids = torch.tensor([[0, 1]])
         labels = torch.tensor([[2, 3]])
         loss_mask = torch.ones(1, 2)
+        mtp_input_mask = torch.tensor([[True, False]])
         zigzag_input_ids = torch.tensor([[4, 3]])
         zigzag_position_ids = torch.tensor([[3, 2]])
         zigzag_labels = torch.tensor([[5, 4]])
         zigzag_loss_mask = torch.tensor([[1.0, 0.0]])
+        zigzag_mtp_input_mask = torch.tensor([[False, True]])
         batches_by_layout = {
             "contiguous": {
                 "tokens": input_ids,
                 "position_ids": position_ids,
                 "labels": labels,
                 "loss_mask": loss_mask,
+                "mtp_input_mask": mtp_input_mask,
             },
             "zigzag": {
                 "tokens": zigzag_input_ids,
                 "position_ids": zigzag_position_ids,
                 "labels": zigzag_labels,
                 "loss_mask": zigzag_loss_mask,
+                "mtp_input_mask": zigzag_mtp_input_mask,
             },
         }
         cp_batch = ContextParallelBatch(
@@ -3813,6 +3817,7 @@ class TestMultiTokenPredictionHybrid:
             decoder_input=hidden_states,
             labels=labels,
             loss_mask=loss_mask,
+            mtp_input_mask=mtp_input_mask,
             packed_seq_params=contiguous_packed_seq_params,
             cp_batch=cp_batch,
         )
@@ -3821,6 +3826,7 @@ class TestMultiTokenPredictionHybrid:
         assert captured["mtp"]["decoder_input"] is zigzag_hidden_states
         assert captured["mtp"]["input_ids"] is zigzag_input_ids
         assert captured["mtp"]["position_ids"] is zigzag_position_ids
+        assert captured["mtp"]["mtp_input_mask"] is zigzag_mtp_input_mask
         assert captured["mtp"]["packed_seq_params"] is zigzag_packed_seq_params
         assert (
             captured["mtp"]["packed_seq_params_by_layout"] is expected_packed_seq_params_by_layout

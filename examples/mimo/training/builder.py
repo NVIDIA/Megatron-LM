@@ -120,6 +120,7 @@ class MimoModelBuilder(ModelBuilder[MimoModel, MimoBuildConfig]):
             mimo_config,
             cp_group=active_pg.cp if is_language else None,
             tp_group=active_pg.tp if is_language else None,
+            tp_cp_group=active_pg.tp_cp if is_language else None,
         )
 
     def build_distributed_models(
