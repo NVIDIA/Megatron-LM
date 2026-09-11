@@ -28,10 +28,19 @@ from torch.distributed.tensor import Partial, Replicate
 from torch.distributed.tensor.placement_types import Placement
 
 from ..mixed_precision import MixedPrecisionPolicy
+from ..utils import HAVE_TE
 from .dbuffer import DBuffer
 from .module_utils import get_parameter_owner
 from .placement import BlockAtomic
-from .quantized_dbuffer import QuantizedDBuffer, effective_dtype
+
+if HAVE_TE:
+    from .quantized_dbuffer import QuantizedDBuffer, effective_dtype
+else:
+
+    def effective_dtype(tensor: torch.Tensor) -> torch.dtype:
+        """Without TE, all parameters use their native storage dtype."""
+        return tensor.dtype
+
 
 _CONTAINING_PARAMETER_GROUP_ATTR = "_mfsdp_parameter_group"
 
@@ -84,9 +93,9 @@ class FsdpParameterGroup:
     dtype: torch.dtype
     requires_grad: bool
     main_weight: DBuffer
-    model_weight: DBuffer | QuantizedDBuffer
+    model_weight: "DBuffer | QuantizedDBuffer"
     # Optimizer-layout representation of model_weight after an optimizer step.
-    post_optimizer_model_weight: DBuffer | QuantizedDBuffer
+    post_optimizer_model_weight: "DBuffer | QuantizedDBuffer"
     # sync_model_weight_from_main_weight() updates only this rank's optimizer-layout
     # view; the remaining model_weight slices must be all-gathered before compute.
     _model_weight_is_stale: bool
@@ -98,7 +107,7 @@ class FsdpParameterGroup:
     # reduction created a smaller view (e.g. ZeRO-1 or HFSDP), the remaining main_grad
     # storage is stale and must be cleared before the next accumulation begins.
     _main_grad_is_stale: bool
-    _unsharded_model_weight: DBuffer | QuantizedDBuffer
+    _unsharded_model_weight: "DBuffer | QuantizedDBuffer"
     _symm_mem_pool: torch.cuda.MemPool | None
     grad_divisor: int
 
@@ -250,7 +259,7 @@ class FsdpParameterGroup:
         self.post_optimizer_model_weight = self.model_weight.view(main_weight_placements)
         self.sync_model_weight_from_main_weight()
         with self._symmetric_memory_context():
-            if isinstance(self.model_weight, QuantizedDBuffer):
+            if HAVE_TE and isinstance(self.model_weight, QuantizedDBuffer):
                 self._unsharded_model_weight = QuantizedDBuffer(
                     self.mesh,
                     [Replicate()] * self.mesh.ndim,
@@ -351,7 +360,7 @@ class FsdpParameterGroup:
 
     def sync_model_weight_from_main_weight(self) -> None:
         """Refresh compute weights from optimizer weights."""
-        if isinstance(self.post_optimizer_model_weight, QuantizedDBuffer):
+        if HAVE_TE and isinstance(self.post_optimizer_model_weight, QuantizedDBuffer):
             self.post_optimizer_model_weight.quantize_(self.main_weight)
         else:
             assert isinstance(self.model_weight, DBuffer)
@@ -376,7 +385,7 @@ class FsdpParameterGroup:
                 unsharded_model_weight.reallocate_storage()
             preserved_tensors = (
                 tuple(plane.local_buffer for plane in unsharded_model_weight.planes)
-                if isinstance(unsharded_model_weight, QuantizedDBuffer)
+                if HAVE_TE and isinstance(unsharded_model_weight, QuantizedDBuffer)
                 else unsharded_model_weight.local_buffer
             )
             # This buffer backs unsharded Parameters whose views may be saved by autograd.
