@@ -313,7 +313,7 @@ class DBuffer:
             block_size=block_size,
         )
         # Only logical tensor ranges are initialized. Padding and layout gaps are not
-        # observable through get_local_tensor() and can remain unspecified.
+        # observable through get_tensor_view() and can remain unspecified.
         for index, tensor in enumerate(tensors):
             owned_range = buffer._get_owned_range(index)
             if owned_range is None or tensor.is_meta:
@@ -505,7 +505,7 @@ class DBuffer:
             out.local_buffer.div_(self.mesh.size(axis))
         return out
 
-    def get_local_tensor(self, index: int) -> torch.Tensor:
+    def get_tensor_view(self, index: int) -> torch.Tensor:
         """Return this rank's local view for logical tensor ``index``.
 
         Flat placements shard dim 0, so the returned view preserves all
@@ -530,7 +530,7 @@ class DBuffer:
 
     def get_dtensor(self, index: int) -> DTensor:
         """Return logical tensor ``index`` as a DTensor."""
-        local_tensor = self.get_local_tensor(index)
+        local_tensor = self.get_tensor_view(index)
         tensor_shape = self.layout.tensor_shapes[index]
         # Keep internal storage details (e.g. Flat and BlockAtomic) out of DTensor placements.
         dtensor_placements = tuple(
