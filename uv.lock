@@ -32,8 +32,8 @@ version = "1.0.0+9edee0c"
 
 [[manifest.dependency-metadata]]
 name = "transformer-engine"
-version = "2.18.0+27486e03"
-requires-dist = ["pydantic<2.14", "importlib-metadata>=1.0", "packaging", "torch>=2.1", "einops", "onnxscript", "onnx", "nvdlfw-inspect", "nvidia-cudnn-frontend>=1.25.0"]
+version = "2.19.0+5e52befd"
+requires-dist = ["pydantic<2.14", "importlib-metadata>=1.0", "packaging", "torch>=2.1", "einops", "onnxscript", "onnx", "nvdlfw-inspect", "nvidia-cudnn-frontend>=1.28.0"]
 
 [[package]]
 name = "absl-py"
@@ -302,25 +302,25 @@ wheels = [
 
 [[package]]
 name = "apache-tvm-ffi"
-version = "0.1.9"
+version = "0.1.12"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "typing-extensions" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/6f/60/1e787a0b5ebf318483235be2a689ee367173983067e441b8379564f667c0/apache_tvm_ffi-0.1.9.tar.gz", hash = "sha256:d2d402587e8906de0a07f4746aa78f3d452c7efe3625d4bb39ac2ad693bce530", size = 2513731, upload-time = "2026-02-27T19:28:06.602Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/ff/95/ef83880657e89a0ce0f1ad79cbff11698286d00522dbc290d34a8458e9c2/apache_tvm_ffi-0.1.12.tar.gz", hash = "sha256:2aa5c8ece3144dad11afd6d0f10191d03cdb368bbcd9c92f9fb919f35906223d", size = 2843816, upload-time = "2026-06-09T18:17:31.68Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/df/f2/b8c4b151169f6d7ba8773c8af68b2e0c1013d7fb3f1bdf87573f47157ce9/apache_tvm_ffi-0.1.9-cp312-abi3-macosx_11_0_arm64.whl", hash = "sha256:49e52350b0470654847de752e65603b604a4d3323e7e9f5e8a982f44acc4c143", size = 2041756, upload-time = "2026-02-27T19:27:23.931Z" },
-    { url = "https://files.pythonhosted.org/packages/a7/c0/6d3d54f50012255b41bc3e24944c086f63c4707c8686c7c6780e9283eb96/apache_tvm_ffi-0.1.9-cp312-abi3-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:7d503029e66c43b1a1cb1a42a1e9bb428c8a28dcbdec31c28e705472ca648a3a", size = 2203712, upload-time = "2026-02-27T19:27:25.867Z" },
-    { url = "https://files.pythonhosted.org/packages/c6/dd/2bab4c6cd86257dbf99e93452a1af833113f8dc3e25a25579f6e4e4c8a94/apache_tvm_ffi-0.1.9-cp312-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:28241371934ea8af10d5067087ba1229ebddded7b2c02d33a258ec2a96df8c46", size = 2299704, upload-time = "2026-02-27T19:27:27.477Z" },
-    { url = "https://files.pythonhosted.org/packages/7a/4a/b469bcb2e1014cb84d336d2a59f42958a058251c577a4c2680cacad346e2/apache_tvm_ffi-0.1.9-cp312-abi3-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:87cacce81df55685fc6a76e1e3c5db1200e85e87bf5974b692c59d131b7bc622", size = 2130865, upload-time = "2026-02-27T19:27:29.092Z" },
-    { url = "https://files.pythonhosted.org/packages/70/ef/5402da5d37f5270fd88ea0348acca78dba9be8bdbf6c2bcae0935eb03ef1/apache_tvm_ffi-0.1.9-cp312-abi3-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:f45eb43499acac45ff6c93564f0ff2d3ca27b69656d540fd56ce59d51c0b4c65", size = 2278991, upload-time = "2026-02-27T19:27:30.729Z" },
-    { url = "https://files.pythonhosted.org/packages/b5/23/1b7dc5f0807f83098183a57db6ee85b2c93b646d74a6e03781c9208aaeb0/apache_tvm_ffi-0.1.9-cp312-abi3-win_amd64.whl", hash = "sha256:d1dcf4c041d5ec05e3da1d545800c33cdbb95c113baa7705085ff79fa262752b", size = 1973200, upload-time = "2026-02-27T19:27:32.367Z" },
-    { url = "https://files.pythonhosted.org/packages/4a/1e/991ae65e64ce132c1ba665562db6638f5696d6133f580e20c653de33b9af/apache_tvm_ffi-0.1.9-cp314-cp314t-macosx_11_0_arm64.whl", hash = "sha256:c3349f72ddb8ce206472d0380a729f213017a2180707096f8d57114b81097dd1", size = 2072944, upload-time = "2026-02-27T19:27:34.261Z" },
-    { url = "https://files.pythonhosted.org/packages/b4/a7/1e0643949e683fb3cfababd87058c0cfef122d1a3bb6ce703f719051b842/apache_tvm_ffi-0.1.9-cp314-cp314t-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:d1f4d2b7ec7b1213632e9a104e9330bfc3dec48decffa62114c33aa188c9f43a", size = 2215954, upload-time = "2026-02-27T19:27:35.872Z" },
-    { url = "https://files.pythonhosted.org/packages/d6/06/5016191ab61d2db4c3a7d754a3c1184e0836f575a7d08491669738c5e4b9/apache_tvm_ffi-0.1.9-cp314-cp314t-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:e4f01d16ba53fe118e363f7257253f07003797e4abe6fc9567f23b6a930dbff2", size = 2307291, upload-time = "2026-02-27T19:27:37.527Z" },
-    { url = "https://files.pythonhosted.org/packages/e3/f5/40bf0667330938efbfc0a51743cc53c79e41b4ece1a8abad3076192c9674/apache_tvm_ffi-0.1.9-cp314-cp314t-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:3c0581dd6bfbce7b017ef85cfda08bbe38891cc4b3afbcfaa8bc2d383728e426", size = 2143850, upload-time = "2026-02-27T19:27:40.437Z" },
-    { url = "https://files.pythonhosted.org/packages/72/4a/421cbd4ed32e8bad3b88af3e8fa145c1f6f493bdd05be15b6f2d9b3cb7d6/apache_tvm_ffi-0.1.9-cp314-cp314t-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:7dfa14be2a49347791ef21222a8225ce7f99bfec17104a676cb4f1bf3a107088", size = 2289038, upload-time = "2026-02-27T19:27:41.972Z" },
-    { url = "https://files.pythonhosted.org/packages/9d/1a/c8923d819b49872a612033b90d29299c0be73a7cbed1ddb3dc78dfe5e9f1/apache_tvm_ffi-0.1.9-cp314-cp314t-win_amd64.whl", hash = "sha256:a42d7ca27dce83efbdce7ec970fe3e773a69c31d928730ee5d9badb1229d106c", size = 2039007, upload-time = "2026-02-27T19:27:43.618Z" },
+    { url = "https://files.pythonhosted.org/packages/7d/ef/8f2ea57791e8df55c5a52e20d415c01032ef5fa3761574268201b7cc2c79/apache_tvm_ffi-0.1.12-cp312-abi3-macosx_11_0_arm64.whl", hash = "sha256:218e55c807d49182710ef2ab0336313ba6becccb7e565f4941d23bded09646d4", size = 2463724, upload-time = "2026-06-09T18:16:41.904Z" },
+    { url = "https://files.pythonhosted.org/packages/bc/c4/34aec1f10353eee555687f3196241457b8e8a06da2014a176f5b022e24bd/apache_tvm_ffi-0.1.12-cp312-abi3-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:557d8deb672f2ad7f445399e3fa0c727a6e11472e19c895ee244cbb8cfd99a66", size = 2616513, upload-time = "2026-06-09T18:16:44.115Z" },
+    { url = "https://files.pythonhosted.org/packages/c8/2a/bff8d73841b49f196852edd8460241d3a363e6b0d64c3a9367542658394f/apache_tvm_ffi-0.1.12-cp312-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:817af52916ca9987e019ae9c811406835c7f26c590b2a7bcfa9db0e3809f4228", size = 2757612, upload-time = "2026-06-09T18:16:45.987Z" },
+    { url = "https://files.pythonhosted.org/packages/9c/20/51d0c31c76bef0f21c11bce0465598d1ea5fdaca22e47a69c29deadeada7/apache_tvm_ffi-0.1.12-cp312-abi3-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:8a7b08f377ea2663dae10e3045f8d0215f0378ee975096174a8af6381eeb1504", size = 2533956, upload-time = "2026-06-09T18:16:47.891Z" },
+    { url = "https://files.pythonhosted.org/packages/52/f3/fba607d803cb081be2d66ea51865492b42872898bd271d9bcc3e1ced4ef3/apache_tvm_ffi-0.1.12-cp312-abi3-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:dc0acd7eeb0e451d5e3f686af3ba0b495fdbf97b5b54cf9a0f770cdafe0e691a", size = 2719638, upload-time = "2026-06-09T18:16:50.021Z" },
+    { url = "https://files.pythonhosted.org/packages/06/d7/a25f51156358c631114e16cb09ca91188b3b79677369e111216d6fa7f83d/apache_tvm_ffi-0.1.12-cp312-abi3-win_amd64.whl", hash = "sha256:23eefd1094a41faae2bb7b9cc5816aa938101b624d48ebb724881f1a89b78e99", size = 2725953, upload-time = "2026-06-09T18:16:52.215Z" },
+    { url = "https://files.pythonhosted.org/packages/05/d4/5f1a59ebf85c4ea3243766318a50bcec2312bacce9dc9b132db514f7c897/apache_tvm_ffi-0.1.12-cp314-cp314t-macosx_11_0_arm64.whl", hash = "sha256:3ee7ebbc4ec8e037364fc1388c081145f790cc97de642348efc39fcda749a8bb", size = 2526890, upload-time = "2026-06-09T18:16:54.547Z" },
+    { url = "https://files.pythonhosted.org/packages/04/4a/428b5bc74a762d62aa5efedc3a72f90e00bae53ab4fb7e5b52206dd9f541/apache_tvm_ffi-0.1.12-cp314-cp314t-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:003027a31011a216295ec8e04ac78bb3d80b8dc47a93f6b602cf242a80676366", size = 2650779, upload-time = "2026-06-09T18:16:56.746Z" },
+    { url = "https://files.pythonhosted.org/packages/a7/c1/550f60d376e7d11cbcfbc2968bd87936beeec91f4c26d16e6c63b60801ee/apache_tvm_ffi-0.1.12-cp314-cp314t-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:f69d28a95648c4e864a53f1bfe099b7547dfbc60d520180fc0eb0ec72245151f", size = 2789261, upload-time = "2026-06-09T18:16:59.021Z" },
+    { url = "https://files.pythonhosted.org/packages/9a/6c/34e8bfb495ada6c1d37d5eb84fee17d5c8cfd630e6fa647c8327377bc17e/apache_tvm_ffi-0.1.12-cp314-cp314t-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:02508fef806cfb1a5224aaa69fb121558d60fa56c2fa7d4166fb9f354945509b", size = 2570469, upload-time = "2026-06-09T18:17:01.376Z" },
+    { url = "https://files.pythonhosted.org/packages/33/a9/005a2537fb043aa2d5916bb9c30ee8b6cda258d9e2db343f7dca233407ca/apache_tvm_ffi-0.1.12-cp314-cp314t-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:786b3073a79c025f85b2bf4aa4b6bc1f8a2b1aae186a613181acd6d9661bd3cb", size = 2750777, upload-time = "2026-06-09T18:17:03.333Z" },
+    { url = "https://files.pythonhosted.org/packages/10/d6/5e3199709bef26975ee5f993029999f05edbf5020df8a910f3ef0884acc7/apache_tvm_ffi-0.1.12-cp314-cp314t-win_amd64.whl", hash = "sha256:d015c7ad8e15ee7896ffacb5b30c81fd507375f1b5650078ba382f52a5dc8795", size = 2820788, upload-time = "2026-06-09T18:17:05.424Z" },
 ]
 
 [[package]]
@@ -2162,7 +2162,7 @@ wheels = [
 [[package]]
 name = "mamba-ssm"
 version = "2.3.2.post1"
-source = { git = "https://github.com/state-spaces/mamba.git?rev=0048fbf2e7b2f214dcbe703ea3dec2b9647595e1#0048fbf2e7b2f214dcbe703ea3dec2b9647595e1" }
+source = { git = "https://github.com/state-spaces/mamba.git?rev=ed6ce09e4d802e274b1ecc7205757b892e180a93#ed6ce09e4d802e274b1ecc7205757b892e180a93" }
 dependencies = [
     { name = "apache-tvm-ffi" },
     { name = "einops" },
@@ -2435,13 +2435,13 @@ requires-dist = [
     { name = "gigatoken", marker = "extra == 'mlm'" },
     { name = "gigatoken", marker = "extra == 'training'" },
     { name = "hypercorn", marker = "extra == 'dev'" },
-    { name = "mamba-ssm", marker = "extra == 'ssm'", git = "https://github.com/state-spaces/mamba.git?rev=0048fbf2e7b2f214dcbe703ea3dec2b9647595e1" },
+    { name = "mamba-ssm", marker = "extra == 'ssm'", git = "https://github.com/state-spaces/mamba.git?rev=ed6ce09e4d802e274b1ecc7205757b892e180a93" },
     { name = "megatron-energon", extras = ["av-decode"], marker = "extra == 'dev'", specifier = "~=7.0" },
     { name = "multi-storage-client", marker = "extra == 'dev'", specifier = "~=0.50" },
     { name = "nemo-lens", marker = "extra == 'dev'", git = "https://github.com/NVIDIA-NeMo/Lens.git?rev=b85578fc2b736a1804705e537001b5f45e9c715d" },
     { name = "nemo-lens", extras = ["sdk"], marker = "extra == 'otel'", git = "https://github.com/NVIDIA-NeMo/Lens.git?rev=b85578fc2b736a1804705e537001b5f45e9c715d" },
     { name = "numpy" },
-    { name = "nvidia-cudnn-frontend", extras = ["cutedsl"], marker = "extra == 'dev'", specifier = "==1.26.0" },
+    { name = "nvidia-cudnn-frontend", extras = ["cutedsl"], marker = "extra == 'dev'", specifier = "==1.28.0" },
     { name = "nvidia-modelopt", extras = ["torch"], marker = "sys_platform != 'darwin' and extra == 'dev'", specifier = ">=0.44" },
     { name = "nvidia-resiliency-ext", marker = "extra == 'dev'", specifier = "==0.6.0" },
     { name = "omegaconf", marker = "extra == 'mlm'" },
@@ -2461,7 +2461,7 @@ requires-dist = [
     { name = "torch", specifier = ">=2.6.0" },
     { name = "torch-memory-saver", marker = "extra == 'inference'", git = "https://github.com/fzyzcjy/torch_memory_saver.git?rev=9bc9a442e6d108c7b7903def199896a005143aaf" },
     { name = "tqdm", marker = "extra == 'dev'" },
-    { name = "transformer-engine", extras = ["core-cu13", "pytorch"], marker = "extra == 'te'", git = "https://github.com/NVIDIA/TransformerEngine.git?rev=27486e03cfc1fa41f6932dcecdc47c71c47eac3e" },
+    { name = "transformer-engine", extras = ["core-cu13", "pytorch"], marker = "extra == 'te'", git = "https://github.com/NVIDIA/TransformerEngine.git?rev=5e52befd5262c06289106338c308079d6adb391f" },
     { name = "transformers", marker = "extra == 'mlm'" },
     { name = "transformers", marker = "extra == 'training'" },
     { name = "wandb", marker = "extra == 'mlm'" },
@@ -2476,7 +2476,7 @@ batch-invariant = [{ name = "deep-gemm", git = "https://github.com/deepseek-ai/D
 build = [
     { name = "cython", specifier = ">=3.0.0" },
     { name = "hatchling" },
-    { name = "nvidia-cudnn-frontend", specifier = ">=1.25.0" },
+    { name = "nvidia-cudnn-frontend", specifier = ">=1.28.0" },
     { name = "nvidia-mathdx" },
     { name = "packaging", specifier = ">=24.2" },
     { name = "pybind11" },
@@ -3033,21 +3033,21 @@ wheels = [
 
 [[package]]
 name = "nvidia-cudnn-frontend"
-version = "1.26.0"
+version = "1.28.0"
 source = { registry = "https://pypi.org/simple" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/19/c4/3f587b73ac2eb6e391aebffb7a7a9ac9ed70e1e0e6a1d90ec0fdcb1a516f/nvidia_cudnn_frontend-1.26.0-cp312-cp312-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:ee50df3468f672aa31402fde4c911ad545d08e1d5e133e15bc55c3679d9fd9ca", size = 3471242, upload-time = "2026-07-07T20:55:30.929Z" },
-    { url = "https://files.pythonhosted.org/packages/9b/31/64818fbaa117456349241b42ddfaef3ae6b050f5e99bb0e9d78eb831279b/nvidia_cudnn_frontend-1.26.0-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:1a1223c4e2e8bbe6f620148d6848f4eb773dd94bef534d5b748e91232b5be618", size = 3627033, upload-time = "2026-07-07T20:55:47.089Z" },
-    { url = "https://files.pythonhosted.org/packages/f9/99/04a37f34b271ed157c6108c3191bd1993ab3fad8d5d66516970bd1e7c12d/nvidia_cudnn_frontend-1.26.0-cp312-cp312-win_amd64.whl", hash = "sha256:7f104a40cb6f25cf01b7d7e84cb99af7dedd32b1cb8264384c2f363b7a3f7fb6", size = 2998730, upload-time = "2026-07-07T20:56:09.848Z" },
-    { url = "https://files.pythonhosted.org/packages/59/71/b09fa3625b8ab915ef4925e8704bf189754dad8386208fa22304171b81b9/nvidia_cudnn_frontend-1.26.0-cp313-cp313-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:7fee9922c6be2c1b43cb10162e7cd63ce102b0509c0f028e37ac23a959e761b4", size = 3470545, upload-time = "2026-07-07T20:56:30.992Z" },
-    { url = "https://files.pythonhosted.org/packages/48/6d/b85a9b36948c0f176a0ea1e137e60e64ea8dc2b2cefc4560b7070536afdc/nvidia_cudnn_frontend-1.26.0-cp313-cp313-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:cf064832e29d74ab5bafa341b1793650496ebfe0c94292ee00b61008ecf9aac4", size = 3626160, upload-time = "2026-07-07T20:56:53.298Z" },
-    { url = "https://files.pythonhosted.org/packages/b8/7c/32f6a54f1283952c205680f892bd9d5fce111bb949063133a58c7f5cf2c7/nvidia_cudnn_frontend-1.26.0-cp313-cp313-win_amd64.whl", hash = "sha256:067e5bd08a1d25391188eb7206f711d88b916a926b929aec3609af3e43dbae0b", size = 2998579, upload-time = "2026-07-07T20:57:11.771Z" },
-    { url = "https://files.pythonhosted.org/packages/fb/99/4c1aba5701e3befeeab953b9ebfd3c1396ffb0dd5fbfc5cca1634f3bdb5e/nvidia_cudnn_frontend-1.26.0-cp314-cp314-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:f2ea02bdad5081210830cd577de86bd0ae73836ffeb3485211753621b145e9d3", size = 3473588, upload-time = "2026-07-07T20:57:36.03Z" },
-    { url = "https://files.pythonhosted.org/packages/4a/d8/8a9aa4d0c1b6e289262c66db3f9a00d076254b28094bc41e2faab6188671/nvidia_cudnn_frontend-1.26.0-cp314-cp314-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:f1e78e77bb145ec9162f2e166241f4c82ca1779a8a545bc3fe0870813c55d5cc", size = 3626696, upload-time = "2026-07-07T20:57:57.742Z" },
-    { url = "https://files.pythonhosted.org/packages/29/78/40ab818ac4f4656d2de0a547643feb1d6d68e7dfe3729642eb2f47841193/nvidia_cudnn_frontend-1.26.0-cp314-cp314-win_amd64.whl", hash = "sha256:1f88e462c6c2cabb08da9b40a5025cbc86274ad3779c421c2a69a405e900278f", size = 2999640, upload-time = "2026-07-07T20:58:21.555Z" },
-    { url = "https://files.pythonhosted.org/packages/44/6d/8d2fb9b1933e182db9f98d94c12b3e0765dfe92f40e1870cb19dac046776/nvidia_cudnn_frontend-1.26.0-cp314-cp314t-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:ce41d00f7b80171c7e3705f0b519ace6b40a2dc8b372206e120f3930568a9afe", size = 3475859, upload-time = "2026-07-07T20:58:42.302Z" },
-    { url = "https://files.pythonhosted.org/packages/67/33/8865ae8a32055d9827a492355ed30b1d8cd38863d13440fc5494fb9cba02/nvidia_cudnn_frontend-1.26.0-cp314-cp314t-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:1e4ee11bb4d3f912f9f7751f0b88ee08bb04c171d1edf63618fbabf63ae75271", size = 3630207, upload-time = "2026-07-07T20:59:05.768Z" },
-    { url = "https://files.pythonhosted.org/packages/11/53/27eed2c212f6e4fe8f336655fbf3a5345818278d30a9b6efefd8e552d20f/nvidia_cudnn_frontend-1.26.0-cp314-cp314t-win_amd64.whl", hash = "sha256:67dd4f7116171567a0e3f1864ecb2933e31997a333bf551ace7ca5e36578387b", size = 3023017, upload-time = "2026-07-07T20:59:25.296Z" },
+    { url = "https://files.pythonhosted.org/packages/d1/9e/33b746b800c36a8aae8432605c5b2af6cc5fc683cc1a6954a084c3853690/nvidia_cudnn_frontend-1.28.0-cp312-cp312-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:060b0c021f6841312ad26dd837a51b4941d4e0d2a547d87455bd974c173da075", size = 5512380, upload-time = "2026-09-02T06:07:11.74Z" },
+    { url = "https://files.pythonhosted.org/packages/fd/0d/b6670b5d2d193322e0765d01889998df11d7f57522f210dc808b456530d9/nvidia_cudnn_frontend-1.28.0-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:335c916be758a8d5533104e04fc4a15f9c30a419b103ecd2b6fd0d23e1d532e4", size = 5677342, upload-time = "2026-09-02T06:07:31.949Z" },
+    { url = "https://files.pythonhosted.org/packages/87/14/4c47521e4dfcebc1e6c59f23942c0aa1d73e3385c1a2a9b16f41c6d3b506/nvidia_cudnn_frontend-1.28.0-cp312-cp312-win_amd64.whl", hash = "sha256:e1929bde04d0172828b65584317b5e2de3e60743768e5f634875f69eeab6b97e", size = 5016827, upload-time = "2026-09-02T06:07:50.919Z" },
+    { url = "https://files.pythonhosted.org/packages/1b/37/ce841fc013bc01de87d33eba58ba386477e411f31e3e41337d3f745ea1f3/nvidia_cudnn_frontend-1.28.0-cp313-cp313-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:30e20178e46a5a5049c2358f4147d1c5414b45b2753a455da05bab914807a44d", size = 5512441, upload-time = "2026-09-02T06:08:14.921Z" },
+    { url = "https://files.pythonhosted.org/packages/3d/1a/51fa7f3d4fd8377d7acdf99e92d33a38be83979897360ca36b6f3521e92d/nvidia_cudnn_frontend-1.28.0-cp313-cp313-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:26cd299d202e832a1d562510d6844dc7c6f256cb1b4f0f29d5b2fa0b34f05e98", size = 5677523, upload-time = "2026-09-02T06:08:37.287Z" },
+    { url = "https://files.pythonhosted.org/packages/2f/c3/a8073be9a425399da5d4ec6bc080d9b5fdc0ef276921c499821937769c24/nvidia_cudnn_frontend-1.28.0-cp313-cp313-win_amd64.whl", hash = "sha256:33884611aa659687138d6abf3a10a5e121cd76018192a14c69be43e8898da384", size = 5016995, upload-time = "2026-09-02T06:09:03.333Z" },
+    { url = "https://files.pythonhosted.org/packages/79/21/dc09de787243c3333d6b958eca44697bfd56951465182373d37d88dec0e8/nvidia_cudnn_frontend-1.28.0-cp314-cp314-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:851fde83b08026f33fc83b2c656232833e4c79ad886c937ed5a035473ad02e1d", size = 5514494, upload-time = "2026-09-02T06:09:23.829Z" },
+    { url = "https://files.pythonhosted.org/packages/e5/31/f6e3c1983cae0da1759c7bb6a57f4b2208b042a24b7ccaad775dd14601e0/nvidia_cudnn_frontend-1.28.0-cp314-cp314-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:56c596054d7ff929ba95ae560bcf1f41d4f0113a9f8b693401c0d508262a4717", size = 5679104, upload-time = "2026-09-02T06:09:44.703Z" },
+    { url = "https://files.pythonhosted.org/packages/b9/b8/3ed83bb8cf6a8c5fd8511883b5b65b2f7cfd50a655626cd4ffb4416b6729/nvidia_cudnn_frontend-1.28.0-cp314-cp314-win_amd64.whl", hash = "sha256:3d4a7a8b33b6c32018162b10b0f8b2d5046ac224c7fcf4765f4562419c3e559e", size = 5015543, upload-time = "2026-09-02T06:10:07.694Z" },
+    { url = "https://files.pythonhosted.org/packages/32/4a/73a453003eb527565b9a5b0b117ec04a75b4eddd0a0796027064d87b77f2/nvidia_cudnn_frontend-1.28.0-cp314-cp314t-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:92d52770600d9b175e3098faed570477cf31c78646dc224cd92b2149d62afe0e", size = 5517650, upload-time = "2026-09-02T06:10:30.932Z" },
+    { url = "https://files.pythonhosted.org/packages/a5/29/742fd93110343da4451eb4d1a713f6291bbb4e80e7b91fae91c826cc150c/nvidia_cudnn_frontend-1.28.0-cp314-cp314t-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:04b209c40cf5295ea6141be8c74c2e65449b619a0911ceb2ae27cd914124d376", size = 5680701, upload-time = "2026-09-02T06:10:55.184Z" },
+    { url = "https://files.pythonhosted.org/packages/92/79/7a341c7eb5252673f7117d77ec6615264c6d2cb08c767ec4665fc722e7c7/nvidia_cudnn_frontend-1.28.0-cp314-cp314t-win_amd64.whl", hash = "sha256:8fe9ab83ac4e14069d0904b5e3dc8307904c583ebe53ce941dacd534b7e8df6e", size = 5042699, upload-time = "2026-09-02T06:11:19.176Z" },
 ]
 
 [package.optional-dependencies]
@@ -3055,8 +3055,6 @@ cutedsl = [
     { name = "apache-tvm-ffi" },
     { name = "cuda-python" },
     { name = "nvidia-cutlass-dsl", extra = ["cu13"] },
-    { name = "torch", marker = "sys_platform == 'never'" },
-    { name = "torch-c-dlpack-ext" },
 ]
 
 [[package]]
@@ -5433,8 +5431,8 @@ wheels = [
 
 [[package]]
 name = "transformer-engine"
-version = "2.18.0+27486e03"
-source = { git = "https://github.com/NVIDIA/TransformerEngine.git?rev=27486e03cfc1fa41f6932dcecdc47c71c47eac3e#27486e03cfc1fa41f6932dcecdc47c71c47eac3e" }
+version = "2.19.0+5e52befd"
+source = { git = "https://github.com/NVIDIA/TransformerEngine.git?rev=5e52befd5262c06289106338c308079d6adb391f#5e52befd5262c06289106338c308079d6adb391f" }
 dependencies = [
     { name = "einops" },
     { name = "importlib-metadata" },
