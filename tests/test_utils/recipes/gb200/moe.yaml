@@ -231,5 +231,5 @@ products:
   - test_case: [deepseek_proxy_mfsdp_v1_ep2]
     products:
       - environment: [dev]
-        scope: [mr]
+        scope: [nightly]
         platforms: [dgx_gb200]
