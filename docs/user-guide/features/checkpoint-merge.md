@@ -86,6 +86,58 @@ Do not use this tool to merge checkpoints from different architectures, tensor
 layouts, or model-parallel sharding. Those cases are rejected instead of being
 reshaped or reconciled.
 
+### MiMo and VLM checkpoints
+
+Recent MiMo/VLM checkpoints can store the distributed model shards separately
+from `common.pt`, and their model tensors use two top-level roots rather than
+the default `model.` root:
+
+- `language_model.` contains the language model, including any MTP parameters;
+- `modality_submodules.` contains the vision encoder and multimodal projector.
+
+In current MiMo/VLM training, the vision encoder is frozen while the projector
+is trained. The merge tool does not infer that training policy: it applies the
+same coefficients to every floating tensor under `modality_submodules.`.
+Normalized coefficients preserve the identical frozen encoder weights while
+averaging the changing projector weights. If a future run also trains the
+encoder, the same command will average its changing weights as well. Manual
+weights whose sum is not one will scale even identical frozen tensors; pass
+`--normalize` unless that behavior is intentional.
+
+Select both roots explicitly and require them to exist in every source. These
+checkpoints can also contain optimizer, RNG, or other training state under
+unrelated roots. `--merge-ignore-non-model-state` is the explicit opt-in to
+exclude that state; it does not make it part of the merged output.
+
+When the selected `iter_*` directories do not contain `common.pt`, point
+`--common-state-checkpoint` at a trusted, complete checkpoint for the output
+iteration:
+
+```bash
+python tools/checkpoint/weighted_merge.py \
+  --merge-inputs /checkpoints/mimo_vlm_run \
+  --start-checkpoint 56000 \
+  --end-checkpoint 70000 \
+  --min-iteration-interval 2000 \
+  --min-checkpoints 8 \
+  --merge-style minus-sqrt \
+  --merge-output /checkpoints/merged/mimo_vlm \
+  --output-iteration 70000 \
+  --common-state-checkpoint /checkpoints/common/iter_0070000 \
+  --merge-model-prefix 'language_model.' \
+  --merge-model-prefix 'modality_submodules.' \
+  --merge-ignore-non-model-state \
+  --merge-balance-rank-work
+```
+
+The common-state checkpoint supplies both `common.pt` and model
+`_extra_state`, so they remain aligned to one source. If it records an
+iteration, that iteration must equal `--output-iteration`. Run the same command
+with `--dry-run` first to validate the selected roots and every source layout
+without writing output. The resulting checkpoint contains merged model state,
+not merged optimizer or RNG state; load it for evaluation with
+`--no-load-optim --no-load-rng`.
+
 ## Checkpoint Selection
 
 ### Manual `PATH:WEIGHT`
