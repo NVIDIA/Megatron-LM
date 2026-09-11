@@ -1757,6 +1757,8 @@ def test_cudnn_sparse_loss_reduces_attention_target_across_tp(monkeypatch):
             return 2
 
     tp_group = FakeTPGroup()
+    # This isolated test uses a fake group, not a live distributed runtime.
+    monkeypatch.setattr(dsa_cudnn_kernels, "get_pg_size", lambda group: group.size())
 
     class FakeDSA:
         @staticmethod
