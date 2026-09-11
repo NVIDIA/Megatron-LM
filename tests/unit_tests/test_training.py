@@ -216,7 +216,7 @@ def test_training_log_resets_first_iteration_when_log_interval_is_one(monkeypatc
 
 
 def test_training_log_uses_nominal_microbatches_and_dynamic_cp_parent(monkeypatch):
-    """DSA metrics use the stable parent and the actual indexer-layer divisor."""
+    """DSA metrics use the stable parent and actual indexer-execution divisor."""
     parent_dp_cp_group = object()
     pp_group = object()
     dp_group = object()
@@ -244,6 +244,7 @@ def test_training_log_uses_nominal_microbatches_and_dynamic_cp_parent(monkeypatc
         log_interval=100,
         micro_batch_size=1,
         mtp_num_layers=None,
+        mtp_use_repeated_layer=False,
         num_experts=None,
         num_layers=8,
         perform_rl_step=False,
@@ -302,6 +303,47 @@ def test_training_log_uses_nominal_microbatches_and_dynamic_cp_parent(monkeypatc
     assert recorded[0]["configured_cp_size"] == 4
     assert recorded[0]["num_layers"] == 8
     assert recorded[0]["num_indexer_layers"] == 2
+    assert recorded[0]["preserve_groups"] is False
+
+    for cuda_graph_impl in ("local", "transformer_engine", "full_iteration"):
+        recorded.clear()
+        args.cuda_graph_impl = cuda_graph_impl
+        run_training_log()
+        assert recorded[0]["preserve_groups"] is True
+    args.cuda_graph_impl = "none"
+
+    standard_mtp_cases = (
+        # Independent MTP layers use logical layer numbers N+1..N+D.
+        (False, 23),
+        # Repeated MTP executes the one physical layer N+1 once per depth.
+        (True, 28),
+    )
+    for use_repeated_layer, indexers in standard_mtp_cases:
+        recorded.clear()
+        args.num_layers = 78
+        args.mtp_num_layers = 7
+        args.mtp_use_repeated_layer = use_repeated_layer
+        args.dsa_indexer_skip_topk_offset = 3
+        args.dsa_indexer_topk_freq = 4
+        run_training_log()
+        assert recorded[0]["num_layers"] == 85
+        assert recorded[0]["num_indexer_layers"] == indexers
+
+    standard_csa_mtp_cases = (
+        # Independent MTP executes its three configured ratios: 4, 128, 0.
+        (False, 3),
+        # Repeated MTP executes the first MTP ratio (4) at every depth.
+        (True, 5),
+    )
+    for use_repeated_layer, indexers in standard_csa_mtp_cases:
+        recorded.clear()
+        args.num_layers = 4
+        args.mtp_num_layers = 3
+        args.mtp_use_repeated_layer = use_repeated_layer
+        args.csa_compress_ratios = [0, 4, 128, 4, 4, 128, 0]
+        run_training_log()
+        assert recorded[0]["num_layers"] == 7
+        assert recorded[0]["num_indexer_layers"] == indexers
 
     hybrid_cases = (
         # Non-DSA symbols do not contribute to the divisor.
@@ -318,6 +360,7 @@ def test_training_log_uses_nominal_microbatches_and_dynamic_cp_parent(monkeypatc
         args.hybrid_layer_pattern = pattern
         args.num_layers = num_layers
         args.mtp_num_layers = mtp_layers
+        args.mtp_use_repeated_layer = False
         args.csa_compress_ratios = ratios
         args.dsa_indexer_skip_topk_offset = offset
         args.dsa_indexer_topk_freq = freq

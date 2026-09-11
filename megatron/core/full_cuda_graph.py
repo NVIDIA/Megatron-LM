@@ -152,7 +152,6 @@ class FullCudaGraphWrapper:
     curr_iteration = {'training': 0, 'validation': 0}
     cuda_graph = {'training': None, 'validation': None}
     result = {'training': None, 'validation': None}
-    _dsa_metric_tracker_prepared = False
 
     def __init__(self, forward_backward_func, cuda_graph_warmup_steps=1, use_single_mempool=False):
         self.forward_backward_func = forward_backward_func
@@ -218,24 +217,13 @@ class FullCudaGraphWrapper:
         training_str = 'training' if training else 'validation'
         curr_iteration = self.curr_iter(training_str)
         if curr_iteration == self.cuda_graph_warmup_steps:
-            pg_collection = kwargs.get('pg_collection')
-            prepare_dsa_tracker, metric_pg_collection = (
-                dsa_logging.resolve_dsa_metric_pg_collection(pg_collection)
-            )
-            dsa_metric_tracker = None
-            dsa_metric_snapshot = None
-            prepared_dsa_tracker_size = (
-                dsa_logging.prepare_dsa_metric_tracker_for_capture(
-                    model, getattr(metric_pg_collection, "pp", None)
-                )
-                if prepare_dsa_tracker
-                else 0
-            )
-            if prepared_dsa_tracker_size > 0:
-                FullCudaGraphWrapper._dsa_metric_tracker_prepared = True
-                dsa_metric_tracker = dsa_logging.DSAIndexerLossLoggingHelper.tracker
-                dsa_metric_snapshot = dsa_logging.snapshot_dsa_metric_tracker_for_capture(
-                    dsa_metric_tracker
+            captures_dsa_metric_writes = dsa_logging.get_dsa_metric_tracker_size(model) > 0
+            if (
+                captures_dsa_metric_writes
+                and dsa_logging.DSAIndexerLossLoggingHelper.tracker.get("agreed_size") is None
+            ):
+                raise RuntimeError(
+                    "DSA metric tracker must be initialized before CUDA Graph capture."
                 )
             logger.info(f'Capture CUDA graph for {training_str}!!!')
             if hasattr(torch.autograd.graph, 'set_override_stale_capture_stream'):
@@ -272,23 +260,6 @@ class FullCudaGraphWrapper:
                 )
             torch.cuda.synchronize()
             torch.distributed.barrier()
-            if dsa_metric_snapshot is not None:
-                captured_reduction_metadata = {
-                    key: dsa_metric_tracker[key]
-                    for key in ("reduce_group", "avg_group")
-                    if key in dsa_metric_tracker
-                }
-                # Recording executes the graph body once. Restore the pre-capture metric values
-                # before the replay below so the capture iteration is accounted exactly once
-                # while retaining the storage referenced by the graph. With zero eager warmup,
-                # reduction groups are first discovered by Python during capture and must survive
-                # because replay only executes the recorded GPU work.
-                dsa_logging.restore_dsa_metric_tracker_after_capture(
-                    dsa_metric_tracker, dsa_metric_snapshot
-                )
-                for key, value in captured_reduction_metadata.items():
-                    if dsa_metric_snapshot[1].get(key) is None:
-                        dsa_metric_tracker[key] = value
             logger.info(f'CUDA graph capture done for {training_str}!!!')
         if FullCudaGraphWrapper.cuda_graph[training_str] is None:
             FullCudaGraphWrapper.result[training_str] = self.forward_backward_func(*args, **kwargs)
@@ -319,9 +290,4 @@ class FullCudaGraphWrapper:
                 FullCudaGraphWrapper.cuda_graph['validation'] = None
             FullCudaGraphWrapper.result['validation'] = None
             FullCudaGraphWrapper.curr_iteration['validation'] = 0
-        if FullCudaGraphWrapper._dsa_metric_tracker_prepared and all(
-            graph is None for graph in FullCudaGraphWrapper.cuda_graph.values()
-        ):
-            dsa_logging.clear_dsa_metric_tracker_capture_state()
-            FullCudaGraphWrapper._dsa_metric_tracker_prepared = False
         gc.collect()
