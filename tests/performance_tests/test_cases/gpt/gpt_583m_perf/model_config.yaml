@@ -1,7 +1,7 @@
 # Inference perf test: 583M mcore-mistral checkpoint, TP=1 PP=1 DP=8 (8 GPUs).
 #
 # DP=8 mirrors what the now-deleted
-# tests/functional_tests/test_cases/gpt/gpt_dynamic_inference_tp1_pp1_dp8_583m_throughputtest_zmq/
+# tests/functional_tests/test_cases/core/models/gpt/gpt_dynamic_inference_tp1_pp1_dp8_583m_throughputtest_zmq/
 # used to cover — exercises the multi-rank dynamic-batching path through the
 # ZMQ DP coordinator, not just the single-GPU efficient case.
 #

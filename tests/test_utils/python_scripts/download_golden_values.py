@@ -12,6 +12,11 @@ import click
 import gitlab
 import requests
 
+if __package__:
+    from .recipe_parser import functional_test_case_dir
+else:
+    from recipe_parser import functional_test_case_dir
+
 BASE_PATH = pathlib.Path(__file__).parent.resolve()
 PROJECT_ID = int(os.getenv("CI_PROJECT_ID", 19378))
 GITHUB_REPO = os.getenv("GITHUB_REPOSITORY", "NVIDIA/Megatron-LM")
@@ -94,11 +99,7 @@ def download_from_gitlab(pipeline_id: int, only_failing: bool):
                 )
 
                 golden_values_target = (
-                    pathlib.Path("tests")
-                    / "functional_tests"
-                    / "test_cases"
-                    / job.stage
-                    / job.name
+                    functional_test_case_dir(job.stage, job.name, repo_root=pathlib.Path.cwd())
                     / golden_values_source_name
                 )
 
@@ -362,11 +363,7 @@ def _move_golden_values(golden_values_files: list, stage: str, test_name: str) -
 
     for golden_values_file in golden_values_files:
         golden_values_target = (
-            pathlib.Path("tests")
-            / "functional_tests"
-            / "test_cases"
-            / stage
-            / test_name
+            functional_test_case_dir(stage, test_name, repo_root=pathlib.Path.cwd())
             / golden_values_file.name
         )
 

@@ -1037,5 +1037,5 @@ is the opposite of the `MegatronLLM` constructor default.
 - Weight refit and resharding: [`megatron/core/resharding/README.md`](https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/core/resharding/README.md)
 - MoE router replay: [`docs/api-guide/router_replay.md`](api-guide/router_replay.md)
 - MoE routing trace tooling: [`examples/inference/README.md`](https://github.com/NVIDIA/Megatron-LM/blob/main/examples/inference/README.md)
-- Functional tests: `tests/functional_tests/test_cases/gpt/gpt_offline_inference_*`, `gpt_inference_server_smoke_*`, `gpt_dynamic_inference_*`, `tests/functional_tests/test_cases/hybrid/hybrid_dynamic_inference_*`
+- Functional tests: `tests/functional_tests/test_cases/core/models/gpt/gpt_offline_inference_*`, `gpt_inference_server_smoke_*`, `gpt_dynamic_inference_*`, `tests/functional_tests/test_cases/core/models/hybrid/hybrid_dynamic_inference_*`
 - Unit tests: `tests/unit_tests/inference/`

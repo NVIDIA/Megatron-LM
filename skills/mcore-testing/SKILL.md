@@ -30,16 +30,34 @@ For questions about disabling tests without deleting them:
 tests/
 ├── unit_tests/          # pytest, 1 node × 8 GPUs, torch.distributed runner
 ├── functional_tests/    # end-to-end shell + training scripts
-│   └── test_cases/
-│       └── {model}/{test_case}/
-│           ├── model_config.yaml          # training args
-│           └── golden_values_{env}_{platform}.json
+│   ├── test_cases/
+│   │   ├── core/
+│   │   │   ├── models/
+│   │   │   │   └── {bert,gpt,hybrid,mimo,multimodal,T5}/{test_case}/
+│   │   │   │       ├── model_config.yaml  # training args
+│   │   │   │       └── golden_values_{env}_{platform}.json
+│   │   │   └── transformer/moe/{test_case}/
+│   │   ├── ckpt_converter/               # external tool scenario bundle
+│   │   └── gpt-nemo/                     # external NeMo scenario bundles
+│   ├── shell_test_utils/                # shared shell runners
+│   └── python_test_utils/               # shared output validation
 └── test_utils/
     ├── recipes/
     │   ├── h100/        # YAML recipes for H100 jobs
     │   └── gb200/       # YAML recipes for GB200 jobs
     └── python_scripts/  # helpers (recipe_parser, golden-value download, …)
 ```
+
+Package directories under `functional_tests/test_cases/` mirror `megatron/`.
+Each scenario keeps its config, scripts, and golden values together in a named
+subdirectory. Scenario directories, the external `ckpt_converter/` bundle, and
+the original `gpt-nemo/` hierarchy are exceptions to package mirroring.
+GPT and Mixtral scenarios live under `core/models/gpt/`; hybrid and
+Nemotron scenarios live under `core/models/hybrid/`; MoE scenarios and the
+`moe_perf/` bundle live under `core/transformer/moe/`. Shared Python and shell
+helpers remain in
+`tests/functional_tests/python_test_utils/` and
+`tests/functional_tests/shell_test_utils/`.
 
 ---
 
@@ -78,7 +96,7 @@ maintainers: [mcore]
 loggers: [stdout]
 spec:
   name: "{test_case}_{environment}_{platforms}"
-  model: gpt              # maps to tests/functional_tests/test_cases/{model}/
+  model: gpt              # logical model name; recipe parsing resolves its directory
   build: mcore-pyt-{environment}
   nodes: 1
   gpus: 8
@@ -98,7 +116,10 @@ products:
 ```
 
 Key runtime placeholders: `{assets_dir}`, `{artifacts_dir}`, `{test_case}`,
-`{environment}`, `{platforms}`, `{n_repeat}`.
+`{environment}`, `{platforms}`, `{n_repeat}`, `{functional_test_case_dir}`.
+`{functional_test_case_dir}` resolves to the scenario directory, for example
+`tests/functional_tests/test_cases/core/models/gpt/{test_case}` for `model: gpt`.
+Recipe model names and test-case names remain independent of package paths.
 
 ### Disabling a Test Without Deleting It
 
@@ -183,7 +204,9 @@ For ad-hoc runs, prefer the direct `torch.distributed.run` invocations above.
 
 ## Adding a Functional / Integration Test
 
-1. Create `tests/functional_tests/test_cases/<model>/<test_name>/`.
+1. Create a scenario directory under the matching Megatron package, for
+   example `tests/functional_tests/test_cases/core/models/gpt/<test_name>/` or
+   `tests/functional_tests/test_cases/core/transformer/moe/<test_name>/`.
 2. Write `model_config.yaml` with `MODEL_ARGS`, `ENV_VARS`, and `TEST_TYPE`.
 3. Add a YAML recipe under `tests/test_utils/recipes/h100/` (and `gb200/` if
    needed). Required fields: `scope`, `environment`, `platform`, `n_repeat`,

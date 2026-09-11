@@ -127,7 +127,11 @@ CLI flags below are verified to exist in `megatron/training/arguments.py` and/or
 
 ## Coverage Matrix
 
-Existing tests live in `tests/functional_tests/test_cases/{gpt,hybrid,moe}/gpt_dynamic_inference_*` and `*_dynamic_inference_*` (the `moe/` ones happen to start with `gpt_` due to model_type).
+Existing tests live under `tests/functional_tests/test_cases/core/models/gpt/`,
+`tests/functional_tests/test_cases/core/models/hybrid/`, and
+`tests/functional_tests/test_cases/core/transformer/moe/` in scenario directories named
+`gpt_dynamic_inference_*` or `*_dynamic_inference_*` (the MoE ones happen to
+start with `gpt_` due to model_type).
 
 Legend: ✅ tested · ⚠️ partially tested · ❌ no test
 
@@ -182,9 +186,13 @@ Legend: ✅ tested · ⚠️ partially tested · ❌ no test
 These are the candidate test cases. **Awaiting sign-off** before I create `model_config.yaml`s and run them.
 
 Per the testing skill, each new test requires:
-1. `tests/functional_tests/test_cases/<model>/<test_case>/model_config.yaml`
-2. `tests/functional_tests/test_cases/<model>/<test_case>/golden_values_dev_dgx_h100.json`
+1. `tests/functional_tests/test_cases/<package_path>/<test_case>/model_config.yaml`
+2. `tests/functional_tests/test_cases/<package_path>/<test_case>/golden_values_dev_dgx_h100.json`
 3. An entry in `tests/test_utils/recipes/h100/<model>-dynamic-inference.yaml`
+
+Use `core/models/gpt`, `core/models/hybrid`, or `core/transformer/moe` for
+`<package_path>` according to the model family; recipe `<model>` names remain
+`gpt`, `hybrid`, and `moe`.
 
 I will generate golden values by running each test on cw-dfw and capturing `INFERENCE_OUTPUT_PATH`. The configs include `--deterministic-mode: true` so the output should be reproducible.
 
@@ -239,7 +247,7 @@ If we want a minimum-credible-coverage first round:
 
 | # | Issue | Where | Severity | Notes |
 |---|---|---|---|---|
-| 1 | Pre-existing test `gpt_dynamic_inference_tp1_pp1_583m_logitsmatch` is broken | `tests/functional_tests/test_cases/gpt/gpt_dynamic_inference_tp1_pp1_583m_logitsmatch/model_config.yaml` | High | Passes 3 flags that `gpt_dynamic_inference.py` no longer accepts: `--inference-dynamic-batching-max-requests-override`, `--inference-dynamic-batching-buffer-guaranteed-fraction`, `--inference-dynamic-batching-buffer-overflow-factor`. These were removed from `arguments.py`. Fix: either remove the flags from the test config or restore them in args. |
+| 1 | Pre-existing test `gpt_dynamic_inference_tp1_pp1_583m_logitsmatch` is broken | `tests/functional_tests/test_cases/core/models/gpt/gpt_dynamic_inference_tp1_pp1_583m_logitsmatch/model_config.yaml` | High | Passes 3 flags that `gpt_dynamic_inference.py` no longer accepts: `--inference-dynamic-batching-max-requests-override`, `--inference-dynamic-batching-buffer-guaranteed-fraction`, `--inference-dynamic-batching-buffer-overflow-factor`. These were removed from `arguments.py`. Fix: either remove the flags from the test config or restore them in args. |
 | 2 | Inference test default GPU count is brittle | `tests/functional_tests/shell_test_utils/_run_training.sh:170` | Medium | `GPUS_PER_NODE=${GPUS_PER_NODE:-8}` defaults to 8 even when the recipe specifies `gpus: 1`. Cog's `--gpus N` doesn't propagate. Workaround: set `GPUS_PER_NODE=<n>` as an env var in the command. Long-term: read from `SLURM_GPUS_ON_NODE` if set. |
 | 3 | `_dgx_h100` golden values are missing for many tests | repo-wide | Medium | Many tests only ship `golden_values_dev_dgx_a100.json`. CI sed-normalizes `dgx_h100 → dgx_a100`, but cross-hardware deterministic comparison then fails on H100. We should record H100 goldens for the new tests we add. |
 | 4 | Chunked prefill asserts `max_tokens >= max_requests` | `megatron/core/inference/contexts/dynamic_context.py` (assert in DynamicContext init) | Low | Setting `--inference-dynamic-batching-max-tokens 64` to force chunking on an 80-token prompt is incompatible with the default `max_requests=256`. Workaround: set both equal. Worth documenting near the CLI help text. |
