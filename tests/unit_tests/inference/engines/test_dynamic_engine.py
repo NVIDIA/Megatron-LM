@@ -104,6 +104,7 @@ class _ImageOnlyCapabilityWrapper:
 )
 def test_add_request_rejects_unsupported_media_before_tokenization(kwargs, modality):
     engine = object.__new__(DynamicInferenceEngine)
+    engine.requests = {}
     wrapper = _ImageOnlyCapabilityWrapper()
     if modality == "image":
         wrapper.supports_image = False
