@@ -124,6 +124,33 @@ def test_from_config_creates_independent_target_config_without_reinitializing():
     assert config.dynamic_value == {"items": []}
 
 
+def _make_softcap_config(attn_logit_softcapping) -> TransformerConfig:
+    return TransformerConfig(
+        num_layers=1,
+        hidden_size=128,
+        num_attention_heads=4,
+        attn_logit_softcapping=attn_logit_softcapping,
+    )
+
+
+@pytest.mark.parametrize("softcap", [None, 50.0])
+def test_attn_logit_softcapping_accepts_none_and_positive_values(softcap):
+    """None disables softcapping; any positive finite cap is a real cap."""
+    assert _make_softcap_config(softcap).attn_logit_softcapping == softcap
+
+
+@pytest.mark.parametrize("softcap", [0.0, -50.0, float("inf")])
+def test_attn_logit_softcapping_rejects_invalid_values(softcap):
+    """Values the attention backends disagree about must not reach a kernel.
+
+    0.0 disables softcapping in TransformerEngine but collapses every logit to zero
+    in the local path, a negative cap is applied as its absolute value locally while
+    FlashAttention ignores it, and a non-finite cap yields NaN logits.
+    """
+    with pytest.raises(ValueError, match="attn_logit_softcapping must be"):
+        _make_softcap_config(softcap)
+
+
 @pytest.mark.parametrize("num_householder", [0, -1])
 def test_gdp_num_householder_rejects_non_positive_values(num_householder: int):
     with pytest.raises(ValueError, match="gdp_num_householder must be positive"):

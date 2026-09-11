@@ -20,7 +20,7 @@ from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
-from megatron.core.transformer.attention import SelfAttention
+from megatron.core.transformer.attention import Attention, SelfAttention
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.utils import is_te_min_version, unwrap_model
 from megatron.training.arguments import parse_args
@@ -806,3 +806,203 @@ def test_qk_layernorm_spec_config_mismatch_raises():
             SelfAttention(config, submodules, layer_number=1)
     finally:
         Utils.destroy_model_parallel()
+
+
+class TestFlashDecodeSoftcapPlumbing:
+    """The direct flash-attention paths bypass core_attention, so the cap must be passed there.
+
+    Asserted by interception rather than by numerics: what matters is that the kwarg carries the
+    configured value, and that it is absent entirely when softcapping is off, so runs that do not
+    use it keep working against flash-attn builds that predate the kwarg.
+    """
+
+    def _call_flash_decode(self, softcap, kernel):
+        """Invoke Attention.flash_decode with a stub self, returning the kernel's kwargs."""
+        attn = mock.Mock()
+        attn.config.attn_logit_softcapping = softcap
+        attn._get_inference_softmax_offset.return_value = None
+        t = torch.zeros(2, 1, 4, 8)
+        with (
+            mock.patch("megatron.core.transformer.attention.flash_attn_with_kvcache", kernel),
+            mock.patch("megatron.core.transformer.attention.is_fa_min_version", return_value=True),
+        ):
+            Attention.flash_decode(
+                attn,
+                sequence_len_offset=torch.tensor([1]),
+                query_layer=t,
+                key_layer=t,
+                value_layer=t,
+                inference_key_memory=t,
+                inference_value_memory=t,
+                rotary_cos=None,
+                rotary_sin=None,
+            )
+        return kernel.call_args.kwargs
+
+    def test_softcap_is_passed_when_configured(self):
+        kernel = mock.Mock(return_value=torch.zeros(2, 1, 4, 8))
+        kwargs = self._call_flash_decode(50.0, kernel)
+        assert kwargs["softcap"] == 50.0
+
+    def test_softcap_kwarg_is_absent_when_disabled(self):
+        """Omitted, not passed as 0.0, so older flash-attn builds are unaffected."""
+        kernel = mock.Mock(return_value=torch.zeros(2, 1, 4, 8))
+        kwargs = self._call_flash_decode(None, kernel)
+        assert "softcap" not in kwargs
+
+
+class TestFlashAttention3SoftcapWrapper:
+    """The FA3 wrapper filters kwargs against the runtime signature, which can drop the cap.
+
+    That filtering exists because FA3 build signatures vary, so a build without `softcap`
+    would discard it silently and run uncapped. Every other call site fails loudly instead,
+    so this one is asserted rather than left to the filter.
+    """
+
+    def _wrapper(self, softcap, fake_forward):
+        attn = mock.Mock()
+        attn.config.attn_logit_softcapping = softcap
+        attn.batch_invariant_mode = False
+        t = torch.zeros(2, 4, 8)
+        with mock.patch(
+            "megatron.core.transformer.attention._flash_attn_forward", fake_forward, create=True
+        ):
+            return Attention._flash_attention_3_forward_wrapper(
+                attn,
+                q=t,
+                k=t,
+                v=t,
+                max_seqlen_q=2,
+                max_seqlen_k=2,
+                cu_seqlens_q=None,
+                seqlens_k=None,
+                block_table=None,
+                softmax_scale=1.0,
+            )
+
+    def test_cap_reaches_a_softcap_capable_build(self):
+        seen = {}
+
+        def fake_forward(q, k, v, softmax_scale, causal, softcap):
+            seen["softcap"] = softcap
+            return torch.zeros_like(q)
+
+        self._wrapper(50.0, fake_forward)
+        assert seen["softcap"] == 50.0
+
+    def test_build_without_softcap_raises_instead_of_dropping_the_cap(self):
+        def fake_forward(q, k, v, softmax_scale, causal):
+            return torch.zeros_like(q)
+
+        with pytest.raises(AssertionError, match="does not accept softcap"):
+            self._wrapper(50.0, fake_forward)
+
+    def test_build_without_softcap_is_fine_when_no_cap_is_configured(self):
+        """Only the combination is rejected, so existing users are unaffected."""
+
+        def fake_forward(q, k, v, softmax_scale, causal):
+            return torch.zeros_like(q)
+
+        self._wrapper(None, fake_forward)
+
+
+class TestFlashDecodeAndPrefillSoftcap:
+    """The cap must reach every kernel flash_decode_and_prefill can dispatch to.
+
+    There are four such call sites, reached by crossing prefill/decode with the FA4 and
+    non-FA4 branches, and each passes the cap separately. Deleting it from any one of them
+    leaves the other three passing, so each site is driven independently here.
+    """
+
+    # site -> (is_decode_only, (use_fa4, use_fa3), patched kernel, returns a tuple)
+    _SITES = {
+        "prefill_fa4": (False, (True, False), "flash_attn4_varlen_func", True),
+        "prefill_fa2": (False, (False, False), "flash_attn_varlen_func", False),
+        "decode_fa4": (True, (True, False), "flash_attn4_varlen_func", True),
+        "decode_kvcache": (True, (False, False), "flash_attn_with_kvcache", False),
+    }
+
+    def _drive(self, site, softcap):
+        """Run flash_decode_and_prefill down one branch, returning the kernel's kwargs."""
+        is_decode_only, flash_version, kernel_name, returns_tuple = self._SITES[site]
+
+        config = TransformerConfig(
+            num_layers=1, hidden_size=128, num_attention_heads=4, attn_logit_softcapping=softcap
+        )
+        attn = mock.Mock()
+        attn.config = config
+        attn.layer_number = 1
+        attn.batch_invariant_mode = False
+        attn.softmax_scale = 1.0
+        attn.training = False  # the function asserts this before dispatching
+        attn._resolve_flash_version.return_value = flash_version
+
+        # (num_requests * tokens_per_request, 1, heads, head_dim), which both branches accept:
+        # prefill squeezes dim 1, decode reshapes on seqlens_k.shape[0] requests.
+        q = torch.zeros(2, 1, 4, 8)
+        kv = torch.zeros(2, 4, 8)
+        out = torch.zeros(2, 4, 8) if not is_decode_only else torch.zeros(2, 1, 4, 8)
+        if is_decode_only and returns_tuple:
+            out = torch.zeros(2, 4, 8)  # FA4 decode reshapes the varlen output itself
+
+        kernel = mock.Mock(return_value=(out, torch.zeros(4, 2)) if returns_tuple else out)
+        with mock.patch(f"megatron.core.transformer.attention.{kernel_name}", kernel):
+            Attention.flash_decode_and_prefill(
+                attn,
+                q=q,
+                k=kv,
+                v=kv,
+                max_seqlen_q=1,
+                max_seqlen_k=2,
+                cu_seqlens_q=torch.tensor([0, 1, 2], dtype=torch.int32),
+                cu_seqlens_k=torch.tensor([0, 2, 4], dtype=torch.int32),
+                seqlens_k=torch.tensor([2, 2], dtype=torch.int32),
+                block_table=torch.zeros(2, 4, dtype=torch.int32),
+                is_decode_only=is_decode_only,
+            )
+        return kernel.call_args.kwargs
+
+    @pytest.mark.parametrize("site", list(_SITES))
+    def test_cap_reaches_every_dispatch_site(self, site):
+        assert self._drive(site, 50.0)["softcap"] == 50.0
+
+    @pytest.mark.parametrize("site", list(_SITES))
+    def test_cap_kwarg_is_omitted_at_every_site_when_disabled(self, site):
+        """Omitted rather than passed as 0.0, so older flash-attn builds still work."""
+        assert "softcap" not in self._drive(site, None)
+
+
+class TestFlashMLASoftcapRejected:
+    """FlashMLA has no softcap support, so the combination must fail rather than half-apply.
+
+    Without this the cap would be applied in prefill, which shares the non-MLA path, and
+    silently dropped in decode, inside a single forward.
+    """
+
+    def test_mla_decode_rejects_a_configured_cap(self):
+        from megatron.core.transformer.transformer_config import MLATransformerConfig
+
+        attn = mock.Mock()
+        attn.config = MLATransformerConfig(
+            num_layers=1, hidden_size=128, num_attention_heads=4, attn_logit_softcapping=50.0
+        )
+        attn.layer_number = 1
+        attn.batch_invariant_mode = False
+        attn.softmax_scale = 1.0
+        attn.training = False
+        attn._resolve_flash_version.return_value = (False, False)
+
+        with pytest.raises(AssertionError, match="does not support attention logit softcapping"):
+            Attention.flash_decode_and_prefill(
+                attn,
+                q=torch.zeros(2, 1, 4, 8),
+                k=torch.zeros(2, 4, 8),
+                v=torch.zeros(2, 4, 8),
+                max_seqlen_q=1,
+                max_seqlen_k=2,
+                cu_seqlens_q=torch.tensor([0, 1, 2], dtype=torch.int32),
+                cu_seqlens_k=torch.tensor([0, 2, 4], dtype=torch.int32),
+                seqlens_k=torch.tensor([2, 2], dtype=torch.int32),
+                block_table=torch.zeros(2, 4, dtype=torch.int32),
+                is_decode_only=True,
+            )
