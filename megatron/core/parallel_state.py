@@ -446,9 +446,18 @@ def create_hybrid_dp_cp_groups(rank, ranks, pg_options):
     hybrid_dp_cp_groups = {}
     # Generate group for every power of 2 up to the number of CP ranks
     # We limit the allowed group sizes in order to avoid excessive overhead.
-    group_sizes = [2**i for i in range(int(log2(len(ranks))))][1:]
+    # Include the largest usable power of two when the full DPxCP domain is not
+    # itself a power of two (e.g. n=6 must expose a size-4 group). Using
+    # ``int(log2(n))`` as the exclusive range bound omitted that group and made
+    # valid long samples fail at runtime with a missing communicator.
+    group_sizes = [2**i for i in range(1, int(log2(len(ranks) - 1)) + 1)]
     for group_size in group_sizes:
         for i in range(0, len(ranks), group_size):
+            # The final slice may be smaller than ``group_size`` when the
+            # DPxCP domain is not a power of two. It is not a valid
+            # communicator for this key and must not be exposed as one.
+            if len(ranks[i : i + group_size]) != group_size:
+                continue
             group = create_group(
                 ranks[i : i + group_size],
                 pg_options=pg_options,
