@@ -102,3 +102,30 @@ def test_fused_adam_adapter_accepts_mismatched_grads(distributed_setup):
         not torch.equal(parameter_before, parameter.detach())
         for parameter_before, parameter in zip(params_before_step, model.parameters())
     )
+
+
+def test_filter_params_for_norm_drops_shared_duplicate():
+    """A tied parameter's PP-split duplicate must not count in gradient statistics.
+
+    With PP > 1 the tied embedding/output weight exists as two distinct parameters: the
+    first stage's embedding, and the last stage's duplicate that ``LanguageModule`` marks
+    with ``shared = True``. Both carry the same gradient, so a statistic summed over the
+    grad-stats group would count it twice and report ``sqrt(2)`` too large a norm -- the
+    7.071-instead-of-5 reproduction. ``_filter_params_for_norm`` must keep the unmarked
+    copy and drop the marked one.
+
+    Pure parameter bookkeeping, so this needs no CUDA and no multi-rank setup.
+    """
+    from megatron.core.optimizer.fully_sharded_optimizer import _filter_params_for_norm
+
+    embedding = nn.Parameter(torch.zeros(4, 4))
+    output_weight = nn.Parameter(torch.zeros(4, 4))
+    output_weight.shared = True
+
+    # Identity, not ==: comparing Parameters elementwise would be a tensor op.
+    kept = _filter_params_for_norm([embedding, output_weight])
+    assert len(kept) == 1
+    assert kept[0] is embedding
+    # An unmarked parameter is never dropped, so the filter is inert without a tie.
+    assert _filter_params_for_norm([embedding]) == [embedding]
+    assert _filter_params_for_norm([]) == []

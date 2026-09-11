@@ -12,7 +12,7 @@ from ..dist_checkpointing.mapping import ShardedStateDict
 from ..distributed.fsdp.src.megatron_fsdp.experimental.parameter_group import (
     sync_model_weights_from_main_weights,
 )
-from ..transformer.module import MegatronModule
+from ..transformer.module import MegatronModule, param_is_not_shared
 from .grad_scaler import MegatronGradScaler
 from .optimizer import MixedPrecisionOptimizer
 from .optimizer_config import OptimizerConfig
@@ -38,6 +38,17 @@ def count_replication(tensor: DTensor) -> int:
                 "the reduction must be finalized first."
             )
     return replication
+
+
+def _filter_params_for_norm(params: List[torch.nn.Parameter]) -> List[torch.nn.Parameter]:
+    """Drop the duplicate copy of a tied parameter from a global gradient statistic.
+
+    With PP > 1 the tied embedding/output weight is two distinct parameters on
+    different pipeline stages, and ``LanguageModule`` marks the duplicate
+    ``shared = True``. Mesh replicas (tensor-parallel and generalized-TP included)
+    need no filtering: ``count_replication`` already divides them out.
+    """
+    return [param for param in params if param_is_not_shared(param)]
 
 
 class FullyShardedOptimizer(MixedPrecisionOptimizer):
@@ -152,11 +163,14 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
         replaces each DTensor with ``grad._local_tensor`` before it runs, so
         ``get_data_parallel_group_if_dtensor`` always sees plain tensors, returns None,
         and the layout is gone by the time the norm is taken.
+
+        Duplicate copies of tied parameters are dropped by ``_filter_params_for_norm``,
+        so each logical gradient is counted once.
         """
         total_norm_squared = torch.zeros(
             (), dtype=torch.float32, device=torch.cuda.current_device()
         )
-        for parameter in self.get_parameters():
+        for parameter in _filter_params_for_norm(self.get_parameters()):
             # MFSDP v2 reduces into parameter.grad; it never populates decoupled_grad,
             # which is a v1 param-and-grad-buffer concept.
             grad = parameter.grad
@@ -183,9 +197,12 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
         DTensor-derived data-parallel group. Counting here keeps MFSDP v2 off that path,
         and matches how ``get_grad_norm`` reduces: each rank contributes its own shard,
         divided by the size of any replicated mesh axis, summed over the grad-stats group.
+
+        Duplicate copies of tied parameters are dropped by ``_filter_params_for_norm``,
+        so each logical gradient is counted once.
         """
         total_zeros = torch.zeros((), dtype=torch.float32, device=torch.cuda.current_device())
-        for parameter in self.get_parameters():
+        for parameter in _filter_params_for_norm(self.get_parameters()):
             grad = parameter.grad
             if grad is None:
                 continue
