@@ -1190,10 +1190,6 @@ class _HybridEPManager(_DispatchManager):
         routing_map = torch.zeros_like(probs, dtype=torch.bool).scatter(1, index, True)
         return routing_map, None, probs
 
-    def _quantization_alignment(self) -> int:
-        """Return the per-expert segment alignment HybridEP pads to."""
-        return get_align_size_for_quantization(self.config)
-
     def dispatch(
         self,
         hidden_states: torch.Tensor,
@@ -1207,7 +1203,7 @@ class _HybridEPManager(_DispatchManager):
                     "HybridEP only supports float32 probs, please set --moe-router-dtype=fp32"
                 )
             self.token_probs = self.token_probs.float()  # downcast or upcast
-        align_size = self._quantization_alignment()
+        align_size = get_align_size_for_quantization(self.config)
         if align_size > 0:
             self.pad_multiple = align_size
         if self._padded_num_tokens is not None and hidden_states.shape[0] < self._padded_num_tokens:
