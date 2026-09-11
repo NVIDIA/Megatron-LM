@@ -123,8 +123,8 @@ def create_hypercomm_grid(offset=0, tp=1, cp=1, pp=1, dp=1, gtp_remat=1):
         os.environ["WORLD_SIZE"] = "8"
 
     grid = HyperCommGrid(
-        shape=[tp, gtp_remat, cp, pp, dp],
-        dim_names=["tp", "gtp_remat", "cp", "pp", "dp"],
+        shape=[tp, cp, gtp_remat, pp, dp],
+        dim_names=["tp", "cp", "gtp_remat", "pp", "dp"],
         rank_offset=offset,
         backend="nccl",
     )
@@ -270,6 +270,73 @@ class TestBridgeCommunicatorSplitMetadata:
         with pytest.raises(ValueError, match="expected 3 tensors for shape communication, got 2"):
             BridgeCommunicator._as_per_peer_tensors(tensors, expected_count=3)
 
+    @pytest.mark.parametrize(
+        "op, expected_callable",
+        [("send", torch.distributed.isend), ("recv", torch.distributed.irecv)],
+    )
+    def test_batched_payload_launches_all_peers_before_waiting(
+        self, monkeypatch, op, expected_callable
+    ):
+        bridge = self._bridge()
+        bridge.bridge_pg = object()
+        peers = [17, 5, 29]
+        tensors = [torch.empty((3, 2)), torch.empty((0, 2)), torch.empty((7, 2))]
+        created_ops = []
+        calls = []
+
+        class FakeOp:
+            def __init__(self, p2p_op, tensor, peer, group):
+                self.op = p2p_op
+                self.tensor = tensor
+                self.peer = peer
+                self.group = group
+                created_ops.append(self)
+                calls.append(("construct", peer))
+
+        class FakeWork:
+            def __init__(self, index):
+                self.index = index
+
+            def wait(self):
+                assert len(created_ops) == len(peers)
+                calls.append(("wait", self.index))
+
+        def fake_batch(ops):
+            assert list(ops) == created_ops
+            calls.append(("launch", tuple(item.peer for item in ops)))
+            return [FakeWork(index) for index in range(len(ops))]
+
+        monkeypatch.setattr(torch.distributed, "P2POp", FakeOp)
+        monkeypatch.setattr(torch.distributed, "batch_isend_irecv", fake_batch)
+
+        bridge._run_batched_payload_p2p(tensors, peers, op=op)
+
+        assert calls == [
+            ("construct", 17),
+            ("construct", 5),
+            ("construct", 29),
+            ("launch", (17, 5, 29)),
+            ("wait", 0),
+            ("wait", 1),
+            ("wait", 2),
+        ]
+        assert [item.op for item in created_ops] == [expected_callable] * len(peers)
+        assert all(item.tensor is tensor for item, tensor in zip(created_ops, tensors))
+        assert [item.peer for item in created_ops] == peers
+        assert all(item.group is bridge.bridge_pg for item in created_ops)
+
+    def test_batched_payload_rejects_invalid_mapping_before_launch(self, monkeypatch):
+        bridge = self._bridge()
+        bridge.bridge_pg = object()
+        monkeypatch.setattr(
+            torch.distributed,
+            "batch_isend_irecv",
+            lambda _ops: (_ for _ in ()).throw(AssertionError("invalid batch was launched")),
+        )
+
+        with pytest.raises(ValueError, match="one payload tensor per peer"):
+            bridge._run_batched_payload_p2p([torch.empty(1)], [4, 5], op="send")
+
 
 class TestBridgeCommunicator:
 
@@ -338,6 +405,25 @@ class TestBridgeCommunicator:
             dist.get_process_group_ranks(bridge.bridge_pg)
         )
 
+    def test_destination_cp_topology(self):
+        """Destination CP keeps DP-based routing and reduces only on the leader TP lane."""
+        src_grid = create_hypercomm_grid(offset=0, tp=1, cp=1, pp=1, dp=4)
+        dest_grid = create_hypercomm_grid(offset=4, tp=2, cp=2, pp=1, dp=1)
+        bridge = BridgeCommunicator(src_grid, dest_grid, comm_dtype=torch.float32)
+
+        assert bridge.dest_tp_leaders == [4]
+        assert bridge.get_boundary_pp_stage_ranks(dest_grid, is_src=False) == [[4, 6, 5, 7]]
+
+        rank = dist.get_rank()
+        expected_broadcast_ranks = [4, 6, 5, 7] if rank >= 4 else []
+        assert bridge.dest_grid_broadcast_ranks == expected_broadcast_ranks
+
+        if rank in (4, 6):
+            assert bridge.dest_cp_reduce_pg is not None
+            assert dist.get_process_group_ranks(bridge.dest_cp_reduce_pg) == [4, 6]
+        else:
+            assert bridge.dest_cp_reduce_pg is None
+
     def test_send_forward_recv_forward(self):
         """Test send_forward and recv_forward operations."""
 
@@ -381,6 +467,56 @@ class TestBridgeCommunicator:
                 128,
                 512,
             ), f"Expected gradient shape {(4, 128, 512)}, got {received_gradient.shape}"
+
+    def test_cp_gradient_reconstruction(self):
+        """Complementary destination-CP gradients are summed before fan-in splitting."""
+        src_grid = create_hypercomm_grid(offset=0, tp=1, cp=1, pp=1, dp=4)
+        dest_grid = create_hypercomm_grid(offset=4, tp=2, cp=2, pp=1, dp=1)
+        bridge = BridgeCommunicator(src_grid, dest_grid, comm_dtype=torch.float32, tensor_ndim=2)
+
+        rows_per_chunk = 2
+        hidden_size = 3
+        chunk_values = (1.0, -2.0, 3.0, -4.0)
+        payload_shape = (4 * rows_per_chunk, hidden_size)
+        expected_source_shape = (rows_per_chunk, hidden_size)
+        source_shape_matches = True
+        source_values_match = True
+
+        if bridge.is_current_rank_in_grid(dest_grid):
+            cp_rank = dist.get_rank(group=dest_grid.get_pg("cp"))
+            owned_chunks = (0, 3) if cp_rank == 0 else (1, 2)
+            local_gradient = torch.zeros(payload_shape, device="cuda", dtype=torch.float32)
+            for chunk_idx in owned_chunks:
+                chunk_start = chunk_idx * rows_per_chunk
+                local_gradient[chunk_start : chunk_start + rows_per_chunk].fill_(
+                    chunk_values[chunk_idx]
+                )
+            bridge.send_backward(local_gradient)
+        else:
+            received_gradient = bridge.recv_backward()
+            source_shape_matches = received_gradient.shape == expected_source_shape
+            source_values_match = source_shape_matches and torch.equal(
+                received_gradient,
+                torch.full(
+                    expected_source_shape,
+                    chunk_values[dist.get_rank()],
+                    device="cuda",
+                    dtype=torch.float32,
+                ),
+            )
+
+        # Synchronize the exact source-side oracle only after every rank has completed its
+        # bridge role, so an assertion failure cannot strand another rank in bridge P2P.
+        source_checks = torch.tensor(
+            [source_shape_matches, source_values_match], device="cuda", dtype=torch.int32
+        )
+        dist.all_reduce(source_checks, op=dist.ReduceOp.MIN)
+        assert (
+            source_checks[0].item() == 1
+        ), f"Every source rank must receive fan-in split shape {expected_source_shape}"
+        assert (
+            source_checks[1].item() == 1
+        ), "Every source rank must receive its exact signed CP-reconstructed gradient chunk"
 
     def test_send_forward_recv_backward_send_backward_recv_forward(self):
         """Test combined send_forward_recv_backward and send_backward_recv_forward operations."""

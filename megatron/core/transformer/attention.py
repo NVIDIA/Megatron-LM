@@ -87,18 +87,17 @@ if not HAVE_FA3:
 # `flash_attn.cute.__version__` (which is 0.0.0), so we cannot use
 # `is_fa_min_version` here.
 _MIN_FA4_VERSION = "4.0.0b20"
+flash_attn4_varlen_func = None
 try:
     from importlib.metadata import PackageNotFoundError
     from importlib.metadata import version as _get_dist_version
 
-    from flash_attn.cute import flash_attn_varlen_func as flash_attn4_varlen_func
     from packaging.version import Version as _Version
 
-    try:
-        HAVE_FA4 = _Version(_get_dist_version("flash-attn-4")) >= _Version(_MIN_FA4_VERSION)
-    except PackageNotFoundError:
-        HAVE_FA4 = False
-except ImportError:
+    HAVE_FA4 = _Version(_get_dist_version("flash-attn-4")) >= _Version(_MIN_FA4_VERSION)
+    if HAVE_FA4:
+        from flash_attn.cute import flash_attn_varlen_func as flash_attn4_varlen_func
+except (ImportError, PackageNotFoundError):
     HAVE_FA4 = False
 
 try:
@@ -303,6 +302,7 @@ class Attention(MegatronModule, ABC):
         cp_comm_type: str | None = None,
         pg_collection: ProcessGroupCollection | None = None,
         pp_layer_offset: Optional[int] = None,
+        is_mtp_layer: bool = False,
         name: str | None = None,
     ):
         """
@@ -314,6 +314,7 @@ class Attention(MegatronModule, ABC):
         self.config = config
         self.layer_number = layer_number
         self._pp_layer_offset = pp_layer_offset
+        self.is_mtp_layer = is_mtp_layer
 
         self.attn_mask_type = attn_mask_type
         self.attention_type = attention_type
@@ -343,6 +344,9 @@ class Attention(MegatronModule, ABC):
                 pg_collection, 'cp'
             ), "Attention pg_collection must have cp process group"
         self.pg_collection = pg_collection
+        # Build-time CP group, kept so runtime (hybrid/dynamic) CP can restore
+        # it on microbatches that carry no per-microbatch CP group.
+        self._build_time_cp_group = pg_collection.cp
         self.tp_group = pg_collection.tp
 
         # Per attention head and per partition values
@@ -1159,7 +1163,20 @@ class Attention(MegatronModule, ABC):
             # the number of tokens per request. Reshape to (B, S, H, D) so the
             # decode kernel sees batch=num_requests and seqlen_q=tokens_per_request.
             num_requests = seqlens_k.shape[0]
-            tokens_per_request = q.shape[0] // num_requests
+            if self.batch_invariant_mode:
+                # Batch-invariant CUDA-graph buckets can append token-only padding so
+                # model-wide M dimensions stay aligned. Those rows do not represent
+                # requests and must not be passed to attention.
+                input_token_count = q.shape[0]
+                tokens_per_request = int(max_seqlen_q)
+                metadata_token_count = num_requests * tokens_per_request
+                assert metadata_token_count <= input_token_count, (
+                    "Batch-invariant decode metadata describes more query tokens "
+                    f"({metadata_token_count}) than q contains ({input_token_count})."
+                )
+                q = q[:metadata_token_count]
+            else:
+                tokens_per_request = q.shape[0] // num_requests
             q = q.reshape(num_requests, tokens_per_request, q.shape[2], q.shape[3])
 
             # If using MLA we use the FlashMLA kernel
@@ -1273,6 +1290,20 @@ class Attention(MegatronModule, ABC):
             output_total = output_total.reshape(
                 num_requests * tokens_per_request, 1, *output_total.shape[2:]
             )
+            if self.batch_invariant_mode:
+                padding_token_count = input_token_count - output_total.shape[0]
+                assert padding_token_count >= 0, (
+                    "Batch-invariant attention produced more query rows "
+                    f"({output_total.shape[0]}) than q contained ({input_token_count})."
+                )
+                if padding_token_count > 0:
+                    output_total = torch.cat(
+                        (
+                            output_total,
+                            output_total.new_zeros(padding_token_count, 1, *output_total.shape[2:]),
+                        ),
+                        dim=0,
+                    )
 
         return output_total
 
@@ -1501,6 +1532,20 @@ class Attention(MegatronModule, ABC):
                 cu_seqlens_q = cu_seqlens_kv = None
                 rope_freqs_max_seqlen = None
 
+            # Hybrid/dynamic CP: bind the sub-sample's runtime CP group
+            # (packed_seq_params.cp_group) on the process-group collection so
+            # RoPE below — and any other CP consumer in this forward — uses
+            # the group this microbatch was actually sharded with. The fused
+            # THD RoPE kernel takes the full cu_seqlens plus (cp_size,
+            # cp_rank) to locate this rank's zigzag slice, and the build-time
+            # group reports cp_size=1. Restore the build-time group when no
+            # runtime group is bound (e.g. local_cp_size == 1 sub-samples):
+            # the previous microbatch may have left a larger group behind.
+            if packed_seq_params is not None and packed_seq_params.cp_group is not None:
+                self.pg_collection.cp = packed_seq_params.cp_group
+            elif self.pg_collection.cp is not self._build_time_cp_group:
+                self.pg_collection.cp = self._build_time_cp_group
+
             if split_qkv:
                 if q_pos_emb is not None:
                     # TODO VIJAY: simplify
@@ -1668,6 +1713,7 @@ class SelfAttention(Attention):
         cp_comm_type: str | None = None,
         pg_collection: ProcessGroupCollection | None = None,
         pp_layer_offset: Optional[int] = None,
+        is_mtp_layer: bool = False,
         name: str | None = None,
     ):
         """
@@ -1683,6 +1729,7 @@ class SelfAttention(Attention):
             cp_comm_type=cp_comm_type,
             pg_collection=pg_collection,
             pp_layer_offset=pp_layer_offset,
+            is_mtp_layer=is_mtp_layer,
             name=name,
         )
 
@@ -2085,6 +2132,7 @@ class CrossAttention(Attention):
         attn_mask_type: AttnMaskType = AttnMaskType.padding,
         cp_comm_type: str | None = None,
         pg_collection: ProcessGroupCollection | None = None,
+        is_mtp_layer: bool = False,
         name: str | None = None,
     ):
         """
@@ -2099,6 +2147,7 @@ class CrossAttention(Attention):
             attention_type="cross",
             cp_comm_type=cp_comm_type,
             pg_collection=pg_collection,
+            is_mtp_layer=is_mtp_layer,
             name=name,
         )
 

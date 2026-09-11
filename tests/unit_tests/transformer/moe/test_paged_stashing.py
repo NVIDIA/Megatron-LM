@@ -19,7 +19,12 @@ from megatron.core.transformer.spec_utils import get_submodules
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_te_min_version
 from megatron.training.initialize import _set_random_seed
-from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.test_utilities import (
+    Utils,
+    is_nccl_ep_available,
+    is_nccl_ep_fp8_dispatch_available,
+    is_nccl_ep_zero_copy_available,
+)
 
 # These tests configure mxfp8 + the TE op fuser, so they only run on Blackwell (sm100+). Mark the
 # whole module for the GB200 CI bucket (selection there is marker-driven; see
@@ -118,6 +123,8 @@ class MoEModelTestContainer:
             moe_permute_fusion=kwargs.get("moe_permute_fusion", False),
             moe_flex_dispatcher_backend=kwargs.get("moe_flex_dispatcher_backend", None),
             moe_ncclep_zero_copy=kwargs.get("moe_ncclep_zero_copy", False),
+            moe_dispatch_fwd_dtype=kwargs.get("moe_dispatch_fwd_dtype", 'bf16'),
+            moe_combine_bwd_dtype=kwargs.get("moe_combine_bwd_dtype", 'bf16'),
             moe_grouped_gemm=kwargs.get("moe_grouped_gemm", False),
             moe_paged_stash=kwargs.get("moe_paged_stash", False),
             moe_expert_rank_capacity_factor=kwargs.get("moe_expert_rank_capacity_factor", None),
@@ -190,43 +197,6 @@ def is_hybrid_ep_available():
     from megatron.core.transformer.moe.fused_a2a import HAVE_HYBRIDEP
 
     return HAVE_HYBRIDEP
-
-
-def is_nccl_ep_zero_copy_available():
-    """Zero-copy needs the newer TE symm-mem APIs (symm_mem_alloc/is_symm_backed), absent in a plain
-    NCCL-EP build."""
-    if not is_nccl_ep_available():
-        return False
-    try:
-        from transformer_engine.pytorch.ep import is_symm_backed, symm_mem_alloc  # noqa: F401
-    except ImportError:
-        return False
-    return True
-
-
-def is_nccl_ep_available():
-    """NCCL EP built into TE, with the eager/drop-capable ``ep_bootstrap`` signature.
-
-    ``ensure_nccl_ep_bootstrapped`` always passes ``recv_capacity_per_rank`` and
-    ``drop_on_overflow``, so a TE predating that signature raises TypeError on the first
-    bootstrap for every ncclEP path -- static as much as eager. Gate on it here so such builds
-    skip cleanly instead of erroring. ``recv_capacity_per_rank`` must also be *optional*: that
-    is what makes eager (the over-budget replay) expressible.
-    """
-    from megatron.core.transformer.moe.fused_a2a import HAVE_TE_EP
-
-    if not HAVE_TE_EP:
-        return False
-
-    import inspect
-
-    from transformer_engine.pytorch.ep import ep_bootstrap
-
-    params = inspect.signature(ep_bootstrap).parameters
-    recv_capacity = params.get("recv_capacity_per_rank")
-    return (
-        recv_capacity is not None and recv_capacity.default is None and "drop_on_overflow" in params
-    )
 
 
 def _te_grouped_mlp_op_fuser_environment_supported() -> bool:
@@ -488,9 +458,9 @@ class TestNcclEpPagedStashing:
         Utils.destroy_model_parallel()
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    @pytest.mark.flaky_in_dev
     @pytest.mark.internal
-    def test_over_budget(self):
+    @pytest.mark.parametrize("wire_dtype", ["bf16", "mxfp8"])
+    def test_over_budget(self, wire_dtype):
         """Budget matches _NCCLEPManager._ensure_bootstrap; over_budget matches map-derived load.
 
         Mirrors TestPagedStashingOverBudget for HybridEP, plus the peak capacity NCCL EP
@@ -498,9 +468,15 @@ class TestNcclEpPagedStashing:
         never needs to know how much was required. The capacity factor is deliberately below
         1.0: each rank receives num_tokens*topk on average, so 1.0 sits exactly at the mean
         and anything under it overflows.
+
+        wire_dtype="mxfp8" runs the same overflow accounting with MXFP8 dispatch-fwd /
+        combine-bwd wire payloads (the opaque carrier); the budget arithmetic under test is
+        payload-dtype independent, so the assertions are unchanged.
         """
         if not is_nccl_ep_available():
             pytest.skip("NCCL EP is not available")
+        if wire_dtype == "mxfp8" and not is_nccl_ep_fp8_dispatch_available():
+            pytest.skip("NCCL EP MXFP8 wire needs EpBuffer quant-recipe support and MXFP8 hardware")
 
         config.ENABLE_EXPERIMENTAL = True
 
@@ -526,6 +502,8 @@ class TestNcclEpPagedStashing:
             moe_router_padding_for_quantization=True,
             gated_linear_unit=True,
             activation_func=F.silu,
+            moe_dispatch_fwd_dtype=wire_dtype,
+            moe_combine_bwd_dtype=wire_dtype,
         )
 
         seq_length = 1024
@@ -586,7 +564,6 @@ class TestNcclEpPagedStashing:
         nccl_ep_release_context()
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    @pytest.mark.flaky_in_dev
     @pytest.mark.internal
     @pytest.mark.parametrize("zero_copy", [False, True])
     def test_over_budget_recovery(self, zero_copy):
@@ -714,18 +691,22 @@ class TestNcclEpPagedStashing:
         torch.testing.assert_close(out_restored, out_replay, rtol=1e-2, atol=0)
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    # NCCL EP static-shape paged stashing aborts in dev CI with a pybind11 GIL dec_ref failure.
-    @pytest.mark.flaky_in_dev
     @pytest.mark.internal
     @pytest.mark.parametrize("zero_copy", [False, True])
-    def test_forward_backward_4_layers(self, zero_copy):
+    @pytest.mark.parametrize("wire_dtype", ["bf16", "mxfp8"])
+    def test_forward_backward_4_layers(self, zero_copy, wire_dtype):
         """Test paged stashing with 4 MoE layers on ncclep static shape: two passes match.
 
-        zero_copy=True additionally exercises the ncclEP symm-mem zero-copy IO under paged stash."""
+        zero_copy=True additionally exercises the ncclEP symm-mem zero-copy IO under paged stash.
+        wire_dtype="mxfp8" additionally sends the dispatch-fwd / combine-bwd payloads as the
+        MXFP8 carrier; both passes use the same wire dtype, so quantization is common-mode and
+        the two-pass determinism tolerance is unchanged."""
         if not is_nccl_ep_available():
             pytest.skip("NCCL EP is not available")
         if zero_copy and not is_nccl_ep_zero_copy_available():
             pytest.skip("NCCL EP zero-copy TE API is not available")
+        if wire_dtype == "mxfp8" and not is_nccl_ep_fp8_dispatch_available():
+            pytest.skip("NCCL EP MXFP8 wire needs EpBuffer quant-recipe support and MXFP8 hardware")
 
         config.ENABLE_EXPERIMENTAL = True
 
@@ -752,6 +733,8 @@ class TestNcclEpPagedStashing:
             gated_linear_unit=True,
             activation_func=F.silu,
             moe_ncclep_zero_copy=zero_copy,
+            moe_dispatch_fwd_dtype=wire_dtype,
+            moe_combine_bwd_dtype=wire_dtype,
         )
 
         seq_length = 1024

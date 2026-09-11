@@ -369,6 +369,14 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     pg_collection=self.pg_collection,
                     vp_stage=self.vp_stage,
                 )
+            if layer_config.enable_mhc_connections and not getattr(
+                module, "supports_mhc_connections", False
+            ):
+                raise ValueError(
+                    f"{type(module).__name__} does not implement mHC residual streams. Build "
+                    "TransformerBlock with HyperConnectionTransformerLayer when "
+                    "enable_mhc_connections=True."
+                )
             return module
 
         # offset is implicit in TransformerLayer

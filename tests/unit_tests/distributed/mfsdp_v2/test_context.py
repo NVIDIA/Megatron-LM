@@ -6,9 +6,9 @@ import pytest
 import torch
 from torch import nn
 from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.tensor import Shard
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
-    Flat,
     Placements,
     fully_shard,
     fully_shard_context,
@@ -72,7 +72,7 @@ class NestedSiblingModel(nn.Module):
 
 
 def _flat_placements() -> Placements:
-    return Placements(dp_axes=[0], parameter=[Flat()], gradient=[Flat()], optimizer=[Flat()])
+    return Placements(dp_axes=[0], parameter=[Shard(0)], gradient=[Shard(0)], optimizer=[Shard(0)])
 
 
 def test_child_then_parent_share_one_context(distributed_setup):
@@ -156,6 +156,22 @@ def test_nested_prefetch_orders_use_dfs(distributed_setup):
     context = model.context
     assert list(context.forward_order) == [model, model.left, model.left.inner, model.right]
     assert list(context.backward_order) == [model, model.right, model.left, model.left.inner]
+
+
+def test_register_post_backward_hook_handles_parameterless_module(distributed_setup):
+    """A parameterless FSDP unit should invoke the external scheduler callback."""
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    model = nn.Identity().to(device)
+
+    with fully_shard_context(device=device):
+        fully_shard(model, mesh=mesh, placements=_flat_placements(), register_hooks=False)
+
+    callback_modules = []
+    model.register_post_backward_hook(callback_modules.append)
+    model(torch.ones(2, 4, device=device, requires_grad=True)).sum().backward()
+
+    assert callback_modules == [model]
 
 
 def test_nested_and_sibling_roots_use_cross_root_orders(distributed_setup):

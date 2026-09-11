@@ -104,6 +104,13 @@ main() {
 
     unset PIP_CONSTRAINT
 
+    # torch-memory-saver builds CUDA-suffixed extensions and requires the CUDA major.
+    export TMS_CUDA_MAJOR="$("${CUDA_HOME:-/usr/local/cuda}"/bin/nvcc --version | sed -n 's/.*release \([0-9][0-9]*\).*/\1/p' | head -1)"
+    if [[ -z "$TMS_CUDA_MAJOR" ]]; then
+        echo "Error: failed to determine CUDA major from nvcc" >&2
+        exit 1
+    fi
+
     if [[ "$USE_UV" == "true" ]]; then
         if [[ "$BASE_IMAGE" == "pytorch" ]]; then
             UV_ARGS=(

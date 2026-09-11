@@ -9575,11 +9575,10 @@
         }
     },
     "iteration-time": {
-        "start_step": 1,
+        "start_step": 5,
         "end_step": 9535,
         "step_interval": 5,
         "values": {
-            "1": "nan",
             "5": 12.24801,
             "10": 12.14767,
             "15": 12.09623,

@@ -17,7 +17,6 @@ try:
 except ImportError:
     from megatron.core.telemetry.fallbacks import trace_fn as _otel_trace_fn
 
-from megatron.core._rank_utils import log_single_rank
 from megatron.core.transformer.cuda_graphs import is_graph_capturing
 from megatron.core.utils import nvtx_range_pop, nvtx_range_push
 
@@ -53,11 +52,12 @@ def _te_do_not_offload(tensor):
 def print_offload_summary_table(
     total_offload_bytes: Dict[str, int],
     local_duplicate_summary: Optional[Dict[str, Tuple[int, int]]] = None,
+    process_group: Optional[torch.distributed.ProcessGroup] = None,
 ):
     """
-    Print offload bytes and warn about duplicate copies across all ranks.
+    Print offload bytes and warn about duplicate copies across participating ranks.
 
-    Gathers both summaries in one object collective and reports them on rank 0.
+    Gathers both summaries in one object collective and reports them on group rank 0.
     The table has rows representing ranks and columns representing groups.
 
     The reported bytes are every byte copied to CPU, so a redundant copy of an
@@ -67,18 +67,19 @@ def print_offload_summary_table(
         total_offload_bytes: Dict mapping group names to offload bytes for this rank.
         local_duplicate_summary: Dict mapping group names to redundant-copy counts
             and bytes for this rank.
+        process_group: Ranks participating in fine-grained activation offloading.
     """
     # pylint: disable=bad-builtin
     assert torch.distributed.is_initialized()
-    rank = torch.distributed.get_rank()
-    world_size = torch.distributed.get_world_size()
+    rank = torch.distributed.get_rank(group=process_group)
+    world_size = torch.distributed.get_world_size(group=process_group)
 
     local_summary = {
         "offload_bytes": dict(total_offload_bytes),
         "duplicate_summary": dict(local_duplicate_summary or {}),
     }
     all_summaries = [None] * world_size
-    torch.distributed.all_gather_object(all_summaries, local_summary)
+    torch.distributed.all_gather_object(all_summaries, local_summary, group=process_group)
 
     if rank == 0:
         details = []
@@ -89,12 +90,10 @@ def print_offload_summary_table(
                     f"{duplicate_bytes / (1024 * 1024):.2f} MB"
                 )
         if details:
-            log_single_rank(
-                logger,
-                logging.WARNING,
+            logger.warning(
                 "Fine-grained activation offloading is copying the same tensor storage to CPU "
                 "more than once within an offload group, wasting host memory and PCIe bandwidth "
-                f"({', '.join(details)}). Offloading proceeds with the duplicated copies.",
+                f"({', '.join(details)}). Offloading proceeds with the duplicated copies."
             )
 
         all_group_names = sorted(
@@ -145,7 +144,7 @@ def print_offload_summary_table(
         print(totals_row)
         print("=" * len(header) + "\n")
 
-    torch.distributed.barrier()
+    torch.distributed.barrier(group=process_group)
 
 
 class OffloadTensorPool:
@@ -549,7 +548,7 @@ class PipelineOffloadManager:
             group_hook(name, forced_released_tensors)
         self._delayed_offload_groups = []
 
-    def reset(self):
+    def reset(self, process_group: Optional[torch.distributed.ProcessGroup] = None):
         """Reset manager state for a new training iteration."""
         self._inside_context = False
         self._cur_forward_chunk = None
@@ -560,7 +559,7 @@ class PipelineOffloadManager:
 
         # Call post_warmup_callback after warmup to collect the offload information.
         if self._is_warmup and len(self._cached_chunks_forward) > 0:
-            self.post_warmup_callback()
+            self.post_warmup_callback(process_group=process_group)
         self._cached_chunks_index_backward = 0
         self._cached_chunks_index_forward = 0
 
@@ -607,7 +606,7 @@ class PipelineOffloadManager:
         for chunk in self._cached_chunks_forward:
             chunk.do_offload = True
 
-    def post_warmup_callback(self):
+    def post_warmup_callback(self, process_group: Optional[torch.distributed.ProcessGroup] = None):
         """Callback after warmup."""
         # pylint: disable=bad-builtin
         debug_rank("post_warmup_callback")
@@ -703,6 +702,7 @@ class PipelineOffloadManager:
         print_offload_summary_table(
             total_offload_bytes,
             {name: tuple(summary) for name, summary in local_duplicate_summary.items()},
+            process_group=process_group,
         )
 
     def push(self, handler):
@@ -1575,9 +1575,9 @@ class FineGrainedActivationOffloadingInterface:
         return FineGrainedOffloadingBackwardRecordFunction.apply(tensor)
 
     @staticmethod
-    def reset():
+    def reset(process_group: Optional[torch.distributed.ProcessGroup] = None):
         """Reset the chunk handler."""
-        PipelineOffloadManager.get_instance().reset()
+        PipelineOffloadManager.get_instance().reset(process_group=process_group)
 
     @staticmethod
     def reset_instance():

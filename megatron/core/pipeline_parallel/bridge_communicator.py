@@ -81,7 +81,8 @@ class BridgeCommunicator:
     ):
         """Initialize the bridge communicator between source and destination grids.
 
-        CP is not supported yet. Will be added in follow up PR.
+        Source CP greater than one is not supported. Destination CP gradients are
+        reduced on the destination leader's TP lane before the backward send.
 
         Args:
             src_grid: Source HyperCommGrid
@@ -104,18 +105,17 @@ class BridgeCommunicator:
         assert tensor_ndim in (2, 3), f"tensor_ndim must be 2 or 3, got {tensor_ndim}"
         self.tensor_ndim = tensor_ndim
 
-        # TODO (ykarnati, pthombre) - CP support will be added in follow up PR.
         if 'cp' in self.src_grid.dim_names:
             assert self.src_grid.shape[self.src_grid.dim_names.index('cp')] == 1, (
                 f"Source grid CP size must be 1, got "
                 f"{self.src_grid.shape[self.src_grid.dim_names.index('cp')]}"
             )
 
-        if 'cp' in self.dest_grid.dim_names:
-            assert self.dest_grid.shape[self.dest_grid.dim_names.index('cp')] == 1, (
-                f"Destination grid CP size must be 1, got "
-                f"{self.dest_grid.shape[self.dest_grid.dim_names.index('cp')]}"
-            )
+        self.dest_cp_size = (
+            self.dest_grid.shape[self.dest_grid.dim_names.index('cp')]
+            if 'cp' in self.dest_grid.dim_names
+            else 1
+        )
 
         self.current_rank = dist.get_rank()
         self.comm_map: Dict[int, RankCommInfo] = {}
@@ -165,6 +165,16 @@ class BridgeCommunicator:
         self.dest_tp_leaders, self.dest_local_leader_rank = self.get_leader_rank(
             self.dest_grid, is_src=False
         )
+
+        self.dest_cp_reduce_pg = None
+        if (
+            self.dest_cp_size > 1
+            and self.dest_local_leader_rank is not None
+            and self.current_rank in self.dest_grid_broadcast_ranks
+        ):
+            dest_cp_pg = self.dest_grid.get_pg("cp")
+            if self.dest_local_leader_rank in dist.get_process_group_ranks(dest_cp_pg):
+                self.dest_cp_reduce_pg = dest_cp_pg
 
         bridge_ranks = sorted(set(self.src_tp_leaders) | set(self.dest_tp_leaders))
         self.bridge_pg = self._get_or_create_bridge_pg(bridge_ranks)
@@ -384,7 +394,7 @@ class BridgeCommunicator:
                         self.current_rank,
                         dest_rank,
                     )
-                    dist.send(tensor_split, dst=dest_rank, group=self.bridge_pg)
+                self._run_batched_payload_p2p(tensor_splits, rank_info.send_to_ranks, op="send")
 
     def recv_forward(self) -> torch.Tensor:
         """Receive forward activation tensor.
@@ -433,8 +443,14 @@ class BridgeCommunicator:
                     dtype=self.comm_dtype,
                     requires_grad=True,
                 )
-                dist.recv(tensor_to_recv, src=src_rank, group=self.bridge_pg)
-                if logger.isEnabledFor(logging.DEBUG):
+                received_tensors_list.append(tensor_to_recv)
+            self._run_batched_payload_p2p(
+                received_tensors_list, rank_info.recv_from_ranks, op="recv"
+            )
+            if logger.isEnabledFor(logging.DEBUG):
+                for src_rank, tensor_to_recv in zip(
+                    rank_info.recv_from_ranks, received_tensors_list
+                ):
                     logger.debug(
                         "[Bridge Communicator] [receive_forward] Rank %s "
                         "received tensor from src rank %s shape %s sum %s",
@@ -443,7 +459,6 @@ class BridgeCommunicator:
                         tensor_to_recv.shape,
                         tensor_to_recv.sum(),
                     )
-                received_tensors_list.append(tensor_to_recv)
             aggregated_tensor = torch.cat(received_tensors_list, dim=self._batch_dim)
             if logger.isEnabledFor(logging.DEBUG):
                 logger.debug(
@@ -500,6 +515,20 @@ class BridgeCommunicator:
             )
             return received_tensor
 
+    def _reduce_dest_cp_gradient(self, grad_tensor: torch.Tensor) -> torch.Tensor:
+        """Reduce destination CP gradient shards onto the destination leader."""
+        if self.dest_cp_size == 1 or self.dest_cp_reduce_pg is None:
+            return grad_tensor
+
+        grad_tensor = grad_tensor.contiguous()
+        dist.reduce(
+            grad_tensor,
+            dst=self.dest_local_leader_rank,
+            op=dist.ReduceOp.SUM,
+            group=self.dest_cp_reduce_pg,
+        )
+        return grad_tensor
+
     def send_backward(self, grad_tensor: torch.Tensor):
         """Send backward gradient tensor.
 
@@ -517,6 +546,8 @@ class BridgeCommunicator:
         rank_info = self.comm_map.get(self.current_rank)
         assert rank_info is not None, f"Rank {self.current_rank} is not in the comm map"
 
+        grad_tensor = self._reduce_dest_cp_gradient(grad_tensor)
+
         if rank_info.role == CommRole.RECEIVER:
             assert (
                 self.current_rank == self.dest_local_leader_rank
@@ -527,7 +558,6 @@ class BridgeCommunicator:
             self._communicate_shapes(tensor_to_send_prev=tensor_splits)
             if num_receives > 0:
                 for src_rank, tensor_split in zip(rank_info.recv_from_ranks, tensor_splits):
-                    # Send the gradient split back to the source rank
                     if logger.isEnabledFor(logging.DEBUG):
                         logger.debug(
                             "[Bridge Communicator] [send_backward] Rank %s "
@@ -537,7 +567,7 @@ class BridgeCommunicator:
                             tensor_split.shape,
                             tensor_split.sum(),
                         )
-                    dist.send(tensor_split, dst=src_rank, group=self.bridge_pg)
+                self._run_batched_payload_p2p(tensor_splits, rank_info.recv_from_ranks, op="send")
 
     def recv_backward(self) -> torch.Tensor:
         """Receive backward gradient tensor.
@@ -579,8 +609,12 @@ class BridgeCommunicator:
                 grad_tensor = torch.empty(
                     grad_shape, device=torch.cuda.current_device(), dtype=self.comm_dtype
                 )
-                dist.recv(grad_tensor, src=dest_rank, group=self.bridge_pg)
-                if logger.isEnabledFor(logging.DEBUG):
+                received_gradients_list.append(grad_tensor)
+            self._run_batched_payload_p2p(
+                received_gradients_list, rank_info.send_to_ranks, op="recv"
+            )
+            if logger.isEnabledFor(logging.DEBUG):
+                for dest_rank, grad_tensor in zip(rank_info.send_to_ranks, received_gradients_list):
                     logger.debug(
                         "[Bridge Communicator] [receive_backward] Rank %s "
                         "received gradient from dest rank %s shape %s sum %s",
@@ -589,7 +623,6 @@ class BridgeCommunicator:
                         grad_tensor.shape,
                         grad_tensor.sum(),
                     )
-                received_gradients_list.append(grad_tensor)
 
             # Concatenate received gradients
             aggregated_gradient = torch.cat(received_gradients_list, dim=self._batch_dim)
@@ -805,6 +838,8 @@ class BridgeCommunicator:
         rank_info = self.comm_map.get(self.current_rank)
         assert rank_info is not None, f"Rank {self.current_rank} is not in the comm map"
 
+        grad_tensor = self._reduce_dest_cp_gradient(grad_tensor)
+
         if rank_info.role == CommRole.RECEIVER:
             assert (
                 self.current_rank == self.dest_local_leader_rank
@@ -924,6 +959,31 @@ class BridgeCommunicator:
                 received_activation.shape,
             )
             return received_activation
+
+    def _run_batched_payload_p2p(
+        self, tensors: List[torch.Tensor], peers: List[int], *, op: str
+    ) -> None:
+        """Launch one payload operation per peer in a single P2P batch."""
+        if len(tensors) != len(peers):
+            raise ValueError(
+                f"expected one payload tensor per peer, got {len(tensors)} tensors "
+                f"for {len(peers)} peers"
+            )
+        if op == "send":
+            p2p_op = dist.isend
+        elif op == "recv":
+            p2p_op = dist.irecv
+        else:
+            raise ValueError(f"unsupported bridge P2P operation: {op}")
+
+        ops = [
+            dist.P2POp(p2p_op, tensor, peer, self.bridge_pg) for tensor, peer in zip(tensors, peers)
+        ]
+        if not ops:
+            return
+        requests = dist.batch_isend_irecv(ops)
+        for request in requests:
+            request.wait()
 
     def _communicate_shapes(
         self,
