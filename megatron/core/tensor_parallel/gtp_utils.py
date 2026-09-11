@@ -1,5 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Checkpoint helpers for GTP-sharded fused projections.
+"""Utilities for Generalized Tensor Parallelism (GTP).
 
 A fused projection (Mamba/GatedDeltaNet ``in_proj``, a gated MLP's ``fc1``) is one weight
 whose dim0 carries several semantic sections. GTP shards dim0, and the section boundaries

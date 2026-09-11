@@ -7,17 +7,12 @@ import torch
 
 from megatron.core.dist_checkpointing import ShardedTensor
 from megatron.core.dist_checkpointing.mapping import ReplicaId, ShardedTensorFactory
-from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
-from megatron.core.tensor_parallel.gtp_ckpt import (
+from megatron.core.tensor_parallel import gtp_api
+from megatron.core.tensor_parallel.gtp_utils import (
     _gtp_gather_rows_for_save,
     _gtp_slice_rows_on_load,
 )
 from megatron.core.transformer.utils import cat_with_oom_fallback
-
-if HAVE_GTP:
-    from megatron.core.tensor_parallel.gtp_api import is_gtp_param
-else:
-    is_gtp_param = None
 
 
 def _split_in_proj_factory(
@@ -47,11 +42,11 @@ def _split_in_proj_factory(
     The returned GTP factory merges unflattened model weights; optimizer states
     continue to use their existing per-shard checkpoint reconstruction.
     """
-    uses_gtp = getattr(weight, "gtp_remat_size", 1) > 1 and HAVE_GTP and is_gtp_param(weight)
+    uses_gtp = gtp_api.HAVE_GTP and gtp_api.is_gtp_param(weight)
     if uses_gtp:
-        # Derive the logical width from the physical parameter, independently of
-        # the requested sections, so the split factory still rejects wrong totals.
-        target_rows = weight.data.size(0) * weight.gtp_remat_size - getattr(weight, "pad_length", 0)
+        # Read the parameter's logical width independently of the requested
+        # sections, so the split factory still rejects wrong totals.
+        target_rows = weight._unsharded_shape[0]
         orig_sh_ten = _gtp_gather_rows_for_save(
             orig_sh_ten,
             orig_sh_ten.key,

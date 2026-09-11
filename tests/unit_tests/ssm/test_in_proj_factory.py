@@ -2,6 +2,7 @@
 
 """CPU checkpoint-layout regressions; run distributed cases with torchrun on 4 or 8 ranks."""
 
+from types import SimpleNamespace
 from unittest import mock
 
 import pytest
@@ -37,7 +38,7 @@ _KEY = 'decoder.layers.in_proj.weight'
 )
 @pytest.mark.parametrize(
     'have_gtp,is_gtp,remat_size',
-    [(False, True, 2), (True, False, 2), (True, True, 1)],
+    [(False, True, 2), (True, False, 2), (True, False, 1)],
     ids=['gtp_unavailable', 'ordinary_parameter', 'remat_one'],
 )
 def test_in_proj_factory_without_gtp(
@@ -51,9 +52,11 @@ def test_in_proj_factory_without_gtp(
     original = ShardedTensor.from_rank_offsets(
         _KEY, data, *_OFFSETS, (1, 1, 2), prepend_axis_num=1, replica_id=replica_id
     )
+    # Replace this consumer's API reference without changing the shared GTP module.
     with (
-        mock.patch.object(ssm_utils, 'HAVE_GTP', have_gtp),
-        mock.patch.object(ssm_utils, 'is_gtp_param', return_value=is_gtp, create=True),
+        mock.patch.object(
+            ssm_utils, 'gtp_api', SimpleNamespace(HAVE_GTP=have_gtp, is_gtp_param=lambda _: is_gtp)
+        ),
         mock.patch.object(ssm_utils, '_gtp_gather_rows_for_save') as gather,
         mock.patch.object(ssm_utils, '_gtp_slice_rows_on_load') as slice_rows,
     ):
@@ -153,6 +156,7 @@ def _factory_for_topology(
     weight.group = gtp_group
     weight.gtp_remat_size = gtp_size
     weight.pad_length = padding_rows
+    weight._unsharded_shape = tuple(logical.shape)
     original = ShardedTensor.from_rank_offsets(
         _KEY,
         weight,
@@ -161,12 +165,12 @@ def _factory_for_topology(
         prepend_axis_num=len(sharded_offsets),
         replica_id=(0, 0, dist.get_rank(dp_group)),
     )
-    # Detection depends on TE; the transformation, collectives, metadata and tensors are real.
-    with (
-        mock.patch.object(ssm_utils, 'HAVE_GTP', True),
-        mock.patch.object(
-            ssm_utils, 'is_gtp_param', side_effect=lambda x: x is weight, create=True
-        ),
+    # Real module constructors leave GTP size-one weights as ordinary parameters.
+    # Only detection is mocked; collectives, metadata and tensors are real.
+    with mock.patch.object(
+        ssm_utils,
+        'gtp_api',
+        SimpleNamespace(HAVE_GTP=True, is_gtp_param=lambda x: x is weight and gtp_size > 1),
     ):
         factory = ssm_utils._split_in_proj_factory(
             original,
@@ -279,16 +283,19 @@ def test_in_proj_factory_gtp_sharding_integrity(projection_groups, sections, nam
 def test_in_proj_factory_gtp_rejects_incorrect_sections(projection_groups, section_delta):
     """The section list cannot truncate real rows or reinterpret alignment padding as data."""
     groups = projection_groups
-    weight = torch.nn.Parameter(torch.arange(18, dtype=torch.float32).reshape(6, 3))
+    logical = torch.arange(24, dtype=torch.float32).reshape(8, 3)
+    padded = torch.nn.functional.pad(logical, (0, 0, 0, 4))
+    gtp_rank = dist.get_rank(groups['gtp'])
+    weight = torch.nn.Parameter(padded.chunk(2)[gtp_rank].clone())
     weight.group = groups['gtp']
     weight.gtp_remat_size = 2
     weight.pad_length = 4
-    original = ShardedTensor.from_rank_offsets(
-        _KEY, weight.data, (0, dist.get_rank(groups['gtp']), 2)
-    )
+    weight._unsharded_shape = tuple(logical.shape)
+    original = ShardedTensor.from_rank_offsets(_KEY, weight.data, (0, gtp_rank, 2))
     with (
-        mock.patch.object(ssm_utils, 'HAVE_GTP', True),
-        mock.patch.object(ssm_utils, 'is_gtp_param', return_value=True, create=True),
+        mock.patch.object(
+            ssm_utils, 'gtp_api', SimpleNamespace(HAVE_GTP=True, is_gtp_param=lambda _: True)
+        ),
         pytest.raises(ValueError, match='Split sections must cover the whole dimension size'),
     ):
         ssm_utils._split_in_proj_factory(
