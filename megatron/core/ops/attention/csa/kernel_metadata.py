@@ -4,19 +4,35 @@
 
 from megatron.core.ops.kernel_metadata import Determinism, DeterminismResult, KernelMetadata
 
-_CONTRACT = "megatron.core.ops.attention.csa"
-_DETERMINISM = DeterminismResult(
-    Determinism.UNKNOWN,
-    "CUDA reductions and indexed accumulation have not been audited for bit-exact repeatability.",
-)
 CSA_ATTENTION = KernelMetadata(
-    name="csa.unfused_sparse_attention", requires=(), determinism=_DETERMINISM, contract=_CONTRACT
+    name="csa.unfused_sparse_attention",
+    requires=(),
+    determinism=DeterminismResult(
+        status=Determinism.UNKNOWN,
+        reason="CUDA reductions and indexed accumulation have not been audited for "
+        "bit-exact repeatability.",
+    ),
+    contract="megatron.core.ops.attention.csa",
 )
 CSA_LSE = KernelMetadata(
-    name="csa.non_compressed_lse", requires=(), determinism=_DETERMINISM, contract=_CONTRACT
+    name="csa.non_compressed_lse",
+    requires=(),
+    determinism=DeterminismResult(
+        status=Determinism.UNKNOWN,
+        reason="CUDA reductions and indexed accumulation have not been audited for "
+        "bit-exact repeatability.",
+    ),
+    contract="megatron.core.ops.attention.csa",
 )
 CSA_POOLING = KernelMetadata(
-    name="csa.compressor_pooling", requires=(), determinism=_DETERMINISM, contract=_CONTRACT
+    name="csa.compressor_pooling",
+    requires=(),
+    determinism=DeterminismResult(
+        status=Determinism.UNKNOWN,
+        reason="CUDA reductions and indexed accumulation have not been audited for "
+        "bit-exact repeatability.",
+    ),
+    contract="megatron.core.ops.attention.csa",
 )
 
 KERNELS = (CSA_ATTENTION, CSA_LSE, CSA_POOLING)

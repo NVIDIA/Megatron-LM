@@ -2,145 +2,202 @@
 
 """GDP training and inference declarations; importing them loads no kernels."""
 
-from dataclasses import replace
-
 from megatron.core.ops.kernel_metadata import (
     Dependency,
     Determinism,
     DeterminismResult,
     KernelMetadata,
 )
-from megatron.core.ops.ssm.common.kernel_metadata import CAUSAL_CONV
+from megatron.core.ops.ssm.common.kernel_metadata import check_causal_conv_determinism
 
-_CONTRACT = "megatron.core.ops.ssm.gdp"
-_TRAINING = DeterminismResult(
-    Determinism.UNKNOWN,
-    "GDP training forward/backward has not been audited for bit-exact repeatability.",
-)
-_INFERENCE = DeterminismResult(
-    Determinism.UNKNOWN,
-    "Forward-only dynamic prefill/decode. Caller-owned states and autotuning settings affect "
-    "execution; no cross-batch or cross-device repeatability guarantee is declared.",
-)
-GDP_CONV = replace(
-    CAUSAL_CONV,
+GDP_CONV = KernelMetadata(
     name="gdp.causal_conv1d_fn",
-    requires=(Dependency("causal-conv1d>=1.4.0", "causal_conv1d", ("causal_conv1d_fn",)),),
-    contract=_CONTRACT,
+    requires=(
+        Dependency(
+            requirement="causal-conv1d>=1.4.0",
+            module="causal_conv1d",
+            symbols=("causal_conv1d_fn",),
+        ),
+    ),
+    determinism=DeterminismResult(
+        status=Determinism.UNKNOWN,
+        reason="Convolution forward/backward is not certified here. Deterministic backward "
+        "requires causal-conv1d >= 1.6.0 and its deterministic reduction to be enabled.",
+    ),
+    contract="megatron.core.ops.ssm.gdp",
+    determinism_check=check_causal_conv_determinism,
 )
 GDP_FLA = KernelMetadata(
     name="gdp.fla.chunk_gated_delta_product",
     requires=(
         Dependency(
-            "flash-linear-attention", "fla.ops.gated_delta_product", ("chunk_gated_delta_product",)
+            requirement="flash-linear-attention",
+            module="fla.ops.gated_delta_product",
+            symbols=("chunk_gated_delta_product",),
         ),
     ),
-    determinism=_TRAINING,
-    contract=_CONTRACT,
+    determinism=DeterminismResult(
+        status=Determinism.UNKNOWN,
+        reason="GDP training forward/backward has not been audited for bit-exact repeatability.",
+    ),
+    contract="megatron.core.ops.ssm.gdp",
 )
 GDP_CUTEDSL = KernelMetadata(
     name="gdp.cutedsl.chunk_gated_delta_product",
-    requires=(Dependency("gdp-attn", "gdp_attn", ("chunk_gated_delta_product",)),),
-    determinism=_TRAINING,
-    contract=_CONTRACT,
+    requires=(
+        Dependency(
+            requirement="gdp-attn", module="gdp_attn", symbols=("chunk_gated_delta_product",)
+        ),
+    ),
+    determinism=DeterminismResult(
+        status=Determinism.UNKNOWN,
+        reason="GDP training forward/backward has not been audited for bit-exact repeatability.",
+    ),
+    contract="megatron.core.ops.ssm.gdp",
 )
 GDP_FLA_CP = KernelMetadata(
     name="gdp.fla.chunkwise_context_parallel",
     requires=(
-        Dependency("triton", "triton"),
+        Dependency(requirement="triton", module="triton"),
         Dependency(
-            "flash-linear-attention",
-            "fla.ops.common.chunk_delta_h",
-            ("chunk_gated_delta_rule_bwd_dhu", "chunk_gated_delta_rule_fwd_h"),
+            requirement="flash-linear-attention",
+            module="fla.ops.common.chunk_delta_h",
+            symbols=("chunk_gated_delta_rule_bwd_dhu", "chunk_gated_delta_rule_fwd_h"),
         ),
         Dependency(
-            "flash-linear-attention",
-            "fla.ops.common.chunk_o",
-            ("chunk_bwd_dqkwg", "chunk_bwd_dv_local"),
+            requirement="flash-linear-attention",
+            module="fla.ops.common.chunk_o",
+            symbols=("chunk_bwd_dqkwg", "chunk_bwd_dv_local"),
         ),
         Dependency(
-            "flash-linear-attention",
-            "fla.ops.common.chunk_scaled_dot_kkt",
-            ("chunk_scaled_dot_kkt_fwd",),
+            requirement="flash-linear-attention",
+            module="fla.ops.common.chunk_scaled_dot_kkt",
+            symbols=("chunk_scaled_dot_kkt_fwd",),
         ),
         Dependency(
-            "flash-linear-attention",
-            "fla.ops.cp.chunk_delta_h",
-            (
+            requirement="flash-linear-attention",
+            module="fla.ops.cp.chunk_delta_h",
+            symbols=(
                 "merge_fwd_bwd_kernel",
                 "pre_process_bwd_kernel_merged",
                 "pre_process_fwd_kernel_merged",
             ),
         ),
         Dependency(
-            "flash-linear-attention",
-            "fla.ops.gated_delta_product.chunk_deltaproduct_h",
-            ("chunk_gated_delta_product_fwd_h",),
+            requirement="flash-linear-attention",
+            module="fla.ops.gated_delta_product.chunk_deltaproduct_h",
+            symbols=("chunk_gated_delta_product_fwd_h",),
         ),
         Dependency(
-            "flash-linear-attention",
-            "fla.ops.gated_delta_product.chunk_deltaproduct_o",
-            ("chunk_gated_delta_product_fwd_o",),
+            requirement="flash-linear-attention",
+            module="fla.ops.gated_delta_product.chunk_deltaproduct_o",
+            symbols=("chunk_gated_delta_product_fwd_o",),
         ),
         Dependency(
-            "flash-linear-attention",
-            "fla.ops.gated_delta_rule.wy_fast",
-            ("prepare_wy_repr_bwd", "recompute_w_u_fwd"),
+            requirement="flash-linear-attention",
+            module="fla.ops.gated_delta_rule.wy_fast",
+            symbols=("prepare_wy_repr_bwd", "recompute_w_u_fwd"),
         ),
-        Dependency("flash-linear-attention", "fla.ops.utils", ("chunk_local_cumsum", "solve_tril")),
-        Dependency("flash-linear-attention", "fla.ops.utils.constant", ("RCP_LN2",)),
-        Dependency("flash-linear-attention", "fla.ops.utils.index", ("prepare_chunk_indices",)),
         Dependency(
-            "flash-linear-attention",
-            "fla.utils",
-            ("autocast_custom_bwd", "autocast_custom_fwd", "input_guard", "tensor_cache"),
+            requirement="flash-linear-attention",
+            module="fla.ops.utils",
+            symbols=("chunk_local_cumsum", "solve_tril"),
+        ),
+        Dependency(
+            requirement="flash-linear-attention",
+            module="fla.ops.utils.constant",
+            symbols=("RCP_LN2",),
+        ),
+        Dependency(
+            requirement="flash-linear-attention",
+            module="fla.ops.utils.index",
+            symbols=("prepare_chunk_indices",),
+        ),
+        Dependency(
+            requirement="flash-linear-attention",
+            module="fla.utils",
+            symbols=("autocast_custom_bwd", "autocast_custom_fwd", "input_guard", "tensor_cache"),
         ),
     ),
-    determinism=_TRAINING,
-    contract=_CONTRACT,
+    determinism=DeterminismResult(
+        status=Determinism.UNKNOWN,
+        reason="GDP training forward/backward has not been audited for bit-exact repeatability.",
+    ),
+    contract="megatron.core.ops.ssm.gdp",
 )
 GDP_CUTEDSL_CP = KernelMetadata(
     name="gdp.cutedsl.chunkwise_context_parallel",
     requires=(
         Dependency(
-            "gdp-attn",
-            "gdp_attn",
-            ("cp_forward_prepare", "cp_forward_apply", "cp_backward_prepare", "cp_backward_apply"),
+            requirement="gdp-attn",
+            module="gdp_attn",
+            symbols=(
+                "cp_forward_prepare",
+                "cp_forward_apply",
+                "cp_backward_prepare",
+                "cp_backward_apply",
+            ),
         ),
         Dependency(
-            "gdp-attn",
-            "gdp_attn.chunk_gated_delta_product",
-            ("GdpCpBackwardContext", "GdpCpForwardLocalContext", "GdpCpSavedContext"),
+            requirement="gdp-attn",
+            module="gdp_attn.chunk_gated_delta_product",
+            symbols=("GdpCpBackwardContext", "GdpCpForwardLocalContext", "GdpCpSavedContext"),
         ),
     ),
-    determinism=_TRAINING,
-    contract=_CONTRACT,
+    determinism=DeterminismResult(
+        status=Determinism.UNKNOWN,
+        reason="GDP training forward/backward has not been audited for bit-exact repeatability.",
+    ),
+    contract="megatron.core.ops.ssm.gdp",
 )
 GDP_PREFILL = KernelMetadata(
     name="gdp.triton.chunk_gated_delta_product_varlen",
-    requires=(Dependency("triton", "triton"),),
-    determinism=_INFERENCE,
-    contract=_CONTRACT,
+    requires=(Dependency(requirement="triton", module="triton"),),
+    determinism=DeterminismResult(
+        status=Determinism.UNKNOWN,
+        reason="Forward-only dynamic prefill/decode. Caller-owned states and autotuning settings "
+        "affect execution; no cross-batch or cross-device repeatability guarantee is declared.",
+    ),
+    contract="megatron.core.ops.ssm.gdp",
 )
 GDP_DECODE = KernelMetadata(
     name="gdp.triton.fused_recurrent_gated_delta_rule_update",
-    requires=GDP_PREFILL.requires,
-    determinism=_INFERENCE,
-    contract=_CONTRACT,
+    requires=(Dependency(requirement="triton", module="triton"),),
+    determinism=DeterminismResult(
+        status=Determinism.UNKNOWN,
+        reason="Forward-only dynamic prefill/decode. Caller-owned states and autotuning settings "
+        "affect execution; no cross-batch or cross-device repeatability guarantee is declared.",
+    ),
+    contract="megatron.core.ops.ssm.gdp",
 )
 GDP_PREPARE = KernelMetadata(
     name="gdp.triton.gdp_decode_prepare",
     requires=(
-        Dependency("triton>=3.0", "triton.language.extra.libdevice", ("exp", "log1p", "div_rn")),
+        Dependency(
+            requirement="triton>=3.0",
+            module="triton.language.extra.libdevice",
+            symbols=("exp", "log1p", "div_rn"),
+        ),
     ),
-    determinism=_INFERENCE,
-    contract=_CONTRACT,
+    determinism=DeterminismResult(
+        status=Determinism.UNKNOWN,
+        reason="Forward-only dynamic prefill/decode. Caller-owned states and autotuning settings "
+        "affect execution; no cross-batch or cross-device repeatability guarantee is declared.",
+    ),
+    contract="megatron.core.ops.ssm.gdp",
 )
 GDP_L2NORM = KernelMetadata(
     name="gdp.fla.l2_norm",
-    requires=(Dependency("flash-linear-attention", "fla.modules.l2norm", ("l2_norm",)),),
-    determinism=_TRAINING,
-    contract=_CONTRACT,
+    requires=(
+        Dependency(
+            requirement="flash-linear-attention", module="fla.modules.l2norm", symbols=("l2_norm",)
+        ),
+    ),
+    determinism=DeterminismResult(
+        status=Determinism.UNKNOWN,
+        reason="GDP training forward/backward has not been audited for bit-exact repeatability.",
+    ),
+    contract="megatron.core.ops.ssm.gdp",
 )
 
 KERNELS = (

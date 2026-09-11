@@ -69,6 +69,12 @@ Every declaration uses the same template:
 - `contract`: the family docstring describing layouts, modes and ownership.
 - `determinism_check`: an optional construction-time environment assessment.
 
+Keep each declaration self-contained: write its `Dependency` entries, determinism
+assessment and contract directly, using named fields. Do not assemble requirements
+from shared tuples, another kernel's `.requires`, or `dataclasses.replace`.
+Repeating a dependency is intentional: changing one implementation's requirements
+must not silently change another's. Share validation logic, not declaration data.
+
 After choosing the implementation, the provider or model owner calls
 `validate_kernel`, or `validate_kernels` for a group of selected entry points:
 

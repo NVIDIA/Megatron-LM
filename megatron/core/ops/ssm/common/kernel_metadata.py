@@ -2,8 +2,6 @@
 
 """Declarations for shared convolution and state-extraction entry points."""
 
-from dataclasses import replace
-
 from megatron.core.ops.kernel_metadata import (
     Dependency,
     Determinism,
@@ -11,94 +9,139 @@ from megatron.core.ops.kernel_metadata import (
     KernelMetadata,
 )
 
-_CONTRACT = "megatron.core.ops.ssm.common"
-_CONV = DeterminismResult(
-    Determinism.UNKNOWN,
-    "Convolution forward/backward is not certified here. Deterministic backward requires "
-    "causal-conv1d >= 1.6.0 and its deterministic reduction to be enabled.",
-)
-_INFERENCE = DeterminismResult(
-    Determinism.UNKNOWN,
-    "Forward-only state mutation/extraction. Callers own buffers and indices; autotuning, "
-    "aliasing and indexed writes are not covered by a general repeatability guarantee.",
-)
 
-
-def _conv_determinism() -> DeterminismResult:
+def check_causal_conv_determinism() -> DeterminismResult:
+    """Apply the convolution library's version and reduction-mode requirements."""
     from megatron.core.ops.ssm.common.causal_conv1d_cp import assert_causal_conv1d_deterministic
 
     try:
         assert_causal_conv1d_deterministic(deterministic_mode=True)
     except AssertionError as exc:
         return DeterminismResult(Determinism.NONDETERMINISTIC, str(exc))
-    return _CONV
+    return DeterminismResult(
+        status=Determinism.UNKNOWN,
+        reason="Convolution forward/backward is not certified here. Deterministic backward "
+        "requires causal-conv1d >= 1.6.0 and its deterministic reduction to be enabled.",
+    )
 
 
 CAUSAL_CONV = KernelMetadata(
     name="ssm.causal_conv1d_fn",
-    requires=(Dependency("causal-conv1d", "causal_conv1d", ("causal_conv1d_fn",)),),
-    determinism=_CONV,
-    contract=_CONTRACT,
-    determinism_check=_conv_determinism,
+    requires=(
+        Dependency(
+            requirement="causal-conv1d", module="causal_conv1d", symbols=("causal_conv1d_fn",)
+        ),
+    ),
+    determinism=DeterminismResult(
+        status=Determinism.UNKNOWN,
+        reason="Convolution forward/backward is not certified here. Deterministic backward "
+        "requires causal-conv1d >= 1.6.0 and its deterministic reduction to be enabled.",
+    ),
+    contract="megatron.core.ops.ssm.common",
+    determinism_check=check_causal_conv_determinism,
 )
-CAUSAL_CONV_CP = replace(
-    CAUSAL_CONV,
+CAUSAL_CONV_CP = KernelMetadata(
     name="ssm.causal_conv1d_cp",
     requires=(
-        *CAUSAL_CONV.requires,
+        Dependency(
+            requirement="causal-conv1d", module="causal_conv1d", symbols=("causal_conv1d_fn",)
+        ),
         # Combining seq_idx with initial_states requires the packed-CP implementation.
-        Dependency("causal-conv1d>=1.7.0", "causal_conv1d", feature="packed"),
+        Dependency(requirement="causal-conv1d>=1.7.0", module="causal_conv1d", feature="packed"),
     ),
+    determinism=DeterminismResult(
+        status=Determinism.UNKNOWN,
+        reason="Convolution forward/backward is not certified here. Deterministic backward "
+        "requires causal-conv1d >= 1.6.0 and its deterministic reduction to be enabled.",
+    ),
+    contract="megatron.core.ops.ssm.common",
+    determinism_check=check_causal_conv_determinism,
 )
 CAUSAL_CONV_CUDA_UPDATE = KernelMetadata(
     name="ssm.causal_conv1d_update_cuda",
-    requires=(Dependency("causal-conv1d", "causal_conv1d", ("causal_conv1d_update",)),),
-    determinism=_INFERENCE,
-    contract=_CONTRACT,
+    requires=(
+        Dependency(
+            requirement="causal-conv1d", module="causal_conv1d", symbols=("causal_conv1d_update",)
+        ),
+    ),
+    determinism=DeterminismResult(
+        status=Determinism.UNKNOWN,
+        reason="Forward-only state mutation/extraction. Callers own buffers and indices; "
+        "autotuning, aliasing and indexed writes are not covered by a general repeatability "
+        "guarantee.",
+    ),
+    contract="megatron.core.ops.ssm.common",
 )
 CAUSAL_CONV_TRITON_UPDATE = KernelMetadata(
     name="ssm.triton.causal_conv1d_update",
-    requires=(Dependency("triton", "triton"),),
-    determinism=_INFERENCE,
-    contract=_CONTRACT,
+    requires=(Dependency(requirement="triton", module="triton"),),
+    determinism=DeterminismResult(
+        status=Determinism.UNKNOWN,
+        reason="Forward-only state mutation/extraction. Callers own buffers and indices; "
+        "autotuning, aliasing and indexed writes are not covered by a general repeatability "
+        "guarantee.",
+    ),
+    contract="megatron.core.ops.ssm.common",
 )
 CAUSAL_CONV_VARLEN = KernelMetadata(
     name="ssm.triton.causal_conv1d_varlen_fn",
-    requires=CAUSAL_CONV_TRITON_UPDATE.requires,
-    determinism=_INFERENCE,
-    contract=_CONTRACT,
+    requires=(Dependency(requirement="triton", module="triton"),),
+    determinism=DeterminismResult(
+        status=Determinism.UNKNOWN,
+        reason="Forward-only state mutation/extraction. Callers own buffers and indices; "
+        "autotuning, aliasing and indexed writes are not covered by a general repeatability "
+        "guarantee.",
+    ),
+    contract="megatron.core.ops.ssm.common",
 )
 CAUSAL_CONV_CARRY = KernelMetadata(
     name="ssm.triton.causal_conv1d_varlen_carry_states",
-    requires=CAUSAL_CONV_TRITON_UPDATE.requires,
-    determinism=_INFERENCE,
-    contract=_CONTRACT,
+    requires=(Dependency(requirement="triton", module="triton"),),
+    determinism=DeterminismResult(
+        status=Determinism.UNKNOWN,
+        reason="Forward-only state mutation/extraction. Callers own buffers and indices; "
+        "autotuning, aliasing and indexed writes are not covered by a general repeatability "
+        "guarantee.",
+    ),
+    contract="megatron.core.ops.ssm.common",
 )
 SCATTER_SSM = KernelMetadata(
     name="ssm.triton.scatter_intermediate_ssm",
-    requires=CAUSAL_CONV_TRITON_UPDATE.requires,
-    determinism=_INFERENCE,
-    contract=_CONTRACT,
+    requires=(Dependency(requirement="triton", module="triton"),),
+    determinism=DeterminismResult(
+        status=Determinism.UNKNOWN,
+        reason="Forward-only state mutation/extraction. Callers own buffers and indices; "
+        "autotuning, aliasing and indexed writes are not covered by a general repeatability "
+        "guarantee.",
+    ),
+    contract="megatron.core.ops.ssm.common",
 )
 THD_PARTITION = KernelMetadata(
     name="ssm.te.thd_get_partitioned_indices",
     requires=(
-        Dependency("transformer-engine>=1.10.0", "transformer_engine"),
+        Dependency(requirement="transformer-engine>=1.10.0", module="transformer_engine"),
         Dependency(
-            "transformer-engine", "transformer_engine_torch", ("thd_get_partitioned_indices",)
+            requirement="transformer-engine",
+            module="transformer_engine_torch",
+            symbols=("thd_get_partitioned_indices",),
         ),
     ),
     determinism=DeterminismResult(
-        Determinism.UNKNOWN,
-        "Packed-sequence CP index generation has not been audited for repeatability.",
+        status=Determinism.UNKNOWN,
+        reason="Packed-sequence CP index generation has not been audited for repeatability.",
     ),
-    contract=_CONTRACT,
+    contract="megatron.core.ops.ssm.common",
 )
 SCATTER_CONV = KernelMetadata(
     name="ssm.triton.scatter_intermediate_conv",
-    requires=CAUSAL_CONV_TRITON_UPDATE.requires,
-    determinism=_INFERENCE,
-    contract=_CONTRACT,
+    requires=(Dependency(requirement="triton", module="triton"),),
+    determinism=DeterminismResult(
+        status=Determinism.UNKNOWN,
+        reason="Forward-only state mutation/extraction. Callers own buffers and indices; "
+        "autotuning, aliasing and indexed writes are not covered by a general repeatability "
+        "guarantee.",
+    ),
+    contract="megatron.core.ops.ssm.common",
 )
 
 KERNELS = (

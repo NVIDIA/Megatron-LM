@@ -22,6 +22,8 @@ from megatron.core.ops.kernel_metadata import (
     validate_kernel,
     validate_kernels,
 )
+from megatron.core.ops.ssm.common.kernel_metadata import CAUSAL_CONV, CAUSAL_CONV_CP
+from megatron.core.ops.ssm.gdp.kernel_metadata import GDP_CONV
 
 FAMILIES = (
     "attention",
@@ -222,25 +224,31 @@ def test_invalid_declarations_and_policy_are_rejected():
     ("env", "torch_enabled", "enabled"),
     [("1", False, True), ("0", True, False), ("", True, True), ("other", False, False)],
 )
-def test_causal_conv_assessment_respects_environment(monkeypatch, env, torch_enabled, enabled):
+@pytest.mark.parametrize(
+    "kernel", [CAUSAL_CONV, CAUSAL_CONV_CP, GDP_CONV], ids=lambda kernel: kernel.name
+)
+def test_causal_conv_assessment_respects_environment(
+    monkeypatch, env, torch_enabled, enabled, kernel
+):
     from megatron.core.ops.ssm.common import causal_conv1d_cp
-    from megatron.core.ops.ssm.common.kernel_metadata import CAUSAL_CONV
 
     monkeypatch.setenv("CAUSAL_CONV1D_DETERMINISTIC", env)
     monkeypatch.setattr(torch, "are_deterministic_algorithms_enabled", lambda: torch_enabled)
     monkeypatch.setattr(causal_conv1d_cp, "is_causal_conv1d_min_version", lambda _version: True)
     expected = Determinism.UNKNOWN if enabled else Determinism.NONDETERMINISTIC
-    assert CAUSAL_CONV.determinism_check().status is expected
+    assert kernel.determinism_check().status is expected
 
 
-def test_causal_conv_old_version_is_not_marked_deterministic(monkeypatch):
+@pytest.mark.parametrize(
+    "kernel", [CAUSAL_CONV, CAUSAL_CONV_CP, GDP_CONV], ids=lambda kernel: kernel.name
+)
+def test_causal_conv_old_version_is_not_marked_deterministic(monkeypatch, kernel):
     from megatron.core.ops.ssm.common import causal_conv1d_cp
-    from megatron.core.ops.ssm.common.kernel_metadata import CAUSAL_CONV
 
     monkeypatch.setenv("CAUSAL_CONV1D_DETERMINISTIC", "1")
     monkeypatch.setattr(causal_conv1d_cp, "is_causal_conv1d_min_version", lambda _version: False)
     with pytest.raises(RuntimeError, match="causal_conv1d >= 1.6.0"):
-        validate_determinism(CAUSAL_CONV, DeterminismPolicy.WARN)
+        validate_determinism(kernel, DeterminismPolicy.WARN)
 
 
 def test_csa_mapping_is_derived_from_kernel_metadata():

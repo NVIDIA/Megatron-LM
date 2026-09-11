@@ -9,82 +9,131 @@ from megatron.core.ops.kernel_metadata import (
     KernelMetadata,
 )
 
-_CONTRACT = "megatron.core.ops.ssm.gated_delta"
-_REFERENCE = DeterminismResult(
-    Determinism.UNKNOWN,
-    "Existing deterministic-mode recurrence, for unpacked inputs. Bit-exact forward/backward "
-    "has not been audited across dtypes and devices; optional Q/K normalization uses FLA.",
-)
-_FLA_TRAINING = DeterminismResult(
-    Determinism.UNKNOWN,
-    "FLA chunk recurrence repeatability has not been audited here. GDN/GDN2 select the Torch "
-    "reference for deterministic_mode; that selection alone does not classify the FLA kernel.",
-)
-_FLA_OTHER = DeterminismResult(
-    Determinism.UNKNOWN, "FLA auxiliary and recurrent entry points have not been audited."
-)
-_L2NORM = Dependency("flash-linear-attention", "fla.modules.l2norm", ("l2norm",))
-
 GDN_TORCH = KernelMetadata(
     name="gdn.torch_chunk_gated_delta_rule",
     requires=(
         Dependency(
-            "flash-linear-attention", "fla.modules.l2norm", ("l2norm",), feature="qk_l2norm"
+            requirement="flash-linear-attention",
+            module="fla.modules.l2norm",
+            symbols=("l2norm",),
+            feature="qk_l2norm",
         ),
     ),
-    determinism=_REFERENCE,
-    contract=_CONTRACT,
+    determinism=DeterminismResult(
+        status=Determinism.UNKNOWN,
+        reason="Existing deterministic-mode recurrence, for unpacked inputs. Bit-exact "
+        "forward/backward has not been audited across dtypes and devices; optional Q/K "
+        "normalization uses FLA.",
+    ),
+    contract="megatron.core.ops.ssm.gated_delta",
 )
 GDN2_TORCH = KernelMetadata(
     name="gdn2.torch_chunk_gdn2",
-    requires=GDN_TORCH.requires,
-    determinism=_REFERENCE,
-    contract=_CONTRACT,
+    requires=(
+        Dependency(
+            requirement="flash-linear-attention",
+            module="fla.modules.l2norm",
+            symbols=("l2norm",),
+            feature="qk_l2norm",
+        ),
+    ),
+    determinism=DeterminismResult(
+        status=Determinism.UNKNOWN,
+        reason="Existing deterministic-mode recurrence, for unpacked inputs. Bit-exact "
+        "forward/backward has not been audited across dtypes and devices; optional Q/K "
+        "normalization uses FLA.",
+    ),
+    contract="megatron.core.ops.ssm.gated_delta",
 )
 GDN_FLA = KernelMetadata(
     name="gdn.fla.chunk_gated_delta_rule",
     requires=(
         Dependency(
-            "flash-linear-attention", "fla.ops.gated_delta_rule", ("chunk_gated_delta_rule",)
+            requirement="flash-linear-attention",
+            module="fla.ops.gated_delta_rule",
+            symbols=("chunk_gated_delta_rule",),
         ),
     ),
-    determinism=_FLA_TRAINING,
-    contract=_CONTRACT,
+    determinism=DeterminismResult(
+        status=Determinism.UNKNOWN,
+        reason="FLA chunk recurrence repeatability has not been audited here. GDN/GDN2 select "
+        "the Torch reference for deterministic_mode; that selection alone does not classify "
+        "the FLA kernel.",
+    ),
+    contract="megatron.core.ops.ssm.gated_delta",
 )
 GDN2_FLA = KernelMetadata(
     name="gdn2.fla.chunk_gdn2",
-    requires=(Dependency("fla-core>=0.5.1", "fla.ops.gdn2.chunk", ("chunk_gdn2",)),),
-    determinism=_FLA_TRAINING,
-    contract=_CONTRACT,
+    requires=(
+        Dependency(
+            requirement="fla-core>=0.5.1", module="fla.ops.gdn2.chunk", symbols=("chunk_gdn2",)
+        ),
+    ),
+    determinism=DeterminismResult(
+        status=Determinism.UNKNOWN,
+        reason="FLA chunk recurrence repeatability has not been audited here. GDN/GDN2 select "
+        "the Torch reference for deterministic_mode; that selection alone does not classify "
+        "the FLA kernel.",
+    ),
+    contract="megatron.core.ops.ssm.gated_delta",
 )
 GDN_RECURRENT = KernelMetadata(
     name="gdn.fla.fused_recurrent_gated_delta_rule",
     requires=(
         Dependency(
-            "flash-linear-attention",
-            "fla.ops.gated_delta_rule",
-            ("fused_recurrent_gated_delta_rule",),
+            requirement="flash-linear-attention",
+            module="fla.ops.gated_delta_rule",
+            symbols=("fused_recurrent_gated_delta_rule",),
         ),
     ),
-    determinism=_FLA_OTHER,
-    contract=_CONTRACT,
+    determinism=DeterminismResult(
+        status=Determinism.UNKNOWN,
+        reason="FLA auxiliary and recurrent entry points have not been audited.",
+    ),
+    contract="megatron.core.ops.ssm.gated_delta",
 )
 FLA_CONV = KernelMetadata(
     name="gdn.fla.causal_conv1d",
-    requires=(Dependency("flash-linear-attention", "fla.modules.convolution", ("causal_conv1d",)),),
-    determinism=_FLA_OTHER,
-    contract=_CONTRACT,
+    requires=(
+        Dependency(
+            requirement="flash-linear-attention",
+            module="fla.modules.convolution",
+            symbols=("causal_conv1d",),
+        ),
+    ),
+    determinism=DeterminismResult(
+        status=Determinism.UNKNOWN,
+        reason="FLA auxiliary and recurrent entry points have not been audited.",
+    ),
+    contract="megatron.core.ops.ssm.gated_delta",
 )
 FLA_CONV_UPDATE = KernelMetadata(
     name="gdn.fla.causal_conv1d_update",
     requires=(
-        Dependency("flash-linear-attention", "fla.modules.convolution", ("causal_conv1d_update",)),
+        Dependency(
+            requirement="flash-linear-attention",
+            module="fla.modules.convolution",
+            symbols=("causal_conv1d_update",),
+        ),
     ),
-    determinism=_FLA_OTHER,
-    contract=_CONTRACT,
+    determinism=DeterminismResult(
+        status=Determinism.UNKNOWN,
+        reason="FLA auxiliary and recurrent entry points have not been audited.",
+    ),
+    contract="megatron.core.ops.ssm.gated_delta",
 )
 FLA_L2NORM = KernelMetadata(
-    name="gdn.fla.l2norm", requires=(_L2NORM,), determinism=_FLA_OTHER, contract=_CONTRACT
+    name="gdn.fla.l2norm",
+    requires=(
+        Dependency(
+            requirement="flash-linear-attention", module="fla.modules.l2norm", symbols=("l2norm",)
+        ),
+    ),
+    determinism=DeterminismResult(
+        status=Determinism.UNKNOWN,
+        reason="FLA auxiliary and recurrent entry points have not been audited.",
+    ),
+    contract="megatron.core.ops.ssm.gated_delta",
 )
 
 KERNELS = (

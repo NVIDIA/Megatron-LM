@@ -9,61 +9,89 @@ from megatron.core.ops.kernel_metadata import (
     KernelMetadata,
 )
 
-_CONTRACT = "megatron.core.ops.ssm.mamba2"
-_TRAINING = DeterminismResult(
-    Determinism.UNKNOWN,
-    "mamba-ssm training forward/backward is not certified here. The caller's causal-conv1d "
-    "version and deterministic-reduction guards must still be applied.",
-)
-_INFERENCE = DeterminismResult(
-    Determinism.UNKNOWN,
-    "Forward-only SSD/state update. Existing deterministic autotuning and batch-invariant "
-    "decode controls remain required; no broader bit-exact guarantee is declared.",
-)
 MAMBA_SCAN = KernelMetadata(
     name="mamba2.mamba_ssm.mamba_chunk_scan_combined",
     requires=(
         Dependency(
-            "mamba-ssm", "mamba_ssm.ops.triton.ssd_combined", ("mamba_chunk_scan_combined",)
+            requirement="mamba-ssm",
+            module="mamba_ssm.ops.triton.ssd_combined",
+            symbols=("mamba_chunk_scan_combined",),
         ),
     ),
-    determinism=_TRAINING,
-    contract=_CONTRACT,
+    determinism=DeterminismResult(
+        status=Determinism.UNKNOWN,
+        reason="mamba-ssm training forward/backward is not certified here. The caller's "
+        "causal-conv1d version and deterministic-reduction guards must still be applied.",
+    ),
+    contract="megatron.core.ops.ssm.mamba2",
 )
 MAMBA_SPLIT_SCAN = KernelMetadata(
     name="mamba2.mamba_ssm.mamba_split_conv1d_scan_combined",
     requires=(
         Dependency(
-            "mamba-ssm", "mamba_ssm.ops.triton.ssd_combined", ("mamba_split_conv1d_scan_combined",)
+            requirement="mamba-ssm",
+            module="mamba_ssm.ops.triton.ssd_combined",
+            symbols=("mamba_split_conv1d_scan_combined",),
         ),
-        Dependency("causal-conv1d", "causal_conv1d", ("causal_conv1d_fn",)),
+        Dependency(
+            requirement="causal-conv1d", module="causal_conv1d", symbols=("causal_conv1d_fn",)
+        ),
     ),
-    determinism=_TRAINING,
-    contract=_CONTRACT,
+    determinism=DeterminismResult(
+        status=Determinism.UNKNOWN,
+        reason="mamba-ssm training forward/backward is not certified here. The caller's "
+        "causal-conv1d version and deterministic-reduction guards must still be applied.",
+    ),
+    contract="megatron.core.ops.ssm.mamba2",
 )
 MAMBA_NORM = KernelMetadata(
     name="mamba2.mamba_ssm.RMSNormGated",
-    requires=(Dependency("mamba-ssm", "mamba_ssm.ops.triton.layernorm_gated", ("RMSNorm",)),),
-    determinism=_TRAINING,
-    contract=_CONTRACT,
+    requires=(
+        Dependency(
+            requirement="mamba-ssm",
+            module="mamba_ssm.ops.triton.layernorm_gated",
+            symbols=("RMSNorm",),
+        ),
+    ),
+    determinism=DeterminismResult(
+        status=Determinism.UNKNOWN,
+        reason="mamba-ssm training forward/backward is not certified here. The caller's "
+        "causal-conv1d version and deterministic-reduction guards must still be applied.",
+    ),
+    contract="megatron.core.ops.ssm.mamba2",
 )
 MAMBA_PREFILL = KernelMetadata(
     name="mamba2.triton.mamba_chunk_scan_combined_varlen",
-    requires=(Dependency("triton", "triton"),),
-    determinism=_INFERENCE,
-    contract=_CONTRACT,
+    requires=(Dependency(requirement="triton", module="triton"),),
+    determinism=DeterminismResult(
+        status=Determinism.UNKNOWN,
+        reason="Forward-only SSD/state update. Existing deterministic autotuning and "
+        "batch-invariant decode controls remain required; no broader bit-exact guarantee "
+        "is declared.",
+    ),
+    contract="megatron.core.ops.ssm.mamba2",
 )
 MAMBA_DECODE = KernelMetadata(
     name="mamba2.triton.selective_state_update",
-    requires=MAMBA_PREFILL.requires,
-    determinism=_INFERENCE,
-    contract=_CONTRACT,
+    requires=(Dependency(requirement="triton", module="triton"),),
+    determinism=DeterminismResult(
+        status=Determinism.UNKNOWN,
+        reason="Forward-only SSD/state update. Existing deterministic autotuning and "
+        "batch-invariant decode controls remain required; no broader bit-exact guarantee "
+        "is declared.",
+    ),
+    contract="megatron.core.ops.ssm.mamba2",
 )
 MAMBA_BATCH_INVARIANT = KernelMetadata(
     name="mamba2.triton.batch_invariant_decode_buffered_scan",
-    requires=MAMBA_PREFILL.requires,
-    determinism=_INFERENCE,
-    contract=_CONTRACT,
+    requires=(Dependency(requirement="triton", module="triton"),),
+    determinism=DeterminismResult(
+        status=Determinism.UNKNOWN,
+        reason="Forward-only SSD/state update. Existing deterministic autotuning and "
+        "batch-invariant decode controls remain required; no broader bit-exact guarantee "
+        "is declared.",
+    ),
+    contract="megatron.core.ops.ssm.mamba2",
 )
 
 KERNELS = (

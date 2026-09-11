@@ -58,7 +58,9 @@ File any bugs you find, keeping the following in mind:
   operation code must not override that selection using package availability.
   A selected but unavailable implementation must fail, not silently select another.
 - Declare optional imports, required exports, known version bounds and scoped
-  determinism in the family's `kernel_metadata.py`. Validate selected targets
+  determinism directly in each kernel's declaration in the family's
+  `kernel_metadata.py`, using named fields rather than shared dependency bundles
+  or inherited metadata. Validate selected targets
   before parameter/state allocation, then import and bind their concrete callables.
   Do not repeat these checks with `HAVE_*` flags or mock implementations in constructors.
 - Validate operation-owned auxiliary kernels separately from provider-owned
