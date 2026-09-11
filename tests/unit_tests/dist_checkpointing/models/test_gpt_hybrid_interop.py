@@ -654,6 +654,10 @@ def _run_gpt_to_hybrid_optimizer_load(
         context_parallel_size=src_cp,
         expert_model_parallel_size=src_ep,
         expert_tensor_parallel_size=src_etp,
+        # FSDP checkpoints contain DTensors whose DeviceMesh resolves process-group
+        # names while saving and loading. Preserve those groups while the source and
+        # destination models coexist, then destroy the registry in teardown.
+        destroy_process_groups=not use_megatron_fsdp,
     )
     with TempNamedDir(tmp_path_dist_ckpt / 'gpt_hybrid_opt_interop') as ckpt_dir:
         mock_args = parse_args(ignore_unknown_args=True)

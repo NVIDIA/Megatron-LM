@@ -2615,8 +2615,11 @@ def destroy_model_parallel(destroy_process_groups: bool = True):
 
     global _DATA_PARALLEL_GROUP_GLOO
     if (
-        _DATA_PARALLEL_GROUP_GLOO is not None
-        and torch.distributed.distributed_c10d._world.pg_map.get(_DATA_PARALLEL_GROUP_GLOO, None)
+        destroy_process_groups
+        and _DATA_PARALLEL_GROUP_GLOO is not None
+        and torch.distributed.distributed_c10d._world.pg_map.get(
+            _DATA_PARALLEL_GROUP_GLOO, None
+        )
         is not None
     ):
         torch.distributed.destroy_process_group(_DATA_PARALLEL_GROUP_GLOO)
@@ -2624,7 +2627,8 @@ def destroy_model_parallel(destroy_process_groups: bool = True):
 
     global _DATA_PARALLEL_GROUP_WITH_CP_GLOO
     if (
-        _DATA_PARALLEL_GROUP_WITH_CP_GLOO is not None
+        destroy_process_groups
+        and _DATA_PARALLEL_GROUP_WITH_CP_GLOO is not None
         and torch.distributed.distributed_c10d._world.pg_map.get(
             _DATA_PARALLEL_GROUP_WITH_CP_GLOO, None
         )
@@ -2678,7 +2682,8 @@ def destroy_model_parallel(destroy_process_groups: bool = True):
 
     global _EXPERT_DATA_PARALLEL_GROUP_GLOO
     if (
-        _EXPERT_DATA_PARALLEL_GROUP_GLOO is not None
+        destroy_process_groups
+        and _EXPERT_DATA_PARALLEL_GROUP_GLOO is not None
         and torch.distributed.distributed_c10d._world.pg_map.get(
             _EXPERT_DATA_PARALLEL_GROUP_GLOO, None
         )
@@ -2692,7 +2697,8 @@ def destroy_model_parallel(destroy_process_groups: bool = True):
 
     global _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_GLOO
     if (
-        _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_GLOO is not None
+        destroy_process_groups
+        and _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_GLOO is not None
         and torch.distributed.distributed_c10d._world.pg_map.get(
             _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_GLOO, None
         )
