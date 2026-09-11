@@ -20,8 +20,11 @@ from typing import Any, Dict, List
 import torch
 from torch.utils._pytree import tree_map as tree_map_pyt
 
-from megatron.core import parallel_state
-from megatron.core.num_microbatches_calculator import get_num_microbatches
+from megatron.core.num_microbatches_calculator import (
+    get_current_running_global_batch_size,
+    get_global_batch_size_upper_bound,
+    get_num_microbatches,
+)
 from megatron.core.packed_seq_params import resolve_thd_tail_padding_policy
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import (
@@ -73,6 +76,9 @@ except:
 _IS_GRAPH_CAPTURING = False
 _IS_GRAPH_WARMUP = False
 logger = logging.getLogger(__name__)
+
+_DSA_GRAPH_LAYOUT_BUFFER_KWARG = "dsa_cp_graph_layout_buffer"
+_DSA_GRAPH_ROUTE_BUFFER_KWARG = "dsa_cp_graph_route_buffer"
 
 
 def _set_skip_fp8_weight_update_tensor(skip: bool) -> None:
@@ -1825,6 +1831,336 @@ class TECudaGraphHelper:
 
         return uses_mhc_recompute_attn_cuda_graph_split(self.config)
 
+    def _uses_graph_dynamic_dsa_route_arena(self):
+        """Whether this capture needs block-owned, fixed-address DSA route metadata."""
+        return bool(getattr(self.config, "dsa_cp_balance_indexer_graph_dynamic_packs", False))
+
+    def _get_graph_sample_index(self, chunk_idx, layer_idx, microbatch_idx):
+        """Map a logical model chunk/callable/slot to TE's flattened input order."""
+        layers_before_chunk = sum(len(layers) for layers in self.callables_per_chunk[:chunk_idx])
+        if self.config.overlap_moe_expert_parallel_comm:
+            return (layers_before_chunk + layer_idx) * self.num_microbatches + microbatch_idx
+        return (
+            layers_before_chunk * self.num_microbatches
+            + microbatch_idx * len(self.callables_per_chunk[chunk_idx])
+            + layer_idx
+        )
+
+    @staticmethod
+    def _validate_graph_dynamic_route_pair(layout_i32, route_i64, *, name):
+        """Validate the two physical owners passed to a captured DSA route."""
+        if not isinstance(layout_i32, torch.Tensor) or not isinstance(route_i64, torch.Tensor):
+            raise TypeError(f"{name} must contain two torch.Tensor owners")
+        if layout_i32.dtype != torch.int32 or route_i64.dtype != torch.int64:
+            raise TypeError(
+                f"{name} must be (int32 layout, int64 route), got "
+                f"({layout_i32.dtype}, {route_i64.dtype})"
+            )
+        if layout_i32.dim() != 1 or route_i64.dim() != 1:
+            raise ValueError(
+                f"{name} owners must be flat, got "
+                f"{tuple(layout_i32.shape)} and {tuple(route_i64.shape)}"
+            )
+        if not layout_i32.is_contiguous() or not route_i64.is_contiguous():
+            raise ValueError(f"{name} owners must be contiguous")
+        if layout_i32.device != route_i64.device:
+            raise ValueError(
+                f"{name} owners must share a device, got "
+                f"{layout_i32.device} and {route_i64.device}"
+            )
+        if layout_i32.numel() == 0 or route_i64.numel() == 0:
+            raise ValueError(f"{name} owners must be non-empty")
+
+    def _canonicalize_graph_dynamic_route_inputs(self, sample_kwargs):
+        """Create one route owner pair per ``(model chunk, live graph slot)``.
+
+        ``_get_sample_arguments`` and TE 2.7 may reuse general graph inputs according to
+        schedule liveness. Route metadata has a stronger identity contract: every captured
+        DSA layer in one chunk/slot must consume the same pair, while distinct chunks or live
+        slots must remain isolated. Canonicalizing the kwargs before capture establishes that
+        contract without disabling reuse for any other input.
+        """
+        if not self._uses_graph_dynamic_dsa_route_arena():
+            return {}
+        if self.config.delay_wgrad_compute:
+            raise RuntimeError(
+                "Graph-dynamic DSA route arenas do not support delayed-wgrad capture"
+            )
+        if not isinstance(sample_kwargs, list):
+            raise TypeError("TE CUDA Graph sample_kwargs must be a list for DSA route capture")
+
+        expected_count = len(self.flattened_callables) * self.num_microbatches
+        if len(sample_kwargs) != expected_count:
+            raise ValueError(
+                "TE CUDA Graph DSA route sample count mismatch: "
+                f"expected {expected_count}, got {len(sample_kwargs)}"
+            )
+
+        route_arenas = {}
+        used_ptrs = set()
+        used_route_lengths = set()
+        logical_route_numel_by_chunk = {}
+        for chunk_idx, layers in enumerate(self.callables_per_chunk):
+            layers_are_mtp = self.callables_per_chunk_is_mtp[chunk_idx]
+            mtp_route_layer_numbers = [
+                layer_number
+                for layer_number, layer in enumerate(layers)
+                if layers_are_mtp[layer_number]
+                and hasattr(layer, "_uses_graph_dynamic_dsa_route")
+                and layer._uses_graph_dynamic_dsa_route()
+            ]
+            if mtp_route_layer_numbers:
+                logger.warning(
+                    "Graph-dynamic DSA MTP callables in model chunk %d keep their direct-layer "
+                    "two-buffer TE inputs; block-level two-copy arena staging applies only to "
+                    "the main decoder stack.",
+                    chunk_idx,
+                )
+            route_layer_numbers = [
+                layer_number
+                for layer_number, layer in enumerate(layers)
+                if not layers_are_mtp[layer_number]
+                and hasattr(layer, "_uses_graph_dynamic_dsa_route")
+                and layer._uses_graph_dynamic_dsa_route()
+            ]
+            if not route_layer_numbers:
+                continue
+
+            chunk_with_decoder = self.chunks_with_decoder[chunk_idx]
+            decoder_layers = tuple(chunk_with_decoder.decoder.layers)
+            if any(
+                layers[layer_number] not in decoder_layers for layer_number in route_layer_numbers
+            ):
+                raise RuntimeError(
+                    "Graph-dynamic DSA route arenas currently require route-enabled callables "
+                    "to belong to the model chunk's main decoder stack"
+                )
+
+            for slot in range(self.num_microbatches):
+                graph_indices = tuple(
+                    self._get_graph_sample_index(chunk_idx, layer_number, slot)
+                    for layer_number in route_layer_numbers
+                )
+                first_kwargs = sample_kwargs[graph_indices[0]]
+                if not isinstance(first_kwargs, dict):
+                    raise TypeError(
+                        f"TE CUDA Graph sample kwargs {graph_indices[0]} must be a dict"
+                    )
+                missing = {
+                    _DSA_GRAPH_LAYOUT_BUFFER_KWARG,
+                    _DSA_GRAPH_ROUTE_BUFFER_KWARG,
+                } - first_kwargs.keys()
+                if missing:
+                    raise RuntimeError(
+                        f"TE CUDA Graph DSA route sample {graph_indices[0]} is missing {missing}"
+                    )
+                source_layout = first_kwargs[_DSA_GRAPH_LAYOUT_BUFFER_KWARG]
+                source_route = first_kwargs[_DSA_GRAPH_ROUTE_BUFFER_KWARG]
+                self._validate_graph_dynamic_route_pair(
+                    source_layout,
+                    source_route,
+                    name=f"TE CUDA Graph DSA route sample {graph_indices[0]}",
+                )
+
+                # Allocate fresh owners even if the generic sample-input reuse pass supplied
+                # an older slot's tensors. The unique positive route suffix makes the whole
+                # TE sample signature distinct for every chunk/slot, so TE 2.7 can keep its
+                # global input/output reuse optimization without rebinding these live arenas.
+                signature_padding = chunk_idx * self.num_microbatches + slot + 1
+                canonical_layout = source_layout.clone()
+                canonical_route = torch.cat(
+                    (
+                        source_route,
+                        torch.full(
+                            (signature_padding,),
+                            signature_padding,
+                            dtype=source_route.dtype,
+                            device=source_route.device,
+                        ),
+                    )
+                )
+                previous_logical_route_numel = logical_route_numel_by_chunk.setdefault(
+                    chunk_idx, source_route.numel()
+                )
+                if previous_logical_route_numel != source_route.numel():
+                    raise ValueError(
+                        f"Graph-dynamic DSA route logical length changed within chunk {chunk_idx}"
+                    )
+                if canonical_route.numel() in used_route_lengths:
+                    raise RuntimeError(
+                        "Graph-dynamic DSA route signature padding did not produce globally "
+                        "unique route shapes"
+                    )
+                used_route_lengths.add(canonical_route.numel())
+                canonical_ptrs = (canonical_layout.data_ptr(), canonical_route.data_ptr())
+                if any(ptr in used_ptrs for ptr in canonical_ptrs):
+                    raise RuntimeError(
+                        "TE CUDA Graph allocator unexpectedly aliased distinct DSA route arenas"
+                    )
+                used_ptrs.update(canonical_ptrs)
+
+                schema = (
+                    source_layout.shape,
+                    source_route.shape,
+                    source_layout.device,
+                    source_route.device,
+                )
+                for graph_idx in graph_indices:
+                    layer_kwargs = sample_kwargs[graph_idx]
+                    if not isinstance(layer_kwargs, dict):
+                        raise TypeError(f"TE CUDA Graph sample kwargs {graph_idx} must be a dict")
+                    if (
+                        _DSA_GRAPH_LAYOUT_BUFFER_KWARG not in layer_kwargs
+                        or _DSA_GRAPH_ROUTE_BUFFER_KWARG not in layer_kwargs
+                    ):
+                        raise RuntimeError(
+                            f"TE CUDA Graph DSA route sample {graph_idx} is missing its two owners"
+                        )
+                    layout_i32 = layer_kwargs[_DSA_GRAPH_LAYOUT_BUFFER_KWARG]
+                    route_i64 = layer_kwargs[_DSA_GRAPH_ROUTE_BUFFER_KWARG]
+                    self._validate_graph_dynamic_route_pair(
+                        layout_i32, route_i64, name=f"TE CUDA Graph DSA route sample {graph_idx}"
+                    )
+                    if (
+                        layout_i32.shape,
+                        route_i64.shape,
+                        layout_i32.device,
+                        route_i64.device,
+                    ) != schema:
+                        raise ValueError(
+                            "All route-enabled layers in one model chunk must expose the same "
+                            f"graph metadata schema; sample {graph_idx} differs"
+                        )
+
+                    # sample kwargs dictionaries may themselves be shared by the generic
+                    # liveness reuse pass. Isolate the mapping before rebinding these two keys.
+                    canonical_kwargs = layer_kwargs.copy()
+                    canonical_kwargs[_DSA_GRAPH_LAYOUT_BUFFER_KWARG] = canonical_layout
+                    canonical_kwargs[_DSA_GRAPH_ROUTE_BUFFER_KWARG] = canonical_route
+                    sample_kwargs[graph_idx] = canonical_kwargs
+
+                route_arenas[(chunk_idx, slot)] = {
+                    "pair": (canonical_layout, canonical_route),
+                    "graph_indices": graph_indices,
+                    "logical_route_numel": source_route.numel(),
+                    "route_padding": signature_padding,
+                }
+
+        return route_arenas
+
+    def _attach_graph_dynamic_route_arenas(self, sample_kwargs, route_arenas):
+        """Validate post-TE pointer identity and attach each chunk's slot arenas."""
+        if not route_arenas:
+            return
+
+        final_ptrs = set()
+        arenas_by_chunk = defaultdict(dict)
+        logical_route_numel_by_chunk = {}
+        for (chunk_idx, slot), arena in route_arenas.items():
+            expected_layout, expected_route = arena["pair"]
+            logical_route_numel = arena["logical_route_numel"]
+            route_padding = arena["route_padding"]
+            expected_padding = chunk_idx * self.num_microbatches + slot + 1
+            if (
+                route_padding != expected_padding
+                or expected_route.numel() != logical_route_numel + route_padding
+            ):
+                raise RuntimeError(
+                    "TE CUDA Graph DSA route signature-padding bookkeeping is malformed for "
+                    f"chunk {chunk_idx}, slot {slot}: logical={logical_route_numel}, "
+                    f"padding={route_padding}, physical={expected_route.numel()}"
+                )
+            final_pair = None
+            for graph_idx in arena["graph_indices"]:
+                layer_kwargs = sample_kwargs[graph_idx]
+                if not isinstance(layer_kwargs, dict):
+                    raise RuntimeError(
+                        f"TE replaced DSA route sample kwargs {graph_idx} with a malformed value"
+                    )
+                try:
+                    actual_layout = layer_kwargs[_DSA_GRAPH_LAYOUT_BUFFER_KWARG]
+                    actual_route = layer_kwargs[_DSA_GRAPH_ROUTE_BUFFER_KWARG]
+                except KeyError as exc:
+                    raise RuntimeError(
+                        f"TE removed a captured DSA route owner from sample {graph_idx}"
+                    ) from exc
+                self._validate_graph_dynamic_route_pair(
+                    actual_layout,
+                    actual_route,
+                    name=f"post-capture TE CUDA Graph DSA route sample {graph_idx}",
+                )
+                actual_ptrs = (actual_layout.data_ptr(), actual_route.data_ptr())
+                if (
+                    actual_layout.shape != expected_layout.shape
+                    or actual_route.shape != expected_route.shape
+                    or actual_layout.device != expected_layout.device
+                    or actual_route.device != expected_route.device
+                ):
+                    raise RuntimeError(
+                        "TE CUDA Graph input-buffer reuse changed the DSA route schema for "
+                        f"chunk {chunk_idx}, slot {slot}, sample {graph_idx}"
+                    )
+                if final_pair is None:
+                    final_pair = (actual_layout, actual_route)
+                elif actual_ptrs != (final_pair[0].data_ptr(), final_pair[1].data_ptr()):
+                    raise RuntimeError(
+                        "TE CUDA Graph input-buffer reuse split one canonical DSA route "
+                        f"arena across layers for chunk {chunk_idx}, slot {slot}: expected "
+                        f"{(final_pair[0].data_ptr(), final_pair[1].data_ptr())}, got "
+                        f"{actual_ptrs} at sample {graph_idx}"
+                    )
+
+            if final_pair is None:
+                raise RuntimeError(
+                    f"TE CUDA Graph DSA route chunk {chunk_idx}, slot {slot} has no samples"
+                )
+            pair_ptrs = (final_pair[0].data_ptr(), final_pair[1].data_ptr())
+            if any(ptr in final_ptrs for ptr in pair_ptrs):
+                raise RuntimeError(
+                    "TE CUDA Graph DSA route arenas alias across model chunks or live slots"
+                )
+            final_ptrs.update(pair_ptrs)
+            arenas_by_chunk[chunk_idx][slot] = final_pair
+            previous_logical_route_numel = logical_route_numel_by_chunk.setdefault(
+                chunk_idx, logical_route_numel
+            )
+            if previous_logical_route_numel != logical_route_numel:
+                raise RuntimeError(
+                    f"TE CUDA Graph DSA route logical length changed within chunk {chunk_idx}"
+                )
+
+        for chunk_idx, slots in arenas_by_chunk.items():
+            if set(slots) != set(range(self.num_microbatches)):
+                raise RuntimeError(
+                    f"TE CUDA Graph DSA route arenas for chunk {chunk_idx} have slots "
+                    f"{sorted(slots)}, expected 0..{self.num_microbatches - 1}"
+                )
+            block = self.chunks_with_decoder[chunk_idx].decoder
+            if not hasattr(block, "set_te_cuda_graph_route_metadata_arenas"):
+                raise RuntimeError(
+                    f"Model chunk {chunk_idx} does not expose a route-metadata arena owner"
+                )
+            cp_group = getattr(getattr(block, "pg_collection", None), "cp", None)
+            if cp_group is None or cp_group.size() != self.config.context_parallel_size:
+                raise RuntimeError(
+                    "TE CUDA Graph DSA route arena requires the model chunk's explicit CP "
+                    f"group to have size {self.config.context_parallel_size}"
+                )
+            block.set_te_cuda_graph_route_metadata_arenas(
+                tuple(slots[slot] for slot in range(self.num_microbatches)),
+                logical_route_numel=logical_route_numel_by_chunk[chunk_idx],
+                cp_rank=cp_group.rank(),
+            )
+
+    def _clear_graph_dynamic_route_arenas(self):
+        """Drop block-owned arena handles after their captured graphs are reset."""
+        for chunk in self.chunks_with_decoder:
+            if chunk is None:
+                continue
+            block = chunk.decoder
+            if hasattr(block, "clear_te_cuda_graph_route_metadata_arenas"):
+                block.clear_te_cuda_graph_route_metadata_arenas()
+
     def _validate_mhc_static_hidden_inputs(self, sample_args):
         """Ensure aliased static inputs have disjoint [fwd, bwd] liveness windows.
 
@@ -2010,9 +2346,15 @@ class TECudaGraphHelper:
             - sample_keys: Tuple of (shape, dtype, layout) for args + (key, shape, dtype, layout)
                 for kwargs, used to match compatible buffers for reuse.
         """
-        assert self.num_model_chunks == max(
+        capture_layers_per_unit = (
+            [1] * len(self.flattened_callables)
+            if chunk_id_list is not None
+            else self.num_layers_per_chunk
+        )
+        num_capture_units = len(capture_layers_per_unit)
+        assert num_capture_units == max(
             order
-        ), "num_model_chunks must match the max chunk id in order."
+        ), "capture units must match the max chunk id in order."
         if chunk_id_list is None:
             # check only if 1f1b overlap is disabled.
             assert (
@@ -2152,8 +2494,7 @@ class TECudaGraphHelper:
 
         # Calculate the starting index of each chunk in callables for future use.
         prefix_num_layers = [0]
-        for model_chunk_idx in range(self.num_model_chunks):
-            num_layers = self.num_layers_per_chunk[model_chunk_idx]
+        for num_layers in capture_layers_per_unit:
             prefix_num_layers.append(prefix_num_layers[-1] + num_layers)
 
         # Reorganize args and kwargs for input tensor reuse.
@@ -2173,7 +2514,7 @@ class TECudaGraphHelper:
         # bookkeeping no one consumes.
         track_mhc_intervals = self._uses_mhc_direct_write_arena()
         self._mhc_sample_order_intervals = {}
-        fwd_idx = [0] * self.num_model_chunks
+        fwd_idx = [0] * num_capture_units
         for idx, chunk_id in enumerate(order):
             model_chunk_idx = abs(ceil(chunk_id)) - 1
 
@@ -2182,7 +2523,7 @@ class TECudaGraphHelper:
                     fwd_sample_queues[model_chunk_idx] = []
 
                 sample_start_idx = (prefix_num_layers[model_chunk_idx] * self.num_microbatches) + (
-                    fwd_idx[model_chunk_idx] * self.num_layers_per_chunk[model_chunk_idx]
+                    fwd_idx[model_chunk_idx] * capture_layers_per_unit[model_chunk_idx]
                 )
                 if chunk_id_list:
                     model_chunk_idx = chunk_id_list[idx][0]
@@ -2264,7 +2605,7 @@ class TECudaGraphHelper:
             elif ceil(chunk_id) == chunk_id:
                 num_consumed_samples = min(
                     len(fwd_sample_queues[model_chunk_idx]),
-                    self.num_layers_per_chunk[model_chunk_idx],
+                    capture_layers_per_unit[model_chunk_idx],
                 )
                 last_retired_samples[model_chunk_idx] = []
                 for sample_keys, per_callable_fwd_idx in fwd_sample_queues[model_chunk_idx][
@@ -2315,24 +2656,16 @@ class TECudaGraphHelper:
     def _needs_full_local_padding_mask(self, layer, chunk, static_inputs) -> bool:
         """Whether this layer's static padding_mask needs full max_seqlen_per_dp_cp_rank.
 
-        For the post_process chunk (last PP/VPP chunk that holds labels),
-        padding_mask arrives at the full CP-local length because:
-          1. labels are present -> actual_T_is_local=True -> no CP re-partition;
-          2. pre_process=False  -> _preprocess does not scatter under SP.
-        Other non-pre_process chunks (intermediate VPP) have no data, so their
-        captured padding_mask stays at the default scattered size from
-        `get_layer_static_inputs` (~max_seqlen/CP/TP).
-
-        Returns True only for that post_process-with-data case under THD CUDA
-        Graph + SP + PP>1.
+        Every non-pre_process PP/VPP chunk receives an already pipeline-local hidden-state tensor;
+        sequence-parallel preprocessing therefore does not scatter its padding mask. Its replay
+        buffer must use the full CP-local THD capacity, including intermediate VPP chunks that do
+        not own labels. First-stage chunks still use the default scattered static-input shape.
         """
         return (
             hasattr(layer, "_is_thd_cuda_graph")
             and layer._is_thd_cuda_graph()
             and self.config.sequence_parallel
-            and self.config.pipeline_model_parallel_size > 1
             and not getattr(chunk, "pre_process", True)
-            and getattr(chunk, "post_process", False)
             and "padding_mask" in static_inputs
         )
 
@@ -2371,7 +2704,7 @@ class TECudaGraphHelper:
 
     def _get_probe_num_microbatches_for_dynamic_slots(self):
         """Return a topology-only probe microbatch count for slot inference."""
-        pipeline_parallel_size = parallel_state.get_pipeline_model_parallel_world_size()
+        pipeline_parallel_size = self.pp_group.size()
         if pipeline_parallel_size == 1 and not self.config.overlap_moe_expert_parallel_comm:
             return 1
 
@@ -2383,6 +2716,20 @@ class TECudaGraphHelper:
             pipeline_parallel_size * max(1, self.num_model_chunks) * 4,
             group_size * max(1, self.num_model_chunks) * 2,
             1,
+        )
+
+    @staticmethod
+    def _get_dynamic_capture_num_microbatches(
+        runtime_num_microbatches, packed_num_microbatches_upper_bound, topology_num_slots
+    ):
+        """Select a capture count that cannot alias any still-live PP/VPP graph input.
+
+        The runtime and packing bounds cover the current data step.  The topology bound is
+        independent of the current global batch size and protects every fixed-GBS PP/VPP
+        schedule; a later source-GBS increase is rejected separately before capture.
+        """
+        return max(
+            runtime_num_microbatches, packed_num_microbatches_upper_bound, topology_num_slots
         )
 
     @staticmethod
@@ -2417,17 +2764,19 @@ class TECudaGraphHelper:
         return max(1, num_packed_sequences // dp_size)
 
     def _get_thd_varlen_max_num_microbatches(
-        self, runtime_num_microbatches, microbatch_group_size_per_vp_stage
+        self, global_batch_size_upper_bound, microbatch_group_size_per_vp_stage
     ):
-        """Return the THD packing upper bound used for dynamic CUDA graph capture."""
-        if self.config.sequence_packing_scheduler != 'dp_balanced':
-            return runtime_num_microbatches, "runtime"
-        if self.config.max_seqlen_per_dp_cp_rank is None:
-            return runtime_num_microbatches, "runtime"
-
+        """Return the run-level THD packing upper bound used for graph capture."""
         dp_size = self.dp_group.size()
+        runtime_upper_bound = math.ceil(
+            global_batch_size_upper_bound / (self.micro_batch_size * dp_size)
+        )
+        if self.config.sequence_packing_scheduler != 'dp_balanced':
+            return runtime_upper_bound, "run_gbs_upper_bound"
+        if self.config.max_seqlen_per_dp_cp_rank is None:
+            return runtime_upper_bound, "run_gbs_upper_bound"
+
         cp_size = self.dp_cp_group.size() // dp_size
-        global_batch_size = runtime_num_microbatches * self.micro_batch_size * dp_size
         # Use the dataset-produced padded sequence length upper bound when available.
         # Do not use max_seqlen_per_dp_cp_rank here: under CP it is only the per-rank
         # token budget, not the max length of one input sample before packing.
@@ -2448,7 +2797,7 @@ class TECudaGraphHelper:
 
         return (
             self._get_dp_balanced_thd_max_num_microbatches(
-                global_batch_size,
+                global_batch_size_upper_bound,
                 dp_size,
                 cp_size,
                 int(self.config.max_seqlen_per_dp_cp_rank),
@@ -2463,23 +2812,41 @@ class TECudaGraphHelper:
             "thd_varlen_upper_bound",
         )
 
-    def _get_cuda_graph_input_data(self):
-        """
-        Create the CUDA Graph capturing input data.
-        The data is organized per-chunk per-microbatch per-layer.
-        """
-
-        # Get the PP and VPP scheduling order.
-        from megatron.core.pipeline_parallel.schedules import (
-            get_pp_rank_microbatches,
-            get_schedule_table,
+    def _get_dynamic_capture_plan(self, auto_num_slots, microbatch_group_size_per_vp_stage):
+        """Return run-level graph slot counts and their sizing diagnostics."""
+        runtime_num_microbatches = get_num_microbatches()
+        current_running_global_batch_size = get_current_running_global_batch_size()
+        run_global_batch_size_upper_bound = get_global_batch_size_upper_bound()
+        if run_global_batch_size_upper_bound > current_running_global_batch_size:
+            raise ValueError(
+                "cuda_graph_dynamic_microbatches does not support a "
+                "step_batch_size_schedule that increases the source global batch size after "
+                "CUDA graphs are captured. Capturing every future schedule slot can require an "
+                "unbounded number of graph instances; use a fixed global batch size or capture "
+                "after the schedule reaches its maximum."
+            )
+        packed_num_microbatches_upper_bound, capture_mode = (
+            self._get_thd_varlen_max_num_microbatches(
+                current_running_global_batch_size, microbatch_group_size_per_vp_stage
+            )
+        )
+        capture_num_microbatches = self._get_dynamic_capture_num_microbatches(
+            runtime_num_microbatches, packed_num_microbatches_upper_bound, auto_num_slots
+        )
+        return (
+            capture_num_microbatches,
+            runtime_num_microbatches,
+            current_running_global_batch_size,
+            run_global_batch_size_upper_bound,
+            packed_num_microbatches_upper_bound,
+            capture_mode,
         )
 
+    def _set_capture_num_microbatches(self):
+        """Agree on capture capacity, including pipeline ranks with no graphable layers."""
         microbatch_group_size_per_vp_stage = self.config.microbatch_group_size_per_vp_stage
         if microbatch_group_size_per_vp_stage is None:
-            microbatch_group_size_per_vp_stage = (
-                parallel_state.get_pipeline_model_parallel_world_size()
-            )
+            microbatch_group_size_per_vp_stage = self.pp_group.size()
 
         # If PP is not enabled, we only need to capture one microbatch.
         if self.pp_group.size() == 1 and not self.config.overlap_moe_expert_parallel_comm:
@@ -2502,6 +2869,7 @@ class TECudaGraphHelper:
                 microbatch_group_size_per_vp_stage,
                 False,
                 overlap_moe_expert_parallel_comm=self.config.overlap_moe_expert_parallel_comm,
+                p2p_communicator=self.p2p_communicator,
             )
             _probe_st = _probe_get_st(
                 probe_num_microbatches, self.num_model_chunks, microbatch_group_size_per_vp_stage
@@ -2512,7 +2880,7 @@ class TECudaGraphHelper:
             auto_num_slots = self._get_required_num_microbatch_slots_from_order(
                 _probe_order, self.num_model_chunks
             )
-            pp_group = parallel_state.get_pipeline_model_parallel_group()
+            pp_group = self.pp_group
             if pp_group is not None and pp_group.size() > 1:
                 auto_num_slots_tensor = torch.tensor(
                     [auto_num_slots], dtype=torch.int32, device=torch.cuda.current_device()
@@ -2521,21 +2889,26 @@ class TECudaGraphHelper:
                     auto_num_slots_tensor, op=torch.distributed.ReduceOp.MAX, group=pp_group
                 )
                 auto_num_slots = int(auto_num_slots_tensor.item())
-            runtime_num_microbatches = get_num_microbatches()
-            max_num_microbatches, capture_mode = self._get_thd_varlen_max_num_microbatches(
-                runtime_num_microbatches, microbatch_group_size_per_vp_stage
-            )
-            if self.config.overlap_moe_expert_parallel_comm or self.config.delay_wgrad_compute:
+            (
+                dynamic_capture_num_microbatches,
+                runtime_num_microbatches,
+                current_running_global_batch_size,
+                run_global_batch_size_upper_bound,
+                max_num_microbatches,
+                capture_mode,
+            ) = self._get_dynamic_capture_plan(auto_num_slots, microbatch_group_size_per_vp_stage)
+            if self.config.delay_wgrad_compute or (
+                self.config.overlap_moe_expert_parallel_comm
+                and not self._uses_graph_dynamic_dsa_route_arena()
+            ):
                 self.num_microbatches = runtime_num_microbatches
                 capture_mode = "runtime"
                 fallback_reason = "overlap_moe_expert_parallel_comm/delay_wgrad_compute"
             else:
-                # auto_num_slots is a topology-only theoretical lower bound for PP/VPP graph
-                # slot liveness. THD varlen packing can produce different real microbatch
-                # counts across iterations, so capture uses the THD/GBS-derived upper
-                # bound instead of the reduced slot count for safety. Currently TE cuda
-                # graph backend may crash if use the auto_num_slots.
-                self.num_microbatches = max(runtime_num_microbatches, max_num_microbatches)
+                # THD packing bounds the current data step, while auto_num_slots is the
+                # topology-only liveness floor that stays valid if a later step-batch-size
+                # schedule entry increases the runtime count after capture.
+                self.num_microbatches = dynamic_capture_num_microbatches
                 fallback_reason = None
             log_on_each_pipeline_stage(
                 logger=logger,
@@ -2544,6 +2917,8 @@ class TECudaGraphHelper:
                 level=logging.INFO,
                 msg=f'Rank {torch.distributed.get_rank()}: dynamic CUDA graph slots '
                 f'enabled. runtime_num_microbatches={runtime_num_microbatches}, '
+                f'current_running_global_batch_size={current_running_global_batch_size}, '
+                f'run_global_batch_size_upper_bound={run_global_batch_size_upper_bound}, '
                 f'auto_num_slots={auto_num_slots}, '
                 f'max_num_microbatches={max_num_microbatches}, '
                 f'capture_num_microbatches={self.num_microbatches}, '
@@ -2552,6 +2927,18 @@ class TECudaGraphHelper:
             )
         else:
             self.num_microbatches = get_num_microbatches()
+
+    def _get_cuda_graph_input_data(self):
+        """Create sample inputs in chunk/microbatch/layer capture order."""
+        from megatron.core.pipeline_parallel.schedules import (
+            get_pp_rank_microbatches,
+            get_schedule_table,
+        )
+
+        self._set_capture_num_microbatches()
+        microbatch_group_size_per_vp_stage = self.config.microbatch_group_size_per_vp_stage
+        if microbatch_group_size_per_vp_stage is None:
+            microbatch_group_size_per_vp_stage = self.pp_group.size()
 
         _, _, num_warmup_microbatches, _ = get_pp_rank_microbatches(
             self.num_microbatches,
@@ -2575,6 +2962,22 @@ class TECudaGraphHelper:
         )
         chunk_id_list = None
         if self.config.overlap_moe_expert_parallel_comm:
+            # The runtime scheduler visits eager layers too. Retain those positions
+            # when interleaving forward/backward graph calls, especially for Hybrid
+            # attention/MoE patterns with an uncaptured trailing dense layer.
+            layer_to_callable = []
+            for chunk, callables in zip(self.chunks_with_decoder, self.callables_per_chunk):
+                if chunk is None:
+                    layer_to_callable.append([])
+                    continue
+                scheduled_layers = list(chunk.decoder.layers) + [
+                    layer.mtp_model_layer
+                    for layer in getattr(getattr(chunk, "mtp", None), "layers", [])
+                ]
+                callable_indices = {id(layer): index for index, layer in enumerate(callables)}
+                layer_to_callable.append(
+                    [callable_indices.get(id(layer)) for layer in scheduled_layers]
+                )
             wgrad_in_graph_scope = CudaGraphModule.attn in self.config.cuda_graph_modules or (
                 CudaGraphModule.moe_router in self.config.cuda_graph_modules
                 and self.config.moe_shared_expert_intermediate_size is not None
@@ -2582,16 +2985,16 @@ class TECudaGraphHelper:
             )
             capture_wgrad_graph = self.config.delay_wgrad_compute and wgrad_in_graph_scope
             order, chunk_id_list = get_overlap_moe_expert_parallel_comm_order(
-                order, self.num_layers_per_chunk, capture_wgrad_graph
+                order, self.num_layers_per_chunk, capture_wgrad_graph, layer_to_callable
             )
-            self.num_layers_per_chunk = [1] * sum(self.num_layers_per_chunk)
-            self.num_model_chunks = max(order)
             _order_without_wgrad = []
             for c_id in order:
                 if ceil(c_id) != c_id:
                     continue
                 _order_without_wgrad.append(c_id)
-            self.num_microbatches = len(_order_without_wgrad) // self.num_model_chunks // 2
+            assert len(_order_without_wgrad) == (
+                len(self.flattened_callables) * self.num_microbatches * 2
+            ), "Expanded overlap capture must preserve the microbatch count"
             log_on_each_pipeline_stage(
                 logger=logger,
                 tp_group=self.tp_group,
@@ -2628,7 +3031,11 @@ class TECudaGraphHelper:
             if is_te_min_version("2.6.0"):
                 # Starting from TE 2.6.0, make_graphed_callables() accepts different number
                 # of layers per chunk.
-                kwargs['_num_layers_per_chunk'] = self.num_layers_per_chunk
+                kwargs['_num_layers_per_chunk'] = (
+                    [1] * len(self.flattened_callables)
+                    if self.config.overlap_moe_expert_parallel_comm
+                    else self.num_layers_per_chunk
+                )
             if is_te_min_version("2.7.0"):
                 # Starting from TE 2.7.0, make_graphed_callables() optimizes the graph memory
                 # usage by reusing input/output data buffers between graphs. The reuse pass
@@ -2721,6 +3128,9 @@ class TECudaGraphHelper:
         Reset the model and optimizer state after capturing CUDA Graphs.
         """
         from megatron.core.distributed.finalize_model_grads import reset_model_temporary_tensors
+        from megatron.core.transformer.experimental_attention_variant.dsa import (
+            DSAIndexerLossLoggingHelper,
+        )
         from megatron.core.transformer.moe.moe_logging import get_moe_metrics_tracker
 
         for model_chunk in self.model:
@@ -2728,6 +3138,10 @@ class TECudaGraphHelper:
         for optimizer in self.optimizers:
             optimizer.zero_grad()
         get_moe_metrics_tracker().clear()
+        # TE warmup also accumulates synthetic indexer losses. Replay writes
+        # through the captured tracker address without rerunning Python, so
+        # clear the values in place and retain the CP/TP reduction groups.
+        DSAIndexerLossLoggingHelper.clean_loss_in_tracker(preserve_groups=True)
         reset_model_temporary_tensors(self.config, self.model)
 
     def _finish_capturing(self, start_time):
@@ -2780,6 +3194,10 @@ class TECudaGraphHelper:
         start_time = self._start_capturing()
 
         if not self.flattened_callables:
+            if self._should_use_dynamic_microbatch_slots():
+                # Other PP ranks reduce their topology liveness bound here.
+                # An eager-only rank must participate in the same collective.
+                self._set_capture_num_microbatches()
             # Check if there are any graphable layers. If not, log a warning and skip capture,
             # but still call _finish_capturing to ensure all ranks complete the capture phase.
             logger.warning(
@@ -2788,6 +3206,8 @@ class TECudaGraphHelper:
         else:
             # Prepare CUDA Graph capturing input data and call `make_graphed_callables`.
             sample_args, kwargs = self._get_cuda_graph_input_data()
+            sample_kwargs = kwargs.get('sample_kwargs', [])
+            route_arenas = self._canonicalize_graph_dynamic_route_inputs(sample_kwargs)
             if self.config.sequence_parallel:
                 rng_context = get_cuda_rng_tracker().fork()
             else:
@@ -2812,22 +3232,14 @@ class TECudaGraphHelper:
             # configuration would retain num_microbatches static input tensors
             # per layer for nothing. Config-level, so hoisted out of both loops.
             retain_static_inputs = self._uses_mhc_direct_write_arena()
-            num_layers_accumulated = 0
-            for layers in self.callables_per_chunk:
+            for chunk_idx, layers in enumerate(self.callables_per_chunk):
                 for layer_number, layer in enumerate(layers):
                     layer.cuda_graphs = []
                     static_hidden_inputs = []
                     for batch_number in range(self.num_microbatches):
-                        if self.config.overlap_moe_expert_parallel_comm:
-                            graph_idx = (
-                                num_layers_accumulated + layer_number
-                            ) * self.num_microbatches + batch_number
-                        else:
-                            graph_idx = (
-                                num_layers_accumulated * self.num_microbatches
-                                + batch_number * len(layers)
-                                + layer_number
-                            )
+                        graph_idx = self._get_graph_sample_index(
+                            chunk_idx, layer_number, batch_number
+                        )
                         layer.cuda_graphs.append(graphs[graph_idx])
                         # TE may rebind sample inputs while optimizing
                         # graph-buffer reuse, so retain the final fixed-address
@@ -2840,7 +3252,11 @@ class TECudaGraphHelper:
                             static_hidden_inputs.append(sample_args[graph_idx][0])
                     if retain_static_inputs:
                         layer.set_te_cuda_graph_static_hidden_inputs(static_hidden_inputs)
-                num_layers_accumulated += len(layers)
+
+            # TE 2.7 may rebind general graph inputs after capture. Adopt the final common
+            # pair for each chunk/slot, while rejecting a split pair or cross-slot alias,
+            # before exposing the fixed addresses to eager block-level staging.
+            self._attach_graph_dynamic_route_arenas(sample_kwargs, route_arenas)
 
             self._graphs_created = True
 
@@ -2875,6 +3291,7 @@ class TECudaGraphHelper:
                 layer.cuda_graphs = []
                 layer.cuda_graph_manual_hooks = []
                 layer.clear_te_cuda_graph_static_hidden_inputs()
+        self._clear_graph_dynamic_route_arenas()
 
         log_on_each_pipeline_stage(
             logger=logger,
@@ -2914,7 +3331,9 @@ def convert_schedule_table_to_order(num_warmup_microbatches, num_model_chunks, s
     return order
 
 
-def get_overlap_moe_expert_parallel_comm_order(order, num_layers_per_chunk, capture_wgrad_graph):
+def get_overlap_moe_expert_parallel_comm_order(
+    order, num_layers_per_chunk, capture_wgrad_graph, layer_to_callable=None
+):
     """
     This functions gets the order for overlap_moe_expert_parallel_comm schedule for the original
     chunk-wise order list. Each chunk is transformered to chunks with only 1 layer so that
@@ -2930,6 +3349,8 @@ def get_overlap_moe_expert_parallel_comm_order(order, num_layers_per_chunk, capt
             of this list equals the number of chunks.
         capture_wgrad_graph (bool): If True, weight gradient computation graphs are added to the
             order by appending entries with layer_id - 0.5.
+        layer_to_callable: Optional per-chunk map from runtime layer positions to local
+            graph callable indices. None entries represent eager layers at schedule yields.
 
     Returns:
         Tuple[List[float], List[Optional[List[int]]]]: A tuple containing:
@@ -2974,6 +3395,12 @@ def get_overlap_moe_expert_parallel_comm_order(order, num_layers_per_chunk, capt
     def get_layer_range(c_id):
         num_layers = num_layers_per_chunk[abs(c_id) - 1]
         num_layers_previous_chunks = sum(num_layers_per_chunk[: abs(c_id) - 1])
+        if layer_to_callable is not None:
+            mapped = [
+                num_layers_previous_chunks + index + 1 if index is not None else 0
+                for index in layer_to_callable[abs(c_id) - 1]
+            ]
+            return mapped if c_id > 0 else [-index for index in reversed(mapped)]
         if c_id > 0:
             return list(
                 range(num_layers_previous_chunks + 1, num_layers_previous_chunks + num_layers + 1)
@@ -2983,8 +3410,11 @@ def get_overlap_moe_expert_parallel_comm_order(order, num_layers_per_chunk, capt
     # warmup stage
     for c_id in order[:first_backward_idx]:
         layer_range = get_layer_range(c_id)
-        new_order += layer_range
-        chunk_id_list.extend([abs(c_id) - 1, i] for i in range(len(layer_range)))
+        offset = sum(num_layers_per_chunk[: c_id - 1])
+        new_order.extend(layer_id for layer_id in layer_range if layer_id != 0)
+        chunk_id_list.extend(
+            [c_id - 1, layer_id - offset - 1] for layer_id in layer_range if layer_id != 0
+        )
 
     # 1f1b overlap stage
     if first_backward_idx < last_forward_idx:
@@ -2994,23 +3424,25 @@ def get_overlap_moe_expert_parallel_comm_order(order, num_layers_per_chunk, capt
         ):
             layer_range_f = get_layer_range(c_id_f)
             layer_range_b = get_layer_range(c_id_b)
-            index = 0
+            backward_graphs = [layer_id for layer_id in layer_range_b if layer_id != 0]
             for l_b, l_f in zip_longest(layer_range_b, layer_range_f, fillvalue=0):
                 # always forward graph before backward graph
                 if l_f != 0:
-                    add_order(c_id_f, l_f, index=index)
+                    callable_idx = l_f - sum(num_layers_per_chunk[: c_id_f - 1]) - 1
+                    add_order(c_id_f, l_f, index=callable_idx)
                 if l_b != 0:
                     add_order(c_id_b, l_b)
-                    if capture_wgrad_graph and index < len(layer_range_b) - 1:
+                    if capture_wgrad_graph and l_b != backward_graphs[-1]:
                         add_order(c_id_b, l_b, is_wgrad=True)
-                index += 1
             # last wgrad backward
-            if capture_wgrad_graph and layer_range_b:
-                add_order(c_id_b, layer_range_b[-1], is_wgrad=True)
+            if capture_wgrad_graph and backward_graphs:
+                add_order(c_id_b, backward_graphs[-1], is_wgrad=True)
 
     # cool down stage, backward graphs only
     for c_id in order[last_forward_idx + 1 :]:
         for l_b in get_layer_range(c_id):
+            if l_b == 0:
+                continue
             add_order(c_id, l_b)
             if capture_wgrad_graph:
                 add_order(c_id, l_b, is_wgrad=True)
@@ -3039,6 +3471,7 @@ def set_current_microbatch(model, microbatch_id):
     except RuntimeError:
         decoder_exists = False
     if decoder_exists and model_with_decoder is not None:
+        model_with_decoder.decoder.current_microbatch = microbatch_id
         for layer in model_with_decoder.decoder.layers:
             layer.current_microbatch = microbatch_id
         if hasattr(model_with_decoder, 'mtp'):
@@ -3066,6 +3499,7 @@ def set_current_microbatch(model, microbatch_id):
     if model_with_vision is not None and hasattr(model_with_vision, 'vision_model'):
         vision_model = model_with_vision.vision_model
         if hasattr(vision_model, 'decoder') and hasattr(vision_model.decoder, 'layers'):
+            vision_model.decoder.current_microbatch = microbatch_id
             for layer in vision_model.decoder.layers:
                 layer.current_microbatch = microbatch_id
 

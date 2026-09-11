@@ -9,6 +9,7 @@ import torch
 from torch import Tensor
 
 from megatron.core import tensor_parallel
+from megatron.core.models.common.utils import _BackwardDWWrapper as _BackwardDWWrapper
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
@@ -222,6 +223,14 @@ class PreProcessNode(ScheduleNode):
         Returns:
             The processed decoder input tensor.
         """
+        # The overlap schedule bypasses TransformerBlock.forward. Stage once for
+        # this invocation and keep its fixed-address route owners until backward.
+        self.chunk_state.packed_seq_params = (
+            self.gpt_model.decoder._stage_te_cuda_graph_route_metadata(
+                self.chunk_state.packed_seq_params,
+                microbatch_idx=self.chunk_state.current_microbatch,
+            )
+        )
         # Get decoder input
         if not self.gpt_model.pre_process:
             self.chunk_state.decoder_input = self.gpt_model.decoder.input_tensor
@@ -496,69 +505,6 @@ class TransformerLayerNode(ScheduleNode):
         self.submodule = None
 
 
-class _BackwardDWWrapper:
-    """Wrapper for managing backward weight gradient computation of attn module.
-
-    This class handles the execution of weight gradient computations for transformer layers,
-    coordinating between CUDA graphed and non-graphed components. It is used when
-    overlap_moe_expert_parallel_comm and delay_wgrad_compute are enabled to manage
-    the delayed weight gradient computation in MoE models.
-
-    The wrapper stores references to the attention and shared expert backward weight gradient
-    callables, and determines which components should be executed based on whether CUDA graphs
-    are being replayed and which scopes are covered by the graphs.
-    """
-
-    def __init__(self, layer):
-        assert isinstance(
-            layer, GraphableMegatronModule
-        ), "cuda graphed ep overlap only supports GraphableMegatronModule."
-        assert isinstance(
-            layer, TransformerLayer
-        ), "cuda graphed ep overlap only supports TransformerLayer for now."
-        self.layer = layer
-        self.graphed_backward_dw_callable = None
-        self.attn_dw_callable = layer.self_attention.backward_dw
-        self.submodules = [layer.self_attention]
-        if layer.is_moe_layer:
-            self.shared_expert_dw_callable = partial(
-                layer.mlp.backward_dw, routed_experts=False, shared_experts=True
-            )
-            if layer.mlp.use_shared_expert:
-                self.submodules.append(layer.mlp.shared_experts)
-        else:
-            self.shared_expert_dw_callable = None
-        self.cuda_graph_modules = layer.config.cuda_graph_modules
-
-    def backward_dw(self):
-        """Execute weight gradients, skipping CUDA graphed components during replay."""
-        is_replay = hasattr(self.layer, 'cuda_graphs') and self.layer.cuda_graphs
-        if self.shared_expert_dw_callable is not None and (
-            not is_replay or CudaGraphModule.moe_router not in self.cuda_graph_modules
-        ):
-            self.shared_expert_dw_callable()
-        if not is_replay or CudaGraphModule.attn not in self.cuda_graph_modules:
-            self.attn_dw_callable()
-        if is_replay and self.graphed_backward_dw_callable is not None:
-            self.graphed_backward_dw_callable()
-        self.layer = None
-
-    def set_graphed_backward_dw_callable(self, graphed_backward_dw_callable):
-        """Store the CUDA graphed backward weight gradient callable."""
-        self.graphed_backward_dw_callable = graphed_backward_dw_callable
-
-    def parameters(self):
-        """Returns an iterator over module parameters.
-
-        This method mimics the behavior of torch.nn.Module.parameters() by yielding
-        all parameters from the submodules managed by this wrapper. It is used to
-        collect parameters that require gradient computation during the backward pass.
-        """
-        for module in self.submodules:
-            for param in module.parameters():
-                yield param
-
-
 def build_transformer_layer_callables(layer: TransformerLayer):
     """Create callables for transformer layer nodes.
 
@@ -707,8 +653,11 @@ def build_transformer_layer_callables(layer: TransformerLayer):
                         residual = hidden_states
 
                 shared_expert_output = layer.mlp.shared_experts_compute(pre_mlp_layernorm_output)
+                padding_mask = layer.mlp._normalize_padding_mask(
+                    pre_mlp_layernorm_output, node.chunk_state.padding_mask
+                )
                 probs, routing_map = layer.mlp.route(
-                    pre_mlp_layernorm_output, padding_mask=node.chunk_state.padding_mask
+                    pre_mlp_layernorm_output, padding_mask=padding_mask
                 )
                 local_tokens, probs = layer.mlp.preprocess(
                     pre_mlp_layernorm_output, probs, routing_map
@@ -738,7 +687,7 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             or CudaGraphModule.attn not in layer.config.cuda_graph_modules
         ):
             forward_kwargs["mhc_recompute_manager"] = mhc_recompute_manager
-        elif is_hyper_connection_layer:
+        if using_cuda_graph_replay:
             # Replay paths that run the MoE routing tail themselves -- the split
             # (dense and overlap variants) and the non-split overlap branch --
             # need the padding_mask the eager branch above reads straight off
@@ -1106,6 +1055,12 @@ def build_layer_callables(layer):
         forward_funcs: list of callable functions for the layer.
         backward_dw: dict of weight gradient functions for the layer.
     """
+    from megatron.core.models.hybrid.hybrid_block import HyperConnectionHybridLayer
+
+    if isinstance(layer, HyperConnectionHybridLayer):
+        from megatron.core.models.hybrid.fine_grained_callables import build_hybrid_layer_callables
+
+        return build_hybrid_layer_callables(layer)
     if isinstance(layer, TransformerLayer):
         return build_transformer_layer_callables(layer)
     elif isinstance(layer, MultiTokenPredictionLayer):

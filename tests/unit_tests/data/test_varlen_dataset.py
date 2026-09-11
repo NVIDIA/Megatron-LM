@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Unit tests for :mod:`megatron.training.datasets.varlen_dataset`.
 
@@ -12,6 +12,7 @@ ValueError on unsupported shapes).
 import json
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
@@ -705,6 +706,7 @@ def test_sbhd_padding_mask_is_partitioned_with_tokens(monkeypatch):
 def test_sbhd_get_batch_returns_dataset_padding_mask(monkeypatch):
     """The dataset padding mask must survive the pretrain_gpt batch handoff."""
     import pretrain_gpt
+    from megatron.core.transformer.experimental_attention_variant import cp_balanced_indexer
 
     padding_mask = torch.tensor([[False, False, True, True]], dtype=torch.bool)
     source_batch = {
@@ -738,9 +740,12 @@ def test_sbhd_get_batch_returns_dataset_padding_mask(monkeypatch):
 
     monkeypatch.setattr(pretrain_gpt, "get_batch_on_this_tp_rank", get_batch_on_this_tp_rank)
     monkeypatch.setattr(pretrain_gpt, "get_batch_on_this_cp_rank", lambda batch: batch)
+    prebuild = MagicMock()
+    monkeypatch.setattr(cp_balanced_indexer, "prebuild_balanced_layouts", prebuild)
 
     *_, returned_padding_mask = pretrain_gpt.get_batch(iter(()))
     assert torch.equal(returned_padding_mask, padding_mask)
+    prebuild.assert_not_called()
 
 
 def test_sbhd_dataset_is_built_on_intermediate_pipeline_stage(monkeypatch):
