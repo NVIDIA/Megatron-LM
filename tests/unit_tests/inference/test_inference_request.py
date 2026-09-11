@@ -16,6 +16,8 @@ from megatron.core.inference.inference_request import (
     compute_block_hashes_batched,
     deserialize_ndarray,
     deserialize_tensor,
+    resolve_multimodal_data_for_engine,
+    serialize_multimodal_data,
     serialize_ndarray,
     serialize_tensor,
     unwrap_serialized_tensors,
@@ -57,6 +59,70 @@ def test_serialization_helpers_round_trip():
     assert out["c"] == ("ndarray", {"data": [], "dtype": "int32"})
 
 
+def test_preexpanded_multimodal_request_round_trip():
+    media = {
+        "image": {"imgs": torch.ones(1, 2, 4), "imgs_sizes": torch.tensor([[2, 2]])},
+        "media_tokens_preexpanded": True,
+    }
+
+    wire = serialize_multimodal_data(media)
+    assert wire["media_tokens_preexpanded"] is True
+
+    resolved = resolve_multimodal_data_for_engine(wire)
+    assert resolved["media_tokens_preexpanded"] is True
+    assert torch.equal(resolved["imgs"], media["image"]["imgs"])
+    assert torch.equal(resolved["imgs_sizes"], media["image"]["imgs_sizes"])
+
+
+def test_gym_style_compact_multimodal_request_omits_preexpanded_flag():
+    wire = serialize_multimodal_data(
+        {"image": {"imgs": torch.ones(1, 2, 4), "imgs_sizes": torch.tensor([[2, 2]])}}
+    )
+    assert "media_tokens_preexpanded" not in wire
+    assert "media_tokens_preexpanded" not in resolve_multimodal_data_for_engine(wire)
+
+
+def test_multimodal_serialization_generates_stable_content_keys():
+    raw_a = serialize_multimodal_data({"image": [b"same-image"]})
+    raw_b = serialize_multimodal_data({"image": [b"same-image"]})
+    raw_c = serialize_multimodal_data({"image": [b"different-image"]})
+    assert raw_a["media_cache_key"] == raw_b["media_cache_key"]
+    assert raw_a["media_cache_key"] != raw_c["media_cache_key"]
+
+    tensor_a = serialize_multimodal_data(
+        {
+            "image": {
+                "imgs": torch.arange(8, dtype=torch.float32).reshape(1, 2, 4),
+                "imgs_sizes": torch.tensor([[2, 2]]),
+            }
+        }
+    )
+    tensor_b = serialize_multimodal_data(
+        {
+            "image": {
+                "imgs": torch.arange(8, dtype=torch.float32).reshape(1, 2, 4),
+                "imgs_sizes": torch.tensor([[2, 2]]),
+            }
+        }
+    )
+    tensor_c = serialize_multimodal_data(
+        {
+            "image": {
+                "imgs": torch.arange(8, dtype=torch.float32).reshape(2, 1, 4),
+                "imgs_sizes": torch.tensor([[2, 2]]),
+            }
+        }
+    )
+    assert tensor_a["media_cache_key"] == tensor_b["media_cache_key"]
+    # Shape participates in identity even when the flattened bytes are equal.
+    assert tensor_a["media_cache_key"] != tensor_c["media_cache_key"]
+
+
+def test_multimodal_serialization_rejects_user_media_cache_key():
+    with pytest.raises(ValueError, match="computed automatically"):
+        serialize_multimodal_data({"image": [b"image"], "media_cache_key": "user-provided"})
+
+
 def test_compute_block_hashes_batched():
     """compute_block_hashes_batched produces one hash per *complete* block and
     chains: the hash of block i depends on block i-1. Single combined test
@@ -74,6 +140,11 @@ def test_compute_block_hashes_batched():
     assert (
         compute_block_hashes_batched(torch.arange(8, dtype=torch.int64), block_size=4)[1] != h_b[1]
     )
+    tokens = torch.arange(8, dtype=torch.int64)
+    media_a = compute_block_hashes_batched(tokens, block_size=4, cache_salt="media-a")
+    media_b = compute_block_hashes_batched(tokens, block_size=4, cache_salt="media-b")
+    assert media_a != media_b
+    assert media_a == compute_block_hashes_batched(tokens, block_size=4, cache_salt="media-a")
 
 
 def test_inference_parameters_alias_warns_and_copies():
@@ -247,6 +318,8 @@ def test_dynamic_inference_request_record_checkpoint_and_merge():
     )
     a.generated_text = "foo"
     b.generated_text = "bar"
+    a.generated_log_probs = None
+    b.generated_log_probs = [-0.5]
     a.routing_indices = np.array([[1, 2]])
     b.routing_indices = np.array([[3, 4]])
     b.policy_epoch = [(0, 3)]
@@ -256,6 +329,7 @@ def test_dynamic_inference_request_record_checkpoint_and_merge():
     merged = rec.merge()
     assert merged.generated_tokens == [10, 11, 12]
     assert merged.generated_text == "foobar"
+    assert merged.generated_log_probs == [-0.5]
     assert merged.generated_length == 3 and merged.latency == 4.2
     assert merged.routing_indices.tolist() == [[1, 2], [3, 4]]
     # Every request mints a distinct chatcmpl- uid; merge() keeps the FIRST
@@ -363,3 +437,104 @@ def test_dynamic_inference_request_serialize_prompt_length_absent():
 
     assert obj["prompt_length"] is None
     assert obj["prompt_tokens"] is None
+
+
+def test_weight_scoped_salt_partitions_the_hash_space():
+    """Block hashes from different weight generations must never match.
+
+    Under PERSIST the prefix cache survives a refit, so without this a request
+    admitted after new weights land can match KV the old weights computed.
+    """
+    from megatron.core.inference.engines.dynamic_engine import _weight_scoped_salt
+
+    tokens = torch.arange(8, dtype=torch.int64)
+    gen1 = compute_block_hashes_batched(
+        tokens, block_size=4, cache_salt=_weight_scoped_salt(1, None)
+    )
+    gen2 = compute_block_hashes_batched(
+        tokens, block_size=4, cache_salt=_weight_scoped_salt(2, None)
+    )
+    assert gen1 and gen2
+    assert set(gen1).isdisjoint(gen2), "same tokens under different weights must not match"
+    # Deterministic within a generation, or a request could not match itself.
+    assert gen1 == compute_block_hashes_batched(
+        tokens, block_size=4, cache_salt=_weight_scoped_salt(1, None)
+    )
+
+
+def test_weight_scoped_salt_is_inert_before_the_first_resume():
+    """Epoch 0 hashes exactly as an unsalted engine did, media key and all."""
+    from megatron.core.inference.engines.dynamic_engine import _weight_scoped_salt
+
+    assert _weight_scoped_salt(0, None) is None
+    assert _weight_scoped_salt(0, "img-1") == "img-1"
+
+    tokens = torch.arange(8, dtype=torch.int64)
+    assert compute_block_hashes_batched(
+        tokens, block_size=4, cache_salt=_weight_scoped_salt(0, None)
+    ) == compute_block_hashes_batched(tokens, block_size=4)
+
+
+def test_weight_scoped_salt_keeps_media_identity_distinct():
+    """Within one generation, different media must still not share KV."""
+    from megatron.core.inference.engines.dynamic_engine import _weight_scoped_salt
+
+    tokens = torch.arange(8, dtype=torch.int64)
+    a = compute_block_hashes_batched(
+        tokens, block_size=4, cache_salt=_weight_scoped_salt(3, "img-a")
+    )
+    b = compute_block_hashes_batched(
+        tokens, block_size=4, cache_salt=_weight_scoped_salt(3, "img-b")
+    )
+    text = compute_block_hashes_batched(
+        tokens, block_size=4, cache_salt=_weight_scoped_salt(3, None)
+    )
+    assert set(a).isdisjoint(b)
+    assert set(a).isdisjoint(text)
+
+
+def test_text_request_hashes_are_scoped_to_the_weight_generation():
+    """A text-only request must not match blocks hashed under earlier weights.
+
+    The salt is only worth anything if it reaches the path that carries the
+    common case; testing the helper alone would pass with the engine never
+    applying it.
+    """
+    from megatron.core.inference.engines.dynamic_engine import _weight_scoped_salt
+
+    tokens = list(range(8))
+
+    def hashes_at(epoch):
+        request = DynamicInferenceRequest(
+            request_id=0,
+            prompt="",
+            prompt_tokens=torch.tensor(tokens, dtype=torch.int64),
+            block_size_tokens=4,
+            enable_prefix_caching=True,
+            block_hash_salt=_weight_scoped_salt(epoch, None),
+        )
+        return request.precomputed_block_hashes
+
+    before, after = hashes_at(1), hashes_at(2)
+    assert before and after
+    assert set(before).isdisjoint(after), "a refit must make earlier blocks unmatchable"
+    assert hashes_at(1) == before, "hashes must be stable within one generation"
+
+
+def test_supplied_block_hashes_are_not_re_salted():
+    """Hashes handed in by a caller are used as-is.
+
+    A disaggregated handoff carries hashes its sender already computed; the
+    receiver must adopt them rather than recompute under its own generation, or
+    the imported KV would be unreachable.
+    """
+    request = DynamicInferenceRequest(
+        request_id=0,
+        prompt="",
+        prompt_tokens=torch.tensor(list(range(8)), dtype=torch.int64),
+        block_size_tokens=4,
+        enable_prefix_caching=True,
+        precomputed_block_hashes=[11, 22],
+        block_hash_salt="w9",
+    )
+    assert request.precomputed_block_hashes == [11, 22]

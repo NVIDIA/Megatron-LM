@@ -10,6 +10,7 @@ from contextlib import aclosing
 import numpy as np
 import pytest
 
+from megatron.rl import rl_utils
 from megatron.rl.agent.api import GroupedRolloutRequest, Rollout, RolloutGroup, TokenRollout
 from megatron.rl.agent.rollout_pipeline import RolloutPipeline
 from megatron.rl.agent.weighted_multi_task import AgentConfig, WeightedMultiTask
@@ -350,6 +351,56 @@ async def test_pipeline_uses_restored_groups_before_fresh_generation(
         persisted = RolloutBank(str(tmp_path)).restore(trained_through=0)
         assert len(persisted) == take_count
         assert {group.uid for group in persisted} == {group.uid for group in produced}
+
+
+@pytest.mark.asyncio
+async def test_restored_group_metrics_are_reported_per_step_and_env(monkeypatch):
+    agent = _weighted_agent([("a", 1.0), ("b", 1.0)])
+    agent.set_restored_groups(
+        [
+            *[_env_group("a", problem_id=f"a{index}") for index in range(3)],
+            _env_group("b", problem_id="b0"),
+        ]
+    )
+    request = GroupedRolloutRequest(
+        num_groups=4,
+        rollouts_per_group=1,
+        inference_interface=MockInferenceInterface(num_slow_calls=100),
+        streaming=True,
+        submission_granularity="B",
+        consumption_granularity="B",
+    )
+    pipeline = RolloutPipeline(agent, request, parallel_generation_tasks=2)
+    monkeypatch.setattr(rl_utils, "_ROLLOUT_PIPELINE", pipeline)
+
+    empty_metrics = rl_utils._collect_rollout_pipeline_metrics()
+    assert empty_metrics["a_restored_groups_percentage"] == 0.0
+    assert empty_metrics["a_fresh_groups_percentage"] == 0.0
+
+    async with aclosing(pipeline.run()) as groups:
+        [await anext(groups) for _ in range(4)]
+        first_step_metrics = rl_utils._collect_rollout_pipeline_metrics()
+
+        assert first_step_metrics["rollout_pipeline_restored_count"] == 3
+        assert first_step_metrics["rollout_pipeline_yielded_count"] == 4
+        assert first_step_metrics["a_restored_groups"] == 2
+        assert first_step_metrics["b_restored_groups"] == 1
+        assert first_step_metrics["a_restored_groups_percentage"] == 100.0
+        assert first_step_metrics["a_fresh_groups_percentage"] == 0.0
+        assert first_step_metrics["b_restored_groups_percentage"] == 50.0
+        assert first_step_metrics["b_fresh_groups_percentage"] == 50.0
+
+        [await anext(groups) for _ in range(4)]
+        second_step_metrics = rl_utils._collect_rollout_pipeline_metrics()
+
+        assert second_step_metrics["rollout_pipeline_restored_count"] == 1
+        assert second_step_metrics["rollout_pipeline_yielded_count"] == 4
+        assert second_step_metrics["a_restored_groups"] == 1
+        assert second_step_metrics["b_restored_groups"] == 0
+        assert second_step_metrics["a_restored_groups_percentage"] == 50.0
+        assert second_step_metrics["a_fresh_groups_percentage"] == 50.0
+        assert second_step_metrics["b_restored_groups_percentage"] == 0.0
+        assert second_step_metrics["b_fresh_groups_percentage"] == 100.0
 
 
 def test_multiple_envs_require_env_ids_for_restore_routing():

@@ -10,6 +10,7 @@ from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fp4_utils import get_fp4_context
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.ssm.mamba_layer_config import MambaLayerConfig
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_layer import TransformerLayer
 
@@ -33,6 +34,7 @@ def checkpointed_forward(
     extract_layer_indices: Optional[Set[int]] = None,
     layer_offset: int = 0,
     cp_layout_state: Optional[ContextParallelLayoutState] = None,
+    packed_sequence_cp_metadata: object | None = None,
 ) -> Union[Tensor, Tuple[Tensor, Tensor]]:
     """Forward method with activation checkpointing.
 
@@ -44,6 +46,7 @@ def checkpointed_forward(
             pipeline stage. Used to convert local layer indices to
             global indices when checking extract_layer_indices.
         cp_layout_state (ContextParallelLayoutState, optional): CP layout state for this forward.
+        packed_sequence_cp_metadata (optional): Packed-sequence CP metadata for Mamba layers.
 
     Returns:
         If extract_layer_indices is empty: hidden_states tensor
@@ -120,6 +123,14 @@ def checkpointed_forward(
                     else:  # MambaLayer (HybridStack `M` slot)
                         for k in ("context", "context_mask", "attention_bias", "padding_mask"):
                             layer_kwargs.pop(k, None)
+                        if (
+                            packed_sequence_cp_metadata is not None
+                            and type(layer.config) is MambaLayerConfig
+                            and layer.config.linear_cp_mode == "chunkwise"
+                        ):
+                            layer_kwargs["packed_sequence_cp_metadata"] = (
+                                packed_sequence_cp_metadata
+                            )
                         hidden_states = layer(**layer_kwargs)
                         context = None
 

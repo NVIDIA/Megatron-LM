@@ -203,6 +203,7 @@ class PostProcessNode(ScheduleNode):
             rotary_pos_sin=self.chunk_state.rotary_pos_sin,
             mtp_in_postprocess=False,
             loss_mask=self.chunk_state.loss_mask,
+            mtp_input_mask=self.chunk_state.mtp_input_mask,
             attention_mask=self.chunk_state.attention_mask,
             packed_seq_params=self.chunk_state.packed_seq_params,
             sequence_len_offset=self.chunk_state.sequence_len_offset,

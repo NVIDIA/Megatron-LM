@@ -22,6 +22,7 @@ from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.ssm.context_parallel.chunkwise import PackedSequenceCPMetadata
 from megatron.core.transformer.enums import CudaGraphModule, InferenceCudaGraphScope
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import GraphableMegatronModule
@@ -128,6 +129,7 @@ class MambaLayer(GraphableMegatronModule):
         *,
         inference_params: Optional[BaseInferenceContext] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
+        packed_sequence_cp_metadata: PackedSequenceCPMetadata | None = None,
     ):
         """
         Perform a forward pass through the Mamba layer.
@@ -142,6 +144,8 @@ class MambaLayer(GraphableMegatronModule):
             inference_context (BaseInferenceContext, optional): Parameters for inference-time
                 optimizations.
             rotary_pos_emb (Tensor, optional): Rotary positional embeddings.
+            packed_sequence_cp_metadata (PackedSequenceCPMetadata, optional): Rank-local
+                packed-sequence metadata for chunkwise CP.
 
         Returns:
             output (Tensor): Transformed hidden states of shape [s, b, h].
@@ -167,11 +171,19 @@ class MambaLayer(GraphableMegatronModule):
             # transformer layer's self_attention/mlp (this is where the SSD kernel autotune
             # lands on the first pass).
             with _otel_managed_span('layer', 'megatron.layer.mamba'):
-                mixer_out_with_bias = self.mixer(
-                    hidden_states,
-                    inference_context=inference_context,
-                    packed_seq_params=packed_seq_params,
-                )
+                if packed_sequence_cp_metadata is None:
+                    mixer_out_with_bias = self.mixer(
+                        hidden_states,
+                        inference_context=inference_context,
+                        packed_seq_params=packed_seq_params,
+                    )
+                else:
+                    mixer_out_with_bias = self.mixer(
+                        hidden_states,
+                        inference_context=inference_context,
+                        packed_seq_params=packed_seq_params,
+                        packed_sequence_cp_metadata=packed_sequence_cp_metadata,
+                    )
 
             with self.bias_dropout_add_exec_handler():
                 hidden_states = self.mamba_bda(

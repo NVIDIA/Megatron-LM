@@ -40,6 +40,79 @@ def clear_nvte_env_vars():
     os.environ.pop('NVTE_UNFUSED_ATTN', None)
 
 
+def is_nccl_ep_available():
+    """NCCL EP built into TE, with the ``ep_bootstrap`` signature mcore actually calls.
+
+    A bare import probe of ``transformer_engine.pytorch.ep`` is not enough: TE releases ship the
+    module with an older API (v2.17/v2.18 predate the ``num_topk`` / ``drop_on_overflow`` kwargs
+    and require ``recv_capacity_per_rank``), so the import succeeds but
+    ``ensure_nccl_ep_bootstrapped`` raises TypeError on the first bootstrap of every ncclEP path.
+    Probe the signature instead: ``num_topk`` and ``drop_on_overflow`` must be accepted (mcore
+    always passes them) and ``recv_capacity_per_rank`` must be optional (``None`` selects eager
+    mode, which the over-budget replay depends on).
+    """
+    from megatron.core.transformer.moe.fused_a2a import HAVE_TE_EP
+
+    if not HAVE_TE_EP:
+        return False
+
+    import inspect
+
+    from transformer_engine.pytorch.ep import ep_bootstrap
+
+    params = inspect.signature(ep_bootstrap).parameters
+    recv_capacity = params.get("recv_capacity_per_rank")
+    return (
+        recv_capacity is not None
+        and recv_capacity.default is None
+        and "num_topk" in params
+        and "drop_on_overflow" in params
+    )
+
+
+def is_nccl_ep_zero_copy_available():
+    """Zero-copy needs the TE symm-mem APIs (symm_mem_alloc/is_symm_backed) on top of NCCL EP."""
+    if not is_nccl_ep_available():
+        return False
+    try:
+        from transformer_engine.pytorch.ep import is_symm_backed, symm_mem_alloc  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+def is_op_fuser_available():
+    """The static-shape/zero-copy path runs the TE op-fuser grouped GEMM (needs TE>=2.14 ops)."""
+    from megatron.core.utils import is_te_min_version
+
+    try:
+        from transformer_engine.pytorch.ops import GroupedLinear, ScaledSwiGLU  # noqa: F401
+    except ImportError:
+        return False
+    return is_te_min_version("2.14.0")
+
+
+def is_nccl_ep_fp8_dispatch_available():
+    """MXFP8 wire dtypes need a TE build whose EpBuffer takes the quant recipes AND that returns
+    the plain-tensor MXFP8 carrier (mxfp8_carrier_to_grouped, TE PR #3355 -- older quant-recipe
+    builds return a GroupedTensor payload the op-fuser attrs cannot rebuild), plus MXFP8 hardware
+    support (Blackwell) for the quantize kernels and the grouped GEMM."""
+    if not is_nccl_ep_available():
+        return False
+    import inspect
+
+    try:
+        import transformer_engine.pytorch.ep as te_ep
+        from transformer_engine.pytorch.fp8 import check_mxfp8_support
+    except ImportError:
+        return False
+    if "dispatch_fwd_quant_recipe" not in inspect.signature(te_ep.EpBuffer).parameters:
+        return False
+    if not hasattr(te_ep, "mxfp8_carrier_to_grouped"):
+        return False
+    return check_mxfp8_support()[0]
+
+
 class Utils:
 
     world_size = int(os.environ.get('WORLD_SIZE', '1'))

@@ -65,6 +65,7 @@ models/index
 :hidden:
 :caption: Advanced Features
 
+user-guide/deterministic-training
 user-guide/features/moe
 user-guide/features/megatron_fsdp
 user-guide/features/dist_optimizer
@@ -74,6 +75,14 @@ user-guide/data-loading
 user-guide/features/megatron_energon
 user-guide/features/megatron_rl
 user-guide/features/tokenizers
+```
+
+```{toctree}
+:maxdepth: 2
+:hidden:
+:caption: Inference
+
+mcore-inference-user-guide
 ```
 
 ```{toctree}

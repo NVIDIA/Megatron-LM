@@ -37,8 +37,8 @@ class Sampling(ABC):
             context: The active DynamicInferenceContext.
             no_top_k, no_top_p: Required batch-level dispatch flags (whether NO active
                 request uses top-k / top-p). The caller computes them once from the
-                pinned CPU sampling metadata (see the controller's
-                `_active_requests_sampling_filter_flags`), so the kernel never has to.
+                pinned CPU sampling metadata (see the context's
+                `active_sampling_filter_flags`), so the kernel never has to.
             gather_indices: If provided, only sample from `logits[gather_indices[:n], :]`.
             token_to_request_index: Per-token request mapping; when set, sampling
                 parameters are gathered per-token instead of per-request.

@@ -201,6 +201,11 @@ class ProcessGroupCollection:
             else "ProcessGroupCollection(empty)"
         )
 
+    def __deepcopy__(self, memo):
+        """Preserve runtime process-group handles when copying owning configuration objects."""
+        memo[id(self)] = self
+        return self
+
     @classmethod
     def use_mpu_process_groups(cls, required_pgs: Optional[List[str]] = None):
         """

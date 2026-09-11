@@ -52,7 +52,7 @@ def build_pretraining_data_loader(dataset, consumed_samples):
             data_parallel_rank=mpu.get_data_parallel_rank(),
             data_parallel_size=mpu.get_data_parallel_world_size())
     elif args.dataloader_type == 'single':
-        if args.hybrid_context_parallel:
+        if args.hybrid_context_parallel and args.sequence_packing_scheduler is None:
             batch_sampler = HybridCPMegatronPretrainingSampler(
                 total_samples=len(dataset),
                 consumed_samples=consumed_samples,
@@ -61,7 +61,8 @@ def build_pretraining_data_loader(dataset, consumed_samples):
                 data_parallel_rank=mpu.get_data_parallel_rank(),
                 data_parallel_size=mpu.get_data_parallel_world_size())
         else:
-            # Megatron sampler
+            # Megatron sampler. Packing schedulers consume one microbatch at a
+            # time and form packed global batches themselves.
             batch_sampler = MegatronPretrainingSampler(
                 total_samples=len(dataset),
                 consumed_samples=consumed_samples,
@@ -103,11 +104,24 @@ def build_pretraining_data_loader(dataset, consumed_samples):
     maybe_worker_init_fn = (
         worker_init_fn if args.num_workers > 0 else None
     )
-    # Torch dataloader.
-    if args.hybrid_context_parallel:
-        extra_kwargs = {"collate_fn": lambda x: x,}
+    # Identity collate for VarlenDataset and packing-scheduler paths; they emit
+    # one variable-length dict per sample, not stack-able by the default
+    # collate. --varlen-sbhd-validation is excluded: it bypasses packing and
+    # emits fixed-length [seq_length] samples that the default collate stacks
+    # normally.
+    if (
+        (args.use_varlen_dataset and not args.varlen_sbhd_validation)
+        or args.hybrid_context_parallel
+        or args.sequence_packing_scheduler is not None
+    ):
+        extra_kwargs = {"collate_fn": lambda x: x}
     else:
         extra_kwargs = {}
+    # Own generator: otherwise _BaseDataLoaderIter draws _base_seed from the default CPU generator
+    # on ITERATOR creation, after load_checkpoint has restored it. initial_seed() reads the seed
+    # without consuming a draw.
+    loader_generator = torch.Generator()
+    loader_generator.manual_seed(torch.initial_seed())
     return torch.utils.data.DataLoader(
         dataset,
         batch_sampler=batch_sampler,
@@ -115,6 +129,7 @@ def build_pretraining_data_loader(dataset, consumed_samples):
         pin_memory=True,
         persistent_workers=True if args.num_workers > 0 else False,
         worker_init_fn=maybe_worker_init_fn,
+        generator=loader_generator,
         **extra_kwargs,
     )
 

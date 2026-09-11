@@ -62,14 +62,15 @@ def _verify_te_to_mcore_mxfp8_conversion(te_dequantized, fi_quantized: MXFP8Tens
 def resolve_mxfp8_backend(
     inference_grouped_gemm_backend: str | InferenceGroupedGemmBackend,
 ) -> MXFP8Backend:
-    """Resolve the MXFP8 quantizer required by an inference grouped-GEMM backend.
+    """Resolve the canonical MXFP8 storage required by a grouped-MoE backend.
 
     Args:
         inference_grouped_gemm_backend: The configured backend, either as its raw
             string value or as the enum produced by ``TransformerConfig``.
 
     Returns:
-        The MXFP8 quantization backend to use.
+        The MXFP8 quantization and storage backend to use. FlashInfer routed MoE
+        derives its TRT-LLM Major-K weights from the canonical Triton/cuBLAS layout.
 
     Raises:
         ValueError: If the grouped-GEMM backend does not support MXFP8.
@@ -77,10 +78,10 @@ def resolve_mxfp8_backend(
     grouped_gemm_backend = getattr(
         inference_grouped_gemm_backend, "value", inference_grouped_gemm_backend
     )
-    if grouped_gemm_backend == "torch":
+    # Both grouped-MoE backends consume MCore's canonical Triton/cuBLAS layout.
+    # FlashInfer repacks expert weights into TRT-LLM Major-K layout separately.
+    if grouped_gemm_backend in ("torch", "flashinfer"):
         return "triton"
-    if grouped_gemm_backend == "flashinfer":
-        return "flashinfer"
     raise ValueError(
         "MXFP8 inference does not support "
         f"inference_grouped_gemm_backend={grouped_gemm_backend!r}."

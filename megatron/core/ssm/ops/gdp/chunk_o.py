@@ -17,6 +17,8 @@ apart.
 
 import torch
 
+from megatron.core.ssm.ops.common.determinism import autotune_configs
+
 from .common import (
     HAVE_TRITON,
     IS_NVIDIA_HOPPER,
@@ -38,13 +40,15 @@ NUM_WARPS = [2, 4] if IS_NVIDIA_HOPPER else [2, 4, 8]
     }
 )
 @triton.autotune(
-    configs=[
-        triton.Config({'BK': BK, 'BV': BV}, num_warps=num_warps, num_stages=num_stages)
-        for BK in BKV_LIST
-        for BV in BKV_LIST
-        for num_warps in NUM_WARPS
-        for num_stages in [2, 3, 4]
-    ],
+    configs=autotune_configs(
+        [
+            triton.Config({'BK': BK, 'BV': BV}, num_warps=num_warps, num_stages=num_stages)
+            for BK in BKV_LIST
+            for BV in BKV_LIST
+            for num_warps in NUM_WARPS
+            for num_stages in [2, 3, 4]
+        ]
+    ),
     key=['H', 'K', 'V', 'BT'],
 )
 @triton.jit(do_not_specialize=['T'])

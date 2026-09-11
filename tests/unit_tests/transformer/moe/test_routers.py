@@ -8,6 +8,7 @@ import pytest
 import torch
 
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_submodules
+from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
 from megatron.core.transformer.moe.moe_utils import (
     get_updated_expert_bias,
@@ -534,6 +535,25 @@ class TestAuxLossFreeTop2Router:
 
         # Print some debug info
         print("Updated bias after first forward pass:", updated_bias)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_expert_bias_update_preserves_large_integer_count_ordering(self):
+        counts = torch.tensor([2**24 + 1, 2**24], dtype=torch.int64, device="cuda")
+        bias = torch.zeros(2, dtype=torch.float32, device="cuda")
+
+        updated_bias = get_updated_expert_bias(
+            counts, bias, self.router.config.moe_router_bias_update_rate
+        )
+
+        expected = torch.tensor([-0.1, 0.1], dtype=torch.float32, device="cuda")
+        torch.testing.assert_close(updated_bias, expected)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_expert_bias_token_counts_survive_float16_module(self):
+        wrapped = Float16Module(self.transformer_config, self.moe_layer.cuda())
+        router = cast(Router, wrapped.module.router)
+
+        assert router.local_tokens_per_expert.dtype == torch.int64
 
     @pytest.mark.internal
     @pytest.mark.skipif(

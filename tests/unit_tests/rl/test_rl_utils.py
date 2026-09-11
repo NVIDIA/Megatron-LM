@@ -1,9 +1,10 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import asyncio
 import itertools
 from contextlib import nullcontext
 from types import SimpleNamespace
-from unittest.mock import MagicMock, call
+from unittest.mock import MagicMock, call, patch
 
 import numpy as np
 import pytest
@@ -347,6 +348,64 @@ class TestRLUtils:
         assert captured["parallel_generation_tasks"] == generation_lag + 1
         assert captured["request"].submission_granularity == submission_granularity
         assert captured["initial_batch_id"] == 17
+
+    @pytest.mark.parametrize(
+        "ready_batches, expected_skip",
+        [
+            pytest.param(1, True, id="banked_batch_skips"),
+            pytest.param(0, False, id="empty_bank_runs_inference"),
+            pytest.param(None, False, id="no_pipeline_runs_inference"),
+        ],
+    )
+    def test_can_skip_inference_routes_rollout_collection(
+        self, monkeypatch, ready_batches, expected_skip
+    ):
+        """can_skip_inference cold-reads the pipeline bank; a skip routes
+        get_environment_rollouts to consume banked groups without inference."""
+        n_prompts = 4
+        fake_groups = [[f"group_{i}"] for i in range(n_prompts)]
+        loop = asyncio.new_event_loop()
+
+        async def gen():
+            for group in fake_groups:
+                yield group
+
+        rollout_generator = gen()
+        colocated = MagicMock(return_value=(list(fake_groups), {}))
+        pipeline = (
+            None if ready_batches is None else SimpleNamespace(settle=lambda loop: ready_batches)
+        )
+        monkeypatch.setattr(rl_utils, "_ROLLOUT_PIPELINE", pipeline)
+        monkeypatch.setattr(rl_utils, "colocated_inference", colocated)
+        monkeypatch.setattr(rl_utils, "_ROLLOUT_GENERATOR", rollout_generator)
+        monkeypatch.setattr(rl_utils, "get_asyncio_loop", lambda: loop)
+        monkeypatch.setattr(rl_utils, "get_args", lambda: SimpleNamespace(curr_iteration=1))
+        monkeypatch.setattr(
+            rl_utils, "get_nvtx_range", lambda: lambda *args, **kwargs: nullcontext()
+        )
+        monkeypatch.setattr(rl_utils, "lang_rl_log_dir", None)
+        try:
+            with (
+                patch("torch.distributed.get_rank", return_value=0),
+                patch("torch.distributed.broadcast_object_list"),
+                patch("torch.are_deterministic_algorithms_enabled", return_value=False),
+            ):
+                skip = rl_utils.can_skip_inference()
+                assert skip == expected_skip
+                rollouts, fresh_ledger = rl_utils.get_environment_rollouts(
+                    [MagicMock()],
+                    inference_model=None,
+                    optimizer=MagicMock(),
+                    n_prompts=n_prompts,
+                    samples_per_group=1,
+                    run_inference=not skip,
+                )
+            assert rollouts == fake_groups
+            assert fresh_ledger == {}
+            assert colocated.called != expected_skip
+        finally:
+            loop.run_until_complete(rollout_generator.aclose())
+            loop.close()
 
     @pytest.mark.parametrize(
         "overrides, match",

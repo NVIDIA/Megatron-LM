@@ -122,6 +122,7 @@ class _GDNBase(MegatronModule):
         A_init_range: tuple[float, float] = (1, 16),
         pg_collection: ProcessGroupCollection = None,
         *,
+        is_mtp_layer: bool = False,
         name: str | None = None,
         cp_comm_type: str | None = None,
         pp_layer_offset: int = 0,
@@ -138,12 +139,15 @@ class _GDNBase(MegatronModule):
             A_init_range: The initialization range for the attention weights.
             pg_collection: The required process groups to use for tensor model parallel and context
                 parallel.
+            is_mtp_layer: Accepted for TransformerLayer compatibility and ignored because GDN
+                does not have MTP-specific construction behavior.
             name (str | None): module instance name passed top-down from its paranet module
             cp_comm_type (Optional[str]): Accepted for TransformerLayer compatibility and
                 ignored; GDN implements context parallelism with its own all-to-alls rather
                 than the attention CP communication schemes.
             pp_layer_offset: Offset of this pipeline stage's first global layer.
         """
+        del is_mtp_layer
         if not HAVE_FLA:
             raise ImportError(
                 "FLA is not installed. Please install it with "

@@ -1,0 +1,108 @@
+# Llama-3-shaped dense proxy (attention + MLP, no Mamba) on MFSDP v2 with
+# full-iteration CUDA graphs.
+#
+# Covers #6152. MoE is intentionally excluded: expert dispatch sizes buffers
+# from data-dependent token counts via a host sync, which is illegal during
+# graph capture. That is a documented MoE limitation independent of FSDP
+# (see megatron/core/transformer/moe/README.md).
+ENV_VARS:
+  # run_ci_test.sh always exports this (yq prints "null" for a missing key,
+  # which fails determinism.py's validator), so it must be set explicitly.
+  NVTE_ALLOW_NONDETERMINISTIC_ALGO: 0
+  PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+  NCCL_NVLS_ENABLE: 0
+  NCCL_DEBUG: VERSION
+MODEL_ARGS:
+  # Precision
+  --bf16: true
+  # Distributed args
+  --distributed-timeout-minutes: 60
+  --tensor-model-parallel-size: 1
+  --pipeline-model-parallel-size: 1
+  --context-parallel-size: 1
+  --overlap-grad-reduce: true
+  --overlap-param-gather: true
+  --attention-backend: unfused
+  # FSDP args
+  --use-megatron-fsdp: true
+  --megatron-fsdp-version: 2
+  --data-parallel-sharding-strategy: "optim_grads_params"
+  --outer-dp-sharding-strategy: "no_shard"
+  --deterministic-mode: true
+  --ckpt-format: "fsdp_dtensor"
+  --no-gradient-accumulation-fusion: true
+  # CUDA graph args. --no-check-for-nan-in-loss-and-grad is required by
+  # full_iteration capture (asserted in validate_args).
+  --cuda-graph-impl: full_iteration
+  --no-check-for-nan-in-loss-and-grad: true
+  # Training args
+  --use-mcore-models: true
+  --sequence-parallel: true
+  --disable-bias-linear: true
+  --micro-batch-size: 4
+  --global-batch-size: 32
+  --train-iters: 50
+  --exit-duration-in-mins: 60
+  --no-rope-fusion: true
+  --manual-gc: true
+  --manual-gc-interval: 100
+  --transformer-impl: transformer_engine
+  # Data args
+  --seq-length: 1024
+  --data-cache-path: ${DATA_CACHE_PATH}
+  --data-path: ${DATA_PATH}/text/the_pile/shard00/my-gpt3_00_text_document
+  --vocab-file: ${DATA_PATH}/text/the_pile/shard00/bpe/vocab.json
+  --merge-file: ${DATA_PATH}/text/the_pile/shard00/bpe/merges.txt
+  --split: 949,50,1
+  # Network: 8 attention+MLP blocks, Llama-3 shaped (GQA, RoPE, SwiGLU,
+  # RMSNorm). '*' is an attention layer and '-' an MLP layer, so this is a
+  # plain dense transformer expressed through HybridModel.
+  --hybrid-layer-pattern: "*-*-*-*-*-*-*-*-"
+  --spec: "[megatron.core.models.hybrid.hybrid_layer_specs hybrid_stack_spec]"
+  --hidden-size: 1024
+  --ffn-hidden-size: 4096
+  --num-attention-heads: 16
+  --group-query-attention: true
+  --num-query-groups: 4
+  --kv-channels: 64
+  --max-position-embeddings: 1024
+  --position-embedding-type: rope
+  --rotary-base: 1000000
+  --make-vocab-size-divisible-by: 64
+  --normalization: RMSNorm
+  --norm-epsilon: 1e-6
+  --swiglu: true
+  --untie-embeddings-and-output-weights: true
+  # Add regularization args
+  --attention-dropout: 0.0
+  --hidden-dropout: 0.0
+  --clip-grad: 1.0
+  --weight-decay: 0.1
+  # Learning rate args
+  --lr-warmup-fraction: .01
+  --lr: 0.00015
+  --min-lr: 1.0e-5
+  --lr-decay-style: cosine
+  --adam-beta1: 0.9
+  --adam-beta2: 0.95
+  # Validation, checkpointing, logging
+  --eval-iters: 10
+  --eval-interval: 200
+  --save-interval: 25
+  --init-method-std: 0.02
+  --log-timers-to-tensorboard: true
+  --log-memory-to-tensorboard: true
+  --log-num-zeros-in-grad: true
+  --log-params-norm: true
+  --log-validation-ppl-to-tensorboard: true
+  --log-throughput: true
+  --log-interval: 1
+  --logging-level: 10
+  --tensorboard-dir: ${TENSORBOARD_PATH}
+  --exit-interval: 50
+TEST_TYPE: regular
+METRICS:
+  - "lm loss"
+  - "mem-allocated-bytes"
+  - "mem-max-allocated-bytes"
+LAUNCHER: ft_launcher

@@ -715,6 +715,92 @@ class MimoModel(MegatronModule):
             packed_seq_params=packed_seq_params,
         )
 
+    def _language_model_owns_mtp(self) -> bool:
+        """Return whether this rank executes the language model's MTP block."""
+        if self.language_model is None:
+            return False
+        return bool(getattr(unwrap_model(self.language_model), 'mtp_process', False))
+
+    @staticmethod
+    def _materialize_mtp_input_mask(
+        input_ids: torch.Tensor,
+        special_token_ids: Dict[str, int],
+        text_token_indices: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Return positions backed by the language model's token embedding table."""
+        if text_token_indices is not None:
+            mtp_input_mask = torch.zeros_like(input_ids, dtype=torch.bool)
+            mtp_input_mask.reshape(-1).index_fill_(0, text_token_indices, True)
+            return mtp_input_mask
+
+        mtp_input_mask = torch.ones_like(input_ids, dtype=torch.bool)
+        for special_token_id in special_token_ids.values():
+            mtp_input_mask &= input_ids != special_token_id
+        return mtp_input_mask
+
+    def _prepare_mtp_inputs(
+        self,
+        input_ids: Optional[torch.Tensor],
+        position_ids: Optional[torch.Tensor],
+        packed_seq_params: Optional[PackedSeqParams],
+        owns_mtp: bool,
+        text_token_indices: Optional[torch.Tensor] = None,
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """Prepare CP-local position IDs and optional MTP token metadata.
+
+        MTP consumes token IDs only on the stage that owns its prediction block. Under
+        context parallelism, those IDs, their validity mask, and position IDs must all
+        use the same local sequence partition as the language-model hidden states.
+        """
+        if owns_mtp and input_ids is None:
+            raise RuntimeError("A language stage that owns MTP requires input_ids.")
+
+        mtp_input_ids = input_ids if owns_mtp else None
+        mtp_input_mask = None
+        if owns_mtp and self.special_token_ids:
+            assert input_ids is not None
+            mtp_input_mask = self._materialize_mtp_input_mask(
+                input_ids, self.special_token_ids, text_token_indices=text_token_indices
+            )
+
+        if self.partition_adapter is None or not self.partition_adapter.cfg.use_cp:
+            return mtp_input_ids, position_ids, mtp_input_mask
+
+        # PartitionAdapter shards batch-first [B, S, ...] metadata along dimension 1.
+        # Multidimensional RoPE positions arrive as [rope_dim, B, S], so expose their
+        # sequence dimension in the adapter's expected layout and restore it afterward.
+        is_multiaxis_position_ids = position_ids is not None and position_ids.dim() == 3
+        position_metadata = (
+            position_ids.movedim(0, -1).contiguous() if is_multiaxis_position_ids else position_ids
+        )
+
+        packed_mtp_metadata = mtp_input_ids
+        if mtp_input_mask is not None:
+            assert mtp_input_ids is not None
+            packed_mtp_metadata = torch.cat(
+                (mtp_input_ids, mtp_input_mask.to(dtype=mtp_input_ids.dtype)), dim=0
+            )
+
+        _, local_position_ids, packed_mtp_metadata, _ = self.partition_adapter.shard(
+            embeddings=None,
+            labels=position_metadata,
+            loss_mask=packed_mtp_metadata,
+            packed_seq_params=packed_seq_params,
+        )
+
+        if mtp_input_mask is not None:
+            assert packed_mtp_metadata is not None
+            mtp_input_ids, mtp_input_mask = packed_mtp_metadata.chunk(2, dim=0)
+            mtp_input_mask = mtp_input_mask.to(dtype=torch.bool)
+        else:
+            mtp_input_ids = packed_mtp_metadata
+
+        if is_multiaxis_position_ids:
+            assert local_position_ids is not None
+            local_position_ids = local_position_ids.movedim(-1, 0).contiguous()
+
+        return mtp_input_ids, local_position_ids, mtp_input_mask
+
     def _forward_language_module(
         self,
         input_ids: torch.Tensor,
@@ -759,6 +845,7 @@ class MimoModel(MegatronModule):
             )
 
         packed_seq_params = self._build_packed_seq_params(packing_kwargs)
+        owns_mtp = self._language_model_owns_mtp()
 
         if self.role.is_first_stage(lang_name):
             # First stage: receive encoder embeddings, combine with text, pass to LM
@@ -793,16 +880,23 @@ class MimoModel(MegatronModule):
                 loss_mask=loss_mask,
                 packed_seq_params=packed_seq_params,
             )
+            mtp_input_ids, position_ids, mtp_input_mask = self._prepare_mtp_inputs(
+                input_ids=input_ids,
+                position_ids=position_ids,
+                packed_seq_params=packed_seq_params,
+                owns_mtp=owns_mtp,
+                text_token_indices=(modality_token_indices or {}).get("text"),
+            )
 
             lm_output = self.language_model(
-                # decoder_input replaces the embedding lookup, so input_ids is
-                # unused here; position_ids is still consumed by mRoPE in models
-                # such as Qwen3-VL.
-                input_ids=None,
+                # decoder_input replaces the main embedding lookup, but MTP still
+                # needs token IDs to construct its shifted-token embeddings.
+                input_ids=mtp_input_ids,
                 position_ids=position_ids,
                 decoder_input=combined_embeddings,
                 labels=labels,
                 loss_mask=loss_mask,
+                mtp_input_mask=mtp_input_mask,
                 attention_mask=attention_mask,
                 packed_seq_params=packed_seq_params,
             )
@@ -816,6 +910,13 @@ class MimoModel(MegatronModule):
                 loss_mask=loss_mask,
                 packed_seq_params=packed_seq_params,
             )
+            mtp_input_ids, position_ids, mtp_input_mask = self._prepare_mtp_inputs(
+                input_ids=input_ids,
+                position_ids=position_ids,
+                packed_seq_params=packed_seq_params,
+                owns_mtp=owns_mtp,
+                text_token_indices=(modality_token_indices or {}).get("text"),
+            )
 
             hidden_states = input_tensors.get(lang_name) if input_tensors else None
 
@@ -828,11 +929,12 @@ class MimoModel(MegatronModule):
             lm_output = self.language_model(
                 # Hidden states arrive via set_input_tensor; position_ids is
                 # still consumed by mRoPE on non-first PP stages.
-                input_ids=None,
+                input_ids=mtp_input_ids,
                 position_ids=position_ids,
                 decoder_input=None,
                 labels=labels,
                 loss_mask=loss_mask,
+                mtp_input_mask=mtp_input_mask,
                 attention_mask=attention_mask,
                 packed_seq_params=packed_seq_params,
             )
@@ -900,6 +1002,7 @@ class MimoModel(MegatronModule):
         This is the original behavior, preserved for backward compatibility.
         """
         packed_seq_params = self._build_packed_seq_params(packing_kwargs)
+        owns_mtp = self._language_model_owns_mtp()
 
         # 1. Process each modality to get embeddings
         modality_embeddings = {}
@@ -951,17 +1054,24 @@ class MimoModel(MegatronModule):
             loss_mask=loss_mask,
             packed_seq_params=packed_seq_params,
         )
+        mtp_input_ids, position_ids, mtp_input_mask = self._prepare_mtp_inputs(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            packed_seq_params=packed_seq_params,
+            owns_mtp=owns_mtp,
+            text_token_indices=(modality_token_indices or {}).get("text"),
+        )
 
         # 5. Forward pass through language model
         lm_output = self.language_model(
-            # decoder_input replaces the embedding lookup, so input_ids is
-            # unused here; position_ids is still consumed by mRoPE in models
-            # such as Qwen3-VL.
-            input_ids=None,
+            # decoder_input replaces the main embedding lookup, but MTP still
+            # needs token IDs to construct its shifted-token embeddings.
+            input_ids=mtp_input_ids,
             position_ids=position_ids,
             decoder_input=combined_embeddings,
             labels=labels,
             loss_mask=loss_mask,
+            mtp_input_mask=mtp_input_mask,
             attention_mask=None,
             packed_seq_params=packed_seq_params,
         )

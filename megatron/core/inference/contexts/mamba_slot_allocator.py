@@ -6,6 +6,7 @@ import torch
 from torch import Tensor
 
 from megatron.core.inference.config import PrefixCachingEvictionPolicy
+from megatron.core.ssm.ops.gdp.common import CHUNK_SIZE as GDP_CHUNK_SIZE
 
 if TYPE_CHECKING:
     from .dynamic_context import DynamicInferenceContext
@@ -59,23 +60,24 @@ class MambaSlotAllocator:
         self.max_slots = max_slots
         self.num_mamba_layers = num_mamba_layers
 
-        # Gated Delta Product prefix caching is not implemented yet. Gate on the
-        # Householder count rather than on the chunk sizes: a GDP model built with
-        # chunk_size=64 satisfies the divisibility check below while still hitting
-        # the mis-indexed offset -> chunk conversion it exists to prevent.
-        assert context.gdp_num_householder == 0, (
-            "Gated Delta Product prefix caching is not supported yet; "
-            "set enable_prefix_caching=False."
-        )
-        # compute_and_store_offsets() records extraction offsets on the
-        # model-wide SSM chunk quantum, but MambaMetadata converts those offsets
-        # to chunk indices with the Mamba kernel chunk size. The conversion is
-        # only valid when the quantum is a multiple of it.
-        assert context.ssm_chunk_alignment % context.mamba_chunk_size == 0, (
-            "Mamba prefix caching requires an SSM chunk alignment that is a multiple of "
-            f"mamba_chunk_size ({context.mamba_chunk_size}); got "
-            f"{context.ssm_chunk_alignment}."
-        )
+        # compute_and_store_offsets() records extraction offsets on the model-wide
+        # SSM chunk quantum, and each mixer converts those offsets to a row of its
+        # own per-chunk states using its own chunk size. That conversion is exact
+        # only if the quantum is a multiple of that chunk size. Which chunk size to
+        # check against follows from the Householder count: ssm_chunking() asserts a
+        # homogeneous SSM stack, so a nonzero count means every SSM layer is Gated
+        # Delta Product, whose prefill kernels chunk at their own fixed size and for
+        # which mamba_chunk_size is an unused default.
+        if context.gdp_num_householder > 0:
+            assert context.ssm_chunk_alignment % GDP_CHUNK_SIZE == 0, (
+                f"SSM chunk alignment must be a multiple of the GDP chunk size "
+                f"({GDP_CHUNK_SIZE}); got {context.ssm_chunk_alignment}."
+            )
+        else:
+            assert context.ssm_chunk_alignment % context.mamba_chunk_size == 0, (
+                "SSM chunk alignment must be a multiple of mamba_chunk_size "
+                f"({context.mamba_chunk_size}); got {context.ssm_chunk_alignment}."
+            )
         gpu_device = torch.cuda.current_device()
         num_blocks = context.kv_block_allocator.pool_size
 
@@ -441,7 +443,7 @@ class MambaSlotAllocator:
         matched_block_ids: list,
         overall_required_blocks: int,
     ) -> None:
-        """Compute intermediate state extraction offsets and store per-request.
+        """Stage reusable recurrent states at interior offsets and/or an aligned chunk endpoint.
 
         Args:
             req: The inference request.
@@ -468,7 +470,7 @@ class MambaSlotAllocator:
         # later turns could not skip prefill.
         chunk_start = req.finished_chunk_token_count + skip_tokens
         seq_len = prefill_chunk_length - skip_tokens  # tokens computed this chunk
-        is_last_chunk = req.finished_chunk_token_count + prefill_chunk_length >= prompt_len
+        chunk_end = req.finished_chunk_token_count + prefill_chunk_length
 
         # Candidate absolute block boundaries at which to cache Mamba state.
         kv_div_abs = num_matched_blocks * bs
@@ -505,13 +507,12 @@ class MambaSlotAllocator:
             self._has_intermediates = True
         self._intermediate_counts_cpu[current_id] = count
 
-        # Block-aligned EOS: when the prompt length is exactly block-aligned, the
-        # request's live final state IS the last block boundary's state and can be
-        # cached directly. Only valid on the final chunk (otherwise the live state
-        # is mid-prompt). Non-block-aligned prompts cache their last complete block
-        # via the intermediate-extraction path above instead.
-        if is_last_chunk and last_aligned_abs == prompt_len and prompt_len > 0:
-            last_block_idx = prompt_len // bs - 1
+        # At a block-aligned chunk end, the request's live state is exactly the
+        # state for that block boundary and can be cached directly. This covers
+        # both aligned final prompts and non-final boundaries, which cannot use
+        # intermediate extraction because their offset equals `seq_len`.
+        if chunk_end > 0 and chunk_end % bs == 0:
+            last_block_idx = chunk_end // bs - 1
             if last_block_idx >= 0:
                 self._eos_cache_block_id_cpu[current_id] = ctx.request_to_kv_block_ids[current_id][
                     last_block_idx
