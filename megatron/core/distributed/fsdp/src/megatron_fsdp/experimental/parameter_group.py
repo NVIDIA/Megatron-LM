@@ -28,7 +28,11 @@ from torch.distributed.tensor.placement_types import Placement
 
 from ..mixed_precision import MixedPrecisionPolicy
 from .dbuffer import DBuffer
-from .module_utils import get_parameter_owner
+from .module_utils import (
+    get_parameter_owner,
+    restore_parameter_attributes,
+    save_parameter_attributes,
+)
 from .placement import changed_mesh_axis
 from .quantization import (
     E4M3_BLOCK_SIZE,
@@ -240,18 +244,26 @@ class FsdpParameterGroup:
         fsdp_parameters: list[FsdpParameter] = []
         main_grad_dtype = self.main_grad.dtype if self.main_grad is not None else None
         for index, (parameter, fqns) in enumerate(parameter_to_fqns.items()):
+            # Materialization may replace the Parameter's tensor state (meta parameters) and
+            # the sharded optimizer parameter is a new object, so snapshot the model metadata
+            # and restore it on both. Otherwise embedding/output markers and explicit Muon
+            # exclusions are lost and these parameters fall out of their scalar optimizer
+            # groups.
+            attributes = save_parameter_attributes(parameter)
             unsharded_tensor = (
                 self._unsharded_model_weight.get_local_tensor(index)
                 if self._unsharded_model_weight is not None
                 else None
             )
             self._materialize_unsharded_parameter(parameter, unsharded_tensor)
+            restore_parameter_attributes(parameter, attributes)
             # Parameter-owned markers must not retain their FSDP module tree.
             setattr(parameter, _CONTAINING_PARAMETER_GROUP_ATTR, ref(self))
 
             sharded_parameter = nn.Parameter(
                 self.main_weight.get_dtensor(index), requires_grad=parameter.requires_grad
             )
+            restore_parameter_attributes(sharded_parameter, attributes)
             sharded_parameter.__fsdp_param__ = True
             if main_grad_dtype:
                 sharded_parameter.grad_dtype = main_grad_dtype
@@ -321,8 +333,9 @@ class FsdpParameterGroup:
         if parameter.is_meta:
             # A meta Parameter cannot set .data to a real tensor because their
             # TensorImpl types are incompatible, so swap in a materialized Parameter.
-            # This may be problematic if attributes from the original Parameter need
-            # to be copied to the unsharded Parameter.
+            # The caller restores the model metadata after this call: swap_tensors()
+            # replaces the Parameter's tensor state (and its attribute dict), and
+            # attributes such as the embedding/output markers must survive the swap.
             materialized_parameter = nn.Parameter(
                 unsharded_tensor, requires_grad=parameter.requires_grad
             )
