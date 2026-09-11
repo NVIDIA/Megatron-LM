@@ -20,8 +20,11 @@ import torch
 import megatron.training.training as training_module
 from megatron.training.training import (
     consume_seqlen_stats_in_iteration,
+    consume_vision_model_flops_stats,
     num_floating_point_operations,
     update_seqlen_stats_from_cu_seqlens,
+    update_vision_model_flops_stats,
+    validate_vision_flops_metadata,
 )
 
 
@@ -29,6 +32,12 @@ def _reset_seqlen_accumulator():
     """Tear down the per-iteration accumulator between tests."""
     training_module._seqlen_stats_in_iteration = None
     training_module._seqlen_stats_active = False
+
+
+def _reset_vision_flops_accumulator():
+    """Tear down the per-iteration vision FLOPs accumulator between tests."""
+    training_module._vision_flops_stats_in_iteration = None
+    training_module._vision_flops_missing_runtime_stats_warned = False
 
 
 def _make_gpt_args(
@@ -136,6 +145,33 @@ def test_situ_glu_counts_the_same_ffn_gemms_as_swiglu():
     ) == num_floating_point_operations(swiglu_args, batch_size=8)
 
 
+def _enable_qwen35_vision_flops(args, validate=True):
+    """Attach a small Qwen3.5-VL vision configuration to decoder args.
+
+    Mirrors what ``examples/multimodal_dev/models/qwen35_vl/factory.py:
+    set_vision_flops_metadata`` sets on ``args``, including calling
+    ``validate_vision_flops_metadata`` (unless ``validate=False``, used by
+    tests that want to construct an invalid config and validate it
+    themselves after further mutating a field).
+    """
+    args.count_vision_model_flops = True
+    args.vision_flops_variant = "qwen35_vl"
+    args.vision_num_layers = 2
+    args.vision_hidden_size = 8
+    args.vision_ffn_hidden_size = 16
+    args.vision_num_attention_heads = 2
+    args.vision_kv_channels = 4
+    args.vision_in_channels = 3
+    args.vision_patch_size = 2
+    args.vision_temporal_patch_size = 2
+    args.vision_spatial_merge_size = 2
+    args.vision_out_hidden_size = 12
+    args.image_size = 8
+    if validate:
+        validate_vision_flops_metadata(args)
+    return args
+
+
 class TestBSHDBackwardCompat:
     """For unpacked BSHD, the new optional arg must not change the result."""
 
@@ -185,6 +221,137 @@ class TestBSHDBackwardCompat:
         )
 
         assert default_flops == explicit_flops
+
+
+class TestQwen35VisionFlops:
+    """Qwen3.5-VL vision work is additive to either decoder FLOPs path."""
+
+    @pytest.mark.parametrize(
+        "args",
+        [
+            pytest.param(_make_gpt_args(), id="standard-decoder"),
+            pytest.param(_make_hybrid_args(), id="hybrid-decoder"),
+        ],
+    )
+    def test_runtime_grid_stats_add_exact_vision_flops(self, args):
+        batch_size = 2
+        decoder_flops = num_floating_point_operations(args, batch_size)
+        _enable_qwen35_vision_flops(args)
+
+        # Equivalent to grids [[2, 4, 4], [1, 2, 4]]:
+        # patches = 2*16 + 1*8 = 40
+        # attention sumsq = 2*16^2 + 1*8^2 = 576
+        # merged tokens = 2*(2*2) + 1*(1*2) = 10
+        vision_stats = {
+            "vision_total_tokens_in_batch": 40,
+            "vision_seqlen_squared_sum_in_batch": 576,
+            "vision_merged_tokens_in_batch": 10,
+        }
+        multimodal_flops = num_floating_point_operations(args, batch_size, **vision_stats)
+
+        # Hand-computed for the tiny config set by _enable_qwen35_vision_flops
+        # (hidden=8, ffn=16, heads=2, kv_channels=4, in_channels=3, patch=2,
+        # temporal_patch=2, spatial_merge=2, out_hidden=12, num_layers=2) --
+        # an independent oracle a wrong factor in the implementation cannot
+        # influence, unlike re-deriving the same formula here.
+        #   projection_size = kv_channels * heads = 4 * 2 = 8
+        #   patch_dim = in_channels * temporal_patch * patch * patch = 3*2*2*2 = 24
+        #   merge_dim = hidden * spatial_merge^2 = 8 * 2^2 = 32
+        #   matmul_factor = 3 (fwd+bwd) * 2 (fma) = 6
+        #   patch_embed = matmul_factor * total_patches * patch_dim * hidden
+        #               = 6 * 40 * 24 * 8 = 46080
+        #   per_layer_proj = matmul_factor * total_patches
+        #       * (hidden*3*projection_size + projection_size*hidden + hidden*ffn + ffn*hidden)
+        #       = 6 * 40 * (8*24 + 64 + 128 + 128) = 6 * 40 * 512 = 122880
+        #   per_layer_attn = 3 * 4 * attention_sum_sq * projection_size
+        #       = 12 * 576 * 8 = 55296
+        #   transformer = num_layers * (per_layer_proj + per_layer_attn)
+        #       = 2 * (122880 + 55296) = 356352
+        #   merger = matmul_factor * merged_tokens * (merge_dim*merge_dim + merge_dim*out_hidden)
+        #       = 6 * 10 * (1024 + 384) = 84480
+        #   total = patch_embed + transformer + merger = 46080 + 356352 + 84480 = 486912
+        assert multimodal_flops - decoder_flops == 486912
+
+    def test_missing_runtime_stats_omit_vision_flops(self):
+        # No nominal fallback: without runtime grid_thw statistics the vision
+        # contribution is excluded rather than synthesised from --image-size
+        # and vision_temporal_patch_size, which describe a patch kernel depth
+        # and a mock-data resolution, not the runtime (T, H, W) grid.
+        args = _make_gpt_args()
+        batch_size = 3
+        decoder_flops = num_floating_point_operations(args, batch_size)
+
+        _enable_qwen35_vision_flops(args)
+        assert num_floating_point_operations(args, batch_size) == decoder_flops
+
+    def test_temporal_extent_independent_of_temporal_patch_size(self):
+        # T is whatever the processor emitted, never vision_temporal_patch_size.
+        # Same total patch count, different temporal split -> same token-linear
+        # work but different per-frame attention work.
+        args = _enable_qwen35_vision_flops(_make_gpt_args())
+        common = dict(vision_total_tokens_in_batch=32, vision_merged_tokens_in_batch=8)
+
+        # T=1, 4x8 grid: one 32-long sequence -> sum(L^2) = 1024.
+        one_frame = num_floating_point_operations(
+            args, 2, vision_seqlen_squared_sum_in_batch=1024, **common
+        )
+        # T=4, 4x2 grid: four 8-long sequences -> sum(L^2) = 4 * 64 = 256.
+        four_frames = num_floating_point_operations(
+            args, 2, vision_seqlen_squared_sum_in_batch=256, **common
+        )
+        # Only the attention term differs: 2 layers * 3 * 4 * dsum * proj(=8).
+        assert one_frame - four_frames == 2 * 12 * (1024 - 256) * 8
+
+    def test_partial_runtime_stats_fail_loudly(self):
+        args = _enable_qwen35_vision_flops(_make_gpt_args())
+        with pytest.raises(ValueError, match="must be provided together"):
+            num_floating_point_operations(args, batch_size=2, vision_total_tokens_in_batch=40)
+
+    def test_invalid_vision_metadata_fails_loudly(self):
+        # Metadata is validated eagerly (at model-construction time), not
+        # inside num_floating_point_operations -- see validate_vision_flops_metadata.
+        args = _enable_qwen35_vision_flops(_make_gpt_args(), validate=False)
+        args.vision_spatial_merge_size = 0
+        with pytest.raises(ValueError, match="metadata must be positive"):
+            validate_vision_flops_metadata(args)
+
+    def test_negative_runtime_stats_fail_loudly(self):
+        args = _enable_qwen35_vision_flops(_make_gpt_args())
+        with pytest.raises(ValueError, match="must be non-negative"):
+            num_floating_point_operations(
+                args,
+                batch_size=2,
+                vision_total_tokens_in_batch=-1,
+                vision_seqlen_squared_sum_in_batch=0,
+                vision_merged_tokens_in_batch=0,
+            )
+
+    def test_unvalidated_metadata_fails_with_an_actionable_error(self):
+        # An entry point that sets count_vision_model_flops without routing
+        # through validate_vision_flops_metadata must get a pointer to the
+        # validator, not a bare AttributeError at iteration 1.
+        args = _enable_qwen35_vision_flops(_make_gpt_args(), validate=False)
+        with pytest.raises(ValueError, match="validate_vision_flops_metadata"):
+            num_floating_point_operations(
+                args,
+                batch_size=2,
+                vision_total_tokens_in_batch=40,
+                vision_seqlen_squared_sum_in_batch=576,
+                vision_merged_tokens_in_batch=10,
+            )
+
+    def test_enabled_unknown_variant_fails_loudly(self):
+        args = _enable_qwen35_vision_flops(_make_gpt_args(), validate=False)
+        args.vision_flops_variant = "unknown"
+        with pytest.raises(ValueError, match="Unsupported vision FLOPs variant"):
+            validate_vision_flops_metadata(args)
+
+    def test_disabled_vision_preserves_decoder_only_result(self):
+        args = _make_gpt_args()
+        decoder_flops = num_floating_point_operations(args, batch_size=2)
+        args.count_vision_model_flops = False
+        args.vision_flops_variant = "unknown"
+        assert num_floating_point_operations(args, batch_size=2) == decoder_flops
 
 
 class TestTHDScaling:
@@ -741,6 +908,106 @@ class TestAccumulator:
         assert training_module._seqlen_stats_in_iteration.tolist() == [0.0, 0.0]
 
 
+class TestVisionFlopsAccumulator:
+    """Actual per-microbatch vision grids feed the global FLOPs estimate."""
+
+    def setup_method(self):
+        _reset_vision_flops_accumulator()
+
+    def teardown_method(self):
+        _reset_vision_flops_accumulator()
+
+    def test_variable_grids_accumulate_exact_stats(self):
+        update_vision_model_flops_stats(
+            torch.tensor([[2, 4, 4], [1, 2, 4]], dtype=torch.int64), spatial_merge_size=2
+        )
+        update_vision_model_flops_stats(
+            torch.tensor([[1, 6, 2]], dtype=torch.int64), spatial_merge_size=2
+        )
+
+        total_patches, attention_sum_sq, merged_tokens = consume_vision_model_flops_stats(True)
+        assert total_patches == 40 + 12
+        assert attention_sum_sq == 576 + 12**2
+        assert merged_tokens == 10 + 3
+
+    def test_no_vision_inputs_returns_none(self):
+        assert consume_vision_model_flops_stats(True) == (None, None, None)
+
+    def test_disabled_returns_none_without_touching_state(self):
+        """count_vision_model_flops=False must short-circuit before touching
+        the accumulator, even if an update happened to land earlier (e.g. a
+        stale value from before the feature was toggled off)."""
+        update_vision_model_flops_stats(
+            torch.tensor([[1, 4, 4]], dtype=torch.int64), spatial_merge_size=2
+        )
+        assert consume_vision_model_flops_stats(False) == (None, None, None)
+        # The (still-active) accumulator is untouched -- draining it with the
+        # feature enabled recovers the same update.
+        assert consume_vision_model_flops_stats(True) == (16.0, 256.0, 4.0)
+
+    def test_explicit_text_only_microbatch_returns_zeros(self):
+        update_vision_model_flops_stats(None, spatial_merge_size=2)
+        assert consume_vision_model_flops_stats(True) == (0.0, 0.0, 0.0)
+
+    def test_consume_resets_accumulator(self):
+        update_vision_model_flops_stats(
+            torch.tensor([[1, 4, 4]], dtype=torch.int64), spatial_merge_size=2
+        )
+        consume_vision_model_flops_stats(True)
+        assert consume_vision_model_flops_stats(True) == (None, None, None)
+
+    def test_multi_image_microbatch_sums_every_grid_row(self):
+        # One microbatch carrying three images of different resolutions.
+        update_vision_model_flops_stats(
+            torch.tensor([[1, 4, 4], [1, 2, 6], [3, 2, 2]], dtype=torch.int64), spatial_merge_size=2
+        )
+        total_patches, attention_sum_sq, merged_tokens = consume_vision_model_flops_stats(True)
+        assert total_patches == 16 + 12 + 3 * 4
+        assert attention_sum_sq == 16**2 + 12**2 + 3 * 4**2
+        assert merged_tokens == (2 * 2) + (1 * 3) + 3 * (1 * 1)
+
+    def test_text_only_and_image_microbatches_mix(self):
+        update_vision_model_flops_stats(None, spatial_merge_size=2)
+        update_vision_model_flops_stats(
+            torch.tensor([[1, 4, 4]], dtype=torch.int64), spatial_merge_size=2
+        )
+        update_vision_model_flops_stats(
+            torch.empty((0, 3), dtype=torch.int64), spatial_merge_size=2
+        )
+        assert consume_vision_model_flops_stats(True) == (16.0, 256.0, 4.0)
+
+    @pytest.mark.parametrize(
+        "grid,merge,error",
+        [
+            (torch.tensor([1, 4, 4]), 2, "shape"),
+            (torch.tensor([[1, 4, 4]]), 0, "positive"),
+            (torch.tensor([[1, 4, 4]]), None, "positive"),
+        ],
+    )
+    def test_malformed_grid_shape_fails_eagerly(self, grid, merge, error):
+        with pytest.raises(ValueError, match=error):
+            update_vision_model_flops_stats(grid, spatial_merge_size=merge)
+
+    @pytest.mark.parametrize(
+        "grid",
+        [
+            pytest.param(torch.tensor([[1, 3, 4]]), id="height-not-divisible"),
+            pytest.param(torch.tensor([[1, 4, 5]]), id="width-not-divisible"),
+            pytest.param(torch.tensor([[0, 4, 4]]), id="zero-temporal"),
+            pytest.param(torch.tensor([[1, -4, 4]]), id="negative-height"),
+        ],
+    )
+    def test_invalid_grid_values_raise_at_consume(self, grid):
+        # Value validation is device-side and deferred to ``consume_*`` so that
+        # production CUDA grids get the same checking as CPU ones without
+        # paying a per-microbatch device-to-host sync.
+        update_vision_model_flops_stats(grid, spatial_merge_size=2)
+        with pytest.raises(ValueError, match="non-positive extent"):
+            consume_vision_model_flops_stats(True)
+        # ...and the error does not leak into the next iteration.
+        assert consume_vision_model_flops_stats(True) == (None, None, None)
+
+
 class TestAccumulatorDistributed:
     """All-reduce + ``TP*CP*PP`` deduplication.
 
@@ -829,6 +1096,124 @@ class TestAccumulatorDistributed:
         assert calls == [], "consume must not issue all_reduce when no update happened"
 
 
+class TestVisionFlopsAccumulatorDistributed:
+    """Vision FLOPs collective entry is gated on config, not on the local flag.
+
+    Regression coverage for the desync fix: entering the all-reduce in
+    ``consume_vision_model_flops_stats`` must depend ONLY on
+    ``count_vision_model_flops`` (identical on every rank), never on whether
+    THIS rank happened to call ``update_vision_model_flops_stats`` locally
+    this iteration (e.g. its data iterator ran dry). A regression here would
+    hang in production with >=2 ranks; run with ``torchrun --nproc_per_node=2``.
+    """
+
+    def setup_method(self):
+        _reset_vision_flops_accumulator()
+
+    def teardown_method(self):
+        from tests.unit_tests.test_utilities import Utils
+
+        _reset_vision_flops_accumulator()
+        Utils.destroy_model_parallel()
+
+    def test_enters_collective_even_when_this_rank_never_updated(self):
+        from tests.unit_tests.test_utilities import Utils
+
+        if Utils.world_size < 2:
+            pytest.skip("requires >= 2 ranks")
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1, pipeline_model_parallel_size=1
+        )
+
+        # Only rank 0 reports a grid this iteration; every other rank's data
+        # iterator is simulated as exhausted (never calls update_*). Before
+        # the fix, only rank 0 would enter the all_reduce here -> hang.
+        if Utils.rank == 0:
+            update_vision_model_flops_stats(
+                torch.tensor([[1, 4, 4]], dtype=torch.int64, device='cuda'), spatial_merge_size=2
+            )
+
+        total_patches, attention_sum_sq, merged_tokens = consume_vision_model_flops_stats(True)
+        # Pure DP (TP=CP=PP=1): no dedup, sums across ranks. Only rank 0
+        # contributed, so the global sum equals rank 0's single update.
+        assert total_patches == 16
+        assert attention_sum_sq == 256
+        assert merged_tokens == 4
+
+    def test_no_updates_anywhere_still_returns_none(self):
+        from tests.unit_tests.test_utilities import Utils
+
+        if Utils.world_size < 2:
+            pytest.skip("requires >= 2 ranks")
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1, pipeline_model_parallel_size=1
+        )
+
+        # No rank calls update_* this iteration -- must still enter the
+        # (cheap) collective without hanging, and report that nothing was
+        # collected so the caller omits the vision terms entirely.
+        assert consume_vision_model_flops_stats(True) == (None, None, None)
+
+    def test_differing_activity_across_ranks_still_deduplicates(self):
+        """Activity differs across ranks AND model parallelism is on.
+
+        Rank 0 of each TP group reports a grid while the others never call
+        ``update_*``. Consumption must complete (no hang) and the ``TP*CP*PP``
+        dedup must still be applied to whatever was reported.
+        """
+        from megatron.core import mpu
+        from tests.unit_tests.test_utilities import Utils
+
+        if Utils.world_size < 2:
+            pytest.skip("requires >= 2 ranks")
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=Utils.world_size, pipeline_model_parallel_size=1
+        )
+
+        # Only the first rank in the TP group has runtime data. The world sum
+        # is therefore ONE grid, but consume divides by tp_size -- so the
+        # reported value is deliberately 1/tp of a grid. This pins the
+        # contract that dedup is unconditional, and documents why every rank
+        # in a model-parallel group is expected to report the same grids.
+        tp_size = mpu.get_tensor_model_parallel_world_size()
+        if mpu.get_tensor_model_parallel_rank() == 0:
+            update_vision_model_flops_stats(
+                torch.tensor([[1, 4, 4]], dtype=torch.int64, device='cuda'), spatial_merge_size=2
+            )
+
+        total_patches, attention_sum_sq, merged_tokens = consume_vision_model_flops_stats(True)
+        assert total_patches == pytest.approx(16 / tp_size)
+        assert attention_sum_sq == pytest.approx(256 / tp_size)
+        assert merged_tokens == pytest.approx(4 / tp_size)
+
+    def test_invalid_grid_on_one_rank_raises_on_all_ranks(self):
+        """A bad grid anywhere must surface everywhere, not just on its rank.
+
+        The malformed-row counter rides in the all-reduced tensor, so every
+        rank raises. A rank-local raise would leave the peers waiting in the
+        next collective.
+        """
+        from tests.unit_tests.test_utilities import Utils
+
+        if Utils.world_size < 2:
+            pytest.skip("requires >= 2 ranks")
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1, pipeline_model_parallel_size=1
+        )
+
+        if Utils.rank == 0:
+            update_vision_model_flops_stats(
+                torch.tensor([[1, 3, 4]], dtype=torch.int64, device='cuda'), spatial_merge_size=2
+            )
+        else:
+            update_vision_model_flops_stats(
+                torch.tensor([[1, 4, 4]], dtype=torch.int64, device='cuda'), spatial_merge_size=2
+            )
+
+        with pytest.raises(ValueError, match="non-positive extent"):
+            consume_vision_model_flops_stats(True)
+
+
 # 8-GPU topology matrix. Each tuple is ``(tp, cp, pp)`` with ``dp = 8 / (tp*cp*pp)``.
 # The matrix covers every model-parallel dim in isolation and the pairwise /
 # three-way combinations that fit in 8 GPUs. This pins the contract that:
@@ -913,6 +1298,64 @@ class TestAccumulatorTopology:
             f"topology tp={tp} cp={cp} pp={pp} dp={dp_size}: "
             f"got seqlen_squared_sum={seqlen_squared_sum}, expected {expected_sum_sq}"
         )
+
+
+class TestVisionFlopsAccumulatorTopology:
+    """``TP*CP*PP`` dedup for the vision accumulator across the 8-GPU matrix.
+
+    Same production invariant as :class:`TestAccumulatorTopology`: every rank
+    within a DP group sees the SAME ``image_grid_thw`` (it is broadcast across
+    the model-parallel dims, and the vision encoder is additionally replicated
+    across CP by design), while DP groups see different samples.
+
+    Skipped unless launched with ``torchrun --nproc_per_node 8``.
+    """
+
+    def setup_method(self):
+        _reset_vision_flops_accumulator()
+
+    def teardown_method(self):
+        from tests.unit_tests.test_utilities import Utils
+
+        _reset_vision_flops_accumulator()
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.parametrize("tp,cp,pp", _TOPOLOGY_8GPU_PARAMS)
+    def test_dedup_across_topology(self, tp, cp, pp):
+        from megatron.core import mpu
+        from tests.unit_tests.test_utilities import Utils
+
+        if Utils.world_size != 8:
+            pytest.skip(f"requires exactly 8 ranks; got {Utils.world_size}")
+
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=tp, pipeline_model_parallel_size=pp, context_parallel_size=cp
+        )
+
+        dp_size = Utils.world_size // (tp * cp * pp)
+        assert dp_size == mpu.get_data_parallel_world_size()
+        dp_rank = mpu.get_data_parallel_rank()
+
+        # Per-DP-group grid: a 2-image microbatch whose extents grow with the
+        # DP rank so every DP group contributes a different amount to all
+        # three statistics.
+        scale = dp_rank + 1
+        grid = torch.tensor(
+            [[1, 2 * scale, 2 * scale], [2, 2, 4 * scale]], dtype=torch.int64, device='cuda'
+        )
+        update_vision_model_flops_stats(grid, spatial_merge_size=2)
+
+        expected_patches = sum((2 * (r + 1)) ** 2 + 2 * (2 * 4 * (r + 1)) for r in range(dp_size))
+        expected_sum_sq = sum(
+            ((2 * (r + 1)) ** 2) ** 2 + 2 * (2 * 4 * (r + 1)) ** 2 for r in range(dp_size)
+        )
+        expected_merged = sum((r + 1) ** 2 + 2 * (1 * 2 * (r + 1)) for r in range(dp_size))
+
+        total_patches, attention_sum_sq, merged_tokens = consume_vision_model_flops_stats(True)
+        context = f"topology tp={tp} cp={cp} pp={pp} dp={dp_size}"
+        assert total_patches == pytest.approx(expected_patches), context
+        assert attention_sum_sq == pytest.approx(expected_sum_sq), context
+        assert merged_tokens == pytest.approx(expected_merged), context
 
 
 def _make_dsv4_args():

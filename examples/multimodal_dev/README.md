@@ -199,10 +199,18 @@ def post_language_config(language_config, args):
     pass
 
 def set_vision_flops_metadata(args, language_config, vision_config):
-    """(Optional) Set vision FLOPs metadata on args."""
+    """(Optional) Set vision FLOPs metadata on args.
+
+    Omit this function entirely unless megatron.training.training implements
+    a FLOPs calculator for THIS architecture -- "qwen35_vl" is the only
+    variant today, and naming it from a different architecture would report
+    Qwen3.5-VL's formula for your model. An unrecognised variant is rejected
+    at model-construction time.
+    """
     args.count_vision_model_flops = True
-    args.vision_flops_variant = "llava_next"
-    # ... set dimension fields for FLOPs calculation
+    args.vision_flops_variant = "<variant implemented in megatron/training/training.py>"
+    # ... set the vision_* dimension fields that variant requires;
+    # see models/qwen35_vl/factory.py:set_vision_flops_metadata
 
 def build_model(args, language_config, vision_config, **kwargs):
     """(Required) Build and return the complete model instance."""
@@ -276,3 +284,41 @@ torchrun --nproc_per_node=8 multimodal_dev/pretrain_multimodal.py \
 | `post_language_config_fn` | No | `(language_config, args) -> None` |
 | `vision_flops_fn` | No | `(args, language_config, vision_config) -> None` |
 | `dataset_providers` | No | `Dict[str, str \| callable]` |
+
+## Vision FLOPs Accounting
+
+Training throughput uses `megatron.training.training.num_floating_point_operations`.
+Architectures opt in through `vision_flops_fn`, which sets a supported
+`vision_flops_variant` plus the vision model dimensions on the global args
+(see `qwen35_vl/factory.py:set_vision_flops_metadata`). `model_provider`
+validates the result centrally right after calling `vision_flops_fn`, via
+`megatron.training.training.validate_vision_flops_metadata(args)` --
+individual `vision_flops_fn` implementations do not need to call it
+themselves. Enabling an unknown variant or omitting required metadata is an
+error rather than silently reporting decoder-only FLOPs, raised at
+model-construction time rather than at the first training iteration.
+
+For Qwen3.5-VL, the estimate includes the dominant training matrix operations
+from:
+
+- the Conv3d patch projection;
+- every vision Transformer layer's dense QKV/output projections, bidirectional
+  attention, and two-linear GELU MLP; and
+- both patch-merger projections.
+
+`forward_step` records the actual `(T, H, W)` values from every
+`image_grid_thw` microbatch. The training loop globally reduces three
+sufficient statistics: total input patches, the per-temporal-frame
+`sum(sequence_length^2)` used by packed vision attention, and the number of
+post-merger tokens. This makes variable-resolution, multi-image, text-only and
+packed-sequence batches use their real vision work.
+
+The runtime statistics are the only input to the vision terms. An entry point
+that enables `count_vision_model_flops` without calling
+`update_vision_model_flops_stats` from its forward step gets decoder-only
+FLOPs plus a one-time warning, not an estimate synthesised from nominal
+architecture metadata — a fabricated-but-plausible figure would silently
+corrupt MFU comparisons and perf regression tracking.
+
+As in the language-model estimate, small elementwise work such as LayerNorm,
+GELU, RoPE, interpolation, and residual additions is intentionally omitted.
