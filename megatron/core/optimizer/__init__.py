@@ -67,7 +67,7 @@ from .emerging_optimizers import (
     _create_emerging_optimizer,
     _get_qkv_split_shapes,
 )
-from .fully_sharded_optimizer import FullyShardedOptimizer, needs_empty_shard_workaround
+from .fully_sharded_optimizer import FullyShardedOptimizer
 from .grad_scaler import ConstantGradScaler, DynamicGradScaler
 from .layer_wise_optimizer import LayerWiseDistributedOptimizer, is_managed_by_layer_wise_optimizer
 from .optimizer import (
@@ -1124,30 +1124,6 @@ def get_megatron_optimizer(
                 param_groups = _get_param_groups(
                     model_chunk, config, config_overrides, param_group_process_group
                 )
-                # Reinstate the empty-parameter workaround removed by
-                # NVIDIA/Megatron-LM#7002. TE FusedAdam can skip pending updates when a
-                # group ends in an empty tensor:
-                # https://github.com/NVIDIA/TransformerEngine/issues/3207. That is fixed
-                # in TE 2.18 (https://github.com/NVIDIA/TransformerEngine/pull/3212), so
-                # the workaround is gated on the TE version and can go away once the
-                # minimum supported TE is 2.18. Empty local shards have no optimizer
-                # state or data to update, so omit them; the nemo:26.08 MFSDP v2 build
-                # uses TE 2.17.1 and still needs this.
-                #
-                # FullyShardedOptimizer.zero_grad clears the module grads that this
-                # filter hides from the optimizer. Both halves are gated by the same
-                # needs_empty_shard_workaround() predicate, and they have to stay in
-                # lockstep: either both run or neither does.
-                if needs_empty_shard_workaround():
-                    for param_group in param_groups:
-                        param_group['params'] = [
-                            parameter
-                            for parameter in param_group['params']
-                            if parameter.to_local().numel() > 0
-                        ]
-                    param_groups = [
-                        param_group for param_group in param_groups if param_group['params']
-                    ]
                 # MFSDP v2 owns its sharded parameter and gradient storage, so
                 # FullyShardedOptimizer does not need DDP param-and-grad buffers.
                 buffers = None
