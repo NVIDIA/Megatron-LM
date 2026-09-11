@@ -10,9 +10,13 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from megatron.core.extensions.transformer_engine import HAVE_TE
+from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
     get_dsv4_hybrid_module_spec_for_backend,
+    get_experimental_attention_variant_module_spec,
 )
+from megatron.core.transformer.experimental_attention_variant.csa2 import CompressedSparseAttention2
 from megatron.core.transformer.transformer_config import MLATransformerConfig, TransformerConfig
 from megatron.training.argument_utils import _resolve_dsa_kernel_backend_cli_default
 from megatron.training.arguments import _add_network_size_args
@@ -25,7 +29,7 @@ def _make_config(
     values = dict(
         experimental_attention_variant="dsv4_hybrid",
         dsv4_version="v4.1",
-        transformer_impl="local",
+        transformer_impl="transformer_engine",
         use_cpu_initialization=True,
         params_dtype=params_dtype,
         bf16=params_dtype == torch.bfloat16,
@@ -132,9 +136,27 @@ def test_candidates_can_be_disabled():
     assert config.csa2_candidate_source_layer is None
 
 
-def test_v41_cannot_build_legacy_attention_spec():
-    with pytest.raises(NotImplementedError, match="CSA2 attention"):
-        get_dsv4_hybrid_module_spec_for_backend(_make_config())
+@pytest.mark.parametrize(
+    "get_spec",
+    [get_dsv4_hybrid_module_spec_for_backend, get_experimental_attention_variant_module_spec],
+)
+@pytest.mark.skipif(not HAVE_TE, reason="Transformer Engine is not installed")
+def test_v41_uses_v4_backend_for_attention_spec(get_spec):
+    backend = TESpecProvider()
+    kwargs = {"backend": backend} if get_spec is get_dsv4_hybrid_module_spec_for_backend else {}
+    spec = get_spec(_make_config(), **kwargs)
+    assert spec.submodules.core_attention.module is CompressedSparseAttention2
+    assert spec.submodules.linear_q_down_proj is backend.linear()
+    assert spec.submodules.linear_q_up_proj is backend.column_parallel_linear()
+    assert spec.submodules.linear_kv_proj is backend.column_parallel_linear()
+    assert spec.submodules.linear_proj is backend.row_parallel_linear()
+    assert spec.submodules.q_layernorm is backend.layer_norm(rms_norm=True, for_qk=True)
+    core = spec.submodules.core_attention.submodules
+    assert core.compressor.submodules.linear_wkv is backend.linear()
+    assert core.compressor.submodules.norm is backend.layer_norm(rms_norm=True, for_qk=False)
+    assert core.indexer.submodules.linear_wq_b is backend.linear()
+    assert core.indexer.submodules.linear_wk is backend.linear()
+    assert core.indexer.submodules.k_norm is backend.layer_norm(rms_norm=True, for_qk=True)
 
 
 @pytest.mark.parametrize("ratio", [0, 4, 128])
