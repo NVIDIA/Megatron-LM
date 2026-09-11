@@ -11,6 +11,7 @@ mode produces the correct per-shard result:
   2. test_gtp_blockwise_mode - TP1: local NS on the GTP shard, no collective.
   3. test_row_parallel      - TP on dim 1, GTP on dim 0: gather smaller group, distribute larger.
   4. test_col_parallel      - TP and GTP both on dim 0: gather smaller group, distribute larger.
+  5. test_padded_distributed_parity - padding stays in NS buffers but not Muon scale math.
 
 The TP cases run at ``tp_size * gtp_remat_size`` ranks and cover ``tp_size != gtp_remat_size``
 in both directions, since equal sizes are the one shape where a mix-up of the two dim-0 axes
@@ -55,6 +56,8 @@ from tests.unit_tests.generalized_tensor_parallel.gtp_test_utils import (  # noq
 _M, _K = 128, 64
 _NS_STEPS = 1
 _ATOL, _RTOL = 1e-4, 1e-4
+# Exercise the 16-row tile alignment used by FP8/NVFP4 GTP configurations.
+_PAD_ALIGNMENT = 16
 
 # Spelled out rather than left to TensorParallelMuon's defaults so the blockwise test can
 # rebuild the expected value from the same primitives the production path uses.
@@ -84,10 +87,10 @@ def _make_muon(pg_collection, tp_mode="distributed"):
     )
 
 
-def _full_weight():
+def _full_weight(rows=_M):
     """Full [M, K] momentum, identical on every rank (rank-0 broadcast)."""
     torch.manual_seed(0)
-    w = torch.randn(_M, _K, dtype=torch.float32, device="cuda")
+    w = torch.randn(rows, _K, dtype=torch.float32, device="cuda")
     torch.distributed.broadcast(w, src=0)
     return w
 
@@ -227,6 +230,61 @@ def _worker_gtp_blockwise(rank, world_size, port):
         ps.initialize_model_parallel()
 
 
+def _worker_padded_distributed_parity(
+    rank, world_size, port, tp_size, gtp_remat_size, logical_m, partition_dim
+):
+    """Padded distributed NS must match unpadded full-matrix NS and Muon scaling."""
+    _init_model_parallel(tp_size, gtp_remat_size)
+    try:
+        pgc = ProcessGroupCollection.use_mpu_process_groups()
+        opt = _make_muon(pgc)
+        w = _full_weight(logical_m)
+        ref = _reference_full_orth(opt, w, pgc.tp)
+
+        gs, gr = _world_size(pgc.gtp_remat), _rank(pgc.gtp_remat)
+        ts, tr = _world_size(pgc.tp), _rank(pgc.tp)
+
+        if partition_dim == 0:
+            # Column-parallel TP owns a contiguous logical row block. GTP pads and shards
+            # each TP block independently, so the padding is repeated once per TP rank.
+            assert logical_m % ts == 0
+            logical_m_per_tp = logical_m // ts
+            pad_length = (-logical_m_per_tp) % (_PAD_ALIGNMENT * gs)
+            tp_start = tr * logical_m_per_tp
+            tp_w = w[tp_start : tp_start + logical_m_per_tp]
+            tp_ref = ref[tp_start : tp_start + logical_m_per_tp]
+            padded_w = torch.nn.functional.pad(tp_w, (0, 0, 0, pad_length))
+            padded_ref = torch.nn.functional.pad(tp_ref, (0, 0, 0, pad_length))
+            shard_rows = padded_w.size(0) // gs
+            local = padded_w[gr * shard_rows : (gr + 1) * shard_rows].clone()
+            expected = padded_ref[gr * shard_rows : (gr + 1) * shard_rows]
+        else:
+            # With TP absent or partitioning dim 1, every TP rank sees the same logical rows;
+            # the one GTP pad is followed by the optional TP column slice.
+            pad_length = (-logical_m) % (_PAD_ALIGNMENT * gs)
+            padded_w = torch.nn.functional.pad(w, (0, 0, 0, pad_length))
+            padded_ref = torch.nn.functional.pad(ref, (0, 0, 0, pad_length))
+            shard_rows = padded_w.size(0) // gs
+            local = padded_w[gr * shard_rows : (gr + 1) * shard_rows]
+            expected = padded_ref[gr * shard_rows : (gr + 1) * shard_rows]
+            if partition_dim == 1:
+                assert _K % ts == 0
+                shard_cols = _K // ts
+                local = local[:, tr * shard_cols : (tr + 1) * shard_cols]
+                expected = expected[:, tr * shard_cols : (tr + 1) * shard_cols]
+            local = local.clone()
+
+        assert pad_length > 0, "test shape must exercise real GTP alignment padding"
+        local.is_gtp_weight_remat = True
+        local.pad_length = pad_length
+
+        out = opt.scaled_orthogonalize_fn_with_gtp_remat(local, local, pgc.tp, partition_dim)
+        torch.testing.assert_close(out, expected, atol=_ATOL, rtol=_RTOL)
+    finally:
+        ps.destroy_model_parallel()
+        ps.initialize_model_parallel()
+
+
 class TestGTPMuonDistributedNS:
     """Distributed-NS orthogonalization matches full-matrix NS, per shard."""
 
@@ -252,3 +310,25 @@ class TestGTPMuonDistributedNS:
     def test_gtp_blockwise_mode(self, world_size):
         _requires_multi_gpu(world_size)
         _run_distributed(_worker_gtp_blockwise, world_size)
+
+    @pytest.mark.parametrize(
+        "tp_size,gtp_remat_size,logical_m,partition_dim",
+        [
+            pytest.param(1, 8, 126, None, id="gtp-only"),
+            pytest.param(1, 8, 62, None, id="gtp-only-padding-spans-shards"),
+            pytest.param(2, 4, 126, 1, id="row-parallel"),
+            pytest.param(4, 2, 124, 0, id="column-parallel"),
+        ],
+    )
+    def test_padded_distributed_parity(self, tp_size, gtp_remat_size, logical_m, partition_dim):
+        world_size = tp_size * gtp_remat_size
+        # The eight ranks may span multiple nodes, so validate the initialized distributed
+        # world rather than requiring all eight CUDA devices to be visible on each host.
+        _run_distributed(
+            _worker_padded_distributed_parity,
+            world_size,
+            tp_size,
+            gtp_remat_size,
+            logical_m,
+            partition_dim,
+        )
