@@ -1480,7 +1480,7 @@ class TestTENativeGroupedMxfp8:
                 root,
                 backend="triton",
                 excluded_parameter_ids=excluded,
-                exclude_pattern=r"\.experts\.",
+                exclude_pattern=r"(^|\.)experts\.",
             )
 
         assert root.dense.weight is original_dense_weight
