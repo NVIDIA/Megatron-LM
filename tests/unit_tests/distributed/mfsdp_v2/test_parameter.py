@@ -1,8 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Unit tests for the minimal Megatron-FSDP path."""
-
-import logging
+"""Unit tests for MFSDP v2 parameter ownership and lifecycle."""
 
 import pytest
 import torch
@@ -15,8 +13,6 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     fully_shard,
     fully_shard_context,
 )
-
-logger = logging.getLogger(__name__)
 
 
 class NestedModel(nn.Module):

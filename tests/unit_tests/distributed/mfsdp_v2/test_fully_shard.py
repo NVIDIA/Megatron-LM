@@ -1,6 +1,9 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Unit tests for the minimal Megatron-FSDP path."""
+"""Unit tests for MFSDP v2."""
+
+# There is no perfect boundary between test files. Keep tests here when they
+# do not fit naturally in one of the more focused test files.
 
 import logging
 
