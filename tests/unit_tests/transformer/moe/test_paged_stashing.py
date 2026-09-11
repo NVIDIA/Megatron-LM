@@ -19,8 +19,12 @@ from megatron.core.transformer.spec_utils import get_submodules
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_te_min_version
 from megatron.training.initialize import _set_random_seed
-from tests.unit_tests.test_utilities import Utils
-from tests.unit_tests.transformer.moe.test_token_dispatcher import is_nccl_ep_fp8_dispatch_available
+from tests.unit_tests.test_utilities import (
+    Utils,
+    is_nccl_ep_available,
+    is_nccl_ep_fp8_dispatch_available,
+    is_nccl_ep_zero_copy_available,
+)
 
 # These tests configure mxfp8 + the TE op fuser, so they only run on Blackwell (sm100+). Mark the
 # whole module for the GB200 CI bucket (selection there is marker-driven; see
@@ -193,43 +197,6 @@ def is_hybrid_ep_available():
     from megatron.core.transformer.moe.fused_a2a import HAVE_HYBRIDEP
 
     return HAVE_HYBRIDEP
-
-
-def is_nccl_ep_zero_copy_available():
-    """Zero-copy needs the newer TE symm-mem APIs (symm_mem_alloc/is_symm_backed), absent in a plain
-    NCCL-EP build."""
-    if not is_nccl_ep_available():
-        return False
-    try:
-        from transformer_engine.pytorch.ep import is_symm_backed, symm_mem_alloc  # noqa: F401
-    except ImportError:
-        return False
-    return True
-
-
-def is_nccl_ep_available():
-    """NCCL EP built into TE, with the eager/drop-capable ``ep_bootstrap`` signature.
-
-    ``ensure_nccl_ep_bootstrapped`` always passes ``recv_capacity_per_rank`` and
-    ``drop_on_overflow``, so a TE predating that signature raises TypeError on the first
-    bootstrap for every ncclEP path -- static as much as eager. Gate on it here so such builds
-    skip cleanly instead of erroring. ``recv_capacity_per_rank`` must also be *optional*: that
-    is what makes eager (the over-budget replay) expressible.
-    """
-    from megatron.core.transformer.moe.fused_a2a import HAVE_TE_EP
-
-    if not HAVE_TE_EP:
-        return False
-
-    import inspect
-
-    from transformer_engine.pytorch.ep import ep_bootstrap
-
-    params = inspect.signature(ep_bootstrap).parameters
-    recv_capacity = params.get("recv_capacity_per_rank")
-    return (
-        recv_capacity is not None and recv_capacity.default is None and "drop_on_overflow" in params
-    )
 
 
 def _te_grouped_mlp_op_fuser_environment_supported() -> bool:
@@ -491,7 +458,6 @@ class TestNcclEpPagedStashing:
         Utils.destroy_model_parallel()
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    @pytest.mark.flaky_in_dev
     @pytest.mark.internal
     @pytest.mark.parametrize("wire_dtype", ["bf16", "mxfp8"])
     def test_over_budget(self, wire_dtype):
@@ -598,7 +564,6 @@ class TestNcclEpPagedStashing:
         nccl_ep_release_context()
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    @pytest.mark.flaky_in_dev
     @pytest.mark.internal
     @pytest.mark.parametrize("zero_copy", [False, True])
     def test_over_budget_recovery(self, zero_copy):
@@ -726,8 +691,6 @@ class TestNcclEpPagedStashing:
         torch.testing.assert_close(out_restored, out_replay, rtol=1e-2, atol=0)
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    # NCCL EP static-shape paged stashing aborts in dev CI with a pybind11 GIL dec_ref failure.
-    @pytest.mark.flaky_in_dev
     @pytest.mark.internal
     @pytest.mark.parametrize("zero_copy", [False, True])
     @pytest.mark.parametrize("wire_dtype", ["bf16", "mxfp8"])
