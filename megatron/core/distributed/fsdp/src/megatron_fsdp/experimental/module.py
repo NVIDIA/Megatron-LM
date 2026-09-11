@@ -56,6 +56,10 @@ class FsdpContext:
     # FsdpModule tracks its own materialized state via ``FsdpModule._unshard_event``.
     forward_order: IndexedOrder["FsdpModule"]
     backward_order: IndexedOrder["FsdpModule"]
+    # The optimizer runs on the current stream and must wait for reductions on
+    # this context's reduce-scatter stream. Each context owns its own stream, so
+    # independent roots sharing a context need only one completion callback.
+    _post_backward_hook_registered: bool
 
     def __init__(
         self,
@@ -77,6 +81,7 @@ class FsdpContext:
         self.unify_communication_stream = unify_communication_stream
         self.forward_order = IndexedOrder()
         self.backward_order = IndexedOrder()
+        self._post_backward_hook_registered = False
         # Construction-only; empty after finalization.
         self._registered_modules: list[FsdpModule] = []
         self._is_finalized = False
@@ -130,19 +135,28 @@ class FsdpContext:
         """Current stream on this context's device."""
         return torch.cuda.current_stream(self.allgather_stream.device)
 
-    def register_post_backward_final_callback(self) -> None:
-        """Register this root context's final callback for the current backward.
+    def post_backward(self) -> None:
+        """Order current-stream consumers after this context's gradient reductions."""
+        self.current_stream().wait_stream(self.reduce_scatter_stream)
+        self._post_backward_hook_registered = False
 
-        Root ``post_backward()`` means only that root-owned parameters have
-        accumulated gradients; it may run before descendant reductions, or not
-        run at all when the root owns no trainable parameters. Waiting at
-        autograd completion orders consumers after every descendant reduction.
+    def register_post_backward_hook(self) -> None:
+        """Register one context-level final callback for the current backward.
+
+        Multiple FSDP roots can share this context. Waiting for the
+        reduce-scatter stream in each root's ``post_backward()`` would prevent
+        one root's backward compute from overlapping another root's gradient
+        reductions. Wait once at context-level autograd completion instead.
         """
 
-        def post_backward_final_callback() -> None:
-            self.current_stream().wait_stream(self.reduce_scatter_stream)
+        if self._post_backward_hook_registered:
+            return
+        self._post_backward_hook_registered = True
 
-        torch.autograd.Variable._execution_engine.queue_callback(post_backward_final_callback)
+        # TODO(wujingyue): Switch to torch.autograd.graph.queue_callback() when Megatron-LM
+        # requires a PyTorch version that includes it:
+        # https://github.com/pytorch/pytorch/pull/193958
+        torch.autograd.Variable._execution_engine.queue_callback(self.post_backward)
 
 
 class FsdpModule:
@@ -488,7 +502,7 @@ class FsdpModule:
         context = self.context
         current_stream = context.current_stream()
         if self.is_root():
-            context.register_post_backward_final_callback()
+            context.register_post_backward_hook()
             # Fork the reduce-scatter stream from the current stream once, at the
             # start of backward, so every module's post-backward reduce-scatter is
             # part of any active CUDA-graph capture. A stream only joins the
