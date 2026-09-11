@@ -957,6 +957,67 @@ def test_dsa_kernel_hooks_dispatch_to_backend(monkeypatch):
     assert seen["full_kwargs"]["packed_thd_causal_identity_layout"] is True
 
 
+def test_dsa_deterministic_mode_splits_combined_fusion_and_marks_sparse_backward(monkeypatch):
+    class Config:
+        attention_backend = "auto"
+        dsa_kernel_backend = "cudnn"
+        deterministic_mode = True
+
+    q = torch.zeros((1, 1, 1, 1))
+    topk_indices = torch.zeros((1, 1, 1), dtype=torch.int32)
+    expected_sparse = torch.ones_like(q)
+    seen = {}
+
+    def fail_combined(**_kwargs):
+        raise AssertionError("deterministic DSA must decline the combined autograd function")
+
+    def sparse_attention(*_args, deterministic=False, **_kwargs):
+        seen["deterministic"] = deterministic
+        return expected_sparse
+
+    monkeypatch.setattr(
+        dsa_kernels,
+        "_load_backend",
+        lambda _config: SimpleNamespace(
+            run_fused_dsa_attention=fail_combined,
+            run_fused_absorbed_sparse_attention=sparse_attention,
+        ),
+    )
+
+    assert (
+        dsa_kernels.run_fused_dsa_attention(
+            config=Config,
+            query=q,
+            key=q,
+            value=None,
+            up_v_weight=None,
+            q_indexer=q,
+            k_indexer=q[..., 0],
+            indexer_weights=q[..., 0],
+            indexer_topk=1,
+            softmax_scale=1.0,
+            loss_coeff=0.01,
+            sparse_loss=True,
+            calculate_per_token_loss=False,
+            absorbed_mla=True,
+            cp_size=1,
+            attn_mask_type=AttnMaskType.causal,
+            packed_seq_params=None,
+            varlen_starts=None,
+            varlen_ends=None,
+            key_positions=None,
+            query_valid_rows=None,
+            use_relu=True,
+        )
+        is None
+    )
+    assert (
+        dsa_kernels.run_fused_absorbed_sparse_attention(Config, q, q, topk_indices, 1.0, 1)
+        is expected_sparse
+    )
+    assert seen["deterministic"] is True
+
+
 def test_dsa_kernel_dependency_validation(monkeypatch):
     from megatron.core import utils as core_utils
 
