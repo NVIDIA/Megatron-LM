@@ -1214,6 +1214,21 @@ class DynamicInferenceEngine(AbstractEngine):
         if dynamo_helper is not None:
             dynamo_helper.discard_pending_kv_stored_events()
 
+        # RECOMPUTE must preserve the current active row order, which maps sampling
+        # RNG draws and request metadata to IDs. Paused rows precede active rows and
+        # resume from the right (LIFO). Snapshot both before releasing their tensors.
+        if (
+            self.context.kv_cache_management_mode == KVCacheManagementMode.RECOMPUTE
+            and self.requests
+        ):
+            resident_request_ids = self.context.request_ids[
+                : self.context.total_request_count
+            ].tolist()
+            resident_paused_count = self.context.paused_request_count
+        else:
+            resident_request_ids = []
+            resident_paused_count = 0
+
         # Deallocate context tensors.
         with self.__class__.suspend_resume_ctx(
             "suspended", unified_memory_level=self.unified_memory_level
@@ -1238,28 +1253,40 @@ class DynamicInferenceEngine(AbstractEngine):
         # All waiting requests are always included; active requests are included
         # only if they are marked for recompute (their KV cache will be gone).
         waiting_request_ids = list(self.waiting_request_ids)
-        active_request_ids = set(self.requests.keys()) - set(waiting_request_ids)
+        waiting_request_id_set = set(waiting_request_ids)
         if self.context.kv_cache_management_mode == KVCacheManagementMode.RECOMPUTE:
             self.controller._async_sched_logits.clear()
-            recompute_active_ids = active_request_ids
+            ordered_resident_ids = [
+                *resident_request_ids[resident_paused_count:],
+                *reversed(resident_request_ids[:resident_paused_count]),
+            ]
+            recompute_resident_ids = [
+                request_id
+                for request_id in ordered_resident_ids
+                if request_id not in waiting_request_id_set
+            ]
 
             # Reset any partially prefilled requests so they recompute from the start
-            for req_id in [*waiting_request_ids, *recompute_active_ids]:
+            for req_id in [*waiting_request_ids, *recompute_resident_ids]:
                 req = self.get_request(req_id)
-                if req.finished_chunk_token_count > 0:
+                if req.finished_chunk_token_count > 0 and not req.generated_tokens:
                     req.remaining_prompt_tokens = req.prompt_tokens
                     req.finished_chunk_token_count = 0
+                    # The restarted prefill recomputes these positions, so its
+                    # scores must replace rather than follow the partial scores.
+                    req.prompt_log_probs = None
+                    req.prompt_top_n_logprobs = None
                     req.num_matched_prefix_blocks = 0
 
             # Reset the chunked prefill request id
             self.chunked_prefill_request_id = -1
         else:
-            recompute_active_ids = set()
-        self.resume_request_ids = [*recompute_active_ids, *waiting_request_ids]
+            recompute_resident_ids = []
+        self.resume_request_ids = [*recompute_resident_ids, *waiting_request_ids]
         self.waiting_request_ids.clear()
 
-        # Checkpoint active requests that are marked for recompute.
-        for request_id in recompute_active_ids:
+        # Checkpoint resident requests that are marked for recompute.
+        for request_id in recompute_resident_ids:
             self.requests[request_id].record.checkpoint()
 
         # If we are not using the inference coordinator, we need to manually handle state.

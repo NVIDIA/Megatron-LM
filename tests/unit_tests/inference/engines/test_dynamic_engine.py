@@ -929,18 +929,9 @@ def _assert_prefix_cache_checkpoint(
 ) -> None:
     """Verify a checkpoint retained config and rehashed its expanded prompt."""
     expected_prompt = torch.cat(
-        (
-            original.prompt_tokens,
-            torch.tensor(
-                original.generated_tokens,
-                dtype=original.prompt_tokens.dtype,
-                device=original.prompt_tokens.device,
-            ),
-        )
+        (original.prompt_tokens, original.prompt_tokens.new_tensor(original.generated_tokens))
     )
-    expected_hashes = compute_block_hashes_batched(
-        expected_prompt, block_size=original.block_size_tokens
-    )
+    expected_hashes = compute_block_hashes_batched(expected_prompt, original.block_size_tokens)
 
     assert checkpointed.enable_prefix_caching is True
     assert checkpointed.block_size_tokens == original.block_size_tokens
@@ -1079,18 +1070,32 @@ async def test_completion_merges_after_final_scores_and_reuses_failed_result():
 
 
 def test_recompute_suspend_resume_readds_prefix_cached_request_with_fresh_hashes():
-    """RECOMPUTE suspend/resume must re-add the prefix-enabled checkpoint tail."""
-    request = _make_prefix_cached_request_for_checkpoint(request_id=23)
-    record = DynamicInferenceRequestRecord.from_request(request)
+    """RECOMPUTE preserves resident order and resets only partial-prefill scores."""
+    requests = [_make_prefix_cached_request_for_checkpoint(request_id=i) for i in range(23, 27)]
+    decoding, partial_prefill = requests[:2]
+    decoding.finished_chunk_token_count = len(decoding.prompt_tokens)
+    decoding.prompt_log_probs = kept_log_probs = [-0.1]
+    decoding.prompt_top_n_logprobs = kept_top_n = [{"<1>": -0.1}]
+    partial_prefill.generated_tokens = []
+    partial_prefill.finished_chunk_token_count = 2
+    partial_prefill.remaining_prompt_tokens = partial_prefill.prompt_tokens[2:]
+    partial_prefill.prompt_log_probs = [-0.4]
+    partial_prefill.prompt_top_n_logprobs = [{"<2>": -0.4}]
     engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
     engine.context = types.SimpleNamespace(
         chunked_prefill_request_id=-1,
         kv_cache_management_mode=KVCacheManagementMode.RECOMPUTE,
         static_kv_memory_pointers=True,
+        request_ids=torch.tensor([25, 26, 23, 24]),
+        total_request_count=4,
+        paused_request_count=2,
         deallocate_inference_state_buffers=mock.Mock(),
         reinitialize_inference_state_buffers=mock.Mock(),
     )
-    engine.requests = {request.request_id: types.SimpleNamespace(record=record)}
+    to_record = DynamicInferenceRequestRecord.from_request
+    engine.requests = {
+        request.request_id: types.SimpleNamespace(record=to_record(request)) for request in requests
+    }
     engine.waiting_request_ids = deque()
     engine.state = EngineState.RUNNING
     engine.controller = types.SimpleNamespace(
@@ -1105,18 +1110,20 @@ def test_recompute_suspend_resume_readds_prefix_cached_request_with_fresh_hashes
     engine._loop = types.SimpleNamespace(call_soon_threadsafe=mock.Mock())
 
     with (
-        mock.patch.object(
-            DynamicInferenceEngine,
-            "suspend_resume_ctx",
-            side_effect=lambda *args, **kwargs: nullcontext(),
-        ),
+        mock.patch.object(DynamicInferenceEngine, "suspend_resume_ctx", return_value=nullcontext()),
         mock.patch.object(InferenceMode, "unset_active"),
         mock.patch.object(InferenceMode, "set_active"),
         mock.patch.object(torch.cuda, "synchronize"),
     ):
         engine.suspend()
-        checkpointed = engine.get_request(request.request_id)
-        _assert_prefix_cache_checkpoint(request, checkpointed)
+        _assert_prefix_cache_checkpoint(decoding, engine.get_request(decoding.request_id))
+        assert (decoding.prompt_log_probs, decoding.prompt_top_n_logprobs) == (
+            kept_log_probs,
+            kept_top_n,
+        )
+        assert partial_prefill.remaining_prompt_tokens is partial_prefill.prompt_tokens
+        assert partial_prefill.finished_chunk_token_count == 0
+        assert partial_prefill.prompt_log_probs is partial_prefill.prompt_top_n_logprobs is None
 
         engine.resume()
 
@@ -1124,9 +1131,8 @@ def test_recompute_suspend_resume_readds_prefix_cached_request_with_fresh_hashes
     assert engine.context.reinitialize_inference_state_buffers.call_count == 1
     engine.controller._async_sched_logits.clear.assert_called_once_with()
     assert engine.state == EngineState.RUNNING
-    assert engine._add_request.call_count == 1
-    assert engine._add_request.call_args.args[0] is checkpointed
-    assert engine._add_request.call_args.kwargs == {"is_resume": True}
+    replayed = [call.args[0].request_id for call in engine._add_request.call_args_list]
+    assert replayed == [23, 24, 26, 25]
 
 
 def test_add_request_defaults_sampling_params():
