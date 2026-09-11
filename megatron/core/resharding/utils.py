@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Mapping, Optional
 import torch
 import torch.distributed as dist
 
-from megatron.core.fp8_utils import get_grouped_quantized_members, is_grouped_mxfp8tensor
+from megatron.core.fp8_utils import get_grouped_tensor_members, is_grouped_tensor
 
 if TYPE_CHECKING:
     from .transforms import ReshardTransform
@@ -290,7 +290,7 @@ def named_refit_tensors(module: torch.nn.Module):
     Used by the refit planner and executor to enumerate which tensors should
     travel during resharding.  Persistent buffers are included alongside
     parameters because they may carry training state (see
-    ``named_persistent_buffers``). TE single-grouped MXFP8 parameters are
+    ``named_persistent_buffers``). TE single-grouped BF16/MXFP8 parameters are
     exposed as their stable per-expert views so their names and shapes match
     the discrete ``weight0..weightN`` representation. This also avoids passing
     metadata-only GroupedTensor wrappers to communication backends.
@@ -306,13 +306,11 @@ def named_refit_tensors(module: torch.nn.Module):
         'pad_length',
     )
     for name, param in module.named_parameters(recurse=True):
-        if not is_grouped_mxfp8tensor(param):
+        if not is_grouped_tensor(param):
             yield name, param
             continue
 
-        for index, member in enumerate(
-            get_grouped_quantized_members(param, create_if_missing=True)
-        ):
+        for index, member in enumerate(get_grouped_tensor_members(param, create_if_missing=True)):
             # Megatron stamps expert/TP/GTP metadata on the registered grouped
             # parameter. Its TE member views share storage but do not inherit
             # arbitrary Python attributes, so propagate the planning metadata.

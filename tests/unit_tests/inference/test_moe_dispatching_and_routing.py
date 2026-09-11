@@ -162,22 +162,169 @@ def test_config_rejects_te_mxfp8_batch_invariant_with_substitute_backend(monkeyp
         )
 
 
-def test_config_rejects_te_mxfp8_batch_invariant_with_gated_activation():
-    """The validated MXFP8 path is limited to Nemotron-style squared-ReLU experts."""
-    with pytest.raises(AssertionError, match="non-gated squared-ReLU"):
-        _make_base_config(
+def test_config_accepts_te_mxfp8_batch_invariant_with_swiglu():
+    """Qwen-style SwiGLU experts use the native TE batch-invariant path."""
+    config = _make_base_config(
+        inference_grouped_gemm_backend="te",
+        fp8="hybrid",
+        fp8_recipe="mxfp8",
+        fp8_param=True,
+        gated_linear_unit=True,
+        activation_func=torch.nn.functional.silu,
+        batch_invariant_mode=True,
+        batch_invariant_backend="te_native",
+        attention_backend=AttnBackend.flash,
+        flash_attention_version=4,
+        attention_dropout=0.0,
+    )
+
+    assert config.gated_linear_unit
+
+
+@pytest.mark.internal
+@pytest.mark.launch_on_gb200
+class TestProductionSelectiveMxfp8Policy:
+    """NeMo-RL policy: routed experts only, with two/four BF16 edge layers."""
+
+    def setup_method(self, method):
+        Utils.initialize_model_parallel(1, 1)
+        _set_random_seed(seed_=123, data_parallel_random_init=False)
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    def test_te_backend_mixes_bf16_edges_and_mxfp8_middle(self):
+        from megatron.core.fp8_utils import get_fp8_context
+        from megatron.core.inference.moe import (
+            HAVE_TE_GROUPED_MXFP8,
+            TEBF16GroupedWeight,
+            is_te_mxfp8_weight,
+            mcore_fused_moe,
+        )
+        from megatron.core.models.backends import InferenceSpecProvider
+        from megatron.core.quantization.quant_config import RecipeConfig
+        from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+            set_batch_invariant_mode,
+        )
+        from megatron.core.transformer.moe.moe_utils import get_default_pg_collection
+
+        if (
+            not torch.cuda.is_available()
+            or not HAVE_TE_GROUPED_MXFP8
+            or torch.cuda.get_device_capability()[0] < 10
+        ):
+            pytest.skip("Native TE grouped GEMM requires its device APIs and Blackwell")
+
+        recipe = RecipeConfig.from_config_dict(
+            {
+                "configs": {
+                    "bf16": {
+                        "transformer_engine_config_type": "TEQuantizationParams",
+                        "training_recipe": {"override_quantized_autocast": True},
+                    },
+                    "mxfp8": {
+                        "transformer_engine_config_type": "TEQuantizationParams",
+                        "training_recipe": {
+                            "fp8_quantization_recipe": "mxfp8",
+                            "override_quantized_autocast": True,
+                        },
+                    },
+                },
+                "matchers": {
+                    "mtp_bf16": {
+                        "config": "bf16",
+                        "type": "glob",
+                        "pattern": "*mtp*",
+                        "enabled": True,
+                    },
+                    "routed_experts_fc1_mxfp8": {
+                        "config": "mxfp8",
+                        "type": "glob",
+                        "pattern": "*mlp.experts.linear_fc1",
+                        "enabled": True,
+                    },
+                    "routed_experts_fc2_mxfp8": {
+                        "config": "mxfp8",
+                        "type": "glob",
+                        "pattern": "*mlp.experts.linear_fc2",
+                        "enabled": True,
+                    },
+                    "all_other_modules_bf16": {
+                        "config": "bf16",
+                        "type": "glob",
+                        "pattern": "*",
+                        "enabled": True,
+                    },
+                },
+            }
+        )
+        config = _make_base_config(
+            num_layers=8,
+            num_moe_experts=4,
+            moe_router_topk=2,
+            moe_shared_expert_intermediate_size=None,
+            gated_linear_unit=True,
+            activation_func=torch.nn.functional.silu,
+            use_cpu_initialization=False,
             inference_grouped_gemm_backend="te",
             fp8="hybrid",
             fp8_recipe="mxfp8",
             fp8_param=True,
-            gated_linear_unit=True,
-            activation_func=torch.nn.functional.silu,
+            quant_recipe=recipe,
+            first_last_layers_bf16=True,
+            num_layers_at_start_in_bf16=2,
+            num_layers_at_end_in_bf16=4,
             batch_invariant_mode=True,
             batch_invariant_backend="te_native",
             attention_backend=AttnBackend.flash,
             flash_attention_version=4,
             attention_dropout=0.0,
         )
+
+        builder = InferenceSpecProvider().grouped_mlp_modules(True)
+        pg_collection = get_default_pg_collection()
+        experts_by_layer = {}
+        for layer_index in (0, 2, 4):
+            with get_fp8_context(config, layer_index, is_init=True):
+                experts = builder(
+                    num_local_experts=config.num_moe_experts,
+                    config=config,
+                    pg_collection=pg_collection,
+                    name=f"decoder.layers.{layer_index}.mlp.experts",
+                ).eval()
+            experts._build_te_inference_weights()
+            experts_by_layer[layer_index] = experts
+
+        assert isinstance(experts_by_layer[0]._fc1_weight, TEBF16GroupedWeight)
+        assert is_te_mxfp8_weight(experts_by_layer[2]._fc1_weight)
+        assert isinstance(experts_by_layer[4]._fc1_weight, TEBF16GroupedWeight)
+
+        torch.manual_seed(456)
+        large_tokens, shared_tokens = 300, 17
+        hidden = torch.randn(large_tokens, config.hidden_size, device="cuda", dtype=torch.bfloat16)
+        probs = torch.rand(large_tokens, config.moe_router_topk, device="cuda")
+        routing_map = torch.randint(
+            0, config.num_moe_experts, (large_tokens, config.moe_router_topk), device="cuda"
+        )
+
+        def run(experts, token_count):
+            return mcore_fused_moe(
+                hidden[:token_count],
+                probs[:token_count],
+                experts._fc1_weight,
+                experts._fc2_weight,
+                activation_type=experts._mcore_activation_type,
+                num_local_experts=config.num_moe_experts,
+                local_expert_start=0,
+                valid_tokens=torch.tensor(token_count, device="cuda", dtype=torch.int32),
+                routing_map=routing_map[:token_count],
+            )
+
+        with torch.no_grad(), set_batch_invariant_mode(True, backend="te_native"):
+            for experts in experts_by_layer.values():
+                small = run(experts, shared_tokens)
+                large = run(experts, large_tokens)[:shared_tokens]
+                assert torch.equal(small, large)
 
 
 # ──────────────────────────────────────────────────────────────────────

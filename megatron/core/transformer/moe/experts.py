@@ -86,6 +86,7 @@ except ImportError:
 from megatron.core.inference.moe import ActivationType as McoreActivationType
 from megatron.core.inference.moe import (
     InferenceGroupedGemmBackend,
+    TEBF16GroupedWeight,
     is_te_mxfp8_weight,
     mcore_fused_moe,
     prepare_te_mxfp8_batch_invariant_weight,
@@ -1340,28 +1341,41 @@ class InferenceGroupedMLP(TEGroupedMLP):
             prepare_routed_mxfp8_weights(canonical_weight, out=routed_weight)
         return True
 
+    @torch.inference_mode(False)
+    @torch.no_grad()
     def _build_te_mxfp8_weights(self):
-        """Keep TE MXFP8 expert weights in their checkpoint-native representation.
+        """Compatibility entry point for callers that require native TE MXFP8 storage."""
+        InferenceGroupedMLP._build_te_inference_weights(self, expected_mxfp8=True)
 
-        TE's device-metadata grouped GEMM accepts either discrete per-expert
-        MXFP8 tensors or a single MXFP8 GroupedTensor, so no dequantize/requantize
-        or concatenation step is needed.
-        """
+    def _get_te_grouped_weight(self, linear_name: str):
+        """Return a TE grouped linear's discrete or single-parameter weight."""
+        linear = getattr(self, linear_name)
+        if getattr(linear, 'single_grouped_weight', False):
+            return linear.weight
+        return [getattr(linear, f'weight{i}') for i in range(self.num_local_experts)]
+
+    @torch.inference_mode(False)
+    @torch.no_grad()
+    def _build_te_inference_weights(self, expected_mxfp8: Optional[bool] = None):
+        """Keep each layer's native TE BF16 or MXFP8 expert representation."""
+        layer_is_mxfp8 = None
         for linear_name, buf_name in [('linear_fc1', '_fc1_weight'), ('linear_fc2', '_fc2_weight')]:
-            linear = getattr(self, linear_name)
-            if getattr(linear, 'single_grouped_weight', False):
-                weight = linear.weight
-            else:
-                weight = [getattr(linear, f'weight{i}') for i in range(self.num_local_experts)]
-            if not is_te_mxfp8_weight(weight):
-                raise RuntimeError(
-                    f"Expected native Transformer Engine MXFP8 weights for {linear_name}; "
-                    "ensure fp8_param=True and fp8_recipe='mxfp8'."
-                )
-            # The source parameters remain registered on the TE GroupedLinear. Keep only
-            # non-owning references here so state_dict and parameter traversal stay unchanged.
-            object.__setattr__(self, buf_name, weight)
-            if getattr(getattr(self, "config", None), "batch_invariant_mode", False):
+            weight = InferenceGroupedMLP._get_te_grouped_weight(self, linear_name)
+            weight_is_mxfp8 = is_te_mxfp8_weight(weight)
+            if expected_mxfp8 is not None and weight_is_mxfp8 != expected_mxfp8:
+                expected = "MXFP8" if expected_mxfp8 else "BF16"
+                raise RuntimeError(f"Expected {expected} expert weights for {linear_name}.")
+            if layer_is_mxfp8 is not None and weight_is_mxfp8 != layer_is_mxfp8:
+                raise RuntimeError("TE inference requires FC1 and FC2 to use the same precision.")
+            layer_is_mxfp8 = weight_is_mxfp8
+
+            # Keep non-owning references so state_dict and parameter traversal stay unchanged.
+            object.__setattr__(
+                self, buf_name, weight if weight_is_mxfp8 else TEBF16GroupedWeight(weight)
+            )
+            if weight_is_mxfp8 and getattr(
+                getattr(self, "config", None), "batch_invariant_mode", False
+            ):
                 prepare_te_mxfp8_batch_invariant_weight(weight)
 
     @torch.inference_mode(False)
@@ -1371,6 +1385,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
         if (
             not self._concatenated_weights_built
             or self.inference_grouped_gemm_backend != InferenceGroupedGemmBackend.TE
+            or isinstance(getattr(self, '_fc1_weight', None), TEBF16GroupedWeight)
         ):
             return False
         refreshed = False
@@ -1517,7 +1532,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
         - Inference + FlashInfer: fused BF16 or routed MXFP8 MoE. tokens_per_expert
           is not used in this path; the FlashInfer kernels operate directly on routing_map.
         - Inference + torch: torch.nn.functional.grouped_mm with GPU-resident cumsum offsets.
-        - Inference + TE: native MXFP8 grouped quantization/GEMM with CUDA split metadata.
+        - Inference + TE: native BF16/MXFP8 grouped GEMM with CUDA split metadata.
         - Inference + vLLM: Triton fused MoE.
 
         Args:
@@ -1538,7 +1553,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
         # Lazily build concatenated weights on first forward (after checkpoint load)
         if not self._concatenated_weights_built:
             if self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.TE:
-                self._build_te_mxfp8_weights()
+                self._build_te_inference_weights()
             else:
                 w = self.linear_fc1.weight0
                 if isinstance(w, MXFP8Tensor) or (

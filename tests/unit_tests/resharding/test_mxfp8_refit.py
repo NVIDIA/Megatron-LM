@@ -773,3 +773,75 @@ class TestTENativeMxfp8Refit:
             assert cached_scale.data_ptr() == cached_scale_ptr
             assert not torch.equal(cached_scale, cached_scale_before)
             assert torch.equal(cached_scale, expected_storage.scale_inv)
+
+    @pytest.mark.parametrize(
+        "source_single_grouped,destination_single_grouped",
+        [(False, False), (False, True), (True, False), (True, True)],
+    )
+    def test_bf16_edge_layer_refit_is_grouped_format_independent(
+        self, monkeypatch, source_single_grouped, destination_single_grouped
+    ):
+        import transformer_engine.pytorch as te
+
+        from megatron.core.resharding.utils import named_refit_tensors
+
+        class LoopbackCopyService(CopyService):
+            requires_process_group_barrier = False
+            supports_multiple_runs_per_plan = True
+
+            def __init__(self):
+                self.sends = {}
+                self.recvs = []
+
+            def submit_send(self, src_tensor, dest_rank, task_id=None):
+                self.sends[task_id] = src_tensor.clone()
+
+            def submit_recv(self, dest_tensor, src_rank, task_id=None):
+                self.recvs.append((dest_tensor, task_id))
+
+            def run(self):
+                for dest_tensor, task_id in self.recvs:
+                    dest_tensor.copy_(self.sends[task_id])
+
+        def make_grouped_linear(single_grouped_weight, seed):
+            torch.manual_seed(seed)
+            return te.GroupedLinear(
+                2,
+                128,
+                64,
+                bias=False,
+                params_dtype=torch.bfloat16,
+                device="cuda",
+                single_grouped_weight=single_grouped_weight,
+            )
+
+        monkeypatch.setenv("NVTE_GROUPED_LINEAR_SINGLE_PARAM", "1")
+        source = make_grouped_linear(source_single_grouped, seed=123)
+        destination = make_grouped_linear(destination_single_grouped, seed=456)
+        source_tensors = dict(named_refit_tensors(source))
+        destination_tensors = dict(named_refit_tensors(destination))
+        assert source_tensors.keys() == destination_tensors.keys() == {"weight0", "weight1"}
+
+        expected = {name: tensor.clone() for name, tensor in source_tensors.items()}
+        pointers_before = {name: tensor.data_ptr() for name, tensor in destination_tensors.items()}
+        full_slice = (slice(None), slice(None))
+        send_ops = [
+            TransferOp(name, 0, True, full_slice, full_slice, task_id=task_id)
+            for task_id, name in enumerate(source_tensors)
+        ]
+        recv_ops = [
+            TransferOp(name, 0, False, full_slice, full_slice, task_id=task_id)
+            for task_id, name in enumerate(source_tensors)
+        ]
+
+        execute_reshard_plan(
+            ReshardPlan(send_ops=send_ops, recv_ops=recv_ops),
+            source,
+            destination,
+            LoopbackCopyService(),
+        )
+
+        actual = dict(named_refit_tensors(destination))
+        assert {name: tensor.data_ptr() for name, tensor in actual.items()} == pointers_before
+        for name, tensor in actual.items():
+            assert torch.equal(tensor, expected[name])

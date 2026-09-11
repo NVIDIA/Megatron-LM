@@ -3589,13 +3589,15 @@ class TransformerConfig(ModelParallelConfig):
                     and self.fp8_recipe == Fp8Recipe.mxfp8
                     and self.fp8_param
                     and not self.fp4
-                    and not self.gated_linear_unit
-                    and self.activation_func == squared_relu
+                    and (
+                        (not self.gated_linear_unit and self.activation_func == squared_relu)
+                        or (self.gated_linear_unit and self.activation_func == F.silu)
+                    )
                 )
                 assert te_mxfp8_inference or not (self.fp8 or self.fp4), (
-                    "Batch-invariant MoE supports bf16, or native TE MXFP8 non-gated "
-                    "squared-ReLU experts with the inference-optimized TE grouped-GEMM "
-                    "and te_native batch-invariant backends."
+                    "Batch-invariant MoE supports bf16, or native TE MXFP8 squared-ReLU/"
+                    "SwiGLU experts with the inference-optimized TE grouped-GEMM and "
+                    "te_native batch-invariant backends."
                 )
                 assert not (self.moe_permute_fusion or self.moe_permute_fusion_into_hybridep), (
                     "Batch-invariant MoE requires the unfused permute/unpermute path so "
