@@ -55,6 +55,10 @@ try:
         fully_shard,
         fully_shard_context,
     )
+    from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module_utils import (
+        restore_parameter_attributes,
+        save_parameter_attributes,
+    )
 
     HAVE_MEGATRON_FSDP = True
 except ImportError as import_megatron_fsdp_error:
@@ -86,8 +90,15 @@ def _materialize_meta_module(module: nn.Module, device: torch.device | None) -> 
             "reset_parameters method."
         )
 
+    # Both _apply() and TE reset_parameters() may replace Parameter objects.
+    attributes = {
+        name: save_parameter_attributes(parameter)
+        for name, parameter in module.named_parameters(recurse=False)
+    }
     module._apply(materialize_tensor, recurse=False)
     reset_parameters()
+    for name, saved_attributes in attributes.items():
+        restore_parameter_attributes(module.get_parameter(name), saved_attributes)
 
 
 def _materialize_owned_meta_modules(module: nn.Module, device: torch.device | None) -> None:
