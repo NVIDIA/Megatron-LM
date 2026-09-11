@@ -1122,6 +1122,94 @@ def test_recompute_suspend_resume_readds_prefix_cached_request_with_fresh_hashes
     assert engine._add_request.call_args.args[0] is checkpointed
 
 
+def test_drained_reset_preserves_coordinator_runtime_state():
+    """A drained reset clears batch data without rebinding coordinator-loop state."""
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine.context = types.SimpleNamespace(reset=mock.Mock(), cuda_graphs_available=True)
+    engine.controller = types.SimpleNamespace(
+        _async_sched_logits=types.SimpleNamespace(clear=mock.Mock())
+    )
+    engine.num_speculative_tokens = 0
+    engine.requests = {}
+    engine.use_coordinator = True
+    engine._loop = object()
+    engine._cond = asyncio.Condition()
+    engine._state_events = {state: asyncio.Event() for state in engine._STATE_EVENTS}
+    engine.state = EngineState.PAUSED
+    engine._state_events[EngineState.PAUSED].set()
+    engine._pending_signals = deque([b"pending-control"])
+    engine.resume_request_ids = []
+    engine._vision_embedding_cache = {"cached": torch.ones(1)}
+    engine._vision_embedding_cache_bytes = 4
+
+    loop = engine._loop
+    condition = engine._cond
+    state_events = engine._state_events
+    pending_signals = engine._pending_signals
+    with (
+        mock.patch(
+            "megatron.core.inference.engines.dynamic_engine.torch.distributed.get_rank",
+            return_value=0,
+        ),
+        mock.patch(
+            "megatron.core.inference.engines.dynamic_engine.torch.cuda.Event",
+            return_value=mock.Mock(),
+        ),
+    ):
+        engine.reset()
+
+    assert engine.use_coordinator is True
+    assert engine._loop is loop
+    assert engine._cond is condition
+    assert engine._state_events is state_events
+    assert engine.state == EngineState.PAUSED
+    assert engine._state_events[EngineState.PAUSED].is_set()
+    assert engine._pending_signals is pending_signals
+    assert list(engine._pending_signals) == [b"pending-control"]
+    assert engine.resume_request_ids is None
+    assert not engine._vision_embedding_cache
+    assert engine._vision_embedding_cache_bytes == 0
+    engine.context.reset.assert_called_once_with()
+    engine.controller._async_sched_logits.clear.assert_called_once_with()
+
+
+def test_drained_reset_rejects_suspended_state_before_context_mutation():
+    """Reset rejects states whose inference storage may be deallocated."""
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine._state_events = {}
+    engine.state = EngineState.SUSPENDED
+    engine.context = types.SimpleNamespace(reset=mock.Mock())
+    engine.controller = types.SimpleNamespace(
+        _async_sched_logits=types.SimpleNamespace(clear=mock.Mock())
+    )
+
+    with pytest.raises(RuntimeError, match="only be reset while RUNNING or PAUSED"):
+        engine.reset()
+
+    engine.context.reset.assert_not_called()
+    engine.controller._async_sched_logits.clear.assert_not_called()
+
+
+def test_drained_reset_rejects_outstanding_requests_before_mutation():
+    """Reset rejects a nonempty request table before clearing engine state."""
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine._state_events = {}
+    engine.state = EngineState.RUNNING
+    requests = {7: object()}
+    engine.requests = requests
+    engine.context = types.SimpleNamespace(reset=mock.Mock())
+    engine.controller = types.SimpleNamespace(
+        _async_sched_logits=types.SimpleNamespace(clear=mock.Mock())
+    )
+
+    with pytest.raises(RuntimeError, match="must drain all requests before reset"):
+        engine.reset()
+
+    assert engine.requests is requests
+    engine.context.reset.assert_not_called()
+    engine.controller._async_sched_logits.clear.assert_not_called()
+
+
 def test_vision_state_invalidation_marks_request_local_embeddings_stale():
     request = DynamicVLMInferenceRequest(
         request_id=31,

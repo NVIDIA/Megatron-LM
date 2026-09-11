@@ -519,8 +519,25 @@ class DynamicInferenceEngine(AbstractEngine):
         )
 
     def reset(self) -> None:
-        """Reset by removing all requests and reset all state."""
+        """Reset per-run state; the caller must first drain all requests."""
 
+        initialize_runtime_state = not hasattr(self, "_state_events")
+        if not initialize_runtime_state and self.state not in (
+            EngineState.RUNNING,
+            EngineState.PAUSED,
+        ):
+            raise RuntimeError(
+                "A drained engine can only be reset while RUNNING or PAUSED; "
+                f"got {self.state.name}."
+            )
+
+        if not initialize_runtime_state and self.requests:
+            raise RuntimeError(
+                "The engine must drain all requests before reset; "
+                f"got {len(self.requests)} outstanding request(s)."
+            )
+
+        use_coordinator = getattr(self, "use_coordinator", False)
         self._reset_pending_kv_imports()
         self.clear_vision_embedding_cache()
         self.context.reset()
@@ -561,12 +578,13 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # Runtime state.
         self.decode_only = DecodeOnly(consumed=None, launched=None)
-        self._loop = get_asyncio_loop(getattr(self, "_loop", None))
-        self._cond = asyncio.Condition()
-        self._state_events = {k: asyncio.Event() for k in self._STATE_EVENTS}
-        self.state = EngineState.RUNNING
-        self._state_events[EngineState.RUNNING].set()
-        self._pending_signals = deque()
+        if initialize_runtime_state:
+            self._loop = get_asyncio_loop(getattr(self, "_loop", None))
+            self._cond = asyncio.Condition()
+            self._state_events = {k: asyncio.Event() for k in self._STATE_EVENTS}
+            self.state = EngineState.RUNNING
+            self._state_events[EngineState.RUNNING].set()
+            self._pending_signals = deque()
 
         self.resume_request_ids = None
 
@@ -588,8 +606,9 @@ class DynamicInferenceEngine(AbstractEngine):
         self._prefill_tokens_skipped = 0
         self._prefix_coordination_waits = 0
 
-        # Coordinator state.
-        self.use_coordinator = False
+        # Coordinator mode and its long-lived runtime objects survive a drained
+        # reset; replacing them can strand waiters on the old asyncio objects.
+        self.use_coordinator = use_coordinator
 
     @staticmethod
     def _tensor_nbytes(tensor: Tensor) -> int:

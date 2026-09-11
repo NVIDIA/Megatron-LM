@@ -979,11 +979,13 @@ is the opposite of the `MegatronLLM` constructor default.
 
 **Engine and serving**
 
-- **`engine.reset()` is unsafe in coordinator mode.** It can deadlock (rebinds
-  internal asyncio primitives that suspended waiters still reference) or
-  silently re-route to direct-mode branches. The offline example therefore
-  blocks `--inference-repeat-n > 1` together with `--use-coordinator`. Direct-mode
-  reset is safe.
+- **High-level coordinator reset is not synchronized.** Once an engine is drained,
+  `engine.reset()` preserves its coordinator mode and long-lived asyncio objects,
+  and accepts resets only while `RUNNING` or `PAUSED`. The high-level coordinator
+  API cannot yet prove that its background engine loop has finished bookkeeping
+  after the final reply, however, so an immediate reset can still race that loop.
+  The offline example therefore blocks `--inference-repeat-n > 1` together with
+  `--use-coordinator`. Direct-mode reset is safe.
 - **HTTP frontend is fixed to global rank 0.** There is no per-rank `role`
   override on `ServeConfig`. Control placement through the launcher (for example, torchrun
   rank-0 placement). `ServeConfig.sock` lets you pre-bind the listening socket,
