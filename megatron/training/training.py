@@ -97,6 +97,7 @@ from megatron.core.parallel_state import (
     update_pg_timeout,
 )
 from megatron.core.pipeline_parallel import get_forward_backward_func
+from megatron.core.pipeline_parallel.parallel_prewarm import prewarm_pipeline_model_parallel
 from megatron.core.pipeline_parallel.p2p_communication import P2PCommunicator
 from megatron.core.pipeline_parallel.utils import (
     is_pp_first_stage,
@@ -4555,6 +4556,15 @@ def train(
         ), "Parameter hashes not matching across DP replicas"
         torch.distributed.barrier()
         print_rank_0(f">>> Weight hashes match after {iteration} iterations...")
+
+    if config.pipeline_model_parallel_prewarm:
+        prewarm_pipeline_model_parallel(
+            model=model,
+            config=config,
+            seq_length=args.seq_length,
+            micro_batch_size=args.micro_batch_size,
+            optimizers=[optimizer],
+        )
 
     # Initialize CUDA Graphs helper.
     if args.cuda_graph_impl == "transformer_engine":
