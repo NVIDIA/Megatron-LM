@@ -24,6 +24,7 @@ from unittest import mock
 import pytest
 import torch
 
+from megatron.core.inference.contexts.mtp_metadata import MTPMetadata
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
@@ -113,7 +114,31 @@ def _make_context(
     context._mtp_setup_prefill_step = _setup_prefill_step
     context._mtp_finalize_prefill_step = _finalize_prefill_step
     context.using_cuda_graph_this_step = lambda: False
+
+    # A REAL MTPMetadata, so the chunk-boundary carry's id+position gating is exercised rather
+    # than stubbed. Its GPU bookkeeping is covered separately in
+    # tests/unit_tests/inference/contexts/test_dynamic_context_mtp_kv_cache.py.
+    context.mtp_metadata = MTPMetadata(
+        enabled=True,
+        max_requests=MAX_REQUESTS,
+        max_kv_block_count=MAX_KV_BLOCK_COUNT,
+        block_size_tokens=8,
+        dummy_block_idx=-1,
+        block_table_dtype=torch.int32,
+        hidden_size=HIDDEN_SIZE,
+        hidden_dtype=torch.float32,
+    )
+    context.mtp_metadata.allocate(
+        device=torch.device(DEVICE), block_table_template=request_to_kv_block_ids
+    )
     return context
+
+
+def _seed_carry(context, req_id: int, position: int, fill: float = 99.0):
+    """Seed the chunk-boundary carry exactly as a prior chunk's commit pass would have."""
+    context.mtp_metadata.carry_chunk_boundary(
+        hidden=_hidden(1, fill=fill), req_id=req_id, position=position
+    )
 
 
 def _make_model():
@@ -162,8 +187,6 @@ def _make_controller(context, model, sp_enabled: bool = False, tp_size: int = 1)
     controller._tp_size = tp_size
     controller._is_last_pp_stage = True
     controller.model_is_pipeline_parallel = False
-    controller._mtp_chunk_boundary_hidden = None
-    controller._mtp_chunk_boundary_req_id = -1
     controller._mtp_resolved_padded_count = None
     controller._accepted_token_counts_per_request = torch.zeros(
         MAX_REQUESTS, dtype=torch.int64, device=DEVICE
@@ -307,9 +330,9 @@ class TestMtpCommitPassPrefill:
         )
         model = _make_model()
         controller = _make_controller(context, model)
-        # The previous chunk of THIS request left its last hidden behind.
-        controller._mtp_chunk_boundary_hidden = _hidden(1, fill=99.0)
-        controller._mtp_chunk_boundary_req_id = 42
+        # The previous chunk of THIS request left its last hidden behind, at the position
+        # its seam will ask for (off - 1 == 7).
+        _seed_carry(context, req_id=42, position=7)
 
         issued = controller._mtp_commit_pass(
             context,
@@ -331,21 +354,23 @@ class TestMtpCommitPassPrefill:
         # The boundary entry consumes this chunk's FIRST token t_off.
         assert forward["next_token_ids"].view(-1).cpu().tolist() == [1000, 1001, 1002]
 
-    def test_prefix_cache_hit_does_not_rewrite_the_shared_divergence_entry(self):
-        """`off > 0` with no own prior chunk: the inherited blocks are shared, so start at `off`.
+    def test_prefix_cache_hit_starts_at_off_with_no_seam(self):
+        """`off > 0` with no own prior chunk: no carry matches, so the run starts at `off`.
 
         On a prefix-cache hit the skipped prefix was computed by a DIFFERENT request whose
-        activations are gone. Every inherited entry p <= off-2 is already correct (its token
-        t_{p+1} is inside the shared prefix). Only entry off-1 differs -- and it lives in a
-        ref-counted block shared with the producer and every sibling, so writing this request's
-        value would corrupt theirs. It must be left alone.
+        activations are gone, so no seam is written -- and none is needed. Every inherited entry
+        is already correct for this request, INCLUDING off-1: `_compute_prefix_match` declines to
+        inherit the last matched block, so t_off is the first token of that given-up block, still
+        inside the hash-matched prefix and therefore identical for every sibling. The one entry
+        that genuinely diverges sits at the end of the block this request now owns, where the
+        body rows below write it from this request's own hidden.
         """
         context = _make_context(
             prefill_query_lengths=(3,), prefill_kv_offsets=(8,), request_ids=[42]
         )
         model = _make_model()
         controller = _make_controller(context, model)
-        assert controller._mtp_chunk_boundary_hidden is None  # no own prior chunk
+        assert not context.mtp_metadata.chunk_boundary_valid  # no own prior chunk
 
         issued = controller._mtp_commit_pass(
             context,
@@ -361,7 +386,7 @@ class TestMtpCommitPassPrefill:
         assert call["append_counts"].cpu().tolist() == [2]
         assert call["request_start_positions"].cpu().tolist() == [
             8
-        ], "the prefix-cache hit wrote the shared divergence entry at off-1"
+        ], "the prefix-cache hit wrote a seam into an inherited block"
         forward = model.mtp_layer_calls[-1]
         assert _row_ids(forward["hidden_states"]) == [0, 1]
         assert forward["next_token_ids"].view(-1).cpu().tolist() == [1001, 1002]
@@ -374,8 +399,7 @@ class TestMtpCommitPassPrefill:
         model = _make_model()
         controller = _make_controller(context, model)
         # A stale boundary left by a DIFFERENT request.
-        controller._mtp_chunk_boundary_hidden = _hidden(1, fill=99.0)
-        controller._mtp_chunk_boundary_req_id = 7
+        _seed_carry(context, req_id=7, position=7)
 
         controller._mtp_commit_pass(
             context,
@@ -390,6 +414,37 @@ class TestMtpCommitPassPrefill:
         assert call["append_counts"].cpu().tolist() == [2]
         assert call["request_start_positions"].cpu().tolist() == [8]
         # The other request's hidden must not appear in the packed batch.
+        assert 99.0 not in _row_ids(model.mtp_layer_calls[-1]["hidden_states"])
+
+    def test_a_carry_at_the_wrong_position_is_declined(self):
+        """A carry only applies at the position it recorded, and a mismatch is skipped silently.
+
+        This is reachable on a healthy request: a continuation chunk's offset is
+        `finished_chunk_token_count + prefix_skip_tokens`, and the KV prefix skip is not gated on
+        `finished == 0`, so a mid-request prefix match moves the next chunk's seam away from the
+        carry. Skipping costs one stale draft K/V and cannot affect verified output.
+        """
+        context = _make_context(
+            prefill_query_lengths=(3,), prefill_kv_offsets=(8,), request_ids=[42]
+        )
+        model = _make_model()
+        controller = _make_controller(context, model)
+        # Same request id, but recorded at position 3 while this chunk's seam is at off - 1 == 7.
+        _seed_carry(context, req_id=42, position=3)
+
+        controller._mtp_commit_pass(
+            context,
+            model,
+            _hidden(3),
+            num_decode_requests=0,
+            active_request_count=1,
+            base_position=torch.tensor([11], device=DEVICE),
+        )
+
+        call = context.setup_prefill_calls[-1]
+        # Body rows only: no seam, so the run is not extended downward.
+        assert call["append_counts"].cpu().tolist() == [2]
+        assert call["request_start_positions"].cpu().tolist() == [8]
         assert 99.0 not in _row_ids(model.mtp_layer_calls[-1]["hidden_states"])
 
     def test_in_flight_chunk_carries_its_last_hidden_forward(self):
@@ -412,11 +467,14 @@ class TestMtpCommitPassPrefill:
             base_position=torch.tensor([4], device=DEVICE),
         )
 
-        assert controller._mtp_chunk_boundary_req_id == 42
-        assert controller._mtp_chunk_boundary_hidden is not None
-        assert controller._mtp_chunk_boundary_hidden.shape == (1, 1, HIDDEN_SIZE)
+        meta = context.mtp_metadata
+        assert meta.chunk_boundary_valid
+        assert meta.chunk_boundary_req_id == 42
+        assert meta.chunk_boundary_hidden.shape == (1, 1, HIDDEN_SIZE)
+        # off=0, q=4 -> this chunk's last prompt position is 3, the next chunk's seam position.
+        assert meta.chunk_boundary_position == 3
         # The LAST hidden of this chunk (row 3) is the one carried.
-        assert _row_ids(controller._mtp_chunk_boundary_hidden) == [3]
+        assert _row_ids(meta.chunk_boundary_hidden) == [3]
 
     def test_boundary_hidden_is_cleared_when_no_chunk_is_in_flight(self):
         """A finished chunk must not leave a boundary a later request could match."""
@@ -428,8 +486,7 @@ class TestMtpCommitPassPrefill:
         )
         model = _make_model()
         controller = _make_controller(context, model)
-        controller._mtp_chunk_boundary_hidden = _hidden(1, fill=99.0)
-        controller._mtp_chunk_boundary_req_id = 42
+        _seed_carry(context, req_id=42, position=3)
 
         controller._mtp_commit_pass(
             context,
@@ -440,8 +497,8 @@ class TestMtpCommitPassPrefill:
             base_position=torch.tensor([4], device=DEVICE),
         )
 
-        assert controller._mtp_chunk_boundary_hidden is None
-        assert controller._mtp_chunk_boundary_req_id == -1
+        assert not context.mtp_metadata.chunk_boundary_valid
+        assert context.mtp_metadata.chunk_boundary_req_id == -1
 
     def test_carried_hidden_is_detached_from_the_step_that_produced_it(self):
         """The carry must be a private copy: the next step's hidden buffer is reused/freed."""
@@ -463,10 +520,10 @@ class TestMtpCommitPassPrefill:
             active_request_count=1,
             base_position=torch.tensor([4], device=DEVICE),
         )
-        carried_before = _row_ids(controller._mtp_chunk_boundary_hidden)
+        carried_before = _row_ids(context.mtp_metadata.chunk_boundary_hidden)
         gathered.fill_(-1.0)  # simulate the buffer being overwritten next step
 
-        assert _row_ids(controller._mtp_chunk_boundary_hidden) == carried_before
+        assert _row_ids(context.mtp_metadata.chunk_boundary_hidden) == carried_before
 
 
 class TestMtpCommitPassMixedBatch:
@@ -1224,8 +1281,10 @@ def _build_step(
             accepted, dtype=torch.int64, device=DEVICE
         )
     if carried_boundary_req_id is not None:
-        controller._mtp_chunk_boundary_hidden = _hidden(1, fill=99.0)
-        controller._mtp_chunk_boundary_req_id = carried_boundary_req_id
+        # Seed at the position the carrying request's next chunk will ask for: its seam is
+        # `off - 1`, and prefill entries are (q, off, request_id).
+        carried_off = next(off for _, off, rid in prefill if rid == carried_boundary_req_id)
+        _seed_carry(context, req_id=carried_boundary_req_id, position=carried_off - 1)
 
     # Packed main hiddens: decode slots first, then each prefill chunk.
     stride = num_speculative_tokens + 1
@@ -1573,8 +1632,8 @@ class TestMtpKvCacheCombinations:
 
         # 6. A boundary hidden is carried only while a chunk is genuinely in flight.
         if kwargs.get("chunked_prefill_request_id", -1) == -1:
-            assert controller._mtp_chunk_boundary_hidden is None
-            assert controller._mtp_chunk_boundary_req_id == -1
+            assert not context.mtp_metadata.chunk_boundary_valid
+            assert context.mtp_metadata.chunk_boundary_req_id == -1
 
     @pytest.mark.parametrize("scenario_name", sorted(SCENARIOS))
     def test_dummy_rank_matches_every_scenario(self, scenario_name):

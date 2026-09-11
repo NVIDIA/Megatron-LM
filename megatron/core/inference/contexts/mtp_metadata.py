@@ -6,6 +6,8 @@ from typing import Optional, Tuple
 import torch
 from torch import Tensor
 
+from megatron.core.inference.utils import log_mtp_debug
+
 from .gpu_view import ContextGPUView
 
 
@@ -41,6 +43,8 @@ class MTPMetadata:
         dummy_block_idx (int): Scratch block that padded rows read and write, so padding never
             touches real KV.
         block_table_dtype (torch.dtype): dtype of `gpu_view.mha_block_table`.
+        hidden_size (int): Model hidden size, sizing the chunked-prefill boundary carry.
+        hidden_dtype (torch.dtype): dtype of the main model's hidden states.
     """
 
     enabled: bool
@@ -49,6 +53,8 @@ class MTPMetadata:
     block_size_tokens: int
     dummy_block_idx: int
     block_table_dtype: torch.dtype
+    hidden_size: int
+    hidden_dtype: torch.dtype
 
     # ---- Draft-loop state (valid between begin_decode() and end_decode()). ----
     # True while an MTP forward owns the attention metadata; the KV append/read paths key off
@@ -63,6 +69,21 @@ class MTPMetadata:
     # Block table as of just before `_rewind_kv_cache` released the draft blocks. None until
     # the first snapshot of the run.
     prerewind_block_table: Optional[Tensor] = field(default=None, repr=False)
+
+    # ---- Chunked-prefill boundary carry (lives BETWEEN steps). ----
+    # The MTP entry at position `off - 1` straddles two prefill chunks: it pairs the previous
+    # chunk's last hidden with the next chunk's first token, so neither chunk can write it alone.
+    # The producing chunk stashes its last hidden here; the consuming chunk splices it in. See
+    # `_mtp_prefill_commit_segments`.
+    #
+    # The carry records the producing request's id AND the prompt position the hidden was computed
+    # at, and `take_chunk_boundary` requires both to match, declining otherwise. The id alone is
+    # not sufficient -- see that method for why.
+    chunk_boundary_valid: bool = False
+    chunk_boundary_req_id: int = -1
+    chunk_boundary_position: int = -1
+    # [1, 1, hidden_size]: preallocated and written in place, like every other buffer here.
+    chunk_boundary_hidden: Optional[Tensor] = field(default=None, repr=False)
 
     # ---- Persistent buffers (allocated by allocate()). ----
     # [max_requests] int32: MTP write position of the current draft depth, per request.
@@ -103,6 +124,10 @@ class MTPMetadata:
         self.kv_lengths = torch.zeros(self.max_requests, dtype=torch.int32, device=device)
         self.row_ids = torch.arange(self.max_requests, dtype=torch.int64, device=device)
         self.prerewind_buf = torch.empty_like(block_table_template).pin_memory()
+        self.chunk_boundary_hidden = torch.zeros(
+            (1, 1, self.hidden_size), dtype=self.hidden_dtype, device=device
+        )
+        self.invalidate_chunk_boundary()
 
     def deallocate(self) -> None:
         """Release the persistent buffers, mirroring `allocate`.
@@ -120,6 +145,83 @@ class MTPMetadata:
         self.active_offsets = None
         self.active_block_table = None
         self.forward_active = False
+        self.chunk_boundary_hidden = None
+        self.invalidate_chunk_boundary()
+
+    # ------------------------------------------------------------------
+    # Chunked-prefill boundary carry.
+    # ------------------------------------------------------------------
+    def invalidate_chunk_boundary(self) -> None:
+        """Drop the carried chunk-boundary hidden.
+
+        Clears the validity and the keys, not the buffer -- its address stays stable. Called from
+        `deallocate` and whenever no chunked request is in flight, so a stale carry can never be
+        matched by a later request.
+        """
+        self.chunk_boundary_valid = False
+        self.chunk_boundary_req_id = -1
+        self.chunk_boundary_position = -1
+
+    def carry_chunk_boundary(self, hidden: Tensor, req_id: int, position: int) -> None:
+        """Stash the in-flight chunked request's last hidden for its next chunk's seam.
+
+        Args:
+            hidden (Tensor): Main hidden state at `position`, any shape with `hidden_size`
+                elements. Copied into the persistent buffer, so the caller's tensor is free to
+                be released with the rest of the step's activations.
+            req_id (int): Producing request's id.
+            position (int): Prompt position `hidden` was computed at. Only a chunk whose seam
+                falls exactly here -- i.e. whose `off == position + 1` -- may consume this carry.
+        """
+        if not self.enabled:
+            return
+        self.chunk_boundary_hidden.copy_(hidden.detach().view(1, 1, -1))
+        self.chunk_boundary_req_id = req_id
+        self.chunk_boundary_position = position
+        self.chunk_boundary_valid = True
+
+    def take_chunk_boundary(self, req_id: int, seam_position: int) -> Optional[Tensor]:
+        """Return the carried hidden if it is the one this seam needs, else None.
+
+        BOTH keys must match, and a mismatch is declined rather than raised. The position key is
+        not merely a staleness guard -- it can differ for a perfectly healthy request. A
+        continuation chunk's offset is `finished_chunk_token_count + prefix_skip_tokens`, and the
+        KV prefix skip in `_compute_prefix_match` is NOT gated on `finished == 0`: if another
+        request publishes cached blocks covering this one's unprefilled region between its chunks,
+        the next chunk starts past `off + q` and its seam lands somewhere the carry does not
+        describe. Declining is then the correct answer, and the only cost is one stale draft K/V
+        that cannot affect verified output.
+
+        The position key also subsumes the `off > 0` guard: a first chunk asks for
+        `seam_position == -1`, and a valid carry always records a position `>= 0`.
+
+        Args:
+            req_id (int): Request that wants to write the seam.
+            seam_position (int): MTP position the seam would be written at (`off - 1`).
+
+        Returns:
+            (Optional[Tensor]): The `[1, 1, hidden_size]` carried hidden, or None on any mismatch.
+        """
+        # The validity check must come first: the invalid sentinels are -1/-1, and an unfilled
+        # request slot is also -1, so an invalid carry could otherwise match `req_id == -1` at a
+        # first chunk's `seam_position == -1`.
+        if not self.chunk_boundary_valid or self.chunk_boundary_req_id != req_id:
+            return None
+
+        if self.chunk_boundary_position != seam_position:
+            # Logged rather than silent: this is legitimate (see above), but it is also what a
+            # genuine bookkeeping drift would look like, and either way it costs draft acceptance.
+            log_mtp_debug(
+                "chunk_boundary_declined",
+                None,
+                reason="position_mismatch",
+                req_id=req_id,
+                carry_position=self.chunk_boundary_position,
+                seam_position=seam_position,
+            )
+            return None
+
+        return self.chunk_boundary_hidden
 
     # ------------------------------------------------------------------
     # Draft-loop lifecycle.

@@ -3324,16 +3324,15 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             hash_to_block_id={block_hashes[0]: 7, block_hashes[1]: 8}
         )
 
-        (
-            matched_block_ids,
-            num_blocks_from_pool,
-            already_allocated_blocks,
-            overall_required_blocks,
-            prefix_skip_tokens,
-            effective_prefill_chunk_length,
-        ) = DynamicInferenceContext._compute_prefix_match(
+        _m = DynamicInferenceContext._compute_prefix_match(
             ctx, req, prefill_chunk_length=211, record_mamba_match=True
         )
+        matched_block_ids = _m.matched_block_ids
+        num_blocks_from_pool = _m.num_blocks_from_pool
+        already_allocated_blocks = _m.already_allocated_blocks
+        overall_required_blocks = _m.overall_required_blocks
+        prefix_skip_tokens = _m.prefix_skip_tokens
+        effective_prefill_chunk_length = _m.effective_prefill_chunk_length
 
         assert matched_block_ids == [7]
         assert num_blocks_from_pool == 0

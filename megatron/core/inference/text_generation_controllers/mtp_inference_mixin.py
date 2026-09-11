@@ -10,8 +10,9 @@ model, SP/PP topology); the split is for readability, and mixing in preserves th
 behaviour exactly.
 
 The only state the mixin writes is its own: the sampling/draft buffers allocated by
-`_init_mtp_sampling_tensors`, and the chunked-prefill boundary hidden carried by
-`_mtp_commit_pass`. Everything else it touches belongs to the inference context or the model.
+`_init_mtp_sampling_tensors`. Everything else it touches belongs to the inference context or
+the model -- including the chunked-prefill boundary carry, which lives on the context's
+`MTPMetadata` so that it is invalidated alongside every other piece of MTP state.
 """
 
 from dataclasses import dataclass
@@ -45,14 +46,14 @@ class _CommitSegments:
             with nothing to refresh; the entry is still required, because the commit pass's
             segment count must stay equal to the active request count.
         starts (Tensor): [R] MTP write position of each request's first rewritten token.
-        hidden (Tensor | None): [T, 1, H] packed main hidden states, None when T == 0.
-        tokens (Tensor | None): [T] next-token ids paired with `hidden`, None when T == 0.
+        hidden (Tensor): [T, 1, H] packed main hidden states; empty when T == 0.
+        tokens (Tensor): [T] next-token ids paired with `hidden`; empty when T == 0.
     """
 
     counts: Tensor
     starts: Tensor
-    hidden: Optional[Tensor]
-    tokens: Optional[Tensor]
+    hidden: Tensor
+    tokens: Tensor
 
 
 class MTPInferenceMixin:
@@ -165,8 +166,7 @@ class MTPInferenceMixin:
         # No in-flight chunked request (none, or it finished its final chunk this step): drop the
         # carried boundary hidden so a later request can never match a stale id.
         if chunked_id == -1:
-            self._mtp_chunk_boundary_hidden = None
-            self._mtp_chunk_boundary_req_id = -1
+            context.mtp_metadata.invalidate_chunk_boundary()
 
         append_counts = torch.cat([s.counts for s in segments]) if segments else None
         total = 0 if append_counts is None else int(append_counts.sum().item())
@@ -179,8 +179,8 @@ class MTPInferenceMixin:
             context,
             unwrapped_model,
             # [total, 1, H] and [total], both in decode-first request order.
-            packed_hidden=torch.cat([s.hidden for s in segments if s.hidden is not None]),
-            packed_tokens=torch.cat([s.tokens for s in segments if s.tokens is not None]),
+            packed_hidden=torch.cat([s.hidden for s in segments]),
+            packed_tokens=torch.cat([s.tokens for s in segments]),
             append_counts=append_counts,
             request_start_positions=torch.cat([s.starts for s in segments]),
             total=total,
@@ -209,15 +209,19 @@ class MTPInferenceMixin:
         # start of each request's refreshed run: (last committed MTP pos) - a_r.
         starts = base_position[:num_decode_requests] - 1 - accepted
 
+        # Needed to size the gathers below. When every request accepted zero drafts this is 0 and
+        # the arithmetic falls through to empty index tensors, yielding empty (but correctly
+        # shaped) hidden/token rows -- the (count, start) pairs are still emitted, because the
+        # segment count must stay equal to the active request count.
         total_a = int(accepted.sum().item())
-        if total_a == 0:
-            # Every decode request accepted zero drafts: the (count, start) pairs are still
-            # needed to keep one segment per active request, but there are no rows to rewrite.
-            return _CommitSegments(counts=accepted, starts=starts, hidden=None, tokens=None)
 
         decode_hidden = gathered_hidden[:decode_len]  # [num_decode*stride, 1, H]
-        decode_tokens = context.gpu_view.token_to_input_ids[:decode_len].to(device)
-        rows_d = torch.repeat_interleave(torch.arange(num_decode_requests, device=device), accepted)
+        decode_tokens = context.gpu_view.token_to_input_ids[:decode_len]
+        # `output_size` is already known on the host, so pass it and skip repeat_interleave's
+        # own device sync.
+        rows_d = torch.repeat_interleave(
+            torch.arange(num_decode_requests, device=device), accepted, output_size=total_a
+        )
         within_d = (
             torch.arange(total_a, device=device) - (torch.cumsum(accepted, 0) - accepted)[rows_d]
         )
@@ -250,15 +254,17 @@ class MTPInferenceMixin:
         SEAM: position off-1 pairs the PREVIOUS chunk's last hidden with this chunk's first
         token, so only this chunk can write it, and only if that hidden was carried over -- i.e.
         this same request computed off-1 itself. At most one request per step qualifies, because
-        chunked prefill admits a single in-flight request. A prefix-cache hit also produces
-        off > 0, but there the skipped prefix was computed by a DIFFERENT request whose
-        activations are gone, so the seam is left unwritten: entries at p <= off-2 are already
-        correct in the inherited blocks (t_{p+1} lies inside the shared prefix, so it is the same
-        token for every sibling), and off-1 -- the one entry that does differ, because it consumes
-        t_off, the first divergent token -- lives in a ref-counted block shared with the producer
-        and every sibling, so writing this request's value would corrupt theirs. One stale
-        key/value at the divergence point costs a little draft acceptance and cannot affect
-        verified output.
+        chunked prefill admits a single in-flight request.
+
+        A prefix-cache hit also produces off > 0, and there no seam is written: the skipped prefix
+        was computed by a DIFFERENT request whose activations are gone, so no carry matches. That
+        is correct, because every inherited entry is already right for this request, off-1
+        included. off-1 is the last slot of the last INHERITED block and nothing writes it -- but
+        it does not need writing: `_compute_prefix_match` drops the last HASH-MATCHED block, so
+        t_off is the first token of that dropped block, still inside the matched prefix and
+        therefore identical for every sibling. The entry that genuinely diverges sits one block
+        later, at the end of the dropped block this request now computes, where the body rows
+        below write it. Removing that back-off would silently make off-1 wrong again.
 
         Every request contributes exactly ONE segment (q-1 entries, or q with a seam), so the
         segment count stays active_request_count and the fixed-size MHA-metadata buffers never
@@ -277,9 +283,7 @@ class MTPInferenceMixin:
         id_list = context.request_ids[active_slice][prefill_slice].tolist()
         total_prompt = sum(q_list)
         prefill_hidden = gathered_hidden[decode_len : decode_len + total_prompt]
-        prefill_tokens = context.gpu_view.token_to_input_ids[
-            decode_len : decode_len + total_prompt
-        ].to(device)
+        prefill_tokens = context.gpu_view.token_to_input_ids[decode_len : decode_len + total_prompt]
 
         # Host-side chunk geometry. `q_list` entries are >= 1, so every request contributes
         # q-1 >= 0 body rows and `chunk_start[i]` is the first row of request i's chunk.
@@ -294,42 +298,58 @@ class MTPInferenceMixin:
         # arithmetically (segment row -> global row) rather than by masking, so no
         # `nonzero()`-style device sync is introduced.
         body_total = total_prompt - num_prefill
-        rows = torch.repeat_interleave(torch.arange(num_prefill, device=device), counts)
-        chunk_start_gpu = torch.tensor(chunk_start, dtype=torch.long, device=device)
-        within = (
-            torch.arange(body_total, device=device) - (torch.cumsum(counts, 0) - counts)[rows]
+        rows = torch.repeat_interleave(
+            torch.arange(num_prefill, device=device), counts, output_size=body_total
         )
+        chunk_start_gpu = torch.tensor(chunk_start, dtype=torch.long, device=device)
+        within = torch.arange(body_total, device=device) - (torch.cumsum(counts, 0) - counts)[rows]
         body_idx = chunk_start_gpu[rows] + within
         hidden = prefill_hidden[body_idx]
         tokens = prefill_tokens[body_idx + 1]  # the token one position to the right
 
         # Seam: at most one request continues its own prior chunk, so this is a single splice
-        # rather than a per-request branch.
+        # rather than a per-request branch. `take_chunk_boundary` gates on the carry's recorded
+        # POSITION as well as its request id, so a carry left behind by a request that has since
+        # restarted at a different offset is never consumed (it also subsumes the `off > 0` check:
+        # a first chunk asks for seam position -1, which no valid carry can hold).
+        mtp_meta = context.mtp_metadata
         seam = (
-            id_list.index(self._mtp_chunk_boundary_req_id)
-            if self._mtp_chunk_boundary_hidden is not None
-            and self._mtp_chunk_boundary_req_id in id_list
+            id_list.index(mtp_meta.chunk_boundary_req_id)
+            if mtp_meta.chunk_boundary_req_id in id_list
             else None
         )
-        if seam is not None and off_list[seam] > 0:
+        seam_hidden = (
+            None
+            if seam is None
+            else mtp_meta.take_chunk_boundary(
+                req_id=id_list[seam], seam_position=off_list[seam] - 1
+            )
+        )
+        if seam_hidden is not None:
             # The seam row precedes request `seam`'s body rows, which start after every earlier
             # request's q-1 body rows.
             insert_at = chunk_start[seam] - seam
             seam_token = prefill_tokens[chunk_start[seam] : chunk_start[seam] + 1]  # t_off
+            # The carry buffer is allocated at `params_dtype`; cast rather than assume the
+            # decoder's output dtype matches it, since `torch.cat` requires exact agreement.
             hidden = torch.cat(
-                [hidden[:insert_at], self._mtp_chunk_boundary_hidden.to(device), hidden[insert_at:]]
+                [hidden[:insert_at], seam_hidden.to(hidden.dtype), hidden[insert_at:]]
             )
             tokens = torch.cat([tokens[:insert_at], seam_token, tokens[insert_at:]])
             counts[seam] += 1
             starts[seam] -= 1
 
-        # Carry the in-flight chunk's last hidden so its next chunk can write the seam entry.
+        # Carry the in-flight chunk's last hidden so its next chunk can write the seam entry. The
+        # recorded position is this chunk's last PROMPT position, which is exactly the seam
+        # position the next chunk will ask for (`off_next - 1 == off + q - 1`).
         if chunked_id != -1 and chunked_id in id_list:
             i = id_list.index(chunked_id)
             last_row = chunk_start[i] + q_list[i] - 1
-            carried = prefill_hidden[last_row].detach().clone()
-            self._mtp_chunk_boundary_hidden = carried.view(1, 1, -1)
-            self._mtp_chunk_boundary_req_id = chunked_id
+            mtp_meta.carry_chunk_boundary(
+                hidden=prefill_hidden[last_row],
+                req_id=chunked_id,
+                position=off_list[i] + q_list[i] - 1,
+            )
 
         return _CommitSegments(counts=counts, starts=starts, hidden=hidden, tokens=tokens)
 
@@ -373,6 +393,7 @@ class MTPInferenceMixin:
             padded_token_count=padded_total,
             padded_request_count=active_request_count,
             request_start_positions=request_start_positions,
+            total=total,
         )
         if context._nvls_dispatcher:
             NVLSAllGatherVDispatcher.modify_real_token_count_for_mtp(total)

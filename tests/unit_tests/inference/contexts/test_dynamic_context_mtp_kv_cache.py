@@ -758,3 +758,124 @@ class TestMtpPrefillBookkeeping:
                 append_counts=torch.tensor([2], device=device),
                 block_table_prefill=self._block_table(context, [[3]]),
             )
+
+
+class TestMtpChunkBoundaryCarry:
+    """The chunked-prefill boundary carry on `MTPMetadata`.
+
+    The carry is the one piece of MTP state that must survive BETWEEN steps, which is exactly
+    what makes a stale one dangerous. It is keyed by request id AND by the prompt position the
+    hidden was computed at, so a carry left behind by a request that has since restarted at a
+    different offset can never be consumed.
+    """
+
+    @classmethod
+    def setup_class(cls):
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1, pipeline_model_parallel_size=1
+        )
+        model_parallel_cuda_manual_seed(123)
+
+    @classmethod
+    def teardown_class(cls):
+        Utils.destroy_model_parallel()
+
+    @staticmethod
+    def _meta():
+        """A freshly allocated context's MTPMetadata (`__init__` runs initialize_all_tensors)."""
+        return _make_context().mtp_metadata
+
+    @staticmethod
+    def _hidden(meta, fill):
+        return torch.full((1, 1, meta.hidden_size), fill, device="cuda", dtype=meta.hidden_dtype)
+
+    def test_carry_then_take_at_the_recorded_position(self):
+        meta = self._meta()
+        hidden = self._hidden(meta, 7.0)
+        meta.carry_chunk_boundary(hidden=hidden, req_id=42, position=3)
+
+        taken = meta.take_chunk_boundary(req_id=42, seam_position=3)
+        assert taken is not None
+        assert taken.shape == (1, 1, meta.hidden_size)
+        assert torch.equal(taken, hidden)
+
+    def test_take_declines_a_position_mismatch(self):
+        """Declined, not raised: a healthy continuation chunk can land at a new offset.
+
+        `_compute_prefix_match` does not gate the KV prefix skip on `finished == 0`, so if
+        another request publishes cached blocks covering this one's unprefilled region between
+        its chunks, the next chunk starts past `off + q` and its seam is somewhere the carry does
+        not describe. Raising here would kill a live step over a legitimate schedule.
+        """
+        meta = self._meta()
+        meta.carry_chunk_boundary(hidden=self._hidden(meta, 1.0), req_id=42, position=3)
+        assert meta.take_chunk_boundary(req_id=42, seam_position=9) is None
+
+    def test_take_declines_a_request_mismatch(self):
+        meta = self._meta()
+        meta.carry_chunk_boundary(hidden=self._hidden(meta, 1.0), req_id=42, position=3)
+        assert meta.take_chunk_boundary(req_id=7, seam_position=3) is None
+
+    def test_a_first_chunk_can_never_consume_a_carry(self):
+        """off == 0 asks for seam position -1; a valid carry always records position >= 0."""
+        meta = self._meta()
+        meta.carry_chunk_boundary(hidden=self._hidden(meta, 1.0), req_id=42, position=0)
+        assert meta.take_chunk_boundary(req_id=42, seam_position=-1) is None
+
+    def test_invalidate_drops_the_carry_but_keeps_the_buffer(self):
+        meta = self._meta()
+        buf_before = meta.chunk_boundary_hidden
+        meta.carry_chunk_boundary(hidden=self._hidden(meta, 1.0), req_id=42, position=3)
+        meta.invalidate_chunk_boundary()
+
+        assert not meta.chunk_boundary_valid
+        assert meta.chunk_boundary_req_id == -1
+        assert meta.chunk_boundary_position == -1
+        assert meta.take_chunk_boundary(req_id=42, seam_position=3) is None
+        # The buffer address is stable across invalidation -- only the keys are cleared.
+        assert meta.chunk_boundary_hidden is buf_before
+
+    def test_reset_metadata_invalidates_the_carry(self):
+        """The gap this closes: a request restarted after a reset must not match its old carry."""
+        context = _make_context()
+        meta = context.mtp_metadata
+        meta.carry_chunk_boundary(
+            hidden=torch.zeros((1, 1, meta.hidden_size), device="cuda", dtype=meta.hidden_dtype),
+            req_id=42,
+            position=3,
+        )
+        context.reset_metadata()
+
+        assert not meta.chunk_boundary_valid
+        assert context.chunked_prefill_request_id == -1
+        assert meta.take_chunk_boundary(req_id=42, seam_position=3) is None
+
+    def test_deallocate_invalidates_the_carry(self):
+        """This is what makes the carry safe: it dies with every other piece of MTP state."""
+        meta = self._meta()
+        meta.carry_chunk_boundary(hidden=self._hidden(meta, 1.0), req_id=42, position=3)
+        meta.deallocate()
+
+        assert not meta.chunk_boundary_valid
+        assert meta.chunk_boundary_hidden is None
+        assert meta.take_chunk_boundary(req_id=42, seam_position=3) is None
+
+    def test_carry_is_a_private_copy(self):
+        """The producing step's activation buffer is reused; the carry must not alias it."""
+        meta = self._meta()
+        src = self._hidden(meta, 5.0)
+        meta.carry_chunk_boundary(hidden=src, req_id=42, position=3)
+        src.fill_(-1.0)
+
+        taken = meta.take_chunk_boundary(req_id=42, seam_position=3)
+        assert torch.all(taken == 5.0)
+
+    def test_disabled_context_never_carries(self):
+        context = _make_context(num_speculative_tokens=0)
+        assert not context.enable_mtp_kv_cache
+        meta = context.mtp_metadata
+        meta.carry_chunk_boundary(
+            hidden=torch.zeros((1, 1, 8), device="cuda"), req_id=42, position=3
+        )
+        assert not meta.chunk_boundary_valid
+        assert meta.take_chunk_boundary(req_id=42, seam_position=3) is None

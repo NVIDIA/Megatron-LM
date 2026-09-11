@@ -2709,9 +2709,9 @@ class DynamicInferenceEngine(AbstractEngine):
                 # add_request() only computes `effective = span - skip` tokens.
                 prefix_skip = 0
                 if prefix_caching_enabled and not is_continuing_chunked_prefill:
-                    _, _, _, _, prefix_skip, _ = self.context._compute_prefix_match(
+                    prefix_skip = self.context._compute_prefix_match(
                         req, remaining_len
-                    )
+                    ).prefix_skip_tokens
                     prefix_skip = min(prefix_skip, remaining_len - 1)  # keep >=1 token to run
 
                 computed_budget = min(remaining_len - prefix_skip, token_budget)
@@ -2789,9 +2789,9 @@ class DynamicInferenceEngine(AbstractEngine):
                 # admits the request). For >= 2 computed tokens add_request computes
                 # exactly this chunk, which already fits the budget.
                 if prefix_skip > 0 and (prefill_chunk_length - prefix_skip) < 2:
-                    _, _, _, _, _, actual_effective = self.context._compute_prefix_match(
+                    actual_effective = self.context._compute_prefix_match(
                         req, prefill_chunk_length
-                    )
+                    ).effective_prefill_chunk_length
                     if self.context.active_token_count + actual_effective > self.context.max_tokens:
                         can_schedule = False
                         break

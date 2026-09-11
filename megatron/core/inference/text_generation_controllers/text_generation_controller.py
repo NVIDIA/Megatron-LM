@@ -273,14 +273,6 @@ class TextGenerationController(MTPInferenceMixin):
                     self.num_speculative_tokens, self.model_config.mtp_num_layers
                 )
 
-        # MTP KV cache + chunked prefill: the last main hidden state of the in-flight chunked
-        # request's most recent chunk, carried one step so the next chunk can seed the position
-        # straddling the two chunks (f(h_{off+c-1} + emb(t_{off+c}))). There is at most one chunked
-        # request at a time and it is never paused, so a single tensor keyed by its request id
-        # suffices. None when no chunk is in flight; see `_mtp_commit_pass`.
-        self._mtp_chunk_boundary_hidden = None
-        self._mtp_chunk_boundary_req_id = -1
-
         if (
             self.model_config.cuda_graph_impl == "local"
             and self.model_config.expert_model_parallel_size > 1
