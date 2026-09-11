@@ -6,8 +6,8 @@ import torch.nn.functional as F
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
     get_transformer_block_with_experimental_attention_variant_spec,
 )
-from megatron.core.ssm.gated_delta_net import HAVE_FLA_GDN2
 from megatron.core.transformer import TransformerConfig
+from tests.unit_tests.ssm.kernel_test_utils import HAVE_FLA_GDN2
 from tests.unit_tests.transformer.test_attention import _test_parallel_attention_correctness
 
 

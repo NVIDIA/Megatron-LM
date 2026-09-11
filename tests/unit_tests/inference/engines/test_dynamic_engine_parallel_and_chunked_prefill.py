@@ -28,7 +28,6 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.models.hybrid.hybrid_model import HybridModel
-from megatron.core.ssm.gated_delta_net import HAVE_FLA
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -42,6 +41,7 @@ from tests.unit_tests.inference.engines.test_dynamic_engine import (
     set_rounder,
     skip_if_mamba_sequence_packing_not_available,
 )
+from tests.unit_tests.ssm.kernel_test_utils import HAVE_FLA
 from tests.unit_tests.test_utilities import Utils, clear_nvte_env_vars
 
 

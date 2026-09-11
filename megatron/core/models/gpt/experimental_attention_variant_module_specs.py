@@ -5,16 +5,8 @@ from typing import List, Optional
 
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.models.backends import BackendSpecProvider, get_backend_from_config
-from megatron.core.ssm.gated_delta_net import GatedDeltaNet, GatedDeltaNet2, GatedDeltaNetSubmodules
-from megatron.core.transformer.enums import AttnMaskType, LayerType
-from megatron.core.transformer.experimental_attention_variant import (
-    deepseek_v4_hybrid_attention_module_specs as dsv4_hybrid_specs,
-)
-from megatron.core.transformer.experimental_attention_variant.absorbed_mla import (
-    AbsorbedMLASelfAttention,
-    AbsorbedMLASelfAttentionSubmodules,
-)
-from megatron.core.transformer.experimental_attention_variant.dsa import (
+from megatron.core.models.gpt import deepseek_v4_hybrid_attention_module_specs as dsv4_hybrid_specs
+from megatron.core.ops.attention.dsa.modules import (
     DSAIndexer,
     DSAIndexerSubmodules,
     DSAttention,
@@ -22,6 +14,16 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
     is_dsa_skip_topk_layer,
     source_dsa_compute_layer,
 )
+from megatron.core.ops.attention.mla import (
+    AbsorbedMLASelfAttention,
+    AbsorbedMLASelfAttentionSubmodules,
+)
+from megatron.core.ops.ssm.gated_delta.modules import (
+    GatedDeltaNet,
+    GatedDeltaNet2,
+    GatedDeltaNetSubmodules,
+)
+from megatron.core.transformer.enums import AttnMaskType, LayerType
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import (
@@ -68,6 +70,7 @@ def get_gated_delta_net_module_spec(
     )
     attention = ModuleSpec(
         module=gdn_module,
+        params={"kernel_backend": backend},
         submodules=GatedDeltaNetSubmodules(
             in_proj=backend.column_parallel_layer_norm_linear(),
             out_norm=backend.layer_norm(rms_norm=rms_norm, for_qk=False),
@@ -89,6 +92,7 @@ def get_dsa_module_spec_for_backend(
     # implementation whether the backend is TransformerEngine or not.
     core_attention = ModuleSpec(
         module=DSAttention,
+        params={"kernel_backend": backend},
         submodules=DSAttentionSubmodules(
             indexer=ModuleSpec(
                 module=DSAIndexer,

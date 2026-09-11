@@ -5,14 +5,10 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from megatron.core.ops.attention.dsa import dsa_cudnn_kernels, dsa_layout, dsa_masking
+from megatron.core.ops.attention.dsa import modules as dsa_module
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer.enums import AttnBackend, AttnMaskType
-from megatron.core.transformer.experimental_attention_variant import dsa as dsa_module
-from megatron.core.transformer.experimental_attention_variant import (
-    dsa_cudnn_kernels,
-    dsa_layout,
-    dsa_masking,
-)
 from tests.unit_tests.transformer.experimental_attention_variant.dsa_native_parity_utils import (
     assert_similarity as _assert_similarity,
 )
@@ -1757,6 +1753,8 @@ def test_cudnn_sparse_loss_reduces_attention_target_across_tp(monkeypatch):
             return 2
 
     tp_group = FakeTPGroup()
+    # This isolated test uses a fake group, not a live distributed runtime.
+    monkeypatch.setattr(dsa_cudnn_kernels, "get_pg_size", lambda group: group.size())
 
     class FakeDSA:
         @staticmethod

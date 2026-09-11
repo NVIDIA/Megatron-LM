@@ -3,22 +3,26 @@ from functools import partial
 
 import torch
 
+from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
+from megatron.core.models.gpt.moe_module_specs import get_moe_module_spec
 from megatron.core.models.hybrid.hybrid_block import HybridStack, HybridStackSubmodules
-from megatron.core.ssm.mamba_layer import MambaLayer, MambaLayerSubmodules
-from megatron.core.ssm.mamba_mixer import MambaMixer, MambaMixerSubmodules
-from megatron.core.ssm.mlp_layer import MLPLayer
+from megatron.core.ops.ssm.mamba2.mixer import MambaMixer, MambaMixerSubmodules
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
 from megatron.core.transformer.dot_product_attention import DotProductAttention
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.identity_op import IdentityOp
+from megatron.core.transformer.mamba_layer import MambaLayer, MambaLayerSubmodules
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
-from megatron.core.models.gpt.moe_module_specs import get_moe_module_spec
+from megatron.core.transformer.mlp_layer import MLPLayer
 from megatron.core.transformer.spec_utils import ModuleSpec
-from megatron.core.transformer.transformer_layer import MoETransformerLayer, TransformerLayer, TransformerLayerSubmodules
+from megatron.core.transformer.transformer_layer import (
+    MoETransformerLayer,
+    TransformerLayer,
+    TransformerLayerSubmodules,
+)
 from megatron.core.typed_torch import not_none
-from megatron.core.extensions.transformer_engine import HAVE_TE
 
 if HAVE_TE:
     from megatron.core.extensions.transformer_engine import (

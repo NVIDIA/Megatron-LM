@@ -20,6 +20,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_mtp_block_spec,
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
+from megatron.core.ops.attention.dsa.modules import DSAttention, DSAttentionSubmodules
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.resharding.refit import clear_all_caches, swap_model_weights
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
@@ -27,10 +28,6 @@ from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
 from megatron.core.transformer.cuda_graphs import CudaGraphManager, _CudagraphGlobalRecord
 from megatron.core.transformer.enums import AttnMaskType
-from megatron.core.transformer.experimental_attention_variant.dsa import (
-    DSAttention,
-    DSAttentionSubmodules,
-)
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import MLATransformerConfig, TransformerConfig
 from tests.unit_tests.test_utilities import Utils

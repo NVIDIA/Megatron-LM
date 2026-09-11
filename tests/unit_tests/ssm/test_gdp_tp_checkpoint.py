@@ -6,14 +6,15 @@ import importlib.util
 import inspect
 import sys
 from collections import defaultdict
+from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
 import torch
 
 from megatron.core.dist_checkpointing import ShardedTensor
-from megatron.core.ssm import gated_delta_product as gdp_module
-from megatron.core.ssm.gated_delta_product import (
+from megatron.core.ops.ssm.gdp import mixer as gdp_module
+from megatron.core.ops.ssm.gdp.mixer import (
     GatedDeltaProductMixer,
     _get_in_proj_checkpoint_split_layout,
     _split_tensor_factory,
@@ -33,7 +34,7 @@ class _FakeProcessGroup:
 
 
 def _load_gdp_module_with_fake_rmsnorm(monkeypatch):
-    """Load GDP with a concrete RMSNorm base when mamba-ssm is unavailable."""
+    """Load the isolated norm adapter with a concrete base for this sharding-only test."""
     for package_name in ("mamba_ssm", "mamba_ssm.ops", "mamba_ssm.ops.triton"):
         package = ModuleType(package_name)
         package.__path__ = []
@@ -42,9 +43,10 @@ def _load_gdp_module_with_fake_rmsnorm(monkeypatch):
     layernorm_gated = ModuleType("mamba_ssm.ops.triton.layernorm_gated")
     layernorm_gated.RMSNorm = torch.nn.Module
     monkeypatch.setitem(sys.modules, layernorm_gated.__name__, layernorm_gated)
-
-    module_name = "megatron.core.ssm._gated_delta_product_with_fake_rmsnorm"
-    spec = importlib.util.spec_from_file_location(module_name, gdp_module.__file__)
+    module_name = "megatron.core.ops.ssm.gdp._norm_with_fake_rmsnorm"
+    spec = importlib.util.spec_from_file_location(
+        module_name, Path(gdp_module.__file__).with_name("norm.py")
+    )
     module = importlib.util.module_from_spec(spec)
     monkeypatch.setitem(sys.modules, module_name, module)
     spec.loader.exec_module(module)
@@ -134,15 +136,12 @@ def test_gdp_checkpoint_threads_explicit_groups_to_all_wrappers():
 
     with (
         patch(
-            "megatron.core.ssm.gated_delta_product.make_sharded_tensors_for_checkpoint",
+            "megatron.core.ops.ssm.gdp.mixer.make_sharded_tensors_for_checkpoint",
             side_effect=checkpoint_wrap,
         ),
+        patch("megatron.core.ops.ssm.gdp.mixer.sharded_state_dict_default", side_effect=child_wrap),
         patch(
-            "megatron.core.ssm.gated_delta_product.sharded_state_dict_default",
-            side_effect=child_wrap,
-        ),
-        patch(
-            "megatron.core.ssm.gated_delta_product._split_tensor_factory",
+            "megatron.core.ops.ssm.gdp.mixer._split_tensor_factory",
             side_effect=lambda tensor, *args, **kwargs: tensor,
         ),
         patch(

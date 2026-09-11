@@ -64,45 +64,25 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.hybrid.hybrid_layer_specs import gated_delta_product_inference_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel
-from megatron.core.ssm.gated_delta_product import GatedDeltaProductMixer
-from megatron.core.ssm.ops.gdp.chunk import chunk_gated_delta_product_varlen
-from megatron.core.ssm.ops.gdp.fused_recurrent import fused_recurrent_gated_delta_rule_update
-from megatron.core.ssm.ops.gdp.metadata import build_gdp_chunk_descriptors, max_gdp_chunk_counts
-from megatron.core.ssm.packed_seq_helpers import check_fla_sequence_packing_support
-from megatron.core.ssm.ssm_inference import SSMDynamicInferenceMixin
+from megatron.core.ops.ssm.common.inference import SSMDynamicInferenceMixin
+from megatron.core.ops.ssm.gated_delta.kernel_metadata import GDN_RECURRENT
+from megatron.core.ops.ssm.gdp.chunk import chunk_gated_delta_product_varlen
+from megatron.core.ops.ssm.gdp.fused_recurrent import fused_recurrent_gated_delta_rule_update
+from megatron.core.ops.ssm.gdp.kernel_metadata import GDP_FLA
+from megatron.core.ops.ssm.gdp.metadata import build_gdp_chunk_descriptors, max_gdp_chunk_counts
+from megatron.core.ops.ssm.gdp.mixer import GatedDeltaProductMixer
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
 from megatron.core.utils import is_fa_min_version
+from tests.unit_tests.ssm.kernel_test_utils import HAVE_GDP_DEPS, kernels_available
 from tests.unit_tests.test_utilities import Utils, clear_nvte_env_vars
-
-try:
-    import fla  # noqa: F401
-
-    HAVE_FLA = True
-except ImportError:
-    HAVE_FLA = False
-
-try:
-    import einops  # noqa: F401
-    import mamba_ssm  # noqa: F401
-
-    HAVE_MAMBA_DEPS = True
-except ImportError:
-    HAVE_MAMBA_DEPS = False
-
-HAVE_GDP_DEPS = HAVE_FLA and HAVE_MAMBA_DEPS
-
-# GDP dynamic inference relies on the same packed-sequence conv1d kernel as the
-# training/prefill path (`causal_conv1d_fn(seq_idx=...)`, added in 1.4.0).
-_PACKING_OK, _PACKING_REASON = check_fla_sequence_packing_support()
 
 pytestmark = [pytest.mark.internal]
 
 # Everything the model-level classes need; the kernel classes below want only a GPU.
 requires_gdp_model = [
-    pytest.mark.skipif(not HAVE_GDP_DEPS, reason="GDP requires fla, mamba_ssm, and einops"),
-    pytest.mark.skipif(not _PACKING_OK, reason=_PACKING_REASON or "packed-seq support missing"),
+    pytest.mark.skipif(not HAVE_GDP_DEPS, reason="Selected GDP kernel dependencies unavailable"),
     pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need flash-attn >= 2.7.3 for dynamic batching"
     ),
@@ -875,7 +855,9 @@ class TestFusedRecurrentGatedDeltaRuleUpdate:
         torch.testing.assert_close(out_padded[:real], out_real, atol=0, rtol=0, equal_nan=True)
         torch.testing.assert_close(state_padded, state_real, atol=0, rtol=0, equal_nan=True)
 
-    @pytest.mark.skipif(not HAVE_FLA, reason="parity check requires flash-linear-attention")
+    @pytest.mark.skipif(
+        not kernels_available(GDN_RECURRENT), reason="parity check requires the FLA recurrence"
+    )
     def test_matches_upstream_fla(self):
         """Fork parity with the pip FLA kernel the training path still uses."""
         from fla.ops.gated_delta_rule import fused_recurrent_gated_delta_rule
@@ -1030,7 +1012,9 @@ class TestChunkGatedDeltaProductVarlen:
 
     SHAPE = dict(H=4, K=64, V=64, num_householder=2, num_slots=8)
 
-    @pytest.mark.skipif(not HAVE_FLA, reason="parity check requires flash-linear-attention")
+    @pytest.mark.skipif(
+        not kernels_available(GDP_FLA), reason="parity check requires the FLA GDP kernel"
+    )
     def test_matches_upstream_fla(self):
         """The fork must agree with the pip kernels the training path still uses."""
         from fla.ops.gated_delta_product import chunk_gated_delta_product

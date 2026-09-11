@@ -11,10 +11,10 @@ import pytest
 import torch
 
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
+from megatron.core.ops.ssm.common import causal_conv1d_cp as causal_conv1d_module
+from megatron.core.ops.ssm.common.causal_conv1d_cp import assert_causal_conv1d_deterministic
+from megatron.core.ops.ssm.mamba2.mixer import MambaMixer
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.ssm import causal_conv1d as causal_conv1d_module
-from megatron.core.ssm.causal_conv1d import assert_causal_conv1d_deterministic
-from megatron.core.ssm.mamba_mixer import MambaMixer
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from tests.unit_tests.determinism.configs import hybrid_base
@@ -200,9 +200,9 @@ class TestMambaMixerDeterminism:
 
     @pytest.mark.skipif(not HAVE_CAUSAL_CONV1D, reason="causal_conv1d is not installed")
     def test_deterministic_mode_requires_a_deterministic_conv(self, monkeypatch):
-        """``MambaMixer.__init__`` actually calls the guard, so a disabled reduction raises."""
+        """Mamba initialization validates the selected convolution's determinism."""
         monkeypatch.setenv("CAUSAL_CONV1D_DETERMINISTIC", "0")
-        with pytest.raises(AssertionError, match="deterministic causal_conv1d backward"):
+        with pytest.raises(RuntimeError, match="deterministic causal_conv1d backward"):
             _build_mixer(deterministic_mode=True)
 
 

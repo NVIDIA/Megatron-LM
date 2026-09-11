@@ -5,7 +5,7 @@ import torch
 import torch.distributed as dist
 
 from megatron.core import parallel_state
-from megatron.core.ssm import causal_conv1d as causal_conv1d_module
+from megatron.core.ops.ssm.common import causal_conv1d_cp as causal_conv1d_module
 from megatron.core.utils import is_causal_conv1d_min_version
 from tests.unit_tests.test_utilities import Utils
 

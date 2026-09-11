@@ -12,10 +12,11 @@ from megatron.core import parallel_state
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
     get_experimental_attention_variant_module_spec,
 )
+from megatron.core.ops.ssm.gated_delta.modules import GatedDeltaNet
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.ssm.gated_delta_net import HAVE_FLA, GatedDeltaNet
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
+from tests.unit_tests.ssm.kernel_test_utils import HAVE_FLA
 from tests.unit_tests.test_utilities import Utils
 
 

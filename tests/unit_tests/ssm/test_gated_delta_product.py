@@ -18,17 +18,11 @@ import torch
 
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.models.hybrid.hybrid_layer_specs import gdp_stack_spec
+from megatron.core.ops.ssm.gdp.mixer import GatedDeltaProductMixer
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.ssm.gated_delta_product import (
-    HAVE_CUTEDSL_GDP,
-    HAVE_EINOPS,
-    HAVE_FLA,
-    HAVE_MAMBA_SSM,
-    GatedDeltaProductMixer,
-    causal_conv1d_fn,
-)
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
+from tests.unit_tests.ssm.kernel_test_utils import HAVE_GDP_DEPS
 from tests.unit_tests.test_utilities import Utils
 
 try:
@@ -37,13 +31,6 @@ try:
     fp8_available, reason_for_no_fp8 = check_fp8_support()
 except ImportError:
     fp8_available, reason_for_no_fp8 = False, "transformer-engine is not installed"
-
-HAVE_GDP_DEPS = (
-    HAVE_MAMBA_SSM
-    and HAVE_EINOPS
-    and (HAVE_FLA or HAVE_CUTEDSL_GDP)
-    and causal_conv1d_fn is not None
-)
 
 # The mixer places several divisibility constraints on these: d_inner = num_heads *
 # head_dim must divide evenly by the group count, and the in_proj output width

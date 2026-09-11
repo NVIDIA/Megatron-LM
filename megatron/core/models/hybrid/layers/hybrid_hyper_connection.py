@@ -6,8 +6,8 @@ from torch import Tensor
 
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.inference.utils import InferenceMode
+from megatron.core.ops.ssm.context_parallel.chunkwise import PackedSequenceCPMetadata
 from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.core.ssm.context_parallel.chunkwise import PackedSequenceCPMetadata
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.hyper_connection import HyperConnectionModule
 from megatron.core.transformer.identity_op import IdentityOp

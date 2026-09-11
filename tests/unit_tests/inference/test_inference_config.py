@@ -20,9 +20,9 @@ from megatron.core.inference.config import (
 from megatron.core.inference.moe import InferenceGroupedGemmBackend
 from megatron.core.inference.quantization.utils import resolve_mxfp8_backend
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
-from megatron.core.ssm.gated_delta_product import GatedDeltaProductMixer
-from megatron.core.ssm.mamba_mixer import MambaMixer
-from megatron.core.ssm.ops.gdp.common import CHUNK_SIZE as GDP_CHUNK_SIZE
+from megatron.core.ops.ssm.gdp.common import CHUNK_SIZE as GDP_CHUNK_SIZE
+from megatron.core.ops.ssm.gdp.mixer import GatedDeltaProductMixer
+from megatron.core.ops.ssm.mamba2.mixer import MambaMixer
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.arguments import _add_inference_args
 from megatron.training.config.inference_config import InferenceSetupConfig
@@ -355,8 +355,8 @@ class TestSSMChunkAlignment:
     @pytest.mark.internal
     def test_stack_without_a_recurrent_layer_reports_no_chunking(self):
         """A pipeline stage of pure attention/MLP layers has nothing to report."""
+        from megatron.core.inference.ssm_config import ssm_chunking
         from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
-        from megatron.core.ssm.ssm_inference import ssm_chunking
 
         layer_types = [Symbols.ATTENTION, Symbols.MLP]
         assert ssm_chunking(layer_types, [SimpleNamespace(), SimpleNamespace()]) is None

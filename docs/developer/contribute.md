@@ -48,6 +48,32 @@ File any bugs you find, keeping the following in mind:
 - Include commented-out code.
 - Attempt large architectural changes without first opening an issue to discuss.
 
+### Kernel Backend Selection
+
+- Route new interchangeable kernel implementations through `BackendSpecProvider`
+  and the operation family's construction-time selector. Extend a provider slot
+  when necessary; do not overload an unrelated operation's interface. Private
+  helpers with no implementation choice do not need provider slots.
+- Preserve an explicitly supplied provider through spec construction. Model and
+  operation code must not override that selection using package availability.
+  A selected but unavailable implementation must fail, not silently select another.
+- Declare optional imports, required exports, known version bounds and scoped
+  determinism directly in each kernel's declaration in the family's
+  `kernel_metadata.py`, using named fields rather than shared dependency bundles
+  or inherited metadata. Validate selected targets
+  before parameter/state allocation, then import and bind their concrete callables.
+  Do not repeat these checks with `HAVE_*` flags or mock implementations in constructors.
+- Validate operation-owned auxiliary kernels separately from provider-owned
+  recurrences. Disabled features and unselected backends must remain optional.
+  Check inference-only dependencies at inference initialization; keep runtime
+  shape/layout checks and documented input-dependent fallbacks at execution.
+- Include tests for provider overrides, selected dependency failures and disabled
+  optional features. Update `tests/unit_tests/ops` alongside new backend choices;
+  its architecture checks supplement review, not prove every future operation is compliant.
+
+See [the operation package guide](../../megatron/core/ops/README.md) for the metadata
+template, validation API and current provider slots.
+
 ## Signing Your Work
 
 - We require that all contributors "sign-off" on their commits. This certifies that the contribution is your original work, or you have rights to submit it under the same license, or a compatible license.

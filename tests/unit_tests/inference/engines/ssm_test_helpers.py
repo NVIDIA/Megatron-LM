@@ -17,27 +17,17 @@ from megatron.core.models.hybrid.hybrid_layer_specs import (
     gated_delta_product_stack_spec,
     hybrid_stack_spec,
 )
-from megatron.core.ssm.mamba_mixer import _check_mamba_sequence_packing_support
-from megatron.core.ssm.packed_seq_helpers import check_fla_sequence_packing_support
-
-try:
-    import einops  # noqa: F401
-    import fla  # noqa: F401
-    import mamba_ssm  # noqa: F401
-
-    HAVE_GDP_DEPS = True
-except ImportError:
-    HAVE_GDP_DEPS = False
+from megatron.core.ops.ssm.mamba2.mixer import _check_mamba_sequence_packing_support
+from tests.unit_tests.ssm.kernel_test_utils import HAVE_GDP_DEPS
 
 
 def skip_if_sequence_packing_not_available(ssm_mixer="mamba"):
     """Skip unless the packing support the given mixer's kernels need is present."""
     if ssm_mixer == "gdp":
         if not HAVE_GDP_DEPS:
-            pytest.skip("GDP requires fla + mamba_ssm + einops")
-        available, reason = check_fla_sequence_packing_support()
-    else:
-        available, reason = _check_mamba_sequence_packing_support()
+            pytest.skip("Selected GDP kernel dependencies unavailable")
+        return
+    available, reason = _check_mamba_sequence_packing_support()
     if not available:
         pytest.skip(reason)
 

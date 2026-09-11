@@ -42,8 +42,8 @@ from megatron.core.models.hybrid.hybrid_layer_allocation import (
     Symbols,
     get_layer_maps_from_layer_type_list,
 )
+from megatron.core.ops.ssm.gdp.metadata import max_gdp_chunk_counts
 from megatron.core.package_info import __version__ as mcore_version
-from megatron.core.ssm.ops.gdp.metadata import max_gdp_chunk_counts
 from megatron.core.transformer import MLATransformerConfig, TransformerConfig
 from megatron.core.transformer.enums import InferenceCudaGraphScope
 from megatron.core.transformer.moe.token_dispatcher_inference import (

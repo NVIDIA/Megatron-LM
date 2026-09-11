@@ -20,6 +20,7 @@ if not HAVE_GTP:
     pytest.skip("GTP requires TransformerEngine >= 2.19", allow_module_level=True)
 
 from megatron.core.fp8_utils import dequantize_fp8_tensor, is_mxfp8tensor
+from megatron.core.ops.ssm.gdp.mixer import GatedDeltaProductMixer
 from megatron.core.optimizer import HAVE_EMERGING_OPTIMIZERS
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 from megatron.core.optimizer.emerging_optimizers import _is_muon_excluded
@@ -27,31 +28,19 @@ from megatron.core.optimizer.layer_wise_optimizer import (
     LayerWiseDistributedOptimizer,
     is_managed_by_layer_wise_optimizer,
 )
-from megatron.core.ssm.gated_delta_product import (
-    HAVE_EINOPS,
-    HAVE_FLA,
-    HAVE_MAMBA_SSM,
-    GatedDeltaProductMixer,
-    causal_conv1d_fn,
-    check_fla_sequence_packing_support,
-)
 from megatron.core.tensor_parallel.generalized_tensor_parallelism import (
     dequantize_gtp_native_fp8,
     is_gtp_param,
 )
 from megatron.core.utils import is_te_min_version, unwrap_model
 from megatron.training.utils import get_device_arch_version
+from tests.unit_tests.ssm.kernel_test_utils import HAVE_GDP_DEPS
 
 # Non-"Test*" alias so pytest does not re-collect the whole TestFP8Param suite here (wrong
 # world/DP config + global-state pollution); reused by composition only.
 from tests.unit_tests.test_fp8_param import TestFP8Param as _FP8ParamHarness
 from tests.unit_tests.test_fp8_param import fp8_available, reason_for_no_fp8
 from tests.unit_tests.test_utilities import Utils
-
-HAVE_FLA_SEQUENCE_PACKING, FLA_SEQUENCE_PACKING_REASON = check_fla_sequence_packing_support()
-HAVE_GDP_DEPS = all(
-    (HAVE_MAMBA_SSM, HAVE_EINOPS, HAVE_FLA, causal_conv1d_fn is not None, HAVE_FLA_SEQUENCE_PACKING)
-)
 
 
 def _gdp_moe_test_args(overlap, *, num_weight_shards):

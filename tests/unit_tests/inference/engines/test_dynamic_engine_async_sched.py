@@ -40,7 +40,7 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
     DynamicBatchControllerStepResult,
     TextGenerationController,
 )
-from megatron.core.ssm.mamba_mixer import _check_mamba_sequence_packing_support
+from megatron.core.ops.ssm.mamba2.mixer import _check_mamba_sequence_packing_support
 from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
 from megatron.core.transformer.enums import InferenceCudaGraphScope
 from megatron.core.transformer.utils import is_layer_window_attention

@@ -43,7 +43,6 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
 )
 from megatron.core.models.hybrid.hybrid_layer_specs import gated_delta_product_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel
-from megatron.core.ssm.packed_seq_helpers import check_fla_sequence_packing_support
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.attention import HAVE_FA3, HAVE_FA4, Attention
 from megatron.core.transformer.cuda_graphs import CudaGraphManager, _CudagraphGlobalRecord
@@ -70,7 +69,7 @@ ROUNDER = 4
 
 
 @pytest.mark.internal
-@pytest.mark.skipif(not HAVE_GDP_DEPS, reason="GDP requires fla + mamba_ssm + einops")
+@pytest.mark.skipif(not HAVE_GDP_DEPS, reason="Selected GDP kernel dependencies unavailable")
 @pytest.mark.skipif(not is_fa_min_version("2.7.3"), reason="need flash attn")
 @pytest.mark.skipif(
     FLASH_ATTENTION_VERSION is None, reason="batch-invariant attention needs FA3 or FA4"
@@ -113,9 +112,6 @@ class TestGDPCudaGraphE2E:
         # conftest's set_env fixture pins the NVTE backend selection; clear it so
         # TE picks the backend the attention layers expect.
         clear_nvte_env_vars()
-        ok, reason = check_fla_sequence_packing_support()
-        if not ok:
-            pytest.skip(reason)
         random.seed(123)
         torch.manual_seed(123)
         model_parallel_cuda_manual_seed(

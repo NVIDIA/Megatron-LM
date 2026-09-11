@@ -10,16 +10,14 @@ import torch.distributed as dist
 
 from megatron.core import parallel_state
 from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
-from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer.enums import AttnMaskType
-from megatron.core.transformer.experimental_attention_variant import (
-    absorbed_mla as absorbed_mla_module,
-)
-from megatron.core.transformer.experimental_attention_variant.absorbed_mla import (
+from megatron.core.ops.attention import mla as absorbed_mla_module
+from megatron.core.ops.attention.mla import (
     AbsorbedMLASelfAttention,
     AbsorbedMLASelfAttentionSubmodules,
 )
+from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.multi_latent_attention import (
     MLASelfAttention,

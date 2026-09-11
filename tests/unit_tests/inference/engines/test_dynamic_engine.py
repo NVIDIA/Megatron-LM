@@ -65,7 +65,6 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.models.hybrid.hybrid_model import HybridModel
-from megatron.core.ssm.gated_delta_net import HAVE_FLA
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
 from megatron.core.transformer.enums import CudaGraphModule, InferenceCudaGraphScope
@@ -76,6 +75,7 @@ from tests.unit_tests.inference.engines.ssm_test_helpers import (
     hybrid_stack_spec_for,
     skip_if_sequence_packing_not_available,
 )
+from tests.unit_tests.ssm.kernel_test_utils import HAVE_FLA
 from tests.unit_tests.test_utilities import Utils, clear_nvte_env_vars
 
 try:

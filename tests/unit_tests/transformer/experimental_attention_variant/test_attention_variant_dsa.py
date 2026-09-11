@@ -13,15 +13,25 @@ from megatron.core.models.gpt.experimental_attention_variant_module_specs import
     get_dsa_module_spec_for_backend,
     get_experimental_attention_variant_module_spec,
 )
-from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer.enums import AttnMaskType
-from megatron.core.transformer.experimental_attention_variant import dsa_indexer_loss, dsa_kernels
-from megatron.core.transformer.experimental_attention_variant.absorbed_mla import (
-    AbsorbedMLASelfAttention,
+from megatron.core.ops.attention.dsa import dsa_indexer_loss, dsa_kernels
+from megatron.core.ops.attention.dsa.backends import DSAKernels
+from megatron.core.ops.attention.dsa.dsa_layout import (
+    build_packed_allgather_cp_local_positions,
+    build_packed_allgather_cp_query_positions_and_key_reorder,
+    build_zigzag_allgather_cp_key_reorder,
+    extract_query_positions_from_position_ids,
+    get_cp_positions_from_layout,
 )
-from megatron.core.transformer.experimental_attention_variant.dsa import (
+from megatron.core.ops.attention.dsa.dsa_masking import (
+    build_causal_mask_from_positions,
+    build_dsattention_forward_mask,
+    build_fused_indexer_varlen_bounds,
+    generate_varlen_mask_params_for_positions,
+    masked_log_softmax,
+    masked_softmax,
+    scatter_topk_into_index_mask,
+)
+from megatron.core.ops.attention.dsa.modules import (
     DSAIndexer,
     DSAIndexerLossAutoScaler,
     DSAIndexerSubmodules,
@@ -40,22 +50,11 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
     source_dsa_compute_layer,
     unfused_dsa_fn,
 )
-from megatron.core.transformer.experimental_attention_variant.dsa_layout import (
-    build_packed_allgather_cp_local_positions,
-    build_packed_allgather_cp_query_positions_and_key_reorder,
-    build_zigzag_allgather_cp_key_reorder,
-    extract_query_positions_from_position_ids,
-    get_cp_positions_from_layout,
-)
-from megatron.core.transformer.experimental_attention_variant.dsa_masking import (
-    build_causal_mask_from_positions,
-    build_dsattention_forward_mask,
-    build_fused_indexer_varlen_bounds,
-    generate_varlen_mask_params_for_positions,
-    masked_log_softmax,
-    masked_softmax,
-    scatter_topk_into_index_mask,
-)
+from megatron.core.ops.attention.mla import AbsorbedMLASelfAttention
+from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
@@ -119,11 +118,13 @@ class TestDSAIndexShareHelpers:
             raise AssertionError("skip layers must not build indexer modules")
 
         monkeypatch.setattr(
-            "megatron.core.transformer.experimental_attention_variant.dsa.build_module",
-            fail_build_module,
+            "megatron.core.ops.attention.dsa.modules.build_module", fail_build_module
         )
         config = SimpleNamespace(
             dsa_indexer_topk=8,
+            transformer_impl="local",
+            attention_backend="unfused",
+            dsa_kernel_backend="none",
             dsa_indexer_topk_freq=4,
             dsa_indexer_skip_topk_offset=1,
             kv_channels=16,
@@ -146,6 +147,9 @@ class TestDSAIndexShareHelpers:
     def test_index_share_holder_uses_attention_mask_without_packed_seq_params(self):
         config = SimpleNamespace(
             dsa_indexer_topk=8,
+            transformer_impl="local",
+            attention_backend="unfused",
+            dsa_kernel_backend="none",
             dsa_indexer_topk_freq=4,
             dsa_indexer_skip_topk_offset=1,
             kv_channels=16,
@@ -172,6 +176,9 @@ class TestDSAIndexShareHelpers:
     def test_index_share_holder_uses_packed_seq_params_when_available(self):
         config = SimpleNamespace(
             dsa_indexer_topk=8,
+            transformer_impl="local",
+            attention_backend="unfused",
+            dsa_kernel_backend="none",
             dsa_indexer_topk_freq=4,
             dsa_indexer_skip_topk_offset=1,
             kv_channels=16,
@@ -323,9 +330,13 @@ class _FakeCPGroup:
 def patch_hadamard_if_needed():
     """Automatically patch hadamard_transform in dsa module if not installed."""
     if not HAVE_HADAMARD:
-        with patch(
-            'megatron.core.transformer.experimental_attention_variant.dsa.hadamard_transform',
-            mock_hadamard_transform,
+        with patch.dict(
+            'sys.modules',
+            {
+                'fast_hadamard_transform': SimpleNamespace(
+                    hadamard_transform=mock_hadamard_transform
+                )
+            },
         ):
             yield
     else:
@@ -347,14 +358,14 @@ def test_dsa_kernel_backend_selects_optional_kernel_module():
     config.dsa_kernel_backend = "tilelang"
     assert (
         dsa_kernels._get_backend_module_name(config)
-        == "megatron.core.transformer.experimental_attention_variant.dsa_tilelang_kernels"
+        == "megatron.core.ops.attention.dsa.dsa_tilelang_kernels"
     )
     assert dsa_kernels.use_fused_dsa_kernels(config)
 
     config.dsa_kernel_backend = "cudnn"
     assert (
         dsa_kernels._get_backend_module_name(config)
-        == "megatron.core.transformer.experimental_attention_variant.dsa_cudnn_kernels"
+        == "megatron.core.ops.attention.dsa.dsa_cudnn_kernels"
     )
 
     config.attention_backend = "unfused"
@@ -384,9 +395,7 @@ def test_dsa_kernel_backend_loader_cache_and_import_errors(monkeypatch):
 
     assert dsa_kernels._load_backend(Config) is fake_backend
     assert dsa_kernels._load_backend(Config) is fake_backend
-    assert imported == [
-        "megatron.core.transformer.experimental_attention_variant.dsa_tilelang_kernels"
-    ]
+    assert imported == ["megatron.core.ops.attention.dsa.dsa_tilelang_kernels"]
 
     Config.dsa_kernel_backend = "none"
     assert dsa_kernels._load_backend(Config) is None
@@ -2419,7 +2428,7 @@ class TestDSAIndexer:
         rotary_pos_emb = torch.randn(2, 1, 1, self.config.qk_pos_emb_head_dim, dtype=torch.bfloat16)
 
         with patch(
-            "megatron.core.transformer.experimental_attention_variant.dsa.apply_rotary_pos_emb",
+            "megatron.core.ops.attention.dsa.modules.apply_rotary_pos_emb",
             side_effect=_fake_apply_rotary_pos_emb,
         ):
             out = self.indexer._apply_rope(x, rotary_pos_emb, mscale=1.0)
@@ -2440,8 +2449,7 @@ class TestDSAIndexer:
         with (
             patch.object(self.indexer, "_apply_rope", side_effect=lambda t, *args, **kwargs: t),
             patch(
-                "megatron.core.transformer.experimental_attention_variant.dsa.rotate_activation",
-                side_effect=lambda t: t,
+                "megatron.core.ops.attention.dsa.modules.rotate_activation", side_effect=lambda t: t
             ) as rotate_mock,
         ):
             q, k, _ = self.indexer.forward_before_topk(x, qr)
@@ -2629,11 +2637,6 @@ class TestDSAttention:
         num_heads = self.config.num_attention_heads
         head_dim = self.config.hidden_size // num_heads
 
-        def _unexpected_fused_attention(**_kwargs):
-            raise AssertionError(
-                "full fused DSA backend should not run for attention_backend=unfused"
-            )
-
         def _fake_forward_before_topk(_x, _qr, _packed_seq_params):
             q_indexer = torch.randn(seq_len, batch_size, 2, 4)
             k_indexer = torch.randn(seq_len, batch_size, 4)
@@ -2646,16 +2649,19 @@ class TestDSAttention:
             return expected_output
 
         monkeypatch.setattr(self.config, "attention_backend", "unfused")
+
+        def unexpected_selection(_config):
+            pytest.fail("forward must use the hooks bound during construction")
+
         monkeypatch.setattr(
-            "megatron.core.transformer.experimental_attention_variant.dsa."
-            "dsa_kernels.run_fused_dsa_attention",
-            _unexpected_fused_attention,
+            "megatron.core.ops.attention.dsa.modules.select_dsa_kernels", unexpected_selection
         )
+        monkeypatch.setattr(self.sparse_attention, "dsa_kernels", DSAKernels())
         monkeypatch.setattr(
             self.sparse_attention.indexer, "forward_before_topk", _fake_forward_before_topk
         )
         monkeypatch.setattr(
-            "megatron.core.transformer.experimental_attention_variant.dsa._run_sparse_attention",
+            "megatron.core.ops.attention.dsa.modules._run_sparse_attention",
             _fake_run_sparse_attention,
         )
 
@@ -2707,9 +2713,9 @@ class TestDSAttention:
         monkeypatch.setattr(self.config, "dsa_kernel_backend", "cudnn")
         monkeypatch.setattr(self.config, "dsa_indexer_loss_coeff", configured_loss_coeff)
         monkeypatch.setattr(
-            "megatron.core.transformer.experimental_attention_variant.dsa."
-            "dsa_kernels.run_fused_dsa_attention",
-            _fake_fused_attention,
+            self.sparse_attention,
+            "dsa_kernels",
+            DSAKernels(backend="cudnn", run_fused_dsa_attention=_fake_fused_attention),
         )
         monkeypatch.setattr(
             self.sparse_attention.indexer, "forward_before_topk", _fake_forward_before_topk
@@ -2767,9 +2773,9 @@ class TestDSAttention:
             self.sparse_attention.indexer, "forward_before_topk", _fake_forward_before_topk
         )
         monkeypatch.setattr(
-            "megatron.core.transformer.experimental_attention_variant.dsa."
-            "dsa_kernels.run_fused_dsa_attention",
-            _fake_run_fused_attention,
+            self.sparse_attention,
+            "dsa_kernels",
+            DSAKernels(backend="cudnn", run_fused_dsa_attention=_fake_run_fused_attention),
         )
 
         was_training = self.sparse_attention.training
@@ -2860,13 +2866,12 @@ class TestDSAttention:
             self.sparse_attention.indexer, "forward_before_topk", _fake_forward_before_topk
         )
         monkeypatch.setattr(
-            "megatron.core.transformer.experimental_attention_variant.dsa."
-            "dsa_kernels.run_fused_dsa_attention",
-            _fake_run_fused_attention,
+            self.sparse_attention,
+            "dsa_kernels",
+            DSAKernels(backend="cudnn", run_fused_dsa_attention=_fake_run_fused_attention),
         )
         monkeypatch.setattr(
-            "megatron.core.transformer.experimental_attention_variant.dsa."
-            "gather_from_sequence_parallel_region",
+            "megatron.core.ops.attention.dsa.modules." "gather_from_sequence_parallel_region",
             _fake_gather_from_sequence_parallel_region,
         )
 
@@ -2955,13 +2960,12 @@ class TestDSAttention:
             self.sparse_attention.indexer, "forward_before_topk", _fake_forward_before_topk
         )
         monkeypatch.setattr(
-            "megatron.core.transformer.experimental_attention_variant.dsa."
-            "dsa_kernels.run_fused_dsa_attention",
-            _fake_run_fused_attention,
+            self.sparse_attention,
+            "dsa_kernels",
+            DSAKernels(backend="cudnn", run_fused_dsa_attention=_fake_run_fused_attention),
         )
         monkeypatch.setattr(
-            "megatron.core.transformer.experimental_attention_variant.dsa."
-            "gather_from_sequence_parallel_region",
+            "megatron.core.ops.attention.dsa.modules." "gather_from_sequence_parallel_region",
             _fake_gather_from_sequence_parallel_region,
         )
 
@@ -3034,13 +3038,12 @@ class TestDSAttention:
             self.sparse_attention.indexer, "forward_before_topk", _fake_forward_before_topk
         )
         monkeypatch.setattr(
-            "megatron.core.transformer.experimental_attention_variant.dsa."
-            "dsa_kernels.run_fused_dsa_attention",
-            _fake_run_fused_attention,
+            self.sparse_attention,
+            "dsa_kernels",
+            DSAKernels(backend="cudnn", run_fused_dsa_attention=_fake_run_fused_attention),
         )
         monkeypatch.setattr(
-            "megatron.core.transformer.experimental_attention_variant.dsa."
-            "gather_from_sequence_parallel_region",
+            "megatron.core.ops.attention.dsa.modules." "gather_from_sequence_parallel_region",
             _fake_gather_from_sequence_parallel_region,
         )
 

@@ -63,10 +63,10 @@ def _worker_mamba_gtp_correctness(rank, world_size, port):
         TERowParallelLinear,
     )
     from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
+    from megatron.core.ops.ssm.mamba2.mixer import MambaMixer, MambaMixerSubmodules
     from megatron.core.process_groups_config import ProcessGroupCollection
-    from megatron.core.ssm.mamba_layer import MambaLayer, MambaLayerSubmodules
-    from megatron.core.ssm.mamba_mixer import MambaMixer, MambaMixerSubmodules
     from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+    from megatron.core.transformer.mamba_layer import MambaLayer, MambaLayerSubmodules
     from megatron.core.transformer.spec_utils import ModuleSpec
     from megatron.core.transformer.transformer_config import TransformerConfig
 

@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import warnings
 from functools import partial
-from typing import Optional, cast
+from typing import TYPE_CHECKING, Callable, Literal, Optional, cast
 
 from megatron.core.extensions.transformer_engine import (
     TEActivationOp,
@@ -29,6 +29,11 @@ from megatron.core.transformer.moe.moe_layer import ExpertsBuilder
 from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.utils import get_te_version, is_te_min_version
 
+if TYPE_CHECKING:
+    from megatron.core.ops.attention.dsa.backends import DSAKernels
+    from megatron.core.ops.ssm.gated_delta import GatedDeltaRuleInterface
+    from megatron.core.transformer.transformer_config import TransformerConfig
+
 
 class _TENormWithResidual:
     """Class adapter for TENorm with residual fusion enabled."""
@@ -43,6 +48,28 @@ class TESpecProvider(BackendSpecProvider):
     # Checked by require() when a caller needs an early refusal. Spec construction itself
     # does not require TE, since several module-level specs are assembled at import time.
     REQUIRES = "transformer_engine"
+
+    def dsa_kernels(self, config: TransformerConfig) -> DSAKernels:
+        """Bind sparse kernels independently of TE's linear and normalization targets."""
+        from megatron.core.ops.attention.dsa.backends import select_dsa_kernels
+
+        return select_dsa_kernels(config)
+
+    def gated_delta_rule(
+        self, variant: Literal["gdn", "gdn2"], deterministic: bool = False
+    ) -> GatedDeltaRuleInterface:
+        """Select the same recurrence as the local provider for the given configuration."""
+        from megatron.core.ops.ssm.gated_delta.backends import select_gated_delta_rule
+
+        return select_gated_delta_rule(variant, deterministic)
+
+    def gated_delta_product(
+        self, use_cutedsl: bool = False, deterministic: bool = False
+    ) -> Callable:
+        """Select the existing GDP training kernel."""
+        from megatron.core.ops.ssm.gdp.backends import select_gated_delta_product
+
+        return select_gated_delta_product(use_cutedsl, deterministic)
 
     def __init__(
         self,

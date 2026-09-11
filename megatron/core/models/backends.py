@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from abc import abstractmethod
 from functools import partial
-from typing import Callable, Literal, Optional, Protocol, cast
+from typing import TYPE_CHECKING, Callable, Literal, Optional, Protocol, cast
 
 import torch
 
@@ -37,6 +37,11 @@ from megatron.core.transformer.moe.moe_layer import ExpertsBuilder
 from megatron.core.transformer.torch_norm import LayerNormBuilder, WrappedTorchNorm
 from megatron.core.typed_torch import not_none
 from megatron.core.utils import is_te_min_version
+
+if TYPE_CHECKING:
+    from megatron.core.ops.attention.dsa.backends import DSAKernels
+    from megatron.core.ops.ssm.gated_delta import GatedDeltaRuleInterface
+    from megatron.core.transformer.transformer_config import TransformerConfig
 
 CrossEntropyTarget = Callable[
     [torch.Tensor, torch.Tensor, Optional[torch.distributed.ProcessGroup]], torch.Tensor
@@ -104,6 +109,10 @@ def select_cross_entropy(
 class BackendSpecProvider(Protocol):
     """A protocol for providing the submodules used in Spec building."""
 
+    def linear(self) -> type:
+        """Which non-parallel linear module to use, if the backend supplies one."""
+        ...
+
     @abstractmethod
     def column_parallel_linear(self) -> type:
         """Which column parallel linear module the backend uses"""
@@ -146,7 +155,7 @@ class BackendSpecProvider(Protocol):
         """Which module to use for activation function"""
         ...
 
-    # The three slots below were added after this protocol was first published. They are not
+    # The slots below were added after this protocol was first published. They are not
     # abstract, so a provider written against the earlier contract stays instantiable, and
     # they have no body, so inheriting one is not mistaken for implementing it -- callers ask
     # through ``backend_slot``, which supplies the previous behaviour instead.
@@ -161,6 +170,22 @@ class BackendSpecProvider(Protocol):
 
     def vocab_parallel_cross_entropy(self) -> CrossEntropyTarget:
         """Which vocab-parallel cross entropy to use."""
+        ...
+
+    def dsa_kernels(self, config: TransformerConfig) -> DSAKernels:
+        """Which concrete optional sparse-attention hooks to bind during construction."""
+        ...
+
+    def gated_delta_rule(
+        self, variant: Literal["gdn", "gdn2"], deterministic: bool = False
+    ) -> GatedDeltaRuleInterface:
+        """Which GDN-family recurrence to bind during construction."""
+        ...
+
+    def gated_delta_product(
+        self, use_cutedsl: bool = False, deterministic: bool = False
+    ) -> Callable:
+        """Which GDP training callable to bind during construction."""
         ...
 
 
@@ -255,6 +280,28 @@ class LocalSpecProvider(BackendSpecProvider):
         return select_cross_entropy(
             self._cross_entropy_loss_fusion, self._cross_entropy_fusion_impl, self._cuda_graph_impl
         )
+
+    def dsa_kernels(self, config: TransformerConfig) -> DSAKernels:
+        """Bind sparse kernels independently of the provider supplying the linears."""
+        from megatron.core.ops.attention.dsa.backends import select_dsa_kernels
+
+        return select_dsa_kernels(config)
+
+    def gated_delta_rule(
+        self, variant: Literal["gdn", "gdn2"], deterministic: bool = False
+    ) -> GatedDeltaRuleInterface:
+        """Select the existing GDN recurrence without changing its numerical path."""
+        from megatron.core.ops.ssm.gated_delta.backends import select_gated_delta_rule
+
+        return select_gated_delta_rule(variant, deterministic)
+
+    def gated_delta_product(
+        self, use_cutedsl: bool = False, deterministic: bool = False
+    ) -> Callable:
+        """Select the existing GDP training kernel."""
+        from megatron.core.ops.ssm.gdp.backends import select_gated_delta_product
+
+        return select_gated_delta_product(use_cutedsl, deterministic)
 
 
 class InferenceSpecProvider(LocalSpecProvider):

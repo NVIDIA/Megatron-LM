@@ -35,9 +35,8 @@ from megatron.core.extensions.transformer_engine import (  # noqa: E402
 )
 from megatron.core.fp8_utils import is_float8tensor  # noqa: E402
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add  # noqa: E402
+from megatron.core.ops.ssm.mamba2.mixer import MambaMixer, MambaMixerSubmodules  # noqa: E402
 from megatron.core.process_groups_config import ProcessGroupCollection  # noqa: E402
-from megatron.core.ssm.mamba_layer import MambaLayer, MambaLayerSubmodules  # noqa: E402
-from megatron.core.ssm.mamba_mixer import MambaMixer, MambaMixerSubmodules  # noqa: E402
 from megatron.core.tensor_parallel.generalized_tensor_parallelism import (  # noqa: E402
     GTP_CONFIG,
     GTPShardedParam,
@@ -52,6 +51,7 @@ from megatron.core.tensor_parallel.gtp_api import (  # noqa: E402
     gtp_remat_shard_dim0,
 )
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed  # noqa: E402
+from megatron.core.transformer.mamba_layer import MambaLayer, MambaLayerSubmodules  # noqa: E402
 from megatron.core.transformer.spec_utils import ModuleSpec  # noqa: E402
 from megatron.core.transformer.transformer_config import TransformerConfig  # noqa: E402
 from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint  # noqa: E402
@@ -1160,7 +1160,7 @@ def _build_gdp_mixer(required_pgs):
     parallel with ``gtp_remat_size=2`` first.
     """
     from megatron.core.models.hybrid.hybrid_layer_specs import gdp_stack_spec
-    from megatron.core.ssm.gated_delta_product import GatedDeltaProductMixer
+    from megatron.core.ops.ssm.gdp.mixer import GatedDeltaProductMixer
 
     pg = ProcessGroupCollection.use_mpu_process_groups(required_pgs=required_pgs)
     config = TransformerConfig(
@@ -1229,7 +1229,7 @@ def _worker_gdp_inproj_gather_split(rank, world_size, port):
         # Save side: the gathered tensor is the full TP-local width, pad stripped.
         assert factory.data.size(0) == in_proj_dim, (factory.data.size(0), in_proj_dim)
 
-        from megatron.core.ssm.gated_delta_product import _get_in_proj_checkpoint_split_layout
+        from megatron.core.ops.ssm.gdp.mixer import _get_in_proj_checkpoint_split_layout
 
         # The chunk names/sizes come from _get_in_proj_checkpoint_split_layout (householder-major:
         # z, V0..V(M-1), K0..K(M-1), Q, b0..b(M-1), a). Derive the expectation from that helper so

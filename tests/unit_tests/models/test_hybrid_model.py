@@ -25,12 +25,12 @@ from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel, _hybrid_logging_pg_kwargs
 from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.core.ssm.mamba_layer_config import MambaLayerConfig
-from megatron.core.ssm.mlp_layer_config import MLPLayerConfig
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import MLATransformerConfig, TransformerConfig
 from megatron.core.transformer.attention_layer_config import AttentionLayerConfig
 from megatron.core.transformer.enums import AttnBackend
+from megatron.core.transformer.mamba_layer_config import MambaLayerConfig
+from megatron.core.transformer.mlp_layer_config import MLPLayerConfig
 from megatron.core.transformer.module import Float16Module
 from megatron.core.utils import divide, is_fa_min_version, is_torch_min_version
 from tests.unit_tests.test_utilities import Utils
@@ -697,7 +697,7 @@ class TestHybridDSAQKLayernorm(TestHybridQKLayernorm):
     def _patch_hadamard_if_needed(self):
         if not _HAVE_HADAMARD:
             with patch(
-                'megatron.core.transformer.experimental_attention_variant.dsa.hadamard_transform',
+                'megatron.core.ops.attention.dsa.modules.hadamard_transform',
                 _mock_hadamard_transform,
             ):
                 yield
@@ -807,9 +807,7 @@ class _MLAQKNormTestBase:
     def _get_mla_attention(self, model):
         """Return the attention submodule for the selected MLA variant, or None."""
         if self.experimental_attention_variant == "dsa":
-            from megatron.core.transformer.experimental_attention_variant.absorbed_mla import (
-                AbsorbedMLASelfAttention,
-            )
+            from megatron.core.ops.attention.mla import AbsorbedMLASelfAttention
 
             attention_cls = AbsorbedMLASelfAttention
         else:
@@ -1184,9 +1182,7 @@ class TestMLADownProjFusion:
 
     def test_enabled_leaves_dsa_layer_alone(self):
         """MLA fusion must not rewrite the absorbed DSA attention specification."""
-        from megatron.core.transformer.experimental_attention_variant.absorbed_mla import (
-            AbsorbedMLASelfAttention,
-        )
+        from megatron.core.ops.attention.mla import AbsorbedMLASelfAttention
         from megatron.core.transformer.multi_latent_attention import FusedMLASelfAttention
 
         submodules = self._fresh_submodules()

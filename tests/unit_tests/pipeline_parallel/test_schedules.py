@@ -350,9 +350,7 @@ def test_hybrid_context_parallel_non_first_tp_rank_uses_broadcast_cp_size(monkey
 def test_dsa_indexer_loss_scale_matches_schedule_cp_scaling(
     calculate_per_token_loss, expected_scale
 ):
-    from megatron.core.transformer.experimental_attention_variant.dsa import (
-        DSAIndexerLossAutoScaler,
-    )
+    from megatron.core.transformer.dsa_loss import DSAIndexerLossAutoScaler
 
     config = SimpleNamespace(
         calculate_per_token_loss=calculate_per_token_loss,
@@ -388,9 +386,7 @@ def test_dsa_indexer_loss_scale_matches_schedule_cp_scaling(
 
 
 def test_dsa_indexer_loss_scale_accepts_dict_output_tensor():
-    from megatron.core.transformer.experimental_attention_variant.dsa import (
-        DSAIndexerLossAutoScaler,
-    )
+    from megatron.core.transformer.dsa_loss import DSAIndexerLossAutoScaler
 
     config = SimpleNamespace(
         calculate_per_token_loss=True,
@@ -427,9 +423,7 @@ def test_dsa_indexer_loss_scale_accepts_dict_output_tensor():
 
 @pytest.mark.parametrize("variant", ["dsa", "dsv4_hybrid"])
 def test_indexer_loss_scale_defaults_from_variant_without_mutating_config(variant):
-    from megatron.core.transformer.experimental_attention_variant.dsa import (
-        DSAIndexerLossAutoScaler,
-    )
+    from megatron.core.transformer.dsa_loss import DSAIndexerLossAutoScaler
 
     config = SimpleNamespace(
         calculate_per_token_loss=True,

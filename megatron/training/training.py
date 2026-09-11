@@ -40,9 +40,10 @@ logging.basicConfig(handlers=[CustomHandler()], level=logging.INFO)
 # measurement (kept for backwards compatibility).
 _LEGACY_TRAIN_START_TIME = time.time()  # NOTE(asolergi-nv): Legacy timestamp
 
+from megatron.core import mpu, nccl_allocator, tensor_parallel
+
 # First-party.
 from megatron.core._rank_utils import safe_get_rank
-from megatron.core import mpu, nccl_allocator, tensor_parallel
 from megatron.core.datasets.data_schedule import HybridCPDataLoaderWrapper, wrap_data_iterator
 from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core.distributed import (
@@ -119,7 +120,7 @@ from megatron.core.rerun_state_machine import (
 )
 from megatron.core.resharding.refit import swap_model_weights
 from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
-from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexerLossLoggingHelper
+from megatron.core.transformer.dsa_loss import DSAIndexerLossLoggingHelper
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.moe import upcycling_utils
 from megatron.core.transformer.moe.moe_logging import get_moe_metrics_tracker
@@ -312,10 +313,10 @@ def set_startup_timestamps(
 
 # OTel: module-level helpers imported once at startup.
 try:
-    from nemo.lens.state import is_span_group_enabled as _otel_sg_enabled
     from nemo.lens.helpers import managed_span as _otel_managed_span
     from nemo.lens.helpers import safe_set_span_attributes as _otel_safe_set_attrs
     from nemo.lens.helpers import trace_fn as _otel_trace_fn
+    from nemo.lens.state import is_span_group_enabled as _otel_sg_enabled
 except ImportError:
     from megatron.core.telemetry.fallbacks import is_span_group_enabled as _otel_sg_enabled
     from megatron.core.telemetry.fallbacks import managed_span as _otel_managed_span
@@ -429,9 +430,10 @@ def _start_otel_job_spans(model_type, program_start):
     if not _otel_sg_enabled('job'):
         return
 
-    from opentelemetry import context as _otel_ctx, trace as _otel_trace
-    from opentelemetry.context import Context as _OtelContext
     from nemo.lens.helpers import safe_set_span_attributes as _otel_set_attrs
+    from opentelemetry import context as _otel_ctx
+    from opentelemetry import trace as _otel_trace
+    from opentelemetry.context import Context as _OtelContext
 
     _otel_ctx_module = _otel_ctx
     _otel_tracer = get_telemetry().tracer
@@ -585,7 +587,8 @@ def _reroot_otel_interval():
     global _otel_interval_span, _otel_interval_ctx_token
     if get_telemetry() is None or not _otel_sg_enabled('job'):
         return
-    from opentelemetry import context as _octx, trace as _otr
+    from opentelemetry import context as _octx
+    from opentelemetry import trace as _otr
     from opentelemetry.context import Context
     from opentelemetry.trace import Link
     prev = _otel_interval_span
@@ -3103,7 +3106,8 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     # OTel: set up per-step sub-span support.
     _otel_step_tracer = None
     if _otel_sg_enabled('forward_backward') or _otel_sg_enabled('optimizer'):
-        from nemo.lens.helpers import span_cm, safe_set_span_attributes as _otel_set_attrs
+        from nemo.lens.helpers import safe_set_span_attributes as _otel_set_attrs
+        from nemo.lens.helpers import span_cm
         _otel_step_tracer = get_telemetry().tracer
 
     rerun_state_machine = get_rerun_state_machine()
@@ -3973,7 +3977,8 @@ def save_checkpoint_and_time(
     _exposed_save_span = None
     _exposed_save_token = None
     if _otel_sg_enabled('checkpoint'):
-        from opentelemetry import context as _octx, trace as _otr
+        from opentelemetry import context as _octx
+        from opentelemetry import trace as _otr
         _exposed_save_span = get_telemetry().tracer.start_span('megatron.checkpoint.exposed_save')
         _otel_mark_goodput(_exposed_save_span)
         _exposed_save_span.set_attribute('megatron.iteration', iteration)
@@ -5013,7 +5018,8 @@ def train(
         _report_span = None
         _report_token = None
         if _otel_sg_enabled('step'):
-            from opentelemetry import context as _octx, trace as _otr
+            from opentelemetry import context as _octx
+            from opentelemetry import trace as _otr
             _report_span = get_telemetry().tracer.start_span('megatron.train.iteration_report')
             _otel_mark_goodput(_report_span)
             _report_token = _octx.attach(_otr.set_span_in_context(_report_span))

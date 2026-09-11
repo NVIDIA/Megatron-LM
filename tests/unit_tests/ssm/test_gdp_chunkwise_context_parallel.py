@@ -5,31 +5,28 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.core.ssm.context_parallel import gdp_common
-from megatron.core.ssm.context_parallel.chunkwise import (
+from megatron.core.ops.ssm.context_parallel import gdp_common
+from megatron.core.ops.ssm.context_parallel.chunkwise import (
     CPBackwardPackedSummary,
     CPForwardPackedSummary,
     CPForwardResult,
     CPSavedContext,
     build_packed_sequence_cp_metadata,
 )
-from megatron.core.ssm.context_parallel.gdp_common import GDPInputs
-from megatron.core.ssm.gated_delta_product import (
-    HAVE_CUTEDSL_GDP_CP,
-    HAVE_FLA_GDP_CP,
-    GatedDeltaProductMixer,
-)
+from megatron.core.ops.ssm.context_parallel.gdp_common import GDPInputs
+from megatron.core.ops.ssm.gdp.mixer import GatedDeltaProductMixer
+from megatron.core.packed_seq_params import PackedSeqParams
+from tests.unit_tests.ssm.kernel_test_utils import HAVE_CUTEDSL_GDP_CP, HAVE_FLA_GDP_CP
 
 pytestmark = pytest.mark.launch_on_gb200
 
 if HAVE_FLA_GDP_CP:
-    import megatron.core.ssm.context_parallel.gdp as gdp_cp_module
+    import megatron.core.ops.ssm.context_parallel.gdp as gdp_cp_module
 else:
     gdp_cp_module = None
 
 if HAVE_CUTEDSL_GDP_CP:
-    import megatron.core.ssm.context_parallel.gdp_cutedsl as gdp_cutedsl_cp_module
+    import megatron.core.ops.ssm.context_parallel.gdp_cutedsl as gdp_cutedsl_cp_module
 else:
     gdp_cutedsl_cp_module = None
 

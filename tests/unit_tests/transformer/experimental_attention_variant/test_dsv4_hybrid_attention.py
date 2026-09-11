@@ -1,6 +1,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
 from functools import partial
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -33,12 +34,16 @@ def patch_hadamard_if_needed():
     """Patch hadamard_transform in dsa/csa modules if the library is not installed."""
     if not HAVE_HADAMARD:
         with (
-            patch(
-                'megatron.core.transformer.experimental_attention_variant.dsa.hadamard_transform',
-                _mock_hadamard_transform,
+            patch.dict(
+                'sys.modules',
+                {
+                    'fast_hadamard_transform': SimpleNamespace(
+                        hadamard_transform=_mock_hadamard_transform
+                    )
+                },
             ),
             patch(
-                'megatron.core.transformer.experimental_attention_variant.csa.rotate_activation',
+                'megatron.core.ops.attention.csa.modules.rotate_activation',
                 lambda x: x * (x.size(-1) ** -0.5),
             ),
         ):
@@ -135,14 +140,12 @@ def test_module_spec_is_built_from_explicit_backend():
     from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
         get_experimental_attention_variant_module_spec,
     )
-    from megatron.core.transformer.experimental_attention_variant.csa import (
+    from megatron.core.ops.attention.csa.modules import (
         CompressedSparseAttention,
         Compressor,
         CSAIndexer,
     )
-    from megatron.core.transformer.experimental_attention_variant.deepseek_v4_hybrid_attention import (
-        DSv4HybridSelfAttention,
-    )
+    from megatron.core.ops.attention.dsv4 import DSv4HybridSelfAttention
 
     class Linear:
         pass
@@ -193,10 +196,8 @@ def test_module_spec_is_built_from_explicit_backend():
 
 def test_grouped_output_projection_respects_cpu_initialization(monkeypatch):
     """The custom grouped projection follows the standard CPU/no-init constructor contract."""
+    from megatron.core.ops.attention import dsv4 as dsv4_attention
     from megatron.core.transformer import identity_op
-    from megatron.core.transformer.experimental_attention_variant import (
-        deepseek_v4_hybrid_attention as dsv4_attention,
-    )
     from megatron.core.transformer.spec_utils import ModuleSpec
 
     class SizeOneGroup:
@@ -270,9 +271,7 @@ def test_config_accepts_hybrid_model_ratio_tail():
 
 def test_constructor_requires_explicit_process_groups():
     """Production DSv4 construction must not read process groups from global MPU state."""
-    from megatron.core.transformer.experimental_attention_variant.deepseek_v4_hybrid_attention import (
-        DSv4HybridSelfAttention,
-    )
+    from megatron.core.ops.attention.dsv4 import DSv4HybridSelfAttention
 
     with pytest.raises(ValueError, match="explicit ProcessGroupCollection"):
         DSv4HybridSelfAttention(config=None, submodules=None, layer_number=1)
@@ -308,9 +307,7 @@ class TestDSv4HybridAttentionConstructor:
 
     def test_basic_construction(self):
         """Verify the layer builds and has the expected sub-modules."""
-        from megatron.core.transformer.experimental_attention_variant.deepseek_v4_hybrid_attention import (
-            DSv4HybridSelfAttention,
-        )
+        from megatron.core.ops.attention.dsv4 import DSv4HybridSelfAttention
 
         torch.manual_seed(_SEED)
         model_parallel_cuda_manual_seed(_SEED)

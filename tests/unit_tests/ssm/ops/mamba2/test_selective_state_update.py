@@ -1,11 +1,11 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-# Unit tests for `selective_state_update` (megatron/core/ssm/ops/mamba2/mamba_ssm.py).
+# Unit tests for `selective_state_update` (megatron/core/ops/ssm/mamba2/mamba_ssm.py).
 
 import pytest
 import torch
 
-from megatron.core.ssm.ops.mamba2.mamba_ssm import selective_state_update
+from megatron.core.ops.ssm.mamba2.mamba_ssm import selective_state_update
 
 
 def _requires_cuda():

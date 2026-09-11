@@ -10,9 +10,9 @@ from megatron.core.models.gpt.experimental_attention_variant_module_specs import
     get_experimental_attention_variant_module_spec,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.ssm.gated_delta_net import HAVE_FLA
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from tests.unit_tests.ssm.gated_delta_net_test_utils import GatedDeltaNetTestBase
+from tests.unit_tests.ssm.kernel_test_utils import HAVE_FLA
 
 
 @pytest.mark.parametrize("use_gdn2", [False, True], ids=["gdn", "gdn2"])
