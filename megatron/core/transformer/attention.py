@@ -397,6 +397,7 @@ class Attention(MegatronModule, ABC):
             self.config.recompute_granularity == 'selective'
             and "core_attn" in self.config.recompute_modules
         )
+        self._core_attn_checkpoint = None
 
         self.offload_qkv_linear = (
             self.config.fine_grained_activation_offloading
@@ -496,9 +497,18 @@ class Attention(MegatronModule, ABC):
         # tensor here and convert it back to AttnMaskType inside custom_forward.
         attn_mask_type = torch.tensor([attn_mask_type.value], dtype=torch.int)
         checkpoint_inputs[5] = attn_mask_type
-        hidden_states = tensor_parallel.checkpoint(custom_forward, False, *checkpoint_inputs)
+        self._core_attn_checkpoint = tensor_parallel.CheckpointWithoutOutput(
+            fp8=self.config.fp8 or self.config.fp4
+        )
+        hidden_states = self._core_attn_checkpoint.checkpoint(custom_forward, *checkpoint_inputs)
 
         return hidden_states
+
+    def _discard_core_attention_output(self, hook_tensor: torch.Tensor) -> None:
+        """Release core attention output after its last forward use, before backward needs it."""
+        if self._core_attn_checkpoint is not None:
+            self._core_attn_checkpoint.discard_output_and_register_recompute(hook_tensor)
+            self._core_attn_checkpoint = None
 
     def _run_core_attention(
         self,
@@ -1698,6 +1708,8 @@ class Attention(MegatronModule, ABC):
         attn_proj_manager = off_interface(self.offload_attn_proj, core_attn_out, "attn_proj")
         with attn_proj_manager as core_attn_out:
             output, bias = apply_module(self.linear_proj)(core_attn_out)
+        # Restore the attention output before the projection (and optional output gate) backward.
+        self._discard_core_attention_output(output)
         output = attn_proj_manager.group_offload(output, forced_released_tensors=[core_attn_out])
         nvtx_range_pop(suffix="linear_proj")
 

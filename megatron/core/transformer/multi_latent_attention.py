@@ -531,17 +531,21 @@ class MultiLatentAttention(Attention):
             # note that batch is a dummy dimension in the packed case
             core_attn_out = core_attn_out.reshape(core_attn_out.size(0), 1, -1)
 
-        if self.recompute_up_proj:
-            assert self.qkv_up_checkpoint is not None
-            self.qkv_up_checkpoint.discard_output_and_register_recompute(core_attn_out)
-            self.qkv_up_checkpoint = None
-
         # =================
         # Output. [sq, b, h]
         # =================
         attn_proj_manager = off_interface(self.offload_attn_proj, core_attn_out, "attn_proj")
         with attn_proj_manager as core_attn_out:
             output, bias = apply_module(self.linear_proj)(core_attn_out)
+
+        if self.recompute_up_proj:
+            assert self.qkv_up_checkpoint is not None
+            # Register on the same tensor in dependency order: Q/K/V must be restored before
+            # core attention is recomputed, and its output is needed by projection backward.
+            self.qkv_up_checkpoint.discard_output_and_register_recompute(output)
+            self.qkv_up_checkpoint = None
+        self._discard_core_attention_output(output)
+
         output = attn_proj_manager.group_offload(output, forced_released_tensors=[core_attn_out])
 
         return output, bias
