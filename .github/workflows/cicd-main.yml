@@ -433,13 +433,21 @@ jobs:
           - **\`cadence\`**: per-test trigger filter (recipe \`cadence:\` field). Recipes default to \`[pr, nightly, mergegroup]\`.
           - **\`run_mbridge\`**: whether to trigger the Megatron-Bridge downstream CI. Off for PR pushes by default; flip on by adding the _Run MBridge tests_ label.
           - **\`run_nemo_rl\`**: whether to trigger the NeMo RL downstream CI. Off for merge queue validation; PR authors can opt in by adding the _Run NeMoRL tests_ label.
-          - **\`selective_tests\`**: The _Run selective unit tests_ label opts a PR into impacted unit-test files plus the always-run baseline. Unlabeled PRs run the full unit-test suite. The _Run full unit tests_ label takes precedence. Functional-test labels do not change unit-test selection. Merge queues, nightly, and manual runs use the full suite.
+          - **\`selective_tests\`**: The _Run selective unit tests_ label opts a PR into impacted unit-test files plus the always-run baseline. Unlabeled PRs run the full unit-test suite. Docs-only PRs skip unit tests. The _Run full unit tests_ label takes precedence. Functional-test labels do not change unit-test selection. Merge queues, nightly, and manual runs use the full suite.
           SUMMARY
 
   linting:
     runs-on: ubuntu-latest
     needs: [pre-flight]
-    if: needs.pre-flight.outputs.is_deployment_workflow == 'false'
+    if: |
+      (
+        needs.pre-flight.outputs.is_deployment_workflow == 'false'
+          && needs.pre-flight.outputs.is_ci_workload == 'true'
+      ) || (
+        needs.pre-flight.outputs.is_deployment_workflow == 'false'
+          && needs.pre-flight.outputs.is_ci_workload == 'false'
+          && needs.pre-flight.outputs.docs_only == 'false'
+      )
     steps:
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -514,7 +522,8 @@ jobs:
     if: |
       !(needs.pre-flight.outputs.is_ci_workload == 'true'
       || needs.pre-flight.outputs.is_deployment_workflow == 'true'
-      || needs.pre-flight.outputs.is_merge_group == 'true')
+      || needs.pre-flight.outputs.is_merge_group == 'true'
+      || needs.pre-flight.outputs.docs_only == 'true')
     steps:
       - name: Running CI tests
         run: |
@@ -1080,16 +1089,8 @@ jobs:
           IS_MERGE_GROUP: ${{ needs.pre-flight.outputs.is_merge_group }}
           IS_CI_WORKLOAD: ${{ needs.pre-flight.outputs.is_ci_workload }}
           FORCE_RUN_ALL: ${{ needs.pre-flight.outputs.force_run_all }}
-          DOCS_ONLY: ${{ needs.pre-flight.outputs.docs_only }}
         shell: bash
         run: |
-          # Documentation PRs still run their unit-test baseline, but do not
-          # launch training workloads.
-          if [ "$DOCS_ONLY" = "true" ]; then
-            echo "should_run=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
           # (A) Approval gate
           approval=false
           if [ "$WAIT_RESULT" = "success" ] \
@@ -1419,10 +1420,9 @@ jobs:
           H100_RESULT: ${{ needs.cicd-integration-tests-latest-h100.result }}
           GB200_RESULT: ${{ needs.cicd-integration-tests-latest-gb200.result }}
         run: |
-          # Deployment workflows intentionally skip tests. Documentation PRs
-          # still require the always-run unit-test baseline.
-          if [ "$IS_DEPLOYMENT" == "true" ]; then
-            echo "✅ Deployment workflow — test checks skipped"
+          # Docs-only and deployment workflows intentionally skip all tests
+          if [ "$DOCS_ONLY" == "true" ] || [ "$IS_DEPLOYMENT" == "true" ]; then
+            echo "✅ Docs-only or deployment workflow — test checks skipped"
             exit 0
           fi
 
@@ -1447,7 +1447,7 @@ jobs:
             fi
           fi
 
-          if [ "$DOCS_ONLY" != "true" ] && [ "$H100_RESULT" != "success" ] && [ "$H100_RESULT" != "skipped-by-unit-failure" ]; then
+          if [ "$H100_RESULT" != "success" ] && [ "$H100_RESULT" != "skipped-by-unit-failure" ]; then
             echo "❌ cicd-integration-tests-latest-h100: $H100_RESULT"
             FAILED=true
           fi
@@ -1456,7 +1456,7 @@ jobs:
           if [ "$ENABLE_GB200_TESTING" == "true" ]; then
             # GB200 tests may be skipped only for non-maintainer PRs
             # (no GB200 runners available); maintainer runs must always succeed.
-            if [ "$DOCS_ONLY" != "true" ] && [ "$GB200_RESULT" == "skipped" ] && [ "$IS_MAINTAINER" == "true" ]; then
+            if [ "$GB200_RESULT" == "skipped" ] && [ "$IS_MAINTAINER" == "true" ]; then
               echo "❌ cicd-integration-tests-latest-gb200: skipped unexpectedly for a maintainer run"
               FAILED=true
             fi
@@ -1504,7 +1504,10 @@ jobs:
     runs-on: ubuntu-latest
     needs: [Nemo_CICD_Test, pre-flight]
     if: |
-      needs.pre-flight.outputs.is_deployment_workflow == 'true'
+      (
+        needs.pre-flight.outputs.docs_only == 'true'
+        || needs.pre-flight.outputs.is_deployment_workflow == 'true'
+      )
       && needs.pre-flight.outputs.is_ci_workload == 'false'
       && !cancelled()
       && github.repository == 'NVIDIA/Megatron-LM'
@@ -1533,14 +1536,13 @@ jobs:
 
   Coverage:
     runs-on: ubuntu-latest
-    needs: [Nemo_CICD_Test, pre-flight]
+    needs: [Nemo_CICD_Test]
     if: |
       (
         (needs.pre-flight.outputs.is_ci_workload == 'true' && !failure())
         || (needs.pre-flight.outputs.is_merge_group == 'true' && !failure())
         || success()
       )
-      && needs.pre-flight.outputs.is_deployment_workflow == 'false'
       && !cancelled()
       && github.repository == 'NVIDIA/Megatron-LM'
     strategy:

@@ -379,11 +379,13 @@ Path(args[args.index('--summary') + 1]).write_text('Full suite' if full else 'Se
         self.assertEqual(manifest["tested_sha"], tested_merge)
         self.assertIsNone(manifest["diff_base_sha"])
 
-    def test_docs_only_still_requires_unit_success_but_skips_training(self):
-        result, outputs = self._run("cicd-integration-gate", "gate", DOCS_ONLY="true")
+    def test_docs_only_skips_tests_and_accepts_skipped_results(self):
+        result, outputs = self._run(
+            "cicd-integration-gate", "gate", WAIT_RESULT="skipped", UNIT_RESULT="skipped"
+        )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(outputs["should_run"], "false")
-        for unit_result, expected_status in [("success", 0), ("skipped", 1), ("failure", 1)]:
+        for unit_result in ("success", "skipped"):
             with self.subTest(unit_result=unit_result):
                 result, _ = self._run(
                     "Nemo_CICD_Test",
@@ -393,16 +395,24 @@ Path(args[args.index('--summary') + 1]).write_text('Full suite' if full else 'Se
                     IS_MAINTAINER="true",
                     ENABLE_GB200_TESTING="true",
                     UNIT_RESULT=unit_result,
-                    UNIT_GB200_RESULT="success",
+                    UNIT_GB200_RESULT="skipped",
                     H100_RESULT="skipped",
                     GB200_RESULT="skipped",
                     GITHUB_RUN_ID="123",
                 )
-                self.assertEqual(result.returncode, expected_status, result.stderr)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("test checks skipped", result.stdout)
         jobs = self.workflow["jobs"]
-        self.assertNotIn("docs_only", jobs["linting"]["if"])
-        self.assertNotIn("docs_only", jobs["cicd-wait-in-queue"]["if"])
+        self.assertIn("needs.pre-flight.outputs.docs_only == 'false'", jobs["linting"]["if"])
+        self.assertIn(
+            "needs.pre-flight.outputs.docs_only == 'true'", jobs["cicd-wait-in-queue"]["if"]
+        )
         self.assertEqual(jobs["cicd-wait-in-queue"]["environment"], "test")
+        for job in ("cicd-container-build", "cicd-parse-unit-tests"):
+            self.assertIn("cicd-wait-in-queue", jobs[job]["needs"])
+            self.assertIn("success()", jobs[job]["if"])
+        self.assertIn("needs.pre-flight.outputs.docs_only == 'true'", jobs["Coverage_Fake"]["if"])
+        self.assertEqual(jobs["Coverage"]["needs"], ["Nemo_CICD_Test"])
 
     def test_collection_step_records_data_with_and_without_label(self):
         reporter = WORKFLOW.parents[1] / "scripts/report_unit_test_selection.py"

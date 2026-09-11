@@ -4,15 +4,15 @@
 
 Add the **`Run selective unit tests`** label to a PR to select H100 unit-test
 **files** affected by the whole PR diff using `pytest-impacted`, including
-transitive import dependencies. PRs without this label run the full unit-test
-suite, including documentation-only PRs, while recording the tests that would
-be selected. CI runs the `impacted-tests` command on every PR with a valid merge
-comparison, independently of the label. CI adds the 10 baseline files in
+transitive import dependencies. Non-documentation PRs without this label run the
+full unit-test suite while recording the tests that would be selected. Docs-only
+PRs retain the existing CI skips: no image build, unit-test selection, or GPU
+tests. For other PRs with a valid merge comparison, CI runs `impacted-tests`
+independently of the label. CI adds the 10 baseline files in
 [`unit_tests/always_run_tests.json`](unit_tests/always_run_tests.json)
 to every selection, maps the union to the existing buckets, and launches only
 buckets with selected files. Each file can contain multiple parametrized test
-cases. Documentation-only PRs with this label run the baseline after the usual
-CI authorization. `Run full unit tests` overrides selection and requests the
+cases. `Run full unit tests` overrides selection and requests the
 full suite when both labels are present.
 The existing GB200 hardware-specific marker suite remains enabled separately.
 
@@ -28,9 +28,9 @@ CI bucket. Changes to the baseline itself run the full suite for validation.
 
 | Build or change | Impact analysis | H100 unit tests executed |
 | --- | --- | --- |
-| PR without `Run selective unit tests`, including documentation-only PRs | Record proposed selection | Full suite |
+| Non-documentation PR without `Run selective unit tests` | Record proposed selection | Full suite |
 | PR labeled `Run selective unit tests`, source or test changes | Record proposed selection | Affected files plus the baseline |
-| Documentation-only PR labeled `Run selective unit tests` | Record proposed selection | Baseline only |
+| Documentation-only PR | Skipped | Skipped |
 | PR labeled `Run full unit tests`, including when both labels are present | Record proposed selection | Full suite |
 | Merge queue, nightly/CI workload, manual dispatch | No PR analysis | Full suite |
 | High-impact or unsupported PR change | Record command result and full-suite policy reason | Full suite |
@@ -42,7 +42,7 @@ they do not enable or disable unit-test selection. The older
 Use `Run selective unit tests`; analysis always covers the entire PR, including
 changes in earlier commits. The full-suite override takes precedence.
 
-For every PR, CI compares the exact synthetic merge commit being built and
+For each analyzed PR, CI compares the exact synthetic merge commit being built and
 tested with its first parent (`git diff HEAD^1 HEAD`). That parent is the
 revision of `main` used to create the merge, so the comparison includes all PR
 changes without including unrelated changes already on `main`. It does not
