@@ -810,54 +810,53 @@ def test_dynamic_cp_indexer_reduction_initializes_empty_pp_stage(monkeypatch):
         helper.tracker.clear()
 
 
-def test_zero_size_agreement_is_renegotiated(monkeypatch):
-    """An empty first call must not permanently suppress later tracker initialization."""
+def test_initialized_zero_capacity_does_not_renegotiate_and_write_fails_fast(monkeypatch):
+    """A finalized empty model stays empty and rejects an unexpected metric writer."""
     helper = dsa_module.DSAIndexerLossLoggingHelper
     pp_group = object()
     dp_group = object()
     calls = []
     helper.tracker.clear()
 
-    def all_reduce(tensor, op=None, group=None):
-        calls.append((group, op, tuple(tensor.shape)))
-
-    monkeypatch.setattr(torch.distributed, "all_reduce", all_reduce)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
+    monkeypatch.setattr(
+        torch.distributed,
+        "all_reduce",
+        lambda tensor, op=None, group=None: calls.append((group, op, tuple(tensor.shape))),
+    )
 
     try:
-        helper.reduce_loss_in_tracker(num_layers=0, pp_group=pp_group, dp_group=dp_group)
+        size = dsa_logging_module.initialize_dsa_metric_tracker(
+            torch.nn.Module(), SimpleNamespace(pp=pp_group)
+        )
+
+        assert size == 0
         assert "values" not in helper.tracker
-        assert "agreed_size" not in helper.tracker
+        assert helper.tracker["agreed_size"] == 0
+        assert helper.tracker["agreed_size_pp_group"] is pp_group
 
         helper.reduce_loss_in_tracker(num_layers=3, pp_group=pp_group, dp_group=dp_group)
-        assert calls == [
-            (pp_group, torch.distributed.ReduceOp.MAX, (1,)),
-            (pp_group, torch.distributed.ReduceOp.MAX, (1,)),
-            (pp_group, None, (3,)),
-            (dp_group, torch.distributed.ReduceOp.AVG, (3,)),
-        ]
-        assert helper.tracker["values"].shape == (3,)
-        assert helper.tracker["agreed_size"] == 3
-        assert helper.tracker["agreed_size_pp_group"] is pp_group
+        assert calls == []
+        assert "values" not in helper.tracker
+
+        with pytest.raises(RuntimeError, match="fixed capacity is too small"):
+            helper.save_loss_to_tracker(loss=torch.tensor(1.0), layer_number=1, num_layers=1)
     finally:
         helper.tracker.clear()
 
 
-def test_reduction_rejects_capture_from_different_pp_group():
-    """Captured tracker storage cannot be resized through another PP domain."""
+def test_reduction_rejects_initialized_tracker_from_different_pp_group():
+    """A fixed-capacity tracker cannot be reduced through another PP domain."""
     helper = dsa_module.DSAIndexerLossLoggingHelper
-    capture_group = object()
+    initialized_group = object()
     reduction_group = object()
     helper.tracker.clear()
     helper.tracker.update(
-        {
-            "values": torch.zeros(1),
-            "capture_prepared_size": 1,
-            "capture_prepared_pp_group": capture_group,
-        }
+        {"values": torch.zeros(1), "agreed_size": 1, "agreed_size_pp_group": initialized_group}
     )
 
     try:
-        with pytest.raises(RuntimeError, match="capture and reduction use different PP groups"):
+        with pytest.raises(RuntimeError, match="cached size belongs to a different PP group"):
             helper.reduce_loss_in_tracker(num_layers=1, pp_group=reduction_group)
     finally:
         helper.tracker.clear()
@@ -877,9 +876,6 @@ def test_reduction_accepts_recreated_pp_group_with_same_ranks(monkeypatch):
             "agreed_size": 1,
             "agreed_size_pp_group": old_pp_group,
             "agreed_size_pp_ranks": (0, 1),
-            "capture_prepared_size": 1,
-            "capture_prepared_pp_group": old_pp_group,
-            "capture_prepared_pp_ranks": (0, 1),
         }
     )
     monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
@@ -933,8 +929,9 @@ def test_dynamic_cp_indexer_reduction_rejects_wrong_parent_domain(monkeypatch):
         )
 
 
-def test_dsv4_metric_logging_preserves_graph_groups_and_uses_indexer_layer_count(monkeypatch):
-    """CUDA Graph reuse keeps groups, and only ratio-4 DSv4 layers enter the average."""
+@pytest.mark.parametrize("preserve_groups", (None, True))
+def test_dsv4_metric_logging_clears_values_and_handles_groups(monkeypatch, preserve_groups):
+    """Metric logging clears values and only graph paths retain reduction groups."""
     helper = dsa_module.DSAIndexerLossLoggingHelper
     reduce_group = object()
     avg_group = object()
@@ -963,16 +960,19 @@ def test_dsv4_metric_logging_preserves_graph_groups_and_uses_indexer_layer_count
     )
 
     try:
+        preserve_groups_kwarg = (
+            {} if preserve_groups is None else {"preserve_groups": preserve_groups}
+        )
         helper.track_indexer_metrics(
             loss_scale=0.5,
             iteration=7,
             writer=Writer(),
             num_indexer_layers=2,
-            preserve_groups=True,
             dynamic_cp_parent_group=avg_group,
             configured_cp_size=4,
             pp_group=reduce_group,
             dp_group=avg_group,
+            **preserve_groups_kwarg,
         )
 
         assert reduced_with == [(avg_group, 4, reduce_group, avg_group)]
@@ -982,7 +982,7 @@ def test_dsv4_metric_logging_preserves_graph_groups_and_uses_indexer_layer_count
         torch.testing.assert_close(value, torch.tensor(2.0))
         assert iteration == 7
         torch.testing.assert_close(helper.tracker["values"], torch.zeros(4))
-        assert helper.tracker["reduce_group"] is reduce_group
-        assert helper.tracker["avg_group"] is avg_group
+        assert helper.tracker["reduce_group"] is (reduce_group if preserve_groups else None)
+        assert helper.tracker["avg_group"] is (avg_group if preserve_groups else None)
     finally:
         helper.tracker.clear()

@@ -119,6 +119,7 @@ from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
 from megatron.core.transformer.experimental_attention_variant.dsa import is_dsa_skip_topk_layer
 from megatron.core.transformer.experimental_attention_variant.dsa_logging import (
     DSAIndexerLossLoggingHelper,
+    initialize_dsa_metric_tracker,
     resolve_dsa_metric_pg_collection,
 )
 from megatron.core.transformer.module import Float16Module
@@ -435,9 +436,10 @@ def _dsa_indexer_flops(
     only the model's defining GEMMs enter the estimate, not auxiliary-loss or
     sorting work.
 
-    Only ``num_indexer_layers`` layers pay: with cross-layer index sharing
-    (``dsa_indexer_topk_freq``) the layers in between reuse the most recent
-    top-k (see ``is_dsa_skip_topk_layer``).
+    Only ``num_indexer_layers`` indexer executions pay: with cross-layer index
+    sharing (``dsa_indexer_topk_freq``) the layers in between reuse the most
+    recent top-k (see ``is_dsa_skip_topk_layer``). Repeated MTP may execute the
+    same physical indexer multiple times.
 
     The indexer does NOT get the global fwd+bwd factor of 3. It is trained
     only by its own KL loss, so ``DSAttention.forward`` runs it under
@@ -481,24 +483,53 @@ def _dsa_indexer_flops(
     )
 
 
-def _num_dsa_indexer_layers(num_layers, skip_topk_offset, topk_freq):
-    """Count layers that compute their own DSA index (the rest reuse one).
+def _standard_layer_numbers_for_execution(
+    num_decoder_layers, *, mtp_num_layers=0, mtp_use_repeated_layer=False
+):
+    """Return standard-model layer numbers in their runtime execution order.
 
-    On the standard-model path every layer is a DSA attention layer (MTP
-    layers included -- ``DSAttention.__init__`` numbers them
-    ``layer_number + config.num_layers``, which is exactly how the caller
-    extends ``num_layers``), so the predicate runs over the whole
-    ``1..num_layers`` range.
+    Decoder layers use global numbers ``1..N``. Independent MTP layers use
+    ``N+1..N+D``, while repeated MTP builds only layer ``N+1`` and executes it
+    ``D`` times.
     """
+    layer_numbers = list(range(1, num_decoder_layers + 1))
+    mtp_num_layers = mtp_num_layers or 0
+    if mtp_use_repeated_layer and mtp_num_layers > 0:
+        layer_numbers.extend([num_decoder_layers + 1] * mtp_num_layers)
+    else:
+        layer_numbers.extend(range(num_decoder_layers + 1, num_decoder_layers + mtp_num_layers + 1))
+    return layer_numbers
+
+
+def _num_dsa_indexer_layers(
+    num_decoder_layers,
+    skip_topk_offset,
+    topk_freq,
+    *,
+    mtp_num_layers=0,
+    mtp_use_repeated_layer=False,
+):
+    """Count DSA indexer executions on the standard-model path.
+
+    Cross-layer top-k sharing is tied to the physical layer number, so repeated
+    MTP either executes its one indexer ``D`` times or reuses top-k ``D`` times.
+    """
+
+    def computes_index(layer_number):
+        return not is_dsa_skip_topk_layer(layer_number, skip_topk_offset or 0, topk_freq or 1)
+
     return sum(
-        1
-        for layer_number in range(1, num_layers + 1)
-        if not is_dsa_skip_topk_layer(layer_number, skip_topk_offset or 0, topk_freq or 1)
+        computes_index(layer_number)
+        for layer_number in _standard_layer_numbers_for_execution(
+            num_decoder_layers,
+            mtp_num_layers=mtp_num_layers,
+            mtp_use_repeated_layer=mtp_use_repeated_layer,
+        )
     )
 
 
 def _num_hybrid_dsa_indexer_layers(hybrid_layer_pattern, num_layers, skip_topk_offset, topk_freq):
-    """Count DSA indexers at their actual main and nested-MTP layer numbers."""
+    """Count DSA indexer executions at actual main and nested-MTP layer numbers."""
     from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols, parse_hybrid_pattern
 
     parsed = parse_hybrid_pattern(hybrid_layer_pattern)
@@ -1315,6 +1346,14 @@ def num_floating_point_operations(
                 f"Invalid length of csa_compress_ratios: {len(compress_ratios)}, "
                 f"expected num_layers + mtp_num_layers ({num_layers})."
             )
+            compress_ratios = [
+                compress_ratios[layer_number - 1]
+                for layer_number in _standard_layer_numbers_for_execution(
+                    args.num_layers,
+                    mtp_num_layers=mtp_num_layers,
+                    mtp_use_repeated_layer=getattr(args, "mtp_use_repeated_layer", False),
+                )
+            ]
             # ratio == 0: window-only; ratio == 4: window + topk compressed KV
             # (compressor + indexer); ratio == 128: window + all compressed KV.
             dsv4_token_term, dsv4_core_term = _dsv4_hybrid_self_attention_flops(
@@ -1380,7 +1419,11 @@ def num_floating_point_operations(
                 n_heads=args.dsa_indexer_n_heads,
                 head_dim=args.dsa_indexer_head_dim,
                 num_indexer_layers=_num_dsa_indexer_layers(
-                    num_layers, args.dsa_indexer_skip_topk_offset, args.dsa_indexer_topk_freq
+                    args.num_layers,
+                    args.dsa_indexer_skip_topk_offset,
+                    args.dsa_indexer_topk_freq,
+                    mtp_num_layers=mtp_num_layers,
+                    mtp_use_repeated_layer=getattr(args, "mtp_use_repeated_layer", False),
                 ),
                 indexer_loss_coeff=args.dsa_indexer_loss_coeff,
             )
@@ -2985,6 +3028,11 @@ def setup_model_and_optimizer(
         torch.distributed.barrier()
         exit()
 
+    # Match training_log's activation gate so every enabled writer is reduced and cleared once
+    # per step. Establish its PP-agreed capacity before the first forward/capture.
+    if (getattr(args, "dsa_indexer_loss_coeff", None) or 0.0) > 0:
+        initialize_dsa_metric_tracker(unwrapped_model, pg_collection)
+
     return model, optimizer, opt_param_scheduler
 
 
@@ -3710,7 +3758,17 @@ def training_log(
                 dynamic_cp_parent_group = mpu.get_data_parallel_group(with_context_parallel=True)
         tracked_layers = args.num_layers + (args.mtp_num_layers or 0)
         if args.csa_compress_ratios is not None:
-            num_indexer_layers = sum(ratio == 4 for ratio in args.csa_compress_ratios)
+            compress_ratios = args.csa_compress_ratios
+            if not is_hybrid_model(args):
+                compress_ratios = [
+                    compress_ratios[layer_number - 1]
+                    for layer_number in _standard_layer_numbers_for_execution(
+                        args.num_layers,
+                        mtp_num_layers=args.mtp_num_layers,
+                        mtp_use_repeated_layer=getattr(args, "mtp_use_repeated_layer", False),
+                    )
+                ]
+            num_indexer_layers = sum(ratio == 4 for ratio in compress_ratios)
         elif is_hybrid_model(args):
             num_indexer_layers = _num_hybrid_dsa_indexer_layers(
                 args.hybrid_layer_pattern,
@@ -3720,7 +3778,11 @@ def training_log(
             )
         else:
             num_indexer_layers = _num_dsa_indexer_layers(
-                tracked_layers, args.dsa_indexer_skip_topk_offset, args.dsa_indexer_topk_freq
+                args.num_layers,
+                args.dsa_indexer_skip_topk_offset,
+                args.dsa_indexer_topk_freq,
+                mtp_num_layers=args.mtp_num_layers,
+                mtp_use_repeated_layer=getattr(args, "mtp_use_repeated_layer", False),
             )
         DSAIndexerLossLoggingHelper.track_indexer_metrics(
             loss_scale=indexer_loss_scale,

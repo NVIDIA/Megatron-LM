@@ -34,7 +34,6 @@ def _reset_full_cuda_graph_state():
     FullCudaGraphWrapper.curr_iteration = {'training': 0, 'validation': 0}
     FullCudaGraphWrapper.cuda_graph = {'training': None, 'validation': None}
     FullCudaGraphWrapper.result = {'training': None, 'validation': None}
-    FullCudaGraphWrapper._dsa_metric_tracker_prepared = False
     StaticBufferLoader.static_buffers = {'training': [], 'validation': []}
 
 
@@ -52,85 +51,6 @@ def reset_full_cuda_graph_state():
     DSAIndexerLossLoggingHelper.tracker = {}
     Utils.destroy_model_parallel()
     gc.collect()
-
-
-def test_full_graph_reset_clears_capture_state_only_after_last_graph(monkeypatch):
-    """Training and validation graphs share tracker storage until both are released."""
-    from types import SimpleNamespace
-
-    from megatron.core.transformer.experimental_attention_variant.dsa_logging import (
-        prepare_dsa_metric_tracker_for_capture,
-    )
-
-    class MetricModule(torch.nn.Module):
-        logs_dsa_indexer_loss = True
-
-        def __init__(self):
-            super().__init__()
-            self.layer_number = 5
-            self.config = SimpleNamespace(num_layers=5, mtp_num_layers=None)
-
-    pp_group = object()
-    values = torch.zeros(2)
-    reduce_group = object()
-    DSAIndexerLossLoggingHelper.tracker = {
-        "values": values,
-        "reduce_group": reduce_group,
-        "agreed_size": 2,
-        "agreed_size_pp_group": pp_group,
-        "capture_prepared_size": 2,
-        "capture_prepared_pp_group": pp_group,
-        "capture_prepared_pp_ranks": (0,),
-    }
-    FullCudaGraphWrapper.cuda_graph = {"training": object(), "validation": object()}
-    FullCudaGraphWrapper._dsa_metric_tracker_prepared = True
-    wrapper = object.__new__(FullCudaGraphWrapper)
-
-    wrapper.reset_cuda_graph("training")
-    assert DSAIndexerLossLoggingHelper.tracker["capture_prepared_size"] == 2
-
-    wrapper.reset_cuda_graph("validation")
-    tracker = DSAIndexerLossLoggingHelper.tracker
-    assert tracker["values"] is values
-    assert tracker["reduce_group"] is reduce_group
-    assert tracker["agreed_size"] == 2
-    assert "capture_prepared_size" not in tracker
-    assert "capture_prepared_pp_group" not in tracker
-    assert "capture_prepared_pp_ranks" not in tracker
-
-    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
-    model = torch.nn.Module()
-    model.add_module("metric", MetricModule())
-    assert prepare_dsa_metric_tracker_for_capture(model, pp_group) == 5
-    assert tracker["values"].shape == (5,)
-
-
-def test_full_graph_reset_preserves_unowned_dsa_capture_state():
-    """A full graph without DSA writers must not clear another model's capture state."""
-    pp_group = object()
-    values = torch.tensor([3.0, 5.0])
-    reduce_group = object()
-    DSAIndexerLossLoggingHelper.tracker = {
-        "values": values,
-        "reduce_group": reduce_group,
-        "agreed_size": 2,
-        "agreed_size_pp_group": pp_group,
-        "capture_prepared_size": 2,
-        "capture_prepared_pp_group": pp_group,
-    }
-    FullCudaGraphWrapper.cuda_graph["training"] = object()
-    wrapper = object.__new__(FullCudaGraphWrapper)
-
-    wrapper.reset_cuda_graph("training")
-
-    tracker = DSAIndexerLossLoggingHelper.tracker
-    assert tracker["values"] is values
-    torch.testing.assert_close(values, torch.tensor([3.0, 5.0]))
-    assert tracker["reduce_group"] is reduce_group
-    assert tracker["agreed_size"] == 2
-    assert tracker["agreed_size_pp_group"] is pp_group
-    assert tracker["capture_prepared_size"] == 2
-    assert tracker["capture_prepared_pp_group"] is pp_group
 
 
 @pytest.mark.skipif(
@@ -246,13 +166,14 @@ def test_forward_backward_func_with_full_cuda_graph(mocker):
 
 
 def test_full_cuda_graph_capture_counts_dsa_metric_once():
-    """Discard capture-time DSA metric writes before replaying the real iteration."""
+    """Capture records the DSA write; replay preserves prior state and executes it once."""
     initialize_rng_tracker(force_reset=True)
     Utils.initialize_model_parallel(tensor_model_parallel_size=1, pipeline_model_parallel_size=1)
 
-    values = torch.zeros(1, device="cuda")
+    values = torch.full((1,), 7.0, device="cuda")
     DSAIndexerLossLoggingHelper.tracker = {
         "values": values,
+        "agreed_size": 1,
         "reduce_group": None,
         "avg_group": None,
     }
@@ -279,10 +200,24 @@ def test_full_cuda_graph_capture_counts_dsa_metric_once():
     )
 
     assert DSAIndexerLossLoggingHelper.tracker["values"] is values
-    torch.testing.assert_close(values, torch.ones_like(values))
-    torch.testing.assert_close(result[0], torch.ones_like(result[0]))
+    torch.testing.assert_close(values, torch.full_like(values, 8.0))
+    torch.testing.assert_close(result[0], torch.full_like(result[0], 8.0))
     assert DSAIndexerLossLoggingHelper.tracker["reduce_group"] is reduce_group
     assert DSAIndexerLossLoggingHelper.tracker["avg_group"] is avg_group
+
+
+def test_full_cuda_graph_capture_requires_initialized_dsa_tracker():
+    """A custom full-iteration caller cannot lazily allocate storage during capture."""
+    model = torch.nn.Module()
+    model.logs_dsa_indexer_loss = True
+    model.layer_number = 1
+    wrapped = FullCudaGraphWrapper(lambda **_kwargs: pytest.fail("capture started"), 0)
+    wrapped.data_read = lambda *_args: []
+
+    with pytest.raises(RuntimeError, match="initialized before CUDA Graph capture"):
+        wrapped(
+            data_iterator=[], model=[model], num_microbatches=1, seq_length=1, forward_only=True
+        )
 
 
 @pytest.mark.skipif(
@@ -422,7 +357,6 @@ def test_full_cuda_graph_training_with_mhc_recompute():
         FullCudaGraphWrapper.cuda_graph = {'training': None, 'validation': None}
         FullCudaGraphWrapper.result = {'training': None, 'validation': None}
         FullCudaGraphWrapper.curr_iteration = {'training': 0, 'validation': 0}
-        FullCudaGraphWrapper._dsa_metric_tracker_prepared = False
         StaticBufferLoader.static_buffers = {'training': [], 'validation': []}
 
     def build_model():
