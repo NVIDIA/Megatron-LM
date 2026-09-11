@@ -1097,6 +1097,19 @@ class DynamicInferenceRequestRecord:
             new_request.event_add_engine = old_request.event_add_engine
         else:
             new_request.add_event_add_engine()
+
+        # The first segment supplies the original prompt to merge(), and the
+        # newest segment must remain on the active device for re-admission. A
+        # superseded intermediate segment only serves as history, so keeping
+        # its cumulative prompt on CUDA causes repeated checkpoints to retain
+        # overlapping, steadily growing GPU allocations.
+        if len(self.requests) > 1:
+            old_prompt_tokens = old_request.prompt_tokens
+            old_request.prompt_tokens = old_prompt_tokens.cpu()
+            if old_request.remaining_prompt_tokens is old_prompt_tokens:
+                old_request.remaining_prompt_tokens = old_request.prompt_tokens
+            elif old_request.remaining_prompt_tokens is not None:
+                old_request.remaining_prompt_tokens = old_request.remaining_prompt_tokens.cpu()
         self.requests.append(new_request)
 
     def merge(self, tokenizer: MegatronTokenizer | None = None) -> DynamicInferenceRequest:
