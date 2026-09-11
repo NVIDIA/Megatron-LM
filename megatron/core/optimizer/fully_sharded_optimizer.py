@@ -13,33 +13,9 @@ from ..distributed.fsdp.src.megatron_fsdp.experimental.parameter_group import (
     sync_model_weights_from_main_weights,
 )
 from ..transformer.module import MegatronModule
-from ..utils import is_te_min_version
 from .grad_scaler import MegatronGradScaler
 from .optimizer import MixedPrecisionOptimizer
 from .optimizer_config import OptimizerConfig
-
-# First TransformerEngine release that handles empty parameter-group tensors correctly:
-# FusedAdam used to silently skip pending updates when a group ended in an empty tensor
-# (https://github.com/NVIDIA/TransformerEngine/issues/3207), fixed by
-# https://github.com/NVIDIA/TransformerEngine/pull/3212 and released in TE 2.18.
-# NVIDIA/TransformerEngine#3202 (out-of-bounds metadata writes when a zero-numel tensor
-# lands in the last multi-tensor-apply slot) is still open, so 2.18 retires the
-# lost-update hazard this workaround exists for, not every empty-tensor hazard.
-_TE_VERSION_FIXES_EMPTY_PARAMS = "2.18"
-
-
-def needs_empty_shard_workaround() -> bool:
-    """Whether empty local shards must still be kept out of the optimizer param groups.
-
-    Shared gate for both halves of the TransformerEngine empty-parameter workaround: the
-    param-group filter in ``megatron/core/optimizer/__init__.py`` and the compensating
-    ``model_chunk.zero_grad()`` loop in :meth:`FullyShardedOptimizer.zero_grad`. They have
-    to switch together. Filtering empty shards out of the optimizer groups without the
-    loop leaves those parameters holding a stale ``sharded.grad``, and
-    ``FsdpParameterGroup._has_sharded_grads()`` then raises "FSDP sharded gradients must
-    be either all set or all None."
-    """
-    return not is_te_min_version(_TE_VERSION_FIXES_EMPTY_PARAMS)
 
 
 def count_replication(tensor: DTensor) -> int:
@@ -228,7 +204,7 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
 
     @override
     def zero_grad(self, set_to_none: bool = True) -> None:
-        """Clear optimizer-visible sharded grads and any grads filtered from local groups."""
+        """Clear optimizer-visible sharded grads."""
         # install_sharded_grads() binds .grad to a persistent main_grad view from
         # Python during backward, and graph replay re-executes only GPU kernels. So
         # unbinding here is never undone on a replayed step: .grad stays None, the
@@ -243,16 +219,6 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
 
         if not self.is_stub_optimizer:
             self.optimizer.zero_grad(set_to_none=set_to_none)
-
-        if needs_empty_shard_workaround():
-            # Empty local DTensor shards are filtered out of optimizer param groups
-            # as a TE FusedAdam workaround. A rank with no local optimizer params
-            # can still have stale module grads to clear.
-            #
-            # Keep this below the cuda_graph_impl override above: under full-iteration
-            # CUDA graphs it must zero the grads in place instead of unbinding them.
-            for model_chunk in self.model_chunks:
-                model_chunk.zero_grad(set_to_none=set_to_none)
 
     def _copy_model_grads_to_main_grads(self) -> None:
         """Install optimizer-compatible gradients for non-precision-aware optimizers."""
