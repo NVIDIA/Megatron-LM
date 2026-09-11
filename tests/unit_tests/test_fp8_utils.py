@@ -29,10 +29,26 @@ reason_for_no_mxfp8 = "MXFP8 requires Transformer Engine and device arch >= 10"
     [
         (
             False,
-            {"fp8": "hybrid", "fp4": None, "fp8_param": False, "fp4_param": False},
+            {
+                "fp8": "hybrid",
+                "fp4": None,
+                "fp8_param": False,
+                "fp4_param": False,
+                "buffer_transformer_engine_calibration_metadata": False,
+            },
             "fp8_autocast",
         ),
-        (True, {"fp8": None, "fp4": None, "fp8_param": True, "fp4_param": False}, "fp8_model_init"),
+        (
+            True,
+            {
+                "fp8": None,
+                "fp4": None,
+                "fp8_param": True,
+                "fp4_param": False,
+                "buffer_transformer_engine_calibration_metadata": False,
+            },
+            "fp8_model_init",
+        ),
     ],
 )
 def test_get_fp8_disabled_context_uses_disabled_te_context(is_init, config_values, te_helper):

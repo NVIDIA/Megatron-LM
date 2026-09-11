@@ -548,6 +548,7 @@ def create_args(run_config):
     args.swiglu = True
     args.num_experts = 1
     args.verify_integrity = False
+    args.buffer_transformer_engine_calibration_metadata = False
 
     yield args
 
@@ -658,6 +659,7 @@ def test_save_checkpoint(
 
     args.use_distributed_optimizer = ckpt_format != "torch_dcp"
     args.use_dist_ckpt = ckpt_format != "torch"
+    args.buffer_transformer_engine_calibration_metadata = ckpt_format == "torch"
 
     config = TransformerConfig(num_layers=1, kv_channels=1)
     model = MockModel(config)
@@ -684,7 +686,9 @@ def test_save_checkpoint(
         with mock.patch(
             "megatron.training.checkpointing.maybe_save_dataloader_state",
             wraps=maybe_save_dataloader_state,
-        ) as save_dataloader_state:
+        ) as save_dataloader_state, mock.patch(
+            "megatron.training.checkpointing.add_ptq_calibration_metadata_to_state_dict"
+        ) as export_calibration_metadata:
             save_checkpoint(
                 iteration,
                 [model],
@@ -694,6 +698,11 @@ def test_save_checkpoint(
                 cp_group=cp_group,
             )
         assert save_dataloader_state.call_args.kwargs["cp_group"] is cp_group
+        if args.buffer_transformer_engine_calibration_metadata:
+            export_calibration_metadata.assert_called_once()
+            assert export_calibration_metadata.call_args.args[1] == [model]
+        else:
+            export_calibration_metadata.assert_not_called()
 
         with open(args.save / "latest_checkpointed_iteration.txt", "r") as f:
             assert iteration == int(f.read())
