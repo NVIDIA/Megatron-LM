@@ -1006,7 +1006,7 @@ class InferenceStateHandoffMixin:
 
                 stop_word_hit = False
                 if request.stop_word_ids:
-                    stop_word_hit, _ = self._check_stop_words_for_request_post_append(request)
+                    stop_word_hit, _, _ = self._check_stop_words_for_request_post_append(request)
                 if first_token == request.sampling_params.termination_id or stop_word_hit:
                     request.sampling_params.num_tokens_to_generate = len(request.generated_tokens)
 

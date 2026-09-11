@@ -41,6 +41,7 @@ from megatron.core.inference.engines import DynamicInferenceEngine, dynamic_engi
 from megatron.core.inference.engines.dynamic_engine import EngineState
 from megatron.core.inference.headers import Headers
 from megatron.core.inference.inference_request import (
+    DynamicInferenceEventType,
     DynamicInferenceRequest,
     DynamicInferenceRequestRecord,
     DynamicVLMInferenceRequest,
@@ -1562,6 +1563,159 @@ def test_streaming_partials_buffer_until_token_interval():
 
     engine.socket_for_receiving_requests.send_multipart.assert_called_once()
     assert engine._partial_emit_lengths == {7: 3}
+
+
+def _generated_event_tokens(request):
+    return [
+        event.payload["token_id"]
+        for event in request.events
+        if event.type == DynamicInferenceEventType.GENERATED_TOKEN
+    ]
+
+
+def test_stop_word_strip_across_decode_steps_trims_stored_metadata():
+    """A multi-token stop spanning decode steps strips earlier token metadata too."""
+    request = DynamicInferenceRequest(
+        request_id=31,
+        prompt_tokens=torch.tensor([1, 2, 3, 4]),
+        sampling_params=SamplingParams(
+            num_tokens_to_generate=8,
+            return_log_probs=True,
+            top_n_logprobs=1,
+            skip_prompt_log_probs=True,
+            detokenize_stop_sequence=False,
+        ),
+        stop_word_ids=[[8, 9]],
+        generated_tokens=[10, 8],
+        generated_log_probs=[-0.1, -0.2],
+        generated_top_n_logprobs=[{"10": -0.1}, {"8": -0.2}],
+        generated_length=2,
+    )
+    request.add_event_generated_token(10)
+    request.add_event_generated_token(8)
+    request.generated_tokens.append(9)
+    request.add_event_generated_token(9)
+    record = DynamicInferenceRequestRecord.from_request(request)
+    engine = types.SimpleNamespace(num_speculative_tokens=0)
+
+    hit, pending_trim, prompt_score_trim = (
+        DynamicInferenceEngine._check_stop_words_for_request_post_append(
+            engine, request, record=record, num_new_tokens=1
+        )
+    )
+    pending_log_probs = [-0.3][:-pending_trim] if pending_trim else [-0.3]
+    pending_top_n = [{"9": -0.3}][:-pending_trim] if pending_trim else [{"9": -0.3}]
+    request.generated_log_probs.extend(pending_log_probs)
+    request.generated_top_n_logprobs.extend(pending_top_n)
+    merged = record.merge()
+
+    assert hit
+    assert (pending_trim, prompt_score_trim) == (1, 0)
+    assert merged.generated_tokens == [10]
+    assert merged.generated_log_probs == [-0.1]
+    assert merged.generated_top_n_logprobs == [{"10": -0.1}]
+    assert merged.generated_length == 1
+    assert _generated_event_tokens(merged) == merged.generated_tokens
+
+
+@pytest.mark.parametrize("keep_stop", [False, True], ids=["strip", "keep"])
+@pytest.mark.parametrize(
+    "prompt_scores_already_stored", [False, True], ids=["pending-scores", "stored-scores"]
+)
+def test_stop_word_checkpoint_boundary_preserves_result_alignment(
+    keep_stop, prompt_scores_already_stored
+):
+    """Stop matching and result metadata remain continuous across a checkpoint."""
+    request = DynamicInferenceRequest(
+        request_id=32,
+        prompt_tokens=torch.tensor([1, 2, 3, 4]),
+        sampling_params=SamplingParams(
+            num_tokens_to_generate=8,
+            return_log_probs=True,
+            top_n_logprobs=1,
+            skip_prompt_log_probs=False,
+            detokenize_stop_sequence=keep_stop,
+        ),
+        stop_word_ids=[[8, 9]],
+        generated_tokens=[10, 8],
+        generated_log_probs=[-0.1, -0.2],
+        generated_top_n_logprobs=[{"10": -0.1}, {"8": -0.2}],
+        tpot=[0.01, 0.02],
+    )
+    request.add_event_generated_token(10)
+    request.add_event_generated_token(8)
+    record = DynamicInferenceRequestRecord.from_request(request)
+    record.checkpoint()
+    current = record[-1]
+    prompt_log_probs = [-1.0, -1.1, -1.2, -1.3, -1.4]
+    prompt_top_n = [{"p1": -1.0}, {"p2": -1.1}, {"p3": -1.2}, {"p4": -1.3}, {"p5": -1.4}]
+    if prompt_scores_already_stored:
+        current.prompt_log_probs = list(prompt_log_probs)
+        current.prompt_top_n_logprobs = list(prompt_top_n)
+    current.generated_tokens.extend([9, 99])
+    current.tpot.extend([0.03, 0.04])
+    current.add_event_generated_token(9)
+    current.add_event_generated_token(99)
+    original_current_prompt = current.prompt_tokens.clone()
+    engine = types.SimpleNamespace(num_speculative_tokens=1)
+
+    hit, pending_trim, prompt_score_trim = (
+        DynamicInferenceEngine._check_stop_words_for_request_post_append(
+            engine, current, record=record, num_new_tokens=2
+        )
+    )
+
+    # A checkpoint prefill returns scores for its cumulative prompt followed
+    # by the newly generated tokens. Apply the same tail trimming and split as
+    # post_process_requests to validate both score classes.
+    step_log_probs = ([] if prompt_scores_already_stored else prompt_log_probs) + [-0.3, -0.4]
+    step_top_n = ([] if prompt_scores_already_stored else prompt_top_n) + [
+        {"9": -0.3},
+        {"99": -0.4},
+    ]
+    score_trim = pending_trim + prompt_score_trim
+    if score_trim:
+        step_log_probs = step_log_probs[:-score_trim]
+        step_top_n = step_top_n[:-score_trim]
+    if current.prompt_log_probs is None:
+        current.prompt_log_probs = []
+    if current.prompt_top_n_logprobs is None:
+        current.prompt_top_n_logprobs = []
+    prompt_score_count = len(current.prompt_tokens) - 1
+    remaining_prompt_scores = max(0, prompt_score_count - len(current.prompt_log_probs))
+    current.prompt_log_probs.extend(step_log_probs[:remaining_prompt_scores])
+    current.generated_log_probs = step_log_probs[remaining_prompt_scores:]
+    current.prompt_top_n_logprobs.extend(step_top_n[:remaining_prompt_scores])
+    current.generated_top_n_logprobs = step_top_n[remaining_prompt_scores:]
+    merged = record.merge()
+    serialized = merged.serialize()
+
+    assert hit
+    if keep_stop:
+        assert (pending_trim, prompt_score_trim) == (1, 0)
+        assert torch.equal(current.prompt_tokens, original_current_prompt)
+        assert current.remaining_prompt_tokens.tolist() == original_current_prompt.tolist()
+        assert merged.generated_tokens == [10, 8, 9]
+        assert merged.generated_log_probs == [-0.1, -0.2, -0.3]
+        assert merged.generated_top_n_logprobs == [{"10": -0.1}, {"8": -0.2}, {"9": -0.3}]
+    else:
+        assert (pending_trim, prompt_score_trim) == (2, 0 if prompt_scores_already_stored else 1)
+        assert current.prompt_tokens.tolist() == [1, 2, 3, 4, 10]
+        assert current.remaining_prompt_tokens.tolist() == [1, 2, 3, 4, 10]
+        assert merged.generated_tokens == [10]
+        assert merged.generated_log_probs == [-0.1]
+        assert merged.generated_top_n_logprobs == [{"10": -0.1}]
+
+    assert len(merged.generated_log_probs) == len(merged.generated_tokens)
+    assert len(merged.generated_top_n_logprobs) == len(merged.generated_tokens)
+    assert len(merged.tpot) == len(merged.generated_tokens)
+    assert _generated_event_tokens(merged) == merged.generated_tokens
+    serialized_event_tokens = [
+        event["payload"]["token_id"]
+        for event in serialized["events"]
+        if event["type"] == DynamicInferenceEventType.GENERATED_TOKEN.name
+    ]
+    assert serialized_event_tokens == merged.generated_tokens
 
 
 class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
@@ -4868,22 +5022,27 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
 
     @pytest.mark.parametrize("detokenize_stop_sequence", [True, False])
     def test_detokenize_stop_sequence_flag(self, detokenize_stop_sequence):
-        """Test that _check_stop_words_for_request_post_append strips or keeps
-        the stop word tokens based on detokenize_stop_sequence."""
-        engine = types.SimpleNamespace(num_speculative_tokens=0)
+        """The earliest speculative stop wins and is either retained or stripped."""
+        engine = types.SimpleNamespace(num_speculative_tokens=1)
         check = DynamicInferenceEngine._check_stop_words_for_request_post_append
 
         request = types.SimpleNamespace(
             generated_tokens=[1, 2, 3, 4, 5],
-            stop_word_ids=[[4, 5]],
+            generated_length=5,
+            generated_log_probs=None,
+            generated_top_n_logprobs=None,
+            events=[],
+            tpot=[],
+            stop_word_ids=[[5], [4]],
             sampling_params=SamplingParams(detokenize_stop_sequence=detokenize_stop_sequence),
         )
-        hit, trimmed = check(engine, request)
+        hit, trimmed, prompt_score_trim = check(engine, request)
         assert hit
+        assert prompt_score_trim == 0
         if detokenize_stop_sequence:
             # Stop word kept
-            assert request.generated_tokens == [1, 2, 3, 4, 5]
-            assert trimmed == 0
+            assert request.generated_tokens == [1, 2, 3, 4]
+            assert trimmed == 1
         else:
             # Stop word stripped
             assert request.generated_tokens == [1, 2, 3]

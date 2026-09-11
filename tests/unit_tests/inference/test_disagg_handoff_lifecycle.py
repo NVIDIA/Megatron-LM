@@ -179,8 +179,8 @@ class _HandoffHarness(InferenceStateHandoffMixin, _SchedulerHarness):
     def _check_stop_words_for_request_post_append(self, request):
         for stop_word_ids in request.stop_word_ids or []:
             if request.generated_tokens[-len(stop_word_ids) :] == stop_word_ids:
-                return True, 0
-        return False, 0
+                return True, 0, 0
+        return False, 0, 0
 
 
 def _meta(request_id):

@@ -2120,6 +2120,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 tokens = accepted_tokens + tokens
 
             num_stop_word_trim = 0
+            num_stop_word_prompt_score_trim = 0
             is_prefill = len(request.generated_tokens) == 0
             if request_id != consumed_chunked_prefill_request_id:
                 # Skip appending token for requests being finished due to stop words
@@ -2196,8 +2197,15 @@ class DynamicInferenceEngine(AbstractEngine):
                 # appended token. The check truncates generated_tokens in-place and
                 # returns how many trailing tokens were removed so we can also trim
                 # the corresponding log probs below.
-                stop_word_hit, num_stop_word_trim = self._check_stop_words_for_request_post_append(
-                    request
+                num_new_tokens = (
+                    len(tokens) if request_id not in self.stop_word_being_finished_ids else 0
+                )
+                stop_word_hit, num_stop_word_trim, num_stop_word_prompt_score_trim = (
+                    self._check_stop_words_for_request_post_append(
+                        request,
+                        record=self.requests[request_id].record,
+                        num_new_tokens=num_new_tokens,
+                    )
                 )
 
                 # Track per-position acceptance statistics for logging.
@@ -2260,11 +2268,12 @@ class DynamicInferenceEngine(AbstractEngine):
 
             # When a stop word was found mid-speculative-batch, trim log probs
             # and top_n_logprobs to match the truncated generated_tokens.
-            if num_stop_word_trim > 0:
+            num_stop_word_score_trim = num_stop_word_trim + num_stop_word_prompt_score_trim
+            if num_stop_word_score_trim > 0:
                 if request_log_probs is not None:
-                    request_log_probs = request_log_probs[:-num_stop_word_trim]
+                    request_log_probs = request_log_probs[:-num_stop_word_score_trim]
                 if top_n_logprobs is not None and req_idx in top_n_logprobs:
-                    top_n_logprobs[req_idx] = top_n_logprobs[req_idx][:-num_stop_word_trim]
+                    top_n_logprobs[req_idx] = top_n_logprobs[req_idx][:-num_stop_word_score_trim]
 
             # Process requested log_probs (unified for both regular and chunked prefill)
             # Skip for requests being finished due to stop words — tokens are not
@@ -2291,7 +2300,8 @@ class DynamicInferenceEngine(AbstractEngine):
                     if is_chunked_prefill:
                         pass
                     elif is_prefill:
-                        request.generated_log_probs.append(request_log_probs[-1])
+                        if request.generated_tokens and len(request_log_probs) > 0:
+                            request.generated_log_probs.append(request_log_probs[-1])
                     else:
                         request.generated_log_probs.extend(request_log_probs)
                 else:
@@ -2404,8 +2414,12 @@ class DynamicInferenceEngine(AbstractEngine):
         return result
 
     def _check_stop_words_for_request_post_append(
-        self, request: DynamicInferenceRequest
-    ) -> Tuple[bool, int]:
+        self,
+        request: DynamicInferenceRequest,
+        *,
+        record: Optional[DynamicInferenceRequestRecord] = None,
+        num_new_tokens: Optional[int] = None,
+    ) -> Tuple[bool, int, int]:
         """Check if a request should stop due to stop words (after token is appended).
 
         This method is called from post_process_requests after the token has already
@@ -2421,35 +2435,167 @@ class DynamicInferenceEngine(AbstractEngine):
 
         Args:
             request: The request to check.
+            record: Full checkpoint history for the request. Supplying the record
+                lets stop sequences span checkpoint boundaries.
+            num_new_tokens: Number of tokens appended in the current step. The
+                returned trim count is limited to these tokens so the caller can
+                trim pending log-probability results without deleting prompt data.
 
         Returns:
-            Tuple of (stop_word_hit, num_tokens_trimmed):
+            Tuple of (stop_word_hit, num_new_tokens_trimmed,
+            num_recomputed_prompt_scores_trimmed):
                 stop_word_hit: True if the generated sequence contains a stop word.
-                num_tokens_trimmed: Number of tokens removed from the end of
-                    generated_tokens (0 when the stop word is at the very end
-                    or when no stop word was found).
+                num_new_tokens_trimmed: Number of current-step tokens removed
+                    from the end of generated_tokens.
+                num_recomputed_prompt_scores_trimmed: Number of prompt-score
+                    entries corresponding to stripped tokens from older
+                    checkpoint segments.
         """
         if request.stop_word_ids is None or len(request.stop_word_ids) == 0:
-            return False, 0
+            return False, 0, 0
 
-        generated_tokens = request.generated_tokens
+        segments = record.requests if record is not None else [request]
+        if record is not None:
+            assert record[-1] is request
 
+        # Legacy direct callers do not have pending score tensors to align and
+        # expect the complete token trim count. The engine path always supplies
+        # num_new_tokens.
+        engine_call = num_new_tokens is not None
+        endpoint_count = num_new_tokens if engine_call else self.num_speculative_tokens + 1
+        pending_token_count = num_new_tokens if engine_call else len(request.generated_tokens)
+        generated_tokens = []
+        suffix_length = max(map(len, request.stop_word_ids)) + max(0, endpoint_count - 1)
+        for segment in reversed(segments):
+            take = min(suffix_length - len(generated_tokens), len(segment.generated_tokens))
+            if take > 0:
+                generated_tokens[:0] = segment.generated_tokens[-take:]
+            if len(generated_tokens) == suffix_length:
+                break
+        tpot_is_token_aligned = {
+            id(segment): len(segment.tpot) == len(segment.generated_tokens) for segment in segments
+        }
+
+        def trim_segment_tail(
+            segment: DynamicInferenceRequest, trim: int, *, trim_stored_scores: bool
+        ) -> None:
+            """Trim token-correlated state from one request segment."""
+            if trim == 0:
+                return
+
+            removed_tokens = list(segment.generated_tokens[-trim:])
+            segment.generated_tokens = segment.generated_tokens[:-trim]
+
+            if trim_stored_scores:
+                for key in ("generated_log_probs", "generated_top_n_logprobs"):
+                    values = getattr(segment, key, None)
+                    if values is not None:
+                        setattr(segment, key, values[:-trim])
+
+            # TPOT is intentionally sparse on non-logging steps. Trim it only
+            # when it is demonstrably one value per generated token.
+            if tpot_is_token_aligned[id(segment)]:
+                segment.tpot = segment.tpot[:-trim]
+
+            generated_event_indexes = [
+                idx
+                for idx, event in enumerate(segment.events)
+                if event.type == DynamicInferenceEventType.GENERATED_TOKEN
+            ]
+            if generated_event_indexes:
+                assert len(generated_event_indexes) >= trim
+                indexes_to_remove = generated_event_indexes[-trim:]
+                event_tokens = [
+                    segment.events[idx].payload["token_id"] for idx in indexes_to_remove
+                ]
+                assert event_tokens == removed_tokens
+                for idx in reversed(indexes_to_remove):
+                    del segment.events[idx]
+
+            if segment.generated_length is not None:
+                segment.generated_length = len(segment.generated_tokens)
+
+        matched_stop = None
         for stop_word_ids in request.stop_word_ids:
             stop_len = len(stop_word_ids)
-            if len(generated_tokens) >= stop_len:
-                # Check the last stop_len tokens shifting by 1 up to num_speculative_tokens.
-                # Speculative decoding can append multiple tokens at once, so the stop
-                # word might end at any position within the newly appended tokens.
-                for i in range(self.num_speculative_tokens + 1):
-                    end_idx = -i if i > 0 else None
-                    if list(generated_tokens[-stop_len - i : end_idx]) == stop_word_ids:
-                        trim = (
-                            i if request.sampling_params.detokenize_stop_sequence else i + stop_len
-                        )
-                        if trim > 0:
-                            request.generated_tokens = request.generated_tokens[:-trim]
-                        return True, trim
-        return False, 0
+            if len(generated_tokens) < stop_len:
+                continue
+            # Search every endpoint produced in this step before mutating state.
+            # A larger trailing-token count means this stop completed earlier;
+            # at the same endpoint, prefer the longer stop sequence.
+            for trailing_token_count in range(endpoint_count):
+                end_idx = -trailing_token_count if trailing_token_count > 0 else None
+                if (
+                    list(generated_tokens[-stop_len - trailing_token_count : end_idx])
+                    == stop_word_ids
+                ):
+                    candidate = (trailing_token_count, stop_len)
+                    if matched_stop is None or candidate > matched_stop:
+                        matched_stop = candidate
+
+        if matched_stop is None:
+            return False, 0, 0
+
+        trailing_token_count, stop_len = matched_stop
+        total_trim = (
+            trailing_token_count
+            if request.sampling_params.detokenize_stop_sequence
+            else trailing_token_count + stop_len
+        )
+        pending_trim = min(total_trim, pending_token_count)
+        if pending_trim > 0:
+            trim_segment_tail(request, pending_trim, trim_stored_scores=False)
+
+        # Any remainder belongs to tokens generated before this step. Remove
+        # their already-stored result metadata from newest to oldest so merged
+        # tokens, logprobs, and top-N values stay aligned.
+        stored_trim = total_trim - pending_trim
+        older_segment_trim = 0
+        for segment in reversed(segments):
+            if stored_trim == 0:
+                break
+            segment_trim = min(stored_trim, len(segment.generated_tokens))
+            if segment_trim == 0:
+                continue
+            trim_segment_tail(segment, segment_trim, trim_stored_scores=True)
+            if segment is not request:
+                older_segment_trim += segment_trim
+            stored_trim -= segment_trim
+        assert stored_trim == 0, "Stop-word trim exceeds generated history."
+
+        # Tokens from older checkpoint segments are duplicated at the end of
+        # the active segment's cumulative prompt. Drop the same suffix so
+        # terminal routing/serialization lengths describe the visible result.
+        if older_segment_trim > 0:
+            old_prompt_tokens = request.prompt_tokens
+            old_remaining_prompt_tokens = request.remaining_prompt_tokens
+            request.prompt_tokens = old_prompt_tokens[:-older_segment_trim]
+            if old_remaining_prompt_tokens is not None:
+                remaining_length = max(0, len(old_remaining_prompt_tokens) - older_segment_trim)
+                request.remaining_prompt_tokens = (
+                    request.prompt_tokens[-remaining_length:]
+                    if remaining_length > 0
+                    else request.prompt_tokens[:0]
+                )
+
+        prompt_score_trim = 0
+        if older_segment_trim > 0 and not request.sampling_params.skip_prompt_log_probs:
+            # Chunked prefill may already have stored some prompt scores. Remove
+            # any suffix now outside the shortened prompt and ask the caller to
+            # trim only the remainder from this step's pending score tensors.
+            target_prompt_score_count = max(0, len(request.prompt_tokens) - 1)
+            existing_prompt_score_count = len(request.prompt_log_probs or [])
+            stored_prompt_score_trim = min(
+                older_segment_trim, max(0, existing_prompt_score_count - target_prompt_score_count)
+            )
+            if stored_prompt_score_trim > 0:
+                request.prompt_log_probs = request.prompt_log_probs[:-stored_prompt_score_trim]
+                if request.prompt_top_n_logprobs is not None:
+                    request.prompt_top_n_logprobs = request.prompt_top_n_logprobs[
+                        :-stored_prompt_score_trim
+                    ]
+            prompt_score_trim = older_segment_trim - stored_prompt_score_trim
+        return True, pending_trim, prompt_score_trim
 
     def get_prefix_coordination_metrics(self) -> dict:
         """Return prefix caching coordination metrics.

@@ -1079,6 +1079,7 @@ class DynamicInferenceRequestRecord:
             status=old_request.status,
             policy_epoch=policy_epoch,
             kv_cache_epoch=kv_cache_epoch,
+            stop_word_ids=copy.deepcopy(old_request.stop_word_ids),
             block_size_tokens=old_request.block_size_tokens,
             enable_prefix_caching=old_request.enable_prefix_caching,
             block_hash_salt=old_request.block_hash_salt,
