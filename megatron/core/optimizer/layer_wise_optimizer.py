@@ -30,6 +30,7 @@ from .param_layout import (
     bucket_end_divisor,
     pad_param_start,
     pad_to_divisor,
+    resolve_buffer_dp_world_size,
 )
 
 logger = logging.getLogger(__name__)
@@ -488,14 +489,9 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         buffer_groups = group_params_for_buffers(params, ddp_config.grad_reduce_in_fp32)
         layouts = {}
         for buffer_key, (group_params, param_indices) in buffer_groups.items():
-            if buffer_key.is_expert_parallel:
-                dp_world_size = (
-                    expert_data_parallel_world_size
-                    if expert_data_parallel_world_size is not None
-                    else data_parallel_world_size
-                )
-            else:
-                dp_world_size = data_parallel_world_size
+            dp_world_size = resolve_buffer_dp_world_size(
+                buffer_key, group_params, data_parallel_world_size, expert_data_parallel_world_size
+            )
 
             # Dispatch per buffer: LayerWise (Muon) params get the shard-aligned
             # layout; non-LayerWise params (e.g. Adam-managed embeddings, biases)
@@ -630,11 +626,16 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
 
         self.tp_group = self.pg_collection.tp
         self.expert_tp_group = getattr(self.pg_collection, 'expt_tp', self.tp_group)
+        # CP-FREE dense axis: the dedup filter's reduce group excludes CP.
+        self.gtp_remat_group = getattr(self.pg_collection, 'gtp_remat_no_cp', None)
+        self.expt_gtp_remat_group = getattr(self.pg_collection, 'expt_gtp_remat', None)
         for optimizer in optimizers:
             # Child optimizers perform duplicate filtering and gradient-stat reductions.
             optimizer.grad_stats_parallel_group = self.grad_stats_parallel_group
             optimizer.tp_group = self.tp_group
             optimizer.expert_tp_group = self.expert_tp_group
+            optimizer.gtp_remat_group = self.gtp_remat_group
+            optimizer.expt_gtp_remat_group = self.expt_gtp_remat_group
 
         super().__init__(optimizers)
 
@@ -984,6 +985,8 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             use_decoupled_grad=self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8,
             tp_group=self.tp_group,
             expert_tp_group=self.expert_tp_group,
+            gtp_remat_group=self.gtp_remat_group,
+            expt_gtp_remat_group=self.expt_gtp_remat_group,
         )
 
     def start_param_sync_for_bucket_group_subset(self) -> None:

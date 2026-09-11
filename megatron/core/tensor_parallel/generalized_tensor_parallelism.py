@@ -659,6 +659,21 @@ def _gtp_slice_one_param(param, gtp_remat_group, *, name="<unnamed>"):
     return gtp_shard
 
 
+def _gtp_folded_cp_size(gtp_remat_group):
+    """CP degree folded into ``gtp_remat_group``, or 1 if it's not the folded dense group
+    (identity-compared against the MPU group; expert/explicit-grid groups always report 1)."""
+    from megatron.core import parallel_state  # noqa: E402
+
+    if gtp_remat_group is None or not parallel_state.is_initialized():
+        return 1
+    if gtp_remat_group is not parallel_state.get_gtp_weight_remat_group(check_initialized=False):
+        return 1
+    size_no_cp = parallel_state.get_gtp_weight_remat_size_no_cp()
+    if size_no_cp <= 0:
+        return 1
+    return gtp_remat_group.size() // size_no_cp
+
+
 def _gtp_attach_attrs(
     gtp_shard, gtp_remat_group, *, is_grouped=False, expert_idx=0, replica_group=None
 ):
@@ -684,6 +699,10 @@ def _gtp_attach_attrs(
         gtp_shard.chain_id = GTPChain.UNGRAPHED.value
     gtp_shard.group = gtp_remat_group
     gtp_shard.gtp_remat_size = gtp_remat_group.size()
+    # CP degree folded into this weight's own sharding group (its RS already summed CP), so the
+    # DDP bucket and optimizer layout must skip that factor. 1 for expert/explicit-grid groups.
+    gtp_shard.gtp_bucket_dp_divisor = _gtp_folded_cp_size(gtp_remat_group)
+    gtp_shard.excludes_cp_from_bucket = gtp_shard.gtp_bucket_dp_divisor > 1
     if replica_group is not None:
         gtp_shard.gtp_replica_group = replica_group
     global _GTP_PARAMS
@@ -2852,44 +2871,38 @@ def reset_gtp_state():
 
 
 def gtp_replica_rank(param, explicit_group=None):
-    """Rank of this process among the true replicas of ``param``'s GTP shard.
-
-    The replicas of a GTP shard are the data-parallel peers EXCLUDING the gtp_remat axis
-    (gtp_remat peers hold *different* shards). Electing over a gtp_remat-inclusive group would
-    leave every shard but one without a writer, so the group must be known to exclude it. Which
-    data-parallel axis applies depends on the param: a routed-expert weight (``allreduce=False``)
-    is replicated over EXPERT DP (``expt_dp``), a dense weight over ``dp_cp``. Resolution order:
-
-    1. ``explicit_group`` passed by the caller,
-    2. ``param.gtp_replica_group``, stamped at wrap time from the caller's collection
-       (``expt_dp`` for expert modules, ``dp_cp`` otherwise),
-    3. the MPU globals, picking the expert or dense axis by the param's ``allreduce`` tag.
-
-    A caller on an explicit process-group grid that never initializes ``parallel_state`` must
-    supply that group in its collection; step 3 cannot serve it and raises instead of guessing.
+    """Rank of this process among the true replicas of ``param``'s GTP shard: the DP peers
+    EXCLUDING every axis the weight is sharded over (gtp_remat, and CP too since the gtp_remat
+    group folds it in) -- a dense weight elects over CP-free ``dp``, a routed-expert weight
+    (``allreduce=False``) over ``expt_dp``. Resolution order: ``explicit_group`` ->
+    (dense-only) MPU globals, overriding the stale CP-inclusive ``param.gtp_replica_group``
+    stamp -> ``param.gtp_replica_group`` -> MPU globals.
     """
     from megatron.core.utils import get_pg_rank  # noqa: E402
 
-    group = (
-        explicit_group if explicit_group is not None else getattr(param, 'gtp_replica_group', None)
-    )
-    if group is not None:
-        return get_pg_rank(group)
+    if explicit_group is not None:
+        return get_pg_rank(explicit_group)
 
     from megatron.core import parallel_state  # noqa: E402
 
-    if parallel_state.is_initialized():
-        if not getattr(param, 'allreduce', True):  # routed-expert weight
-            return parallel_state.get_expert_data_parallel_rank(with_gtp_remat=False)
+    is_expert = not getattr(param, 'allreduce', True)  # routed-expert weight
+    if not is_expert and parallel_state.is_initialized():
         return parallel_state.get_data_parallel_rank(
-            with_context_parallel=True, with_gtp_remat=False
+            with_context_parallel=False, with_gtp_remat=False
         )
+
+    group = getattr(param, 'gtp_replica_group', None)
+    if group is not None:
+        return get_pg_rank(group)
+
+    if parallel_state.is_initialized():
+        return parallel_state.get_expert_data_parallel_rank(with_gtp_remat=False)
     if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
         return 0  # single-process save: this rank is the only replica.
     raise RuntimeError(
         "GTP distributed checkpointing needs the gtp_remat-excluded DP x CP group to elect a "
         "shard writer, but parallel_state is not initialized and the param carries no "
-        "gtp_replica_group. Pass a pg_collection containing `dp_cp` when building the model "
+        "gtp_replica_group. Pass a pg_collection containing `dp` when building the model "
         "(it is stamped onto GTP params at wrap time)."
     )
 

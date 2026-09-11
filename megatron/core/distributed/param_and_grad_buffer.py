@@ -938,13 +938,16 @@ def group_params_for_buffers(
 ) -> Dict['BufferKey', Tuple[List[torch.nn.Parameter], List[int]]]:
     """Group parameters by buffer identity for buffer allocation.
 
-    Each distinct buffer is identified by a BufferKey with three dimensions:
+    Each distinct buffer is identified by a BufferKey with these dimensions:
     - param_dtype: storage dtype (torch.uint8 for FP8/NVFP4 parameters, else param.dtype).
     - grad_dtype: gradient reduction dtype (torch.float if grad_reduce_in_fp32, else param.dtype).
     - is_expert_parallel: whether the parameter uses the expert topology (param.allreduce == False),
       which requires a separate buffer for the expert data-parallel group. This is true for experts
       when expert-parallelism > 1, expert-tensor-parallelism != tensor-parallelism, or expert-GTP
       != GTP.
+    - excludes_cp_from_bucket: dense GTP params whose sharding group already folds CP in (its
+      reduce-scatter summed CP), so the bucket collective must use the CP-free DP group instead
+      of DP+CP. Never set for expert/EGTP params.
 
     The param_indices track each parameter's position among same-dtype params (using
     the "fake" high-precision dtype for FP8/NVFP4 params), needed for loading non-native-fp8
@@ -974,9 +977,16 @@ def group_params_for_buffers(
         is_managed_by_layer_wise_optimizer = getattr(
             param, 'is_managed_by_layer_wise_optimizer', False
         )
+        excludes_cp_from_bucket = (
+            getattr(param, 'excludes_cp_from_bucket', False) and not is_expert_parallel
+        )
 
         key = BufferKey(
-            param_dtype, grad_dtype, is_expert_parallel, is_managed_by_layer_wise_optimizer
+            param_dtype,
+            grad_dtype,
+            is_expert_parallel,
+            is_managed_by_layer_wise_optimizer,
+            excludes_cp_from_bucket,
         )
         param_list = key_to_params.get(key, [])
         param_list.append(param)
@@ -985,7 +995,11 @@ def group_params_for_buffers(
         # Use param.dtype (not param_dtype) so FP8/NVFP4 params share offsets with their
         # logical high-precision dtype, needed for checkpoint compatibility.
         offset_key = BufferKey(
-            param.dtype, grad_dtype, is_expert_parallel, is_managed_by_layer_wise_optimizer
+            param.dtype,
+            grad_dtype,
+            is_expert_parallel,
+            is_managed_by_layer_wise_optimizer,
+            excludes_cp_from_bucket,
         )
         offset = dtype_to_offsets.get(offset_key, 0)
         dtype_to_offsets[offset_key] = offset + 1
