@@ -7,9 +7,6 @@ import pytest
 import torch
 
 from megatron.core import mpu
-from megatron.core.dist_checkpointing.strategies.cached_metadata_filesystem_reader import (
-    CachedMetadataFileSystemReader,
-)
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_block_spec
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_spec as gpt_te_spec,
@@ -29,6 +26,15 @@ from tests.unit_tests.dist_checkpointing.models.common import (
     common_test_parallel_reconfiguration_e2e,
 )
 from tests.unit_tests.test_utilities import Utils
+
+try:
+    from nvidia_resiliency_ext.checkpointing.async_ckpt.cached_metadata_filesystem_reader import (
+        CachedMetadataFileSystemReader,
+    )
+
+    HAVE_NVRX = True
+except ModuleNotFoundError:
+    HAVE_NVRX = False
 
 
 def initialize_gpt_model(
@@ -294,12 +300,15 @@ def test_save_and_load_checkpoint_vpp(
     args.num_attention_heads = 8
     # Ckpt format
     args.ckpt_format = "torch_dist"
-    args.async_strategy = "mcore"
+    args.async_strategy = "nvrx"
     set_args(args)
 
     # Cached metadata is mutated in-place by torch's load planner, so reusing it
     # across loads of the same checkpoint dir corrupts subsequent reads.
-    CachedMetadataFileSystemReader.clear_metadata_cache()
+    if HAVE_NVRX:
+        CachedMetadataFileSystemReader.clear_metadata_cache()
+    else:
+        raise ModuleNotFoundError('`nvidia-resiliency-ext` should be installed to run this test.')
 
     def set_tp_pp_vpp(tp, pp, vpp=None, pp_layout=None, destroy_first=True):
         if destroy_first:
