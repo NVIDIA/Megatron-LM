@@ -4,9 +4,12 @@ import warnings
 from typing import List, Optional
 
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
-from megatron.core.models.backends import BackendSpecProvider
+from megatron.core.models.backends import BackendSpecProvider, get_backend_from_config
 from megatron.core.ssm.gated_delta_net import GatedDeltaNet, GatedDeltaNet2, GatedDeltaNetSubmodules
 from megatron.core.transformer.enums import AttnMaskType, LayerType
+from megatron.core.transformer.experimental_attention_variant import (
+    deepseek_v4_hybrid_attention_module_specs as dsv4_hybrid_specs,
+)
 from megatron.core.transformer.experimental_attention_variant.absorbed_mla import (
     AbsorbedMLASelfAttention,
     AbsorbedMLASelfAttentionSubmodules,
@@ -33,25 +36,6 @@ from megatron.core.transformer.transformer_layer import (
     get_transformer_layer_offset,
 )
 from megatron.core.typed_torch import not_none
-
-try:
-    import transformer_engine as te  # type: ignore[import-untyped]  # pylint: disable=unused-import
-
-    from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
-
-    HAVE_TE = True
-except ImportError:
-    HAVE_TE = False
-
-try:
-    import nvidia_kitchen  # type: ignore[import-not-found]  # pylint: disable=unused-import
-
-    from megatron.core.extensions.kitchen import KitchenSpecProvider
-
-    HAVE_KITCHEN = True
-except ImportError:
-    HAVE_KITCHEN = False
-
 
 ##########
 # Experimental Attention Variant Names
@@ -158,6 +142,10 @@ def get_experimental_attention_variant_module_spec(
         return get_gated_delta_net_module_spec(config=config, backend=backend)
     elif config.experimental_attention_variant == "dsa":
         return get_dsa_module_spec_for_backend(config=config, backend=backend)
+    elif config.experimental_attention_variant == "dsv4_hybrid":
+        return dsv4_hybrid_specs.get_dsv4_hybrid_module_spec_for_backend(
+            config=config, backend=backend
+        )
     else:
         raise ValueError(
             f"Invalid experimental attention variant: {config.experimental_attention_variant}"
@@ -499,16 +487,8 @@ def _get_backend_spec_provider(config: TransformerConfig) -> BackendSpecProvider
         "Experimental GPT decoder block spec only supports "
         "transformer engine implementation for now."
     )
-    backend: BackendSpecProvider = (
-        KitchenSpecProvider(
-            fallback=TESpecProvider(),
-            use_kitchen_attention=config.use_kitchen_attention,
-            kitchen_attention_backend=config.kitchen_attention_backend,
-        )
-        if config.use_kitchen
-        else TESpecProvider()
-    )
-    return backend
+    # The factory also applies config.use_kitchen with TE as its fallback provider.
+    return get_backend_from_config(config)
 
 
 ##########

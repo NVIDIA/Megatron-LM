@@ -346,8 +346,11 @@ def core_transformer_config_from_args(args, config_class=None):
     if args.hybrid_layer_pattern is not None:
         kw_args['is_hybrid_model'] = True
         from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
+
         if Symbols.DS_ATTENTION in args.hybrid_layer_pattern:
-            kw_args['experimental_attention_variant'] = 'dsa'
+            # Preserve an explicitly selected D-attention implementation while keeping
+            # the existing DSA default for legacy hybrid patterns.
+            kw_args['experimental_attention_variant'] = args.experimental_attention_variant or 'dsa'
 
     kw_args['inference_sampling_seed'] = args.seed
 
@@ -464,6 +467,7 @@ def gpt_config_from_args(
     kwargs["rotary_base"] = args.rotary_base
     kwargs["make_vocab_size_divisible_by"] = args.make_vocab_size_divisible_by
     kwargs["rope_scaling"] = args.use_rope_scaling
+    kwargs["rope_scaling_factor"] = args.rope_scaling_factor
 
     kwargs["seq_len_interpolation_factor"] = args.rotary_seq_len_interpolation_factor
     kwargs["seq_length"] = args.max_position_embeddings

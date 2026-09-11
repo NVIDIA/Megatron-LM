@@ -5,6 +5,7 @@ import functools
 import logging
 import warnings
 from abc import ABC
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Dict, Optional, Protocol, Union
 
@@ -23,6 +24,7 @@ except ImportError:
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
+from megatron.core.enums import Fp8Recipe
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -392,6 +394,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         attention_optional_kwargs["pg_collection"] = pg_collection
         if pp_layer_offset is not None:
             attention_optional_kwargs["pp_layer_offset"] = pp_layer_offset
+        attention_optional_kwargs["is_mtp_layer"] = is_mtp_layer
 
         # [Module 2: SelfAttention]
         self.self_attention = build_module(
@@ -577,6 +580,18 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             if "_forward_post_mlp" in vars(klass):
                 self._legacy_forward_post_mlp = klass._forward_post_mlp
                 break
+
+    def get_inner_quantization_context(self) -> AbstractContextManager:
+        """Return the quantization context for fine-grained layer execution."""
+        if self.config.fp8 and self.config.fp8_recipe != Fp8Recipe.delayed:
+            from megatron.core.fp8_utils import get_fp8_context  # to avoid circular import
+
+            return get_fp8_context(self.config, self.layer_number - 1)
+        if self.config.fp4:
+            from megatron.core.fp4_utils import get_fp4_context  # to avoid circular import
+
+            return get_fp4_context(self.config, self.layer_number - 1)
+        return nullcontext()
 
     def create_mcore_cudagraph_manager(self, config):
         """Register the transformer layer for cudagraphs."""
