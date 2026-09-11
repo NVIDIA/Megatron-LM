@@ -19,7 +19,7 @@ from megatron.core.dist_checkpointing import ShardedTensor
 from megatron.core.dist_checkpointing.mapping import LocalNonpersistentObject, ShardedTensorFactory
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer, Range
 from megatron.core.ssm.utils import _split_in_proj_factory, _split_tensor_factory
-from megatron.core.tensor_parallel.gtp_ckpt import _gtp_slice_rows_on_load
+from megatron.core.tensor_parallel.gtp_utils import _gtp_slice_rows_on_load
 from megatron.core.transformer.mlp import apply_swiglu_sharded_factory
 from tests.unit_tests.dist_checkpointing.cpu_test_utils import TorchDistCPUSaveShardedStrategy
 

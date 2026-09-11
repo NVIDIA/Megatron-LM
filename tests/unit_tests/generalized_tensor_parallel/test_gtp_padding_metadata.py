@@ -10,7 +10,7 @@ from megatron.core.dist_checkpointing.optimizer import (
     make_sharded_optimizer_tensor,
 )
 from megatron.core.dist_checkpointing.strategies.torch import _gtp_restore_padded
-from megatron.core.tensor_parallel.gtp_ckpt import gtp_entry_backlink, untrimmed_gtp_shard
+from megatron.core.tensor_parallel.gtp_utils import gtp_entry_backlink, untrimmed_gtp_shard
 from megatron.core.utils import _make_gtp_logical_sharded_tensor
 
 

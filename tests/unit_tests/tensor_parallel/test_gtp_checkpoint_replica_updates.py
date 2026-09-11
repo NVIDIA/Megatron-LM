@@ -12,7 +12,7 @@ from megatron.core.dist_checkpointing import ShardedTensor
 from megatron.core.dist_checkpointing.mapping import ShardedTensorFactory, is_main_replica
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 from megatron.core.ssm.utils import _split_tensor_factory
-from megatron.core.tensor_parallel.gtp_ckpt import _fused_projection_optimizer_factory
+from megatron.core.tensor_parallel.gtp_utils import _fused_projection_optimizer_factory
 from megatron.core.transformer.moe.experts import SequentialMLP
 from tests.unit_tests.tensor_parallel.test_gtp_checkpoint_optimizer import _optimizer_stub
 

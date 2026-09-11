@@ -87,7 +87,7 @@ def _resolve_gtp_sharded_metadata(
     Reuse the original metadata, including expert offsets and replica IDs; never
     infer checkpoint keys from debug names or reconstruct an EP-unaware shard.
     """
-    from megatron.core.tensor_parallel.gtp_ckpt import gtp_entry_backlink
+    from megatron.core.tensor_parallel.gtp_utils import gtp_entry_backlink
 
     for entry in nested_values(model_sharded_state_dict):
         if isinstance(entry, ShardedTensorFactory):

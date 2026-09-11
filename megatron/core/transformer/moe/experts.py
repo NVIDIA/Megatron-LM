@@ -1133,7 +1133,7 @@ class TEGroupedMLP(MegatronModule):
                             # writes, and slice this rank's contiguous rows back out on load.
                             # This also pins "a shard is a contiguous row slice of [gate|up]",
                             # so the runtime all-gather is already in logical order.
-                            from megatron.core.tensor_parallel.gtp_ckpt import (
+                            from megatron.core.tensor_parallel.gtp_utils import (
                                 _gtp_gather_rows_for_save,
                                 _gtp_slice_rows_on_load,
                             )

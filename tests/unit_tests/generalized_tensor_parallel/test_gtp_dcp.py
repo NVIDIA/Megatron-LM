@@ -1867,7 +1867,7 @@ def _worker_padded_fused_projection_gather(rank, world_size, port):
     dim0 10 over GTP=4 with alignment 3*4=12 -> pad 2, padded 12, shards of 3; the gather must
     still return exactly the 10 logical rows, in order.
     """
-    from megatron.core.tensor_parallel.gtp_ckpt import _gtp_gather_rows_for_save
+    from megatron.core.tensor_parallel.gtp_utils import _gtp_gather_rows_for_save
 
     orig = GTP_CONFIG.pad_for_alignment
     update_gtp_config(pad_for_alignment=3)
@@ -2469,7 +2469,7 @@ def _worker_gdn_inproj_checkpoint(rank, world_size, port):
 def _worker_fc1_swiglu_checkpoint(rank, world_size, port):
     """A gated fc1 under GTP must save logical gate/up splits and load the contiguous shard.
 
-    End-to-end through the real wiring (transformer/mlp.py + tensor_parallel/gtp_ckpt.py):
+    End-to-end through the real wiring (transformer/mlp.py + tensor_parallel/gtp_utils.py):
     the checkpoint entries must be IDENTICAL to a non-GTP TP2 run's (same keys, same
     gate/up global offsets), and the load-side merge must reconstruct this rank's live
     shard as a CONTIGUOUS row slice of the merged TP-local [gate | up] tensor. This pins

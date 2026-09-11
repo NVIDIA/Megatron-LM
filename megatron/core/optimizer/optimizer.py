@@ -880,7 +880,7 @@ def _backfill_gtp_sharded_param_map(
             is_gtp_param,
             make_sharded_tensors_for_checkpoint_with_gtp_remat,
         )
-        from megatron.core.tensor_parallel.gtp_ckpt import gtp_entry_backlink
+        from megatron.core.tensor_parallel.gtp_utils import gtp_entry_backlink
     except ImportError:
         return  # GTP not built in -- nothing to backfill.
 
