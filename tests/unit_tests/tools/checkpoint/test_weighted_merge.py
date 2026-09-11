@@ -1298,6 +1298,35 @@ def test_metadata_same_layout_explicit_roots_ignore_mixed_state(
         assert "rng_state._extra_state" not in output_metadata.state_dict_metadata
 
 
+def test_metadata_same_layout_dry_run_validates_without_output(
+    tmp_path_dist_ckpt, process_group
+):
+    with (
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_dry_run_a") as ckpt_a,
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_dry_run_b") as ckpt_b,
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_dry_run_out") as output_root,
+    ):
+        _write_unprefixed_gpt_like_checkpoint_with_mixed_state(ckpt_a, 1.0)
+        _write_unprefixed_gpt_like_checkpoint_with_mixed_state(ckpt_b, 5.0)
+        prefixes = ("decoder.", "embedding.", "output_layer.")
+
+        result = merge_same_layout_dcp_metadata_checkpoints(
+            [ckpt_a, ckpt_b],
+            [0.25, 0.75],
+            output_root,
+            output_iteration=61,
+            model_key_prefixes=prefixes,
+            include_default_model_roots=False,
+            ignore_non_model_state=True,
+            required_model_key_prefixes=prefixes,
+            dry_run=True,
+        )
+
+        assert result.dry_run is True
+        assert result.averaged_tensors == 4
+        assert not result.output_dir.exists()
+
+
 def test_metadata_same_layout_cli_dispatch_skips_megatron_parser(tmp_path, monkeypatch):
     ckpt_a = tmp_path / "iter_0000001"
     ckpt_b = tmp_path / "iter_0000002"
@@ -1344,6 +1373,7 @@ def test_metadata_same_layout_cli_dispatch_skips_megatron_parser(tmp_path, monke
             "--merge-model-prefix",
             "modality_submodules.",
             "--merge-ignore-non-model-state",
+            "--dry-run",
             "--merge-balance-rank-work",
             "--ckpt-format",
             "torch_dist",
@@ -1363,6 +1393,7 @@ def test_metadata_same_layout_cli_dispatch_skips_megatron_parser(tmp_path, monke
     )
     assert calls["kwargs"]["include_default_model_roots"] is False
     assert calls["kwargs"]["ignore_non_model_state"] is True
+    assert calls["kwargs"]["dry_run"] is True
     assert calls["kwargs"]["required_model_key_prefixes"] == (
         "language_model.",
         "modality_submodules.",

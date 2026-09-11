@@ -139,6 +139,7 @@ class MergeResult:
     balance_rank_work: bool = False
     plan_tensor_bytes_by_rank: tuple[int, ...] = ()
     plan_tensor_chunks_by_rank: tuple[int, ...] = ()
+    dry_run: bool = False
 
 
 @dataclass(frozen=True)
@@ -1628,6 +1629,7 @@ def merge_same_layout_dcp_metadata_checkpoints(
     ignore_non_model_state: bool = False,
     required_model_key_prefixes: tuple[str, ...] = (),
     balance_rank_work: bool = False,
+    dry_run: bool = False,
 ) -> MergeResult:
     """Merge same-layout torch_dist checkpoints using public DCP metadata only.
 
@@ -1725,7 +1727,8 @@ def merge_same_layout_dcp_metadata_checkpoints(
     discovery_time = time.perf_counter() - discovery_start
 
     _print_rank_0(
-        f"Merging {len(resolved_input_dirs)} same-layout metadata checkpoints into "
+        f"{'Validating' if dry_run else 'Merging'} {len(resolved_input_dirs)} "
+        "same-layout metadata checkpoints into "
         f"{output_dir} with weights {weights}",
         flush=True,
     )
@@ -1735,6 +1738,35 @@ def merge_same_layout_dcp_metadata_checkpoints(
             f"tensor_bytes_by_rank={list(work_plan.tensor_bytes_by_rank)}, "
             f"tensor_chunks_by_rank={list(work_plan.tensor_chunks_by_rank)}",
             flush=True,
+        )
+
+    if dry_run:
+        host_peak_bytes = _host_peak_memory_bytes()
+        rank, world_size, max_host_peak_rank, max_host_peak_bytes = _distributed_memory_peaks(
+            host_peak_bytes
+        )
+        timings = MergeTimings(
+            discovery=discovery_time,
+            total=_distributed_max_seconds(time.perf_counter() - total_start),
+        )
+        return MergeResult(
+            output_dir=output_dir,
+            input_dirs=tuple(resolved_input_dirs),
+            weights=tuple(weights),
+            timings=timings,
+            averaged_tensors=work_plan.merge_keys,
+            copied_extra_states=work_plan.extra_state_keys,
+            backend=first_format,
+            host_peak_bytes=host_peak_bytes,
+            max_host_peak_bytes=max_host_peak_bytes,
+            max_host_peak_rank=max_host_peak_rank,
+            world_size=world_size,
+            rank=rank,
+            implementation_mode=METADATA_SAME_LAYOUT_MODE,
+            balance_rank_work=balance_rank_work,
+            plan_tensor_bytes_by_rank=work_plan.tensor_bytes_by_rank,
+            plan_tensor_chunks_by_rank=work_plan.tensor_chunks_by_rank,
+            dry_run=True,
         )
 
     base_common_state = _load_output_common_state(resolved_input_dirs, output_iteration)
@@ -1964,6 +1996,14 @@ def _add_merge_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
             "model roots. The default remains fail-closed."
         ),
     )
+    group.add_argument(
+        "--dry-run",
+        action="store_true",
+        help=(
+            "Validate metadata, selected roots, layouts, and distributed work planning "
+            "without creating an output."
+        ),
+    )
     return parser
 
 
@@ -2046,6 +2086,7 @@ def _run_metadata_same_layout_cli(args: argparse.Namespace) -> MergeResult:
         ignore_non_model_state=args.merge_ignore_non_model_state,
         required_model_key_prefixes=(model_key_prefixes if explicit_model_prefixes else ()),
         balance_rank_work=args.merge_balance_rank_work,
+        dry_run=args.dry_run,
     )
 
 
@@ -2070,7 +2111,7 @@ def _format_rank_bytes(values: tuple[int, ...]) -> str:
 
 def _print_merge_result(result: MergeResult) -> None:
     _print_rank_0(
-        "Merge complete: "
+        f"{'Dry run' if result.dry_run else 'Merge'} complete: "
         f"averaged={result.averaged_tensors}, copied_extra_state={result.copied_extra_states}, "
         f"backend={result.backend}, implementation_mode={result.implementation_mode}, "
         f"output={result.output_dir}",
