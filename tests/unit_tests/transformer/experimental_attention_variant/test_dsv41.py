@@ -3,6 +3,7 @@
 """V4.1 configuration checks through the existing DSv4 path."""
 
 from argparse import ArgumentParser
+from dataclasses import fields
 from types import SimpleNamespace
 from typing import Any
 
@@ -64,6 +65,8 @@ def _make_config(
         dsa_indexer_topk=4,
         dsa_indexer_rotate_activation=False,
         enable_hyper_connections=True,
+        # This recipe opts in explicitly; model-version selection does not enable it.
+        mhc_single_pass=overrides.get("enable_hyper_connections", True),
         num_residual_streams=4,
         mhc_sinkhorn_iterations=20,
         mhc_epsilon=1e-6,
@@ -173,6 +176,21 @@ def test_v4_config_remains_unchanged(ratio):
     assert config.csa_compress_rotary_base == 40000
     assert config.dsa_kernel_backend == "none"
     assert not config.rotary_interleaved
+    assert not config.mhc_single_pass
+
+
+def test_v41_does_not_implicitly_enable_single_pass():
+    """Omitting the independent switch preserves legacy mHC even with CSA2."""
+    recipe = _make_config()
+    values = {
+        field.name: getattr(recipe, field.name)
+        for field in fields(recipe)
+        if field.init and field.name != "mhc_single_pass"
+    }
+    config = MLATransformerConfig(**values)
+    assert config.dsv4_version == "v4.1"
+    assert config.enable_hyper_connections
+    assert not config.mhc_single_pass
 
 
 def test_v41_requires_explicit_version_and_mla_config():
@@ -215,6 +233,7 @@ def test_v41_cli_fields():
             "2",
             "--mhc-epsilon",
             "1e-6",
+            "--mhc-single-pass",
         ]
     )
     assert args.dsv4_version == "v4.1"
@@ -226,6 +245,7 @@ def test_v41_cli_fields():
         args.csa2_candidate_block_size,
     ) == (3, 2, 2)
     assert args.mhc_epsilon == 1e-6
+    assert args.mhc_single_pass
 
 
 @pytest.mark.parametrize("version, expected", [(None, "cudnn"), ("v4", "cudnn"), ("v4.1", "none")])

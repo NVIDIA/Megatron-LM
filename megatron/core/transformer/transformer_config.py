@@ -1309,6 +1309,13 @@ class TransformerConfig(ModelParallelConfig):
     enable_hyper_connections: bool = False
     """Enable mHC residual connections."""
 
+    mhc_single_pass: bool = False
+    """Use the previous sublayer's mixing coefficients for mHC input contraction.
+
+    This opt-in mode is independent of the model/attention version. It uses eager
+    PyTorch operations and contracts the final streams with the last sublayer's mix.
+    """
+
     num_residual_streams: int = 4
     """Number of residual streams (n in paper)."""
 
@@ -1316,7 +1323,7 @@ class TransformerConfig(ModelParallelConfig):
     """Number of Sinkhorn-Knopp iterations for doubly stochastic projection."""
 
     mhc_epsilon: float = 1e-6
-    """V4.1 mHC mixing/Sinkhorn epsilon; RMS statistics use layernorm_epsilon instead."""
+    """Single-pass mHC mixing/Sinkhorn epsilon; RMS statistics use layernorm_epsilon instead."""
 
     mhc_init_gating_factor: float = 0.01
     """Initial value of Gating Factor (alpha in paper)."""
@@ -2778,7 +2785,7 @@ class TransformerConfig(ModelParallelConfig):
         # itself requires is checked further down, under
         # mhc_recompute_attn_cuda_graph_split.
 
-        if self.enable_hyper_connections and not use_mhc_recompute:
+        if self.enable_hyper_connections and not use_mhc_recompute and not self.mhc_single_pass:
             warnings.warn(
                 "HyperConnections are enabled but 'mhc' is not in "
                 "recompute_modules with selective recompute. Consider adding 'mhc' to "
@@ -4278,6 +4285,43 @@ class TransformerConfig(ModelParallelConfig):
                     f"Unsupported scheduler: {self.sequence_packing_scheduler}. "
                     f"Available schedulers: {supported_schedulers}"
                 )
+
+        if self.mhc_single_pass:
+            self._validate_mhc_single_pass()
+
+    def _validate_mhc_single_pass(self) -> None:
+        """Validate the forward-local eager implementation independently of model version."""
+        if not self.enable_hyper_connections:
+            raise ValueError("mhc_single_pass requires enable_hyper_connections=True")
+        if self.use_fused_mhc:
+            raise ValueError("mhc_single_pass requires use_fused_mhc=False")
+        if self.recompute_granularity is not None:
+            raise ValueError("mhc_single_pass does not yet support activation recomputation")
+        if self.cuda_graph_impl != "none":
+            raise ValueError("mhc_single_pass does not yet support CUDA Graphs")
+        if self.mtp_num_layers:
+            raise ValueError("mhc_single_pass does not yet support MTP")
+        for name in (
+            "tensor_model_parallel_size",
+            "pipeline_model_parallel_size",
+            "context_parallel_size",
+            "expert_model_parallel_size",
+            "expert_tensor_parallel_size",
+        ):
+            if getattr(self, name) != 1:
+                raise ValueError(f"mhc_single_pass requires {name}=1")
+        if self.virtual_pipeline_model_parallel_size is not None or self.sequence_parallel:
+            raise ValueError("mhc_single_pass does not yet support VPP or sequence parallelism")
+        if self.dynamic_context_parallel:
+            raise ValueError("mhc_single_pass does not yet support dynamic CP")
+        for name in ("num_residual_streams", "mhc_sinkhorn_iterations"):
+            value = getattr(self, name)
+            if type(value) is not int or value < 1:
+                raise ValueError(f"mhc_single_pass requires positive integer {name}")
+        for name in ("mhc_epsilon", "layernorm_epsilon"):
+            value = getattr(self, name)
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(f"mhc_single_pass requires positive finite {name}")
 
 
 @dataclass
