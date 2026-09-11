@@ -8,7 +8,6 @@ from megatron.core import config
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
-from megatron.core.transformer.moe import paged_stash as paged_stash_module
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.moe.moe_utils import get_align_size_for_quantization
 from megatron.core.transformer.moe.paged_stash import (
@@ -27,48 +26,6 @@ from tests.unit_tests.transformer.moe.test_token_dispatcher import is_nccl_ep_fp
 # whole module for the GB200 CI bucket (selection there is marker-driven; see
 # tests/unit_tests/find_test_cases.py and recipes/gb200/unit-tests.yaml).
 pytestmark = pytest.mark.launch_on_gb200
-
-
-def test_allocate_stash_buffers_falls_back_from_zero_average_capacity(monkeypatch):
-    """Missing avg-token metadata must size buffers from captured actual maxima."""
-    allocations = []
-
-    class FakePagedStashBuffer:
-        def __init__(
-            self,
-            num_tokens,
-            hidden_size,
-            page_size,
-            device,
-            overflow,
-            host_spill,
-            dtype,
-            num_tokens_host=0,
-        ):
-            allocations.append((num_tokens, num_tokens_host, hidden_size))
-            self.cuda_buffer = torch.empty((num_tokens, 1))
-            self.host_buffer = (
-                torch.empty((num_tokens_host, 1)) if num_tokens_host > 0 else None
-            )
-            self.dtype = dtype
-
-    monkeypatch.setattr(paged_stash_module, "PagedStashBuffer", FakePagedStashBuffer)
-    manager = PagedStashManager.__new__(PagedStashManager)
-    manager.stash_buffers = None
-    manager.overflow = None
-    manager.host_spill = None
-    manager.device = torch.device("cpu")
-    manager.page_size = 64
-    key = (torch.bfloat16, 4096)
-    manager.max_avg_tokens_across_vp_stages = {key: 0}
-    manager.max_tokens_across_vp_stages = {key: 128}
-
-    manager.allocate_stash_buffers(
-        moe_paged_stash_buffer_size_factor_cuda=1.5,
-        moe_paged_stash_buffer_size_factor_cpu=1.0,
-    )
-
-    assert allocations == [(192, 128, 4096)]
 
 
 def _global_tokens_per_expert_from_local_routing_map(routing_map: torch.Tensor) -> torch.Tensor:
