@@ -89,6 +89,11 @@ class TransformerConfig(ModelParallelConfig):
     mtp_use_repeated_layer: bool = False
     """Use a single MTP layer repeatedly instead of multiple separate layers."""
 
+    mtp_repeated_layer_shared_components: Optional[List[str]] = None
+    """Components obtained by the first repeated MTP layer invocation and reused by later ones.
+    Currently supported components are "latent_kv" and "sparse_attention_index". None or an
+    empty list disables repeated-layer sharing."""
+
     mtp_detach_heads: bool = False
     """If True, detach MTP head inputs from the main model graph.
     This prevents MTP loss gradients from flowing back to the main model,
@@ -348,11 +353,12 @@ class TransformerConfig(ModelParallelConfig):
     """Number of top-k tokens to select in DSA indexer."""
 
     dsa_indexer_topk_freq: int = 1
-    """Frequency of DSA indexer top-k computation across layers.
-    A value greater than 1 enables cross-layer top-k sharing."""
+    """Frequency of DSA indexer top-k computation across globally numbered Transformer and MTP
+    layers. A value greater than 1 enables cross-layer top-k sharing. This does not control
+    sharing across repeated MTP layer invocations; use mtp_repeated_layer_shared_components."""
 
     dsa_indexer_skip_topk_offset: int = 0
-    """Layer offset for DSA cross-layer top-k sharing."""
+    """Global layer-number offset for DSA cross-layer top-k sharing."""
 
     dsa_indexer_loss_coeff: Optional[float] = None
     """Coefficient for the DSA indexer KL divergence loss. Set to 0 to disable indexer loss."""
@@ -1804,6 +1810,43 @@ class TransformerConfig(ModelParallelConfig):
                 "Use dsa_kernel_backend='tilelang' or 'none'."
             )
 
+        shared_components = self.mtp_repeated_layer_shared_components
+        if shared_components is not None and not isinstance(shared_components, list):
+            raise ValueError("mtp_repeated_layer_shared_components must be a list or None.")
+        if shared_components is not None:
+            allowed_components = {"latent_kv", "sparse_attention_index"}
+            if any(not isinstance(component, str) for component in shared_components):
+                raise ValueError(
+                    "mtp_repeated_layer_shared_components entries must be strings; supported "
+                    "components are 'latent_kv' and 'sparse_attention_index'."
+                )
+            if len(shared_components) != len(set(shared_components)):
+                raise ValueError(
+                    "mtp_repeated_layer_shared_components must not contain duplicate components."
+                )
+            unknown_components = set(shared_components) - allowed_components
+            if unknown_components:
+                raise ValueError(
+                    "Unsupported mtp_repeated_layer_shared_components "
+                    f"{sorted(unknown_components)}; supported components are "
+                    f"{sorted(allowed_components)}."
+                )
+
+        if shared_components:
+            if self.experimental_attention_variant != "dsa":
+                raise ValueError(
+                    "mtp_repeated_layer_shared_components currently requires "
+                    "experimental_attention_variant='dsa'."
+                )
+            if not self.mtp_use_repeated_layer:
+                raise ValueError(
+                    "mtp_repeated_layer_shared_components requires mtp_use_repeated_layer=True."
+                )
+            if self.mtp_num_layers is None or self.mtp_num_layers <= 1:
+                raise ValueError(
+                    "mtp_repeated_layer_shared_components requires mtp_num_layers > 1."
+                )
+
         if is_gated_delta_net_variant(self.experimental_attention_variant):
             if not self.is_hybrid_model:
                 assert (
@@ -2574,6 +2617,15 @@ class TransformerConfig(ModelParallelConfig):
             self.recompute_modules = ["core_attn"]
 
         if self.recompute_granularity == "selective":
+            if (
+                "latent_kv" in (self.mtp_repeated_layer_shared_components or [])
+                and "core_attn" in self.recompute_modules
+            ):
+                raise ValueError(
+                    "mtp_repeated_layer_shared_components containing latent_kv does not support "
+                    "selective core_attn recompute. Use full recompute, select mla_up_proj "
+                    "instead, or disable latent_kv sharing."
+                )
             if len(self.recompute_modules) > 0:
                 allowed_modules = {
                     "core_attn",
@@ -3697,6 +3749,11 @@ class TransformerConfig(ModelParallelConfig):
                 f"(experimental_attention_variant={self.experimental_attention_variant!r}, "
                 f"cuda_graph_impl={self.cuda_graph_impl!r}, "
                 f"cuda_graph_modules={self.cuda_graph_modules!r})."
+            )
+        if self.mtp_repeated_layer_shared_components and cuda_graph_captures_attention:
+            raise ValueError(
+                "mtp_repeated_layer_shared_components does not support CUDA graph capture that "
+                "includes attention. Use a MoE-only scope or disable CUDA graphs."
             )
 
         if self.cuda_graph_impl != "none":

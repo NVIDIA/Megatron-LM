@@ -15,6 +15,7 @@ from megatron.core.models.gpt.experimental_attention_variant_module_specs import
     get_dsa_module_spec_for_backend,
     get_experimental_attention_variant_module_spec,
 )
+from megatron.core.models.gpt.gpt_layer_specs import _validate_dsa_mtp_index_share_pipeline_split
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
@@ -30,6 +31,7 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
     DSAttention,
     DSAttentionSubmodules,
     FusedDSAIndexerLoss,
+    _DSAIndexSharingPayload,
     _run_sparse_attention,
     _validate_nonpacked_cp_uniform_length,
     compute_dsa_indexer_loss,
@@ -54,6 +56,7 @@ from megatron.core.transformer.experimental_attention_variant.dsa_masking import
     masked_log_softmax,
     scatter_topk_into_index_mask,
 )
+from megatron.core.transformer.forward_sharing import get_forward_sharing_state
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
@@ -112,6 +115,23 @@ class TestDSAIndexShareHelpers:
         with pytest.raises(RuntimeError, match="pipeline split is invalid"):
             _validate_dsa_index_share_pipeline_split(config, [1, 2, 3, 4])
 
+    @pytest.mark.parametrize("shared_components", [["latent_kv"], ["sparse_attention_index"]])
+    def test_repeated_mtp_index_share_rejects_cross_segment_source(self, shared_components):
+        config = SimpleNamespace(
+            experimental_attention_variant="dsa",
+            mtp_repeated_layer_shared_components=shared_components,
+            dsa_indexer_topk_freq=4,
+            dsa_indexer_skip_topk_offset=3,
+        )
+
+        _validate_dsa_mtp_index_share_pipeline_split(
+            config, local_decoder_layer_ids=[2], mtp_layer_number=4
+        )
+        with pytest.raises(RuntimeError, match="repeated-MTP IndexShare pipeline split"):
+            _validate_dsa_mtp_index_share_pipeline_split(
+                config, local_decoder_layer_ids=[], mtp_layer_number=4
+            )
+
     def test_skip_layer_does_not_build_indexer(self, monkeypatch):
         def fail_build_module(*_args, **_kwargs):
             raise AssertionError("skip layers must not build indexer modules")
@@ -124,6 +144,7 @@ class TestDSAIndexShareHelpers:
             dsa_indexer_topk=8,
             dsa_indexer_topk_freq=4,
             dsa_indexer_skip_topk_offset=1,
+            mtp_repeated_layer_shared_components=None,
             kv_channels=16,
         )
 
@@ -141,11 +162,12 @@ class TestDSAIndexShareHelpers:
         assert attention.indexer is None
         assert attention.source_layer == 1
 
-    def test_index_share_holder_uses_attention_mask_without_packed_seq_params(self):
+    def test_index_share_state_uses_attention_mask_without_packed_seq_params(self):
         config = SimpleNamespace(
             dsa_indexer_topk=8,
             dsa_indexer_topk_freq=4,
             dsa_indexer_skip_topk_offset=1,
+            mtp_repeated_layer_shared_components=None,
             kv_channels=16,
         )
         attention = DSAttention(
@@ -159,19 +181,20 @@ class TestDSAIndexShareHelpers:
         )
         attention_mask = torch.empty(1)
 
-        topk_holder = attention._get_index_share_topk_holder(None, attention_mask)
-        length_holder = attention._get_index_share_topk_length_holder(None, attention_mask)
+        index_payload = attention._get_dsa_index_sharing_payload(None, attention_mask)
 
-        assert topk_holder is getattr(attention_mask, DSAttention._HOLDER_ATTR)
-        assert length_holder is getattr(attention_mask, DSAttention._LENGTH_HOLDER_ATTR)
-        assert not hasattr(config, DSAttention._HOLDER_ATTR)
-        assert not hasattr(config, DSAttention._LENGTH_HOLDER_ATTR)
+        forward_state = get_forward_sharing_state(None, attention_mask, config)
+        dsa_payload = forward_state.get(_DSAIndexSharingPayload)
+        assert dsa_payload is not None
+        assert index_payload is dsa_payload
+        assert not hasattr(config, "_forward_sharing_state")
 
-    def test_index_share_holder_uses_packed_seq_params_when_available(self):
+    def test_index_share_state_uses_packed_seq_params_when_available(self):
         config = SimpleNamespace(
             dsa_indexer_topk=8,
             dsa_indexer_topk_freq=4,
             dsa_indexer_skip_topk_offset=1,
+            mtp_repeated_layer_shared_components=None,
             kv_channels=16,
         )
         attention = DSAttention(
@@ -186,15 +209,13 @@ class TestDSAIndexShareHelpers:
         packed_seq_params = PackedSeqParams(qkv_format="thd")
         attention_mask = torch.empty(1)
 
-        topk_holder = attention._get_index_share_topk_holder(packed_seq_params, attention_mask)
-        length_holder = attention._get_index_share_topk_length_holder(
-            packed_seq_params, attention_mask
-        )
+        index_payload = attention._get_dsa_index_sharing_payload(packed_seq_params, attention_mask)
 
-        assert topk_holder is getattr(packed_seq_params, DSAttention._HOLDER_ATTR)
-        assert length_holder is getattr(packed_seq_params, DSAttention._LENGTH_HOLDER_ATTR)
-        assert not hasattr(attention_mask, DSAttention._HOLDER_ATTR)
-        assert not hasattr(attention_mask, DSAttention._LENGTH_HOLDER_ATTR)
+        forward_state = get_forward_sharing_state(packed_seq_params, attention_mask, config)
+        dsa_payload = forward_state.get(_DSAIndexSharingPayload)
+        assert dsa_payload is not None
+        assert index_payload is dsa_payload
+        assert not hasattr(attention_mask, "_forward_sharing_state")
 
 
 def _build_packed_causal_mask_for_test(

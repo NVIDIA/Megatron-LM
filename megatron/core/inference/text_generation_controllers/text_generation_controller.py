@@ -137,6 +137,13 @@ class TextGenerationController:
         inference_config = self.inference_wrapped_model.inference_context.config
         self.tokenizer = tokenizer
         self.num_speculative_tokens = inference_config.num_speculative_tokens
+        if self.num_speculative_tokens and self.model_config.mtp_repeated_layer_shared_components:
+            raise ValueError(
+                "mtp_repeated_layer_shared_components is not supported with speculative "
+                "decoding because serial compute_mtp_single_step calls do not provide one "
+                "ordered forward repeat chain. Clear "
+                "mtp_repeated_layer_shared_components or set num_speculative_tokens=0."
+            )
 
         pg_collection = inference_config.pg_collection
         if pg_collection is not None:
