@@ -1333,6 +1333,29 @@ def test_metadata_same_layout_rejects_chunk_layout_mismatch():
         )
 
 
+def test_metadata_same_layout_accepts_reordered_chunks():
+    weighted_merge_module._validate_metadata_same_layout(
+        tensor_metadata_by_checkpoint=[
+            {
+                "model.weight": _fake_tensor_metadata(
+                    shape=(4, 2),
+                    chunks=(((0, 0), (2, 2)), ((2, 0), (2, 2))),
+                )
+            },
+            {
+                "model.weight": _fake_tensor_metadata(
+                    shape=(4, 2),
+                    chunks=(((2, 0), (2, 2)), ((0, 0), (2, 2))),
+                )
+            },
+        ],
+        byte_extra_state_keys_by_checkpoint=[(), ()],
+        resolved_input_dirs=[Path("checkpoint_a"), Path("checkpoint_b")],
+        model_key_prefixes=weighted_merge_module.METADATA_SAME_LAYOUT_MODEL_PREFIXES,
+        require_matching_chunks=True,
+    )
+
+
 @pytest.mark.parametrize(
     "sidecar_target",
     [

@@ -1217,11 +1217,13 @@ def _metadata_same_layout_tensor_layout(
     fqn: str, metadata_entry: TensorStorageMetadata
 ) -> _DcpMetadataTensorLayout:
     chunks = tuple(
-        (
-            tuple(int(offset) for offset in chunk.offsets),
-            tuple(int(size) for size in chunk.sizes),
+        sorted(
+            (
+                tuple(int(offset) for offset in chunk.offsets),
+                tuple(int(size) for size in chunk.sizes),
+            )
+            for chunk in getattr(metadata_entry, "chunks", ()) or ()
         )
-        for chunk in getattr(metadata_entry, "chunks", ()) or ()
     )
     if not chunks:
         raise WeightedMergeError(f"DCP metadata for '{fqn}' has no tensor chunks.")
