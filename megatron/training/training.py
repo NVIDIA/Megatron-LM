@@ -894,6 +894,7 @@ def num_floating_point_operations(
         kda_conv_kernel_dim=4,
         vocab_size=256000,
         mtp_num_layers=0,
+        mtp_loss_type="cross_entropy",
         q_lora_rank=None,
         kv_lora_rank=0,
         qk_head_dim=0,
@@ -1018,7 +1019,14 @@ def num_floating_point_operations(
             2 * mtp_num_layers * (3 * hidden_size + 2 * hidden_size * hidden_size) * total_tokens
             + 2 * total_tokens * hidden_size * vocab_size * (1 + mtp_num_layers)
         )
-        return flops_fwd * 3
+        # E2E TV projects the frozen backbone once to produce target logits.
+        # This projection has no backward pass because the target distribution
+        # is detached. Softmax/overlap elementwise work is omitted consistently
+        # with the existing cross-entropy FLOPs convention.
+        e2e_tv_target_projection_flops = (
+            2 * total_tokens * hidden_size * vocab_size if mtp_loss_type == "e2e_tv" else 0
+        )
+        return flops_fwd * 3 + e2e_tv_target_projection_flops
 
     def transformer_flops():
         """Calculate FLOPs for a standard Transformer model."""
@@ -1432,6 +1440,11 @@ def num_floating_point_operations(
                 * args.hidden_size
                 * args.padded_vocab_size
                 * (mtp_num_layers + 1)  # MTP + final logit
+                # E2E TV target distribution: one frozen forward-only output projection.
+                + fma_expansion_factor
+                * args.hidden_size
+                * args.padded_vocab_size
+                * int(getattr(args, "mtp_loss_type", "cross_entropy") == "e2e_tv")
             )
             # Self Attention (core L^2 part). For BSHD the default
             # ``seqlen_squared_sum_in_batch = batch_size * seq_length^2`` recovers the
@@ -1546,6 +1559,7 @@ def num_floating_point_operations(
             kda_conv_kernel_dim=args.linear_conv_kernel_dim or 4,
             vocab_size=args.padded_vocab_size,
             mtp_num_layers=mtp_num_layers,
+            mtp_loss_type=getattr(args, "mtp_loss_type", "cross_entropy"),
             q_lora_rank=args.q_lora_rank,
             kv_lora_rank=args.kv_lora_rank,
             qk_head_dim=args.qk_head_dim,
@@ -5116,7 +5130,7 @@ def evaluate(
             ft_integration.on_eval_step_start()
             if getattr(config, 'sequence_packing_scheduler', None) is not None:
                 try:
-                    (packed_data_iterator, scheduled_eval_num_microbatches, _, _) = (
+                    packed_data_iterator, scheduled_eval_num_microbatches, _, _ = (
                         wrap_data_iterator(data_iterator, config, eval_num_microbatches)
                     )
                 except StopIteration:
@@ -5414,7 +5428,7 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
 
     args = get_args()
 
-    (train_dataloader, valid_dataloaders, test_dataloader) = (None, None, None)
+    train_dataloader, valid_dataloaders, test_dataloader = (None, None, None)
 
     print_rank_0('> building train, validation, and test datasets ...')
 
