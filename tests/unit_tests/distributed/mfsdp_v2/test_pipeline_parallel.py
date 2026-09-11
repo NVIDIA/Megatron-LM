@@ -67,9 +67,7 @@ class TestMfsdpV2PipelineSharedContext:
         """Destroy the process groups initialized in ``setup_method``."""
         Utils.destroy_model_parallel()
 
-    @pytest.mark.skipif(
-        torch.cuda.device_count() < 2, reason="Requires at least 2 CUDA devices."
-    )
+    @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Requires at least 2 CUDA devices.")
     def test_shared_context_across_virtual_pipeline_chunks(self, distributed_setup):
         """Multiple virtual-pipeline chunks wrapped in one call share one FsdpContext."""
         device = distributed_setup.device
@@ -78,9 +76,7 @@ class TestMfsdpV2PipelineSharedContext:
         # rank; model two virtual-pipeline sub-stages here. The ambient
         # fully_shard_context is opened for every MFSDP v2 wrap, regardless of the
         # chunk count.
-        chunks = [
-            _VirtualPipelineChunk().to(device=device, dtype=torch.bfloat16) for _ in range(2)
-        ]
+        chunks = [_VirtualPipelineChunk().to(device=device, dtype=torch.bfloat16) for _ in range(2)]
 
         wrapped_chunks = wrap_model_chunks_with_ddp(
             chunks,

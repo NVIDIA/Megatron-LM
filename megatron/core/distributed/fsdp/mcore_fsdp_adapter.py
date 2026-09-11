@@ -747,10 +747,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         # wrap_model_chunks_with_ddp / dist_utils._ddp_wrap). The data-parallel mesh is
         # built solely from dp_cp, so DP sharding is unaffected by how layers are split
         # across pipeline stages or virtual stages.
-        unsupported_parallelisms = [
-            "tensor_model_parallel_size",
-            "context_parallel_size",
-        ]
+        unsupported_parallelisms = ["tensor_model_parallel_size", "context_parallel_size"]
         if any(getattr(config, parallelism) != 1 for parallelism in unsupported_parallelisms):
             raise ValueError(
                 "MFSDP v2 does not currently support: "
