@@ -303,6 +303,33 @@ def _normalize_dsv4_hybrid_csa_compress_ratios(args, kw_args, pattern):
     if variant != 'dsv4_hybrid':
         return
 
+    version = kw_args.get('dsv4_version', getattr(args, 'dsv4_version', 'v4'))
+    if version == 'v4.1':
+        layers = pattern.replace(Symbols.PIPE, '').replace(Symbols.MTP_SEPARATOR, '')
+        assert not any(
+            symbol in (Symbols.CSA, Symbols.HCA) for symbol in layers
+        ), "V4.1 does not support the fixed-ratio C/H hybrid symbols; use D instead."
+        provided = getattr(args, 'csa_compress_ratios', None)
+        assert provided is not None and len(provided) == len(layers), (
+            "V4.1 csa_compress_ratios must contain one entry per Hybrid layer "
+            f"({len(layers)} entries), including zeros for non-attention layers."
+        )
+        for ratio, symbol in zip(provided, layers):
+            assert type(ratio) is int and ratio in (
+                0,
+                1,
+                2,
+            ), "V4.1 csa_compress_ratios must contain only integer ratios 0, 1, or 2."
+            if symbol != Symbols.DS_ATTENTION:
+                assert (
+                    ratio == 0
+                ), f"V4.1 hybrid symbol '{symbol}' requires compression ratio 0, got {ratio}."
+        # V4.1 uses actual Hybrid layer indices for both ratios and CSA2 sources.
+        # Keep the full CLI list so rebuilding a config does not reinterpret its indices.
+        args.csa_compress_ratios = list(provided)
+        kw_args['csa_compress_ratios'] = list(provided)
+        return
+
     fixed_ratio_map = {Symbols.WINDOW: 0, Symbols.CSA: 4, Symbols.HCA: 128}
     ratio_symbols = set(fixed_ratio_map)
     sections = pattern.split(Symbols.MTP_SEPARATOR)

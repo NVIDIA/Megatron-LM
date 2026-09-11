@@ -13,6 +13,7 @@ from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.models.gpt.moe_module_specs import (
     get_inference_optimized_moe_spec,
     get_moe_module_spec,
+    get_moe_module_spec_for_backend,
 )
 from megatron.core.models.hybrid.hybrid_block import HybridStack, HybridStackSubmodules
 from megatron.core.ssm.gated_delta_net import (
@@ -400,7 +401,7 @@ def hybrid_dsv4_stack_spec(config):
     (which is config-aware, e.g. picks the qk-layernorm form from ``config``) so the two
     model paths build the *same* attention module. Selected via
     ``--spec megatron.core.models.hybrid.hybrid_layer_specs hybrid_dsv4_stack_spec``;
-    ``hybrid_builder`` invokes this function with ``config`` when the spec is callable.
+    ``hybrid_config_from_args`` invokes this function with ``config`` when the spec is callable.
     """
     import dataclasses
 
@@ -438,4 +439,19 @@ def hybrid_dsv4_stack_spec(config):
         hca_layer=_wrap_dsv4_layer(compress_ratio=128),  # 'H': HCA
         window_layer=_wrap_dsv4_layer(compress_ratio=0),  # 'W': sliding-window-only
     )
+    if config.dsv4_version == "v4.1" and config.num_moe_experts is not None:
+        # V4.1's native path must honor the configured expert implementation instead of
+        # inheriting the grouped-GEMM MoE from the default Hybrid spec.
+        submodules.moe_layer = dataclasses.replace(
+            submodules.moe_layer,
+            submodules=dataclasses.replace(
+                submodules.moe_layer.submodules,
+                mlp=get_moe_module_spec_for_backend(
+                    backend=backend,
+                    num_experts=config.num_moe_experts,
+                    moe_grouped_gemm=config.moe_grouped_gemm,
+                    use_te_activation_func=config.use_te_activation_func,
+                ),
+            ),
+        )
     return ModuleSpec(module=HybridStack, submodules=submodules)
