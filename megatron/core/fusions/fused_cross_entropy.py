@@ -33,7 +33,7 @@ def calculate_predicted_logits(
     """
     Calculates the predicted logits for the tokens.
     """
-    (target_mask, masked_target_1d, predicted_logits, sum_exp_logits, exp_logits) = (
+    target_mask, masked_target_1d, predicted_logits, sum_exp_logits, exp_logits = (
         VocabParallelCrossEntropy.calculate_predicted_logits(
             vocab_parallel_logits, target, logits_max, vocab_start_index, vocab_end_index
         )
@@ -72,7 +72,7 @@ def calculate_gradients(
     """
     Calculate the logits gradients scaled based on the CE loss
     """
-    (grad_2d, arange_1d, softmax_update, grad_input) = (
+    grad_2d, arange_1d, softmax_update, grad_input = (
         VocabParallelCrossEntropy.prepare_gradient_calculation_operands(softmax, target_mask)
     )
 
@@ -107,7 +107,7 @@ class _VocabParallelCrossEntropy(torch.autograd.Function):
             partition_vocab_size, tp_group.rank(), tp_group.size()
         )
 
-        (target_mask, masked_target_1d, predicted_logits_sum_exp_logits, exp_logits) = (
+        target_mask, masked_target_1d, predicted_logits_sum_exp_logits, exp_logits = (
             calculate_predicted_logits(
                 vocab_parallel_logits, target, logits_max, vocab_start_index, vocab_end_index
             )

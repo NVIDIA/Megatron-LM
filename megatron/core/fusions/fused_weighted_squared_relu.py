@@ -194,9 +194,7 @@ class WeightedSquaredReLUFunction(torch.autograd.Function):
 
 
 def weighted_squared_relu_impl(
-    input: torch.Tensor,
-    weights: Optional[torch.Tensor] = None,
-    clamp_scale: Optional[float] = None,
+    input: torch.Tensor, weights: Optional[torch.Tensor] = None, clamp_scale: Optional[float] = None
 ) -> torch.Tensor:
     """Squared-ReLU fusion with optional per-token weights and optional tanh soft clamping.
 
