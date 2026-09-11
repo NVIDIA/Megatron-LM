@@ -378,8 +378,6 @@ class _WeightedMergeDirectOutputSavePlanner(SavePlanner):
         value = loaded[spec.path]
         if isinstance(value, io.BytesIO):
             value = io.BytesIO(value.getvalue())
-        elif isinstance(value, (bytes, bytearray)):
-            value = io.BytesIO(value)
         else:
             value = copy.deepcopy(value)
         serialized = io.BytesIO()

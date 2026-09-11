@@ -280,6 +280,18 @@ def _write_unprefixed_gpt_like_checkpoint_with_byte_extra_state(
     dist_checkpointing.save(state, str(path))
 
 
+def _write_unprefixed_gpt_like_checkpoint_with_raw_byte_extra_state(path, value, extra_value):
+    state = _unprefixed_gpt_like_model_state(value)
+    state[UNPREFIXED_GPT_BYTE_EXTRA_STATE_KEY] = ShardedObject(
+        UNPREFIXED_GPT_BYTE_EXTRA_STATE_KEY,
+        extra_value,
+        (_world_size(),),
+        (_rank(),),
+        replica_id=0,
+    )
+    dist_checkpointing.save(state, str(path))
+
+
 def _write_unprefixed_gpt_like_checkpoint_with_mtp_state(path, value, extra_value):
     state = _unprefixed_gpt_like_model_state(value)
     state["mtp.layers.0.eh_proj.weight"] = ShardedTensor.from_rank_offsets(
@@ -1096,6 +1108,41 @@ def test_metadata_same_layout_copies_unprefixed_byte_extra_state_from_selected_s
         normal_extra_state = normal_loaded[UNPREFIXED_GPT_BYTE_EXTRA_STATE_KEY]
         normal_extra_state.seek(0)
         assert torch.load(normal_extra_state, weights_only=False) == {"value": 999}
+
+
+@pytest.mark.parametrize("extra_value", [b"raw bytes", bytearray(b"raw bytearray")])
+def test_metadata_same_layout_preserves_raw_byte_extra_state_type(
+    tmp_path_dist_ckpt, process_group, extra_value
+):
+    with (
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_raw_bytes_a") as ckpt_a,
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_raw_bytes_b") as ckpt_b,
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_raw_bytes_out") as output_root,
+    ):
+        _write_unprefixed_gpt_like_checkpoint_with_raw_byte_extra_state(
+            ckpt_a, 1.0, type(extra_value)(b"other")
+        )
+        _write_unprefixed_gpt_like_checkpoint_with_raw_byte_extra_state(
+            ckpt_b, 5.0, extra_value
+        )
+
+        result = merge_same_layout_dcp_metadata_checkpoints(
+            [ckpt_a, ckpt_b],
+            [0.25, 0.75],
+            output_root,
+            output_iteration=51,
+            extra_state_source_index=1,
+        )
+
+        object_key = f"{UNPREFIXED_GPT_BYTE_EXTRA_STATE_KEY}/shard_0_1"
+        loaded = dist_checkpointing.load(
+            {object_key: ShardedObject.empty_from_unique_key(object_key)},
+            str(result.output_dir),
+            validate_access_integrity=False,
+        )
+        merged_value = _decode_sharded_object_value(loaded[object_key])
+        assert type(merged_value) is type(extra_value)
+        assert merged_value == extra_value
 
 
 def test_metadata_same_layout_accepts_unprefixed_mtp_tensor_and_byte_extra_state(
