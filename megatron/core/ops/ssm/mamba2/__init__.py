@@ -8,3 +8,5 @@ owns parameters and recurrent state, and performs CP transformations outside
 these local kernels. Packed offsets, initial states and output buffers are
 explicit kernel inputs. Keep existing dtype, graph and determinism guards.
 """
+
+from .kernel_metadata import KERNELS as KERNELS

@@ -16,6 +16,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Protocol
 
+from .kernel_metadata import KERNELS as KERNELS
+
 if TYPE_CHECKING:
     import torch
 

@@ -19,6 +19,7 @@ import torch.nn.functional as F
 from megatron.core.fp8_utils import get_fp8_align_size
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.jit import jit_fuser
+from megatron.core.ops.kernel_metadata import DeterminismPolicy, validate_kernels
 from megatron.core.ops.ssm.gated_delta import GatedDeltaRuleInterface
 from megatron.core.ops.ssm.gated_delta.fla import (
     HAVE_FLA,
@@ -26,6 +27,7 @@ from megatron.core.ops.ssm.gated_delta.fla import (
     chunk_gated_delta_rule,
     l2norm,
 )
+from megatron.core.ops.ssm.gated_delta.kernel_metadata import FLA_CONV, FLA_L2NORM
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.mamba_context_parallel import (
@@ -128,6 +130,12 @@ class _GDNBase(MegatronModule):
                 "FLA is not installed. Please install it with "
                 "`pip install flash-linear-attention[cuda]`."
             )
+        validate_kernels(
+            (FLA_CONV, FLA_L2NORM) if use_qk_l2norm else (FLA_CONV,),
+            determinism=(
+                DeterminismPolicy.WARN if config.deterministic_mode else DeterminismPolicy.IGNORE
+            ),
+        )
 
         super().__init__(config)
 

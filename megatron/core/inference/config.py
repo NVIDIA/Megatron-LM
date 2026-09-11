@@ -76,6 +76,7 @@ class MambaInferenceStateConfig:
     ) -> Optional["MambaInferenceStateConfig"]:
         """Return recurrent inference state config for a Mamba or GDN hybrid model."""
         from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
+        from megatron.core.ops.kernel_metadata import DeterminismPolicy, validate_kernels
         from megatron.core.ssm.ssm_inference import ssm_chunking
 
         decoder = get_attr_wrapped_model(model, "decoder")
@@ -98,6 +99,21 @@ class MambaInferenceStateConfig:
                 and model.config.experimental_attention_variant == "gdn2"
             ):
                 raise NotImplementedError("GDN2 does not support dynamic inference.")
+            # Inspect actual pipeline-local owners, not the global layer allocation.
+            for layer in decoder.layers:
+                for attribute in ("mixer", "self_attention"):
+                    mixer = getattr(layer, attribute, None)
+                    # Older/custom mixers may not expose declarations. Check the type
+                    # rather than triggering dynamic attributes on wrappers or test doubles.
+                    if callable(getattr(type(mixer), "get_inference_kernel_metadata", None)):
+                        validate_kernels(
+                            mixer.get_inference_kernel_metadata(),
+                            determinism=(
+                                DeterminismPolicy.WARN
+                                if getattr(model.config, "deterministic_mode", False)
+                                else DeterminismPolicy.IGNORE
+                            ),
+                        )
             mamba_conv_states_shape, mamba_ssm_states_shape = (
                 decoder.mamba_state_shapes_per_request()
             )

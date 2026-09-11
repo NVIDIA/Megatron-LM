@@ -52,6 +52,10 @@ def torch_chunk_gdn2(
 
     initial_dtype = q.dtype
     if use_qk_l2norm_in_kernel:
+        if l2norm is None:
+            raise ImportError(
+                "GDN2 reference Q/K normalization requires flash-linear-attention's l2norm."
+            )
         q = l2norm(q, dim=-1, eps=1e-6)
         k = l2norm(k, dim=-1, eps=1e-6)
 

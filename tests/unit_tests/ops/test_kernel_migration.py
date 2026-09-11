@@ -129,6 +129,7 @@ def test_dsa_binds_direct_hooks_once_and_keeps_instances_independent(monkeypatch
         return modules[name]
 
     monkeypatch.setattr(dsa_backends, "import_module", load)
+    monkeypatch.setattr(dsa_backends, "validate_kernels", lambda *args, **kwargs: None)
     config = SimpleNamespace(attention_backend="auto", dsa_kernel_backend="tilelang")
     first = select_dsa_kernels(config)
     config.dsa_kernel_backend = "cudnn"

@@ -17,9 +17,15 @@ from megatron.core.inference.contexts.attention_context.triton.tensor_ops import
     tensor_masked_update,
 )
 from megatron.core.jit import jit_fuser
+from megatron.core.ops.kernel_metadata import KernelMetadata
 from megatron.core.ops.ssm.gated_delta.fla import (
     causal_conv1d_update,
     fused_recurrent_gated_delta_rule,
+)
+from megatron.core.ops.ssm.gated_delta.kernel_metadata import (
+    FLA_CONV_UPDATE,
+    GDN_FLA,
+    GDN_RECURRENT,
 )
 from megatron.core.ops.ssm.gated_delta.reference import (
     torch_chunk_gated_delta_rule as torch_chunk_gated_delta_rule,
@@ -40,6 +46,10 @@ __all__ = ["GatedDeltaNet", "torch_chunk_gated_delta_rule"]
 
 class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
     # pylint: disable=missing-class-docstring
+    def get_inference_kernel_metadata(self) -> tuple[KernelMetadata, ...]:
+        """Declare the additional FLA targets selected by dynamic inference."""
+        return (FLA_CONV_UPDATE, GDN_FLA, GDN_RECURRENT)
+
     def _setup_variant_attrs(self, kernel_backend=None):
         """Set the GDN in_proj sizing, split tables, gate parameter dims, and kernel."""
         from megatron.core.models.backends import backend_slot, get_backend_from_config

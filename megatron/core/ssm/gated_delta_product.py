@@ -25,7 +25,21 @@ from megatron.core.inference.contexts import BaseInferenceContext, DynamicInfere
 from megatron.core.inference.contexts.attention_context.triton.tensor_ops import (
     tensor_masked_update,
 )
+from megatron.core.ops.kernel_metadata import (
+    DeterminismPolicy,
+    KernelMetadata,
+    validate_determinism,
+    validate_kernels,
+)
 from megatron.core.ops.ssm.common.causal_conv1d import causal_conv1d_fn
+from megatron.core.ops.ssm.common.kernel_metadata import (
+    CAUSAL_CONV,
+    CAUSAL_CONV_CARRY,
+    CAUSAL_CONV_TRITON_UPDATE,
+    CAUSAL_CONV_VARLEN,
+    SCATTER_CONV,
+    SCATTER_SSM,
+)
 from megatron.core.ops.ssm.gdp.backends import (
     HAVE_CUTEDSL_GDP,
     HAVE_FLA,
@@ -39,6 +53,15 @@ from megatron.core.ops.ssm.gdp.backends import (
     cutedsl_chunk_gated_delta_product as cutedsl_chunk_gated_delta_product,
 )
 from megatron.core.ops.ssm.gdp.backends import l2_norm, select_gated_delta_product
+from megatron.core.ops.ssm.gdp.kernel_metadata import (
+    GDP_CUTEDSL,
+    GDP_DECODE,
+    GDP_FLA,
+    GDP_L2NORM,
+    GDP_PREFILL,
+    GDP_PREPARE,
+)
+from megatron.core.ops.ssm.mamba2.kernel_metadata import MAMBA_NORM
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
@@ -267,6 +290,12 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
             default=lambda: select_gated_delta_product(config.gdp_cutedsl_kernel),
             use_cutedsl=config.gdp_cutedsl_kernel,
         )
+        policy = DeterminismPolicy.WARN if config.deterministic_mode else DeterminismPolicy.IGNORE
+        # Custom providers own their declarations; do not label them as the default backend.
+        if self.gdp_kernel is chunk_gated_delta_product:
+            validate_determinism(GDP_FLA, policy)
+        elif self.gdp_kernel is cutedsl_chunk_gated_delta_product:
+            validate_determinism(GDP_CUTEDSL, policy)
 
         # CuTeDSL releases have used two names for checkpoint coarsening. Probe once and
         # prefer the current API spelling while retaining compatibility with older releases.
@@ -412,6 +441,12 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
 
         # _prepare_qkv feeds the conv channel-last; see assert_causal_conv1d_deterministic.
         assert_causal_conv1d_deterministic(config.deterministic_mode)
+        kernels = [] if config.gdp_cutedsl_kernel else [GDP_L2NORM]
+        if self.rmsnorm:
+            kernels.append(MAMBA_NORM)
+        if causal_conv1d_fn is not None:
+            kernels.append(CAUSAL_CONV)
+        validate_kernels(kernels, determinism=policy)
 
         self.activation = "silu"
         self.act = nn.SiLU()
@@ -1195,6 +1230,19 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
         # transpose is free at l == 1. post_conv_ssm inside it is a no-op here: decode
         # only runs at cp_size == 1.
         return self._postprocess(core_attn_out, z).transpose(0, 1)
+
+    def get_inference_kernel_metadata(self) -> tuple[KernelMetadata, ...]:
+        """Declare the local dynamic-inference fork, not the training backend."""
+        return (
+            GDP_PREFILL,
+            GDP_DECODE,
+            GDP_PREPARE,
+            CAUSAL_CONV_TRITON_UPDATE,
+            CAUSAL_CONV_VARLEN,
+            CAUSAL_CONV_CARRY,
+            SCATTER_CONV,
+            SCATTER_SSM,
+        )
 
     def ssm_prefill(
         self,

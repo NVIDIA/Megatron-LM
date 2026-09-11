@@ -10,6 +10,7 @@ import torch.nn as nn
 from megatron.core.fp8_utils import get_fp8_disabled_context
 from megatron.core.fusions.fused_mla_yarn_rope_apply import fused_mla_rope_inplace
 from megatron.core.models.common.embeddings import RotaryEmbedding, apply_rotary_pos_emb
+from megatron.core.ops.attention.csa import kernel_metadata as csa_metadata
 from megatron.core.ops.attention.csa.reference import (
     _compute_unfused_csa_non_compressed_lse as _compute_unfused_csa_non_compressed_lse,
 )
@@ -33,8 +34,10 @@ from megatron.core.ops.attention.csa.reference import get_window_topk_idxs as ge
 from megatron.core.ops.attention.csa.reference import (
     unfused_compressed_sparse_attn as unfused_compressed_sparse_attn,
 )
+from megatron.core.ops.attention.dsa.kernel_metadata import HADAMARD_ROTATION
 from megatron.core.ops.attention.dsa.reference import FusedDSAIndexerLoss, fused_qk_topk_naive
 from megatron.core.ops.attention.dsa.rotation import rotate_activation
+from megatron.core.ops.kernel_metadata import DeterminismPolicy, validate_kernel
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.experimental_attention_variant.dsa import (
@@ -47,15 +50,7 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.typed_torch import apply_module, not_none
 from megatron.core.utils import nvtx_range_pop, nvtx_range_push
 
-#: Bit-exact determinism status for the eager CSA operations introduced here.
-#: The operations use CUDA reductions and indexed accumulation, but bit-exact
-#: repeatability has not been certified, so the conservative status is unknown.
-CSA_OPERATION_DETERMINISM: dict[str, str] = {
-    "unfused_sparse_attention": "unknown",
-    "non_compressed_lse": "unknown",
-    "compressor_pooling": "unknown",
-}
-
+CSA_OPERATION_DETERMINISM: dict[str, str] = csa_metadata.CSA_OPERATION_DETERMINISM
 
 # ---------------------------------------------------------------------------
 # Helper functions for RoPE
@@ -226,6 +221,10 @@ class Compressor(MegatronModule):
 
         if pg_collection is None:
             raise ValueError("Compressor requires an explicit ProcessGroupCollection")
+        policy = DeterminismPolicy.WARN if config.deterministic_mode else DeterminismPolicy.IGNORE
+        validate_kernel(csa_metadata.CSA_POOLING, determinism=policy)
+        if rotate:
+            validate_kernel(HADAMARD_ROTATION, determinism=policy)
         self.pg_collection = pg_collection
 
         self.compress_ratio = compress_ratio
@@ -446,6 +445,12 @@ class CSAIndexer(MegatronModule):
 
         if pg_collection is None:
             raise ValueError("CSAIndexer requires an explicit ProcessGroupCollection")
+        validate_kernel(
+            HADAMARD_ROTATION,
+            determinism=(
+                DeterminismPolicy.WARN if config.deterministic_mode else DeterminismPolicy.IGNORE
+            ),
+        )
         self.pg_collection = pg_collection
 
         self.compress_ratio = compress_ratio
@@ -663,6 +668,9 @@ class CompressedSparseAttention(MegatronModule):
             raise ValueError(
                 "CompressedSparseAttention requires an explicit ProcessGroupCollection"
             )
+        policy = DeterminismPolicy.WARN if config.deterministic_mode else DeterminismPolicy.IGNORE
+        for kernel in csa_metadata.KERNELS:
+            validate_kernel(kernel, determinism=policy)
         self.pg_collection = pg_collection
 
         tp_size = self.pg_collection.tp.size()

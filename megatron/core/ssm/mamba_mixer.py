@@ -20,12 +20,22 @@ from megatron.core.inference.contexts.attention_context.triton.tensor_ops import
     tensor_masked_update,
 )
 from megatron.core.inference.utils import InferenceMode
+from megatron.core.ops.kernel_metadata import DeterminismPolicy, KernelMetadata, validate_kernels
 from megatron.core.ops.ssm.common.causal_conv1d import causal_conv1d_fn, causal_conv1d_update_cuda
 from megatron.core.ops.ssm.common.causal_conv1d_triton import causal_conv1d_update
 from megatron.core.ops.ssm.common.causal_conv1d_varlen import causal_conv1d_varlen_carry_states
 from megatron.core.ops.ssm.common.intermediate_extraction import (
     scatter_intermediate_conv,
     scatter_intermediate_ssm,
+)
+from megatron.core.ops.ssm.common.kernel_metadata import (
+    CAUSAL_CONV,
+    CAUSAL_CONV_CARRY,
+    CAUSAL_CONV_CUDA_UPDATE,
+    CAUSAL_CONV_TRITON_UPDATE,
+    CAUSAL_CONV_VARLEN,
+    SCATTER_CONV,
+    SCATTER_SSM,
 )
 from megatron.core.ops.ssm.mamba2.backends import (
     HAVE_MAMBA_SSM,
@@ -35,6 +45,14 @@ from megatron.core.ops.ssm.mamba2.backends import (
     mamba_split_conv1d_scan_combined,
 )
 from megatron.core.ops.ssm.mamba2.batch_invariant_decode import MambaBatchInvariantDecode
+from megatron.core.ops.ssm.mamba2.kernel_metadata import (
+    MAMBA_BATCH_INVARIANT,
+    MAMBA_DECODE,
+    MAMBA_NORM,
+    MAMBA_PREFILL,
+    MAMBA_SCAN,
+    MAMBA_SPLIT_SCAN,
+)
 from megatron.core.ops.ssm.mamba2.mamba_ssm import selective_state_update
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -348,6 +366,13 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule):
 
         # Both of this mixer's conv layouts need it; see assert_causal_conv1d_deterministic.
         assert_causal_conv1d_deterministic(config.deterministic_mode)
+        policy = DeterminismPolicy.WARN if config.deterministic_mode else DeterminismPolicy.IGNORE
+        kernels = [MAMBA_SPLIT_SCAN if self.use_mem_eff_path else MAMBA_SCAN]
+        if self.rmsnorm:
+            kernels.append(MAMBA_NORM)
+        if causal_conv1d_fn is not None:
+            kernels.append(CAUSAL_CONV)
+        validate_kernels(kernels, determinism=policy)
 
         self.activation = "silu"
         self.act = nn.SiLU()
@@ -710,6 +735,17 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule):
             y = self.norm(y)
 
         return y
+
+    def get_inference_kernel_metadata(self) -> tuple[KernelMetadata, ...]:
+        """Declare prefill/decode dependencies before inference allocates its caches."""
+        kernels = [MAMBA_PREFILL, CAUSAL_CONV_VARLEN, CAUSAL_CONV_CARRY, SCATTER_CONV, SCATTER_SSM]
+        if self.config.batch_invariant_mode:
+            kernels.extend((MAMBA_BATCH_INVARIANT, CAUSAL_CONV_CUDA_UPDATE))
+        else:
+            kernels.append(MAMBA_DECODE)
+            if causal_conv1d_update is not None:
+                kernels.append(CAUSAL_CONV_TRITON_UPDATE)
+        return tuple(kernels)
 
     def ssm_prefill(
         self,

@@ -14,6 +14,7 @@ from megatron.core.models.common.embeddings import (
 )
 from megatron.core.ops.attention.dsa import dsa_layout, dsa_masking
 from megatron.core.ops.attention.dsa.backends import DSAKernels, select_dsa_kernels
+from megatron.core.ops.attention.dsa.kernel_metadata import HADAMARD_ROTATION
 from megatron.core.ops.attention.dsa.reference import (
     _FUSED_DSA_INDEXER_LOSS_INPUT_NAMES as _FUSED_DSA_INDEXER_LOSS_INPUT_NAMES,
 )
@@ -41,6 +42,7 @@ from megatron.core.ops.attention.dsa.reference import (
 from megatron.core.ops.attention.dsa.reference import unfused_dsa_fn as unfused_dsa_fn
 from megatron.core.ops.attention.dsa.rotation import hadamard_transform as hadamard_transform
 from megatron.core.ops.attention.dsa.rotation import rotate_activation as rotate_activation
+from megatron.core.ops.kernel_metadata import DeterminismPolicy, validate_kernel
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
@@ -512,6 +514,15 @@ class DSAIndexer(MegatronModule):
         """
         super().__init__(config=config)
         self.hidden_size = self.config.hidden_size
+        if config.dsa_indexer_rotate_activation:
+            validate_kernel(
+                HADAMARD_ROTATION,
+                determinism=(
+                    DeterminismPolicy.WARN
+                    if config.deterministic_mode
+                    else DeterminismPolicy.IGNORE
+                ),
+            )
         self.qk_pos_emb_head_dim = self.config.qk_pos_emb_head_dim
         self.q_lora_rank = (
             self.config.q_lora_rank

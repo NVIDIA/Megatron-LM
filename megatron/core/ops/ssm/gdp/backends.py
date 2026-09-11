@@ -4,6 +4,9 @@
 
 from typing import Callable
 
+from megatron.core.ops.kernel_metadata import validate_kernel
+from megatron.core.ops.ssm.gdp.kernel_metadata import GDP_CUTEDSL, GDP_FLA
+
 try:
     from mamba_ssm.ops.triton.layernorm_gated import RMSNorm as RMSNormGated
 
@@ -49,9 +52,11 @@ def select_gated_delta_product(use_cutedsl: bool = False) -> Callable:
     if use_cutedsl:
         if cutedsl_chunk_gated_delta_product is None:
             raise ImportError("CuTeDSL GDP requires gdp_attn.")
+        validate_kernel(GDP_CUTEDSL)
         return cutedsl_chunk_gated_delta_product
     if chunk_gated_delta_product is None:
         raise ImportError(
             "GDP requires flash-linear-attention with the gated_delta_product kernel."
         )
+    validate_kernel(GDP_FLA)
     return chunk_gated_delta_product

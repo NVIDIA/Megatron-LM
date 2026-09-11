@@ -9,6 +9,19 @@ from dataclasses import dataclass
 from importlib import import_module
 from typing import TYPE_CHECKING, Callable
 
+from megatron.core.ops.attention.dsa.kernel_metadata import (
+    CUDNN_ATTENTION,
+    CUDNN_FULL,
+    CUDNN_LOSS,
+    CUDNN_TOPK,
+    DSA_INDEXER_REFERENCE,
+    DSA_REFERENCE,
+    TILELANG_ATTENTION,
+    TILELANG_LOSS,
+    TILELANG_TOPK,
+)
+from megatron.core.ops.kernel_metadata import DeterminismPolicy, KernelMetadata, validate_kernels
+
 if TYPE_CHECKING:
     from torch import Tensor
 
@@ -33,6 +46,7 @@ class DSAKernels:
     ) = None
     run_fused_absorbed_sparse_attention: Callable[..., Tensor | None] | None = None
     run_fused_dsa_attention: Callable[..., tuple[Tensor, Tensor] | None] | None = None
+    metadata: tuple[KernelMetadata, ...] = ()
 
     def log_declined(self, hook_name: str) -> None:
         """Keep fallback diagnostics without wrapping or resolving a kernel call."""
@@ -47,15 +61,27 @@ def select_dsa_kernels(config: TransformerConfig) -> DSAKernels:
     """Bind the configured backend once; do not resolve it from a model forward."""
     from megatron.core.ops.attention.dsa import dsa_kernels
 
+    policy = (
+        DeterminismPolicy.WARN
+        if getattr(config, "deterministic_mode", False)
+        else DeterminismPolicy.IGNORE
+    )
     if not dsa_kernels.use_fused_dsa_kernels(config):
+        validate_kernels((DSA_REFERENCE, DSA_INDEXER_REFERENCE), determinism=policy)
         return DSAKernels()
     module_name = dsa_kernels._get_backend_module_name(config)
     assert module_name is not None
     try:
         # Python caches modules; the legacy mutable backend-selection cache is not needed.
         backend = import_module(module_name)
+        declarations = (
+            (TILELANG_TOPK, TILELANG_LOSS, TILELANG_ATTENTION)
+            if config.dsa_kernel_backend == "tilelang"
+            else (CUDNN_TOPK, CUDNN_LOSS, CUDNN_ATTENTION, CUDNN_FULL)
+        )
+        validate_kernels(declarations, determinism=policy)
     except (ImportError, OSError) as exc:
-        raise RuntimeError(f"Failed to import DSA kernel backend {module_name}.") from exc
+        raise RuntimeError(f"Failed to import DSA kernel backend {module_name}: {exc}") from exc
     return DSAKernels(
         backend=config.dsa_kernel_backend,
         run_fused_qk_topk=getattr(backend, "run_fused_qk_topk", None),
@@ -64,4 +90,5 @@ def select_dsa_kernels(config: TransformerConfig) -> DSAKernels:
             backend, "run_fused_absorbed_sparse_attention", None
         ),
         run_fused_dsa_attention=getattr(backend, "run_fused_dsa_attention", None),
+        metadata=declarations,
     )

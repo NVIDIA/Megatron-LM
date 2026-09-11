@@ -44,6 +44,10 @@ def torch_chunk_gated_delta_rule(
     query, key, value = q, k, v
     initial_dtype = query.dtype
     if use_qk_l2norm_in_kernel:
+        if l2norm is None:
+            raise ImportError(
+                "GDN reference Q/K normalization requires flash-linear-attention's l2norm."
+            )
         query = l2norm(query, dim=-1, eps=1e-6)
         key = l2norm(key, dim=-1, eps=1e-6)
     query, key, value, beta, g = [

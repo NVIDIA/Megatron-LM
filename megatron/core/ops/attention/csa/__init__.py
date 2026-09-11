@@ -8,3 +8,5 @@ kernels own no parameters or process groups. Compressors, rotary embeddings,
 learnable sinks, index sharing and checkpointing stay with the model. See each
 callable for dtype and gradient details; bit-exact determinism is not certified.
 """
+
+from .kernel_metadata import KERNELS as KERNELS

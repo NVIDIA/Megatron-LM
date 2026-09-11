@@ -7,3 +7,5 @@ owns slot allocation, sequence metadata and CP exchange. Kernel signatures retai
 the existing layouts and dtype constraints; they are not interchangeable with
 training kernels that provide backward.
 """
+
+from .kernel_metadata import KERNELS as KERNELS

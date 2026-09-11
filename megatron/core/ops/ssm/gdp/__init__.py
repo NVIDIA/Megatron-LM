@@ -23,6 +23,8 @@ All entry points are forward-only.
 
 from importlib import import_module
 
+from .kernel_metadata import KERNELS as KERNELS
+
 _ENTRY_POINT_MODULES = {
     "chunk_gated_delta_product_varlen": ".chunk",
     "gdp_decode_prepare": ".decode_prepare",
@@ -32,6 +34,7 @@ _ENTRY_POINT_MODULES = {
 }
 
 __all__ = [
+    "KERNELS",
     "chunk_gated_delta_product_varlen",
     "fused_recurrent_gated_delta_rule_update",
     "gdp_decode_prepare",
