@@ -49,7 +49,7 @@ from megatron.core.post_training.modelopt.checkpointing import (
     save_modelopt_state,
     save_sharded_modelopt_state,
 )
-from megatron.core.rerun_state_machine import get_rerun_state_machine
+from megatron.core.rerun_state_machine import RerunState, get_rerun_state_machine
 from megatron.core.tokenizers import MegatronTokenizer
 from megatron.core.utils import (
     get_pg_rank,
@@ -2806,11 +2806,19 @@ def load_checkpoint(
             and 'rerun_state_machine' in state_dict
         ):
             rerun_state_machine = get_rerun_state_machine()
-            if rerun_state_machine.validate_state_dict(state_dict['rerun_state_machine']):
+            saved_rerun_state = state_dict['rerun_state_machine']
+            restore_rerun_state = rerun_state_machine.validate_state_dict(saved_rerun_state)
+            idle_rerun_state = (
+                isinstance(saved_rerun_state, dict)
+                and saved_rerun_state.get('state') == RerunState.NOT_RUNNING_YET
+            )
+            # Idle checkpoints still contain a rerun shard for cached save plans.
+            # Include it in strict load requests without resuming a rerun.
+            if restore_rerun_state or idle_rerun_state:
                 gen_sd_rerun_state = rerun_state_machine.state_dict(
                     data_iterator=None, ckpt_format=ckpt_format, force=True
                 )
-                ignore_rerun_state = False
+                ignore_rerun_state = not restore_rerun_state
         if ckpt_world_size != run_world_size or ckpt_tp_pp != run_tp_pp or ckpt_dp != run_dp:
             print_rank_0('Job sharding has changed: Rerun state will be ignored')
 
