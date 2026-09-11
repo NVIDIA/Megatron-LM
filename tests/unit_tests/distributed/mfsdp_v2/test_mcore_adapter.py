@@ -75,6 +75,50 @@ class TestMcoreAdapterDense:
     def teardown_method(self):
         _destroy_model_parallel()
 
+    def test_shared_parameters_are_excluded_from_grad_norm(self):
+        """MFSDP v2 should apply MCore's shared-parameter grad-norm rule."""
+
+        class SharedGradModel(torch.nn.Module):
+            """Model with an ordinary and a pipeline-shared parameter."""
+
+            def __init__(self) -> None:
+                super().__init__()
+                self.ordinary = torch.nn.Parameter(torch.ones(2, device="cuda"))
+                self.shared = torch.nn.Parameter(torch.ones(2, device="cuda"))
+                self.shared.shared = True
+
+            def forward(self) -> torch.Tensor:
+                """Produce gradients of known norms for both parameters."""
+                return 3.0 * self.ordinary.sum() + 4.0 * self.shared.sum()
+
+        config = TransformerConfig(num_layers=1, hidden_size=16, num_attention_heads=4)
+        model = FullyShardedDataParallel(
+            config=config,
+            ddp_config=DistributedDataParallelConfig(
+                use_megatron_fsdp=True,
+                megatron_fsdp_version=2,
+                use_distributed_optimizer=False,
+                data_parallel_sharding_strategy="optim_grads_params",
+            ),
+            module=SharedGradModel(),
+            pg_collection=self.pg_collection,
+        )
+        optimizer = get_megatron_optimizer(
+            OptimizerConfig(optimizer="sgd", lr=1.0e-3, use_distributed_optimizer=False), [model]
+        )
+        assert isinstance(optimizer, FullyShardedOptimizer)
+
+        # MFSDP replaces Parameters with DTensor Parameters, so the marker must survive
+        # that replacement for the optimizer to identify pipeline-shared weights.
+        assert model.module.shared.shared
+        model().backward()
+
+        # Only ordinary has gradient [3, 3], whose global norm is sqrt(18). Including
+        # shared's [4, 4] would incorrectly produce sqrt(50).
+        torch.testing.assert_close(
+            optimizer.get_grad_norm(), torch.tensor(18.0, device="cuda").sqrt()
+        )
+
     def test_init_model_with_meta_device_initializes_fsdp_v2_parameters(self):
         """init_model_with_meta_device should materialize FSDP v2 parameters with configured values."""
 
