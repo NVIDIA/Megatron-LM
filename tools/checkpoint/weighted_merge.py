@@ -1169,16 +1169,25 @@ def _load_tensor_path_group_fast(
 
 
 def _metadata_same_layout_is_model_key(
-    fqn: str, model_key_prefixes: tuple[str, ...]
+    fqn: str,
+    model_key_prefixes: tuple[str, ...],
+    *,
+    include_default_model_roots: bool = True,
 ) -> bool:
-    return (
-        any(fqn.startswith(prefix) for prefix in model_key_prefixes)
-        or METADATA_SAME_LAYOUT_NUMBERED_MODEL_RE.match(fqn) is not None
-        or any(fqn.startswith(root) for root in METADATA_SAME_LAYOUT_UNPREFIXED_MODEL_ROOTS)
+    if any(fqn.startswith(prefix) for prefix in model_key_prefixes):
+        return True
+    if not include_default_model_roots:
+        return False
+    return METADATA_SAME_LAYOUT_NUMBERED_MODEL_RE.match(fqn) is not None or any(
+        fqn.startswith(root) for root in METADATA_SAME_LAYOUT_UNPREFIXED_MODEL_ROOTS
     )
 
 
-def _metadata_same_layout_allowed_roots_label(model_key_prefixes: tuple[str, ...]) -> str:
+def _metadata_same_layout_allowed_roots_label(
+    model_key_prefixes: tuple[str, ...], *, include_default_model_roots: bool = True
+) -> str:
+    if not include_default_model_roots:
+        return f"Allowed model prefixes are exactly {model_key_prefixes}."
     return (
         f"Allowed model prefixes are {model_key_prefixes} plus indexed Megatron "
         f"roots matching model\\d+.; allowed unprefixed roots are "
@@ -1233,7 +1242,11 @@ def _metadata_same_layout_tensor_layout(
 
 
 def _read_public_dcp_metadata(
-    checkpoint_dir: Path, *, model_key_prefixes: tuple[str, ...]
+    checkpoint_dir: Path,
+    *,
+    model_key_prefixes: tuple[str, ...],
+    include_default_model_roots: bool = True,
+    required_model_key_prefixes: tuple[str, ...] = (),
 ) -> _DcpMetadataSnapshot:
     try:
         metadata = FileSystemReader(checkpoint_dir).read_metadata()
@@ -1251,7 +1264,11 @@ def _read_public_dcp_metadata(
         fqn = str(fqn)
         if isinstance(metadata_entry, TensorStorageMetadata):
             tensor_metadata[fqn] = metadata_entry
-        elif _metadata_same_layout_is_model_key(fqn, model_key_prefixes):
+        elif _metadata_same_layout_is_model_key(
+            fqn,
+            model_key_prefixes,
+            include_default_model_roots=include_default_model_roots,
+        ):
             if isinstance(metadata_entry, BytesStorageMetadata) and (
                 _metadata_same_layout_is_extra_state_key(fqn)
             ):
@@ -1266,13 +1283,23 @@ def _read_public_dcp_metadata(
         raise WeightedMergeError(
             "metadata-same-layout refuses byte/object DCP entries outside model roots "
             f"in {checkpoint_dir}: {sample}. "
-            f"{_metadata_same_layout_allowed_roots_label(model_key_prefixes)}"
+            f"{_metadata_same_layout_allowed_roots_label(model_key_prefixes, include_default_model_roots=include_default_model_roots)}"
         )
     if non_tensor_model_keys:
         sample = ", ".join(sorted(non_tensor_model_keys)[:5])
         raise WeightedMergeError(
             "metadata-same-layout currently supports tensor DCP entries only; "
             f"found non-tensor model metadata in {checkpoint_dir}: {sample}."
+        )
+    missing_prefixes = tuple(
+        prefix
+        for prefix in required_model_key_prefixes
+        if not any(fqn.startswith(prefix) for fqn in tensor_metadata)
+    )
+    if missing_prefixes:
+        raise WeightedMergeError(
+            f"Checkpoint {checkpoint_dir} has no tensor entries for required model "
+            f"prefixes {missing_prefixes}."
         )
     return _DcpMetadataSnapshot(
         tensor_metadata=tensor_metadata,
@@ -1285,18 +1312,23 @@ def _metadata_same_layout_model_keys(
     *,
     checkpoint_dir: Path,
     model_key_prefixes: tuple[str, ...],
+    include_default_model_roots: bool = True,
 ) -> tuple[str, ...]:
     unsupported = sorted(
         fqn
         for fqn in tensor_metadata
-        if not _metadata_same_layout_is_model_key(fqn, model_key_prefixes)
+        if not _metadata_same_layout_is_model_key(
+            fqn,
+            model_key_prefixes,
+            include_default_model_roots=include_default_model_roots,
+        )
     )
     if unsupported:
         sample = ", ".join(unsupported[:5])
         raise WeightedMergeError(
             "metadata-same-layout refuses to infer merge policy for non-model "
             f"DCP tensor keys in {checkpoint_dir}: {sample}. "
-            f"{_metadata_same_layout_allowed_roots_label(model_key_prefixes)}"
+            f"{_metadata_same_layout_allowed_roots_label(model_key_prefixes, include_default_model_roots=include_default_model_roots)}"
         )
     model_keys = tuple(sorted(tensor_metadata))
     if not model_keys:
@@ -1312,12 +1344,14 @@ def _validate_metadata_same_layout(
     byte_extra_state_keys_by_checkpoint: list[tuple[str, ...]],
     resolved_input_dirs: list[Path],
     model_key_prefixes: tuple[str, ...],
+    include_default_model_roots: bool = True,
     require_matching_chunks: bool = True,
 ) -> tuple[tuple[str, ...], tuple[str, ...], dict[str, _DcpMetadataTensorLayout]]:
     first_keys = _metadata_same_layout_model_keys(
         tensor_metadata_by_checkpoint[0],
         checkpoint_dir=resolved_input_dirs[0],
         model_key_prefixes=model_key_prefixes,
+        include_default_model_roots=include_default_model_roots,
     )
     expected_key_set = set(first_keys)
     for checkpoint_dir, tensor_metadata in zip(
@@ -1327,6 +1361,7 @@ def _validate_metadata_same_layout(
             tensor_metadata,
             checkpoint_dir=checkpoint_dir,
             model_key_prefixes=model_key_prefixes,
+            include_default_model_roots=include_default_model_roots,
         )
         key_set = set(model_keys)
         if key_set != expected_key_set:
@@ -1585,6 +1620,8 @@ def merge_same_layout_dcp_metadata_checkpoints(
     byte_accounting: str = "rank0",
     merge_style: str | None = None,
     model_key_prefixes: tuple[str, ...] = METADATA_SAME_LAYOUT_MODEL_PREFIXES,
+    include_default_model_roots: bool = True,
+    required_model_key_prefixes: tuple[str, ...] = (),
     balance_rank_work: bool = False,
 ) -> MergeResult:
     """Merge same-layout torch_dist checkpoints using public DCP metadata only.
@@ -1619,6 +1656,16 @@ def merge_same_layout_dcp_metadata_checkpoints(
         )
     if not model_key_prefixes:
         raise WeightedMergeError("model_key_prefixes must contain at least one prefix.")
+    if any(not prefix for prefix in model_key_prefixes):
+        raise WeightedMergeError("model_key_prefixes must not contain empty prefixes.")
+    unknown_required_prefixes = tuple(
+        prefix for prefix in required_model_key_prefixes if prefix not in model_key_prefixes
+    )
+    if unknown_required_prefixes:
+        raise WeightedMergeError(
+            "required_model_key_prefixes must be present in model_key_prefixes; "
+            f"missing {unknown_required_prefixes}."
+        )
 
     resolved_input_dirs = [_resolve_checkpoint_dir(path) for path in input_paths]
     input_formats = [_checkpoint_format(path) for path in resolved_input_dirs]
@@ -1640,7 +1687,10 @@ def merge_same_layout_dcp_metadata_checkpoints(
 
     metadata_snapshots = [
         _read_public_dcp_metadata(
-            checkpoint_dir, model_key_prefixes=model_key_prefixes
+            checkpoint_dir,
+            model_key_prefixes=model_key_prefixes,
+            include_default_model_roots=include_default_model_roots,
+            required_model_key_prefixes=required_model_key_prefixes,
         )
         for checkpoint_dir in resolved_input_dirs
     ]
@@ -1655,6 +1705,7 @@ def merge_same_layout_dcp_metadata_checkpoints(
         byte_extra_state_keys_by_checkpoint=byte_extra_state_keys_by_checkpoint,
         resolved_input_dirs=resolved_input_dirs,
         model_key_prefixes=model_key_prefixes,
+        include_default_model_roots=include_default_model_roots,
         require_matching_chunks=True,
     )
     work_plan = _build_metadata_same_layout_write_specs(
@@ -1889,6 +1940,16 @@ def _add_merge_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         default=0,
         help="Input checkpoint index whose Transformer Engine _extra_state values are copied.",
     )
+    group.add_argument(
+        "--merge-model-prefix",
+        action="append",
+        default=None,
+        help=(
+            "Exact model-state prefix to merge; repeat for each required root. "
+            "When supplied, implicit legacy model roots are disabled and every "
+            "listed prefix must match tensors in every input checkpoint."
+        ),
+    )
     return parser
 
 
@@ -1950,6 +2011,12 @@ def _parse_metadata_same_layout_args(
 
 def _run_metadata_same_layout_cli(args: argparse.Namespace) -> MergeResult:
     input_paths, weights, output_iteration, merge_style = _resolve_cli_inputs_and_weights(args)
+    explicit_model_prefixes = args.merge_model_prefix is not None
+    model_key_prefixes = (
+        tuple(args.merge_model_prefix)
+        if explicit_model_prefixes
+        else METADATA_SAME_LAYOUT_MODEL_PREFIXES
+    )
     return merge_same_layout_dcp_metadata_checkpoints(
         input_paths,
         weights,
@@ -1960,6 +2027,9 @@ def _run_metadata_same_layout_cli(args: argparse.Namespace) -> MergeResult:
         extra_state_source_index=args.extra_state_source_index,
         byte_accounting=args.merge_byte_accounting,
         merge_style=merge_style,
+        model_key_prefixes=model_key_prefixes,
+        include_default_model_roots=not explicit_model_prefixes,
+        required_model_key_prefixes=(model_key_prefixes if explicit_model_prefixes else ()),
         balance_rank_work=args.merge_balance_rank_work,
     )
 

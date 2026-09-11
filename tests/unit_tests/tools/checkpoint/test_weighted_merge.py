@@ -1232,6 +1232,29 @@ def test_metadata_same_layout_rejects_unprefixed_non_model_tensor_root(
             )
 
 
+def test_metadata_same_layout_requires_every_explicit_model_prefix(
+    tmp_path_dist_ckpt, process_group
+):
+    with (
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_required_a") as ckpt_a,
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_required_b") as ckpt_b,
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_required_out") as output_root,
+    ):
+        _write_unprefixed_gpt_like_checkpoint(ckpt_a, 1.0)
+        _write_unprefixed_gpt_like_checkpoint(ckpt_b, 5.0)
+        prefixes = ("decoder.", "missing_model_root.")
+
+        with pytest.raises(WeightedMergeError, match="required model prefixes"):
+            merge_same_layout_dcp_metadata_checkpoints(
+                [ckpt_a, ckpt_b],
+                [0.25, 0.75],
+                output_root,
+                model_key_prefixes=prefixes,
+                include_default_model_roots=False,
+                required_model_key_prefixes=prefixes,
+            )
+
+
 def test_metadata_same_layout_cli_dispatch_skips_megatron_parser(tmp_path, monkeypatch):
     ckpt_a = tmp_path / "iter_0000001"
     ckpt_b = tmp_path / "iter_0000002"
@@ -1273,6 +1296,10 @@ def test_metadata_same_layout_cli_dispatch_skips_megatron_parser(tmp_path, monke
             "30",
             "--extra-state-source-index",
             "1",
+            "--merge-model-prefix",
+            "language_model.",
+            "--merge-model-prefix",
+            "modality_submodules.",
             "--merge-balance-rank-work",
             "--ckpt-format",
             "torch_dist",
@@ -1286,6 +1313,15 @@ def test_metadata_same_layout_cli_dispatch_skips_megatron_parser(tmp_path, monke
     assert calls["output_root"] == str(output_root)
     assert calls["kwargs"]["output_iteration"] == 30
     assert calls["kwargs"]["extra_state_source_index"] == 1
+    assert calls["kwargs"]["model_key_prefixes"] == (
+        "language_model.",
+        "modality_submodules.",
+    )
+    assert calls["kwargs"]["include_default_model_roots"] is False
+    assert calls["kwargs"]["required_model_key_prefixes"] == (
+        "language_model.",
+        "modality_submodules.",
+    )
     assert calls["kwargs"]["balance_rank_work"] is True
 
 
