@@ -20,10 +20,11 @@ def _run_split_hook(
     use_local_indexer_varlen=True,
     single_packed_thd_sequence=True,
     cp_size=1,
+    config=None,
 ):
     marker = object()
     result = dsa_kernels.run_fused_qk_topk(
-        object(),
+        object() if config is None else config,
         marker,
         marker,
         marker,
@@ -83,10 +84,11 @@ def _run_split_loss_hook(
     use_local_indexer_varlen=True,
     single_packed_thd_sequence=True,
     cp_size=1,
+    config=None,
 ):
     marker = object()
     result = dsa_kernels.run_fused_qk_topk_with_loss(
-        object(),
+        object() if config is None else config,
         marker,
         marker,
         marker,
@@ -105,6 +107,25 @@ def _run_split_loss_hook(
         varlen_is_plain_causal=varlen_is_plain_causal,
     )
     return result, marker
+
+
+@pytest.mark.parametrize("runner", [_run_split_hook, _run_split_loss_hook])
+def test_config_deterministic_mode_reaches_compatible_split_hook(monkeypatch, runner):
+    calls = []
+    expected = object()
+
+    def hook(*, deterministic=False, **_kwargs):
+        calls.append(deterministic)
+        return expected
+
+    config = type("Config", (), {"deterministic_mode": True})()
+    monkeypatch.setattr(dsa_kernels, "_resolve_fused_hook", lambda _config, _name: hook)
+    monkeypatch.setattr(dsa_kernels.torch, "are_deterministic_algorithms_enabled", lambda: False)
+
+    result, _marker = runner(config=config)
+
+    assert result is expected
+    assert calls == [True]
 
 
 def test_hook_kwarg_signature_is_inspected_once(monkeypatch):
