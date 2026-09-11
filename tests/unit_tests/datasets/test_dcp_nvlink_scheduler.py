@@ -1,7 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import random
-from itertools import groupby
+from itertools import groupby, product
 from math import ceil, lcm
 
 import pytest
@@ -13,6 +13,7 @@ from megatron.core.datasets.data_schedule import (
 from megatron.core.datasets.data_schedule_utils import (
     _dcp_communication_overhead,
     _dcp_communication_tokens,
+    align_sample_id_groups,
     next_hdp_group_packing_aware,
     reorder_dcp_groups,
 )
@@ -29,14 +30,15 @@ def _local_length(length, cp_size, sp_size=1):
     return ceil(length / alignment) * alignment // cp_size
 
 
-def _layout_cost(layout, lengths, domains, sp_size=1):
+def _layout_cost(layout, lengths, domains, sp_size=1, padding_alignment=None, capacity=None):
     costs = []
     start = 0
     for samples, cp_size in _groups(layout):
         local_lengths = [_local_length(lengths[sid], cp_size, sp_size) for sid in samples]
         compute = sum(length**2 * cp_size for length in local_lengths)
         crosses = len(set(domains[start : start + cp_size])) > 1
-        extra = _dcp_communication_overhead(compute, sum(local_lengths), cp_size, crosses, _COST)
+        tokens = _dcp_communication_tokens(sum(local_lengths), capacity, padding_alignment)
+        extra = _dcp_communication_overhead(compute, tokens, cp_size, crosses, _COST)
         costs.extend([compute + extra] * cp_size)
         start += cp_size
     return costs
@@ -66,6 +68,29 @@ def test_disabled_topology_preserves_every_scheduler_output(arbitrary, sp_size):
                 samples, **kwargs, nvlink_domains=domains, communication_cost=cost
             )
             assert actual == expected
+
+
+@pytest.mark.parametrize(
+    'domains,cost',
+    [([0] * 8, _COST), ([0] * 4 + [1] * 4, (1024.0, 1024.0)), ([0] * 4 + [1] * 4, (0.0, 0.0))],
+)
+@pytest.mark.parametrize('padding', [None, 'max'])
+def test_single_domain_keeps_three_sequences_in_one_cp8_pack(domains, cost, padding):
+    # Rebalancing before the legacy full-parent packing fallback would split
+    # this into two rounds, despite all three sequences fitting one CP8 pack.
+    scheduler = DefaultDynamicCPScheduler(
+        max_seqlen_per_dp_cp_rank=4096,
+        cp_size=8,
+        dp_size=1,
+        microbatch_group_size_per_vp_stage=None,
+        allow_arbitrary_group_starts=True,
+        nvlink_domains=domains,
+        communication_cost=cost,
+        padding_alignment=padding,
+    )
+    assert scheduler.get_groups_and_subsamples([(sid, 8193) for sid in range(3)]) == [
+        [[0, 1, 2]] * 8
+    ]
 
 
 @pytest.mark.parametrize('cp_size', range(1, 17))
@@ -151,6 +176,88 @@ def test_reorder_validates_explicit_capacity_even_without_empty_ranks():
     with pytest.raises(ValueError, match='per-rank token capacity'):
         reorder_dcp_groups(layout, {0: 13}, [0, 0, 1], max_seq_len_per_rank=5)
     assert reorder_dcp_groups(layout, {0: 13}, [0, 0, 1], max_seq_len_per_rank=6) == layout
+
+
+@pytest.mark.parametrize('sp_size', [1, 4])
+@pytest.mark.parametrize('padding', [None, 'max'])
+def test_spare_ranks_are_distributed_across_all_packs(sp_size, padding):
+    # Giving all eight spare ranks to one CP3 pack creates CP11 and leaves
+    # seven slow CP3 packs. CP4 for each pack fills all four NVL8 domains.
+    layout = [[sid] for sid in range(8) for _ in range(3)] + [[] for _ in range(8)]
+    result = reorder_dcp_groups(
+        layout,
+        {sid: 4096 for sid in range(8)},
+        [rank // 8 for rank in range(32)],
+        sequence_parallel_size=sp_size,
+        max_seq_len_per_rank=2048,
+        padding_alignment=padding,
+    )
+    assert result == [[sid] for sid in range(8) for _ in range(4)]
+
+
+def test_rank_allocation_optimizes_total_work_under_the_final_bottleneck():
+    # A later pack sets max=147456. Keeping only one lexicographic prefix state
+    # incorrectly chooses CP2+2+4 (sum=688192); the exact tie is CP1+3+4.
+    lengths, domains = {0: 243, 1: 188, 2: 758}, [0] * 4 + [1] * 4
+    result = reorder_dcp_groups(
+        [[0], [1], [2], [2]] + [[] for _ in range(4)],
+        lengths,
+        domains,
+        sequence_parallel_size=4,
+        max_seq_len_per_rank=512,
+    )
+    assert sorted(_groups(result)) == [([0], 1), ([1], 3), ([2], 4)]
+    costs = _layout_cost(result, lengths, domains, 4)
+    assert (max(costs), sum(costs)) == (147456, 686224)
+
+
+def test_rank_allocation_considers_group_order_before_filling_spare_ranks():
+    # NVL8 plus a four-rank tail: keeping pack order forces CP7+5 across the
+    # boundary. Ordering the larger group first permits domain-local CP8+4.
+    lengths = {0: 336, 1: 282, 2: 345, 3: 390, 4: 390}
+    domains = [0] * 8 + [1] * 4
+    result = reorder_dcp_groups(
+        [[0, 1]] * 3 + [[2, 3, 4]] * 5 + [[] for _ in range(4)],
+        lengths,
+        domains,
+        sequence_parallel_size=4,
+        max_seq_len_per_rank=256,
+        padding_alignment=256,
+    )
+    assert result == [[2, 3, 4]] * 8 + [[0, 1]] * 4
+    costs = _layout_cost(result, lengths, domains, 4, 256, 256)
+    assert (max(costs), sum(costs)) == (58752, 665856)
+
+
+@pytest.mark.parametrize('sp_size', [1, 4])
+@pytest.mark.parametrize('padding', [None, 'max'])
+def test_rank_allocation_matches_bounded_fixed_order_oracle(sp_size, padding):
+    # Exhaustion is intentionally confined to this tiny CPU test, never used
+    # by the training scheduler. Whole-pack reordering may improve further.
+    rng, domains = random.Random(58085), [0] * 4 + [1] * 4
+    for _ in range(10):
+        lengths = {0: rng.randint(1, 512), 1: rng.randint(1, 512), 2: rng.randint(512, 1024)}
+        candidates = []
+        for extras in product(range(5), repeat=3):
+            if sum(extras) != 4:
+                continue
+            sizes = [minimum + extra for minimum, extra in zip([1, 1, 2], extras)]
+            if any(_local_length(lengths[sid], cp, sp_size) > 512 for sid, cp in enumerate(sizes)):
+                continue
+            layout = [[sid] for sid, cp in enumerate(sizes) for _ in range(cp)]
+            costs = _layout_cost(layout, lengths, domains, sp_size, padding, 512)
+            candidates.append((max(costs), sum(costs)))
+        result = reorder_dcp_groups(
+            [[0], [1], [2], [2]] + [[] for _ in range(4)],
+            lengths,
+            domains,
+            sequence_parallel_size=sp_size,
+            max_seq_len_per_rank=512,
+            padding_alignment=padding,
+        )
+        costs = _layout_cost(result, lengths, domains, sp_size, padding, 512)
+        assert (max(costs), sum(costs)) <= min(candidates)
+        assert sorted(samples for samples, _ in _groups(result)) == [[0], [1], [2]]
 
 
 @pytest.mark.parametrize('sp_size', [1, 4])
@@ -397,3 +504,82 @@ def test_vpp_alignment_keeps_all_samples_after_topology_reordering():
             seen.extend(samples)
             assert sum(_local_length(lengths[sid], cp_size) for sid in samples) <= 512
     assert sorted(seen) == sorted(lengths)
+
+
+@pytest.mark.parametrize('sp_size', [1, 4])
+@pytest.mark.parametrize('padding', [None, 'max'])
+def test_vpp_split_allocates_spare_ranks_before_expansion_is_locked_in(sp_size, padding):
+    scheduler = DefaultDynamicCPScheduler(
+        max_seqlen_per_dp_cp_rank=1024,
+        cp_size=16,
+        dp_size=1,
+        microbatch_group_size_per_vp_stage=2,
+        allow_arbitrary_group_starts=True,
+        sequence_parallel_size=sp_size,
+        nvlink_domains=[0] * 8 + [1] * 8,
+        padding_alignment=padding,
+    )
+    result = scheduler.get_groups_and_subsamples([(sid, 4096) for sid in range(4)])
+    assert result == [[[2]] * 8 + [[3]] * 8, [[0]] * 8 + [[1]] * 8]
+    assert sorted(
+        sid for layout in result for samples, _ in _groups(layout) for sid in samples
+    ) == list(range(4))
+
+
+def test_missing_topology_vpp_keeps_legacy_fill_instead_of_noop_callback():
+    scheduler = DefaultDynamicCPScheduler(
+        max_seqlen_per_dp_cp_rank=1024,
+        cp_size=16,
+        dp_size=1,
+        microbatch_group_size_per_vp_stage=2,
+        allow_arbitrary_group_starts=True,
+        nvlink_domains=None,
+    )
+    result = scheduler.get_groups_and_subsamples([(sid, 4096) for sid in range(4)])
+    # Exact legacy a9b7cb530 output. A disabled reorder callback would return
+    # holes here; the callback must be omitted so the legacy CP4+12 fill runs.
+    assert result == [[[2]] * 4 + [[3]] * 12, [[0]] * 4 + [[1]] * 12]
+    assert all(all(layout) for layout in result)
+
+
+@pytest.mark.parametrize(
+    'domains,cost',
+    [([0] * 16, _COST), ([0] * 8 + [1] * 8, (1024.0, 1024.0)), ([0] * 8 + [1] * 8, (0.0, 0.0))],
+)
+def test_zero_network_penalty_vpp_preserves_legacy_fill(domains, cost):
+    scheduler = DefaultDynamicCPScheduler(
+        max_seqlen_per_dp_cp_rank=1024,
+        cp_size=16,
+        dp_size=1,
+        microbatch_group_size_per_vp_stage=2,
+        allow_arbitrary_group_starts=True,
+        nvlink_domains=domains,
+        communication_cost=cost,
+    )
+    result = scheduler.get_groups_and_subsamples([(sid, 4096) for sid in range(4)])
+    assert result == [[[2]] * 4 + [[3]] * 12, [[0]] * 4 + [[1]] * 12]
+    assert all(all(layout) for layout in result)
+    assert sorted(
+        sid for layout in result for samples, _ in _groups(layout) for sid in samples
+    ) == list(range(4))
+
+
+def test_vpp_fill_callback_observes_unexpanded_split_groups():
+    seen = []
+
+    def fill(layout):
+        seen.append([list(samples) for samples in layout])
+        return reorder_dcp_groups(
+            layout, {sid: 4096 for sid in range(4)}, [0] * 8 + [1] * 8, max_seq_len_per_rank=1024
+        )
+
+    result = align_sample_id_groups(
+        [[[sid] for sid in range(4) for _ in range(4)]],
+        2,
+        allow_arbitrary_group_starts=True,
+        fill_empty_ranks=fill,
+    )
+    assert len(seen) == 2
+    assert all(sum(not samples for samples in layout) == 8 for layout in seen)
+    assert all([cp for samples, cp in _groups(layout) if samples] == [4, 4] for layout in seen)
+    assert all([cp for _, cp in _groups(layout)] == [8, 8] for layout in result)

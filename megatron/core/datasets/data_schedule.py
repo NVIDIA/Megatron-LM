@@ -6,6 +6,7 @@ import torch
 
 from megatron.core import parallel_state
 from megatron.core.datasets.data_schedule_utils import (
+    _validate_dcp_nvlink_cost,
     align_sample_id_groups,
     broadcast_scalars,
     broadcast_tensor,
@@ -479,25 +480,30 @@ class DefaultDynamicCPScheduler(DpBalancedScheduler):
             self.microbatch_group_size_per_vp_stage is not None
             and self.microbatch_group_size_per_vp_stage > 1
         ):
+
+            def fill_group(group):
+                return reorder_dcp_groups(
+                    group,
+                    sample_lengths,
+                    self.nvlink_domains,
+                    self.communication_cost,
+                    self.sequence_parallel_size,
+                    self.max_seq_len_per_rank,
+                    self.padding_alignment,
+                )
+
             sample_id_groups = align_sample_id_groups(
                 sample_id_groups,
                 self.microbatch_group_size_per_vp_stage,
                 allow_arbitrary_group_starts=self.allow_arbitrary_group_starts,
-            )
-
-            if self.nvlink_domains is not None:
-                sample_id_groups = [
-                    reorder_dcp_groups(
-                        group,
-                        sample_lengths,
-                        self.nvlink_domains,
-                        self.communication_cost,
-                        self.sequence_parallel_size,
-                        self.max_seq_len_per_rank,
-                        self.padding_alignment,
+                fill_empty_ranks=(
+                    fill_group
+                    if _validate_dcp_nvlink_cost(
+                        self.nvlink_domains, self.communication_cost, self.total_hdp_gpus
                     )
-                    for group in sample_id_groups
-                ]
+                    else None
+                ),
+            )
 
         return sample_id_groups
 

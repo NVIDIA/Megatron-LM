@@ -107,13 +107,18 @@ only a tie-break. Payload size follows the existing `pad_packed_seq_alignment`
 setting (including full-capacity `max` padding), not just the valid tokens.
 The two default weights are a rounded H100/Qwen3 attention
 reference, not native-transport calibration; override them for a different
-model, payload or interconnect. Setting equal weights disables the adjustment.
+model, payload or interconnect. Equal weights or a single NVLink domain preserve
+the existing packing/filling policy, including its full-parent packing fallback.
 
 All integer CP sizes remain eligible, including groups that must cross a
-domain. Whole-group placement and capacity-checked filling avoid gratuitous
-crossings without leaving empty ranks; VPP-aligned groups are rechecked.
-The training path loads no predictor, runs no solver, and creates no process
-groups or topology-probing collectives. This heuristic does not guarantee an
+domain. Spare ranks are distributed across packs by a bounded dynamic program,
+instead of all being assigned to one pack. It minimizes the slowest group, then
+total rank-work and cross-domain traffic, exactly for each fixed pack order.
+Only two orders are tried for rank allocation (original and topology-greedy),
+so this is not a globally optimal packing solver. Each order costs O(groups × ranks²); VPP
+splits use the same allocator before committing an expansion.
+The training path loads no predictor, uses no external solver, and creates no
+process groups or topology-probing collectives. This heuristic does not guarantee an
 E2E improvement: EP imbalance, communication overlap and native timings still
 need offline prediction or measurement for the workload of interest.
 

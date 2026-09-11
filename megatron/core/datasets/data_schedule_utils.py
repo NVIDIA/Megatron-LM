@@ -2,7 +2,7 @@
 
 from functools import lru_cache
 from math import ceil, isfinite, lcm
-from typing import Dict, List, Literal, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Literal, Optional, Sequence, Tuple
 
 import torch
 
@@ -683,8 +683,9 @@ def reorder_dcp_groups(
     """Compact/fill a rank layout, then greedily place whole packs within NVLink domains.
 
     CP sizes and sample membership are preserved except when absorbing unused
-    ranks. Compare complete layouts before accepting a reorder; no search solver
-    or measured-model dependency runs in the training path.
+    ranks. A bounded dynamic program allocates spare ranks across packs. Compare
+    complete layouts before accepting a reorder; no external solver or measured
+    model is needed in the training path.
     """
     if not _validate_dcp_nvlink_cost(nvlink_domains, communication_cost, len(sample_id_group)):
         return sample_id_group
@@ -698,6 +699,9 @@ def reorder_dcp_groups(
             groups.append((1, tuple(samples)))
     if not groups:
         return sample_id_group
+    boundaries_before = [0]
+    for a, b in zip(nvlink_domains, nvlink_domains[1:]):
+        boundaries_before.append(boundaries_before[-1] + (a != b))
 
     @lru_cache(maxsize=None)
     def pack_work(cp_size, samples):
@@ -705,12 +709,12 @@ def reorder_dcp_groups(
         local = [ceil(sample_lengths[sid] / alignment) * (alignment // cp_size) for sid in samples]
         return sum(length**2 * cp_size for length in local), sum(local)
 
+    @lru_cache(maxsize=None)
     def cost(group, start):
         cp_size, samples = group
         compute, tokens = pack_work(cp_size, samples)
         tokens = _dcp_communication_tokens(tokens, capacity, padding_alignment)
-        domains = nvlink_domains[start : start + cp_size]
-        boundaries = sum(a != b for a, b in zip(domains, domains[1:]))
+        boundaries = boundaries_before[start + cp_size - 1] - boundaries_before[start]
         extra = _dcp_communication_overhead(
             compute, tokens, cp_size, boundaries > 0, communication_cost
         )
@@ -742,22 +746,70 @@ def reorder_dcp_groups(
     capacity = max_seq_len_per_rank
     if capacity is None:
         capacity = max(pack_work(*group)[1] for group in groups)
-    missing = len(sample_id_group) - sum(cp for cp, _ in groups)
-    best, best_score = None, None
-    # Check CP1 -> CP>1 explicitly: zigzag alignment can grow very short sequences.
-    for expanded in range(len(groups)) if missing else (None,):
-        filled = [
-            (cp + (missing if i == expanded else 0), samples)
-            for i, (cp, samples) in enumerate(groups)
-        ]
-        if any(pack_work(*group)[1] > capacity for group in filled):
-            continue
-        candidate_score = score(filled)
-        if best is None or candidate_score < best_score:
-            best, best_score = filled, candidate_score
-    if best is None:
-        raise ValueError('Cannot fill DPxCP ranks without exceeding per-rank token capacity')
-    # Only one placement pass, not one per expansion candidate: O(number_of_groups * ranks).
+    total_ranks = len(sample_id_group)
+
+    def allocate(ordered, limit=None):
+        # State is the occupied rank prefix. First minimize the bottleneck;
+        # then minimize total rank-work/traffic under that exact bottleneck.
+        # Keeping only one (max, sum) label in a single pass loses optimal ties
+        # when a later group hides the earlier prefix's maximum.
+        states, parents = {0: (0.0, 0.0)}, []
+        reserved = sum(cp for cp, _ in ordered)
+        for minimum, samples in ordered:
+            reserved -= minimum
+            next_states, previous = {}, {}
+            for start, prefix in states.items():
+                ends = (
+                    range(start + minimum, total_ranks - reserved + 1)
+                    if reserved
+                    else (total_ranks,)
+                )
+                for end in ends:
+                    cp = end - start
+                    # CP1 -> CP>1 can increase zigzag padding; do not assume
+                    # every expansion fits or that feasibility is monotone.
+                    if pack_work(cp, samples)[1] > capacity:
+                        continue
+                    duration, _, traffic = cost((cp, samples), start)
+                    if limit is not None and duration > limit:
+                        continue
+                    candidate = (
+                        (max(prefix[0], duration), prefix[1] + cp * duration)
+                        if limit is None
+                        else (prefix[0] + cp * duration, prefix[1] + traffic)
+                    )
+                    if end not in next_states or candidate < next_states[end]:
+                        next_states[end], previous[end] = candidate, start
+            states = next_states
+            parents.append(previous)
+        if total_ranks not in states:
+            raise ValueError('Cannot fill DPxCP ranks without exceeding per-rank token capacity')
+        end, filled = total_ranks, []
+        for (_, samples), previous in zip(reversed(ordered), reversed(parents)):
+            start = previous[end]
+            filled.append((end - start, samples))
+            end = start
+        return states[total_ranks], list(reversed(filled))
+
+    if sum(cp for cp, _ in groups) == total_ranks:
+        best = groups
+        if any(pack_work(*group)[1] > capacity for group in best):
+            raise ValueError('Cannot fill DPxCP ranks without exceeding per-rank token capacity')
+        best_score = score(best)
+    else:
+        # Allocating first can lock in an avoidable crossing. Try the existing
+        # order and one topology-aware order of the minimum-size packs; do not
+        # enumerate permutations or run an unbounded local search.
+        placed = place(groups)
+        orders = [groups] if placed == groups else [groups, placed]
+        best, best_score = None, None
+        for ordered in orders:
+            optimum, _ = allocate(ordered)
+            _, filled = allocate(ordered, optimum[0])
+            candidate_score = score(filled)
+            if best is None or candidate_score < best_score:
+                best, best_score = filled, candidate_score
+    # At most two orders, each with O(groups * ranks**2) exact rank allocation.
     placed = place(best)
     if score(placed) < best_score:
         best = placed
@@ -1126,10 +1178,12 @@ def align_sample_id_groups(
     sample_id_groups: List,
     microbatch_group_size_per_vp_stage: int,
     allow_arbitrary_group_starts: bool = False,
+    fill_empty_ranks: Callable[[List], List] | None = None,
 ) -> List:
     """Align len(sample_id_groups) to microbatch_group_size_per_vp_stage when VPP is enabled.
 
-    Standalone version extracted from DefaultDynamicCPScheduler.
+    An optional fill callback assigns the spare ranks immediately after each
+    split, before the default expansion can lock in a larger CP size.
     """
     multiple = int(microbatch_group_size_per_vp_stage)
     remainder = (-len(sample_id_groups)) % multiple
@@ -1174,6 +1228,8 @@ def align_sample_id_groups(
         return new_mb, old_mb
 
     def fill_empty_by_expanding_cp(sample_id_group):
+        if fill_empty_ranks is not None:
+            return fill_empty_ranks(sample_id_group)
         if allow_arbitrary_group_starts:
             # A logical group can absorb any tail length, including one smaller
             # than its current CP size. Repeating its rank assignment changes
