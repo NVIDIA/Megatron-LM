@@ -1960,12 +1960,6 @@ class TransformerConfig(ModelParallelConfig):
                     "moe_flex_dispatcher_backend='ncclep' requires "
                     "moe_token_dispatcher_type='flex'."
                 )
-            if self.moe_use_grouped_tensor and not self.use_transformer_engine_op_fuser:
-                raise ValueError(
-                    "moe_use_grouped_tensor=True without use_transformer_engine_op_fuser is "
-                    "not yet supported with the NCCL-EP dispatcher. Use the TE op-fuser path "
-                    "or select the alltoall, DeepEP, or HybridEP dispatcher."
-                )
 
         if self.moe_dispatch_fwd_dtype != 'bf16' or self.moe_combine_bwd_dtype != 'bf16':
             if (

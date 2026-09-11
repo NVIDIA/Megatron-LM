@@ -187,7 +187,9 @@ class TopKRouter(Router):
                 'local_tokens_per_expert',
                 torch.zeros(
                     self.config.num_moe_experts,
-                    dtype=torch.float32,
+                    # Keep token counts exact through accumulation and cross-rank reduction.
+                    # Float16Module leaves integer buffers in their original dtype.
+                    dtype=torch.int64,
                     device=torch.cuda.current_device(),
                 ),
                 persistent=False,

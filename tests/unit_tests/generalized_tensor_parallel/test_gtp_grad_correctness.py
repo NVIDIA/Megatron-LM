@@ -269,7 +269,12 @@ def _build_ddp_distopt_and_optim(
     from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
     from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 
-    config = _make_config()
+    # The stack's own layers already carry the config they were built with (including
+    # gtp_weight_remat_size/expert_gtp_weight_remat_size/expert_model_parallel_size, set
+    # correctly by _make_moe_config/_make_config for THIS phase) -- building a fresh, always-
+    # default _make_config() here instead would silently disconnect DDP's config from the
+    # model's actual GTP/EGTP/EP setup.
+    config = stack[0].config
     ddp_config = DistributedDataParallelConfig(
         use_distributed_optimizer=True,
         overlap_grad_reduce=overlap_grad_reduce,
@@ -309,18 +314,18 @@ def _run_step_distopt(ddp_model, optim, rank):
         out, _ = layer(out, attention_mask=None)
     loss = out.float().mean()
     loss.backward()
-    # Production order (finalize_model_grads): reduce across DP first, THEN the gtp_remat finalize.
+    # Production order (finalize_model_grads): reduce across DP first, THEN the gtp_remat
+    # finalize. The GTP/EGTP expert-grad correction lives in DDP's own
+    # expert_gradient_scaling_factor (computed once at construction) -- no separate step here.
     ddp_model.finish_grad_sync()
     from megatron.core import parallel_state as ps
     from megatron.core.distributed.finalize_model_grads import (
         _allreduce_replicated_grads_over_gtp_remat_group,
     )
 
-    _allreduce_replicated_grads_over_gtp_remat_group(
-        [ddp_model],
-        ps.get_gtp_weight_remat_group(check_initialized=False),
-        ps.get_expert_gtp_weight_remat_group(check_initialized=False),
-    )
+    gtp_remat_group = ps.get_gtp_weight_remat_group(check_initialized=False)
+    egtp_remat_group = ps.get_expert_gtp_weight_remat_group(check_initialized=False)
+    _allreduce_replicated_grads_over_gtp_remat_group([ddp_model], gtp_remat_group, egtp_remat_group)
     _, grad_norm, _ = optim.step()
     return float(grad_norm)
 
@@ -377,11 +382,12 @@ def _worker_distopt(rank, world_size, port):
         ratio = gtp_gn / max(base_gn, 1e-12)
         print(
             f"\n[distopt grad-norm] baseline={base_gn:.6f}  GTP_remat={gtp_gn:.6f}  "
-            f"ratio={ratio:.4f}",
+            f"ratio={ratio:.6f}",
             flush=True,
         )
-        # Same model, same data, gradients proven equal -> grad-norm must match.
-        torch.testing.assert_close(torch.tensor(gtp_gn), torch.tensor(base_gn), atol=0, rtol=3e-2)
+        # Same model, same data, gradients proven equal -> grad-norm must match (bf16 Adam
+        # noise floor is ~4e-5 here).
+        torch.testing.assert_close(torch.tensor(gtp_gn), torch.tensor(base_gn), atol=0, rtol=1e-4)
 
 
 # ---------------------------------------------------------------------------
@@ -392,7 +398,17 @@ NUM_EXPERTS = 4
 MOE_FFN = 256
 
 
-def _make_moe_config():
+def _make_moe_config(expert_model_parallel_size=1, gtp_remat_size=1, expert_gtp_remat_size=1):
+    """``expert_model_parallel_size``, ``gtp_remat_size``, and ``expert_gtp_remat_size`` must
+    all match the values passed to ``parallel_state.initialize_model_parallel`` for this phase.
+
+    Both TE's expert ``allreduce`` tagging and DDP's GTP scaling correction read these off
+    THIS TransformerConfig object, not off the global parallel_state -- leaving them at their
+    defaults while GTP/EGTP/EP are actually active silently produces the wrong config. Note
+    gtp_remat_size/expert_gtp_remat_size map to the DERIVED fields gtp_weight_remat_size /
+    expert_gtp_weight_remat_size via tensor_parallel_num_weight_shards (production sets these
+    the same way, from CLI args); with tensor_model_parallel_size=1 below they're equal.
+    """
     from megatron.core.transformer.transformer_config import TransformerConfig
 
     return TransformerConfig(
@@ -413,6 +429,9 @@ def _make_moe_config():
         bias_dropout_fusion=False,
         tensor_model_parallel_size=1,
         pipeline_model_parallel_size=1,
+        expert_model_parallel_size=expert_model_parallel_size,
+        tensor_parallel_num_weight_shards=gtp_remat_size,
+        expert_tensor_parallel_num_weight_shards=expert_gtp_remat_size,
     )
 
 
@@ -456,7 +475,10 @@ def _worker_moe_distopt(rank, world_size, port):
     )
     model_parallel_cuda_manual_seed(42)
     pgc = ProcessGroupCollection.use_mpu_process_groups(required_pgs=pgs)
-    base_stack = _make_moe_stack(_make_moe_config(), pgc)
+    base_stack = _make_moe_stack(
+        _make_moe_config(expert_model_parallel_size=2, gtp_remat_size=1, expert_gtp_remat_size=1),
+        pgc,
+    )
     for layer in base_stack:
         layer.cuda()
     # Broadcast only NON-expert (dense) params; expert weights are EP-local and must
@@ -481,7 +503,10 @@ def _worker_moe_distopt(rank, world_size, port):
     )
     model_parallel_cuda_manual_seed(42)
     pgc = ProcessGroupCollection.use_mpu_process_groups(required_pgs=pgs)
-    moe_stack = _make_moe_stack(_make_moe_config(), pgc)
+    moe_stack = _make_moe_stack(
+        _make_moe_config(expert_model_parallel_size=2, gtp_remat_size=2, expert_gtp_remat_size=2),
+        pgc,
+    )
     for layer in moe_stack:
         layer.cuda()
     g = ps.get_gtp_weight_remat_group()
@@ -516,10 +541,114 @@ def _worker_moe_distopt(rank, world_size, port):
         ratio = moe_gn / max(base_gn, 1e-12)
         print(
             f"\n[moe distopt grad-norm] baseline={base_gn:.6f}  GTP_remat={moe_gn:.6f}  "
-            f"ratio={ratio:.4f}",
+            f"ratio={ratio:.6f}",
             flush=True,
         )
-        torch.testing.assert_close(torch.tensor(moe_gn), torch.tensor(base_gn), atol=0, rtol=3e-2)
+        # bf16 Adam noise floor is ~6e-5 here.
+        torch.testing.assert_close(torch.tensor(moe_gn), torch.tensor(base_gn), atol=0, rtol=1e-4)
+
+
+def _worker_moe_gtp_egtp_mismatch(rank, world_size, port, gtp, egtp):
+    """EP=2 MoE dist-opt grad-norm for a mismatched (gtp, egtp) must match the GTP1/EGTP1
+    baseline: end-to-end regression for expert_gradient_scaling_factor's egtp/gtp correction
+    (folded into DistributedDataParallel's one-time prescale), through a real MoE model and a
+    real backward pass -- not mock groups or hand-set gradients.
+
+    The correction must apply for ANY gtp vs egtp relationship, not just gtp>egtp. Parametrized
+    over both directions by the caller.
+
+    EP=2 (not 1): the real grouped_gemm MoE model only tags expert weights allreduce=False
+    (building expert_parallel_buffers at all) when
+    TransformerConfig.expert_model_parallel_size > 1.
+    """
+    from megatron.core import parallel_state as ps
+    from megatron.core.process_groups_config import ProcessGroupCollection
+    from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+
+    pgs = None
+
+    # ---------- Phase A: baseline GTP1/EGTP1, EP2 ----------
+    ps.destroy_model_parallel()
+    ps.initialize_model_parallel(
+        tensor_model_parallel_size=1,
+        pipeline_model_parallel_size=1,
+        expert_model_parallel_size=2,
+        gtp_remat_size=1,
+        expert_gtp_remat_size=1,
+    )
+    model_parallel_cuda_manual_seed(42)
+    pgc = ProcessGroupCollection.use_mpu_process_groups(required_pgs=pgs)
+    base_stack = _make_moe_stack(
+        _make_moe_config(expert_model_parallel_size=2, gtp_remat_size=1, expert_gtp_remat_size=1),
+        pgc,
+    )
+    for layer in base_stack:
+        layer.cuda()
+    for name, p in base_stack.named_parameters():
+        if not _is_expert_param(name, p):
+            dist.broadcast(p.data, src=0)
+    saved = {n: p.data.clone() for n, p in base_stack.named_parameters()}
+    base_ddp, base_optim = _build_ddp_distopt_and_optim(base_stack)
+    assert (
+        len(base_ddp.expert_parallel_buffers) > 0
+    ), "no expert buffer built at EP=2 -- test setup bug (would make the comparison vacuous)"
+    base_gn = _run_step_distopt(base_ddp, base_optim, rank)
+
+    ps.destroy_model_parallel()
+    GTPShardedParam._chain_state = {}
+
+    # ---------- Phase B: GTP={gtp}/EGTP={egtp}, EP2 (mismatched) ----------
+    ps.initialize_model_parallel(
+        tensor_model_parallel_size=1,
+        pipeline_model_parallel_size=1,
+        expert_model_parallel_size=2,
+        gtp_remat_size=gtp,
+        expert_gtp_remat_size=egtp,
+    )
+    model_parallel_cuda_manual_seed(42)
+    pgc = ProcessGroupCollection.use_mpu_process_groups(required_pgs=pgs)
+    moe_stack = _make_moe_stack(
+        _make_moe_config(
+            expert_model_parallel_size=2, gtp_remat_size=gtp, expert_gtp_remat_size=egtp
+        ),
+        pgc,
+    )
+    for layer in moe_stack:
+        layer.cuda()
+    gtp_rank = ps.get_gtp_weight_remat_group().rank()
+    egtp_rank = ps.get_expert_gtp_weight_remat_group().rank()
+    n_sharded = 0
+    for name, p in moe_stack.named_parameters():
+        full = saved[name]  # EP2 layout identical to baseline -> rank-local match
+        if isinstance(p, GTPShardedParam):
+            is_expert = _is_expert_param(name, p)
+            r = egtp_rank if is_expert else gtp_rank
+            ss = p.shape[0]
+            p.data.copy_(full[r * ss : (r + 1) * ss])
+            n_sharded += 1
+        else:
+            p.data.copy_(full)
+    assert n_sharded > 0, "no GTP_remat/EGTP_remat-sharded param found -- test setup bug"
+    moe_ddp, moe_optim = _build_ddp_distopt_and_optim(moe_stack)
+    assert (
+        len(moe_ddp.expert_parallel_buffers) > 0
+    ), "no expert buffer built at EP=2 -- test setup bug (would make the comparison vacuous)"
+    moe_gn = _run_step_distopt(moe_ddp, moe_optim, rank)
+
+    ps.destroy_model_parallel()
+    GTPShardedParam._chain_state = {}
+
+    if rank == 0:
+        ratio = moe_gn / max(base_gn, 1e-12)
+        print(
+            f"\n[moe gtp{gtp}-egtp{egtp}-mismatch grad-norm] baseline={base_gn:.6f}  "
+            f"moe={moe_gn:.6f}  ratio={ratio:.6f}",
+            flush=True,
+        )
+        # Without the egtp/gtp correction, expert grads come out gtp/egtp (or egtp/gtp) off,
+        # blowing the ratio far outside this tolerance (real MoE routing is noisier than the
+        # dense-only case, hence the same rtol as above rather than something tighter).
+        torch.testing.assert_close(torch.tensor(moe_gn), torch.tensor(base_gn), atol=0, rtol=1e-4)
 
 
 # ---------------------------------------------------------------------------
@@ -677,7 +806,12 @@ def _gtp_rs_phase(rank, saved, fp32_accum, moe=False, gtp_size=4):
     # None => every group; the MoE dispatcher needs tp_ep (see _worker_moe_distopt).
     pgc = ProcessGroupCollection.use_mpu_process_groups()
     stack = (_make_moe_stack if moe else _make_stack)(
-        _make_moe_config() if moe else _make_config(), pgc
+        (
+            _make_moe_config(gtp_remat_size=gtp_size, expert_gtp_remat_size=gtp_size)
+            if moe
+            else _make_config()
+        ),
+        pgc,
     )
     for layer in stack:
         layer.cuda()
@@ -946,3 +1080,24 @@ class TestGTPGradCorrectness:
         if torch.cuda.device_count() < 4:
             pytest.skip("Requires 4 CUDA devices")
         _run_distributed(_worker_moe_distopt, 4)
+
+    @pytest.mark.parametrize(
+        "gtp,egtp",
+        [
+            (4, 1),  # dense-only GTP_remat; experts stay EP-local, not EGTP-sharded
+            (1, 2),  # GTP_remat inactive; experts EGTP-sharded (the gtp<egtp direction)
+        ],
+    )
+    def test_moe_gtp_egtp_mismatch_distopt_grad_norm_matches_baseline(self, gtp, egtp):
+        """Mismatched (gtp, egtp), EP=2: MoE dist-opt grad-norm must match GTP1/EGTP1 baseline.
+
+        End-to-end regression for expert_gradient_scaling_factor's GTP/EGTP correction through
+        a real MoE model and real backward pass, covering both gtp>egtp and gtp<egtp -- unlike
+        TestExpertGradientScalingFactorGTPRemat (test_distributed_data_parallel.py; a synthetic
+        model checking the scaling factor value directly) or
+        test_moe_egtp_distopt_grad_norm_matches_baseline (GTP==EGTP, collapses the correction
+        to 1.0). See worker docstring for the full reasoning.
+        """
+        if torch.cuda.device_count() < 4:
+            pytest.skip("Requires 4 CUDA devices")
+        _run_distributed(_worker_moe_gtp_egtp_mismatch, 4, gtp, egtp)
