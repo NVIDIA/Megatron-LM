@@ -31,9 +31,8 @@ model-template approach, which needs CUDA merely to construct Mamba/TE model
 templates.
 
 The metadata-driven design is a layout mechanism, not a security boundary. Treat
-source checkpoints as trusted inputs: the merge loads common checkpoint state
-from the first input and deserializes byte/object `_extra_state` entries from the
-selected extra-state source when copying them into the output.
+source checkpoints as trusted inputs: the merge deserializes common checkpoint
+state and byte/object `_extra_state` entries when copying them into the output.
 
 ## How It Runs
 
@@ -177,16 +176,23 @@ writes that directory directly. If `--merge-output` names a different `iter_*`
 directory than `--output-iteration`, the merge is rejected to avoid publishing an
 iteration under the wrong path.
 
-Common checkpoint state is copied from the first input checkpoint, with the
-output iteration updated when requested. Both common state loading and byte/object
-`_extra_state` copying use checkpoint deserialization, so the input checkpoints
-must be trusted.
+By default, common checkpoint state comes from the input whose recorded iteration
+matches `--output-iteration`, or from the first input when no output iteration is
+requested. Use `--common-state-checkpoint PATH` when the merge inputs contain only
+distributed model shards and a separate checkpoint must supply `common.pt`. If
+the supplied common state records an iteration, it must match
+`--output-iteration`. The explicit checkpoint also supplies model `_extra_state`,
+keeping the copied common and extra state from one consistent source; otherwise
+`--extra-state-source-index` selects the extra-state source. All of these paths
+may name either a concrete checkpoint directory or a root with a latest marker.
+Common state and byte/object `_extra_state` loading use checkpoint
+deserialization, so every source checkpoint must be trusted.
 
 The output `common.pt` includes `weighted_merge_provenance`: input paths, source
 iterations when they can be inferred from `iter_*` directory names, weights,
-normalization policy, merge style, output dtype, extra-state source, implementation
-mode (`dcp-metadata-same-layout`), rank-work balancing policy, and the git
-revision when available.
+normalization policy, merge style, output dtype, common-state and extra-state
+sources, implementation mode (`dcp-metadata-same-layout`), rank-work balancing
+policy, and the git revision when available.
 
 Only recognized model-root tensors and `_extra_state` entries are supported.
 Optimizer/RNG sharded DCP tensor entries outside the recognized model roots must
