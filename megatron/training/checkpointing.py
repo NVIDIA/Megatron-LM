@@ -2410,6 +2410,10 @@ def _maybe_setup_gpt_to_hybrid_load(args, ckpt_args, model):
         return False
 
     runtime_is_hybrid = any(_contains_hybrid_model(m) for m in model)
+    if not vars(ckpt_args):
+        # Checkpoints imported by Megatron Bridge may omit training args entirely.
+        # Without explicit source-model metadata, keep the regular loading path.
+        return None, False
     ckpt_pattern = getattr(ckpt_args, 'hybrid_layer_pattern', None) or getattr(
         ckpt_args, 'hybrid_override_pattern', None
     )

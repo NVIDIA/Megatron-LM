@@ -14,6 +14,7 @@ Covers the load-time sharded state dict retargeting in
 """
 
 from functools import partial
+from types import SimpleNamespace
 from unittest import mock
 
 import pytest
@@ -48,7 +49,11 @@ from megatron.core.num_microbatches_calculator import (
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.arguments import parse_args
-from megatron.training.checkpointing import load_checkpoint, save_checkpoint
+from megatron.training.checkpointing import (
+    _maybe_setup_gpt_to_hybrid_load,
+    load_checkpoint,
+    save_checkpoint,
+)
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.dist_checkpointing.utils import (
     init_checkpointing_mock_args,
@@ -58,6 +63,14 @@ from tests.unit_tests.test_utilities import Utils
 
 
 class TestGPTCompatLayerMaps:
+    def test_metadata_less_bridge_checkpoint_uses_regular_load_path(self):
+        runtime_model = object.__new__(HybridModel)
+
+        assert _maybe_setup_gpt_to_hybrid_load(mock.Mock(), SimpleNamespace(), [runtime_model]) == (
+            None,
+            False,
+        )
+
     def test_pairs_positions_in_pattern_order(self):
         maps = gpt_compatible_layer_maps('M*-M*-')
         assert maps.attention_to_gpt == {1: 0, 4: 1}
