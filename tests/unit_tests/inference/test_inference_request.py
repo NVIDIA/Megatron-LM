@@ -246,8 +246,9 @@ def test_dynamic_inference_request_record_checkpoint_and_merge():
     prefix-cache configuration is inherited while hashes are recomputed for the
     expanded prompt. The add_engine event is inherited (or created) so
     downstream tooling can find it. RequestRecord.merge() collapses the chain
-    back into a single request with concatenated tokens, text, routing_indices,
-    and the record's latency. Both are non-trivial state machines."""
+    back into a single request with concatenated tokens, routing_indices, and
+    the record's latency while leaving text finalization to the caller. Both
+    are non-trivial state machines."""
     sp = SamplingParams(num_tokens_to_generate=8, termination_id=0)
 
     # checkpoint() inherits prefix-cache configuration and event_add_engine.
@@ -304,7 +305,7 @@ def test_dynamic_inference_request_record_checkpoint_and_merge():
     record2.checkpoint()
     assert record2.requests[-1].event_add_engine is not None
 
-    # merge() concatenates tokens, text, and ndarray routing_indices; falls back to None.
+    # merge() concatenates tokens and ndarray routing_indices, but never segment text.
     a = DynamicInferenceRequest(
         request_id=3,
         prompt_tokens=torch.tensor([1, 2, 3]),
@@ -329,7 +330,7 @@ def test_dynamic_inference_request_record_checkpoint_and_merge():
     rec.latency = 4.2
     merged = rec.merge()
     assert merged.generated_tokens == [10, 11, 12]
-    assert merged.generated_text == "foobar"
+    assert (merged.prompt, merged.generated_text) == (None, None)
     assert merged.generated_log_probs == [-0.5]
     assert merged.generated_length == 3 and merged.latency == 4.2
     assert merged.routing_indices.tolist() == [[1, 2], [3, 4]]
@@ -341,6 +342,37 @@ def test_dynamic_inference_request_record_checkpoint_and_merge():
     finished = FinishedRequestRecord.from_request(merged)
     assert finished.policy_epoch == [(0, 3)] and finished.kv_cache_epoch is None
     assert finished.num_evictions == 1
+
+    class NonComposableTokenizer:
+        eod = 0
+
+        def __init__(self):
+            self.calls = []
+
+        def detokenize(self, tokens):
+            self.calls.append(list(tokens))
+            return f"<{','.join(str(token) for token in tokens)}>"
+
+    tokenizer = NonComposableTokenizer()
+    with pytest.raises(ValueError, match="tokenizer"):
+        merged.finalize_text(None)
+    assert merged.finalize_text(tokenizer) is merged
+    assert merged.generated_text == "<10,11,12>"
+    assert tokenizer.calls == [[10, 11, 12]]
+    assert merged.finalize_text(tokenizer) is merged
+    assert tokenizer.calls == [[10, 11, 12]]
+
+    for keep_eod, tokens, expected in (
+        (0, [], ""),
+        (0, [0, 0], ""),
+        (0, [1, 0], "<1>"),
+        (1, [1, 0], "<1,0>"),
+    ):
+        request = _make_dynamic_request(
+            generated_tokens=tokens,
+            sampling_params=SamplingParams(detokenize_stop_sequence=keep_eod),
+        )
+        assert request.finalize_text(tokenizer).generated_text == expected
 
     # merge() with both generated_text=None propagates None (rather than "None"+"None").
     c = DynamicInferenceRequest(
@@ -409,8 +441,7 @@ def test_checkpoint_preserves_runtime_state_without_aliasing():
 def test_dynamic_inference_request_serialize_strips_event_add_engine():
     """DynamicInferenceRequest.serialize() omits `event_add_engine` (it's a
     pointer into `events`, not independent state); on deserialize we get the
-    request back with its events list intact. Tested via a record round-trip
-    because that's the real caller."""
+    request back with its events list intact."""
     req = _make_dynamic_request()
     req.add_event_finish()
     data = req.serialize()
@@ -419,13 +450,6 @@ def test_dynamic_inference_request_serialize_strips_event_add_engine():
     assert out.request_id == req.request_id
     assert len(out.events) == 1
     assert out.events[0].type == DynamicInferenceEventType.FINISH
-
-    # Record-level serialize/deserialize preserves latency and request ids.
-    rec = DynamicInferenceRequestRecord.from_request(_make_dynamic_request(request_id=7))
-    rec.latency = 1.0
-    rec_out = DynamicInferenceRequestRecord.deserialize(rec.serialize())
-    assert rec_out.latency == 1.0
-    assert rec_out.requests[0].request_id == 7
 
 
 @pytest.mark.parametrize(

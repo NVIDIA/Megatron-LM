@@ -2562,6 +2562,7 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
 
         # No trailing EOD.
         assert detok(tokenizer, [1, 2, 3], remove_EOD=remove_EOD) == "T1 T2 T3"
+        self.mock_tokenizer.detokenize.assert_called_with([1, 2, 3], skip_special_tokens=True)
 
         # Single trailing EOD.
         result = detok(tokenizer, [1, 2, eod], remove_EOD=remove_EOD)

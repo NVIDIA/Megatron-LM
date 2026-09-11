@@ -304,7 +304,7 @@ async def test_completions_request_uses_sampling_defaults_and_overrides(
     response = await app.test_client().post("/v1/completions", json=payload)
 
     assert response.status_code == 500
-    assert len(inference_client.sampling_params) == 1
+    assert not inference_client.sampling_params[0].detokenize_generations
     sampling_params = inference_client.sampling_params[0]
     assert sampling_params.temperature == expected_temperature
     assert sampling_params.top_p == expected_top_p

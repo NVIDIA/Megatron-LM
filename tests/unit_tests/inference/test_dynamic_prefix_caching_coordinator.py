@@ -136,7 +136,7 @@ class DummyEngine(DynamicInferenceEngine):
 
     def add_request(
         self, request_id: int, prompt: str, sampling_params: Optional[SamplingParams] = None
-    ) -> asyncio.Future[DynamicInferenceRequestRecord]:
+    ) -> asyncio.Future[DynamicInferenceRequest]:
         self.requests[request_id] = RequestEntry(
             record=DynamicInferenceRequestRecord.from_request(
                 DynamicInferenceRequest(
@@ -152,7 +152,7 @@ class DummyEngine(DynamicInferenceEngine):
         return self.requests[request_id].future
 
     async def async_step(self, *, verbose: Optional[bool] = False) -> Dict:
-        finished_request_records = []
+        finished_requests = []
         to_remove = []
         for request_id, entry in self.requests.items():
             request = entry.record[-1]
@@ -162,12 +162,12 @@ class DummyEngine(DynamicInferenceEngine):
                     continue
                 request.status = Status.COMPLETED
                 self.context.active_cnt -= 1
-                finished_request_records.append(entry.record)
-                entry.future.set_result(entry.record)
+                finished_request = self._complete_request(entry)
+                finished_requests.append(finished_request)
                 to_remove.append(request_id)
                 if self.is_mp_coordinator:
                     self.socket_for_receiving_requests.send_multipart(
-                        _engine_reply_frames([entry.record.serialize()])
+                        _engine_reply_frames([finished_request.serialize()])
                     )
 
         for request_id in to_remove:
@@ -183,7 +183,7 @@ class DummyEngine(DynamicInferenceEngine):
 
         return {
             "active_request_ids": active_request_ids,
-            "finished_request_records": finished_request_records,
+            "finished_requests": finished_requests,
             "step_time": 0.01,
             "cuda_graph_request_count": 1,
         }
@@ -751,8 +751,10 @@ class TestCoordinatorEndToEnd:
                 ]
                 results = await asyncio.wait_for(asyncio.gather(*futures), timeout=10.0)
 
-                for record in results:
-                    assert record[-1].status == Status.COMPLETED
+                for result in results:
+                    assert result["status"] == Status.COMPLETED.name
+                    assert result["generated_text"] == ""
+                    assert "requests" not in result
         finally:
             if torch.distributed.get_rank() == 0:
                 await asyncio.wait_for(client.stop_engines(), timeout=10.0)

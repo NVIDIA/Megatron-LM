@@ -293,6 +293,7 @@ def test_async_forward_routes_one_controller_iteration(
     """Primer-only work crosses the engine boundary without an internal controller loop."""
     engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
     engine.state = EngineState.RUNNING
+    engine._cuda_graph_rebuild_pending = False
     engine.logging_step_interval = 0
     engine.metrics_writer = None
     engine.schedule_waiting_requests = mock.Mock()
@@ -1450,8 +1451,7 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
             runtime["steps"] += 1
             runtime["cuda_graph_steps"] += int(context.using_cuda_graph_this_step())
             runtime["max_paused"] = max(runtime["max_paused"], context.paused_request_count)
-            for record in result["finished_request_records"]:
-                request = record.merge()
+            for request in result["finished_requests"]:
                 env.requests[request.request_id] = request
                 if request.request_id == 1 and any(
                     other.request_id != 1 and other.status not in (Status.COMPLETED, Status.FAILED)
@@ -2025,7 +2025,7 @@ def _controller_with_pending_logits():
 def test_async_reset_clears_pending_logits():
     """Engine reset cannot expose logits produced for the previous request batch."""
     engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
-    engine.context = SimpleNamespace(reset=mock.Mock())
+    engine.context = SimpleNamespace(reset=mock.Mock(), cuda_graphs_available=True)
     engine.controller = _controller_with_pending_logits()
     engine.num_speculative_tokens = 1
     engine._loop = None

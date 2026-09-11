@@ -767,16 +767,23 @@ def test_immediate_handoff_completion_resolves_request_future(handoff_loop):
     engine.finished_request_count = 0
     engine.use_coordinator = False
     engine.is_mp_coordinator = False
-    engine.controller = SimpleNamespace(
-        tokenizer=object(), detokenize=mock.Mock(side_effect=["prompt", "answer"])
-    )
+    tokenizer = SimpleNamespace(eod=None, detokenize=mock.Mock(return_value="answer"))
+
+    def complete_request(request_entry):
+        finished_request = request_entry.record.merge()
+        request_entry.future.set_result(finished_request)
+        return finished_request
+
+    engine._complete_request = complete_request
 
     engine._complete_handoff_request_without_forward(7)
 
     assert request.status == Status.COMPLETED
     assert request.generated_length == 1
-    assert request.generated_text == "answer"
-    assert request_future.result() is record
+    finished_request = request_future.result()
+    assert isinstance(finished_request, DynamicInferenceRequest)
+    assert finished_request.generated_text is None
+    assert finished_request.finalize_text(tokenizer).generated_text == "answer"
     assert engine.finished_request_count == 1
     assert 7 not in engine.requests
 

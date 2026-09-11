@@ -14,7 +14,7 @@ import torch
 
 from megatron.core.inference.config import ImageProcessingConfig, VideoProcessingConfig
 from megatron.core.inference.sampling_params import SamplingParams
-from megatron.core.tokenizers import MegatronTokenizer
+from megatron.core.inference.utils import detokenize_tokens
 from megatron.core.utils import experimental_api, nvtx_range_pop, nvtx_range_push
 
 
@@ -776,6 +776,29 @@ class DynamicInferenceRequest(InferenceRequest):
     event_add_engine: Optional[DynamicInferenceEvent] = field(default=None, repr=False)
     generated_tokens: List[int] = field(default_factory=list)
 
+    def finalize_text(self, tokenizer: Any) -> "DynamicInferenceRequest":
+        """Populate generated text by decoding the complete generated token stream.
+
+        Args:
+            tokenizer: Tokenizer used to decode ``generated_tokens``.
+
+        Returns:
+            This request, with ``generated_text`` populated.
+
+        Raises:
+            ValueError: If ``tokenizer`` is ``None``.
+        """
+        if tokenizer is None:
+            raise ValueError("tokenizer must not be None")
+        if self.generated_text is not None:
+            return self
+
+        detokenize_stop_sequence = getattr(self.sampling_params, "detokenize_stop_sequence", False)
+        self.generated_text = detokenize_tokens(
+            tokenizer, self.generated_tokens, remove_EOD=not detokenize_stop_sequence
+        )
+        return self
+
     def __str__(self):
         return ", ".join(
             (
@@ -973,8 +996,7 @@ class DynamicInferenceRequest(InferenceRequest):
 
 @dataclass(kw_only=True)
 class DynamicInferenceRequestRecord:
-    """History of DynamicInferenceRequest objects over multiple request
-    checkpoints."""
+    """Internal engine history across request checkpoints."""
 
     requests: list[DynamicInferenceRequest] = field(default_factory=list)
     latency: Optional[float] = None
@@ -1013,13 +1035,9 @@ class DynamicInferenceRequestRecord:
         """
         return self.requests[0].request_id
 
-    def checkpoint(self, tokenizer: MegatronTokenizer | None = None):
+    def checkpoint(self) -> None:
         """Maintain reference to previous request, and then append a new request
-        that concatenates the previous prompt and generations.
-
-        Args:
-            tokenizer (MegatronTokenizer | None): (Deprecated) Tokenizer.
-        """
+        that concatenates the previous prompt and generations."""
 
         old_request = self[-1]
 
@@ -1112,11 +1130,8 @@ class DynamicInferenceRequestRecord:
                 old_request.remaining_prompt_tokens = old_request.remaining_prompt_tokens.cpu()
         self.requests.append(new_request)
 
-    def merge(self, tokenizer: MegatronTokenizer | None = None) -> DynamicInferenceRequest:
+    def merge(self) -> DynamicInferenceRequest:
         """Merge requests into a single checkpoint-agnostic request object.
-
-        Args:
-            tokenizer (MegatronTokenizer | None): (Deprecated) Tokenizer.
 
         Returns:
             (DynamicInferenceRequest) Merged request.
@@ -1136,10 +1151,6 @@ class DynamicInferenceRequestRecord:
         if routing_parts:
             routing_indices = np.concatenate(routing_parts)
         generated_tokens = merge_lists("generated_tokens")
-        try:
-            generated_text = "".join(r.generated_text for r in self.requests)
-        except TypeError as e:  # generally means r.generated_text is None
-            generated_text = None
 
         # Detach the merged result's outer epoch lists under the engine's append-only
         # mutation pattern described in checkpoint().
@@ -1165,7 +1176,7 @@ class DynamicInferenceRequestRecord:
             compact_prompt_tokens=first_request.compact_prompt_tokens,
             prompt_log_probs=self.requests[0].prompt_log_probs,
             prompt_top_n_logprobs=self.requests[0].prompt_top_n_logprobs,
-            generated_text=generated_text,
+            generated_text=None,
             generated_tokens=generated_tokens,
             generated_length=len(generated_tokens),
             generated_log_probs=merge_lists("generated_log_probs"),
@@ -1187,33 +1198,6 @@ class DynamicInferenceRequestRecord:
             disaggregated_params=disaggregated_params,
         )
 
-        return request
-
-    def serialize(self) -> dict:
-        """Converts the instance into a serializable dictionary.
-
-        Returns:
-            (dict) A dictionary representation of the instance suitable for
-                serialization.
-        """
-        nvtx_range_push("DynamicInferenceRequestRecord.serialize")
-        obj = self.__dict__.copy()  # shallow dict copy
-        obj["requests"] = [r.serialize() for r in obj["requests"]]
-        nvtx_range_pop("DynamicInferenceRequestRecord.serialize")
-        return obj
-
-    @classmethod
-    def deserialize(cls, obj: dict) -> "DynamicInferenceRequestRecord":
-        """Deserialize record.
-
-        Args:
-            obj (dict): Serialized record data.
-
-        Returns:
-            (DynamicInferenceRequestRecord) Deserialized record.
-        """
-        request = cls(**obj)
-        request.requests = [DynamicInferenceRequest.deserialize(r) for r in obj["requests"]]
         return request
 
 

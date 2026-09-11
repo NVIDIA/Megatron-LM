@@ -871,10 +871,15 @@ arrival schedules, batch-drain modes, or suspend and resume policies:
 engine.add_request(request_id, prompt_text, sampling_params)
 while engine.has_unfinished_requests():
     result = engine.step_modern()
-    for record in result["finished_request_records"]:
-        finished = record.merge()
+    for finished in result["finished_requests"]:
+        finished.finalize_text(tokenizer)
         print(finished.request_id, finished.generated_text)
 ```
+
+The engine owns checkpoint records internally and returns one flat,
+token-complete `DynamicInferenceRequest` per finished request. Its
+`generated_text` starts as `None`; direct low-level callers decode the complete
+token stream once by calling `finalize_text(tokenizer)` where text is needed.
 
 The fully worked manual-stepping example is
 [`examples/inference/advanced/gpt_dynamic_inference.py`](https://github.com/NVIDIA/Megatron-LM/blob/main/examples/inference/advanced/gpt_dynamic_inference.py).

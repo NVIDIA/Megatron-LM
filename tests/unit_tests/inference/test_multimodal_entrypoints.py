@@ -226,7 +226,7 @@ class _ToyInferenceService:
                 **engine_kwargs,
             )
             request.generated_text = "toy output"
-            request.generated_tokens = [7]
+            request.generated_tokens = [7] if self.deserialize else [7, 8]
             self._run_toy_decoder(request)
             self.last_request = request
             if self.deserialize:
@@ -238,7 +238,7 @@ class _ToyInferenceService:
                     "generated_text": request.generated_text,
                     "generated_tokens": request.generated_tokens,
                     "prompt_tokens": request.prompt_tokens.tolist(),
-                    "sampling_params": {"num_tokens_to_generate": 1},
+                    "sampling_params": {"num_tokens_to_generate": 2},
                     "routing_indices": None,
                 }
             future.set_result(result)
@@ -352,14 +352,14 @@ async def test_completions_multimodal_entrypoint_with_toy_model(
         "/v1/completions",
         json={
             "prompt": _PROMPT_TOKENS,
-            "max_tokens": 1,
+            "max_tokens": 2,
             "multi_modal_data": {modality: encoded_media},
         },
     )
 
     assert response.status_code == 200
     payload = await response.get_json()
-    assert payload["choices"][0]["text"] == "toy output"
+    assert payload["choices"][0]["text"] == "7 8"
     assert service.last_request.compact_prompt_tokens.tolist() == _PROMPT_TOKENS
     assert service.last_wire_data[modality] == [_MEDIA_BYTES]
     assert service.wrapper._forward_vision_encoder.call_count == 1
