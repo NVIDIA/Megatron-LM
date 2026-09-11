@@ -5,6 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+import pytest
 import torch
 
 from megatron.core.tokenizers.utils.build_tokenizer import vocab_size_with_padding
@@ -123,8 +124,9 @@ class TestTraining:
         Utils.destroy_model_parallel()
 
 
-def test_training_log_resets_first_iteration_when_log_interval_is_one(monkeypatch):
-    """The second per-step log must not include the first step's loss."""
+@pytest.mark.parametrize("indexer_version", [None, "v4", "v4.1"])
+def test_training_log_resets_first_iteration_when_log_interval_is_one(monkeypatch, indexer_version):
+    """Per-step logs reset losses and average indexer owners using their model layout."""
     args = SimpleNamespace(
         consumed_train_samples=0,
         data_parallel_size=1,
@@ -147,6 +149,24 @@ def test_training_log_resets_first_iteration_when_log_interval_is_one(monkeypatc
         train_iters=2,
         world_size=1,
     )
+    indexer_values = None
+    if indexer_version is not None:
+        args.dsa_indexer_loss_coeff = 0.1
+        args.dsv4_version = indexer_version
+        args.num_layers = 12
+        args.cuda_graph_impl = "none"
+        if indexer_version == "v4.1":
+            args.csa_compress_ratios = [0, 0, 2, 0, 2, 0, 1, 0, 1, 0, 1, 0]
+            args.csa2_index_source_layers = [2, 6, 8]
+            indexer_values = torch.tensor([0.0, 0, 2, 0, 0, 0, 4, 0, 6, 0, 0, 0])
+            expected_indexer_loss = 2.0  # Sum 12 / two microbatches / three Full/Reindex layers.
+        else:
+            args.csa_compress_ratios = [0, 0, 4, 0, 128, 0, 4, 0, 128, 0, 0, 0]
+            indexer_values = torch.tensor([0.0, 0, 2, 0, 0, 0, 6, 0, 0, 0, 0, 0])
+            expected_indexer_loss = 2.0  # Sum 8 / two microbatches / two ratio-4 layers.
+        helper = training_module.DSAIndexerLossLoggingHelper
+        monkeypatch.setattr(helper, "tracker", {"values": indexer_values.clone()})
+        monkeypatch.setattr(helper, "reduce_loss_in_tracker", lambda num_layers=None: None)
     timers = mock.MagicMock()
     timers.return_value.elapsed.return_value = 1.0
     log_lines = []
@@ -157,7 +177,9 @@ def test_training_log_resets_first_iteration_when_log_interval_is_one(monkeypatc
     monkeypatch.setattr(training_module, "get_wandb_writer", lambda: None)
     monkeypatch.setattr(training_module, "get_one_logger", lambda: None)
     monkeypatch.setattr(training_module, "get_energy_monitor", lambda: None)
-    monkeypatch.setattr(training_module, "get_num_microbatches", lambda: 1)
+    monkeypatch.setattr(
+        training_module, "get_num_microbatches", lambda: 2 if indexer_version else 1
+    )
     monkeypatch.setattr(
         training_module,
         "reduce_max_stat_across_model_parallel_group",
@@ -201,6 +223,11 @@ def test_training_log_resets_first_iteration_when_log_interval_is_one(monkeypatc
     assert total_loss_dict["advanced iterations"] == 0
     assert total_loss_dict["skipped iterations"] == 0
     assert total_loss_dict["nan iterations"] == 0
+    if indexer_values is not None:
+        assert f" indexer loss: {expected_indexer_loss:.6E} |" in log_lines[-1]
+        assert total_loss_dict["indexer loss"].item() == 0.0
+        assert not helper.tracker["values"].any()
+        helper.tracker["values"].copy_(indexer_values)
 
     training_module.training_log(
         {"alignment loss": make_tensor([6.0])},
@@ -212,6 +239,8 @@ def test_training_log_resets_first_iteration_when_log_interval_is_one(monkeypatc
 
     assert " alignment loss: 6.000000E+00 |" in log_lines[-1]
     assert " alignment loss: 4.000000E+00 |" not in log_lines[-1]
+    if indexer_values is not None:
+        assert f" indexer loss: {expected_indexer_loss:.6E} |" in log_lines[-1]
 
 
 class TestGetModelBucketSizingPgCollection:
