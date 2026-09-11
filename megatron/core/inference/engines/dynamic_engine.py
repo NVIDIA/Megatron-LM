@@ -1317,7 +1317,7 @@ class DynamicInferenceEngine(AbstractEngine):
             torch.cuda.synchronize()
             for request_id in self.resume_request_ids:
                 request = self.get_request(request_id)
-                self._add_request(request)
+                self._add_request(request, is_resume=True)
                 if isinstance(request, DynamicVLMInferenceRequest):
                     # Buffer reinitialization wipes the context maps. Restore
                     # either the freshly recomputed state or the explicitly
@@ -1490,12 +1490,14 @@ class DynamicInferenceEngine(AbstractEngine):
             raise ValueError("Async scheduling does not support routing replay.")
 
     def _add_request(
-        self, request: DynamicInferenceRequest
+        self, request: DynamicInferenceRequest, *, is_resume: bool = False
     ) -> asyncio.Future[DynamicInferenceRequest]:
         """Add a request to the engine.
 
         Args:
             request (DynamicInferenceRequest): Request to add.
+            is_resume (bool): Whether an existing record is being explicitly
+                re-admitted after suspend/resume.
 
         Returns:
             asyncio.Future[DynamicInferenceRequest]: Future completed when the request finishes.
@@ -1503,9 +1505,12 @@ class DynamicInferenceEngine(AbstractEngine):
 
         request_id = request.request_id
 
-        # Add request to self.requests. If the engine has previously been
-        # suspended, then the request may already exist.
-        if request_id not in self.requests:
+        if is_resume:
+            if request_id not in self.requests or self.get_request(request_id) is not request:
+                raise ValueError(f"Cannot resume unknown request ID {request_id}.")
+        elif request_id in self.requests:
+            raise ValueError(f"Request ID {request_id} is already active.")
+        else:
             self.requests[request_id] = RequestEntry(
                 record=DynamicInferenceRequestRecord.from_request(request),
                 future=self._loop.create_future(),
@@ -1659,6 +1664,11 @@ class DynamicInferenceEngine(AbstractEngine):
         Return:
             Returns an asyncio `Future[DynamicInferenceRequest]` for the user to wait on.
         """
+        if request_id in self.requests:
+            raise ValueError(f"Request ID {request_id} is already active.")
+        if sampling_params is None:
+            sampling_params = SamplingParams()
+
         input_modalities = ["text"]
         if num_frames is not None:
             input_modalities.append("video")

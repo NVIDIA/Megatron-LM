@@ -1086,10 +1086,10 @@ def test_recompute_suspend_resume_readds_prefix_cached_request_with_fresh_hashes
     )
     engine.requests = {request.request_id: types.SimpleNamespace(record=record)}
     engine.waiting_request_ids = deque()
+    engine.state = EngineState.RUNNING
     engine.controller = types.SimpleNamespace(
         _async_sched_logits=types.SimpleNamespace(clear=mock.Mock())
     )
-    engine.state = EngineState.RUNNING
     engine.unified_memory_level = 0
     engine.use_coordinator = False
     engine._vision_embedding_cache = {}
@@ -1120,6 +1120,56 @@ def test_recompute_suspend_resume_readds_prefix_cached_request_with_fresh_hashes
     assert engine.state == EngineState.RUNNING
     assert engine._add_request.call_count == 1
     assert engine._add_request.call_args.args[0] is checkpointed
+    assert engine._add_request.call_args.kwargs == {"is_resume": True}
+
+
+def test_add_request_defaults_sampling_params():
+    """The public optional sampling argument constructs a fresh default before token handling."""
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine.requests = {}
+    engine.context = types.SimpleNamespace(block_size_tokens=4, enable_prefix_caching=False)
+    engine.controller = types.SimpleNamespace(
+        inference_wrapped_model=types.SimpleNamespace(validate_input_modalities=mock.Mock())
+    )
+    expected_future = object()
+    engine._add_request = mock.Mock(return_value=expected_future)
+    tokens = torch.tensor([1, 2], dtype=torch.int64)
+
+    with mock.patch(
+        "megatron.core.inference.engines.dynamic_engine.torch.tensor", return_value=tokens
+    ):
+        result = engine.add_request(3, [1, 2])
+        engine.add_request(4, [1, 2])
+
+    first_request = engine._add_request.call_args_list[0].args[0]
+    second_request = engine._add_request.call_args_list[1].args[0]
+    assert result is expected_future
+    assert isinstance(first_request.sampling_params, SamplingParams)
+    assert first_request.sampling_params is not second_request.sampling_params
+    assert first_request.sampling_params.add_BOS is False
+
+
+def test_add_request_rejects_duplicate_id_before_mutation():
+    """An external duplicate fails before tokenization or request-state mutation."""
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine.requests = {7: object()}
+    engine.controller = types.SimpleNamespace(tokenize_prompt=mock.Mock())
+    engine._add_request = mock.Mock()
+
+    with pytest.raises(ValueError, match="Request ID 7 is already active"):
+        engine.add_request(7, "duplicate")
+
+    engine.controller.tokenize_prompt.assert_not_called()
+    engine._add_request.assert_not_called()
+
+    duplicate = DynamicInferenceRequest(
+        request_id=7,
+        prompt_tokens=torch.tensor([1, 2]),
+        sampling_params=SamplingParams(num_tokens_to_generate=1),
+    )
+    with pytest.raises(ValueError, match="Request ID 7 is already active"):
+        DynamicInferenceEngine._add_request(engine, duplicate)
+    assert duplicate.status is None
 
 
 def test_drained_reset_preserves_coordinator_runtime_state():
