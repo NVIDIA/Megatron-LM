@@ -3917,16 +3917,6 @@ def _add_experimental_attention_variant_args(parser):
         help='Number of source tokens selected per query token by DSA.',
     )
     _maybe_add_argument(
-        '--dsa-kernel-backend',
-        type=str,
-        default='reference',
-        choices=['reference', 'triton-min-memory', 'torch-min-memory'],
-        help=(
-            'DSA-GQA backend. triton-min-memory uses optional Triton kernels; '
-            'torch-min-memory uses the same min-memory algorithm with Triton dispatch disabled.'
-        ),
-    )
-    _maybe_add_argument(
         '--dsa-min-memory-profile',
         action='store_true',
         help='Print per-layer DSA min-memory forward/backward timing breakdowns.',
