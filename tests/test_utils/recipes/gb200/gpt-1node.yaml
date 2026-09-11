@@ -200,10 +200,10 @@ products:
       - environment: [dev]
         scope: [mr-github-temp-disabled]
         platforms: [dgx_gb200]
-  - test_case: [gpt3_mcore_te_tp2_zp_z3_resume_fsdp_dtensor_1node]
+  - test_case: [gpt3_mcore_te_tp2_zp_z3_resume_mfsdp_v1_1node]
     products:
       - environment: [dev]
-        scope: [mr-github]
+        scope: [nightly]
         platforms: [dgx_gb200]
   - test_case: [gpt3_mcore_te_tp2_pp1_modelopt_distill_resume_1node]
     products:

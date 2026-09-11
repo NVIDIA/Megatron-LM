@@ -327,7 +327,7 @@ products:
       - environment: [dev]
         scope: [nightly]
         platforms: [dgx_gb200]
-  - test_case: [gpt3_mcore_te_tp2_zp_z3_resume_fsdp_dtensor]
+  - test_case: [gpt3_mcore_te_tp2_zp_z3_resume_mfsdp_v1]
     products:
       - environment: [dev]
         scope: [nightly]

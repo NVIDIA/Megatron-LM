@@ -454,10 +454,10 @@ products:
         platforms: [dgx_h100]
       # - environment: [lts]
       #   scope: [nightly] # OOM: #434
-  - test_case: [gpt3_mcore_te_tp2_zp_z3_resume_fsdp_dtensor]
+  - test_case: [gpt3_mcore_te_tp2_zp_z3_resume_mfsdp_v1]
     products:
       - environment: [dev]
-        scope: [mr, mr-github]
+        scope: [nightly]
         platforms: [dgx_h100]
       # - environment: [lts]
       #   scope: [nightly]
