@@ -653,8 +653,7 @@ class TestGatedDeltaNet:
             return tuple(torch.empty(0, device=qkvzba_arg.device) for _ in range(6))
 
         with mock.patch(
-            "megatron.core.fusions.fused_pre_gated_delta_rule."
-            "fused_streamed_pre_gated_delta_rule",
+            "megatron.core.ssm.gated_delta_net.gdn.fused_streamed_pre_gated_delta_rule",
             side_effect=fake_fused_streamed_pre_gated_delta_rule,
         ):
             gdn._fused_streamed_pre_gated_delta_rule(qkvzba, cp_group_headwise=gdn.pg_collection.cp)
@@ -841,3 +840,12 @@ class TestGDNCuSeqlensResolve:
         actual = torch.tensor([0, 500, 1000], dtype=torch.int32)
         with pytest.raises(ValueError, match="does not match"):
             mock_gdn._resolve_cu_seqlens(None, actual, 1008, "cu_seqlens_q", cp_size=1)
+
+    def test_strict_runtime_validation_can_be_skipped(self, mock_gdn):
+        invalid = torch.tensor([0, 505, 1000], dtype=torch.int32)
+
+        result = mock_gdn._resolve_cu_seqlens(
+            None, invalid, 1008, "cu_seqlens_q", cp_size=2, strict_runtime_validation=False
+        )
+
+        assert result is invalid

@@ -630,6 +630,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         inference_context: Optional[BaseInferenceContext] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
         sequence_len_offset: Optional[Tensor] = None,
+        strict_runtime_validation: Optional[bool] = None,
         mhc_recompute_manager: Optional['MHCCheckpointManager'] = None,
         *,
         inference_params: Optional[Any] = None,
@@ -673,6 +674,12 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         if using_fused_tp_inference_kernel:
             self._set_proj_residual(residual)
 
+        runtime_validation_kwargs = {}
+        if strict_runtime_validation is not None and getattr(
+            self.self_attention, "supports_strict_runtime_validation", False
+        ):
+            runtime_validation_kwargs["strict_runtime_validation"] = strict_runtime_validation
+
         nvtx_range_push(suffix="self_attention")
         attention_output_with_bias = self.self_attention(
             input_layernorm_output,
@@ -685,6 +692,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             attention_bias=attention_bias,
             packed_seq_params=packed_seq_params,
             sequence_len_offset=sequence_len_offset,
+            **runtime_validation_kwargs,
         )
         nvtx_range_pop(suffix="self_attention")
 
@@ -711,6 +719,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         sequence_len_offset: Optional[Tensor] = None,
         padding_mask: Optional[Tensor] = None,
         input_ids: Optional[Tensor] = None,
+        strict_runtime_validation: Optional[bool] = None,
         *,
         inference_params: Optional[Any] = None,
     ):
@@ -776,6 +785,12 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         if using_fused_tp_inference_kernel:
             self._set_proj_residual(residual)
 
+        runtime_validation_kwargs = {}
+        if strict_runtime_validation is not None and getattr(
+            self.self_attention, "supports_strict_runtime_validation", False
+        ):
+            runtime_validation_kwargs["strict_runtime_validation"] = strict_runtime_validation
+
         # Self attention.
         nvtx_range_push(suffix="self_attention")
         attention_output_with_bias = self.self_attention(
@@ -789,6 +804,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             attention_bias=attention_bias,
             packed_seq_params=packed_seq_params,
             sequence_len_offset=sequence_len_offset,
+            **runtime_validation_kwargs,
         )
         nvtx_range_pop(suffix="self_attention")
 
