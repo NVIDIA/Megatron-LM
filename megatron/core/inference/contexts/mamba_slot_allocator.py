@@ -6,7 +6,7 @@ import torch
 from torch import Tensor
 
 from megatron.core.inference.config import PrefixCachingEvictionPolicy
-from megatron.core.ssm.ops.gdp.common import CHUNK_SIZE as GDP_CHUNK_SIZE
+from megatron.core.ops.ssm.gdp.common import CHUNK_SIZE as GDP_CHUNK_SIZE
 
 if TYPE_CHECKING:
     from .dynamic_context import DynamicInferenceContext

@@ -5,7 +5,6 @@
 # This source code is licensed under the Apache license found in the
 # LICENSE file in the root directory of this source tree.
 
-import inspect
 import logging
 import math
 from dataclasses import dataclass, replace
@@ -21,17 +20,25 @@ from megatron.core.inference.contexts.attention_context.triton.tensor_ops import
     tensor_masked_update,
 )
 from megatron.core.inference.utils import InferenceMode
-from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.ssm.causal_conv1d import assert_causal_conv1d_deterministic
-from megatron.core.ssm.ops.common.causal_conv1d_triton import causal_conv1d_update
-from megatron.core.ssm.ops.common.causal_conv1d_varlen import causal_conv1d_varlen_carry_states
-from megatron.core.ssm.ops.common.intermediate_extraction import (
+from megatron.core.ops.ssm.common.causal_conv1d import causal_conv1d_fn, causal_conv1d_update_cuda
+from megatron.core.ops.ssm.common.causal_conv1d_triton import causal_conv1d_update
+from megatron.core.ops.ssm.common.causal_conv1d_varlen import causal_conv1d_varlen_carry_states
+from megatron.core.ops.ssm.common.intermediate_extraction import (
     scatter_intermediate_conv,
     scatter_intermediate_ssm,
 )
-from megatron.core.ssm.ops.mamba2.batch_invariant_decode import MambaBatchInvariantDecode
-from megatron.core.ssm.ops.mamba2.mamba_ssm import selective_state_update
+from megatron.core.ops.ssm.mamba2.backends import (
+    HAVE_MAMBA_SSM,
+    MAMBA_HAS_STATE_DTYPE,
+    RMSNormGated,
+    mamba_chunk_scan_combined,
+    mamba_split_conv1d_scan_combined,
+)
+from megatron.core.ops.ssm.mamba2.batch_invariant_decode import MambaBatchInvariantDecode
+from megatron.core.ops.ssm.mamba2.mamba_ssm import selective_state_update
+from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.ssm.causal_conv1d import assert_causal_conv1d_deterministic
 from megatron.core.ssm.ssm_inference import SSMDynamicInferenceMixin
 from megatron.core.ssm.utils import _split_tensor_factory
 from megatron.core.tensor_parallel import get_cuda_rng_tracker
@@ -60,45 +67,12 @@ else:
 from .mamba_context_parallel import MambaContextParallel
 
 try:
-    from causal_conv1d import causal_conv1d_fn
-    from causal_conv1d import causal_conv1d_update as causal_conv1d_update_cuda
-
-except ImportError:
-    causal_conv1d_fn = None
-    causal_conv1d_update_cuda = None
-
-try:
-    from mamba_ssm.ops.triton.layernorm_gated import RMSNorm as RMSNormGated
-    from mamba_ssm.ops.triton.ssd_combined import (
-        mamba_chunk_scan_combined,
-        mamba_split_conv1d_scan_combined,
-    )
-
-    HAVE_MAMBA_SSM = True
-except ImportError:
-    mamba_chunk_scan_combined = None
-    mamba_split_conv1d_scan_combined = None
-    HAVE_MAMBA_SSM = False
-
-try:
-    from megatron.core.ssm.ops.mamba2.ssd_combined import mamba_chunk_scan_combined_varlen
+    from megatron.core.ops.ssm.mamba2.ssd_combined import mamba_chunk_scan_combined_varlen
 
     HAVE_SSM_OPS_VARLEN = True
 except ImportError:
     mamba_chunk_scan_combined_varlen = None
     HAVE_SSM_OPS_VARLEN = False
-
-if not HAVE_MAMBA_SSM:
-    from unittest.mock import MagicMock
-
-    RMSNormGated = MagicMock()
-    HAVE_MAMBA_SSM = False
-
-MAMBA_HAS_STATE_DTYPE = (
-    HAVE_MAMBA_SSM
-    and ("state_dtype" in inspect.signature(mamba_split_conv1d_scan_combined).parameters)
-    and ("state_dtype" in inspect.signature(mamba_chunk_scan_combined).parameters)
-)
 
 try:
     from einops import rearrange, repeat
@@ -852,7 +826,7 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule):
         conv_bias = self.cp.get_conv1d_bias().to(conv_state_dtype)
 
         xBC_pre_conv = xBC if intermediate_conv_out is not None else None
-        from megatron.core.ssm.ops.common.causal_conv1d_varlen import causal_conv1d_varlen_fn
+        from megatron.core.ops.ssm.common.causal_conv1d_varlen import causal_conv1d_varlen_fn
 
         xBC_out = causal_conv1d_varlen_fn(
             x=xBC.squeeze(0).contiguous(),

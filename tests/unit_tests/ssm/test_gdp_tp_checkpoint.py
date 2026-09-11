@@ -12,6 +12,7 @@ from unittest.mock import patch
 import torch
 
 from megatron.core.dist_checkpointing import ShardedTensor
+from megatron.core.ops.ssm.gdp import backends as gdp_backends
 from megatron.core.ssm import gated_delta_product as gdp_module
 from megatron.core.ssm.gated_delta_product import (
     GatedDeltaProductMixer,
@@ -42,6 +43,7 @@ def _load_gdp_module_with_fake_rmsnorm(monkeypatch):
     layernorm_gated = ModuleType("mamba_ssm.ops.triton.layernorm_gated")
     layernorm_gated.RMSNorm = torch.nn.Module
     monkeypatch.setitem(sys.modules, layernorm_gated.__name__, layernorm_gated)
+    monkeypatch.setattr(gdp_backends, "RMSNormGated", torch.nn.Module)
 
     module_name = "megatron.core.ssm._gated_delta_product_with_fake_rmsnorm"
     spec = importlib.util.spec_from_file_location(module_name, gdp_module.__file__)

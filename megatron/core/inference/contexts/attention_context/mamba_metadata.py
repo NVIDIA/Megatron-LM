@@ -8,8 +8,8 @@ from megatron.core.inference.batch_dimensions_utils import InferenceBatchDimensi
 from megatron.core.inference.contexts.mamba_slot_allocator import (
     MAX_INTERMEDIATE_OFFSETS_PER_REQUEST,
 )
-from megatron.core.ssm.ops.gdp.common import CHUNK_SIZE as GDP_CHUNK_SIZE
-from megatron.core.ssm.ops.gdp.metadata import build_gdp_chunk_descriptors, max_gdp_chunk_counts
+from megatron.core.ops.ssm.gdp.common import CHUNK_SIZE as GDP_CHUNK_SIZE
+from megatron.core.ops.ssm.gdp.metadata import build_gdp_chunk_descriptors, max_gdp_chunk_counts
 
 
 class MambaMetadata:

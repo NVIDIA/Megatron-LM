@@ -10,7 +10,7 @@
 import logging
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import Callable, Optional, Protocol, Union
+from typing import TYPE_CHECKING, Callable, Optional, Union
 
 import torch
 import torch.nn as nn
@@ -19,6 +19,13 @@ import torch.nn.functional as F
 from megatron.core.fp8_utils import get_fp8_align_size
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.jit import jit_fuser
+from megatron.core.ops.ssm.gated_delta import GatedDeltaRuleInterface
+from megatron.core.ops.ssm.gated_delta.fla import (
+    HAVE_FLA,
+    causal_conv1d,
+    chunk_gated_delta_rule,
+    l2norm,
+)
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.mamba_context_parallel import (
@@ -40,18 +47,8 @@ from megatron.core.transformer.utils import (
 )
 from megatron.core.utils import nvtx_range_pop, nvtx_range_push
 
-try:
-    from fla.modules.convolution import causal_conv1d
-    from fla.modules.l2norm import l2norm
-    from fla.ops.gated_delta_rule import chunk_gated_delta_rule
-
-    HAVE_FLA = True
-except ImportError:
-    causal_conv1d = None
-    l2norm = None
-    chunk_gated_delta_rule = None
-
-    HAVE_FLA = False
+if TYPE_CHECKING:
+    from megatron.core.models.backends import BackendSpecProvider
 
 logger = logging.getLogger(__name__)
 
@@ -65,30 +62,6 @@ class GatedDeltaNetSubmodules:
     in_proj: Union[ModuleSpec, type] = IdentityOp
     out_norm: Union[ModuleSpec, type] = IdentityOp
     out_proj: Union[ModuleSpec, type] = IdentityOp
-
-
-class GatedDeltaRuleInterface(Protocol):
-    """
-    Unified typing protocol for linear attention interfaces, compliant to upstream FLA interfaces.
-
-    Only ``q``/``k``/``v``/``g`` are common to every kernel, and only as keywords: each
-    variant inserts its own gates after ``g`` (e.g., ``beta`` for GDN, ``b``/``w`` for GDN2).
-    """
-
-    def __call__(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        g: torch.Tensor,
-        *,
-        scale: float | None = None,
-        initial_state: torch.Tensor | None = None,
-        output_final_state: bool = False,
-        use_qk_l2norm_in_kernel: bool = False,
-        cu_seqlens: torch.LongTensor | None = None,
-        **kwargs,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]: ...
 
 
 class _GDNBase(MegatronModule):
@@ -126,6 +99,7 @@ class _GDNBase(MegatronModule):
         name: str | None = None,
         cp_comm_type: str | None = None,
         pp_layer_offset: int = 0,
+        kernel_backend: "BackendSpecProvider | None" = None,
     ):
         """
         Args:
@@ -146,6 +120,7 @@ class _GDNBase(MegatronModule):
                 ignored; GDN implements context parallelism with its own all-to-alls rather
                 than the attention CP communication schemes.
             pp_layer_offset: Offset of this pipeline stage's first global layer.
+            kernel_backend: Optional provider supplied by the module spec.
         """
         del is_mtp_layer
         if not HAVE_FLA:
@@ -199,7 +174,7 @@ class _GDNBase(MegatronModule):
             "feat_dim_split",
             "gated_delta_rule",
         )
-        self._setup_variant_attrs()
+        self._setup_variant_attrs(kernel_backend=kernel_backend)
         for attr in attrs_to_check:
             assert getattr(self, attr, None) is not None, f"Attribute {attr} for GDN is not set"
         # QK, V, gate, shared across all variants
@@ -292,7 +267,7 @@ class _GDNBase(MegatronModule):
 
         self.reset_parameters()
 
-    def _setup_variant_attrs(self):
+    def _setup_variant_attrs(self, kernel_backend=None):
         """Set variant specifics on the module. Called once from ``__init__``.
 
         Must set:

@@ -527,7 +527,7 @@ _VALID_DSA_KERNEL_BACKENDS = ("none", "tilelang", "cudnn")
 def _missing_tilelang_dsa_kernel_dependencies() -> List[str]:
     """Return missing TileLang DSA kernel dependencies."""
     try:
-        from megatron.core.transformer.experimental_attention_variant.ops import tilelang_dsa
+        from megatron.core.ops.attention.dsa.kernels import tilelang_dsa
     except (ImportError, OSError):
         return ["TileLang DSA kernels"]
 

@@ -7,13 +7,9 @@ import os
 
 import torch
 
+from megatron.core.ops.ssm.common.causal_conv1d import causal_conv1d_fn
 from megatron.core.tensor_parallel.mappings import all_to_all
 from megatron.core.utils import is_causal_conv1d_min_version
-
-try:
-    from causal_conv1d import causal_conv1d_fn
-except ImportError:
-    causal_conv1d_fn = None
 
 
 def _use_causal_conv1d_deterministic_mode():

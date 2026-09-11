@@ -34,7 +34,7 @@ def patch_hadamard_if_needed():
     if not HAVE_HADAMARD:
         with (
             patch(
-                'megatron.core.transformer.experimental_attention_variant.dsa.hadamard_transform',
+                'megatron.core.ops.attention.dsa.rotation.hadamard_transform',
                 _mock_hadamard_transform,
             ),
             patch(

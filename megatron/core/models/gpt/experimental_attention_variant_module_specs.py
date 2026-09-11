@@ -68,6 +68,7 @@ def get_gated_delta_net_module_spec(
     )
     attention = ModuleSpec(
         module=gdn_module,
+        params={"kernel_backend": backend},
         submodules=GatedDeltaNetSubmodules(
             in_proj=backend.column_parallel_layer_norm_linear(),
             out_norm=backend.layer_norm(rms_norm=rms_norm, for_qk=False),
@@ -89,6 +90,7 @@ def get_dsa_module_spec_for_backend(
     # implementation whether the backend is TransformerEngine or not.
     core_attention = ModuleSpec(
         module=DSAttention,
+        params={"kernel_backend": backend},
         submodules=DSAttentionSubmodules(
             indexer=ModuleSpec(
                 module=DSAIndexer,

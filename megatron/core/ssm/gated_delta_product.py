@@ -9,11 +9,14 @@ import logging
 import math
 from dataclasses import dataclass, replace
 from functools import partial
-from typing import List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+if TYPE_CHECKING:
+    from megatron.core.models.backends import BackendSpecProvider
 
 from megatron.core import tensor_parallel
 from megatron.core.dist_checkpointing import ShardedTensor
@@ -22,6 +25,20 @@ from megatron.core.inference.contexts import BaseInferenceContext, DynamicInfere
 from megatron.core.inference.contexts.attention_context.triton.tensor_ops import (
     tensor_masked_update,
 )
+from megatron.core.ops.ssm.common.causal_conv1d import causal_conv1d_fn
+from megatron.core.ops.ssm.gdp.backends import (
+    HAVE_CUTEDSL_GDP,
+    HAVE_FLA,
+    HAVE_MAMBA_SSM,
+    RMSNormGated,
+)
+from megatron.core.ops.ssm.gdp.backends import (
+    chunk_gated_delta_product as chunk_gated_delta_product,
+)
+from megatron.core.ops.ssm.gdp.backends import (
+    cutedsl_chunk_gated_delta_product as cutedsl_chunk_gated_delta_product,
+)
+from megatron.core.ops.ssm.gdp.backends import l2_norm, select_gated_delta_product
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
@@ -51,34 +68,11 @@ else:
     is_gtp_param = None
 
 try:
-    from causal_conv1d import causal_conv1d_fn
-except ImportError:
-    causal_conv1d_fn = None
-
-try:
-    from mamba_ssm.ops.triton.layernorm_gated import RMSNorm as RMSNormGated
-
-    HAVE_MAMBA_SSM = True
-except ImportError:
-    from unittest.mock import MagicMock
-
-    RMSNormGated = MagicMock()
-    HAVE_MAMBA_SSM = False
-
-try:
     from einops import rearrange
 
     HAVE_EINOPS = True
 except ImportError:
     HAVE_EINOPS = False
-
-try:
-    from fla.modules.l2norm import l2_norm
-    from fla.ops.gated_delta_product import chunk_gated_delta_product
-
-    HAVE_FLA = True
-except ImportError:
-    HAVE_FLA = False
 
 try:
     from megatron.core.ssm.context_parallel.gdp import FLAGatedDeltaProductCPBackend
@@ -87,13 +81,6 @@ try:
 except ImportError:
     FLAGatedDeltaProductCPBackend = None
     HAVE_FLA_GDP_CP = False
-
-try:
-    from gdp_attn import chunk_gated_delta_product as cutedsl_chunk_gated_delta_product
-
-    HAVE_CUTEDSL_GDP = True
-except ImportError:
-    HAVE_CUTEDSL_GDP = False
 
 try:
     from megatron.core.ssm.context_parallel.gdp_cutedsl import CuTeDSLGatedDeltaProductCPBackend
@@ -107,23 +94,32 @@ except ImportError:
 # the pip `flash-linear-attention` / `causal_conv1d` ones. The fork is
 # forward-only and CUDA-graph safe, so training (which owns the backward pass)
 # keeps calling upstream.
-from megatron.core.ssm.ops.common.causal_conv1d_triton import causal_conv1d_update
-from megatron.core.ssm.ops.common.causal_conv1d_varlen import (
+from megatron.core.ops.ssm.common.causal_conv1d_triton import causal_conv1d_update
+from megatron.core.ops.ssm.common.causal_conv1d_varlen import (
     causal_conv1d_varlen_carry_states,
     causal_conv1d_varlen_fn,
 )
-from megatron.core.ssm.ops.common.intermediate_extraction import (
+from megatron.core.ops.ssm.common.intermediate_extraction import (
     scatter_intermediate_conv,
     scatter_intermediate_ssm,
 )
-from megatron.core.ssm.ops.gdp import (
+from megatron.core.ops.ssm.gdp import (
     chunk_gated_delta_product_varlen,
     fused_recurrent_gated_delta_rule_update,
     gdp_decode_prepare,
 )
-from megatron.core.ssm.ops.gdp.common import CHUNK_SIZE as GDP_INFERENCE_CHUNK_SIZE
+from megatron.core.ops.ssm.gdp.common import CHUNK_SIZE as GDP_INFERENCE_CHUNK_SIZE
 
 logger = logging.getLogger(__name__)
+
+
+__all__ = [
+    "ExtendedRMSNorm",
+    "GatedDeltaProductMixer",
+    "GatedDeltaProductMixerSubmodules",
+    "chunk_gated_delta_product",
+    "cutedsl_chunk_gated_delta_product",
+]
 
 
 def _kernel_accepts_kwarg(kernel, name: str) -> bool:
@@ -207,6 +203,7 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
         pg_collection: The required process groups to use for tensor model parallel and context
             parallel.
         name: Module instance name passed top-down from its parent module.
+        kernel_backend: Optional provider supplied by a custom module spec.
     """
 
     def __init__(
@@ -231,6 +228,7 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
         pg_collection: ProcessGroupCollection = None,
         pp_layer_offset: int = 0,
         name: str | None = None,
+        kernel_backend: "BackendSpecProvider | None" = None,
     ):
         if not HAVE_MAMBA_SSM:
             raise ImportError(
@@ -259,10 +257,15 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
         # Select the chunked gated delta product kernel once. The CuTeDSL and FLA
         # implementations share the main call surface but are imported under distinct
         # names; checkpoint-keyword differences are normalized below.
-        self.gdp_kernel = (
-            cutedsl_chunk_gated_delta_product
-            if config.gdp_cutedsl_kernel
-            else chunk_gated_delta_product
+        from megatron.core.models.backends import backend_slot, get_backend_from_config
+
+        self.gdp_kernel = backend_slot(
+            backend=(
+                kernel_backend if kernel_backend is not None else get_backend_from_config(config)
+            ),
+            name="gated_delta_product",
+            default=lambda: select_gated_delta_product(config.gdp_cutedsl_kernel),
+            use_cutedsl=config.gdp_cutedsl_kernel,
         )
 
         # CuTeDSL releases have used two names for checkpoint coarsening. Probe once and
@@ -1091,8 +1094,8 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
     # ``DynamicInferenceContext``.
     #
     # Both hooks are CUDA-graph capturable. They run the forked Triton kernels
-    # under `megatron/core/ssm/ops/gdp` (plus the forked conv kernels in
-    # `ops/common`), which take precomputed metadata instead of deriving it with
+    # under `megatron/core/ops/ssm/gdp` (plus the forked conv kernels in
+    # `megatron/core/ops/ssm/common`), which take precomputed metadata instead of deriving it with
     # a device-to-host sync, and which treat a `-1` entry in `batch_indices` as
     # a padding request: zero output, no state access. A graph captured at a
     # rounded-up batch shape therefore replays correctly for any smaller real
