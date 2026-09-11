@@ -163,9 +163,7 @@ def test_inference_only_grouped_mlp_retains_single_copy_of_expert_weights(device
 
     # In-place refit writes land in the serving buffers without a refresh.
     module.linear_fc1.weight0.data.fill_(33)
-    torch.testing.assert_close(
-        module._fc1_weight[0], torch.full_like(module._fc1_weight[0], 33.0)
-    )
+    torch.testing.assert_close(module._fc1_weight[0], torch.full_like(module._fc1_weight[0], 33.0))
 
     # Steady state: nothing to refresh, serving addresses unchanged.
     serving_ptrs = (module._fc1_weight.data_ptr(), module._fc2_weight.data_ptr())
@@ -193,12 +191,8 @@ def test_inference_only_grouped_mlp_reattaches_detached_parameters_on_refresh(de
 
     # Values landed at the original serving addresses; parameters are views again.
     assert (module._fc1_weight.data_ptr(), module._fc2_weight.data_ptr()) == serving_ptrs
-    torch.testing.assert_close(
-        module._fc1_weight[0], torch.full_like(module._fc1_weight[0], 44.0)
-    )
-    torch.testing.assert_close(
-        module._fc2_weight[1], torch.full_like(module._fc2_weight[1], 55.0)
-    )
+    torch.testing.assert_close(module._fc1_weight[0], torch.full_like(module._fc1_weight[0], 44.0))
+    torch.testing.assert_close(module._fc2_weight[1], torch.full_like(module._fc2_weight[1], 55.0))
     assert module.linear_fc1.weight0.data_ptr() == module._fc1_weight[0].data_ptr()
     assert module.linear_fc2.weight1.data_ptr() == module._fc2_weight[1].data_ptr()
     if device == "cuda":
