@@ -1165,14 +1165,9 @@ class _HybridEPManager(_DispatchManager):
             )
         )
         if self.moe_expert_rank_capacity_factor is not None:
-            # Static-budget path only. The overflow flag is the eleventh field in HybridEP's
-            # stable handle layout. Newer HybridEP revisions append num_of_valid_tokens after
-            # it, so indexing from the end would mistake every non-empty dispatch for overflow.
-            if len(self.handle) <= 10:
-                raise RuntimeError(
-                    f"Unexpected HybridEP dispatch handle with {len(self.handle)} fields"
-                )
-            over_budget = self.handle[10] != 0
+            # Static-budget path only: handle[-1] is HybridEP overflow_flag when tokens were
+            # dropped because permuted count exceeded num_permuted_tokens from setup_metadata.
+            over_budget = self.handle[-1] != 0
             self.over_budget |= over_budget
         # When capacity factor is None, skip overflow tracking (no token drops). Actual
         # permuted size is resolved below via tokens_per_expert.sum() (CPU sync).
