@@ -4231,6 +4231,7 @@ class TestDynamicContext:
         ([0, 0, 0], [0.0, 1.0, 1.0], [None, None, None]),  # all no-op: fast path
         ([4, 0], [0.0, 1.0], [4, None]),  # mixed batch: per-row repair
         ([1], [1.0], [1]),  # greedy: exactly one finite argmax, even on a tie
+        ([1], [0.9], [1]),  # top-k=1 remains greedy when combined with top-p
     ],
 )
 def test_flashinfer_no_op_filter_rows_get_exact_log_softmax(top_k, top_p, finite_counts):
@@ -4345,16 +4346,18 @@ def test_flashinfer_sample_kernel_dispatch(
         assert torch.equal(safe_arg, expected)
 
 
-def test_flashinfer_top_k_one_ties_use_deterministic_argmax(monkeypatch):
-    """top_k=1 is greedy even when several logits tie for the maximum."""
+@pytest.mark.parametrize("top_p_value", [1.0, 0.9])
+def test_flashinfer_top_k_one_ties_use_deterministic_argmax(monkeypatch, top_p_value):
+    """top_k=1 is greedy on ties, including when combined with top-p."""
     fake = mock.MagicMock()
     fake.sampling.top_k_sampling_from_probs.return_value = torch.tensor([3, 1])
+    fake.sampling.top_k_top_p_sampling_from_logits.return_value = torch.tensor([3, 1])
     monkeypatch.setattr("megatron.core.inference.sampling.flashinfer_sampling.flashinfer", fake)
 
     logits = torch.tensor([[0.0, 3.0, 1.0, 3.0], [2.0, 2.0, 1.0, 0.0]])
     n, vocab_size = logits.shape
     top_k = torch.ones(n, dtype=torch.int32)
-    top_p = torch.ones(n)
+    top_p = torch.full((n,), top_p_value)
     context = SimpleNamespace(
         gpu_view=SimpleNamespace(temperature=torch.ones(n), top_k=top_k, top_p=top_p),
         active_request_metadata={"top_k": top_k, "top_p": top_p},
@@ -4363,23 +4366,24 @@ def test_flashinfer_top_k_one_ties_use_deterministic_argmax(monkeypatch):
     )
 
     backend = FlashInferSampling(vocab_size, torch.Generator())
-    sampled = backend.sample_kernel(logits, n, context, no_top_k=False, no_top_p=True)
+    sampled = backend.sample_kernel(logits, n, context, no_top_k=False, no_top_p=top_p_value >= 1.0)
 
     assert torch.equal(sampled, torch.tensor([1, 0]))
     fake.sampling.top_k_sampling_from_probs.assert_not_called()
+    fake.sampling.top_k_top_p_sampling_from_logits.assert_not_called()
 
 
 def test_flashinfer_mixed_batch_repairs_greedy_ties(monkeypatch):
     """Greedy rows remain deterministic alongside stochastic top-k rows."""
     fake = mock.MagicMock()
-    fake.sampling.top_k_sampling_from_probs.return_value = torch.tensor(
+    fake.sampling.top_k_top_p_sampling_from_logits.return_value = torch.tensor(
         [3, 2], dtype=torch.int32
     )
     monkeypatch.setattr("megatron.core.inference.sampling.flashinfer_sampling.flashinfer", fake)
 
     logits = torch.tensor([[0.0, 3.0, 1.0, 3.0], [2.0, 2.0, 1.0, 0.0]])
     top_k = torch.tensor([1, 2], dtype=torch.int32)
-    top_p = torch.ones(2)
+    top_p = torch.full((2,), 0.9)
     context = SimpleNamespace(
         gpu_view=SimpleNamespace(temperature=torch.ones(2), top_k=top_k, top_p=top_p),
         active_request_metadata={"top_k": top_k, "top_p": top_p},
@@ -4388,7 +4392,7 @@ def test_flashinfer_mixed_batch_repairs_greedy_ties(monkeypatch):
     )
 
     backend = FlashInferSampling(logits.size(1), torch.Generator())
-    sampled = backend.sample_kernel(logits, 2, context, no_top_k=False, no_top_p=True)
+    sampled = backend.sample_kernel(logits, 2, context, no_top_k=False, no_top_p=False)
 
     assert torch.equal(sampled, torch.tensor([1, 2]))
-    fake.sampling.top_k_sampling_from_probs.assert_called_once()
+    fake.sampling.top_k_top_p_sampling_from_logits.assert_called_once()

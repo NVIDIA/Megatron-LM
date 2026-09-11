@@ -19,7 +19,7 @@ from megatron.core.inference.sampling_params import (
 
 
 def _greedy_batch_flags(context) -> tuple[bool, bool]:
-    """Return whether any/all active requests use greedy sampling.
+    """Return whether any/all active requests use ``top_k=1`` greedy sampling.
 
     Sampling parameters have a pinned CPU source of truth, so these checks add
     no GPU synchronization to the sampling path.
@@ -29,8 +29,9 @@ def _greedy_batch_flags(context) -> tuple[bool, bool]:
         return False, False
     metadata = context.active_request_metadata
     top_k = metadata["top_k"][:active_count]
-    top_p = metadata["top_p"][:active_count]
-    greedy = (top_k == 1) & is_no_op_top_p(top_p)
+    # Applying top-p after top-k cannot broaden top-k's one-token support, so
+    # top_k=1 remains greedy when the FlashInfer backend combines both filters.
+    greedy = top_k == 1
     return bool(greedy.any()), bool(greedy.all())
 
 
@@ -171,7 +172,7 @@ class FlashInferSampling(Sampling):
         # Mixed batches still use FlashInfer for stochastic rows, then repair
         # greedy rows with deterministic first-argmax tie breaking.
         if has_greedy_rows:
-            greedy_mask = (top_k == 1) & is_no_op_top_p(top_p)
+            greedy_mask = top_k == 1
             sampled_tokens = torch.where(greedy_mask, torch.argmax(scaled, dim=-1), sampled_tokens)
 
         if output is None:
@@ -240,7 +241,7 @@ class FlashInferSampling(Sampling):
             torch.log(renormed),
         )
         if has_greedy_rows:
-            greedy_mask = (top_k == 1) & is_no_op_top_p(top_p)
+            greedy_mask = top_k == 1
             greedy_log_probs = torch.full_like(scaled, float("-inf"))
             greedy_log_probs.scatter_(1, torch.argmax(scaled, dim=-1, keepdim=True), 0.0)
             log_probs = torch.where(greedy_mask.unsqueeze(1), greedy_log_probs, log_probs)
