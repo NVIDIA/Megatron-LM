@@ -386,7 +386,17 @@ def _te_mxfp8_batch_invariant_grouped_mm(
     alpha = torch.ones(num_experts, dtype=torch.float32, device=x_bf16.device)
     beta = torch.zeros(num_experts, dtype=torch.float32, device=x_bf16.device)
     output_rows_per_chunk = rows_per_chunk * out_features
-    launch_state = []
+    # TE's device-metadata grouped GEMM and grouped quantization both execute on
+    # the caller's CUDA stream. Reuse one workspace across the serialized chunk
+    # launches, matching TE's public grouped-GEMM wrapper. Allocating one 32 MiB
+    # workspace per chunk retains 64 GiB across the two Qwen3-30B expert GEMMs at
+    # EP=16 (1024 chunks each), even though their lifetimes do not overlap.
+    workspace_setup = torch.empty(
+        get_grouped_gemm_setup_workspace_size(num_experts), dtype=torch.uint8, device=x_bf16.device
+    )
+    workspace_cublas = torch.empty(
+        get_unrestricted_te_workspace_size_bytes(), dtype=torch.uint8, device=x_bf16.device
+    )
     for chunk in range(num_chunks):
         row_start = chunk * rows_per_chunk
         row_end = row_start + rows_per_chunk
@@ -405,22 +415,6 @@ def _te_mxfp8_batch_invariant_grouped_mm(
             tensor_offsets=tensor_offsets,
             requires_grad=False,
         )
-        # TE may execute grouped GEMMs on auxiliary streams. Keep workspaces distinct
-        # across chunk launches just like its public wrapper does; reusing them here
-        # introduces a cross-stream race between consecutive chunks.
-        workspace_setup = torch.empty(
-            get_grouped_gemm_setup_workspace_size(num_experts),
-            dtype=torch.uint8,
-            device=x_bf16.device,
-        )
-        workspace_cublas = torch.empty(
-            get_unrestricted_te_workspace_size_bytes(), dtype=torch.uint8, device=x_bf16.device
-        )
-        # The implementation may consume its input and workspaces on auxiliary
-        # streams. Retain each chunk's state until every launch has been queued;
-        # otherwise the caching allocator can recycle an earlier chunk while a
-        # later one is being prepared.
-        launch_state.append((grouped_input, workspace_setup, workspace_cublas))
         _te_mxfp8_batch_invariant_grouped_gemm(
             normalized_weight,
             grouped_input,

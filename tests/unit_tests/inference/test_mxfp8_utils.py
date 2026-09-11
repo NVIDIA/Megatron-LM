@@ -1084,6 +1084,56 @@ class TestTENativeGroupedMxfp8:
         assert calls[0][6] is None
         assert calls[0][7] is alpha
 
+    def test_batch_invariant_chunks_reuse_serialized_workspace(self, monkeypatch):
+        """Chunked grouped GEMMs allocate one workspace per call, not per chunk."""
+        import megatron.core.inference.moe.fused_moe as fused_moe
+
+        num_experts, num_chunks = 2, 3
+        rows_per_chunk = num_experts * fused_moe._TE_MXFP8_BATCH_INVARIANT_CHUNK_SIZE
+        x = torch.zeros(num_chunks * rows_per_chunk, 4, device="cuda", dtype=torch.bfloat16)
+        first_dims = torch.full((num_experts,), 256, device="cuda", dtype=torch.int64)
+        setup_allocations = 0
+        cublas_allocations = 0
+        launches = []
+
+        monkeypatch.setattr(fused_moe, "_normalize_te_mxfp8_weight", lambda weight: list(weight))
+        monkeypatch.setattr(
+            fused_moe, "_get_te_mxfp8_batch_invariant_weight", lambda weight: weight
+        )
+        monkeypatch.setattr(fused_moe, "_te_weight_out_features", lambda weight: 3)
+        monkeypatch.setattr(fused_moe.tex, "group_quantize", lambda *args: object())
+        monkeypatch.setattr(fused_moe, "TEGroupedTensor", lambda **kwargs: object())
+
+        def setup_size(_):
+            nonlocal setup_allocations
+            setup_allocations += 1
+            return 16
+
+        def cublas_size():
+            nonlocal cublas_allocations
+            cublas_allocations += 1
+            return 32
+
+        def record_launch(
+            weight, grouped_input, grouped_output, alpha, beta, workspace_setup, workspace_cublas
+        ):
+            del weight, grouped_input, grouped_output, alpha, beta
+            launches.append((workspace_setup.data_ptr(), workspace_cublas.data_ptr()))
+
+        monkeypatch.setattr(fused_moe, "get_grouped_gemm_setup_workspace_size", setup_size)
+        monkeypatch.setattr(fused_moe, "get_unrestricted_te_workspace_size_bytes", cublas_size)
+        monkeypatch.setattr(fused_moe, "_te_mxfp8_batch_invariant_grouped_gemm", record_launch)
+
+        output = fused_moe._te_mxfp8_batch_invariant_grouped_mm(
+            x, [object()] * num_experts, first_dims, num_chunks=num_chunks
+        )
+
+        assert output.shape == (num_chunks * rows_per_chunk, 3)
+        assert setup_allocations == 1
+        assert cublas_allocations == 1
+        assert len(launches) == num_chunks
+        assert len(set(launches)) == 1
+
     def test_single_grouped_2d_swizzled_scale_layout(self, monkeypatch):
         """Single grouped weights accept TE's newer 2-D swizzled scale buffer."""
         import transformer_engine.pytorch as te
