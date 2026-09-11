@@ -20,7 +20,11 @@ from megatron.core.activations import situ_glu, squared_relu, tanh_soft_clamp
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.enums import Fp4Recipe, Fp8Recipe
-from megatron.core.extensions.transformer_engine import HAVE_TE
+from megatron.core.extensions.transformer_engine import (
+    HAVE_TE,
+    _get_fp8_autocast_for_quant_recipe,
+    _get_fp8_autocast_recipe_for_quant_params,
+)
 from megatron.core.fusions.fused_bias_geglu import quick_gelu, weighted_bias_quick_geglu_impl
 from megatron.core.fusions.fused_bias_swiglu import weighted_bias_swiglu_impl
 from megatron.core.fusions.fused_weighted_squared_relu import weighted_squared_relu_impl
@@ -802,6 +806,23 @@ class TEGroupedMLP(MegatronModule):
     ) -> torch.Tensor:
         """Forward pass using Transformer Engine operation fuser API."""
 
+        # Resolve after GPTModel's finish_init sweep, using the original modules' current
+        # train/eval mode. The whole TE sequence must execute under one precision override.
+        fc1_recipe = _get_fp8_autocast_recipe_for_quant_params(
+            self.linear_fc1.te_quant_params, self.linear_fc1.training
+        )
+        fc2_recipe = _get_fp8_autocast_recipe_for_quant_params(
+            self.linear_fc2.te_quant_params, self.linear_fc2.training
+        )
+        if fc1_recipe != fc2_recipe:
+            raise ValueError(
+                "TE grouped-MLP op-fuser requires the same precision override for linear_fc1 "
+                "and linear_fc2. Apply the override to both linears."
+            )
+        quant_context = (
+            nullcontext() if fc1_recipe is None else _get_fp8_autocast_for_quant_recipe(fc1_recipe)
+        )
+
         # Construct fused impl if needed
         # Note: We initialize during the first forward pass in case
         # the params are modified after the constructor.
@@ -890,7 +911,7 @@ class TEGroupedMLP(MegatronModule):
                 if fine_grained_activation_offloading and output_buffer is None
                 else []
             )
-            with stash_context:
+            with stash_context, quant_context:
                 # NCCL-EP zero-copy: route the fc2 output (fwd combine reads it one-sided) and the
                 # fc1 dgrad (bwd dispatch scatters it one-sided) into caller-provided symm buffers.
                 # op_kwargs keys are basic-op indices into [fc1, activation, fc2]: 0=fc1, -1=fc2.
