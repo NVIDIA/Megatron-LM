@@ -36,7 +36,7 @@ env:
 
 jobs:
   ephemeral-runner-routing:
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_ephemeral_runner_routing.yml@d0878a142525ff79366ca96fbc0b306cd8d64670 # v1.9.0
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_ephemeral_runner_routing.yml@4fe957d4ea5816af1d67fae130bbab4b434c10b3 # v1.9.2
     with:
       lane: ${{ vars.NEMO_CI_EPHEMERAL_LANE }}
       legacy_label: nvidia-ci-aws-gpu-x8-ephemeral
@@ -50,7 +50,7 @@ jobs:
     outputs:
       is_external_contributor: ${{ github.event.pull_request.user.type == 'User' }}
       is_maintainer: ${{ steps.check-membership.outputs.is_maintainer }}
-      selected_runner: ${{ steps.check-membership.outputs.is_maintainer == 'true' && 'nvidia-ci-aws-gpu-x8' || needs.ephemeral-runner-routing.outputs.runner_label }}
+      selected_runner: ${{ steps.check-membership.outputs.is_maintainer == 'true' && 'nvidia-ci-aws-gpu-x8' || needs.ephemeral-runner-routing.outputs.runner_label_base }}
       selected_runner_gb200: ${{ steps.check-membership.outputs.is_maintainer == 'true' && 'nvidia-ci-aws-use2-gpu-x4' || 'ubuntu-latest' }}
     permissions:
       issues: write
@@ -425,6 +425,9 @@ jobs:
       - name: Test queue approval topology
         run: .github/scripts/test_approve_test_queue.sh
 
+      - name: Test DCO gate publisher
+        run: python3 .github/scripts/test_dco_gate.py
+
       - name: Test superseded merge-group cleanup
         run: python3 .github/scripts/test_cancel_superseded_merge_group_runs.py
 
@@ -680,7 +683,7 @@ jobs:
     uses: ./.github/workflows/_build_ci_container.yml
     with:
       is-maintainer: ${{ needs.is-not-external-contributor.outputs.is_maintainer == 'true' }}
-      selected-runner: ${{ needs.is-not-external-contributor.outputs.selected_runner }}
+      selected-runner: ${{ startsWith(needs.is-not-external-contributor.outputs.selected_runner, 'ephe-v2-') && format('{0}-a{1}', needs.is-not-external-contributor.outputs.selected_runner, github.run_attempt) || needs.is-not-external-contributor.outputs.selected_runner }}
       selected-runner-gb200: ${{ needs.is-not-external-contributor.outputs.selected_runner_gb200 }}
       source-sha: ${{ needs.configure.outputs.sha }}
       lts: ${{ needs.configure.outputs.lts == 'true' }}
@@ -729,7 +732,7 @@ jobs:
       - cicd-wait-in-queue
       - cicd-container-build
       - cicd-parse-unit-tests
-    runs-on: ${{ needs.is-not-external-contributor.outputs.selected_runner }}
+    runs-on: ${{ startsWith(needs.is-not-external-contributor.outputs.selected_runner, 'ephe-v2-') && format('{0}-a{1}', needs.is-not-external-contributor.outputs.selected_runner, github.run_attempt) || needs.is-not-external-contributor.outputs.selected_runner }}
     timeout-minutes: 60
     name: "${{ matrix.bucket }} - latest"
     if: |
@@ -982,7 +985,7 @@ jobs:
       - configure
       - cicd-integration-gate
       - cicd-parse-integration-tests-h100
-    runs-on: ${{ needs.is-not-external-contributor.outputs.selected_runner }}
+    runs-on: ${{ startsWith(needs.is-not-external-contributor.outputs.selected_runner, 'ephe-v2-') && format('{0}-a{1}', needs.is-not-external-contributor.outputs.selected_runner, github.run_attempt) || needs.is-not-external-contributor.outputs.selected_runner }}
     name: "${{ matrix.model }}/${{ matrix.test_case }} - latest"
     env:
       PIP_DISABLE_PIP_VERSION_CHECK: 1
