@@ -117,7 +117,11 @@ def get_model_for_inference() -> MegatronModule:
         unwrapped_model = unwrap_model(model)
         excluded_parameter_ids = get_te_grouped_moe_parameter_ids(unwrapped_model)
         quantize_model_to_mxfp8(
-            unwrapped_model, backend=quant_backend, excluded_parameter_ids=excluded_parameter_ids
+            unwrapped_model,
+            backend=quant_backend,
+            excluded_parameter_ids=excluded_parameter_ids,
+            include_pattern=getattr(args, "inference_mxfp8_include_parameters", None),
+            exclude_pattern=getattr(args, "inference_mxfp8_exclude_parameters", None),
         )
     return model
 

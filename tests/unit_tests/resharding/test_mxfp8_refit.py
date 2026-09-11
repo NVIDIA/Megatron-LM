@@ -436,6 +436,30 @@ class TestQuantizeParamsToMXFP8:
         assert "0.weight" in buffers and "1.weight" in buffers
         assert isinstance(buffers["0.weight"], MXFP8Tensor)
 
+    def test_parameter_filter_materializes_unmatched_weight_in_bf16(self):
+        from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
+        from megatron.core.inference.quantization.utils import quantize_params_to_mxfp8
+
+        model = torch.nn.Module()
+        model.attention = torch.nn.Linear(128, 64, bias=False)
+        model.mlp = torch.nn.Module()
+        model.mlp.experts = torch.nn.Module()
+        model.mlp.experts.linear_fc1 = torch.nn.Linear(128, 64, bias=False)
+        model.to(dtype=torch.bfloat16, device="cuda")
+        _pre_quantize_linear(model)
+
+        buffers = quantize_params_to_mxfp8(
+            model,
+            backend="triton",
+            include_pattern=r"(^|\.)mlp\.experts\.linear_fc[12]\.",
+            _filter_prefix="decoder.",
+        )
+
+        assert model.attention.weight.dtype == torch.bfloat16
+        assert "attention.weight" not in buffers
+        assert isinstance(model.mlp.experts.linear_fc1.weight, MXFP8Tensor)
+        assert "mlp.experts.linear_fc1.weight" in buffers
+
 
 # ===========================================================================
 # End-to-end MXFP8 refit integration (single-GPU)

@@ -1385,6 +1385,56 @@ class TestTENativeGroupedMxfp8:
         assert root.experts._fc1_weight[0] is root.experts.linear_fc1.weight0
         assert root.experts._fc2_weight[0] is root.experts.linear_fc2.weight0
 
+    def test_model_conversion_materializes_unmatched_parameters_in_bf16(self):
+        from megatron.core.inference.quantization.utils import quantize_model_to_mxfp8
+
+        hidden_size = 128
+        root = torch.nn.Module()
+        root.attention = torch.nn.Module()
+        _, weights = self._quantized_weights(1, hidden_size, optimize_for_gemm=False)
+        root.attention.weight = torch.nn.Parameter(weights[0], requires_grad=False)
+
+        quantize_model_to_mxfp8(
+            root, backend="triton", include_pattern=r"\.mlp\.experts\.linear_fc[12]\."
+        )
+
+        assert isinstance(root.attention.weight, torch.nn.Parameter)
+        assert root.attention.weight.dtype == torch.bfloat16
+
+    def test_model_conversion_rejects_filter_that_excludes_te_experts_before_mutation(self):
+        from megatron.core.inference.moe import InferenceGroupedGemmBackend
+        from megatron.core.inference.quantization.utils import (
+            get_te_grouped_moe_parameter_ids,
+            quantize_model_to_mxfp8,
+        )
+
+        hidden_size = 128
+        root = torch.nn.Module()
+        root.dense = torch.nn.Module()
+        _, dense_weights = self._quantized_weights(1, hidden_size, optimize_for_gemm=False)
+        root.dense.weight = torch.nn.Parameter(dense_weights[0], requires_grad=False)
+        original_dense_weight = root.dense.weight
+
+        root.experts = torch.nn.Module()
+        root.experts.inference_grouped_gemm_backend = InferenceGroupedGemmBackend.TE
+        root.experts.linear_fc1 = torch.nn.Module()
+        root.experts.linear_fc2 = torch.nn.Module()
+        _, fc1_weights = self._quantized_weights(1, hidden_size)
+        _, fc2_weights = self._quantized_weights(1, hidden_size)
+        root.experts.linear_fc1.weight0 = torch.nn.Parameter(fc1_weights[0], requires_grad=False)
+        root.experts.linear_fc2.weight0 = torch.nn.Parameter(fc2_weights[0], requires_grad=False)
+
+        excluded = get_te_grouped_moe_parameter_ids(root)
+        with pytest.raises(ValueError, match="requires it in native TE MXFP8"):
+            quantize_model_to_mxfp8(
+                root,
+                backend="triton",
+                excluded_parameter_ids=excluded,
+                exclude_pattern=r"\.experts\.",
+            )
+
+        assert root.dense.weight is original_dense_weight
+
     def test_single_grouped_weight_representation(self, monkeypatch):
         import transformer_engine.pytorch as te
         from transformer_engine.common.recipe import MXFP8BlockScaling
