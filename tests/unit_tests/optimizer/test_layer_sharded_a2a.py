@@ -2,11 +2,9 @@
 
 """Tests for the layer-sharded Muon all_to_all routing primitives.
 
-The forward exchange must assemble each home's complete matrices from the
-per-rank shards; the backward exchange must scatter per-home results back to
-the exact originating shards; and a fwd -> identity -> bwd roundtrip must
-reproduce the input bit-for-bit. All three are pure routing properties -- no
-Newton-Schulz involved -- so any failure is an indexing bug, not numerics.
+The forward exchange must assemble each home's complete matrices from the per-rank
+shards, and a fwd -> identity -> bwd roundtrip over uneven shapes and homes must
+reproduce the input bit-for-bit. Pure routing properties: a failure is an indexing bug.
 
 Launch with torchrun (the fixtures initialize the torchrun-managed group):
   torchrun --nproc-per-node=4 -m pytest tests/unit_tests/optimizer/test_layer_sharded_a2a.py
@@ -16,10 +14,7 @@ import pytest
 import torch
 import torch.distributed as dist
 
-from megatron.core.optimizer.layer_sharded_a2a import (
-    route_from_ns_home,
-    route_to_ns_home,
-)
+from megatron.core.optimizer.layer_sharded_a2a import route_from_ns_home, route_to_ns_home
 from tests.unit_tests.test_utilities import Utils
 
 _SEED = 42
@@ -71,33 +66,6 @@ def test_fwd_reconstructs_complete_matrix():
         )
 
 
-def test_bwd_distributes_shards_correctly():
-    """Every rank receives exactly its row shard of each home's result."""
-    _require_multi_rank()
-    S, r = dist.get_world_size(), dist.get_rank()
-    P, Q = 16 * S, 8
-    N = S
-
-    torch.manual_seed(_SEED + 1)
-    full_results = [torch.randn(P, Q) for _ in range(N)]
-    my_results = [full_results[i] for i in range(N) if i % S == r]
-    my_indices = [i for i in range(N) if i % S == r]
-    templates = [torch.empty(P // S, Q) for _ in range(N)]
-    homes = {i: i % S for i in range(N)}
-
-    shards = route_from_ns_home(
-        my_results, my_indices, templates, homes, _world(), shard_dim=0
-    )
-
-    assert len(shards) == N
-    for i, shard in enumerate(shards):
-        assert shard is not None, f"missing shard for param {i}"
-        expected = full_results[i][r * (P // S) : (r + 1) * (P // S), :]
-        torch.testing.assert_close(
-            shard, expected, msg=lambda m: f"shard of param {i} on rank {r}\n\n{m}"
-        )
-
-
 def test_roundtrip_without_ns_is_identity():
     """fwd -> identity -> bwd returns the original shards, heterogeneous shapes included.
 
@@ -115,9 +83,7 @@ def test_roundtrip_without_ns_is_identity():
 
     complete, my_indices = route_to_ns_home(shards, homes, _world(), shard_dim=0)
     identity = [m.clone() for m in complete]
-    recovered = route_from_ns_home(
-        identity, my_indices, shards, homes, _world(), shard_dim=0
-    )
+    recovered = route_from_ns_home(identity, my_indices, shards, homes, _world(), shard_dim=0)
 
     for i, (orig, back) in enumerate(zip(shards, recovered)):
         assert back is not None, f"missing roundtrip result for param {i}"

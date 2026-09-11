@@ -689,7 +689,7 @@ def _kwargs_from_config(optimizer_cls: type, prefix: str, config) -> Dict[str, A
 def _is_layer_sharded(config) -> bool:
     """Whether the config selects layer sharding: ``muon_tp_mode='layer_sharded'``
     is a registry-level class selector, not a TensorParallelMuon runtime mode."""
-    return getattr(config, 'muon_tp_mode', 'duplicated') == 'layer_sharded' 
+    return getattr(config, 'muon_tp_mode', 'duplicated') == 'layer_sharded'
 
 
 def _muon_config_to_cls(config) -> type:
@@ -727,9 +727,7 @@ def _layer_sharded_muon_config_to_kwargs(config, model_chunks, pg_collection) ->
     # reference mode instead.
     kwargs['tp_mode'] = 'duplicated'
     # Explicit injections: reflective matching cannot cover these (no config attr).
-    kwargs['gtp_remat_group'] = (
-        getattr(pg_collection, 'gtp_remat', None) if pg_collection else None
-    )
+    kwargs['gtp_remat_group'] = getattr(pg_collection, 'gtp_remat', None) if pg_collection else None
     kwargs['tp_group'] = getattr(pg_collection, 'tp', None) if pg_collection else None
     return kwargs
 
