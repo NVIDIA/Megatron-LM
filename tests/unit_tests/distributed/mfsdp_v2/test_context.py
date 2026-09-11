@@ -2,6 +2,8 @@
 
 """Unit tests for experimental Megatron-FSDP runtime contexts."""
 
+from unittest.mock import Mock
+
 import pytest
 import torch
 from torch import nn
@@ -137,6 +139,24 @@ def test_sibling_roots_share_context_and_cross_root_orders(distributed_setup):
     assert list(context.backward_order) == [model.layers[1], model.layers[0]]
 
 
+def test_sibling_roots_enqueue_one_post_backward_wait(distributed_setup, monkeypatch):
+    """Sibling roots should enqueue one wait on their shared reduction stream."""
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    model = MultiChildModel(dim=4, num_children=2).to(device)
+
+    with fully_shard_context(device=device) as context:
+        fully_shard(model.layers[0], mesh=mesh, placements=_flat_placements())
+        fully_shard(model.layers[1], mesh=mesh, placements=_flat_placements())
+
+    post_backward = Mock(wraps=context.post_backward)
+    monkeypatch.setattr(context, "post_backward", post_backward)
+
+    model(torch.ones(2, 4, device=device)).sum().backward()
+
+    post_backward.assert_called_once_with()
+
+
 def test_nested_prefetch_orders_use_dfs(distributed_setup):
     """Nested FsdpModules should use DFS orders for one-step prefetch."""
     device = distributed_setup.device
@@ -156,6 +176,22 @@ def test_nested_prefetch_orders_use_dfs(distributed_setup):
     context = model.context
     assert list(context.forward_order) == [model, model.left, model.left.inner, model.right]
     assert list(context.backward_order) == [model, model.right, model.left, model.left.inner]
+
+
+def test_register_post_backward_hook_handles_parameterless_module(distributed_setup):
+    """A parameterless FSDP unit should invoke the external scheduler callback."""
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    model = nn.Identity().to(device)
+
+    with fully_shard_context(device=device):
+        fully_shard(model, mesh=mesh, placements=_flat_placements(), register_hooks=False)
+
+    callback_modules = []
+    model.register_post_backward_hook(callback_modules.append)
+    model(torch.ones(2, 4, device=device, requires_grad=True)).sum().backward()
+
+    assert callback_modules == [model]
 
 
 def test_nested_and_sibling_roots_use_cross_root_orders(distributed_setup):

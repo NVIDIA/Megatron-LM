@@ -12,10 +12,10 @@ from typing import Optional
 
 import torch
 
-from megatron.core.msc_utils import maybe_msc
 from megatron.core._rank_utils import safe_get_rank as _safe_get_rank
 from megatron.core._slurm_utils import resolve_slurm_local_rank
 from megatron.core.dist_checkpointing.strategies.nvrx import has_nvrx_async_support
+from megatron.core.msc_utils import maybe_msc
 
 try:
     from transformer_engine.pytorch.optimizers import multi_tensor_applier, multi_tensor_l2norm
@@ -37,6 +37,11 @@ except ImportError:
 
 from megatron.core import mpu
 from megatron.core.datasets.utils import get_blend_from_list
+from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY
+from megatron.core.process_groups_config import (
+    MultiModuleProcessGroupCollection,
+    ProcessGroupCollection,
+)
 from megatron.core.tensor_parallel import param_is_not_tensor_parallel_duplicate
 from megatron.core.transformer.module import param_is_not_shared
 from megatron.core.utils import (
@@ -46,7 +51,6 @@ from megatron.core.utils import (
     unwrap_model,
 )
 from megatron.training import get_adlr_autoresume, get_args, get_timers
-
 
 
 def _compute_norm_2(params_list):
@@ -77,11 +81,26 @@ def _get_param_data(param, force_create_fp32_copy, bf16):
     return param.data, False
 
 
-def calc_params_l2_norm(model, force_create_fp32_copy=False):
-    """Calculate l2 norm of parameters"""
-    args = get_args()
+def calc_params_l2_norm(
+    model,
+    force_create_fp32_copy=False,
+    *,
+    pg_collection: ProcessGroupCollection | MultiModuleProcessGroupCollection | None = None,
+    return_squared_tensor=False,
+):
+    """Calculate the parameter L2 norm using global, single-model, or multi-module groups."""
     if not isinstance(model, list):
         model = [model]
+
+    if isinstance(pg_collection, MultiModuleProcessGroupCollection):
+        return _calc_mimo_params_l2_norm(
+            model,
+            pg_collection,
+            force_create_fp32_copy=force_create_fp32_copy,
+            return_squared_tensor=return_squared_tensor,
+        )
+
+    args = get_args()
 
     if getattr(args, 'use_megatron_fsdp', False):
         # All Megatron FSDP parameters are expected to be PyTorch DTensor.
@@ -97,7 +116,9 @@ def calc_params_l2_norm(model, force_create_fp32_copy=False):
                     )
                 params.append(param)
 
-        return calc_dtensor_params_l2_norm(params)
+        return calc_dtensor_params_l2_norm(
+            params, return_squared_tensor=return_squared_tensor
+        )
 
     # 8 buckets: 4 categories × (non-sharded, sharded optimizer main_param).
     # Each category needs different reduction groups.
@@ -110,10 +131,28 @@ def calc_params_l2_norm(model, force_create_fp32_copy=False):
     moe_gtp_params_data = []        # MoE-GTP_remat, non-sharded
     moe_gtp_sharded_params_data = []  # MoE-GTP_remat sharded → expert_dp
 
-    gtp_rank = mpu.get_gtp_weight_remat_rank()
-    egtp_rank = mpu.get_expert_gtp_weight_remat_rank()
-    tp_group = mpu.get_tensor_model_parallel_group()
-    expert_tp_group = mpu.get_expert_tensor_parallel_group()
+    if pg_collection is None:
+        gtp_rank = mpu.get_gtp_weight_remat_rank()
+        egtp_rank = mpu.get_expert_gtp_weight_remat_rank()
+        tp_group = mpu.get_tensor_model_parallel_group()
+        expert_tp_group = mpu.get_expert_tensor_parallel_group()
+        dp_cp_group = mpu.get_data_parallel_group(
+            with_context_parallel=True, with_gtp_remat=False
+        )
+        expert_dp_group = mpu.get_expert_data_parallel_group(with_gtp_remat=False)
+        expert_gtp_group = mpu.get_expert_gtp_weight_remat_group()
+        dense_reduce_group = mpu.get_model_parallel_group()
+        expert_reduce_group = mpu.get_expert_tensor_model_pipeline_parallel_group()
+    else:
+        gtp_rank = get_pg_rank(pg_collection.gtp_remat)
+        egtp_rank = get_pg_rank(pg_collection.expt_gtp_remat)
+        tp_group = pg_collection.tp
+        expert_tp_group = pg_collection.expt_tp
+        dp_cp_group = pg_collection.dp_cp
+        expert_dp_group = pg_collection.expt_dp
+        expert_gtp_group = pg_collection.expt_gtp_remat
+        dense_reduce_group = pg_collection.mp
+        expert_reduce_group = pg_collection.tp_ep_pp
 
     for model_chunk in model:
         for param in model_chunk.parameters():
@@ -176,14 +215,14 @@ def calc_params_l2_norm(model, force_create_fp32_copy=False):
     # over-count by gtp_remat. No-op for non-GTP_remat runs.
     _sum_reduce(
         sharded_norm_2,
-        mpu.get_data_parallel_group(with_context_parallel=True, with_gtp_remat=False),
+        dp_cp_group,
     )
     _sum_reduce(
         gtp_sharded_norm_2,
-        mpu.get_data_parallel_group(with_context_parallel=True, with_gtp_remat=False),
+        dp_cp_group,
     )
-    _sum_reduce(moe_sharded_norm_2, mpu.get_expert_data_parallel_group(with_gtp_remat=False))
-    _sum_reduce(moe_gtp_sharded_norm_2, mpu.get_expert_data_parallel_group(with_gtp_remat=False))
+    _sum_reduce(moe_sharded_norm_2, expert_dp_group)
+    _sum_reduce(moe_gtp_sharded_norm_2, expert_dp_group)
 
     # --- Combine dense + GTP_remat norms ---
     # model_parallel group = TP×GTP_remat×PP, so GTP_remat reduction is implicit.
@@ -193,12 +232,10 @@ def calc_params_l2_norm(model, force_create_fp32_copy=False):
     # expert_model_parallel = TP×EP×PP (does NOT include EGTP_remat), so we need
     # an explicit EGTP_remat reduction for MoE-GTP_remat before the model-parallel reduce.
     moe_gtp_combined_norm_2 = moe_gtp_norm_2 + moe_gtp_sharded_norm_2
-    _sum_reduce(moe_gtp_combined_norm_2, mpu.get_expert_gtp_weight_remat_group())
+    _sum_reduce(moe_gtp_combined_norm_2, expert_gtp_group)
     moe_total_norm_2 = moe_norm_2 + moe_sharded_norm_2 + moe_gtp_combined_norm_2
 
     # --- Model-parallel reductions ---
-    dense_reduce_group = mpu.get_model_parallel_group()
-    expert_reduce_group = mpu.get_expert_tensor_model_pipeline_parallel_group()
     ranks_in_dense_reduce_group = torch.distributed.get_process_group_ranks(dense_reduce_group)
     ranks_in_expert_reduce_group = torch.distributed.get_process_group_ranks(expert_reduce_group)
 
@@ -210,10 +247,49 @@ def calc_params_l2_norm(model, force_create_fp32_copy=False):
         _sum_reduce(moe_total_norm_2, expert_reduce_group)
         norm_2 += moe_total_norm_2
 
+    if return_squared_tensor:
+        return norm_2
     return norm_2.item() ** 0.5
 
 
-def calc_dtensor_params_l2_norm(params):
+def _get_mimo_module(model_chunk, module_name):
+    """Get a MIMO module by its topology name."""
+    if module_name == MIMO_LANGUAGE_MODULE_KEY:
+        return model_chunk.language_model
+    return model_chunk.modality_submodules[module_name]
+
+
+@torch.no_grad()
+def _calc_mimo_params_l2_norm(
+    model,
+    pg_collection: MultiModuleProcessGroupCollection,
+    *,
+    force_create_fp32_copy=False,
+    return_squared_tensor=False,
+):
+    """Calculate a combined parameter L2 norm across MIMO model grids."""
+    model_chunks = [unwrap_model(model_chunk) for model_chunk in model]
+    module_names = sorted(model_chunks[0].mimo_config.module_to_grid_map)
+    norm_sq = torch.zeros(len(module_names), device='cuda', dtype=torch.float32)
+
+    for index, name in enumerate(module_names):
+        if name not in pg_collection.keys():
+            continue
+
+        module_norm_sq = calc_params_l2_norm(
+            [_get_mimo_module(model_chunk, name) for model_chunk in model_chunks],
+            force_create_fp32_copy,
+            pg_collection=pg_collection[name],
+            return_squared_tensor=True,
+        )
+        norm_sq[index].copy_(module_norm_sq.reshape(()))
+
+    torch.distributed.all_reduce(norm_sq, op=torch.distributed.ReduceOp.MAX)
+    total_norm_sq = norm_sq.sum()
+    return total_norm_sq if return_squared_tensor else total_norm_sq.sqrt().item()
+
+
+def calc_dtensor_params_l2_norm(params, return_squared_tensor=False):
     """Calculate l2 norm of DTensor parameters."""
     params_data = defaultdict(list)
     for param in params:
@@ -247,6 +323,8 @@ def calc_dtensor_params_l2_norm(params):
                 )
         total_norm_2 += norm_2
 
+    if return_squared_tensor:
+        return total_norm_2
     return total_norm_2.item() ** 0.5
 
 
