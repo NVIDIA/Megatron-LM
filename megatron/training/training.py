@@ -15,6 +15,7 @@ import dataclasses
 import functools
 import gc
 import inspect
+import json
 import logging
 import math
 import os
@@ -2782,6 +2783,7 @@ def setup_model_and_optimizer(
 
     model = _build_model_wrapper(wrap_with_ddp)
     unwrapped_model = unwrap_model(model)
+    _report_engram_memory_state(model, None, "after_model_ddp")
 
     if args.logits_save_dir is not None:
         from megatron.training.distillation import LogitsSaverHooks
@@ -2833,6 +2835,7 @@ def setup_model_and_optimizer(
             dump_param_to_param_group_map=args.dump_param_to_param_group_map,
         )
         opt_param_scheduler = get_optimizer_param_scheduler(optimizer)
+        _report_engram_memory_state(model, optimizer, "after_optimizer_construction")
 
     one_logger and one_logger.log_metrics(
         {"app_build_optimzer_finish_time": one_logger_utils.get_timestamp_in_ms()}
@@ -3077,6 +3080,155 @@ def _capture_engram_table_training_state(model):
             checksum = torch.stack((value.sum(), value.square().sum()))
             snapshots.append((name, parameter, grad_square_sum, checksum))
     return snapshots, _model_parameter_checksum(model)
+
+
+def _find_engram_main_parameter(optimizer_part, parameter):
+    """Locate the optimizer's main (master) parameter for a model parameter.
+
+    Supports the distributed optimizer (``model_param_group_index_map``), the mixed-precision
+    optimizer (``float16_groups`` -> ``fp32_from_float16_groups``), and FP32 training where the
+    model parameter is its own main parameter. Returns None when this optimizer part does not
+    own the parameter.
+    """
+    group_map = getattr(optimizer_part, "model_param_group_index_map", None)
+    if group_map is not None:
+        if parameter not in group_map:
+            return None
+        group_index, group_order = group_map[parameter]
+        return optimizer_part.optimizer.param_groups[group_index]["params"][group_order]
+
+    float16_groups = getattr(optimizer_part, "float16_groups", None)
+    if float16_groups is not None:
+        for group_index, group in enumerate(float16_groups):
+            for group_order, candidate in enumerate(group):
+                if candidate is parameter:
+                    return optimizer_part.fp32_from_float16_groups[group_index][group_order]
+        for group in getattr(optimizer_part, "fp32_from_fp32_groups", []):
+            for candidate in group:
+                if candidate is parameter:
+                    return parameter
+        return None
+
+    # FP32 optimizer: the model parameter is the main parameter.
+    for group in optimizer_part.optimizer.param_groups:
+        for candidate in group["params"]:
+            if candidate is parameter:
+                return parameter
+    return None
+
+
+def _report_engram_memory_state(model, optimizer, phase):
+    """Write exact rank-local Engram model and optimizer tensor bytes for profiling runs."""
+    args = get_args()
+    if (
+        not getattr(args, "record_memory_history", False)
+        or getattr(args, "engram_vocab_sizes", None) is None
+    ):
+        return
+
+    torch.cuda.synchronize()
+    rank = torch.distributed.get_rank()
+    pg_collection = get_attr_wrapped_model(model[0], "pg_collection")
+    group_names = ("tp", "pp", "ep", "dp_cp", "expt_dp")
+    topology = {
+        name: {
+            "size": get_pg_size(getattr(pg_collection, name, None)),
+            "rank": get_pg_rank(getattr(pg_collection, name, None)),
+        }
+        for name in group_names
+    }
+
+    optimizer_parts = []
+    if optimizer is not None:
+        optimizer_parts = getattr(optimizer, "chained_optimizers", [optimizer])
+
+    table_records = []
+    for model_chunk_id, model_chunk in enumerate(model):
+        for name, parameter in unwrap_model(model_chunk).named_parameters():
+            if not getattr(parameter, "is_engram_embedding", False):
+                continue
+
+            record = {
+                "name": f"model_chunk{model_chunk_id}.{name}",
+                "shape": list(parameter.shape),
+                "model_numel": parameter.numel(),
+                "model_bytes": parameter.numel() * parameter.element_size(),
+                "main_numel": 0,
+                "main_bytes": 0,
+                "optimizer_state_numel": {},
+                "optimizer_state_bytes": {},
+            }
+            for optimizer_part in optimizer_parts:
+                main_parameter = _find_engram_main_parameter(optimizer_part, parameter)
+                if main_parameter is None:
+                    continue
+                inner_optimizer = optimizer_part.optimizer
+                record["main_numel"] = main_parameter.numel()
+                record["main_bytes"] = main_parameter.numel() * main_parameter.element_size()
+                for state_name, state_value in inner_optimizer.state.get(
+                    main_parameter, {}
+                ).items():
+                    if isinstance(state_value, torch.Tensor):
+                        record["optimizer_state_numel"][state_name] = state_value.numel()
+                        record["optimizer_state_bytes"][state_name] = (
+                            state_value.numel() * state_value.element_size()
+                        )
+                break
+            table_records.append(record)
+
+    state_names = sorted(
+        {state_name for record in table_records for state_name in record["optimizer_state_bytes"]}
+    )
+    totals = {
+        "model_numel": sum(record["model_numel"] for record in table_records),
+        "model_bytes": sum(record["model_bytes"] for record in table_records),
+        "main_numel": sum(record["main_numel"] for record in table_records),
+        "main_bytes": sum(record["main_bytes"] for record in table_records),
+        "optimizer_state_numel": {
+            state_name: sum(
+                record["optimizer_state_numel"].get(state_name, 0) for record in table_records
+            )
+            for state_name in state_names
+        },
+        "optimizer_state_bytes": {
+            state_name: sum(
+                record["optimizer_state_bytes"].get(state_name, 0) for record in table_records
+            )
+            for state_name in state_names
+        },
+    }
+    cuda_memory = {
+        "allocated_bytes": torch.cuda.memory_allocated(),
+        "reserved_bytes": torch.cuda.memory_reserved(),
+        "max_allocated_bytes": torch.cuda.max_memory_allocated(),
+        "max_reserved_bytes": torch.cuda.max_memory_reserved(),
+    }
+    # The report is written next to the snapshots and already names its own rank.
+    report_path = Path(args.memory_snapshot_path).with_name(f"engram_memory_rank-{rank}.jsonl")
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report = {
+        "phase": phase,
+        "global_rank": rank,
+        "world_size": torch.distributed.get_world_size(),
+        "topology": topology,
+        "cuda_memory": cuda_memory,
+        "totals": totals,
+        "tables": table_records,
+    }
+    with report_path.open("a", encoding="utf-8") as output:
+        output.write(json.dumps(report, sort_keys=True) + "\n")
+    print(
+        "[Engram memory] "
+        f"rank={rank} phase={phase} ep_size={topology['ep']['size']} "
+        f"expert_dp_size={topology['expt_dp']['size']} "
+        f"model_bytes={totals['model_bytes']} main_bytes={totals['main_bytes']} "
+        f"optimizer_state_bytes={sum(totals['optimizer_state_bytes'].values())} "
+        f"allocated_bytes={cuda_memory['allocated_bytes']} "
+        f"reserved_bytes={cuda_memory['reserved_bytes']} "
+        f"max_allocated_bytes={cuda_memory['max_allocated_bytes']} "
+        f"max_reserved_bytes={cuda_memory['max_reserved_bytes']}",
+        flush=True,
+    )
 
 
 def _verify_engram_table_training_state(training_state, model, iteration):
@@ -3451,6 +3603,9 @@ def train_step(
     update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
     if engram_training_state is not None:
         _verify_engram_table_training_state(engram_training_state, model, iteration + 1)
+    if args.record_memory_history and (iteration == 0 or iteration + 1 == args.train_iters):
+        phase = "after_first_optimizer_step" if iteration == 0 else "after_steady_state"
+        _report_engram_memory_state(model, optimizer, phase)
 
     # get max attention logit for logging and run clip_qk()
     # Part of MuonClip Optimizer step
@@ -3829,13 +3984,23 @@ def training_log(
 
     # Dump memory snapshot and print metrics to stdout.
     if iteration % args.log_interval == 0 or is_first_iteration:
-        if args.record_memory_history and (
-            is_last_rank() or torch.distributed.get_backend() == 'fake'
-        ):
+        rank = torch.distributed.get_rank()
+        should_dump_memory = (
+            torch.distributed.get_backend() == 'fake'
+            or (len(args.profile_ranks) == 0 and is_last_rank())
+            or rank in args.profile_ranks
+        )
+        if args.record_memory_history and should_dump_memory:
             snapshot = torch.cuda.memory._snapshot()
             from pickle import dump
 
-            with open(args.memory_snapshot_path, 'wb') as f:
+            from megatron.training.utils import memory_snapshot_path
+
+            snapshot_path = memory_snapshot_path(
+                args.memory_snapshot_path, args.profile_ranks, rank
+            )
+            Path(snapshot_path).parent.mkdir(parents=True, exist_ok=True)
+            with open(snapshot_path, 'wb') as f:
                 dump(snapshot, f)
 
         elapsed_time = timers('interval-time').elapsed(barrier=True, reset=should_reset)
@@ -4646,6 +4811,13 @@ def train(
 
     prof = None
     nsys_nvtx_context = None  # reference to context for nsys profiling, so it can be cleaned up
+    standalone_nvtx_ranges = (
+        args.nvtx_ranges
+        and not args.profile
+        and (len(args.profile_ranks) == 0 or torch.distributed.get_rank() in args.profile_ranks)
+    )
+    if standalone_nvtx_ranges:
+        configure_nvtx_profiling(True)
     if (
         args.profile
         and (len(args.profile_ranks) == 0 or torch.distributed.get_rank() in args.profile_ranks)
@@ -5117,6 +5289,9 @@ def train(
         )
         if should_exit:
             break
+
+    if standalone_nvtx_ranges:
+        configure_nvtx_profiling(False)
 
     # Destroy CUDA Graphs.
     if args.cuda_graph_impl == "transformer_engine" and cuda_graph_helper.graphs_created():
