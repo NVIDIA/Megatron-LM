@@ -1,7 +1,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
 from collections import OrderedDict
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Union
 
 from megatron.core.tokenizers.base_tokenizer import MegatronTokenizerBase
 
