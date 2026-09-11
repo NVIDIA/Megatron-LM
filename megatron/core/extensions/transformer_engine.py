@@ -49,6 +49,7 @@ from megatron.core.tensor_parallel.random import (
 from megatron.core.tensor_parallel.utils import divide
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
+from megatron.core.transformer.module import is_first_microbatch_tracked
 from megatron.core.transformer.torch_norm import LayerNormInterface
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import (
@@ -400,6 +401,21 @@ def _get_should_context_be_quantized_params(
         )
 
 
+def _resolve_is_first_microbatch(module) -> Optional[bool]:
+    """The value to pass TE, or ``None`` meaning "no opinion, just accumulate".
+
+    A ``True`` tells TE the gradient is fresh, so backward writes over ``main_grad`` instead of
+    adding into it. Pass the flag on only when it can be trusted.
+    """
+    if (
+        module.disable_parameter_transpose_cache
+        or not is_first_microbatch_tracked(module.config)
+        or getattr(module, 'is_repeated_layer', False)
+    ):
+        return None
+    return module.is_first_microbatch
+
+
 def _get_extra_te_kwargs(config: TransformerConfig):
     extra_transformer_engine_kwargs = {"params_dtype": config.params_dtype}
 
@@ -605,16 +621,22 @@ if HAVE_TE and is_te_min_version("1.13.0"):
                     layer_type = te.pytorch.ops.SwiGLU
                 elif config.activation_func == F.gelu:
                     layer_type = te.pytorch.ops.GEGLU
-                elif config.activation_func == F.silu:
+                elif config.activation_func == F.relu:
                     layer_type = te.pytorch.ops.ReGLU
             else:
                 if config.activation_func == F.gelu:
                     layer_type = te.pytorch.ops.GELU
-                elif config.activation_func == F.silu:
+                elif config.activation_func == F.relu:
                     layer_type = te.pytorch.ops.ReLU
+                elif config.activation_func == F.silu:
+                    if not is_te_min_version("2.8.0"):
+                        raise NotImplementedError(
+                            "SiLU activation requires Transformer Engine 2.8+"
+                        )
+                    layer_type = te.pytorch.ops.SiLU
             if layer_type is None:
                 raise Exception(
-                    'Only SwiGLU, GEGLU, ReGLU, GELU, ReLU are supported by '
+                    'Only SwiGLU, GEGLU, ReGLU, GELU, ReLU, SiLU are supported by '
                     'transformer engine. Please set use_te_activation_func=False'
                 )
             activation_func_kwargs = {}
@@ -649,8 +671,8 @@ if HAVE_TE and is_te_min_version("1.13.0"):
         - Hooks on the wrapper itself are handled by its normal
           ``Module.__call__``.
         - Forward hooks on descendant source modules are best-effort emulated
-          on the fused implementation. Hooks that modify tensors are unsupported
-          because TE fused ops do not expose intermediate tensors.
+          on the unregistered execution views. Hooks that modify tensors are
+          unsupported because TE fused ops do not expose intermediate tensors.
         - The descendant module set is captured when the fused implementation
           is built. Pre-forward hooks on those descendants are resolved
           dynamically because DDP may change them after construction;
@@ -698,39 +720,24 @@ if HAVE_TE and is_te_min_version("1.13.0"):
             """
             self._fused_impl = None
 
-        def _register_hooks_on_fused_impl(self, fused_impl: torch.nn.Module) -> None:
-            """Attempt to emulate submodule callback hooks.
+        def _register_forward_pre_hooks_on_fused_impl(
+            self, fused_impl: torch.nn.Module, source_submodules: Sequence[torch.nn.Module]
+        ) -> None:
+            """Forward current source-submodule pre-hooks at an execution boundary."""
 
-            This is not always possible because Transformer Engine's
-            op fuser does not expose intermediate tensors. Depending
-            on what kernel fusions the op fuser chooses, the
-            intermediate tensors may not even exist. Hooks that modify
-            tensors will result in incorrect behavior.
-            """
+            source_submodules = tuple(source_submodules)
+            if not source_submodules:
+                return
+            source_submodule_ids = [id(submodule) for submodule in source_submodules]
+            if len(source_submodule_ids) != len(set(source_submodule_ids)):
+                raise ValueError("Pre-forward hook sources must not contain duplicates")
+            descendant_ids = {
+                id(submodule) for submodule in self.modules() if submodule is not self
+            }
+            if any(submodule_id not in descendant_ids for submodule_id in source_submodule_ids):
+                raise ValueError("Pre-forward hook sources must be descendants of the wrapper")
 
             module_name = self.__class__.__name__
-
-            # Hooks on the wrapper itself are executed by its normal Module.__call__.
-            # Cache only the descendants whose calls the fused implementation skips.
-            skipped_submodules = tuple(
-                submodule for submodule in self.modules() if submodule is not self
-            )
-            for submodule in skipped_submodules:
-                if submodule._backward_pre_hooks:
-                    raise RuntimeError(
-                        f"{module_name} module does not support submodules with pre-backward hooks"
-                    )
-                if submodule._backward_hooks:
-                    raise RuntimeError(
-                        f"{module_name} module does not support submodules with post-backward hooks"
-                    )
-
-            if not skipped_submodules:
-                return
-
-            # Pre-forward hooks
-            # Note: DDP pre-forward hooks are safe since they do not
-            # interact with input tensor.
             distributed_data_parallel = None
             warned_non_ddp_hooks = set()
 
@@ -740,7 +747,7 @@ if HAVE_TE and is_te_min_version("1.13.0"):
                 # current hook registries on every invocation instead of capturing a stale
                 # construction-time snapshot.
                 nonlocal distributed_data_parallel
-                for submodule in skipped_submodules:
+                for submodule in source_submodules:
                     hooks_with_kwargs = submodule._forward_pre_hooks_with_kwargs
                     for hook_id, hook in list(submodule._forward_pre_hooks.items()):
                         if distributed_data_parallel is None:
@@ -775,6 +782,54 @@ if HAVE_TE and is_te_min_version("1.13.0"):
             # Install the pre-hook forwarder even when source hook registries are currently
             # empty. DDP changes their contents throughout the training lifecycle.
             fused_impl.register_forward_pre_hook(forward_pre_hook)
+
+        def _register_hooks_on_fused_impl(
+            self,
+            fused_impl: torch.nn.Module,
+            *,
+            pre_forward_submodules: Optional[Sequence[torch.nn.Module]] = None,
+        ) -> None:
+            """Attempt to emulate submodule callback hooks.
+
+            This is not always possible because Transformer Engine's
+            op fuser does not expose intermediate tensors. Depending
+            on what kernel fusions the op fuser chooses, the
+            intermediate tensors may not even exist. Hooks that modify
+            tensors will result in incorrect behavior.
+
+            ``pre_forward_submodules`` selects the descendants whose current
+            pre-hooks run at this execution boundary. By default, all skipped
+            descendants are selected. Backward validation and post-hook
+            forwarding always cover all skipped descendants.
+            """
+
+            module_name = self.__class__.__name__
+
+            # Hooks on the wrapper itself are executed by its normal Module.__call__.
+            # Cache only the descendants whose calls the fused implementation skips.
+            skipped_submodules = tuple(
+                submodule for submodule in self.modules() if submodule is not self
+            )
+            for submodule in skipped_submodules:
+                if submodule._backward_pre_hooks:
+                    raise RuntimeError(
+                        f"{module_name} module does not support submodules with pre-backward hooks"
+                    )
+                if submodule._backward_hooks:
+                    raise RuntimeError(
+                        f"{module_name} module does not support submodules with post-backward hooks"
+                    )
+
+            if not skipped_submodules:
+                return
+
+            if pre_forward_submodules is None:
+                pre_forward_submodules = skipped_submodules
+            else:
+                pre_forward_submodules = tuple(pre_forward_submodules)
+
+            # DDP pre-forward hooks are safe since they do not interact with input tensors.
+            self._register_forward_pre_hooks_on_fused_impl(fused_impl, pre_forward_submodules)
 
             # Post-forward hooks
             forward_post_hooks = []
@@ -1335,9 +1390,7 @@ class TELinear(te.pytorch.Linear):
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Forward."""
-        _is_first_microbatch = (
-            None if self.disable_parameter_transpose_cache else self.is_first_microbatch
-        )
+        _is_first_microbatch = _resolve_is_first_microbatch(self)
         quant_context = _get_fp8_autocast_for_quant_params(self.te_quant_params, self.training)
 
         with quant_context:
@@ -1584,9 +1637,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
 
     def forward(self, x):
         """Forward."""
-        _is_first_microbatch = (
-            None if self.disable_parameter_transpose_cache else self.is_first_microbatch
-        )
+        _is_first_microbatch = _resolve_is_first_microbatch(self)
         quant_context = _get_fp8_autocast_for_quant_params(self.te_quant_params, self.training)
 
         # FP32 residual connections pass the FP32 residual stream into this fused module, but
@@ -2251,11 +2302,25 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         attention_bias: Optional[Tensor] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
         num_splits: Optional[int] = None,
+        bf16_backward: Optional[bool] = None,
     ) -> torch.Tensor:
         """Forward."""
         if packed_seq_params is not None:
             # If Dynamic CP group is provided, update TE DPA CP group
             if packed_seq_params.cp_group is not None:
+                # Converse of the assert below: a CP-off (local_cp_size == 1)
+                # sub-sample must not carry a CP group, otherwise it would be
+                # routed through the CP attention path. Producers must only
+                # bind cp_group when local_cp_size > 1.
+                assert (
+                    packed_seq_params.local_cp_size is None or packed_seq_params.local_cp_size > 1
+                ), "cp_group must not be set when local_cp_size == 1 (CP-off convention)"
+                # Hybrid/dynamic CP can enable CP at runtime on a model built
+                # with context_parallel_size == 1, where the constructor never
+                # allocated the auxiliary CP stream. Create it lazily; TE's
+                # AttnFuncWithCPAndKVP2P dereferences it unconditionally.
+                if TEDotProductAttention.cp_stream is None:
+                    TEDotProductAttention.cp_stream = torch.cuda.Stream()
                 self.cp_group = packed_seq_params.cp_group
                 super().set_context_parallel_group(
                     self.cp_group,
@@ -2318,6 +2383,8 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             )
             if num_splits is not None:
                 _fa_kwargs["num_splits"] = num_splits
+            if bf16_backward is not None:
+                _fa_kwargs["bf16_backward"] = bf16_backward
 
             core_attn_out = super().forward(query, key, value, attention_mask, **_fa_kwargs)
 
@@ -2348,6 +2415,8 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             _fa_kwargs = dict(**attention_bias_kwargs, **packed_seq_kwargs)
             if num_splits is not None:
                 _fa_kwargs["num_splits"] = num_splits
+            if bf16_backward is not None:
+                _fa_kwargs["bf16_backward"] = bf16_backward
             core_attn_out = super().forward(query, key, value, attention_mask, **_fa_kwargs)
 
         return core_attn_out
@@ -2718,9 +2787,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
 
         def forward(self, x, m_splits):
             """Forward."""
-            _is_first_microbatch = (
-                None if self.disable_parameter_transpose_cache else self.is_first_microbatch
-            )
+            _is_first_microbatch = _resolve_is_first_microbatch(self)
             quant_context = _get_fp8_autocast_for_quant_params(self.te_quant_params, self.training)
 
             with quant_context:
@@ -3175,6 +3242,11 @@ if HAVE_TE and is_te_min_version("1.13.0"):
                     f"gated_linear_unit={self.config.gated_linear_unit}."
                 )
 
+        def _reset_fused_impl(self) -> None:
+            """Discard both cached execution views."""
+            super()._reset_fused_impl()
+            self._norm_seq = None
+
         def _make_fused_impl(self) -> te.pytorch.ops.Sequential:
             """Construct fused module with GroupedLinear(num_groups=1) + ScaledSwiGLU."""
 
@@ -3271,8 +3343,41 @@ if HAVE_TE and is_te_min_version("1.13.0"):
             # No _mxfp8_weight0 pre-computation to avoid ~28 GB persistent FP8 tensors.
             fused_impl.append(op)
 
-            self._register_hooks_on_fused_impl(fused_impl)
             return fused_impl
+
+        def _register_hooks_on_fused_impl(
+            self,
+            fused_impl: torch.nn.Module,
+            *,
+            pre_forward_submodules: Optional[Sequence[torch.nn.Module]] = None,
+        ) -> None:
+            """Register hook forwarding for the grouped and normalization boundaries."""
+
+            if get_tensor_model_parallel_world_size() > 1:
+                super()._register_hooks_on_fused_impl(
+                    fused_impl, pre_forward_submodules=pre_forward_submodules
+                )
+                return
+            if pre_forward_submodules is not None:
+                raise ValueError("Grouped MLP pre-forward hook phases are selected internally")
+
+            if self._norm_seq is None:
+                raise RuntimeError("Grouped MLP normalization sequence has not been built")
+
+            # DDP's parameter-gather hook on FC1 must run before the separate norm
+            # sequence reads FC1's aliased normalization parameters. Keep FC1's
+            # subtree out of the main fused boundary so every source hook runs once.
+            fc1_submodules = tuple(self.linear_fc1.modules())
+            fc1_submodule_ids = {id(submodule) for submodule in fc1_submodules}
+            remaining_submodules = tuple(
+                submodule
+                for submodule in self.modules()
+                if submodule is not self and id(submodule) not in fc1_submodule_ids
+            )
+            super()._register_hooks_on_fused_impl(
+                fused_impl, pre_forward_submodules=remaining_submodules
+            )
+            self._register_forward_pre_hooks_on_fused_impl(self._norm_seq[0], fc1_submodules)
 
         def forward(self, hidden_states: torch.Tensor, **kwargs) -> Tuple[Tensor, Optional[Tensor]]:
             """Forward pass using GroupedLinear(num_groups=1) + ScaledSwiGLU."""
@@ -3303,7 +3408,9 @@ if HAVE_TE and is_te_min_version("1.13.0"):
 
             if self._fused_impl is None:
                 with te.pytorch.quantized_model_init(enabled=True, recipe=recipe):
-                    self._fused_impl = (self._make_fused_impl(),)
+                    fused_impl = self._make_fused_impl()
+                    self._register_hooks_on_fused_impl(fused_impl)
+                    self._fused_impl = (fused_impl,)
 
             # Apply norm in BF16 OUTSIDE the MXFP8 autocast to preserve the rstd
             # tensor used by RMSNorm backward (running it inside causes up to 10^6
@@ -3615,6 +3722,21 @@ try:
 
 except ImportError:
     te_parallel_cross_entropy = None  # type: ignore[assignment, misc]
+
+
+def te_cross_entropy(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    tp_group: torch.distributed.ProcessGroup | None = None,
+    *,
+    cuda_graph_capturable: bool = False,
+) -> torch.Tensor:
+    """Adapt TE cross entropy to the backend target signature and required label stride."""
+    if te_parallel_cross_entropy is None:
+        raise RuntimeError("Trying to use a TE block when it's not present.")
+    labels = torch.as_strided(labels, labels.size(), (labels.size()[1], 1))
+    return te_parallel_cross_entropy(logits, labels, tp_group, cuda_graph_capturable)
+
 
 try:
     from transformer_engine.pytorch.cpp_extensions import general_gemm

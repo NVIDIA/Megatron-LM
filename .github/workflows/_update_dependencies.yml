@@ -74,7 +74,11 @@ jobs:
           -w /workspace \
           -e GH_TOKEN=${{ secrets.PAT }} \
           megatron-core \
-          bash -c 'uv lock --upgrade'
+          bash -ec '
+          export TMS_CUDA_MAJOR="$("${CUDA_HOME:-/usr/local/cuda}"/bin/nvcc --version | sed -n "s/.*release \([0-9][0-9]*\).*/\1/p" | head -1)"
+          test -n "$TMS_CUDA_MAJOR"
+          uv lock --upgrade
+          '
 
       - name: Upload lock file
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
