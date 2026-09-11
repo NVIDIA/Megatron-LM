@@ -71,99 +71,6 @@ def _bucket_is_managed_by_layer_wise_optimizer(bucket, default_for_untagged: boo
     return param.is_managed_by_layer_wise_optimizer
 
 
-# One communicator per (tp ranks, gtp_remat ranks) domain per process: new_group
-# creates a fresh NCCL communicator on every call, and the layer-wise optimizer
-# constructs many inner optimizers sharing the same dense/expert domain. None is
-# cached too (non-grid fallback), so the world collective below runs once per
-# domain either way; hits and misses are world-uniform because the keys derive
-# from the same wiring sequence on every rank.
-_GTP_GROUP_CACHE: Dict[Tuple, "torch.distributed.ProcessGroup | None"] = {}
-
-
-def _build_gtp_group(gtp_remat_group, tp_group):
-    """Lazily build the full GTP communicator (the TP x GTP_remat product domain).
-
-    parallel_state-free: members are derived from the two axis groups the
-    caller's ProcessGroupCollection already carries, so setups that never
-    initialize the MPU (e.g. multimodal) get the fused exchange from their own
-    groups. For any affine grid — interleaved axes such as cp/ep included —
-    the two axis groups through this rank determine the whole domain
-    additively: ``global(g, t) = gtp_ranks[g] + tp_ranks[t] - my_rank``. Every
-    member of a domain derives the SAME list, so deduplicating the gathered
-    lists enumerates each domain exactly once.
-
-    The member list is emitted g-outer/t-inner and passed to
-    ``new_subgroups_by_enumeration`` as-is: group rank is assigned BY POSITION,
-    so the ``g * tp_size + t`` contract LayerShardedMuon asserts at step time
-    holds by construction, with no assumption about the axes' global strides.
-
-    Returns None — callers keep the bitwise-identical two-stage exchange — when
-    the axis groups do not form an affine grid (derived members duplicated or
-    out of range), rather than building a communicator the step-time assert
-    would reject.
-    """
-    my_tp = torch.distributed.get_process_group_ranks(tp_group)
-    my_gtp_remat = torch.distributed.get_process_group_ranks(gtp_remat_group)
-    key = (tuple(my_tp), tuple(my_gtp_remat))
-    if key in _GTP_GROUP_CACHE:
-        return _GTP_GROUP_CACHE[key]
-
-    my_rank = torch.distributed.get_rank()
-    world_size = torch.distributed.get_world_size()
-    derived_domain_ranks = [g + t - my_rank for g in my_gtp_remat for t in my_tp]
-    is_affine_grid = len(set(derived_domain_ranks)) == len(derived_domain_ranks) and all(
-        0 <= r < world_size for r in derived_domain_ranks
-    )
-
-    # new_subgroups_by_enumeration is collective over the world: gather every
-    # rank's derived domain so all ranks create all domains in the same order.
-    gathered: List = [None] * world_size
-    torch.distributed.all_gather_object(gathered, (derived_domain_ranks, is_affine_grid))
-    if not all(ok for _, ok in gathered):
-        log_single_rank(
-            logger,
-            logging.WARNING,
-            'Layer-sharded Muon: the tp/gtp_remat groups do not form an affine '
-            'grid; keeping the two-stage exchange (bitwise-identical, one extra '
-            'all_to_all per direction).',
-        )
-        _GTP_GROUP_CACHE[key] = None
-        return None
-
-    domains = sorted({tuple(rs) for rs, _ in gathered})
-    _, subgroups = torch.distributed.new_subgroups_by_enumeration([list(d) for d in domains])
-    result = None
-    for domain, group in zip(domains, subgroups):
-        if my_rank in domain:
-            result = group
-    _GTP_GROUP_CACHE[key] = result
-    return result
-
-
-def _select_gtp_group(gtp_remat_group, tp_group, explicit, domain_params):
-    """Pick the flat (GTP_remat x TP) communicator — i.e. the full GTP group
-    (GTP = TP x GTP_remat) — for the single-all_to_all exchange.
-
-    With one trivial axis the surviving axis group IS the flat domain (flat
-    rank g*T+t degenerates to g or t). A genuinely 2-D domain uses the
-    explicitly supplied communicator when the caller provides one of the right
-    size, and otherwise builds it lazily (:func:`_build_gtp_group`) — except
-    when any param in the domain carries GTP alignment padding: the fused
-    exchange does not implement 2-D padding (LayerShardedMuon raises), while
-    the two-stage exchange strips it at the stage-1 seam, so padded domains
-    fall back to two-stage automatically.
-    """
-    g = get_pg_size(gtp_remat_group)
-    t = get_pg_size(tp_group)
-    if not (g > 1 and t > 1):
-        return tp_group if t > 1 else gtp_remat_group
-    if any(getattr(p, 'pad_length', 0) for p in domain_params):
-        return None
-    if explicit is not None and explicit.size() == g * t:
-        return explicit
-    return _build_gtp_group(gtp_remat_group, tp_group)
-
-
 def tag_params_for_buffer_routing(model_chunks) -> None:
     """Tag every requires-grad param with ``is_managed_by_layer_wise_optimizer``.
 
@@ -837,18 +744,14 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         except ImportError:
             return
 
-        # Axis groups + the optional explicitly supplied fused communicator per
-        # family. The fused decision itself happens per DOMAIN after pooling:
-        # the pad gate in _select_gtp_group needs to see the domain's params.
-        dense_axes = (
-            getattr(pg_collection, 'gtp_remat', None),
-            getattr(pg_collection, 'tp', None),
-            getattr(pg_collection, 'gtp', None),
-        )
+        # Axis groups per family: dense params over (gtp_remat, tp), expert params
+        # over (expt_gtp_remat, expt_tp). Nothing here creates process groups: this
+        # code runs with rank-local inventory, which differs across pipeline and
+        # multimodal stages, so it must never issue a collective.
+        dense_axes = (getattr(pg_collection, 'gtp_remat', None), getattr(pg_collection, 'tp', None))
         expert_axes = (
             getattr(pg_collection, 'expt_gtp_remat', None),
             getattr(pg_collection, 'expt_tp', None),
-            getattr(pg_collection, 'expt_gtp', None),
         )
 
         for opt in optimizers:
@@ -863,27 +766,13 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             for group_index, group in enumerate(inner.param_groups):
                 axes = expert_axes if group.get('is_expert_parallel', False) else dense_axes
                 group_axes[group_index] = axes
-                entry = domains.setdefault(
-                    (id(axes[0]), id(axes[1])), (axes[0], axes[1], axes[2], [])
-                )
-                entry[3].extend(group['params'])
+                entry = domains.setdefault((id(axes[0]), id(axes[1])), (axes[0], axes[1], []))
+                entry[2].extend(group['params'])
 
-            # Fused communicator per domain: explicit supply wins, else lazily
-            # derived from the axis groups; padded domains fall back to the
-            # two-stage exchange (see _select_gtp_group). Every rank walks
-            # the same optimizers/groups, so the world collective inside
-            # _build_gtp_group stays aligned (and cached after the first call).
-            fused_by_domain = {
-                key: _select_gtp_group(g_grp, t_grp, explicit, domain_params)
-                for key, (g_grp, t_grp, explicit, domain_params) in domains.items()
-            }
-            group_pgs: Dict[int, Tuple] = {
-                gi: (axes[0], axes[1], fused_by_domain[(id(axes[0]), id(axes[1]))])
-                for gi, axes in group_axes.items()
-            }
+            group_pgs: Dict[int, Tuple] = group_axes
 
             assignment: Dict[int, Tuple[int, int]] = {}
-            for gtp_remat_group, tp_group, _explicit, domain_params in domains.values():
+            for gtp_remat_group, tp_group, domain_params in domains.values():
                 gtp_remat_size = get_pg_size(gtp_remat_group)
                 tp_size = get_pg_size(tp_group)
                 if not domain_params or gtp_remat_size * tp_size <= 1:
