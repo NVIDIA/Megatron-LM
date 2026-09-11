@@ -442,6 +442,27 @@ class TestBridgeCommunicator:
         else:
             assert bridge.dest_cp_reduce_pg is None
 
+    def test_cp_forward_broadcast(self):
+        """Every destination TP/CP rank receives the complete fan-in activation."""
+        src_grid = create_hypercomm_grid(offset=0, tp=1, cp=1, pp=1, dp=4)
+        dest_grid = create_hypercomm_grid(offset=4, tp=2, cp=2, pp=1, dp=1)
+        bridge = BridgeCommunicator(src_grid, dest_grid, comm_dtype=torch.float32, tensor_ndim=2)
+
+        activation_matches = True
+        if bridge.is_current_rank_in_grid(src_grid):
+            activation = torch.full((2, 3), float(dist.get_rank()), device="cuda")
+            bridge.send_forward(activation)
+        else:
+            received_activation = bridge.recv_forward()
+            expected_activation = torch.cat(
+                [torch.full((2, 3), float(rank), device="cuda") for rank in range(4)]
+            )
+            activation_matches = torch.equal(received_activation, expected_activation)
+
+        global_check = torch.tensor(activation_matches, device="cuda", dtype=torch.int32)
+        dist.all_reduce(global_check, op=dist.ReduceOp.MIN)
+        assert global_check.item() == 1
+
     def test_send_forward_recv_forward(self):
         """Test send_forward and recv_forward operations."""
 

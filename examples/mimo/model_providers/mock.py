@@ -97,6 +97,9 @@ def model_provider_mock_vlm_single_encoder(
     # Create MIMO model
     cp_group = pg_collection.cp if pg_collection is not None else None
     tp_group = pg_collection.tp if pg_collection is not None else None
-    mimo_model = MimoModel(mimo_model_config, cp_group=cp_group, tp_group=tp_group)
+    tp_cp_group = pg_collection.tp_cp if pg_collection is not None else None
+    mimo_model = MimoModel(
+        mimo_model_config, cp_group=cp_group, tp_group=tp_group, tp_cp_group=tp_cp_group
+    )
 
     return mimo_model

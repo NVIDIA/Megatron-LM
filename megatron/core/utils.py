@@ -2609,15 +2609,22 @@ def _get_batch_on_this_cp_rank_per_document_balancing(
             if batch["cu_seqlens_padded"] is not None
             else batch["cu_seqlens"]
         )[0]
-        index = tex.thd_get_partitioned_indices(
-            cu_seqlens_for_te,
-            (
-                batch["tokens"].size(1) if batch["tokens"] is not None else batch["labels"].size(1)
-            ),  # NOTE(asolergi-nv): Labels to enable PP!
-            cp_size,
-            cp_rank,
+        SEQUENCE_KEYS = (
+            'tokens',
+            'labels',
+            'loss_mask',
+            'position_ids',
+            'decoder_input',
+            'mtp_input_mask',
         )
-        SEQUENCE_KEYS = ('tokens', 'labels', 'loss_mask', 'position_ids')
+        sequence_tensor = next(
+            (batch.get(key) for key in SEQUENCE_KEYS if batch.get(key) is not None), None
+        )
+        if sequence_tensor is None:
+            return batch
+        index = tex.thd_get_partitioned_indices(
+            cu_seqlens_for_te, sequence_tensor.size(1), cp_size, cp_rank
+        )
         for key in SEQUENCE_KEYS:
             if batch.get(key) is not None:
                 batch[key] = batch[key].index_select(1, index)

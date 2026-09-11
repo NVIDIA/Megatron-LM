@@ -12,10 +12,10 @@ import torch
 from torch.utils.data import DataLoader, Dataset
 
 from examples.mimo.training.topology import HeteroTopology
+from examples.mimo.utils.hetero import get_data_lane_rank
 from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.utils import is_pp_first_stage, is_pp_last_stage
-from megatron.core.utils import get_pg_rank
 
 _ENCODER_SEED_OFFSET = 10_000
 _LANGUAGE_SEED_OFFSET = 20_000
@@ -346,14 +346,7 @@ def _build_split_loaders(
     encoder_name: Optional[str],
 ) -> tuple[DataLoader, DataLoader, DataLoader]:
     """Build split-local datasets with deterministic module/DP/split seeds."""
-    data_group = pg_collection.dp_cp_gtp_remat or pg_collection.dp
-    lane_rank = get_pg_rank(data_group)
-    if pg_collection.dp_cp_gtp_remat is not None:
-        # The combined group orders CP first (fastest), then GTP and DP.
-        # CP replicas consume the same full batch before the model shards it;
-        # GTP and DP remain distinct data lanes, matching the bridge topology.
-        lane_rank //= pg_collection.cp.size()
-    base_seed = args.seed + module_seed_offset + lane_rank
+    base_seed = args.seed + module_seed_offset + get_data_lane_rank(pg_collection)
     common = _mock_loader_kwargs(args, encoder_name)
     return tuple(
         _build_mock_vlm_dataloader(
