@@ -656,6 +656,7 @@ class RequestLifecyclePairwiseBase(_DynamicInferenceEngineTestBase):
     def _manual_env(cls, **config_values):
         vocab_size = config_values.pop("vocab_size", None)
         values = {
+            "async_sched_mode": AsyncScheduleMode.LEGACY,
             "context_max_requests": 4,
             "context_buffer_size_gb": 0.01,
             "context_paused_buffer_size_gb": 0.0,
