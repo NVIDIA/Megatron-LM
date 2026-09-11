@@ -6,11 +6,18 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.cuda_graphs import create_cudagraphs
 from megatron.core.transformer.moe.fused_a2a import HAVE_TE_EP, nccl_ep_finalize
+from megatron.core.transformer.moe.paged_stash import (
+    PagedStashManager,
+    check_paged_stash_overflow,
+    paged_stash_init_chunk_handler,
+    paged_stash_reset,
+)
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.determinism.configs import gpt_base
 from tests.unit_tests.determinism.utils import (
@@ -61,16 +68,35 @@ requires_megamoe = pytest.mark.skipif(
 
 
 @pytest.fixture(autouse=True)
-def _restore_test_state():
+def _restore_test_state(monkeypatch):
+    monkeypatch.setenv("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "1")
+    monkeypatch.setenv("NVTE_GROUPED_LINEAR_SINGLE_PARAM", "1")
     deterministic = torch.are_deterministic_algorithms_enabled()
     warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
     yield
+    stash_manager = PagedStashManager.STASH_MGR
+    if stash_manager is not None:
+        stash_manager.enabled = False
+        stash_manager.release_stash_buffers()
+        stash_manager.status = 'begin'
+        stash_manager.max_tokens_across_vp_stages = None
+        stash_manager.temp_tokens_across_vp_stages = None
+        stash_manager.max_avg_tokens_across_vp_stages = None
+        stash_manager.temp_avg_tokens_across_vp_stages = None
+        stash_manager._pp_schedule = None
+        stash_manager.paged_tensors_to_stash.clear()
+        stash_manager.paged_tensors_stash_in_progress.clear()
+        stash_manager.paged_tensors_to_reload.clear()
+    if HAVE_TE_EP:
+        from transformer_engine.pytorch.ops.fused.moe_ep import finalize_moe_ep_resources
+
+        finalize_moe_ep_resources()
     nccl_ep_finalize()
     Utils.destroy_model_parallel()
     torch.use_deterministic_algorithms(deterministic, warn_only=warn_only)
 
 
-def _build_model(cuda_graph_impl: str = "none") -> GPTModel:
+def _build_model(cuda_graph_impl: str = "none", paged_stash: bool = False) -> GPTModel:
     config = TransformerConfig(
         **(
             gpt_base()
@@ -97,6 +123,9 @@ def _build_model(cuda_graph_impl: str = "none") -> GPTModel:
                 "fp8_param": True,
                 "moe_mlp_glu_interleave_size": 32,
                 "moe_expert_rank_capacity_factor": 8.0,
+                "moe_paged_stash": paged_stash,
+                "moe_paged_stash_buffer_size_factor_cuda": 1.1,
+                "moe_paged_stash_buffer_size_factor_cpu": 0.0,
                 "cuda_graph_impl": cuda_graph_impl,
                 "cuda_graph_modules": [],
                 "cuda_graph_warmup_steps": 1,
@@ -111,13 +140,14 @@ def _build_model(cuda_graph_impl: str = "none") -> GPTModel:
             or config.moe_use_transformer_engine_fused_moe
         ),
     )
-    return GPTModel(
-        config=config,
-        transformer_layer_spec=layer_spec,
-        vocab_size=_VOCAB_SIZE,
-        max_sequence_length=_SEQ_LEN,
-        position_embedding_type="rope",
-    ).cuda()
+    with get_fp8_context(config, layer_no=-1, is_init=True):
+        return GPTModel(
+            config=config,
+            transformer_layer_spec=layer_spec,
+            vocab_size=_VOCAB_SIZE,
+            max_sequence_length=_SEQ_LEN,
+            position_embedding_type="rope",
+        ).cuda()
 
 
 def _make_inputs() -> dict[str, torch.Tensor]:
@@ -198,6 +228,57 @@ def test_megamoe_cross_entropy_replays_bit_exactly():
 
     assert_bit_exact(loss_a, grads_a, loss_b, grads_b)
     _assert_megamoe_selected(model)
+
+
+@pytest.mark.internal
+@requires_megamoe
+def test_megamoe_paged_stash_matches_capture():
+    """Compare the captured paged-stash iteration with its unstashed capture iteration."""
+    if Utils.world_size < _EP_SIZE:
+        pytest.skip(f"requires at least {_EP_SIZE} GPUs")
+
+    Utils.initialize_model_parallel(
+        tensor_model_parallel_size=1,
+        expert_model_parallel_size=_EP_SIZE,
+    )
+    torch.manual_seed(42)
+    model_parallel_cuda_manual_seed(123)
+    model = _build_model(paged_stash=True)
+    inputs = _make_inputs()
+    stash_manager = PagedStashManager.get_instance()
+    stash_manager.release_stash_buffers()
+    stash_manager.status = 'begin'
+    stash_manager.max_tokens_across_vp_stages = None
+    stash_manager.temp_tokens_across_vp_stages = None
+    stash_manager.max_avg_tokens_across_vp_stages = None
+    stash_manager.temp_avg_tokens_across_vp_stages = None
+    stash_manager._pp_schedule = None
+
+    def fwd_bwd():
+        loss = model(**inputs).float().mean()
+        loss.backward()
+        return loss.detach().clone(), _collect_expert_grads(model)
+
+    state = capture_rng_state()
+    paged_stash_reset(True, config=model.config)
+    paged_stash_init_chunk_handler(1, 0)
+    capture_loss, capture_grads = fwd_bwd()
+    _assert_megamoe_selected(model)
+
+    restore_rng_state(state)
+    zero_grads(model)
+    reset_quantizer_state([model])
+    paged_stash_reset(True, config=model.config)
+    paged_stash_init_chunk_handler(1, 0)
+    stashed_loss, stashed_grads = fwd_bwd()
+
+    torch.testing.assert_close(stashed_loss, capture_loss, rtol=0.0, atol=0.0)
+    assert stashed_grads.keys() == capture_grads.keys()
+    for name in capture_grads:
+        torch.testing.assert_close(
+            stashed_grads[name], capture_grads[name], rtol=0.0, atol=0.0
+        )
+    assert not check_paged_stash_overflow().any().item()
 
 
 @pytest.mark.internal

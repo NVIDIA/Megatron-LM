@@ -725,6 +725,13 @@ class PagedStashManager:
             if (dtype, hidden_size) not in self.temp_tokens_across_vp_stages:
                 self.temp_tokens_across_vp_stages[dtype, hidden_size] = 0
                 self.max_tokens_across_vp_stages[dtype, hidden_size] = 0
+            # Do not populate the average-token maps when no hint is provided. Keeping them
+            # empty makes buffer allocation fall back to actual-token sizing instead of
+            # treating zero-valued entries as valid and allocating zero-sized buffers.
+            if (
+                avg_num_tokens is not None
+                and (dtype, hidden_size) not in self.temp_avg_tokens_across_vp_stages
+            ):
                 self.temp_avg_tokens_across_vp_stages[dtype, hidden_size] = 0
                 self.max_avg_tokens_across_vp_stages[dtype, hidden_size] = 0
 

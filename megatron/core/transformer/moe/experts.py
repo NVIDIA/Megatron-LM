@@ -755,9 +755,15 @@ class TEGroupedMLP(MegatronModule):
 
         if self.config.moe_paged_stash:
             hidden_states = paged_stash_group_start(hidden_states)
+            # cuDNN's saved FC1 state uses kernel-private physical layouts, so paged
+            # stashing must preserve the full static receive-capacity allocation.
+            num_tokens_tensor = hidden_states.new_full(
+                (1,), ep_config.recv_capacity_per_rank, dtype=torch.int64
+            )
             stash_context = get_paged_stash_context(
                 name="fused_moe",
                 max_num_tokens=ep_config.recv_capacity_per_rank,
+                num_tokens_tensor=num_tokens_tensor,
             )
         else:
             stash_context = nullcontext()
