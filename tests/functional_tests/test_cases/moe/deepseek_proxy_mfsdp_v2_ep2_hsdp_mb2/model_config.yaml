@@ -1,11 +1,11 @@
 # DeepSeek-style proxy: 8 layers - 3 dense, rest MoE with expert parallelism 2.
-# HFSDP: ZeRO-1 outer axis over a ZeRO-3 inner axis.
+# HSDP: unsharded outer axis over a ZeRO-3 inner axis.
 #
 # Splits the data-parallel domain into two optimizer instances AND accumulates over
 # two microbatches (global 512 / (8 ranks * micro 32)). Both matter: MFSDP keeps the
 # DP-outer axis Partial between microbatches and reduces it on the last backward, so
 # a single microbatch cannot tell a correct implementation from one that finalizes
-# every backward. Loss should match deepseek_proxy_mfsdp_v2_ep2_accum, which runs the
+# every backward. Loss should match deepseek_proxy_mfsdp_v2_ep2_mb2, which runs the
 # same batch geometry with a single optimizer instance.
 ENV_VARS:
   # run_ci_test.sh always exports this (yq prints "null" for a missing key,
@@ -32,7 +32,7 @@ MODEL_ARGS:
   --megatron-fsdp-version: 2
   --data-parallel-sharding-strategy: "optim_grads_params"
   --num-distributed-optimizer-instances: 2
-  --outer-dp-sharding-strategy: "optim"
+  --outer-dp-sharding-strategy: "no_shard"
   --deterministic-mode: true
   --ckpt-format: "fsdp_dtensor"
   --no-gradient-accumulation-fusion: true

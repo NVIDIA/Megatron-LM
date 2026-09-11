@@ -233,17 +233,17 @@ products:
   # optimizer instances is a sharding decision and must not change the math. MFSDP keeps
   # the DP-outer axis Partial between microbatches and reduces it on the last backward,
   # so this only has teeth with more than one microbatch.
-  - test_case: [deepseek_proxy_mfsdp_v2_ep2_accum]
+  - test_case: [deepseek_proxy_mfsdp_v2_ep2_mb2]
     products:
       - environment: [dev]
         scope: [mr, mr-github]
         platforms: [dgx_h100]
-  - test_case: [deepseek_proxy_mfsdp_v2_ep2_hsdp]
+  - test_case: [deepseek_proxy_mfsdp_v2_ep2_hsdp_mb2]
     products:
       - environment: [dev]
         scope: [mr, mr-github]
         platforms: [dgx_h100]
-  - test_case: [deepseek_proxy_mfsdp_v2_ep2_hfsdp]
+  - test_case: [deepseek_proxy_mfsdp_v2_ep2_hfsdp_mb2]
     products:
       - environment: [dev]
         scope: [mr, mr-github]
