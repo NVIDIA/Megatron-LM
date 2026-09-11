@@ -37,7 +37,7 @@ from megatron.core.inference.contexts.dynamic_context import (
     RequestOverflowError,
     TokenOverflowError,
 )
-from megatron.core.inference.engines import DynamicInferenceEngine
+from megatron.core.inference.engines import DynamicInferenceEngine, dynamic_engine
 from megatron.core.inference.engines.dynamic_engine import EngineState
 from megatron.core.inference.headers import Headers
 from megatron.core.inference.inference_request import (
@@ -1045,31 +1045,37 @@ async def test_completion_merges_after_final_scores_and_reuses_failed_result():
     assert (finished.generated_tokens, finished.generated_text) == ([10, 11, 12], None)
     assert finished.finalize_text(engine.controller.tokenizer).generated_text == "<10,11,12>"
 
+    params = SamplingParams(num_tokens_to_generate=-1, termination_id=-1)
     failed = DynamicInferenceRequest(
-        request_id=42,
-        prompt_tokens=torch.tensor([3, 4]),
-        sampling_params=SamplingParams(num_tokens_to_generate=1, termination_id=-1),
+        request_id=42, prompt_tokens=torch.tensor([3, 4]), sampling_params=params
     )
     failed_record = DynamicInferenceRequestRecord.from_request(failed)
     failed_future = asyncio.get_running_loop().create_future()
     engine.requests = {42: types.SimpleNamespace(record=failed_record, future=failed_future)}
     engine.failed_request_ids = []
-    engine.rank = 1
-    engine.use_coordinator = engine.is_mp_coordinator = True
-    engine.socket_for_receiving_requests = engine._try_send_streaming_partials = mock.Mock()
-    engine._partial_emit_lengths = {}
-    engine.context = types.SimpleNamespace(enable_prefix_caching=False, step_count=0)
-    engine.logging_step_interval = 0
+    engine.rank, engine.use_coordinator, engine.is_mp_coordinator = 1, True, True
+    submit = dynamic_engine.Headers.SUBMIT_REQUEST.value
+    message = [
+        dynamic_engine.msgpack.packb([submit, 42, params.serialize(), None], use_bin_type=True),
+        dynamic_engine.msgpack.packb([3, 4], use_bin_type=True),
+        dynamic_engine.msgpack.packb(None, use_bin_type=True),
+    ]
+    engine.add_request = lambda *_: engine._handle_failed_request(42)
+    socket = engine.socket_for_receiving_requests = mock.Mock()
+    socket.recv_multipart.side_effect = [message, dynamic_engine.zmq.Again]
+    engine.model_parallel_publisher_socket, engine._pending_signals = mock.Mock(), deque()
+    engine.local_metadata_ledger_enabled = False
+    engine._drain_handoff_completion_notifications = mock.Mock(return_value=[])
 
     with mock.patch.object(failed_record, "merge", wraps=failed_record.merge) as merge:
-        engine._handle_failed_request(42)
-        result = await engine.async_bookkeep(None, {"kv_stats": None}, 0.0)
+        assert engine.schedule_requests() == 1
 
+    failed_result = failed_future.result()
+    collect = engine._collect_failed_requests
     assert merge.call_count == 1
-    assert result["finished_requests"] == [failed_future.result()]
-    assert result["finished_requests"][0].status == Status.FAILED
-    assert result["finished_requests"][0].generated_text is None
-    assert engine.socket_for_receiving_requests.send_multipart.call_count == 1
+    assert (engine.requests, engine.failed_request_ids, collect()) == ({}, [], [])
+    assert (failed_result.status, failed_result.generated_text) == (Status.FAILED, None)
+    assert socket.send_multipart.call_count == 1
 
 
 def test_recompute_suspend_resume_readds_prefix_cached_request_with_fresh_hashes():
@@ -1258,6 +1264,90 @@ def test_drained_reset_rejects_outstanding_requests_before_mutation():
     assert engine.requests is requests
     engine.context.reset.assert_not_called()
     engine.controller._async_sched_logits.clear.assert_not_called()
+
+
+def _make_request_entry(loop, request_id: int, status: Status, resolve: bool = True):
+    request = DynamicInferenceRequest(
+        request_id=request_id,
+        prompt_tokens=torch.tensor([1, 2]),
+        sampling_params=SamplingParams(num_tokens_to_generate=1),
+        status=status,
+    )
+    entry = types.SimpleNamespace(
+        record=DynamicInferenceRequestRecord.from_request(request), future=loop.create_future()
+    )
+    if resolve:
+        DynamicInferenceEngine._complete_request(entry)
+    return entry
+
+
+def test_generate_collects_own_invalid_batch_without_model_step():
+    """A synchronous all-invalid call returns its failures without taking unrelated ones."""
+    loop = asyncio.new_event_loop()
+    try:
+        engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+        engine.request_counter = iter(range(10))
+        engine.requests = {}
+        engine.failed_request_ids = []
+        engine.step_modern = mock.Mock()
+
+        engine.requests[9] = _make_request_entry(loop, 9, Status.FAILED)
+        engine.failed_request_ids.append(9)
+
+        def reject_request(request_id, _prompt, _sampling_params):
+            entry = _make_request_entry(loop, request_id, Status.FAILED)
+            engine.requests[request_id] = entry
+            engine.failed_request_ids.append(request_id)
+            return entry.future
+
+        engine.add_request = mock.Mock(side_effect=reject_request)
+
+        results = engine.generate(["bad-a", "bad-b"], SamplingParams())
+
+        assert [request.request_id for request in results] == [0, 1]
+        assert all(request.status == Status.FAILED for request in results)
+        engine.step_modern.assert_not_called()
+        assert engine.failed_request_ids == [9]
+        assert set(engine.requests) == {9}
+    finally:
+        loop.close()
+
+
+def test_generate_mixed_batch_waits_only_for_its_pending_future():
+    """Mixed admission returns failed and completed requests without an extra empty step."""
+    loop = asyncio.new_event_loop()
+    try:
+        engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+        engine.request_counter = iter(range(10))
+        engine.requests = {}
+        engine.failed_request_ids = []
+
+        def add_request(request_id, _prompt, _sampling_params):
+            status = Status.FAILED if request_id == 0 else Status.ACTIVE_AND_GENERATING_TOKENS
+            entry = _make_request_entry(loop, request_id, status, resolve=request_id == 0)
+            engine.requests[request_id] = entry
+            if request_id == 0:
+                engine.failed_request_ids.append(request_id)
+            return entry.future
+
+        def finish_pending_request():
+            entry = engine.requests.pop(1)
+            entry.record[-1].status = Status.COMPLETED
+            finished_request = DynamicInferenceEngine._complete_request(entry)
+            return {"finished_requests": [finished_request]}
+
+        engine.add_request = mock.Mock(side_effect=add_request)
+        engine.step_modern = mock.Mock(side_effect=finish_pending_request)
+
+        results = engine.generate(["bad", "good"], SamplingParams())
+
+        assert [request.request_id for request in results] == [0, 1]
+        assert [request.status for request in results] == [Status.FAILED, Status.COMPLETED]
+        engine.step_modern.assert_called_once_with()
+        assert engine.failed_request_ids == []
+        assert engine.requests == {}
+    finally:
+        loop.close()
 
 
 def test_vision_state_invalidation_marks_request_local_embeddings_stale():

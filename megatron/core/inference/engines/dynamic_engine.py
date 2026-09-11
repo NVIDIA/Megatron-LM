@@ -1457,6 +1457,31 @@ class DynamicInferenceEngine(AbstractEngine):
         )
         self._handle_failed_request(request_id)
 
+    def _collect_failed_requests(
+        self, request_ids: Optional[set[int]] = None
+    ) -> List[DynamicInferenceRequest]:
+        """Remove and return a snapshot of synchronously failed requests.
+
+        Args:
+            request_ids: Optional ownership filter. Failed requests outside this
+                set remain queued for their caller.
+
+        Returns:
+            Failed requests selected from the current queue snapshot.
+        """
+        failed_request_ids, self.failed_request_ids = self.failed_request_ids, []
+        failed_requests = []
+        for failed_request_id in failed_request_ids:
+            if request_ids is not None and failed_request_id not in request_ids:
+                self.failed_request_ids.append(failed_request_id)
+                continue
+            failed_entry = self.requests.pop(failed_request_id)
+            assert (
+                failed_entry.future.done()
+            ), f"Failed request {failed_request_id} future has not been properly resolved."
+            failed_requests.append(failed_entry.future.result())
+        return failed_requests
+
     def has_unfinished_requests(self) -> bool:
         """Test if context contains unfinished requests."""
         return self.context.has_unfinished_requests() or len(self.waiting_request_ids) > 0
@@ -3077,15 +3102,9 @@ class DynamicInferenceEngine(AbstractEngine):
             active_request_ids: list[int] = []
             finished_requests: list[DynamicInferenceRequest] = []
 
-        # Failed requests. Status and events were already set in _handle_failed_request;
-        # here we just clean up the entry and reuse its already-merged future result.
-        for failed_request_id in self.failed_request_ids:
-            failed_entry = self.requests.pop(failed_request_id)
-            assert (
-                failed_entry.future.done()
-            ), f"Failed request {failed_request_id} future has not been properly resolved."
-            finished_requests.append(failed_entry.future.result())
-        self.failed_request_ids.clear()
+        # Failed requests. Take the current queue snapshot so a later admission
+        # cannot be erased by this bookkeeping pass.
+        finished_requests.extend(self._collect_failed_requests())
 
         nvtx_range_pop("bookkeeping")
 
@@ -3351,14 +3370,21 @@ class DynamicInferenceEngine(AbstractEngine):
     ) -> List[DynamicInferenceRequest]:
         """Generate token-complete, text-unfinalized requests for a prompt batch."""
 
+        request_futures = []
+        submitted_request_ids = set()
         for prompt in prompts:
             request_id = int(next(self.request_counter))
-            _ = self.add_request(request_id, prompt, sampling_params)
+            submitted_request_ids.add(request_id)
+            request_futures.append(self.add_request(request_id, prompt, sampling_params))
 
-        finished_requests = []
-        while self.has_unfinished_requests():
-            result = self.step_modern()
-            finished_requests.extend(result["finished_requests"])
+        # Admission failures resolve their futures synchronously. Remove only
+        # this call's failed entries, and do not run an empty model step solely
+        # to make bookkeeping observe them.
+        self._collect_failed_requests(submitted_request_ids)
+        while any(not future.done() for future in request_futures):
+            self.step_modern()
+
+        finished_requests = [future.result() for future in request_futures]
 
         # Ensure requests are returned in the same order they were passed in.
         finished_requests.sort(key=lambda request: request.request_id)
@@ -3643,6 +3669,7 @@ class DynamicInferenceEngine(AbstractEngine):
             else:
                 raise UnknownHeaderError(header)
 
+        self._collect_failed_requests()
         return len(all_messages)
 
     async def shutdown(self):
