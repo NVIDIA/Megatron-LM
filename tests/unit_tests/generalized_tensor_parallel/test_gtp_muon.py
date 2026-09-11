@@ -65,6 +65,9 @@ _SCALE_MODE = "spectral"
 _GTP_ONLY_WORLD_SIZES = [4, 8]
 # (tp_size, gtp_remat_size) for the combined TP + GTP shapes; world size is their product.
 _TP_GTP_SHAPES = [(2, 2), (2, 4), (4, 2)]
+# (cp_size, gtp_remat_size) for the CP + GTP shapes (TP1); world size is their product. CP is
+# folded into the weight-sharding group, so the weight is cut into cp*gtp_remat row shards.
+_CP_GTP_SHAPES = [(2, 2), (2, 4), (4, 2)]
 
 
 def _make_muon(pg_collection, tp_mode="distributed"):
@@ -227,6 +230,50 @@ def _worker_gtp_blockwise(rank, world_size, port):
         ps.initialize_model_parallel()
 
 
+def _init_model_parallel_with_cp(cp_size, gtp_remat_size):
+    ps.destroy_model_parallel()
+    ps.initialize_model_parallel(
+        tensor_model_parallel_size=1,
+        pipeline_model_parallel_size=1,
+        context_parallel_size=cp_size,
+        gtp_remat_size=gtp_remat_size,
+    )
+
+
+def _worker_cp_gtp_parity(rank, world_size, port, cp_size, gtp_remat_size, tp_mode):
+    """CP + GTP (TP1): Muon must orthogonalize over the CP-MERGED group.
+
+    Under CP a dense GTP weight is sharded over cp x gtp_remat, so each rank holds
+    M/(cp*gtp_remat) rows. Resolving the CP-free gtp_remat group instead would reconstruct
+    only M/cp rows -- the wrong full shape -- and reshard against the wrong rank space.
+    """
+    _init_model_parallel_with_cp(cp_size, gtp_remat_size)
+    try:
+        pgc = ProcessGroupCollection.use_mpu_process_groups()
+        # gtp_remat itself folds CP in, so Muon needs no CP awareness at all.
+        merged = pgc.gtp_remat
+        assert _world_size(merged) == cp_size * gtp_remat_size, (
+            f"expected gtp_remat group cp({cp_size})*gtp_remat({gtp_remat_size}), "
+            f"got {_world_size(merged)}"
+        )
+
+        opt = _make_muon(pgc, tp_mode=tp_mode)
+        w = _full_weight()
+        ref = _reference_full_orth(opt, w, pgc.tp)
+
+        gs, gr = _world_size(merged), _rank(merged)
+        sp = _M // gs
+        local = w[gr * sp : (gr + 1) * sp, :].clone()
+        local.is_gtp_weight_remat = True
+
+        out = opt.scaled_orthogonalize_fn_with_gtp_remat(local, local, pgc.tp, None)
+        expected = ref[gr * sp : (gr + 1) * sp, :]
+        torch.testing.assert_close(out, expected, atol=_ATOL, rtol=_RTOL)
+    finally:
+        ps.destroy_model_parallel()
+        ps.initialize_model_parallel()
+
+
 class TestGTPMuonDistributedNS:
     """Distributed-NS orthogonalization matches full-matrix NS, per shard."""
 
@@ -252,3 +299,12 @@ class TestGTPMuonDistributedNS:
     def test_gtp_blockwise_mode(self, world_size):
         _requires_multi_gpu(world_size)
         _run_distributed(_worker_gtp_blockwise, world_size)
+
+    # blockwise is excluded: it runs a deliberately local NS on the shard, which is not equal
+    # to full-matrix NS, so it needs its own reference (see test_gtp_blockwise_mode).
+    @pytest.mark.parametrize("tp_mode", ["distributed", "duplicated", "auto"])
+    @pytest.mark.parametrize("cp_size,gtp_remat_size", _CP_GTP_SHAPES)
+    def test_cp_gtp_parity(self, cp_size, gtp_remat_size, tp_mode):
+        world_size = cp_size * gtp_remat_size
+        _requires_multi_gpu(world_size)
+        _run_distributed(_worker_cp_gtp_parity, world_size, cp_size, gtp_remat_size, tp_mode)

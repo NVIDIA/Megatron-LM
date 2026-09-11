@@ -2069,3 +2069,56 @@ class TestGTPReplicatedBias:
         biased at GTP_remat=2, with no error)."""
         _requires_multi_gpu(4)
         _run_distributed(_worker_bias_is_replicated, 4, gtp_remat_size)
+
+
+def _worker_gtp_cp_init_seeds_distinct(rank, world_size, port, cp_size, gtp_remat_size):
+    """Every shard of a CP-folded GTP weight must draw DIFFERENT init values.
+
+    A dense GTP weight is cut into cp * gtp_remat shards, and every other seed ingredient is
+    CP-invariant, so seeding off the CP-free gtp_remat rank hands two CP peers holding different
+    shards the same seed -- the logical weight comes out with cp-fold repeated blocks.
+    """
+    from megatron.core import parallel_state as ps
+    from megatron.core.tensor_parallel.random import (
+        get_cuda_rng_tracker,
+        get_gtp_remat_rng_tracker_name,
+        model_parallel_cuda_manual_seed,
+    )
+
+    ps.destroy_model_parallel()
+    ps.initialize_model_parallel(
+        tensor_model_parallel_size=1,
+        pipeline_model_parallel_size=1,
+        context_parallel_size=cp_size,
+        gtp_remat_size=gtp_remat_size,
+    )
+    try:
+        model_parallel_cuda_manual_seed(1234)
+        merged = ps.get_gtp_weight_remat_group()
+        assert merged.size() == cp_size * gtp_remat_size
+
+        # Draw this rank's shard exactly the way the pre-sharded TE init does.
+        with get_cuda_rng_tracker().fork(get_gtp_remat_rng_tracker_name(is_expert=False)):
+            local = torch.randn(8, device="cuda")
+
+        gathered = [torch.empty_like(local) for _ in range(merged.size())]
+        dist.all_gather(gathered, local, group=merged)
+        for i in range(len(gathered)):
+            for j in range(i + 1, len(gathered)):
+                assert not torch.equal(gathered[i], gathered[j]), (
+                    f"shards {i} and {j} of the cp({cp_size}) x gtp_remat({gtp_remat_size}) "
+                    "group drew identical init values"
+                )
+    finally:
+        ps.destroy_model_parallel()
+        ps.initialize_model_parallel()
+
+
+class TestGTPCPInitSeeds:
+    """Weight init must key off the CP-expanded sharding group."""
+
+    @pytest.mark.parametrize("cp_size,gtp_remat_size", [(2, 2), (2, 4), (4, 2)])
+    def test_gtp_cp_init_seeds_distinct(self, cp_size, gtp_remat_size):
+        world_size = cp_size * gtp_remat_size
+        _requires_multi_gpu(world_size)
+        _run_distributed(_worker_gtp_cp_init_seeds_distinct, world_size, cp_size, gtp_remat_size)

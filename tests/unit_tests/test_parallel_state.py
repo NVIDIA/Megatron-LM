@@ -15,6 +15,9 @@ test_parallel_order = ['tp-cp-ep-dp-pp', 'tp-cp-pp-ep-dp']
 
 
 def test_inject_gtp_remat_axis():
+    # Default anchor (after='cp'): this is the no-`after`-arg form initialize_model_parallel
+    # actually relies on, so it must be covered independently of the explicit-`after` cases below.
+    assert ps._inject_gtp_remat_axis('tp-cp-ep-dp-pp') == 'tp-cp-gtp_remat-ep-dp-pp'
     # Decoder/dense axis: GTP_remat is injected after 'cp', so CP keeps the more-local
     # (smaller-stride) placement and GTP_remat sits one step further out.
     assert ps._inject_gtp_remat_axis('tp-cp-ep-dp-pp', after='cp') == 'tp-cp-gtp_remat-ep-dp-pp'
@@ -88,7 +91,14 @@ def test_initialize_model_parallel_with_cp_and_gtp_remat():
         raise AssertionError(f"rank {my_rank} not found in any '{token}' group")
 
     assert group_ranks(ps.get_context_parallel_group()) == expected_group('cp')
-    assert group_ranks(ps.get_gtp_weight_remat_group()) == expected_group('gtp_remat')
+    # The weight-sharding group FOLDS CP IN: a dense weight is cut into cp x gtp_remat shards,
+    # so every weight-sharding caller is CP-unaware by construction.
+    assert group_ranks(ps.get_gtp_weight_remat_group()) == expected_group('cp-gtp_remat')
+    assert ps.get_gtp_weight_remat_group().size() == cp_size * gtp_remat_size
+    # The CP-free axis survives only for the replicated-grad AVG, whose params already had CP
+    # reduced by their ordinary dp_cp bucket.
+    assert group_ranks(ps.get_gtp_weight_remat_group_no_cp()) == expected_group('gtp_remat')
+    assert ps.get_gtp_weight_remat_size_no_cp() == gtp_remat_size
     assert group_ranks(ps.get_data_parallel_group(with_gtp_remat=False)) == expected_group('dp')
     assert group_ranks(
         ps.get_data_parallel_group(with_context_parallel=True, with_gtp_remat=False)
@@ -97,6 +107,24 @@ def test_initialize_model_parallel_with_cp_and_gtp_remat():
         ps.get_data_parallel_group(with_context_parallel=True, with_gtp_remat=True)
     ) == expected_group('gtp_remat-dp-cp')
     assert group_ranks(ps.get_model_parallel_group()) == expected_group('tp-gtp_remat-pp')
+
+    Utils.destroy_model_parallel()
+
+
+def test_gtp_weight_remat_group_no_cp_aliases_plain_group_when_cp_inactive():
+    """With gtp_remat_size>1 but context_parallel_size=1, get_gtp_weight_remat_group_no_cp()
+    must be the identical object to get_gtp_weight_remat_group() -- no separate NCCL group,
+    byte-identical to pre-CP-support behavior."""
+    Utils.destroy_model_parallel()
+    actual_world_size = torch.cuda.device_count()
+    gtp_remat_size = 2
+    if actual_world_size % gtp_remat_size != 0:
+        pytest.skip(
+            f"Test requires world_size divisible by {gtp_remat_size}, but got {actual_world_size}"
+        )
+    Utils.initialize_model_parallel(gtp_remat_size=gtp_remat_size)
+
+    assert ps.get_gtp_weight_remat_group_no_cp() is ps.get_gtp_weight_remat_group()
 
     Utils.destroy_model_parallel()
 

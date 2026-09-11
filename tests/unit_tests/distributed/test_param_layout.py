@@ -161,6 +161,69 @@ class TestGroupParamsForBuffers:
         assert bf16_key in result
         assert fp32_key in result
 
+    def test_gtp_managed_excluded_from_bucket_under_cp(self):
+        """Dense GTP param whose materialization group spans CP -> excludes_cp_from_bucket.
+
+        CP is folded into the gtp_remat group, so a GTP param's own reduce-scatter already
+                summed it and the ordinary bucket collective must skip CP -- flagged via a distinct
+                BufferKey.
+        """
+        gtp_param = _make_param_with_attrs((100,), is_gtp_weight_remat=True)
+        result = group_params_for_buffers(
+            [gtp_param], grad_reduce_in_fp32=True, context_parallel_size=2
+        )
+
+        assert len(result) == 1
+        key = list(result.keys())[0]
+        assert key.excludes_cp_from_bucket is True
+        assert result[key][0] == [gtp_param]
+
+    def test_gtp_managed_not_excluded_without_cp(self):
+        """Same GTP param, but context_parallel_size=1 (default) -> no-op flag."""
+        gtp_param = _make_param_with_attrs((100,), is_gtp_weight_remat=True)
+        result = group_params_for_buffers([gtp_param], grad_reduce_in_fp32=True)
+
+        key = list(result.keys())[0]
+        assert key.excludes_cp_from_bucket is False
+
+    def test_expert_gtp_managed_not_excluded_under_cp(self):
+        """Expert (EGTP) params never get excludes_cp_from_bucket: the expert RankGenerator
+        has no CP axis, so there is no CP-expanded EGTP group to double-count against."""
+        expert_gtp_param = _make_param_with_attrs((100,), is_gtp_weight_remat=True, allreduce=False)
+        result = group_params_for_buffers(
+            [expert_gtp_param], grad_reduce_in_fp32=True, context_parallel_size=2
+        )
+
+        key = list(result.keys())[0]
+        assert key.is_expert_parallel is True
+        assert key.excludes_cp_from_bucket is False
+
+    def test_non_gtp_param_not_excluded_under_cp(self):
+        """Ordinary (non-GTP) params are unaffected by context_parallel_size."""
+        plain_param = _make_params((100,))[0]
+        result = group_params_for_buffers(
+            [plain_param], grad_reduce_in_fp32=True, context_parallel_size=2
+        )
+
+        key = list(result.keys())[0]
+        assert key.excludes_cp_from_bucket is False
+
+    def test_gtp_managed_and_plain_params_split_under_cp(self):
+        """A GTP-managed and an ordinary param of the same dtype land in separate buffers
+        once CP is active, since only the GTP-managed one needs its bucket collective to
+        skip CP."""
+        gtp_param = _make_param_with_attrs((100,), is_gtp_weight_remat=True)
+        plain_param = _make_params((100,))[0]
+        result = group_params_for_buffers(
+            [gtp_param, plain_param], grad_reduce_in_fp32=True, context_parallel_size=2
+        )
+
+        assert len(result) == 2
+        excluded_key = BufferKey(torch.bfloat16, torch.float, False, excludes_cp_from_bucket=True)
+        plain_key = BufferKey(torch.bfloat16, torch.float, False)
+        assert result[excluded_key][0] == [gtp_param]
+        assert result[plain_key][0] == [plain_param]
+
 
 # ---------------------------------------------------------------------------
 # Tests for _compute_default_per_buffer_param_layout
