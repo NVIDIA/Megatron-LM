@@ -29,6 +29,13 @@ SOURCE_ROOT = Path("megatron")
 ALWAYS_RUN_FILE = UNIT_TEST_ROOT / "always_run_tests.json"
 SELECTOR_TIMEOUT_SECONDS = 300
 SAFE_DOCUMENTATION_SUFFIXES = {".gif", ".jpeg", ".jpg", ".md", ".png", ".rst", ".svg"}
+# Run only the existing baseline when every changed path matches this list.
+# Mixed PRs keep the normal selection policy; full-suite overrides still win.
+ALWAYS_RUN_ONLY_PATTERNS = (
+    "tests/functional_tests/**",
+    "skills/**",
+    ".github/workflows/claude_review.yml",
+)
 HIGH_IMPACT_PATTERNS = (
     ".github/**",
     "docker/**",
@@ -219,6 +226,32 @@ def _is_documentation_path(path: str) -> bool:
 
 def _matches_high_impact_path(path: str) -> bool:
     return any(fnmatch.fnmatch(path, pattern) for pattern in HIGH_IMPACT_PATTERNS)
+
+
+def _only_always_run_changes(changes: Sequence[Change]) -> bool:
+    """Match a nonempty diff, including both sides of every rename or copy."""
+
+    if not changes:
+        return False
+    for change in changes:
+        if change.status not in {"A", "M", "D", "R", "C"}:
+            return False
+        if (change.status in {"R", "C"}) != (change.old_path is not None):
+            return False
+        for path in change.paths:
+            candidate = Path(path)
+            if (
+                not path
+                or candidate.is_absolute()
+                or candidate.as_posix() != path
+                or ".." in candidate.parts
+                or any(character in path for character in "\\\x00\n\r\t")
+                or not any(
+                    fnmatch.fnmatchcase(path, pattern) for pattern in ALWAYS_RUN_ONLY_PATTERNS
+                )
+            ):
+                return False
+    return True
 
 
 def _source_module_is_discoverable(repo_root: Path, relative_path: Path) -> bool:
@@ -497,7 +530,8 @@ def _select_candidate(
 ) -> dict[str, object]:
     """Apply conservative selection policy to optional, already recorded analysis."""
 
-    policy_reason = full_run_reason(repo_root, changes)
+    patterns_only = _only_always_run_changes(changes)
+    policy_reason = None if patterns_only else full_run_reason(repo_root, changes)
     if policy_reason:
         return _full_report(policy_reason, buckets, ownership, changes)
     if analysis_error:
@@ -513,11 +547,11 @@ def _select_candidate(
             f"always-run test configuration is invalid: {error}", buckets, ownership, changes
         )
 
-    documentation_only = all(
+    baseline_only = patterns_only or all(
         _is_documentation_path(path) for change in changes for path in change.paths
     )
     impacted: set[str] = set()
-    if not documentation_only:
+    if not baseline_only:
         input_error = None if analysis_result is not None else analysis_input_error(repo_root)
         if input_error:
             return _full_report(input_error, buckets, ownership, changes)
@@ -568,7 +602,7 @@ def _select_candidate(
             ownership,
             changes,
         )
-    if not impacted and not documentation_only:
+    if not impacted and not baseline_only:
         return _full_report(
             "pytest-impacted returned no unit tests for an analyzable change",
             buckets,
@@ -588,9 +622,13 @@ def _select_candidate(
     return {
         "mode": "selective",
         "reason": (
-            "documentation-only change; running the always-run baseline"
-            if documentation_only
-            else f"{len(impacted)} impacted + {len(always_run)} always-run files (deduplicated)"
+            "all changed paths match ALWAYS_RUN_ONLY_PATTERNS; running the always-run baseline"
+            if patterns_only
+            else (
+                "documentation-only change; running the always-run baseline"
+                if baseline_only
+                else f"{len(impacted)} impacted + {len(always_run)} always-run files (deduplicated)"
+            )
         ),
         "changed_files": sorted({path for change in changes for path in change.paths}),
         "selected_files": sorted(selected),
@@ -622,6 +660,8 @@ def select_unit_tests(
     policy requires the full suite. ``execute_full`` preserves that candidate
     while executing all tests. ``force_full`` skips analysis entirely when no
     valid comparison is available or the workflow is outside PR analysis.
+    Changes entirely matching ``ALWAYS_RUN_ONLY_PATTERNS`` skip impact analysis
+    and select the baseline, unless a full-suite execution override is supplied.
     """
 
     if force_full and execute_full:
@@ -681,7 +721,7 @@ def select_unit_tests(
         report = _full_report(force_full, buckets, ownership, changes)
     else:
         recorded_result = None
-        if record_impact:
+        if record_impact and not _only_always_run_changes(changes):
             try:
                 recorded_result = run_pytest_impacted(
                     repo_root, git_mode, base_ref, runner=recording_runner

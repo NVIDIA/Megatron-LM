@@ -13,6 +13,26 @@ enable selection. Merge queues, scheduled workloads, and manual runs use the
 full suite. Docs-only PRs retain the existing CI skips, and the separate GB200
 marker-based suite is unchanged.
 
+Maintain `ALWAYS_RUN_ONLY_PATTERNS` in
+[`select_unit_tests.py`](../.github/scripts/select_unit_tests.py) for PR changes
+that need only the existing always-run files:
+
+```python
+ALWAYS_RUN_ONLY_PATTERNS = (
+    "tests/functional_tests/**",
+    "skills/**",
+    ".github/workflows/claude_review.yml",
+)
+```
+
+When the selector receives a nonempty PR diff and every changed path matches a
+pattern, it selects only the baseline without running `pytest-impacted`. Both
+the old and new paths of renames/copies must match. If any path does not match,
+the entire diff follows the normal selection policy. Full-suite overrides and
+baseline validation remain in effect. With the unchanged CI workflow, this rule
+applies to H100 PRs with the selective-testing label; unlabeled PRs still run
+the full suite, and GB200 behavior is unchanged.
+
 Selection compares the tested synthetic merge with its first parent
 (`git diff HEAD^1 HEAD`), covering all PR commits without unrelated main
 changes. Missing merge history, analyzer failures, empty impact results, and

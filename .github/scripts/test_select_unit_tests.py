@@ -14,6 +14,7 @@ from unittest import mock
 from select_unit_tests import (
     Change,
     CommandResult,
+    _only_always_run_changes,
     _run_command,
     build_bucket_ownership,
     find_changes,
@@ -109,6 +110,149 @@ class TestSelectUnitTests(unittest.TestCase):
             record_impact=record_impact,
             execute_full=execute_full,
         )
+
+    def test_matching_patterns_run_only_baseline_without_analysis(self) -> None:
+        changes = [
+            Change(status="A", path="tests/functional_tests/nested/golden.json"),
+            Change(status="D", path="skills/example/scripts/removed.py"),
+            Change(status="M", path=".github/workflows/claude_review.yml"),
+        ]
+        for scoped_changes in ([changes[0]], [changes[1]], [changes[2]], changes):
+            for record_impact in (False, True):
+                with self.subTest(changes=scoped_changes, record_impact=record_impact):
+                    report = self._select(
+                        CommandResult(returncode=7, stdout="", stderr="must not run"),
+                        changes=scoped_changes,
+                        record_impact=record_impact,
+                    )
+                    self.assertEqual(report["mode"], "selective")
+                    self.assertEqual(report["selected_files"], ["tests/unit_tests/test_root.py"])
+                    self.assertEqual(report["selected_count"], 1)
+                    self.assertEqual(report["impacted_count"], 0)
+                    self.assertEqual(report["always_run_count"], 1)
+                    self.assertEqual(len(report["matrix"]), 1)
+                    self.assertEqual(
+                        _decode_test_files(report["matrix"][0]["unit_test_files"]),
+                        report["selected_files"],
+                    )
+                    self.assertEqual(report["impact_analysis"]["status"], "not_run")
+                    self.assertEqual(
+                        report["changed_files"], sorted(change.path for change in scoped_changes)
+                    )
+        self.assertEqual(self.runner_calls, [])
+
+    def test_always_run_patterns_require_complete_canonical_changes(self) -> None:
+        cases = [
+            [],
+            [Change(status="S", path="skills/guide.md")],
+            [Change(status="T", path="tests/functional_tests/case.py")],
+            [Change(status="R", path="skills/new.md")],
+            [Change(status="C", path="skills/new.md")],
+            [Change(status="M", old_path="skills/old.md", path="skills/new.md")],
+        ]
+        cases.extend(
+            [Change(status="M", path=path)]
+            for path in (
+                "skills/../megatron/core/layers.py",
+                "skills/./guide.md",
+                "skills//guide.md",
+                "/skills/guide.md",
+                "skills/guide.md/",
+                "skills/..\\outside.py",
+                "tests/functional_tests_extra/case.py",
+                ".github/workflows/claude_review.yml.bak",
+                "docs/guide.md",
+                "",
+            )
+        )
+        for changes in cases:
+            with self.subTest(changes=changes):
+                self.assertFalse(_only_always_run_changes(changes))
+
+    def test_always_run_patterns_check_both_rename_and_copy_paths(self) -> None:
+        for status in ("R", "C"):
+            for old_path, path, matches in (
+                ("skills/old.py", "tests/functional_tests/new.py", True),
+                ("skills/old.py", "megatron/core/layers.py", False),
+                ("megatron/core/layers.py", "skills/new.py", False),
+            ):
+                with self.subTest(status=status, old_path=old_path, path=path):
+                    changes = [Change(status=status, old_path=old_path, path=path)]
+                    self.assertEqual(_only_always_run_changes(changes), matches)
+                    report = self._select(
+                        CommandResult(returncode=7, stdout="", stderr="must not run"),
+                        changes=changes,
+                    )
+                    if matches:
+                        self.assertEqual(
+                            report["selected_files"], ["tests/unit_tests/test_root.py"]
+                        )
+                        self.assertEqual(report["changed_files"], sorted([old_path, path]))
+                    else:
+                        self._assert_full_report(report, f"git status '{status}'")
+        self.assertEqual(self.runner_calls, [])
+
+    def test_mixed_changes_keep_original_policy_and_analysis(self) -> None:
+        for path, reason in (
+            ("tests/functional_tests/golden.json", "unsupported non-Python file"),
+            ("skills/example.py", "Python file outside the analyzed package"),
+            (".github/workflows/claude_review.yml", "high-impact file changed"),
+        ):
+            with self.subTest(path=path):
+                report = self._select(
+                    CommandResult(returncode=7, stdout="", stderr="must not run"),
+                    changes=[
+                        Change(status="M", path="megatron/core/layers.py"),
+                        Change(status="M", path=path),
+                    ],
+                )
+                self._assert_full_report(report, reason)
+        self.assertEqual(self.runner_calls, [])
+        report = self._select(
+            CommandResult(
+                returncode=0, stdout="tests/unit_tests/models/test_model.py\n", stderr=""
+            ),
+            changes=[
+                Change(status="M", path="megatron/core/layers.py"),
+                Change(status="M", path="skills/guide.md"),
+            ],
+        )
+        self.assertEqual(report["mode"], "selective")
+        self.assertEqual(report["selected_count"], 2)
+        self.assertEqual(len(self.runner_calls), 1)
+
+    def test_matching_patterns_fail_closed_for_invalid_or_missing_baseline(self) -> None:
+        for contents in (None, "invalid JSON", "[]", '["tests/unit_tests/test_missing.py"]'):
+            with self.subTest(contents=contents):
+                if contents is None:
+                    (self.repo_root / "tests/unit_tests/always_run_tests.json").unlink()
+                else:
+                    self._write("tests/unit_tests/always_run_tests.json", contents)
+                report = self._select(
+                    CommandResult(returncode=7, stdout="", stderr="must not run"),
+                    changes=[Change(status="M", path="skills/guide.md")],
+                    record_impact=True,
+                )
+                self._assert_full_report(report, "always-run test configuration is invalid")
+                self.assertEqual(report["impact_analysis"]["status"], "not_run")
+        self.assertEqual(self.runner_calls, [])
+
+    def test_full_overrides_take_precedence_over_matching_patterns(self) -> None:
+        for override in ("force_full", "execute_full"):
+            with self.subTest(override=override):
+                report = self._select(
+                    CommandResult(returncode=7, stdout="", stderr="must not run"),
+                    changes=[Change(status="M", path=".github/workflows/claude_review.yml")],
+                    record_impact=True,
+                    **{override: "explicit full suite"},
+                )
+                self._assert_full_report(report, "explicit full suite")
+                self.assertEqual(report["impact_analysis"]["status"], "not_run")
+                if override == "execute_full":
+                    self.assertEqual(report["candidate_selection"]["selected_count"], 1)
+                else:
+                    self.assertIsNone(report["candidate_selection"])
+        self.assertEqual(self.runner_calls, [])
 
     def test_policy_allows_discoverable_source_tests_and_documentation(self) -> None:
         changes = [
