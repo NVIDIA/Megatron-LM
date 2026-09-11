@@ -13,6 +13,7 @@ from megatron.core.inference.inference_request import (
     DynamicInferenceRequestRecord,
     FinishedRequestRecord,
     InferenceRequest,
+    Status,
     compute_block_hashes_batched,
     deserialize_ndarray,
     deserialize_tensor,
@@ -359,6 +360,50 @@ def test_dynamic_inference_request_record_checkpoint_and_merge():
     # Never-stamped requests record None epochs (non-RL serving).
     finished_cd = FinishedRequestRecord.from_request(merged_cd)
     assert finished_cd.policy_epoch is None and finished_cd.num_evictions == 0
+
+
+def test_checkpoint_preserves_runtime_state_without_aliasing():
+    """Checkpointing preserves state that controls re-admission and generation."""
+    sampling_params = SamplingParams(num_tokens_to_generate=5, termination_id=0)
+    sampling_params.add_attributes({"min_length": 3, "custom_sampler_state": {"seed": 17}})
+    request = _make_dynamic_request(
+        sampling_params=sampling_params,
+        generated_tokens=[8, 9],
+        status=Status.ACTIVE_BUT_NOT_GENERATING_TOKENS,
+        policy_epoch=[(0, 4)],
+        kv_cache_epoch=[(0, 4)],
+        ttft=None,
+    )
+    record = DynamicInferenceRequestRecord.from_request(request)
+
+    record.checkpoint()
+    checkpoint = record[-1]
+    checkpoint.ttft = 0.25
+
+    assert checkpoint.sampling_params.num_tokens_to_generate == 3
+    assert checkpoint.sampling_params.num_tokens_total is None
+    assert checkpoint.sampling_params.min_length == 3
+    assert checkpoint.sampling_params.custom_sampler_state == {"seed": 17}
+    assert checkpoint.sampling_params is not request.sampling_params
+    assert checkpoint.status == Status.ACTIVE_BUT_NOT_GENERATING_TOKENS
+    assert request.ttft is None
+    assert checkpoint.policy_epoch == [(0, 4)]
+    assert checkpoint.policy_epoch is not request.policy_epoch
+    # KV state is recomputed, so unlike policy history it deliberately starts unstamped.
+    assert checkpoint.kv_cache_epoch is None
+
+    request.policy_epoch.append((1, 5))
+    request.sampling_params.custom_sampler_state["seed"] = 99
+    assert checkpoint.policy_epoch == [(0, 4)]
+    assert checkpoint.sampling_params.custom_sampler_state == {"seed": 17}
+
+    checkpoint.kv_cache_epoch = [(1, 7)]
+    merged = record.merge()
+    assert merged.policy_epoch == [(0, 4)]
+    assert merged.policy_epoch is not checkpoint.policy_epoch
+    assert merged.kv_cache_epoch == [(1, 7)]
+    assert merged.kv_cache_epoch is not checkpoint.kv_cache_epoch
+    assert merged.ttft == 0.25
 
 
 def test_dynamic_inference_request_serialize_strips_event_add_engine():

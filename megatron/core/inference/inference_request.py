@@ -5,7 +5,7 @@ import hashlib
 import time
 import uuid
 import warnings
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -1023,8 +1023,14 @@ class DynamicInferenceRequestRecord:
 
         old_request = self[-1]
 
-        # Carry forward policy_epoch as-is.
-        policy_epoch = old_request.policy_epoch
+        # Engine-created epoch entries are immutable (token index, epoch) tuples, and
+        # the engine only appends to the outer list, so list.copy() provides isolation
+        # without the recursive cost of deepcopy. MessagePack can deserialize tuples
+        # as mutable lists, which would require a deep copy if entries were mutated in
+        # place, but current engine paths never perform such mutations.
+        policy_epoch = (
+            old_request.policy_epoch.copy() if old_request.policy_epoch is not None else None
+        )
 
         # Reset kv_cache_epoch to None: the KV cache is recomputed fresh after checkpoint;
         # the engine's stamping logic will initialize a new stamp record with the recompute epoch.
@@ -1043,24 +1049,16 @@ class DynamicInferenceRequestRecord:
             dim=0,
         )
 
-        # New sampling params.
-        new_sampling_params = SamplingParams(
-            **{
-                **asdict(old_request.sampling_params),
-                "num_tokens_to_generate": (
-                    old_request.sampling_params.num_tokens_to_generate
-                    - len(old_request.generated_tokens)
-                ),
-            }
-        )
-
         # Preserve prefix-cache configuration and let __post_init__ recompute hashes for the
         # expanded prompt. The previous hash list may not include newly completed blocks.
+        # DynamicInferenceRequest.__post_init__ deep-copies sampling_params, including
+        # dynamically added fields, so the new request owns the copy adjusted below.
         common_kwargs = dict(
             request_id=old_request.request_id,
             prompt_tokens=new_prompt_tokens,
             compact_prompt_tokens=old_request.compact_prompt_tokens,
-            sampling_params=new_sampling_params,
+            sampling_params=old_request.sampling_params,
+            status=old_request.status,
             policy_epoch=policy_epoch,
             kv_cache_epoch=kv_cache_epoch,
             block_size_tokens=old_request.block_size_tokens,
@@ -1085,6 +1083,14 @@ class DynamicInferenceRequestRecord:
             )
         else:
             new_request = DynamicInferenceRequest(**common_kwargs)
+        if old_request.sampling_params.num_tokens_to_generate is not None:
+            new_request.sampling_params.num_tokens_to_generate = (
+                old_request.sampling_params.num_tokens_to_generate
+                - len(old_request.generated_tokens)
+            )
+        # num_tokens_total is converted to a generation budget on first
+        # admission and must not be applied again to the expanded prompt.
+        new_request.sampling_params.num_tokens_total = None
         # Preserve event_add_engine from old request if it exists, otherwise set it.
         # This ensures TTFT calculation works correctly for evicted/resumed requests.
         if old_request.event_add_engine is not None:
@@ -1122,8 +1128,18 @@ class DynamicInferenceRequestRecord:
         except TypeError as e:  # generally means r.generated_text is None
             generated_text = None
 
-        policy_epoch = self.requests[-1].policy_epoch
-        kv_cache_epoch = self.requests[-1].kv_cache_epoch
+        # Detach the merged result's outer epoch lists under the engine's append-only
+        # mutation pattern described in checkpoint().
+        latest_request = self.requests[-1]
+        policy_epoch = (
+            latest_request.policy_epoch.copy() if latest_request.policy_epoch is not None else None
+        )
+        kv_cache_epoch = (
+            latest_request.kv_cache_epoch.copy()
+            if latest_request.kv_cache_epoch is not None
+            else None
+        )
+        ttft = next((request.ttft for request in self.requests if request.ttft is not None), None)
         # Preserve KV handoff metadata when merging request segments.
         disaggregated_params = self.requests[-1].disaggregated_params
 
@@ -1144,7 +1160,7 @@ class DynamicInferenceRequestRecord:
             sampling_params=self.requests[0].sampling_params,
             policy_epoch=policy_epoch,
             kv_cache_epoch=kv_cache_epoch,
-            ttft=self.requests[0].ttft,
+            ttft=ttft,
             tpot=merge_lists("tpot"),
             status=self.requests[-1].status,
             latency=self.latency,
