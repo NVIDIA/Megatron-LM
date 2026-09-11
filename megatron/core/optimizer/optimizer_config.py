@@ -316,6 +316,19 @@ class OptimizerConfig:
     > 1 require emerging-optimizers >= 0.3.0 (batched 3-D Newton-Schulz); the
     default runs on any version with the newton_schulz API."""
 
+    muon_expert_tp_mode: Optional[str] = None
+    """Tensor-parallel NS mode for expert-parallel weights. None (default): expert
+    weights follow muon_tp_mode. Set to any muon_tp_mode value to give the expert
+    domain its own mode — e.g. muon_tp_mode='auto' with
+    muon_expert_tp_mode='layer_sharded' runs the per-weight duplicated/distributed
+    cost model on dense weights while layer-sharding the MoE expert weights, where
+    the layer-sharded win concentrates (many identically shaped matrices per NS
+    home). When the effective expert mode differs from muon_tp_mode, the optimizer
+    builder keeps the dense/expert buckets separate and constructs one base
+    optimizer per bucket; both feed LayerWiseDistributedOptimizer. Requires
+    num_experts when set explicitly (a model without expert weights has no expert
+    bucket to route)."""
+
     muon_concurrent_groups: bool = True
     """Run each param group's layer-sharded pipeline (exchange + Newton-Schulz + update)
     on its own CUDA stream so one group's compute fills another group's all_to_all stall.
