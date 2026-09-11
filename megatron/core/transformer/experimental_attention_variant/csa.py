@@ -2662,12 +2662,16 @@ class CompressedSparseAttention(MegatronModule):
                 deterministic=self.config.deterministic_mode,
             )
 
-        # Same lowering as ``FusedCSAIndexerSparseAttnFunc.forward`` (the
-        # grad-enabled path): ``build_attention_indices`` in indexer-loss mode
-        # emits compressed ids before window ids, and the list is compacted
-        # afterwards. FlashMLA's online softmax accumulates in key order, so a
-        # forward-only pass reproduces the training forward only if it hands
-        # the kernel the same id sequence.
+        # ``build_attention_indices`` has two output layouts. Its default puts
+        # window ids first and returns the list already compacted with a
+        # ``topk_length``. Its indexer-loss layout puts the compressed ids
+        # first at fixed positions (so the grad-enabled path can slice the
+        # window segment for the dense teacher) and leaves compaction to the
+        # caller, returning ``None`` for the length. The grad-enabled path in
+        # ``FusedCSAIndexerSparseAttnFunc.forward`` uses the latter; take the
+        # same layout here and compact it ourselves so both forwards hand
+        # FlashMLA an identical id sequence. With no compressed ids the two
+        # layouts coincide, so keep the default and its precomputed length.
         compressed_first = topk_indices_cmp.shape[-1] > 0
         flat_idxs, flat_tlen, _, _ = thd_layout_kernels.build_attention_indices(
             cu_seqlens_q,
