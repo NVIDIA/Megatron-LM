@@ -286,6 +286,7 @@ addopts = "--durations=15 -s -rA"
 testpaths = ["tests"]
 python_files = "test_*.py"
 markers = [
+    "determinism_case(op_id, implementation): measured kernel replay case",
     "internal: mark a test as a test to private/internal functions.",
     "flaky: mark flaky tests for LTS environment",
     "flaky_in_dev: mark flaky tests for DEV environment",
