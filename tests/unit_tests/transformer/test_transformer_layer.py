@@ -743,6 +743,98 @@ class TestTransformerLayerWithHyperConnectionRecompute:
         # Check that gradient is non-trivial (not all zeros)
         assert hidden_states.grad.abs().sum() > 0
 
+    def test_moe_layer_forward_backward_without_partial_cuda_graphs(self):
+        """mHC uses the ordinary MoE execution path when partial graphs are disabled."""
+        config = _make_mhc_config(
+            hidden_size=32,
+            num_streams=4,
+            num_layers=1,
+            ffn_hidden_size=64,
+            moe_ffn_hidden_size=64,
+            num_moe_experts=4,
+            moe_router_topk=2,
+            moe_router_load_balancing_type="none",
+            moe_token_dispatcher_type="allgather",
+            add_bias_linear=False,
+        )
+        layer = HyperConnectionTransformerLayer(
+            config,
+            _make_mhc_layer_spec(
+                num_experts=4, moe_grouped_gemm=False, use_te_op_fuser=False
+            ).submodules,
+        )
+
+        assert layer.is_moe_layer
+        assert layer.supports_mhc_connections
+
+        state_dict = layer.state_dict()
+        assert any("self_attention_hyper_connection" in key for key in state_dict)
+        assert any("mlp_hyper_connection" in key for key in state_dict)
+
+        layer = layer.cuda()
+        hidden_states = torch.randn(8, 2, 128, device="cuda", requires_grad=True)
+        attention_mask = torch.zeros((1, 1, 8, 8), dtype=bool, device="cuda")
+        output, _ = layer(hidden_states=hidden_states, attention_mask=attention_mask)
+        output.float().sum().backward()
+
+        assert output.shape == hidden_states.shape
+        assert torch.isfinite(output).all()
+        assert hidden_states.grad is not None
+
+    def test_moe_layer_skips_mlp_cuda_graph(self):
+        """A global MLP graph request must leave the mHC MoE layer eager."""
+        config = _make_mhc_config(
+            hidden_size=32,
+            num_streams=4,
+            num_layers=1,
+            ffn_hidden_size=64,
+            moe_ffn_hidden_size=64,
+            num_moe_experts=4,
+            moe_router_topk=2,
+            moe_router_load_balancing_type="none",
+            moe_token_dispatcher_type="allgather",
+        )
+        config.cuda_graph_impl = "local"
+        config.cuda_graph_modules = [CudaGraphModule.mlp]
+
+        layer = HyperConnectionTransformerLayer(
+            config,
+            _make_mhc_layer_spec(
+                num_experts=4, moe_grouped_gemm=False, use_te_op_fuser=False
+            ).submodules,
+        )
+
+        assert layer.is_moe_layer
+        assert not hasattr(layer, "cudagraph_manager")
+        assert layer.mlp_hyper_connection not in layer._get_submodules_under_cudagraphs()
+
+    @pytest.mark.parametrize(
+        "cuda_graph_module",
+        [CudaGraphModule.moe, CudaGraphModule.moe_router, CudaGraphModule.moe_preprocess],
+    )
+    def test_moe_layer_rejects_partial_cuda_graphs(self, cuda_graph_module):
+        """Partial MoE graphs must not drop the hyper-connection state."""
+        config = _make_mhc_config(
+            hidden_size=32,
+            num_streams=4,
+            num_layers=1,
+            ffn_hidden_size=64,
+            moe_ffn_hidden_size=64,
+            num_moe_experts=4,
+            moe_router_topk=2,
+            moe_router_load_balancing_type="none",
+            moe_token_dispatcher_type="allgather",
+        )
+        config.cuda_graph_modules = [cuda_graph_module]
+
+        with pytest.raises(NotImplementedError, match="MoE CUDA graph"):
+            HyperConnectionTransformerLayer(
+                config,
+                _make_mhc_layer_spec(
+                    num_experts=4, moe_grouped_gemm=False, use_te_op_fuser=False
+                ).submodules,
+            )
+
     @pytest.mark.parametrize("norm_attr", ["input_layernorm", "pre_mlp_layernorm"])
     def test_residual_returning_layernorm_is_rejected(self, norm_attr):
         """A norm returning (output, residual) must fail fast, not feed a tuple downstream.

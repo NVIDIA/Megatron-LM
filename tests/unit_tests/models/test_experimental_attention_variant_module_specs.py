@@ -5,10 +5,14 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from megatron.core.transformer.enums import AttnMaskType, LayerType
+from megatron.core.transformer.hyper_connection import HyperConnectionModule
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import TransformerBlockSubmodules
-from megatron.core.transformer.transformer_layer import TransformerLayer
+from megatron.core.transformer.transformer_layer import (
+    HyperConnectionTransformerLayer,
+    TransformerLayer,
+)
 
 # ---------------------------------------------------------------------------
 # Helpers: fake backend and config builders
@@ -82,6 +86,7 @@ def _make_config(**overrides):
         use_kitchen_attention=False,
         kitchen_attention_backend="sdpa",
         fallback_to_eager_attn=False,
+        enable_mhc_connections=False,
     )
     defaults.update(overrides)
     cfg = MagicMock()
@@ -574,6 +579,50 @@ class TestGetTransformerLayerWithExperimentalAttentionVariantSpec:
         assert specs[1].submodules.mlp is dense_spec
         assert specs[2].submodules.mlp is moe_spec
         assert specs[3].submodules.mlp is dense_spec
+
+    def test_mhc_wires_hyper_connections_for_mixed_moe_pattern(self):
+        """Verify every mixed layer consumes mHC streams without changing its MLP pattern."""
+        from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
+            get_transformer_layer_with_experimental_attention_variant_spec,
+        )
+
+        cfg = _make_config(
+            num_layers=4,
+            experimental_attention_variant="dsv4_hybrid",
+            num_moe_experts=8,
+            moe_layer_freq=2,
+            normalization="RMSNorm",
+            enable_mhc_connections=True,
+        )
+        backend = _make_backend()
+        attn_spec = self._make_attention_spec(fuse_input_layernorm=False)
+        moe_spec = self._make_mlp_spec(fuse_pre_mlp_layernorm=False)
+        dense_spec = self._make_mlp_spec(fuse_pre_mlp_layernorm=True)
+
+        with (
+            patch(
+                f"{self.MODULE}.get_experimental_attention_variant_module_spec",
+                return_value=attn_spec,
+            ),
+            patch(f"{self.MODULE}._get_moe_module_spec", return_value=(moe_spec, False)),
+            patch(f"{self.MODULE}._get_dense_mlp_module_spec", return_value=(dense_spec, True)),
+        ):
+            specs = get_transformer_layer_with_experimental_attention_variant_spec(
+                cfg, backend=backend
+            )
+
+        assert all(spec.module is HyperConnectionTransformerLayer for spec in specs)
+        assert all(
+            spec.submodules.self_attention_hyper_connection is HyperConnectionModule
+            and spec.submodules.mlp_hyper_connection is HyperConnectionModule
+            for spec in specs
+        )
+        assert [spec.submodules.mlp for spec in specs] == [
+            moe_spec,
+            dense_spec,
+            moe_spec,
+            dense_spec,
+        ]
 
 
 # ===================================================================
