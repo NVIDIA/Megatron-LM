@@ -4,7 +4,7 @@
 
 from .config import EngramConfig
 from .engram import Engram
-from .layer_specs import apply_engram_to_layer_spec
+from .layer_specs import apply_engram_to_hybrid_stack_spec, apply_engram_to_layer_spec
 from .variants import ENGRAM_VARIANTS, EngramVariant, resolve_variant
 
 __all__ = [
@@ -12,6 +12,7 @@ __all__ = [
     "Engram",
     "EngramConfig",
     "EngramVariant",
+    "apply_engram_to_hybrid_stack_spec",
     "apply_engram_to_layer_spec",
     "resolve_variant",
 ]

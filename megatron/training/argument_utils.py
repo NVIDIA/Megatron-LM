@@ -658,6 +658,10 @@ def hybrid_config_from_args(
             hybrid_stack_spec = hybrid_stack_spec(transformer_cfg)
         kwargs["hybrid_stack_spec"] = hybrid_stack_spec
 
+    # Built here so the CLI/YAML validation runs once; the padded vocabulary is checked later
+    # by the model builder, which is the first place that knows it.
+    kwargs["engram_config"] = EngramConfig.from_args(args, transformer_cfg)
+
     kwargs["fp16_lm_cross_entropy"] = args.fp16_lm_cross_entropy
     kwargs["hybrid_layer_pattern"] = args.hybrid_layer_pattern
     kwargs["position_embedding_type"] = args.position_embedding_type
