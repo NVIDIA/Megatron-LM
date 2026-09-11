@@ -13,6 +13,7 @@ from ..distributed.fsdp.src.megatron_fsdp.experimental.parameter_group import (
     sync_model_weights_from_main_weights,
 )
 from ..transformer.module import MegatronModule
+from ..utils import is_te_min_version
 from .grad_scaler import MegatronGradScaler
 from .optimizer import MixedPrecisionOptimizer
 from .optimizer_config import OptimizerConfig
@@ -204,15 +205,28 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
 
     @override
     def zero_grad(self, set_to_none: bool = True) -> None:
-        """Clear optimizer-visible sharded grads and any grads filtered from local groups."""
+        """Clear optimizer-visible sharded grads."""
+        # install_sharded_grads() binds .grad to a persistent main_grad view from
+        # Python during backward, and graph replay re-executes only GPU kernels. So
+        # unbinding here is never undone on a replayed step: .grad stays None, the
+        # optimizer skips every parameter, and the run silently stops training with
+        # a 0.0 grad norm. Zero in place to keep the binding alive.
+        #
+        # Overriding rather than asserting: ChainedOptimizer forwards its own True
+        # default positionally, so set_to_none is always True here regardless of
+        # caller intent, and an assert would fire on every graphed step.
+        if any(model_chunk.config.cuda_graph_impl != "none" for model_chunk in self.model_chunks):
+            set_to_none = False
+
         if not self.is_stub_optimizer:
             self.optimizer.zero_grad(set_to_none=set_to_none)
 
-        # Empty local DTensor shards are filtered out of optimizer param groups
-        # as a TE FusedAdam workaround. A rank with no local optimizer params
-        # can still have stale module grads to clear.
-        for model_chunk in self.model_chunks:
-            model_chunk.zero_grad(set_to_none=set_to_none)
+        if not is_te_min_version("2.18.0"):
+            # Older TE FusedAdam requires empty local shards to be omitted from optimizer
+            # parameter groups (see the matching workaround in get_megatron_optimizer()).
+            # Those parameters are not cleared by optimizer.zero_grad().
+            for model_chunk in self.model_chunks:
+                model_chunk.zero_grad(set_to_none=set_to_none)
 
     def _copy_model_grads_to_main_grads(self) -> None:
         """Install optimizer-compatible gradients for non-precision-aware optimizers."""
