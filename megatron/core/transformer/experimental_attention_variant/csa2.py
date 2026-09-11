@@ -21,8 +21,14 @@ from megatron.core.transformer.experimental_attention_variant.csa import (
     CompressedSparseAttentionSubmodules,
     CompressorSubmodules,
     _apply_rope,
+    _compute_unfused_csa_non_compressed_lse,
     get_window_topk_idxs,
     unfused_compressed_sparse_attn,
+)
+from megatron.core.transformer.experimental_attention_variant.dsa import (
+    DSAIndexerLossAutoScaler,
+    DSAIndexerLossLoggingHelper,
+    compute_dsa_indexer_loss,
 )
 from megatron.core.transformer.module import MegatronModule, mark_keep_in_fp32
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
@@ -265,8 +271,8 @@ class CSA2Indexer(MegatronModule):
     ) -> torch.Tensor:
         """Return differentiable causal scores ``[batch, sequence, global positions]``.
 
-        The discrete top-k has no LM-loss gradient. A future indexer auxiliary loss can
-        consume these scores explicitly without retaining a graph in module state. Full layers
+        The discrete top-k has no LM-loss gradient. The indexer auxiliary loss consumes
+        these scores without retaining a graph in module state. Full layers
         may pass a pre-RoPE latent as before; Reindex layers pass ``latent=None`` and the Full
         owner's ``indexer_k``. Supplying shared keys preserves their graph for auxiliary losses.
         """
@@ -358,8 +364,6 @@ class CompressedSparseAttention2(MegatronModule):
             raise NotImplementedError("Native CSA2 currently requires TP=CP=1.")
         if (attention_dropout or config.attention_dropout) != 0:
             raise NotImplementedError("Native CSA2 does not implement attention dropout.")
-        if config.dsa_indexer_loss_coeff:
-            raise NotImplementedError("CSA2 indexer auxiliary loss is not integrated yet.")
         layer_idx = layer_number - 1
         ratio = config.csa_compress_ratios[layer_idx]
         if compress_ratio is not None and compress_ratio != ratio:
@@ -383,6 +387,7 @@ class CompressedSparseAttention2(MegatronModule):
             and layer_idx > config.csa2_candidate_source_layer
         )
         self.compress_ratio = ratio
+        self.pg_collection = pg_collection
         self.tp_group = pg_collection.tp
         self.cp_group = pg_collection.cp
         self.rotary_pos_emb = rotary_pos_emb
@@ -407,14 +412,16 @@ class CompressedSparseAttention2(MegatronModule):
             )
 
     def _shared_global_attention(
-        self, x: torch.Tensor, qr: torch.Tensor, state: CSA2State
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        self, x: torch.Tensor, qr: torch.Tensor, state: CSA2State, *, use_indexer_loss: bool = False
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """Publish or consume shared graph tensors and logical position indices."""
         if self.is_kv_source:
             latent = self.compressor(x)
-            # Derive index K before main KV RoPE. Both tensors keep the Full owner's graph;
-            # only the subsequent discrete selection runs without gradient recording.
-            state.indexer_k = self.indexer.project_keys(latent, self.rotary_pos_emb)
+            # The auxiliary objective trains the indexer, not the main compressor.
+            # Detach BEFORE projection so Full and Reindex losses still reach the
+            # owning indexer's K projection and normalization through the shared keys.
+            indexer_latent = latent.detach() if use_indexer_loss else latent
+            state.indexer_k = self.indexer.project_keys(indexer_latent, self.rotary_pos_emb)
             pos_dim = self.config.qk_pos_emb_head_dim
             state.global_kv = _apply_rope(
                 latent,
@@ -439,6 +446,7 @@ class CompressedSparseAttention2(MegatronModule):
                 f"{self.kv_source_layer} in the same forward's CSA2State."
             )
 
+        scores = None
         if self.is_index_source:
             candidates = None
             if self.uses_candidates:
@@ -451,15 +459,16 @@ class CompressedSparseAttention2(MegatronModule):
                         f"{self.config.csa2_candidate_source_layer} in the same CSA2State."
                     )
                 candidates = state.candidates
-            with torch.no_grad():
+            with torch.set_grad_enabled(use_indexer_loss):
                 scores = self.indexer.forward_before_topk(
-                    x,
-                    qr,
+                    x.detach(),
+                    qr.detach(),
                     None,
                     self.rotary_pos_emb,
                     indexer_k=state.indexer_k,
                     candidates=candidates,
                 )
+            with torch.no_grad():
                 if self.is_candidate_source:
                     visible = (
                         torch.arange(1, x.shape[0] + 1, device=x.device) // self.compress_ratio
@@ -480,7 +489,49 @@ class CompressedSparseAttention2(MegatronModule):
                 f"CSA2 Reuse layer {self.layer_idx} requires indices from layer "
                 f"{self.index_source_layer} in the same forward's CSA2State."
             )
-        return state.global_kv, state.global_indices
+        return state.global_kv, state.global_indices, scores if use_indexer_loss else None
+
+    def _compute_indexer_loss(
+        self,
+        query: torch.Tensor,
+        local_kv: torch.Tensor,
+        global_kv: torch.Tensor,
+        window_indices: torch.Tensor,
+        global_indices: torch.Tensor,
+        scores: torch.Tensor,
+    ) -> torch.Tensor:
+        """Apply the existing DSv4 KL objective to this Full/Reindex layer's teacher.
+
+        Dense loss covers all causal global keys, restricted by the candidate mask
+        on later Reindex layers. Sparse loss further restricts both distributions to
+        this layer's top-k. The teacher includes SWA and sink mass before summing
+        heads and renormalizing over global keys. Reuse layers add no objective.
+
+        As in DSv4, this objective covers input tokens independently of the LM label
+        mask. Token reduction and backward scaling use the existing DSA interfaces;
+        the number of indexer layers only normalizes the reported metric.
+        """
+        if scores.shape[-1] == 0:
+            # No complete compression group: preserve zero gradients for the indexer.
+            return scores.sum() * 0
+        non_compressed_lse = _compute_unfused_csa_non_compressed_lse(
+            query, local_kv, self.attn_sink, window_indices, self.softmax_scale
+        )
+        mask = torch.zeros_like(scores).masked_fill(torch.isneginf(scores), -torch.inf)
+        return compute_dsa_indexer_loss(
+            # The shared helper adds masks in place; keep the scoring/selection tensor intact.
+            scores.clone(),
+            global_indices,
+            query.detach(),
+            global_kv.detach().unsqueeze(2).expand(-1, -1, query.shape[2], -1),
+            self.softmax_scale,
+            self.config.dsa_indexer_loss_coeff,
+            self.config.dsa_indexer_use_sparse_loss,
+            self.pg_collection,
+            mask=mask,
+            calculate_per_token_loss=self.config.calculate_per_token_loss,
+            non_compressed_lse=non_compressed_lse,
+        )
 
     def forward(
         self,
@@ -526,8 +577,20 @@ class CompressedSparseAttention2(MegatronModule):
                 )
         indices = get_window_topk_idxs(self.config.csa_window_size, batch, seq_len, query.device)
         kv = key.squeeze(-2)
+        indexer_loss = None
         if self.compress_ratio:
-            global_kv, global_indices = self._shared_global_attention(x, qr, csa2_state)
+            use_indexer_loss = (
+                self.training
+                and torch.is_grad_enabled()
+                and (self.config.dsa_indexer_loss_coeff or 0.0) > 0
+            )
+            global_kv, global_indices, scores = self._shared_global_attention(
+                x, qr, csa2_state, use_indexer_loss=use_indexer_loss
+            )
+            if scores is not None:
+                indexer_loss = self._compute_indexer_loss(
+                    query, kv, global_kv, indices, global_indices, scores
+                )
             # Keep the shared indices logical: every consumer applies its own concatenation
             # offset out of place, without corrupting the indices seen by the next layer.
             global_indices = torch.where(global_indices >= 0, global_indices + seq_len, -1)
@@ -538,6 +601,16 @@ class CompressedSparseAttention2(MegatronModule):
         output = unfused_compressed_sparse_attn(
             query, kv.float(), self.attn_sink, indices, self.softmax_scale
         )
+        if indexer_loss is not None:
+            # The tracker averages microbatches, so report a token mean in either
+            # reduction mode. Backward still receives the raw sum in per-token mode.
+            logged_loss = indexer_loss.detach()
+            if self.config.calculate_per_token_loss:
+                logged_loss = logged_loss / (seq_len * batch)
+            DSAIndexerLossLoggingHelper.save_loss_to_tracker(
+                loss=logged_loss, layer_number=self.layer_idx + 1, num_layers=self.config.num_layers
+            )
+            output = DSAIndexerLossAutoScaler.apply(output, indexer_loss)
         csa2_state.last_layer = self.layer_idx
         return output
 

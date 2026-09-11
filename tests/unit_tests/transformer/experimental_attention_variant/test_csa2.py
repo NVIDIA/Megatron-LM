@@ -9,10 +9,12 @@ it does not call the implementation's compressor, indexer, or sparse attention h
 """
 
 import math
+from types import SimpleNamespace
 
 import pytest
 import torch
 import torch.nn.functional as F
+from torch import nn
 
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
@@ -24,13 +26,25 @@ from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_dsv4_stack_spec
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.enums import AttnMaskType
+from megatron.core.transformer.experimental_attention_variant.csa import (
+    CompressedSparseAttentionSubmodules,
+    CompressorSubmodules,
+)
 from megatron.core.transformer.experimental_attention_variant.csa2 import (
     CompressedSparseAttention2,
+    CSA2Compressor,
+    CSA2Indexer,
+    CSA2IndexerSubmodules,
     CSA2State,
     select_candidate_blocks,
 )
+from megatron.core.transformer.experimental_attention_variant.dsa import (
+    DSAIndexerLossAutoScaler,
+    DSAIndexerLossLoggingHelper,
+)
 from megatron.core.transformer.module import convert_module_to_dtype_except_fp32_marked
-from megatron.core.transformer.spec_utils import build_module
+from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_layer import (
     HyperConnectionTransformerLayer,
@@ -39,14 +53,14 @@ from megatron.core.transformer.transformer_layer import (
 from tests.unit_tests.test_utilities import Utils
 from tests.unit_tests.transformer.experimental_attention_variant.test_dsv41 import _make_config
 
-pytestmark = [
-    pytest.mark.skipif(not torch.cuda.is_available(), reason="Megatron RoPE requires CUDA"),
-    pytest.mark.skipif(not HAVE_TE, reason="Transformer Engine is not installed"),
-]
-
 
 @pytest.fixture
 def pg_collection():
+    # Native indexer-loss tests below do not need CUDA or Transformer Engine.
+    if not torch.cuda.is_available():
+        pytest.skip("Megatron RoPE requires CUDA")
+    if not HAVE_TE:
+        pytest.skip("Transformer Engine is not installed")
     Utils.initialize_model_parallel()
     model_parallel_cuda_manual_seed(1234)
     yield ProcessGroupCollection.use_mpu_process_groups()
@@ -328,9 +342,7 @@ def test_candidate_source_can_run_standalone(pg_collection):
     assert torch.isfinite(output).all() and torch.isfinite(x.grad).all()
 
 
-def test_unimplemented_loss_and_dropout_fail_clearly(pg_collection):
-    with pytest.raises(NotImplementedError, match="auxiliary loss"):
-        _layer(pg_collection, 2, dsa_indexer_loss_coeff=0.1)
+def test_unimplemented_dropout_fails_clearly(pg_collection):
     with pytest.raises(NotImplementedError, match="dropout"):
         _layer(pg_collection, 2, attention_dropout=0.1)
 
@@ -688,6 +700,7 @@ def test_reindex_scores_preserve_owner_key_graph_and_candidate_mask(pg_collectio
     assert reindex.core_attention.indexer.linear_wq_b.weight.grad.abs().sum() > 0
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Candidate tensors use CUDA")
 def test_candidate_blocks_exclude_old_blocks_and_force_newest():
     # Latest position has the lowest score; pinning must displace the second-best old block.
     scores = torch.tensor([[[9.0, 7.0, 8.0, 6.0, 5.0, 4.0, -100.0]]], device="cuda")
@@ -816,3 +829,379 @@ def test_stack_owns_fresh_csa2_state_for_each_forward(
     for name, parameter in stack.named_parameters():
         if parameter.grad is not None:
             assert torch.isfinite(parameter.grad).all(), name
+
+
+# Native CPU indexer-loss supervision and shared autograd graphs.
+# The teacher oracle normalizes joint global, window, and sink logits. Native
+# projection/norm adapters retain the production compressor, indexer, RoPE, and loss.
+
+
+def _groups():
+    # A real singleton ProcessGroup supplies size/rank without starting collectives.
+    groups = ProcessGroupCollection()
+    groups.tp = groups.cp = torch.distributed.ProcessGroup(0, 1)
+    return groups
+
+
+def _math_core(sparse=False, per_token=False, coefficient=0.3):
+    core = CompressedSparseAttention2.__new__(CompressedSparseAttention2)
+    nn.Module.__init__(core)
+    core.config = SimpleNamespace(
+        dsa_indexer_loss_coeff=coefficient,
+        dsa_indexer_use_sparse_loss=sparse,
+        calculate_per_token_loss=per_token,
+    )
+    core.pg_collection = _groups()
+    core.softmax_scale = 0.5
+    core.attn_sink = nn.Parameter(torch.tensor([-1.0, 2.0, 4.0]))
+    return core
+
+
+def _inputs(dtype=torch.float32, candidates=False, empty=False):
+    torch.manual_seed(102)
+    length, batch, heads, dim = (1 if empty else 7), 2, 3, 4
+    width = length // 2
+    query = torch.randn(length, batch, heads, dim, dtype=dtype, requires_grad=True)
+    local_kv = torch.randn(length, batch, dim, dtype=dtype, requires_grad=True)
+    global_kv = torch.randn(width, batch, dim, dtype=dtype, requires_grad=True)
+    raw_scores = torch.randn(batch, length, width, requires_grad=True)
+    visible = torch.arange(width)[None, :] < torch.arange(1, length + 1)[:, None] // 2
+    visible = visible.expand(batch, -1, -1).clone()
+    if candidates:
+        visible[0, 5:, 1] = False
+        visible[1, 3:, 0] = False
+    scores = raw_scores.masked_fill(~visible, -torch.inf)
+    topk = scores.detach().topk(min(2, width), dim=-1).indices
+    topk = topk.masked_fill(~scores.detach().gather(-1, topk).isfinite(), -1)
+    window = torch.full((batch, length, 2), -1, dtype=torch.int64)
+    for row in range(length):
+        positions = torch.arange(max(row - 1, 0), row + 1)
+        window[:, row, : positions.numel()] = positions
+    return (query, local_kv, global_kv, window, topk, scores), raw_scores, visible
+
+
+def _teacher_oracle(core, query, local_kv, global_kv, window, topk, scores):
+    """Independent per-query KL, including window/sink mass before summing heads."""
+    losses = []
+    for batch in range(scores.shape[0]):
+        for row in range(scores.shape[1]):
+            positions = scores[batch, row].detach().isfinite().nonzero().flatten()
+            if core.config.dsa_indexer_use_sparse_loss:
+                positions = positions[torch.isin(positions, topk[batch, row])]
+            if positions.numel() == 0:
+                losses.append(scores[batch, row, :0].sum() * 0)
+                continue
+            q = query[row, batch].detach().float()
+            selected = global_kv[positions, batch].detach().float()
+            global_logits = (q @ selected.T) * core.softmax_scale
+            local_positions = window[batch, row]
+            local_positions = local_positions[local_positions >= 0]
+            local = local_kv[local_positions, batch].detach().float()
+            window_logits = (q @ local.T) * core.softmax_scale
+            all_logits = torch.cat(
+                (global_logits, window_logits, core.attn_sink.detach()[:, None]), dim=-1
+            )
+            teacher = all_logits.softmax(-1)[:, : positions.numel()].sum(0)
+            teacher = teacher / teacher.sum()
+            log_prediction = scores[batch, row, positions].float().log_softmax(-1)
+            losses.append((teacher * (teacher.clamp_min(1e-10).log() - log_prediction)).sum())
+    loss = torch.stack(losses).sum() * core.config.dsa_indexer_loss_coeff
+    if not core.config.calculate_per_token_loss:
+        loss = loss / (scores.shape[0] * scores.shape[1])
+    return loss
+
+
+@pytest.mark.parametrize("sparse", [False, True])
+@pytest.mark.parametrize("per_token", [False, True])
+@pytest.mark.parametrize("candidates", [False, True])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_loss_and_score_gradients_match_joint_teacher(sparse, per_token, candidates, dtype):
+    core = _math_core(sparse, per_token)
+    args, raw_scores, visible = _inputs(dtype, candidates)
+    scores_before = args[-1].detach().clone()
+    reference_raw = raw_scores.detach().clone().requires_grad_()
+    reference_scores = reference_raw.masked_fill(~visible, -torch.inf)
+    expected = _teacher_oracle(core, *args[:-1], reference_scores)
+    actual = core._compute_indexer_loss(*args)
+    torch.testing.assert_close(actual, expected, atol=2e-7, rtol=2e-6)
+    torch.testing.assert_close(args[-1], scores_before)
+    actual.backward()
+    expected.backward()
+    torch.testing.assert_close(raw_scores.grad, reference_raw.grad, atol=2e-7, rtol=2e-6)
+    assert torch.isfinite(raw_scores.grad).all()
+    assert raw_scores.grad.abs().sum() > 0
+    assert torch.count_nonzero(raw_scores.grad.masked_select(~visible)) == 0
+    assert all(tensor.grad is None for tensor in args[:3])
+    assert core.attn_sink.grad is None
+
+
+@pytest.mark.parametrize("sparse", [False, True])
+def test_teacher_depends_on_window_and_sink_mass(sparse):
+    core = _math_core(sparse)
+    args, _, _ = _inputs()
+    baseline = core._compute_indexer_loss(*args)
+    changed_window = (args[0], args[1] * 5, *args[2:])
+    changed = core._compute_indexer_loss(*changed_window)
+    assert not torch.isclose(baseline, changed, atol=1e-5, rtol=1e-5)
+    with torch.no_grad():
+        core.attn_sink.copy_(torch.tensor([9.0, -7.0, 0.5]))
+    changed = core._compute_indexer_loss(*args)
+    assert not torch.isclose(baseline, changed, atol=1e-5, rtol=1e-5)
+
+
+@pytest.mark.parametrize("sparse", [False, True])
+@pytest.mark.parametrize("empty_width", [False, True])
+def test_no_visible_global_positions_have_finite_zero_loss(sparse, empty_width):
+    core = _math_core(sparse)
+    args, raw_scores, _ = _inputs(empty=empty_width)
+    if not empty_width:
+        args = (
+            *args[:-2],
+            torch.full_like(args[-2], -1),
+            raw_scores.masked_fill(torch.ones_like(raw_scores, dtype=torch.bool), -torch.inf),
+        )
+    loss = core._compute_indexer_loss(*args)
+    assert loss.item() == 0
+    loss.backward()
+    assert raw_scores.grad is not None
+    assert torch.isfinite(raw_scores.grad).all()
+    assert torch.count_nonzero(raw_scores.grad) == 0
+
+
+def test_coefficient_and_token_sum_scaling():
+    args, _, _ = _inputs()
+    base = _math_core()._compute_indexer_loss(*args)
+    scaled = _math_core(coefficient=0.9)._compute_indexer_loss(*args)
+    token_sum = _math_core(per_token=True)._compute_indexer_loss(*args)
+    torch.testing.assert_close(scaled, base * 3)
+    torch.testing.assert_close(token_sum, base * 14)
+
+
+def test_autoscaler_preserves_output_and_scales_only_auxiliary_backward():
+    args, raw_scores, _ = _inputs()
+    loss = _math_core()._compute_indexer_loss(*args)
+    expected_gradient = torch.autograd.grad(loss, raw_scores, retain_graph=True)[0]
+    output = torch.randn(3, requires_grad=True)
+    previous = DSAIndexerLossAutoScaler.main_loss_backward_scale
+    try:
+        DSAIndexerLossAutoScaler.main_loss_backward_scale = None
+        DSAIndexerLossAutoScaler.set_loss_scale(torch.tensor(0.25))
+        attached = DSAIndexerLossAutoScaler.apply(output, loss)
+        torch.testing.assert_close(attached, output)
+        (attached.sum() * 3).backward()
+        torch.testing.assert_close(output.grad, torch.full_like(output, 3))
+        torch.testing.assert_close(raw_scores.grad, expected_gradient * 0.25)
+    finally:
+        DSAIndexerLossAutoScaler.main_loss_backward_scale = previous
+
+
+class _NativeLinear(nn.Module):
+    def __init__(self, input_size, output_size, config, **kwargs):
+        super().__init__()
+        self.weight = nn.Parameter(torch.empty(output_size, input_size, dtype=config.params_dtype))
+        nn.init.normal_(self.weight, std=0.2)
+
+    def forward(self, x):
+        return F.linear(x, self.weight), None
+
+
+class _NativeNorm(nn.RMSNorm):
+    def __init__(self, hidden_size, eps, config):
+        super().__init__(hidden_size, eps=eps, dtype=config.params_dtype)
+
+
+class _CPURotaryTable(nn.Module):
+    """Ordinary CPU frequency table; the production RoPE application remains unchanged."""
+
+    def __init__(self, dim):
+        super().__init__()
+        self.register_buffer("frequencies", 10000 ** (-torch.arange(0, dim, 2).float() / dim))
+
+    def forward(self, length, packed_seq=False):
+        angles = torch.outer(torch.arange(length).float(), self.frequencies)
+        return torch.cat((angles, angles), dim=-1)[:, None, None, :]
+
+
+def _sharing_cores(per_token=False, reuse=False):
+    config = _make_config(
+        num_layers=4 if reuse else 3,
+        csa_compress_ratios=[1] * (4 if reuse else 3),
+        csa2_kv_source_layers=[0],
+        csa2_index_source_layers=[0, 1, 2],
+        csa2_candidate_source_layer=0,
+        dsa_indexer_topk=2,
+        dsa_indexer_loss_coeff=0.3,
+        calculate_per_token_loss=per_token,
+    )
+    modules = CompressedSparseAttentionSubmodules(
+        compressor=ModuleSpec(
+            module=CSA2Compressor,
+            submodules=CompressorSubmodules(_NativeLinear, _NativeLinear, _NativeNorm),
+        ),
+        indexer=ModuleSpec(
+            module=CSA2Indexer,
+            submodules=CSA2IndexerSubmodules(
+                _NativeLinear, _NativeLinear, _NativeNorm, _NativeLinear
+            ),
+        ),
+    )
+    return [
+        CompressedSparseAttention2(
+            config,
+            modules,
+            layer_number=layer + 1,
+            attn_mask_type=AttnMaskType.causal,
+            attention_type="self",
+            pg_collection=_groups(),
+            rotary_pos_emb=_CPURotaryTable(config.qk_pos_emb_head_dim),
+        )
+        for layer in range(config.num_layers)
+    ]
+
+
+def test_shared_keys_accumulate_consumer_auxiliary_gradients_without_backbone_gradients():
+    torch.manual_seed(91)
+    owner, first, second = _sharing_cores()
+    state = CSA2State()
+    hidden = [torch.randn(7, 2, 32, requires_grad=True) for _ in range(3)]
+    query_latents = [torch.randn(7, 2, 16, requires_grad=True) for _ in range(3)]
+    records = [
+        core._shared_global_attention(x, qr, state, use_indexer_loss=True)
+        for core, x, qr in zip((owner, first, second), hidden, query_latents)
+    ]
+    assert records[0][0] is records[1][0] is records[2][0]
+    assert state.indexer_k.requires_grad
+    assert state.candidates is not None and not state.candidates.requires_grad
+    losses = []
+    for core, (global_kv, indices, scores) in zip((owner, first, second), records):
+        query = torch.randn(7, 2, 4, 16, requires_grad=True)
+        local = torch.randn(7, 2, 16, requires_grad=True)
+        window = torch.arange(7).view(1, 7, 1).expand(2, -1, -1)
+        losses.append(core._compute_indexer_loss(query, local, global_kv, window, indices, scores))
+    weight = owner.indexer.linear_wk.weight
+    individual = [torch.autograd.grad(loss, weight, retain_graph=True)[0] for loss in losses]
+    assert all(gradient.abs().sum() > 0 for gradient in individual)
+    sum(losses).backward()
+    torch.testing.assert_close(weight.grad, sum(individual), atol=2e-6, rtol=2e-5)
+    assert all(x.grad is None for x in hidden + query_latents)
+    assert all(parameter.grad is None for parameter in owner.compressor.parameters())
+    for core in (owner, first, second):
+        for parameter in core.indexer.parameters():
+            assert parameter.grad is not None and torch.isfinite(parameter.grad).all()
+    # Detaching the indexer branch must preserve the independent LM/global-KV graph.
+    records[0][0].square().sum().backward()
+    assert hidden[0].grad is not None and hidden[0].grad.abs().sum() > 0
+    assert owner.compressor.linear_wkv.weight.grad.abs().sum() > 0
+
+
+def _forward_inputs(count):
+    return [
+        (
+            torch.randn(7, 2, 4, 16, requires_grad=True),
+            torch.randn(7, 2, 1, 16, requires_grad=True),
+            torch.randn(7, 2, 32, requires_grad=True),
+            torch.randn(7, 2, 16, requires_grad=True),
+        )
+        for _ in range(count)
+    ]
+
+
+def _forward_cores(cores, inputs):
+    state = CSA2State()
+    return [
+        core(q, kv, kv, None, x=x, qr=qr, csa2_state=state)
+        for core, (q, kv, x, qr) in zip(cores, inputs)
+    ]
+
+
+def _record_losses(monkeypatch):
+    records = []
+
+    def record(**kwargs):
+        assert not kwargs["loss"].requires_grad
+        records.append(kwargs)
+
+    monkeypatch.setattr(DSAIndexerLossLoggingHelper, "save_loss_to_tracker", record)
+    monkeypatch.setattr(DSAIndexerLossAutoScaler, "main_loss_backward_scale", None)
+    return records
+
+
+@pytest.mark.parametrize("per_token", [False, True])
+def test_forward_auxiliary_loss_preserves_main_gradients_and_excludes_reuse(monkeypatch, per_token):
+    torch.manual_seed(307)
+    records = _record_losses(monkeypatch)
+    cores = _sharing_cores(per_token, reuse=True)
+    baseline = _sharing_cores(per_token, reuse=True)
+    for core, reference in zip(cores, baseline):
+        reference.load_state_dict(core.state_dict())
+    baseline[0].config.dsa_indexer_loss_coeff = 0
+    inputs = _forward_inputs(len(cores))
+    reference_inputs = [
+        tuple(tensor.detach().clone().requires_grad_() for tensor in row) for row in inputs
+    ]
+    outputs = _forward_cores(cores, inputs)
+    expected = _forward_cores(baseline, reference_inputs)
+    assert [record["layer_number"] for record in records] == [1, 2, 3]
+    assert all(record["num_layers"] == 4 for record in records)
+    for actual, reference in zip(outputs, expected):
+        torch.testing.assert_close(actual, reference, atol=0, rtol=0)
+    sum(output.square().mean() for output in outputs).backward()
+    sum(output.square().mean() for output in expected).backward()
+    for core, reference in zip(cores, baseline):
+        parameters = dict(reference.named_parameters())
+        for name, parameter in core.named_parameters():
+            if name.startswith("indexer."):
+                assert parameter.grad is not None and torch.isfinite(parameter.grad).all()
+                assert parameters[name].grad is None
+            else:
+                torch.testing.assert_close(parameter.grad, parameters[name].grad, atol=0, rtol=0)
+    for row, reference_row in zip(inputs, reference_inputs):
+        for tensor, reference in zip(row, reference_row):
+            torch.testing.assert_close(tensor.grad, reference.grad, atol=0, rtol=0)
+
+
+def test_token_sum_mode_keeps_same_logged_metric_and_scales_gradients(monkeypatch):
+    torch.manual_seed(81)
+    records = _record_losses(monkeypatch)
+    average_cores = _sharing_cores()
+    sum_cores = _sharing_cores(per_token=True)
+    for core, summed in zip(average_cores, sum_cores):
+        summed.load_state_dict(core.state_dict())
+    inputs = _forward_inputs(3)
+    average_outputs = _forward_cores(average_cores, inputs)
+    sum_outputs = _forward_cores(sum_cores, inputs)
+    assert len(records) == 6
+    for average, summed in zip(records[:3], records[3:]):
+        torch.testing.assert_close(average["loss"], summed["loss"])
+    sum(output.sum() for output in average_outputs).backward()
+    sum(output.sum() for output in sum_outputs).backward()
+    for average, summed in zip(average_cores, sum_cores):
+        for parameter, summed_parameter in zip(
+            average.indexer.parameters(), summed.indexer.parameters()
+        ):
+            torch.testing.assert_close(
+                summed_parameter.grad, parameter.grad * 14, atol=3e-6, rtol=3e-5
+            )
+
+
+@pytest.mark.parametrize("evaluation", [False, True])
+def test_evaluation_and_no_grad_do_not_attach_auxiliary_loss(monkeypatch, evaluation):
+    records = _record_losses(monkeypatch)
+    cores = _sharing_cores(reuse=True)
+    inputs = _forward_inputs(len(cores))
+    if evaluation:
+        for core in cores:
+            core.eval()
+        outputs = _forward_cores(cores, inputs)
+        sum(output.square().mean() for output in outputs).backward()
+        assert all(
+            parameter.grad is None
+            for core in cores
+            if core.indexer is not None
+            for parameter in core.indexer.parameters()
+        )
+    else:
+        with torch.no_grad():
+            outputs = _forward_cores(cores, inputs)
+        assert all(not output.requires_grad for output in outputs)
+    assert not records
