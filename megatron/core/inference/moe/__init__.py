@@ -5,6 +5,7 @@ import enum
 from .fused_moe import (
     HAVE_TE_GROUPED_MXFP8,
     ActivationType,
+    TEBF16GroupedWeight,
     is_te_mxfp8_weight,
     mcore_fused_moe,
     prepare_te_mxfp8_batch_invariant_weight,

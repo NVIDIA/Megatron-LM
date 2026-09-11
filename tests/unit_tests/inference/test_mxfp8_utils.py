@@ -1075,7 +1075,7 @@ class TestTENativeGroupedMxfp8:
         workspace_setup = torch.empty(1, dtype=torch.uint8)
         workspace_cublas = torch.empty(1, dtype=torch.uint8)
 
-        fused_moe._te_mxfp8_batch_invariant_grouped_gemm(
+        fused_moe._te_batch_invariant_grouped_gemm(
             [object()], object(), object(), alpha, beta, workspace_setup, workspace_cublas
         )
 
@@ -1089,7 +1089,7 @@ class TestTENativeGroupedMxfp8:
         import megatron.core.inference.moe.fused_moe as fused_moe
 
         num_experts, num_chunks = 2, 3
-        rows_per_chunk = num_experts * fused_moe._TE_MXFP8_BATCH_INVARIANT_CHUNK_SIZE
+        rows_per_chunk = num_experts * fused_moe._TE_BATCH_INVARIANT_CHUNK_SIZE
         x = torch.zeros(num_chunks * rows_per_chunk, 4, device="cuda", dtype=torch.bfloat16)
         first_dims = torch.full((num_experts,), 256, device="cuda", dtype=torch.int64)
         setup_allocations = 0
@@ -1122,9 +1122,9 @@ class TestTENativeGroupedMxfp8:
 
         monkeypatch.setattr(fused_moe, "get_grouped_gemm_setup_workspace_size", setup_size)
         monkeypatch.setattr(fused_moe, "get_unrestricted_te_workspace_size_bytes", cublas_size)
-        monkeypatch.setattr(fused_moe, "_te_mxfp8_batch_invariant_grouped_gemm", record_launch)
+        monkeypatch.setattr(fused_moe, "_te_batch_invariant_grouped_gemm", record_launch)
 
-        output = fused_moe._te_mxfp8_batch_invariant_grouped_mm(
+        output = fused_moe._te_batch_invariant_grouped_mm(
             x, [object()] * num_experts, first_dims, num_chunks=num_chunks
         )
 
@@ -1193,13 +1193,13 @@ class TestTENativeGroupedMxfp8:
         fc2_bf16, fc2_mxfp8 = self._quantized_weights(num_experts, hidden_size)
 
         captured_splits = []
-        original_grouped_mm = fused_moe._te_mxfp8_grouped_mm
+        original_grouped_mm = fused_moe._te_grouped_mm
 
         def record_splits(x, weight, first_dims):
             captured_splits.append(first_dims.clone())
             return original_grouped_mm(x, weight, first_dims)
 
-        monkeypatch.setattr(fused_moe, "_te_mxfp8_grouped_mm", record_splits)
+        monkeypatch.setattr(fused_moe, "_te_grouped_mm", record_splits)
         actual = fused_moe.mcore_fused_moe(
             hidden,
             probs,
@@ -1485,11 +1485,16 @@ class TestTENativeGroupedMxfp8:
 
         assert root.dense.weight is original_dense_weight
 
-    def test_single_grouped_weight_representation(self, monkeypatch):
+    @pytest.mark.parametrize("mxfp8", [False, True])
+    def test_single_grouped_weight_representation(self, monkeypatch, mxfp8):
         import transformer_engine.pytorch as te
         from transformer_engine.common.recipe import MXFP8BlockScaling
 
-        from megatron.core.inference.moe.fused_moe import ActivationType, mcore_fused_moe
+        from megatron.core.inference.moe.fused_moe import (
+            ActivationType,
+            TEBF16GroupedWeight,
+            mcore_fused_moe,
+        )
         from megatron.core.transformer.moe.experts import InferenceGroupedMLP
 
         # TE gates the experimental single-parameter representation behind this flag.
@@ -1497,7 +1502,7 @@ class TestTENativeGroupedMxfp8:
         monkeypatch.setenv("NVTE_GROUPED_LINEAR_SINGLE_PARAM", "1")
         torch.manual_seed(12)
         num_tokens, hidden_size, num_experts = 19, 128, 4
-        with te.fp8_model_init(enabled=True, recipe=MXFP8BlockScaling()):
+        with te.fp8_model_init(enabled=mxfp8, recipe=MXFP8BlockScaling()):
             fc1 = te.GroupedLinear(
                 num_experts,
                 hidden_size,
@@ -1521,7 +1526,7 @@ class TestTENativeGroupedMxfp8:
         grouped_mlp.num_local_experts = num_experts
         grouped_mlp.linear_fc1 = fc1
         grouped_mlp.linear_fc2 = fc2
-        InferenceGroupedMLP._build_te_mxfp8_weights(grouped_mlp)
+        InferenceGroupedMLP._build_te_inference_weights(grouped_mlp)
 
         hidden = torch.randn(num_tokens, hidden_size, device="cuda", dtype=torch.bfloat16)
         probs = torch.rand(num_tokens, 2, device="cuda", dtype=torch.float32)
@@ -1542,8 +1547,13 @@ class TestTENativeGroupedMxfp8:
             routing_map,
         )
 
-        assert grouped_mlp._fc1_weight is fc1.weight
-        assert grouped_mlp._fc2_weight is fc2.weight
+        if mxfp8:
+            assert grouped_mlp._fc1_weight is fc1.weight
+            assert grouped_mlp._fc2_weight is fc2.weight
+        else:
+            assert isinstance(grouped_mlp._fc1_weight, TEBF16GroupedWeight)
+            assert grouped_mlp._fc1_weight.payload is fc1.weight
+            assert grouped_mlp._fc2_weight.payload is fc2.weight
         assert output.shape == hidden.shape
         assert torch.isfinite(output).all()
 

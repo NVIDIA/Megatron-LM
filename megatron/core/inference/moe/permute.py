@@ -452,7 +452,7 @@ def permute_tokens(
 
 
 @triton.jit
-def _permute_tokens_for_te_mxfp8_batch_invariant_kernel(
+def _permute_tokens_for_te_batch_invariant_kernel(
     hidden_ptr,  # [max_tokens, hidden_dim] input hidden states
     probs_ptr,  # [max_tokens, topk] routing probabilities
     routing_map_ptr,  # [max_tokens, topk] global expert assignments
@@ -522,7 +522,7 @@ def _permute_tokens_for_te_mxfp8_batch_invariant_kernel(
         tl.store(n_used_ptr, output_rows)
 
 
-def permute_tokens_for_te_mxfp8_batch_invariant(
+def permute_tokens_for_te_batch_invariant(
     hidden_states: torch.Tensor,
     probs: torch.Tensor,
     routing_map: torch.Tensor,
@@ -532,7 +532,7 @@ def permute_tokens_for_te_mxfp8_batch_invariant(
     num_chunks: int,
     chunk_size: int = 256,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Permute into fixed token/expert rows for batch-invariant TE MXFP8 GEMMs.
+    """Permute into fixed token/expert rows for batch-invariant TE grouped GEMMs.
 
     Args:
         hidden_states: Input hidden states of shape ``[max_tokens, hidden_dim]``.
@@ -552,7 +552,7 @@ def permute_tokens_for_te_mxfp8_batch_invariant(
         zero hidden states/probabilities and a ``-1`` token map.
     """
     if not HAVE_TRITON:
-        raise RuntimeError("Batch-invariant TE MXFP8 permutation requires Triton.")
+        raise RuntimeError("Batch-invariant TE grouped permutation requires Triton.")
     if hidden_states.ndim != 2 or probs.ndim != 2 or routing_map.ndim != 2:
         raise ValueError("Expected 2-D hidden-state, probability, and routing tensors.")
     if probs.shape != routing_map.shape or probs.shape[0] != hidden_states.shape[0]:
@@ -582,7 +582,7 @@ def permute_tokens_for_te_mxfp8_batch_invariant(
     first_dims = torch.empty(num_local_experts, dtype=torch.int64, device=probs.device)
     n_used = torch.empty(1, dtype=torch.int32, device=probs.device)
     block_h = min(triton.next_power_of_2(hidden_dim), 1024)
-    _permute_tokens_for_te_mxfp8_batch_invariant_kernel[(output_rows,)](
+    _permute_tokens_for_te_batch_invariant_kernel[(output_rows,)](
         hidden_states,
         probs,
         routing_map,

@@ -1,7 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Fused MoE: permute -> FC1 -> activation -> FC2 -> unpermute.
 
-Supports BF16, MCore MXFP8, and native Transformer Engine MXFP8 weights.
+Supports BF16, MCore MXFP8, and native Transformer Engine BF16/MXFP8 weights.
 All permutation logic is handled internally — callers invoke a single function.
 """
 
@@ -20,7 +20,7 @@ from megatron.core.inference.moe.activations import (
 from megatron.core.inference.moe.permute import (
     permute_and_quantize_mxfp8,
     permute_tokens,
-    permute_tokens_for_te_mxfp8_batch_invariant,
+    permute_tokens_for_te_batch_invariant,
     unpermute_tokens,
 )
 from megatron.core.inference.quantization.mxfp8_quantize import MXFP8_SCALE_ROW_BLOCK
@@ -78,7 +78,7 @@ except (ImportError, AttributeError):
 
 
 _TE_MXFP8_ACTIVATION_QUANTIZER = None
-_TE_MXFP8_BATCH_INVARIANT_CHUNK_SIZE = 256
+_TE_BATCH_INVARIANT_CHUNK_SIZE = 256
 _TE_MXFP8_BATCH_INVARIANT_WEIGHT_CACHE = "_mcore_batch_invariant_gemm_weight"
 
 
@@ -87,6 +87,21 @@ class ActivationType(Enum):
 
     SQUARED_RELU = "squared_relu"
     SWIGLU = "swiglu"
+
+
+class TEBF16GroupedWeight:
+    """Non-owning marker for a native TE grouped-linear BF16 weight.
+
+    The payload is either TE's discrete per-expert parameter list or its single
+    ``GroupedTensor`` parameter. The marker lets :func:`mcore_fused_moe` select
+    TE's device-metadata grouped GEMM without confusing an ordinary stacked BF16
+    tensor with native TE storage.
+    """
+
+    __slots__ = ("payload",)
+
+    def __init__(self, payload):
+        self.payload = payload
 
 
 def _bf16_grouped_mm(
@@ -138,6 +153,17 @@ def is_te_mxfp8_weight(weight: object) -> bool:
     return _unwrap_te_mxfp8_weight(weight) is not None
 
 
+def _weight_format(weight) -> str:
+    """Classify an expert weight representation for dispatch validation."""
+    if isinstance(weight, TEBF16GroupedWeight):
+        return "te_bf16"
+    if is_te_mxfp8_weight(weight):
+        return "te_mxfp8"
+    if isinstance(weight, MXFP8Tensor):
+        return "mcore_mxfp8"
+    return "bf16"
+
+
 def _get_te_mxfp8_activation_quantizer():
     """Create the row-wise TE MXFP8 quantizer used by grouped activations."""
     global _TE_MXFP8_ACTIVATION_QUANTIZER
@@ -164,6 +190,36 @@ def _normalize_te_mxfp8_weight(weight):
     return normalized
 
 
+def _normalize_te_bf16_weight(weight: TEBF16GroupedWeight):
+    """Validate and return a native TE grouped-linear BF16 payload."""
+    if not isinstance(weight, TEBF16GroupedWeight):
+        raise TypeError(f"Expected TEBF16GroupedWeight, got {type(weight).__name__}.")
+    payload = weight.payload
+    if isinstance(payload, (list, tuple)):
+        if not payload or any(
+            not isinstance(item, torch.Tensor) or item.dtype != torch.bfloat16 for item in payload
+        ):
+            raise TypeError("All discrete TE expert weights must be BF16 tensors.")
+        return list(payload)
+    if (
+        isinstance(payload, TEGroupedTensor)
+        and not is_te_mxfp8_weight(payload)
+        and payload.dtype == torch.bfloat16
+    ):
+        return payload
+    raise TypeError(
+        "A native TE BF16 grouped weight must be a discrete tensor list or an "
+        f"unquantized GroupedTensor, got {type(payload).__name__}."
+    )
+
+
+def _normalize_te_weight(weight):
+    """Return a native TE grouped weight and whether it uses MXFP8 storage."""
+    if isinstance(weight, TEBF16GroupedWeight):
+        return _normalize_te_bf16_weight(weight), False
+    return _normalize_te_mxfp8_weight(weight), True
+
+
 def _te_weight_out_features(normalized) -> int:
     """Get the common GEMM output width of a normalized TE weight without device metadata."""
     if isinstance(normalized, list):
@@ -179,7 +235,68 @@ def _te_weight_out_features(normalized) -> int:
     raise ValueError("Unable to infer the output width of the TE grouped expert weight.")
 
 
-def _te_mxfp8_batch_invariant_grouped_gemm(
+def _te_weight_num_experts(normalized) -> int:
+    """Return the number of experts represented by a normalized TE weight."""
+    return len(normalized) if isinstance(normalized, list) else normalized.num_tensors
+
+
+def _te_grouped_bf16_tensor(
+    data: torch.Tensor, first_dims: torch.Tensor, tensor_offsets: torch.Tensor | None = None
+) -> TEGroupedTensor:
+    """Wrap contiguous BF16 rows in a device-metadata TE ``GroupedTensor``."""
+    rows, features = data.shape
+    if tensor_offsets is None:
+        tensor_offsets = torch.cat(
+            (first_dims.new_zeros(1), torch.cumsum(first_dims[:-1] * features, dim=0))
+        )
+    return TEGroupedTensor(
+        shape=(rows, features),
+        dtype=torch.bfloat16,
+        num_tensors=first_dims.numel(),
+        shapes=None,
+        quantizer=None,
+        data=data.reshape(-1),
+        first_dims=first_dims,
+        tensor_offsets=tensor_offsets,
+        requires_grad=False,
+    )
+
+
+def _te_grouped_mm(x_bf16: torch.Tensor, weight, first_dims: torch.Tensor) -> torch.Tensor:
+    """Native TE BF16/MXFP8 grouped GEMM initialized from CUDA split metadata."""
+    assert HAVE_TE_GROUPED_MXFP8, (
+        "Native TE device-metadata grouped GEMM requires Transformer Engine's "
+        "GroupedTensor APIs."
+    )
+    assert x_bf16.dtype == torch.bfloat16, f"Expected bf16 input, got {x_bf16.dtype}"
+    assert x_bf16.is_cuda and first_dims.is_cuda, "TE grouped GEMM requires CUDA tensors."
+    assert first_dims.dtype == torch.int64, f"Expected int64 expert splits, got {first_dims.dtype}"
+
+    normalized_weight, is_mxfp8 = _normalize_te_weight(weight)
+    num_experts = first_dims.numel()
+    weight_experts = _te_weight_num_experts(normalized_weight)
+    if weight_experts != num_experts:
+        raise ValueError(
+            f"Expert split count ({num_experts}) does not match weight count ({weight_experts})."
+        )
+
+    grouped_input = (
+        tex.group_quantize(x_bf16, _get_te_mxfp8_activation_quantizer(), num_experts, first_dims)
+        if is_mxfp8
+        else _te_grouped_bf16_tensor(x_bf16, first_dims)
+    )
+    out_features = _te_weight_out_features(normalized_weight)
+    output_data = torch.empty(
+        x_bf16.shape[0], out_features, dtype=torch.bfloat16, device=x_bf16.device
+    )
+    grouped_output = _te_grouped_bf16_tensor(output_data, first_dims)
+    general_grouped_gemm_for_grouped_tensor(
+        normalized_weight, grouped_input, grouped_output, layout="TN"
+    )
+    return grouped_output.rowwise_data.view(x_bf16.shape[0], out_features)
+
+
+def _te_batch_invariant_grouped_gemm(
     weight,
     grouped_input,
     grouped_output,
@@ -188,12 +305,12 @@ def _te_mxfp8_batch_invariant_grouped_gemm(
     workspace_setup: torch.Tensor,
     workspace_cublas: torch.Tensor,
 ) -> None:
-    """Launch grouped MXFP8 GEMM without inheriting te_native's starved workspace.
+    """Launch grouped TE GEMM without inheriting te_native's starved workspace.
 
     The te_native batch-invariant backend restricts ordinary TE GEMMs to a 1 KiB
     workspace to disqualify split-K algorithms. TE's device-metadata grouped
-    MXFP8 kernel requires its normal cuBLASLt workspace even when every GEMM has
-    a fixed M. Recover the unrestricted size and call the device-metadata API
+    kernel requires its normal cuBLASLt workspace even when every GEMM has a
+    fixed M. Recover the unrestricted size and call the device-metadata API
     directly for this fixed-shape path only.
     """
     sm_count = _get_te_sm_count()
@@ -295,61 +412,10 @@ def refresh_te_mxfp8_batch_invariant_weight(weight) -> bool:
     return True
 
 
-def _te_mxfp8_grouped_mm(x_bf16: torch.Tensor, weight, first_dims: torch.Tensor) -> torch.Tensor:
-    """TE MXFP8 grouped GEMM initialized entirely from CUDA split metadata."""
-    assert HAVE_TE_GROUPED_MXFP8, (
-        "Native TE MXFP8 grouped GEMM requires Transformer Engine's device-metadata "
-        "group_quantize and grouped-GEMM APIs."
-    )
-    assert x_bf16.dtype == torch.bfloat16, f"Expected bf16 input, got {x_bf16.dtype}"
-    assert x_bf16.is_cuda and first_dims.is_cuda, "TE grouped MXFP8 requires CUDA tensors."
-    assert first_dims.dtype == torch.int64, f"Expected int64 expert splits, got {first_dims.dtype}"
-
-    normalized_weight = _normalize_te_mxfp8_weight(weight)
-    num_experts = first_dims.numel()
-    weight_experts = (
-        len(normalized_weight)
-        if isinstance(normalized_weight, list)
-        else normalized_weight.num_tensors
-    )
-    if weight_experts != num_experts:
-        raise ValueError(
-            f"Expert split count ({num_experts}) does not match weight count ({weight_experts})."
-        )
-
-    grouped_input = tex.group_quantize(
-        x_bf16, _get_te_mxfp8_activation_quantizer(), num_experts, first_dims
-    )
-    out_features = _te_weight_out_features(normalized_weight)
-    # tensor_offsets holds each expert's output start in the flat storage. Build it
-    # with CUDA ops so changing routing counts does not synchronize or invalidate a graph.
-    tensor_offsets = torch.cat(
-        (first_dims.new_zeros(1), torch.cumsum(first_dims[:-1] * out_features, dim=0))
-    )
-    output_data = torch.empty(
-        x_bf16.shape[0] * out_features, dtype=torch.bfloat16, device=x_bf16.device
-    )
-    grouped_output = TEGroupedTensor(
-        shape=(x_bf16.shape[0], out_features),
-        dtype=torch.bfloat16,
-        num_tensors=num_experts,
-        shapes=None,
-        quantizer=None,
-        data=output_data,
-        first_dims=first_dims,
-        tensor_offsets=tensor_offsets,
-        requires_grad=False,
-    )
-    general_grouped_gemm_for_grouped_tensor(
-        normalized_weight, grouped_input, grouped_output, layout="TN"
-    )
-    return grouped_output.rowwise_data.view(x_bf16.shape[0], out_features)
-
-
-def _te_mxfp8_batch_invariant_grouped_mm(
+def _te_batch_invariant_grouped_mm(
     x_bf16: torch.Tensor, weight, first_dims: torch.Tensor, *, num_chunks: int
 ) -> torch.Tensor:
-    """Run identical fixed-M grouped GEMMs for each expert-token chunk.
+    """Run identical fixed-M TE grouped GEMMs for each expert-token chunk.
 
     ``x_bf16`` is chunk-major with ``num_experts * 256`` rows per chunk.
     Launching chunks separately keeps an expert at the same grouped-GEMM index;
@@ -357,35 +423,31 @@ def _te_mxfp8_batch_invariant_grouped_mm(
     when that expert's data moves to another group index.
     """
     assert x_bf16.dtype == torch.bfloat16, f"Expected bf16 input, got {x_bf16.dtype}"
-    normalized_weight = _normalize_te_mxfp8_weight(weight)
-    normalized_weight = _get_te_mxfp8_batch_invariant_weight(normalized_weight)
+    normalized_weight, is_mxfp8 = _normalize_te_weight(weight)
+    if is_mxfp8:
+        normalized_weight = _get_te_mxfp8_batch_invariant_weight(normalized_weight)
     num_experts = first_dims.numel()
-    weight_experts = (
-        len(normalized_weight)
-        if isinstance(normalized_weight, list)
-        else normalized_weight.num_tensors
-    )
+    weight_experts = _te_weight_num_experts(normalized_weight)
     if weight_experts != num_experts:
         raise ValueError(
             f"Expert split count ({num_experts}) does not match weight count ({weight_experts})."
         )
-    rows_per_chunk = num_experts * _TE_MXFP8_BATCH_INVARIANT_CHUNK_SIZE
+    rows_per_chunk = num_experts * _TE_BATCH_INVARIANT_CHUNK_SIZE
     if x_bf16.shape[0] != num_chunks * rows_per_chunk:
         raise ValueError(
-            "Batch-invariant TE MXFP8 input has an invalid chunked row count: "
+            "Batch-invariant TE input has an invalid chunked row count: "
             f"got {x_bf16.shape[0]}, expected {num_chunks * rows_per_chunk}."
         )
 
     out_features = _te_weight_out_features(normalized_weight)
     output_data = torch.empty(
-        x_bf16.shape[0] * out_features, dtype=torch.bfloat16, device=x_bf16.device
+        x_bf16.shape[0], out_features, dtype=torch.bfloat16, device=x_bf16.device
     )
-    tensor_offsets = torch.arange(num_experts, dtype=first_dims.dtype, device=first_dims.device) * (
-        _TE_MXFP8_BATCH_INVARIANT_CHUNK_SIZE * out_features
-    )
+    expert_indices = torch.arange(num_experts, dtype=first_dims.dtype, device=first_dims.device)
+    input_offsets = expert_indices * (_TE_BATCH_INVARIANT_CHUNK_SIZE * x_bf16.shape[1])
+    output_offsets = expert_indices * (_TE_BATCH_INVARIANT_CHUNK_SIZE * out_features)
     alpha = torch.ones(num_experts, dtype=torch.float32, device=x_bf16.device)
     beta = torch.zeros(num_experts, dtype=torch.float32, device=x_bf16.device)
-    output_rows_per_chunk = rows_per_chunk * out_features
     # TE's device-metadata grouped GEMM and grouped quantization both execute on
     # the caller's CUDA stream. Reuse one workspace across the serialized chunk
     # launches, matching TE's public grouped-GEMM wrapper. Allocating one 32 MiB
@@ -400,22 +462,18 @@ def _te_mxfp8_batch_invariant_grouped_mm(
     for chunk in range(num_chunks):
         row_start = chunk * rows_per_chunk
         row_end = row_start + rows_per_chunk
-        grouped_input = tex.group_quantize(
-            x_bf16[row_start:row_end], _get_te_mxfp8_activation_quantizer(), num_experts, first_dims
+        input_chunk = x_bf16[row_start:row_end]
+        grouped_input = (
+            tex.group_quantize(
+                input_chunk, _get_te_mxfp8_activation_quantizer(), num_experts, first_dims
+            )
+            if is_mxfp8
+            else _te_grouped_bf16_tensor(input_chunk, first_dims, input_offsets)
         )
-        output_start = chunk * output_rows_per_chunk
-        grouped_output = TEGroupedTensor(
-            shape=(rows_per_chunk, out_features),
-            dtype=torch.bfloat16,
-            num_tensors=num_experts,
-            shapes=None,
-            quantizer=None,
-            data=output_data[output_start : output_start + output_rows_per_chunk],
-            first_dims=first_dims,
-            tensor_offsets=tensor_offsets,
-            requires_grad=False,
+        grouped_output = _te_grouped_bf16_tensor(
+            output_data[row_start:row_end], first_dims, output_offsets
         )
-        _te_mxfp8_batch_invariant_grouped_gemm(
+        _te_batch_invariant_grouped_gemm(
             normalized_weight,
             grouped_input,
             grouped_output,
@@ -424,7 +482,7 @@ def _te_mxfp8_batch_invariant_grouped_mm(
             workspace_setup,
             workspace_cublas,
         )
-    return output_data.view(x_bf16.shape[0], out_features)
+    return output_data
 
 
 def _get_activation_func(
@@ -478,18 +536,18 @@ def mcore_fused_moe(
     """Fused MoE: permute -> pad -> FC1 -> activation -> FC2 -> unpad -> unpermute.
 
     MCore MXFP8 weights use fused Triton permute/activation + quantization kernels
-    unless disable_fused_quant_kernels=True. Native TE MXFP8 weights use TE's
-    device-metadata grouped quantization and grouped GEMM kernels; their expert
-    segments are zero-padded to 256 rows.
+    unless disable_fused_quant_kernels=True. Native TE BF16 and MXFP8 weights use
+    TE's device-metadata grouped GEMM kernels. MXFP8 segments and all native TE
+    batch-invariant segments are zero-padded to 256 rows.
 
     Args:
         hidden_states: [max_tokens, hidden_size] BF16 input. max_tokens =
             max_local_tokens * ep_size; only the first valid_tokens rows are valid.
         probs: [max_tokens, topk] routing probabilities.
-        fc1_weight: stacked BF16/MCore MXFP8 weight, a list of native TE MXFP8
-            expert weights, or a native TE MXFP8 GroupedTensor.
+        fc1_weight: stacked BF16/MCore MXFP8 weight, native TE MXFP8 expert
+            weights, or a :class:`TEBF16GroupedWeight`.
         fc2_weight: weight for FC2 (same representation as fc1_weight).
-        activation_type: ActivationType enum (SQUARED_RELU).
+        activation_type: Expert activation type.
         num_local_experts: number of experts on this rank.
         local_expert_start: first global expert index on this rank.
         valid_tokens: scalar int32 CUDA tensor holding the number of valid tokens this
@@ -498,7 +556,7 @@ def mcore_fused_moe(
         routing_map: [max_tokens, topk] int expert assignments.
         disable_fused_quant_kernels: if True, disable fused permute+quantize and
             activation+quantize kernels for MCore MXFP8, using separate launches
-            instead. Useful for debugging. Ignored for BF16 and native TE MXFP8.
+            instead. Useful for debugging. Ignored for BF16 and native TE weights.
         out: optional pre-allocated output buffer. If provided, unpermute writes
             directly into this tensor (e.g. the RSV symmetric buffer), avoiding a
             separate copy before reduce-scatter.
@@ -515,26 +573,30 @@ def mcore_fused_moe(
     ), f"mcore_fused_moe requires bf16 input, got {hidden_states.dtype}"
 
     max_tokens = hidden_states.shape[0]
-    use_mcore_mxfp8 = isinstance(fc1_weight, MXFP8Tensor)
-    use_te_mxfp8 = is_te_mxfp8_weight(fc1_weight)
+    weight_format = _weight_format(fc1_weight)
+    fc2_weight_format = _weight_format(fc2_weight)
+    if weight_format != fc2_weight_format:
+        raise TypeError(
+            f"FC1 and FC2 weight formats must match, got {weight_format} and {fc2_weight_format}."
+        )
+    use_mcore_mxfp8 = weight_format == "mcore_mxfp8"
+    use_te_mxfp8 = weight_format == "te_mxfp8"
+    use_te_bf16 = weight_format == "te_bf16"
     use_mxfp8 = use_mcore_mxfp8 or use_te_mxfp8
-    if use_te_mxfp8 != is_te_mxfp8_weight(fc2_weight):
-        raise TypeError("FC1 and FC2 must either both use native TE MXFP8 weights or neither.")
+    use_te_grouped = use_te_bf16 or use_te_mxfp8
     # Fused Triton quant kernels only apply to the MCore MXFP8 path.
     use_fused_quant = use_mcore_mxfp8 and not disable_fused_quant_kernels
     batch_invariant_mode = batch_invariant.enabled()
-    use_te_mxfp8_batch_invariant = batch_invariant_mode and use_te_mxfp8
+    use_te_batch_invariant = batch_invariant_mode and use_te_grouped
 
-    if use_te_mxfp8_batch_invariant:
+    if use_te_batch_invariant:
         # Launch each 256-row token chunk separately so an expert always has the same
         # grouped-GEMM index and M, independent of routing counts and graph bucket size.
         num_te_chunks = max(
-            1,
-            (max_tokens + _TE_MXFP8_BATCH_INVARIANT_CHUNK_SIZE - 1)
-            // _TE_MXFP8_BATCH_INVARIANT_CHUNK_SIZE,
+            1, (max_tokens + _TE_BATCH_INVARIANT_CHUNK_SIZE - 1) // _TE_BATCH_INVARIANT_CHUNK_SIZE
         )
-        mm_fn = partial(_te_mxfp8_batch_invariant_grouped_mm, num_chunks=num_te_chunks)
-        expert_alignment = _TE_MXFP8_BATCH_INVARIANT_CHUNK_SIZE
+        mm_fn = partial(_te_batch_invariant_grouped_mm, num_chunks=num_te_chunks)
+        expert_alignment = _TE_BATCH_INVARIANT_CHUNK_SIZE
     elif batch_invariant_mode:
         assert not use_mcore_mxfp8, (
             "batch_invariant_mode does not support MCore MXFP8 weights. Use native "
@@ -542,15 +604,14 @@ def mcore_fused_moe(
         )
         mm_fn = batch_invariant.grouped_mm
         expert_alignment = batch_invariant.grouped_mm_alignment()
-    elif use_te_mxfp8:
-        assert HAVE_TE_GROUPED_MXFP8, (
-            "Native TE MXFP8 grouped GEMM requires Transformer Engine's device-metadata "
-            "group_quantize and grouped-GEMM APIs."
-        )
-        mm_fn = _te_mxfp8_grouped_mm
+    elif use_te_grouped:
+        assert (
+            HAVE_TE_GROUPED_MXFP8
+        ), "Native TE grouped GEMM requires Transformer Engine's device-metadata APIs."
+        mm_fn = _te_grouped_mm
         # TE's device-initialized MXFP8 grouped kernels currently require every
         # non-empty expert segment to be a multiple of 256 rows.
-        expert_alignment = 256
+        expert_alignment = 256 if use_te_mxfp8 else 16
     elif use_mcore_mxfp8:
         assert (
             HAVE_SCALED_GMM
@@ -577,7 +638,7 @@ def mcore_fused_moe(
     offs = None
     first_dims = None
     n_used = None
-    if use_te_mxfp8_batch_invariant:
+    if use_te_batch_invariant:
         (
             hidden_states,
             permuted_probs,
@@ -585,7 +646,7 @@ def mcore_fused_moe(
             batch_invariant_inverse_map,
             first_dims,
             n_used,
-        ) = permute_tokens_for_te_mxfp8_batch_invariant(
+        ) = permute_tokens_for_te_batch_invariant(
             hidden_states,
             probs,
             routing_map,
@@ -593,7 +654,7 @@ def mcore_fused_moe(
             num_local_experts,
             valid_tokens,
             num_te_chunks,
-            chunk_size=_TE_MXFP8_BATCH_INVARIANT_CHUNK_SIZE,
+            chunk_size=_TE_BATCH_INVARIANT_CHUNK_SIZE,
         )
     elif use_fused_quant:
         # Fused permute + MXFP8 quantize: single kernel produces MXFP8Tensor
@@ -617,7 +678,7 @@ def mcore_fused_moe(
             valid_tokens,
             alignment=expert_alignment,
             row_alignment=MXFP8_SCALE_ROW_BLOCK if use_mxfp8 else 1,
-            zero_padding=use_te_mxfp8,
+            zero_padding=use_te_grouped,
             return_batch_invariant_inverse_map=batch_invariant_mode,
         )
         hidden_states, permuted_probs, permutation_map, offs = permuted[:4]
@@ -630,11 +691,11 @@ def mcore_fused_moe(
     # produces MXFP8Tensor directly).
     if use_mcore_mxfp8 and not isinstance(hidden_states, MXFP8Tensor):
         hidden_states = MXFP8Tensor.from_bf16(hidden_states, backend="triton")
-    if not use_te_mxfp8_batch_invariant:
+    if not use_te_batch_invariant:
         assert offs is not None
         n_used = offs[-1:]
-    if use_te_mxfp8:
-        if not use_te_mxfp8_batch_invariant:
+    if use_te_grouped:
+        if not use_te_batch_invariant:
             assert offs is not None
             first_dims = torch.cat((offs[:1], offs[1:] - offs[:-1])).to(torch.int64)
         assert first_dims is not None
@@ -652,7 +713,7 @@ def mcore_fused_moe(
                 "the gated form (SiTU-GLU) has no inference kernel yet."
             )
             activation_out = batch_invariant.swiglu_with_probs(
-                fc1_output, permutation_map, n_used, permuted_probs, zero_padding=use_te_mxfp8
+                fc1_output, permutation_map, n_used, permuted_probs, zero_padding=use_te_grouped
             )
         else:
             activation_out = batch_invariant.squared_relu_with_probs(
@@ -661,17 +722,17 @@ def mcore_fused_moe(
                 n_used,
                 permuted_probs,
                 activation_clamp_scale,
-                zero_padding=use_te_mxfp8,
+                zero_padding=use_te_grouped,
             )
     else:
-        if use_te_mxfp8:
+        if use_te_grouped:
             activation_out = activation_func(fc1_output, permutation_map, n_used, zero_padding=True)
         else:
             activation_out = activation_func(fc1_output, permutation_map, n_used)
     # Fused activation+quant returns MXFP8Tensor; otherwise quantize separately.
     if use_mcore_mxfp8 and not isinstance(activation_out, MXFP8Tensor):
         activation_out = MXFP8Tensor.from_bf16(activation_out, backend="triton")
-    if use_te_mxfp8:
+    if use_te_grouped:
         fc2_output = mm_fn(activation_out, fc2_weight, first_dims)
     else:
         fc2_output = mm_fn(activation_out, fc2_weight, offs)

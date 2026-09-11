@@ -373,9 +373,9 @@ class TestPermuteTokens:
         splits = torch.cat((offsets[:1], offsets[1:] - offsets[:-1]))
         assert splits.tolist() == [256, 256, 256, 0]
 
-    def test_te_mxfp8_batch_invariant_layout(self):
+    def test_te_batch_invariant_layout(self):
         """The direct TE permutation fixes rows and zeroes non-local, invalid, and tail rows."""
-        from megatron.core.inference.moe.permute import permute_tokens_for_te_mxfp8_batch_invariant
+        from megatron.core.inference.moe.permute import permute_tokens_for_te_batch_invariant
 
         max_tokens, valid_token_count, hidden_dim = 270, 263, 70
         topk, local_expert_start, num_local_experts = 3, 4, 3
@@ -387,7 +387,7 @@ class TestPermuteTokens:
         route_offsets = torch.tensor([0, 3, 5], dtype=torch.int64)[None, :]
         routing_cpu = (tokens + route_offsets) % 8
 
-        actual = permute_tokens_for_te_mxfp8_batch_invariant(
+        actual = permute_tokens_for_te_batch_invariant(
             hidden_cpu.cuda(),
             probs_cpu.cuda(),
             routing_cpu.cuda(),
@@ -424,9 +424,9 @@ class TestPermuteTokens:
         assert n_used.item() == output_rows
 
     @pytest.mark.launch_on_gb200
-    def test_te_mxfp8_batch_invariant_layout_uses_64_bit_offsets(self):
+    def test_te_batch_invariant_layout_uses_64_bit_offsets(self):
         """Qwen3-30B's 16K-token buffer crosses the 32-bit flat-offset boundary."""
-        from megatron.core.inference.moe.permute import permute_tokens_for_te_mxfp8_batch_invariant
+        from megatron.core.inference.moe.permute import permute_tokens_for_te_batch_invariant
 
         # This is the per-GPU layout for a 4-way EP reproduction of Qwen3-30B's
         # 16K-token inference buffer. The output contains exactly 2**32 BF16
@@ -439,7 +439,7 @@ class TestPermuteTokens:
         routing_map = torch.full((max_tokens, 1), -1, device="cuda", dtype=torch.int64)
         routing_map[0, 0] = 0
 
-        actual = permute_tokens_for_te_mxfp8_batch_invariant(
+        actual = permute_tokens_for_te_batch_invariant(
             hidden, probs, routing_map, 0, num_local_experts, _vt(1), num_chunks, chunk_size
         )
         output_hidden, output_probs, output_map, inverse_map, first_dims, n_used = actual
