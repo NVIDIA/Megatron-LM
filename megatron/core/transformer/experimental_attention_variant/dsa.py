@@ -1626,7 +1626,7 @@ class DSAIndexer(MegatronModule):
             self.index_topk,
             mask,
             use_relu=self.config.dsa_indexer_scoring_relu,
-            use_cudnn=getattr(self.config, 'dsa_use_cudnn', False),
+            use_cudnn=getattr(self.config, 'dsa_kernel_backend', 'none') == 'cudnn',
         )
 
         return index_scores, topk_indices
@@ -2318,7 +2318,7 @@ class DSAttention(MegatronModule):
                 query_valid_rows,
                 self.config.calculate_per_token_loss,
                 self.config.dsa_indexer_scoring_relu,
-                getattr(self.config, 'dsa_use_cudnn', False),
+                getattr(self.config, 'dsa_kernel_backend', 'none') == 'cudnn',
             )
 
         fused_output = None

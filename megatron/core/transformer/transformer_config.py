@@ -355,16 +355,6 @@ class TransformerConfig(ModelParallelConfig):
 
     dsa_indexer_skip_topk_offset: int = 0
     """Layer offset for DSA cross-layer top-k sharing."""
-    dsa_min_memory_backend: Literal['reference', 'triton-min-memory', 'torch-min-memory'] = (
-        'reference'
-    )
-    """Which min-memory DSA-over-GQA implementation to use.
-
-    Distinct from dsa_kernel_backend, which selects the fused kernel backend for
-    DSA over MLA (none/tilelang/cudnn). This selects the streamed min-memory
-    implementation used by the GQA path. Both names existed independently
-    before this branch was rebased onto main."""
-
     dsa_min_memory_profile: bool = False
     """Whether to print per-layer DSA min-memory forward/backward timing breakdowns."""
 
@@ -424,10 +414,30 @@ class TransformerConfig(ModelParallelConfig):
     """Whether to use sparse DSA indexer loss. If True, the indexer loss will be computed using the
     top-k indices."""
 
-    dsa_kernel_backend: Literal["none", "tilelang", "cudnn"] = "none"
-    """Optional fused DSA kernel backend.
-    ``none`` disables fused DSA kernels. Explicit ``tilelang`` or ``cudnn`` enables only that
-    backend. Unsupported DSA layouts continue to use the PyTorch fallback."""
+    dsa_kernel_backend: Literal[
+        "none", "tilelang", "cudnn", "min-memory-triton", "min-memory-torch", "reference"
+    ] = "none"
+    """Which DSA implementation to run. This is the only backend selector.
+
+    Support matrix:
+
+    =================== ============ ============ =========================================
+    value               DSA over MLA DSA over GQA notes
+    =================== ============ ============ =========================================
+    ``none``            yes          no           no fused kernels; PyTorch fallback
+    ``tilelang``        yes          no           fused TileLang kernels
+    ``cudnn``           yes          no           fused cuDNN kernels
+    ``min-memory-triton`` no         yes          streamed min-memory, Triton kernels
+    ``min-memory-torch``  no         yes          streamed min-memory, Triton dispatch off
+    ``reference``       no           yes          dense-mask reference the kernels are A/B'd against
+    =================== ============ ============ =========================================
+
+    ``cudnn`` selects the fused cuDNN indexer, which exists only on the standard-indexer path
+    and so is MLA-only: the simplified indexer the GQA path requires has no cuDNN branch.
+
+    On the DSA-over-GQA path ``none`` resolves to ``min-memory-triton``, since "no fused
+    kernels" has no meaning there. ``tilelang`` and ``cudnn`` are rejected rather than silently
+    downgraded; see ``__post_init__``."""
 
     dsa_indexer_rope_interleaved: bool = False
     """Whether DSA indexer RoPE should use MLA-style interleaving."""
@@ -448,10 +458,6 @@ class TransformerConfig(ModelParallelConfig):
 
     dsa_indexer_use_hadamard: bool = False
     """Whether to apply Hadamard rotation to DSA indexer queries and keys."""
-
-    dsa_use_cudnn: bool = False
-    """Whether to use cuDNN DSA kernels where available (requires nvidia-cudnn-frontend
-    with DSA support)."""
 
     ####################
     # Compressed sparse attention
@@ -3650,9 +3656,9 @@ class TransformerConfig(ModelParallelConfig):
                     "dsa_train_main_only has no selected-score KL backward; do not set "
                     "dsa_kernel_cache_selected_scores."
                 )
-            min_memory_dsa_backend = self.dsa_min_memory_backend in (
-                'triton-min-memory',
-                'torch-min-memory',
+            min_memory_dsa_backend = self.dsa_kernel_backend in (
+                'min-memory-triton',
+                'min-memory-torch',
             )
             skip_dsa = self.dsa_fwd_skip_dsa
             dense_dsa_warmup = self.dsa_fwd_use_dense_attn
@@ -3662,14 +3668,6 @@ class TransformerConfig(ModelParallelConfig):
                 and not skip_dsa
                 and not dense_dsa_warmup
                 and not self.dsa_indexer_use_sparse_loss
-            )
-            assert self.dsa_min_memory_backend in (
-                'reference',
-                'triton-min-memory',
-                'torch-min-memory',
-            ), (
-                "dsa_min_memory_backend must be 'reference', 'triton-min-memory', "
-                "or 'torch-min-memory'."
             )
             assert (
                 self.dsa_min_memory_profile_rank >= -1
@@ -3682,25 +3680,46 @@ class TransformerConfig(ModelParallelConfig):
             ), "dsa_kernel_key_block_size must be a positive integer when set."
             assert (
                 not self.dsa_kernel_cache_routing or min_memory_dsa_backend
-            ), "dsa_kernel_cache_routing requires a min-memory dsa_min_memory_backend."
+            ), "dsa_kernel_cache_routing requires a min-memory dsa_kernel_backend."
             assert (
                 not self.dsa_kernel_cache_indexer_k or min_memory_dsa_backend
-            ), "dsa_kernel_cache_indexer_k requires a min-memory dsa_min_memory_backend."
+            ), "dsa_kernel_cache_indexer_k requires a min-memory dsa_kernel_backend."
             assert not self.dsa_kernel_cache_selected_scores or min_memory_dsa_backend, (
-                "dsa_kernel_cache_selected_scores requires " "a min-memory dsa_min_memory_backend."
+                "dsa_kernel_cache_selected_scores requires " "a min-memory dsa_kernel_backend."
             )
             assert (
                 not dense_dsa_warmup or min_memory_dsa_backend
-            ), "dsa_fwd_use_dense_attn requires a min-memory dsa_min_memory_backend."
+            ), "dsa_fwd_use_dense_attn requires a min-memory dsa_kernel_backend."
             assert (
                 not self.dsa_indexer_sparse_loss_use_topk_only or self.dsa_indexer_use_sparse_loss
             ), "dsa_indexer_sparse_loss_use_topk_only requires dsa_indexer_use_sparse_loss."
+            # The simplified indexer has only ever been exercised on the GQA path. Rather than
+            # let an untested combination run, refuse it; the MLA path keeps the standard indexer.
+            assert not (
+                self.multi_latent_attention and self.dsa_indexer_mode == 'simplified'
+            ), "dsa_indexer_mode='simplified' is not supported with multi_latent_attention."
+
             if not self.multi_latent_attention:
                 # Only the simplified indexer is implemented for DSA over GQA; the standard
                 # DeepSeek indexer remains available for DSA over MLA.
                 assert (
                     self.dsa_indexer_mode == 'simplified'
                 ), "DSA over GQA requires dsa_indexer_mode='simplified'."
+                # 'none' is the field default and means "no fused kernels" on the MLA path.
+                # The GQA path has no such mode, so resolve it to the streamed min-memory
+                # backend -- the one intended for production -- rather than failing. Note this
+                # is not a literal reading of "none": that backend does use Triton kernels.
+                if self.dsa_kernel_backend == 'none':
+                    self.dsa_kernel_backend = 'min-memory-triton'
+                assert self.dsa_kernel_backend in (
+                    'min-memory-triton',
+                    'min-memory-torch',
+                    'reference',
+                ), (
+                    "DSA over GQA supports dsa_kernel_backend in ('min-memory-triton', "
+                    f"'min-memory-torch', 'reference'); got {self.dsa_kernel_backend!r}. "
+                    "'tilelang' and 'cudnn' select fused kernels and are MLA-only."
+                )
                 # DSA over MLA supports CP/SP (upstream gates CP on cp_comm_type=allgather
                 # below). The GQA path does not: its min-memory kernels have no
                 # sequence-parallel gather and no CP support yet.
@@ -3713,7 +3732,7 @@ class TransformerConfig(ModelParallelConfig):
             assert not self.apply_rope_fusion, "RoPE fusion is not supported for DSAttention"
             if min_memory_dsa_backend:
                 assert not self.dsa_sparse_attention_use_gather, (
-                    "min-memory dsa_min_memory_backend bypasses the reference gather backend; "
+                    "min-memory dsa_kernel_backend bypasses the reference gather backend; "
                     "leave dsa_sparse_attention_use_gather for legacy/reference paths."
                 )
                 if skip_dsa:
@@ -3743,16 +3762,14 @@ class TransformerConfig(ModelParallelConfig):
                 else:
                     assert (
                         self.dsa_indexer_loss_coeff or 0.0
-                    ) > 0.0, (
-                        "min-memory dsa_min_memory_backend requires dsa_indexer_loss_coeff > 0."
-                    )
+                    ) > 0.0, "min-memory dsa_kernel_backend requires dsa_indexer_loss_coeff > 0."
                     if sparse_fwd_dense_loss:
                         assert not self.dsa_kernel_cache_selected_scores, (
                             "Sparse-forward dense-loss mode has no selected scores; do not set "
                             "dsa_kernel_cache_selected_scores."
                         )
                 assert skip_dsa or simplified_indexer or self.dsa_indexer_use_hadamard, (
-                    "min-memory dsa_min_memory_backend requires "
+                    "min-memory dsa_kernel_backend requires "
                     "dsa_indexer_use_hadamard for the standard DeepSeek indexer."
                 )
             if self.context_parallel_size > 1:
