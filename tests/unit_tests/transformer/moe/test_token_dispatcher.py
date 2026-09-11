@@ -22,7 +22,13 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.typed_torch import apply_module
 from megatron.core.utils import is_te_min_version
 from megatron.training.initialize import _set_random_seed
-from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.test_utilities import (
+    Utils,
+    is_nccl_ep_available,
+    is_nccl_ep_fp8_dispatch_available,
+    is_nccl_ep_zero_copy_available,
+    is_op_fuser_available,
+)
 
 
 def token_permutation(token_dispatcher, hidden_states, probs, indices):
@@ -713,15 +719,7 @@ class TestFlexDispatcher:
     @pytest.mark.internal
     @pytest.mark.parametrize("tp_size,ep_size", [(1, 8), (8, 1), (4, 2)])
     @pytest.mark.parametrize("permute_fusion", permute_fusion_params)
-    @pytest.mark.parametrize(
-        "moe_flex_dispatcher_backend",
-        [
-            "deepep",
-            "hybridep",
-            # NCCL EP aborts in dev CI with a pybind11 GIL dec_ref failure.
-            pytest.param("ncclep", marks=pytest.mark.flaky_in_dev),
-        ],
-    )
+    @pytest.mark.parametrize("moe_flex_dispatcher_backend", ["deepep", "hybridep", "ncclep"])
     @pytest.mark.parametrize("moe_permute_fusion_into_hybridep", [True, False])
     def test_forward_backward(
         self,

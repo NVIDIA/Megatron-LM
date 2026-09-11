@@ -93,8 +93,8 @@ class MegatronAsyncLLM(_MegatronLLMBase):
             ``"image"`` accepts raw image bytes, a list of raw image bytes, or
             a preprocessed image tensor dictionary.
         Video:
-            Video does not yet have any supported data preprocessing or
-            modeling formats.
+            ``"video"`` accepts raw video bytes, a list of raw video bytes, or
+            a preprocessed video tensor dictionary.
         Audio:
             Audio does not yet have any supported data preprocessing or
             modeling formats.
@@ -223,6 +223,13 @@ class MegatronAsyncLLM(_MegatronLLMBase):
                 num_replicas=serve_config.frontend_replicas,
                 hostname=serve_config.host,
                 sock=serve_config.sock,
+                multimodal_prompt_config=(
+                    self._controller.inference_wrapped_model.multimodal_prompt_config
+                ),
+                default_temperature=serve_config.default_temperature,
+                default_top_p=serve_config.default_top_p,
+                default_top_k=serve_config.default_top_k,
+                eval_mode=serve_config.eval_mode,
             )
             self._serve_started = True
 
