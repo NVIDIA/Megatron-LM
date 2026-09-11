@@ -18,12 +18,10 @@ from .checkpoint import load_checkpoint, save_checkpoint
 from .dbuffer import DBuffer
 from .fully_shard import Placements, fully_shard, fully_shard_context, microbatch
 from .optimizer import fully_shard_optimizer
-from .quantized_dbuffer import QuantizedDBuffer
 from .schedule import SchedulePolicy
 
 __all__ = [
     "DBuffer",
-    "QuantizedDBuffer",
     "Placements",
     "SchedulePolicy",
     "fully_shard",
