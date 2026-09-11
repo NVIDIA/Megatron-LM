@@ -47,7 +47,14 @@ def set_vision_flops_metadata(args, language_config, vision_config):
     args.vision_out_hidden_size = language_config.hidden_size
 
 
-def build_model(args, language_config, vision_config, **kwargs):
+def build_model(
+    args,
+    language_config,
+    vision_config,
+    pre_process: bool = True,
+    post_process: bool = True,
+    **kwargs,
+):
     """Build a complete Qwen3.5-VL model instance.
 
     Selects the HybridModel stack spec and instantiates the model with the
@@ -58,11 +65,15 @@ def build_model(args, language_config, vision_config, **kwargs):
         language_config: ``TransformerConfig`` for the language decoder
             (already post-processed by :func:`post_language_config`).
         vision_config: ``TransformerConfig`` for the vision encoder.
+        pre_process: First PP stage flag — vision encoder + embedding live here.
+        post_process: Last PP stage flag — output projection + loss live here.
         **kwargs: Extra keyword arguments (e.g. ``vp_stage``).
 
     Returns:
         A :class:`Qwen35VLModel` instance.
     """
+    vp_stage = kwargs.get("vp_stage", None)
+
     hybrid_layer_pattern = getattr(args, "hybrid_layer_pattern", None)
     if hybrid_layer_pattern is None:
         raise ValueError(
@@ -104,4 +115,7 @@ def build_model(args, language_config, vision_config, **kwargs):
         position_embedding_type=args.position_embedding_type,
         parallel_output=True,
         share_embeddings_and_output_weights=share_embeddings,
+        pre_process=pre_process,
+        post_process=post_process,
+        vp_stage=vp_stage,
     )
