@@ -4401,8 +4401,6 @@ class MLATransformerConfig(TransformerConfig):
         Only validate source relationships here. CSA2 construction will resolve each
         layer's mode and owners when the attention implementation is added.
         """
-        if self.transformer_impl != "local":
-            raise ValueError("Native V4.1 requires transformer_impl='local'")
         for name in (
             "tensor_model_parallel_size",
             "pipeline_model_parallel_size",

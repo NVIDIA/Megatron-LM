@@ -183,10 +183,11 @@ class DSv4HybridAttention(Attention):
         _linear_o_group_proj = torch.empty(
             group_proj_out_size,
             group_proj_in_size,
-            device=torch.cuda.current_device(),
+            device="cpu" if self.config.use_cpu_initialization else torch.cuda.current_device(),
             dtype=self.config.params_dtype,
         )
-        self.config.init_method(_linear_o_group_proj)
+        if self.config.perform_initialization:
+            self.config.init_method(_linear_o_group_proj)
         self.linear_o_group_proj = torch.nn.Parameter(_linear_o_group_proj)
 
         linear_proj_in_size = self.config.o_groups * self.config.o_lora_rank
@@ -256,6 +257,11 @@ class DSv4HybridAttention(Attention):
         assert (
             inference_context is None and inference_params is None
         ), "Inference is not supported for DSv4HybridAttention."
+
+        if self.config.dsv4_version == "v4.1" and packed_seq_params is not None:
+            raise NotImplementedError(
+                "Native CSA2 currently supports unpacked sequences with CP=1."
+            )
 
         # Select this microbatch's dynamic CP group. QKV captures it explicitly
         # for recompute; the rest of this forward reads it from pg_collection.
@@ -712,7 +718,8 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
 
             # q: [num_tokens, n, q_head_dim]
             q = q.view(*q.size()[:-1], self.num_attention_heads_per_partition, self.q_head_dim)
-            q = _q_rms_norm(q, self.config.layernorm_epsilon)
+            if self.config.dsv4_version == "v4":
+                q = _q_rms_norm(q, self.config.layernorm_epsilon)
 
             boundary_rows = 0
             if boundary_kv_compressed is not None:
