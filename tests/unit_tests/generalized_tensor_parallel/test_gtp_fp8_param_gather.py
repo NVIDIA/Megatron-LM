@@ -20,20 +20,20 @@ if not HAVE_GTP:
     pytest.skip("GTP requires TransformerEngine >= 2.19", allow_module_level=True)
 
 from megatron.core.fp8_utils import dequantize_fp8_tensor, is_mxfp8tensor
-from megatron.core.optimizer import HAVE_EMERGING_OPTIMIZERS
-from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
-from megatron.core.optimizer.emerging_optimizers import _is_muon_excluded
-from megatron.core.optimizer.layer_wise_optimizer import (
-    LayerWiseDistributedOptimizer,
-    is_managed_by_layer_wise_optimizer,
-)
-from megatron.core.ssm.gated_delta_product import (
+from megatron.core.ops.ssm.gdp.mixer import (
     HAVE_EINOPS,
     HAVE_FLA,
     HAVE_MAMBA_SSM,
     GatedDeltaProductMixer,
     causal_conv1d_fn,
     check_fla_sequence_packing_support,
+)
+from megatron.core.optimizer import HAVE_EMERGING_OPTIMIZERS
+from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
+from megatron.core.optimizer.emerging_optimizers import _is_muon_excluded
+from megatron.core.optimizer.layer_wise_optimizer import (
+    LayerWiseDistributedOptimizer,
+    is_managed_by_layer_wise_optimizer,
 )
 from megatron.core.tensor_parallel.generalized_tensor_parallelism import (
     dequantize_gtp_native_fp8,

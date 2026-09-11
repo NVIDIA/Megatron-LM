@@ -18,8 +18,7 @@ import torch
 
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.models.hybrid.hybrid_layer_specs import gdp_stack_spec
-from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.ssm.gated_delta_product import (
+from megatron.core.ops.ssm.gdp.mixer import (
     HAVE_CUTEDSL_GDP,
     HAVE_EINOPS,
     HAVE_FLA,
@@ -27,6 +26,7 @@ from megatron.core.ssm.gated_delta_product import (
     GatedDeltaProductMixer,
     causal_conv1d_fn,
 )
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from tests.unit_tests.test_utilities import Utils

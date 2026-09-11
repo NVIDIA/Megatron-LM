@@ -1,11 +1,12 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Local SSM kernels, separate from mixers, recurrent caches and CP communication.
+"""SSM operation implementations, kernels and operation-local communication.
 
 ``common`` holds causal convolution, state gather/scatter and Triton determinism
-helpers; ``mamba2`` holds SSD kernels; ``gdp`` holds the forward-only GDP fork;
-``gated_delta`` holds GDN/GDN2 references and optional FLA targets. Phase-specific
-contracts live with these subpackages. No kernel creates a process group.
+helpers and inference execution; ``mamba2``, ``gdp`` and ``gated_delta`` hold
+their mixers and kernels. ``context_parallel`` holds chunkwise communication.
+Stack assembly and global recurrent-cache management remain outside this package.
+Phase-specific contracts live with the families; callers supply process groups.
 
 The two historical exports are loaded on demand, so importing this namespace
 does not import Triton, FLA, causal-conv1d or mamba-ssm.

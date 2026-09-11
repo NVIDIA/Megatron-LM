@@ -5,7 +5,7 @@
 import pytest
 import torch
 
-from megatron.core.ssm.ops.mamba2.mamba_ssm import selective_state_update
+from megatron.core.ops.ssm.mamba2.mamba_ssm import selective_state_update
 
 
 def _requires_cuda():

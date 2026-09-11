@@ -16,7 +16,7 @@ reachable, since a prompt's final chunk can be as short as two tokens.
 import pytest
 import torch
 
-from megatron.core.ssm.ops.common.causal_conv1d_varlen import (
+from megatron.core.ops.ssm.common.causal_conv1d_varlen import (
     causal_conv1d_varlen_carry_states,
     causal_conv1d_varlen_fn,
 )

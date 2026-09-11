@@ -29,10 +29,10 @@ from megatron.core.models.hybrid.hybrid_layer_allocation import (
 )
 from megatron.core.models.hybrid.layers import utils as layer_utils
 from megatron.core.models.hybrid.layers.hybrid_hyper_connection import HyperConnectionHybridLayer
+from megatron.core.ops.ssm.context_parallel.chunkwise import build_packed_sequence_cp_metadata
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.recompute import checkpointed_forward
-from megatron.core.ssm.context_parallel.chunkwise import build_packed_sequence_cp_metadata
 from megatron.core.tensor_parallel.random import CheckpointWithoutOutputManager
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.cuda_graphs import annotate_first_last_layer
@@ -272,7 +272,7 @@ class HybridStack(MegatronModule):
                     if layer_config.experimental_attention_variant == "gdn2":
                         # 'G' layers build the GDN2 variant when the gdn2 experimental
                         # attention variant is selected.
-                        from megatron.core.ssm.gated_delta_net import GatedDeltaNet2
+                        from megatron.core.ops.ssm.gated_delta.modules import GatedDeltaNet2
 
                         gdn_layer_spec = copy.deepcopy(gdn_layer_spec)
                         gdn_layer_spec.submodules.self_attention.module = GatedDeltaNet2

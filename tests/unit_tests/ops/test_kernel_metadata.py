@@ -348,7 +348,7 @@ def test_inference_initialization_validates_before_state_allocation(
 def test_mamba_inference_declarations_follow_selected_mode(batch_invariant):
     from megatron.core.ops.ssm.common.kernel_metadata import CAUSAL_CONV_CUDA_UPDATE
     from megatron.core.ops.ssm.mamba2.kernel_metadata import MAMBA_BATCH_INVARIANT, MAMBA_DECODE
-    from megatron.core.ssm.mamba_mixer import MambaMixer
+    from megatron.core.ops.ssm.mamba2.mixer import MambaMixer
 
     mixer = SimpleNamespace(config=SimpleNamespace(batch_invariant_mode=batch_invariant))
     kernels = MambaMixer.get_inference_kernel_metadata(mixer)
@@ -358,7 +358,7 @@ def test_mamba_inference_declarations_follow_selected_mode(batch_invariant):
 
 
 def test_gdp_dynamic_inference_does_not_require_training_backends():
-    from megatron.core.ssm.gated_delta_product import GatedDeltaProductMixer
+    from megatron.core.ops.ssm.gdp.mixer import GatedDeltaProductMixer
 
     kernels = GatedDeltaProductMixer.get_inference_kernel_metadata(None)
     assert kernels
@@ -384,8 +384,8 @@ def test_reference_missing_runtime_normalization_has_useful_error(monkeypatch, v
 
 @pytest.mark.parametrize("owner", ["indexer", "compressor"])
 def test_selected_hadamard_dependency_is_checked_before_parameters(monkeypatch, owner):
-    from megatron.core.transformer.experimental_attention_variant.csa import Compressor
-    from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexer
+    from megatron.core.ops.attention.csa.modules import Compressor
+    from megatron.core.ops.attention.dsa.modules import DSAIndexer
 
     def missing(self, name):
         assert self.module == "fast_hadamard_transform"

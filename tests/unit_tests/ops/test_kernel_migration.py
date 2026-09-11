@@ -94,15 +94,41 @@ assert not {name for name in set(sys.modules) - before if name.split('.')[0] in 
     subprocess.run([sys.executable, "-c", code], check=True, timeout=120)
 
 
-def test_ops_do_not_import_model_owners():
+def _imports_model_assembly_or_legacy_path(name):
+    if name == "megatron.core.models.backends" or name == "megatron.core.models.common.embeddings":
+        return False
+    if name.startswith("megatron.core.models.common.embeddings."):
+        return False
+    return name.startswith(
+        (
+            "megatron.core.ssm",
+            "megatron.core.models",
+            "megatron.core.transformer.experimental_attention_variant",
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    ("name", "forbidden"),
+    [
+        ("megatron.core.models.backends", False),
+        ("megatron.core.models.common.embeddings", False),
+        ("megatron.core.models.common.embeddings.rope_utils", False),
+        ("megatron.core.models.hybrid.hybrid_layer_specs", True),
+        ("megatron.core.models.gpt", True),
+        ("megatron.core.models.common.language_module", True),
+        ("megatron.core.ssm.mamba_mixer", True),
+        ("megatron.core.transformer.experimental_attention_variant.dsa", True),
+    ],
+)
+def test_operation_import_boundary_distinguishes_shared_infrastructure(name, forbidden):
+    assert _imports_model_assembly_or_legacy_path(name) is forbidden
+
+
+def test_ops_do_not_import_model_assembly_or_legacy_paths():
     import megatron.core.ops
 
     root = Path(megatron.core.ops.__file__).parent
-    forbidden = (
-        "megatron.core.ssm",
-        "megatron.core.models",
-        "megatron.core.transformer.experimental_attention_variant",
-    )
     for path in root.rglob("*.py"):
         for node in ast.walk(ast.parse(path.read_text())):
             if isinstance(node, ast.ImportFrom):
@@ -111,7 +137,7 @@ def test_ops_do_not_import_model_owners():
                 names = [alias.name for alias in node.names]
             else:
                 continue
-            assert not any(name.startswith(forbidden) for name in names), path
+            assert not any(_imports_model_assembly_or_legacy_path(name) for name in names), path
 
 
 def test_dsa_binds_direct_hooks_once_and_keeps_instances_independent(monkeypatch):

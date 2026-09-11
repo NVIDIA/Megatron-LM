@@ -1,9 +1,11 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""GDN/GDN2 recurrence contracts, reference implementations and FLA targets.
+"""GDN/GDN2 operation modules, recurrence contracts, references and FLA targets.
 
 Inputs use BTHD layout. Kernels own the local recurrence and its backward, not
-parameters, CP transforms, checkpointing or inference-cache allocation. Optional
+parameters, CP transforms, checkpointing or inference-cache allocation. The
+``common``, ``gdn`` and ``gdn2`` modules own operation parameters, CP execution
+and checkpoint mappings; global inference-cache allocation remains external. Optional
 initial/final states are BHKV. GDN uses scalar gates; GDN2 uses channel-wise gates.
 Their additional keywords differ, but their common call surface is below.
 

@@ -6,10 +6,7 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer.enums import AttnMaskType
-from megatron.core.transformer.experimental_attention_variant.csa import (
+from megatron.core.ops.attention.csa.modules import (
     CSA_OPERATION_DETERMINISM,
     CompressedSparseAttention,
     CompressedSparseAttentionSubmodules,
@@ -26,11 +23,14 @@ from megatron.core.transformer.experimental_attention_variant.csa import (
     get_window_topk_idxs,
     unfused_compressed_sparse_attn,
 )
-from megatron.core.transformer.experimental_attention_variant.dsa import (
+from megatron.core.ops.attention.dsa.modules import (
     FusedDSAIndexerLoss,
     compute_dsa_indexer_loss,
     fused_qk_topk_naive,
 )
+from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
@@ -79,7 +79,7 @@ def patch_hadamard_if_needed():
                 mock_hadamard_transform,
             ),
             patch(
-                'megatron.core.transformer.experimental_attention_variant.csa.rotate_activation',
+                'megatron.core.ops.attention.csa.modules.rotate_activation',
                 lambda x: x * (x.size(-1) ** -0.5),
             ),
         ):
@@ -813,8 +813,7 @@ class TestCompressor:
             monkeypatch.setattr(projection, 'forward', checked_forward)
 
         monkeypatch.setattr(
-            'megatron.core.transformer.experimental_attention_variant.csa.get_fp8_disabled_context',
-            tracker,
+            'megatron.core.ops.attention.csa.modules.get_fp8_disabled_context', tracker
         )
         x = torch.randn(
             compress_ratio * 2, 1, self.config.hidden_size, dtype=torch.bfloat16, device='cuda'
@@ -926,8 +925,7 @@ class TestCSAIndexer:
 
         monkeypatch.setattr(self.indexer.linear_weights_proj, 'forward', checked_forward)
         monkeypatch.setattr(
-            'megatron.core.transformer.experimental_attention_variant.csa.get_fp8_disabled_context',
-            tracker,
+            'megatron.core.ops.attention.csa.modules.get_fp8_disabled_context', tracker
         )
         x = torch.randn(seqlen, 1, self.config.hidden_size, dtype=torch.bfloat16, device='cuda')
         weights = self.indexer._project_weights(x)

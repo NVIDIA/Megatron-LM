@@ -9,8 +9,8 @@ from megatron.core import parallel_state
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
     get_experimental_attention_variant_module_spec,
 )
+from megatron.core.ops.ssm.gated_delta.modules import HAVE_FLA
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.ssm.gated_delta_net import HAVE_FLA
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from tests.unit_tests.ssm.gated_delta_net_test_utils import GatedDeltaNetTestBase
 

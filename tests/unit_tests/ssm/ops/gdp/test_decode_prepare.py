@@ -12,7 +12,7 @@ import torch
 import torch.nn.functional as F
 from einops import rearrange
 
-from megatron.core.ssm.ops.gdp.decode_prepare import gdp_decode_prepare
+from megatron.core.ops.ssm.gdp.decode_prepare import gdp_decode_prepare
 
 
 def _requires_cuda():

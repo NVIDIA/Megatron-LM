@@ -5,7 +5,7 @@ from contextlib import nullcontext
 import pytest
 import torch
 
-from megatron.core.ssm.context_parallel.chunkwise import (
+from megatron.core.ops.ssm.context_parallel.chunkwise import (
     CPBackwardPackedSummary,
     CPBackwardUnpackedSummary,
     CPForwardPackedSummary,

@@ -5,14 +5,10 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from megatron.core.ops.attention.dsa import dsa_cudnn_kernels, dsa_layout, dsa_masking
+from megatron.core.ops.attention.dsa import modules as dsa_module
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer.enums import AttnBackend, AttnMaskType
-from megatron.core.transformer.experimental_attention_variant import dsa as dsa_module
-from megatron.core.transformer.experimental_attention_variant import (
-    dsa_cudnn_kernels,
-    dsa_layout,
-    dsa_masking,
-)
 from tests.unit_tests.transformer.experimental_attention_variant.dsa_native_parity_utils import (
     assert_similarity as _assert_similarity,
 )

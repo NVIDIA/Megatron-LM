@@ -13,8 +13,8 @@ import torch
 
 from megatron.core.dist_checkpointing import ShardedTensor
 from megatron.core.ops.ssm.gdp import backends as gdp_backends
-from megatron.core.ssm import gated_delta_product as gdp_module
-from megatron.core.ssm.gated_delta_product import (
+from megatron.core.ops.ssm.gdp import mixer as gdp_module
+from megatron.core.ops.ssm.gdp.mixer import (
     GatedDeltaProductMixer,
     _get_in_proj_checkpoint_split_layout,
     _split_tensor_factory,
@@ -136,15 +136,12 @@ def test_gdp_checkpoint_threads_explicit_groups_to_all_wrappers():
 
     with (
         patch(
-            "megatron.core.ssm.gated_delta_product.make_sharded_tensors_for_checkpoint",
+            "megatron.core.ops.ssm.gdp.mixer.make_sharded_tensors_for_checkpoint",
             side_effect=checkpoint_wrap,
         ),
+        patch("megatron.core.ops.ssm.gdp.mixer.sharded_state_dict_default", side_effect=child_wrap),
         patch(
-            "megatron.core.ssm.gated_delta_product.sharded_state_dict_default",
-            side_effect=child_wrap,
-        ),
-        patch(
-            "megatron.core.ssm.gated_delta_product._split_tensor_factory",
+            "megatron.core.ops.ssm.gdp.mixer._split_tensor_factory",
             side_effect=lambda tensor, *args, **kwargs: tensor,
         ),
         patch(

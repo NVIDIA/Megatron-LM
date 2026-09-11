@@ -1,21 +1,50 @@
-# SSM and Sparse-Attention Kernels
+# SSM and Sparse-Attention Operations
 
-This package owns kernel implementations and their optional dependency adapters.
-It does not own model parameters, inference state, checkpoints, context-parallel
-communication, or index-sharing state. Those remain with the model/SSM callers.
-Importing a family namespace does not import its optional kernel libraries.
+This is an operation-implementation package, not just a kernel directory. It
+owns concrete operation modules, kernels, backend adapters, operation-local
+parameters and checkpoint mappings, state updates, and operation-specific
+communication. Model assembly and global runtime management stay outside.
+
+Import family namespaces for contracts and metadata without loading optional
+kernel libraries. Import concrete implementation modules explicitly when
+constructing an operation. Moving an implementation does not change its
+parameter names, registered submodules, checkpoint layout or numerical behavior.
 
 ## Families
 
 | Location | Contents |
 | --- | --- |
-| `ssm/common` | Causal convolution, determinism and intermediate extraction |
-| `ssm/mamba2` | Mamba SSD training, varlen and decode kernels |
-| `ssm/gated_delta` | GDN/GDN2 reference recurrences and FLA adapters |
-| `ssm/gdp` | GDP chunk, recurrent, decode and backend adapters |
-| `attention/dsa` | DSA layout/masking, indexer loss, reference and fused adapters |
+| `ssm/common` | Convolution, packing, checkpoint helpers and per-operation inference execution |
+| `ssm/mamba2` | `mixer.py`, context-parallel transforms, SSD training and inference kernels |
+| `ssm/gated_delta` | GDN/GDN2 modules, reference recurrences and FLA adapters |
+| `ssm/gdp` | `mixer.py`, context-parallel transforms, training adapters and inference kernels |
+| `ssm/context_parallel` | Chunkwise SSM communication and GDP backend implementations |
+| `attention/dsa` | `modules.py`, layout/masking, indexer loss, reference and fused adapters |
 | `attention/dsa/kernels` | TileLang/Triton kernel implementations |
-| `attention/csa` | CSA indexing, masks, compressor pooling and sparse attention |
+| `attention/csa` | `modules.py` with compressor/indexer/attention modules and reference kernels |
+| `attention/mla.py` | Absorbed MLA operation and its projection/layout helpers |
+| `attention/dsv4.py` | DeepSeek-v4 hybrid attention operation |
+
+## Ownership Boundary
+
+An implementation may own state when it belongs to that operation: parameters,
+local buffers, checkpoint sharding, or communication using supplied process
+groups. Merely subclassing `nn.Module` does not put an implementation outside
+`ops`. Existing operation boundaries are preserved; relocation adds no wrapper.
+
+The following remain outside:
+
+- Model/layer assembly, hybrid allocation, configuration and spec builders.
+- Inference contexts, global cache allocation, request scheduling and stack-wide
+  recurrent-state configuration (`ssm/ssm_inference.py`).
+- Training-wide indexer-loss tracking and gradient-scale management
+  (`transformer/dsa_loss.py`).
+
+Operations may use shared infrastructure such as embeddings, `MegatronModule`,
+checkpoint utilities, inference contexts and explicit process groups. They must
+not import concrete model assembly or legacy SSM/attention compatibility paths.
+The existing provider API is used only at construction; no new reverse
+dependency on model spec builders is introduced.
 
 The family docstrings and callable signatures describe tensor layouts, masks,
 state ownership and distributed inputs. Moving a kernel does not certify its
@@ -82,6 +111,11 @@ the FLA normalization helper if Q/K normalization is requested later. Numerical,
 gradient, graph-capture and scoped repeatability tests remain separate from
 metadata validation.
 
+`KERNELS` describes kernel entry points, not a blanket dependency or determinism
+certificate for the operation modules that compose them. An operation validates
+its selected targets; adding a module to this package does not certify all its
+training, communication or inference behavior.
+
 ## Selection
 
 The existing `BackendSpecProvider` has optional `dsa_kernels`, `gated_delta_rule`
@@ -105,18 +139,20 @@ every helper. No extra callable wrapper is inserted into these kernel calls.
 
 ## Compatibility
 
-The former `ssm/ops`, `ssm/triton_cache_manager` and sparse-attention helper
-module paths remain importable. Leaf modules alias the canonical module object,
-so caches and Triton module state are not duplicated. References extracted from
-model files are explicitly re-exported under their old names. New production
-imports should use this package. Tests patching an implementation dependency
-must patch its canonical owner, not a re-exported name in a model module.
+Former kernel and operation-module paths remain importable. Leaf modules alias
+the canonical module object, so classes, caches, monkeypatches and Triton state
+are not duplicated. Package exports and the two split ownership modules keep
+explicit identity-preserving re-exports. Historical pickle globals still resolve
+through those paths; new pickles record the canonical implementation path.
+State-dict keys do not depend on the source directory and remain unchanged.
+Production and numerical tests use canonical paths; dedicated compatibility
+tests exercise legacy imports separately.
 
 Vendored kernel files retain their original licenses and internal file structure.
-Future changes should keep low-level computation here and stateful model or
-distributed orchestration in its existing owner.
+Future changes should keep cohesive operation implementations here and model
+assembly or global runtime lifecycle in its existing subsystem.
 
 The `megatron/core/ssm` and `transformer/experimental_attention_variant` folders
-remain model owners, not obsolete kernel folders. Removing compatibility leaf
-modules is a separate API-deprecation decision; deleting their parent folders
-would also delete live model and distributed code.
+now retain assembly/configuration code and compatibility imports, rather than
+the migrated operation implementations. Removing compatibility paths is a
+separate API-deprecation decision, not part of the implementation relocation.
