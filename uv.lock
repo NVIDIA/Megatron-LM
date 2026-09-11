@@ -1640,7 +1640,7 @@ dependencies = [
     { name = "numpy", version = "2.0.2", source = { registry = "https://pypi.org/simple" }, marker = "(python_full_version < '3.11' and extra == 'extra-13-megatron-core-dev') or (python_full_version < '3.11' and extra == 'extra-13-megatron-core-lts') or (extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts')" },
     { name = "numpy", version = "2.4.4", source = { registry = "https://pypi.org/simple" }, marker = "(python_full_version >= '3.11' and extra == 'extra-13-megatron-core-dev') or (python_full_version >= '3.11' and extra == 'extra-13-megatron-core-lts') or (extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts')" },
     { name = "nvidia-cudnn-frontend", version = "1.27.0", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-13-megatron-core-lts'" },
-    { name = "nvidia-cudnn-frontend", version = "1.28.0", source = { git = "https://github.com/NVIDIA/cudnn-frontend.git?rev=develop#b15181d82170c172f2023521638367cc4c01047b" }, marker = "extra == 'extra-13-megatron-core-dev'" },
+    { name = "nvidia-cudnn-frontend", version = "1.28.0", source = { git = "https://github.com/NVIDIA/cudnn-frontend.git?rev=b15181d82170c172f2023521638367cc4c01047b#b15181d82170c172f2023521638367cc4c01047b" }, marker = "extra == 'extra-13-megatron-core-dev'" },
     { name = "nvidia-cutlass-dsl" },
     { name = "nvidia-ml-py" },
     { name = "packaging" },
@@ -2815,7 +2815,7 @@ dev = [
     { name = "mamba-ssm" },
     { name = "megatron-energon", version = "7.4.1", source = { registry = "https://pypi.org/simple" }, extra = ["av-decode"], marker = "extra == 'extra-13-megatron-core-dev'" },
     { name = "multi-storage-client" },
-    { name = "nvidia-cudnn-frontend", version = "1.28.0", source = { git = "https://github.com/NVIDIA/cudnn-frontend.git?rev=develop#b15181d82170c172f2023521638367cc4c01047b" }, extra = ["cutedsl"], marker = "extra == 'extra-13-megatron-core-dev'" },
+    { name = "nvidia-cudnn-frontend", version = "1.28.0", source = { git = "https://github.com/NVIDIA/cudnn-frontend.git?rev=b15181d82170c172f2023521638367cc4c01047b#b15181d82170c172f2023521638367cc4c01047b" }, extra = ["cutedsl"], marker = "extra == 'extra-13-megatron-core-dev'" },
     { name = "nvidia-modelopt", marker = "(sys_platform != 'darwin' and extra == 'extra-13-megatron-core-dev') or (extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts')" },
     { name = "nvidia-resiliency-ext" },
     { name = "nvtx" },
@@ -2963,7 +2963,7 @@ requires-dist = [
     { name = "multi-storage-client", marker = "extra == 'dev'", specifier = "~=0.27" },
     { name = "multi-storage-client", marker = "extra == 'lts'", specifier = "~=0.27" },
     { name = "numpy" },
-    { name = "nvidia-cudnn-frontend", extras = ["cutedsl"], marker = "extra == 'dev'", git = "https://github.com/NVIDIA/cudnn-frontend.git?rev=develop" },
+    { name = "nvidia-cudnn-frontend", extras = ["cutedsl"], marker = "extra == 'dev'", git = "https://github.com/NVIDIA/cudnn-frontend.git?rev=b15181d82170c172f2023521638367cc4c01047b" },
     { name = "nvidia-modelopt", extras = ["torch"], marker = "sys_platform != 'darwin' and extra == 'dev'" },
     { name = "nvidia-resiliency-ext", marker = "extra == 'dev'", specifier = "==0.6.0" },
     { name = "nvtx", marker = "extra == 'dev'", specifier = "~=0.2" },
@@ -3940,7 +3940,7 @@ wheels = [
 [[package]]
 name = "nvidia-cudnn-frontend"
 version = "1.28.0"
-source = { git = "https://github.com/NVIDIA/cudnn-frontend.git?rev=develop#b15181d82170c172f2023521638367cc4c01047b" }
+source = { git = "https://github.com/NVIDIA/cudnn-frontend.git?rev=b15181d82170c172f2023521638367cc4c01047b#b15181d82170c172f2023521638367cc4c01047b" }
 resolution-markers = [
     "python_full_version >= '3.14' and platform_machine != 's390x' and sys_platform == 'win32'",
     "python_full_version >= '3.14' and platform_machine == 's390x' and sys_platform == 'win32'",
