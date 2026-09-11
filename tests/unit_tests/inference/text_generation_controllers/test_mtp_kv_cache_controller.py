@@ -742,8 +742,8 @@ def _make_draft_loop_controller(
     context.mtp_decoder_hidden_states = _hidden(active_request_count)
     context._mtp_begin_decode = mock.Mock()
     context._mtp_setup_decode_step = mock.Mock()
-    context._mtp_advance_decode_step = mock.Mock()
-    context._mtp_end_decode = mock.Mock()
+    context.mtp_metadata.advance_decode_step = mock.Mock()
+    context.mtp_metadata.end_forward = mock.Mock()
     return controller, model, context
 
 
@@ -762,8 +762,8 @@ class TestSerialMtpDraftLoop:
         assert len(model.mtp_step_calls) == 3, "expected D depth forwards plus one extra append"
         # Every forward writes KV, and the write position advances once per forward.
         assert context._mtp_setup_decode_step.call_count == 3
-        assert context._mtp_advance_decode_step.call_count == 3
-        context._mtp_end_decode.assert_called_once()
+        assert context.mtp_metadata.advance_decode_step.call_count == 3
+        context.mtp_metadata.end_forward.assert_called_once()
 
     def test_begins_decode_at_base_position_minus_one(self):
         """Depth 0 writes the roll-by-one entry for main position `base - 1`."""
@@ -850,7 +850,7 @@ class TestSerialMtpDraftLoop:
             # `mtp_inference_context=None` fails with "argument mismatch: Unexpected kwargs".
             assert "mtp_inference_context" not in call
         context._mtp_begin_decode.assert_not_called()
-        context._mtp_end_decode.assert_not_called()
+        context.mtp_metadata.end_forward.assert_not_called()
 
     def test_draft_forwards_receive_the_inference_context_when_enabled(self):
         """Without the context the MTP attention runs cache-free and appends nothing."""
@@ -1315,8 +1315,8 @@ def _build_step(
     context.using_cuda_graph_this_step = lambda: context._using_cuda_graph_this_step
     context._mtp_begin_decode = mock.Mock(side_effect=begin_decode)
     context._mtp_setup_decode_step = mock.Mock(side_effect=setup_decode_step)
-    context._mtp_advance_decode_step = mock.Mock(side_effect=advance_decode_step)
-    context._mtp_end_decode = mock.Mock()
+    context.mtp_metadata.advance_decode_step = mock.Mock(side_effect=advance_decode_step)
+    context.mtp_metadata.end_forward = mock.Mock()
     # The commit pass drives real prefill metadata; keep recording it.
     return controller, model, context, state
 
@@ -1609,8 +1609,8 @@ class TestMtpKvCacheCombinations:
 
         # 3. Draft writes: one setup+advance per forward, positions strictly +1 per depth.
         assert context._mtp_setup_decode_step.call_count == num_mtp_depths + 1
-        assert context._mtp_advance_decode_step.call_count == num_mtp_depths + 1
-        context._mtp_end_decode.assert_called_once()
+        assert context.mtp_metadata.advance_decode_step.call_count == num_mtp_depths + 1
+        context.mtp_metadata.end_forward.assert_called_once()
         positions = state["positions"]
         assert positions[0] == (base_position - 1).cpu().tolist()
         for earlier, later in zip(positions, positions[1:]):

@@ -572,7 +572,7 @@ class MTPInferenceMixin:
         # write position is base_position - 1 (roll-by-one): the MTP entry for main position
         # base_position-1 is computed from H_{base_position-1} + emb(base token). Deriving it from
         # base_position each step (rather than tracking a separate MTP length) means it can never
-        # desync through compaction/pause/rewind. `_mtp_advance_decode_step` bumps it per depth.
+        # desync through compaction/pause/rewind. `advance_decode_step` bumps it per depth.
         mtp_kv_cache_on = getattr(context, "enable_mtp_kv_cache", False) and has_mtp
         # Whether the MTP draft forwards replay captured CUDA graphs this step. Mirror the MAIN
         # decode step's graph decision via `_mtp_resolved_padded_count` (set from the un-clobbered,
@@ -631,7 +631,7 @@ class MTPInferenceMixin:
                     **mtp_context_kwarg,
                 )
                 if mtp_kv_cache_on:
-                    context._mtp_advance_decode_step()
+                    context.mtp_metadata.advance_decode_step()
                 nvtx_range_pop(f"mtp-spec-decoding/depth-{depth}/forward")
 
                 # Strip padding from logits only. Hidden states stay padded+SP
@@ -688,10 +688,10 @@ class MTPInferenceMixin:
                 cache_key=(("mtp_kv", padded_count, extra_depth) if mtp_graphed else None),
                 mtp_inference_context=context,
             )
-            context._mtp_advance_decode_step()
+            context.mtp_metadata.advance_decode_step()
 
         if mtp_kv_cache_on:
-            context._mtp_end_decode()
+            context.mtp_metadata.end_forward()
 
         # In eager mode forward() assigns the hidden states tensor directly to
         # the context attribute; release it so the tensor can be garbage

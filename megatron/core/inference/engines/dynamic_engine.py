@@ -847,7 +847,7 @@ class DynamicInferenceEngine(AbstractEngine):
                         # Uses synthetic scratch metadata (all dummy_block_idx / position 0); graph
                         # replay overwrites it from gpu_view each step, so only shapes/bounds count.
                         if context.enable_mtp_kv_cache:
-                            context._mtp_begin_decode_for_capture(n)
+                            context.mtp_metadata.begin_decode_for_capture(n)
                             for depth in mtp_warmup_depths:
                                 context._mtp_setup_decode_step()
                                 unwrapped.compute_mtp_single_step(
@@ -866,8 +866,8 @@ class DynamicInferenceEngine(AbstractEngine):
                                     mtp_inference_context=context,
                                     cache_key=("mtp_kv", n, depth),
                                 )
-                                context._mtp_advance_decode_step()
-                            context._mtp_end_decode()
+                                context.mtp_metadata.advance_decode_step()
+                            context.mtp_metadata.end_forward()
 
                 context.reset()
 

@@ -2003,7 +2003,9 @@ class DynamicInferenceContext(BaseInferenceContext):
     # advances by exactly 1 + accepted and rejected drafts are overwritten next step.
     #
     # The metadata is driven directly on the GPU, bypassing the coalesced CPU->GPU bookkeeping
-    # transfer, so draft forwards never disturb the main step's Mamba/H2D state.
+    # transfer, so draft forwards never disturb the main step's Mamba/H2D state. Callers drive
+    # the per-depth lifecycle through `mtp_metadata` directly (`advance_decode_step`,
+    # `end_forward`); only the steps that need context state live here.
     #
     # Every draft forward -- depth or varlen commit pass -- prepares the same three things, and
     # the setups below differ only in how they derive the (row, position) pairs and lengths:
@@ -2081,18 +2083,6 @@ class DynamicInferenceContext(BaseInferenceContext):
             block_table_src=block_table_src[active_slice],
             graphed=graphed,
         )
-
-    def _mtp_begin_decode_for_capture(self, padded_count: int) -> None:
-        """Set up synthetic (safe) graphed MTP decode metadata for CUDA-graph CAPTURE at warmup.
-
-        Unlike `_mtp_begin_decode` (which reads real per-request block tables), this points every
-        row at the scratch `dummy_block_idx` at position 0, so the captured append/attend touch only
-        scratch KV memory. Graph replay overwrites all of this from `gpu_view` each step, so the
-        capture-time values are irrelevant to correctness — only the shapes and the fixed launch
-        bounds (padded_count, max_seqlen) matter, and those match the runtime graphed step.
-        """
-        assert self.enable_mtp_kv_cache
-        self.mtp_metadata.begin_decode_for_capture(padded_count)
 
     def _mtp_snapshot_prerewind_block_table(self) -> None:
         """Capture the block table before `_rewind_kv_cache` releases draft blocks.
@@ -2252,14 +2242,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         """Exit MTP-forward mode after the commit-pass (varlen) forward."""
         self.mtp_metadata.end_forward()
         self.num_prefill_requests = self.mtp_metadata.saved_num_prefill_requests
-
-    def _mtp_advance_decode_step(self) -> None:
-        """Advance each active request's MTP write position by one after a depth forward."""
-        self.mtp_metadata.advance_decode_step()
-
-    def _mtp_end_decode(self) -> None:
-        """Exit MTP-forward mode. No persistent MTP length state to write back."""
-        self.mtp_metadata.end_forward()
 
     def mamba_states_cache(
         self, layer_number: int, intermediate: bool = False

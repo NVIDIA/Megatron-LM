@@ -257,6 +257,7 @@ class MTPMetadata:
         touch only scratch KV. Replay overwrites all of it, so only the shapes and the fixed
         launch bounds matter here, and those match the runtime graphed step.
         """
+        assert self.enabled
         self.offsets[:padded_count].zero_()
         self.block_table[:padded_count].fill_(self.dummy_block_idx)
         self._enter_decode(padded_count, padded_count, graphed=True)

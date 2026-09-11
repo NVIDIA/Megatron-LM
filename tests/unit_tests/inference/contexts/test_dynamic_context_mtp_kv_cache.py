@@ -8,11 +8,14 @@ forwards never disturb the main step's state. The methods under test are pure GP
 bookkeeping -- no model forward is involved -- so they are exercised directly against a real
 context with hand-seeded per-request state:
 
-  * `_mtp_begin_decode` / `_mtp_begin_decode_for_capture` -- enter MTP-forward mode
-  * `_mtp_setup_decode_step` / `_mtp_advance_decode_step` -- one draft depth (roll-by-one)
+  * `_mtp_begin_decode` -- enter MTP-forward mode for a draft loop
+  * `_mtp_setup_decode_step` -- one draft depth (roll-by-one)
   * `_mtp_setup_prefill_step` / `_mtp_finalize_prefill_step` -- the varlen commit pass
   * `_mtp_snapshot_prerewind_block_table` -- the pre-rewind block-table snapshot
-  * `_mtp_end_decode` -- leave MTP-forward mode
+
+The per-depth lifecycle itself (`begin_decode_for_capture`, `advance_decode_step`,
+`end_forward`) lives on `MTPMetadata` and is driven directly; only the steps needing context
+state have a wrapper here.
 
 The invariants asserted are the ones the draft attention depends on: write position
 `P_r = base_position_r - 1 + depth`, read length `kv_len = P_r + 1` (write-then-attend), and
@@ -190,14 +193,14 @@ class TestMtpDecodeBookkeeping:
         assert context.mtp_metadata.active_block_table[:, :2].cpu().tolist() == [[3, 4], [7, 9]]
 
     def test_begin_decode_clones_caller_start_positions(self):
-        """`_mtp_advance_decode_step` must not mutate the caller's `base_position - 1` tensor."""
+        """`advance_decode_step` must not mutate the caller's `base_position - 1` tensor."""
         context = _make_context()
         _seed_requests(context, [[3], [7]])
         start_positions = torch.tensor([5, 11], device=torch.cuda.current_device())
 
         context._mtp_begin_decode(2, 2, start_positions)
-        context._mtp_advance_decode_step()
-        context._mtp_advance_decode_step()
+        context.mtp_metadata.advance_decode_step()
+        context.mtp_metadata.advance_decode_step()
 
         assert start_positions.cpu().tolist() == [
             5,
@@ -289,7 +292,7 @@ class TestMtpDecodeBookkeeping:
         assert int(gv.token_to_block_idx[0].item()) == 3
         assert int(gv.token_to_local_position_within_kv_block[0].item()) == BLOCK_SIZE_TOKENS - 1
 
-        context._mtp_advance_decode_step()
+        context.mtp_metadata.advance_decode_step()
         context._mtp_setup_decode_step()
         assert int(gv.token_to_block_idx[0].item()) == 4
         assert int(gv.token_to_local_position_within_kv_block[0].item()) == 0
@@ -306,7 +309,7 @@ class TestMtpDecodeBookkeeping:
         for _ in range(4):
             context._mtp_setup_decode_step()
             seen.append(gv.token_to_position_in_request[:2].cpu().tolist())
-            context._mtp_advance_decode_step()
+            context.mtp_metadata.advance_decode_step()
 
         assert seen == [[5, 11], [6, 12], [7, 13], [8, 14]]
 
@@ -426,14 +429,14 @@ class TestMtpDecodeBookkeeping:
         dummy = context.kv_block_allocator.dummy_block_idx
         gv = context.gpu_view
 
-        context._mtp_begin_decode_for_capture(2)
+        context.mtp_metadata.begin_decode_for_capture(2)
         seen_positions = []
         for _ in range(3):
             context._mtp_setup_decode_step()
             seen_positions.append(gv.token_to_position_in_request[:2].cpu().tolist())
             assert (gv.token_to_block_idx[:2] == dummy).all()
-            context._mtp_advance_decode_step()
-        context._mtp_end_decode()
+            context.mtp_metadata.advance_decode_step()
+        context.mtp_metadata.end_forward()
 
         assert seen_positions == [[0, 0], [1, 1], [2, 2]]
         assert context.mtp_metadata.forward_active is False
@@ -444,18 +447,18 @@ class TestMtpDecodeBookkeeping:
         _seed_requests(context, [[3, 4]])
         dummy = context.kv_block_allocator.dummy_block_idx
 
-        context._mtp_begin_decode_for_capture(1)
+        context.mtp_metadata.begin_decode_for_capture(1)
         for _ in range(BLOCK_SIZE_TOKENS + 2):
             context._mtp_setup_decode_step()
             assert int(context.gpu_view.token_to_block_idx[0].item()) == dummy
-            context._mtp_advance_decode_step()
+            context.mtp_metadata.advance_decode_step()
 
     def test_capture_uses_graph_metadata_at_the_padded_size(self):
         """Capture-time launch bounds must match the runtime graphed step's."""
         context = _make_context()
         _seed_requests(context, [[3, 4]])
 
-        context._mtp_begin_decode_for_capture(4)
+        context.mtp_metadata.begin_decode_for_capture(4)
         context._mtp_setup_decode_step()
 
         assert context.active_attn_metadata is context.graph_attn_metadata
@@ -472,7 +475,7 @@ class TestMtpDecodeBookkeeping:
         context = _make_context()
         _seed_requests(context, [[3, 4]])
 
-        context._mtp_begin_decode_for_capture(4)
+        context.mtp_metadata.begin_decode_for_capture(4)
 
         dummy = context.kv_block_allocator.dummy_block_idx
         assert context.mtp_metadata.graphed is True
@@ -492,7 +495,7 @@ class TestMtpDecodeBookkeeping:
         context._mtp_begin_decode(1, 1, torch.tensor([5], device=torch.cuda.current_device()))
         assert context.mtp_metadata.forward_active is True
 
-        context._mtp_end_decode()
+        context.mtp_metadata.end_forward()
 
         assert context.mtp_metadata.forward_active is False
 
