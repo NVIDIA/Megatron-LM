@@ -610,7 +610,7 @@ def test_2d_mesh_flat_before_replicate_is_rejected(distributed_setup):
         mesh_dim_names=("flat", "replicate"),
     )
 
-    with pytest.raises(ValueError, match="Shard placements must be a suffix"):
+    with pytest.raises(ValueError, match="Flat placements must be a suffix"):
         DBuffer.empty(
             mesh=mesh,
             placements=[Flat(), Replicate()],
