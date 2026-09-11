@@ -223,7 +223,7 @@ class ModelBuilder(abc.ABC, Generic[ModelT, BuildConfigT]):
         mixed_precision_wrapper: Callable[[Any, MegatronModule], MegatronModule] | None = Float16Module,
         model_type: ModelType = ModelType.encoder_or_decoder,
         use_layer_wise_distributed_optimizer: bool = False,
-        use_layer_wise_param_layout: bool = True,
+        layer_wise_param_layout: str = 'decoupled',
     ) -> list[ModelT]:
         """Build model stages and wrap for distributed training.
 
@@ -238,8 +238,10 @@ class ModelBuilder(abc.ABC, Generic[ModelT, BuildConfigT]):
             mixed_precision_wrapper: Mixed precision wrapper, e.g. ``Float16Module``
             model_type: Deprecated flag, only used for backwards compatibility.
             use_layer_wise_distributed_optimizer: Whether the layerwise wiring runs.
-            use_layer_wise_param_layout: When ``use_layer_wise_distributed_optimizer=True``,
-                controls whether to compute and supply a shard-aligned param layout to DDP.
+            layer_wise_param_layout: When ``use_layer_wise_distributed_optimizer=True``, selects the
+                DDP layout for LayerWise-managed buffers: ``'decoupled'`` (default) for the compact
+                no-padding layout, ``'padded'`` for the shard-aligned layout, or ``'legacy'`` to keep
+                LayerWise on its ``allgather_params`` sync path with no layout supplied to DDP.
 
         Returns:
             List of model stages. If the model does not support virtual pipeline parallelism,

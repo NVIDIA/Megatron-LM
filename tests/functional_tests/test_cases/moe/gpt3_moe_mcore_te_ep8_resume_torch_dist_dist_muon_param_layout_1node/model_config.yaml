@@ -66,5 +66,6 @@ MODEL_ARGS:
   --async-save: true
   --use-persistent-ckpt-worker: true
   --use-distributed-optimizer: true
+  --layer-wise-param-layout: padded
 TEST_TYPE: ckpt-resume
 LAUNCHER: ft_launcher

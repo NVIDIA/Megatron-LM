@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from unittest.mock import MagicMock, Mock, patch
 
@@ -719,6 +719,95 @@ class TestDdpWrapFullParamLayout:
         assert layout_args.args[2] == 4  # dp world size
         assert layout_args.args[3] is ddp_config
         assert layout_args.kwargs["expert_data_parallel_world_size"] == 2
+
+    @pytest.mark.parametrize("layout", ["padded", "decoupled"])
+    @patch("megatron.training.models.dist_utils.tag_params_for_buffer_routing")
+    @patch("megatron.training.models.dist_utils.LayerWiseDistributedOptimizer")
+    @patch("megatron.training.models.dist_utils.DistributedDataParallel")
+    @patch("megatron.training.models.dist_utils.get_model_config")
+    @patch("torch.cuda.stream", new_callable=MagicMock)
+    @patch("torch.cuda.current_stream")
+    @patch("torch.cuda.Stream")
+    def test_layer_wise_layout_matches_traditional_model_entry(
+        self,
+        mock_stream,
+        mock_curr,
+        mock_ctx,
+        mock_cfg,
+        mock_ddp,
+        mock_layer_wise_optimizer,
+        mock_tag_params,
+        layout,
+    ):
+        """'padded' and 'decoupled' both supply a LayerWise layout to DDP."""
+        mock_ctx.return_value.__enter__ = Mock(return_value=None)
+        mock_ctx.return_value.__exit__ = Mock(return_value=False)
+        mock_layer_wise_optimizer.compute_full_param_layout.return_value = "LAYERWISE_LAYOUT"
+        chunk, param = self._make_chunk_with_params()
+        # Seed with the other layout so the assertion below proves _ddp_wrap wrote it.
+        ddp_config = self._ddp_config(
+            use_distributed_optimizer=False,
+            layer_wise_param_layout="decoupled" if layout == "padded" else "padded",
+        )
+
+        _ddp_wrap(
+            [chunk],
+            False,
+            ddp_config,
+            False,
+            pg_collection=self.pg,
+            use_layer_wise_distributed_optimizer=True,
+            layer_wise_param_layout=layout,
+        )
+
+        assert ddp_config.use_distributed_optimizer
+        assert ddp_config.layer_wise_param_layout == layout
+        mock_tag_params.assert_called_once_with([chunk])
+        layout_args = mock_layer_wise_optimizer.compute_full_param_layout.call_args
+        assert layout_args.args[0] == [param]
+        assert layout_args.args[3] is ddp_config
+        assert mock_ddp.call_args.kwargs["full_param_layout"] == "LAYERWISE_LAYOUT"
+
+    @patch("megatron.training.models.dist_utils.tag_params_for_buffer_routing")
+    @patch("megatron.training.models.dist_utils.LayerWiseDistributedOptimizer")
+    @patch("megatron.training.models.dist_utils.DistributedDataParallel")
+    @patch("megatron.training.models.dist_utils.get_model_config")
+    @patch("torch.cuda.stream", new_callable=MagicMock)
+    @patch("torch.cuda.current_stream")
+    @patch("torch.cuda.Stream")
+    def test_layer_wise_legacy_layout_leaves_ddp_untouched(
+        self,
+        mock_stream,
+        mock_curr,
+        mock_ctx,
+        mock_cfg,
+        mock_ddp,
+        mock_layer_wise_optimizer,
+        mock_tag_params,
+    ):
+        """'legacy' tells DDP nothing about LayerWise: no DistOpt, no tagging, no layout."""
+        mock_ctx.return_value.__enter__ = Mock(return_value=None)
+        mock_ctx.return_value.__exit__ = Mock(return_value=False)
+        chunk, _param = self._make_chunk_with_params()
+        ddp_config = self._ddp_config(
+            use_distributed_optimizer=False, layer_wise_param_layout="decoupled"
+        )
+
+        _ddp_wrap(
+            [chunk],
+            False,
+            ddp_config,
+            False,
+            pg_collection=self.pg,
+            use_layer_wise_distributed_optimizer=True,
+            layer_wise_param_layout="legacy",
+        )
+
+        assert not ddp_config.use_distributed_optimizer
+        assert ddp_config.layer_wise_param_layout == "legacy"
+        mock_tag_params.assert_not_called()
+        mock_layer_wise_optimizer.compute_full_param_layout.assert_not_called()
+        assert mock_ddp.call_args.kwargs.get("full_param_layout") is None
 
     @patch("megatron.training.models.dist_utils.DistributedDataParallel")
     @patch("megatron.training.models.dist_utils.get_model_config")

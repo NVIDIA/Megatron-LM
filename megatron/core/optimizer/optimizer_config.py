@@ -1,8 +1,8 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import fnmatch
 from dataclasses import dataclass, field
-from typing import Callable, Optional, Tuple, Union
+from typing import Callable, Literal, Optional, Tuple, Union
 
 import torch
 
@@ -330,6 +330,20 @@ class OptimizerConfig:
     When set via ``--use-distributed-optimizer`` with an emerging optimizer, the training
     arguments layer sets this flag and resets ``use_distributed_optimizer`` to False so
     that the standard distributed-optimizer path is not triggered."""
+
+    layer_wise_param_layout: Literal['padded', 'decoupled', 'legacy'] = 'decoupled'
+    """Layer-wise (Muon) optimizer only; selects the DDP layout for LayerWise-managed buffers.
+
+    - ``'decoupled'`` (default): compact no-padding DDP layout for the LayerWise (Muon) buffers,
+      which locally disable ``use_distributed_optimizer`` (all-reduce gradients, whole-param
+      ping-pong ownership, ``allgather_params`` sync), while sibling buffers keep the byte-level
+      ``DistributedOptimizer``.
+    - ``'padded'``: shard-aligned padded LayerWise param layout, synced through the standard DDP
+      parameter buffer.
+    - ``'legacy'``: no layout is supplied to DDP; every parameter lands in one non-DistOpt buffer
+      and LayerWise owns the sync end to end.
+
+    Mirrors ``layer_wise_param_layout`` in ``distributed_data_parallel_config.py``."""
 
     overlap_param_gather: bool = False
     """If true, overlap param all-gather with forward compute. 
