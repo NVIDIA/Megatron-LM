@@ -226,7 +226,8 @@ class TestMXFP8ReshardTransform:
                 persistent_buffers={"first": triton_buffer, "second": flashinfer_buffer},
             )
 
-    def test_concatenated_moe_buffers_remain_refittable(self):
+    @pytest.mark.parametrize("grouped_gemm_backend", ["torch", "vllm"])
+    def test_concatenated_moe_buffers_remain_refittable(self, grouped_gemm_backend):
         """Lazy MoE stacking must not replace persistent storage with inference tensors."""
         from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
         from megatron.core.resharding.transforms import MXFP8ReshardTransform
@@ -238,7 +239,7 @@ class TestMXFP8ReshardTransform:
         num_experts, M, K = 2, 64, 128
         grouped_mlp = Namespace()
         grouped_mlp.num_local_experts = num_experts
-        grouped_mlp.inference_grouped_gemm_backend = "torch"
+        grouped_mlp.inference_grouped_gemm_backend = grouped_gemm_backend
         buffers = {}
         for linear_name in ("linear_fc1", "linear_fc2"):
             linear = Namespace()

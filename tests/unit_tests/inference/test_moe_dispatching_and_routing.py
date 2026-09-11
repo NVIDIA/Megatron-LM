@@ -658,11 +658,41 @@ class TestNVLSAllGatherVDispatcher:
 
     @requires_te
     @pytest.mark.launch_on_gb200
-    @pytest.mark.parametrize("batch_invariant_mode", [False, True])
-    def test_te_mxfp8_moe_layer_end_to_end(self, batch_invariant_mode):
-        """Native TE MXFP8 is bitwise co-batch invariant through the real NVLS layer."""
+    @pytest.mark.parametrize(
+        (
+            "inference_grouped_gemm_backend",
+            "batch_invariant_mode",
+            "expert_mxfp8",
+            "gated_linear_unit",
+        ),
+        [
+            pytest.param("te", False, True, False, id="te-non-invariant"),
+            pytest.param("te", True, True, False, id="te-invariant"),
+            pytest.param("flashinfer", True, True, False, id="flashinfer-invariant"),
+            pytest.param("torch", True, True, False, id="torch-invariant"),
+            pytest.param("torch", True, True, True, id="torch-swiglu-invariant"),
+            pytest.param("flashinfer", True, False, False, id="flashinfer-bf16-edge"),
+            pytest.param("vllm", False, True, False, id="vllm-mxfp8"),
+            pytest.param("vllm", False, True, True, id="vllm-swiglu-mxfp8"),
+            pytest.param("vllm", False, False, False, id="vllm-bf16-edge"),
+        ],
+    )
+    def test_mxfp8_moe_layer_end_to_end(
+        self, inference_grouped_gemm_backend, batch_invariant_mode, expert_mxfp8, gated_linear_unit
+    ):
+        """MXFP8 and selectively BF16 experts execute through the real NVLS layer."""
         from megatron.core.fp8_utils import get_fp8_context
         from megatron.core.inference.moe import HAVE_TE_GROUPED_MXFP8
+        from megatron.core.inference.moe.flashinfer_mxfp8 import (
+            HAVE_FLASHINFER_ROUTED_MXFP8,
+            FlashInferRoutedMXFP8Weight,
+        )
+        from megatron.core.inference.moe.fused_moe import HAVE_SCALED_GMM
+        from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
+        from megatron.core.inference.quantization.utils import (
+            quantize_model_to_mxfp8,
+            resolve_mxfp8_backend,
+        )
         from megatron.core.models.gpt.moe_module_specs import get_inference_optimized_moe_spec
         from megatron.core.parallel_state import get_expert_model_parallel_group
         from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
@@ -674,16 +704,25 @@ class TestNVLSAllGatherVDispatcher:
 
         if Utils.world_size & (Utils.world_size - 1):
             pytest.skip("NVLS Triton symmetric-memory barrier requires power-of-two EP size.")
-        if (
-            not torch.cuda.is_available()
-            or not HAVE_TE_GROUPED_MXFP8
-            or torch.cuda.get_device_capability()[0] < 10
-        ):
-            pytest.skip("Native TE MXFP8 grouped GEMM requires its device APIs and Blackwell")
+        if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 10:
+            pytest.skip("MXFP8 grouped GEMM requires Blackwell")
+        if inference_grouped_gemm_backend == "te" and not HAVE_TE_GROUPED_MXFP8:
+            pytest.skip("Native TE MXFP8 grouped GEMM requires its device APIs")
+        if inference_grouped_gemm_backend == "flashinfer" and not HAVE_FLASHINFER_ROUTED_MXFP8:
+            pytest.skip("FlashInfer routed MXFP8 is unavailable")
+        if inference_grouped_gemm_backend == "torch" and not HAVE_SCALED_GMM:
+            pytest.skip("Torch scaled_grouped_mm MXFP8 is unavailable")
 
         config = _make_base_config(
+            num_layers=1,
+            hidden_size=256,
+            ffn_hidden_size=256,
+            moe_ffn_hidden_size=256,
+            num_attention_heads=8,
+            gated_linear_unit=gated_linear_unit,
+            activation_func=(torch.nn.functional.silu if gated_linear_unit else squared_relu),
             expert_model_parallel_size=Utils.world_size,
-            inference_grouped_gemm_backend="te",
+            inference_grouped_gemm_backend=inference_grouped_gemm_backend,
             inference_moe_token_dispatcher_type="nvls",
             fp8="hybrid",
             fp8_recipe="mxfp8",
@@ -704,6 +743,12 @@ class TestNVLSAllGatherVDispatcher:
         )
         with get_fp8_context(config, 0, is_init=True):
             layer = get_inference_optimized_moe_spec()(config=config).cuda().eval()
+        if inference_grouped_gemm_backend != "te":
+            quantize_model_to_mxfp8(
+                layer,
+                backend=resolve_mxfp8_backend(inference_grouped_gemm_backend),
+                include_pattern=(r"(^|\.)experts\.linear_fc[12]\." if expert_mxfp8 else r"$^"),
+            )
 
         shared_tokens = 17 + torch.distributed.get_rank()
         # Across EP ranks the larger case adds enough routed rows to move typical
@@ -717,6 +762,8 @@ class TestNVLSAllGatherVDispatcher:
             set_batch_invariant_mode(batch_invariant_mode, backend="te_native"),
         ):
             small_output, _ = layer(hidden_states[:shared_tokens])
+            # NVLS may return graph-stable workspace, which the next iteration reuses.
+            small_output = small_output.clone()
             large_output, _ = layer(hidden_states)
 
         assert small_output.shape == hidden_states[:shared_tokens].shape
@@ -724,6 +771,11 @@ class TestNVLSAllGatherVDispatcher:
         assert small_output.dtype == torch.bfloat16
         assert torch.isfinite(small_output).all()
         assert torch.isfinite(large_output).all()
+
+        if inference_grouped_gemm_backend == "flashinfer" and expert_mxfp8:
+            assert isinstance(layer.experts._fc1_weight, FlashInferRoutedMXFP8Weight)
+        elif inference_grouped_gemm_backend in ("torch", "vllm") and expert_mxfp8:
+            assert isinstance(layer.experts._fc1_weight, MXFP8Tensor)
 
         if batch_invariant_mode:
             shared_large_output = large_output[:shared_tokens]
