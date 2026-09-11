@@ -9,7 +9,11 @@ import pytest
 import torch
 
 from megatron.core import parallel_state
-from megatron.core.inference.config import InferenceConfig, MambaInferenceStateConfig
+from megatron.core.inference.config import (
+    InferenceConfig,
+    KVCacheManagementMode,
+    MambaInferenceStateConfig,
+)
 from megatron.core.inference.contexts.dynamic_context import (
     DynamicInferenceContext,
     RequestOverflowError,
@@ -21,6 +25,7 @@ from megatron.core.inference.sampling.torch_sampling import TorchSampling
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.moe.token_dispatcher_inference import NVLSAllGatherVDispatcher
 from megatron.core.transformer.transformer_block import get_num_layers_to_build
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
@@ -78,6 +83,52 @@ class TestDynamicContext:
             tensor_model_parallel_size=1, pipeline_model_parallel_size=1
         )
         model_parallel_cuda_manual_seed(123)
+
+    @pytest.mark.internal
+    def test_recompute_rebinds_nvls_real_token_count_tensor(self):
+        """A RECOMPUTE resume binds NVLS to the newly allocated GPU view."""
+        model_config = TransformerConfig(
+            params_dtype=torch.float32,
+            num_layers=4,
+            hidden_size=16,
+            ffn_hidden_size=16,
+            kv_channels=8,
+            num_attention_heads=2,
+            num_moe_experts=2,
+            moe_ffn_hidden_size=16,
+            moe_router_topk=2,
+            moe_router_dtype="fp32",
+            moe_grouped_gemm=True,
+            transformer_impl="inference_optimized",
+            inference_grouped_gemm_backend="torch",
+            normalization="RMSNorm",
+            add_bias_linear=False,
+            add_qkv_bias=False,
+            use_cpu_initialization=True,
+        )
+        context = DynamicInferenceContext(
+            model_config=model_config,
+            inference_config=InferenceConfig(
+                max_sequence_length=512,
+                buffer_size_gb=0.03,
+                paused_buffer_size_gb=0.006,
+                block_size_tokens=128,
+                kv_cache_management_mode=KVCacheManagementMode.RECOMPUTE,
+                use_flashinfer_fused_rope=False,
+                unified_memory_level=0,
+            ),
+        )
+
+        old_real_token_count = context.gpu_view.real_token_count
+        assert NVLSAllGatherVDispatcher._real_token_count_tensor is old_real_token_count
+
+        context.deallocate_inference_state_buffers()
+        context.reinitialize_inference_state_buffers()
+
+        assert context.gpu_view.real_token_count is not old_real_token_count
+        assert (
+            NVLSAllGatherVDispatcher._real_token_count_tensor is context.gpu_view.real_token_count
+        )
 
     def _get_dynamic_context(
         self,

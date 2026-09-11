@@ -754,10 +754,15 @@ class DynamicInferenceContext(BaseInferenceContext):
             and model_config.inference_moe_token_dispatcher_type == 'nccl'
         )
 
-        # are we using the inference_optimized nvls ep dispatcher for MoEs?
-        self._nvls_dispatcher = (
-            get_pg_size(self.expert_model_parallel_group) > 1
+        # Does the model construct the inference-optimized NVLS dispatcher? Unlike
+        # the communication-buffer predicate below, this remains true at EP=1.
+        self._uses_nvls_dispatcher = (
+            model_config.transformer_impl == "inference_optimized"
+            and model_config.num_moe_experts is not None
             and model_config.inference_moe_token_dispatcher_type == 'nvls'
+        )
+        self._nvls_dispatcher = (
+            get_pg_size(self.expert_model_parallel_group) > 1 and self._uses_nvls_dispatcher
         )
 
         # are we using the training a2a dispatcher for MoEs?
@@ -876,16 +881,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.is_tensor_state_allocated = False
         self._bookkeeping_no_real_work = False
         self.initialize_all_tensors()
-
-        # Bind the GPU real-token-count tensor onto the NVLS dispatcher class
-        # so it can mask out CUDA-graph padding tokens during routing. The
-        # tensor lives inside gpu_view._buf (fixed address) and is refreshed
-        # each step by transfer_bookkeeping_to_gpu(). EP=1 still constructs the
-        # NVLS dispatcher even though it does not allocate communication
-        # buffers, and needs this tensor to distinguish real from graph-padded
-        # rows.
-        if model_config.inference_moe_token_dispatcher_type == 'nvls':
-            NVLSAllGatherVDispatcher.set_real_token_count_tensor(self.gpu_view.real_token_count)
 
         # Print info.
         pool_size = self.kv_block_allocator.pool_size
@@ -1497,6 +1492,12 @@ class DynamicInferenceContext(BaseInferenceContext):
                 self._mamba_decode_indices_dtype if self.is_hybrid_model else torch.int64
             ),
         )
+        # Bind after every ContextGPUView allocation, including RECOMPUTE resume.
+        # The tensor lives inside gpu_view._buf (fixed address) and is refreshed
+        # each step by transfer_bookkeeping_to_gpu(). EP=1 still constructs the
+        # NVLS dispatcher even though it does not allocate communication buffers.
+        if self._uses_nvls_dispatcher:
+            NVLSAllGatherVDispatcher.set_real_token_count_tensor(self.gpu_view.real_token_count)
         self._bookkeeping_h2d_done_event = torch.cuda.Event()
 
         # Cache of (input_ids_view, pos_ids_view) keyed by num_tokens. Instead of slicing and
