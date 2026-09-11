@@ -910,6 +910,32 @@ def test_cpu_initialized_parameters_shard_to_mesh_device(distributed_setup):
     torch.testing.assert_close(output, expected_output)
 
 
+def test_fully_shard_preserves_parameter_attributes(distributed_setup):
+    """Sharded parameters should retain the original model metadata."""
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    model = nn.Linear(8, 8, bias=False, device=device)
+    attributes = {
+        "is_embedding_or_output_parameter": True,
+        "is_embedding_parameter": True,
+        "use_muon": False,
+        "allreduce": False,
+        "sequence_parallel": True,
+        "tensor_model_parallel": True,
+        "partition_dim": 0,
+        "partition_stride": 1,
+        "qkv_split_shapes": None,
+    }
+    for name, value in attributes.items():
+        setattr(model.weight, name, value)
+
+    with fully_shard_context(device=device):
+        fully_shard(model, mesh=mesh, placements=_flat_placements())
+
+    for name, value in attributes.items():
+        assert getattr(model.weight, name) == value, name
+
+
 def test_meta_parameters_shard_to_mesh_device(distributed_setup):
     """A sharded meta model should support initialization and forward."""
     world_size = distributed_setup.world_size
