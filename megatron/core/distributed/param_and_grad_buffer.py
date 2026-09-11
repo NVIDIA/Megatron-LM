@@ -151,13 +151,13 @@ class _ParamAndGradBucket:
             self.param_to_index[param] = (global_start - offset, global_end - offset)
         self.params_with_extra_main_grads = params_with_extra_main_grads
 
-        # Layer-wise optimizer attributes for async param gather.
+        # Layer-wise optimizer attributes for bucket-based parameter gather.
         self.layerwise_params_list = None
         self.layerwise_param_flat_sizes = None
         self.layerwise_gather_list = None
 
     def set_layerwise_params_list(self, layerwise_params_list: List[List[torch.nn.Parameter]]):
-        """Set per-rank parameter lists for layer-wise async all-gather.
+        """Set per-rank parameter lists for layer-wise bucket all-gather.
 
         Args:
             layerwise_params_list: List of param lists, one per rank in the DP group.
@@ -242,9 +242,15 @@ class _ParamAndGradBucketGroup:
         self.buckets = buckets
         self.ddp_config = ddp_config
 
-        # overlap_param_gather covers the layer-wise optimizer case, which sets
-        # overlap_param_gather=True without use_distributed_optimizer.
-        if self.ddp_config.use_distributed_optimizer or self.ddp_config.overlap_param_gather:
+        # ``reuse_grad_buf_for_mxfp8_param_ag`` also uses this group for the synchronous
+        # compact LayerWise path. That path has no overlap and no distributed-optimizer
+        # param buffer, but it still needs the bucket's collective metadata in order to
+        # reuse ``grad_data`` as its fixed receive arena.
+        if (
+            self.ddp_config.use_distributed_optimizer
+            or self.ddp_config.overlap_param_gather
+            or self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag
+        ):
             self.intra_distributed_optimizer_instance_group = collective_group
             self.intra_distributed_optimizer_instance_size = collective_group_size
             self.intra_distributed_optimizer_instance_rank = collective_group.rank()
@@ -457,9 +463,19 @@ class _ParamAndGradBucketGroup:
             force_sync (bool, optional): force synchronous collective regardless of
                 other settings if true.
         """
-        # overlap_param_gather covers the layer-wise optimizer case, which sets
-        # overlap_param_gather=True without use_distributed_optimizer.
-        assert self.ddp_config.use_distributed_optimizer or self.ddp_config.overlap_param_gather
+        # The compact LayerWise MXFP8 path can invoke the bucket synchronously after
+        # optimizer.step(). It reuses grad_data and therefore requires both the explicit
+        # reuse contract and populated per-rank LayerWise parameter lists.
+        synchronous_layerwise_reuse = bool(
+            force_sync
+            and self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag
+            and any(bucket.layerwise_params_list is not None for bucket in self.buckets)
+        )
+        assert (
+            self.ddp_config.use_distributed_optimizer
+            or self.ddp_config.overlap_param_gather
+            or synchronous_layerwise_reuse
+        )
 
         if force_sync:
             if self.param_gather_handle is not None:
@@ -550,22 +566,51 @@ class _ParamAndGradBucketGroup:
                 # during the forward pass where autograd is active.
                 if local_size > 0:
                     if bucket_is_fp8:
-                        # Stage fp32 master->bf16 (high-precision source), not lossy dequant(fp8).
-                        staged = [
-                            _stage_param_to_bf16(p)
-                            for p in bucket.layerwise_params_list[local_rank]
-                        ]
-                        flat_local_params = _flatten_dense_tensors(staged)
+                        # Stage fp32 master->bf16 (high-precision source), not lossy
+                        # dequant(fp8), directly into the receive arena. Copying one
+                        # parameter at a time avoids retaining both every staged tensor
+                        # and a second flattened local-owner tensor at peak memory.
+                        local_offset = 0
+                        for param in bucket.layerwise_params_list[local_rank]:
+                            param_end = local_offset + param.numel()
+                            destination = local_slot_view[local_offset:param_end]
+                            main_param = getattr(param, "main_param", None)
+                            if main_param is not None:
+                                # Let copy_ cast fp32 directly into the bf16 arena instead
+                                # of allocating an equally large intermediate tensor.
+                                destination.copy_(main_param.detach().view(-1))
+                            else:
+                                destination.copy_(_stage_param_to_bf16(param).view(-1))
+                            local_offset = param_end
+                        assert local_offset == local_size
                     else:
                         flat_local_params = _flatten_dense_tensors(
                             bucket.layerwise_params_list[local_rank]
                         ).detach()
-                    local_slot_view.copy_(flat_local_params)
+                        local_slot_view.copy_(flat_local_params)
                 bucket.layerwise_gather_list = gather_list
 
-                work = torch.distributed.all_gather(
-                    gather_list, local_slot_view, group=group, async_op=async_op
-                )
+                if len(set(bucket.layerwise_param_flat_sizes)) == 1:
+                    # ProcessGroupNCCL's list-based equal-size fast path first
+                    # flattens the output list into a new tensor. Use the tensor API
+                    # so NCCL writes directly into the existing contiguous grad arena.
+                    # This is the same supported in-place layout as the standard
+                    # distributed-optimizer path: the input is its rank-local slice
+                    # of the output tensor.
+                    work = dist_all_gather_func(
+                        reuse_buf[:total_gather_size],
+                        local_slot_view,
+                        group=group,
+                        async_op=async_op,
+                    )
+                else:
+                    # The list API preserves uneven owner sizes. ProcessGroupNCCL
+                    # implements this case as grouped point-to-point operations into
+                    # the supplied views rather than allocating an equal-size flat
+                    # output tensor.
+                    work = torch.distributed.all_gather(
+                        gather_list, local_slot_view, group=group, async_op=async_op
+                    )
                 if async_op and work is not None:
                     layerwise_work_handles.append(work)
 
