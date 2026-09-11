@@ -125,6 +125,10 @@ class MockQwen35VLDataset(Dataset):
         # data_parallel_random_init is set, so ambient-RNG draws collapse a global batch's
         # distinct samples to the per-rank microbatch count — a number that changes with the
         # parallel layout, so two configurations being compared see different data.
+        # Indexing also keeps pipeline stages in agreement: Megatron gives each stage a
+        # different global seed (initialize._set_random_seed adds 100 * pp_rank) and every
+        # PP rank builds its own dataset, so a globally-drawn sample would differ between
+        # stages of the same job.
         generator = torch.Generator().manual_seed(
             _sample_seed(self.seed, self.split, idx)
         )
