@@ -86,23 +86,13 @@ Do not use this tool to merge checkpoints from different architectures, tensor
 layouts, or model-parallel sharding. Those cases are rejected instead of being
 reshaped or reconciled.
 
-### MiMo and VLM checkpoints
+### VLM checkpoints with split model roots
 
-Recent MiMo/VLM checkpoints can store the distributed model shards separately
-from `common.pt`, and their model tensors use two top-level roots rather than
-the default `model.` root:
+Some VLM checkpoints store distributed model shards separately from
+`common.pt` and use two top-level roots rather than the default `model.` root:
 
 - `language_model.` contains the language model, including any MTP parameters;
 - `modality_submodules.` contains the vision encoder and multimodal projector.
-
-In current MiMo/VLM training, the vision encoder is frozen while the projector
-is trained. The merge tool does not infer that training policy: it applies the
-same coefficients to every floating tensor under `modality_submodules.`.
-Normalized coefficients preserve the identical frozen encoder weights while
-averaging the changing projector weights. If a future run also trains the
-encoder, the same command will average its changing weights as well. Manual
-weights whose sum is not one will scale even identical frozen tensors; pass
-`--normalize` unless that behavior is intentional.
 
 Select both roots explicitly and require them to exist in every source. These
 checkpoints can also contain optimizer, RNG, or other training state under
@@ -115,15 +105,15 @@ iteration:
 
 ```bash
 python tools/checkpoint/weighted_merge.py \
-  --merge-inputs /checkpoints/mimo_vlm_run \
-  --start-checkpoint 56000 \
-  --end-checkpoint 70000 \
-  --min-iteration-interval 2000 \
-  --min-checkpoints 8 \
+  --merge-inputs /checkpoints/vlm_run \
+  --start-checkpoint 1000 \
+  --end-checkpoint 5000 \
+  --min-iteration-interval 1000 \
+  --min-checkpoints 2 \
   --merge-style minus-sqrt \
-  --merge-output /checkpoints/merged/mimo_vlm \
-  --output-iteration 70000 \
-  --common-state-checkpoint /checkpoints/common/iter_0070000 \
+  --merge-output /checkpoints/merged/vlm \
+  --output-iteration 5000 \
+  --common-state-checkpoint /checkpoints/common/iter_0005000 \
   --merge-model-prefix 'language_model.' \
   --merge-model-prefix 'modality_submodules.' \
   --merge-ignore-non-model-state \
