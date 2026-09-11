@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import TYPE_CHECKING, Dict, Optional, Tuple
 
 import torch
@@ -106,15 +107,76 @@ def get_te_grouped_moe_parameter_ids(model: torch.nn.Module) -> set[int]:
     return parameter_ids
 
 
+def matches_mxfp8_parameter_filter(
+    parameter_name: str, include_pattern: str | None = None, exclude_pattern: str | None = None
+) -> bool:
+    """Return whether a fully qualified parameter name should remain in MXFP8.
+
+    Inclusion defaults to all parameters. Exclusion takes precedence when both
+    regular expressions match.
+    """
+    included = include_pattern is None or re.search(include_pattern, parameter_name) is not None
+    excluded = (
+        exclude_pattern is not None and re.search(exclude_pattern, parameter_name) is not None
+    )
+    return included and not excluded
+
+
+def _validate_mxfp8_parameter_filters(
+    include_pattern: str | None, exclude_pattern: str | None
+) -> None:
+    """Validate parameter filters before any model parameters are mutated."""
+    for pattern in (include_pattern, exclude_pattern):
+        if pattern is None:
+            continue
+        try:
+            re.compile(pattern)
+        except re.error as error:
+            raise ValueError(f"Invalid MXFP8 parameter regex {pattern!r}: {error}") from error
+
+
+def _materialize_mxfp8_parameter_as_bf16(
+    module: torch.nn.Module, parameter_name: str, parameter: torch.Tensor
+) -> None:
+    """Replace a TE MXFP8 parameter with a BF16 parameter while preserving sharding metadata."""
+    bf16_parameter = torch.nn.Parameter(
+        parameter.dequantize().to(torch.bfloat16), requires_grad=parameter.requires_grad
+    )
+    for attribute in (
+        "allreduce",
+        "expert_parallel",
+        "expert_tp",
+        "group",
+        "is_embedding_or_output_parameter",
+        "is_gtp_weight_remat",
+        "is_qkv",
+        "pad_length",
+        "partition_dim",
+        "partition_sizes",
+        "partition_stride",
+        "qkv_split_shapes",
+        "sequence_parallel",
+        "tensor_model_parallel",
+    ):
+        if hasattr(parameter, attribute):
+            setattr(bf16_parameter, attribute, getattr(parameter, attribute))
+    del module._parameters[parameter_name]
+    setattr(module, parameter_name, bf16_parameter)
+
+
 def quantize_model_to_mxfp8(
     model: torch.nn.Module,
     backend: MXFP8Backend = "flashinfer",
     excluded_parameter_ids: set[int] | None = None,
+    include_pattern: str | None = None,
+    exclude_pattern: str | None = None,
+    _prefix: str = "",
 ) -> None:
     """Convert TE MXFP8 weights to mcore MXFP8Tensor format.
 
-    Recursively walks the model and replaces each TEMXFP8Tensor parameter
-    with an MXFP8Tensor re-quantized via the specified backend.
+    Recursively walks the model and applies the configured precision policy to
+    each TEMXFP8Tensor parameter. Selected parameters are re-quantized into an
+    MCore MXFP8Tensor and unselected parameters are materialized in BF16.
 
     Args:
         model: The model whose TE MXFP8 parameters should be converted.
@@ -122,14 +184,43 @@ def quantize_model_to_mxfp8(
         excluded_parameter_ids: Parameters to preserve in their native TE format.
             The TE grouped-MoE backend uses this for its expert weights while dense
             inference layers are still converted to the requested MCore layout.
+        include_pattern: Regex selecting fully qualified parameter names to keep in MXFP8.
+            If unset, all MXFP8 parameters are included.
+        exclude_pattern: Regex selecting fully qualified parameter names to materialize
+            in BF16. Exclusion takes precedence over inclusion.
+        _prefix: Internal recursion prefix; callers should not set this.
     """
     assert HAVE_TE
     if backend == "flashinfer":
         assert HAVE_FLASHINFER, "FlashInfer not available for MXFP8 quantization"
 
-    for child in model.children():
+    if _prefix == "":
+        _validate_mxfp8_parameter_filters(include_pattern, exclude_pattern)
+
+    if _prefix == "" and excluded_parameter_ids is not None:
+        for parameter_name, parameter in model.named_parameters():
+            if id(parameter) not in excluded_parameter_ids:
+                continue
+            is_te_mxfp8 = isinstance(parameter, TEMXFP8Tensor) or (
+                hasattr(parameter, 'data') and isinstance(parameter.data, TEMXFP8Tensor)
+            )
+            if is_te_mxfp8 and not matches_mxfp8_parameter_filter(
+                parameter_name, include_pattern=include_pattern, exclude_pattern=exclude_pattern
+            ):
+                raise ValueError(
+                    f"MXFP8 parameter filters select {parameter_name!r} for BF16, but the "
+                    "configured grouped-MoE backend requires it in native TE MXFP8."
+                )
+
+    for child_name, child in model.named_children():
+        child_prefix = f"{_prefix}{child_name}."
         quantize_model_to_mxfp8(
-            child, backend=backend, excluded_parameter_ids=excluded_parameter_ids
+            child,
+            backend=backend,
+            excluded_parameter_ids=excluded_parameter_ids,
+            include_pattern=include_pattern,
+            exclude_pattern=exclude_pattern,
+            _prefix=child_prefix,
         )
 
     def replace_in_dict(attr_dict):
@@ -137,12 +228,24 @@ def quantize_model_to_mxfp8(
         keys = list(attr_dict.keys())
         for key in keys:
             val = attr_dict[key]
-            if excluded_parameter_ids is not None and id(val) in excluded_parameter_ids:
-                continue
             is_te_mxfp8 = isinstance(val, TEMXFP8Tensor) or (
                 hasattr(val, 'data') and isinstance(val.data, TEMXFP8Tensor)
             )
             if is_te_mxfp8:
+                full_name = f"{_prefix}{key}"
+                keep_mxfp8 = matches_mxfp8_parameter_filter(
+                    full_name, include_pattern=include_pattern, exclude_pattern=exclude_pattern
+                )
+                if excluded_parameter_ids is not None and id(val) in excluded_parameter_ids:
+                    if not keep_mxfp8:
+                        raise ValueError(
+                            f"MXFP8 parameter filters select {full_name!r} for BF16, but the "
+                            "configured grouped-MoE backend requires it in native TE MXFP8."
+                        )
+                    continue
+                if not keep_mxfp8:
+                    _materialize_mxfp8_parameter_as_bf16(model, key, val)
+                    continue
                 # Undo the TE quantization and re-quantize
                 # Note that this introduces a one-time overhead but avoids any
                 # numerical differences between TE and mcore MXFP8 formats
@@ -214,6 +317,9 @@ def quantize_params_to_mxfp8(
     _prefix: str = "",
     backend: MXFP8Backend = "flashinfer",
     excluded_parameter_ids: set[int] | None = None,
+    include_pattern: str | None = None,
+    exclude_pattern: str | None = None,
+    _filter_prefix: str = "",
 ) -> Dict[str, MXFP8Tensor]:
     """Quantize model parameters to mutable MXFP8Tensor storage.
 
@@ -232,12 +338,33 @@ def quantize_params_to_mxfp8(
         _prefix: Internal recursion prefix; callers should not set this.
         backend: 'flashinfer' or 'triton' quantization backend.
         excluded_parameter_ids: Parameters that should remain in native TE format.
+        include_pattern: Regex selecting fully qualified parameter names to keep in MXFP8.
+            If unset, all MXFP8 parameters are included.
+        exclude_pattern: Regex selecting fully qualified parameter names to materialize
+            in BF16. Exclusion takes precedence over inclusion.
+        _filter_prefix: Internal prefix used to match names from a model subtree.
 
     Returns:
         The ``persistent_buffers`` dict (created on first call if ``None``).
     """
     if backend == "flashinfer":
         assert HAVE_FLASHINFER, "FlashInfer not available for MXFP8 quantization"
+
+    if _prefix == "":
+        _validate_mxfp8_parameter_filters(include_pattern, exclude_pattern)
+
+        if excluded_parameter_ids is not None:
+            for parameter_name, parameter in model.named_parameters():
+                if id(parameter) not in excluded_parameter_ids:
+                    continue
+                full_name = f"{_filter_prefix}{parameter_name}"
+                if _should_quantize_param(parameter) and not matches_mxfp8_parameter_filter(
+                    full_name, include_pattern=include_pattern, exclude_pattern=exclude_pattern
+                ):
+                    raise ValueError(
+                        f"MXFP8 parameter filters select {full_name!r} for BF16, but the "
+                        "configured grouped-MoE backend requires it in native TE MXFP8."
+                    )
 
     if persistent_buffers is None:
         persistent_buffers = {}
@@ -251,6 +378,9 @@ def quantize_params_to_mxfp8(
             _prefix=child_prefix,
             backend=backend,
             excluded_parameter_ids=excluded_parameter_ids,
+            include_pattern=include_pattern,
+            exclude_pattern=exclude_pattern,
+            _filter_prefix=_filter_prefix,
         )
 
     # Process parameters owned directly by this module
@@ -260,12 +390,24 @@ def quantize_params_to_mxfp8(
             val = model._parameters[key]
             if val is None:
                 continue
-            if excluded_parameter_ids is not None and id(val) in excluded_parameter_ids:
-                continue
             if not _should_quantize_param(val):
                 continue
 
             fqn = f"{_prefix}{key}"
+            filter_fqn = f"{_filter_prefix}{fqn}"
+            keep_mxfp8 = matches_mxfp8_parameter_filter(
+                filter_fqn, include_pattern=include_pattern, exclude_pattern=exclude_pattern
+            )
+            if excluded_parameter_ids is not None and id(val) in excluded_parameter_ids:
+                if not keep_mxfp8:
+                    raise ValueError(
+                        f"MXFP8 parameter filters select {filter_fqn!r} for BF16, but the "
+                        "configured grouped-MoE backend requires it in native TE MXFP8."
+                    )
+                continue
+            if not keep_mxfp8:
+                _materialize_mxfp8_parameter_as_bf16(model, key, val)
+                continue
             bf16_data = _to_bf16(val)
 
             if fqn in persistent_buffers:

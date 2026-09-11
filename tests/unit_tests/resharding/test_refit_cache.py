@@ -473,6 +473,8 @@ class TestSetupMxfp8TransformOnPlan:
             fp8 = "hybrid"
             fp8_recipe = "mxfp8"
             inference_grouped_gemm_backend = "flashinfer"
+            inference_mxfp8_include_parameters = r"decoder\.mlp\.experts\."
+            inference_mxfp8_exclude_parameters = None
 
         class _Model(nn.Module):
             def __init__(self):
@@ -482,12 +484,22 @@ class TestSetupMxfp8TransformOnPlan:
 
         captured = {}
 
-        def _quantize(_decoder, *, backend, excluded_parameter_ids=None):
+        def _quantize(
+            _decoder,
+            *,
+            backend,
+            excluded_parameter_ids=None,
+            include_pattern=None,
+            exclude_pattern=None,
+            _filter_prefix="",
+        ):
             captured["backend"] = backend
             captured["excluded_parameter_ids"] = excluded_parameter_ids
+            captured["include_pattern"] = include_pattern
+            captured["exclude_pattern"] = exclude_pattern
+            captured["filter_prefix"] = _filter_prefix
             return {}
 
-        monkeypatch.setattr(refit, "_should_quantize_param", lambda _param: True)
         monkeypatch.setattr(refit, "quantize_params_to_mxfp8", _quantize)
 
         plan = ReshardPlan(send_ops=[], recv_ops=[])
@@ -495,6 +507,9 @@ class TestSetupMxfp8TransformOnPlan:
         assert captured["backend"] == plan.transform.backend == "triton"
         # No TE grouped-MoE experts here, so nothing is held back from conversion.
         assert captured["excluded_parameter_ids"] == set()
+        assert captured["include_pattern"] == _Config.inference_mxfp8_include_parameters
+        assert captured["exclude_pattern"] is None
+        assert captured["filter_prefix"] == "decoder."
 
 
 class TestRefitTensorCache:

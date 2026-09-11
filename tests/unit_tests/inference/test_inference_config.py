@@ -30,6 +30,30 @@ from megatron.training.config.inference_config import InferenceSetupConfig
 
 class TestInferenceConfig:
     @pytest.mark.parametrize(
+        ("name", "include", "exclude", "expected"),
+        [
+            ("decoder.layers.2.mlp.experts.linear_fc1.weight0", None, None, True),
+            (
+                "decoder.layers.2.mlp.experts.linear_fc1.weight0",
+                r"\.mlp\.experts\.linear_fc[12]\.",
+                None,
+                True,
+            ),
+            ("decoder.layers.2.self_attention.linear_qkv.weight", r"\.mlp\.experts\.", None, False),
+            (
+                "decoder.layers.2.mlp.experts.linear_fc2.weight0",
+                r"\.mlp\.experts\.",
+                r"linear_fc2",
+                False,
+            ),
+        ],
+    )
+    def test_mxfp8_parameter_filter(self, name, include, exclude, expected):
+        from megatron.core.inference.quantization.utils import matches_mxfp8_parameter_filter
+
+        assert matches_mxfp8_parameter_filter(name, include, exclude) is expected
+
+    @pytest.mark.parametrize(
         ("grouped_gemm_backend", "expected_backend"),
         [
             ("torch", "triton"),
