@@ -22,8 +22,10 @@ import os
 import pytest
 import torch
 import torch.nn.functional as F
+from transformer_engine.pytorch.quantization import FP8GlobalStateManager
 
 from megatron.core.activations import squared_relu
+from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.transformer.moe import fused_a2a
 from megatron.core.transformer.moe.virtual_expert_load_balancer import VirtualExpertLoadBalancer
 
@@ -103,6 +105,21 @@ def _weight_storage_ptrs(weight):
     return (weight.data_ptr(),)
 
 
+def _assert_numerical_parity(actual, expected, tolerance, name):
+    """Bound relative L2 and absolute error against each tensor/expert's own signal scale."""
+    reference = expected.float()
+    assert torch.isfinite(reference).all() and reference.norm() > 0, f"{name}: invalid reference"
+    relative_l2 = (actual.float() - reference).norm() / reference.norm()
+    assert relative_l2 <= tolerance, f"{name}: relative L2 error {relative_l2} > {tolerance}"
+    torch.testing.assert_close(
+        actual,
+        expected,
+        rtol=0,
+        atol=tolerance * reference.abs().max().item(),
+        msg=lambda msg: f"{name}: {msg}",
+    )
+
+
 def _assert_mxfp8_prefetch_exact(manager, plan, orientation):
     """Check every active virtual MXFP8 component byte-for-byte against its owning rank."""
     components = MXFP8_COMPONENTS[:2] if orientation == "rowwise" else MXFP8_COMPONENTS[2:]
@@ -112,6 +129,10 @@ def _assert_mxfp8_prefetch_exact(manager, plan, orientation):
             local = torch.stack(tuple(getattr(source, component) for source in parameters))
             gathered = [torch.empty_like(local) for _ in range(manager.ep_size)]
             torch.distributed.all_gather(gathered, local, group=manager.group)
+            semantic = torch.cat(gathered)
+            for expert, weight in enumerate(semantic):
+                if any(torch.equal(weight, other) for other in semantic[:expert]):
+                    errors.append(f"FC{index + 1} {component}: indistinguishable expert {expert}")
             for slot, expert in enumerate(
                 plan.experts_to_copy[manager.virtual_experts.rank].tolist()
             ):
@@ -169,7 +190,7 @@ def _run_full_layer_parity(
     moe_latent_size=None,
     shared_expert_size=None,
     mxfp8=False,
-    gtp=False,
+    gtp_topology=False,
     grad_dtype=torch.float32,
     reference_dispatcher="alltoall",
     bitwise=False,
@@ -183,42 +204,28 @@ def _run_full_layer_parity(
 
     monkeypatch.setenv("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "1")
     monkeypatch.setenv("NVTE_GROUPED_LINEAR_SINGLE_PARAM", "0")
-    expert_model_parallel_size = 2 if gtp else 4
+    expert_model_parallel_size = 2 if gtp_topology else 4
     Utils.initialize_model_parallel(
         tensor_model_parallel_size=1,
         expert_model_parallel_size=expert_model_parallel_size,
         expert_tensor_parallel_size=1,
-        expert_gtp_remat_size=2 if gtp else 1,
+        expert_gtp_remat_size=2 if gtp_topology else 1,
     )
-    if gtp:
-        from megatron.core.tensor_parallel.generalized_tensor_parallelism import update_gtp_config
-
-        # This test isolates the bridge's explicit materialize-before-exchange
-        # dependency; the production script covers linked async GTP chains.
-        update_gtp_config(
-            weight_prefetch=False,
-            async_reduction=False,
-            reduce_scatter_with_fp32_accumulation=(grad_dtype == torch.bfloat16),
-        )
     torch.manual_seed(1234)
 
-    bf16_grads = grad_dtype == torch.bfloat16
     common = {
         **BASE_CONFIG,
         "hidden_size": 1024,
         "ffn_hidden_size": 1024,
         "moe_ffn_hidden_size": 1024,
         "expert_model_parallel_size": expert_model_parallel_size,
-        "expert_tensor_parallel_num_weight_shards": 2 if gtp else 1,
+        "expert_tensor_parallel_num_weight_shards": 2 if gtp_topology else 1,
         "activation_func": F.silu if activation == "swiglu" else squared_relu,
         "gated_linear_unit": activation == "swiglu",
         "use_fused_weighted_squared_relu": activation != "swiglu",
         "moe_latent_size": moe_latent_size,
         "moe_shared_expert_intermediate_size": shared_expert_size,
-        # The fused (Transformer Engine) router returns dense outputs the virtual-expert path
-        # must recover its compact routes from, so run it where the reference allows: the
-        # all-to-all reference pads the routing map in place, which the fused router's backward
-        # rejects.
+        # Cover both fused (dense output recovered as compact routes) and unfused routing.
         "moe_router_fusion": reference_dispatcher == "hybridep",
     }
     if mxfp8:
@@ -226,7 +233,12 @@ def _run_full_layer_parity(
             fp8="e4m3", fp8_recipe="mxfp8", fp8_param=True, moe_router_padding_for_quantization=True
         )
     reference_config = TransformerConfig(
-        **common,
+        # With fewer than 256 input rows, all-to-all must pad inside the experts:
+        # padding a routing mask cannot create the missing rows.
+        **{
+            **common,
+            "moe_router_padding_for_quantization": mxfp8 and reference_dispatcher != "alltoall",
+        },
         **(
             {"moe_token_dispatcher_type": "alltoall"}
             if reference_dispatcher == "alltoall"
@@ -245,21 +257,27 @@ def _run_full_layer_parity(
     submodules = get_submodules(mlp_spec)
 
     try:
-        if mxfp8:
-            from transformer_engine.common.recipe import MXFP8BlockScaling
-            from transformer_engine.pytorch import fp8_model_init
 
-            def build(config):
-                with fp8_model_init(enabled=True, recipe=MXFP8BlockScaling()):
-                    return MoELayer(config, submodules).cuda()
-
-        else:
-
-            def build(config):
+        def build(config):
+            with get_fp8_context(config, is_init=True):
                 return MoELayer(config, submodules).cuda()
 
         ref_layer = build(reference_config)
         virtual_expert_layer = build(virtual_expert_config)
+        with torch.no_grad():
+            for fc, linear in enumerate(
+                (ref_layer.experts.linear_fc1, ref_layer.experts.linear_fc2)
+            ):
+                for local, expert in enumerate(ref_layer.local_expert_indices):
+                    weight = linear.get_parameter(f"weight{local}")
+                    generator = torch.Generator(device=weight.device).manual_seed(
+                        1000 + 17 * expert + fc
+                    )
+                    values = torch.randn(
+                        weight.shape, dtype=weight.dtype, device=weight.device, generator=generator
+                    )
+                    # Distinct semantic experts, including quantized data AND block scales.
+                    weight.copy_(values * (0.0075 * (expert + 1)))
         for layer in (ref_layer, virtual_expert_layer):
             assert not layer.experts.linear_fc1.single_grouped_weight
             assert not layer.experts.linear_fc2.single_grouped_weight
@@ -277,8 +295,14 @@ def _run_full_layer_parity(
         _set_main_grads(ref_layer, grad_dtype)
         _set_main_grads(virtual_expert_layer, grad_dtype)
 
-        torch.manual_seed(1234)
-        test_input = torch.randn(2, 4, 1024, device="cuda", dtype=torch.bfloat16)
+        generator = torch.Generator(device="cuda").manual_seed(1234 + torch.distributed.get_rank())
+        # Dense MXFP8 linears require 32 rows; expert dispatch remains padding-heavy.
+        test_input = torch.randn(
+            8, 4, 1024, device="cuda", dtype=torch.bfloat16, generator=generator
+        )
+        upstream = torch.randn(
+            test_input.shape, device="cuda", dtype=torch.bfloat16, generator=generator
+        )
         manager = virtual_expert_layer.token_dispatcher._comm_manager
         manager._runtime_init(test_input)
         _assert_runtime_layout(manager, grad_dtype=grad_dtype, mxfp8=mxfp8)
@@ -292,6 +316,15 @@ def _run_full_layer_parity(
             plans.append(manager._plan)
 
         manager.plan_dispatch = record_plan
+        native_only = {}
+        start_grad_reduce = manager._start_grad_reduce
+
+        def record_native_grad(fc_layer):
+            # The actual GEMM partial before any peer's virtual-expert gradient is added.
+            native_only[fc_layer] = manager.virtual_experts.native_grads[fc_layer].clone()
+            start_grad_reduce(fc_layer)
+
+        manager._start_grad_reduce = record_native_grad
         if mxfp8:
             # A state_dict load does not carry the quantized component storage,
             # so mirror it explicitly before comparing the two layers.
@@ -306,10 +339,12 @@ def _run_full_layer_parity(
 
         def run(layer, *, virtual_experts=None):
             hidden = test_input.detach().clone().requires_grad_(True)
-            output, _ = layer(hidden)
+            with get_fp8_context(layer.config):
+                assert FP8GlobalStateManager.is_fp8_enabled() == mxfp8
+                output, _ = layer(hidden)
             if virtual_experts is not None and mxfp8:
                 _assert_mxfp8_prefetch_exact(virtual_experts, plans[-1], "rowwise")
-            output.float().sum().backward()
+            (output.float() * upstream).sum().backward()
             if virtual_experts is not None:
                 for fc_layer, parameters in enumerate(virtual_experts.virtual_experts.parameters):
                     for parameter in parameters:
@@ -371,37 +406,57 @@ def _run_full_layer_parity(
         torch.distributed.all_reduce(active_virtual_expert, op=torch.distributed.ReduceOp.MAX)
         assert active_virtual_expert.item(), "parity must exercise an active virtual-expert"
 
+        # Gather before asserting so a failing rank cannot strand peers in a later collective.
+        wrong_experts = []
+        for expected in ref_values[3:5]:
+            gathered = [torch.empty_like(expected) for _ in range(manager.ep_size)]
+            torch.distributed.all_gather(gathered, expected, group=manager.group)
+            wrong_experts.append(torch.cat(gathered))
+        remote_experts = {
+            expert
+            for rank, row in enumerate(plans[0].experts_to_copy.tolist())
+            if rank != manager.virtual_experts.rank
+            for expert in row
+            if expert >= 0
+        }
         names = ["output", "input grad", "router grad", "FC1 main_grad", "FC2 main_grad"]
         if moe_latent_size is not None:
             names += ["latent FC1 main_grad", "latent FC2 main_grad"]
         if shared_expert_size is not None:
             names += ["shared FC1 main_grad", "shared FC2 main_grad"]
         for name, actual, expected in zip(names, virtual_expert_values, ref_values):
-            if bitwise and "main_grad" not in name:
-                tolerance = dict(rtol=0, atol=0)
-            elif bitwise:
-                # A materialized expert's wgrad sums independently rounded FP32
-                # partials. That changes addition order, not the gradient.
-                tolerance = dict(rtol=2e-7, atol=2e-6)
-            elif mxfp8:
-                # Virtual-expert placement changes the token population of each MX
-                # quantization block, so per-element absolute tolerances are not
-                # stable across those block boundaries. Bound execution noise
-                # while the raw weights and scales stay byte-exact above; these
-                # limits sit far below the corruption a wrong expert or scale
-                # mapping produces.
-                atol = 32.0 if "main_grad" in name else 16.0 if name == "router grad" else 0.75
-                tolerance = dict(rtol=0.2, atol=atol)
-            else:
-                # Different dispatchers may reorder BF16 reductions even when
-                # virtual-expert planning leaves the mathematical result unchanged.
-                tolerance = dict(rtol=2e-2, atol=2e-2)
-            torch.testing.assert_close(
-                actual, expected, **tolerance, msg=lambda msg: f"{name}: {msg}"
-            )
+            # Fixed-fixture peak error / reference peak: below 4e-6 for MXFP8 FP32
+            # wgrads, below 0.008 when summing separately rounded BF16 partials.
+            tolerance = 0.01 if grad_dtype == torch.bfloat16 else 1e-5
+            if bitwise:
+                tolerance = 2e-6 if "main_grad" in name else 0
+            fc = ("FC1 main_grad", "FC2 main_grad").index(name) if name in names[3:5] else None
+            pairs = zip(actual, expected) if fc is not None else [(actual, expected)]
+            for local, (value, reference) in enumerate(pairs):
+                label = (
+                    f"{name} expert {ref_layer.local_expert_indices[local]}"
+                    if fc is not None
+                    else name
+                )
+                _assert_numerical_parity(value, reference, tolerance, label)
+                corruptions = {"zeroed": torch.zeros_like(value)}
+                if fc is not None:
+                    expert = ref_layer.local_expert_indices[local]
+                    corruptions["wrong expert"] = wrong_experts[fc][(expert + 1) % 4]
+                    if expert in remote_experts:
+                        assert (
+                            native_only[fc][local].norm() > 0
+                        ), f"{label}: missing native contribution"
+                        corruptions["omitted remote"] = native_only[fc][local]
+                for corruption, broken in corruptions.items():
+                    with pytest.raises(AssertionError):
+                        _assert_numerical_parity(
+                            broken, reference, tolerance, f"{corruption} {label}"
+                        )
     finally:
         # Release the arenas while their communicator is alive, then destroy the
         # process-global HybridEP buffer in lockstep across ranks.
+        FP8GlobalStateManager.reset()
         VirtualExpertLoadBalancer.finalize()
         Utils.destroy_model_parallel()
         torch.cuda.synchronize()
@@ -409,12 +464,6 @@ def _run_full_layer_parity(
         fused_a2a.reset_hybrid_ep_buffer()
         torch.cuda.synchronize()
         torch.distributed.barrier()
-        if gtp:
-            update_gtp_config(
-                weight_prefetch=True,
-                async_reduction=True,
-                reduce_scatter_with_fp32_accumulation=False,
-            )
 
 
 def _run_repeated_mtp_parity(monkeypatch):
@@ -615,7 +664,7 @@ def _run_repeated_mtp_parity(monkeypatch):
 @pytest.mark.internal
 @requires_four_ranks
 def test_virtual_expert_hybridep_production_recipe_matches_alltoall(monkeypatch):
-    """Cover the production combination: MXFP8 weights, GTP experts, BF16 grads, latent MoE
+    """Cover MXFP8 compute/weights, the EP2/GTP2 topology, BF16 grads, and latent MoE
     with shared experts (which must see the full-width layer input, not the latent one)."""
     try:
         from transformer_engine.pytorch.ops import ScaledSReLU  # noqa: F401
@@ -627,7 +676,7 @@ def test_virtual_expert_hybridep_production_recipe_matches_alltoall(monkeypatch)
         moe_latent_size=640,
         shared_expert_size=1024,
         mxfp8=True,
-        gtp=True,
+        gtp_topology=True,
         grad_dtype=torch.bfloat16,
     )
 
