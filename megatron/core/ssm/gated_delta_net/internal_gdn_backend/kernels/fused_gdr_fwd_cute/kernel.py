@@ -4544,7 +4544,9 @@ class GatedDeltaNetChunkedKernel:
                             l1c_evict_priority=cute.nvgpu.CacheEvictionPriority.NO_ALLOCATE,
                         )
                     else:
-                        h_checkpoint_idx = checkpoint_offset + 1
+                        h_checkpoint_idx = checkpoint_offset
+                        if cutlass.const_expr(not (is_first_chunk and self.use_initial_state)):
+                            h_checkpoint_idx = checkpoint_offset + 1
                         gH_out = cute.make_tensor(
                             mH_out[None, None, head_idx, h_checkpoint_idx].iterator,
                             cute.make_ordered_layout(
