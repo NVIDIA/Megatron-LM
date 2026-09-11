@@ -396,6 +396,7 @@ class DynamicEngineTestConfig:
     kv_cache_management_mode: str = "persist"
     static_kv_memory_pointers: bool = True
     track_generated_token_events: bool = False
+    track_paused_request_events: bool = False
     num_speculative_tokens: int = 0
     position_embedding_type: str = "learned_absolute"
     use_flashinfer_fused_rope: Optional[bool] = None
@@ -569,6 +570,7 @@ class DynamicInferenceEngineTestBase:
                 # this is for compatibility with the LTS environment
                 unified_memory_level=0,  # unit tests currently broken with UVM
                 track_generated_token_events=test_config.track_generated_token_events,
+                track_paused_request_events=test_config.track_paused_request_events,
                 num_speculative_tokens=test_config.num_speculative_tokens,
                 sampling_backend=test_config.sampling_backend,
                 offset_sampling_seed_by_dp_rank=test_config.offset_sampling_seed_by_dp_rank,

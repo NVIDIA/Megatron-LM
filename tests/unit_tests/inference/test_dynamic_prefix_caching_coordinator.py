@@ -1245,15 +1245,15 @@ class TestEngineReplyDetokenization:
         coordinator._pending_counts = np.zeros(1, dtype=np.int32)
         coordinator.identity_to_rank_index = {b"rank_0": 0}
         coordinator.router_socket = MagicMock()
-        coordinator.detokenize = MagicMock()
+        coordinator.tokenizer.detokenize = MagicMock(wraps=coordinator.tokenizer.detokenize)
         return coordinator
 
     def test_detokenizes_when_the_client_asked(self):
         coordinator = self._coordinator()
         metadata = [Headers.ENGINE_REPLY.value, [[5, True]]]
-        body = msgpack.packb({"request_id": 5}, use_bin_type=True)
+        body = msgpack.packb({"request_id": 5, "generated_tokens": [1, 2]}, use_bin_type=True)
         handle_engine_reply(coordinator, b"rank_0", metadata, [body])
-        coordinator.detokenize.assert_called_once()
+        coordinator.tokenizer.detokenize.assert_called_once()
 
     def test_forwards_the_body_untouched_when_it_did_not(self):
         """The opt-out is the whole point: the body is never decoded."""
@@ -1261,6 +1261,6 @@ class TestEngineReplyDetokenization:
         metadata = [Headers.ENGINE_REPLY.value, [[5, False]]]
         body = msgpack.packb({"request_id": 5}, use_bin_type=True)
         handle_engine_reply(coordinator, b"rank_0", metadata, [body])
-        coordinator.detokenize.assert_not_called()
+        coordinator.tokenizer.detokenize.assert_not_called()
         sent = coordinator.router_socket.send_multipart.call_args.args[0]
         assert body in sent, "an un-detokenized body must be forwarded verbatim"

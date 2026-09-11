@@ -377,15 +377,14 @@ def _coordinator_projection(request):
     coordinator.request_id_to_rank = {request_id: rank}
     coordinator._pending_counts[coordinator.identity_to_rank_index[rank]] = 1
 
-    engine_payload = msgpack.packb(
-        [Headers.ENGINE_REPLY.value, [{**request.serialize(), "generated_text": None}]],
-        use_bin_type=True,
-    )
-    handle_engine_reply(coordinator, rank, msgpack.unpackb(engine_payload, raw=False))
+    metadata = [Headers.ENGINE_REPLY.value, [[request_id, True]]]
+    body = msgpack.packb({**request.serialize(), "generated_text": None}, use_bin_type=True)
+    handle_engine_reply(coordinator, rank, metadata, [body])
     coordinator.tokenizer.detokenize.assert_called_once()
     frames = coordinator.router_socket.send_multipart.call_args.args[0]
     assert frames[0] == client
-    header, returned_id, returned = msgpack.unpackb(frames[1], raw=False)
+    header, returned_id = msgpack.unpackb(frames[1], raw=False)
+    returned = msgpack.unpackb(frames[2], raw=False)
     assert header == Headers.ENGINE_REPLY.value
     assert returned_id == client_request_id
     assert request_id not in coordinator.request_id_to_client_id
@@ -661,7 +660,7 @@ class RequestLifecyclePairwiseBase(_DynamicInferenceEngineTestBase):
             "context_buffer_size_gb": 0.01,
             "context_paused_buffer_size_gb": 0.0,
             "track_generated_token_events": True,
-            "inference_config_overrides": {"track_paused_request_events": True},
+            "track_paused_request_events": True,
         }
         values.update(config_values)
         config = _DynamicEngineTestConfig(num_requests=0, **values)
