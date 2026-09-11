@@ -497,6 +497,12 @@ class TEGroupedMLP(MegatronModule):
 
         assert HAVE_TE, "_make_fused_ops requires Transformer Engine."
 
+        def register_member_weights(op: torch.nn.Module, weights) -> None:
+            """Attach ungrouped native or runtime weights to a meta TE op shell."""
+            op.register_parameter("weight", None)
+            for idx, weight in enumerate(weights):
+                op.register_parameter(f"weight{idx}", weight)
+
         def register_grouped_linear_params(
             op: torch.nn.Module,
             linear: torch.nn.Module,
@@ -509,9 +515,9 @@ class TEGroupedMLP(MegatronModule):
                 for idx in range(linear.num_gemms):
                     op.register_parameter(f"weight{idx}", None)
             else:
-                op.register_parameter("weight", None)
-                for idx in range(linear.num_gemms):
-                    op.register_parameter(f"weight{idx}", linear.get_parameter(f"weight{idx}"))
+                register_member_weights(
+                    op, [linear.get_parameter(f"weight{idx}") for idx in range(linear.num_gemms)]
+                )
 
             if not linear.use_bias:
                 return
@@ -524,13 +530,6 @@ class TEGroupedMLP(MegatronModule):
                 op.register_parameter("bias", None)
                 for idx in range(linear.num_gemms):
                     op.register_parameter(f"bias{idx}", linear.get_parameter(f"bias{idx}"))
-
-        def register_virtual_expert_weights(op: torch.nn.Module, runtime_weights) -> None:
-            """Attach native-then-virtual-expert runtime weights to a TE op shell."""
-            assert len(runtime_weights) == op.num_groups
-            op.register_parameter("weight", None)
-            for idx, runtime_weight in enumerate(runtime_weights):
-                op.register_parameter(f"weight{idx}", runtime_weight)
 
         # Container for fusible ops
         ops = te.pytorch.ops.Sequential()
@@ -577,7 +576,7 @@ class TEGroupedMLP(MegatronModule):
         )
 
         if virtual_experts is not None:
-            register_virtual_expert_weights(op, virtual_experts.runtime_weights(0))
+            register_member_weights(op, virtual_experts.runtime_weights(0))
         else:
             register_grouped_linear_params(
                 op, self.linear_fc1, fc1_single_grouped_weight, fc1_single_grouped_bias
@@ -688,7 +687,7 @@ class TEGroupedMLP(MegatronModule):
         )
 
         if virtual_experts is not None:
-            register_virtual_expert_weights(op, virtual_experts.runtime_weights(1))
+            register_member_weights(op, virtual_experts.runtime_weights(1))
             op.wgrad_store = _VirtualExpertFC2WgradStore(virtual_experts)
         else:
             register_grouped_linear_params(
@@ -720,26 +719,22 @@ class TEGroupedMLP(MegatronModule):
         """
 
         def forward_pre_hook(module, *_) -> None:
-            self.prepare_fused_impl_parameters()
+            for submodule in chain(self.linear_fc1.modules(), self.linear_fc2.modules()):
+                for hook in submodule._forward_pre_hooks.values():
+                    ret = hook(submodule, None)
+                    if ret is not None:
+                        raise RuntimeError(
+                            f"Applying a fused implementation for {self.__class__.__name__}, "
+                            f"but a {submodule.__class__.__name__} submodule pre-forward hook "
+                            "modifies the input tensor."
+                        )
+            self._ensure_main_grad_for_fused_impl()
             if self._virtual_experts is not None:
                 # Wait for the weight push; GTP consumes the expert weights here, right before
                 # the expert GEMMs, as it would without virtual experts (the push only peeked).
                 self._virtual_experts.prepare_expert_forward()
 
         return forward_pre_hook
-
-    def prepare_fused_impl_parameters(self) -> None:
-        """Run the fused ops' parameter hooks (DDP/FSDP all-gathers) before they execute."""
-        for submodule in chain(self.linear_fc1.modules(), self.linear_fc2.modules()):
-            for hook in submodule._forward_pre_hooks.values():
-                ret = hook(submodule, None)
-                if ret is not None:
-                    raise RuntimeError(
-                        f"Applying a fused implementation for {self.__class__.__name__}, "
-                        f"but a {submodule.__class__.__name__} submodule pre-forward hook "
-                        "modifies the input tensor."
-                    )
-        self._ensure_main_grad_for_fused_impl()
 
     @staticmethod
     def _ensure_main_grad(linear_module: torch.nn.Module) -> None:

@@ -1,11 +1,11 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""CUDA-graph lifecycle support for Generalized Tensor Parallelism (GTP).
+"""Persistent wgrad storage and CUDA-graph lifecycle support for GTP.
 
-This module owns state that exists only for local CUDA-graph capture and replay:
+This module owns:
 
 * capture-local ownership of asynchronous GTP communication;
-* persistent wgrad ring buffers whose lifetime may cross graph boundaries;
+* persistent wgrad rings shared by eager execution and local CUDA graphs;
 * routing graph-owned allocations into the shared CUDA-graph memory pool.
 """
 
@@ -69,13 +69,18 @@ def preserve_gtp_prefetch_state(params: Iterable[torch.nn.Parameter]):
 
 
 @dataclass
-class GraphWgradRingSlot:
+class WgradRingSlot:
     """One persistent wgrad slot guarded by its reduce-scatter completion event."""
 
     tensor: torch.Tensor
     ready_event: torch.cuda.Event
-    key: tuple
-    index: int
+    owner: object = None
+
+    def wait_for_reader(self) -> None:
+        """Acquire an eager writer's slot, finalizing any deferred reduction first."""
+        if self.owner is not None and self.owner._wgrad_rs_handle is not None:
+            self.owner._wait_reduce_scatter(finalize_grad=True)
+        self.ready_event.wait()
 
 
 @dataclass
@@ -141,7 +146,7 @@ class GTPCaptureCommState:
 
         return params, ag_streams, rs_streams
 
-    def register_wgrad_ring_slot(self, slot: GraphWgradRingSlot, param) -> None:
+    def register_wgrad_ring_slot(self, slot: WgradRingSlot, param) -> None:
         """Track slots used by this graph and reject unsafe intra-graph aliasing."""
         slot_id = id(slot)
         param_id = id(param)
@@ -171,7 +176,7 @@ def register_capture_params_to_ensure_ready(params: Iterable) -> None:
         _ACTIVE_CAPTURE_COMM_STATE.register_params_to_ensure_ready(params)
 
 
-def register_capture_wgrad_ring_slot(slot: GraphWgradRingSlot, param) -> None:
+def register_capture_wgrad_ring_slot(slot: WgradRingSlot, param) -> None:
     """Register a ring slot with the active capture, if one exists."""
     if _ACTIVE_CAPTURE_COMM_STATE is not None:
         _ACTIVE_CAPTURE_COMM_STATE.register_wgrad_ring_slot(slot, param)
@@ -200,7 +205,27 @@ def track_gtp_capture_comms():
 
 # Slots live outside the shared graph pool so independently replayed graphs cannot reuse an
 # in-flight reduce-scatter input as temporary workspace.
-_GRAPH_WGRAD_RINGS: dict[tuple, list[GraphWgradRingSlot]] = {}
+_WGRAD_RINGS: dict[tuple, WgradRingSlot] = {}
+
+
+def bind_wgrad_ring_slot(param, key: tuple) -> WgradRingSlot:
+    """Bind a parameter to fixed padded storage in its caller-selected scheduling domain."""
+    slot = _WGRAD_RINGS.get(key)
+    if slot is None:
+        symm = is_gtp_symm_pool_registered(param.group)
+        with gtp_symm_pool_ctx(param.group) if symm else nullcontext():
+            tensor = torch.empty(
+                param._unsharded_shape_padded, dtype=param.main_grad.dtype, device=param.device
+            )
+        if param.pad_length > 0:
+            tensor[param._unsharded_shape[0] :].zero_()
+        slot = _WGRAD_RINGS[key] = WgradRingSlot(
+            tensor=tensor, ready_event=torch.cuda.Event(external=True)
+        )
+        slot.ready_event.record()
+    param._gtp_wgrad_ring_slot = slot
+    param._gtp_wgrad_ring_view = slot.tensor[: param._unsharded_shape[0]]
+    return slot
 
 
 def allocate_graph_wgrad_rings(
@@ -217,7 +242,7 @@ def allocate_graph_wgrad_rings(
     Slots are shared across layers only within one communication scheduling domain. A two-slot
     ring retains one graph of overlap without allocating one full unsharded wgrad per layer.
     """
-    if full_iteration or not async_reduction or _GRAPH_WGRAD_RINGS:
+    if full_iteration or not async_reduction:
         return
     if ring_size < 1:
         raise ValueError("GTP_CONFIG.graph_wgrad_ring_size must be at least 1")
@@ -230,7 +255,7 @@ def allocate_graph_wgrad_rings(
         if chain_param.chain_id != graphed_chain_id or chain_param.prev_w is None:
             continue
         for param in chain_param._weights:
-            if id(param) in seen_params:
+            if id(param) in seen_params or hasattr(param, "_gtp_wgrad_ring_slot"):
                 continue
             seen_params.add(id(param))
             if not hasattr(param, "main_grad"):
@@ -252,53 +277,22 @@ def allocate_graph_wgrad_rings(
     # capture-safe; slot addresses stay stable either way.
     total_bytes = 0
     buffer_count = 0
-    new_slots = []
     for key, matching_params in params_by_key.items():
         slot_count = min(ring_size, len(matching_params))
-        slots = []
         exemplar = matching_params[0]
         assert all(p.group is exemplar.group for p in matching_params), (
             "GTP wgrad ring slots are allocated from the exemplar's symmetric pool, so "
             "every param sharing a ring key must share its process group"
         )
-        symm = is_gtp_symm_pool_registered(exemplar.group)
-        for slot_index in range(slot_count):
-            with gtp_symm_pool_ctx(exemplar.group) if symm else nullcontext():
-                tensor = torch.empty(
-                    exemplar._unsharded_shape_padded,
-                    dtype=exemplar.main_grad.dtype,
-                    device=exemplar.device,
-                    memory_format=torch.contiguous_format,
-                )
-            if exemplar.pad_length > 0:
-                tensor.narrow(0, exemplar._unsharded_shape[0], exemplar.pad_length).zero_()
-            slot = GraphWgradRingSlot(
-                tensor=tensor,
-                ready_event=torch.cuda.Event(external=True),
-                key=key,
-                index=slot_index,
-            )
-            slots.append(slot)
-            new_slots.append(slot)
-            total_bytes += tensor.numel() * tensor.element_size()
-            buffer_count += 1
-
-        _GRAPH_WGRAD_RINGS[key] = slots
         for param_index, param in enumerate(matching_params):
-            slot = slots[param_index % slot_count]
-            param._gtp_graph_wgrad_ring_slot = slot
-            if param.pad_length > 0:
-                param._gtp_graph_wgrad_ring_view = slot.tensor.narrow(
-                    0, 0, param._unsharded_shape[0]
-                )
-            else:
-                param._gtp_graph_wgrad_ring_view = slot.tensor
+            slot = bind_wgrad_ring_slot(param, ("graph", key, param_index % slot_count))
+            if param_index < slot_count:
+                total_bytes += slot.tensor.numel() * slot.tensor.element_size()
+                buffer_count += 1
 
     # Initially every slot is available. Later generations are recorded on the RS stream after NCCL
     # has finished reading the slot.
-    for slot in new_slots:
-        slot.ready_event.record()
-    if new_slots:
+    if buffer_count:
         torch.cuda.current_stream().synchronize()
 
     log_single_rank(
@@ -309,14 +303,13 @@ def allocate_graph_wgrad_rings(
     )
 
 
-def clear_graph_wgrad_rings() -> None:
-    """Drop every ring slot so a rebuilt model reallocates them.
-
-    Without this, the stale non-empty dict makes allocate_graph_wgrad_rings a silent
-    no-op on the next build, leaving slots keyed by the old model's groups and shapes.
-    GPU work must be idle (callers synchronize).
-    """
-    _GRAPH_WGRAD_RINGS.clear()
+def clear_wgrad_rings(params: Iterable) -> None:
+    """Drop persistent storage and parameter bindings after callers have synchronized GPU work."""
+    for param in params:
+        for attr in ("_gtp_wgrad_ring_slot", "_gtp_wgrad_ring_view"):
+            if hasattr(param, attr):
+                delattr(param, attr)
+    _WGRAD_RINGS.clear()
 
 
 _CG_MEMPOOL_DEVICE = None

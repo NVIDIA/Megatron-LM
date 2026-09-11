@@ -1444,6 +1444,7 @@ class TestGTPDDPGradReadyWiring:
         _run_distributed(_worker_gtp_ddp_grad_ready_wiring, 4)
 
 
+@pytest.mark.launch_on_gb200
 class TestGTPGraphWgradRing:
     @staticmethod
     def _make_padded_chain(count=4):
@@ -1460,22 +1461,74 @@ class TestGTPGraphWgradRing:
         return weights
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA event test")
+    @pytest.mark.parametrize("eager_first", [False, True])
+    def test_eager_and_graph_rings_coexist_and_reset(self, monkeypatch, eager_first):
+        """Either initialization order preserves bindings; model reset releases both paths."""
+        monkeypatch.setattr(gtp_module, "_FULL_ITERATION", False)
+        monkeypatch.setattr(gtp_module.GTP_CONFIG, "async_reduction", True)
+        monkeypatch.setattr(gtp_module.GTP_CONFIG, "graph_wgrad_ring_size", 2)
+        monkeypatch.setattr(gtp_cuda_graphs, "_WGRAD_RINGS", {})
+        weights = self._make_padded_chain()
+        eager = self._make_padded_chain(count=1)[0]
+        eager.chain_id = GTPChain.UNGRAPHED.value
+        monkeypatch.setattr(gtp_module, "_GTP_PARAMS", [*weights, eager])
+
+        if eager_first:
+            eager.get_wgrad_tensor(persistent=True)
+        gtp_module.initialize_graph_wgrad_rings()
+        eager_view = eager.get_wgrad_tensor(persistent=True)
+        bound = [*weights[1:], eager]
+        old_slots = [p._gtp_wgrad_ring_slot for p in bound]
+        assert len(gtp_cuda_graphs._WGRAD_RINGS) == 3
+        assert eager_view.data_ptr() not in [slot.tensor.data_ptr() for slot in old_slots[:-1]]
+        gtp_module.initialize_graph_wgrad_rings()
+        for param, slot in zip(bound, old_slots):
+            assert param._gtp_wgrad_ring_slot is slot
+        assert eager.get_wgrad_tensor().data_ptr() == eager_view.data_ptr()
+
+        torch.cuda.synchronize()
+        gtp_module.reset_gtp_state()
+        assert not gtp_cuda_graphs._WGRAD_RINGS
+        assert all(not hasattr(p, "_gtp_wgrad_ring_slot") for p in bound)
+        assert all(not hasattr(p, "_gtp_wgrad_ring_view") for p in bound)
+        gtp_module.initialize_graph_wgrad_rings()
+        eager.get_wgrad_tensor(persistent=True)
+        for param, old_slot in zip(bound, old_slots):
+            assert param._gtp_wgrad_ring_slot is not old_slot
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA event test")
+    def test_eager_ring_isolates_logical_shape_with_same_padded_shape(self, monkeypatch):
+        """A longer logical gradient must not leave nonzero padding in a shorter one."""
+        monkeypatch.setattr(gtp_cuda_graphs, "_WGRAD_RINGS", {})
+        longer, shorter = self._make_padded_chain(count=2)
+        for weight in (longer, shorter):
+            weight.chain_id = GTPChain.UNGRAPHED.value
+        shorter.pad_length = 3
+        assert longer._unsharded_shape_padded == shorter._unsharded_shape_padded
+        longer.get_wgrad_tensor(persistent=True).fill_(7)
+        grad = shorter.get_wgrad_tensor(persistent=True)
+        assert grad.data_ptr() != longer._gtp_wgrad_ring_view.data_ptr()
+        send, _ = shorter._prepare_wgrad_reduce_scatter_inputs([torch.ones_like(grad)])
+        torch.testing.assert_close(send[0][:3], torch.ones_like(grad))
+        assert torch.count_nonzero(send[0][3:]) == 0
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA event test")
     def test_partial_cg_wgrad_ring_ownership(self, monkeypatch):
         monkeypatch.setattr(gtp_module, "_FULL_ITERATION", False)
         monkeypatch.setattr(gtp_module.GTP_CONFIG, "async_reduction", True)
         monkeypatch.setattr(gtp_module.GTP_CONFIG, "graph_wgrad_ring_size", 2)
-        monkeypatch.setattr(gtp_cuda_graphs, "_GRAPH_WGRAD_RINGS", {})
+        monkeypatch.setattr(gtp_cuda_graphs, "_WGRAD_RINGS", {})
 
         weights = self._make_padded_chain()
         monkeypatch.setattr(gtp_module, "_GTP_PARAMS", weights)
         gtp_module.initialize_graph_wgrad_rings()
 
-        slot_1 = weights[1]._gtp_graph_wgrad_ring_slot
-        slot_2 = weights[2]._gtp_graph_wgrad_ring_slot
-        slot_3 = weights[3]._gtp_graph_wgrad_ring_slot
+        slot_1 = weights[1]._gtp_wgrad_ring_slot
+        slot_2 = weights[2]._gtp_wgrad_ring_slot
+        slot_3 = weights[3]._gtp_wgrad_ring_slot
         assert slot_1 is not slot_2
         assert slot_1 is slot_3
-        assert len(gtp_cuda_graphs._GRAPH_WGRAD_RINGS) == 1
+        assert len(gtp_cuda_graphs._WGRAD_RINGS) == 2
         assert slot_1.ready_event.query()
 
         capture_state = gtp_cuda_graphs.GTPCaptureCommState()
@@ -1519,7 +1572,7 @@ class TestGTPGraphWgradRing:
         monkeypatch.setattr(gtp_module, "_FULL_ITERATION", False)
         monkeypatch.setattr(gtp_module.GTP_CONFIG, "async_reduction", True)
         monkeypatch.setattr(gtp_module.GTP_CONFIG, "graph_wgrad_ring_size", 2)
-        monkeypatch.setattr(gtp_cuda_graphs, "_GRAPH_WGRAD_RINGS", {})
+        monkeypatch.setattr(gtp_cuda_graphs, "_WGRAD_RINGS", {})
 
         group = _FakeGroup(size=2)
         first = NativeFP8StyleParam(group)
@@ -1530,15 +1583,15 @@ class TestGTPGraphWgradRing:
 
         gtp_module.initialize_graph_wgrad_rings()
 
-        assert second._gtp_graph_wgrad_ring_slot.tensor.shape == (6, 4)
-        assert len(gtp_cuda_graphs._GRAPH_WGRAD_RINGS) == 1
+        assert second._gtp_wgrad_ring_slot.tensor.shape == (6, 4)
+        assert len(gtp_cuda_graphs._WGRAD_RINGS) == 1
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA event test")
     def test_rs_input_copies_into_ring(self, monkeypatch):
         monkeypatch.setattr(gtp_module, "_FULL_ITERATION", False)
         monkeypatch.setattr(gtp_module.GTP_CONFIG, "async_reduction", True)
         monkeypatch.setattr(gtp_module.GTP_CONFIG, "graph_wgrad_ring_size", 2)
-        monkeypatch.setattr(gtp_cuda_graphs, "_GRAPH_WGRAD_RINGS", {})
+        monkeypatch.setattr(gtp_cuda_graphs, "_WGRAD_RINGS", {})
 
         weights = self._make_padded_chain(count=2)
         monkeypatch.setattr(gtp_module, "_GTP_PARAMS", weights)
@@ -1548,7 +1601,7 @@ class TestGTPGraphWgradRing:
         send_bufs, release_bufs = weights[1]._prepare_wgrad_reduce_scatter_inputs([wgrad])
         rs_input = send_bufs[0]
 
-        assert rs_input is weights[1]._gtp_graph_wgrad_ring_slot.tensor
+        assert rs_input is weights[1]._gtp_wgrad_ring_slot.tensor
         assert release_bufs[0] is wgrad
         torch.testing.assert_close(rs_input[:4], wgrad)
         assert torch.count_nonzero(rs_input[4:]) == 0
