@@ -1,5 +1,6 @@
 # Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import contextlib
 import math
 import os
 import random
@@ -620,6 +621,298 @@ class TestDynamicInferenceEngineParallel(DynamicInferenceEngineTestBase):
         assert results[AsyncScheduleMode.LEGACY] == results[AsyncScheduleMode.ASYNC], (
             "async and legacy scheduling disagree on verified output; the MTP draft KV must "
             "affect acceptance rate only"
+        )
+
+    # ---- Feature-invariance of the MTP draft-KV coverage ------------------- #
+    #
+    # Guiding invariant: chunked prefill and prefix caching are TRANSPARENT. The draft KV a
+    # request ends up with must not depend on whether either feature is enabled.
+    #
+    # Values cannot be compared across configs -- different varlen packing changes GEMM and
+    # attention reduction order, so the last bits legitimately differ. What must be identical
+    # is WHICH positions get written, and that is exact.
+    #
+    # `MTPMetadata.write_token_maps` is the single funnel for MTP write destinations: its only
+    # two callers are `_mtp_setup_decode_step` (one per draft depth) and
+    # `_mtp_setup_prefill_step` (the varlen commit pass). Recording it captures complete
+    # coverage without perturbing the numerics at all.
+
+    @staticmethod
+    @contextlib.contextmanager
+    def _record_mtp_kv_writes(context):
+        """Record MTP draft-KV write destinations, and any that land in a SHARED block.
+
+        Yields `(written, shared)`:
+          * `written`: every (block, slot) the draft KV was written to, engine-wide. Keyed by
+            block rather than by request, so an inherited block carries its producer's coverage.
+          * `shared`: the subset whose block had `ref_count > 1` at write time -- i.e. another
+            request was reading it. Writing draft KV there corrupts theirs, so this must always
+            be empty. `_mtp_setup_prefill_step` redirects such writes to the dummy block via
+            `write_token_maps(inherited_blocks=...)`, mirroring the main KV path's
+            `overlap_start_token` span; this is the guard on that redirect.
+        """
+        meta = context.mtp_metadata
+        alloc = context.kv_block_allocator
+        original = meta.write_token_maps
+        written = set()
+        shared = []
+        # `block_ref_counts` exists only under prefix caching; without it no block is ever
+        # shared, so the shared-write check is vacuous rather than skipped.
+        ref_counts = getattr(alloc, "block_ref_counts", None)
+
+        def recording(gpu_view, rows, positions, block_table, padded_token_count, **kwargs):
+            # Observe the OUTPUT, not the inputs: `write_token_maps` decides the final
+            # destination (including redirecting inherited and padded rows to the dummy block),
+            # so reading the map it produced keeps this in step with the implementation instead
+            # of re-deriving it here. `**kwargs` absorbs future arguments for the same reason.
+            result = original(
+                gpu_view=gpu_view,
+                rows=rows,
+                positions=positions,
+                block_table=block_table,
+                padded_token_count=padded_token_count,
+                **kwargs,
+            )
+            total = positions.numel()
+            if total:
+                dest = gpu_view.token_to_block_idx[:total].tolist()
+                slots = gpu_view.token_to_local_position_within_kv_block[:total].tolist()
+                # Dummy-block rows are deliberately discarded writes, not coverage.
+                pairs = [(b, sl) for b, sl in zip(dest, slots) if b != meta.dummy_block_idx]
+                written.update(pairs)
+                if ref_counts is not None and pairs:
+                    refs = ref_counts[torch.tensor([b for b, _ in pairs], dtype=torch.long)]
+                    shared.extend((b, sl, r) for (b, sl), r in zip(pairs, refs.tolist()) if r > 1)
+            return result
+
+        meta.write_token_maps = recording
+        try:
+            yield written, shared
+        finally:
+            meta.write_token_maps = original
+
+    @staticmethod
+    def _missing_mtp_kv_positions(context, written, row, committed_len):
+        """MTP positions in `0 .. committed_len-2` that nobody wrote.
+
+        Entry p pairs h_p with t_{p+1}, so it only becomes writable once position p+1 is itself
+        committed -- hence the -1. Inherited positions count as covered: the producing request's
+        writes are in the same recorded set, which is keyed by (block, slot) rather than by
+        request, so sharing a block means sharing its coverage.
+        """
+        bs = context.block_size_tokens
+        table = context.request_to_kv_block_ids[row].tolist()
+        missing = []
+        for p in range(max(0, committed_len - 1)):
+            block = table[p // bs]
+            if block < 0 or (block, p % bs) not in written:
+                missing.append(p)
+        return missing
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @pytest.mark.parametrize("enable_prefix_caching", [False, True])
+    @pytest.mark.parametrize("enable_chunked_prefill", [False, True])
+    @torch.inference_mode()
+    def test_mtp_kv_coverage_is_feature_invariant(
+        self, enable_chunked_prefill, enable_prefix_caching
+    ):
+        """Every committed MTP position must be written, in all four feature combinations.
+
+        A gap is a real bug, not a tolerable cost: the draft attention then reads whatever was
+        in that KV slot beforehand. It cannot corrupt verified output -- drafts are checked by
+        the main model -- so it surfaces only as an unexplained acceptance-rate regression,
+        which is exactly the kind of thing that needs a mechanical guard rather than review.
+
+        The two features are checked together because the known gaps live at their interaction,
+        not in either alone.
+        """
+        from tests.unit_tests.inference.engines.test_dynamic_engine import DynamicEngineTestConfig
+
+        skip_if_mamba_sequence_packing_not_available("hybrid")
+
+        test_config = DynamicEngineTestConfig(
+            num_requests=0,
+            model_provider="hybrid",
+            # An attention (not recurrent) MTP head is what enables the draft KV cache.
+            mtp_layer_pattern="*-",
+            num_speculative_tokens=2,
+            mtp_use_repeated_layer=True,
+            enable_prefix_caching=enable_prefix_caching,
+            # Without a Mamba-state budget a hybrid model falls back to memory-only prefix
+            # caching, which dedupes blocks but recomputes every token -- no real skip, so the
+            # inherited-coverage path would go unexercised.
+            prefix_caching_mamba_gb=0.2 if enable_prefix_caching else None,
+            enable_chunked_prefill=enable_chunked_prefill,
+            num_tokens_to_generate=4,
+            max_sequence_length=768,
+            # Geometry copied from test_mtp_kv_cache_prefix_caching_matches_across_schedulers:
+            # Mamba state is cached only at coarse boundaries, so a small block size makes
+            # `_find_mamba_match_count` return 0 and the hybrid branch zeroes the skip entirely.
+            context_block_size_tokens=256,
+            # A token budget below the prompt length is what forces chunking.
+            context_max_tokens=384 if enable_chunked_prefill else 1024,
+            context_max_requests=4,
+            materialize_only_last_token_logits=False,
+        )
+        env = self._build_test_env(test_config)
+        context = env.engine.context
+        self._assert_mtp_kv_cache_active(env)
+
+        prompt = torch.arange(512, dtype=torch.int64, device="cuda") % (test_config.vocab_size - 1)
+
+        def add_request(request_id):
+            env.engine.add_request(
+                request_id=request_id,
+                prompt=prompt.clone(),
+                sampling_params=SamplingParams(
+                    num_tokens_to_generate=4, termination_id=-1, top_k=1, top_p=0.0
+                ),
+            )
+
+        saw_chunking = False
+        with self._record_mtp_kv_writes(context) as (written, shared_writes):
+
+            def step_and_check():
+                """Step once, then assert coverage for every active request."""
+                nonlocal saw_chunking
+                env.engine.step_modern()
+                saw_chunking |= context.chunked_prefill_request_id != -1
+                for row in range(context.paused_request_count, context.total_request_count):
+                    committed = int(context.request_kv_length_offsets[row].item())
+                    missing = self._missing_mtp_kv_positions(context, written, row, committed)
+                    assert not missing, (
+                        f"MTP draft KV is unwritten at positions {missing[:8]} "
+                        f"(of {committed} committed) for active row {row}; "
+                        f"chunked_prefill={enable_chunked_prefill}, "
+                        f"prefix_caching={enable_prefix_caching}"
+                    )
+
+            add_request(0)
+            # Sampled like every other step: request 0 does its chunking here, and with prefix
+            # caching on request 1 inherits and never chunks, so this is the only observation.
+            step_and_check()
+            # An identical second prompt is what produces the prefix-cache hit.
+            add_request(1)
+            while env.engine.has_unfinished_requests():
+                step_and_check()
+
+        # Guard against the config silently not exercising the feature under test.
+        if enable_prefix_caching:
+            assert (
+                env.engine._prefill_tokens_skipped > 0
+            ), "no prefix-cache hit occurred, so the inherited-coverage path never ran"
+        if enable_chunked_prefill:
+            assert saw_chunking, "no request was ever chunked, so the seam path never ran"
+
+        # No MTP draft-KV write may land in a block another request is reading. The main KV
+        # path redirects such writes to the dummy block; if this fires, the MTP path needs the
+        # same redirect in `_mtp_setup_prefill_step`.
+        assert not shared_writes, (
+            f"MTP draft KV written into {len(shared_writes)} slot(s) of ref-counted SHARED "
+            f"blocks (first few, as (block, slot, ref_count)): {shared_writes[:8]}; "
+            f"chunked_prefill={enable_chunked_prefill}, prefix_caching={enable_prefix_caching}"
+        )
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @torch.inference_mode()
+    def test_mtp_kv_never_writes_into_an_inherited_block(self):
+        """Memory-only hybrid prefix caching: blocks ARE shared but NO tokens are skipped.
+
+        Without a Mamba-state budget, `_compute_prefix_match` leaves `prefix_skip_tokens = 0`
+        while still matching blocks, so `effective_kv_offset` stays at 0 and the request
+        recomputes tokens that live inside blocks it inherited. That is the widest possible
+        overlap between "blocks I share" and "positions I write".
+
+        The MAIN KV path redirects exactly these writes to the dummy block (the
+        `overlap_start_token` span in `add_request`, whose comment names this mode as one of its
+        three triggers). The MTP draft-KV path builds its own write map and has no such
+        redirect, so this is the configuration that decides whether it needs one.
+
+        `test_mtp_kv_coverage_is_feature_invariant` cannot reach this: it sets a Mamba budget,
+        which makes the skip cover the matched blocks and leaves the overlap empty.
+        """
+        from tests.unit_tests.inference.engines.test_dynamic_engine import DynamicEngineTestConfig
+
+        skip_if_mamba_sequence_packing_not_available("hybrid")
+
+        test_config = DynamicEngineTestConfig(
+            num_requests=0,
+            model_provider="hybrid",
+            mtp_layer_pattern="*-",
+            num_speculative_tokens=2,
+            mtp_use_repeated_layer=True,
+            enable_prefix_caching=True,
+            # Deliberately omitted: no Mamba-state budget means memory-only prefix caching,
+            # which dedupes blocks but recomputes every token. That is the whole point here.
+            prefix_caching_mamba_gb=None,
+            enable_chunked_prefill=False,
+            num_tokens_to_generate=4,
+            max_sequence_length=768,
+            context_block_size_tokens=256,
+            context_max_tokens=1024,
+            context_max_requests=4,
+            materialize_only_last_token_logits=False,
+        )
+        env = self._build_test_env(test_config)
+        context = env.engine.context
+        self._assert_mtp_kv_cache_active(env)
+
+        prompt = torch.arange(512, dtype=torch.int64, device="cuda") % (test_config.vocab_size - 1)
+
+        def add_request(request_id):
+            env.engine.add_request(
+                request_id=request_id,
+                prompt=prompt.clone(),
+                sampling_params=SamplingParams(
+                    num_tokens_to_generate=4, termination_id=-1, top_k=1, top_p=0.0
+                ),
+            )
+
+        # Ground truth for "blocks were shared": a live block with ref_count > 1. Sampled each
+        # step rather than read off a counter, so the guard cannot be fooled by counter
+        # semantics I have already misread once.
+        max_ref_seen = 0
+
+        def step_and_sample():
+            nonlocal max_ref_seen
+            env.engine.step_modern()
+            max_ref_seen = max(max_ref_seen, int(context.kv_block_allocator.block_ref_counts.max()))
+
+        with self._record_mtp_kv_writes(context) as (_written, shared_writes):
+            add_request(0)
+            step_and_sample()
+            # An identical prompt inherits request 0's blocks without skipping any tokens.
+            add_request(1)
+            while env.engine.has_unfinished_requests():
+                step_and_sample()
+
+        # Non-vacuity: blocks must have been shared, and nothing skipped. Together these are
+        # exactly the condition that makes the main path's redirect span non-empty.
+        assert max_ref_seen > 1, (
+            f"no block was ever shared (max ref_count seen = {max_ref_seen}), so the overlap is "
+            f"empty and this test is vacuous. Diagnostics: "
+            f"prefix_cache_hits={context.prefix_cache_hits}, "
+            f"blocks_matched={context.prefix_cache_blocks_matched}, "
+            f"tokens_skipped={env.engine._prefill_tokens_skipped}, "
+            f"enable_prefix_caching={context.enable_prefix_caching}, "
+            f"has_mamba_slot_allocator={context.mamba_slot_allocator is not None}"
+        )
+        assert env.engine._prefill_tokens_skipped == 0, (
+            "tokens were skipped, so this is not memory-only mode and the overlap may be empty; "
+            "check that prefix_caching_mamba_gb is really unset"
+        )
+
+        assert not shared_writes, (
+            f"MTP draft KV written into {len(shared_writes)} slot(s) of ref-counted SHARED "
+            f"blocks (first few, as (block, slot, ref_count)): {shared_writes[:8]}. The "
+            f"`inherited_blocks` redirect in `_mtp_setup_prefill_step` should have sent these to "
+            f"the dummy block -- check `request_matched_prefix_blocks` for these rows."
         )
 
     # ---- MTP draft-KV cache on inference-optimized layers ------------------ #

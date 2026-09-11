@@ -3469,52 +3469,45 @@ class TestMtpPrefixCacheBackOff(PrefixCachingTestBase):
         self._assert_hash_registry_is_injective(alloc)
 
     @pytest.mark.internal
-    def test_continuation_chunk_with_a_mid_request_prefix_match_declines_the_seam(self):
-        """A healthy continuation chunk can start past `off + q`, so the seam must be DECLINED.
+    def test_continuation_chunk_with_a_pending_carry_gives_up_its_whole_match(self):
+        """A carry pending for this request means its next chunk takes NO prefix skip.
 
-        The KV prefix skip in `_compute_prefix_match` is not gated on `finished == 0`, and
-        `_find_kv_match_count` searches from `already_allocated_blocks`. So if another request
-        publishes cached blocks covering this one's UNPREFILLED region between its chunks, the
-        next chunk starts past `off + q` and its seam lands somewhere the carry does not describe.
-
-        This is a legitimate schedule, not bookkeeping drift: `take_chunk_boundary` must return
-        None rather than raise, or a live step dies. The reachability here comes from the real
-        allocator and hash registry -- the match is genuinely published by request 2, not stubbed.
+        The carry can only be consumed at `finished - 1`. Any skip moves the chunk's start past
+        that position, and nothing can then write it -- the hidden for the skipped region was
+        never computed by anyone able to pair it with the following token. The skip is block
+        granular, so the only way to keep the carry usable is to take none of the match.
         """
         ctx = self._mtp_ctx(enable_chunked_prefill=True)
         bs = ctx.block_size_tokens
         meta = ctx.mtp_metadata
         prompt = self._prompt(bs * 5)
 
-        # Chunk 1 of request 1: blocks 0-1. Registers their hashes.
         r = self._req(ctx, prompt.clone(), request_id=1)
         ctx.add_request(r, prefill_chunk_length=bs * 2)
         r.finished_chunk_token_count += bs * 2
         r.remaining_prompt_tokens = r.remaining_prompt_tokens[bs * 2 :]
 
-        # The commit pass would carry this chunk's last hidden, at off_1 + q_1 - 1 (off_1 == 0).
-        carry_position = bs * 2 - 1
+        # Another request publishes the blocks request 1 has not prefilled yet.
+        ctx.add_request(self._req(ctx, prompt[: bs * 4].clone(), request_id=2))
+
+        # Without a carry the continuation chunk would take the match (minus the last block).
+        assert not meta.chunk_boundary_valid
+        with_skip = ctx._compute_prefix_match(r, bs * 3)
+        assert with_skip.prefix_skip_tokens > 0
+        assert with_skip.matched_block_ids
+
+        # With a carry pending for THIS request, the whole match is given up so the chunk starts
+        # at `finished` and the seam stays writable.
         meta.carry_chunk_boundary(
             hidden=torch.zeros((1, 1, meta.hidden_size), device="cuda", dtype=meta.hidden_dtype),
             req_id=r.request_id,
-            position=carry_position,
+            position=bs * 2 - 1,
         )
-        assert meta.chunk_boundary_valid
-
-        # A DIFFERENT request completes the blocks request 1 has not prefilled yet, publishing
-        # their hashes into the cache.
-        ctx.add_request(self._req(ctx, prompt[: bs * 4].clone(), request_id=2))
-
-        # Request 1's continuation chunk now picks up a prefix match it did not have before, so
-        # its offset jumps past off_1 + q_1.
         match = ctx._compute_prefix_match(r, bs * 3)
-        assert match.prefix_skip_tokens > 0, "the mid-request match is what makes this reachable"
-        off_2 = r.finished_chunk_token_count + match.prefix_skip_tokens
-        assert off_2 - 1 != carry_position
+        assert match.matched_block_ids == []
+        assert match.prefix_skip_tokens == 0
+        assert match.backed_off_blocks == len(with_skip.matched_block_ids) + 1
 
-        # Declined, not raised. The carry is still VALID, so this is the position key alone
-        # doing the work -- not invalidation, and not the request-id key.
-        assert meta.chunk_boundary_valid
-        assert meta.chunk_boundary_req_id == r.request_id
-        assert meta.take_chunk_boundary(req_id=r.request_id, seam_position=off_2 - 1) is None
-        self._assert_hash_registry_is_injective(ctx.kv_block_allocator)
+        # The seam now lands exactly where the carry describes.
+        off = r.finished_chunk_token_count + match.prefix_skip_tokens
+        assert meta.take_chunk_boundary(req_id=r.request_id, seam_position=off - 1) is not None

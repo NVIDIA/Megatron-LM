@@ -23,7 +23,6 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from megatron.core.inference.communication_utils import broadcast_from_last_pipeline_stage
-from megatron.core.inference.utils import log_mtp_debug
 from megatron.core.tensor_parallel.mappings import (
     gather_from_sequence_parallel_region,
     scatter_to_sequence_parallel_region,
@@ -241,35 +240,29 @@ class MTPInferenceMixin:
         num_decode_requests: int,
         active_request_count: int,
     ) -> _CommitSegments:
-        """Seed the prompt positions of every prefill request from main hiddens (roll-by-one).
+        """Seed each prefill request's prompt positions from main hiddens (roll-by-one).
 
-        A draft entry at MTP position p is f(h_p + emb(t_{p+1})): hidden and token come from
-        positions one apart. request_query_lengths is this step's CHUNK length `q` and
-        request_kv_length_offsets is how many prompt tokens prior chunks already prefilled
-        (`off`), so pairing each of a chunk's hiddens with the token that follows it seeds
-        positions off..off+q-2. The chunk's last hidden is dropped because its partner token
-        t_{off+q} is not in this chunk -- it is seeded by the next chunk's seam entry below, or
-        by decode depth 0 on the final/only chunk.
+        Entry p is f(h_p, emb(t_{p+1})): its two inputs are one position apart. With `off` =
+        `request_kv_length_offsets` and `q` = this chunk's `request_query_lengths`, pairing each
+        of the chunk's hiddens with the token after it seeds positions `off .. off+q-2`. The
+        chunk's last hidden is dropped because its partner token is not in this chunk -- the next
+        chunk writes it as a seam, or draft depth 0 does on the final chunk.
 
-        SEAM: position off-1 pairs the PREVIOUS chunk's last hidden with this chunk's first
-        token, so only this chunk can write it, and only if that hidden was carried over -- i.e.
-        this same request computed off-1 itself. At most one request per step qualifies, because
-        chunked prefill admits a single in-flight request.
+        SEAM: position `off-1` needs the PREVIOUS chunk's last hidden, so only this chunk can
+        write it, and only if that hidden was carried over -- i.e. this same request computed
+        `off-1`. At most one request per step qualifies, since chunked prefill admits one
+        in-flight request.
 
-        A prefix-cache hit also produces off > 0, and there no seam is written: the skipped prefix
-        was computed by a DIFFERENT request whose activations are gone, so no carry matches. That
-        is correct, because every inherited entry is already right for this request, off-1
-        included. off-1 is the last slot of the last INHERITED block and nothing writes it -- but
-        it does not need writing: `_compute_prefix_match` drops the last HASH-MATCHED block, so
-        t_off is the first token of that dropped block, still inside the matched prefix and
-        therefore identical for every sibling. The entry that genuinely diverges sits one block
-        later, at the end of the dropped block this request now computes, where the body rows
-        below write it. Removing that back-off would silently make off-1 wrong again.
+        A prefix-cache hit also gives `off > 0`, and writes no seam: the skipped prefix came from
+        a DIFFERENT request whose activations are gone, so no carry matches. That is correct
+        because every inherited entry is already right, `off-1` included --
+        `_compute_prefix_match` drops the last HASH-MATCHED block, so `t_off` is the first token
+        of that dropped block, still inside the matched prefix and identical for every sibling.
+        The entry that genuinely diverges sits one block later, in the block this request now
+        computes, where the body rows below write it. Removing that back-off silently breaks this.
 
         Every request contributes exactly ONE segment (q-1 entries, or q with a seam), so the
-        segment count stays active_request_count and the fixed-size MHA-metadata buffers never
-        overflow.
-
+        segment count stays `active_request_count` and the fixed-size MHA buffers never overflow.
         Also refreshes the carried chunk-boundary hidden for the in-flight chunked request.
         """
         device = gathered_hidden.device
@@ -405,19 +398,6 @@ class MTPInferenceMixin:
             token_ids = F.pad(token_ids, (0, padded_total - total))
             position_ids = F.pad(position_ids, (0, padded_total - total))
 
-        log_mtp_debug(
-            "commit_pass_forward",
-            context,
-            total=total,
-            padded_total=padded_total,
-            active_request_count=active_request_count,
-            num_decode_requests=num_decode_requests,
-            hidden_states_shape=tuple(packed_hidden.shape),
-            token_ids_shape=tuple(token_ids.shape),
-            block_table_shape=tuple(block_table.shape),
-            sp_enabled=self._sp_enabled,
-            tp_size=self._tp_size,
-        )
         # Run the MTP attention to populate K/V only (output hidden discarded).
         unwrapped_model.mtp.layers[0].forward_single_position(
             hidden_states=packed_hidden,
@@ -448,15 +428,6 @@ class MTPInferenceMixin:
             )
         dummy_tokens = torch.zeros((1, n), device=device, dtype=torch.long)
         dummy_positions = torch.zeros((1, n), device=device, dtype=torch.long)
-        log_mtp_debug(
-            "dummy_prefill_forward",
-            context,
-            n=n,
-            hidden_states_shape=tuple(dummy_hidden.shape),
-            token_ids_shape=tuple(dummy_tokens.shape),
-            sp_enabled=self._sp_enabled,
-            tp_size=self._tp_size,
-        )
         unwrapped_model.mtp.layers[0].forward_single_position(
             hidden_states=dummy_hidden,
             next_token_ids=dummy_tokens,
@@ -646,21 +617,6 @@ class MTPInferenceMixin:
                 mtp_depth = None if unwrapped_model.mtp.mtp_use_repeated_layer else depth
                 if mtp_kv_cache_on:
                     context._mtp_setup_decode_step()
-                log_mtp_debug(
-                    "draft_depth_forward",
-                    context,
-                    depth=depth,
-                    mtp_depth=mtp_depth,
-                    active_request_count=active_request_count,
-                    padded_count=padded_count,
-                    num_mtp_draft_requests=num_mtp_draft_requests,
-                    mtp_graphed=mtp_graphed,
-                    graph_key_prefix=mtp_graph_key_prefix,
-                    hidden_states_shape=tuple(current_hidden.shape),
-                    token_ids_shape=tuple(token_ids_buf.shape),
-                    sp_enabled=self._sp_enabled,
-                    tp_size=self._tp_size,
-                )
                 current_hidden, mtp_logits = unwrapped_model.compute_mtp_single_step(
                     hidden_states=current_hidden,
                     next_token_ids=token_ids_buf,
@@ -718,16 +674,6 @@ class MTPInferenceMixin:
             context._mtp_setup_decode_step()
             extra_depth = (
                 None if unwrapped_model.mtp.mtp_use_repeated_layer else self.num_mtp_depths - 1
-            )
-            log_mtp_debug(
-                "extra_append_forward",
-                context,
-                extra_depth=extra_depth,
-                active_request_count=active_request_count,
-                padded_count=padded_count,
-                mtp_graphed=mtp_graphed,
-                hidden_states_shape=tuple(current_hidden.shape),
-                token_ids_shape=tuple(token_ids_buf.shape),
             )
             # The extra-append is a structurally identical one-token append+attend, so it reuses the
             # last depth's captured KV-aware graph key (repeated-layer -> ("mtp_kv", n, None);
@@ -831,16 +777,6 @@ class MTPInferenceMixin:
             mtp_logits_2d = None
             if has_mtp:
                 mtp_depth = None if unwrapped_model.mtp.mtp_use_repeated_layer else depth
-                log_mtp_debug(
-                    "dummy_draft_depth_forward",
-                    context,
-                    depth=depth,
-                    mtp_depth=mtp_depth,
-                    padded_count=padded_count,
-                    mtp_forward_eager=mtp_forward_eager,
-                    hidden_states_shape=tuple(dummy_hidden.shape),
-                    token_ids_shape=tuple(dummy_token_ids.shape),
-                )
                 dummy_hidden, mtp_logits = unwrapped_model.compute_mtp_single_step(
                     hidden_states=dummy_hidden,
                     next_token_ids=dummy_token_ids,

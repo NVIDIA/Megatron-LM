@@ -37,7 +37,7 @@ from megatron.core.inference.unified_memory import (
     UnifiedMemoryUnsupportedError,
     create_unified_mempool,
 )
-from megatron.core.inference.utils import device_memory_summary, log_mtp_debug, tensor_swap
+from megatron.core.inference.utils import device_memory_summary, tensor_swap
 from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_emb
 from megatron.core.models.hybrid.hybrid_layer_allocation import (
     Symbols,
@@ -533,25 +533,16 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.mamba_conv_states_shape, self.mamba_ssm_states_shape = (None, None)
             self.layer_map = {i: i for i in range(self.num_attention_layers)}
 
-        # MTP KV cache (v2): reserve one extra attention-layer plane in the shared KV `memory_buffer`
-        # for the repeated MTP draft attention. Main KV position i and MTP KV position i are
-        # position-aligned and MTP length <= main length, so the MTP layer reuses main's block
-        # table; only its per-request length offset is tracked separately. The MTP forward routes
-        # its append/read to this slot via the `mtp.forward_active` flag (see
-        # append_key_value_cache / key_value_cache), so no attention-layer renumbering is needed.
+        # Reserve one extra attention-layer plane in the shared KV `memory_buffer` for the
+        # repeated MTP draft attention. Draft position i is aligned with main position i and the
+        # draft is never longer, so it reuses main's block table; `append_key_value_cache` and
+        # `key_value_cache` route to this slot on `mtp_metadata.forward_active`.
         #
-        # Always on wherever it is implementable -- there is no opt-in flag. The draft KV is an
-        # acceptance-rate optimization that cannot change verified output, so the only gate is
-        # whether this model/config can populate it: speculative decoding must be active, the
-        # head must be the repeated-layer kind (a per-depth head has no single `mtp.layers[0]`
-        # to seed through), and the head itself must be exactly one attention layer.
-        #
-        # The gate is on the MTP HEAD, not the main decoder. A hybrid main decoder is fine: the
-        # reserved slot bypasses `layer_map` on both append and read (see append_key_value_cache
-        # / key_value_cache), so the main model's Mamba/GDN layers never interact with it. What
-        # does not work is a recurrent MTP head (no KV to append) or a multi-attention-layer head
-        # (its layers would collide on the single reserved slot). Hybrid models state the two
-        # patterns independently as "<main>/<mtp>/...", so only the MTP half is consulted here.
+        # No opt-in flag: the draft KV only affects acceptance rate, so the gate is purely
+        # whether this config CAN populate it. The gate is on the MTP HEAD, not the decoder --
+        # a hybrid decoder is fine because the reserved slot bypasses `layer_map` entirely.
+        # A recurrent head has no KV to append; a multi-attention head would collide on the one
+        # reserved slot. Hybrid models state the two patterns as "<main>/<mtp>/...".
         mtp_head_layer_types = (
             mamba_inference_state_config.mtp_layer_type_list
             if mamba_inference_state_config is not None
@@ -1232,6 +1223,13 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.max_requests, dtype=torch.int32, device='cpu', pin_memory=True
         )
         self.request_kv_block_counts = torch.empty(
+            self.max_requests, dtype=torch.int32, device='cpu', pin_memory=True
+        )
+        # Leading blocks each request INHERITED rather than computed -- a context-side mirror of
+        # `DynamicInferenceRequest.num_matched_prefix_blocks`, because the MTP commit pass sees
+        # only the context. Used to keep draft-KV writes out of blocks this request did not
+        # compute, mirroring the main path's `overlap_start_token` redirect in `add_request`.
+        self.request_matched_prefix_blocks = torch.zeros(
             self.max_requests, dtype=torch.int32, device='cpu', pin_memory=True
         )
         self.request_last_kv_block_id = torch.empty(
@@ -1990,39 +1988,30 @@ class DynamicInferenceContext(BaseInferenceContext):
             )
 
     # ------------------------------------------------------------------
-    # MTP KV cache (v1) — decode-step bookkeeping.
+    # ------------------------------------------------------------------
+    # MTP draft-KV bookkeeping.
     #
-    # The MTP draft attention reuses this context's KV `memory_buffer` (extra slot
-    # `mtp_kv_layer_slot`) and main's block table. Each MTP draft depth is a decode-style
-    # forward: every active request contributes exactly one token, written at its own MTP
-    # position and attending over its own MTP history (write-then-attend).
+    # The draft attention reuses this context's KV `memory_buffer` (slot `mtp_kv_layer_slot`)
+    # and main's block table. Each draft depth is a decode-style forward: one token per active
+    # request, written at its own draft position and attending over its own history
+    # (write-then-attend). RoPE is assumed absent.
     #
-    # There is NO persistent per-request MTP length. The MTP write position for depth 0 is
-    # DERIVED each step as `base_position - 1` (roll-by-one), where `base_position` is the
-    # main model's next-token position (`request_kv_length_offsets + request_query_lengths`).
-    # Because the main KV offsets are maintained by the context through compaction, pause/
-    # resume, and speculative rewind, the derived MTP position can never desync — and no
-    # separate MTP rewind is needed (rejected drafts are simply overwritten next step, since
-    # `base_position` advances by exactly 1 + accepted).
+    # There is NO persistent per-request draft length. Depth 0's write position is DERIVED each
+    # step as `base_position - 1` (roll-by-one). Because the main KV offsets it comes from are
+    # already maintained through compaction, pause/resume and speculative rewind, the derived
+    # position cannot desync -- and no separate draft rewind is needed, since `base_position`
+    # advances by exactly 1 + accepted and rejected drafts are overwritten next step.
     #
-    # For the eager draft loop we drive the attention metadata directly on the GPU (bypassing
-    # the coalesced CPU->GPU bookkeeping transfer) so the MTP forwards do not disturb the main
-    # step's Mamba/H2D state. `_mtp_begin_decode` seeds the GPU scratch from the caller's start
-    # positions + block table; `_mtp_setup_decode_step` populates the write maps + MHA read
-    # metadata for one depth; `_mtp_advance_decode_step` bumps the positions; `_mtp_end_decode`
-    # restores non-MTP mode. RoPE is assumed absent (v1).
+    # The metadata is driven directly on the GPU, bypassing the coalesced CPU->GPU bookkeeping
+    # transfer, so draft forwards never disturb the main step's Mamba/H2D state.
     #
-    # Every MTP forward — decode depth or varlen commit pass — prepares the same three pieces of
-    # state, so they share one interface, which the step setups below call in order:
-    #   1. `mtp.write_token_maps`      : per-token KV write destinations (where this forward's
-    #                                    K/V lands), from (row, position) pairs + a block table.
-    #   2. `mtp.write_mha_metadata`    : per-request MHA read metadata (query/kv lengths, their
-    #                                    cumulative sums, block table), plus padded-row sentinels.
-    #   3. `_mtp_activate_attn_metadata`: pick the graphed vs eager metadata object, publish the
-    #                                    sequence-length bounds and token counts for the step.
-    # The step setups differ only in how they derive the (row, position) pairs and the per-request
-    # lengths. Everything persistent lives in `self.mtp_metadata` (`MTPMetadata`), whose
-    # buffers are allocated once and updated in place, so no draft depth allocates metadata tensors.
+    # Every draft forward -- depth or varlen commit pass -- prepares the same three things, and
+    # the setups below differ only in how they derive the (row, position) pairs and lengths:
+    #   1. `mtp.write_token_maps`       : per-token KV write destinations.
+    #   2. `mtp.write_mha_metadata`     : per-request read metadata + padded-row sentinels.
+    #   3. `_mtp_activate_attn_metadata`: graphed vs eager object, bounds, token counts.
+    # Everything persistent lives in `self.mtp_metadata`, allocated once and updated in place,
+    # so no draft depth allocates metadata tensors.
     # ------------------------------------------------------------------
     def _mtp_activate_attn_metadata(
         self,
@@ -2152,28 +2141,13 @@ class DynamicInferenceContext(BaseInferenceContext):
         else:
             # Eager: tight per-step max via a GPU->CPU sync, non-graph metadata, graphs disabled.
             max_seqlen_k = int(kv_len.max().item()) if n > 0 else 1
-        mha = self._mtp_activate_attn_metadata(
+        self._mtp_activate_attn_metadata(
             graphed=mtp.graphed,
             padded_request_count=padded,
             max_seqlen_q=1,
             max_seqlen_k=max_seqlen_k,
             token_count=n,
             padded_token_count=padded,
-        )
-
-        # Shapes only -- no `.tolist()`/`.item()` on the GPU metadata here. This runs during
-        # CUDA-graph warmup too, and a device sync in that path would be both slow and
-        # misleading about what the captured graph sees.
-        log_mtp_debug(
-            "setup_decode_step",
-            self,
-            n=n,
-            padded=padded,
-            max_seqlen_q=mha.state_data["max_seqlen_q"],
-            max_seqlen_k=mha.state_data["max_seqlen_k"],
-            cu_query_seq_lengths_shape=tuple(mha.state_data["cu_query_seq_lengths"].shape),
-            kv_seq_lengths_shape=tuple(mha.state_data["kv_seq_lengths"].shape),
-            block_table_shape=tuple(mha.state_data["block_table"].shape),
         )
 
     def _mtp_setup_prefill_step(
@@ -2219,12 +2193,22 @@ class DynamicInferenceContext(BaseInferenceContext):
         if request_start_positions is not None:
             positions = positions + request_start_positions.to(device)[rows]
 
+        # Keep writes out of blocks this request inherited. The two spans overlap whenever the
+        # prefix skip covers fewer tokens than the matched blocks span -- a short chunk, a
+        # non-block-aligned resume, the `>= 2` clamp, a short Mamba match, or memory-only mode.
+        active_slice = slice(self.paused_request_count, self.total_request_count)
+        inherited = (
+            self.request_matched_prefix_blocks[active_slice][: block_table_prefill.shape[0]]
+            .to(block_table_prefill.device, non_blocking=True)
+            .to(torch.long)
+        )
         self.mtp_metadata.write_token_maps(
             gpu_view=gv,
             rows=rows,
             positions=positions,
             block_table=block_table_prefill,
             padded_token_count=padded_total,
+            inherited_blocks=inherited,
         )
 
         # MHA metadata: fresh causal prefill, so per-request kv_length == query_length and one
@@ -2247,7 +2231,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Read the bound back off `seq_lengths` rather than off `append_counts`: either branch
         # above may have introduced a run longer than any single `append_counts` entry.
         max_seqlen = int(seq_lengths.max().item()) if p > 0 else 1
-        mha = self._mtp_activate_attn_metadata(
+        self._mtp_activate_attn_metadata(
             graphed=False,
             padded_request_count=padded_p,
             max_seqlen_q=max_seqlen,
@@ -2264,26 +2248,10 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.mtp_metadata.saved_num_prefill_requests = self.num_prefill_requests
         self.num_prefill_requests = max(1, num_prefill)
 
-        log_mtp_debug(
-            "setup_prefill_step",
-            self,
-            num_prefill=num_prefill,
-            total=total,
-            padded_total=padded_total,
-            padded_request_count=padded_p,
-            max_seqlen=max_seqlen,
-            # `total` above already forced a device sync, so this adds no new one.
-            append_counts=append_counts.tolist(),
-            cu_query_seq_lengths_shape=tuple(mha.state_data["cu_query_seq_lengths"].shape),
-            block_table_shape=tuple(mha.state_data["block_table"].shape),
-            saved_num_prefill_requests=self.mtp_metadata.saved_num_prefill_requests,
-        )
-
     def _mtp_finalize_prefill_step(self) -> None:
         """Exit MTP-forward mode after the commit-pass (varlen) forward."""
         self.mtp_metadata.end_forward()
         self.num_prefill_requests = self.mtp_metadata.saved_num_prefill_requests
-        log_mtp_debug("finalize_prefill_step", self)
 
     def _mtp_advance_decode_step(self) -> None:
         """Advance each active request's MTP write position by one after a depth forward."""
@@ -2618,6 +2586,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.request_in_prefill_status_tensor[request_slice] = 1
         self.request_output_lengths[request_slice] = lengths_tensor + tokens_to_generate_tensor
         self.request_kv_length_offsets[request_slice] = 0
+        self.request_matched_prefix_blocks[request_slice] = 0
         self.request_kv_block_counts[request_slice] = block_counts
         for i, (label, dtype) in enumerate(self.request_metadata_types):
             self.request_metadata[label][request_slice] = torch.tensor(
@@ -2790,6 +2759,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 self.request_query_lengths[N_decode : N_decode + rem_prefill_tokens] += 1
 
         self.request_kv_length_offsets[0:N].fill_(0)
+        self.request_matched_prefix_blocks[0:N].fill_(0)
         self.request_to_kv_block_ids[0:N, 0] = dummy_block_idx
 
         # 3. Token-level state consumed by the triton KV append kernel.
@@ -3551,37 +3521,42 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Fast path: skip all prefix matching when disabled.
         if not self.enable_prefix_caching:
-            num_blocks_from_pool = max(0, overall_required_blocks - already_allocated_blocks)
-            return (
-                [],
-                num_blocks_from_pool,
-                already_allocated_blocks,
-                overall_required_blocks,
-                0,
-                prefill_chunk_length,
+            return PrefixMatch(
+                matched_block_ids=[],
+                num_blocks_from_pool=max(0, overall_required_blocks - already_allocated_blocks),
+                already_allocated_blocks=already_allocated_blocks,
+                overall_required_blocks=overall_required_blocks,
+                prefix_skip_tokens=0,
+                effective_prefill_chunk_length=prefill_chunk_length,
             )
 
         matched_block_ids, _ = self._find_kv_match_count(
             req, already_allocated_blocks, overall_required_blocks
         )
 
-        # MTP draft KV: give up the LAST matched block.
+        # MTP draft KV: give up matched blocks we would otherwise inherit incorrectly.
         #
-        # The draft KV shares these blocks with the main KV, but its entry at a block's final slot
-        # is f(h_p, emb(t_{p+1})) -- it consumes one token PAST the block, so it is not determined
-        # by the block's hash. Inheriting that block means inheriting the producing request's value
-        # for a slot whose correct value depends on THIS request's first divergent token, and the
-        # block is ref-counted, so it cannot be corrected in place without corrupting every sibling.
+        # A block's FINAL draft slot is f(h_p, emb(t_{p+1})) -- it consumes one token past the
+        # block, so it is not determined by the block's hash, and the block is ref-counted so it
+        # cannot be corrected in place. Giving up the last matched block makes this request
+        # compute and own it. Costs one block of prefill per hit; keeps the draft KV exact.
         #
-        # Dropping it makes this request compute and own that block, so the commit pass writes the
-        # boundary entry from its own hidden and its own next token. Costs one block of prefill per
-        # prefix hit and keeps the draft KV exact. Trimming here rather than adjusting
-        # `prefix_skip_tokens` below keeps the matched-block list and the skip count consistent,
-        # which everything downstream (block-table assignment, `num_blocks_from_pool`,
-        # `req.num_matched_prefix_blocks`) depends on.
-        backed_off_blocks = 1 if (self.enable_mtp_kv_cache and matched_block_ids) else 0
-        if backed_off_blocks:
-            matched_block_ids = matched_block_ids[:-1]
+        # A continuation chunk still holding a boundary carry gives up the WHOLE match: the carry
+        # is only consumable at `finished - 1`, and any skip (block granular, so all-or-nothing)
+        # moves this chunk's start past it, orphaning that entry permanently.
+        #
+        # Trimming here rather than adjusting `prefix_skip_tokens` keeps the matched-block list
+        # and the skip consistent, which block-table assignment, `num_blocks_from_pool` and
+        # `req.num_matched_prefix_blocks` all depend on. Named `mtp_backed_off_blocks` because
+        # the Mamba branch below binds `backed_off_blocks` for an unrelated purpose.
+        mtp_backed_off_blocks = 0
+        if self.enable_mtp_kv_cache and matched_block_ids:
+            if self.mtp_metadata.chunk_boundary_req_id == req.request_id:
+                mtp_backed_off_blocks = len(matched_block_ids)
+                matched_block_ids = []
+            else:
+                mtp_backed_off_blocks = 1
+                matched_block_ids = matched_block_ids[:-1]
 
         num_matched = len(matched_block_ids)
 
@@ -3668,7 +3643,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             overall_required_blocks=overall_required_blocks,
             prefix_skip_tokens=prefix_skip_tokens,
             effective_prefill_chunk_length=effective_prefill_chunk_length,
-            backed_off_blocks=backed_off_blocks,
+            backed_off_blocks=mtp_backed_off_blocks,
         )
 
     def check_availability(self, req: DynamicInferenceRequest) -> Tuple[bool, bool, bool]:
@@ -4062,6 +4037,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         # computed by this request and the tokens completing them must be written.
         if num_matched_blocks > 0 and req.num_matched_prefix_blocks >= already_allocated_blocks:
             req.num_matched_prefix_blocks = already_allocated_blocks + num_matched_blocks
+        # Mirror onto the context for the MTP commit pass, which cannot reach `req`.
+        self.request_matched_prefix_blocks[current_id] = req.num_matched_prefix_blocks
 
         self.active_token_count += effective_prefill_chunk_length
         self.lifetime_prefill_token_count += effective_prefill_chunk_length
@@ -4078,6 +4055,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         Move all the relevent booking tensors with src idxs to dst idxs
         """
         self.request_kv_length_offsets[dst_idxs] = self.request_kv_length_offsets[src_idxs]
+        self.request_matched_prefix_blocks[dst_idxs] = self.request_matched_prefix_blocks[src_idxs]
         self.request_in_prefill_status_tensor[dst_idxs] = self.request_in_prefill_status_tensor[
             src_idxs
         ]
@@ -4107,6 +4085,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         Swaps all the relevent booking tensors with src idxs to dst idxs
         """
         tensor_swap(self.request_kv_length_offsets, src_idxs, dst_idxs)
+        tensor_swap(self.request_matched_prefix_blocks, src_idxs, dst_idxs)
         tensor_swap(self.request_query_lengths, src_idxs, dst_idxs)
         tensor_swap(self.request_in_prefill_status_tensor, src_idxs, dst_idxs)
         tensor_swap(self.request_output_lengths, src_idxs, dst_idxs)
@@ -4681,6 +4660,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         dst_idxs = torch.arange(active_request_count, device='cpu')
         if not torch.equal(survivor_idxs, dst_idxs):
             self.request_kv_length_offsets[dst_idxs] = self.request_kv_length_offsets[survivor_idxs]
+            self.request_matched_prefix_blocks[dst_idxs] = self.request_matched_prefix_blocks[
+                survivor_idxs
+            ]
             self.request_query_lengths[dst_idxs] = self.request_query_lengths[survivor_idxs]
             self.request_output_lengths[dst_idxs] = self.request_output_lengths[survivor_idxs]
             self.request_ids[dst_idxs] = self.request_ids[survivor_idxs]

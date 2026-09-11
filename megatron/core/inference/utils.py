@@ -4,7 +4,6 @@ import asyncio
 import contextlib
 import logging
 import multiprocessing
-import os
 import sys
 from importlib.metadata import PackageNotFoundError, version
 
@@ -16,58 +15,6 @@ try:
     FLASHINFER_JIT_CACHE_VERSION = version("flashinfer-jit-cache")
 except PackageNotFoundError:
     FLASHINFER_JIT_CACHE_VERSION = None
-
-_mtp_debug_logger = logging.getLogger(__name__ + ".mtp_debug")
-
-# Debug aid for the MTP draft KV cache. Set MCORE_MTP_DEBUG_SHAPES=1 to log, for every MTP
-# forward, the attention metadata the inference context published next to the tensor shapes
-# actually handed to the MTP layer. A disagreement between the two is what surfaces downstream
-# as `RuntimeError: shape '[...]' is invalid for input of size N` inside flash-attn, by which
-# point the offending metadata is long gone. Off by default and read once at import, so a
-# production run pays only a module-level bool check per call.
-MTP_DEBUG_SHAPES = os.environ.get("MCORE_MTP_DEBUG_SHAPES", "0").lower() not in (
-    "0",
-    "",
-    "false",
-    "no",
-)
-
-
-def log_mtp_debug(tag: str, context=None, **fields) -> None:
-    """Log one MTP forward's context metadata alongside caller-supplied tensor shapes.
-
-    No-op unless `MCORE_MTP_DEBUG_SHAPES` is set. Every line is prefixed with the global rank
-    and the engine step so lines can be correlated across ranks and against a crash traceback.
-
-    Args:
-        tag: Short label for the call site, e.g. "commit_pass" or "draft_depth".
-        context: The `DynamicInferenceContext`, if available; its published attention metadata
-            is included automatically.
-        **fields: Call-site values, typically the shapes about to be passed to the MTP layer.
-    """
-    if not MTP_DEBUG_SHAPES:
-        return
-    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-    parts = []
-    if context is not None:
-        for name in (
-            "step_count",
-            "active_token_count",
-            "padded_active_token_count",
-            "total_request_count",
-            "paused_request_count",
-            "num_prefill_requests",
-            "chunked_prefill_request_id",
-            "_using_cuda_graph_this_step",
-            "mtp_kv_layer_slot",
-        ):
-            parts.append(f"{name.lstrip('_')}={getattr(context, name, '<absent>')}")
-        mtp = getattr(context, "mtp_metadata", None)
-        if mtp is not None:
-            parts.append(f"mtp_forward_active={mtp.forward_active}")
-            parts.append(f"mtp_graphed={mtp.graphed}")
-    parts.extend(f"{key}={value}" for key, value in fields.items())
-    _mtp_debug_logger.info("[MTP-DBG][rank %s] %s | %s", rank, tag, " ".join(parts))
 
 
 class InferenceMode:

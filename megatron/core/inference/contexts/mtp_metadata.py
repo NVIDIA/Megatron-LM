@@ -6,8 +6,6 @@ from typing import Optional, Tuple
 import torch
 from torch import Tensor
 
-from megatron.core.inference.utils import log_mtp_debug
-
 from .gpu_view import ContextGPUView
 
 
@@ -183,14 +181,16 @@ class MTPMetadata:
     def take_chunk_boundary(self, req_id: int, seam_position: int) -> Optional[Tensor]:
         """Return the carried hidden if it is the one this seam needs, else None.
 
-        BOTH keys must match, and a mismatch is declined rather than raised. The position key is
-        not merely a staleness guard -- it can differ for a perfectly healthy request. A
-        continuation chunk's offset is `finished_chunk_token_count + prefix_skip_tokens`, and the
-        KV prefix skip in `_compute_prefix_match` is NOT gated on `finished == 0`: if another
-        request publishes cached blocks covering this one's unprefilled region between its chunks,
-        the next chunk starts past `off + q` and its seam lands somewhere the carry does not
-        describe. Declining is then the correct answer, and the only cost is one stale draft K/V
-        that cannot affect verified output.
+        BOTH keys must match, and a mismatch is declined rather than raised.
+
+        A position mismatch should not happen: `_compute_prefix_match` gives up its ENTIRE prefix
+        match for a continuation chunk of a request that still holds a carry, precisely so this
+        chunk starts at `finished` and its seam lands where the carry describes. (Without that,
+        a mid-request prefix match would move the chunk's start past the carried position and
+        orphan that entry permanently.) This check is defence in depth for a path that is meant
+        to be unreachable, so it declines rather than raising: skipping one seam costs a little
+        draft acceptance and cannot affect verified output, whereas raising would kill a live
+        step.
 
         The position key also subsumes the `off > 0` guard: a first chunk asks for
         `seam_position == -1`, and a valid carry always records a position `>= 0`.
@@ -211,14 +211,6 @@ class MTPMetadata:
         if self.chunk_boundary_position != seam_position:
             # Logged rather than silent: this is legitimate (see above), but it is also what a
             # genuine bookkeeping drift would look like, and either way it costs draft acceptance.
-            log_mtp_debug(
-                "chunk_boundary_declined",
-                None,
-                reason="position_mismatch",
-                req_id=req_id,
-                carry_position=self.chunk_boundary_position,
-                seam_position=seam_position,
-            )
             return None
 
         return self.chunk_boundary_hidden
@@ -352,6 +344,7 @@ class MTPMetadata:
         positions: Tensor,
         block_table: Tensor,
         padded_token_count: int,
+        inherited_blocks: Optional[Tensor] = None,
     ) -> None:
         """Write the per-token KV destination maps for one MTP forward.
 
@@ -362,13 +355,24 @@ class MTPMetadata:
             block_table (Tensor): [R, max_kv_block_count] block ids indexed by `rows`.
             padded_token_count (int): Token rows the forward runs, including padding. Padded
                 rows are redirected to the dummy block so they never touch real KV.
+            inherited_blocks (Optional[Tensor]): [R] leading blocks each row INHERITED from the
+                prefix cache rather than computed. Tokens landing in those blocks are redirected
+                to the dummy block: their KV is already correct from the producing request, and
+                the block is ref-counted, so writing would corrupt every request sharing it.
+                The main KV path redirects the same span (`overlap_start_token` in
+                `add_request`). None disables the redirect, for callers with no inherited blocks.
         """
         total = positions.numel()
         block_within = (positions // self.block_size_tokens).to(torch.long)
 
-        gpu_view.token_to_block_idx[:total] = block_table[rows, block_within].to(
-            gpu_view.token_to_block_idx.dtype
-        )
+        destinations = block_table[rows, block_within]
+        if inherited_blocks is not None:
+            destinations = torch.where(
+                block_within < inherited_blocks[rows],
+                torch.full_like(destinations, self.dummy_block_idx),
+                destinations,
+            )
+        gpu_view.token_to_block_idx[:total] = destinations.to(gpu_view.token_to_block_idx.dtype)
         gpu_view.token_to_local_position_within_kv_block[:total] = (
             positions % self.block_size_tokens
         ).to(gpu_view.token_to_local_position_within_kv_block.dtype)
