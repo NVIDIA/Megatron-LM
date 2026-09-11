@@ -47,6 +47,7 @@ from megatron.core.utils import nvtx_range_pop, nvtx_range_push
 
 from . import csa_indexer_loss_kernels, thd_indexer_kernels, thd_layout_kernels
 from .csa_teacher_lse import can_use_fused_csa_teacher_lse, fused_csa_teacher_lse
+from .thd_utils import batch_of_row
 
 # ---------------------------------------------------------------------------
 # Lazy kernel imports
@@ -758,37 +759,6 @@ def _ensure_dsa_namespace():
 # ---------------------------------------------------------------------------
 # Index helpers
 # ---------------------------------------------------------------------------
-
-
-def batch_of_row(cu_seqlens_q: Tensor, total_q: Optional[int] = None) -> Tensor:
-    """For a THD-packed query of length ``total_q``, return a ``(total_q,)``
-    int64 tensor where entry ``i`` is the index of the segment that owns
-    query row ``i`` (i.e. the unique ``b`` with
-    ``cu_seqlens_q[b] <= i < cu_seqlens_q[b+1]``).
-
-    When ``total_q`` exceeds ``cu_seqlens_q[-1]`` (e.g. after
-    ``pad_thd_for_cuda_graph`` pads token tensors to a static capacity),
-    orphan rows are clamped to the last segment so the returned indices
-    are always in ``[0, B-1]`` and never cause OOB on per-segment arrays.
-
-    Used by every helper that needs to translate between per-row indices
-    and per-segment cumulative tensors.
-
-    Args:
-        cu_seqlens_q: ``(B+1,)`` int — cumulative Q lengths.
-        total_q: optional row count override; defaults to
-            ``int(cu_seqlens_q[-1].item())`` (forces a GPU→CPU sync).
-
-    Returns:
-        ``(total_q,)`` int64.
-    """
-    if total_q is None:
-        total_q = int(cu_seqlens_q[-1].item())
-    num_sequences = cu_seqlens_q.shape[0] - 1
-    row_idx = torch.arange(total_q, device=cu_seqlens_q.device, dtype=torch.int64)
-    return torch.bucketize(row_idx, cu_seqlens_q[1:], right=True).clamp(
-        max=max(num_sequences - 1, 0)
-    )
 
 
 def _teacher_lse_chunk_rows(

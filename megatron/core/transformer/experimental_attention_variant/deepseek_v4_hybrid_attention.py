@@ -259,11 +259,6 @@ class DSv4HybridAttention(Attention):
             inference_context is None and inference_params is None
         ), "Inference is not supported for DSv4HybridAttention."
 
-        if self.config.dsv4_version == "v4.1" and packed_seq_params is not None:
-            raise NotImplementedError(
-                "Native CSA2 currently supports unpacked sequences with CP=1."
-            )
-
         # Select this microbatch's dynamic CP group. QKV captures it explicitly
         # for recompute; the rest of this forward reads it from pg_collection.
         # Restore the static group before returning.
@@ -275,11 +270,14 @@ class DSv4HybridAttention(Attention):
 
         cp_size = cp_group.size()
         qkv_format = packed_seq_params.qkv_format if packed_seq_params is not None else None
+        if self.config.dsv4_version == "v4.1" and cp_size != 1:
+            raise NotImplementedError("Native CSA2 currently requires CP=1.")
         if cp_size > 1 and qkv_format != 'thd':
             raise ValueError("DSv4 Hybrid with CP requires qkv_format='thd'.")
         use_thd_cp = cp_size > 1 and qkv_format == 'thd'
         if use_thd_cp and packed_seq_params.cp_partition_mode != "contiguous":
             raise ValueError("DSv4 THD CP requires a contiguous CP partition.")
+
         self.pg_collection.cp = cp_group
 
         boundary_hidden = None
@@ -347,7 +345,9 @@ class DSv4HybridAttention(Attention):
             # (t, np, hn) -> (t, b=1, h=np*hn)
             # t is the pack size = sum (sq_i)
             # note that batch is a dummy dimension in the packed case
-            core_attn_out = core_attn_out.reshape(core_attn_out.size(0), 1, -1)
+            core_attn_out = core_attn_out.reshape(
+                core_attn_out.size(0), 1, self.query_projection_size
+            )
 
         if self.recompute_up_proj:
             assert self.qkv_up_checkpoint is not None
@@ -359,8 +359,19 @@ class DSv4HybridAttention(Attention):
         n_heads = self.num_attention_heads_per_partition
         pos_dim = self.config.qk_pos_emb_head_dim
         nope_dim = self.config.v_head_dim - pos_dim
-        core_attn_out = core_attn_out.view(seq_len, core_attn_out.size(1), n_heads, -1)
+        core_attn_out = core_attn_out.view(
+            seq_len, core_attn_out.size(1), n_heads, self.config.v_head_dim
+        )
         packed_seq = packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
+        skip_csa2_rope = (
+            self.config.dsv4_version == "v4.1"
+            and packed_seq
+            and (
+                seq_len == 0
+                or packed_seq_params.max_seqlen_kv == 0
+                or packed_seq_params.cu_seqlens_kv.numel() < 2
+            )
+        )
         if packed_seq:
             cu_seqlens_kv = (
                 packed_seq_params.cu_seqlens_kv_padded
@@ -395,7 +406,9 @@ class DSv4HybridAttention(Attention):
             rotary_pos_emb, _ = self.rotary_pos_emb(rope_seqlen, packed_seq=packed_seq)
         else:
             rotary_pos_emb = self.rotary_pos_emb(rope_seqlen, packed_seq=packed_seq)
-        if self.config.apply_rope_fusion:
+        if skip_csa2_rope:
+            pass
+        elif self.config.apply_rope_fusion:
             if use_thd_cp:
                 global_start = self.pg_collection.cp.rank() * core_attn_out.shape[0]
                 core_attn_out = cp_utils.apply_thd_cp_local_rope_fused(
@@ -468,17 +481,24 @@ class DSv4HybridAttention(Attention):
             else:
                 rot_part = rot_part_out
             core_attn_out = torch.cat([content_part, rot_part], dim=-1)
-        core_attn_out = core_attn_out.view(seq_len, core_attn_out.size(1), -1)
+        core_attn_out = core_attn_out.view(
+            seq_len, core_attn_out.size(1), self.query_projection_size
+        )
 
         # Grouped output
         core_attn_out = core_attn_out.view(
-            core_attn_out.size(0), core_attn_out.size(1), self.o_local_groups, -1
+            core_attn_out.size(0),
+            core_attn_out.size(1),
+            self.o_local_groups,
+            self.query_projection_size // self.o_local_groups,
         )
         wo_a_weight = self.linear_o_group_proj.view(
             self.o_local_groups, self.config.o_lora_rank, -1
         )
         core_attn_out = torch.einsum("...gd,grd->...gr", core_attn_out, wo_a_weight)
-        core_attn_out = core_attn_out.reshape(*core_attn_out.shape[:-2], -1)
+        core_attn_out = core_attn_out.reshape(
+            *core_attn_out.shape[:-2], self.o_local_groups * self.config.o_lora_rank
+        )
 
         # =================
         # Output. [sq, b, h]
@@ -635,6 +655,15 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
         rotary_pos_cos = None
         rotary_pos_sin = None
         packed_seq = packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
+        skip_csa2_rope = (
+            self.config.dsv4_version == "v4.1"
+            and packed_seq
+            and (
+                hidden_states.shape[0] == 0
+                or packed_seq_params.max_seqlen_q == 0
+                or packed_seq_params.cu_seqlens_q.numel() < 2
+            )
+        )
         if self.config.apply_rope_fusion:
             # ``mscale=1.0`` strips yarn's concentration factor from the
             # cached cos/sin so the fused kernel matches the unfused
@@ -739,7 +768,10 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
                 k_pos_emb = torch.unsqueeze(k_pos_emb, -2)
 
             cp_size = cp_group.size()
-            if self.config.apply_rope_fusion:
+            if skip_csa2_rope:
+                query = q
+                key = value = kv.unsqueeze(-2)
+            elif self.config.apply_rope_fusion:
                 if cp_size > 1 and packed_seq:
                     cp_rank = cp_group.rank()
                     # Rank r owns global rows [r * local_rows, (r + 1) * local_rows).

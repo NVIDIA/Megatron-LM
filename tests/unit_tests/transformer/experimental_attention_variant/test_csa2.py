@@ -9,6 +9,7 @@ it does not call the implementation's compressor, indexer, or sparse attention h
 """
 
 import math
+from itertools import accumulate
 from types import SimpleNamespace
 
 import pytest
@@ -17,6 +18,8 @@ import torch.nn.functional as F
 from torch import nn
 
 from megatron.core.extensions.transformer_engine import HAVE_TE
+from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
+from megatron.core.models.common.embeddings.yarn_rotary_pos_embedding import YarnRotaryEmbedding
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
     get_experimental_attention_variant_module_spec,
     get_transformer_block_with_experimental_attention_variant_spec,
@@ -24,11 +27,17 @@ from megatron.core.models.gpt.experimental_attention_variant_module_specs import
 from megatron.core.models.hybrid.hybrid_block import HybridStack, HyperConnectionHybridLayer
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_dsv4_stack_spec
+from megatron.core.packed_seq_params import (
+    PackedSeqParams,
+    get_thd_padding_kwargs,
+    pad_sequence_for_thd,
+)
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.experimental_attention_variant.csa import (
     CompressedSparseAttentionSubmodules,
+    Compressor,
     CompressorSubmodules,
 )
 from megatron.core.transformer.experimental_attention_variant.csa2 import (
@@ -37,13 +46,20 @@ from megatron.core.transformer.experimental_attention_variant.csa2 import (
     CSA2Indexer,
     CSA2IndexerSubmodules,
     CSA2State,
+    apply_csa2_thd_rope,
     select_candidate_blocks,
+)
+from megatron.core.transformer.experimental_attention_variant.csa_utils.thd_utils import (
+    build_csa2_thd_layout,
 )
 from megatron.core.transformer.experimental_attention_variant.dsa import (
     DSAIndexerLossAutoScaler,
     DSAIndexerLossLoggingHelper,
 )
-from megatron.core.transformer.module import convert_module_to_dtype_except_fp32_marked
+from megatron.core.transformer.module import (
+    MegatronModule,
+    convert_module_to_dtype_except_fp32_marked,
+)
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_layer import (
@@ -195,7 +211,9 @@ def _reference(x, weights, config, ratio):
         ).sum(dim=2)
         global_visible = torch.arange(latent.shape[0], device=x.device) < (qi + 1) // ratio
         index_scores = index_scores.masked_fill(~global_visible, -torch.inf)
-        selected = index_scores.topk(min(config.dsa_indexer_topk, latent.shape[0]), dim=-1).indices
+        selected = index_scores.argsort(dim=-1, descending=True, stable=True)[
+            ..., : min(config.dsa_indexer_topk, latent.shape[0])
+        ]
         selected_mask = torch.zeros_like(index_scores, dtype=torch.bool).scatter(-1, selected, True)
         visible = torch.cat((visible, selected_mask & global_visible), dim=-1)
         kv = torch.cat((kv, _reference_rope(latent, config, ratio, position_stride=ratio)))
@@ -347,7 +365,7 @@ def test_unimplemented_dropout_fails_clearly(pg_collection):
         _layer(pg_collection, 2, attention_dropout=0.1)
 
 
-def test_causal_mask_and_unsupported_packing(pg_collection):
+def test_causal_mask_and_unsupported_packing_format(pg_collection):
     layer = _layer(pg_collection, 2)
     x = torch.randn(5, 2, layer.config.hidden_size, device="cuda")
     mask = torch.ones(1, 1, 5, 5, device="cuda", dtype=torch.bool).triu(1)
@@ -355,8 +373,8 @@ def test_causal_mask_and_unsupported_packing(pg_collection):
     mask[..., 3, 0] = True
     with pytest.raises(NotImplementedError, match="ordinary causal"):
         layer(x, mask)
-    with pytest.raises(NotImplementedError, match="unpacked"):
-        layer(x, None, packed_seq_params=object())
+    with pytest.raises((ValueError, NotImplementedError), match="[Tt][Hh][Dd]"):
+        layer(x, None, packed_seq_params=PackedSeqParams(qkv_format="sbhd"))
 
 
 # Cross-layer sharing and hierarchical candidate selection
@@ -400,9 +418,11 @@ def _reference_candidates(scores, ratio, blocks_to_keep, block_size):
     newest = (visible - 1) // block_size
     for block in range(len(blocks)):
         block_scores[..., block] = torch.where(newest == block, torch.inf, block_scores[..., block])
-    top = block_scores.topk(min(blocks_to_keep, len(blocks)), dim=-1)
+    top_indices = block_scores.argsort(dim=-1, descending=True, stable=True)[
+        ..., : min(blocks_to_keep, len(blocks))
+    ]
     selected = torch.zeros_like(block_scores, dtype=torch.bool).scatter(
-        -1, top.indices, top.values > -torch.inf
+        -1, top_indices, block_scores.gather(-1, top_indices) > -torch.inf
     )
     return torch.stack([selected[..., position // block_size] for position in range(width)], -1)
 
@@ -483,9 +503,11 @@ def _reference_layer(x, weights, config, layer_idx, state):
             elif candidate_owner is not None and candidate_owner < layer_idx:
                 scores = scores.masked_fill(~state["candidates"], -torch.inf)
             state["scores"] = scores
-            top = scores.topk(min(config.dsa_indexer_topk, global_len), dim=-1)
+            top_indices = scores.argsort(dim=-1, descending=True, stable=True)[
+                ..., : min(config.dsa_indexer_topk, global_len)
+            ]
             state["selected"] = torch.zeros_like(scores, dtype=torch.bool).scatter(
-                -1, top.indices, top.values.isfinite()
+                -1, top_indices, scores.gather(-1, top_indices).isfinite()
             )
         visible = torch.cat((visible, state["selected"] & causal), -1)
         kv = torch.cat((kv, state["global_kv"]), 0)
@@ -1205,3 +1227,1149 @@ def test_evaluation_and_no_grad_do_not_attach_auxiliary_loss(monkeypatch, evalua
             outputs = _forward_cores(cores, inputs)
         assert all(not output.requires_grad for output in outputs)
     assert not records
+
+
+# Packed layout and padding-producer contracts.
+
+
+def _params(valid, physical=None, max_seqlen=None):
+    cu = torch.tensor(valid, dtype=torch.int32)
+    padded = None if physical is None else torch.tensor(physical, dtype=torch.int32)
+    lengths = cu.diff() if padded is None else padded.diff()
+    if max_seqlen is None:
+        max_seqlen = max(lengths.tolist(), default=0)
+    return PackedSeqParams(
+        qkv_format="thd",
+        cu_seqlens_q=cu,
+        cu_seqlens_kv=cu.clone(),
+        cu_seqlens_q_padded=padded,
+        cu_seqlens_kv_padded=None if padded is None else padded.clone(),
+        max_seqlen_q=max_seqlen,
+        max_seqlen_kv=max_seqlen,
+        pad_between_seqs=physical is not None,
+    )
+
+
+def _pad(alignment, maximum, max_num_seqs, static, tail_policy):
+    # Real sequences have lengths 5 and 3. The first has one physical padding
+    # token. Logical prefixes are cumulative REAL lengths, not physical starts.
+    params = _params([0, 5, 8], [0, 6, 9])
+    mask = torch.tensor([[False] * 5 + [True] + [False] * 3])
+    pad_alignment, target, sequence_capacity = get_thd_padding_kwargs(
+        alignment, maximum, max_num_seqs, static
+    )
+    tokens, _, _, _, params, mask = pad_sequence_for_thd(
+        tokens=torch.arange(9).unsqueeze(0),
+        labels=None,
+        loss_mask=None,
+        position_ids=None,
+        packed_seq_params=params,
+        alignment=pad_alignment,
+        target_len=target,
+        max_num_seqs=sequence_capacity,
+        tail_padding_policy=tail_policy,
+        padding_mask=mask,
+        cp_size=1,
+        cp_rank=0,
+    )
+    return tokens, params, mask
+
+
+def _check_compression(layout, ratio):
+    """Independent per-sequence enumeration checks addresses and validity."""
+    compressed = layout.for_compression(ratio)
+    valid = layout.valid_tokens.tolist()
+    physical = layout.cu_seqlens_padded.tolist()
+    source_rows, valid_groups, positions, seq_ids = [], [], [], []
+    physical_prefix, valid_prefix = [0], [0]
+    for seq_id, (start, end) in enumerate(zip(physical, physical[1:])):
+        group_count = (end - start) // ratio
+        seq_valid = 0
+        for local_group in range(group_count):
+            sources = list(range(start + ratio * local_group, start + ratio * (local_group + 1)))
+            is_valid = all(valid[source] for source in sources)
+            source_rows.append(sources)
+            valid_groups.append(is_valid)
+            positions.append(ratio * local_group if is_valid else 0)
+            seq_ids.append(seq_id)
+            seq_valid += is_valid
+        physical_prefix.append(physical_prefix[-1] + group_count)
+        valid_prefix.append(valid_prefix[-1] + seq_valid)
+    expected_capacity = min(
+        layout.total_tokens // ratio, (len(physical) - 1) * (layout.max_seqlen // ratio)
+    )
+    while len(source_rows) < expected_capacity:
+        source_rows.append([0] * ratio)
+        valid_groups.append(False)
+        positions.append(0)
+        seq_ids.append(-1)
+    assert compressed.capacity == expected_capacity
+    assert compressed.max_seqlen == layout.max_seqlen // ratio
+    assert compressed.source_indices.shape == (compressed.capacity, ratio)
+    assert compressed.source_indices.tolist() == source_rows
+    assert compressed.valid_groups.tolist() == valid_groups
+    assert compressed.position_ids.tolist() == positions
+    assert compressed.sequence_ids.tolist() == seq_ids
+    assert compressed.cu_seqlens_padded.tolist() == physical_prefix
+    assert compressed.cu_seqlens.tolist() == valid_prefix
+    assert compressed.cu_seqlens.dtype == layout.cu_seqlens.dtype
+    return compressed
+
+
+@pytest.mark.parametrize("alignment", [4, 8, "max"])
+@pytest.mark.parametrize("max_num_seqs", [None, 6])
+@pytest.mark.parametrize("static", [False, True])
+@pytest.mark.parametrize("tail_policy", ["append_dummy_seq", "extend_last"])
+def test_actual_padding_configuration_layout(alignment, max_num_seqs, static, tail_policy):
+    tokens, params, _ = _pad(alignment, 16, max_num_seqs, static, tail_policy)
+    total = tokens.shape[-1]
+    expected_total = 16 if static or alignment in (8, "max") else 12
+    assert total == expected_total
+    if max_num_seqs is not None:
+        assert params.cu_seqlens_q.numel() == max_num_seqs + 1
+        assert params.cu_seqlens_q[-1] == params.cu_seqlens_q[-2]
+    layout = build_csa2_thd_layout(params, total)
+    dummy_length = total - 9 if tail_policy == "append_dummy_seq" else 0
+    assert layout.valid_tokens.tolist() == (
+        [True] * 5 + [False] + [True] * (3 + dummy_length) + [False] * (total - 9 - dummy_length)
+    )
+    assert layout.position_ids.tolist() == (
+        [0, 1, 2, 3, 4, 0, 0, 1, 2] + list(range(dummy_length)) + [0] * (total - 9 - dummy_length)
+    )
+    assert layout.valid_tokens.sum() == 8 + dummy_length
+    for ratio, expected_valid in ((1, 8), (2, 3)):
+        compressed = _check_compression(layout, ratio)
+        assert compressed.valid_groups.sum() == expected_valid + dummy_length // ratio
+
+
+def test_integer_alignment_capacity_comes_from_padded_tensor():
+    # Integer alignment rounds the complete pack, even when rounding exceeds
+    # max_seqlen_per_dp_cp_rank. That maximum is a target only for "max"/static.
+    tokens, params, _ = _pad(8, 10, 6, False, "append_dummy_seq")
+    assert tokens.shape[-1] == 16
+    layout = build_csa2_thd_layout(params, tokens.shape[-1])
+    compressed = _check_compression(layout, 2)
+    assert compressed.capacity == 8
+    assert compressed.cu_seqlens_padded[-1] == 7
+    assert compressed.sequence_ids[-1] == -1
+
+
+def test_dummy_sequence_is_logically_valid_as_in_dsv4():
+    tokens, params, mask = _pad("max", 16, 6, False, "append_dummy_seq")
+    layout = build_csa2_thd_layout(params, tokens.shape[-1])
+    # The producer mask still excludes dummies for consumers such as MoE.
+    # Attention follows DSv4's cu metadata, where dummy sequences are ordinary sequences.
+    assert (~mask).sum() == 8
+    assert layout.valid_tokens.sum() == 15
+    assert layout.for_compression(2).valid_groups.sum() == 6
+
+
+def test_metadata_capacity_includes_dummy_sequence():
+    with pytest.raises(AssertionError, match="thd_max_packed_sequences"):
+        _pad("max", 16, 2, False, "append_dummy_seq")
+    tokens, params, _ = _pad("max", 16, 2, False, "extend_last")
+    layout = build_csa2_thd_layout(params, tokens.shape[-1])
+    assert layout.cu_seqlens.numel() == 3
+    assert _check_compression(layout, 2).valid_groups.sum() == 3
+
+
+def test_fixed_target_rejects_oversize_without_truncation():
+    with pytest.raises(AssertionError, match="exceeds"):
+        _pad("max", 8, 6, False, "append_dummy_seq")
+
+
+@pytest.mark.parametrize(
+    "valid,physical,total",
+    [
+        ([0], [0], 0),
+        ([0], [0], 4),
+        ([0, 0, 0], [0, 0, 0], 0),
+        ([0, 0, 0], [0, 2, 4], 4),
+        ([0, 1], [0, 1], 1),
+        ([0, 1, 2], [0, 1, 2], 2),
+        ([0, 0, 3, 3], [0, 0, 3, 3], 5),
+    ],
+)
+def test_empty_repeated_and_unassigned_capacity(valid, physical, total):
+    layout = build_csa2_thd_layout(_params(valid, physical), total)
+    for ratio in (1, 2):
+        _check_compression(layout, ratio)
+
+
+@pytest.mark.parametrize(
+    "valid,physical,total,max_seqlen,expected_capacities",
+    [
+        pytest.param([0, 3], [0, 4], 64, 4, (4, 2), id="tail-exceeds-sequence-bound"),
+        pytest.param([0, 1, 2], [0, 1, 2], 32, 1, (2, 0), id="max-shorter-than-r2"),
+        pytest.param([0], [0], 16, 8, (0, 0), id="no-sequences-with-token-capacity"),
+        pytest.param(
+            [0, 2, 2, 2],
+            [0, 2, 2, 2],
+            64,
+            4,
+            (12, 6),
+            id="metadata-capacity-includes-empty-entries",
+        ),
+    ],
+)
+def test_compressed_capacity_respects_dsv4_sequence_bound(
+    valid, physical, total, max_seqlen, expected_capacities
+):
+    layout = build_csa2_thd_layout(_params(valid, physical, max_seqlen), total)
+    for ratio, expected in zip((1, 2), expected_capacities):
+        compressed = _check_compression(layout, ratio)
+        assert compressed.capacity == expected
+        assert compressed.capacity < total // ratio
+
+
+def test_layout_snapshot_detects_reused_metadata_changes():
+    params = _params([0, 2, 4], max_seqlen=4)
+    layout = build_csa2_thd_layout(params, 4)
+    layout.validate_layout(layout)
+    layout.validate_compatible(params, 4)
+    params.cu_seqlens_q[1] = 1
+    params.cu_seqlens_kv[1] = 1
+    assert layout.cu_seqlens.tolist() == [0, 2, 4]
+    with pytest.raises(ValueError, match="different THD layout"):
+        layout.validate_compatible(params, 4)
+
+
+@pytest.mark.parametrize(
+    "valid,physical,total,max_seqlen,message",
+    [
+        ([1, 4], [1, 4], 4, 4, "start at zero"),
+        ([0, 3, 2], [0, 3, 4], 4, 4, "monotonic"),
+        ([0, 5], [0, 5], 4, 5, "exceeds physical token"),
+        ([0, 4], [0, 3], 4, 4, "exceeds its physical segment"),
+        ([0, 3], [0, 4], 4, 3, "exceeds max_seqlen"),
+    ],
+)
+def test_invalid_prefix_values(valid, physical, total, max_seqlen, message):
+    with pytest.raises(ValueError, match=message):
+        build_csa2_thd_layout(_params(valid, physical, max_seqlen), total)
+
+
+@pytest.mark.parametrize("mismatch", ["shape", "dtype", "values", "physical_values"])
+def test_query_kv_metadata_must_agree(mismatch):
+    params = _params([0, 2, 4], [0, 2, 4])
+    if mismatch == "shape":
+        params.cu_seqlens_kv = params.cu_seqlens_kv[:2]
+    elif mismatch == "dtype":
+        params.cu_seqlens_kv = params.cu_seqlens_kv.to(torch.int64)
+    elif mismatch == "values":
+        params.cu_seqlens_kv[1] = 1
+    else:
+        params.cu_seqlens_kv_padded[1] = 1
+    with pytest.raises(ValueError, match="query/KV"):
+        build_csa2_thd_layout(params, 4)
+
+
+@pytest.mark.parametrize("ratio", [0, 3, True])
+def test_unsupported_compression_ratio(ratio):
+    layout = build_csa2_thd_layout(_params([0, 4]), 4)
+    with pytest.raises(ValueError, match="ratio must be 1 or 2"):
+        layout.for_compression(ratio)
+
+
+def test_nonlocal_cp_metadata_is_rejected():
+    params = _params([0, 4])
+    params.local_cp_size = 2
+    with pytest.raises(ValueError, match="requires CP=1"):
+        build_csa2_thd_layout(params, 4)
+
+
+# Packed compressor/RoPE parity and shared DSv4 indexing regressions.
+
+
+class _Linear(nn.Linear):
+    """Ordinary PyTorch projection exposing Megatron's output/bias interface."""
+
+    def __init__(self, input_size, output_size, config, **kwargs):
+        super().__init__(input_size, output_size, bias=False, dtype=config.params_dtype)
+
+    def forward(self, x):
+        return super().forward(x), None
+
+
+class _RMSNorm(nn.Module):
+    """Native RMSNorm with FP32 statistics and activation-dtype output."""
+
+    def __init__(self, hidden_size, eps, config):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size, dtype=config.params_dtype))
+        self.eps = eps
+
+    def forward(self, x):
+        return F.rms_norm(x.float(), (x.shape[-1],), self.weight.float(), self.eps).to(x.dtype)
+
+
+def _config(dtype):
+    return SimpleNamespace(
+        params_dtype=dtype,
+        bf16=dtype == torch.bfloat16,
+        hidden_size=6,
+        q_lora_rank=4,
+        v_head_dim=8,
+        qk_pos_emb_head_dim=4,
+        dsa_indexer_n_heads=2,
+        dsa_indexer_head_dim=6,
+        dsa_indexer_topk=2,
+        attention_latent_norm_epsilon=1e-20,
+        init_method=lambda weight: nn.init.normal_(weight, std=0.2),
+        apply_rope_fusion=False,
+        rotary_interleaved=False,
+        multi_latent_attention=True,
+        mrope_section=None,
+    )
+
+
+def _compressor(ratio, dtype):
+    module = CSA2Compressor(
+        config=_config(dtype),
+        submodules=CompressorSubmodules(_Linear, _Linear, _RMSNorm),
+        compress_ratio=ratio,
+        pg_collection=_groups(),
+    )
+    with torch.no_grad():
+        module.norm.weight.uniform_(0.7, 1.3)
+    return module
+
+
+def _packed(real_lengths, physical_lengths, *, tail=0, dummy_sequences=(), device="cpu"):
+    """Build metadata and a producer mask; DSv4 attention includes logical dummy rows."""
+    real_cu = torch.tensor([0, *accumulate(real_lengths)], dtype=torch.int32, device=device)
+    physical_cu = torch.tensor([0, *accumulate(physical_lengths)], dtype=torch.int32, device=device)
+    total = sum(physical_lengths) + tail
+    valid = torch.zeros(total, dtype=torch.bool, device=device)
+    producer_valid = valid.clone()
+    offset = 0
+    for sequence, (real, physical) in enumerate(zip(real_lengths, physical_lengths)):
+        valid[offset : offset + real] = True
+        if sequence not in dummy_sequences:
+            producer_valid[offset : offset + real] = True
+        offset += physical
+    params = PackedSeqParams(
+        qkv_format="thd",
+        cu_seqlens_q=real_cu,
+        cu_seqlens_kv=real_cu,
+        cu_seqlens_q_padded=physical_cu,
+        cu_seqlens_kv_padded=physical_cu,
+        max_seqlen_q=max(physical_lengths, default=0),
+        max_seqlen_kv=max(physical_lengths, default=0),
+        total_tokens=total,
+        pad_between_seqs=True,
+    )
+    return params, (~producer_valid).unsqueeze(0), valid
+
+
+def _reference_compressor(x, weights, ratio, physical_lengths, valid):
+    """Project each complete physical group separately; padded groups have no derivative."""
+    safe_x = x.masked_fill(~valid[:, None, None], 0)
+    zero = safe_x.sum() * 0
+    for weight in weights.values():
+        zero = zero + weight.sum() * 0
+    zero_row = zero.expand(1, weights["norm.weight"].shape[0]).to(x.dtype)
+    outputs = []
+    offset = 0
+    for physical in physical_lengths:
+        for position in range(0, physical - ratio + 1, ratio):
+            start = offset + position
+            if not valid[start : start + ratio].all():
+                outputs.append(zero_row)
+                continue
+            tokens = x[start : start + ratio]
+            if ratio == 1:
+                latent = F.linear(tokens[0].float(), weights["linear_wkv.weight"]).to(x.dtype)
+            else:
+                projected = F.linear(tokens.float(), weights["linear_wkv.weight"])
+                gate = F.linear(tokens.float(), weights["linear_wgate.weight"])
+                # Each output channel has its own distribution over this sequence's group.
+                latent = (projected * gate.softmax(dim=0)).sum(dim=0).to(x.dtype)
+            xf = latent.float()
+            normalized = xf / (xf.square().mean(dim=-1, keepdim=True) + 1e-20).sqrt()
+            outputs.append((normalized * weights["norm.weight"].float()).to(x.dtype))
+        offset += physical
+    expected_capacity = min(
+        x.shape[0] // ratio, len(physical_lengths) * (max(physical_lengths, default=0) // ratio)
+    )
+    outputs.extend([zero_row] * (expected_capacity - len(outputs)))
+    if not outputs:
+        return zero_row.unsqueeze(0)[:0]
+    return torch.stack(outputs)
+
+
+_PACK_CASES = [
+    pytest.param([1, 3, 4, 5], [1, 3, 4, 5], 0, (), id="odd-sequences"),
+    pytest.param([1, 3, 4], [4, 4, 6], 3, (), id="inter-sequence-and-tail-padding"),
+    pytest.param([3, 4, 2], [4, 4, 2], 3, (2,), id="dummy-present-in-both-cu-arrays"),
+    pytest.param([1, 1, 1], [3, 3, 3], 1, (), id="no-complete-r2-group"),
+    pytest.param([0, 0], [4, 2], 2, (), id="entirely-padding"),
+    pytest.param([1], [1], 0, (), id="zero-r2-capacity"),
+    pytest.param([3], [4], 60, (), id="capacity-bounded-by-sequence-length"),
+    pytest.param([1, 1], [1, 1], 30, (), id="capacity-zero-when-max-shorter-than-r2"),
+    pytest.param([], [], 8, (), id="no-sequences-with-token-capacity"),
+]
+
+
+@pytest.mark.parametrize("ratio", [1, 2])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("real_lengths,physical_lengths,tail,dummies", _PACK_CASES)
+def test_compressor_packed_outputs_and_gradients_match_independent_groups(
+    ratio, dtype, real_lengths, physical_lengths, tail, dummies
+):
+    torch.manual_seed(320)
+    params, _, valid = _packed(real_lengths, physical_lengths, tail=tail, dummy_sequences=dummies)
+    module = _compressor(ratio, dtype)
+    x = torch.randn(valid.numel(), 1, 6, dtype=dtype, requires_grad=True)
+    reference_x = x.detach().clone().requires_grad_()
+    weights = {
+        name: parameter.detach().float().clone().requires_grad_()
+        for name, parameter in module.named_parameters()
+    }
+    latent, layout = module(x, packed_seq_params=params)
+    expected = _reference_compressor(reference_x, weights, ratio, physical_lengths, valid)
+    tolerance = dict(atol=3e-6, rtol=3e-5)
+    if dtype == torch.bfloat16:
+        tolerance = dict(atol=2e-2, rtol=3e-2)
+    expected_capacity = min(
+        valid.numel() // ratio, len(physical_lengths) * (max(physical_lengths, default=0) // ratio)
+    )
+    assert latent.shape == (expected_capacity, 1, 8)
+    assert latent.dtype == dtype
+    torch.testing.assert_close(latent, expected, **tolerance)
+    assert torch.count_nonzero(latent[~layout.valid_groups]) == 0
+
+    # Multiple consumers exercise accumulation into the same compressor projections.
+    probe_a = torch.randn_like(latent)
+    probe_b = torch.randn_like(latent)
+    actual_loss = (latent.float() * probe_a).sum() + (latent.float() * probe_b).sum() * 0.3
+    expected_loss = (expected.float() * probe_a).sum() + (expected.float() * probe_b).sum() * 0.3
+    actual_loss.backward()
+    expected_loss.backward()
+    torch.testing.assert_close(x.grad, reference_x.grad, **tolerance)
+    assert torch.count_nonzero(x.grad[~valid]) == 0
+    for name, parameter in module.named_parameters():
+        assert parameter.grad is not None, name
+        assert torch.isfinite(parameter.grad).all(), name
+        torch.testing.assert_close(
+            parameter.grad.float(),
+            weights[name].grad,
+            **tolerance,
+            msg=lambda detail: f"{name}: {detail}",
+        )
+
+
+@pytest.mark.parametrize("ratio", [1, 2])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_nonfinite_padding_cannot_poison_compressor_forward_or_backward(ratio, dtype):
+    torch.manual_seed(321)
+    params, _, valid = _packed([3, 1, 2], [4, 4, 2], tail=2, dummy_sequences=(2,))
+    module = _compressor(ratio, dtype)
+    x = torch.randn(valid.numel(), 1, 6, dtype=dtype)
+    contaminated = x.clone()
+    invalid_rows = (~valid).nonzero().flatten()
+    for index, row in enumerate(invalid_rows):
+        contaminated[row] = [float("nan"), float("inf"), -float("inf")][index % 3]
+    x.requires_grad_()
+    contaminated.requires_grad_()
+    expected, _ = module(x, packed_seq_params=params)
+    actual, layout = module(contaminated, packed_seq_params=params)
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    assert torch.isfinite(actual).all()
+    assert torch.count_nonzero(actual[~layout.valid_groups]) == 0
+    probe = torch.randn_like(actual)
+    parameters = tuple(module.parameters())
+    expected_grads = torch.autograd.grad((expected * probe).sum(), (x, *parameters))
+    actual_grads = torch.autograd.grad((actual * probe).sum(), (contaminated, *parameters))
+    for actual_grad, expected_grad in zip(actual_grads, expected_grads):
+        assert torch.isfinite(actual_grad).all()
+        torch.testing.assert_close(actual_grad, expected_grad, atol=0, rtol=0)
+    assert torch.count_nonzero(actual_grads[0][~valid]) == 0
+
+
+@pytest.mark.parametrize("ratio", [1, 2])
+def test_prebuilt_layout_and_ordinary_compressor_calls_preserve_contract(ratio):
+    params, _, _ = _packed([3, 5], [4, 6], tail=2)
+    module = _compressor(ratio, torch.float32)
+    x = torch.randn(12, 1, 6)
+    layout = build_csa2_thd_layout(params, x.shape[0])
+    direct, _ = module(x, packed_seq_params=params)
+    reused, _ = module(x, thd_layout=layout)
+    torch.testing.assert_close(reused, direct, atol=0, rtol=0)
+    ordinary = module(x[:5])
+    assert isinstance(ordinary, torch.Tensor)
+    assert ordinary.shape == (5 // ratio, 1, 8)
+
+
+def _rotary_module(config, use_yarn, cp_group):
+    if use_yarn:
+        return YarnRotaryEmbedding(
+            config.qk_pos_emb_head_dim,
+            rotary_base=160000,
+            scaling_factor=16,
+            original_max_position_embeddings=128,
+            beta_fast=32,
+            beta_slow=1,
+            mscale=0,
+            mscale_all_dim=0,
+            cp_group=cp_group,
+        )
+    return RotaryEmbedding(config.qk_pos_emb_head_dim, 1.0, rotary_base=10000, cp_group=cp_group)
+
+
+def _rope_reference(x, config, rotary, positions, valid):
+    """Adjacent-pair rotation from the module's mathematical frequency table."""
+    dim = config.qk_pos_emb_head_dim
+    frequencies = rotary(64, packed_seq=True)
+    if isinstance(frequencies, tuple):
+        frequencies = frequencies[0]
+    # Frequency generation is independent of packing. Apply explicit local positions here.
+    angles = frequencies[positions, 0, 0, : dim // 2]
+    shape = (x.shape[0], *([1] * (x.ndim - 2)), dim // 2)
+    cos = angles.cos().to(x.dtype).reshape(shape)
+    sin = angles.sin().to(x.dtype).reshape(shape)
+    safe_x = x.masked_fill(~valid.reshape(-1, *([1] * (x.ndim - 1))), 0)
+    even, odd = safe_x[..., -dim::2], safe_x[..., -dim + 1 :: 2]
+    rotated = torch.stack((even * cos - odd * sin, odd * cos + even * sin), dim=-1).flatten(-2)
+    return torch.cat((safe_x[..., :-dim], rotated), dim=-1)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Megatron rotary tables require CUDA")
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("stream", ["token-rope", "token-yarn", "compressed-r1", "compressed-r2"])
+@pytest.mark.parametrize("heads", [None, 2])
+def test_packed_rope_resets_positions_and_preserves_gradients(dtype, stream, heads):
+    torch.manual_seed(322)
+    config = _config(dtype)
+    params, _, token_valid = _packed(
+        [3, 5, 2], [4, 6, 2], tail=3, dummy_sequences=(2,), device="cuda"
+    )
+    token_layout = build_csa2_thd_layout(params, token_valid.numel())
+    ratio = 2 if stream == "compressed-r2" else 1
+    is_compressed = stream.startswith("compressed")
+    layout = token_layout.for_compression(ratio) if is_compressed else token_layout
+    # Derive the expected physical row positions separately from layout.position_ids.
+    positions, validity = [], []
+    for real, physical in zip([3, 5, 2], [4, 6, 2]):
+        step = ratio if is_compressed else 1
+        for position in range(0, physical - step + 1, step):
+            positions.append(position)
+            validity.append(position + step <= real)
+    rows = (
+        min(token_valid.numel() // ratio, 3 * (6 // ratio))
+        if is_compressed
+        else token_valid.numel()
+    )
+    positions.extend([0] * (rows - len(positions)))
+    validity.extend([False] * (rows - len(validity)))
+    positions = torch.tensor(positions, dtype=torch.long, device="cuda")
+    valid = torch.tensor(validity, dtype=torch.bool, device="cuda")
+    shape = (rows, 1, config.v_head_dim) if heads is None else (rows, 1, heads, config.v_head_dim)
+    x = torch.randn(shape, dtype=dtype, device="cuda")
+    x[~valid] = float("nan")
+    x.requires_grad_()
+    reference_x = x.detach().clone().requires_grad_()
+    cp_group = _groups().cp
+    rotary = _rotary_module(config, stream != "token-rope", cp_group)
+    actual = apply_csa2_thd_rope(x, rotary, config, layout, cp_group)
+    expected = _rope_reference(reference_x, config, rotary, positions, valid)
+    tolerance = dict(atol=2e-6, rtol=2e-6)
+    if dtype == torch.bfloat16:
+        tolerance = dict(atol=2e-2, rtol=2e-2)
+    assert torch.isfinite(actual).all()
+    assert actual.shape == x.shape
+    assert torch.isnan(x[~valid]).all(), "RoPE must not mutate shared input storage"
+    torch.testing.assert_close(actual, expected, **tolerance)
+    assert torch.count_nonzero(actual[~valid]) == 0
+    probe = torch.randn_like(actual)
+    (actual * probe).sum().backward()
+    (expected * probe).sum().backward()
+    assert torch.isfinite(x.grad).all()
+    torch.testing.assert_close(x.grad, reference_x.grad, **tolerance)
+    assert torch.count_nonzero(x.grad[~valid]) == 0
+
+
+class _CPUFrequencyTable(nn.Module):
+    """Deterministic frequency inputs; the production RoPE operation remains unchanged."""
+
+    def __init__(self, dim):
+        super().__init__()
+        self.register_buffer("frequencies", 160000 ** (-torch.arange(0, dim, 2).float() / dim))
+
+    def forward(self, length, packed_seq=False):
+        angles = torch.outer(torch.arange(length).float(), self.frequencies)
+        return torch.cat((angles, angles), dim=-1)[:, None, None, :]
+
+
+def _complex_rotation(x, dim, positions, valid, frequency_table):
+    """Independent complex-number multiplication, with padding removed before arithmetic."""
+    safe_x = x.masked_fill(~valid.reshape(-1, *([1] * (x.ndim - 1))), 0)
+    pairs = safe_x[..., -dim:].float().reshape(*safe_x.shape[:-1], dim // 2, 2)
+    values = torch.view_as_complex(pairs.contiguous())
+    angles = torch.outer(positions.float(), frequency_table.frequencies)
+    phase = torch.polar(torch.ones_like(angles), angles)
+    phase = phase.reshape(x.shape[0], *([1] * (x.ndim - 2)), dim // 2)
+    rotated = torch.view_as_real(values * phase).flatten(-2).to(x.dtype)
+    return torch.cat((safe_x[..., :-dim], rotated), dim=-1)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("ratio", [0, 1, 2], ids=["token", "compressed-r1", "compressed-r2"])
+@pytest.mark.parametrize("heads", [None, 2])
+def test_native_cpu_packed_rope_matches_complex_rotation(dtype, ratio, heads):
+    params, _, token_valid = _packed([3, 5], [4, 6], tail=2)
+    token_layout = build_csa2_thd_layout(params, 12)
+    layout = token_layout.for_compression(ratio) if ratio else token_layout
+    if ratio == 2:
+        positions = torch.tensor([0, 2, 0, 2, 4, 0])
+        valid = torch.tensor([True, False, True, True, False, False])
+    else:
+        positions = torch.tensor([0, 1, 2, 3, 0, 1, 2, 3, 4, 5, 0, 0])
+        valid = token_valid
+    shape = (len(positions), 1, 8) if heads is None else (len(positions), 1, heads, 8)
+    torch.manual_seed(323)
+    x = torch.randn(shape, dtype=dtype)
+    x[~valid] = float("inf")
+    x.requires_grad_()
+    reference_x = x.detach().clone().requires_grad_()
+    rotary = _CPUFrequencyTable(4)
+    actual = apply_csa2_thd_rope(x, rotary, _config(dtype), layout, _groups().cp)
+    expected = _complex_rotation(reference_x, 4, positions, valid, rotary)
+    tolerance = dict(atol=2e-6, rtol=2e-6)
+    if dtype == torch.bfloat16:
+        # Native RoPE rounds each product to BF16; the complex oracle evaluates in FP32.
+        tolerance = dict(atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(actual, expected, **tolerance)
+    assert torch.isinf(x[~valid]).all()
+    assert torch.count_nonzero(actual[~valid]) == 0
+    probe = torch.randn_like(actual)
+    (actual * probe).sum().backward()
+    (expected * probe).sum().backward()
+    torch.testing.assert_close(x.grad, reference_x.grad, **tolerance)
+    assert torch.isfinite(x.grad).all()
+    assert torch.count_nonzero(x.grad[~valid]) == 0
+
+
+@pytest.mark.parametrize("changed", ["physical-cu", "logical-cu"])
+def test_shared_state_rejects_changed_packing_even_when_total_shape_matches(changed):
+    params, _, _ = _packed([3, 5], [4, 6])
+    original = build_csa2_thd_layout(params, 10)
+    query = torch.randn(10, 2, 8)
+    state = CSA2State()
+    state.validate_forward(0, query, thd_layout=original)
+    state.last_layer = 0
+    # An equal independently built snapshot is valid; object identity is not required.
+    equivalent = build_csa2_thd_layout(params, 10)
+    state.validate_forward(1, query, thd_layout=equivalent)
+    if changed == "physical-cu":
+        different_params, _, _ = _packed([3, 5], [3, 7])
+    else:
+        different_params, _, _ = _packed([4, 4], [4, 6])
+    different = build_csa2_thd_layout(different_params, 10)
+    with pytest.raises(ValueError):
+        state.validate_forward(1, query, thd_layout=different)
+    with pytest.raises(ValueError, match="packed and unpacked"):
+        state.validate_forward(1, query.unsqueeze(1))
+    ordinary_state = CSA2State()
+    ordinary_state.validate_forward(0, query.unsqueeze(1))
+    ordinary_state.last_layer = 0
+    with pytest.raises(ValueError, match="packed and unpacked"):
+        ordinary_state.validate_forward(1, query, thd_layout=original)
+
+
+@pytest.mark.parametrize("ratio", [1, 2])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_packed_indexer_key_projection_preserves_owner_gradients_and_input(ratio, dtype):
+    torch.manual_seed(324)
+    params, _, _ = _packed([3, 5], [4, 6], tail=2)
+    token_layout = build_csa2_thd_layout(params, 12)
+    layout = token_layout.for_compression(ratio)
+    config = _config(dtype)
+    module = CSA2Indexer(
+        config, CSA2IndexerSubmodules(_Linear, _Linear, _RMSNorm, _Linear), ratio, _groups()
+    )
+    latent = torch.randn(layout.capacity, 1, 8, dtype=dtype)
+    latent[~layout.valid_groups] = float("nan")
+    latent.requires_grad_()
+    reference_latent = latent.detach().clone().requires_grad_()
+    wk = module.linear_wk.weight.detach().float().clone().requires_grad_()
+    gamma = module.k_norm.weight.detach().float().clone().requires_grad_()
+    rotary = _CPUFrequencyTable(4)
+    actual = module.project_keys(latent, rotary, thd_layout=layout)
+    safe_latent = reference_latent.masked_fill(~layout.valid_groups[:, None, None], 0)
+    projected = F.linear(safe_latent.float(), wk).to(dtype)
+    xf = projected.float()
+    normalized = (xf * (xf.square().mean(-1, keepdim=True) + 1e-20).rsqrt() * gamma).to(dtype)
+    expected = _rope_reference(normalized, config, rotary, layout.position_ids, layout.valid_groups)
+    tolerance = dict(atol=3e-6, rtol=3e-5)
+    if dtype == torch.bfloat16:
+        tolerance = dict(atol=2e-2, rtol=3e-2)
+    torch.testing.assert_close(actual, expected, **tolerance)
+    assert torch.isnan(latent[~layout.valid_groups]).all()
+    assert torch.count_nonzero(actual[~layout.valid_groups]) == 0
+    # Shared keys receive the sum of gradients from two independent downstream consumers.
+    probes = [torch.randn_like(actual), torch.randn_like(actual)]
+    actual_gradients = None
+    if dtype == torch.float32:
+        # In BF16, separate backwards round the upstream sum at different points.
+        # Compare that combined backward to the FP32 oracle below instead.
+        actual_gradients = [
+            torch.autograd.grad((actual * probe).sum(), module.linear_wk.weight, retain_graph=True)[
+                0
+            ]
+            for probe in probes
+        ]
+    sum((actual * probe).sum() for probe in probes).backward()
+    sum((expected * probe).sum() for probe in probes).backward()
+    torch.testing.assert_close(latent.grad, reference_latent.grad, **tolerance)
+    torch.testing.assert_close(module.linear_wk.weight.grad.float(), wk.grad, **tolerance)
+    torch.testing.assert_close(module.k_norm.weight.grad.float(), gamma.grad, **tolerance)
+    if actual_gradients is not None:
+        torch.testing.assert_close(module.linear_wk.weight.grad, sum(actual_gradients), **tolerance)
+    assert torch.isfinite(latent.grad).all()
+    assert torch.count_nonzero(latent.grad[~layout.valid_groups]) == 0
+
+
+def _dsv4_cpu_compressor(ratio):
+    """Install real CPU parameters without the constructor's CUDA-only APE allocation."""
+    config = _config(torch.float32)
+    config.fp8 = config.fp4 = False
+    config.layernorm_epsilon = 1e-5
+    module = Compressor.__new__(Compressor)
+    MegatronModule.__init__(module, config)
+    module.compress_ratio = ratio
+    module.head_dim = 8
+    module.overlap = ratio == 4
+    module.coff = 2 if module.overlap else 1
+    module.use_fused_compressor = False
+    module.rotate = False
+    module.qk_pos_emb_head_dim = 4
+    module.pg_collection = _groups()
+    module.rotary_pos_emb = _CPUFrequencyTable(4)
+    module.linear_wkv = _Linear(6, module.coff * 8, config)
+    module.linear_wgate = _Linear(6, module.coff * 8, config)
+    module.ape = nn.Parameter(torch.randn(ratio, module.coff * 8) * 0.2)
+    module.norm = _RMSNorm(8, config.layernorm_epsilon, config)
+    return module
+
+
+def _dsv4_reference_groups(x, weights, ratio, lengths, rotary):
+    """Enumerate DSv4 groups, including r4's previous-group overlap and APE."""
+    result, positions = [], []
+    offset = 0
+    for length in lengths:
+        previous_values = previous_logits = None
+        for group in range(length // ratio):
+            tokens = x[offset + group * ratio : offset + (group + 1) * ratio]
+            values = F.linear(tokens, weights["linear_wkv.weight"])
+            logits = F.linear(tokens, weights["linear_wgate.weight"]) + weights["ape"][:, None]
+            if ratio == 4:
+                # The current group's second half and previous group's first half
+                # are pooled. A sequence's first group never consumes its neighbour.
+                selected_values, selected_logits = values[..., 8:], logits[..., 8:]
+                if previous_values is not None:
+                    selected_values = torch.cat((previous_values, selected_values))
+                    selected_logits = torch.cat((previous_logits, selected_logits))
+                previous_values, previous_logits = values[..., :8], logits[..., :8]
+            else:
+                selected_values, selected_logits = values, logits
+            latent = (selected_values * selected_logits.softmax(dim=0)).sum(dim=0)
+            normalized = latent * (latent.square().mean(dim=-1, keepdim=True) + 1e-5).rsqrt()
+            result.append(normalized * weights["norm.weight"])
+            positions.append(group * ratio)
+        offset += length
+    result = torch.stack(result)
+    return _complex_rotation(
+        result, 4, torch.tensor(positions), torch.ones(len(positions), dtype=torch.bool), rotary
+    )
+
+
+@pytest.mark.parametrize("ratio", [4, 128])
+def test_dsv4_native_compressor_preserves_per_sequence_forward_and_backward(ratio):
+    """Shared indexing preserves DSv4 overlap, APE, odd tails, and packed capacity."""
+    torch.manual_seed(325)
+    lengths = [ratio + 1, 0, 2 * ratio + 3]
+    params, _, valid = _packed(lengths, lengths, tail=4 * ratio)
+    module = _dsv4_cpu_compressor(ratio)
+    x = torch.randn(valid.numel(), 1, 6, requires_grad=True)
+    reference_x = x.detach().clone().requires_grad_()
+    weights = {
+        name: parameter.detach().clone().requires_grad_()
+        for name, parameter in module.named_parameters()
+    }
+    actual, compressed_cu = module(x, packed_seq_params=params)
+    expected = _dsv4_reference_groups(reference_x, weights, ratio, lengths, module.rotary_pos_emb)
+    # Three metadata slots (including the empty sequence) reserve at most two
+    # compressed rows each, even though the token buffer permits more than six.
+    assert actual.shape == (6, 1, 8)
+    assert compressed_cu.tolist() == [0, 1, 1, 3]
+    torch.testing.assert_close(actual[:3], expected, atol=3e-6, rtol=3e-5)
+    # DSv4's extra capacity rows are ignored by downstream masking, not defined
+    # as zeros. Exclude them from the loss when checking the shared gather graph.
+    probe = torch.randn_like(expected)
+    (actual[:3] * probe).sum().backward()
+    (expected * probe).sum().backward()
+    torch.testing.assert_close(x.grad, reference_x.grad, atol=3e-6, rtol=3e-5)
+    assert torch.count_nonzero(x.grad[~valid]) == 0
+    for name, parameter in module.named_parameters():
+        assert parameter.grad is not None, name
+        torch.testing.assert_close(
+            parameter.grad,
+            weights[name].grad,
+            atol=4e-6,
+            rtol=4e-5,
+            msg=lambda detail: f"{name}: {detail}",
+        )
+
+
+# Complete THD attention and indexer supervision, compared to independent sequences.
+
+
+def _packed_attention_cores(
+    dtype=torch.float32, *, candidates=True, coefficient=0, sparse=False, per_token=False
+):
+    config = _make_config(
+        params_dtype=dtype,
+        csa2_candidate_source_layer=3 if candidates else None,
+        csa2_candidate_topk_blocks=1 if candidates else 0,
+        csa2_candidate_block_size=2 if candidates else 0,
+        dsa_indexer_topk=2,
+        dsa_indexer_loss_coeff=coefficient,
+        dsa_indexer_use_sparse_loss=sparse,
+        calculate_per_token_loss=per_token,
+    )
+    modules = CompressedSparseAttentionSubmodules(
+        compressor=ModuleSpec(
+            CSA2Compressor, submodules=CompressorSubmodules(_Linear, _Linear, _RMSNorm)
+        ),
+        indexer=ModuleSpec(
+            CSA2Indexer, submodules=CSA2IndexerSubmodules(_Linear, _Linear, _RMSNorm, _Linear)
+        ),
+    )
+    cores = nn.ModuleList(
+        CompressedSparseAttention2(
+            config,
+            modules,
+            layer_number=index + 1,
+            attn_mask_type=AttnMaskType.causal,
+            attention_type="self",
+            pg_collection=_groups(),
+            rotary_pos_emb=_CPUFrequencyTable(config.qk_pos_emb_head_dim),
+        )
+        for index in range(config.num_layers)
+    )
+    with torch.no_grad():
+        for core in cores:
+            core.attn_sink.uniform_(-1, 1)
+    return cores
+
+
+def _packed_core_inputs(cores, total):
+    config = cores[0].config
+    dtype = config.params_dtype
+    return [
+        (
+            torch.randn(
+                total,
+                config.num_attention_heads,
+                config.v_head_dim,
+                dtype=dtype,
+                requires_grad=True,
+            ),
+            torch.randn(total, 1, config.v_head_dim, dtype=dtype, requires_grad=True),
+            torch.randn(total, 1, config.hidden_size, dtype=dtype, requires_grad=True),
+            torch.randn(total, 1, config.q_lora_rank, dtype=dtype, requires_grad=True),
+        )
+        for _ in cores
+    ]
+
+
+def _run_packed_cores(cores, inputs, params):
+    state = CSA2State()
+    outputs = [
+        core(
+            # DSv4's QKV wrapper returns packed qr without the dummy batch axis.
+            q,
+            kv,
+            kv,
+            None,
+            x=x,
+            qr=qr.squeeze(1),
+            packed_seq_params=params,
+            csa2_state=state,
+        )
+        for core, (q, kv, x, qr) in zip(cores, inputs)
+    ]
+    return outputs, state
+
+
+def _run_separate_cores(cores, inputs, real_lengths, physical_lengths):
+    """Run independent SBHD forwards; no THD metadata/helpers enter this reference."""
+    total = inputs[0][0].shape[0]
+    contributions = [[] for _ in cores]
+    start = 0
+    for length, physical in zip(real_lengths, physical_lengths):
+        if length:
+            state = CSA2State()
+            for index, (core, (q, kv, x, qr)) in enumerate(zip(cores, inputs)):
+                selected = slice(start, start + length)
+                output = core(
+                    q[selected].unsqueeze(1),
+                    kv[selected].unsqueeze(2),
+                    kv[selected].unsqueeze(2),
+                    None,
+                    x=x[selected],
+                    qr=qr[selected],
+                    csa2_state=state,
+                ).squeeze(1)
+                contributions[index].append(F.pad(output, (0, 0, start, total - start - length)))
+        start += physical
+    return [sum(values) for values in contributions]
+
+
+def _copy_core_inputs(inputs):
+    return [tuple(tensor.detach().clone().requires_grad_() for tensor in row) for row in inputs]
+
+
+def _assert_optional_gradients(actual, expected, *, dtype=torch.float32):
+    if actual is None or expected is None:
+        assert actual is expected
+        return
+    assert torch.isfinite(actual).all()
+    tolerance = dict(atol=3e-6, rtol=3e-5)
+    if dtype == torch.bfloat16:
+        tolerance = dict(atol=2e-4, rtol=4e-2)
+    torch.testing.assert_close(actual, expected, **tolerance)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("candidates", [False, True])
+def test_thd_attention_stack_matches_separate_sequence_outputs_and_gradients(dtype, candidates):
+    # This FP32 seed ties several Full1 indexer scores at zero. Packing must
+    # retain the same smaller-position tie break despite the wider KV capacity.
+    torch.manual_seed(326)
+    cores = _packed_attention_cores(dtype, candidates=candidates)
+    reference = _packed_attention_cores(dtype, candidates=candidates)
+    reference.load_state_dict(cores.state_dict())
+    real, physical, dummies = [1, 5, 7, 3], [3, 7, 8, 4], (3,)
+    params, _, valid = _packed(real, physical, tail=3, dummy_sequences=dummies)
+    inputs = _packed_core_inputs(cores, valid.numel())
+    reference_inputs = _copy_core_inputs(inputs)
+    outputs, state = _run_packed_cores(cores, inputs, params)
+    expected = _run_separate_cores(reference, reference_inputs, real, physical)
+    assert state.thd_layout is not None and state.compressed_layout is not None
+    actual_loss = expected_loss = 0
+    for output, ref_output in zip(outputs, expected):
+        tolerance = (
+            dict(atol=3e-6, rtol=3e-5) if dtype == torch.float32 else dict(atol=1e-2, rtol=2e-2)
+        )
+        torch.testing.assert_close(output, ref_output, **tolerance)
+        assert torch.count_nonzero(output[~valid]) == 0
+        probe = torch.randn_like(output)
+        normalization = valid.sum() * output.shape[-1]
+        actual_loss = actual_loss + (output.float() * probe).sum() / normalization
+        expected_loss = expected_loss + (ref_output.float() * probe).sum() / normalization
+    actual_loss.backward()
+    expected_loss.backward()
+    for row, reference_row in zip(inputs, reference_inputs):
+        for tensor, reference_tensor in zip(row, reference_row):
+            _assert_optional_gradients(tensor.grad, reference_tensor.grad, dtype=dtype)
+            if tensor.grad is not None:
+                assert torch.count_nonzero(tensor.grad[~valid]) == 0
+    for parameter, reference_parameter in zip(cores.parameters(), reference.parameters()):
+        _assert_optional_gradients(parameter.grad, reference_parameter.grad, dtype=dtype)
+
+
+def test_thd_candidate_score_ties_are_invariant_to_masked_capacity():
+    scores = torch.zeros(1, 1, 6)
+    padded = F.pad(scores, (0, 7), value=-torch.inf)
+    visible = torch.tensor([[[6]]])
+    expected = torch.tensor([[[True, True, False, False, True, True]]])
+    actual = select_candidate_blocks(scores, visible, 2, 2)
+    with_capacity = select_candidate_blocks(padded, visible, 2, 2)
+    torch.testing.assert_close(actual, expected)
+    torch.testing.assert_close(with_capacity[..., :6], expected)
+    assert not with_capacity[..., 6:].any()
+
+
+def _capture_core_indexer_losses(monkeypatch, cores):
+    records = {}
+    for core in cores:
+        if core.indexer is None:
+            continue
+        losses = records.setdefault(core.layer_idx, [])
+        original = core._compute_indexer_loss
+
+        def record(*args, _original=original, _losses=losses, **kwargs):
+            loss = _original(*args, **kwargs)
+            _losses.append(loss)
+            return loss
+
+        monkeypatch.setattr(core, "_compute_indexer_loss", record)
+    return records
+
+
+@pytest.mark.parametrize("sparse", [False, True])
+@pytest.mark.parametrize("per_token", [False, True])
+def test_thd_indexer_loss_matches_token_weighted_separate_sequences(monkeypatch, sparse, per_token):
+    torch.manual_seed(327)
+    logged = _record_losses(monkeypatch)
+    cores = _packed_attention_cores(coefficient=0.3, sparse=sparse, per_token=per_token)
+    reference = _packed_attention_cores(coefficient=0.3, sparse=sparse, per_token=per_token)
+    reference.load_state_dict(cores.state_dict())
+    packed_losses = _capture_core_indexer_losses(monkeypatch, cores)
+    separate_losses = _capture_core_indexer_losses(monkeypatch, reference)
+    real, physical, dummies = [1, 5, 7, 3], [3, 7, 8, 4], (3,)
+    params, _, valid = _packed(real, physical, tail=3, dummy_sequences=dummies)
+    inputs = _packed_core_inputs(cores, valid.numel())
+    reference_inputs = _copy_core_inputs(inputs)
+    _, state = _run_packed_cores(cores, inputs, params)
+    packed_logged = list(logged)
+    _run_separate_cores(reference, reference_inputs, real, physical)
+    assert list(packed_losses) == [1, 3, 4]
+    assert [record["layer_number"] for record in packed_logged] == [2, 4, 5]
+    # The dummy sequence is included exactly as in DSv4; a one-token sequence
+    # also counts in the mean even though it has no complete r2 group.
+    assert valid.sum() == 16
+    actual_terms, expected_terms = [], []
+    for index, losses in packed_losses.items():
+        assert len(losses) == 1
+        actual = losses[0]
+        separate = separate_losses[index]
+        assert len(separate) == 4
+        if per_token:
+            expected = sum(separate)
+        else:
+            expected = sum(loss * length for loss, length in zip(separate, real)) / 16
+        torch.testing.assert_close(actual, expected, atol=3e-6, rtol=3e-5)
+        metric = next(
+            record["loss"] for record in packed_logged if record["layer_number"] == index + 1
+        )
+        torch.testing.assert_close(metric, actual.detach() / (16 if per_token else 1))
+        actual_terms.append(actual)
+        expected_terms.append(expected)
+    # Owner K receives both the Full and Reindex auxiliary gradients.
+    owner_weight = cores[3].indexer.linear_wk.weight
+    individual = [
+        torch.autograd.grad(loss, owner_weight, retain_graph=True)[0] for loss in actual_terms[1:]
+    ]
+    sum(actual_terms).backward()
+    sum(expected_terms).backward()
+    torch.testing.assert_close(owner_weight.grad, sum(individual), atol=3e-6, rtol=3e-5)
+    assert owner_weight.grad.abs().sum() > 0
+    for core, reference_core in zip(cores, reference):
+        for name, parameter in core.named_parameters():
+            reference_parameter = dict(reference_core.named_parameters())[name]
+            if name.startswith("indexer."):
+                _assert_optional_gradients(parameter.grad, reference_parameter.grad)
+            else:
+                assert parameter.grad is None, name
+    assert all(tensor.grad is None for row in inputs for tensor in row)
+    # The main compressed KV remains graph-connected independently of indexer supervision.
+    state.global_kv.float().square().sum().backward()
+    assert cores[3].compressor.linear_wkv.weight.grad.abs().sum() > 0
+
+
+def test_thd_padding_and_other_sequences_cannot_contaminate_attention_or_gradients():
+    torch.manual_seed(328)
+    cores = _packed_attention_cores()
+    real, physical, dummies = [1, 5, 7, 3], [3, 7, 8, 4], (3,)
+    params, _, valid = _packed(real, physical, tail=3, dummy_sequences=dummies)
+    inputs = _packed_core_inputs(cores, valid.numel())
+    contaminated = _copy_core_inputs(inputs)
+    with torch.no_grad():
+        for row in contaminated:
+            for tensor in row:
+                tensor[~valid] = float("nan")
+                tensor[10:17] = torch.randn_like(tensor[10:17]) * 10
+    outputs, _ = _run_packed_cores(cores, inputs, params)
+    changed, _ = _run_packed_cores(cores, contaminated, params)
+    for output, changed_output in zip(outputs, changed):
+        assert torch.isfinite(changed_output).all()
+        torch.testing.assert_close(changed_output[3:8], output[3:8], atol=0, rtol=0)
+        assert torch.count_nonzero(changed_output[~valid]) == 0
+    actual_grads = torch.autograd.grad(
+        sum(output[3:8].sum() for output in changed),
+        [tensor for row in contaminated for tensor in row],
+        allow_unused=True,
+    )
+    reference_grads = torch.autograd.grad(
+        sum(output[3:8].sum() for output in outputs),
+        [tensor for row in inputs for tensor in row],
+        allow_unused=True,
+    )
+    for actual, expected in zip(actual_grads, reference_grads):
+        _assert_optional_gradients(actual, expected)
+        if actual is not None:
+            assert torch.count_nonzero(actual[:3]) == 0
+            assert torch.count_nonzero(actual[8:]) == 0
+
+
+@pytest.mark.parametrize(
+    "real,physical,tail,dummies",
+    [
+        pytest.param([], [], 0, (), id="zero-tokens"),
+        pytest.param([0, 0], [3, 4], 3, (), id="only-padding"),
+        pytest.param([1, 1], [1, 1], 2, (), id="no-complete-r2-groups"),
+    ],
+)
+def test_thd_empty_groups_and_padding_have_finite_outputs_and_losses(
+    monkeypatch, real, physical, tail, dummies
+):
+    logged = _record_losses(monkeypatch)
+    cores = _packed_attention_cores(coefficient=0.3)
+    params, _, valid = _packed(real, physical, tail=tail, dummy_sequences=dummies)
+    inputs = _packed_core_inputs(cores, valid.numel())
+    outputs, _ = _run_packed_cores(cores, inputs, params)
+    for output in outputs:
+        assert output.shape == (valid.numel(), 64)
+        assert torch.isfinite(output).all()
+        assert torch.count_nonzero(output[~valid]) == 0
+    assert all(torch.isfinite(record["loss"]) and record["loss"] == 0 for record in logged)
+    sum(output.float().sum() for output in outputs).backward()
+    for row in inputs:
+        for tensor in row:
+            if tensor.grad is not None:
+                assert torch.isfinite(tensor.grad).all()
+                assert torch.count_nonzero(tensor.grad[~valid]) == 0
+    for parameter in cores.parameters():
+        if parameter.grad is not None:
+            assert torch.isfinite(parameter.grad).all()
+
+
+def test_thd_reuse_forward_rejects_changed_sequence_boundaries():
+    cores = _packed_attention_cores()
+    params, _, valid = _packed([3, 5], [4, 6])
+    changed_params, _, _ = _packed([4, 4], [4, 6])
+    inputs = _packed_core_inputs(cores, valid.numel())
+    state = CSA2State()
+    q, kv, x, qr = inputs[1]
+    cores[1](q, kv, kv, None, x=x, qr=qr, packed_seq_params=params, csa2_state=state)
+    q, kv, x, qr = inputs[2]
+    with pytest.raises(ValueError, match="different THD layout"):
+        cores[2](q, kv, kv, None, x=x, qr=qr, packed_seq_params=changed_params, csa2_state=state)
+
+
+@pytest.mark.parametrize("ratio", [0, 1, 2])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_thd_attention_wrapper_matches_independent_sequences(pg_collection, ratio, dtype):
+    layer = _layer(pg_collection, ratio, dtype)
+    params, _, valid = _packed([3, 5], [4, 6], tail=2, device="cuda")
+    x = torch.randn(12, 1, layer.config.hidden_size, dtype=dtype, device="cuda", requires_grad=True)
+    reference_x = x.detach().clone().requires_grad_()
+    output, _ = layer(x, None, packed_seq_params=params)
+    first = layer(reference_x[:3], None)[0]
+    second = layer(reference_x[4:9], None)[0]
+    expected = F.pad(first, (0, 0, 0, 0, 0, 9)) + F.pad(second, (0, 0, 0, 0, 4, 3))
+    tolerance = dict(atol=3e-6, rtol=3e-5) if dtype == torch.float32 else dict(atol=2e-2, rtol=3e-2)
+    # DSv4's wrapper leaves padding output values unspecified; only logical
+    # sequence rows contribute to the reference objective.
+    torch.testing.assert_close(output[valid], expected[valid], **tolerance)
+    probe = (torch.randn_like(output) / output.numel()).masked_fill(~valid[:, None, None], 0)
+    parameters = tuple(layer.parameters())
+    actual_grads = torch.autograd.grad((output * probe).sum(), (x, *parameters), allow_unused=True)
+    expected_grads = torch.autograd.grad(
+        (expected * probe).sum(), (reference_x, *parameters), allow_unused=True
+    )
+    for actual, expected_gradient in zip(actual_grads, expected_grads):
+        _assert_optional_gradients(actual, expected_gradient, dtype=dtype)
