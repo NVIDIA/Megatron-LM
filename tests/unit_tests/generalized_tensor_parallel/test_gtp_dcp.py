@@ -1721,7 +1721,7 @@ def _worker_gdn_inproj_checkpoint(rank, world_size, port):
 def _worker_fc1_swiglu_checkpoint(rank, world_size, port):
     """A gated fc1 under GTP must save logical gate/up splits and load the contiguous shard.
 
-    End-to-end through the real wiring (transformer/mlp.py + tensor_parallel/gtp_ckpt.py):
+    End-to-end through the real wiring (transformer/mlp.py + tensor_parallel/gtp_utils.py):
     the checkpoint entries must be IDENTICAL to a non-GTP TP2 run's (same keys, same
     gate/up global offsets), and the load-side merge must reconstruct this rank's live
     shard as a CONTIGUOUS row slice of the merged TP-local [gate | up] tensor. This pins

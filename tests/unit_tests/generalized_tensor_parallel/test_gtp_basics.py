@@ -846,7 +846,7 @@ def _worker_gated_fused_microbatches(rank, world_size, port):
     """A fused GLU weight's storage mapping is CONTIGUOUS rows of the logical [gate | up].
 
     Regression guard for the storage re-layout that replaced the runtime de-interleave pair.
-    The checkpoint wiring (transformer/mlp.py + tensor_parallel/gtp_ckpt.py) defines a GTP
+    The checkpoint wiring (transformer/mlp.py + tensor_parallel/gtp_utils.py) defines a GTP
     shard as a contiguous row slice of the logical TP-local weight, so the all-gathered
     weight is already [all gate | all up] and the GEMM consumes it with NO permutation.
 
