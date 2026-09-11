@@ -457,6 +457,20 @@ class TransformerConfig(ModelParallelConfig):
     This is only valid without chunkwise CP: padding a chunk-local causal-conv input changes
     the sequence seen by later chunks and therefore changes the GDN recurrence numerics."""
 
+    gdn_gdr_backend: Literal["torch", "fla", "internal", "cudnn"] = "internal"
+    """Backend used for the Gated DeltaNet recurrence.
+
+    The cuDNN backend uses cuDNN Frontend's FLA-compatible GDN adapter and retains
+    its automatic FLA fallback for unsupported cases. With context parallelism, the
+    cuDNN backend currently supports only headwise CP.
+    """
+
+    gdn_gdr_recompute_h: bool = False
+    """Whether the internal GDR backward recomputes recurrent states instead of saving them.
+
+    This has no effect unless ``gdn_gdr_backend`` is ``"internal"``.
+    """
+
     ####################
     # initialization
     ####################
@@ -1864,7 +1878,27 @@ class TransformerConfig(ModelParallelConfig):
                     f"got {self.gdn_conv_pad_alignment}."
                 )
 
+            if self.experimental_attention_variant == "gdn":
+                if self.gdn_gdr_backend not in ("torch", "fla", "internal", "cudnn"):
+                    raise ValueError(
+                        "gdn_gdr_backend must be one of: torch, fla, internal, cudnn."
+                    )
+                if self.gdn_gdr_backend == "cudnn" and self.deterministic_mode:
+                    raise ValueError(
+                        "gdn_gdr_backend='cudnn' is incompatible with deterministic_mode=True; "
+                        "use gdn_gdr_backend='torch' for deterministic GDR."
+                    )
+
             if self.context_parallel_size > 1:
+                if (
+                    self.experimental_attention_variant == "gdn"
+                    and self.gdn_gdr_backend == "cudnn"
+                    and self.linear_cp_mode != "headwise"
+                ):
+                    raise ValueError(
+                        "gdn_gdr_backend='cudnn' only supports "
+                        "linear_cp_mode='headwise' when context_parallel_size > 1."
+                    )
                 if self.gdn_conv_pad_alignment is not None:
                     assert self.linear_cp_mode != "chunkwise", (
                         "gdn_conv_pad_alignment is incompatible with "
