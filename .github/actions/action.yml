@@ -24,7 +24,7 @@ inputs:
     default: "30"
   script:
     description: "Test script to execute"
-    required: false
+    required: true
   is-optional:
     description: "Pass this job on failure."
     required: false

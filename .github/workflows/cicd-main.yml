@@ -195,8 +195,6 @@ jobs:
       cadence:        ${{ steps.configure.outputs.cadence }}
       cadence_bypass: ${{ steps.configure.outputs.cadence_bypass }}
       selective_tests: ${{ steps.configure.outputs.selective_tests }}
-      selective_label_present: ${{ steps.configure.outputs.selective_label_present }}
-      pr_number: ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }}
       unit_test_reason: ${{ steps.configure.outputs.unit_test_reason }}
       sha:            ${{ steps.resolve-sha.outputs.sha }}
     steps:
@@ -350,11 +348,6 @@ jobs:
             UNIT_TEST_REASON='no Run selective unit tests label; running the full suite'
           fi
 
-          SELECTIVE_LABEL_PRESENT=$HAS_SELECTIVE_TESTS
-          if [[ "$LABELS_AVAILABLE" != "true" ]]; then
-            SELECTIVE_LABEL_PRESENT=unknown
-          fi
-
           echo "scope=$SCOPE"                   | tee -a $GITHUB_OUTPUT
           echo "n_repeat=$N_REPEAT"             | tee -a $GITHUB_OUTPUT
           echo "lightweight=$LIGHTWEIGHT"       | tee -a $GITHUB_OUTPUT
@@ -366,7 +359,6 @@ jobs:
           echo "cadence=$CADENCE_OUTPUT"        | tee -a $GITHUB_OUTPUT
           echo "cadence_bypass=$CADENCE_BYPASS" | tee -a $GITHUB_OUTPUT
           echo "selective_tests=$SELECTIVE_TESTS" | tee -a $GITHUB_OUTPUT
-          echo "selective_label_present=$SELECTIVE_LABEL_PRESENT" | tee -a $GITHUB_OUTPUT
           echo "unit_test_reason=$UNIT_TEST_REASON" | tee -a $GITHUB_OUTPUT
 
           # Pre-compute active row markers for the decision tree
@@ -476,8 +468,6 @@ jobs:
         run: |
           uv run --locked --project .github/test-selection \
             python -m unittest discover -s .github/scripts -p 'test_select*.py' -v
-          uv run --locked --project .github/test-selection \
-            python -m unittest discover -s .github/scripts -p 'test_report_unit_test_selection.py' -v
 
       - name: Get PR info
         id: get-pr-info
@@ -767,7 +757,7 @@ jobs:
         with:
           python-version: '3.12'
       - name: Setup uv
-        if: startsWith(github.ref, 'refs/heads/pull-request/') && github.event_name == 'push'
+        if: needs.configure.outputs.selective_tests == 'true'
         uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
         continue-on-error: true
         timeout-minutes: 2
@@ -785,34 +775,28 @@ jobs:
           SELECTIVE_TESTS: ${{ needs.configure.outputs.selective_tests }}
           UNIT_TEST_REASON: ${{ needs.configure.outputs.unit_test_reason }}
         run: |
-          PLANNING_STARTED=$SECONDS
           TESTED_SHA=$(git rev-parse --verify HEAD)
           BASE_SHA=''
-          EXECUTION_FULL_REASON=''
-          ANALYSIS_FAILURE=''
+          FORCE_FULL_REASON=''
           if [[ "$IS_MERGE_GROUP" == "true" ]]; then
-            EXECUTION_FULL_REASON='merge queue validation always runs the full unit-test suite'
+            FORCE_FULL_REASON='merge queue validation always runs the full unit-test suite'
           elif [[ "$IS_CI_WORKLOAD" == "true" ]]; then
-            EXECUTION_FULL_REASON='scheduled and CI workloads always run the full unit-test suite'
+            FORCE_FULL_REASON='scheduled and CI workloads always run the full unit-test suite'
           elif [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
-            EXECUTION_FULL_REASON='manually dispatched workflows always run the full unit-test suite'
+            FORCE_FULL_REASON='manually dispatched workflows always run the full unit-test suite'
           elif [[ "$FORCE_RUN_ALL" == "true" ]]; then
-            EXECUTION_FULL_REASON='pre-flight requested the full test suite'
+            FORCE_FULL_REASON='pre-flight requested the full test suite'
           elif [[ "$IS_PR" != "true" ]]; then
-            EXECUTION_FULL_REASON='selective testing is limited to pull-request pushes'
+            FORCE_FULL_REASON='selective testing is limited to pull-request pushes'
           elif [[ "$SELECTIVE_TESTS" != "true" ]]; then
-            EXECUTION_FULL_REASON="${UNIT_TEST_REASON:-unit-test selection is disabled}"
+            FORCE_FULL_REASON="${UNIT_TEST_REASON:-unit-test selection is disabled}"
           fi
 
-          # Every PR records an impact plan. Labels control which plan executes.
-          # Non-PR triggers and invalid merge history cannot produce a PR plan.
-          FORCE_FULL_REASON="$EXECUTION_FULL_REASON"
           # The checked-out synthetic merge is the same commit built and tested
           # downstream. Compare it with its own first parent: the exact main
           # revision used for this merge. PR metadata can report an older base.
           # This diff includes every PR commit and excludes main-only changes.
-          if [[ "$IS_PR" == "true" && "$EVENT_NAME" == "push" ]]; then
-            FORCE_FULL_REASON=''
+          if [[ -z "$FORCE_FULL_REASON" ]]; then
             if ! git rev-parse --verify 'HEAD^2^{commit}' >/dev/null 2>&1; then
               FORCE_FULL_REASON='the tested commit is not a pull-request merge'
             elif ! BASE_SHA=$(git rev-parse --verify 'HEAD^1^{commit}' 2>/dev/null); then
@@ -833,10 +817,7 @@ jobs:
           if [[ -n "$FORCE_FULL_REASON" ]]; then
             SELECTOR_ARGS+=(--force-full "$FORCE_FULL_REASON")
           else
-            SELECTOR_ARGS+=(--base-ref "$BASE_SHA" --record-impact)
-            if [[ -n "$EXECUTION_FULL_REASON" ]]; then
-              SELECTOR_ARGS+=(--execute-full "$EXECUTION_FULL_REASON")
-            fi
+            SELECTOR_ARGS+=(--base-ref "$BASE_SHA")
           fi
 
           if [[ -n "$FORCE_FULL_REASON" ]]; then
@@ -844,10 +825,9 @@ jobs:
           elif ! timeout --signal=TERM --kill-after=30s 7m \
             uv run --locked --project .github/test-selection \
             python .github/scripts/select_unit_tests.py "${SELECTOR_ARGS[@]}"; then
-            ANALYSIS_FAILURE='the impact selector could not be installed, completed, or started'
             python .github/scripts/select_unit_tests.py \
               --buckets-file unit-test-buckets.json \
-              --force-full "$ANALYSIS_FAILURE" \
+              --force-full 'the impact selector could not be installed, completed, or started' \
               --output unit-test-selection.json \
               --summary unit-test-selection-summary.md
           fi
@@ -858,41 +838,11 @@ jobs:
               (.bucket | type == "string" and length > 0)
               and (.unit_test_files | type == "string"))
           ' unit-test-selection.json >/dev/null; then
-            ANALYSIS_FAILURE='the impact selector returned an invalid or empty matrix'
             python .github/scripts/select_unit_tests.py \
               --buckets-file unit-test-buckets.json \
-              --force-full "$ANALYSIS_FAILURE" \
+              --force-full 'the impact selector returned an invalid or empty matrix' \
               --output unit-test-selection.json \
               --summary unit-test-selection-summary.md
-          fi
-
-          # Persist the plan for both full and selective runs. Include time
-          # spent installing/starting the selector, including failed attempts.
-          jq --slurpfile buckets unit-test-buckets.json \
-            --argjson elapsed "$((SECONDS - PLANNING_STARTED))" \
-            --arg tested_sha "$TESTED_SHA" --arg diff_base_sha "$BASE_SHA" \
-            --arg analysis_failure "$ANALYSIS_FAILURE" \
-            '. + {total_bucket_count: ($buckets[0] | length), planning_duration_seconds: $elapsed,
-                  tested_sha: $tested_sha, diff_base_sha: (if $diff_base_sha == "" then null else $diff_base_sha end)}
-             | if $analysis_failure != "" then
-                 .candidate_selection = null
-                 | .impact_analysis = {status: "failed", reason: $analysis_failure,
-                                       selected_files: null, selected_count: null, duration_seconds: null}
-               else . end' \
-            unit-test-selection.json > unit-test-selection.tmp
-          mv unit-test-selection.tmp unit-test-selection.json
-
-          if [[ -n "$ANALYSIS_FAILURE" ]]; then
-            # Render the final failure status after enriching the fallback plan.
-            python -c '
-          import json
-          import sys
-          from pathlib import Path
-          sys.path.insert(0, ".github/scripts")
-          from select_unit_tests import write_summary
-          write_summary(json.loads(Path("unit-test-selection.json").read_text()),
-                        Path("unit-test-selection-summary.md"))
-          '
           fi
 
           printf '\nTested commit: `%s`\n' "$TESTED_SHA" >> unit-test-selection-summary.md
@@ -1312,72 +1262,6 @@ jobs:
           platform: dgx_gb200
           cadence: ${{ needs.configure.outputs.cadence }}
           sha: ${{ needs.configure.outputs.sha }}
-
-  cicd-unit-test-report:
-    runs-on: ubuntu-latest
-    needs: [configure, cicd-parse-unit-tests, cicd-unit-tests-latest]
-    if: |
-      always()
-      && needs.configure.result == 'success'
-      && needs.cicd-parse-unit-tests.result != 'skipped'
-      && github.repository == 'NVIDIA/Megatron-LM'
-    permissions:
-      contents: read
-      actions: read
-    steps:
-      - name: Checkout tested revision
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-        with:
-          ref: ${{ needs.configure.outputs.sha }}
-      - name: Download unit-test selection plan
-        continue-on-error: true
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
-        with:
-          name: unit-test-selection-${{ github.run_id }}-${{ github.run_attempt }}
-          path: unit-test-plan
-      - name: Collect unit-test comparison data
-        if: always()
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REPOSITORY: ${{ github.repository }}
-          RUN_ID: ${{ github.run_id }}
-          RUN_ATTEMPT: ${{ github.run_attempt }}
-          TESTED_SHA: ${{ needs.configure.outputs.sha }}
-          EVENT_NAME: ${{ github.event_name }}
-          PR_NUMBER: ${{ needs.configure.outputs.pr_number }}
-          SELECTIVE_LABEL_PRESENT: ${{ needs.configure.outputs.selective_label_present }}
-        run: |
-          # Restrict timing to this attempt; old attempts must not inflate it.
-          if ! gh run view "$RUN_ID" --repo "$REPOSITORY" --attempt "$RUN_ATTEMPT" \
-            --json jobs > unit-test-jobs.json; then
-            printf '%s\n' '{"jobs": [], "fetch_error": true}' > unit-test-jobs.json
-          fi
-          ARGS=()
-          if [[ -n "$PR_NUMBER" && "$PR_NUMBER" != "null" ]]; then
-            ARGS+=(--pr-number "$PR_NUMBER")
-          fi
-          python3 .github/scripts/report_unit_test_selection.py \
-            --selection unit-test-plan/unit-test-selection.json \
-            --jobs unit-test-jobs.json \
-            --repository "$REPOSITORY" \
-            --run-id "$RUN_ID" \
-            --run-attempt "$RUN_ATTEMPT" \
-            --sha "$TESTED_SHA" \
-            --event-name "$EVENT_NAME" \
-            --selective-label-present "${SELECTIVE_LABEL_PRESENT:-unknown}" \
-            --output-dir unit-test-metrics "${ARGS[@]}"
-          cat unit-test-metrics/unit-test-metrics.md >> "$GITHUB_STEP_SUMMARY"
-      - name: Upload unit-test comparison data
-        if: always()
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
-        with:
-          name: unit-test-metrics-${{ github.run_id }}-${{ github.run_attempt }}
-          path: |
-            unit-test-metrics/
-            unit-test-plan/
-            unit-test-jobs.json
-          retention-days: 90
-          if-no-files-found: error
 
   Nemo_CICD_Test:
     needs:

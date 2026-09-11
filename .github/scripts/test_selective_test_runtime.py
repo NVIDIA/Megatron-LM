@@ -3,6 +3,7 @@
 
 """Exercise the CI shell and pytest guard without importing Megatron or using GPUs."""
 
+import ast
 import base64
 import importlib.util
 import json
@@ -38,12 +39,20 @@ class TestSelectiveTestRuntime(unittest.TestCase):
         self.command_log = self.repo_root / "commands.jsonl"
         self._write("tests/__init__.py")
         self._write("tests/unit_tests/__init__.py")
+        # Preserve the suite's existing empty-phase handling without importing
+        # its GPU-dependent conftest. The selective guard only records collection.
+        conftest_source = (REPO_ROOT / "tests/unit_tests/conftest.py").read_text()
+        sessionfinish_hook = next(
+            node
+            for node in ast.parse(conftest_source).body
+            if isinstance(node, ast.FunctionDef) and node.name == "pytest_sessionfinish"
+        )
         self._write(
             "tests/unit_tests/conftest.py",
-            """
-            def pytest_addoption(parser):
-                parser.addoption('--experimental', action='store_true')
-            """,
+            textwrap.dedent("""
+                def pytest_addoption(parser):
+                    parser.addoption('--experimental', action='store_true')
+                """) + "\n" + ast.unparse(sessionfinish_hook) + "\n",
         )
         self._write(
             "pytest.ini",
