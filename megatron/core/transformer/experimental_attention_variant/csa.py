@@ -29,6 +29,7 @@ from megatron.core.transformer.experimental_attention_variant.csa_utils.fused_sp
     BSHDCompactIndexerWorkspace,
     FusedCSAIndexerSparseAttnFromTopkFunc,
     THDCompactIndexerWorkspace,
+    _compact_flat_topk_idxs,
     batch_of_row,
     bshd_compact_indexer_available,
     build_flat_topk_idxs,
@@ -2202,8 +2203,13 @@ class CompressedSparseAttention(MegatronModule):
             deterministic=self.config.deterministic_mode,
         )
         compress_topk_idxs = torch.where(topk_indices_cmp >= 0, topk_indices_cmp + offset, -1)
+        # Same lowering as ``FusedCSAIndexerSparseAttnFunc.forward`` (the
+        # grad-enabled path): compressed ids, then window ids, globalized and
+        # compacted. FlashMLA's online softmax accumulates in key order, so a
+        # forward-only pass reproduces the training forward only if it hands
+        # the kernel the same id sequence.
         flat_idxs, flat_tlen = build_flat_topk_idxs(
-            window_idxs, compress_topk_idxs, batch_size=b, compact=True
+            compress_topk_idxs, window_idxs, batch_size=b, compact=True
         )
         nvtx_range_pop("compressed_indices")
 
@@ -2656,6 +2662,17 @@ class CompressedSparseAttention(MegatronModule):
                 deterministic=self.config.deterministic_mode,
             )
 
+        # ``build_attention_indices`` has two output layouts. Its default puts
+        # window ids first and returns the list already compacted with a
+        # ``topk_length``. Its indexer-loss layout puts the compressed ids
+        # first at fixed positions (so the grad-enabled path can slice the
+        # window segment for the dense teacher) and leaves compaction to the
+        # caller, returning ``None`` for the length. The grad-enabled path in
+        # ``FusedCSAIndexerSparseAttnFunc.forward`` uses the latter; take the
+        # same layout here and compact it ourselves so both forwards hand
+        # FlashMLA an identical id sequence. With no compressed ids the two
+        # layouts coincide, so keep the default and its precomputed length.
+        compressed_first = topk_indices_cmp.shape[-1] > 0
         flat_idxs, flat_tlen, _, _ = thd_layout_kernels.build_attention_indices(
             cu_seqlens_q,
             0,
@@ -2666,11 +2683,14 @@ class CompressedSparseAttention(MegatronModule):
             topk_indices_cmp.shape[-1],
             topk_indices_cmp,
             cu_seqlens_compressed=cu_seqlens_compressed,
+            for_indexer_loss=compressed_first,
             compressed_base=compressed_base,
             compressed_rows=compressed_rows,
             compressed_is_sequence_major=True,
             output_alignment=get_flash_mla_topk_alignment(),
         )
+        if compressed_first:
+            flat_idxs, flat_tlen = _compact_flat_topk_idxs(flat_idxs)
         output = csa_sparse_attn(
             query,
             kv_full_thd,

@@ -1525,6 +1525,31 @@ def csa_sparse_attn(
 # ---------------------------------------------------------------------------
 
 
+def _stable_topk_indices(scores: Tensor, seq_lens: Tensor, topk_k: int) -> Tensor:
+    """Select the ``topk_k`` highest-scoring key ids per row with a fixed tie order.
+
+    Rows may only draw from their first ``seq_lens[row]`` key columns; a row with
+    fewer valid keys than ``topk_k`` is padded with ``-1``. Exact score ties are
+    resolved toward the smallest key id and the selected ids are returned in
+    descending-score order, so identical inputs always yield identical ids. The
+    radix Top-K kernel does not order equal scores, which matters for ReLU-scored
+    indexers where many keys share a score of exactly zero.
+
+    Args:
+        scores: ``(rows, sk)`` fp32 indexer scores; masked positions hold ``-inf``.
+        seq_lens: ``(rows,)`` int32 number of candidate key columns per row.
+        topk_k: number of ids to select, at most ``sk``.
+
+    Returns:
+        ``(rows, topk_k)`` int32 key ids, ``-1`` where a row has no more valid keys.
+    """
+    columns = torch.arange(scores.shape[-1], device=scores.device, dtype=seq_lens.dtype)
+    candidates = scores.masked_fill(columns.unsqueeze(0) >= seq_lens.unsqueeze(1), float("-inf"))
+    sorted_scores, order = torch.sort(candidates, dim=-1, descending=True, stable=True)
+    selected = order[:, :topk_k].to(torch.int32)
+    return selected.masked_fill(torch.isneginf(sorted_scores[:, :topk_k]), -1)
+
+
 def _indexer_topk_core(
     q: Tensor,
     k: Tensor,
@@ -1829,10 +1854,13 @@ def _indexer_topk_core(
 
     # ---------------- Shared: radix top-K + pad-to-topk -----------------
     topk_k = min(topk, sk)
-    tk_result = _DSA.indexer_top_k_wrapper(
-        scores_flat, seq_lens, top_k=topk_k, next_n=1, return_val=False
-    )
-    topk_indices = tk_result["indices"]  # (total_q, topk_k) int32
+    if deterministic:
+        topk_indices = _stable_topk_indices(scores_flat, seq_lens, topk_k)
+    else:
+        tk_result = _DSA.indexer_top_k_wrapper(
+            scores_flat, seq_lens, top_k=topk_k, next_n=1, return_val=False
+        )
+        topk_indices = tk_result["indices"]  # (total_q, topk_k) int32
 
     if is_thd:
         topk_indices, topk_length = thd_indexer_kernels.sanitize_topk(
@@ -1901,8 +1929,9 @@ def indexer_topk(
             outputs are allocated by each dispatch. A matching workspace is
             required while capturing the compact path.
         deterministic: resolve exact-value ties at the K-th boundary toward
-            the smallest local KV indices. The output slot order remains
-            unspecified.
+            the smallest local KV indices. Compact dispatch leaves the output
+            slot order unspecified; the standalone Top-K fallback returns ids in
+            descending-score order.
         return_softmax: also return the compact kernel's Top-K softmax. The
             third return is ``None`` when compact dispatch is unavailable.
 

@@ -4162,7 +4162,7 @@ class TestThdWrapperDispatchAndValidation:
                 max_seqlen_q=3,
                 max_seqlen_kv=2,
                 q_causal_offsets=q_causal_offsets,
-                deterministic=True,
+                deterministic=False,
             )
         # THD return shape: (total_q, topk) + (total_q,).
         assert topk_idxs.shape == (total_q, 2)
@@ -4171,6 +4171,50 @@ class TestThdWrapperDispatchAndValidation:
         fake_dsa.indexer_forward_wrapper.assert_called_once()
         seq_lens = fake_dsa.indexer_top_k_wrapper.call_args.args[1]
         assert torch.equal(seq_lens, torch.tensor([1, 1, 2, 0, 0], device=q.device))
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_indexer_topk_thd_deterministic_fallback_skips_radix_kernel(
+        self, reset_lazy_kernel_state
+    ):
+        """Without a compact wrapper, ``deterministic=True`` selects ids from the
+        dense scores with a fixed tie order instead of the radix Top-K kernel."""
+        q, k, w, cu_q, cu_kv = self._make_indexer_topk_thd_inputs()
+        total_q = q.shape[0]
+        q_causal_offsets = torch.tensor([5, 0], dtype=torch.int32, device=q.device)
+
+        fake_dsa = MagicMock(name='_DSA_thd_deterministic_stub')
+        fake_dsa.indexer_forward_top_k_wrapper = None
+        # Causal lengths are [1, 1, 2, 0, 0]. Row 0 scores its out-of-range key
+        # highest, row 2 has two valid keys with equal scores, rows 3/4 have none.
+        scores = torch.zeros(total_q, 2, dtype=torch.float32, device=q.device)
+        scores[0, 1] = 1.0
+        scores[3:] = float('-inf')
+        fake_dsa.indexer_forward_wrapper.return_value = {'scores': scores}
+        dk._DSA = fake_dsa
+
+        with pytest.warns(RuntimeWarning, match="Compact indexer.*falling back"):
+            topk_idxs, topk_len = indexer_topk(
+                q,
+                k,
+                w,
+                topk=2,
+                ratio=4,
+                cu_seqlens_q=cu_q,
+                cu_seqlens_kv=cu_kv,
+                max_seqlen_q=3,
+                max_seqlen_kv=2,
+                q_causal_offsets=q_causal_offsets,
+                deterministic=True,
+            )
+
+        fake_dsa.indexer_top_k_wrapper.assert_not_called()
+        expected = torch.tensor(
+            [[0, -1], [0, -1], [0, 1], [-1, -1], [-1, -1]], dtype=torch.int32, device=q.device
+        )
+        assert torch.equal(topk_idxs, expected)
+        assert torch.equal(
+            topk_len, torch.tensor([1, 1, 2, 0, 0], dtype=torch.int32, device=q.device)
+        )
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_indexer_topk_thd_compact_dispatch(self, reset_lazy_kernel_state):
@@ -5418,3 +5462,32 @@ class TestPublicApi:
         assert issubclass(CSASparseAttnFunc, torch.autograd.Function)
         assert issubclass(FusedCSAIndexerSparseAttnFunc, torch.autograd.Function)
         assert issubclass(FusedCSAIndexerSparseAttnFromTopkFunc, torch.autograd.Function)
+
+
+# ---------------------------------------------------------------------------
+# _stable_topk_indices — deterministic fallback for the standalone Top-K
+# ---------------------------------------------------------------------------
+
+
+class TestStableTopkIndices:
+    """``_stable_topk_indices`` orders exact ties toward the smallest key id and
+    pads rows that run out of valid keys with ``-1``."""
+
+    def test_ties_resolve_toward_smallest_index(self):
+        scores = torch.tensor([[0.0, 3.0, 0.0, 3.0, 1.0, 0.0]])
+        seq_lens = torch.tensor([6], dtype=torch.int32)
+        out = dk._stable_topk_indices(scores, seq_lens, topk_k=4)
+        assert torch.equal(out, torch.tensor([[1, 3, 4, 0]], dtype=torch.int32))
+
+    def test_seq_lens_mask_and_padding(self):
+        scores = torch.tensor([[5.0, 4.0, 3.0, 2.0], [5.0, 4.0, 3.0, 2.0], [5.0, 4.0, 3.0, 2.0]])
+        seq_lens = torch.tensor([4, 2, 0], dtype=torch.int32)
+        out = dk._stable_topk_indices(scores, seq_lens, topk_k=3)
+        expected = torch.tensor([[0, 1, 2], [0, 1, -1], [-1, -1, -1]], dtype=torch.int32)
+        assert torch.equal(out, expected)
+
+    def test_masked_scores_are_never_selected(self):
+        scores = torch.tensor([[float('-inf'), 0.0, float('-inf'), 0.0]])
+        seq_lens = torch.tensor([4], dtype=torch.int32)
+        out = dk._stable_topk_indices(scores, seq_lens, topk_k=3)
+        assert torch.equal(out, torch.tensor([[1, 3, -1]], dtype=torch.int32))
