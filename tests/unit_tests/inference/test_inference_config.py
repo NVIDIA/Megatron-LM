@@ -355,8 +355,8 @@ class TestSSMChunkAlignment:
     @pytest.mark.internal
     def test_stack_without_a_recurrent_layer_reports_no_chunking(self):
         """A pipeline stage of pure attention/MLP layers has nothing to report."""
+        from megatron.core.inference.ssm_config import ssm_chunking
         from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
-        from megatron.core.ssm.ssm_inference import ssm_chunking
 
         layer_types = [Symbols.ATTENTION, Symbols.MLP]
         assert ssm_chunking(layer_types, [SimpleNamespace(), SimpleNamespace()]) is None

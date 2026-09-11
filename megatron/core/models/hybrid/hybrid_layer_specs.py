@@ -28,8 +28,6 @@ from megatron.core.ops.attention.mla import (
 from megatron.core.ops.ssm.gated_delta.modules import GatedDeltaNet, GatedDeltaNetSubmodules
 from megatron.core.ops.ssm.gdp.mixer import GatedDeltaProductMixer, GatedDeltaProductMixerSubmodules
 from megatron.core.ops.ssm.mamba2.mixer import MambaMixer, MambaMixerSubmodules
-from megatron.core.ssm.mamba_layer import MambaLayer, MambaLayerSubmodules
-from megatron.core.ssm.mlp_layer import MLPLayer
 from megatron.core.tensor_parallel import (
     InferenceColumnParallelLinear,
     InferenceLayerNormColumnParallelLinear,
@@ -38,7 +36,9 @@ from megatron.core.tensor_parallel import (
 from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.identity_op import IdentityOp
+from megatron.core.transformer.mamba_layer import MambaLayer, MambaLayerSubmodules
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
+from megatron.core.transformer.mlp_layer import MLPLayer
 from megatron.core.transformer.multi_latent_attention import (
     MLASelfAttention,
     MLASelfAttentionSubmodules,

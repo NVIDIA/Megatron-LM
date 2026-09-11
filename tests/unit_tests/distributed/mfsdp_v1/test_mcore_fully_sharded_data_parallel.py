@@ -22,9 +22,9 @@ from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.optimizer import OptimizerConfig
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.ssm.mamba_layer import MambaLayer
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
+from megatron.core.transformer.mamba_layer import MambaLayer
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.utils import is_te_min_version, is_torch_min_version
 from tests.unit_tests.distributed.mfsdp_v1.utils import (
@@ -1316,8 +1316,8 @@ class TestFsdpNonUnitBucketPreservation:
         pytest.importorskip("einops")
 
         from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
-        from megatron.core.ssm.mamba_layer import MambaLayer
         from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+        from megatron.core.transformer.mamba_layer import MambaLayer
         from megatron.core.transformer.transformer_layer import TransformerLayer
 
         # MambaMixer's __init__ reads the 'model-parallel-rng' tracker.

@@ -37,7 +37,6 @@ from megatron.core.fp8_utils import is_float8tensor  # noqa: E402
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add  # noqa: E402
 from megatron.core.ops.ssm.mamba2.mixer import MambaMixer, MambaMixerSubmodules  # noqa: E402
 from megatron.core.process_groups_config import ProcessGroupCollection  # noqa: E402
-from megatron.core.ssm.mamba_layer import MambaLayer, MambaLayerSubmodules  # noqa: E402
 from megatron.core.tensor_parallel.generalized_tensor_parallelism import (  # noqa: E402
     GTP_CONFIG,
     GTPShardedParam,
@@ -52,6 +51,7 @@ from megatron.core.tensor_parallel.gtp_api import (  # noqa: E402
     gtp_remat_shard_dim0,
 )
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed  # noqa: E402
+from megatron.core.transformer.mamba_layer import MambaLayer, MambaLayerSubmodules  # noqa: E402
 from megatron.core.transformer.spec_utils import ModuleSpec  # noqa: E402
 from megatron.core.transformer.transformer_config import TransformerConfig  # noqa: E402
 from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint  # noqa: E402

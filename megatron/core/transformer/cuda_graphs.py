@@ -2174,8 +2174,8 @@ def _layer_is_graphable(layer, config):
         return True
 
     # import modules here to avoid a circular import
-    from megatron.core.ssm.mamba_layer import MambaLayer
     from megatron.core.transformer.identity_op import IdentityOp
+    from megatron.core.transformer.mamba_layer import MambaLayer
     from megatron.core.transformer.mlp import MLP
     from megatron.core.transformer.moe.moe_layer import MoELayer
     from megatron.core.transformer.transformer_layer import TransformerLayer

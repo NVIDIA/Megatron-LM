@@ -45,7 +45,7 @@ def _load_gdp_module_with_fake_rmsnorm(monkeypatch):
     monkeypatch.setitem(sys.modules, layernorm_gated.__name__, layernorm_gated)
     monkeypatch.setattr(gdp_backends, "RMSNormGated", torch.nn.Module)
 
-    module_name = "megatron.core.ssm._gated_delta_product_with_fake_rmsnorm"
+    module_name = "megatron.core.ops.ssm.gdp._mixer_with_fake_rmsnorm"
     spec = importlib.util.spec_from_file_location(module_name, gdp_module.__file__)
     module = importlib.util.module_from_spec(spec)
     monkeypatch.setitem(sys.modules, module_name, module)

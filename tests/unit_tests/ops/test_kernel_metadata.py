@@ -219,9 +219,9 @@ def test_causal_conv_old_version_is_not_marked_deterministic(monkeypatch):
         validate_determinism(CAUSAL_CONV, DeterminismPolicy.WARN)
 
 
-def test_csa_legacy_mapping_is_derived_from_kernel_metadata():
+def test_csa_mapping_is_derived_from_kernel_metadata():
+    from megatron.core.ops.attention.csa import modules as csa
     from megatron.core.ops.attention.csa.kernel_metadata import CSA_OPERATION_DETERMINISM
-    from megatron.core.transformer.experimental_attention_variant import csa
 
     assert csa.CSA_OPERATION_DETERMINISM is CSA_OPERATION_DETERMINISM
     assert CSA_OPERATION_DETERMINISM == {

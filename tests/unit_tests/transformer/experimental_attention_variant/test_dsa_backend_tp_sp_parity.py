@@ -384,9 +384,7 @@ def _record_backend_calls(backend: str, monkeypatch: pytest.MonkeyPatch):
         )
     else:
         try:
-            from megatron.core.transformer.experimental_attention_variant import (
-                dsa_tilelang_kernels,
-            )
+            from megatron.core.ops.attention.dsa import dsa_tilelang_kernels
         except (ImportError, OSError, AttributeError) as exc:
             pytest.skip(f"TileLang DSA backend code is unavailable: {exc}")
 

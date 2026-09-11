@@ -18,63 +18,48 @@ from megatron.core.ops.ssm.gated_delta.backends import select_gated_delta_rule
 
 
 @pytest.mark.parametrize(
-    ("old", "new"),
+    "module",
     [
-        ("ssm.ops.common.causal_conv1d_varlen", "ops.ssm.common.causal_conv1d_varlen"),
-        ("ssm.ops.mamba2.ssd_combined", "ops.ssm.mamba2.ssd_combined"),
-        ("ssm.ops.gdp.decode_prepare", "ops.ssm.gdp.decode_prepare"),
-        ("ssm.triton_cache_manager", "ops.ssm.triton_cache_manager"),
+        "ops.ssm.common.causal_conv1d_varlen",
+        "ops.ssm.mamba2.ssd_combined",
+        "ops.ssm.gdp.decode_prepare",
+        "ops.ssm.triton_cache_manager",
         *[
-            (f"transformer.experimental_attention_variant.{name}", f"ops.attention.dsa.{name}")
+            f"ops.attention.dsa.{name}"
             for name in ("dsa_kernels", "dsa_layout", "dsa_masking", "dsa_indexer_loss")
         ],
     ],
 )
-def test_legacy_leaf_is_canonical_module(old, new):
-    canonical = importlib.import_module("megatron.core." + new)
-    legacy = importlib.import_module("megatron.core." + old)
-    assert legacy is canonical
+def test_kernel_module_has_canonical_source(module):
+    path = "megatron.core." + module
+    target = importlib.import_module(path)
+    assert target.__name__ == path
+    assert Path(target.__file__).as_posix().endswith(path.replace(".", "/") + ".py")
 
 
 @pytest.mark.parametrize(
-    ("old", "new", "symbol"),
+    ("owner", "kernel", "symbol"),
     [
+        ("ops.attention.csa.modules", "ops.attention.csa.reference", "_pool_compressor_values"),
         (
-            "transformer.experimental_attention_variant.csa",
-            "ops.attention.csa.reference",
-            "_pool_compressor_values",
-        ),
-        (
-            "ssm.gated_delta_net.gdn",
+            "ops.ssm.gated_delta.gdn",
             "ops.ssm.gated_delta.reference",
             "torch_chunk_gated_delta_rule",
         ),
-        ("ssm.gated_delta_net.gdn2", "ops.ssm.gated_delta.reference_gdn2", "torch_chunk_gdn2"),
+        ("ops.ssm.gated_delta.gdn2", "ops.ssm.gated_delta.reference_gdn2", "torch_chunk_gdn2"),
+        ("ops.attention.dsa.modules", "ops.attention.dsa.reference", "unfused_dsa_fn"),
+        ("ops.attention.dsa.modules", "ops.attention.dsa.reference", "FusedDSAIndexerLoss"),
+        ("ops.attention.csa.modules", "ops.attention.csa.reference", "get_window_topk_idxs"),
         (
-            "transformer.experimental_attention_variant.dsa",
-            "ops.attention.dsa.reference",
-            "unfused_dsa_fn",
-        ),
-        (
-            "transformer.experimental_attention_variant.dsa",
-            "ops.attention.dsa.reference",
-            "FusedDSAIndexerLoss",
-        ),
-        (
-            "transformer.experimental_attention_variant.csa",
-            "ops.attention.csa.reference",
-            "get_window_topk_idxs",
-        ),
-        (
-            "transformer.experimental_attention_variant.csa",
+            "ops.attention.csa.modules",
             "ops.attention.csa.reference",
             "unfused_compressed_sparse_attn",
         ),
     ],
 )
-def test_reference_reexports_keep_identity(old, new, symbol):
-    assert getattr(importlib.import_module("megatron.core." + old), symbol) is getattr(
-        importlib.import_module("megatron.core." + new), symbol
+def test_operation_uses_canonical_reference(owner, kernel, symbol):
+    assert getattr(importlib.import_module("megatron.core." + owner), symbol) is getattr(
+        importlib.import_module("megatron.core." + kernel), symbol
     )
 
 
@@ -246,11 +231,8 @@ def test_specs_preserve_the_explicit_kernel_provider():
 
 
 def test_dsa_construction_uses_explicit_provider_without_rebuilding_it():
+    from megatron.core.ops.attention.dsa.modules import DSAttention, DSAttentionSubmodules
     from megatron.core.transformer.enums import AttnMaskType
-    from megatron.core.transformer.experimental_attention_variant.dsa import (
-        DSAttention,
-        DSAttentionSubmodules,
-    )
 
     kernels = DSAKernels(backend="custom")
     seen = []

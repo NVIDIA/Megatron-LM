@@ -36,13 +36,13 @@ The following remain outside:
 
 - Model/layer assembly, hybrid allocation, configuration and spec builders.
 - Inference contexts, global cache allocation, request scheduling and stack-wide
-  recurrent-state configuration (`ssm/ssm_inference.py`).
+  recurrent-state configuration (`inference/ssm_config.py`).
 - Training-wide indexer-loss tracking and gradient-scale management
   (`transformer/dsa_loss.py`).
 
 Operations may use shared infrastructure such as embeddings, `MegatronModule`,
 checkpoint utilities, inference contexts and explicit process groups. They must
-not import concrete model assembly or legacy SSM/attention compatibility paths.
+not import concrete model assembly or retired SSM/attention module paths.
 The existing provider API is used only at construction; no new reverse
 dependency on model spec builders is introduced.
 
@@ -137,22 +137,43 @@ GDN/GDN2 and GDP likewise bind the existing selected recurrence once. Mamba's
 phase-specific entry points remain direct calls; a provider is not needed for
 every helper. No extra callable wrapper is inserted into these kernel calls.
 
-## Compatibility
+## Import Migration
 
-Former kernel and operation-module paths remain importable. Leaf modules alias
-the canonical module object, so classes, caches, monkeypatches and Triton state
-are not duplicated. Package exports and the two split ownership modules keep
-explicit identity-preserving re-exports. Historical pickle globals still resolve
-through those paths; new pickles record the canonical implementation path.
-State-dict keys do not depend on the source directory and remain unchanged.
-Production and numerical tests use canonical paths; dedicated compatibility
-tests exercise legacy imports separately.
+The former `megatron.core.ssm` and
+`megatron.core.transformer.experimental_attention_variant` packages are removed.
+Import implementations from their canonical owners; there are no compatibility
+files, `sys.modules` aliases or replacement import hooks for the retired paths.
+This is an intentional breaking change to Python imports and serialized objects
+that record those paths. Historical pickles referring to the removed modules
+are not supported. Ordinary state-dict keys and checkpoint tensor mappings do
+not depend on the source directory and remain unchanged.
+
+Paths below are relative to `megatron.core`:
+
+| Former owner | Canonical owner |
+| --- | --- |
+| `ssm.mamba_mixer`, `ssm.gated_delta_product`, `ssm.gated_delta_net` | `ops.ssm.mamba2.mixer`, `ops.ssm.gdp.mixer`, `ops.ssm.gated_delta.modules` |
+| `ssm.ops.{common,mamba2,gdp}` | `ops.ssm.{common,mamba2,gdp}` |
+| SSM CP, packing and checkpoint helpers | `ops.ssm` operation families and `ops.ssm.common` |
+| Experimental DSA/CSA, absorbed MLA and DeepSeek-v4 attention | `ops.attention.{dsa,csa}.modules`, `ops.attention.mla`, `ops.attention.dsv4` |
+| Experimental DSA kernel adapters and helpers | `ops.attention.dsa` and `ops.attention.dsa.kernels` |
+| `ssm.mamba_layer`, `ssm.mlp_layer` and their layer-config classes | `transformer.mamba_layer`, `transformer.mlp_layer` and `transformer.*_layer_config` |
+| Experimental `dsa_layer_config` | `transformer.dsa_layer_config` |
+| Experimental `deepseek_v4_hybrid_attention_module_specs` | `models.gpt.deepseek_v4_hybrid_attention_module_specs` |
+| `ssm.ssm_inference.SSMChunking` and `ssm_chunking` | `inference.ssm_config` |
+| `ssm.ssm_inference.SSMDynamicInferenceMixin` | `ops.ssm.common.inference` |
+| `ssm.mamba_block`, `ssm.mamba_hybrid_layer_allocation` | `models.hybrid.hybrid_block`, `models.hybrid.hybrid_layer_allocation` |
+
+Update launch-script module strings as well as Python imports. In particular,
+the cache-manager setting is now:
+
+```bash
+export TRITON_CACHE_MANAGER=megatron.core.ops.ssm.triton_cache_manager:ParallelFileCacheManager
+```
+
+Tests cover canonical module/class ownership and pickle round trips, construction
+import order, absence of retired source files and stale runtime references.
 
 Vendored kernel files retain their original licenses and internal file structure.
 Future changes should keep cohesive operation implementations here and model
 assembly or global runtime lifecycle in its existing subsystem.
-
-The `megatron/core/ssm` and `transformer/experimental_attention_variant` folders
-now retain assembly/configuration code and compatibility imports, rather than
-the migrated operation implementations. Removing compatibility paths is a
-separate API-deprecation decision, not part of the implementation relocation.

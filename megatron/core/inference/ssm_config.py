@@ -1,16 +1,10 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Stack-wide recurrent-inference configuration and compatibility exports."""
+"""Stack-wide recurrent-inference configuration."""
 
 from __future__ import annotations
 
 from typing import List, NamedTuple, Optional, Sequence
-
-from megatron.core.ops.ssm.common.inference import (
-    SSMDynamicInferenceMixin as SSMDynamicInferenceMixin,
-)
-
-__all__ = ["SSMChunking", "SSMDynamicInferenceMixin", "ssm_chunking"]
 
 
 class SSMChunking(NamedTuple):

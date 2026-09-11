@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from megatron.core.ops.ssm.context_parallel import gdp_common
 from megatron.core.ops.ssm.context_parallel.chunkwise import (
     CPBackwardPackedSummary,
     CPForwardPackedSummary,
@@ -19,7 +20,6 @@ from megatron.core.ops.ssm.gdp.mixer import (
     GatedDeltaProductMixer,
 )
 from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.core.ssm.context_parallel import gdp_common
 
 pytestmark = pytest.mark.launch_on_gb200
 

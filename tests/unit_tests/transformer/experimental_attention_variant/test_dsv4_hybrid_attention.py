@@ -191,10 +191,8 @@ def test_module_spec_is_built_from_explicit_backend():
 
 def test_grouped_output_projection_respects_cpu_initialization(monkeypatch):
     """The custom grouped projection follows the standard CPU/no-init constructor contract."""
+    from megatron.core.ops.attention import dsv4 as dsv4_attention
     from megatron.core.transformer import identity_op
-    from megatron.core.transformer.experimental_attention_variant import (
-        deepseek_v4_hybrid_attention as dsv4_attention,
-    )
     from megatron.core.transformer.spec_utils import ModuleSpec
 
     class SizeOneGroup:

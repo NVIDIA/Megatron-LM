@@ -3,13 +3,13 @@
 import pytest
 
 from megatron.core.models.hybrid.layers import utils as layer_utils
-from megatron.core.ssm.gdn_layer_config import GDNLayerConfig
-from megatron.core.ssm.mamba_layer_config import MambaLayerConfig
-from megatron.core.ssm.mlp_layer_config import MLPLayerConfig
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.attention_layer_config import AttentionLayerConfig
-from megatron.core.transformer.experimental_attention_variant.dsa_layer_config import DSALayerConfig
+from megatron.core.transformer.dsa_layer_config import DSALayerConfig
+from megatron.core.transformer.gdn_layer_config import GDNLayerConfig
+from megatron.core.transformer.mamba_layer_config import MambaLayerConfig
 from megatron.core.transformer.mla_layer_config import MLALayerConfig
+from megatron.core.transformer.mlp_layer_config import MLPLayerConfig
 from megatron.core.transformer.moe.moe_layer_config import MoELayerConfig
 
 _EXPECTED_LAYER_CONFIG_TYPES = [

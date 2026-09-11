@@ -82,4 +82,4 @@ The following abbreviations appear in model discussions:
 | DSA | DeepSeek Sparse Attention: a lightning indexer scores tokens and top-k selection sparsifies core attention. |
 | MTP | Multi-Token Prediction: auxiliary layers predicting additional future tokens. |
 | SSM | State-space model layers (Mamba family). |
-| GDN | Gated delta net, an SSM variant (`megatron/core/ssm/gated_delta_net.py`). |
+| GDN | Gated delta net, an SSM variant (`megatron/core/ops/ssm/gated_delta/modules.py`). |

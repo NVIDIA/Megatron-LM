@@ -2,12 +2,12 @@
 
 from unittest.mock import patch
 
-from megatron.core.ssm.mlp_layer import MLPLayer
+from megatron.core.transformer.mlp_layer import MLPLayer
 
 
 def test_mlp_layer_forwards_name_to_transformer_layer():
     with patch(
-        "megatron.core.ssm.mlp_layer.TransformerLayer.__init__", return_value=None
+        "megatron.core.transformer.mlp_layer.TransformerLayer.__init__", return_value=None
     ) as transformer_layer_init:
         MLPLayer(
             config=object(),

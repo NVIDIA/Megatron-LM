@@ -5,6 +5,7 @@ from typing import List, Optional
 
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.models.backends import BackendSpecProvider, get_backend_from_config
+from megatron.core.models.gpt import deepseek_v4_hybrid_attention_module_specs as dsv4_hybrid_specs
 from megatron.core.ops.attention.dsa.modules import (
     DSAIndexer,
     DSAIndexerSubmodules,
@@ -23,9 +24,6 @@ from megatron.core.ops.ssm.gated_delta.modules import (
     GatedDeltaNetSubmodules,
 )
 from megatron.core.transformer.enums import AttnMaskType, LayerType
-from megatron.core.transformer.experimental_attention_variant import (
-    deepseek_v4_hybrid_attention_module_specs as dsv4_hybrid_specs,
-)
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import (
