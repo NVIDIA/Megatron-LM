@@ -53,11 +53,13 @@ not passing tests or measured runtime savings; pytest still applies markers
 and skips. Static import analysis cannot cover every dynamic dependency, so
 full-suite validation remains necessary.
 
-Run the CPU regression checks inside the development container:
+The focused CPU regression checks in `.github/scripts/test_select_unit_tests.py`
+cover selection policy, CI wiring, and runtime safeguards. Run them inside the
+development container:
 
 ```bash
 uv run --locked --project .github/test-selection \
-  python -m unittest discover -s .github/scripts -p 'test_select*.py' -v
+  python .github/scripts/test_select_unit_tests.py -v
 ```
 
 ## Updating Functional Test Golden Values

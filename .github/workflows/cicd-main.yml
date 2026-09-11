@@ -467,7 +467,7 @@ jobs:
       - name: Test unit-test selection and execution
         run: |
           uv run --locked --project .github/test-selection \
-            python -m unittest discover -s .github/scripts -p 'test_select*.py' -v
+            python .github/scripts/test_select_unit_tests.py -v
 
       - name: Get PR info
         id: get-pr-info
