@@ -822,9 +822,10 @@ class TestFlashDecodeSoftcapPlumbing:
         attn.config.attn_logit_softcapping = softcap
         attn._get_inference_softmax_offset.return_value = None
         t = torch.zeros(2, 1, 4, 8)
-        with mock.patch(
-            "megatron.core.transformer.attention.flash_attn_with_kvcache", kernel
-        ), mock.patch("megatron.core.transformer.attention.is_fa_min_version", return_value=True):
+        with (
+            mock.patch("megatron.core.transformer.attention.flash_attn_with_kvcache", kernel),
+            mock.patch("megatron.core.transformer.attention.is_fa_min_version", return_value=True),
+        ):
             Attention.flash_decode(
                 attn,
                 sequence_len_offset=torch.tensor([1]),

@@ -126,9 +126,9 @@ class TestDotProductAttentionSoftcap:
 
         # Anti-vacuity: a cap that is wrong by exactly layer_number must be distinguishable,
         # otherwise this comparison would pass no matter what the code did.
-        wrong = self._attention(
-            qk_layer_scaling=False, cap=self._CAP * self._LAYER_NUMBER
-        )(q, k, v, None).float()
+        wrong = self._attention(qk_layer_scaling=False, cap=self._CAP * self._LAYER_NUMBER)(
+            q, k, v, None
+        ).float()
         assert (without - wrong).abs().max() > 1e-3, "inputs do not separate the two caps"
 
         torch.testing.assert_close(with_scaling, without, rtol=1e-2, atol=1e-2)
