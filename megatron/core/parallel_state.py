@@ -2515,8 +2515,15 @@ def get_all_ranks():
     return "_".join(map(lambda x: str(x or 0), ranks))
 
 
-def destroy_model_parallel():
-    """Set the groups to none."""
+def destroy_model_parallel(destroy_process_groups: bool = True):
+    """Reset model-parallel state and optionally destroy its process groups.
+
+    Args:
+        destroy_process_groups: Destroy every process group tracked by
+            :func:`create_group`. Tests that serialize objects containing
+            process-group names may defer destruction until those objects have
+            been consumed, but must eventually call this function with ``True``.
+    """
     # Release the NCCL EP context (if the 'ncclep' flex dispatcher bootstrapped one) before the
     # process group's communicator is torn down. TE registers an atexit ep_finalize that would
     # otherwise run after dist.destroy_process_group() and hit a "corrupted comm object" at exit.
@@ -2702,7 +2709,7 @@ def destroy_model_parallel():
     _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP = None
 
     global _global_process_group_list
-    if _global_process_group_list is not None:
+    if destroy_process_groups and _global_process_group_list is not None:
         # ``new_group`` keeps every process group registered in PyTorch's global
         # process-group map. Dropping Megatron's references alone does not tear
         # down the NCCL communicators, so repeated test initialization eventually
@@ -2714,6 +2721,7 @@ def destroy_model_parallel():
                 and torch.distributed.distributed_c10d._world.pg_map.get(group) is not None
             ):
                 torch.distributed.destroy_process_group(group)
-    _global_process_group_list = None
+    if destroy_process_groups:
+        _global_process_group_list = None
 
     SymmetricMemoryManager.destroy()
