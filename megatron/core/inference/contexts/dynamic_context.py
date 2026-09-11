@@ -1386,6 +1386,12 @@ class DynamicInferenceContext(BaseInferenceContext):
         self._decode_logit_idxs = torch.arange(
             max_logit_idxs, dtype=torch.int32, device=torch.cuda.current_device()
         )
+        # A partial prefill chunk's last logit predicts a known prompt token, not
+        # the provisional sample that is discarded after the step. The scheduler
+        # permits only one partial chunk, so one stable scalar is sufficient.
+        self.chunked_prefill_next_prompt_token = torch.empty(
+            (), dtype=torch.int64, device=torch.cuda.current_device()
+        )
 
         # MHA flash-attention metadata views (write-only on CPU, read-only on
         # GPU via the matching region of ContextGPUView._buf). Populated per
@@ -3342,6 +3348,11 @@ class DynamicInferenceContext(BaseInferenceContext):
         assert (
             prefill_chunk_length <= req.remaining_prompt_length
         ), "Prefill chunk length is greater than remaining prompt length"
+
+        if prefill_chunk_length < req.remaining_prompt_length:
+            self.chunked_prefill_next_prompt_token.copy_(
+                req.remaining_prompt_tokens[prefill_chunk_length]
+            )
 
         # =========================================================================
         # Block allocation + prefix matching + prefill skipping

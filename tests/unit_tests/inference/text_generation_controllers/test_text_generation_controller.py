@@ -348,6 +348,23 @@ def _make_async_sched_controller(context=None, model_config=None):
     return controller
 
 
+@pytest.mark.parametrize("chunk_row", [2, -1], ids=["active", "hidden"])
+def test_partial_prefill_selected_token_uses_known_prompt_target(chunk_row):
+    """A visible chunk uses its next prompt token; a hidden chunk changes no row."""
+    context = _make_async_sched_context(total_request_count=3)
+    context.chunked_prefill_request_id = 12
+    context.chunked_prefill_next_prompt_token = torch.tensor(42, dtype=torch.int64)
+    context.get_index_of_chunked_prefill_request = mock.Mock(return_value=chunk_row)
+    controller = _make_async_sched_controller(context)
+    controller._sampled_tokens_cuda.copy_(torch.tensor([7, 8, 9], dtype=torch.int64))
+
+    controller._replace_partial_prefill_sample_with_prompt_token()
+
+    expected = [7, 8, 42] if chunk_row == 2 else [7, 8, 9]
+    assert controller._sampled_tokens_cuda.tolist() == expected
+    context.get_index_of_chunked_prefill_request.assert_called_once_with(safe=True)
+
+
 @pytest.mark.parametrize(
     "consumed, launched, expected",
     [

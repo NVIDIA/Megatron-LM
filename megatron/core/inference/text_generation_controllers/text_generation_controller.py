@@ -1087,6 +1087,21 @@ class TextGenerationController(MTPInferenceMixin):
             output=self._sampled_tokens_cuda[:n],
         )
 
+    def _replace_partial_prefill_sample_with_prompt_token(self) -> None:
+        """Use the known next prompt token for a partial chunk's selected logprob."""
+        context = self.inference_wrapped_model.inference_context
+        if context.chunked_prefill_request_id == -1:
+            return
+
+        context_idx = context.get_index_of_chunked_prefill_request(safe=True)
+        if context_idx == -1:
+            return
+        active_idx = context_idx - context.paused_request_count
+        active_request_count = context.total_request_count - context.paused_request_count
+        assert 0 <= active_idx < active_request_count
+        assert active_idx == active_request_count - 1
+        self._sampled_tokens_cuda[active_idx].copy_(context.chunked_prefill_next_prompt_token)
+
     def _dynamic_step_log_probs_bookkeeping(self) -> Tuple[bool, bool]:
         """Perform bookkeeping necessary to compute log probs for dynamic batching.
 
@@ -1972,6 +1987,7 @@ class TextGenerationController(MTPInferenceMixin):
 
         range_push("sampling")
         self._dynamic_step_sample_logits()
+        self._replace_partial_prefill_sample_with_prompt_token()
         sampled_tokens_gpu = self._sampled_tokens_cuda[:active_request_count]
         if sampled_tokens_gpu.is_cuda:
             self._async_sched_sample_gpu_ready_event.record(
@@ -2024,6 +2040,7 @@ class TextGenerationController(MTPInferenceMixin):
             torch.int64
         )
         self._compute_serial_mtp_and_sample(base_position=base_position)
+        self._replace_partial_prefill_sample_with_prompt_token()
         sampled_tokens_gpu = self._sampled_tokens_cuda[:active_request_count]
         sampled_mtp_tokens_gpu = self._sampled_mtp_tokens_cuda[:, :active_request_count]
         accepted_tokens_gpu = (
@@ -2971,6 +2988,8 @@ class TextGenerationController(MTPInferenceMixin):
                 context.kv_block_allocator.release_memory_blocks(blocks_to_release[remove_mask])
             else:
                 self._dynamic_step_sample_logits()
+
+            self._replace_partial_prefill_sample_with_prompt_token()
 
             log_probs = None
             top_n_logprobs = None

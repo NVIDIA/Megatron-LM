@@ -2324,6 +2324,10 @@ class DynamicInferenceEngine(AbstractEngine):
                 top_n_logprobs is not None
                 and req_idx in top_n_logprobs
                 and request_id not in self.stop_word_being_finished_ids
+                and not (
+                    request_id == consumed_chunked_prefill_request_id
+                    and request.sampling_params.skip_prompt_log_probs
+                )
             ):
                 # Initialize lists if they don't exist
                 if request.prompt_top_n_logprobs is None:
