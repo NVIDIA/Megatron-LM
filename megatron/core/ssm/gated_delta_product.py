@@ -991,14 +991,19 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
 
         return query, key, value
 
-    def _decode_conv(self, x, conv_state, conv_state_indices):
-        """Step the cached short conv one token per request, in place.
+    def _decode_conv(self, x, conv_state, conv_state_indices, intermediate_conv_state=None):
+        """Step the cached short conv over this step's tokens per request, in place.
 
         Indexed conv update: reads/writes the per-request conv state rows selected by
         ``conv_state_indices``. Unlike ``causal_conv1d_fn``, the Triton
         ``causal_conv1d_update`` takes ``x`` as (batch, seq_len, dim) -- a 2-D
         (batch, dim) input is unsqueezed at dim 1 -- so decode keeps the (b, l, d)
-        layout rather than transposing to [B, D, L]. Here l == 1.
+        layout rather than transposing to [B, D, L]. Here l is 1 plus the number of
+        speculative draft tokens, and the kernel walks them in one launch.
+
+        ``intermediate_conv_state`` is the speculative-decoding snapshot buffer: the
+        kernel writes the conv state after each of those tokens so that verification
+        can roll back to an accepted prefix.
         """
         assert self.cp is not None
         return causal_conv1d_update(
@@ -1008,6 +1013,7 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
             self.cp.get_conv1d_bias(),
             self.activation,
             conv_state_indices=conv_state_indices,
+            intermediate_conv_states=intermediate_conv_state,
         )
 
     def _compute_gating(self, ba):
@@ -1098,10 +1104,9 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
     # rounded-up batch shape therefore replays correctly for any smaller real
     # batch, for decode-only and mixed steps alike.
     #
-    # Remaining unsupported: context parallelism (cp_size > 1), speculative
-    # decoding, chunked prefill, and Mamba prefix caching. The reshapes mirror
-    # the static ``forward`` math with batch/seq repurposed for the packed
-    # dynamic layout.
+    # Remaining unsupported: context parallelism (cp_size > 1). The reshapes
+    # mirror the static ``forward`` math with batch/seq repurposed for the
+    # packed dynamic layout.
     # ------------------------------------------------------------------
     def ssm_decode(
         self,
@@ -1112,27 +1117,33 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
         intermediate_conv_state: Optional[torch.Tensor] = None,
         intermediate_ssm_state: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Single-token-per-request decode. ``zVKQba`` is ``[n, seq_len,
-        proj_dim]``; returns ``[n, seq_len, d_inner]``. The conv and SSM states
+        """Decode step of ``seq_len`` tokens per request. ``zVKQba`` is ``[n,
+        seq_len, proj_dim]``; returns ``[n, seq_len, d_inner]``. ``seq_len`` is
+        1 plus the number of speculative draft tokens. The conv and SSM states
         are read/written in place at the slots named by ``batch_indices``
         (``-1`` marks padding slots, whose outputs are zeroed);
         ``batch_indices=None`` means static batching, where the caches are
         already in request order.
 
+        Under speculative decoding the two ``intermediate_*`` buffers receive
+        the conv and SSM state after each draft token, so that verification can
+        roll each request's recurrence back to its accepted prefix. Both come
+        from the inference context and are slot-indexed like the caches they
+        shadow; they are passed as a pair or not at all.
+
         Every op here is CUDA-graph safe: no host synchronization, no
         data-dependent shapes, and the state caches are addressed by device-side
         indices rather than gathered and scattered."""
-        _, seq_len, _ = zVKQba.shape
-        assert seq_len == 1, "GDP decode supports one token per request"
-        assert (
-            intermediate_conv_state is None and intermediate_ssm_state is None
-        ), "GDP decode does not support speculative decoding yet"
+        assert (intermediate_conv_state is None) == (intermediate_ssm_state is None), (
+            "the speculative-decoding conv and SSM snapshot buffers must be passed together; "
+            "a rollback needs both halves of the recurrent state"
+        )
 
-        # Keep the length-1 sequence dimension so the shared helpers apply: with l == 1
-        # their (b, l, ...) reshapes collapse to exactly the layouts the fla recurrent
-        # kernel wants here, i.e. "b (l m) h p" is "n m h p" and "b l g n" is "n 1 g n".
-        # ``_preprocess`` takes the sequence-first layout that in_proj produces, so hand
-        # it back the (1, n, proj_dim) view; both transposes are free at l == 1.
+        # Keep the sequence dimension so the shared helpers apply: their (b, l, ...)
+        # reshapes give exactly the layouts the fla recurrent kernel wants here, i.e.
+        # "b (l m) h p" is "n (s m) h p". ``_preprocess`` takes the sequence-first
+        # layout that in_proj produces, so hand it back the (seq_len, n, proj_dim)
+        # view.
         z, VKQ, ba = self._preprocess(zVKQba.transpose(0, 1))
 
         # Decode runs the forked Triton `causal_conv1d_update` (not the pip
@@ -1141,7 +1152,7 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
         # what makes a replayed CUDA graph with a partially filled batch match an
         # eager run. `batch_indices=None` is static batching, where the cache is
         # already in request order.
-        x_conv = self._decode_conv(VKQ, conv_state, batch_indices)
+        x_conv = self._decode_conv(VKQ, conv_state, batch_indices, intermediate_conv_state)
 
         # Everything between the conv and the recurrence is one kernel: the
         # value/key/query split, the GQA expansion, the householder interleave
@@ -1168,6 +1179,11 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
         # batch position `i` to slot `i`, which is the static-batching layout.
         # `ssm_state` is updated in place, so the returned final state is that
         # same tensor and is discarded here.
+        #
+        # The Householder copies are folded into the sequence dimension, so the
+        # kernel takes `num_householder` steps per draft token; it snapshots the
+        # state into `intermediate_ssm_state` on the last of each group, which
+        # is the per-draft-token state a rollback restores.
         core_attn_out, _ = fused_recurrent_gated_delta_rule_update(
             query,
             key,
@@ -1177,6 +1193,8 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
             beta=beta,
             state_indices=batch_indices,
             use_qk_l2norm_in_kernel=True,
+            intermediate_states=intermediate_ssm_state,
+            steps_per_token=self.num_householder,
         )
         core_attn_out = rearrange(
             core_attn_out, "n (t m) h d -> n t m h d", m=self.num_householder
