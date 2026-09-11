@@ -3077,7 +3077,9 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
                 TestPrefixCacheRealEngineMatrix._assert_scalar_logprob_close(
                     cached_values[key], baseline_values[key]
                 )
-            token_key = f"tok_{token}"
+            # Top-n dicts are keyed by token id as a decimal string, not by detokenized
+            # text, so byte-fallback tokens don't collide into one entry.
+            token_key = str(int(token))
             assert token_key in cached_values
             assert token_key in baseline_values
             TestPrefixCacheRealEngineMatrix._assert_scalar_logprob_close(
@@ -3127,7 +3129,7 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
         ):
             assert 0 < len(values) <= request.sampling_params.top_n_logprobs
             assert np.isfinite(np.asarray(list(values.values()))).all()
-            token_key = f"tok_{token}"
+            token_key = str(int(token))
             assert token_key in values
             TestPrefixCacheRealEngineMatrix._assert_scalar_logprob_close(
                 values[token_key], logprob, abs=0.1
