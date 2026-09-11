@@ -2617,9 +2617,7 @@ def destroy_model_parallel(destroy_process_groups: bool = True):
     if (
         destroy_process_groups
         and _DATA_PARALLEL_GROUP_GLOO is not None
-        and torch.distributed.distributed_c10d._world.pg_map.get(
-            _DATA_PARALLEL_GROUP_GLOO, None
-        )
+        and torch.distributed.distributed_c10d._world.pg_map.get(_DATA_PARALLEL_GROUP_GLOO, None)
         is not None
     ):
         torch.distributed.destroy_process_group(_DATA_PARALLEL_GROUP_GLOO)
