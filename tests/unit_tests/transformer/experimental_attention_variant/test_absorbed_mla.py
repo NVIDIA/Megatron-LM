@@ -345,6 +345,85 @@ def test_absorbed_v_up_projection_skips_when_core_consumed_weight():
     assert projected is core_attn_out
 
 
+def test_forward_honors_fine_grained_attention_offload(monkeypatch):
+    """Absorbed MLA should use the same attention offload scopes as standard MLA."""
+    events = []
+    managers = []
+
+    class OffloadManager:
+        def __init__(self, enabled, tensor, name):
+            self.enabled = enabled
+            self.tensor = tensor
+            self.name = name
+            self.released = None
+            managers.append(self)
+
+        def __enter__(self):
+            events.append(f"enter:{self.name}")
+            return self.tensor
+
+        def __exit__(self, *args):
+            events.append(f"exit:{self.name}")
+
+        def group_offload(self, tensor, forced_released_tensors=None):
+            events.append(f"offload:{self.name}")
+            self.released = forced_released_tensors
+            return tensor
+
+    def run_core_attention(*args, **kwargs):
+        del args, kwargs
+        events.append("core_attention")
+        return torch.ones(2, 1, 4)
+
+    def run_output_projection(tensor):
+        events.append("output_projection")
+        return tensor, None
+
+    attention = SimpleNamespace(
+        get_query_key_value_tensors=lambda *args, **kwargs: (
+            torch.ones(2, 1, 4),
+            torch.ones(2, 1, 4),
+            torch.ones(2, 1, 4),
+        ),
+        _get_v_up_weight=lambda: torch.eye(2).repeat(2, 1, 1),
+        core_attention=run_core_attention,
+        linear_proj=run_output_projection,
+        config=SimpleNamespace(
+            kv_lora_rank=2,
+            v_head_dim=2,
+            tensor_model_parallel_size=1,
+        ),
+        num_attention_heads_per_partition=2,
+        checkpoint_core_attention=False,
+        offload_core_attention=True,
+        offload_attn_proj=True,
+        training=True,
+        cache_mla_latents=False,
+        attn_mask_type=AttnMaskType.causal,
+        recompute_up_proj=False,
+    )
+    monkeypatch.setattr(absorbed_mla_module, "off_interface", OffloadManager)
+
+    hidden_states = torch.ones(2, 1, 4)
+    output, bias = AbsorbedMLASelfAttention.forward(attention, hidden_states, None)
+
+    assert output.shape == hidden_states.shape
+    assert bias is None
+    assert events == [
+        "enter:core_attn",
+        "core_attention",
+        "exit:core_attn",
+        "offload:core_attn",
+        "enter:attn_proj",
+        "output_projection",
+        "exit:attn_proj",
+        "offload:attn_proj",
+    ]
+    assert [manager.enabled for manager in managers] == [True, True]
+    assert len(managers[0].released) == 2
+    assert managers[1].released == [managers[1].tensor]
+
+
 def test_load_from_state_dict_backwards_compatible_with_split_kv_up_projection(monkeypatch):
     """Pre-refactor split K/V up-projection checkpoints load into the combined layout."""
 
