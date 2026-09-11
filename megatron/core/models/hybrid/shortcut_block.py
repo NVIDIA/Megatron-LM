@@ -1,5 +1,20 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+"""Implement shortcut-connected MoE blocks based on the ScMoE architecture introduced in
+`Shortcut-connected Expert Parallelism for Accelerating Mixture of Experts
+<https://arxiv.org/abs/2404.05019>`_.
+
+ScMoE routes the preceding layer's representation through sparse experts while the paired layer
+computes attention and the shared expert, breaking the usual sequential dependency so
+expert-parallel All-to-All communication can overlap with computation.
+Our variant adds two LayerNorms to the paper's design: `shortcut_pre_mlp_layernorm` normalizes
+the shortcut representation before routing and expert dispatch, while `shortcut_post_norm`
+normalizes the merged routed- and shared-expert result before the MoE residual/BDA step.
+Also supports selective activation recomputation, activation offloading on 
+shortcut_pre_mlp_layernorm and shortcut_post_norm respectively, in which case the memory usage
+from enabling Shortcut-MoE is expected to be flat.
+"""
+
 from __future__ import annotations
 
 from typing import Sequence
@@ -44,8 +59,8 @@ def group_layers_into_shortcut_blocks(
 ) -> torch.nn.ModuleList:
     """Group physical layers into their registered shortcut-block hierarchy.
 
-    Grouping updates the layer names through the returned ``ModuleList`` hierarchy. Layers not
-    followed by an MoE remain direct children of the returned ``ModuleList``.
+    Grouping updates the layer names through the returned `ModuleList` hierarchy. Layers not
+    followed by an MoE remain direct children of the returned `ModuleList`.
 
     Args:
         layers: Physical layers in execution order.
@@ -195,7 +210,7 @@ class ShortcutMoEBlock(MegatronModule):
         """Run the paired MoE layer's pre-MLP norm and shared experts.
 
         Returns:
-            ``(shared_expert_output, moe_unflatten_mbs, residual, mlp_state)``.
+            `(shared_expert_output, moe_unflatten_mbs, residual, mlp_state)`.
         """
         pre_mlp_output, residual, mlp_state = self.moe_layer._pre_mlp_layernorm_and_residual(
             hidden_states
