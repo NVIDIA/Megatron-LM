@@ -520,11 +520,12 @@ Under **full-iteration CUDA graphs** the recompute-forward is captured; `wait_as
 
 ![DDP + (E)GTP_remat interaction with the distributed optimizer](../../images/generalized_tensor_parallel/0611_ddp_egtp_orthogonal_bucketing.png)
 
-**(E)GTP_remat is *super loosely coupled* to DDP and the distributed optimizer — they stay completely GTP_remat-agnostic.** GTP_remat is just another sub-axis of the rank grid (`world = TP×CP×GTP_remat×DP`); a GTP_remat-sharded weight rides the *exact same* code path as an ordinary param. There are **no** GTP_remat/EGTP_remat-specific buffers, optimizers, gradient-scaling factors, or bucket groups. The entire DDP/DistOpt stack touches GTP_remat in only **three** narrow places:
+**(E)GTP_remat is *super loosely coupled* to DDP and the distributed optimizer — they stay almost completely GTP_remat-agnostic.** GTP_remat is just another sub-axis of the rank grid (`world = TP×CP×GTP_remat×DP`); a GTP_remat-sharded weight rides the *exact same* code path as an ordinary param. There are **no** GTP_remat/EGTP_remat-specific buffers, optimizers, or bucket groups, and just **one** GTP_remat-specific gradient-scaling factor (the expert-buffer correction below). The entire DDP/DistOpt stack touches GTP_remat in only **four** narrow places:
 
 1. **finalize all-reduce** (`_allreduce_replicated_grads_over_gtp_remat_group`) — completes the gtp_remat axis for *replicated* (non-GTP_remat) params (SUM under `calculate_per_token_loss`, AVG otherwise; see §3.2 table); a no-op when GTP_remat is inactive.
 2. **`is_gtp_weight_remat` / `allreduce` tags** propagated onto the optimizer's master shards — consumed only by the grad-norm dedup filter.
 3. **grad-ready hook routing** (`DistributedDataParallel.__init__`) — for a GTP_remat param, DDP registers its backward post-hook via GTP_remat's `register_grad_accum_hook` instead of autograd's `AccumulateGrad`. GTP_remat fires it from `_handle_megatron_grad_accum` **after** the per-param `{wgrad RS → main_grad add}`. This enforces the invariant below; a no-op (plain autograd path) when GTP_remat is inactive.
+4. **expert-buffer prescale correction** (`expert_gradient_scaling_factor`, `DistributedDataParallel.__init__`) — only applies when `calculate_per_token_loss=False` (the SUM/`÷total_global_tokens` path needs no such correction; see §3.2 table). On that path, expert params can't recover the DDP pre-scale's `1/gtp_remat` shrinkage via the finalize AVG above (ranks within one gtp_remat group hold *different* experts, so averaging their grads would be wrong); they instead recover only `expert_gtp_remat`'s worth via the analogous EGTP-remat finalize, so the prescale folds in an `egtp_remat/gtp_remat` correction to make up the rest. `1.0` — a no-op — when `gtp_remat == egtp_remat` or GTP_remat is inactive.
 
 #### Ordering invariants
 
@@ -556,7 +557,7 @@ Everything else — bucketing, the reduce-scatter/all-reduce schedule and its ov
 - **Free reuse of a mature stack.** GTP_remat inherits DDP's bucketing + comm/compute overlap, the distributed optimizer's fp32-master + Adam-moment sharding, grad-norm/clip, and the existing checkpoint format — no parallel re-implementation to write or maintain (contrast FSDP, which replaces all of these).
 - **Orthogonal composability.** Because GTP_remat is a rank-grid sub-axis cut along `out_features` (dim 0, whichever axis TP used), it composes with TP/EP/CP/PP and the DistOpt the same way TP does — no special nesting logic.
 - **Zero-cost when off.** With GTP_remat disabled the gtp_remat axis is size-1 and the hooks become no-ops, so non-GTP_remat runs hit byte-identical behavior — GTP_remat can be toggled without forking the DDP/optimizer code paths.
-- **Small, auditable surface.** These three hooks are the whole integration contract, which is what makes the correctness argument below tractable.
+- **Small, auditable surface.** These four hooks are the whole integration contract, which is what makes the correctness argument below tractable.
 
 #### Bucketing and gradient scaling
 
@@ -566,12 +567,14 @@ The DP collective only covers the replicate axis; the gtp_remat axis is complete
 
 | | `calculate_per_token_loss=False` (default) | `calculate_per_token_loss=True` |
 |---|---|---|
-| DDP pre-scale (`gradient_scaling_factor`) | `1/replicate` (= `1/dp_cp_group.size()`) | `1.0` (no pre-scale) |
+| DDP pre-scale, dense buffer (`gradient_scaling_factor`) | `1/replicate` (= `1/dp_cp_group.size()`) | `1.0` (no pre-scale) |
+| DDP pre-scale, expert buffer (`expert_gradient_scaling_factor`) | `1/replicate × (egtp_remat/gtp_remat)` | `1.0` (no pre-scale) |
 | gtp_remat reduce-scatter (sharded weights) | **MEAN** (pre-scale wgrad by `1/gtp_remat`) | **SUM** (plain reduce-scatter) |
 | finalize over gtp_remat (replicated params) | **AVG** all-reduce | **SUM** all-reduce |
 | final normalization | net grad = full `(replicate × gtp_remat)` **mean** | grads summed over all axes, then `÷ total_global_tokens` in `finalize_model_grads` |
 
 - **Default (mean) path** decouples gradient scaling from the gtp_remat degree: the DP `1/replicate` mean × the reduce-scatter `1/gtp_remat` mean (sharded weights) — or × the finalize AVG (replicated params) — equals the exact full mean, independent of the gtp_remat axis size.
+- **Expert buffer needs an extra `egtp_remat/gtp_remat` correction** because the finalize step it gets is EGTP-remat's AVG, not GTP_remat's — a gtp_remat group's ranks hold *different* experts, so an AVG across the full gtp_remat axis (mixing different experts' grads) would be wrong; only EGTP_remat peers hold the *same* expert's replica. That AVG only recovers `1/egtp_remat` of the `1/gtp_remat` the dense-buffer pre-scale assumed, so the expert pre-scale folds in `egtp_remat/gtp_remat` to make up the gap — a no-op (`=1.0`) whenever `gtp_remat == egtp_remat`, including the common case of GTP_remat off.
 - **`--gtp-remat-reduce-scatter-with-fp32-accumulation` swaps the collective, not the scaling**
   — this table applies unchanged (§2.6).
 - **Per-token-loss path** must SUM over gtp_remat (like the DP axis): `total_global_tokens` already counts the gtp_remat peers' distinct tokens, so the single `÷ total_global_tokens` does all normalization. A `1/gtp_remat` mean here would shrink every gtp_remat gradient by `1/gtp_remat` (grad-norm mismatch + divergence), so the reduce-scatter mean and finalize AVG are both gated on `not calculate_per_token_loss`.
