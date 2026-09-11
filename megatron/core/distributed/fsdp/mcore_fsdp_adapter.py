@@ -688,10 +688,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             if config.init_model_with_meta_device:
                 _materialize_owned_meta_modules(module, device)
             fully_shard(
-                module,
-                mesh=dp_mesh,
-                placements=dense_placements,
-                **common_fully_shard_kwargs,
+                module, mesh=dp_mesh, placements=dense_placements, **common_fully_shard_kwargs
             )
         super().__init__(config=config, module=module)
 

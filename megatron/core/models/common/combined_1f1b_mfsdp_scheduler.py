@@ -1,24 +1,28 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-from torch import nn
-
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
 
 
 def _make_unshard_forward_hook(owner: FsdpModule):
-    """Create a forward pre-hook that unshards the owning FSDP module before the submodule forward."""
+    """Create a forward pre-hook that unshards the owning FSDP module before the submodule
+    forward."""
+
     def hook(submodule, _args, _kwargs):
         if owner.is_root():
             context = owner.context
             context.allgather_stream.wait_stream(context.current_stream())
         owner.unshard()
+
     return hook
 
 
 def _make_unshard_backward_hook(owner: FsdpModule):
-    """Create a backward pre-hook that unshards the owning FSDP module before the submodule backward."""
+    """Create a backward pre-hook that unshards the owning FSDP module before the submodule
+    backward."""
+
     def hook(submodule, _grad_output):
         owner.unshard()
+
     return hook
 
 
@@ -38,7 +42,7 @@ def register_combined_1f1b_hooks(module: FsdpModule) -> None:
 
     def register_hooks(submodule, owner):
         if isinstance(submodule, FsdpModule):
-            owner = submodule            # BEFORE registering: an FSDP unit owns itself
+            owner = submodule  # BEFORE registering: an FSDP unit owns itself
         if len(list(submodule.parameters(recurse=False))) > 0:
             submodule.register_forward_pre_hook(
                 _make_unshard_forward_hook(owner), prepend=True, with_kwargs=True
