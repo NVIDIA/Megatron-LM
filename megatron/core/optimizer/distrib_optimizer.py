@@ -46,6 +46,7 @@ from ..dist_checkpointing.mapping import (
     ShardedStateDict,
     ShardedTensorFactory,
 )
+from ..dist_checkpointing.optimizer import make_sharded_optimizer_fragment
 from ..dist_checkpointing.utils import extract_sharded_tensors_and_factories
 from ..distributed.param_and_grad_buffer import (
     _ParamAndGradBuffer,
@@ -73,6 +74,25 @@ from .optimizer_config import OptimizerConfig
 from .param_layout import FullParamLayout, PerBufferParamLayout, pad_bucket_end, pad_param_start
 
 logger = getLogger(__name__)
+
+
+def _resolve_gtp_sharded_metadata(
+    model_param: torch.Tensor, model_sharded_state_dict: ShardedStateDict
+) -> ShardedTensor | ShardedTensorFactory | None:
+    """Resolve checkpoint views through exact source identity.
+
+    Fused projections expose an explicit physical-parameter companion. Ordinary
+    native-FP8 entries retain the original parameter on their dequantized data.
+    Reuse the original metadata, including expert offsets and replica IDs; never
+    infer checkpoint keys from debug names or reconstruct an EP-unaware shard.
+    """
+    for entry in nested_values(model_sharded_state_dict):
+        if isinstance(entry, ShardedTensorFactory):
+            entry = entry.for_optimizer()
+        data = getattr(entry, 'data', None)
+        if data is model_param or getattr(data, '_gtp_dequant_src', None) is model_param:
+            return entry
+    return None
 
 
 class Range:
@@ -1078,6 +1098,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     'Skipping loading grad scaler ...',
                 )
 
+        self._loaded_master_mismatch = torch.zeros(
+            (), dtype=torch.long, device=torch.cuda.current_device()
+        )
+
         if 'param_state' in state_dict:
             assert 'param_state_sharding_type' in state_dict, state_dict.keys()
             param_state = state_dict['param_state']
@@ -1097,6 +1121,41 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 self.load_parameter_state_from_fs_model_space(param_state)
             else:
                 raise NotImplementedError(f'Unknown sharding_type: {sharding_type}')
+
+            self._warn_if_master_disagrees_with_model_weights()
+
+    def _warn_if_master_disagrees_with_model_weights(self):
+        """Warn when the checkpoint's model weights differ from its optimizer master.
+
+        With fp32 params the main param is a view of the model param, so loading the
+        parameter state rewrites model weights over the shard this rank owns and leaves the
+        rest as loaded from the model state dict. When the two copies in the checkpoint hold
+        the same values that is a no-op; when they do not, what each rank ends up training on
+        depends on its shard share and ranks holding the same replica can disagree with each
+        other. The usual cause is resuming a checkpoint whose model weights were saved at a
+        different precision than this run's params (e.g. a bf16-saved checkpoint resumed with
+        fp32 params); a converted or hand-assembled checkpoint does it too.
+        """
+        counter = self._loaded_master_mismatch
+        self._loaded_master_mismatch = None
+        if counter is None:
+            return
+        # Reduce over the whole world, not the DP group: the mismatch can be confined to
+        # ranks outside the group that happens to contain the rank that logs.
+        torch.distributed.all_reduce(counter)
+        num_params = int(counter.item())
+        if num_params == 0:
+            return
+        log_single_rank(
+            logger,
+            logging.WARNING,
+            f'***WARNING*** {num_params} fp32 parameter shards were loaded from an optimizer '
+            f'master that disagrees with the model weights stored in the same checkpoint. '
+            f'Each rank only restores the shard it owns, so the weights this run starts from '
+            f'depend on the parallel layout and replicas may differ from one another. This '
+            f'usually means the checkpoint was saved with a different parameter precision '
+            f'than this run uses.',
+        )
 
     def _get_main_param_and_optimizer_states(self, model_param):
         """Return a dict containing the main param and optimizer states corresponding to the input
@@ -1230,10 +1289,33 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             for k, v in optim_state.items():
                 if isinstance(v, torch.Tensor):
                     dst_tensors[k] = v
-            for key in dst_tensors:
-                if not isinstance(tensors[key], torch.Tensor):
-                    continue
-                dst_tensors[key].copy_(tensors[key])
+            # For fp32 model params, main_param is an autograd-tracked view of
+            # the model param (built without detach() in
+            # _build_model_and_main_param_groups), so the in-place copy must
+            # run under no_grad.
+            with torch.no_grad():
+                for key in dst_tensors:
+                    if not isinstance(tensors[key], torch.Tensor):
+                        continue
+                    dst = dst_tensors[key]
+                    src = tensors[key].to(device=dst.device, dtype=dst.dtype)
+                    if (
+                        key == "param"
+                        and model_param.dtype == torch.float32
+                        # The counter only exists between load_state_dict creating it and
+                        # the end-of-load warning consuming it. The legacy
+                        # load_parameter_state() entry reaches this copy WITHOUT
+                        # load_state_dict, and must not crash on a missing counter.
+                        and getattr(self, "_loaded_master_mismatch", None) is not None
+                    ):
+                        # For fp32 params the optimizer's main param is a view of the model
+                        # param, so this copy rewrites model weights -- and only over the
+                        # shard this rank owns. That is harmless while the checkpoint's model
+                        # weights and its optimizer master agree, and silently topology
+                        # dependent when they do not. Record the disagreement here (device
+                        # side, no sync) and report it once the load is done.
+                        self._loaded_master_mismatch += torch.ne(dst, src).any().long()
+                    dst.copy_(src)
 
     def get_parameter_state_dp_reshardable(self):
         """Get internal representation of parameter state without any copies and modifications.
@@ -1756,6 +1838,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             model_sharded_state_dict
         )
         for sh_base in nested_values(model_sharded_state_dict):
+            if isinstance(sh_base, ShardedTensorFactory):
+                sh_base = sh_base.for_optimizer()
             param_to_sharded_metadata[sh_base.data] = sh_base
 
         prefix = 'optimizer.state'
@@ -1790,13 +1874,18 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     param_world_end,
                     bucket_id,
                 ) in buffer.param_index_map.items():
-                    try:
-                        sharded_metadata = param_to_sharded_metadata[model_param]
-                    except KeyError as e:
+                    sharded_metadata = param_to_sharded_metadata.get(model_param)
+                    if sharded_metadata is None:
+                        sharded_metadata = _resolve_gtp_sharded_metadata(
+                            model_param, model_sharded_state_dict
+                        )
+                    if sharded_metadata is None:
+                        name = getattr(model_param, '_debug_name', None) or '<unnamed>'
                         raise ValueError(
-                            f"Model param {model_param} not in model_sharded_state_dict."
+                            f"Model param {name} (shape={tuple(model_param.shape)})"
+                            f" has no source-bound metadata in model_sharded_state_dict."
                             f" Hint: {KEEP_VARS_HINT}"
-                        ) from e
+                        )
                     assert (
                         sharded_metadata.flattened_range is None
                     ), f"Flattened model tensor not supported ({sharded_metadata})"
@@ -2014,6 +2103,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             model_sharded_state_dict
         )
         for sh_base in nested_values(model_sharded_state_dict):
+            if isinstance(sh_base, ShardedTensorFactory):
+                sh_base = sh_base.for_optimizer()
             param_to_sharded_metadata[sh_base.data] = sh_base
 
         prefix = 'optimizer.state'
@@ -2028,13 +2119,18 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
             # Match optimizer parameter with model ShardedTensor (or
             # ShardedTensorFactory).
-            try:
-                sharded_metadata = param_to_sharded_metadata[model_param]
-            except KeyError as e:
+            sharded_metadata = param_to_sharded_metadata.get(model_param)
+            if sharded_metadata is None:
+                sharded_metadata = _resolve_gtp_sharded_metadata(
+                    model_param, model_sharded_state_dict
+                )
+            if sharded_metadata is None:
+                name = getattr(model_param, '_debug_name', None) or '<unnamed>'
                 raise ValueError(
-                    f"Model param {model_param} not in model_sharded_state_dict"
+                    f"Model param {name} (shape={tuple(model_param.shape)})"
+                    f" has no source-bound metadata in model_sharded_state_dict."
                     f" Hint: {KEEP_VARS_HINT}"
-                ) from e
+                )
 
             # Set DP corresponding replica_id coordinate to 0.
             assert (
@@ -2060,7 +2156,15 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 )
                 if isinstance(sharded_metadata, ShardedTensorFactory):
                     replace_kwargs.pop('dtype')
-                tensors[state_key] = replace(sharded_metadata, **replace_kwargs)
+                    tensors[state_key] = replace(sharded_metadata, **replace_kwargs)
+                else:
+                    tensors[state_key] = make_sharded_optimizer_fragment(
+                        sharded_metadata,
+                        state_ten,
+                        f'{prefix}.{state_key}',
+                        item_slice,
+                        replica_id=replica_id,
+                    )
                 tensors[state_key].validate_metadata_integrity()
             return tensors
 
