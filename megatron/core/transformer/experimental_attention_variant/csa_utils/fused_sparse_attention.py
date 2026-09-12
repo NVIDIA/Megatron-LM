@@ -47,6 +47,7 @@ from megatron.core.utils import nvtx_range_pop, nvtx_range_push
 
 from . import csa_indexer_loss_kernels, thd_indexer_kernels, thd_layout_kernels
 from .csa_teacher_lse import can_use_fused_csa_teacher_lse, fused_csa_teacher_lse
+from .thd_utils import batch_of_row
 
 # ---------------------------------------------------------------------------
 # Lazy kernel imports
@@ -760,37 +761,6 @@ def _ensure_dsa_namespace():
 # ---------------------------------------------------------------------------
 
 
-def batch_of_row(cu_seqlens_q: Tensor, total_q: Optional[int] = None) -> Tensor:
-    """For a THD-packed query of length ``total_q``, return a ``(total_q,)``
-    int64 tensor where entry ``i`` is the index of the segment that owns
-    query row ``i`` (i.e. the unique ``b`` with
-    ``cu_seqlens_q[b] <= i < cu_seqlens_q[b+1]``).
-
-    When ``total_q`` exceeds ``cu_seqlens_q[-1]`` (e.g. after
-    ``pad_thd_for_cuda_graph`` pads token tensors to a static capacity),
-    orphan rows are clamped to the last segment so the returned indices
-    are always in ``[0, B-1]`` and never cause OOB on per-segment arrays.
-
-    Used by every helper that needs to translate between per-row indices
-    and per-segment cumulative tensors.
-
-    Args:
-        cu_seqlens_q: ``(B+1,)`` int — cumulative Q lengths.
-        total_q: optional row count override; defaults to
-            ``int(cu_seqlens_q[-1].item())`` (forces a GPU→CPU sync).
-
-    Returns:
-        ``(total_q,)`` int64.
-    """
-    if total_q is None:
-        total_q = int(cu_seqlens_q[-1].item())
-    num_sequences = cu_seqlens_q.shape[0] - 1
-    row_idx = torch.arange(total_q, device=cu_seqlens_q.device, dtype=torch.int64)
-    return torch.bucketize(row_idx, cu_seqlens_q[1:], right=True).clamp(
-        max=max(num_sequences - 1, 0)
-    )
-
-
 def _teacher_lse_chunk_rows(
     num_rows: int, batch: int, heads: int, keys: int, extra_bytes_per_row: int = 0
 ) -> int:
@@ -1362,6 +1332,47 @@ def _validate_kv_reconstruction_parts(
         )
 
 
+def _csa_bwd_cudnn(
+    q: Tensor,
+    kv: Tensor,
+    out: Tensor,
+    grad_out: Tensor,
+    lse: Tensor,
+    attn_sink: Tensor,
+    topk_idxs: Tensor,
+    softmax_scale: float,
+    topk_length: Optional[Tensor] = None,
+    q_padding_mask: Optional[Tensor] = None,
+) -> Tuple[Tensor, Tensor, Tensor]:
+    """Run cuDNN backward without modifying shared compact indices or lengths.
+
+    Compact forward indices retain -1 in their unused suffix. cuDNN requires
+    non-negative addresses even in ignored slots, so sanitize a temporary only
+    when backward runs. Padding rows with zero valid keys must be identified by
+    q_padding_mask: cuDNN needs one harmless address and finite LSE for those rows.
+    """
+    _ensure_dsa_namespace()
+    if topk_length is not None:
+        topk_idxs = topk_idxs.clamp_min(0)
+        if q_padding_mask is not None:
+            topk_length = topk_length.clamp_min(1)
+    if q_padding_mask is not None:
+        grad_out = grad_out.masked_fill(q_padding_mask[:, None, None], 0)
+        lse = lse.masked_fill(q_padding_mask[:, None], 0)
+    result = _DSA.sparse_attention_backward_wrapper(
+        q,
+        kv,
+        out,
+        grad_out.contiguous(),
+        lse,
+        attn_sink,
+        topk_idxs,
+        softmax_scale=softmax_scale,
+        topk_length=topk_length,
+    )
+    return result["dq"], result["dkv"], result["d_sink"]
+
+
 class CSASparseAttnFunc(torch.autograd.Function):
     """Sparse attention fwd + bwd on flat tensors.
 
@@ -1380,6 +1391,7 @@ class CSASparseAttnFunc(torch.autograd.Function):
         softmax_scale: float,
         indexer_topk: int,
         kv_reconstruction_parts: Tuple[Tensor, Tensor, Tensor] | None = None,
+        q_padding_mask: Optional[Tensor] = None,
     ) -> Tuple[Tensor, Tensor, Optional[Tensor]]:
         """Run FlashMLA sparse-attention forward and save tensors for backward."""
         out, lse, lse_indexer = _csa_fwd_flash_mla(
@@ -1400,13 +1412,12 @@ class CSASparseAttnFunc(torch.autograd.Function):
             ctx.save_for_backward(q, kv, attn_sink, topk_idxs, out, lse)
         ctx.softmax_scale = softmax_scale
         ctx.topk_length = topk_length
+        ctx.q_padding_mask = q_padding_mask
         return out, lse, lse_indexer
 
     @staticmethod
     def backward(ctx, dO, d_lse, d_lse_indexer):
         """Compute sparse-attention backward via cuDNN DSA wrapper."""
-        _ensure_dsa_namespace()
-
         if ctx.reconstruct_kv_for_backward:
             q, boundary_kv, local_kv, compressed_kv, attn_sink, topk_idxs, out, lse = (
                 ctx.saved_tensors
@@ -1415,7 +1426,7 @@ class CSASparseAttnFunc(torch.autograd.Function):
         else:
             q, kv, attn_sink, topk_idxs, out, lse = ctx.saved_tensors
 
-        result = _DSA.sparse_attention_backward_wrapper(
+        dq, dkv, d_sink = _csa_bwd_cudnn(
             q,
             kv,
             out,
@@ -1425,9 +1436,9 @@ class CSASparseAttnFunc(torch.autograd.Function):
             topk_idxs,
             softmax_scale=ctx.softmax_scale,
             topk_length=ctx.topk_length,
+            q_padding_mask=ctx.q_padding_mask,
         )
-        dq, dkv, d_sink = result["dq"], result["dkv"], result["d_sink"]
-        return dq, dkv, d_sink, None, None, None, None, None
+        return dq, dkv, d_sink, None, None, None, None, None, None
 
 
 def csa_sparse_attn(
@@ -1440,6 +1451,7 @@ def csa_sparse_attn(
     indexer_topk: int = 0,
     is_thd: bool = False,
     kv_reconstruction_parts: Tuple[Tensor, Tensor, Tensor] | None = None,
+    q_padding_mask: Optional[Tensor] = None,
 ) -> Tensor:
     """Sparse attention (Path A / Path C step 2).
 
@@ -1464,6 +1476,8 @@ def csa_sparse_attn(
         softmax_scale: scalar float.
         topk_length: ``(rows,)`` int32 — optional compact fast-path. Must be
             ``None`` when ``indexer_topk > 0`` (FlashMLA constraint).
+        q_padding_mask: ``(rows,)`` bool in flat query order; True excludes a
+            padding row from backward. Required for zero-length compact rows.
         indexer_topk: int; ``0`` for Paths A/C, positive for Path B.
         is_thd: when True, treat ``query`` and ``kv`` as already-packed
             THD tensors and skip the SBHD reshape steps.
@@ -1510,6 +1524,7 @@ def csa_sparse_attn(
         softmax_scale,
         indexer_topk,
         kv_reconstruction_parts,
+        q_padding_mask,
     )  # (rows, np, d_v)
 
     # Layout-specific output reshape: collapse (np, d_v) → (np * d_v),

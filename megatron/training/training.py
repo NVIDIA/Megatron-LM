@@ -3678,9 +3678,13 @@ def training_log(
             total_loss_dict=total_loss_dict,
             num_layers=args.num_layers + (args.mtp_num_layers or 0),
             num_indexer_layers=(
-                sum(ratio == 4 for ratio in args.csa_compress_ratios)
-                if args.csa_compress_ratios is not None
-                else None
+                len(args.csa2_index_source_layers)
+                if getattr(args, "dsv4_version", None) == "v4.1"
+                else (
+                    sum(ratio == 4 for ratio in args.csa_compress_ratios)
+                    if args.csa_compress_ratios is not None
+                    else None
+                )
             ),
             preserve_groups=args.cuda_graph_impl != "none",
         )

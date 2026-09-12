@@ -10,6 +10,8 @@ from typing import TYPE_CHECKING, Any, Dict, Optional, Protocol, Union
 
 if TYPE_CHECKING:
     from megatron.core.tensor_parallel.random import MHCCheckpointManager
+    from megatron.core.transformer.experimental_attention_variant.csa2 import CSA2State
+    from megatron.core.transformer.hyper_connection import SinglePassMHCState
 
 import torch
 import torch.distributed
@@ -633,6 +635,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         mhc_recompute_manager: Optional['MHCCheckpointManager'] = None,
         *,
         inference_params: Optional[Any] = None,
+        csa2_state: CSA2State | None = None,
     ):
         """Run input norm + self-attention and return the raw output before BDA."""
         inference_context = deprecate_inference_params(inference_context, inference_params)
@@ -685,6 +688,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             attention_bias=attention_bias,
             packed_seq_params=packed_seq_params,
             sequence_len_offset=sequence_len_offset,
+            **({"csa2_state": csa2_state} if csa2_state is not None else {}),
         )
         nvtx_range_pop(suffix="self_attention")
 
@@ -713,6 +717,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         input_ids: Optional[Tensor] = None,
         *,
         inference_params: Optional[Any] = None,
+        csa2_state: CSA2State | None = None,
     ):
         """
         Perform a forward pass through the attention layer and the layernorms before and after
@@ -789,6 +794,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             attention_bias=attention_bias,
             packed_seq_params=packed_seq_params,
             sequence_len_offset=sequence_len_offset,
+            **({"csa2_state": csa2_state} if csa2_state is not None else {}),
         )
         nvtx_range_pop(suffix="self_attention")
 
@@ -2149,6 +2155,7 @@ class HyperConnectionTransformerLayer(TransformerLayer):
             input_ids=kwargs.get("input_ids", None),
             packed_seq_params=kwargs.get("packed_seq_params", None),
             mhc_recompute_manager=mhc_recompute_manager,
+            **({"mhc_state": kwargs["mhc_state"]} if kwargs.get("mhc_state") is not None else {}),
         )
         return output, context
 
@@ -2288,6 +2295,8 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         mhc_recompute_manager: Optional['MHCCheckpointManager'] = None,
         *,
         inference_params: Optional[Any] = None,
+        csa2_state: CSA2State | None = None,
+        mhc_state: SinglePassMHCState | None = None,
     ):
         """Forward attention with hyper connection pre/post processing on self-attention."""
         inference_context = deprecate_inference_params(inference_context, inference_params)
@@ -2295,7 +2304,9 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         nvtx_range_push(suffix="self_attention_hyper_connection")
         hidden_states, self_attn_h_res, self_attn_hc_h_post, residual = (
             self.self_attention_hyper_connection(
-                hidden_states, mhc_recompute_manager=mhc_recompute_manager
+                hidden_states,
+                mhc_recompute_manager=mhc_recompute_manager,
+                **({"mhc_state": mhc_state} if mhc_state is not None else {}),
             )
         )
         nvtx_range_pop(suffix="self_attention_hyper_connection")
@@ -2330,6 +2341,7 @@ class HyperConnectionTransformerLayer(TransformerLayer):
             attention_bias=attention_bias,
             packed_seq_params=packed_seq_params,
             sequence_len_offset=sequence_len_offset,
+            **({"csa2_state": csa2_state} if csa2_state is not None else {}),
         )
         nvtx_range_pop(suffix="self_attention")
 
@@ -2383,6 +2395,7 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         input_ids=None,
         packed_seq_params: Optional[PackedSeqParams] = None,
         mhc_recompute_manager: Optional['MHCCheckpointManager'] = None,
+        mhc_state: SinglePassMHCState | None = None,
     ):
         """Forward MLP with hyper connection pre/post processing."""
         is_last_in_recompute_block = bool(
@@ -2393,7 +2406,9 @@ class HyperConnectionTransformerLayer(TransformerLayer):
 
         nvtx_range_push(suffix="mlp_hyper_connection")
         hidden_states, mlp_h_res, mlp_hc_h_post, residual = self.mlp_hyper_connection(
-            hidden_states, mhc_recompute_manager=mhc_recompute_manager
+            hidden_states,
+            mhc_recompute_manager=mhc_recompute_manager,
+            **({"mhc_state": mhc_state} if mhc_state is not None else {}),
         )
         nvtx_range_pop(suffix="mlp_hyper_connection")
         # mHC aggregation upcasts the single-stream MLP input to fp32 for numerical

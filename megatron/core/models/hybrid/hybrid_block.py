@@ -9,7 +9,7 @@ import copy
 import warnings
 from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 import torch
 from torch import Tensor, nn
@@ -32,6 +32,7 @@ from megatron.core.transformer.cuda_graphs import annotate_first_last_layer
 from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.hyper_connection import (
     HyperConnectionModule,
+    SinglePassMHCState,
     learned_output_contract,
 )
 from megatron.core.transformer.identity_op import IdentityOp
@@ -50,6 +51,9 @@ from megatron.core.transformer.utils import (
     sharded_state_dict_default,
 )
 from megatron.core.utils import WrappedTensor, deprecate_inference_params, make_viewless_tensor
+
+if TYPE_CHECKING:
+    from megatron.core.transformer.experimental_attention_variant.csa2 import CSA2State
 
 
 @dataclass
@@ -81,6 +85,9 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
     the layer delta back through mHC expansion. The expansion path intentionally
     uses zero additional dropout because the wrapped hybrid layer has already
     applied its local dropout/residual update before the delta is computed.
+
+    Single-pass mHC requires one wrapper per attention or FFN sublayer;
+    a complete Transformer layer must be represented by two split wrappers.
 
     Checkpoint compatibility: this is a *wrapper* (the inner layer is held as
     `self.inner_layer`), so wrapped-layer state_dict keys are nested under
@@ -122,6 +129,16 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
 
     def __init__(self, config: TransformerConfig, layer: MegatronModule) -> None:
         super().__init__(config=config)
+        if config.mhc_single_pass and (
+            not isinstance(layer, TransformerLayer)
+            or not isinstance(layer.cross_attention, IdentityOp)
+            or isinstance(layer.self_attention, IdentityOp) == isinstance(layer.mlp, IdentityOp)
+        ):
+            raise ValueError(
+                "Single-pass mHC requires an attention-only or FFN-only "
+                "TransformerLayer in each Hybrid wrapper. Split attention and FFN "
+                "into separate layers (for example, the DSv4 'DE' pattern)."
+            )
         if (
             config.cuda_graph_impl in ("transformer_engine", "full_iteration")
             and config.recompute_granularity == "selective"
@@ -526,6 +543,7 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
         packed_seq_params: Optional[PackedSeqParams],
         padding_mask: Optional[Tensor],
         input_ids: Optional[Tensor] = None,
+        csa2_state: "CSA2State | None" = None,
     ) -> Tuple[Tensor, Optional[Tensor]]:
         # When this wrapper is itself being CUDA-graph captured, the inner layer
         # must run as a plain forward: routing through its ``__call__`` would
@@ -548,6 +566,7 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
                 padding_mask=padding_mask,
                 input_ids=input_ids,
                 _called_from_hybrid_mhc_wrapper=True,
+                **({"csa2_state": csa2_state} if csa2_state is not None else {}),
             )
         else:
             # Non-transformer layers (e.g. MambaLayer; GatedDeltaNet which does
@@ -579,6 +598,7 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
         padding_mask: Optional[Tensor],
         input_ids: Optional[Tensor] = None,
         mhc_recompute_manager: Optional[MHCCheckpointManager] = None,
+        csa2_state: "CSA2State | None" = None,
     ) -> Optional[Tuple[Tuple[Tensor, Optional[Tensor]], Optional[Tensor], float, bool]]:
         """Return a raw TransformerLayer branch output when the wrapped layer is split.
 
@@ -611,6 +631,7 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
                     packed_seq_params=packed_seq_params,
                     sequence_len_offset=sequence_len_offset,
                     mhc_recompute_manager=mhc_recompute_manager,
+                    **({"csa2_state": csa2_state} if csa2_state is not None else {}),
                 )
             )
             output_with_bias = layer._group_offload_output_with_bias(
@@ -650,6 +671,8 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
         padding_mask: Optional[Tensor] = None,
         input_ids: Optional[Tensor] = None,
         mhc_recompute_manager=None,
+        csa2_state: "CSA2State | None" = None,
+        mhc_state: SinglePassMHCState | None = None,
     ) -> Tuple[Tensor, Optional[Tensor]]:
         """Run the wrapped hybrid layer through one layer-boundary mHC update.
 
@@ -663,7 +686,9 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
             mhc_recompute_manager = getattr(self, '_mhc_recompute_manager', None)
 
         aggregated, h_res, h_post, residual = self.hyper_connection(
-            hidden_states, mhc_recompute_manager=mhc_recompute_manager
+            hidden_states,
+            mhc_recompute_manager=mhc_recompute_manager,
+            **({"mhc_state": mhc_state} if mhc_state is not None else {}),
         )
         fast_path_result = self._call_inner_transformer_layer_without_local_bda(
             aggregated,
@@ -675,6 +700,7 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
             padding_mask,
             input_ids,
             mhc_recompute_manager=mhc_recompute_manager,
+            csa2_state=csa2_state,
         )
 
         if fast_path_result is None:
@@ -687,6 +713,7 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
                 packed_seq_params,
                 padding_mask,
                 input_ids,
+                csa2_state=csa2_state,
             )
             # The inner hybrid layer already applied its own local residual/dropout, so
             # it returns `aggregated + f(aggregated)`. We feed only the function
@@ -972,7 +999,14 @@ class HybridStack(MegatronModule):
         # no longer calls `learned_output_contract` there (MTP owns that), so these
         # params would be orphaned and break DDP's per-param grad-ready accounting
         # with a `len(per_param_grad_ready_counts) != len(params)` AssertionError.
-        if self.config.enable_hyper_connections and self.post_process and not self.is_mtp_layer:
+        # Single-pass mHC contracts with the final sublayer's pre-mix instead of learning
+        # a separate output contraction.
+        if (
+            self.config.enable_hyper_connections
+            and self.post_process
+            and not self.is_mtp_layer
+            and not self.config.mhc_single_pass
+        ):
             hc_mult = self.config.num_residual_streams
             hc_dim = self.config.hidden_size * hc_mult
             self.hc_head_fn = mark_keep_in_fp32(nn.Parameter(torch.randn(hc_mult, hc_dim)))
@@ -1140,6 +1174,20 @@ class HybridStack(MegatronModule):
                 hidden_states, self.config.num_residual_streams
             )
 
+        csa2_kwargs = {}
+        mhc_state = None
+        if (
+            self.config.experimental_attention_variant == "dsv4_hybrid"
+            and self.config.dsv4_version == "v4.1"
+        ):
+            from megatron.core.transformer.experimental_attention_variant.csa2 import CSA2State
+
+            csa2_kwargs["csa2_state"] = CSA2State()
+        if self.config.mhc_single_pass:
+            # The split attention/FFN wrappers share one pre-mix chain for
+            # this forward; a later forward must start with the identity mix.
+            mhc_state = SinglePassMHCState()
+
         if inference_context and inference_context.is_static_batching():
             # NOTE(bnorick): match BaseInferenceContext attributes for
             # mamba_ssm.utils.generation.BaseInferenceContext,
@@ -1240,7 +1288,10 @@ class HybridStack(MegatronModule):
                                 sequence_len_offset=sequence_len_offset,
                                 packed_seq_params=packed_seq_params,
                                 padding_mask=padding_mask,
+                                **csa2_kwargs,
                             )
+                            if mhc_state is not None:
+                                layer_kwargs["mhc_state"] = mhc_state
                             if input_ids is not None:
                                 layer_kwargs["input_ids"] = input_ids
                             if mhc_manager is not None and isinstance(
@@ -1287,14 +1338,21 @@ class HybridStack(MegatronModule):
         if self.config.enable_hyper_connections and self.post_process and not self.is_mtp_layer:
             if (self.config.mtp_num_layers or 0) > 0:
                 mhc_multistream = hidden_states
-            hidden_states = learned_output_contract(
-                hidden_states,
-                self.hc_head_fn,
-                self.hc_head_base,
-                self.hc_head_scale,
-                self.config.num_residual_streams,
-                self.config.layernorm_epsilon,
-            )
+            if mhc_state is not None:
+                hidden_states = mhc_state.contract(
+                    hidden_states,
+                    self.config.num_residual_streams,
+                    use_fused=self.config.use_fused_mhc,
+                )
+            else:
+                hidden_states = learned_output_contract(
+                    hidden_states,
+                    self.hc_head_fn,
+                    self.hc_head_base,
+                    self.hc_head_scale,
+                    self.config.num_residual_streams,
+                    self.config.layernorm_epsilon,
+                )
 
         # Final layer norm.
         if self.post_process and self.post_layer_norm:

@@ -7,7 +7,6 @@ import pytest
 import torch
 import torch.distributed as dist
 from packaging import version
-from pytest_mock import mocker
 
 import megatron.core.pipeline_parallel.schedules as schedule
 from megatron.core import ModelParallelConfig
@@ -158,22 +157,27 @@ def test_dsa_indexer_loss_scale_accepts_dict_output_tensor():
     )
 
 
-def test_dsa_indexer_loss_scale_defaults_from_variant_without_mutating_config():
+@pytest.mark.parametrize("variant,model_version", [("dsa", None), ("dsv4_hybrid", "v4.1")])
+@pytest.mark.parametrize("calculate_per_token_loss,expected_scale", [(False, 3.5), (True, 7.0)])
+def test_dsa_indexer_loss_scale_defaults_from_variant_without_mutating_config(
+    monkeypatch, variant, model_version, calculate_per_token_loss, expected_scale
+):
     from megatron.core.transformer.experimental_attention_variant.dsa import (
         DSAIndexerLossAutoScaler,
     )
 
     config = SimpleNamespace(
-        calculate_per_token_loss=True,
+        calculate_per_token_loss=calculate_per_token_loss,
         experimental_attention_variant_loss_scale_func=None,
-        experimental_attention_variant='dsa',
+        experimental_attention_variant=variant,
+        dsv4_version=model_version,
         grad_scale_func=lambda tensor: tensor * 7.0,
         num_moe_experts=None,
         mtp_num_layers=None,
         timers=None,
     )
 
-    DSAIndexerLossAutoScaler.main_loss_backward_scale = None
+    monkeypatch.setattr(DSAIndexerLossAutoScaler, "main_loss_backward_scale", None)
     schedule.forward_step_calc_loss(
         model=None,
         output_tensor=torch.tensor(8.0),
@@ -183,14 +187,40 @@ def test_dsa_indexer_loss_scale_defaults_from_variant_without_mutating_config():
         collect_non_loss_data=False,
         num_microbatches=2,
         forward_data_store=[],
-        cp_group_size=4,
+        cp_group_size=1,
         is_last_stage=True,
     )
 
     assert config.experimental_attention_variant_loss_scale_func is None
     torch.testing.assert_close(
-        DSAIndexerLossAutoScaler.main_loss_backward_scale, torch.tensor([7.0])
+        DSAIndexerLossAutoScaler.main_loss_backward_scale, torch.tensor([expected_scale])
     )
+    # The selected hook must affect the attached auxiliary backward, not the main edge.
+    output = torch.tensor(2.0, requires_grad=True)
+    indexer_loss = torch.tensor(5.0, requires_grad=True)
+    DSAIndexerLossAutoScaler.apply(output, indexer_loss).backward()
+    torch.testing.assert_close(output.grad, torch.tensor(1.0))
+    torch.testing.assert_close(indexer_loss.grad, torch.tensor(expected_scale))
+
+
+@pytest.mark.parametrize("model_version", [None, "v4"])
+def test_dsv4_indexer_loss_scale_default_is_unchanged(model_version):
+    config = SimpleNamespace(
+        experimental_attention_variant="dsv4_hybrid", dsv4_version=model_version
+    )
+    assert schedule._get_experimental_attention_variant_loss_scale_func(config) is None
+
+
+def test_dsv41_indexer_loss_scale_explicit_hook_takes_precedence():
+    def loss_scale_hook(scale):
+        return scale
+
+    config = SimpleNamespace(
+        experimental_attention_variant="dsv4_hybrid",
+        dsv4_version="v4.1",
+        experimental_attention_variant_loss_scale_func=loss_scale_hook,
+    )
+    assert schedule._get_experimental_attention_variant_loss_scale_func(config) is loss_scale_hook
 
 
 @pytest.mark.internal

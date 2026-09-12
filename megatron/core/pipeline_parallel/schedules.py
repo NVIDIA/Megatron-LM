@@ -277,7 +277,10 @@ def _get_experimental_attention_variant_loss_scale_func(config):
     if loss_scale_func is not None:
         return loss_scale_func
 
-    if getattr(config, 'experimental_attention_variant', None) == 'dsa':
+    variant = getattr(config, 'experimental_attention_variant', None)
+    if variant == 'dsa' or (
+        variant == 'dsv4_hybrid' and getattr(config, 'dsv4_version', None) == 'v4.1'
+    ):
         from megatron.core.transformer.experimental_attention_variant.dsa import (
             DSAIndexerLossAutoScaler,
         )

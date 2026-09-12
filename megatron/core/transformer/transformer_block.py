@@ -27,6 +27,7 @@ from megatron.core.transformer.cuda_graphs import annotate_first_last_layer
 from megatron.core.transformer.enums import InferenceCudaGraphScope, LayerType
 from megatron.core.transformer.hyper_connection import (
     HyperConnectionModule,
+    SinglePassMHCState,
     learned_output_contract,
 )
 from megatron.core.transformer.module import (
@@ -397,7 +398,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                 hidden_size=self.config.hidden_size,
                 eps=self.config.layernorm_epsilon,
             )
-            if self.config.enable_hyper_connections:
+            if self.config.enable_hyper_connections and not self.config.mhc_single_pass:
                 hc_mult = self.config.num_residual_streams
                 hc_dim = self.config.hidden_size * hc_mult
                 self.hc_head_fn = mark_keep_in_fp32(nn.Parameter(torch.randn(hc_mult, hc_dim)))
@@ -487,6 +488,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         *,
         extract_layer_indices: Optional[Set[int]] = None,
         return_mhc_multistream: bool = False,
+        mhc_state: SinglePassMHCState | None = None,
     ) -> Union[Tensor, Tuple[Tensor, Optional[Tensor]]]:
         """Apply TransformerBlock exit processing shared by normal and scheduled forward paths.
 
@@ -500,6 +502,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                 extraction is not supported when mHC and MTP are both enabled.
             return_mhc_multistream: Whether to return the pre-contraction mHC streams together with
                 the processed hidden states.
+            mhc_state: Forward-local single-pass mHC coefficients for final contraction.
 
         Returns:
             The processed hidden states. If ``return_mhc_multistream`` is true, returns a tuple of
@@ -520,16 +523,24 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                         len(extract_layer_indices) == 0
                     ), "Feature extraction is not supported with mHC + MTP."
                 mhc_multistream = hidden_states
-            # DSv4 introduced the new output contraction for mHC.
-            # [s, b, n*C] -> [s, b, C]
-            hidden_states = learned_output_contract(
-                hidden_states,
-                self.hc_head_fn,
-                self.hc_head_base,
-                self.hc_head_scale,
-                self.config.num_residual_streams,
-                self.config.layernorm_epsilon,
-            )
+            # Single-pass mHC consumes the last FFN's mix instead of learning a separate head.
+            if self.config.mhc_single_pass:
+                if mhc_state is None:
+                    raise ValueError("Single-pass mHC final contraction requires mhc_state")
+                hidden_states = mhc_state.contract(
+                    hidden_states,
+                    self.config.num_residual_streams,
+                    use_fused=self.config.use_fused_mhc,
+                )
+            else:
+                hidden_states = learned_output_contract(
+                    hidden_states,
+                    self.hc_head_fn,
+                    self.hc_head_base,
+                    self.hc_head_scale,
+                    self.config.num_residual_streams,
+                    self.config.layernorm_epsilon,
+                )
 
         # Final layer norm.
         if self.final_layernorm is not None:
@@ -925,6 +936,20 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
 
         hidden_states = self.preprocess_for_layer_schedule(hidden_states)
 
+        # Share CSA2 activations and single-pass mHC mixes only within this forward.
+        shared_state_kwargs = {}
+        mhc_state = None
+        if (
+            self.config.experimental_attention_variant == "dsv4_hybrid"
+            and self.config.dsv4_version == "v4.1"
+        ):
+            from megatron.core.transformer.experimental_attention_variant.csa2 import CSA2State
+
+            shared_state_kwargs["csa2_state"] = CSA2State()
+        if self.config.mhc_single_pass:
+            mhc_state = SinglePassMHCState()
+            shared_state_kwargs["mhc_state"] = mhc_state
+
         if self.config.sequence_parallel:
             rng_context = tensor_parallel.get_cuda_rng_tracker().fork()
         else:
@@ -1028,6 +1053,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                             padding_mask=padding_mask,
                             mhc_recompute_manager=mhc_manager,
                             input_ids=input_ids,
+                            **shared_state_kwargs,
                         )
                     self._finalize_mhc_recompute_layer(
                         mhc_manager=mhc_manager,
@@ -1047,7 +1073,10 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                         intermediate_hidden_states.append(hidden_states)
 
         hidden_states, mhc_multistream = self.postprocess_for_layer_schedule(
-            hidden_states, extract_layer_indices=extract_layer_indices, return_mhc_multistream=True
+            hidden_states,
+            extract_layer_indices=extract_layer_indices,
+            return_mhc_multistream=True,
+            mhc_state=mhc_state,
         )
 
         if len(extract_layer_indices) > 0:

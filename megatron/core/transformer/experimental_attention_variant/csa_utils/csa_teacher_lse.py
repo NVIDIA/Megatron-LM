@@ -48,7 +48,8 @@ if _TRITON_AVAILABLE:
         BLOCK_K: tl.constexpr,
     ):
         """Compute ``log(exp(sink) + sum_window(exp(q @ k * scale)))``."""
-        query_row = tl.program_id(0)
+        # Flattened H64/D512 queries exceed int32 element offsets after 64K rows.
+        query_row = tl.program_id(0).to(tl.int64)
         head_block = tl.program_id(1)
 
         head_offsets = head_block * BLOCK_H + tl.arange(0, BLOCK_H)
@@ -77,7 +78,7 @@ if _TRITON_AVAILABLE:
                 other=-1,
             )
             valid_keys = index_mask & (global_indices >= 0) & (global_indices < total_kv)
-            safe_indices = tl.where(valid_keys, global_indices, 0)
+            safe_indices = tl.where(valid_keys, global_indices, 0).to(tl.int64)
 
             k_offsets = dim_offsets[:, None] * stride_kv_dim + safe_indices[None, :] * stride_kv_row
             k = tl.load(
@@ -132,8 +133,10 @@ if _TRITON_AVAILABLE:
     ):
         """Add the causal compressed-key mass for fixed-shape SBHD input."""
         query_blocks = tl.cdiv(seqlen_q, BLOCK_Q)
-        batch = tl.program_id(0) // query_blocks
-        query_block = tl.program_id(0) % query_blocks
+        # Promote before applying batch/head/dimension strides to physical rows.
+        program = tl.program_id(0).to(tl.int64)
+        batch = program // query_blocks
+        query_block = program % query_blocks
         head_block = tl.program_id(1)
 
         row_offsets = tl.arange(0, BLOCK_Q * BLOCK_H)
@@ -162,7 +165,7 @@ if _TRITON_AVAILABLE:
         visible_keys = (query_offsets + 1) // ratio
 
         for key_start in range(0, seqlen_k, BLOCK_K):
-            key_offsets = key_start + tl.arange(0, BLOCK_K)
+            key_offsets = (key_start + tl.arange(0, BLOCK_K)).to(tl.int64)
             key_mask = key_offsets < seqlen_k
             k_offsets = (
                 batch * stride_k_batch
@@ -232,9 +235,10 @@ if _TRITON_AVAILABLE:
         query_block = tl.program_id(0) % query_blocks
         head_block = tl.program_id(1)
 
-        query_start = tl.load(cu_seqlens_q + sequence)
+        # Packed sequence prefixes may address storage beyond 2**31 elements.
+        query_start = tl.load(cu_seqlens_q + sequence).to(tl.int64)
         query_end = tl.load(cu_seqlens_q + sequence + 1)
-        key_start_offset = tl.load(cu_seqlens_k + sequence)
+        key_start_offset = tl.load(cu_seqlens_k + sequence).to(tl.int64)
         key_end_offset = tl.load(cu_seqlens_k + sequence + 1)
         query_length = query_end - query_start
         key_length = key_end_offset - key_start_offset
@@ -326,6 +330,58 @@ def can_use_fused_csa_teacher_lse(
 
 
 @torch.no_grad()
+def fused_csa_window_lse(
+    query: Tensor, full_kv: Tensor, attn_sink: Tensor, window_indices: Tensor, softmax_scale: float
+) -> Tensor:
+    """Compute the detached window-plus-sink denominator in flat physical rows.
+
+    Shared by V4's dense teacher and V4.1's candidate-aware teacher. This
+    component does not depend on compression or the selected global keys.
+    """
+    if not can_use_fused_csa_teacher_lse(query, full_kv, full_kv, attn_sink, window_indices):
+        raise ValueError("unsupported tensor layout or dtype for fused CSA window LSE")
+    total_q, num_heads, head_dim = query.shape
+    block_d = max(16, triton.next_power_of_2(head_dim))
+    window_block_h = min(128, max(16, triton.next_power_of_2(num_heads)))
+    window_block_k = min(64, max(16, triton.next_power_of_2(max(1, window_indices.shape[1]))))
+    window_num_stages = 1 if window_block_h == 128 and block_d == 512 else 2
+    non_compressed_lse = torch.empty((total_q, num_heads), device=query.device, dtype=torch.float32)
+    window_grid = (total_q, triton.cdiv(num_heads, window_block_h))
+    if total_q == 0:
+        return non_compressed_lse
+    with torch.cuda.device(query.device):
+        _csa_window_lse_kernel[window_grid](
+            query,
+            full_kv,
+            window_indices,
+            attn_sink,
+            non_compressed_lse,
+            query.stride(0),
+            query.stride(1),
+            query.stride(2),
+            full_kv.stride(0),
+            full_kv.stride(1),
+            window_indices.stride(0),
+            window_indices.stride(1),
+            attn_sink.stride(0),
+            non_compressed_lse.stride(0),
+            non_compressed_lse.stride(1),
+            softmax_scale,
+            num_heads,
+            head_dim,
+            full_kv.shape[0],
+            window_indices.shape[1],
+            BLOCK_H=window_block_h,
+            BLOCK_D=block_d,
+            BLOCK_K=window_block_k,
+            num_warps=8,
+            num_stages=window_num_stages,
+        )
+
+    return non_compressed_lse
+
+
+@torch.no_grad()
 def fused_csa_teacher_lse(
     query: Tensor,
     full_kv: Tensor,
@@ -356,44 +412,11 @@ def fused_csa_teacher_lse(
 
     total_q, num_heads, head_dim = query.shape
     block_d = max(16, triton.next_power_of_2(head_dim))
-    window_block_h = min(128, max(16, triton.next_power_of_2(num_heads)))
-    window_block_k = min(64, max(16, triton.next_power_of_2(max(1, window_indices.shape[1]))))
-    window_num_stages = 1 if window_block_h == 128 and block_d == 512 else 2
-    compressed_block_h = 16
-    compressed_block_k = 32
-    compressed_block_q = 8
-
-    non_compressed_lse = torch.empty((total_q, num_heads), device=query.device, dtype=torch.float32)
-    window_grid = (total_q, triton.cdiv(num_heads, window_block_h))
+    compressed_block_h, compressed_block_k, compressed_block_q = 16, 32, 8
+    non_compressed_lse = fused_csa_window_lse(
+        query, full_kv, attn_sink, window_indices, softmax_scale
+    )
     with torch.cuda.device(query.device):
-        _csa_window_lse_kernel[window_grid](
-            query,
-            full_kv,
-            window_indices,
-            attn_sink,
-            non_compressed_lse,
-            query.stride(0),
-            query.stride(1),
-            query.stride(2),
-            full_kv.stride(0),
-            full_kv.stride(1),
-            window_indices.stride(0),
-            window_indices.stride(1),
-            attn_sink.stride(0),
-            non_compressed_lse.stride(0),
-            non_compressed_lse.stride(1),
-            softmax_scale,
-            num_heads,
-            head_dim,
-            full_kv.shape[0],
-            window_indices.shape[1],
-            BLOCK_H=window_block_h,
-            BLOCK_D=block_d,
-            BLOCK_K=window_block_k,
-            num_warps=8,
-            num_stages=window_num_stages,
-        )
-
         if cu_seqlens_q is None:
             if batch_size is None or seqlen_q is None:
                 raise ValueError("SBHD fused CSA teacher LSE requires batch_size and seqlen_q")

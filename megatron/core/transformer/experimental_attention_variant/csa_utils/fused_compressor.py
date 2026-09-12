@@ -1,11 +1,17 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Dispatch shim for the fused CSA/HCA ``Compressor`` gated-pooling kernels.
+"""Fused CSA/HCA and CSA2 compressor dispatch.
+
+CSA2 reuses the frontend's r2, coff=1 pooling with BF16 projections, FP32
+softmax/accumulation and zero APE. Its BF16 THD path projects the original token
+buffer, then gathers KV/gate and pools inside the frontend kernel, as in V4.
+The FP32 THD fallback gathers and masks hidden pairs before the Linear modules.
+The native path remains the reference for unsupported devices and dtypes.
 
 The fused forward+backward kernels live in the cudnn-frontend Python package
 (``cudnn.csa.compressor``, added in https://github.com/NVIDIA/cudnn-frontend/pull/427,
 following maintainer guidance on https://github.com/NVIDIA/Megatron-LM/pull/5984).
-This module contains only the framework-side wiring:
+The cuDNN pooling integration consists of:
 
   - an import guard that probes for the frontend's CSA compressor API by importing the
     concrete entry points (capability detection, no version comparisons — installs that
@@ -48,7 +54,7 @@ Dispatch gating (everything else keeps eager):
     gates the other optional CSA/DSA fused kernels (``Compressor.use_fused_compressor``);
   - cudnn-frontend with the CSA compressor API importable, CUDA device with
     compute-capability major >= 10 (SM100+, the frontend's validated envelope);
-  - ``compress_ratio in {4, 128}`` and ``coff in {1, 2}`` (the frontend's validated
+  - ``compress_ratio in {2, 4, 128}`` and ``coff in {1, 2}`` (the frontend's validated
     envelope; ``Compressor`` itself only produces ``(4, 2)`` and ``(128, 1)``), with
     ``compress_ratio == 128`` additionally restricted to ``head_dim in {128, 512}``
     (the r128 kernels' validated head dims); bf16 ``kv``/``score``, fp32 ``ape``, int32
@@ -69,6 +75,18 @@ from typing import Optional
 
 import torch
 
+from .thd_utils import CSA2THDCompressionLayout
+
+try:
+    import triton
+    import triton.language as tl
+
+    HAVE_TRITON = True
+except ImportError:
+    triton = None
+    tl = None
+    HAVE_TRITON = False
+
 logger = logging.getLogger(__name__)
 
 # The frontend kernels use no architecture-specific features beyond the SM100 baseline,
@@ -77,12 +95,12 @@ logger = logging.getLogger(__name__)
 # with it.
 _MINIMUM_COMPUTE_CAPABILITY_MAJOR = 10
 
-# Mirrors ``cudnn.csa.compressor``'s validated envelope: ``ratio in {4, 128}`` x
+# Mirrors ``cudnn.csa.compressor``'s validated envelope: ``ratio in {2, 4, 128}`` x
 # ``coff in {1, 2}``. ``Compressor`` currently only produces (4, 2) and (128, 1) --
 # ``overlap`` is derived from ``compress_ratio`` -- but the gate follows the kernels
 # rather than that derivation, so a future overlap-policy change keeps the fast path
 # instead of silently falling back to eager. Widen together with the frontend.
-_SUPPORTED_RATIOS = frozenset({4, 128})
+_SUPPORTED_RATIOS = frozenset({2, 4, 128})
 _SUPPORTED_COFF = frozenset({1, 2})
 # ratio 128 is served by the frontend's dedicated r128 kernels, validated for these
 # head dims.
@@ -287,3 +305,209 @@ def maybe_compress_thd_fused(
         total_comp,
     )
     return out.unsqueeze(1)
+
+
+if HAVE_TRITON:
+
+    @triton.jit
+    def _csa2_prepare_r2_kernel(
+        x,
+        sources,
+        valid,
+        output,
+        N: tl.constexpr,
+        HIDDEN: tl.constexpr,
+        STRIDE_T: tl.constexpr,
+        STRIDE_D: tl.constexpr,
+        BLOCK: tl.constexpr,
+    ):
+        offset = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+        row, dim = offset // HIDDEN, offset % HIDDEN
+        active = (offset < N) & tl.load(valid + row // 2, offset < N, other=False)
+        source = tl.load(sources + row, active, other=0)
+        # Mask the load, not just its result: NaN/Inf in padding must never reach GEMMs.
+        value = tl.load(x + source * STRIDE_T + dim * STRIDE_D, active, other=0.0)
+        tl.store(output + offset, value, offset < N)
+
+    @triton.jit
+    def _csa2_prepare_r2_backward_kernel(
+        grad, sources, valid, dx, N: tl.constexpr, HIDDEN: tl.constexpr, BLOCK: tl.constexpr
+    ):
+        offset = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+        row, dim = offset // HIDDEN, offset % HIDDEN
+        active = (offset < N) & tl.load(valid + row // 2, offset < N, other=False)
+        source = tl.load(sources + row, active, other=0)
+        value = tl.load(grad + offset, active, other=0.0)
+        # The layout partitions valid tokens into non-overlapping complete pairs.
+        tl.store(dx + source * HIDDEN + dim, value, active)
+
+
+class _CSA2PrepareR2(torch.autograd.Function):
+    """Gather complete THD pairs directly into the Linear input buffer."""
+
+    @staticmethod
+    def forward(ctx, x, sources, valid):
+        output = torch.empty((sources.numel(), 1, x.shape[-1]), device=x.device, dtype=x.dtype)
+        _csa2_prepare_r2_kernel[(triton.cdiv(output.numel(), 256),)](
+            x, sources, valid, output, output.numel(), x.shape[-1], x.stride(0), x.stride(2), 256
+        )
+        ctx.save_for_backward(sources, valid)
+        ctx.input_shape, ctx.input_dtype = x.shape, x.dtype
+        return output
+
+    @staticmethod
+    def backward(ctx, grad):
+        sources, valid = ctx.saved_tensors
+        dx = torch.zeros(ctx.input_shape, device=grad.device, dtype=ctx.input_dtype)
+        _csa2_prepare_r2_backward_kernel[(triton.cdiv(grad.numel(), 256),)](
+            grad.contiguous(), sources, valid, dx, grad.numel(), dx.shape[-1], 256
+        )
+        return dx, None, None
+
+
+def maybe_prepare_csa2_r2_fused(
+    x: torch.Tensor, layout: CSA2THDCompressionLayout, *, enabled: bool = True
+) -> torch.Tensor | None:
+    """Return grouped THD input in its original dtype, or None for native gather/mask.
+
+    ``layout`` must come from ``CSA2THDLayout.for_compression(2)``; in particular,
+    its valid source pairs are disjoint. No device metadata is read on the host.
+    """
+    if not enabled or not HAVE_TRITON or x.device.type != "cuda":
+        return None
+    if (
+        layout.ratio != 2
+        or layout.capacity == 0
+        or x.ndim != 3
+        or x.shape[1] != 1
+        or x.shape[-1] == 0
+        or x.dtype not in (torch.float32, torch.bfloat16)
+    ):
+        return None
+    if (
+        x.shape[0] != layout.total_tokens
+        or layout.source_indices.shape != (layout.capacity, 2)
+        or layout.valid_groups.shape != (layout.capacity,)
+        or layout.source_indices.device != x.device
+        or layout.valid_groups.device != x.device
+        or layout.source_indices.dtype != torch.int64
+        or layout.valid_groups.dtype != torch.bool
+        or not layout.source_indices.is_contiguous()
+        or not layout.valid_groups.is_contiguous()
+    ):
+        return None
+    return _CSA2PrepareR2.apply(x, layout.source_indices, layout.valid_groups)
+
+
+def maybe_compress_csa2_thd_fused(
+    kv: torch.Tensor,
+    gate: torch.Tensor,
+    cu_seqlens_padded: torch.Tensor,
+    layout: CSA2THDCompressionLayout,
+    *,
+    enabled: bool = True,
+) -> torch.Tensor | None:
+    """Gather and pool token-order BF16 projections through V4's THD frontend.
+
+    The caller projects sanitized hidden input with the original Linear modules.
+    Physical prefixes preserve gaps between sequences and odd physical tails;
+    ``valid_groups`` excludes logical padding before RMSNorm and clears incoming
+    gradients on those rows. Static output capacity is passed without a host read.
+    """
+    if (
+        not enabled
+        or layout.ratio != 2
+        or kv.ndim != 3
+        or kv.shape[1] != 1
+        or gate.shape != kv.shape
+        or gate.device != kv.device
+        or kv.dtype != torch.bfloat16
+        or gate.dtype != torch.bfloat16
+        or kv.device.type != "cuda"
+        or layout.capacity == 0
+        or layout.valid_groups.device != kv.device
+        or layout.cu_seqlens_padded.device != kv.device
+        or cu_seqlens_padded.device != kv.device
+        or cu_seqlens_padded.shape != layout.cu_seqlens_padded.shape
+    ):
+        return None
+    if not fused_compressor_available(kv.device) or torch.are_deterministic_algorithms_enabled():
+        return None
+    ape = torch.zeros((2, kv.shape[-1]), dtype=torch.float32, device=kv.device)
+    output = maybe_compress_thd_fused(
+        kv,
+        gate,
+        ape,
+        cu_seqlens_padded,
+        layout.cu_seqlens_padded,
+        layout.capacity,
+        ratio=2,
+        head_dim=kv.shape[-1],
+        coff=1,
+    )
+    if output is None:
+        return None
+    return output.masked_fill(~layout.valid_groups[:, None, None], 0)
+
+
+def maybe_pool_csa2_r2_fused(
+    kv: torch.Tensor,
+    gate: torch.Tensor,
+    output_dtype: torch.dtype,
+    *,
+    valid_groups: torch.Tensor | None = None,
+    enabled: bool = True,
+) -> torch.Tensor | None:
+    """Pool BF16 pairs through the existing cuDNN r2/coff=1 frontend.
+
+    Batch and channel are independent pooling columns, so folding them together
+    avoids a full SBHD-to-BSHD copy. APE is a constant zero buffer, not a parameter.
+    Invalid THD groups are masked at both boundaries, including incoming NaN grads.
+    Unsupported dtypes/devices and deterministic mode retain native pooling.
+    """
+    if not enabled or kv.device.type != "cuda":
+        return None
+    if (
+        kv.ndim != 3
+        or kv.numel() == 0
+        or kv.shape[0] % 2
+        or gate.shape != kv.shape
+        or gate.device != kv.device
+        or kv.dtype != torch.bfloat16
+        or gate.dtype != torch.bfloat16
+        or output_dtype != torch.bfloat16
+    ):
+        return None
+    if valid_groups is not None and (
+        valid_groups.shape != (kv.shape[0] // 2,)
+        or valid_groups.dtype != torch.bool
+        or valid_groups.device != kv.device
+    ):
+        return None
+    if not fused_compressor_available(kv.device) or torch.are_deterministic_algorithms_enabled():
+        return None
+    total, batch, dim = kv.shape
+    if valid_groups is not None:
+        invalid = ~valid_groups[:, None, None, None]
+        kv = kv.reshape(-1, 2, batch, dim).masked_fill(invalid, 0).reshape(total, batch, dim)
+        gate = gate.reshape(-1, 2, batch, dim).masked_fill(invalid, 0).reshape(total, batch, dim)
+    cu = torch.arange(2, dtype=torch.int32, device=kv.device) * total
+    cuc = cu // 2
+    ape = torch.zeros((2, batch * dim), dtype=torch.float32, device=kv.device)
+    output = maybe_compress_thd_fused(
+        kv.reshape(total, 1, batch * dim),
+        gate.reshape(total, 1, batch * dim),
+        ape,
+        cu,
+        cuc,
+        total // 2,
+        ratio=2,
+        head_dim=batch * dim,
+        coff=1,
+    )
+    if output is None:
+        return None
+    output = output.reshape(total // 2, batch, dim)
+    if valid_groups is not None:
+        output = output.masked_fill(~valid_groups[:, None, None], 0)
+    return output

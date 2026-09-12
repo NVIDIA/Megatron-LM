@@ -1551,7 +1551,8 @@ class TestDsaSparseAttn:
         assert torch.equal(attn_sink.grad, d_sink_kernel), "(b) attn_sink.grad mismatch"
         fake_dsa.sparse_attention_backward_wrapper.assert_called_once()
 
-    def test_thd_backward_reconstructs_kv_without_saving_concatenation(self, monkeypatch):
+    @pytest.mark.parametrize('compact', [False, True])
+    def test_thd_backward_reconstructs_kv_without_saving_concatenation(self, monkeypatch, compact):
         """THD backward rebuilds KV while gradients still use the original cat edge."""
         total_q, num_heads, head_dim = 4, 2, 3
         boundary_kv = torch.randn(1, head_dim, requires_grad=True)
@@ -1562,18 +1563,34 @@ class TestDsaSparseAttn:
         query = torch.randn(total_q, num_heads, head_dim, requires_grad=True)
         attn_sink = torch.randn(num_heads, requires_grad=True)
         topk_idxs = torch.zeros(total_q, 2, dtype=torch.int32)
+        topk_length = padding_mask = None
+        if compact:
+            topk_idxs[:, 1] = -1
+            topk_idxs[-1] = -1
+            topk_length = torch.tensor([1, 1, 1, 0], dtype=torch.int32)
+            padding_mask = topk_length == 0
+        original_indices = topk_idxs.clone()
+        original_lengths = topk_length.clone() if compact else None
         expected_kv = kv_full.detach().clone()
         expected_dkv = torch.arange(kv_full.numel(), dtype=kv_full.dtype).reshape_as(kv_full)
         seen = {}
 
-        def fake_flash(q, *args, **kwargs):
-            del args, kwargs
-            return torch.zeros_like(q), torch.zeros(total_q, num_heads), None
+        def fake_flash(q, kv, indices, *args, **kwargs):
+            assert indices is topk_idxs
+            assert kwargs['topk_length'] is topk_length
+            lse = torch.zeros(total_q, num_heads)
+            if compact:
+                lse[padding_mask] = -torch.inf
+            return torch.zeros_like(q), lse, None
 
         class FakeDSA:
             @staticmethod
             def sparse_attention_backward_wrapper(q, kv, out, dO, lse, sink, topk, **kwargs):
-                del out, dO, lse, topk, kwargs
+                if compact:
+                    assert torch.equal(topk, original_indices.clamp_min(0))
+                    assert torch.equal(kwargs['topk_length'], original_lengths.clamp_min(1))
+                    assert torch.count_nonzero(dO[padding_mask]) == 0
+                    assert torch.count_nonzero(lse[padding_mask]) == 0
                 seen['backward_kv'] = kv.detach().clone()
                 return {
                     'dq': torch.zeros_like(q),
@@ -1598,12 +1615,17 @@ class TestDsaSparseAttn:
                 attn_sink,
                 topk_idxs,
                 softmax_scale=0.5,
+                topk_length=topk_length,
                 is_thd=True,
                 kv_reconstruction_parts=(boundary_kv, local_kv, compressed_kv),
+                q_padding_mask=padding_mask,
             )
             output.sum().backward()
 
         assert kv_full.untyped_storage()._cdata not in saved_storage_ids
+        assert torch.equal(topk_idxs, original_indices)
+        if compact:
+            assert torch.equal(topk_length, original_lengths)
         for part in (boundary_kv, local_kv, compressed_kv):
             assert part.untyped_storage()._cdata in saved_storage_ids
         torch.testing.assert_close(seen['backward_kv'], expected_kv)

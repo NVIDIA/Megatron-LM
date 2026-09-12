@@ -1000,7 +1000,7 @@ if _CUTILE_AVAILABLE:
         dev = grad_output.device
         stream = torch.cuda.current_stream()
         grad_input = torch.empty(N_batch, hc, hc, dtype=grad_output.dtype, device=dev)
-        go = grad_output.view(N_batch, hc, hc)
+        go = grad_output.reshape(N_batch, hc, hc)
         mi = M_init.view(N_batch, hc, hc)
 
         cache_key = (N_batch, hc, num_iterations)
@@ -1134,7 +1134,7 @@ if _CUTILE_AVAILABLE:
         stream = torch.cuda.current_stream()
         gx = torch.empty(sb, n, C, dtype=x.dtype, device=x.device)
         gh = torch.empty(sb, n, dtype=h_pre.dtype, device=x.device)
-        go_flat = grad_output.view(sb, C)
+        go_flat = grad_output.reshape(sb, C)
         x_flat = x.view(sb, n, C)
         h_flat = h_pre.view(sb, n)
 
@@ -1352,7 +1352,7 @@ if _CUTILE_AVAILABLE:
         g_res = torch.empty(sb, n, C, dtype=original_residual.dtype, device=h_res.device)
         g_hp = torch.empty(sb, n, dtype=h_post.dtype, device=h_res.device)
         g_x = torch.empty(sb, C, dtype=x.dtype, device=h_res.device)
-        go_flat = grad_output.view(sb, n, C)
+        go_flat = grad_output.reshape(sb, n, C)
         hr_flat = h_res.view(sb, n, n)
         orig_flat = original_residual.view(sb, n, C)
         hp_flat = h_post.view(sb, n)
@@ -1535,6 +1535,7 @@ if _CUTILE_AVAILABLE:
         TILE_SIZE_M: ConstInt,
         TILE_SIZE_N: ConstInt,
         SPLIT_K: ConstInt,
+        EPS_INSIDE_SQRT: ConstInt,
     ):
         """Reduce split-K partial proj/norm, compute r, and apply compute_h activations.
 
@@ -1574,14 +1575,20 @@ if _CUTILE_AVAILABLE:
         ct.store(PROJ_OUT, index=(bid_m, 0), tile=pre_accum.astype(PROJ_OUT.dtype))
         ct.store(PROJ_OUT, index=(bid_m, 1), tile=post_accum.astype(PROJ_OUT.dtype))
 
-        # 2. Compute r = norm / sqrt(K)
+        # Single-pass mHC stores sqrt(mean(x^2) + eps) as r. Its derivative
+        # remains x / (K * r), so the existing backward can use additive eps=0.
         denom = ct.full((TILE_SIZE_M, 1), K * 1.0, dtype=ct.float32)
-        r_val = ct.sqrt(ct.truediv(r_accum, denom))
+        mean_square = ct.truediv(r_accum, denom)
+        if EPS_INSIDE_SQRT:
+            r_val = ct.sqrt(mean_square + eps)
+            inv_r_eps = 1.0 / r_val
+        else:
+            r_val = ct.sqrt(mean_square)
+            inv_r_eps = 1.0 / (r_val + eps)
 
         ct.store(R, index=(bid_m, 0), tile=r_val.astype(R.dtype))
 
         # 3. Apply compute_h directly into split outputs.
-        inv_r_eps = 1.0 / (r_val + eps)
         bias_pre = ct.load(Bias, index=(0, 0), shape=(1, n), padding_mode=PAD_ZERO)
         bias_post = ct.load(Bias, index=(0, 1), shape=(1, n), padding_mode=PAD_ZERO)
         bias_pre = ct.astype(bias_pre, ct.float32)
@@ -1645,7 +1652,7 @@ if _CUTILE_AVAILABLE:
     def _default_proj_rms_fwd_config(M: int, K: int, TILE_N: int):
         """Static fallback for skinny MHC projection when autotune cache is absent."""
         split_k = 16 if K >= 16384 else 8 if K >= 8192 else 1
-        return _default_tile_m(M), TILE_N, min(128, K), split_k
+        return _default_tile_m(M), TILE_N, min(128, _next_power_of_2(K)), split_k
 
     # Cache the best config across calls (keyed by M, N, K).
     _proj_rms_fwd_best_cfg: dict = {}
@@ -1693,6 +1700,7 @@ if _CUTILE_AVAILABLE:
         tile_n: int,
         split_k: int,
         out_dtype: torch.dtype,
+        eps_inside_sqrt: bool = False,
     ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
         """Launch reduce split-K + compute_h kernel.
 
@@ -1718,7 +1726,7 @@ if _CUTILE_AVAILABLE:
         proj_out = torch.empty(M, N, dtype=proj_acc.dtype, device=dev)
 
         default_tm = _default_reduce_compute_h_tile_m(M)
-        cache_key = (M, N, K, n, split_k)
+        cache_key = (M, N, K, n, split_k, eps_inside_sqrt)
         cached = _reduce_compute_h_best_cfg.get(cache_key)
 
         def _make_args(tm):
@@ -1743,6 +1751,7 @@ if _CUTILE_AVAILABLE:
                 tm,
                 tile_n,
                 split_k,
+                int(eps_inside_sqrt),
             )
 
         if cached is not None or not _CUTILE_EXPERIMENTAL_AVAILABLE:
@@ -1779,6 +1788,7 @@ if _CUTILE_AVAILABLE:
         n: int,
         eps: float,
         compute_h_eps: float,
+        eps_inside_sqrt: bool = False,
     ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
         """Fused proj_rms + compute_h forward.
 
@@ -1789,7 +1799,7 @@ if _CUTILE_AVAILABLE:
             h_pre: [M, n] activated pre weights
             h_post: [M, n] activated post weights
             h_res: [M, n*n] residual logits
-            r: [M, 1] r = norm / sqrt(K)
+            r: [M, 1] RMS, including epsilon under the square root when requested
             proj_reduced: [M, N] reduced projection (for backward)
         """
         M, K = x.shape
@@ -1934,6 +1944,7 @@ if _CUTILE_AVAILABLE:
             TILE_N,
             split_k,
             torch.promote_types(x.dtype, weight.dtype),
+            eps_inside_sqrt,
         )
         return h_pre, h_post, h_res, r, proj_reduced
 
@@ -1980,7 +1991,9 @@ if _CUTILE_AVAILABLE:
         r_tile = ct.load(R, index=(tile_m_id, 0), shape=(TILE_SIZE_M, 1), padding_mode=PAD_ZERO)
         r_tile = ct.astype(r_tile, ct.float32)
 
-        r_eps = r_tile + eps
+        # Out-of-range rows are zero-padded. Do not form 0 * inf when the
+        # regularized RMS path deliberately passes zero additive epsilon.
+        r_eps = ct.where(ct.less(0.0, r_tile + eps), r_tile + eps, 1.0)
         inv_r_eps = 1.0 / r_eps
         grad_r_from_h = ct.full((TILE_SIZE_M, 1), 0.0, dtype=ct.float32)
 
@@ -2080,7 +2093,7 @@ if _CUTILE_AVAILABLE:
     def _ct_fused_grad_x_weight_kernel(
         X,  # [M, K]
         WEIGHT,  # [N, K]
-        GRAD_PROJ,  # [M, TILE_SIZE_N] precomputed
+        GRAD_PROJ,  # [M, N] precomputed; loads pad to TILE_SIZE_N
         GRAD_R_TOTAL,  # [M, 1] precomputed
         R,  # [M, 1]
         GRAD_X,  # [M, K] output
@@ -2128,7 +2141,7 @@ if _CUTILE_AVAILABLE:
             r_tile = ct.astype(r_tile, ct.float32)
 
             # grad_x = grad_proj @ weight + grad_r_total * x / (r * K)
-            inv_rK = 1.0 / (r_tile * K)
+            inv_rK = 1.0 / (ct.where(ct.less(0.0, r_tile), r_tile, 1.0) * K)
             acc_grad_x = (grad_r_total * inv_rK) * ct.astype(x_tile, ct.float32)
             acc_grad_x = ct.mma(
                 grad_proj_tile.astype(ct.tfloat32), weight_tile.astype(ct.tfloat32), acc=acc_grad_x
@@ -2150,7 +2163,7 @@ if _CUTILE_AVAILABLE:
 
     @ct.kernel
     def _ct_scalar_grads_partials_kernel(
-        GRAD_H,  # [M, TILE_SIZE_N] precomputed
+        GRAD_H,  # [M, N] precomputed; loads pad to TILE_SIZE_N
         PROJ,  # [M, N]
         R,  # [M, 1]
         GRAD_ALPHA_PRE_PARTIALS,  # [num_m_blocks, 1] output
@@ -2191,7 +2204,7 @@ if _CUTILE_AVAILABLE:
         r_tile = ct.load(R, index=(bid_m, 0), shape=(TILE_SIZE_M, 1), padding_mode=PAD_ZERO)
         r_tile = ct.astype(r_tile, ct.float32)
 
-        r_eps = r_tile + eps
+        r_eps = ct.where(ct.less(0.0, r_tile + eps), r_tile + eps, 1.0)
         inv_r_eps = 1.0 / r_eps
 
         ga_all = grad_h * proj_tile * inv_r_eps
@@ -2262,7 +2275,7 @@ if _CUTILE_AVAILABLE:
     def _ct_fused_compute_h_proj_rms_bwd_small_k_kernel(
         X,  # [M, K]
         WEIGHT,  # [N, K]
-        GRAD_PROJ,  # [M, TILE_N] precomputed
+        GRAD_PROJ,  # [M, N] precomputed; loads pad to TILE_N
         GRAD_R_TOTAL,  # [M, 1] precomputed
         R,  # [M, 1]
         GRAD_X,  # [M, K] output
@@ -2351,7 +2364,7 @@ if _CUTILE_AVAILABLE:
                     shape=(TILE_DA_SIZE_M, TILE_DA_SIZE_K),
                     padding_mode=zero_pad,
                 )
-                inv_rK = 1.0 / (r_tile * K)
+                inv_rK = 1.0 / (ct.where(ct.less(0.0, r_tile), r_tile, 1.0) * K)
                 accumulator_da = (grad_r_total * inv_rK) * ct.astype(x_tile, ct.float32)
 
                 weight_tile = ct.load(
@@ -2432,8 +2445,10 @@ if _CUTILE_AVAILABLE:
         grad_h_res_arg = grad_h_res if has_grad_h_res else h_res
 
         # 0. Precompute grad_h, grad_proj, grad_r_total
-        grad_h_buf = torch.empty(M, TILE_N, dtype=torch.float32, device=dev)
-        grad_proj_buf = torch.empty(M, TILE_N, dtype=torch.float32, device=dev)
+        # The precomputation writes exactly N columns. Let tile loads zero-pad
+        # the rest instead of reading uninitialized columns in an oversized buffer.
+        grad_h_buf = torch.empty(M, N, dtype=torch.float32, device=dev)
+        grad_proj_buf = torch.empty(M, N, dtype=torch.float32, device=dev)
         grad_r_total_buf = torch.empty(M, 1, dtype=torch.float32, device=dev)
 
         tile_m_precomp = _default_tile_m(M)
@@ -2573,7 +2588,7 @@ if _CUTILE_AVAILABLE:
             )
 
         # 2. Separate lightweight kernel for scalar gradients (grad_alpha, grad_bias)
-        tile_m_scalar = min(128, M)
+        tile_m_scalar = min(128, _next_power_of_2(M))
         num_m_blocks = math.ceil(M / tile_m_scalar)
         grad_alpha_pre_partials = torch.empty(num_m_blocks, 1, dtype=torch.float32, device=dev)
         grad_alpha_post_partials = torch.empty(num_m_blocks, 1, dtype=torch.float32, device=dev)
@@ -2820,6 +2835,7 @@ def _torch_proj_rms_compute_h(
     n: int,
     eps: float,
     compute_h_eps: float = 1e-6,
+    eps_inside_sqrt: bool = False,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
     # compute_mappings() hands us activations in the activation dtype while the
     # mapping parameters are keep_in_fp32, so matmul would reject the pair.
@@ -2827,12 +2843,17 @@ def _torch_proj_rms_compute_h(
     # without letting a lower-precision parameter downcast the activations.
     x = x.to(torch.promote_types(x.dtype, weight.dtype))
     proj = torch.matmul(x, weight.t())
-    r = x.norm(dim=-1, keepdim=True) / math.sqrt(x.shape[-1])
+    if eps_inside_sqrt:
+        r = (x.square().mean(dim=-1, keepdim=True) + eps).sqrt()
+        denominator = r
+    else:
+        r = x.norm(dim=-1, keepdim=True) / math.sqrt(x.shape[-1])
+        denominator = r + eps
     alpha = torch.cat(
         [alpha_pre.expand(n), alpha_post.expand(n), alpha_res.expand(weight.shape[0] - 2 * n)],
         dim=-1,
     )
-    h = proj * alpha.unsqueeze(0) / (r + eps) + bias.unsqueeze(0)
+    h = proj * alpha.unsqueeze(0) / denominator + bias.unsqueeze(0)
     h_pre = h[..., :n].sigmoid() + compute_h_eps
     h_post = h[..., n : 2 * n].sigmoid() * 2
     h_res = h[..., 2 * n :]
@@ -2891,10 +2912,21 @@ if _CUTILE_AVAILABLE:
             n: int,
             eps: float = 1e-6,
             compute_h_eps: float = 1e-6,
+            eps_inside_sqrt: bool = False,
         ):
             """Run fused cuTile projection, RMS normalization, and compute_h forward."""
+            ctx.set_materialize_grads(False)
             h_pre, h_post, h_res, r, proj_reduced = _cutile_proj_rms_compute_h_fwd(
-                x, weight, bias, alpha_pre, alpha_post, alpha_res, n, eps, compute_h_eps
+                x,
+                weight,
+                bias,
+                alpha_pre,
+                alpha_post,
+                alpha_res,
+                n,
+                eps,
+                compute_h_eps,
+                eps_inside_sqrt,
             )
             ctx.save_for_backward(
                 x,
@@ -2910,7 +2942,7 @@ if _CUTILE_AVAILABLE:
                 bias,
             )
             ctx.n = n
-            ctx.eps = eps
+            ctx.eps = 0.0 if eps_inside_sqrt else eps
             ctx.compute_h_eps = compute_h_eps
             return h_pre, h_post, h_res, r
 
@@ -2954,7 +2986,19 @@ if _CUTILE_AVAILABLE:
                 )
             )
 
-            return (grad_x, grad_weight, grad_ap, grad_apo, grad_ar, grad_bias, None, None, None)
+            grads = (
+                grad_x,
+                grad_weight,
+                grad_ap,
+                grad_apo,
+                grad_ar,
+                grad_bias,
+                None,
+                None,
+                None,
+                None,
+            )
+            return grads[: len(ctx.needs_input_grad)]
 
 
 class FusedHAggregate(torch.autograd.Function):
@@ -3071,6 +3115,8 @@ class FusedHPostBDA(torch.autograd.Function):
 def fused_sinkhorn(input_logits: Tensor, num_iterations: int, eps: float = 1e-6) -> Tensor:
     """Project logits to a doubly stochastic matrix using Triton, cuTile, then torch."""
     _raise_mhc_backend_validation_error()
+    if not input_logits.is_cuda or input_logits.numel() == 0:
+        return native_sinkhorn(input_logits, num_iterations, eps)
     triton_sinkhorn = _get_triton_sinkhorn()
     if triton_sinkhorn is not None:
         return triton_sinkhorn(input_logits, num_iterations, eps)
@@ -3082,7 +3128,7 @@ def fused_sinkhorn(input_logits: Tensor, num_iterations: int, eps: float = 1e-6)
 def fused_h_aggregate(x: Tensor, h_pre: Tensor) -> Tensor:
     """Weighted n-stream to 1-stream aggregation using Triton/cuTile/torch."""
     _raise_mhc_backend_validation_error()
-    if _TRITON_AVAILABLE or is_cutile_available():
+    if x.is_cuda and x.numel() and (_TRITON_AVAILABLE or is_cutile_available()):
         return FusedHAggregate.apply(x, h_pre)
     return native_h_aggregate(x, h_pre)
 
@@ -3090,7 +3136,7 @@ def fused_h_aggregate(x: Tensor, h_pre: Tensor) -> Tensor:
 def fused_h_aggregate_into(x: Tensor, h_pre: Tensor, out: Tensor) -> Tensor:
     """Weighted aggregation that writes directly to fixed-address ``out``."""
     _raise_mhc_backend_validation_error()
-    if _TRITON_AVAILABLE or is_cutile_available():
+    if x.is_cuda and x.numel() and (_TRITON_AVAILABLE or is_cutile_available()):
         return FusedHAggregateInto.apply(x, h_pre, out)
     from megatron.core.transformer.hyper_connection import native_h_aggregate_into
 
@@ -3102,7 +3148,7 @@ def fused_h_post_bda(
 ) -> Tensor:
     """Fused H_res.T @ residual + H_post * (x + bias)."""
     _raise_mhc_backend_validation_error()
-    if _TRITON_AVAILABLE or is_cutile_available():
+    if x.is_cuda and x.numel() and (_TRITON_AVAILABLE or is_cutile_available()):
         return FusedHPostBDA.apply(h_res, original_residual, h_post, x, bias)
     return native_h_post_bda(h_res, original_residual, h_post, x, bias)
 
@@ -3117,13 +3163,29 @@ def fused_proj_rms_compute_h(
     n: int,
     eps: float = 1e-6,
     compute_h_eps: float = 1e-6,
+    *,
+    eps_inside_sqrt: bool = False,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
-    """Projection + RMS norm + compute_h split outputs using cuTile, then torch."""
+    """Projection + RMS norm + compute_h split outputs using cuTile, then torch.
+
+    ``eps_inside_sqrt`` selects single-pass mHC normalization. In that mode the
+    fourth output is ``sqrt(mean(x**2) + eps)``; otherwise it is the unregularized
+    RMS and epsilon is added after the square root, preserving legacy mHC.
+    """
     _raise_mhc_backend_validation_error()
-    if is_cutile_available():
+    if x.is_cuda and x.numel() and is_cutile_available():
         return CutileProjRmsComputeH.apply(
-            x, weight, alpha_pre, alpha_post, alpha_res, bias, n, eps, compute_h_eps
+            x,
+            weight,
+            alpha_pre,
+            alpha_post,
+            alpha_res,
+            bias,
+            n,
+            eps,
+            compute_h_eps,
+            eps_inside_sqrt,
         )
     return _torch_proj_rms_compute_h(
-        x, weight, alpha_pre, alpha_post, alpha_res, bias, n, eps, compute_h_eps
+        x, weight, alpha_pre, alpha_post, alpha_res, bias, n, eps, compute_h_eps, eps_inside_sqrt
     )
