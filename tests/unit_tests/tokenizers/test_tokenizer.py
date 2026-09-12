@@ -447,6 +447,8 @@ def test_own_metadata_class(tmp_path):
 
 def test_multimodal_tokenizer():
     """Test MegatronMultimodalTokenizer."""
+    from megatron.core.models.multimodal.llava_model import DEFAULT_IMAGE_TOKEN_INDEX
+
     prompt_format = "qwen2p0"
     special_tokens = ["<image>"]
     image_tag_type = "nvlm"
@@ -461,11 +463,12 @@ def test_multimodal_tokenizer():
     assert (
         tokenizer.detokenize(tokenizer.tokenize("abc")) == "abc"
     ), "encode-decode roundtrip failed"
+    assert tokenizer.image_token_index == DEFAULT_IMAGE_TOKEN_INDEX
 
     conversation = [
         {"role": "system", "content": "You are a helpful assistant."},
         {"role": "user", "content": "Hello! Can you summarize this image for me?"},
-        {"role": "user", "content": "<image>"},
+        {"role": "user", "content": [{"type": "image"}]},
         {"role": "assistant", "content": "Sure! The image shows a sunset over a mountain range."},
         {"role": "user", "content": "Thanks! Can you also give a short poem about it?"},
     ]
@@ -485,14 +488,17 @@ def test_multimodal_tokenizer():
     # Try converting tokens to ids.
     assert tokenizer.convert_tokens_to_ids("a"), "failed to convert tokens to ids."
 
-    assert tokenizer._tokenizer._apply_image_tag("<image>hello") == "<Image><image></Image>hello"
-    assert tokenizer._tokenizer._apply_image_tag([{"role": "user", "content": "<image>hello"}]) == [
-        {"role": "user", "content": "<Image><image></Image>hello"}
-    ]
+    # Structured media parts keep the image sentinel between the configured tags.
+    assert conv_tokens.count(DEFAULT_IMAGE_TOKEN_INDEX) == 1
+    image_index = conv_tokens.index(DEFAULT_IMAGE_TOKEN_INDEX)
+    assert tokenizer.detokenize(conv_tokens[:image_index]).endswith("<Image>")
+    assert tokenizer.detokenize(conv_tokens[image_index + 1 :]).startswith("</Image>")
 
 
 def test_null_multimodal_tokenizer():
     """Test MegatronNullMultimodalTokenizer."""
+    from megatron.core.models.multimodal.llava_model import DEFAULT_IMAGE_TOKEN_INDEX
+
     vocab_size = 10000
     tokenizer = MegatronTokenizer.from_pretrained(
         metadata_path={"library": "null-multimodal"}, vocab_size=vocab_size
@@ -503,6 +509,7 @@ def test_null_multimodal_tokenizer():
     assert tokenizer.tokenize("1 22 333") == [1, 22, 333], "tokenization is failed."
 
     assert tokenizer.detokenize([1, 22, 333]) == "1 22 333", "detokenization is failed."
+    assert tokenizer.image_token_index == DEFAULT_IMAGE_TOKEN_INDEX
 
 
 def test_sft_tokenizer():
