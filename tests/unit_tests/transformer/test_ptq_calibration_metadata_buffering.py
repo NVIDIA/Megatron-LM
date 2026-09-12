@@ -42,11 +42,7 @@ def test_calibration_option_requires_te_config_support(monkeypatch):
         buffer_transformer_engine_calibration_metadata=True,
         transformer_engine_calibration_decay=0.123,
     )
-    monkeypatch.setattr(
-        fp8_utils.transformer_engine.pytorch,
-        "QuantizationCalibrationConfig",
-        None,
-    )
+    monkeypatch.setattr(fp8_utils.transformer_engine.pytorch, "QuantizationCalibrationConfig", None)
     fp8_utils._make_te_calibration_config.cache_clear()
 
     with pytest.raises(RuntimeError, match="QuantizationCalibrationConfig support"):
@@ -110,11 +106,7 @@ def test_fp8_context_reports_unsupported_te_calibration_autocast(monkeypatch):
     def legacy_fp8_autocast(*, enabled, fp8_recipe, fp8_group):
         return enabled, fp8_recipe, fp8_group
 
-    monkeypatch.setattr(
-        fp8_utils.transformer_engine.pytorch,
-        "fp8_autocast",
-        legacy_fp8_autocast,
-    )
+    monkeypatch.setattr(fp8_utils.transformer_engine.pytorch, "fp8_autocast", legacy_fp8_autocast)
 
     with pytest.raises(
         RuntimeError,
@@ -216,10 +208,7 @@ def test_per_module_disabled_autocast_ignores_calibration_config(monkeypatch):
     monkeypatch.setattr(te_ext, "fp8_autocast", lambda **kwargs: autocast_kwargs.update(kwargs))
     recipe = te_ext.TEQuantizationRecipe(override_nonquantized_autocast=True)
 
-    te_ext._get_fp8_autocast_for_quant_recipe(
-        recipe,
-        calibration_config=calibration_config,
-    )
+    te_ext._get_fp8_autocast_for_quant_recipe(recipe, calibration_config=calibration_config)
 
     assert autocast_kwargs == {"enabled": False}
 
@@ -231,14 +220,10 @@ def test_per_module_quantized_autocast_receives_calibration_config(monkeypatch):
     monkeypatch.setattr(te_ext, "model_parallel_is_initialized", lambda: False)
     monkeypatch.setattr(te_ext, "fp8_autocast", lambda **kwargs: autocast_kwargs.update(kwargs))
     recipe = te_ext.TEQuantizationRecipe(
-        fp8_quantization_recipe=te_ext.Fp8Recipe.tensorwise,
-        override_nonquantized_autocast=True,
+        fp8_quantization_recipe=te_ext.Fp8Recipe.tensorwise, override_nonquantized_autocast=True
     )
 
-    te_ext._get_fp8_autocast_for_quant_recipe(
-        recipe,
-        calibration_config=calibration_config,
-    )
+    te_ext._get_fp8_autocast_for_quant_recipe(recipe, calibration_config=calibration_config)
 
     assert autocast_kwargs["enabled"]
     assert autocast_kwargs["calibration_config"] is calibration_config
