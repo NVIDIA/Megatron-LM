@@ -292,6 +292,8 @@ class _VirtualExperts:
             (data[i], scales[i].view(rowwise), data[i], scales[i].view(columnwise))
             for i in range(count)
         )
+        # set_() empties the components at teardown but would leave a view's arena _base alive.
+        views = tuple(tuple(view.detach() for view in slot) for slot in views)
         weights = cls._wrap_mxfp8(template, shape, views, data.device)
         return tuple(cls._runtime_parameter(w, g) for w, g in zip(weights, grads))
 
