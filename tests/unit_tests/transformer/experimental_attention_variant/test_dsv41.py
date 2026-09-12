@@ -405,9 +405,9 @@ def test_v41_cli_fields():
     assert args.mhc_single_pass
 
 
-@pytest.mark.parametrize("version, expected", [(None, "cudnn"), ("v4", "cudnn"), ("v4.1", "none")])
-@pytest.mark.parametrize("explicit_backend", [None, "none"])
-def test_cli_backend_defaults_preserve_v4(version, expected, explicit_backend):
+@pytest.mark.parametrize("version", [None, "v4", "v4.1"])
+@pytest.mark.parametrize("explicit_backend", [None, "none", "cudnn"])
+def test_cli_backend_defaults_to_cudnn_for_all_dsv4_versions(version, explicit_backend):
     kwargs = {
         "experimental_attention_variant": "dsv4_hybrid",
         "dsa_kernel_backend": explicit_backend,
@@ -415,4 +415,4 @@ def test_cli_backend_defaults_preserve_v4(version, expected, explicit_backend):
     if version is not None:
         kwargs["dsv4_version"] = version
     _resolve_dsa_kernel_backend_cli_default(SimpleNamespace(), kwargs)
-    assert kwargs["dsa_kernel_backend"] == (explicit_backend or expected)
+    assert kwargs["dsa_kernel_backend"] == (explicit_backend or "cudnn")
