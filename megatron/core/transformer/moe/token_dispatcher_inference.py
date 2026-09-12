@@ -22,6 +22,7 @@ per-step metadata kernel is captured inside the CUDA graph.
 """
 
 import operator
+import os
 from functools import reduce
 from typing import List, Optional
 
@@ -33,6 +34,7 @@ from megatron.core.inference.communication.torch_symm_triton import (
     multimem_reduce_scatter_v,
 )
 from megatron.core.inference.moe import InferenceGroupedGemmBackend, batch_invariant
+from megatron.core.inference.moe import router_topk as _fused_topk
 from megatron.core.inference.moe.metadata import fused_metadata_update
 from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -49,6 +51,10 @@ from megatron.core.transformer.moe.token_dispatcher import MoEAllGatherTokenDisp
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.typed_torch import apply_module
 from megatron.core.utils import get_pg_rank, get_pg_size
+
+# Reduce the MoE combine in bf16 instead of fp32. Off by default because it changes
+# numerics; see the buffer allocation for why it is worth measuring.
+_NVLS_RS_BF16: bool = os.environ.get("MCORE_NVLS_RS_BF16", "0") == "1"
 
 
 class InferenceAllGatherDispatcherBase(MoEAllGatherTokenDispatcher):
@@ -324,7 +330,8 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
     _real_token_count_tensor: Optional[torch.Tensor] = None
 
     # ── Class-level symmetric buffer handles (allocated once at model init) ───────
-    # Dtypes: hidden=bf16, routing=int64, probs=fp32, rsv=fp32.
+    # Dtypes: hidden=bf16, routing=int64, probs=fp32, rsv=fp32 (bf16 when
+    # MCORE_NVLS_RS_BF16 is set).
     _symm_agv_hidden: Optional[dict] = None  # {"tensor": ..., "handle": ...}
     _symm_agv_routing: Optional[dict] = None
     _symm_agv_probs: Optional[dict] = None
@@ -433,9 +440,24 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
             "ep_agv_p", process_group=ep_group, size_mb=_size_mb(agv_p_shape, torch.float32)
         ).maybe_get_tensor(agv_p_shape, dtype=torch.float32)
 
+        # The combine reduce-scatter buffer. fp32 makes the cross-rank sum exact but
+        # costs twice the NVLink bytes on the largest collective in the step, and it
+        # forces a per-layer cast on the way out because everything downstream is
+        # bf16. vLLM reduces in bf16 (`ncclDevKernel_ReduceScatter_Sum_bf16`), and the
+        # multimem kernel already accepts either, so bf16 is a supported point on the
+        # same curve: the top-k sum still accumulates in fp32 registers inside
+        # `_moe_sum`, only the store and the 4-way cross-rank add become bf16.
+        rsv_dtype = torch.float32
+        if _NVLS_RS_BF16:
+            assert not batch_invariant.enabled(), (
+                "MCORE_NVLS_RS_BF16 cannot be combined with batch-invariant mode: "
+                "ordered_reduce_scatter_v reduces ranks with an explicit fp32 loop and "
+                "requires an fp32 buffer."
+            )
+            rsv_dtype = torch.bfloat16
         cls._symm_rsv = SymmetricMemoryManager.get_buffer(
-            "ep_rsv", process_group=ep_group, size_mb=_size_mb(rsv_shape, torch.float32)
-        ).maybe_get_tensor(rsv_shape, dtype=torch.float32)
+            "ep_rsv", process_group=ep_group, size_mb=_size_mb(rsv_shape, rsv_dtype)
+        ).maybe_get_tensor(rsv_shape, dtype=rsv_dtype)
 
         # Small scratch buffer for fused metadata allgather (WORLD_SIZE int32s).
         cls._symm_metadata = SymmetricMemoryManager.get_buffer(
@@ -506,6 +528,11 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         # the routing map along. Base class self.tp_rank is the expt_tp rank,
         # which is not what we want for the SP padding offset.
         self.sp_rank = get_pg_rank(pg_collection.tp)
+        # Unsharded rows let the router fold the padding sentinel into its selection
+        # kernel: local and global row indices coincide, so no row offset is needed.
+        # Requiring group size 1 rather than rank 0 keeps every rank on the same
+        # branch, which matters because the NVLS path barriers across ranks.
+        self._rows_unsharded = get_pg_size(pg_collection.tp) == 1
         # Set in dispatch_preprocess; consumed by token_dispatch and token_combine.
         self._local_tokens: int = 0
         # When shared_expert_overlap is enabled, the shared expert forward is launched
@@ -571,7 +598,17 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         # shift local rows into the global frame for the comparison. When unset
         # (standalone dispatcher use without a context) all rows are real, so
         # skip the mask.
-        if self.__class__._real_token_count_tensor is not None:
+        #
+        # Publishing the count lets the router's selection kernel emit the sentinel
+        # itself and retires this launch. The skip below keys off the tag the router
+        # leaves on the tensor it actually masked, so it is evidence that the fused
+        # path ran rather than a second copy of the gate.
+        if self.__class__._real_token_count_tensor is not None and self._rows_unsharded:
+            _fused_topk.publish_graph_padding(self.__class__._real_token_count_tensor)
+
+        if self.__class__._real_token_count_tensor is not None and not getattr(
+            self.routing_map, "_mcore_padding_masked", False
+        ):
             mask_routing_padding(
                 self.routing_map, self.__class__._real_token_count_tensor, self.sp_rank
             )
