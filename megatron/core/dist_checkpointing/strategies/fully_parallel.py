@@ -186,8 +186,7 @@ class FullyParallelLoadStrategyWrapper:
         exchange_algo (str): algorithm to use for exchanging the data.
             Options:
             - broadcast - each rank broadcasts individual tensors to others
-            - gather_object (default) - ranks all_gather_object the whole loaded state dicts
-            - gather_rounds (default) - ranks all gather individual tensors in rounds
+            - gather_object - ranks all_gather_object the whole loaded state dicts
             See method docs for more details.
     """
 
