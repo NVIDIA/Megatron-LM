@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import time
 from contextlib import contextmanager
+from dataclasses import dataclass
 from typing import Optional, Tuple
 
 import torch
@@ -201,28 +202,68 @@ def _triton_dispatch_enabled(enabled: bool):
         set_min_memory_triton_enabled(previous)
 
 
-def _default_query_chunk_size(query_length: int) -> int:
-    return min(query_length, 512)
+# Budget for one streamed index-score tile, which is [batch, query_chunk, key_chunk] in fp32 and
+# is what the chunk sizes exist to bound. 256 MiB is a starting point chosen to keep the tile well
+# inside a layer's activation headroom at the sequence lengths this path targets; it has not been
+# tuned against measured peak memory.
+_SCORE_TILE_BUDGET_BYTES = 256 << 20
+# Upper bound on the query chunk. Past this the tile stops being the thing that limits occupancy,
+# and larger chunks mostly cost temporaries.
+_MAX_QUERY_CHUNK = 8192
+_MAX_KEY_CHUNK = 1024
 
 
-def _default_key_chunk_size(key_length: int) -> int:
-    return min(key_length, 1024)
+@dataclass(frozen=True)
+class _DSAExecutionPlan:
+    """Streaming chunk sizes for one min-memory DSA call.
+
+    These are execution details, not model hyperparameters: they set how the index scores are
+    tiled, and so the temporary memory and loop counts, without changing what is computed --
+    with one exception noted on ``routing_key_chunk``. They are derived from the shapes and the
+    backend rather than configured, so that a model definition does not carry kernel tuning.
+    """
+
+    query_chunk: int
+    key_chunk: int
+    routing_key_chunk: int
 
 
-def _chunk_size(config_value: Optional[int], default_value: int, maximum: int) -> int:
-    if config_value is None or config_value <= 0:
-        return min(default_value, maximum)
-    return min(config_value, maximum)
+def _plan_execution(
+    batch_size: int,
+    query_length: int,
+    key_length: int,
+    use_triton: bool,
+    query_chunk_override: Optional[int] = None,
+    key_chunk_override: Optional[int] = None,
+) -> _DSAExecutionPlan:
+    """Choose streaming chunk sizes for the given shapes and backend.
 
+    The overrides exist so tests can force multi-chunk paths on small tensors, and so a kernel
+    experiment can pin a size without a config field. They are arguments to this module, not a
+    model option; nothing in the layer or the config sets them.
+    """
+    key_chunk = min(key_length, _MAX_KEY_CHUNK)
+    if key_chunk_override is not None and key_chunk_override > 0:
+        key_chunk = min(key_chunk_override, key_length)
 
-def _routing_key_chunk_size(config_value: Optional[int], key_length: int, use_triton: bool) -> int:
-    if not use_triton:
-        # The PyTorch backend is the numerical oracle. Streaming torch.topk over key chunks is
-        # not tie-equivalent to a single full torch.topk. Exact zero ties are common in standard
-        # DSA after ReLU, and simplified routing can also contain equal scores. Use one key block
-        # so torch-min-memory preserves reference routing for both indexer formulations.
-        return key_length
-    return _chunk_size(config_value, _default_key_chunk_size(key_length), key_length)
+    # The PyTorch backend is the numerical oracle. Streaming torch.topk over key chunks is not
+    # tie-equivalent to a single full torch.topk: exact zero ties are common in standard DSA
+    # after ReLU, and simplified routing can also contain equal scores. Routing therefore reads
+    # the whole key length under torch, so min-memory-torch reproduces reference routing. This
+    # is a correctness rule, not a tuning choice.
+    routing_key_chunk = key_length if not use_triton else key_chunk
+
+    # Size the query chunk so the largest score tile stays inside the budget. The routing tile is
+    # the widest, so it sets the bound.
+    tile_row_bytes = max(1, batch_size * routing_key_chunk * 4)
+    affordable = max(1, _SCORE_TILE_BUDGET_BYTES // tile_row_bytes)
+    query_chunk = min(query_length, _MAX_QUERY_CHUNK, affordable)
+    if query_chunk_override is not None and query_chunk_override > 0:
+        query_chunk = min(query_chunk_override, query_length)
+
+    return _DSAExecutionPlan(
+        query_chunk=query_chunk, key_chunk=key_chunk, routing_key_chunk=routing_key_chunk
+    )
 
 
 def _linear(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
@@ -1150,7 +1191,9 @@ class DSASimplifiedMinMemoryGQAFn(torch.autograd.Function):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Run the sparse forward, streaming index scores so the full score matrix is never held."""
         profile = _DSATimingProfiler(profile_enabled, profile_rank, profile_label, query.device)
-        key_chunk_size = _routing_key_chunk_size(key_chunk_size, key.size(0), use_triton)
+        key_chunk_size = _plan_execution(
+            query.size(1), query.size(0), key.size(0), use_triton, key_chunk_override=key_chunk_size
+        ).routing_key_chunk
         routing_topk_cache = [] if cache_routing else None
         selected_scores_cache = [] if cache_selected_scores else None
         use_learned_k = linear_k_weight.numel() > 0
@@ -2129,10 +2172,16 @@ def dsa_min_memory_gqa_forward_only(
 ) -> torch.Tensor:
     """Run min-memory DSA-GQA for no-grad validation/eval forward passes."""
     if getattr(indexer.config, "dsa_indexer_mode", "standard") == "simplified":
-        query_chunk_size = _chunk_size(
-            query_chunk_size, _default_query_chunk_size(query.size(0)), query.size(0)
+        plan = _plan_execution(
+            query.size(1),
+            query.size(0),
+            key.size(0),
+            use_triton,
+            query_chunk_override=query_chunk_size,
+            key_chunk_override=key_chunk_size,
         )
-        key_chunk_size = _routing_key_chunk_size(key_chunk_size, key.size(0), use_triton)
+        query_chunk_size = plan.query_chunk
+        key_chunk_size = plan.routing_key_chunk
         profile = _DSATimingProfiler(profile_enabled, profile_rank, profile_label, query.device)
         use_learned_k = getattr(indexer.config, "dsa_simplified_use_learned_k", False)
         linear_k_weight = (
@@ -2280,6 +2329,14 @@ def dsa_dense_indexer_loss(
     simplified_input_norm=None,
 ) -> torch.Tensor:
     """Run tiled dense DSA indexer KL for dense-attention warmup."""
+    _plan = _plan_execution(
+        query.size(1),
+        query.size(0),
+        key.size(0),
+        use_triton,
+        query_chunk_override=query_chunk_size,
+        key_chunk_override=key_chunk_size,
+    )
     if getattr(indexer.config, "dsa_indexer_mode", "standard") == "simplified":
         use_learned_k = getattr(indexer.config, "dsa_simplified_use_learned_k", False)
         return DSASimplifiedDenseIndexerLossFn.apply(
@@ -2295,8 +2352,8 @@ def dsa_dense_indexer_loss(
             softmax_scale,
             indexer.softmax_scale,
             loss_coeff,
-            _chunk_size(query_chunk_size, _default_query_chunk_size(query.size(0)), query.size(0)),
-            _chunk_size(key_chunk_size, _default_key_chunk_size(key.size(0)), key.size(0)),
+            _plan.query_chunk,
+            _plan.key_chunk,
             indexer.pg_collection,
             getattr(indexer.config, "rotary_interleaved", False),
             simplified_input_norm,
@@ -2328,6 +2385,14 @@ def dsa_min_memory_gqa(
     simplified_input_norm=None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Run the minimum-activation DSA-GQA training backend."""
+    _plan = _plan_execution(
+        query.size(1),
+        query.size(0),
+        key.size(0),
+        use_triton,
+        query_chunk_override=query_chunk_size,
+        key_chunk_override=key_chunk_size,
+    )
     if getattr(indexer.config, "dsa_indexer_mode", "standard") == "simplified":
         use_learned_k = getattr(indexer.config, "dsa_simplified_use_learned_k", False)
         if cache_indexer_k and not use_learned_k:
@@ -2349,8 +2414,8 @@ def dsa_min_memory_gqa(
             softmax_scale,
             indexer.softmax_scale,
             loss_coeff,
-            _chunk_size(query_chunk_size, _default_query_chunk_size(query.size(0)), query.size(0)),
-            _routing_key_chunk_size(key_chunk_size, key.size(0), use_triton),
+            _plan.query_chunk,
+            _plan.routing_key_chunk,
             indexer.pg_collection,
             getattr(indexer.config, "rotary_interleaved", False),
             simplified_input_norm,
