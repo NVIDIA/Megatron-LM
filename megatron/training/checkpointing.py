@@ -833,7 +833,7 @@ def save_checkpoint(
                 rerun_state=rerun_state,
             )
 
-        if args.save_trainable_params_only:
+        if getattr(args, 'save_trainable_params_only', False):
             # `validate_args` asserts `args.ckpt_format == 'torch_dist'` at CLI-parse time, but
             # `ckpt_format` (this save call's *effective* format) can differ afterwards -- e.g.
             # `--ckpt-convert-format` reassigns `args.ckpt_format` post-validation (see
@@ -1701,13 +1701,21 @@ def _is_trainable_leaf(value: Any) -> bool:
 
     `ShardedTensor`/`ShardedTensorFactory` carry the original parameter as `.data`, so
     `requires_grad` reflects whether the parameter is frozen (e.g. a PEFT base model) or
-    trainable (e.g. a PEFT adapter). Any other leaf (`ShardedObject`, `LocalNonpersistentObject`,
-    plain metadata, ...) is kept unconditionally: only tensor-carrying leaves are filtered.
+    trainable (e.g. a PEFT adapter). Transformer Engine `._extra_state` entries (persistent
+    per-module state, e.g. FP8 scale/amax history) are dropped unconditionally, even for a
+    trainable/adapter module: they carry no `requires_grad` signal of their own, and keeping
+    one while its sibling weight tensor gets dropped as frozen would leave a structurally
+    inconsistent checkpoint (extra_state present, weight/bias missing at the same module
+    path) that fails to load. Adapter-checkpoint loading already tolerates a missing
+    extra_state key and reinitializes it to defaults. Any other non-tensor leaf (plain
+    metadata, `LocalNonpersistentObject`, ...) is kept unconditionally.
     """
     if isinstance(value, (ShardedTensor, ShardedTensorFactory)):
         return value.data is None or value.data.requires_grad
     if isinstance(value, torch.Tensor):
         return value.requires_grad
+    if isinstance(value, ShardedObject) and '_extra_state' in value.key:
+        return False
     return True
 
 
@@ -1720,10 +1728,26 @@ def filter_state_dict_to_trainable_params(state_dict: Dict[str, Any]) -> Dict[st
     optimizer section, RNG state, and other metadata are returned unchanged: the optimizer
     section already only contains state for whichever parameters were passed to the optimizer.
 
-    Loading a checkpoint produced this way onto a fully-initialized model (which still has its
-    frozen weights) requires `--dist-ckpt-strictness log_unexpected` (or another `*_unexpected`
-    strictness value): the on-disk checkpoint is missing the frozen keys the model will request,
-    and the default strictness raises on that mismatch.
+    Also used, applied to the *load* side, on the model section of the sharded-state-dict
+    request built from a fully-initialized model before it's handed to the dist_checkpointing
+    load call (see `load_checkpoint`): this makes the model-section request match the trimmed
+    on-disk checkpoint, so the model's existing frozen weights are left untouched rather than
+    requested from a checkpoint that doesn't have them. Filtering the request this way
+    (matching Megatron-Bridge's PEFT checkpoint loading) is necessary, not just
+    belt-and-suspenders: relying on `--dist-ckpt-strictness log_unexpected` alone to reconcile
+    an unfiltered request against the trimmed checkpoint does not work for every leaf type -- a
+    frozen `ShardedTensorFactory`-wrapped parameter (e.g. SwiGLU's `linear_fc1`) raises in
+    `apply_factory_merges` because the generic non-strict "unexpected key" pruning does not
+    correctly propagate through un-built factory requests.
+
+    `--dist-ckpt-strictness log_unexpected` (or another `*_unexpected` value) is still required
+    in addition to this filtering, since the optimizer section is deliberately left unfiltered
+    (see above) and a separate load-time shape-validation list
+    (`MCoreLoadPlanner._validate_global_shapes`) still needs non-strict pruning to tolerate an
+    optimizer-section entry for a frozen parameter.
+
+    Transformer Engine `._extra_state` entries are dropped unconditionally (even under a
+    trainable/adapter module); see `_is_trainable_leaf`.
 
     Args:
         state_dict: a state dict as produced by `generate_state_dict`.
@@ -2828,6 +2852,19 @@ def load_checkpoint(
                 optim_sd_kwargs=optim_sd_kwargs,
                 model_sd_kwargs=model_sd_kwargs,
                 rerun_state=gen_sd_rerun_state,
+            )
+
+        if getattr(args, 'save_trainable_params_only', False):
+            # Filter the load *request* the same way the checkpoint on disk was filtered at
+            # save time, rather than requesting every parameter and relying on
+            # --dist-ckpt-strictness to reconcile the gap afterward: some leaves (e.g. a
+            # frozen ShardedTensorFactory-wrapped SwiGLU linear_fc1) aren't correctly pruned
+            # by the generic non-strict/"unexpected key" path and raise in
+            # apply_factory_merges if left in the request. Filtering the request itself
+            # avoids the mismatch entirely, matching Megatron-Bridge's PEFT checkpoint
+            # loading (megatron.bridge.training.checkpointing.apply_peft_adapter_filter_to_state_dict).
+            load_kwargs['sharded_state_dict'] = filter_state_dict_to_trainable_params(
+                load_kwargs['sharded_state_dict']
             )
 
         if gpt_compat_layer_maps is not None:

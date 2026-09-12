@@ -428,13 +428,20 @@ class CheckpointConfig:
     """Do not save current rng state."""
 
     save_trainable_params_only: bool = False
-    """Save only parameters with requires_grad=True in the model section(s) of the checkpoint,
-    omitting frozen weights (e.g., a frozen base model under PEFT/LoRA-style fine-tuning). The
-    optimizer section is unaffected: it already only contains state for the parameters passed to
-    the optimizer. Loading such a checkpoint onto a fully-initialized model that already has the
-    frozen weights (from scratch or from a separate full-model checkpoint) requires
-    `--dist-ckpt-strictness log_unexpected` (or another `*_unexpected` strictness value), since the
-    on-disk checkpoint will be missing the frozen keys the model requests."""
+    """Save and load only parameters with requires_grad=True in the model section(s) of the
+    checkpoint, omitting frozen weights (e.g., a frozen base model under PEFT/LoRA-style
+    fine-tuning). The optimizer section is unaffected: it already only contains state for the
+    parameters passed to the optimizer.
+
+    Set this the same way for the run that saves the checkpoint and any run that loads it
+    (including a resume): loading filters the model-section load *request* down to trainable
+    parameters the same way the save filtered what was written, so the request matches the
+    on-disk checkpoint and the model's existing frozen weights (from scratch or from a separate
+    full-model checkpoint) are left untouched rather than requested from a checkpoint that
+    doesn't have them. Also still pass `--dist-ckpt-strictness log_unexpected` (or another
+    `*_unexpected` value) when loading: the optimizer section is deliberately left unfiltered,
+    and a separate load-time shape-validation check still needs non-strict handling to tolerate
+    an optimizer-section entry for a frozen parameter."""
 
     load: str | None = None
     """Directory containing a model checkpoint."""

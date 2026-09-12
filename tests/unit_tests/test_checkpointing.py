@@ -9,7 +9,7 @@ import pytest
 import torch
 import torch.distributed.checkpoint
 
-from megatron.core.dist_checkpointing.mapping import ShardedTensor, ShardedTensorFactory
+from megatron.core.dist_checkpointing.mapping import ShardedObject, ShardedTensor, ShardedTensorFactory
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
 from megatron.core.num_microbatches_calculator import (
@@ -770,3 +770,25 @@ class TestFilterStateDictToTrainableParams:
         }
         filtered = filter_state_dict_to_trainable_params(state_dict)
         assert set(filtered['model'].keys()) == {'adapter.linear_fc1'}
+
+    def test_extra_state_is_dropped_even_under_a_trainable_module(self):
+        # A ShardedObject's `.key` carries no requires_grad signal of its own. If a
+        # frozen module's `_extra_state` were kept (the generic "keep unconditionally"
+        # fallback) while its sibling weight/bias got dropped as frozen, the checkpoint
+        # would be structurally inconsistent (extra_state present, weight/bias missing
+        # at the same module path) and fail to load. So `_extra_state` is dropped
+        # unconditionally, matching Megatron-Bridge's proven PEFT checkpoint filter,
+        # even when the sibling parameter at the same path is trainable.
+        extra_state = ShardedObject(
+            'decoder.layers.0.mlp.linear_fc1._extra_state', b'', (1,), (0,)
+        )
+        state_dict = {
+            'model': {
+                'decoder.layers.0.mlp.linear_fc1.weight': _sharded_tensor(
+                    'decoder.layers.0.mlp.linear_fc1.weight', requires_grad=True
+                ),
+                'decoder.layers.0.mlp.linear_fc1._extra_state': extra_state,
+            }
+        }
+        filtered = filter_state_dict_to_trainable_params(state_dict)
+        assert set(filtered['model'].keys()) == {'decoder.layers.0.mlp.linear_fc1.weight'}
