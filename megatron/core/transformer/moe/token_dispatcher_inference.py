@@ -32,6 +32,7 @@ from megatron.core.inference.communication.torch_symm_triton import (
     multimem_all_gatherv_3tensor,
     multimem_reduce_scatter_v,
 )
+from megatron.core.inference.batch_dimensions_utils import TOKEN_ROUNDER
 from megatron.core.inference.moe import InferenceGroupedGemmBackend, batch_invariant
 from megatron.core.inference.moe.metadata import fused_metadata_update
 from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
@@ -49,6 +50,84 @@ from megatron.core.transformer.moe.token_dispatcher import MoEAllGatherTokenDisp
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.typed_torch import apply_module
 from megatron.core.utils import get_pg_rank, get_pg_size
+
+
+def bucket_shared_expert_token_count(tokens: int) -> int:
+    """Round a token count up to a coarse bucket for side-stream shared-expert launches.
+
+    Uses a quarter-octave ladder floored at `TOKEN_ROUNDER`: at most ~25% padding
+    and roughly four distinct shapes per power of two, so the number of shapes the
+    side-stream allocator pool must hold stays in the low tens rather than
+    `max_tokens // TOKEN_ROUNDER`.
+
+    Args:
+        tokens: Unpadded token count this rank contributes.
+
+    Returns:
+        The bucketed token count, always >= `tokens`.
+    """
+    if tokens <= TOKEN_ROUNDER:
+        return TOKEN_ROUNDER
+    octave = 1 << (tokens - 1).bit_length()
+    step = max(TOKEN_ROUNDER, octave // 4)
+    return ((tokens + step - 1) // step) * step
+
+
+def launch_shared_experts_on_side_stream(shared_experts, hidden_states: torch.Tensor):
+    """Run the shared-expert forward on `SharedExpertMLP.stream`, bucketing token counts.
+
+    The caller is responsible for joining the stream (via `wait_stream`) before
+    consuming the returned tensor.
+
+    Two hazards are handled here that a bare `with torch.cuda.stream(...)` launch
+    does not:
+
+    1. `hidden_states` is allocated on the main stream but read on the side stream.
+       The caching allocator only tracks the allocating stream, so without
+       `record_stream` it may hand the block to a new main-stream allocation while
+       these kernels are still reading it. See the equivalent handling on the
+       training path in `token_dispatcher.py`.
+
+    2. The side stream owns a separate allocator pool. Prefill token counts vary
+       with the request mix, so an unbucketed launch keeps missing that pool, and a
+       miss that falls through to `release_cached_blocks()` blocks the host in
+       `cudaDeviceSynchronize`. That is unsafe here specifically because the main
+       stream may already have an NVLS `symm_mem_sync` spin-wait barrier in flight:
+       the host then waits on a device that is waiting on a peer rank. Bucketing
+       bounds the shape set so the pool reaches steady state after a few steps.
+
+    Bucketing is skipped during CUDA graph capture: captured work allocates from
+    the graph's private pool and replay allocates nothing, so padding there would
+    bake in permanent extra compute for no benefit.
+
+    Args:
+        shared_experts: The `SharedExpertMLP` module to run.
+        hidden_states: Main-stream input tensor, `[..., hidden_size]`.
+
+    Returns:
+        The shared-expert output on the side stream, shaped like `hidden_states`
+        except for the trailing dimension.
+    """
+    stream = SharedExpertMLP.stream
+    orig_shape = hidden_states.shape
+    flat = hidden_states.view(-1, orig_shape[-1])
+    tokens = flat.shape[0]
+    padded_tokens = tokens
+    if not torch.cuda.is_current_stream_capturing():
+        padded_tokens = bucket_shared_expert_token_count(tokens)
+
+    stream.wait_stream(torch.cuda.current_stream())
+    # Keep the block alive until the side stream is done reading it (hazard 1).
+    hidden_states.record_stream(stream)
+    with torch.cuda.stream(stream):
+        if padded_tokens != tokens:
+            padded_input = flat.new_zeros(padded_tokens, orig_shape[-1])
+            padded_input[:tokens] = flat
+            output = apply_module(shared_experts)(padded_input)[:tokens]
+        else:
+            output = apply_module(shared_experts)(flat)
+        output = output.view(*orig_shape[:-1], output.shape[-1])
+    return output
 
 
 class InferenceAllGatherDispatcherBase(MoEAllGatherTokenDispatcher):
@@ -535,10 +614,9 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         """
         self.hidden_shape = hidden_states.shape
         if self.shared_experts is not None and not self._external_shared_expert_launch:
-            stream = SharedExpertMLP.stream
-            stream.wait_stream(torch.cuda.current_stream())
-            with torch.cuda.stream(stream):
-                self._shared_expert_output = apply_module(self.shared_experts)(hidden_states)
+            self._shared_expert_output = launch_shared_experts_on_side_stream(
+                self.shared_experts, hidden_states
+            )
         # [S/TP, B, H] -> [S*B/TP, H]
         hidden_states = hidden_states.view(-1, self.hidden_shape[-1])
         self._local_tokens = hidden_states.shape[0]
