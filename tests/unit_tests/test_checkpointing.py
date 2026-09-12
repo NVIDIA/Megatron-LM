@@ -466,6 +466,9 @@ def test_load_checkpoint_override_opt_param_scheduler(
         optimizer.param_groups = [
             {"is_decoupled_lr": False, "max_lr": -1.0, "min_lr": -1.0},
             {"is_decoupled_lr": True, "max_lr": -1.0, "min_lr": -1.0},
+            {"max_lr": -1.0, "min_lr": -1.0},
+            {"max_lr": -1.0, "min_lr": -1.0},
+            {"max_lr": -1.0, "min_lr": -1.0},
         ]
         opt_param_scheduler = MockOptParamScheduler(
             {"opt_param_scheduler": "scheduler_state", "num_steps": 3}
@@ -480,8 +483,11 @@ def test_load_checkpoint_override_opt_param_scheduler(
         new_model = MockModel(config)
         new_optimizer = MockOptimizer({"optimizer": "dummy1"})
         new_optimizer.param_groups = [
-            {"is_decoupled_lr": False, "max_lr": -2.0, "min_lr": -2.0},
-            {"is_decoupled_lr": True, "max_lr": -2.0, "min_lr": -2.0},
+            {"is_decoupled_lr": False, "max_lr": args.lr, "min_lr": args.min_lr},
+            {"is_decoupled_lr": True, "max_lr": args.decoupled_lr, "min_lr": args.decoupled_min_lr},
+            {"max_lr": 5.0, "min_lr": 0.5},
+            {"max_lr": 0.7, "min_lr": 0.25},
+            {},
         ]
         new_opt_param_scheduler = MockOptParamScheduler(
             {"opt_param_scheduler": "dummy2", "num_steps": 0}
@@ -497,6 +503,12 @@ def test_load_checkpoint_override_opt_param_scheduler(
         assert new_optimizer.param_groups[0]["min_lr"] == args.min_lr
         assert new_optimizer.param_groups[1]["max_lr"] == args.decoupled_lr
         assert new_optimizer.param_groups[1]["min_lr"] == args.decoupled_min_lr
+        assert new_optimizer.param_groups[2]["max_lr"] == 5.0
+        assert new_optimizer.param_groups[2]["min_lr"] == 0.5
+        assert new_optimizer.param_groups[3]["max_lr"] == 0.7
+        assert new_optimizer.param_groups[3]["min_lr"] == 0.25
+        assert "max_lr" not in new_optimizer.param_groups[4]
+        assert "min_lr" not in new_optimizer.param_groups[4]
         assert new_opt_param_scheduler.num_steps == args.consumed_train_samples
         assert new_opt_param_scheduler.step_calls[-1] == 0
 

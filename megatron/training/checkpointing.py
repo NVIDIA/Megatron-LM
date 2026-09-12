@@ -2470,6 +2470,32 @@ def _maybe_setup_gpt_to_hybrid_load(args, ckpt_args, model):
     return layer_maps, load_optim
 
 
+def _snapshot_optimizer_param_group_lr_bounds(param_groups: list[dict]) -> list[dict]:
+    """Capture runtime LR overrides in the optimizer's native parameter-group order."""
+    return [
+        {key: group[key] for key in ('max_lr', 'min_lr') if key in group} for group in param_groups
+    ]
+
+
+def _restore_optimizer_param_group_lr_bounds(
+    param_groups: list[dict], runtime_lr_bounds: list[dict]
+) -> None:
+    """Restore runtime group bounds, including the absence of scheduler overrides."""
+    if len(param_groups) != len(runtime_lr_bounds):
+        raise ValueError(
+            "Optimizer parameter-group count changed while loading its checkpoint: "
+            f"{len(runtime_lr_bounds)} runtime groups, {len(param_groups)} restored groups"
+        )
+    # Native optimizer loading preserves group order, including empty groups on
+    # pipeline stages. Group dictionaries themselves may have been replaced.
+    for group, runtime_bounds in zip(param_groups, runtime_lr_bounds):
+        for key in ('max_lr', 'min_lr'):
+            if key in runtime_bounds:
+                group[key] = runtime_bounds[key]
+            else:
+                group.pop(key, None)
+
+
 def load_checkpoint(
     ddp_model,
     optimizer,
@@ -2498,6 +2524,15 @@ def load_checkpoint(
     """
     args = get_args()
     load_dir = getattr(args, load_arg)
+    runtime_lr_bounds = None
+    if (
+        getattr(args, 'override_opt_param_scheduler', False)
+        and optimizer is not None
+        and not getattr(optimizer, 'is_stub_optimizer', False)
+    ):
+        # Some DCP backends load optimizer metadata in-place while reading the
+        # checkpoint, so capture runtime bounds before any checkpoint I/O.
+        runtime_lr_bounds = _snapshot_optimizer_param_group_lr_bounds(optimizer.param_groups)
 
     # --freeze-all-layers: nothing trains, so load the model in --load weights-only (finetune-style)
     # and auto-resume the data position by feeding this run's own progress tracker -- written to
@@ -3030,9 +3065,8 @@ def load_checkpoint(
                 else:
                     opt_param_scheduler.load_state_dict(state_dict['opt_param_scheduler'])
 
-            # Optimizer state dict can overwrite per-group max_lr/min_lr values.
-            # If scheduler override is requested, re-apply runtime lr bounds from
-            # args so scheduler math does not stay pinned to checkpoint lr settings.
+            # Optimizer loading overwrites group bounds. Preserve runtime group
+            # overrides instead of replacing them with the global args.lr values.
             if getattr(args, "override_opt_param_scheduler", False):
                 if (
                     optimizer is None
@@ -3045,17 +3079,10 @@ def load_checkpoint(
                         "and optimizer param_group max_lr/min_lr."
                     )
                 else:
-                    for param_group in optimizer.param_groups:
-                        if param_group.get("is_decoupled_lr", False):
-                            max_lr = getattr(args, "decoupled_lr", None)
-                            min_lr = getattr(args, "decoupled_min_lr", None)
-                        else:
-                            max_lr = args.lr
-                            min_lr = args.min_lr
-                        if max_lr is not None:
-                            param_group["max_lr"] = max_lr
-                        if min_lr is not None:
-                            param_group["min_lr"] = min_lr
+                    assert runtime_lr_bounds is not None
+                    _restore_optimizer_param_group_lr_bounds(
+                        optimizer.param_groups, runtime_lr_bounds
+                    )
                     # Synchronize scheduler num_steps with consumed_train_samples
                     # to ensure lr calculation is based on current training progress
                     if opt_param_scheduler.num_steps != args.consumed_train_samples:

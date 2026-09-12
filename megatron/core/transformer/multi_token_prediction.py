@@ -1362,6 +1362,7 @@ class MultiTokenPredictionLayer(MegatronModule):
         if mtp_layer_pattern is not None and hybrid_submodules is not None:
             from megatron.core.models.hybrid.hybrid_block import HybridStack
             from megatron.core.models.hybrid.hybrid_layer_allocation import validate_segment_layers
+            from megatron.core.transformer.moe.router import Router
 
             self.mtp_model_layer = HybridStack(
                 config=self.config,
@@ -1376,6 +1377,12 @@ class MultiTokenPredictionLayer(MegatronModule):
                 boundary_layout=self.config.attention_cp_layout,
                 name=(name + ".mtp_model_layer") if name is not None else None,
             )
+            # Auxiliary metrics have one slot per prediction depth, regardless
+            # of the number or positions of MoE layers in the Hybrid segment.
+            # Keep the inner layer numbering used by routing and replay intact.
+            for module in self.mtp_model_layer.modules():
+                if isinstance(module, Router):
+                    module.mtp_layer_number = self.layer_number
         elif self.config.mtp_num_layers is not None:
             # GPT path: Uses the transformer block spec for MTP layer
             # MTP inner layers use their own layer numbering (self.layer_number = 1, 2, etc.)
