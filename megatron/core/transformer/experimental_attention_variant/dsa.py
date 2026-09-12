@@ -2214,18 +2214,6 @@ class DSAttention(MegatronModule):
             cp_group if cp_size > 1 and not self.config.calculate_per_token_loss else None
         )
 
-        if (
-            self.training
-            and torch.is_grad_enabled()
-            and getattr(self.config, "dsa_train_main_only", False)
-        ):
-            # Train the main attention only: skip the indexer loss entirely and route
-            # with detached top-k indices.
-            _, topk_indices = self.indexer.forward_with_scores(
-                x, qr, mask=float_mask, packed_seq_params=packed_seq_params
-            )
-            return unfused_dsa_fn(query, key, value, topk_indices, self.softmax_scale)
-
         topk_holder = (
             self._get_index_share_topk_holder(packed_seq_params, attention_mask)
             if self.index_share
