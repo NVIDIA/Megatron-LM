@@ -398,6 +398,15 @@ def combined_forward_backward_step(
         # may apply to expert parameters only. The release callbacks skip any parameter
         # whose weights are not sharded.
         forward_fsdp_wrapper = find_megatron_fsdp(f_model)
+        # Full recompute re-runs each layer segment's forward at backward time, which
+        # needs the (sharded) parameters to be all-gathered again. That interaction
+        # with the FSDP reshard hooks is not yet supported.
+        assert not (
+            forward_fsdp_wrapper is not None and getattr(f_schedule_plan, "recompute_full", False)
+        ), (
+            "overlap_moe_expert_parallel_comm full recompute (recompute_granularity=full) "
+            "is not yet supported together with Megatron FSDP."
+        )
         if forward_fsdp_wrapper is not None and any_sharding_strategy_in(
             forward_fsdp_wrapper.ddp_config, ["optim_grads_params"]
         ):
