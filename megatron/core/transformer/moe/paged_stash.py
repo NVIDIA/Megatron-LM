@@ -1005,7 +1005,23 @@ class PagedStashRunner:
 
         # Local import avoids circular import: schedules -> paged_stash -> multi_token_prediction
         # -> megatron.core (still loading).
+        from megatron.core.transformer.cuda_graphs import _graphable_leaves
         from megatron.core.transformer.multi_token_prediction import MultiTokenPredictionLayer
+
+        def _moe_mlps_in(layer):
+            # Descend into grouped HybridStack layers: for bracketed hybrid patterns,
+            # decoder.layers[] holds the group whose own .mlp is None, so the flat lookup
+            # finds zero MoE layers and the paged stash silently skips the whole model.
+            if isinstance(layer, MultiTokenPredictionLayer):
+                layer = layer.mtp_model_layer
+            for leaf in _graphable_leaves(layer):
+                mlp = getattr(leaf, 'mlp', None)
+                if (
+                    mlp is not None
+                    and hasattr(mlp, 'token_dispatcher')
+                    and hasattr(mlp.token_dispatcher, 'check_over_budget')
+                ):
+                    yield mlp
 
         for model_chunk in self.model:
             model_with_decoder = get_attr_wrapped_model(
@@ -1023,16 +1039,7 @@ class PagedStashRunner:
                 _track_cfg(getattr(module, 'config', None))
 
             for layer in model_with_decoder.decoder.layers:
-                transformer_layer = (
-                    layer.mtp_model_layer if isinstance(layer, MultiTokenPredictionLayer) else layer
-                )
-                mlp = getattr(transformer_layer, "mlp", None)
-                if (
-                    mlp is not None
-                    and hasattr(mlp, 'token_dispatcher')
-                    and hasattr(mlp.token_dispatcher, 'check_over_budget')
-                ):
-                    self.moe_layers.append(mlp)
+                self.moe_layers.extend(_moe_mlps_in(layer))
             if model_with_decoder.mtp_process:
                 for layer in model_with_decoder.mtp.layers:
                     transformer_layer = (

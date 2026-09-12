@@ -11,6 +11,7 @@ from megatron.core.tensor_parallel.random import (
     get_cuda_rng_tracker,
     model_parallel_cuda_manual_seed,
 )
+from megatron.core.transformer.moe.moe_logging import destroy_moe_metrics_tracker
 from megatron.core.transformer.moe.moe_utils import (
     clear_aux_losses_tracker,
     get_default_pg_collection,
@@ -131,6 +132,43 @@ class TestAuxLoss:
             moe_aux_loss_coeff=0.1,
         )
         container.aux_loss_test(self.input, self.baseline_grad, "load_balancing_loss")
+
+
+@pytest.mark.internal
+def test_z_loss_wraps_hybrid_mtp_layer_number_to_tracker_slot():
+    """Hybrid MTP routers must record z-loss in one of the configured MTP slots."""
+
+    class DummyGroup:
+        @staticmethod
+        def size():
+            return 1
+
+    class DummyConfig:
+        moe_z_loss_coeff = 1.0
+        mtp_num_layers = 2
+        mtp_use_repeated_layer = False
+        num_layers = 8
+
+    class DummyRouter:
+        config = DummyConfig()
+        tp_cp_group = DummyGroup()
+        tp_dp_cp_group = DummyGroup()
+        training = True
+        calculate_per_token_loss = False
+        is_mtp_layer = True
+        layer_number = 5
+
+    destroy_moe_metrics_tracker()
+    try:
+        logits = torch.randn(4, 3, requires_grad=True)
+        TopKRouter.apply_z_loss(DummyRouter(), logits)
+
+        values = get_moe_layer_wise_logging_tracker()["z_loss"]["values"]
+        assert values.shape == (10,)
+        assert values[8] > 0
+        assert torch.count_nonzero(values) == 1
+    finally:
+        destroy_moe_metrics_tracker()
 
 
 class TestSeqAuxLoss:
