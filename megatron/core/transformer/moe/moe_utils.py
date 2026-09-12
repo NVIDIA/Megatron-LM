@@ -604,9 +604,6 @@ def unpermute(
     if torch.are_deterministic_algorithms_enabled():
         # Use index_add which is deterministic when deterministic algorithms are enabled
         # and is CUDA graph compatible
-        output_tokens = torch.zeros(
-            restore_shape, dtype=permuted_tokens.dtype, device=permuted_tokens.device
-        )
         # index_add is deterministic when torch.use_deterministic_algorithms(True) is set
         # and is CUDA graph compatible unlike scatter_add
         output_tokens.index_add_(0, sorted_indices, permuted_tokens)
