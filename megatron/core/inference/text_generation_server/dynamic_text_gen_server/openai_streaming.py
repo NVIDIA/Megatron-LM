@@ -46,16 +46,34 @@ def json_safe_top_n_logprobs(
     ]
 
 
-def _top_logprob_entries(top_logprobs):
+def detokenize_top_n_keys(top_n_logprobs, tokenizer):
+    """Re-key id-keyed top-n logprob dicts by detokenized string for the OpenAI wire format.
+
+    The engine keys these by token id so that byte-fallback tokens don't collide.
+    The OpenAI response schema is string-keyed, so convert back at the edge.
+    Distinct ids that detokenize to the same string (byte fallbacks) still collide
+    here; use /raw_completions when exact token identity matters.
+    """
+    return [
+        (
+            {tokenizer.detokenize([int(token_id)]): logprob for token_id, logprob in entry.items()}
+            if isinstance(entry, dict)
+            else entry
+        )
+        for entry in top_n_logprobs
+    ]
+
+
+def _top_logprob_entries(top_logprobs, tokenizer):
     if not isinstance(top_logprobs, dict):
         return []
     return [
         {
-            "token": str(token),
+            "token": token,
             "logprob": json_safe_logprob(logprob),
-            "bytes": list(str(token).encode("utf-8")),
+            "bytes": list(token.encode("utf-8")),
         }
-        for token, logprob in top_logprobs.items()
+        for token, logprob in detokenize_top_n_keys([top_logprobs], tokenizer)[0].items()
     ]
 
 
@@ -73,7 +91,7 @@ def _token_logprobs(tokenizer, token_ids, log_probs, top_log_probs, chat, start_
                 "token": token,
                 "logprob": json_safe_logprob(log_probs[i]) if i < len(log_probs) else None,
                 "bytes": list(token.encode("utf-8")),
-                "top_logprobs": _top_logprob_entries(token_top_logprobs),
+                "top_logprobs": _top_logprob_entries(token_top_logprobs, tokenizer),
             }
         )
         offsets.append(offset)
@@ -84,8 +102,17 @@ def _token_logprobs(tokenizer, token_ids, log_probs, top_log_probs, chat, start_
         "tokens": [entry["token"] for entry in entries],
         "token_logprobs": [entry["logprob"] for entry in entries],
         "top_logprobs": json_safe_top_n_logprobs(
-            top_log_probs[i] if top_log_probs is not None and i < len(top_log_probs) else None
-            for i in range(len(entries))
+            detokenize_top_n_keys(
+                [
+                    (
+                        top_log_probs[i]
+                        if top_log_probs is not None and i < len(top_log_probs)
+                        else None
+                    )
+                    for i in range(len(entries))
+                ],
+                tokenizer,
+            )
         ),
         "text_offset": offsets,
     }
@@ -97,7 +124,9 @@ def _prompt_logprobs(tokenizer, token_ids, log_probs, top_log_probs):
     token_logprobs = [None] + json_safe_logprobs(log_probs or [])
     token_logprobs = token_logprobs[: len(tokens)]
     token_logprobs.extend([None] * (len(tokens) - len(token_logprobs)))
-    prompt_top_logprobs = [None] + json_safe_top_n_logprobs(top_log_probs or [])
+    prompt_top_logprobs = [None] + json_safe_top_n_logprobs(
+        detokenize_top_n_keys(top_log_probs or [], tokenizer)
+    )
     prompt_top_logprobs = prompt_top_logprobs[: len(tokens)]
     prompt_top_logprobs.extend([None] * (len(tokens) - len(prompt_top_logprobs)))
 

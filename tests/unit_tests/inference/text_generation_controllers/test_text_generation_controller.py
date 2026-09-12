@@ -2438,7 +2438,9 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
             for k, log_probs in enumerate(generated_log_probs):
                 token_id = generated_tokens[k]
                 top_n = generated_top_n_logprobs[k]
-                token = self.mock_tokenizer.detokenize([token_id])
+                # The controller keys top-n dicts by token id as a decimal string, not by
+                # detokenized text, so byte-fallback tokens don't collide.
+                token = str(int(token_id))
 
                 assert token in top_n, f"{request_id}: Generated token {token} missing in top‑N"
                 assert (

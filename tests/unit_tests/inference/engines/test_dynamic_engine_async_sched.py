@@ -1685,10 +1685,12 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
                         request.generated_log_probs,
                         request.generated_top_n_logprobs,
                     ):
-                        token_text = controller.tokenizer.detokenize([token])
+                        # The engine keys top-n dicts by token id as a decimal string,
+                        # not by detokenized text.
+                        token_key = str(int(token))
                         assert 0 < len(top_n) <= request.sampling_params.top_n_logprobs
-                        assert token_text in top_n
-                        assert top_n[token_text] == pytest.approx(logprob, rel=0, abs=0.1)
+                        assert token_key in top_n
+                        assert top_n[token_key] == pytest.approx(logprob, rel=0, abs=0.1)
                     if request.sampling_params.skip_prompt_log_probs:
                         assert not request.prompt_top_n_logprobs
                     else:

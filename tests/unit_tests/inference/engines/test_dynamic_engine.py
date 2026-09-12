@@ -3617,17 +3617,18 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                         request.generated_tokens,
                     )
                 ):
-                    # Get the token string for this token_id
-                    token_str = env.engine.controller.tokenizer.detokenize([token_id])
+                    # The engine keys top-n dicts by token id as a decimal string, not by
+                    # detokenized text, so byte-fallback tokens don't collide.
+                    token_key = str(int(token_id))
                     # The selected token should be in the top-n
                     assert (
-                        token_str in top_n_dict
-                    ), f"Request {request.request_id}, token {i}: selected token '{token_str}' not in top-n"
+                        token_key in top_n_dict
+                    ), f"Request {request.request_id}, token {i}: selected token '{token_key}' not in top-n"
                     # The log prob should match (with some tolerance for floating point precision)
                     # Using 0.1 tolerance to account for FP16/BF16 precision in mixed precision training
                     assert (
-                        abs(log_prob - top_n_dict[token_str]) < 0.1
-                    ), f"Request {request.request_id}, token {i}: log_prob mismatch {log_prob} vs {top_n_dict[token_str]}"
+                        abs(log_prob - top_n_dict[token_key]) < 0.1
+                    ), f"Request {request.request_id}, token {i}: log_prob mismatch {log_prob} vs {top_n_dict[token_key]}"
 
     @pytest.mark.internal
     @pytest.mark.skipif(
@@ -5313,14 +5314,16 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                 for j, (lp, top_n_dict, token_id) in enumerate(
                     zip(req.generated_log_probs, req.generated_top_n_logprobs, req.generated_tokens)
                 ):
-                    token_str = env.engine.controller.tokenizer.detokenize([token_id])
-                    assert token_str in top_n_dict, (
+                    # The engine keys top-n dicts by token id as a decimal string, not by
+                    # detokenized text, so byte-fallback tokens don't collide.
+                    token_key = str(int(token_id))
+                    assert token_key in top_n_dict, (
                         f"Request {req.request_id}, token {j}: "
-                        f"selected token '{token_str}' not in top-n keys {list(top_n_dict.keys())}"
+                        f"selected token '{token_key}' not in top-n keys {list(top_n_dict.keys())}"
                     )
-                    assert abs(lp - top_n_dict[token_str]) < 0.01, (
+                    assert abs(lp - top_n_dict[token_key]) < 0.01, (
                         f"Request {req.request_id}, token {j}: "
-                        f"log_prob {lp} vs top-n {top_n_dict[token_str]}"
+                        f"log_prob {lp} vs top-n {top_n_dict[token_key]}"
                     )
 
             # Validate prompt top-n logprobs.
@@ -5584,19 +5587,21 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                 for j, (lp, top_n_dict, token_id) in enumerate(
                     zip(req.generated_log_probs, req.generated_top_n_logprobs, req.generated_tokens)
                 ):
-                    token_str = env.engine.controller.tokenizer.detokenize([token_id])
-                    if token_str in top_n_dict:
+                    # The engine keys top-n dicts by token id as a decimal string, not by
+                    # detokenized text, so byte-fallback tokens don't collide.
+                    token_key = str(int(token_id))
+                    if token_key in top_n_dict:
                         # Sampled token is in Top N.
-                        assert abs(lp - top_n_dict[token_str]) < 0.01, (
+                        assert abs(lp - top_n_dict[token_key]) < 0.01, (
                             f"Request {req.request_id}, token {j}: "
-                            f"log_prob {lp} vs top-n {top_n_dict[token_str]}"
+                            f"log_prob {lp} vs top-n {top_n_dict[token_key]}"
                         )
                     else:
                         # Sampled token is not in the Top N. It must be a tie.
                         # Check that it is at least as probable as Top N tokens.
                         assert lp + 0.01 >= min(top_n_dict.values()), (
                             f"Request {req.request_id}, token {j}: "
-                            f"selected token '{token_str}' log_prob {lp} is worse than "
+                            f"selected token '{token_key}' log_prob {lp} is worse than "
                             f"top-n minimum {min(top_n_dict.values())}"
                         )
 

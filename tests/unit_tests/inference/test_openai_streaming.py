@@ -74,7 +74,7 @@ async def test_openai_stream_emits_delta_chunks_and_terminal_metadata():
                 "request_id": 1,
                 "new_tokens": [1, 2],
                 "new_log_probs": [-0.1, NEG_INF],
-                "new_top_n_logprobs": [{"a": -0.01}, {"b": NEG_INF}],
+                "new_top_n_logprobs": [{"1": -0.01}, {"2": NEG_INF}],
             }
         }
     )
@@ -86,7 +86,7 @@ async def test_openai_stream_emits_delta_chunks_and_terminal_metadata():
                 "prompt_tokens": [9, 9],
                 "generated_tokens": [1, 2, 3],
                 "generated_log_probs": [-0.1, NEG_INF, -0.3],
-                "generated_top_n_logprobs": [{"a": -0.01}, {"b": -0.02}, {"c": -0.03}],
+                "generated_top_n_logprobs": [{"1": -0.01}, {"2": -0.02}, {"3": -0.03}],
                 "num_cached_tokens": 2,
                 "sampling_params": {"num_tokens_to_generate": 3},
             }
@@ -162,9 +162,9 @@ async def test_openai_stream_echoes_completion_prompt_before_generated_text():
                 "request_id": 1,
                 "new_tokens": [1],
                 "new_log_probs": [-0.1],
-                "new_top_n_logprobs": [{"a": -0.01}],
+                "new_top_n_logprobs": [{"1": -0.01}],
                 "prompt_log_probs": [NEG_INF],
-                "prompt_top_n_logprobs": [{"z": -0.04}],
+                "prompt_top_n_logprobs": [{"26": -0.04}],
             }
         }
     )
@@ -174,7 +174,7 @@ async def test_openai_stream_echoes_completion_prompt_before_generated_text():
                 "prompt_tokens": [26, 26],
                 "generated_tokens": [1],
                 "generated_log_probs": [-0.1],
-                "generated_top_n_logprobs": [{"a": -0.01}],
+                "generated_top_n_logprobs": [{"1": -0.01}],
                 "sampling_params": {"num_tokens_to_generate": 2},
             }
         }
@@ -241,7 +241,7 @@ async def test_openai_stream_preserves_chat_top_logprobs_with_parser():
                 "request_id": 1,
                 "new_tokens": [1],
                 "new_log_probs": [-0.1],
-                "new_top_n_logprobs": [{"a": NEG_INF}],
+                "new_top_n_logprobs": [{"1": NEG_INF}],
             }
         }
     )
@@ -251,7 +251,7 @@ async def test_openai_stream_preserves_chat_top_logprobs_with_parser():
                 "prompt_tokens": [9],
                 "generated_tokens": [1],
                 "generated_log_probs": [-0.1],
-                "generated_top_n_logprobs": [{"a": NEG_INF}],
+                "generated_top_n_logprobs": [{"1": NEG_INF}],
                 "sampling_params": {"num_tokens_to_generate": 2},
             }
         }
