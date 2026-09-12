@@ -3018,6 +3018,89 @@ class TestMultiTokenPrediction:
 
         torch.testing.assert_close(rolled, expected)
 
+    @pytest.mark.parametrize("cp", [1, 2, 4])
+    @pytest.mark.parametrize("lengths", [(7, 11), (1, 3), (8, 16)])
+    @pytest.mark.parametrize(
+        "kind,dtype", [("mask", torch.float32), ("mask", torch.bool), ("tokens", torch.int64)]
+    )
+    @pytest.mark.parametrize("padding_value", [0, 1])
+    def test_roll_tensor_respects_logical_ends_with_padded_cp(
+        self, cp, lengths, kind, dtype, padding_value
+    ):
+        """Padding must stay invalid even when its tensor values are nonzero."""
+        if int(os.environ.get("WORLD_SIZE", "1")) < cp:
+            pytest.skip(f"CP={cp} requires at least {cp} ranks")
+        Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=cp)
+        cp_group = get_context_parallel_group()
+        cp_rank = get_pg_rank(cp_group)
+        capacities = [((length + 7) // 8) * 8 for length in lengths]
+        logical = [0]
+        physical = [0]
+        local_indices = []
+        for length, capacity in zip(lengths, capacities):
+            start = physical[-1]
+            width = capacity // (2 * cp)
+            for chunk in (cp_rank, 2 * cp - cp_rank - 1):
+                local_indices.extend(range(start + chunk * width, start + (chunk + 1) * width))
+            logical.append(logical[-1] + length)
+            physical.append(start + capacity)
+        index = torch.tensor(local_indices, dtype=torch.long, device="cuda")
+        cu_seqlens = torch.tensor(logical, dtype=torch.int32, device="cuda")
+        cu_seqlens_padded = torch.tensor(physical, dtype=torch.int32, device="cuda")
+        packed_seq_params = PackedSeqParams(
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_kv=cu_seqlens,
+            cu_seqlens_q_padded=cu_seqlens_padded,
+            cu_seqlens_kv_padded=cu_seqlens_padded,
+            qkv_format="thd",
+        )
+
+        full = torch.full((2, physical[-1]), padding_value, dtype=dtype, device="cuda")
+        for sequence, (start, length) in enumerate(zip(physical, lengths)):
+            if kind == "mask":
+                full[..., start : start + length] = 1
+            else:
+                full[..., start : start + length] = torch.arange(
+                    100 * sequence + 1, 100 * sequence + length + 1, device="cuda"
+                )
+        current = full.index_select(-1, index)
+        for depth in range(1, 7):
+            expected = torch.zeros_like(full)
+            for start, length in zip(physical, lengths):
+                count = max(0, length - depth)
+                expected[..., start : start + count] = full[
+                    ..., start + depth : start + depth + count
+                ]
+            expected = expected.index_select(-1, index)
+            before = current.clone()
+            rolled, total = roll_tensor(
+                current, cp_group=cp_group, packed_seq_params=packed_seq_params
+            )
+            without_sum, disabled_sum = roll_tensor(
+                current, cp_group=cp_group, packed_seq_params=packed_seq_params, return_sum=False
+            )
+            checks = [
+                torch.equal(rolled, expected),
+                torch.equal(without_sum, expected),
+                torch.equal(current, before),
+                disabled_sum is None,
+                total.item() == rolled.sum().item(),
+            ]
+            if kind == "mask":
+                global_count = rolled.sum()
+                torch.distributed.all_reduce(global_count, group=cp_group)
+                checks.append(
+                    global_count.item() == 2 * sum(max(0, length - depth) for length in lengths)
+                )
+            # Fail on every rank together so a bad CP boundary cannot strand peers
+            # in the next roll's point-to-point communication or test teardown.
+            passed = torch.tensor(checks, dtype=torch.int32, device="cuda")
+            torch.distributed.all_reduce(passed, op=torch.distributed.ReduceOp.MIN)
+            assert passed.all().item(), f"Invalid packed roll at depth {depth}: {passed.tolist()}"
+            current = rolled
+        assert cu_seqlens.tolist() == logical
+        assert cu_seqlens_padded.tolist() == physical
+
     def test_roll_tensor_with_attention_padded_packed_sequences(self):
         cp = 4
         if int(os.environ.get("WORLD_SIZE", "1")) < cp:
