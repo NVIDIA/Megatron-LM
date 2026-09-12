@@ -508,11 +508,12 @@ class TestMegatronFsdpFullyShard:
                 "lerp on a Replicate() DTensor, which is unsupported by the DTensor "
                 "dispatcher in PyTorch 26.06+."
             )
-        elif dp_outer_strategy == OPTIM and dp_shard_strategy != OPTIM_GRADS_PARAMS:
-            # TODO(@shjwudp, @cspades): Requires various modifications to support.
+        elif dp_outer_strategy == OPTIM and dp_shard_strategy in (NO_SHARD, OPTIM):
+            # DP-Outer sharding reduce-scatters the DP-Shard gradient shard into the DP-wide
+            # shard, so a DP-Shard strategy that replicates gradients has none to feed it.
             pytest.skip(
-                f"dp_outer sharding strategy {dp_outer_strategy} requires "
-                "zero_dp_strategy to be full-sharded ('optim_grads_params', 3)."
+                f"dp_outer sharding strategy {dp_outer_strategy} requires a zero_dp_strategy "
+                "that shards gradients ('optim_grads', 2 or 'optim_grads_params', 3)."
             )
 
         # Construct device mesh.
@@ -628,11 +629,12 @@ class TestMegatronFsdpFullyShard:
         from torch.distributed.tensor import DTensor
 
         # Skip tests.
-        if outer_shard_strategy == OPTIM and shard_strategy != OPTIM_GRADS_PARAMS:
-            # TODO(@shjwudp, @cspades): Requires various modifications to support.
+        if outer_shard_strategy == OPTIM and shard_strategy in (NO_SHARD, OPTIM):
+            # DP-Outer sharding reduce-scatters the DP-Shard gradient shard into the DP-wide
+            # shard, so a DP-Shard strategy that replicates gradients has none to feed it.
             pytest.skip(
-                f"dp_outer sharding strategy {outer_shard_strategy} requires "
-                "zero_dp_strategy to be full-sharded ('optim_grads_params', 3)."
+                f"dp_outer sharding strategy {outer_shard_strategy} requires a zero_dp_strategy "
+                "that shards gradients ('optim_grads', 2 or 'optim_grads_params', 3)."
             )
         if shard_strategy == NO_SHARD:
             # NOTE: Just directly checkpoint the MegatronFSDP.module.state_dict() using torch.save().
@@ -1346,10 +1348,12 @@ class TestMegatronFsdpFullyShard:
         Test custom data-types for gather and reduce communications.
         """
 
-        if dp_outer_strategy == OPTIM and dp_shard_strategy != OPTIM_GRADS_PARAMS:
+        if dp_outer_strategy == OPTIM and dp_shard_strategy == OPTIM:
+            # DP-Outer sharding reduce-scatters the DP-Shard gradient shard into the DP-wide
+            # shard, so a DP-Shard strategy that replicates gradients has none to feed it.
             pytest.skip(
-                f"dp_outer sharding strategy {dp_outer_strategy} requires "
-                "zero_dp_strategy to be full-sharded ('optim_grads_params', 3)."
+                f"dp_outer sharding strategy {dp_outer_strategy} requires a zero_dp_strategy "
+                "that shards gradients ('optim_grads', 2 or 'optim_grads_params', 3)."
             )
         if model_type == TE_TRANSFORMER and custom_main_params_dtype is None:
             pytest.skip(
