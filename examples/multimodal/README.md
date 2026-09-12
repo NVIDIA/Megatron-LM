@@ -99,7 +99,7 @@ You can execute the pretraining script multiple times to resume training. On res
 
 ### SFT
 
-1. Prepare an instruction tuning dataset such in [megatron-energon format](https://nvidia.github.io/Megatron-Energon/data_prep.html#). NOTE: we do not provide instructions for this.
+1. Prepare an instruction tuning dataset such in [megatron-energon format](https://nvidia.github.io/Megatron-Energon/basic/data_prep.html). NOTE: we do not provide instructions for this.
 
 2. Update `sft_dataset.yaml` so that both `path` variables point to the train and val splits of your instruction tuning dataset.
 

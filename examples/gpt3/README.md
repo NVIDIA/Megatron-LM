@@ -3,7 +3,6 @@
 ## Table of contents
 - [1. Training Setup](#1-training-setup)
 - [2. Configurations](#2-configurations)
-- [3. Training Results](#3-training-results)
 
 ## 1. Training setup
 <a id="markdown-training-setup" name="training-setup"></a>
