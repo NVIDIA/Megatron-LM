@@ -160,6 +160,9 @@ test = [
     "pyyaml",
     "nemo-run",
 ]
+# docker/common/install.sh installs all dependency groups in the CI image.
+# Testmon remains inactive unless pytest receives a --testmon option.
+testmon = ["pytest-testmon==2.2.0"]
 docs = [
     "sphinx",
     "sphinx-autobuild",    # For live doc serving while editing docs

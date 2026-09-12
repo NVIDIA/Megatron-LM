@@ -298,7 +298,7 @@ def _build_num_microbatches_calculator(
 
 def _round(batch_size: int, divisor: int) -> int:
     """Round `batch_size` down to nearest batch size divisible by `divisor`."""
-    return (batch_size // divisor) * divisor
+    return divisor * (batch_size // divisor)
 
 
 class NumMicroBatchesCalculator(ABC):

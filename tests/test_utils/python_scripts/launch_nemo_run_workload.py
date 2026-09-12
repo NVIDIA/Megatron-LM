@@ -146,6 +146,13 @@ def _collect_failure_logs(workdir: pathlib.Path) -> list[str]:
 @click.option("--hf-home", required=False, type=str, help="HF home directory of the workload")
 @click.option("--tag", required=False, type=str, help="Tag of the workload")
 @click.option(
+    "--unit-testmon-mode",
+    type=click.Choice(["full", "enforce", "baseline", "bootstrap"]),
+    default="full",
+    show_default=True,
+    help="Selective unit-test mode.",
+)
+@click.option(
     "--enable-lightweight-mode",
     is_flag=True,
     show_default=True,
@@ -175,6 +182,7 @@ def main(
     data_dir: Optional[str] = None,
     hf_home: Optional[str] = None,
     tag: Optional[str] = None,
+    unit_testmon_mode: str = "full",
     enable_lightweight_mode: Optional[bool] = False,
     cadence: Optional[str] = None,
 ):
@@ -223,6 +231,7 @@ def main(
         shm_size="30g",
         env_vars={
             "PYTHONUNBUFFERED": "1",
+            "UNIT_TESTMON_MODE": unit_testmon_mode,
             "FORCE_COLOR": "1",
             "TERM": "xterm-256color",
             "OUTPUT_PATH": os.getcwd(),
