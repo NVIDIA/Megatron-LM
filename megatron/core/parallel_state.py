@@ -30,6 +30,9 @@ _TENSOR_MODEL_PARALLEL_GROUP = None
 # Generalized tensor parallelism group that the current rank belongs to.
 _GTP_WEIGHT_REMAT_GROUP = None
 _GTP_WEIGHT_REMAT_GLOBAL_RANKS = None
+# CP-free GTP_remat group/degree; see get_gtp_weight_remat_group_no_cp.
+_GTP_WEIGHT_REMAT_GROUP_NO_CP = None
+_GTP_WEIGHT_REMAT_SIZE_NO_CP = 1
 # Inter-layer model parallel group that the current rank belongs to.
 _PIPELINE_MODEL_PARALLEL_GROUP = None
 # Model parallel group (both intra- and pipeline) that the current rank belongs to.
@@ -927,15 +930,36 @@ def initialize_model_parallel(
         data_parallel_size * context_parallel_size
     ) // num_distributed_optimizer_instances
 
-    # Build the generalized tensor parallel groups.
-    # GTP_remat overlaps with the CP-DP domain because GTP_remat only shards weights
-    # while CP only shards activations — they are independent and can share ranks.
+    # Build the generalized tensor parallel group: the axis a GTP weight is sharded over.
+    #
+    # CP is FOLDED IN whenever it is active, so the group is cp x gtp_remat and a dense weight
+    # is cut into that many shards. A CP rank computes a partial wgrad for the whole weight
+    # exactly like a DP rank does, so sharding over CP makes the wgrad reduce-scatter sum CP's
+    # contribution as a side effect -- CP is then absorbed here rather than handled beside it,
+    # and every weight-sharding caller (materialization, init seeds, Muon, CUDA-graph streams)
+    # stays CP-unaware by construction.
+    #
+    # Two consequences, handled at their own sites rather than here:
+    #   * a GTP-managed param's DDP bucket must skip CP (it was already summed above), see
+    #     BufferKey.excludes_cp_from_bucket;
+    #   * checkpoint writer election must exclude whatever this group shards over, see
+    #     gtp_replica_rank.
+    #
+    # `config.gtp_weight_remat_size` deliberately stays CP-FREE: it doubles as the
+    # "peers consuming distinct microbatches" factor in global-batch accounting, and CP peers
+    # share a sample. Use get_gtp_weight_remat_size_no_cp() to compare against it.
     global _GTP_WEIGHT_REMAT_GROUP
     global _GTP_WEIGHT_REMAT_GLOBAL_RANKS
     assert (
         _GTP_WEIGHT_REMAT_GROUP is None
     ), "generalized tensor parallel group is already initialized"
-    for gtp_ranks in decoder_rank_generator.get_gtp_ranks(gtp_remat_size):
+    if context_parallel_size > 1 and gtp_remat_size > 1:
+        gtp_rank_sets = decoder_rank_generator.get_ranks('cp-gtp_remat')
+    else:
+        gtp_rank_sets = decoder_rank_generator.get_gtp_ranks(gtp_remat_size)
+    for gtp_ranks in gtp_rank_sets:
+        # Keeps the "gtp_remat" NCCL key: this is the group carrying the AG/RS traffic either
+        # way, so existing tuning and --high-priority-stream-groups entries still apply.
         group = create_group(
             gtp_ranks,
             timeout=timeout,
@@ -945,6 +969,24 @@ def initialize_model_parallel(
         if rank in gtp_ranks:
             _GTP_WEIGHT_REMAT_GROUP = group
             _GTP_WEIGHT_REMAT_GLOBAL_RANKS = gtp_ranks
+
+    # The CP-free axis, kept for the consumers that must NOT see CP (see
+    # get_gtp_weight_remat_group_no_cp). Aliases the group above when CP is inactive.
+    global _GTP_WEIGHT_REMAT_GROUP_NO_CP
+    global _GTP_WEIGHT_REMAT_SIZE_NO_CP
+    _GTP_WEIGHT_REMAT_SIZE_NO_CP = gtp_remat_size
+    if context_parallel_size > 1 and gtp_remat_size > 1:
+        for gtp_no_cp_ranks in decoder_rank_generator.get_gtp_ranks(gtp_remat_size):
+            group = create_group(
+                gtp_no_cp_ranks,
+                timeout=timeout,
+                pg_options=get_nccl_options("gtp_remat_no_cp", nccl_comm_cfgs),
+                group_desc="GTP_WEIGHT_REMAT_GROUP_NO_CP",
+            )
+            if rank in gtp_no_cp_ranks:
+                _GTP_WEIGHT_REMAT_GROUP_NO_CP = group
+    else:
+        _GTP_WEIGHT_REMAT_GROUP_NO_CP = _GTP_WEIGHT_REMAT_GROUP
 
     # Disable Gloo under GTP_remat (out of scope; the GTP_remat optimizer uses DCP).
     if gtp_remat_size > 1:
@@ -1734,6 +1776,48 @@ def get_gtp_weight_remat_rank():
         return group.rank() if group is not None else 0
     else:
         return 0
+
+
+def get_gtp_weight_remat_group_no_cp(check_initialized=True):
+    """Get the CP-FREE GTP_remat group. Almost nothing should use this.
+
+    :func:`get_gtp_weight_remat_group` folds CP in, which is what weight sharding wants. This
+    one exists for the opposite case: reductions over params that are NOT GTP-sharded and whose
+    CP contribution was already reduced by their ordinary dp_cp DDP bucket. Reducing those over
+    the CP-folded group would count CP twice. The replicated-grad AVG in finalize_model_grads
+    is the only such consumer. Aliases the folded group when CP is inactive.
+    """
+    if check_initialized:
+        assert (
+            _GTP_WEIGHT_REMAT_GROUP_NO_CP is not None
+        ), "generalized tensor parallel (CP-free) group is not initialized"
+    return _GTP_WEIGHT_REMAT_GROUP_NO_CP
+
+
+def get_gtp_weight_remat_rank_no_cp():
+    """Return caller's rank on the CP-FREE GTP_remat axis.
+
+    :func:`get_gtp_weight_remat_rank` folds CP in, matching its group. Use this one where a
+    replicated param must be counted exactly once per CP-FREE reduction group -- e.g. the
+    grad-norm / num-zeros dedup filters, whose reduce group is ``mp`` (tp-gtp_remat-pp, no CP).
+    Keying those off the folded rank would keep the param only on the cp=0 slice, so every other
+    slice would silently under-count.
+    """
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        group = get_gtp_weight_remat_group_no_cp(check_initialized=False)
+        return group.rank() if group is not None else 0
+    else:
+        return 0
+
+
+def get_gtp_weight_remat_size_no_cp():
+    """Return the CP-FREE GTP_remat degree, i.e. ``config.gtp_weight_remat_size``.
+
+    The group itself folds CP in, so ``get_gtp_weight_remat_world_size()`` is cp x this. Use
+    this only where CP must not be counted: global-batch accounting (CP peers share a sample,
+    gtp_remat peers do not) and asserts against the configured degree.
+    """
+    return _GTP_WEIGHT_REMAT_SIZE_NO_CP
 
 
 def get_gtp_weight_remat_global_ranks(check_initialized=True):
@@ -2526,6 +2610,12 @@ def destroy_model_parallel():
 
     global _GTP_WEIGHT_REMAT_GLOBAL_RANKS
     _GTP_WEIGHT_REMAT_GLOBAL_RANKS = None
+
+    global _GTP_WEIGHT_REMAT_GROUP_NO_CP
+    _GTP_WEIGHT_REMAT_GROUP_NO_CP = None
+
+    global _GTP_WEIGHT_REMAT_SIZE_NO_CP
+    _GTP_WEIGHT_REMAT_SIZE_NO_CP = 1
 
     global _PIPELINE_MODEL_PARALLEL_GROUP
     _PIPELINE_MODEL_PARALLEL_GROUP = None

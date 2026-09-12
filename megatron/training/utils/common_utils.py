@@ -132,7 +132,8 @@ def calc_params_l2_norm(
     moe_gtp_sharded_params_data = []  # MoE-GTP_remat sharded → expert_dp
 
     if pg_collection is None:
-        gtp_rank = mpu.get_gtp_weight_remat_rank()
+        # CP-free: dense_reduce_group below is `mp` (tp-gtp_remat-pp), which excludes CP.
+        gtp_rank = mpu.get_gtp_weight_remat_rank_no_cp()
         egtp_rank = mpu.get_expert_gtp_weight_remat_rank()
         tp_group = mpu.get_tensor_model_parallel_group()
         expert_tp_group = mpu.get_expert_tensor_parallel_group()
@@ -144,7 +145,8 @@ def calc_params_l2_norm(
         dense_reduce_group = mpu.get_model_parallel_group()
         expert_reduce_group = mpu.get_expert_tensor_model_pipeline_parallel_group()
     else:
-        gtp_rank = get_pg_rank(pg_collection.gtp_remat)
+        # CP-free: dense_reduce_group below is `mp`, which excludes CP.
+        gtp_rank = get_pg_rank(pg_collection.gtp_remat_no_cp)
         egtp_rank = get_pg_rank(pg_collection.expt_gtp_remat)
         tp_group = pg_collection.tp
         expert_tp_group = pg_collection.expt_tp

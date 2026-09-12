@@ -391,6 +391,10 @@ def _ddp_wrap(
                         if intra_expt_dp_group is not None
                         else pg_collection.expt_dp
                     ).size(),
+                    # Must match DDP: GTP params' bucket skips CP (folded into gtp_remat).
+                    context_parallel_size=(
+                        cp_group.size() if (cp_group := getattr(pg_collection, "cp", None)) else 1
+                    ),
                 )
 
             wrapped_chunk = DP(

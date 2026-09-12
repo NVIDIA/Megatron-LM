@@ -18,7 +18,7 @@ from megatron.core.model_parallel_config import ModelParallelConfig
 from megatron.core.parallel_state import (
     get_expert_gtp_weight_remat_rank,
     get_global_memory_buffer,
-    get_gtp_weight_remat_rank,
+    get_gtp_weight_remat_rank_no_cp,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
@@ -126,13 +126,16 @@ def param_is_not_gtp_duplicate(param):
     GTP_remat/EGTP_remat shards are unique per peer (kept); replicated params counted only on
     rank 0 of the gtp_remat/egtp_remat axis (else counted N times). When GTP_remat is off rank is 0,
     so every param is kept.
+
+    Uses the CP-FREE gtp_remat rank: the consumer reduces over a CP-free group, so keying off the
+    CP-folded rank would keep replicated params only on the cp=0 slice.
     """
     if getattr(param, "is_gtp_weight_remat", False):
         return True
     is_expert = not getattr(param, "allreduce", True)
     if is_expert:
         return get_expert_gtp_weight_remat_rank() == 0
-    return get_gtp_weight_remat_rank() == 0
+    return get_gtp_weight_remat_rank_no_cp() == 0
 
 
 def gtp_local_pad_zero_count(gtp_shard, range_start, range_end):

@@ -58,12 +58,49 @@ class BufferKey:
             managed by :class:`LayerWiseDistributedOptimizer` (shard-aligned layout
             so each whole param lives in one shard). Non-LayerWise params get
             :class:`DistributedOptimizer`'s byte-level layout in a separate buffer.
+        excludes_cp_from_bucket: Whether this buffer's bucket collective must skip CP (use
+            the plain replicate DP group instead of the DP+CP group). True only for
+            GTP-managed params whose own weight-materialization group already spans CP
+            (gtp_remat_size > 1 and context_parallel_size > 1) — CP's contribution is summed
+            there, so the ordinary bucket collective must not sum it again.
     """
 
     param_dtype: torch.dtype
     grad_dtype: torch.dtype
     is_expert_parallel: bool
     is_managed_by_layer_wise_optimizer: bool = False
+    excludes_cp_from_bucket: bool = False
+
+
+def resolve_buffer_dp_world_size(
+    buffer_key: BufferKey,
+    data_parallel_world_size: int,
+    expert_data_parallel_world_size: Optional[int] = None,
+    context_parallel_size: int = 1,
+) -> int:
+    """Size of the data-parallel group a buffer's grads are sharded over.
+
+    Must agree with the group DDP assigns to the same buffer, since the layout dictates the
+    padding those collectives depend on. Expert buffers use the expert DP group; buffers whose
+    params already reduce over CP themselves (``excludes_cp_from_bucket``) drop the CP factor.
+
+    Args:
+        buffer_key: Key of the buffer group being laid out.
+        data_parallel_world_size: Size of the default (dense, CP-inclusive) DP group.
+        expert_data_parallel_world_size: Size of the expert DP group.
+        context_parallel_size: CP degree folded into the gtp_remat group.
+    """
+    if buffer_key.is_expert_parallel:
+        if expert_data_parallel_world_size is not None:
+            return expert_data_parallel_world_size
+        return data_parallel_world_size
+    if buffer_key.excludes_cp_from_bucket:
+        assert data_parallel_world_size % context_parallel_size == 0, (
+            f"DP world size {data_parallel_world_size} not divisible by CP "
+            f"{context_parallel_size}."
+        )
+        return data_parallel_world_size // context_parallel_size
+    return data_parallel_world_size
 
 
 @dataclass

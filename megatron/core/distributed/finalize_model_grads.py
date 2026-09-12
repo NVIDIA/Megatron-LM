@@ -601,7 +601,16 @@ def finalize_model_grads(
         # Full DP x CP x gtp_remat group: num_tokens (the per-token-loss divisor below) counts the
         # gtp_remat peers' distinct tokens. Falls back to replicate dp_cp when gtp is inactive.
         dp_cp_group = getattr(pg_collection, 'dp_cp_gtp_remat', None) or pg_collection.dp_cp
-        gtp_remat_group = getattr(pg_collection, 'gtp_remat', None)
+        # CP-FREE gtp_remat: only used for the replicated-grad AVG below, whose params already
+        # had CP reduced by their ordinary dp_cp bucket (see get_gtp_weight_remat_group_no_cp).
+        # NOT `pg_collection.gtp_remat`, which folds CP in -- that would count CP twice. A
+        # collection predating the field falls back to the MPU global rather than to the folded
+        # group; the assert below then fails loudly if neither is available.
+        gtp_remat_group = getattr(pg_collection, 'gtp_remat_no_cp', None)
+        if gtp_remat_group is None:
+            gtp_remat_group = parallel_state.get_gtp_weight_remat_group_no_cp(
+                check_initialized=False
+            )
         egtp_remat_group = getattr(pg_collection, 'expt_gtp_remat', None)
     else:
         tp_group = parallel_state.get_tensor_model_parallel_group()
@@ -609,11 +618,12 @@ def finalize_model_grads(
         embd_group = parallel_state.get_embedding_group(check_initialized=False)
         pos_emb_group = parallel_state.get_position_embedding_group(check_initialized=False)
         dp_cp_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
-        gtp_remat_group = parallel_state.get_gtp_weight_remat_group(check_initialized=False)
+        gtp_remat_group = parallel_state.get_gtp_weight_remat_group_no_cp(check_initialized=False)
         egtp_remat_group = parallel_state.get_expert_gtp_weight_remat_group(check_initialized=False)
 
     # A missing group would silently skip the gtp_remat-axis reduction below and train on
     # wrong gradients, so fail loudly whenever the config says the axis is active.
+    # Both groups here are CP-free, so they match the CP-free config scalars directly.
     for axis, group, axis_size in (
         ('gtp_remat', gtp_remat_group, config.gtp_weight_remat_size),
         ('expt_gtp_remat', egtp_remat_group, config.expert_gtp_weight_remat_size),
