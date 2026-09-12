@@ -3709,6 +3709,18 @@ def _require_candidate_kernels(precision="bf16"):
     csa2_candidates.fused_sparse_attention._ensure_dsa_namespace()
 
 
+def _reject_cuda_host_reads(monkeypatch):
+    for method in ("tolist", "item", "cpu", "numpy", "__bool__", "__int__", "__index__"):
+        original = getattr(torch.Tensor, method)
+
+        def reject_host_read(tensor, *args, original=original, **kwargs):
+            if tensor.is_cuda:
+                pytest.fail("Candidate generation must not read CUDA tensor values on the host")
+            return original(tensor, *args, **kwargs)
+
+        monkeypatch.setattr(torch.Tensor, method, reject_host_read)
+
+
 @pytest.mark.parametrize("backend", ["native", "real"])
 @pytest.mark.parametrize(
     "block_size,topk,width", [(8, 3, 59), (3, 1, 37), (2, 8, 13), (8, 2048, 32771)]
@@ -3811,6 +3823,18 @@ def test_fused_candidate_generation_matches_dense_oracle(
     monkeypatch.setattr(csa2_candidates, "_SCORE_CHUNK_MAX_BYTES", 17 * ((max_k + 3) // 4 * 4) * 4)
     scorer = csa2_candidates.fused_sparse_attention._DSA.indexer_forward_wrapper
     chunks = []
+    chunk_metadata = []
+    quantize = csa2_candidates.quantize_indexer_mxfp8
+    quantizations = []
+
+    def tracked_quantize(x, **kwargs):
+        # Keep the actual TE quantization and scale packing under the host-read
+        # guard; metadata-only or mocked-quantizer coverage misses .item().
+        result = quantize(x, **kwargs)
+        quantizations.append((x.shape, kwargs.get("buffers"), kwargs.get("out_scale")))
+        return result
+
+    monkeypatch.setattr(csa2_candidates, "quantize_indexer_mxfp8", tracked_quantize)
 
     def bounded_scorer(chunk_q, all_k, chunk_w, **kwargs):
         assert chunk_q.shape[0] <= 17
@@ -3818,10 +3842,15 @@ def test_fused_candidate_generation_matches_dense_oracle(
             assert all_k.data_ptr() == prepared.k.data_ptr()
             offset = sum(chunks) * heads * 128 * prepared.q.element_size()
             assert chunk_q.data_ptr() == prepared.q.data_ptr() + offset
-        assert kwargs["cu_seqlens_q"][-1] == chunk_q.shape[0]
-        assert kwargs["cu_seqlens_k"][-1] == all_k.shape[0]
-        assert kwargs["cu_seqlens_q"].diff().max() <= kwargs["max_seqlen_q"]
-        assert kwargs["cu_seqlens_k"].diff().max() <= kwargs["max_seqlen_k"]
+        chunk_metadata.append(
+            (
+                kwargs["cu_seqlens_q"],
+                kwargs["cu_seqlens_k"],
+                kwargs["max_seqlen_q"],
+                kwargs["max_seqlen_k"],
+                all_k.shape[0],
+            )
+        )
         chunks.append(chunk_q.shape[0])
         return scorer(chunk_q, all_k, chunk_w, **kwargs)
 
@@ -3835,11 +3864,27 @@ def test_fused_candidate_generation_matches_dense_oracle(
         q, k, w, ratio, thd_layout=token_layout, compressed_layout=compressed
     )
     prepared_before = [t.clone() for t in (prepared.q, prepared.k, prepared.weights)]
-    actual_topk, actual = indexer._fused_topk_and_candidates(prepared)
+    with monkeypatch.context() as patch:
+        _reject_cuda_host_reads(patch)
+        actual_topk, actual = indexer._fused_topk_and_candidates(prepared)
     torch.testing.assert_close(actual_topk, expected_topk)
     torch.testing.assert_close(actual.indices, expected.indices)
     torch.testing.assert_close(actual.lengths, expected.lengths)
     assert len(chunks) > 1 and sum(chunks) == q.shape[0] * (2 if layout == "sbhd" else 1)
+    for rows, (cu_q, cu_k, max_q, max_k, key_rows) in zip(chunks, chunk_metadata):
+        assert cu_q[-1] == rows and cu_k[-1] == key_rows
+        assert cu_q.diff().max() <= max_q and cu_k.diff().max() <= max_k
+    if precision == "mxfp8":
+        assert len(quantizations) == len(chunks) + 1
+        k_shape, _, k_scale = quantizations[0]
+        assert k_shape == prepared.k.shape and k_scale is not None
+        _, first_buffers, first_scale = quantizations[1]
+        assert first_buffers is not None and first_scale is not None
+        for rows, (shape, buffers, scale) in zip(chunks, quantizations[1:]):
+            assert shape == (rows, 64, 128) and scale is first_scale
+            assert buffers is not None and buffers.input_shape == shape
+            if rows == chunks[0]:
+                assert buffers is first_buffers
     for x, before in zip((q, k, w), snapshots):
         torch.testing.assert_close(x, before, atol=0, rtol=0)
     for x, before in zip((prepared.q, prepared.k, prepared.weights), prepared_before):
@@ -3863,7 +3908,9 @@ def test_fused_candidate_generation_matches_dense_oracle(
 @pytest.mark.parametrize("precision", ["bf16", "mxfp8"])
 @pytest.mark.parametrize("ratio", [1, 2])
 @pytest.mark.parametrize("layout", ["empty", "padding", "short", "unused-capacity"])
-def test_fused_candidate_generation_empty_and_unused_capacity(precision, ratio, layout):
+def test_fused_candidate_generation_empty_and_unused_capacity(
+    monkeypatch, precision, ratio, layout
+):
     _require_candidate_kernels(precision)
     real, physical, tail = {
         "empty": ([0, 0], [0, 0], 0),
@@ -3885,9 +3932,11 @@ def test_fused_candidate_generation_empty_and_unused_capacity(precision, ratio, 
     expected = _reference_candidate_blocks(
         indexer, q, k, w, thd_layout=token_layout, compressed_layout=compressed
     )
-    actual = indexer._candidate_blocks(
-        q, k, w, selection_scores=None, thd_layout=token_layout, compressed_layout=compressed
-    )
+    with monkeypatch.context() as patch:
+        _reject_cuda_host_reads(patch)
+        actual = indexer._candidate_blocks(
+            q, k, w, selection_scores=None, thd_layout=token_layout, compressed_layout=compressed
+        )
     torch.testing.assert_close(actual.indices, expected.indices)
     torch.testing.assert_close(actual.lengths, expected.lengths)
     expected_topk = _reference_fused_indexer(
