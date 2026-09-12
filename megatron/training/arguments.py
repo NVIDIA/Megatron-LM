@@ -455,10 +455,23 @@ def validate_args(args, defaults={}):
 
     update_use_dist_ckpt(args)
 
+    # GTP remat is an independent weight-shard axis, so derive it before calculating
+    # total_model_size and leave data_parallel_size as the replicate degree.
+    from megatron.core.model_parallel_config import resolve_tensor_parallel_weight_shards
+
+    (args.tensor_parallel_num_weight_shards, args.gtp_weight_remat_size) = (
+        resolve_tensor_parallel_weight_shards(
+            args.tensor_model_parallel_size,
+            args.tensor_parallel_num_weight_shards,
+            getattr(args, "gtp_weight_remat_size", 1),
+        )
+    )
+
     total_model_size = (
         args.tensor_model_parallel_size
         * args.pipeline_model_parallel_size
         * args.context_parallel_size
+        * args.gtp_weight_remat_size
     )
 
     # Total model size.
@@ -478,6 +491,7 @@ def validate_args(args, defaults={}):
         args.tensor_model_parallel_size
         * args.pipeline_model_parallel_size
         * args.context_parallel_size
+        * args.gtp_weight_remat_size
     )
     args.data_parallel_size = args.world_size // total_model_size
 
@@ -740,11 +754,17 @@ def validate_args(args, defaults={}):
         args.eval_global_batch_size = args.global_batch_size
     if args.eval_micro_batch_size is None:
         args.eval_micro_batch_size = args.micro_batch_size
+    # data_parallel_size is the replicate degree, so multiply the GTP-remat axis back in: evaluate()
+    # divides eval_global_batch_size by the same product to get its microbatch count, and without
+    # gtp_weight_remat_size here that division can silently floor (down to zero microbatches).
     assert (
-        args.eval_global_batch_size % (args.eval_micro_batch_size * args.data_parallel_size) == 0
+        args.eval_global_batch_size
+        % (args.eval_micro_batch_size * args.data_parallel_size * args.gtp_weight_remat_size)
+        == 0
     ), (
         f"eval_global_batch_size ({args.eval_global_batch_size}) must be divisible by "
         f"eval_micro_batch_size ({args.eval_micro_batch_size}) * data_parallel_size ({args.data_parallel_size})"
+        f" * gtp_weight_remat_size ({args.gtp_weight_remat_size})"
     )
 
     if args.perform_rl_step:

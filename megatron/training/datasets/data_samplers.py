@@ -2,7 +2,6 @@
 
 """Dataloaders."""
 
-
 import random
 
 import numpy as np
@@ -20,6 +19,12 @@ def build_pretraining_data_loader(dataset, consumed_samples):
 
     if dataset is None:
         return None
+    # Empty split (e.g. valid/test when --eval-iters 0): return null loader
+    try:
+        if len(dataset) == 0:
+            return None
+    except TypeError:
+        pass
     args = get_args()
 
     if hasattr(dataset, 'split'):
@@ -41,6 +46,12 @@ def build_pretraining_data_loader(dataset, consumed_samples):
         if is_eval
         else args.micro_batch_size
     )
+    global_batch_size = (
+        getattr(args, 'eval_global_batch_size', args.global_batch_size)
+        if is_eval
+        else args.global_batch_size
+    )
+
     if split == Split.valid and args.full_validation:
         batch_sampler = MegatronFullValidationSampler(
             total_samples=len(dataset),
@@ -48,15 +59,25 @@ def build_pretraining_data_loader(dataset, consumed_samples):
             data_parallel_size=mpu.get_data_parallel_world_size(),
         )
     elif args.dataloader_type == 'single':
-        # Packing schedulers consume one microbatch at a time and form
-        # global/DCP batches themselves.
-        batch_sampler = MegatronPretrainingSampler(
-            total_samples=len(dataset),
-            consumed_samples=consumed_samples,
-            micro_batch_size=micro_batch_size,
-            data_parallel_rank=mpu.get_data_parallel_rank(),
-            data_parallel_size=mpu.get_data_parallel_world_size(),
-        )
+        if args.dynamic_context_parallel and args.sequence_packing_scheduler is None:
+            batch_sampler = HybridCPMegatronPretrainingSampler(
+                total_samples=len(dataset),
+                consumed_samples=consumed_samples,
+                micro_batch_size=micro_batch_size,
+                global_batch_size=global_batch_size,
+                data_parallel_rank=mpu.get_data_parallel_rank(),
+                data_parallel_size=mpu.get_data_parallel_world_size(),
+            )
+        else:
+            # Megatron sampler. Packing schedulers consume one microbatch at a
+            # time and form packed global batches themselves.
+            batch_sampler = MegatronPretrainingSampler(
+                total_samples=len(dataset),
+                consumed_samples=consumed_samples,
+                micro_batch_size=micro_batch_size,
+                data_parallel_rank=mpu.get_data_parallel_rank(),
+                data_parallel_size=mpu.get_data_parallel_world_size(),
+            )
     elif args.dataloader_type == 'cyclic':
         batch_sampler = MegatronPretrainingRandomSampler(
             dataset,
@@ -90,20 +111,24 @@ def build_pretraining_data_loader(dataset, consumed_samples):
             DistributedSignalHandler(args.exit_signal).__enter__()
 
     maybe_worker_init_fn = worker_init_fn if args.num_workers > 0 else None
-    # Identity collate for VarlenDataset and packing-scheduler paths;
-    # they emit one variable-length dict per sample, not stack-able by
-    # the default collate. --varlen-sbhd-validation is excluded: it bypasses
-    # packing and emits fixed-length [seq_length] samples that the default
-    # collate stacks normally.
+    # Identity collate for VarlenDataset and packing-scheduler paths; they emit
+    # one variable-length dict per sample, not stack-able by the default
+    # collate. --varlen-sbhd-validation is excluded: it bypasses packing and
+    # emits fixed-length [seq_length] samples that the default collate stacks
+    # normally.
     if (
         (args.use_varlen_dataset and not args.varlen_sbhd_validation)
         or args.dynamic_context_parallel
         or args.sequence_packing_scheduler is not None
-        or getattr(args, "use_vanilla_collate_fn", False)
     ):
         extra_kwargs = {"collate_fn": lambda x: x}
     else:
         extra_kwargs = {}
+    # Own generator: otherwise _BaseDataLoaderIter draws _base_seed from the default CPU generator
+    # on ITERATOR creation, after load_checkpoint has restored it. initial_seed() reads the seed
+    # without consuming a draw.
+    loader_generator = torch.Generator()
+    loader_generator.manual_seed(torch.initial_seed())
     return torch.utils.data.DataLoader(
         dataset,
         batch_sampler=batch_sampler,
@@ -111,6 +136,7 @@ def build_pretraining_data_loader(dataset, consumed_samples):
         pin_memory=True,
         persistent_workers=True if args.num_workers > 0 else False,
         worker_init_fn=maybe_worker_init_fn,
+        generator=loader_generator,
         **extra_kwargs,
     )
 
@@ -183,6 +209,70 @@ class MegatronPretrainingSampler:
         if len(batch) > 0 and not self.drop_last:
             start_idx, end_idx = self.get_start_end_idx()
             yield batch[start_idx:end_idx]
+
+
+class HybridCPMegatronPretrainingSampler(MegatronPretrainingSampler):
+    """
+    Data sampler for hybrid context parallel (Hybrid CP) format.
+    This data sampler pulls in the entire global batch at once across all data parallel ranks.
+    This helps provide the Hybrid CP Dataloader Wrapper to schedule and load balance sub-samples
+    of the entire global batch.
+    """
+
+    def __init__(
+        self,
+        total_samples,
+        consumed_samples,
+        micro_batch_size,
+        global_batch_size,
+        data_parallel_rank,
+        data_parallel_size,
+        drop_last=True,
+    ):
+        super().__init__(
+            total_samples,
+            consumed_samples,
+            micro_batch_size,
+            data_parallel_rank,
+            data_parallel_size,
+            drop_last,
+        )
+        self.global_batch_size = global_batch_size
+        self.data_parallel_size = data_parallel_size
+        self.num_micro_batches = self.global_batch_size // self.micro_batch_times_data_parallel_size
+
+    def __len__(self):
+        return self.total_samples
+
+    def get_start_end_idx_global_batch(self):
+        start_idx = [
+            self.data_parallel_rank * self.micro_batch_size
+            + i * self.micro_batch_size * self.data_parallel_size
+            for i in range(self.num_micro_batches)
+        ]
+        end_idx = [start_idx[i] + self.micro_batch_size for i in range(self.num_micro_batches)]
+        return start_idx, end_idx
+
+    def __iter__(self):
+        batch = []
+        # Last batch will be dropped if drop_last is not set False
+        for idx in range(self.consumed_samples, self.total_samples):
+            batch.append(idx)
+            if len(batch) == self.micro_batch_times_data_parallel_size * self.num_micro_batches:
+                start_idx, end_idx = self.get_start_end_idx_global_batch()
+                global_batch_idx = []
+                for i in range(self.num_micro_batches):
+                    global_batch_idx.extend(batch[start_idx[i] : end_idx[i]])
+                yield global_batch_idx
+                batch = []
+
+        # Check the last partial batch and see drop_last is set
+        if len(batch) > 0 and not self.drop_last:
+            start_idx, end_idx = self.get_start_end_idx_global_batch()
+            global_batch_idx = []
+            for i in range(self.num_micro_batches):
+                global_batch_idx.extend(batch[start_idx[i] : end_idx[i]])
+            yield global_batch_idx
 
 
 class MegatronFullValidationSampler:

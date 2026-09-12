@@ -93,3 +93,20 @@ class TestContextGPUView:
             for name in MAMBA_VIEWS_INT32:
                 assert getattr(v, name) is not None
                 assert getattr(v, name).dtype == torch.int32
+
+    @pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+    def test_mamba_decode_indices_dtype(self, dtype):
+        """The runtime-selected decode dtype must not change the remaining layout."""
+        v = ContextGPUView(
+            max_requests=MAX_REQUESTS,
+            max_tokens=MAX_TOKENS,
+            max_kv_blocks=MAX_KV_BLOCKS,
+            device=torch.device("cuda"),
+            max_mamba_chunks=MAX_MAMBA_CHUNKS,
+            mamba_decode_indices_dtype=dtype,
+        )
+
+        assert v.mamba_batch_indices_decode.dtype == dtype
+        assert v.mamba_batch_indices_decode.shape == (MAX_REQUESTS,)
+        assert v.mamba_batch_indices_prefill.dtype == torch.int32
+        assert v.mamba_conv_seq_start.shape == (MAX_TOKENS,)

@@ -17,6 +17,7 @@ onelogger.err
 runs/
 /test_cases/
 **/dist/
+.mypy_cache/
 
 # Sphinx documentation
 docs/_build

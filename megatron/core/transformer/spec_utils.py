@@ -1,12 +1,9 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 import functools
-import logging
 import types
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Tuple, Union
-
-logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -50,10 +47,15 @@ def import_module(module_path: Tuple[str]):
     base_path, name = module_path
     try:
         module = __import__(base_path, globals(), locals(), [name])
-    except ImportError as e:
-        logger.error(f"couldn't import module due to {e}")
-        return None
-    return vars(module)[name]
+    except ImportError as exc:
+        raise ImportError(
+            f"Could not import module '{base_path}' for spec '{name}': {exc}"
+        ) from exc
+
+    try:
+        return vars(module)[name]
+    except KeyError as exc:
+        raise ImportError(f"Could not find spec '{name}' in module '{base_path}'") from exc
 
 
 # pylint: disable=missing-function-docstring

@@ -5,6 +5,8 @@
 Covers:
 - ``match_local_ops_by_task_id``: pairing semantics and every error branch.
 - ``CopyService.close()`` default no-op contract.
+- Explicit opt-in for multiple runs per plan.
+- NCCL communicator initialization on ranks with no local operations.
 """
 
 import pytest
@@ -16,6 +18,10 @@ from megatron.core.resharding.copy_services.base import (
     SendOp,
     match_local_ops_by_task_id,
 )
+from megatron.core.resharding.copy_services.gloo_copy_service import GlooCopyService
+from megatron.core.resharding.copy_services.nccl_copy_service import NCCLCopyService
+from megatron.core.resharding.copy_services.nixl_copy_service import NixlCopyService
+from megatron.core.resharding.copy_services.nvshmem_copy_service import NVSHMEMCopyService
 
 
 def _t():
@@ -164,3 +170,62 @@ class TestCopyServiceClose:
         assert svc.closed is False
         svc.close()
         assert svc.closed is True
+
+
+def test_nixl_service_skips_redundant_process_group_barrier():
+    """NIXL's ready/data protocol provides its own peer completion."""
+    assert NixlCopyService.requires_process_group_barrier is False
+
+
+def test_multiple_runs_per_plan_require_explicit_backend_support():
+    """Third-party services stay model-wide unless they accept the stream contract."""
+    assert CopyService.supports_multiple_runs_per_plan is False
+    assert GlooCopyService.supports_multiple_runs_per_plan is True
+    assert NCCLCopyService.supports_multiple_runs_per_plan is True
+    assert NVSHMEMCopyService.supports_multiple_runs_per_plan is True
+    assert NixlCopyService.supports_multiple_runs_per_plan is False
+
+
+def test_nccl_service_eagerly_connects_before_first_run(monkeypatch):
+    """Idle ranks must join NCCL setup before active ranks issue their first P2P."""
+    device = torch.device("cuda", 1)
+
+    class Backend:
+        def __init__(self):
+            self.connected_devices = []
+
+        def eager_connect_single_device(self, connected_device):
+            self.connected_devices.append(connected_device)
+
+    class Group:
+        def __init__(self, backend):
+            self.backend = backend
+            self.requested_devices = []
+
+        def rank(self):
+            return 1
+
+        def size(self):
+            return 4
+
+        def _get_backend(self, requested_device):
+            self.requested_devices.append(requested_device)
+            return self.backend
+
+    class Stream:
+        def wait_stream(self, _stream):
+            pass
+
+    backend = Backend()
+    group = Group(backend)
+    stream = Stream()
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: device.index)
+    monkeypatch.setattr(torch.cuda, "Stream", lambda: stream)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: stream)
+
+    service = NCCLCopyService(group=group)
+    service.run()
+    service.run()
+
+    assert group.requested_devices == [device]
+    assert backend.connected_devices == [device]

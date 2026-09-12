@@ -175,6 +175,38 @@ tokenizer = MegatronTokenizer.from_pretrained(
 )
 ```
 
+### Fast Tokenization with GigaToken
+
+Hugging Face and Megatron tokenizers can optionally use [GigaToken](https://pypi.org/project/gigatoken/),
+a faster tokenizer backend for encoding whole **JSONL** files in parallel instead of tokenizing
+document-by-document.
+
+Enable it by passing `use_gigatoken=True` when building the tokenizer, or `--use-gigatoken` on the CLI:
+
+```python
+tokenizer = MegatronTokenizer.from_pretrained(
+    tokenizer_path="/path/to/tokenizer.model",
+    metadata_path={"library": "huggingface"},
+    use_gigatoken=True,
+)
+```
+
+Requires the `gigatoken` package (`pip install gigatoken`). If `use_gigatoken=True` and the
+package isn't installed, tokenizer construction raises `ModuleNotFoundError`.
+
+**Tokenizing Whole Files**
+
+When `use_gigatoken=True`, use `tokenize_files()` to tokenize an entire **JSONL** file (or list of
+files) in parallel, returning an **Awkward** `ak.Array` of token-id documents instead of looping
+document-by-document:
+
+```python
+encoded_docs = tokenizer.tokenize_files("data.jsonl", field="text")
+```
+
+`tokenize_files()` is only supported for the `huggingface` and `megatron` tokenizer libraries,
+and only when the tokenizer was constructed with `use_gigatoken=True`.
+
 ## Integration with Megatron-LM
 
 ### Using with Training Scripts

@@ -203,6 +203,7 @@ class PostProcessNode(ScheduleNode):
             rotary_pos_sin=self.chunk_state.rotary_pos_sin,
             mtp_in_postprocess=False,
             loss_mask=self.chunk_state.loss_mask,
+            mtp_input_mask=self.chunk_state.mtp_input_mask,
             attention_mask=self.chunk_state.attention_mask,
             packed_seq_params=self.chunk_state.packed_seq_params,
             sequence_len_offset=self.chunk_state.sequence_len_offset,
@@ -252,6 +253,7 @@ class TransformerLayerNode(ScheduleNode):
             weak_method(self.backward_impl),
             free_input=free_input,
             name=name,
+            ncclep_zero_copy=config.moe_ncclep_zero_copy,
         )
         self.layer_state = layer_state
         self.chunk_state = chunk_state

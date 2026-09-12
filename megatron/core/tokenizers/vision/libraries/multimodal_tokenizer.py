@@ -88,9 +88,13 @@ class MegatronMultimodalTokenizer:
         self._vocab_size = len(tokenizer)
 
         num_added_tokens = tokenizer.add_tokens(special_tokens, special_tokens=True)
-        assert num_added_tokens == len(
-            special_tokens
-        ), f"failed to add {len(special_tokens)} special tokens; only added {num_added_tokens}"
+        # When loading a pre-trained tokenizer for inference, the special tokens
+        # may already be in the vocabulary (num_added_tokens == 0 is OK).
+        if num_added_tokens not in (0, len(special_tokens)):
+            raise ValueError(
+                f"Expected to add 0 or {len(special_tokens)} special tokens, "
+                f"but added {num_added_tokens}"
+            )
 
         self.tokenizer = tokenizer
 
@@ -179,6 +183,14 @@ class MegatronMultimodalTokenizer:
                 pad_token_id=tokenizer.convert_tokens_to_ids("<|finetune_right_pad_id|>"),
                 custom_chat_template=llama3p1_chat_template,
                 has_bos=True,
+                has_system_role=True,
+            )
+        elif prompt_format == "nemotron6-moe":
+            self._prompt_config = PromptConfig(
+                assistant_prefix_len=None,  # Not used for pre-training.
+                pad_token_id=tokenizer.convert_tokens_to_ids("<unk>"),
+                custom_chat_template=None,
+                has_bos=False,
                 has_system_role=True,
             )
         else:
@@ -312,6 +324,10 @@ class MegatronMultimodalTokenizer:
 
     def detokenize(self, tokens: List[int]):
         """Detokenize tokens."""
+        # Filter out invalid token IDs (e.g. -1 pad values from image token expansion).
+        # Use self._vocab_size (== len(tokenizer)) rather than tokenizer.vocab_size
+        # so multimodal special tokens added via add_tokens() survive detokenization.
+        tokens = [t for t in tokens if 0 <= t < self._vocab_size]
         return self.tokenizer.decode(tokens)
 
     def add_special_tokens(self, special_tokens: List[str]):
@@ -326,6 +342,11 @@ class MegatronMultimodalTokenizer:
     def pad(self):
         """Pad token ID."""
         return self._prompt_config.pad_token_id
+
+    @property
+    def bos(self):
+        """Beginning of sentence token ID."""
+        return self.tokenizer.bos_token_id
 
     @property
     def eod(self):

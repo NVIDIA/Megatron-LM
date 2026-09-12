@@ -1,7 +1,7 @@
 # Copyright (c) 2023, NVIDIA CORPORATION.  All rights reserved.
 
 [build-system]
-requires = ["setuptools<80.0.0", "pybind11", "packaging>=24.2"]
+requires = ["setuptools>=80", "pybind11", "packaging>=24.2"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
@@ -18,7 +18,7 @@ readme = { file = "README.md", content-type = "text/markdown" }
 name = "megatron-core"
 dynamic = ["version", "readme"]
 description = "Megatron Core - a library for efficient and scalable training of transformer based models"
-requires-python = ">=3.10"
+requires-python = ">=3.12"
 license = { text = "Apache 2.0" }
 dependencies = ["torch>=2.6.0", "numpy", "packaging>=24.2"]
 authors = [{ name = "NVIDIA", email = "nemo-toolkit@nvidia.com" }]
@@ -70,6 +70,7 @@ training = [
     "wandb",
     "transformers",
     "accelerate",
+    "gigatoken",
 ]
 
 ### 'mlm' group is deprecated. please use 'training' instead ###
@@ -80,6 +81,7 @@ mlm = [
     "wandb",
     "transformers",
     "accelerate",
+    "gigatoken",
 ]
 
 dev = [
@@ -91,7 +93,8 @@ dev = [
     "tensorstore~=0.1,!=0.1.46,!=0.1.72",
     "nvtx~=0.2",
     "multi-storage-client~=0.27",
-    "opentelemetry-api~=1.33.1",
+    "opentelemetry-api>=1.33.1,<2",
+    "nemo-lens",
     "mamba-ssm~=2.2",
     "causal-conv1d~=1.5",
     "flash-linear-attention[tilelang]==0.5.1",
@@ -111,13 +114,21 @@ dev = [
     "openai[aiohttp]",
 ]
 
+inference = [
+    "torch-memory-saver",
+]
+
+otel = [
+    "nemo-lens[sdk]",
+]
+
 lts = [
     "tqdm",
     "einops~=0.8",
     "tensorstore~=0.1,!=0.1.46,!=0.1.72",
     "nvtx~=0.2",
     "multi-storage-client~=0.27",
-    "opentelemetry-api~=1.33.1",
+    "opentelemetry-api>=1.33.1,<2",
     "mamba-ssm~=2.2",
     "causal-conv1d~=1.5",
     "megatron-energon[av_decode]~=6.0",
@@ -185,7 +196,8 @@ linting = [
     "pylint==3.2.6",
 ]
 ci = ["python-gitlab", "slack-sdk", "pandas"]
-no_pypi_wheels = ["flash_mla", "emerging_optimizers; python_version >= '3.12'", "fast-hadamard-transform"]
+batch_invariant = ["deep_gemm"]
+no_pypi_wheels = ["flash_mla", "emerging_optimizers; python_version >= '3.12'", "fast-hadamard-transform", "deep_gemm"]
 
 [tool.uv]
 default-groups = ["linting", "build", "test"]
@@ -195,6 +207,7 @@ no-build-isolation-package = [
     "mamba-ssm",
     "transformer-engine",
     "transformer-engine-torch",
+    "deep_gemm",
     "fast-hadamard-transform",
 ]
 link-mode = "copy"
@@ -245,6 +258,9 @@ nemo-run = { git = "https://github.com/NVIDIA-NeMo/Run.git", rev = "17ae86b64d7f
 emerging_optimizers = { git = "https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git", rev = "v0.3.0" }
 fast-hadamard-transform = { git = "https://github.com/Dao-AILab/fast-hadamard-transform.git", rev = "f134af63deb2df17e1171a9ec1ea4a7d8604d5ca" }
 
+deep_gemm = { git = "https://github.com/deepseek-ai/DeepGEMM.git", rev = "714dd1a4a980f7937a74343d19a8eba4fe321480" }
+nemo-lens = { git = "https://github.com/NVIDIA-NeMo/Lens.git", rev = "b85578fc2b736a1804705e537001b5f45e9c715d" }
+torch-memory-saver = { git = "https://github.com/fzyzcjy/torch_memory_saver.git", rev = "9bc9a442e6d108c7b7903def199896a005143aaf" }
 [tool.isort]
 profile = "black"                                                          # black-compatible
 line_length = 100                                                          # should match black parameters

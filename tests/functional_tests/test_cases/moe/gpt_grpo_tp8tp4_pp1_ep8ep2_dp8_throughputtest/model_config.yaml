@@ -1,5 +1,6 @@
 ENV_VARS:
   CUDA_DEVICE_MAX_CONNECTIONS: 1
+  NVTE_ALLOW_UNSAFE_PICKLE_EXTRA_STATE: 1
   THROUGHPUT_START_STEP: 1
   NVTE_ALLOW_NONDETERMINISTIC_ALGO: 0
   NCCL_ALGO: Ring
@@ -136,3 +137,4 @@ METRICS:
   - "num-zeros"
   - "mem-allocated-bytes"
   - "mem-max-allocated-bytes"
+LAUNCHER: ft_launcher

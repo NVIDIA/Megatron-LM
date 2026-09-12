@@ -5,6 +5,7 @@ from .audio_feature_config import (
     NemoTransformerAudioTokenEstimator,
     ceil_div,
 )
+from .audio_processor import NemoAudioProcessor
 from .audio_projector import AudioProjection
 from .nemo_audio_checkpoint import (
     CHECKPOINT_NEMO_AUDIO_PREPROCESSOR_CONFIG_NAME,
@@ -29,6 +30,7 @@ __all__ = [
     "CHECKPOINT_NEMO_AUDIO_PREPROCESSOR_CONFIG_NAME",
     "CHECKPOINT_NEMO_TRANSFORMER_AUDIO_CONFIG_NAME",
     "NemoAudioFeatureConfig",
+    "NemoAudioProcessor",
     "NemoTransformerAudioConfig",
     "NemoTransformerAudioModel",
     "NemoTransformerAudioTokenEstimator",

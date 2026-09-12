@@ -28,21 +28,18 @@ def safe_get_rank() -> int:
         return torch.distributed.get_rank()
 
     # If torch.distributed is not initialized, try to read environment variables.
-    try:
-        if "RANK" in os.environ:
-            return int(os.environ["RANK"])
+    if "RANK" in os.environ:
+        return int(os.environ["RANK"])
 
-        slurm_rank = resolve_slurm_rank()
-        if slurm_rank is not None:
-            return slurm_rank
+    slurm_rank = resolve_slurm_rank()
+    if slurm_rank is not None:
+        return slurm_rank
 
-        warnings.warn(
-            "Could not determine rank from torch.distributed, RANK, or SLURM_PROCID. "
-            "Defaulting to rank 0."
-        )
-        return 0
-    except (ValueError, TypeError):
-        return 0
+    warnings.warn(
+        "Could not determine rank from torch.distributed, RANK, or SLURM_PROCID. "
+        "Defaulting to rank 0."
+    )
+    return 0
 
 
 def safe_get_world_size() -> int:
@@ -74,16 +71,23 @@ def safe_get_world_size() -> int:
     return 1
 
 
-def log_single_rank(logger: logging.Logger, *args: Any, rank: int = 0, **kwargs: Any) -> None:
+def log_single_rank(
+    logger: logging.Logger, level: int, msg: object, *args: Any, rank: int = 0, **kwargs: Any
+) -> None:
     """Log a message only on a single rank.
 
     If torch distributed is initialized, write log on only one rank.
 
     Args:
         logger: The logger to write the logs.
-        *args: All logging.Logger.log positional arguments.
+        level: Logging level for the message.
+        msg: Message format string.
+        *args: Message format arguments.
         rank: The rank to write on. Defaults to 0.
-        **kwargs: All logging.Logger.log keyword arguments.
+        **kwargs: Additional ``logging.Logger.log`` keyword arguments.
     """
+    if not logger.isEnabledFor(level):
+        return
+
     if safe_get_rank() == rank:
-        logger.log(*args, **kwargs)
+        logger.log(level, msg, *args, **kwargs)

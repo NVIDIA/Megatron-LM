@@ -8,15 +8,39 @@ from megatron.core.inference.communication_utils import (
     is_pipeline_first_stage,
     is_pipeline_last_stage,
 )
+from megatron.core.inference.config import MediaPromptSpec, MultimodalPromptConfig
 from megatron.core.inference.contexts import StaticInferenceContext
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
     GPTInferenceWrapper,
 )
+from megatron.core.inference.model_inference_wrappers.multimodal.utils import (
+    dynamic_media_embedding_counts,
+    dynamic_media_replacement_counts,
+)
+from megatron.core.utils import get_attr_wrapped_model
 
 
 # pylint: disable=line-too-long
 class VLMInferenceWrapper(GPTInferenceWrapper):
     """Inference wrapper for VLMs"""
+
+    supports_text = True
+    supports_image = True
+    supports_video = True
+    supports_audio = False
+    _recv_only_vision_embeds: bool = False
+    _encoder_only: bool = False
+
+    _media_prompt_spec = MediaPromptSpec(model_token="<image>")
+    multimodal_prompt_config = MultimodalPromptConfig(
+        image_spec=_media_prompt_spec, video_spec=_media_prompt_spec
+    )
+
+    def get_preexpanded_media_token_id(self, modality: str) -> int:
+        """Return LLaVA's internal sentinel without exposing it as a vocabulary ID."""
+        del modality
+        module = get_attr_wrapped_model(self.model, "image_token_index", return_model_obj=True)
+        return int(module.image_token_index)
 
     def prep_model_for_inference(self, prompts_tokens: Optional[torch.Tensor] = None):
         """A utility function for preparing model for inference
@@ -123,8 +147,359 @@ class VLMInferenceWrapper(GPTInferenceWrapper):
             "decoder_seq_length": decoder_seq_length,
         }
 
+    # ---- Dynamic inference methods ----
+
+    def expand_image_tokens(
+        self, tokens, num_tiles=None, imgs_sizes=None, num_frames=None, *, image_token_id=None
+    ):
+        """Expand image tokens to multiple pad tokens.
+
+        Supports two modes:
+        - Static resolution (num_tiles provided): each <image> is replaced with
+          tiles_for_that_image * img_embeddings_per_tile padding values.
+        - Dynamic resolution (imgs_sizes provided): each <image> is replaced with
+          (H/patch_dim * W/patch_dim) / 4 (if pixel_shuffle) padding values per image.
+
+        Args:
+            tokens (List[List[int]]): List of token sequences, one per sample.
+            num_tiles (torch.Tensor): Number of tiles per image (static resolution).
+            imgs_sizes (torch.Tensor): Per-image sizes [N, 2] with [H, W] (dynamic resolution).
+
+        Returns:
+            expanded_tokens (List[List[int]]): Tokens with image tokens expanded to -1 pad values.
+            mask (List[List[int or None]]): Mask indicating image embedding indices for each
+                position, None for non-image positions.
+        """
+        module = get_attr_wrapped_model(self.model, "image_token_index", return_model_obj=True)
+        image_token_index = (
+            module.image_token_index if image_token_id is None else int(image_token_id)
+        )
+
+        pad_value = -1
+        batch_size = len(tokens)
+        img_embeddings_per_tile = 0  # set below in the static-resolution branch
+
+        # Reject dynamic-resolution requests when the model does not expose
+        # the required attributes; falling through to the static path would
+        # silently miscount tokens.
+        if imgs_sizes is not None and not getattr(module, 'dynamic_resolution', False):
+            raise NotImplementedError(
+                "Dynamic-resolution image expansion requires LLaVAModel "
+                "with dynamic_resolution enabled and patch_dim/_class_token_len "
+                "available. Use num_tiles for static-resolution inputs."
+            )
+
+        # Compute per-image embedding counts
+        if imgs_sizes is not None and getattr(module, 'dynamic_resolution', False):
+            frame_embedding_counts = dynamic_media_embedding_counts(
+                imgs_sizes,
+                module.patch_dim,
+                pixel_shuffle=module._pixel_shuffle,
+                spatial_merge_size=2 if module._conv_merging else 1,
+            )
+            if not module._drop_vision_class_token:
+                class_token_len = int(getattr(module, "_class_token_len", 0))
+                if module._pixel_shuffle and class_token_len > 0:
+                    raise ValueError(
+                        "Dynamic-resolution pixel shuffle requires dropping " "vision class tokens."
+                    )
+                frame_embedding_counts = [
+                    count + class_token_len for count in frame_embedding_counts
+                ]
+            placeholder_count = sum(
+                token == image_token_index for sample_tokens in tokens for token in sample_tokens
+            )
+            per_image_embeddings = dynamic_media_replacement_counts(
+                frame_embedding_counts,
+                num_frames=num_frames,
+                temporal_patch_size=int(getattr(module, "temporal_patch_dim", 1)),
+            )
+            media_kind = "video" if num_frames is not None else "image"
+            if placeholder_count != len(per_image_embeddings):
+                raise ValueError(
+                    f"Expected one compact placeholder per {media_kind}: "
+                    f"expected {len(per_image_embeddings)}, got {placeholder_count}."
+                )
+        else:
+            # Static resolution: fixed embeddings per tile
+            img_embeddings_per_tile = module.img_seq_len
+            per_image_embeddings = None  # computed per-image below
+
+        # Count images per sample
+        num_images_per_sample = []
+        for sample_tokens in tokens:
+            num_images_per_sample.append(
+                sum(1 for token in sample_tokens if token == image_token_index)
+            )
+
+        expanded_tokens_list = []
+        mask_list = []
+
+        if per_image_embeddings is not None:
+            # Dynamic resolution path
+            image_global_idx = 0
+            for batch_idx in range(batch_size):
+                sample_tokens = tokens[batch_idx]
+                expanded_sample = []
+                mask_sample = []
+                image_embedding_offset = sum(per_image_embeddings[:image_global_idx])
+
+                for token in sample_tokens:
+                    if token == image_token_index and image_global_idx < len(per_image_embeddings):
+                        tokens_for_image = per_image_embeddings[image_global_idx]
+                        expanded_sample.extend([pad_value] * tokens_for_image)
+
+                        start_idx = image_embedding_offset
+                        end_idx = start_idx + tokens_for_image
+                        mask_sample.extend(list(range(start_idx, end_idx)))
+
+                        image_embedding_offset += tokens_for_image
+                        image_global_idx += 1
+                    else:
+                        expanded_sample.append(token)
+                        mask_sample.append(None)
+
+                expanded_tokens_list.append(expanded_sample)
+                mask_list.append(mask_sample)
+        else:
+            # Static resolution path (original logic)
+            num_tiles_per_sample = num_tiles.split(num_images_per_sample, dim=0)
+
+            for batch_idx in range(batch_size):
+                sample_tokens = tokens[batch_idx]
+                sample_num_tiles = (
+                    num_tiles_per_sample[batch_idx]
+                    if len(num_tiles_per_sample[batch_idx]) > 0
+                    else torch.tensor([])
+                )
+
+                expanded_sample = []
+                mask_sample = []
+
+                image_idx = 0
+                image_embedding_offset = (
+                    sum(num_tiles_per_sample[i].sum().item() for i in range(batch_idx))
+                    * img_embeddings_per_tile
+                )
+
+                for token in sample_tokens:
+                    if token == image_token_index:
+                        if image_idx < len(sample_num_tiles):
+                            tiles_for_image = sample_num_tiles[image_idx].item()
+                            tokens_for_image = tiles_for_image * img_embeddings_per_tile
+
+                            expanded_sample.extend([pad_value] * tokens_for_image)
+
+                            start_idx = image_embedding_offset
+                            end_idx = start_idx + tokens_for_image
+                            mask_sample.extend(list(range(start_idx, end_idx)))
+
+                            image_embedding_offset += tokens_for_image
+                            image_idx += 1
+                        else:
+                            expanded_sample.append(token)
+                            mask_sample.append(None)
+                    else:
+                        expanded_sample.append(token)
+                        mask_sample.append(None)
+
+                expanded_tokens_list.append(expanded_sample)
+                mask_list.append(mask_sample)
+
+        return expanded_tokens_list, mask_list
+
+    def _forward_vision_encoder(
+        self, images, num_image_tiles=None, imgs_sizes=None, num_frames=None
+    ) -> torch.Tensor:
+        """Run the vision encoder only, returning image embeddings.
+
+        Temporarily disables the decoder so that the LLaVA forward only runs
+        the vision encoder + projection.
+
+        Args:
+            images (torch.Tensor): Input images [num_tiles, C, H, W] or [1, total_patches, patch_features].
+            num_image_tiles (torch.Tensor): Number of tiles per image (static resolution).
+            imgs_sizes (torch.Tensor): Per-image sizes [N, 2] with [H, W] (dynamic resolution).
+
+        Returns:
+            torch.Tensor: Image embeddings [img_seq_len, num_tiles, hidden].
+        """
+        from megatron.core.packed_seq_params import PackedSeqParams
+
+        module = get_attr_wrapped_model(self.model, "image_token_index", return_model_obj=True)
+        target_dtype = module.vision_model.config.params_dtype
+        if images.dtype != target_dtype:
+            images = images.to(dtype=target_dtype)
+
+        # Reject dynamic-resolution requests when the model does not expose
+        # the required attributes (see expand_image_tokens for context).
+        if imgs_sizes is not None and not getattr(module, 'dynamic_resolution', False):
+            raise NotImplementedError(
+                "Dynamic-resolution vision-encoder forward requires LLaVAModel "
+                "with dynamic_resolution enabled and patch_dim available. "
+                "Use num_tiles for static-resolution inputs."
+            )
+
+        # Build vision_packed_seq_params for dynamic resolution
+        vision_packed_seq_params = None
+        if imgs_sizes is not None and getattr(module, 'dynamic_resolution', False):
+            patch_dim = module.patch_dim
+            seq_lens = torch.prod(imgs_sizes // patch_dim, dim=-1)
+            cu_seqlens = torch.cat(
+                [
+                    torch.zeros(1, dtype=torch.int32, device=imgs_sizes.device),
+                    torch.cumsum(seq_lens, dim=0).to(torch.int32),
+                ]
+            )
+            max_seqlen = int(seq_lens.max().item())
+            vision_packed_seq_params = PackedSeqParams(
+                qkv_format="thd",
+                cu_seqlens_q=cu_seqlens,
+                cu_seqlens_kv=cu_seqlens,
+                max_seqlen_q=max_seqlen,
+                max_seqlen_kv=max_seqlen,
+            )
+
+        old_add_decoder = module.add_decoder
+        module.add_decoder = False
+        media_kind = "video" if num_frames is not None else "image"
+        empty_input_ids = torch.empty((1, 0), dtype=torch.long, device=images.device)
+        try:
+            with torch.cuda.nvtx.range(f"megatron.multimodal.{media_kind}_encoder"):
+                output = self.model(
+                    images,
+                    empty_input_ids,
+                    position_ids=None,
+                    attention_mask=None,
+                    inference_context=self.inference_context,
+                    num_image_tiles=num_image_tiles,
+                    runtime_gather_output=True,
+                    imgs_sizes=imgs_sizes,
+                    vision_packed_seq_params=vision_packed_seq_params,
+                    num_frames=num_frames,
+                )
+        finally:
+            module.add_decoder = old_add_decoder
+
+        if isinstance(output, tuple):
+            image_embeddings, _ = output
+        else:
+            image_embeddings = output
+        return image_embeddings
+
+    def _forward_dynamic(self, inference_input: Dict[str, Any]) -> torch.Tensor:
+        """Forward for dynamic inference with pre-computed image embeddings.
+
+        On PP first stage: embeds text tokens (replacing -1 padding with 0 for
+        embedding lookup), gets language embeddings, scatters pre-computed image
+        embeddings at mask positions, calls forward_lm_only. On non-first PP stages:
+        passes None embeddings.
+
+        Args:
+            inference_input (Dict[str, Any]): Must contain 'tokens', 'position_ids',
+                'image_token_mask', 'image_embeddings', and optionally 'attention_mask'.
+
+        Returns:
+            torch.Tensor: Language model output logits.
+        """
+        tokens = inference_input["tokens"]
+        position_ids = inference_input["position_ids"]
+        image_token_mask = inference_input.get("image_token_mask", None)
+        attention_mask = inference_input.get("attention_mask", None)
+        image_embeddings = inference_input.get("image_embeddings", None)
+
+        module = get_attr_wrapped_model(self.model, "image_token_index", return_model_obj=True)
+
+        if is_pipeline_first_stage(self.pp_group) or self._recv_only_vision_embeds:
+            # Media positions may contain either compact-path padding or the
+            # model's pre-expanded sentinel (for example, -200). The mask is
+            # authoritative for both representations.
+            input_ids_text = tokens.clone()
+            if image_token_mask is not None:
+                input_ids_text[image_token_mask >= 0] = 0
+            else:
+                input_ids_text[input_ids_text == -1] = 0
+
+            # Get language embeddings: [seq_len, b, h_language]
+            language_embeddings = module.language_model.embedding(
+                input_ids=input_ids_text, position_ids=position_ids
+            )
+
+            # Transpose to [b, seq_len, h_language]
+            language_embeddings = language_embeddings.transpose(1, 0).contiguous()
+
+            embed_dim = language_embeddings.shape[-1]
+            final_embedding = language_embeddings.clone()
+
+            # Inject vision embeddings into the decoder input.
+            if image_token_mask is not None and image_embeddings is not None:
+                image_positions = image_token_mask >= 0
+
+                if image_positions.any():
+                    image_indices = image_token_mask[image_positions]
+
+                    # Reshape image embeddings to [total_image_tokens, embed_dim]
+                    image_embeddings_flat = image_embeddings.permute(1, 0, 2).reshape(-1, embed_dim)
+
+                    image_embeddings_flat = image_embeddings_flat.to(dtype=final_embedding.dtype)
+
+                    # Guard against count disagreement between expand_image_tokens
+                    # (which drove image_token_mask indices) and
+                    # _forward_vision_encoder (which produced image_embeddings).
+                    # Class-token handling or pixel-shuffle rounding differing
+                    # between the two would otherwise silently index out of bounds.
+                    # Raise instead of asserting so ``python -O`` doesn't strip
+                    # the check and turn a mismatch into out-of-bounds indexing.
+                    if image_indices.numel() > 0:
+                        max_idx = int(image_indices.max().item())
+                        if max_idx >= image_embeddings_flat.shape[0]:
+                            raise RuntimeError(
+                                f"image_indices max ({max_idx}) exceeds "
+                                f"image_embeddings_flat size "
+                                f"({image_embeddings_flat.shape[0]}); "
+                                f"expand_image_tokens count disagrees with "
+                                f"_forward_vision_encoder output"
+                            )
+
+                    final_embedding[image_positions] = image_embeddings_flat[image_indices]
+
+            # LLaVAModel.forward_lm_only handles the batch->sequence transpose
+            # (and SP/CP sharding when configured).
+        else:
+            final_embedding = None
+
+        # Fall through to a clear error rather than an AttributeError if the
+        # wrapped model doesn't implement forward_lm_only. LLaVAModel does
+        # (added in this PR); other model classes need their own implementation
+        # to be usable on the dynamic decode path.
+        if not hasattr(module, "forward_lm_only"):
+            raise NotImplementedError(
+                "Decode-phase forward for this model requires "
+                "`forward_lm_only`, which is implemented on LLaVAModel but not "
+                "on this model class. Implement `forward_lm_only` on the "
+                "wrapped model to enable dynamic-batching decode."
+            )
+
+        output = module.forward_lm_only(
+            combined_embeddings=final_embedding,
+            attention_mask=attention_mask,
+            labels=None,
+            inference_context=self.inference_context,
+            runtime_gather_output=True,
+        )
+
+        return output
+
+    # ---- Static inference path ----
+
     def _forward(self, inference_input: Dict[str, Any]):
         """Runs a forward pass of the model.
+
+        Dispatches to one of three paths:
+        1. Dynamic VLM path: 'image_token_mask' key is present.
+        2. Static VLM path: 'images' key is present (LLaVA forward).
+        3. Pure text (GPT) path: neither key present — delegates to the base
+           GPTInferenceWrapper._forward so that text-only models work unmodified.
 
         Args:
             inference_input(Dict[str, Any]): The input data.
@@ -132,6 +507,36 @@ class VLMInferenceWrapper(GPTInferenceWrapper):
         Returns:
             The model output logits.
         """
+        # Dynamic path: image_token_mask is present
+        if "image_token_mask" in inference_input:
+            return self._forward_dynamic(inference_input)
+
+        # Pure text path: no VLM keys.
+        # Cannot delegate to super()._forward() because the abstract wrapper passes
+        # (tokens, position_ids, attention_mask) positionally, but LLaVAModel.forward
+        # expects (images, input_ids, position_ids, attention_mask).
+        if "images" not in inference_input:
+            tokens = inference_input["tokens"]
+            position_ids = inference_input["position_ids"]
+            attention_mask = inference_input["attention_mask"]
+            # Pass an empty images tensor (not None) to match what the training
+            # data pipeline provides for text-only samples.
+            empty_images = torch.tensor([], device=tokens.device).reshape(0, 0, 0)
+            output = self.model(
+                empty_images,
+                tokens,
+                position_ids,
+                attention_mask=attention_mask,
+                inference_context=self.inference_context,
+                runtime_gather_output=True,
+            )
+            if isinstance(output, tuple):
+                logits, _ = output
+            else:
+                logits = output
+            return logits
+
+        # VLM path: standard LLaVA forward
         images = inference_input["images"]
         tokens = inference_input["tokens"]
         position_ids = inference_input["position_ids"]
@@ -163,7 +568,31 @@ class VLMInferenceWrapper(GPTInferenceWrapper):
             The logits are returned only in the last pipeline stage for PP models.
         """
         tokens = inference_input["tokens"]
-        num_image_tokens = (tokens == self.model.module.image_token_index).sum().item()
+
+        # Dynamic path: image_token_mask present, no decoder_seq_length
+        if "image_token_mask" in inference_input:
+            num_tokens = tokens.size(1)
+            recv_buffer_seq_len = num_tokens
+
+            if self._recv_only_vision_embeds or self._encoder_only:
+                raise NotImplementedError(
+                    "Dynamic VLM inference does not yet support split "
+                    "encoder/decoder pipeline stages "
+                    "(_recv_only_vision_embeds / _encoder_only). PP is not "
+                    "supported."
+                )
+            output = super().run_one_forward_step(
+                inference_input, recv_buffer_seq_len=recv_buffer_seq_len
+            )
+            return output
+
+        # Pure text path: no VLM keys, use base GPT forward
+        if "images" not in inference_input:
+            return super().run_one_forward_step(inference_input)
+
+        # Static VLM path
+        module = get_attr_wrapped_model(self.model, "image_token_index", return_model_obj=True)
+        num_image_tokens = (tokens == module.image_token_index).sum().item()
         num_img_embeddings = inference_input["num_img_embeddings"]
         decoder_seq_length = inference_input["decoder_seq_length"]
         num_tokens = tokens.size(1)

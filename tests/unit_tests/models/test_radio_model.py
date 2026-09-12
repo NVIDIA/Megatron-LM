@@ -290,12 +290,57 @@ class TestPixelShuffleNonSquare:
     def test_non_square_h_w_required_for_dynamic_res(self):
         from megatron.core.models.multimodal.llava_model import pixel_shuffle
 
-        # 12 patches arranged as 3×4 (non-square). With h, w supplied the
-        # function must accept this and produce the shuffled output.
+        # Pixel shuffle must group spatial 2x2 neighborhoods rather than four
+        # consecutive entries in the flattened non-square grid.
+        x = torch.arange(24, dtype=torch.float32).reshape(1, 24, 1)
+        out = pixel_shuffle(x, h=4, w=6)
+
+        expected = torch.tensor(
+            [
+                [
+                    [0, 1, 6, 7],
+                    [2, 3, 8, 9],
+                    [4, 5, 10, 11],
+                    [12, 13, 18, 19],
+                    [14, 15, 20, 21],
+                    [16, 17, 22, 23],
+                ]
+            ],
+            dtype=torch.float32,
+        )
+        torch.testing.assert_close(out, expected)
+
+    @pytest.mark.internal
+    def test_dynamic_resolution_non_square_image_golden_values(self):
+        from megatron.core.models.multimodal.llava_model import pixel_shuffle_dynamic_res
+
+        x = torch.arange(24, dtype=torch.float32).reshape(1, 24, 1)
+        imgs_sizes = torch.tensor([[4, 6]], dtype=torch.int32)
+
+        out = pixel_shuffle_dynamic_res(x, imgs_sizes, patch_dim=1)
+
+        expected = torch.tensor(
+            [
+                [
+                    [0, 1, 6, 7],
+                    [2, 3, 8, 9],
+                    [4, 5, 10, 11],
+                    [12, 13, 18, 19],
+                    [14, 15, 20, 21],
+                    [16, 17, 22, 23],
+                ]
+            ],
+            dtype=torch.float32,
+        )
+        torch.testing.assert_close(out, expected)
+
+    @pytest.mark.internal
+    def test_non_square_h_w_must_be_even(self):
+        from megatron.core.models.multimodal.llava_model import pixel_shuffle
+
         x = torch.randn(1, 12, 4)
-        out = pixel_shuffle(x, h=3, w=4)
-        # scale=0.5 ⇒ each spatial dim halves ⇒ output area = (3*4)/(2*2) = 3.
-        assert out.shape == (1, 3, 16)
+        with pytest.raises(AssertionError, match="must both be divisible"):
+            pixel_shuffle(x, h=3, w=4)
 
     @pytest.mark.internal
     def test_h_w_mismatch_raises(self):
@@ -305,6 +350,48 @@ class TestPixelShuffleNonSquare:
         # Mismatch: h*w != patches.
         with pytest.raises(AssertionError):
             pixel_shuffle(x, h=2, w=2)
+
+    @pytest.mark.internal
+    def test_dynamic_resolution_video_chunks_use_real_non_square_grids(self):
+        from megatron.core.models.multimodal.llava_model import (
+            _pixel_shuffle_dynamic_resolution_chunks,
+        )
+
+        # The temporal encoder returns one 2D chunk per tubelet. The shared
+        # helper must also continue accepting packed 3D image chunks.
+        video_chunks = [torch.randn(1008, 8) for _ in range(8)]
+        shuffled_video = _pixel_shuffle_dynamic_resolution_chunks(
+            video_chunks, [(448, 576)] * 8, patch_dim=16
+        )
+        assert all(chunk.shape == (252, 32) for chunk in shuffled_video)
+
+        packed_image_chunks = [torch.randn(1, 1008, 8)]
+        shuffled_images = _pixel_shuffle_dynamic_resolution_chunks(
+            packed_image_chunks, [(448, 576)], patch_dim=16
+        )
+        assert shuffled_images[0].shape == (1, 252, 32)
+
+    @pytest.mark.internal
+    def test_temporal_token_counts_group_one_placeholder_per_media(self):
+        from megatron.core.models.multimodal.llava_model import _group_temporal_token_counts_tensor
+
+        tubelet_counts = torch.tensor([252, 252, 128], dtype=torch.int32, device="cuda")
+        media_tubelet_counts = [2, 1]
+        grouped_counts = _group_temporal_token_counts_tensor(tubelet_counts, media_tubelet_counts)
+        assert torch.equal(
+            grouped_counts, torch.tensor([504, 128], dtype=torch.int32, device="cuda")
+        )
+
+        # temporal_patch_dim=1 makes every frame one tubelet. A per-video
+        # placeholder therefore receives the sum of all frame embeddings.
+        device_counts = torch.tensor([64, 64, 32], dtype=torch.int32, device="cuda")
+        grouped_counts = _group_temporal_token_counts_tensor(device_counts, [2, 1])
+        assert torch.equal(
+            grouped_counts, torch.tensor([128, 32], dtype=torch.int32, device="cuda")
+        )
+
+        with pytest.raises(ValueError, match="must partition"):
+            _group_temporal_token_counts_tensor(tubelet_counts, [1, 1])
 
 
 class TestRADIODynamicResAndTemporal:

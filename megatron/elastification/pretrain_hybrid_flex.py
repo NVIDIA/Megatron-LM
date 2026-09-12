@@ -164,6 +164,7 @@ def model_provider(
         hybrid_layer_pattern=args.hybrid_layer_pattern,
         post_process=post_process,
         fp16_lm_cross_entropy=args.fp16_lm_cross_entropy,
+        logit_dtype=getattr(args, 'logit_dtype', None),
         parallel_output=True,
         share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,
         position_embedding_type=args.position_embedding_type,
@@ -317,7 +318,7 @@ def loss_func(
 
     alpha = args.loss_alpha
 
-    (output_tensor, (param_loss, extra_reporting_dict)) = output_tensor
+    output_tensor, (param_loss, extra_reporting_dict) = output_tensor
 
     if param_loss is not None:
         if param_loss > 0:
@@ -459,8 +460,8 @@ def forward_step(data_iterator, model: HybridModel):
     timers('batch-generator', log_level=2).start()
     global stimer
     with stimer(bdata=True):
-        (tokens, labels, loss_mask, attention_mask, position_ids, cu_seqlens, max_seqlen) = (
-            get_batch(data_iterator)
+        tokens, labels, loss_mask, attention_mask, position_ids, cu_seqlens, max_seqlen = get_batch(
+            data_iterator
         )
     timers('batch-generator').stop()
 

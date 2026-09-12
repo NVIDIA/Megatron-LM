@@ -49,6 +49,89 @@ def _make_inputs(num_tokens, hidden_dim, topk, num_experts, seed=42):
     return hidden, probs, routing_map
 
 
+def test_batch_invariant_squared_relu_applies_probs_before_fc2():
+    """Match training's probability placement and BF16 rounding before FC2."""
+    from megatron.core.activations import squared_relu
+    from megatron.core.inference.moe.activations import padded_squared_relu
+    from megatron.core.inference.moe.batch_invariant import squared_relu_with_probs
+
+    torch.manual_seed(17)
+    rows, hidden, output_size = 37, 1856, 512
+    x = torch.randn(rows, hidden, device="cuda", dtype=torch.bfloat16)
+    probs = torch.rand(rows, device="cuda", dtype=torch.float32)
+    fc2_weight = torch.randn(output_size, hidden, device="cuda", dtype=torch.bfloat16)
+    permutation_map = torch.arange(rows, device="cuda", dtype=torch.int32)
+
+    unweighted = padded_squared_relu(x, permutation_map, _vt(rows))
+    actual = squared_relu_with_probs(x, permutation_map, _vt(rows), probs)
+    expected_unweighted = squared_relu(x)
+    expected = (squared_relu(x) * probs.unsqueeze(1)).to(torch.bfloat16)
+
+    assert torch.equal(unweighted, expected_unweighted)
+    assert torch.equal(actual, expected)
+
+    training_output = expected @ fc2_weight.T
+    inference_output = actual @ fc2_weight.T
+    old_inference_output = ((unweighted @ fc2_weight.T).float() * probs.unsqueeze(1)).to(
+        torch.bfloat16
+    )
+
+    assert torch.equal(inference_output, training_output)
+    assert not torch.equal(old_inference_output, training_output)
+
+
+def test_padded_squared_relu_applies_tanh_soft_clamp():
+    """config.activation_func_tanh_clamp_scale bounds the activation by ``s ** 2``.
+
+    The reference keeps the clamped pre-activation in FP32 to match training's fused
+    ``weighted_clamped_squared_relu``, rather than composing
+    ``squared_relu(tanh_soft_clamp(x, s))`` — ``tanh_soft_clamp`` downcasts on return, so
+    that composition squares a BF16 value instead.
+    """
+    from megatron.core.activations import squared_relu
+    from megatron.core.inference.moe.activations import padded_squared_relu
+
+    torch.manual_seed(23)
+    rows, hidden, clamp_scale = 37, 512, 16.0
+    # Scaled past the clamp so the tanh saturates; inside the linear region a dropped
+    # clamp would be indistinguishable.
+    x = torch.randn(rows, hidden, device="cuda", dtype=torch.bfloat16) * 50.0
+    permutation_map = torch.arange(rows, device="cuda", dtype=torch.int32)
+
+    clamped = padded_squared_relu(x, permutation_map, _vt(rows), clamp_scale=clamp_scale)
+    c = clamp_scale * torch.tanh(torch.clamp(x.float(), min=0.0) / clamp_scale)
+    expected = (c**2).to(torch.bfloat16)
+
+    # Bit-exact: no GEMM is involved, so the only op that could differ from the reference
+    # is libdevice.tanh vs torch.tanh, and those agree in fp32.
+    assert torch.equal(clamped, expected)
+    assert clamped.max().item() <= clamp_scale**2
+    # clamp_scale=None must leave the existing unclamped path bit-identical.
+    assert torch.equal(padded_squared_relu(x, permutation_map, _vt(rows)), squared_relu(x))
+
+
+def test_batch_invariant_clamped_squared_relu_matches_training_rounding():
+    """The clamped batch-invariant kernel reproduces training's rounding sequence exactly.
+
+    Compares against the fused training kernel itself, so a change to its rounding order
+    surfaces here rather than silently diverging.
+    """
+    from megatron.core.fusions.fused_weighted_squared_relu import weighted_clamped_squared_relu
+    from megatron.core.inference.moe.batch_invariant import squared_relu_with_probs
+
+    torch.manual_seed(29)
+    rows, hidden, clamp_scale = 37, 512, 16.0
+    x = torch.randn(rows, hidden, device="cuda", dtype=torch.bfloat16) * 50.0
+    probs = torch.rand(rows, device="cuda", dtype=torch.float32)
+    permutation_map = torch.arange(rows, device="cuda", dtype=torch.int32)
+
+    actual = squared_relu_with_probs(x, permutation_map, _vt(rows), probs, clamp_scale)
+    # Training applies the routing probability as a [rows, 1] weight broadcast over hidden.
+    expected = weighted_clamped_squared_relu(x, probs.unsqueeze(1), clamp_scale)
+
+    assert torch.equal(actual, expected)
+
+
 @pytest.mark.internal
 class TestComputeLocalTokensPerExpert:
 
@@ -392,6 +475,50 @@ class TestUnpermuteTokens:
         torch.testing.assert_close(
             result[0], torch.full((hidden_dim,), expected_val, device="cuda"), atol=1e-4, rtol=1e-4
         )
+
+    def test_batch_invariant_unpermute_is_token_local(self):
+        """Unrelated earlier tokens must not affect another token's top-k sum."""
+        from megatron.core.inference.moe.permute import unpermute_tokens
+        from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+            set_batch_invariant_mode,
+        )
+
+        hidden_dim = 8
+        permutation_map = torch.empty(3, dtype=torch.int32, device="cuda")
+        probs = torch.ones(3, device="cuda", dtype=torch.float32)
+
+        # Token 1 has two unit contributions in both layouts. Layout B adds a
+        # huge unrelated token-0 contribution before it; token 1 must not drift.
+        expert_output_a = torch.ones(2, hidden_dim, device="cuda", dtype=torch.bfloat16)
+        inverse_a = torch.tensor([[-1, -1], [0, 1]], dtype=torch.int32, device="cuda")
+
+        expert_output_b = torch.ones(3, hidden_dim, device="cuda", dtype=torch.bfloat16)
+        expert_output_b[0] = 1e20
+        inverse_b = torch.tensor([[0, -1], [1, 2]], dtype=torch.int32, device="cuda")
+
+        with set_batch_invariant_mode(True):
+            out_a = unpermute_tokens(
+                expert_output_a,
+                probs[:2],
+                permutation_map[:2],
+                2,
+                _vt(2),
+                _vt(2),
+                batch_invariant_inverse_map=inverse_a,
+            )
+            out_b = unpermute_tokens(
+                expert_output_b,
+                probs,
+                permutation_map,
+                2,
+                _vt(3),
+                _vt(2),
+                batch_invariant_inverse_map=inverse_b,
+            )
+
+        expected = torch.full((hidden_dim,), 2.0, device="cuda")
+        torch.testing.assert_close(out_a[1], expected, rtol=0.0, atol=0.0)
+        torch.testing.assert_close(out_b[1], expected, rtol=0.0, atol=0.0)
 
 
 @pytest.mark.internal

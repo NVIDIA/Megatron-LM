@@ -403,6 +403,24 @@ def read_metadata(tracker_filename):
     return max_iter, release
 
 
+def read_frozen_resume_iteration(save_dir):
+    """Resume iteration for a ``--freeze-all-layers`` run.
+
+    Returns the integer recorded in ``save_dir``'s progress tracker
+    (``latest_checkpointed_iteration.txt``), or ``0`` when there is none -- i.e. a
+    fresh run, equivalent to ``--finetune`` on the first launch. Unlike
+    :func:`read_metadata` (which returns ``-1`` / errors on a missing or malformed
+    file), a missing tracker here simply means "start from the beginning".
+    """
+    if save_dir is None:
+        return 0
+    tracker_filename = get_checkpoint_tracker_filename(save_dir)
+    if not isfile(tracker_filename):
+        return 0
+    iteration, _release = read_metadata(tracker_filename)
+    return iteration
+
+
 def get_rng_state(
     ckpt_format: str,
     tp_group: torch.distributed.ProcessGroup,
@@ -2037,6 +2055,22 @@ def load_checkpoint(
     """
     args = get_args()
     load_dir = getattr(args, load_arg)
+
+    # --freeze-all-layers: nothing trains, so load the model in --load weights-only (finetune-style)
+    # and auto-resume the data position by feeding this run's own progress tracker -- written to
+    # --save on the previous launch -- into the standard --override-ckpt-iteration path. Reading
+    # progress from --save (this job's output) rather than --load lets --load stay pinned to a
+    # fixed checkpoint across resubmits. An explicit --override-ckpt-iteration wins. (The main use
+    # today is offline-KD teacher-logit dumps.)
+    if getattr(args, 'freeze_all_layers', False):
+        # Weights only: don't adopt the loaded checkpoint's optimizer / LR-scheduler / rng, or run
+        # check_checkpoint_args against a checkpoint from a different run (finetune gates all of
+        # those; --freeze-all-layers alone would still load the scheduler and assert on arg drift).
+        args.finetune = True
+        if args.override_ckpt_iteration is None:
+            progress_iteration = read_frozen_resume_iteration(args.save)
+            if progress_iteration > 0:
+                args.override_ckpt_iteration = progress_iteration
 
     # Finetuning directories
     pretrained_dir = getattr(args, 'pretrained_checkpoint', None)

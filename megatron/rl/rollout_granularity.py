@@ -16,6 +16,10 @@ RELEASE_STATE_BY_SUBMISSION: dict[SubmissionGranularity, ReleaseState] = {
 }
 
 
+# Coarseness order of the granularity ladder (rollout < group < batch).
+GRANULARITY_RANK: dict[str, int] = {"R": 0, "G": 1, "B": 2}
+
+
 def get_rl_parallel_generation_tasks(args) -> int:
     """Return the number of generation slots implied by RL lag and submission granularity."""
     parallel_generation_tasks = args.rl_generation_lag + 1

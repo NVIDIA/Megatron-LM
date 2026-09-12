@@ -158,45 +158,50 @@ class PELogger:
             cls._logger.log(logging.DEBUG - 5, msg)
 
     @classmethod
-    def debug(cls, msg: str):
+    def is_enabled_for(cls, level: int) -> bool:
+        """Return whether a message at ``level`` would be emitted."""
+        return cls._logger is not None and cls._logger.isEnabledFor(level)
+
+    @classmethod
+    def debug(cls, msg: str, *args):
         """Log at DEBUG level."""
         if cls._logger:
-            cls._logger.debug(msg)
+            cls._logger.debug(msg, *args)
 
     @classmethod
-    def info(cls, msg: str):
+    def info(cls, msg: str, *args):
         """Log at INFO level."""
         if cls._logger:
-            cls._logger.info(msg)
+            cls._logger.info(msg, *args)
 
     @classmethod
-    def summary(cls, msg: str):
+    def summary(cls, msg: str, *args):
         """Log summary information (INFO level with [SUMMARY] prefix)."""
         if cls._logger:
-            cls._logger.info(f"[SUMMARY] {msg}")
+            cls._logger.info("[SUMMARY] " + msg, *args)
 
     @classmethod
-    def warn(cls, msg: str):
+    def warn(cls, msg: str, *args):
         """Log at WARNING level."""
         if cls._logger:
-            cls._logger.warning(msg)
+            cls._logger.warning(msg, *args)
 
     @classmethod
-    def warning(cls, msg: str):
+    def warning(cls, msg: str, *args):
         """Log at WARNING level (alias for warn)."""
-        cls.warn(msg)
+        cls.warn(msg, *args)
 
     @classmethod
-    def error(cls, msg: str):
+    def error(cls, msg: str, *args):
         """Log at ERROR level."""
         if cls._logger:
-            cls._logger.error(msg)
+            cls._logger.error(msg, *args)
 
     @classmethod
-    def critical(cls, msg: str):
+    def critical(cls, msg: str, *args):
         """Log at CRITICAL level."""
         if cls._logger:
-            cls._logger.critical(msg)
+            cls._logger.critical(msg, *args)
 
     @classmethod
     def shutdown(cls):

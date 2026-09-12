@@ -53,3 +53,4 @@ MODEL_ARGS:
   --dist-ckpt-strictness: log_all # backward compatibility for TE changes
   --log-memory-to-tensorboard: true
 TEST_TYPE: regular
+LAUNCHER: ft_launcher

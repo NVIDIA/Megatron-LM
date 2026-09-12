@@ -23,6 +23,7 @@ Use :meth:`InferenceSetupConfig.to_inference_config` to produce the runtime engi
 from this declarative config plus the runtime artifacts. This mirrors the
 ``GPTModelConfig -> TransformerConfig`` relationship.
 """
+
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -82,14 +83,15 @@ class InferenceSetupConfig:
     """Enable dynamic batching mode."""
 
     inference_dynamic_batching_buffer_size_gb: float = 40.0
-    """Amount of on-GPU memory allocated for the KV cache. The total amount of memory allocated for
+    """On-GPU portion of the shared KV cache block pool. The total amount of memory allocated for
     the KV cache (CPU + GPU memory) depends on the value set for the unified virtual memory (UVM)
     level (via inference_dynamic_batching_unified_memory_level)."""
 
     inference_dynamic_batching_paused_buffer_size_gb: float | None = None
-    """Amount of memory reserved for paused requests in the dynamic inference context. Active
-    requests are paused when there are not enough active blocks available to continue generating a
-    request."""
+    """Memory used to derive the paused-request block retention budget. This does not reserve blocks
+    from active requests: active requests may use the entire shared pool of usable KV cache blocks.
+    Under allocation pressure, paused requests retain blocks only within this budget and excess
+    paused requests may be evicted."""
 
     inference_dynamic_batching_mamba_memory_ratio: float | None = None
     """Percentage of memory buffer to allocate for Mamba states. If not specified, allocates Mamba
@@ -125,22 +127,26 @@ class InferenceSetupConfig:
     inference_dynamic_batching_cuda_graph_mixed_prefill_count: int = 16
     """Number of mixed prefill requests to capture in a cuda graph."""
 
-    inference_dynamic_batching_cuda_graph_sizing_distribution: Literal["exponential", "linear"] = (
-        "exponential"
-    )
+    inference_dynamic_batching_cuda_graph_sizing_distribution: Literal[
+        "exponential", "linear", "hybrid"
+    ] = "hybrid"
     """Spacing of CUDA graph token counts. "exponential" (default) halves from cuda_graph_max_tokens
     down to tp_size, giving a log-spaced distribution with bounded relative padding. "linear" uses
     varying linear strides across the range."""
 
-    inference_dynamic_batching_sampling_backend: Literal["torch", "flashinfer"] = "torch"
-    """Which sampling kernels to use during inference. Falls back to "torch" with a warning if
-    "flashinfer" is requested but the package is not installed."""
+    inference_dynamic_batching_sampling_backend: Literal["torch", "flashinfer"] = "flashinfer"
+    """Which sampling kernels to use during inference. Defaults to "flashinfer" and falls back to
+    "torch" with a warning if the flashinfer package is not installed."""
 
-    inference_dynamic_batching_async_sched_mode: Literal["legacy", "serial", "overlap"] = "legacy"
-    """Async scheduling mode for dynamic batching. "legacy" (default) preserves the
-    existing resolve-before-prepare path. "serial" speculatively prepares and forwards decode-only
-    steps before resolving finished requests. "overlap" uses the same async scheduling path while
-    overlapping prepare/sample and forward/resolve phases."""
+    offset_sampling_seed_by_dp_rank: bool = True
+    """Offset the inference sampling seed by the data-parallel rank so each DP rank gets a unique
+    generation seed. Disable with --use-same-sampling-seed-across-dp-ranks. Also forced off when
+    --deterministic-mode is enabled."""
+
+    inference_dynamic_batching_async_sched_mode: Literal["async", "legacy"] = "async"
+    """Async scheduling mode for dynamic batching. "async" (default) overlaps asynchronous
+    scheduling phases by reordering them to prepare-before-resolve. Select "legacy" to disable
+    async scheduling and use the resolve-before-prepare path."""
 
     inference_dynamic_batching_logprobs_mode: Literal["raw_logprobs", "processed_logprobs"] = (
         "raw_logprobs"
@@ -174,24 +180,41 @@ class InferenceSetupConfig:
     """Enable/disable prefix caching for dynamic batching inference. When disabled, KV cache blocks
     cannot be shared between requests with identical prompt prefixes."""
 
-    inference_dynamic_batching_prefix_caching_eviction_policy: Literal["ref_zero", "lru"] = "ref_zero"
-    """Eviction policy for prefix caching blocks. "ref_zero" (default) immediately returns blocks to
+    inference_dynamic_batching_prefix_caching_eviction_policy: Literal["ref_zero", "lru"] = "lru"
+    """Eviction policy for prefix caching blocks. "ref_zero" immediately returns blocks to
     the free pool when ref_count hits 0. "lru" keeps blocks cached and evicts via LRU only when
     space is needed."""
 
     inference_dynamic_batching_prefix_caching_coordinator_policy: Literal[
         "longest_prefix", "first_prefix_block", "load_balanced"
-    ] = "load_balanced"
-    """Coordinator routing policy for prefix caching. "load_balanced" (default) routes to the rank
+    ] = "longest_prefix"
+    """Coordinator routing policy for prefix caching. "load_balanced" routes to the rank
     with the fewest in-flight requests, ignoring prefix affinity. "first_prefix_block" routes based
-    on the first block hash only. "longest_prefix" routes to the rank with the longest matching
+    on the first block hash only. "longest_prefix" (the default) routes to the rank with the longest matching
     prefix. "first_prefix_block" and "longest_prefix" both combine prefix affinity with load
     balancing and fall back to load-balanced routing when prefix caching is disabled or no prefix
     match exists."""
 
-    inference_dynamic_batching_prefix_caching_routing_alpha: float = 0.5
-    """Weight for prefix-aware routing score: score = alpha * match + (1 - alpha) * normalized_load.
-    Higher alpha favors prefix cache hits; lower alpha favors load balance."""
+    inference_dynamic_batching_prefix_caching_routing_alpha: float = 1.0
+    """How hard to penalise load when routing on prefix affinity:
+    score = cache_score - alpha * relative_load, where relative_load is a rank's in-flight count
+    measured against the fleet mean. 0 is pure prefix affinity; higher values divert to idle ranks
+    more readily as the fleet becomes lopsided. Dimensionless and not capped at 1."""
+
+    inference_dynamic_batching_prefix_cache_ttl_seconds: float = 300.0
+    """How long the coordinator assumes an engine still holds a block it routed there. It never
+    observes evictions, so entries untouched for this long are dropped rather than kept forever."""
+
+    inference_dynamic_batching_media_cache_coordinator_policy: Literal[
+        "affinity", "load_balanced"
+    ] = "affinity"
+    """Coordinator routing policy for media caching."""
+
+    inference_dynamic_batching_media_cache_routing_weight: float = 1.0
+    """Media-cache hit weight in equivalent compact-prompt blocks."""
+
+    inference_dynamic_batching_vision_embedding_cache_max_bytes: int = 0
+    """Maximum GPU bytes retained per engine for reusable vision embeddings."""
 
     inference_dynamic_batching_prefix_caching_mamba_gb: float | None = None
     """GPU memory budget (in GB) for the Mamba state cache used by prefix caching on hybrid models.
@@ -246,6 +269,9 @@ class InferenceSetupConfig:
     use_flashinfer_fused_rope: bool = False
     """Use flashinfer's fused rope implementation. Mirrors ``--use-flashinfer-fused-rope``."""
 
+    inference_dynamic_batching_allow_stale_multimodal_embeddings: bool = False
+    """Allow request-local and cached multimodal embeddings across weight-change boundaries."""
+
     def to_inference_config(
         self,
         model: "MegatronModule",
@@ -291,6 +317,7 @@ class InferenceSetupConfig:
             InferenceConfig,
             KVCacheManagementMode,
             MambaInferenceStateConfig,
+            MediaCacheCoordinatorPolicy,
             PrefixCachingCoordinatorPolicy,
             PrefixCachingEvictionPolicy,
         )
@@ -366,6 +393,17 @@ class InferenceSetupConfig:
                 self.inference_dynamic_batching_prefix_caching_coordinator_policy
             ),
             prefix_caching_routing_alpha=self.inference_dynamic_batching_prefix_caching_routing_alpha,
+            prefix_cache_ttl_seconds=self.inference_dynamic_batching_prefix_cache_ttl_seconds,
+            media_cache_coordinator_policy=MediaCacheCoordinatorPolicy(
+                self.inference_dynamic_batching_media_cache_coordinator_policy
+            ),
+            media_cache_routing_weight=self.inference_dynamic_batching_media_cache_routing_weight,
+            vision_embedding_cache_max_bytes=(
+                self.inference_dynamic_batching_vision_embedding_cache_max_bytes
+            ),
+            allow_stale_multimodal_embeddings=(
+                self.inference_dynamic_batching_allow_stale_multimodal_embeddings
+            ),
             prefix_caching_mamba_gb=self.inference_dynamic_batching_prefix_caching_mamba_gb,
             metrics_writer=metrics_writer,
             logging_step_interval=self.inference_logging_step_interval,
@@ -373,8 +411,7 @@ class InferenceSetupConfig:
             use_synchronous_zmq_collectives=self.inference_use_synchronous_zmq_collectives,
             disable_ep_consensus=self.inference_disable_ep_consensus,
             sampling_backend=self.inference_dynamic_batching_sampling_backend,
-            async_sched_mode=AsyncScheduleMode(
-                self.inference_dynamic_batching_async_sched_mode
-            ),
+            offset_sampling_seed_by_dp_rank=self.offset_sampling_seed_by_dp_rank,
+            async_sched_mode=AsyncScheduleMode(self.inference_dynamic_batching_async_sched_mode),
             logprobs_mode=self.inference_dynamic_batching_logprobs_mode,
         )

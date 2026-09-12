@@ -414,7 +414,7 @@ class TestMTPCudaGraphInference:
             )
             dist.broadcast(full_hidden, src=0)
             local_hidden = full_hidden.chunk(tp_size)[tp_rank].contiguous()
-            unwrapped._decoder_hidden_states_cache = local_hidden
+            context.mtp_decoder_hidden_states = local_hidden
 
             ctrl._last_accepted_seq_indices = torch.arange(active_request_count, device='cuda')
             ctrl._mtp_resolved_padded_count = padded_count
@@ -435,7 +435,7 @@ class TestMTPCudaGraphInference:
                 assert sampled.dtype == torch.int64
                 assert torch.all(sampled >= 0) and torch.all(sampled < self.VOCAB_SIZE)
 
-            assert not hasattr(unwrapped, '_decoder_hidden_states_cache')
+            assert context.mtp_decoder_hidden_states is None
 
         self._assert_mtp_cuda_graphs_were_replayed(model, True)
 
@@ -517,7 +517,7 @@ class TestMTPCudaGraphInference:
                 )
                 dist.broadcast(full_hidden, src=0)
                 local_hidden = full_hidden.chunk(tp_size)[tp_rank].contiguous()
-                unwrapped._decoder_hidden_states_cache = local_hidden
+                context.mtp_decoder_hidden_states = local_hidden
 
                 ctrl._last_accepted_seq_indices = torch.arange(active_request_count, device='cuda')
                 # Greedy sampling for all active requests.

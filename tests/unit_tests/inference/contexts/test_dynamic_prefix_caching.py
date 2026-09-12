@@ -255,10 +255,10 @@ class TestPrefixCachingCore(PrefixCachingTestBase):
         prompt = self._prompt(bs * 3)
         ctx.add_request(self._req(ctx, prompt.clone()))
         first_blocks = self._block_ids(ctx, 0, 3)
-        avail_after_first = alloc.total_avail
+        avail_after_first = alloc.pool_avail
         for i in range(2, 11):
             ctx.add_request(self._req(ctx, prompt.clone(), request_id=i))
-        assert alloc.total_avail == avail_after_first
+        assert alloc.pool_avail == avail_after_first
         for req_idx in range(1, 10):
             assert self._block_ids(ctx, req_idx, 3) == first_blocks
         for bid in first_blocks:
@@ -353,26 +353,26 @@ class TestPrefixCachingCore(PrefixCachingTestBase):
         prompt = self._prompt(bs * 4)
         ctx.add_request(self._req(ctx, prompt.clone()))
         first_blocks = self._block_ids(ctx, 0, 4)
-        avail = alloc.total_avail
+        avail = alloc.pool_avail
         ctx.add_request(self._req(ctx, prompt.clone(), request_id=2))
-        assert self._block_ids(ctx, 1, 4) == first_blocks and alloc.total_avail == avail
+        assert self._block_ids(ctx, 1, 4) == first_blocks and alloc.pool_avail == avail
 
         # extended prompt allocates only new blocks
         ctx2 = self._ctx()
         alloc2 = ctx2.kv_block_allocator
         p2a = self._prompt(bs * 3)
         ctx2.add_request(self._req(ctx2, p2a))
-        avail2 = alloc2.total_avail
+        avail2 = alloc2.pool_avail
         p2b = torch.cat([p2a, self._prompt(bs * 2, offset=1000)])
         ctx2.add_request(self._req(ctx2, p2b, request_id=2))
-        assert alloc2.total_avail == avail2 - 2
+        assert alloc2.pool_avail == avail2 - 2
 
         # check_availability accounts for prefix match
         ctx3 = self._ctx(buffer_size_gb=0.01, rounder=1)
         alloc3 = ctx3.kv_block_allocator
         p3 = self._prompt(ctx3.block_size_tokens * 2)
         ctx3.add_request(self._req(ctx3, p3.clone()))
-        while alloc3.total_avail > 0:
+        while alloc3.pool_avail > 0:
             alloc3.allocate_memory_blocks(1)
         _, _, kv_available = ctx3.check_availability(self._req(ctx3, p3.clone(), request_id=2))
         assert kv_available
@@ -440,13 +440,13 @@ class TestPrefixCachingCore(PrefixCachingTestBase):
         ctx.add_request(self._req(ctx, prompt.clone(), request_id=2))
         b0, b1 = self._block_ids(ctx, 0, 2)
         b0_hash = alloc.block_hashes[b0].item()
-        avail_before = alloc.total_avail
+        avail_before = alloc.pool_avail
         ctx.release_memory_blocks_from_request_indexes(torch.tensor([0]))
         assert alloc.block_ref_counts[b0].item() == 1 and b0_hash in alloc.kv_hash_to_block_id
         ctx.release_memory_blocks_from_request_indexes(torch.tensor([1]))
         assert alloc.block_ref_counts[b0].item() == 0 and b0_hash not in alloc.kv_hash_to_block_id
         assert alloc.block_hashes[b0].item() == -1 and alloc.block_hashes[b1].item() == -1
-        assert alloc.total_avail == avail_before + 2
+        assert alloc.pool_avail == avail_before + 2
 
         # released blocks not discoverable
         ctx2 = self._ctx(prefix_caching_eviction_policy=PrefixCachingEvictionPolicy.REF_ZERO)
@@ -594,7 +594,7 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         req1 = self._req(ctx, prompt.clone())
         ctx.add_request(req1)
         first_blocks = self._block_ids(ctx, 0, 3)
-        avail = alloc.total_avail
+        avail = alloc.pool_avail
         tokens_after = ctx.active_token_count
 
         req2 = self._req(ctx, prompt.clone(), request_id=2)
@@ -604,7 +604,7 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
 
         ctx.add_request(req2)
         # blocks reused (pool unchanged), ref counts incremented
-        assert alloc.total_avail == avail
+        assert alloc.pool_avail == avail
         for bid in first_blocks:
             assert alloc.block_ref_counts[bid].item() == 2
         # all tokens processed (none skipped)
@@ -688,17 +688,13 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         ctx6.add_request(self._req(ctx6, p6.clone()))
         msa6 = ctx6.mamba_slot_allocator
         self._mamba_allocate_and_register(ctx6, self._block_ids(ctx6, 0, 4)[:2])
-        engine6 = _StubEngine(ctx6)
-        assert engine6._find_mamba_match_count(self._req(ctx6, p6.clone(), request_id=2)) == 2
+        req6 = self._req(ctx6, p6.clone(), request_id=2)
+        assert ctx6._find_mamba_match_count(req6, 0, len(req6.precomputed_block_hashes)) == 2
         # no match when no mamba hashes registered
         ctx7 = self._mctx()
         ctx7.add_request(self._req(ctx7, self._prompt(bs * 3)))
-        assert (
-            _StubEngine(ctx7)._find_mamba_match_count(
-                self._req(ctx7, self._prompt(bs * 3), request_id=2)
-            )
-            == 0
-        )
+        req7 = self._req(ctx7, self._prompt(bs * 3), request_id=2)
+        assert ctx7._find_mamba_match_count(req7, 0, len(req7.precomputed_block_hashes)) == 0
 
         # allocate, free, re-allocate
         ctx8 = self._mctx()

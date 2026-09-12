@@ -66,3 +66,14 @@ class TestAsyncStream:
         with pytest.raises(asyncio.CancelledError):
             await gen.aclose()
         assert called == [True]
+
+    async def test_stream_is_directly_iterable_and_explicitly_closeable(self):
+        called = []
+        s = AsyncStream(request_id=7, cancel=lambda: (called.append(True), s.finish()))
+        s.put("first")
+
+        assert s.request_id == 7
+        assert await s.__anext__() == "first"
+        await s.aclose()
+        assert [item async for item in s] == []
+        assert called == [True]

@@ -4,6 +4,8 @@ import logging
 from dataclasses import dataclass
 from typing import Any, Callable, ClassVar, Literal, override
 
+import torch
+
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.enums import ModelType
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_inference_stack_spec
@@ -46,6 +48,7 @@ class HybridModelConfig(ModelConfig):
     builder: ClassVar[str] = "megatron.training.models.hybrid.HybridModelBuilder"
     transformer: TransformerConfig
     fp16_lm_cross_entropy: bool = False
+    logit_dtype: torch.dtype | None = None
     parallel_output: bool = True
     share_embeddings_and_output_weights: bool = False
     hybrid_attention_ratio: float = 0.0
@@ -182,6 +185,7 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
             max_sequence_length=self._model_config.seq_length,
             hybrid_layer_pattern=self._model_config.hybrid_layer_pattern,
             fp16_lm_cross_entropy=self._model_config.fp16_lm_cross_entropy,
+            logit_dtype=self._model_config.logit_dtype,
             parallel_output=self._model_config.parallel_output,
             share_embeddings_and_output_weights=self._model_config.share_embeddings_and_output_weights,
             position_embedding_type=self._model_config.position_embedding_type,

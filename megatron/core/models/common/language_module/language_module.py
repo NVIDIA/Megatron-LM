@@ -6,7 +6,7 @@ from typing import Optional, Tuple
 import torch
 from torch import Tensor
 
-from megatron.core import parallel_state, tensor_parallel
+from megatron.core import tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.transformer.cuda_graphs import CudaGraphManager
 
@@ -28,6 +28,7 @@ from megatron.core.transformer.multi_token_prediction import tie_word_embeddings
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import ensure_metadata_has_dp_cp_group
 from megatron.core.utils import (
+    get_pg_rank,
     get_tensor_model_parallel_group_if_none,
     is_te_min_version,
     make_tp_sharded_tensor_for_checkpoint,
@@ -110,6 +111,12 @@ class LanguageModule(MegatronModule):
 
         Transformer engine works based on optout. By default all three attention backend flags are set to 1. So if the user choses a particular attention backend we set the other two to 0. If the user choses local, we set all 3 TE env variables to 0.
         """
+        if self.config.batch_invariant_mode:
+            from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+                assert_te_supports_batch_invariant_attention,
+            )
+
+            assert_te_supports_batch_invariant_attention()
 
         def check_and_set_env_variable(
             env_variable_name: str, expected_value: int, attn_type: AttnBackend
@@ -140,6 +147,17 @@ class LanguageModule(MegatronModule):
             check_and_set_env_variable("NVTE_FLASH_ATTN", 1, AttnBackend.auto)
             check_and_set_env_variable("NVTE_FUSED_ATTN", 1, AttnBackend.auto)
             check_and_set_env_variable("NVTE_UNFUSED_ATTN", 1, AttnBackend.auto)
+
+        # Pin the FlashAttention generation for TransformerEngine by disabling the
+        # other versions via NVTE_FLASH_ATTN_V2/V3/V4 (default 1). This keeps the
+        # training-side attention on the same kernel as the mcore inference path,
+        # which honors config.flash_attention_version directly.
+        if self.config.flash_attention_version is not None:
+            for version in (2, 3, 4):
+                if version != self.config.flash_attention_version:
+                    check_and_set_env_variable(
+                        f"NVTE_FLASH_ATTN_V{version}", 0, self.config.attention_backend
+                    )
 
     def compute_language_model_loss(self, labels: Tensor, logits: Tensor) -> Tensor:
         """Computes the language model loss (Cross entropy across vocabulary)
@@ -494,7 +512,7 @@ class LanguageModule(MegatronModule):
         last_stage_word_emb_replica_id = (
             1,  # copy of first stage embedding
             0,
-            parallel_state.get_data_parallel_rank(with_context_parallel=True),
+            get_pg_rank(metadata['dp_cp_group']),
         )
 
         sharded_state_dict[output_layer_weight_key] = make_tp_sharded_tensor_for_checkpoint(

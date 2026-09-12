@@ -487,6 +487,14 @@ class _RolloutPipeline:
                 self.gate.release_after("consumed")
 
 
+class EnvAllocation(NamedTuple):
+    """One env's constant share of every trainer batch."""
+
+    agent: "GroupedRolloutGenerator"
+    env_id: str
+    num_groups: int
+
+
 class GroupedRolloutGenerator(Agent, ABC):
     """An interface to return grouped Rollout objects to support algorithms like GRPO."""
 
@@ -506,6 +514,18 @@ class GroupedRolloutGenerator(Agent, ABC):
         _RolloutPipeline.stage_assemble.
         """
         ...
+
+    def rollout_allocations(self, num_groups: int) -> list[EnvAllocation]:
+        """Returns this env's per-trainer-batch allocation."""
+        return [
+            EnvAllocation(
+                agent=self, env_id=getattr(self, "env_id", None) or "rollout", num_groups=num_groups
+            )
+        ]
+
+    def take_restored_group(self, env_id: str) -> RolloutGroup | None:
+        """Return one recovered group for ``env_id``, if one is available."""
+        return None
 
     async def get_grouped_rollouts(
         self, request: GroupedRolloutRequest

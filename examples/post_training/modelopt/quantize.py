@@ -58,12 +58,11 @@ from megatron.core import parallel_state
 from megatron.core.parallel_state import get_context_parallel_group
 from megatron.core.utils import get_batch_on_this_cp_rank, unwrap_model
 from megatron.post_training.arguments import add_modelopt_args
-from megatron.post_training.checkpointing import load_modelopt_checkpoint
 from megatron.post_training.model_builder import modelopt_gpt_hybrid_builder
 from megatron.post_training.utils import print_distributed_quant_summary, report_current_memory_info
 from megatron.training import get_args, get_model, initialize_megatron
 from megatron.training.arguments import parse_and_validate_args
-from megatron.training.checkpointing import save_checkpoint
+from megatron.training.checkpointing import load_checkpoint, save_checkpoint
 from megatron.training.utils import print_rank_0
 from model_provider import model_provider
 
@@ -249,9 +248,7 @@ def check_arguments():
             )
             args.export_quant_cfg = None
         if args.recipe is not None:
-            print_rank_0(
-                "WARNING: --auto-quantize-bits overrides --recipe; the latter is ignored."
-            )
+            print_rank_0("WARNING: --auto-quantize-bits overrides --recipe; the latter is ignored.")
             args.recipe = None
         if args.pipeline_model_parallel_size > 1:
             raise ValueError(
@@ -441,10 +438,7 @@ def auto_quantize_model(unwrapped_model, tokenizer):
         return megatron_prefill(model, batch["input_ids"])
 
     def forward_backward_step(model, batch):
-        lm_batch = build_lm_batch_from_input_ids(
-            batch,
-            cp_group=get_context_parallel_group(),
-        )
+        lm_batch = build_lm_batch_from_input_ids(batch, cp_group=get_context_parallel_group())
         loss = model.forward(
             input_ids=lm_batch["tokens"],
             position_ids=lm_batch["position_ids"],
@@ -462,7 +456,9 @@ def auto_quantize_model(unwrapped_model, tokenizer):
         if "parent_class" not in entry
     ]
 
-    dp_world_size = parallel_state.get_data_parallel_world_size() if torch.distributed.is_initialized() else 1
+    dp_world_size = (
+        parallel_state.get_data_parallel_world_size() if torch.distributed.is_initialized() else 1
+    )
     num_calib_steps = len(calib_dataloader)
     score_samples_per_step = max(dp_world_size * args.calib_batch_size, 1)
     num_score_steps = min(
@@ -496,7 +492,9 @@ def auto_quantize_model(unwrapped_model, tokenizer):
         os.makedirs(args.save, exist_ok=True)
         torch.save(
             search_state,
-            os.path.join(args.save, f"auto_quantize_search_state_rank_{torch.distributed.get_rank()}.pth"),
+            os.path.join(
+                args.save, f"auto_quantize_search_state_rank_{torch.distributed.get_rank()}.pth"
+            ),
         )
     return search_state
 
@@ -525,7 +523,7 @@ if __name__ == "__main__":
     report_current_memory_info()
 
     if args.load is not None:
-        load_modelopt_checkpoint(model, strict=not args.untie_embeddings_and_output_weights)
+        load_checkpoint(model, None, None, strict=not args.untie_embeddings_and_output_weights)
         print_rank_0("Done loading checkpoint")
 
     if args.pretrained_model_path is not None:
@@ -538,9 +536,8 @@ if __name__ == "__main__":
         import_kwargs = {"dtype": import_dtype}
         if "trust_remote_code" in inspect.signature(import_mcore_gpt_from_hf).parameters:
             import_kwargs.update({"trust_remote_code": args.trust_remote_code})
-        if (
-            "moe_router_dtype" in inspect.signature(import_mcore_gpt_from_hf).parameters
-            and getattr(args, "moe_router_dtype", None)
+        if "moe_router_dtype" in inspect.signature(import_mcore_gpt_from_hf).parameters and getattr(
+            args, "moe_router_dtype", None
         ):
             import_kwargs.update({"moe_router_dtype": args.moe_router_dtype})
         import_mcore_gpt_from_hf(

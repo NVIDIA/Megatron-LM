@@ -23,7 +23,11 @@ from megatron.core.process_groups_config import (
     MultiModuleProcessGroupCollection,
     ProcessGroupCollection,
 )
-from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.tensor_parallel.random import (
+    initialize_rng_tracker,
+    model_parallel_cuda_manual_seed,
+)
+from megatron.core.transformer.cuda_graphs import _CudagraphGlobalRecord, delete_cuda_graphs
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
@@ -111,7 +115,9 @@ def add_embedding_groups(pg_collection):
     return pg_collection
 
 
-def create_transformer_block(hidden_size, pg_collection, dtype=torch.bfloat16):
+def create_transformer_block(
+    hidden_size, pg_collection, dtype=torch.bfloat16, use_local_cudagraphs=False
+):
     """Create a transformer block for testing."""
     torch.manual_seed(12345)
     model_parallel_cuda_manual_seed(
@@ -121,6 +127,17 @@ def create_transformer_block(hidden_size, pg_collection, dtype=torch.bfloat16):
         etp_rank=dist.get_rank(),
     )
 
+    cudagraph_kwargs = {}
+    if use_local_cudagraphs:
+        cudagraph_kwargs = {
+            "pipeline_model_parallel_size": pg_collection.pp.size(),
+            "pipeline_dtype": dtype,
+            "cuda_graph_impl": "local",
+            "cuda_graph_modules": [],
+            "cuda_graph_warmup_steps": 0,
+            "deallocate_pipeline_outputs": True,
+        }
+
     config = TransformerConfig(
         num_layers=1,
         hidden_size=hidden_size,
@@ -129,11 +146,16 @@ def create_transformer_block(hidden_size, pg_collection, dtype=torch.bfloat16):
         attention_dropout=0.0,
         hidden_dropout=0.0,
         bf16=(dtype == torch.bfloat16),
+        **cudagraph_kwargs,
     )
 
     block = (
         TransformerBlock(
-            config, get_gpt_layer_with_transformer_engine_spec(), pg_collection=pg_collection
+            config,
+            get_gpt_layer_with_transformer_engine_spec(),
+            post_process=not use_local_cudagraphs,
+            post_layer_norm=not use_local_cudagraphs,
+            pg_collection=pg_collection,
         )
         .cuda()
         .to(dtype)
@@ -154,14 +176,16 @@ def create_transformer_block(hidden_size, pg_collection, dtype=torch.bfloat16):
     return block
 
 
-def create_module_with_grid(tp, pp, dp, grid_offset, hidden_size):
+def create_module_with_grid(tp, pp, dp, grid_offset, hidden_size, use_local_cudagraphs=False):
     """Create a module (transformer block) with its grid."""
     rank = dist.get_rank()
     grid = create_hypercomm_grid(offset=grid_offset, tp=tp, pp=pp, dp=dp)
 
     if grid.rank_offset <= rank < grid.rank_offset + grid.size:
         pg_collection = add_embedding_groups(get_pg_collection(grid))
-        module = create_transformer_block(hidden_size, pg_collection)
+        module = create_transformer_block(
+            hidden_size, pg_collection, use_local_cudagraphs=use_local_cudagraphs
+        )
     else:
         pg_collection = None
         module = None
@@ -177,7 +201,7 @@ def create_module_with_grid(tp, pp, dp, grid_offset, hidden_size):
 class MultiModuleModel(torch.nn.Module):
     """Wrapper for testing multimodule schedules with multiple encoders + LLM."""
 
-    def __init__(self, encoder_configs, llm_config, hidden_size):
+    def __init__(self, encoder_configs, llm_config, hidden_size, use_local_cudagraphs=False):
         """
         Args:
             encoder_configs: List of dicts with keys: tp, pp, dp, grid_offset, name
@@ -195,7 +219,12 @@ class MultiModuleModel(torch.nn.Module):
         for enc_cfg in encoder_configs:
             name = enc_cfg['name']
             module, grid, pg_col = create_module_with_grid(
-                enc_cfg['tp'], enc_cfg['pp'], enc_cfg['dp'], enc_cfg['grid_offset'], hidden_size
+                enc_cfg['tp'],
+                enc_cfg['pp'],
+                enc_cfg['dp'],
+                enc_cfg['grid_offset'],
+                hidden_size,
+                use_local_cudagraphs,
             )
             self.encoders[name] = module
             self.encoder_grids[name] = grid
@@ -208,6 +237,7 @@ class MultiModuleModel(torch.nn.Module):
             llm_config['dp'],
             llm_config['grid_offset'],
             hidden_size,
+            use_local_cudagraphs,
         )
 
         # Track all modules for gradient sync
@@ -350,7 +380,13 @@ class DataIterator:
 
 
 def run_multimodule_schedule_test(
-    encoder_configs, llm_config, hidden_size, seq_length, micro_batch_size, num_microbatches
+    encoder_configs,
+    llm_config,
+    hidden_size,
+    seq_length,
+    micro_batch_size,
+    num_microbatches,
+    use_local_cudagraphs=False,
 ):
     """Run multimodule schedule test with given configuration.
 
@@ -363,7 +399,9 @@ def run_multimodule_schedule_test(
         num_microbatches: Number of microbatches
     """
     # Create model
-    model = MultiModuleModel(encoder_configs, llm_config, hidden_size)
+    model = MultiModuleModel(
+        encoder_configs, llm_config, hidden_size, use_local_cudagraphs=use_local_cudagraphs
+    )
     model.model_type = 'unit-test'
 
     # Build module_to_grid_map and topology
@@ -390,6 +428,7 @@ def run_multimodule_schedule_test(
         else loss
     )
     config.hidden_size = hidden_size
+    config.deallocate_pipeline_outputs = use_local_cudagraphs
     model.config = config
 
     # Create communicator
@@ -467,7 +506,9 @@ class TestMultimoduleSchedules:
 
     @classmethod
     def setup_class(cls):
-        Utils.initialize_distributed()
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1, pipeline_model_parallel_size=1
+        )
         cls.world_size = dist.get_world_size()
 
     @classmethod
@@ -493,6 +534,35 @@ class TestMultimoduleSchedules:
             micro_batch_size=2,
             num_microbatches=4,
         )
+
+    def test_local_cudagraph_module_pp1_output_supports_cross_module_deallocation(self):
+        """A module-local PP1 CUDA-graph output can still cross a pipeline boundary."""
+        if self.world_size != 2:
+            pytest.skip(f"Requires 2 GPUs, got {self.world_size}")
+
+        initialize_rng_tracker(use_cudagraphable_rng=True, force_reset=True)
+        encoder_configs = [{'name': 'encoder', 'tp': 1, 'pp': 1, 'dp': 1, 'grid_offset': 0}]
+        llm_config = {'tp': 1, 'pp': 1, 'dp': 1, 'grid_offset': 1}
+
+        try:
+            run_multimodule_schedule_test(
+                encoder_configs,
+                llm_config,
+                hidden_size=64,
+                seq_length=8,
+                micro_batch_size=1,
+                num_microbatches=1,
+                use_local_cudagraphs=True,
+            )
+
+            records = list(_CudagraphGlobalRecord.cudagraph_record)
+            assert {record[1] for record in records} == {'fwd', 'bwd'}
+            assert all(
+                record[0].base_module.config.pipeline_model_parallel_size == 1 for record in records
+            )
+        finally:
+            delete_cuda_graphs()
+            torch.cuda.set_stream(torch.cuda.default_stream())
 
     def test_dual_encoder_2gpu(self):
         """Test dual encoder + LLM on 2 GPUs (both encoders on rank 0)."""

@@ -92,6 +92,10 @@ class TestTELMHeadColumnParallelLinearRejections:
         with pytest.raises(ValueError, match="disable_grad_reduce"):
             TELMHeadColumnParallelLinear(**self._kwargs(disable_grad_reduce=True))
 
+    def test_rejects_output_dtype(self):
+        with pytest.raises(ValueError, match="output_dtype"):
+            TELMHeadColumnParallelLinear(**self._kwargs(output_dtype=torch.float32))
+
 
 class TestGPTModelOutputLayerSelection:
     """Verify GPTModel picks the right output-layer class based on config."""
@@ -117,6 +121,20 @@ class TestGPTModelOutputLayerSelection:
         )
         assert isinstance(model.output_layer, tensor_parallel.ColumnParallelLinear)
         assert not isinstance(model.output_layer, TELMHeadColumnParallelLinear)
+
+    @pytest.mark.internal
+    def test_logit_dtype_is_forwarded_to_output_layer(self):
+        config = TransformerConfig(
+            num_layers=2, hidden_size=12, num_attention_heads=4, use_cpu_initialization=True
+        )
+        model = GPTModel(
+            config=config,
+            transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
+            vocab_size=100,
+            max_sequence_length=4,
+            logit_dtype=torch.float32,
+        )
+        assert model.output_layer.output_dtype == torch.float32
 
     @pytest.mark.internal
     @pytest.mark.skipif(

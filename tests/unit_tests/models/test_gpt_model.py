@@ -1,6 +1,7 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 import inspect
+import logging
 import os
 from datetime import timedelta
 from unittest.mock import MagicMock, patch
@@ -47,18 +48,29 @@ class TestGPTModel:
             use_cpu_initialization=True,
             embedding_init_method_std=1.0,  # Test that we can initialize the embedding weights to something else.
         )
-        self.gpt_model = GPTModel(
-            config=transformer_config,
-            transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
-            vocab_size=100,
-            max_sequence_length=4,
-        )
+        with patch('megatron.core.models.gpt.gpt_model.log_single_rank') as mock_log_single_rank:
+            self.gpt_model = GPTModel(
+                config=transformer_config,
+                transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
+                vocab_size=100,
+                max_sequence_length=4,
+            )
+        self.mock_log_single_rank = mock_log_single_rank
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
     @pytest.mark.internal
     def test_constructor(self):
+        self.mock_log_single_rank.assert_called_once()
+        _, level, message = self.mock_log_single_rank.call_args.args
+        assert level == logging.WARNING
+        assert message == (
+            "GPTModel IS DEPRECATED. GPTModel is only accepting critical bug fixes, no new "
+            "features. Please reference the migration guide "
+            "`docs/user-guide/hybrid-model-migration.md` for details on how to use `HybridModel`"
+        )
+
         assert isinstance(self.gpt_model, GPTModel)
 
         assert self.gpt_model.max_sequence_length == 4
@@ -132,6 +144,7 @@ class TestGPTModel:
         ).cuda()
 
         context = {"selected_token_positions": torch.tensor([0, 2], device="cuda")}
+        created = {}
         seen = {}
 
         def output_processor(**kwargs):
@@ -146,7 +159,14 @@ class TestGPTModel:
                 dim=-1, index=kwargs["labels"].unsqueeze(-1)
             )
             token_logprobs = token_logprobs.squeeze(-1)
-            return token_logprobs.index_select(1, kwargs["context"]["selected_token_positions"])
+            result = {
+                "payload": token_logprobs.index_select(
+                    1, kwargs["context"]["selected_token_positions"]
+                ),
+                "tag": "structured",
+            }
+            created["result"] = result
+            return result
 
         with torch.no_grad():
             logits = self.gpt_model.forward(
@@ -164,10 +184,14 @@ class TestGPTModel:
                 output_processor_context=context,
             )
 
-        assert torch.allclose(output, expected)
+        assert output is created["result"]
+        assert isinstance(output, dict)
+        assert torch.allclose(output["payload"], expected)
+        assert output["tag"] == "structured"
         assert seen["context"] is context
         assert seen["output_layer"] is self.gpt_model.output_layer
         assert seen["output_weight"] is None
+        assert seen["output_layer"].weight is not None
         assert seen["labels"] is labels
         assert seen["runtime_gather_output"] is None
         assert seen["config"] is config
@@ -602,3 +626,38 @@ def test_get_transformer_layer_spec_forwards_use_te_activation_func():
         assert (
             call_kwargs.get('use_te_activation_func') is True
         ), "use_te_activation_func must be forwarded from config"
+
+
+def test_gpt_builder_forwards_rope_scaling_factor():
+    """Test that gpt_builder forwards rope_scaling_factor to GPTModel.
+
+    Regression test for https://github.com/NVIDIA/Megatron-LM/issues/6305
+    The --rope-scaling-factor flag was silently ignored because gpt_builder
+    passed rope_scaling but not rope_scaling_factor, so GPTModel always fell
+    back to its default factor of 8.0.
+    """
+    mock_config = MagicMock()
+
+    mock_args = MagicMock()
+    mock_args.spec = None
+    mock_args.transformer_impl = "transformer_engine"
+    mock_args.experimental_attention_variant = None
+    mock_args.num_experts = None
+    mock_args.heterogeneous_layers_config_path = None
+    mock_args.mtp_num_layers = None
+    mock_args.use_rope_scaling = True
+    mock_args.rope_scaling_factor = 32.0
+
+    with (
+        patch('gpt_builders.GPTModel') as mock_gpt_model,
+        patch('gpt_builders._get_transformer_layer_spec'),
+    ):
+        from gpt_builders import gpt_builder
+
+        gpt_builder(mock_args, pre_process=True, post_process=True, config=mock_config)
+
+        mock_gpt_model.assert_called_once()
+        _, call_kwargs = mock_gpt_model.call_args
+        assert (
+            call_kwargs.get('rope_scaling_factor') == 32.0
+        ), "rope_scaling_factor must be forwarded from args"
