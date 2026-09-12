@@ -694,8 +694,9 @@ def _get_megatron_optimizer_based_on_param_groups(
         optimizer = FP32Optimizer(optimizer, config, init_state_fn)
         setattr(optimizer, 'grad_stats_parallel_group', model_parallel_group)
 
-    if pg_collection is None or not hasattr(pg_collection, 'tp'):
-        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+    assert pg_collection is not None and hasattr(
+        pg_collection, 'tp'
+    ), "pg_collection with tp must be resolved by get_megatron_optimizer"
     tp_group = pg_collection.tp
     expert_tp_group = getattr(pg_collection, 'expt_tp', tp_group)
     # TODO(M4): plumb TP groups through optimizer constructors so these setattrs disappear.
@@ -783,8 +784,7 @@ def _get_megatron_emerging_optimizer(
     if config.fp16:
         raise ValueError('emerging optimizer with fp16 is not supported.')
 
-    if pg_collection is None:
-        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+    assert pg_collection is not None, "pg_collection must be resolved by get_megatron_optimizer"
 
     log_single_rank(logger, logging.INFO, f'Setting up emerging optimizer with config {config}')
 
@@ -862,9 +862,8 @@ def _get_megatron_emerging_optimizer(
         for (opt_name, _), groups in grouped_param_groups.items()
         if groups
     ):
-        # ``setup_process_groups_for_optimizer`` rejects Gloo groups whenever
-        # an explicit ``pg_collection`` is supplied, so the only legal value
-        # here is False.
+        # ``use_gloo_process_groups`` is not plumbed through the emerging-optimizer path, so
+        # Gloo stays disabled for this DistOpt instance.
         distopt_process_groups = ProcessGroupCollection.setup_process_groups_for_optimizer(
             pg_collection, model_chunks, use_gloo_process_groups=False
         )
@@ -1051,6 +1050,12 @@ def get_megatron_optimizer(
         config_overrides = get_standard_config_overrides(config)
 
     check_config_overrides_consistency(config, config_overrides)
+
+    # Compatibility boundary. get_megatron_optimizer is the edge of megatron/core for optimizer
+    # construction, so the global-state fallback lives here and nowhere deeper: every helper below
+    # receives an explicit collection. See docs/developer/parallel-state-deprecation.md.
+    if pg_collection is None:
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
 
     is_mfsdp_v2 = isinstance(model_chunks[0], FullyShardedDataParallelV2)
     # TODO: the standard and emerging optimizer paths handle pg_collection differently;
