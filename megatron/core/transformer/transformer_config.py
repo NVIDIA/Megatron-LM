@@ -382,9 +382,6 @@ class TransformerConfig(ModelParallelConfig):
     dsa_indexer_reset_method: Literal['random', 'main-q-mean', 'main-q-mean-rescaled'] = 'random'
     """How to initialize DSA indexer parameters when resetting after checkpoint load."""
 
-    dsa_indexer_reset_seed: Optional[int] = None
-    """Optional seed used when resetting DSA indexer parameters after checkpoint load."""
-
     dsa_indexer_activation_start_samples: Optional[int] = None
     """Sample position where DSA indexer activation/warmup starts."""
 
@@ -441,9 +438,6 @@ class TransformerConfig(ModelParallelConfig):
 
     dsa_indexer_k_norm_fp32: bool = False
     """Whether DSA indexer key LayerNorm should run on fp32 inputs."""
-    dsa_indexer_sparse_loss_use_topk_only: bool = False
-    """When using sparse DSA indexer loss, compute KL only on the selected top-k support."""
-
     ####################
     # Compressed sparse attention
     ####################
@@ -3536,9 +3530,6 @@ class TransformerConfig(ModelParallelConfig):
             self.dsa_fwd_skip_dsa and self.dsa_reset_indexer_on_load
         ), "dsa_fwd_skip_dsa must be disabled when resetting the indexer for activation."
         assert (
-            self.dsa_indexer_reset_seed is None or self.dsa_indexer_reset_seed >= 0
-        ), "dsa_indexer_reset_seed must be non-negative when set."
-        assert (
             self.dsa_indexer_activation_start_samples is None
             or self.dsa_indexer_activation_start_samples >= 0
         ), "dsa_indexer_activation_start_samples must be non-negative when set."
@@ -3591,9 +3582,6 @@ class TransformerConfig(ModelParallelConfig):
                 assert not (
                     main_q_reset and self.qk_layernorm
                 ), "Main-Q initialization is not defined when qk_layernorm is enabled."
-                assert not (
-                    main_q_reset and self.dsa_indexer_reset_seed is not None
-                ), "dsa_indexer_reset_seed is only used by random indexer reset."
             else:
                 assert (
                     self.dsa_indexer_n_heads is not None and self.dsa_indexer_n_heads > 0
@@ -3621,10 +3609,6 @@ class TransformerConfig(ModelParallelConfig):
                 assert not self.dsa_indexer_use_sparse_loss, (
                     "dsa_train_main_only disables indexer KL; do not set "
                     "dsa_indexer_use_sparse_loss."
-                )
-                assert not self.dsa_indexer_sparse_loss_use_topk_only, (
-                    "dsa_train_main_only disables indexer KL; do not set "
-                    "dsa_indexer_sparse_loss_use_topk_only."
                 )
                 assert not self.dsa_kernel_cache_selected_scores, (
                     "dsa_train_main_only has no selected-score KL backward; do not set "
@@ -3658,9 +3642,6 @@ class TransformerConfig(ModelParallelConfig):
             assert (
                 not dense_dsa_warmup or min_memory_dsa_backend
             ), "dsa_fwd_use_dense_attn requires a min-memory dsa_kernel_backend."
-            assert (
-                not self.dsa_indexer_sparse_loss_use_topk_only or self.dsa_indexer_use_sparse_loss
-            ), "dsa_indexer_sparse_loss_use_topk_only requires dsa_indexer_use_sparse_loss."
             # The simplified indexer has only ever been exercised on the GQA path. Rather than
             # let an untested combination run, refuse it; the MLA path keeps the standard indexer.
             assert not (
