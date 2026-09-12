@@ -473,10 +473,9 @@ class TestParallelTransformerBlockCudagraphs:
         )
 
     def teardown_method(self, method):
+        # Release validation graphs too, before destroying their process groups.
+        delete_cuda_graphs()
         Utils.destroy_model_parallel()
-        _CudagraphGlobalRecord.cudagraph_created = False
-        _CudagraphGlobalRecord.cudagraph_record = []
-        CudaGraphManager.global_mempool = None
 
     @pytest.mark.skipif(
         not (HAVE_TE and is_te_min_version("1.5.0")),
@@ -560,10 +559,8 @@ class TestPackedSeqCudagraphs:
 
     def teardown_method(self, method):
         try:
+            delete_cuda_graphs()
             Utils.destroy_model_parallel()
-            _CudagraphGlobalRecord.cudagraph_created = False
-            _CudagraphGlobalRecord.cudagraph_record = []
-            CudaGraphManager.global_mempool = None
         finally:
             for name, value in self.original_nvte_env.items():
                 if value is None:
@@ -870,10 +867,8 @@ def test_cuda_graph_determine_first_last_layer_logic(
     torch.cuda.synchronize()
 
     # Teardown
+    delete_cuda_graphs()
     Utils.destroy_model_parallel()
-    _CudagraphGlobalRecord.cudagraph_created = False
-    _CudagraphGlobalRecord.cudagraph_record = []
-    CudaGraphManager.global_mempool = None
     CudaGraphManager.fwd_mempools = None
     CudaGraphManager.bwd_mempools = None
 
@@ -960,9 +955,8 @@ class TestLLaVACudaGraph:
         )
 
     def teardown_method(self, method):
+        delete_cuda_graphs()
         Utils.destroy_model_parallel()
-        _CudagraphGlobalRecord.cudagraph_created = False
-        _CudagraphGlobalRecord.cudagraph_record = []
 
     @pytest.mark.skipif(
         not (HAVE_TE and is_te_min_version("1.5.0")),
@@ -1105,9 +1099,8 @@ class TestParallelHybridBlockCudagraphs:
         self.transformer_config = self.mamba_block.config
 
     def teardown_method(self, method):
+        delete_cuda_graphs()
         Utils.destroy_model_parallel()
-        _CudagraphGlobalRecord.cudagraph_created = False
-        _CudagraphGlobalRecord.cudagraph_record = []
 
     @pytest.mark.skipif(
         not (HAVE_TE and is_te_min_version("1.5.0")),
@@ -1929,6 +1922,8 @@ class TestLocalCudaGraphEvaluation:
         val_runners = [r.val_runner for r in training_runners]
         training_statuses = [r.status for r in training_runners]
         assert len(training_runners) == (1 if pp_size == 1 else 2)
+        assert len(_CudagraphGlobalRecord.cudagraph_val_record) == 1
+        assert all(r is val_runners[0] for r in val_runners)
 
         # Establish the replay baseline before validation can affect any training state.
         for _ in training_runners:
@@ -1996,6 +1991,40 @@ class TestLocalCudaGraphEvaluation:
         with torch.no_grad():
             eval_output = first_output(ddp_model(test_input.detach()))
             torch.testing.assert_close(eval_output, reference_output)
+
+    def test_validation_graphs_match_method_and_inputs(self, monkeypatch):
+        class Module(MegatronModule):
+            def project(self, x, scale):
+                return x * scale
+
+            def shift(self, x, scale):
+                return x + scale
+
+        config = _base_cuda_graph_config(cuda_graph_impl="local", cuda_graph_warmup_steps=0)
+        module = Module(config)
+        managers = [
+            CudaGraphManager(config, base_module=module, function_name=name)
+            for name in ("project", "shift")
+        ]
+        cases = [("project", 4, 2), ("project", 2, 2), ("project", 4, 3), ("shift", 4, 2)]
+        for name, batch_size, scale in cases:
+            x = torch.randn(batch_size, config.hidden_size, device="cuda", requires_grad=True)
+            getattr(module, name)(x, scale=scale).sum().backward()
+        create_cudagraphs()
+        assert len(_CudagraphGlobalRecord.cudagraph_val_record) == len(cases)
+
+        def fail_eager(*args, **kwargs):
+            pytest.fail("Recorded validation signatures must replay their graphs")
+
+        for manager in managers:
+            monkeypatch.setattr(manager, "func", fail_eager)
+        module.eval()
+        with torch.no_grad():
+            for name, batch_size, scale in cases * 2:
+                x = torch.randn(batch_size, config.hidden_size, device="cuda")
+                output = getattr(module, name)(x, scale=scale)
+                expected = x * scale if name == "project" else x + scale
+                torch.testing.assert_close(output, expected, rtol=0, atol=0)
 
     @pytest.mark.skipif(not fp8_available, reason="FP8 requires supported hardware")
     @pytest.mark.parametrize("recipe", ["delayed", "mxfp8", "nvfp4"])
@@ -2140,12 +2169,7 @@ class TestCheckpointParameterDiscovery:
         model_parallel_cuda_manual_seed(123)
 
     def teardown_method(self, method):
-        if _CudagraphGlobalRecord.cudagraph_created:
-            delete_cuda_graphs()
-        else:
-            _CudagraphGlobalRecord.cudagraph_record = []
-            _CudagraphGlobalRecord.cudagraph_inference_record = []
-            CudaGraphManager.global_mempool = None
+        delete_cuda_graphs()
         torch.cuda.set_stream(torch.cuda.default_stream())
         Utils.destroy_model_parallel()
 
@@ -2228,12 +2252,7 @@ class TestRepeatedParameterCapture:
         model_parallel_cuda_manual_seed(123)
 
     def teardown_method(self, method):
-        if _CudagraphGlobalRecord.cudagraph_created:
-            delete_cuda_graphs()
-        else:
-            _CudagraphGlobalRecord.cudagraph_record = []
-            _CudagraphGlobalRecord.cudagraph_inference_record = []
-            CudaGraphManager.global_mempool = None
+        delete_cuda_graphs()
         torch.cuda.set_stream(torch.cuda.default_stream())
         Utils.destroy_model_parallel()
 
@@ -2329,10 +2348,7 @@ class TestInlineCaptureManager:
         )
 
     def teardown_method(self, method):
-        _CudagraphGlobalRecord.cudagraph_created = False
-        _CudagraphGlobalRecord.cudagraph_record = []
-        _CudagraphGlobalRecord.cudagraph_inference_record = []
-        CudaGraphManager.global_mempool = None
+        delete_cuda_graphs()
         Utils.destroy_model_parallel()
 
     @pytest.mark.parametrize(
