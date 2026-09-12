@@ -2,9 +2,11 @@
 
 import pytest
 import torch
+import torch.nn as nn
 
 import megatron.core.parallel_state as ps
 from megatron.core.extensions.transformer_engine import TEColumnParallelLinear, TERowParallelLinear
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.layers import (
     ColumnParallelLinear,
     RowParallelLinear,
@@ -12,7 +14,23 @@ from megatron.core.tensor_parallel.layers import (
 )
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.training.models.dist_utils import (
+    prepare_existing_model_chunks_for_distributed_training,
+)
 from tests.unit_tests.test_utilities import Utils
+
+
+def _model_process_groups() -> ProcessGroupCollection:
+    """Build the explicit groups consumed by the model-initialization lifecycle."""
+    return ProcessGroupCollection(
+        tp=ps.get_tensor_model_parallel_group(),
+        pp=ps.get_pipeline_model_parallel_group(),
+        dp=ps.get_data_parallel_group(with_gtp_remat=False),
+        cp=ps.get_context_parallel_group(),
+        gtp_remat=ps.get_gtp_weight_remat_group(check_initialized=False),
+        expt_tp=ps.get_expert_tensor_parallel_group(check_initialized=False),
+        expt_gtp_remat=ps.get_expert_gtp_weight_remat_group(check_initialized=False),
+    )
 
 
 class Test:
@@ -23,6 +41,49 @@ class Test:
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_muon_ht_init_runs_before_distributed_wrapping(self):
+        """The model initialization lifecycle should enforce a configured Hyperball radius."""
+        Utils.initialize_model_parallel(1, 1)
+        config = TransformerConfig(
+            num_layers=1, hidden_size=12, num_attention_heads=4, muon_ht_radius=2.5
+        )
+        model = nn.Linear(12, 12, bias=True, device='cuda')
+
+        result = prepare_existing_model_chunks_for_distributed_training(
+            [model],
+            config,
+            _model_process_groups(),
+            wrap_with_ddp=False,
+            mixed_precision_wrapper=None,
+        )
+
+        torch.testing.assert_close(result[0].weight.norm(), torch.tensor(2.5, device='cuda'))
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_muon_ht_init_respects_disabled_parameter_initialization(self):
+        """Checkpoint-oriented model construction should not modify uninitialized parameters."""
+        Utils.initialize_model_parallel(1, 1)
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=12,
+            num_attention_heads=4,
+            muon_ht_radius=2.5,
+            perform_initialization=False,
+        )
+        model = nn.Linear(12, 12, bias=False, device='cuda')
+        weight_before = model.weight.detach().clone()
+
+        result = prepare_existing_model_chunks_for_distributed_training(
+            [model],
+            config,
+            _model_process_groups(),
+            wrap_with_ddp=False,
+            mixed_precision_wrapper=None,
+        )
+
+        torch.testing.assert_close(result[0].weight, weight_before, rtol=0.0, atol=0.0)
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_embedding_init(self):
