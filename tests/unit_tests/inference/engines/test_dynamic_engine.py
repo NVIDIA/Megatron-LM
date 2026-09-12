@@ -375,6 +375,11 @@ class DynamicEngineTestConfig:
     skip_prompt_log_probs: bool = False
     enable_chunked_prefill: bool = False
     enable_prefix_caching: bool = False
+    # Hybrid (Mamba) models need a Mamba-state cache budget for prefix caching to skip any
+    # prefill. Left None, `DynamicInferenceContext` logs a warning and runs in memory-only
+    # mode: prefixes are deduplicated but `prefix_skip_tokens` is forced to 0, so every token
+    # is recomputed and `engine._prefill_tokens_skipped` stays 0.
+    prefix_caching_mamba_gb: Optional[float] = None
     prefix_caching_eviction_policy: PrefixCachingEvictionPolicy = (
         PrefixCachingEvictionPolicy.REF_ZERO
     )
@@ -395,6 +400,21 @@ class DynamicEngineTestConfig:
     static_kv_memory_pointers: bool = True
     track_generated_token_events: bool = False
     num_speculative_tokens: int = 0
+    # A repeated (rather than per-depth) MTP head is one of the gates on
+    # DynamicInferenceContext.enable_mtp_kv_cache; set it to exercise the MTP draft KV cache.
+    mtp_use_repeated_layer: bool = False
+    # Required by TextGenerationController when cuda_graph_impl == "local" and EP > 1: the
+    # graphs are captured with expert padding enabled, so the router must keep it on.
+    moe_pad_experts_for_cuda_graph_inference: bool = False
+    # Layer block for ONE MTP depth in the hybrid pattern ("<main>/<mtp>/<mtp>/..."); every
+    # depth section must be identical. "M" (recurrent) is the historical default. A head that
+    # is exactly one attention layer -- e.g. "*-" -- is what enables the MTP draft KV cache;
+    # a recurrent head has no KV to append, so the gate stays off. See
+    # DynamicInferenceContext.enable_mtp_kv_cache.
+    mtp_layer_pattern: str = "M"
+    # Required by transformer_config validation when transformer_impl == "inference_optimized"
+    # and num_moe_experts is set: fp32 routing avoids dtype conversions during decode.
+    moe_router_dtype: Optional[str] = None
     position_embedding_type: str = "learned_absolute"
     use_flashinfer_fused_rope: Optional[bool] = None
     sampling_backend: str = 'torch'
@@ -563,6 +583,7 @@ class DynamicInferenceEngineTestBase:
                 static_kv_memory_pointers=test_config.static_kv_memory_pointers,
                 enable_chunked_prefill=test_config.enable_chunked_prefill,
                 enable_prefix_caching=test_config.enable_prefix_caching,
+                prefix_caching_mamba_gb=test_config.prefix_caching_mamba_gb,
                 prefix_caching_eviction_policy=test_config.prefix_caching_eviction_policy,
                 use_flashinfer_fused_rope=test_config.use_flashinfer_fused_rope,
                 # this is for compatibility with the LTS environment
@@ -610,6 +631,24 @@ class DynamicInferenceEngineTestBase:
                 params_dtype=torch.bfloat16,
                 num_layers=4,
                 mtp_num_layers=test_config.num_speculative_tokens,
+                mtp_use_repeated_layer=test_config.mtp_use_repeated_layer,
+                moe_pad_experts_for_cuda_graph_inference=(
+                    test_config.moe_pad_experts_for_cuda_graph_inference
+                ),
+                # An explicit `moe_router_dtype` on the test config wins; otherwise fall back to
+                # fp32 for inference-optimized MoE, which `TransformerConfig.__post_init__`
+                # requires (it raises otherwise). Scenarios such as the async-scheduling
+                # "topology:ep" pair rely on that fallback instead of setting the field.
+                moe_router_dtype=(
+                    test_config.moe_router_dtype
+                    if test_config.moe_router_dtype is not None
+                    else (
+                        "fp32"
+                        if test_config.transformer_impl == "inference_optimized"
+                        and test_config.expert_model_parallel_size > 1
+                        else None
+                    )
+                ),
                 hidden_size=(
                     test_config.hidden_size
                     if test_config.hidden_size is not None
@@ -647,12 +686,6 @@ class DynamicInferenceEngineTestBase:
                     if test_config.transformer_impl == "inference_optimized"
                     and test_config.expert_model_parallel_size > 1
                     else torch.nn.functional.gelu
-                ),
-                moe_router_dtype=(
-                    "fp32"
-                    if test_config.transformer_impl == "inference_optimized"
-                    and test_config.expert_model_parallel_size > 1
-                    else None
                 ),
                 inference_moe_token_dispatcher_type=(
                     test_config.inference_moe_token_dispatcher_type
@@ -709,6 +742,11 @@ class DynamicInferenceEngineTestBase:
                     3 if pp_size == 1 else 6
                 ),  # 1 Mamba layer, 1 attention layer, 1 MLP layer
                 mtp_num_layers=test_config.num_speculative_tokens,
+                mtp_use_repeated_layer=test_config.mtp_use_repeated_layer,
+                moe_pad_experts_for_cuda_graph_inference=(
+                    test_config.moe_pad_experts_for_cuda_graph_inference
+                ),
+                moe_router_dtype=test_config.moe_router_dtype,
                 hidden_size=256,  # The Mamba layer places several constraints on this
                 **hybrid_mixer_kwargs(test_config.ssm_mixer),
                 num_attention_heads=16,
@@ -759,7 +797,7 @@ class DynamicInferenceEngineTestBase:
             # Hybrid model.
             # When speculative tokens are configured, append MTP depth sections
             # to the hybrid layer pattern so the model creates MTP blocks.
-            mtp_suffix = "/M" * test_config.num_speculative_tokens
+            mtp_suffix = ("/" + test_config.mtp_layer_pattern) * test_config.num_speculative_tokens
             recurrent_symbol = "G" if is_gdn else "M"
             if pp_size == 1:
                 mamba_pattern = recurrent_symbol + "*-" + mtp_suffix
@@ -3286,16 +3324,15 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             hash_to_block_id={block_hashes[0]: 7, block_hashes[1]: 8}
         )
 
-        (
-            matched_block_ids,
-            num_blocks_from_pool,
-            already_allocated_blocks,
-            overall_required_blocks,
-            prefix_skip_tokens,
-            effective_prefill_chunk_length,
-        ) = DynamicInferenceContext._compute_prefix_match(
+        _m = DynamicInferenceContext._compute_prefix_match(
             ctx, req, prefill_chunk_length=211, record_mamba_match=True
         )
+        matched_block_ids = _m.matched_block_ids
+        num_blocks_from_pool = _m.num_blocks_from_pool
+        already_allocated_blocks = _m.already_allocated_blocks
+        overall_required_blocks = _m.overall_required_blocks
+        prefix_skip_tokens = _m.prefix_skip_tokens
+        effective_prefill_chunk_length = _m.effective_prefill_chunk_length
 
         assert matched_block_ids == [7]
         assert num_blocks_from_pool == 0

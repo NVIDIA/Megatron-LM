@@ -84,6 +84,8 @@ class PrefixCachingTestBase:
         prefix_caching_mamba_gb=None,
         batch_invariant_mode=False,
         enable_chunked_prefill=False,
+        num_speculative_tokens=0,
+        mtp_num_layers=None,
     ):
         DynamicInferenceContext.ROUNDER = rounder
         DynamicInferenceContext.TOKEN_ROUNDER = rounder
@@ -102,6 +104,8 @@ class PrefixCachingTestBase:
             attention_backend=AttnBackend.flash if batch_invariant_mode else AttnBackend.auto,
             flash_attention_version=4 if batch_invariant_mode else None,
             attention_dropout=0.0 if batch_invariant_mode else 0.1,
+            mtp_num_layers=mtp_num_layers,
+            mtp_use_repeated_layer=True,
         )
         if batch_invariant_mode:
             max_tokens = 512 if max_tokens is None else max_tokens
@@ -120,6 +124,7 @@ class PrefixCachingTestBase:
             enable_chunked_prefill=enable_chunked_prefill,
             prefix_caching_eviction_policy=prefix_caching_eviction_policy,
             prefix_caching_mamba_gb=prefix_caching_mamba_gb,
+            num_speculative_tokens=num_speculative_tokens,
         )
         return DynamicInferenceContext(
             model_config=transformer_config, inference_config=inference_config
@@ -631,7 +636,9 @@ class TestPrefixCachingCore(PrefixCachingTestBase):
 
         # Request B shares H0/H1 with A and needs one new block for H2.
         req_b = self._req(ctx, self._prompt(bs * 3), request_id=3)
-        matched, num_from_pool, *_ = ctx._compute_prefix_match(req_b, req_b.remaining_prompt_length)
+        _m = ctx._compute_prefix_match(req_b, req_b.remaining_prompt_length)
+        matched = _m.matched_block_ids
+        num_from_pool = _m.num_blocks_from_pool
         assert matched == [s0, s1]
         assert num_from_pool == 1
 
@@ -880,7 +887,10 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
 
         req2 = self._req(ctx, prompt.clone(), request_id=2)
         # no prefill skipping
-        matched, _, _, _, prefix_skip, eff_chunk = ctx._compute_prefix_match(req2, len(prompt))
+        _m = ctx._compute_prefix_match(req2, len(prompt))
+        matched = _m.matched_block_ids
+        prefix_skip = _m.prefix_skip_tokens
+        eff_chunk = _m.effective_prefill_chunk_length
         assert len(matched) == 3 and prefix_skip == 0 and eff_chunk == len(prompt)
 
         ctx.add_request(req2)
@@ -1064,7 +1074,10 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         self._mamba_allocate_and_register(ctx, self._block_ids(ctx, 0, 3)[:1])
         req2 = self._req(ctx, prompt.clone(), request_id=2)
         req2._mamba_num_matched_blocks = 1
-        matched, _, _, _, prefix_skip, eff_chunk = ctx._compute_prefix_match(req2, len(prompt))
+        _m = ctx._compute_prefix_match(req2, len(prompt))
+        matched = _m.matched_block_ids
+        prefix_skip = _m.prefix_skip_tokens
+        eff_chunk = _m.effective_prefill_chunk_length
         assert len(matched) == 3 and prefix_skip == bs and eff_chunk == len(prompt) - bs
         ctx.add_request(req2)
         assert req2.num_cached_tokens == prefix_skip
@@ -1077,7 +1090,10 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         ctx2.add_request(self._req(ctx2, p2.clone()))
         req2b = self._req(ctx2, p2.clone(), request_id=2)
         req2b._mamba_num_matched_blocks = 0
-        m2, _, _, _, ps2, ec2 = ctx2._compute_prefix_match(req2b, len(p2))
+        _m = ctx2._compute_prefix_match(req2b, len(p2))
+        m2 = _m.matched_block_ids
+        ps2 = _m.prefix_skip_tokens
+        ec2 = _m.effective_prefill_chunk_length
         assert len(m2) == 3 and ps2 == 0 and ec2 == len(p2)
 
         # a full hybrid match backs off to one prefill block
@@ -1087,7 +1103,10 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         self._mamba_allocate_and_register(ctx3, self._block_ids(ctx3, 0, 3))
         req3 = self._req(ctx3, p3.clone(), request_id=2)
         req3._mamba_num_matched_blocks = 3
-        m3, _, _, _, ps3, ec3 = ctx3._compute_prefix_match(req3, len(p3))
+        _m = ctx3._compute_prefix_match(req3, len(p3))
+        m3 = _m.matched_block_ids
+        ps3 = _m.prefix_skip_tokens
+        ec3 = _m.effective_prefill_chunk_length
         assert len(m3) == 3 and ps3 == 2 * bs and ec3 == bs
         ctx3.add_request(req3)
         assert req3.num_cached_tokens == ps3
@@ -1103,7 +1122,10 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         req4a = self._req(ctx4, p4.clone())
         ctx4.add_request(req4a)
         req4b = self._req(ctx4, p4.clone(), request_id=2)
-        m4, _, _, _, ps4, ec4 = ctx4._compute_prefix_match(req4b, len(p4))
+        _m = ctx4._compute_prefix_match(req4b, len(p4))
+        m4 = _m.matched_block_ids
+        ps4 = _m.prefix_skip_tokens
+        ec4 = _m.effective_prefill_chunk_length
         assert len(m4) == 3 and ps4 == 3 * bs4 and ec4 == tail
         ctx4.add_request(req4b)
 
@@ -1137,7 +1159,10 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         # and there is no earlier cached block to fall back to: skip nothing.
         self._mamba_allocate_and_register(ctx, self._block_ids(ctx, 0, 3)[2:])
         req = self._req(ctx, prompt.clone(), request_id=2)
-        matched, _, _, _, prefix_skip, eff_chunk = ctx._compute_prefix_match(req, len(prompt))
+        _m = ctx._compute_prefix_match(req, len(prompt))
+        matched = _m.matched_block_ids
+        prefix_skip = _m.prefix_skip_tokens
+        eff_chunk = _m.effective_prefill_chunk_length
         assert len(matched) == 3 and prefix_skip == 0 and eff_chunk == len(prompt)
 
         # Same clamp, but the first block is also cached: back off to it rather
@@ -1148,7 +1173,10 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         blocks2 = self._block_ids(ctx2, 0, 3)
         self._mamba_allocate_and_register(ctx2, [blocks2[0], blocks2[2]])
         req2 = self._req(ctx2, p2.clone(), request_id=2)
-        m2, _, _, _, ps2, ec2 = ctx2._compute_prefix_match(req2, len(p2))
+        _m = ctx2._compute_prefix_match(req2, len(p2))
+        m2 = _m.matched_block_ids
+        ps2 = _m.prefix_skip_tokens
+        ec2 = _m.effective_prefill_chunk_length
         assert len(m2) == 3 and ps2 == bs and ec2 == len(p2) - bs
 
     @pytest.mark.internal
@@ -1203,7 +1231,10 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         self._mamba_allocate_and_register(ctx, self._block_ids(ctx, 0, 4)[:2])
         req2 = self._req(ctx, prompt.clone(), request_id=2)
         req2._mamba_num_matched_blocks = 2
-        matched, _, _, overall, prefix_skip, _ = ctx._compute_prefix_match(req2, len(prompt))
+        _m = ctx._compute_prefix_match(req2, len(prompt))
+        matched = _m.matched_block_ids
+        overall = _m.overall_required_blocks
+        prefix_skip = _m.prefix_skip_tokens
         # Copy block IDs to slot 1 so compute_and_store_offsets can resolve EOS block
         ctx.request_to_kv_block_ids[1] = ctx.request_to_kv_block_ids[0]
         msa.compute_and_store_offsets(
@@ -2326,7 +2357,9 @@ class TestPrefixCacheReuse(PrefixCachingTestBase):
 
         # request 2 shares the first 4 blocks, adds 2 new blocks
         req2 = self._req(ctx, self._prompt(bs * 6), request_id=2)
-        matched, _, _, _, prefix_skip, _ = ctx._compute_prefix_match(req2, bs * 6)
+        _m = ctx._compute_prefix_match(req2, bs * 6)
+        matched = _m.matched_block_ids
+        prefix_skip = _m.prefix_skip_tokens
         assert len(matched) == 4 and prefix_skip == bs * 4
         ctx.add_request(req2)
 
@@ -2428,7 +2461,9 @@ class TestPrefixCacheReuse(PrefixCachingTestBase):
         assert torch.all(msa.ssm_states[:, endpoint_slot] == 23)
 
         follower = self._req(ctx, prompt.clone(), request_id=2)
-        matched, _, _, _, prefix_skip, _ = ctx._compute_prefix_match(follower, len(prompt))
+        _m = ctx._compute_prefix_match(follower, len(prompt))
+        matched = _m.matched_block_ids
+        prefix_skip = _m.prefix_skip_tokens
         assert len(matched) == 2 and prefix_skip == 2 * bs
         ctx.add_request(follower)
         assert follower._mamba_num_matched_blocks == 2
@@ -2517,7 +2552,10 @@ class TestPrefixCachePolicyStressMatrix(PrefixCachingTestBase):
 
         if feature == "exact-prefix":
             probe = self._req(ctx, prompt.clone(), request_id=2)
-            matched, _, _, _, skipped, effective = ctx._compute_prefix_match(probe, len(prompt))
+            _m = ctx._compute_prefix_match(probe, len(prompt))
+            matched = _m.matched_block_ids
+            skipped = _m.prefix_skip_tokens
+            effective = _m.effective_prefill_chunk_length
             assert matched == producer_blocks
             assert skipped == 2 * block_size and effective == block_size
             ctx.add_request(probe)
@@ -2526,14 +2564,14 @@ class TestPrefixCachePolicyStressMatrix(PrefixCachingTestBase):
         elif feature == "partial-prefix":
             partial = torch.cat((prompt[: 2 * block_size], self._prompt(block_size, offset=50_000)))
             probe = self._req(ctx, partial, request_id=2)
-            matched, *_ = ctx._compute_prefix_match(probe, len(partial))
+            matched = ctx._compute_prefix_match(probe, len(partial)).matched_block_ids
             assert matched == producer_blocks[:2]
             ctx.add_request(probe)
             assert probe.num_cached_tokens == 2 * block_size
 
         elif feature == "missing-prefix":
             probe = self._req(ctx, self._prompt(3 * block_size, offset=50_000), request_id=2)
-            matched, *_ = ctx._compute_prefix_match(probe, 3 * block_size)
+            matched = ctx._compute_prefix_match(probe, 3 * block_size).matched_block_ids
             assert not matched
             ctx.add_request(probe)
             assert probe.num_cached_tokens == 0
@@ -3215,3 +3253,261 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
             DynamicInferenceContext.TOKEN_ROUNDER = 64
             DynamicInferenceContext.REQUEST_ROUNDER = 64
             Utils.destroy_model_parallel()
+
+
+class TestMtpPrefixCacheBackOff(PrefixCachingTestBase):
+    """The MTP draft-KV back-off, driven through the real allocator and hash registry.
+
+    The draft KV shares blocks with the main KV, but its entry at a block's final slot is
+    f(h_p, emb(t_{p+1})) -- it consumes one token PAST the block, so that slot is not determined
+    by the block's hash. `_compute_prefix_match` therefore declines to inherit the last matched
+    block, and the request recomputes it into a block it owns.
+
+    Nothing here is stubbed: real `add_request`, real block tables, real hash registration and
+    ref counts. These contexts are non-hybrid, which is what makes `enable_mtp_kv_cache` true
+    without a layer pattern (a hybrid MTP head would need `mtp_layer_type_list`).
+    """
+
+    def _mtp_ctx(self, **kwargs):
+        ctx = self._ctx(num_speculative_tokens=2, mtp_num_layers=1, **kwargs)
+        assert ctx.enable_mtp_kv_cache, "fixture must actually enable the MTP draft KV"
+        return ctx
+
+    @staticmethod
+    def _diverging_pair(ctx, shared_blocks, tail_blocks=1):
+        """Two prompts sharing `shared_blocks` full blocks then diverging."""
+        bs = ctx.block_size_tokens
+        shared = PrefixCachingTestBase._prompt(bs * shared_blocks)
+        a = torch.cat([shared, PrefixCachingTestBase._prompt(bs * tail_blocks, offset=100_000)])
+        b = torch.cat([shared, PrefixCachingTestBase._prompt(bs * tail_blocks, offset=900_000)])
+        return a, b
+
+    @staticmethod
+    def _assert_hash_registry_is_injective(alloc):
+        """No two live blocks may carry the same hash.
+
+        This is the invariant the back-off could have broken. `_deregister_blocks` pops
+        `kv_hash_to_block_id` by HASH without checking which block it lands on, so two live
+        blocks holding one hash means releasing either silently evicts the other's entry.
+        """
+        live = [b for b in range(alloc.block_hashes.numel()) if alloc.block_hashes[b].item() != -1]
+        hashes = [alloc.block_hashes[b].item() for b in live]
+        assert len(hashes) == len(set(hashes)), f"duplicate hash across live blocks: {hashes}"
+        for b in live:
+            h = alloc.block_hashes[b].item()
+            assert alloc.kv_hash_to_block_id[h] == b, (
+                f"block {b} carries hash {h} but the map points at "
+                f"{alloc.kv_hash_to_block_id.get(h)}"
+            )
+
+    @pytest.mark.internal
+    def test_sibling_gives_up_the_last_matched_block(self):
+        ctx = self._mtp_ctx()
+        alloc = ctx.kv_block_allocator
+        p_prompt, s_prompt = self._diverging_pair(ctx, shared_blocks=3)
+
+        ctx.add_request(self._req(ctx, p_prompt))
+        p_blocks = self._block_ids(ctx, 0, 4)
+        ctx.add_request(self._req(ctx, s_prompt, request_id=2))
+        s_blocks = self._block_ids(ctx, 1, 4)
+
+        # Blocks 0-1 inherited; block 2 was matched but given up, so it is recomputed privately.
+        assert s_blocks[:2] == p_blocks[:2]
+        assert s_blocks[2] != p_blocks[2]
+        assert alloc.block_ref_counts[p_blocks[0]].item() == 2
+        assert alloc.block_ref_counts[p_blocks[1]].item() == 2
+        assert alloc.block_ref_counts[p_blocks[2]].item() == 1  # producer only
+        assert alloc.block_ref_counts[s_blocks[2]].item() == 1  # sibling only
+
+    @pytest.mark.internal
+    def test_given_up_block_stays_out_of_the_hash_registry(self):
+        """The producer keeps ownership of the hash; our recomputed copy stays private."""
+        ctx = self._mtp_ctx()
+        alloc = ctx.kv_block_allocator
+        p_prompt, s_prompt = self._diverging_pair(ctx, shared_blocks=3)
+
+        producer = self._req(ctx, p_prompt)
+        ctx.add_request(producer)
+        p_blocks = self._block_ids(ctx, 0, 4)
+        ctx.add_request(self._req(ctx, s_prompt, request_id=2))
+        s_blocks = self._block_ids(ctx, 1, 4)
+
+        h2 = producer.precomputed_block_hashes[2]
+        assert alloc.kv_hash_to_block_id[h2] == p_blocks[2]
+        assert alloc.block_hashes[s_blocks[2]].item() == -1
+        self._assert_hash_registry_is_injective(alloc)
+
+    @pytest.mark.internal
+    def test_many_siblings_each_give_up_the_block_independently(self):
+        """Every sibling recomputes privately; none of them takes over the hash."""
+        ctx = self._mtp_ctx()
+        alloc = ctx.kv_block_allocator
+        bs = ctx.block_size_tokens
+        shared = self._prompt(bs * 3)
+
+        producer = self._req(ctx, torch.cat([shared, self._prompt(bs, offset=100_000)]))
+        ctx.add_request(producer)
+        p_blocks = self._block_ids(ctx, 0, 4)
+
+        private_blocks = []
+        for i in range(2, 6):
+            tail = self._prompt(bs, offset=100_000 * i)
+            ctx.add_request(self._req(ctx, torch.cat([shared, tail]), request_id=i))
+            blocks = self._block_ids(ctx, i - 1, 4)
+            assert blocks[:2] == p_blocks[:2]
+            private_blocks.append(blocks[2])
+
+        # Each sibling's recomputed block is its own, and the hash never moved.
+        assert len(set(private_blocks)) == len(private_blocks)
+        assert p_blocks[2] not in private_blocks
+        assert alloc.kv_hash_to_block_id[producer.precomputed_block_hashes[2]] == p_blocks[2]
+        assert alloc.block_ref_counts[p_blocks[0]].item() == 5
+        self._assert_hash_registry_is_injective(alloc)
+
+    @pytest.mark.internal
+    def test_releasing_the_producer_leaves_the_siblings_blocks_intact(self):
+        """The aliasing hazard: releasing the hash owner must not disturb a private copy."""
+        ctx = self._mtp_ctx()
+        alloc = ctx.kv_block_allocator
+        p_prompt, s_prompt = self._diverging_pair(ctx, shared_blocks=3)
+
+        ctx.add_request(self._req(ctx, p_prompt))
+        p_blocks = self._block_ids(ctx, 0, 4)
+        ctx.add_request(self._req(ctx, s_prompt, request_id=2))
+        s_blocks = self._block_ids(ctx, 1, 4)
+
+        alloc.release_memory_blocks(torch.tensor(p_blocks, device=alloc.block_hashes.device))
+
+        # The sibling still owns its inherited and its private blocks.
+        assert alloc.block_ref_counts[s_blocks[0]].item() >= 1
+        assert alloc.block_ref_counts[s_blocks[2]].item() == 1
+        assert alloc.block_hashes[s_blocks[2]].item() == -1
+        self._assert_hash_registry_is_injective(alloc)
+
+    @pytest.mark.internal
+    def test_no_back_off_without_the_mtp_kv_cache(self):
+        """Regression guard: the cost is paid only when the draft plane actually exists."""
+        ctx = self._ctx()
+        assert not ctx.enable_mtp_kv_cache
+        alloc = ctx.kv_block_allocator
+        p_prompt, s_prompt = self._diverging_pair(ctx, shared_blocks=3)
+
+        ctx.add_request(self._req(ctx, p_prompt))
+        p_blocks = self._block_ids(ctx, 0, 4)
+        ctx.add_request(self._req(ctx, s_prompt, request_id=2))
+        s_blocks = self._block_ids(ctx, 1, 4)
+
+        # All three matched blocks inherited, including the last.
+        assert s_blocks[:3] == p_blocks[:3]
+        assert alloc.block_ref_counts[p_blocks[2]].item() == 2
+        self._assert_hash_registry_is_injective(alloc)
+
+    @pytest.mark.internal
+    def test_back_off_costs_exactly_one_extra_block_from_the_pool(self):
+        bs = None
+        drawn = {}
+        for mtp_on in (False, True):
+            ctx = self._mtp_ctx() if mtp_on else self._ctx()
+            bs = ctx.block_size_tokens
+            alloc = ctx.kv_block_allocator
+            p_prompt, s_prompt = self._diverging_pair(ctx, shared_blocks=3)
+            ctx.add_request(self._req(ctx, p_prompt))
+            avail = alloc.pool_avail
+            ctx.add_request(self._req(ctx, s_prompt, request_id=2))
+            drawn[mtp_on] = avail - alloc.pool_avail
+
+        assert drawn[True] == drawn[False] + 1
+
+    @pytest.mark.internal
+    def test_a_single_matched_block_is_given_up_entirely(self):
+        """Backing off below one block means inheriting nothing, not a negative count."""
+        ctx = self._mtp_ctx()
+        alloc = ctx.kv_block_allocator
+        p_prompt, s_prompt = self._diverging_pair(ctx, shared_blocks=1, tail_blocks=1)
+
+        ctx.add_request(self._req(ctx, p_prompt))
+        p_blocks = self._block_ids(ctx, 0, 2)
+        req2 = self._req(ctx, s_prompt, request_id=2)
+        match = ctx._compute_prefix_match(req2, req2.remaining_prompt_length)
+        assert match.matched_block_ids == []
+        assert match.backed_off_blocks == 1
+        assert match.prefix_skip_tokens == 0
+
+        ctx.add_request(req2)
+        s_blocks = self._block_ids(ctx, 1, 2)
+        assert s_blocks[0] != p_blocks[0]
+        self._assert_hash_registry_is_injective(alloc)
+
+    @pytest.mark.internal
+    def test_back_off_across_chunked_prefill_chunks(self):
+        """A chunked sibling gives up one block once, not once per chunk."""
+        ctx = self._mtp_ctx(enable_chunked_prefill=True)
+        alloc = ctx.kv_block_allocator
+        bs = ctx.block_size_tokens
+        p_prompt, s_prompt = self._diverging_pair(ctx, shared_blocks=3, tail_blocks=2)
+
+        ctx.add_request(self._req(ctx, p_prompt))
+        p_blocks = self._block_ids(ctx, 0, 5)
+
+        sibling = self._req(ctx, s_prompt, request_id=2)
+        # First chunk covers the matched region plus one block of divergence.
+        first = ctx._compute_prefix_match(sibling, bs * 4)
+        assert first.backed_off_blocks == 1
+        assert len(first.matched_block_ids) == 2
+        ctx.add_request(sibling, prefill_chunk_length=bs * 4)
+        sibling.finished_chunk_token_count += bs * 4
+        sibling.remaining_prompt_tokens = sibling.remaining_prompt_tokens[bs * 4 :]
+
+        # The continuation chunk has nothing new to match, so nothing more is given up.
+        second = ctx._compute_prefix_match(sibling, bs)
+        assert second.matched_block_ids == []
+        assert second.backed_off_blocks == 0
+
+        s_blocks = self._block_ids(ctx, 1, 4)
+        assert s_blocks[:2] == p_blocks[:2]
+        assert s_blocks[2] != p_blocks[2]
+        self._assert_hash_registry_is_injective(alloc)
+
+    @pytest.mark.internal
+    def test_continuation_chunk_with_a_pending_carry_gives_up_its_whole_match(self):
+        """A carry pending for this request means its next chunk takes NO prefix skip.
+
+        The carry can only be consumed at `finished - 1`. Any skip moves the chunk's start past
+        that position, and nothing can then write it -- the hidden for the skipped region was
+        never computed by anyone able to pair it with the following token. The skip is block
+        granular, so the only way to keep the carry usable is to take none of the match.
+        """
+        ctx = self._mtp_ctx(enable_chunked_prefill=True)
+        bs = ctx.block_size_tokens
+        meta = ctx.mtp_metadata
+        prompt = self._prompt(bs * 5)
+
+        r = self._req(ctx, prompt.clone(), request_id=1)
+        ctx.add_request(r, prefill_chunk_length=bs * 2)
+        r.finished_chunk_token_count += bs * 2
+        r.remaining_prompt_tokens = r.remaining_prompt_tokens[bs * 2 :]
+
+        # Another request publishes the blocks request 1 has not prefilled yet.
+        ctx.add_request(self._req(ctx, prompt[: bs * 4].clone(), request_id=2))
+
+        # Without a carry the continuation chunk would take the match (minus the last block).
+        assert not meta.chunk_boundary_valid
+        with_skip = ctx._compute_prefix_match(r, bs * 3)
+        assert with_skip.prefix_skip_tokens > 0
+        assert with_skip.matched_block_ids
+
+        # With a carry pending for THIS request, the whole match is given up so the chunk starts
+        # at `finished` and the seam stays writable.
+        meta.carry_chunk_boundary(
+            hidden=torch.zeros((1, 1, meta.hidden_size), device="cuda", dtype=meta.hidden_dtype),
+            req_id=r.request_id,
+            position=bs * 2 - 1,
+        )
+        match = ctx._compute_prefix_match(r, bs * 3)
+        assert match.matched_block_ids == []
+        assert match.prefix_skip_tokens == 0
+        assert match.backed_off_blocks == len(with_skip.matched_block_ids) + 1
+
+        # The seam now lands exactly where the carry describes.
+        off = r.finished_chunk_token_count + match.prefix_skip_tokens
+        assert meta.take_chunk_boundary(req_id=r.request_id, seam_position=off - 1) is not None

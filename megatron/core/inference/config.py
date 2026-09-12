@@ -63,6 +63,13 @@ class MambaInferenceStateConfig:
     model has none. Sizes the GDP chunk descriptors used by the forked prefill
     kernels, whose Householder-expanded token stream is this many times longer."""
 
+    mtp_layer_type_list: Optional[List[str]] = None
+    """Layer types of one MTP draft-head depth, one symbol per layer, or None when the model has
+    no MTP head. Distinct from `layer_type_list`, which describes the MAIN decoder: a hybrid
+    model states the two independently (`"<main>/<mtp>/..."`), so a Mamba main decoder can carry
+    an attention MTP head and vice versa. Read by `DynamicInferenceContext` to decide whether the
+    MTP draft attention can be given its own KV plane."""
+
     def __post_init__(self):
         if self.ssm_chunk_alignment is None:
             self.ssm_chunk_alignment = self.mamba_chunk_size
@@ -130,8 +137,17 @@ class MambaInferenceStateConfig:
                 mamba_chunk_size = chunking.chunk_size
                 ssm_chunk_alignment = chunking.inference_chunk_size
                 gdp_num_householder = chunking.num_householder
+            # The MTP head's layer types are stated separately from the main decoder's in the
+            # unified hybrid pattern ("<main>/<mtp>/..."), and only HybridModel parses them.
+            # Absent (non-hybrid wrapper, or no MTP) leaves this None.
+            try:
+                mtp_pattern = get_attr_wrapped_model(model, "mtp_pattern")
+            except RuntimeError:
+                mtp_pattern = None
+
             return cls(
                 layer_type_list=layer_type_list,
+                mtp_layer_type_list=list(mtp_pattern) if mtp_pattern else None,
                 conv_states_shape=mamba_conv_states_shape,
                 ssm_states_shape=mamba_ssm_states_shape,
                 conv_states_dtype=conv_states_dtype,
