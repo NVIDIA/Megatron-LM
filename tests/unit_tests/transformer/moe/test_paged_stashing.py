@@ -11,6 +11,7 @@ from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transfor
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.moe.moe_utils import get_align_size_for_quantization
 from megatron.core.transformer.moe.paged_stash import (
+    _stash_buffer_dtype,
     check_paged_stash_overflow,
     paged_stash_init_chunk_handler,
     paged_stash_reset,
@@ -58,6 +59,23 @@ def _pad_token_counts_to_align_size(
     """Round each count up to a multiple of ``pad_multiple`` (``n + (-n % m)`` like budget)."""
     t = tokens_per_expert.to(torch.int64)
     return t + (-t % pad_multiple)
+
+
+class TestStashBufferDtype:
+    def test_native_dtypes_are_kept(self):
+        for dtype in (torch.bfloat16, torch.float32, torch.int64, torch.bool):
+            assert _stash_buffer_dtype(dtype) is dtype
+
+    def test_one_byte_dtypes_are_byte_copied(self):
+        dtypes = [torch.float8_e4m3fn, torch.float8_e8m0fnu]
+        if hasattr(torch, "float4_e2m1fn_x2"):
+            dtypes.append(torch.float4_e2m1fn_x2)
+        for dtype in dtypes:
+            assert _stash_buffer_dtype(dtype) is torch.uint8
+
+    def test_multi_byte_dtypes_are_rejected(self):
+        with pytest.raises(ValueError, match="complex64"):
+            _stash_buffer_dtype(torch.complex64)
 
 
 class MoEModelTestContainer:
