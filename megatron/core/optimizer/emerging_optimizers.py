@@ -442,28 +442,28 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
                     else "duplicated"
                 )
 
-        def orthogonalize_whole_matrix(whole_grad):
-            """Orthogonalize `whole_grad`, splitting [q|k|v] first when asked.
+        def scaled_orthogonalize_fn_with_qkv_split(grad):
+            """Orthogonalize `grad`, splitting [q|k|v] first when asked.
 
-            `whole_grad` is always the WHOLE matrix -- GTP is inactive, or the caller
+            `grad` is always the WHOLE matrix -- GTP is inactive, or the caller
             has already gathered. A row shard would cut q/k/v mid-boundary.
             """
             if qkv_split_shapes is None:
                 return self.scaled_orthogonalize_fn(
-                    whole_grad, tp_group, partition_dim, tp_mode_this_group=mode
+                    grad, tp_group, partition_dim, tp_mode_this_group=mode
                 )
             qkv_rows = sum(qkv_split_shapes)
-            if whole_grad.size(0) % qkv_rows != 0:
+            if grad.size(0) % qkv_rows != 0:
                 raise RuntimeError(
                     f"Muon QKV split shape mismatch on the whole matrix: "
-                    f"rows={whole_grad.size(0)}, qkv_split_shapes={qkv_split_shapes} "
+                    f"rows={grad.size(0)}, qkv_split_shapes={qkv_split_shapes} "
                     f"(sum {qkv_rows}). The row count is decided by the optimizer's qkv "
                     f"tagging loop (qkv_rows_after_gtp_gather), not here."
                 )
-            num_query_groups = whole_grad.size(0) // qkv_rows
-            cols = whole_grad.size(-1)
+            num_query_groups = grad.size(0) // qkv_rows
+            cols = grad.size(-1)
             qkv_grads = torch.split(
-                whole_grad.view(num_query_groups, qkv_rows, cols), qkv_split_shapes, dim=1
+                grad.view(num_query_groups, qkv_rows, cols), qkv_split_shapes, dim=1
             )
             qkv_grads = [
                 self.scaled_orthogonalize_fn(
@@ -471,10 +471,10 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
                 ).view(num_query_groups, -1, cols)
                 for g in qkv_grads
             ]
-            return torch.cat(qkv_grads, dim=1).view(whole_grad.shape)
+            return torch.cat(qkv_grads, dim=1).view(grad.shape)
 
         if not gtp_active:
-            return orthogonalize_whole_matrix(grad)
+            return scaled_orthogonalize_fn_with_qkv_split(grad)
 
         gtp_rank = get_pg_rank(gtp_remat_group)
         pad_length = getattr(p, 'pad_length', 0)
@@ -523,7 +523,9 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
             # holds the same padded tensor), orthogonalize the whole matrix
             # (scaled_orthogonalize_fn handles any TP sharding per tp_mode), reshard dim 0.
             gathered_grad = self._all_gather_tensor(grad, gtp_remat_group, 0)
-            result = orthogonalize_whole_matrix(self._strip_pad(gathered_grad, pad_length))
+            result = scaled_orthogonalize_fn_with_qkv_split(
+                self._strip_pad(gathered_grad, pad_length)
+            )
             result = self._restore_pad(result, pad_length)
             reshard_size = result.size(0) // gtp_remat_size
             return result[gtp_rank * reshard_size : (gtp_rank + 1) * reshard_size].contiguous()
