@@ -1140,6 +1140,7 @@ class TestTENativeGroupedMxfp8:
         )
         monkeypatch.setattr(fused_moe.tex, "te_general_grouped_gemm_for_discrete_in", record_call)
         monkeypatch.setattr(fused_moe, "_get_te_sm_count", lambda: 1)
+        monkeypatch.delenv("NVTE_EXT_MARGIN_SM", raising=False)
         alpha = torch.ones(1)
         beta = torch.zeros(1)
         workspace_setup = torch.empty(1, dtype=torch.uint8)
@@ -1153,6 +1154,8 @@ class TestTENativeGroupedMxfp8:
         assert len(calls[0]) == 13
         assert calls[0][6] is None
         assert calls[0][7] is alpha
+        # Match TE's wrapper: zero means use cuBLAS heuristics (all available SMs).
+        assert calls[0][-1] == 0
 
     def test_batch_invariant_chunks_reuse_serialized_workspace(self, monkeypatch):
         """Chunked grouped GEMMs allocate one workspace per call, not per chunk."""
@@ -1497,7 +1500,7 @@ class TestTENativeGroupedMxfp8:
 
         excluded = get_te_grouped_moe_parameter_ids(root)
         quantize_model_to_mxfp8(root, backend="triton", excluded_parameter_ids=excluded)
-        InferenceGroupedMLP._build_te_mxfp8_weights(root.experts)
+        InferenceGroupedMLP._build_te_inference_weights(root.experts, expected_mxfp8=True)
 
         assert isinstance(root.dense.weight, MXFP8Tensor)
         assert not isinstance(root.experts.linear_fc1.weight0, MXFP8Tensor)

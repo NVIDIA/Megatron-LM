@@ -9,6 +9,7 @@ import torch
 import torch.distributed as dist
 
 from megatron.core.fp8_utils import get_grouped_tensor_members, is_grouped_tensor
+from megatron.core.parameter_metadata import PARAMETER_SHARDING_ATTRIBUTES
 
 if TYPE_CHECKING:
     from .transforms import ReshardTransform
@@ -295,16 +296,6 @@ def named_refit_tensors(module: torch.nn.Module):
     the discrete ``weight0..weightN`` representation. This also avoids passing
     metadata-only GroupedTensor wrappers to communication backends.
     """
-    metadata_attributes = (
-        'allreduce',
-        'tensor_model_parallel',
-        'partition_dim',
-        'partition_stride',
-        'partition_sizes',
-        'is_gtp_weight_remat',
-        'group',
-        'pad_length',
-    )
     for name, param in module.named_parameters(recurse=True):
         if not is_grouped_tensor(param):
             yield name, param
@@ -314,7 +305,7 @@ def named_refit_tensors(module: torch.nn.Module):
             # Megatron stamps expert/TP/GTP metadata on the registered grouped
             # parameter. Its TE member views share storage but do not inherit
             # arbitrary Python attributes, so propagate the planning metadata.
-            for attribute in metadata_attributes:
+            for attribute in PARAMETER_SHARDING_ATTRIBUTES:
                 if hasattr(param, attribute):
                     setattr(member, attribute, getattr(param, attribute))
             yield f"{name}{index}", member

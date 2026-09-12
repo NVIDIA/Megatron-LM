@@ -12,6 +12,7 @@ from megatron.core.inference.quantization.mxfp8_tensor import (
     MXFP8Tensor,
     validate_mxfp8_tensor,
 )
+from megatron.core.parameter_metadata import PARAMETER_SHARDING_ATTRIBUTES
 
 if TYPE_CHECKING:
     from megatron.core.inference.moe import InferenceGroupedGemmBackend
@@ -122,19 +123,6 @@ def matches_mxfp8_parameter_filter(
     return included and not excluded
 
 
-def _validate_mxfp8_parameter_filters(
-    include_pattern: str | None, exclude_pattern: str | None
-) -> None:
-    """Validate parameter filters before any model parameters are mutated."""
-    for pattern in (include_pattern, exclude_pattern):
-        if pattern is None:
-            continue
-        try:
-            re.compile(pattern)
-        except re.error as error:
-            raise ValueError(f"Invalid MXFP8 parameter regex {pattern!r}: {error}") from error
-
-
 def _materialize_mxfp8_parameter_as_bf16(
     module: torch.nn.Module, parameter_name: str, parameter: torch.Tensor
 ) -> None:
@@ -142,22 +130,7 @@ def _materialize_mxfp8_parameter_as_bf16(
     bf16_parameter = torch.nn.Parameter(
         parameter.dequantize().to(torch.bfloat16), requires_grad=parameter.requires_grad
     )
-    for attribute in (
-        "allreduce",
-        "expert_parallel",
-        "expert_tp",
-        "group",
-        "is_embedding_or_output_parameter",
-        "is_gtp_weight_remat",
-        "is_qkv",
-        "pad_length",
-        "partition_dim",
-        "partition_sizes",
-        "partition_stride",
-        "qkv_split_shapes",
-        "sequence_parallel",
-        "tensor_model_parallel",
-    ):
+    for attribute in PARAMETER_SHARDING_ATTRIBUTES:
         if hasattr(parameter, attribute):
             setattr(bf16_parameter, attribute, getattr(parameter, attribute))
     del module._parameters[parameter_name]
@@ -193,9 +166,6 @@ def quantize_model_to_mxfp8(
     assert HAVE_TE
     if backend == "flashinfer":
         assert HAVE_FLASHINFER, "FlashInfer not available for MXFP8 quantization"
-
-    if _prefix == "":
-        _validate_mxfp8_parameter_filters(include_pattern, exclude_pattern)
 
     if _prefix == "" and excluded_parameter_ids is not None:
         for parameter_name, parameter in model.named_parameters():
@@ -351,8 +321,6 @@ def quantize_params_to_mxfp8(
         assert HAVE_FLASHINFER, "FlashInfer not available for MXFP8 quantization"
 
     if _prefix == "":
-        _validate_mxfp8_parameter_filters(include_pattern, exclude_pattern)
-
         if excluded_parameter_ids is not None:
             for parameter_name, parameter in model.named_parameters():
                 if id(parameter) not in excluded_parameter_ids:
