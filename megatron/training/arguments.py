@@ -1130,15 +1130,6 @@ def validate_args(args, defaults={}):
             '--dsa-simplified-indexer-disable-main-input-norm requires '
             '--dsa-indexer-mode simplified'
         )
-    if getattr(args, 'dsa_standard_indexer_use_main_input_norm', False):
-        assert args.experimental_attention_variant == 'dsa', (
-            '--dsa-standard-indexer-use-main-input-norm requires '
-            '--experimental-attention-variant dsa'
-        )
-        assert getattr(args, 'dsa_indexer_mode', 'standard') == 'standard', (
-            '--dsa-standard-indexer-use-main-input-norm requires '
-            '--dsa-indexer-mode standard'
-        )
     if getattr(args, 'dsa_indexer_reset_method', 'random') != 'random':
         assert getattr(args, 'dsa_reset_indexer_on_load', False), \
             '--dsa-indexer-reset-method requires --dsa-reset-indexer-on-load'
@@ -3890,15 +3881,6 @@ def _add_experimental_attention_variant_args(parser):
         ),
     )
     _maybe_add_argument(
-        '--dsa-standard-indexer-use-main-input-norm',
-        action='store_true',
-        help=(
-            'Make the standard DSA Q, K, and routing-weight projections consume the detached '
-            'normalized activation used by the main QKV projection. The default preserves the '
-            'historical residual-stream input.'
-        ),
-    )
-    _maybe_add_argument(
         '--dsa-indexer-n-heads',
         type=int,
         default=None,
@@ -4041,16 +4023,6 @@ def _add_experimental_attention_variant_args(parser):
         '--dsa-indexer-sparse-loss-use-topk-only',
         action='store_true',
         help='When using sparse DSA indexer loss, compute teacher/student KL only on the selected top-k support.',
-    )
-    _maybe_add_argument(
-        '--dsa-indexer-use-hadamard',
-        action='store_true',
-        help='Apply Hadamard rotation to DSA indexer queries and keys.',
-    )
-    _maybe_add_argument(
-        '--dsa-use-cudnn',
-        action='store_true',
-        help='Use cuDNN DSA kernels where available (requires nvidia-cudnn-frontend with DSA support).',
     )
     # Linear attention
     group.add_argument('--linear-attention-freq', type=la_freq_type, default=None,
