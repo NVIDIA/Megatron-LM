@@ -9,6 +9,7 @@ import pytest
 import torch
 import torch.distributed.checkpoint
 
+from megatron.core.dist_checkpointing.mapping import ShardedTensor, ShardedTensorFactory
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
 from megatron.core.num_microbatches_calculator import (
@@ -23,6 +24,7 @@ from megatron.training.checkpointing import (
     CheckpointType,
     _build_sharded_state_dict_metadata,
     _load_base_checkpoint,
+    filter_state_dict_to_trainable_params,
     get_checkpoint_tracker_filename,
     load_args_from_checkpoint,
     load_checkpoint,
@@ -653,3 +655,118 @@ class TestBuildShardedStateDictMetadata:
         args = _make_metadata_args()
         metadata = _build_sharded_state_dict_metadata(args, dp_cp_group=self.DUMMY_GROUP)
         assert 'distrib_optim_sharding_type' not in metadata
+
+
+def _sharded_tensor(key, requires_grad, shape=(2, 2)):
+    """Build a minimal, non-fragmented ShardedTensor wrapping a CPU tensor."""
+    data = torch.zeros(shape)
+    data.requires_grad_(requires_grad)
+    return ShardedTensor.from_rank_offsets(key, data)
+
+
+def _sharded_tensor_factory(key, requires_grad, shape=(2, 2)):
+    """Build a minimal ShardedTensorFactory wrapping a CPU tensor (e.g. the SwiGLU/split-tensor
+    checkpoint factories in `megatron/core/transformer/mlp.py` and `megatron/core/ssm/utils.py`,
+    which store the original, un-split parameter as `.data`)."""
+    data = torch.zeros(shape)
+    data.requires_grad_(requires_grad)
+    return ShardedTensorFactory(key, data, build_fn=lambda *a: {}, merge_fn=lambda x: x)
+
+
+class TestFilterStateDictToTrainableParams:
+    """``filter_state_dict_to_trainable_params`` is a pure function over an already-built
+    checkpoint state dict (as produced by ``generate_state_dict``), so it can be exercised
+    entirely on CPU with synthetic ``ShardedTensor``/plain-tensor leaves -- no
+    torch.distributed initialization or real model is needed.
+    """
+
+    def test_keeps_trainable_drops_frozen_leaves(self):
+        state_dict = {
+            'model': {
+                'base.weight': _sharded_tensor('base.weight', requires_grad=False),
+                'adapter.lora_a': _sharded_tensor('adapter.lora_a', requires_grad=True),
+            }
+        }
+        filtered = filter_state_dict_to_trainable_params(state_dict)
+        assert set(filtered['model'].keys()) == {'adapter.lora_a'}
+
+    def test_drops_fully_frozen_submodule_entirely(self):
+        state_dict = {
+            'model': {
+                'layers': {
+                    '0': {
+                        'base.weight': _sharded_tensor('layers.0.base.weight', requires_grad=False),
+                        'base.bias': _sharded_tensor('layers.0.base.bias', requires_grad=False),
+                    },
+                    '1': {
+                        'base.weight': _sharded_tensor('layers.1.base.weight', requires_grad=False),
+                        'adapter.lora_b': _sharded_tensor('layers.1.adapter.lora_b', requires_grad=True),
+                    },
+                }
+            }
+        }
+        filtered = filter_state_dict_to_trainable_params(state_dict)
+        # Layer 0 has no trainable leaves at all, so the whole subtree is dropped.
+        assert '0' not in filtered['model']['layers']
+        assert set(filtered['model']['layers']['1'].keys()) == {'adapter.lora_b'}
+
+    def test_multiple_pipeline_model_chunks_are_each_filtered(self):
+        state_dict = {
+            'model0': {'w': _sharded_tensor('model0.w', requires_grad=False)},
+            'model1': {'w': _sharded_tensor('model1.w', requires_grad=True)},
+        }
+        filtered = filter_state_dict_to_trainable_params(state_dict)
+        assert filtered['model0'] == {}
+        assert set(filtered['model1'].keys()) == {'w'}
+
+    def test_non_model_sections_pass_through_unchanged(self):
+        state_dict = {
+            'model': {'adapter.lora_a': _sharded_tensor('adapter.lora_a', requires_grad=True)},
+            'iteration': 100,
+            'checkpoint_version': 3.0,
+            'optimizer': {'anything': _sharded_tensor('optimizer.anything', requires_grad=False)},
+            'rng_state': [{'random_rng_state': (1, 2, 3)}],
+        }
+        filtered = filter_state_dict_to_trainable_params(state_dict)
+        assert filtered['iteration'] == 100
+        assert filtered['checkpoint_version'] == 3.0
+        # 'optimizer' is not a model section, so it is untouched even though it contains a
+        # frozen-looking ShardedTensor: the optimizer already only holds trainable-parameter
+        # state by construction (only trainable params are ever passed to the optimizer).
+        assert 'anything' in filtered['optimizer']
+        assert filtered['rng_state'] == state_dict['rng_state']
+
+    def test_plain_tensor_leaves_are_filtered_by_requires_grad(self):
+        # Covers the non-torch_dist ('torch'/'torch_dcp'/'fsdp_dtensor') model_sd shape, where
+        # model sections hold plain tensors instead of ShardedTensor. (Callers must still pass
+        # `state_dict(keep_vars=True)`-equivalent tensors for requires_grad to survive; see
+        # the --ckpt-format torch_dist validation in arguments.py.)
+        frozen = torch.zeros(2)
+        frozen.requires_grad_(False)
+        trainable = torch.zeros(2)
+        trainable.requires_grad_(True)
+        state_dict = {'model': {'base.weight': frozen, 'adapter.lora_a': trainable}}
+        filtered = filter_state_dict_to_trainable_params(state_dict)
+        assert set(filtered['model'].keys()) == {'adapter.lora_a'}
+
+    def test_non_tensor_leaves_pass_through_unconditionally(self):
+        # e.g. ShardedObject / LocalNonpersistentObject / plain metadata values.
+        state_dict = {'model': {'some_flag': True, 'adapter.lora_a': _sharded_tensor('a', True)}}
+        filtered = filter_state_dict_to_trainable_params(state_dict)
+        assert filtered['model']['some_flag'] is True
+        assert set(filtered['model'].keys()) == {'some_flag', 'adapter.lora_a'}
+
+    def test_sharded_tensor_factory_leaves_are_filtered_by_requires_grad(self):
+        # ShardedTensorFactory wraps the original (un-split/un-fused) parameter as `.data` --
+        # e.g. the SwiGLU and split-tensor checkpoint factories -- so it must be filtered the
+        # same way as a plain ShardedTensor, by the factory's own `.data.requires_grad`.
+        state_dict = {
+            'model': {
+                'base.linear_fc1': _sharded_tensor_factory('base.linear_fc1', requires_grad=False),
+                'adapter.linear_fc1': _sharded_tensor_factory(
+                    'adapter.linear_fc1', requires_grad=True
+                ),
+            }
+        }
+        filtered = filter_state_dict_to_trainable_params(state_dict)
+        assert set(filtered['model'].keys()) == {'adapter.linear_fc1'}

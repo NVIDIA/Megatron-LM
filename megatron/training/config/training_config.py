@@ -427,6 +427,15 @@ class CheckpointConfig:
     save_rng: bool = True
     """Do not save current rng state."""
 
+    save_trainable_params_only: bool = False
+    """Save only parameters with requires_grad=True in the model section(s) of the checkpoint,
+    omitting frozen weights (e.g., a frozen base model under PEFT/LoRA-style fine-tuning). The
+    optimizer section is unaffected: it already only contains state for the parameters passed to
+    the optimizer. Loading such a checkpoint onto a fully-initialized model that already has the
+    frozen weights (from scratch or from a separate full-model checkpoint) requires
+    `--dist-ckpt-strictness log_unexpected` (or another `*_unexpected` strictness value), since the
+    on-disk checkpoint will be missing the frozen keys the model requests."""
+
     load: str | None = None
     """Directory containing a model checkpoint."""
 

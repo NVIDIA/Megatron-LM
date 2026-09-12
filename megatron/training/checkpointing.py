@@ -31,8 +31,16 @@ except ImportError:
 
 from megatron.core import dist_checkpointing, mpu, tensor_parallel
 from megatron.core._rank_utils import safe_get_rank as get_rank_safe
-from megatron.core.dist_checkpointing.dict_utils import dict_list_map_inplace
-from megatron.core.dist_checkpointing.mapping import LocalNonpersistentObject, ShardedObject
+from megatron.core.dist_checkpointing.dict_utils import (
+    dict_list_map_inplace,
+    extract_matching_values,
+)
+from megatron.core.dist_checkpointing.mapping import (
+    LocalNonpersistentObject,
+    ShardedObject,
+    ShardedTensor,
+    ShardedTensorFactory,
+)
 from megatron.core.dist_checkpointing.strategies.async_utils import _disable_gc
 from megatron.core.dist_checkpointing.strategies.fully_parallel import (
     FullyParallelLoadStrategyWrapper,
@@ -824,6 +832,25 @@ def save_checkpoint(
                 model_sd_kwargs=dict(metadata=sharded_sd_metadata),
                 rerun_state=rerun_state,
             )
+
+        if args.save_trainable_params_only:
+            # `validate_args` asserts `args.ckpt_format == 'torch_dist'` at CLI-parse time, but
+            # `ckpt_format` (this save call's *effective* format) can differ afterwards -- e.g.
+            # `--ckpt-convert-format` reassigns `args.ckpt_format` post-validation (see
+            # `megatron/training/training.py`). Re-check the effective format here: every
+            # non-torch_dist path calls `state_dict_for_save_checkpoint(keep_vars=False)`, which
+            # detaches every tensor, so `requires_grad` would read False for *everything*
+            # (including real adapter weights) and the filter would silently empty the model
+            # section instead of merely failing to shrink it.
+            if ckpt_format != 'torch_dist':
+                raise RuntimeError(
+                    f"--save-trainable-params-only requires the torch_dist checkpoint "
+                    f"format (got effective ckpt_format={ckpt_format!r}). Other formats detach "
+                    f"every tensor before this filter runs, which would silently drop all "
+                    f"parameters -- including trainable ones -- instead of just the frozen base "
+                    f"model."
+                )
+            state_dict = filter_state_dict_to_trainable_params(state_dict)
 
         state_dict['num_floating_point_operations_so_far'] = num_floating_point_operations_so_far
         if ckpt_type == CheckpointType.GLOBAL and ckpt_format == 'torch_dist':
@@ -1657,6 +1684,61 @@ def generate_state_dict(
         _localize_redundant_extra_states(state_dict)
 
     return state_dict
+
+
+def _is_model_section(section_key: str) -> bool:
+    """Whether a top-level checkpoint state-dict key holds model parameters.
+
+    Model sections are named "model" (single model) or "model0", "model1", ... (virtual
+    pipeline-parallel model chunks). Other sections ("optimizer", "iteration",
+    "checkpoint_version", "rng_state", ...) are not model sections.
+    """
+    return section_key == 'model' or bool(re.fullmatch(r'model\d+', section_key))
+
+
+def _is_trainable_leaf(value: Any) -> bool:
+    """Predicate used by `filter_state_dict_to_trainable_params`: keep non-frozen leaves.
+
+    `ShardedTensor`/`ShardedTensorFactory` carry the original parameter as `.data`, so
+    `requires_grad` reflects whether the parameter is frozen (e.g. a PEFT base model) or
+    trainable (e.g. a PEFT adapter). Any other leaf (`ShardedObject`, `LocalNonpersistentObject`,
+    plain metadata, ...) is kept unconditionally: only tensor-carrying leaves are filtered.
+    """
+    if isinstance(value, (ShardedTensor, ShardedTensorFactory)):
+        return value.data is None or value.data.requires_grad
+    if isinstance(value, torch.Tensor):
+        return value.requires_grad
+    return True
+
+
+def filter_state_dict_to_trainable_params(state_dict: Dict[str, Any]) -> Dict[str, Any]:
+    """Filter the model section(s) of a checkpoint state dict to trainable parameters only.
+
+    Intended for PEFT/LoRA-style fine-tuning where the base model is frozen and only a small
+    number of adapter parameters are trainable: this keeps the saved checkpoint proportional to
+    the adapter size instead of duplicating the (already-available) frozen base weights. The
+    optimizer section, RNG state, and other metadata are returned unchanged: the optimizer
+    section already only contains state for whichever parameters were passed to the optimizer.
+
+    Loading a checkpoint produced this way onto a fully-initialized model (which still has its
+    frozen weights) requires `--dist-ckpt-strictness log_unexpected` (or another `*_unexpected`
+    strictness value): the on-disk checkpoint is missing the frozen keys the model will request,
+    and the default strictness raises on that mismatch.
+
+    Args:
+        state_dict: a state dict as produced by `generate_state_dict`.
+
+    Returns:
+        A new state dict with frozen parameters removed from every model section.
+    """
+    return {
+        section_key: (
+            extract_matching_values(section_value, _is_trainable_leaf)[0]
+            if _is_model_section(section_key)
+            else section_value
+        )
+        for section_key, section_value in state_dict.items()
+    }
 
 
 # Byte markers of the dict keys that TE `get_extra_state` writes ONLY under
