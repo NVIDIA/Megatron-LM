@@ -1462,7 +1462,11 @@ class CompressedSparseAttention2(MegatronModule):
         csa2_state: CSA2State | None = None,
         thd_layout: CSA2THDLayout | None = None,
     ) -> torch.Tensor:
-        """Attend jointly to causal window and selected global latents using one softmax."""
+        """Attend jointly to causal window and selected global latents using one softmax.
+
+        As in DSv4 CSA, attention_mask is unused: sparse indices and packed
+        sequence metadata define causal visibility and sequence boundaries.
+        """
         if boundary_hidden is not None or boundary_kv is not None:
             raise NotImplementedError("Native CSA2 currently requires CP=1.")
         is_thd = packed_seq_params is not None
@@ -1500,25 +1504,6 @@ class CompressedSparseAttention2(MegatronModule):
             csa2_state = CSA2State()
         csa2_state.validate_forward(self.layer_idx, query, thd_layout=thd_layout)
         seq_len, batch = query.shape[0], 1 if is_thd else query.shape[1]
-        if attention_mask is not None:
-            causal_mask = torch.ones(seq_len, seq_len, device=query.device, dtype=torch.bool).triu(
-                1
-            )
-            valid_mask = attention_mask.dtype == torch.bool and attention_mask.shape[-2:] == (
-                seq_len,
-                seq_len,
-            )
-            if valid_mask:
-                valid_mask = torch.equal(attention_mask, causal_mask.expand_as(attention_mask))
-                if is_thd and not valid_mask:
-                    packed_mask = causal_mask | (
-                        thd_layout.sequence_ids[:, None] != thd_layout.sequence_ids[None, :]
-                    )
-                    valid_mask = torch.equal(attention_mask, packed_mask.expand_as(attention_mask))
-            if not valid_mask:
-                raise NotImplementedError(
-                    "Native CSA2 only supports an ordinary causal attention mask."
-                )
         if is_thd and self.use_fused_kernels and query.is_cuda and seq_len > 0:
             # Build the final physical indices after selection. Reuse layers
             # consume the source's cache without constructing a window matrix.

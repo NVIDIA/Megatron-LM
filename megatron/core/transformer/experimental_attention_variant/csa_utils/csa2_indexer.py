@@ -65,19 +65,27 @@ class CSA2IndexerInputs:
 
     @cached_property
     def packed_metadata(self) -> tuple[Tensor, Tensor, int, int]:
-        """Prepare cuDNN prefixes/bounds lazily; indexed loss needs no CPU sync."""
+        """Prepare cuDNN prefixes with host-known bounds, without reading device values."""
         if self.thd_layout is None:
             batch, seq_len = self.output_shape
             prefix = torch.arange(batch + 1, dtype=torch.int32, device=self.q.device)
             return prefix * seq_len, prefix * self.key_capacity, seq_len, self.max_keys
         cu_q = self.thd_layout.cu_seqlens_padded.to(torch.int32).contiguous()
         cu_k = self.compressed_layout.cu_seqlens_padded.to(torch.int32).contiguous()
-        # Compact Top-K scans every physical row. Assign unused capacity to a
-        # synthetic padding segment, including an empty tail when fully owned.
-        cu_q = torch.cat((cu_q, cu_q.new_full((1,), self.q.shape[0])))
-        cu_k = torch.cat((cu_k, cu_k.new_full((1,), self.k.shape[0])))
-        tail_q, tail_k = torch.stack((cu_q[-1] - cu_q[-2], cu_k[-1] - cu_k[-2])).tolist()
-        return (cu_q, cu_k, max(self.thd_layout.max_seqlen, tail_q), max(self.max_keys, tail_k))
+        # Compact Top-K scans every physical row, including unassigned capacity.
+        # Split that tail into bounded padding segments on the device. Like V4,
+        # launch bounds come from host metadata, not a device-to-host length read;
+        # they stay per-sequence instead of growing with the whole packed batch.
+        max_q, max_k = max(self.thd_layout.max_seqlen, 1), self.max_keys
+        tail_segments = max(
+            (self.q.shape[0] + max_q - 1) // max_q,
+            (self.k.shape[0] + max(max_k, 1) - 1) // max(max_k, 1),
+            1,
+        )
+        steps = torch.arange(1, tail_segments + 1, device=cu_q.device, dtype=torch.int64)
+        tail_q = (cu_q[-1] + steps * max_q).clamp_max(self.q.shape[0]).int()
+        tail_k = (cu_k[-1] + steps * max_k).clamp_max(self.k.shape[0]).int()
+        return torch.cat((cu_q, tail_q)), torch.cat((cu_k, tail_k)), max_q, max_k
 
 
 def prepare_csa2_indexer_inputs(
