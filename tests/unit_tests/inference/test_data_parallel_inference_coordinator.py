@@ -78,10 +78,11 @@ class _StubCoordinator:
     def get_least_loaded_data_parallel_rank(self):
         return self._identity
 
-    def _send_to_engine(self, identity, frames):
+    def _send_to_engine(self, identity, frames, header):
         # Mirrors the real signature: a list of frames, metadata first. Passing
         # raw bytes here would splay one frame per byte, so assert the shape.
         assert isinstance(frames, list), f"expected a frame list, got {type(frames).__name__}"
+        assert header == msgpack.unpackb(frames[0], raw=False)[0]
         self.sent.append((identity, frames))
         return True
 

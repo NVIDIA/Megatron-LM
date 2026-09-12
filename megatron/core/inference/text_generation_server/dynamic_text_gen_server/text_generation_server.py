@@ -29,6 +29,75 @@ logger = logging.getLogger(__name__)
 _SERVER_PROCESSES: List[mp.Process] = []
 
 
+def build_app(
+    client,
+    tokenizer,
+    parsers: Optional[List[str]] = None,
+    verbose: bool = False,
+    chat_template: Optional[str] = None,
+    multimodal_prompt_config: Optional[MultimodalPromptConfig] = None,
+    default_temperature: float = 1.0,
+    default_top_p: float = 1.0,
+    default_top_k: int = 0,
+    eval_mode: bool = False,
+):
+    """Build the OpenAI-compatible Quart app around an already-started client.
+
+    Split out from _run_text_gen_server so the HTTP layer can be exercised
+    against a test client without binding a socket or forking replicas.
+
+    Args:
+        client: An InferenceClient (or any object with the same add_request /
+            add_request_streaming interface).
+        tokenizer: Tokenizer used for prompt tokenization and detokenization.
+        parsers: Optional list of tool/reasoning parser names.
+        verbose: Whether endpoints should log per-batch timing.
+        chat_template: Optional server-configured chat template.
+        multimodal_prompt_config: Configuration for multimodal prompt tokens.
+        default_temperature: Default sampling temperature.
+        default_top_p: Default nucleus-sampling probability.
+        default_top_k: Default top-k sampling value.
+        eval_mode: Whether evaluation-mode request defaults are enabled.
+
+    Returns:
+        Quart: The configured app with every endpoint blueprint registered.
+    """
+    if not HAS_BACKEND:
+        raise RuntimeError("Web backend framework (Quart) not available")
+
+    app = Quart(__name__)
+
+    # Quart native way to handle max body size (1 GB; needed for large prompts)
+    app.config['MAX_CONTENT_LENGTH'] = 2**30
+
+    # Store client and tokenizer in app config for Blueprints to use
+    app.config['client'] = client
+    app.config['tokenizer'] = tokenizer
+    app.config['parsers'] = parsers
+    app.config['verbose'] = verbose
+    app.config['chat_template'] = chat_template
+    app.config['multimodal_prompt_config'] = multimodal_prompt_config or MultimodalPromptConfig()
+    app.config['default_temperature'] = default_temperature
+    app.config['default_top_p'] = default_top_p
+    app.config['default_top_k'] = default_top_k
+    app.config['eval_mode'] = eval_mode
+
+    # Applying the chat template is synchronous and O(prompt); on the event loop it
+    # stalls every other request this replica owns, including delivery of responses
+    # that already finished. One worker is enough - the point is the yield, not
+    # throughput. The copy is required: HF tokenizers are not thread-safe.
+    app.config['tokenize_executor'] = ThreadPoolExecutor(
+        max_workers=1, thread_name_prefix="tokenize"
+    )
+    app.config['tokenizer_copy'] = copy.deepcopy(tokenizer)
+
+    # Register all blueprints from the 'endpoints' package
+    for endpoint in endpoints.__all__:
+        app.register_blueprint(endpoint)
+
+    return app
+
+
 @contextmanager
 def temp_log_level(level, logger=None):
     """Enables temporarily overriding the logging level."""
@@ -91,37 +160,18 @@ async def _run_text_gen_server(
                 logger.warning(f"Could not get hostname: {e}")
                 hostname = "0.0.0.0"
 
-        app = Quart(__name__)
-
-        # Quart native way to handle max body size (1 GB; needed for large prompts)
-        app.config['MAX_CONTENT_LENGTH'] = 2**30
-
-        # Store client and tokenizer in app config for Blueprints to use
-        app.config['client'] = inference_client
-        app.config['tokenizer'] = tokenizer
-        app.config['parsers'] = parsers
-        app.config['verbose'] = verbose
-        app.config['chat_template'] = chat_template
-        app.config['multimodal_prompt_config'] = (
-            multimodal_prompt_config or MultimodalPromptConfig()
+        app = build_app(
+            inference_client,
+            tokenizer,
+            parsers,
+            verbose,
+            chat_template=chat_template,
+            multimodal_prompt_config=multimodal_prompt_config,
+            default_temperature=default_temperature,
+            default_top_p=default_top_p,
+            default_top_k=default_top_k,
+            eval_mode=eval_mode,
         )
-        app.config['default_temperature'] = default_temperature
-        app.config['default_top_p'] = default_top_p
-        app.config['default_top_k'] = default_top_k
-        app.config['eval_mode'] = eval_mode
-
-        # Applying the chat template is synchronous and O(prompt); on the event loop it
-        # stalls every other request this replica owns, including delivery of responses
-        # that already finished. One worker is enough - the point is the yield, not
-        # throughput. The copy is required: HF tokenizers are not thread-safe.
-        app.config['tokenize_executor'] = ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix="tokenize"
-        )
-        app.config['tokenizer_copy'] = copy.deepcopy(tokenizer)
-
-        # Register all blueprints from the 'endpoints' package
-        for endpoint in endpoints.__all__:
-            app.register_blueprint(endpoint)
 
         config = Config()
         config.keep_alive_timeout = 30.0  # Keep connection alive between long-running requests.
