@@ -60,7 +60,7 @@ jobs:
         if: steps.pr.outputs.number
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
-          python-version: "3.10"
+          python-version: "3.12"
 
       - name: Install dependencies
         if: steps.pr.outputs.number
