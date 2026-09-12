@@ -182,9 +182,10 @@ class DistributedDataParallelConfig:
     Valid values are 'no_shard', 'optim'. This option is only effective when Hybrid FSDP is enabled.
     """
 
-    expert_outer_dp_sharding_strategy: str = 'no_shard'
+    expert_outer_dp_sharding_strategy: str | None = None
     """Sharding strategy for the outer expert data-parallel group in MFSDP v2.
-    Valid values are ``'no_shard'`` and ``'optim'``.
+    Valid values are ``'no_shard'`` and ``'optim'``. None inherits
+    ``outer_dp_sharding_strategy``.
     """
 
     disable_symmetric_registration: bool = False
