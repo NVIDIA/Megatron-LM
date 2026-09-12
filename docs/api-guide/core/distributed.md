@@ -17,3 +17,6 @@ synchronize gradients across different parallelism modes (e.g., 'tied'
 layers on different pipeline stages, or gradients for experts in a MoE on
 different ranks due to expert parallelism).
 
+Both `DistributedDataParallel` and `finalize_model_grads` take a
+[`ProcessGroupCollection`](process_groups.md) from the caller.
+
