@@ -361,12 +361,6 @@ class TransformerConfig(ModelParallelConfig):
     dsa_min_memory_profile_rank: int = 0
     """Global rank that prints DSA min-memory timings. Set to -1 to print on every rank."""
 
-    dsa_kernel_query_block_size: Optional[int] = None
-    """Optional query tile size for DSA min-memory kernel backends."""
-
-    dsa_kernel_key_block_size: Optional[int] = None
-    """Optional key tile size for DSA min-memory kernel backends."""
-
     dsa_kernel_cache_routing: bool = False
     """Whether DSA kernel backends may save forward routing top-k indices for backward speed."""
 
@@ -3672,12 +3666,6 @@ class TransformerConfig(ModelParallelConfig):
             assert (
                 self.dsa_min_memory_profile_rank >= -1
             ), "dsa_min_memory_profile_rank must be -1 or a non-negative global rank."
-            assert (
-                self.dsa_kernel_query_block_size is None or self.dsa_kernel_query_block_size > 0
-            ), "dsa_kernel_query_block_size must be a positive integer when set."
-            assert (
-                self.dsa_kernel_key_block_size is None or self.dsa_kernel_key_block_size > 0
-            ), "dsa_kernel_key_block_size must be a positive integer when set."
             assert (
                 not self.dsa_kernel_cache_routing or min_memory_dsa_backend
             ), "dsa_kernel_cache_routing requires a min-memory dsa_kernel_backend."
