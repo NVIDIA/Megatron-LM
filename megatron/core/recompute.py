@@ -56,6 +56,21 @@ def checkpointed_forward(
         extract_layer_indices = set()
     intermediate_hidden_states: List[Tensor] = []
 
+    dsa_index_share_carrier = None
+    dsa_index_share_carrier_scope = None
+    if (
+        packed_seq_params is None
+        and getattr(self.config, "experimental_attention_variant", None) == "dsa"
+        and (getattr(self.config, "dsa_indexer_topk_freq", 1) or 1) > 1
+    ):
+        from megatron.core.transformer.experimental_attention_variant.dsa import (
+            _dsa_index_share_carrier_scope,
+            _DSAIndexShareCarrier,
+        )
+
+        dsa_index_share_carrier = _DSAIndexShareCarrier()
+        dsa_index_share_carrier_scope = _dsa_index_share_carrier_scope
+
     # Wrap non-dual RoPE to tuple to unify custom_forward interface.
     is_dual_rope = isinstance(rotary_pos_emb, (tuple, list))
     assert not is_dual_rope or len(rotary_pos_emb) == 2, "Dual RoPE input length is not equal to 2"
@@ -141,7 +156,14 @@ def checkpointed_forward(
                     hidden_states = cp_layout_state.finalize_layer(index, hidden_states)
             return hidden_states, context
 
-        return custom_forward
+        if dsa_index_share_carrier_scope is None:
+            return custom_forward
+
+        def carrier_scoped_forward(*args):
+            with dsa_index_share_carrier_scope(dsa_index_share_carrier):
+                return custom_forward(*args)
+
+        return carrier_scoped_forward
 
     def chunk_runner(start: int, end: int, use_checkpoint: bool):
         nonlocal hidden_states, context
