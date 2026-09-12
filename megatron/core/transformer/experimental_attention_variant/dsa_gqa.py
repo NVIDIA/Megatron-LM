@@ -135,10 +135,14 @@ def _dsa_rope_setting(config: TransformerConfig, name: str):
 
 
 def _simplified_indexer_uses_main_input_norm(config: TransformerConfig) -> bool:
-    """Whether simplified DSA should reproduce a norm fused into main QKV."""
-    return getattr(config, "dsa_indexer_mode", "standard") == "simplified" and not getattr(
-        config, "dsa_simplified_indexer_disable_main_input_norm", False
-    )
+    """Whether simplified DSA reproduces a norm fused into main QKV.
+
+    The indexer always consumes the same normalized activation as the main Q projection. With an
+    unfused layer spec the incoming hidden states have already been normalized and there is no
+    fused norm to reproduce, so this is only True for the fused case -- the input the indexer
+    sees is the same either way.
+    """
+    return getattr(config, "dsa_indexer_mode", "standard") == "simplified"
 
 
 def _split_topk_padding(topk_indices):
