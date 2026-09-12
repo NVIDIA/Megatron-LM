@@ -113,18 +113,12 @@ def test_dsa_trainability_mode_requires_no_load_optim_for_transitions(monkeypatc
         use_dist_ckpt=True,
     )
     runtime_args = SimpleNamespace(
-        **common,
-        dsa_train_main_only=True,
-        dsa_train_indexer_only=False,
-        no_load_optim=False,
-        finetune=False,
+        **common, dsa_train_indexer_only=True, no_load_optim=False, finetune=False
     )
     monkeypatch.setattr(checkpointing, "get_args", lambda: runtime_args)
     monkeypatch.setattr(checkpointing, "get_checkpoint_version", lambda: 3.0)
 
-    checkpointing.check_checkpoint_args(
-        SimpleNamespace(**common, dsa_train_main_only=True, dsa_train_indexer_only=False)
-    )
+    checkpointing.check_checkpoint_args(SimpleNamespace(**common, dsa_train_indexer_only=True))
     with pytest.raises(AssertionError, match="Use --no-load-optim"):
         checkpointing.check_checkpoint_args(SimpleNamespace(**common))
 
@@ -351,7 +345,6 @@ def test_simplified_main_q_reset_handles_optimizer_load_modes(
     )
     monkeypatch.setattr(training, "_broadcast_dsa_indexer_params", lambda model: None)
     args = SimpleNamespace(
-        dsa_indexer_reset_seed=None,
         dsa_indexer_reset_method=reset_method,
         no_load_optim=no_load_optim,
         finetune=False,
@@ -448,41 +441,6 @@ def test_dsa_train_indexer_only_freezes_exactly_indexer_submodule_parameters(mon
 
     for name, param in model.named_parameters():
         assert param.requires_grad == name.startswith("block.indexer.")
-
-
-def test_dsa_train_main_only_allows_pipeline_stage_without_local_indexer(monkeypatch):
-    import megatron.training.training as training
-
-    model = torch.nn.Linear(3, 2)
-    monkeypatch.setattr(training, "_global_dsa_indexer_reset_count", lambda local_count: 5)
-
-    training._freeze_dsa_indexer_parameters([model])
-
-    assert all(param.requires_grad for param in model.parameters())
-
-
-def test_dsa_train_main_only_freezes_exactly_indexer_and_preserves_other_freezes(monkeypatch):
-    import megatron.training.training as training
-
-    class _Model(torch.nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.backbone = torch.nn.Linear(3, 2)
-            self.block = torch.nn.Module()
-            self.block.indexer = torch.nn.Linear(3, 2)
-            self.indexer_aux = torch.nn.Linear(3, 2)
-            self.backbone.bias.requires_grad_(False)
-
-    model = _Model()
-    monkeypatch.setattr(training, "_global_dsa_indexer_reset_count", lambda count: count)
-
-    training._freeze_dsa_indexer_parameters([model])
-
-    for name, param in model.named_parameters():
-        if name.startswith("block.indexer.") or name == "backbone.bias":
-            assert not param.requires_grad
-        else:
-            assert param.requires_grad
 
 
 def test_dsa_indexer_optimizer_refresh_preserves_backbone_master_weights(monkeypatch):
@@ -614,14 +572,11 @@ def test_dsa_indexer_reset_seed_derivation_is_tp_invariant_and_dp_aware(monkeypa
     monkeypatch.setattr(training.mpu, "get_pipeline_model_parallel_rank", lambda: 2)
     monkeypatch.setattr(training.mpu, "get_data_parallel_rank", lambda: 3)
 
-    args = SimpleNamespace(dsa_indexer_reset_seed=None, seed=1234, data_parallel_random_init=False)
+    args = SimpleNamespace(seed=1234, data_parallel_random_init=False)
     assert training._get_dsa_indexer_reset_seed(args) == 1434
 
     args.data_parallel_random_init = True
     assert training._get_dsa_indexer_reset_seed(args) == 1464
-
-    args.dsa_indexer_reset_seed = 77
-    assert training._get_dsa_indexer_reset_seed(args) == 77
 
 
 def test_dsa_indexer_optimizer_state_clear_preserves_backbone_state(monkeypatch):
