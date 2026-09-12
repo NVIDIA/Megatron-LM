@@ -419,7 +419,8 @@ KERNELS: Tuple[KernelEntry, ...] = (
         ),
         tests=(K + "test_optimizer_kernels.py",),
         kind="external-lib",
-        notes="multi_tensor l2norm / scale (TE, apex or local fallback) and fused Adam; "
+        notes="multi_tensor l2norm / scale (TE, apex or local fallback), including mixed-dtype "
+        "caller bucketing and padded-storage replay, and fused Adam; "
         "optimizer.py (gradient unscaling) and training/utils/common_utils.py (param / grad norm "
         "logging) launch the same multi_tensor kernels through multi_tensor_applier.",
     ),
