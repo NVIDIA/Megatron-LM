@@ -556,35 +556,35 @@ def is_nccl_ep_fp8_dispatch_available():
     return check_mxfp8_support()[0]
 
 
+@pytest.mark.launch_on_gb200
 @pytest.mark.parametrize("dense_topk_routing", [True, False])
 def test_hybridep_compact_routes_metadata(dense_topk_routing):
-    """Compact routes expand once, for the plain and the virtual-expert path alike: the
-    probabilities are scattered dense and carry the gradient; the ids go in as int16 dense top-k
-    routing or, on a build without it, as the bool routing map rebuilt from them."""
+    """Plain and virtual routes preserve high expert ids, zero scores and their gradients."""
     manager = _HybridEPManager.__new__(_HybridEPManager)
-    manager.num_experts, manager.num_local_experts = 8, 2
+    manager.num_experts, manager.num_local_experts = 512, 8
     manager.config = TransformerConfig(
-        num_layers=1, hidden_size=16, num_attention_heads=4, num_moe_experts=8, moe_router_topk=2
+        num_layers=1, hidden_size=16, num_attention_heads=4, num_moe_experts=512, moe_router_topk=2
     )
     manager.moe_expert_rank_capacity_factor = None
     manager.drop_and_pad = False
     manager.dense_routing_metadata = False
     manager._dense_topk_routing = dense_topk_routing
-
-    top_indices = torch.tensor([[0, 5], [7, 2], [3, 4]])
-    probs = torch.tensor([[0.6, 0.4], [0.5, 0.5], [0.9, 0.1]], requires_grad=True)
+    top_indices = torch.tensor([[0, 65], [511, 2], [127, 256]])
+    probs = torch.tensor([[0.6, 0.4], [0.0, 0.5], [0.9, 0.1]], requires_grad=True)
     manager.setup_metadata(top_indices, probs)
-    expected = torch.zeros(3, 8).scatter(1, top_indices, probs.detach())
+    expected = torch.zeros(3, 512).scatter(1, top_indices, probs.detach())
     torch.testing.assert_close(manager.token_probs, expected, rtol=0, atol=0)
-    (manager.token_probs * torch.arange(8.0)).sum().backward()
+    (manager.token_probs * torch.arange(512.0)).sum().backward()
     torch.testing.assert_close(probs.grad, top_indices.float(), rtol=0, atol=0)
     if dense_topk_routing:
         assert manager.routing_map is None and manager.topk_idx.dtype == torch.int16
         assert torch.equal(manager.topk_idx.long(), top_indices)
     else:
-        assert manager.topk_idx is None and torch.equal(manager.routing_map, expected != 0)
+        expected_map = torch.zeros_like(expected, dtype=torch.bool).scatter(1, top_indices, True)
+        assert manager.topk_idx is None and torch.equal(manager.routing_map, expected_map)
 
 
+@pytest.mark.launch_on_gb200
 def test_uses_compact_routes_covers_hybridep_without_dense_map_consumers():
     """Plain HybridEP takes compact routes unless something downstream needs the dense map;
     virtual experts always do."""
@@ -593,7 +593,7 @@ def test_uses_compact_routes_covers_hybridep_without_dense_map_consumers():
         moe_token_dispatcher_type="flex",
         moe_flex_dispatcher_backend="hybridep",
         moe_router_fusion=False,
-        moe_router_load_balancing_type="aux_loss",
+        moe_router_load_balancing_type="seq_aux_loss",
         moe_expert_capacity_factor=None,
         moe_pad_expert_input_to_capacity=False,
         moe_token_dropping=False,
@@ -601,6 +601,9 @@ def test_uses_compact_routes_covers_hybridep_without_dense_map_consumers():
         moe_hybridep_pad_uneven_dispatch_inputs=False,
     )
     assert uses_compact_routes(SimpleNamespace(**plain))
+    assert not uses_compact_routes(
+        SimpleNamespace(**{**plain, "moe_router_load_balancing_type": "quantile_balancing"})
+    )
     assert uses_compact_routes(
         SimpleNamespace(**{**plain, "moe_router_load_balancing_type": ["aux_loss", "seq_aux_loss"]})
     )
@@ -677,6 +680,28 @@ class TestFlexDispatcher:
     def teardown_method(self, method):
         reset_hybrid_ep_buffer()
         Utils.destroy_model_parallel()
+
+    @pytest.mark.launch_on_gb200
+    @pytest.mark.parametrize("router_fusion", [False, True])
+    def test_plain_hybridep_four_rank_compatibility(self, router_fusion):
+        """Exercise ordinary dispatch/combine on both old and new installed HybridEP builds."""
+        if Utils.world_size != 4 or not is_hybrid_ep_available():
+            pytest.skip("requires four ranks and HybridEP")
+        container = MoEModelTestContainer(
+            tp_size=1,
+            ep_size=4,
+            pp_size=1,
+            num_moe_experts=128,
+            moe_router_topk=2,
+            moe_token_dispatcher_type="flex",
+            moe_flex_dispatcher_backend="hybridep",
+            hidden_size=128,
+            test_dtype=torch.bfloat16,
+        )
+        container.moe_layer = container.new_moe_layer(
+            moe_router_fusion=router_fusion, moe_router_score_function="sigmoid"
+        )
+        container.dispatcher_dropless_test()
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.internal

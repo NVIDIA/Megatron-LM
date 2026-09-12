@@ -264,10 +264,13 @@ def test_virtual_expert_gtp_persistent_wgrads_match_recycled_scratch(monkeypatch
         fused_a2a.reset_hybrid_ep_buffer()
 
 
-@pytest.mark.parametrize("expert_gtp", [2, 1], ids=["egtp2", "edp2"])
-@pytest.mark.parametrize("mxfp8", [False, True], ids=["bf16", "mxfp8"])
+@pytest.mark.parametrize(
+    ("mxfp8", "expert_gtp", "quantile"),
+    [(False, 2, False), (False, 1, False), (True, 2, False), (True, 1, False), (True, 2, True)],
+    ids=["bf16-egtp2", "bf16-edp2", "mxfp8-egtp2", "mxfp8-edp2", "mxfp8-quantile"],
+)
 def test_virtual_expert_gtp_training_matches_hybridep(
-    monkeypatch, tmp_path_dist_ckpt, mxfp8, expert_gtp
+    monkeypatch, tmp_path_dist_ckpt, mxfp8, expert_gtp, quantile
 ):
     """Compare complete DDP/GTP training, Adam updates and resumed training with HybridEP."""
     from contextlib import nullcontext
@@ -321,10 +324,12 @@ def test_virtual_expert_gtp_training_matches_hybridep(
             # first-microbatch overwrite optimization assumes a single use per forward.
             disable_parameter_transpose_cache=True,
             calculate_per_token_loss=True,
+            normalization="RMSNorm",
             moe_router_score_function="sigmoid",
-            moe_router_load_balancing_type="seq_aux_loss",
-            moe_aux_loss_coeff=1e-3,
-            moe_router_enable_expert_bias=True,
+            moe_router_load_balancing_type="quantile_balancing" if quantile else "seq_aux_loss",
+            moe_aux_loss_coeff=0 if quantile else 1e-4,
+            moe_router_enable_expert_bias=not quantile,
+            moe_router_quantile_balancing_ema=0.9,
             moe_router_bias_update_rate=1e-3,
             moe_router_topk_scaling_factor=2.5,
             moe_router_fusion=True,
@@ -392,9 +397,6 @@ def test_virtual_expert_gtp_training_matches_hybridep(
             assert all(is_mxfp8tensor(p) == mxfp8 for p in experts)
             assert all(p.main_grad.dtype == torch.bfloat16 for p in experts)
             assert len(optimizer.chained_optimizers) >= 2
-            zero_initialized = {
-                i for i, p in enumerate(optimizer.get_parameters()) if not p.detach().any()
-            }
             routers = [layer.mlp.router for layer in module.layers]
             semantic_keys = set(module.state_dict())
             metadata = {
@@ -436,6 +438,7 @@ def test_virtual_expert_gtp_training_matches_hybridep(
 
             def record_routes(router, inputs, output):
                 probs, ids = output
+                assert (ids.dtype != torch.bool) == virtual
                 if ids.dtype == torch.bool:
                     ids = ids.to(torch.int8).topk(router.topk, dim=1).indices
                     probs = probs.gather(1, ids)
@@ -514,6 +517,17 @@ def test_virtual_expert_gtp_training_matches_hybridep(
                             (0.37 * (y.float() * dy).sum()).backward()
                         values[f"output {microbatch}"] = y.detach().float().clone()
                         values[f"input gradient {microbatch}"] = x.grad.float().clone()
+                    if quantile:
+                        assert [r.qb_beta_count.item() for r in routers] == [2, 2, 4]
+                        expected_beta = torch.stack(
+                            [r.qb_beta_accum / r.qb_beta_count for r in routers]
+                        )
+                        torch.distributed.all_reduce(expected_beta, group=pg.dp_cp_gtp_remat)
+                        expected_beta /= pg.dp_cp_gtp_remat.size()
+                        expected_beta = (
+                            0.9 * torch.stack([r.qb_beta for r in routers]) + 0.1 * expected_beta
+                        )
+                        expected_beta -= expected_beta.mean(dim=1, keepdim=True)
                     finalize_model_grads(
                         [model],
                         num_tokens=torch.tensor(64, dtype=torch.int64, device="cuda"),
@@ -542,10 +556,21 @@ def test_virtual_expert_gtp_training_matches_hybridep(
                                 errors.append(
                                     f"virtual={virtual} resume={resume} step={step} expert DP reduction: {exc}"
                                 )
-                    values["auxiliary loss"] = (
-                        get_moe_metrics_tracker().metrics["seq_load_balancing_loss"].values.cpu()
-                    )
-                    values["router bias"] = torch.stack([r.expert_bias for r in routers]).cpu()
+                    if quantile:
+                        actual_beta = torch.stack([r.qb_beta for r in routers])
+                        torch.testing.assert_close(actual_beta, expected_beta, rtol=1e-6, atol=1e-7)
+                        assert all(
+                            r.qb_beta_count.item() == 0 and not r.qb_beta_accum.any()
+                            for r in routers
+                        )
+                        values["quantile bias"] = actual_beta.cpu()
+                    else:
+                        values["auxiliary loss"] = (
+                            get_moe_metrics_tracker()
+                            .metrics["seq_load_balancing_loss"]
+                            .values.cpu()
+                        )
+                        values["router bias"] = torch.stack([r.expert_bias for r in routers]).cpu()
                     assert all(r.weight.main_grad.float().norm() > 0 for r in routers)
                     for name, parameter in module.named_parameters():
                         values[f"model weight {name}"] = parameter.detach().float().cpu()
@@ -555,10 +580,7 @@ def test_virtual_expert_gtp_training_matches_hybridep(
                     ):
                         values[f"gradient {index}"] = parameter.grad.detach().cpu()
                         values[f"update {index}"] = (parameter.detach() - initial).cpu()
-                        # A zero-initialized master is the sum of Adam updates: use the same
-                        # peak/sign-flip allowance and tight aggregate bound as individual updates.
-                        kind = "update total" if index in zero_initialized else "master weight"
-                        values[f"{kind} {index}"] = parameter.detach().cpu()
+                        values[f"master weight {index}"] = parameter.detach().cpu()
                     for index, child in enumerate(optimizer.chained_optimizers):
                         for local, parameter in enumerate(child.get_parameters()):
                             for name in ("exp_avg", "exp_avg_sq"):
@@ -593,6 +615,9 @@ def test_virtual_expert_gtp_training_matches_hybridep(
                         model.start_param_sync(force_sync=True)
                         save(checkpoint_state(), checkpoint)
             if virtual:
+                for layer in module.layers:
+                    manager = layer.mlp.token_dispatcher._comm_manager
+                    assert manager._dense_topk_routing
                 active = torch.stack(active_plans).any().to(torch.int32)
                 torch.distributed.all_reduce(active)
                 assert active.item(), "training must materialize a virtual expert"
@@ -609,7 +634,7 @@ def test_virtual_expert_gtp_training_matches_hybridep(
 
     try:
         with TempNamedDir(
-            tmp_path_dist_ckpt / f"virtual_expert_training_{mxfp8}_{expert_gtp}"
+            tmp_path_dist_ckpt / f"virtual_expert_training_{mxfp8}_{expert_gtp}_{quantile}"
         ) as checkpoint:
             reference = train(False, checkpoint)
             candidate = train(True, checkpoint)
@@ -629,10 +654,6 @@ def test_virtual_expert_gtp_training_matches_hybridep(
             ):
                 assert actual.keys() == expected.keys()
                 for name in actual:
-                    # LayerNorm biases start at zero; gradients and updates must remain nonzero.
-                    if name.startswith("model weight ") and not expected[name].any():
-                        torch.testing.assert_close(actual[name], expected[name], atol=0, rtol=0)
-                        continue
                     update = name.startswith("update ")
                     tolerance = (0.1 if mxfp8 else 0.03) if label == "HybridEP" else 1e-5
                     if label == "HybridEP":
@@ -643,7 +664,11 @@ def test_virtual_expert_gtp_training_matches_hybridep(
                         elif name.startswith(("output ", "input gradient ")):
                             tolerance = 0.02
                         elif name == "auxiliary loss":
-                            tolerance = 1e-5
+                            tolerance = 1e-4
+                        elif name == "quantile bias":
+                            tolerance = 1e-3
+                        elif quantile and name.startswith("gradient "):
+                            tolerance = 0.15  # Isolated MXFP8 peaks; aggregate stays <=6%.
                     if name == "router bias":
                         tolerance = 0
                     _assert_numerical_parity(

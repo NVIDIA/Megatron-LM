@@ -98,7 +98,6 @@ def test_virtual_expert_init_rejects_layout_before_cuda(
             "no MoE layer recompute",
         ),
         ({"moe_router_load_balancing_type": "sinkhorn"}, "no sinkhorn"),
-        ({"moe_router_load_balancing_type": "quantile_balancing"}, "no sinkhorn"),
         (
             {
                 "moe_router_load_balancing_type": ["aux_loss", "sinkhorn"],
@@ -119,10 +118,36 @@ def test_virtual_expert_init_checks_normalized_settings(monkeypatch, overrides, 
 
 
 @requires_cuda
-@pytest.mark.parametrize(("ep_size", "num_experts", "topk"), [(2, 2, 1), (64, 8192, 32)])
-def test_virtual_expert_init_accepts_supported_limits(monkeypatch, ep_size, num_experts, topk):
+def test_virtual_expert_compact_api_requirement_preserves_plain_hybridep(monkeypatch):
+    """Old HybridEP remains usable without virtual experts; virtual experts fail before launch."""
+    from megatron.core.transformer.moe import token_dispatcher
+
+    monkeypatch.setattr(token_dispatcher, "hybrid_ep_dense_topk_routing", lambda *_: False)
+    monkeypatch.setattr(token_dispatcher, "hybrid_ep_dispatch", object())
+    for virtual in (False, True):
+        config = _virtual_expert_hybridep_config(moe_virtual_expert_load_balance=virtual)
+        if virtual:
+            with pytest.raises(ValueError, match="compact top-k routing API"):
+                token_dispatcher._HybridEPManager(object(), 1, 2, config)
+        else:
+            manager = token_dispatcher._HybridEPManager(object(), 1, 2, config)
+            assert not manager._dense_topk_routing
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    ("ep_size", "num_experts", "topk", "routing"),
+    [(2, 2, 1, "none"), (64, 8192, 32, "seq_aux_loss"), (64, 512, 10, "quantile_balancing")],
+)
+def test_virtual_expert_init_accepts_supported_limits(
+    monkeypatch, ep_size, num_experts, topk, routing
+):
     """Large positive HybridEP SM budgets are valid; transport caps its own budget later."""
-    config = _virtual_expert_hybridep_config(moe_flex_dispatcher_num_sms=64)
+    config = _virtual_expert_hybridep_config(
+        moe_flex_dispatcher_num_sms=64,
+        moe_router_load_balancing_type=routing,
+        moe_router_fusion=True,
+    )
     monkeypatch.setattr(torch.distributed, "get_world_size", lambda group: ep_size)
     manager = VirtualExpertLoadBalancer()
     manager.initialize_virtual_expert_load_balancer(

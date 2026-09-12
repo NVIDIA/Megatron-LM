@@ -822,9 +822,6 @@ def topk_routing_with_score_function(
     """
     assert logits.dim() == 2, f"Expected 2D logits [num_tokens, num_experts], got {logits.dim()}."
     num_tokens, num_experts = logits.shape
-    assert not (
-        fused and precomputed_indices is not None
-    ), "precomputed_indices is not supported with the fused top-k score function."
     if fused:
         if not HAVE_TE or fused_topk_with_score_function is None:
             raise ValueError(
@@ -835,8 +832,23 @@ def topk_routing_with_score_function(
                 "Fused sqrtsoftplus score function requires TE >= 2.13.0. "
                 "Please upgrade Transformer Engine or disable moe_router_fusion."
             )
-        return fused_topk_with_score_function(
-            logits=logits,
+        if precomputed_indices is not None:
+            assert (
+                score_function == "sigmoid"
+            ), "Fused precomputed routing requires sigmoid scoring."
+            # Select all K gathered logits: TE normalizes over exactly QB's chosen experts,
+            # and gather backward returns their gradients to the original semantic experts.
+            fused_logits = logits.gather(1, precomputed_indices)
+            num_groups, group_topk, expert_bias = None, None, None
+        else:
+            fused_logits = logits
+        index_output = {}
+        if dense_output and precomputed_indices is None:
+            index_output["topk_indices"] = torch.empty(
+                (num_tokens, topk), dtype=torch.int64, device=logits.device
+            )
+        probs, routing_map = fused_topk_with_score_function(
+            logits=fused_logits,
             topk=topk,
             use_pre_softmax=use_pre_softmax,
             num_groups=num_groups,
@@ -844,7 +856,15 @@ def topk_routing_with_score_function(
             scaling_factor=scaling_factor,
             score_function=score_function,
             expert_bias=expert_bias,
+            **index_output,
         )
+        if precomputed_indices is not None:
+            if dense_output:
+                return probs, precomputed_indices
+            return dense_routing_from_topk(logits, precomputed_indices, probs)
+        if dense_output:
+            probs = probs.gather(1, routing_map)
+        return probs, routing_map
 
     def _compute_topk(
         scores: torch.Tensor,
@@ -969,14 +989,9 @@ def uses_compact_routes(config) -> bool:
     """Whether the router hands the token dispatcher its compact ``[num_tokens, topk]`` expert ids
     and probabilities instead of the dense ``[num_tokens, num_experts]`` map and probabilities.
 
-    HybridEP's fastest path takes the ids as dense top-k routing and needs only the probabilities
-    dense, so the flex dispatcher's HybridEP backend consumes compact routes whenever nothing
-    downstream needs the dense map: top-k routing (sinkhorn and quantile balancing produce only
-    the map), no fused router (TE's router produces only the map), no token dropping or capacity
-    padding (they act on the map), expert tensor parallelism 1 (the dense path replicates routes
-    across TP ranks) and no uneven-dispatch padding. Virtual-expert load balancing plans from
-    compact routes and always requires them. The router and the dispatcher both read this, so
-    the formats agree by construction.
+    Ordinary HybridEP keeps its dense format with fused or Sinkhorn/quantile routing, token
+    dropping, capacity/uneven padding and expert TP. Virtual-expert planning always requires
+    compact routes and uses TE's newer index-output API for fused top-k routing.
     """
     if config.moe_virtual_expert_load_balance:
         return True

@@ -327,9 +327,20 @@ accumulation in subsequent reductions, also enable
 
 Virtual-expert load balancing supports EP sizes 2–64, up to 8,192 experts evenly divided
 across EP ranks, and top-k from 1 to min(32, number of experts). It does not support
-Sinkhorn/quantile routing or full/whole-MoE recomputation. The load-balancer initializer checks
+Sinkhorn routing or full/whole-MoE recomputation. The load-balancer initializer checks
 the EP/expert layout, dispatcher SM budget and normalized routing/recompute settings before
 allocating resources.
+
+Virtual experts require HybridEP's compact `topk_idx` API alongside dense probabilities;
+the fused TE router must expose its `topk_indices` output buffer. Ordinary HybridEP retains
+its older-build compatibility. The target router uses FP32 sigmoid scores, fusion, top-k 10
+of 512 experts, scaling 2.5, `seq_aux_loss` and expert bias. To use quantile balancing instead,
+set `--moe-router-load-balancing-type quantile_balancing --moe-aux-loss-coeff 0`, omit
+`--moe-router-enable-expert-bias` and disable `--moe-router-force-load-balancing` for real routing.
+Keep `--moe-router-fusion`: QB selects experts using its existing dual update, then TE computes
+fused sigmoid probabilities and gradients over those selected logits. The quantile update itself
+is unchanged. QB requires token-count × top-k divisible by the number of experts and does not
+support padding masks or group-limited routing.
 
 With expert GTP, virtual experts request GTP's persistent wgrad rings automatically during eager
 training. Eager execution and CUDA graphs share the ring allocator and reduce-scatter storage.
