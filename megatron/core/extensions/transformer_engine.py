@@ -165,9 +165,10 @@ class TEQuantizationRecipe:
     If an amax reduction is applicable, such as in per-tensor quantization recipe,
     whether to reduce only along TP groups.
     """
-    fp8_param: bool = False
+    fp8_param: Optional[bool] = None
     """
-    If cast the initialized parameters to fp8 precision and all-gather weights in FP8.
+    Whether to cast initialized parameters to FP8. ``None`` inherits the enclosing
+    model-init context, which lets global first/last-layer BF16 policy take precedence.
     """
     fp4_param: bool = False
     """
@@ -179,6 +180,14 @@ class TEQuantizationRecipe:
         """
         Parse config from quantization dictionary.
         """
+        if "fp8_quantization_recipe" in quant_config and "fp8_param" not in quant_config:
+            warnings.warn(
+                "A Transformer Engine per-module FP8 recipe without 'fp8_param' now "
+                "inherits the enclosing parameter-storage context. Set fp8_param=False "
+                "explicitly to preserve the previous forced-BF16 behavior.",
+                UserWarning,
+                stacklevel=2,
+            )
         kwargs = {}
         class_keys = cls.get_config_keys()
         for field in class_keys:
@@ -260,6 +269,12 @@ def _get_fp8_model_init_for_quant_recipe(qrecipe: TEQuantizationRecipe):
         enabled = False
         quant_recipe = None
     elif qrecipe.fp8_quantization_recipe is not None:
+        if qrecipe.fp8_param is None:
+            # A module execution recipe should not implicitly override the enclosing
+            # parameter-storage policy. This is what lets a selective MXFP8 recipe
+            # inherit global fp8_param in middle layers and the disabled context in
+            # first/last BF16 layers.
+            return nullcontext()
         enabled = qrecipe.fp8_param
         if qrecipe.fp8_format == "e4m3":
             fp8_format = te.common.recipe.Format.E4M3

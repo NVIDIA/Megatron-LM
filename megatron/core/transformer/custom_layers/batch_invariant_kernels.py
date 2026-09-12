@@ -51,6 +51,7 @@ __all__ = [
     "enable_batch_invariant_mode",
     "grouped_gemm_batch_invariant",
     "grouped_gemm_batch_invariant_alignment",
+    "get_unrestricted_te_workspace_size_bytes",
     "assert_te_supports_batch_invariant_attention",
     "te_supports_batch_invariant_attention",
     "HAVE_DEEPGEMM_BF16",
@@ -1660,6 +1661,14 @@ _TE_NATIVE_WORKSPACE_BYTES = 1024
 # Originals saved by _enable_te_native_workspace_starvation for restoration.
 _TE_WORKSPACE_SIZE_FN_ORIG = None
 _TE_NATIVE_ENV_ORIG: dict = {}
+
+
+def get_unrestricted_te_workspace_size_bytes() -> int:
+    """Return TE's normal workspace size even while te_native starvation is active."""
+    import transformer_engine.pytorch.cpp_extensions.gemm as te_gemm
+
+    workspace_size_fn = _TE_WORKSPACE_SIZE_FN_ORIG or te_gemm.get_cublas_workspace_size_bytes
+    return workspace_size_fn()
 
 
 def _enable_te_native_workspace_starvation(workspace_bytes: int = _TE_NATIVE_WORKSPACE_BYTES):
