@@ -140,6 +140,15 @@ class MegatronCheckpointLoaderBase:
             sys.exit(1)
 
         set_global_variables(self.margs, build_tokenizer=self.build_tokenizer)
+
+        # Initialize torch.distributed with a minimal single-process backend so that
+        # dist_checkpointing (which calls torch.distributed.get_world_size()) has a
+        # default process group to query when loading torch_dist checkpoints.
+        if not torch.distributed.is_initialized():
+            os.environ.setdefault('MASTER_ADDR', 'localhost')
+            os.environ.setdefault('MASTER_PORT', '12356')
+            torch.distributed.init_process_group(backend='gloo', rank=0, world_size=1)
+
         mpu.set_tensor_model_parallel_world_size(self.margs.tensor_model_parallel_size)
         mpu.set_pipeline_model_parallel_world_size(self.margs.pipeline_model_parallel_size)
         mpu.set_virtual_pipeline_model_parallel_world_size(self.margs.virtual_pipeline_model_parallel_size)
