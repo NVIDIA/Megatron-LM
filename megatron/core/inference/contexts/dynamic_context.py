@@ -754,10 +754,15 @@ class DynamicInferenceContext(BaseInferenceContext):
             and model_config.inference_moe_token_dispatcher_type == 'nccl'
         )
 
-        # are we using the inference_optimized nvls ep dispatcher for MoEs?
-        self._nvls_dispatcher = (
-            get_pg_size(self.expert_model_parallel_group) > 1
+        # Does the model construct the inference-optimized NVLS dispatcher? Unlike
+        # the communication-buffer predicate below, this remains true at EP=1.
+        self._uses_nvls_dispatcher = (
+            model_config.transformer_impl == "inference_optimized"
+            and model_config.num_moe_experts is not None
             and model_config.inference_moe_token_dispatcher_type == 'nvls'
+        )
+        self._nvls_dispatcher = (
+            get_pg_size(self.expert_model_parallel_group) > 1 and self._uses_nvls_dispatcher
         )
 
         # are we using the training a2a dispatcher for MoEs?
@@ -876,14 +881,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.is_tensor_state_allocated = False
         self._bookkeeping_no_real_work = False
         self.initialize_all_tensors()
-
-        # Bind the GPU real-token-count tensor onto the NVLS dispatcher class
-        # so it can mask out CUDA-graph padding tokens during routing. The
-        # tensor lives inside gpu_view._buf (fixed address) and is refreshed
-        # each step by transfer_bookkeeping_to_gpu(). NVLS-only — the NCCL
-        # dispatcher requires equal token counts across ranks already.
-        if self._nvls_dispatcher:
-            NVLSAllGatherVDispatcher.set_real_token_count_tensor(self.gpu_view.real_token_count)
 
         # Print info.
         pool_size = self.kv_block_allocator.pool_size
@@ -1495,6 +1492,12 @@ class DynamicInferenceContext(BaseInferenceContext):
                 self._mamba_decode_indices_dtype if self.is_hybrid_model else torch.int64
             ),
         )
+        # Bind after every ContextGPUView allocation, including RECOMPUTE resume.
+        # The tensor lives inside gpu_view._buf (fixed address) and is refreshed
+        # each step by transfer_bookkeeping_to_gpu(). EP=1 still constructs the
+        # NVLS dispatcher even though it does not allocate communication buffers.
+        if self._uses_nvls_dispatcher:
+            NVLSAllGatherVDispatcher.set_real_token_count_tensor(self.gpu_view.real_token_count)
         self._bookkeeping_h2d_done_event = torch.cuda.Event()
 
         # Cache of (input_ids_view, pos_ids_view) keyed by num_tokens. Instead of slicing and
@@ -3474,10 +3477,10 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.token_to_block_idx[
             self.active_token_count : self.active_token_count + effective_prefill_chunk_length
         ] = self.request_to_kv_block_ids[current_id][token_offset_range // self.block_size_tokens]
-        if num_matched_blocks > 0:
-            # Some tokens we are about to compute may land inside a block we matched
-            # by hash. That block already holds the correct KV for exactly these
-            # tokens and is shared with whoever cached it, so send those writes to the
+        if num_matched_blocks > 0 or req.num_matched_prefix_blocks > 0:
+            # Some tokens we are about to compute may land inside a block this or an
+            # earlier chunk matched by hash. That block already holds the correct KV
+            # for exactly these tokens and is shared with whoever cached it, so send those writes to the
             # dummy block rather than perturb a concurrent reader's values.
             #
             # Only the write mapping moves. `request_to_kv_block_ids` still points at

@@ -1335,12 +1335,14 @@ class TransformerConfig(ModelParallelConfig):
     """
 
     inference_moe_token_dispatcher_type: Literal['nccl', 'nvls'] = 'nvls'
-    """Token dispatcher to use for MoE expert parallelism during inference.
+    """Token dispatcher to use for inference-optimized MoE layers.
     - 'nccl': AllGather/ReduceScatter via NCCL. Fixed token counts per rank; requires
       decode-only CUDA graphs (forced automatically).
     - 'nvls': Variable-count AllGather-V/ReduceScatter-V via NVLS multimem kernels.
-      Requires Hopper+ GPUs with NVLink and symmetric memory. Default.
-    Only applies when transformer_impl='inference_optimized' and EP > 1."""
+      With EP > 1, requires Hopper+ GPUs with NVLink and symmetric memory. Default.
+    With EP = 1, the selected dispatcher still handles local routing and valid-token
+    metadata, but does not allocate communication buffers. Only applies when
+    transformer_impl='inference_optimized'."""
 
     mrope_section: Optional[List[int]] = None
     """ Multimodal rope section is for channel dimension of temporal, height and width

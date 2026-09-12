@@ -1788,6 +1788,43 @@ def test_async_generate_output_tokens_dynamic_batch_assertions(mode, expected_me
         asyncio.run(controller.async_generate_output_tokens_dynamic_batch(skip_bookkeeping=True))
 
 
+def test_ep1_nvls_mtp_overrides_main_forward_real_token_count(monkeypatch):
+    """MTP refreshes NVLS routing metadata when EP=1 has no communication buffers."""
+    controller = object.__new__(TextGenerationController)
+    context = SimpleNamespace(
+        total_request_count=2,
+        paused_request_count=0,
+        mtp_decoder_hidden_states=None,
+        _uses_nvls_dispatcher=True,
+        _nvls_dispatcher=False,
+        inference_cuda_graph_scope=InferenceCudaGraphScope.none,
+    )
+    controller.inference_wrapped_model = SimpleNamespace(inference_context=context)
+    controller._unwrapped_model = SimpleNamespace()
+    controller._is_last_pp_stage = False
+    controller._sp_enabled = False
+    controller._mtp_resolved_padded_count = None
+    controller._sampled_tokens_cuda = torch.tensor([10, 11])
+    controller._sampled_mtp_tokens_cuda = torch.empty((1, 2), dtype=torch.int64)
+    controller._mtp_token_ids_buf = torch.empty((1, 2), dtype=torch.int64)
+    controller._mtp_position_ids_buf = torch.empty((1, 2), dtype=torch.int64)
+    controller.num_mtp_depths = 1
+    controller.model_is_pipeline_parallel = False
+    controller._sample_from_logits_2d = mock.Mock(return_value=torch.tensor([12, 13]))
+
+    mtp_mixin_module = "megatron.core.inference.text_generation_controllers.mtp_inference_mixin"
+    modify_count = mock.Mock()
+    monkeypatch.setattr(f"{mtp_mixin_module}.nvtx_range_push", lambda *_: None)
+    monkeypatch.setattr(f"{mtp_mixin_module}.nvtx_range_pop", lambda *_: None)
+    monkeypatch.setattr(
+        f"{mtp_mixin_module}.NVLSAllGatherVDispatcher.modify_real_token_count_for_mtp", modify_count
+    )
+
+    controller._compute_serial_mtp_and_sample(base_position=torch.tensor([5, 7]))
+
+    modify_count.assert_called_once_with(2)
+
+
 class TestTextGenerationController(TextGenerationControllerTestBase):
 
     @classmethod

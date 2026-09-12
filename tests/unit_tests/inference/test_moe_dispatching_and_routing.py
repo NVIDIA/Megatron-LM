@@ -944,3 +944,89 @@ class TestMaskRoutingPadding:
         mask_routing_padding(routing_map, self._real_token_count(8), tp_rank=1)
 
         assert torch.all(routing_map == -1)
+
+    @pytest.mark.parametrize(
+        "sp_size,sp_rank,n_rows,real_count,expected_local_count",
+        [(1, 0, 16, 9, 9), (2, 0, 8, 11, 8), (2, 1, 8, 11, 3)],
+    )
+    def test_ep1_nvls_dispatch_uses_real_token_count(
+        self, sp_size, sp_rank, n_rows, real_count, expected_local_count
+    ):
+        """EP=1 reports and routes only real rows, including SP-sharded inputs."""
+        from megatron.core.transformer.moe.token_dispatcher_inference import (
+            InferenceAllGatherDispatcherBase,
+            NVLSAllGatherVDispatcher,
+        )
+
+        dispatcher = object.__new__(NVLSAllGatherVDispatcher)
+        dispatcher.ep_size = 1
+        dispatcher.sp_size = sp_size
+        dispatcher.sp_rank = sp_rank
+        dispatcher._runs_metadata_sync = True
+        dispatcher.routing_map = self._routing_map(n_rows)
+        original = dispatcher.routing_map.clone()
+        real_token_count_tensor = self._real_token_count(real_count)
+
+        previous_real_count = NVLSAllGatherVDispatcher._real_token_count_tensor
+        previous_valid_tokens = InferenceAllGatherDispatcherBase._valid_tokens_tensor
+        try:
+            InferenceAllGatherDispatcherBase.allocate_valid_tokens_tensor()
+            NVLSAllGatherVDispatcher.set_real_token_count_tensor(real_token_count_tensor)
+            hidden_states = torch.zeros((n_rows, 8), dtype=torch.bfloat16, device="cuda")
+            probs = torch.zeros((n_rows, self.TOPK), dtype=torch.float32, device="cuda")
+
+            dispatched_hidden, dispatched_probs = dispatcher.token_dispatch(hidden_states, probs)
+            torch.cuda.synchronize()
+
+            assert dispatched_hidden is hidden_states
+            assert dispatched_probs is probs
+            assert (
+                InferenceAllGatherDispatcherBase._valid_tokens_tensor.item() == expected_local_count
+            )
+            torch.testing.assert_close(
+                dispatcher.routing_map[:expected_local_count], original[:expected_local_count]
+            )
+            assert torch.all(dispatcher.routing_map[expected_local_count:] == -1)
+        finally:
+            NVLSAllGatherVDispatcher._real_token_count_tensor = previous_real_count
+            InferenceAllGatherDispatcherBase._valid_tokens_tensor = previous_valid_tokens
+
+    def test_ep1_nvls_dispatch_replays_with_new_real_token_count(self):
+        """CUDA graph replay reads the current real-token count from its stable GPU address."""
+        from megatron.core.transformer.moe.token_dispatcher_inference import (
+            InferenceAllGatherDispatcherBase,
+            NVLSAllGatherVDispatcher,
+        )
+
+        n_rows = 16
+        dispatcher = object.__new__(NVLSAllGatherVDispatcher)
+        dispatcher.ep_size = 1
+        dispatcher.sp_size = 1
+        dispatcher.sp_rank = 0
+        dispatcher._runs_metadata_sync = True
+        dispatcher.routing_map = self._routing_map(n_rows)
+        real_token_count_tensor = self._real_token_count(n_rows)
+        hidden_states = torch.zeros((n_rows, 8), dtype=torch.bfloat16, device="cuda")
+        probs = torch.zeros((n_rows, self.TOPK), dtype=torch.float32, device="cuda")
+
+        previous_real_count = NVLSAllGatherVDispatcher._real_token_count_tensor
+        previous_valid_tokens = InferenceAllGatherDispatcherBase._valid_tokens_tensor
+        try:
+            InferenceAllGatherDispatcherBase.allocate_valid_tokens_tensor()
+            NVLSAllGatherVDispatcher.set_real_token_count_tensor(real_token_count_tensor)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                dispatcher.token_dispatch(hidden_states, probs)
+
+            for real_count in (9, 13):
+                real_token_count_tensor.fill_(real_count)
+                dispatcher.routing_map.fill_(3)
+                graph.replay()
+                torch.cuda.synchronize()
+
+                assert InferenceAllGatherDispatcherBase._valid_tokens_tensor.item() == real_count
+                assert torch.all(dispatcher.routing_map[:real_count] == 3)
+                assert torch.all(dispatcher.routing_map[real_count:] == -1)
+        finally:
+            NVLSAllGatherVDispatcher._real_token_count_tensor = previous_real_count
+            InferenceAllGatherDispatcherBase._valid_tokens_tensor = previous_valid_tokens

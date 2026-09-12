@@ -195,7 +195,7 @@ class MTPInferenceMixin:
         # active_request_count real rows followed by padding up to padded_count.
         # The NVLS routing mask defaults to the main step's token count, so point
         # it at the MTP row count instead, else padding rows route to experts.
-        if context._nvls_dispatcher:
+        if context._uses_nvls_dispatcher:
             NVLSAllGatherVDispatcher.modify_real_token_count_for_mtp(active_request_count)
 
         for depth in range(self.num_mtp_depths):
