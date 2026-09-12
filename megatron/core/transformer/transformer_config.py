@@ -1411,6 +1411,14 @@ class TransformerConfig(ModelParallelConfig):
     """Transformer implementation to use.
     Options are 'transformer_engine' for Transformer Engine and 'local' for MCore."""
 
+    buffer_transformer_engine_calibration_metadata: bool = False
+    """If True, enable Transformer Engine calibration and buffer input and weight scaling
+    factors for export to inference engines."""
+
+    transformer_engine_calibration_decay: float = 0.0
+    """Decay applied to buffered activation scaling factors before each update. Defaults to 0.0,
+    in which case only the most recent scaling factor is buffered."""
+
     #####################################
     # Fine-grained Activation Offloading
     #####################################
