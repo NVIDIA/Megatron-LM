@@ -45,6 +45,46 @@ def test_initialization(mock_optimizer):
     assert scheduler.wd_incr_style == 'linear'
 
 
+def _make_scheduler(mock_optimizer, **overrides):
+    kwargs = dict(
+        optimizer=mock_optimizer,
+        init_lr=0.01,
+        max_lr=0.1,
+        min_lr=0.001,
+        lr_warmup_steps=100,
+        lr_decay_steps=1000,
+        lr_decay_style='linear',
+        start_wd=0.0,
+        end_wd=0.1,
+        wd_incr_steps=1000,
+        wd_incr_style='linear',
+    )
+    kwargs.update(overrides)
+    return OptimizerParamScheduler(**kwargs)
+
+
+@pytest.mark.parametrize(
+    ('overrides', 'match'),
+    [
+        ({'lr_decay_steps': 0}, r'lr_decay_steps must be > 0, got 0'),
+        (
+            {'lr_warmup_steps': 1000, 'lr_decay_steps': 1000},
+            r'lr_warmup_steps \(1000\) must be < lr_decay_steps \(1000\)',
+        ),
+        ({'min_lr': -0.001}, r'min_lr must be >= 0.0, got -0.001'),
+        ({'max_lr': 0.0005}, r'max_lr \(0.0005\) must be >= min_lr \(0.001\)'),
+        ({'init_lr': 0.2}, r'init_lr \(0.2\) must be <= max_lr \(0.1\)'),
+        ({'start_wd': -0.1}, r'start_wd must be >= 0.0, got -0.1'),
+        ({'end_wd': -0.1, 'start_wd': 0.0}, r'end_wd \(-0.1\) must be >= start_wd \(0.0\)'),
+        ({'lr_decay_style': 'WSD', 'wsd_decay_steps': None}, r'wsd_decay_steps must be provided'),
+    ],
+)
+def test_invalid_config_error_messages(mock_optimizer, overrides, match):
+    """Invalid scheduler configs fail with a message naming the offending values."""
+    with pytest.raises(AssertionError, match=match):
+        _make_scheduler(mock_optimizer, **overrides)
+
+
 def test_get_wd_constant(mock_optimizer):
     scheduler = OptimizerParamScheduler(
         optimizer=mock_optimizer,
