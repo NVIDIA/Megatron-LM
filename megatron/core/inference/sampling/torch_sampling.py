@@ -15,7 +15,7 @@ from megatron.core.inference.sampling_params import (
 
 
 class TorchSampling(Sampling):
-    """Sampling via bucketed `torch.multinomial`.
+    """Sampling via a bucketed Gumbel-max (exponential-race) draw.
 
     Groups requests into unique buckets by `(temperature, top_k, top_p)` for separate launches.
     """
@@ -34,7 +34,7 @@ class TorchSampling(Sampling):
     def _modify_logits_for_top_p_filtering(logits: Tensor, top_p: float) -> None:
         """In-place: set logits outside the top-p (nucleus) set to -inf."""
         sorted_logits, sorted_indices = torch.sort(logits, descending=True)
-        cumulative_probs = sorted_logits.softmax(dim=-1).cumsum(dim=-1)
+        cumulative_probs = sorted_logits.softmax(dim=-1, dtype=torch.float32).cumsum(dim=-1)
 
         filter_ = cumulative_probs > top_p
         # Clone needed: filter_[:, 1:] and filter_[:, :-1] are overlapping views;
@@ -111,8 +111,18 @@ class TorchSampling(Sampling):
         filtered = TorchSampling.filter_logits(
             last_token_logits, temperature, top_k, top_p, vocab_size=vocab_size
         )
-        probabilities = filtered.softmax(dim=-1)
-        sampled = torch.multinomial(probabilities, num_samples=1, generator=generator).view(-1)
+        probabilities = filtered.softmax(dim=-1, dtype=torch.float32)
+        # Gumbel-max in exponential form: draw q ~ Exp(1) per vocabulary entry and
+        # take argmax(p / q). Distributionally identical to `torch.multinomial`,
+        # but it never forms a cumulative sum, so the low-probability tail is not
+        # eroded by the rounding an inverse-CDF walk accumulates across a 100k+
+        # vocabulary. Matches vLLM's sampler
+        # (`vllm/v1/sample/ops/topk_topp_sampler.py::random_sample`), which keeps
+        # the two engines' sampling paths aligned; vLLM also uses it to avoid the
+        # CPU-GPU sync that `torch.multinomial` incurs.
+        q = torch.empty_like(probabilities)
+        q.exponential_(generator=generator)
+        sampled = probabilities.div_(q).argmax(dim=-1).view(-1)
 
         if vocab_size:
             sampled = torch.clamp(sampled, min=0, max=(vocab_size - 1))
@@ -161,7 +171,7 @@ class TorchSampling(Sampling):
             filtered = TorchSampling.filter_logits(
                 logits[idx], float(t), int(k), float(p), vocab_size=self._vocab_size
             )
-            log_probs[idx] = torch.log_softmax(filtered, dim=-1)
+            log_probs[idx] = torch.log_softmax(filtered, dim=-1, dtype=torch.float32)
         return log_probs
 
     def sample_kernel(
