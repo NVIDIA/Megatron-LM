@@ -990,11 +990,13 @@ class TestSinglePassMHC:
         return tuple(value.to(hidden.dtype) if legacy else value for value in (pre, post, comb))
 
     def _reference_contract(self, hidden, pre, n):
-        streams = hidden.reshape(*hidden.shape[:-1], n, -1).float()
+        streams = hidden.reshape(*hidden.shape[:-1], n, hidden.shape[-1] // n).float()
         return (streams * pre.unsqueeze(-1)).sum(dim=-2).to(hidden.dtype)
 
     def _reference_merge(self, hidden, output, post, comb, bias=None):
-        streams = hidden.reshape(*hidden.shape[:-1], post.shape[-1], -1).float()
+        streams = hidden.reshape(
+            *hidden.shape[:-1], post.shape[-1], hidden.shape[-1] // post.shape[-1]
+        ).float()
         # comb[i, j] routes residual stream i into output stream j.
         mixed = (comb.unsqueeze(-1) * streams.unsqueeze(-2)).sum(dim=-3)
         expanded = output.float() if bias is None else output.float() + bias.float()
@@ -1096,8 +1098,26 @@ class TestSinglePassMHC:
         for actual_grad, expected_grad in zip(actual_grads, expected_grads):
             torch.testing.assert_close(actual_grad, expected_grad, atol=2e-5, rtol=2e-5)
 
-    def _run_chain(self, modules, hidden, *, reference=False):
+    @staticmethod
+    def _reference_dsv4_contract(hidden, pre, n):
+        streams = hidden.unflatten(-1, (n, hidden.shape[-1] // n))
+        return (streams * pre.to(hidden.dtype).unsqueeze(-1)).sum(-2)
+
+    @staticmethod
+    def _reference_dsv4_merge(hidden, output, post, comb, bias=None):
+        s, b, C = output.shape
+        n = post.shape[-1]
+        streams = hidden.reshape(s * b, n, C)
+        mixed = torch.bmm(comb.reshape(s * b, n, n).transpose(1, 2), streams).reshape(s, b, n, C)
+        expanded = post.unsqueeze(-1) * output.unsqueeze(-2)
+        if bias is not None:
+            expanded = expanded + post.unsqueeze(-1) * bias
+        return (expanded + mixed).flatten(-2)
+
+    def _run_chain(self, modules, hidden, *, reference=False, dsv4_mixing=False):
         state = SinglePassMHCState()
+        contract = self._reference_dsv4_contract if dsv4_mixing else self._reference_contract
+        merge = self._reference_dsv4_merge if dsv4_mixing else self._reference_merge
         previous = torch.zeros(
             *hidden.shape[:-1], modules[0].n, device=hidden.device, dtype=torch.float32
         )
@@ -1106,7 +1126,9 @@ class TestSinglePassMHC:
         for index, module in enumerate(modules):
             if reference:
                 pre, post, comb = self._reference_mappings(module, hidden)
-                aggregated = self._reference_contract(hidden, previous, module.n)
+                if dsv4_mixing:
+                    pre, post, comb = (value.to(hidden.dtype) for value in (pre, post, comb))
+                aggregated = contract(hidden, previous, module.n)
                 residual = hidden
             else:
                 aggregated, comb, post, residual = module(hidden, mhc_state=state)
@@ -1115,7 +1137,7 @@ class TestSinglePassMHC:
             # recurrence; production attention and FFN are exercised separately below.
             output = torch.tanh(aggregated.float() * (0.2 + 0.07 * index)).to(hidden.dtype)
             if reference:
-                hidden = self._reference_merge(residual, output, post, comb)
+                hidden = merge(residual, output, post, comb)
             else:
                 hidden = module.fused_h_res_h_post_bda(
                     comb, residual, post, (output, None), 0.0, True, False
@@ -1124,9 +1146,9 @@ class TestSinglePassMHC:
             pre_mixes.append(pre)
             previous = pre
         contracted = (
-            self._reference_contract(hidden, previous, modules[-1].n)
+            contract(hidden, previous, modules[-1].n)
             if reference
-            else state.contract(hidden, modules[-1].n)
+            else state.contract(hidden, modules[-1].n, use_fused=modules[-1].config.use_fused_mhc)
         )
         return contracted, pre_mixes
 
@@ -1187,7 +1209,7 @@ class TestSinglePassMHC:
         assert post.dtype == comb.dtype == dtype
         torch.testing.assert_close(residual, hidden, atol=0, rtol=0)
 
-    def _build_single_pass_stack(self, stack_kind, pg_collection, version):
+    def _build_single_pass_stack(self, stack_kind, pg_collection, version, use_fused=False):
         from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
             get_transformer_block_with_experimental_attention_variant_spec,
         )
@@ -1221,6 +1243,7 @@ class TestSinglePassMHC:
         config = _make_config(
             dsv4_version=version,
             mhc_single_pass=True,
+            use_fused_mhc=use_fused,
             num_layers=layers,
             num_moe_experts=None,
             moe_ffn_hidden_size=None,
@@ -1257,11 +1280,12 @@ class TestSinglePassMHC:
     @pytest.mark.skipif(not HAVE_TE, reason="Transformer Engine is not installed")
     @pytest.mark.parametrize("stack_kind", ["transformer", "hybrid"])
     @pytest.mark.parametrize("version", ["v4", "v4.1"])
+    @pytest.mark.parametrize("use_fused", [False, True])
     def test_production_stack_shift_final_contract_and_live_forward_graphs(
-        self, pg_collection, monkeypatch, stack_kind, version
+        self, pg_collection, monkeypatch, stack_kind, version, use_fused
     ):
         """Both existing DSv4 stacks carry one local state and contract the final live pre."""
-        stack = self._build_single_pass_stack(stack_kind, pg_collection, version)
+        stack = self._build_single_pass_stack(stack_kind, pg_collection, version, use_fused)
         assert not any("hc_head_" in name for name, _ in stack.named_parameters())
         assert not any("hc_head_" in name for name in stack.state_dict())
         records = []
@@ -1284,8 +1308,9 @@ class TestSinglePassMHC:
             records.append((module, state, previous, state.pre_mix))
             return result
 
-        def observe_contract(state, hidden_states, n):
-            result = original_contract(state, hidden_states, n)
+        def observe_contract(state, hidden_states, n, **kwargs):
+            assert kwargs.get("use_fused", False) is use_fused
+            result = original_contract(state, hidden_states, n, **kwargs)
             final_contracts.append((state, hidden_states, state.pre_mix, result))
             return result
 
@@ -1338,6 +1363,216 @@ class TestSinglePassMHC:
         for module in stack.modules():
             assert not any(isinstance(value, SinglePassMHCState) for value in vars(module).values())
 
+    @staticmethod
+    def _assert_fused_close(actual, expected, tolerance):
+        """Use a scale-relative RMS bound, including tiny inputs and BF16 gradients."""
+        assert actual.dtype == expected.dtype
+        assert torch.isfinite(actual).all()
+        if actual.numel() == 0:
+            assert actual.shape == expected.shape
+            return
+        difference = (actual.double() - expected.double()).square().mean().sqrt()
+        scale = expected.double().abs().max().clamp_min(1e-30)
+        assert difference / scale < tolerance, (difference.item(), scale.item(), tolerance)
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+    @pytest.mark.parametrize("amplitude,eps", [(1.0, 1e-4), (1e-12, 1e-20), (0.0, 1e-20)])
+    @pytest.mark.parametrize("outputs_used", ["all", "pre", "r"])
+    @pytest.mark.parametrize("hidden_size", [32, 2048])
+    def test_fused_regularized_rms_values_and_gradients(
+        self, device, dtype, amplitude, eps, outputs_used, hidden_size
+    ):
+        """Check regularized RMS, its external gradient, and unused mapping outputs."""
+        from megatron.core.fusions.fused_mhc_kernels import fused_proj_rms_compute_h
+
+        torch.manual_seed(2210)
+        module = self._module(
+            device, use_fused_mhc=True, layernorm_epsilon=eps, hidden_size=hidden_size
+        )
+        with torch.no_grad():
+            module.mapping_proj.weight.mul_((32 / hidden_size) ** 0.5)
+        n, K = module.n, module.n * module.hidden_size
+        # Six rows exercise padded scalar reductions; K=8192 also selects the
+        # split-K projection and the large-K input/weight gradient kernel.
+        x = (torch.randn(6, K, device=device) * amplitude).to(dtype).requires_grad_()
+        ref_x = x.detach().clone().requires_grad_()
+        parameters = (
+            module.mapping_proj.weight,
+            module.alpha_pre,
+            module.alpha_post,
+            module.alpha_res,
+            module.bias,
+        )
+        actual = fused_proj_rms_compute_h(
+            x, *parameters, n, eps, module.compute_h_eps, eps_inside_sqrt=True
+        )
+        weight, ap, apo, ar, bias = parameters
+        r = (ref_x.float().square().mean(-1, keepdim=True) + eps).sqrt()
+        projection = F.linear(ref_x.float(), weight) / r
+        expected = (
+            (projection[:, :n] * ap + bias[:n]).sigmoid() + module.compute_h_eps,
+            (projection[:, n : 2 * n] * apo + bias[n : 2 * n]).sigmoid() * 2,
+            projection[:, 2 * n :] * ar + bias[2 * n :],
+            r,
+        )
+        for index, (value, reference) in enumerate(zip(actual, expected)):
+            self._assert_fused_close(value, reference, 1e-5 if index == 3 else 1e-4)
+        indices = range(4) if outputs_used == "all" else [0 if outputs_used == "pre" else 3]
+        probes = [torch.randn_like(expected[index]) for index in indices]
+        actual_grads = torch.autograd.grad(
+            sum((actual[index] * probe).sum() for index, probe in zip(indices, probes)),
+            (x, *parameters),
+            allow_unused=True,
+        )
+        expected_grads = torch.autograd.grad(
+            sum((expected[index] * probe).sum() for index, probe in zip(indices, probes)),
+            (ref_x, *parameters),
+            allow_unused=True,
+        )
+        for value, reference, parameter in zip(actual_grads, expected_grads, (x, *parameters)):
+            value = torch.zeros_like(parameter) if value is None else value
+            reference = torch.zeros_like(parameter) if reference is None else reference
+            self._assert_fused_close(
+                value, reference, 2e-3 if value.dtype == torch.bfloat16 else 5e-4
+            )
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+    @pytest.mark.parametrize("with_bias", [False, True])
+    def test_fused_mixing_uses_dsv4_dtypes(self, device, dtype, with_bias, monkeypatch):
+        """Use activation-dtype coefficients with the existing DSv4 mixing operators."""
+        from megatron.core.fusions import fused_mhc_kernels
+
+        torch.manual_seed(2211)
+        module = self._module(device, use_fused_mhc=True)
+        hidden = torch.randn(3, 2, 128, device=device, dtype=dtype, requires_grad=True)
+        x = torch.randn(3, 2, 32, device=device, dtype=dtype, requires_grad=True)
+        previous = torch.randn(3, 2, 4, device=device, dtype=dtype, requires_grad=True)
+        bias = (
+            torch.randn(32, device=device, dtype=dtype, requires_grad=True) if with_bias else None
+        )
+        state = SinglePassMHCState(previous)
+        aggregated, comb, post, residual = module(hidden, mhc_state=state)
+        assert state.pre_mix.dtype == comb.dtype == post.dtype == dtype
+        assert all(parameter.dtype == torch.float32 for parameter in module.parameters())
+        post_calls = []
+        original_post = fused_mhc_kernels.fused_h_post_bda
+
+        def observe_post(comb, streams, post, x, bias):
+            assert comb.dtype == streams.dtype == post.dtype == x.dtype == dtype
+            if bias is not None:
+                assert bias.dtype == dtype
+            post_calls.append(x.shape)
+            return original_post(comb, streams, post, x, bias)
+
+        monkeypatch.setattr(module, "_h_post_bda_op", observe_post)
+        output = module.fused_h_res_h_post_bda(comb, residual, post, (x, bias), 0.0, True, False)
+        assert len(post_calls) == 1
+        assert aggregated.dtype == output.dtype == dtype
+        # Use the DSv4 native expression, including activation-dtype rounding.
+        expected_aggregate = self._reference_dsv4_contract(hidden, previous, 4)
+        expected_output = self._reference_dsv4_merge(hidden, x, post, comb, bias)
+        tolerance = 2e-2 if dtype == torch.bfloat16 else 2e-6
+        torch.testing.assert_close(aggregated, expected_aggregate, atol=tolerance, rtol=tolerance)
+        torch.testing.assert_close(output, expected_output, atol=tolerance, rtol=tolerance)
+        final = state.contract(output, 4, use_fused=True)
+        inputs = (hidden, x, previous, *module.parameters()) + ((bias,) if with_bias else ())
+        grads = torch.autograd.grad(
+            (final, aggregated), inputs, (torch.randn_like(final), torch.randn_like(aggregated))
+        )
+        for value, parameter in zip(grads, inputs):
+            assert value.dtype == parameter.dtype and torch.isfinite(value).all()
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+    @pytest.mark.parametrize("batch_size", [1, 2])
+    def test_fused_single_pass_chain_and_final_mix(self, device, dtype, batch_size, monkeypatch):
+        """Check SBHD/THD-shaped recurrence and gradients through all shifted pre maps."""
+        from megatron.core.fusions import fused_mhc_kernels
+
+        torch.manual_seed(2212)
+        modules = [self._module(device, use_fused_mhc=True) for _ in range(4)]
+        calls = []
+        grad_sum_calls = []
+        aggregate_calls = []
+        original_aggregate = fused_mhc_kernels.fused_h_aggregate
+
+        def observe_aggregate(x, pre):
+            assert pre.dtype == x.dtype == dtype
+            aggregate_calls.append(pre)
+            return original_aggregate(x, pre)
+
+        monkeypatch.setattr(fused_mhc_kernels, "fused_h_aggregate", observe_aggregate)
+        for module in modules:
+            original = module._proj_rms_compute_h_op
+            original_grad_sum = module._fused_add_3_op
+
+            def observe_projection(x, *args, _original=original, **kwargs):
+                assert x.dtype == dtype
+                assert kwargs["eps_inside_sqrt"]
+                calls.append(x.shape)
+                return _original(x, *args, **kwargs)
+
+            monkeypatch.setattr(module, "_proj_rms_compute_h_op", observe_projection)
+
+            def observe_grad_sum(*grads, _original=original_grad_sum):
+                grad_sum_calls.append(tuple(grad.shape for grad in grads))
+                return _original(*grads)
+
+            monkeypatch.setattr(module, "_fused_add_3_op", observe_grad_sum)
+        hidden = torch.randn(7, batch_size, 128, device=device, dtype=dtype, requires_grad=True)
+        ref_hidden = hidden.detach().clone().requires_grad_()
+        actual, actual_pre = self._run_chain(modules, hidden)
+        expected, expected_pre = self._run_chain(
+            modules, ref_hidden, reference=True, dsv4_mixing=True
+        )
+        assert len(calls) == len(modules)
+        # Three shifted contractions plus the last FFN's contraction at stack exit.
+        assert len(aggregate_calls) == len(modules)
+        assert all(used is predicted for used, predicted in zip(aggregate_calls, actual_pre))
+        self._assert_fused_close(actual, expected, 2e-2 if dtype == torch.bfloat16 else 3e-4)
+        parameters = tuple(parameter for module in modules for parameter in module.parameters())
+        probe = torch.randn_like(actual)
+        actual_grads = torch.autograd.grad((actual * probe).sum(), (hidden, *parameters))
+        assert len(grad_sum_calls) == len(modules)
+        expected_grads = torch.autograd.grad((expected * probe).sum(), (ref_hidden, *parameters))
+        for value, reference in zip(actual_grads, expected_grads):
+            if dtype == torch.bfloat16:
+                # Existing DSv4 kernels round intermediates differently from eager Torch.
+                torch.testing.assert_close(value, reference, atol=5e-2, rtol=5e-2)
+            else:
+                self._assert_fused_close(value, reference, 8e-4)
+        for value, reference in zip(actual_pre, expected_pre):
+            assert value.grad is not None and value.grad.abs().sum() > 0
+            if dtype == torch.bfloat16:
+                torch.testing.assert_close(value.grad, reference.grad, atol=5e-2, rtol=5e-2)
+            else:
+                self._assert_fused_close(value.grad, reference.grad, 8e-4)
+
+    def test_fused_post_dropout_keeps_native_branch_mask(self, device, monkeypatch):
+        """Training dropout masks only the expanded branch, leaving residual mixing intact."""
+        torch.manual_seed(2213)
+        module = self._module(device, use_fused_mhc=True)
+        hidden = torch.randn(3, 2, 128, device=device, requires_grad=True)
+        x = torch.randn(3, 2, 32, device=device, requires_grad=True)
+        _, post, comb = self._reference_mappings(module, hidden)
+
+        def unexpected_fused_post(*args):
+            raise AssertionError("The no-dropout kernel cannot apply training dropout")
+
+        monkeypatch.setattr(module, "_h_post_bda_op", unexpected_fused_post)
+        torch.manual_seed(2214)
+        actual = module.fused_h_res_h_post_bda(comb, hidden, post, (x, None), 0.3, True, False)
+        streams = hidden.unflatten(-1, (4, 32))
+        mixed = (comb.unsqueeze(-1) * streams.unsqueeze(-2)).sum(-3)
+        torch.manual_seed(2214)
+        expected = (mixed + F.dropout(post.unsqueeze(-1) * x.unsqueeze(-2), p=0.3)).flatten(-2)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        probe = torch.randn_like(actual)
+        inputs = (hidden, x, post, comb)
+        actual_grads = torch.autograd.grad(actual, inputs, probe, retain_graph=True)
+        expected_grads = torch.autograd.grad(expected, inputs, probe)
+        for value, reference in zip(actual_grads, expected_grads):
+            torch.testing.assert_close(value, reference, rtol=0, atol=0)
+
     @pytest.mark.parametrize("enabled", [False, True])
     def test_single_pass_cli_roundtrip_without_attention_version(self, enabled):
         """The CLI switch works independently of any experimental attention variant."""
@@ -1363,7 +1598,14 @@ class TestSinglePassMHC:
         "overrides, message",
         [
             ({"enable_hyper_connections": False}, "requires enable_hyper_connections=True"),
-            ({"use_fused_mhc": True}, "requires use_fused_mhc=False"),
+            (
+                {
+                    "recompute_granularity": "full",
+                    "recompute_method": "uniform",
+                    "recompute_num_layers": 1,
+                },
+                "activation recomputation",
+            ),
         ],
     )
     def test_single_pass_validates_its_own_prerequisites(self, overrides, message):

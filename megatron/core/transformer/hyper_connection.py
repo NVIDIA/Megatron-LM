@@ -47,12 +47,12 @@ class SinglePassMHCState:
 
     pre_mix: Tensor | None = None
 
-    def contract(self, hidden_states: Tensor, n: int) -> Tensor:
+    def contract(self, hidden_states: Tensor, n: int, *, use_fused: bool = False) -> Tensor:
         """Contract flattened ``[s, b, n*C]`` streams using the preceding mix.
 
-        Mixing uses FP32 arithmetic and returns the activation dtype. At stack
-        exit, the last FFN's mix supplies the contraction without learned head
-        parameters.
+        Native mixing uses FP32 arithmetic; fused mixing follows DSv4 by casting
+        coefficients to the activation dtype. At stack exit, the last FFN's mix
+        supplies the contraction without learned head parameters.
         """
         if n < 1 or hidden_states.ndim != 3 or hidden_states.shape[-1] % n:
             raise ValueError("Single-pass mHC requires [s, b, n*C] hidden states and n >= 1")
@@ -65,6 +65,10 @@ class SinglePassMHCState:
                 f"Single-pass mHC pre_mix shape {tuple(self.pre_mix.shape)} "
                 f"does not match {tuple(expected_shape)}"
             )
+        if use_fused:
+            from megatron.core.fusions.fused_mhc_kernels import fused_h_aggregate
+
+            return fused_h_aggregate(streams, self.pre_mix.to(hidden_states.dtype))
         return (
             (streams.float() * self.pre_mix.float().unsqueeze(-1)).sum(-2).to(hidden_states.dtype)
         )
@@ -464,7 +468,32 @@ class HyperConnectionModule(MegatronModule):
         return h_pre.to(dtype), h_post.to(dtype), h_res.to(dtype)
 
     def _compute_single_pass_mappings(self, x: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
-        """Compute single-pass mappings with eager FP32 operations and reference RMS math."""
+        """Compute FP32 single-pass mappings with epsilon inside the RMS square root."""
+        if self._proj_rms_compute_h_op is not None:
+            s, b, _ = x.shape
+            with torch.autocast(device_type=x.device.type, enabled=False):
+                h_pre, h_post, h_res, _ = self._proj_rms_compute_h_op(
+                    x.reshape(s * b, self.n * self.hidden_size),
+                    self.mapping_proj.weight,
+                    self.alpha_pre,
+                    self.alpha_post,
+                    self.alpha_res,
+                    self.bias,
+                    self.n,
+                    self.norm_eps,
+                    self.compute_h_eps,
+                    eps_inside_sqrt=True,
+                )
+            h_res = self._sinkhorn_op(
+                h_res.reshape(s, b, self.n, self.n), self.sinkhorn_iterations, self.sinkhorn_eps
+            )
+            # Match the existing DSv4 kernel contract: compute mappings/Sinkhorn
+            # with FP32 parameters, then mix streams in the activation dtype.
+            return (
+                h_pre.reshape(s, b, self.n).to(x.dtype),
+                h_post.reshape(s, b, self.n).to(x.dtype),
+                h_res.to(x.dtype),
+            )
         x_fp32 = x.float()
         inv_rms = torch.rsqrt(x_fp32.square().mean(-1, keepdim=True) + self.norm_eps)
         with torch.autocast(device_type=x.device.type, enabled=False):
@@ -580,7 +609,9 @@ class HyperConnectionModule(MegatronModule):
         if self.single_pass:
             if out is not None:
                 raise ValueError("Single-pass mHC does not support recompute output storage")
-            return SinglePassMHCState(h_pre).contract(x, self.n)
+            return SinglePassMHCState(h_pre).contract(
+                x, self.n, use_fused=self.config.use_fused_mhc
+            )
 
         s, b, _ = x.shape
         C = self.hidden_size
@@ -653,10 +684,20 @@ class HyperConnectionModule(MegatronModule):
                 raise ValueError("Single-pass mHC requires a forward-local SinglePassMHCState")
             if mhc_recompute_manager is not None or output_slot is not None:
                 raise ValueError("Single-pass mHC does not yet support activation recomputation")
-            h_pre, h_post, h_res = self.compute_mappings(hidden_states)
-            aggregated = mhc_state.contract(hidden_states, self.n)
+            if self.config.use_fused_mhc:
+                # Accumulate the residual/branch gradients before the mapping
+                # gradient, which also receives the next sublayer's pre-mix edge.
+                residual, aggregate_input, mappings_input = BroadcastTensorFused.apply(
+                    hidden_states, self._fused_add_3_op
+                )
+            else:
+                mappings_input = aggregate_input = residual = hidden_states
+            h_pre, h_post, h_res = self.compute_mappings(mappings_input)
+            aggregated = mhc_state.contract(
+                aggregate_input, self.n, use_fused=self.config.use_fused_mhc
+            )
             mhc_state.pre_mix = h_pre
-            return aggregated, h_res, h_post, hidden_states
+            return aggregated, h_res, h_post, residual
 
         if mhc_recompute_manager is not None:
             return self._forward_with_checkpoint(
@@ -831,6 +872,10 @@ class HyperConnectionModule(MegatronModule):
             if manager is not None:
                 raise ValueError("Single-pass mHC does not yet support activation recomputation")
             x, bias = layer_output_with_bias
+            if self.config.use_fused_mhc and (not training or dropout_prob == 0.0):
+                streams = original_residual.unflatten(-1, (self.n, self.hidden_size))
+                with torch.autocast(device_type=x.device.type, enabled=False):
+                    return self._h_post_bda_op(h_res, streams, h_post, x, bias).flatten(-2)
             streams = original_residual.float().unflatten(-1, (self.n, self.hidden_size))
             mixed = (h_res.float().unsqueeze(-1) * streams.unsqueeze(-2)).sum(-3)
             expanded = h_post.float().unsqueeze(-1) * x.float().unsqueeze(-2)

@@ -1325,8 +1325,10 @@ class TransformerConfig(ModelParallelConfig):
     mhc_single_pass: bool = False
     """Use the previous sublayer's mixing coefficients for mHC input contraction.
 
-    This opt-in mode is independent of the model/attention version. It uses eager
-    PyTorch operations and contracts the final streams with the last sublayer's mix.
+    This opt-in mode is independent of the model/attention version and contracts
+    the final streams with the last sublayer's mix. ``use_fused_mhc`` also applies
+    to this mode, using the existing DSv4 kernels with activation-dtype mixing
+    coefficients after the FP32 mapping and Sinkhorn computations.
     """
 
     num_residual_streams: int = 4
@@ -4303,11 +4305,9 @@ class TransformerConfig(ModelParallelConfig):
             self._validate_mhc_single_pass()
 
     def _validate_mhc_single_pass(self) -> None:
-        """Validate the forward-local eager implementation independently of model version."""
+        """Validate the forward-local single-pass implementation independently of model version."""
         if not self.enable_hyper_connections:
             raise ValueError("mhc_single_pass requires enable_hyper_connections=True")
-        if self.use_fused_mhc:
-            raise ValueError("mhc_single_pass requires use_fused_mhc=False")
         if self.recompute_granularity is not None:
             raise ValueError("mhc_single_pass does not yet support activation recomputation")
         if self.cuda_graph_impl != "none":
@@ -4511,7 +4511,6 @@ class MLATransformerConfig(TransformerConfig):
             # V4's backward restrictions (dense loss on SM90 / MXFP8) do not apply.
         for name in (
             "mla_down_proj_fusion",
-            "use_fused_mhc",
             "bias_activation_fusion",
             "bias_dropout_fusion",
             "masked_softmax_fusion",

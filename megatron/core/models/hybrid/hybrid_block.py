@@ -1339,7 +1339,11 @@ class HybridStack(MegatronModule):
             if (self.config.mtp_num_layers or 0) > 0:
                 mhc_multistream = hidden_states
             if mhc_state is not None:
-                hidden_states = mhc_state.contract(hidden_states, self.config.num_residual_streams)
+                hidden_states = mhc_state.contract(
+                    hidden_states,
+                    self.config.num_residual_streams,
+                    use_fused=self.config.use_fused_mhc,
+                )
             else:
                 hidden_states = learned_output_contract(
                     hidden_states,
