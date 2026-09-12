@@ -12,7 +12,7 @@ MODEL_ARGS:
   --tokenizer-model: ${CHECKPOINT_LOAD_PATH}/model/mcore_mistral/nemo_minitron-0.5b/v1/multiMixV8.gpt4o_nc_sd.500000.128k.vocab.json
   --auto-detect-ckpt-format: true
   --max-tokens-to-oom: 3600000
-  --inference-max-seq-length: 4096
+  --inference-max-seq-length: 8192
   --attention-backend: flash
   --use-checkpoint-args: true
   --micro-batch-size: 1
