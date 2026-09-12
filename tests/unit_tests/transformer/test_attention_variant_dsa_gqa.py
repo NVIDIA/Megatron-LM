@@ -344,23 +344,6 @@ def test_transformer_config_rejects_simplified_mode_without_dsa_variant():
         )
 
 
-def test_transformer_config_rejects_reset_while_dsa_is_still_skipped():
-    with pytest.raises(AssertionError, match="disabled when resetting"):
-        TransformerConfig(
-            num_layers=1,
-            hidden_size=32,
-            num_attention_heads=4,
-            num_query_groups=1,
-            kv_channels=8,
-            experimental_attention_variant="dsa",
-            add_bias_linear=False,
-            dsa_indexer_mode="simplified",
-            dsa_indexer_topk=4,
-            dsa_fwd_skip_dsa=True,
-            dsa_reset_indexer_on_load=True,
-        )
-
-
 def test_simplified_indexer_accepts_internal_tp_group_rewrite(monkeypatch):
     import megatron.core.transformer.experimental_attention_variant.dsa_gqa as dsa_gqa
 
@@ -839,62 +822,6 @@ def test_transformer_config_min_memory_accepts_sparse_loss_without_topk_only_fla
     assert config.dsa_indexer_use_sparse_loss
 
 
-@pytest.mark.parametrize("backend", ["reference", "min-memory-torch", "min-memory-triton"])
-def test_transformer_config_accepts_dsa_train_main_only(backend):
-    config = TransformerConfig(
-        num_layers=1,
-        hidden_size=32,
-        num_attention_heads=4,
-        num_query_groups=1,
-        kv_channels=8,
-        experimental_attention_variant="dsa",
-        dsa_indexer_mode="simplified",
-        add_bias_linear=False,
-        dsa_indexer_topk=4,
-        dsa_kernel_backend=backend,
-        dsa_indexer_loss_coeff=0.0,
-        dsa_train_main_only=True,
-    )
-
-    assert config.dsa_train_main_only
-    assert not config.dsa_indexer_use_sparse_loss
-
-
-@pytest.mark.parametrize(
-    "override,match",
-    [
-        ({"dsa_indexer_loss_coeff": 0.1}, "leave dsa_indexer_loss_coeff"),
-        ({"dsa_indexer_use_sparse_loss": True}, "dsa_indexer_use_sparse_loss"),
-        ({"dsa_fwd_use_dense_attn": True}, "sparse DSA forward"),
-        ({"dsa_fwd_skip_dsa": True}, "sparse DSA forward"),
-        ({"dsa_train_indexer_only": True}, "incompatible"),
-        ({"dsa_kernel_cache_selected_scores": True}, "selected-score"),
-        ({"dsa_reset_indexer_on_load": True}, "incompatible"),
-        ({"dsa_indexer_activation_start_samples": 100}, "activation_start_samples"),
-        ({"dsa_indexer_activation_warmup_samples": 100}, "warmup_samples"),
-    ],
-)
-def test_transformer_config_rejects_incompatible_dsa_train_main_only_modes(override, match):
-    kwargs = dict(
-        num_layers=1,
-        hidden_size=32,
-        num_attention_heads=4,
-        experimental_attention_variant="dsa",
-        add_bias_linear=False,
-        dsa_indexer_n_heads=2,
-        dsa_indexer_head_dim=8,
-        dsa_indexer_topk=4,
-        dsa_kernel_backend="min-memory-triton",
-        dsa_indexer_loss_coeff=0.0,
-        dsa_indexer_rotate_activation=True,
-        dsa_train_main_only=True,
-    )
-    kwargs.update(override)
-
-    with pytest.raises(AssertionError, match=match):
-        TransformerConfig(**kwargs)
-
-
 def test_transformer_config_accepts_dense_warmup_min_memory_backend():
     for backend in ("min-memory-triton", "min-memory-torch"):
         config = TransformerConfig(
@@ -1021,7 +948,6 @@ def test_min_memory_backend_supports_no_grad_validation_forward(monkeypatch):
         core = SimpleNamespace(
             config=SimpleNamespace(
                 dsa_kernel_backend=backend,
-                dsa_sparse_attention_use_gather=False,
                 dsa_indexer_use_sparse_loss=True,
                 dsa_indexer_rotate_activation=True,
                 fp8=None,
@@ -1061,63 +987,6 @@ def test_min_memory_backend_supports_no_grad_validation_forward(monkeypatch):
     assert all(call["simplified_input_norm"] is indexer_input_norm for call in calls)
 
 
-def test_reference_train_main_only_routes_without_constructing_indexer_loss(monkeypatch):
-    import megatron.core.transformer.experimental_attention_variant.dsa_gqa as dsa_gqa
-
-    class _Indexer:
-        def forward_before_topk(self, hidden_states, **_kwargs):
-            sq, batch_size, _ = hidden_states.shape
-            q_index = hidden_states.new_zeros((sq, batch_size, 1, 4))
-            k_index = hidden_states.new_zeros((sq, batch_size, 1, 4))
-            weights = hidden_states.new_ones((sq, batch_size, 1))
-            return q_index, k_index, weights
-
-    topk_calls = []
-
-    def _fake_topk(q_index, _k_index, _weights, topk, _mask):
-        topk_calls.append((q_index.shape, topk))
-        sq, batch_size = q_index.shape[:2]
-        scores = q_index.new_zeros((batch_size, sq, sq), dtype=torch.float32)
-        indices = torch.zeros((batch_size, sq, topk), dtype=torch.long)
-        return scores, indices
-
-    def _unexpected_indexer_loss(*_args, **_kwargs):
-        raise AssertionError("main-only mode must not construct indexer KL")
-
-    monkeypatch.setattr(dsa_gqa, "fused_qk_topk_naive", _fake_topk)
-    monkeypatch.setattr(dsa_gqa, "compute_gqa_dsa_indexer_loss", _unexpected_indexer_loss)
-    monkeypatch.setattr(dsa_gqa, "unfused_grouped_dsa_fn", lambda query, *_args, **_kwargs: query)
-
-    core = SimpleNamespace(
-        config=SimpleNamespace(
-            sequence_parallel=False,
-            dsa_kernel_backend="reference",
-            dsa_fwd_skip_dsa=False,
-            dsa_indexer_mode="standard",
-            dsa_sparse_attention_use_gather=False,
-            dsa_train_main_only=True,
-            dsa_indexer_loss_coeff=0.0,
-            dsa_indexer_use_sparse_loss=False,
-        ),
-        indexer=_Indexer(),
-        softmax_scale=0.5,
-        training=True,
-        layer_number=1,
-    )
-    core.indexer.index_topk = 2
-    query = torch.randn(4, 1, 4, 4, requires_grad=True)
-    key = torch.randn(4, 1, 2, 4, requires_grad=True)
-    value = torch.randn(4, 1, 2, 4, requires_grad=True)
-    hidden_states = torch.randn(4, 1, 8)
-
-    output = DSGQACoreAttention.forward(
-        core, query, key, value, None, hidden_states, attn_mask_type=AttnMaskType.causal
-    )
-
-    assert output is query
-    assert topk_calls == [(torch.Size([4, 1, 1, 4]), 2)]
-
-
 def test_dense_warmup_no_grad_validation_uses_dense_core_attention():
     torch.manual_seed(123)
     calls = []
@@ -1131,7 +1000,6 @@ def test_dense_warmup_no_grad_validation_uses_dense_core_attention():
         config=SimpleNamespace(
             dsa_kernel_backend="min-memory-triton",
             dsa_fwd_use_dense_attn=True,
-            dsa_sparse_attention_use_gather=False,
             dsa_indexer_use_sparse_loss=False,
             dsa_indexer_rotate_activation=True,
             fp8=None,

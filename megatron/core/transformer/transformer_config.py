@@ -367,14 +367,8 @@ class TransformerConfig(ModelParallelConfig):
     dsa_fwd_use_dense_attn: bool = False
     """Whether DSA min-memory backends use dense GQA attention forward for indexer warmup."""
 
-    dsa_fwd_skip_dsa: bool = False
-    """Whether DSA forward skips all DSA routing/loss and uses dense GQA forward."""
-
     dsa_train_indexer_only: bool = False
     """Whether to freeze non-indexer parameters and train only DSA indexer parameters."""
-
-    dsa_train_main_only: bool = False
-    """Whether to freeze DSA indexer parameters and train only non-indexer parameters."""
 
     dsa_reset_indexer_on_load: bool = False
     """Whether to reset DSA indexer parameters and optimizer state after checkpoint load."""
@@ -390,10 +384,6 @@ class TransformerConfig(ModelParallelConfig):
 
     dsa_indexer_loss_coeff: Optional[float] = None
     """Coefficient for the DSA indexer KL divergence loss. Set to 0 to disable indexer loss."""
-
-    dsa_sparse_attention_use_gather: bool = False
-    """Whether to use the gather-based sparse DSA attention backend instead of the
-    dense-mask reference path."""
 
     dsa_indexer_use_sparse_loss: bool = False
     """Whether to use sparse DSA indexer loss. If True, the indexer loss will be computed using the
@@ -3490,45 +3480,11 @@ class TransformerConfig(ModelParallelConfig):
             "and dsa_indexer_mode='simplified'."
         )
         assert (
-            not self.dsa_fwd_skip_dsa or self.experimental_attention_variant == "dsa"
-        ), "dsa_fwd_skip_dsa requires experimental_attention_variant='dsa'."
-        assert (
             not self.dsa_reset_indexer_on_load or self.experimental_attention_variant == "dsa"
         ), "dsa_reset_indexer_on_load requires experimental_attention_variant='dsa'."
         assert (
             not self.dsa_train_indexer_only or self.experimental_attention_variant == "dsa"
         ), "dsa_train_indexer_only requires experimental_attention_variant='dsa'."
-        assert (
-            not self.dsa_train_main_only or self.experimental_attention_variant == "dsa"
-        ), "dsa_train_main_only requires experimental_attention_variant='dsa'."
-        assert not (
-            self.dsa_fwd_skip_dsa and self.dsa_train_indexer_only
-        ), "dsa_fwd_skip_dsa is incompatible with dsa_train_indexer_only."
-        assert not (
-            self.dsa_train_main_only and self.dsa_train_indexer_only
-        ), "dsa_train_main_only is incompatible with dsa_train_indexer_only."
-        assert not (
-            self.dsa_train_main_only and self.dsa_fwd_skip_dsa
-        ), "dsa_train_main_only requires sparse DSA forward attention."
-        assert not (
-            self.dsa_train_main_only and self.dsa_fwd_use_dense_attn
-        ), "dsa_train_main_only requires sparse DSA forward attention."
-        assert not (
-            self.dsa_train_main_only and self.dsa_reset_indexer_on_load
-        ), "dsa_train_main_only is incompatible with dsa_reset_indexer_on_load."
-        assert not (
-            self.dsa_train_main_only and self.dsa_indexer_activation_start_samples is not None
-        ), (
-            "dsa_train_main_only has no indexer optimizer group; leave "
-            "dsa_indexer_activation_start_samples unset."
-        )
-        assert not (self.dsa_train_main_only and self.dsa_indexer_activation_warmup_samples != 0), (
-            "dsa_train_main_only has no indexer optimizer group; leave "
-            "dsa_indexer_activation_warmup_samples at zero."
-        )
-        assert not (
-            self.dsa_fwd_skip_dsa and self.dsa_reset_indexer_on_load
-        ), "dsa_fwd_skip_dsa must be disabled when resetting the indexer for activation."
         assert (
             self.dsa_indexer_activation_start_samples is None
             or self.dsa_indexer_activation_start_samples >= 0
@@ -3601,29 +3557,13 @@ class TransformerConfig(ModelParallelConfig):
             assert (
                 not self.dsa_train_indexer_only or (self.dsa_indexer_loss_coeff or 0.0) > 0.0
             ), "dsa_train_indexer_only requires dsa_indexer_loss_coeff > 0."
-            if self.dsa_train_main_only:
-                assert (self.dsa_indexer_loss_coeff or 0.0) == 0.0, (
-                    "dsa_train_main_only disables indexer KL; leave "
-                    "dsa_indexer_loss_coeff unset or set it to zero."
-                )
-                assert not self.dsa_indexer_use_sparse_loss, (
-                    "dsa_train_main_only disables indexer KL; do not set "
-                    "dsa_indexer_use_sparse_loss."
-                )
-                assert not self.dsa_kernel_cache_selected_scores, (
-                    "dsa_train_main_only has no selected-score KL backward; do not set "
-                    "dsa_kernel_cache_selected_scores."
-                )
             min_memory_dsa_backend = self.dsa_kernel_backend in (
                 'min-memory-triton',
                 'min-memory-torch',
             )
-            skip_dsa = self.dsa_fwd_skip_dsa
             dense_dsa_warmup = self.dsa_fwd_use_dense_attn
             sparse_fwd_dense_loss = (
                 min_memory_dsa_backend
-                and not self.dsa_train_main_only
-                and not skip_dsa
                 and not dense_dsa_warmup
                 and not self.dsa_indexer_use_sparse_loss
             )
@@ -3680,13 +3620,7 @@ class TransformerConfig(ModelParallelConfig):
                 ), "Sequence parallelism is not supported by DSA over GQA."
             assert not self.apply_rope_fusion, "RoPE fusion is not supported for DSAttention"
             if min_memory_dsa_backend:
-                assert not self.dsa_sparse_attention_use_gather, (
-                    "min-memory dsa_kernel_backend bypasses the reference gather backend; "
-                    "leave dsa_sparse_attention_use_gather for legacy/reference paths."
-                )
-                if skip_dsa:
-                    pass
-                elif dense_dsa_warmup:
+                if dense_dsa_warmup:
                     assert not self.dsa_indexer_use_sparse_loss, (
                         "dsa_fwd_use_dense_attn uses dense indexer loss; do not set "
                         "dsa_indexer_use_sparse_loss."
@@ -3706,8 +3640,6 @@ class TransformerConfig(ModelParallelConfig):
                         "dsa_fwd_use_dense_attn has no selected scores; do not set "
                         "dsa_kernel_cache_selected_scores."
                     )
-                elif self.dsa_train_main_only:
-                    pass
                 else:
                     assert (
                         self.dsa_indexer_loss_coeff or 0.0
@@ -3717,7 +3649,7 @@ class TransformerConfig(ModelParallelConfig):
                             "Sparse-forward dense-loss mode has no selected scores; do not set "
                             "dsa_kernel_cache_selected_scores."
                         )
-                assert skip_dsa or simplified_indexer or self.dsa_indexer_rotate_activation, (
+                assert simplified_indexer or self.dsa_indexer_rotate_activation, (
                     "min-memory dsa_kernel_backend requires dsa_indexer_rotate_activation for "
                     "the standard DeepSeek indexer."
                 )
