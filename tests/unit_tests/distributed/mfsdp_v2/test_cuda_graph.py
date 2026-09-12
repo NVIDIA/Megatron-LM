@@ -137,3 +137,257 @@ def test_captures_full_iteration(distributed_setup, use_symmetric_memory):
         f"first={loss_values[0]:.6f}, "
         f"last={loss_values[-1]:.6f}, trace={loss_values}"
     )
+
+
+def test_mixed_captured_and_eager_forward_schedule(distributed_setup):
+    """Capture layers 0 and 2 while keeping layer 1 eager.
+
+    The communication stream follows the forward schedule from
+    ``runtime_schedule.md``: ``pre_0, pre_1, post_0, pre_2, post_1, post_2``.
+    External events bridge eager communication with the captured layers, while
+    ordinary events synchronize the eager middle layer.
+    """
+    device = distributed_setup.device
+    default_stream = torch.cuda.current_stream(device)
+    communication_stream = torch.cuda.Stream(device=device)
+
+    pre_tokens = [torch.zeros(1, device=device) for _ in range(3)]
+    forward_tokens = [torch.zeros(1, device=device) for _ in range(3)]
+    post_tokens = [torch.zeros(1, device=device) for _ in range(3)]
+
+    # Captured forwards need graph-external event nodes to synchronize with
+    # eager communication. The eager middle forward uses ordinary events.
+    pre_done = [
+        torch.cuda.Event(external=True),
+        torch.cuda.Event(),
+        torch.cuda.Event(external=True),
+    ]
+    forward_done = [
+        torch.cuda.Event(external=True),
+        torch.cuda.Event(),
+        torch.cuda.Event(external=True),
+    ]
+    forward_start = [torch.cuda.Event(enable_timing=True) for _ in range(3)]
+    forward_end = [torch.cuda.Event(enable_timing=True) for _ in range(3)]
+    post_start = [torch.cuda.Event(enable_timing=True) for _ in range(3)]
+    post_end = [torch.cuda.Event(enable_timing=True) for _ in range(3)]
+    sleep_cycles = 200_000_000
+
+    def capture_forward(layer: int, pool: object) -> torch.cuda.CUDAGraph:
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, pool=pool):
+            pre_done[layer].wait()
+            torch.add(pre_tokens[layer], 1, out=forward_tokens[layer])
+            forward_done[layer].record()
+        return graph
+
+    graph_pool = torch.cuda.graph_pool_handle()
+    forward_0 = capture_forward(0, graph_pool)
+    forward_2 = capture_forward(2, graph_pool)
+
+    communication_schedule = []
+    default_schedule = []
+    timeline_start = torch.cuda.Event(enable_timing=True)
+    timeline_start.record()
+
+    with torch.cuda.stream(communication_stream):
+        communication_stream.wait_event(timeline_start)
+        pre_tokens[0].fill_(1)
+        pre_done[0].record()
+        communication_schedule.append("pre_0")
+        pre_tokens[1].fill_(2)
+        pre_done[1].record()
+        communication_schedule.append("pre_1")
+
+    default_stream.wait_event(pre_done[0])
+    forward_start[0].record()
+    forward_0.replay()
+    forward_end[0].record()
+    default_schedule.append("forward_0")
+
+    with torch.cuda.stream(communication_stream):
+        communication_stream.wait_event(forward_done[0])
+        post_start[0].record()
+        torch.add(forward_tokens[0], 1, out=post_tokens[0])
+        torch.cuda._sleep(sleep_cycles)
+        post_end[0].record()
+        communication_schedule.append("post_0")
+        pre_tokens[2].fill_(3)
+        pre_done[2].record()
+        communication_schedule.append("pre_2")
+
+    default_stream.wait_event(pre_done[1])
+    forward_start[1].record()
+    torch.add(pre_tokens[1], 1, out=forward_tokens[1])
+    torch.cuda._sleep(sleep_cycles)
+    forward_end[1].record()
+    forward_done[1].record()
+    default_schedule.append("forward_1")
+
+    with torch.cuda.stream(communication_stream):
+        communication_stream.wait_event(forward_done[1])
+        post_start[1].record()
+        torch.add(forward_tokens[1], 1, out=post_tokens[1])
+        torch.cuda._sleep(sleep_cycles)
+        post_end[1].record()
+        communication_schedule.append("post_1")
+
+    default_stream.wait_event(pre_done[2])
+    forward_start[2].record()
+    forward_2.replay()
+    torch.cuda._sleep(sleep_cycles)
+    forward_end[2].record()
+    default_schedule.append("forward_2")
+
+    with torch.cuda.stream(communication_stream):
+        communication_stream.wait_event(forward_done[2])
+        post_start[2].record()
+        torch.add(forward_tokens[2], 1, out=post_tokens[2])
+        torch.cuda._sleep(sleep_cycles)
+        post_end[2].record()
+        communication_schedule.append("post_2")
+
+    torch.cuda.synchronize(device)
+
+    assert communication_schedule == ["pre_0", "pre_1", "post_0", "pre_2", "post_1", "post_2"]
+    assert default_schedule == ["forward_0", "forward_1", "forward_2"]
+    torch.testing.assert_close(
+        torch.cat(forward_tokens), torch.tensor([2.0, 3.0, 4.0], device=device)
+    )
+    torch.testing.assert_close(
+        torch.cat(post_tokens), torch.tensor([3.0, 4.0, 5.0], device=device)
+    )
+
+    def timestamp(event: torch.cuda.Event) -> float:
+        return timeline_start.elapsed_time(event)
+
+    def assert_overlaps(
+        first_start: torch.cuda.Event,
+        first_end: torch.cuda.Event,
+        second_start: torch.cuda.Event,
+        second_end: torch.cuda.Event,
+    ) -> None:
+        overlap = min(timestamp(first_end), timestamp(second_end)) - max(
+            timestamp(first_start), timestamp(second_start)
+        )
+        assert overlap > 0, f"expected overlap, got {overlap:.3f} ms"
+
+    assert_overlaps(post_start[0], post_end[0], forward_start[1], forward_end[1])
+    assert_overlaps(post_start[1], post_end[1], forward_start[2], forward_end[2])
+
+
+def test_partially_captures_forward_with_graphed_callables(distributed_setup):
+    """Capture compatible layers as shared-pool graph islands around an eager layer.
+
+    ``make_graphed_callables`` is PyTorch's partial-network capture API. It
+    captures the compatible callables in their execution order into separate
+    graphs that share one pool; layer 1 remains eager.
+    """
+    device = distributed_setup.device
+    default_stream = torch.cuda.current_stream(device)
+    communication_stream = torch.cuda.Stream(device=device)
+
+    pre_tokens = [torch.zeros(1, device=device) for _ in range(3)]
+    post_tokens = [torch.zeros(1, device=device) for _ in range(3)]
+    pre_done = [
+        torch.cuda.Event(external=True),
+        torch.cuda.Event(),
+        torch.cuda.Event(external=True),
+    ]
+    forward_done = [
+        torch.cuda.Event(external=True),
+        torch.cuda.Event(),
+        torch.cuda.Event(external=True),
+    ]
+    forward_start = [torch.cuda.Event(enable_timing=True) for _ in range(3)]
+    forward_end = [torch.cuda.Event(enable_timing=True) for _ in range(3)]
+    post_start = [torch.cuda.Event(enable_timing=True) for _ in range(3)]
+    post_end = [torch.cuda.Event(enable_timing=True) for _ in range(3)]
+    sleep_cycles = 200_000_000
+
+    def captured_forward(layer: int):
+        def forward(pre_token: torch.Tensor) -> torch.Tensor:
+            pre_done[layer].wait()
+            output = pre_token + 1
+            forward_done[layer].record()
+            return output
+
+        return forward
+
+    graph_pool = torch.cuda.graph_pool_handle()
+    forward_0, forward_2 = torch.cuda.make_graphed_callables(
+        (captured_forward(0), captured_forward(2)),
+        ((pre_tokens[0],), (pre_tokens[2],)),
+        num_warmup_iters=1,
+        pool=graph_pool,
+    )
+    timeline_start = torch.cuda.Event(enable_timing=True)
+    timeline_start.record()
+
+    with torch.cuda.stream(communication_stream):
+        communication_stream.wait_event(timeline_start)
+        pre_tokens[0].fill_(1)
+        pre_done[0].record()
+        pre_tokens[1].fill_(2)
+        pre_done[1].record()
+
+    default_stream.wait_event(pre_done[0])
+    forward_start[0].record()
+    forward_output_0 = forward_0(pre_tokens[0])
+    forward_end[0].record()
+
+    with torch.cuda.stream(communication_stream):
+        communication_stream.wait_event(forward_done[0])
+        post_start[0].record()
+        torch.add(forward_output_0, 1, out=post_tokens[0])
+        torch.cuda._sleep(sleep_cycles)
+        post_end[0].record()
+        pre_tokens[2].fill_(3)
+        pre_done[2].record()
+
+    default_stream.wait_event(pre_done[1])
+    forward_start[1].record()
+    forward_output_1 = pre_tokens[1] + 1
+    torch.cuda._sleep(sleep_cycles)
+    forward_end[1].record()
+    forward_done[1].record()
+
+    with torch.cuda.stream(communication_stream):
+        communication_stream.wait_event(forward_done[1])
+        post_start[1].record()
+        torch.add(forward_output_1, 1, out=post_tokens[1])
+        torch.cuda._sleep(sleep_cycles)
+        post_end[1].record()
+
+    default_stream.wait_event(pre_done[2])
+    forward_start[2].record()
+    forward_output_2 = forward_2(pre_tokens[2])
+    torch.cuda._sleep(sleep_cycles)
+    forward_end[2].record()
+
+    with torch.cuda.stream(communication_stream):
+        communication_stream.wait_event(forward_done[2])
+        torch.add(forward_output_2, 1, out=post_tokens[2])
+
+    torch.cuda.synchronize(device)
+
+    torch.testing.assert_close(
+        torch.cat(post_tokens), torch.tensor([3.0, 4.0, 5.0], device=device)
+    )
+
+    def timestamp(event: torch.cuda.Event) -> float:
+        return timeline_start.elapsed_time(event)
+
+    def assert_overlaps(
+        first_start: torch.cuda.Event,
+        first_end: torch.cuda.Event,
+        second_start: torch.cuda.Event,
+        second_end: torch.cuda.Event,
+    ) -> None:
+        overlap = min(timestamp(first_end), timestamp(second_end)) - max(
+            timestamp(first_start), timestamp(second_start)
+        )
+        assert overlap > 0, f"expected overlap, got {overlap:.3f} ms"
+
+    assert_overlaps(post_start[0], post_end[0], forward_start[1], forward_end[1])
+    assert_overlaps(post_start[1], post_end[1], forward_start[2], forward_end[2])
