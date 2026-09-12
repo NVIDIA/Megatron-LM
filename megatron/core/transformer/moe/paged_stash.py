@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import logging
+import os
 from contextlib import nullcontext
 from typing import Any
 
@@ -223,6 +224,52 @@ class PagedTensor:
             if paged_stash_buffer.host_buffer is not None
             else paged_stash_buffer.cuda_buffer
         )
+
+        # Optional CuTeDSL copy path (opt in with MEGATRON_PAGED_STASH_CUTE=1). It needs the
+        # explicit (tokens, row_bytes) shape; activations may arrive as a flat allocation even
+        # though the stash is row-major. Anything that cannot be reshaped to match the stash row
+        # width, or whose rows are not 16B-aligned, stays on the Triton kernel below.
+        if os.getenv("MEGATRON_PAGED_STASH_CUTE", "0") == "1":
+            source_bytes = tensor_to_copy.view(paged_stash_buffer.cuda_buffer.dtype)
+            stash_row_width = paged_stash_buffer.cuda_buffer.shape[1]
+            if source_bytes.ndim == 1 and source_bytes.numel() % stash_row_width == 0:
+                source_bytes = source_bytes.view(-1, stash_row_width)
+            if (
+                source_bytes.ndim == 2
+                and source_bytes.shape[1] == stash_row_width
+                and source_bytes.shape[1] % 16 == 0
+            ):
+                from megatron.core.transformer.moe.ops.paged_stash_cute_copy import (
+                    run as cute_copy_run,
+                )
+
+                # The advanced head goes to scratch, never to free_list_head itself: every CTA
+                # reads free_list_head to resolve its page, so letting CTA 0 write the new head
+                # into that same tensor lets later CTAs pick up the already-advanced value and
+                # stash into the next activation's pages. Publish it afterwards, exactly like
+                # the Triton path does below.
+                cute_copy_run(
+                    source_bytes,
+                    num_tokens_tensor,
+                    paged_stash_buffer.free_list_cuda,
+                    paged_stash_buffer.free_list_host,
+                    paged_stash_buffer.free_list_head,
+                    paged_stash_buffer.free_list_tail,
+                    paged_stash_buffer.free_list_capacity,
+                    paged_stash_buffer.overflow,
+                    paged_stash_buffer.cuda_buffer,
+                    host_dst,
+                    self.page_record,
+                    paged_stash_buffer.overflow,
+                    paged_stash_buffer.host_spill,
+                    self.spilled_to_host,
+                    new_free_list_head,
+                    new_free_list_head,
+                )
+                paged_stash_buffer.free_list_head.copy_(new_free_list_head)
+                self._original_tensor = self._tensor
+                self._tensor = None
+                return
 
         paged_stash_copy_kernel[grid](
             tensor_to_copy.view(paged_stash_buffer.cuda_buffer.dtype),
