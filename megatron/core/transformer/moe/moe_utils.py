@@ -835,7 +835,12 @@ def topk_routing_with_score_function(
                 "Fused sqrtsoftplus score function requires TE >= 2.13.0. "
                 "Please upgrade Transformer Engine or disable moe_router_fusion."
             )
-        return fused_topk_with_score_function(
+        index_output = {}
+        if dense_output:
+            index_output["topk_indices"] = torch.empty(
+                (num_tokens, topk), dtype=torch.int64, device=logits.device
+            )
+        probs, routing_map = fused_topk_with_score_function(
             logits=logits,
             topk=topk,
             use_pre_softmax=use_pre_softmax,
@@ -844,7 +849,11 @@ def topk_routing_with_score_function(
             scaling_factor=scaling_factor,
             score_function=score_function,
             expert_bias=expert_bias,
+            **index_output,
         )
+        if dense_output:
+            probs = probs.gather(1, routing_map)
+        return probs, routing_map
 
     def _compute_topk(
         scores: torch.Tensor,
@@ -969,14 +978,9 @@ def uses_compact_routes(config) -> bool:
     """Whether the router hands the token dispatcher its compact ``[num_tokens, topk]`` expert ids
     and probabilities instead of the dense ``[num_tokens, num_experts]`` map and probabilities.
 
-    HybridEP's fastest path takes the ids as dense top-k routing and needs only the probabilities
-    dense, so the flex dispatcher's HybridEP backend consumes compact routes whenever nothing
-    downstream needs the dense map: top-k routing (sinkhorn and quantile balancing produce only
-    the map), no fused router (TE's router produces only the map), no token dropping or capacity
-    padding (they act on the map), expert tensor parallelism 1 (the dense path replicates routes
-    across TP ranks) and no uneven-dispatch padding. Virtual-expert load balancing plans from
-    compact routes and always requires them. The router and the dispatcher both read this, so
-    the formats agree by construction.
+    Ordinary HybridEP keeps its dense format with fused or Sinkhorn/quantile routing, token
+    dropping, capacity/uneven padding and expert TP. Virtual-expert planning always requires
+    compact routes and uses TE's newer index-output API for fused top-k routing.
     """
     if config.moe_virtual_expert_load_balance:
         return True

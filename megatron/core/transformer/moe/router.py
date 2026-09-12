@@ -328,8 +328,8 @@ class TopKRouter(Router):
             logits (torch.Tensor): The logits tensor, shape ``[num_tokens, num_experts]``.
 
         Returns:
-            Tuple[torch.Tensor, torch.Tensor]: Sparse routing probs and boolean
-            routing map, each shaped ``[num_tokens, num_experts]``.
+            Tuple[torch.Tensor, torch.Tensor]: Compact probabilities and expert ids when
+            requested by the dispatcher, otherwise dense probabilities and a boolean map.
         """
         assert (
             not self.config.moe_router_fusion
@@ -390,6 +390,7 @@ class TopKRouter(Router):
             score_function=self.score_function,
             fused=self.config.moe_router_fusion,
             precomputed_indices=indices,
+            dense_output=uses_compact_routes(self.config),
         )
 
     def get_aux_loss_coeff(self, aux_loss_type: str) -> float:
@@ -790,7 +791,7 @@ class TopKRouter(Router):
         # HybridEP and virtual-expert planning consume the compact [num_tokens, topk] ids and
         # probabilities directly (see uses_compact_routes); the dispatcher expects the same format.
         compact_routes = uses_compact_routes(self.config)
-        if compact_routes and self.routing_type in ("sinkhorn", "quantile_balancing"):
+        if compact_routes and self.routing_type == "sinkhorn":
             raise NotImplementedError(
                 f"Virtual-expert load balancing does not support {self.routing_type} routing."
             )
@@ -817,12 +818,6 @@ class TopKRouter(Router):
                 router_replay=self.router_replay,
                 dense_output=compact_routes,
             )
-            if compact_routes and routing_map.dtype == torch.bool:
-                # The fused (Transformer Engine) router only produces the dense map and
-                # probabilities; recover the selected ids from the map (it is authoritative) and
-                # their probabilities with a gather, which also carries the gradient.
-                routing_map = torch.topk(routing_map.to(torch.int8), self.topk, dim=1).indices
-                probs = probs.gather(1, routing_map)
 
         # Apply token dropping to probs and routing_map.
         if self.config.moe_expert_capacity_factor is not None:
