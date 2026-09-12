@@ -22,6 +22,8 @@ from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
 if not HAVE_GTP:
     pytest.skip("GTP requires TransformerEngine >= 2.19", allow_module_level=True)
 
+from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Tensor
+
 from megatron.core.tensor_parallel import generalized_tensor_parallelism as gtp
 from megatron.core.tensor_parallel.generalized_tensor_parallelism import GTPShardedParam
 from tests.unit_tests.generalized_tensor_parallel.gtp_test_utils import (  # noqa: F401
@@ -141,11 +143,15 @@ def _worker(rank, world_size, port):
         torch.cuda.synchronize()
     finally:
         ps.destroy_model_parallel()
-        GTPShardedParam._chain_state = {}
+        GTPShardedParam._chain_state.clear()
 
 
 def test_peek_hands_out_the_buffer_the_consume_hands_out():
+    native_cls = gtp._gtp_native_fp8_subclass(MXFP8Tensor)
     _run_distributed(_worker, 4)
+    # Native FP8 subclasses must retain the shared dictionary when a test resets its chains.
+    assert native_cls._chain_state is GTPShardedParam._chain_state
+    assert not native_cls._chain_state
 
 
 @pytest.mark.parametrize("check_states", [False, True], ids=["states_off", "states_on"])
