@@ -521,7 +521,12 @@ def is_emerging_optimizers_min_version(version, check_equality=True):
     return get_emerging_optimizers_version() > PkgVersion(version)
 
 
-_VALID_DSA_KERNEL_BACKENDS = ("none", "tilelang", "cudnn")
+# Values that select a fused kernel backend and therefore carry optional dependencies.
+_FUSED_DSA_KERNEL_BACKENDS = ("tilelang", "cudnn")
+# Values that select a DSA implementation needing no optional dependency: "none" plus the
+# DSA-over-GQA paths, which are written in PyTorch and Triton.
+_UNFUSED_DSA_KERNEL_BACKENDS = ("none", "min-memory-triton", "min-memory-torch", "reference")
+_VALID_DSA_KERNEL_BACKENDS = _UNFUSED_DSA_KERNEL_BACKENDS + _FUSED_DSA_KERNEL_BACKENDS
 
 
 def _missing_tilelang_dsa_kernel_dependencies() -> List[str]:
@@ -559,7 +564,7 @@ def _validate_dsa_kernel_backend_dependencies(dsa_kernel_backend: str) -> None:
         raise ValueError(
             "dsa_kernel_backend must be one of: " f"{', '.join(_VALID_DSA_KERNEL_BACKENDS)}."
         )
-    if dsa_kernel_backend == "none":
+    if dsa_kernel_backend in _UNFUSED_DSA_KERNEL_BACKENDS:
         return
     if not torch.cuda.is_available():
         raise ValueError(
