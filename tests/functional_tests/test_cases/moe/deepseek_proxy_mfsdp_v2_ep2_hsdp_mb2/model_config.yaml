@@ -33,6 +33,7 @@ MODEL_ARGS:
   --data-parallel-sharding-strategy: "optim_grads_params"
   --num-distributed-optimizer-instances: 2
   --outer-dp-sharding-strategy: "no_shard"
+  --expert-outer-dp-sharding-strategy: "no_shard"
   --deterministic-mode: true
   --ckpt-format: "fsdp_dtensor"
   --no-gradient-accumulation-fusion: true
