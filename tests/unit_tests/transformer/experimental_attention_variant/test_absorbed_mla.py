@@ -430,6 +430,11 @@ def test_functionality(tp_cp: List[int], qkv_format: str, down_proj_use_column_p
         cp_comm_type="all_gather" if cp_size > 1 else None,
         pg_collection=None,
     ).cuda()
+    assert absorbed_mla.linear_q_up_proj.weight.qkv_layout.num_groups == config.num_attention_heads
+    assert absorbed_mla.linear_kv_up_proj.weight.qkv_layout.projection_split_shapes == (
+        config.qk_head_dim,
+        config.v_head_dim,
+    )
 
     state_dict = standard_mla.state_dict()
     absorbed_mla.load_state_dict(state_dict)
