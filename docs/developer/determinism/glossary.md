@@ -37,7 +37,15 @@ The contract uses these definitions:
 
   Console logs print at limited precision, so for a strict comparison use
   the full-precision serialized metrics (for example the TensorBoard event
-  files) rather than the printed values.
+  files) rather than the printed values. The functional-test golden values
+  (`tests/functional_tests/test_cases/**/golden_values_*.json`) keep the full
+  `float32` precision of the TensorBoard scalars, record it as
+  `"value_precision": "full"`, and are compared bit-exactly by
+  `DeterministicTest`. Files written before this convention carry no marker,
+  are treated as rounded to five decimals and are compared at that precision
+  until they are regenerated; `tools/check_golden_values.py` rejects changed
+  golden files of deterministically compared cases whose metrics lack the
+  `full` marker.
 
 ## Terms
 
