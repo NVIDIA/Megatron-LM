@@ -24,6 +24,12 @@ logger = logging.getLogger(__name__)
 _MAX_RERUN_ATTEMPTS = 2
 
 SCALE_INV_BLOCK_SIZE = 32
+_RECOMPUTE_MANAGED_TENSOR_ATTR = '_mcore_paged_stash_recompute_managed'
+
+
+def mark_paged_stash_recompute_managed(tensor: torch.Tensor) -> None:
+    """Mark a tensor whose storage is released and restored by activation recomputation."""
+    setattr(tensor, _RECOMPUTE_MANAGED_TENSOR_ATTR, True)
 
 
 class PagedStashBuffer:
@@ -686,6 +692,12 @@ class PagedStashManager:
         Hook called when autograd saves a tensor for backward pass.
         Returns a tag to identify the tensor later.
         """
+        # CheckpointWithoutOutput intentionally releases the storage of its output after the
+        # following module has saved it, then restores that same StorageImpl during backward
+        # recomputation. Paged stashing must not take ownership of such a tensor in between.
+        if getattr(tensor, _RECOMPUTE_MANAGED_TENSOR_ATTR, False):
+            return tensor
+
         # Handle 0-dim tensors (torch.Size([])) - they have no size(0)
         if (
             self.max_num_tokens is None
