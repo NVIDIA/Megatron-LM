@@ -16,7 +16,7 @@ import torch.nn.functional as F
 
 from megatron.core.transformer.experimental_attention_variant.dsa_min_memory import (
     _accumulate_simplified_learned_k_wgrad,
-    _routing_key_chunk_size,
+    _plan_execution,
     _sparse_attention_backward_torch_fp32,
     _sparse_attention_tile,
     dsa_min_memory_gqa,
@@ -265,10 +265,28 @@ def test_simplified_train_main_only_zero_loss_produces_no_indexer_update(learned
 
 
 def test_torch_min_memory_forces_full_key_routing_chunk():
-    assert _routing_key_chunk_size(None, key_length=8192, use_triton=False) == 8192
-    assert _routing_key_chunk_size(1024, key_length=8192, use_triton=False) == 8192
-    assert _routing_key_chunk_size(None, key_length=8192, use_triton=True) == 1024
-    assert _routing_key_chunk_size(2048, key_length=8192, use_triton=True) == 2048
+    """Routing under torch reads every key, so its top-k stays tie-equivalent to the reference."""
+    torch_plan = _plan_execution(1, 8192, 8192, use_triton=False)
+    assert torch_plan.routing_key_chunk == 8192
+    # ...even when a caller asks for a smaller key chunk.
+    assert _plan_execution(1, 8192, 8192, False, key_chunk_override=1024).routing_key_chunk == 8192
+
+    triton_plan = _plan_execution(1, 8192, 8192, use_triton=True)
+    assert triton_plan.routing_key_chunk == 1024
+    assert _plan_execution(1, 8192, 8192, True, key_chunk_override=2048).routing_key_chunk == 2048
+
+
+def test_execution_plan_bounds_the_score_tile():
+    """The query chunk shrinks with the tile, so long context does not blow up temporaries."""
+    # Short sequence: the cap applies, not the budget.
+    assert _plan_execution(1, 8192, 8192, use_triton=True).query_chunk == 8192
+    # Long sequence under torch, where routing reads all 262144 keys: 256 MiB / (262144 * 4)
+    # leaves room for 256 query rows, far below the 8192 cap.
+    long_plan = _plan_execution(1, 262144, 262144, use_triton=False)
+    assert long_plan.routing_key_chunk == 262144
+    assert long_plan.query_chunk == 256
+    # Batch enters the same product, so a larger batch shrinks the chunk proportionally.
+    assert _plan_execution(4, 262144, 262144, use_triton=False).query_chunk == 64
 
 
 @pytest.mark.skipif(not torch.cuda.is_available() or not HAVE_TRITON, reason="CUDA Triton only")
