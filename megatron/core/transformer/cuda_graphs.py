@@ -1225,10 +1225,21 @@ class _CudaGraphRunner(torch.nn.Module):
     def create_val_graph(self):
         """Capture validation's forward-only graph using the training capture's inputs and pool."""
         module = self.base_module
+        args, kwargs = self.fwd_graph_input_args, self.fwd_graph_input_kwargs
+        # Validation reuses the first matching graph across microbatches. Share it instead of
+        # capturing duplicates for PP training runners with the same method and input signature.
+        for runner, _ in _CudagraphGlobalRecord.cudagraph_val_record:
+            if (
+                runner.base_module is module
+                and runner.func == self.func
+                and not runner.get_mismatch_errors(args, kwargs)
+            ):
+                self.val_runner = runner
+                return
+
         was_training = module.training
         module.eval()
         try:
-            args, kwargs = self.fwd_graph_input_args, self.fwd_graph_input_kwargs
             runner = _CudaGraphRunner(module, self.mempool, args, kwargs, self.func, False)
             runner.training = False
             runner.num_warmup_steps = self.num_warmup_steps
