@@ -1072,13 +1072,12 @@ class _HybridEPManager(_DispatchManager):
 
         # Metadata
         self.token_probs: Optional[torch.Tensor] = None
-        # Dense top-k expert ids replacing the routing map when HybridEP supports them.
+        # Compact expert ids use HybridEP's int16 top-k API.
         self.topk_idx: Optional[torch.Tensor] = None
-        # Compact routes when the config allows: the ids go in as dense top-k routing when the
-        # build supports it, else as the bool map rebuilt from them; the probabilities are
-        # scattered dense either way (see _expand_compact_routes).
         self.dense_routing_metadata = not uses_compact_routes(config)
         self._dense_topk_routing = hybrid_ep_dense_topk_routing(num_experts, num_local_experts)
+        if config.moe_virtual_expert_load_balance and not self._dense_topk_routing:
+            raise ValueError("Virtual experts require HybridEP's compact top-k routing API.")
         # Handle used for combine operation
         self.handle = None
         # Used for padding the output for each expert
@@ -1179,9 +1178,9 @@ class _HybridEPManager(_DispatchManager):
 
     def _expand_compact_routes(self, top_indices: torch.Tensor, probs: torch.Tensor):
         """HybridEP's inputs from compact routes: the dense ``[num_tokens, num_experts]``
-        probabilities (HybridEP reads one per route from them; the scatter carries the router's
-        gradient) and the ids as int16 dense top-k routing when the build supports it, else the
-        bool routing map rebuilt from them. Shared by the plain path (the router's ids) and the
+        probabilities (the scatter carries the router's gradient) and int16 top-k ids.
+        Ordinary HybridEP retains the boolean-map fallback for older builds.
+        Shared by the plain path (the router's ids) and the
         virtual-expert path (the planner's runtime ids)."""
         index = top_indices.long()
         probs = probs.new_zeros((probs.shape[0], self.num_experts)).scatter(1, index, probs)
