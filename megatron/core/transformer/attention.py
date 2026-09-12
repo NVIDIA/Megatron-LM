@@ -2145,10 +2145,13 @@ class SelfAttention(Attention):
 
 
 class CrossAttention(Attention):
-    """Cross-attention layer class
+    """Cross-attention with multi-head, grouped-query, or multi-query attention.
 
-    Cross-attention layer takes input with size [s, b, h] and context with size
-    [s, b, h] and returns output of the same size.
+    Takes queries of shape [sq, b, h] and context of shape [sk, b, h], returning
+    output with the query shape. ``num_query_groups`` controls the number of KV
+    heads independently of ``num_attention_heads``. When there are fewer KV heads
+    than tensor-parallel ranks, each KV head is shared by the ranks owning its
+    query heads. The combined KV projection size must be divisible by TP size.
     """
 
     def __init__(
@@ -2178,9 +2181,11 @@ class CrossAttention(Attention):
             name=name,
         )
 
-        if self.config.num_query_groups != self.config.num_attention_heads:
-            raise ValueError("Group query attention is not currently supported in cross attention.")
-        assert self.query_projection_size == self.kv_projection_size
+        # Unlike SelfAttention's combined QKV projection, the separate Q projection
+        # already partitions query heads evenly even when TP exceeds the KV head count.
+        self.num_attention_heads_per_partition = divide(
+            self.config.num_attention_heads, self.world_size
+        )
 
         self.linear_q = submodules.linear_q(
             self.config.hidden_size,
@@ -2191,6 +2196,8 @@ class CrossAttention(Attention):
             bias=self.config.add_bias_linear,
             skip_bias_add=False,
             is_expert=False,
+            tp_group=self.pg_collection.tp,
+            pg_collection=self.pg_collection,
             name=(name + ".linear_q") if name is not None else None,
         )
 
@@ -2203,6 +2210,8 @@ class CrossAttention(Attention):
             bias=self.config.add_bias_linear,
             skip_bias_add=False,
             is_expert=False,
+            tp_group=self.pg_collection.tp,
+            pg_collection=self.pg_collection,
             name=(name + ".linear_kv") if name is not None else None,
         )
 
@@ -2221,17 +2230,31 @@ class CrossAttention(Attention):
         assert not output_gate, "Output gate is not supported in cross attention for now."
 
         assert key_value_states is not None, "key_value_states cannot be None for CrossAttention"
-        # Attention heads [sk, b, h] --> [sk, b, (np * 2 * hn)]
+        # Project KV independently of the query head count.
         mixed_kv, _ = apply_module(self.linear_kv)(key_value_states)
 
-        # [sk, b, (np * 2 * hn)] --> [sk, b, np, 2 * hn]
+        if self.config.num_query_groups < self.world_size:
+            # A KV head can span multiple column-parallel weight shards. Reconstruct
+            # the projection and select the head shared by this rank's query heads.
+            # The all-gather's reduce-scatter backward sums all of those query ranks'
+            # KV gradients before returning them to the original weight shards.
+            mixed_kv = all_gather_last_dim_from_tensor_parallel_region(
+                mixed_kv, group=self.pg_collection.tp
+            )
+            group_index = get_pg_rank(self.pg_collection.tp) // (
+                self.world_size // self.config.num_query_groups
+            )
+            group_size = 2 * self.hidden_size_per_attention_head
+            mixed_kv = mixed_kv[..., group_index * group_size : (group_index + 1) * group_size]
+
+        # [sk, b, ng * 2 * hn] --> [sk, b, ng, 2 * hn]
         new_tensor_shape = mixed_kv.size()[:-1] + (
-            self.num_attention_heads_per_partition,
+            self.num_query_groups_per_partition,
             2 * self.hidden_size_per_attention_head,
         )
         mixed_kv = mixed_kv.view(*new_tensor_shape)
 
-        # [sk, b, np, 2 * hn] --> 2 [sk, b, np, hn]
+        # [sk, b, ng, 2 * hn] --> 2 [sk, b, ng, hn]
         key, value = tensor_parallel.split_tensor_along_last_dim(mixed_kv, 2)
 
         # Attention head [sq, b, h] --> [sq, b, hp]
