@@ -206,7 +206,8 @@ def test_deprecated_dsa_kernel_fusion_cli_has_no_implicit_true_default():
     assert args.apply_dsa_kernel_fusion is False
 
 
-def test_dsa_kernel_backend_cli_flag_and_effective_default():
+@pytest.mark.parametrize("version", ["v4", "v4.1"])
+def test_dsa_kernel_backend_cli_flag_and_effective_default(version):
     parser = ArgumentParser()
     _add_experimental_attention_variant_args(parser)
 
@@ -219,6 +220,7 @@ def test_dsa_kernel_backend_cli_flag_and_effective_default():
         args = SimpleNamespace(apply_dsa_kernel_fusion=legacy)
         kw_args = {
             "dsa_kernel_backend": backend,
+            "dsv4_version": version,
             "experimental_attention_variant": variant,
             "linear_attention_type": linear_attention_type,
         }

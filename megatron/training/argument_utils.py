@@ -400,19 +400,15 @@ def _resolve_dsa_kernel_backend_cli_default(args, kw_args):
     The CLI flag carries no static default so an omitted flag is distinguishable
     from an explicit "none". DSv4 hybrid launches historically ran fused kernels
     by default (the deprecated --no-dsa-kernel-fusion flag defaulted to True), so
-    an omitted flag resolves to "cudnn" for V4 unless the deprecated switch was
-    passed. V4.1 and every other configuration resolve to "none". Runs before
+    an omitted flag resolves to "cudnn" for both V4 and V4.1 unless the deprecated
+    switch was passed. Every other configuration resolves to "none". Runs before
     TransformerConfig.__post_init__ folds the deprecated switch into
     dsa_kernel_backend, so explicit legacy values still win.
     """
     if 'dsa_kernel_backend' not in kw_args or kw_args['dsa_kernel_backend'] is not None:
         return
     variant = kw_args.get('experimental_attention_variant') or kw_args.get('linear_attention_type')
-    if (
-        variant == 'dsv4_hybrid'
-        and kw_args.get('dsv4_version', 'v4') == 'v4'
-        and getattr(args, 'apply_dsa_kernel_fusion', None) is None
-    ):
+    if variant == 'dsv4_hybrid' and getattr(args, 'apply_dsa_kernel_fusion', None) is None:
         kw_args['dsa_kernel_backend'] = 'cudnn'
     else:
         kw_args['dsa_kernel_backend'] = 'none'
