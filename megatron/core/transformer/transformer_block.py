@@ -527,7 +527,11 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             if self.config.mhc_single_pass:
                 if mhc_state is None:
                     raise ValueError("Single-pass mHC final contraction requires mhc_state")
-                hidden_states = mhc_state.contract(hidden_states, self.config.num_residual_streams)
+                hidden_states = mhc_state.contract(
+                    hidden_states,
+                    self.config.num_residual_streams,
+                    use_fused=self.config.use_fused_mhc,
+                )
             else:
                 hidden_states = learned_output_contract(
                     hidden_states,

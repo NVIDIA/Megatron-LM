@@ -116,7 +116,6 @@ def test_tiny_config_accepts_source_reuse_and_ratio_transition():
         ({"dsa_kernel_backend": "tilelang"}, "dsa_kernel_backend='none' or 'cudnn'"),
         ({"dsa_indexer_precision": "mxfp8"}, "MXFP8 indexers require"),
         ({"gradient_accumulation_fusion": True}, "gradient_accumulation_fusion=False"),
-        ({"use_fused_mhc": True}, "use_fused_mhc=False"),
         ({"dsa_indexer_rotate_activation": True}, "Hadamard"),
         ({"tensor_model_parallel_size": 2}, "tensor_model_parallel_size=1"),
         ({"qk_pos_emb_head_dim": 7}, "rotary dimension"),
