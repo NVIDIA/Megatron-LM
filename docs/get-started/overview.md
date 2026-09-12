@@ -9,7 +9,7 @@
 
 # Overview
 
-Megatron-Core and Megatron-LM are open-source tools that typically work together to train LLMs at scale across GPUs. Megatron-Core expands the capability of Megatron-LM. Megatron Bridge connects Megatron-Core and Megatron-LM to other popular training models, such as Hugging Face.
+Megatron Core and Megatron-LM are open-source tools that are typically used together to train LLMs at scale across GPUs. Megatron Core expands the capabilities of Megatron-LM. Megatron Bridge connects Megatron Core and Megatron-LM to other popular training frameworks, such as Hugging Face.
 
 ## Megatron Core
 
@@ -40,7 +40,7 @@ Megatron Core is a **composable library** with GPU-optimized building blocks for
 
 ## Megatron-LM
 
-Megatron-LM is a reference implementation, with a lightweight large-scale LLM training framework. It offers a customizable native PyTorch training loop with fewer abstraction layers. It scales transformer models to the multi-billion and trillion-parameter regimes under realistic memory and compute constraints. **It serves as a direct entry point for exploring Megatron-Core.**
+Megatron-LM is a reference implementation providing a lightweight large-scale LLM training framework. It offers a customizable native PyTorch training loop with fewer abstraction layers. It was designed for scaling transformer models to the multi-billion- and trillion-parameter regimes under realistic memory and compute constraints. **It serves as a direct entry point for exploring Megatron-Core.**
 
 It uses advanced parallelization techniques including model parallelism (tensor and pipeline), to allow models with billions of parameters to fit and train across large GPU clusters. It enables breakthroughs in large-scale NLP tasks. It splits model computations across many GPUs, overcoming single-GPU memory limits for training huge models, like GPT-style transformers.
 
