@@ -870,12 +870,12 @@ class TestMcoreAdapterHybrid:
         assert torch.isfinite(reference).all()
         torch.testing.assert_close(hybrid, reference, rtol=1e-2, atol=0)
 
-    def test_moe_with_hybrid_dense(self):
-        """Dense parameters go hybrid; experts stay ZeRO-3 over the whole expert-DP domain.
-
-        This is the intended MoE configuration: ZeRO-3 + EP for the large expert weights,
-        and hybrid sharding for the dense ones. The two must end up on different meshes.
-        """
+    @pytest.mark.parametrize("dense_outer_strategy", ["optim", "no_shard"])
+    @pytest.mark.parametrize("expert_outer_strategy", ["optim", "no_shard"])
+    def test_moe_with_independent_hybrid_placements(
+        self, dense_outer_strategy, expert_outer_strategy
+    ):
+        """Dense and expert parameters use different placements on the same hybrid mesh."""
         world_size = int(os.environ.get("WORLD_SIZE", "1"))
         if world_size < 4 or world_size % 4:
             pytest.skip("MoE + hybrid needs a world size divisible by four (EP=2, instances=2).")
@@ -913,7 +913,8 @@ class TestMcoreAdapterHybrid:
                 use_distributed_optimizer=False,
                 data_parallel_sharding_strategy="optim_grads_params",
                 num_distributed_optimizer_instances=2,
-                outer_dp_sharding_strategy="optim",
+                outer_dp_sharding_strategy=dense_outer_strategy,
+                expert_outer_dp_sharding_strategy=expert_outer_strategy,
             ),
             module=HybridModel(
                 config=config,
@@ -944,12 +945,27 @@ class TestMcoreAdapterHybrid:
         success, _, _ = optimizer.step()
         assert success
 
-        meshes = {
+        mesh_dim_names = {
             parameter.grad.device_mesh.mesh_dim_names
             for parameter in model.parameters()
             if parameter.grad is not None
         }
-        assert ("dp_outer", "dp_shard") in meshes, f"no hybrid dense mesh in {meshes}"
-        assert ("expert_dp",) in meshes, f"no expert mesh in {meshes}"
-        # Experts must not have acquired an outer axis.
-        assert meshes == {("dp_outer", "dp_shard"), ("expert_dp",)}, meshes
+        assert mesh_dim_names == {("dp_outer", "dp_shard")}
+
+        dense_parameters = []
+        expert_parameters = []
+        for name, parameter in model.named_parameters():
+            if parameter.grad is None:
+                continue
+            # In this model, expert weights live under mlp.experts; router weights are dense.
+            if "experts" in name:
+                expert_parameters.append((name, parameter))
+            else:
+                dense_parameters.append((name, parameter))
+        dense_outer = Replicate() if dense_outer_strategy == "no_shard" else Shard(0)
+        for name, parameter in dense_parameters:
+            assert parameter.grad.placements == (dense_outer, Shard(0)), name
+
+        expert_outer = Replicate() if expert_outer_strategy == "no_shard" else Shard(0)
+        for name, parameter in expert_parameters:
+            assert parameter.grad.placements == (expert_outer, Shard(0)), name

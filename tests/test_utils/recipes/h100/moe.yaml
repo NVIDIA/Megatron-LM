@@ -179,7 +179,7 @@ products:
   - test_case: [gpt3_mcore_te_tp2_zp_z3_resume_torch_dist_te_8experts2parallel_top2router]
     products:
       - environment: [dev]
-        scope: [mr-broken, mr-github-broken]
+        scope: [nightly-broken]
         platforms: [dgx_h100]
   - test_case: [gpt3_mcore_te_tp2_pp1_te_8experts2parallel_ddp_average_in_collective]
     products:
@@ -221,7 +221,7 @@ products:
   - test_case: [deepseek_proxy_mfsdp_v1_ep2_ep_overlap]
     products:
       - environment: [dev]
-        scope: [mr, mr-github]
+        scope: [nightly]
         platforms: [dgx_h100]
   - test_case: [deepseek_proxy_mfsdp_v2_ep2]
     products:

@@ -70,7 +70,7 @@ products:
   - test_case: [deepseek_proxy_mfsdp_v1_ep2_1node]
     products:
       - environment: [dev]
-        scope: [mr-github, mr-github-slim]
+        scope: [nightly]
         platforms: [dgx_gb200]
   - test_case: [gpt3_moe_mcore_te_ep8_resume_torch_dist_muon_1node]
     products:
