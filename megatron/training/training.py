@@ -1510,48 +1510,6 @@ def _freeze_non_dsa_indexer_parameters(model):
     )
 
 
-def _freeze_dsa_indexer_parameters(model):
-    """Freeze DSA indexer parameters while preserving all other trainability choices."""
-
-    indexer_param_count = 0
-    indexer_element_count = 0
-    trainable_main_param_count = 0
-    trainable_main_element_count = 0
-
-    for model_module in model:
-        for name, param in model_module.named_parameters():
-            if _is_dsa_indexer_param_name(name):
-                param.requires_grad_(False)
-                indexer_param_count += 1
-                indexer_element_count += param.nelement()
-            elif param.requires_grad:
-                trainable_main_param_count += 1
-                trainable_main_element_count += param.nelement()
-
-    global_indexer_param_count = _global_dsa_indexer_reset_count(indexer_param_count)
-    global_trainable_main_param_count = _global_dsa_indexer_reset_count(
-        trainable_main_param_count
-    )
-    if global_indexer_param_count == 0:
-        raise RuntimeError(
-            "--dsa-train-main-only was set, but no DSA indexer parameters were found. "
-            "Check that --experimental-attention-variant dsa is active and DSA layers are built."
-        )
-    if global_trainable_main_param_count == 0:
-        raise RuntimeError(
-            "--dsa-train-main-only left no non-indexer parameters trainable."
-        )
-
-    print_rank_0(
-        " > DSA train-main-only: frozen indexer params "
-        f"{indexer_param_count} local tensors ({global_indexer_param_count} across ranks) / "
-        f"{indexer_element_count} local elements; trainable non-indexer params "
-        f"{trainable_main_param_count} local tensors "
-        f"({global_trainable_main_param_count} across ranks) / "
-        f"{trainable_main_element_count} local elements."
-    )
-
-
 def apply_dsa_param_freezing(model):
     """Apply --dsa-train-indexer-only / --dsa-train-main-only parameter freezing.
 
@@ -1578,18 +1536,6 @@ def apply_dsa_param_freezing(model):
                 "the module forward pre-hooks that overlapped param gather depends on."
             )
         _freeze_non_dsa_indexer_parameters(model)
-    elif getattr(args, "dsa_train_main_only", False):
-        if getattr(args, "experimental_attention_variant", None) != "dsa":
-            raise RuntimeError(
-                "--dsa-train-main-only requires --experimental-attention-variant dsa."
-            )
-        if getattr(args, "use_torch_fsdp2", False) or getattr(
-            args, "use_megatron_fsdp", False
-        ):
-            raise RuntimeError(
-                "--dsa-train-main-only currently supports DDP/distributed-optimizer models only."
-            )
-        _freeze_dsa_indexer_parameters(model)
 
 
 def _is_dsa_indexer_param_name(name: str) -> bool:
@@ -1805,12 +1751,10 @@ def _broadcast_dsa_indexer_params(model) -> None:
 
 def _get_dsa_indexer_reset_seed(args) -> int:
     """Return the reset seed, following normal Megatron model-init seed derivation."""
-    seed = args.dsa_indexer_reset_seed
-    if seed is None:
-        seed = getattr(args, "seed", 1234)
-        seed += 100 * mpu.get_pipeline_model_parallel_rank()
-        if getattr(args, "data_parallel_random_init", False):
-            seed += 10 * mpu.get_data_parallel_rank()
+    seed = getattr(args, "seed", 1234)
+    seed += 100 * mpu.get_pipeline_model_parallel_rank()
+    if getattr(args, "data_parallel_random_init", False):
+        seed += 10 * mpu.get_data_parallel_rank()
     return seed
 
 
@@ -4315,10 +4259,7 @@ def training_log(
         )
 
     # Track sparse attention indexer loss.
-    if (
-        args.dsa_indexer_loss_coeff is not None
-        and args.dsa_indexer_loss_coeff > 0
-    ) or getattr(args, "dsa_fwd_skip_dsa", False):
+    if args.dsa_indexer_loss_coeff is not None and args.dsa_indexer_loss_coeff > 0:
         indexer_loss_scale = 1 / get_num_microbatches()
         if isinstance(pg_collection, MultiModuleProcessGroupCollection):
             assert pg_collection.has_language_model(), (

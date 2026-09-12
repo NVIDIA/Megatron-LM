@@ -216,8 +216,6 @@ def check_checkpoint_args(checkpoint_args, skip_args: set[str] | None = None):
         def _dsa_trainability_mode(namespace):
             if getattr(namespace, 'dsa_train_indexer_only', False):
                 return 'indexer-only'
-            if getattr(namespace, 'dsa_train_main_only', False):
-                return 'main-only'
             return 'joint'
 
         checkpoint_mode = _dsa_trainability_mode(checkpoint_args)
@@ -225,8 +223,7 @@ def check_checkpoint_args(checkpoint_args, skip_args: set[str] | None = None):
         assert checkpoint_mode == runtime_mode, (
             "DSA trainability mode changed from checkpoint "
             f"({checkpoint_mode}) to runtime ({runtime_mode}) while loading optimizer state. "
-            "Use --no-load-optim when transitioning among joint, indexer-only, and main-only "
-            "training."
+            "Use --no-load-optim when transitioning between joint and indexer-only training."
         )
     if args.vocab_file:
         _compare('max_position_embeddings')
