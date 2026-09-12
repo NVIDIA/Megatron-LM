@@ -198,7 +198,7 @@ def _build_vmm_allocator():
     """
     # Own subdirectory: load_inline writes a fixed main.cpp per build dir, so sharing
     # nccl_allocator's dir would clobber sources. Torch's file lock serializes ranks.
-    module_dir = os.path.dirname(os.path.abspath(__file__))
+    module_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     build_dir = os.path.join(module_dir, "build", "vmm_symm_allocator")
     os.makedirs(build_dir, exist_ok=True)
     try:

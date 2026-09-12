@@ -5,7 +5,7 @@
 """GTP symmetric memory: NCCL window registration for GTP communication buffers.
 
 This module keeps one ``torch.cuda.MemPool`` per GTP process group, backed by the
-VMM allocator (see megatron.core.vmm_symm_allocator). Once
+VMM allocator (see megatron.core.allocator.vmm_symm_allocator). Once
 ``register_gtp_symm_pool(group)`` registers a pool on its group, PyTorch's
 ProcessGroupNCCL hook window-registers every allocation made inside
 ``gtp_symm_pool_ctx(group)``, which lets NCCL run its symmetric / NVLS kernels on
@@ -29,8 +29,8 @@ from contextlib import AbstractContextManager
 import torch
 import torch.distributed as dist
 
+import megatron.core.allocator.vmm_symm_allocator as vmm_symm_allocator
 import megatron.core.nccl_allocator as nccl_allocator
-import megatron.core.vmm_symm_allocator as vmm_symm_allocator
 from megatron.core.utils import is_torch_min_version, log_single_rank
 
 logger = logging.getLogger(__name__)

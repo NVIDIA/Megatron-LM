@@ -131,7 +131,7 @@ class TestRegisterVersionGuard:
 def _vmm_pool_or_skip():
     import shutil
 
-    import megatron.core.vmm_symm_allocator as vmm_alloc
+    import megatron.core.allocator.vmm_symm_allocator as vmm_alloc
 
     # Preflight only: skip where the extension cannot possibly build, but let a real
     # build failure FAIL the test (a broad skip would turn compiler regressions green).
@@ -143,7 +143,7 @@ def _vmm_pool_or_skip():
 class TestVmmAllocatorModule:
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA allocator test")
     def test_build_is_cached(self):
-        import megatron.core.vmm_symm_allocator as vmm_alloc
+        import megatron.core.allocator.vmm_symm_allocator as vmm_alloc
 
         _vmm_pool_or_skip()
         first = vmm_alloc._allocator
