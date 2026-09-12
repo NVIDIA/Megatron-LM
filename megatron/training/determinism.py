@@ -28,6 +28,8 @@ DETERMINISM_ENV_VAR_DEFAULTS: dict[str, str] = {
     "NCCL_ALGO": "Ring",
     "NVTE_ALLOW_NONDETERMINISTIC_ALGO": "0",
     "CUBLAS_WORKSPACE_CONFIG": ":4096:8",
+    # TRITON_CACHE_AUTOTUNING is deliberately absent: unset is already deterministic, so
+    # turning caching on is the operator's call. See apply_determinism_env().
 }
 
 # Accepted NCCL_ALGO tokens under --deterministic-mode. Comma-separated lists
@@ -57,9 +59,14 @@ ACCEPTED_NCCL_ALGO_TOKENS: frozenset[str] = frozenset({"Ring", "CollnetDirect", 
 #   - ``CUBLAS_WORKSPACE_CONFIG``: NVIDIA docs list ``:4096:8`` (4x4MiB) and
 #     ``:16:8`` (8x16KiB) as the two deterministic workspace configurations;
 #     any other value breaks reproducibility.
+#   - ``TRITON_CACHE_AUTOTUNING``: the consumer tests it as ``== "1"``, so any
+#     other truthy spelling ("true", "yes") would silently read as opted out.
+#     Both settings are deterministic, so both are accepted and neither is
+#     defaulted -- see :func:`apply_determinism_env` for the pairing rule.
 ACCEPTED_ENV_VAR_VALUES: dict[str, frozenset[str]] = {
     "NVTE_ALLOW_NONDETERMINISTIC_ALGO": frozenset({"0"}),
     "CUBLAS_WORKSPACE_CONFIG": frozenset({":4096:8", ":16:8"}),
+    "TRITON_CACHE_AUTOTUNING": frozenset({"0", "1"}),
 }
 
 
@@ -75,6 +82,9 @@ def apply_determinism_env(env: MutableMapping[str, str]) -> None:
     * ``MAMBA_DETERMINISTIC`` / ``CAUSAL_CONV1D_DETERMINISTIC`` — if set
       (non-empty), must start with ``'1'``; unset auto-follows
       :func:`torch.are_deterministic_algorithms_enabled`.
+    * ``TRITON_CACHE_AUTOTUNING`` — opt-in; if set to ``'1'``, requires
+      ``TRITON_CACHE_DIR``. Unset, Triton autotuning falls back to a pinned
+      cheapest config, which is deterministic without any cache.
 
     After validation, ``setdefault`` fills every key in
     :data:`DETERMINISM_ENV_VAR_DEFAULTS` that has not been set — a value the
@@ -111,6 +121,25 @@ def apply_determinism_env(env: MutableMapping[str, str]) -> None:
                 "--deterministic-mode. Unset it or set to '1'."
             )
 
+    # Cross-field rule, so it cannot go in ACCEPTED_ENV_VAR_VALUES: caching only makes ranks
+    # agree if they share one cache, and unset TRITON_CACHE_DIR means a node-local one.
+    if env.get("TRITON_CACHE_AUTOTUNING") == "1":
+        assert env.get("TRITON_CACHE_DIR"), (
+            "TRITON_CACHE_AUTOTUNING=1 under --deterministic-mode requires TRITON_CACHE_DIR "
+            "(a shared-filesystem path); unset TRITON_CACHE_AUTOTUNING to use the "
+            "deterministic pinned-config fallback instead."
+        )
+
+        # Recommended, not required: changes no numerics, only visibility. print() because this
+        # runs from validate_args, before logging is configured.
+        if not env.get("TRITON_PRINT_AUTOTUNING"):
+            print(
+                "Deterministic mode: set TRITON_PRINT_AUTOTUNING=1 to log the kernel config "
+                "each rank selects. A cache miss re-times the selection on that rank alone, "
+                "which is how ranks come to disagree; without this the miss leaves no record.",
+                flush=True,
+            )
+
     # setdefault preserves any launcher-set value that just passed validation.
     for k, v in DETERMINISM_ENV_VAR_DEFAULTS.items():
         env.setdefault(k, v)
@@ -127,7 +156,8 @@ def apply_determinism_to_args(args) -> None:
     2. Calls :func:`apply_determinism_env` on ``os.environ`` — validates
        every determinism-relevant env var (``NCCL_ALGO``,
        ``NVTE_ALLOW_NONDETERMINISTIC_ALGO``, ``CUBLAS_WORKSPACE_CONFIG``,
-       ``MAMBA_DETERMINISTIC``, ``CAUSAL_CONV1D_DETERMINISTIC``) and
+       ``MAMBA_DETERMINISTIC``, ``CAUSAL_CONV1D_DETERMINISTIC``,
+       ``TRITON_CACHE_AUTOTUNING`` and its required ``TRITON_CACHE_DIR``) and
        setdefaults the canonical values.
     3. Calls ``torch.use_deterministic_algorithms(True)``.
 
