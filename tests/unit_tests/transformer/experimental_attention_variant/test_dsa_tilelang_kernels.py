@@ -538,37 +538,34 @@ def test_sparse_mla_delta_pads_partial_sequence_tile(monkeypatch):
     torch.testing.assert_close(delta, expected)
 
 
-def test_fused_qk_topk_lighting_preserves_single_head_weight_axis(monkeypatch):
+def test_lighting_indexer_indices_preserves_single_head_weight_axis(monkeypatch):
     seen = {}
 
-    def fake_lighting_indexer_indices(
-        index_q, index_k, weights, cu_seqlen_ks, cu_seqlen_ke, topk, use_relu
+    def fake_indexer_fwd_interface(
+        index_q, index_k, weights, cu_seqlen_ks, cu_seqlen_ke, clean_logits, use_relu
     ):
-        del index_k, cu_seqlen_ks, cu_seqlen_ke
-        seen["index_q_shape"] = index_q.shape
+        del index_q, index_k, cu_seqlen_ks, cu_seqlen_ke
         seen["weights_shape"] = weights.shape
-        seen["topk"] = topk
+        seen["clean_logits"] = clean_logits
         seen["use_relu"] = use_relu
-        return torch.tensor([[2, 1], [2, 1]], dtype=torch.int32)
+        return torch.arange(6, dtype=torch.float32).view(2, 3)
 
-    monkeypatch.setattr(tilelang_dsa, "lighting_indexer_indices", fake_lighting_indexer_indices)
+    monkeypatch.setattr(indexer, "indexer_fwd_interface", fake_indexer_fwd_interface)
 
-    topk_indices = tilelang_dsa.fused_qk_topk_lighting(
-        q=torch.empty(2, 1, 1, 4, dtype=torch.bfloat16),
-        k=torch.empty(3, 1, 4, dtype=torch.bfloat16),
-        weights=torch.ones(2, 1, 1),
-        index_topk=2,
-        starts=torch.zeros(2, dtype=torch.int32),
-        ends=torch.full((2,), 3, dtype=torch.int32),
-        block_size=2,
+    topk_indices = indexer.lighting_indexer_indices(
+        index_q=torch.empty(2, 1, 4),
+        index_k=torch.empty(3, 4),
+        weights=torch.ones(2, 1),
+        cu_seqlen_ks=torch.zeros(2, dtype=torch.int32),
+        cu_seqlen_ke=torch.full((2,), 3, dtype=torch.int32),
+        topk=2,
         use_relu=False,
     )
 
-    assert seen["index_q_shape"] == (2, 1, 4)
     assert seen["weights_shape"] == (2, 1)
-    assert seen["topk"] == 2
+    assert seen["clean_logits"] is True
     assert seen["use_relu"] is False
-    torch.testing.assert_close(topk_indices, torch.tensor([[[2, 1], [2, 1]]], dtype=torch.int32))
+    torch.testing.assert_close(topk_indices, torch.tensor([[2, 1], [2, 1]], dtype=torch.int32))
 
 
 def _skip_if_real_tilelang_indexer_unavailable():

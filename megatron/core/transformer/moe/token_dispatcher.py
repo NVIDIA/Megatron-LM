@@ -247,6 +247,10 @@ class MoETokenDispatcher:
         self.shared_experts = shared_experts
         self.use_nccl_stream = True
 
+    def get_expert_zero_copy_buffers(self):
+        """Return expert output/grad-input communication buffers when supported."""
+        return None, None
+
 
 class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
     """

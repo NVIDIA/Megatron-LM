@@ -1,9 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
 import logging
-
-logger = logging.getLogger(__name__)
-
 from typing import Any, Callable
 
 import torch
@@ -14,6 +11,7 @@ from megatron.core.distributed import (
     DistributedDataParallelConfig,
     FullyShardedDataParallel,
 )
+from megatron.core.full_cuda_graph import get_shared_capture_stream
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 from megatron.core.optimizer.layer_wise_optimizer import (
     LayerWiseDistributedOptimizer,
@@ -31,12 +29,16 @@ from megatron.core.enums import ModelType
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import MegatronModule, TransformerConfig
 from megatron.core.transformer.module import Float16Module
-from megatron.core.utils import get_model_config
+from megatron.core.utils import get_model_config, get_pg_rank
+
 
 try:
     from megatron.core.fp8_utils import correct_amax_history_if_needed
 except ImportError:
     correct_amax_history_if_needed = None
+
+
+logger = logging.getLogger(__name__)
 
 
 def unimodal_build_distributed_models(
@@ -94,13 +96,9 @@ def unimodal_build_distributed_models(
     init_model_with_meta_device = transformer_config.init_model_with_meta_device
     if init_model_with_meta_device:
         with torch.device("meta"):
-            model_list = build_virtual_pipeline_stages(
-                build_model_func, pg_collection, vp_size, model_type
-            )
+            model_list = build_virtual_pipeline_stages(build_model_func, pg_collection, vp_size, model_type)
     else:
-        model_list = build_virtual_pipeline_stages(
-            build_model_func, pg_collection, vp_size, model_type
-        )
+        model_list = build_virtual_pipeline_stages(build_model_func, pg_collection, vp_size, model_type)
 
     # Apply pre wrap hooks
     if pre_wrap_hook is not None:
@@ -217,7 +215,7 @@ def _print_num_params(model: list[MegatronModule], pg_collection: ProcessGroupCo
     """Print the number of parameters in the model on rank 0.
 
     Only prints on data parallel rank 0 to avoid duplicate output.
-    Shows parameter count per (tensor parallel, pipeline parallel) rank.
+    Shows parameter count per (tensor parallel, gtp_remat, pipeline parallel) rank.
 
     Args:
         model: List of model modules to count parameters from
@@ -225,15 +223,11 @@ def _print_num_params(model: list[MegatronModule], pg_collection: ProcessGroupCo
     """
     if (pg_collection.dp.rank() == 0) and (pg_collection.cp.rank() == 0):
         print(
-            " > number of parameters on (tensor, pipeline) model parallel rank ({}, {}): {}".format(
+            " > number of parameters on (tensor, gtp_remat, pipeline) model parallel rank ({}, {}, {}): {}".format(
                 pg_collection.tp.rank(),
+                get_pg_rank(pg_collection.gtp_remat),
                 pg_collection.pp.rank(),
-                sum(
-                    [
-                        sum([p.nelement() for p in model_module.parameters()])
-                        for model_module in model
-                    ]
-                ),
+                sum([sum([p.nelement() for p in model_module.parameters()]) for model_module in model]),
             ),
             flush=True,
         )
@@ -247,9 +241,7 @@ def _wrap_with_mp_wrapper(
     fp16 = transformer_config.fp16
     bf16 = transformer_config.bf16
     if (fp16 or bf16) and mixed_precision_wrapper is not None:
-        model_list = [
-            mixed_precision_wrapper(transformer_config, model_module) for model_module in model_list
-        ]
+        model_list = [mixed_precision_wrapper(transformer_config, model_module) for model_module in model_list]
 
         # Maintain expert bias in float32 wrapped in Float16Module
         for model_module in model_list:
@@ -291,9 +283,7 @@ def _ddp_wrap(
     if use_megatron_fsdp:
         DP = FullyShardedDataParallel
         if use_torch_fsdp2:
-            raise ValueError(
-                "Using use_megatron_fsdp and use_torch_fsdp2 at the same time is not supported."
-            )
+            raise ValueError("Using use_megatron_fsdp and use_torch_fsdp2 at the same time is not supported.")
     elif use_torch_fsdp2:
         assert HAVE_FSDP2, "Torch FSDP2 requires torch>=2.4.0"
         DP = TorchFullyShardedDataParallel
@@ -303,10 +293,6 @@ def _ddp_wrap(
     compute_layout = None
     if DP is DistributedDataParallel:
         if use_layer_wise_distributed_optimizer:
-            # LayerWise (Muon) manages matrix parameters as whole tensors while
-            # sibling Adam parameters use byte-sharded DistOpt buffers. Tag before
-            # DDP groups parameters into buffers and force reduce-scatter for the
-            # sibling DistOpt buffers.
             ddp_config.use_distributed_optimizer = True
             tag_params_for_buffer_routing(model)
             compute_layout = LayerWiseDistributedOptimizer.compute_full_param_layout
@@ -331,11 +317,15 @@ def _ddp_wrap(
         if not ddp_config.overlap_grad_reduce:
             ddp_config.bucket_size = None
 
-    # DDP initialization is required to be on a side-stream for the full-iteration CUDA graph.
-    #  this side-stream may be nested if being called from within the get_model function, but it
-    #  is here in case someone wants to use this directly outside of get_model.
-    ddp_stream = torch.cuda.Stream()
+    if get_model_config(model[0]).cuda_graph_impl == "full_iteration":
+        # DDP initialization must use the full-iteration capture stream so its retained
+        # AccumulateGrad nodes do not reference a different, non-capturing stream.
+        ddp_stream = get_shared_capture_stream()
+    else:
+        # Preserve a dedicated initialization stream for all other implementations.
+        ddp_stream = torch.cuda.Stream()
     ddp_stream.wait_stream(torch.cuda.current_stream())
+
     with torch.cuda.stream(ddp_stream):
         dp_init_kwargs = {}
         if not use_torch_fsdp2:
@@ -344,22 +334,45 @@ def _ddp_wrap(
         wrapped_model = []
         for model_chunk_idx, model_chunk in enumerate(model):
             chunk_kwargs = dict(dp_init_kwargs)
-            disable_bucketing = (model_chunk_idx > 0) or overlap_param_gather_with_optimizer_step
+            disable_bucketing = (
+                (model_chunk_idx > 0)
+                or overlap_param_gather_with_optimizer_step
+            )
 
             # Pre-compute parameter layouts for the distributed optimizer.
             # Only pass to DDP; FSDP variants don't accept full_param_layout.
             if compute_layout is not None:
-                all_params = [p for p in model_chunk.parameters() if p.requires_grad]
+                all_params = [
+                    p for p in model_chunk.parameters() if p.requires_grad
+                ]
                 pp_rank = pg_collection.pp.rank()
                 effective_bucket_size = (
-                    None if disable_bucketing or pp_rank > 0 else ddp_config.bucket_size
+                    None
+                    if disable_bucketing or pp_rank > 0
+                    else ddp_config.bucket_size
                 )
-                chunk_kwargs["full_param_layout"] = compute_layout(
-                    all_params,
-                    effective_bucket_size,
-                    pg_collection.dp_cp.size(),
-                    ddp_config,
-                    expert_data_parallel_world_size=pg_collection.expt_dp.size(),
+                # Size the layout by the group the optimizer actually shards over, which is
+                # the intra-instance group when there are several optimizer instances. Using
+                # the full dp_cp would report more shards than the reduce-scatter uses and
+                # leave the trailing shard of every bucket owned by no rank.
+                intra_dp_cp_group = getattr(pg_collection, "intra_dp_cp", None)
+                intra_expt_dp_group = getattr(pg_collection, "intra_expt_dp", None)
+                chunk_kwargs["full_param_layout"] = (
+                    compute_layout(
+                        all_params,
+                        effective_bucket_size,
+                        (
+                            intra_dp_cp_group
+                            if intra_dp_cp_group is not None
+                            else pg_collection.dp_cp
+                        ).size(),
+                        ddp_config,
+                        expert_data_parallel_world_size=(
+                            intra_expt_dp_group
+                            if intra_expt_dp_group is not None
+                            else pg_collection.expt_dp
+                        ).size(),
+                    )
                 )
 
             wrapped_chunk = DP(
@@ -372,7 +385,7 @@ def _ddp_wrap(
             wrapped_model.append(wrapped_chunk)
         model = wrapped_model
 
-    # Critical: ensure side-stream work completes before touching params on default stream
+    # Ensure initialization-stream work completes before touching params on the default stream.
     torch.cuda.current_stream().wait_stream(ddp_stream)
 
     # Broadcast params from data parallel src rank to other data parallel ranks.
@@ -412,14 +425,13 @@ def build_virtual_pipeline_stages(
         # Create multiple model stages for virtual pipeline
         model_list = []
         for i in range(vp_size):
-            pre_process = is_vp_first_stage(vp_stage=i, vp_size=vp_size) and is_pp_first_stage(
-                pp_group
-            )
-            post_process = is_vp_last_stage(vp_stage=i, vp_size=vp_size) and is_pp_last_stage(
-                pp_group
-            )
+            pre_process = is_vp_first_stage(vp_stage=i, vp_size=vp_size) and is_pp_first_stage(pp_group)
+            post_process = is_vp_last_stage(vp_stage=i, vp_size=vp_size) and is_pp_last_stage(pp_group)
             model = build_model_func(
-                pg_collection, pre_process=pre_process, post_process=post_process, vp_stage=i
+                pg_collection,
+                pre_process=pre_process,
+                post_process=post_process,
+                vp_stage=i,
             )
             model.model_type = model_type
             model_list.append(model)

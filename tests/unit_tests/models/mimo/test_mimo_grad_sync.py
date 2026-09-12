@@ -16,14 +16,42 @@ import torch.distributed as dist
 
 from examples.mimo.training.grad_sync import (
     _vision_participation_count,
+    configure_grad_sync,
     mark_modality_participation,
     reset_modality_participation,
 )
+from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY
 from tests.unit_tests.models.mimo.test_mimo_1f1b_schedule import (
     create_hypercomm_grid,
     destroy_all_grids,
 )
 from tests.unit_tests.test_utilities import Utils
+
+
+def test_configure_grad_sync_installs_production_overlap_hooks():
+    def no_sync():
+        return None
+
+    def start_grad_sync(*_unused):
+        return None
+
+    config = SimpleNamespace(no_sync_func=None, grad_sync_func=None)
+    model = SimpleNamespace(
+        config=config,
+        no_sync=no_sync,
+        start_grad_sync=start_grad_sync,
+        language_model=None,
+        modality_submodules={},
+    )
+    language_grid = SimpleNamespace(get_rank_enum=lambda _name: [[0]])
+    topology = SimpleNamespace(grids={MIMO_LANGUAGE_MODULE_KEY: language_grid}, module_pgs={})
+
+    configure_grad_sync(
+        SimpleNamespace(overlap_grad_reduce=True, align_grad_reduce=True), model, topology
+    )
+
+    assert config.no_sync_func is no_sync
+    assert config.grad_sync_func is start_grad_sync
 
 
 class TestVisionParticipation:

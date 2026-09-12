@@ -190,6 +190,13 @@ def setup_model_and_optimizer(
     optimizer_state_offload_fraction=1.0,
     use_precision_aware_optimizer=False,
     initialize_optimizer_state=True,
+    muon_scalar_optimizer="adam",
+    ddp_num_buckets=None,
+    ddp_pad_buckets_for_high_nccl_busbw=False,
+    cp=1,
+    ep=1,
+    etp=1,
+    use_megatron_fsdp=False,
 ):
     optimizer_type = optimizer
     use_layer_wise = False
@@ -210,6 +217,22 @@ def setup_model_and_optimizer(
     mock_args = parse_args(ignore_unknown_args=True)
     with mock.patch('megatron.training.training.get_args', new=lambda: mock_args):
         init_basic_mock_args(mock_args, tp, pp, bf16=bf16)
+        if ddp_num_buckets is not None:
+            mock_args.ddp_num_buckets = ddp_num_buckets
+            mock_args.overlap_grad_reduce = True
+        mock_args.ddp_pad_buckets_for_high_nccl_busbw = ddp_pad_buckets_for_high_nccl_busbw
+        mock_args.context_parallel_size = cp
+        mock_args.expert_model_parallel_size = ep
+        mock_args.expert_tensor_parallel_size = etp
+        mock_args.use_megatron_fsdp = use_megatron_fsdp
+        mock_args.data_parallel_sharding_strategy = (
+            "optim_grads_params" if use_megatron_fsdp else "no_shard"
+        )
+        if use_megatron_fsdp:
+            mock_args.megatron_fsdp_main_params_dtype = torch.float32
+            mock_args.megatron_fsdp_main_grads_dtype = None
+            mock_args.megatron_fsdp_grad_comm_dtype = None
+        mock_args.gradient_accumulation_fusion = False
         mock_args.use_distributed_optimizer = ddp_use_dist_opt
         mock_args.use_layer_wise_distributed_optimizer = ddp_use_layer_wise
         if ddp_use_layer_wise:
@@ -221,6 +244,9 @@ def setup_model_and_optimizer(
                 tensor_model_parallel_size=tp,
                 pipeline_model_parallel_size=pp,
                 pipeline_dtype=torch.bfloat16,
+                context_parallel_size=cp,
+                expert_model_parallel_size=ep,
+                expert_tensor_parallel_size=etp,
                 bf16=bf16,
             )
         )
@@ -231,11 +257,15 @@ def setup_model_and_optimizer(
         use_distributed_optimizer=ddp_use_dist_opt,
         use_layer_wise_distributed_optimizer=use_layer_wise,
         optimizer=optimizer,
+        muon_scalar_optimizer=muon_scalar_optimizer,
         chunked_optimizer_state_offload=chunked_optimizer_state_offload,
         optimizer_state_offload_chunk_size_mb=optimizer_state_offload_chunk_size_mb,
         optimizer_state_offload_fraction=optimizer_state_offload_fraction,
         use_precision_aware_optimizer=use_precision_aware_optimizer,
     )
+
+    if use_megatron_fsdp:
+        config.lr = 1.0e-3
 
     if optimizer_type in ('muon', 'dist_muon'):
         config.lr = 0.0
@@ -271,7 +301,8 @@ def setup_model_and_optimizer(
                         optimizer.optimizer.state[p]['exp_avg'] = torch.rand_like(p.data)
                         optimizer.optimizer.state[p]['exp_avg_sq'] = torch.rand_like(p.data)
 
-    optimizer.reload_model_params()
+    if not use_megatron_fsdp:
+        optimizer.reload_model_params()
     if chunked_optimizer_state_offload:
         optimizer.offload_optimizer_state_for_forward()
     CachedMetadataFileSystemReader.clear_metadata_cache()

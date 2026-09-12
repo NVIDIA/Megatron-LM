@@ -9,6 +9,11 @@ import zipfile
 import click
 import gitlab
 
+if __package__:
+    from .archive_utils import safe_extract_zip
+else:
+    from archive_utils import safe_extract_zip
+
 BASE_PATH = pathlib.Path(__file__).parent.resolve()
 PROJECT_ID = int(os.getenv("CI_PROJECT_ID", 19378))
 
@@ -53,8 +58,8 @@ def main(pipeline_id: int):
                 file_name = '__artifacts.zip'
                 with open(file_name, "wb") as f:
                     job.artifacts(streamed=True, action=f.write)
-                zip = zipfile.ZipFile(file_name)
-                zip.extractall("tmp")
+                with zipfile.ZipFile(file_name) as archive:
+                    safe_extract_zip(archive, "tmp")
                 logger.info("Downloaded artifacts of job %s", job.name)
             except Exception:
                 continue

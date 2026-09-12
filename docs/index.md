@@ -50,7 +50,6 @@ get-started/quickstart
 user-guide/data-preparation
 user-guide/training-examples
 user-guide/parallelism-guide
-user-guide/hybrid-model-migration
 ```
 
 ```{toctree}
@@ -67,11 +66,9 @@ models/index
 :caption: Advanced Features
 
 user-guide/features/moe
-user-guide/features/context_parallel
 user-guide/features/megatron_fsdp
 user-guide/features/dist_optimizer
 user-guide/features/optimizer_cpu_offload
-user-guide/features/pipeline_parallel_layout
 user-guide/features/fine_grained_activation_offloading
 user-guide/data-loading
 user-guide/features/megatron_energon
@@ -104,5 +101,6 @@ apidocs/index.rst
 :hidden:
 :caption: Resources
 
+user-guide/hybrid-model-migration
 advanced/index
 ```

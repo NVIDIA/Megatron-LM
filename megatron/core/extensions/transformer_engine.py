@@ -8,6 +8,7 @@ import inspect
 import io
 import os
 import pickle
+import re
 import warnings
 from contextlib import nullcontext
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tuple, cast
@@ -88,6 +89,28 @@ except ImportError:
         HAVE_TE = False
 
 _TE_CONFIG_TYPE_KEY = "transformer_engine_config_type"
+_EXPERT_PARAMETER_NAME_PATTERN = re.compile(r"(weight|bias)\d*")
+
+
+def _set_expert_parameter_attributes(
+    module: torch.nn.Module, parallel_mode: Optional[str], use_expert_pgs: bool
+) -> None:
+    """Set expert process-group and tensor-partition metadata on a TE module."""
+    for name, param in module.named_parameters(recurse=False):
+        param.allreduce = not use_expert_pgs
+
+        name_match = _EXPERT_PARAMETER_NAME_PATTERN.fullmatch(name)
+        parameter_kind = name_match.group(1) if name_match else None
+        is_weight = parameter_kind == "weight"
+        is_bias = parameter_kind == "bias"
+        is_partitioned = parallel_mode in ("column", "row") and (
+            is_weight or (parallel_mode == "column" and is_bias)
+        )
+        if is_weight or is_bias:
+            param.tensor_model_parallel = is_partitioned
+        if is_partitioned:
+            param.partition_dim = 1 if parallel_mode == "row" else 0
+            param.partition_stride = 1
 
 
 class TransformerEngineConfigType(enum.Enum):
@@ -872,6 +895,11 @@ class TELinear(te.pytorch.Linear):
             tp_size = get_pg_size(tp_group)
 
         self.expert_parallel = self.config.expert_model_parallel_size > 1
+        use_expert_pgs = is_expert and (
+            self.expert_parallel
+            or self.config.expert_tensor_parallel_size != self.config.tensor_model_parallel_size
+            or self.config.expert_gtp_weight_remat_size != self.config.gtp_weight_remat_size
+        )
         if is_expert:
             rng_tracker_name = get_expert_parallel_rng_tracker_name()
         else:
@@ -929,11 +957,10 @@ class TELinear(te.pytorch.Linear):
                 **extra_kwargs,
             )
 
-        for param in self.parameters():
-            if is_expert:
-                # Reduce the gradient on the expert_data_parallel group for expert linear layers
-                setattr(param, "allreduce", not self.expert_parallel)
-            else:
+        if is_expert:
+            _set_expert_parameter_attributes(self, parallel_mode, use_expert_pgs)
+        else:
+            for param in self.parameters():
                 # Reduce the gradient on DP group
                 setattr(param, "allreduce", True)
                 if parallel_mode == "duplicated":
@@ -1466,6 +1493,14 @@ class TEColumnParallelLinear(TELinear):
                     self.bias.zero_()
                 setattr(self.bias, "allreduce", True)
 
+        if is_expert:
+            use_expert_pgs = (
+                config.expert_model_parallel_size > 1
+                or config.expert_tensor_parallel_size != config.tensor_model_parallel_size
+                or config.expert_gtp_weight_remat_size != config.gtp_weight_remat_size
+            )
+            _set_expert_parameter_attributes(self, "column", use_expert_pgs)
+
     def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
         """Sharding along axis 0, bias sharded"""
         state_dict = self.state_dict(prefix="", keep_vars=True)
@@ -1704,6 +1739,14 @@ class TERowParallelLinear(TELinear):
                     self.bias.zero_()
                 setattr(self.bias, "allreduce", True)
                 setattr(self.bias, "sequence_parallel", config.sequence_parallel)
+
+        if is_expert:
+            use_expert_pgs = (
+                config.expert_model_parallel_size > 1
+                or config.expert_tensor_parallel_size != config.tensor_model_parallel_size
+                or config.expert_gtp_weight_remat_size != config.gtp_weight_remat_size
+            )
+            _set_expert_parameter_attributes(self, "row", use_expert_pgs)
 
     def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
         """Sharding along axis 1, bias not sharded"""
@@ -2162,6 +2205,11 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             extra_kwargs["ub_name"] = tp_comm_buffer_name
 
             self.expert_parallel = self.config.expert_model_parallel_size > 1
+            use_expert_pgs = is_expert and (
+                self.expert_parallel
+                or self.config.expert_tensor_parallel_size != self.config.tensor_model_parallel_size
+                or self.config.expert_gtp_weight_remat_size != self.config.gtp_weight_remat_size
+            )
             if is_expert:
                 extra_kwargs["rng_tracker_name"] = get_expert_parallel_rng_tracker_name()
 
@@ -2252,23 +2300,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                     **extra_kwargs,
                 )
 
-            for param in self.parameters():
-                setattr(param, "allreduce", not (is_expert and self.expert_parallel))
-
-            # Explicitly stamp partition_dim and partition_stride on expert weight
-            # tensors when explicit_expert_comm cleared parallel_mode.  TE ≤2.12
-            # set these internally; TE ≥2.13 no longer does (parallel_mode=None
-            # is passed due to explicit_expert_comm).  The resharding/refit planner
-            # relies on partition_dim to correctly plan TP gather/scatter operations.
-            # NOTE: we intentionally do NOT stamp tensor_model_parallel here —
-            # doing so would change num-zeros gradient counting.
-            if self.explicit_expert_comm and original_parallel_mode in ("column", "row"):
-                part_dim = 0 if original_parallel_mode == "column" else 1
-                for i in range(num_gemms):
-                    weight = getattr(self, f"weight{i}", None)
-                    if weight is not None:
-                        setattr(weight, "partition_dim", part_dim)
-                        setattr(weight, "partition_stride", 1)
+            _set_expert_parameter_attributes(self, original_parallel_mode, use_expert_pgs)
 
             self._register_load_state_dict_pre_hook(
                 type(self)._normalize_grouped_parameter_keys, with_module=True
@@ -2503,7 +2535,10 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             if not fp8_checkpoint:
                 return [state] * self.num_gemms
 
-            state = self._decode_extra_state(state)
+            decoded_state = self._decode_extra_state(state)
+            if decoded_state is None:
+                return [state] * self.num_gemms
+            state = decoded_state
             extra_states = []
             extra_fp8_variables = state["extra_fp8_variables"]
             extra_fp8_variables["num_gemms"] = 1

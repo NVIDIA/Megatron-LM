@@ -129,6 +129,7 @@ def test_training_log_resets_first_iteration_when_log_interval_is_one(monkeypatc
         consumed_train_samples=0,
         data_parallel_size=1,
         dsa_indexer_loss_coeff=None,
+        gtp_weight_remat_size=1,
         log_energy=False,
         log_interval=1,
         log_memory_interval=None,

@@ -1,4 +1,4 @@
-# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
 import gc
 import inspect
@@ -691,22 +691,7 @@ class TestMoESingleGroupedWeightNumerics:
 
         self.assert_all_ranks_passed(local_passed, local_error)
 
-    @pytest.mark.parametrize(
-        "precision",
-        [
-            "bf16",
-            "mxfp8",
-            pytest.param(
-                "nvfp4",
-                marks=pytest.mark.skip(
-                    reason=(
-                        "NVFP4 single grouped weights are not supported by the "
-                        "TransformerEngine native grouped-tensor path yet."
-                    )
-                ),
-            ),
-        ],
-    )
+    @pytest.mark.parametrize("precision", ["bf16", "mxfp8", "nvfp4"])
     @pytest.mark.parametrize("gradient_accumulation_fusion", [False, True])
     def test_single_grouped_weight_parity_with_primary_param_gather(
         self, precision, gradient_accumulation_fusion

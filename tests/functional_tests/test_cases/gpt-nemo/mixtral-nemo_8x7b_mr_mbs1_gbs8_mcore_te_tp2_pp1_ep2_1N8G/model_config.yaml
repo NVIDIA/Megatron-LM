@@ -19,3 +19,4 @@ MODEL_ARGS:
   data.global_batch_size: 8
   data.seq_length: 2048
 TEST_TYPE: regular
+LAUNCHER: ft_launcher

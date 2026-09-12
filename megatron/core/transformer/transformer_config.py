@@ -154,6 +154,9 @@ class TransformerConfig(ModelParallelConfig):
     If attention backend is local we use the local pytorch implementation in mcore.
     Users can specify exact backend by changing this config. """
 
+    flash_attention_version: Optional[Literal[2, 3, 4]] = None
+    """FlashAttention version to use. None selects the default implementation."""
+
     softmax_scale: Optional[float] = None
     """Softmax scale for attention scaling."""
 
@@ -3989,9 +3992,11 @@ class TransformerConfig(ModelParallelConfig):
             assert (
                 not self.moe_shared_expert_overlap
             ), 'disable moe_shared_expert_overlap when enabling overlap_moe_expert_parallel_comm'
-            assert (
-                self.mtp_num_layers is None or self.mtp_num_layers == 1
-            ), 'MTP layernum only supports 1 when enabling overlap_moe_expert_parallel_comm.'
+            assert self.mtp_num_layers in (
+                None,
+                0,
+                1,
+            ), 'MTP supports at most one layer when enabling overlap_moe_expert_parallel_comm.'
 
             # NCCL EP (ncclep flex backend) mirrors hybridep's comm/compute overlap, but a few
             # configs are not yet safe under the 1F1B split and are gated here.
@@ -4164,6 +4169,12 @@ class TransformerConfig(ModelParallelConfig):
             assert self.transformer_impl == "inference_optimized", (
                 "inference_disable_triton_nvls_kernels is only supported "
                 "for inference_optimized transformer implementation."
+            )
+
+        if self.flash_attention_version is not None:
+            assert self.flash_attention_version in (2, 3, 4), (
+                "flash_attention_version must be one of 2, 3, or 4, got "
+                f"{self.flash_attention_version}"
             )
 
         if self.batch_invariant_mode:

@@ -53,3 +53,4 @@ MODEL_ARGS:
   --bf16: true
   --log-memory-to-tensorboard: true
 TEST_TYPE: ckpt-resume
+LAUNCHER: ft_launcher

@@ -63,3 +63,4 @@ MODEL_ARGS:
   --bf16: true
   --no-bias-gelu-fusion: true
 TEST_TYPE: ckpt-resume
+LAUNCHER: ft_launcher

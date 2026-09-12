@@ -47,7 +47,6 @@ HAVE_EMERGING_OPTIMIZERS = _eo_ver >= (0, 2)
 if HAVE_EMERGING_OPTIMIZERS:
     from emerging_optimizers.scalar_optimizers import Lion
 
-from megatron.core import parallel_state
 from megatron.core.optimizer.cpu_offloading.hybrid_optimizer import HybridDeviceOptimizer
 from megatron.core.optimizer_param_scheduler import (
     ParamGroupOverride,
@@ -686,11 +685,12 @@ def _get_megatron_optimizer_based_on_param_groups(
         setattr(optimizer, 'grad_stats_parallel_group', model_parallel_group)
 
     if pg_collection is None or not hasattr(pg_collection, 'tp'):
-        tp_group = parallel_state.get_tensor_model_parallel_group()
-    else:
-        tp_group = pg_collection.tp
-    # TODO(M4): plumb tp_group through optimizer constructors so this setattr disappears.
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+    tp_group = pg_collection.tp
+    expert_tp_group = getattr(pg_collection, 'expt_tp', tp_group)
+    # TODO(M4): plumb TP groups through optimizer constructors so these setattrs disappear.
     setattr(optimizer, 'tp_group', tp_group)
+    setattr(optimizer, 'expert_tp_group', expert_tp_group)
 
     return optimizer
 
@@ -898,11 +898,10 @@ def _get_megatron_emerging_optimizer(
             else:
                 optimizer = FP32Optimizer(optimizer, config, init_state_fn)
             setattr(optimizer, 'grad_stats_parallel_group', model_parallel_group)
-            if pg_collection is None or not hasattr(pg_collection, 'tp'):
-                tp_group = parallel_state.get_tensor_model_parallel_group()
-            else:
-                tp_group = pg_collection.tp
+            tp_group = pg_collection.tp
+            expert_tp_group = getattr(pg_collection, 'expt_tp', tp_group)
             setattr(optimizer, 'tp_group', tp_group)
+            setattr(optimizer, 'expert_tp_group', expert_tp_group)
             results.append(optimizer)
             continue
         else:
@@ -1064,10 +1063,12 @@ def get_megatron_optimizer(
     intra_expt_dp_group = process_groups_dict['intra_expt_dp_group']
     mp_group = process_groups_dict['mp_group']
     expt_tp_pp_group = process_groups_dict['expt_tp_pp_group']
+    expt_tp_pp_with_egtp_remat_group = process_groups_dict['expt_tp_pp_with_egtp_remat_group']
     intra_dp_cp_group_gloo = process_groups_dict['intra_dp_cp_group_gloo']
     intra_expt_dp_group_gloo = process_groups_dict['intra_expt_dp_group_gloo']
     intra_dist_opt_group = process_groups_dict['intra_dist_opt_group']
 
+    # ``mp_group`` spans TP×GTP_remat×PP (GTP_remat-merged).
     model_parallel_rank = get_pg_rank(mp_group)
 
     if get_pg_size(dp_cp_group) > get_pg_size(intra_dp_cp_group):
@@ -1192,8 +1193,9 @@ def get_megatron_optimizer(
                 param_to_param_group[param_name] = param_group_id
             param_group_id += 1
     if len(moe_param_groups) > 0:
-        expt_model_parallel_rank = get_pg_rank(expt_tp_pp_group)
-        # Pass Gloo process groups into optimizer only if needed.
+        # Expert analog of dense ``model_parallel_rank``; use the EGTP_remat-merged group so each
+        # EGTP_remat peer gets a distinct distopt ShardedObject key (else DCP "duplicate" error).
+        expt_model_parallel_rank = get_pg_rank(expt_tp_pp_with_egtp_remat_group)
         if use_gloo_process_groups:
             expt_data_parallel_group_gloo = intra_expt_dp_group_gloo
         else:
@@ -1204,7 +1206,7 @@ def get_megatron_optimizer(
                 model_chunks=model_chunks,
                 param_groups=moe_param_groups,
                 per_model_buffers=moe_buffers,
-                model_parallel_group=expt_tp_pp_group,
+                model_parallel_group=expt_tp_pp_with_egtp_remat_group,
                 data_parallel_group=intra_expt_dp_group,
                 data_parallel_group_gloo=expt_data_parallel_group_gloo,
                 data_parallel_group_idx=expt_model_parallel_rank,

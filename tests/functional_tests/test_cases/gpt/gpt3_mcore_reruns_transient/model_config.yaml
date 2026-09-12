@@ -88,3 +88,4 @@ AFTER_SCRIPT: |
   check_log -E "ERROR:megatron\.core\.rerun_state_machine:Rank [0-9]+, node ([0-9a-z]|\-)+, device [0-9]+: Possible transient error!!"
   EXIT_CODE=0
 TEST_TYPE: regular
+LAUNCHER: ft_launcher

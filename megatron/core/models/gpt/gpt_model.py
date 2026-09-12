@@ -1,5 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import logging
 from collections import OrderedDict
 from typing import Any, Callable, Dict, Literal, Optional
 
@@ -27,7 +28,7 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.quantization.utils import get_quant_config_or_none
 from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
-from megatron.core.transformer.enums import ModelType
+from megatron.core.transformer.enums import InferenceCudaGraphScope, ModelType
 from megatron.core.transformer.linear_cross_entropy import LinearCrossEntropyModule
 from megatron.core.transformer.moe.paged_stash import paged_stash_init_chunk_handler
 from megatron.core.transformer.multi_token_prediction import (
@@ -43,7 +44,10 @@ from megatron.core.utils import (
     WrappedTensor,
     deprecate_inference_params,
     is_using_quantization_scales,
+    log_single_rank,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class GPTModel(LanguageModule):
@@ -113,6 +117,13 @@ class GPTModel(LanguageModule):
         pg_collection: Optional[ProcessGroupCollection] = None,
         vp_stage: Optional[int] = None,
     ) -> None:
+        log_single_rank(
+            logger,
+            logging.WARNING,
+            "GPTModel IS DEPRECATED. GPTModel is only accepting critical bug fixes, no new "
+            "features. Please reference the migration guide "
+            "`docs/user-guide/hybrid-model-migration.md` for details on how to use `HybridModel`",
+        )
         super().__init__(config=config, pg_collection=pg_collection)
 
         if has_config_logger_enabled(config):
@@ -758,11 +769,18 @@ class GPTModel(LanguageModule):
 
         if self.config.mtp_num_layers:
             assert self.config.mtp_num_layers > 0
-            if in_inference_mode or is_spec_decode:
+            if is_spec_decode:
                 # Cache decoder hidden states for serial MTP computation
                 # after speculative token verification.
-                self._decoder_hidden_states_cache = hidden_states
-            else:
+                assert inference_context is not None
+                if self.config.inference_cuda_graph_scope == InferenceCudaGraphScope.block:
+                    assert inference_context.mtp_decoder_hidden_states is not None
+                    inference_context.mtp_decoder_hidden_states[: hidden_states.shape[0]].copy_(
+                        hidden_states
+                    )
+                else:
+                    inference_context.mtp_decoder_hidden_states = hidden_states
+            elif not in_inference_mode:
                 # In training/eval, use the utility function for processing MTP loss/scaling.
                 hidden_states = process_mtp_loss(
                     hidden_states=hidden_states,
