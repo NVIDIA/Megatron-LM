@@ -12,6 +12,7 @@ from megatron.core.models.hybrid.hybrid_layer_allocation import (
     get_hybrid_layer_counts,
     get_hybrid_total_layer_count,
     get_hybrid_total_pipeline_segment_count,
+    get_layer_maps_from_layer_config_list,
     get_layer_maps_from_layer_type_list,
     parse_hybrid_pattern,
     pattern_from_ratios,
@@ -1012,3 +1013,57 @@ class TestGetLayerMapsFromLayerTypeList:
         assert mamba_map == {2: 0}
         assert mlp_map == {3: 0}
         assert moe_map == {}
+
+
+@pytest.mark.internal
+class TestGetLayerMapsFromLayerConfigList:
+    """Tests for get_layer_maps_from_layer_config_list."""
+
+    def test_maps_are_keyed_by_layer_symbol(self):
+        """Config-derived maps expose readable layer-symbol keys."""
+        layer_symbols = list(_EXPECTED_LAYER_CONFIG_CLASSES)
+        layer_configs = [
+            _EXPECTED_LAYER_CONFIG_CLASSES[layer_symbol](
+                num_layers=1, hidden_size=64, num_attention_heads=4
+            )
+            for layer_symbol in layer_symbols
+        ]
+
+        assert get_layer_maps_from_layer_config_list(layer_configs) == {
+            layer_symbol: {global_layer_idx: 0}
+            for global_layer_idx, layer_symbol in enumerate(layer_symbols)
+        }
+
+    def test_repeated_config_types_use_type_local_indices(self):
+        """Repeated config types receive consecutive type-local indices."""
+        config_kwargs = {"num_layers": 1, "hidden_size": 64, "num_attention_heads": 4}
+        layer_configs = [
+            MambaLayerConfig(**config_kwargs),
+            AttentionLayerConfig(**config_kwargs),
+            MambaLayerConfig(**config_kwargs),
+        ]
+
+        maps = get_layer_maps_from_layer_config_list(layer_configs)
+
+        assert maps[Symbols.MAMBA] == {0: 0, 2: 1}
+        assert maps[Symbols.ATTENTION] == {1: 0}
+        assert maps[Symbols.GDN] == {}
+        assert maps[Symbols.DS_ATTENTION] == {}
+
+    def test_rejects_config_subclasses(self):
+        """Unregistered config subclasses are not implicitly supported."""
+
+        class CustomMambaLayerConfig(MambaLayerConfig):
+            pass
+
+        with pytest.raises(
+            ValueError, match="Unexpected hybrid layer config type: CustomMambaLayerConfig"
+        ):
+            get_layer_maps_from_layer_config_list(
+                [CustomMambaLayerConfig(num_layers=1, hidden_size=64, num_attention_heads=4)]
+            )
+
+    def test_rejects_unknown_config_types(self):
+        """Unknown config classes fail instead of silently omitting a layer."""
+        with pytest.raises(ValueError, match="Unexpected hybrid layer config type: object"):
+            get_layer_maps_from_layer_config_list([object()])
