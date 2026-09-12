@@ -13,6 +13,7 @@ import torch
 import torch.nn.functional as F
 
 from megatron.core import tensor_parallel
+from megatron.core.context_parallel_layout import convert_module_input_tensors_cp_partition_mode
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.jit import jit_fuser
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -165,6 +166,23 @@ class GatedDeltaNet2(_GDNBase):
         """
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
+
+        cp_group = (
+            packed_seq_params.cp_group
+            if packed_seq_params is not None and packed_seq_params.cp_group is not None
+            else self.pg_collection.cp
+        )
+        hidden_states, back_to_input_converter = convert_module_input_tensors_cp_partition_mode(
+            hidden_states=hidden_states,
+            packed_seq_params=packed_seq_params,
+            cp_group=cp_group,
+            tp_group=self.pg_collection.tp,
+            tp_cp_group=getattr(self.pg_collection, "tp_cp", None),
+            target_partition_mode="zigzag",
+            sequence_parallel=self.config.sequence_parallel,
+            source_partition_mode=getattr(self, "_cp_input_partition_mode", None),
+            config=self.config,
+        )
 
         seq_len, batch, _ = hidden_states.shape
         seq_len = seq_len * self.sp_size * self.cp_size
@@ -329,6 +347,11 @@ class GatedDeltaNet2(_GDNBase):
 
         if self.recompute_norm_out:
             self.norm_out_checkpoint.discard_output_and_register_recompute(out)
+
+        if back_to_input_converter is not None:
+            out = back_to_input_converter.convert(
+                out, seq_dim=0, sequence_parallel=self.config.sequence_parallel
+            )
 
         return out, out_bias
 

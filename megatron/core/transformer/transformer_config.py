@@ -1091,6 +1091,14 @@ class TransformerConfig(ModelParallelConfig):
     linear_cp_mode: Literal["headwise", "chunkwise"] = "headwise"
     """Context-parallel algorithm for recurrent and linear-attention layers."""
 
+    cp_partition_mode: CPLayout = "zigzag"
+    """CP layout at model boundaries.
+
+    Module-local adapters may temporarily convert this layout to the layout required by an
+    attention or recurrent layer. ``linear_cp_layout`` and ``attention_cp_layout`` remain the
+    internal-layout preferences used by main's cross-layer layout manager.
+    """
+
     linear_cp_layout: CPLayout = "zigzag"
     """CP layout for linear-attention layers."""
 
@@ -1501,6 +1509,8 @@ class TransformerConfig(ModelParallelConfig):
 
     def _validate_cp_layouts(self) -> None:
         """Validate context-parallel layout settings."""
+        if self.cp_partition_mode not in ("zigzag", "contiguous"):
+            raise ValueError(f"Unsupported cp_partition_mode: {self.cp_partition_mode}")
         if self.linear_cp_mode == "chunkwise" and self.linear_cp_layout != "contiguous":
             raise ValueError("linear_cp_mode='chunkwise' requires linear_cp_layout='contiguous'.")
         if self.context_parallel_size > 1 and self.attention_cp_layout == "contiguous":
@@ -1510,14 +1520,6 @@ class TransformerConfig(ModelParallelConfig):
         if self.linear_cp_layout == "contiguous" and self.hybrid_context_parallel:
             raise ValueError(
                 "hybrid_context_parallel is not supported with linear_cp_layout='contiguous'."
-            )
-        if (
-            self.sequence_packing_scheduler is not None
-            and self.context_parallel_size > 1
-            and self.linear_cp_layout != self.attention_cp_layout
-        ):
-            raise ValueError(
-                "The sequence-packing scheduler does not support CP layout conversion."
             )
         if (
             self.context_parallel_size > 1
@@ -3055,6 +3057,27 @@ class TransformerConfig(ModelParallelConfig):
         assert not (
             self.cuda_graph_impl == "full_iteration" and self.cuda_graph_modules
         ), 'cuda_graph_modules must be empty when cuda_graph_impl="full_iteration".'
+
+        cuda_graph_captures_attention = self.cuda_graph_impl == "full_iteration" or (
+            self.cuda_graph_impl in ("local", "transformer_engine")
+            and (not self.cuda_graph_modules or CudaGraphModule.attn in self.cuda_graph_modules)
+        )
+        if (
+            self.context_parallel_size > 1
+            and self.sequence_packing_scheduler is not None
+            and self.cp_partition_mode != "zigzag"
+            and cuda_graph_captures_attention
+        ):
+            # TODO(yuzhongw): use GIN to make native NCCL all-to-all split sizes replayable
+            # before allowing a non-empty ThdCpRoute inside CUDA graph capture.
+            raise ValueError(
+                "THD context-parallel layout conversion is required for this model "
+                "configuration, but native NCCL all-to-all with per-microbatch split sizes "
+                "cannot be replayed inside CUDA graph capture that includes attention "
+                f"(cp_partition_mode={self.cp_partition_mode!r}, "
+                f"cuda_graph_impl={self.cuda_graph_impl!r}, "
+                f"cuda_graph_modules={self.cuda_graph_modules!r})."
+            )
 
         if self.cuda_graph_impl != "none":
 

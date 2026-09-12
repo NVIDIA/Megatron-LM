@@ -1,4 +1,4 @@
-# Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import copy
 from unittest import mock
@@ -480,6 +480,8 @@ def _test_parallel_attention_correctness(
     sequence_length=256,
     micro_batch_size=4,
     sequence_packing=False,
+    cp_partition_mode="zigzag",
+    compare_param_grads=False,
 ):
     # Model initialization function
     def initialize_gpt_model(
@@ -532,8 +534,52 @@ def _test_parallel_attention_correctness(
         mock_args.no_load_rng = True
         save_checkpoint(10, gpt_model, None, None, 0)
 
+        def get_param_grad(param):
+            grad = param.grad
+            if grad is None:
+                grad = getattr(param, "main_grad", None)
+            if grad is None:
+                return torch.zeros_like(param, dtype=torch.float32)
+            return grad
+
+        def zero_param_grads(module):
+            for param in module.parameters():
+                param.grad = None
+                main_grad = getattr(param, "main_grad", None)
+                if main_grad is not None:
+                    main_grad.zero_()
+
+        def assert_param_grad_close(baseline, parallel, tensor_name):
+            try:
+                torch.testing.assert_close(
+                    baseline,
+                    parallel,
+                    atol=atol,
+                    rtol=rtol,
+                    msg=lambda msg: f"Mismatch in {tensor_name}: {msg}",
+                )
+                return
+            except AssertionError as close_error:
+                baseline_flat = baseline.flatten().float()
+                parallel_flat = parallel.flatten().float()
+                cosine_sim = torch.nn.functional.cosine_similarity(
+                    baseline_flat.unsqueeze(0), parallel_flat.unsqueeze(0)
+                ).item()
+                diff_norm = torch.linalg.vector_norm(parallel_flat - baseline_flat)
+                baseline_norm = torch.linalg.vector_norm(baseline_flat).clamp_min(1e-12)
+                relative_l2 = (diff_norm / baseline_norm).item()
+                assert cosine_sim >= 0.9999, (
+                    f"Mismatch in {tensor_name}: cosine similarity {cosine_sim} < 0.9999, "
+                    f"while assert_close failed: {close_error}"
+                )
+                assert relative_l2 <= 0.1, (
+                    f"Mismatch in {tensor_name}: relative L2 {relative_l2} > 0.1, "
+                    f"while assert_close failed: {close_error}"
+                )
+
         # Calculate baseline output
         attention = gpt_model[0].decoder.layers[0].self_attention
+        zero_param_grads(attention)
         output_hidden_states_baseline, bias_hidden_states_baseline = attention(
             input_hidden_states, attention_mask=None
         )
@@ -541,6 +587,13 @@ def _test_parallel_attention_correctness(
 
         # Save baseline output
         input_grad_baseline = input_hidden_states.grad.detach()
+        param_grads_baseline = None
+        if compare_param_grads:
+            param_grads_baseline = {
+                name: get_param_grad(param).detach().float().clone()
+                for name, param in attention.named_parameters()
+                if param.requires_grad
+            }
         output_hidden_states_baseline = output_hidden_states_baseline.detach()
         bias_hidden_states_baseline = bias_hidden_states_baseline
         if bias_hidden_states_baseline is not None:
@@ -559,9 +612,11 @@ def _test_parallel_attention_correctness(
         transformer_config.context_parallel_size = cp
         transformer_config.tensor_model_parallel_size = tp
         transformer_config.sequence_parallel = sp
+        transformer_config.cp_partition_mode = cp_partition_mode
         init_basic_mock_args(mock_args, tp, 1, bf16=True)
         mock_args.context_parallel_size = cp
         mock_args.sequence_parallel = sp
+        mock_args.cp_partition_mode = cp_partition_mode
         gpt_model = unwrap_model(get_model(initialize_gpt_model, config=transformer_config))
         with mock.patch('megatron.training.checkpointing.check_checkpoint_args'):
             with mock.patch('megatron.training.checkpointing.update_num_microbatches'):
@@ -572,10 +627,25 @@ def _test_parallel_attention_correctness(
         tp_rank = parallel_state.get_tensor_model_parallel_rank()
 
         def get_tensor_on_this_rank(tensor):
-            if cp > 1:
-                tensor = get_tensor_on_this_cp_rank(tensor, 0, cp_group)
+            if cp_partition_mode not in ("zigzag", "contiguous"):
+                raise ValueError(f"Unsupported test CP partition mode {cp_partition_mode!r}.")
+
             if sequence_packing:
+                if cp > 1 and cp_partition_mode == "zigzag":
+                    tensor = get_tensor_on_this_cp_rank(tensor, 0, cp_group)
                 tensor = tensor.transpose(0, 1).contiguous().view(-1, 1, *tensor.shape[2:])
+                if cp > 1 and cp_partition_mode == "contiguous":
+                    cp_rank = torch.distributed.get_rank(cp_group)
+                    part_length = tensor.shape[0] // cp
+                    tensor = tensor.narrow(0, cp_rank * part_length, part_length)
+            elif cp > 1:
+                cp_rank = torch.distributed.get_rank(cp_group)
+                if cp_partition_mode == "zigzag":
+                    cp_idx = torch.tensor([cp_rank, 2 * cp - cp_rank - 1], device=tensor.device)
+                else:
+                    cp_idx = torch.tensor([2 * cp_rank, 2 * cp_rank + 1], device=tensor.device)
+                tensor = tensor.view(2 * cp, -1, *tensor.shape[1:])
+                tensor = tensor.index_select(0, cp_idx).view(-1, *tensor.shape[2:])
             if tp > 1 and sp:
                 sp_seg = tensor.shape[0] // tp
                 tensor = tensor[tp_rank * sp_seg : (tp_rank + 1) * sp_seg]
@@ -585,15 +655,27 @@ def _test_parallel_attention_correctness(
         if sequence_packing:
             cu_seqlens = [i * sequence_length for i in range(micro_batch_size + 1)]
             packed_seq_params = make_test_packed_seq_params(cu_seqlens=cu_seqlens)
+            packed_seq_params.cp_partition_mode = cp_partition_mode
         else:
             packed_seq_params = None
         input_hidden_states = get_tensor_on_this_rank(input_hidden_states)
         input_hidden_states = input_hidden_states.detach().requires_grad_(True)
         parallel_attention = gpt_model[0].decoder.layers[0].self_attention
+        zero_param_grads(parallel_attention)
         output_hidden_states_parallel, bias_hidden_states_parallel = parallel_attention(
             input_hidden_states, attention_mask=None, packed_seq_params=packed_seq_params
         )
         output_hidden_states_parallel.sum().backward()
+        param_grads_parallel = None
+        if compare_param_grads:
+            assert tp == 1, "Parameter gradient parity only supports unsharded parameters."
+            param_grads_parallel = {}
+            for name, param in parallel_attention.named_parameters():
+                if param.requires_grad:
+                    grad = get_param_grad(param)
+                    if cp > 1:
+                        torch.distributed.all_reduce(grad, group=cp_group)
+                    param_grads_parallel[name] = grad.detach().float().clone()
         input_grad_parallel = input_hidden_states.grad.detach()
 
         # Check if the output is close
@@ -652,6 +734,12 @@ def _test_parallel_attention_correctness(
                 rtol=rtol,
                 msg=lambda msg: f"Mismatch in bias_hidden_states: {msg}",
             )
+        if compare_param_grads:
+            assert param_grads_baseline.keys() == param_grads_parallel.keys()
+            for name, grad_baseline in param_grads_baseline.items():
+                assert_param_grad_close(
+                    grad_baseline, param_grads_parallel[name], f"param_grad[{name}]"
+                )
 
         Utils.destroy_model_parallel()
 
@@ -659,19 +747,30 @@ def _test_parallel_attention_correctness(
 @pytest.mark.parametrize("sequence_packing", [False, True])
 @pytest.mark.parametrize("apply_rope_fusion", [False, True])
 @pytest.mark.parametrize(
-    ("tp", "sp", "cp"),
+    ("tp", "sp", "cp", "cp_partition_mode"),
     [
-        (4, False, 1),  # TP w/o SP
-        (4, True, 1),  # TP w/ SP
-        (1, False, 4),  # CP
-        (2, False, 2),  # CP + TP w/o SP
-        (2, True, 2),  # CP + TP w/ SP
+        (4, False, 1, "zigzag"),  # TP w/o SP
+        (4, True, 1, "zigzag"),  # TP w/ SP
+        (1, False, 4, "zigzag"),  # CP
+        (1, False, 4, "contiguous"),  # CP
+        (2, False, 2, "zigzag"),  # CP + TP w/o SP
+        (2, False, 2, "contiguous"),  # CP + TP w/o SP
+        (2, True, 2, "zigzag"),  # CP + TP w/ SP
+        (2, True, 2, "contiguous"),  # CP + TP w/ SP
     ],
 )
 @pytest.mark.parametrize("qk_layernorm", [False, True])
 @pytest.mark.parametrize("output_gate", [False, True])
 def test_parallel_attention_correctness(
-    tmp_path_dist_ckpt, sequence_packing, apply_rope_fusion, tp, sp, cp, qk_layernorm, output_gate
+    tmp_path_dist_ckpt,
+    sequence_packing,
+    apply_rope_fusion,
+    tp,
+    sp,
+    cp,
+    cp_partition_mode,
+    qk_layernorm,
+    output_gate,
 ):
     transformer_config = TransformerConfig(
         num_layers=1,
@@ -690,9 +789,9 @@ def test_parallel_attention_correctness(
     atol, rtol = 1e-2, 1e-2
 
     _test_parallel_attention_correctness(
-        transformer_config,
-        transformer_layer_spec,
-        tmp_path_dist_ckpt,
+        transformer_config=transformer_config,
+        transformer_layer_spec=transformer_layer_spec,
+        tmp_path_dist_ckpt=tmp_path_dist_ckpt,
         atol=atol,
         rtol=rtol,
         tp=tp,
@@ -701,6 +800,8 @@ def test_parallel_attention_correctness(
         seed=123,
         sequence_length=256,
         sequence_packing=sequence_packing,
+        cp_partition_mode=cp_partition_mode,
+        compare_param_grads=(tp == 1 and cp > 1),
     )
 
 

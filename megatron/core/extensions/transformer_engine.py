@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 from __future__ import annotations
 
 import copy
@@ -2272,11 +2272,15 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             self.kept_packed_seq_params.discard("cu_seqlens_q_padded")
             self.kept_packed_seq_params.discard("cu_seqlens_kv_padded")
 
-        # total_tokens and seq_idx are only for Mamba and should not be forwarded to TE attention.
-        # tokens_per_sample is only for MoE sequence-level aux loss reshaping.
+        # These fields are MCore-only and should not be forwarded to TE attention.
+        # total_tokens and seq_idx are only for Mamba; tokens_per_sample is only for
+        # MoE sequence-level aux loss reshaping; cp_partition_mode and cp_partition_route
+        # are MCore CP metadata.
         self.kept_packed_seq_params.discard("total_tokens")
         self.kept_packed_seq_params.discard("seq_idx")
         self.kept_packed_seq_params.discard("tokens_per_sample")
+        self.kept_packed_seq_params.discard("cp_partition_mode")
+        self.kept_packed_seq_params.discard("cp_partition_route")
         self.kept_packed_seq_params.discard("cp_scatter_cache")
 
         if get_te_version() < PkgVersion("2.2.0"):
@@ -3849,3 +3853,24 @@ try:
     from transformer_engine.pytorch.float8_tensor import Float8Tensor
 except ImportError:
     Float8Tensor = None
+
+
+def get_thd_partitioned_indices(cu_seqlens, total_tokens, cp_size, cp_rank):
+    """Get partitioned indices for THD format data in context parallel.
+
+    Args:
+        cu_seqlens: Cumulative sequence lengths tensor.
+        total_tokens: Total number of tokens.
+        cp_size: Context parallel world size.
+        cp_rank: Context parallel rank.
+
+    Returns:
+        Partitioned indices tensor.
+    """
+    assert is_te_min_version("1.10.0"), (
+        "Please update Transformer Engine to >= 1.10 to use "
+        "Context Parallel with THD format data"
+    )
+    import transformer_engine_torch as tex
+
+    return tex.thd_get_partitioned_indices(cu_seqlens, total_tokens, cp_size, cp_rank)

@@ -157,6 +157,7 @@ def test_cp_layouts_are_selected_by_layer_config_type(monkeypatch):
         "zigzag",
     )
     assert layout_manager_kwargs["boundary_layout"] == "contiguous"
+    assert layout_manager_kwargs["cuda_graph_impl"] == config.cuda_graph_impl
 
 
 def test_hybrid_stack_rejects_layer_config_subclasses(monkeypatch):

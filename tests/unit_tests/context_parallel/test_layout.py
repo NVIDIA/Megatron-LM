@@ -13,6 +13,7 @@ from megatron.core.context_parallel import (
     THDCPLayoutPlan,
     build_thd_cp_layout_plan,
     contiguous_to_zigzag,
+    convert_cp_layout,
     zigzag_to_contiguous,
 )
 from megatron.core.context_parallel.layout import (
@@ -20,6 +21,7 @@ from megatron.core.context_parallel.layout import (
     _build_layout_redistribution_plan,
     _build_thd_cp_layout_plan_from_rank_order_indices,
     _build_thd_zigzag_metadata,
+    _get_layout_parallel_context,
     _local_segment_ids,
 )
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -91,18 +93,18 @@ def test_layout_conversion_coalesces_layout_runs(monkeypatch):
     calls = []
 
     def fake_contiguous_to_zigzag(
-        hidden_states, cp_group, sequence_parallel, tp_group, tp_cp_group, thd_plan
+        input_, cp_group, sequence_parallel, tp_group, tp_cp_group, thd_plan
     ):
         calls.append(("to_zigzag", cp_group, sequence_parallel, tp_group, tp_cp_group, thd_plan))
-        return hidden_states + 1
+        return input_ + 1
 
     def fake_zigzag_to_contiguous(
-        hidden_states, cp_group, sequence_parallel, tp_group, tp_cp_group, thd_plan
+        input_, cp_group, sequence_parallel, tp_group, tp_cp_group, thd_plan
     ):
         calls.append(
             ("to_contiguous", cp_group, sequence_parallel, tp_group, tp_cp_group, thd_plan)
         )
-        return hidden_states + 2
+        return input_ + 2
 
     monkeypatch.setattr(
         context_parallel_layout_module, "contiguous_to_zigzag", fake_contiguous_to_zigzag
@@ -176,6 +178,64 @@ def test_prebuilt_packed_layout_state_is_reused():
     assert state.thd_plan is plan
     assert state.contiguous_packed_seq_params is contiguous_params
     assert state.zigzag_packed_seq_params is zigzag_params
+
+
+def test_layout_conversion_noops_without_cp_group():
+    hidden_states = torch.randn(4, 2, 8)
+
+    assert contiguous_to_zigzag(input_=hidden_states) is hidden_states
+    assert zigzag_to_contiguous(input_=hidden_states) is hidden_states
+    assert (
+        convert_cp_layout(input_=hidden_states, source_layout="contiguous", target_layout="zigzag")
+        is hidden_states
+    )
+
+
+def test_sequence_parallel_without_tp_group_uses_cp_group():
+    cp_group = SimpleNamespace(size=lambda: 2, rank=lambda: 1)
+
+    context = _get_layout_parallel_context(
+        cp_group=cp_group, sequence_parallel=True, tp_group=None, tp_cp_group=None
+    )
+
+    assert context.cp_size == 2
+    assert context.cp_rank == 1
+    assert context.tp_size == 1
+    assert context.tp_rank == 0
+    assert context.communication_group is cp_group
+    assert context.group_rank_by_logical_rank == (0, 1)
+
+
+def test_full_iteration_cuda_graph_rejects_thd_layout_conversion():
+    manager = ContextParallelLayoutManager(
+        layer_layouts=("zigzag",),
+        boundary_layout="contiguous",
+        sequence_parallel=False,
+        cp_group=SimpleNamespace(size=lambda: 2),
+        tp_group=None,
+        tp_cp_group=None,
+        cuda_graph_impl="full_iteration",
+    )
+
+    with pytest.raises(ValueError, match="Full-iteration CUDA graph.*THD CP layout conversion"):
+        manager.build_forward_state(packed_seq_params=None, thd_plan=object())
+
+
+def test_full_iteration_cuda_graph_allows_sbhd_layout_conversion():
+    manager = ContextParallelLayoutManager(
+        layer_layouts=("zigzag",),
+        boundary_layout="contiguous",
+        sequence_parallel=False,
+        cp_group=SimpleNamespace(size=lambda: 2),
+        tp_group=None,
+        tp_cp_group=None,
+        cuda_graph_impl="full_iteration",
+    )
+
+    state = manager.build_forward_state(packed_seq_params=None)
+
+    assert state is not None
+    assert state.thd_plan is None
 
 
 @pytest.mark.parametrize(
@@ -425,7 +485,11 @@ def test_layout_all_to_all_round_trip_and_backward(tp_size, cp_size):
         ).requires_grad_(True)
 
         zigzag = contiguous_to_zigzag(
-            contiguous, cp_group, sequence_parallel, tp_group, tp_cp_group
+            input_=contiguous,
+            cp_group=cp_group,
+            sequence_parallel=sequence_parallel,
+            tp_group=tp_group,
+            tp_cp_group=tp_cp_group,
         )
         zigzag_ids = _local_segment_ids(
             "zigzag", cp_size, cp_rank, tp_size=tp_size, tp_rank=tp_rank
@@ -438,7 +502,13 @@ def test_layout_all_to_all_round_trip_and_backward(tp_size, cp_size):
         )
         torch.testing.assert_close(zigzag, expected_zigzag)
 
-        restored = zigzag_to_contiguous(zigzag, cp_group, sequence_parallel, tp_group, tp_cp_group)
+        restored = zigzag_to_contiguous(
+            input_=zigzag,
+            cp_group=cp_group,
+            sequence_parallel=sequence_parallel,
+            tp_group=tp_group,
+            tp_cp_group=tp_cp_group,
+        )
         torch.testing.assert_close(restored, contiguous)
         restored.sum().backward()
         torch.testing.assert_close(contiguous.grad, torch.ones_like(contiguous))
@@ -480,15 +550,20 @@ def test_thd_layout_all_to_all_pads_and_round_trips(tp_size, cp_size):
         metadata = _build_thd_zigzag_metadata(cu_seqlens, None, cp_size, tp_size)
         assert metadata.pad_between_seqs
         plan = build_thd_cp_layout_plan(
-            metadata.rank_order_indices,
-            total_tokens,
-            cp_group,
+            rank_order_indices=metadata.rank_order_indices,
+            source_token_count=total_tokens,
+            cp_group=cp_group,
             sequence_parallel=sequence_parallel,
             tp_group=tp_group,
             tp_cp_group=tp_cp_group,
         )
         zigzag = contiguous_to_zigzag(
-            contiguous, cp_group, sequence_parallel, tp_group, tp_cp_group, plan
+            input_=contiguous,
+            cp_group=cp_group,
+            sequence_parallel=sequence_parallel,
+            tp_group=tp_group,
+            tp_cp_group=tp_cp_group,
+            thd_plan=plan,
         )
         expected = global_values.new_zeros(
             (plan.zigzag_local_token_count, *global_values.shape[1:])
@@ -503,7 +578,12 @@ def test_thd_layout_all_to_all_pads_and_round_trips(tp_size, cp_size):
         torch.testing.assert_close(zigzag, expected)
 
         restored = zigzag_to_contiguous(
-            zigzag, cp_group, sequence_parallel, tp_group, tp_cp_group, plan
+            input_=zigzag,
+            cp_group=cp_group,
+            sequence_parallel=sequence_parallel,
+            tp_group=tp_group,
+            tp_cp_group=tp_cp_group,
+            thd_plan=plan,
         )
         torch.testing.assert_close(restored, contiguous)
         restored.sum().backward()
