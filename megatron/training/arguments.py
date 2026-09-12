@@ -3928,18 +3928,6 @@ def _add_experimental_attention_variant_args(parser):
         help='Global rank that prints DSA min-memory timings. Set to -1 to print on every rank.',
     )
     _maybe_add_argument(
-        '--dsa-kernel-query-block-size',
-        type=int,
-        default=None,
-        help='Query tile size for DSA min-memory kernel backends.',
-    )
-    _maybe_add_argument(
-        '--dsa-kernel-key-block-size',
-        type=int,
-        default=None,
-        help='Key tile size for DSA min-memory kernel backends.',
-    )
-    _maybe_add_argument(
         '--dsa-kernel-cache-routing',
         action='store_true',
         help=(
