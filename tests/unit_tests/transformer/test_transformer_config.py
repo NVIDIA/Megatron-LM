@@ -2,8 +2,67 @@
 
 import pytest
 
-from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.transformer_config import MLATransformerConfig, TransformerConfig
 from megatron.core.utils import is_te_min_version
+
+
+@pytest.mark.parametrize("config_cls", [TransformerConfig, MLATransformerConfig])
+@pytest.mark.parametrize("recompute_modules", [None, ["core_attn"], ["core_attn", "layernorm"]])
+@pytest.mark.parametrize("offload_modules", [["attn_proj"], ["core_attn", "attn_proj"]])
+def test_core_attn_recompute_rejects_projection_offload(
+    config_cls, recompute_modules, offload_modules
+):
+    """Reject competing storage owners before attention modules are constructed."""
+    with pytest.raises(
+        ValueError, match="core_attn in recompute_modules cannot be combined with attn_proj"
+    ):
+        config_cls(
+            num_layers=1,
+            hidden_size=128,
+            num_attention_heads=4,
+            recompute_granularity="selective",
+            recompute_modules=recompute_modules,
+            fine_grained_activation_offloading=True,
+            offload_modules=offload_modules,
+        )
+
+
+@pytest.mark.parametrize("config_cls", [TransformerConfig, MLATransformerConfig])
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        pytest.param({"fine_grained_activation_offloading": False}, id="offloading-disabled"),
+        pytest.param({"recompute_granularity": None}, id="recompute-disabled"),
+        pytest.param({"recompute_modules": ["layernorm"]}, id="other-recompute-module"),
+        pytest.param({"recompute_modules": []}, id="no-recompute-modules"),
+        pytest.param({"offload_modules": ["core_attn"]}, id="other-offload-module"),
+        pytest.param(
+            {
+                "recompute_granularity": "full",
+                "recompute_method": "uniform",
+                "recompute_num_layers": 1,
+            },
+            id="full-recompute",
+        ),
+    ],
+)
+def test_core_attn_recompute_offload_validation_allows_nonconflicting_configs(
+    config_cls, overrides
+):
+    """Module lists only conflict when both affected selective features are enabled."""
+    options = dict(
+        num_layers=1,
+        hidden_size=128,
+        num_attention_heads=4,
+        recompute_granularity="selective",
+        recompute_modules=["core_attn"],
+        fine_grained_activation_offloading=True,
+        offload_modules=["core_attn", "attn_proj"],
+    )
+    options.update(overrides)
+    config = config_cls(**options)
+    assert config.recompute_granularity == options["recompute_granularity"]
+    assert config.offload_modules == options["offload_modules"]
 
 
 def _make_overlap_config(mtp_num_layers: int | None) -> TransformerConfig:

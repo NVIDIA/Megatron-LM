@@ -614,8 +614,8 @@ class TransformerConfig(ModelParallelConfig):
     "mhc": recompute HyperConnection intermediate activations via
             CheckpointWithoutOutput + CheckpointWithoutOutputManager. Requires
             enable_mhc_connections=True. Cannot be used with "mlp".
-    "moe_act", "layernorm", "mla_up_proj", "gdn_norm_out", "gdp_in_proj", "gdp_qkv", and
-    "mhc" use output-discarding checkpointing, "core_attn", "mlp", "moe", and
+    "core_attn", "moe_act", "layernorm", "mla_up_proj", "gdn_norm_out", "gdp_in_proj",
+    "gdp_qkv", and "mhc" use output-discarding checkpointing, "mlp", "moe", and
     "shared_experts" use normal checkpointing.
     """
 
@@ -2189,14 +2189,6 @@ class TransformerConfig(ModelParallelConfig):
                     "experimental_attention_variant='gdn' or 'gdn2'."
                 )
 
-            if "core_attn" in self.recompute_modules:
-                warnings.warn(
-                    "If you are using transformer_engine as the transformer implementation, "
-                    "the core_attn is from transformer_engine and may be the fused version. "
-                    "For fused attention, you have no need to set 'core_attn' to recompute. "
-                    "Please check that the core_attn recompute is really needed."
-                )
-
             if "shared_experts" in self.recompute_modules:
                 if (
                     self.moe_shared_expert_intermediate_size is not None
@@ -2359,6 +2351,17 @@ class TransformerConfig(ModelParallelConfig):
                 f'Invalid choices for offload_modules: {invalid_modules}. '
                 f'Allowed modules are: {allowed_modules}'
             )
+            if (
+                self.recompute_granularity == "selective"
+                and "core_attn" in self.recompute_modules
+                and "attn_proj" in self.offload_modules
+            ):
+                raise ValueError(
+                    "core_attn in recompute_modules cannot be combined with attn_proj in "
+                    "offload_modules: core_attn recomputation discards the projection input "
+                    "whose storage is also managed by activation offloading. Remove core_attn "
+                    "from --recompute-modules or attn_proj from --offload-modules."
+                )
             if "attn_proj" in self.offload_modules and "core_attn" not in self.offload_modules:
                 raise ValueError(
                     "attn_proj cannot be set to offload_modules alone without core_attn "
