@@ -42,7 +42,6 @@ if HAVE_TE:
         fused_sort_chunks_by_index,
         fused_sort_chunks_by_index_with_probs,
         fused_topk_with_score_function,
-        fused_topk_with_score_function_supports_topk_indices,
         fused_unpermute,
         te_general_gemm,
     )
@@ -56,10 +55,9 @@ else:
         fused_sort_chunks_by_index,
         fused_sort_chunks_by_index_with_probs,
         fused_topk_with_score_function,
-        fused_topk_with_score_function_supports_topk_indices,
         fused_unpermute,
         te_general_gemm,
-    ) = (None, None, None, None, None, None, None, None, False, None, None)
+    ) = (None, None, None, None, None, None, None, None, None, None)
 
 
 def switch_load_balancing_loss_func(
@@ -780,7 +778,6 @@ def topk_routing_with_score_function(
     router_replay: Optional['RouterReplay'] = None,
     dense_output: bool = False,
     precomputed_indices: Optional[torch.Tensor] = None,
-    topk_indices: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Compute the routing probabilities and map for top-k selection with score function.
 
@@ -809,8 +806,6 @@ def topk_routing_with_score_function(
                                        selected by the caller. When given, the score function's
                                        own top-k is bypassed and probs are computed at these
                                        indices (e.g. for quantile balancing). Defaults to None.
-        topk_indices (torch.Tensor, optional): Optional dense top-k index output buffer with shape
-                                               [num_tokens, topk]. Only used by the fused TE path.
 
     Returns:
         Tuple[torch.Tensor, torch.Tensor]:
@@ -820,8 +815,7 @@ def topk_routing_with_score_function(
                   entries correspond to the top-k selected experts per token.
                 - routing_map (torch.Tensor): Shape [num_tokens, num_experts]. Boolean mask where
                   True indicates the token is routed to that expert (i.e. the expert was in the
-                  token's top-k selection). When topk_indices is provided, this is instead that
-                  [num_tokens, topk] dense index buffer.
+                  token's top-k selection).
             When dense_output=True:
                 - probs (torch.Tensor): Shape [num_tokens, topk]. The normalized routing
                   probabilities for each token's top-k selected experts.
@@ -843,7 +837,12 @@ def topk_routing_with_score_function(
                 "Fused sqrtsoftplus score function requires TE >= 2.13.0. "
                 "Please upgrade Transformer Engine or disable moe_router_fusion."
             )
-        return fused_topk_with_score_function(
+        index_output = {}
+        if dense_output:
+            index_output["topk_indices"] = torch.empty(
+                (num_tokens, topk), dtype=torch.int64, device=logits.device
+            )
+        probs, routing_map = fused_topk_with_score_function(
             logits=logits,
             topk=topk,
             use_pre_softmax=use_pre_softmax,
@@ -852,12 +851,11 @@ def topk_routing_with_score_function(
             scaling_factor=scaling_factor,
             score_function=score_function,
             expert_bias=expert_bias,
-            **(
-                {"topk_indices": topk_indices}
-                if fused_topk_with_score_function_supports_topk_indices and topk_indices is not None
-                else {}
-            ),
+            **index_output,
         )
+        if dense_output:
+            probs = probs.gather(1, routing_map)
+        return probs, routing_map
 
     def _compute_topk(
         scores: torch.Tensor,
@@ -1007,14 +1005,9 @@ def uses_compact_routes(config) -> bool:
     """Whether the router hands the token dispatcher its compact ``[num_tokens, topk]`` expert ids
     and probabilities instead of the dense ``[num_tokens, num_experts]`` map and probabilities.
 
-    HybridEP's fastest path takes the ids as dense top-k routing and needs only the probabilities
-    dense, so the flex dispatcher's HybridEP backend consumes compact routes whenever nothing
-    downstream needs the dense map: top-k routing (sinkhorn and quantile balancing produce only
-    the map), no fused router (TE's router produces only the map), no token dropping or capacity
-    padding (they act on the map), expert tensor parallelism 1 (the dense path replicates routes
-    across TP ranks) and no uneven-dispatch padding. Virtual-expert load balancing plans from
-    compact routes and always requires them. The router and the dispatcher both read this, so
-    the formats agree by construction.
+    Ordinary HybridEP keeps its dense format with fused or Sinkhorn/quantile routing, token
+    dropping, capacity/uneven padding and expert TP. Virtual-expert planning always requires
+    compact routes and uses TE's newer index-output API for fused top-k routing.
     """
     if config.moe_virtual_expert_load_balance:
         return True
