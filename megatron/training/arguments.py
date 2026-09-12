@@ -1121,15 +1121,6 @@ def validate_args(args, defaults={}):
         raise AssertionError(
             '--dsa-simplified-use-learned-k requires --dsa-indexer-mode simplified'
         )
-    if getattr(args, 'dsa_simplified_indexer_disable_main_input_norm', False):
-        assert args.experimental_attention_variant == 'dsa', (
-            '--dsa-simplified-indexer-disable-main-input-norm requires '
-            '--experimental-attention-variant dsa'
-        )
-        assert getattr(args, 'dsa_indexer_mode', 'standard') == 'simplified', (
-            '--dsa-simplified-indexer-disable-main-input-norm requires '
-            '--dsa-indexer-mode simplified'
-        )
     if getattr(args, 'dsa_indexer_reset_method', 'random') != 'random':
         assert getattr(args, 'dsa_reset_indexer_on_load', False), \
             '--dsa-indexer-reset-method requires --dsa-reset-indexer-on-load'
@@ -3868,16 +3859,6 @@ def _add_experimental_attention_variant_args(parser):
         help=(
             'Use a separate learned K projection for simplified DSA instead of reusing the '
             'main-attention K cache.'
-        ),
-    )
-    _maybe_add_argument(
-        '--dsa-simplified-indexer-disable-main-input-norm',
-        action='store_true',
-        help=(
-            'Make simplified DSA project its detached attention-module input directly instead '
-            'of reproducing a norm fused into the main QKV projection. With fused norm+QKV '
-            'attention specs this is the residual-stream input; externally normalized specs '
-            'have already normalized the input before self-attention.'
         ),
     )
     _maybe_add_argument(
