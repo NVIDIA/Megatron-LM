@@ -871,11 +871,11 @@ class TestMcoreAdapterHybrid:
         torch.testing.assert_close(hybrid, reference, rtol=1e-2, atol=0)
 
     @pytest.mark.parametrize("dense_outer_strategy", ["optim", "no_shard"])
-    @pytest.mark.parametrize("expert_outer_strategy", ["optim", "no_shard"])
+    @pytest.mark.parametrize("expert_outer_strategy", [None, "optim", "no_shard"])
     def test_moe_with_independent_hybrid_placements(
         self, dense_outer_strategy, expert_outer_strategy
     ):
-        """Dense and expert parameters use different placements on the same hybrid mesh."""
+        """Experts inherit dense outer placements unless explicitly overridden."""
         world_size = int(os.environ.get("WORLD_SIZE", "1"))
         if world_size < 4 or world_size % 4:
             pytest.skip("MoE + hybrid needs a world size divisible by four (EP=2, instances=2).")
@@ -966,6 +966,10 @@ class TestMcoreAdapterHybrid:
         for name, parameter in dense_parameters:
             assert parameter.grad.placements == (dense_outer, Shard(0)), name
 
-        expert_outer = Replicate() if expert_outer_strategy == "no_shard" else Shard(0)
+        expected_expert_strategy = (
+            dense_outer_strategy if expert_outer_strategy is None else expert_outer_strategy
+        )
+        assert model.ddp_config.expert_outer_dp_sharding_strategy == expected_expert_strategy
+        expert_outer = Replicate() if expected_expert_strategy == "no_shard" else Shard(0)
         for name, parameter in expert_parameters:
             assert parameter.grad.placements == (expert_outer, Shard(0)), name

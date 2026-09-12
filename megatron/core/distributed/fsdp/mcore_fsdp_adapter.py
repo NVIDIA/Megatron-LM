@@ -766,14 +766,14 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                 f"{ddp_config.outer_dp_sharding_strategy!r} requires an outer DP axis, "
                 "i.e. num_distributed_optimizer_instances > 1."
             )
-        if ddp_config.expert_outer_dp_sharding_strategy != "no_shard" and (
-            config.expert_model_parallel_size <= 1
-            or ddp_config.num_distributed_optimizer_instances <= 1
+        if (
+            ddp_config.expert_outer_dp_sharding_strategy != "no_shard"
+            and ddp_config.num_distributed_optimizer_instances <= 1
         ):
             raise ValueError(
                 "MFSDP v2 expert_outer_dp_sharding_strategy="
-                f"{ddp_config.expert_outer_dp_sharding_strategy!r} requires an outer expert-DP "
-                "axis, i.e. expert parallelism and num_distributed_optimizer_instances > 1."
+                f"{ddp_config.expert_outer_dp_sharding_strategy!r} requires "
+                "num_distributed_optimizer_instances > 1."
             )
         if config.gradient_accumulation_fusion:
             raise ValueError("MFSDP v2 does not currently support gradient accumulation fusion.")
