@@ -215,6 +215,7 @@ class TestGPTModel:
         Utils.initialize_model_parallel(
             tensor_model_parallel_size=tp, expert_model_parallel_size=ep
         )
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         set_upcycling_args(ep, granularity, num_experts=2)
         # model_parallel_cuda_manual_seed(_SEED+1)
         model_cfg = gpt_config_from_args(args)
@@ -358,6 +359,7 @@ class TestGPTModel:
         Utils.initialize_model_parallel(
             tensor_model_parallel_size=tp, expert_model_parallel_size=ep
         )
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         set_upcycling_args(ep, granularity)
         # model_parallel_cuda_manual_seed(_SEED+1)
         model_cfg = gpt_config_from_args(args)

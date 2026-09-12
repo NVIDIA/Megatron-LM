@@ -61,8 +61,11 @@ class OptimizerCudaGraphWrapper:
 
     def __del__(self):
         logger.info(f"Destructor called for {type(self.optimizer_step_func).__name__} optimizer!!!")
-        if OptimizerCudaGraphWrapper.cuda_graph is not None:
-            del OptimizerCudaGraphWrapper.cuda_graph
-            OptimizerCudaGraphWrapper.cuda_graph = None
-        if OptimizerCudaGraphWrapper.result is not None:
-            OptimizerCudaGraphWrapper.result = None
+        self.reset_cuda_graph()
+
+    @classmethod
+    def reset_cuda_graph(cls) -> None:
+        """Release the captured graph and reset the optimizer capture lifetime."""
+        cls.cuda_graph = None
+        cls.result = None
+        cls.curr_iteration = 0
