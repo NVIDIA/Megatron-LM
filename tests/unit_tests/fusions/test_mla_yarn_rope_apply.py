@@ -15,13 +15,22 @@ from megatron.core.utils import is_torch_min_version
 from tests.unit_tests.test_utilities import Utils
 
 try:
+    import triton
+
     from megatron.core.fusions.fused_mla_yarn_rope_apply import (
+        HAVE_TRITON,
+        _mla_rope_bwd_inplace_kernel,
+        _mla_rope_fwd_inplace_kernel,
         fused_apply_mla_rope_for_q,
         fused_mla_rope_inplace,
         fused_mla_rope_kv_split,
         fused_mla_rope_out_of_place,
     )
 except Exception:
+    HAVE_TRITON = False
+    triton = None
+    _mla_rope_bwd_inplace_kernel = None
+    _mla_rope_fwd_inplace_kernel = None
     fused_apply_mla_rope_for_q = None
     fused_mla_rope_inplace = None
     fused_mla_rope_kv_split = None
@@ -413,6 +422,125 @@ def _test_fused_mla_rope_kv_split(input_format, remove_interleaving=False):
         msg=lambda msg: f"Mismatch in emb bwd: {msg}",
         **tols,
     )
+
+
+def _q_inplace_test_data(input_format, emb_dim):
+    num_heads = 32
+    q_dim = 128
+    total_seqlen = 128
+    generator = torch.Generator(device="cuda").manual_seed(617)
+    source = torch.randn(
+        (total_seqlen, num_heads, q_dim + emb_dim),
+        dtype=torch.bfloat16,
+        device="cuda",
+        generator=generator,
+    )
+
+    if input_format == "sbhd":
+        batch_size = 2
+        seq_num = None
+        cu_seqlens = None
+        max_seqlen = total_seqlen // batch_size
+        token_idx = torch.arange(max_seqlen, device="cuda").repeat_interleave(batch_size)
+    else:
+        batch_size = None
+        cu_seqlens = torch.tensor([0, 27, 54, 99, 128], dtype=torch.int32, device="cuda")
+        seq_num = len(cu_seqlens) - 1
+        lengths = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
+        max_seqlen = max(lengths)
+        token_idx = torch.cat([torch.arange(length, device="cuda") for length in lengths])
+
+    angles = torch.randn(
+        (max_seqlen, 1, 1, emb_dim // 2), dtype=torch.float32, device="cuda", generator=generator
+    )
+    cos_half = torch.cos(angles)
+    sin_half = torch.sin(angles)
+    cos = torch.cat((cos_half, cos_half), dim=-1).to(torch.bfloat16)
+    sin = torch.cat((sin_half, sin_half), dim=-1).to(torch.bfloat16)
+    return source, cos, sin, token_idx, q_dim, batch_size, seq_num, cu_seqlens
+
+
+def _q_inplace_torch_reference(source, cos, sin, token_idx, q_dim, direction):
+    expected = source.clone()
+    rotary = source[..., q_dim:].float()
+    emb_dim = rotary.shape[-1]
+    half = emb_dim // 2
+    token_cos = cos.view(-1, emb_dim)[token_idx].unsqueeze(1).float()
+    token_sin = sin.view(-1, emb_dim)[token_idx].unsqueeze(1).float()
+
+    if direction == "forward":
+        x_1, x_2 = rotary[..., 0::2], rotary[..., 1::2]
+        left = x_1 * token_cos[..., :half] - x_2 * token_sin[..., :half]
+        right = x_2 * token_cos[..., half:] + x_1 * token_sin[..., half:]
+        converted = torch.cat((left, right), dim=-1)
+    else:
+        left, right = rotary[..., :half], rotary[..., half:]
+        x_1 = left * token_cos[..., :half] + right * token_sin[..., half:]
+        x_2 = -left * token_sin[..., :half] + right * token_cos[..., half:]
+        converted = torch.empty_like(rotary)
+        converted[..., 0::2] = x_1
+        converted[..., 1::2] = x_2
+
+    expected[..., q_dim:] = converted.to(source.dtype)
+    return expected
+
+
+@pytest.mark.experimental
+@pytest.mark.internal
+@pytest.mark.skipif(not is_torch_min_version("2.5.0"), reason="Requires PyTorch >= 2.5.0")
+@pytest.mark.skipif(not HAVE_TRITON, reason="Triton not available")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.parametrize("input_format", ["sbhd", "thd"])
+@pytest.mark.parametrize(
+    "direction,emb_dim,block_h,num_warps,repeats",
+    [("forward", 128, 1, 8, 200), ("backward", 64, 2, 4, 100)],
+    ids=["forward-multi-warp", "backward-multi-warp"],
+)
+def test_rotary_q_inplace_conversion_loads_before_stores(
+    input_format, direction, emb_dim, block_h, num_warps, repeats
+) -> None:
+    """Validate a single-warp control, then require exact multi-warp reproducibility."""
+    source, cos, sin, token_idx, q_dim, batch_size, seq_num, cu_seqlens = _q_inplace_test_data(
+        input_format, emb_dim
+    )
+    expected = _q_inplace_torch_reference(source, cos, sin, token_idx, q_dim, direction)
+    kernel = (
+        _mla_rope_fwd_inplace_kernel if direction == "forward" else _mla_rope_bwd_inplace_kernel
+    )
+
+    def launch(launch_block_h, launch_num_warps):
+        actual = source.clone()
+        grid = (source.shape[0], triton.cdiv(source.shape[1], launch_block_h))
+        kernel[grid](
+            actual,
+            cos,
+            sin,
+            q_dim,
+            emb_dim,
+            source.shape[1],
+            batch_size,
+            seq_num,
+            cu_seqlens,
+            None,
+            actual.stride(0),
+            actual.stride(1),
+            cos.stride(0),
+            sin.stride(0),
+            0,
+            1,
+            INVERSE=False,
+            REMOVE_INTERLEAVING=False,
+            BLOCK_H=launch_block_h,
+            num_warps=launch_num_warps,
+            num_stages=3,
+        )
+        return actual
+
+    control = launch(1, 1)
+    torch.testing.assert_close(control.float(), expected.float(), **dtype_tols(source.dtype))
+    for _ in range(repeats):
+        actual = launch(block_h, num_warps)
+        torch.testing.assert_close(actual, control, rtol=0, atol=0)
 
 
 @pytest.mark.experimental

@@ -61,20 +61,6 @@ def _get_thd_token_idx(cu_seqlens, pid_m, seq_num, cp_rank, cp_size):
     return token_idx
 
 
-@triton.autotune(
-    configs=[
-        triton.Config({"BLOCK_H": 1}),
-        triton.Config({"BLOCK_H": 2}),
-        triton.Config({"BLOCK_H": 4}),
-        triton.Config({"BLOCK_H": 8}),
-        triton.Config({"BLOCK_H": 16}),
-        triton.Config({"BLOCK_H": 32}),
-        triton.Config({"BLOCK_H": 64}),
-        triton.Config({"BLOCK_H": 128}),
-    ],
-    key=["emb_dim", "head_num"],
-    restore_value=["Q"],
-)
 @triton.jit
 def _mla_rope_fwd_inplace_kernel(
     Q,
@@ -153,13 +139,16 @@ def _mla_rope_fwd_inplace_kernel(
         tl.store(Q + x_1_off, x_left, mask=mask)
         tl.store(Q + x_2_off, x_right, mask=mask)
     else:
+        # The interleaved input and split output layouts alias. Finish all loads
+        # before any warp stores to the overlapping destination addresses.
+        tl.debug_barrier()
         x_left_off = x_off + tl.arange(0, emb_dim // 2)[None, :]
         x_right_off = x_left_off + emb_dim // 2
         tl.store(Q + x_left_off, x_left, mask=mask)
         tl.store(Q + x_right_off, x_right, mask=mask)
 
 
-@triton.autotune(
+_autotuned_mla_rope_fwd_inplace_kernel = triton.autotune(
     configs=[
         triton.Config({"BLOCK_H": 1}),
         triton.Config({"BLOCK_H": 2}),
@@ -171,8 +160,10 @@ def _mla_rope_fwd_inplace_kernel(
         triton.Config({"BLOCK_H": 128}),
     ],
     key=["emb_dim", "head_num"],
-    restore_value=["DO"],
-)
+    restore_value=["Q"],
+)(_mla_rope_fwd_inplace_kernel)
+
+
 @triton.jit
 def _mla_rope_bwd_inplace_kernel(
     DO,
@@ -252,8 +243,28 @@ def _mla_rope_bwd_inplace_kernel(
     x_1 = x_left * cos_left + x_right * sin_right
     x_2 = -x_left * sin_left + x_right * cos_right
 
+    if not REMOVE_INTERLEAVING:
+        # The split input and interleaved output layouts alias. Finish all loads
+        # before any warp stores to the overlapping destination addresses.
+        tl.debug_barrier()
     tl.store(DO + x_1_off, x_1, mask=mask)
     tl.store(DO + x_2_off, x_2, mask=mask)
+
+
+_autotuned_mla_rope_bwd_inplace_kernel = triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_H": 1}),
+        triton.Config({"BLOCK_H": 2}),
+        triton.Config({"BLOCK_H": 4}),
+        triton.Config({"BLOCK_H": 8}),
+        triton.Config({"BLOCK_H": 16}),
+        triton.Config({"BLOCK_H": 32}),
+        triton.Config({"BLOCK_H": 64}),
+        triton.Config({"BLOCK_H": 128}),
+    ],
+    key=["emb_dim", "head_num"],
+    restore_value=["DO"],
+)(_mla_rope_bwd_inplace_kernel)
 
 
 class _FusedMLARoPEInplace(torch.autograd.Function):
@@ -312,7 +323,7 @@ class _FusedMLARoPEInplace(torch.autograd.Function):
         assert emb_dim % 4 == 0
 
         grid = lambda META: (total_seqlen, triton.cdiv(nheads, META["BLOCK_H"]))
-        _mla_rope_fwd_inplace_kernel[grid](
+        _autotuned_mla_rope_fwd_inplace_kernel[grid](
             q,
             cos,
             sin,
@@ -375,7 +386,7 @@ class _FusedMLARoPEInplace(torch.autograd.Function):
         assert grad.stride(-1) == 1
 
         grid = lambda META: (total_seqlen, triton.cdiv(nheads, META["BLOCK_H"]))
-        _mla_rope_bwd_inplace_kernel[grid](
+        _autotuned_mla_rope_bwd_inplace_kernel[grid](
             grad,
             cos,
             sin,
