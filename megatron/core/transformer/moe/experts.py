@@ -5,6 +5,7 @@ import functools
 import inspect
 import logging
 import os
+import weakref
 from collections.abc import Callable, Iterable
 from contextlib import nullcontext
 from copy import deepcopy
@@ -245,7 +246,8 @@ class _VirtualExpertFC2WgradStore:
     context = None
 
     def __init__(self, load_balancer) -> None:
-        self._load_balancer = load_balancer
+        # TE's backward context retains this store; the manager holds routing tensors.
+        self._load_balancer = weakref.proxy(load_balancer)
 
     @staticmethod
     def delay_wgrad_compute() -> bool:
