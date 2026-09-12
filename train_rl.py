@@ -262,7 +262,9 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
                 max_sequences_per_bin=args.rl_sequence_packing_max_sequences_per_bin,
                 device=tokens.device,
             )
-        else:
+        elif args.rl_training_cuda_graphs:
+            # Single-sequence thd == dense; only needed so the CUDA graph signature
+            # matches between the training forward and the reference logprobs.
             cu_seqlens = torch.tensor([0, tokens.shape[1]], dtype=torch.int32, device=tokens.device)
             # Make sure to omit `total_tokens` to prevent `seq_idx` from being auto-computed.
             # That would cause a sequence packing kernel to be incorrectly used.
