@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import torch
 
 from megatron.core.tokenizers.utils.build_tokenizer import vocab_size_with_padding
+from megatron.training.argument_utils import _normalize_dsv4_hybrid_csa_compress_ratios
 from megatron.training.checkpointing import save_grads
 from megatron.training.global_vars import set_args
 from megatron.training.training import (
@@ -93,6 +94,27 @@ def test_indexer_logging_counts_hybrid_mtp_depths_and_dense_mode():
 
     args.csa_dense_mode = True
     assert _get_indexer_logging_layer_counts(args) == (5, 0)
+
+
+def test_indexer_logging_uses_normalized_hybrid_layer_positions():
+    """C layers in the main and repeated MTP patterns keep their positional denominator."""
+    args = SimpleNamespace(
+        experimental_attention_variant="dsv4_hybrid",
+        num_layers=3,
+        mtp_num_layers=2,
+        mtp_use_repeated_layer=False,
+        hybrid_layer_pattern="W-C/H-C/H-C",
+        csa_compress_ratios=None,
+        csa_dense_mode=False,
+    )
+    config_kwargs = {}
+
+    _normalize_dsv4_hybrid_csa_compress_ratios(args, config_kwargs, args.hybrid_layer_pattern)
+
+    expected_ratios = [0, 0, 4, 128, 0, 4, 128, 0, 4]
+    assert args.csa_compress_ratios == expected_ratios
+    assert config_kwargs["csa_compress_ratios"] == expected_ratios
+    assert _get_indexer_logging_layer_counts(args) == (6, 3)
 
 
 class TestTraining:

@@ -151,10 +151,10 @@ def get_hybrid_layer_counts(pattern: str) -> Dict[str, int]:
 
     Examples:
         >>> get_hybrid_layer_counts("M*M*")
-        {'*': 2, 'D': 0, 'G': 0, 'M': 2, '+': 0, '-': 0, 'E': 0}
+        {'*': 2, 'C': 0, 'D': 0, 'G': 0, 'H': 0, 'M': 2, '+': 0, '-': 0, 'E': 0, 'W': 0}
 
         >>> get_hybrid_layer_counts("M-M-|M-M*-/MM/MM")
-        {'*': 1, 'D': 0, 'G': 0, 'M': 8, '+': 0, '-': 4, 'E': 0}
+        {'*': 1, 'C': 0, 'D': 0, 'G': 0, 'H': 0, 'M': 8, '+': 0, '-': 4, 'E': 0, 'W': 0}
     """
     parsed = parse_hybrid_pattern(pattern)
     counts = {symbol: 0 for symbol in Symbols.name_sorted_valid_layer_symbols()}
@@ -268,9 +268,11 @@ def _validate_pattern(pattern: str, allow_pipe: bool = False) -> None:
                 f"Valid symbols are: {Symbols.LAYER_CONFIG_MAP.keys()}"
             )
 
-    # Disallow Attention + MLA/DSA hybridity.
-    if Symbols.ATTENTION in pattern and (Symbols.DS_ATTENTION in pattern or Symbols.MLA in pattern):
-        raise ValueError("Not supported to have both Attention and MLA/DSA in one model")
+    # MLA variants may coexist, but standard attention cannot share a model with them.
+    if Symbols.ATTENTION in pattern and any(symbol in pattern for symbol in Symbols.MLA_ATTENTION):
+        raise ValueError(
+            "Not supported to have both Attention and MLA/DSA/CSA/HCA/Window in one model"
+        )
 
 
 def validate_segment_layers(segment: str, config: TransformerConfig) -> List[TransformerConfig]:

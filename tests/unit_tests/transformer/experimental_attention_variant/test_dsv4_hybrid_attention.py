@@ -268,6 +268,97 @@ def test_config_accepts_hybrid_model_ratio_tail():
     assert config.csa_compress_ratios == [0, 4, 128, 4]
 
 
+def test_hybrid_stack_spec_uses_one_ratio_agnostic_spec_without_mutating_base_spec():
+    """Each config-aware build gets one private DSv4 spec; layer configs provide ratios."""
+    from megatron.core.models.hybrid.hybrid_layer_specs import (
+        hybrid_dsv4_stack_spec,
+        hybrid_stack_spec,
+    )
+
+    first = hybrid_dsv4_stack_spec(_make_config())
+    second = hybrid_dsv4_stack_spec(_make_config())
+    baseline = hybrid_stack_spec.submodules
+
+    assert first.submodules is not baseline
+    assert second.submodules is not first.submodules
+    assert first.submodules.dsa_layer is baseline.dsa_layer
+    assert first.submodules.mla_layer is baseline.mla_layer
+
+    first_attention = first.submodules.csa_layer.submodules.self_attention
+    second_attention = second.submodules.csa_layer.submodules.self_attention
+    assert "compress_ratio" not in first_attention.params
+    assert first_attention is not second_attention
+
+
+def _build_cpu_attention_for_ratio_resolution(monkeypatch, config, explicit_ratio=None):
+    """Build enough of DSv4 attention on CPU to exercise ratio selection."""
+    from megatron.core.transformer import identity_op
+    from megatron.core.transformer.experimental_attention_variant import (
+        deepseek_v4_hybrid_attention as dsv4_attention,
+    )
+    from megatron.core.transformer.spec_utils import ModuleSpec
+
+    class SizeOneGroup:
+        def size(self) -> int:
+            return 1
+
+    monkeypatch.setattr(dsv4_attention, "RotaryEmbedding", identity_op.IdentityOp)
+    monkeypatch.setattr(dsv4_attention, "YarnRotaryEmbedding", identity_op.IdentityOp)
+    monkeypatch.setattr(dsv4_attention, "TELinear", identity_op.IdentityOp)
+
+    pg_collection = ProcessGroupCollection()
+    pg_collection.tp = SizeOneGroup()
+    pg_collection.cp = SizeOneGroup()
+    submodules = dsv4_attention.DSv4HybridSelfAttentionSubmodules(
+        q_layernorm=identity_op.IdentityOp,
+        kv_layernorm=identity_op.IdentityOp,
+        linear_q_down_proj=identity_op.IdentityOp,
+        linear_q_up_proj=identity_op.IdentityOp,
+        linear_kv_proj=identity_op.IdentityOp,
+        core_attention=ModuleSpec(module=identity_op.IdentityOp),
+        linear_proj=identity_op.IdentityOp,
+    )
+    kwargs = {}
+    if explicit_ratio is not None:
+        kwargs["compress_ratio"] = explicit_ratio
+    return dsv4_attention.DSv4HybridSelfAttention(
+        config=config,
+        submodules=submodules,
+        layer_number=1,
+        attn_mask_type=AttnMaskType.causal,
+        pg_collection=pg_collection,
+        **kwargs,
+    )
+
+
+@pytest.mark.parametrize(
+    ("config_ratio", "explicit_ratio", "expected_ratio"),
+    [
+        pytest.param(None, None, 4, id="global-list-fallback"),
+        pytest.param(128, None, 128, id="layer-config-precedes-global-list"),
+        pytest.param(128, 4, 4, id="explicit-argument-precedes-layer-config"),
+    ],
+)
+def test_compress_ratio_resolution_precedence(
+    monkeypatch, config_ratio, explicit_ratio, expected_ratio
+):
+    """Resolve explicit, per-layer, and legacy-list ratios in that priority order."""
+    from megatron.core.transformer.experimental_attention_variant.dsv4_layer_config import (
+        CSALayerConfig,
+    )
+
+    config = _make_config(perform_initialization=False, csa_compress_ratios=[4, 0, 0, 0])
+    if config_ratio is not None:
+        config = CSALayerConfig.from_config(config)
+        config.compress_ratio = config_ratio
+
+    attention = _build_cpu_attention_for_ratio_resolution(
+        monkeypatch, config, explicit_ratio=explicit_ratio
+    )
+
+    assert attention._dsv4_compress_ratio == expected_ratio
+
+
 def test_constructor_requires_explicit_process_groups():
     """Production DSv4 construction must not read process groups from global MPU state."""
     from megatron.core.transformer.experimental_attention_variant.deepseek_v4_hybrid_attention import (

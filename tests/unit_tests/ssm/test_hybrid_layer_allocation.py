@@ -25,6 +25,9 @@ from megatron.core.ssm.mlp_layer_config import MLPLayerConfig
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.attention_layer_config import AttentionLayerConfig
 from megatron.core.transformer.experimental_attention_variant.dsa_layer_config import DSALayerConfig
+from megatron.core.transformer.experimental_attention_variant.dsv4_layer_config import (
+    CSALayerConfig,
+)
 from megatron.core.transformer.mla_layer_config import MLALayerConfig
 from megatron.core.transformer.moe.moe_layer_config import MoELayerConfig
 from megatron.core.transformer.transformer_config import MLATransformerConfig
@@ -34,10 +37,15 @@ _EXPECTED_LAYER_CONFIG_CLASSES = {
     Symbols.GDN: GDNLayerConfig,
     Symbols.ATTENTION: AttentionLayerConfig,
     Symbols.DS_ATTENTION: DSALayerConfig,
+    Symbols.CSA: CSALayerConfig,
+    Symbols.HCA: CSALayerConfig,
     Symbols.MLA: MLALayerConfig,
+    Symbols.WINDOW: CSALayerConfig,
     Symbols.MLP: MLPLayerConfig,
     Symbols.MOE: MoELayerConfig,
 }
+
+_DSV4_COMPRESS_RATIOS = {Symbols.CSA: 4, Symbols.HCA: 128, Symbols.WINDOW: 0}
 
 
 def _make_transformer_config() -> TransformerConfig:
@@ -51,9 +59,12 @@ def _assert_layer_config_types(layer_config_list, pattern: str) -> None:
 
 
 def _assert_config_contents_equal(actual, expected) -> None:
-    assert vars(actual).keys() == vars(expected).keys()
+    actual_vars = vars(actual).copy()
+    if type(actual) is CSALayerConfig:
+        actual_vars.pop("compress_ratio")
+    assert actual_vars.keys() == vars(expected).keys()
     for field_name, expected_value in vars(expected).items():
-        actual_value = getattr(actual, field_name)
+        actual_value = actual_vars[field_name]
         if isinstance(expected_value, functools.partial):
             assert isinstance(actual_value, functools.partial)
             assert actual_value.func is expected_value.func
@@ -126,6 +137,7 @@ class TestValidateSegmentLayers:
             "GEGEGE*E",
             "MDMD",
             "M+M+",
+            "WECEH+",
         ]:
             result = validate_segment_layers(pattern, self.config)
             _assert_layer_config_types(result, pattern)
@@ -149,6 +161,8 @@ class TestValidateSegmentLayers:
         assert layer_config_list[0] is not self.config
         _assert_config_contents_equal(layer_config_list[0], self.config)
         assert layer_config_list[0].hidden_size == self.config.hidden_size
+        if layer_symbol in _DSV4_COMPRESS_RATIOS:
+            assert layer_config_list[0].compress_ratio == _DSV4_COMPRESS_RATIOS[layer_symbol]
         _assert_layer_config_types(layer_config_list, layer_symbol)
 
     def test_all_layer_symbols_have_an_expected_config_class(self):
@@ -210,6 +224,17 @@ class TestValidateSegmentLayers:
             # as DSA: * uses the model-level rotary_pos_emb while + uses MLA's
             # own decoupled RoPE).
             validate_segment_layers("M+M*-", self.config)
+
+    def test_dsv4_attention_symbols(self):
+        assert {Symbols.WINDOW, Symbols.CSA, Symbols.HCA, Symbols.MLA} <= Symbols.MLA_ATTENTION
+        assert CSALayerConfig in Symbols.ATTENTION_LAYER_CONFIGS
+        layer_configs = validate_segment_layers("WDCH+", self.config)
+        _assert_layer_config_types(layer_configs, "WDCH+")
+        assert [layer_configs[index].compress_ratio for index in (0, 2, 3)] == [
+            _DSV4_COMPRESS_RATIOS[symbol] for symbol in (Symbols.WINDOW, Symbols.CSA, Symbols.HCA)
+        ]
+        with pytest.raises(ValueError):
+            validate_segment_layers("W*C", self.config)
 
 
 @pytest.mark.internal
@@ -420,75 +445,96 @@ class TestGetHybridLayerCounts:
     def test_simple_pattern(self):
         assert get_hybrid_layer_counts("M*M*") == {
             '*': 2,
+            'C': 0,
             'D': 0,
             'G': 0,
+            'H': 0,
             'M': 2,
             '+': 0,
             '-': 0,
             'E': 0,
+            'W': 0,
         }
 
     def test_all_layer_types(self):
         # Not allowed to have both standard Attention and MLA/DSA, so we do separate asserts.
         assert get_hybrid_layer_counts("MG*-E") == {
             '*': 1,
+            'C': 0,
             'D': 0,
             'G': 1,
+            'H': 0,
             'M': 1,
             '+': 0,
             '-': 1,
             'E': 1,
+            'W': 0,
         }
         assert get_hybrid_layer_counts("MGD-E") == {
             '*': 0,
+            'C': 0,
             'D': 1,
             'G': 1,
+            'H': 0,
             'M': 1,
             '+': 0,
             '-': 1,
             'E': 1,
+            'W': 0,
         }
         assert get_hybrid_layer_counts("MG+-E") == {
             '*': 0,
+            'C': 0,
             'D': 0,
             'G': 1,
+            'H': 0,
             'M': 1,
             '+': 1,
             '-': 1,
             'E': 1,
+            'W': 0,
         }
 
     def test_with_pipes(self):
         # Pipes should be skipped in counting
         assert get_hybrid_layer_counts("M*|M*") == {
             '*': 2,
+            'C': 0,
             'D': 0,
             'G': 0,
+            'H': 0,
             'M': 2,
             '+': 0,
             '-': 0,
             'E': 0,
+            'W': 0,
         }
         assert get_hybrid_layer_counts("M-M-|M-M*-") == {
             '*': 1,
+            'C': 0,
             'D': 0,
             'G': 0,
+            'H': 0,
             'M': 4,
             '+': 0,
             '-': 4,
             'E': 0,
+            'W': 0,
         }
 
     def test_with_mtp(self):
         # MTP pattern "MM" repeated 2 depths -> 4 extra mamba layers
         assert get_hybrid_layer_counts("M*M*/MM/MM") == {
             '*': 2,
+            'C': 0,
             'D': 0,
             'G': 0,
+            'H': 0,
             'M': 6,
             '+': 0,
             '-': 0,
             'E': 0,
+            'W': 0,
         }
 
     def test_with_pipes_and_mtp(self):
@@ -496,91 +542,115 @@ class TestGetHybridLayerCounts:
         # MTP: MM x 2 depths -> +4 mamba
         assert get_hybrid_layer_counts("M-M-|M-M*-/MM/MM") == {
             '*': 1,
+            'C': 0,
             'D': 0,
             'G': 0,
+            'H': 0,
             'M': 8,
             '+': 0,
             '-': 4,
             'E': 0,
+            'W': 0,
         }
 
     def test_moe_pattern(self):
         assert get_hybrid_layer_counts("MEME") == {
             '*': 0,
+            'C': 0,
             'D': 0,
             'G': 0,
+            'H': 0,
             'M': 2,
             '+': 0,
             '-': 0,
             'E': 2,
+            'W': 0,
         }
 
     def test_mtp_with_attention(self):
         # MTP pattern "*M" repeated 3 depths -> 3 attn + 3 mamba from MTP
         assert get_hybrid_layer_counts("MMMM/*M/*M/*M") == {
             '*': 3,
+            'C': 0,
             'D': 0,
             'G': 0,
+            'H': 0,
             'M': 7,
             '+': 0,
             '-': 0,
             'E': 0,
+            'W': 0,
         }
 
     def test_gdn_pattern(self):
         assert get_hybrid_layer_counts("GMGM") == {
             '*': 0,
+            'C': 0,
             'D': 0,
             'G': 2,
+            'H': 0,
             'M': 2,
             '+': 0,
             '-': 0,
             'E': 0,
+            'W': 0,
         }
 
     def test_gdn_hybrid_pattern(self):
         # GDN + Mamba + Attention
         assert get_hybrid_layer_counts("G*GM*") == {
             '*': 2,
+            'C': 0,
             'D': 0,
             'G': 2,
+            'H': 0,
             'M': 1,
             '+': 0,
             '-': 0,
             'E': 0,
+            'W': 0,
         }
 
     def test_dsa_pattern(self):
         assert get_hybrid_layer_counts("DMDM") == {
             '*': 0,
+            'C': 0,
             'D': 2,
             'G': 0,
+            'H': 0,
             'M': 2,
             '+': 0,
             '-': 0,
             'E': 0,
+            'W': 0,
         }
 
     def test_mla_pattern(self):
         assert get_hybrid_layer_counts("+M+M") == {
             '*': 0,
+            'C': 0,
             'D': 0,
             'G': 0,
+            'H': 0,
             'M': 2,
             '+': 2,
             '-': 0,
             'E': 0,
+            'W': 0,
         }
 
     def test_empty_pattern(self):
         assert get_hybrid_layer_counts("") == {
             '*': 0,
+            'C': 0,
             'D': 0,
             'G': 0,
+            'H': 0,
             'M': 0,
             '+': 0,
             '-': 0,
             'E': 0,
+            'W': 0,
         }
 
 
@@ -992,6 +1062,13 @@ class TestGetLayerMapsFromLayerTypeList:
         assert mamba_map == {1: 0, 3: 1}
         assert mlp_map == {}
         assert moe_map == {}
+
+    def test_dsv4_attention_variants(self):
+        """C/H/W layers get independent maps and retain their local ordering."""
+        maps = get_layer_maps_from_layer_type_list(["C", "H", "W", "C"])
+        assert maps[Symbols.CSA] == {0: 0, 3: 1}
+        assert maps[Symbols.HCA] == {1: 0}
+        assert maps[Symbols.WINDOW] == {2: 0}
 
     def test_mixed_dsa_and_mla(self):
         """DSA and MLA layers maintain separate local indices."""
