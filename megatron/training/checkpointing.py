@@ -210,11 +210,9 @@ def check_checkpoint_args(checkpoint_args, skip_args: set[str] | None = None):
     _compare('dsa_indexer_mode', default='standard')
     _compare('dsa_simplified_use_learned_k', default=False)
     _compare('dsa_simplified_indexer_disable_main_input_norm', default=False)
-    _compare('dsa_standard_indexer_use_main_input_norm', default=False)
     _compare('dsa_indexer_n_heads', default=None)
     _compare('dsa_indexer_head_dim', default=None)
     _compare('dsa_indexer_topk', default=None)
-    _compare('dsa_indexer_use_hadamard', default=False)
     if not getattr(args, 'no_load_optim', False) and not getattr(args, 'finetune', False):
         def _dsa_trainability_mode(namespace):
             if getattr(namespace, 'dsa_train_indexer_only', False):
@@ -2358,16 +2356,12 @@ def load_args_from_checkpoint(args, load_arg='load', checkpointing_context=None)
             setattr(checkpoint_args, 'dsa_simplified_use_learned_k', False)
         if not hasattr(checkpoint_args, 'dsa_simplified_indexer_disable_main_input_norm'):
             setattr(checkpoint_args, 'dsa_simplified_indexer_disable_main_input_norm', False)
-        if not hasattr(checkpoint_args, 'dsa_standard_indexer_use_main_input_norm'):
-            setattr(checkpoint_args, 'dsa_standard_indexer_use_main_input_norm', False)
         _set_arg('dsa_indexer_mode', force=True)
         _set_arg('dsa_simplified_use_learned_k', force=True)
         _set_arg('dsa_simplified_indexer_disable_main_input_norm', force=True)
-        _set_arg('dsa_standard_indexer_use_main_input_norm', force=True)
         _set_arg('dsa_indexer_n_heads', force=True)
         _set_arg('dsa_indexer_head_dim', force=True)
         _set_arg('dsa_indexer_topk', force=True)
-        _set_arg('dsa_indexer_use_hadamard', force=True)
 
     # Legacy MTP pattern for old checkpoints
     _set_arg('mtp_hybrid_override_pattern', force=True)
