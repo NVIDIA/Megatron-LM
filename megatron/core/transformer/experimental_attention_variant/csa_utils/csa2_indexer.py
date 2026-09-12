@@ -304,7 +304,8 @@ if HAVE_TRITON:
         TILE_H: tl.constexpr,
         TILE_K: tl.constexpr,
     ):
-        row = tl.program_id(0)
+        # This launch spans the full flattened batch, before loss query chunking.
+        row = tl.program_id(0).to(tl.int64)
         h = tl.program_id(1) * TILE_H + tl.arange(0, TILE_H)
         d = tl.arange(0, DIM)
         qv = tl.load(q + (row * HEADS + h[:, None]) * DIM + d[None, :], h[:, None] < HEADS, other=0)
@@ -315,7 +316,7 @@ if HAVE_TRITON:
             keys, valid = _key_ids(
                 ids, counts, starts, visible, row, cols, WIDTH, ID_WIDTH, MODE, BLOCK_SIZE
             )
-            kv = tl.load(k + keys[None, :] * DIM + d[:, None], valid[None, :], other=0)
+            kv = tl.load(k + keys[None, :].to(tl.int64) * DIM + d[:, None], valid[None, :], other=0)
             logits = tl.where(valid[None, :], tl.dot(qv, kv) * SCALE, -float("inf"))
             new_max = tl.maximum(maximum, tl.max(logits, 1))
             old_scale = tl.where(maximum > -float("inf"), tl.exp(maximum - new_max), 0.0)

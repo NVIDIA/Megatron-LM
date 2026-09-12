@@ -48,7 +48,8 @@ if _TRITON_AVAILABLE:
         BLOCK_K: tl.constexpr,
     ):
         """Compute ``log(exp(sink) + sum_window(exp(q @ k * scale)))``."""
-        query_row = tl.program_id(0)
+        # Flattened H64/D512 queries exceed int32 element offsets after 64K rows.
+        query_row = tl.program_id(0).to(tl.int64)
         head_block = tl.program_id(1)
 
         head_offsets = head_block * BLOCK_H + tl.arange(0, BLOCK_H)
@@ -77,7 +78,7 @@ if _TRITON_AVAILABLE:
                 other=-1,
             )
             valid_keys = index_mask & (global_indices >= 0) & (global_indices < total_kv)
-            safe_indices = tl.where(valid_keys, global_indices, 0)
+            safe_indices = tl.where(valid_keys, global_indices, 0).to(tl.int64)
 
             k_offsets = dim_offsets[:, None] * stride_kv_dim + safe_indices[None, :] * stride_kv_row
             k = tl.load(
@@ -132,8 +133,10 @@ if _TRITON_AVAILABLE:
     ):
         """Add the causal compressed-key mass for fixed-shape SBHD input."""
         query_blocks = tl.cdiv(seqlen_q, BLOCK_Q)
-        batch = tl.program_id(0) // query_blocks
-        query_block = tl.program_id(0) % query_blocks
+        # Promote before applying batch/head/dimension strides to physical rows.
+        program = tl.program_id(0).to(tl.int64)
+        batch = program // query_blocks
+        query_block = program % query_blocks
         head_block = tl.program_id(1)
 
         row_offsets = tl.arange(0, BLOCK_Q * BLOCK_H)
@@ -162,7 +165,7 @@ if _TRITON_AVAILABLE:
         visible_keys = (query_offsets + 1) // ratio
 
         for key_start in range(0, seqlen_k, BLOCK_K):
-            key_offsets = key_start + tl.arange(0, BLOCK_K)
+            key_offsets = (key_start + tl.arange(0, BLOCK_K)).to(tl.int64)
             key_mask = key_offsets < seqlen_k
             k_offsets = (
                 batch * stride_k_batch
@@ -232,9 +235,10 @@ if _TRITON_AVAILABLE:
         query_block = tl.program_id(0) % query_blocks
         head_block = tl.program_id(1)
 
-        query_start = tl.load(cu_seqlens_q + sequence)
+        # Packed sequence prefixes may address storage beyond 2**31 elements.
+        query_start = tl.load(cu_seqlens_q + sequence).to(tl.int64)
         query_end = tl.load(cu_seqlens_q + sequence + 1)
-        key_start_offset = tl.load(cu_seqlens_k + sequence)
+        key_start_offset = tl.load(cu_seqlens_k + sequence).to(tl.int64)
         key_end_offset = tl.load(cu_seqlens_k + sequence + 1)
         query_length = query_end - query_start
         key_length = key_end_offset - key_start_offset
