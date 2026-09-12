@@ -11,6 +11,10 @@
 [Knowledge Distillation](./distillation.md) |
 [Advanced Topics](./ADVANCED.md)
 
+For a walkthrough of the quantization and quantization-aware distillation workflows, see the
+[Post-Training Quantization and Distillation](https://docs.nvidia.com/megatron-core/developer-guide/latest/user-guide/features/post_training_quantization.html)
+user guide.
+
 </div>
 
 [Model Optimizer](https://github.com/NVIDIA/Model-Optimizer) (**ModelOpt**, `nvidia-modelopt`)
