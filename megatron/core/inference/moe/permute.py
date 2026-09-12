@@ -8,6 +8,7 @@ Includes:
 - Unpermute expert outputs back to original token order
 """
 
+import os
 from typing import Optional
 from unittest.mock import MagicMock
 
@@ -48,6 +49,15 @@ def _get_num_sms(device: torch.device) -> int:
 
 def _ceil_div(a, b):
     return (a + b - 1) // b
+
+
+# Pairs per program for the persistent token-count kernel. Each thread issues one
+# atomic per pair it owns, so an oversized block serialises those atomics inside the
+# thread instead of spreading them across CTAs: at decode shape (2048 routed pairs)
+# the kernel costs 8.08 us at 1024 and 2.11 us at 128. Larger blocks only pay off once
+# there are enough pairs to fill the machine anyway, where the curve is flat (13.3 us
+# at 128 vs 13.2 us at 512 for 131072 pairs). Measured on GB200, Qwen3-30B-A3B EP4.
+_COUNT_TOKENS_BLOCK = int(os.environ.get("MCORE_COUNT_TOKENS_BLOCK", "128"))
 
 
 @triton.jit
@@ -148,7 +158,7 @@ def compute_local_tokens_per_expert(
             local_expert_start,
             num_local_experts,
             num_sms,
-            BLOCK_SIZE=BLOCK,
+            BLOCK_SIZE=_COUNT_TOKENS_BLOCK,
         )
     else:
         _count_local_tokens_kernel[(_ceil_div(max_pairs, BLOCK),)](
