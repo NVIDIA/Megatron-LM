@@ -53,7 +53,7 @@ from megatron.core.optimizer_param_scheduler import (
     combine_param_group_overrides,
     param_group_override_to_tuple,
 )
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.process_groups_config import ProcessGroupCollection, resolve_gtp_remat_group
 from megatron.core.transformer.fsdp_dtensor_checkpoint import get_global_unique_param_name
 
 from ..distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallelV2
@@ -732,6 +732,42 @@ def check_config_overrides_consistency(
     return True
 
 
+def qkv_rows_after_gtp_gather(
+    param: torch.nn.Parameter,
+    qkv_split_shapes: List[int],
+    gtp_remat_group: Optional[torch.distributed.ProcessGroup] = None,
+) -> Tuple[int, int, bool]:
+    """Total rows of a fused QKV weight across its GTP shards, and whether [q|k|v] divides them.
+
+    Not ``param.shape[0]``: once the GTP degree stops dividing the query-group count, a
+    shard-local test switches the split off on GTP ranks while TP1 keeps it, and one
+    weight gets two different Muon rules.
+
+    The count is still TP-local, which is enough to decide because TP splits whole query
+    groups -- but it is not model-global, so do not reuse it for checkpoint shapes.
+
+    Args:
+        param: Fused QKV weight; reads ``is_gtp_weight_remat`` and ``pad_length``.
+        qkv_split_shapes: Per-query-group rows, e.g. ``[q, k, v]``. Must be non-empty.
+        gtp_remat_group: The group the optimizer gathers over -- ``param.group`` can name
+            a different one under a ``MultiModuleProcessGroupCollection``.
+
+    Returns:
+        ``(gathered_rows, gtp_size, splittable)``, padding already subtracted.
+    """
+    if not qkv_split_shapes:
+        raise ValueError("qkv_split_shapes must be non-empty to decide the QKV split")
+    gtp_size = (
+        get_pg_size(gtp_remat_group)
+        if gtp_remat_group is not None and getattr(param, 'is_gtp_weight_remat', False)
+        else 1
+    )
+    # Subtract the pad only when the rows were scaled up.
+    alignment_pad_rows = getattr(param, 'pad_length', 0) if gtp_size > 1 else 0
+    gathered_rows = param.shape[0] * gtp_size - alignment_pad_rows
+    return gathered_rows, gtp_size, gathered_rows % sum(qkv_split_shapes) == 0
+
+
 def _get_megatron_emerging_optimizer(
     config: OptimizerConfig,
     model_chunks: List[MegatronModule],
@@ -800,15 +836,22 @@ def _get_megatron_emerging_optimizer(
             if 'linear_qkv.weight' in name and len(param.shape) == 2:
                 if qkv_split_shapes is None:
                     qkv_split_shapes = _get_qkv_split_shapes(model_chunk.config)
-                if param.shape[0] % sum(qkv_split_shapes) == 0:
+                gtp_remat_group = resolve_gtp_remat_group(pg_collection, is_expert=False)
+                gathered_rows, gtp_size, splittable = qkv_rows_after_gtp_gather(
+                    param, qkv_split_shapes, gtp_remat_group
+                )
+                if splittable:
                     param.is_qkv = True
                     param.qkv_split_shapes = qkv_split_shapes
                 else:
                     log_single_rank(
                         logger,
-                        logging.DEBUG,
-                        f"Emerging optimizer QKV split skipped for {name}: "
-                        f"shape={tuple(param.shape)}, split_shapes={qkv_split_shapes}",
+                        logging.INFO,
+                        f"Emerging optimizer QKV split disabled for {name}: gathered rows "
+                        f"{gathered_rows} (local {param.shape[0]} x gtp {gtp_size} - pad "
+                        f"{param.shape[0] * gtp_size - gathered_rows}) not divisible by "
+                        f"{sum(qkv_split_shapes)}={qkv_split_shapes}; whole-matrix "
+                        f"Newton-Schulz at every layout.",
                     )
 
     # Apply optimizer-specific default param overrides (e.g. muon: non-linear -> adam).
