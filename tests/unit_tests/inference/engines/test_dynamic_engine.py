@@ -997,6 +997,10 @@ def test_post_process_eviction_requeues_prefix_cached_request_with_fresh_hashes(
     ],
 )
 def test_init_refreshes_inference_only_experts_before_first_capture(conversion, device):
+    if device == "cuda":
+        # PyTorch caches the capture stream on the first device used.
+        torch.cuda.set_device(Utils.local_rank)
+
     config = TransformerConfig(
         num_layers=1,
         hidden_size=4,

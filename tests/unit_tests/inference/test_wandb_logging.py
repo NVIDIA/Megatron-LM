@@ -219,7 +219,7 @@ class TestInferenceWandbLogging:
         mock_controller._async_sched_logits = Mock()
         # Set up nested mock structure
         mock_controller.inference_wrapped_model = Mock()
-        mock_controller.inference_wrapped_model.model = Mock()
+        mock_controller.inference_wrapped_model.model = torch.nn.Module()
         mock_controller.inference_wrapped_model.model.config = Mock()
         mock_controller.inference_wrapped_model.model.config.cuda_graph_impl = "none"
         mock_controller.inference_wrapped_model.model.config.moe_enable_routing_replay = False
@@ -275,7 +275,7 @@ class TestInferenceWandbLogging:
         mock_controller._async_sched_logits = Mock()
         # Set up nested mock structure
         mock_controller.inference_wrapped_model = Mock()
-        mock_controller.inference_wrapped_model.model = Mock()
+        mock_controller.inference_wrapped_model.model = torch.nn.Module()
         mock_controller.inference_wrapped_model.model.config = Mock()
         mock_controller.inference_wrapped_model.model.config.cuda_graph_impl = "none"
         mock_controller.inference_wrapped_model.model.config.moe_enable_routing_replay = False
