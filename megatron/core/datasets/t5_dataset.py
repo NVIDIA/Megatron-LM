@@ -14,6 +14,7 @@ from megatron.core.datasets.masked_dataset import (
     MaskedWordPieceDataset,
     MaskedWordPieceDatasetConfig,
 )
+from megatron.core.datasets.megatron_dataset import is_out_of_vocab_token_id
 from megatron.core.datasets.utils import Split
 from megatron.core.utils import get_te_version
 
@@ -312,9 +313,11 @@ class T5MaskedWordPieceDataset(MaskedWordPieceDataset):
         loss_mask[:length_toks_decoder] = 1
 
         # For padded sequences, ensure the embedding layer can map the token ID
-        encoder_input[encoder_input == self._pad_token_id] = 0
-        decoder_input[decoder_input == self._pad_token_id] = 0
-        decoder_output[decoder_output == self._pad_token_id] = 0
+        vocab_size = getattr(self.config.tokenizer, "vocab_size", None)
+        if is_out_of_vocab_token_id(self._pad_token_id, vocab_size):
+            encoder_input[encoder_input == self._pad_token_id] = 0
+            decoder_input[decoder_input == self._pad_token_id] = 0
+            decoder_output[decoder_output == self._pad_token_id] = 0
 
         return {
             "text_enc": encoder_input,
