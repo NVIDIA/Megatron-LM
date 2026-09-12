@@ -1,5 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import importlib.util
 import logging
 import math
 import warnings
@@ -2422,6 +2423,15 @@ class TransformerConfig(ModelParallelConfig):
             )
 
         if self.moe_paged_stash:
+            # Without this the kernel is a mock (paged_stash.py guards the triton import), so the
+            # first launch raises TypeError: '_GeneratorContextManager' object is not
+            # subscriptable, mid-step and naming neither triton nor this flag. Nothing else
+            # rejects the combination.
+            if importlib.util.find_spec("triton") is None:
+                raise ValueError(
+                    "moe_paged_stash requires triton, which is not installed. "
+                    "Install triton or disable moe_paged_stash."
+                )
             if self.cpu_offloading:
                 raise ValueError("moe_paged_stash cannot be enabled with cpu_offloading.")
             if self.moe_expert_rank_capacity_factor is None:
