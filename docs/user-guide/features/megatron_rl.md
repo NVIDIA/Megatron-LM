@@ -49,6 +49,23 @@ Reinforcement learning library for post-training large language models at scale.
 - Policy optimization for specific tasks
 - Research on RL post-training techniques
 
+## Selected-token logprobs with tensor parallelism
+
+RL training normally gathers tensor-parallel vocabulary shards before selecting the
+next-token logprob. Set `--rl-use-vocab-parallel-selected-logprobs` to compute the
+selected-token values directly from local vocabulary shards with Megatron Core's
+vocabulary-parallel cross entropy. The option is disabled by default and does not
+change the existing gathered-logits path.
+
+The optimized path avoids materializing full-vocabulary logits on every tensor-parallel
+rank and can increase feasible microbatch capacity. It does not use Liger kernels and
+does not modify the vocabulary-parallel cross-entropy primitive.
+
+Sequence packing is supported when context parallelism is disabled. The implementation
+explicitly uses the gathered-logits path for CUDA Graph execution, batch-invariant mode,
+context or pipeline parallelism greater than one, MTP, nonzero label smoothing, and
+consumers that require full logits, entropy, top-N logprobs, or another output processor.
+
 ## Resources
 
 - **[Megatron RL GitHub](https://github.com/NVIDIA/Megatron-LM/tree/dev/megatron/rl)**: Source code and documentation
