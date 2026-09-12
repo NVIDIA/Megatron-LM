@@ -116,7 +116,7 @@ class DistributedDataParallelConfig:
       (e.g. 'optim' on non-experts and 'optim_grads_params' on experts). Expert parameters are
       already sharded over a narrower DP group than non-expert parameters when expert
       parallelism is enabled, so the two classes have very different traffic-per-byte.
-      When None, `data_parallel_sharding_strategy` applies to all parameters."""
+      None is replaced with `data_parallel_sharding_strategy` during initialization."""
 
     gradient_reduce_div_fusion: bool = True
     """If true, perform gradient reduce and division fusion."""
@@ -184,8 +184,8 @@ class DistributedDataParallelConfig:
 
     expert_outer_dp_sharding_strategy: str | None = None
     """Sharding strategy for the outer expert data-parallel group in MFSDP v2.
-    Valid values are ``'no_shard'`` and ``'optim'``. None inherits
-    ``outer_dp_sharding_strategy``.
+    Valid values are ``'no_shard'`` and ``'optim'``. None is replaced with
+    ``outer_dp_sharding_strategy`` during initialization.
     """
 
     disable_symmetric_registration: bool = False
@@ -308,20 +308,21 @@ class DistributedDataParallelConfig:
         import os
 
         """Check the validity of the config."""
-        for name in ("data_parallel_sharding_strategy", "outer_dp_sharding_strategy"):
+        if self.expert_data_parallel_sharding_strategy is None:
+            self.expert_data_parallel_sharding_strategy = self.data_parallel_sharding_strategy
+        if self.expert_outer_dp_sharding_strategy is None:
+            self.expert_outer_dp_sharding_strategy = self.outer_dp_sharding_strategy
+
+        for name in (
+            "data_parallel_sharding_strategy",
+            "expert_data_parallel_sharding_strategy",
+            "outer_dp_sharding_strategy",
+        ):
             value = getattr(self, name)
             if value not in _SHARDING_STRATEGIES:
                 raise ValueError(
                     f"{name} must be one of {list(_SHARDING_STRATEGIES)}, got {value!r}."
                 )
-        # Unlike the two above, this one is optional: None means expert parameters follow
-        # data_parallel_sharding_strategy rather than taking a strategy of their own.
-        expert_strategy = self.expert_data_parallel_sharding_strategy
-        if expert_strategy is not None and expert_strategy not in _SHARDING_STRATEGIES:
-            raise ValueError(
-                "expert_data_parallel_sharding_strategy must be None or one of "
-                f"{list(_SHARDING_STRATEGIES)}, got {expert_strategy!r}."
-            )
         if self.megatron_fsdp_version not in (1, 2):
             raise ValueError("megatron_fsdp_version must be either 1 or 2")
 

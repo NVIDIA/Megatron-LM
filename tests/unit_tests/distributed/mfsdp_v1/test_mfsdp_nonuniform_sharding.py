@@ -11,6 +11,7 @@ import pytest
 import torch
 from torch.nn.functional import mse_loss
 
+from megatron.core.distributed import DistributedDataParallelConfig as MCoreDDPConfig
 from megatron.core.distributed.fsdp.src.megatron_fsdp.distributed_data_parallel_config import (
     DistributedDataParallelConfig,
 )
@@ -146,15 +147,22 @@ class TestShardingStrategyResolution:
             expert_data_parallel_sharding_strategy=experts_strategy,
         )
 
-    def test_experts_strategy_applies_to_expert_parameters_only(self):
-        config = self.make_config(OPTIM_GRADS, experts_strategy=OPTIM_GRADS_PARAMS)
+    @pytest.mark.parametrize("config_type", [MCoreDDPConfig, DistributedDataParallelConfig])
+    def test_experts_strategy_applies_to_expert_parameters_only(self, config_type):
+        config = config_type(
+            data_parallel_sharding_strategy=OPTIM_GRADS,
+            expert_data_parallel_sharding_strategy=OPTIM_GRADS_PARAMS,
+        )
         assert get_sharding_strategy(config, is_expert_param=False) == OPTIM_GRADS
         assert get_sharding_strategy(config, is_expert_param=True) == OPTIM_GRADS_PARAMS
 
-    def test_unset_experts_strategy_falls_back_to_the_common_strategy(self):
-        config = self.make_config(OPTIM_GRADS)
-        assert get_sharding_strategy(config, is_expert_param=False) == OPTIM_GRADS
-        assert get_sharding_strategy(config, is_expert_param=True) == OPTIM_GRADS
+    @pytest.mark.parametrize("config_type", [MCoreDDPConfig, DistributedDataParallelConfig])
+    @pytest.mark.parametrize("strategy", ["no_shard", "optim", "optim_grads", "optim_grads_params"])
+    def test_unset_experts_strategy_is_resolved_at_initialization(self, config_type, strategy):
+        config = config_type(data_parallel_sharding_strategy=strategy)
+        assert config.expert_data_parallel_sharding_strategy == strategy
+        assert get_sharding_strategy(config, is_expert_param=False) == strategy
+        assert get_sharding_strategy(config, is_expert_param=True) == strategy
 
     def test_strategies_in_use_reports_every_configured_strategy(self):
         uniform = self.make_config(OPTIM_GRADS)
