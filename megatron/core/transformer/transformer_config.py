@@ -371,11 +371,27 @@ class TransformerConfig(ModelParallelConfig):
     dsa_indexer_scoring_relu: bool = True
     """Whether DSA indexer should apply ReLU to q@k^T scores before weighting."""
 
+    dsa_indexer_kpool_fp8: bool = False
+    """Match FP8 KPool index scores
+       model weights and attention remain in their configured dtype."""
+
     dsa_indexer_k_norm_epsilon: Optional[float] = None
     """Optional epsilon override for the DSA indexer key LayerNorm."""
 
     dsa_indexer_k_norm_fp32: bool = False
     """Whether DSA indexer key LayerNorm should run on fp32 inputs."""
+
+    mla_disable_attention_fp8: bool = False
+    """Force MLA attention GEMMs (q_a_proj, q_b_proj, kv_a_proj, o_proj) to BF16
+    even under FP8 training. This aligns the actor's attention path with vLLM
+    rollout, which runs the main MLA attention in BF16. Only the attention GEMMs
+    (~2.5% of model params) are affected; MoE experts stay FP8."""
+
+    dsa_indexer_kpool: int = 1
+    """Number of keys per softmax-weighted indexer pool; 1 keeps per-token selection."""
+
+    dsa_indexer_kpool_always_select_tail: bool = False
+    """Append each query's incomplete causal pool after the selected history tokens."""
 
     ####################
     # Compressed sparse attention
@@ -419,6 +435,27 @@ class TransformerConfig(ModelParallelConfig):
 
     linear_num_value_heads: Optional[int] = 32
     """Number of value and gate heads for the gated delta net."""
+
+    kda_disable_fp8: bool = False
+    """Force KDA projections to BF16 even under FP8 training,
+    (KDA projections are BF16 in the checkpoint)."""
+
+    kda_safe_gate: bool = False
+    """Whether the KDA kernel should use bounded gate values."""
+
+    kda_lower_bound: Optional[float] = None
+    """Optional lower bound for KDA's bounded gate values."""
+
+    kda_two_stage_gates: bool = False
+    """Use low-rank f_b(f_a(x)) and g_b(g_a(x)) gates with a QKV-only input projection."""
+
+    gdn_pre_gated_delta_rule_fusion: bool = False
+    """Whether to use the streamed Triton fusion for GatedDeltaNet pre-GDR preprocessing."""
+
+    gdn_conv_pad_alignment: Optional[int] = None
+    """When set, pad packed GDN causal-conv inputs to this token alignment.
+    This is only valid without chunkwise CP: padding a chunk-local causal-conv input changes
+    the sequence seen by later chunks and therefore changes the GDN recurrence numerics."""
 
     ####################
     # initialization
@@ -1204,6 +1241,15 @@ class TransformerConfig(ModelParallelConfig):
 
     mhc_init_gating_factor: float = 0.01
     """Initial value of Gating Factor (alpha in paper)."""
+
+    mhc_norm_eps_inside_sqrt: bool = False
+    """Use rsqrt(mean(x**2) + layernorm_epsilon) for the mHC mapping norm."""
+
+    mhc_keep_mappings_in_fp32: bool = False
+    """Keep mHC coefficients and stream mixing in FP32 until the output cast."""
+
+    mhc_learned_output_contract: bool = True
+    """Use learned hc_head_* weights to contract residual streams; otherwise take their mean."""
 
     use_fused_mhc: bool = False
     """Use fused kernels for mHC operations when supported.
@@ -2279,13 +2325,6 @@ class TransformerConfig(ModelParallelConfig):
             )
         if self.mhc_fused_backend != "auto" and not self.use_fused_mhc:
             raise ValueError("mhc_fused_backend requires use_fused_mhc=True when set explicitly.")
-
-        if self.enable_mhc_connections and self.recompute_granularity == "full":
-            raise NotImplementedError(
-                "enable_mhc_connections is not yet compatible with full activation recompute. "
-                "Use selective recompute with 'mhc' in recompute_modules, or disable "
-                "activation recompute."
-            )
 
         if self.enable_mhc_connections and self.inference_fuse_tp_communication:
             raise NotImplementedError(

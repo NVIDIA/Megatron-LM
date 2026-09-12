@@ -2401,6 +2401,28 @@ class TestDSAIndexer:
         assert self.indexer.index_topk == 32
         assert self.indexer.k_norm.eps == pytest.approx(1e-6)
 
+    def test_kpool_projection_precision_and_backward(self, seqlen):
+        self.indexer.cuda()
+        x = torch.randn(seqlen, 1, 256, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        qr = torch.randn(seqlen, 1, 64, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        gate = torch.nn.Parameter(torch.randn(64, 256, device="cuda", dtype=torch.bfloat16))
+        with (
+            patch.object(self.indexer, "index_kpool", 4),
+            patch.object(self.indexer, "index_kpool_compress_gate", gate),
+            patch.object(self.config, "dsa_indexer_rotate_activation", False),
+        ):
+            q, k, weights = self.indexer.forward_before_topk(x, qr)
+            gate_score = self.indexer._kpool_gate_score
+            assert q.dtype == k.dtype == gate_score.dtype == torch.bfloat16
+            assert weights.dtype == torch.float32
+            torch.testing.assert_close(gate_score, torch.nn.functional.linear(x, gate))
+            (
+                q.float().sum() + k.float().sum() + weights.sum() + gate_score.float().sum()
+            ).backward()
+            assert torch.isfinite(x.grad).all()
+            assert torch.isfinite(qr.grad).all()
+            assert torch.isfinite(gate.grad).all()
+
     @pytest.mark.parametrize("interleaved", [False, True])
     def test_dsa_indexer_rope_interleave_follows_config(self, seqlen, interleaved):
         """Ensure indexer RoPE uses the model-configured interleave convention."""
