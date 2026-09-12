@@ -264,13 +264,17 @@ def test_virtual_expert_gtp_persistent_wgrads_match_recycled_scratch(monkeypatch
         fused_a2a.reset_hybrid_ep_buffer()
 
 
+@pytest.mark.parametrize("expert_gtp", [2, 1], ids=["egtp2", "edp2"])
 @pytest.mark.parametrize("mxfp8", [False, True], ids=["bf16", "mxfp8"])
-def test_virtual_expert_gtp_training_matches_hybridep(monkeypatch, tmp_path_dist_ckpt, mxfp8):
+def test_virtual_expert_gtp_training_matches_hybridep(
+    monkeypatch, tmp_path_dist_ckpt, mxfp8, expert_gtp
+):
     """Compare complete DDP/GTP training, Adam updates and resumed training with HybridEP."""
     from contextlib import nullcontext
 
     from megatron.core.dist_checkpointing import load, save
     from megatron.core.distributed.finalize_model_grads import finalize_model_grads
+    from megatron.core.distributed.param_and_grad_buffer import _ParamAndGradBucketGroup
     from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
     from megatron.core.transformer.moe.moe_logging import (
         destroy_moe_metrics_tracker,
@@ -296,8 +300,12 @@ def test_virtual_expert_gtp_training_matches_hybridep(monkeypatch, tmp_path_dist
 
     ps.destroy_model_parallel()
     ps.initialize_model_parallel(
-        expert_model_parallel_size=2, expert_gtp_remat_size=2, gtp_remat_size=2 if mxfp8 else 1
+        expert_model_parallel_size=2,
+        expert_gtp_remat_size=expert_gtp,
+        gtp_remat_size=2 if mxfp8 else 1,
     )
+
+    errors = []
 
     def train(virtual, checkpoint, resume=False):
         gtp.reset_gtp_state()
@@ -308,6 +316,7 @@ def test_virtual_expert_gtp_training_matches_hybridep(monkeypatch, tmp_path_dist
         config = _expert_config(
             mxfp8,
             moe_virtual_expert_load_balance=virtual,
+            expert_gtp_weight_remat_size=expert_gtp,
             # Reusing a layer before backward must accumulate both invocations. TE's
             # first-microbatch overwrite optimization assumes a single use per forward.
             disable_parameter_transpose_cache=True,
@@ -376,11 +385,16 @@ def test_virtual_expert_gtp_training_matches_hybridep(monkeypatch, tmp_path_dist
                 use_gloo_process_groups=False,
                 pg_collection=pg,
             )
-            experts = [p for p in model.parameters() if getattr(p, "is_routed_expert", False)]
-            assert experts and all(p.gtp_remat_size == 2 for p in experts)
+            experts = [p for p in model.parameters() if not getattr(p, "allreduce", True)]
+            assert experts and all(getattr(p, "gtp_remat_size", 1) == expert_gtp for p in experts)
+            assert pg.expt_dp.size() == 2 // expert_gtp
+            main_grad_ptrs = tuple(p.main_grad.data_ptr() for p in experts)
             assert all(is_mxfp8tensor(p) == mxfp8 for p in experts)
             assert all(p.main_grad.dtype == torch.bfloat16 for p in experts)
             assert len(optimizer.chained_optimizers) >= 2
+            zero_initialized = {
+                i for i, p in enumerate(optimizer.get_parameters()) if not p.detach().any()
+            }
             routers = [layer.mlp.router for layer in module.layers]
             semantic_keys = set(module.state_dict())
             metadata = {
@@ -441,10 +455,24 @@ def test_virtual_expert_gtp_training_matches_hybridep(monkeypatch, tmp_path_dist
                 tables[identity] = table
                 return table
 
+            local_grads = {}
+            start_grad_sync = _ParamAndGradBucketGroup.start_grad_sync
+
+            def capture_expert_grads(bucket_group, *args, **kwargs):
+                if bucket_group in model.expert_parallel_bucket_groups:
+                    for bucket in bucket_group.buckets:
+                        if bucket not in local_grads:
+                            assert bucket.gradient_scaling_factor == 1
+                            local_grads[bucket] = bucket.grad_data.clone()
+                return start_grad_sync(bucket_group, *args, **kwargs)
+
             first_step = 2 if resume else 0
             with monkeypatch.context() as patch:
                 patch.setattr(_VirtualExperts, "get_weight_table", check_tables)
+                if expert_gtp == 1:
+                    patch.setattr(_ParamAndGradBucketGroup, "start_grad_sync", capture_expert_grads)
                 for step in range(first_step, 3):
+                    local_grads.clear()
                     optimizer.zero_grad()
                     model.zero_grad_buffer()
                     if mxfp8:
@@ -491,6 +519,29 @@ def test_virtual_expert_gtp_training_matches_hybridep(monkeypatch, tmp_path_dist
                         num_tokens=torch.tensor(64, dtype=torch.int64, device="cuda"),
                         pg_collection=pg,
                     )
+                    if expert_gtp == 1:
+                        assert len(local_grads) == sum(
+                            len(g.buckets) for g in model.expert_parallel_bucket_groups
+                        )
+                        replica = torch.distributed.get_rank(pg.expt_dp)
+                        for bucket, local in local_grads.items():
+                            expected = local.float()
+                            torch.distributed.all_reduce(expected, group=pg.expt_dp)
+                            local = local.chunk(2)[replica].float()
+                            expected = expected.chunk(2)[replica]
+                            try:
+                                peer = expected - local
+                                assert peer.norm() > 0 and not torch.equal(
+                                    peer, local
+                                ), "replicas must contribute distinct gradients"
+                                expected = expected.bfloat16() / (64 * pg.dp_cp_gtp_remat.size())
+                                torch.testing.assert_close(
+                                    bucket.grad_data.chunk(2)[replica], expected, rtol=0, atol=0
+                                )
+                            except AssertionError as exc:
+                                errors.append(
+                                    f"virtual={virtual} resume={resume} step={step} expert DP reduction: {exc}"
+                                )
                     values["auxiliary loss"] = (
                         get_moe_metrics_tracker().metrics["seq_load_balancing_loss"].values.cpu()
                     )
@@ -504,7 +555,10 @@ def test_virtual_expert_gtp_training_matches_hybridep(monkeypatch, tmp_path_dist
                     ):
                         values[f"gradient {index}"] = parameter.grad.detach().cpu()
                         values[f"update {index}"] = (parameter.detach() - initial).cpu()
-                        values[f"master weight {index}"] = parameter.detach().cpu()
+                        # A zero-initialized master is the sum of Adam updates: use the same
+                        # peak/sign-flip allowance and tight aggregate bound as individual updates.
+                        kind = "update total" if index in zero_initialized else "master weight"
+                        values[f"{kind} {index}"] = parameter.detach().cpu()
                     for index, child in enumerate(optimizer.chained_optimizers):
                         for local, parameter in enumerate(child.get_parameters()):
                             for name in ("exp_avg", "exp_avg_sq"):
@@ -513,8 +567,21 @@ def test_virtual_expert_gtp_training_matches_hybridep(monkeypatch, tmp_path_dist
                                 )
                     assert tuple(name for name, _ in module.named_parameters()) == parameter_names
                     assert set(module.state_dict()) == semantic_keys
+                    assert tuple(p.main_grad.data_ptr() for p in experts) == main_grad_ptrs
                     if virtual:
-                        assert tables and all(p._gtp_wgrad_ring_slot is not None for p in experts)
+                        assert tables
+                        if expert_gtp == 2:
+                            assert all(p._gtp_wgrad_ring_slot is not None for p in experts)
+                        else:
+                            for layer in module.layers:
+                                owner = layer.mlp.token_dispatcher._comm_manager.virtual_experts
+                                assert owner.gtp_leaders == (None, None)
+                                for fc, grads in enumerate(owner.native_grads):
+                                    owner.get_weight_table(fc, "grad", grads)
+                                    assert all(
+                                        p.main_grad.data_ptr() == g.data_ptr()
+                                        for p, g in zip(owner.runtime_weights[fc], grads)
+                                    )
                     history.append(
                         (
                             {name: value.cpu() for name, value in values.items()},
@@ -541,14 +608,15 @@ def test_virtual_expert_gtp_training_matches_hybridep(monkeypatch, tmp_path_dist
             gc.collect()
 
     try:
-        with TempNamedDir(tmp_path_dist_ckpt / f"virtual_expert_training_{mxfp8}") as checkpoint:
+        with TempNamedDir(
+            tmp_path_dist_ckpt / f"virtual_expert_training_{mxfp8}_{expert_gtp}"
+        ) as checkpoint:
             reference = train(False, checkpoint)
             candidate = train(True, checkpoint)
             resumed = train(True, checkpoint, resume=True)
     finally:
         ps.destroy_model_parallel()
         fused_a2a.reset_hybrid_ep_buffer()
-    errors = []
     try:
         assert len(reference) == len(candidate) == 3 and len(resumed) == 1
         # Compare after model collectives, then report failures on every rank before the next test.
