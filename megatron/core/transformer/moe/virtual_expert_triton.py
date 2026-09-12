@@ -235,32 +235,31 @@ def _plan_virtual_expert_routes_kernel(
         balances = tl.load(balance + ranks, mask=valid_ranks, other=0)
         # quotas[BLOCK_EP_SIZE], quotas[d] is how many routes this rank must transfer to rank d
         quotas = tl.zeros((BLOCK_EP_SIZE,), dtype=tl.int32)
-        for _ in tl.range(0, EP_SIZE, 1, loop_unroll_factor=1):
-            maximum, overloaded = _argmax_lowest(balances, ranks, valid_ranks, BLOCK_EP_SIZE)
-            deficit, receiver = _argmax_lowest(-balances, ranks, valid_ranks, BLOCK_EP_SIZE)
-            active = maximum > 0
-            moved = tl.where(active, deficit, 0).to(tl.int32)
-            quotas = tl.where(active & (overloaded == program) & (ranks == receiver), moved, quotas)
-            balances = tl.where(active & (ranks == overloaded), balances - moved, balances)
-            balances = tl.where(active & (ranks == receiver), 0, balances)
+        quota_step = 0
+        while (quota_step < EP_SIZE) & (tl.max(balances, 0) > 0):
+            quota_step += 1
+            _, overloaded = _argmax_lowest(balances, ranks, valid_ranks, BLOCK_EP_SIZE)
+            moved, receiver = _argmax_lowest(-balances, ranks, valid_ranks, BLOCK_EP_SIZE)
+            quotas = tl.where((overloaded == program) & (ranks == receiver), moved, quotas)
+            balances = tl.where(ranks == overloaded, balances - moved, balances)
+            balances = tl.where(ranks == receiver, 0, balances)
         # allocations[local_expert, destination_rank]
         allocations = tl.where(ranks[None, :] == program, native_totals[:, None], 0)
         remaining = native_totals
-        for _ in tl.range(0, EP_SIZE + NUM_EXPERTS_PER_GPU, 1, loop_unroll_factor=1):
+        placement_step = 0
+        while (placement_step < EP_SIZE + NUM_EXPERTS_PER_GPU) & (tl.max(quotas, 0) > 0):
+            placement_step += 1
             max_quota, destination = _argmax_lowest(quotas, ranks, valid_ranks, BLOCK_EP_SIZE)
             max_remaining, local_expert = _argmax_lowest(
                 remaining, local_experts, valid_local_experts, BLOCK_NUM_EXPERTS_PER_GPU
             )
-            active = max_quota > 0
-            moved = tl.where(active, tl.minimum(max_quota, max_remaining), 0).to(tl.int32)
+            moved = tl.minimum(max_quota, max_remaining).to(tl.int32)
             transfer = tl.where(
                 ranks[None, :] == destination, moved, tl.where(ranks[None, :] == program, -moved, 0)
             )
-            allocations += tl.where((local_experts[:, None] == local_expert) & active, transfer, 0)
-            remaining = tl.where(
-                active & (local_experts == local_expert), remaining - moved, remaining
-            )
-            quotas = tl.where(active & (ranks == destination), quotas - moved, quotas)
+            allocations += tl.where(local_experts[:, None] == local_expert, transfer, 0)
+            remaining = tl.where(local_experts == local_expert, remaining - moved, remaining)
+            quotas = tl.where(ranks == destination, quotas - moved, quotas)
         tl.store(
             allocation + native_experts[:, None] * EP_SIZE + ranks[None, :],
             allocations,
