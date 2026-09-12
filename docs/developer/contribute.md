@@ -24,7 +24,7 @@ File any bugs you find, keeping the following in mind:
 - If you are requesting a new feature or modification of an existing feature, use the `ENHANCEMENT` template.
 - If opening an issue to ask a question, you do not need a template, but make your question as clear and concise as possible.
 - One issue per bug. Putting multiple things in the same issue makes both discussion and completion unnecessarily complicated.
-- Reproducible bugs get the fastest attention from the development team.
+- Reproducible bug reports get the fastest attention from the development team.
 - Use proper spelling, grammar, and punctuation.
 - Write in an authoritative and technical tone.
 
