@@ -334,9 +334,6 @@ class TransformerConfig(ModelParallelConfig):
     dsa_simplified_use_learned_k: bool = False
     """Whether simplified DSA uses a learned indexer K instead of main-attention K."""
 
-    dsa_simplified_indexer_disable_main_input_norm: bool = False
-    """Whether simplified DSA skips the main-QKV input normalization."""
-
     dsa_indexer_n_heads: Optional[int] = None
     """Number of DSA indexer heads."""
 
@@ -3497,12 +3494,6 @@ class TransformerConfig(ModelParallelConfig):
         ), (
             "dsa_simplified_use_learned_k requires experimental_attention_variant='dsa' "
             "and dsa_indexer_mode='simplified'."
-        )
-        assert not self.dsa_simplified_indexer_disable_main_input_norm or (
-            self.experimental_attention_variant == "dsa" and self.dsa_indexer_mode == "simplified"
-        ), (
-            "dsa_simplified_indexer_disable_main_input_norm requires "
-            "experimental_attention_variant='dsa' and dsa_indexer_mode='simplified'."
         )
         assert (
             not self.dsa_fwd_skip_dsa or self.experimental_attention_variant == "dsa"

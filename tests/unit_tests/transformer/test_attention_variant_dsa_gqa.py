@@ -252,61 +252,6 @@ def test_transformer_config_accepts_min_memory_backend():
         assert config.dsa_min_memory_profile_rank == -1
 
 
-def test_transformer_config_accepts_disabled_simplified_main_input_norm():
-    config = TransformerConfig(
-        num_layers=1,
-        hidden_size=32,
-        num_attention_heads=4,
-        num_query_groups=1,
-        kv_channels=8,
-        experimental_attention_variant="dsa",
-        add_bias_linear=False,
-        dsa_indexer_mode="simplified",
-        dsa_indexer_topk=4,
-        dsa_simplified_indexer_disable_main_input_norm=True,
-    )
-
-    assert config.dsa_simplified_indexer_disable_main_input_norm
-
-
-@pytest.mark.parametrize("disable_main_input_norm", [False, True])
-def test_attention_wrapper_honors_simplified_main_input_norm_disable(disable_main_input_norm):
-    hidden_states = torch.randn(3, 1, 8)
-    attention = SimpleNamespace(
-        config=SimpleNamespace(
-            experimental_attention_variant="dsa",
-            dsa_indexer_mode="simplified",
-            dsa_simplified_indexer_disable_main_input_norm=disable_main_input_norm,
-            dsa_fwd_skip_dsa=False,
-            normalization="RMSNorm",
-            layernorm_epsilon=1.0e-5,
-            layernorm_zero_centered_gamma=False,
-        ),
-        linear_qkv=SimpleNamespace(
-            layer_norm_weight=torch.randn(8), layer_norm_bias=None, eps=1.0e-5
-        ),
-        _use_indexer_rope=lambda *args: False,
-    )
-
-    kwargs = DSGroupedSelfAttention._get_core_attention_extra_kwargs(
-        attention,
-        hidden_states,
-        torch.empty(0),
-        torch.empty(0),
-        torch.empty(0),
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        AttnMaskType.causal,
-        None,
-    )
-
-    assert (kwargs["indexer_input_norm"] is None) is disable_main_input_norm
-
-
 def _simplified_test_indexer(hidden_size, head_dim, topk, learned_k=False):
     indexer = SimpleNamespace(
         index_n_heads=1,
@@ -1143,72 +1088,6 @@ def test_min_memory_backend_supports_no_grad_validation_forward(monkeypatch):
 
     assert [call["use_triton"] for call in calls] == [False, True]
     assert all(call["simplified_input_norm"] is indexer_input_norm for call in calls)
-
-
-@pytest.mark.parametrize("learned_k", [False, True])
-def test_min_memory_simplified_no_norm_discards_supplied_norm(monkeypatch, learned_k):
-    calls = []
-    supplied_norm = SimpleNamespace(
-        normalization="RMSNorm",
-        weight=torch.randn(8),
-        bias=None,
-        eps=1.0e-5,
-        zero_centered_gamma=False,
-    )
-
-    def _fake_forward_only(**kwargs):
-        calls.append(kwargs)
-        query = kwargs["query"]
-        value = kwargs["value"]
-        return query.new_empty(query.size(0), query.size(1), query.size(2) * value.size(-1))
-
-    monkeypatch.setattr(
-        "megatron.core.transformer.experimental_attention_variant.dsa_gqa."
-        "dsa_min_memory_gqa_forward_only",
-        _fake_forward_only,
-    )
-    core = SimpleNamespace(
-        config=SimpleNamespace(
-            dsa_kernel_backend="min-memory-triton",
-            dsa_indexer_mode="simplified",
-            dsa_simplified_use_learned_k=learned_k,
-            dsa_simplified_indexer_disable_main_input_norm=True,
-            dsa_fwd_skip_dsa=False,
-            dsa_fwd_use_dense_attn=False,
-            dsa_indexer_use_sparse_loss=True,
-            dsa_sparse_attention_use_gather=False,
-            fp8=None,
-            fp8_param=False,
-            layernorm_zero_centered_gamma=False,
-            dsa_kernel_cache_indexer_k=learned_k,
-            dsa_min_memory_profile=False,
-            dsa_min_memory_profile_rank=0,
-        ),
-        indexer=object(),
-        softmax_scale=4**-0.5,
-        training=False,
-        layer_number=1,
-    )
-    query = torch.randn(4, 2, 4, 4)
-    key = torch.randn(4, 2, 1, 4)
-    value = torch.randn(4, 2, 1, 4)
-    hidden_states = torch.randn(4, 2, 8)
-
-    with torch.no_grad():
-        output = DSGQACoreAttention._forward_min_memory(
-            core,
-            query,
-            key,
-            value,
-            None,
-            hidden_states,
-            indexer_input_norm=supplied_norm,
-            attn_mask_type=AttnMaskType.causal,
-        )
-
-    assert output.shape == (4, 2, 16)
-    assert len(calls) == 1
-    assert calls[0]["simplified_input_norm"] is None
 
 
 def test_reference_train_main_only_routes_without_constructing_indexer_loss(monkeypatch):
