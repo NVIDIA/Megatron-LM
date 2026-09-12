@@ -10,12 +10,16 @@ from packaging import version
 from megatron.core import mpu, parallel_state
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.hyper_comm_grid import HyperCommGrid
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_decoder_block_spec,
+    get_gpt_layer_with_transformer_engine_spec,
+)
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.attention import SelfAttention
 from megatron.core.transformer.enums import ModelType
+from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
 from megatron.core.transformer.spec_utils import build_module
 from megatron.core.transformer.transformer_block import TransformerBlock, get_num_layers_to_build
@@ -959,3 +963,74 @@ class TestPipelineParallelLayoutTransformerBlock:
                 f"Expected: {expected_repr!r}\n"
                 f"Got: {repr_result!r}"
             )
+
+
+class TestMoeLayerFreqWithSingleLayerSpec:
+    """A single layer spec cannot express an interleaved dense/MoE stack (issue #6059)."""
+
+    def setup_method(self, method):
+        Utils.initialize_model_parallel(1, 1)
+        model_parallel_cuda_manual_seed(123)
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    def _config(self, moe_layer_freq, num_moe_experts=2, num_layers=4):
+        return TransformerConfig(
+            num_layers=num_layers,
+            hidden_size=64,
+            num_attention_heads=4,
+            num_moe_experts=num_moe_experts,
+            moe_ffn_hidden_size=256,
+            moe_layer_freq=moe_layer_freq,
+            add_bias_linear=False,
+            use_cpu_initialization=True,
+        )
+
+    @pytest.mark.parametrize("moe_layer_freq", [2, 4, [0, 1, 1, 1], [0, 0, 1, 1]])
+    def test_interleaved_pattern_raises(self, moe_layer_freq):
+        """Replicating one spec would silently ignore moe_layer_freq, so it must fail."""
+        config = self._config(moe_layer_freq)
+        layer_spec = get_gpt_layer_with_transformer_engine_spec(
+            num_experts=config.num_moe_experts, moe_grouped_gemm=config.moe_grouped_gemm
+        )
+        with pytest.raises(ValueError, match="moe_layer_freq"):
+            TransformerBlock(config, layer_spec)
+
+    @pytest.mark.parametrize("moe_layer_freq", [1, [1, 1, 1, 1]])
+    def test_homogeneous_moe_pattern_is_allowed(self, moe_layer_freq):
+        """Every layer is an MoE layer, so replicating a single MoE spec is correct."""
+        config = self._config(moe_layer_freq)
+        layer_spec = get_gpt_layer_with_transformer_engine_spec(
+            num_experts=config.num_moe_experts, moe_grouped_gemm=config.moe_grouped_gemm
+        )
+        block = TransformerBlock(config, layer_spec)
+        assert len(block.layers) == config.num_layers
+        assert all(isinstance(layer.mlp, MoELayer) for layer in block.layers)
+
+    def test_dense_model_is_unaffected(self):
+        """moe_layer_freq is meaningless without experts and must not trigger the guard."""
+        config = TransformerConfig(
+            num_layers=4,
+            hidden_size=64,
+            num_attention_heads=4,
+            moe_layer_freq=2,
+            use_cpu_initialization=True,
+        )
+        block = TransformerBlock(config, get_gpt_layer_with_transformer_engine_spec())
+        assert len(block.layers) == config.num_layers
+
+    @pytest.mark.parametrize("moe_layer_freq", [2, [0, 1, 1, 1]])
+    def test_block_spec_still_interleaves(self, moe_layer_freq):
+        """The supported path builds the dense/MoE mix that moe_layer_freq asks for."""
+        config = self._config(moe_layer_freq)
+        block = TransformerBlock(
+            config, get_gpt_decoder_block_spec(config, use_transformer_engine=True)
+        )
+
+        expected = (
+            [1 if i % moe_layer_freq == 0 else 0 for i in range(config.num_layers)]
+            if isinstance(moe_layer_freq, int)
+            else moe_layer_freq
+        )
+        assert [int(isinstance(layer.mlp, MoELayer)) for layer in block.layers] == expected
