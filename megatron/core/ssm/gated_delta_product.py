@@ -7,7 +7,7 @@
 import inspect
 import logging
 import math
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from functools import partial
 from typing import List, Optional, Tuple, Union
 
@@ -16,8 +16,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from megatron.core import tensor_parallel
-from megatron.core.dist_checkpointing import ShardedTensor
-from megatron.core.dist_checkpointing.mapping import ReplicaId, ShardedTensorFactory
 from megatron.core.inference.contexts import BaseInferenceContext, DynamicInferenceContext
 from megatron.core.inference.contexts.attention_context.triton.tensor_ops import (
     tensor_masked_update,
@@ -33,8 +31,8 @@ from megatron.core.ssm.context_parallel.gdp_common import gdp_chunkwise_context_
 from megatron.core.ssm.gdp_context_parallel import GDPContextParallel
 from megatron.core.ssm.packed_seq_helpers import check_fla_sequence_packing_support, get_cu_seqlens
 from megatron.core.ssm.ssm_inference import SSMDynamicInferenceMixin
+from megatron.core.ssm.utils import _split_in_proj_factory, _split_tensor_factory
 from megatron.core.tensor_parallel import get_cuda_rng_tracker
-from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
@@ -43,12 +41,7 @@ from megatron.core.transformer.utils import (
     make_sharded_tensors_for_checkpoint,
     sharded_state_dict_default,
 )
-from megatron.core.utils import deprecate_inference_params, make_tp_sharded_tensor_for_checkpoint
-
-if HAVE_GTP:
-    from megatron.core.tensor_parallel.gtp_api import is_gtp_param
-else:
-    is_gtp_param = None
+from megatron.core.utils import deprecate_inference_params
 
 try:
     from causal_conv1d import causal_conv1d_fn
@@ -1467,51 +1460,6 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
 
         # At this point the TP sharding is correctly defined for each tensor, but some of the
         # tensors must be additionally split into separate parts
-        in_proj_dim = (
-            self.d_inner_local_tp * (1 + self.num_householder)
-            + (1 + self.num_householder) * self.ngroups_local_tp * self.d_state
-            + self.nheads_local_tp * (1 + self.num_householder)
-        )
-        # Under GTP, in_proj.weight is GTP-sliced along axis 0. The [z|V*|K*|Q|b*|a] split
-        # boundaries don't line up with GTP slice boundaries, so gather the shards back to
-        # TP-local size (strip the trailing pad rows from the gathered tail) and fall through
-        # to the same split path the non-GTP run uses — saved ckpt matches a non-GTP run.
-        in_proj_gtp_remat_size = getattr(self.in_proj.weight, "gtp_remat_size", 1)
-        in_proj_is_gtp = (
-            in_proj_gtp_remat_size > 1 and HAVE_GTP and is_gtp_param(self.in_proj.weight)
-        )
-        if in_proj_is_gtp:
-            gtp_remat_group = self.in_proj.weight.group
-            # in_proj.weight was already built at the sharded size by the submodule
-            # sharded_state_dict above — and, for native-FP8 GTP, dequantized to BF16 there
-            # (make_tp_sharded_tensor_for_checkpoint). Gather those (BF16) shards back to the
-            # full TP-local size so the [z|V*|K*|Q|b*|a] split below matches a non-GTP run.
-            local = sharded_state_dict[f"{prefix}in_proj.weight"].data.contiguous()
-            gathered = torch.empty(
-                (local.shape[0] * in_proj_gtp_remat_size,) + local.shape[1:],
-                dtype=local.dtype,
-                device=local.device,
-            )
-            torch.distributed.all_gather_into_tensor(gathered, local, group=gtp_remat_group)
-            if gathered.shape[0] != in_proj_dim:
-                gathered = gathered[:in_proj_dim].contiguous()
-            # Gathered weight is replicated across full dp_cp; replica_id needs only the DP slot.
-            dp_cp_rank = torch.distributed.get_rank(metadata["dp_cp_group"])
-            sharded_state_dict[f"{prefix}in_proj.weight"] = make_tp_sharded_tensor_for_checkpoint(
-                gathered,
-                f"{prefix}in_proj.weight",
-                tp_axis=0,
-                replica_id=(0, 0, dp_cp_rank),
-                prepend_offsets=sharded_offsets,
-                tp_group=self.pg_collection.tp,
-                dp_cp_group=metadata["dp_cp_group"],
-            )
-
-        assert sharded_state_dict[f"{prefix}in_proj.weight"].data.size(0) == in_proj_dim, (
-            in_proj_dim,
-            sharded_state_dict[f"{prefix}in_proj.weight"],
-        )
-
         # V, K, and b are laid out householder-major on every TP rank:
         #
         #   rank r: [M0-local-r, M1-local-r, ..., M(M-1)-local-r]
@@ -1531,46 +1479,18 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
             self.nheads_local_tp,
             self.num_householder,
         )
-        for in_proj_param in ["in_proj.weight", "in_proj.bias"]:
-            key = f"{prefix}{in_proj_param}"
+        for param_name in ["weight", "bias"]:
+            key = f"{prefix}in_proj.{param_name}"
             if key in sharded_state_dict:
-                sharded_state_dict[key] = _split_tensor_factory(
-                    sharded_state_dict[key], in_proj_split_sections, in_proj_split_names, 0
+                sharded_state_dict[key] = _split_in_proj_factory(
+                    sharded_state_dict[key],
+                    in_proj_split_sections,
+                    in_proj_split_names,
+                    weight=getattr(self.in_proj, param_name),
+                    tp_group=self.pg_collection.tp,
+                    dp_cp_group=metadata["dp_cp_group"],
+                    sharded_offsets=sharded_offsets,
                 )
-
-        # GTP load-side inverse of the save-time all-gather (see
-        # docs/api-guide/core/generalized_tensor_parallel.md §3.3, in_proj note): the checkpoint
-        # stores the FULL TP-local in_proj.weight (pad stripped) under the per-householder split
-        # keys, so the default merge_fn cats them back to ``in_proj_dim`` rows with no
-        # padding. To reload into the live GTP param we must mirror init
-        # (``_gtp_slice_one_param``): F.pad the merged tensor with zeros up to
-        # ``gtp_remat_local_size * gtp_remat_size``, then slice by ``gtp_remat_local_rank``.
-        # gtp_remat_size=1 has no pad/slice.
-        if in_proj_is_gtp:
-            factory = sharded_state_dict[f"{prefix}in_proj.weight"]
-            gtp_remat_local_rank = torch.distributed.get_rank(self.in_proj.weight.group)
-            gtp_remat_local_size = self.in_proj.weight.data.size(0)
-            original_merge_fn = factory.merge_fn
-
-            @torch.no_grad()
-            def _gtp_slice_after_cat(
-                sub_state_dict,
-                _orig=original_merge_fn,
-                _rank=gtp_remat_local_rank,
-                _size=gtp_remat_local_size,
-                _gtp_remat_size=in_proj_gtp_remat_size,
-            ):
-                full = _orig(sub_state_dict)
-                aligned_total = _size * _gtp_remat_size
-                pad_rows = aligned_total - full.shape[0]
-                if pad_rows > 0:
-                    full = torch.nn.functional.pad(full, (0, 0, 0, pad_rows))
-                start = _rank * _size
-                return full[start : start + _size].contiguous()
-
-            sharded_state_dict[f"{prefix}in_proj.weight"] = replace(
-                factory, merge_fn=_gtp_slice_after_cat
-            )
 
         conv_dim = (
             self.d_inner_local_tp * self.num_householder
@@ -1632,63 +1552,3 @@ def _get_conv_checkpoint_split_layout(
         + ["Q"]
     )
     return sections, names
-
-
-def _split_tensor_factory(
-    orig_sh_ten: ShardedTensor, split_sections: List[int], split_names: List[str], split_dim: int
-) -> ShardedTensorFactory:
-    """Builds a factory that splits a given ShardedTensor into several independent chunks."""
-    assert isinstance(orig_sh_ten, ShardedTensor), type(orig_sh_ten)
-    orig_sh_ten_no_data = orig_sh_ten.without_data()  # remove `data` reference
-
-    if sum(split_sections) != orig_sh_ten_no_data.local_shape[split_dim]:
-        raise ValueError(
-            f"Split sections must cover the whole dimension size, "
-            f"got {split_sections=} vs dimensions size "
-            f"{orig_sh_ten_no_data.local_shape[split_dim]}"
-        )
-
-    assert not isinstance(
-        split_sections, int
-    ), "Splitting into predefined section sizes is supported (`split_sections` must be a list)"
-    assert len(split_sections) == len(split_names), (len(split_sections), len(split_names))
-
-    @torch.no_grad()
-    def sh_ten_build_fn(
-        key: str, t: torch.Tensor, replica_id: ReplicaId, flattened_range: Optional[slice]
-    ):
-        factory_sh_ten = replace(
-            orig_sh_ten_no_data,
-            key=key,
-            data=t,
-            dtype=t.dtype,
-            replica_id=replica_id,
-            flattened_range=flattened_range,
-        )
-
-        chunk_sh_tens = []
-        split_start = 0
-        for split_size, split_name in zip(split_sections, split_names):
-            split_chunks = factory_sh_ten.narrow(split_dim, split_start, split_size)
-            for sh_ten in split_chunks:
-                sh_ten.key = f"{sh_ten.key}.{split_name}"
-            chunk_sh_tens.extend(split_chunks)
-            split_start += split_size
-
-        assert split_start == orig_sh_ten_no_data.local_shape[split_dim], (
-            split_start,
-            orig_sh_ten_no_data.local_shape[split_dim],
-        )
-        assert sum(sh_ten.data.numel() for sh_ten in chunk_sh_tens) == t.numel(), (
-            chunk_sh_tens,
-            t.shape,
-        )
-        return chunk_sh_tens
-
-    @torch.no_grad()
-    def sh_ten_merge_fn(sub_state_dict):
-        return torch.cat(sub_state_dict)
-
-    return ShardedTensorFactory(
-        orig_sh_ten.key, orig_sh_ten.data, sh_ten_build_fn, sh_ten_merge_fn, orig_sh_ten.replica_id
-    )

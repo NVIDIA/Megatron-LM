@@ -3297,6 +3297,12 @@ def _add_distributed_args(parser):
                        'low-precision values over the wire via an all-to-all and accumulate locally in FP32. '
                        'Independent of the DDP flag (different collective, different process group). Costs one '
                        'extra unsharded-wgrad-sized scratch buffer per in-flight reduce-scatter.')
+    group.add_argument('--gtp-remat-pad-for-alignment', type=int, default=None,
+                       help='Pad each GTP weight-remat shard so its rows are a multiple of this value '
+                       '(times the gtp_remat degree). Unset keeps the recipe default, which is 32 for mxfp8, '
+                       '16 for the other quantized recipes, and 1 (minimum GTP divisibility) for everything '
+                       'else including bf16. Set 0 to disable padding explicitly. The pad rows are stripped '
+                       'before every GEMM; pin this value to compare alignment settings.')
     group.add_argument('--ddp-param-name-patterns-for-fp32-local-accumulation', nargs='+', default=[],
                        help='List of param_name patterns (in Python\'s fnmatch format) to match against '
                        'to do local gradient accumulation in FP32. The special pattern \'all\' matches '

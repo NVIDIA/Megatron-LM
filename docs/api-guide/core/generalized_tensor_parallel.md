@@ -419,6 +419,13 @@ it** — a different collective over a different process group, so enable either
 
 ### 3.1 GTP_remat architecture (Mcore ↔ TE integration)
 
+GDN now splits `in_proj.bias` into the same sections as its weight. New training
+checkpoints record `gdn_in_proj_bias_split=True`. Training detects legacy global and local checkpoints
+without this flag and loads their unsplit bias at the saved TP degree. Resave at that
+degree to migrate before changing TP. Direct MCore callers loading the old layout
+must supply `gdn_in_proj_bias_split=False` and `gdn_legacy_in_proj_bias_tp_size` in
+checkpoint metadata. Bias-free GDN checkpoints are unaffected by this migration.
+
 ![GTP_remat / Mcore-TE integration architecture](../../images/generalized_tensor_parallel/0712_gtp_te_protocol_redesign.png)
 
 **Ownership.** TE owns the linear primitives (`Linear` / `LayerNormLinear` / `LayerNormMLP` / `GroupedLinear`), the low-precision tensor types (FP8 / MXFP8 / NVFP4), and a generic **`DistributedWeight` protocol** (`transformer_engine/pytorch/distributed_weight.py`). Megatron owns **all** GTP_remat logic — sharding, the prefetch chain, the buffer cache, the AG/RS state machines, and DDP integration. **TE never names GTP.**
@@ -587,6 +594,26 @@ The DP collective only covers the replicate axis; the gtp_remat axis is complete
 
 ### 3.3 Distributed checkpointing (DCP)
 
+**Fused projection sections.** Mamba, GDN, and GDP share
+`ssm.utils._split_in_proj_factory`. It gathers GTP row shards under `torch.no_grad()`,
+removes alignment padding, and checkpoints each semantic section in its TP-local
+layout. Loading restores the physical row shard and zero padding. Gated MLPs use the
+same low-level GTP helpers around their SwiGLU section factory.
+
+These gathered factories carry an `optimizer_factory` companion bound to the live
+parameter. Both distributed optimizer model-space paths use it through
+`ShardedTensorFactory.for_optimizer()`, which propagates outer key and replica
+ownership changes while retaining the physical GTP shard coordinate. It maps each physical
+optimizer tensor or flat DP fragment into the same semantic keys without GTP
+collectives. Partial boundary rows become rectangular DCP shards; no unsupported
+`ShardedTensor.flattened_range` leaves are emitted. The mapping also handles DP-owner-only construction; the training CLI restriction
+on memory-efficient fully reshardable GTP checkpoints remains in place.
+Ordinary model-space optimizer fragments use the same rectangular representation,
+including higher-dimensional weights and prepended expert or layer axes. The fragment
+factory preserves the original unsplit key and restores the local flat state on load.
+The companion is opt-in: the regular/Muon optimizer keeps its existing checkpoint
+mapping and on-disk keys.
+
 ![GTP_remat + DCP save/load reshard for a TP2×GTP2 weight](../../images/generalized_tensor_parallel/0612_gtp_dcp_tp2gtp2_save_load.png)
 
 GTP_remat supports **PyTorch / Mcore sharded distributed checkpointing** (`--ckpt-format torch_dist`, the `megatron.core.dist_checkpointing` `ShardedTensor` / `ShardedObject` format) for **both model weights and distributed-optimizer state**. Checkpoints are **fully resharding-capable**: a checkpoint saved at one `(TP, GTP_remat, EGTP_remat, DP, PP)` topology can be loaded at a *different* one — including a different GTP_remat/EGTP_remat size — without an offline conversion step.
@@ -611,11 +638,34 @@ Because the offsets reconstruct the global shape, the checkpoint is independent 
 
 **`_extra_state`.** This is TransformerEngine's per-module **FP8 calibration state** — for delayed-scaling recipes it holds the `recipe`, the forward/backward `scale` tensors and `amax_history` buffers, plus picklable `extra_fp8_variables`; for BF16 (non-FP8) runs it is an empty tensor. Because it is a pickled byte blob rather than a tensor with a meaningful shape, it is emitted as a `ShardedObject` (via `make_sharded_object_for_checkpoint`), not a `ShardedTensor`. Its amax/scale statistics are *per-tensor globals* for the **full** weight (amax is reduced across the FP8 group), so every GTP_remat peer carries an identical copy — which is exactly why it takes the replicated path above, with `gtp_rank` folded into its `replica_id`.
 
-**Alignment padding & cross-topology reshard.** When `_gtp_slice_one_param` pads `out_features` to a multiple of `gtp_remat_size · pad_for_alignment`, the saved global describes the *padded* shape, so the helper sets `allow_shape_mismatch=True`. DCP then tolerates a load-side topology whose alignment yields a different padded size — the unpadded data overlaps and the tail pad rows are zeros GTP_remat recomputes (§3.7 covers how that padding is laid out per rank).
+**Alignment padding & cross-topology reshard.** Alignment rows belong only to the local
+allocation. `_make_gtp_logical_sharded_tensor` excludes them from the saved global
+shape and places each shard at its unpadded TP/GTP offset. Uneven and padding-only
+shards use explicit offsets with `axis_fragmentations=None`; no shape-mismatch
+waiver is required. Model gathers use the full dequantized buffer before removing
+the tail, so all GTP ranks contribute equal-sized inputs. `gtp_pad_src` identifies
+the live parameter for optimizer matching, while `gtp_pad_buffer` retains the
+checkpoint data buffer, which differs for native FP8. Optimizer save trims the
+same tail and load restores zeros only when the saved size matches the known
+logical size of that GTP shard. Flat DP optimizer fragments use the same size
+validation before mapping their physical interval to logical DCP rectangles.
+`--gtp-remat-pad-for-alignment` overrides the recipe
+alignment (MXFP8: 32; other quantized recipes: 16; BF16: 1).
 
-> Note: the SSM `in_proj` weights — Mamba's (`mamba_mixer.py`, split `[z|x|B|C|dt]`) and gated-delta-product's (`gated_delta_product.py`, split householder-major into `z|V*|K*|Q|b*|a`) — are a special case: each **all-gathers its GTP_remat shards** back to the logical TP-local size and strips the pad *before* saving, so its global is topology-independent and needs no `allow_shape_mismatch`. This is required, not just tidier: the split-chunk boundaries do not line up with the GTP_remat slice boundaries, so a raw shard cannot be split at all. The checkpoint therefore matches a non-GTP_remat run byte-for-byte.
+> **SSM input projections.** Mamba (`z|x|B|C|dt`), Gated Delta Net (GDN, using its configured input-projection sections), and Gated Delta Product (GDP, split householder-major into `z|V*|K*|Q|b*|a`) share `_split_in_proj_factory` in `megatron/core/ssm/utils.py`. Each module provides its TP-local section sizes and checkpoint names, the live parameter, and explicit TP/DP-CP groups and prepended offsets. The factory detects GTP, **all-gathers the physical shards before the semantic split**, and removes trailing alignment padding. The logical width comes from the live parameter's `_unsharded_shape` property, independently of the requested sections, so invalid section totals still fail validation. The checkpoint's keys and layout match a non-GTP run and need no `allow_shape_mismatch`.
 >
-> On **load**, the split factory's `merge_fn` is wrapped to invert this: it cats the chunks back to the unpadded TP-local width, re-pads with zeros up to `gtp_remat_local_size · gtp_remat_size`, and slices by the GTP_remat rank — mirroring `_gtp_slice_one_param` so the tensor lands in the live shard's layout. `gtp_remat_size == 1` skips both the gather and the pad/slice.
+> The common factory composes `_gtp_gather_rows_for_save` and `_gtp_slice_rows_on_load` from `tensor_parallel/gtp_utils.py` with the shared section splitter. Gathering runs under `torch.no_grad()` and uses the submodule checkpoint entry's data, accepting live Parameters while preserving native-FP8 dequantization to BF16. The gathered tensor's replica ID includes the GTP rank, so only one GTP peer writes a section even when the explicit DP/CP group excludes GTP. When loading without GTP, former GTP ranks become DP replicas; the destination groups and replica IDs must reflect that topology.
+>
+> On **load**, the factory concatenates the sections into the unpadded TP-local tensor, restores zero padding, and selects this GTP rank's physical rows. Ordinary parameters and GDP's replicated input-projection bias use the section splitter directly; normal initialization leaves parameters unwrapped at `gtp_remat_size == 1`, so they skip gather and pad/slice. GDP keeps separate keys for every householder copy, including in its convolution parameters, which also reuse the shared splitter. The GTP merge accepts unflattened model weights; optimizer state continues through the existing per-shard reconstruction path.
+
+**Grouped gated experts.** EGTP-sharded grouped `linear_fc1` gathers and splits
+`gate|up` with the same logical factory used by dense MLPs. It uses the checkpoint
+key carried by TEGroupedLinear, preserves the prepended expert axis, and elects
+writers over expert DP. Distributed Adam obtains its physical companion through
+`for_optimizer()`. Muon retains its unsplit physical schema: the grouped factory
+keeps its original `ShardedTensor`, and its mapper reuses that metadata with the
+current checkpoint prefix. A raw gathered factory cannot describe the smaller
+Muon state tensor.
 
 **Optimizer state.** The distributed optimizer's master/moment `ShardedObject`s are keyed by `dp_group_idx`. Under GTP_remat/EGTP_remat each peer owns a *different* master shard (the optimizer shards over the gtp_remat/egtp_remat-**excluded** replicate group), so the index is taken from the gtp_remat/egtp_remat-**merged** model-parallel group (`mp_group` for dense, `expt_tp_pp_with_egtp_remat_group` for expert) — giving every peer a distinct key while replicate-group ranks remain true replicas under that key.
 
@@ -839,7 +889,7 @@ Case A is what §1.3's "tail slice" framing describes for the reassembled tensor
 
 - **Uniform shard sizes without runtime coordination.** `pad_length` is a pure function of `dim0`, `pad_for_alignment`, and `gtp_remat_size` — computed once, locally, at shard-construction time. No cross-rank negotiation is needed to agree on a shard size before the first AG/RS.
 - **Equal-sized AG/RS shards fall out for free.** For MXFP8/NVFP4, `pad_for_alignment` is set to the precision format's tile size, so the same pass that satisfies tiling also leaves every rank with an equal-sized shard. For BF16, `pad_for_alignment=1` rounds `dim0` up to the next multiple of `gtp_remat_size` directly — no tile size to satisfy, so padding is only the minimum AG/RS itself requires.
-- **A contiguous tail keeps stripping (and resharding) cheap.** Padding is always appended as a suffix *before* slicing, never interleaved with real data, so recovering the logical tensor is a single trailing slice (`tensor[:-pad_length]`) — simple enough to stay correct even when a checkpoint reload changes `gtp_remat_size` and thus the padded size (§3.3's `allow_shape_mismatch`).
+- **A contiguous tail keeps stripping (and resharding) cheap.** Padding is always appended as a suffix *before* slicing, never interleaved with real data, so recovering the logical tensor is a single trailing slice (`tensor[:-pad_length]`) — simple enough to stay correct even when a checkpoint reload changes `gtp_remat_size` and thus the padded size (§3.3's logical checkpoint layout).
 - **A predictable invariant other systems can build on.** "Padding is always an exact structural zero, never written" is safe for any consumer that needs to distinguish real elements from padding — DCP's cross-topology reshard tolerance (§3.3) and the wgrad-ring's fixed-address buffers (§3.6) both lean on it, and it's what lets `count_zeros_fp32` exclude these permanent zeros from `num_zeros` instead of miscounting them as converged-to-zero gradients.
 
 #### Trade-off

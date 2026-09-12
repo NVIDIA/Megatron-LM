@@ -27,7 +27,7 @@ from megatron.core.ssm.mamba_context_parallel import (
     _redo_attention_load_balancing,
     _undo_attention_load_balancing,
 )
-from megatron.core.ssm.utils import _split_tensor_factory
+from megatron.core.ssm.utils import _split_in_proj_factory, _split_tensor_factory
 from megatron.core.tensor_parallel import get_cuda_rng_tracker
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.identity_op import IdentityOp
@@ -497,7 +497,14 @@ class _GDNBase(MegatronModule):
         return cu_seqlens
 
     def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None, tp_group=None):
-        """Provide a sharded state dictionary for distributed checkpointing."""
+        """Provide a sharded state dictionary for distributed checkpointing.
+
+        Legacy checkpoints stored ``in_proj.bias`` without semantic sections.
+        To load one, set ``metadata['gdn_in_proj_bias_split'] = False`` and
+        ``metadata['gdn_legacy_in_proj_bias_tp_size']`` to its saved TP size, and
+        use that same TP size. Save again with ``gdn_in_proj_bias_split = True``
+        (the default) to migrate the bias to the reshardable section layout.
+        """
         # Guard for cases metadata is not provided
         metadata = ensure_metadata_has_dp_cp_group(metadata)
 
@@ -541,18 +548,34 @@ class _GDNBase(MegatronModule):
 
         # At this point the TP sharding is correctly defined for each tensor, but some of the
         # tensors must be additionally split into separate parts
-        in_proj_dim_local_tp = self.in_proj_dim // self.tp_size
-        assert sharded_state_dict[f"{prefix}in_proj.weight"].data.size(0) == in_proj_dim_local_tp, (
-            in_proj_dim_local_tp,
-            sharded_state_dict[f"{prefix}in_proj.weight"],
-        )
-
-        sharded_state_dict[f"{prefix}in_proj.weight"] = _split_tensor_factory(
-            sharded_state_dict[f"{prefix}in_proj.weight"],
-            list(self.in_proj_split_sections),
-            self.in_proj_split_names,
-            0,
-        )
+        in_proj_params = ["weight"]
+        if f"{prefix}in_proj.bias" in sharded_state_dict:
+            if not metadata.get('gdn_in_proj_bias_split', True):
+                legacy_tp_size = metadata.get('gdn_legacy_in_proj_bias_tp_size')
+                # Legacy biases concatenate whole TP shards, so changing TP here
+                # would silently mix semantic sections. Load at the saved TP size,
+                # then save without this flag to migrate to semantic section keys.
+                if type(legacy_tp_size) is not int or legacy_tp_size < 1:
+                    raise ValueError("gdn_legacy_in_proj_bias_tp_size must be a positive integer")
+                if legacy_tp_size != torch.distributed.get_world_size(tp_group):
+                    raise ValueError(
+                        "Legacy GDN in_proj.bias checkpoints must first be loaded at their "
+                        f"saved TP size ({legacy_tp_size}), then saved with "
+                        "gdn_in_proj_bias_split=True before changing TP size."
+                    )
+            else:
+                in_proj_params.append("bias")
+        for param_name in in_proj_params:
+            key = f"{prefix}in_proj.{param_name}"
+            sharded_state_dict[key] = _split_in_proj_factory(
+                sharded_state_dict[key],
+                list(self.in_proj_split_sections),
+                self.in_proj_split_names,
+                weight=getattr(self.in_proj, param_name),
+                tp_group=tp_group,
+                dp_cp_group=metadata['dp_cp_group'],
+                sharded_offsets=sharded_offsets,
+            )
 
         conv_layer_name_list = ["conv1d.weight"]
         assert (

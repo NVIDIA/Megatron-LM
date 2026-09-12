@@ -901,8 +901,9 @@ def _backfill_gtp_sharded_param_map(
       2. Gathered+split factory params (Mamba ``in_proj``): the model entry exposes the *gathered*
          tensor, so nothing matches the per-shard GTP param. Rebuild the same per-shard
          ShardedTensor every other GTP_remat weight gets. The rebuild is NOT expert-parallel
-         aware (no expert offsets/replica), so expert params must resolve via case 1; refuse
-         loudly instead of writing colliding shards across EP groups.
+         aware (no expert offsets/replica). Grouped factories retain their original physical
+         ShardedTensor for exact identity resolution; other expert params must resolve via
+         case 1. Refuse loudly instead of writing colliding shards across EP groups.
 
     WHEN: only the distributed-Muon path reaches here. ``LayerWiseDistributedOptimizer`` keeps such
     matrix params whole and routes them through this ``Float16OptimizerWithFloat16Params``.
@@ -916,6 +917,7 @@ def _backfill_gtp_sharded_param_map(
             is_gtp_param,
             make_sharded_tensors_for_checkpoint_with_gtp_remat,
         )
+        from megatron.core.tensor_parallel.gtp_utils import gtp_entry_backlink
     except ImportError:
         return  # GTP not built in -- nothing to backfill.
 
@@ -936,9 +938,20 @@ def _backfill_gtp_sharded_param_map(
     key_to_entry = {}
     if model_sharded_state_dict is not None:
         for entry in nested_values(model_sharded_state_dict):
-            src = getattr(getattr(entry, 'data', None), '_gtp_dequant_src', None)
+            # See gtp_entry_backlink: the native-FP8 dequantized copy and the pad-trimmed shard
+            # both break the id() match, and each tags the live param a different way.
+            src = gtp_entry_backlink(entry)
             if src is not None:
                 src_id_to_entry[id(src)] = entry
+            source_entry = getattr(entry, 'gtp_source_sharded_tensor', None)
+            source_param = getattr(entry, 'gtp_source_param', None)
+            if isinstance(source_entry, ShardedTensor) and source_param is not None:
+                # A gathered grouped-expert factory retains its physical, unsplit metadata.
+                # Copy all attributes, including padding backlinks, and apply the current
+                # checkpoint key after the caller's prefix replacement.
+                physical_entry = copy.copy(source_entry)
+                physical_entry.key = entry.key
+                src_id_to_entry[id(source_param)] = physical_entry
             key = getattr(entry, 'key', None)
             if key is not None:
                 # Grouped-expert entries share one key (offsets differ) -> ambiguous, drop.
