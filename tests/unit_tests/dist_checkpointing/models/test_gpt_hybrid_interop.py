@@ -786,6 +786,14 @@ class TestGPTToHybridOptimizerLoad:
 
 class TestGPTToHybridFSDPLoad:
     def teardown_method(self, method):
+        # Parameterized FSDP cases create DTensors whose DeviceMesh instances retain
+        # process-group names across the class. Reset the Megatron globals after each
+        # case without unregistering those names.
+        Utils.destroy_model_parallel(destroy_process_groups=False)
+
+    @classmethod
+    def teardown_class(cls):
+        # The final class teardown reclaims every process group retained above.
         Utils.destroy_model_parallel()
 
     @pytest.mark.internal
