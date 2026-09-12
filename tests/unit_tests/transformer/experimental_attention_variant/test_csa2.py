@@ -381,14 +381,15 @@ def test_unimplemented_dropout_fails_clearly(pg_collection):
         _layer(pg_collection, 2, attention_dropout=0.1)
 
 
-def test_causal_mask_and_unsupported_packing_format(pg_collection):
+def test_attention_mask_and_unsupported_packing_format(pg_collection):
     layer = _layer(pg_collection, 2)
     x = torch.randn(5, 2, layer.config.hidden_size, device="cuda")
     mask = torch.ones(1, 1, 5, 5, device="cuda", dtype=torch.bool).triu(1)
     torch.testing.assert_close(layer(x, mask)[0], layer(x, None)[0])
     mask[..., 3, 0] = True
-    with pytest.raises(NotImplementedError, match="ordinary causal"):
-        layer(x, mask)
+    # Match V4: the sparse indices, rather than the caller's dense mask,
+    # determine visibility.
+    torch.testing.assert_close(layer(x, mask)[0], layer(x, None)[0])
     with pytest.raises((ValueError, NotImplementedError), match="[Tt][Hh][Dd]"):
         layer(
             x,
@@ -2526,6 +2527,45 @@ def _assert_optional_gradients(actual, expected, *, dtype=torch.float32):
     torch.testing.assert_close(actual, expected, **tolerance)
 
 
+@pytest.mark.parametrize("layout", ["sbhd", "thd"])
+@pytest.mark.parametrize("mask_kind", ["causal", "all-masked", "placeholder"])
+def test_attention_mask_does_not_change_sparse_visibility(layout, mask_kind):
+    """Like V4, dense masks do not override the sparse/packed attention layout."""
+    torch.manual_seed(329)
+    cores = _packed_attention_cores(torch.bfloat16)
+    params, _, valid = _packed([3, 5], [4, 6], tail=3)
+    inputs = _packed_core_inputs(cores, valid.numel())
+    if layout == "sbhd":
+        inputs = [(q.unsqueeze(1), kv.unsqueeze(1), x, qr) for q, kv, x, qr in inputs]
+        params = None
+    if mask_kind == "placeholder":
+        mask = torch.tensor(float("nan"))
+    else:
+        mask = torch.ones(1, 1, valid.numel(), valid.numel(), dtype=torch.bool)
+        if mask_kind == "causal":
+            mask = mask.triu(1)
+    masked_state, reference_state = CSA2State(), CSA2State()
+    outputs, expected = [], []
+    for core, (q, kv, x, qr) in zip(cores, inputs):
+        kwargs = dict(x=x, qr=qr, packed_seq_params=params)
+        outputs.append(core(q, kv, kv, mask, csa2_state=masked_state, **kwargs))
+        expected.append(core(q, kv, kv, None, csa2_state=reference_state, **kwargs))
+        torch.testing.assert_close(outputs[-1], expected[-1], rtol=0, atol=0)
+    leaves = tuple(t for row in inputs for t in row) + tuple(cores.parameters())
+    probes = [torch.randn_like(output) for output in outputs]
+    actual_grads = torch.autograd.grad(
+        sum((out * probe).sum() for out, probe in zip(outputs, probes)), leaves, allow_unused=True
+    )
+    expected_grads = torch.autograd.grad(
+        sum((out * probe).sum() for out, probe in zip(expected, probes)), leaves, allow_unused=True
+    )
+    for actual, reference in zip(actual_grads, expected_grads):
+        if actual is None or reference is None:
+            assert actual is reference
+        else:
+            torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("candidates", [False, True])
 def test_thd_attention_stack_matches_separate_sequence_outputs_and_gradients(dtype, candidates):
@@ -3167,11 +3207,61 @@ def _kernel_indexer(ratio, precision, heads, device):
     return indexer
 
 
+@pytest.mark.parametrize("ratio", [1, 2])
+@pytest.mark.parametrize(
+    "real, physical, tail, bound",
+    [
+        ([3, 5], [4, 6], 0, 6),
+        ([1, 0, 5], [3, 0, 7], 3, 7),
+        ([1, 1], [1, 1], 31, 3),
+        ([0, 0], [0, 0], 0, 0),
+        ([0, 0], [0, 0], 9, 4),
+        ([], [], 16, 0),
+    ],
+)
+def test_packed_indexer_metadata_uses_host_bounds(monkeypatch, ratio, real, physical, tail, bound):
+    params, _, valid = _packed(real, physical, tail=tail)
+    params.max_seqlen_q = params.max_seqlen_kv = bound
+    layout = build_csa2_thd_layout(params, valid.numel())
+    compressed = layout.for_compression(ratio)
+    inputs = prepare_csa2_indexer_inputs(
+        torch.empty(valid.numel(), 2, 8, dtype=torch.bfloat16),
+        torch.empty(compressed.capacity, 8, dtype=torch.bfloat16),
+        torch.empty(valid.numel(), 2, dtype=torch.bfloat16),
+        ratio,
+        thd_layout=layout,
+        compressed_layout=compressed,
+    )
+
+    def reject_host_read(*args, **kwargs):
+        pytest.fail("Packed indexer metadata must not read tensor values on the host")
+
+    with monkeypatch.context() as patch:
+        for method in ("tolist", "item", "cpu", "numpy", "__bool__", "__int__", "__index__"):
+            patch.setattr(torch.Tensor, method, reject_host_read)
+        metadata = inputs.packed_metadata
+        assert inputs.packed_metadata is metadata
+    cu_q, cu_k, max_q, max_k = metadata
+    assert cu_q.dtype == cu_k.dtype == torch.int32
+    assert cu_q.is_contiguous() and cu_k.is_contiguous() and cu_q.shape == cu_k.shape
+    # Every original sequence keeps its addresses. Synthetic segments cover
+    # all physical capacity, including tails larger than the real-sequence bound.
+    prefix_size = len(physical) + 1
+    torch.testing.assert_close(cu_q[:prefix_size], layout.cu_seqlens_padded)
+    torch.testing.assert_close(cu_k[:prefix_size], compressed.cu_seqlens_padded)
+    assert cu_q[-1] == inputs.q.shape[0] and cu_k[-1] == inputs.k.shape[0]
+    assert (cu_q.diff() >= 0).all() and cu_q.diff().max() <= max_q
+    assert (cu_k.diff() >= 0).all() and cu_k.diff().max() <= max_k
+    assert max_q == max(bound, 1) and max_k == bound // ratio
+
+
 @pytest.mark.parametrize("backend", ["adapter", "real"])
 @pytest.mark.parametrize("precision", ["bf16", "mxfp8"])
 @pytest.mark.parametrize("heads", [32, 64])
 @pytest.mark.parametrize("ratio", [1, 2])
-@pytest.mark.parametrize("layout", ["sbhd", "thd", "empty", "short", "padding", "unused-capacity"])
+@pytest.mark.parametrize(
+    "layout", ["sbhd", "thd", "empty", "short", "padding", "unused-capacity", "long-tail"]
+)
 def test_fused_indexer_topk_layout_and_precision(
     monkeypatch, backend, precision, heads, ratio, layout
 ):
@@ -3212,6 +3302,7 @@ def test_fused_indexer_topk_layout_and_precision(
             "short": ([1, 1], [1, 1], 0),
             "padding": ([0, 0], [3, 5], 3),
             "unused-capacity": ([1, 1], [1, 1], 5),
+            "long-tail": ([3, 0, 5], [4, 0, 6], 31),
         }[layout]
         params, _, valid = _packed(lengths, padded, tail=tail, device=device)
         if layout == "unused-capacity":
@@ -3681,7 +3772,7 @@ def test_fused_candidate_radix_rows_with_unaligned_block_counts():
 @pytest.mark.parametrize("precision", ["bf16", "mxfp8"])
 @pytest.mark.parametrize("heads", [32, 64])
 @pytest.mark.parametrize("ratio", [1, 2])
-@pytest.mark.parametrize("layout", ["sbhd", "thd"])
+@pytest.mark.parametrize("layout", ["sbhd", "thd", "long-tail"])
 def test_fused_candidate_generation_matches_dense_oracle(
     monkeypatch, precision, heads, ratio, layout
 ):
@@ -3696,7 +3787,12 @@ def test_fused_candidate_generation_matches_dense_oracle(
         k = torch.randn(131 // ratio, 2, 128, device="cuda", dtype=torch.bfloat16)
         w = torch.randn(131, 2, heads, device="cuda", dtype=torch.bfloat16)
     else:
-        params, _, valid = _packed([1, 0, 43, 131], [3, 0, 48, 134], tail=7, device="cuda")
+        params, _, valid = _packed(
+            [1, 0, 43, 131],
+            [3, 0, 48, 134],
+            tail=511 if layout == "long-tail" else 7,
+            device="cuda",
+        )
         token_layout = build_csa2_thd_layout(params, valid.numel())
         compressed = token_layout.for_compression(ratio)
         q = torch.randn(valid.numel(), heads, 128, device="cuda", dtype=torch.bfloat16)
@@ -3750,7 +3846,7 @@ def test_fused_candidate_generation_matches_dense_oracle(
         torch.testing.assert_close(x, before, atol=0, rtol=0)
     assert actual.indices.is_contiguous() and not actual.indices.requires_grad
     mask = actual.to_mask(k.shape[0], thd_layout=token_layout, compressed_layout=compressed)
-    if layout == "thd":
+    if token_layout is not None:
         assert not mask[~token_layout.valid_tokens].any()
         assert not mask[:, ~compressed.valid_groups].any()
         assert not mask[
