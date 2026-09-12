@@ -9,6 +9,38 @@ from .utils import is_hybrid_model, print_rank_0
 NUM_BYTES_IN_MEGABYTE = 1024 * 1024
 
 
+def _get_moe_layer_counts(args) -> tuple[int, int, int, list[int]]:
+    """Split the transformer block into dense and MoE layers.
+
+    Args:
+        args: Parsed training arguments.
+
+    Returns:
+        A tuple of (num_dense_layers, num_moe_layers, moe_ffn_hidden_size, moe_layer_pattern).
+        A model without experts is reported as all-dense with a zero-sized expert FFN.
+    """
+    if args.num_experts is None:
+        return args.num_layers, 0, 0, [0] * args.num_layers
+
+    if isinstance(args.moe_layer_freq, int):
+        moe_layer_pattern = [
+            1 if (i % args.moe_layer_freq == 0) else 0 for i in range(args.num_layers)
+        ]
+    elif isinstance(args.moe_layer_freq, list):
+        moe_layer_pattern = args.moe_layer_freq
+        assert len(moe_layer_pattern) == args.num_layers, (
+            f"Invalid length of moe_layer_pattern: {len(moe_layer_pattern)}, "
+            f"expected {args.num_layers}, "
+            f"current moe layer pattern: {args.moe_layer_freq}"
+        )
+    else:
+        raise ValueError(f"Invalid moe_layer_freq: {args.moe_layer_freq}")
+
+    num_moe_layers = sum(moe_layer_pattern)
+    num_dense_layers = args.num_layers - num_moe_layers
+    return num_dense_layers, num_moe_layers, args.moe_ffn_hidden_size, moe_layer_pattern
+
+
 def compute_weight_and_optimizer_memory(args, verbose=False):
     # Attention projection size.
     query_projection_size = args.kv_channels * args.num_attention_heads
@@ -26,28 +58,9 @@ def compute_weight_and_optimizer_memory(args, verbose=False):
         else args.moe_shared_expert_intermediate_size
     )
 
-    if args.num_experts is not None:
-        if isinstance(args.moe_layer_freq, int):
-            moe_layer_pattern = [
-                1 if (i % args.moe_layer_freq == 0) else 0 for i in range(args.num_layers)
-            ]
-        elif isinstance(args.moe_layer_freq, list):
-            moe_layer_pattern = args.moe_layer_freq
-            assert len(moe_layer_pattern) == args.num_layers, (
-                f"Invalid length of moe_layer_pattern: {len(moe_layer_pattern)}, "
-                f"expected {args.num_layers}, "
-                f"current moe layer pattern: {args.moe_layer_freq}"
-            )
-
-        num_dense_layers = args.num_layers - sum(moe_layer_pattern)
-        num_moe_layers = sum(moe_layer_pattern)
-        moe_ffn_hidden_size = args.moe_ffn_hidden_size
-    else:
-        moe_layer_pattern = [0] * args.num_layers
-        num_dense_layers = args.num_layers
-        num_moe_layers = 0
-        moe_ffn_hidden_size = 0
-    assert num_dense_layers + num_moe_layers == args.num_layers
+    num_dense_layers, num_moe_layers, moe_ffn_hidden_size, moe_layer_pattern = (
+        _get_moe_layer_counts(args)
+    )
     if args.mtp_num_layers is not None:
         mtp_layer_is_moe = moe_layer_pattern[-1]
         mtp_num_moe_layers = mtp_layer_is_moe * args.mtp_num_layers
@@ -313,16 +326,107 @@ def compute_activation_memory(args, num_microbatches, verbose=False):
     # TODO: This function needs to take into account query_projection_size potentially being
     # different from hidden_size.
 
-    # Memory footprint from transformer layer (self-attention and MLP).
-    activation_memory = (args.seq_length * args.micro_batch_size * args.hidden_size) * (
-        18 + (4 * (args.ffn_hidden_size / args.hidden_size))
+    # Deliberately not modelled, and inaccurate to the extent they apply:
+    # - Dropless routing is assumed. moe_expert_capacity_factor with
+    #   moe_pad_expert_input_to_capacity scales the routed terms by the capacity factor.
+    # - MTP layers are ignored, as they already are in the dense estimate.
+    # - Latent MoE fc1/fc2 projection activations are ignored.
+    # - The dense/MoE layer mix is taken globally. A model whose MoE layers are spread
+    #   unevenly over pipeline stages (a dense prefix, say) will not have its first stage
+    #   weighted exactly.
+
+    num_dense_layers, num_moe_layers, moe_ffn_hidden_size, _ = _get_moe_layer_counts(args)
+
+    seq_micro_batch = args.seq_length * args.micro_batch_size
+    seq_micro_batch_hidden = seq_micro_batch * args.hidden_size
+
+    # This function is only reached under selective recompute, where recompute_modules decides
+    # which submodules give up their saved activations.
+    recompute_modules = set(args.recompute_modules or ())
+    if args.recompute_granularity != "selective":
+        recompute_modules = set()
+    recompute_moe = "moe" in recompute_modules
+
+    def mlp_intermediate_bytes_per_token(ffn_hidden_size, recompute_activation=False):
+        """Saved intermediates of one MLP, in bytes per token.
+
+        The FC1 output, whose width a gated linear unit doubles, plus the activation
+        function's output. Both are held in 2 bytes per element.
+        """
+        fc1_output = 2 * ffn_hidden_size * (2 if args.swiglu else 1)
+        activation_output = 0 if recompute_activation else 2 * ffn_hidden_size
+        return fc1_output + activation_output
+
+    # The per-layer footprint splits into a term that scales with hidden_size (the attention
+    # block, both LayerNorms, the residuals and the dropout masks) and a term that scales with
+    # the MLP intermediate size. Together they reproduce the 34 * s * b * h of the paper for a
+    # non-gated MLP with ffn_hidden_size == 4 * hidden_size.
+    attention_and_norm_memory = 18 * seq_micro_batch_hidden
+
+    # Memory footprint from a dense transformer layer (self-attention and MLP).
+    dense_mlp_memory = (
+        0
+        if "mlp" in recompute_modules
+        else seq_micro_batch * mlp_intermediate_bytes_per_token(args.ffn_hidden_size)
     )
+    dense_layer_memory = attention_and_norm_memory + dense_mlp_memory
+
+    # Memory footprint from a MoE transformer layer. The dense MLP is replaced by an optional
+    # shared expert, which still runs at hidden_size over every token, plus the routed experts.
+    shared_expert_ffn_hidden_size = (
+        0
+        if args.moe_shared_expert_intermediate_size is None
+        else args.moe_shared_expert_intermediate_size
+    )
+    shared_expert_memory = (
+        0
+        if recompute_moe or "shared_experts" in recompute_modules
+        else seq_micro_batch * mlp_intermediate_bytes_per_token(shared_expert_ffn_hidden_size)
+    )
+    moe_layer_memory = attention_and_norm_memory + shared_expert_memory
+
+    # Latent MoE projects tokens down before the routed experts, so the dispatcher and the
+    # experts see moe_latent_size rather than hidden_size.
+    routed_expert_hidden_size = (
+        args.moe_latent_size if args.moe_latent_size is not None else args.hidden_size
+    )
+    # Dropless routing sends every token to moe_router_topk experts. Expert parallelism is
+    # carved out of the data-parallel dimension, so every EP rank keeps its own microbatch and
+    # dispatch does not reduce the per-rank token count. Under sequence parallelism a rank
+    # holds s * b / tp tokens and the dispatcher gathers over expert-tensor parallelism, so a
+    # rank ends up with topk * s * b * etp / tp dispatched tokens. Everything below is stated
+    # before the final division by tp.
+    routed_token_copies = args.moe_router_topk * seq_micro_batch if num_moe_layers > 0 else 0
+    dispatched_tokens = routed_token_copies * args.expert_tensor_parallel_size
+    # Permuted (dispatched) tokens plus the expert outputs held for the combine.
+    dispatched_token_memory = (
+        0 if recompute_moe else 4 * dispatched_tokens * routed_expert_hidden_size
+    )
+    # FC1 output and activation output inside each expert. The expert FFN width is sharded
+    # over expert-tensor parallelism, which cancels the etp factor in dispatched_tokens.
+    expert_intermediate_memory = (
+        0
+        if recompute_moe
+        else routed_token_copies
+        * mlp_intermediate_bytes_per_token(
+            moe_ffn_hidden_size, recompute_activation="moe_act" in recompute_modules
+        )
+    )
+    moe_layer_memory += dispatched_token_memory + expert_intermediate_memory
+
     if verbose:
         print(
-            f"Activation memory footprint per transformer layer: "
-            f"{activation_memory / NUM_BYTES_IN_MEGABYTE / args.tensor_model_parallel_size:.1f} MB"
+            f"Activation memory footprint per dense transformer layer: "
+            f"{dense_layer_memory / NUM_BYTES_IN_MEGABYTE / args.tensor_model_parallel_size:.1f} MB"
         )
-    activation_memory *= args.num_layers
+        if num_moe_layers > 0:
+            print(
+                f"Activation memory footprint per MoE transformer layer: "
+                f"{moe_layer_memory / NUM_BYTES_IN_MEGABYTE / args.tensor_model_parallel_size:.1f}"
+                f" MB"
+            )
+
+    activation_memory = dense_layer_memory * num_dense_layers + moe_layer_memory * num_moe_layers
 
     # Now add activation memory required for input embeddings, last LayerNorm and output layer.
 
@@ -331,12 +435,7 @@ def compute_activation_memory(args, num_microbatches, verbose=False):
         8 * args.seq_length * args.micro_batch_size * args.pipeline_model_parallel_size
     )
     # Dropout in embedding layer (pp_size microbatches in flight).
-    activation_memory += (
-        args.seq_length
-        * args.micro_batch_size
-        * args.hidden_size
-        * args.pipeline_model_parallel_size
-    )
+    activation_memory += seq_micro_batch_hidden * args.pipeline_model_parallel_size
 
     # Multiply by interleaved PP memory factor.
     if args.virtual_pipeline_model_parallel_size is not None:
@@ -368,14 +467,11 @@ def compute_activation_memory(args, num_microbatches, verbose=False):
     if args.pipeline_model_parallel_size == 1:
         # Inputs to output layer and CE loss.
         activation_memory += (
-            args.seq_length
-            * args.micro_batch_size
-            * args.hidden_size
-            * 4
-            * (1 + (args.padded_vocab_size / args.hidden_size))
+            seq_micro_batch_hidden * 4 * (1 + (args.padded_vocab_size / args.hidden_size))
         )
 
     # Activation memory is partitioned by TP size due to tensor and sequence model parallelism.
+    # The routed-expert terms above are already expressed in the same pre-division units.
     return activation_memory / args.tensor_model_parallel_size
 
 
