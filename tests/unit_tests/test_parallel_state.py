@@ -101,7 +101,11 @@ def test_destroy_model_parallel_can_defer_process_group_destruction():
     Utils.destroy_model_parallel()
     assert ps._global_process_group_list is None
     assert all(group not in pg_map for group in all_groups)
-    assert not _mesh_resources.child_to_root_mapping
+    # PyTorch releases with process-group-backed DeviceMesh either keep the
+    # legacy global child-to-root cache or store mesh relationships on the
+    # DeviceMesh itself. If the legacy cache exists, teardown must clear it.
+    child_to_root_mapping = getattr(_mesh_resources, 'child_to_root_mapping', None)
+    assert child_to_root_mapping is None or not child_to_root_mapping
 
 
 @pytest.mark.parametrize('order', test_parallel_order)
