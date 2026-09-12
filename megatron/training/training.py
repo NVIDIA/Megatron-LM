@@ -40,10 +40,16 @@ logging.basicConfig(handlers=[CustomHandler()], level=logging.INFO)
 # measurement (kept for backwards compatibility).
 _LEGACY_TRAIN_START_TIME = time.time()  # NOTE(asolergi-nv): Legacy timestamp
 
+from megatron.core import mpu, nccl_allocator, tensor_parallel
+
 # First-party.
 from megatron.core._rank_utils import safe_get_rank
-from megatron.core import mpu, nccl_allocator, tensor_parallel
 from megatron.core.datasets.data_schedule import HybridCPDataLoaderWrapper, wrap_data_iterator
+from megatron.core.determinism.trace import (
+    TraceConfig,
+    close_determinism_trace,
+    initialize_determinism_trace,
+)
 from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core.distributed import (
     DistributedDataParallelConfig,
@@ -312,10 +318,10 @@ def set_startup_timestamps(
 
 # OTel: module-level helpers imported once at startup.
 try:
-    from nemo.lens.state import is_span_group_enabled as _otel_sg_enabled
     from nemo.lens.helpers import managed_span as _otel_managed_span
     from nemo.lens.helpers import safe_set_span_attributes as _otel_safe_set_attrs
     from nemo.lens.helpers import trace_fn as _otel_trace_fn
+    from nemo.lens.state import is_span_group_enabled as _otel_sg_enabled
 except ImportError:
     from megatron.core.telemetry.fallbacks import is_span_group_enabled as _otel_sg_enabled
     from megatron.core.telemetry.fallbacks import managed_span as _otel_managed_span
@@ -429,9 +435,10 @@ def _start_otel_job_spans(model_type, program_start):
     if not _otel_sg_enabled('job'):
         return
 
-    from opentelemetry import context as _otel_ctx, trace as _otel_trace
-    from opentelemetry.context import Context as _OtelContext
     from nemo.lens.helpers import safe_set_span_attributes as _otel_set_attrs
+    from opentelemetry import context as _otel_ctx
+    from opentelemetry import trace as _otel_trace
+    from opentelemetry.context import Context as _OtelContext
 
     _otel_ctx_module = _otel_ctx
     _otel_tracer = get_telemetry().tracer
@@ -585,7 +592,8 @@ def _reroot_otel_interval():
     global _otel_interval_span, _otel_interval_ctx_token
     if get_telemetry() is None or not _otel_sg_enabled('job'):
         return
-    from opentelemetry import context as _octx, trace as _otr
+    from opentelemetry import context as _octx
+    from opentelemetry import trace as _otr
     from opentelemetry.context import Context
     from opentelemetry.trace import Link
     prev = _otel_interval_span
@@ -2079,6 +2087,8 @@ def pretrain(
                 # (SystemExit from the exit-interval path is NOT caught here; it already
                 # flushed before sys.exit(). SIGKILL is unrecoverable regardless.)
                 _end_otel_job_spans()
+                if getattr(args, "determinism_trace_dir", None):
+                    close_determinism_trace()
                 raise
 
         print_datetime('after training is done')
@@ -3103,7 +3113,8 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     # OTel: set up per-step sub-span support.
     _otel_step_tracer = None
     if _otel_sg_enabled('forward_backward') or _otel_sg_enabled('optimizer'):
-        from nemo.lens.helpers import span_cm, safe_set_span_attributes as _otel_set_attrs
+        from nemo.lens.helpers import safe_set_span_attributes as _otel_set_attrs
+        from nemo.lens.helpers import span_cm
         _otel_step_tracer = get_telemetry().tracer
 
     rerun_state_machine = get_rerun_state_machine()
@@ -3973,7 +3984,8 @@ def save_checkpoint_and_time(
     _exposed_save_span = None
     _exposed_save_token = None
     if _otel_sg_enabled('checkpoint'):
-        from opentelemetry import context as _octx, trace as _otr
+        from opentelemetry import context as _octx
+        from opentelemetry import trace as _otr
         _exposed_save_span = get_telemetry().tracer.start_span('megatron.checkpoint.exposed_save')
         _otel_mark_goodput(_exposed_save_span)
         _exposed_save_span.set_attribute('megatron.iteration', iteration)
@@ -4553,6 +4565,23 @@ def train(
         )
         get_moe_router_tracer().register_hooks(model)
 
+    determinism_trace = None
+    determinism_trace_dir = getattr(args, "determinism_trace_dir", None)
+    if determinism_trace_dir:
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        determinism_trace = initialize_determinism_trace(
+            TraceConfig(
+                output_dir=determinism_trace_dir,
+                rank=rank,
+                mode=getattr(args, "determinism_trace_mode", "metadata"),
+                sample_count=getattr(args, "determinism_trace_sample_count", 256),
+                flush_every=getattr(args, "determinism_trace_flush_every", 0),
+                append=getattr(args, "determinism_trace_append", False),
+                rank_spec=getattr(args, "determinism_trace_ranks", "all"),
+                iteration_spec=getattr(args, "determinism_trace_iterations", "all"),
+            )
+        )
+
     report_memory_flag = True
     pre_hook_enabled = False
     should_exit = False
@@ -4786,6 +4815,15 @@ def train(
         num_microbatches = get_num_microbatches()
         update_num_microbatches(args.consumed_train_samples, consistency_check=True, verbose=True)
 
+        trace_iteration = iteration + 1
+        if determinism_trace is not None:
+            determinism_trace.record_event(
+                "iteration_start",
+                iteration=trace_iteration,
+                phase="train",
+                fields={"num_microbatches": num_microbatches},
+            )
+
         # Capture CUDA Graphs. One-off, at the warmup-step boundary -- the actual
         # graph capture (create_cudagraphs) is a notable one-time cost worth its
         # own span, distinct from the megatron.train.iteration spans around it.
@@ -4819,6 +4857,14 @@ def train(
             )
             args.consumed_train_samples += batch_size
             args.skipped_train_samples += batch_size
+            if determinism_trace is not None:
+                determinism_trace.record_event(
+                    "iteration_skipped",
+                    iteration=trace_iteration,
+                    phase="train",
+                    fields={"reason": "configured_skip"},
+                )
+                determinism_trace.flush()
             continue
 
         args.curr_iteration = iteration
@@ -4901,6 +4947,46 @@ def train(
                     _otel_safe_set_attrs(
                         _step_span, {'megatron.skipped': bool(skipped_iter)}
                     )
+        if determinism_trace is not None:
+            determinism_trace.record_event(
+                "iteration_result",
+                iteration=trace_iteration,
+                phase="train",
+                fields={"skipped": bool(skipped_iter)},
+            )
+            for loss_name, loss_value in sorted(loss_dict.items()):
+                trace_name = f"loss.{loss_name}"
+                if isinstance(loss_value, torch.Tensor) and loss_value.numel() == 1:
+                    determinism_trace.record_scalar(
+                        trace_name,
+                        loss_value,
+                        iteration=trace_iteration,
+                        phase="train",
+                    )
+                elif isinstance(loss_value, torch.Tensor):
+                    determinism_trace.record_tensor(
+                        trace_name,
+                        loss_value,
+                        iteration=trace_iteration,
+                        phase="train",
+                    )
+                elif isinstance(loss_value, (bool, int, float)) or loss_value is None:
+                    determinism_trace.record_scalar(
+                        trace_name,
+                        loss_value,
+                        iteration=trace_iteration,
+                        phase="train",
+                    )
+            determinism_trace.record_scalar(
+                "grad_norm", grad_norm, iteration=trace_iteration, phase="train"
+            )
+            determinism_trace.record_scalar(
+                "num_zeros_in_grad",
+                num_zeros_in_grad,
+                iteration=trace_iteration,
+                phase="train",
+            )
+            determinism_trace.flush()
         if should_checkpoint:
             save_checkpoint_and_time(
                 iteration,
@@ -5019,7 +5105,8 @@ def train(
         _report_span = None
         _report_token = None
         if _otel_sg_enabled('step'):
-            from opentelemetry import context as _octx, trace as _otr
+            from opentelemetry import context as _octx
+            from opentelemetry import trace as _otr
             _report_span = get_telemetry().tracer.start_span('megatron.train.iteration_report')
             _otel_mark_goodput(_report_span)
             _report_token = _octx.attach(_otr.set_span_in_context(_report_span))
@@ -5209,6 +5296,9 @@ def train(
     # Shutdown RL profiler and export summary
     if args.rl_profile:
         shutdown_rl_profiler()
+
+    if determinism_trace is not None:
+        close_determinism_trace()
 
     # If any exit conditions (signal handler, duration, iterations) have been reached, exit.
     if should_exit:
