@@ -28,6 +28,19 @@ See the [Megatron Bridge supported models list](https://github.com/NVIDIA-NeMo/M
 | **Qwen** | Alibaba's Qwen series | HuggingFace integration, multilingual support |
 | **Mamba** | State Space Model | Subquadratic sequence length scaling, efficient long context |
 
+## Hybrid / DSA Models
+
+GLM-5.2 and DeepSeek-V3.2-class models use DeepSeek Sparse Attention (DSA) with absorbed Multi-Latent Attention (`experimental_attention_variant="dsa"` / AbsorbedMLA). Training support is tracked in [#6392](https://github.com/NVIDIA/Megatron-LM/issues/6392).
+
+In-framework Megatron text generation and refit-style eval are not supported for these checkpoints. Both the AbsorbedMLA forward path and the inference-optimized GPT layer spec assert when `experimental_attention_variant="dsa"` is set. See [#7106](https://github.com/NVIDIA/Megatron-LM/issues/7106).
+
+The supported generation path today is:
+
+1. Convert the Megatron checkpoint with [Megatron Bridge](https://github.com/NVIDIA-NeMo/Megatron-Bridge).
+2. Serve the HuggingFace export with vLLM (`GlmMoeDsaForCausalLM`, as reported in [#7106](https://github.com/NVIDIA/Megatron-LM/issues/7106)).
+
+Do not run Megatron or Megatron-Bridge in-framework generation against a DSA / AbsorbedMLA checkpoint. Those entry points hit the same limitation.
+
 ## Encoder-Only Models
 
 | Model | Description | Key Features |
