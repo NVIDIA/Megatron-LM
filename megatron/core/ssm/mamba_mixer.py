@@ -1074,6 +1074,24 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule):
             self.refresh_cache()
         return super().train(mode)
 
+    def refresh_inference_weight_caches(self) -> None:
+        """Refill weight-derived decode caches from the current weights.
+
+        Call after ``A_log`` is updated without a ``train()`` transition, as an
+        RL refit does: the model stays in eval mode throughout, so nothing else
+        marks the decode cache stale and inference would keep using the value
+        derived from the pre-refit weights.
+
+        Refills in place rather than only marking the cache stale. Once decode
+        graphs are captured, a replay does not re-execute the staleness check in
+        ``_get_decode_A_neg_exp``, so the captured buffer itself must be
+        updated -- which is safe precisely because that buffer is allocated
+        outside graph capture and keeps its address for the model's lifetime.
+        """
+        with torch.no_grad():
+            self._A_neg_exp_cache.copy_(-torch.exp(self.A_log.float()))
+        self._A_neg_exp_cache_stale = False
+
     def ssm_decode(
         self,
         zxBCdt: torch.Tensor,
