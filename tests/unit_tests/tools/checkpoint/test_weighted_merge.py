@@ -1604,6 +1604,7 @@ def test_metadata_same_layout_multi_rank_product_round_trip_public_metadata(
             output_root,
             output_iteration=2,
             extra_state_source_index=1,
+            ignore_non_model_state=True,
         )
 
         loaded = _load_checkpoint(result.output_dir)
@@ -1707,6 +1708,7 @@ def test_metadata_same_layout_multi_rank_byte_extra_state_round_trip(
             output_root,
             output_iteration=31,
             extra_state_source_index=1,
+            ignore_non_model_state=True,
         )
 
         load_template = _unprefixed_gpt_like_model_state(0.0, rank_sharded=True)
