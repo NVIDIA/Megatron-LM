@@ -53,6 +53,13 @@ Operationally, this path is tightly integrated into MCore training and inference
 - users select the mode through config flags only; there is no separate helper API to
   wire into a custom training loop or a separate need to handle static input buffers
 
+Training graph setup also captures separate forward-only graphs for `model.eval()` with
+`torch.no_grad()`, excluding training-only operations such as dropout and MoE router token-count
+accumulation. Validation reuses the training graph pool's inactive activation storage and leaves
+training replay order intact. Run validation between completed training steps, after all training
+backwards have finished. Evaluation before graph setup, with unmatched input shapes or arguments,
+or with autograd enabled runs eagerly.
+
 ### Usage
 
 ```bash

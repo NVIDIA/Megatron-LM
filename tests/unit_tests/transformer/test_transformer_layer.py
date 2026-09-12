@@ -27,6 +27,7 @@ from megatron.core.transformer.cuda_graphs import (
     CudaGraphManager,
     _CudagraphGlobalRecord,
     create_cudagraphs,
+    delete_cuda_graphs,
 )
 from megatron.core.transformer.enums import CudaGraphModule, InferenceCudaGraphScope
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -435,10 +436,8 @@ def _make_cuda_graph_gpt_block(**config_kwargs):
 
 
 def _reset_cudagraph_state():
-    _CudagraphGlobalRecord.cudagraph_created = False
-    _CudagraphGlobalRecord.cudagraph_record = []
-    CudaGraphManager.global_mempool = None
     torch.cuda.synchronize()
+    delete_cuda_graphs()
 
 
 def _all_layers_have_manager(block) -> bool:
@@ -506,8 +505,8 @@ class TestTransformerLayerCudaGraphManagers:
         model_parallel_cuda_manual_seed(123)
 
     def teardown_method(self, method):
-        Utils.destroy_model_parallel()
         _reset_cudagraph_state()
+        Utils.destroy_model_parallel()
         gc.collect()
 
     def test_moe_router_partial_cudagraph_forward_matches_eager(self):
