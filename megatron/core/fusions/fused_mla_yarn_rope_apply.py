@@ -310,6 +310,12 @@ class _FusedMLARoPEInplace(torch.autograd.Function):
         assert sin.stride(-1) == 1
         assert headdim == nope_dim + emb_dim
         assert emb_dim % 4 == 0
+        if cos.shape[-1] != emb_dim or sin.shape[-1] != emb_dim:
+            raise ValueError(
+                f"cos/sin last dim must equal emb_dim={emb_dim} "
+                f"(got cos={cos.shape[-1]}, sin={sin.shape[-1]}); a narrower rotary cache "
+                f"(e.g. rotary_percent < 1) makes the fused MLA kernel read past the buffer."
+            )
 
         grid = lambda META: (total_seqlen, triton.cdiv(nheads, META["BLOCK_H"]))
         _mla_rope_fwd_inplace_kernel[grid](
@@ -778,6 +784,12 @@ class _FusedMLARoPEKVSplit(torch.autograd.Function):
         assert cos.is_contiguous()
         assert sin.is_contiguous()
         assert emb_dim % 4 == 0
+        if cos.shape[-1] != emb_dim or sin.shape[-1] != emb_dim:
+            raise ValueError(
+                f"cos/sin last dim must equal emb_dim={emb_dim} "
+                f"(got cos={cos.shape[-1]}, sin={sin.shape[-1]}); a narrower rotary cache "
+                f"(e.g. rotary_percent < 1) makes the fused MLA kernel read past the buffer."
+            )
 
         o_key = kv.new_empty(total_seqlen, nheads, emb_dim + k_dim)
         o_value = kv.new_empty(total_seqlen, nheads, v_dim)
