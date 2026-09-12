@@ -659,8 +659,8 @@ class DSGQACoreAttention(MegatronModule):
         self.dense_core_attention = None
         if (
             getattr(config, "dsa_fwd_use_dense_attn", False)
-            or getattr(config, "dsa_fwd_skip_dsa", False)
-        ) and (submodules.dense_core_attention is not None):
+            and submodules.dense_core_attention is not None
+        ):
             self.dense_core_attention = build_module(
                 submodules.dense_core_attention,
                 config=config,
@@ -706,10 +706,7 @@ class DSGQACoreAttention(MegatronModule):
         sq, b, _, _ = query.size()
         skv = key.size(0)
         dsa_kernel_backend = getattr(self.config, "dsa_kernel_backend", "reference")
-        if getattr(self.config, "dsa_fwd_skip_dsa", False) or dsa_kernel_backend in (
-            "min-memory-triton",
-            "min-memory-torch",
-        ):
+        if dsa_kernel_backend in ("min-memory-triton", "min-memory-torch"):
             return self._forward_min_memory(
                 query=query,
                 key=key,
@@ -723,7 +720,6 @@ class DSGQACoreAttention(MegatronModule):
                 packed_seq_params=packed_seq_params,
             )
 
-        sparse_attention_use_gather = getattr(self.config, "dsa_sparse_attention_use_gather", False)
         simplified_indexer = getattr(self.config, "dsa_indexer_mode", "standard") == "simplified"
         simplified_learned_k = simplified_indexer and getattr(
             self.config, "dsa_simplified_use_learned_k", False
@@ -739,20 +735,16 @@ class DSGQACoreAttention(MegatronModule):
                 torch.full((sq, skv), float('-inf'), dtype=torch.float32, device=query.device),
                 diagonal=1,
             )
-            sparse_attention_mask = None if sparse_attention_use_gather else routing_mask
+            sparse_attention_mask = routing_mask
         else:
             assert attention_mask.shape == (b, 1, sq, skv), 'attention_mask shape mismatch'
             sparse_attention_mask = attention_mask.squeeze(1)
             routing_mask = torch.zeros_like(sparse_attention_mask, dtype=torch.float32).masked_fill(
                 sparse_attention_mask, float('-inf')
             )
-            if not sparse_attention_use_gather:
-                sparse_attention_mask = routing_mask
+            sparse_attention_mask = routing_mask
 
-        train_main_only = getattr(self.config, "dsa_train_main_only", False)
-        indexer_loss_coeff = (
-            0.0 if train_main_only else (getattr(self.config, 'dsa_indexer_loss_coeff', 0.0) or 0.0)
-        )
+        indexer_loss_coeff = getattr(self.config, 'dsa_indexer_loss_coeff', 0.0) or 0.0
         if self.training and torch.is_grad_enabled():
             sparse_indexer_loss = getattr(self.config, "dsa_indexer_use_sparse_loss", False)
             if simplified_indexer:
@@ -851,9 +843,6 @@ class DSGQACoreAttention(MegatronModule):
                     layer_number=self.layer_number,
                     num_layers=self.config.num_layers,
                 )
-            sparse_attention_use_gather = getattr(
-                self.config, "dsa_sparse_attention_use_gather", False
-            )
             sparse_attention_query_chunk_size = None
             output = unfused_grouped_dsa_fn(
                 query,
@@ -863,7 +852,6 @@ class DSGQACoreAttention(MegatronModule):
                 self.softmax_scale,
                 mask=sparse_attention_mask,
                 query_chunk_size=sparse_attention_query_chunk_size,
-                use_gather=sparse_attention_use_gather,
             )
             if indexer_loss is not None:
                 output = DSAIndexerLossAutoScaler.apply(output, indexer_loss)
@@ -897,7 +885,6 @@ class DSGQACoreAttention(MegatronModule):
             self.softmax_scale,
             mask=sparse_attention_mask,
             query_chunk_size=None,
-            use_gather=sparse_attention_use_gather,
         )
 
     def _forward_min_memory(
@@ -915,13 +902,9 @@ class DSGQACoreAttention(MegatronModule):
     ) -> torch.Tensor:
         """Minimum-activation DSA-GQA path for training and no-grad validation."""
         dsa_kernel_backend = getattr(self.config, "dsa_kernel_backend", "reference")
-        skip_dsa = getattr(self.config, "dsa_fwd_skip_dsa", False)
         dense_warmup = getattr(self.config, "dsa_fwd_use_dense_attn", False)
-        train_main_only = getattr(self.config, "dsa_train_main_only", False)
         sparse_indexer_loss = getattr(self.config, "dsa_indexer_use_sparse_loss", False)
-        sparse_fwd_dense_loss = (
-            not train_main_only and not skip_dsa and not dense_warmup and not sparse_indexer_loss
-        )
+        sparse_fwd_dense_loss = not dense_warmup and not sparse_indexer_loss
         simplified_indexer = getattr(self.config, "dsa_indexer_mode", "standard") == "simplified"
         if simplified_indexer and not _simplified_indexer_uses_main_input_norm(self.config):
             indexer_input_norm = None
@@ -936,45 +919,6 @@ class DSGQACoreAttention(MegatronModule):
             raise NotImplementedError(
                 f"dsa_kernel_backend='{dsa_kernel_backend}' requires full-sequence self "
                 "attention."
-            )
-        if skip_dsa:
-            if self.dense_core_attention is None:
-                raise RuntimeError("DSA skip mode requires an original dense core attention spec.")
-            output = self.dense_core_attention(
-                query,
-                key,
-                value,
-                attention_mask,
-                attn_mask_type=attn_mask_type,
-                attention_bias=attention_bias,
-                packed_seq_params=packed_seq_params,
-            )
-            zero_indexer_loss = output.new_zeros((), dtype=torch.float32)
-            DSAIndexerLossLoggingHelper.save_loss_to_tracker(
-                loss=zero_indexer_loss,
-                raw_loss=zero_indexer_loss,
-                layer_number=self.layer_number,
-                num_layers=self.config.num_layers,
-            )
-            if not torch.is_grad_enabled():
-                return output
-            if not self.training:
-                raise NotImplementedError(
-                    "dsa_fwd_skip_dsa supports training and no-grad validation only."
-                )
-            trainable_indexer_params = tuple(
-                param
-                for param in self.indexer.parameters()
-                if param.requires_grad and param.numel() > 0
-            )
-            if not trainable_indexer_params:
-                return output
-            return _DSAZeroParamDependency.apply(output, *trainable_indexer_params)
-        if getattr(self.config, "dsa_sparse_attention_use_gather", False):
-            raise NotImplementedError(
-                f"dsa_kernel_backend='{dsa_kernel_backend}' bypasses the reference gather "
-                "backend; "
-                "do not set dsa_sparse_attention_use_gather."
             )
         if dense_warmup and getattr(self.config, "dsa_indexer_use_sparse_loss", False):
             raise NotImplementedError(
@@ -994,13 +938,6 @@ class DSGQACoreAttention(MegatronModule):
                 "Sparse-forward dense-loss mode has no selected-score sparse loss; do not set "
                 "dsa_kernel_cache_selected_scores."
             )
-        if train_main_only and getattr(self.config, "dsa_kernel_cache_selected_scores", False):
-            raise NotImplementedError(
-                "dsa_train_main_only has no selected-score KL backward; do not set "
-                "dsa_kernel_cache_selected_scores."
-            )
-        if train_main_only and (skip_dsa or dense_warmup):
-            raise NotImplementedError("dsa_train_main_only requires sparse DSA forward attention.")
         if not simplified_indexer and not getattr(
             self.config, "dsa_indexer_rotate_activation", True
         ):
@@ -1106,13 +1043,13 @@ class DSGQACoreAttention(MegatronModule):
             )
 
         configured_indexer_loss_coeff = getattr(self.config, "dsa_indexer_loss_coeff", 0.0) or 0.0
-        if not train_main_only and configured_indexer_loss_coeff <= 0:
+        if configured_indexer_loss_coeff <= 0:
             raise NotImplementedError(
                 f"dsa_kernel_backend='{dsa_kernel_backend}' expects dsa_indexer_loss_coeff "
                 "> 0 "
                 "for indexer training."
             )
-        indexer_loss_coeff = 0.0 if train_main_only else configured_indexer_loss_coeff
+        indexer_loss_coeff = configured_indexer_loss_coeff
 
         sparse_loss_coeff = indexer_loss_coeff if sparse_indexer_loss else 0.0
         output, indexer_loss = dsa_min_memory_gqa(
@@ -1148,15 +1085,12 @@ class DSGQACoreAttention(MegatronModule):
                 profile_label=f"layer={self.layer_number}",
                 use_triton=dsa_kernel_backend == "min-memory-triton",
             )
-        if not train_main_only:
-            DSAIndexerLossLoggingHelper.save_loss_to_tracker(
-                loss=indexer_loss,
-                raw_loss=indexer_loss / indexer_loss_coeff,
-                layer_number=self.layer_number,
-                num_layers=self.config.num_layers,
-            )
-        if train_main_only:
-            return output
+        DSAIndexerLossLoggingHelper.save_loss_to_tracker(
+            loss=indexer_loss,
+            raw_loss=indexer_loss / indexer_loss_coeff,
+            layer_number=self.layer_number,
+            num_layers=self.config.num_layers,
+        )
         return DSAIndexerLossAutoScaler.apply(output, indexer_loss)
 
 
@@ -1238,9 +1172,7 @@ class DSGroupedSelfAttention(SelfAttention):
         if self.config.experimental_attention_variant != "dsa":
             return {}
         indexer_input_norm = None
-        if _simplified_indexer_uses_main_input_norm(self.config) and not getattr(
-            self.config, "dsa_fwd_skip_dsa", False
-        ):
+        if _simplified_indexer_uses_main_input_norm(self.config):
             indexer_input_norm = _indexer_input_norm_spec(self.linear_qkv, self.config)
         return {
             "hidden_states": hidden_states,
