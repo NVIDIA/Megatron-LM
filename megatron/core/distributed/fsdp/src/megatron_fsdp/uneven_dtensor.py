@@ -23,10 +23,13 @@ from torch.distributed.checkpoint.metadata import (
     TensorProperties,
 )
 from torch.distributed.checkpoint.planner import TensorWriteData, WriteItem, WriteItemType
+from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor.placement_types import Replicate, Shard, _StridedShard
 
 
-def gather_and_compute_chunk_metadata(dtensor: DTensor) -> ChunkStorageMetadata:
+def gather_and_compute_chunk_metadata(
+    dtensor: DTensor, device_mesh: DeviceMesh | None = None
+) -> ChunkStorageMetadata:
     """
     Gather chunk metadata for a DTensor across all ranks and compute the
     offsets and sizes of each chunk. This is necessary for handling uneven
@@ -34,8 +37,8 @@ def gather_and_compute_chunk_metadata(dtensor: DTensor) -> ChunkStorageMetadata:
     """
     local_tensor = dtensor.to_local()
     local_shape = local_tensor.shape
-    device_mesh = dtensor.device_mesh
-
+    if device_mesh is None:
+        device_mesh = dtensor.device_mesh
     offsets = [0] * len(local_shape)
     cumulative_shape = list(local_shape).copy()
 
@@ -93,7 +96,9 @@ def gather_and_compute_chunk_metadata(dtensor: DTensor) -> ChunkStorageMetadata:
     return ChunkStorageMetadata(offsets=tuple(offsets), sizes=tuple(local_shape))
 
 
-def update_uneven_dtensor_chunk_metadata(dtensor: DTensor) -> dict:
+def update_uneven_dtensor_chunk_metadata(
+    dtensor: DTensor, device_mesh: DeviceMesh | None = None
+) -> dict:
     """
     Update the DTensor's chunk metadata to handle uneven sharding.
     This function modifies the DTensor in-place to include chunk metadata
@@ -129,7 +134,9 @@ def update_uneven_dtensor_chunk_metadata(dtensor: DTensor) -> dict:
     #    across devices before entering barrier (prevents potential hangs)
     # 2. Implement batched barrier using grouped collectives
     #    to amortize synchronization overhead
-    uneven_chunk_meta = gather_and_compute_chunk_metadata(dtensor)
+    if device_mesh is None:
+        device_mesh = dtensor.device_mesh
+    uneven_chunk_meta = gather_and_compute_chunk_metadata(dtensor, device_mesh)
 
     # Set the chunk list and write items closure for the DTensor
     dtensor._local_tensor.__create_chunk_list__ = _chunk_list_closure([uneven_chunk_meta])
@@ -244,12 +251,43 @@ def preprocess_state_dict_for_uneven_dtensor(state_dict: dict) -> dict:
     visit_dtensor = filter_unflattened_state_dict(
         state_dict, visit_condition=lambda x: isinstance(x, DTensor)
     )
-    # Sort the keys, since some state dictionaries are mocked
-    # and extended to include empty global keys.
-    for key_chain in sorted(visit_dtensor):
-        # Get the DTensor at the key chain
-        dtensor = get_unflattened_state_dict(state_dict, key_chain)
-        update_uneven_dtensor_chunk_metadata(dtensor)
+    temporary_meshes = {}
+    temporary_groups = []
+    try:
+        # Sort the keys, since some state dictionaries are mocked
+        # and extended to include empty global keys.
+        for key_chain in sorted(visit_dtensor):
+            # Get the DTensor at the key chain
+            dtensor = get_unflattened_state_dict(state_dict, key_chain)
+            mesh = dtensor.device_mesh
+            try:
+                mesh.get_all_groups()
+            except RuntimeError:
+                # A checkpoint can carry a DeviceMesh whose c10d group names belong to a
+                # different process lifetime. Recreate equivalent groups from its rank layout
+                # only long enough to compute DCP's chunk metadata; never retain the old groups.
+                mesh_key = (
+                    mesh.device_type,
+                    tuple(mesh.mesh.flatten().tolist()),
+                    mesh.mesh_dim_names,
+                )
+                if mesh_key not in temporary_meshes:
+                    temporary_mesh = DeviceMesh(
+                        mesh.device_type, mesh.mesh, mesh_dim_names=mesh.mesh_dim_names
+                    )
+                    if hasattr(mesh, "_shard_order"):
+                        temporary_mesh._shard_order = mesh._shard_order
+                    temporary_meshes[mesh_key] = temporary_mesh
+                    temporary_groups.extend(
+                        group
+                        for group in temporary_mesh.get_all_groups()
+                        if group is not dist.group.WORLD
+                    )
+                mesh = temporary_meshes[mesh_key]
+            update_uneven_dtensor_chunk_metadata(dtensor, mesh)
+    finally:
+        for group in reversed(temporary_groups):
+            dist.destroy_process_group(group)
     return state_dict
 
 
