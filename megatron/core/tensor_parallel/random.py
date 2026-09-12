@@ -21,9 +21,9 @@ from megatron.core.parallel_state import (
     get_expert_gtp_weight_remat_rank,
     get_expert_gtp_weight_remat_world_size,
     get_expert_model_parallel_rank,
+    get_expert_tensor_parallel_rank,
     get_gtp_weight_remat_rank,
     get_gtp_weight_remat_world_size,
-    get_expert_tensor_parallel_rank,
     get_tensor_model_parallel_rank,
 )
 from megatron.core.utils import is_te_min_version, safely_set_viewless_tensor_data

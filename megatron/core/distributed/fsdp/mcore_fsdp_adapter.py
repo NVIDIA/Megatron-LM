@@ -863,6 +863,7 @@ def FullyShardedDataParallel(
         config, ddp_config, module, fsdp_unit_modules, disable_bucketing, device, pg_collection
     )
 
+
 # Preserve static policy helpers on the public factory for callers that do not
 # select an implementation class explicitly.
 FullyShardedDataParallel._fine_grained_recurse_module_types = (

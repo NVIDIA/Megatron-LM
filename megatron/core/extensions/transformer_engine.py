@@ -548,7 +548,6 @@ else:
     TEActivationOp = None
 
 
-
 if HAVE_TE and is_te_min_version("1.13.0"):
 
     class TEFusedOpsMixin:
@@ -1659,7 +1658,6 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
         # layer receives a parameter-compatible local view outside autocast.
         if x.dtype != self.layer_norm_weight.dtype:
             x = x.to(self.layer_norm_weight.dtype)
-
 
         with quant_context:
             out = super().forward(x, is_first_microbatch=_is_first_microbatch)

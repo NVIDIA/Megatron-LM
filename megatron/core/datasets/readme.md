@@ -279,7 +279,7 @@ The packing scheduler re-schedules variable-length sequences across DP×CP ranks
 
 This module contains the high-level scheduling logic and entry points:
 
-- **`HybridCPDataLoaderWrapper`**: A wrapper class for hybrid context parallel (CP) scheduling. For every `__next__` call, it: (1) pulls a batch of packed samples from each DP rank, (2) gathers sequence lengths across the DP group, (3) schedules sub-samples using the `BalancedCPScheduler`, (4) reroutes sub-samples to the correct DPxCP ranks via all-to-all communication.
+- **`DefaultDynamicCPScheduler`**: A dynamic-CP scheduler that balances variable-length sequences over the available CP ranks while preserving dev's sequence-packing pipeline.
 
 - **`BasePackingScheduler`**: Abstract base class for packing schedulers. Defines the interface for `get_groups_and_subsamples()` (scheduling algorithm) and `run()` (full scheduling pipeline including fetch, schedule, reroute, pack, broadcast, and VPP handling).
 

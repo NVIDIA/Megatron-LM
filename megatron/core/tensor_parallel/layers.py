@@ -789,7 +789,18 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
             handle.wait()
             # Need to return None's as gradient has to flow for all the input arguments
             # provided during forward
-            return (sub_grad_input, grad_weight, grad_bias, None, None, None, None, None, None, None)
+            return (
+                sub_grad_input,
+                grad_weight,
+                grad_bias,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
 
         if ctx.allreduce_dgrad:
             handle.wait()

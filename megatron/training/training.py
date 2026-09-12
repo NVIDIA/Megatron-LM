@@ -44,7 +44,7 @@ from megatron.core import mpu, nccl_allocator, tensor_parallel
 
 # First-party.
 from megatron.core._rank_utils import safe_get_rank
-from megatron.core.datasets.data_schedule import HybridCPDataLoaderWrapper, wrap_data_iterator
+from megatron.core.datasets.data_schedule import wrap_data_iterator
 from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core.distributed import (
     DistributedDataParallelConfig,
@@ -2150,17 +2150,6 @@ def preprocess_common_state_dict(common_state_dict):
                     reorder_inner_param_groups(optimizer_state_dict[i])
 
     return preprocessed_common_state_dict
-
-
-def wrap_hybrid_cp_data_iterator(train_data_iterator, config):
-    """Wrap the training data iterator for hybrid context parallelism.
-
-    The rerun state machine asserts that every training data iterator is a
-    RerunDataIterator; a raw iter() around HybridCPDataLoaderWrapper would
-    strip the wrapping applied at dataloader build time and fail that assert
-    on the first train step.
-    """
-    return RerunDataIterator(iter(HybridCPDataLoaderWrapper(train_data_iterator, config)))
 
 
 def pretrain(
@@ -5336,9 +5325,6 @@ def train(
 
     energy_monitor = get_energy_monitor()
     one_logger = get_one_logger()
-
-    if args.dynamic_context_parallel:
-        train_data_iterator = wrap_hybrid_cp_data_iterator(train_data_iterator, config)
 
     if args.run_workload_inspector_server:
         try:

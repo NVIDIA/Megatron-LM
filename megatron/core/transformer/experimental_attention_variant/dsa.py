@@ -346,8 +346,7 @@ class DSAIndexerLossLoggingHelper:
 
     @staticmethod
     def reduce_loss_in_tracker(
-        num_layers: Optional[int] = None,
-        pg_collection: Optional[ProcessGroupCollection] = None,
+        num_layers: Optional[int] = None, pg_collection: Optional[ProcessGroupCollection] = None
     ):
         """Collect and reduce the indexer losses across ranks.
 
@@ -415,9 +414,7 @@ class DSAIndexerLossLoggingHelper:
             if pg_collection is not None
             else parallel_state.get_data_parallel_group(with_context_parallel=False)
         )
-        torch.distributed.all_reduce(
-            values, group=dp_group, op=torch.distributed.ReduceOp.AVG
-        )
+        torch.distributed.all_reduce(values, group=dp_group, op=torch.distributed.ReduceOp.AVG)
 
     @staticmethod
     def track_indexer_metrics(

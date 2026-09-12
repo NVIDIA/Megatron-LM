@@ -190,12 +190,6 @@ class ModelParallelConfig:
     that value + 1 entries in both eager and CUDA Graph modes.
     """
 
-    sequence_packing_scheduler: Optional[Literal['dp_balanced']] = None
-    """
-    Scheduler for sequence packing and hybrid context parallel.
-    dp_balanced: DP-balanced scheduler for sequence packing.
-    """
-
     expert_model_parallel_size: int = 1
     """Distributes Moe Experts across sub data parallel dimension."""
 
