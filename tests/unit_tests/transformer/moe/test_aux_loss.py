@@ -770,6 +770,47 @@ class TestRouterAuxLoss:
 
         torch.testing.assert_close(loss_with_implicit_reshape, loss_baseline)
 
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.parametrize("with_padding", [False, True])
+    def test_global_aux_loss_uneven_token_counts(self, with_padding):
+        """Constant routing frequencies must stay normalized across uneven microbatches."""
+        router = self.new_router(
+            moe_router_load_balancing_type="global_aux_loss",
+            moe_aux_loss_coeff=1.0,
+            moe_router_dtype="fp32",
+            moe_router_topk=1,
+            num_moe_experts=4,
+            num_attention_heads=4,
+            bf16=False,
+            params_dtype=torch.float32,
+            calculate_per_token_loss=False,
+        ).cuda()
+        with torch.no_grad():
+            router.weight.zero_()
+            router.weight[0].fill_(0.01)
+
+        def run(valid_counts):
+            router.reset_global_aux_loss_tracker()
+            router.weight.grad = None
+            for count in valid_counts:
+                physical_count = 6 if with_padding else count
+                inputs = torch.ones((physical_count, 1, router.config.hidden_size), device="cuda")
+                padding_mask = None
+                if with_padding:
+                    padding_mask = torch.arange(physical_count, device="cuda")[:, None] >= count
+                scores, _ = router(inputs, padding_mask=padding_mask)
+                scores.backward(torch.zeros_like(scores))
+                clear_aux_losses_tracker()
+            return router.weight.grad.detach().clone()
+
+        balanced = run((4, 4, 4))
+        uneven = run((6, 2, 4))
+        assert torch.linalg.vector_norm(balanced) > 0
+        torch.testing.assert_close(uneven, balanced, rtol=1e-6, atol=1e-7)
+        # A new window must also reset the token-count denominator.
+        torch.testing.assert_close(run((4, 4, 4)), balanced, rtol=1e-6, atol=1e-7)
+
 
 class TestPaddingMaskAuxLoss:
     """Test padding mask support in various aux loss types."""
