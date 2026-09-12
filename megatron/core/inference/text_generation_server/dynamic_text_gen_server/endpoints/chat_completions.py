@@ -555,20 +555,29 @@ def _replace_prefix_tokens(
     if previous_turn_token_ids and previous_turn_token_ids[-1] == eos_token_id:
         previous_turn_token_ids = previous_turn_token_ids[:-1]
 
-    # Find the last EOS token id in the previous turn token ids
-    last_eos_token_id_index = len(retokeenized_previous_turn_token_ids) - 1
-    # Note that the current conversation stat may be shorter than the previous conversation state.
-    scan_len = min(len(retokeenized_previous_turn_token_ids), len(current_turn_token_ids))
-    for i in reversed(range(scan_len)):
-        if current_turn_token_ids[i] == eos_token_id:
-            last_eos_token_id_index = i
-            break
+    last_eos_token_id_index = _prefix_replacement_start(
+        eos_token_id, retokeenized_previous_turn_token_ids, current_turn_token_ids
+    )
 
     # Replace the current turn token ids with the tokens from the previous generation
     current_turn_additional_token_ids = current_turn_token_ids[last_eos_token_id_index:]
 
     # Return the previous turn token ids + the current turn token ids
     return previous_turn_token_ids + current_turn_additional_token_ids
+
+
+def _prefix_replacement_start(
+    eos_token_id, retokenized_previous_turn_token_ids, current_turn_token_ids
+):
+    """Locate the rendered boundary at which an exact prior prefix is spliced."""
+    last_eos_token_id_index = len(retokenized_previous_turn_token_ids) - 1
+    # The current conversation state may be shorter than the previous conversation state.
+    scan_len = min(len(retokenized_previous_turn_token_ids), len(current_turn_token_ids))
+    for i in reversed(range(scan_len)):
+        if current_turn_token_ids[i] == eos_token_id:
+            last_eos_token_id_index = i
+            break
+    return last_eos_token_id_index
 
 
 def _apply_chat_template_sync(
@@ -756,9 +765,20 @@ try:
         parsers = current_app.config['parsers']
 
         req = await request.get_json()
+        request_metadata = req.get("request_metadata")
+        if request_metadata is not None and not isinstance(request_metadata, dict):
+            return Response("'request_metadata' must be an object", status=400)
         prevent_retokenization = req.get(
             "prevent_retokenization", not current_app.config.get('eval_mode', False)
         )
+        # Client-supplied token ids of the conversation through its last assistant message.
+        # They replace the previous turn's compact prompt + generation ids as the stitched prefix.
+        required_prefix_token_ids = req.get("required_prefix_token_ids") or None
+        if required_prefix_token_ids is not None and not (
+            isinstance(required_prefix_token_ids, list)
+            and all(isinstance(token_id, int) for token_id in required_prefix_token_ids)
+        ):
+            return Response("'required_prefix_token_ids' must be a list of token ids", status=400)
         tools = req.get("tools", None)
         tool_choice = req.get("tool_choice", None)
         parallel_tool_calls = req.get("parallel_tool_calls", True)
@@ -859,7 +879,7 @@ try:
                         ),
                     )
 
-                if prevent_retokenization:
+                if prevent_retokenization or required_prefix_token_ids is not None:
                     # If we are avoiding retokenization, we need to replace some prompt tokens with the prompt/generation tokens from the previous generation
                     # This improves prefix cache hits and reduces logprob variation between training and inference.
 
@@ -875,13 +895,20 @@ try:
                         if last_assistant_message_idx is not None
                         else None
                     )
+                    if required_prefix_token_ids is not None and last_assistant_message is None:
+                        raise ValueError(
+                            "An exact token prefix was requested but the conversation has no "
+                            "assistant message to anchor it."
+                        )
 
                     # Only proceed if the last assistant message has the token IDs from a previous generation.
                     # Dataset-provided conversation history won't have these fields.
-                    if (
-                        last_assistant_message is not None
-                        and isinstance(last_assistant_message.get("prompt_token_ids"), list)
-                        and isinstance(last_assistant_message.get("generation_token_ids"), list)
+                    if last_assistant_message is not None and (
+                        required_prefix_token_ids is not None
+                        or (
+                            isinstance(last_assistant_message.get("prompt_token_ids"), list)
+                            and isinstance(last_assistant_message.get("generation_token_ids"), list)
+                        )
                     ):
                         messages_to_last_assistant_message = template_messages[
                             : last_assistant_message_idx + 1
@@ -892,7 +919,9 @@ try:
                         previous_prompt_token_ids = last_assistant_message.get(
                             "compact_prompt_token_ids"
                         )
-                        if not isinstance(previous_prompt_token_ids, list):
+                        if required_prefix_token_ids is None and not isinstance(
+                            previous_prompt_token_ids, list
+                        ):
                             raise ValueError(
                                 "Prefix stitching requires compact_prompt_token_ids "
                                 "from the previous Megatron-Inference response."
@@ -938,10 +967,14 @@ try:
                                 )
                             )
 
-                        previous_turn_token_ids = (
-                            previous_prompt_token_ids
-                            + last_assistant_message["generation_token_ids"]
-                        )
+                        if required_prefix_token_ids is not None:
+                            # Tokens for the previous turn are supplied by the user.
+                            previous_turn_token_ids = required_prefix_token_ids
+                        else:
+                            previous_turn_token_ids = (
+                                previous_prompt_token_ids
+                                + last_assistant_message["generation_token_ids"]
+                            )
                         prompt_tokens = _replace_prefix_tokens(
                             eos_token_id,
                             previous_turn_token_ids,
@@ -952,6 +985,8 @@ try:
             else:
                 if media_slots:
                     raise ValueError("Multimodal chat requests require a chat template.")
+                if required_prefix_token_ids is not None:
+                    raise ValueError("exact token prefixes require a tokenizer chat template")
                 warnings.warn(
                     "Tokenizer does not support 'apply_chat_template'. Using tokenize instead."
                 )
@@ -1060,7 +1095,10 @@ try:
 
             streams = [
                 client.add_request_streaming(
-                    prompt_tokens, sampling_params, multi_modal_data=multi_modal_data
+                    prompt_tokens,
+                    sampling_params,
+                    multi_modal_data=multi_modal_data,
+                    request_metadata=request_metadata,
                 )
                 for _ in range(n)
             ]
@@ -1128,7 +1166,10 @@ try:
         try:
             for _ in range(n):
                 request_id, future = client.add_request_with_id(
-                    prompt_tokens, sampling_params, multi_modal_data=multi_modal_data
+                    prompt_tokens,
+                    sampling_params,
+                    multi_modal_data=multi_modal_data,
+                    request_metadata=request_metadata,
                 )
                 request_ids.append(request_id)
                 tasks.append(future)
@@ -1206,10 +1247,18 @@ try:
         # engine kept the prompt_tokens tensor on the payload.
         request_idx = 0
         response_uid = None
+        response_metadata = {}
         for result_item in batch_results:
             result = unwrap_serialized_tensors(result_item)
             if response_uid is None:
                 response_uid = result["uid"]
+            stage_metadata = result.get("payload_stage_metadata") or {}
+            for key, value in stage_metadata.items():
+                if key in response_metadata and response_metadata[key] != value:
+                    raise ValueError(
+                        f"payload stager returned conflicting response metadata for {key!r}"
+                    )
+                response_metadata[key] = value
 
             text_output = TextGenerationController.detokenize(
                 tokenizer,
@@ -1225,9 +1274,12 @@ try:
             prompt_tokens_counts.append(prompt_tokens_count)
             cached_tokens_counts.append(result.get("num_cached_tokens", 0))
 
+            # Under payload offload the engine dropped the per-token log probs from the reply
+            # so the OpenAI logprobs block is absent.
+            payload_offloaded = bool(result.get("payload_offloaded"))
             logprobs_content = None
-            if sampling_params.return_log_probs:
-                token_logprobs = json_safe_logprobs(result.get('log_probs') or [])
+            if sampling_params.return_log_probs and not payload_offloaded:
+                token_logprobs = json_safe_logprobs(result.get("generated_log_probs") or [])
 
                 tokens_to_decode = [[tok] for tok in result["generated_tokens"]]
                 tokens = list(map(tokenizer.detokenize, tokens_to_decode))
@@ -1295,7 +1347,7 @@ try:
             if "reasoning" in metadata:
                 message["reasoning_content"] = metadata["reasoning"]
 
-            if return_tokenized_data:
+            if return_tokenized_data and not payload_offloaded:
                 # Wire contract matches vLLM: prompt_token_ids are model-input tokens
                 # (post vision/video expansion). Preserve the exact compact form
                 # separately for lossless multi-turn prefix stitching.
@@ -1304,11 +1356,12 @@ try:
                     result.get("compact_prompt_tokens") or result["prompt_tokens"]
                 )
                 message["generation_token_ids"] = result["generated_tokens"]
-            if return_raw_text:
+            if return_raw_text and not payload_offloaded:
                 prompt_str = tokenizer.detokenize(result["prompt_tokens"])
                 message["raw_text"] = prompt_str + text_output
-            # Small RL/debug scalars (a few bytes each); harmless to keep for NeMo-RL compatibility.
-            message["generation_log_probs"] = result.get("generated_log_probs", [])
+            if not payload_offloaded:
+                # Small RL/debug scalars (a few bytes each); harmless to keep for compatibility.
+                message["generation_log_probs"] = result.get("generated_log_probs", [])
             return_log_probs = sampling_params.return_log_probs
 
             # Determine finish_reason following vLLM conventions:
@@ -1332,7 +1385,7 @@ try:
                 "index": request_idx,
                 "message": message,
                 # 'logprobs' in chat API is an object containing 'content'
-                "logprobs": {"content": logprobs_content} if return_log_probs else None,
+                "logprobs": {"content": logprobs_content} if logprobs_content is not None else None,
                 "finish_reason": finish_reason,
             }
             if current_app.config['verbose']:
@@ -1346,7 +1399,7 @@ try:
                     ]
 
             choices.append(choice_data)
-            if result.get("generated_log_probs") is None:
+            if not payload_offloaded and result.get("generated_log_probs") is None:
                 logger.warning(
                     "Generation log probs is None for request:\n%s",
                     json.dumps(_redact_token_id_lists_for_logging(result), indent=4),
@@ -1369,6 +1422,12 @@ try:
                 "prompt_tokens_details": {"cached_tokens": cached_token_count},
             },
         }
+        overlap = set(response).intersection(response_metadata)
+        if overlap:
+            raise ValueError(
+                f"payload stager response metadata collides with reserved fields: {sorted(overlap)}"
+            )
+        response.update(response_metadata)
 
         if HAVE_ORJSON:
             # Use orjson for faster serialization

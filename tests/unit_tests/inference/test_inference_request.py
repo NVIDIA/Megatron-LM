@@ -13,6 +13,7 @@ from megatron.core.inference.inference_request import (
     DynamicInferenceRequestRecord,
     FinishedRequestRecord,
     InferenceRequest,
+    OffloadedRequestPayload,
     compute_block_hashes_batched,
     deserialize_ndarray,
     deserialize_tensor,
@@ -384,14 +385,15 @@ def test_dynamic_inference_request_serialize_strips_event_add_engine():
 
 
 @pytest.mark.parametrize(
-    ("return_prompt_tokens", "expected_prompt_field"),
+    ("return_prompt_tokens", "payload_offloaded", "expected_prompt_field"),
     [
-        (False, None),  # default: prompt_tokens dropped from payload
-        (True, ("tensor", [1, 2, 3, 4])),  # opt-in: prompt_tokens preserved
+        (False, False, None),  # default: prompt_tokens dropped from payload
+        (True, False, ("tensor", [1, 2, 3, 4])),  # opt-in: prompt_tokens preserved
+        (True, True, ("tensor", [1, 2, 3, 4])),  # offload preserves explicit prompt
     ],
 )
 def test_dynamic_inference_request_serialize_return_prompt_tokens(
-    return_prompt_tokens, expected_prompt_field
+    return_prompt_tokens, payload_offloaded, expected_prompt_field
 ):
     """DynamicInferenceRequest.serialize() reports prompt_length unconditionally
     (the API uses it for `usage.prompt_tokens` on the response) and drops the
@@ -412,17 +414,22 @@ def test_dynamic_inference_request_serialize_return_prompt_tokens(
         prompt_tokens=prompt, sampling_params=sp, generated_tokens=[10], routing_indices=routing
     )
 
-    obj = req.serialize()
+    obj = req.serialize(payload_offloaded=payload_offloaded)
 
     # prompt_length is always populated (independent of the drop).
     assert obj["prompt_length"] == 4
     # Payload either preserves the tensor wrapper or drops it (present but None).
     assert obj["prompt_tokens"] == expected_prompt_field
+    assert obj["payload_offloaded"] is payload_offloaded
     # Local instance is unaffected — the drop is wire-only.
     assert torch.equal(req.prompt_tokens, prompt)
-    # routing_indices survives the drop path (shape check would have crashed on
-    # the temporarily-None self.prompt_tokens if the fix used self.prompt_tokens).
-    assert isinstance(obj["routing_indices"], tuple) and obj["routing_indices"][0] == "ndarray"
+    # routing_indices survives the prompt-only drop path, but payload offload strips it.
+    # The former's shape check would crash if it used temporarily-None self.prompt_tokens.
+    if payload_offloaded:
+        assert obj["routing_indices"] is None
+    else:
+        assert isinstance(obj["routing_indices"], tuple)
+        assert obj["routing_indices"][0] == "ndarray"
 
 
 def test_dynamic_inference_request_serialize_prompt_length_absent():
@@ -538,3 +545,70 @@ def test_supplied_block_hashes_are_not_re_salted():
         block_hash_salt="w9",
     )
     assert request.precomputed_block_hashes == [11, 22]
+
+
+def test_payload_staging_metadata_survives_checkpoint_and_stays_off_reply():
+    admission = {"rollout_id": "r0", "model_call_id": "c1"}
+    request = _make_dynamic_request(
+        uid="chatcmpl-fixed", request_metadata={"ng_capture": admission}, generated_tokens=[10]
+    )
+    request.generated_log_probs = [-0.25]
+    record = DynamicInferenceRequestRecord.from_request(request)
+    record.checkpoint()
+    merged = record.merge()
+
+    assert merged.uid == "chatcmpl-fixed"
+    assert merged.request_metadata == {"ng_capture": admission}
+
+    serialized = merged.serialize(
+        payload_offloaded=True,
+        payload_stage_metadata={"ng_commit_coords": {"staging_key": "r0/c1"}},
+    )
+    assert serialized["uid"] == "chatcmpl-fixed"
+    assert "request_metadata" not in serialized
+    assert serialized["generated_log_probs"] is None
+    assert serialized["payload_offloaded"] is True
+    assert serialized["payload_stage_metadata"] == {"ng_commit_coords": {"staging_key": "r0/c1"}}
+    round_trip = DynamicInferenceRequest.deserialize(unwrap_serialized_tensors(serialized))
+    assert round_trip.payload_offloaded is True
+    assert round_trip.payload_stage_metadata == {"ng_commit_coords": {"staging_key": "r0/c1"}}
+
+
+def test_offloaded_request_payload_and_serialize():
+    """The payload copies a finished request's per-token data as plain host-side lists;
+    serialize(payload_offloaded=True) drops that data from the wire, marks the reply, and
+    restores local state; defaults are unchanged."""
+    routing = np.array([[1], [2], [3], [4]])  # total_tokens - 1 rows
+
+    def make_request():
+        req = DynamicInferenceRequest(
+            request_id=7,
+            prompt_tokens=torch.tensor([1, 2, 3]),
+            sampling_params=SamplingParams(num_tokens_to_generate=4, termination_id=0),
+            generated_tokens=[10, 11],
+        )
+        req.generated_log_probs = [-0.5, -0.25]
+        req.prompt_log_probs = torch.tensor([-1.0, -2.0])
+        req.routing_indices = routing
+        return req
+
+    req = make_request()
+    payload = OffloadedRequestPayload.from_request(req)
+    assert payload.prompt_token_ids == [1, 2, 3]
+    assert payload.generated_token_ids == [10, 11]
+    assert payload.generated_log_probs == [-0.5, -0.25]
+    assert payload.prompt_log_probs == [-1.0, -2.0]  # coerced from tensor
+    assert payload.routing_indices is routing
+
+    obj = req.serialize(payload_offloaded=True)
+    assert obj["payload_offloaded"] is True
+    assert obj["generated_log_probs"] is None
+    assert obj["prompt_log_probs"] is None and obj["routing_indices"] is None
+    assert obj["generated_tokens"] == [10, 11]  # token ids stay: they are the response
+    # The drop is wire-only: local state is restored after the send.
+    assert req.generated_log_probs == [-0.5, -0.25] and req.routing_indices is routing
+
+    obj = make_request().serialize()
+    assert obj["payload_offloaded"] is False
+    assert obj["generated_log_probs"] == [-0.5, -0.25]
+    assert obj["routing_indices"][0] == "ndarray"
