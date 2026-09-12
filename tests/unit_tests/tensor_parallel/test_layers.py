@@ -1,9 +1,12 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+from types import SimpleNamespace
+
 import pytest
 import torch
 
 from megatron.core.extensions.transformer_engine import te_general_gemm
 from megatron.core.tensor_parallel.layers import (
+    ColumnParallelLinear,
     copy_gtp_attributes,
     gtp_local_pad_zero_count,
     linear_with_frozen_weight,
@@ -112,6 +115,50 @@ class TestCopyGtpAttributes:
         expected = gtp_local_pad_zero_count(source, 0, source.numel())
         assert expected > 0, "test setup must exercise real padding"
         assert gtp_local_pad_zero_count(destination, 0, destination.numel()) == expected
+
+
+def _make_column_parallel_linear_for_weight_shape_check():
+    layer = ColumnParallelLinear.__new__(ColumnParallelLinear)
+    torch.nn.Module.__init__(layer)
+    layer.output_size_per_partition = 8
+    layer.input_size = 4
+    layer.bias = None
+    layer.skip_bias_add = False
+    layer.allreduce_dgrad = True
+    layer.sequence_parallel = False
+    layer.explicit_expert_comm = False
+    layer.disable_grad_reduce = False
+    layer.config = SimpleNamespace(
+        defer_embedding_wgrad_compute=False, _cpu_offloading_context=None
+    )
+    layer.gradient_accumulation_fusion = False
+    layer.grad_output_buffer = None
+    layer.tp_group = None
+    layer.gtp_remat_size = 2
+    layer.output_dtype = None
+    layer.gather_output = False
+    layer._forward_impl = lambda **kwargs: kwargs["input"]
+    return layer
+
+
+def test_column_parallel_linear_skips_shape_check_for_gtp_weight():
+    layer = _make_column_parallel_linear_for_weight_shape_check()
+    weight = torch.nn.Parameter(torch.zeros(4, 4))
+    weight.is_gtp_weight_remat = True
+    input_ = torch.zeros(2, 4)
+
+    output, output_bias = layer(input_, weight=weight)
+
+    assert output is input_
+    assert output_bias is None
+
+
+def test_column_parallel_linear_checks_shape_for_non_gtp_weight():
+    layer = _make_column_parallel_linear_for_weight_shape_check()
+    weight = torch.nn.Parameter(torch.zeros(4, 4))
+
+    with pytest.raises(RuntimeError, match="supplied weight's shape is"):
+        layer(torch.zeros(2, 4), weight=weight)
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
