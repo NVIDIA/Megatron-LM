@@ -3522,6 +3522,8 @@ class TestMultiTokenPredictionHybrid:
                 mtp_num_layers=1,
                 use_mup=False,
                 inference_cuda_graph_scope=None,
+                cuda_graph_impl='none',
+                flash_decode=False,
             ),
             pre_process=False,
             post_process=True,
@@ -3540,6 +3542,8 @@ class TestMultiTokenPredictionHybrid:
             tp_group=None,
             _scale_logits=lambda logits: logits,
         )
+        model._preprocess = types.MethodType(HybridModel._preprocess, model)
+        model._postprocess = types.MethodType(HybridModel._postprocess, model)
         return model, hidden_states, call_counts, metric_avg_group
 
     @pytest.mark.parametrize(
