@@ -1945,6 +1945,14 @@ def validate_args(args, defaults={}):
             )
             args.overlap_param_gather = False
 
+    if args.save_trainable_params_only:
+        assert args.ckpt_format == 'torch_dist', (
+            "--save-trainable-params-only requires --ckpt-format torch_dist: only the "
+            "torch_dist sharded state dict preserves each parameter's requires_grad (via "
+            "ShardedTensor.data). Other formats save state_dict(keep_vars=False), which detaches "
+            "every tensor and would make every parameter look frozen."
+        )
+
     if args.override_ckpt_iteration is not None:
         assert not args.finetune, "Cannot override checkpoint iteration together with finetune flag."
 
