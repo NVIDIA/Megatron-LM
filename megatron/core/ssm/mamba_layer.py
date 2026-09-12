@@ -73,13 +73,14 @@ class MambaLayer(GraphableMegatronModule):
         pg_collection: ProcessGroupCollection = None,
         pp_layer_offset: int = 0,
         name: str | None = None,
+        create_cudagraph_manager: bool = True,
     ):
         """Initialize Mamba Layer.
 
         Args:
             name (str | None): module instance name passed top-down from its paranet module
         """
-        super().__init__(config)
+        super().__init__(config, create_cudagraph_manager=create_cudagraph_manager)
         assert pg_collection is not None, "pg_collection must be provided for MambaLayer"
         self.tp_group = pg_collection.tp
 

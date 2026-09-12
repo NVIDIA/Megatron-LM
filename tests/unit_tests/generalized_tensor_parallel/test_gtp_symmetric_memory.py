@@ -165,6 +165,44 @@ class TestRegisteredLIFOPool:
         pool.free(torch.empty(8, device="cuda"))
         assert not pool._free  # nothing entered the free lists
 
+    def test_reuse_waits_for_release_stream(self, monkeypatch):
+        class FakeEvent:
+            def __init__(self, *, external=False):
+                self.external = external
+                self.recorded_stream = None
+
+            def record(self, stream=None):
+                self.recorded_stream = stream
+
+        class FakeStream:
+            def __init__(self):
+                self.waited_events = []
+
+            def wait_event(self, event):
+                self.waited_events.append(event)
+
+        pool = RegisteredLIFOPool()
+        group = _StubGroup()
+        producer_stream = object()
+        consumer_stream = FakeStream()
+        event = FakeEvent(external=True)
+        buffer = pool.alloc((8,), torch.bfloat16, "cuda", group)
+
+        monkeypatch.setattr(torch.cuda, "current_stream", lambda device=None: consumer_stream)
+
+        event.record(producer_stream)
+        pool.free(buffer, ready_event=event)
+        reused = pool.alloc(buffer.shape, buffer.dtype, "cuda", group)
+
+        assert reused.data_ptr() == buffer.data_ptr()
+        assert event.external
+        assert event.recorded_stream is producer_stream
+        assert consumer_stream.waited_events == [event]
+
+        pool.free(reused)
+        assert pool.alloc(buffer.shape, buffer.dtype, "cuda", group).data_ptr() == buffer.data_ptr()
+        assert consumer_stream.waited_events == [event]
+
     def test_capture_guard_raises_on_empty_bucket(self, monkeypatch):
         pool = RegisteredLIFOPool()
         group = _StubGroup()

@@ -130,11 +130,10 @@ class RegisteredLIFOPool:
     untagged tensors, which lets callers pass mixed buffer lists to both this pool and
     the plain scratch pool and have each take only its own.
 
-    Why LIFO: ordering cannot affect correctness (buffers enter the free list only
-    after their reduce-scatter has been waited on), but LIFO keeps the same buffer
-    reused for the same operation at steady state even if a key ever over-allocates,
-    whereas FIFO would rotate the assignment every iteration -- LIFO keeps memory
-    behavior deterministic and repeatable across iterations.
+    Why LIFO: callers attach an event whenever prior use may outlive release, and allocation
+    waits on that event. LIFO keeps the same buffer reused for the same operation at steady state
+    even if a key ever over-allocates, whereas FIFO would rotate the assignment every iteration --
+    LIFO keeps memory behavior deterministic and repeatable across iterations.
     """
 
     def __init__(self) -> None:
@@ -155,8 +154,12 @@ class RegisteredLIFOPool:
         """
         numel = int(math.prod(shape))
         bucket = self._free[(numel, dtype, group.group_name)]
+        reuse_event = None
         if bucket:
             flat = bucket.pop()
+            reuse_event = getattr(flat, "_gtp_wgrad_reuse_event", None)
+            if reuse_event is not None:
+                torch.cuda.current_stream(device=device).wait_event(reuse_event)
         else:
             if torch.cuda.is_current_stream_capturing():
                 mine = sum(len(v) for k, v in self._free.items() if k[2] == group.group_name)
@@ -191,14 +194,18 @@ class RegisteredLIFOPool:
                 flat = torch.empty(numel, dtype=dtype, device=device)
         out = flat.view(shape)
         out._gtp_symm_group = group  # marks the buffer as pool-owned; free() keys on this
+        if reuse_event is not None:
+            out._gtp_wgrad_reuse_event = reuse_event
         return out
 
-    def free(self, buf: torch.Tensor) -> None:
-        """Return ``buf`` to its group's free list; no-op for untagged (foreign) buffers."""
+    def free(self, buf: torch.Tensor, ready_event=None) -> None:
+        """Return ``buf`` with an optional, already-recorded prior-use completion event."""
         group = getattr(buf, "_gtp_symm_group", None)
         if group is None:
             return
-        self._free[(buf.numel(), buf.dtype, group.group_name)].append(buf.view(-1))
+        flat = buf.view(-1)
+        flat._gtp_wgrad_reuse_event = ready_event
+        self._free[(buf.numel(), buf.dtype, group.group_name)].append(flat)
 
     def clear(self) -> None:
         """Drop every cached buffer. Called at teardown, before the pools they alias go away."""

@@ -23,6 +23,16 @@ from megatron.core.fp4_utils import get_fp4_context
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.inference.utils import InferenceMode
+from megatron.core.models.hybrid.cuda_graph_spans import (
+    HybridCudaGraphEagerExpertSpec,
+    HybridCudaGraphEagerLayerSpec,
+    HybridCudaGraphSpan,
+    HybridCudaGraphSpanSpec,
+    build_hybrid_cuda_graph_span_plan,
+    run_hybrid_eager_expert,
+    run_hybrid_eager_layer,
+    should_use_hybrid_cuda_graph_spans,
+)
 from megatron.core.models.hybrid.hybrid_layer_allocation import (
     get_layer_type_list_from_layer_config_list,
     validate_segment_layers,
@@ -36,6 +46,7 @@ from megatron.core.ssm.context_parallel.chunkwise import build_packed_sequence_c
 from megatron.core.tensor_parallel.random import CheckpointWithoutOutputManager
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.cuda_graphs import annotate_first_last_layer
+from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.hyper_connection import (
     HyperConnectionModule,
     learned_output_contract,
@@ -44,7 +55,7 @@ from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule, mark_keep_in_fp32
 from megatron.core.transformer.multi_latent_attention import FusedMLASelfAttention
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
-from megatron.core.transformer.transformer_layer import TransformerLayer
+from megatron.core.transformer.transformer_layer import MoETransformerLayer, TransformerLayer
 from megatron.core.transformer.utils import (
     ensure_metadata_has_dp_cp_group,
     make_sharded_tensors_for_checkpoint,
@@ -162,6 +173,9 @@ class HybridStack(MegatronModule):
         # Required for pipeline parallel schedules
         self.input_tensor = None
         self.pg_collection = pg_collection
+        use_cuda_graph_spans = should_use_hybrid_cuda_graph_spans(
+            self.config, cp_size=self.cp_group.size()
+        )
 
         self._mhc_block_end_plan: Optional[List[bool]] = None
 
@@ -215,6 +229,7 @@ class HybridStack(MegatronModule):
                         pp_layer_offset=pp_layer_offset,
                         pg_collection=pg_collection,
                         name=(name + f".layers.{i}") if name is not None else None,
+                        create_cudagraph_manager=not use_cuda_graph_spans,
                     )
                 elif type(layer_config) is layer_utils.AttentionLayerConfig:
                     layer = build_module(
@@ -226,6 +241,7 @@ class HybridStack(MegatronModule):
                         add_layer_offset=False,
                         pp_layer_offset=pp_layer_offset,
                         name=(name + f".layers.{i}") if name is not None else None,
+                        create_cudagraph_manager=not use_cuda_graph_spans,
                     )
                 elif type(layer_config) is layer_utils.DSALayerConfig:
                     layer = build_module(
@@ -266,6 +282,7 @@ class HybridStack(MegatronModule):
                         is_mtp_layer=is_mtp_layer,
                         add_layer_offset=False,
                         name=(name + f".layers.{i}") if name is not None else None,
+                        create_cudagraph_manager=not use_cuda_graph_spans,
                     )
                 elif type(layer_config) is layer_utils.GDNLayerConfig:
                     gdn_layer_spec = submodules.gdn_layer
@@ -293,10 +310,36 @@ class HybridStack(MegatronModule):
 
             if self.config.enable_mhc_connections:
                 layer = HyperConnectionHybridLayer(config=layer_config, layer=layer)
+            elif (
+                use_cuda_graph_spans
+                and isinstance(layer, MoETransformerLayer)
+                and CudaGraphModule.moe_router in self.config.cuda_graph_modules
+            ):
+                layer.transition_cudagraph_scope('partial', create_managers=False)
             self.layers.append(layer)
 
         if self.config.cuda_graph_impl == "local":
             annotate_first_last_layer(self.layers)
+
+        self._cuda_graph_span_plan = None
+        if use_cuda_graph_spans:
+            self._cuda_graph_span_plan = build_hybrid_cuda_graph_span_plan(
+                self.layer_config_list, self.config.cuda_graph_modules
+            )
+            self._cuda_graph_spans = nn.ModuleList(
+                HybridCudaGraphSpan(self.config, entry, self.layers)
+                for entry in self._cuda_graph_span_plan
+                if isinstance(entry, HybridCudaGraphSpanSpec)
+            )
+
+            span_index = 0
+            for plan_index, entry in enumerate(self._cuda_graph_span_plan):
+                if not isinstance(entry, HybridCudaGraphSpanSpec):
+                    continue
+                span = self._cuda_graph_spans[span_index]
+                span.is_first_layer = plan_index == 0
+                span.is_last_layer = plan_index == len(self._cuda_graph_span_plan) - 1
+                span_index += 1
 
         # Required for activation recomputation
         self.num_layers_per_pipeline_rank = len(self.layers)
@@ -419,6 +462,65 @@ class HybridStack(MegatronModule):
         """Finalize the current mHC recompute block when its last layer finishes."""
         if manager is not None and is_block_end:
             manager.discard_all_outputs_and_register_unified_recompute(hidden_states)
+
+    def _forward_cuda_graph_spans(
+        self,
+        hidden_states,
+        *,
+        attention_mask,
+        inference_context,
+        rotary_pos_emb,
+        packed_seq_params,
+        sequence_len_offset,
+        padding_mask,
+    ):
+        """Execute the precomputed alternating span/eager plan."""
+
+        if inference_context is not None:
+            raise ValueError("Hybrid CUDA-graph spans currently support training only")
+        if packed_seq_params is not None:
+            raise NotImplementedError("Hybrid CUDA-graph spans do not yet support packed sequences")
+
+        state = (hidden_states,)
+        span_index = 0
+        for entry in self._cuda_graph_span_plan:
+            if isinstance(entry, HybridCudaGraphSpanSpec):
+                output = self._cuda_graph_spans[span_index](
+                    *state,
+                    attention_mask=attention_mask,
+                    inference_context=inference_context,
+                    rotary_pos_emb=rotary_pos_emb,
+                    packed_seq_params=packed_seq_params,
+                    sequence_len_offset=sequence_len_offset,
+                    padding_mask=padding_mask,
+                )
+                state = output if isinstance(output, tuple) else (output,)
+                span_index += 1
+            elif isinstance(entry, HybridCudaGraphEagerExpertSpec):
+                layer = self.layers[entry.layer_index]
+                state = run_hybrid_eager_expert(layer, state)
+            elif isinstance(entry, HybridCudaGraphEagerLayerSpec):
+                if len(state) != 1:
+                    raise RuntimeError("A complete eager layer expects one hidden-state tensor")
+                layer = self.layers[entry.layer_index]
+                state = (
+                    run_hybrid_eager_layer(
+                        layer,
+                        state[0],
+                        attention_mask=attention_mask,
+                        inference_context=inference_context,
+                        rotary_pos_emb=rotary_pos_emb,
+                        packed_seq_params=packed_seq_params,
+                        sequence_len_offset=sequence_len_offset,
+                        padding_mask=padding_mask,
+                    ),
+                )
+            else:
+                raise AssertionError(f"Unknown hybrid CUDA-graph plan entry: {entry}")
+
+        if len(state) != 1:
+            raise RuntimeError(f"Hybrid CUDA-graph span plan ended with {len(state)} tensors")
+        return state[0]
 
     def forward(
         self,
@@ -559,6 +661,16 @@ class HybridStack(MegatronModule):
                     use_inner_quantization_context=(use_inner_fp8_context or use_fp4_context),
                     cp_layout_state=cp_layout_state,
                     packed_sequence_cp_metadata=packed_sequence_cp_metadata,
+                )
+            elif self._cuda_graph_span_plan is not None:
+                hidden_states = self._forward_cuda_graph_spans(
+                    hidden_states,
+                    attention_mask=attention_mask,
+                    inference_context=inference_context,
+                    rotary_pos_emb=rotary_pos_emb,
+                    packed_seq_params=packed_seq_params,
+                    sequence_len_offset=sequence_len_offset,
+                    padding_mask=padding_mask,
                 )
             else:
                 for layer_idx, (layer_config, layer) in enumerate(
