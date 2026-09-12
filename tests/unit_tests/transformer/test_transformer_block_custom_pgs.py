@@ -167,9 +167,9 @@ def _gpt_te_layer_spec_with_hetro_pgs(
 ):
 
     def build_mlp(
-        config: TransformerConfig, pg_collection: ProcessGroupCollection, is_mtp_layer: bool
+        config: TransformerConfig, pg_collection: ProcessGroupCollection, is_mtp_layer: bool, name=None
     ):
-        del pg_collection, is_mtp_layer
+        del pg_collection, is_mtp_layer, name
         return MLP(
             config,
             submodules=MLPSubmodules(
@@ -365,7 +365,6 @@ class TestTransformerBlockWithProcessGroups:
                     default_param.main_grad is not None and custom_param.main_grad is not None
                 ), f"Gradient is None for parameter '{param_name}' at index {i}"
 
-    @pytest.mark.flaky_in_dev
     @pytest.mark.skipif(
         version.parse(torch.__version__) < version.parse('2.3.0'),
         reason="Device mesh feature requires PyTorch 2.3 or later",
