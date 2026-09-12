@@ -12,14 +12,17 @@ from tests.unit_tests.test_utilities import Utils
 
 
 class _FakeTPGroup:
+    def __init__(self, size: int = 1):
+        self._size = size
+
     def rank(self):
         return 0
 
     def size(self):
-        return 1
+        return self._size
 
 
-def test_vocab_parallel_cross_entropy_uses_explicit_tp_group(monkeypatch):
+def test_vocab_parallel_cross_entropy_skips_collectives_for_single_rank(monkeypatch):
     tp_group = _FakeTPGroup()
     all_reduce_groups = []
 
@@ -44,6 +47,32 @@ def test_vocab_parallel_cross_entropy_uses_explicit_tp_group(monkeypatch):
     output = vocab_parallel_cross_entropy(vocab_parallel_logits, target, tp_group=tp_group)
 
     torch.testing.assert_close(output, expected_output)
+    assert all_reduce_groups == []
+
+
+def test_vocab_parallel_cross_entropy_uses_explicit_tp_group_for_multiple_ranks(monkeypatch):
+    tp_group = _FakeTPGroup(size=2)
+    all_reduce_groups = []
+
+    def fake_all_reduce(tensor, op=None, group=None):
+        all_reduce_groups.append(group)
+        return tensor
+
+    def fail_parallel_state_call(*args, **kwargs):
+        raise AssertionError("explicit tp_group should avoid parallel_state")
+
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "all_reduce", fake_all_reduce)
+    monkeypatch.setattr(
+        cross_entropy_module, "get_tensor_model_parallel_group", fail_parallel_state_call
+    )
+
+    vocab_parallel_logits = torch.tensor([[1.0, 2.0, 3.0], [0.5, -0.5, 1.0]])
+    target = torch.tensor([2, 0])
+
+    output = vocab_parallel_cross_entropy(vocab_parallel_logits, target, tp_group=tp_group)
+
+    assert torch.isfinite(output).all()
     assert all_reduce_groups == [tp_group, tp_group, tp_group]
 
 

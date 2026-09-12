@@ -127,13 +127,16 @@ class _VocabParallelCrossEntropy(torch.autograd.Function):
         vocab_parallel_logits, logits_max = VocabParallelCrossEntropy.calculate_logits_max(
             vocab_parallel_logits
         )
-        torch.distributed.all_reduce(logits_max, op=torch.distributed.ReduceOp.MAX, group=tp_group)
+        world_size = get_pg_size(tp_group)
+        if world_size > 1:
+            torch.distributed.all_reduce(
+                logits_max, op=torch.distributed.ReduceOp.MAX, group=tp_group
+            )
 
         # Get the partition's vocab indices
         get_vocab_range = VocabUtility.vocab_range_from_per_partition_vocab_size
         partition_vocab_size = vocab_parallel_logits.size()[-1]
         rank = get_pg_rank(tp_group)
-        world_size = get_pg_size(tp_group)
         vocab_start_index, vocab_end_index = get_vocab_range(partition_vocab_size, rank, world_size)
 
         target_mask, masked_target_1d, predicted_logits, sum_exp_logits, exp_logits = (
@@ -143,13 +146,14 @@ class _VocabParallelCrossEntropy(torch.autograd.Function):
         )
 
         # All reduce is needed to get the chunks from other GPUs.
-        torch.distributed.all_reduce(
-            predicted_logits, op=torch.distributed.ReduceOp.SUM, group=tp_group
-        )
+        if world_size > 1:
+            torch.distributed.all_reduce(
+                predicted_logits, op=torch.distributed.ReduceOp.SUM, group=tp_group
+            )
 
-        torch.distributed.all_reduce(
-            sum_exp_logits, op=torch.distributed.ReduceOp.SUM, group=tp_group
-        )
+            torch.distributed.all_reduce(
+                sum_exp_logits, op=torch.distributed.ReduceOp.SUM, group=tp_group
+            )
 
         exp_logits, loss = VocabParallelCrossEntropy.calculate_cross_entropy_loss(
             exp_logits, predicted_logits, sum_exp_logits
