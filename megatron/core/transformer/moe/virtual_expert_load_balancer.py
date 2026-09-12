@@ -548,10 +548,8 @@ class VirtualExpertLoadBalancer:
             raise ValueError("Virtual-expert load balancing requires no MoE layer recompute.")
         routing = config.moe_router_load_balancing_type
         routing = (routing,) if isinstance(routing, str) else routing
-        if any(t in ("sinkhorn", "quantile_balancing") for t in routing):
-            raise ValueError(
-                "Virtual-expert top-k routing requires no sinkhorn or quantile_balancing."
-            )
+        if "sinkhorn" in routing:
+            raise ValueError("Virtual-expert top-k routing requires no sinkhorn.")
         self.group = group
         self.config = config
         self.router_topk = router_topk
