@@ -1973,8 +1973,14 @@ def pretrain(
                 dataset_provider_parameters = inspect.signature(train_valid_test_dataset_provider).parameters
                 assert "vp_stage" in dataset_provider_parameters, \
                     "vp_stage must be a kwarg in train_valid_test_dataset_provider when using virtual pipeline parallelism"
-                vp_stage_train_valid_test_dataset_provider = \
-                    functools.partial(train_valid_test_dataset_provider, vp_stage=vp_stage)
+                provider_kwargs = {'vp_stage': vp_stage}
+                if 'requires_token_ids' in dataset_provider_parameters:
+                    provider_kwargs['requires_token_ids'] = getattr(
+                        unwrap_model(model[vp_stage]), 'requires_token_context', False
+                    )
+                vp_stage_train_valid_test_dataset_provider = functools.partial(
+                    train_valid_test_dataset_provider, **provider_kwargs
+                )
                 if getattr(train_valid_test_dataset_provider, 'is_distributed', False):
                     vp_stage_train_valid_test_dataset_provider.is_distributed = True
                 iterators = build_train_valid_test_data_iterators(
@@ -1984,8 +1990,19 @@ def pretrain(
                 valid_data_iterator.append(iterators[1])
                 test_data_iterator.append(iterators[2])
         else:
+            dataset_provider = train_valid_test_dataset_provider
+            if 'requires_token_ids' in inspect.signature(dataset_provider).parameters:
+                dataset_provider = functools.partial(
+                    dataset_provider,
+                    requires_token_ids=getattr(
+                        unwrap_model(model[0]), 'requires_token_context', False
+                    ),
+                )
+                dataset_provider.is_distributed = getattr(
+                    train_valid_test_dataset_provider, 'is_distributed', False
+                )
             train_data_iterator, valid_data_iterator, test_data_iterator = (
-                build_train_valid_test_data_iterators(train_valid_test_dataset_provider)
+                build_train_valid_test_data_iterators(dataset_provider)
             )
     timers('train/valid/test-data-iterators-setup').stop()
     print_datetime('after dataloaders are built')
@@ -3568,16 +3585,16 @@ def training_log(
                 wandb_writer.log({'grpo_collection_iteration': grpo_collection_iteration}, iteration)
         if args.log_memory_to_tensorboard:
             mem_stats = torch.cuda.memory_stats()
-            writer.add_scalar(
-                "mem-reserved-bytes", mem_stats["reserved_bytes.all.current"], iteration
-            )
-            writer.add_scalar(
-                "mem-allocated-bytes", mem_stats["allocated_bytes.all.current"], iteration
-            )
-            writer.add_scalar(
-                "mem-max-allocated-bytes", mem_stats["allocated_bytes.all.peak"], iteration
-            )
-            writer.add_scalar("mem-allocated-count", mem_stats["allocation.all.current"], iteration)
+            memory_metrics = {
+                "mem-reserved-bytes": mem_stats["reserved_bytes.all.current"],
+                "mem-allocated-bytes": mem_stats["allocated_bytes.all.current"],
+                "mem-max-allocated-bytes": mem_stats["allocated_bytes.all.peak"],
+                "mem-allocated-count": mem_stats["allocation.all.current"],
+            }
+            for metric, value in memory_metrics.items():
+                writer.add_scalar(metric, value, iteration)
+            if wandb_writer:
+                wandb_writer.log(memory_metrics, iteration)
         if args.log_max_attention_logit:
             writer.add_scalar('max_attention_logit', max_attention_logit, iteration)
             if wandb_writer:
@@ -3717,6 +3734,23 @@ def training_log(
                 writer.add_scalar('iteration-time', elapsed_time_per_iteration, iteration)
             if wandb_writer:
                 wandb_writer.log({'iteration-time': elapsed_time_per_iteration}, iteration)
+        if iteration % args.log_interval == 0:
+            # Report this update, including the first update after a restart.
+            # Interval accumulators can overlap the initial startup report.
+            health_metrics = {
+                'optimizer-skipped-iterations': int(skipped_iter),
+                'nan-iterations': int(got_nan),
+            }
+            if args.log_throughput:
+                # Match the nominal-token throughput used by native telemetry.
+                health_metrics['tokens-per-second'] = (
+                    batch_size * args.seq_length / elapsed_time_per_iteration
+                )
+            if writer:
+                for metric, value in health_metrics.items():
+                    writer.add_scalar(metric, value, iteration)
+            if wandb_writer:
+                wandb_writer.log(health_metrics, iteration)
         log_string = f" [{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')}]"
         log_string += ' iteration {:8d}/{:8d} |'.format(iteration, args.train_iters)
         log_string += ' consumed samples: {:12d} |'.format(args.consumed_train_samples)
@@ -5499,7 +5533,7 @@ def evaluate_and_print_results(
 
         # with full validation we need to distribute eval_iters to all ranks
         if mpu.get_tensor_model_parallel_rank() == 0:
-            eval_iters = torch.tensor(args.eval_iters, dtype=torch.long, device='cuda')
+            eval_iters = torch.tensor(eval_iters, dtype=torch.long, device='cuda')
         else:
             eval_iters = torch.tensor([0] * len(eval_iters), dtype=torch.long, device='cuda')
         torch.distributed.broadcast(eval_iters, 0)

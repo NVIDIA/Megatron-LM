@@ -8,9 +8,9 @@ import torch
 
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.enums import ModelType
+from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_inference_stack_spec
 from megatron.core.models.hybrid.hybrid_layer_specs import (
     hybrid_stack_spec as default_hybrid_stack_spec,
-    hybrid_inference_stack_spec,
 )
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.pipeline_parallel.utils import is_pp_first_stage, is_pp_last_stage
@@ -19,12 +19,9 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import Float16Module, MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.training.models.base import (
-    ModelBuilder,
-    ModelConfig,
-    compose_hooks,
-)
+from megatron.training.models.base import ModelBuilder, ModelConfig, compose_hooks
 from megatron.training.models.dist_utils import unimodal_build_distributed_models
+from megatron.training.models.engram import engram_context_provider_spec
 from megatron.training.vocab_utils import calculate_padded_vocab_size
 
 logger = logging.getLogger(__name__)
@@ -69,6 +66,7 @@ class HybridModelConfig(ModelConfig):
     hybrid_stack_spec: ModuleSpec | None = None
     vocab_size: int | None = None
     should_pad_vocab: bool = False
+    engram_pad_id: int | None = None
 
     @property
     def mamba_stack_spec(self):
@@ -89,7 +87,9 @@ class HybridModelConfig(ModelConfig):
             raise AttributeError(f"HybridModelConfig has no attribute '{name}'")
         if hasattr(transformer, name):
             return getattr(transformer, name)
-        raise AttributeError(f"Neither HybridModelConfig nor TransformerConfig has any attribute '{name}'.")
+        raise AttributeError(
+            f"Neither HybridModelConfig nor TransformerConfig has any attribute '{name}'."
+        )
 
     @override
     def __setattr__(self, name: str, value: Any, /) -> None:
@@ -157,13 +157,14 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
                 hybrid_stack_spec = hybrid_inference_stack_spec
             elif self._model_config.restore_modelopt_state:
                 hybrid_stack_spec = get_hybrid_stack_modelopt_spec(
-                    local_core_attention=False,
-                    remap_te_layernorm=False,
+                    local_core_attention=False, remap_te_layernorm=False
                 )
             else:
                 hybrid_stack_spec = default_hybrid_stack_spec
 
-        assert self._model_config.vocab_size is not None, "vocab_size must be configured before calling build_model()"
+        assert (
+            self._model_config.vocab_size is not None
+        ), "vocab_size must be configured before calling build_model()"
         if self._model_config.should_pad_vocab:
             padded_vocab_size = calculate_padded_vocab_size(
                 self._model_config.vocab_size,
@@ -173,8 +174,12 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
         else:
             padded_vocab_size = self._model_config.vocab_size
 
-        pre_process = pre_process if pre_process is not None else is_pp_first_stage(pg_collection.pp)
-        post_process = post_process if post_process is not None else is_pp_last_stage(pg_collection.pp)
+        pre_process = (
+            pre_process if pre_process is not None else is_pp_first_stage(pg_collection.pp)
+        )
+        post_process = (
+            post_process if post_process is not None else is_pp_last_stage(pg_collection.pp)
+        )
         return HybridModel(
             config=self._model_config.transformer,
             hybrid_stack_spec=hybrid_stack_spec,
@@ -193,6 +198,11 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
             post_process=post_process,
             pg_collection=pg_collection,
             vp_stage=vp_stage,
+            token_context_provider_spec=engram_context_provider_spec(
+                self._model_config.transformer,
+                self._model_config.hybrid_layer_pattern,
+                self._model_config.engram_pad_id,
+            ),
         )
 
     def build_distributed_models(
@@ -204,7 +214,9 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
         use_torch_fsdp2: bool = False,
         wrap_with_ddp: bool = True,
         data_parallel_random_init: bool = False,
-        mixed_precision_wrapper: Callable[[Any, MegatronModule], MegatronModule] | None = Float16Module,
+        mixed_precision_wrapper: (
+            Callable[[Any, MegatronModule], MegatronModule] | None
+        ) = Float16Module,
         model_type: ModelType = ModelType.encoder_or_decoder,
         use_layer_wise_distributed_optimizer: bool = False,
         use_layer_wise_param_layout: bool = True,
@@ -230,6 +242,8 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
             List of model stages.
         """
         transformer_config = self._model_config.transformer
+        if transformer_config.engram_layer_ids and (use_megatron_fsdp or use_torch_fsdp2):
+            raise ValueError("Engram currently supports ordinary Megatron DDP only")
         composed_pre_wrap_hook = compose_hooks(self._model_config.pre_wrap_hooks)
         model_list = unimodal_build_distributed_models(
             self.build_model,

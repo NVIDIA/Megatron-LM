@@ -4,7 +4,7 @@ import logging
 import warnings
 from collections import defaultdict
 from dataclasses import astuple
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union, cast
 
 import torch
 from torch.optim import SGD as CPUSGD
@@ -87,6 +87,7 @@ from .optimizer_config import (
     ParamWithNamePredicate,
     SGDOptimizerConfig,
 )
+from .sparse_adam import RowSparseAdamOptimizer
 
 logger = logging.getLogger(__name__)
 
@@ -350,6 +351,27 @@ def _get_param_groups(
             else:
                 param_override = None
 
+            engram_metadata = getattr(param, 'engram_table_metadata', None)
+            is_engram_row_parallel = bool(
+                engram_metadata is not None and engram_metadata.row_parallel
+            )
+            if is_engram_row_parallel and not getattr(param, 'skip_param_and_grad_buffer', False):
+                raise ValueError(
+                    "Engram row-parallel parameters must set skip_param_and_grad_buffer"
+                )
+            if engram_metadata is not None:
+                param_override = dict(param_override or {})
+                param_override['wd_mult'] = engram_metadata.weight_decay
+                param_override['lr_mult'] = engram_metadata.lr_multiplier
+                if config.lr is not None:
+                    param_override['max_lr'] = config.lr * engram_metadata.lr_multiplier
+                if config.min_lr is not None:
+                    param_override['min_lr'] = config.min_lr * engram_metadata.lr_multiplier
+                if config.optimizer not in ('adam', 'sgd'):
+                    param_override['optimizer'] = 'adam'
+                if is_engram_row_parallel:
+                    param_override['is_engram_row_parallel'] = True
+
             is_expert_parallel = not getattr(param, 'allreduce', True)
 
             # Create config_tuple that is hash-able, and has a consistent ordering of the keys.
@@ -415,6 +437,86 @@ def _get_param_groups(
         param_groups.append(param_group)
 
     return param_groups
+
+
+def _is_engram_row_param_group(param_group: Dict) -> bool:
+    """Whether a parameter group belongs to the row-sharded Engram tables."""
+    return param_group.get('is_engram_row_parallel', False)
+
+
+def _get_row_sparse_optimizer(
+    param_groups: List[Dict],
+    config: OptimizerConfig,
+    pg_collection: Optional[ProcessGroupCollection] = None,
+) -> RowSparseAdamOptimizer:
+    """Construct the dedicated optimizer for row-sharded Engram table groups."""
+    return RowSparseAdamOptimizer(param_groups, config, pg_collection=pg_collection)
+
+
+def _validate_row_sparse_optimizer_config(
+    config: OptimizerConfig, model_chunks: List[MegatronModule]
+) -> bool:
+    """Validate options incompatible with sparse COO table gradients."""
+    has_row_params = any(
+        bool(
+            getattr(param, 'engram_table_metadata', None) is not None
+            and param.engram_table_metadata.row_parallel
+        )
+        for model_chunk in model_chunks
+        for param in model_chunk.parameters()
+    )
+    if not has_row_params:
+        has_row_params = any(
+            getattr(get_model_config(model_chunk), 'engram_layer_ids', None)
+            and getattr(get_model_config(model_chunk), 'engram_table_backend', None) == 'row_a2a'
+            for model_chunk in model_chunks
+        )
+    if not has_row_params:
+        return False
+
+    ddp_config = getattr(model_chunks[0], 'ddp_config', None)
+    if ddp_config is not None and (
+        getattr(ddp_config, 'use_megatron_fsdp', False)
+        or getattr(ddp_config, 'use_custom_fsdp', False)
+    ):
+        raise ValueError("Engram row_a2a requires Megatron distributed data parallel")
+    if getattr(config, 'optimizer_cpu_offload', False):
+        raise ValueError("Engram row_a2a does not support optimizer CPU offload")
+    if config.fp16:
+        raise ValueError("Engram row_a2a supports FP32 and BF16, not FP16")
+    if getattr(config, 'loss_scale', None) not in (None, 1.0):
+        raise ValueError(
+            "Engram row_a2a requires unity loss scaling because sparse gradients "
+            "are not handled by Megatron loss scalers"
+        )
+    if config.optimizer == 'sgd':
+        raise ValueError(
+            "Engram row_a2a requires Adam or an emerging dense optimizer; "
+            "its table parameters use RowSparseAdam"
+        )
+    if getattr(config, 'optimizer_cuda_graph', False):
+        raise ValueError("Engram row_a2a does not support optimizer CUDA graph capture")
+    return True
+
+
+def _maybe_append_row_sparse_optimizer(
+    optimizers: List[MegatronOptimizer],
+    model_chunks: List[MegatronModule],
+    config: OptimizerConfig,
+    config_overrides: Optional[Dict[ParamKey, ParamGroupOverride]],
+    process_group: Optional[torch.distributed.ProcessGroup] = None,
+    pg_collection: Optional[ProcessGroupCollection] = None,
+) -> List[MegatronOptimizer]:
+    """Append RowSparseAdam when row-sharded Engram tables are present."""
+    if not _validate_row_sparse_optimizer_config(config, model_chunks):
+        return optimizers
+    row_sparse_param_groups = [
+        group
+        for group in _get_param_groups(model_chunks, config, config_overrides, process_group)
+        if _is_engram_row_param_group(group)
+    ]
+    optimizers.append(_get_row_sparse_optimizer(row_sparse_param_groups, config, pg_collection))
+    return optimizers
 
 
 def _get_param_groups_and_buffers(
@@ -829,6 +931,8 @@ def _get_megatron_emerging_optimizer(
     )
     grouped_param_groups = defaultdict(list)
     for group in all_param_groups:
+        if _is_engram_row_param_group(group):
+            continue
         opt_name = group.get('optimizer', eopt_name)
         is_expert = group['is_expert_parallel'] and not use_layer_wise
         grouped_param_groups[(opt_name, is_expert)].append(group)
@@ -995,10 +1099,36 @@ def _get_megatron_emerging_optimizer(
         # LayerWise owns Muon-managed params; DistOpt instances in ``results``
         # own the rest. Chain them so the training loop sees one optimizer.
         if results:
-            return ChainedOptimizer([layer_wise_optimizer] + results)
-        return layer_wise_optimizer
+            return ChainedOptimizer(
+                _maybe_append_row_sparse_optimizer(
+                    [layer_wise_optimizer] + results,
+                    model_chunks,
+                    config,
+                    config_overrides,
+                    param_group_process_group,
+                    pg_collection,
+                )
+            )
+        chained = _maybe_append_row_sparse_optimizer(
+            [layer_wise_optimizer],
+            model_chunks,
+            config,
+            config_overrides,
+            param_group_process_group,
+            pg_collection,
+        )
+        return chained[0] if len(chained) == 1 else ChainedOptimizer(chained)
 
-    return ChainedOptimizer(results)
+    return ChainedOptimizer(
+        _maybe_append_row_sparse_optimizer(
+            results,
+            model_chunks,
+            config,
+            config_overrides,
+            param_group_process_group,
+            pg_collection,
+        )
+    )
 
 
 def get_megatron_optimizer(
@@ -1198,7 +1328,7 @@ def get_megatron_optimizer(
             model_chunk_offset=model_chunk_offset,
             config=config,
             config_overrides=config_overrides,
-            filter_fn=lambda g: not g['is_expert_parallel'],
+            filter_fn=lambda g: not g['is_expert_parallel'] and not _is_engram_row_param_group(g),
             buffer_name='buffers',
             process_group=param_group_process_group,
         )
@@ -1236,7 +1366,7 @@ def get_megatron_optimizer(
         model_chunk_offset=0,
         config=config,
         config_overrides=config_overrides,
-        filter_fn=lambda g: g['is_expert_parallel'],
+        filter_fn=lambda g: g['is_expert_parallel'] and not _is_engram_row_param_group(g),
         buffer_name='expert_parallel_buffers',
         process_group=param_group_process_group,
     )
@@ -1281,5 +1411,15 @@ def get_megatron_optimizer(
             clearer_fn = getattr(param, 'clear_high_precision_init_val', None)
             if getter_fn is not None and clearer_fn is not None and getter_fn() is not None:
                 clearer_fn()
+
+    # The standard factory calls above retain the default skip_megatron_wrapping=False.
+    _maybe_append_row_sparse_optimizer(
+        cast(List[MegatronOptimizer], optimizers),
+        model_chunks,
+        config,
+        config_overrides,
+        param_group_process_group,
+        pg_collection,
+    )
 
     return ChainedOptimizer(optimizers)

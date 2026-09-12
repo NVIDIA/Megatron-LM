@@ -30,6 +30,7 @@ if rank != 0:
 
     warnings.showwarning = _rank0_only_showwarning
 
+from collections.abc import Iterator
 from functools import lru_cache, partial
 from typing import Any, List, Optional, Tuple
 
@@ -42,8 +43,8 @@ from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegat
 from megatron.core.datasets.data_schedule import get_batch_on_this_rank_for_sequence_packing
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
 from megatron.core.enums import ModelType
-from megatron.core.package_info import __version__ as mcore_version
 from megatron.core.models.hybrid.hybrid_model import HybridModel
+from megatron.core.package_info import __version__ as mcore_version
 from megatron.core.parallel_state import (
     get_context_parallel_group,
     get_hybrid_data_context_parallel_groups,
@@ -108,8 +109,17 @@ BATCH_KEYS = [
 ]
 
 
-def get_batch(data_iterator, vp_stage=None):
-    """Generate a batch."""
+def get_batch(
+    data_iterator: Iterator[dict[str, torch.Tensor]] | None,
+    vp_stage: int | None = None,
+    requires_token_ids: bool = False,
+) -> ContextParallelBatch:
+    """Generate the next microbatch for this model chunk's input requirements.
+
+    Token-consuming interior chunks use their own identically ordered dataloader.
+    Only the existing TP broadcast is needed; a PP broadcast during forward would
+    impose an ordering incompatible with interleaved pipeline schedules.
+    """
 
     args = get_args()
     config = core_transformer_config_from_args(args)
@@ -164,6 +174,7 @@ def get_batch(data_iterator, vp_stage=None):
         not is_first_or_last_pipeline_stage(vp_stage)
         and not mtp_on_this_rank
         and not has_cu_seqlens
+        and not requires_token_ids
     ):
         return ContextParallelBatch(
             boundary_layout=config.linear_cp_layout,
@@ -194,13 +205,22 @@ def get_batch(data_iterator, vp_stage=None):
         seq_length=args.seq_length,
         mtp_on_this_rank=mtp_on_this_rank,
         pipeline_model_parallel_size=args.pipeline_model_parallel_size,
-        is_pipeline_first_stage=mpu.is_pipeline_first_stage(),
-        is_pipeline_last_stage=mpu.is_pipeline_last_stage(),
+        is_pipeline_first_stage=mpu.is_pipeline_first_stage(
+            ignore_virtual=vp_stage is None, vp_stage=vp_stage
+        ),
+        is_pipeline_last_stage=mpu.is_pipeline_last_stage(
+            ignore_virtual=vp_stage is None, vp_stage=vp_stage
+        ),
+        requires_token_ids=requires_token_ids,
     )
 
     batch = flatten_batch_for_packed_sequences(batch)
 
-    if not is_first_or_last_pipeline_stage(vp_stage) and not mtp_on_this_rank:
+    if (
+        not is_first_or_last_pipeline_stage(vp_stage)
+        and not mtp_on_this_rank
+        and not requires_token_ids
+    ):
         assert has_cu_seqlens
         batch = {
             **dict.fromkeys(BATCH_KEYS),
@@ -341,7 +361,10 @@ def forward_step(data_iterator, model: HybridModel):
 
     with stimer(bdata=True):
         vp_stage = get_attr_wrapped_model(model, "vp_stage")
-        cp_batch = get_batch(data_iterator, vp_stage)
+        requires_token_ids = bool(
+            get_attr_wrapped_model(model, "requires_token_context", allow_none=True)
+        )
+        cp_batch = get_batch(data_iterator, vp_stage, requires_token_ids=requires_token_ids)
         batch = cp_batch.get_batch()
         attention_mask = batch.get("attention_mask")
         cu_seqlens = batch.get("cu_seqlens")
@@ -372,13 +395,15 @@ def forward_step(data_iterator, model: HybridModel):
     return output_tensor, partial(loss_func, loss_mask, model=model)
 
 
-def is_dataset_built_on_rank(vp_stage=None, is_packed_sequence=False):
+def is_dataset_built_on_rank(
+    vp_stage: int | None = None, is_packed_sequence: bool = False, requires_token_ids: bool = False
+) -> bool:
     """Whether the dataset should be built on the current rank."""
     args = get_args()
     config = core_transformer_config_from_args(args)
     if mpu.get_tensor_model_parallel_rank() != 0:
         return False
-    elif is_packed_sequence:
+    elif is_packed_sequence or requires_token_ids:
         return True
     return is_first_or_last_pipeline_stage(vp_stage) or mtp_on_this_rank_func(
         layout=config.pipeline_model_parallel_layout,
@@ -434,11 +459,17 @@ def core_gpt_dataset_config_from_args(args: Any) -> GPTDatasetConfig:
     )
 
 
-def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None):
+def train_valid_test_datasets_provider(
+    train_val_test_num_samples: list[int],
+    vp_stage: int | None = None,
+    requires_token_ids: bool = False,
+) -> tuple[torch.utils.data.Dataset | None, ...]:
     """Build the train test and validation datasets.
 
     Args:
-        train_val_test_num_samples : A list containing the number of samples in train test and validation.
+        train_val_test_num_samples: Number of samples for each dataset split.
+        vp_stage: Virtual pipeline chunk owning this independent data stream.
+        requires_token_ids: Build data on token-consuming interior chunks as well.
     """
     args = get_args()
     config = core_gpt_dataset_config_from_args(args)
@@ -469,7 +500,12 @@ def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None
     train_ds, valid_ds, test_ds = BlendedMegatronDatasetBuilder(
         dataset_type,
         train_val_test_num_samples,
-        partial(is_dataset_built_on_rank, vp_stage=vp_stage, is_packed_sequence=is_packed_sequence),
+        partial(
+            is_dataset_built_on_rank,
+            vp_stage=vp_stage,
+            is_packed_sequence=is_packed_sequence,
+            requires_token_ids=requires_token_ids,
+        ),
         config,
     ).build()
 
@@ -525,8 +561,8 @@ if __name__ == "__main__":
     # so its mere presence is a compatible fallback signal for an agent that predates NVRX_CYCLE.
     _NVRX_CYCLE_START = _env_float('NVRX_CYCLE_START_TIME')
     _IS_NVRX_RESTART = (
-        (_NVRX_CYCLE not in ('', '0') and _NVRX_CYCLE.isdigit()) or _NVRX_CYCLE_START is not None
-    )
+        _NVRX_CYCLE not in ('', '0') and _NVRX_CYCLE.isdigit()
+    ) or _NVRX_CYCLE_START is not None
     if _NVRX_LAUNCH_TIME is not None:
         _LAUNCH_SCRIPT_PRESRUN_TIME = None
         if _IS_NVRX_RESTART:

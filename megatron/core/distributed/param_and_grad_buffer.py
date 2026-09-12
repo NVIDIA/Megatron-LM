@@ -949,7 +949,8 @@ def group_params_for_buffers(
     checkpoints in native-fp8 mode.
 
     Args:
-        params: List of parameters to group.
+        params: List of parameters to group. Parameters explicitly marked with
+            ``skip_param_and_grad_buffer`` are omitted.
         grad_reduce_in_fp32: Whether gradients are reduced in FP32.
 
     Returns:
@@ -963,6 +964,8 @@ def group_params_for_buffers(
 
     for param in params:
         assert param.requires_grad
+        if getattr(param, 'skip_param_and_grad_buffer', False):
+            continue
 
         param_dtype = param.dtype
         if _param_uses_quantized_storage(param):

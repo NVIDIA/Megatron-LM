@@ -1871,11 +1871,16 @@ class ChainedOptimizer(MegatronOptimizer):
             return self.chained_optimizers[0].get_grad_norm()
         if self.grads_states_parallel_group_is_shared():
             grads_for_norm = []
+            custom_grad_norms = []
             for optimizer in self.chained_optimizers:
-                grads_for_norm += optimizer.get_grads_for_grad_norm()
+                if getattr(optimizer, "uses_custom_grad_norm", False):
+                    custom_grad_norms.append(optimizer.get_grad_norm())
+                else:
+                    grads_for_norm += optimizer.get_grads_for_grad_norm()
             grad_norm = get_grad_norm_fp32(
                 grads_for_norm, grad_stats_parallel_group=self.get_grad_stats_parallel_group()
             )
+            grad_norm = math.sqrt(grad_norm**2 + sum(norm**2 for norm in custom_grad_norms))
         else:
             grad_norms = []
             for optimizer in self.chained_optimizers:
@@ -1888,9 +1893,15 @@ class ChainedOptimizer(MegatronOptimizer):
     def count_zeros(self):
         if self.grads_states_parallel_group_is_shared():
             params = []
+            custom_num_zeros = 0
             for optimizer in self.chained_optimizers:
-                params += optimizer.get_parameters()
-            return count_zeros_fp32(
+                if getattr(optimizer, "uses_custom_grad_norm", False):
+                    custom_num_zeros += optimizer.count_zeros()
+                else:
+                    params += optimizer.get_parameters()
+            if not params:
+                return custom_num_zeros
+            return custom_num_zeros + count_zeros_fp32(
                 params,
                 grad_stats_parallel_group=self.get_grad_stats_parallel_group(),
                 use_decoupled_grad=self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8
@@ -2011,23 +2022,28 @@ class ChainedOptimizer(MegatronOptimizer):
                     main_params.append(p)
 
             if optimizer.config.clip_grad > 0.0:
-                if main_params:
-                    clip_grad_by_total_norm_fp32(
-                        main_params,
-                        max_norm=optimizer.config.clip_grad,
-                        total_norm=grad_norm,
-                        use_decoupled_grad=use_decoupled_grad,
-                    )
-                for grad_norm_group, grouped_params in params_by_grad_norm_group.items():
-                    group_grad_norm = self.grad_norms_by_group.get(grad_norm_group)
-                    if group_grad_norm is None:
-                        continue
-                    clip_grad_by_total_norm_fp32(
-                        grouped_params,
-                        max_norm=optimizer.config.clip_grad,
-                        total_norm=group_grad_norm,
-                        use_decoupled_grad=use_decoupled_grad,
-                    )
+                if getattr(optimizer, "uses_custom_grad_norm", False):
+                    # RowSparseAdam owns COO table grads; dense multi-tensor scale
+                    # cannot touch tensors that have no storage.
+                    optimizer.clip_grad_by_total_norm(optimizer.config.clip_grad, grad_norm)
+                else:
+                    if main_params:
+                        clip_grad_by_total_norm_fp32(
+                            main_params,
+                            max_norm=optimizer.config.clip_grad,
+                            total_norm=grad_norm,
+                            use_decoupled_grad=use_decoupled_grad,
+                        )
+                    for grad_norm_group, grouped_params in params_by_grad_norm_group.items():
+                        group_grad_norm = self.grad_norms_by_group.get(grad_norm_group)
+                        if group_grad_norm is None:
+                            continue
+                        clip_grad_by_total_norm_fp32(
+                            grouped_params,
+                            max_norm=optimizer.config.clip_grad,
+                            total_norm=group_grad_norm,
+                            use_decoupled_grad=use_decoupled_grad,
+                        )
 
             grad_norm_skip_threshold = optimizer.config.grad_norm_skip_threshold
             if (

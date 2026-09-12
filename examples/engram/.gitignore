@@ -1,0 +1,6 @@
+local_data.sh
+checkpoints/
+tensorboard/
+wandb/
+.wandb.env
+*.env

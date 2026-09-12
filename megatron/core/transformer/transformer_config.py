@@ -5,7 +5,7 @@ import math
 import warnings
 from copy import deepcopy
 from dataclasses import dataclass, field
-from typing import Callable, List, Literal, Optional, Self, Tuple, Union
+from typing import Callable, List, Literal, Optional, Self, Sequence, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -259,6 +259,40 @@ class TransformerConfig(ModelParallelConfig):
     num_moe_experts: Optional[int] = None
     """Number of experts to use for MoE layer. When set, it replaces MLP with MoE layer. Set to None
     for no MoE."""
+
+    ####################
+    # Engram memory
+    ####################
+
+    engram_hash_table_min_sizes: Optional[List[int]] = None
+    """Minimum hash-table sizes for n-gram orders 2 through max_ngram_size."""
+
+    engram_max_ngram_size: int = 3
+    """Largest suffix n-gram size used by NgramHashMapping."""
+
+    engram_embedding_dim_per_ngram: int = 512
+    """Total embedding width contributed by each n-gram order."""
+
+    engram_num_hash_heads_per_ngram: int = 8
+    """Number of hash heads and embedding tables per n-gram order."""
+
+    engram_layer_ids: Optional[List[int]] = None
+    """Stable non-negative Engram memory IDs used for hash seeds and checkpoint keys.
+    Presence of this list enables Engram. Without explicit target indices, each ID selects
+    the corresponding zero-based attention occurrence in the HybridModel pattern."""
+
+    engram_target_layer_indices: Optional[List[int]] = None
+    """Zero-based HybridModel attention positions paired with engram_layer_ids.
+    These physical positions do not change the logical memory IDs or hash seeds."""
+
+    engram_seed: int = 0
+    """Base seed for official NumPy-compatible per-layer hash multipliers."""
+
+    engram_kernel_size: int = 4
+    """Kernel size of the official ShortConv module."""
+
+    engram_table_backend: Literal['local', 'row_a2a'] = "local"
+    """Engram table backend: replicated local tables or row-sharded all-to-all tables."""
 
     rotary_interleaved: bool = False
     """True is rotate pairs of even and odd dimensions (RoFormer style), False is rotate pairs of
@@ -3564,6 +3598,40 @@ class TransformerConfig(ModelParallelConfig):
                     f"sequence_packing only supports moe_token_dispatcher_type='alltoall', "
                     f"got '{self.moe_token_dispatcher_type}'"
                 )
+
+        if self.engram_target_layer_indices is not None and not self.engram_layer_ids:
+            raise ValueError('engram_target_layer_indices requires engram_layer_ids')
+        if self.engram_layer_ids:
+            validate_engram_layer_ids(self.engram_layer_ids)
+            if self.engram_target_layer_indices is not None:
+                validate_engram_layer_ids(self.engram_target_layer_indices, self.num_layers)
+                if len(self.engram_target_layer_indices) != len(self.engram_layer_ids):
+                    raise ValueError('Engram target indices must match the number of memory IDs')
+            # Algorithm dimensions and table partitioning have one validation owner.
+            from megatron.core.transformer.engram.config import EngramConfig
+
+            EngramConfig.from_transformer_config(self)
+            if self.init_model_with_meta_device:
+                raise ValueError("Engram requires materialized tokenizer and addressing buffers")
+            if getattr(self, "cuda_graph_impl", "none") != "none":
+                raise ValueError("Engram does not support CUDA graph capture")
+
+
+def validate_engram_layer_ids(layer_ids: Sequence[int], num_layers: int | None = None) -> None:
+    """Validate memory identities or an explicitly bounded list of target indices.
+
+    Placement is validated against the HybridModel pattern by the adapter, independently
+    of GPT block counts or MoE frequency.
+    """
+    layer_ids = list(layer_ids)
+    if not layer_ids:
+        raise ValueError('engram_layer_ids must not be empty')
+    if len(layer_ids) != len(set(layer_ids)):
+        raise ValueError('engram_layer_ids must be unique')
+    if min(layer_ids) < 0:
+        raise ValueError('Engram IDs must be non-negative')
+    if num_layers is not None and max(layer_ids) >= num_layers:
+        raise ValueError(f'Engram layer IDs are out of range [0, {num_layers}): {layer_ids}')
 
 
 @dataclass
