@@ -42,6 +42,25 @@ for split in Split:
 _MARGIN = 0.005
 
 
+def test_get_blend_from_list():
+    # Odd-length list is a plain list of prefixes.
+    assert get_blend_from_list(["p0", "p1", "p2"]) == (["p0", "p1", "p2"], None)
+
+    # Even-length list of numeric weight/prefix pairs.
+    assert get_blend_from_list(["30", "p0", "70", "p1"]) == (["p0", "p1"], [30.0, 70.0])
+
+    # Even-length list where no token parses as a weight is a plain list of prefixes.
+    assert get_blend_from_list(["p0", "p1", "p2", "p3"]) == (["p0", "p1", "p2", "p3"], None)
+
+    # A malformed blend that mixes a numeric weight with a non-numeric one must be
+    # rejected, regardless of the position of the non-numeric token. Previously the
+    # check consumed a shared `map` iterator across any()/all(), so a non-numeric
+    # weight in a non-leading position silently slipped through.
+    for bad in (["x", "p0", "2.0", "p1"], ["1.0", "p0", "x", "p1"]):
+        with pytest.raises(AssertionError):
+            get_blend_from_list(bad)
+
+
 def create_file_prefixes(tokenizer, number_of_files, maximum_number_of_documents, dataset_dir):
     # Create dataset directory
     os.makedirs(dataset_dir, exist_ok=True)
