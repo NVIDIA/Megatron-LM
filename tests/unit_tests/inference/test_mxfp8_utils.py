@@ -1250,6 +1250,48 @@ class TestTENativeGroupedMxfp8:
 
         assert fused_moe.refresh_te_mxfp8_batch_invariant_weight(layer.weight)
 
+    def test_single_grouped_member_refit_updates_grouped_gemm(self, monkeypatch):
+        """Per-expert refit views must update the GroupedTensor GEMM payload."""
+        import transformer_engine.pytorch as te
+        from transformer_engine.common.recipe import MXFP8BlockScaling
+
+        import megatron.core.inference.moe.fused_moe as fused_moe
+
+        torch.manual_seed(17)
+        num_experts, in_features, out_features = 2, 128, 64
+        monkeypatch.setenv("NVTE_GROUPED_LINEAR_SINGLE_PARAM", "1")
+        with te.fp8_model_init(enabled=True, recipe=MXFP8BlockScaling()):
+            layer = te.GroupedLinear(
+                num_experts,
+                in_features,
+                out_features,
+                bias=False,
+                params_dtype=torch.bfloat16,
+                device="cuda",
+                single_grouped_weight=True,
+            )
+        fused_moe.prepare_te_mxfp8_batch_invariant_weight(layer.weight)
+        members = layer.weight.quantized_tensors
+        assert members is not None
+        refit_values = [torch.randn_like(member.dequantize()) * 0.02 for member in members]
+        for member, value in zip(members, refit_values):
+            member.quantize_(value)
+        assert fused_moe.refresh_te_mxfp8_batch_invariant_weight(layer.weight)
+
+        first_dims = torch.tensor([256, 256], device="cuda", dtype=torch.int64)
+        inputs = torch.randn(512, in_features, device="cuda", dtype=torch.bfloat16)
+        expected = fused_moe._te_grouped_mm(inputs, members, first_dims)
+        actual = fused_moe._te_grouped_mm(inputs, layer.weight, first_dims)
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+        expected_batch_invariant = fused_moe._te_batch_invariant_grouped_mm(
+            inputs, members, first_dims, num_chunks=1
+        )
+        actual_batch_invariant = fused_moe._te_batch_invariant_grouped_mm(
+            inputs, layer.weight, first_dims, num_chunks=1
+        )
+        torch.testing.assert_close(actual_batch_invariant, expected_batch_invariant, atol=0, rtol=0)
+
     def test_moe_zero_pads_splits_to_256_and_matches_reference(self, monkeypatch):
         import megatron.core.inference.moe.fused_moe as fused_moe
 

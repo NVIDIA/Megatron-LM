@@ -273,6 +273,17 @@ def _te_grouped_mm(x_bf16: torch.Tensor, weight, first_dims: torch.Tensor) -> to
     assert first_dims.dtype == torch.int64, f"Expected int64 expert splits, got {first_dims.dtype}"
 
     normalized_weight, is_mxfp8 = _normalize_te_weight(weight)
+    if is_mxfp8 and not isinstance(normalized_weight, list):
+        # Refit updates a single GroupedTensor through its stable per-expert
+        # views.  Those views contain independently GEMM-swizzled MXFP8 scales;
+        # treating their concatenated scale buffer as one grouped-swizzled
+        # layout makes TE decode incorrect after refit.  Use the discrete API,
+        # which consumes each member's own valid scale layout.
+        members = normalized_weight.quantized_tensors
+        if members is None:
+            members = normalized_weight.split_into_quantized_tensors()
+            normalized_weight.quantized_tensors = members
+        normalized_weight = members
     num_experts = first_dims.numel()
     weight_experts = _te_weight_num_experts(normalized_weight)
     if weight_experts != num_experts:
