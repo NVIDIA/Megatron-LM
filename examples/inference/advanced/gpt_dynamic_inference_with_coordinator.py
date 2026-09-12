@@ -16,7 +16,7 @@ from examples.inference.utils import Request, build_dynamic_engine_setup_prefix,
 from megatron.core.inference.engines import DynamicInferenceEngine
 from megatron.core.inference.engines.dynamic_engine import EngineState
 from megatron.core.inference.inference_client import InferenceClient
-from megatron.core.inference.inference_request import DynamicInferenceRequestRecord
+from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.transformer.moe.router_trace import get_moe_router_tracer, init_moe_router_tracer
 from megatron.core.utils import configure_nvtx_profiling
@@ -75,11 +75,15 @@ async def main(
     )
 
     # All ranks agree on the number of suspend/resume cycles from args.
-    num_suspend_resume_cycles = len(requests) // args.suspend_resume_interval if args.suspend_resume_interval else 0
+    num_suspend_resume_cycles = (
+        len(requests) // args.suspend_resume_interval if args.suspend_resume_interval else 0
+    )
 
     # Create client and run example.
     if dist.get_rank() == 0:
-        client = InferenceClient(dp_addr, deserialize=True)  # submits requests to the inference coordinator
+        client = InferenceClient(
+            dp_addr, deserialize=True
+        )  # submits requests to the inference coordinator
         client.start()
         base_arrival_time = time.time_ns() / 10**9
         for request in requests:
@@ -105,7 +109,10 @@ async def main(
                     futures.append(client.add_request(request.prompt_text, request.sampling_params))
                     num_requests_added += 1
 
-                    if num_requests_added >= next_suspend_at and cycles_done < num_suspend_resume_cycles:
+                    if (
+                        num_requests_added >= next_suspend_at
+                        and cycles_done < num_suspend_resume_cycles
+                    ):
                         await suspend_resume_cycle(client, engine, args, futures)
                         cycles_done += 1
                         next_suspend_at += args.suspend_resume_interval
@@ -122,7 +129,10 @@ async def main(
                     futures.append(client.add_request(request.prompt_text, request.sampling_params))
                     num_requests_added += 1
 
-                    if num_requests_added >= next_suspend_at and cycles_done < num_suspend_resume_cycles:
+                    if (
+                        num_requests_added >= next_suspend_at
+                        and cycles_done < num_suspend_resume_cycles
+                    ):
                         await suspend_resume_cycle(client, engine, args, futures)
                         cycles_done += 1
                         next_suspend_at += args.suspend_resume_interval
@@ -133,7 +143,7 @@ async def main(
             await asyncio.sleep(0)
 
         # While we wait for the requests to complete, the engine runs in the background.
-        results: List[DynamicInferenceRequestRecord] = await asyncio.gather(*futures)
+        results: List[DynamicInferenceRequest] = await asyncio.gather(*futures)
     else:
         # Non-rank-0: match the suspend/resume cycles that rank 0 drives.
         for _ in range(num_suspend_resume_cycles):
@@ -161,7 +171,7 @@ async def main(
                 throughputs.append(throughput)
                 if req.routing_indices is not None:
                     result_dict["routing_indices"] = req.routing_indices.tolist()
-                                
+
                 json_results[req.request_id] = result_dict
             throughput_dict = {"throughput": throughputs}
             if args.throughput_check_only:
@@ -233,7 +243,9 @@ if __name__ == "__main__":
                 output_dir=args.moe_routing_trace_path,
                 max_steps=max_steps,
                 rank=rank,
-                capture_hidden_states=getattr(args, 'moe_routing_trace_capture_hidden_states', False),
+                capture_hidden_states=getattr(
+                    args, 'moe_routing_trace_capture_hidden_states', False
+                ),
                 capture_logits=getattr(args, 'moe_routing_trace_capture_logits', False),
                 dump_router_weights=getattr(args, 'moe_routing_trace_dump_weights', False),
             )
@@ -247,6 +259,7 @@ if __name__ == "__main__":
             # that buffer into the tracer once per decode step. If router replay is not on,
             # use the forward hook method which allows for additionally saving hidden states.
             from megatron.core.utils import get_model_config
+
             if not get_model_config(model).moe_enable_routing_replay:
                 tracer.register_hooks(model)
 

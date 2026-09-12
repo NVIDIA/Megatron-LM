@@ -713,10 +713,6 @@ def test_complex_multi_pause_evict_lifecycle_with_record():
     record.requests.append(req2)
     record.requests.append(req3)
 
-    # Serialize and deserialize record
-    serialized = record.serialize()
-    assert len(serialized['requests']) == 3
-
     # Merge all checkpoints
     merged = record.merge()
 
@@ -732,19 +728,12 @@ def test_complex_multi_pause_evict_lifecycle_with_record():
     assert event_types.count(DynamicInferenceEventType.FINISH) == 1
     assert event_types.count(DynamicInferenceEventType.GENERATED_TOKEN) == 8
 
-    # Total events: 7 from req1 + 7 from req2 + 6 from req3 = 20
     assert len(merged.events) == 20
 
-    # Test serialization roundtrip of entire record
-    serialized = record.serialize()
-    assert len(serialized['requests']) == 3
+    serialized_events = merged.serialize()['events']
+    assert all(isinstance(e, dict) for e in serialized_events)
 
-    # Verify all events are dicts (no compact mode)
-    first_request_events = serialized['requests'][0]['events']
-    assert all(isinstance(e, dict) for e in first_request_events)
-
-    # Verify GENERATED_TOKEN events use {"token_id": ...} payload format
-    token_events = [e for e in first_request_events if e['type'] == 'GENERATED_TOKEN']
+    token_events = [e for e in serialized_events if e['type'] == 'GENERATED_TOKEN']
     assert token_events[0]['payload'] == {"token_id": 10}
     assert token_events[1]['payload'] == {"token_id": 11}
     assert token_events[2]['payload'] == {"token_id": 12}

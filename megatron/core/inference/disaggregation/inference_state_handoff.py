@@ -1006,7 +1006,7 @@ class InferenceStateHandoffMixin:
 
                 stop_word_hit = False
                 if request.stop_word_ids:
-                    stop_word_hit, _ = self._check_stop_words_for_request_post_append(request)
+                    stop_word_hit, _, _ = self._check_stop_words_for_request_post_append(request)
                 if first_token == request.sampling_params.termination_id or stop_word_hit:
                     request.sampling_params.num_tokens_to_generate = len(request.generated_tokens)
 
@@ -1054,22 +1054,11 @@ class InferenceStateHandoffMixin:
         request.status = Status.COMPLETED
         request.add_event_finish()
         self.finished_request_count += 1
+        finished_request = self._complete_request(request_entry)
 
         if self.use_coordinator and self.is_mp_coordinator:
-            self._send_request_records_to_coordinator([request_entry.record])
+            self._send_requests_to_coordinator([finished_request])
             self._partial_emit_lengths.pop(request_id, None)
-        elif not self.use_coordinator:
-            if request.prompt is None:
-                request.prompt = self.controller.detokenize(
-                    self.controller.tokenizer, request.prompt_tokens.tolist(), remove_EOD=False
-                )
-            request.generated_text = self.controller.detokenize(
-                self.controller.tokenizer,
-                request.generated_tokens,
-                remove_EOD=not request.sampling_params.detokenize_stop_sequence,
-            )
-
-        request_entry.future.set_result(request_entry.record)
 
     def _release_pending_kv_import(self, pending: PendingKvImport) -> None:
         """Release storage owned by an unadmitted decode import.

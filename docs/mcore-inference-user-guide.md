@@ -871,10 +871,15 @@ arrival schedules, batch-drain modes, or suspend and resume policies:
 engine.add_request(request_id, prompt_text, sampling_params)
 while engine.has_unfinished_requests():
     result = engine.step_modern()
-    for record in result["finished_request_records"]:
-        finished = record.merge()
+    for finished in result["finished_requests"]:
+        finished.finalize_text(tokenizer)
         print(finished.request_id, finished.generated_text)
 ```
+
+The engine owns checkpoint records internally and returns one flat,
+token-complete `DynamicInferenceRequest` per finished request. Its
+`generated_text` starts as `None`; direct low-level callers decode the complete
+token stream once by calling `finalize_text(tokenizer)` where text is needed.
 
 The fully worked manual-stepping example is
 [`examples/inference/advanced/gpt_dynamic_inference.py`](https://github.com/NVIDIA/Megatron-LM/blob/main/examples/inference/advanced/gpt_dynamic_inference.py).
@@ -974,11 +979,13 @@ is the opposite of the `MegatronLLM` constructor default.
 
 **Engine and serving**
 
-- **`engine.reset()` is unsafe in coordinator mode.** It can deadlock (rebinds
-  internal asyncio primitives that suspended waiters still reference) or
-  silently re-route to direct-mode branches. The offline example therefore
-  blocks `--inference-repeat-n > 1` together with `--use-coordinator`. Direct-mode
-  reset is safe.
+- **High-level coordinator reset is not synchronized.** Once an engine is drained,
+  `engine.reset()` preserves its coordinator mode and long-lived asyncio objects,
+  and accepts resets only while `RUNNING` or `PAUSED`. The high-level coordinator
+  API cannot yet prove that its background engine loop has finished bookkeeping
+  after the final reply, however, so an immediate reset can still race that loop.
+  The offline example therefore blocks `--inference-repeat-n > 1` together with
+  `--use-coordinator`. Direct-mode reset is safe.
 - **HTTP frontend is fixed to global rank 0.** There is no per-rank `role`
   override on `ServeConfig`. Control placement through the launcher (for example, torchrun
   rank-0 placement). `ServeConfig.sock` lets you pre-bind the listening socket,

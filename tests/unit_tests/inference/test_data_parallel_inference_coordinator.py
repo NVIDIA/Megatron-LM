@@ -176,6 +176,7 @@ class DummyTokenizer:
         self.bos = bos
         self.eod = eod
         self.pad = pad
+        self.detokenize_calls = []
 
     def tokenize(self, prompt):
         if isinstance(prompt, str):
@@ -185,6 +186,7 @@ class DummyTokenizer:
     def detokenize(self, tokens, skip_special_tokens: bool = False):
         if isinstance(tokens, torch.Tensor):
             tokens = tokens.tolist()
+        self.detokenize_calls.append(list(tokens))
         if skip_special_tokens and self.eod in tokens:
             tokens = [tok for tok in tokens if tok != self.eod]
         return " ".join(str(tok) for tok in tokens)
@@ -268,7 +270,7 @@ class DummyEngine(DynamicInferenceEngine):
 
     def add_request(
         self, request_id: int, prompt: str, sampling_params: Optional[SamplingParams] = None
-    ) -> asyncio.Future[DynamicInferenceRequestRecord]:
+    ) -> asyncio.Future[DynamicInferenceRequest]:
         """Dummy add_request."""
 
         # Mock tokenization to prevent `prompt_tokens == None`.
@@ -296,7 +298,7 @@ class DummyEngine(DynamicInferenceEngine):
         await asyncio.sleep(0)
 
         # Finish "active" requests.
-        finished_request_records = []
+        finished_requests = []
         to_remove = []
         for request_id, entry in self.requests.items():
             request = entry.record[-1]
@@ -306,13 +308,13 @@ class DummyEngine(DynamicInferenceEngine):
                     continue
                 request.status = Status.COMPLETED
                 self.context.active_cnt -= 1
-                finished_request_records.append(entry.record)
-                entry.future.set_result(entry.record)
+                finished_request = self._complete_request(entry)
+                finished_requests.append(finished_request)
                 to_remove.append(request_id)
                 # Send signal to coordinator, framed the way a real engine does.
                 if self.is_mp_coordinator:
                     self.socket_for_receiving_requests.send_multipart(
-                        _engine_reply_frames([entry.record.merge().serialize()])
+                        _engine_reply_frames([finished_request.serialize()])
                     )
 
         for request_id in to_remove:
@@ -329,7 +331,7 @@ class DummyEngine(DynamicInferenceEngine):
 
         return {
             "active_request_ids": active_request_ids,
-            "finished_request_records": finished_request_records,
+            "finished_requests": finished_requests,
             "step_time": 0.01,
             "cuda_graph_request_count": 1,
         }
@@ -624,8 +626,11 @@ class TestCoordinator:
                 for result in results:
                     if deserialize:
                         assert isinstance(result, DynamicInferenceRequest)
+                        assert result.generated_text == ""
                     else:
                         assert isinstance(result, dict)
+                        assert result["generated_text"] == ""
+                        assert "requests" not in result
 
             await asyncio.wait_for(test_case_communicator.all_reduce_max(1), timeout=30.0)
         finally:
@@ -991,10 +996,10 @@ class TestRoutingPolicies:
             The metadata frame carries only the routing key and the detokenize
             flag; the finished request travels as an opaque body frame.
             """
-            metadata = [Headers.ENGINE_REPLY.value, [[fid, False]]]
+            metadata = [Headers.ENGINE_REPLY.value, [[fid, True]]]
             bodies = [
                 msgpack.packb(
-                    {"request_id": fid, "generated_tokens": [1], "sampling_params": {}},
+                    {"request_id": fid, "generated_tokens": [10, 11, 12], "sampling_params": {}},
                     use_bin_type=True,
                 )
             ]
@@ -1020,6 +1025,7 @@ class TestRoutingPolicies:
         with caplog.at_level(logging.WARNING):
             handle_engine_reply(coord, b"rank-0", *reply(11))
         assert "removed engine" in caplog.text
+        assert coord.tokenizer.detokenize_calls == [[10, 11, 12]]
         assert coord.router_socket.send_multipart.call_args[0][0][0] == b"client-A"
         assert 11 not in coord.request_id_to_client_id
 
