@@ -969,6 +969,7 @@ class TestMcoreAdapterHybrid:
         expected_expert_strategy = (
             dense_outer_strategy if expert_outer_strategy is None else expert_outer_strategy
         )
+        assert model.ddp_config.expert_outer_dp_sharding_strategy == expected_expert_strategy
         expert_outer = Replicate() if expected_expert_strategy == "no_shard" else Shard(0)
         for name, parameter in expert_parameters:
             assert parameter.grad.placements == (expert_outer, Shard(0)), name
