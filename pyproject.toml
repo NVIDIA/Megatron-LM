@@ -76,6 +76,7 @@ training = [
     "transformers",
     "accelerate",
     "omegaconf",
+    "pyyaml",
     "gigatoken",
 ]
 
@@ -88,6 +89,7 @@ mlm = [
     "transformers",
     "accelerate",
     "omegaconf",
+    "pyyaml",
     "gigatoken",
 ]
 
