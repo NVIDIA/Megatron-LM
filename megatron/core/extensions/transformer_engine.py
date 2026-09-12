@@ -556,9 +556,7 @@ def _get_fp8_autocast_for_quant_recipe(qrecipe: TEQuantizationRecipe, calibratio
         from megatron.core.fp8_utils import _fp8_autocast_with_calibration_config
 
         return _fp8_autocast_with_calibration_config(
-            fp8_autocast,
-            calibration_config=calibration_config,
-            **context_args,
+            fp8_autocast, calibration_config=calibration_config, **context_args
         )
 
 

@@ -129,9 +129,7 @@ def get_te_calibration_config(config: TransformerConfig):
     return _make_te_calibration_config(config.transformer_engine_calibration_decay)
 
 
-def _fp8_autocast_with_calibration_config(
-    fp8_autocast, *, calibration_config=None, **kwargs
-):
+def _fp8_autocast_with_calibration_config(fp8_autocast, *, calibration_config=None, **kwargs):
     """Enter TE autocast with a clear error when calibration is unsupported."""
     if calibration_config is None:
         return fp8_autocast(**kwargs)
@@ -139,7 +137,7 @@ def _fp8_autocast_with_calibration_config(
         return fp8_autocast(calibration_config=calibration_config, **kwargs)
     except TypeError as exc:
         if "calibration_config" not in str(exc):
-            raise   # the exc
+            raise  # the exc
         raise RuntimeError(
             "--buffer-transformer-engine-calibration-metadata requires a Transformer Engine "
             "version whose autocast API accepts calibration_config; upgrade Transformer Engine "
