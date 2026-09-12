@@ -10,6 +10,7 @@ import numpy as np
 import torch
 from image_processing import ImageTransform
 from PIL import Image
+from PIL.ImageFile import ImageFile
 
 from megatron.training import print_rank_0
 
@@ -44,7 +45,8 @@ class VQADataset(torch.utils.data.Dataset):
         vision_model_type,
         split="validation"
     ):
-        samples = json.load(open(gt_path, encoding='utf-8'))
+        with open(gt_path, "r", encoding="utf-8") as f:
+            samples = json.load(f)
         if "data" in samples:
             samples = samples["data"]
 
@@ -79,15 +81,21 @@ class VQADataset(torch.utils.data.Dataset):
             if not os.path.exists(img_file):
                 img_file = img_file.replace('.jpg', '.png')
 
-        img = Image.open(img_file)
-        imgs = self._transform_img(
-            img,
-            self._img_h,
-            self._img_w,
-            self._use_tiling,
-            self._max_num_tiles,
-            self._use_thumbnail,
-            augment=False,
+        with Image.open(img_file) as img:
+            imgs = self._transform_img(
+                img,
+                self._img_h,
+                self._img_w,
+                self._use_tiling,
+                self._max_num_tiles,
+                self._use_thumbnail,
+                augment=False,
+            )
+        # If the returned elements are not tensors, we may still have to keep the `ImageFile`
+        # returned by `Image.open` open.
+        assert not imgs or isinstance(imgs[0], torch.Tensor), (
+            "returned type is not expected list[torch.Tensor]; please ensure the `ImageFile` does "
+            "not need to still be open or adjust its lifetime"
         )
         tile_count = torch.tensor([len(imgs)], dtype=torch.int)
 
@@ -133,7 +141,8 @@ class CaptioningDataset(torch.utils.data.Dataset):
             )
             image_files = image_files[lb:ub]
 
-        gts = json.load(open(gt_path))
+        with open(gt_path, "r") as f:
+            gts = json.load(f)
         answers = defaultdict(list)
         for gt in gts["annotations"]:
             answers[gt["image_id"]].append(gt['caption'])
@@ -157,15 +166,21 @@ class CaptioningDataset(torch.utils.data.Dataset):
         except:
             image_id = int(img_file.split("/")[-1].split(".")[0])  # flickr
 
-        img = Image.open(img_file)
-        imgs = self._transform_img(
-            img,
-            self._img_h,
-            self._img_w,
-            self._use_tiling,
-            self._max_num_tiles,
-            self._use_thumbnail,
-            augment=False,
+        with Image.open(img_file) as img:
+            imgs = self._transform_img(
+                img,
+                self._img_h,
+                self._img_w,
+                self._use_tiling,
+                self._max_num_tiles,
+                self._use_thumbnail,
+                augment=False,
+            )
+        # If the returned elements are not tensors, we may still have to keep the `ImageFile`
+        # returned by `Image.open` open.
+        assert not imgs or isinstance(imgs[0], torch.Tensor), (
+            "returned type is not expected list[torch.Tensor]; please ensure the `ImageFile` does "
+            "not need to still be open or adjust its lifetime"
         )
 
         tile_count = torch.tensor([len(imgs)], dtype=torch.int)
@@ -467,7 +482,8 @@ class VideoMMEDataset(torch.utils.data.Dataset):
         num_frames,
         vision_model_type,
     ):
-        ground_truth_original = json.load(open(gt_path))
+        with open(gt_path, "r") as f:
+            ground_truth_original = json.load(f)
         ground_truth = []
         for gt in ground_truth_original:
             video_path = gt["url"]
@@ -567,7 +583,8 @@ class OCRBenchDataset(torch.utils.data.Dataset):
         use_thumbnail,
         vision_model_type,
     ):
-        gt = json.load(open(gt_path, encoding='utf-8'))
+        with open(gt_path, "r", encoding="utf-8") as f:
+            gt = json.load(f)
 
         if num_partitions > 0:
             start_idx, end_idx = _get_partition_bounds(
@@ -590,15 +607,21 @@ class OCRBenchDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx):
         img_path = os.path.join(self._input_image_path, self._gt[idx]['image_path'])
 
-        img = Image.open(img_path)
-        imgs = self._transform_img(
-            img,
-            self._img_h,
-            self._img_w,
-            self._use_tiling,
-            self._max_num_tiles,
-            self._use_thumbnail,
-            augment=False,
+        with Image.open(img_path) as img:
+            imgs = self._transform_img(
+                img,
+                self._img_h,
+                self._img_w,
+                self._use_tiling,
+                self._max_num_tiles,
+                self._use_thumbnail,
+                augment=False,
+            )
+        # If the returned elements are not tensors, we may still have to keep the `ImageFile`
+        # returned by `Image.open` open.
+        assert not imgs or isinstance(imgs[0], torch.Tensor), (
+            "returned type is not expected list[torch.Tensor]; please ensure the `ImageFile` does "
+            "not need to still be open or adjust its lifetime"
         )
 
         tile_count = torch.tensor([len(imgs)], dtype=torch.int)
@@ -759,15 +782,21 @@ class AI2DDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx):
         img_path = os.path.join(self._input_image_path, self._gt[idx]['image'].split("/")[-1])
 
-        img = Image.open(img_path)
-        imgs = self._transform_img(
-            img,
-            self._img_h,
-            self._img_w,
-            self._use_tiling,
-            self._max_num_tiles,
-            self._use_thumbnail,
-            augment=False,
+        with Image.open(img_path) as img:
+            imgs = self._transform_img(
+                img,
+                self._img_h,
+                self._img_w,
+                self._use_tiling,
+                self._max_num_tiles,
+                self._use_thumbnail,
+                augment=False,
+            )
+        # If the returned elements are not tensors, we may still have to keep the `ImageFile`
+        # returned by `Image.open` open.
+        assert not imgs or isinstance(imgs[0], torch.Tensor), (
+            "returned type is not expected list[torch.Tensor]; please ensure the `ImageFile` does "
+            "not need to still be open or adjust its lifetime"
         )
 
         tile_count = torch.tensor([len(imgs)], dtype=torch.int)
@@ -831,15 +860,21 @@ class RDTableBenchDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx):
         img_path = os.path.join(self._input_image_path, self._gt[idx]['image'])
 
-        img = Image.open(img_path)
-        imgs = self._transform_img(
-            img,
-            self._img_h,
-            self._img_w,
-            self._use_tiling,
-            self._max_num_tiles,
-            self._use_thumbnail,
-            augment=False,
+        with Image.open(img_path) as img:
+            imgs = self._transform_img(
+                img,
+                self._img_h,
+                self._img_w,
+                self._use_tiling,
+                self._max_num_tiles,
+                self._use_thumbnail,
+                augment=False,
+            )
+        # If the returned elements are not tensors, we may still have to keep the `ImageFile`
+        # returned by `Image.open` open.
+        assert not imgs or isinstance(imgs[0], torch.Tensor), (
+            "returned type is not expected list[torch.Tensor]; please ensure the `ImageFile` does "
+            "not need to still be open or adjust its lifetime"
         )
 
         tile_count = torch.tensor([len(imgs)], dtype=torch.int)
@@ -877,8 +912,8 @@ class RealworldQADataset(torch.utils.data.Dataset):
         use_thumbnail,
         vision_model_type,
     ):
-        gt = json.load(open(gt_path, encoding='utf-8'))
-
+        with open(gt_path, "r", encoding="utf-8") as f:
+            gt = json.load(f)
 
         if num_partitions > 0:
             start_idx, end_idx = _get_partition_bounds(
@@ -901,15 +936,21 @@ class RealworldQADataset(torch.utils.data.Dataset):
 
     def __getitem__(self, idx):
         img_path = os.path.join(self._input_image_path, self._gt[idx]['image'])
-        img = Image.open(img_path)
-        imgs = self._transform_img(
-            img,
-            self._img_h,
-            self._img_w,
-            self._use_tiling,
-            self._max_num_tiles,
-            self._use_thumbnail,
-            augment=False,
+        with Image.open(img_path) as img:
+            imgs = self._transform_img(
+                img,
+                self._img_h,
+                self._img_w,
+                self._use_tiling,
+                self._max_num_tiles,
+                self._use_thumbnail,
+                augment=False,
+            )
+        # If the returned elements are not tensors, we may still have to keep the `ImageFile`
+        # returned by `Image.open` open.
+        assert not imgs or isinstance(imgs[0], torch.Tensor), (
+            "returned type is not expected list[torch.Tensor]; please ensure the `ImageFile` does "
+            "not need to still be open or adjust its lifetime"
         )
 
         question_id = int(self._gt[idx]['image'].replace(".webp", ""))
@@ -1072,7 +1113,8 @@ class PhysGameBenchDataset(torch.utils.data.Dataset):
         split
     ):
 
-        ground_truth_original = json.load(open(gt_path, encoding='utf-8'))
+        with open(gt_path, "r", encoding="utf-8") as f:
+            ground_truth_original = json.load(f)
 
         ground_truth = []
         for gt in ground_truth_original:
@@ -1309,28 +1351,37 @@ class MVBenchDataset(torch.utils.data.Dataset):
 
         video_decode_func = self.decord_method[data['data_type']]
 
-        video_frames = video_decode_func(video_path, bound)
+        try:
+            video_frames = video_decode_func(video_path, bound)
 
-        imgs = []
-        for img in video_frames:
-            from torchvision.transforms import ToPILImage
+            imgs = []
+            for img in video_frames:
+                from torchvision.transforms import ToPILImage
 
-            if data['data_type'] == 'video':
-                to_pil = ToPILImage()
-                img = to_pil(img)
-            imgs += self._transform_img(
-                img, self._img_h, self._img_w, self._use_tiling, self._max_num_tiles,
-                self._use_thumbnail, augment=False
-            )
+                if data['data_type'] == 'video':
+                    to_pil = ToPILImage()
+                    img = to_pil(img)
+                imgs += self._transform_img(
+                    img, self._img_h, self._img_w, self._use_tiling, self._max_num_tiles,
+                    self._use_thumbnail, augment=False
+                )
 
-        num_tiles = torch.tensor([len(imgs)], dtype=torch.int)
+            num_tiles = torch.tensor([len(imgs)], dtype=torch.int)
 
-        q_id = data['question_id']
-        metadata = {'task_type': data['task_type']}
-        question, answer = self.qa_template(data['data'])
+            q_id = data['question_id']
+            metadata = {'task_type': data['task_type']}
+            question, answer = self.qa_template(data['data'])
 
+            tensor_imgs = torch.stack(imgs)
+        finally:
+            try:
+                for frame in video_frames:
+                    if isinstance(frame, ImageFile):
+                        frame.close()
+            except NameError:
+                pass
         return (
-            torch.stack(imgs),
+            tensor_imgs,
             num_tiles,
             q_id,
             question,
@@ -1378,15 +1429,21 @@ class ExampleInferenceDataset(torch.utils.data.Dataset):
         sample_imgs = []
         sample_tile_count = []
         for image_path in sample.get("image_paths", []):
-            img = Image.open(image_path)
-            imgs = self._transform_img(
-                img,
-                self._img_h,
-                self._img_w,
-                self._use_tiling,
-                self._max_num_tiles,
-                self._use_thumbnail,
-                augment=False,
+            with Image.open(image_path) as img:
+                imgs = self._transform_img(
+                    img,
+                    self._img_h,
+                    self._img_w,
+                    self._use_tiling,
+                    self._max_num_tiles,
+                    self._use_thumbnail,
+                    augment=False,
+                )
+            # If the returned elements are not tensors, we may still have to keep the `ImageFile`
+            # returned by `Image.open` open.
+            assert not imgs or isinstance(imgs[0], torch.Tensor), (
+                "returned type is not expected list[torch.Tensor]; please ensure the `ImageFile` does "
+                "not need to still be open or adjust its lifetime"
             )
 
             sample_imgs.extend(imgs)
