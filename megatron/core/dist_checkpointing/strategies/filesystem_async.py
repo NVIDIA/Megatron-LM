@@ -234,17 +234,19 @@ class FileSystemWriterAsync(FileSystemWriter):
             non_blocking (bool, optional): knob to enable pinned D2H memcpy. Default is True.
         """
         result = []
+        synchronize_cuda = False
 
         for bucket in write_buckets:
             file_name, storage_key, (bytes_data, tensor_data) = bucket
             tensor_list = []
             for item, tensor in tensor_data:
                 # we belive these tensors are detached from the model trainers
+                synchronize_cuda |= tensor.is_cuda
                 tensor_list.append((item, tensor.to("cpu", non_blocking=non_blocking)))
                 # This is required for `PersistentAsyncCaller` to remove reference
                 del tensor
             result.append((file_name, storage_key, (bytes_data, tensor_list)))
-        if non_blocking:
+        if non_blocking and synchronize_cuda:
             torch.cuda.synchronize()
         return result
 

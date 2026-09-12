@@ -1,5 +1,6 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 import sys
+from pathlib import Path
 from unittest import mock
 
 import pytest
@@ -11,6 +12,9 @@ from megatron.core.dist_checkpointing.dict_utils import diff
 from megatron.core.dist_checkpointing.strategies.async_utils import AsyncCallsQueue
 from megatron.core.dist_checkpointing.strategies.filesystem_async import FileSystemWriterAsync
 from megatron.core.dist_checkpointing.strategies.nvrx import has_nvrx_async_support
+from megatron.core.dist_checkpointing.strategies.state_dict_saver import (
+    save_state_dict_async_finalize,
+)
 from megatron.core.dist_checkpointing.strategies.torch import (
     TorchDistSaveShardedStrategy,
     get_async_strategy,
@@ -163,3 +167,63 @@ class TestHasNvrxAsyncSupport:
         ):
             with pytest.raises(AssertionError, match="Minimum required nvidia-resiliency-ext"):
                 has_nvrx_async_support()
+
+
+class TestFileSystemWriterAsync:
+    @staticmethod
+    def _write_buckets(tensor):
+        return [(Path("checkpoint"), "storage-key", ([], [(mock.sentinel.item, tensor)]))]
+
+    def test_preload_cpu_tensors_does_not_synchronize_cuda(self):
+        tensor = torch.ones(2)
+
+        with mock.patch.object(torch.cuda, "synchronize") as synchronize:
+            result = FileSystemWriterAsync.preload_tensors(self._write_buckets(tensor))
+
+        synchronize.assert_not_called()
+        assert result[0][2][1][0][1] is tensor
+
+    def test_preload_cuda_tensors_synchronizes_cuda(self):
+        tensor = mock.MagicMock()
+        tensor.is_cuda = True
+        tensor.to.return_value = torch.ones(2)
+
+        with mock.patch.object(torch.cuda, "synchronize") as synchronize:
+            FileSystemWriterAsync.preload_tensors(self._write_buckets(tensor))
+
+        tensor.to.assert_called_once_with("cpu", non_blocking=True)
+        synchronize.assert_called_once_with()
+
+
+class TestSaveStateDictAsyncFinalize:
+    @pytest.mark.parametrize("collective_device", ["cpu", "cuda"])
+    def test_failure_status_uses_process_group_device(self, collective_device):
+        storage_writer = mock.Mock()
+        storage_writer.retrieve_write_results.return_value = [mock.sentinel.local_result]
+        all_results = [mock.sentinel.all_results]
+        dist_wrapper = mock.Mock(is_coordinator=True, coordinator_rank=0, group=mock.sentinel.group)
+        dist_wrapper.gather_object.return_value = all_results
+        failures_occurred = mock.MagicMock()
+        failures_occurred.__bool__.return_value = False
+
+        with (
+            mock.patch(
+                "megatron.core.dist_checkpointing.strategies.state_dict_saver._get_failure_dict",
+                return_value={},
+            ),
+            mock.patch(
+                "megatron.core.dist_checkpointing.strategies.state_dict_saver._get_object_coll_device",
+                return_value=collective_device,
+            ) as get_collective_device,
+            mock.patch.object(torch, "tensor", return_value=failures_occurred) as tensor,
+            mock.patch.object(torch.distributed, "get_rank", return_value=0),
+            mock.patch.object(torch.distributed, "broadcast") as broadcast,
+        ):
+            save_state_dict_async_finalize(storage_writer, mock.sentinel.metadata, dist_wrapper)
+
+        storage_writer.finish.assert_called_once_with(mock.sentinel.metadata, all_results)
+        get_collective_device.assert_called_once_with(dist_wrapper.group)
+        tensor.assert_called_once_with([0], dtype=torch.int, device=collective_device)
+        broadcast.assert_called_once_with(
+            failures_occurred, src=dist_wrapper.coordinator_rank, group=dist_wrapper.group
+        )
