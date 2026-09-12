@@ -88,6 +88,9 @@ class TransformerConfig(ModelParallelConfig):
     freeze_base_model_for_mtp: bool = False
     """Freeze every non-MTP parameter and avoid recording backbone activations."""
 
+    keep_mtp_spec_in_bf16: bool = False
+    """Keep MTP layers out of FP8 and FP4 quantization contexts."""
+
     mtp_detach_heads: bool = False
     """If True, detach MTP head inputs from the main model graph.
     This prevents MTP loss gradients from flowing back to the main model,

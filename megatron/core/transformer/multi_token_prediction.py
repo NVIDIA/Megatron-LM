@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import warnings
 from contextlib import AbstractContextManager, nullcontext
+from copy import deepcopy
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Callable, List, Optional, Union
 
@@ -324,9 +325,12 @@ def _roll_tensor_packed_seq(
 
     # Notice: This is a naive implementation to test the correctness,
     # a better solution will only sync the boundary tokens once.
-    assert (
-        dims == -1 or dims == tensor.dim() - 1
-    ), "Packed sequence roll only supports the last dimension."
+    ndim = tensor.dim()
+    sequence_dim = dims if dims >= 0 else ndim + dims
+    assert sequence_dim in (
+        0,
+        ndim - 1,
+    ), f"Packed sequence roll only supports the first or last dimension, got dims={dims}."
     assert shifts == -1, "Packed sequence roll only supports a single-token left shift."
     cu_seqlens = packed_seq_params.cu_seqlens_q
     assert cu_seqlens is not None, "Packed sequence parameters must provide cu_seqlens_q."
@@ -336,6 +340,16 @@ def _roll_tensor_packed_seq(
 
     rolled_tensor = tensor.clone()
 
+    def slice_sequence(tensor, start, end):
+        index = [slice(None)] * tensor.dim()
+        index[sequence_dim] = slice(start, end)
+        return tensor[tuple(index)]
+
+    def assign_sequence(tensor, start, end, value):
+        index = [slice(None)] * tensor.dim()
+        index[sequence_dim] = slice(start, end)
+        tensor[tuple(index)] = value
+
     cp_size = cp_group.size() if cp_group is not None else 1
     if cp_size == 1:
         # CP disabled: roll each packed sequence independently within its boundaries
@@ -344,12 +358,15 @@ def _roll_tensor_packed_seq(
             valid_length = cu_seqlens[i + 1] - cu_seqlens[i]
             end_idx = start_idx + valid_length
             physical_end_idx = physical_cu_seqlens[i + 1]
-            seq_slice = tensor[..., start_idx:end_idx]
-            rolled_seq = torch.roll(seq_slice, shifts=shifts, dims=dims)
-            # Zero out the last position(s) that would cross sequence boundaries
-            rolled_seq[..., shifts:] = 0
-            rolled_tensor[..., start_idx:end_idx] = rolled_seq
-            rolled_tensor[..., end_idx:physical_end_idx] = 0
+            # Shard-local packed boundaries can collapse documents outside this
+            # SP rank to empty slices. They have no boundary token to clear.
+            if end_idx > start_idx:
+                seq_slice = slice_sequence(tensor, start_idx, end_idx)
+                rolled_seq = torch.roll(seq_slice, shifts=shifts, dims=sequence_dim)
+                # Zero out the last position that would cross a document boundary.
+                rolled_seq.select(sequence_dim, shifts).zero_()
+                assign_sequence(rolled_tensor, start_idx, end_idx, rolled_seq)
+            assign_sequence(rolled_tensor, end_idx, physical_end_idx, 0)
         rolled_sum = rolled_tensor.sum() if return_sum else None
         return rolled_tensor, rolled_sum
 
@@ -374,25 +391,29 @@ def _roll_tensor_packed_seq(
         if local_seq_len == 0:
             continue
 
-        tensor_slice = rolled_tensor[..., local_start_idx:local_end_idx].clone()
+        tensor_slice = slice_sequence(rolled_tensor, local_start_idx, local_end_idx).clone()
 
         # The following code is very similar as the code in roll_tensor function
-        local_chunks = tensor_slice.chunk(2, dim=dims)
-        rolled_chunks = [torch.roll(chunk, shifts=shifts, dims=dims) for chunk in local_chunks]
+        local_chunks = tensor_slice.chunk(2, dim=sequence_dim)
+        rolled_chunks = [
+            torch.roll(chunk, shifts=shifts, dims=sequence_dim) for chunk in local_chunks
+        ]
 
         tensor_send_list = []
         tensor_recv_list = []
         for chunk in rolled_chunks:
             # Skip empty chunks that can occur when the sequence slice is very small
-            if chunk.size(dims) == 0:
+            if chunk.size(sequence_dim) == 0:
+                boundary_shape = list(chunk.shape)
+                del boundary_shape[sequence_dim]
                 tensor_send_list.append(
-                    torch.empty(chunk.shape[:-1], dtype=chunk.dtype, device=chunk.device)
+                    torch.empty(boundary_shape, dtype=chunk.dtype, device=chunk.device)
                 )
                 tensor_recv_list.append(
-                    torch.empty(chunk.shape[:-1], dtype=chunk.dtype, device=chunk.device)
+                    torch.empty(boundary_shape, dtype=chunk.dtype, device=chunk.device)
                 )
                 continue
-            boundary = chunk.select(dims, shifts).contiguous().clone()
+            boundary = chunk.select(sequence_dim, shifts).contiguous().clone()
             tensor_send_list.append(boundary)
             tensor_recv_list.append(torch.empty_like(boundary))
 
@@ -413,20 +434,53 @@ def _roll_tensor_packed_seq(
             op.wait()
 
         index = [slice(None)] * rolled_chunks[0].dim()
-        index[dims] = shifts
+        index[sequence_dim] = shifts
         for chunk, recv in zip(rolled_chunks, tensor_recv_list):
             # Skip empty chunks
-            if chunk.size(dims) == 0:
+            if chunk.size(sequence_dim) == 0:
                 continue
             chunk[tuple(index)] = recv
 
-        seq_result = torch.cat(rolled_chunks, dim=dims)
+        seq_result = torch.cat(rolled_chunks, dim=sequence_dim)
 
         # update the rolled tensor
-        rolled_tensor[..., local_start_idx:local_end_idx] = seq_result
+        assign_sequence(rolled_tensor, local_start_idx, local_end_idx, seq_result)
 
     rolled_sum = rolled_tensor.sum() if return_sum else None
     return rolled_tensor, rolled_sum
+
+
+def roll_tensor_precomputed_embeddings(
+    tensor, shifts=-1, dims=0, sp_group=None, cp_group=None, packed_seq_params=None, return_sum=True
+):
+    """Roll precomputed embeddings while preserving SP and packed-sequence boundaries."""
+    sp_size = get_pg_size(sp_group)
+    if sp_size == 1:
+        return roll_tensor(
+            tensor,
+            shifts=shifts,
+            dims=dims,
+            cp_group=cp_group,
+            packed_seq_params=packed_seq_params,
+            return_sum=return_sum,
+        )
+
+    sp_rank = get_pg_rank(sp_group)
+    gathered_shape = list(tensor.shape)
+    gathered_shape[dims] *= sp_size
+    full_tensor = torch.empty(gathered_shape, dtype=tensor.dtype, device=tensor.device)
+    dist_all_gather_func(full_tensor, tensor.contiguous(), group=sp_group)
+
+    rolled_full, rolled_sum = roll_tensor(
+        full_tensor,
+        shifts=shifts,
+        dims=dims,
+        cp_group=cp_group,
+        packed_seq_params=packed_seq_params,
+        return_sum=return_sum,
+    )
+    local_tensor = rolled_full.chunk(sp_size, dim=dims)[sp_rank].contiguous()
+    return local_tensor, rolled_sum
 
 
 def _packed_seq_params_for_local_hsm_roll(
@@ -1232,6 +1286,10 @@ class MultiTokenPredictionLayer(MegatronModule):
         Args:
             name (str | None): module instance name passed top-down from its paranet module
         """
+        if config.keep_mtp_spec_in_bf16:
+            config = deepcopy(config)
+            config.fp4 = None
+            config.fp8 = None
         super().__init__(config=config)
         if mamba_submodules is not None:
             if hybrid_submodules is not None:
@@ -1540,6 +1598,26 @@ class MultiTokenPredictionLayer(MegatronModule):
             hidden_states.requires_grad_(True)
 
         return (input_ids, position_ids, padding_mask, mtp_input_mask, decoder_input, hidden_states)
+
+    def _get_precomputed_embeddings(self, decoder_input: torch.Tensor, hidden_states: torch.Tensor):
+        """Prepare externally composed embeddings for an MTP depth."""
+        row_norms = decoder_input.norm(dim=-1)
+        zero_norm_mask = row_norms < 1e-6
+        if zero_norm_mask.any():
+            non_zero_mask = ~zero_norm_mask
+            if non_zero_mask.any():
+                fill_embedding = decoder_input[non_zero_mask].mean(dim=0)
+                decoder_input = decoder_input.clone()
+                decoder_input[zero_norm_mask] = fill_embedding
+
+        if self.config.mtp_detach_heads:
+            decoder_input = decoder_input.detach()
+
+        hidden_states = make_viewless_tensor(inp=hidden_states, requires_grad=True, keep_graph=True)
+        if not hidden_states.requires_grad:
+            hidden_states.requires_grad_(True)
+
+        return decoder_input, hidden_states
 
     def _concat_embeddings(self, hidden_states: torch.Tensor, decoder_input: torch.Tensor):
         """
@@ -1902,8 +1980,8 @@ class MultiTokenPredictionLayer(MegatronModule):
 
     def forward(
         self,
-        input_ids: Tensor,
-        position_ids: Tensor,
+        input_ids: Optional[Tensor],
+        position_ids: Optional[Tensor],
         hidden_states: Tensor,
         attention_mask: Tensor,
         padding_mask: Optional[Tensor] = None,
@@ -1917,6 +1995,7 @@ class MultiTokenPredictionLayer(MegatronModule):
         packed_seq_params: Optional[PackedSeqParams] = None,
         sequence_len_offset: Optional[Tensor] = None,
         embedding=None,
+        decoder_input: Optional[Tensor] = None,
         mtp_input_mask: Optional[Tensor] = None,
         packed_seq_params_by_layout: Optional[dict[CPLayout, PackedSeqParams | None]] = None,
         cp_layout_plan: Optional[THDCPLayoutPlan] = None,
@@ -1945,8 +2024,16 @@ class MultiTokenPredictionLayer(MegatronModule):
             [s, b, h], and optionally the updated context tensor if cross-attention is used.
         """
         assert context is None, "multi token prediction + cross attention is not yet supported."
-        input_ids, position_ids, padding_mask, mtp_input_mask, decoder_input, hidden_states = (
-            self._get_embeddings(
+        if decoder_input is None:
+            assert input_ids is not None and position_ids is not None
+            (
+                input_ids,
+                position_ids,
+                padding_mask,
+                mtp_input_mask,
+                decoder_input,
+                hidden_states,
+            ) = self._get_embeddings(
                 input_ids=input_ids,
                 position_ids=position_ids,
                 padding_mask=padding_mask,
@@ -1955,7 +2042,10 @@ class MultiTokenPredictionLayer(MegatronModule):
                 packed_seq_params=packed_seq_params,
                 mtp_input_mask=mtp_input_mask,
             )
-        )
+        else:
+            decoder_input, hidden_states = self._get_precomputed_embeddings(
+                decoder_input=decoder_input, hidden_states=hidden_states
+            )
 
         # Legacy GPT MTP owns one outer checkpoint around its projection and Transformer
         # layer. Hybrid MTP instead delegates full recompute to the nested HybridStack so
@@ -2055,9 +2145,10 @@ class MultiTokenPredictionBlockSubmodules:
 class MultiTokenPredictionInputs:
     """Inputs prepared in the CP layout consumed by an MTP block."""
 
-    input_ids: Tensor
-    position_ids: Tensor
+    input_ids: Optional[Tensor]
+    position_ids: Optional[Tensor]
     hidden_states: Tensor
+    decoder_input: Optional[Tensor]
     mhc_multistream: Optional[Tensor]
     labels: Optional[Tensor]
     loss_mask: Optional[Tensor]
@@ -2211,6 +2302,7 @@ class MultiTokenPredictionBlock(MegatronModule):
         input_ids: Tensor,
         position_ids: Tensor,
         hidden_states: Tensor,
+        decoder_input: Optional[Tensor],
         mhc_multistream: Optional[Tensor],
         labels: Optional[Tensor],
         loss_mask: Optional[Tensor],
@@ -2240,6 +2332,17 @@ class MultiTokenPredictionBlock(MegatronModule):
                 self.tp_cp_group,
                 cp_batch.thd_plan,
             )
+            if decoder_input is not None:
+                decoder_input = convert_cp_layout(
+                    decoder_input,
+                    source_layout,
+                    target_layout,
+                    self.cp_group,
+                    self.sequence_parallel,
+                    self.tp_group,
+                    self.tp_cp_group,
+                    cp_batch.thd_plan,
+                )
             if mhc_multistream is not None:
                 mhc_multistream = convert_cp_layout(
                     mhc_multistream,
@@ -2262,6 +2365,7 @@ class MultiTokenPredictionBlock(MegatronModule):
             input_ids=input_ids,
             position_ids=position_ids,
             hidden_states=hidden_states,
+            decoder_input=decoder_input,
             mhc_multistream=mhc_multistream,
             labels=labels,
             loss_mask=loss_mask,
@@ -2358,8 +2462,8 @@ class MultiTokenPredictionBlock(MegatronModule):
 
     def forward(
         self,
-        input_ids: Tensor,
-        position_ids: Tensor,
+        input_ids: Optional[Tensor],
+        position_ids: Optional[Tensor],
         hidden_states: Tensor,
         attention_mask: Tensor,
         padding_mask: Optional[Tensor] = None,
@@ -2374,6 +2478,7 @@ class MultiTokenPredictionBlock(MegatronModule):
         sequence_len_offset: Optional[Tensor] = None,
         extra_block_kwargs: Optional[dict] = None,
         embedding=None,
+        decoder_input: Optional[Tensor] = None,
         mtp_input_mask: Optional[Tensor] = None,
         mhc_multistream: Optional[Tensor] = None,
         packed_seq_params_by_layout: Optional[dict[CPLayout, PackedSeqParams | None]] = None,
@@ -2412,6 +2517,17 @@ class MultiTokenPredictionBlock(MegatronModule):
 
         for iteration in range(self.config.mtp_num_layers):
             layer_idx = 0 if self.mtp_use_repeated_layer else iteration
+
+            if decoder_input is not None:
+                decoder_input, _ = roll_tensor_precomputed_embeddings(
+                    decoder_input,
+                    shifts=-1,
+                    dims=0,
+                    sp_group=self.tp_group if self.sequence_parallel else None,
+                    cp_group=self.cp_group,
+                    packed_seq_params=packed_seq_params,
+                    return_sum=False,
+                )
 
             # Older HSM entries predict earlier targets than the newest entry. Roll
             # them once per depth so all candidates correspond to the same target.
@@ -2494,6 +2610,7 @@ class MultiTokenPredictionBlock(MegatronModule):
                 cp_layout_plan=cp_layout_plan,
                 sequence_len_offset=sequence_len_offset,
                 embedding=embedding,
+                decoder_input=decoder_input,
                 mtp_input_mask=mtp_input_mask,
                 **(extra_block_kwargs or {}),
             )

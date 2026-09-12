@@ -784,6 +784,10 @@ class TestMegatronNetworkArgumentGeneration:
         with pytest.raises(ArgumentError, match="invalid choice"):
             self._parser().parse_args(["--mhc-fused-backend", "cuda"])
 
+    def test_keep_mtp_spec_in_bf16_flag(self):
+        assert self._parser().parse_args([]).keep_mtp_spec_in_bf16 is False
+        assert self._parser().parse_args(["--keep-mtp-spec-in-bf16"]).keep_mtp_spec_in_bf16
+
 
 class TestMegatronMLAArgumentGeneration:
     """Test Megatron's manually registered MLA arguments."""
