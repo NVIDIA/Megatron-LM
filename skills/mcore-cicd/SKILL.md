@@ -1,6 +1,6 @@
 ---
 name: mcore-cicd
-description: CI/CD reference for Megatron-LM. Covers CI pipeline structure, PR scope labels, triggering internal GitLab CI (which force-pushes the current branch to a pull-request/BRANCH ref — always dry-run and verify the destination first; never run against shared or protected branches), and CI failure investigation.
+description: CI/CD reference for Megatron-LM. Covers CI pipeline structure, PR scope labels, rerunning GitHub PR checks through copy-pr-bot, triggering internal GitLab CI, and CI failure investigation.
 license: Apache-2.0
 when_to_use: Investigating a CI failure; understanding the pipeline structure; which CI label to attach; triggering internal GitLab CI; 'CI is red', 'how do I trigger CI', 'PR labels', 'where are the logs', 'pull-request branch'.
 metadata:
@@ -24,6 +24,8 @@ For PR-label or trigger questions, lead with the exact values:
   for a container or dependency change.**
 - `Run MBridge tests` additionally triggers the MBridge L1 suite.
 - `Run NeMoRL tests` additionally triggers NeMo RL's Megatron functional test suite.
+- To rerun a GitHub Actions run already associated with the current PR head,
+  use `gh run rerun <run-id> --repo NVIDIA/Megatron-LM`.
 - ⚠️ **WARNING — destructive remote write.** `tools/trigger_internal_ci.py`
   **force-pushes the current branch** to the internal GitLab remote as
   `pull-request/<branch>`. Always run with `--dry-run` first and confirm the
@@ -100,7 +102,27 @@ The CI pipeline reads PR labels to decide test scope, n_repeat, and container im
 
 ---
 
-## Triggering Internal CI
+## Rerunning GitHub PR Checks
+
+For an existing failed run on the current PR head, rerun it directly:
+
+```bash
+gh run rerun <run-id> --repo NVIDIA/Megatron-LM
+```
+
+After a new fork-head commit, no NVIDIA `pull-request/<PR>` run exists for that
+SHA. In that case, post the signed full SHA to create one:
+
+```bash
+gh pr comment <PR number> --repo NVIDIA/Megatron-LM \
+  --body "/ok to test <full signed SHA>"
+```
+
+`copy-pr-bot` mirrors the SHA and triggers the GitHub workflows. This is
+separate from the internal GitLab functional-CI helper below; never push
+directly to NVIDIA's repository.
+
+## Triggering Internal GitLab CI
 
 Use `tools/trigger_internal_ci.py` after the internal GitLab remote and
 `GITLAB_TOKEN` are configured; see @tools/trigger_internal_ci.md for setup
