@@ -100,6 +100,37 @@ def _make_hybrid_args(*, num_layers=4, hidden_size=512, num_attention_heads=8, s
     return args
 
 
+def _make_dsa_args(**overrides):
+    """Minimal args for absorbed MLA with Dynamic Sparse Attention."""
+    values = {
+        "num_layers": 1,
+        "hidden_size": 8,
+        "num_attention_heads": 2,
+        "seq_length": 4,
+        "swiglu": False,
+        "ffn_hidden_size": 0,
+        "padded_vocab_size": 128,
+    }
+    values.update(overrides)
+    args = _make_gpt_args(**values)
+    args.multi_latent_attention = True
+    args.group_query_attention = False
+    args.experimental_attention_variant = "dsa"
+    args.q_lora_rank = 4
+    args.kv_lora_rank = 3
+    args.qk_head_dim = 2
+    args.qk_pos_emb_head_dim = 1
+    args.v_head_dim = 2
+    args.dsa_indexer_n_heads = 2
+    args.dsa_indexer_head_dim = 2
+    args.dsa_indexer_topk = 2
+    args.dsa_indexer_topk_freq = 1
+    args.dsa_indexer_skip_topk_offset = 0
+    args.dsa_indexer_loss_coeff = 0.001
+    args.dsa_indexer_use_sparse_loss = True
+    return args
+
+
 class TestBSHDBackwardCompat:
     """For unpacked BSHD, the new optional arg must not change the result."""
 
@@ -149,6 +180,83 @@ class TestBSHDBackwardCompat:
         )
 
         assert default_flops == explicit_flops
+
+
+class TestDynamicSparseAttentionFlops:
+    """Closed-form training FLOPs for absorbed MLA with Dynamic Sparse Attention."""
+
+    def test_dsa_exact_toy_formula(self):
+        """A one-layer toy covers absorbed sparse MLA and every lightning-indexer matmul."""
+        # At S=4 and top-k=2, the causal selected counts are [1, 2, 2, 2],
+        # while the dense indexer sees [1, 2, 3, 4]. The independently reduced
+        # per-token terms are:
+        #   MLA projections: 906; sparse QK+AV: 147
+        #   indexer projections (forward+wgrad): 192
+        #   index scores (dense forward 30 + sparse-loss backward 42): 72
+        #   sparse detached teacher QK (forward only): 28
+        #   vocabulary projection: 6144
+        expected = 4 * (906 + 147 + 192 + 72 + 28 + 6144)
+
+        assert num_floating_point_operations(_make_dsa_args(), batch_size=1) == expected
+
+    def test_dsa_sequence_length_and_topk_scaling(self):
+        """Sparse MLA saturates at top-k while the lightning indexer remains quadratic."""
+        short = num_floating_point_operations(_make_dsa_args(), batch_size=1)
+        long = num_floating_point_operations(_make_dsa_args(seq_length=8), batch_size=1)
+        wider_topk_args = _make_dsa_args()
+        wider_topk_args.dsa_indexer_topk = 4
+        wider_topk = num_floating_point_operations(wider_topk_args, batch_size=1)
+
+        # S=8, k=2: average sparse context is 15/8 and dense causal context is 9/2.
+        assert long == 60_228
+        assert long > 2 * short
+        # S=4, k=4 raises average sparse context from 7/4 to 5/2. Sparse QK/AV,
+        # the sparse-loss score backward, and the sparse teacher target change;
+        # top-k comparisons are not FLOPs.
+        assert wider_topk - short == 372
+
+    def test_dsa_index_sharing_cadence_and_offset(self):
+        """Only full IndexShare layers pay indexer projection, score, and teacher work."""
+        no_sharing_args = _make_dsa_args(num_layers=6)
+        no_sharing_args.dsa_indexer_topk_freq = 1
+        no_sharing = num_floating_point_operations(no_sharing_args, batch_size=1)
+
+        offset_three_args = _make_dsa_args(num_layers=6)
+        offset_three_args.dsa_indexer_topk_freq = 4
+        offset_three_args.dsa_indexer_skip_topk_offset = 3
+        offset_three = num_floating_point_operations(offset_three_args, batch_size=1)
+
+        offset_one_args = _make_dsa_args(num_layers=6)
+        offset_one_args.dsa_indexer_topk_freq = 4
+        offset_one_args.dsa_indexer_skip_topk_offset = 1
+        offset_one = num_floating_point_operations(offset_one_args, batch_size=1)
+
+        # Full layers are [1..6], [1,2,3], and [1,5], respectively. Each full
+        # layer contributes (192 + 72 + 28) FLOPs per token of indexer work.
+        assert no_sharing - offset_three == 3 * 4 * 292
+        assert offset_three - offset_one == 4 * 292
+
+    def test_dsa_detached_indexer_projection_backward_multiplier(self):
+        """Indexer loss adds wgrad, not dgrad, for projections fed by detached inputs."""
+        with_loss = num_floating_point_operations(_make_dsa_args(), batch_size=1)
+        without_loss_args = _make_dsa_args()
+        without_loss_args.dsa_indexer_loss_coeff = 0.0
+        without_loss = num_floating_point_operations(without_loss_args, batch_size=1)
+
+        # Enabling sparse indexer loss adds one projection wgrad (96/token),
+        # score gradients over the selected top-k context only (42/token),
+        # and teacher QK (28/token).
+        assert with_loss - without_loss == 4 * (96 + 42 + 28)
+
+    def test_dsa_mtp_layer_has_independent_sparse_attention_and_indexer(self):
+        """MTP1 adds one full DSA layer because MCore restarts MTP layer numbering at one."""
+        decoder_only = num_floating_point_operations(_make_dsa_args(), batch_size=1)
+        with_mtp_args = _make_dsa_args()
+        with_mtp_args.mtp_num_layers = 1
+        with_mtp = num_floating_point_operations(with_mtp_args, batch_size=1)
+
+        # Added per-token work: DSA layer 1345 + MTP norms/eh-proj 912 + logits 6144.
+        assert with_mtp - decoder_only == 4 * (1345 + 912 + 6144)
 
 
 class TestTHDScaling:
