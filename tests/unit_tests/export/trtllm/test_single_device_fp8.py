@@ -17,6 +17,7 @@ from megatron.core.export.model_type import ModelType
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.pipeline_parallel.schedules import get_forward_backward_func
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tokenizers import MegatronTokenizer
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
@@ -47,6 +48,7 @@ def _model_provider():
         transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
         vocab_size=100,
         max_sequence_length=SEQUENCE_LENGTH,
+        pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
     )
 
     return gpt_model

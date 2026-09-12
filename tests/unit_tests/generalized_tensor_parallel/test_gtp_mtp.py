@@ -23,6 +23,7 @@ import pytest
 import torch
 import torch.distributed as dist
 
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
 
 if not HAVE_GTP:
@@ -115,6 +116,7 @@ def _build_mtp_gpt_model(repeated_layer=False, moe=False):
         pre_process=True,
         post_process=True,
         mtp_block_spec=get_gpt_mtp_block_spec(config, spec, use_transformer_engine=True),
+        pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
     ).cuda()
 
 

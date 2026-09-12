@@ -43,6 +43,7 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
 )
 from megatron.core.models.hybrid.hybrid_layer_specs import gated_delta_product_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.packed_seq_helpers import check_fla_sequence_packing_support
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.attention import HAVE_FA3, HAVE_FA4, Attention
@@ -159,6 +160,7 @@ class TestGDPCudaGraphE2E:
             hybrid_layer_pattern="M*-",
             pre_process=parallel_state.is_pipeline_first_stage(),
             post_process=parallel_state.is_pipeline_last_stage(),
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         ).cuda()
         for param in model.parameters():
             param.data = param.data.to(config.params_dtype)

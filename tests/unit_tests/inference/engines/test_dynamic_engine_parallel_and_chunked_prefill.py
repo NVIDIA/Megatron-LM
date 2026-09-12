@@ -28,6 +28,7 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.models.hybrid.hybrid_model import HybridModel
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.gated_delta_net import HAVE_FLA
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
@@ -320,6 +321,7 @@ class TestChunkedPrefillCudaGraphs:
                 parallel_output=True,
                 pre_process=parallel_state.is_pipeline_first_stage(),
                 post_process=parallel_state.is_pipeline_last_stage(),
+                pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
             ).cuda()
         elif model_provider == "hybrid":
             config = TransformerConfig(
@@ -346,6 +348,7 @@ class TestChunkedPrefillCudaGraphs:
                 hybrid_layer_pattern="M*-",
                 pre_process=parallel_state.is_pipeline_first_stage(),
                 post_process=parallel_state.is_pipeline_last_stage(),
+                pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
             ).cuda()
         else:
             raise ValueError(f"Invalid model_provider {model_provider}")

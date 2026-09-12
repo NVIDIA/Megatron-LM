@@ -64,6 +64,7 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.hybrid.hybrid_layer_specs import gated_delta_product_inference_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.gated_delta_product import GatedDeltaProductMixer
 from megatron.core.ssm.ops.gdp.chunk import chunk_gated_delta_product_varlen
 from megatron.core.ssm.ops.gdp.fused_recurrent import fused_recurrent_gated_delta_rule_update
@@ -185,6 +186,7 @@ def _build_model(tp: int = 1) -> HybridModel:
         vocab_size=_VOCAB_SIZE,
         max_sequence_length=_MAX_SEQ_LEN,
         hybrid_layer_pattern=_LAYER_PATTERN,
+        pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
     )
     return model.cuda().eval()
 
@@ -580,6 +582,7 @@ class TestGDPDynamicInferenceEngine:
             hybrid_layer_pattern=_LAYER_PATTERN,
             pre_process=parallel_state.is_pipeline_first_stage(),
             post_process=parallel_state.is_pipeline_last_stage(),
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         ).cuda()
         for param in model.parameters():
             param.data = param.data.to(config.params_dtype)

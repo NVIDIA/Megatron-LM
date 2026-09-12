@@ -29,6 +29,7 @@ from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_inference_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.mamba_mixer import _check_mamba_sequence_packing_support
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.attention import HAVE_FA3, HAVE_FA4
@@ -163,6 +164,7 @@ class _TestDynamicInferenceBase:
             vocab_size=self.VOCAB_SIZE,
             max_sequence_length=self.MAX_SEQ_LEN,
             hybrid_layer_pattern="ME*",
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
         model.cuda()
         model.eval()
@@ -300,6 +302,7 @@ class TestDynamicInferenceNVLS(_TestDynamicInferenceBase):
             vocab_size=self.VOCAB_SIZE,
             max_sequence_length=self.MAX_SEQ_LEN,
             hybrid_layer_pattern="ME*",
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         ).cuda()
         model.eval()
 

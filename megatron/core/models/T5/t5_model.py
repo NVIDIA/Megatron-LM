@@ -158,7 +158,7 @@ class T5Model(LanguageModule):
         pg_collection: ProcessGroupCollection = None,
     ):
 
-        super(T5Model, self).__init__(config=config)
+        super(T5Model, self).__init__(config=config, pg_collection=pg_collection)
 
         self.config: TransformerConfig = config
         self.encoder_config: TransformerConfig = encoder_config

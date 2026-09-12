@@ -65,6 +65,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.models.hybrid.hybrid_model import HybridModel
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.gated_delta_net import HAVE_FLA
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
@@ -698,6 +699,7 @@ class DynamicInferenceEngineTestBase:
                 post_process=parallel_state.is_pipeline_last_stage(),
                 mtp_block_spec=mtp_block_spec,
                 position_embedding_type=test_config.position_embedding_type,
+                pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
             ).cuda()
         elif test_config.model_provider == "hybrid":
             is_gdn = test_config.ssm_mixer == "gdn"
@@ -774,6 +776,7 @@ class DynamicInferenceEngineTestBase:
                 hybrid_layer_pattern=mamba_pattern,
                 pre_process=parallel_state.is_pipeline_first_stage(),
                 post_process=parallel_state.is_pipeline_last_stage(),
+                pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
             ).cuda()
         else:
             raise ValueError(f"Invalid model provider {test_config.model_provider}")

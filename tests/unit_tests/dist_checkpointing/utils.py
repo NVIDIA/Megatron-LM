@@ -16,6 +16,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 )
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.optimizer.optimizer import ChainedOptimizer
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from megatron.core.utils import unwrap_model
@@ -54,6 +55,7 @@ def initialize_gpt_model(
         max_sequence_length=4,
         pre_process=pre_process,
         post_process=post_process,
+        pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
     )
 
     with torch.no_grad():
@@ -106,6 +108,7 @@ def initialize_moe_model(
         max_sequence_length=4,
         pre_process=pre_process,
         post_process=post_process,
+        pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
     )
 
     model.bfloat16()

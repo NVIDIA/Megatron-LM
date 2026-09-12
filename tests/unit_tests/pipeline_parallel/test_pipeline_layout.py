@@ -19,6 +19,7 @@ from megatron.core.num_microbatches_calculator import (
     init_num_microbatches_calculator,
     unset_num_microbatches_calculator,
 )
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import ModelType
 from megatron.core.transformer.multi_token_prediction import mtp_on_this_rank
@@ -104,6 +105,7 @@ def initialize_gpt_model(
                 vp_stage=i,
                 mtp_block_spec=mtp_block_spec,
                 share_embeddings_and_output_weights=False,
+                pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
             )
             .bfloat16()
             .cuda()

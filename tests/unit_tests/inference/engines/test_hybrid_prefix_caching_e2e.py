@@ -57,6 +57,7 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
     TextGenerationController,
 )
 from megatron.core.models.hybrid.hybrid_model import HybridModel
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.cuda_graphs import (
     CudaGraphManager,
@@ -183,6 +184,7 @@ class TestMambaPrefixCachingE2E:
             hybrid_layer_pattern="M*-",
             pre_process=parallel_state.is_pipeline_first_stage(),
             post_process=parallel_state.is_pipeline_last_stage(),
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         ).cuda()
         for param in model.parameters():
             param.data = param.data.to(transformer_config.params_dtype)
