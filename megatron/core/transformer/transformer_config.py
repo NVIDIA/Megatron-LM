@@ -987,6 +987,12 @@ class TransformerConfig(ModelParallelConfig):
     supported in TransformerEngine 2.7.0 and above.
     """
 
+    moe_router_aux_loss_fusion: Optional[bool] = None
+    """Enable fusion for the MoE aux loss only, independently of the fused TopK routing.
+    ``None`` follows ``moe_router_fusion`` and is resolved to a concrete bool in
+    ``__post_init__``.
+    """
+
     moe_apply_probs_on_input: bool = False
     """Apply probs on input of experts instead of applying after activation and glu."""
 
@@ -1550,6 +1556,11 @@ class TransformerConfig(ModelParallelConfig):
                 "value there while FlashAttention ignores it entirely, and a non-finite cap "
                 "produces NaN logits."
             )
+
+        # Unset means "follow moe_router_fusion". Resolve it here so every consumer
+        # downstream reads a plain bool.
+        if self.moe_router_aux_loss_fusion is None:
+            self.moe_router_aux_loss_fusion = self.moe_router_fusion
 
         # Resolve deprecated attention variant spellings up front so that every consumer
         # downstream only has to handle the canonical names. Imported lazily because the
