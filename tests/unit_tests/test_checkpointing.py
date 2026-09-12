@@ -31,6 +31,7 @@ from megatron.training.checkpointing import (
     save_checkpoint,
 )
 from megatron.training.global_vars import set_args
+from megatron.training.train_state import TrainState
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
 
@@ -371,6 +372,7 @@ def test_save_checkpoint(init_model_parallel, create_args, tmp_path_dist_ckpt, c
             assert iteration == int(f.read())
 
         ckpt_dir = args.save / "iter_0000123"
+        train_state_path = ckpt_dir / "train_state.pt"
 
         expected_ckpt_path = None
         if ckpt_format == "torch":
@@ -379,6 +381,13 @@ def test_save_checkpoint(init_model_parallel, create_args, tmp_path_dist_ckpt, c
             expected_ckpt_path = ckpt_dir / ".metadata"
 
         assert os.path.exists(expected_ckpt_path)
+        assert os.path.exists(train_state_path)
+        train_state_dict = torch.load(train_state_path, map_location="cpu", weights_only=True)
+        assert train_state_dict["step"].item() == iteration
+        assert (
+            train_state_dict["floating_point_operations_so_far"].item()
+            == num_floating_point_operations_so_far
+        )
 
 
 @pytest.mark.parametrize("ckpt_format", ["torch"])
@@ -398,6 +407,12 @@ def test_load_checkpoint(
         args.load = ckpt_dir
         args.save = ckpt_dir
         args.save_tokenizer_assets = False
+        args.consumed_train_samples = 11
+        args.skipped_train_samples = 12
+        args.consumed_valid_samples = 13
+        args.do_train = True
+        args.do_valid = False
+        args.do_test = True
         set_args(args)
 
         # Create and save a checkpoint first.
@@ -413,6 +428,29 @@ def test_load_checkpoint(
             iteration, [model], optimizer, opt_param_scheduler, num_floating_point_operations_so_far
         )
 
+        # Make the sidecar differ from legacy checkpoint args to verify it is preferred.
+        sidecar_state = TrainState(
+            step=321,
+            consumed_train_samples=31,
+            skipped_train_samples=32,
+            consumed_valid_samples=33,
+            floating_point_operations_so_far=654,
+            do_train=False,
+            do_valid=True,
+            do_test=False,
+        )
+        sidecar_path = ckpt_dir / "iter_0000123" / "train_state.pt"
+        if torch.distributed.get_rank() == 0:
+            torch.save(sidecar_state.state_dict(), sidecar_path)
+        torch.distributed.barrier()
+
+        args.consumed_train_samples = 0
+        args.skipped_train_samples = 0
+        args.consumed_valid_samples = 0
+        args.do_train = True
+        args.do_valid = False
+        args.do_test = True
+
         # Create new model, optimizer, and scheduler instances to load into.
         new_model = MockModel(config)
         new_optimizer = MockState({"optimizer": "dummy1"})
@@ -423,14 +461,38 @@ def test_load_checkpoint(
             [new_model], new_optimizer, new_opt_param_scheduler, strict=True
         )
 
-        assert loaded_iter == iteration
-        assert loaded_flops == num_floating_point_operations_so_far
+        assert loaded_iter == sidecar_state.step
+        assert loaded_flops == sidecar_state.floating_point_operations_so_far
+        assert args.consumed_train_samples == sidecar_state.consumed_train_samples
+        assert args.skipped_train_samples == sidecar_state.skipped_train_samples
+        assert args.consumed_valid_samples == sidecar_state.consumed_valid_samples
+        assert args.do_train == sidecar_state.do_train
+        assert args.do_valid == sidecar_state.do_valid
+        assert args.do_test == sidecar_state.do_test
 
         for k in model.state_dict():
             assert torch.equal(model.state_dict()[k], new_model.state_dict()[k])
 
         assert new_optimizer.state_dict() == optimizer.state_dict()
         assert new_opt_param_scheduler.state_dict() == opt_param_scheduler.state_dict()
+
+        # Removing the sidecar preserves the legacy mutable-state fallback.
+        if torch.distributed.get_rank() == 0:
+            sidecar_path.unlink()
+        torch.distributed.barrier()
+        args.consumed_train_samples = 0
+        args.skipped_train_samples = 0
+        args.consumed_valid_samples = 0
+
+        loaded_iter, loaded_flops = load_checkpoint(
+            [new_model], new_optimizer, new_opt_param_scheduler, strict=True
+        )
+
+        assert loaded_iter == iteration
+        assert loaded_flops == num_floating_point_operations_so_far
+        assert args.consumed_train_samples == 11
+        assert args.skipped_train_samples == 12
+        assert args.consumed_valid_samples == 13
 
 
 @pytest.mark.parametrize("ckpt_format", ["torch"])
