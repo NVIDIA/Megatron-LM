@@ -21,7 +21,10 @@ from megatron.core.pipeline_parallel.utils import (
 from megatron.core.process_groups_config import ProcessGroupCollection
 
 from .. import parallel_state
-from ..transformer.moe.moe_utils import get_updated_expert_bias
+from ..transformer.moe.moe_utils import (
+    get_updated_expert_bias,
+    get_updated_expert_bias_quantile_balancing,
+)
 from ..transformer.transformer_config import TransformerConfig
 from ..utils import (
     get_attr_wrapped_model,
@@ -326,6 +329,8 @@ def reset_model_temporary_tensors(config: TransformerConfig, model: List[torch.n
                 or "global_aux_loss" in config.moe_router_load_balancing_type
             ) and hasattr(module, 'reset_global_aux_loss_tracker'):
                 module.reset_global_aux_loss_tracker()
+            if getattr(module, 'local_quantile_balancing_histogram', None) is not None:
+                module.local_quantile_balancing_histogram.zero_()
             if getattr(module, 'qb_beta_accum', None) is not None:
                 module.qb_beta_accum.zero_()
                 module.qb_beta_count.zero_()
@@ -374,40 +379,70 @@ def _update_router_expert_bias(
 def _update_router_qb_beta(
     model: List[torch.nn.Module],
     config: TransformerConfig,
-    dp_cp_group: Optional[torch.distributed.ProcessGroup] = None,
+    tp_dp_cp_group: Optional[torch.distributed.ProcessGroup] = None,
 ):
-    """Update the quantile-balancing per-expert bias once per global batch.
+    """Update QB bias using either the gated histogram or original PR implementation."""
+    if not config.moe_router_quantile_balancing_histogram:
+        qb_beta_list = []
+        qb_beta_accum_list = []
+        qb_beta_count_list = []
+        for model_chunk in model:
+            for module in get_attr_wrapped_model(model_chunk, 'modules')():
+                if getattr(module, 'qb_beta_accum', None) is not None and module.training:
+                    qb_beta_list.append(module.qb_beta)
+                    qb_beta_accum_list.append(module.qb_beta_accum)
+                    qb_beta_count_list.append(module.qb_beta_count)
+        if not qb_beta_list:
+            return
+        stacked_beta = torch.stack(qb_beta_list, dim=0)
+        stacked_local_average = torch.stack(
+            [
+                accum / count.clamp(min=1).to(accum.dtype)
+                for accum, count in zip(qb_beta_accum_list, qb_beta_count_list)
+            ],
+            dim=0,
+        )
+        torch.distributed.all_reduce(
+            stacked_local_average, op=torch.distributed.ReduceOp.AVG, group=tp_dp_cp_group
+        )
+        updated = config.moe_router_quantile_balancing_ema * stacked_beta + (
+            1.0 - config.moe_router_quantile_balancing_ema
+        ) * stacked_local_average
+        updated -= updated.mean(dim=-1, keepdim=True)
+        for qb_beta, new_beta in zip(qb_beta_list, updated):
+            qb_beta.copy_(new_beta)
+        return
 
-    Averages each router's accumulated quantile (qb_beta_accum/qb_beta_count) across
-    DP, EMA-blends it with the current qb_beta, re-centers, and writes it back.
-    """
+    """Pool whole-step QB histograms and update the per-expert bias once per global batch."""
     qb_beta_list = []
-    qb_beta_accum_list = []
-    qb_beta_count_list = []
+    histogram_list = []
+    ema_step_list = []
     for model_chunk in model:
         for module in get_attr_wrapped_model(model_chunk, 'modules')():
-            if getattr(module, 'qb_beta_accum', None) is not None and module.training:
+            if (
+                getattr(module, 'local_quantile_balancing_histogram', None) is not None
+                and module.training
+            ):
                 qb_beta_list.append(module.qb_beta)
-                qb_beta_accum_list.append(module.qb_beta_accum)
-                qb_beta_count_list.append(module.qb_beta_count)
+                histogram_list.append(module.local_quantile_balancing_histogram)
+                if getattr(module, 'qb_beta_ema_step', None) is not None:
+                    module.qb_beta_ema_step.add_(1)
+                    ema_step_list.append(module.qb_beta_ema_step)
 
     if len(qb_beta_list) == 0:
         return
 
     stacked_beta = torch.stack(qb_beta_list, dim=0)
-    local_avg_list = [
-        accum / count.clamp(min=1).to(accum.dtype)
-        for accum, count in zip(qb_beta_accum_list, qb_beta_count_list)
-    ]
-    stacked_local_avg = torch.stack(local_avg_list, dim=0)
-
-    torch.distributed.all_reduce(
-        stacked_local_avg, op=torch.distributed.ReduceOp.AVG, group=dp_cp_group
+    stacked_histogram = torch.stack(histogram_list, dim=0)
+    stacked_ema_step = torch.stack(ema_step_list, dim=0) if ema_step_list else None
+    stacked_new_beta = get_updated_expert_bias_quantile_balancing(
+        stacked_histogram,
+        stacked_beta,
+        topk=config.moe_router_topk,
+        ema_beta=config.moe_router_quantile_balancing_ema,
+        ema_step=stacked_ema_step,
+        tp_dp_cp_group=tp_dp_cp_group,
     )
-
-    ema = config.moe_router_quantile_balancing_ema
-    stacked_new_beta = ema * stacked_beta + (1.0 - ema) * stacked_local_avg
-    stacked_new_beta = stacked_new_beta - stacked_new_beta.mean(dim=-1, keepdim=True)
 
     for qb_beta, new_beta in zip(qb_beta_list, stacked_new_beta):
         qb_beta.copy_(new_beta)
@@ -589,7 +624,10 @@ def finalize_model_grads(
             "If you don't need pos_embd_group, you need to explicitly set it to None."
         )
         assert hasattr(pg_collection, 'dp_cp')
-        if config.moe_router_enable_expert_bias:
+        if (
+            config.moe_router_enable_expert_bias
+            or config.moe_router_load_balancing_type == "quantile_balancing"
+        ):
             assert hasattr(pg_collection, 'tp_dp_cp') and pg_collection.tp_dp_cp is not None, (
                 "pg_collection must have tp_dp_cp when " "moe_router_enable_expert_bias is enabled."
             )
@@ -687,7 +725,11 @@ def finalize_model_grads(
         _update_router_expert_bias(model, config, tp_dp_cp_group=tp_dp_cp_group)
 
     if config.moe_router_load_balancing_type == "quantile_balancing":
-        _update_router_qb_beta(model, config, dp_cp_group=dp_cp_group)
+        if pg_collection is None:
+            tp_dp_cp_group = parallel_state.get_tensor_and_data_parallel_group(
+                with_context_parallel=True
+            )
+        _update_router_qb_beta(model, config, tp_dp_cp_group=tp_dp_cp_group)
 
     reset_model_temporary_tensors(config, model)
 
