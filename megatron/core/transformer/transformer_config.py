@@ -4509,18 +4509,11 @@ class MLATransformerConfig(TransformerConfig):
                 raise ValueError("V4.1 MXFP8 indexers require SM100 or later")
             # V4.1's indexed loss kernel uses the original BF16 projections.
             # V4's backward restrictions (dense loss on SM90 / MXFP8) do not apply.
-        for name in (
-            "mla_down_proj_fusion",
-            "bias_activation_fusion",
-            "bias_dropout_fusion",
-            "masked_softmax_fusion",
-            "moe_router_fusion",
-            "moe_permute_fusion",
-            "moe_grouped_gemm",
-            "use_te_activation_func",
-            "use_transformer_engine_op_fuser",
-            "gradient_accumulation_fusion",
-        ):
+        # General MLP/MoE and gradient accumulation fusions use the existing DSv4
+        # implementations and their normal dependency checks. CSA2 does not use
+        # MLA's fused down projection or masked softmax; the standalone TE SwiGLU
+        # activation does not implement the required clamp.
+        for name in ("mla_down_proj_fusion", "masked_softmax_fusion", "use_te_activation_func"):
             if getattr(self, name):
                 raise ValueError(f"Native V4.1 requires {name}=False")
         if self.cuda_graph_impl != "none" or self.enable_cuda_graph:

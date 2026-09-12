@@ -115,7 +115,8 @@ def test_tiny_config_accepts_source_reuse_and_ratio_transition():
         ({"csa2_candidate_source_layer": None}, "Disabled CSA2 candidates"),
         ({"dsa_kernel_backend": "tilelang"}, "dsa_kernel_backend='none' or 'cudnn'"),
         ({"dsa_indexer_precision": "mxfp8"}, "MXFP8 indexers require"),
-        ({"gradient_accumulation_fusion": True}, "gradient_accumulation_fusion=False"),
+        ({"mla_down_proj_fusion": True}, "mla_down_proj_fusion=False"),
+        ({"masked_softmax_fusion": True}, "masked_softmax_fusion=False"),
         ({"dsa_indexer_rotate_activation": True}, "Hadamard"),
         ({"tensor_model_parallel_size": 2}, "tensor_model_parallel_size=1"),
         ({"qk_pos_emb_head_dim": 7}, "rotary dimension"),
@@ -137,6 +138,56 @@ def test_candidates_can_be_disabled():
         csa2_candidate_source_layer=None, csa2_candidate_topk_blocks=0, csa2_candidate_block_size=0
     )
     assert config.csa2_candidate_source_layer is None
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"bias_activation_fusion": True},
+        {"bias_dropout_fusion": True},
+        {"moe_router_fusion": True},
+        {"moe_permute_fusion": True},
+        {"moe_grouped_gemm": True},
+        {"gradient_accumulation_fusion": True},
+        {"moe_grouped_gemm": True, "use_transformer_engine_op_fuser": True},
+        dict.fromkeys(
+            (
+                "bias_activation_fusion",
+                "bias_dropout_fusion",
+                "moe_router_fusion",
+                "moe_permute_fusion",
+                "moe_grouped_gemm",
+                "gradient_accumulation_fusion",
+                "use_transformer_engine_op_fuser",
+            ),
+            True,
+        ),
+    ],
+)
+def test_v41_accepts_existing_mlp_moe_fusions(monkeypatch, options):
+    # Check configuration only; kernel availability is tested independently below.
+    for name in (
+        "fused_permute",
+        "fused_permute_with_probs",
+        "fused_sort_chunks_by_index",
+        "fused_sort_chunks_by_index_with_probs",
+        "fused_unpermute",
+    ):
+        monkeypatch.setattr(f"megatron.core.transformer.moe.moe_utils.{name}", object())
+    config = _make_config(params_dtype=torch.bfloat16, **options)
+    assert all(getattr(config, name) == value for name, value in options.items())
+    assert config.activation_func_clamp_value == 10
+    assert config.moe_router_dtype == "fp32"
+    if options.get("use_transformer_engine_op_fuser"):
+        assert config.moe_use_grouped_tensor
+
+
+def test_v41_preserves_general_fusion_requirements(monkeypatch):
+    monkeypatch.setattr("megatron.core.transformer.moe.moe_utils.fused_permute", None)
+    with pytest.raises(ValueError, match="fused permutation is not available"):
+        _make_config(moe_permute_fusion=True)
+    with pytest.raises(ValueError, match="use_te_activation_func=False"):
+        _make_config(use_te_activation_func=True)
 
 
 @pytest.mark.parametrize("fused_rope", [False, True])
