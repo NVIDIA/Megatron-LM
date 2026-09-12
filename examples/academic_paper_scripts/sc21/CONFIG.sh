@@ -2,25 +2,29 @@
 
 
 # SLURM options.
-export SLURM_PARTITION=<slurm partition, used to feed -p option in slurm>
-export SLURM_ACCOUNT=<slurm account, used to feed -A option in slurm>
+: "${SLURM_PARTITION:?Set SLURM_PARTITION, e.g. batch}"
+: "${SLURM_ACCOUNT:?Set SLURM_ACCOUNT, e.g. my-slurm-account}"
+export SLURM_PARTITION
+export SLURM_ACCOUNT
 
 
 # Source code.
-export MEGATRON_CODE_DIR=<megatron source code directory>
+: "${MEGATRON_CODE_DIR:?Set MEGATRON_CODE_DIR, e.g. /path/to/Megatron-LM}"
+export MEGATRON_CODE_DIR
 
 
 # This variable is used to mount the relevant part of the filesystem
 # inside the docker container. Note that the `MEGATRON_CODE_DIR` and the
 # launch directory already get mounted; this variable should be used to
 # mount the directories that contain the data and tokenizer files.
-export DOCKER_MOUNT_DIR=<megatron dataset and bpe tokenizer vocab path>
+: "${DOCKER_MOUNT_DIR:?Set DOCKER_MOUNT_DIR, e.g. /path/to/data-and-tokenizers}"
+export DOCKER_MOUNT_DIR
 
 
 # Data and tokenizer files.
-MEGATRON_DATA=<path to megatron processed data>
-BPE_VOCAB_FILE=<path to bpe vocab file>
-BPE_MERGE_FILE=<path to bpe merges file>
+: "${MEGATRON_DATA:?Set MEGATRON_DATA, e.g. /path/to/megatron_processed_data}"
+: "${BPE_VOCAB_FILE:?Set BPE_VOCAB_FILE, e.g. /path/to/gpt2-vocab.json}"
+: "${BPE_MERGE_FILE:?Set BPE_MERGE_FILE, e.g. /path/to/gpt2-merges.txt}"
 
 
 # Megatron input parameters.
@@ -53,5 +57,4 @@ export MEGATRON_PARAMS=" ${MEGATRON_EXTRA_PARAMS} \
         --clip-grad 1.0 \
         --fp16 \
 	--loss-scale 8192 "
-
 
