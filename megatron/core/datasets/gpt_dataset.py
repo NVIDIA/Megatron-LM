@@ -311,9 +311,14 @@ class GPTDataset(MegatronDataset):
         # For padded sequences, mask the loss
         loss_mask[labels == self._pad_token_id] = 0.0
 
-        # For padded sequences, ensure the embedding layer can map the token ID
-        tokens[tokens == self._pad_token_id] = 0
-        labels[labels == self._pad_token_id] = 0
+        # Remap only out-of-vocabulary pad ids (for example the -1 sentinel used
+        # when pad collides with another special token). In-vocabulary pad ids
+        # are left unchanged so embedding lookup keeps the tokenizer pad identity.
+        if _is_out_of_vocabulary_token_id(
+            self._pad_token_id, getattr(self.config.tokenizer, "vocab_size", None)
+        ):
+            tokens[tokens == self._pad_token_id] = 0
+            labels[labels == self._pad_token_id] = 0
 
         # Batch padding sequence so we mask the loss
         if idx is None:
@@ -795,6 +800,23 @@ def _build_shuffle_index(
     numpy_random_state.shuffle(shuffle_idx_last)
 
     return numpy.concatenate((shuffle_idx_first, shuffle_idx_last))
+
+
+def _is_out_of_vocabulary_token_id(token_id: int, vocab_size: Optional[int]) -> bool:
+    """Return whether a token id cannot be used as an embedding index.
+
+    Args:
+        token_id (int): Token id to check.
+        vocab_size (Optional[int]): Tokenizer vocabulary size, if known.
+
+    Returns:
+        bool: True when token_id is negative or at/beyond vocab_size.
+    """
+    if token_id < 0:
+        return True
+    if vocab_size is not None and token_id >= vocab_size:
+        return True
+    return False
 
 
 def _get_ltor_masks_and_position_ids(
