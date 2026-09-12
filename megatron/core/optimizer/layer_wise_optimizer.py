@@ -282,8 +282,8 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             m, n = param.data.shape
             if getattr(param, 'is_gtp_weight_remat', False):
                 m = m * getattr(param, 'gtp_remat_size', 1)
-            big, small = max(m, n), min(m, n)
-            return big * small * small
+            small = min(m, n)
+            return m * n * small
 
         def _emit_bucket(
             chunk_params: List[torch.nn.Parameter], shared_embedding: bool = False
@@ -455,6 +455,71 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             param_indices=param_indices if param_indices is not None else [],
             num_optimizer_shards=dp_size,
         )
+
+    @staticmethod
+    def _assign_ns_homes(params: list, gtp_remat_group, tp_group) -> dict:
+        """Assign each param an NS home ``(g_home, t_home)`` in the GTP_remat x TP domain.
+
+        Uses Longest Processing Time (LPT) bin-packing over ``gtp_remat_size * tp_size``
+        bins: sorts params by NS compute cost descending and assigns each to the bin
+        with the least accumulated cost.
+
+        Args:
+            params: List of parameters to assign.
+            gtp_remat_group: The GTP_remat weight-shard process group.
+            tp_group: The TP process group (None when TP is unused).
+
+        Params sharded by neither GTP_remat nor TP (e.g. the MoE router and latent
+        projections) are omitted: they are whole on every rank of the domain, so
+        every rank orthogonalizes its own copy instead of electing a home, and
+        giving them a bin would charge one rank for work all of them do.
+
+        Returns:
+            Dict mapping ``id(param)`` -> ``(g_home, t_home)``.
+        """
+        gtp_remat_size = get_pg_size(gtp_remat_group)
+        tp_size = get_pg_size(tp_group) if tp_group is not None else 1
+        num_bins = gtp_remat_size * tp_size
+        if num_bins <= 1:
+            return {id(p): (0, 0) for p in params}
+
+        def _is_sharded(p):
+            if gtp_remat_size > 1 and getattr(p, 'is_gtp_weight_remat', False):
+                return True
+            return tp_size > 1 and getattr(p, 'partition_dim', -1) not in (None, -1)
+
+        params = [p for p in params if _is_sharded(p)]
+
+        def _ns_cost(p):
+            """Estimate Newton-Schulz compute cost ~ max(M,N) * min(M,N)^2 on the FULL
+            post-gather matrix: reconstruct the GTP_remat extent on dim 0 AND the TP
+            extent on ``partition_dim`` — NS on the home runs on the full matrix, so
+            costing only the GTP_remat axis would skew the bin packing whenever TP > 1.
+            """
+            if p.data.dim() != 2:
+                return p.data.nelement()
+            m, n = p.data.shape
+            if getattr(p, 'is_gtp_weight_remat', False):
+                m = m * getattr(p, 'gtp_remat_size', gtp_remat_size)
+            if tp_size > 1:
+                pd = getattr(p, 'partition_dim', None)
+                if pd == 0:
+                    m = m * tp_size
+                elif pd == 1:
+                    n = n * tp_size
+            small = min(m, n)
+            return m * n * small
+
+        # LPT: assign each param (sorted by cost desc) to the bin with least
+        # accumulated cost. Bin b -> (g_home, t_home) = (b // tp_size, b % tp_size).
+        sorted_params = sorted(params, key=lambda p: -_ns_cost(p))
+        bin_cost = [0] * num_bins
+        assignment = {}
+        for p in sorted_params:
+            min_bin = min(range(num_bins), key=lambda b: bin_cost[b])
+            assignment[id(p)] = (min_bin // tp_size, min_bin % tp_size)
+            bin_cost[min_bin] += _ns_cost(p)
+        return assignment
 
     @staticmethod
     def compute_full_param_layout(
@@ -645,12 +710,108 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         # ``for model_chunk in self.model_chunks`` actually iterates.
         self.model_chunks = model_chunks if model_chunks is not None else []
 
+        # Wire up layer sharding NS home assignment for LayerShardedMuon.
+        # After shard_params, group["params"] contains only this DP rank's assigned params.
+        # We further assign each param to a (g_home, t_home) NS home via _assign_ns_homes.
+        # Dense and expert params are sharded over *different* domains, so the groups
+        # are resolved per param group inside the helper.
+        if pg_collection is not None:
+            self._wire_layer_sharding_ns_homes(optimizers, pg_collection)
+
         # TODO(kunlun, deyuf): potential future perf optimization
         # since allreduce is unchanged and handled by megatron DDP, they're already in
         # contiguous gbuf. So instead of shard param by layer randomly, we can shard by
         # buf range but keep some "extras" to keep boundary weight not sharded.
         # This way each rank do some duplicated work but allgather_v is no longer needed
         # All current distopt optimization can also be potentially applied
+
+    def _wire_layer_sharding_ns_homes(self, optimizers, pg_collection) -> None:
+        """Wire up NS home assignments for any LayerShardedMuon inner optimizers.
+
+        After ``shard_params``, each optimizer's ``group["params"]`` is narrowed to
+        this DP rank's assigned params. Each param group is then matched to the domain
+        it is actually sharded over -- dense params over ``(gtp_remat, tp)``, expert
+        params over ``(expt_gtp_remat, expt_tp)`` -- and the resulting
+        ``(g_home, t_home)`` assignments are pushed onto every ``LayerShardedMuon``
+        found in the wrapped optimizer tree.
+
+        Params sharing a domain are pooled before LPT so the balancing sees all of
+        them at once. A degenerate domain (a single rank) is left unassigned; those
+        groups fall back to plain local Newton-Schulz inside ``LayerShardedMuon.step``.
+        """
+        try:
+            from megatron.core.optimizer.layer_sharded_muon import LayerShardedMuon
+        except ImportError:
+            return
+
+        # Axis groups per family: dense params over (gtp_remat, tp), expert params
+        # over (expt_gtp_remat, expt_tp). Nothing here creates process groups: this
+        # code runs with rank-local inventory, which differs across pipeline and
+        # multimodal stages, so it must never issue a collective.
+        dense_axes = (getattr(pg_collection, 'gtp_remat', None), getattr(pg_collection, 'tp', None))
+        expert_axes = (
+            getattr(pg_collection, 'expt_gtp_remat', None),
+            getattr(pg_collection, 'expt_tp', None),
+        )
+
+        for opt in optimizers:
+            # Unwrap Float16OptimizerWithFloat16Params / FP32Optimizer if present.
+            inner = getattr(opt, 'optimizer', opt)
+            if not isinstance(inner, LayerShardedMuon):
+                continue
+
+            # Match each param group to its domain, pooling params that share one.
+            group_axes: Dict[int, Tuple] = {}
+            domains: Dict[Tuple[int, int], Tuple] = {}
+            for group_index, group in enumerate(inner.param_groups):
+                axes = expert_axes if group.get('is_expert_parallel', False) else dense_axes
+                group_axes[group_index] = axes
+                entry = domains.setdefault((id(axes[0]), id(axes[1])), (axes[0], axes[1], []))
+                entry[2].extend(group['params'])
+
+            group_pgs: Dict[int, Tuple] = group_axes
+
+            assignment: Dict[int, Tuple[int, int]] = {}
+            for gtp_remat_group, tp_group, domain_params in domains.values():
+                gtp_remat_size = get_pg_size(gtp_remat_group)
+                tp_size = get_pg_size(tp_group)
+                if not domain_params or gtp_remat_size * tp_size <= 1:
+                    continue
+                # Reject at wiring time what LayerShardedMuon.step() would reject on
+                # its first call (same condition): a TP-sharded param without the GTP
+                # tag is replicated across the GTP_remat group, and the exchange would
+                # concatenate its copies as dim-0 shards. Failing here surfaces the
+                # misconfiguration at optimizer construction instead of after data
+                # loading and the first forward/backward; the step()-level check
+                # remains as the last line of defense for direct-API users.
+                if gtp_remat_size > 1 and tp_size > 1:
+                    for p in domain_params:
+                        pd = getattr(p, 'partition_dim', None)
+                        if pd not in (None, -1) and not getattr(p, 'is_gtp_weight_remat', False):
+                            raise ValueError(
+                                f"LayerShardedMuon wiring: param of shape {tuple(p.shape)} "
+                                f"is TP-sharded (partition_dim={pd}) but not GTP-sharded "
+                                f"(is_gtp_weight_remat absent/False) while gtp_remat_size="
+                                f"{gtp_remat_size} > 1. The GTP_remat exchange would concatenate "
+                                "replicated copies as shards and silently corrupt the "
+                                "update. Tag the param with is_gtp_weight_remat or run "
+                                "it in a domain without a GTP_remat axis."
+                            )
+                assignment.update(
+                    LayerWiseDistributedOptimizer._assign_ns_homes(
+                        domain_params, gtp_remat_group, tp_group
+                    )
+                )
+                log_single_rank(
+                    logger,
+                    logging.INFO,
+                    f'LayerShardedMuon: assigned {len(domain_params)} params across '
+                    f'{tp_size} x {gtp_remat_size} (TP x GTP_remat) NS homes.',
+                )
+
+            if assignment:
+                inner.set_group_process_groups(group_pgs)
+                inner.set_param_ns_homes(assignment)
 
     def shard_params(self, optimizers, full_param_layouts=None):
         """Shard params across ranks according to the computed param layout.
