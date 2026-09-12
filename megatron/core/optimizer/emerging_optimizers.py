@@ -16,7 +16,7 @@ from typing import Any, Callable, Dict, Literal, Optional, get_args
 import torch
 from torch.optim.optimizer import ParamsT
 
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.process_groups_config import ProcessGroupCollection, resolve_gtp_remat_group
 from megatron.core.utils import (
     get_emerging_optimizers_version,
     get_pg_rank,
@@ -284,6 +284,7 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
             tp_group: torch.distributed.ProcessGroup,
             partition_dim: int | None = None,
             tp_mode_this_group: str = tp_mode,
+            scale_shape: tuple[int, int] | None = None,
         ) -> torch.Tensor:
             log_single_rank(
                 logger,
@@ -292,9 +293,14 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
                 f'{coefficient_type} coefficient, '
                 f'{scale_mode} scale mode, extra_scale_factor={extra_scale_factor}',
             )
-            size = [grad.size(-2), grad.size(-1)]
-            if partition_dim is not None:
-                size[partition_dim] *= get_pg_size(tp_group)
+            if scale_shape is None:
+                size = [grad.size(-2), grad.size(-1)]
+                if partition_dim is not None:
+                    size[partition_dim] *= get_pg_size(tp_group)
+            else:
+                # This overrides only the final Muon scalar; NS still uses grad's physical
+                # shape and partition metadata for its collectives.
+                size = scale_shape
             # Only forward the kwarg when enabled; older emerging_optimizers do not
             # accept it at all, and __init__ has already rejected use_syrk on those.
             ns_kwargs = {"use_syrk": True} if use_syrk else {}
@@ -321,6 +327,7 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         self.elem_size = 2 if fp32_matmul_prec == "medium" else 4  # bf16 vs tf32/fp32
         self._tp_mode_cache: Dict[tuple, str] = {}
         self._hw_profile = _hardware_profile() if tp_mode == "auto" else None
+        self._warned_qkv_split_disabled = False
 
         weight_decay_method = "decoupled" if use_decoupled_weight_decay else "l2"
         # Use explicit class call instead of super() so that subclasses with
@@ -381,7 +388,9 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
             )
         return self._tp_mode_cache[key]
 
-    def scaled_orthogonalize_fn_with_gtp_remat(self, p, grad, tp_group, partition_dim):
+    def scaled_orthogonalize_fn_with_gtp_remat(
+        self, p, grad, tp_group, partition_dim, qkv_split_shapes=None
+    ):
         """Orthogonalize a (possibly GTP-sharded) momentum, then reshard.
 
         When GTP is inactive this is a plain passthrough to ``scaled_orthogonalize_fn``.
@@ -397,15 +406,22 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         GTP_remat may pad dim 0 for alignment (see gtp_remat_shard_dim0). blockwise and
         duplicated strip the padding before calling scaled_orthogonalize_fn and restore it
         after, since every rank holds a uniform, fully-reconstructed tensor by then.
-        distributed does not: it stays row-sharded through its own collective, where
-        stripping isn't safe (known limitation).
+        distributed keeps the padding needed by its collective, but applies Muon's scale
+        factor using the unpadded logical matrix shape.
+
+        ``qkv_split_shapes`` (when set) runs Newton-Schulz on q, k and v separately. The
+        split needs the whole matrix, so under GTP it is available on the duplicated path
+        only -- blockwise and distributed fall back to whole-matrix NS and warn once.
         """
+        if qkv_split_shapes is not None and not qkv_split_shapes:
+            raise ValueError(
+                "qkv_split_shapes must be None (no split) or non-empty; got an empty sequence"
+            )
+
         # TODO: Clean up code that determines if parameter is a MoE layer and which TP group to use
         is_expert = getattr(p, 'expert_tp', False)
         gtp_remat_group = (
-            (self.pg_collection.expt_gtp_remat if is_expert else self.pg_collection.gtp_remat)
-            if self.pg_collection
-            else None
+            resolve_gtp_remat_group(self.pg_collection, is_expert) if self.pg_collection else None
         )
 
         # Parameters with is_gtp_weight_remat=False are not sharded along the
@@ -420,20 +436,76 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
 
         mode = self.tp_mode
         if mode == "auto":
-            # Scoped to dense (GTP) weights for now; expert weights keep today's default.
-            mode = (
-                self._resolve_tp_mode(p.shape[0] * gtp_remat_size, p.shape[1], gtp_remat_size)
-                if gtp_active and not is_expert
-                else "duplicated"
+            if qkv_split_shapes is not None:
+                # Only duplicated can honor a split; the cost model below doesn't know
+                # that, so pin it here instead of letting the shape decide.
+                mode = "duplicated"
+            else:
+                # Scoped to dense (GTP) weights for now; expert weights keep today's default.
+                mode = (
+                    self._resolve_tp_mode(p.shape[0] * gtp_remat_size, p.shape[1], gtp_remat_size)
+                    if gtp_active and not is_expert
+                    else "duplicated"
+                )
+
+        def orthogonalize_whole_matrix(whole_grad):
+            """Orthogonalize `whole_grad`, splitting [q|k|v] first when asked.
+
+            `whole_grad` is always the WHOLE matrix -- GTP is inactive, or the caller
+            has already gathered. A row shard would cut q/k/v mid-boundary.
+            """
+            if qkv_split_shapes is None:
+                return self.scaled_orthogonalize_fn(
+                    whole_grad, tp_group, partition_dim, tp_mode_this_group=mode
+                )
+            qkv_rows = sum(qkv_split_shapes)
+            if whole_grad.size(0) % qkv_rows != 0:
+                raise RuntimeError(
+                    f"Muon QKV split shape mismatch on the whole matrix: "
+                    f"rows={whole_grad.size(0)}, qkv_split_shapes={qkv_split_shapes} "
+                    f"(sum {qkv_rows}). The row count is decided by the optimizer's qkv "
+                    f"tagging loop (qkv_rows_after_gtp_gather), not here."
+                )
+            num_query_groups = whole_grad.size(0) // qkv_rows
+            cols = whole_grad.size(-1)
+            qkv_grads = torch.split(
+                whole_grad.view(num_query_groups, qkv_rows, cols), qkv_split_shapes, dim=1
             )
+            qkv_grads = [
+                self.scaled_orthogonalize_fn(
+                    g.reshape(-1, cols), tp_group, partition_dim, tp_mode_this_group=mode
+                ).view(num_query_groups, -1, cols)
+                for g in qkv_grads
+            ]
+            return torch.cat(qkv_grads, dim=1).view(whole_grad.shape)
 
         if not gtp_active:
-            return self.scaled_orthogonalize_fn(
-                grad, tp_group, partition_dim, tp_mode_this_group=mode
-            )
+            return orthogonalize_whole_matrix(grad)
 
         gtp_rank = get_pg_rank(gtp_remat_group)
         pad_length = getattr(p, 'pad_length', 0)
+
+        if qkv_split_shapes is not None and mode != "duplicated":
+            # Fall back, not raise: these configs ran before the qkv fix, so an abort
+            # here would break live jobs.
+            if not self._warned_qkv_split_disabled:
+                self._warned_qkv_split_disabled = True
+                debug_name = getattr(p, '_debug_name', '')
+                log_single_rank(
+                    logger,
+                    logging.WARNING,
+                    f"Muon: split-QKV is disabled for GTP-sharded qkv weights under "
+                    f"tp_mode='{mode}'"
+                    + (f" (auto-resolved from '{self.tp_mode}')" if self.tp_mode == "auto" else "")
+                    + (f", first seen on {debug_name}" if debug_name else "")
+                    + "; blockwise/distributed keep the rows sharded, so the q/k/v "
+                    "boundaries are not available on any rank. These weights get "
+                    "whole-matrix Newton-Schulz, which is NOT the update rule the same "
+                    "model gets at TP1. Pass --muon-tp-mode duplicated for a "
+                    "layout-invariant qkv update, or --muon-no-split-qkv to make the "
+                    "whole-matrix rule explicit at every layout.",
+                )
+            qkv_split_shapes = None
 
         if mode == "blockwise":
             # Local block NS on this rank's GTP row-shard (shape [M/gtp_remat_size, K]):
@@ -457,24 +529,32 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
             # holds the same padded tensor), orthogonalize the whole matrix
             # (scaled_orthogonalize_fn handles any TP sharding per tp_mode), reshard dim 0.
             gathered_grad = self._all_gather_tensor(grad, gtp_remat_group, 0)
-            result = self.scaled_orthogonalize_fn(
-                self._strip_pad(gathered_grad, pad_length),
-                tp_group,
-                partition_dim,
-                tp_mode_this_group=mode,
-            )
+            result = orthogonalize_whole_matrix(self._strip_pad(gathered_grad, pad_length))
             result = self._restore_pad(result, pad_length)
             reshard_size = result.size(0) // gtp_remat_size
             return result[gtp_rank * reshard_size : (gtp_rank + 1) * reshard_size].contiguous()
 
         # distributed: NS via the small-Gram all-reduce (no redundant full-matrix NS).
+        # QKV splitting has already fallen back to this unsplit fused layout above, so
+        # pad_length describes grad's full dim-0 layout here. Keep the physical rows for
+        # the collective, but exclude them from Muon's shape-based scale.
+        scale_shape = None
+        if pad_length:
+            if grad.shape != p.shape:
+                raise RuntimeError(
+                    "Distributed GTP Muon padding requires the momentum and parameter "
+                    f"layouts to match, got grad={tuple(grad.shape)} and p={tuple(p.shape)}"
+                )
+            size = [grad.size(-2) * gtp_remat_size - pad_length, grad.size(-1)]
+            if partition_dim is not None:
+                size[partition_dim] *= get_pg_size(tp_group)
+            scale_shape = (size[0], size[1])
+
         # A momentum with both TP and GTP as sharding axes takes two communication steps: an
         # all-gather that eliminates one axis, then the Gram all-reduce that distributes NS over
         # the other. With GTP as the only sharding axis, the Gram all-reduce is the only
         # communication needed. partition_dim is what says whether TP is a sharding axis here,
         # the same signal scaled_orthogonalize_fn and newton_schulz_tp key off.
-        #
-        # GTP_remat's alignment padding is not corrected for here -- see the class docstring.
         needs_two_step_communication = (
             partition_dim is not None and tp_group is not None and get_pg_size(tp_group) > 1
         )
@@ -482,7 +562,11 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         if not needs_two_step_communication:
             # GTP is the only sharding axis: distribute NS over it on the local dim-0 row shard.
             return self.scaled_orthogonalize_fn(
-                grad, gtp_remat_group, partition_dim=0, tp_mode_this_group=mode
+                grad,
+                gtp_remat_group,
+                partition_dim=0,
+                tp_mode_this_group=mode,
+                scale_shape=scale_shape,
             )
 
         # GTP + TP: distributed NS can only operate over one (group, dim) at a
@@ -499,7 +583,11 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
 
         gathered_grad = self._all_gather_tensor(grad, smaller_group, smaller_dim)
         orthogonalized_grad = self.scaled_orthogonalize_fn(
-            gathered_grad, larger_group, larger_dim, tp_mode_this_group=mode
+            gathered_grad,
+            larger_group,
+            larger_dim,
+            tp_mode_this_group=mode,
+            scale_shape=scale_shape,
         )
         shard_size = orthogonalized_grad.size(smaller_dim) // get_pg_size(smaller_group)
         reshard_rank = get_pg_rank(smaller_group)
@@ -532,39 +620,18 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         if partition_dim == -1:
             partition_dim = None
 
+        # Look up the shapes only. `grad` is still this rank's row shard here, so the
+        # split has to wait until the callee has gathered the whole matrix.
+        qkv_split_shapes = None
         if self.split_qkv and self.is_qkv_fn(p):  # type: ignore[misc]
-            grad_shape = grad.shape
             qkv_split_shapes = getattr(p, "qkv_split_shapes", None)
             if qkv_split_shapes is None:
                 qkv_split_shapes = self.qkv_split_shapes
-            if qkv_split_shapes is None:
+            if not qkv_split_shapes:
                 raise RuntimeError("Muon QKV split requested but qkv_split_shapes is not set")
-            qkv_split_dim = sum(qkv_split_shapes)
-            if grad_shape[0] % qkv_split_dim != 0:
-                raise RuntimeError(
-                    f"Muon QKV split shape mismatch: grad_shape={tuple(grad_shape)}, "
-                    f"split_shapes={qkv_split_shapes}"
-                )
-            log_single_rank(
-                logger,
-                logging.DEBUG,
-                f'qkv split grad shape {grad_shape}, split shapes {qkv_split_shapes}',
-            )
-            num_query_groups = grad_shape[0] // qkv_split_dim
-            qkv_grads = torch.split(
-                grad.view(num_query_groups, qkv_split_dim, -1), qkv_split_shapes, dim=1
-            )
-            qkv_grads = [g.reshape(-1, grad_shape[-1]) for g in qkv_grads]
-
-            qkv_grads = [
-                self.scaled_orthogonalize_fn_with_gtp_remat(p, g, tp_group, partition_dim).view(
-                    num_query_groups, -1, grad_shape[-1]
-                )
-                for g in qkv_grads
-            ]
-            grad = torch.cat(qkv_grads, dim=1).view(grad_shape)
-        else:
-            grad = self.scaled_orthogonalize_fn_with_gtp_remat(p, grad, tp_group, partition_dim)
+        grad = self.scaled_orthogonalize_fn_with_gtp_remat(
+            p, grad, tp_group, partition_dim, qkv_split_shapes=qkv_split_shapes
+        )
         return grad
 
 
