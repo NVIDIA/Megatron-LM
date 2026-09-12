@@ -1171,6 +1171,8 @@ class InferenceGroupedMLP(TEGroupedMLP):
     - Inference + eager: torch.nn.functional.grouped_mm with GPU-resident cumsum offsets
     """
 
+    _serving_weights_canonical = False
+
     def __init__(
         self,
         num_local_experts: int,
@@ -1188,9 +1190,19 @@ class InferenceGroupedMLP(TEGroupedMLP):
             name=name,
         )
 
-        # Concatenated weights are built lazily on first forward to ensure
-        # checkpoint loading has already populated the per-expert parameters.
+        # Trainable models pack lazily after checkpoint loading.
         self._concatenated_weights_built = False
+
+        # Inference-only models share parameter and serving storage.
+        # MXFP8 retains high-precision parameters for refits.
+        self._serving_weights_canonical = config.inference_only and not (
+            config.fp8 and config.fp8_recipe == Fp8Recipe.mxfp8
+        )
+        if self._serving_weights_canonical and self.linear_fc1.weight0.device.type != 'meta':
+            # Pack in the caller's allocation region to support offloading and
+            # release the original expert storage before loading weights.
+            self._build_concatenated_weights()
+            self._concatenated_weights_built = True
 
         if HAVE_FLASHINFER:
             self._flashinfer_activation_type = self._resolve_flashinfer_activation_type()
@@ -1332,19 +1344,13 @@ class InferenceGroupedMLP(TEGroupedMLP):
         return True
 
     @torch.inference_mode(False)  # needed for non-colocated inference.
+    @torch.no_grad()
     def _build_concatenated_weights(self):
-        """Create big contiguous weight tensors that share storage with TE's per-expert parameters.
+        """Pack TE expert weights into serving buffers with stable CUDA-graph addresses.
 
-        Creates _fc1_weight and _fc2_weight as contiguous tensors of shape
-        [num_experts, out_features, in_features]. Instead of replacing TE's parameters
-        (which breaks TE's internal bookkeeping), we redirect each parameter's .data
-        to be a view into the contiguous buffer. The nn.Parameter objects themselves
-        remain untouched in TE's module, preserving FP8 scaling state, etc.
-
-        This allows:
-        - TE's forward to work correctly (same Parameter objects, same internal state)
-        - Training updates to flow through (param.data is a view into the big tensor)
-        - torch.nn.functional.grouped_mm / FlashInfer to use the big tensor directly
+        Trainable models retain optimizer/DDP-owned storage and copy on refresh.
+        Inference-only models alias parameters into the buffers, retaining one copy
+        without replacing TE's Parameter objects.
         """
         # Get device/dtype from existing TE weights
         device = self.linear_fc1.weight0.device
@@ -1357,23 +1363,71 @@ class InferenceGroupedMLP(TEGroupedMLP):
         _fc1_weight = torch.empty(self.num_local_experts, *fc1_shape, device=device, dtype=dtype)
         _fc2_weight = torch.empty(self.num_local_experts, *fc2_shape, device=device, dtype=dtype)
 
-        # Copy existing TE weights into big tensors, then point param.data to the views
-        for i in range(self.num_local_experts):
-            fc1_param = getattr(self.linear_fc1, f'weight{i}')
-            fc2_param = getattr(self.linear_fc2, f'weight{i}')
-
-            # Copy initialized data into contiguous buffer
-            _fc1_weight[i].copy_(fc1_param.data)
-            _fc2_weight[i].copy_(fc2_param.data)
-
-            # Redirect param.data to view into contiguous buffer.
-            # The nn.Parameter object stays the same — TE's internal state is preserved.
-            fc1_param.data = _fc1_weight[i]
-            fc2_param.data = _fc2_weight[i]
-
         # Register big tensors as non-persistent buffers (for .to() device movement, not saved)
         self.register_buffer('_fc1_weight', _fc1_weight, persistent=False)
         self.register_buffer('_fc2_weight', _fc2_weight, persistent=False)
+
+        if self._serving_weights_canonical:
+            self._attach_serving_views()
+        else:
+            # Preserve optimizer/DDP-owned parameter storage.
+            for i in range(self.num_local_experts):
+                _fc1_weight[i].copy_(getattr(self.linear_fc1, f'weight{i}'))
+                _fc2_weight[i].copy_(getattr(self.linear_fc2, f'weight{i}'))
+
+    @torch.no_grad()
+    def _attach_serving_views(self) -> bool:
+        """Copy detached parameters into the serving buffers and rebind them as views.
+
+        Returns:
+            Whether any parameter was reattached.
+        """
+        attached = False
+        for linear, serving_weight in (
+            (self.linear_fc1, self._fc1_weight),
+            (self.linear_fc2, self._fc2_weight),
+        ):
+            for i in range(self.num_local_experts):
+                param = getattr(linear, f'weight{i}')
+                serving_view = serving_weight[i]
+                if param.data.data_ptr() == serving_view.data_ptr():
+                    continue
+                serving_view.copy_(param)
+                param.data = serving_view
+                attached = True
+        return attached
+
+    @torch.inference_mode(False)  # needed for non-colocated inference.
+    @torch.no_grad()
+    def refresh_inference_weights(self) -> bool:
+        """Refresh serving weights in place, preserving CUDA-graph addresses.
+
+        Inference-only models reattach views detached by device/dtype conversion or
+        assigning checkpoint loads; already-attached parameters need no copy.
+
+        Returns:
+            Whether any weights were copied or parameter views reattached.
+        """
+        if not self._concatenated_weights_built:
+            return False
+
+        weight = self.linear_fc1.weight0
+        if isinstance(weight, MXFP8Tensor) or (
+            hasattr(weight, 'data') and isinstance(weight.data, MXFP8Tensor)
+        ):
+            return False
+
+        if self._serving_weights_canonical:
+            return self._attach_serving_views()
+
+        for linear, serving_weight in (
+            (self.linear_fc1, self._fc1_weight),
+            (self.linear_fc2, self._fc2_weight),
+        ):
+            for expert_idx in range(self.num_local_experts):
+                param = getattr(linear, f'weight{expert_idx}')
+                serving_weight[expert_idx].copy_(param)
+        return True
 
     def _flashinfer_forward(self, hidden_states, routing_map, probs):
         """FlashInfer fused MoE kernel for CUDA-graphed inference iterations."""

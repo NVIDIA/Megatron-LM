@@ -69,6 +69,7 @@ from megatron.core.ssm.gated_delta_net import HAVE_FLA
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
 from megatron.core.transformer.enums import CudaGraphModule, InferenceCudaGraphScope
+from megatron.core.transformer.moe.experts import InferenceGroupedMLP, TEGroupedMLP
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_fa_min_version, is_te_min_version
 from tests.unit_tests.inference.engines.ssm_test_helpers import (
@@ -985,6 +986,202 @@ def test_post_process_eviction_requeues_prefix_cached_request_with_fresh_hashes(
     _assert_prefix_cache_checkpoint(request, engine.get_request(request.request_id))
 
 
+@pytest.mark.parametrize(
+    "conversion,device",
+    [
+        ("dtype", "cpu"),
+        ("dtype", "cuda"),
+        ("device", "cuda"),
+        ("assign", "cpu"),
+        ("assign", "cuda"),
+    ],
+)
+def test_init_refreshes_inference_only_experts_before_first_capture(conversion, device):
+    if device == "cuda":
+        # PyTorch caches the capture stream on the first device used.
+        torch.cuda.set_device(Utils.local_rank)
+
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=4,
+        num_attention_heads=1,
+        activation_func=squared_relu,
+        inference_only=True,
+    )
+
+    def init_te_weights(module, num_local_experts, config, **kwargs):
+        # Stub only TE setup; packing, conversion, and checkpoint loading stay real.
+        torch.nn.Module.__init__(module)
+        module.config = config
+        module.num_local_experts = num_local_experts
+        initial_device = "cpu" if conversion == "device" else device
+        for name in ("linear_fc1", "linear_fc2"):
+            linear = torch.nn.Module()
+            for idx in range(num_local_experts):
+                linear.register_parameter(
+                    f"weight{idx}", torch.nn.Parameter(torch.ones(2, 3, device=initial_device))
+                )
+            setattr(module, name, linear)
+
+    with mock.patch.object(TEGroupedMLP, "__init__", init_te_weights):
+        experts = InferenceGroupedMLP(2, config, submodules=None)
+    assert experts._concatenated_weights_built
+    assert experts.linear_fc1.weight0.data_ptr() == experts._fc1_weight[0].data_ptr()
+    model = torch.nn.Sequential(experts)
+    model.config = config
+    if conversion == "dtype":
+        model.double()
+    elif conversion == "device":
+        model.cuda()
+    else:
+        model.load_state_dict(
+            {name: tensor.clone() for name, tensor in model.state_dict().items()}, assign=True
+        )
+    with torch.no_grad():
+        for param in model.parameters():
+            param.fill_(7)
+    assert experts.linear_fc1.weight0.data_ptr() != experts._fc1_weight[0].data_ptr()
+    torch.testing.assert_close(experts._fc1_weight, torch.ones_like(experts._fc1_weight))
+    serving_ptrs = (experts._fc1_weight.data_ptr(), experts._fc2_weight.data_ptr())
+
+    context = mock.Mock(
+        spec=DynamicInferenceContext,
+        config=InferenceConfig(
+            pg_collection=mock.sentinel.pg, async_sched_mode=AsyncScheduleMode.LEGACY
+        ),
+        max_sequence_length=16,
+    )
+    controller = mock.Mock(
+        spec=TextGenerationController,
+        inference_wrapped_model=types.SimpleNamespace(model=model),
+        _async_sched_logits=mock.Mock(),
+    )
+    graph = None
+    serving_sum = None
+
+    def check_weights_before_capture():
+        nonlocal graph, serving_sum
+        for linear, serving in (
+            (experts.linear_fc1, experts._fc1_weight),
+            (experts.linear_fc2, experts._fc2_weight),
+        ):
+            torch.testing.assert_close(serving, torch.full_like(serving, 7))
+            for idx in range(experts.num_local_experts):
+                assert getattr(linear, f"weight{idx}").data_ptr() == serving[idx].data_ptr()
+        assert (experts._fc1_weight.data_ptr(), experts._fc2_weight.data_ptr()) == serving_ptrs
+        if device == "cuda":
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                serving_sum = experts._fc1_weight.sum() + experts._fc2_weight.sum()
+
+    with (
+        mock.patch.object(torch.distributed, "get_rank", return_value=0),
+        mock.patch.object(torch.cuda, "Event") if device == "cpu" else nullcontext(),
+        mock.patch.object(InferenceMode, "set_active"),
+        mock.patch.object(
+            DynamicInferenceEngine, "create_cuda_graphs", side_effect=check_weights_before_capture
+        ) as capture,
+    ):
+        engine = DynamicInferenceEngine(controller, context)
+    capture.assert_called_once()
+    assert engine.state == EngineState.RUNNING
+    assert not experts.refresh_inference_weights()
+    # Subsequent in-place refits remain visible to the first captured graph.
+    with torch.no_grad():
+        for param in model.parameters():
+            param.fill_(9)
+    if graph is not None:
+        graph.replay()
+        torch.testing.assert_close(
+            serving_sum, experts._fc1_weight.sum() + experts._fc2_weight.sum()
+        )
+
+
+@pytest.mark.parametrize("wrapped_model", [False, True])
+def test_resume_refreshes_expert_weights_before_context_and_graphs(wrapped_model):
+    experts = InferenceGroupedMLP.__new__(InferenceGroupedMLP)
+    torch.nn.Module.__init__(experts)
+    experts.num_local_experts = 2
+    experts._concatenated_weights_built = False
+    for linear_name in ('linear_fc1', 'linear_fc2'):
+        linear = torch.nn.Module()
+        for idx in range(experts.num_local_experts):
+            linear.register_parameter(f'weight{idx}', torch.nn.Parameter(torch.ones(2, 3)))
+        setattr(experts, linear_name, linear)
+    experts._build_concatenated_weights()
+    experts._concatenated_weights_built = True
+    serving_ptrs = (experts._fc1_weight.data_ptr(), experts._fc2_weight.data_ptr())
+    parameter_ptrs = [param.data_ptr() for param in experts.parameters()]
+    with torch.no_grad():
+        for param in experts.parameters():
+            param.fill_(7)
+
+    model = torch.nn.Sequential(experts)
+    if wrapped_model:
+        wrapper = torch.nn.Module()
+        wrapper.module = model
+        model = wrapper
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine.controller = types.SimpleNamespace(
+        inference_wrapped_model=types.SimpleNamespace(model=model)
+    )
+    engine.state = EngineState.SUSPENDED
+    engine._weight_epoch = 0
+    engine.unified_memory_level = 0
+    engine.use_coordinator = True
+    engine.requests = {}
+    engine.resume_request_ids = []
+    events = []
+    refresh_weights = experts.refresh_inference_weights
+
+    def refresh():
+        assert engine._weight_epoch == 1
+        events.append('refresh')
+        return refresh_weights()
+
+    def check_weights(event):
+        events.append(event)
+        torch.testing.assert_close(experts._fc1_weight, torch.full((2, 2, 3), 7.0))
+        torch.testing.assert_close(experts._fc2_weight, torch.full((2, 2, 3), 7.0))
+        assert (experts._fc1_weight.data_ptr(), experts._fc2_weight.data_ptr()) == serving_ptrs
+        assert [param.data_ptr() for param in experts.parameters()] == parameter_ptrs
+
+    engine.context = types.SimpleNamespace(
+        reinitialize_inference_state_buffers=lambda: check_weights('context'),
+        kv_cache_management_mode=KVCacheManagementMode.RECOMPUTE,
+        static_kv_memory_pointers=False,
+        chunked_prefill_request_id=-1,
+    )
+    engine.create_cuda_graphs = lambda: check_weights('graphs')
+    with (
+        mock.patch.object(experts, 'refresh_inference_weights', side_effect=refresh),
+        mock.patch.object(DynamicInferenceEngine, 'suspend_resume_ctx', return_value=nullcontext()),
+        mock.patch.object(InferenceMode, 'set_active'),
+        mock.patch.object(torch.cuda, 'synchronize'),
+    ):
+        engine.resume()
+
+    assert events == ['refresh', 'context', 'graphs']
+
+
+@pytest.mark.parametrize("has_experts", [False, True])
+def test_refresh_inference_weights_skips_unmaterialized_buffers(has_experts):
+    model = torch.nn.Sequential()
+    if has_experts:
+        experts = InferenceGroupedMLP.__new__(InferenceGroupedMLP)
+        torch.nn.Module.__init__(experts)
+        experts._concatenated_weights_built = False
+        model.append(experts)
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine.controller = types.SimpleNamespace(
+        inference_wrapped_model=types.SimpleNamespace(model=model)
+    )
+
+    engine._refresh_inference_grouped_mlp_weights()
+
+    assert list(model.buffers()) == []
+
+
 def test_recompute_suspend_resume_readds_prefix_cached_request_with_fresh_hashes():
     """RECOMPUTE suspend/resume must re-add the prefix-enabled checkpoint tail."""
     request = _make_prefix_cached_request_for_checkpoint(request_id=23)
@@ -999,7 +1196,10 @@ def test_recompute_suspend_resume_readds_prefix_cached_request_with_fresh_hashes
     )
     engine.requests = {request.request_id: types.SimpleNamespace(record=record)}
     engine.waiting_request_ids = deque()
-    engine.controller = types.SimpleNamespace(_async_sched_logits=mock.Mock())
+    engine.controller = types.SimpleNamespace(
+        _async_sched_logits=mock.Mock(),
+        inference_wrapped_model=types.SimpleNamespace(model=torch.nn.Sequential()),
+    )
     engine.state = EngineState.RUNNING
     engine.unified_memory_level = 0
     engine.use_coordinator = False

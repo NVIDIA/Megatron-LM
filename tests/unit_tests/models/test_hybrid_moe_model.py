@@ -163,6 +163,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "hierarchical_context_parallel_sizes": None,
     "high_priority_a2a_comm_stream": False,
     "inference_fuse_tp_communication": False,
+    "inference_only": False,
     "inference_rng_tracker": False,
     "inference_sampling_seed": 42,
     "init_method": {},

@@ -1898,6 +1898,8 @@ def pretrain(
 
             # Build an isolated inference config so training config remains unchanged
             inference_config = copy.deepcopy(model_cfg)
+            # This separate model is never DDP-wrapped or optimizer-owned.
+            inference_config.inference_only = True
             if args.rl_inference_tensor_model_parallel_size is not None:
                 inference_config.tensor_model_parallel_size = args.rl_inference_tensor_model_parallel_size
             if args.rl_inference_pipeline_model_parallel_size is not None:
