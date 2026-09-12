@@ -1857,14 +1857,13 @@ class HyperConnectionTransformerLayer(TransformerLayer):
             return
 
         if self.is_moe_layer:
-            # Whole-layer and MLP-scope graphs would capture dynamic MoE dispatch. Mixed
-            # models may still request MLP graphs globally, so leave only this MoE layer eager.
-            if not config.cuda_graph_modules or (
-                CudaGraphModule.mlp in config.cuda_graph_modules
-                and CudaGraphModule.attn not in config.cuda_graph_modules
-            ):
-                return
-
+            # The base manager has no function_name and therefore captures the entire layer,
+            # including dynamic MoE dispatch, regardless of the requested attn/MLP scopes.
+            # Mixed models may still request those scopes globally, so leave only this MoE
+            # layer eager.
+            if hasattr(self, "cudagraph_manager"):
+                del self.cudagraph_manager
+            return
         super().create_mcore_cudagraph_manager(config)
 
     def _get_submodules_under_cudagraphs(self):
