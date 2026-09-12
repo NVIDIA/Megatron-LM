@@ -456,6 +456,15 @@ class TestRLUtils:
         with pytest.raises(AssertionError, match=match):
             self.create_test_args(perform_rl_step=True, **overrides)
 
+    def test_nccl_ub_rejects_rl_grad_buffer_offload(self):
+        with pytest.raises(ValueError, match="unsupported with --use-nccl-ub"):
+            self.create_test_args(
+                perform_rl_step=True,
+                nccl_ub=True,
+                rl_offload_optimizer_during_inference=True,
+                rl_training_cuda_graphs=False,
+            )
+
     @pytest.mark.parametrize(
         "flag", ["--rl-submission-granularity", "--rl-consumption-granularity"]
     )
@@ -1364,6 +1373,12 @@ class TestRLUtils:
         assert (
             initial_sizes == restored_sizes
         ), f"Expected restored sizes {restored_sizes} to match initial {initial_sizes}"
+
+        # Registered buffers must be rejected before their storage is released.
+        all_buffers[0].nccl_mem_pool = object()
+        with pytest.raises(RuntimeError, match="owns an NCCL memory pool"):
+            ddp_model.offload_grad_buffers()
+        assert [buf.grad_data.storage().size() for buf in all_buffers] == restored_sizes
 
     @pytest.mark.parametrize(
         "initialize_model_parallel",
