@@ -21,6 +21,7 @@ from megatron.core.tensor_parallel import (
 )
 from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.moe.fused_a2a import (
+    HYBRIDEP_HANDLE_OVERFLOW_FLAG_INDEX,
     HYBRIDEP_TOKEN_ALIGNMENT,
     alloc_ep_symm_buffer,
     ensure_nccl_ep_bootstrapped,
@@ -1165,9 +1166,9 @@ class _HybridEPManager(_DispatchManager):
             )
         )
         if self.moe_expert_rank_capacity_factor is not None:
-            # Static-budget path only: handle[-1] is HybridEP overflow_flag when tokens were
-            # dropped because permuted count exceeded num_permuted_tokens from setup_metadata.
-            over_budget = self.handle[-1] != 0
+            # Static-budget path only: HybridEP sets overflow_flag when tokens were dropped
+            # because the permuted count exceeded num_permuted_tokens from setup_metadata.
+            over_budget = self.handle[HYBRIDEP_HANDLE_OVERFLOW_FLAG_INDEX] != 0
             self.over_budget |= over_budget
         # When capacity factor is None, skip overflow tracking (no token drops). Actual
         # permuted size is resolved below via tokens_per_expert.sum() (CPU sync).
