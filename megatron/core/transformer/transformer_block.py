@@ -302,17 +302,31 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         )
 
         if get_cpu_offload_context is not None:
-            self.offload_context, self.group_prefetch_offload_commit_async = (
-                get_cpu_offload_context(
-                    self.config.cpu_offloading,
-                    self.config.cpu_offloading_num_layers,
-                    self.config.num_layers,
-                    self.config.cpu_offloading_activations,
-                    self.config.cpu_offloading_weights,
-                    self.config.cpu_offloading_double_buffering,
-                    self.config.cpu_offloading_retain_pinned_cpu_buffers,
-                )
+            # Under full block-wise recompute the recompute loop schedules offloads and
+            # reloads itself (see recompute.CheckpointOffloadScheduler), so request TE's
+            # manual controller instead of its default schedule.
+            use_manual_offload_sync = (
+                self.config.cpu_offloading and self.config.recompute_granularity == 'full'
             )
+            offload_handles = get_cpu_offload_context(
+                self.config.cpu_offloading,
+                self.config.cpu_offloading_num_layers,
+                self.config.num_layers,
+                self.config.cpu_offloading_activations,
+                self.config.cpu_offloading_weights,
+                self.config.cpu_offloading_double_buffering,
+                self.config.cpu_offloading_retain_pinned_cpu_buffers,
+                manual_synchronization=use_manual_offload_sync,
+            )
+            if use_manual_offload_sync:
+                (
+                    self.offload_context,
+                    self.group_prefetch_offload_commit_async,
+                    self.offload_manual_controller,
+                ) = offload_handles
+            else:
+                self.offload_context, self.group_prefetch_offload_commit_async = offload_handles
+                self.offload_manual_controller = None
             self.config._cpu_offloading_context = (
                 self.offload_context if self.config.cpu_offloading else None
             )
@@ -322,6 +336,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             ), "CPU Offloading is enabled when TE is not present"
 
             self.offload_context, self.group_prefetch_offload_commit_async = nullcontext(), None
+            self.offload_manual_controller = None
             self.config._cpu_offloading_context = None
 
         self.mhc_num_residual_streams = config.mhc_num_residual_streams

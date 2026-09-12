@@ -488,6 +488,14 @@ class ModelParallelConfig:
        next iteration. It is useful for cuda graphs capture.
     """
 
+    cpu_offloading_prefetch_num_layers: int = 1
+    """Backward prefetch distance, in layers, when CPU offloading is combined with
+       recompute_granularity='full' and recompute_method='block'. The reload of an
+       offloaded layer's activations starts right before the backward of the layer this
+       many positions above it, so the host-to-device copy overlaps the recompute and
+       backward of those layers. Must be at least 1.
+    """
+
     ###################
     # Timing
     ###################

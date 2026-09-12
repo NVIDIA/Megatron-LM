@@ -1,7 +1,9 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+from collections import defaultdict
 from contextlib import nullcontext
-from typing import List, Optional, Set, Tuple, Union
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
+import torch
 from torch import Tensor
 
 from megatron.core import tensor_parallel
@@ -15,9 +17,95 @@ from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_layer import TransformerLayer
 
 if HAVE_TE:
-    from megatron.core.extensions.transformer_engine import te_checkpoint
+    from megatron.core.extensions.transformer_engine import (
+        te_checkpoint,
+        te_mark_not_offload,
+        te_start_offload,
+    )
 else:
     te_checkpoint = None
+    te_mark_not_offload = None
+    te_start_offload = None
+
+
+class CheckpointOffloadScheduler:
+    """Drive Transformer Engine's manual CPU-offload controller from the block-recompute loop.
+
+    Used when ``cpu_offloading`` is combined with ``recompute_granularity='full'`` and
+    ``recompute_method='block'``. Layer ``i`` is offloaded when ``i < num_offload_layers``.
+    For a checkpointed layer the only tensor autograd saves is the chunk input, so that is
+    what moves to the CPU; a non-checkpointed layer inside the offload window moves every
+    tensor it saves, exactly as on the plain (no-recompute) offload path.
+
+    Forward: once layer ``i`` has been enqueued, its saved tensors start copying to pinned
+    CPU memory on TE's offload stream, and the GPU copies of layer ``i - 1`` are released.
+    The release makes the compute stream wait for that layer's copy, which by then has had
+    a full layer of forward compute to finish.
+
+    Backward: a ``grad_fn`` prehook on the output of layer ``min(i + prefetch, last)``
+    starts the asynchronous reload of layer ``i``. The prehook fires right before that
+    layer's backward (its recompute, when checkpointed), so the host-to-device copy of
+    layer ``i`` overlaps the backward of the ``prefetch`` layers above it. TE's unpack hook
+    waits on the per-tensor reload event before the checkpoint backward reads the tensor.
+    """
+
+    def __init__(
+        self, controller: Any, num_layers: int, num_offload_layers: int, prefetch_num_layers: int
+    ):
+        assert prefetch_num_layers >= 1, "The reload prefetch distance must be at least one layer."
+        self.controller = controller
+        self.num_layers = num_layers
+        self.num_offload_layers = max(0, min(num_offload_layers, num_layers))
+        self.prefetch_num_layers = prefetch_num_layers
+        # Offloaded layers whose GPU copies have not been released yet, in layer order.
+        self._pending_release: List[int] = []
+        # Layer whose backward triggers a reload -> offloaded layers reloaded at that point.
+        self._reload_triggers: Dict[int, List[int]] = defaultdict(list)
+        for layer_idx in range(self.num_offload_layers):
+            trigger = min(layer_idx + prefetch_num_layers, num_layers - 1)
+            self._reload_triggers[trigger].append(layer_idx)
+
+    def is_offloaded(self, layer_idx: int) -> bool:
+        """Whether the saved tensors of ``layer_idx`` are moved to the CPU."""
+        return layer_idx < self.num_offload_layers
+
+    @staticmethod
+    def mark_ready(*tensors: Optional[Tensor]) -> None:
+        """Record on the current stream that ``tensors`` are complete.
+
+        TE keys the start of each device-to-host copy on this event. The checkpoint input
+        is final before its layer runs, so recording it here lets the copy start underneath
+        the layer's forward instead of after it.
+        """
+        ready = tuple(t for t in tensors if isinstance(t, Tensor))
+        if te_start_offload is not None and ready:
+            te_start_offload(*ready)
+
+    def after_layer_forward(self, layer_idx: int, output: Tensor) -> None:
+        """Start the offload of ``layer_idx`` and arm the reload it is responsible for."""
+        self._release_below(layer_idx)
+        if self.is_offloaded(layer_idx):
+            self.controller.start_offload_layer(layer_idx)
+            self._pending_release.append(layer_idx)
+
+        to_reload = self._reload_triggers.get(layer_idx)
+        if to_reload and output.grad_fn is not None:
+            controller = self.controller
+            layers = tuple(to_reload)
+
+            def _start_reloads(_grad_outputs):
+                for reload_idx in layers:
+                    controller.start_reload_layer(reload_idx)
+
+            output.grad_fn.register_prehook(_start_reloads)
+
+    def finish_forward(self) -> None:
+        """Release whatever is still pending once every layer has run."""
+        self._release_below(self.num_layers)
+
+    def _release_below(self, layer_idx: int) -> None:
+        while self._pending_release and self._pending_release[0] < layer_idx:
+            self.controller.release_activation_forward_gpu_memory(self._pending_release.pop(0))
 
 
 def checkpointed_forward(
@@ -60,6 +148,40 @@ def checkpointed_forward(
     is_dual_rope = isinstance(rotary_pos_emb, (tuple, list))
     assert not is_dual_rope or len(rotary_pos_emb) == 2, "Dual RoPE input length is not equal to 2"
     rotary_pos_emb = rotary_pos_emb if is_dual_rope else (None, rotary_pos_emb)
+
+    # CPU offloading of saved activations along the recompute path. The block's TE offload
+    # context installs saved-tensor hooks; for a checkpointed layer they see the
+    # ``save_for_backward`` inside CheckpointFunction, i.e. the chunk input.
+    offload_commit = getattr(self, "group_prefetch_offload_commit_async", None)
+    offload_enabled = (
+        torch.is_grad_enabled() and self.config.cpu_offloading and offload_commit is not None
+    )
+    offload_context = self.offload_context if offload_enabled else nullcontext()
+    offload_scheduler: Optional[CheckpointOffloadScheduler] = None
+    if offload_enabled:
+        assert self.config.recompute_method == "block", (
+            "CPU offloading on the recompute path needs recompute_method='block': the TE "
+            "offload context identifies layers by entry count, one layer per entry."
+        )
+        controller = getattr(self, "offload_manual_controller", None)
+        if controller is not None:
+            offload_scheduler = CheckpointOffloadScheduler(
+                controller,
+                self.num_layers_per_pipeline_rank,
+                self.config.cpu_offloading_num_layers,
+                self.config.cpu_offloading_prefetch_num_layers,
+            )
+        # Masks, rotary embeddings and the cross-attention context are shared by every
+        # layer, but the checkpoint saves them per layer. Keep them resident rather than
+        # copying them to the CPU once per layer.
+        if te_mark_not_offload is not None:
+            shared = [
+                t
+                for t in (attention_mask, context, context_mask, *rotary_pos_emb, padding_mask)
+                if isinstance(t, Tensor)
+            ]
+            if shared:
+                te_mark_not_offload(*shared)
 
     def custom(start: int, end: int):
         def custom_forward(
@@ -148,25 +270,38 @@ def checkpointed_forward(
         cf = custom(start, end)
         # Unpack the RoPE tuple as torch cannot save tuples for backward pass.
         args = (hidden_states, attention_mask, context, context_mask, *rotary_pos_emb, padding_mask)
-        if use_checkpoint:
-            # Precision-aware activation checkpoint: TE under FP8/FP4,
-            # tensor_parallel under BF16/FP16/FP32.
-            if self.config.fp8 or self.config.fp4:
-                hidden_states, context = te_checkpoint(
-                    cf,
-                    self.config.distribute_saved_activations,
-                    tensor_parallel.random.get_cuda_rng_tracker,
-                    self.pg_collection.tp,
-                    *args,
-                )
+        if (
+            offload_scheduler is not None
+            and use_checkpoint
+            and offload_scheduler.is_offloaded(start)
+        ):
+            offload_scheduler.mark_ready(hidden_states)
+        with offload_context:
+            if use_checkpoint:
+                # Precision-aware activation checkpoint: TE under FP8/FP4,
+                # tensor_parallel under BF16/FP16/FP32.
+                if self.config.fp8 or self.config.fp4:
+                    hidden_states, context = te_checkpoint(
+                        cf,
+                        self.config.distribute_saved_activations,
+                        tensor_parallel.random.get_cuda_rng_tracker,
+                        self.pg_collection.tp,
+                        *args,
+                    )
+                else:
+                    hidden_states, context = tensor_parallel.checkpoint(
+                        cf, self.config.distribute_saved_activations, *args
+                    )
             else:
-                hidden_states, context = tensor_parallel.checkpoint(
-                    cf, self.config.distribute_saved_activations, *args
-                )
-        else:
-            # Note: original block-branch no-checkpoint path omitted padding_mask
-            # (relied on its default=None); restored here for consistency.
-            hidden_states, context = cf(*args)
+                # Note: original block-branch no-checkpoint path omitted padding_mask
+                # (relied on its default=None); restored here for consistency.
+                hidden_states, context = cf(*args)
+        if offload_enabled:
+            # Registers TE's backward hook on this layer's output; on a checkpointed layer
+            # that is the checkpoint node, so it fires right before the recompute.
+            hidden_states = offload_commit(hidden_states)
+            if offload_scheduler is not None:
+                offload_scheduler.after_layer_forward(start, hidden_states)
 
         if self.config.recompute_method == "uniform":
             if (end - 1 + layer_offset) in extract_layer_indices:
@@ -200,6 +335,8 @@ def checkpointed_forward(
                 and layer_idx < self.config.recompute_num_layers + recompute_skip_num_layers
             )
             chunk_runner(layer_idx, layer_idx + 1, use_checkpoint)
+        if offload_scheduler is not None:
+            offload_scheduler.finish_forward()
     else:
         raise ValueError("Invalid activation recompute method.")
 

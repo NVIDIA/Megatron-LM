@@ -3544,8 +3544,32 @@ try:
         weight_offloading,
         double_buffering,
         retain_pinned_cpu_buffers,
+        manual_synchronization=False,
     ):
-        """Get CPU offload context and sync function."""
+        """Get CPU offload context and sync function.
+
+        With ``manual_synchronization=True`` TE does not schedule offloads or reloads
+        itself; the caller drives them through the manual controller that is returned as
+        a third value ``(context, sync_func, controller)``.
+        """
+        if manual_synchronization:
+            te_params = inspect.signature(_get_cpu_offload_context).parameters
+            if "manual_synchronization" not in te_params:
+                raise RuntimeError(
+                    "Manual CPU-offload synchronization needs a Transformer Engine whose "
+                    "get_cpu_offload_context accepts manual_synchronization."
+                )
+            return _get_cpu_offload_context(
+                enabled,
+                num_layers,
+                model_layers,
+                activation_offloading,
+                weight_offloading,
+                double_buffering,
+                manual_synchronization=True,
+                retain_pinned_cpu_buffers=retain_pinned_cpu_buffers,
+            )
+
         if is_te_min_version("2.10.0"):
             # TE 2.10+ supports retain_pinned_cpu_buffers
             context, sync_func = _get_cpu_offload_context(
@@ -3580,6 +3604,13 @@ try:
 
 except ImportError:
     get_cpu_offload_context = None  # type: ignore[assignment, misc]
+
+try:
+    from transformer_engine.pytorch.cpu_offload import mark_not_offload as te_mark_not_offload
+    from transformer_engine.pytorch.cpu_offload import start_offload as te_start_offload
+except ImportError:
+    te_mark_not_offload = None  # type: ignore[assignment]
+    te_start_offload = None  # type: ignore[assignment]
 
 try:
     if HAVE_TE and is_te_min_version("2.3.0"):

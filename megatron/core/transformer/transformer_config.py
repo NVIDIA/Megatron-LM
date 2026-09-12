@@ -2084,9 +2084,22 @@ class TransformerConfig(ModelParallelConfig):
                 "Currently there is no support for Pipeline parallelism with CPU offloading"
             )
 
-        if self.cpu_offloading and self.recompute_granularity is not None:
+        # CPU offloading is allowed together with full, block-wise activation
+        # checkpointing; every other recompute setting is still rejected.
+        if (
+            self.cpu_offloading
+            and self.recompute_granularity is not None
+            and not (self.recompute_granularity == "full" and self.recompute_method == "block")
+        ):
             raise ValueError(
-                "CPU offloading does not work when activation recomputation is enabled"
+                "CPU offloading does not work when activation recomputation is enabled, "
+                "except for recompute_granularity='full' with recompute_method='block'"
+            )
+
+        if self.cpu_offloading and self.cpu_offloading_prefetch_num_layers < 1:
+            raise ValueError(
+                "cpu_offloading_prefetch_num_layers must be at least 1, got "
+                f"{self.cpu_offloading_prefetch_num_layers}"
             )
 
         if self.recompute_granularity is not None:
