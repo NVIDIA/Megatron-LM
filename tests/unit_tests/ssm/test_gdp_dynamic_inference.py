@@ -465,6 +465,350 @@ class TestGDPDynamicInference:
 
 
 # ======================================================================
+# Speculative decoding.
+#
+# A speculative decode step runs `1 + num_speculative_tokens` tokens per request
+# in a single call, and verification may accept only a prefix of them. The
+# recurrent state therefore has to be recoverable at every draft token, which
+# the decode kernels provide by snapshotting into the context's intermediate
+# conv/SSM buffers -- the contract `MambaMixer` already implements and
+# `TextGenerationController`'s rollback reads back.
+#
+# The reference for snapshot `i` is a decode step over just the first `i + 1`
+# tokens: the same kernels doing the same arithmetic in the same order, with
+# the state landing in the cache rather than in the snapshot buffer. So the two
+# agree bitwise even in bf16, and no tolerance can hide a drifting snapshot.
+# ======================================================================
+
+
+class TestGDPSpeculativeDecode:
+    """Multi-token decode steps and their per-draft-token state snapshots."""
+
+    pytestmark = requires_gdp_model + [requires_cuda]
+
+    _SLOTS = 6
+    _BATCH = 3
+
+    def setup_method(self, method):
+        Utils.initialize_model_parallel(1, 1)
+        model = _build_model(tp=1)
+        self.mixer = next(
+            layer.mixer
+            for layer in model.decoder.layers
+            if getattr(layer, "mixer", None) is not None
+        )
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _caches(self, seed=0):
+        """Non-zero conv/SSM caches, so a dropped carry-in shows up."""
+        torch.manual_seed(seed)
+        conv_shape, ssm_shape = self.mixer.mamba_state_shapes_per_request()
+        dtype = self.mixer.config.params_dtype
+        conv = torch.randn(self._SLOTS, *conv_shape, device="cuda", dtype=dtype)
+        ssm = torch.randn(self._SLOTS, *ssm_shape, device="cuda", dtype=dtype)
+        return conv, ssm
+
+    def _snapshot_buffers(self, seq_len, fill=None):
+        """Per-slot, per-draft-token snapshot buffers, shaped as the context's."""
+        conv_shape, ssm_shape = self.mixer.mamba_state_shapes_per_request()
+        dtype = self.mixer.config.params_dtype
+        make = torch.empty if fill is None else (lambda *a, **kw: torch.full(*a, fill, **kw))
+        return (
+            make((self._SLOTS, seq_len, *conv_shape), device="cuda", dtype=dtype),
+            make((self._SLOTS, seq_len, *ssm_shape), device="cuda", dtype=dtype),
+        )
+
+    def _projected(self, seq_len, seed=0):
+        """A decode step's `in_proj` output: `[batch, seq_len, proj_dim]`."""
+        torch.manual_seed(seed + 1)
+        return torch.randn(
+            self._BATCH,
+            seq_len,
+            self.mixer.in_proj.weight.shape[0],
+            device="cuda",
+            dtype=self.mixer.config.params_dtype,
+        )
+
+    # ------------------------------------------------------------------
+    # Tests
+    # ------------------------------------------------------------------
+
+    @torch.inference_mode()
+    @pytest.mark.parametrize("num_speculative_tokens", [1, 2, 4])
+    def test_snapshots_match_truncated_decode_steps(self, num_speculative_tokens):
+        """Snapshot `i` is the state a step that stopped at draft token `i` leaves."""
+        seq_len = 1 + num_speculative_tokens
+        # Slots deliberately out of order: a snapshot written at the batch
+        # position rather than the cache slot fails here.
+        indices = torch.tensor([4, 0, 3], device="cuda", dtype=torch.int32)
+        projected = self._projected(seq_len)
+        conv_cache, ssm_cache = self._caches()
+        int_conv, int_ssm = self._snapshot_buffers(seq_len)
+
+        self.mixer.ssm_decode(
+            projected,
+            conv_cache.clone(),
+            ssm_cache.clone(),
+            batch_indices=indices,
+            intermediate_conv_state=int_conv,
+            intermediate_ssm_state=int_ssm,
+        )
+
+        slots = indices.long()
+        for accepted in range(seq_len):
+            ref_conv, ref_ssm = conv_cache.clone(), ssm_cache.clone()
+            self.mixer.ssm_decode(
+                projected[:, : accepted + 1].contiguous(), ref_conv, ref_ssm, batch_indices=indices
+            )
+            assert torch.equal(int_conv[slots, accepted], ref_conv[slots]), (
+                f"conv snapshot for draft token {accepted} does not match a decode step "
+                "that stopped there"
+            )
+            assert torch.equal(int_ssm[slots, accepted], ref_ssm[slots]), (
+                f"SSM snapshot for draft token {accepted} does not match a decode step "
+                "that stopped there"
+            )
+
+    @torch.inference_mode()
+    def test_snapshots_do_not_change_the_step(self):
+        """The snapshots are a pure side effect: same output, same final caches.
+
+        The engine captures one decode graph and replays it for every step, so
+        the speculative and non-speculative paths must not diverge beyond the
+        extra stores.
+        """
+        seq_len = 3
+        indices = torch.tensor([2, 5, 0], device="cuda", dtype=torch.int32)
+        projected = self._projected(seq_len)
+        conv_cache, ssm_cache = self._caches()
+
+        projected_before = projected.clone()
+
+        plain_conv, plain_ssm = conv_cache.clone(), ssm_cache.clone()
+        plain_out = self.mixer.ssm_decode(projected, plain_conv, plain_ssm, batch_indices=indices)
+
+        # A decode step without snapshot buffers must not write through them.
+        # Both kernels take the buffers as optional pointers, and substituting a
+        # dummy for a missing one is what broke Mamba2's `selective_state_update`
+        # in 6e5a8c1: the `is not None` heuristic stayed on and the dump
+        # scribbled over the input with all-zero strides.
+        assert torch.equal(projected, projected_before)
+
+        snap_conv, snap_ssm = conv_cache.clone(), ssm_cache.clone()
+        int_conv, int_ssm = self._snapshot_buffers(seq_len)
+        snap_out = self.mixer.ssm_decode(
+            projected,
+            snap_conv,
+            snap_ssm,
+            batch_indices=indices,
+            intermediate_conv_state=int_conv,
+            intermediate_ssm_state=int_ssm,
+        )
+
+        assert torch.equal(plain_out, snap_out)
+        assert torch.equal(plain_conv, snap_conv)
+        assert torch.equal(plain_ssm, snap_ssm)
+        # The last snapshot is where a fully-accepted draft leaves the caches.
+        slots = indices.long()
+        assert torch.equal(int_conv[slots, -1], snap_conv[slots])
+        assert torch.equal(int_ssm[slots, -1], snap_ssm[slots])
+
+    @torch.inference_mode()
+    def test_padding_requests_write_no_snapshot(self):
+        """A `-1` row zeroes its output and touches neither cache nor snapshot.
+
+        Decode batches are padded up to the captured graph's shape, so padding
+        rows run the kernels over whatever the input buffers hold. Nothing they
+        compute may land where a real request can read it.
+        """
+        seq_len = 3
+        indices = torch.tensor([1, -1, 4], device="cuda", dtype=torch.int32)
+        projected = self._projected(seq_len)
+        conv_cache, ssm_cache = self._caches()
+        before_conv, before_ssm = conv_cache.clone(), ssm_cache.clone()
+        int_conv, int_ssm = self._snapshot_buffers(seq_len, fill=float("nan"))
+        sentinel_conv, sentinel_ssm = int_conv.clone(), int_ssm.clone()
+
+        out = self.mixer.ssm_decode(
+            projected,
+            conv_cache,
+            ssm_cache,
+            batch_indices=indices,
+            intermediate_conv_state=int_conv,
+            intermediate_ssm_state=int_ssm,
+        )
+
+        # `ssm_decode` ends in the gated output norm, so a padding row's zeros
+        # only have to survive the recurrence, not the norm's bias-free scaling.
+        assert torch.count_nonzero(out[1]) == 0
+
+        untouched = [0, 2, 3, 5]
+        torch.testing.assert_close(
+            int_conv[untouched], sentinel_conv[untouched], atol=0, rtol=0, equal_nan=True
+        )
+        torch.testing.assert_close(
+            int_ssm[untouched], sentinel_ssm[untouched], atol=0, rtol=0, equal_nan=True
+        )
+        torch.testing.assert_close(
+            conv_cache[untouched], before_conv[untouched], atol=0, rtol=0, equal_nan=True
+        )
+        torch.testing.assert_close(
+            ssm_cache[untouched], before_ssm[untouched], atol=0, rtol=0, equal_nan=True
+        )
+
+    @torch.inference_mode()
+    def test_cuda_graph_capture_and_replay(self):
+        """Capture and replay a speculative decode step, snapshots included.
+
+        Every decode step in the engine is a graph replay, so the snapshot
+        stores have to be capturable: no host synchronization, no
+        data-dependent shapes, and fixed buffer addresses. A replay must
+        reproduce the eager step exactly -- the kernels are the same, and only
+        the launch mechanism differs.
+        """
+        seq_len = 3
+        indices = torch.tensor([3, 0, 5], device="cuda", dtype=torch.int32)
+        projected = self._projected(seq_len)
+        conv_cache, ssm_cache = self._caches()
+
+        eager_conv, eager_ssm = conv_cache.clone(), ssm_cache.clone()
+        # Zero-filled, not `empty`: slots no request names are written by
+        # neither run, so the comparison below only means something if both
+        # sides start from the same value there. It then doubles as a check
+        # that a replay leaves unnamed slots alone.
+        eager_int_conv, eager_int_ssm = self._snapshot_buffers(seq_len, fill=0.0)
+        eager_out = self.mixer.ssm_decode(
+            projected,
+            eager_conv,
+            eager_ssm,
+            batch_indices=indices,
+            intermediate_conv_state=eager_int_conv,
+            intermediate_ssm_state=eager_int_ssm,
+        )
+
+        # Static buffers: capture records these addresses, so replay must find
+        # its inputs here and will write its outputs here.
+        static_projected = projected.clone()
+        graph_conv, graph_ssm = conv_cache.clone(), ssm_cache.clone()
+        graph_int_conv, graph_int_ssm = self._snapshot_buffers(seq_len, fill=0.0)
+
+        def step():
+            return self.mixer.ssm_decode(
+                static_projected,
+                graph_conv,
+                graph_ssm,
+                batch_indices=indices,
+                intermediate_conv_state=graph_int_conv,
+                intermediate_ssm_state=graph_int_ssm,
+            )
+
+        warmup_stream = torch.cuda.Stream()
+        warmup_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(warmup_stream):
+            for _ in range(3):
+                graph_conv.copy_(conv_cache)
+                graph_ssm.copy_(ssm_cache)
+                step()
+        torch.cuda.current_stream().wait_stream(warmup_stream)
+
+        graph = torch.cuda.CUDAGraph()
+        graph_conv.copy_(conv_cache)
+        graph_ssm.copy_(ssm_cache)
+        with torch.cuda.graph(graph):
+            graph_out = step()
+
+        # Reset the caches so the replay -- not the capture-time launch -- is
+        # what produces the values compared below.
+        graph_conv.copy_(conv_cache)
+        graph_ssm.copy_(ssm_cache)
+        graph_int_conv.zero_()
+        graph_int_ssm.zero_()
+        graph.replay()
+        torch.cuda.synchronize()
+
+        assert torch.equal(graph_out, eager_out)
+        assert torch.equal(graph_conv, eager_conv)
+        assert torch.equal(graph_ssm, eager_ssm)
+        assert torch.equal(graph_int_conv, eager_int_conv)
+        assert torch.equal(graph_int_ssm, eager_int_ssm)
+
+    @torch.inference_mode()
+    def test_cuda_graph_replay_tolerates_a_smaller_batch(self):
+        """A graph captured at the padded batch shape replays for fewer requests.
+
+        The engine rounds the decode batch up to a captured shape and marks the
+        leftover rows `-1`. Those rows must not perturb the real ones, snapshots
+        included.
+        """
+        seq_len = 2
+        projected = self._projected(seq_len)
+        conv_cache, ssm_cache = self._caches()
+
+        real = 2
+        padded_indices = torch.tensor([2, 5, -1], device="cuda", dtype=torch.int32)
+
+        # Reference: the same real rows, run eagerly without the padding row.
+        ref_conv, ref_ssm = conv_cache.clone(), ssm_cache.clone()
+        ref_int_conv, ref_int_ssm = self._snapshot_buffers(seq_len, fill=0.0)
+        ref_out = self.mixer.ssm_decode(
+            projected[:real].contiguous(),
+            ref_conv,
+            ref_ssm,
+            batch_indices=padded_indices[:real],
+            intermediate_conv_state=ref_int_conv,
+            intermediate_ssm_state=ref_int_ssm,
+        )
+
+        static_projected = projected.clone()
+        graph_conv, graph_ssm = conv_cache.clone(), ssm_cache.clone()
+        graph_int_conv, graph_int_ssm = self._snapshot_buffers(seq_len, fill=0.0)
+
+        def step():
+            return self.mixer.ssm_decode(
+                static_projected,
+                graph_conv,
+                graph_ssm,
+                batch_indices=padded_indices,
+                intermediate_conv_state=graph_int_conv,
+                intermediate_ssm_state=graph_int_ssm,
+            )
+
+        warmup_stream = torch.cuda.Stream()
+        warmup_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(warmup_stream):
+            for _ in range(3):
+                graph_conv.copy_(conv_cache)
+                graph_ssm.copy_(ssm_cache)
+                step()
+        torch.cuda.current_stream().wait_stream(warmup_stream)
+
+        graph = torch.cuda.CUDAGraph()
+        graph_conv.copy_(conv_cache)
+        graph_ssm.copy_(ssm_cache)
+        with torch.cuda.graph(graph):
+            graph_out = step()
+
+        graph_conv.copy_(conv_cache)
+        graph_ssm.copy_(ssm_cache)
+        graph_int_conv.zero_()
+        graph_int_ssm.zero_()
+        graph.replay()
+        torch.cuda.synchronize()
+
+        assert torch.equal(graph_out[:real], ref_out)
+        assert torch.equal(graph_conv, ref_conv)
+        assert torch.equal(graph_ssm, ref_ssm)
+        assert torch.equal(graph_int_conv, ref_int_conv)
+        assert torch.equal(graph_int_ssm, ref_int_ssm)
+
+
+# ======================================================================
 # End-to-end engine tests.
 #
 # The tests above exercise a single forward pass. These drive the full
