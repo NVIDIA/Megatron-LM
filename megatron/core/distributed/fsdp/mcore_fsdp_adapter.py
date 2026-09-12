@@ -768,7 +768,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                 f"{ddp_config.outer_dp_sharding_strategy!r} requires an outer DP axis, "
                 "i.e. num_distributed_optimizer_instances > 1."
             )
-        if ddp_config.expert_outer_dp_sharding_strategy != "no_shard" and (
+        if ddp_config.expert_outer_dp_sharding_strategy not in (None, "no_shard") and (
             config.expert_model_parallel_size <= 1
             or ddp_config.num_distributed_optimizer_instances <= 1
         ):
@@ -899,7 +899,10 @@ def _build_expert_mesh_and_placements(
             pg_collection.inter_dist_opt, pg_collection.intra_expt_dp, device_type
         )
         inner = _DATA_PARALLEL_PLACEMENTS[inner_strategy]
-        outer = _DATA_PARALLEL_PLACEMENTS[ddp_config.expert_outer_dp_sharding_strategy]
+        expert_outer_strategy = ddp_config.expert_outer_dp_sharding_strategy
+        if expert_outer_strategy is None:
+            expert_outer_strategy = ddp_config.outer_dp_sharding_strategy
+        outer = _DATA_PARALLEL_PLACEMENTS[expert_outer_strategy]
         placements = Placements(
             dp_axes=[0, 1],
             parameter=[outer.parameter, inner.parameter],
