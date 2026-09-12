@@ -194,6 +194,8 @@ jobs:
       dev:            ${{ steps.configure.outputs.dev }}
       cadence:        ${{ steps.configure.outputs.cadence }}
       cadence_bypass: ${{ steps.configure.outputs.cadence_bypass }}
+      selective_tests: ${{ steps.configure.outputs.selective_tests }}
+      unit_test_reason: ${{ steps.configure.outputs.unit_test_reason }}
       sha:            ${{ steps.resolve-sha.outputs.sha }}
     steps:
       - name: Get PR info
@@ -237,15 +239,26 @@ jobs:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           IS_CI_WORKLOAD: ${{ needs.pre-flight.outputs.is_ci_workload }}
           IS_MERGE_GROUP: ${{ needs.pre-flight.outputs.is_merge_group }}
+          IS_PR: ${{ startsWith(github.ref, 'refs/heads/pull-request/') && github.event_name == 'push' }}
+          FORCE_RUN_ALL: ${{ needs.pre-flight.outputs.force_run_all }}
           EVENT_NAME: ${{ github.event_name }}
+          PR_NUMBER: ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }}
+          REPOSITORY: ${{ github.repository }}
         run: |
-          PR_NUMBER=${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }}
-
-          # Fetch all labels in a single API call; fall back to empty list if no PR
-          LABELS=$(gh pr view $PR_NUMBER --repo ${{ github.repository }} --json labels --jq '[.labels[].name]') || LABELS='[]'
+          # A failed lookup must not accidentally discard a full-suite override.
+          LABELS='[]'
+          LABELS_AVAILABLE=true
+          if [[ "$IS_PR" == "true" ]]; then
+            if ! LABELS=$(gh pr view "$PR_NUMBER" --repo "$REPOSITORY" --json labels --jq '[.labels[].name]'); then
+              LABELS='[]'
+              LABELS_AVAILABLE=false
+            fi
+          fi
 
           HAS_RUN_TESTS=$(echo "$LABELS"      | jq 'any(. == "Run tests")')
           HAS_RUN_FUNCTIONAL=$(echo "$LABELS" | jq 'any(. == "Run functional tests")')
+          HAS_SELECTIVE_TESTS=$(echo "$LABELS" | jq 'any(. == "Run selective unit tests")')
+          HAS_FULL_UNIT_TESTS=$(echo "$LABELS" | jq 'any(. == "Run full unit tests")')
           HAS_LTS=$(echo "$LABELS"            | jq 'any(. == "container::lts")')
           HAS_MBRIDGE=$(echo "$LABELS"        | jq 'any(. == "Run MBridge tests")')
           HAS_NEMO_RL=$(echo "$LABELS"        | jq 'any(. == "Run NeMoRL tests")')
@@ -317,6 +330,24 @@ jobs:
 
           DEV=true
 
+          # Unit-test selection is opt-in and independent of functional scope.
+          # Always analyze the entire PR, including its earlier commits.
+          SELECTIVE_TESTS=false
+          if [[ "$IS_PR" != "true" || "$IS_MERGE_GROUP" == "true" || "$IS_CI_WORKLOAD" == "true" ]]; then
+            UNIT_TEST_REASON='non-PR workflows always run the full unit-test suite'
+          elif [[ "$FORCE_RUN_ALL" == "true" ]]; then
+            UNIT_TEST_REASON='pre-flight requested the full test suite'
+          elif [[ "$LABELS_AVAILABLE" != "true" ]]; then
+            UNIT_TEST_REASON='PR labels could not be read safely'
+          elif [[ "$HAS_FULL_UNIT_TESTS" == "true" ]]; then
+            UNIT_TEST_REASON='the Run full unit tests label requested the full suite'
+          elif [[ "$HAS_SELECTIVE_TESTS" == "true" ]]; then
+            SELECTIVE_TESTS=true
+            UNIT_TEST_REASON='Run selective unit tests requested PR-wide analysis plus the baseline'
+          else
+            UNIT_TEST_REASON='no Run selective unit tests label; running the full suite'
+          fi
+
           echo "scope=$SCOPE"                   | tee -a $GITHUB_OUTPUT
           echo "n_repeat=$N_REPEAT"             | tee -a $GITHUB_OUTPUT
           echo "lightweight=$LIGHTWEIGHT"       | tee -a $GITHUB_OUTPUT
@@ -327,6 +358,8 @@ jobs:
           echo "dev=$DEV"                       | tee -a $GITHUB_OUTPUT
           echo "cadence=$CADENCE_OUTPUT"        | tee -a $GITHUB_OUTPUT
           echo "cadence_bypass=$CADENCE_BYPASS" | tee -a $GITHUB_OUTPUT
+          echo "selective_tests=$SELECTIVE_TESTS" | tee -a $GITHUB_OUTPUT
+          echo "unit_test_reason=$UNIT_TEST_REASON" | tee -a $GITHUB_OUTPUT
 
           # Pre-compute active row markers for the decision tree
           _MG=$( [ "$IS_MERGE_GROUP" == "true" ]                                                                           && echo "**→**" || echo "" )
@@ -355,6 +388,8 @@ jobs:
           | \`mbridge_suite\` | \`$MBRIDGE_SUITE\` |
           | \`cadence\` | \`$CADENCE\` |
           | \`cadence_bypass\` | \`$CADENCE_BYPASS\` |
+          | \`selective_tests\` | \`$SELECTIVE_TESTS\` |
+          | Unit-test policy | $UNIT_TEST_REASON |
 
           ### Decision tree
 
@@ -390,6 +425,7 @@ jobs:
           - **\`cadence\`**: per-test trigger filter (recipe \`cadence:\` field). Recipes default to \`[pr, nightly, mergegroup]\`.
           - **\`run_mbridge\`**: whether to trigger the Megatron-Bridge downstream CI. Off for PR pushes by default; flip on by adding the _Run MBridge tests_ label.
           - **\`run_nemo_rl\`**: whether to trigger the NeMo RL downstream CI. Off for merge queue validation; PR authors can opt in by adding the _Run NeMoRL tests_ label.
+          - **\`selective_tests\`**: The _Run selective unit tests_ label opts a PR into impacted unit-test files plus the always-run baseline. Unlabeled PRs run the full unit-test suite. Docs-only PRs skip unit tests. The _Run full unit tests_ label takes precedence. Functional-test labels do not change unit-test selection. Merge queues, nightly, and manual runs use the full suite.
           SUMMARY
 
   linting:
@@ -430,6 +466,11 @@ jobs:
 
       - name: Test superseded merge-group cleanup
         run: python3 .github/scripts/test_cancel_superseded_merge_group_runs.py
+
+      - name: Test unit-test selection and execution
+        run: |
+          uv run --locked --project .github/test-selection \
+            python .github/scripts/test_select_unit_tests.py -v
 
       - name: Get PR info
         id: get-pr-info
@@ -704,6 +745,7 @@ jobs:
       source-sha: ${{ needs.configure.outputs.sha }}
       lts: ${{ needs.configure.outputs.lts == 'true' }}
 
+  # CPU-only selection uses its own Python environment and can overlap the image build.
   cicd-parse-unit-tests:
     runs-on: ubuntu-latest
     outputs:
@@ -712,12 +754,10 @@ jobs:
       - pre-flight
       - configure
       - cicd-wait-in-queue
-      - cicd-container-build
     if: |
       needs.pre-flight.result != 'cancelled'
       && needs.configure.result != 'cancelled'
       && needs.cicd-wait-in-queue.result != 'cancelled'
-      && needs.cicd-container-build.result != 'cancelled'
       && (
         success()
         || needs.pre-flight.outputs.is_ci_workload == 'true'
@@ -730,11 +770,118 @@ jobs:
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ needs.configure.outputs.sha }}
+          fetch-depth: 0
+      - name: Setup Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+      - name: Setup uv
+        if: needs.configure.outputs.selective_tests == 'true'
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        continue-on-error: true
+        timeout-minutes: 2
+        with:
+          version: 0.7.2
       - name: Parse unit tests
         id: parse-unit-tests
+        shell: bash -e -u -o pipefail {0}
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          FORCE_RUN_ALL: ${{ needs.pre-flight.outputs.force_run_all }}
+          IS_CI_WORKLOAD: ${{ needs.pre-flight.outputs.is_ci_workload }}
+          IS_MERGE_GROUP: ${{ needs.pre-flight.outputs.is_merge_group }}
+          IS_PR: ${{ startsWith(github.ref, 'refs/heads/pull-request/') && github.event_name == 'push' }}
+          SELECTIVE_TESTS: ${{ needs.configure.outputs.selective_tests }}
+          UNIT_TEST_REASON: ${{ needs.configure.outputs.unit_test_reason }}
         run: |
-          cat tests/test_utils/recipes/h100/unit-tests.yaml | yq -o json '[.products[].test_case[] | { "bucket": .}] | sort_by(.model, .test_case)' | jq -c > unit-tests.json
-          echo "unit-tests=$(cat unit-tests.json)" | tee -a $GITHUB_OUTPUT
+          TESTED_SHA=$(git rev-parse --verify HEAD)
+          BASE_SHA=''
+          FORCE_FULL_REASON=''
+          if [[ "$IS_MERGE_GROUP" == "true" ]]; then
+            FORCE_FULL_REASON='merge queue validation always runs the full unit-test suite'
+          elif [[ "$IS_CI_WORKLOAD" == "true" ]]; then
+            FORCE_FULL_REASON='scheduled and CI workloads always run the full unit-test suite'
+          elif [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            FORCE_FULL_REASON='manually dispatched workflows always run the full unit-test suite'
+          elif [[ "$FORCE_RUN_ALL" == "true" ]]; then
+            FORCE_FULL_REASON='pre-flight requested the full test suite'
+          elif [[ "$IS_PR" != "true" ]]; then
+            FORCE_FULL_REASON='selective testing is limited to pull-request pushes'
+          elif [[ "$SELECTIVE_TESTS" != "true" ]]; then
+            FORCE_FULL_REASON="${UNIT_TEST_REASON:-unit-test selection is disabled}"
+          fi
+
+          # The checked-out synthetic merge is the same commit built and tested
+          # downstream. Compare it with its own first parent: the exact main
+          # revision used for this merge. PR metadata can report an older base.
+          # This diff includes every PR commit and excludes main-only changes.
+          if [[ -z "$FORCE_FULL_REASON" ]]; then
+            if ! git rev-parse --verify 'HEAD^2^{commit}' >/dev/null 2>&1; then
+              FORCE_FULL_REASON='the tested commit is not a pull-request merge'
+            elif ! BASE_SHA=$(git rev-parse --verify 'HEAD^1^{commit}' 2>/dev/null); then
+              BASE_SHA=''
+              FORCE_FULL_REASON='the tested pull-request merge has no base parent'
+            fi
+          fi
+
+          yq -o=json '[.products[].test_case[] | {"bucket": .}] | sort_by(.bucket)' \
+            tests/test_utils/recipes/h100/unit-tests.yaml > unit-test-buckets.json
+
+          SELECTOR_ARGS=(
+            --buckets-file unit-test-buckets.json
+            --git-mode branch
+            --output unit-test-selection.json
+            --summary unit-test-selection-summary.md
+          )
+          if [[ -n "$FORCE_FULL_REASON" ]]; then
+            SELECTOR_ARGS+=(--force-full "$FORCE_FULL_REASON")
+          else
+            SELECTOR_ARGS+=(--base-ref "$BASE_SHA")
+          fi
+
+          if [[ -n "$FORCE_FULL_REASON" ]]; then
+            python .github/scripts/select_unit_tests.py "${SELECTOR_ARGS[@]}"
+          elif ! timeout --signal=TERM --kill-after=30s 7m \
+            uv run --locked --project .github/test-selection \
+            python .github/scripts/select_unit_tests.py "${SELECTOR_ARGS[@]}"; then
+            python .github/scripts/select_unit_tests.py \
+              --buckets-file unit-test-buckets.json \
+              --force-full 'the impact selector could not be installed, completed, or started' \
+              --output unit-test-selection.json \
+              --summary unit-test-selection-summary.md
+          fi
+
+          # Never publish an empty/malformed matrix as a successful test plan.
+          if ! jq -e '
+            .matrix | type == "array" and length > 0 and all(.[];
+              (.bucket | type == "string" and length > 0)
+              and (.unit_test_files | type == "string"))
+          ' unit-test-selection.json >/dev/null; then
+            python .github/scripts/select_unit_tests.py \
+              --buckets-file unit-test-buckets.json \
+              --force-full 'the impact selector returned an invalid or empty matrix' \
+              --output unit-test-selection.json \
+              --summary unit-test-selection-summary.md
+          fi
+
+          printf '\nTested commit: `%s`\n' "$TESTED_SHA" >> unit-test-selection-summary.md
+          if [[ -n "$BASE_SHA" ]]; then
+            printf '\nPR comparison: `%s..%s` (merge first parent to tested merge).\n' \
+              "$BASE_SHA" "$TESTED_SHA" >> unit-test-selection-summary.md
+          fi
+          echo "unit-tests=$(jq -c '.matrix' unit-test-selection.json)" | tee -a "$GITHUB_OUTPUT"
+          cat unit-test-selection-summary.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload unit-test selection plan
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: unit-test-selection-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            unit-test-selection.json
+            unit-test-selection-summary.md
+          retention-days: 90
+          if-no-files-found: warn
 
   cicd-unit-tests-latest:
     strategy:
@@ -756,8 +903,8 @@ jobs:
       && needs.pre-flight.result != 'cancelled'
       && needs.configure.result != 'cancelled'
       && needs.cicd-wait-in-queue.result != 'cancelled'
-      && needs.cicd-container-build.result != 'cancelled'
-      && needs.cicd-parse-unit-tests.result != 'cancelled'
+      && needs.cicd-container-build.result == 'success'
+      && needs.cicd-parse-unit-tests.result == 'success'
       && (
         success()
         || needs.pre-flight.outputs.is_ci_workload == 'true'
@@ -780,6 +927,7 @@ jobs:
         uses: ./.github/actions
         with:
           test_case: ${{ matrix.bucket }}
+          unit_test_files: ${{ matrix.unit_test_files }}
           tag: latest
           timeout: ${{ matrix.timeout || 30 }}
           is_unit_test: "true"

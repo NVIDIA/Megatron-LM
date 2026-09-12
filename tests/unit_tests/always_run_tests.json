@@ -1,0 +1,12 @@
+[
+  "tests/unit_tests/test_basic.py",
+  "tests/unit_tests/test_model_parallel_config.py",
+  "tests/unit_tests/test_parallel_state.py",
+  "tests/unit_tests/test_process_groups_config.py",
+  "tests/unit_tests/test_rank_utils.py",
+  "tests/unit_tests/test_utils.py",
+  "tests/unit_tests/tensor_parallel/test_cross_entropy.py",
+  "tests/unit_tests/transformer/test_transformer_config.py",
+  "tests/unit_tests/models/test_gpt_model.py",
+  "tests/unit_tests/dist_checkpointing/test_mapping.py"
+]
