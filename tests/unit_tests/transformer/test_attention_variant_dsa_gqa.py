@@ -240,15 +240,11 @@ def test_transformer_config_accepts_min_memory_backend():
             dsa_indexer_loss_coeff=0.1,
             dsa_indexer_use_sparse_loss=True,
             dsa_indexer_sparse_loss_use_topk_only=True,
-            dsa_kernel_query_block_size=256,
-            dsa_kernel_key_block_size=1024,
             dsa_min_memory_profile=True,
             dsa_min_memory_profile_rank=-1,
         )
 
         assert config.dsa_kernel_backend == backend
-        assert config.dsa_kernel_query_block_size == 256
-        assert config.dsa_kernel_key_block_size == 1024
         assert config.dsa_kernel_cache_routing
         assert config.dsa_kernel_cache_indexer_k
         assert config.dsa_kernel_cache_selected_scores
@@ -1148,8 +1144,6 @@ def test_min_memory_backend_supports_no_grad_validation_forward(monkeypatch):
                 fp8=None,
                 fp8_param=False,
                 layernorm_zero_centered_gamma=False,
-                dsa_kernel_query_block_size=2,
-                dsa_kernel_key_block_size=3,
                 dsa_kernel_cache_indexer_k=True,
                 dsa_min_memory_profile=False,
                 dsa_min_memory_profile_rank=0,
@@ -1219,8 +1213,6 @@ def test_min_memory_simplified_no_norm_discards_supplied_norm(monkeypatch, learn
             fp8=None,
             fp8_param=False,
             layernorm_zero_centered_gamma=False,
-            dsa_kernel_query_block_size=2,
-            dsa_kernel_key_block_size=3,
             dsa_kernel_cache_indexer_k=learned_k,
             dsa_min_memory_profile=False,
             dsa_min_memory_profile_rank=0,
