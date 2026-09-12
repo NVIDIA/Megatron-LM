@@ -642,6 +642,9 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 assert mtp_inputs is not None
                 # For RL (labels is None), process_mtp_loss derives labels from
                 # input_ids to match the SFT label format.
+                # For hybrid/dynamic CP, use the microbatch's runtime CP sub-group
+                # (packed_seq_params.cp_group) instead of the build-time group so MTP
+                # loss rolling exchanges shard boundaries across the right ranks.
                 hidden_states = process_mtp_loss(
                     hidden_states=mtp_hidden_states,
                     labels=mtp_inputs.labels,
@@ -652,7 +655,12 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                     is_training=self.training,
                     compute_language_model_loss=self.compute_language_model_loss,
                     config=self.config,
-                    cp_group=self.pg_collection.cp,
+                    cp_group=(
+                        mtp_inputs.packed_seq_params.cp_group
+                        if mtp_inputs.packed_seq_params is not None
+                        and mtp_inputs.packed_seq_params.cp_group is not None
+                        else self.pg_collection.cp
+                    ),
                     tp_group=self.tp_group,
                     packed_seq_params=mtp_inputs.packed_seq_params,
                     scale_logits_fn=self._scale_logits if self.config.use_mup else None,
