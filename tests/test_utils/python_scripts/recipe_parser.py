@@ -424,7 +424,8 @@ def load_workloads(
                 workloads.append(build_workload)
 
         workload.spec["n_repeat"] = n_repeat
-        workload.spec["time_limit"] = time_limit
+        # Explicit per-workload overrides take precedence over the shared CI limit.
+        workload.spec["time_limit"] = workload.spec.pop("time_limit_override", time_limit)
         workload.spec["artifacts"] = {
             key: value.replace(r"{platforms}", workload.spec["platforms"])
             for key, value in (

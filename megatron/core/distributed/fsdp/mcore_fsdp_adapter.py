@@ -59,6 +59,7 @@ try:
     from megatron.core.distributed.fsdp.src.megatron_fsdp.utils import (
         all_sharding_strategies_in,
         any_sharding_strategy_in,
+        get_sharding_strategy,
     )
 
     HAVE_MEGATRON_FSDP = True
@@ -596,26 +597,8 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
 
         device_type = device.type if device is not None else "cuda"
 
-        # Expert parameters use a single mesh over the whole expert-DP domain and never
-        # take an outer axis. Dense parameters are the ones that go hybrid below.
-        expert_dp_mesh = None
-        if config.expert_model_parallel_size > 1:
-            expert_dp_mesh = DeviceMesh.from_group(
-                pg_collection.expt_dp, device_type=device_type, mesh_dim_names=("expert_dp",)
-            )
-        expert_axis = _DATA_PARALLEL_PLACEMENTS[
-            ddp_config.expert_data_parallel_sharding_strategy
-            or ddp_config.data_parallel_sharding_strategy
-        ]
-        expert_placements = Placements(
-            dp_axes=[0],
-            parameter=[expert_axis.parameter],
-            gradient=[expert_axis.gradient],
-            optimizer=[expert_axis.optimizer],
-        )
-
         if has_outer_dp_axis := ddp_config.num_distributed_optimizer_instances > 1:
-            # Dense parameters get an outer DP axis. There is no HSDP/HFSDP special case:
+            # There is no HSDP/HFSDP special case:
             # each axis takes the placements of its own strategy, so no_shard outer over
             # ZeRO-3 inner is HSDP and ZeRO-1 outer over ZeRO-3 inner is HFSDP.
             dp_mesh = _build_hybrid_dp_mesh(
@@ -640,6 +623,10 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                 gradient=[axis.gradient],
                 optimizer=[axis.optimizer],
             )
+        expert_dp_mesh, expert_placements = _build_expert_mesh_and_placements(
+            config, ddp_config, pg_collection, device_type
+        )
+
         # NCCL symmetric memory requires UB. MFSDP v2 intentionally does not support UB
         # without symmetric memory: it uses ncclCommRegister rather than the more performant
         # ncclCommWindowRegister:
@@ -650,7 +637,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         )
         with fully_shard_context(device=device, use_symmetric_memory=ddp_config.nccl_ub):
             if expert_dp_mesh is not None:
-                # Expert parameters are replicated over expert-DP, not the full DP group.
+                # Expert parameters use expert-DP rather than the full dense-DP group.
                 # Their gradients need the EP divisor because the same expert receives
                 # contributions after dispatch from every EP rank.
                 for submodule in module.modules():
@@ -781,6 +768,15 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                 f"{ddp_config.outer_dp_sharding_strategy!r} requires an outer DP axis, "
                 "i.e. num_distributed_optimizer_instances > 1."
             )
+        if ddp_config.expert_outer_dp_sharding_strategy != "no_shard" and (
+            config.expert_model_parallel_size <= 1
+            or ddp_config.num_distributed_optimizer_instances <= 1
+        ):
+            raise ValueError(
+                "MFSDP v2 expert_outer_dp_sharding_strategy="
+                f"{ddp_config.expert_outer_dp_sharding_strategy!r} requires an outer expert-DP "
+                "axis, i.e. expert parallelism and num_distributed_optimizer_instances > 1."
+            )
         if config.gradient_accumulation_fusion:
             raise ValueError("MFSDP v2 does not currently support gradient accumulation fusion.")
         if config.calculate_per_token_loss:
@@ -884,41 +880,75 @@ _DATA_PARALLEL_PLACEMENTS = {
 }
 
 
+def _build_expert_mesh_and_placements(
+    config: TransformerConfig,
+    ddp_config: DistributedDataParallelConfig,
+    pg_collection: ProcessGroupCollection,
+    device_type: str,
+) -> Tuple[DeviceMesh | None, Placements | None]:
+    """Build the expert-DP mesh and placements, or return neither when EP is disabled."""
+    if config.expert_model_parallel_size <= 1:
+        return None, None
+
+    inner_strategy = get_sharding_strategy(ddp_config, is_expert_param=True)
+
+    if ddp_config.num_distributed_optimizer_instances > 1:
+        # Match v1 topology: dense and expert parameters share the outer DP axis,
+        # while experts use the existing expert-DP inner group. Only placements differ.
+        dp_mesh = _build_hybrid_dp_mesh(
+            pg_collection.inter_dist_opt, pg_collection.intra_expt_dp, device_type
+        )
+        inner = _DATA_PARALLEL_PLACEMENTS[inner_strategy]
+        outer = _DATA_PARALLEL_PLACEMENTS[ddp_config.expert_outer_dp_sharding_strategy]
+        placements = Placements(
+            dp_axes=[0, 1],
+            parameter=[outer.parameter, inner.parameter],
+            gradient=[outer.gradient, inner.gradient],
+            optimizer=[outer.optimizer, inner.optimizer],
+        )
+        return dp_mesh, placements
+
+    dp_mesh = DeviceMesh.from_group(
+        pg_collection.expt_dp, device_type=device_type, mesh_dim_names=("expert_dp",)
+    )
+    axis = _DATA_PARALLEL_PLACEMENTS[inner_strategy]
+    placements = Placements(
+        dp_axes=[0],
+        parameter=[axis.parameter],
+        gradient=[axis.gradient],
+        optimizer=[axis.optimizer],
+    )
+    return dp_mesh, placements
+
+
 def _build_hybrid_dp_mesh(outer_group, inner_group, device_type):
-    """Build the ("dp_outer", "dp_shard") mesh for a hybrid data-parallel domain.
-
-    DeviceMesh.from_group requires an explicit rank table when given more than one group,
-    since no single argument spans the mesh. parallel_state cuts the data-parallel domain
-    into num_distributed_optimizer_instances contiguous chunks, so the table is world
-    ranks reshaped to (outer, inner).
-
-    The assumption is checked rather than trusted, because the position of a rank in the
-    table is its mesh coordinate: a table with the right members in the wrong order would
-    keep reducing over valid groups while assigning every shard index to the wrong rank.
-    """
+    """Build the ("dp_outer", "dp_shard") mesh for a hybrid data-parallel domain."""
     if outer_group is None or inner_group is None:
         raise ValueError(
-            "MFSDP v2 with num_distributed_optimizer_instances > 1 requires both the "
-            "inter- and intra-distributed-optimizer process groups."
+            "MFSDP v2 hybrid sharding requires inter- and intra-instance process groups."
         )
 
-    inner_size = inner_group.size()
-    layout = torch.arange(dist.get_world_size()).reshape(outer_group.size(), inner_size).tolist()
+    rank = dist.get_rank()
+    inner_ranks = dist.get_process_group_ranks(inner_group)
+    outer_ranks = dist.get_process_group_ranks(outer_group)
+    outer_offsets = torch.tensor(outer_ranks) - rank
+    inner_offsets = torch.tensor(inner_ranks) - rank
+    layout = rank + outer_offsets[:, None] + inner_offsets[None, :]
 
-    outer_index, inner_index = divmod(dist.get_rank(), inner_size)
-    expected_inner = layout[outer_index]
-    expected_outer = [row[inner_index] for row in layout]
-    actual_inner = dist.get_process_group_ranks(inner_group)
-    actual_outer = dist.get_process_group_ranks(outer_group)
-    if actual_inner != expected_inner:
+    # Sort the mesh ranks into outer-to-inner order, then check that this rank's
+    # row and column match its inner and outer process groups, respectively.
+    expected_layout = layout.flatten().sort().values.reshape(layout.shape)
+    expected_inner = expected_layout[outer_group.rank()].tolist()
+    expected_outer = expected_layout[:, inner_group.rank()].tolist()
+    if inner_ranks != expected_inner:
         raise ValueError(
             f"MFSDP v2 hybrid mesh row {expected_inner} does not match the intra "
-            f"data-parallel group {actual_inner}."
+            f"data-parallel group {inner_ranks}."
         )
-    if actual_outer != expected_outer:
+    if outer_ranks != expected_outer:
         raise ValueError(
             f"MFSDP v2 hybrid mesh column {expected_outer} does not match the inter "
-            f"distributed-optimizer group {actual_outer}."
+            f"distributed-optimizer group {outer_ranks}."
         )
 
     return DeviceMesh.from_group(

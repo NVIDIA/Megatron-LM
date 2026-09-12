@@ -85,5 +85,7 @@ hotspots are:
 
 Reducing this cost is a tracked workstream in
 [issue #5785](https://github.com/NVIDIA/Megatron-LM/issues/5785). A change to
-any row above needs a bit-exact test and a comparison of deterministic and
+any row above needs a bit-exact test (registered in
+`tests/unit_tests/determinism/kernels/manifest.py`, refer to
+[`testing.md`](./testing.md)) and a comparison of deterministic and
 default performance (`tests/performance_tests/shell_test_utils/determinism/`).

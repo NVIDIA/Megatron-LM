@@ -32,9 +32,6 @@ from tests.unit_tests.a2a_overlap.utils import (
 )
 from tests.unit_tests.test_utilities import Utils
 
-# Transformer Engine 2.17 aborts in the A2A overlap suite with a pybind11 GIL dec_ref failure.
-pytestmark = pytest.mark.flaky_in_dev
-
 
 def save(fn, message):
     with open(fn, 'w') as f:

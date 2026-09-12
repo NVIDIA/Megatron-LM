@@ -50,6 +50,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "attention_dropout": 0.0,
     "attention_output_gate": False,
     "attention_softmax_in_fp32": False,
+    "attn_logit_softcapping": None,
     "autocast_dtype": "torch.bfloat16",
     "barrier_with_L1_time": True,
     "batch_invariant_backend": "te_native",

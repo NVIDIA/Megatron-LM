@@ -1783,16 +1783,24 @@ class HyperConnectionTransformerLayer(TransformerLayer):
             "Use TransformerLayer instead if hyper connections are not needed."
         )
 
-        # mHC over a single MoE-MLP layer is not supported in this implementation;
-        # compose mHC with MoE by wrapping MoE inside a HyperConnectionHybridLayer
-        # (HybridStack path) instead. This guard fires at setup so misconfigured
-        # specs fail fast rather than producing silently-wrong shapes at runtime.
-        if self.is_moe_layer:
+        unsupported_moe_cuda_graph_modules = {
+            CudaGraphModule.moe,
+            CudaGraphModule.moe_router,
+            CudaGraphModule.moe_preprocess,
+        }
+        if self.is_moe_layer and unsupported_moe_cuda_graph_modules.intersection(
+            self.config.cuda_graph_modules
+        ):
             raise NotImplementedError(
-                "HyperConnectionTransformerLayer does not support MoE MLP submodules. "
-                "To combine mHC with MoE, wrap the MoE block as a HybridStack layer "
-                "via HyperConnectionHybridLayer instead."
+                "HyperConnectionTransformerLayer does not support MoE CUDA graph "
+                "scopes. Disable the moe, moe_router, and moe_preprocess CUDA graph modules "
+                "when combining mHC with a MoE MLP submodule."
             )
+
+        # GraphableMegatronModule calls create_mcore_cudagraph_manager before the MLP is
+        # built, so repeat the local-graph decision now that self.is_moe_layer is authoritative.
+        if self.config.cuda_graph_impl == "local":
+            self.create_mcore_cudagraph_manager(self.config)
 
         self.self_attention_hyper_connection = build_module(
             submodules.self_attention_hyper_connection,
@@ -1841,6 +1849,24 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         )
         return static_inputs
 
+    def create_mcore_cudagraph_manager(self, config):
+        """Create only CUDA graph managers compatible with this mHC layer."""
+        # The first call comes from GraphableMegatronModule before TransformerLayer has
+        # constructed self.mlp and set self.is_moe_layer.
+        if not hasattr(self, "mlp"):
+            return
+
+        if self.is_moe_layer:
+            # Whole-layer and MLP-scope graphs would capture dynamic MoE dispatch. Mixed
+            # models may still request MLP graphs globally, so leave only this MoE layer eager.
+            if not config.cuda_graph_modules or (
+                CudaGraphModule.mlp in config.cuda_graph_modules
+                and CudaGraphModule.attn not in config.cuda_graph_modules
+            ):
+                return
+
+        super().create_mcore_cudagraph_manager(config)
+
     def _get_submodules_under_cudagraphs(self):
         """Override to include hyper connection modules.
 
@@ -1856,8 +1882,7 @@ class HyperConnectionTransformerLayer(TransformerLayer):
 
         if CudaGraphModule.attn in self.config.cuda_graph_modules:
             submodules.append(self.self_attention_hyper_connection)
-        # HC layer rejects MoE MLPs in __init__, so only the dense (mlp) scope applies.
-        if CudaGraphModule.mlp in self.config.cuda_graph_modules:
+        if CudaGraphModule.mlp in self.config.cuda_graph_modules and not self.is_moe_layer:
             submodules.append(self.mlp_hyper_connection)
         return submodules
 

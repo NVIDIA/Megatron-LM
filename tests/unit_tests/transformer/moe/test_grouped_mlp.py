@@ -15,6 +15,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_submodules,
     get_gpt_layer_with_transformer_engine_submodules,
 )
+from megatron.core.quantization.quant_config import RecipeConfig
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.moe.experts import TEGroupedMLP
 from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
@@ -1217,6 +1218,86 @@ class TestTEGroupedMLP:
                 assert getattr(ops[2], f"weight{idx}") is getattr(
                     experts.linear_fc2, f"weight{idx}"
                 )
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.internal
+    @pytest.mark.parametrize("override_pattern", (None, "*experts*", "*linear_fc1", "*linear_fc2"))
+    def test_gpu_precision_override_keeps_experts_unfused(self, override_pattern):
+        """A per-module precision override must keep these experts off the op-fuser path.
+
+        The fused grouped-MLP kernels are FP8/NVFP4-only and select their recipe from the
+        global autocast state, not from the module's own quantization config. So a module the
+        precision config forces to high precision has to run unfused: otherwise it is silently
+        quantized anyway, and with GTP weight sharding its backward pass is handed an
+        unquantized weight the kernel cannot consume (AttributeError on `_columnwise_data`).
+
+        The fused op covers fc1 and fc2 jointly, so an override matching either one alone must
+        still disable it -- matching only fc2 is what the original GTP crash hit.
+        """
+        try:
+            from transformer_engine.pytorch.ops import GroupedLinear
+        except ImportError:
+            pytest.skip("TE op fuser API not available")
+
+        Utils.destroy_model_parallel()
+        Utils.initialize_model_parallel(1, 1)
+
+        quant_recipe = None
+        if override_pattern is not None:
+            quant_recipe = RecipeConfig.from_config_dict(
+                {
+                    "configs": {
+                        "high_precision": {
+                            "transformer_engine_config_type": "TEQuantizationParams",
+                            "training_recipe": {},
+                        }
+                    },
+                    "matchers": {
+                        "experts_high_precision": {
+                            "type": "glob",
+                            "enabled": True,
+                            "pattern": override_pattern,
+                            "config": "high_precision",
+                        }
+                    },
+                }
+            )
+
+        tf_config = TransformerConfig(
+            num_layers=1,
+            hidden_size=self.hidden_size,
+            num_attention_heads=4,
+            num_moe_experts=self.num_experts,
+            use_cpu_initialization=False,
+            add_bias_linear=False,
+            gated_linear_unit=True,
+            activation_func=F.silu,
+            bias_activation_fusion=False,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            moe_router_load_balancing_type="sinkhorn",
+            moe_router_topk=1,
+            moe_grouped_gemm=True,
+            use_transformer_engine_op_fuser=True,
+            quant_recipe=quant_recipe,
+        )
+        _set_random_seed(seed_=123, data_parallel_random_init=False)
+        submodules = get_submodules(
+            get_gpt_layer_with_transformer_engine_submodules(
+                self.num_experts, moe_grouped_gemm=True
+            ).mlp
+        )
+        # The override is resolved by module path, so the layer needs its name populated.
+        layer = MoELayer(tf_config, submodules, name="mlp")
+        layer = Float16Module(layer.config, layer).module
+        layer.cuda()
+        experts = layer.experts
+        assert isinstance(experts, TEGroupedMLP)
+
+        if override_pattern is None:
+            assert experts._with_fused_impl
+        else:
+            assert not experts._with_fused_impl
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.internal

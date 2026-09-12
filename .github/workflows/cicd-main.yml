@@ -425,6 +425,9 @@ jobs:
       - name: Test queue approval topology
         run: .github/scripts/test_approve_test_queue.sh
 
+      - name: Test DCO gate publisher
+        run: python3 .github/scripts/test_dco_gate.py
+
       - name: Test superseded merge-group cleanup
         run: python3 .github/scripts/test_cancel_superseded_merge_group_runs.py
 
@@ -452,6 +455,22 @@ jobs:
           fi
 
           python3 tools/check_golden_values.py "${GOLDEN_VALUES_FILES[@]}"
+
+      - name: Require determinism tests for kernel changes
+        # PR pushes only: a merge-group head also contains the PRs queued ahead of
+        # it, whose kernel changes were gated (and possibly labelled) on their own PRs.
+        if: startsWith(github.ref, 'refs/heads/pull-request/') && github.event_name == 'push'
+        env:
+          BASE_REF: ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').base.ref }}
+          # Labels come with the PR object; no extra API call or token permission needed.
+          LABELS: ${{ join(fromJSON(steps.get-pr-info.outputs.pr-info || '{}').labels.*.name, ',') }}
+        run: |
+          BASE_REF="${BASE_REF#refs/heads/}"
+          git fetch origin "$BASE_REF"
+
+          python3 tools/check_kernel_determinism_coverage.py \
+            --base-ref "origin/$BASE_REF" \
+            --labels "$LABELS"
 
       - name: Run linting
         if: startsWith(github.ref, 'refs/heads/pull-request/') && github.event_name == 'push'

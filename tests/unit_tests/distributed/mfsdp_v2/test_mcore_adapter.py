@@ -350,19 +350,16 @@ class TestMcoreAdapterDense:
         success, _, _ = optimizer.step()
         assert success
 
-    def test_gradient_clipping_reaches_global_norm(self):
-        """MFSDP v2 reports the true global gradient norm and clips the update to it.
+    @pytest.mark.parametrize("use_precision_aware_optimizer", [False, True])
+    def test_gradient_clipping_reaches_global_norm(self, use_precision_aware_optimizer):
+        """MFSDP v2 reports the true global gradient norm and clips the gradients to it.
 
-        Clipping is measured through the optimizer update rather than through
-        parameter.grad after the step. _copy_model_grads_to_main_grads installs a
-        dtype-cast copy of each gradient, clip_grad_norm scales that copy, and
-        step_with_ready_grads restores the original afterwards, so the post-step
-        gradient is unclipped by design. Plain SGD at lr=1.0 makes the weight delta
-        exactly the gradient the optimizer stepped with, which keeps this test on the
-        default FP32-main-weight / BF16-gradient configuration.
+        Main gradients are kept in the main-weight dtype so that clipping is measurable on
+        parameter.grad: _copy_model_grads_to_main_grads otherwise installs a dtype-cast copy
+        for non-precision-aware optimizers, clip_grad_norm scales that copy, and
+        step_with_ready_grads restores the original afterwards.
         """
         clip_grad = 1.0
-        learning_rate = 1.0
         config = TransformerConfig(
             num_layers=2,
             hidden_size=16,
@@ -380,19 +377,21 @@ class TestMcoreAdapterDense:
                 megatron_fsdp_version=2,
                 use_distributed_optimizer=False,
                 data_parallel_sharding_strategy="optim_grads_params",
+                megatron_fsdp_main_grads_dtype=torch.float32,
             ),
             module=_build_block(config),
             pg_collection=self.pg_collection,
         )
         optimizer = get_megatron_optimizer(
             OptimizerConfig(
-                optimizer="sgd",
-                lr=learning_rate,
+                optimizer="adam",
+                lr=1.0e-3,
                 weight_decay=0.0,
                 bf16=True,
                 params_dtype=torch.bfloat16,
                 use_distributed_optimizer=False,
                 clip_grad=clip_grad,
+                use_precision_aware_optimizer=use_precision_aware_optimizer,
             ),
             [model],
         )
@@ -421,20 +420,17 @@ class TestMcoreAdapterDense:
         ]
         assert all(isinstance(parameter.grad, DTensor) for parameter in parameters)
         expected_pre_clip_norm = global_norm([p.grad.to_local() for p in parameters])
-        weights_before = [p.data.to_local().float().clone() for p in parameters]
-
-        success, pre_clip_norm, _ = optimizer.step()
-        updates = [
-            before - parameter.data.to_local().float()
-            for parameter, before in zip(parameters, weights_before)
-        ]
-
-        assert success
-        torch.testing.assert_close(pre_clip_norm.item(), expected_pre_clip_norm)
         assert (
             expected_pre_clip_norm > clip_grad
         ), "Test gradients must exceed the clipping threshold to exercise clipping."
-        torch.testing.assert_close(global_norm(updates), clip_grad, rtol=1e-3, atol=0)
+
+        success, pre_clip_norm, _ = optimizer.step()
+
+        assert success
+        torch.testing.assert_close(pre_clip_norm.item(), expected_pre_clip_norm)
+        torch.testing.assert_close(
+            global_norm([p.grad.to_local() for p in parameters]), clip_grad, rtol=1e-3, atol=0
+        )
 
 
 class TestMcoreAdapterCudaGraph:
@@ -874,12 +870,12 @@ class TestMcoreAdapterHybrid:
         assert torch.isfinite(reference).all()
         torch.testing.assert_close(hybrid, reference, rtol=1e-2, atol=0)
 
-    def test_moe_with_hybrid_dense(self):
-        """Dense parameters go hybrid; experts stay ZeRO-3 over the whole expert-DP domain.
-
-        This is the intended MoE configuration: ZeRO-3 + EP for the large expert weights,
-        and hybrid sharding for the dense ones. The two must end up on different meshes.
-        """
+    @pytest.mark.parametrize("dense_outer_strategy", ["optim", "no_shard"])
+    @pytest.mark.parametrize("expert_outer_strategy", ["optim", "no_shard"])
+    def test_moe_with_independent_hybrid_placements(
+        self, dense_outer_strategy, expert_outer_strategy
+    ):
+        """Dense and expert parameters use different placements on the same hybrid mesh."""
         world_size = int(os.environ.get("WORLD_SIZE", "1"))
         if world_size < 4 or world_size % 4:
             pytest.skip("MoE + hybrid needs a world size divisible by four (EP=2, instances=2).")
@@ -917,7 +913,8 @@ class TestMcoreAdapterHybrid:
                 use_distributed_optimizer=False,
                 data_parallel_sharding_strategy="optim_grads_params",
                 num_distributed_optimizer_instances=2,
-                outer_dp_sharding_strategy="optim",
+                outer_dp_sharding_strategy=dense_outer_strategy,
+                expert_outer_dp_sharding_strategy=expert_outer_strategy,
             ),
             module=HybridModel(
                 config=config,
@@ -948,12 +945,27 @@ class TestMcoreAdapterHybrid:
         success, _, _ = optimizer.step()
         assert success
 
-        meshes = {
+        mesh_dim_names = {
             parameter.grad.device_mesh.mesh_dim_names
             for parameter in model.parameters()
             if parameter.grad is not None
         }
-        assert ("dp_outer", "dp_shard") in meshes, f"no hybrid dense mesh in {meshes}"
-        assert ("expert_dp",) in meshes, f"no expert mesh in {meshes}"
-        # Experts must not have acquired an outer axis.
-        assert meshes == {("dp_outer", "dp_shard"), ("expert_dp",)}, meshes
+        assert mesh_dim_names == {("dp_outer", "dp_shard")}
+
+        dense_parameters = []
+        expert_parameters = []
+        for name, parameter in model.named_parameters():
+            if parameter.grad is None:
+                continue
+            # In this model, expert weights live under mlp.experts; router weights are dense.
+            if "experts" in name:
+                expert_parameters.append((name, parameter))
+            else:
+                dense_parameters.append((name, parameter))
+        dense_outer = Replicate() if dense_outer_strategy == "no_shard" else Shard(0)
+        for name, parameter in dense_parameters:
+            assert parameter.grad.placements == (dense_outer, Shard(0)), name
+
+        expert_outer = Replicate() if expert_outer_strategy == "no_shard" else Shard(0)
+        for name, parameter in expert_parameters:
+            assert parameter.grad.placements == (expert_outer, Shard(0)), name

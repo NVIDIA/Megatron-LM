@@ -178,6 +178,12 @@ class TransformerConfig(ModelParallelConfig):
        Supports both TE FusedAttention and local unfused attention. Supports both a fixed offset and 
        and learnable offset."""
 
+    attn_logit_softcapping: Optional[float] = None
+    """If not None, cap the attention logits at this value using cap * tanh(logits / cap) before
+    softmax. Must be positive; use None to disable softcapping. Note that TransformerEngine
+    spells the disabled state as 0.0 rather than None, so 0.0 is rejected here to keep the two
+    from meaning different things."""
+
     num_query_groups: Optional[int] = field(
         default=None, metadata={"argparse_meta": {"default": 1}}
     )
@@ -1533,6 +1539,18 @@ class TransformerConfig(ModelParallelConfig):
         super().__post_init__()
         self._validate_cp_layouts()
 
+        if self.attn_logit_softcapping is not None and not (
+            math.isfinite(self.attn_logit_softcapping) and self.attn_logit_softcapping > 0
+        ):
+            raise ValueError(
+                "attn_logit_softcapping must be a positive finite value, got "
+                f"{self.attn_logit_softcapping}. Use None to disable softcapping. A cap of 0.0 "
+                "disables softcapping in TransformerEngine but collapses every logit to zero in "
+                "the local attention path, a negative cap is silently applied as its absolute "
+                "value there while FlashAttention ignores it entirely, and a non-finite cap "
+                "produces NaN logits."
+            )
+
         # Resolve deprecated attention variant spellings up front so that every consumer
         # downstream only has to handle the canonical names. Imported lazily because the
         # spec module imports this one.
@@ -1959,12 +1977,6 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError(
                     "moe_flex_dispatcher_backend='ncclep' requires "
                     "moe_token_dispatcher_type='flex'."
-                )
-            if self.moe_use_grouped_tensor and not self.use_transformer_engine_op_fuser:
-                raise ValueError(
-                    "moe_use_grouped_tensor=True without use_transformer_engine_op_fuser is "
-                    "not yet supported with the NCCL-EP dispatcher. Use the TE op-fuser path "
-                    "or select the alltoall, DeepEP, or HybridEP dispatcher."
                 )
 
         if self.moe_dispatch_fwd_dtype != 'bf16' or self.moe_combine_bwd_dtype != 'bf16':
