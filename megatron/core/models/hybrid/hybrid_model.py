@@ -547,6 +547,14 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         packed_seq_params_by_layout = (
             cp_batch.packed_seq_params_by_layout if cp_batch is not None else None
         )
+        padding_mask_by_layout = (
+            {
+                layout: layout_batch.get("padding_mask")
+                for layout, layout_batch in cp_batch.batches_by_layout.items()
+            }
+            if cp_batch is not None
+            else None
+        )
         cp_layout_plan = cp_batch.thd_plan if cp_batch is not None else None
 
         # Run decoder.
@@ -563,6 +571,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 rotary_pos_emb=rotary_pos_emb,
                 packed_seq_params=packed_seq_params,
                 padding_mask=padding_mask,
+                padding_mask_by_layout=padding_mask_by_layout,
                 packed_seq_params_by_layout=packed_seq_params_by_layout,
                 cp_layout_plan=cp_layout_plan,
             )

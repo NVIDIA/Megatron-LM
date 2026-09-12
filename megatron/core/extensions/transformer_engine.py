@@ -24,7 +24,7 @@ from megatron.core.dist_checkpointing.mapping import ShardedObject, ShardedState
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.enums import Fp4Recipe, Fp8Recipe
 from megatron.core.model_parallel_config import ModelParallelConfig
-from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
 from megatron.core.parallel_state import (
     get_amax_reduction_group,
     get_context_parallel_group,
@@ -2307,6 +2307,46 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             **extra_kwargs,
         )
 
+    @contextmanager
+    def _temporary_runtime_context_parallel_group(
+        self, packed_seq_params: Optional[PackedSeqParams]
+    ):
+        """Bind TE to one microbatch's CP group and restore it on every exit path."""
+        if packed_seq_params is None or packed_seq_params.local_cp_size is None:
+            yield
+            return
+
+        runtime_cp_group = resolve_cp_group(self.cp_group, packed_seq_params)
+        assert runtime_cp_group is not None
+        original_cp_group = self.cp_group
+        original_cp_global_ranks = self.cp_global_ranks
+
+        try:
+            if runtime_cp_group.size() == 1:
+                # Dynamic CP metadata retains the singleton group, while TE
+                # must see CP disabled for this microbatch.
+                super().set_context_parallel_group(None, None, None, self.cp_comm_type)
+            else:
+                if TEDotProductAttention.cp_stream is None:
+                    TEDotProductAttention.cp_stream = torch.cuda.Stream()
+                super().set_context_parallel_group(
+                    runtime_cp_group,
+                    torch.distributed.get_process_group_ranks(runtime_cp_group),
+                    TEDotProductAttention.cp_stream,
+                    self.cp_comm_type,
+                )
+            yield
+        finally:
+            if original_cp_group is None or original_cp_group.size() == 1:
+                super().set_context_parallel_group(None, None, None, self.cp_comm_type)
+            else:
+                super().set_context_parallel_group(
+                    original_cp_group,
+                    original_cp_global_ranks,
+                    TEDotProductAttention.cp_stream,
+                    self.cp_comm_type,
+                )
+
     def forward(
         self,
         query: Tensor,
@@ -2320,36 +2360,33 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         bf16_backward: Optional[bool] = None,
     ) -> torch.Tensor:
         """Forward."""
+        with self._temporary_runtime_context_parallel_group(packed_seq_params):
+            return self._forward(
+                query,
+                key,
+                value,
+                attention_mask,
+                attn_mask_type,
+                attention_bias=attention_bias,
+                packed_seq_params=packed_seq_params,
+                num_splits=num_splits,
+                bf16_backward=bf16_backward,
+            )
+
+    def _forward(
+        self,
+        query: Tensor,
+        key: Tensor,
+        value: Tensor,
+        attention_mask: Optional[Tensor],
+        attn_mask_type: AttnMaskType,
+        attention_bias: Optional[Tensor] = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
+        num_splits: Optional[int] = None,
+        bf16_backward: Optional[bool] = None,
+    ) -> torch.Tensor:
+        """Run TE attention after the runtime CP binding has been installed."""
         if packed_seq_params is not None:
-            # If Dynamic CP group is provided, update TE DPA CP group
-            if packed_seq_params.cp_group is not None:
-                # Converse of the assert below: a CP-off (local_cp_size == 1)
-                # sub-sample must not carry a CP group, otherwise it would be
-                # routed through the CP attention path. Producers must only
-                # bind cp_group when local_cp_size > 1.
-                assert (
-                    packed_seq_params.local_cp_size is None or packed_seq_params.local_cp_size > 1
-                ), "cp_group must not be set when local_cp_size == 1 (CP-off convention)"
-                # Hybrid/dynamic CP can enable CP at runtime on a model built
-                # with context_parallel_size == 1, where the constructor never
-                # allocated the auxiliary CP stream. Create it lazily; TE's
-                # AttnFuncWithCPAndKVP2P dereferences it unconditionally.
-                if TEDotProductAttention.cp_stream is None:
-                    TEDotProductAttention.cp_stream = torch.cuda.Stream()
-                self.cp_group = packed_seq_params.cp_group
-                super().set_context_parallel_group(
-                    self.cp_group,
-                    torch.distributed.get_process_group_ranks(self.cp_group),
-                    TEDotProductAttention.cp_stream,
-                    self.cp_comm_type,
-                )
-            # If cp_group is None but local_cp_size is provided,
-            # Indicates to turn off CP dynamically
-            elif packed_seq_params.local_cp_size is not None:
-                assert (
-                    packed_seq_params.local_cp_size == 1
-                ), "local_cp_size must be == 1 if provided without cp_group"
-                super().set_context_parallel_group(None, None, None, self.cp_comm_type)
             self.kept_packed_seq_params.discard("cp_group")
             self.kept_packed_seq_params.discard("local_cp_size")
 

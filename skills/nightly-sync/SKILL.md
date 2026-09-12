@@ -200,23 +200,22 @@ continue to diverge:
 
 ### Special Handling: data_schedule.py
 
-Main and dev have completely different classes in this file:
-- Main: `HybridCPDataLoaderWrapper` (imported by main's `training.py`)
-- Dev: `BasePackingScheduler`, `DpBalancedScheduler`,
+Dynamic CP uses the scheduling implementation from dev:
+- `BasePackingScheduler`, `DpBalancedScheduler`,
   `DefaultDynamicCPScheduler`, `wrap_data_iterator`,
   `get_batch_on_this_rank_for_sequence_packing` (imported by `pretrain_gpt.py`
   and tests)
 
-**Do NOT take either version wholesale.** Keep dev's file and append main's
-`HybridCPDataLoaderWrapper` class (plus any missing imports like
-`BalancedCPScheduler`, `Any`, `List`) at the end.
+Do not append the legacy main-only scheduling path. Training and evaluation
+must use `wrap_data_iterator` so `RerunDataIterator`, PP, and VPP behavior stay
+on the standard schedules.
 
 ### Restore Deleted Files
 
 Compare `git ls-tree` between `origin/main` and HEAD to find files in main
 that are missing from the merged tree. For each:
 - **Restore** if main's code imports/references it and would break without it
-  (e.g. `hybrid_cp_schedule.py` if `data_schedule.py` imports from it)
+  (after first checking that the import is still intentional)
 - **Do NOT restore** if dev intentionally deleted it — check
   `git log origin/dev -- <file>` for the deletion commit to understand intent
 - When in doubt, check whether any file in the merged tree imports from the

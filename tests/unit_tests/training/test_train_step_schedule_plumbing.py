@@ -21,7 +21,7 @@ class _Rerun:
         return False, True, 0  # (checkpoint, exit, code)
 
 
-def _run(*, args_overrides=None, model=None, optimizer=None, **kwargs):
+def _run(*, args_overrides=None, model=None, optimizer=None, config=None, **kwargs):
     args = SimpleNamespace(
         save_params_interval=None,
         save_activations_interval=None,
@@ -47,18 +47,33 @@ def _run(*, args_overrides=None, model=None, optimizer=None, **kwargs):
         mock.patch.object(training_mod, "get_num_microbatches", return_value=1),
         mock.patch.object(training_mod, "has_nvidia_modelopt", False),
     ):
-        training_mod.train_step(
+        result = training_mod.train_step(
             forward_step_func=lambda *a, **k: None,
             data_iterator=iter([]),
             model=model,
             optimizer=optimizer,
             opt_param_scheduler=None,
-            config=SimpleNamespace(),
+            config=config or SimpleNamespace(),
             forward_backward_func=lambda **kw: captured.update(kw) or [],
             iteration=0,
             **kwargs,
         )
+    captured['returned_num_microbatches'] = result[-1]
     return captured
+
+
+def test_train_step_returns_scheduled_microbatch_count():
+    packed_iterator = iter([1, 2, 3])
+    with (
+        mock.patch.object(
+            training_mod, 'wrap_data_iterator', return_value=(packed_iterator, 3, 60, 1200)
+        ),
+        mock.patch.object(training_mod, 'get_attr_wrapped_model', return_value=object()),
+        mock.patch.object(training_mod, 'set_seqlen_stats_in_iteration'),
+    ):
+        captured = _run(config=SimpleNamespace(sequence_packing_scheduler='default_dynamic_cp'))
+    assert captured['num_microbatches'] == captured['returned_num_microbatches'] == 3
+    assert captured['data_iterator'] is packed_iterator
 
 
 def test_train_step_forwards_schedule_plumbing():

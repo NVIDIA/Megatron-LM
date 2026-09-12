@@ -1,5 +1,17 @@
 # Data Pipeline
 
+Packed training and evaluation support `--pad-packed-seq-alignment N` (a CP-local
+token multiple before SP) or `max` (pad to `--max-seqlen-per-dp-cp-rank`). MXFP8
+automatically requires a multiple of 32 tokens after SP; the effective alignment
+combines that requirement with the requested multiple. Padding is added before
+CP layout construction, with masked dummy sequences and consistent THD metadata.
+The scheduler reserves an aligned capacity; padding never truncates valid tokens.
+This eager path does not require CUDA graphs.
+
+When unpacking SFT data, prompt-only sub-sequences with no supervised targets are
+omitted. A DP rank can contribute no samples and still receive scheduled work;
+a global batch with no supervised sequences is rejected on all ranks.
+
 ## Data pre-processing
 
 Data preprocessing is built around the following classes:
@@ -212,11 +224,11 @@ The packing scheduler re-schedules variable-length sequences across DP×CP ranks
 
 This module contains the high-level scheduling logic and entry points:
 
-- **`HybridCPDataLoaderWrapper`**: A wrapper class for hybrid context parallel (CP) scheduling. For every `__next__` call, it: (1) pulls a batch of packed samples from each DP rank, (2) gathers sequence lengths across the DP group, (3) schedules sub-samples using the `BalancedCPScheduler`, (4) reroutes sub-samples to the correct DPxCP ranks via all-to-all communication.
-
 - **`BasePackingScheduler`**: Abstract base class for packing schedulers. Defines the interface for `get_groups_and_subsamples()` (scheduling algorithm) and `run()` (full scheduling pipeline including fetch, schedule, reroute, pack, broadcast, and VPP handling).
 
 - **`DpBalancedScheduler`**: A concrete scheduler that packs sequences in their original order until reaching the max sequence length limit per DPxCP rank. Supports aligning the number of microbatches to DP size and VPP stage multiples.
+
+- **`DefaultDynamicCPScheduler`**: Selects a valid runtime CP group for each packed microbatch while balancing sequences across the DP×CP domain.
 
 - **`wrap_data_iterator()`**: Top-level entry point that wraps an existing `data_iterator`. It creates the appropriate scheduler, runs the scheduling pipeline, broadcast metadata and new num_microbatches, returns a new data iterator along with the updated number of microbatches and FLOPs statistics.
 

@@ -2486,15 +2486,20 @@ def _get_batch_on_this_cp_rank_per_document_balancing(
             if batch["cu_seqlens_padded"] is not None
             else batch["cu_seqlens"]
         )[0]
-        index = tex.thd_get_partitioned_indices(
-            cu_seqlens_for_te,
+        sequence_tensor = next(
             (
-                batch["tokens"].size(1) if batch["tokens"] is not None else batch["labels"].size(1)
-            ),  # NOTE(asolergi-nv): Labels to enable PP!
-            cp_size,
-            cp_rank,
+                batch[key]
+                for key in ('tokens', 'labels', 'loss_mask', 'position_ids', 'padding_mask')
+                if batch.get(key) is not None
+            ),
+            None,
         )
-        SEQUENCE_KEYS = ('tokens', 'labels', 'loss_mask', 'position_ids')
+        if sequence_tensor is None:
+            return batch
+        index = tex.thd_get_partitioned_indices(
+            cu_seqlens_for_te, sequence_tensor.size(1), cp_size, cp_rank
+        )
+        SEQUENCE_KEYS = ('tokens', 'labels', 'loss_mask', 'position_ids', 'padding_mask')
         for key in SEQUENCE_KEYS:
             if batch.get(key) is not None:
                 batch[key] = batch[key].index_select(1, index)
@@ -2636,7 +2641,7 @@ def flatten_batch_for_packed_sequences(batch: Dict[str, Any]) -> Dict[str, Any]:
         return batch
 
     seq_length = None
-    for key in ('tokens', 'labels', 'loss_mask', 'position_ids'):
+    for key in ('tokens', 'labels', 'loss_mask', 'position_ids', 'padding_mask'):
         if batch.get(key) is not None:
             seq_length = batch[key].shape[1]
             break
@@ -2651,11 +2656,41 @@ def flatten_batch_for_packed_sequences(batch: Dict[str, Any]) -> Dict[str, Any]:
     if batch.get('max_seqlen') is not None:
         batch['max_seqlen'] = batch['max_seqlen'].max().unsqueeze(0)
 
-    for key in ('tokens', 'labels', 'loss_mask', 'position_ids'):
+    for key in ('tokens', 'labels', 'loss_mask', 'position_ids', 'padding_mask'):
         if batch.get(key) is not None:
             batch[key] = batch[key].reshape(1, -1)
 
     return batch
+
+
+def _resolve_dynamic_cp_group_for_batch(
+    batch: Dict[str, Any],
+    hybrid_cp_group_func: Optional[Callable[[int], torch.distributed.ProcessGroup]],
+) -> torch.distributed.ProcessGroup:
+    """Resolve and validate the runtime CP group recorded by a scheduled batch."""
+    local_cp_size = batch.get('local_cp_size')
+    if local_cp_size is None:
+        raise ValueError("local_cp_size is required for dynamic context parallelism")
+    if isinstance(local_cp_size, torch.Tensor):
+        local_cp_size = int(local_cp_size.item())
+    else:
+        local_cp_size = int(local_cp_size)
+
+    runtime_cp_group = batch.get('hybrid_cp_group')
+    if runtime_cp_group is None:
+        if hybrid_cp_group_func is None:
+            raise ValueError("hybrid_cp_group_func is required to resolve the dynamic CP group")
+        runtime_cp_group = hybrid_cp_group_func(group_size=local_cp_size)
+    if runtime_cp_group is None:
+        raise ValueError(f"No dynamic CP group exists for local_cp_size={local_cp_size}")
+    runtime_cp_size = runtime_cp_group.size()
+    if runtime_cp_size != local_cp_size:
+        raise ValueError(
+            "Dynamic CP group size does not match local_cp_size: "
+            f"group has {runtime_cp_size} ranks, metadata requests {local_cp_size}."
+        )
+    batch['hybrid_cp_group'] = runtime_cp_group
+    return runtime_cp_group
 
 
 def get_batch_on_this_cp_rank(
@@ -2676,19 +2711,18 @@ def get_batch_on_this_cp_rank(
       - **Per-document zigzag**: When ``cu_seqlens`` is present and
         ``is_hybrid_cp`` is False, delegates to
         ``_get_batch_on_this_cp_rank_per_document_balancing``.
-      - **Hybrid CP**: When ``cu_seqlens`` is present and ``is_hybrid_cp`` is
-        True, creates a local hybrid CP group (via ``hybrid_cp_group_func``)
-        and delegates to ``_get_batch_on_this_cp_rank_per_sequence_balancing``.
-      - **Contiguous CP**: Keeps the hybrid residual stream in causal rank order.
+      - **Dynamic CP**: Resolves the runtime CP group before selecting either
+        sharding strategy. The singleton group is retained as batch metadata.
+      - **Contiguous CP**: Keeps the dynamic-CP residual stream in causal rank order.
 
     Args:
         batch (Dict[str, Any]): Input batch tensors. Must contain a
             'cu_seqlens' key (may be None for pretraining).
-        is_hybrid_cp (bool): Whether hybrid context parallelism is enabled.
+        is_hybrid_cp (bool): Whether dynamic context parallelism is enabled.
         cp_group (Optional[torch.distributed.ProcessGroup]): Context-parallel
             process group used for CP partitioning.
         hybrid_cp_group_func (Optional[Callable[[int], torch.distributed.ProcessGroup]]):
-            Factory function that returns a hybrid CP process group for a given
+            Factory function that returns a dynamic CP process group for a given
             ``group_size``. Required when ``is_hybrid_cp`` is True.
         use_per_sequence_balancing (bool): When True, use per-sequence zigzag
             even when ``cu_seqlens`` is present (e.g., for inter-document
@@ -2701,22 +2735,18 @@ def get_batch_on_this_cp_rank(
         to this CP rank.
     """
 
+    if cp_group is None:
+        cp_group = parallel_state.get_context_parallel_group()
+
+    if is_hybrid_cp:
+        cp_group = _resolve_dynamic_cp_group_for_batch(batch, hybrid_cp_group_func)
+
     if use_contiguous_cp:
         from megatron.core.context_parallel.utils import _get_batch_on_this_cp_rank_contiguous
 
         batch = _get_batch_on_this_cp_rank_contiguous(batch, cp_group=cp_group)
-    elif use_per_sequence_balancing or batch.get("cu_seqlens") is None:
+    elif is_hybrid_cp or use_per_sequence_balancing or batch.get("cu_seqlens") is None:
         batch = _get_batch_on_this_cp_rank_per_sequence_balancing(batch, cp_group=cp_group)
-    elif is_hybrid_cp:
-        assert (
-            batch['local_cp_size'] is not None
-        ), "local_cp_size is required for hybrid context parallel"
-        if batch['local_cp_size'].item() > 1:
-            hybrid_cp_group = hybrid_cp_group_func(group_size=batch['local_cp_size'].item())
-            batch = _get_batch_on_this_cp_rank_per_sequence_balancing(
-                batch, cp_group=hybrid_cp_group
-            )
-            batch["hybrid_cp_group"] = hybrid_cp_group
     else:
         batch = _get_batch_on_this_cp_rank_per_document_balancing(batch, cp_group=cp_group)
     return batch

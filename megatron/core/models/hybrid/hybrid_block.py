@@ -430,6 +430,7 @@ class HybridStack(MegatronModule):
         inference_params: Optional[BaseInferenceContext] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
         padding_mask=None,
+        padding_mask_by_layout: dict[CPLayout, Tensor | None] | None = None,
         packed_seq_params_by_layout: dict[CPLayout, PackedSeqParams | None] | None = None,
         cp_layout_plan: THDCPLayoutPlan | None = None,
     ):
@@ -452,11 +453,6 @@ class HybridStack(MegatronModule):
         """
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
-
-        if self._has_linear_layer_with_chunkwise_cp and padding_mask is not None:
-            raise NotImplementedError(
-                "Hybrid chunkwise context parallelism does not support padding masks."
-            )
 
         cp_layout_state = None
         if self._cp_layout_manager is not None:
@@ -556,6 +552,7 @@ class HybridStack(MegatronModule):
                     attention_bias=None,
                     packed_seq_params=packed_seq_params,
                     padding_mask=padding_mask,
+                    padding_mask_by_layout=padding_mask_by_layout,
                     use_inner_quantization_context=(use_inner_fp8_context or use_fp4_context),
                     cp_layout_state=cp_layout_state,
                     packed_sequence_cp_metadata=packed_sequence_cp_metadata,
@@ -568,6 +565,11 @@ class HybridStack(MegatronModule):
                     if cp_layout_state is not None:
                         hidden_states, layer_packed_seq_params = cp_layout_state.prepare_layer(
                             layer_idx, hidden_states
+                        )
+                    layer_padding_mask = padding_mask
+                    if cp_layout_state is not None:
+                        layer_padding_mask = cp_layout_state.get_layer_padding_mask(
+                            layer_idx, padding_mask, padding_mask_by_layout
                         )
                     # Layers have 1-indexed layer numbers attribute.
                     inner_quant_context = get_inner_quant_context(
@@ -592,7 +594,7 @@ class HybridStack(MegatronModule):
                                 rotary_pos_emb=rotary_pos_emb,
                                 sequence_len_offset=sequence_len_offset,
                                 packed_seq_params=layer_packed_seq_params,
-                                padding_mask=padding_mask,
+                                padding_mask=layer_padding_mask,
                             )
                             if layer_cp_metadata is not None:
                                 layer_kwargs["packed_sequence_cp_metadata"] = layer_cp_metadata
