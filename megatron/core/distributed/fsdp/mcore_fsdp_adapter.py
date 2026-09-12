@@ -714,11 +714,9 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             # silently inflated norm.
             raise ValueError("MFSDP v2 does not currently support mtp_detach_heads.")
 
-        unsupported_parallelisms = [
-            "tensor_model_parallel_size",
-            "pipeline_model_parallel_size",
-            "context_parallel_size",
-        ]
+        # Context parallelism is absent on purpose: the mesh is built from dp_cp, which
+        # already folds CP ranks into the axis this shards and reduces gradients over.
+        unsupported_parallelisms = ["tensor_model_parallel_size", "pipeline_model_parallel_size"]
         if any(getattr(config, parallelism) != 1 for parallelism in unsupported_parallelisms):
             raise ValueError(
                 "MFSDP v2 does not currently support: "
@@ -730,7 +728,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
 
         # The config validates the requested topology, while these checks validate the
         # materialized topology supplied by the caller's process-group collection.
-        for group_name in ("tp", "pp", "cp"):
+        for group_name in ("tp", "pp"):
             group = getattr(pg_collection, group_name, None)
             if group is not None and group.size() != 1:
                 raise ValueError(
