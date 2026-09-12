@@ -1354,7 +1354,7 @@ def test_async_sched_initial_no_overlap_step_launches_primer_only():
     controller._async_sched_logits = AsyncScheduleLogitsState()
     call_order = []
 
-    def admit_request():
+    def admit_request(_prompt_logprob_updates):
         call_order.append("admit")
         context.total_request_count = 1
         context.active_token_count = 4
@@ -1395,7 +1395,7 @@ def test_async_sched_no_overlap_admission_can_finish_without_launching_a_primer(
     assert result == DynamicBatchControllerStepResult(
         decode_only=DecodeOnly(consumed=None, launched=None)
     )
-    admit_request.assert_called_once_with()
+    admit_request.assert_called_once_with({})
     controller._run_async_sched_forward_primer.assert_not_called()
 
 
@@ -1518,7 +1518,7 @@ def test_async_sched_no_overlap_updates_before_admission(
     ):
         result = asyncio.run(
             controller._run_async_sched_step_no_overlap(
-                schedule_waiting_requests=lambda: call_order.append("admit")
+                schedule_waiting_requests=lambda _updates: call_order.append("admit")
             )
         )
 
@@ -1534,12 +1534,12 @@ def test_async_sched_no_overlap_updates_before_admission(
         "log_probs",
         "copy_log_probs",
         "wait:sample",
+        "wait:log_probs",
+        "materialize_log_probs",
         "update",
         "admit",
         "context_init",
         "forward",
-        "wait:log_probs",
-        "materialize_log_probs",
         "yield",
     ]
     context.resolve_requests.assert_not_called()

@@ -815,6 +815,8 @@ class DynamicInferenceRequest(InferenceRequest):
         obj = super().serialize()
         obj["events"] = [e.serialize() for e in self.events]
         obj.pop("event_add_engine", None)
+        obj.pop("_prompt_logprobs_cache_key", None)
+        obj.pop("_pending_prompt_logprob_row", None)
         obj["prompt_length"] = prompt_len
 
         # Sanity check routing_indices: ndarray [total_tokens - 1, num_layers, topk]

@@ -113,7 +113,7 @@ class _MambaMetadata:
 
 
 class _SchedulerHarness:
-    def schedule_waiting_requests(self):
+    def schedule_waiting_requests(self, prompt_logprob_updates=None):
         if not self.waiting_request_ids:
             return
         request_id = self.waiting_request_ids[0]
@@ -689,7 +689,7 @@ def test_transfer_polling_defers_batch_mutation_to_scheduling(handoff_loop):
         assert engine._poll_pending_kv_imports() == 1
         finalize.assert_not_called()
 
-        engine.schedule_waiting_requests()
+        engine.schedule_waiting_requests({"sentinel": {}})
         _drain_loop(handoff_loop)
 
     finalize.assert_called_once_with(pending)

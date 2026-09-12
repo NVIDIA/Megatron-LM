@@ -59,7 +59,7 @@ from .attention_context.mamba_metadata import MambaMetadata
 from .attention_context.mha_metadata import GraphedMHAMetadata, NonGraphedMHAMetadata
 from .base_context import BaseInferenceContext
 from .gpu_view import ContextGPUView
-from .kv_block_allocator import KVBlockAllocator
+from .kv_block_allocator import KVBlockAllocator, PromptLogprobsBlock
 from .mamba_slot_allocator import MAX_INTERMEDIATE_OFFSETS_PER_REQUEST, MambaSlotAllocator
 from .routing_metadata import RoutingMetadata
 
@@ -1386,6 +1386,12 @@ class DynamicInferenceContext(BaseInferenceContext):
         self._decode_logit_idxs = torch.arange(
             max_logit_idxs, dtype=torch.int32, device=torch.cuda.current_device()
         )
+        # A partial prefill chunk's final logit predicts the next prompt token,
+        # rather than the provisional sampled token that is discarded after the
+        # step. Only one partial prefill request may be scheduled at a time.
+        self.chunked_prefill_next_prompt_token = torch.empty(
+            (), dtype=torch.int64, device=torch.cuda.current_device()
+        )
 
         # MHA flash-attention metadata views (write-only on CPU, read-only on
         # GPU via the matching region of ContextGPUView._buf). Populated per
@@ -1513,6 +1519,12 @@ class DynamicInferenceContext(BaseInferenceContext):
         # update_requests() (CPU phase), executed by transfer_bookkeeping_to_gpu().
         self._pending_mamba_zeros: list = []
         self._pending_mamba_restores: list = []
+
+        # Per-request prompt-logprob cache state used while the controller stores
+        # and eventually materializes allocator-owned sidecars.
+        self.prompt_logprobs_cache_keys: Dict[int, Any] = {}
+        self.prompt_logprobs_block_hashes: Dict[int, Tuple[int, ...]] = {}
+        self.prompt_logprobs_matched_refs: Dict[int, Dict[int, PromptLogprobsBlock]] = {}
 
         # Allocate large non-graphed buffers.
         need_static_addr = (
@@ -2907,6 +2919,10 @@ class DynamicInferenceContext(BaseInferenceContext):
         # There is no prefix-cache state to preserve when caching is disabled.
         preserve_prefix_cache = preserve_prefix_cache and self.enable_prefix_caching
 
+        self.prompt_logprobs_cache_keys.clear()
+        self.prompt_logprobs_block_hashes.clear()
+        self.prompt_logprobs_matched_refs.clear()
+
         # Reset request/token counts.
         self.total_request_count = 0
         self.active_token_count = 0
@@ -3105,6 +3121,26 @@ class DynamicInferenceContext(BaseInferenceContext):
         is_cached = torch.isin(block_hashes, cached_hashes)
         return int(is_cached.nonzero()[-1].item()) + 1 if is_cached.any() else 0
 
+    def _find_prompt_logprob_match_count(
+        self, req: DynamicInferenceRequest, start_block: int, matched_block_ids: list[int]
+    ) -> int:
+        """Count the consecutive matched blocks with an exact logprob sidecar."""
+        cache_key = getattr(req, "_prompt_logprobs_cache_key", None)
+        if cache_key is None:
+            return 0
+
+        for offset, block_id in enumerate(matched_block_ids):
+            block_index = start_block + offset
+            block_hash = req.precomputed_block_hashes[block_index]
+            if (
+                self.kv_block_allocator.get_prompt_logprobs_block(
+                    block_id, cache_key, expected_block_hash=block_hash
+                )
+                is None
+            ):
+                return offset
+        return len(matched_block_ids)
+
     def _compute_prefix_match(
         self,
         req: DynamicInferenceRequest,
@@ -3134,6 +3170,8 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Fast path: skip all prefix matching when disabled.
         if not self.enable_prefix_caching:
+            if record_mamba_match and self.is_hybrid_model:
+                req._mamba_num_matched_blocks = 0
             num_blocks_from_pool = max(0, overall_required_blocks - already_allocated_blocks)
             return (
                 [],
@@ -3150,7 +3188,22 @@ class DynamicInferenceContext(BaseInferenceContext):
         num_matched = len(matched_block_ids)
 
         block_aligned = finished % self.block_size_tokens == 0
-        if num_matched > 0 and block_aligned:
+        prompt_logprob_key = getattr(req, "_prompt_logprobs_cache_key", None)
+        num_logprob_matched = self._find_prompt_logprob_match_count(
+            req, already_allocated_blocks, matched_block_ids
+        )
+        if prompt_logprob_key is not None and num_logprob_matched > 0 and block_aligned:
+            if self.is_hybrid_model:
+                # Recurrent state is restored only at block boundaries.
+                prefix_skip_tokens = max(0, num_logprob_matched - 1) * self.block_size_tokens
+            else:
+                # A score belongs to its target token. To compute the first
+                # uncached target, pure-attention models therefore recompute the
+                # final source token of the last sidecar-backed block.
+                prefix_skip_tokens = min(
+                    num_logprob_matched * self.block_size_tokens - 1, prefill_chunk_length - 1
+                )
+        elif prompt_logprob_key is None and num_matched > 0 and block_aligned:
             prefix_skip_tokens = min(num_matched * self.block_size_tokens, prefill_chunk_length - 1)
         else:
             prefix_skip_tokens = 0
@@ -3169,7 +3222,13 @@ class DynamicInferenceContext(BaseInferenceContext):
             assert (
                 num_mamba_matched <= num_matched
             ), f"Mamba match ({num_mamba_matched}) > KV match ({num_matched})"
-            if num_mamba_matched > 0 and block_aligned:
+            if prompt_logprob_key is not None and block_aligned:
+                # Recurrent state is stored only at block boundaries. Restore
+                # the preceding boundary and recompute the final sidecar-backed
+                # block so the first uncached prompt score has the right state.
+                executable_blocks = min(num_mamba_matched, num_logprob_matched)
+                prefix_skip_tokens = max(0, executable_blocks - 1) * self.block_size_tokens
+            elif num_mamba_matched > 0 and block_aligned:
                 raw_skip = num_mamba_matched * self.block_size_tokens
                 if raw_skip >= prefill_chunk_length:
                     # Back off to previous block with cached Mamba state
@@ -3234,7 +3293,9 @@ class DynamicInferenceContext(BaseInferenceContext):
             effective_prefill_chunk_length,
         )
 
-    def check_availability(self, req: DynamicInferenceRequest) -> Tuple[bool, bool, bool]:
+    def check_availability(
+        self, req: DynamicInferenceRequest, prefill_chunk_length: Optional[int] = None
+    ) -> Tuple[bool, bool, bool]:
         """
         Check if the request can be added to the context.
         """
@@ -3248,8 +3309,11 @@ class DynamicInferenceContext(BaseInferenceContext):
         if self.is_hybrid_model and self.kv_block_allocator.enable_handoff_pinning:
             request_can_be_added &= self.mamba_metadata.mamba_state_free_slot_count > 0
 
+        if prefill_chunk_length is None:
+            prefill_chunk_length = req.remaining_prompt_length
+
         matched_block_ids, num_blocks_from_pool, _, _, _, effective_prefill_chunk_length = (
-            self._compute_prefix_match(req, req.remaining_prompt_length)
+            self._compute_prefix_match(req, prefill_chunk_length)
         )
 
         request_tokens_can_be_added = (
@@ -3343,6 +3407,16 @@ class DynamicInferenceContext(BaseInferenceContext):
             prefill_chunk_length <= req.remaining_prompt_length
         ), "Prefill chunk length is greater than remaining prompt length"
 
+        if prefill_chunk_length < req.remaining_prompt_length:
+            self.chunked_prefill_next_prompt_token.copy_(
+                req.remaining_prompt_tokens[prefill_chunk_length]
+            )
+
+        prompt_logprob_key = getattr(req, "_prompt_logprobs_cache_key", None)
+        if prompt_logprob_key is not None:
+            self.prompt_logprobs_cache_keys[req.request_id] = prompt_logprob_key
+            self.prompt_logprobs_block_hashes[req.request_id] = tuple(req.precomputed_block_hashes)
+
         # =========================================================================
         # Block allocation + prefix matching + prefill skipping
         # =========================================================================
@@ -3356,6 +3430,19 @@ class DynamicInferenceContext(BaseInferenceContext):
         ) = self._compute_prefix_match(req, prefill_chunk_length, record_mamba_match=True)
         num_matched_blocks = len(matched_block_ids)
         effective_kv_offset = req.finished_chunk_token_count + prefix_skip_tokens
+        cache_hit_blocks = num_matched_blocks
+        if prompt_logprob_key is not None:
+            cache_hit_blocks = self._find_prompt_logprob_match_count(
+                req, already_allocated_blocks, matched_block_ids
+            )
+            retained_refs = self.prompt_logprobs_matched_refs.setdefault(req.request_id, {})
+            for offset, block_id in enumerate(matched_block_ids[:cache_hit_blocks]):
+                logical_block_index = already_allocated_blocks + offset
+                retained = self.kv_block_allocator.get_prompt_logprobs_block(
+                    block_id, prompt_logprob_key, req.precomputed_block_hashes[logical_block_index]
+                )
+                assert retained is not None
+                retained_refs[logical_block_index] = retained
 
         # Slice tokens to skip matched prefix
         this_round_tokens = req.remaining_prompt_tokens[prefix_skip_tokens:prefill_chunk_length]
@@ -3385,12 +3472,12 @@ class DynamicInferenceContext(BaseInferenceContext):
                     self.kv_block_allocator.block_ref_counts[matched_tensor] -= 1
                 raise BlockOverflowError(req.request_id)
 
-        # Track prefix cache hits only after allocation succeeds. Matched blocks
-        # measure KV reuse, while num_cached_tokens accumulates the prefill tokens
-        # actually skipped after Mamba and minimum-prefill backoff.
-        if num_matched_blocks > 0:
+        # Track prefix cache hits only after allocation succeeds. Prompt-logprob
+        # requests count only score-compatible blocks, while num_cached_tokens
+        # records the prefill tokens actually skipped after all backoff.
+        if cache_hit_blocks > 0:
             self.prefix_cache_hits += 1
-            self.prefix_cache_blocks_matched += num_matched_blocks
+            self.prefix_cache_blocks_matched += cache_hit_blocks
             req.num_cached_tokens += prefix_skip_tokens
 
         # Note that we decremented the total_request_count for the chunked prefill request
