@@ -103,7 +103,12 @@ def _te_or_local_layer_spec(config: "GPTModelConfig", vp_stage: int) -> ModuleSp
     use_te = transformer_cfg.transformer_impl == "transformer_engine"
     if use_te:
         if "use_te_op_fuser" in inspect.signature(get_gpt_layer_with_transformer_engine_spec).parameters:
-            kwargs = {"use_te_op_fuser": config.use_transformer_engine_op_fuser}
+            kwargs = {
+                "use_te_op_fuser": (
+                    transformer_cfg.use_transformer_engine_op_fuser
+                    or transformer_cfg.moe_use_transformer_engine_fused_moe
+                )
+            }
         else:
             kwargs = {}
         return get_gpt_layer_with_transformer_engine_spec(

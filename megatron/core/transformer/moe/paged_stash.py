@@ -698,6 +698,7 @@ class PagedStashManager:
 
         original_shape = tensor.shape
         columnwise_scale_inv = tensor.grouped_tensor_scale_inv
+        num_tokens_tensor = getattr(tensor, 'grouped_tensor_num_tokens', self.num_tokens_tensor)
         tensor = tensor.flatten()
         dtype = tensor.dtype
         hidden_size = tensor.numel() // (
@@ -715,7 +716,7 @@ class PagedStashManager:
         avg_num_tokens = None
         if self.status == 'capture':
 
-            self.num_tokens = self.num_tokens_tensor.item()
+            self.num_tokens = num_tokens_tensor.item()
             actual_num_tokens = (
                 self.num_tokens // SCALE_INV_BLOCK_SIZE if columnwise_scale_inv else self.num_tokens
             )
@@ -725,6 +726,13 @@ class PagedStashManager:
             if (dtype, hidden_size) not in self.temp_tokens_across_vp_stages:
                 self.temp_tokens_across_vp_stages[dtype, hidden_size] = 0
                 self.max_tokens_across_vp_stages[dtype, hidden_size] = 0
+            # Do not populate the average-token maps when no hint is provided. Keeping them
+            # empty makes buffer allocation fall back to actual-token sizing instead of
+            # treating zero-valued entries as valid and allocating zero-sized buffers.
+            if (
+                avg_num_tokens is not None
+                and (dtype, hidden_size) not in self.temp_avg_tokens_across_vp_stages
+            ):
                 self.temp_avg_tokens_across_vp_stages[dtype, hidden_size] = 0
                 self.max_avg_tokens_across_vp_stages[dtype, hidden_size] = 0
 
@@ -757,7 +765,7 @@ class PagedStashManager:
         tensor.grouped_tensor_scale_inv = columnwise_scale_inv
         paged_tensor = PagedTensor(
             tensor,
-            num_tokens_tensor=self.num_tokens_tensor,
+            num_tokens_tensor=num_tokens_tensor,
             avg_num_tokens=avg_num_tokens,
             vp_stage=self.current_vp_stage,
             original_shape=original_shape,

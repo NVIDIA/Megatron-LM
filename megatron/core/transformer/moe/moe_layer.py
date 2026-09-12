@@ -700,12 +700,24 @@ class MoELayer(BaseMoELayer):
                 if intermediate_tensors is not None:
                     hidden_states, probs = intermediate_tensors
 
-                dispatched_input, probs = self.dispatch(hidden_states, probs)
-                output, mlp_bias = self.routed_experts_compute(dispatched_input, probs)
+                if self.config.moe_use_transformer_engine_fused_moe:
+                    ep_config, topk_idx, topk_weights = (
+                        self.token_dispatcher.prepare_fused_moe_sequential()
+                    )
+                    output = self.experts.fused_moe_forward(
+                        hidden_states,
+                        topk_idx,
+                        topk_weights,
+                        ep_config,
+                    )
+                    mlp_bias = None
+                else:
+                    dispatched_input, probs = self.dispatch(hidden_states, probs)
+                    output, mlp_bias = self.routed_experts_compute(dispatched_input, probs)
+                    output = self.combine(output)
                 assert (
                     mlp_bias is None
                 ), f"mlp_bias is not supported for {type(self.token_dispatcher)}"
-                output = self.combine(output)
 
                 if intermediate_tensors is not None:
                     return output, mlp_bias

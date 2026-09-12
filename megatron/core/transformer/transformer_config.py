@@ -1039,12 +1039,22 @@ class TransformerConfig(ModelParallelConfig):
     symm-mem buffers are a fixed [recv_capacity, hidden] and cannot be resized per step) and the
     fused op (use_transformer_engine_op_fuser). Defaults to False."""
 
+    moe_use_transformer_engine_fused_moe: bool = False
+    """Build routed experts as one Transformer Engine
+    ``Sequential(MoeDispatch, FC1, SwiGLU, FC2, MoeCombine)`` and require Transformer Engine to
+    replace it with the cuDNN ``FusedMoeEp`` implementation. The first forward raises an error
+    when no eligible fused implementation is available. This option enables the op-fuser for the
+    routed experts without requiring the model-wide ``use_transformer_engine_op_fuser`` option.
+    The TE Sequential is retained for the module lifetime. Set
+    ``NVTE_MEGAMOE_TRAINING_SLOT_COUNT`` when more than the TE default of eight forward
+    microbatches may be simultaneously in flight."""
+
     moe_dispatch_fwd_dtype: Literal['bf16', 'mxfp8'] = 'bf16'
     """Wire dtype of the MoE dispatch forward payload ('ncclep' flex dispatcher only). With
     'mxfp8', TransformerEngine quantizes the payload before the all-to-all and the receive
     buffer comes back as a per-expert MXFP8 GroupedTensor that the grouped GEMM consumes
-    directly. Requires moe_grouped_gemm and use_transformer_engine_op_fuser. Defaults to
-    'bf16' (no quantization on the wire)."""
+    directly. Requires ``moe_grouped_gemm`` and either the model-wide op-fuser or the
+    end-to-end fused MoE Sequential. Defaults to 'bf16' (no quantization on the wire)."""
 
     moe_combine_bwd_dtype: Literal['bf16', 'mxfp8'] = 'bf16'
     """Wire dtype of the MoE combine backward gradient ('ncclep' flex dispatcher only). With
@@ -1564,7 +1574,10 @@ class TransformerConfig(ModelParallelConfig):
                 self.experimental_attention_variant
             )
 
-        if self.use_transformer_engine_op_fuser and self.moe_grouped_gemm:
+        if (
+            self.use_transformer_engine_op_fuser
+            or self.moe_use_transformer_engine_fused_moe
+        ) and self.moe_grouped_gemm:
             self.moe_use_grouped_tensor = True
 
         if self.moe_use_grouped_tensor and not self.moe_grouped_gemm:
@@ -1978,6 +1991,64 @@ class TransformerConfig(ModelParallelConfig):
                     "moe_flex_dispatcher_backend='ncclep' requires "
                     "moe_token_dispatcher_type='flex'."
                 )
+            if self.moe_use_grouped_tensor and not (
+                self.use_transformer_engine_op_fuser
+                or self.moe_use_transformer_engine_fused_moe
+            ):
+                raise ValueError(
+                    "moe_use_grouped_tensor=True without use_transformer_engine_op_fuser is "
+                    "not yet supported with the NCCL-EP dispatcher. Use the TE op-fuser path "
+                    "or select the alltoall, DeepEP, or HybridEP dispatcher."
+                )
+
+        if self.moe_use_transformer_engine_fused_moe:
+            requirements = {
+                "moe_token_dispatcher_type='flex'": self.moe_token_dispatcher_type == "flex",
+                "moe_flex_dispatcher_backend='ncclep'": (
+                    self.moe_flex_dispatcher_backend == "ncclep"
+                ),
+                "moe_grouped_gemm=True": self.moe_grouped_gemm,
+                "moe_single_grouped_weight=True": self.moe_single_grouped_weight,
+                "moe_use_grouped_tensor=True": self.moe_use_grouped_tensor,
+                "gated_linear_unit=True": self.gated_linear_unit,
+                "activation_func=F.silu": self.activation_func is F.silu,
+                "add_bias_linear=False": not self.add_bias_linear,
+                "bf16=True": self.bf16,
+            }
+            missing = [name for name, enabled in requirements.items() if not enabled]
+            if missing:
+                raise ValueError(
+                    "moe_use_transformer_engine_fused_moe requires " + ", ".join(missing) + "."
+                )
+            if self.fp4:
+                raise ValueError("moe_use_transformer_engine_fused_moe does not support FP4.")
+            if self.fp8 and self.fp8_recipe != Fp8Recipe.mxfp8:
+                raise ValueError(
+                    "moe_use_transformer_engine_fused_moe supports only the MXFP8 FP8 recipe."
+                )
+            if self.fp8:
+                # TE MoeDispatch/MoeCombine take MXFP8 comms from the autocast quantizer
+                # role and require matching EpBuffer recipes.
+                self.moe_dispatch_fwd_dtype = 'mxfp8'
+                self.moe_combine_bwd_dtype = 'mxfp8'
+            incompatible = {
+                "overlap_moe_expert_parallel_comm": self.overlap_moe_expert_parallel_comm,
+                "moe_shared_expert_overlap": self.moe_shared_expert_overlap,
+                "moe_latent_size": self.moe_latent_size is not None,
+                "overlap_dispatch_backward_with_experts_wgrad": (
+                    self.overlap_dispatch_backward_with_experts_wgrad
+                ),
+                "delay_wgrad_compute": self.delay_wgrad_compute,
+                "fine_grained_activation_offloading": self.fine_grained_activation_offloading,
+                "moe_ncclep_zero_copy": self.moe_ncclep_zero_copy,
+            }
+            active = [name for name, enabled in incompatible.items() if enabled]
+            if active:
+                raise ValueError(
+                    "moe_use_transformer_engine_fused_moe does not yet support "
+                    + ", ".join(active)
+                    + "."
+                )
 
         if self.moe_dispatch_fwd_dtype != 'bf16' or self.moe_combine_bwd_dtype != 'bf16':
             if (
@@ -1988,11 +2059,17 @@ class TransformerConfig(ModelParallelConfig):
                     "moe_dispatch_fwd_dtype / moe_combine_bwd_dtype require the 'ncclep' flex "
                     "dispatcher backend."
                 )
-            if not (self.use_transformer_engine_op_fuser and self.moe_grouped_gemm):
+            if not (
+                (
+                    self.use_transformer_engine_op_fuser
+                    or self.moe_use_transformer_engine_fused_moe
+                )
+                and self.moe_grouped_gemm
+            ):
                 raise ValueError(
                     "moe_dispatch_fwd_dtype / moe_combine_bwd_dtype = 'mxfp8' require BOTH "
-                    "use_transformer_engine_op_fuser and moe_grouped_gemm: only the fused "
-                    "grouped GEMM path consumes the pre-quantized MXFP8 GroupedTensor payload."
+                    "an enabled TE MoE op-fuser path and moe_grouped_gemm: only the fused grouped "
+                    "GEMM path consumes the pre-quantized MXFP8 GroupedTensor payload."
                 )
 
         if self.moe_use_norm_before_up_proj and self.moe_latent_size is None:
