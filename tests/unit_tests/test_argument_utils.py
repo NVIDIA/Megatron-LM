@@ -89,6 +89,20 @@ def test_moe_norm_flag_reaches_transformer_config():
     assert config.moe_use_norm_before_up_proj is True
 
 
+def test_hash_moe_uses_tp_independent_tokenizer_vocab_size():
+    parser = ArgumentParser()
+    add_megatron_arguments(parser)
+    args = parser.parse_args([])
+    args.params_dtype = torch.float32
+    args.tokenizer_vocab_size = 100003
+    args.vocab_size = 100003
+    args.padded_vocab_size = 100352
+
+    config = core_transformer_config_from_args(args, config_class=CapturingTransformerConfig)
+
+    assert config.hash_moe_vocab_size == 100003
+
+
 def test_moe_norm_flag_requires_latent_size(monkeypatch):
     """validate_args should reject the LatentMoE norm flag without a latent size."""
     monkeypatch.setattr(sys, 'argv', ['test_argument_utils.py'])
