@@ -59,14 +59,19 @@ spec:
       --bucket $BUCKET \
       --platform gb200 \
       --unit-test-repeat $UNIT_TEST_REPEAT \
+      --unit-testmon-mode {unit_testmon_mode} \
       --log-dir {assets_dir}/logs/1/
 
     ls -al
 
     cd $TEST_PATH
-    /opt/venv/bin/coverage xml
-    cp .coverage {assets_dir}/coverage_report
-    cp coverage.xml {assets_dir}
+    if [[ -f .coverage ]]; then
+        /opt/venv/bin/coverage xml
+        cp .coverage {assets_dir}/coverage_report
+        cp coverage.xml {assets_dir}
+    else
+        echo "No unit-test coverage data was produced; skipping coverage export."
+    fi
 
 # GB200 unit-test selection is marker-driven: a single catch-all bucket is
 # narrowed to files carrying @pytest.mark.launch_on_gb200 by find_test_cases.py

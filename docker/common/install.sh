@@ -147,7 +147,8 @@ main() {
             --link-mode copy \
             --locked \
             --extra ${ENVIRONMENT} \
-            --all-groups ${UV_ARGS[@]}
+            --all-groups \
+            --no-group testmon ${UV_ARGS[@]}
 
         # Install the package
         uv pip install --no-deps -e .
