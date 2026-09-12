@@ -5384,19 +5384,11 @@ def evaluate(
                     val = [x[key].view(-1) for x in loss_dicts]
 
                     if val[0].numel() == 2:
-                        if args.sft:
-                            # normalize over micro batch instead of global
-                            val = torch.vstack(val)
-                            val = val[:, 0] / val[:, 1].clamp(min=1)
-                            val = val.mean()
-                            torch.distributed.all_reduce(val, group=eval_dp_cp_group)
-                            val /= torch.distributed.get_world_size(group=eval_dp_cp_group)
-                            total_loss_dict[key][0] += val
-                            total_loss_dict[key][1] += 1
-                        else :
-                            val = torch.vstack(val).sum(dim=0)
-                            torch.distributed.all_reduce(val, group=eval_dp_cp_group)
-                            total_loss_dict[key] += val
+                        # Preserve loss sums and valid-token counts across microbatches,
+                        # DP/CP ranks, and iterations. SFT masks can make counts unequal.
+                        val = torch.vstack(val).sum(dim=0)
+                        torch.distributed.all_reduce(val, group=eval_dp_cp_group)
+                        total_loss_dict[key] += val
                     elif val[0].numel() == 1:
                         val = torch.cat(val).sum()
                         total_loss_dict[key][0] += val
@@ -5442,7 +5434,7 @@ def evaluate(
 
     for key in total_loss_dict:
         numerator, denominator = total_loss_dict[key]
-        total_loss_dict[key] = numerator / denominator
+        total_loss_dict[key] = numerator / denominator.clamp(min=1)
 
     timers('evaluate').stop()
     timers.log(['evaluate'])
