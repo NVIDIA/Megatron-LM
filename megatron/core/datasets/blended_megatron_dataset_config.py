@@ -58,7 +58,19 @@ class BlendedMegatronDatasetConfig:
     """Where all re-useable dataset indices are to be cached."""
 
     mmap_bin_files: bool = True
-    """Whether to mmap the .bin files or use file pointers."""
+    """Whether to mmap the .bin files or use file pointers.
+
+       Set to False when the .bin files cannot be safely mmapped by the process. Known cases:
+
+       - Object storage backends (e.g. S3) where mmap is not supported.
+       - Parallel filesystems (e.g. Lustre, WekaFS) when a blend contains many prefixes
+         (hundreds or more). The FS client may enforce a per-process live-mmap quota that is
+         lower than ``vm.max_map_count`` and raise ``PermissionError: [Errno 1] Operation not
+         permitted`` (EPERM) from ``numpy.memmap`` partway through ``IndexedDataset``
+         construction. Switching to file-pointer reads halves the per-dataset mmap count
+         (the ``.idx`` mmap is still unconditional) and is often enough to clear the
+         threshold. See NVIDIA-NeMo/Megatron-Bridge#3968.
+    """
 
     mock: bool = field(init=False, default=False)
     """Whether to bypass real data loading and validation in favor of mock data generation.
