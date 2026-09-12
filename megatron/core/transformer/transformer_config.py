@@ -337,9 +337,6 @@ class TransformerConfig(ModelParallelConfig):
     dsa_simplified_indexer_disable_main_input_norm: bool = False
     """Whether simplified DSA skips the main-QKV input normalization."""
 
-    dsa_standard_indexer_use_main_input_norm: bool = False
-    """Whether standard DSA consumes the normalized input used by the main QKV projection."""
-
     dsa_indexer_n_heads: Optional[int] = None
     """Number of DSA indexer heads."""
 
@@ -449,9 +446,6 @@ class TransformerConfig(ModelParallelConfig):
     """Whether DSA indexer key LayerNorm should run on fp32 inputs."""
     dsa_indexer_sparse_loss_use_topk_only: bool = False
     """When using sparse DSA indexer loss, compute KL only on the selected top-k support."""
-
-    dsa_indexer_use_hadamard: bool = False
-    """Whether to apply Hadamard rotation to DSA indexer queries and keys."""
 
     ####################
     # Compressed sparse attention
@@ -3510,12 +3504,6 @@ class TransformerConfig(ModelParallelConfig):
             "dsa_simplified_indexer_disable_main_input_norm requires "
             "experimental_attention_variant='dsa' and dsa_indexer_mode='simplified'."
         )
-        assert not self.dsa_standard_indexer_use_main_input_norm or (
-            self.experimental_attention_variant == "dsa" and self.dsa_indexer_mode == "standard"
-        ), (
-            "dsa_standard_indexer_use_main_input_norm requires "
-            "experimental_attention_variant='dsa' and dsa_indexer_mode='standard'."
-        )
         assert (
             not self.dsa_fwd_skip_dsa or self.experimental_attention_variant == "dsa"
         ), "dsa_fwd_skip_dsa requires experimental_attention_variant='dsa'."
@@ -3595,9 +3583,10 @@ class TransformerConfig(ModelParallelConfig):
                 self.dsa_indexer_n_heads = 1
                 if self.dsa_indexer_head_dim is None:
                     self.dsa_indexer_head_dim = self.kv_channels
-                assert (
-                    not self.dsa_indexer_use_hadamard
-                ), "Simplified DSA uses a plain Q/K dot product and does not support Hadamard."
+                # Simplified DSA scores a plain Q/K dot product, with no Hadamard rotation to
+                # apply. dsa_indexer_rotate_activation defaults True for the standard indexer,
+                # so resolve it here rather than making every simplified config turn it off.
+                self.dsa_indexer_rotate_activation = False
                 assert (
                     self.dsa_simplified_use_learned_k or not self.dsa_kernel_cache_indexer_k
                 ), "Simplified DSA using main-attention K has no separate indexer K cache."
@@ -3756,9 +3745,9 @@ class TransformerConfig(ModelParallelConfig):
                             "Sparse-forward dense-loss mode has no selected scores; do not set "
                             "dsa_kernel_cache_selected_scores."
                         )
-                assert skip_dsa or simplified_indexer or self.dsa_indexer_use_hadamard, (
-                    "min-memory dsa_kernel_backend requires "
-                    "dsa_indexer_use_hadamard for the standard DeepSeek indexer."
+                assert skip_dsa or simplified_indexer or self.dsa_indexer_rotate_activation, (
+                    "min-memory dsa_kernel_backend requires dsa_indexer_rotate_activation for "
+                    "the standard DeepSeek indexer."
                 )
             if self.context_parallel_size > 1:
                 cp_comm_types = (

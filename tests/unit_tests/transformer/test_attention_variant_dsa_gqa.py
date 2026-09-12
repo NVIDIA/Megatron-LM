@@ -269,59 +269,6 @@ def test_transformer_config_accepts_disabled_simplified_main_input_norm():
     assert config.dsa_simplified_indexer_disable_main_input_norm
 
 
-def test_transformer_config_rejects_standard_main_input_norm_for_simplified_dsa():
-    with pytest.raises(AssertionError, match="dsa_indexer_mode='standard'"):
-        TransformerConfig(
-            num_layers=1,
-            hidden_size=32,
-            num_attention_heads=4,
-            num_query_groups=1,
-            kv_channels=8,
-            experimental_attention_variant="dsa",
-            add_bias_linear=False,
-            dsa_indexer_mode="simplified",
-            dsa_indexer_topk=4,
-            dsa_standard_indexer_use_main_input_norm=True,
-        )
-
-
-@pytest.mark.parametrize("enabled", [False, True])
-def test_attention_wrapper_supplies_fused_norm_to_standard_indexer_only_when_enabled(enabled):
-    hidden_states = torch.randn(3, 1, 8)
-    linear_qkv = SimpleNamespace(layer_norm_weight=torch.randn(8), layer_norm_bias=None, eps=1.0e-5)
-    attention = SimpleNamespace(
-        config=SimpleNamespace(
-            experimental_attention_variant="dsa",
-            dsa_indexer_mode="standard",
-            dsa_standard_indexer_use_main_input_norm=enabled,
-            dsa_fwd_skip_dsa=False,
-            normalization="RMSNorm",
-            layernorm_epsilon=1.0e-5,
-            layernorm_zero_centered_gamma=False,
-        ),
-        linear_qkv=linear_qkv,
-        _use_indexer_rope=lambda *args: False,
-    )
-
-    kwargs = DSGroupedSelfAttention._get_core_attention_extra_kwargs(
-        attention,
-        hidden_states,
-        torch.empty(0),
-        torch.empty(0),
-        torch.empty(0),
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        AttnMaskType.causal,
-        None,
-    )
-
-    assert (kwargs["indexer_input_norm"] is not None) is enabled
-
-
 @pytest.mark.parametrize("disable_main_input_norm", [False, True])
 def test_attention_wrapper_honors_simplified_main_input_norm_disable(disable_main_input_norm):
     hidden_states = torch.randn(3, 1, 8)
@@ -398,7 +345,28 @@ def test_transformer_config_accepts_simplified_dsa_and_derives_shape():
 
     assert config.dsa_indexer_n_heads == 1
     assert config.dsa_indexer_head_dim == 8
-    assert not config.dsa_indexer_use_hadamard
+
+
+def test_simplified_dsa_turns_off_indexer_rotation():
+    """Simplified DSA scores a plain dot product, so the rotation setting resolves to off.
+
+    dsa_indexer_rotate_activation defaults True for the standard DeepSeek indexer. Rather than
+    make every simplified config turn it off, __post_init__ resolves it -- there is no Hadamard
+    rotation in the simplified scoring path for the flag to control.
+    """
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=32,
+        num_attention_heads=4,
+        num_query_groups=1,
+        kv_channels=8,
+        experimental_attention_variant="dsa",
+        add_bias_linear=False,
+        dsa_indexer_mode="simplified",
+        dsa_indexer_topk=4,
+    )
+
+    assert not config.dsa_indexer_rotate_activation
 
 
 def test_transformer_config_accepts_simplified_learned_k_with_independent_dimension():
@@ -610,7 +578,6 @@ def test_simplified_indexer_rope_matches_model_rotary_config(monkeypatch):
         ({"num_query_groups": 2}, "num_query_groups == 1"),
         ({"dsa_indexer_n_heads": 2}, "one indexer Q head"),
         ({"dsa_indexer_head_dim": 4}, "main attention head dimension"),
-        ({"dsa_indexer_use_hadamard": True}, "does not support Hadamard"),
         ({"dsa_kernel_cache_indexer_k": True}, "no separate indexer K cache"),
     ],
 )
@@ -1003,7 +970,7 @@ def test_transformer_config_rejects_incompatible_dsa_train_main_only_modes(overr
         dsa_indexer_topk=4,
         dsa_kernel_backend="min-memory-triton",
         dsa_indexer_loss_coeff=0.0,
-        dsa_indexer_use_hadamard=True,
+        dsa_indexer_rotate_activation=True,
         dsa_train_main_only=True,
     )
     kwargs.update(override)
@@ -1140,7 +1107,7 @@ def test_min_memory_backend_supports_no_grad_validation_forward(monkeypatch):
                 dsa_kernel_backend=backend,
                 dsa_sparse_attention_use_gather=False,
                 dsa_indexer_use_sparse_loss=True,
-                dsa_indexer_use_hadamard=True,
+                dsa_indexer_rotate_activation=True,
                 fp8=None,
                 fp8_param=False,
                 layernorm_zero_centered_gamma=False,
@@ -1278,7 +1245,6 @@ def test_reference_train_main_only_routes_without_constructing_indexer_loss(monk
             dsa_fwd_skip_dsa=False,
             dsa_indexer_mode="standard",
             dsa_sparse_attention_use_gather=False,
-            dsa_standard_indexer_use_main_input_norm=False,
             dsa_train_main_only=True,
             dsa_indexer_loss_coeff=0.0,
             dsa_indexer_use_sparse_loss=False,
@@ -1318,7 +1284,7 @@ def test_dense_warmup_no_grad_validation_uses_dense_core_attention():
             dsa_fwd_use_dense_attn=True,
             dsa_sparse_attention_use_gather=False,
             dsa_indexer_use_sparse_loss=False,
-            dsa_indexer_use_hadamard=True,
+            dsa_indexer_rotate_activation=True,
             fp8=None,
             fp8_param=False,
             layernorm_zero_centered_gamma=False,
