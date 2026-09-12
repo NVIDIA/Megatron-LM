@@ -180,6 +180,14 @@ class TEQuantizationRecipe:
         """
         Parse config from quantization dictionary.
         """
+        if "fp8_quantization_recipe" in quant_config and "fp8_param" not in quant_config:
+            warnings.warn(
+                "A Transformer Engine per-module FP8 recipe without 'fp8_param' now "
+                "inherits the enclosing parameter-storage context. Set fp8_param=False "
+                "explicitly to preserve the previous forced-BF16 behavior.",
+                UserWarning,
+                stacklevel=2,
+            )
         kwargs = {}
         class_keys = cls.get_config_keys()
         for field in class_keys:

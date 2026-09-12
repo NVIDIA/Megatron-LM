@@ -3,6 +3,7 @@
 import pytest
 import torch
 
+from megatron.core.enums import Fp8Recipe
 from megatron.core.extensions import transformer_engine as te_ext
 
 pytestmark = pytest.mark.skipif(
@@ -34,6 +35,15 @@ def _grouped_linear_stub(
 def _empty_load_args():
     """Standard load_state_dict pre-hook trailing arguments."""
     return {}, True, [], [], []
+
+
+def test_omitted_fp8_param_warns_about_inherited_storage_context():
+    with pytest.warns(UserWarning, match="inherits the enclosing parameter-storage context"):
+        recipe = te_ext.TEQuantizationRecipe.parse_from_config(
+            {"fp8_quantization_recipe": Fp8Recipe.mxfp8}
+        )
+
+    assert recipe.fp8_param is None
 
 
 @pytest.mark.parametrize(("parallel_mode", "partition_dim"), (("column", 0), ("row", 1)))

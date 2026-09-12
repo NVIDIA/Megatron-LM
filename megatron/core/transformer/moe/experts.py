@@ -1341,12 +1341,6 @@ class InferenceGroupedMLP(TEGroupedMLP):
             prepare_routed_mxfp8_weights(canonical_weight, out=routed_weight)
         return True
 
-    @torch.inference_mode(False)
-    @torch.no_grad()
-    def _build_te_mxfp8_weights(self):
-        """Compatibility entry point for callers that require native TE MXFP8 storage."""
-        InferenceGroupedMLP._build_te_inference_weights(self, expected_mxfp8=True)
-
     def _get_te_grouped_weight(self, linear_name: str):
         """Return a TE grouped linear's discrete or single-parameter weight."""
         linear = getattr(self, linear_name)

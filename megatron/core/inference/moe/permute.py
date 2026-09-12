@@ -316,7 +316,7 @@ def _zero_permutation_padding_kernel(
                 for h in tl.range(0, hidden_dim, BLOCK_H):
                     offsets = h + tl.arange(0, BLOCK_H)
                     mask = offsets < hidden_dim
-                    tl.store(hidden_ptr + row * hidden_dim + offsets, 0.0, mask=mask)
+                    tl.store(hidden_ptr + row.to(tl.int64) * hidden_dim + offsets, 0.0, mask=mask)
 
 
 def permute_tokens(

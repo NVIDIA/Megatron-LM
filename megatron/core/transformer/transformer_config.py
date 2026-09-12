@@ -3568,18 +3568,20 @@ class TransformerConfig(ModelParallelConfig):
                         "Batch-invariant MoE training requires "
                         "moe_token_dispatcher_type='alltoall'."
                     )
+                mxfp8_params_enabled = (
+                    self.transformer_impl == "inference_optimized"
+                    and bool(self.fp8)
+                    and self.fp8_recipe == Fp8Recipe.mxfp8
+                    and self.fp8_param
+                    and not self.fp4
+                )
                 # DeepGEMM is used by the "deepgemm"/"triton" backends, and by
                 # the torch inference path for BF16 experts. MXFP8 experts use
                 # torch scaled_grouped_mm directly and do not need DeepGEMM.
                 needs_deepgemm = self.batch_invariant_backend in ("deepgemm", "triton") or (
                     self.transformer_impl == "inference_optimized"
                     and self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.TORCH
-                    and not (
-                        bool(self.fp8)
-                        and self.fp8_recipe == Fp8Recipe.mxfp8
-                        and self.fp8_param
-                        and not self.fp4
-                    )
+                    and not mxfp8_params_enabled
                 )
                 assert not needs_deepgemm or HAVE_DEEPGEMM_BF16, (
                     "batch_invariant_mode=True with MoE requires DeepGEMM with bf16 "
@@ -3587,48 +3589,21 @@ class TransformerConfig(ModelParallelConfig):
                     "this backend combination. "
                     "Install via `uv pip install -e .[batch_invariant]`."
                 )
-                te_mxfp8_inference = (
-                    self.transformer_impl == "inference_optimized"
-                    and self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.TE
-                    and self.batch_invariant_backend == "te_native"
-                    and bool(self.fp8)
-                    and self.fp8_recipe == Fp8Recipe.mxfp8
-                    and self.fp8_param
-                    and not self.fp4
-                    and (
-                        (not self.gated_linear_unit and self.activation_func == squared_relu)
-                        or (self.gated_linear_unit and self.activation_func == F.silu)
-                    )
+                squared_relu_or_swiglu = (
+                    not self.gated_linear_unit and self.activation_func == squared_relu
+                ) or (self.gated_linear_unit and self.activation_func == F.silu)
+                non_gated_squared_relu = (
+                    not self.gated_linear_unit and self.activation_func == squared_relu
                 )
-                flashinfer_mxfp8_inference = (
-                    self.transformer_impl == "inference_optimized"
-                    and self.inference_grouped_gemm_backend
-                    == InferenceGroupedGemmBackend.FLASHINFER
-                    and bool(self.fp8)
-                    and self.fp8_recipe == Fp8Recipe.mxfp8
-                    and self.fp8_param
-                    and not self.fp4
-                    and not self.gated_linear_unit
-                    and self.activation_func == squared_relu
-                )
-                torch_mxfp8_inference = (
-                    self.transformer_impl == "inference_optimized"
-                    and self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.TORCH
-                    and bool(self.fp8)
-                    and self.fp8_recipe == Fp8Recipe.mxfp8
-                    and self.fp8_param
-                    and not self.fp4
-                    and (
-                        (not self.gated_linear_unit and self.activation_func == squared_relu)
-                        or (self.gated_linear_unit and self.activation_func == F.silu)
-                    )
-                )
-                assert (
-                    te_mxfp8_inference
-                    or flashinfer_mxfp8_inference
-                    or torch_mxfp8_inference
-                    or not (self.fp8 or self.fp4)
-                ), (
+                backend_supports_mxfp8 = {
+                    InferenceGroupedGemmBackend.TE: (
+                        self.batch_invariant_backend == "te_native" and squared_relu_or_swiglu
+                    ),
+                    InferenceGroupedGemmBackend.TORCH: squared_relu_or_swiglu,
+                    InferenceGroupedGemmBackend.FLASHINFER: non_gated_squared_relu,
+                }.get(self.inference_grouped_gemm_backend, False)
+                mxfp8_inference_supported = mxfp8_params_enabled and backend_supports_mxfp8
+                assert mxfp8_inference_supported or not (self.fp8 or self.fp4), (
                     "Batch-invariant MoE supports bf16, native TE MXFP8 squared-ReLU/"
                     "SwiGLU experts, Torch MXFP8 squared-ReLU/SwiGLU experts, or FlashInfer "
                     "MXFP8 squared-ReLU experts with the inference-optimized transformer "

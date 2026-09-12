@@ -30,6 +30,7 @@ except (ImportError, ModuleNotFoundError):
     # Transformer Engine not found
     pass
 
+
 try:
     from packaging.version import Version as PkgVersion
 
@@ -184,7 +185,13 @@ def get_grouped_quantized_members(
 def get_grouped_tensor_members(
     tensor: torch.Tensor, *, create_if_missing: bool = False
 ) -> List[torch.Tensor]:
-    """Return cached per-member views for a high-precision or quantized GroupedTensor."""
+    """Return cached per-member views for a high-precision or quantized GroupedTensor.
+
+    Transformer Engine uses ``quantized_tensors`` and
+    ``split_into_quantized_tensors`` for these members even when the grouped
+    storage is high precision. Keep that upstream cache convention so TE and
+    MCore share the same stable member views.
+    """
     grouped_tensor = _unwrap_parameter_data(tensor)
     if not is_grouped_tensor(grouped_tensor):
         raise ValueError("get_grouped_tensor_members expects a TE GroupedTensor.")
