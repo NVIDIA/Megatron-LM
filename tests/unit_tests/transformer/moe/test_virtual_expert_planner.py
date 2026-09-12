@@ -300,9 +300,14 @@ def test_virtual_expert_fc2_reduction_starts_from_the_wgrad_store_and_fc1_after_
     load_balancer._plan = VirtualExpertPlan(None, None, push_in_flight=True)
     with pytest.raises(RuntimeError, match="prepared backward"):
         VirtualExpertLoadBalancer._start_grad_reduce(load_balancer, 1)
+
     load_balancer._plan = None
     with pytest.raises(RuntimeError, match="prepared backward"):
         VirtualExpertLoadBalancer._start_grad_reduce(load_balancer, 1)
+
+    alive = weakref.ref(load_balancer)
+    del load_balancer
+    assert alive() is None, "TE's wgrad store must not retain the load balancer"
 
 
 MEMBER_SHAPE = (128, 128)
@@ -806,8 +811,10 @@ def test_virtual_expert_owners_share_slots_but_keep_native_bindings_separate(wei
     with pytest.raises(ValueError, match="share one layout"):
         cls(None, bad, ((parameters[1],),))
 
+    arenas = [weakref.ref(cls.weight_arena), weakref.ref(cls.grad_arena)]
     cls.destroy()
     cls.destroy()  # Idempotent, even while layers retain runtime parameters.
+    assert all(ref() is None for ref in arenas), "slot views retained their arena base"
     assert cls.config is None and cls.weight_arena is None and cls.grad_arena is None
     assert cls.slot_weights == cls.native_staging == ()
     for owner in (first, second):

@@ -4,10 +4,12 @@
 
 import gc
 import os
+import weakref
 
 import pytest
 import torch
 import torch.nn.functional as F
+from torch.multiprocessing.reductions import StorageWeakRef
 from transformer_engine.pytorch.quantization import FP8GlobalStateManager
 
 from megatron.core import parallel_state as ps
@@ -262,6 +264,142 @@ def test_virtual_expert_gtp_persistent_wgrads_match_recycled_scratch(monkeypatch
         gtp._GTP_PARAMS.clear()
         ps.destroy_model_parallel()
         fused_a2a.reset_hybrid_ep_buffer()
+
+
+@pytest.mark.parametrize("mxfp8", [False, True], ids=["bf16-no-gtp", "mxfp8-gtp"])
+def test_virtual_expert_training_lifetime(monkeypatch, mxfp8):
+    """Repeated forwards/backwards plateau; rebuilding releases graphs and real NCCL windows."""
+    if mxfp8 and torch.cuda.get_device_capability()[0] < 10:
+        pytest.skip("MXFP8 requires Blackwell")
+    monkeypatch.setenv("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "1")
+    monkeypatch.setattr(gtp.GTP_CONFIG, "async_reduction", True)
+    monkeypatch.setattr(gtp.GTP_CONFIG, "weight_prefetch", True)
+    monkeypatch.setattr(gtp.GTP_CONFIG, "reduce_scatter_with_fp32_accumulation", True)
+    # GTP's ticket cache intentionally retains source parameters until the cache is discarded.
+    monkeypatch.setattr(gtp, "_GTP_CACHE", None)
+    Utils.initialize_distributed()
+    ps.destroy_model_parallel()
+    gtp.reset_gtp_state()
+    gtp._GTP_PARAMS.clear()
+    remat = 2 if mxfp8 else 1
+    ps.initialize_model_parallel(
+        expert_model_parallel_size=2, expert_gtp_remat_size=remat, gtp_remat_size=remat
+    )
+    config = _expert_config(
+        mxfp8,
+        expert_gtp_weight_remat_size=remat,
+        normalization="RMSNorm",
+        moe_router_score_function="sigmoid",
+        moe_router_fusion=True,
+        disable_parameter_transpose_cache=True,
+    )
+    pg = ProcessGroupCollection.use_mpu_process_groups()
+
+    def cycle():
+        initialize_rng_tracker(use_te_rng_tracker=True, force_reset=True)
+        model_parallel_cuda_manual_seed(1234)
+        with get_fp8_context(config, is_init=True):
+            model = _ExpertStack(config, pg, repeat_last=True).cuda()
+        # Supply the same BF16 main gradients without DDP's own model-retaining hook cycle.
+        # The optimizer parity tests below exercise the complete DDP/GTP integration.
+        for parameter in model.parameters():
+            parameter.main_grad = torch.zeros(
+                parameter.shape, device=parameter.device, dtype=torch.bfloat16
+            )
+        gtp.classify_gtp_remat_chains(
+            model, cuda_graph_modules=config.cuda_graph_modules, cuda_graph_impl="none"
+        )
+        managers = [layer.mlp.token_dispatcher._comm_manager for layer in model.layers]
+        pointers, memory, graphs = [], [], []
+        for step in range(12):
+            for parameter in model.parameters():
+                parameter.grad = None
+                parameter.main_grad.zero_()
+            model.set_is_first_microbatch()
+            rng = torch.Generator(device="cuda").manual_seed(100 + step + pg.ep.rank())
+            x = torch.randn(
+                32, 1, config.hidden_size, device="cuda", dtype=torch.bfloat16, generator=rng
+            ).requires_grad_()
+            with get_fp8_context(config):
+                y = model(x)
+            graphs.append((weakref.ref(x), weakref.ref(y)))
+            y.float().square().mean().backward()
+            gtp.wait_for_gtp_grad_reduction_on_current_stream()
+            assert torch.isfinite(x.grad).all() and x.grad.count_nonzero() > 0
+            del x, y
+            gc.collect()
+            torch.cuda.synchronize()
+            # Dispatcher metadata may retain the latest pass until the next forward replaces it.
+            assert all(ref() is None for pair in graphs[:-1] for ref in pair), "old graph retained"
+            assert all(manager._plan is None for manager in managers)
+            # Ignore chain discovery, then compare identities and every recorded source address.
+            current = tuple(
+                (id(table), table.data_ptr(), tuple(map(tuple, rows)))
+                for manager in managers
+                for tables in manager.virtual_experts._tables
+                for table, rows in tables.values()
+            )
+            current += (
+                _VirtualExperts.weight_arena.data_ptr(),
+                _VirtualExperts.grad_arena.data_ptr(),
+            )
+            if step >= 2:
+                assert len(current) == 3 * 2 * config.num_layers + 2  # tables and arenas
+                pointers.append(current)
+                memory.append(torch.cuda.memory_allocated())
+        assert pointers and all(value == pointers[0] for value in pointers)
+        # Active bytes, not the caching allocator's reservation. One retained H512 activation
+        # per pass exceeds this budget over the ten post-warmup samples.
+        assert max(memory) - min(memory) <= 128 * 1024, memory
+        planner = VirtualExpertLoadBalancer.planner
+        windows = [
+            StorageWeakRef(t.untyped_storage())
+            for t in (
+                _VirtualExperts.weight_arena,
+                _VirtualExperts.grad_arena,
+                planner.gathered_counts,
+            )
+        ]
+        handles = [
+            weakref.ref(handle)
+            for handle in (
+                _VirtualExperts.weight_handle,
+                _VirtualExperts.grad_handle,
+                planner.histogram_handle,
+            )
+        ]
+        owners = [weakref.ref(manager.virtual_experts) for manager in managers]
+        VirtualExpertLoadBalancer.finalize()
+        VirtualExpertLoadBalancer.finalize()
+        assert all(ref() is None for ref in handles), "symmetric-memory handle survived finalize"
+        assert all(ref.expired() for ref in windows), "live model retained a symmetric window"
+        return [weakref.ref(model), *owners, *(weakref.ref(p) for p in model.parameters())]
+
+    memory = []
+    try:
+        for _ in range(3):
+            objects = cycle()
+            FP8GlobalStateManager.reset()
+            gtp.reset_gtp_state()
+            gtp._GTP_PARAMS.clear()
+            gtp._GTP_CACHE = None
+            # C++ tensor destruction can expose another Python reference cycle to the collector.
+            for _ in range(3):
+                gc.collect()
+            torch.cuda.synchronize()
+            assert all(ref() is None for ref in objects), "rebuild retained the previous model"
+            memory.append(torch.cuda.memory_allocated())
+        # Rebuilds may release process-wide caches; reject growth beyond the warmup peak.
+        assert memory[-1] <= max(memory[:-1]) + 128 * 1024, memory
+    finally:
+        VirtualExpertLoadBalancer.finalize()
+        FP8GlobalStateManager.reset()
+        gtp.reset_gtp_state()
+        gtp._GTP_PARAMS.clear()
+        gtp._GTP_CACHE = None
+        gc.collect()
+        fused_a2a.reset_hybrid_ep_buffer()
+        ps.destroy_model_parallel()
 
 
 @pytest.mark.parametrize(
