@@ -837,9 +837,7 @@ class DSGQACoreAttention(MegatronModule):
         )
 
         hidden_states = hidden_states.detach()
-        if _simplified_indexer_uses_main_input_norm(self.config) or getattr(
-            self.config, "dsa_standard_indexer_use_main_input_norm", False
-        ):
+        if _simplified_indexer_uses_main_input_norm(self.config):
             hidden_states = _normalized_indexer_input(hidden_states, indexer_input_norm)
 
         if attn_mask_type is not None:
@@ -1142,9 +1140,12 @@ class DSGQACoreAttention(MegatronModule):
             )
         if train_main_only and (skip_dsa or dense_warmup):
             raise NotImplementedError("dsa_train_main_only requires sparse DSA forward attention.")
-        if not simplified_indexer and not getattr(self.config, "dsa_indexer_use_hadamard", False):
+        if not simplified_indexer and not getattr(
+            self.config, "dsa_indexer_rotate_activation", True
+        ):
             raise NotImplementedError(
-                f"dsa_kernel_backend='{dsa_kernel_backend}' requires " "dsa_indexer_use_hadamard."
+                f"dsa_kernel_backend='{dsa_kernel_backend}' requires "
+                "dsa_indexer_rotate_activation."
             )
         if (
             self.config.fp8 is not None
@@ -1376,12 +1377,7 @@ class DSGroupedSelfAttention(SelfAttention):
         if self.config.experimental_attention_variant != "dsa":
             return {}
         indexer_input_norm = None
-        simplified_indexer = getattr(self.config, "dsa_indexer_mode", "standard") == "simplified"
-        normalized_simplified_indexer = _simplified_indexer_uses_main_input_norm(self.config)
-        normalized_standard_indexer = not simplified_indexer and getattr(
-            self.config, "dsa_standard_indexer_use_main_input_norm", False
-        )
-        if (normalized_simplified_indexer or normalized_standard_indexer) and not getattr(
+        if _simplified_indexer_uses_main_input_norm(self.config) and not getattr(
             self.config, "dsa_fwd_skip_dsa", False
         ):
             indexer_input_norm = _indexer_input_norm_spec(self.linear_qkv, self.config)
