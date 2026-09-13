@@ -47,11 +47,17 @@ from megatron.core.transformer.experimental_attention_variant.csa_utils.fused_co
     maybe_prepare_csa2_r2_fused,
 )
 from megatron.core.transformer.experimental_attention_variant.csa_utils.fused_sparse_attention import (
+    BSHDCompactIndexerWorkspace,
+    THDCompactIndexerWorkspace,
     _compact_flat_topk_idxs,
     _indexer_topk_core,
+    bshd_compact_indexer_available,
     build_flat_topk_idxs,
     csa_sparse_attn,
     get_flash_mla_topk_alignment,
+    prepare_bshd_compact_indexer_workspace,
+    prepare_thd_compact_indexer_workspace,
+    thd_compact_indexer_available,
 )
 from megatron.core.transformer.experimental_attention_variant.csa_utils.thd_utils import (
     CSA2THDCompressionLayout,
@@ -114,6 +120,10 @@ class CSA2State:
     last_layer: int | None = None
     thd_layout: CSA2THDLayout | None = None
     compressed_layout: CSA2THDCompressionLayout | None = None
+    # Layer graphs export the objective and attach its backward scaler outside
+    # capture. A zero gradient on an unused hidden output must not inject aux loss.
+    defer_indexer_loss: bool = False
+    indexer_loss: torch.Tensor | None = None
 
     def prepare_fused_kv(self) -> None:
         """Pack canonical shared K once per owner or pipeline receiver, retaining its graph."""
@@ -514,6 +524,12 @@ class CSA2Indexer(MegatronModule):
             config, "dsa_kernel_backend", "none"
         ) == "cudnn" and use_fused_dsa_kernels(config)
         self.precision = getattr(config, "dsa_indexer_precision", "bf16")
+        # Keep every warmed-up geometry alive while its graphs may replay.
+        # As in DSv4, only selection scratch/quantization storage persists;
+        # Top-K outputs and differentiable projections belong to each forward.
+        self._compact_indexer_workspaces: dict[
+            tuple, BSHDCompactIndexerWorkspace | THDCompactIndexerWorkspace
+        ] = {}
         linear_kwargs = dict(
             config=config,
             init_method=config.init_method,
@@ -723,6 +739,62 @@ class CSA2Indexer(MegatronModule):
         return indices.masked_fill(~scores.gather(-1, indices).isfinite(), -1).int()
 
     @torch.no_grad()
+    def _get_compact_indexer_workspace(
+        self, q: torch.Tensor, k: torch.Tensor, *, topk: int, **packed_kwargs
+    ) -> BSHDCompactIndexerWorkspace | THDCompactIndexerWorkspace | None:
+        """Reuse DSv4 compact storage prepared eagerly for this static geometry.
+
+        Prefix values may change between packed microbatches. Their shapes,
+        device and host bounds determine capacity; the compact dispatcher
+        refreshes offsets and MXFP8 scale prefixes from current device values.
+        """
+        if getattr(self.config, "cuda_graph_impl", "none") == "none":
+            return None
+        is_thd = bool(packed_kwargs)
+        available = thd_compact_indexer_available if is_thd else bshd_compact_indexer_available
+        if not available(q, k, self.precision):
+            return None
+
+        def tensor_metadata(tensor):
+            return tuple(tensor.shape), tensor.dtype, tensor.device
+
+        key = (
+            tensor_metadata(q),
+            tensor_metadata(k),
+            topk,
+            self.compress_ratio,
+            self.precision,
+            tuple(
+                (name, tensor_metadata(value) if isinstance(value, torch.Tensor) else value)
+                for name, value in packed_kwargs.items()
+            ),
+        )
+        workspace = self._compact_indexer_workspaces.get(key)
+        if workspace is not None:
+            return workspace
+        if torch.cuda.is_current_stream_capturing():
+            raise ValueError(
+                "CSA2 compact CUDA graph capture requires an eagerly prepared workspace "
+                "for this static geometry. Run eager warmup before capture."
+            )
+        kwargs = dict(topk=topk, ratio=self.compress_ratio, precision=self.precision)
+        if is_thd:
+            workspace = prepare_thd_compact_indexer_workspace(
+                q,
+                k,
+                **kwargs,
+                cu_seqlens_q=packed_kwargs["cu_seqlens_q"],
+                cu_seqlens_k=packed_kwargs["cu_seqlens_kv"],
+                max_seqlen_q=packed_kwargs["max_seqlen_q"],
+                max_seqlen_k=packed_kwargs["max_seqlen_kv"],
+            )
+        else:
+            workspace = prepare_bshd_compact_indexer_workspace(q, k, **kwargs)
+        if workspace is not None:
+            self._compact_indexer_workspaces[key] = workspace
+        return workspace
+
+    @torch.no_grad()
     def _fused_topk(self, inputs: CSA2IndexerInputs) -> torch.Tensor:
         """Adapt DSv4 score/Top-K kernels to r1/r2 and physical CSA2 THD rows."""
         if inputs.candidates is not None:
@@ -772,6 +844,7 @@ class CSA2Indexer(MegatronModule):
             topk=width,
             ratio=self.compress_ratio,
             use_compact=True,
+            compact_workspace=self._get_compact_indexer_workspace(q, k, topk=width, **kwargs),
             precision=self.precision,
             # Native CSA2 also resolves exact ties toward earlier local keys.
             deterministic=True,
@@ -1567,7 +1640,10 @@ class CompressedSparseAttention2(MegatronModule):
             DSAIndexerLossLoggingHelper.save_loss_to_tracker(
                 loss=logged_loss, layer_number=self.layer_idx + 1, num_layers=self.config.num_layers
             )
-            output = DSAIndexerLossAutoScaler.apply(output, indexer_loss)
+            if csa2_state.defer_indexer_loss:
+                csa2_state.indexer_loss = indexer_loss
+            else:
+                output = DSAIndexerLossAutoScaler.apply(output, indexer_loss)
         csa2_state.last_layer = self.layer_idx
         return output
 

@@ -19,6 +19,9 @@ from megatron.core.pipeline_parallel.pipeline_payload import (
     PipelinePayloadSpec,
 )
 from megatron.core.transformer.experimental_attention_variant.csa2 import CSA2State
+from megatron.core.transformer.experimental_attention_variant.csa_utils.csa2_cuda_graph import (
+    CSA2CudaGraphAdapter,
+)
 from megatron.core.transformer.experimental_attention_variant.csa_utils.csa2_pipeline import (
     CSA2PipelineChunk,
     CSA2PipelinePayload,
@@ -62,6 +65,15 @@ class CSA2HybridAdapter:
         self.post_process = post_process
         self._pipeline_chunk: CSA2PipelineChunk | None = None
         self._pipeline_chunks: dict[str, CSA2PipelineChunk] = {}
+
+    def configure_cuda_graphs(self, layers: ModuleList) -> None:
+        """Attach graph schemas without changing module registration or checkpoint keys."""
+        if self.config.cuda_graph_impl != "transformer_engine":
+            return
+        for layer, symbol in zip(layers, self.layer_pattern):
+            layer._te_cuda_graph_adapter = CSA2CudaGraphAdapter(
+                self.config, layer_number=layer.layer_number, is_attention=symbol in ("D", "W")
+            )
 
     def configure_pipeline(self, chunk: CSA2PipelineChunk) -> None:
         """Bind a static logical chunk for local split execution."""
