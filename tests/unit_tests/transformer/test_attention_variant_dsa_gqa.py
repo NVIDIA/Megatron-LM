@@ -19,7 +19,9 @@ from megatron.core.transformer.experimental_attention_variant.dsa_gqa import (
     SimplifiedDSGQAIndexer,
     SimplifiedDSGQAIndexerSubmodules,
     _DSAZeroParamDependency,
+    _dsa_caches_indexer_k,
     _dsa_caches_routing,
+    _dsa_caches_selected_scores,
     _simplified_index_scores,
     _simplified_indexer_input,
     _simplified_indexer_norm_spec,
@@ -211,8 +213,6 @@ def test_transformer_config_accepts_min_memory_backend():
             add_bias_linear=False,
             dsa_indexer_topk=4,
             dsa_kernel_backend=backend,
-            dsa_kernel_cache_indexer_k=True,
-            dsa_kernel_cache_selected_scores=True,
             dsa_indexer_loss_coeff=0.1,
             dsa_indexer_use_sparse_loss=True,
             dsa_min_memory_profile=True,
@@ -220,8 +220,6 @@ def test_transformer_config_accepts_min_memory_backend():
         )
 
         assert config.dsa_kernel_backend == backend
-        assert config.dsa_kernel_cache_indexer_k
-        assert config.dsa_kernel_cache_selected_scores
         assert config.dsa_min_memory_profile
         assert config.dsa_min_memory_profile_rank == -1
 
@@ -297,14 +295,12 @@ def test_transformer_config_accepts_simplified_learned_k_with_independent_dimens
         dsa_indexer_head_dim=6,
         dsa_indexer_topk=4,
         dsa_kernel_backend="min-memory-torch",
-        dsa_kernel_cache_indexer_k=True,
         dsa_indexer_loss_coeff=0.1,
         dsa_indexer_use_sparse_loss=True,
     )
 
     assert config.dsa_indexer_n_heads == 1
     assert config.dsa_indexer_head_dim == 6
-    assert config.dsa_kernel_cache_indexer_k
 
 
 def test_simplified_main_q_reset_requires_main_attention_dimension_with_learned_k():
@@ -790,7 +786,6 @@ def test_min_memory_backend_supports_no_grad_validation_forward(monkeypatch):
                 fp8=None,
                 fp8_param=False,
                 layernorm_zero_centered_gamma=False,
-                dsa_kernel_cache_indexer_k=True,
                 dsa_min_memory_profile=False,
                 dsa_min_memory_profile_rank=0,
             ),
@@ -842,8 +837,6 @@ def test_dense_warmup_no_grad_validation_uses_dense_core_attention():
             fp8=None,
             fp8_param=False,
             layernorm_zero_centered_gamma=False,
-            dsa_kernel_cache_indexer_k=False,
-            dsa_kernel_cache_selected_scores=False,
         ),
         dense_core_attention=_DenseCore(),
         indexer=object(),
@@ -910,50 +903,39 @@ def test_dsa_routing_is_saved_when_other_modules_are_recomputed():
     assert _dsa_caches_routing(config)
 
 
+def test_dsa_indexer_k_and_selected_scores_are_saved_by_default():
+    config = _routing_config()
+    assert _dsa_caches_indexer_k(config)
+    assert _dsa_caches_selected_scores(config)
+
+
+def test_dsa_indexer_k_is_recomputed_when_listed_in_recompute_modules():
+    config = _routing_config(recompute_granularity="selective", recompute_modules=["dsa_indexer_k"])
+    assert not _dsa_caches_indexer_k(config)
+    assert _dsa_caches_selected_scores(config)
+
+
+def test_dsa_selected_scores_are_recomputed_when_listed_in_recompute_modules():
+    config = _routing_config(
+        recompute_granularity="selective", recompute_modules=["dsa_selected_scores"]
+    )
+    assert not _dsa_caches_selected_scores(config)
+    assert _dsa_caches_indexer_k(config)
+
+
+def test_dsa_selected_scores_are_unavailable_without_the_sparse_objective():
+    config = _routing_config(dsa_indexer_use_sparse_loss=False)
+    assert not _dsa_caches_selected_scores(config)
+    assert _dsa_caches_indexer_k(config)
+
+
 def test_dsa_routing_is_not_saved_for_dense_indexer_warmup():
     config = _routing_config(
         dsa_fwd_use_dense_attn=True, dsa_indexer_use_sparse_loss=False, dsa_indexer_loss_coeff=0.1
     )
     assert not _dsa_caches_routing(config)
-
-
-@pytest.mark.parametrize(
-    "cache_flag", ["dsa_kernel_cache_indexer_k", "dsa_kernel_cache_selected_scores"]
-)
-def test_transformer_config_optional_kernel_caches_require_min_memory_backend(cache_flag):
-    with pytest.raises(AssertionError, match=cache_flag):
-        TransformerConfig(
-            num_layers=1,
-            hidden_size=32,
-            num_attention_heads=4,
-            num_query_groups=1,
-            kv_channels=8,
-            experimental_attention_variant="dsa",
-            dsa_indexer_mode="simplified",
-            add_bias_linear=False,
-            dsa_indexer_topk=4,
-            dsa_kernel_backend="reference",
-            dsa_indexer_loss_coeff=0.1,
-            **{cache_flag: True},
-        )
-
-
-def test_transformer_config_sparse_forward_dense_loss_rejects_selected_score_cache():
-    with pytest.raises(AssertionError, match="dsa_kernel_cache_selected_scores"):
-        TransformerConfig(
-            num_layers=1,
-            hidden_size=32,
-            num_attention_heads=4,
-            num_query_groups=1,
-            kv_channels=8,
-            experimental_attention_variant="dsa",
-            dsa_indexer_mode="simplified",
-            add_bias_linear=False,
-            dsa_indexer_topk=4,
-            dsa_kernel_backend="min-memory-triton",
-            dsa_indexer_loss_coeff=0.1,
-            dsa_kernel_cache_selected_scores=True,
-        )
+    assert not _dsa_caches_indexer_k(config)
+    assert not _dsa_caches_selected_scores(config)
 
 
 def test_compute_gqa_dsa_indexer_loss_dense_and_sparse():
