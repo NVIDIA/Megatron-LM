@@ -3828,14 +3828,6 @@ def _add_experimental_attention_variant_args(parser):
         help='Global rank that prints DSA min-memory timings. Set to -1 to print on every rank.',
     )
     _maybe_add_argument(
-        '--dsa-kernel-cache-routing',
-        action='store_true',
-        help=(
-            'Save DSA kernel routing top-k indices from forward for backward speed. '
-            'This trades activation memory for less recomputation.'
-        ),
-    )
-    _maybe_add_argument(
         '--dsa-kernel-cache-indexer-k',
         action='store_true',
         help=(
