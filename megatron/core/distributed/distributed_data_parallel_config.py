@@ -184,7 +184,8 @@ class DistributedDataParallelConfig:
 
     expert_outer_dp_sharding_strategy: Optional[str] = None
     """Sharding strategy for the outer expert data-parallel group in MFSDP v2.
-    Valid values are ``'no_shard'`` and ``'optim'``. None is replaced with
+    Valid values are ``'no_shard'``, ``'optim'``, ``'optim_grads'``, and
+    ``'optim_grads_params'``. None is replaced with
     ``outer_dp_sharding_strategy`` during initialization.
     """
 
@@ -317,17 +318,13 @@ class DistributedDataParallelConfig:
             "data_parallel_sharding_strategy",
             "expert_data_parallel_sharding_strategy",
             "outer_dp_sharding_strategy",
+            "expert_outer_dp_sharding_strategy",
         ):
             value = getattr(self, name)
             if value not in _SHARDING_STRATEGIES:
                 raise ValueError(
                     f"{name} must be one of {list(_SHARDING_STRATEGIES)}, got {value!r}."
                 )
-        if self.expert_outer_dp_sharding_strategy not in ("no_shard", "optim"):
-            raise ValueError(
-                "expert_outer_dp_sharding_strategy must be one of ['no_shard', 'optim'], "
-                f"got {self.expert_outer_dp_sharding_strategy!r}."
-            )
         if self.megatron_fsdp_version not in (1, 2):
             raise ValueError("megatron_fsdp_version must be either 1 or 2")
 
