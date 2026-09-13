@@ -188,7 +188,6 @@ class DataParallelInferenceCoordinator:
         self.request_id_to_client_id = {}
         self.request_id_to_client_request_id = {}
         self.request_id_to_rank = {}  # Maps request_id → rank identity for pending count tracking
-        self.removed_engine_identities = set()
 
         self.next_request_id = 0
         self.tokenizer = tokenizer
@@ -271,7 +270,6 @@ class DataParallelInferenceCoordinator:
         only if dynamic registration/deregistration at high engine counts becomes a use case.
         """
         self.identities_of_data_parallel_ranks.remove(identity)
-        self.removed_engine_identities.add(identity)
         idx = self.identity_to_rank_index.pop(identity, None)
         if idx is None:
             return

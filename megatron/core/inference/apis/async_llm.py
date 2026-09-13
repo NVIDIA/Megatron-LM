@@ -61,6 +61,8 @@ class MegatronAsyncLLM(_MegatronLLMBase):
             coordinator_host=coordinator_host,
             coordinator_port=coordinator_port,
         )
+        # Set in serve() when this rank starts the HTTP frontend; consulted by shutdown().
+        self._serve_started: bool = False
 
     async def generate(
         self,
@@ -145,7 +147,17 @@ class MegatronAsyncLLM(_MegatronLLMBase):
             return
         self._shutdown_called = True
 
-        self._stop_frontend_if_started()
+        # If we started an HTTP frontend, stop it first so no new requests
+        # arrive while we tear down the coordinator. Invariant:
+        # ``_serve_started`` can only be True when ``use_coordinator=True``
+        # because ``serve()`` raises otherwise.
+        if self._serve_started:
+            from megatron.core.inference.text_generation_server.dynamic_text_gen_server.text_generation_server import (  # pylint: disable=line-too-long
+                stop_text_gen_server,
+            )
+
+            stop_text_gen_server()
+            self._serve_started = False
 
         if not self._use_coordinator:
             return

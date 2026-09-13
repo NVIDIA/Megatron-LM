@@ -2,9 +2,8 @@
 """Static throughput/latency benchmark against an OpenAI-compatible completions server.
 
 Fires --batch-size requests simultaneously via asyncio.gather, waits for all to
-finish, and reports throughput, latency (avg/p50/p99), and TPOT. Warmup batches
-are widened to cover every data-parallel worker when needed. Timed batches keep
-the requested batch size and emit a JSON results file consumable by
+finish, and reports throughput, latency (avg/p50/p99), and TPOT. Iterates over
+warmup + timed batches and emits a JSON results file consumable by
 compare_to_baseline.py.
 
 Hits the server's POST /v1/completions endpoint directly via aiohttp — no
@@ -93,15 +92,10 @@ async def _run_batch(
     url: str,
     prompts: list[str],
     iter_start_index: int,
-    request_count: int | None = None,
 ) -> tuple[list[int], list[int], list[float], float]:
-    """Fire requests in parallel, defaulting to the measured batch size.
-
-    Cycles through `prompts` deterministically starting at `iter_start_index`
-    so each timed iteration sees the same prompt distribution (reduces
-    run-to-run variance for gsm8k mode).
-    """
-    request_count = args.batch_size if request_count is None else request_count
+    """Fire batch_size requests in parallel. Cycles through `prompts` deterministically
+    starting at `iter_start_index` so each timed iteration sees the same prompt
+    distribution (reduces run-to-run variance for gsm8k mode)."""
     t0 = time.perf_counter()
     results = await asyncio.gather(
         *[
@@ -113,7 +107,7 @@ async def _run_batch(
                 args.num_output_tokens,
                 args.temperature,
             )
-            for i in range(request_count)
+            for i in range(args.batch_size)
         ]
     )
     wall = time.perf_counter() - t0
@@ -128,14 +122,8 @@ def _percentile(sorted_values: list[float], pct: float) -> float:
     return sorted_values[idx]
 
 
-def _get_warmup_batch_size(batch_size: int, data_parallel_size: int) -> int:
-    """Keep batch-shape warmup while issuing enough requests to cover DP workers."""
-    return max(batch_size, data_parallel_size)
-
-
 async def main(args: argparse.Namespace) -> dict:
     url = f"{args.server_url.rstrip('/')}/completions"
-    warmup_batch_size = _get_warmup_batch_size(args.batch_size, args.data_parallel_size)
 
     if args.dataset == "gsm8k":
         prompts = _load_gsm8k_prompts()
@@ -152,34 +140,26 @@ async def main(args: argparse.Namespace) -> dict:
     print(f"Dataset         : {prompt_source}")
     print(f"Output tokens   : {args.num_output_tokens}")
     print(f"Warmup iters    : {args.num_warmup_iters}")
-    print(f"Warmup batch    : {warmup_batch_size}")
     print(f"Timed iters     : {args.num_iters}", flush=True)
 
     connector = aiohttp.TCPConnector(limit=0)
     async with aiohttp.ClientSession(connector=connector) as session:
-        warmup_cursor = 0
+        cursor = 0
         for i in range(args.num_warmup_iters):
-            print(
-                f"\nWarmup {i + 1}/{args.num_warmup_iters} (batch={warmup_batch_size})...",
-                flush=True,
-            )
-            await _run_batch(
-                session, args, url, prompts, warmup_cursor, request_count=warmup_batch_size
-            )
-            warmup_cursor += warmup_batch_size
+            print(f"\nWarmup {i + 1}/{args.num_warmup_iters}...", flush=True)
+            await _run_batch(session, args, url, prompts, cursor)
+            cursor += args.batch_size
 
         all_wall: list[float] = []
         all_output_tokens: list[int] = []
         all_input_tokens: list[int] = []
         all_latencies: list[float] = []
-        # Keep the timed prompt sequence stable when widening warmup batches.
-        timed_cursor = args.num_warmup_iters * args.batch_size
 
         for i in range(args.num_iters):
             input_counts, output_counts, latencies, wall = await _run_batch(
-                session, args, url, prompts, timed_cursor
+                session, args, url, prompts, cursor
             )
-            timed_cursor += args.batch_size
+            cursor += args.batch_size
             total_out = sum(output_counts)
             all_wall.append(wall)
             all_output_tokens.append(total_out)
@@ -246,13 +226,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-output-tokens", type=int, default=128)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--num-warmup-iters", type=int, default=2)
-    parser.add_argument(
-        "--data-parallel-size",
-        type=int,
-        default=1,
-        help="Number of coordinator-addressable data-parallel workers. Warmup batches "
-        "use at least this many concurrent requests; timed batch size is unchanged.",
-    )
     parser.add_argument("--num-iters", type=int, default=5)
     parser.add_argument(
         "--output-json",

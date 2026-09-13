@@ -67,4 +67,3 @@ MODEL_ARGS:
   --use-persistent-ckpt-worker: true
   --use-distributed-optimizer: true
 TEST_TYPE: ckpt-resume
-LAUNCHER: ft_launcher

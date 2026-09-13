@@ -51,4 +51,3 @@ MODEL_ARGS:
   --mock-data: true
   --log-memory-to-tensorboard: true
 TEST_TYPE: regular
-LAUNCHER: ft_launcher

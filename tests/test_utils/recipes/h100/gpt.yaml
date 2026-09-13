@@ -140,6 +140,11 @@ products:
       - environment: [dev]
         scope: [mr, mr-github, mr-github-slim]
         platforms: [dgx_h100]
+  - test_case: [gpt3_mr_mcore_te_tp1_pp2_core_attn_offload_attn_cudagraph]
+    products:
+      - environment: [dev]
+        scope: [mr, mr-github, mr-github-slim]
+        platforms: [dgx_h100]
   # - test_case: [gpt3_mcore_te_tp1_pp2_resume_torch_dist_cp4_a2a_p2p_nondeterministic]
   #   products:
   #     - environment: [dev]

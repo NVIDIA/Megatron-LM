@@ -125,4 +125,3 @@ MODEL_ARGS:
   --slice: true
   --router-std: 0.1
 TEST_TYPE: regular
-LAUNCHER: ft_launcher

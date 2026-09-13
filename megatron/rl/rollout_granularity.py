@@ -6,6 +6,14 @@ from typing import Literal
 
 SubmissionGranularity = Literal["R", "G", "B"]
 ConsumptionGranularity = Literal["G", "B"]
+ReleaseState = Literal["inferred", "assembled", "consumed"]
+
+
+RELEASE_STATE_BY_SUBMISSION: dict[SubmissionGranularity, ReleaseState] = {
+    "R": "inferred",
+    "G": "assembled",
+    "B": "consumed",
+}
 
 
 def get_rl_parallel_generation_tasks(args) -> int:

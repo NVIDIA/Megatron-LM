@@ -30,7 +30,7 @@ sharded        ``Replicate``  ``allgather()``
 """
 
 import dataclasses
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable
 
 import torch.distributed as dist
 
@@ -82,7 +82,7 @@ def changed_mesh_axis(
 class Placements:
     """Per-mesh-axis placements for parameter, gradient, and optimizer buffers."""
 
-    dp_axes: Sequence[MeshAxis]
+    dp_axes: list[MeshAxis]
     parameter: list[Placement]
     gradient: list[Placement]
     optimizer: list[Placement]

@@ -72,4 +72,3 @@ TEST_TYPE: ckpt-resume
 METRICS:
   - lm loss
   - total loss
-LAUNCHER: ft_launcher

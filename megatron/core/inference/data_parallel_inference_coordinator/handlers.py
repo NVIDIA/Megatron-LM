@@ -183,13 +183,7 @@ def handle_cuda_profiler_signal(coordinator, sender_identity, payload):
 def handle_engine_reply(coordinator, sender_identity, payload):
     """Route completed requests from an engine back to their originating clients."""
     # This is the output of a single engine step on some data parallel rank.
-    if sender_identity not in coordinator.identities_of_data_parallel_ranks:
-        # A removed engine's final replies may still be queued up.
-        # Only exit with an assert if the sender was never connected to the coordinator.
-        assert (
-            sender_identity in coordinator.removed_engine_identities
-        ), f"ENGINE_REPLY from never-connected sender {sender_identity!r}"
-        logging.warning("Coordinator: ENGINE_REPLY from removed engine %r", sender_identity)
+    assert sender_identity in coordinator.identities_of_data_parallel_ranks
     finished_requests = payload[1]
 
     for finished_request in finished_requests:

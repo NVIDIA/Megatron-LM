@@ -114,34 +114,14 @@ class TorchSampling(Sampling):
         return sampled
 
     def log_probs_kernel(
-        self, logits: Tensor, context, *, token_to_request_index: Optional[Tensor] = None
+        self, logits: Tensor, temperature: Tensor, top_k: Tensor, top_p: Tensor
     ) -> Tensor:
         """Per-row log-probs of the temperature, top-k/top-p sampling distribution.
 
         Buckets rows by identical (temperature, top_k, top_p) and reuses `filter_logits`
-        (the same filter as `sample_from_logits`) so log-probs match how this backend samples.
-
-        Args:
-            logits (Tensor): Raw logits with shape `[num_rows, vocab_size]`.
-            context: Active dynamic inference context providing CPU sampling metadata.
-            token_to_request_index (Optional[Tensor]): Optional CPU mapping from
-                each logits row to its request index.
-
-        Returns:
-            Tensor: Per-row log probabilities for the processed distribution.
+        (the same filter as `sample_from_logits`) so log-probs match how this backend
+        samples. `temperature`/`top_k`/`top_p` are per-row `[num_rows]` tensors.
         """
-        active_request_count = context.total_request_count - context.paused_request_count
-        metadata = context.active_request_metadata
-        if token_to_request_index is None:
-            temperature = metadata["temperature"][:active_request_count]
-            top_k = metadata["top_k"][:active_request_count]
-            top_p = metadata["top_p"][:active_request_count]
-        else:
-            assert not token_to_request_index.is_cuda
-            temperature = metadata["temperature"][:active_request_count][token_to_request_index]
-            top_k = metadata["top_k"][:active_request_count][token_to_request_index]
-            top_p = metadata["top_p"][:active_request_count][token_to_request_index]
-
         temps = temperature.tolist()
         top_ks = top_k.tolist()
         top_ps = top_p.tolist()
@@ -164,34 +144,28 @@ class TorchSampling(Sampling):
         n: int,
         context,
         *,
-        no_top_k: bool,
-        no_top_p: bool,
         gather_indices: Optional[Tensor] = None,
         token_to_request_index: Optional[Tensor] = None,
-        output: Optional[Tensor] = None,
         eager: bool = False,
         cache_key: Any = None,
     ) -> Tensor:
-        """Bucket active requests by sampling parameters and sample each bucket.
+        """Bucket active requests by `(temperature, top_k, top_p)` and sample each bucket.
 
         Args:
             logits: Logits tensor of shape `[>=n, vocab_size]`.
             n: Number of rows to sample.
             context: The active DynamicInferenceContext.
-            no_top_k, no_top_p: Batch-level dispatch flags (part of the shared kernel
-                contract); ignored here since the exact per-bucket sort already handles
-                any top-k / top-p combination.
             gather_indices: When set, sample from `logits[gather_indices[:n], :]`.
             token_to_request_index: When set, the loop dispatches per-token rather than
                 per-request (used by the speculative path).
-            output: Optional caller-owned destination tensor of shape `[n]`.
             eager: Accepted for API symmetry; ignored (TorchSampling has no graph wrapper).
             cache_key: Accepted for API symmetry; ignored.
 
         Returns:
-            Sampled token IDs in `output`, or a newly allocated tensor when it is not provided.
+            Sampled token ids of shape `[n]`.
         """
-        del eager, cache_key, no_top_k, no_top_p
+        # CudaGraphManager consumes these args, if it exists.
+        del eager, cache_key
 
         # Group active requests into sampling buckets by (temperature, top_k, top_p).
         active_request_count = context.total_request_count - context.paused_request_count
@@ -213,8 +187,7 @@ class TorchSampling(Sampling):
         if gather_indices is not None:
             logits = logits[gather_indices[:n], :]
 
-        if output is None:
-            output = torch.empty(n, device=logits.device, dtype=torch.int64)
+        output = torch.empty(n, device=logits.device, dtype=torch.int64)
         token_list = []
         indices_list = []
         for idx_tensor, (_, temp, top_k, top_p) in zip(bucket_index_tensors, buckets):

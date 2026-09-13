@@ -29,16 +29,6 @@ try:
 except ImportError:
     HAVE_FA3 = False
 
-try:
-    from flash_attn.cute import flash_attn_varlen_func as _fa4_varlen_func  # noqa: F401
-
-    HAVE_FA4 = True
-except ImportError:
-    HAVE_FA4 = False
-
-# Batch-invariant mode requires an explicit FlashAttention version.
-_BIK_FA_VERSION = 4 if HAVE_FA4 else 3
-
 
 # ============================================================================
 # Batch-Invariant test helpers
@@ -118,7 +108,6 @@ def test_te_column_parallel_linear_batch_invariant_randomized():
         hidden_dropout=0.0,
         attention_dropout=0.0,
         batch_invariant_mode=True,
-        flash_attention_version=_BIK_FA_VERSION,
         params_dtype=torch.bfloat16,
         normalization="RMSNorm",
         layernorm_epsilon=1e-5,
@@ -165,7 +154,6 @@ def test_te_row_parallel_linear_batch_invariant_randomized():
         hidden_dropout=0.0,
         attention_dropout=0.0,
         batch_invariant_mode=True,
-        flash_attention_version=_BIK_FA_VERSION,
         params_dtype=torch.bfloat16,
         normalization="RMSNorm",
         layernorm_epsilon=1e-5,
@@ -212,7 +200,6 @@ def test_te_layernorm_column_parallel_linear_batch_invariant_randomized():
         hidden_dropout=0.0,
         attention_dropout=0.0,
         batch_invariant_mode=True,
-        flash_attention_version=_BIK_FA_VERSION,
         params_dtype=torch.bfloat16,
         normalization="RMSNorm",
         layernorm_epsilon=1e-5,
@@ -259,7 +246,6 @@ def test_te_norm_batch_invariant_randomized():
         hidden_dropout=0.0,
         attention_dropout=0.0,
         batch_invariant_mode=True,
-        flash_attention_version=_BIK_FA_VERSION,
         params_dtype=torch.bfloat16,
         normalization="RMSNorm",
         layernorm_epsilon=1e-5,
@@ -293,7 +279,6 @@ def test_column_parallel_linear_batch_invariant_randomized():
         hidden_dropout=0.0,
         attention_dropout=0.0,
         batch_invariant_mode=True,
-        flash_attention_version=_BIK_FA_VERSION,
         params_dtype=torch.bfloat16,
         normalization="RMSNorm",
         layernorm_epsilon=1e-5,
@@ -347,7 +332,6 @@ def test_te_attention_layer_batch_invariant_randomized():
         hidden_dropout=0.0,
         attention_dropout=0.0,
         batch_invariant_mode=True,
-        flash_attention_version=_BIK_FA_VERSION,
         params_dtype=torch.bfloat16,
         normalization="RMSNorm",
         layernorm_epsilon=1e-5,
@@ -438,7 +422,6 @@ def test_te_column_parallel_linear_parity():
         hidden_dropout=0.0,
         attention_dropout=0.0,
         batch_invariant_mode=True,
-        flash_attention_version=_BIK_FA_VERSION,
         params_dtype=torch.bfloat16,
         normalization="RMSNorm",
         layernorm_epsilon=1e-5,
@@ -534,7 +517,6 @@ def test_te_rmsnorm_parity():
         hidden_dropout=0.0,
         attention_dropout=0.0,
         batch_invariant_mode=True,
-        flash_attention_version=_BIK_FA_VERSION,
         params_dtype=torch.bfloat16,
         normalization="RMSNorm",
         layernorm_epsilon=1e-5,
@@ -614,7 +596,6 @@ def test_te_layernorm_linear_parity():
         hidden_dropout=0.0,
         attention_dropout=0.0,
         batch_invariant_mode=True,
-        flash_attention_version=_BIK_FA_VERSION,
         params_dtype=torch.bfloat16,
         normalization="RMSNorm",
         layernorm_epsilon=1e-5,

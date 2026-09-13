@@ -252,7 +252,6 @@ class TransformerLayerNode(ScheduleNode):
             weak_method(self.backward_impl),
             free_input=free_input,
             name=name,
-            ncclep_zero_copy=config.moe_ncclep_zero_copy,
         )
         self.layer_state = layer_state
         self.chunk_state = chunk_state

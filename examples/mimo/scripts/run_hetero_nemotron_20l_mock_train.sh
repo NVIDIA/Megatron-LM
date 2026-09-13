@@ -4,6 +4,8 @@
 
 set -euo pipefail
 
+export CUDA_DEVICE_MAX_CONNECTIONS=1
+
 TRAIN_ITERS=${TRAIN_ITERS:-20}
 NUM_MICROBATCHES=${NUM_MICROBATCHES:-4}
 EVAL_INTERVAL=${EVAL_INTERVAL:-1}
@@ -94,9 +96,7 @@ uv run --extra ssm python -m torch.distributed.run \
   --adam-beta2 0.95 \
   --clip-grad 1.0 \
   --use-distributed-optimizer \
-  --overlap-grad-reduce \
-  --overlap-param-gather \
-  --encoder-ddp-overlap \
+  --ddp-bucket-size 0 \
   --train-iters "${TRAIN_ITERS}" \
   --eval-interval "${EVAL_INTERVAL}" \
   --eval-iters "${EVAL_ITERS}" \

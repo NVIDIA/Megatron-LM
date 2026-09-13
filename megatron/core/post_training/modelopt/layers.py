@@ -159,12 +159,7 @@ class Linear(torch.nn.Linear):
         for param in self.parameters():
             if is_expert:
                 # Reduce the gradient on the expert_data_parallel group for expert linear layers
-                use_expert_groups = (
-                    self.config.expert_model_parallel_size > 1
-                    or self.config.expert_tensor_parallel_size
-                    != self.config.tensor_model_parallel_size
-                )
-                setattr(param, "allreduce", not use_expert_groups)
+                setattr(param, "allreduce", self.config.expert_model_parallel_size == 1)
             else:
                 # Reduce the gradient on DP group
                 setattr(param, "allreduce", True)
