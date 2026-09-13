@@ -6,7 +6,7 @@ from functools import partial
 
 import torch
 
-from megatron.core import parallel_state, tensor_parallel
+from megatron.core import mpu, parallel_state, tensor_parallel
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.multimodal_dataset import MockMultimodalDataset, MultimodalDatasetConfig
 from megatron.core.enums import ModelType

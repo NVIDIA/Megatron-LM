@@ -23,7 +23,7 @@ from megatron.core.inference.contexts.attention_context.triton.tensor_ops import
     tensor_merge,
 )
 from megatron.core.inference.utils import InferenceMode
-from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.ops.causal_conv1d_triton import causal_conv1d_update
 from megatron.core.ssm.ops.intermediate_extraction import (
@@ -368,18 +368,26 @@ class MambaMixer(MegatronModule):
         self.act = nn.SiLU()
 
         with get_cuda_rng_tracker().fork():
-            # Initialize dt bias so that F.softplus(dt_bias) is between dt_min and dt_max
-            dt = torch.exp(
-                torch.rand(
+            if self.config.perform_initialization:
+                # Initialize dt bias so that F.softplus(dt_bias) is between dt_min and dt_max
+                dt = torch.exp(
+                    torch.rand(
+                        self.nheads_local_tp,
+                        device=torch.cuda.current_device(),
+                        dtype=config.params_dtype,
+                    )
+                    * (math.log(dt_max) - math.log(dt_min))
+                    + math.log(dt_min)
+                ).clamp(min=dt_init_floor)
+                # Inverse of softplus: https://github.com/pytorch/pytorch/issues/72759
+                inv_dt = dt + torch.log(-torch.expm1(-dt))
+            else:
+                inv_dt = torch.empty(
                     self.nheads_local_tp,
                     device=torch.cuda.current_device(),
                     dtype=config.params_dtype,
                 )
-                * (math.log(dt_max) - math.log(dt_min))
-                + math.log(dt_min)
-            ).clamp(min=dt_init_floor)
-            # Inverse of softplus: https://github.com/pytorch/pytorch/issues/72759
-            inv_dt = dt + torch.log(-torch.expm1(-dt))
+
             self.dt_bias = nn.Parameter(inv_dt)
             setattr(self.dt_bias, "tensor_model_parallel", True)
             setattr(self.dt_bias, "partition_dim", 0)
@@ -495,6 +503,11 @@ class MambaMixer(MegatronModule):
                     out, out_bias = self._decode(hidden_states, conv_state, ssm_state)
                     return out, out_bias
 
+        _orig_cp_group = self.cp.cp_group
+        _resolved_cp_group = resolve_cp_group(_orig_cp_group, packed_seq_params)
+        if _resolved_cp_group is not _orig_cp_group:
+            self.cp.set_context_parallel_group(_resolved_cp_group)
+
         zxBCdt, _ = self.in_proj(hidden_states)
 
         zxBCdt = self.cp.pre_conv_ssm(zxBCdt, packed_seq_params)
@@ -512,6 +525,8 @@ class MambaMixer(MegatronModule):
 
         out, out_bias = self.out_proj(y)
 
+        if _resolved_cp_group is not _orig_cp_group:
+            self.cp.set_context_parallel_group(_orig_cp_group)
         return out, out_bias
 
     def _dynamic_inference(self, hidden_states: torch.Tensor, context: DynamicInferenceContext):

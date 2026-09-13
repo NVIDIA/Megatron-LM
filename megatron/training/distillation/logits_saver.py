@@ -48,7 +48,6 @@ from megatron.core.models.common.language_module.language_module import Language
 from megatron.core.msc_utils import MultiStorageClientFeature
 from megatron.core.num_microbatches_calculator import get_num_microbatches
 from megatron.training import get_args, get_tensorboard_writer
-from megatron.training.utils import print_rank_0
 from megatron.training.distillation.utils_logits import (
     CACHED_LOGITS_INDEX_SENTINEL,
     CACHED_LOGITS_LOGPROB_SENTINEL,
@@ -63,6 +62,7 @@ from megatron.training.distillation.utils_logits import (
     storage_makedirs,
     storage_move,
 )
+from megatron.training.utils import print_rank_0
 
 logger = logging.getLogger(__name__)
 
@@ -75,7 +75,8 @@ def get_logits_saver() -> Optional["LogitsSaverHooks"]:
     return _ACTIVE_LOGITS_SAVER
 
 
-_MAX_VOCAB_SIZE = 2 ** 17  # 131072 - maximum supported vocab size
+_MAX_VOCAB_SIZE = 2**17  # 131072 - maximum supported vocab size
+
 
 class LogitsSaverHooks:
     """
@@ -127,11 +128,7 @@ class LogitsSaverHooks:
             disk.  One of ``'fp16'``, ``'bf16'``, or ``'fp32'``.
     """
 
-    _DTYPE_MAP = {
-        'fp16': torch.float16,
-        'bf16': torch.bfloat16,
-        'fp32': torch.float32,
-    }
+    _DTYPE_MAP = {'fp16': torch.float16, 'bf16': torch.bfloat16, 'fp32': torch.float32}
 
     def __init__(
         self,
@@ -151,13 +148,9 @@ class LogitsSaverHooks:
         self._save_dtype = self._DTYPE_MAP[save_dtype]
 
         if p is not None and not (0.0 < p <= 1.0):
-            raise ValueError(
-                f"p must be in (0, 1] or None, got {p}"
-            )
+            raise ValueError(f"p must be in (0, 1] or None, got {p}")
         if min_k < 1:
-            raise ValueError(
-                f"min_k must be >= 1, got {min_k}"
-            )
+            raise ValueError(f"min_k must be >= 1, got {min_k}")
 
         self.save_dir = save_dir
         self.k = k
@@ -184,15 +177,10 @@ class LogitsSaverHooks:
         self.metadata_dict: Dict[str, Any] = {
             "hash": self.dataset_hash,
             "identifiers": self._dataset_identifiers,
-            "saver": {
-                "k": self.k,
-                "p": self.p,
-                "min_k": self.min_k,
-                "save_dtype": save_dtype,
-            },
+            "saver": {"k": self.k, "p": self.p, "min_k": self.min_k, "save_dtype": save_dtype},
         }
         self._meta_bytes: bytes = json.dumps(
-            self.metadata_dict, sort_keys=False, separators=(',', ':'),
+            self.metadata_dict, sort_keys=False, separators=(',', ':')
         ).encode("utf-8")
 
         # Hook states – store already-processed top-K results (not full logits)
@@ -214,10 +202,7 @@ class LogitsSaverHooks:
         _ACTIVE_LOGITS_SAVER = self
 
     def _forward_hook(
-        self,
-        module: torch.nn.Module,
-        input: Any,
-        output: Tuple[torch.Tensor, ...],
+        self, module: torch.nn.Module, input: Any, output: Tuple[torch.Tensor, ...]
     ) -> None:
         """Capture top-K log-probs for one output-layer forward.
 
@@ -258,6 +243,7 @@ class LogitsSaverHooks:
 
     def _override_language_model_loss(self, model: LanguageModule) -> None:
         """Replace LM loss with a zero-valued tensor that preserves gradient edges."""
+
         def _compute_zero_language_model_loss(_self, _labels, logits):
             return (logits * 0).sum(dim=-1).transpose(0, 1).contiguous()
 
@@ -331,9 +317,9 @@ class LogitsSaverHooks:
         local_vocab_size = logits.shape[-1]
         global_vocab_size = local_vocab_size * self.tp_size
 
-        assert global_vocab_size <= _MAX_VOCAB_SIZE, (
-            f"Global vocab size {global_vocab_size} exceeds maximum supported {_MAX_VOCAB_SIZE} (17 bits)"
-        )
+        assert (
+            global_vocab_size <= _MAX_VOCAB_SIZE
+        ), f"Global vocab size {global_vocab_size} exceeds maximum supported {_MAX_VOCAB_SIZE} (17 bits)"
 
         effective_k = min(self.k, global_vocab_size)
         local_k = min(effective_k, local_vocab_size)
@@ -372,7 +358,7 @@ class LogitsSaverHooks:
 
         if self.p is not None:
             global_values, global_indices = self._apply_topp_truncation(
-                global_values, global_indices,
+                global_values, global_indices
             )
 
         global_values = global_values.to(self._save_dtype)
@@ -417,10 +403,7 @@ class LogitsSaverHooks:
         # fp32 can exactly represent integers up to 2^24, sufficient for
         # 17-bit vocab indices.  Shape: (seq, batch, local_k, 3)
         combined = torch.stack(
-            [local_logit_vals,
-             local_logprob_vals.float(),
-             global_indices.float()],
-            dim=-1,
+            [local_logit_vals, local_logprob_vals.float(), global_indices.float()], dim=-1
         )
 
         if self.tp_rank == 0:
@@ -447,9 +430,7 @@ class LogitsSaverHooks:
         return topk_logprobs, topk_global_indices
 
     def _apply_topp_truncation(
-        self,
-        values: torch.Tensor,
-        indices: torch.Tensor,
+        self, values: torch.Tensor, indices: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Apply top-P (nucleus) mask to already-sorted top-K log-probs.
 
@@ -521,11 +502,9 @@ class LogitsSaverHooks:
         """
         # Serialize all tensors together
         buffer = io.BytesIO()
-        torch.save({
-            'values': values_list,
-            'indices_low': indices_low_list,
-            'bit_17': bit_17_list,
-        }, buffer)
+        torch.save(
+            {'values': values_list, 'indices_low': indices_low_list, 'bit_17': bit_17_list}, buffer
+        )
         data = buffer.getvalue()
         iteration = get_current_iteration()
         self._pending_writes[iteration] = data
@@ -552,9 +531,7 @@ class LogitsSaverHooks:
         self._pending_writes = OrderedDict()
 
         last_iter = max(writes.keys())
-        tar_filename = batched_tar_filename(
-            self.cp_rank, self.dp_rank, last_iter,
-        )
+        tar_filename = batched_tar_filename(self.cp_rank, self.dp_rank, last_iter)
         tar_path = os.path.join(self.save_dir, tar_filename)
         print_rank_0(f"Handing off {len(writes)} logit iterations for async flush")
         return (tar_path, writes, self._meta_bytes, msc_enabled)

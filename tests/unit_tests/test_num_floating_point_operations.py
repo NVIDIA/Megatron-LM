@@ -54,6 +54,7 @@ def _make_gpt_args(
     args.group_query_attention = False
     args.num_query_groups = num_attention_heads
     args.attention_output_gate = False
+    args.gated_attention_proj_granularity = "elementwise"
     args.multi_latent_attention = False
     # MoE / MTP disabled.
     args.num_experts = None
@@ -97,6 +98,42 @@ def _make_hybrid_args(*, num_layers=4, hidden_size=512, num_attention_heads=8, s
     args.mamba_num_groups = 8
     args.mamba_num_heads = 128
     return args
+
+
+def _make_kda_hybrid_args():
+    """Minimal KDA dimensions for hybrid FLOPs tests."""
+    args = _make_hybrid_args()
+    args.hybrid_layer_pattern = "K"
+    args.linear_key_head_dim = 32
+    args.linear_value_head_dim = 32
+    args.linear_num_key_heads = 8
+    args.linear_num_value_heads = 8
+    args.linear_conv_kernel_dim = 4
+    return args
+
+
+def _make_mla_hybrid_args():
+    """Minimal head-wise gated MLA dimensions for hybrid FLOPs tests."""
+    args = _make_hybrid_args()
+    args.hybrid_layer_pattern = "+"
+    args.q_lora_rank = 128
+    args.qk_head_dim = 48
+    args.qk_pos_emb_head_dim = 16
+    args.kv_lora_rank = 256
+    args.v_head_dim = 64
+    args.attention_output_gate = True
+    args.gated_attention_proj_granularity = "headwise"
+    return args
+
+
+def test_situ_glu_counts_the_same_ffn_gemms_as_swiglu():
+    swiglu_args = _make_gpt_args(swiglu=True)
+    situ_glu_args = _make_gpt_args(swiglu=False)
+    situ_glu_args.situ_glu = True
+
+    assert num_floating_point_operations(
+        situ_glu_args, batch_size=8
+    ) == num_floating_point_operations(swiglu_args, batch_size=8)
 
 
 class TestBSHDBackwardCompat:
@@ -253,6 +290,238 @@ class TestHybridTHDScaling:
         expected_delta_per_layer_per_unit_sum = 2 * kv * n * 3  # *3 for fwd+bwd
         expected_delta = num_attn_layers * expected_delta_per_layer_per_unit_sum * bshd_sum
         assert flops_doubled - flops_bshd == expected_delta
+
+    def test_mla_attention_variants_are_counted(self):
+        """Regression: DSv4 MLA attention variants (CSA 'C', HCA 'H', Window 'W',
+        DS_ATTENTION 'D') must contribute attention FLOPs. Previously these symbols
+        were omitted, so a pattern made entirely of C/H/W layers reported zero
+        attention FLOPs -- roughly halving the throughput estimate."""
+        args = _make_hybrid_args()
+        args.multi_latent_attention = True
+        # MLA dims (DSv4-like; values only need to be self-consistent and positive).
+        args.q_lora_rank = 256
+        args.kv_lora_rank = 32
+        args.qk_head_dim = 64
+        args.qk_pos_emb_head_dim = 32
+        args.v_head_dim = 64
+        batch_size = 4
+
+        # MLA attention variants (C, H) must be counted exactly like dense MLA '+'.
+        # Both patterns are 2 MLA + 2 Mamba layers, so they yield identical FLOPs.
+        # Regular attention '*' is intentionally not the reference: hybrid grammar
+        # assigns different projection work to '*' and '+'.
+        args.hybrid_layer_pattern = "CMHM"
+        flops_mla_variants = num_floating_point_operations(args, batch_size)
+        args.hybrid_layer_pattern = "+M+M"
+        flops_dense_mla = num_floating_point_operations(args, batch_size)
+
+        assert flops_mla_variants == flops_dense_mla
+        # And attention must be a non-trivial contributor: dropping the two
+        # attention layers entirely (all Mamba) changes the estimate.
+        args.hybrid_layer_pattern = "MMMM"
+        flops_no_attn = num_floating_point_operations(args, batch_size)
+        assert flops_mla_variants != flops_no_attn
+
+
+class TestHybridMatchesStandard:
+    """The hybrid-model path (``hybrid_flops`` / ``mla_attn_layer_flops``) must
+    agree with the standard-model path (``transformer_flops``) for an equivalent
+    architecture.
+
+    A dense Transformer with ``N`` layers has ``N`` attention sub-layers and
+    ``N`` MLP sub-layers. The hybrid path models those as separate layers, so the
+    matching hybrid pattern is ``N`` attention layers interleaved with ``N`` MLP
+    layers (``"*-" * N``). With identical hidden / head / ffn / vocab dims the
+    two estimates must be bit-for-bit equal -- this pins ``mla_attn_layer_flops``
+    (and the dense ``attn_layer_flops``) against the reference MLA / MHA / GQA
+    terms in ``transformer_flops`` (see GitHub PR #5358), both for BSHD and for
+    the THD ``sum(L_i^2)`` / real-token scaling.
+    """
+
+    @staticmethod
+    def _equivalent_pair(configure, num_layers=3):
+        """Build (standard_args, hybrid_args) describing the same architecture."""
+        standard = _make_gpt_args(num_layers=num_layers)
+        configure(standard)
+
+        hybrid = _make_gpt_args(num_layers=num_layers)
+        configure(hybrid)
+        # The hybrid path reads Mamba dims even when no Mamba layers are present.
+        hybrid.mamba_state_dim = 128
+        hybrid.mamba_head_dim = 64
+        hybrid.mamba_num_groups = 8
+        hybrid.mamba_num_heads = 128
+        # Match the standard model's attention implementation explicitly:
+        # '*' is regular attention and '+' is dense MLA in the hybrid grammar.
+        attention_symbol = "+" if hybrid.multi_latent_attention else "*"
+        hybrid.hybrid_layer_pattern = (attention_symbol + "-") * num_layers
+        return standard, hybrid
+
+    def _assert_match(self, configure):
+        standard, hybrid = self._equivalent_pair(configure)
+        batch_size = 4
+
+        # BSHD: closed-form defaults.
+        assert num_floating_point_operations(standard, batch_size) == num_floating_point_operations(
+            hybrid, batch_size
+        )
+
+        # THD: both paths must consume the ragged stats identically.
+        s = standard.seq_length
+        thd_sum_sq = batch_size * 4 * (s // 4) ** 2
+        thd_tokens = batch_size * s * 3 // 4
+        assert num_floating_point_operations(
+            standard,
+            batch_size,
+            seqlen_squared_sum_in_batch=thd_sum_sq,
+            total_real_tokens_in_batch=thd_tokens,
+        ) == num_floating_point_operations(
+            hybrid,
+            batch_size,
+            seqlen_squared_sum_in_batch=thd_sum_sq,
+            total_real_tokens_in_batch=thd_tokens,
+        )
+
+    def test_dense_mha(self):
+        self._assert_match(lambda args: None)
+
+    def test_gqa(self):
+        def configure(args):
+            args.group_query_attention = True
+            args.num_query_groups = 2
+
+        self._assert_match(configure)
+
+    def test_mla_with_q_lora(self):
+        def configure(args):
+            args.multi_latent_attention = True
+            args.group_query_attention = False
+            args.q_lora_rank = 256
+            args.qk_head_dim = 64
+            args.qk_pos_emb_head_dim = 32
+            args.kv_lora_rank = 256
+            args.v_head_dim = 64
+
+        self._assert_match(configure)
+
+    def test_mla_without_q_lora(self):
+        def configure(args):
+            args.multi_latent_attention = True
+            args.group_query_attention = False
+            args.q_lora_rank = None
+            args.qk_head_dim = 64
+            args.qk_pos_emb_head_dim = 32
+            args.kv_lora_rank = 256
+            args.v_head_dim = 64
+
+        self._assert_match(configure)
+
+    @pytest.mark.parametrize("gate_granularity", ("elementwise", "headwise"))
+    def test_mla_output_gate(self, gate_granularity):
+        def configure(args):
+            args.multi_latent_attention = True
+            args.group_query_attention = False
+            args.q_lora_rank = 256
+            args.qk_head_dim = 64
+            args.qk_pos_emb_head_dim = 32
+            args.kv_lora_rank = 256
+            args.v_head_dim = 64
+            args.attention_output_gate = True
+            args.gated_attention_proj_granularity = gate_granularity
+
+        self._assert_match(configure)
+
+
+class TestKimiDeltaAttentionFlops:
+    """KDA layers must contribute their projection and kernel work."""
+
+    def test_direct_projection_formula(self):
+        args = _make_kda_hybrid_args()
+        batch_size = 2
+        total_tokens = batch_size * args.seq_length
+        qk_dim = args.linear_key_head_dim * args.linear_num_key_heads
+        v_dim = args.linear_value_head_dim * args.linear_num_value_heads
+        in_proj_dim = 3 * qk_dim + 2 * v_dim
+        kda_forward = (
+            2
+            * total_tokens
+            * (
+                args.hidden_size * (in_proj_dim + args.linear_num_key_heads)
+                + args.linear_conv_kernel_dim * (2 * qk_dim + v_dim)
+                + args.hidden_size * v_dim
+            )
+        )
+        kda_forward += (
+            8
+            * total_tokens
+            * args.linear_num_key_heads
+            * args.linear_key_head_dim
+            * args.linear_value_head_dim
+        )
+        logits_forward = 2 * total_tokens * args.hidden_size * args.padded_vocab_size
+
+        assert num_floating_point_operations(args, batch_size) == 3 * (kda_forward + logits_forward)
+
+
+class TestMLAHeadwiseOutputGateFlops:
+    """Head-wise gated MLA must account for gate projection and ragged attention work."""
+
+    def test_uses_ragged_attention_work(self):
+        args = _make_mla_hybrid_args()
+        batch_size = 2
+        bshd_sum = batch_size * args.seq_length**2
+        flops_full = num_floating_point_operations(
+            args, batch_size, seqlen_squared_sum_in_batch=bshd_sum
+        )
+        flops_half = num_floating_point_operations(
+            args, batch_size, seqlen_squared_sum_in_batch=bshd_sum // 2
+        )
+        expected_delta = (
+            3
+            * (bshd_sum // 2)
+            * args.num_attention_heads
+            * (args.qk_head_dim + args.qk_pos_emb_head_dim + args.v_head_dim)
+        )
+        assert flops_full - flops_half == expected_delta
+
+    def test_headwise_gate_projection_work(self):
+        args = _make_mla_hybrid_args()
+        batch_size = 2
+        total_tokens = batch_size * args.seq_length
+
+        args.attention_output_gate = False
+        ungated_flops = num_floating_point_operations(args, batch_size)
+        args.attention_output_gate = True
+        gated_flops = num_floating_point_operations(args, batch_size)
+
+        expected_delta = 3 * 2 * total_tokens * args.hidden_size * args.num_attention_heads
+        assert gated_flops - ungated_flops == expected_delta
+
+
+class TestHybridAttentionOutputGateFlops:
+    """Regular attention output gating must use the regular attention projection width."""
+
+    @pytest.mark.parametrize(
+        ("gate_granularity", "gate_projection_size"), (("elementwise", 512), ("headwise", 8))
+    )
+    def test_projection_work(self, gate_granularity, gate_projection_size):
+        args = _make_hybrid_args()
+        args.hybrid_layer_pattern = "*"
+        # The model-wide MLA flag is also enabled in mixed '*' / '+' models, but '*' remains
+        # regular attention. Use a different MLA value-head width to make that distinction visible.
+        args.multi_latent_attention = True
+        args.v_head_dim = 32
+        batch_size = 2
+        total_tokens = batch_size * args.seq_length
+
+        args.attention_output_gate = False
+        ungated_flops = num_floating_point_operations(args, batch_size)
+        args.attention_output_gate = True
+        args.gated_attention_proj_granularity = gate_granularity
+        gated_flops = num_floating_point_operations(args, batch_size)
+
+        expected_delta = 3 * 2 * total_tokens * args.hidden_size * gate_projection_size
+        assert gated_flops - ungated_flops == expected_delta
 
 
 class TestPaddingRemoval:
@@ -644,3 +913,534 @@ class TestAccumulatorTopology:
             f"topology tp={tp} cp={cp} pp={pp} dp={dp_size}: "
             f"got seqlen_squared_sum={seqlen_squared_sum}, expected {expected_sum_sq}"
         )
+
+
+def _make_dsv4_args():
+    """Minimal args for a DSv4-hybrid MLA model with sparse attention.
+
+    4 layers with compress_ratios [0, 4, 128, 128] (1 r0, 1 r4, 2 r128).
+    No MoE / MTP to keep the golden reference simple.
+    """
+    args = _make_gpt_args(
+        num_layers=4,
+        hidden_size=512,
+        num_attention_heads=8,
+        seq_length=256,
+        ffn_hidden_size=2048,
+        padded_vocab_size=1024,
+    )
+    args.multi_latent_attention = True
+    args.group_query_attention = False
+    args.q_lora_rank = 128
+    args.qk_head_dim = 64
+    args.qk_pos_emb_head_dim = 32
+    args.kv_lora_rank = 64
+    args.v_head_dim = 64
+    args.o_lora_rank = 64
+    args.o_groups = 2
+    args.experimental_attention_variant = "dsv4_hybrid"
+    args.csa_window_size = 64
+    args.csa_compress_ratios = [0, 4, 128, 128]
+    args.dsa_indexer_n_heads = 4
+    args.dsa_indexer_head_dim = 32
+    args.dsa_indexer_topk = 16
+    return args
+
+
+def _dsv4_golden_flops(args, total_tokens, seqlen_squared_sum):
+    """Independent golden calculator for DSv4-hybrid FLOPs.
+
+    Reimplements the formula from ``num_floating_point_operations`` so that the
+    test does not just call the same code twice. Assumes no MoE / MTP.
+    """
+    fwd_bwd = 3
+    fma = 2
+    ffn_exp = 3 if args.swiglu else 2
+
+    # ---- MLA projections (token-linear, per layer) ----
+    q_term = args.q_lora_rank * (args.hidden_size + args.num_attention_heads * args.v_head_dim + 1)
+    kv_term = args.hidden_size * args.v_head_dim + args.v_head_dim
+    o_term = (
+        args.num_attention_heads * args.v_head_dim * args.o_lora_rank
+        + args.o_groups * args.o_lora_rank * args.hidden_size
+    )
+    mla_proj_per_layer = fwd_bwd * fma * (q_term + kv_term + o_term)
+
+    # ---- DSv4 sparse attention extra (token-linear + L^2) ----
+    ratios = args.csa_compress_ratios
+    n_r0 = sum(1 for r in ratios if r == 0)
+    n_r4 = sum(1 for r in ratios if r == 4)
+    n_r128 = sum(1 for r in ratios if r == 128)
+    nh = args.num_attention_heads
+    vhd = args.v_head_dim
+    w = args.csa_window_size
+
+    # Token-linear sparse attention
+    sparse_r0 = n_r0 * nh * w * vhd * 2
+    sparse_r128_win = n_r128 * nh * w * vhd * 2
+    if n_r4 > 0:
+        eff_topk = min(args.dsa_indexer_topk, args.seq_length // 4)
+        avg_comp_4 = eff_topk * (1 - eff_topk * 4 / (2 * args.seq_length))
+        sparse_r4 = n_r4 * nh * (w + avg_comp_4) * vhd * 2
+        idx_tok = (
+            n_r4 * args.hidden_size * (2 * args.dsa_indexer_head_dim) * 2
+            + n_r4 * args.q_lora_rank * args.dsa_indexer_n_heads * args.dsa_indexer_head_dim
+            + n_r4 * args.hidden_size * args.dsa_indexer_n_heads
+        )
+        idx_core = n_r4 * args.dsa_indexer_n_heads * args.dsa_indexer_head_dim / 4
+    else:
+        sparse_r4, idx_tok, idx_core = 0, 0, 0
+
+    compressor = n_r4 * args.hidden_size * (2 * vhd) * 2 + n_r128 * args.hidden_size * (1 * vhd) * 2
+    dsv4_token = fwd_bwd * fma * (sparse_r0 + sparse_r4 + sparse_r128_win + compressor + idx_tok)
+    # L^2 core: r=128 compressed-KV + r=4 indexer scoring
+    r128_core = n_r128 * nh * vhd / 128
+    dsv4_core = fwd_bwd * fma * (r128_core + idx_core)
+
+    # ---- Aggregation ----
+    num_layers = args.num_layers
+    self_attn_term = mla_proj_per_layer * num_layers + dsv4_token
+    self_attn_core_term = dsv4_core  # standard core is 0 for DSv4
+
+    mlp = fwd_bwd * fma * args.hidden_size * (args.ffn_hidden_size * ffn_exp * num_layers)
+    logit = fwd_bwd * fma * args.hidden_size * args.padded_vocab_size
+
+    return total_tokens * (mlp + self_attn_term + logit) + seqlen_squared_sum * self_attn_core_term
+
+
+class TestDSv4Hybrid:
+    """DSv4 hybrid sparse-attention FLOPs against an independent golden calculator."""
+
+    def test_bshd(self):
+        """BSHD (uniform sequences) must match the golden calculator."""
+        args = _make_dsv4_args()
+        batch_size = 2
+        total_tokens = batch_size * args.seq_length
+        sum_sq = batch_size * args.seq_length**2
+
+        flops = num_floating_point_operations(args, batch_size)
+        expected = _dsv4_golden_flops(args, total_tokens, sum_sq)
+        assert flops == expected
+
+    def test_thd(self):
+        """THD (packed variable-length subsequences) must match the golden
+        calculator and be strictly less than BSHD due to the L^2 sparse-attention
+        components (r=128 compressed-KV, r=4 indexer scoring)."""
+        args = _make_dsv4_args()
+        batch_size = 2
+        packed_lengths = [64, 64, 128, 256]
+        total_tokens = sum(packed_lengths)
+        thd_sum_sq = sum(L**2 for L in packed_lengths)
+
+        flops = num_floating_point_operations(
+            args,
+            batch_size,
+            seqlen_squared_sum_in_batch=thd_sum_sq,
+            total_real_tokens_in_batch=total_tokens,
+        )
+        expected = _dsv4_golden_flops(args, total_tokens, thd_sum_sq)
+        assert flops == expected
+        # THD must be strictly less than BSHD.
+        bshd_flops = num_floating_point_operations(args, batch_size)
+        assert flops < bshd_flops
+
+
+# ``compress_ratio -> hybrid attention symbol``: Window (r0) / CSA (r4) / HCA (r128).
+_RATIO_TO_SYMBOL = {0: "W", 4: "C", 128: "H"}
+
+
+def _make_dsv4_pair(*, ratios, mtp, moe):
+    """Build (standard_args, hybrid_args) for the SAME DSv4-hybrid model.
+
+    The standard-model path expresses it as ``len(ratios)`` fused layers
+    (MLA attention + FFN per layer, ``experimental_attention_variant`` =
+    ``dsv4_hybrid``); the hybrid-model path expresses the identical model as a
+    pattern with one attention layer (W/C/H per ratio) and one FFN layer (MoE
+    ``E`` or dense ``-``) each. With one MTP depth, the standard path appends a
+    fused MTP layer (ratio 0 / Window) and the hybrid path appends ``/W<ffn>``.
+    """
+    ffn_symbol = "E" if moe else "-"
+
+    def _configure(args):
+        args.multi_latent_attention = True
+        args.group_query_attention = False
+        args.q_lora_rank = 256
+        args.qk_head_dim = 64
+        args.qk_pos_emb_head_dim = 32
+        args.kv_lora_rank = 64
+        args.v_head_dim = 64
+        args.o_lora_rank = 64
+        args.o_groups = 2
+        args.experimental_attention_variant = "dsv4_hybrid"
+        args.csa_window_size = 64
+        args.dsa_indexer_n_heads = 4
+        args.dsa_indexer_head_dim = 32
+        args.dsa_indexer_topk = 16
+        if moe:
+            args.num_experts = 256
+            args.moe_layer_freq = 1
+            args.moe_router_topk = 6
+            args.moe_ffn_hidden_size = 2048
+            args.moe_shared_expert_intermediate_size = 2048
+
+    # ---- standard-model args (fused layers) ----
+    standard = _make_gpt_args(
+        num_layers=len(ratios),
+        hidden_size=512,
+        num_attention_heads=8,
+        seq_length=256,
+        ffn_hidden_size=2048,
+        padded_vocab_size=1024,
+    )
+    _configure(standard)
+    # ``csa_compress_ratios`` must cover main + MTP layers; the MTP layer is a
+    # Window (ratio 0) attention layer.
+    standard.csa_compress_ratios = list(ratios) + [0] * mtp
+    standard.mtp_num_layers = mtp if mtp else None
+
+    # ---- hybrid-model args (split layers, same dims) ----
+    hybrid = _make_gpt_args(
+        num_layers=len(ratios),
+        hidden_size=512,
+        num_attention_heads=8,
+        seq_length=256,
+        ffn_hidden_size=2048,
+        padded_vocab_size=1024,
+    )
+    _configure(hybrid)
+    hybrid.mamba_state_dim = 128
+    hybrid.mamba_head_dim = 64
+    hybrid.mamba_num_groups = 8
+    hybrid.mamba_num_heads = 128
+    main_pattern = "".join(_RATIO_TO_SYMBOL[r] + ffn_symbol for r in ratios)
+    mtp_pattern = ("/" + "W" + ffn_symbol) * mtp  # MTP layer = Window attention
+    hybrid.hybrid_layer_pattern = main_pattern + mtp_pattern
+    hybrid.mtp_num_layers = mtp if mtp else None
+    return standard, hybrid
+
+
+class TestDSv4HybridMatchesStandard:
+    """The hybrid-model path and the standard-model path must agree for a DSv4
+    model with sparse attention.
+
+    Regression for GitHub PR #5485: ``hybrid_flops`` previously routed DSv4
+    attention through the plain full-MLA helper, which (a) computes the full
+    ``O(L^2)`` core attention that DSv4 actually replaces with sparse attention,
+    and (b) uses the dense output projection instead of DSv4's grouped low-rank
+    one. That inflated the hybrid-model FLOPs estimate by ~30% vs. the
+    (correct) standard-model ``dsv4_hybrid`` estimate, even though both describe
+    the same model. Both paths now share ``_dsv4_hybrid_self_attention_flops``,
+    so they must match bit-for-bit -- for BSHD and THD, with and without MTP,
+    and for dense and MoE FFN layers.
+    """
+
+    @staticmethod
+    def _assert_match(*, ratios, mtp, moe):
+        standard, hybrid = _make_dsv4_pair(ratios=ratios, mtp=mtp, moe=moe)
+        batch_size = 2
+
+        # BSHD (closed-form defaults).
+        assert num_floating_point_operations(standard, batch_size) == num_floating_point_operations(
+            hybrid, batch_size
+        )
+
+        # THD: both paths must consume the ragged stats identically.
+        s = standard.seq_length
+        thd_sum_sq = batch_size * 4 * (s // 4) ** 2
+        thd_tokens = batch_size * s * 3 // 4
+        assert num_floating_point_operations(
+            standard,
+            batch_size,
+            seqlen_squared_sum_in_batch=thd_sum_sq,
+            total_real_tokens_in_batch=thd_tokens,
+        ) == num_floating_point_operations(
+            hybrid,
+            batch_size,
+            seqlen_squared_sum_in_batch=thd_sum_sq,
+            total_real_tokens_in_batch=thd_tokens,
+        )
+
+    def test_dense_no_mtp(self):
+        self._assert_match(ratios=[0, 4, 128], mtp=0, moe=False)
+
+    def test_dense_with_mtp(self):
+        self._assert_match(ratios=[0, 4, 128], mtp=1, moe=False)
+
+    def test_moe_no_mtp(self):
+        self._assert_match(ratios=[0, 4, 128, 128], mtp=0, moe=True)
+
+    def test_moe_with_mtp(self):
+        # Production-like: MoE FFN, window/CSA/HCA mix, one MTP depth.
+        self._assert_match(ratios=[0, 0, 4, 128, 4, 128], mtp=1, moe=True)
+
+    def test_hybrid_overcount_is_gone(self):
+        """The OLD bug made the hybrid estimate strictly larger than the standard
+        one (phantom full-MLA O(L^2) core attention). Pin that they are equal,
+        not merely close."""
+        standard, hybrid = _make_dsv4_pair(ratios=[0, 4, 128, 128], mtp=1, moe=True)
+        batch_size = 2
+        std_flops = num_floating_point_operations(standard, batch_size)
+        hyb_flops = num_floating_point_operations(hybrid, batch_size)
+        assert hyb_flops == std_flops
+
+
+def _make_dsa_args(dsa_indexer_loss_coeff=0.01):
+    """Minimal MLA + DSA args (GLM-5.2 style, small scale).
+
+    Uses ``dsa_indexer_topk_freq=1`` and ``dsa_indexer_skip_topk_offset=0``
+    so every layer computes its own top-k index -- the golden reference can
+    set ``num_indexer_layers = num_layers`` without importing the skip-layer
+    predicate from megatron.core.
+
+    ``dsa_indexer_loss_coeff`` drives the indexer's fwd/bwd expansion: the
+    indexer only has a backward pass when its KL loss is enabled. The default
+    here matches the in-tree functional test configs.
+    """
+    args = _make_gpt_args(
+        num_layers=4,
+        hidden_size=512,
+        num_attention_heads=8,
+        seq_length=256,
+        ffn_hidden_size=2048,
+        padded_vocab_size=1024,
+    )
+    args.multi_latent_attention = True
+    args.group_query_attention = False
+    args.q_lora_rank = 128
+    args.kv_lora_rank = 64
+    args.qk_head_dim = 48
+    args.qk_pos_emb_head_dim = 16
+    args.v_head_dim = 64
+    args.experimental_attention_variant = "dsa"
+    args.dsa_indexer_n_heads = 4
+    args.dsa_indexer_head_dim = 32
+    args.dsa_indexer_topk = 16
+    args.dsa_indexer_topk_freq = 1
+    args.dsa_indexer_skip_topk_offset = 0
+    args.dsa_indexer_loss_coeff = dsa_indexer_loss_coeff
+    return args
+
+
+def _dsa_golden_flops(args, total_tokens, seqlen_squared_sum, num_indexer_layers=None):
+    """Independent golden calculator for DSA FLOPs.
+
+    Reimplements the formula from ``num_floating_point_operations`` so that
+    the test does not just call the same code twice. Assumes no MoE / MTP.
+    ``num_indexer_layers`` defaults to every layer, which is what
+    ``dsa_indexer_topk_freq=1`` / ``dsa_indexer_skip_topk_offset=0`` give;
+    cross-layer sharing cases pass the expected count explicitly.
+    """
+    fwd_bwd = 3
+    fma = 2
+    ffn_exp = 3 if args.swiglu else 2
+    num_layers = args.num_layers
+    nh = args.num_attention_heads
+
+    # ---- MLA projections (token-linear, per layer) ----
+    q_term = args.q_lora_rank * (
+        args.hidden_size + nh * (args.qk_head_dim + args.qk_pos_emb_head_dim) + 1
+    )
+    kv_term = (
+        args.kv_lora_rank * (args.hidden_size + nh * (args.qk_head_dim + args.v_head_dim) + 1)
+        + args.hidden_size * args.qk_pos_emb_head_dim
+    )
+    o_term = nh * args.v_head_dim * args.hidden_size
+    mla_proj_per_layer = fwd_bwd * fma * (q_term + kv_term + o_term)
+
+    # ---- Core attention: absorbed-MLA cost scaled down to top-k sparse pairs.
+    # DSA executes ``AbsorbedMLASelfAttention``: QK^T over the compressed KV
+    # latent (kv_lora_rank + rope per head) and AV over kv_lora_rank.
+    raw_core = nh * (args.kv_lora_rank + args.qk_pos_emb_head_dim) / 2 + nh * args.kv_lora_rank / 2
+    mean_seqlen = seqlen_squared_sum / total_tokens
+    topk = args.dsa_indexer_topk
+    if mean_seqlen <= topk:
+        sparse_scale = 1.0
+    else:
+        dense_pairs = mean_seqlen * mean_seqlen / 2
+        topk_pairs = topk * mean_seqlen - topk * topk / 2
+        sparse_scale = topk_pairs / dense_pairs
+    sparse_core_per_layer = fwd_bwd * fma * raw_core * sparse_scale
+
+    # ---- DSA indexer: only layers that compute their own top-k index ----
+    if num_indexer_layers is None:
+        num_indexer_layers = num_layers
+    idx_dim = args.dsa_indexer_n_heads * args.dsa_indexer_head_dim
+    idx_token = num_indexer_layers * (
+        args.q_lora_rank * idx_dim  # wq_b
+        + args.hidden_size * args.dsa_indexer_head_dim  # wk
+        + args.hidden_size * args.dsa_indexer_n_heads  # weights_proj
+    )
+    idx_core = num_indexer_layers * idx_dim / 2
+    # The indexer only runs a backward pass when its KL loss is on, and its
+    # inputs are detached: projections pay fwd + wgrad, scoring pays fwd + dq + dk.
+    if (args.dsa_indexer_loss_coeff or 0.0) > 0:
+        idx_token_expansion, idx_core_expansion = 2, 3
+    else:
+        idx_token_expansion, idx_core_expansion = 1, 1
+    dsa_extra_token = idx_token_expansion * fma * idx_token
+    dsa_extra_core = idx_core_expansion * fma * idx_core
+
+    # ---- Aggregation ----
+    mlp = fwd_bwd * fma * args.hidden_size * (args.ffn_hidden_size * ffn_exp * num_layers)
+    logit = fwd_bwd * fma * args.hidden_size * args.padded_vocab_size
+    self_attn_term = mla_proj_per_layer * num_layers + dsa_extra_token
+    self_attn_core_term = sparse_core_per_layer * num_layers + dsa_extra_core
+
+    return total_tokens * (mlp + self_attn_term + logit) + seqlen_squared_sum * self_attn_core_term
+
+
+class TestDSA:
+    """DSA sparse-attention FLOPs against an independent golden calculator."""
+
+    def test_bshd(self):
+        """BSHD (uniform sequences) must match the golden calculator."""
+        args = _make_dsa_args()
+        batch_size = 2
+        total_tokens = batch_size * args.seq_length
+        sum_sq = batch_size * args.seq_length**2
+
+        flops = num_floating_point_operations(args, batch_size)
+        expected = _dsa_golden_flops(args, total_tokens, sum_sq)
+        assert flops == expected
+
+    def test_thd(self):
+        """THD (packed variable-length subsequences) must match the golden
+        calculator and be strictly less than BSHD due to the L^2 terms
+        (indexer scoring and sparse core attention)."""
+        args = _make_dsa_args()
+        batch_size = 2
+        packed_lengths = [64, 64, 128, 256]
+        total_tokens = sum(packed_lengths)
+        thd_sum_sq = sum(L**2 for L in packed_lengths)
+
+        flops = num_floating_point_operations(
+            args,
+            batch_size,
+            seqlen_squared_sum_in_batch=thd_sum_sq,
+            total_real_tokens_in_batch=total_tokens,
+        )
+        expected = _dsa_golden_flops(args, total_tokens, thd_sum_sq)
+        assert flops == expected
+        # THD must be strictly less than BSHD.
+        bshd_flops = num_floating_point_operations(args, batch_size)
+        assert flops < bshd_flops
+
+    @pytest.mark.parametrize("loss_coeff", [0.0, None])
+    def test_indexer_without_loss_is_forward_only(self, loss_coeff):
+        """With the indexer KL loss disabled the indexer has no backward pass.
+
+        ``DSAttention.forward`` runs it under ``torch.no_grad()`` in that case,
+        so its terms must drop from 2x/3x to 1x rather than keep the global
+        fwd+bwd factor. Everything outside the indexer is unchanged.
+        """
+        args = _make_dsa_args(dsa_indexer_loss_coeff=loss_coeff)
+        batch_size = 2
+        total_tokens = batch_size * args.seq_length
+        sum_sq = batch_size * args.seq_length**2
+
+        flops = num_floating_point_operations(args, batch_size)
+        assert flops == _dsa_golden_flops(args, total_tokens, sum_sq)
+        # A frozen indexer must cost strictly less than a trained one.
+        assert flops < num_floating_point_operations(_make_dsa_args(0.01), batch_size)
+
+    def test_cross_layer_index_sharing(self):
+        """Only layers that compute their own top-k index pay for the indexer.
+
+        ``dsa_indexer_topk_freq=1`` makes ``is_dsa_skip_topk_layer``
+        unconditionally False, so the layer-counting logic is only actually
+        exercised with sharing on. Here ``freq=4, offset=1`` leaves layers 1 and
+        5 computing out of 8, and ``_num_dsa_indexer_layers`` has to stay in
+        lockstep with the predicate in megatron.core.
+        """
+        args = _make_dsa_args()
+        args.num_layers = 8
+        args.dsa_indexer_topk_freq = 4
+        args.dsa_indexer_skip_topk_offset = 1
+        batch_size = 2
+        total_tokens = batch_size * args.seq_length
+        sum_sq = batch_size * args.seq_length**2
+
+        # Layers 1..8 compute when (max(L - 1, 0) % 4) == 0, i.e. layers 1 and 5.
+        expected = _dsa_golden_flops(args, total_tokens, sum_sq, num_indexer_layers=2)
+        assert num_floating_point_operations(args, batch_size) == expected
+
+        # Sharing must be cheaper than every layer running its own indexer.
+        no_sharing = _make_dsa_args()
+        no_sharing.num_layers = 8
+        assert num_floating_point_operations(args, batch_size) < num_floating_point_operations(
+            no_sharing, batch_size
+        )
+
+    def test_topk_caps_long_context_growth(self):
+        """Pin the bug: a long sequence must not be charged dense ``L^2 / 2``.
+
+        With ``seq_length`` well past ``dsa_indexer_topk`` the old behaviour
+        (plain dense MLA core, no top-k scaling) grows quadratically; the
+        corrected sparse core term is capped by top-k and only the indexer's
+        dense scoring keeps a (much smaller) quadratic component.
+        """
+        args = _make_dsa_args()
+        args.seq_length = 8192
+        batch_size = 1
+
+        corrected = num_floating_point_operations(args, batch_size)
+
+        # Same model reading as plain MLA (the branch DSA used to fall into).
+        dense = SimpleNamespace(**vars(args))
+        dense.experimental_attention_variant = None
+        assert corrected < num_floating_point_operations(dense, batch_size)
+
+
+class TestDSAHelperEdgeCases:
+    """Direct coverage of the helper guards and the hybrid rejection."""
+
+    def test_indexer_flops_zero_layers(self):
+        """No indexer layers contribute nothing."""
+        from megatron.training.training import _dsa_indexer_flops
+
+        assert _dsa_indexer_flops(
+            hidden_size=512,
+            q_lora_rank=128,
+            n_heads=4,
+            head_dim=32,
+            num_indexer_layers=0,
+            indexer_loss_coeff=0.01,
+        ) == (0, 0)
+
+    def test_sparse_core_scale_degenerate_inputs(self):
+        """Zero tokens or an unset top-k fall back to the dense scale of 1.0."""
+        from megatron.training.training import _dsa_sparse_core_scale
+
+        assert _dsa_sparse_core_scale(0, 0, 2048) == 1.0
+        assert _dsa_sparse_core_scale(512, 512 * 4096, None) == 1.0
+
+    def test_hybrid_dsa_rejected(self):
+        """A hybrid layer pattern with DSA must fail loud, not fall through
+        to the dense full-MLA estimate (which overcounts core attention and
+        drops the indexer)."""
+        args = _make_dsa_args()
+        args.hybrid_layer_pattern = "D-D-"
+        args.mamba_state_dim = 128
+        args.mamba_head_dim = 64
+        args.mamba_num_groups = 8
+        args.mamba_num_heads = 128
+
+        with pytest.raises(AssertionError, match="hybrid-model path"):
+            num_floating_point_operations(args, 2)
+
+    def test_hybrid_dsa_rejected_without_variant_attribute(self):
+        """The guard must key off the 'D' symbols in the layer pattern, not
+        just ``args.experimental_attention_variant``: on the hybrid path a
+        'D' pattern sets the variant only in the config kwargs (never back
+        onto ``args``), so a real ``--hybrid-layer-pattern "D..."`` launch
+        reaches this code with the attribute still ``None``."""
+        args = _make_dsa_args()
+        args.experimental_attention_variant = None
+        args.hybrid_layer_pattern = "D-D-"
+        args.mamba_state_dim = 128
+        args.mamba_head_dim = 64
+        args.mamba_num_groups = 8
+        args.mamba_num_heads = 128
+
+        with pytest.raises(AssertionError, match="hybrid-model path"):
+            num_floating_point_operations(args, 2)

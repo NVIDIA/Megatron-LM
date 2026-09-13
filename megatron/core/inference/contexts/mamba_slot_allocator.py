@@ -58,10 +58,7 @@ class MambaSlotAllocator:
         self.free_slots = torch.arange(max_slots, dtype=torch.int32, device='cpu')
         self.free_count = max_slots
 
-        # Durable cache state tensors (GPU - accessed by Mamba CUDA kernels):
-        # one slot per cached block boundary, reused across requests. Sized to
-        # `max_slots`; the budget accounting in DynamicInferenceContext refers to
-        # these as the "durable" buffers.
+        # State tensors (GPU - accessed by Mamba CUDA kernels).
         self.conv_states = torch.zeros(
             (num_mamba_layers, max_slots) + conv_states_shape,
             dtype=conv_states_dtype,
@@ -103,13 +100,8 @@ class MambaSlotAllocator:
         # CPU flag to skip GPU sync when no intermediates exist
         self._has_intermediates = False
 
-        # Pre-allocated "scratch" output buffers for CUDA graph compatible
-        # extraction (GPU): per-step staging that the kernel writes intermediate
-        # states into before commit copies them to the durable cache above. Sized
-        # by the per-step token budget computed once on the context; the budget
-        # accounting in DynamicInferenceContext refers to these as the "scratch"
-        # buffers.
-        self.max_intermediate_count = context.max_mamba_intermediate_states_per_step
+        # Pre-allocated output buffers for CUDA graph compatible extraction (GPU).
+        self.max_intermediate_count = MAX_INTERMEDIATE_OFFSETS_PER_REQUEST * context.max_requests
         self.intermediate_ssm_out = torch.zeros(
             (num_mamba_layers, self.max_intermediate_count) + ssm_states_shape,
             dtype=ssm_states_dtype,
@@ -432,10 +424,8 @@ class MambaSlotAllocator:
         last_aligned_abs = (prompt_len // bs) * bs  # last complete block boundary
         penultimate_abs = (overall_required_blocks - 1) * bs
 
-        # SSM chunk size the mamba kernel actually runs with. States can only be
-        # extracted at multiples of this value, and it must match the value used
-        # in MambaMetadata (offset -> chunk-index conversion) to stay consistent.
-        mamba_chunk_size = ctx.mamba_chunk_size
+        # Determine mamba_chunk_size from mamba config (128 is the standard SSM kernel chunk size)
+        mamba_chunk_size = 128
 
         # Keep only boundaries that land inside this chunk's computed tokens and on
         # a mamba-chunk boundary (required for mid-sequence state extraction).

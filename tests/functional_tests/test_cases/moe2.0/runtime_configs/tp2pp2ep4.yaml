@@ -1,0 +1,55 @@
+ENV_VARS:
+  CUDA_DEVICE_MAX_CONNECTIONS: 1
+  NVTE_ALLOW_NONDETERMINISTIC_ALGO: 0
+  PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+  NCCL_NVLS_ENABLE: 0
+  PYTHONWARNINGS: ignore
+  NCCL_DEBUG: VERSION
+
+MODEL_ARGS:
+  # Transformer Engine args
+  --transformer-impl: transformer_engine
+  # Distributed args
+  --distributed-timeout-minutes: 60
+  --tensor-model-parallel-size: 2
+  --pipeline-model-parallel-size: 2
+  --num-virtual-stages-per-pipeline-rank: 4
+  --expert-model-parallel-size: 4
+  --context-parallel-size: 1
+  --expert-tensor-parallel-size: 1
+  --use-distributed-optimizer: true
+  --overlap-grad-reduce: true
+  --overlap-param-gather: true
+  # Use unfused attention since MLA with fused attention and deterministic mode leads to NaN
+  --attention-backend: unfused # TODO: switch back to fused attention after fix
+  --use-mcore-models: true
+  --sequence-parallel: true
+  --micro-batch-size: 4
+  # MoE training related args
+  --moe-token-dispatcher-type: alltoall
+  --moe-permute-fusion: true
+  # Add checkpointing args
+  --save: ${CHECKPOINT_SAVE_PATH}
+  --load: ${CHECKPOINT_LOAD_PATH}
+  --save-interval: 25
+  # Add logging args
+  --log-timers-to-tensorboard: true
+  --log-memory-to-tensorboard: true
+  --log-num-zeros-in-grad: true
+  --log-params-norm: true
+  --log-validation-ppl-to-tensorboard: true
+  --log-throughput: true
+  --log-interval: 1
+  --logging-level: 40
+  --tensorboard-dir: ${TENSORBOARD_PATH}
+  # Add mixed precision args
+  --bf16: true
+  --exit-interval: 50
+  # kernel fusion related args
+  --no-rope-fusion: true
+  --cross-entropy-loss-fusion: true
+  --cross-entropy-fusion-impl: native
+  # MISC
+  --manual-gc: true
+  --manual-gc-interval: 100
+TEST_TYPE: resume-ckpt

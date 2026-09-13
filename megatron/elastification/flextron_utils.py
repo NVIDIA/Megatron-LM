@@ -211,7 +211,6 @@ class FlextronModelManager:
             moe_router_topk=self.config.moe_router_topk,
         )
 
-
         if self.config.budget_type == 'param':
             if self.memory_config.param_budget_target == 'active':
                 diff = abs(current_param_active / (budget_item * self.active_param) - 1)
@@ -297,11 +296,7 @@ class FlextronModelManager:
             mse_loss_emb = F.mse_loss(flextron_kwargs['router_emb'][0], label_emb)
 
             diff += 10 * (
-                mse_loss_mamba
-                + mse_loss_mlp
-                + mse_loss_moe_expert
-                + mse_loss_skip
-                + mse_loss_emb
+                mse_loss_mamba + mse_loss_mlp + mse_loss_moe_expert + mse_loss_skip + mse_loss_emb
             )
 
         return diff.bfloat16(), {}
@@ -315,8 +310,8 @@ class FlextronModelManager:
         if self.router is None:
             return {}, None
 
-        (router_mlp, router_skip, router_emb, router_mamba, router_moe_expert) = (
-            self.router(budget_item)
+        (router_mlp, router_skip, router_emb, router_mamba, router_moe_expert) = self.router(
+            budget_item
         )
 
         flextron_kwargs = {

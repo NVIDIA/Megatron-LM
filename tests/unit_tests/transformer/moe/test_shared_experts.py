@@ -7,9 +7,11 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from megatron.core.activations import situlu
 from megatron.core.models.gpt import moe_module_specs
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_submodules
 from megatron.core.parallel_state import get_tensor_model_parallel_world_size
+from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.moe import shared_experts as shared_experts_module
 from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
 from megatron.core.transformer.moe.shared_experts import FusedSharedExpertMLP, SharedExpertMLP
@@ -52,6 +54,14 @@ class _FakeTEScaledSwiGLU(torch.nn.Module):
         self.glu_interleave_size = glu_interleave_size
 
 
+class _FakeTEScaledSiTUGLU(torch.nn.Module):
+    def __init__(self, glu_interleave_size, *, beta1, beta2):
+        super().__init__()
+        self.glu_interleave_size = glu_interleave_size
+        self.beta1 = beta1
+        self.beta2 = beta2
+
+
 class _FakeTESequential(torch.nn.Module):
     def append(self, module):
         self.add_module(str(len(self._modules)), module)
@@ -90,6 +100,7 @@ def _fake_te_module(linear_cls=_FakeTELinear):
             ops=SimpleNamespace(
                 GroupedLinear=_FakeTEGroupedLinear,
                 ScaledSwiGLU=_FakeTEScaledSwiGLU,
+                ScaledSiTUGLU=_FakeTEScaledSiTUGLU,
                 Sequential=_FakeTESequential,
             ),
             fp8_autocast=_FakeFP8Autocast,
@@ -123,6 +134,10 @@ def _fake_shared_expert(**config_kwargs):
         add_bias_linear=False,
         gated_linear_unit=True,
         activation_func=F.silu,
+        activation_func_clamp_value=None,
+        situ_glu_beta1=4.0,
+        situ_glu_beta2=25.0,
+        use_fused_weighted_squared_relu=False,
         moe_shared_expert_glu_interleave_size=32,
         delay_wgrad_compute=False,
         sequence_parallel=False,
@@ -189,8 +204,8 @@ def test_validate_fused_grouped_swiglu_requires_te(monkeypatch):
     ("config_kwargs", "bad_linear", "match"),
     [
         ({"add_bias_linear": True}, None, "add_bias_linear"),
-        ({"activation_func": F.gelu}, None, "SwiGLU activation"),
-        ({"gated_linear_unit": False}, None, "SwiGLU activation"),
+        ({"activation_func": F.gelu}, None, "SwiGLU or SiTU-GLU activation"),
+        ({"gated_linear_unit": False}, None, "SwiGLU or SiTU-GLU activation"),
         ({"moe_shared_expert_glu_interleave_size": None}, None, "glu_interleave_size"),
         ({}, "linear_fc1", "FC1"),
         ({}, "linear_fc2", "FC2"),
@@ -239,6 +254,20 @@ def test_make_fused_grouped_swiglu_ops_builds_grouped_pipeline(monkeypatch):
     assert fc2_op.kwargs["bias"] is False
     assert fc2_op.kwargs["accumulate_into_main_grad"] is False
     assert fc2_op.weight0 is shared_expert.linear_fc2.weight
+
+
+def test_make_fused_grouped_swiglu_ops_selects_situ_glu(monkeypatch):
+    _patch_fake_shared_expert_te(monkeypatch)
+    shared_expert = _fake_shared_expert(activation_func=situlu)
+
+    shared_expert._validate_fused_grouped_swiglu()
+    ops = shared_expert._make_fused_grouped_swiglu_ops()
+
+    activation_op = list(ops.children())[1]
+    assert isinstance(activation_op, _FakeTEScaledSiTUGLU)
+    assert activation_op.glu_interleave_size == 32
+    assert activation_op.beta1 == 4.0
+    assert activation_op.beta2 == 25.0
 
 
 def test_fused_grouped_swiglu_ops_replay_linear_pre_forward_hooks(monkeypatch):
@@ -415,3 +444,84 @@ class TestSharedExperts:
             assert torch.allclose(
                 p_overlap.grad, p_no_overlap.grad
             ), f"max diff: {torch.max(torch.abs(p_overlap.grad - p_no_overlap.grad))}"
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.parametrize("bias_activation_fusion", [True, False])
+    def test_shared_expert_clamped_swiglu(self, bias_activation_fusion):
+        """
+        Verifies that ``activation_func_clamp_value`` is honored for SwiGLU shared
+        experts in both the overlapped and non-overlapped paths, and in both the
+        ``bias_activation_fusion`` and manual-glu code paths.
+        """
+        Utils.initialize_model_parallel(tensor_model_parallel_size=1, expert_model_parallel_size=1)
+
+        clamp_value = 1.0
+
+        # Create MoE layer with shared expert overlap enabled.
+        model_parallel_cuda_manual_seed(123)
+        moe_layer_overlap = self.get_moe_layer(
+            moe_shared_expert_overlap=True,
+            moe_token_dispatcher_type="alltoall",
+            activation_func_clamp_value=clamp_value,
+            bias_activation_fusion=bias_activation_fusion,
+        ).to(dtype=torch.bfloat16)
+
+        # Create MoE layer with shared expert overlap disabled, sharing weights.
+        model_parallel_cuda_manual_seed(123)
+        moe_layer_no_overlap = self.get_moe_layer(
+            moe_shared_expert_overlap=False,
+            moe_token_dispatcher_type="alltoall",
+            activation_func_clamp_value=clamp_value,
+            bias_activation_fusion=bias_activation_fusion,
+        ).to(dtype=torch.bfloat16)
+        moe_layer_no_overlap.load_state_dict(moe_layer_overlap.state_dict())
+
+        # Use a large input range to ensure the clamp actually triggers.
+        hidden_states = (
+            torch.randn((32, 2, self.config.hidden_size), device="cuda", dtype=torch.bfloat16) * 5.0
+        )
+        hidden_states = hidden_states.detach().requires_grad_(True)
+        hidden_states_no_overlap = hidden_states.detach().clone().requires_grad_(True)
+
+        output_overlap, _ = moe_layer_overlap(hidden_states)
+        output_no_overlap, _ = moe_layer_no_overlap(hidden_states_no_overlap)
+
+        cos_out = torch.nn.functional.cosine_similarity(
+            output_overlap.flatten().unsqueeze(0).float(),
+            output_no_overlap.flatten().unsqueeze(0).float(),
+        ).item()
+        assert cos_out > 0.999, (
+            f"shared-expert clamp output mismatch (fusion={bias_activation_fusion}): "
+            f"cos sim = {cos_out:.6f}"
+        )
+
+        output_overlap.mean().backward()
+        output_no_overlap.mean().backward()
+
+        for p_overlap, p_no_overlap in zip(
+            moe_layer_overlap.parameters(), moe_layer_no_overlap.parameters()
+        ):
+            assert torch.allclose(p_overlap.grad, p_no_overlap.grad), (
+                f"shared-expert clamp mismatch (fusion={bias_activation_fusion}); "
+                f"max diff: {torch.max(torch.abs(p_overlap.grad - p_no_overlap.grad))}"
+            )
+
+        model_parallel_cuda_manual_seed(123)
+        moe_layer_unclamped = self.get_moe_layer(
+            moe_shared_expert_overlap=False,
+            moe_token_dispatcher_type="alltoall",
+            activation_func_clamp_value=None,
+            situ_glu_beta1=4.0,
+            situ_glu_beta2=25.0,
+            use_fused_weighted_squared_relu=False,
+            bias_activation_fusion=bias_activation_fusion,
+        ).to(dtype=torch.bfloat16)
+        moe_layer_unclamped.load_state_dict(moe_layer_overlap.state_dict())
+
+        hidden_states_unclamped = hidden_states.clone().detach().requires_grad_(True)
+        output_unclamped, _ = moe_layer_unclamped(hidden_states_unclamped)
+        assert not torch.allclose(output_no_overlap, output_unclamped), (
+            "Clamping had no observable effect on shared-expert output; "
+            "activation_func_clamp_value may not be plumbed through."
+        )

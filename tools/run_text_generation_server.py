@@ -66,16 +66,14 @@ def get_inference_engine(args: Namespace, model: MegatronModule) -> AbstractEngi
 
     tokenizer = get_tokenizer()
 
-    inference_context = StaticInferenceContext(args.inference_max_requests, args.inference_max_sequence_length)
-    inference_wrapped_model = GPTInferenceWrapper(
-        model, inference_context
+    inference_context = StaticInferenceContext(
+        args.inference_max_requests, args.inference_max_sequence_length
     )
+    inference_wrapped_model = GPTInferenceWrapper(model, inference_context)
     text_generation_controller = TextGenerationController(
         inference_wrapped_model=inference_wrapped_model, tokenizer=tokenizer
     )
-    return StaticInferenceEngine(
-        text_generation_controller=text_generation_controller,
-    )
+    return StaticInferenceEngine(text_generation_controller=text_generation_controller)
 
 
 def add_text_generate_args(parser):
@@ -188,6 +186,7 @@ def main(model_type: str = "gpt"):
                 pass
         elif choice.item() == 1:
             break
+
 
 if __name__ == "__main__":
     main(model_type="gpt")

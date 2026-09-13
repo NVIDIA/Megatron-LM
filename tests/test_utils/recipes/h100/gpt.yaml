@@ -135,6 +135,16 @@ products:
         platforms: [dgx_h100]
       - environment: [lts]
         scope: [nightly]
+  - test_case: [gpt3_mcore_te_tp1_pp2_dsv4_hybrid_mhc_mtp]
+    products:
+      - environment: [dev]
+        scope: [mr, mr-github, mr-github-slim]
+        platforms: [dgx_h100]
+  - test_case: [gpt3_mr_mcore_te_tp1_pp2_core_attn_offload_attn_cudagraph]
+    products:
+      - environment: [dev]
+        scope: [mr, mr-github, mr-github-slim]
+        platforms: [dgx_h100]
   # - test_case: [gpt3_mcore_te_tp1_pp2_resume_torch_dist_cp4_a2a_p2p_nondeterministic]
   #   products:
   #     - environment: [dev]
@@ -319,6 +329,11 @@ products:
         platforms: [dgx_h100]
       - environment: [lts]
         scope: [nightly]
+  - test_case: [gpt3_mcore_te_tp2_pp1_cp4_dcp]
+    products:
+      - environment: [dev]
+        scope: [mr, mr-github, mr-github-slim]
+        platforms: [dgx_h100]
   - test_case: [gpt3_mcore_te_tp2_pp2_cp2_etp4_calculate_per_token_loss_nondeterministic_dp_last]
     products:
       - environment: [dev]
@@ -352,6 +367,26 @@ products:
     products:
       - environment: [dev]
         scope: [mr, mr-github, mr-github-slim]
+        platforms: [dgx_h100]
+  - test_case: [gpt3_mcore_te_tp2_pp2_mhc]
+    products:
+      - environment: [dev]
+        scope: [mr, mr-github]
+        platforms: [dgx_h100]
+  - test_case: [gpt3_mcore_te_tp2_pp2_mhc_attn_cudagraph]
+    products:
+      - environment: [dev]
+        scope: [mr, mr-github]
+        platforms: [dgx_h100]
+  - test_case: [gpt3_mcore_te_tp2_pp2_ep4_mhc_overlap_attn_cudagraph]
+    products:
+      - environment: [dev]
+        scope: [mr, mr-github]
+        platforms: [dgx_h100]
+  - test_case: [gpt3_mcore_te_tp2_pp2_ep4_mhc_overlap_attn_cudagraph_nosplit]
+    products:
+      - environment: [dev]
+        scope: [mr, mr-github]
         platforms: [dgx_h100]
   - test_case: [gpt3_mcore_te_tp2_pp1_gdn_no_nvrx_sync]
     products:

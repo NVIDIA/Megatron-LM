@@ -19,6 +19,7 @@ from megatron.core.extensions.transformer_engine import (
 from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
 from megatron.core.models.backends import BackendSpecProvider
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
+from megatron.core.transformer.dot_product_attention import DotProductAttention
 from megatron.core.transformer.mlp import MLPSubmodules, TEActivationFunctionBuilder
 from megatron.core.transformer.moe.experts import GroupedMLPSubmodules, SequentialMLP, TEGroupedMLP
 from megatron.core.transformer.moe.moe_layer import ExpertsBuilder
@@ -35,6 +36,11 @@ class _TENormWithResidual:
 
 class TESpecProvider(BackendSpecProvider):
     """A protocol for providing the submodules used in Spec building."""
+
+    def __init__(self, fallback_to_eager_attn: bool = False, use_flex_attention: bool = False):
+        super().__init__()
+        self.fallback_to_eager_attn = fallback_to_eager_attn
+        self.use_flex_attention = use_flex_attention
 
     def linear(self) -> type:
         """Which linear module TE backend uses"""
@@ -70,6 +76,12 @@ class TESpecProvider(BackendSpecProvider):
 
     def core_attention(self) -> type:
         """Which module to use for attention"""
+        if self.use_flex_attention:
+            from megatron.core.models.bagel.flex_attention import FlexAttention
+
+            return FlexAttention
+        if self.fallback_to_eager_attn:
+            return DotProductAttention
         return TEDotProductAttention
 
     def grouped_mlp_modules(self, moe_use_grouped_gemm: bool) -> ExpertsBuilder:

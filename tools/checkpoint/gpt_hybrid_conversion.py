@@ -118,7 +118,6 @@ import re
 from collections import OrderedDict
 
 import torch
-
 from dist_checkpoint_io import (
     DIST_FORMATS,
     FORMAT_TORCH_DIST,
@@ -127,7 +126,6 @@ from dist_checkpoint_io import (
     save_dist_checkpoint_full,
     write_latest_iteration_marker,
 )
-
 
 # ---------------------------------------------------------------------------
 # Hybrid layer pattern parsing (standalone, no Megatron imports needed)
@@ -166,8 +164,7 @@ def parse_hybrid_layer_pattern(pattern):
     for ch in layer_types:
         if ch not in VALID_LAYER_SYMBOLS:
             raise ValueError(
-                f"Invalid layer symbol '{ch}' in pattern. "
-                f"Valid symbols: {VALID_LAYER_SYMBOLS}"
+                f"Invalid layer symbol '{ch}' in pattern. " f"Valid symbols: {VALID_LAYER_SYMBOLS}"
             )
     return layer_types
 
@@ -285,11 +282,7 @@ _GPT_COMPAT_REJECT_FIELDS = (
         lambda v: v is not None,
         'linear attention layers (linear_attention_freq)',
     ),
-    (
-        'heterogeneous_block_specs',
-        lambda v: bool(v),
-        'heterogeneous per-layer block specs',
-    ),
+    ('heterogeneous_block_specs', lambda v: bool(v), 'heterogeneous per-layer block specs'),
     (
         'heterogeneous_layers_config_path',
         lambda v: v is not None and v != '',
@@ -300,11 +293,7 @@ _GPT_COMPAT_REJECT_FIELDS = (
         lambda v: v is not None and v != '',
         'heterogeneous layers config (Nemotron-NAS, inline JSON)',
     ),
-    (
-        'multi_latent_attention',
-        lambda v: bool(v),
-        'Multi-Latent Attention (MLA)',
-    ),
+    ('multi_latent_attention', lambda v: bool(v), 'Multi-Latent Attention (MLA)'),
     (
         'mtp_num_layers',
         lambda v: v is not None and v > 0,
@@ -401,6 +390,7 @@ def validate_source_args_gpt_compatible(source_args, direction):
 # SSM parameter initialization (for gpt-to-hybrid)
 # ---------------------------------------------------------------------------
 
+
 def initialize_ssm_layer_params(
     layer_idx,
     d_model,
@@ -465,9 +455,7 @@ def initialize_ssm_layer_params(
 
     # dt_bias
     dt = torch.exp(
-        torch.rand(nheads, dtype=dtype)
-        * (math.log(dt_max) - math.log(dt_min))
-        + math.log(dt_min)
+        torch.rand(nheads, dtype=dtype) * (math.log(dt_max) - math.log(dt_min)) + math.log(dt_min)
     ).clamp(min=dt_init_floor)
     inv_dt = dt + torch.log(-torch.expm1(-dt))
     params[prefix + 'dt_bias'] = inv_dt
@@ -486,6 +474,7 @@ def initialize_ssm_layer_params(
 # ---------------------------------------------------------------------------
 # Key name helpers
 # ---------------------------------------------------------------------------
+
 
 def get_layer_num_from_key(key):
     """Extract the layer number from a state dict key like 'decoder.layers.5.mlp...'"""
@@ -512,9 +501,17 @@ def is_mlp_param(key):
 
 def is_ssm_param(key):
     """Check if a key belongs to a Mamba SSM mixer sub-layer."""
-    ssm_markers = ['mixer.in_proj', 'mixer.conv1d', 'mixer.A_log', 'mixer.D',
-                   'mixer.dt_bias', 'mixer.norm', 'mixer.out_proj',
-                   'mixer.x_proj', 'mixer.dt_proj']
+    ssm_markers = [
+        'mixer.in_proj',
+        'mixer.conv1d',
+        'mixer.A_log',
+        'mixer.D',
+        'mixer.dt_bias',
+        'mixer.norm',
+        'mixer.out_proj',
+        'mixer.x_proj',
+        'mixer.dt_proj',
+    ]
     return any(m in key for m in ssm_markers)
 
 
@@ -531,6 +528,7 @@ def is_layer_norm_for_ssm(key):
 # Core conversion: GPT -> Hybrid
 # ---------------------------------------------------------------------------
 
+
 def convert_gpt_to_hybrid(full_model, layer_types, args):
     """Convert a GPT state dict to a Hybrid state dict.
 
@@ -542,9 +540,7 @@ def convert_gpt_to_hybrid(full_model, layer_types, args):
     Returns:
         OrderedDict: Hybrid state dict with globally-indexed keys.
     """
-    attn_map, mlp_map, ssm_indices = build_layer_index_mapping(
-        layer_types, 'gpt-to-hybrid'
-    )
+    attn_map, mlp_map, ssm_indices = build_layer_index_mapping(layer_types, 'gpt-to-hybrid')
     num_gpt_layers = len(attn_map)
 
     # Validate GPT layer count
@@ -628,6 +624,7 @@ def convert_gpt_to_hybrid(full_model, layer_types, args):
 # Core conversion: Hybrid -> GPT
 # ---------------------------------------------------------------------------
 
+
 def convert_hybrid_to_gpt(full_model, layer_types, args):
     """Convert a Hybrid state dict to a GPT state dict.
 
@@ -639,9 +636,7 @@ def convert_hybrid_to_gpt(full_model, layer_types, args):
     Returns:
         OrderedDict: GPT state dict with globally-indexed keys.
     """
-    attn_map, mlp_map, ssm_indices = build_layer_index_mapping(
-        layer_types, 'hybrid-to-gpt'
-    )
+    attn_map, mlp_map, ssm_indices = build_layer_index_mapping(layer_types, 'hybrid-to-gpt')
     num_gpt_layers = len(attn_map)
 
     target = OrderedDict()
@@ -686,8 +681,10 @@ def convert_hybrid_to_gpt(full_model, layer_types, args):
             discarded_ssm_keys.append(key)
 
     if discarded_ssm_keys:
-        print(f"\n  WARNING: Discarded {len(discarded_ssm_keys)} SSM parameter tensors "
-              f"from {len(ssm_indices)} SSM layers (no GPT equivalent).")
+        print(
+            f"\n  WARNING: Discarded {len(discarded_ssm_keys)} SSM parameter tensors "
+            f"from {len(ssm_indices)} SSM layers (no GPT equivalent)."
+        )
         print(f"  First few discarded keys: {discarded_ssm_keys[:5]}")
 
     target = _sort_state_dict(target)
@@ -699,8 +696,10 @@ def convert_hybrid_to_gpt(full_model, layer_types, args):
 # Sorting helper
 # ---------------------------------------------------------------------------
 
+
 def _sort_state_dict(state_dict):
     """Sort state dict keys so that layer-indexed keys are in order."""
+
     def sort_key(item):
         key = item[0]
         # Extract layer number if present
@@ -723,8 +722,8 @@ def _sort_state_dict(state_dict):
 # Format-aware save
 # ---------------------------------------------------------------------------
 
-def _save_dist_full(target_state_dict, common_state, model_prefix, backend,
-                    args, iteration):
+
+def _save_dist_full(target_state_dict, common_state, model_prefix, backend, args, iteration):
     """Save a fully-gathered state dict in dist-ckpt format.
 
     The on-disk tensors carry their full logical shape, so downstream Megatron
@@ -748,18 +747,24 @@ def _save_dist_full(target_state_dict, common_state, model_prefix, backend,
             else:
                 ckpt_args.hybrid_layer_pattern = None
         if args.reset_iterations:
-            for attr in ('iteration', 'consumed_valid_samples',
-                         'consumed_train_samples', 'train_iters', 'train_samples'):
+            for attr in (
+                'iteration',
+                'consumed_valid_samples',
+                'consumed_train_samples',
+                'train_iters',
+                'train_samples',
+            ):
                 if hasattr(ckpt_args, attr):
                     setattr(ckpt_args, attr, 0)
     if args.reset_iterations and 'iteration' in common_state:
         common_state['iteration'] = 0
 
-    print(f"  Writing dist checkpoint to {iter_dir} "
-          f"(backend={backend}, prefix='{model_prefix}')...")
+    print(
+        f"  Writing dist checkpoint to {iter_dir} "
+        f"(backend={backend}, prefix='{model_prefix}')..."
+    )
     save_dist_checkpoint_full(
-        target_state_dict, common_state, iter_dir,
-        model_prefix=model_prefix, backend=backend,
+        target_state_dict, common_state, iter_dir, model_prefix=model_prefix, backend=backend
     )
     write_latest_iteration_marker(iter_dir, out_iter)
 
@@ -781,9 +786,11 @@ def main(args):
     attn_count = sum(1 for t in layer_types if t == '*')
     mlp_count = sum(1 for t in layer_types if t == '-')
     ssm_count = sum(1 for t in layer_types if t == 'M')
-    print(f"\n  Pattern: {len(layer_types)} total layers "
-          f"({attn_count} attn, {mlp_count} MLP, {ssm_count} SSM, "
-          f"{len(layer_types) - attn_count - mlp_count - ssm_count} other)")
+    print(
+        f"\n  Pattern: {len(layer_types)} total layers "
+        f"({attn_count} attn, {mlp_count} MLP, {ssm_count} SSM, "
+        f"{len(layer_types) - attn_count - mlp_count - ssm_count} other)"
+    )
 
     # Pattern-level GPT compatibility whitelist (fails fast, pre-load).
     validate_pattern_gpt_compatible(layer_types, args.direction)
@@ -811,11 +818,13 @@ def main(args):
 
     # 2. Load source checkpoint into a fully-gathered state dict
     print("\n[Step 1] Loading source checkpoint...")
-    full_model, common_state, model_prefix, dist_backend, iteration = (
-        load_dist_checkpoint_full(args.load_dir)
+    full_model, common_state, model_prefix, dist_backend, iteration = load_dist_checkpoint_full(
+        args.load_dir
     )
-    print(f"  Source: dist backend={dist_backend}, prefix='{model_prefix}', "
-          f"iteration={iteration}, params={len(full_model)}")
+    print(
+        f"  Source: dist backend={dist_backend}, prefix='{model_prefix}', "
+        f"iteration={iteration}, params={len(full_model)}"
+    )
 
     # Args-level GPT compatibility whitelist: reject MoE, MLA, MTP, linear /
     # experimental attention, heterogeneous block specs, etc. See module header.
@@ -836,10 +845,7 @@ def main(args):
 
     # 4. Save
     print(f"\n[Step 3] Saving to {args.save_dir}...")
-    _save_dist_full(
-        target_state_dict, common_state, model_prefix, output_format,
-        args, iteration,
-    )
+    _save_dist_full(target_state_dict, common_state, model_prefix, output_format, args, iteration)
 
     print("\n====CONVERSION COMPLETE====\n")
 
@@ -851,51 +857,68 @@ if __name__ == "__main__":
     )
 
     parser.add_argument(
-        '--direction', type=str, required=True,
+        '--direction',
+        type=str,
+        required=True,
         choices=['gpt-to-hybrid', 'hybrid-to-gpt'],
         help='Conversion direction.',
     )
-    parser.add_argument('--load-dir', type=str, required=True,
-                        help='Path to source checkpoint directory.')
-    parser.add_argument('--save-dir', type=str, required=True,
-                        help='Path to target checkpoint directory.')
-    parser.add_argument('--hybrid-layer-pattern', type=str, required=True,
-                        help='Hybrid layer pattern string, e.g. "M*-M*-M*-M*-".')
+    parser.add_argument(
+        '--load-dir', type=str, required=True, help='Path to source checkpoint directory.'
+    )
+    parser.add_argument(
+        '--save-dir', type=str, required=True, help='Path to target checkpoint directory.'
+    )
+    parser.add_argument(
+        '--hybrid-layer-pattern',
+        type=str,
+        required=True,
+        help='Hybrid layer pattern string, e.g. "M*-M*-M*-M*-".',
+    )
 
     parser.add_argument(
-        '--input-format', type=str, default='auto',
+        '--input-format',
+        type=str,
+        default='auto',
         choices=('auto',) + DIST_FORMATS,
         help='Source checkpoint format. "auto" detects from metadata.json.',
     )
     parser.add_argument(
-        '--output-format', type=str, default='auto',
+        '--output-format',
+        type=str,
+        default='auto',
         choices=('auto',) + DIST_FORMATS,
         help='Target checkpoint format. "auto" matches the input format. '
-             'Dist formats (torch_dist / fsdp_dtensor) transparently support '
-             'TP+PP+FSDP training checkpoints.',
+        'Dist formats (torch_dist / fsdp_dtensor) transparently support '
+        'TP+PP+FSDP training checkpoints.',
     )
 
     # Model architecture params
-    parser.add_argument('--d-model', type=int, default=4096,
-                        help='Model hidden dimension.')
-    parser.add_argument('--mamba-version', type=int, default=2,
-                        choices=[1, 2], help='Mamba SSM version.')
-    parser.add_argument('--mamba-d-state', type=int, default=128,
-                        help='Mamba state dimension.')
-    parser.add_argument('--mamba2-n-groups', type=int, default=8,
-                        help='Number of groups (Mamba v2).')
-    parser.add_argument('--mamba2-head-dim', type=int, default=64,
-                        help='Head dimension (Mamba v2).')
-    parser.add_argument('--d-conv', type=int, default=4,
-                        help='Causal convolution kernel size.')
+    parser.add_argument('--d-model', type=int, default=4096, help='Model hidden dimension.')
+    parser.add_argument(
+        '--mamba-version', type=int, default=2, choices=[1, 2], help='Mamba SSM version.'
+    )
+    parser.add_argument('--mamba-d-state', type=int, default=128, help='Mamba state dimension.')
+    parser.add_argument(
+        '--mamba2-n-groups', type=int, default=8, help='Number of groups (Mamba v2).'
+    )
+    parser.add_argument(
+        '--mamba2-head-dim', type=int, default=64, help='Head dimension (Mamba v2).'
+    )
+    parser.add_argument('--d-conv', type=int, default=4, help='Causal convolution kernel size.')
 
     # Initialization params
-    parser.add_argument('--init-method-std', type=float, default=0.02,
-                        help='Std for initializing new Mamba SSM params.')
+    parser.add_argument(
+        '--init-method-std',
+        type=float,
+        default=0.02,
+        help='Std for initializing new Mamba SSM params.',
+    )
 
     # Checkpoint control
-    parser.add_argument('--reset-iterations', action='store_true',
-                        help='Zero out the training iteration count.')
+    parser.add_argument(
+        '--reset-iterations', action='store_true', help='Zero out the training iteration count.'
+    )
 
     args = parser.parse_args()
     main(args)

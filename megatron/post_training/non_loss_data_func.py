@@ -12,7 +12,11 @@ def report_draft_acceptance_length(model, osl: int = 64, draft_steps: int = 7):
     """Report MTBench acceptance length."""
     tokenizer = get_tokenizer()._tokenizer
     unwrapped_model = unwrap_model(model)[0]
-    parallel_draft_step = unwrapped_model.eagle_config.parallel_draft_step if hasattr(unwrapped_model, "eagle_config") else 1
+    parallel_draft_step = (
+        unwrapped_model.eagle_config.parallel_draft_step
+        if hasattr(unwrapped_model, "eagle_config")
+        else 1
+    )
 
     if unwrapped_model.training:
         return

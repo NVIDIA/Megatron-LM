@@ -1,17 +1,17 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from megatron.core.models.gpt import GPTModel
-from megatron.core.models.gpt.gpt_layer_specs import (
-    get_gpt_decoder_block_spec,
-    get_gpt_layer_local_spec,
-    get_gpt_layer_with_transformer_engine_spec,
-    get_gpt_layer_with_inference_spec,
-    get_gpt_mtp_block_spec,
-    get_gpt_decoder_layer_specs,
-)
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
     get_transformer_block_with_experimental_attention_variant_spec,
     get_transformer_layer_with_experimental_attention_variant_spec,
+)
+from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_decoder_block_spec,
+    get_gpt_decoder_layer_specs,
+    get_gpt_layer_local_spec,
+    get_gpt_layer_with_inference_spec,
+    get_gpt_layer_with_transformer_engine_spec,
+    get_gpt_mtp_block_spec,
 )
 from megatron.core.models.gpt.heterogeneous.heterogeneous_layer_specs import (
     get_gpt_heterogeneous_layer_spec,
@@ -63,6 +63,13 @@ def gpt_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_
             # Get the decoder layer spec explicitly if no decoder layer in the last stage,
             # Only happens with block spec (TransformerBlockSubmodules) when using MoE.
             transformer_layer_spec_for_mtp = _get_transformer_layer_spec(use_te, config)
+        elif args.experimental_attention_variant is not None:
+            # get_gpt_decoder_layer_specs rejects experimental variants;
+            # build per-layer specs via the experimental entry point.
+            experimental_layer_specs = (
+                get_transformer_layer_with_experimental_attention_variant_spec(config=config)
+            )
+            transformer_layer_spec_for_mtp = experimental_layer_specs[-1]
         else:
             # Define the decoder block spec
             if args.experimental_attention_variant is not None:
@@ -127,8 +134,10 @@ def _get_transformer_layer_spec(use_te, config):
             use_te_activation_func=config.use_te_activation_func,
             use_kitchen_attention=config.use_kitchen_attention,
             kitchen_attention_backend=config.kitchen_attention_backend,
+            fallback_to_eager_attn=config.fallback_to_eager_attn,
+            enable_hyper_connection=config.enable_hyper_connections,
             mla_down_proj_fusion=getattr(config, "mla_down_proj_fusion", False),
-            use_grouped_gemm_for_dense_mlp=config.use_grouped_gemm_for_dense_mlp,
+            dense_grouped_gemm=config.dense_grouped_gemm,
         )
     elif config.transformer_impl == "inference_optimized":
         return get_gpt_layer_with_inference_spec(
@@ -145,4 +154,5 @@ def _get_transformer_layer_spec(use_te, config):
             use_kitchen=config.use_kitchen,
             use_kitchen_attention=config.use_kitchen_attention,
             kitchen_attention_backend=config.kitchen_attention_backend,
+            enable_hyper_connection=config.enable_hyper_connections,
         )

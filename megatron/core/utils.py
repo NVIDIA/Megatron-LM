@@ -1,4 +1,4 @@
-# Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Utility functions used throughout Megatron core"""
 
@@ -24,7 +24,7 @@ from datetime import datetime
 from functools import lru_cache, reduce, wraps
 from importlib.metadata import version
 from types import TracebackType
-from typing import Any, Callable, Dict, List, Optional, Tuple, Type, TypeVar, Union
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Type, TypeVar, Union
 
 import numpy
 import torch
@@ -43,6 +43,7 @@ except ImportError:
 
 from megatron.core import parallel_state
 from megatron.core.dist_checkpointing.mapping import ShardedTensor
+from megatron.core.packed_seq_params import PackedSeqParams
 
 try:
     from packaging.version import Version as PkgVersion
@@ -511,7 +512,7 @@ def _missing_cudnn_dsa_kernel_dependencies() -> List[str]:
     try:
         from flash_mla import flash_mla_sparse_fwd  # noqa: F401
     except ImportError:
-        missing.append("flash_mla")
+        missing.append("flash_mla " "(https://github.com/deepseek-ai/FlashMLA/tree/nv_dev)")
     try:
         from cudnn import DSA  # noqa: F401
     except ImportError:
@@ -992,6 +993,12 @@ def make_tp_sharded_tensor_for_checkpoint(
     # Pop group parameters from kwargs
     tp_group = kwargs.pop('tp_group', None)
     dp_cp_group = kwargs.pop('dp_cp_group', None)
+    # If there are any additional kwargs left, surface them for visibility
+    # (these will be forwarded to ShardedTensor.from_rank_offsets).
+    if kwargs:
+        logger.warning(
+            "make_tp_sharded_tensor_for_checkpoint received extra kwargs: %s", list(kwargs.keys())
+        )
 
     prepend_axis_num = len(prepend_offsets)
 
@@ -1121,6 +1128,12 @@ def make_sharded_tensor_for_checkpoint(tensor, key, prepend_offsets=(), replica_
     # Pop group parameters from kwargs
     tp_group = kwargs.pop('tp_group', None)
     dp_cp_group = kwargs.pop('dp_cp_group', None)
+    # If there are any additional kwargs left, surface them for visibility
+    # (these will be forwarded to ShardedTensor.from_rank_offsets).
+    if kwargs:
+        logger.warning(
+            "make_sharded_tensor_for_checkpoint received extra kwargs: %s", list(kwargs.keys())
+        )
 
     prepend_axis_num = len(prepend_offsets)
 
@@ -2611,7 +2624,7 @@ def flatten_batch_for_packed_sequences(batch: Dict[str, Any]) -> Dict[str, Any]:
 
 def get_batch_on_this_cp_rank(
     batch: Dict[str, Any],
-    is_hybrid_cp: bool,
+    is_hybrid_cp: bool = False,
     cp_group: Optional[torch.distributed.ProcessGroup] = None,
     hybrid_cp_group_func: Optional[Callable[[int], torch.distributed.ProcessGroup]] = None,
     use_per_sequence_balancing: bool = False,
@@ -2649,6 +2662,12 @@ def get_batch_on_this_cp_rank(
         to this CP rank.
     """
 
+    if cp_group is None:
+        # Backward-compatible fallback for callers that pass only ``batch``
+        # (pretrain entrypoints historically read the global CP group
+        # internally): use the current context-parallel group.
+        cp_group = parallel_state.get_context_parallel_group()
+
     if use_per_sequence_balancing or batch.get("cu_seqlens") is None:
         batch = _get_batch_on_this_cp_rank_per_sequence_balancing(batch, cp_group=cp_group)
     elif is_hybrid_cp:
@@ -2664,6 +2683,46 @@ def get_batch_on_this_cp_rank(
     else:
         batch = _get_batch_on_this_cp_rank_per_document_balancing(batch, cp_group=cp_group)
     return batch
+
+
+def get_thd_batch_on_this_cp_rank(
+    batch: Dict[str, Any],
+    cu_seqlens: torch.Tensor,
+    cu_seqlens_padded: torch.Tensor,
+    max_seqlen: torch.Tensor,
+    cp_size: Optional[int] = None,
+    cp_rank: Optional[int] = None,
+):
+    """Slice each sub-sample in a packed sample batch input along
+    sequence dimension into multiple chunks, which are parallelized
+    across GPUs in a context parallel group.
+    """
+    packed_seq_params = PackedSeqParams(
+        qkv_format="thd",
+        cu_seqlens_q=cu_seqlens,
+        cu_seqlens_kv=cu_seqlens,
+        cu_seqlens_q_padded=cu_seqlens_padded,
+        cu_seqlens_kv_padded=cu_seqlens_padded,
+        max_seqlen_q=int(max_seqlen[0].item()),
+        max_seqlen_kv=int(max_seqlen[0].item()),
+    )
+
+    cp_size = parallel_state.get_context_parallel_world_size() if cp_size is None else cp_size
+    cp_rank = parallel_state.get_context_parallel_rank() if cp_rank is None else cp_rank
+    if cp_size > 1:  # slice batch along sequence dimension for context parallelism
+        assert tex is not None and is_te_min_version("1.10.0"), (
+            "Please update Transformer Engine to >= 1.10 to use "
+            "Context Parallel with THD format data"
+        )
+        index = tex.thd_get_partitioned_indices(
+            cu_seqlens_padded, batch['tokens'].size(1), cp_size, cp_rank
+        )
+        for key, data in batch.items():
+            if key in {'attention_mask', 'cu_seqlens', 'cu_seqlens_padded', 'max_seqlen'}:
+                continue
+            batch[key] = data.index_select(1, index)
+
+    return batch, packed_seq_params
 
 
 ######################
@@ -2756,6 +2815,16 @@ def nvtx_range_pop(msg=None, suffix=None) -> None:
 
     # Pop NVTX range
     torch.cuda.nvtx.range_pop()
+
+
+@contextmanager
+def nvtx_range(msg=None, suffix=None):
+    """Create an NVTX range controlled by ``configure_nvtx_profiling``."""
+    nvtx_range_push(msg, suffix)
+    try:
+        yield
+    finally:
+        nvtx_range_pop(msg, suffix)
 
 
 @lru_cache(maxsize=None)
@@ -3111,3 +3180,27 @@ def deprecate_inference_params(inference_context, inference_params):
         )
         return inference_params
     return inference_context
+
+
+#: Attribute a parameter-sharding backend sets on each parameter it publishes asynchronously.
+#: See :func:`ensure_params_ready`.
+PARAM_READY_CALLBACK_ATTR = "_ensure_param_ready_callback"
+
+
+def ensure_params_ready(params: Iterable[Any]) -> None:
+    """Make ``params`` readable now, finishing any outstanding backend publication.
+
+    A parameter-sharding backend publishes values asynchronously, so only the owning module's
+    forward pre-hook normally makes ``param.data`` valid. Consumers that read a parameter without
+    invoking its owning module call this first. Backends mark their parameters with
+    :data:`PARAM_READY_CALLBACK_ATTR`; unmarked parameters are already readable.
+
+    Callbacks are shared per communication bucket, so each fires once, not once per parameter.
+    """
+    fired = set()
+    for param in params:
+        callback = getattr(param, PARAM_READY_CALLBACK_ATTR, None)
+        if callback is None or id(callback) in fired:
+            continue
+        fired.add(id(callback))
+        callback()

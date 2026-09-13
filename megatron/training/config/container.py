@@ -33,9 +33,10 @@ from megatron.training.config.training_config import (
 )
 from megatron.training.config.utils import sanitize_dataclass_config
 from megatron.training.config.yaml_utils import safe_yaml_representers
-from megatron.training.models import GPTModelConfig, Serializable, HybridModelConfig
+from megatron.training.models import GPTModelConfig, HybridModelConfig, Serializable
 
 T = TypeVar("T", bound="ConfigContainerBase")
+
 
 @dataclass(kw_only=True)
 class ConfigContainerBase:
@@ -44,7 +45,7 @@ class ConfigContainerBase:
 
     Provides YAML/Dict serialization and deserialization.
     """
-    
+
     @classmethod
     def from_dict(
         cls: Type[T],
@@ -77,7 +78,9 @@ class ConfigContainerBase:
 
         if extra_keys:
             if mode == InstantiationMode.STRICT:
-                raise ValueError(f"Dictionary contains extra keys not in {cls.__qualname__}: {extra_keys}")
+                raise ValueError(
+                    f"Dictionary contains extra keys not in {cls.__qualname__}: {extra_keys}"
+                )
             else:
                 # In lenient mode, remove extra keys
                 for key in extra_keys:
@@ -89,7 +92,9 @@ class ConfigContainerBase:
         return instance
 
     @classmethod
-    def from_yaml(cls: Type[T], yaml_path: str, mode: InstantiationMode = InstantiationMode.LENIENT) -> T:
+    def from_yaml(
+        cls: Type[T], yaml_path: str, mode: InstantiationMode = InstantiationMode.LENIENT
+    ) -> T:
         """
         Create a config container from a YAML file.
 
@@ -202,8 +207,7 @@ class ConfigContainerBase:
         """
         if not HAVE_YAML:
             raise ImportError(
-                "PyYAML is required to save a config to YAML. "
-                "Install via `pip install pyyaml`."
+                "PyYAML is required to save a config to YAML. " "Install via `pip install pyyaml`."
             )
 
         config_dict = self.to_dict()
@@ -218,8 +222,7 @@ class ConfigContainerBase:
         """
         if not HAVE_YAML:
             raise ImportError(
-                "PyYAML is required to print a config as YAML. "
-                "Install via `pip install pyyaml`."
+                "PyYAML is required to print a config as YAML. " "Install via `pip install pyyaml`."
             )
 
         config_dict = self.to_dict()
@@ -236,6 +239,7 @@ class ConfigContainerBase:
             setattr(result, f.name, copy.deepcopy(getattr(self, f.name), memo))
 
         return result
+
 
 @dataclass(kw_only=True)
 class PretrainConfigContainer(ConfigContainerBase):

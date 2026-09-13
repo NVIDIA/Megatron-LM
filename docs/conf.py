@@ -20,7 +20,6 @@
 import os
 import sys
 
-
 # -- Project information -----------------------------------------------------
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#project-information
 
@@ -84,24 +83,17 @@ if not skip_autodoc:
     # This is a workaround that uses the parser located in autodoc2_docstrings_parser.py to allow autodoc2 to
     # render google style docstrings.
     # Related Issue: https://github.com/sphinx-extensions2/sphinx-autodoc2/issues/33
-    autodoc2_docstring_parser_regexes = [
-        (r".*", "docs.autodoc2_docstrings_parser"),
-    ]
+    autodoc2_docstring_parser_regexes = [(r".*", "docs.autodoc2_docstrings_parser")]
     # Regex patterns whose values contain raw regex syntax (e.g. \p{L}) that docutils
     # mis-parses as footnote/reference markup. Exclude them from the generated docs.
-    autodoc2_hidden_regexes = [
-        r".*\._PATTERN_TIKTOKEN.*",
-    ]
+    autodoc2_hidden_regexes = [r".*\._PATTERN_TIKTOKEN.*"]
 
 # -- Options for HTML output -------------------------------------------------
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#options-for-html-output
 
 html_theme = "nvidia_sphinx_theme"
 html_theme_options = {
-    "switcher": {
-        "json_url": "../versions1.json",
-        "version_match": release,
-    },
+    "switcher": {"json_url": "../versions1.json", "version_match": release},
     "icon_links": [
         {
             "name": "GitHub",
@@ -114,23 +106,15 @@ html_theme_options = {
 html_extra_path = ["project.json", "versions1.json"]
 
 # Github links are now getting rate limited from the Github Actions
-linkcheck_ignore = [
-    ".*github\\.com.*",
-    ".*githubusercontent\\.com.*",
-    "http://localhost.*",
-]
+linkcheck_ignore = [".*github\\.com.*", ".*githubusercontent\\.com.*", "http://localhost.*"]
 linkcheck_retries = 10
 linkcheck_rate_limit_timeout = 600
 linkcheck_workers = 1
 
 # PyTorch docs use a JS-rendered frontend; anchor IDs are injected at runtime
 # and are not present in the static HTML that linkcheck fetches.
-linkcheck_anchors_ignore_for_url = [
-    r"https://docs\.pytorch\.org/.*",
-]
+linkcheck_anchors_ignore_for_url = [r"https://docs\.pytorch\.org/.*"]
 
 # PyTorch docs anchor IDs change between stable versions; verify the page
 # loads but skip anchor validation to avoid spurious failures on redirects.
-linkcheck_anchors_ignore_for_url = [
-    "https://docs.pytorch.org/.*",
-]
+linkcheck_anchors_ignore_for_url = ["https://docs.pytorch.org/.*"]

@@ -1,16 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.import functools
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import functools
 import importlib
@@ -185,6 +173,9 @@ class MegatronFSDP(torch.nn.Module):
             children). Checked with :func:`isinstance`. Defaults to empty (none).
         report_nan_in_param_grad (bool): Whether to enable precise NaN-checking for parameter wgrad.
             Can significantly degrade performance. Defaults to False.
+        fsdp_buffer_count (int): Number of persistent buffers allocated for each FSDP
+            communication pool. Defaults to two. Appended to preserve positional-call
+            compatibility.
 
     Examples:
         >>> model = GPTModel(config)
@@ -225,6 +216,7 @@ class MegatronFSDP(torch.nn.Module):
         enable_fine_grained_param_gather_backward_hook: bool = False,
         fine_grained_recurse_module_types: Optional[Tuple[Type[nn.Module], ...]] = None,
         report_nan_in_param_grad: bool = False,
+        fsdp_buffer_count: int = 2,
     ):
         super().__init__()
         # If device is not specified, use the current device.
@@ -265,6 +257,7 @@ class MegatronFSDP(torch.nn.Module):
                 keep_fp8_transpose_cache=keep_fp8_transpose_cache,  # pylint: disable=C0301
                 nccl_ub=nccl_ub,
                 fsdp_double_buffer=fsdp_double_buffer or nccl_ub,
+                fsdp_buffer_count=fsdp_buffer_count,
                 fsdp_db_use_persist_buf_on_alloc_fail=fsdp_db_use_persist_buf_on_alloc_fail,
                 disable_symmetric_registration=disable_symmetric_registration,
                 check_for_nan_in_grad=False,
@@ -278,6 +271,9 @@ class MegatronFSDP(torch.nn.Module):
         self.enable_fine_grained_param_gather_hook = enable_fine_grained_param_gather_hook
         self.enable_fine_grained_param_gather_backward_hook = (
             enable_fine_grained_param_gather_backward_hook
+        )
+        self.prefetch_recompute_forward_weights = (
+            self.ddp_config.megatron_fsdp_prefetch_recompute_forward_weights
         )
         recurse_types = fine_grained_recurse_module_types or ()
         self.fine_grained_recurse_module_types: Tuple[Type[nn.Module], ...] = recurse_types
@@ -906,9 +902,29 @@ class MegatronFSDP(torch.nn.Module):
             param_list = _param_list_for_submodule_unshard(module, "backward")
 
             # All-gather / unshard the module parameters before the backward pass.
-            self.all_gather_and_wait_parameters_ready(
-                param_list, prefetch_order=PrefetchOrder.BACKWARD_PASS_ORDER, bwd=True
-            )
+            if self.prefetch_recompute_forward_weights:
+                self.all_gather_and_wait_parameters_ready(
+                    param_list,
+                    prefetch=False,
+                    prefetch_order=PrefetchOrder.BACKWARD_PASS_ORDER,
+                    bwd=True,
+                )
+                self.all_gather_and_wait_parameters_ready(
+                    param_list,
+                    prefetch=True,
+                    prefetch_order=PrefetchOrder.BACKWARD_PASS_ORDER,
+                    bwd=False,
+                )
+                self.all_gather_and_wait_parameters_ready(
+                    param_list,
+                    prefetch=True,
+                    prefetch_order=PrefetchOrder.BACKWARD_PASS_ORDER,
+                    bwd=True,
+                )
+            else:
+                self.all_gather_and_wait_parameters_ready(
+                    param_list, prefetch_order=PrefetchOrder.BACKWARD_PASS_ORDER, bwd=True
+                )
 
         self._root_pre_backward_hook_issued = False
 

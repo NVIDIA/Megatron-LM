@@ -1,19 +1,14 @@
 # Copyright (c) 2023, NVIDIA CORPORATION.  All rights reserved.
 
 [build-system]
-requires = ["setuptools>=80", "pybind11", "packaging>=24.2"]
+requires = ["setuptools<80.0.0", "pybind11", "packaging>=24.2"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
 include-package-data = true
 
 [tool.setuptools.packages.find]
-include = [
-    "megatron.core",
-    "megatron.core.*",
-    "megatron.training",
-    "megatron.training.*",
-]
+include = ["megatron.core", "megatron.core.*", "megatron.training", "megatron.training.*"]
 
 [tool.setuptools.dynamic]
 version = { attr = "megatron.core.package_info.__version__" }
@@ -23,7 +18,7 @@ readme = { file = "README.md", content-type = "text/markdown" }
 name = "megatron-core"
 dynamic = ["version", "readme"]
 description = "Megatron Core - a library for efficient and scalable training of transformer based models"
-requires-python = ">=3.12"
+requires-python = ">=3.10"
 license = { text = "Apache 2.0" }
 dependencies = ["torch>=2.6.0", "numpy", "packaging>=24.2"]
 authors = [{ name = "NVIDIA", email = "nemo-toolkit@nvidia.com" }]
@@ -75,7 +70,6 @@ training = [
     "wandb",
     "transformers",
     "accelerate",
-    "omegaconf",
 ]
 
 ### 'mlm' group is deprecated. please use 'training' instead ###
@@ -86,49 +80,68 @@ mlm = [
     "wandb",
     "transformers",
     "accelerate",
-    "omegaconf",
 ]
 
 dev = [
-    "nvidia-modelopt[torch]>=0.44; sys_platform != 'darwin'",
+    "nvidia-modelopt[torch]; sys_platform != 'darwin'",
+    "transformer-engine[pytorch,core_cu13]>=2.9.0a0,<2.12.0",
     "nvidia-resiliency-ext==0.6.0",
     "tqdm",
     "einops~=0.8",
     "tensorstore~=0.1,!=0.1.46,!=0.1.72",
-    "multi-storage-client~=0.50",
+    "nvtx~=0.2",
+    "multi-storage-client~=0.27",
     "opentelemetry-api~=1.33.1",
-    "flash-linear-attention~=0.4.0",
+    "mamba-ssm~=2.2",
+    "causal-conv1d~=1.5",
+    "flash-linear-attention[tilelang]==0.5.1",
+    "tilelang==0.1.12",
+    "apache-tvm-ffi==0.1.11",
     "megatron-energon[av_decode]~=7.0",
     "av",
     "flashinfer-python>=0.5.0,<0.7.0",
-    "nvidia-cudnn-frontend[cutedsl]==1.26.0",
+    "nvidia-cudnn-frontend[cutedsl]",
     "wget",
     "onnxscript",
-    "fastapi~=0.50",                                    # Forcing a little bit more recent version of fastapi to be compatible with pydantic 2.0
+    "fastapi~=0.50",                                          # Forcing a little bit more recent version of fastapi to be compatible with pydantic 2.0
     "datasets",
-    "emerging_optimizers",
-    "hypercorn",
+    "emerging_optimizers; python_version >= '3.12'",
     "quart",
+    "hypercorn",
     "openai[aiohttp]",
-    "orjson",
-    "fast-hadamard-transform",
-    "zstandard",
 ]
 
-### 'lts' extra is deprecated                                                   ###
-### LTS Python dependencies are now pinned directly in docker/Dockerfile.ci.lts ###
-### so this pyproject.toml can host meaningful module-level extras without      ###
-### colliding with the LTS pin set. Kept as an empty alias for one release      ###
-### cycle so `pip install megatron-core[lts]` does not error out.               ###
-lts = []
+lts = [
+    "tqdm",
+    "einops~=0.8",
+    "tensorstore~=0.1,!=0.1.46,!=0.1.72",
+    "nvtx~=0.2",
+    "multi-storage-client~=0.27",
+    "opentelemetry-api~=1.33.1",
+    "mamba-ssm~=2.2",
+    "causal-conv1d~=1.5",
+    "megatron-energon[av_decode]~=6.0",
+    "av",
+    "flashinfer-python>=0.5.0,<0.7.0",
+    "wget",
+    "onnxscript",
+    "fastapi~=0.50",                      # Forcing a little bit more recent version of fastapi to be compatible with pydantic 2.0
+    "datasets",
+    "emerging_optimizers; python_version >= '3.12'",
+]
 
+### Module-level extras consumed by `docker/Dockerfile.ci.lts`.               ###
+### They must stay defined on every branch that carries that Dockerfile, or   ###
+### the LTS image build fails with "Extra `...` is not defined in the         ###
+### project's `optional-dependencies` table".                                 ###
 te = [
-    "transformer-engine[pytorch,core_cu13]",
+    "transformer-engine[pytorch,core_cu13]>=2.9.0a0,<2.12.0",
 ]
 
 ssm = [
-    "mamba-ssm",
+    "mamba-ssm~=2.2",
     "causal-conv1d~=1.5",
+    "flash-linear-attention==0.5.1",
 ]
 
 [dependency-groups]
@@ -138,7 +151,6 @@ test = [
     "wrapt",
     "pytest==8.3.5",
     "pytest-mock",
-    "mock",
     "pytest-cov",
     "pytest-random-order",
     "pytest-asyncio",
@@ -157,27 +169,25 @@ docs = [
     "nvidia-sphinx-theme", # Our NVIDIA theme
 ]
 build = [
-    "setuptools>=80",
+    "setuptools<80.0.0,>=77.0.0",
     "packaging>=24.2",
     "hatchling",
     "pybind11",
     "Cython>=3.0.0",
     "torch",
-    "nvidia-cudnn-frontend>=1.25.0",  # for TE
-    "nvidia-mathdx",                  # for TE
+    "nvidia-mathdx",              # for TE
 ]
 linting = [
     "ruff~=0.9.0",
-    "black==24.4.2",
+    "black==26.3.0",
     "isort==5.13.2",
     "flake8==7.1.0",
     "pylint==3.2.6",
 ]
 ci = ["python-gitlab", "slack-sdk", "pandas"]
-no_pypi_wheels = ["flash_mla", "emerging_optimizers"]
+no_pypi_wheels = ["flash_mla", "emerging_optimizers; python_version >= '3.12'", "fast-hadamard-transform"]
 
 [tool.uv]
-managed = true
 default-groups = ["linting", "build", "test"]
 no-build-isolation-package = [
     "causal-conv1d",
@@ -188,35 +198,35 @@ no-build-isolation-package = [
     "fast-hadamard-transform",
 ]
 link-mode = "copy"
+conflicts = [[{ extra = "lts" }, { extra = "dev" }]]
 # We don't define override-dependencies globally but rather locally where we need it.
-# For instance, when installing into a PyTorch base image, we don't want to install torch,
+# For instance, when installing into a PyTorch base image, we don't want to install torch, 
 # torchvision, and triton.
 override-dependencies = [
     "torch; sys_platform == 'never'",
     "torchvision; sys_platform == 'never'",
     "triton; sys_platform == 'never'",
+    # TorchX 0.7.0 caps urllib3 below 1.27; require the fix for GHSA-38jv-5279-wg99.
+    "urllib3>=2.6.3",
 ]
 
 [[tool.uv.dependency-metadata]]
 name = "flash-mla"
-version = "1.0.0+9edee0c"
+version = "1.0.0+b7643bd"
 requires-dist = []
 
 [[tool.uv.dependency-metadata]]
 name = "transformer-engine"
-version = "2.18.0+e7c550c5"
+version = "2.14.0+f031cf87"
 requires-dist = [
-    # Cap below 2.14: pydantic 2.14 breaks langchain_core's module-level
-    # RunnablePassthrough() instantiation, which is imported transitively in
-    # downstream consumers (e.g. Megatron-Bridge via nvidia-resiliency-ext).
-    "pydantic<2.14",
-    "importlib-metadata>=1.0",
-    "packaging",
-    "torch>=2.1",
     "einops",
-    "onnxscript",
-    "onnx",
+    "importlib-metadata",
     "nvdlfw-inspect",
+    "onnx",
+    "onnxscript",
+    "packaging",
+    "pydantic",
+    "torch",
 ]
 
 [[tool.uv.dependency-metadata]]
@@ -229,16 +239,16 @@ requires-dist = ["torch", "packaging", "ninja"]
 flash_mla = [
     { git = "https://github.com/deepseek-ai/FlashMLA", rev = "nv_dev" },
 ]
-transformer-engine = { git = "https://github.com/NVIDIA/TransformerEngine.git", rev = "e7c550c5f80636cf841a8204b1d6f85a5f3f28b7" }
-nemo-run = { git = "https://github.com/NVIDIA-NeMo/Run.git", rev = "e3935393a290aed1822af52139b4b8ee270fed1f" }
-emerging_optimizers = { git = "https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git", rev = "v0.2.0" }
+nvidia-cudnn-frontend = { git = "https://github.com/NVIDIA/cudnn-frontend.git", rev = "develop" }
+transformer-engine = { git = "https://github.com/NVIDIA/TransformerEngine.git", rev = "f031cf87bd054c7558b887df7bed93975456667f" }
+nemo-run = { git = "https://github.com/NVIDIA-NeMo/Run.git", rev = "17ae86b64d7f75653351664f5d8c9e466faede00" }
+emerging_optimizers = { git = "https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git", rev = "v0.3.0" }
 fast-hadamard-transform = { git = "https://github.com/Dao-AILab/fast-hadamard-transform.git", rev = "f134af63deb2df17e1171a9ec1ea4a7d8604d5ca" }
-mamba-ssm = { git = "https://github.com/state-spaces/mamba.git", rev = "0048fbf2e7b2f214dcbe703ea3dec2b9647595e1" }
 
 [tool.isort]
 profile = "black"                                                          # black-compatible
 line_length = 100                                                          # should match black parameters
-py_version = 312                                                           # python 3.12 as a target version
+py_version = 310                                                           # python 3.10 as a target version
 known_first_party = ["megatron"]                                           # FIRSTPARTY section
 known_third_party = ["transformer_engine"]                                 # THIRDPARTY section
 sections = ["FUTURE", "STDLIB", "THIRDPARTY", "FIRSTPARTY", "LOCALFOLDER"]
@@ -250,7 +260,7 @@ line_length = 100
 skip_string_normalization = true
 # recognized by future versions, disallows to reformat code with incompatible versions
 # Matches NeMO version so people working on both codebases don't need two different version of black installed
-required_version = "24"
+required_version = "26"
 skip_magic_trailing_comma = true
 include = '\.pyi?$'
 exclude = '''
@@ -262,24 +272,25 @@ exclude = '''
 '''
 
 [tool.pytest.ini_options]
-addopts = "--durations=15 -s -rA"
+addopts = "--durations=15 -s -rA -x"
 testpaths = ["tests"]
 python_files = "test_*.py"
 markers = [
     "internal: mark a test as a test to private/internal functions.",
     "flaky: mark flaky tests for LTS environment",
     "flaky_in_dev: mark flaky tests for DEV environment",
-    "launch_on_gb200: mark a unit test to be launched on GB200 hardware (4 GPUs/node)",
 ]
 
 [tool.coverage.run]
 concurrency = ["thread", "multiprocessing"]
 omit = [
     "/tmp/*",
-    "/opt/megatron-lm/tests/*",
-    "/opt/megatron-lm/tools/*",
+    "/workspace/tests/*",
     "/usr/local/lib/python3.12/dist-packages/*",
-    "/opt/megatron-lm/_remote_module_non_scriptable",
+    # These fused paths are mostly Triton DSL kernels and PyTorch
+    # autograd-engine callbacks. The CUDA code is exercised by unit tests,
+    # but coverage.py cannot reliably trace those execution contexts.
+    "*/megatron/core/fusions/*",
 ]
 parallel = true
 sigterm = false

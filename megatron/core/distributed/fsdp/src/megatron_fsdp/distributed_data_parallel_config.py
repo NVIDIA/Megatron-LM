@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from dataclasses import dataclass
 from typing import Optional
@@ -76,11 +76,19 @@ class DistributedDataParallelConfig:
     """
 
     fsdp_double_buffer: bool = False
-    """If true, use persistently allocated double buffers for the 
-      temporary memory needed in the Megatron FSDP communications.
-      This option will cause additional memory overhead, however, it is necessary for
-      to register user buffer (nccl_ub=True) for the Megatron FSDP. 
-      This option will be automatically set to True when nccl_ub=True.
+    """If true, enable persistent communication-buffer pools for Megatron FSDP.
+      The legacy option name is retained for compatibility; the number of buffers in
+      each pool is controlled by fsdp_buffer_count. Persistent buffers add memory
+      overhead but are required for NCCL user-buffer registration. This option is
+      automatically enabled when nccl_ub=True or the MaxPool allocator is requested.
+    """
+
+    fsdp_buffer_count: int = 2
+    """Number of persistent buffers allocated for each Megatron FSDP communication pool.
+      The default of two preserves the conventional double-buffer behavior. Combined 1F1B
+      overlap may require three buffers because a backward/recompute unit, the current
+      forward unit, and its forward-prefetched successor can be live concurrently. This
+      option may only be changed when fsdp_double_buffer is enabled.
     """
 
     fsdp_all_gather_in_start_param_sync: bool = True
@@ -155,6 +163,16 @@ class DistributedDataParallelConfig:
       main gradients to parameter dtype for `.grad`.
     """
 
+    megatron_fsdp_prefetch_recompute_forward_weights: bool = False
+    """If set to True, Megatron-FSDP prefetches rowwise weights needed by activation
+      recomputation during backward before prefetching backward transpose weights.
+    """
+
+    megatron_fsdp_cache_param_bucket_views: bool = False
+    """If set to True, Megatron-FSDP caches parameter bucket views to reduce repeated
+      Python-side view setup when attaching module parameters to all-gather buckets.
+    """
+
     megatron_fsdp_cuda_graph_mode: bool = False
     """If set to True, Megatron-FSDP will practice CUDA graph-safe operations, such as
     not dereferencing `param.grad` after the optimizer step to preserve references for
@@ -190,6 +208,12 @@ class DistributedDataParallelConfig:
         import os
 
         """Check the validity of the config."""
+        if self.megatron_fsdp_prefetch_recompute_forward_weights:
+            assert self.data_parallel_sharding_strategy == "optim_grads_params", (
+                "megatron_fsdp_prefetch_recompute_forward_weights is only supported with "
+                "data_parallel_sharding_strategy='optim_grads_params'."
+            )
+
         if self.nccl_ub and not is_torch_min_version("2.11.0a0"):
             if 'expandable_segments:True' in os.getenv('PYTORCH_CUDA_ALLOC_CONF', '').split(','):
                 raise ValueError(
@@ -197,6 +221,17 @@ class DistributedDataParallelConfig:
                     "with nccl_ub due to compatibility issue with torch.cuda.MemPool API."
                 )
 
-        if self.megatron_fsdp_max_pool_double_buffer:
-            # MaxPoolAllocator is a type of double-buffer allocator.
+        if self.nccl_ub or self.megatron_fsdp_max_pool_double_buffer:
+            # NCCL user buffers and MaxPoolAllocator require persistent buffer pools.
             self.fsdp_double_buffer = True
+
+        if self.fsdp_double_buffer:
+            if self.fsdp_buffer_count < 2:
+                raise ValueError(
+                    "fsdp_buffer_count must be at least 2 when fsdp_double_buffer is enabled."
+                )
+        elif self.fsdp_buffer_count != 2:
+            raise ValueError(
+                "fsdp_buffer_count may only be changed from its default of 2 when "
+                "fsdp_double_buffer is enabled."
+            )

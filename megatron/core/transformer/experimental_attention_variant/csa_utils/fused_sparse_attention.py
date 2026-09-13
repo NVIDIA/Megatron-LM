@@ -1,0 +1,3572 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+"""Fused CSA sparse-attention wrappers and Python integration utilities.
+
+Mirrors the three integration paths of the old standalone ``dsa_kernels``
+package, but built on top of
+
+* :mod:`cudnn.deepseek_sparse_attention` (a.k.a. ``DSA``) — CuTe-DSL backward
+  + indexer score kernels + TRT-LLM radix top-K, shipped as part of
+  cuDNN Frontend.
+* :mod:`flash_mla` — production sparse-attention forward kernel, expected to
+  be available as a separate PyPI package.
+
+Public API (same shape as the old ``dsa_kernels`` package):
+
+* ``build_flat_topk_idxs`` / ``local_to_global_flat`` — index helpers.
+* ``csa_sparse_attn`` — Path A / Path C step 2, differentiable sparse attention.
+* ``indexer_topk`` — Path C inference indexer scoring + top-K.
+* ``fused_csa_indexer_sparse_attn`` — Path B training, fused indexer loss +
+  sparse attention with shared backward.
+"""
+
+from __future__ import annotations
+
+import warnings
+from dataclasses import dataclass
+from functools import lru_cache
+from typing import Optional, Tuple
+
+import torch
+from torch import Tensor
+
+from megatron.core.quantization.indexer_quantization import (
+    HAVE_TE_MXFP8,
+    HAVE_TRITON,
+    IndexerMXFP8QuantizationBuffers,
+    create_indexer_mxfp8_quantization_buffers,
+    indexer_mxfp8_scale_shape,
+    indexer_mxfp8_thd_scale_capacity,
+    indexer_mxfp8_thd_scale_shape,
+    make_indexer_mxfp8_scale_cu_seqlens,
+    quantize_indexer_mxfp8,
+    refresh_indexer_mxfp8_scale_cu_seqlens,
+)
+from megatron.core.tensor_parallel.mappings import async_reduce_scatter_along_first_dim
+from megatron.core.utils import nvtx_range_pop, nvtx_range_push
+
+from . import csa_indexer_loss_kernels, thd_indexer_kernels, thd_layout_kernels
+from .csa_teacher_lse import can_use_fused_csa_teacher_lse, fused_csa_teacher_lse
+
+# ---------------------------------------------------------------------------
+# Lazy kernel imports
+# ---------------------------------------------------------------------------
+
+
+_flash_mla_sparse_fwd = None
+_DSA = None
+
+_CSA_TEACHER_LSE_CHUNK_MAX_BYTES = 1024 * 1024 * 1024
+
+
+class _DeferredReduceScatterState:
+    """Carry one asynchronous reduce-scatter into its gradient consumer."""
+
+    def __init__(self, wait_range: str):
+        self.handle = None
+        self.wait_range = wait_range
+
+
+class _WaitForDeferredReduceScatter(torch.autograd.Function):
+    """Wait only on the autograd branch that consumes the reduced gradient."""
+
+    @staticmethod
+    def forward(ctx, input_: Tensor, state: _DeferredReduceScatterState) -> Tensor:
+        """Preserve the input while attaching the deferred collective state."""
+        ctx.state = state
+        return input_.view_as(input_)
+
+    @staticmethod
+    def backward(ctx, _grad_output: Tensor):
+        """Wait for the collective and return its reduced gradient."""
+        handle = ctx.state.handle
+        if handle is None:
+            raise RuntimeError("Deferred reduce-scatter was not launched before consumption")
+        nvtx_range_push(ctx.state.wait_range)
+        try:
+            reduced_gradient = handle.wait()
+        finally:
+            ctx.state.handle = None
+            nvtx_range_pop(ctx.state.wait_range)
+        return reduced_gradient, None
+
+
+def defer_reduce_scatter_wait(
+    input_: Tensor, wait_range: str = "dsv4_cp_reduce_scatter_consumer_wait"
+):
+    """Return a gradient edge whose backward waits for an attached collective."""
+    state = _DeferredReduceScatterState(wait_range)
+    return _WaitForDeferredReduceScatter.apply(input_, state), state
+
+
+@dataclass(frozen=True)
+class _BSHDCompactIndexerGeometry:
+    """Static BSHD geometry for a caller-owned compact workspace."""
+
+    q_shape: tuple[int, ...]
+    k_shape: tuple[int, ...]
+    topk: int
+    ratio: int
+    return_softmax: bool
+    precision: str = "bf16"
+
+
+@dataclass(frozen=True)
+class _THDCompactIndexerGeometry:
+    """Static THD geometry for a caller-owned compact workspace."""
+
+    q_shape: tuple[int, ...]
+    k_shape: tuple[int, ...]
+    batch_size: int
+    has_q_causal_offsets: bool
+    topk: int
+    ratio: int
+    max_seqlen_q: int
+    max_seqlen_k: int
+    return_softmax: bool
+    precision: str = "bf16"
+
+
+@dataclass
+class MXFP8IndexerWorkspace:
+    """Caller-owned TE quantization destinations and packed Indexer scales."""
+
+    q_buffers: IndexerMXFP8QuantizationBuffers
+    k_buffers: IndexerMXFP8QuantizationBuffers
+    q_scale: Tensor
+    k_scale: Tensor
+    cu_seqlens_q_scale_padded: Tensor | None = None
+    cu_seqlens_k_scale_padded: Tensor | None = None
+
+
+@dataclass
+class BSHDCompactIndexerWorkspace:
+    """Persistent compact BSHD capture metadata and MXFP8 storage."""
+
+    cand_buffer_numel: int
+    geometry: _BSHDCompactIndexerGeometry
+    mxfp8: MXFP8IndexerWorkspace | None = None
+
+    def matches_shape(
+        self,
+        *,
+        q_shape: tuple[int, ...],
+        k_shape: tuple[int, ...],
+        device: torch.device,
+        topk: int,
+        ratio: int,
+        return_softmax: bool,
+        precision: str = "bf16",
+    ) -> bool:
+        """Return whether static BSHD metadata matches this workspace."""
+        if len(q_shape) != 4 or len(k_shape) != 3:
+            return False
+        batch_size, seqlen_q, num_heads, head_dim = q_shape
+        k_batch, seqlen_k, k_head_dim = k_shape
+        mxfp8_valid = self.mxfp8 is None
+        if precision == "mxfp8":
+            mxfp8 = self.mxfp8
+            q_scale_shape = indexer_mxfp8_scale_shape(batch_size, seqlen_q, num_heads, head_dim)
+            k_scale_shape = indexer_mxfp8_scale_shape(batch_size, seqlen_k, 1, k_head_dim)
+            mxfp8_valid = mxfp8 is not None and all(
+                (
+                    tuple(mxfp8.q_buffers.input_shape) == q_shape,
+                    mxfp8.q_buffers.data.device == device,
+                    tuple(mxfp8.k_buffers.input_shape) == k_shape,
+                    mxfp8.k_buffers.data.device == device,
+                    mxfp8.q_scale.device == device,
+                    mxfp8.q_scale.dtype == torch.float8_e8m0fnu,
+                    tuple(mxfp8.q_scale.shape) == q_scale_shape,
+                    mxfp8.q_scale.is_contiguous(),
+                    mxfp8.k_scale.device == device,
+                    mxfp8.k_scale.dtype == torch.float8_e8m0fnu,
+                    tuple(mxfp8.k_scale.shape) == k_scale_shape,
+                    mxfp8.k_scale.is_contiguous(),
+                    mxfp8.cu_seqlens_q_scale_padded is None,
+                    mxfp8.cu_seqlens_k_scale_padded is None,
+                )
+            )
+        return all(
+            (
+                precision in ("bf16", "mxfp8"),
+                self.geometry.precision == precision,
+                self.geometry.q_shape == q_shape,
+                self.geometry.k_shape == k_shape,
+                self.geometry.topk == topk,
+                self.geometry.ratio == ratio,
+                self.geometry.return_softmax == return_softmax,
+                batch_size == k_batch,
+                head_dim == k_head_dim,
+                isinstance(self.cand_buffer_numel, int) and self.cand_buffer_numel >= 0,
+                mxfp8_valid,
+            )
+        )
+
+    def matches(
+        self,
+        *,
+        q: Tensor,
+        k: Tensor,
+        topk: int,
+        ratio: int,
+        return_softmax: bool,
+        precision: str = "bf16",
+    ) -> bool:
+        """Return whether this workspace can serve the current BSHD call."""
+        inputs_valid = all(
+            (
+                q.dtype == torch.bfloat16,
+                k.dtype == torch.bfloat16,
+                q.device == k.device,
+                q.is_contiguous(),
+                k.is_contiguous(),
+            )
+        )
+        if not inputs_valid or not self.matches_shape(
+            q_shape=tuple(q.shape),
+            k_shape=tuple(k.shape),
+            device=q.device,
+            topk=topk,
+            ratio=ratio,
+            return_softmax=return_softmax,
+            precision=precision,
+        ):
+            return False
+        if precision == "mxfp8":
+            assert self.mxfp8 is not None
+            return self.mxfp8.q_buffers.matches(q) and self.mxfp8.k_buffers.matches(k)
+        return True
+
+    def validate(
+        self,
+        *,
+        q: Tensor,
+        k: Tensor,
+        topk: int,
+        ratio: int,
+        return_softmax: bool,
+        precision: str = "bf16",
+    ) -> None:
+        """Validate caller-owned BSHD state before dispatch."""
+        if not self.matches(
+            q=q, k=k, topk=topk, ratio=ratio, return_softmax=return_softmax, precision=precision
+        ):
+            raise ValueError(
+                "BSHD compact_workspace does not match the current buffers or static geometry; "
+                "prepare a workspace for this exact call during eager warmup."
+            )
+
+
+@dataclass
+class THDCompactIndexerWorkspace:
+    """Persistent compact THD offsets, capture metadata, and MXFP8 storage."""
+
+    cand_batch_offsets: Tensor
+    cand_buffer_numel: int
+    geometry: _THDCompactIndexerGeometry
+    mxfp8: MXFP8IndexerWorkspace | None = None
+
+    def matches(
+        self,
+        *,
+        q: Tensor,
+        k: Tensor,
+        topk: int,
+        ratio: int,
+        cu_seqlens_q: Tensor,
+        cu_seqlens_k: Tensor,
+        max_seqlen_q: int,
+        max_seqlen_k: int,
+        q_causal_offsets: Tensor | None,
+        return_softmax: bool,
+        precision: str = "bf16",
+    ) -> bool:
+        """Return whether this workspace can serve the current static indexer geometry."""
+        geometry = self.geometry
+        batch_size = geometry.batch_size
+        inputs_valid = all(
+            (
+                q.dtype == torch.bfloat16,
+                k.dtype == torch.bfloat16,
+                tuple(q.shape) == geometry.q_shape,
+                tuple(k.shape) == geometry.k_shape,
+                q.device == k.device,
+                q.is_contiguous(),
+                k.is_contiguous(),
+            )
+        )
+        cu_seqlens_valid = all(
+            tensor.device == q.device
+            and tensor.dtype == torch.int32
+            and tensor.ndim == 1
+            and tensor.numel() == batch_size + 1
+            and tensor.is_contiguous()
+            for tensor in (cu_seqlens_q, cu_seqlens_k)
+        )
+        q_causal_offsets_valid = (
+            q_causal_offsets is None
+            if not geometry.has_q_causal_offsets
+            else (
+                q_causal_offsets is not None
+                and q_causal_offsets.device == q.device
+                and q_causal_offsets.dtype == torch.int32
+                and q_causal_offsets.ndim == 1
+                and q_causal_offsets.numel() == batch_size
+                and q_causal_offsets.is_contiguous()
+            )
+        )
+        mxfp8_valid = self.mxfp8 is None
+        if precision == "mxfp8":
+            mxfp8 = self.mxfp8
+            q_scale_shape = indexer_mxfp8_thd_scale_shape(
+                indexer_mxfp8_thd_scale_capacity(q.shape[0], batch_size, q.shape[1]),
+                q.shape[1],
+                q.shape[2],
+            )
+            k_scale_shape = indexer_mxfp8_thd_scale_shape(
+                indexer_mxfp8_thd_scale_capacity(k.shape[0], batch_size, 1), 1, k.shape[1]
+            )
+            scale_prefixes_valid = mxfp8 is not None and all(
+                prefix is not None
+                and prefix.device == q.device
+                and prefix.dtype == torch.int32
+                and prefix.ndim == 1
+                and prefix.numel() == batch_size + 1
+                and prefix.is_contiguous()
+                for prefix in (mxfp8.cu_seqlens_q_scale_padded, mxfp8.cu_seqlens_k_scale_padded)
+            )
+            mxfp8_valid = (
+                mxfp8 is not None
+                and scale_prefixes_valid
+                and all(
+                    (
+                        mxfp8.q_scale.device == q.device,
+                        mxfp8.q_scale.dtype == torch.float8_e8m0fnu,
+                        tuple(mxfp8.q_scale.shape) == q_scale_shape,
+                        mxfp8.q_scale.is_contiguous(),
+                        mxfp8.k_scale.device == q.device,
+                        mxfp8.k_scale.dtype == torch.float8_e8m0fnu,
+                        tuple(mxfp8.k_scale.shape) == k_scale_shape,
+                        mxfp8.k_scale.is_contiguous(),
+                        mxfp8.q_buffers.matches(q),
+                        mxfp8.k_buffers.matches(k),
+                    )
+                )
+            )
+        static_valid = (
+            precision in ("bf16", "mxfp8")
+            and inputs_valid
+            and geometry.precision == precision
+            and geometry.topk == topk
+            and geometry.ratio == ratio
+            and geometry.max_seqlen_q == max_seqlen_q
+            and geometry.max_seqlen_k == max_seqlen_k
+            and geometry.return_softmax == return_softmax
+            and cu_seqlens_valid
+            and q_causal_offsets_valid
+            and self.cand_batch_offsets.device == q.device
+            and self.cand_batch_offsets.dtype == torch.int64
+            and self.cand_batch_offsets.ndim == 1
+            and self.cand_batch_offsets.numel() == batch_size + 1
+            and self.cand_batch_offsets.is_contiguous()
+            and isinstance(self.cand_buffer_numel, int)
+            and self.cand_buffer_numel >= 0
+            and mxfp8_valid
+        )
+        return static_valid
+
+    def validate(
+        self,
+        *,
+        q: Tensor,
+        k: Tensor,
+        topk: int,
+        ratio: int,
+        cu_seqlens_q: Tensor,
+        cu_seqlens_k: Tensor,
+        max_seqlen_q: int,
+        max_seqlen_k: int,
+        q_causal_offsets: Tensor | None,
+        return_softmax: bool,
+        precision: str = "bf16",
+    ) -> None:
+        """Validate static workspace metadata without synchronizing."""
+        if not self.matches(
+            q=q,
+            k=k,
+            topk=topk,
+            ratio=ratio,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            q_causal_offsets=q_causal_offsets,
+            return_softmax=return_softmax,
+            precision=precision,
+        ):
+            raise ValueError(
+                "THD compact_workspace does not match the current buffers or static geometry; "
+                "prepare a compatible workspace during eager warmup."
+            )
+
+
+def _compact_indexer_available(q: Tensor, k: Tensor, precision: str) -> bool:
+    """Return whether this device/frontend can dispatch compact Top-K."""
+    _ensure_dsa_namespace()
+    try:
+        compact_wrapper = getattr(_DSA, "indexer_forward_top_k_wrapper", None)
+    except (AttributeError, ImportError):
+        compact_wrapper = None
+    return (
+        precision in ("bf16", "mxfp8")
+        and (precision != "mxfp8" or (HAVE_TE_MXFP8 and HAVE_TRITON))
+        and callable(compact_wrapper)
+        and q.dtype == torch.bfloat16
+        and k.dtype == torch.bfloat16
+        and torch.cuda.get_device_capability(q.device)[0] >= 10
+    )
+
+
+def bshd_compact_indexer_available(q: Tensor, k: Tensor, precision: str = "bf16") -> bool:
+    """Return whether this device/frontend can dispatch compact BSHD Top-K."""
+    return _compact_indexer_available(q, k, precision)
+
+
+def thd_compact_indexer_available(q: Tensor, k: Tensor, precision: str = "bf16") -> bool:
+    """Return whether this device/frontend can dispatch compact THD Top-K."""
+    return _compact_indexer_available(q, k, precision)
+
+
+def _allocate_compact_candidate_buffer(numel: int, device: torch.device) -> Tensor:
+    """Allocate candidate scratch in the active eager or CUDA-graph memory pool.
+
+    The compact wrapper consumes this stage-1 output before returning, so the
+    tensor must not be retained in the persistent workspace. During capture,
+    its short lifetime lets serialized graphs reuse storage from their shared
+    graph pool.
+    """
+    return torch.empty(numel, dtype=torch.float32, device=device)
+
+
+def _allocate_compact_output_buffers(
+    shape: tuple[int, ...], device: torch.device, return_softmax: bool
+) -> dict[str, Tensor]:
+    """Allocate compact outputs in the active eager or CUDA-graph memory pool.
+
+    These tensors follow the captured forward's dataflow instead of being
+    retained by the module. Keeping their ownership dispatch-local lets
+    serialized CUDA graphs reuse their storage from a shared graph pool.
+    """
+    outputs = {
+        "out_indices": torch.empty(shape, dtype=torch.int32, device=device),
+        "out_logits": torch.empty(shape, dtype=torch.float32, device=device),
+    }
+    if return_softmax:
+        outputs["softmax_out"] = torch.empty(shape, dtype=torch.float32, device=device)
+    return outputs
+
+
+def prepare_bshd_compact_indexer_workspace(
+    q: Tensor,
+    k: Tensor,
+    *,
+    topk: int,
+    ratio: int,
+    return_softmax: bool = False,
+    precision: str = "bf16",
+) -> BSHDCompactIndexerWorkspace | None:
+    """Prepare persistent compact BSHD state before CUDA graph capture.
+
+    ``q`` and ``k`` use the BSHD/BSD layouts consumed by
+    :func:`_indexer_topk_core`. The workspace forces the upstream compact
+    wrapper's single-launch mode so its candidate sizing is identical for
+    BF16 and MXFP8. Candidate scratch and compact outputs are allocated by each
+    dispatch, allowing a CUDA-graph capture pool to reuse them across serialized
+    graphs.
+    """
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError("BSHD compact indexer workspace must be prepared before CUDA capture")
+    if q.ndim != 4 or k.ndim != 3:
+        raise ValueError(
+            f"BSHD workspace expects q (B,S,H,D) and k (B,S,D), got {q.shape}, {k.shape}"
+        )
+    if not q.is_contiguous() or not k.is_contiguous():
+        raise ValueError("BSHD workspace inputs must be contiguous")
+
+    _ensure_dsa_namespace()
+    size_helper = getattr(_DSA, "compress_topk_cand_buffer_size", None)
+    if not bshd_compact_indexer_available(q, k, precision) or not callable(size_helper):
+        return None
+
+    batch_size, seqlen_q, num_heads, head_dim = q.shape
+    k_batch, seqlen_k, k_head_dim = k.shape
+    if batch_size != k_batch or head_dim != k_head_dim:
+        raise ValueError("BSHD workspace q/k batch size and head dimension must match")
+    cand_floats = size_helper(batch_size, seqlen_q, seqlen_k, ratio, microbatch_rows=0)
+    device = q.device
+    mxfp8_workspace = None
+    if precision == "mxfp8":
+        mxfp8_workspace = MXFP8IndexerWorkspace(
+            q_buffers=create_indexer_mxfp8_quantization_buffers(q),
+            k_buffers=create_indexer_mxfp8_quantization_buffers(k),
+            q_scale=torch.empty(
+                indexer_mxfp8_scale_shape(batch_size, seqlen_q, num_heads, head_dim),
+                dtype=torch.float8_e8m0fnu,
+                device=device,
+            ),
+            k_scale=torch.empty(
+                indexer_mxfp8_scale_shape(batch_size, seqlen_k, 1, k_head_dim),
+                dtype=torch.float8_e8m0fnu,
+                device=device,
+            ),
+        )
+    return BSHDCompactIndexerWorkspace(
+        cand_buffer_numel=int(cand_floats),
+        geometry=_BSHDCompactIndexerGeometry(
+            q_shape=tuple(q.shape),
+            k_shape=tuple(k.shape),
+            topk=topk,
+            ratio=ratio,
+            return_softmax=return_softmax,
+            precision=precision,
+        ),
+        mxfp8=mxfp8_workspace,
+    )
+
+
+@torch.compile
+def _refresh_thd_compact_cand_batch_offsets(
+    destination: Tensor, cu_seqlens_q: Tensor, ratio: int, q_causal_offsets: Tensor | None
+) -> None:
+    """Refresh caller-owned THD candidate offsets from graph inputs."""
+    cu_q = cu_seqlens_q.to(torch.int64)
+    q_lengths = cu_q[1:] - cu_q[:-1]
+    if q_causal_offsets is None:
+        q_starts = torch.zeros_like(q_lengths)
+    else:
+        q_starts = q_causal_offsets.to(torch.int64)
+
+    def prefix_candidate_count(length: Tensor) -> Tensor:
+        quotient = torch.div(length, ratio, rounding_mode="floor")
+        remainder = length - quotient * ratio
+        return ratio * quotient * (quotient - 1) // 2 + quotient * (remainder + 1)
+
+    per_sequence = prefix_candidate_count(q_starts + q_lengths) - prefix_candidate_count(q_starts)
+    destination.zero_()
+    torch.cumsum(per_sequence, dim=0, out=destination[1:])
+
+
+def prepare_thd_compact_indexer_workspace(
+    q: Tensor,
+    k: Tensor,
+    *,
+    topk: int,
+    ratio: int,
+    cu_seqlens_q: Tensor,
+    cu_seqlens_k: Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    q_causal_offsets: Tensor | None = None,
+    return_softmax: bool = False,
+    precision: str = "bf16",
+) -> THDCompactIndexerWorkspace | None:
+    """Prepare persistent compact THD state before CUDA graph capture.
+
+    Returns None when the installed cuDNN Frontend or GPU does not expose
+    the SM100 compact API. The sizing helper performs a GPU-to-host sync and
+    therefore this function must never be called from inside graph capture.
+    Eager warmup must prepare this workspace before any THD compact capture.
+    Candidate scratch and compact outputs are allocated by each dispatch so a
+    CUDA-graph capture pool can reuse that temporary storage across serialized
+    graphs.
+    """
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError("THD compact indexer workspace must be prepared before CUDA capture")
+
+    _ensure_dsa_namespace()
+    size_helper = getattr(_DSA, "compress_topk_cand_buffer_size_thd", None)
+    if not thd_compact_indexer_available(q, k, precision) or not callable(size_helper):
+        return None
+
+    cand_batch_offsets, cand_floats = size_helper(
+        cu_seqlens_q, cu_seqlens_k, ratio, q_causal_offsets=q_causal_offsets
+    )
+    device = q.device
+    # Sequence boundaries may change between graph capture and replay while
+    # tensor shapes and maxima remain static. Reserve the geometry-wide upper
+    # bound so refreshed candidate offsets always address valid storage.
+    cand_floats = max(cand_floats, q.shape[0] * int(max_seqlen_k))
+    mxfp8_workspace = None
+    if precision == "mxfp8":
+        q_buffers = create_indexer_mxfp8_quantization_buffers(q)
+        k_buffers = create_indexer_mxfp8_quantization_buffers(k)
+        cu_seqlens_q_scale_padded = make_indexer_mxfp8_scale_cu_seqlens(cu_seqlens_q, q.shape[1])
+        cu_seqlens_k_scale_padded = make_indexer_mxfp8_scale_cu_seqlens(cu_seqlens_k, 1)
+        batch_size = cu_seqlens_q.numel() - 1
+        q_scale_capacity = indexer_mxfp8_thd_scale_capacity(q.shape[0], batch_size, q.shape[1])
+        k_scale_capacity = indexer_mxfp8_thd_scale_capacity(k.shape[0], batch_size, 1)
+        mxfp8_workspace = MXFP8IndexerWorkspace(
+            q_buffers=q_buffers,
+            k_buffers=k_buffers,
+            q_scale=torch.empty(
+                indexer_mxfp8_thd_scale_shape(q_scale_capacity, q.shape[1], q.shape[2]),
+                dtype=torch.float8_e8m0fnu,
+                device=device,
+            ),
+            k_scale=torch.empty(
+                indexer_mxfp8_thd_scale_shape(k_scale_capacity, 1, k.shape[1]),
+                dtype=torch.float8_e8m0fnu,
+                device=device,
+            ),
+            cu_seqlens_q_scale_padded=cu_seqlens_q_scale_padded,
+            cu_seqlens_k_scale_padded=cu_seqlens_k_scale_padded,
+        )
+    return THDCompactIndexerWorkspace(
+        cand_batch_offsets=cand_batch_offsets,
+        cand_buffer_numel=int(cand_floats),
+        geometry=_THDCompactIndexerGeometry(
+            q_shape=tuple(q.shape),
+            k_shape=tuple(k.shape),
+            batch_size=cu_seqlens_q.numel() - 1,
+            has_q_causal_offsets=q_causal_offsets is not None,
+            topk=topk,
+            ratio=ratio,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            return_softmax=return_softmax,
+            precision=precision,
+        ),
+        mxfp8=mxfp8_workspace,
+    )
+
+
+def _ensure_flash_mla():
+    """Lazily import the FlashMLA sparse-forward kernel.
+
+    FlashMLA ships ``flash_mla_sparse_fwd`` with a multi-head-KV signature;
+    :func:`_csa_fwd_flash_mla` below is a thin adapter that unbatches the
+    DSA-shape inputs and pads ``TopK`` to the alignment expected by
+    FlashMLA's SM90 / SM100 kernels.
+    """
+    global _flash_mla_sparse_fwd
+    if _flash_mla_sparse_fwd is not None:
+        return
+
+    try:
+        from flash_mla import flash_mla_sparse_fwd as _fwd
+    except ImportError as e:
+        raise ImportError(
+            "FlashMLA is required for DSA sparse attention forward. "
+            "Install from https://github.com/deepseek-ai/FlashMLA/tree/nv_dev "
+            "so that `from flash_mla import flash_mla_sparse_fwd` succeeds."
+        ) from e
+    _flash_mla_sparse_fwd = _fwd
+
+
+@lru_cache(maxsize=1)
+def get_flash_mla_topk_alignment() -> int:
+    """Minimum ``TopK`` alignment required by the current GPU architecture.
+
+    * SM90 : dual-warpgroup loop steps by 2 blocks → ``2 * B_TOPK = 128``
+    * SM100: single-pipeline loop steps by 1 block → ``B_TOPK`` (64 for
+      head64, 128 for head128). DSA uses ``D = 512`` which maps to the
+      head64 kernel path → 64.
+    """
+    sm = torch.cuda.get_device_capability()
+    if sm[0] >= 10:
+        return 64
+    return 128
+
+
+# Backward-compatible private spelling retained for existing internal callers
+# and tests.
+_get_topk_alignment = get_flash_mla_topk_alignment
+
+
+def _csa_fwd_flash_mla(
+    q: Tensor,
+    kv: Tensor,
+    topk_idxs: Tensor,
+    softmax_scale: float,
+    d_v: int = 512,
+    attn_sink: Optional[Tensor] = None,
+    topk_length: Optional[Tensor] = None,
+    indexer_topk: int = 0,
+) -> Tuple[Tensor, Tensor, Optional[Tensor]]:
+    """DSA-shaped adapter around :func:`flash_mla.flash_mla_sparse_fwd`.
+
+    Accepts flat (unbatched) tensors with global indices; pads ``TopK`` to
+    the GPU-specific alignment; returns ``(out, lse, lse_indexer)``.
+    """
+    assert not (
+        indexer_topk > 0 and topk_length is not None
+    ), "indexer_topk > 0 requires non-compact mode (topk_length must be None)"
+    _ensure_flash_mla()
+
+    _total_S_q, _H, _D = q.shape
+    TopK = topk_idxs.shape[-1]
+    topk_align = get_flash_mla_topk_alignment()
+    TopK_padded = (TopK + topk_align - 1) // topk_align * topk_align
+    if TopK_padded != TopK:
+        pad_width = TopK_padded - TopK
+        topk_idxs = torch.nn.functional.pad(topk_idxs, (0, pad_width), value=-1)
+
+    kv_3d = kv.unsqueeze(1)  # (total_S_kv, 1, D)  h_kv=1
+    indices = topk_idxs.unsqueeze(1)  # (total_S_q, 1, TopK_padded) h_kv=1
+
+    with torch.cuda.nvtx.range("flash_mla_sparse_fwd"):
+        res = _flash_mla_sparse_fwd(
+            q,
+            kv_3d,
+            indices,
+            softmax_scale,
+            d_v=d_v,
+            attn_sink=attn_sink,
+            topk_length=topk_length,
+            indexer_topk=indexer_topk,
+        )
+        if indexer_topk > 0:
+            out, _max_logits, lse, lse_indexer = res
+        else:
+            out, _max_logits, lse = res
+            lse_indexer = None
+
+    if indexer_topk > 0:
+        # When indexer_topk == total TopK, lse_indexer should equal lse but
+        # the kernel may not snapshot correctly; fall back to lse.
+        if indexer_topk >= TopK:
+            return out, lse, lse.clone()
+        return out, lse, lse_indexer
+    return out, lse, None
+
+
+def _ensure_dsa_namespace():
+    """Lazily import the cudnn-frontend DSA namespace."""
+    global _DSA
+    if _DSA is not None:
+        return
+    try:
+        from cudnn import DSA as _ns
+    except ImportError as e:
+        raise ImportError(
+            "cudnn-frontend DSA namespace not available. Install with "
+            "`pip install nvidia-cudnn-frontend[cutedsl]`."
+        ) from e
+    _DSA = _ns
+
+
+# ---------------------------------------------------------------------------
+# Index helpers
+# ---------------------------------------------------------------------------
+
+
+def batch_of_row(cu_seqlens_q: Tensor, total_q: Optional[int] = None) -> Tensor:
+    """For a THD-packed query of length ``total_q``, return a ``(total_q,)``
+    int64 tensor where entry ``i`` is the index of the segment that owns
+    query row ``i`` (i.e. the unique ``b`` with
+    ``cu_seqlens_q[b] <= i < cu_seqlens_q[b+1]``).
+
+    When ``total_q`` exceeds ``cu_seqlens_q[-1]`` (e.g. after
+    ``pad_thd_for_cuda_graph`` pads token tensors to a static capacity),
+    orphan rows are clamped to the last segment so the returned indices
+    are always in ``[0, B-1]`` and never cause OOB on per-segment arrays.
+
+    Used by every helper that needs to translate between per-row indices
+    and per-segment cumulative tensors.
+
+    Args:
+        cu_seqlens_q: ``(B+1,)`` int — cumulative Q lengths.
+        total_q: optional row count override; defaults to
+            ``int(cu_seqlens_q[-1].item())`` (forces a GPU→CPU sync).
+
+    Returns:
+        ``(total_q,)`` int64.
+    """
+    if total_q is None:
+        total_q = int(cu_seqlens_q[-1].item())
+    num_sequences = cu_seqlens_q.shape[0] - 1
+    row_idx = torch.arange(total_q, device=cu_seqlens_q.device, dtype=torch.int64)
+    return torch.bucketize(row_idx, cu_seqlens_q[1:], right=True).clamp(
+        max=max(num_sequences - 1, 0)
+    )
+
+
+def _teacher_lse_chunk_rows(
+    num_rows: int, batch: int, heads: int, keys: int, extra_bytes_per_row: int = 0
+) -> int:
+    """Bound temporary storage used to recompute a teacher LSE."""
+    bytes_per_row = max(1, batch) * max(1, heads) * max(1, keys) * 4 + extra_bytes_per_row
+    return max(1, min(num_rows, _CSA_TEACHER_LSE_CHUNK_MAX_BYTES // bytes_per_row))
+
+
+@torch.no_grad()
+def _compute_csa_non_compressed_lse(
+    query: Tensor, kv_full: Tensor, attn_sink: Tensor, window_indices: Tensor, softmax_scale: float
+) -> Tensor:
+    """Return per-head LSE for the CSA sliding-window and sink mass.
+
+    Inputs use FlashMLA's flat layout and global KV indices. The returned
+    tensor has shape ``[total_q, heads]``. Invalid indices contribute no
+    mass, while ``attn_sink`` always participates in the denominator.
+    """
+    if query.ndim != 3:
+        raise ValueError(f"query must have shape [total_q, heads, dim], got {tuple(query.shape)}")
+    if kv_full.ndim != 2 or kv_full.shape[1] != query.shape[2]:
+        raise ValueError(
+            "kv_full must have shape [total_kv, dim] matching query, "
+            f"got {tuple(kv_full.shape)} and {tuple(query.shape)}"
+        )
+    if window_indices.ndim != 2 or window_indices.shape[0] != query.shape[0]:
+        raise ValueError(
+            "window_indices must have shape [total_q, window], "
+            f"got {tuple(window_indices.shape)} for total_q={query.shape[0]}"
+        )
+    if attn_sink.ndim != 1 or attn_sink.numel() != query.shape[1]:
+        raise ValueError(
+            f"attn_sink must contain {query.shape[1]} head values, got {tuple(attn_sink.shape)}"
+        )
+    if not (query.device == kv_full.device == attn_sink.device == window_indices.device):
+        raise ValueError("query, kv_full, attn_sink, and window_indices must share a device")
+    if kv_full.shape[0] == 0 and window_indices.numel() > 0:
+        raise ValueError("window indices cannot address an empty KV tensor")
+
+    total_q, num_heads, head_dim = query.shape
+    window_width = window_indices.shape[1]
+    # In addition to the FP32 score matrix, window recomputation materializes
+    # gathered KV in its source dtype and an FP32 cast consumed by einsum.
+    gathered_kv_bytes = window_width * head_dim * (kv_full.element_size() + 4)
+    query_float_bytes = num_heads * head_dim * 4
+    chunk_rows = _teacher_lse_chunk_rows(
+        total_q, 1, num_heads, window_width, gathered_kv_bytes + query_float_bytes
+    )
+    sink = attn_sink.detach().float().view(1, num_heads)
+    lse_chunks = []
+    for start in range(0, total_q, chunk_rows):
+        end = min(start + chunk_rows, total_q)
+        indices = window_indices[start:end].to(dtype=torch.int64)
+        valid = (indices >= 0) & (indices < kv_full.shape[0])
+        if window_width == 0:
+            window_lse = torch.full(
+                (end - start, num_heads), float("-inf"), device=query.device, dtype=torch.float32
+            )
+        else:
+            safe_indices = indices.clamp(min=0, max=max(kv_full.shape[0] - 1, 0))
+            gathered_kv = (
+                kv_full.detach()
+                .index_select(0, safe_indices.reshape(-1))
+                .reshape(end - start, window_width, head_dim)
+            )
+            window_logits = torch.einsum(
+                "rhd,rkd->rhk", query[start:end].detach().float(), gathered_kv.float()
+            )
+            window_logits = (window_logits * softmax_scale).masked_fill(
+                ~valid.unsqueeze(1), float("-inf")
+            )
+            window_lse = torch.logsumexp(window_logits, dim=-1)
+        lse_chunks.append(torch.logaddexp(window_lse, sink))
+
+    if not lse_chunks:
+        return torch.empty((0, num_heads), device=query.device, dtype=torch.float32)
+    return torch.cat(lse_chunks, dim=0)
+
+
+@torch.no_grad()
+def _compute_dense_csa_teacher_lse(
+    query: Tensor,
+    compressed_kv: Tensor,
+    non_compressed_lse: Tensor,
+    softmax_scale: float,
+    ratio: int,
+    *,
+    cu_seqlens_q: Optional[Tensor] = None,
+    cu_seqlens_kv: Optional[Tensor] = None,
+    max_seqlen_q: Optional[int] = None,
+    max_seqlen_kv: Optional[int] = None,
+    q_causal_offsets: Optional[Tensor] = None,
+) -> Tensor:
+    """Return the full CSA teacher LSE for dense indexer loss.
+
+    ``non_compressed_lse`` contains sliding-window plus sink mass. This
+    helper recomputes the per-head LSE over every causally valid compressed
+    key and combines the two masses. SBHD callers pass BSHD/BKHD tensors;
+    packed callers pass THD tensors plus cumulative-length metadata.
+    """
+    if ratio <= 0:
+        raise ValueError(f"ratio must be positive, got {ratio}")
+
+    if query.ndim == 4:
+        b, sq, num_heads, head_dim = query.shape
+        if compressed_kv.ndim == 4:
+            if compressed_kv.shape[2] != 1:
+                raise ValueError("CSA dense teacher expects exactly one compressed KV head")
+            compressed_kv = compressed_kv.squeeze(2)
+        if compressed_kv.ndim != 3 or compressed_kv.shape[0] != b:
+            raise ValueError(
+                "SBHD compressed_kv must have shape [batch, seqlen_k, dim], "
+                f"got {tuple(compressed_kv.shape)}"
+            )
+        if compressed_kv.shape[2] != head_dim:
+            raise ValueError("query and compressed_kv head dimensions must match")
+        if tuple(non_compressed_lse.shape) != (b, sq, num_heads):
+            raise ValueError(
+                "SBHD non_compressed_lse must have shape "
+                f"[{b}, {sq}, {num_heads}], got {tuple(non_compressed_lse.shape)}"
+            )
+
+        sk = compressed_kv.shape[1]
+        compressed_lse = torch.empty_like(non_compressed_lse, dtype=torch.float32)
+        compressed_kv_float = compressed_kv.detach().float()
+        key_positions = torch.arange(sk, device=query.device).view(1, 1, 1, sk)
+        chunk_rows = _teacher_lse_chunk_rows(sq, b, num_heads, sk)
+        for start in range(0, sq, chunk_rows):
+            end = min(start + chunk_rows, sq)
+            scores = torch.einsum(
+                "bqhd,bkd->bqhk", query[:, start:end].detach().float(), compressed_kv_float
+            )
+            scores.mul_(softmax_scale)
+            visible_k = torch.div(
+                torch.arange(start + 1, end + 1, device=query.device), ratio, rounding_mode="floor"
+            ).view(1, end - start, 1, 1)
+            scores.masked_fill_(key_positions >= visible_k, float("-inf"))
+            compressed_lse[:, start:end] = torch.logsumexp(scores, dim=-1)
+    elif query.ndim == 3:
+        total_q, num_heads, head_dim = query.shape
+        if compressed_kv.ndim == 3:
+            if compressed_kv.shape[1] != 1:
+                raise ValueError("CSA dense teacher expects exactly one compressed KV head")
+            compressed_kv = compressed_kv.squeeze(1)
+        if compressed_kv.ndim != 2 or compressed_kv.shape[1] != head_dim:
+            raise ValueError(
+                "THD compressed_kv must have shape [total_k, dim] matching query, "
+                f"got {tuple(compressed_kv.shape)} and {tuple(query.shape)}"
+            )
+        if tuple(non_compressed_lse.shape) != (total_q, num_heads):
+            raise ValueError(
+                "THD non_compressed_lse must have shape "
+                f"[{total_q}, {num_heads}], got {tuple(non_compressed_lse.shape)}"
+            )
+        if any(
+            value is None for value in (cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv)
+        ):
+            raise ValueError("THD dense teacher LSE requires cumulative lengths and max lengths")
+        if cu_seqlens_q.shape != cu_seqlens_kv.shape:
+            raise ValueError("THD query and compressed-KV cumulative lengths must have equal shape")
+
+        num_sequences = cu_seqlens_q.shape[0] - 1
+        if q_causal_offsets is None:
+            q_causal_offsets = torch.zeros(
+                num_sequences, device=query.device, dtype=cu_seqlens_q.dtype
+            )
+        if q_causal_offsets.shape != (num_sequences,):
+            raise ValueError(
+                f"q_causal_offsets must have shape [{num_sequences}], "
+                f"got {tuple(q_causal_offsets.shape)}"
+            )
+
+        max_q = int(max_seqlen_q)
+        max_k = int(max_seqlen_kv)
+        q_padded = query.new_zeros((num_sequences, max_q, num_heads, head_dim))
+        k_padded = compressed_kv.new_zeros((num_sequences, max_k, head_dim))
+
+        q_rows = torch.arange(total_q, device=query.device, dtype=torch.int64)
+        q_batch = batch_of_row(cu_seqlens_q, total_q=total_q)
+        q_positions = q_rows - cu_seqlens_q[q_batch].to(torch.int64)
+        q_padded[q_batch, q_positions] = query
+
+        total_k = compressed_kv.shape[0]
+        k_rows = torch.arange(total_k, device=query.device, dtype=torch.int64)
+        k_batch = batch_of_row(cu_seqlens_kv, total_q=total_k)
+        k_positions = k_rows - cu_seqlens_kv[k_batch].to(torch.int64)
+        k_padded[k_batch, k_positions] = compressed_kv
+
+        q_lens = (cu_seqlens_q[1:] - cu_seqlens_q[:-1]).to(torch.int64)
+        k_lens = (cu_seqlens_kv[1:] - cu_seqlens_kv[:-1]).to(torch.int64)
+        key_positions = torch.arange(max_k, device=query.device).view(1, 1, 1, max_k)
+        compressed_lse_padded = torch.full(
+            (num_sequences, max_q, num_heads),
+            float("-inf"),
+            device=query.device,
+            dtype=torch.float32,
+        )
+        k_padded_float = k_padded.detach().float()
+        q_causal_offsets_i64 = q_causal_offsets.to(torch.int64)
+        chunk_rows = _teacher_lse_chunk_rows(max_q, num_sequences, num_heads, max_k)
+        for start in range(0, max_q, chunk_rows):
+            end = min(start + chunk_rows, max_q)
+            scores = torch.einsum(
+                "bqhd,bkd->bqhk", q_padded[:, start:end].detach().float(), k_padded_float
+            )
+            scores.mul_(softmax_scale)
+            local_q = torch.arange(start, end, device=query.device, dtype=torch.int64)
+            visible_k = torch.div(
+                local_q.view(1, -1) + q_causal_offsets_i64.view(-1, 1) + 1,
+                ratio,
+                rounding_mode="floor",
+            ).clamp(max=max_k)
+            valid = key_positions < torch.minimum(visible_k, k_lens.view(-1, 1)).view(
+                num_sequences, end - start, 1, 1
+            )
+            valid = valid & (local_q.view(1, -1, 1, 1) < q_lens.view(-1, 1, 1, 1))
+            scores.masked_fill_(~valid, float("-inf"))
+            compressed_lse_padded[:, start:end] = torch.logsumexp(scores, dim=-1)
+        compressed_lse = compressed_lse_padded[q_batch, q_positions]
+    else:
+        raise ValueError(
+            "query must be BSHD [batch, seqlen_q, heads, dim] or "
+            f"THD [total_q, heads, dim], got {tuple(query.shape)}"
+        )
+
+    return torch.logaddexp(non_compressed_lse.detach().float(), compressed_lse)
+
+
+@torch.no_grad()
+def _compute_full_csa_teacher_lse(
+    query: Tensor,
+    query_flat: Tensor,
+    full_kv_flat: Tensor,
+    compressed_kv: Tensor,
+    attn_sink: Tensor,
+    window_indices: Tensor,
+    softmax_scale: float,
+    ratio: int,
+    *,
+    cu_seqlens_q: Optional[Tensor] = None,
+    cu_seqlens_kv: Optional[Tensor] = None,
+    max_seqlen_q: Optional[int] = None,
+    max_seqlen_kv: Optional[int] = None,
+    q_causal_offsets: Optional[Tensor] = None,
+) -> Tensor:
+    """Return the full CSA teacher LSE through Triton or the eager reference.
+
+    The Triton path streams both key domains through online reductions and
+    emits only the per-row/per-head LSE. Unsupported layouts and dtypes retain
+    the eager implementation as a correctness fallback.
+    """
+    if can_use_fused_csa_teacher_lse(
+        query_flat, full_kv_flat, compressed_kv, attn_sink, window_indices
+    ):
+        if query.ndim == 4:
+            batch, seqlen_q = query.shape[:2]
+            return fused_csa_teacher_lse(
+                query_flat,
+                full_kv_flat,
+                compressed_kv,
+                attn_sink,
+                window_indices,
+                softmax_scale,
+                ratio,
+                batch_size=batch,
+                seqlen_q=seqlen_q,
+            )
+        return fused_csa_teacher_lse(
+            query_flat,
+            full_kv_flat,
+            compressed_kv,
+            attn_sink,
+            window_indices,
+            softmax_scale,
+            ratio,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_kv,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_kv,
+            q_causal_offsets=q_causal_offsets,
+        )
+
+    non_compressed_lse_flat = _compute_csa_non_compressed_lse(
+        query_flat, full_kv_flat, attn_sink, window_indices, softmax_scale
+    )
+    if query.ndim == 4:
+        batch, seqlen_q, num_heads = query.shape[:3]
+        non_compressed_lse = (
+            non_compressed_lse_flat.reshape(seqlen_q, batch, num_heads)
+            .permute(1, 0, 2)
+            .contiguous()
+        )
+    else:
+        non_compressed_lse = non_compressed_lse_flat
+    return _compute_dense_csa_teacher_lse(
+        query,
+        compressed_kv,
+        non_compressed_lse,
+        softmax_scale,
+        ratio,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_kv=cu_seqlens_kv,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_kv=max_seqlen_kv,
+        q_causal_offsets=q_causal_offsets,
+    )
+
+
+@torch.compile
+def build_thd_compact_k_layout(
+    cu_seqlens_q: Tensor, cu_seqlens_k: Tensor, total_k_rows: int, ratio: int
+) -> Tuple[Tensor, Tensor]:
+    """Build compact-THD K metadata and a physical-to-logical row map.
+
+    The compact wrapper requires ``cu_seqlens_k[-1] == k.shape[0]`` and
+    ``seqlen_q[b] <= seqlen_k[b] * ratio`` for every packed segment. A
+    floor-compressed sequence violates the latter whenever it has a tail.
+    Insert one zero-valued row after every real K segment and distribute any
+    fixed-capacity K tail across those segments. The compact causal mask can
+    never expose these appended rows, so returned local K ids are unchanged.
+
+    ``cu_seqlens_q`` may contain one additional synthetic padding segment, as
+    used by the CP path. Its K rows consume the corresponding fixed-capacity
+    tail instead of being assigned to a real sequence.
+    """
+    num_sequences = cu_seqlens_k.shape[0] - 1
+    zero = torch.zeros((1,), dtype=cu_seqlens_k.dtype, device=cu_seqlens_k.device)
+    valid_k_lens = cu_seqlens_k[1:] - cu_seqlens_k[:-1]
+
+    padding_q = (cu_seqlens_q[-1] - cu_seqlens_q[num_sequences]).clamp_min(0)
+    padding_k = torch.div(padding_q + int(ratio) - 1, int(ratio), rounding_mode="floor")
+    capacity_gap = (int(total_k_rows) - cu_seqlens_k[-1]).clamp_min(0)
+    # The static compressed capacity reserves enough rows for a synthetic Q
+    # segment. All remaining capacity can be spread over real segments.
+    remaining_extra = (capacity_gap - padding_k).clamp_min(0)
+    sequence_ids = torch.arange(num_sequences, dtype=cu_seqlens_k.dtype, device=cu_seqlens_k.device)
+    base_extra = torch.div(remaining_extra, num_sequences, rounding_mode="floor")
+    extra_remainder = remaining_extra - base_extra * num_sequences
+    extra_per_sequence = base_extra + (sequence_ids < extra_remainder).to(cu_seqlens_k.dtype)
+
+    kernel_k_lens = valid_k_lens + 1 + extra_per_sequence
+    kernel_k_prefix = torch.cumsum(kernel_k_lens, dim=0, dtype=torch.int32)
+    if cu_seqlens_q.shape[0] == cu_seqlens_k.shape[0]:
+        compact_cu_seqlens_k = torch.cat((zero, kernel_k_prefix))
+    else:
+        compact_cu_seqlens_k = torch.cat(
+            (zero, kernel_k_prefix, (kernel_k_prefix[-1] + padding_k).view(1))
+        )
+
+    kernel_rows = torch.arange(
+        int(total_k_rows) + num_sequences, dtype=cu_seqlens_k.dtype, device=cu_seqlens_k.device
+    )
+    # Avoid ``torch.bucketize`` here: ``torch.compile`` can miscompile CUDA
+    # bucketize when the boundaries are produced inside the same graph.
+    kernel_sequence_ids = (
+        (kernel_rows.unsqueeze(1) >= compact_cu_seqlens_k[1:].unsqueeze(0))
+        .sum(dim=1, dtype=torch.int64)
+        .clamp_max(num_sequences)
+    )
+    safe_sequence_ids = kernel_sequence_ids.clamp_max(num_sequences - 1)
+    kernel_positions = kernel_rows - compact_cu_seqlens_k[kernel_sequence_ids]
+    valid_source = (kernel_sequence_ids < num_sequences) & (
+        kernel_positions < valid_k_lens[safe_sequence_ids]
+    )
+    source_rows = cu_seqlens_k[safe_sequence_ids] + kernel_positions
+    source_row_map = torch.where(
+        valid_source, source_rows, torch.full_like(source_rows, int(total_k_rows))
+    ).to(torch.int64)
+    return compact_cu_seqlens_k, source_row_map
+
+
+@torch.compile
+def pack_thd_compact_k(k: Tensor, source_row_map: Tensor) -> Tensor:
+    """Pack THD K with zero-valued rows that remain causally unreachable."""
+    k_with_padding = torch.cat((k, torch.zeros_like(k[:1])))
+    return torch.index_select(k_with_padding, 0, source_row_map)
+
+
+def local_to_global_flat(
+    local_idxs: Tensor,
+    batch_size: int,
+    cu_seqlens_q: Optional[Tensor] = None,
+    cu_seqlens_kv: Optional[Tensor] = None,
+) -> Tensor:
+    """Convert local per-sequence indices to global flat indices.
+
+    Follows the convention used by FlashMLA / SparseAttentionBackward:
+    flat row order is SBHD ``row[s * B + b]``; global index is
+    ``local * B + b`` for valid entries and ``-1`` otherwise.
+    Two layouts are supported:
+
+    * **SBHD-flat (default, ``cu_seqlens_*=None``)** — the convention used
+      by FlashMLA / SparseAttentionBackward when packing a fixed-shape
+      batch: flat row order is ``row[s * B + b]``; global index is
+      ``local * B + b`` for valid entries and ``-1`` otherwise. Inputs
+      are ``(b, sq, topk)``; outputs are ``(sq*b, topk)``.
+    * **THD packed (``cu_seqlens_*`` supplied)** — for variable-length
+      packed sequences. Both ``cu_seqlens_q`` and ``cu_seqlens_kv``
+      must be supplied as 1-D int32 tensors of length ``B+1``. Flat row
+      order is the natural ``(total_q,)`` order; global index is
+      ``cu_seqlens_kv[batch_of_q] + local`` for valid entries and ``-1``
+      otherwise. Inputs are ``(total_q, topk)``; outputs are
+      ``(total_q, topk)``.
+
+    Args:
+        local_idxs: SBHD ``(b, sq, topk)`` or THD ``(total_q, topk)`` int.
+        batch_size: ``B`` (only consulted in the SBHD branch).
+        cu_seqlens_q: optional 1-D ``(B+1,)`` int32 — when present (with
+            ``cu_seqlens_kv``), switches to the THD branch.
+        cu_seqlens_kv: optional 1-D ``(B+1,)`` int32 — same.
+
+    Returns:
+        ``(sq*b, topk)`` int32 in SBHD mode; ``(total_q, topk)`` int32 in
+        THD mode.
+    """
+    if (cu_seqlens_q is None) != (cu_seqlens_kv is None):
+        raise ValueError(
+            "cu_seqlens_q and cu_seqlens_kv must both be provided for THD, or "
+            "both None for SBHD."
+        )
+
+    if cu_seqlens_q is None:
+        # ---- SBHD-flat path -------------------------------------------------
+        b, sq, topk = local_idxs.shape
+        assert b == batch_size
+
+        idxs_sb = local_idxs.permute(1, 0, 2).reshape(sq * b, topk)
+        valid = idxs_sb >= 0
+        batch_ids = torch.arange(sq * b, device=local_idxs.device) % b
+        batch_ids_exp = batch_ids.unsqueeze(1).expand_as(idxs_sb)
+        idxs_sb = torch.where(valid, idxs_sb * b + batch_ids_exp, idxs_sb)
+        return idxs_sb.int()
+
+    # ---- THD packed path ----------------------------------------------------
+    # Expect ``local_idxs`` to be (total_q, topk). For each row, look up its
+    # batch index from ``cu_seqlens_q``, then add the corresponding KV offset
+    # ``cu_seqlens_kv[batch]`` to every valid local index in the row.
+    if local_idxs.ndim != 2:
+        raise ValueError(f"THD local_idxs must be 2-D (total_q, topk), got {local_idxs.shape}")
+    total_q, topk = local_idxs.shape
+    if cu_seqlens_q.ndim != 1 or cu_seqlens_kv.ndim != 1:
+        raise ValueError("cu_seqlens_q/kv must be 1-D")
+    if cu_seqlens_q.shape != cu_seqlens_kv.shape:
+        raise ValueError(
+            f"cu_seqlens_q.shape={tuple(cu_seqlens_q.shape)} must equal "
+            f"cu_seqlens_kv.shape={tuple(cu_seqlens_kv.shape)}"
+        )
+
+    row_batch_ids = batch_of_row(cu_seqlens_q, total_q=total_q)
+    kv_offset = cu_seqlens_kv[row_batch_ids].unsqueeze(1)  # (total_q, 1)
+    valid = local_idxs >= 0
+    global_idxs = torch.where(valid, local_idxs + kv_offset, local_idxs)
+    return global_idxs.int()
+
+
+def _compact_flat_topk_idxs(global_idxs: Tensor) -> Tuple[Tensor, Tensor]:
+    """Pack valid global indices into a per-row prefix.
+
+    The returned ``topk_length`` selects that prefix in FlashMLA forward and
+    cuDNN DSA backward. Invalid suffix entries remain ``-1`` until forward has
+    consumed them; callers may then replace the ignored suffix with a safe
+    non-negative placeholder before backward.
+    """
+    if global_idxs.ndim != 2:
+        raise ValueError(f"global_idxs must be 2-D (rows, topk), got {tuple(global_idxs.shape)}")
+
+    if global_idxs.is_cuda:
+        _ensure_dsa_namespace()
+        res = _DSA.compactify_wrapper(global_idxs)
+        compact_idxs, topk_length = res["indices"], res["topk_length"]
+    else:
+        valid_mask = global_idxs >= 0
+        sorted_indices = valid_mask.int().argsort(dim=-1, descending=True, stable=True)
+        compact_idxs = global_idxs.gather(-1, sorted_indices)
+        topk_length = valid_mask.sum(dim=-1).int()
+
+    return compact_idxs.int().contiguous(), topk_length.int().contiguous()
+
+
+def build_flat_topk_idxs(
+    *idx_groups: Tensor,
+    batch_size: int,
+    compact: bool = False,
+    cu_seqlens_q: Optional[Tensor] = None,
+    cu_seqlens_kv: Optional[Tensor] = None,
+) -> Tuple[Tensor, Optional[Tensor]]:
+    """Combine local per-sequence index groups and convert to flat global form.
+
+    Each *idx_group* contains local per-sequence KV indices (already in
+    ``kv_full`` index space, i.e. with any compressed-position offset
+    applied). ``-1`` marks invalid positions. The shape of each group
+    differs by layout:
+
+    * **SBHD-flat** (``cu_seqlens_*=None``, default): each group is
+      ``(b, sq, topk_i)``; outputs are ``(sq*b, total_topk)`` (flat
+      SBHD with row order ``s*B + b``).
+    * **THD packed** (``cu_seqlens_*`` supplied): each group is
+      ``(total_q, topk_i)`` with ``total_q = cu_seqlens_q[-1]``;
+      outputs are ``(total_q, total_topk)``.
+
+    Args:
+        *idx_groups: one or more index tensors, all of the same layout.
+        batch_size: ``B`` (only consulted in SBHD).
+        compact: if True, pack valid entries to the front of each row and
+            additionally return ``topk_length``; if False, leave as-is and
+            return ``None``.
+        cu_seqlens_q: optional 1-D ``(B+1,)`` int32 — selects THD branch.
+        cu_seqlens_kv: optional 1-D ``(B+1,)`` int32 — selects THD branch.
+
+    Returns:
+        ``(topk_idxs, topk_length)`` where the first axis of ``topk_idxs``
+        is ``sq*b`` (SBHD) or ``total_q`` (THD), and ``topk_length`` is
+        ``(rows,)`` int32 when ``compact``, else ``None``.
+    """
+    combined = torch.cat(idx_groups, dim=-1)
+
+    # Globalize first, compact second. Both ops are element-wise +
+    # ``-1``-preserving, so swapping the order is a no-op for correctness;
+    # globalizing first puts the indices into the same flat row order the
+    # cuDNN compactify kernel returns its per-row ``length`` in, so no
+    # extra permute is needed afterward.
+    global_idxs = local_to_global_flat(
+        combined, batch_size, cu_seqlens_q=cu_seqlens_q, cu_seqlens_kv=cu_seqlens_kv
+    )
+
+    topk_length_flat = None
+    if compact:
+        # The CUDA path is a single warp-per-row CuTe DSL kernel; the helper
+        # retains a stable PyTorch fallback for CPU-only unit tests.
+        global_idxs, topk_length_flat = _compact_flat_topk_idxs(global_idxs)
+
+    return global_idxs, topk_length_flat
+
+
+# ---------------------------------------------------------------------------
+# Path A + Path C step 2: differentiable sparse attention
+# ---------------------------------------------------------------------------
+
+
+def _validate_kv_reconstruction_parts(
+    kv: Tensor, kv_reconstruction_parts: Tuple[Tensor, Tensor, Tensor]
+) -> None:
+    """Validate tensors used to rebuild a flat THD KV buffer in backward."""
+    if len(kv_reconstruction_parts) != 3:
+        raise ValueError(
+            "kv_reconstruction_parts must contain boundary, local, and compressed KV tensors"
+        )
+
+    part_names = ("boundary", "local", "compressed")
+    for name, part in zip(part_names, kv_reconstruction_parts):
+        if not isinstance(part, Tensor):
+            raise TypeError(f"{name} KV reconstruction part must be a torch.Tensor")
+        if part.device != kv.device or part.dtype != kv.dtype:
+            raise ValueError(
+                f"{name} KV reconstruction part must match kv device and dtype; "
+                f"got {part.device}/{part.dtype} and {kv.device}/{kv.dtype}"
+            )
+        if part.ndim != kv.ndim or part.shape[1:] != kv.shape[1:]:
+            raise ValueError(
+                f"{name} KV reconstruction part has incompatible shape {tuple(part.shape)} "
+                f"for kv shape {tuple(kv.shape)}"
+            )
+
+    reconstructed_rows = sum(part.shape[0] for part in kv_reconstruction_parts)
+    if reconstructed_rows != kv.shape[0]:
+        raise ValueError(
+            "KV reconstruction parts have an unexpected total row count: "
+            f"got {reconstructed_rows}, expected {kv.shape[0]}"
+        )
+
+
+class CSASparseAttnFunc(torch.autograd.Function):
+    """Sparse attention fwd + bwd on flat tensors.
+
+    Forward uses :mod:`flash_mla`; backward uses cuDNN Frontend's
+    :attr:`cudnn.DSA.sparse_attention_backward_wrapper`.
+    """
+
+    @staticmethod
+    def forward(
+        ctx,
+        q: Tensor,  # (total_sq, H, D) bf16
+        kv: Tensor,  # (total_skv, D) bf16
+        attn_sink: Tensor,  # (H,) f32
+        topk_idxs: Tensor,  # (total_sq, TopK) int32 global
+        topk_length: Optional[Tensor],  # (total_sq,) int32 or None
+        softmax_scale: float,
+        indexer_topk: int,
+        kv_reconstruction_parts: Tuple[Tensor, Tensor, Tensor] | None = None,
+    ) -> Tuple[Tensor, Tensor, Optional[Tensor]]:
+        """Run FlashMLA sparse-attention forward and save tensors for backward."""
+        out, lse, lse_indexer = _csa_fwd_flash_mla(
+            q,
+            kv,
+            topk_idxs,
+            softmax_scale,
+            attn_sink=attn_sink,
+            topk_length=topk_length,
+            indexer_topk=indexer_topk,
+        )
+
+        ctx.reconstruct_kv_for_backward = kv_reconstruction_parts is not None
+        if ctx.reconstruct_kv_for_backward:
+            _validate_kv_reconstruction_parts(kv, kv_reconstruction_parts)
+            ctx.save_for_backward(q, *kv_reconstruction_parts, attn_sink, topk_idxs, out, lse)
+        else:
+            ctx.save_for_backward(q, kv, attn_sink, topk_idxs, out, lse)
+        ctx.softmax_scale = softmax_scale
+        ctx.topk_length = topk_length
+        return out, lse, lse_indexer
+
+    @staticmethod
+    def backward(ctx, dO, d_lse, d_lse_indexer):
+        """Compute sparse-attention backward via cuDNN DSA wrapper."""
+        _ensure_dsa_namespace()
+
+        if ctx.reconstruct_kv_for_backward:
+            q, boundary_kv, local_kv, compressed_kv, attn_sink, topk_idxs, out, lse = (
+                ctx.saved_tensors
+            )
+            kv = torch.cat((boundary_kv, local_kv, compressed_kv), dim=0)
+        else:
+            q, kv, attn_sink, topk_idxs, out, lse = ctx.saved_tensors
+
+        result = _DSA.sparse_attention_backward_wrapper(
+            q,
+            kv,
+            out,
+            dO,
+            lse,
+            attn_sink,
+            topk_idxs,
+            softmax_scale=ctx.softmax_scale,
+            topk_length=ctx.topk_length,
+        )
+        dq, dkv, d_sink = result["dq"], result["dkv"], result["d_sink"]
+        return dq, dkv, d_sink, None, None, None, None, None
+
+
+def csa_sparse_attn(
+    query: Tensor,
+    kv: Tensor,
+    attn_sink: Tensor,
+    topk_idxs: Tensor,
+    softmax_scale: float,
+    topk_length: Optional[Tensor] = None,
+    indexer_topk: int = 0,
+    is_thd: bool = False,
+    kv_reconstruction_parts: Tuple[Tensor, Tensor, Tensor] | None = None,
+) -> Tensor:
+    """Sparse attention (Path A / Path C step 2).
+
+    Two layouts:
+
+    * **SBHD** (``is_thd=False``, default): ``query`` is ``(sq, b, np, d)``
+      and ``kv`` is ``(skv, b, d)``; the wrapper reshapes them to
+      ``(sq*b, np, d)`` / ``(skv*b, d)`` before passing to FlashMLA, and
+      returns ``(sq, b, np * d_v)``.
+    * **THD packed** (``is_thd=True``): ``query`` is already
+      ``(total_sq, np, d)`` (3-D) and ``kv`` is ``(total_skv, d)`` (2-D).
+      No reshape is needed; output is ``(total_sq, np * d_v)`` with a
+      leading 2-D layout that the caller can fold into its own packed
+      representation.
+
+    Args:
+        query: SBHD ``(sq, b, np, d)`` or THD ``(total_sq, np, d)`` bf16.
+        kv:    SBD ``(skv, b, d)`` or THD ``(total_skv, d)`` bf16 (K=V).
+        attn_sink: ``(np,)`` f32.
+        topk_idxs: ``(rows, topk)`` int32 — **flat global** indices produced
+            by :func:`build_flat_topk_idxs` in the matching layout.
+        softmax_scale: scalar float.
+        topk_length: ``(rows,)`` int32 — optional compact fast-path. Must be
+            ``None`` when ``indexer_topk > 0`` (FlashMLA constraint).
+        indexer_topk: int; ``0`` for Paths A/C, positive for Path B.
+        is_thd: when True, treat ``query`` and ``kv`` as already-packed
+            THD tensors and skip the SBHD reshape steps.
+        kv_reconstruction_parts: Optional ``(boundary_kv, local_kv, compressed_kv)``
+            tuple used only to reconstruct THD ``kv`` during backward. Supplying
+            the direct producer tensors lets selective MLA-up-projection
+            checkpointing release their storage instead of retaining the
+            concatenated ``kv`` allocation. ``kv`` remains the differentiable
+            Function input and receives the reconstructed buffer's gradient.
+
+    Returns:
+        SBHD ``(sq, b, np * d_v)`` or THD ``(total_sq, np * d_v)`` bf16.
+    """
+    # Layout-specific input pre-reshape — the kernel always consumes a
+    # flat ``(rows, np, d)`` query and ``(n_kv, d)`` KV; only the rows
+    # axis interpretation differs (rows = ``total_sq`` for THD, rows =
+    # ``sq * b`` for SBHD). ``topk_idxs`` is already a flat ``(rows, k)``
+    # tensor in both layouts (built by :func:`build_flat_topk_idxs`).
+    if is_thd:
+        if query.ndim != 3:
+            raise ValueError(
+                f"THD csa_sparse_attn expects query of shape "
+                f"(total_sq, np, d), got {tuple(query.shape)}"
+            )
+        if kv.ndim != 2:
+            raise ValueError(
+                f"THD csa_sparse_attn expects kv of shape (total_skv, d), got {tuple(kv.shape)}"
+            )
+        q_flat, kv_flat = query, kv
+    else:
+        if kv_reconstruction_parts is not None:
+            raise ValueError("kv_reconstruction_parts is supported only for THD inputs")
+        sq, b, np_, d = query.shape
+        skv = kv.shape[0]
+        q_flat = query.reshape(sq * b, np_, d)
+        kv_flat = kv.reshape(skv * b, d)
+
+    out_flat, _lse, _lse_indexer = CSASparseAttnFunc.apply(
+        q_flat,
+        kv_flat,
+        attn_sink,
+        topk_idxs,
+        topk_length,
+        softmax_scale,
+        indexer_topk,
+        kv_reconstruction_parts,
+    )  # (rows, np, d_v)
+
+    # Layout-specific output reshape: collapse (np, d_v) → (np * d_v),
+    # then THD stays flat (rows = total_sq); SBHD reflates the (sq, b) axes.
+    np_, d_v = out_flat.shape[1], out_flat.shape[-1]
+    if is_thd:
+        return out_flat.reshape(-1, np_ * d_v)
+    return out_flat.reshape(sq, b, np_ * d_v)
+
+
+# ---------------------------------------------------------------------------
+# Path C inference: indexer scoring + top-K
+# ---------------------------------------------------------------------------
+
+
+def _indexer_topk_core(
+    q: Tensor,
+    k: Tensor,
+    w: Tensor,
+    topk: int,
+    ratio: int = 4,
+    *,
+    cu_seqlens_q: Optional[Tensor] = None,
+    cu_seqlens_kv: Optional[Tensor] = None,
+    max_seqlen_q: Optional[int] = None,
+    max_seqlen_kv: Optional[int] = None,
+    q_causal_offsets: Optional[Tensor] = None,
+    use_compact: bool = False,
+    return_softmax: bool = False,
+    compact_workspace: BSHDCompactIndexerWorkspace | THDCompactIndexerWorkspace | None = None,
+    precision: str = "bf16",
+    deterministic: bool = False,
+) -> Tuple[Tensor, Tensor, Optional[Tensor], Optional[Tensor]]:
+    """Layout-agnostic core for :func:`indexer_topk`.
+
+    Wraps cuDNN Frontend's CuTe-DSL indexer-forward kernels. On SM10x,
+    ``use_compact=True`` selects the combined forward + Top-K wrapper when it
+    is available. Otherwise this falls back to the existing forward → per-row
+    valid lengths → radix Top-K pipeline. Compact BSHD and THD CUDA-graph
+    capture requires a layout-matching workspace prepared during eager warmup.
+
+    BSHD layout (``cu_seqlens_q is None``):
+        q: ``(b, sq, idx_nh, idx_hd)`` bf16, C-contiguous.
+        k: ``(b, sk, idx_hd)`` bf16, C-contiguous.
+        w: ``(b, sq, idx_nh)`` bf16, C-contiguous, **already
+           ``indexer_softmax_scale``-scaled by the caller**.
+        Returns local ``topk_indices`` and ``topk_length``.  The third return
+        is the dense score tensor for the fallback path (otherwise ``None``);
+        the fourth is the compact kernel's Top-K softmax when requested
+        (otherwise ``None``).
+
+    THD packed layout (``cu_seqlens_q is not None``):
+        q: ``(total_q, idx_nh, idx_hd)`` bf16.
+        k: ``(total_k, idx_hd)`` bf16.
+        w: ``(total_q, idx_nh)`` bf16, already scaled.
+        cu_seqlens_q/kv, max_seqlen_q/kv: standard packed args.
+        The first two returns are ``topk_indices (total_q, topk)`` and
+        ``topk_length (total_q,)``.  Indices are per-batch LOCAL ids in
+        ``[0, seqlen_kv[batch])``; use :func:`local_to_global_flat` (with
+        ``cu_seqlens_q/kv``) to promote them to flat-global ids.
+
+    Two internal entry points besides :func:`indexer_topk`:
+
+    * Path B's ``FusedCSAIndexerSparseAttnFunc.forward`` calls this directly
+      so the SBHD→BSHD permute can be performed once and reused across
+      the indexer forward and the score-recompute backward kernels.
+    """
+    if precision not in ("bf16", "mxfp8"):
+        raise ValueError(f"Unsupported DSA indexer precision: {precision!r}")
+    if precision == "mxfp8" and not use_compact:
+        raise ValueError("MXFP8 indexer precision requires the compact forward + Top-K path")
+
+    is_thd = cu_seqlens_q is not None
+    device = q.device
+
+    # ---------------- Layout-specific input prep ------------------------
+    if is_thd:
+        if q.ndim != 3:
+            raise ValueError(f"THD q must be (total_q, idx_nh, idx_hd), got {q.shape}")
+        if k.ndim != 2:
+            raise ValueError(f"THD k must be (total_k, idx_hd), got {k.shape}")
+        if w.ndim != 2:
+            raise ValueError(f"THD w must be (total_q, idx_nh), got {w.shape}")
+        if max_seqlen_kv == 0 or k.shape[0] == 0:
+            raise ValueError("indexer_topk requires at least one K row.")
+    elif k.shape[1] == 0:
+        raise ValueError("indexer_topk requires at least one K row.")
+
+    if precision == "mxfp8" and (
+        q.shape[-2:] != (64, 128) or k.shape[-1] != 128 or w.shape[-1] != 64
+    ):
+        raise ValueError(
+            "MXFP8 compact indexer requires 64 Q heads, head_dim=128, one K head, and 64 weights"
+        )
+
+    _ensure_dsa_namespace()
+
+    # Symbol detection preserves compatibility with cuDNN Frontend versions
+    # that do not expose the compact forward + Top-K wrapper.
+    try:
+        compact_wrapper = getattr(_DSA, "indexer_forward_top_k_wrapper", None)
+    except (AttributeError, ImportError):
+        compact_wrapper = None
+    compact_available = (
+        use_compact
+        and (precision != "mxfp8" or (HAVE_TE_MXFP8 and HAVE_TRITON))
+        and callable(compact_wrapper)
+        and all(t.dtype == torch.bfloat16 for t in (q, k, w))
+        and torch.cuda.get_device_capability(device)[0] >= 10
+    )
+    if precision == "mxfp8" and not compact_available:
+        raise RuntimeError(
+            "MXFP8 compact indexer requires Transformer Engine MXFP8, Triton, a cuDNN "
+            "Frontend compact wrapper with MXFP8 support, BF16 source tensors, and SM100+"
+        )
+    if precision == "bf16" and use_compact and not compact_available:
+        warnings.warn(
+            "Compact indexer forward + Top-K was requested but is unavailable; "
+            "falling back to dense indexer forward + standalone Top-K.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+    capturing = compact_available and torch.cuda.is_current_stream_capturing()
+    if compact_available and capturing and compact_workspace is None:
+        layout = "THD" if is_thd else "BSHD"
+        raise ValueError(
+            f"{layout} compact CUDA graph capture requires a preallocated compact_workspace. "
+            "Prepare it during eager warmup before capture."
+        )
+
+    if compact_available:
+        compact_kwargs = dict(
+            ratio=ratio,
+            precision=precision,
+            return_softmax=return_softmax,
+            topk_indices_global=False,
+            deterministic=deterministic,
+        )
+        if is_thd:
+            if compact_workspace is not None:
+                if not isinstance(compact_workspace, THDCompactIndexerWorkspace):
+                    raise ValueError("THD compact dispatch requires a THDCompactIndexerWorkspace")
+                compact_workspace.validate(
+                    q=q,
+                    k=k,
+                    topk=topk,
+                    ratio=ratio,
+                    cu_seqlens_q=cu_seqlens_q,
+                    cu_seqlens_k=cu_seqlens_kv,
+                    max_seqlen_q=int(max_seqlen_q),
+                    max_seqlen_k=int(max_seqlen_kv),
+                    q_causal_offsets=q_causal_offsets,
+                    return_softmax=return_softmax,
+                    precision=precision,
+                )
+                _refresh_thd_compact_cand_batch_offsets(
+                    compact_workspace.cand_batch_offsets, cu_seqlens_q, ratio, q_causal_offsets
+                )
+            compact_kwargs.update(
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_kv,
+                max_seqlen_q=int(max_seqlen_q),
+                max_seqlen_k=int(max_seqlen_kv),
+            )
+            if compact_workspace is not None:
+                compact_kwargs.update(
+                    cand_buffer=_allocate_compact_candidate_buffer(
+                        compact_workspace.cand_buffer_numel, device
+                    ),
+                    cand_batch_offsets=compact_workspace.cand_batch_offsets,
+                )
+                compact_kwargs.update(
+                    _allocate_compact_output_buffers((q.shape[0], topk), device, return_softmax)
+                )
+            if q_causal_offsets is not None:
+                compact_kwargs["q_causal_offsets"] = q_causal_offsets
+        elif compact_workspace is not None:
+            if not isinstance(compact_workspace, BSHDCompactIndexerWorkspace):
+                raise ValueError("BSHD compact dispatch requires a BSHDCompactIndexerWorkspace")
+            compact_workspace.validate(
+                q=q, k=k, topk=topk, ratio=ratio, return_softmax=return_softmax, precision=precision
+            )
+            compact_kwargs.update(
+                cand_buffer=_allocate_compact_candidate_buffer(
+                    compact_workspace.cand_buffer_numel, device
+                ),
+                microbatch_rows=0,
+            )
+            compact_kwargs.update(
+                _allocate_compact_output_buffers(
+                    (q.shape[0], q.shape[1], topk), device, return_softmax
+                )
+            )
+
+        kernel_q, kernel_k = q, k
+        if precision == "mxfp8":
+            mxfp8_workspace = compact_workspace.mxfp8 if compact_workspace is not None else None
+            cu_seqlens_q_scale_padded = None
+            cu_seqlens_k_scale_padded = None
+            if is_thd:
+                if mxfp8_workspace is not None:
+                    cu_seqlens_q_scale_padded = mxfp8_workspace.cu_seqlens_q_scale_padded
+                    cu_seqlens_k_scale_padded = mxfp8_workspace.cu_seqlens_k_scale_padded
+                    assert cu_seqlens_q_scale_padded is not None
+                    assert cu_seqlens_k_scale_padded is not None
+                    refresh_indexer_mxfp8_scale_cu_seqlens(
+                        cu_seqlens_q_scale_padded, cu_seqlens_q, q.shape[1]
+                    )
+                    refresh_indexer_mxfp8_scale_cu_seqlens(
+                        cu_seqlens_k_scale_padded, cu_seqlens_kv, 1
+                    )
+                else:
+                    cu_seqlens_q_scale_padded = make_indexer_mxfp8_scale_cu_seqlens(
+                        cu_seqlens_q, q.shape[1]
+                    )
+                    cu_seqlens_k_scale_padded = make_indexer_mxfp8_scale_cu_seqlens(
+                        cu_seqlens_kv, 1
+                    )
+
+            kernel_q, q_scale = quantize_indexer_mxfp8(
+                q,
+                cu_seqlens=cu_seqlens_q,
+                cu_seqlens_scale_padded=cu_seqlens_q_scale_padded,
+                buffers=(mxfp8_workspace.q_buffers if mxfp8_workspace is not None else None),
+                out_scale=(mxfp8_workspace.q_scale if mxfp8_workspace is not None else None),
+            )
+            kernel_k, k_scale = quantize_indexer_mxfp8(
+                k,
+                cu_seqlens=cu_seqlens_kv,
+                cu_seqlens_scale_padded=cu_seqlens_k_scale_padded,
+                buffers=(mxfp8_workspace.k_buffers if mxfp8_workspace is not None else None),
+                out_scale=(mxfp8_workspace.k_scale if mxfp8_workspace is not None else None),
+            )
+            compact_kwargs.update(q_scale=q_scale, k_scale=k_scale, sf_vec_size=32)
+            if is_thd:
+                compact_kwargs.update(
+                    cu_seqlens_q_scale_padded=cu_seqlens_q_scale_padded,
+                    cu_seqlens_k_scale_padded=cu_seqlens_k_scale_padded,
+                )
+
+        if is_thd:
+            compact_result = compact_wrapper(
+                kernel_q, kernel_k.unsqueeze(1), w, top_k=topk, **compact_kwargs
+            )
+        else:
+            compact_result = compact_wrapper(
+                kernel_q, kernel_k.unsqueeze(2), w, top_k=topk, **compact_kwargs
+            )
+        if compact_workspace is not None:
+            del compact_kwargs["cand_buffer"]
+
+        topk_indices = compact_result["indices"]
+        compact_logits = compact_result["logits"]
+        compact_softmax = compact_result["softmax"] if return_softmax else None
+        if compact_workspace is not None:
+            returned_buffers = (
+                ("indices", topk_indices, compact_kwargs["out_indices"]),
+                ("logits", compact_logits, compact_kwargs["out_logits"]),
+            )
+            if return_softmax:
+                returned_buffers += (("softmax", compact_softmax, compact_kwargs["softmax_out"]),)
+            for name, actual, expected in returned_buffers:
+                if actual.data_ptr() != expected.data_ptr():
+                    layout = "THD" if is_thd else "BSHD"
+                    raise RuntimeError(
+                        f"cuDNN compact {layout} {name} did not alias "
+                        "the dispatch-local output buffer"
+                    )
+            for output_name in ("out_indices", "out_logits", "softmax_out"):
+                compact_kwargs.pop(output_name, None)
+            del returned_buffers, actual, expected
+        del compact_logits, compact_result
+
+        topk_indices = topk_indices.int()
+        topk_length = (topk_indices >= 0).sum(dim=-1).int()
+        if is_thd:
+            return topk_indices, topk_length, None, compact_softmax
+        b, sq = q.shape[:2]
+        return (topk_indices.view(b, sq, topk), topk_length.view(b, sq), None, compact_softmax)
+
+    if is_thd:
+        # Kernel wants k as 3-D ``(total_k, h_kv, idx_hd)``.
+        forward_kwargs = dict(
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_kv,
+            max_seqlen_q=int(max_seqlen_q),
+            max_seqlen_k=int(max_seqlen_kv),
+        )
+        if q_causal_offsets is not None:
+            forward_kwargs["q_causal_offsets"] = q_causal_offsets
+        scores = _DSA.indexer_forward_wrapper(q, k.unsqueeze(1), w, ratio=ratio, **forward_kwargs)[
+            "scores"
+        ]  # (total_q, max_seqlen_kv) fp32, -inf on masked positions
+        # Defensive contiguify (wrapper may return a stride-padded slice).
+        scores_flat = scores.contiguous()
+        sk = int(max_seqlen_kv)
+        total_q = q.shape[0]
+
+        seq_lens = thd_indexer_kernels.build_seq_lens(
+            cu_seqlens_q, cu_seqlens_kv, total_q, ratio, q_causal_offsets
+        )
+    else:
+        # Kernel wants k as 4-D ``(b, sk, h_kv, idx_hd)``.
+        scores = _DSA.indexer_forward_wrapper(q, k.unsqueeze(2), w, ratio=ratio)[
+            "scores"
+        ]  # (b, sq, sk) fp32, -inf on masked positions
+        b, sq = q.shape[:2]
+        sk = k.shape[1]
+        total_q = b * sq
+        scores_flat = scores.reshape(total_q, sk).contiguous()
+
+        # Per-row valid KV length: ((q_idx + 1) // ratio).clamp(max=sk),
+        # tiled across the batch axis.
+        q_idx = torch.arange(sq, device=device)
+        valid_per_q = ((q_idx + 1) // ratio).clamp(max=sk).to(torch.int32)
+        seq_lens = valid_per_q.repeat(b)  # (b*sq,), row-major over (b, sq)
+
+    # ---------------- Shared: radix top-K + pad-to-topk -----------------
+    topk_k = min(topk, sk)
+    tk_result = _DSA.indexer_top_k_wrapper(
+        scores_flat, seq_lens, top_k=topk_k, next_n=1, return_val=False
+    )
+    topk_indices = tk_result["indices"]  # (total_q, topk_k) int32
+
+    if is_thd:
+        topk_indices, topk_length = thd_indexer_kernels.sanitize_topk(
+            topk_indices, scores_flat, seq_lens, output_width=topk
+        )
+    else:
+        if topk_k < topk:
+            pad = torch.full((total_q, topk - topk_k), -1, dtype=torch.int32, device=device)
+            topk_indices = torch.cat([topk_indices, pad], dim=-1)
+        topk_length = (topk_indices >= 0).sum(dim=-1).int()  # (total_q,)
+
+    # ---------------- Layout-specific output reshape --------------------
+    if is_thd:
+        return topk_indices.int(), topk_length, scores_flat, None
+    return (
+        topk_indices.view(b, sq, topk).int(),
+        topk_length.view(b, sq),
+        scores_flat.view(b, sq, sk),
+        None,
+    )
+
+
+def indexer_topk(
+    q_indexer: Tensor,
+    k_indexer: Tensor,
+    weights: Tensor,
+    topk: int,
+    ratio: int = 4,
+    indexer_softmax_scale: float = 1.0,
+    *,
+    cu_seqlens_q: Optional[Tensor] = None,
+    cu_seqlens_kv: Optional[Tensor] = None,
+    max_seqlen_q: Optional[int] = None,
+    max_seqlen_kv: Optional[int] = None,
+    q_causal_offsets: Optional[Tensor] = None,
+    compact_workspace: BSHDCompactIndexerWorkspace | THDCompactIndexerWorkspace | None = None,
+    precision: str = "bf16",
+    deterministic: bool = False,
+    return_softmax: bool = False,
+) -> Tuple[Tensor, Tensor] | Tuple[Tensor, Tensor, Optional[Tensor]]:
+    """Score + top-K selection for inference (no KL loss, no backward).
+
+    Uses cuDNN Frontend's combined forward + Top-K kernel on SM10x when
+    available, and otherwise falls back to the dense indexer forward followed
+    by the standalone radix Top-K kernel.
+
+    Args:
+        q_indexer: SBHD ``(sq, b, idx_nh, idx_hd)`` /
+                   THD ``(total_q, idx_nh, idx_hd)`` bf16.
+        k_indexer: SBHD ``(sk, b, idx_hd)`` / THD ``(total_k, idx_hd)`` bf16.
+        weights:   SBHD ``(sq, b, idx_nh)`` / THD ``(total_q, idx_nh)``
+            bf16 — raw (unscaled) weights.
+        topk: number of top-K indices to select.
+        ratio: compression ratio for the causal mask.
+        indexer_softmax_scale: scale applied to the indexer ``Q @ K^T``
+            scores (typically ``idx_hd ** -0.5``). Default ``1.0`` means
+            weights are treated as already-scaled.
+        cu_seqlens_q: THD only — ``(B+1,)`` int32 CUDA cumulative Q lens.
+        cu_seqlens_kv: THD only — ``(B+1,)`` int32 CUDA cumulative KV lens.
+        max_seqlen_q: THD only — per-batch max Q length.
+        max_seqlen_kv: THD only — per-batch max KV length.
+        q_causal_offsets: THD only — optional ``(B,)`` int32 CUDA tensor. Entry
+            ``b`` is the sequence-relative position of that segment's first Q.
+        compact_workspace: caller-owned sizing metadata and optional MXFP8
+            storage prepared during eager warmup. Candidate scratch and compact
+            outputs are allocated by each dispatch. A matching workspace is
+            required while capturing the compact path.
+        deterministic: resolve exact-value ties at the K-th boundary toward
+            the smallest local KV indices. The output slot order remains
+            unspecified.
+        return_softmax: also return the compact kernel's Top-K softmax. The
+            third return is ``None`` when compact dispatch is unavailable.
+
+    Returns:
+        SBHD: ``(topk_indices (b, sq, topk),  topk_length (b, sq))`` int32
+              — per-batch LOCAL ids into ``k_indexer`` (``-1`` invalid).
+        THD:  ``(topk_indices (total_q, topk), topk_length (total_q,))``
+              int32 — per-batch LOCAL ids in ``[0, seqlen_kv[batch])``.
+    """
+    is_thd = cu_seqlens_q is not None
+    if is_thd and (cu_seqlens_kv is None or max_seqlen_q is None or max_seqlen_kv is None):
+        raise ValueError(
+            "indexer_topk THD mode requires cu_seqlens_q, cu_seqlens_kv, "
+            "max_seqlen_q, and max_seqlen_kv to all be supplied."
+        )
+    if not is_thd and q_causal_offsets is not None:
+        raise ValueError("q_causal_offsets is only supported in THD mode.")
+
+    # ``indexer_softmax_scale`` is applied via the
+    # ``relu(c·x) = c·relu(x)`` trick (the cudnn kernel does the relu),
+    # so we push the scale onto the weights tensor (small) instead of the
+    # score tensor (big). This is uniform across SBHD and THD; in SBHD
+    # the subsequent permute carries the scaled values into BSHD order.
+    if indexer_softmax_scale != 1.0:
+        weights = (weights.float() * indexer_softmax_scale).to(weights.dtype)
+
+    if is_thd:
+        q, k, w = q_indexer, k_indexer, weights
+    else:
+        # SBHD → BSHD permute (one-shot copy each).
+        q = q_indexer.permute(1, 0, 2, 3).contiguous()
+        k = k_indexer.permute(1, 0, 2).contiguous()
+        w = weights.permute(1, 0, 2).contiguous()
+
+    topk_indices, topk_length, _, compact_softmax = _indexer_topk_core(
+        q,
+        k,
+        w,
+        topk=topk,
+        ratio=ratio,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_kv=cu_seqlens_kv,
+        max_seqlen_q=int(max_seqlen_q) if max_seqlen_q is not None else None,
+        max_seqlen_kv=int(max_seqlen_kv) if max_seqlen_kv is not None else None,
+        q_causal_offsets=q_causal_offsets,
+        use_compact=True,
+        return_softmax=return_softmax,
+        compact_workspace=compact_workspace,
+        precision=precision,
+        deterministic=deterministic,
+    )
+    if return_softmax:
+        return topk_indices, topk_length, compact_softmax
+    return topk_indices, topk_length
+
+
+# ---------------------------------------------------------------------------
+# Path B: fused indexer + sparse attention (training)
+# ---------------------------------------------------------------------------
+
+
+_CLIP_PROB_MIN = torch.finfo(torch.float32).tiny  # kept compatible w/ cudnn kernel
+
+
+def _thd_to_fake_bshd(*tensors: Tensor) -> Tuple[Tensor, ...]:
+    """Prepend a B=1 dim to THD tensors for cuDNN wrappers that expect BSHD."""
+    return tuple(t.unsqueeze(0) for t in tensors)
+
+
+def _compute_indexer_predict(
+    q_indexer: Tensor,
+    k_indexer: Tensor,
+    weights: Tensor,
+    topk_indices: Tensor,
+    qhead_per_kv_head: int,
+    *,
+    topk_indices_global: bool = False,
+) -> Tensor:
+    """Compute ``predict`` distribution (softmax over top-K of indexer scores).
+
+    Wraps `cudnn.DSA.sparse_indexer_score_recompute_wrapper`.
+    This function is not used now, but it is kept for potential future use.
+
+    Two layouts:
+
+    * **BSHD** (default; 4-D q): ``q (B, S_q, H, D)``, ``k (B, S_k, D)``,
+      ``w (B, S_q, H)``, ``topk (B, S_q, topk)``.
+    * **THD packed** (3-D q): ``q (total_q, H, D)``, ``k (total_k, D)``,
+      ``w (total_q, H)``, ``topk (total_q, topk)``. Internally
+      fake-BSHD'd with ``B=1`` so the wrapper's 4-D-Q shape check
+      passes; ``topk_indices_global=True`` is required (and enforced) so
+      the kernel decodes the flat ids directly as positions into the
+      ``(1*total_k, D)`` view.
+
+    Output shape matches the layout: BSHD ``(B, S_q, topk)`` or
+    THD ``(total_q, topk)``, fp32 softmax over the top-K axis.
+    """
+    _ensure_dsa_namespace()
+    is_thd = q_indexer.ndim == 3
+    if is_thd:
+        if not topk_indices_global:
+            raise ValueError(
+                "THD ``_compute_indexer_predict`` requires "
+                "``topk_indices_global=True`` so the kernel addresses K "
+                "by flat ids over the packed ``(total_k, D)`` buffer."
+            )
+        q_bshd, k_bsd, w_bsh, topk_bst = _thd_to_fake_bshd(
+            q_indexer, k_indexer, weights, topk_indices
+        )
+    else:
+        q_bshd, k_bsd, w_bsh, topk_bst = q_indexer, k_indexer, weights, topk_indices
+
+    result = _DSA.sparse_indexer_score_recompute_wrapper(
+        q_bshd,
+        k_bsd,
+        w_bsh,
+        topk_bst,
+        qhead_per_kv_head=qhead_per_kv_head,
+        topk_indices_global=topk_indices_global,
+    )
+    predict = result["predict"]
+    if is_thd:
+        predict = predict.squeeze(0)
+    return predict
+
+
+def _compute_attn_target(
+    q_attn: Tensor,
+    k_attn: Tensor,
+    lse: Tensor,
+    topk_indices: Tensor,
+    softmax_scale: float,
+    qhead_per_kv_head: int,
+    *,
+    topk_indices_global: bool = False,
+) -> Tensor:
+    """Compute ``target`` distribution (L1-normalised head-sum softmax).
+
+    Wraps :attr:`cudnn.DSA.sparse_attn_score_recompute_wrapper`. Same
+    layout convention as :func:`_compute_indexer_predict`: 4-D q is
+    BSHD; 3-D q is THD and gets fake-BSHD'd with ``B=1`` before the
+    wrapper call (so the 4-D-Q shape check passes).
+    """
+    _ensure_dsa_namespace()
+    is_thd = q_attn.ndim == 3
+    if is_thd:
+        if not topk_indices_global:
+            raise ValueError(
+                "THD ``_compute_attn_target`` requires "
+                "``topk_indices_global=True`` so the kernel addresses K "
+                "by flat ids over the packed ``(total_k, D)`` buffer."
+            )
+        q_bshd, k_bsd, lse_bsh, topk_bst = _thd_to_fake_bshd(q_attn, k_attn, lse, topk_indices)
+    else:
+        q_bshd, k_bsd, lse_bsh, topk_bst = q_attn, k_attn, lse, topk_indices
+
+    result = _DSA.sparse_attn_score_recompute_wrapper(
+        q_bshd,
+        k_bsd,
+        lse_bsh,
+        topk_bst,
+        softmax_scale,
+        qhead_per_kv_head=qhead_per_kv_head,
+        topk_indices_global=topk_indices_global,
+    )
+    target = result["target"]
+    if is_thd:
+        target = target.squeeze(0)
+    return target
+
+
+def _kl_loss_from_target_predict(
+    target: Tensor,
+    predict: Tensor,
+    topk_indices: Tensor,
+    loss_coeff: float,
+    calculate_per_token_loss: bool = False,
+    loss_divisor: int | float | Tensor | None = None,
+) -> Tensor:
+    """KL(target || predict) reduced over ``(B, S_q)`` and scaled by loss_coeff.
+
+    Rows with no valid top-K positions (early query rows with ratio causal
+    masking) contribute 0 to the loss — the sparse score kernels produce
+    garbage for those rows, mirroring ``compute_dsa_indexer_loss``'s
+    ``row_valid`` handling. The default mean is taken over all ``(B, S_q)``
+    positions. Per-token-loss mode returns a raw local sum unless
+    ``loss_divisor`` is supplied, in which case the global normalization is
+    folded into the same compiled reduction.
+    """
+    return csa_indexer_loss_kernels.sparse_kl_loss(
+        target, predict, topk_indices, loss_coeff, calculate_per_token_loss, loss_divisor
+    )
+
+
+def _scale_indexer_grads(grad_loss: Tensor, *grads: Tensor) -> Tuple[Tensor, ...]:
+    """Scale independent indexer gradients with one foreach launch per dtype group."""
+    if not grads:
+        return ()
+
+    grouped_grads: dict[
+        tuple[torch.device, torch.dtype, torch.layout], list[tuple[int, Tensor]]
+    ] = {}
+    for index, grad in enumerate(grads):
+        grouped_grads.setdefault((grad.device, grad.dtype, grad.layout), []).append((index, grad))
+
+    scaled_by_index: dict[int, Tensor] = {}
+    for indexed_grads in grouped_grads.values():
+        scaled_group = torch._foreach_mul([grad for _, grad in indexed_grads], grad_loss)
+        for (index, _), scaled_grad in zip(indexed_grads, scaled_group):
+            scaled_by_index[index] = scaled_grad
+    return tuple(scaled_by_index[index] for index in range(len(grads)))
+
+
+# ---------------------------------------------------------------------------
+# Dense path (``sparse_loss=False``) — full-KV indexer loss
+# ---------------------------------------------------------------------------
+
+
+def _compute_dense_indexer_score(
+    q_indexer: Tensor,
+    k_indexer: Tensor,
+    weights: Tensor,
+    qhead_per_kv_head: int,
+    indexer_softmax_scale: float,
+    ratio: int,
+    *,
+    cu_seqlens_q: Optional[Tensor] = None,
+    cu_seqlens_kv: Optional[Tensor] = None,
+    max_seqlen_q: Optional[int] = None,
+    max_seqlen_kv: Optional[int] = None,
+    q_causal_offsets: Optional[Tensor] = None,
+) -> Tuple[Tensor, Tensor]:
+    """Dense indexer score forward over the full ``S_k`` axis (BSHD or THD).
+
+    Wraps :attr:`cudnn.DSA.dense_indexer_score_recompute_wrapper`.
+    Layout is selected by ``cu_seqlens_*`` kwargs:
+
+    * **BSHD** (``cu_seqlens_*=None``): inputs are 4-D q ``(B, S_q, H, D)``,
+      4-D k ``(B, S_k, H_kv, D)``, 3-D w ``(B, S_q, H)``. Outputs are
+      ``out (B, S_q, S_k)`` + ``denom (B, S_q)``.
+    * **THD** (``cu_seqlens_*`` supplied): inputs are 3-D q
+      ``(total_q, H, D)``, 3-D k ``(total_k, H_kv, D)``, 2-D w
+      ``(total_q, H)``. Outputs are ``out (total_q, max_seqlen_kv)`` +
+      ``denom (total_q,)``.
+
+    The ratio-causal limit is
+    ``min(S_k, (q_causal_offset + q + 1) // ratio)``; omitted offsets are zero.
+    """
+    _ensure_dsa_namespace()
+    kwargs = dict(
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_kv,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_kv,
+    )
+    if q_causal_offsets is not None:
+        kwargs["q_causal_offsets"] = q_causal_offsets
+    result = _DSA.dense_indexer_score_recompute_wrapper(
+        q_indexer,
+        k_indexer,
+        weights,
+        qhead_per_kv_head=qhead_per_kv_head,
+        sm_scale=indexer_softmax_scale,
+        ratio=ratio,
+        **kwargs,
+    )
+    return result["out"], result["denom"]
+
+
+def _compute_dense_attn_score(
+    q_attn: Tensor,
+    k_attn: Tensor,
+    lse: Tensor,
+    qhead_per_kv_head: int,
+    softmax_scale: float,
+    ratio: int,
+    *,
+    cu_seqlens_q: Optional[Tensor] = None,
+    cu_seqlens_kv: Optional[Tensor] = None,
+    max_seqlen_q: Optional[int] = None,
+    max_seqlen_kv: Optional[int] = None,
+    q_causal_offsets: Optional[Tensor] = None,
+) -> Tuple[Tensor, Tensor]:
+    """Dense attention score forward over the full ``S_k`` axis (BSHD or THD).
+
+    Wraps :attr:`cudnn.DSA.dense_attn_score_recompute_wrapper`. Same
+    BSHD/THD layout convention as :func:`_compute_dense_indexer_score`.
+    """
+    _ensure_dsa_namespace()
+    kwargs = dict(
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_kv,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_kv,
+    )
+    if q_causal_offsets is not None:
+        kwargs["q_causal_offsets"] = q_causal_offsets
+    result = _DSA.dense_attn_score_recompute_wrapper(
+        q_attn,
+        k_attn,
+        lse,
+        softmax_scale,
+        qhead_per_kv_head=qhead_per_kv_head,
+        ratio=ratio,
+        **kwargs,
+    )
+    return result["out"], result["denom"]
+
+
+def _kl_loss_from_dense_scores(
+    attn_score: Tensor,
+    attn_l1norm: Tensor,
+    index_score: Tensor,
+    index_lse: Tensor,
+    loss_coeff: float,
+    calculate_per_token_loss: bool = False,
+) -> Tensor:
+    """KL(target || predict) over the **full** KV axis, averaged over rows.
+
+    Derives ``target = attn_score / attn_l1norm`` (L1-normalised, matches
+    ``compute_dsa_indexer_loss``'s ``attention_scores / sum`` step) and
+    ``log_predict = index_score - index_lse`` (LSE-normalised log-softmax),
+    then computes ``KL = sum_k target * (log target - log predict)`` and
+    scales by ``loss_coeff``.
+
+    Layout-agnostic: works for both BSHD inputs (shapes
+    ``attn_score (B, S_q, S_k)``, ``attn_l1norm (B, S_q)``, …) and THD
+    inputs (shapes ``attn_score (total_q, max_seqlen_kv)``,
+    ``attn_l1norm (total_q,)``, …). The final ``.mean()`` averages over
+    all rows in either case.
+
+    Rows where the kernel's ``ratio`` causal mask leaves no valid KV
+    position have ``attn_l1norm <= 0`` (L1) or ``index_lse == -inf``
+    (LSE); those rows contribute 0 to the loss — the same ``row_valid``
+    semantics as the reference ``compute_dsa_indexer_loss``.
+    """
+    eps = _CLIP_PROB_MIN
+    # row_valid: rows with at least one un-masked KV position.
+    row_valid = (attn_l1norm > eps) & torch.isfinite(index_lse)
+
+    # Safe denoms: replace invalid rows with a finite value so target /
+    # log-predict don't produce NaN; the row mask zeroes their KL below.
+    safe_l1 = attn_l1norm.clamp(min=eps)
+    safe_lse = torch.where(row_valid, index_lse, torch.zeros_like(index_lse))
+
+    target = attn_score / safe_l1.unsqueeze(-1)
+    target_clamped = target.clamp(min=eps)
+    # Per-position validity: the indexer-score kernel emits -inf at
+    # ratio-masked positions; those contribute 0 to KL by the
+    # ``0 · log(0/p) = 0`` convention. Without this gate, the eps-clamp
+    # on target makes the term ``eps · (log eps - (-inf)) = +inf``.
+    position_valid = torch.isfinite(index_score)
+    safe_index_score = torch.where(position_valid, index_score, torch.zeros_like(index_score))
+    log_predict = safe_index_score - safe_lse.unsqueeze(-1)
+
+    kl_terms = target_clamped * (torch.log(target_clamped) - log_predict)
+    kl_terms = torch.where(position_valid, kl_terms, torch.zeros_like(kl_terms))
+    kl_per_row = kl_terms.sum(dim=-1)  # (B, S_q)
+    kl_per_row = torch.where(row_valid, kl_per_row, torch.zeros_like(kl_per_row))
+    loss = kl_per_row.sum() if calculate_per_token_loss else kl_per_row.mean()
+    return loss_coeff * loss
+
+
+class FusedCSAIndexerSparseAttnFunc(torch.autograd.Function):
+    """Path B: fused indexer (+KL loss) + sparse attention in one autograd.
+
+    Differentiable w.r.t. ``query``, ``kv_full``, ``attn_sink``,
+    ``q_indexer``, ``k_indexer``, ``weights``.
+
+    Layout is selected by the ``cu_seqlens_q`` kwarg passed to
+    :func:`fused_csa_indexer_sparse_attn`:
+
+    * **SBHD** (``cu_seqlens_q is None``): inputs carry an explicit batch
+      axis; the indexer pipeline runs in BSHD (after one SBHD→BSHD
+      permute).
+    * **THD packed** (``cu_seqlens_q`` supplied): inputs are flat
+      packed-sequence tensors; the indexer pipeline runs directly on
+      ``(total_q, …)`` / ``(total_kv, …)`` shapes with
+      ``cu_seqlens_q/kv`` forwarded to every layout-aware kernel
+      (``_indexer_topk_core`` THD branch, ``local_to_global_flat`` THD
+      branch, ``_compute_dense_*_score`` THD branch,
+      ``dense_indexer_backward_wrapper`` with ``cu_seqlens_q/k``).
+      Generic fused THD stores KV as raw ``[all original, all compressed]``
+      sources and lowers the logical indexer output with the shared THD
+      final-index kernel. The legacy per-segment layout remains available to
+      direct callers.
+
+    Two indexer-loss variants, selected by the ``sparse_loss`` argument
+    (matches ``compute_dsa_indexer_loss`` in the reference ``dsa.py``):
+
+    * **Sparse loss** (``sparse_loss=True``) — KL is computed only over
+      the top-K KV positions the indexer has selected.
+      **Supports both SBHD and THD.**
+    * **Dense loss** (``sparse_loss=False``, the default) — KL is
+      computed over *all* causally valid KV positions.
+      **Supports both SBHD and THD.**
+
+    The indexer backward is eagerly computed in the forward pass with
+    ``grad_loss=1.0``; the actual backward simply scales the
+    pre-computed gradients by ``grad_loss``.
+
+    Both variants share the FlashMLA sparse-attention forward + the
+    cuDNN sparse-attn backward (both of which are layout-agnostic — the
+    flat shape they require is what the THD branch already passes
+    directly, and what the SBHD branch reshapes into).
+    """
+
+    @staticmethod
+    def forward(
+        ctx,
+        # Sparse attn inputs (differentiable)
+        query: Tensor,  # SBHD (sq, b, np, d) / THD (total_q, np, d)
+        kv_full: Tensor,  # SBHD (skv, b, d) / THD (total_kv_full, d)
+        attn_sink: Tensor,  # (np,) f32
+        # Window indices (not differentiable)
+        window_idxs: Tensor | None,  # SBHD/legacy THD window ids; None for raw THD KV.
+        # Indexer inputs (differentiable)
+        q_indexer: Tensor,  # SBHD (sq, b, idx_nh, idx_hd) / THD (total_q, idx_nh, idx_hd)
+        k_indexer: Tensor,  # SBHD (n_comp, b, idx_hd) / THD (total_comp_idx, idx_hd)
+        weights: Tensor,  # SBHD (sq, b, idx_nh) / THD (total_q, idx_nh) — raw (unscaled)
+        # Scalars
+        indexer_topk: int,
+        ratio: int,
+        softmax_scale: float,
+        indexer_softmax_scale: float,
+        loss_coeff: float,
+        sparse_loss: bool,
+        kv_offset: int,  # SBHD only — start of compressed region in kv_full
+        calculate_per_token_loss: bool,
+        # THD packed-sequence args (all None for SBHD; all required for THD)
+        cu_seqlens_q: Optional[Tensor],
+        cu_seqlens_kv: Optional[Tensor],  # original (uncompressed) KV cu_seqlens
+        cu_seqlens_kv_full: Optional[Tensor],  # original + compressed concat'd cu_seqlens
+        cu_seqlens_compressed_idx: Optional[Tensor],  # indexer K cu_seqlens (== compressor's)
+        max_seqlen_q: Optional[int],
+        max_seqlen_compressed_idx: Optional[int],  # indexer K max
+        compressed_kv: Optional[Tensor] = None,  # THD only — pre-packed compressed KV
+        cu_seqlens_q_unpadded: Optional[Tensor] = None,  # THD only — unpadded Q cu_seqlens
+        compact_workspace: BSHDCompactIndexerWorkspace | THDCompactIndexerWorkspace | None = None,
+        indexer_precision: str = "bf16",
+        deterministic: bool = False,
+        thd_window_size: int | None = None,
+        thd_compressed_is_sequence_major: bool = False,
+    ) -> Tuple[Tensor, Tensor]:
+        """Fused forward: indexer scoring, sparse attention, KL loss, and indexer backward."""
+        _ensure_dsa_namespace()
+
+        is_thd = cu_seqlens_q is not None
+        total_q = q_indexer.shape[0] if is_thd else q_indexer.shape[0] * q_indexer.shape[1]
+
+        # ---- Layout-specific input prep --------------------------------------
+        # SBHD: permute SBHD→BSHD once and reuse the BSHD tensors for indexer
+        # forward, dense score helpers, and the indexer backward.
+        # THD: skip the permute; tensors are already flat.
+        if is_thd:
+            idx_nh = q_indexer.shape[1]
+            np_, d = query.shape[1], query.shape[2]
+
+            q_indexer_flat = q_indexer
+            k_indexer_flat = k_indexer
+            w_indexer = weights
+        else:
+            sq, b, np_, d = query.shape
+            skv = kv_full.shape[0]
+            idx_nh = q_indexer.shape[2]
+
+            q_indexer_flat = q_indexer.permute(1, 0, 2, 3).contiguous()
+            k_indexer_flat = k_indexer.permute(1, 0, 2).contiguous()
+            w_indexer = weights.permute(1, 0, 2).contiguous()
+
+        # ``indexer_softmax_scale`` is applied via the
+        # ``relu(c·x) = c·relu(x)`` trick (the cudnn kernel does the relu),
+        # so we push the scale onto the weights tensor (small) instead of the
+        # score tensor (big). This is uniform across SBHD and THD; in SBHD
+        # the subsequent permute carries the scaled values into BSHD order.
+        if indexer_softmax_scale != 1.0:
+            w_indexer_scaled = (w_indexer.float() * indexer_softmax_scale).to(w_indexer.dtype)
+        else:
+            w_indexer_scaled = w_indexer
+
+        # ---- 2. Indexer scoring + top-K. -------------------------------------
+        # Compact THD requires physical K coverage and enough per-sequence K
+        # rows for floor-compressed tails. Keep the original K/layout for the
+        # loss and its backward, and pad only the non-differentiable Top-K call.
+        topk_k_indexer = k_indexer_flat
+        topk_cu_seqlens_k = cu_seqlens_compressed_idx
+        topk_max_seqlen_k = max_seqlen_compressed_idx
+        if is_thd and thd_compact_indexer_available(
+            q_indexer_flat, k_indexer_flat, indexer_precision
+        ):
+            assert cu_seqlens_q is not None
+            assert cu_seqlens_compressed_idx is not None
+            compact_cu_seqlens_k, source_row_map = build_thd_compact_k_layout(
+                cu_seqlens_q, cu_seqlens_compressed_idx, k_indexer_flat.shape[0], ratio
+            )
+            topk_k_indexer = pack_thd_compact_k(k_indexer_flat, source_row_map)
+            topk_cu_seqlens_k = compact_cu_seqlens_k
+            topk_max_seqlen_k = int(max_seqlen_compressed_idx) + 2
+
+        # Pass the original ``indexer_topk`` (not min(indexer_topk, n_comp)) so
+        # that the output is always padded to a fixed size. Top-K dispatch is
+        # independent of the configured loss: SM100 always uses the compact
+        # wrapper, while an enabled dense KL loss separately recomputes the
+        # full score tensor it needs below.
+        topk_indices_cmp, _, indexer_scores, compact_predict = _indexer_topk_core(
+            q_indexer_flat,
+            topk_k_indexer,
+            w_indexer_scaled,
+            indexer_topk,
+            ratio,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_kv=topk_cu_seqlens_k,
+            max_seqlen_q=int(max_seqlen_q) if max_seqlen_q is not None else None,
+            max_seqlen_kv=(int(topk_max_seqlen_k) if topk_max_seqlen_k is not None else None),
+            use_compact=True,
+            return_softmax=loss_coeff > 0 and sparse_loss,
+            compact_workspace=compact_workspace,
+            precision=indexer_precision,
+            deterministic=deterministic,
+        )
+
+        # ---- 3. Combine indices (indexer first, then window) + globalize. ----
+        indexer_physical_idxs = None
+        padding_row_mask: Optional[Tensor] = None  # True = padding (excluded from loss)
+        if is_thd and thd_compressed_is_sequence_major:
+            if compressed_kv is None or thd_window_size is None:
+                raise ValueError(
+                    "Raw sequence-major THD lowering requires compressed_kv and thd_window_size."
+                )
+            compressed_base = kv_full.shape[0] - compressed_kv.shape[0]
+            global_idxs, _, indexer_physical_idxs, padding_row_mask = (
+                thd_layout_kernels.build_attention_indices(
+                    cu_seqlens_q,
+                    0,
+                    total_q,
+                    0,
+                    int(thd_window_size),
+                    ratio,
+                    indexer_topk,
+                    topk_indices_cmp,
+                    cu_seqlens_compressed=cu_seqlens_compressed_idx,
+                    for_indexer_loss=True,
+                    compressed_base=compressed_base,
+                    compressed_rows=compressed_kv.shape[0],
+                    compressed_is_sequence_major=True,
+                    cu_seqlens_unpadded=cu_seqlens_q_unpadded,
+                    output_alignment=get_flash_mla_topk_alignment(),
+                )
+            )
+        elif is_thd:
+            if window_idxs is None:
+                raise ValueError("Legacy THD lowering requires caller-supplied window indices.")
+            row_batch_ids = batch_of_row(cu_seqlens_q, total_q=total_q)
+            offset_per_row = (
+                (cu_seqlens_kv[1:] - cu_seqlens_kv[:-1])[row_batch_ids].unsqueeze(1).to(torch.int32)
+            )
+            compress_topk_idxs = torch.where(
+                topk_indices_cmp >= 0,
+                topk_indices_cmp + offset_per_row,
+                torch.full_like(topk_indices_cmp, -1),
+            )
+            combined_local = torch.cat(
+                [compress_topk_idxs, window_idxs], dim=-1
+            )  # (total_q, indexer_topk + win_topk)
+            global_idxs = local_to_global_flat(
+                combined_local,
+                batch_size=-1,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_kv=cu_seqlens_kv_full,
+            )
+        else:
+            if window_idxs is None:
+                raise ValueError("SBHD lowering requires caller-supplied window indices.")
+            compress_topk_idxs = torch.where(
+                topk_indices_cmp >= 0, topk_indices_cmp + kv_offset, -1
+            )
+            combined_local = torch.cat([compress_topk_idxs, window_idxs], dim=-1)
+            global_idxs = local_to_global_flat(combined_local, b)
+
+        # The dense teacher still needs the fixed window suffix. Attention no
+        # longer needs that segment boundary because FlashMLA's partial
+        # ``lse_indexer`` is not used, so compact the full attention set once
+        # and share the resulting prefix length with forward and backward.
+        if is_thd and thd_compressed_is_sequence_major:
+            logical_window_width = int(thd_window_size)
+        else:
+            assert window_idxs is not None
+            logical_window_width = window_idxs.shape[-1]
+        window_global_idxs = global_idxs[:, indexer_topk : indexer_topk + logical_window_width]
+        global_idxs, topk_length = _compact_flat_topk_idxs(global_idxs)
+
+        # ---- 4. FlashMLA forward (flat layout for both SBHD and THD). --------
+        if is_thd:
+            q_flat = query
+            kv_flat = kv_full
+        else:
+            q_flat = query.reshape(sq * b, np_, d)
+            kv_flat = kv_full.reshape(skv * b, d)
+        # The partial indexer LSE excludes the window (and FlashMLA excludes
+        # the sink from every returned LSE), so it is not a valid teacher
+        # denominator. Sparse loss uses the full LSE below; dense loss
+        # recomputes the all-compressed denominator.
+        out_flat, lse, _ = _csa_fwd_flash_mla(
+            q_flat,
+            kv_flat,
+            global_idxs,
+            softmax_scale,
+            attn_sink=attn_sink,
+            topk_length=topk_length,
+            indexer_topk=0,
+        )
+        # cuDNN DSA backward assumes every slot is a non-negative address when
+        # ``topk_length`` is supplied, including ignored suffix slots. Forward
+        # has already consumed the ``-1`` sentinels, so sanitize in-place and
+        # avoid keeping a second TopK-sized tensor for backward.
+        global_idxs.clamp_min_(0)
+
+        # ---- 4b. Resolve padding-row mask for loss exclusion. ----------------
+        # When CUDA-graph padding makes cu_seqlens_q cover all total_q rows
+        # (including padding), cu_seqlens_q_unpadded supplies the true
+        # boundaries.  Padding rows must not contribute to the indexer KL
+        # loss or backward gradients — only the sparse-attention output
+        # needs them for static-shape compatibility.
+        # Raw sequence-major THD emits this mask from final-index lowering.
+        # Legacy THD derives it here; the caller only supplies unpadded lengths
+        # when they differ from cu_seqlens_q, so no GPU→CPU sync is needed.
+        if padding_row_mask is None and is_thd and cu_seqlens_q_unpadded is not None:
+            real_seg_lens = cu_seqlens_q_unpadded[1:] - cu_seqlens_q_unpadded[:-1]
+            row_idx = torch.arange(total_q, device=query.device, dtype=torch.int32)
+            row_batch_ids = batch_of_row(cu_seqlens_q, total_q=total_q)
+            pos_in_seg = row_idx - cu_seqlens_q[row_batch_ids].to(torch.int32)
+            # Rows whose intra-segment position >= real segment length
+            # are padding (including rows in a dummy trailing segment
+            # whose real length is 0).
+            real_len_per_row = real_seg_lens[row_batch_ids].to(torch.int32)
+            padding_row_mask = pos_in_seg >= real_len_per_row
+
+        if padding_row_mask is not None:
+            # FlashMLA correctly treats a zero-length row as sink-only, but
+            # cuDNN DSA backward requires at least one tile. The indices were
+            # sanitized above, so make padding rows consume one harmless
+            # placeholder during backward; dO and LSE are masked below.
+            topk_length.masked_fill_(padding_row_mask, 1)
+
+        # ---- 5. Derive predict from indexer_scores, compute target. ----------
+        if loss_coeff <= 0:
+            indexer_loss = torch.zeros((), device=query.device, dtype=torch.float32)
+        else:
+            # Layout-specific attention tensors are detached because the loss
+            # is not differentiable through the attention-score target.
+            if is_thd:
+                assert compressed_kv is not None, "compressed_kv is required for THD"
+                q_attn_det = query.detach()
+                k_attn_compressed_det = compressed_kv.detach()
+            else:
+                q_attn_det = query.detach().permute(1, 0, 2, 3).contiguous()
+                k_attn_compressed_det = kv_full[kv_offset:].detach().permute(1, 0, 2).contiguous()
+
+            if sparse_loss:
+                if is_thd:
+                    sparse_teacher_lse = torch.logaddexp(
+                        lse.detach().float(), attn_sink.detach().float().view(1, np_)
+                    )
+                else:
+                    sparse_teacher_lse = (
+                        torch.logaddexp(
+                            lse.detach().float(), attn_sink.detach().float().view(1, np_)
+                        )
+                        .reshape(sq, b, np_)
+                        .permute(1, 0, 2)
+                        .contiguous()
+                    )
+
+                if compact_predict is not None:
+                    predict = compact_predict
+                    if padding_row_mask is not None:
+                        row_mask = padding_row_mask.unsqueeze(-1)
+                        topk_indices_cmp = topk_indices_cmp.masked_fill(row_mask, -1)
+                        predict = predict.masked_fill(row_mask, 0)
+                        if indexer_physical_idxs is not None:
+                            indexer_physical_idxs = indexer_physical_idxs.masked_fill(row_mask, -1)
+                else:
+                    assert indexer_scores is not None
+                    # The fused row kernel invalidates CUDA-graph padding rows
+                    # in both index spaces and computes gather + masked softmax.
+                    predict, topk_indices_cmp, indexer_physical_idxs = (
+                        csa_indexer_loss_kernels.prepare_sparse_loss(
+                            indexer_scores,
+                            topk_indices_cmp,
+                            padding_row_mask,
+                            indexer_physical_idxs,
+                        )
+                    )
+
+                # THD: _compute_attn_target's kernel addresses K by flat ids over
+                # the packed (total_k, D) buffer, so promote per-segment-local
+                # indices to flat-global against cu_seqlens_compressed_idx.
+                if is_thd:
+                    if indexer_physical_idxs is not None:
+                        topk_for_target = indexer_physical_idxs
+                    else:
+                        topk_for_target = local_to_global_flat(
+                            topk_indices_cmp,
+                            batch_size=-1,
+                            cu_seqlens_q=cu_seqlens_q,
+                            cu_seqlens_kv=cu_seqlens_compressed_idx,
+                        )
+                else:
+                    topk_for_target = topk_indices_cmp
+
+                target = _compute_attn_target(
+                    q_attn_det,
+                    k_attn_compressed_det,
+                    sparse_teacher_lse,
+                    topk_for_target,
+                    softmax_scale,
+                    qhead_per_kv_head=np_,
+                    topk_indices_global=is_thd,
+                )
+
+                indexer_loss = _kl_loss_from_target_predict(
+                    target, predict, topk_indices_cmp, loss_coeff, calculate_per_token_loss
+                )
+            else:
+                if indexer_scores is None:
+                    k_unsqueeze_dim = 1 if is_thd else 2
+                    dense_indexer_kwargs = {}
+                    if is_thd:
+                        dense_indexer_kwargs = dict(
+                            cu_seqlens_q=cu_seqlens_q,
+                            cu_seqlens_kv=cu_seqlens_compressed_idx,
+                            max_seqlen_q=int(max_seqlen_q),
+                            max_seqlen_kv=int(max_seqlen_compressed_idx),
+                        )
+                    index_score, index_lse = _compute_dense_indexer_score(
+                        q_indexer_flat,
+                        k_indexer_flat.unsqueeze(k_unsqueeze_dim),
+                        w_indexer,
+                        qhead_per_kv_head=idx_nh,
+                        indexer_softmax_scale=indexer_softmax_scale,
+                        ratio=ratio,
+                        **dense_indexer_kwargs,
+                    )
+                else:
+                    index_score = indexer_scores
+                    index_lse = torch.logsumexp(indexer_scores, dim=-1)
+                if padding_row_mask is not None:
+                    index_score = index_score.masked_fill(
+                        padding_row_mask.unsqueeze(-1), float("-inf")
+                    )
+                    index_lse = index_lse.masked_fill(padding_row_mask, float("-inf"))
+
+                k_unsqueeze_dim = 1 if is_thd else 2
+                dense_attn_kwargs = {}
+                if is_thd:
+                    dense_attn_kwargs = dict(
+                        cu_seqlens_q=cu_seqlens_q,
+                        cu_seqlens_kv=cu_seqlens_compressed_idx,
+                        max_seqlen_q=int(max_seqlen_q),
+                        max_seqlen_kv=int(max_seqlen_compressed_idx),
+                    )
+                dense_teacher_lse = _compute_full_csa_teacher_lse(
+                    q_attn_det,
+                    q_flat,
+                    kv_flat,
+                    k_attn_compressed_det,
+                    attn_sink,
+                    window_global_idxs,
+                    softmax_scale,
+                    ratio,
+                    **dense_attn_kwargs,
+                )
+                attn_score, attn_l1norm = _compute_dense_attn_score(
+                    q_attn_det,
+                    k_attn_compressed_det.unsqueeze(k_unsqueeze_dim),
+                    dense_teacher_lse,
+                    qhead_per_kv_head=np_,
+                    softmax_scale=softmax_scale,
+                    ratio=ratio,
+                    **dense_attn_kwargs,
+                )
+                if padding_row_mask is not None:
+                    attn_score = attn_score.masked_fill(padding_row_mask.unsqueeze(-1), 0)
+                    attn_l1norm = attn_l1norm.masked_fill(padding_row_mask, 0)
+
+                indexer_loss = _kl_loss_from_dense_scores(
+                    attn_score,
+                    attn_l1norm,
+                    index_score,
+                    index_lse,
+                    loss_coeff,
+                    calculate_per_token_loss,
+                )
+
+        # ---- 6. Eagerly compute indexer backward (grad_loss=1). ------------
+        # The actual grad_loss scaling is deferred to backward (when
+        # DSAIndexerLossAutoScaler provides the correct scale).
+        # Use total_q (not real token count) for the loss coefficient even
+        # when padding rows are masked.  The cuDNN kernel divides by total_q
+        # internally; since masked rows contribute 0, multiplying back by
+        # total_q still yields the correct real-token sum — and avoids a
+        # GPU→CPU sync that would break CUDA graph capture.
+        if loss_coeff > 0:
+            indexer_loss_coeff = loss_coeff
+            if calculate_per_token_loss:
+                indexer_loss_coeff = loss_coeff * (total_q if is_thd else b * sq)
+            unit_grad_loss = torch.ones((), device=query.device, dtype=torch.float32)
+
+            if sparse_loss:
+                attn_score_for_bwd = target.clone()
+                index_score_for_bwd = predict.clone()
+                if is_thd:
+                    if indexer_physical_idxs is not None:
+                        topk_indices_cmp_global = indexer_physical_idxs
+                    else:
+                        topk_indices_cmp_global = local_to_global_flat(
+                            topk_indices_cmp,
+                            batch_size=-1,
+                            cu_seqlens_q=cu_seqlens_q,
+                            cu_seqlens_kv=cu_seqlens_compressed_idx,
+                        )
+                    bwd_q, bwd_w, bwd_k, bwd_attn, bwd_idx, bwd_topk = _thd_to_fake_bshd(
+                        q_indexer_flat,
+                        w_indexer,
+                        k_indexer_flat,
+                        attn_score_for_bwd,
+                        index_score_for_bwd,
+                        topk_indices_cmp_global,
+                    )
+                else:
+                    bwd_q = q_indexer_flat
+                    bwd_w = w_indexer
+                    bwd_k = k_indexer_flat
+                    bwd_attn = attn_score_for_bwd
+                    bwd_idx = index_score_for_bwd
+                    bwd_topk = topk_indices_cmp
+
+                ig = _DSA.indexer_backward_wrapper(
+                    bwd_q,
+                    bwd_w,
+                    bwd_k,
+                    bwd_attn,
+                    bwd_idx,
+                    bwd_topk,
+                    sm_scale=indexer_softmax_scale,
+                    loss_coeff=indexer_loss_coeff,
+                    grad_loss=unit_grad_loss,
+                    block_I=128,
+                )
+
+                if is_thd:
+                    precomputed_grad_q_indexer = ig["d_index_q"].squeeze(0)
+                    precomputed_grad_k_indexer = ig["d_index_k"].squeeze(0)
+                    precomputed_grad_weights = ig["d_weights"].squeeze(0)
+                else:
+                    precomputed_grad_q_indexer = ig["d_index_q"].permute(1, 0, 2, 3).contiguous()
+                    precomputed_grad_k_indexer = ig["d_index_k"].permute(1, 0, 2).contiguous()
+                    precomputed_grad_weights = ig["d_weights"].permute(1, 0, 2).contiguous()
+            else:
+                attn_score_for_bwd = attn_score.clone()
+                index_score_for_bwd = index_score.clone()
+                index_lse_for_bwd = index_lse
+                if padding_row_mask is not None:
+                    index_score_for_bwd[padding_row_mask] = 0
+                    index_lse_for_bwd = index_lse.masked_fill(padding_row_mask, 0)
+                dense_bwd_kwargs = {}
+                if is_thd:
+                    dense_bwd_kwargs = dict(
+                        cu_seqlens_q=cu_seqlens_q,
+                        cu_seqlens_k=cu_seqlens_compressed_idx,
+                        max_seqlen_q=int(max_seqlen_q),
+                        max_seqlen_k=int(max_seqlen_compressed_idx),
+                    )
+                ig = _DSA.dense_indexer_backward_wrapper(
+                    q_indexer_flat,
+                    w_indexer,
+                    k_indexer_flat,
+                    attn_score_for_bwd,
+                    attn_l1norm,
+                    index_score_for_bwd,
+                    index_lse_for_bwd,
+                    sm_scale=indexer_softmax_scale,
+                    loss_coeff=indexer_loss_coeff,
+                    grad_loss=unit_grad_loss,
+                    ratio=ratio,
+                    block_I=128,
+                    **dense_bwd_kwargs,
+                )
+                if is_thd:
+                    precomputed_grad_q_indexer = ig["d_index_q"]
+                    precomputed_grad_k_indexer = ig["d_index_k"]
+                    precomputed_grad_weights = ig["d_weights"]
+                else:
+                    precomputed_grad_q_indexer = ig["d_index_q"].permute(1, 0, 2, 3).contiguous()
+                    precomputed_grad_k_indexer = ig["d_index_k"].permute(1, 0, 2).contiguous()
+                    precomputed_grad_weights = ig["d_weights"].permute(1, 0, 2).contiguous()
+        else:
+            precomputed_grad_q_indexer = torch.zeros_like(q_indexer)
+            precomputed_grad_k_indexer = torch.zeros_like(k_indexer)
+            precomputed_grad_weights = torch.zeros_like(weights)
+
+        # Zero out pre-computed indexer gradients for padding rows so they
+        # don't contribute to DSAIndexerLossAutoScaler backward.
+        if padding_row_mask is not None and loss_coeff > 0:
+            precomputed_grad_q_indexer[padding_row_mask] = 0
+            precomputed_grad_weights[padding_row_mask] = 0
+
+        # ---- 7. Save context (only sparse-attn bwd tensors + indexer grads). -
+        ctx.save_for_backward(
+            q_flat,
+            kv_flat,
+            attn_sink,
+            global_idxs,
+            topk_length,
+            out_flat,
+            lse,
+            precomputed_grad_q_indexer,
+            precomputed_grad_k_indexer,
+            precomputed_grad_weights,
+        )
+        ctx.softmax_scale = softmax_scale
+        ctx.is_thd = is_thd
+        ctx.padding_row_mask = padding_row_mask
+        ctx.np_ = np_
+        ctx.d = d
+        if is_thd:
+            ctx.total_q = total_q
+        else:
+            ctx.sq = sq
+            ctx.b = b
+            ctx.skv = skv
+
+        # ---- Output reshape: layout-specific. --------------------------------
+        d_v = out_flat.shape[-1]
+        if is_thd:
+            output = out_flat.reshape(total_q, np_ * d_v)
+        else:
+            output = out_flat.reshape(sq, b, np_, d_v).reshape(sq, b, np_ * d_v)
+        return output, indexer_loss
+
+    @staticmethod
+    def backward(ctx, grad_output, grad_loss):
+        """Backward: sparse attention bwd + scale pre-computed indexer grads."""
+        (
+            q_flat,
+            kv_flat,
+            attn_sink,
+            global_idxs,
+            topk_length,
+            out_flat,
+            lse,
+            precomputed_grad_q_indexer,
+            precomputed_grad_k_indexer,
+            precomputed_grad_weights,
+        ) = ctx.saved_tensors
+
+        is_thd = ctx.is_thd
+        np_, d = ctx.np_, ctx.d
+
+        # ---- 1. Sparse attn backward (flat layout, layout-agnostic). --------
+        d_v = out_flat.shape[-1]
+        if is_thd:
+            dO_flat = grad_output.reshape(ctx.total_q, np_, d_v)
+        else:
+            sq, b, skv = ctx.sq, ctx.b, ctx.skv
+            dO_flat = grad_output.reshape(sq * b, np_, d_v)
+
+        if ctx.padding_row_mask is not None:
+            dO_flat = dO_flat.masked_fill(ctx.padding_row_mask[:, None, None], 0)
+            lse = lse.masked_fill(ctx.padding_row_mask[:, None], 0)
+
+        attn_bwd = _DSA.sparse_attention_backward_wrapper(
+            q_flat,
+            kv_flat,
+            out_flat,
+            dO_flat,
+            lse,
+            attn_sink,
+            global_idxs,
+            softmax_scale=ctx.softmax_scale,
+            topk_length=topk_length,
+        )
+        if is_thd:
+            grad_query = attn_bwd["dq"]
+            grad_kv_full = attn_bwd["dkv"]
+        else:
+            grad_query = attn_bwd["dq"].reshape(sq, b, np_, d)
+            grad_kv_full = attn_bwd["dkv"].reshape(skv, b, d)
+        d_sink = attn_bwd["d_sink"]
+
+        # ---- 2. Scale pre-computed indexer grads by grad_loss. ---------------
+        grad_q_indexer, grad_k_indexer, grad_weights = _scale_indexer_grads(
+            grad_loss,
+            precomputed_grad_q_indexer,
+            precomputed_grad_k_indexer,
+            precomputed_grad_weights,
+        )
+
+        # Grads: query, kv_full, attn_sink, window_idxs, q_indexer, k_indexer,
+        #   weights, indexer_topk, ratio, softmax_scale, indexer_softmax_scale,
+        #   loss_coeff, sparse_loss, kv_offset, calculate_per_token_loss,
+        #   cu_seqlens_q, cu_seqlens_kv, cu_seqlens_kv_full,
+        #   cu_seqlens_compressed_idx,
+        #   max_seqlen_q, max_seqlen_compressed_idx,
+        #   compressed_kv, cu_seqlens_q_unpadded, compact_workspace,
+        #   indexer_precision, deterministic,
+        #   thd_window_size, thd_compressed_is_sequence_major
+        return (
+            grad_query,
+            grad_kv_full,
+            d_sink,
+            None,
+            grad_q_indexer,
+            grad_k_indexer,
+            grad_weights,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+
+
+class FusedCSAIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
+    """Sparse attention with caller-supplied indexer top-k.
+
+    The caller owns top-k selection. Sparse attention and indexer-loss
+    backward still use FlashMLA / cuDNN DSA wrappers.
+    """
+
+    @staticmethod
+    def forward(
+        ctx,
+        query: Tensor,
+        kv_full: Tensor,
+        attn_sink: Tensor,
+        topk_idxs: Tensor,
+        q_indexer: Tensor,
+        k_indexer: Tensor,
+        weights: Tensor,
+        indexer_topk_idxs: Tensor,
+        compressed_kv: Tensor,
+        softmax_scale: float,
+        indexer_softmax_scale: float,
+        loss_coeff: float,
+        loss_divisor: float,
+        sparse_loss: bool,
+        ratio: int,
+        max_seqlen_q: int,
+        indexer_layout: Tuple[Tensor, Tensor, Tensor],
+        q_padding_mask: Optional[Tensor] = None,
+        compact_predict: Optional[Tensor] = None,
+        local_k_indexer: Optional[Tensor] = None,
+        local_compressed_kv: Optional[Tensor] = None,
+        cp_group=None,
+        compressed_kv_start: int = 0,
+        indexer_rank_map: Optional[Tensor] = None,
+        indexer_k_reduce_scatter_state: Optional[_DeferredReduceScatterState] = None,
+        compressed_kv_reduce_scatter_state: Optional[_DeferredReduceScatterState] = None,
+        logical_window_width: int | None = None,
+        kv_reconstruction_parts: Tuple[Tensor, Tensor, Tensor] | None = None,
+    ) -> Tuple[Tensor, Tensor]:
+        """Run fused sparse attention using caller-supplied top-k indices."""
+        _ensure_dsa_namespace()
+
+        total_q, np_ = query.shape[:2]
+        idx_nh, idx_hd = q_indexer.shape[1], q_indexer.shape[2]
+        total_comp = k_indexer.shape[0]
+        indexer_topk = indexer_topk_idxs.shape[-1]
+
+        # Preserve the fixed window suffix for the dense teacher before
+        # compacting the complete attention index set.
+        if logical_window_width is None:
+            logical_window_width = topk_idxs.shape[-1] - indexer_topk
+        window_topk_idxs = topk_idxs[:, indexer_topk : indexer_topk + int(logical_window_width)]
+        topk_idxs, topk_length = _compact_flat_topk_idxs(topk_idxs)
+
+        # Do not request FlashMLA's partial indexer LSE: it omits both the
+        # window and sink masses required by the CSA teacher.
+        out_flat, lse, _ = _csa_fwd_flash_mla(
+            query,
+            kv_full,
+            topk_idxs,
+            softmax_scale,
+            attn_sink=attn_sink,
+            topk_length=topk_length,
+            indexer_topk=0,
+        )
+        topk_idxs.clamp_min_(0)
+        if q_padding_mask is not None:
+            # Keep padded sink-only rows out of cuDNN DSA's zero-tile path.
+            # Backward masks their dO and LSE before using this placeholder.
+            topk_length.masked_fill_(q_padding_mask, 1)
+
+        bwd_loss_coeff = loss_coeff * total_q / loss_divisor
+        unit_grad_loss = torch.ones((), device=query.device, dtype=torch.float32)
+
+        if sparse_loss:
+            indexer_topk_idxs_for_loss = indexer_topk_idxs
+            if q_padding_mask is not None:
+                indexer_topk_idxs_for_loss = indexer_topk_idxs.masked_fill(
+                    q_padding_mask.unsqueeze(-1), -1
+                )
+            if compact_predict is not None:
+                predict = compact_predict
+                if q_padding_mask is not None:
+                    predict = predict.masked_fill(q_padding_mask.unsqueeze(-1), 0)
+            else:
+                weights_scaled = weights
+                if indexer_softmax_scale != 1.0:
+                    weights_scaled = (weights.float() * indexer_softmax_scale).to(weights.dtype)
+                q_bshd, k_bsd, w_bsh, topk_bst = _thd_to_fake_bshd(
+                    q_indexer, k_indexer, weights_scaled, indexer_topk_idxs_for_loss
+                )
+                predict = _DSA.sparse_indexer_score_recompute_wrapper(
+                    q_bshd,
+                    k_bsd,
+                    w_bsh,
+                    topk_bst,
+                    qhead_per_kv_head=idx_nh,
+                    topk_indices_global=True,
+                )["predict"].squeeze(0)
+            target = _compute_attn_target(
+                query.detach(),
+                compressed_kv.detach(),
+                torch.logaddexp(lse.detach().float(), attn_sink.detach().float().view(1, np_)),
+                indexer_topk_idxs_for_loss,
+                softmax_scale,
+                qhead_per_kv_head=np_,
+                topk_indices_global=True,
+            )
+            indexer_loss = _kl_loss_from_target_predict(
+                target,
+                predict,
+                indexer_topk_idxs_for_loss,
+                loss_coeff,
+                calculate_per_token_loss=True,
+                loss_divisor=loss_divisor,
+            )
+            if loss_coeff > 0:
+                ig = _DSA.indexer_backward_wrapper(
+                    q_indexer.view(1, total_q, idx_nh, idx_hd),
+                    weights.view(1, total_q, idx_nh),
+                    k_indexer.view(1, total_comp, idx_hd),
+                    target.view(1, total_q, indexer_topk),
+                    predict.view(1, total_q, indexer_topk),
+                    indexer_topk_idxs_for_loss.view(1, total_q, indexer_topk),
+                    sm_scale=indexer_softmax_scale,
+                    loss_coeff=bwd_loss_coeff,
+                    grad_loss=unit_grad_loss,
+                    block_I=128,
+                )
+        else:
+            cu_seqlens_q, cu_seqlens_k, q_causal_offsets = indexer_layout
+            max_seqlen_k = max_seqlen_q // ratio
+            index_score, index_lse = _compute_dense_indexer_score(
+                q_indexer,
+                k_indexer.unsqueeze(1),
+                weights,
+                qhead_per_kv_head=idx_nh,
+                indexer_softmax_scale=indexer_softmax_scale,
+                ratio=ratio,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_kv=cu_seqlens_k,
+                max_seqlen_q=max_seqlen_q,
+                max_seqlen_kv=max_seqlen_k,
+                q_causal_offsets=q_causal_offsets,
+            )
+            if q_padding_mask is not None:
+                index_score = index_score.masked_fill(q_padding_mask.unsqueeze(-1), float("-inf"))
+                index_lse = index_lse.masked_fill(q_padding_mask, float("-inf"))
+            dense_teacher_lse = _compute_full_csa_teacher_lse(
+                query.detach(),
+                query,
+                kv_full,
+                compressed_kv.detach(),
+                attn_sink,
+                window_topk_idxs,
+                softmax_scale,
+                ratio,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_kv=cu_seqlens_k,
+                max_seqlen_q=max_seqlen_q,
+                max_seqlen_kv=max_seqlen_k,
+                q_causal_offsets=q_causal_offsets,
+            )
+            attn_score, attn_l1norm = _compute_dense_attn_score(
+                query.detach(),
+                compressed_kv.detach().unsqueeze(1),
+                dense_teacher_lse,
+                qhead_per_kv_head=np_,
+                softmax_scale=softmax_scale,
+                ratio=ratio,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_kv=cu_seqlens_k,
+                max_seqlen_q=max_seqlen_q,
+                max_seqlen_kv=max_seqlen_k,
+                q_causal_offsets=q_causal_offsets,
+            )
+            if q_padding_mask is not None:
+                attn_score = attn_score.masked_fill(q_padding_mask.unsqueeze(-1), 0)
+                attn_l1norm = attn_l1norm.masked_fill(q_padding_mask, 0)
+            raw_local_loss = _kl_loss_from_dense_scores(
+                attn_score,
+                attn_l1norm,
+                index_score,
+                index_lse,
+                loss_coeff,
+                calculate_per_token_loss=True,
+            )
+            indexer_loss = raw_local_loss / loss_divisor
+
+            if loss_coeff > 0:
+                index_score_for_bwd = index_score.clone()
+                index_lse_for_bwd = index_lse
+                if q_padding_mask is not None:
+                    index_score_for_bwd[q_padding_mask] = 0
+                    index_lse_for_bwd = index_lse.masked_fill(q_padding_mask, 0)
+                ig = _DSA.dense_indexer_backward_wrapper(
+                    q_indexer,
+                    weights,
+                    k_indexer,
+                    attn_score,
+                    attn_l1norm,
+                    index_score_for_bwd,
+                    index_lse_for_bwd,
+                    sm_scale=indexer_softmax_scale,
+                    loss_coeff=bwd_loss_coeff,
+                    grad_loss=unit_grad_loss,
+                    block_I=128,
+                    ratio=ratio,
+                    cu_seqlens_q=cu_seqlens_q,
+                    cu_seqlens_k=cu_seqlens_k,
+                    max_seqlen_q=max_seqlen_q,
+                    max_seqlen_k=max_seqlen_k,
+                    q_causal_offsets=q_causal_offsets,
+                )
+        if loss_coeff > 0:
+            saved_grad_q_indexer = ig["d_index_q"].view(total_q, idx_nh, idx_hd)
+            saved_grad_k_indexer = ig["d_index_k"].view(total_comp, idx_hd)
+            saved_grad_weights = ig["d_weights"].view(total_q, idx_nh)
+            if q_padding_mask is not None:
+                saved_grad_q_indexer[q_padding_mask] = 0
+                saved_grad_weights[q_padding_mask] = 0
+        else:
+            saved_grad_q_indexer = torch.zeros_like(q_indexer)
+            saved_grad_k_indexer = torch.zeros_like(k_indexer)
+            saved_grad_weights = torch.zeros_like(weights)
+
+        if cp_group is not None:
+            if local_k_indexer is None or local_compressed_kv is None:
+                raise RuntimeError("CP backward overlap requires both local compressed tensors.")
+            ctx.local_k_indexer_rows = local_k_indexer.shape[0]
+            ctx.local_compressed_kv_rows = local_compressed_kv.shape[0]
+        if indexer_rank_map is None:
+            indexer_rank_map = torch.empty(0, dtype=torch.int32, device=query.device)
+
+        ctx.cp_group = cp_group
+        ctx.compressed_kv_start = int(compressed_kv_start)
+        ctx.indexer_k_reduce_scatter_state = indexer_k_reduce_scatter_state
+        ctx.compressed_kv_reduce_scatter_state = compressed_kv_reduce_scatter_state
+        ctx.indexer_grad_is_sequence_major = cp_group is not None and not sparse_loss
+        ctx.num_forward_inputs = len(ctx.needs_input_grad)
+        ctx.reconstruct_kv_for_backward = kv_reconstruction_parts is not None
+        if ctx.reconstruct_kv_for_backward:
+            _validate_kv_reconstruction_parts(kv_full, kv_reconstruction_parts)
+            ctx.save_for_backward(
+                query,
+                *kv_reconstruction_parts,
+                attn_sink,
+                topk_idxs,
+                topk_length,
+                out_flat,
+                lse,
+                saved_grad_q_indexer,
+                saved_grad_k_indexer,
+                saved_grad_weights,
+                indexer_rank_map,
+            )
+        else:
+            ctx.save_for_backward(
+                query,
+                kv_full,
+                attn_sink,
+                topk_idxs,
+                topk_length,
+                out_flat,
+                lse,
+                saved_grad_q_indexer,
+                saved_grad_k_indexer,
+                saved_grad_weights,
+                indexer_rank_map,
+            )
+        ctx.softmax_scale = softmax_scale
+        ctx.q_padding_mask = q_padding_mask
+
+        return out_flat.reshape(total_q, np_ * out_flat.shape[-1]), indexer_loss
+
+    @staticmethod
+    def backward(ctx, grad_output, grad_loss):
+        """Run sparse-attention and indexer-loss backward kernels."""
+        _ensure_dsa_namespace()
+        if getattr(ctx, "reconstruct_kv_for_backward", False):
+            (
+                query,
+                boundary_kv,
+                local_kv,
+                compressed_kv,
+                attn_sink,
+                topk_idxs,
+                topk_length,
+                out_flat,
+                lse,
+                saved_grad_q_indexer,
+                saved_grad_k_indexer,
+                saved_grad_weights,
+                indexer_rank_map,
+            ) = ctx.saved_tensors
+            kv_full = torch.cat((boundary_kv, local_kv, compressed_kv), dim=0)
+        else:
+            (
+                query,
+                kv_full,
+                attn_sink,
+                topk_idxs,
+                topk_length,
+                out_flat,
+                lse,
+                saved_grad_q_indexer,
+                saved_grad_k_indexer,
+                saved_grad_weights,
+                indexer_rank_map,
+            ) = ctx.saved_tensors
+
+        cp_group = ctx.cp_group
+        grad_k_indexer = saved_grad_k_indexer * grad_loss
+        grad_k_indexer_rank_major = None
+        if cp_group is not None:
+            if ctx.indexer_grad_is_sequence_major:
+                global_rows = ctx.local_k_indexer_rows * cp_group.size()
+                grad_k_indexer_rank_major = grad_k_indexer.new_zeros(
+                    (global_rows, *grad_k_indexer.shape[1:])
+                )
+                valid_rows = indexer_rank_map >= 0
+                rank_rows = indexer_rank_map.clamp_min(0).long()
+                mask_shape = (valid_rows.shape[0],) + (1,) * (grad_k_indexer.ndim - 1)
+                grad_k_indexer_rank_major.index_add_(
+                    0, rank_rows, grad_k_indexer * valid_rows.view(mask_shape)
+                )
+            else:
+                grad_k_indexer_rank_major = grad_k_indexer
+
+        dO_flat = grad_output.reshape(query.shape[0], query.shape[1], out_flat.shape[-1])
+        if ctx.q_padding_mask is not None:
+            dO_flat = dO_flat.masked_fill(ctx.q_padding_mask[:, None, None], 0)
+            lse = lse.masked_fill(ctx.q_padding_mask[:, None], 0)
+        nvtx_range_push("dsv4_cp_sparse_attention_backward")
+        attn_bwd = _DSA.sparse_attention_backward_wrapper(
+            query,
+            kv_full,
+            out_flat,
+            dO_flat,
+            lse,
+            attn_sink,
+            topk_idxs,
+            softmax_scale=ctx.softmax_scale,
+            topk_length=topk_length,
+        )
+        nvtx_range_pop("dsv4_cp_sparse_attention_backward")
+
+        grad_local_k_indexer = None
+        grad_local_compressed_kv = None
+        if cp_group is not None:
+            expected_indexer_rows = ctx.local_k_indexer_rows * cp_group.size()
+            if grad_k_indexer_rank_major.shape[0] != expected_indexer_rows:
+                raise RuntimeError(
+                    "Indexer-K gradient has an unexpected CP-global shape: "
+                    f"got {grad_k_indexer_rank_major.shape[0]} rows, "
+                    f"expected {expected_indexer_rows}."
+                )
+            grad_compressed_kv = attn_bwd["dkv"][ctx.compressed_kv_start :]
+            expected_rows = ctx.local_compressed_kv_rows * cp_group.size()
+            if grad_compressed_kv.shape[0] != expected_rows:
+                raise RuntimeError(
+                    "Compressed-KV gradient has an unexpected CP-global shape: "
+                    f"got {grad_compressed_kv.shape[0]} rows, expected {expected_rows}."
+                )
+            nvtx_range_push("dsv4_cp_attention_kv_reduce_scatter_launch")
+            compressed_kv_reduce_scatter = async_reduce_scatter_along_first_dim(
+                grad_compressed_kv, group=cp_group
+            )
+            nvtx_range_pop("dsv4_cp_attention_kv_reduce_scatter_launch")
+
+            # Both reductions launch after the main sparse-attention backward,
+            # avoiding its SM/L2 contention. Compressed-KV goes first because
+            # its consumer branch is newer in autograd and runs first; Indexer-K
+            # can then remain in flight during the attention compressor backward.
+            nvtx_range_push("dsv4_cp_indexer_k_reduce_scatter_launch")
+            indexer_reduce_scatter = async_reduce_scatter_along_first_dim(
+                grad_k_indexer_rank_major, group=cp_group
+            )
+            nvtx_range_pop("dsv4_cp_indexer_k_reduce_scatter_launch")
+
+            if ctx.indexer_k_reduce_scatter_state is not None:
+                ctx.indexer_k_reduce_scatter_state.handle = indexer_reduce_scatter
+                grad_local_k_indexer = indexer_reduce_scatter.tensor
+            if ctx.compressed_kv_reduce_scatter_state is not None:
+                ctx.compressed_kv_reduce_scatter_state.handle = compressed_kv_reduce_scatter
+                grad_local_compressed_kv = compressed_kv_reduce_scatter.tensor
+
+        # These local branches do not consume either reduce-scatter result.
+        # Queue them before either branch-local consumer wait. K stays in the
+        # earlier scaling launch so its reduce-scatter is not delayed.
+        nvtx_range_push("dsv4_cp_local_indexer_grads")
+        grad_q_indexer, grad_weights = _scale_indexer_grads(
+            grad_loss, saved_grad_q_indexer, saved_grad_weights
+        )
+        nvtx_range_pop("dsv4_cp_local_indexer_grads")
+
+        if cp_group is not None:
+            if ctx.indexer_k_reduce_scatter_state is None:
+                grad_local_k_indexer = indexer_reduce_scatter.wait()
+            if ctx.compressed_kv_reduce_scatter_state is None:
+                grad_local_compressed_kv = compressed_kv_reduce_scatter.wait()
+            grad_k_indexer = None
+
+        gradients = (
+            attn_bwd["dq"],
+            attn_bwd["dkv"],
+            attn_bwd["d_sink"],
+            None,
+            grad_q_indexer,
+            grad_k_indexer,
+            grad_weights,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            grad_local_k_indexer,
+            grad_local_compressed_kv,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        # Older call sites omit the optional CP-overlap inputs. PyTorch expects
+        # exactly one backward result for every argument passed to ``apply``.
+        return gradients[: ctx.num_forward_inputs]
+
+
+def fused_csa_indexer_sparse_attn(
+    query: Tensor,
+    kv_full: Tensor,
+    attn_sink: Tensor,
+    window_idxs: Tensor | None,
+    q_indexer: Tensor,
+    k_indexer: Tensor,
+    weights: Tensor,
+    indexer_topk: int,
+    ratio: int,
+    softmax_scale: float,
+    indexer_softmax_scale: float = 1.0,
+    loss_coeff: float = 0.0,
+    sparse_loss: bool = False,
+    kv_offset: int = 0,
+    calculate_per_token_loss: bool = False,
+    *,
+    cu_seqlens_q: Optional[Tensor] = None,
+    cu_seqlens_kv: Optional[Tensor] = None,
+    cu_seqlens_kv_full: Optional[Tensor] = None,
+    cu_seqlens_compressed_idx: Optional[Tensor] = None,
+    max_seqlen_q: Optional[int] = None,
+    max_seqlen_compressed_idx: Optional[int] = None,
+    compressed_kv: Optional[Tensor] = None,
+    cu_seqlens_q_unpadded: Optional[Tensor] = None,
+    compact_workspace: BSHDCompactIndexerWorkspace | THDCompactIndexerWorkspace | None = None,
+    indexer_precision: str = "bf16",
+    deterministic: bool = False,
+    thd_window_size: int | None = None,
+    thd_compressed_is_sequence_major: bool = False,
+) -> Tuple[Tensor, Tensor]:
+    """Path B (training): fused indexer (+KL loss) + sparse attention.
+
+    Layout is selected by ``cu_seqlens_q``:
+
+    * **SBHD** (``cu_seqlens_q is None``, default): inputs carry an
+      explicit batch axis; the THD kwargs are ignored.
+    * **THD packed** (``cu_seqlens_q`` supplied): packed-sequence metadata
+      must be supplied as described below. Both ``sparse_loss=True`` and
+      ``sparse_loss=False`` are supported. Raw sequence-major THD lowers top-k
+      directly to physical compressed rows; the legacy per-segment layout
+      retains the eager globalization fallback.
+
+    See :class:`FusedCSAIndexerSparseAttnFunc` for the detailed data flow.
+
+    SBHD args:
+        query:        ``(sq, b, np, d)`` bf16 SBHD — attention query.
+        kv_full:      ``(skv, b, d)`` bf16 SBD — original + compressed KV.
+        window_idxs:  ``(b, sq, win_topk)`` int32 — local window indices.
+        q_indexer:    ``(sq, b, idx_nh, idx_hd)`` bf16 — indexer query.
+        k_indexer:    ``(n_comp, b, idx_hd)`` bf16 — indexer key (compressed).
+        weights:      ``(sq, b, idx_nh)`` bf16 — raw indexer weights.
+        kv_offset:    start of compressed region within ``kv_full`` (== sq).
+
+    SBHD return: ``output (sq, b, np * d_v)`` + scalar ``indexer_loss``.
+
+    THD args (when ``cu_seqlens_q is not None``):
+        query:        ``(total_q, np, d)`` bf16 — flat-packed Q.
+        kv_full:      ``(total_kv_full, d)`` bf16 — either the legacy
+                      per-segment layout or raw ``[all kv, all compressed_kv]``
+                      when ``thd_compressed_is_sequence_major=True``.
+        window_idxs:  ``(total_q, win_topk)`` local window indices for the
+                      legacy layout; pass ``None`` for raw sequence-major THD.
+        q_indexer:    ``(total_q, idx_nh, idx_hd)`` bf16.
+        k_indexer:    ``(total_comp_idx, idx_hd)`` bf16 — compressed-only K
+                      (== Compressor's output, packed flat).
+        weights:      ``(total_q, idx_nh)`` bf16 — raw.
+        kv_offset:    ignored.
+        cu_seqlens_q:               ``(B+1,)`` int32 CUDA.
+        cu_seqlens_kv:              ``(B+1,)`` int32 — original-KV cu_seqlens.
+        cu_seqlens_kv_full:         ``(B+1,)`` int32 — required only by the
+                                    legacy layout and built by
+                                    :func:`csa.build_cu_seqlens_kv_full`.
+        cu_seqlens_compressed_idx:  ``(B+1,)`` int32 — Compressor's
+                                    second return value.
+        max_seqlen_q / max_seqlen_compressed_idx:
+                                    per-batch maxima for tile sizing.
+
+    THD return: ``output (total_q, np * d_v)`` + scalar ``indexer_loss``.
+
+    Common args:
+        attn_sink:    ``(np,)`` f32 — learnable sink per head.
+        indexer_topk: number of top-K compressed positions to select.
+        ratio:        compression ratio used for the causal mask.
+        softmax_scale: attention ``Q @ K^T`` scale, typically
+            ``1/sqrt(v_head_dim)``.
+        indexer_softmax_scale: indexer ``Q @ K^T`` scale, typically
+            ``1/sqrt(idx_hd)``. Applied internally — caller passes raw
+            (unscaled) ``weights``.
+        loss_coeff:   coefficient scaling the KL divergence loss.
+        sparse_loss:  if ``True``, KL is computed only over the top-K
+            positions (cheap); if ``False`` (the default,
+            matches ``transformer_config.dsa_indexer_use_sparse_loss``),
+            KL is computed over the full causally-valid KV. See
+            :class:`FusedCSAIndexerSparseAttnFunc` for the full data flow.
+        compressed_kv: THD only (required) — ``(total_compressed_kv, d)``
+            bf16, the sequence-major compressed KV from the Compressor. Used
+            directly by the loss path and as the appended region of raw THD KV.
+        calculate_per_token_loss: if True, report raw local KL sum and
+            compensate the cuDNN backward wrappers' local averaging.
+        cu_seqlens_q_unpadded: THD only (optional) — ``(B+1,)`` int32,
+            the *unpadded* cumulative Q sequence lengths.  When CUDA-graph
+            padding makes ``cu_seqlens_q`` cover all ``total_q`` rows
+            (including padding), this tensor supplies the true boundaries
+            so padding rows are excluded from the indexer KL loss and backward
+            gradients, and receive the non-empty placeholder required by
+            sparse-attention backward. Ignored when ``None`` or when it equals
+            ``cu_seqlens_q``.
+        compact_workspace: optional caller-owned persistent BSHD or THD sizing
+            metadata and MXFP8 storage. A matching workspace is required during
+            compact CUDA-graph capture; prepare it outside capture with the
+            matching ``prepare_*_compact_indexer_workspace`` helper.
+        deterministic: resolve exact-value compact Top-K ties toward the
+            smallest local KV indices. This is normally sourced from
+            ``TransformerConfig.deterministic_mode``.
+        thd_window_size: THD raw-layout sliding-window width. Required when
+            ``thd_compressed_is_sequence_major=True``.
+        thd_compressed_is_sequence_major: lower logical compressed ids directly
+            into the appended sequence-major compressed buffer.
+    """
+    if indexer_precision == "mxfp8" and not sparse_loss and loss_coeff > 0:
+        raise ValueError("MXFP8 indexer loss supports only sparse indexer loss")
+
+    if cu_seqlens_q is not None:
+        missing = [
+            name
+            for name, val in (
+                ("cu_seqlens_kv", cu_seqlens_kv),
+                ("cu_seqlens_compressed_idx", cu_seqlens_compressed_idx),
+                ("max_seqlen_q", max_seqlen_q),
+                ("max_seqlen_compressed_idx", max_seqlen_compressed_idx),
+                ("compressed_kv", compressed_kv),
+            )
+            if val is None
+        ]
+        if not thd_compressed_is_sequence_major and cu_seqlens_kv_full is None:
+            missing.append("cu_seqlens_kv_full")
+        if thd_compressed_is_sequence_major and thd_window_size is None:
+            missing.append("thd_window_size")
+        if missing:
+            raise ValueError(
+                f"fused_csa_indexer_sparse_attn THD mode requires {missing} " "to all be supplied."
+            )
+    return FusedCSAIndexerSparseAttnFunc.apply(
+        query,
+        kv_full,
+        attn_sink,
+        window_idxs,
+        q_indexer,
+        k_indexer,
+        weights,
+        indexer_topk,
+        ratio,
+        softmax_scale,
+        indexer_softmax_scale,
+        loss_coeff,
+        sparse_loss,
+        kv_offset,
+        calculate_per_token_loss,
+        cu_seqlens_q,
+        cu_seqlens_kv,
+        cu_seqlens_kv_full,
+        cu_seqlens_compressed_idx,
+        max_seqlen_q,
+        max_seqlen_compressed_idx,
+        compressed_kv,
+        cu_seqlens_q_unpadded,
+        compact_workspace,
+        indexer_precision,
+        deterministic,
+        thd_window_size,
+        thd_compressed_is_sequence_major,
+    )
+
+
+__all__ = [
+    "BSHDCompactIndexerWorkspace",
+    "THDCompactIndexerWorkspace",
+    "batch_of_row",
+    "build_thd_compact_k_layout",
+    "build_flat_topk_idxs",
+    "local_to_global_flat",
+    "csa_sparse_attn",
+    "get_flash_mla_topk_alignment",
+    "indexer_topk",
+    "fused_csa_indexer_sparse_attn",
+    "prepare_bshd_compact_indexer_workspace",
+    "prepare_thd_compact_indexer_workspace",
+    "pack_thd_compact_k",
+]

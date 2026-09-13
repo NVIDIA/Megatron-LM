@@ -7,6 +7,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from megatron.core.activations import situlu
 from megatron.core.extensions.transformer_engine import (
     HAVE_TE,
     TEFusedMLP,
@@ -74,13 +75,18 @@ def _patch_fake_te_ops(monkeypatch):
         def __init__(self, **kwargs):
             self.kwargs = kwargs
 
+    class FakeScaledSiTUGLU(FakeScaledSwiGLU):
+        pass
+
     fake_ops = SimpleNamespace(
         Sequential=FakeSequential,
         LayerNorm=FakeNorm,
         RMSNorm=FakeNorm,
         GroupedLinear=FakeGroupedLinear,
         ScaledSwiGLU=FakeScaledSwiGLU,
+        ScaledSiTUGLU=FakeScaledSiTUGLU,
     )
+    monkeypatch.setattr(te_ext, "HAVE_TE", True)
     monkeypatch.setattr(te_ext.te.pytorch, "LayerNormLinear", FakeLayerNormLinear, raising=False)
     monkeypatch.setattr(te_ext.te.pytorch, "Linear", FakeLinear, raising=False)
     monkeypatch.setattr(te_ext.te.pytorch, "ops", fake_ops, raising=False)
@@ -95,11 +101,20 @@ def _patch_fake_te_ops(monkeypatch):
         Linear=FakeLinear,
         GroupedLinear=FakeGroupedLinear,
         ScaledSwiGLU=FakeScaledSwiGLU,
+        ScaledSiTUGLU=FakeScaledSiTUGLU,
     )
 
 
-def _make_fake_grouped_mlp(fake_te, normalization="LayerNorm"):
+def _make_fake_grouped_mlp(fake_te, normalization="LayerNorm", activation_func=F.silu):
     module = TEFusedMLPWithGroupedLinear.__new__(TEFusedMLPWithGroupedLinear)
+    module.config = SimpleNamespace(
+        activation_func=activation_func,
+        activation_func_clamp_value=None,
+        gated_linear_unit=True,
+        situ_glu_beta1=4.0,
+        situ_glu_beta2=25.0,
+        use_fused_weighted_squared_relu=False,
+    )
 
     fc1 = fake_te.LayerNormLinear()
     fc1.normalization = normalization
@@ -147,8 +162,8 @@ class TestTEFusedMLPWithGroupedLinearControlFlow:
         ("config_overrides", "match"),
         [
             ({"add_bias_linear": True}, "add_bias_linear"),
-            ({"activation_func": F.gelu}, "SwiGLU activation"),
-            ({"gated_linear_unit": False}, "SwiGLU activation"),
+            ({"activation_func": F.gelu}, "SwiGLU or SiTU-GLU activation"),
+            ({"gated_linear_unit": False}, "SwiGLU or SiTU-GLU activation"),
         ],
     )
     def test_init_validates_supported_dense_swiglu_config(
@@ -207,6 +222,15 @@ class TestTEFusedMLPWithGroupedLinearControlFlow:
         assert fc2_op.kwargs["out_features"] == 4
         assert fc2_op.kwargs["accumulate_into_main_grad"] is False
         assert fc2_op.weight0 is module.linear_fc2.weight
+
+    def test_make_fused_impl_selects_scaled_situ_glu(self, monkeypatch):
+        fake_te = _patch_fake_te_ops(monkeypatch)
+        module = _make_fake_grouped_mlp(fake_te, activation_func=situlu)
+
+        fused_impl = TEFusedMLPWithGroupedLinear._make_fused_impl(module)
+
+        assert isinstance(fused_impl[1], fake_te.ScaledSiTUGLU)
+        assert fused_impl[1].kwargs == {"glu_interleave_size": 32, "beta1": 4.0, "beta2": 25.0}
 
     @pytest.mark.parametrize(("bad_attr", "match"), [("linear_fc1", "FC1"), ("linear_fc2", "FC2")])
     def test_make_fused_impl_validates_te_linear_types(self, monkeypatch, bad_attr, match):
@@ -333,12 +357,12 @@ class TestTEFusedMLPWithGroupedLinearSpec:
 
     def test_wrong_activation_raises(self):
         config = _make_config(activation_func=F.gelu, gated_linear_unit=False)
-        with pytest.raises(ValueError, match="SwiGLU activation"):
+        with pytest.raises(ValueError, match="SwiGLU or SiTU-GLU activation"):
             TEFusedMLPWithGroupedLinear(config, _make_submodules())
 
     def test_gated_linear_unit_false_raises(self):
         config = _make_config(gated_linear_unit=False)
-        with pytest.raises(ValueError, match="SwiGLU activation"):
+        with pytest.raises(ValueError, match="SwiGLU or SiTU-GLU activation"):
             TEFusedMLPWithGroupedLinear(config, _make_submodules())
 
     def test_add_bias_linear_raises(self):

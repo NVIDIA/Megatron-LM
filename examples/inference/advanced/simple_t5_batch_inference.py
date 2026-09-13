@@ -4,9 +4,10 @@ import os
 import sys
 from argparse import Namespace
 
-import torch
-
 import pretrain_t5
+import torch
+from pretrain_t5 import model_provider
+
 from megatron.core.inference.engines import AbstractEngine, StaticInferenceEngine
 from megatron.core.inference.inference_request import InferenceRequest
 from megatron.core.inference.model_inference_wrappers.inference_wrapper_config import (
@@ -21,7 +22,6 @@ from megatron.core.inference.text_generation_controllers.encoder_decoder_text_ge
 )
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.core.transformer.module import MegatronModule
-from pretrain_t5 import model_provider
 
 sys.path.append(
     os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir, os.path.pardir))

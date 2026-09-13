@@ -370,8 +370,11 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         if not self.param_update_in_fp32:
             return
         for param, v in self.state.items():
-            fp32_param = self.param_to_fp32_param[param]
-            fp32_param.data.copy_(v["master_param"])
+            # Native FP32 params do not need a separate master parameter and are
+            # intentionally absent from param_to_fp32_param.
+            fp32_param = self.param_to_fp32_param.get(param)
+            if fp32_param is not None:
+                fp32_param.data.copy_(v["master_param"])
 
     def update_fp32_param_by_new_param(self):
         """

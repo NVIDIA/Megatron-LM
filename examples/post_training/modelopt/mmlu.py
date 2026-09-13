@@ -64,9 +64,7 @@ def add_mmlu_args(parser):
     # Kept for backward compatibility with prior MLM_EXTRA_ARGS callers. Has no effect:
     # `megatron_mmlu` already disables its progress bar on non-master ranks.
     group.add_argument("--disable-tqdm", action="store_true", help=argparse.SUPPRESS)
-    group.add_argument(
-        "--mmlu-dataset", type=str, default="cais/mmlu", help=argparse.SUPPRESS
-    )
+    group.add_argument("--mmlu-dataset", type=str, default="cais/mmlu", help=argparse.SUPPRESS)
     add_modelopt_args(parser)
     return parser
 
@@ -99,8 +97,7 @@ if __name__ == "__main__":
         )
 
     model = get_model(
-        functools.partial(model_provider, modelopt_gpt_hybrid_builder),
-        wrap_with_ddp=False,
+        functools.partial(model_provider, modelopt_gpt_hybrid_builder), wrap_with_ddp=False
     )
     report_current_memory_info()
 
@@ -113,9 +110,7 @@ if __name__ == "__main__":
     tokenizer = get_hf_tokenizer()
 
     if args.load is not None:
-        load_modelopt_checkpoint(
-            model, strict=not args.untie_embeddings_and_output_weights
-        )
+        load_modelopt_checkpoint(model, strict=not args.untie_embeddings_and_output_weights)
         print_rank_0("Done loading checkpoint")
 
     # Fold the scalars into weight for speedup.
@@ -123,9 +118,7 @@ if __name__ == "__main__":
     # however, this is not the case when share_embeddings_and_output_weights is False.
     # [TODO]: fold_weight does not support TEGroupedMLP (QuantTEColumnParallelGroupedLinear)
     # which stores per-expert weights as weight0, weight1, etc. instead of a single weight.
-    has_grouped_mlp = any(
-        "TEGroupedMLP" in type(m).__name__ for m in unwrapped_model.modules()
-    )
+    has_grouped_mlp = any("TEGroupedMLP" in type(m).__name__ for m in unwrapped_model.modules())
     if (
         not getattr(unwrapped_model, "share_embeddings_and_output_weights", False)
         and not has_grouped_mlp
@@ -142,6 +135,6 @@ if __name__ == "__main__":
         )
 
     if torch.distributed.get_rank() == 0 and args.lower_bound is not None:
-        assert avg > args.lower_bound, (
-            f"MMLU accuracy {avg:.4f} below lower bound {args.lower_bound}"
-        )
+        assert (
+            avg > args.lower_bound
+        ), f"MMLU accuracy {avg:.4f} below lower bound {args.lower_bound}"

@@ -4,6 +4,7 @@
 
 
 import math
+
 from .utils import is_hybrid_model, print_rank_0
 
 NUM_BYTES_IN_MEGABYTE = 1024 * 1024
@@ -18,7 +19,7 @@ def compute_weight_and_optimizer_memory(args, verbose=False):
         args.num_query_groups = args.num_attention_heads
     # MoE.
     num_experts = 1 if args.num_experts is None else args.num_experts
-    gated_linear_multiplier = 3 / 2 if args.swiglu else 1
+    gated_linear_multiplier = 3 / 2 if (args.swiglu or getattr(args, "situ_glu", False)) else 1
 
     shared_expert_ffn_hidden_size = (
         0
@@ -62,19 +63,29 @@ def compute_weight_and_optimizer_memory(args, verbose=False):
     if args.multi_latent_attention:
         assert not args.group_query_attention
         if args.q_lora_rank is None:
-            q_term = args.hidden_size * args.num_attention_heads * (args.qk_head_dim + args.qk_pos_emb_head_dim)
+            q_term = (
+                args.hidden_size
+                * args.num_attention_heads
+                * (args.qk_head_dim + args.qk_pos_emb_head_dim)
+            )
         else:
             ## q lora + rope + q norm
-            q_term = args.q_lora_rank * (args.hidden_size + args.num_attention_heads * (args.qk_head_dim + args.qk_pos_emb_head_dim) + norm_size) 
-        
+            q_term = args.q_lora_rank * (
+                args.hidden_size
+                + args.num_attention_heads * (args.qk_head_dim + args.qk_pos_emb_head_dim)
+                + norm_size
+            )
+
         self_attn_term = (
             q_term
-
             ## kv lora + rope + kv norm
             + args.kv_lora_rank
-            * (args.hidden_size + args.num_attention_heads * (args.qk_head_dim + args.v_head_dim) + norm_size)
+            * (
+                args.hidden_size
+                + args.num_attention_heads * (args.qk_head_dim + args.v_head_dim)
+                + norm_size
+            )
             + args.hidden_size * args.qk_pos_emb_head_dim
-
             ## o proj
             + (args.num_attention_heads * args.v_head_dim) * args.hidden_size
         )
@@ -101,7 +112,9 @@ def compute_weight_and_optimizer_memory(args, verbose=False):
 
     attention_params = self_attn_term
     dense_mlp_params = 2 * args.hidden_size * args.ffn_hidden_size * gated_linear_multiplier
-    shared_expert_params = 2 * args.hidden_size * shared_expert_ffn_hidden_size * gated_linear_multiplier
+    shared_expert_params = (
+        2 * args.hidden_size * shared_expert_ffn_hidden_size * gated_linear_multiplier
+    )
     # Latent MoE projects tokens down before routed experts and projects them back after
     # combine. Shared experts still operate on the full hidden dimension.
     routed_expert_hidden_size = (
@@ -205,41 +218,27 @@ def compute_weight_and_optimizer_memory(args, verbose=False):
     expert_tensor_parallel_size = args.expert_tensor_parallel_size
     expert_model_parallel_size = args.expert_model_parallel_size
     expert_tensor_model_pipeline_parallel_size = (
-        expert_tensor_parallel_size
-        * expert_model_parallel_size
-        * args.pipeline_model_parallel_size
+        expert_tensor_parallel_size * expert_model_parallel_size * args.pipeline_model_parallel_size
     )
     expert_data_parallel_size = args.world_size // expert_tensor_model_pipeline_parallel_size
 
     # Split params by how they are held on each rank: regular TP, replicated, or EP/ETP.
     tp_sharded_params_in_transformer_block = (
-        (attention_params + dense_mlp_params) * num_dense_layers
-        + (attention_params + shared_expert_params) * num_moe_layers
-    )
+        attention_params + dense_mlp_params
+    ) * num_dense_layers + (attention_params + shared_expert_params) * num_moe_layers
     replicated_params_in_transformer_block = (
         layernorm_params * num_dense_layers
-        + (
-            layernorm_params
-            + latent_projection_params
-            + router_params
-            + shared_expert_gate_params
-        )
+        + (layernorm_params + latent_projection_params + router_params + shared_expert_gate_params)
         * num_moe_layers
         + final_layernorm
     )
     expert_sharded_params_in_transformer_block = routed_expert_params * num_moe_layers
     tp_sharded_params_in_mtp_block = (
-        (attention_params + dense_mlp_params) * mtp_num_dense_layers
-        + (attention_params + shared_expert_params) * mtp_num_moe_layers
-    )
+        attention_params + dense_mlp_params
+    ) * mtp_num_dense_layers + (attention_params + shared_expert_params) * mtp_num_moe_layers
     replicated_params_in_mtp_block = (
         layernorm_params * mtp_num_dense_layers
-        + (
-            layernorm_params
-            + latent_projection_params
-            + router_params
-            + shared_expert_gate_params
-        )
+        + (layernorm_params + latent_projection_params + router_params + shared_expert_gate_params)
         * mtp_num_moe_layers
     )
     expert_sharded_params_in_mtp_block = routed_expert_params * mtp_num_moe_layers
@@ -264,7 +263,9 @@ def compute_weight_and_optimizer_memory(args, verbose=False):
     )
     if args.untie_embeddings_and_output_weights and args.pipeline_model_parallel_size == 1:
         tp_sharded_params_on_most_loaded_shard += embedding_size / args.tensor_model_parallel_size
-        num_parameters_on_most_loaded_model_shard += embedding_size / args.tensor_model_parallel_size
+        num_parameters_on_most_loaded_model_shard += (
+            embedding_size / args.tensor_model_parallel_size
+        )
     if verbose:
         print(
             f"Number of parameters in most loaded shard in billions: "
@@ -296,10 +297,11 @@ def compute_weight_and_optimizer_memory(args, verbose=False):
         return 18 if not args.use_distributed_optimizer else 6 + (12 / data_parallel_size)
 
     weight_and_optimizer_memory = (
-        (tp_sharded_params_on_most_loaded_shard + replicated_params_on_most_loaded_shard)
-        * num_bytes_per_parameter(args.data_parallel_size)
-        + expert_sharded_params_on_most_loaded_shard
-        * num_bytes_per_parameter(expert_data_parallel_size)
+        tp_sharded_params_on_most_loaded_shard + replicated_params_on_most_loaded_shard
+    ) * num_bytes_per_parameter(
+        args.data_parallel_size
+    ) + expert_sharded_params_on_most_loaded_shard * num_bytes_per_parameter(
+        expert_data_parallel_size
     )
 
     return weight_and_optimizer_memory
@@ -383,7 +385,12 @@ def compute_activation_memory_without_sp(args, num_microbatches, verbose=False):
     """Compute activation memory without sequence parallelism"""
 
     # 4. Compute per-layer memory
-    per_layer_memory = args.seq_length * args.micro_batch_size * args.hidden_size * (10 + (24 / args.tensor_model_parallel_size))
+    per_layer_memory = (
+        args.seq_length
+        * args.micro_batch_size
+        * args.hidden_size
+        * (10 + (24 / args.tensor_model_parallel_size))
+    )
 
     if verbose:
         print(
@@ -455,7 +462,9 @@ def compute_activation_memory_without_sp(args, num_microbatches, verbose=False):
 
 def report_theoretical_memory(args, num_microbatches=None, verbose=False):
     if is_hybrid_model(args):
-        print("Theoretical memory footprints not yet supported for hybrid Mamba-Transformer models.")
+        print(
+            "Theoretical memory footprints not yet supported for hybrid Mamba-Transformer models."
+        )
         return
 
     weight_and_optimizer_memory = (
@@ -472,7 +481,9 @@ def report_theoretical_memory(args, num_microbatches=None, verbose=False):
     else:
         print_rank_0("compute_activation_memory_without_sp")
         activation_memory = (
-            compute_activation_memory_without_sp(args, num_microbatches=num_microbatches, verbose=verbose)
+            compute_activation_memory_without_sp(
+                args, num_microbatches=num_microbatches, verbose=verbose
+            )
             / NUM_BYTES_IN_MEGABYTE
         )
 

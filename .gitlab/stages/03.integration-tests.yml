@@ -56,7 +56,6 @@ integration:configure:
         "--no-enable-warmup"
         "--dependent-job integration:configure"
         "--enable-lightweight-mode"
-        "--enable-error-extraction"
       )
     - |
       export PYTHONPATH=$(pwd)

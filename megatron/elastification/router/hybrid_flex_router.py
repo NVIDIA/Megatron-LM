@@ -125,9 +125,7 @@ class FlextronRouter(MegatronModule):
         # must save/restore both - otherwise the CUDA RNG leaks the deterministic
         # state we set here into other CUDA random ops elsewhere in the model.
         cpu_state = torch.get_rng_state()
-        cuda_state = (
-            torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
-        )
+        cuda_state = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
         torch.manual_seed(seed)
 
         try:
@@ -557,8 +555,7 @@ class FlextronRouter(MegatronModule):
             # to the largest configured budget. Using max() instead of [0]
             # makes this independent of budget_list ordering.
             budget_tensor = torch.nn.functional.one_hot(
-                self.budget_map[max(self.budget_map.keys())],
-                len(self.config.budget_list),
+                self.budget_map[max(self.budget_map.keys())], len(self.config.budget_list)
             ).to(device=device, dtype=dtype)
         else:
             # budget_list is enforced descending by sort_budget_list_descending

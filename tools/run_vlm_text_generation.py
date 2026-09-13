@@ -188,9 +188,9 @@ class VLMForwardStep(ForwardStep):
         # Update the sequence length offset by the number of image tokens.
         num_tokens = tokens.size(1)
         if num_tokens > 1:
-            self.inference_context.sequence_len_offset += self.inference_context.key_value_memory_dict[
-                "image_tokens_count"
-            ]
+            self.inference_context.sequence_len_offset += (
+                self.inference_context.key_value_memory_dict["image_tokens_count"]
+            )
 
         return logits
 

@@ -1,4 +1,4 @@
-# Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 
 import gc
@@ -16,18 +16,70 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 )
 from megatron.core.tensor_parallel.random import (
     HAVE_TE,
+    MHCCheckpointManager,
     initialize_rng_tracker,
     model_parallel_cuda_manual_seed,
 )
 from megatron.core.transformer.cuda_graphs import CudaGraphManager, _CudagraphGlobalRecord
-from megatron.core.transformer.enums import InferenceCudaGraphScope
+from megatron.core.transformer.enums import AttnMaskType, CudaGraphModule, InferenceCudaGraphScope
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import (
+    HyperConnectionTransformerLayer,
     TransformerLayer,
     get_transformer_layer_offset,
 )
 from megatron.core.utils import is_te_min_version
 from tests.unit_tests.test_utilities import Utils
+
+
+def _make_mhc_config(hidden_size=64, num_streams=4, **extra):
+    """Build a TransformerConfig with common MHC defaults.
+
+    Any default can be overridden via **extra
+    (e.g. ``_make_mhc_config(num_layers=8, recompute_modules=["core_attn", "mhc"])``).
+    """
+    base = dict(
+        num_layers=2,
+        hidden_size=hidden_size,
+        num_attention_heads=4,
+        use_cpu_initialization=True,
+        enable_hyper_connections=True,
+        num_residual_streams=num_streams,
+        mhc_sinkhorn_iterations=5,
+        mhc_init_gating_factor=0.01,
+        hidden_dropout=0.0,
+        attention_dropout=0.0,
+    )
+    base.update(extra)
+    return TransformerConfig(**base)
+
+
+def _make_cuda_graph_gpt_block(**config_kwargs):
+    cfg = TransformerConfig(
+        num_layers=2,
+        hidden_size=64,
+        num_attention_heads=4,
+        use_cpu_initialization=True,
+        **config_kwargs,
+    )
+    from megatron.core.transformer.transformer_block import TransformerBlock
+
+    return TransformerBlock(cfg, get_gpt_layer_with_transformer_engine_spec())
+
+
+def _reset_cudagraph_state():
+    _CudagraphGlobalRecord.cudagraph_created = False
+    _CudagraphGlobalRecord.cudagraph_record = []
+    CudaGraphManager.global_mempool = None
+    torch.cuda.synchronize()
+
+
+def _all_layers_have_manager(block) -> bool:
+    return all(hasattr(layer, 'cudagraph_manager') for layer in block.layers)
+
+
+def _no_layers_have_manager(block) -> bool:
+    return all(not hasattr(layer, 'cudagraph_manager') for layer in block.layers)
 
 
 class TestParallelTransformerLayer:
@@ -49,9 +101,155 @@ class TestParallelTransformerLayer:
         parallel_transformer_layer = self.parallel_transformer_layer
         assert isinstance(parallel_transformer_layer, TransformerLayer)
         assert parallel_transformer_layer.layer_number == 1
+        # The TE dense spec fuses both norms into their following linears, leaving
+        # IdentityOp placeholders that must not be checkpointed independently.
+        assert not parallel_transformer_layer.mhc_checkpoint_input_layernorm
+        assert not parallel_transformer_layer.mhc_checkpoint_pre_mlp_layernorm
 
         num_weights = sum([p.numel() for p in parallel_transformer_layer.parameters()])
         assert num_weights == 1884
+
+    def test_offload_scope_in_cuda_graph_preserves_gpt_rules(self):
+        """The shared helper keeps the existing GPT attention/dense-MLP scope rules."""
+        layer = self.parallel_transformer_layer
+        layer.config.fine_grained_activation_offloading = True
+        layer.offload_qkv_linear = False
+        layer.offload_core_attn = True
+        layer.offload_attn_proj = False
+        layer.offload_mlp_norm = False
+        layer.is_moe_layer = False
+
+        layer.config.cuda_graph_modules = [CudaGraphModule.attn]
+        assert layer.offload_scope_in_cuda_graph()
+
+        layer.offload_core_attn = False
+        assert not layer.offload_scope_in_cuda_graph()
+
+        layer.config.cuda_graph_modules = [CudaGraphModule.mlp]
+        layer.offload_mlp_norm = True
+        assert layer.offload_scope_in_cuda_graph()
+
+        layer.is_moe_layer = True
+        assert not layer.offload_scope_in_cuda_graph()
+
+    def test_offload_scope_in_cuda_graph_can_require_concrete_branches(self):
+        """Hybrid split layers ignore configured scopes backed only by IdentityOp."""
+        from megatron.core.transformer.identity_op import IdentityOp
+
+        layer = self.parallel_transformer_layer
+        layer.config.fine_grained_activation_offloading = True
+        layer.config.cuda_graph_modules = [CudaGraphModule.attn, CudaGraphModule.mlp]
+        layer.offload_qkv_linear = False
+        layer.offload_core_attn = True
+        layer.offload_attn_proj = False
+        layer.offload_mlp_norm = True
+        layer.is_moe_layer = False
+        layer.self_attention = IdentityOp()
+        layer.cross_attention = IdentityOp()
+        layer.mlp = IdentityOp()
+
+        # The default intentionally preserves GPT's config-based rule.
+        assert layer.offload_scope_in_cuda_graph()
+        assert not layer.offload_scope_in_cuda_graph(require_concrete_modules=True)
+
+        layer.self_attention = torch.nn.Linear(2, 2)
+        assert layer.offload_scope_in_cuda_graph(require_concrete_modules=True)
+
+        layer.offload_core_attn = False
+        layer.mlp = torch.nn.Linear(2, 2)
+        assert layer.offload_scope_in_cuda_graph(require_concrete_modules=True)
+
+    def test_set_offload_modules_requires_concrete_attention_branch(self, monkeypatch):
+        """The stored capture flag must not survive on an attention-free split layer."""
+        import megatron.core.transformer.transformer_layer as transformer_layer_module
+        from megatron.core.transformer.identity_op import IdentityOp
+
+        layer = self.parallel_transformer_layer
+        layer.config.fine_grained_activation_offloading = True
+        layer.config.offload_modules = ['core_attn']
+        layer.config.cuda_graph_modules = [CudaGraphModule.attn]
+        layer.config.cuda_graph_warmup_steps = 1
+        layer.is_moe_layer = False
+        monkeypatch.setattr(transformer_layer_module, 'is_torch_min_version', lambda _version: True)
+        monkeypatch.setattr(transformer_layer_module, 'is_te_min_version', lambda _version: True)
+
+        # A normal GPT attention layer owns the configured core-attention boundary.
+        assert not isinstance(layer.self_attention, IdentityOp)
+        layer._set_offload_modules()
+        assert layer.offload_module_in_cuda_graph
+
+        # A split Hybrid MoE tail shares the config but has no attention body.
+        layer.self_attention = IdentityOp()
+        layer.cross_attention = IdentityOp()
+        layer._set_offload_modules()
+        assert not layer.offload_module_in_cuda_graph
+
+    def test_split_branch_norms_join_mhc_recompute_manager(self, monkeypatch):
+        """Explicit norms in split hybrid branches use the unified mHC manager."""
+        from contextlib import nullcontext
+
+        import megatron.core.transformer.transformer_layer as transformer_layer_module
+
+        def build_layernorm(config, hidden_size, eps):
+            del config
+            return torch.nn.LayerNorm(hidden_size, eps=eps)
+
+        submodules = transformer_layer_module.TransformerLayerSubmodules(
+            input_layernorm=build_layernorm, pre_mlp_layernorm=build_layernorm
+        )
+        layer = TransformerLayer(self.parallel_transformer_layer.config, submodules)
+        assert layer.mhc_checkpoint_input_layernorm
+        assert layer.mhc_checkpoint_pre_mlp_layernorm
+        assert not layer.recompute_input_layernorm
+        assert not layer.recompute_pre_mlp_layernorm
+        layer.off_interface = lambda _enabled, hidden_states, _name: nullcontext(hidden_states)
+
+        class IdentityBranch(torch.nn.Module):
+            def forward(self, hidden_states, **_kwargs):
+                return hidden_states, None
+
+        layer.self_attention = IdentityBranch()
+        layer.mlp = IdentityBranch()
+        layer.is_moe_layer = False
+
+        seen_managers = []
+        discarded_outputs = []
+
+        class RecordingCheckpoint:
+            def __init__(self, fp8=False, ckpt_manager=None):
+                del fp8
+                seen_managers.append(ckpt_manager)
+
+            def checkpoint(self, function, *args):
+                return function(*args)
+
+            def discard_output_and_register_recompute(self, hook_tensor):
+                discarded_outputs.append(hook_tensor)
+
+        monkeypatch.setattr(
+            transformer_layer_module.tensor_parallel, "CheckpointWithoutOutput", RecordingCheckpoint
+        )
+        monkeypatch.setattr(transformer_layer_module, "nvtx_range_push", lambda **_kwargs: None)
+        monkeypatch.setattr(transformer_layer_module, "nvtx_range_pop", lambda **_kwargs: None)
+
+        hidden_states = torch.randn(4, 2, layer.config.hidden_size)
+
+        layer._forward_self_attention_output_with_bias(hidden_states)
+        layer._forward_mlp_output_with_bias(hidden_states)
+        assert seen_managers == []
+
+        manager = MHCCheckpointManager()
+        attention_output, _, _ = layer._forward_self_attention_output_with_bias(
+            hidden_states, mhc_recompute_manager=manager
+        )
+        mlp_output, _ = layer._forward_mlp_output_with_bias(
+            hidden_states, mhc_recompute_manager=manager
+        )
+
+        assert seen_managers == [manager, manager]
+        assert len(discarded_outputs) == 1
+        assert discarded_outputs[0] is attention_output[0]
+        assert mlp_output[0].shape == hidden_states.shape
 
     def test_gpu_forward(self):
         parallel_transformer_layer = self.parallel_transformer_layer
@@ -72,6 +270,89 @@ class TestParallelTransformerLayer:
         assert hidden_states.shape[0] == sequence_length
         assert hidden_states.shape[1] == micro_batch_size
         assert hidden_states.shape[2] == config.hidden_size
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+    @pytest.mark.skipif(
+        not (HAVE_TE and is_te_min_version("1.10.0")),
+        reason="TE CUDA graph kwargs require TransformerEngine >= 1.10",
+    )
+    def test_te_cuda_graph_omits_absent_attention_mask(self):
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=12,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            cuda_graph_impl="transformer_engine",
+            cuda_graph_modules=[CudaGraphModule.attn],
+            create_attention_mask_in_dataloader=False,
+        )
+        layer = TransformerLayer(config, get_gpt_layer_with_transformer_engine_submodules())
+
+        static_inputs = layer.get_layer_static_inputs(seq_length=32, micro_batch_size=1)
+        assert "attention_mask" not in static_inputs
+
+        hidden_states = torch.ones((32, 1, config.hidden_size), device="cuda")
+        _, cudagraph_kwargs = layer._get_te_cuda_graph_replay_args(
+            hidden_states, attention_mask=None
+        )
+        assert "attention_mask" not in cudagraph_kwargs
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+    @pytest.mark.skipif(
+        not (HAVE_TE and is_te_min_version("1.10.0")),
+        reason="TE CUDA graph kwargs require TransformerEngine >= 1.10",
+    )
+    def test_te_cuda_graph_keeps_configured_attention_mask(self):
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=12,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            cuda_graph_impl="transformer_engine",
+            cuda_graph_modules=[CudaGraphModule.attn],
+            create_attention_mask_in_dataloader=True,
+        )
+        layer = TransformerLayer(config, get_gpt_layer_with_transformer_engine_submodules())
+
+        static_inputs = layer.get_layer_static_inputs(seq_length=32, micro_batch_size=1)
+        assert static_inputs["attention_mask"].shape == (1, 1, 32, 32)
+
+        hidden_states = torch.ones((32, 1, config.hidden_size), device="cuda")
+        _, cudagraph_kwargs = layer._get_te_cuda_graph_replay_args(
+            hidden_states, attention_mask=None
+        )
+        assert cudagraph_kwargs["attention_mask"].shape == (1, 1, 32, 32)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+    @pytest.mark.skipif(
+        not (HAVE_TE and is_te_min_version("1.10.0")),
+        reason="TE CUDA graph kwargs require TransformerEngine >= 1.10",
+    )
+    def test_te_cuda_graph_warns_when_omitting_padding_attention_mask(self, monkeypatch):
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=12,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            cuda_graph_impl="transformer_engine",
+            cuda_graph_modules=[CudaGraphModule.attn],
+            create_attention_mask_in_dataloader=False,
+        )
+        layer = TransformerLayer(config, get_gpt_layer_with_transformer_engine_submodules())
+        layer.self_attention.attn_mask_type = AttnMaskType.padding
+
+        warning_messages = []
+        monkeypatch.setattr(
+            "megatron.core.transformer.transformer_layer.log_single_rank",
+            lambda _logger, _level, message: warning_messages.append(message),
+        )
+
+        static_inputs = layer.get_layer_static_inputs(seq_length=32, micro_batch_size=1)
+
+        assert "attention_mask" not in static_inputs
+        assert any(
+            "attn_mask_type=padding may require an explicit mask" in msg for msg in warning_messages
+        )
 
     def test_chunked_mlp(self):
         with torch.no_grad():
@@ -350,32 +631,1051 @@ def get_tensor_shapes_for_tp(transformer_config, tp_size):
     }
 
 
-def _make_cuda_graph_gpt_block(**config_kwargs):
-    cfg = TransformerConfig(
-        num_layers=2,
-        hidden_size=64,
-        num_attention_heads=4,
-        use_cpu_initialization=True,
-        **config_kwargs,
+class TestTransformerLayerWithHyperConnectionRecompute:
+    """Test TransformerLayer with HyperConnection and MHC block recomputation."""
+
+    def setup_method(self, method):
+        Utils.initialize_model_parallel(1, 1)
+        model_parallel_cuda_manual_seed(123)
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    def _create_layer_with_hyper_connection(
+        self, hidden_size=64, num_streams=4, layer_number=1, **extra
+    ):
+        """Create a HyperConnectionTransformerLayer with hyper connection enabled."""
+        config = _make_mhc_config(
+            hidden_size=hidden_size,
+            num_streams=num_streams,
+            recompute_modules=["core_attn", "mhc"],
+            recompute_granularity='selective',
+            **extra,
+        )
+        layer_spec = get_gpt_layer_with_transformer_engine_spec(enable_hyper_connection=True)
+        layer = HyperConnectionTransformerLayer(
+            config, layer_spec.submodules, layer_number=layer_number
+        )
+        layer.cuda()
+        return layer, config
+
+    def test_forward_with_hyper_connection_recompute(self):
+        """
+        Test that TransformerLayer forward works correctly with HyperConnection
+        and MHC block recomputation enabled.
+        """
+        hidden_size = 64
+        num_streams = 4
+        seq_len = 8
+        batch_size = 2
+
+        layer, config = self._create_layer_with_hyper_connection(hidden_size, num_streams)
+        layer.train()  # Enable training mode for recomputation
+
+        # Input shape: [seq_len, batch_size, n * hidden_size] for hyper connections
+        n_channels = num_streams * hidden_size
+        hidden_states = torch.randn(
+            seq_len, batch_size, n_channels, device='cuda', requires_grad=True
+        )
+        attention_mask = torch.ones((1, 1, seq_len, seq_len), dtype=bool, device='cuda')
+
+        # Create manager for MHC block recomputation
+        manager = MHCCheckpointManager()
+
+        # Forward pass with recompute manager
+        manager.is_last_layer_in_recompute_block = True
+        output, context = layer(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            mhc_recompute_manager=manager,
+        )
+
+        # Verify output shape
+        assert output.shape == (
+            seq_len,
+            batch_size,
+            n_channels,
+        ), f"Expected output shape {(seq_len, batch_size, n_channels)}, got {output.shape}"
+
+        # Register unified recompute hook at block boundary.
+        manager.discard_all_outputs_and_register_unified_recompute(output)
+
+        # Backward pass should work without error
+        loss = output.sum()
+        loss.backward()
+
+        # Verify gradients exist
+        assert hidden_states.grad is not None, "Gradients should be computed for hidden_states"
+        assert hidden_states.grad.shape == hidden_states.shape
+
+    def test_intermediate_layer_with_recompute(self):
+        """
+        Test TransformerLayer as an intermediate layer (not last in block).
+        In this case, MLP BDA should also be checkpointed.
+        """
+        hidden_size = 64
+        num_streams = 4
+        seq_len = 8
+        batch_size = 2
+
+        layer, config = self._create_layer_with_hyper_connection(hidden_size, num_streams)
+        layer.train()
+
+        n_channels = num_streams * hidden_size
+        hidden_states = torch.randn(
+            seq_len, batch_size, n_channels, device='cuda', requires_grad=True
+        )
+        attention_mask = torch.ones((1, 1, seq_len, seq_len), dtype=bool, device='cuda')
+
+        manager = MHCCheckpointManager()
+
+        # Forward pass - NOT the last layer in block
+        manager.is_last_layer_in_recompute_block = False
+        output, context = layer(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            mhc_recompute_manager=manager,
+        )
+
+        # Verify output shape
+        assert output.shape == (seq_len, batch_size, n_channels)
+
+        # Backward pass should work
+        loss = output.sum()
+        # For intermediate layers, we need to pass output to next layer
+        # Here we just register the recompute hook on output for testing
+        manager.discard_all_outputs_and_register_unified_recompute(loss)
+
+        loss.backward()
+
+        assert hidden_states.grad is not None
+        assert hidden_states.grad.shape == hidden_states.shape
+
+    def test_multiple_layers_chain_with_recompute(self):
+        """
+        Test multiple TransformerLayers chained together with a single
+        MHCCheckpointManager, simulating TransformerBlock behavior.
+        """
+        hidden_size = 64
+        num_streams = 4
+        seq_len = 8
+        batch_size = 2
+        num_layers = 3
+
+        layers = [
+            self._create_layer_with_hyper_connection(
+                hidden_size, num_streams, layer_number=i + 1, num_layers=num_layers
+            )[0]
+            for i in range(num_layers)
+        ]
+
+        for layer in layers:
+            layer.train()
+
+        n_channels = num_streams * hidden_size
+        hidden_states = torch.randn(
+            seq_len, batch_size, n_channels, device='cuda', requires_grad=True
+        )
+        attention_mask = torch.ones((1, 1, seq_len, seq_len), dtype=bool, device='cuda')
+
+        # Single manager for all layers (like TransformerBlock)
+        manager = MHCCheckpointManager()
+
+        # Forward through all layers
+        h = hidden_states
+        for i, layer in enumerate(layers):
+            is_last = i == num_layers - 1
+            manager.is_last_layer_in_recompute_block = is_last
+            h, _ = layer(
+                hidden_states=h, attention_mask=attention_mask, mhc_recompute_manager=manager
+            )
+            if is_last:
+                manager.discard_all_outputs_and_register_unified_recompute(h)
+
+        # Backward pass
+        loss = h.sum()
+        loss.backward()
+
+        # Verify gradients
+        assert hidden_states.grad is not None
+        assert hidden_states.grad.shape == hidden_states.shape
+        # Check that gradient is non-trivial (not all zeros)
+        assert hidden_states.grad.abs().sum() > 0
+
+
+class TestMHCRecomputeMemorySaving:
+    """Verify that 'mhc' in recompute_modules actually reduces peak GPU memory."""
+
+    def setup_method(self, method):
+        Utils.initialize_model_parallel(1, 1)
+        model_parallel_cuda_manual_seed(123)
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    @staticmethod
+    def _run_forward_backward(
+        num_layers,
+        hidden_size,
+        num_streams,
+        seq_len,
+        batch_size,
+        use_recompute,
+        recompute_block_size=2,
+    ):
+        """Run a full forward + backward pass and return (peak memory, output grad).
+
+        When use_recompute=True, a new MHCCheckpointManager is created every
+        `recompute_block_size` layers, mirroring TransformerBlock's
+        _build_mhc_recompute_layer_plan logic.
+        """
+        config = _make_mhc_config(
+            hidden_size=hidden_size,
+            num_streams=num_streams,
+            num_layers=num_layers,
+            recompute_modules=["core_attn", "mhc"] if use_recompute else None,
+            recompute_granularity='selective' if use_recompute else None,
+        )
+        layer_spec = get_gpt_layer_with_transformer_engine_spec(enable_hyper_connection=True)
+        layers = [
+            HyperConnectionTransformerLayer(
+                config, layer_spec.submodules, layer_number=i + 1
+            ).cuda()
+            for i in range(num_layers)
+        ]
+        for layer in layers:
+            layer.train()
+
+        n_channels = num_streams * hidden_size
+        hidden_states = torch.randn(
+            seq_len, batch_size, n_channels, device='cuda', requires_grad=True
+        )
+        attention_mask = torch.ones((1, 1, seq_len, seq_len), dtype=bool, device='cuda')
+
+        torch.cuda.reset_peak_memory_stats()
+        torch.cuda.synchronize()
+
+        manager = MHCCheckpointManager() if use_recompute else None
+
+        h = hidden_states
+        for i, layer in enumerate(layers):
+            is_last_in_block = (i == num_layers - 1) or ((i + 1) % recompute_block_size == 0)
+            kwargs = dict(hidden_states=h, attention_mask=attention_mask)
+            if manager is not None:
+                manager.is_last_layer_in_recompute_block = is_last_in_block
+                kwargs['mhc_recompute_manager'] = manager
+            h, _ = layer(**kwargs)
+            if manager is not None and is_last_in_block:
+                manager.discard_all_outputs_and_register_unified_recompute(h)
+                if i < num_layers - 1:
+                    manager = MHCCheckpointManager()
+
+        loss = h.sum()
+        loss.backward()
+        torch.cuda.synchronize()
+
+        peak_mem = torch.cuda.max_memory_allocated()
+        grad = hidden_states.grad.clone()
+
+        del layers, hidden_states, h, loss, manager
+        torch.cuda.empty_cache()
+
+        return peak_mem, grad
+
+    def test_recompute_reduces_peak_memory(self):
+        """Peak memory with recompute (block_size=2) should be lower than without."""
+        num_layers = 8
+        hidden_size = 128
+        num_streams = 4
+        seq_len = 64
+        batch_size = 4
+
+        peak_no_recompute, _ = self._run_forward_backward(
+            num_layers, hidden_size, num_streams, seq_len, batch_size, use_recompute=False
+        )
+        peak_recompute, _ = self._run_forward_backward(
+            num_layers,
+            hidden_size,
+            num_streams,
+            seq_len,
+            batch_size,
+            use_recompute=True,
+            recompute_block_size=2,
+        )
+
+        saving_pct = (peak_no_recompute - peak_recompute) / peak_no_recompute * 100
+
+        assert peak_recompute < peak_no_recompute, (
+            f"Recompute should reduce peak memory, but got "
+            f"no_recompute={peak_no_recompute / 1e6:.1f}MB vs "
+            f"recompute={peak_recompute / 1e6:.1f}MB "
+            f"(saving={saving_pct:.1f}%)"
+        )
+
+
+class TestMHCWithCudaGraph:
+    """Test HyperConnectionTransformerLayer compatibility with CUDA graphs.
+
+    CUDA graph capture requires static computation graphs and fixed tensor shapes.
+    These tests verify that the mHC layer properly supports the CUDA graph interface
+    defined in GraphableMegatronModule and TransformerLayer.
+    """
+
+    def setup_method(self, method):
+        Utils.initialize_model_parallel(1, 1)
+        model_parallel_cuda_manual_seed(123, use_cudagraphable_rng=True, force_reset_rng=True)
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    def _create_mhc_layer(self, hidden_size=64, num_streams=4, **extra_config):
+        config = _make_mhc_config(hidden_size=hidden_size, num_streams=num_streams, **extra_config)
+        layer_spec = get_gpt_layer_with_transformer_engine_spec(enable_hyper_connection=True)
+        layer = HyperConnectionTransformerLayer(config, layer_spec.submodules)
+        layer.cuda()
+        return layer, config
+
+    def test_get_layer_static_inputs_shape_for_mhc(self):
+        """get_layer_static_inputs must return [s, b, n*C] for mHC layers.
+
+        CUDA graph capture creates static buffers whose shapes are determined by
+        this method. If the shape is [s, b, C] instead of [s, b, n*C], the graph
+        capture will produce a shape mismatch at the first hyper connection module.
+        """
+        layer, config = self._create_mhc_layer()
+        seq_length = 32
+        micro_batch_size = 2
+
+        static_inputs = layer.get_layer_static_inputs(seq_length, micro_batch_size)
+        hidden_states = static_inputs["hidden_states"]
+
+        expected_hidden_dim = config.num_residual_streams * config.hidden_size
+        assert hidden_states.shape[-1] == expected_hidden_dim, (
+            f"get_layer_static_inputs returns hidden dim {hidden_states.shape[-1]} "
+            f"but mHC expects {expected_hidden_dim} (n={config.num_residual_streams} * "
+            f"C={config.hidden_size}). "
+            f"HyperConnectionTransformerLayer must override get_layer_static_inputs."
+        )
+
+    def test_mhc_recompute_attention_graph_starts_from_one_stream_aggregate(self):
+        """The split attention graph input is the eager mHC aggregate [s, b, C]."""
+        layer, config = self._create_mhc_layer(
+            bf16=True,
+            cuda_graph_impl="transformer_engine",
+            cuda_graph_modules=[CudaGraphModule.attn],
+            recompute_granularity="selective",
+            recompute_modules=["mhc"],
+            mhc_recompute_attn_cuda_graph_split=True,
+        )
+
+        static_inputs = layer.get_layer_static_inputs(seq_length=32, micro_batch_size=2)
+        assert static_inputs["hidden_states"].shape == (32, 2, config.hidden_size)
+
+        graph_submodules = layer._get_submodules_under_cudagraphs()
+        assert layer.self_attention in graph_submodules
+        assert layer.self_attention_hyper_connection not in graph_submodules
+
+    def test_mhc_split_config_rejects_packed_sequence(self):
+        """The split validator rejects packed (THD) sequences at config time.
+
+        The split replay's kwargs assembly does not forward the THD captured
+        kwargs (cu_seqlens_*, padding_mask) to the graphed callable, and
+        Transformer Engine raises TypeError for a kwarg present at capture but
+        missing at replay -- so without this gate a THD split run is accepted
+        and then dies on the first replay. The gate keys on
+        sequence_packing_scheduler, the same signal _is_thd_cuda_graph() uses
+        to shape the THD static inputs.
+        """
+        with pytest.raises(ValueError, match="does not support packed"):
+            self._create_mhc_layer(
+                bf16=True,
+                cuda_graph_impl="transformer_engine",
+                cuda_graph_modules=[CudaGraphModule.attn],
+                recompute_granularity="selective",
+                recompute_modules=["mhc"],
+                mhc_recompute_attn_cuda_graph_split=True,
+                sequence_packing_scheduler="dp_balanced",
+                max_seqlen_per_dp_cp_rank=32,
+                thd_max_packed_sequences=2,
+                pad_packed_seq_alignment="max",
+            )
+
+    @pytest.mark.parametrize(
+        "offload_modules",
+        [
+            ["qkv_linear"],
+            ["core_attn"],
+            # attn_proj cannot be requested alone: its input is core_attn's output,
+            # and an earlier config check rejects that combination on its own terms.
+            ["core_attn", "attn_proj"],
+        ],
     )
-    from megatron.core.transformer.transformer_block import TransformerBlock
+    @pytest.mark.parametrize("graph_modules", [["attn"], [CudaGraphModule.attn]])
+    def test_mhc_split_config_rejects_attention_scope_offloading(
+        self, offload_modules, graph_modules
+    ):
+        """Opting into the split rejects offloading a captured attention module.
 
-    return TransformerBlock(cfg, get_gpt_layer_with_transformer_engine_spec())
+        This shape is not one the split inherited -- before the split existed it
+        went through the parent capture, which does plant the edges -- so the
+        rejection blocks nothing that used to run and fails closed on a race
+        whose only symptom is corrupted activations.
+
+        The split replaces ``_te_cuda_graph_capture`` instead of extending it, so
+        it never plants the parent's two offload synchronization edges. Both
+        cuda_graph_modules spellings are exercised so the gate keeps comparing
+        normalized module forms rather than whatever spelling the caller used.
+        """
+        with pytest.raises(ValueError, match="incompatible with offload_modules"):
+            _make_mhc_config(
+                cuda_graph_impl="transformer_engine",
+                cuda_graph_modules=graph_modules,
+                recompute_granularity="selective",
+                recompute_modules=["mhc"],
+                mhc_recompute_attn_cuda_graph_split=True,
+                fine_grained_activation_offloading=True,
+                offload_modules=offload_modules,
+            )
+
+    @pytest.mark.parametrize(
+        "extra_config",
+        [
+            # The default. Capture covers the whole attention range, so the parent
+            # plants the synchronization edges and there is nothing to reject --
+            # this is the shape that ran before the split existed.
+            dict(mhc_recompute_attn_cuda_graph_split=False),
+            # Not the split: no capture at all, so there is nothing to synchronize.
+            # The switch has to come off with it -- opting into a Transformer Engine
+            # split while disabling CUDA graphs is self-contradictory and is rejected
+            # on its own terms.
+            dict(
+                cuda_graph_impl="none",
+                cuda_graph_modules=[],
+                mhc_recompute_attn_cuda_graph_split=False,
+            ),
+            # Not the split: mHC recompute is off, so no eager checkpoint feeds the
+            # graph and the parent capture path runs unchanged.
+            dict(recompute_granularity=None, recompute_modules=[]),
+        ],
+    )
+    def test_attention_scope_offloading_allowed_outside_the_split(self, extra_config):
+        """The guard must not leak into configurations the split does not own."""
+        base = dict(
+            cuda_graph_impl="transformer_engine",
+            cuda_graph_modules=[CudaGraphModule.attn],
+            recompute_granularity="selective",
+            recompute_modules=["mhc"],
+            mhc_recompute_attn_cuda_graph_split=True,
+            fine_grained_activation_offloading=True,
+            offload_modules=["core_attn"],
+        )
+        base.update(extra_config)
+        if (
+            base.get("mhc_recompute_attn_cuda_graph_split") is False
+            and base["cuda_graph_impl"] == "transformer_engine"
+        ):
+            # The exact [attn]+[mhc] shape without the switch warns that the
+            # captured producer's checkpoint no longer pays; pin it.
+            with pytest.warns(UserWarning, match="capturing the whole attention range"):
+                _make_mhc_config(**base)
+        else:
+            _make_mhc_config(**base)
+
+    def test_te_graph_static_hidden_input_tracks_runtime_microbatch_slot(self):
+        """Static-input handles use the same modulo slot selection as TE graphs."""
+        layer, _ = self._create_mhc_layer()
+        layer.cuda_graphs = [object(), object()]
+        slot_inputs = (
+            torch.empty((4, 1, 64), device="cuda"),
+            torch.empty((4, 1, 64), device="cuda"),
+        )
+        layer.set_te_cuda_graph_static_hidden_inputs(slot_inputs)
+
+        layer.current_microbatch = 3
+        assert layer.get_te_cuda_graph_static_hidden_input() is slot_inputs[1]
+        layer.clear_te_cuda_graph_static_hidden_inputs()
+        with pytest.raises(RuntimeError, match="have not been attached"):
+            layer.get_te_cuda_graph_static_hidden_input()
+
+    def test_te_graph_static_hidden_input_rejects_address_drift(self):
+        """A retained static-input handle whose storage moved must refuse to serve."""
+        layer, _ = self._create_mhc_layer()
+        layer.cuda_graphs = [object()]
+        slot = torch.empty((4, 1, 64), device="cuda")
+        layer.set_te_cuda_graph_static_hidden_inputs((slot,))
+        slot.data = torch.empty_like(slot)
+        with pytest.raises(RuntimeError, match="changed address"):
+            layer.get_te_cuda_graph_static_hidden_input()
+
+    def test_set_te_cuda_graph_static_hidden_inputs_validates_inputs(self):
+        layer, _ = self._create_mhc_layer()
+        layer.cuda_graphs = [object(), object()]
+        with pytest.raises(ValueError, match="match graph count"):
+            layer.set_te_cuda_graph_static_hidden_inputs((torch.empty(2, device="cuda"),))
+        with pytest.raises(TypeError, match="CUDA tensors"):
+            layer.set_te_cuda_graph_static_hidden_inputs((torch.empty(2), torch.empty(2)))
+
+    def _create_split_layer(self):
+        layer, config = self._create_mhc_layer(
+            bf16=True,
+            cuda_graph_impl="transformer_engine",
+            cuda_graph_modules=[CudaGraphModule.attn],
+            recompute_granularity="selective",
+            recompute_modules=["mhc"],
+            mhc_recompute_attn_cuda_graph_split=True,
+        )
+        assert layer._uses_mhc_recompute_attn_cuda_graph_split()
+        return layer, config
+
+    def test_split_replay_dispatch_routes_split_configs(self, monkeypatch):
+        """_te_cuda_graph_replay_impl must route split configs into the split method."""
+        layer, config = self._create_split_layer()
+        sentinel = (object(), object())
+        monkeypatch.setattr(
+            HyperConnectionTransformerLayer,
+            "_te_cuda_graph_replay_mhc_attention_split",
+            lambda self, args, kwargs, context: sentinel,
+        )
+        hidden = torch.randn(8, 2, config.num_residual_streams * config.hidden_size, device="cuda")
+        assert layer._te_cuda_graph_replay_impl((hidden,), {}, None) is sentinel
+
+        plain_layer, _ = self._create_mhc_layer()
+        assert not plain_layer._uses_mhc_recompute_attn_cuda_graph_split()
+
+    def test_split_replay_rejects_ambiguous_hidden_states(self):
+        layer, config = self._create_split_layer()
+        hidden = torch.randn(8, 2, config.num_residual_streams * config.hidden_size, device="cuda")
+        with pytest.raises(ValueError, match="exactly one positional"):
+            layer._te_cuda_graph_replay_mhc_attention_split((hidden, hidden), {}, None)
+        with pytest.raises(ValueError, match="not both"):
+            layer._te_cuda_graph_replay_mhc_attention_split(
+                (hidden,), {"hidden_states": hidden}, None
+            )
+
+    def _run_split_replay(self, layer, config, fake_graph_output, monkeypatch, manager=None):
+        """Drive the split replay with a stubbed captured graph and eager tails."""
+        from megatron.core.transformer.module import GraphableMegatronModule
+
+        recorded = {}
+
+        def fake_replay(layer_self, *args, **kwargs):
+            recorded["graph_input"] = args[0]
+            out = fake_graph_output(args[0])
+            return out
+
+        def fake_post(attention_output_with_bias, h_res, residual, h_post, **kwargs):
+            recorded["attention_output_with_bias"] = attention_output_with_bias
+            recorded["post_manager"] = kwargs.get("mhc_recompute_manager")
+            return attention_output_with_bias[0], kwargs.get("context")
+
+        def fake_mlp(hidden_states, **kwargs):
+            recorded["mlp_manager"] = kwargs.get("mhc_recompute_manager")
+            return hidden_states
+
+        monkeypatch.setattr(GraphableMegatronModule, "_te_cuda_graph_replay", fake_replay)
+        layer._forward_mhc_attention_post_cuda_graph = fake_post
+        layer._forward_mlp = fake_mlp
+        layer._mhc_recompute_manager = manager
+
+        hidden = torch.randn(8, 2, config.num_residual_streams * config.hidden_size, device="cuda")
+        output, context = layer._te_cuda_graph_replay_mhc_attention_split(
+            (hidden,), {"attention_mask": None}, None
+        )
+        return output, recorded
+
+    def test_split_replay_maps_output_arity_and_bias(self, monkeypatch):
+        """Captured output arity: 1 tensor -> (out, None); 2 -> (out, bias); else error."""
+        layer, config = self._create_split_layer()
+
+        _, recorded = self._run_split_replay(layer, config, lambda agg: agg * 2, monkeypatch)
+        out, bias = recorded["attention_output_with_bias"]
+        assert bias is None and torch.equal(out, recorded["graph_input"] * 2)
+
+        bias_value = torch.randn(config.hidden_size, device="cuda")
+        _, recorded = self._run_split_replay(
+            layer, config, lambda agg: (agg * 2, bias_value), monkeypatch
+        )
+        assert recorded["attention_output_with_bias"][1] is bias_value
+
+        with pytest.raises(RuntimeError, match="optional bias"):
+            self._run_split_replay(layer, config, lambda agg: (agg, agg, agg), monkeypatch)
+
+    def test_split_replay_without_manager_skips_arena(self, monkeypatch):
+        """Eval / beyond-recompute-window layers replay without a checkpoint arena."""
+        layer, config = self._create_split_layer()
+        _, recorded = self._run_split_replay(layer, config, lambda agg: agg, monkeypatch)
+        assert recorded["post_manager"] is None
+        assert recorded["mlp_manager"] is None
+        # The one-stream aggregate feeds the captured graph directly.
+        assert recorded["graph_input"].shape == (8, 2, config.hidden_size)
+
+    def test_split_replay_with_manager_direct_writes_arena_slot(self, monkeypatch):
+        """Forward and recompute must produce directly at the captured input address."""
+        from megatron.core.tensor_parallel.random import MHCCheckpointManager
+
+        layer, config = self._create_split_layer()
+        layer.cuda_graphs = [object()]
+        slot = torch.empty((8, 2, config.hidden_size), device="cuda")
+        layer.set_te_cuda_graph_static_hidden_inputs((slot,))
+
+        manager = MHCCheckpointManager()
+        _, recorded = self._run_split_replay(
+            layer, config, lambda agg: agg, monkeypatch, manager=manager
+        )
+        assert recorded["post_manager"] is manager
+        assert recorded["mlp_manager"] is manager
+        assert len(manager.checkpoints) == 1
+        assert manager.checkpoints[0].output_slot is not None
+        assert len(manager.mhc_arena.slots) == 1
+        assert recorded["graph_input"].data_ptr() == slot.data_ptr()
+
+        # Poison the stable bytes after the captured forward consumer is done;
+        # recompute must launch the aggregate kernel with the same tensor as its
+        # output instead of materializing through a copy.
+        expected = recorded["graph_input"].detach().clone()
+        slot_ptr = slot.data_ptr()
+        with torch.no_grad():
+            slot.fill_(float("nan"))
+        manager.discard_all_outputs()
+        manager.recompute_now()
+        assert slot.data_ptr() == slot_ptr
+        assert torch.equal(slot, expected)
+        assert manager.checkpoints[0].output_slot.metadata.data_ptr == slot_ptr
+
+    def test_submodules_under_cudagraphs_includes_hyper_connection(self):
+        """_get_submodules_under_cudagraphs must include hyper connection modules.
+
+        CUDA graph manual hooks are set up for parameters of submodules returned
+        by this method. Missing hyper connection modules means their parameters
+        (mapping_proj, alpha_*, bias) will not get proper pre-forward hooks during
+        graph replay, leading to stale parameter values.
+        """
+        layer, config = self._create_mhc_layer()
+
+        submodules = layer._get_submodules_under_cudagraphs()
+
+        hc_modules_found = any(
+            hasattr(m, 'mapping_proj') for submod in submodules for m in submod.modules()
+        )
+        assert hc_modules_found, (
+            "_get_submodules_under_cudagraphs does not include HyperConnectionModule. "
+            "Parameters like mapping_proj, alpha_pre/post/res will not be updated "
+            "during CUDA graph replay."
+        )
+
+    def test_forward_through_te_cuda_graph_capture_path(self):
+        """_te_cuda_graph_capture must produce correct output shapes for mHC.
+
+        TE CUDA graph capture calls _te_cuda_graph_capture() during warmup.
+        For mHC layers, the input must be n-stream [s, b, n*C] and output must
+        also be [s, b, n*C].
+        """
+        layer, config = self._create_mhc_layer()
+        layer.eval()
+
+        seq_len = 8
+        batch_size = 2
+        n_channels = config.num_residual_streams * config.hidden_size
+
+        hidden_states = torch.randn(seq_len, batch_size, n_channels, device='cuda')
+        attention_mask = torch.ones((1, 1, seq_len, seq_len), dtype=bool, device='cuda')
+
+        with torch.no_grad():
+            outputs = layer._te_cuda_graph_capture(
+                hidden_states=hidden_states, attention_mask=attention_mask
+            )
+
+        if isinstance(outputs, tuple):
+            output = outputs[0]
+        else:
+            output = outputs
+
+        assert output.shape == (seq_len, batch_size, n_channels), (
+            f"_te_cuda_graph_capture output shape {output.shape} != "
+            f"expected {(seq_len, batch_size, n_channels)}"
+        )
+
+    def test_cuda_graph_fwd_bwd_with_hyper_connection(self):
+        """End-to-end CUDA graph capture and replay for forward+backward with mHC.
+
+        Captures both the forward and backward pass of HyperConnectionTransformerLayer
+        into a torch.cuda.CUDAGraph and replays it with fresh input data, verifying
+        that the computation graph is fully static (capturable) and produces correct
+        output shapes and non-trivial gradients.
+        """
+        layer, config = self._create_mhc_layer()
+        layer.train()
+
+        seq_len = 8
+        batch_size = 2
+        n_channels = config.num_residual_streams * config.hidden_size
+
+        static_input = torch.randn(
+            seq_len, batch_size, n_channels, device='cuda', requires_grad=True
+        )
+        attention_mask = torch.ones((1, 1, seq_len, seq_len), dtype=bool, device='cuda')
+
+        # Warmup on side stream to trigger lazy allocations
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            for _ in range(3):
+                out, _ = layer(hidden_states=static_input, attention_mask=attention_mask)
+                out.sum().backward()
+        torch.cuda.current_stream().wait_stream(s)
+
+        # Set .grad to None so backward allocates fresh gradient tensors in the
+        # graph's private memory pool during capture.
+        layer.zero_grad(set_to_none=True)
+        static_input.grad = None
+
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            output, _ = layer(hidden_states=static_input, attention_mask=attention_mask)
+            output.sum().backward()
+
+        # Replay with new input data.
+        # Use no_grad because backward inside the captured graph already
+        # bumped the autograd version counter on static_input, making
+        # in-place copy_ illegal without disabling grad tracking.
+        with torch.no_grad():
+            static_input.copy_(torch.randn_like(static_input))
+        g.replay()
+
+        assert output.shape == (
+            seq_len,
+            batch_size,
+            n_channels,
+        ), f"Output shape {output.shape} != expected {(seq_len, batch_size, n_channels)}"
+        assert (
+            static_input.grad is not None
+        ), "Gradients should be computed for static_input after graph replay"
+        assert static_input.grad.shape == static_input.shape
+        assert static_input.grad.abs().sum() > 0, "Gradients should be non-trivial"
+
+        # Verify numerical consistency: graph replay should match eager execution
+        # with the same input and weights.
+        test_data = torch.randn(seq_len, batch_size, n_channels, device='cuda')
+
+        with torch.no_grad():
+            static_input.copy_(test_data)
+        g.replay()
+        graph_out = output.detach().clone()
+        graph_grad = static_input.grad.detach().clone()
+
+        eager_input = test_data.clone().requires_grad_(True)
+        eager_output, _ = layer(hidden_states=eager_input, attention_mask=attention_mask)
+        eager_output.sum().backward()
+
+        assert torch.allclose(graph_out, eager_output.detach(), atol=1e-5), (
+            f"Graph vs eager output mismatch: "
+            f"max diff = {(graph_out - eager_output.detach()).abs().max().item()}"
+        )
+        assert torch.allclose(graph_grad, eager_input.grad, atol=1e-5), (
+            f"Graph vs eager gradient mismatch: "
+            f"max diff = {(graph_grad - eager_input.grad).abs().max().item()}"
+        )
+
+    def test_cuda_graph_fwd_bwd_with_hyper_connection_and_recompute(self):
+        """CUDA graph capture+replay for fwd+bwd with mHC and MHCCheckpointManager.
+
+        When a MHCCheckpointManager is used, additional CheckpointWithoutOutput
+        objects are created for layernorm and hyper-connection operations. The
+        manager discards intermediate activations during forward (storage.resize_(0))
+        and recomputes them during backward via a unified gradient hook.
+        This test verifies the full capture+replay still works correctly.
+        """
+        layer, config = self._create_mhc_layer()
+        layer.train()
+
+        seq_len = 8
+        batch_size = 2
+        n_channels = config.num_residual_streams * config.hidden_size
+
+        static_input = torch.randn(
+            seq_len, batch_size, n_channels, device='cuda', requires_grad=True
+        )
+        attention_mask = torch.ones((1, 1, seq_len, seq_len), dtype=bool, device='cuda')
+
+        # Warmup on side stream; fresh manager per iteration to avoid stale state.
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            for _ in range(3):
+                mgr = MHCCheckpointManager()
+                mgr.is_last_layer_in_recompute_block = True
+                out, _ = layer(
+                    hidden_states=static_input,
+                    attention_mask=attention_mask,
+                    mhc_recompute_manager=mgr,
+                )
+                mgr.discard_all_outputs_and_register_unified_recompute(out)
+                out.sum().backward()
+        torch.cuda.current_stream().wait_stream(s)
+
+        layer.zero_grad(set_to_none=True)
+        static_input.grad = None
+
+        capture_mgr = MHCCheckpointManager()
+        capture_mgr.is_last_layer_in_recompute_block = True
+
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            output, _ = layer(
+                hidden_states=static_input,
+                attention_mask=attention_mask,
+                mhc_recompute_manager=capture_mgr,
+            )
+            capture_mgr.discard_all_outputs_and_register_unified_recompute(output)
+            output.sum().backward()
+
+        # Replay with new input data.
+        with torch.no_grad():
+            static_input.copy_(torch.randn_like(static_input))
+        g.replay()
+
+        assert output.shape == (
+            seq_len,
+            batch_size,
+            n_channels,
+        ), f"Output shape {output.shape} != expected {(seq_len, batch_size, n_channels)}"
+        assert (
+            static_input.grad is not None
+        ), "Gradients should be computed for static_input after graph replay"
+        assert static_input.grad.shape == static_input.shape
+        assert static_input.grad.abs().sum() > 0, "Gradients should be non-trivial"
+
+        # Numerical consistency: graph replay vs eager with the same input.
+        test_data = torch.randn(seq_len, batch_size, n_channels, device='cuda')
+
+        with torch.no_grad():
+            static_input.copy_(test_data)
+        g.replay()
+        graph_out = output.detach().clone()
+        graph_grad = static_input.grad.detach().clone()
+
+        eager_mgr = MHCCheckpointManager()
+        eager_mgr.is_last_layer_in_recompute_block = True
+        eager_input = test_data.clone().requires_grad_(True)
+        eager_output, _ = layer(
+            hidden_states=eager_input,
+            attention_mask=attention_mask,
+            mhc_recompute_manager=eager_mgr,
+        )
+        eager_mgr.discard_all_outputs_and_register_unified_recompute(eager_output)
+        eager_output.sum().backward()
+
+        assert torch.allclose(graph_out, eager_output.detach(), atol=1e-5), (
+            f"Graph vs eager output mismatch: "
+            f"max diff = {(graph_out - eager_output.detach()).abs().max().item()}"
+        )
+        assert torch.allclose(graph_grad, eager_input.grad, atol=1e-5), (
+            f"Graph vs eager gradient mismatch: "
+            f"max diff = {(graph_grad - eager_input.grad).abs().max().item()}"
+        )
+
+    def test_mcore_cudagraph_manager_with_mhc_recompute_manager(self):
+        """MCore CudaGraphManager must not crash on mhc_recompute_manager kwarg.
+
+        When cuda_graph_impl="local" is set, TransformerLayer.__call__ routes
+        through MegatronModule.__call__ → CudaGraphManager.__call__, which
+        iterates over all kwargs to check supported types. MHCCheckpointManager
+        (used by mhc_recompute_manager) is not a CUDA-graph-supported type.
+
+        This test verifies that mhc_recompute_manager is properly extracted
+        from kwargs before the CudaGraphManager sees them, preventing the
+        AssertionError that would otherwise occur.
+        """
+        layer, config = self._create_mhc_layer(cuda_graph_impl="local", cuda_graph_modules="attn")
+        layer.train()
+
+        assert hasattr(
+            layer, 'cudagraph_manager'
+        ), "Layer should have cudagraph_manager with cuda_graph_impl='local'"
+
+        seq_len = 8
+        batch_size = 2
+        n_channels = config.num_residual_streams * config.hidden_size
+
+        hidden_states = torch.randn(
+            seq_len, batch_size, n_channels, device='cuda', requires_grad=True
+        )
+        attention_mask = torch.ones((1, 1, seq_len, seq_len), dtype=bool, device='cuda')
+
+        mgr = MHCCheckpointManager()
+        mgr.is_last_layer_in_recompute_block = True
+
+        output, context = layer(
+            hidden_states=hidden_states, attention_mask=attention_mask, mhc_recompute_manager=mgr
+        )
+
+        assert output.shape == (seq_len, batch_size, n_channels)
+
+    def test_mcore_cudagraph_manager_without_mhc_recompute_manager(self):
+        """MCore CudaGraphManager path works when mhc_recompute_manager is None."""
+        layer, config = self._create_mhc_layer(cuda_graph_impl="local", cuda_graph_modules="attn")
+        layer.train()
+
+        seq_len = 8
+        batch_size = 2
+        n_channels = config.num_residual_streams * config.hidden_size
+
+        hidden_states = torch.randn(
+            seq_len, batch_size, n_channels, device='cuda', requires_grad=True
+        )
+        attention_mask = torch.ones((1, 1, seq_len, seq_len), dtype=bool, device='cuda')
+
+        output, context = layer(hidden_states=hidden_states, attention_mask=attention_mask)
+
+        assert output.shape == (seq_len, batch_size, n_channels)
 
 
-def _reset_cudagraph_state():
-    _CudagraphGlobalRecord.cudagraph_created = False
-    _CudagraphGlobalRecord.cudagraph_record = []
-    CudaGraphManager.global_mempool = None
-    torch.cuda.synchronize()
+class TestMHCWithOffloading:
+    """Test HyperConnectionTransformerLayer with fine-grained activation offloading.
 
+    Fine-grained activation offloading transfers specific activations (e.g., layernorm
+    inputs) to CPU during forward and reloads them during backward. These tests verify
+    that the mHC layer's multi-stream architecture works correctly with offloading.
+    """
 
-def _all_layers_have_manager(block) -> bool:
-    return all(hasattr(layer, 'cudagraph_manager') for layer in block.layers)
+    def setup_method(self, method):
+        Utils.initialize_model_parallel(1, 1)
+        model_parallel_cuda_manual_seed(123)
 
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
 
-def _no_layers_have_manager(block) -> bool:
-    return all(not hasattr(layer, 'cudagraph_manager') for layer in block.layers)
+    def _create_mhc_layer_with_offloading(
+        self, hidden_size=64, num_streams=4, offload_modules=None
+    ):
+        if offload_modules is None:
+            offload_modules = ["attn_norm", "mlp_norm"]
+
+        config = _make_mhc_config(
+            hidden_size=hidden_size,
+            num_streams=num_streams,
+            fine_grained_activation_offloading=True,
+            offload_modules=offload_modules,
+        )
+        layer_spec = get_gpt_layer_with_transformer_engine_spec(enable_hyper_connection=True)
+        layer = HyperConnectionTransformerLayer(config, layer_spec.submodules)
+        layer.cuda()
+        return layer, config
+
+    def test_forward_backward_with_offloading(self):
+        """Forward+backward should work with activation offloading enabled.
+
+        This exercises the off_interface context manager around layernorms in
+        the mHC forward path, including the group_commit that commits the
+        offloading group for the aggregated 1-stream layernorm input.
+        """
+        from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+            PipelineOffloadManager,
+        )
+
+        layer, config = self._create_mhc_layer_with_offloading()
+        layer.train()
+
+        seq_len = 8
+        batch_size = 2
+        n_channels = config.num_residual_streams * config.hidden_size
+
+        hidden_states = torch.randn(
+            seq_len, batch_size, n_channels, device='cuda', requires_grad=True
+        )
+        attention_mask = torch.ones((1, 1, seq_len, seq_len), dtype=bool, device='cuda')
+
+        mgr = PipelineOffloadManager.get_instance()
+        mgr.init_model_chunk_offload_handler(
+            pp_rank=0, vp_size=1, vp_stage=0, min_offloaded_tensor_size=0
+        )
+
+        output, context = layer(hidden_states=hidden_states, attention_mask=attention_mask)
+
+        assert output.shape == (
+            seq_len,
+            batch_size,
+            n_channels,
+        ), f"Output shape {output.shape} != expected {(seq_len, batch_size, n_channels)}"
+
+        loss = output.sum()
+        loss.backward()
+
+        assert hidden_states.grad is not None, "Gradients should flow through offloaded path"
+        assert hidden_states.grad.shape == hidden_states.shape
+        assert hidden_states.grad.abs().sum() > 0, "Gradients should be non-trivial"
+
+        PipelineOffloadManager.reset_instance()
+
+    def test_offloading_numerical_equivalence(self):
+        """Offloaded forward+backward must produce the same result as non-offloaded.
+
+        Compares outputs and gradients between a layer with offloading disabled
+        vs enabled to ensure the offloading path does not corrupt activations.
+        """
+        from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+            PipelineOffloadManager,
+        )
+
+        PipelineOffloadManager.reset_instance()
+
+        hidden_size = 64
+        num_streams = 4
+        seq_len = 8
+        batch_size = 2
+        n_channels = num_streams * hidden_size
+
+        torch.manual_seed(42)
+        input_data = torch.randn(seq_len, batch_size, n_channels, device='cuda')
+        attention_mask = torch.ones((1, 1, seq_len, seq_len), dtype=bool, device='cuda')
+
+        # Run without offloading
+        config_no_offload = _make_mhc_config(hidden_size=hidden_size, num_streams=num_streams)
+        layer_spec = get_gpt_layer_with_transformer_engine_spec(enable_hyper_connection=True)
+        layer_no_offload = HyperConnectionTransformerLayer(
+            config_no_offload, layer_spec.submodules
+        ).cuda()
+        layer_no_offload.train()
+
+        h1 = input_data.clone().detach().requires_grad_(True)
+        out1, _ = layer_no_offload(hidden_states=h1, attention_mask=attention_mask)
+        out1.sum().backward()
+        grad_no_offload = h1.grad.clone()
+        out1_detached = out1.detach().clone()
+
+        # Run with offloading using the same weights
+        config_offload = _make_mhc_config(
+            hidden_size=hidden_size,
+            num_streams=num_streams,
+            fine_grained_activation_offloading=True,
+            offload_modules=["attn_norm", "mlp_norm"],
+        )
+        layer_offload = HyperConnectionTransformerLayer(
+            config_offload, layer_spec.submodules
+        ).cuda()
+        layer_offload.load_state_dict(layer_no_offload.state_dict())
+        layer_offload.train()
+
+        mgr = PipelineOffloadManager.get_instance()
+        mgr.init_model_chunk_offload_handler(
+            pp_rank=0, vp_size=1, vp_stage=0, min_offloaded_tensor_size=0
+        )
+
+        h2 = input_data.clone().detach().requires_grad_(True)
+        out2, _ = layer_offload(hidden_states=h2, attention_mask=attention_mask)
+        out2.sum().backward()
+        grad_offload = h2.grad.clone()
+
+        PipelineOffloadManager.reset_instance()
+
+        assert torch.allclose(out1_detached, out2.detach(), atol=1e-5), (
+            f"Forward outputs differ: max diff = "
+            f"{(out1_detached - out2.detach()).abs().max().item()}"
+        )
+        assert torch.allclose(grad_no_offload, grad_offload, atol=1e-5), (
+            f"Gradients differ: max diff = "
+            f"{(grad_no_offload - grad_offload).abs().max().item()}"
+        )
 
 
 @pytest.mark.skipif(

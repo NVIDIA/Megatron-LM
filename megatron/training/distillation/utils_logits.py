@@ -8,9 +8,9 @@ focused on the current batched tar layout.
 """
 
 import concurrent.futures
-import hashlib
 import fnmatch
 import glob
+import hashlib
 import io
 import json
 import logging
@@ -44,9 +44,7 @@ MSC_PREFIX = "msc://"
 #   cp   – CP rank
 #   dp   – DP rank
 #   iter – trailing iteration number *I*
-BATCHED_TAR_RE = re.compile(
-    r"^cp(?P<cp>\d+)_dp(?P<dp>\d+)__(?P<iter>\d+)\.tar$"
-)
+BATCHED_TAR_RE = re.compile(r"^cp(?P<cp>\d+)_dp(?P<dp>\d+)__(?P<iter>\d+)\.tar$")
 
 # Name of the metadata member written as the first entry of every batched
 # tar. Contains the dataset-identity hash and the fields that produced it.
@@ -55,9 +53,7 @@ META_TAR_MEMBER = "_meta.json"
 LOGPROBS_TAR_MEMBER_SUFFIX = ".pt.zst"
 
 # Matches compressed iteration payload members inside a batched tar archive.
-LOGPROBS_TAR_MEMBER_RE = re.compile(
-    rf"^(?P<iter>\d+){re.escape(LOGPROBS_TAR_MEMBER_SUFFIX)}$"
-)
+LOGPROBS_TAR_MEMBER_RE = re.compile(rf"^(?P<iter>\d+){re.escape(LOGPROBS_TAR_MEMBER_SUFFIX)}$")
 
 CACHED_LOGITS_LOGPROB_SENTINEL = -1e3
 CACHED_LOGITS_INDEX_SENTINEL = -1
@@ -148,9 +144,7 @@ def storage_glob_with_caching(root: str, name_pattern: str, cached: bool = True)
     listing = _storage_glob_rank0(os.path.join(root, "*.tar"), cached=cached)
 
     return [
-        str(path)
-        for path in listing
-        if fnmatch.fnmatch(storage_basename(str(path)), name_pattern)
+        str(path) for path in listing if fnmatch.fnmatch(storage_basename(str(path)), name_pattern)
     ]
 
 
@@ -208,9 +202,7 @@ def compute_dataset_hash() -> Tuple[str, Dict[str, Any]]:
     identifiers["blend"] = _blend_identifiers(args)
 
     description = json.dumps(identifiers, sort_keys=False, separators=(',', ':'))
-    md5_hex = hashlib.md5(
-        description.encode("utf-8"), usedforsecurity=False
-    ).hexdigest()
+    md5_hex = hashlib.md5(description.encode("utf-8"), usedforsecurity=False).hexdigest()
     return md5_hex, dict(identifiers)
 
 
@@ -270,12 +262,7 @@ def open_logit_file(path: str, mode: str = "rb", **kwargs):
     return open(path, mode, **local_kwargs)
 
 
-def _verify_logprobs_metadata(
-    data: bytes,
-    *,
-    tar_path: str,
-    expected_hash: Optional[str],
-) -> None:
+def _verify_logprobs_metadata(data: bytes, *, tar_path: str, expected_hash: Optional[str]) -> None:
     """Validate the per-tar dataset hash stored in ``_meta.json``."""
     if expected_hash is None:
         return
@@ -289,10 +276,7 @@ def _verify_logprobs_metadata(
 
 
 def iter_logprobs_tar_entries(
-    tar_path: str,
-    *,
-    start_iteration: int = 0,
-    expected_hash: Optional[str] = None,
+    tar_path: str, *, start_iteration: int = 0, expected_hash: Optional[str] = None
 ) -> Iterator[LogprobsTarEntry]:
     """Stream cached-logits payload members from a batched tar archive.
 
@@ -315,9 +299,7 @@ def iter_logprobs_tar_entries(
                     if extracted is None:
                         raise RuntimeError(f"Could not read metadata member in '{tar_path}'")
                     _verify_logprobs_metadata(
-                        extracted.read(),
-                        tar_path=tar_path,
-                        expected_hash=expected_hash,
+                        extracted.read(), tar_path=tar_path, expected_hash=expected_hash
                     )
                     metadata_seen = True
                     continue
@@ -338,13 +320,8 @@ def iter_logprobs_tar_entries(
 
                 extracted = tar.extractfile(member)
                 if extracted is None:
-                    raise RuntimeError(
-                        f"Could not read log-probs member '{name}' in '{tar_path}'"
-                    )
-                yield LogprobsTarEntry(
-                    iteration=iteration,
-                    data=extracted.read(),
-                )
+                    raise RuntimeError(f"Could not read log-probs member '{name}' in '{tar_path}'")
+                yield LogprobsTarEntry(iteration=iteration, data=extracted.read())
 
     if expected_hash is not None and not metadata_seen:
         raise RuntimeError(
@@ -363,8 +340,7 @@ def decode_logprobs_payload(data: bytes) -> Tuple[List[torch.Tensor], List[torch
     data = zstandard.ZstdDecompressor().decompress(data)
     tensors = torch.load(io.BytesIO(data), weights_only=True)
     indices_list = [
-        unpack_indices(low, bit17)
-        for low, bit17 in zip(tensors["indices_low"], tensors["bit_17"])
+        unpack_indices(low, bit17) for low, bit17 in zip(tensors["indices_low"], tensors["bit_17"])
     ]
     return tensors["values"], indices_list
 
@@ -383,8 +359,7 @@ def detect_saved_dp_size(logprobs_dir: str) -> Optional[int]:
 
 # NOTE: This function is for interactive debugging purposes
 def load_log_probs_from_tar(
-    tar_path: str,
-    iteration: int,
+    tar_path: str, iteration: int
 ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
     """Load one iteration from a specific batched tar shard."""
     for entry in iter_logprobs_tar_entries(tar_path, start_iteration=iteration):
@@ -393,21 +368,13 @@ def load_log_probs_from_tar(
         if entry.iteration > iteration:
             break
 
-    raise FileNotFoundError(
-        f"No log-probs member found for iteration {iteration} in '{tar_path}'"
-    )
+    raise FileNotFoundError(f"No log-probs member found for iteration {iteration} in '{tar_path}'")
 
 
 class TarShardPrefetcher:
     """Asynchronously materialize whole tar shards into the MSC cache."""
 
-    def __init__(
-        self,
-        *,
-        enabled: bool,
-        depth: int = 2,
-        max_workers: Optional[int] = None,
-    ):
+    def __init__(self, *, enabled: bool, depth: int = 2, max_workers: Optional[int] = None):
         self.enabled = bool(enabled and depth > 0)
         self.depth = depth
 
@@ -450,9 +417,7 @@ class TarShardPrefetcher:
         future.result()
         waited = time.monotonic() - start
         if waited > 0.5:
-            logger.warning(
-                "Waited %.3fs for cached-logit tar shard prefetch: %s", waited, url
-            )
+            logger.warning("Waited %.3fs for cached-logit tar shard prefetch: %s", waited, url)
 
     def wait_group(self, urls: Sequence[str]) -> None:
         for url in urls:

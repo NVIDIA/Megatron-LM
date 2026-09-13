@@ -12,6 +12,7 @@ from hybrid_builders import hybrid_builder
 from megatron.core import mpu
 from megatron.core.enums import ModelType
 from megatron.core.models.gpt import GPTModel
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import is_pipeline_last_stage
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.utils import StragglerDetector
@@ -21,20 +22,23 @@ from megatron.rl.rl_utils import (
     get_rl_runtime_state,
     load_packed_data_by_index,
 )
-from megatron.training import get_args, get_timers, pretrain, print_rank_0
-from megatron.training.utils import is_hybrid_model
-from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
-from megatron.training.argument_utils import gpt_config_from_args, hybrid_config_from_args, pretrain_cfg_container_from_args
-from model_provider import model_provider
-
-from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.rl.sequence_packing_utils import get_default_packed_seq_params
+from megatron.training import get_args, get_timers, pretrain, print_rank_0
+from megatron.training.argument_utils import (
+    gpt_config_from_args,
+    hybrid_config_from_args,
+    pretrain_cfg_container_from_args,
+)
+from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
+from megatron.training.utils import is_hybrid_model
+from model_provider import model_provider
 
 stimer = StragglerDetector()
 
 import logging
 
 logging.basicConfig(level=logging.INFO, force=True)
+
 
 def _gpt_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_collection=None):
     # TODO(Peter): This is a hack to get around the fact that we are activation recomputation for training but not
@@ -224,7 +228,11 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
             seq_lengths,
             seq_indices,
             packed_seq_params,
-        ) = load_packed_data_by_index(bin_tensor.item(), runtime_state.packing_context, args.rl_inference_logprobs_is_correction)
+        ) = load_packed_data_by_index(
+            bin_tensor.item(),
+            runtime_state.packing_context,
+            args.rl_inference_logprobs_is_correction,
+        )
 
         runtime_state.increment_sequences(len(seq_indices))
     else:
@@ -290,8 +298,7 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
     # Get current logprobs and calculate loss with straggler detection
     with stimer:
         logprobs_or_hidden_states = get_logprobs(
-            model_to_use, tokens, position_ids, no_grad=False,
-            packed_seq_params=packed_seq_params
+            model_to_use, tokens, position_ids, no_grad=False, packed_seq_params=packed_seq_params
         )
 
         if not is_pipeline_last_stage():
@@ -411,10 +418,7 @@ if __name__ == "__main__":
                 pg_collection=pg_collection,
             )
 
-    args = parse_and_validate_args(
-        extra_args_provider=add_inference_args,
-        args_defaults={},
-    )
+    args = parse_and_validate_args(extra_args_provider=add_inference_args, args_defaults={})
     if is_hybrid_model(args):
         model_cfg = hybrid_config_from_args(args)
     else:

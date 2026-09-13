@@ -5,7 +5,6 @@ import sys
 import time
 from argparse import Namespace
 
-from megatron.training.arguments import parse_and_validate_args
 import torch
 
 from megatron.core.inference.contexts import StaticInferenceContext
@@ -20,6 +19,7 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
 )
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.core.transformer.module import MegatronModule
+from megatron.training.arguments import parse_and_validate_args
 
 sys.path.append(
     os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir, os.path.pardir))

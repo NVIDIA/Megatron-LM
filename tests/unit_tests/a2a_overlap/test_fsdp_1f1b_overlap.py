@@ -4,6 +4,7 @@ import gc
 
 import pytest
 import torch
+import torch.nn.functional as F
 
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel

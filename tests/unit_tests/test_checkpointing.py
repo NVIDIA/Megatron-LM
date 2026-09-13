@@ -24,8 +24,8 @@ from megatron.training.checkpointing import (
     _build_sharded_state_dict_metadata,
     _load_base_checkpoint,
     get_checkpoint_tracker_filename,
+    load_args_from_checkpoint,
     load_checkpoint,
-    maybe_save_dataloader_state,
     read_metadata,
     save_checkpoint,
 )
@@ -75,78 +75,121 @@ class MockState:
         return self.state_dict()
 
 
-def test_maybe_save_dataloader_state_uses_explicit_process_groups(tmp_path):
-    """Dataloader checkpoints use the supplied module groups and canonical model-parallel path."""
-    groups = {
-        "tp": SimpleNamespace(rank=0, size=2),
-        "pp": SimpleNamespace(rank=0, size=2),
-        "dp": SimpleNamespace(rank=3, size=4),
-    }
-    barriers = []
-    saved = []
-    iterator = SimpleNamespace(
-        iterable=SimpleNamespace(save_state=lambda: {"global_sequence_id": 16})
+def test_load_args_restores_quantile_balancing_from_checkpoint():
+    """QB mode and histogram shape are reconstructed before the router is built."""
+    checkpoint_args = SimpleNamespace(
+        moe_router_load_balancing_type="quantile_balancing",
+        moe_aux_loss_coeff=0.0,
+        moe_router_quantile_balancing_estimation_scope="global_batch",
+        moe_router_qb_num_bins=257,
     )
-
-    with (
-        mock.patch(
-            "megatron.training.checkpointing.get_pg_rank", side_effect=lambda group: group.rank
-        ),
-        mock.patch(
-            "megatron.training.checkpointing.get_pg_size", side_effect=lambda group: group.size
-        ),
-        mock.patch(
-            "megatron.training.checkpointing.torch.distributed.barrier",
-            side_effect=lambda group: barriers.append(group),
-        ),
-        mock.patch(
-            "megatron.training.checkpointing.torch.save",
-            side_effect=lambda state, path: saved.append((state, path)),
-        ),
-    ):
-        maybe_save_dataloader_state(
-            iterator,
-            2,
-            tmp_path,
-            tp_group=groups["tp"],
-            pp_group=groups["pp"],
-            dp_group=groups["dp"],
-        )
-
-    assert barriers == [groups["dp"], groups["dp"]]
-    assert saved[0][0] == {"dataloader_state_dict": {"global_sequence_id": 16}}
-    assert saved[0][1] == str(
-        tmp_path / "iter_0000002" / "mp_rank_00_000" / "train_dataloader_dprank003.pt"
+    args = SimpleNamespace(
+        load="checkpoint",
+        iteration=0,
+        moe_router_load_balancing_type="aux_loss",
+        moe_aux_loss_coeff=0.01,
+        moe_router_quantile_balancing_estimation_scope="micro_batch",
+        moe_router_qb_num_bins=64,
+        use_tokenizer_model_from_checkpoint_args=False,
+        use_mp_args_from_checkpoint_args=False,
     )
+    state_dict = {"args": checkpoint_args, "iteration": 12}
 
-
-def test_maybe_save_dataloader_state_skips_empty_state_after_barriers(tmp_path):
-    """Ranks without dataloader state participate in barriers but do not write a file."""
-    group = SimpleNamespace(rank=0, size=1)
-    iterator = SimpleNamespace(iterable=SimpleNamespace(save_state=lambda: None))
-    barriers = []
-
-    with (
-        mock.patch(
-            "megatron.training.checkpointing.get_pg_rank",
-            side_effect=lambda process_group: process_group.rank,
-        ),
-        mock.patch(
-            "megatron.training.checkpointing.get_pg_size",
-            side_effect=lambda process_group: process_group.size,
-        ),
-        mock.patch(
-            "megatron.training.checkpointing.torch.distributed.barrier",
-            side_effect=lambda group: barriers.append(group),
-        ),
-        mock.patch("megatron.training.checkpointing.torch.save") as save,
+    with mock.patch(
+        "megatron.training.checkpointing._load_base_checkpoint",
+        return_value=(state_dict, "checkpoint", False, CheckpointType.LEGACY),
     ):
-        maybe_save_dataloader_state(
-            iterator, 2, tmp_path, tp_group=group, pp_group=group, dp_group=group
-        )
+        restored_args, _ = load_args_from_checkpoint(args)
 
-    assert barriers == [group, group]
-    save.assert_not_called()
+    assert restored_args.moe_router_load_balancing_type == "quantile_balancing"
+    assert restored_args.moe_aux_loss_coeff == 0.0
+    assert restored_args.moe_router_quantile_balancing_estimation_scope == "global_batch"
+    assert restored_args.moe_router_qb_num_bins == 257
+
+
+def test_load_args_restores_latent_rmsnorm_from_checkpoint():
+    """The latent dimension and its RMSNorm up-projection are reconstructed together."""
+    checkpoint_args = SimpleNamespace(moe_latent_size=16, moe_latent_up_projection_rmsnorm=True)
+    args = SimpleNamespace(
+        load="checkpoint",
+        iteration=0,
+        moe_latent_size=None,
+        moe_latent_up_projection_rmsnorm=False,
+        use_tokenizer_model_from_checkpoint_args=False,
+        use_mp_args_from_checkpoint_args=False,
+    )
+    state_dict = {"args": checkpoint_args, "iteration": 12}
+
+    with mock.patch(
+        "megatron.training.checkpointing._load_base_checkpoint",
+        return_value=(state_dict, "checkpoint", False, CheckpointType.LEGACY),
+    ):
+        restored_args, _ = load_args_from_checkpoint(args)
+
+    assert restored_args.moe_latent_size == 16
+    assert restored_args.moe_latent_up_projection_rmsnorm is True
+
+
+@pytest.mark.parametrize(
+    "checkpoint_args",
+    [
+        SimpleNamespace(swiglu=True, situ_glu=False, situ_glu_beta1=4.0, situ_glu_beta2=25.0),
+        SimpleNamespace(swiglu=False, situ_glu=True, situ_glu_beta1=3.0, situ_glu_beta2=20.0),
+    ],
+)
+def test_load_args_restores_glu_activation_from_checkpoint(checkpoint_args):
+    """Checkpoint arguments select the saved gated activation and SiTU scaling."""
+    args = SimpleNamespace(
+        load="checkpoint",
+        iteration=0,
+        swiglu=not checkpoint_args.swiglu,
+        situ_glu=not checkpoint_args.situ_glu,
+        situ_glu_beta1=1.0,
+        situ_glu_beta2=1.0,
+        use_tokenizer_model_from_checkpoint_args=False,
+        use_mp_args_from_checkpoint_args=False,
+    )
+    state_dict = {"args": checkpoint_args, "iteration": 12}
+
+    with mock.patch(
+        "megatron.training.checkpointing._load_base_checkpoint",
+        return_value=(state_dict, "checkpoint", False, CheckpointType.LEGACY),
+    ):
+        restored_args, _ = load_args_from_checkpoint(args)
+
+    assert restored_args.swiglu is checkpoint_args.swiglu
+    assert restored_args.situ_glu is checkpoint_args.situ_glu
+    assert restored_args.situ_glu_beta1 == checkpoint_args.situ_glu_beta1
+    assert restored_args.situ_glu_beta2 == checkpoint_args.situ_glu_beta2
+
+
+@pytest.mark.parametrize(
+    ("runtime_mode", "checkpoint_args", "expected_mode"),
+    [
+        ("indices", SimpleNamespace(moe_hybridep_routing_map_mode="bool"), "indices"),
+        (None, SimpleNamespace(moe_hybridep_routing_map_mode="bool"), "bool"),
+        (None, SimpleNamespace(), None),
+    ],
+)
+def test_load_args_preserves_runtime_hybridep_routing_map_mode(
+    runtime_mode, checkpoint_args, expected_mode
+):
+    args = SimpleNamespace(
+        load="checkpoint",
+        iteration=0,
+        moe_hybridep_routing_map_mode=runtime_mode,
+        use_tokenizer_model_from_checkpoint_args=False,
+        use_mp_args_from_checkpoint_args=False,
+    )
+    state_dict = {"args": checkpoint_args, "iteration": 12}
+
+    with mock.patch(
+        "megatron.training.checkpointing._load_base_checkpoint",
+        return_value=(state_dict, "checkpoint", False, CheckpointType.LEGACY),
+    ):
+        restored_args, _ = load_args_from_checkpoint(args)
+
+    assert restored_args.moe_hybridep_routing_map_mode == expected_mode
 
 
 def create_checkpoint(load_path, ckpt_format):
@@ -198,6 +241,87 @@ def create_args():
     yield args
 
 
+def test_async_save_rejects_reusable_chunked_optimizer_buffers(create_args):
+    """Checkpoint entry must preserve the CLI guard when startup validation was bypassed."""
+
+    create_args.async_save = True
+    create_args.ckpt_format = 'torch_dist'
+    optimizer = SimpleNamespace(config=SimpleNamespace(chunked_optimizer_state_offload=True))
+    with (
+        mock.patch("megatron.training.checkpointing.get_args", return_value=create_args),
+        pytest.raises(RuntimeError, match="does not support --async-save"),
+    ):
+        save_checkpoint(0, [], optimizer, None, 0)
+
+
+def test_checkpoint_save_rejects_mutated_format_with_chunked_optimizer_offload(create_args):
+    """Checkpoint entry revalidates the format after resume-time argument restoration."""
+
+    create_args.ckpt_format = 'torch'
+    optimizer = SimpleNamespace(config=SimpleNamespace(chunked_optimizer_state_offload=True))
+    with (
+        mock.patch("megatron.training.checkpointing.get_args", return_value=create_args),
+        pytest.raises(RuntimeError, match="requires --ckpt-format torch_dist"),
+    ):
+        save_checkpoint(0, [], optimizer, None, 0)
+
+
+def test_checkpoint_save_treats_zero_offload_fraction_as_disabled(create_args):
+    """A zero fraction must not impose async-save or distributed-format restrictions."""
+
+    create_args.async_save = True
+    create_args.ckpt_format = 'torch'
+    optimizer = SimpleNamespace(
+        config=SimpleNamespace(
+            chunked_optimizer_state_offload=True, optimizer_state_offload_fraction=0.0
+        )
+    )
+    with (
+        mock.patch("megatron.training.checkpointing.get_args", return_value=create_args),
+        mock.patch(
+            "megatron.training.checkpointing.is_empty_async_queue",
+            side_effect=RuntimeError("continued past optimizer offload guard"),
+        ),
+        pytest.raises(RuntimeError, match="continued past optimizer offload guard"),
+    ):
+        save_checkpoint(0, [], optimizer, None, 0)
+
+
+def test_checkpoint_save_skips_offload_guards_without_optimizer_state(create_args):
+    """Model-only saves do not expose reusable optimizer buffers to the async writer."""
+
+    create_args.async_save = True
+    create_args.ckpt_format = 'torch_dist'
+    create_args.no_save_optim = True
+    optimizer = SimpleNamespace(config=SimpleNamespace(chunked_optimizer_state_offload=True))
+    with (
+        mock.patch("megatron.training.checkpointing.get_args", return_value=create_args),
+        mock.patch(
+            "megatron.training.checkpointing.is_empty_async_queue",
+            side_effect=RuntimeError("continued past optimizer offload guard"),
+        ),
+        pytest.raises(RuntimeError, match="continued past optimizer offload guard"),
+    ):
+        save_checkpoint(0, [], optimizer, None, 0)
+
+
+def test_checkpoint_save_allows_legacy_format_without_optimizer_state(create_args):
+    """A model-only save is not forced through optimizer-specific distributed hooks."""
+
+    create_args.ckpt_format = 'torch'
+    create_args.no_save_optim = True
+    optimizer = SimpleNamespace(config=SimpleNamespace(chunked_optimizer_state_offload=True))
+    with (
+        mock.patch("megatron.training.checkpointing.get_args", return_value=create_args),
+        mock.patch(
+            "megatron.training.checkpointing.on_save_checkpoint_start",
+            side_effect=RuntimeError("continued past optimizer offload guard"),
+        ),
+        pytest.raises(RuntimeError, match="continued past optimizer offload guard"),
+    ):
+        save_checkpoint(0, [], optimizer, None, 0)
+
+
 @pytest.fixture
 def create_ckpt_load_args(create_args):
     """Setup dummy args allowing checkpoint load."""
@@ -214,7 +338,6 @@ def create_ckpt_load_args(create_args):
     args.tensor_model_parallel_size = 1
     args.pipeline_model_parallel_size = 1
     args.ckpt_assume_constant_structure = False
-    args.stream_ckpt_dequant = True
     args.ckpt_fully_parallel_save = False
     args.ckpt_fully_parallel_load = False
     args.ckpt_load_validate_sharding_integrity = True

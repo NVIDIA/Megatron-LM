@@ -66,23 +66,23 @@ import torch.utils.data
 
 from megatron.core import parallel_state
 from megatron.core.models.common.language_module.language_module import LanguageModule
-from megatron.training.utils import print_rank_0
 from megatron.training.distillation.utils_logits import (
-  BATCHED_TAR_RE,
-  CACHED_LOGITS_LOGPROB_SENTINEL,
-  LogprobsTarEntry,
-  TarShardPrefetcher,
-  batched_tar_prefix,
-  compute_dataset_hash,
-  decode_logprobs_payload,
-  detect_saved_dp_size,
-  get_current_iteration,
-  iter_logprobs_tar_entries,
-  is_remote_storage_path,
-  storage_basename,
-  storage_glob_with_caching,
-  sorted_batched_tars,
+    BATCHED_TAR_RE,
+    CACHED_LOGITS_LOGPROB_SENTINEL,
+    LogprobsTarEntry,
+    TarShardPrefetcher,
+    batched_tar_prefix,
+    compute_dataset_hash,
+    decode_logprobs_payload,
+    detect_saved_dp_size,
+    get_current_iteration,
+    is_remote_storage_path,
+    iter_logprobs_tar_entries,
+    sorted_batched_tars,
+    storage_basename,
+    storage_glob_with_caching,
 )
+from megatron.training.utils import print_rank_0
 
 logger = logging.getLogger(__name__)
 
@@ -111,12 +111,7 @@ class StudentLogitsCapture:
         global _ACTIVE_STUDENT_LOGITS_CAPTURE
         _ACTIVE_STUDENT_LOGITS_CAPTURE = self
 
-    def _capture_logits(
-        self,
-        module: torch.nn.Module,
-        input: Any,
-        output: Any,
-    ) -> None:
+    def _capture_logits(self, module: torch.nn.Module, input: Any, output: Any) -> None:
         if not module.training:
             return
         # NOTE: Assumes main head runs after MTP layers, overwriting this value prior to pop().
@@ -142,9 +137,7 @@ class StudentLogitsCapture:
 
 
 def _compute_dp_remapping(
-    logprobs_dir: str,
-    dp_rank: int,
-    dp_size: int,
+    logprobs_dir: str, dp_rank: int, dp_size: int
 ) -> Tuple[List[int], int, int, int]:
     """Compute the DP rank remapping when loading data saved with a different DP size.
 
@@ -214,6 +207,7 @@ def _compute_dp_remapping(
 #  Dataset – streaming batched tar shards
 # ---------------------------------------------------------------------------
 
+
 class TeacherTarDataset(torch.utils.data.IterableDataset):
     """Streaming dataset that reads teacher log-probs from batched tar shards.
 
@@ -271,8 +265,7 @@ class TeacherTarDataset(torch.utils.data.IterableDataset):
             )
         if self._remote_logprobs and self._msc_prefetch_depth > 0:
             print_rank_0(
-                f"Teacher logits remote tar prefetch: {self._msc_prefetch_depth} "
-                "shard(s) ahead"
+                f"Teacher logits remote tar prefetch: {self._msc_prefetch_depth} " "shard(s) ahead"
             )
 
         # DP remapping: detect saved DP size and compute mapping
@@ -313,9 +306,7 @@ class TeacherTarDataset(torch.utils.data.IterableDataset):
         return new_urls
 
     def _slice_microbatches(
-        self,
-        values_list: List[torch.Tensor],
-        indices_list: List[torch.Tensor],
+        self, values_list: List[torch.Tensor], indices_list: List[torch.Tensor]
     ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
         """Return only this rank's strided microbatch slice when DP ratio > 1."""
         if self._dp_ratio <= 1:
@@ -335,8 +326,7 @@ class TeacherTarDataset(torch.utils.data.IterableDataset):
 
     @staticmethod
     def _interleave_microbatches(
-        all_values: List[List[torch.Tensor]],
-        all_indices: List[List[torch.Tensor]],
+        all_values: List[List[torch.Tensor]], all_indices: List[List[torch.Tensor]]
     ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
         """Interleave microbatches from multiple source dp_ranks (downscaling).
 
@@ -378,9 +368,7 @@ class TeacherTarDataset(torch.utils.data.IterableDataset):
         )
 
     def _shard_groups(
-        self,
-        processed: set,
-        prefetcher: TarShardPrefetcher,
+        self, processed: set, prefetcher: TarShardPrefetcher
     ) -> Iterator[Tuple[str, ...]]:
         """Yield source-DP shard URL groups as new shards are discovered.
 
@@ -391,8 +379,7 @@ class TeacherTarDataset(torch.utils.data.IterableDataset):
         """
         while True:
             urls_per_src = [
-                self._discover_shards(processed, src_dp)
-                for src_dp in self._source_dp_ranks
+                self._discover_shards(processed, src_dp) for src_dp in self._source_dp_ranks
             ]
             if not all(urls_per_src):
                 if not processed:
@@ -408,17 +395,14 @@ class TeacherTarDataset(torch.utils.data.IterableDataset):
     # ------------------------------------------------------------------
 
     def _decode_entry(
-        self,
-        entry: LogprobsTarEntry,
+        self, entry: LogprobsTarEntry
     ) -> Tuple[int, List[torch.Tensor], List[torch.Tensor]]:
         """Decode one raw tar payload into logical iteration tensors."""
         values_list, indices_list = decode_logprobs_payload(entry.data)
         return entry.iteration, values_list, indices_list
 
     def _iter_entries_parallel(
-        self,
-        pool: concurrent.futures.ThreadPoolExecutor,
-        entries: Iterator[LogprobsTarEntry],
+        self, pool: concurrent.futures.ThreadPoolExecutor, entries: Iterator[LogprobsTarEntry]
     ) -> Iterator[Tuple[int, List[torch.Tensor], List[torch.Tensor]]]:
         """Yield decoded entries using a decode thread pool.
 
@@ -452,15 +436,11 @@ class TeacherTarDataset(torch.utils.data.IterableDataset):
             yield decoded
 
     def _iter_decoded_entries(
-        self,
-        pool: Optional[concurrent.futures.ThreadPoolExecutor],
-        url: str,
+        self, pool: Optional[concurrent.futures.ThreadPoolExecutor], url: str
     ) -> Iterator[Tuple[int, List[torch.Tensor], List[torch.Tensor]]]:
         """Yield decoded iteration payloads from one tar URL."""
         entries = iter_logprobs_tar_entries(
-            url,
-            start_iteration=self.start_iteration,
-            expected_hash=self._expected_hash,
+            url, start_iteration=self.start_iteration, expected_hash=self._expected_hash
         )
         if pool is None:
             for entry in entries:
@@ -469,8 +449,7 @@ class TeacherTarDataset(torch.utils.data.IterableDataset):
             yield from self._iter_entries_parallel(pool, entries)
 
     def _interleave_decoded_group(
-        self,
-        decoded_group: Tuple[Tuple[int, List[torch.Tensor], List[torch.Tensor]], ...],
+        self, decoded_group: Tuple[Tuple[int, List[torch.Tensor], List[torch.Tensor]], ...]
     ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
         """Interleave matching iterations from multiple source DP ranks."""
         all_values: List[List[torch.Tensor]] = []
@@ -491,18 +470,14 @@ class TeacherTarDataset(torch.utils.data.IterableDataset):
         return self._interleave_microbatches(all_values, all_indices)
 
     def _iter_single_source_group(
-        self,
-        pool: Optional[concurrent.futures.ThreadPoolExecutor],
-        url: str,
+        self, pool: Optional[concurrent.futures.ThreadPoolExecutor], url: str
     ) -> Iterator[Tuple[List[torch.Tensor], List[torch.Tensor]]]:
         """Yield DP-sliced microbatches from one source DP tar stream."""
         for _, values_list, indices_list in self._iter_decoded_entries(pool, url):
             yield self._slice_microbatches(values_list, indices_list)
 
     def _iter_downscaled_group(
-        self,
-        pool: Optional[concurrent.futures.ThreadPoolExecutor],
-        urls: Tuple[str, ...],
+        self, pool: Optional[concurrent.futures.ThreadPoolExecutor], urls: Tuple[str, ...]
     ) -> Iterator[Tuple[List[torch.Tensor], List[torch.Tensor]]]:
         """Yield interleaved microbatches from source DP tar streams in lockstep."""
         decoded_iters = [self._iter_decoded_entries(pool, url) for url in urls]
@@ -510,9 +485,7 @@ class TeacherTarDataset(torch.utils.data.IterableDataset):
             yield self._interleave_decoded_group(decoded_group)
 
     def _iter_group(
-        self,
-        pool: Optional[concurrent.futures.ThreadPoolExecutor],
-        group: Tuple[str, ...],
+        self, pool: Optional[concurrent.futures.ThreadPoolExecutor], group: Tuple[str, ...]
     ) -> Iterator[Tuple[List[torch.Tensor], List[torch.Tensor]]]:
         """Yield logical training iterations from one shard group."""
         if len(self._source_dp_ranks) > 1:
@@ -536,8 +509,7 @@ class TeacherTarDataset(torch.utils.data.IterableDataset):
                     yield from self._iter_group(None, group)
             else:
                 with concurrent.futures.ThreadPoolExecutor(
-                    max_workers=self._decode_threads,
-                    thread_name_prefix="teacher-decode",
+                    max_workers=self._decode_threads, thread_name_prefix="teacher-decode"
                 ) as pool:
                     for group in self._shard_groups(processed, prefetcher):
                         yield from self._iter_group(pool, group)
@@ -546,6 +518,7 @@ class TeacherTarDataset(torch.utils.data.IterableDataset):
 # ---------------------------------------------------------------------------
 #  Top-K KL divergence
 # ---------------------------------------------------------------------------
+
 
 def topk_kl_div(
     student_logits: torch.Tensor,
@@ -587,17 +560,21 @@ def topk_kl_div(
     # ---- Add a "ghost" token containing sum of non-top-K probabilities to both student and teacher ----
     if add_ghost_token:
         eps = 1e-8
-        student_topk_logprobs_exp = student_topk_logprobs.exp() * mask  # don't sum duplicate indices if any
+        student_topk_logprobs_exp = (
+            student_topk_logprobs.exp() * mask
+        )  # don't sum duplicate indices if any
         student_topk_exp_sum = student_topk_logprobs_exp.sum(dim=-1, keepdim=True)
         if tp_size > 1:
             student_topk_exp_sum = dist_nn.functional.all_reduce(
                 student_topk_exp_sum, op=dist.ReduceOp.SUM, group=tp_group
             )
         student_residual = torch.log((1.0 - student_topk_exp_sum).clamp(min=eps))
-        teacher_residual = torch.log((1.0 - teacher_topk_logprobs.exp().sum(dim=-1, keepdim=True)).clamp(min=eps))
+        teacher_residual = torch.log(
+            (1.0 - teacher_topk_logprobs.exp().sum(dim=-1, keepdim=True)).clamp(min=eps)
+        )
         student_topk_logprobs = torch.cat([student_topk_logprobs, student_residual], dim=-1)
         teacher_topk_logprobs = torch.cat([teacher_topk_logprobs, teacher_residual], dim=-1)
-        mask = torch.cat([mask, mask.new_full((*mask.shape[:-1], 1), float(tp_rank==0))], dim=-1)
+        mask = torch.cat([mask, mask.new_full((*mask.shape[:-1], 1), float(tp_rank == 0))], dim=-1)
 
     # ---- Sparse KL divergence (summed over top-K dimension) ----
     kl_div = teacher_topk_logprobs.exp() * (teacher_topk_logprobs - student_topk_logprobs)
@@ -605,9 +582,11 @@ def topk_kl_div(
 
     return kl_loss.transpose(0, 1).contiguous()  # [S, B] -> [B, S]
 
+
 # ---------------------------------------------------------------------------
 #  KD dataloading + loss class
 # ---------------------------------------------------------------------------
+
 
 class CachedLogitsKDLoss:
     """Offline knowledge-distillation loss backed by cached teacher top-K log-probs.
@@ -777,8 +756,14 @@ class CachedLogitsKDLoss:
             student_logits.device, non_blocking=True
         )
 
-        logger.debug("[TP%s-CP%s-DP%s]: Iter_%s Batch_%s",
-                     self.tp_rank, self.cp_rank, self.dp_rank, iteration, microbatch_idx)
+        logger.debug(
+            "[TP%s-CP%s-DP%s]: Iter_%s Batch_%s",
+            self.tp_rank,
+            self.cp_rank,
+            self.dp_rank,
+            iteration,
+            microbatch_idx,
+        )
 
         # ---- compute loss ----
         return topk_kl_div(
@@ -791,9 +776,11 @@ class CachedLogitsKDLoss:
             add_ghost_token=True,
         )
 
+
 # ---------------------------------------------------------------------------
 #  Main callable wrapper to pass to Megatron LM training loop
 # ---------------------------------------------------------------------------
+
 
 class LossFuncCallable:
     def __init__(
@@ -865,10 +852,14 @@ class LossFuncCallable:
             if not self.ignore_errors:
                 raise
             # Don't fail the entire training process if KD loss fails
-            logger.warning(f">>>>>> KD LOSS FAILED — falling back to LM loss. {type(e).__name__}: {e} <<<<<<")
+            logger.warning(
+                f">>>>>> KD LOSS FAILED — falling back to LM loss. {type(e).__name__}: {e} <<<<<<"
+            )
             return loss_lm, num_tokens, report
 
-        report["logits distillation loss"] = torch.cat([loss_kd.clone().detach().view(1), num_tokens.view(1)])
+        report["logits distillation loss"] = torch.cat(
+            [loss_kd.clone().detach().view(1), num_tokens.view(1)]
+        )
 
         loss_total = (1 - self.alpha) * loss_lm + self.alpha * loss_kd
         report["total loss"] = torch.cat([loss_total.clone().detach().view(1), num_tokens.view(1)])

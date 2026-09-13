@@ -1,3 +1,5 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 #!/usr/bin/env python3
 """One-off script to add NVIDIA copyright header to all .md files under docs/."""
 

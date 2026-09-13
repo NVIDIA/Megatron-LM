@@ -39,14 +39,14 @@ def add_serve_args(parser: ArgumentParser) -> ArgumentParser:
     group.add_argument("--coordinator-port", type=int, default=None)
     group.add_argument("--host", type=str, default="0.0.0.0", help="HTTP bind host")
     group.add_argument("--port", type=int, default=5000, help="HTTP bind port")
-    group.add_argument(
-        "--parsers", type=str, nargs="+", default=[], help="Response parser names"
-    )
+    group.add_argument("--parsers", type=str, nargs="+", default=[], help="Response parser names")
     group.add_argument(
         "--verbose", action="store_true", default=False, help="Per-request HTTP logging"
     )
     group.add_argument(
-        "--frontend-replicas", type=int, default=4,
+        "--frontend-replicas",
+        type=int,
+        default=4,
         help="Number of HTTP frontend processes spawned on the primary rank.",
     )
     return parser

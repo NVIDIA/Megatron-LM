@@ -1,4 +1,4 @@
-# Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import os
 from inspect import signature
@@ -7,7 +7,6 @@ from unittest import mock
 import pytest
 import torch
 
-import megatron.core.transformer.multi_latent_attention as mla_module
 from megatron.core import parallel_state
 from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
 from megatron.core.models.common.embeddings.rope_utils import (
@@ -97,9 +96,9 @@ def make_test_packed_seq_params_with_padding(
     return packed_seq_params
 
 
-def get_mla_self_attn_submodules(linear_qkv_down_proj=None):
+def get_mla_self_attn_submodules(linear_qkv_down_proj=None, qk_layernorm=False):
     submodules = get_gpt_layer_with_transformer_engine_submodules(
-        multi_latent_attention=True
+        multi_latent_attention=True, qk_layernorm=qk_layernorm
     ).self_attention.submodules
     assert isinstance(submodules, MLASelfAttentionSubmodules)
     if linear_qkv_down_proj is not None:
@@ -108,10 +107,10 @@ def get_mla_self_attn_submodules(linear_qkv_down_proj=None):
     return submodules
 
 
-def get_fused_mla_submodules():
+def get_fused_mla_submodules(qk_layernorm=False):
     """Get submodules for FusedMLASelfAttention via the mla_down_proj_fusion spec path."""
     submodules = get_gpt_layer_with_transformer_engine_submodules(
-        multi_latent_attention=True, mla_down_proj_fusion=True
+        multi_latent_attention=True, mla_down_proj_fusion=True, qk_layernorm=qk_layernorm
     ).self_attention.submodules
     assert isinstance(submodules, MLASelfAttentionSubmodules)
     assert submodules.linear_qkv_down_proj is not None
@@ -222,6 +221,31 @@ class TestParallelMLAAttention:
 
         num_weights = sum([p.numel() for p in self.parallel_attention.parameters()])
         assert num_weights == 65036
+
+    def test_attention_latent_norm_epsilon_on_fused_projections(self):
+        config = MLATransformerConfig(
+            num_layers=2,
+            hidden_size=12,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            q_lora_rank=32,
+            kv_lora_rank=32,
+            qk_head_dim=128,
+            v_head_dim=128,
+            qk_pos_emb_head_dim=64,
+            qk_layernorm=True,
+            layernorm_epsilon=1.0e-5,
+            attention_latent_norm_epsilon=1.0e-6,
+        )
+        attention = MLASelfAttention(
+            config,
+            get_mla_self_attn_submodules(qk_layernorm=True),
+            layer_number=1,
+            attn_mask_type=AttnMaskType.causal,
+        )
+
+        assert attention.linear_q_up_proj.eps == pytest.approx(1.0e-6)
+        assert attention.linear_kv_up_proj.eps == pytest.approx(1.0e-6)
 
     def test_cpu_forward(self):
         # we can't currently do this because the global memory buffer is on GPU
@@ -642,11 +666,7 @@ class TestTensorParallelMLAAttention:
 )
 @pytest.mark.parametrize(
     ("rope_type", "apply_rope_fusion"),
-    (
-        ('rope', False),
-        ('yarn', False),
-        ('yarn', True),  # apply_rope_fusion for MLA only works with YARN RoPE.
-    ),
+    (('rope', False), ('rope', True), ('yarn', False), ('yarn', True)),
 )
 class TestContextParallelMLAAttention:
 
@@ -739,6 +759,189 @@ class TestContextParallelMLAAttention:
             assert output.shape[1] == micro_batch_size
             assert output.shape[2] == config.hidden_size
             assert bias.shape[0] == config.hidden_size
+
+
+@pytest.mark.parametrize("gate_granularity", ("elementwise", "headwise"))
+class TestMLAOutputGate:
+
+    @pytest.fixture(scope='function', autouse=True)
+    def setup_and_teardown(self, gate_granularity):
+        Utils.initialize_model_parallel(1, 1)
+        model_parallel_cuda_manual_seed(123)
+        self.transformer_config = MLATransformerConfig(
+            num_layers=2,
+            hidden_size=12,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            q_lora_rank=32,
+            kv_lora_rank=32,
+            qk_head_dim=128,
+            v_head_dim=128,
+            qk_pos_emb_head_dim=64,
+            rope_type="yarn",
+            rotary_base=10000,
+            original_max_position_embeddings=32,
+            attention_output_gate=True,
+            gated_attention_proj_granularity=gate_granularity,
+        )
+        self.parallel_attention = MLASelfAttention(
+            self.transformer_config,
+            get_mla_self_attn_submodules(),
+            layer_number=1,
+            attn_mask_type=AttnMaskType.causal,
+        )
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    def test_constructor_builds_configured_gate_projection(self, gate_granularity):
+        gate = self.parallel_attention.linear_gate
+        assert gate is not None
+        expected_projection_size = (
+            self.parallel_attention.query_projection_size
+            if gate_granularity == "elementwise"
+            else self.transformer_config.num_attention_heads
+        )
+        assert gate.weight.shape == (expected_projection_size, self.transformer_config.hidden_size)
+        assert gate.bias is None or gate.bias.numel() == 0
+
+    def test_gate_matches_independent_fp32_sigmoid_reference(self, gate_granularity):
+        output_size = self.parallel_attention.query_projection_size
+        core_attn_out = torch.linspace(-2.0, 2.0, 2 * output_size, dtype=torch.bfloat16).view(
+            2, 1, output_size
+        )
+        gate_size = (
+            output_size
+            if gate_granularity == "elementwise"
+            else self.transformer_config.num_attention_heads
+        )
+        gate = torch.linspace(-4.0, 4.0, 2 * gate_size, dtype=torch.bfloat16).view(2, 1, gate_size)
+
+        output = self.parallel_attention._apply_mla_output_gate(core_attn_out, gate)
+        reference_scale = torch.sigmoid(gate.float()).to(core_attn_out.dtype)
+        if gate_granularity == "headwise":
+            reference_scale = torch.repeat_interleave(
+                reference_scale, self.transformer_config.v_head_dim, dim=-1
+            )
+        expected = core_attn_out * reference_scale
+
+        assert output.dtype == core_attn_out.dtype
+        torch.testing.assert_close(output, expected, atol=0, rtol=0)
+
+    def test_gate_matches_fp32_sigmoid_reference_vjp(self, gate_granularity):
+        generator = torch.Generator().manual_seed(20260814)
+        output_size = self.parallel_attention.query_projection_size
+        gate_size = (
+            output_size
+            if gate_granularity == "elementwise"
+            else self.transformer_config.num_attention_heads
+        )
+        gate_input = torch.randn((8, 1, gate_size), generator=generator, dtype=torch.bfloat16)
+        core_output = torch.randn((8, 1, output_size), generator=generator, dtype=torch.bfloat16)
+        output_gradient = torch.randn(core_output.shape, generator=generator, dtype=torch.bfloat16)
+
+        actual_gate = gate_input.detach().clone().requires_grad_(True)
+        actual_core = core_output.detach().clone().requires_grad_(True)
+        actual_output = self.parallel_attention._apply_mla_output_gate(actual_core, actual_gate)
+        actual_gradients = torch.autograd.grad(
+            actual_output, (actual_gate, actual_core), output_gradient
+        )
+
+        sigmoid_fp32 = torch.sigmoid(gate_input.float())
+        native_scale = sigmoid_fp32.to(core_output.dtype)
+        if gate_granularity == "headwise":
+            native_scale = torch.repeat_interleave(
+                native_scale, self.transformer_config.v_head_dim, dim=-1
+            )
+            expected_core_gradient = output_gradient * native_scale
+            head_shape = (*core_output.shape[:-1], gate_size, self.transformer_config.v_head_dim)
+            scale_gradient = (
+                output_gradient.float().view(head_shape) * core_output.float().view(head_shape)
+            ).sum(dim=-1)
+            # The fused broadcast reduction returns a native-dtype gradient to the
+            # FP32-sigmoid cast before applying the sigmoid derivative.
+            scale_gradient = scale_gradient.to(gate_input.dtype).float()
+        else:
+            expected_core_gradient = output_gradient * native_scale
+            scale_gradient = (output_gradient * core_output).float()
+
+        expected_output = core_output * native_scale
+        expected_gate_gradient = (scale_gradient * sigmoid_fp32 * (1.0 - sigmoid_fp32)).to(
+            gate_input.dtype
+        )
+
+        torch.testing.assert_close(actual_output, expected_output, atol=0, rtol=0)
+        torch.testing.assert_close(actual_gradients[0], expected_gate_gradient)
+        torch.testing.assert_close(actual_gradients[1], expected_core_gradient)
+
+    def test_missing_gate_spec_raises(self):
+        submodules = get_mla_self_attn_submodules()
+        submodules.linear_gate = None
+        with pytest.raises(ValueError, match="linear_gate module spec"):
+            MLASelfAttention(
+                self.transformer_config,
+                submodules,
+                layer_number=1,
+                attn_mask_type=AttnMaskType.causal,
+            )
+
+    def test_fused_down_projection_is_rejected(self, gate_granularity):
+        with pytest.raises(ValueError, match="does not support fused down projections"):
+            MLATransformerConfig(
+                num_layers=2,
+                hidden_size=12,
+                num_attention_heads=4,
+                q_lora_rank=32,
+                kv_lora_rank=32,
+                qk_head_dim=128,
+                v_head_dim=128,
+                qk_pos_emb_head_dim=64,
+                rope_type=self.transformer_config.rope_type,
+                rotary_base=10000,
+                original_max_position_embeddings=32,
+                attention_output_gate=True,
+                gated_attention_proj_granularity=gate_granularity,
+                mla_down_proj_fusion=True,
+            )
+
+    def test_gpu_forward_thd(self):
+        if not is_te_min_version("1.10.0"):
+            pytest.skip("MLA requires TransformerEngine >= 1.10.0")
+
+        attention = self.parallel_attention.cuda().bfloat16()
+        call_order = []
+        core_attention_hook = attention.core_attention.register_forward_pre_hook(
+            lambda *_: call_order.append("core_attention")
+        )
+        gate_projection_hook = attention.linear_gate.register_forward_pre_hook(
+            lambda *_: call_order.append("linear_gate")
+        )
+        sequence_length = 32
+        hidden_states = torch.ones(
+            (sequence_length, 1, self.transformer_config.hidden_size),
+            device='cuda',
+            dtype=torch.bfloat16,
+            requires_grad=True,
+        )
+        packed_seq_params = make_test_packed_seq_params(sequence_length=sequence_length)
+
+        try:
+            with mock.patch.dict(
+                os.environ, {"NVTE_FUSED_ATTN": "1", "NVTE_FLASH_ATTN": "0"}, clear=False
+            ):
+                output, bias = attention(
+                    hidden_states, attention_mask=None, packed_seq_params=packed_seq_params
+                )
+                output.sum().backward()
+        finally:
+            core_attention_hook.remove()
+            gate_projection_hook.remove()
+
+        assert call_order == ["core_attention", "linear_gate"]
+        assert output.shape == hidden_states.shape
+        assert bias.shape == (self.transformer_config.hidden_size,)
+        assert hidden_states.grad is not None
+        assert attention.linear_gate.weight.grad is not None
 
 
 @pytest.mark.parametrize("rope_type", ('yarn', 'rope'))
@@ -895,11 +1098,7 @@ class TestParallelMLAAttentionPrecision:
 )
 @pytest.mark.parametrize(
     ("rope_type", "apply_rope_fusion"),
-    (
-        ('rope', False),
-        ('yarn', False),
-        ('yarn', True),  # apply_rope_fusion for MLA only works with YARN RoPE.
-    ),
+    (('rope', False), ('rope', True), ('yarn', False), ('yarn', True)),
 )
 class TestContextParallelMLAAttentionPrecision:
 
@@ -1431,26 +1630,28 @@ class TestMLAClipQK:
 @pytest.mark.experimental
 @pytest.mark.parametrize(
     ("rope_type", "apply_rope_fusion"),
-    [
-        ("rope", False),
-        ("yarn", False),
-        ("yarn", True),  # apply_rope_fusion for MLA only works with YARN RoPE.
-    ],
+    [("rope", False), ("rope", True), ("yarn", False), ("yarn", True)],
 )
 @pytest.mark.parametrize(
-    ("tp", "sp", "cp"),
+    ("tp", "sp", "cp", "output_gate", "gate_granularity"),
     [
-        (4, False, 1),  # TP w/o SP
-        (4, True, 1),  # TP w/ SP
-        (1, False, 4),  # CP
-        (2, False, 2),  # CP + TP w/o SP
-        (2, True, 2),  # CP + TP w/ SP
+        (4, False, 1, False, "elementwise"),  # TP w/o SP
+        (4, True, 1, False, "elementwise"),  # TP w/ SP
+        (1, False, 4, False, "elementwise"),  # CP
+        (2, False, 2, False, "elementwise"),  # CP + TP w/o SP
+        (2, True, 2, False, "elementwise"),  # CP + TP w/ SP
+        (4, True, 1, True, "elementwise"),  # Elementwise gate with TP + SP
+        (4, True, 1, True, "headwise"),  # Headwise gate with TP + SP
+        (1, False, 2, True, "elementwise"),  # Elementwise gate with CP
+        (1, False, 2, True, "headwise"),  # Headwise gate with CP
     ],
 )
 @pytest.mark.skipif(not is_te_min_version("1.10.0"), reason="Requires TransformerEngine >= 1.10.0")
 def test_parallel_multi_latent_attention_correctness(
-    tmp_path_dist_ckpt, rope_type, apply_rope_fusion, tp, sp, cp
+    tmp_path_dist_ckpt, rope_type, apply_rope_fusion, tp, sp, cp, output_gate, gate_granularity
 ):
+    if output_gate and (rope_type != "yarn" or apply_rope_fusion):
+        pytest.skip("Gated MLA parallel coverage uses one representative YARN configuration.")
     if cp > 1 and not is_te_min_version("2.5.0", check_equality=True):
         pytest.skip("MLA CP requires TransformerEngine >= 2.5.0")
     if rope_type == "yarn" and apply_rope_fusion and not is_torch_min_version("2.5.0"):
@@ -1524,6 +1725,8 @@ def test_parallel_multi_latent_attention_correctness(
         bf16=True,
         rope_type=rope_type,
         apply_rope_fusion=apply_rope_fusion,
+        attention_output_gate=output_gate,
+        gated_attention_proj_granularity=gate_granularity,
         hidden_dropout=0.0,
         attention_dropout=0.0,
     )
@@ -1701,6 +1904,31 @@ class TestFusedMLASelfAttention:
         assert self.fused_attention.layer_number == 1
         assert hasattr(self.fused_attention, 'linear_qkv_down_proj')
 
+    def test_attention_latent_norm_epsilon_on_fused_projections(self):
+        config = MLATransformerConfig(
+            num_layers=2,
+            hidden_size=12,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            q_lora_rank=32,
+            kv_lora_rank=32,
+            qk_head_dim=128,
+            v_head_dim=128,
+            qk_pos_emb_head_dim=64,
+            qk_layernorm=True,
+            layernorm_epsilon=1.0e-5,
+            attention_latent_norm_epsilon=1.0e-6,
+        )
+        attention = FusedMLASelfAttention(
+            config,
+            get_fused_mla_submodules(qk_layernorm=True),
+            layer_number=1,
+            attn_mask_type=AttnMaskType.causal,
+        )
+
+        assert attention.linear_q_up_proj.eps == pytest.approx(1.0e-6)
+        assert attention.linear_kv_up_proj.eps == pytest.approx(1.0e-6)
+
     def test_fused_weight_shape(self):
         config = self.transformer_config
         expected_out = config.q_lora_rank + config.kv_lora_rank + config.qk_pos_emb_head_dim
@@ -1724,45 +1952,6 @@ class TestFusedMLASelfAttention:
             batch,
             config.kv_lora_rank + config.qk_pos_emb_head_dim,
         )
-
-    def test_qkv_down_projection_split_tensor_parallel_shard(self, monkeypatch):
-        config = self.transformer_config
-        tp_size = 2
-        seq_len, batch = 2, 1
-        q_split = config.q_lora_rank // tp_size
-        kv_split = (config.kv_lora_rank + config.qk_pos_emb_head_dim) // tp_size
-
-        q_shard = torch.arange(seq_len * batch * q_split, dtype=torch.float32).view(
-            seq_len, batch, q_split
-        )
-        kv_shard = torch.full((seq_len, batch, kv_split), 7.0)
-        qkv_shard = torch.cat([q_shard, kv_shard], dim=-1)
-
-        class FakeQKVDownProjection(torch.nn.Module):
-            def forward(self, hidden_states):
-                return qkv_shard, None
-
-        gathered_q = torch.cat([q_shard, torch.zeros_like(q_shard)], dim=-1)
-        captured = {}
-
-        def fake_gather_from_tensor_model_parallel_region(tensor):
-            captured["q_shard"] = tensor
-            return gathered_q
-
-        monkeypatch.setattr(mla_module, "get_pg_size", lambda group: tp_size)
-        monkeypatch.setattr(
-            mla_module,
-            "gather_from_tensor_model_parallel_region",
-            fake_gather_from_tensor_model_parallel_region,
-        )
-        self.fused_attention.linear_qkv_down_proj = FakeQKVDownProjection()
-
-        hidden = torch.zeros(seq_len, batch, config.hidden_size)
-        q_compressed, kv_combined = self.fused_attention._qkv_down_projection(hidden)
-
-        torch.testing.assert_close(captured["q_shard"], q_shard)
-        torch.testing.assert_close(q_compressed, gathered_q)
-        torch.testing.assert_close(kv_combined, kv_shard)
 
     def test_gpu_forward(self):
         if not is_te_min_version("1.10.0"):
@@ -1858,6 +2047,36 @@ class TestFusedMLAGradientFlow:
         assert hidden_states.grad is not None
 
 
+def test_fused_mla_training_hooks_use_fused_down_projection(monkeypatch):
+    """Training hooks should use fused q/kv down projection attributes."""
+
+    class LinearWithDelayedWgrad:
+        def __init__(self, name):
+            self.name = name
+
+        def backward_dw(self):
+            calls.append(self.name)
+
+    calls = []
+    fused = FusedMLASelfAttention.__new__(FusedMLASelfAttention)
+    fused.linear_kv_up_proj = LinearWithDelayedWgrad("kv_up")
+    fused.linear_qkv_down_proj = LinearWithDelayedWgrad("qkv_down")
+    fused.linear_q_up_proj = LinearWithDelayedWgrad("q_up")
+    fused.linear_proj = LinearWithDelayedWgrad("out")
+
+    fused.backward_dw()
+
+    assert calls == ["kv_up", "qkv_down", "q_up", "out"]
+
+    saved_inputs = []
+    mla_module = __import__(FusedMLASelfAttention.__module__, fromlist=["set_save_original_input"])
+    monkeypatch.setattr(mla_module, "set_save_original_input", saved_inputs.append)
+
+    fused.set_for_recompute_input_layernorm()
+
+    assert saved_inputs == [fused.linear_qkv_down_proj]
+
+
 class TestFusedMLALoadFromStateDict:
 
     @pytest.fixture(scope='function', autouse=True)
@@ -1938,78 +2157,6 @@ class TestFusedMLALoadFromStateDict:
         assert not any(
             'linear_qkv_down_proj.weight' in k for k in sharded_sd
         ), f"Unexpected linear_qkv_down_proj.weight in sharded state dict"
-
-    def test_set_for_recompute_input_layernorm_uses_fused_down_proj(self, monkeypatch):
-        if not is_te_min_version("1.10.0"):
-            pytest.skip("Requires TE >= 1.10.0")
-
-        fused = FusedMLASelfAttention(
-            self.transformer_config,
-            get_fused_mla_submodules(),
-            layer_number=1,
-            attn_mask_type=AttnMaskType.causal,
-        )
-        seen = []
-
-        def mock_set_save_original_input(module):
-            seen.append(module)
-
-        monkeypatch.setattr(
-            "megatron.core.transformer.multi_latent_attention.set_save_original_input",
-            mock_set_save_original_input,
-        )
-
-        fused.set_for_recompute_input_layernorm()
-
-        assert seen == [fused.linear_qkv_down_proj]
-
-    def test_sharded_state_dict_preserves_fused_layernorm_keys(self):
-        if not is_te_min_version("1.10.0"):
-            pytest.skip("Requires TE >= 1.10.0")
-
-        fused = FusedMLASelfAttention(
-            self.transformer_config,
-            get_fused_mla_submodules(),
-            layer_number=1,
-            attn_mask_type=AttnMaskType.causal,
-        )
-
-        sharded_sd = fused.sharded_state_dict(prefix="")
-        layernorm_keys = [k for k in sharded_sd if k.startswith("linear_qkv_down_proj.layer_norm_")]
-        if not layernorm_keys:
-            pytest.skip("Fused test backend did not expose linear_qkv_down_proj layernorm keys")
-
-        fused_keys = [k for k in sharded_sd if k.startswith("linear_qkv_down_proj.")]
-        assert all(k.startswith("linear_qkv_down_proj.layer_norm_") for k in fused_keys)
-
-    def test_synthetic_state_dict_hooks_fuse_legacy_down_proj_weights(self):
-        if not is_te_min_version("1.10.0"):
-            pytest.skip("Requires TE >= 1.10.0")
-
-        fused = FusedMLASelfAttention(
-            self.transformer_config,
-            get_fused_mla_submodules(),
-            layer_number=1,
-            attn_mask_type=AttnMaskType.causal,
-        )
-        config = self.transformer_config
-        q_weight = torch.randn(config.q_lora_rank, config.hidden_size)
-        kv_weight = torch.randn(
-            config.kv_lora_rank + config.qk_pos_emb_head_dim, config.hidden_size
-        )
-        state_dict = {
-            "linear_q_down_proj.weight": q_weight,
-            "linear_kv_down_proj.weight": kv_weight,
-        }
-
-        assert fused._synthetic_state_dict_key_suffixes() == ("linear_q_down_proj.weight",)
-        fused._synthesize_fused_qkv_down_weight(state_dict, "")
-
-        assert "linear_q_down_proj.weight" not in state_dict
-        assert "linear_kv_down_proj.weight" not in state_dict
-        torch.testing.assert_close(
-            state_dict["linear_qkv_down_proj.weight"], torch.cat([q_weight, kv_weight], dim=0)
-        )
 
 
 class TestFusedMLARequiresQLora:

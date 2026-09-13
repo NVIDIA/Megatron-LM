@@ -36,13 +36,10 @@ logger = logging.getLogger(__name__)
 WARMUP_ITERS = 5
 BENCH_ITERS = 20
 
-STANDARD_GEMM_SHAPES = [
-    (8192, 8192, 8192),
-    (4096, 4096, 16384),
-]
+STANDARD_GEMM_SHAPES = [(8192, 8192, 8192), (4096, 4096, 16384)]
 
 MSG_BYTES_LARGE = 256 * 1024 * 1024  # 256 MiB.
-MSG_BYTES_SMALL = 1 * 1024 * 1024    # 1 MiB.
+MSG_BYTES_SMALL = 1 * 1024 * 1024  # 1 MiB.
 MSG_SIZES = [MSG_BYTES_LARGE, MSG_BYTES_SMALL]
 
 OUTLIER_MIN_DEVIATION_FRAC = 0.10  # Only flag if deviation from mean exceeds 10% of mean.
@@ -51,6 +48,7 @@ OUTLIER_MIN_DEVIATION_FRAC = 0.10  # Only flag if deviation from mean exceeds 10
 # ---------------------------------------------------------------------------
 # Timing / reporting helpers (no Megatron dependency).
 # ---------------------------------------------------------------------------
+
 
 def _time_cuda_op(fn, warmup, iters):
     """Time *fn* using CUDA events, return average seconds per call."""
@@ -111,11 +109,15 @@ def _gather_and_check(name, local_value, hostnames=None):
         outlier_ranks = participating_indices[outlier_mask]
         has_outliers = len(outlier_ranks) > 0
 
-        logger.info(f"  {name}: median={median:.2f}, mean={mean:.2f}, min={min_val:.2f}, max={max_val:.2f}")
+        logger.info(
+            f"  {name}: median={median:.2f}, mean={mean:.2f}, min={min_val:.2f}, max={max_val:.2f}"
+        )
         if has_outliers:
             for i in outlier_ranks:
                 node = f" ({hostnames[i]})" if hostnames else ""
-                logger.warning(f"    OUTLIER rank {i}{node}: {all_vals[i]:.2f} ({(all_vals[i] - median) / median:+.1%})")
+                logger.warning(
+                    f"    OUTLIER rank {i}{node}: {all_vals[i]:.2f} ({(all_vals[i] - median) / median:+.1%})"
+                )
 
     return has_outliers
 
@@ -123,6 +125,7 @@ def _gather_and_check(name, local_value, hostnames=None):
 # ---------------------------------------------------------------------------
 # GEMM benchmark.
 # ---------------------------------------------------------------------------
+
 
 def bench_gemms(extra_shapes=None):
     """Run GEMM benchmarks.
@@ -155,6 +158,7 @@ def bench_gemms(extra_shapes=None):
 # All-reduce benchmark.
 # ---------------------------------------------------------------------------
 
+
 def bench_all_reduce(group):
     """Run all-reduce benchmark over *group*.
 
@@ -177,7 +181,12 @@ def bench_all_reduce(group):
         avg = _time_cuda_op(_run, WARMUP_ITERS, BENCH_ITERS)
         nbytes = numel * 2
         busbw = 2 * nbytes * (group_size - 1) / group_size / avg / 1e9
-        results.append((f"All-reduce busbw (global PG, size={group_size}, {nbytes / 1e6:.0f} MB) [GB/s]", busbw))
+        results.append(
+            (
+                f"All-reduce busbw (global PG, size={group_size}, {nbytes / 1e6:.0f} MB) [GB/s]",
+                busbw,
+            )
+        )
         del buf
     return results
 
@@ -185,6 +194,7 @@ def bench_all_reduce(group):
 # ---------------------------------------------------------------------------
 # Reduce-scatter benchmark.
 # ---------------------------------------------------------------------------
+
 
 def bench_reduce_scatter(group):
     """Run reduce-scatter benchmark over *group*.
@@ -210,7 +220,12 @@ def bench_reduce_scatter(group):
         avg = _time_cuda_op(_run, WARMUP_ITERS, BENCH_ITERS)
         nbytes = numel * 2
         busbw = nbytes * (group_size - 1) / group_size / avg / 1e9
-        results.append((f"Reduce-scatter busbw (TP PG, size={group_size}, {nbytes / 1e6:.0f} MB) [GB/s]", busbw))
+        results.append(
+            (
+                f"Reduce-scatter busbw (TP PG, size={group_size}, {nbytes / 1e6:.0f} MB) [GB/s]",
+                busbw,
+            )
+        )
         del sendbuf, recvbuf
     return results
 
@@ -218,6 +233,7 @@ def bench_reduce_scatter(group):
 # ---------------------------------------------------------------------------
 # All-to-all benchmark.
 # ---------------------------------------------------------------------------
+
 
 def bench_all_to_all(group):
     """Run all-to-all benchmark over *group*.
@@ -243,7 +259,9 @@ def bench_all_to_all(group):
         avg = _time_cuda_op(_run, WARMUP_ITERS, BENCH_ITERS)
         nbytes = numel * 2
         busbw = nbytes * (group_size - 1) / group_size / avg / 1e9
-        results.append((f"All-to-all busbw (EP PG, size={group_size}, {nbytes / 1e6:.0f} MB) [GB/s]", busbw))
+        results.append(
+            (f"All-to-all busbw (EP PG, size={group_size}, {nbytes / 1e6:.0f} MB) [GB/s]", busbw)
+        )
         del sendbuf, recvbuf
     return results
 
@@ -251,6 +269,7 @@ def bench_all_to_all(group):
 # ---------------------------------------------------------------------------
 # Send/recv benchmark.
 # ---------------------------------------------------------------------------
+
 
 def bench_sendrecv(group):
     """Pairwise send/recv within *group* at multiple strides.
@@ -310,10 +329,12 @@ def bench_sendrecv(group):
                 busbw = float('nan')
 
             rank0_partner = global_ranks[stride] if stride < group_size else -1
-            results.append((
-                f"Send/recv busbw (DP PG, {msg_bytes / 1e6:.0f} MB, e.g., rank {global_ranks[0]} <-> rank {rank0_partner}) [GB/s]",
-                busbw,
-            ))
+            results.append(
+                (
+                    f"Send/recv busbw (DP PG, {msg_bytes / 1e6:.0f} MB, e.g., rank {global_ranks[0]} <-> rank {rank0_partner}) [GB/s]",
+                    busbw,
+                )
+            )
 
         del sendbuf, recvbuf
     return results
@@ -323,9 +344,9 @@ def bench_sendrecv(group):
 # Orchestration: run all benchmarks and report
 # ---------------------------------------------------------------------------
 
+
 def run_sniff_tests(
-    ep_group, dp_group, ar_group=None, tp_group=None,
-    extra_gemm_shapes=None, tag="",
+    ep_group, dp_group, ar_group=None, tp_group=None, extra_gemm_shapes=None, tag=""
 ):
     """Run all sniff tests and report.
 
@@ -378,6 +399,7 @@ def run_sniff_tests(
 # Entry point for the Megatron training loop
 # ---------------------------------------------------------------------------
 
+
 def _get_ffn_gemm_shapes():
     """Derive up-proj and down-proj GEMM shapes from current training args."""
     from megatron.training.global_vars import get_args
@@ -404,10 +426,7 @@ def _get_ffn_gemm_shapes():
     fc2_N = h
     fc2_K = ffn_h // tp
 
-    return [
-        (fc1_M, fc1_N, fc1_K, "up-proj/fc1"),
-        (fc2_M, fc2_N, fc2_K, "down-proj/fc2"),
-    ]
+    return [(fc1_M, fc1_N, fc1_K, "up-proj/fc1"), (fc2_M, fc2_N, fc2_K, "down-proj/fc2")]
 
 
 def run_gpu_sniff_test(tag="", pg_collection=None):
@@ -421,7 +440,7 @@ def run_gpu_sniff_test(tag="", pg_collection=None):
         from megatron.core.process_groups_config import ProcessGroupCollection
 
         pg_collection = ProcessGroupCollection.use_mpu_process_groups(
-            required_pgs=['ep', 'dp', 'tp'],
+            required_pgs=['ep', 'dp', 'tp']
         )
 
     ffn_shapes = _get_ffn_gemm_shapes()
@@ -439,6 +458,7 @@ def run_gpu_sniff_test(tag="", pg_collection=None):
 # ---------------------------------------------------------------------------
 # Standalone entry point
 # ---------------------------------------------------------------------------
+
 
 def _create_ep_groups(ep_size):
     """Create EP-style groups: consecutive blocks of *ep_size* ranks."""
@@ -484,18 +504,25 @@ def _create_tp_groups(tp_size):
 
 def main():
     p = argparse.ArgumentParser(
-        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     p.add_argument(
-        "--ep-size", type=int, default=None,
+        "--ep-size",
+        type=int,
+        default=None,
         help="EP group size. Default: LOCAL_WORLD_SIZE (one node).",
     )
     p.add_argument(
-        "--tp-size", type=int, default=None,
+        "--tp-size",
+        type=int,
+        default=None,
         help="TP group size for reduce-scatter. Default: LOCAL_WORLD_SIZE (one node).",
     )
     p.add_argument(
-        "--gemm-shapes", type=str, nargs="*", default=None,
+        "--gemm-shapes",
+        type=str,
+        nargs="*",
+        default=None,
         help="Extra GEMM shapes as MxNxK strings, e.g. 2048x8192x4096.",
     )
     p.add_argument("--skip-gemm", action="store_true")
@@ -516,7 +543,9 @@ def main():
     tp_size = args.tp_size or int(os.environ.get("LOCAL_WORLD_SIZE", world_size))
 
     if rank == 0:
-        logger.info(f"GPU sniff test (standalone): world_size={world_size}, ep_size={ep_size}, tp_size={tp_size}")
+        logger.info(
+            f"GPU sniff test (standalone): world_size={world_size}, ep_size={ep_size}, tp_size={tp_size}"
+        )
         logger.info(f"CUDA device: {torch.cuda.get_device_name()}")
 
     ep_group = _create_ep_groups(ep_size) if not args.skip_alltoall else None

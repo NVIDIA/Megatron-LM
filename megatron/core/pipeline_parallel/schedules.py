@@ -1,7 +1,8 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import contextlib
 from functools import partial
+from itertools import zip_longest
 from typing import Callable, Dict, Iterator, List, Optional, Union
 
 import torch
@@ -39,7 +40,6 @@ from .combined_1f1b import (
     combined_1f1b_schedule_for_interleaved_pipelining,
     combined_1f1b_schedule_for_no_pipelining,
 )
-from .hybrid_cp_schedule import hybrid_context_parallel_forward_backward
 
 # Types
 Shape = Union[List[int], torch.Size]
@@ -357,6 +357,8 @@ def forward_step_calc_loss(
         if config.calculate_per_token_loss:
             MoEAuxLossAutoScaler.set_loss_scale(loss_scale)
         else:
+            # See https://github.com/NVIDIA/Megatron-LM/pull/2217 for detailed explanation
+            # of scaling by cp_group_size
             cp_size_for_scaling = cp_group_size if cp_group_size is not None else 1
             MoEAuxLossAutoScaler.set_loss_scale(loss_scale * cp_size_for_scaling / num_microbatches)
 
@@ -765,24 +767,6 @@ def forward_backward_no_pipelining(
             total_num_tokens,
             partial(check_first_val_step, first_val_step, forward_only),
         )
-    elif config.hybrid_context_parallel:
-        forward_data_store, total_num_tokens = hybrid_context_parallel_forward_backward(
-            forward_step_func,
-            data_iterator,
-            model,
-            num_microbatches,
-            input_tensor,
-            output_tensor_grad,
-            forward_data_store,
-            config,
-            collect_non_loss_data,
-            first_val_step,
-            forward_only,
-            no_sync_func,
-            total_num_tokens,
-            check_first_val_step,
-            model_type,
-        )
     else:
         with no_sync_func():
             for i in range(num_microbatches - 1):
@@ -989,6 +973,136 @@ def get_schedule_table(num_microbatches, num_model_chunks, microbatch_group_size
     return schedule_table
 
 
+def convert_schedule_table_to_order(num_warmup_microbatches, num_model_chunks, schedule_table):
+    """Convert a tunable schedule lookup table to the te.make_graphed_callables() accepted
+    order format. For example, the tunable schedule table for PP2 N3M5 with VP2 is as below:
+    virtual_microbatch_id | 0 1 2 3 4 5 6 7 8 9
+    microbatch_id         | 0 1 2 0 1 2 3 4 3 4
+    model_chunk_id        | 0 0 0 1 1 1 0 0 1 1
+
+    Then the forward backward separated order is:
+    forward               | 1 1 1 2 2 2 1 1 2 2
+    backward              | -2 -2 -2 -1 -1 -1 -2 -2 -1 -1
+
+    If num_warmup_microbatches is 5, the output order is:
+    1 1 1 2 2 2 -2 1 -2 1 -2 2 -1 2 -1 -1 -2 -2 -1 -1
+    """
+    _, model_chunk_id_table = zip(*schedule_table)
+    forward_order = [chunk_id + 1 for chunk_id in model_chunk_id_table]
+    backward_order = [chunk_id - num_model_chunks for chunk_id in model_chunk_id_table]
+    order = forward_order[:num_warmup_microbatches]
+    for i in range(num_warmup_microbatches, len(forward_order)):
+        order.append(forward_order[i])
+        order.append(backward_order[i - num_warmup_microbatches])
+    if num_warmup_microbatches > 0:
+        order.extend(backward_order[-num_warmup_microbatches:])
+    return order
+
+
+def get_overlap_moe_expert_parallel_comm_order(order, num_layers_per_chunk, capture_wgrad_graph):
+    """
+    This functions gets the order for overlap_moe_expert_parallel_comm schedule for the original
+    chunk-wise order list. Each chunk is transformered to chunks with only 1 layer so that
+    layers between 2 chunks can now overlap with each other while following the graph order.
+    If capture_wgrad_graph is True, the wgrad backward graph is also added to the order by
+    decreasing the layer id by 0.5.
+
+    Args:
+        order (List[int]): The original chunk-wise order list. Positive values represent forward
+            passes for chunks, negative values represent backward passes. The absolute value
+            indicates the chunk ID (1-indexed).
+        num_layers_per_chunk (List[int]): Number of graphable layers in each chunk. The length
+            of this list equals the number of chunks.
+        capture_wgrad_graph (bool): If True, weight gradient computation graphs are added to the
+            order by appending entries with layer_id - 0.5.
+
+    Returns:
+        Tuple[List[float], List[Optional[List[int]]]]: A tuple containing:
+            - new_order: The layer-wise order list where each chunk is expanded to individual
+              layers. Positive values are forward passes, negative values are backward passes.
+              Values with .5 suffix indicate weight gradient computations.
+            - chunk_id_list: A list parallel to new_order. For forward passes, contains
+              [chunk_id, layer_index_within_chunk]. For backward passes, contains None.
+
+    Example:
+        original_order: [1, 2, -2, 1, -1, -1]
+        num_layers_per_chunk: [1, 2]
+        capture_wgrad_graph=True:
+            new_order: [1, 2, 3, 1, -3, -3.5, -2, -2.5, -1, -1.5, -1, -1.5]
+            chunk_id_list: [[0, 0], [1, 0], [1, 1], [0, 0], None,
+                            None, None, None, None, None, None, None]
+        capture_wgrad_graph=False:
+            new_order: [1, 2, 3, 1, -3, -2, -1, -1]
+            chunk_id_list: [[0, 0], [1, 0], [1, 1], [0, 0], None, None, None, None]
+    """
+
+    def _add_order(new_order, chunk_id_list, c_id, layer_id, is_wgrad=False, index=None):
+        if is_wgrad:
+            new_order.append(layer_id - 0.5)
+        else:
+            new_order.append(layer_id)
+        if c_id > 0:
+            chunk_id_list.append([abs(c_id) - 1, index])
+        else:
+            chunk_id_list.append(None)
+
+    new_order = []
+    chunk_id_list = []
+    add_order = partial(_add_order, new_order, chunk_id_list)
+    first_backward_idx, last_forward_idx = None, None
+    for idx, c_id in enumerate(order):
+        if first_backward_idx is None and c_id < 0:
+            first_backward_idx = idx
+        if c_id > 0:
+            last_forward_idx = idx
+
+    def get_layer_range(c_id):
+        num_layers = num_layers_per_chunk[abs(c_id) - 1]
+        num_layers_previous_chunks = sum(num_layers_per_chunk[: abs(c_id) - 1])
+        if c_id > 0:
+            return list(
+                range(num_layers_previous_chunks + 1, num_layers_previous_chunks + num_layers + 1)
+            )
+        return list(range(-num_layers_previous_chunks - num_layers, -num_layers_previous_chunks))
+
+    # warmup stage
+    for c_id in order[:first_backward_idx]:
+        layer_range = get_layer_range(c_id)
+        new_order += layer_range
+        chunk_id_list.extend([abs(c_id) - 1, i] for i in range(len(layer_range)))
+
+    # 1f1b overlap stage
+    if first_backward_idx < last_forward_idx:
+        for c_id_b, c_id_f in zip(
+            order[first_backward_idx : last_forward_idx + 1 : 2],
+            order[first_backward_idx + 1 : last_forward_idx + 1 : 2],
+        ):
+            layer_range_f = get_layer_range(c_id_f)
+            layer_range_b = get_layer_range(c_id_b)
+            index = 0
+            for l_b, l_f in zip_longest(layer_range_b, layer_range_f, fillvalue=0):
+                # always forward graph before backward graph
+                if l_f != 0:
+                    add_order(c_id_f, l_f, index=index)
+                if l_b != 0:
+                    add_order(c_id_b, l_b)
+                    if capture_wgrad_graph and index < len(layer_range_b) - 1:
+                        add_order(c_id_b, l_b, is_wgrad=True)
+                index += 1
+            # last wgrad backward
+            if capture_wgrad_graph and layer_range_b:
+                add_order(c_id_b, layer_range_b[-1], is_wgrad=True)
+
+    # cool down stage, backward graphs only
+    for c_id in order[last_forward_idx + 1 :]:
+        for l_b in get_layer_range(c_id):
+            add_order(c_id, l_b)
+            if capture_wgrad_graph:
+                add_order(c_id, l_b, is_wgrad=True)
+
+    return new_order, chunk_id_list
+
+
 def forward_backward_pipelining_with_interleaving(
     *,
     forward_step_func,
@@ -1154,7 +1268,15 @@ def forward_backward_pipelining_with_interleaving(
 
     model_type = get_model_type(model[0])
 
-    tensor_shape = [seq_length, micro_batch_size, config.hidden_size]
+    # Determine hidden dimension for P2P communication
+    # For hyper connections with multiple PP stages, use n-stream dimension
+    hidden_dim = config.hidden_size
+    if getattr(config, 'enable_hyper_connections', False) and pipeline_parallel_size > 1:
+        # For interleaved PP with hyper connections, all intermediate communications use n-stream
+        # Note: This is a simplified approach - proper VPP support may need more complex logic
+        hidden_dim = config.hidden_size * getattr(config, 'num_residual_streams', 1)
+
+    tensor_shape = [seq_length, micro_batch_size, hidden_dim]
     tensor_shape[0] = tensor_shape[0] // cp_group.size()
     if config.sequence_parallel:
         tensor_shape[0] = tensor_shape[0] // tp_group.size()
@@ -2093,8 +2215,18 @@ def get_tensor_shapes(
     config,
     tp_group: Optional[torch.distributed.ProcessGroup] = None,
     cp_group: Optional[torch.distributed.ProcessGroup] = None,
+    pp_group: Optional[torch.distributed.ProcessGroup] = None,
+    is_recv: bool = True,
 ):
     """Determine tensor shapes for pipeline communication.
+
+    For hyper connections (mHC), intermediate pipeline stages communicate n-stream tensors
+    with dimension hidden_size * num_residual_streams.
+
+    Args:
+        is_recv: If True, compute shape for receiving; if False, for sending.
+                 This matters for hyper connections where first/last stages have different
+                 send/recv dimensions.
 
     Returns [()] for variable_seq_lengths mode (shapes exchanged dynamically),
     or computed shapes for fixed sequence length mode.
@@ -2113,7 +2245,27 @@ def get_tensor_shapes(
     if config.sequence_parallel:
         effective_seq_length = effective_seq_length // tp_group.size()
 
-    tensor_shapes.append((effective_seq_length, micro_batch_size, config.hidden_size))
+    # Determine hidden dimension based on hyper connections and pipeline stage
+    hidden_size = config.hidden_size
+    # TODO: make this more robust, including flexible VPP layout
+    if getattr(config, 'enable_hyper_connections', False) and pp_group is not None:
+        pp_rank = pp_group.rank()
+        pp_size = pp_group.size()
+        # For hyper connections:
+        # - recv: stages with rank > 0 receive n-stream (n*C) from previous stage
+        # - send: stages with rank < pp_size-1 send n-stream (n*C) to next stage
+        use_nstream = False
+        if is_recv and pp_rank > 0:
+            # Receiving from previous stage (which sends n*C)
+            use_nstream = True
+        elif not is_recv and pp_rank < pp_size - 1:
+            # Sending to next stage (send n*C)
+            use_nstream = True
+
+        if use_nstream:
+            hidden_size = hidden_size * getattr(config, 'num_residual_streams', 1)
+
+    tensor_shapes.append((effective_seq_length, micro_batch_size, hidden_size))
     return tensor_shapes
 
 
@@ -2272,6 +2424,8 @@ def forward_backward_pipelining_without_interleaving(
         config=config,
         tp_group=tp_group,
         cp_group=cp_group,
+        pp_group=getattr(p2p_communicator, "pp_group", None),
+        is_recv=True,
     )
     send_tensor_shapes = get_tensor_shapes(
         seq_length=seq_length,
@@ -2280,6 +2434,8 @@ def forward_backward_pipelining_without_interleaving(
         config=config,
         tp_group=tp_group,
         cp_group=cp_group,
+        pp_group=getattr(p2p_communicator, "pp_group", None),
+        is_recv=False,
     )
     if adjust_tensor_shapes_fn is not None:
         recv_tensor_shapes, send_tensor_shapes = adjust_tensor_shapes_fn(

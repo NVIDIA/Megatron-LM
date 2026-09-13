@@ -1,16 +1,16 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
 import logging
-from datetime import datetime
 import os
+from datetime import datetime
 from functools import partial
 from logging import Filter, LogRecord
 from typing import Callable
 
-from megatron.core._rank_utils import safe_get_rank, safe_get_world_size
-from megatron.training.utils import print_rank_0
 import torch
 
+from megatron.core._rank_utils import safe_get_rank, safe_get_world_size
+from megatron.training.utils import print_rank_0
 
 logger = logging.getLogger(__name__)
 

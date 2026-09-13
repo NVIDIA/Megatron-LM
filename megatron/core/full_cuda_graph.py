@@ -75,14 +75,21 @@ def copy_tensors_in_struct(src):
 def clone_tensors_in_struct(tgt, src):
     """Copy src to pre-existing tensors in tgt."""
     if isinstance(src, tuple):
-        raise Exception(f"Unsupported copy for tuple yet: {type(src)}")
+        if not isinstance(tgt, tuple) or len(tgt) != len(src):
+            return copy_tensors_in_struct(src)
+        return tuple(clone_tensors_in_struct(t, s) for t, s in zip(tgt, src))
     elif isinstance(src, list):
+        if not isinstance(tgt, list) or len(tgt) != len(src):
+            return copy_tensors_in_struct(src)
         for i in range(len(src)):
             if isinstance(src[i], (tuple, list, dict, torch.Tensor)):
-                clone_tensors_in_struct(tgt[i], src[i])
+                tgt[i] = clone_tensors_in_struct(tgt[i], src[i])
             else:
                 tgt[i] = src[i]
+        return tgt
     elif isinstance(src, dict):
+        if not isinstance(tgt, dict):
+            return copy_tensors_in_struct(src)
         for k in src:
             if isinstance(src[k], (tuple, list, dict, torch.Tensor)):
                 clone_tensors_in_struct(tgt[k], src[k])
@@ -132,7 +139,10 @@ class StaticBufferLoader:
                     StaticBufferLoader.static_buffers[stage][microbatch], inputs
                 )
         torch.cuda.current_stream().wait_stream(self.stream)
-        return StaticBufferLoader.static_buffers[stage][microbatch]
+        # Shallow-copy so callers may replace or remove top-level entries to tailor the
+        # batch to their pipeline stage without mutating the cached static buffer. Nested
+        # containers and the tensors themselves are still shared with the buffer.
+        return StaticBufferLoader.static_buffers[stage][microbatch].copy()
 
 
 class FullCudaGraphWrapper:
@@ -217,6 +227,13 @@ class FullCudaGraphWrapper:
                     'Upgrade to a PyTorch build that includes pytorch/pytorch#180090.'
                 )
             torch.distributed.barrier()
+            # Release cached blocks reserved during the eager warmup iterations
+            # before the capture allocates its private pool: the two pools
+            # coexist for the lifetime of the graph, and warmup fragmentation
+            # (reserved-but-unallocated blocks) otherwise counts against the
+            # capture's headroom.
+            gc.collect()
+            torch.cuda.empty_cache()
             assert FullCudaGraphWrapper.cuda_graph[training_str] is None
             FullCudaGraphWrapper.cuda_graph[training_str] = torch.cuda.CUDAGraph()
             for _, state in get_all_rng_states().items():

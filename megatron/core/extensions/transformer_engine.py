@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 from __future__ import annotations
 
 import copy
@@ -8,9 +8,8 @@ import inspect
 import io
 import os
 import pickle
-import re
 import warnings
-from contextlib import contextmanager, nullcontext
+from contextlib import nullcontext
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tuple, cast
 
 import torch
@@ -20,9 +19,13 @@ from torch import Tensor
 from torch.nn.parameter import Parameter
 from typing_extensions import override
 
-from megatron.core.dist_checkpointing.mapping import ShardedObject, ShardedStateDict
+from megatron.core.activations import situlu
+from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.enums import Fp4Recipe, Fp8Recipe
+from megatron.core.extensions.transformer_engine_int4_fake_qat import (
+    maybe_fake_quantize_int4_weight_tensors,
+)
 from megatron.core.model_parallel_config import ModelParallelConfig
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import (
@@ -85,42 +88,6 @@ except ImportError:
         HAVE_TE = False
 
 _TE_CONFIG_TYPE_KEY = "transformer_engine_config_type"
-_EXPERT_PARAMETER_NAME_PATTERN = re.compile(r"(weight|bias)\d*")
-
-
-def _set_expert_parameter_attributes(
-    module: torch.nn.Module, parallel_mode: Optional[str], use_expert_pgs: bool
-) -> None:
-    """Set process-group and tensor-partition metadata on an expert TE module.
-
-    ``allreduce=False`` selects EDP for gradient reduction.
-
-    Weights and biases, including TEGroupedLinear's numbered parameters, are also marked as
-    TP-partitioned according to ``parallel_mode``; row-parallel biases remain replicated.
-
-    Any parameter which is partitioned along TP or ETP is marked with ``tensor_model_parallel``,
-    which ensures that all shards contribute to the gradient norm.
-
-    Args:
-        module: Transformer Engine module whose direct parameters should be marked.
-        parallel_mode: Tensor-parallel mode used by the module (``"column"``, ``"row"``, or None).
-        use_expert_pgs: Whether to use EP/ETP/EDP process groups instead of TP/CP/DP.
-    """
-    for name, param in module.named_parameters(recurse=False):
-        param.allreduce = not use_expert_pgs
-
-        name_match = _EXPERT_PARAMETER_NAME_PATTERN.fullmatch(name)
-        parameter_kind = name_match.group(1) if name_match else None
-        is_weight = parameter_kind == "weight"
-        is_bias = parameter_kind == "bias"
-        is_partitioned = parallel_mode in ("column", "row") and (
-            is_weight or (parallel_mode == "column" and is_bias)
-        )
-        if is_weight or is_bias:
-            param.tensor_model_parallel = is_partitioned
-        if is_partitioned:
-            param.partition_dim = 1 if parallel_mode == "row" else 0
-            param.partition_stride = 1
 
 
 class TransformerEngineConfigType(enum.Enum):
@@ -418,90 +385,6 @@ def condition_init_method(config, init_method):
     return init_method if config.perform_initialization else (lambda w: None)
 
 
-def _gtp_pre_init(
-    module,
-    output_size,
-    gtp_remat_group,
-    extra_kwargs,
-    *,
-    is_expert=False,
-    rng_via_kwarg=True,
-    out_split_size=1,
-):
-    """Pre-shard ``out_features`` so plain TE builds this rank's shard; route init to a per-rank
-    RNG region (``rng_via_kwarg=False`` for LayerNormLinear). Returns ``(out_features, gtp_ctx)``.
-
-    ``out_split_size`` is the factor TE further splits ``out_features`` by AFTER GTP (=tp_size for
-    column-parallel, else 1). GTP pads the per-TP slice (``output_size // out_split_size``) so each
-    rank's final shard stays alignment-divisible. Padding the full ``out_features`` would leave the
-    post-TP-split shard mis-aligned (MXFP8 needs dims divisible by 32).
-    """
-    from megatron.core.tensor_parallel.gtp_api import gtp_remat_shard_dim0
-    from megatron.core.tensor_parallel.random import get_gtp_remat_rng_tracker_name
-
-    assert (
-        output_size % out_split_size == 0
-    ), f"_gtp_pre_init: output_size={output_size} not divisible by out_split_size={out_split_size}"
-    per_rank, pad_length = gtp_remat_shard_dim0(output_size // out_split_size, gtp_remat_group)
-    shard_out = per_rank * out_split_size
-    gtp_ctx = (gtp_remat_group, pad_length, output_size)
-
-    tracker_name = get_gtp_remat_rng_tracker_name(is_expert=is_expert)
-    if rng_via_kwarg:
-        extra_kwargs["rng_tracker_name"] = tracker_name
-    else:
-        module.rng_tracker_name = tracker_name
-    return shard_out, gtp_ctx
-
-
-def _gtp_attach_post_init(module, gtp_ctx, is_grouped=False):
-    """Attach the GTP surface to a pre-sharded TE module's weights and restore logical out_features.
-
-    ``is_grouped=True`` for GroupedLinear (per-expert weight0..N, coalesced AG via weight_list).
-    """
-    from megatron.core.tensor_parallel.gtp_api import attach_gtp_to_presharded_module
-
-    gtp_remat_group, pad_length, logical_out_features = gtp_ctx
-    # Restore the LOGICAL out_features (the sharded value was only needed to size the weight in
-    # super().__init__): downstream code reads it, e.g. the grouped-MLP fusion gate checks
-    # fc1.out_features == 2 * fc2.in_features (a shard-sized fc1 would silently disable fusion).
-    module.out_features = logical_out_features
-    attach_gtp_to_presharded_module(module, gtp_remat_group, pad_length, is_grouped=is_grouped)
-
-
-@contextmanager
-def _init_gtp_remat_context(
-    module,
-    output_size,
-    gtp_remat_group,
-    extra_kwargs,
-    *,
-    is_expert=False,
-    is_grouped=False,
-    rng_via_kwarg=True,
-    out_split_size=1,
-):
-    """Wrap a plain TE constructor: yield out_features for ``super().__init__`` (pre-sharded under
-    GTP), then attach GTP wiring on exit (skipped if construction raises, so it can't half-init).
-
-    ``out_split_size`` = tp_size TE splits ``out_features`` by after GTP (column-parallel), else 1.
-    """
-    if gtp_remat_group is None or gtp_remat_group.size() <= 1:
-        yield output_size
-        return
-    out_features, gtp_ctx = _gtp_pre_init(
-        module,
-        output_size,
-        gtp_remat_group,
-        extra_kwargs,
-        is_expert=is_expert,
-        rng_via_kwarg=rng_via_kwarg,
-        out_split_size=out_split_size,
-    )
-    yield out_features
-    _gtp_attach_post_init(module, gtp_ctx, is_grouped=is_grouped)
-
-
 def split_te_layernorm_column_parallel_linear(
     fused_layer,
     config,
@@ -601,6 +484,13 @@ if HAVE_TE and is_te_min_version("1.13.0"):
                     layer_type = te.pytorch.ops.GEGLU
                 elif config.activation_func == F.silu:
                     layer_type = te.pytorch.ops.ReGLU
+                elif config.activation_func is situlu:
+                    layer_type = getattr(te.pytorch.ops, "SiTUGLU", None)
+                    if layer_type is None:
+                        raise RuntimeError(
+                            "SiTU-GLU requires Transformer Engine with "
+                            "pytorch.ops.SiTUGLU support."
+                        )
             else:
                 if config.activation_func == F.gelu:
                     layer_type = te.pytorch.ops.GELU
@@ -608,10 +498,14 @@ if HAVE_TE and is_te_min_version("1.13.0"):
                     layer_type = te.pytorch.ops.ReLU
             if layer_type is None:
                 raise Exception(
-                    'Only SwiGLU, GEGLU, ReGLU, GELU, ReLU are supported by '
+                    'Only SwiGLU, SiTU-GLU, GEGLU, ReGLU, GELU, ReLU are supported by '
                     'transformer engine. Please set use_te_activation_func=False'
                 )
             activation_func_kwargs = {}
+            if config.activation_func is situlu:
+                activation_func_kwargs.update(
+                    beta1=config.situ_glu_beta1, beta2=config.situ_glu_beta2
+                )
             if config.activation_func_fp8_input_store:
                 activation_func_kwargs["cache_quantized_input"] = True
             layer = layer_type(**activation_func_kwargs)
@@ -883,7 +777,6 @@ class TELinear(te.pytorch.Linear):
         symmetric_ar_type: Optional[str] = None,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
         name: str | None = None,
-        gtp_remat_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
         """
         Args:
@@ -979,10 +872,6 @@ class TELinear(te.pytorch.Linear):
             tp_size = get_pg_size(tp_group)
 
         self.expert_parallel = self.config.expert_model_parallel_size > 1
-        use_expert_pgs = is_expert and (
-            self.expert_parallel
-            or self.config.expert_tensor_parallel_size != self.config.tensor_model_parallel_size
-        )
         if is_expert:
             rng_tracker_name = get_expert_parallel_rng_tracker_name()
         else:
@@ -1020,16 +909,8 @@ class TELinear(te.pytorch.Linear):
         init_quant_context = _get_fp8_model_init_for_quant_params(
             self.te_quant_params, torch.is_grad_enabled()
         )
-        init_gtp_remat_context = _init_gtp_remat_context(
-            self,
-            output_size,
-            gtp_remat_group,
-            extra_kwargs,
-            is_expert=is_expert,
-            out_split_size=tp_size if te_parallel_mode == "column" else 1,
-        )
 
-        with init_quant_context, init_gtp_remat_context as output_size:
+        with init_quant_context:
             super().__init__(
                 in_features=input_size,
                 out_features=output_size,
@@ -1048,10 +929,11 @@ class TELinear(te.pytorch.Linear):
                 **extra_kwargs,
             )
 
-        if is_expert:
-            _set_expert_parameter_attributes(self, parallel_mode, use_expert_pgs)
-        else:
-            for param in self.parameters():
+        for param in self.parameters():
+            if is_expert:
+                # Reduce the gradient on the expert_data_parallel group for expert linear layers
+                setattr(param, "allreduce", not self.expert_parallel)
+            else:
                 # Reduce the gradient on DP group
                 setattr(param, "allreduce", True)
                 if parallel_mode == "duplicated":
@@ -1119,6 +1001,141 @@ class TELinear(te.pytorch.Linear):
             super().backward_dw()
 
 
+class TERMSNormDuplicatedLinear(te.pytorch.LayerNormLinear):
+    """Transformer Engine RMSNormLinear with weights duplicated across TP ranks."""
+
+    def __init__(
+        self,
+        input_size: int,
+        output_size: int,
+        *,
+        parallel_mode: Optional[str],
+        config: TransformerConfig,
+        init_method: Callable,
+        bias: bool,
+        skip_bias_add: bool,
+        skip_weight_param_allocation: bool,
+        is_expert: bool = False,
+        tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        name: str | None = None,
+    ):
+        if not HAVE_TE:
+            raise ImportError(
+                "Transformer Engine is not installed. "
+                "Please install it with `pip install transformer-engine`."
+            )
+        if parallel_mode != "duplicated":
+            raise ValueError("TERMSNormDuplicatedLinear requires parallel_mode='duplicated'.")
+        if is_expert:
+            raise ValueError("TERMSNormDuplicatedLinear does not support expert parameters.")
+        if skip_weight_param_allocation:
+            raise ValueError(
+                "Transformer Engine linear layers do not support skip_weight_param_allocation"
+            )
+
+        self.config = config
+        self.te_return_bias = skip_bias_add and bias
+        self.is_first_microbatch = True
+        self.disable_parameter_transpose_cache = self.config.disable_parameter_transpose_cache
+        self.rng_tracker_name = get_data_parallel_rng_tracker_name()
+
+        extra_kwargs = _get_extra_te_kwargs(config)
+        if self.config.delay_wgrad_compute:
+            if is_te_min_version("2.3.0"):
+                extra_kwargs["delay_wgrad_compute"] = True
+            else:
+                raise RuntimeError("Only TE with version >=2.3.0 supports delay_wgrad_compute now.")
+
+        self.te_quant_params: Optional[TEQuantizationParams] = None
+        quant_config = get_quant_config_or_none(name, config.quant_recipe)
+        self.finish_init(quant_config)
+        init_quant_context = _get_fp8_model_init_for_quant_params(
+            self.te_quant_params, torch.is_grad_enabled()
+        )
+
+        # TODO: When GTP reaches LatentMoE on dev, accept its rematerialization and replica
+        # groups here and wrap TE construction in `_init_gtp_remat_context` with
+        # `rng_via_kwarg=False`. GTP should shard only the linear weight's output dimension
+        # (including any alignment padding); the RMSNorm scale stays replicated at [input_size],
+        # and the rematerialized output keeps the logical [..., output_size] shape.
+        with init_quant_context:
+            super().__init__(
+                in_features=input_size,
+                out_features=output_size,
+                eps=self.config.layernorm_epsilon,
+                sequence_parallel=False,
+                fuse_wgrad_accumulation=self.config.gradient_accumulation_fusion,
+                tp_group=None,
+                tp_size=1,
+                get_rng_state_tracker=(
+                    get_cuda_rng_tracker if get_cuda_rng_tracker().is_initialized() else None
+                ),
+                init_method=condition_init_method(config, init_method),
+                bias=bias,
+                normalization="RMSNorm",
+                return_bias=self.te_return_bias,
+                parallel_mode=None,
+                return_layernorm_output=False,
+                zero_centered_gamma=self.config.layernorm_zero_centered_gamma,
+                **extra_kwargs,
+            )
+
+        # TODO: With GTP, restore the optional bias after pre-sharded TE construction. GTP
+        # shards only the linear weight, so bias must remain replicated at [output_size].
+        self._tp_group = (
+            tp_group
+            if tp_group is not None
+            else get_tensor_model_parallel_group_if_none(tp_group, is_expert=False)
+        )
+        for param in self.parameters():
+            setattr(param, "allreduce", True)
+            setattr(param, "sequence_parallel", self.config.sequence_parallel)
+            setattr(param, "tensor_model_parallel", False)
+
+    def finish_init(self, quantization_config: QuantizationConfig):
+        """Post-init of quantization override."""
+        if quantization_config is None:
+            self.te_quant_params = None
+        else:
+            self.te_quant_params = TEQuantizationParams.parse_from_config(quantization_config)
+
+    def will_execute_quantized(self, is_context_quantized: bool) -> bool:
+        """Return whether the module is configured to execute quantized."""
+        return _get_should_context_be_quantized_params(
+            self.te_quant_params, self.training, is_context_quantized
+        )
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Apply RMSNorm followed by the duplicated linear projection."""
+        _is_first_microbatch = (
+            None if self.disable_parameter_transpose_cache else self.is_first_microbatch
+        )
+        quant_context = _get_fp8_autocast_for_quant_params(self.te_quant_params, self.training)
+        with quant_context:
+            out = super().forward(x, is_first_microbatch=_is_first_microbatch)
+        self.is_first_microbatch = False
+        if self.te_return_bias:
+            return out
+        return out, None
+
+    def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
+        """Replicate parameters across TP and DP checkpoint coordinates."""
+        state_dict = self.state_dict(prefix="", keep_vars=True)
+        return make_sharded_tensors_for_checkpoint(
+            state_dict,
+            prefix,
+            None,
+            sharded_offsets,
+            tp_group=self._tp_group,
+            dp_cp_group=metadata["dp_cp_group"],
+        )
+
+    def backward_dw(self):
+        """Compute weight gradients when delayed wgrad computation is enabled."""
+        if self.config.delay_wgrad_compute:
+            super().backward_dw()
+
+
 class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
     """Wrapper for the Transformer-Engine's `LayerNormLinear` layer
     that combines layernorm and linear layers."""
@@ -1139,10 +1156,13 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
         stride: int = 1,
         name: str | None = None,
+        eps: float | None = None,
     ):
         """
         Args:
             name (str | None): module instance name passed top-down from its paranet module
+            eps (float | None): Epsilon for the fused layer norm. Defaults to
+                ``config.layernorm_epsilon`` when ``None``.
         """
         if not HAVE_TE:
             raise ImportError(
@@ -1234,10 +1254,6 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
             ), "Must have at least TE version 2.3 or higher to use symmetric memory all reduce"
             extra_kwargs["symmetric_ar_type"] = self.config.symmetric_ar_type
 
-        pg_collection = ProcessGroupCollection.use_mpu_process_groups(
-            required_pgs=["gtp_remat", "expt_gtp_remat"]
-        )
-        gtp_remat_group = pg_collection.expt_gtp_remat if is_expert else pg_collection.gtp_remat
         self.stride = stride
 
         self.te_quant_params: Optional[TEQuantizationParams] = None
@@ -1246,23 +1262,12 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
         init_quant_context = _get_fp8_model_init_for_quant_params(
             self.te_quant_params, torch.is_grad_enabled()
         )
-        # Yield a separate gtp_output_size: the logical output_size is reused below for cpu-init
-        # (divide(output_size, tp_size)), so it must stay unsharded.
-        # rng_via_kwarg=False: TE's LayerNormLinear constructor has no rng_tracker_name kwarg.
-        init_gtp_remat_context = _init_gtp_remat_context(
-            self,
-            output_size,
-            gtp_remat_group,
-            extra_kwargs,
-            rng_via_kwarg=False,
-            out_split_size=self.tp_size,
-        )
 
-        with init_quant_context, init_gtp_remat_context as gtp_output_size:
+        with init_quant_context:
             super().__init__(
                 in_features=input_size,
-                out_features=gtp_output_size,
-                eps=self.config.layernorm_epsilon,
+                out_features=output_size,
+                eps=self.config.layernorm_epsilon if eps is None else eps,
                 sequence_parallel=self.config.sequence_parallel,
                 fuse_wgrad_accumulation=self.config.gradient_accumulation_fusion,
                 tp_group=tp_group if torch.distributed.is_initialized() else None,
@@ -1365,11 +1370,6 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
             f"out_features={self.out_features}, "
             f"bias={self.use_bias}, "
             f"TP={self.tp_size}"
-            + (
-                f", GTP_remat={self.weight.gtp_remat_size}"
-                if getattr(self.weight, "gtp_remat_size", None) is not None
-                else ""
-            )
         )
 
     def backward_dw(self):
@@ -1416,10 +1416,6 @@ class TEColumnParallelLinear(TELinear):
         world_size = get_pg_size(tp_group)
         rank = get_pg_rank(tp_group)
         self.stride = stride
-        pg_collection = ProcessGroupCollection.use_mpu_process_groups(
-            required_pgs=["gtp_remat", "expt_gtp_remat"]
-        )
-        gtp_remat_group = pg_collection.expt_gtp_remat if is_expert else pg_collection.gtp_remat
 
         super().__init__(
             input_size=input_size,
@@ -1439,7 +1435,6 @@ class TEColumnParallelLinear(TELinear):
             symmetric_ar_type=config.symmetric_ar_type,
             tp_group=tp_group,
             name=name,
-            gtp_remat_group=gtp_remat_group,
         )
 
         # Set proper partition_stride
@@ -1471,13 +1466,6 @@ class TEColumnParallelLinear(TELinear):
                     self.bias.zero_()
                 setattr(self.bias, "allreduce", True)
 
-        if is_expert:
-            use_expert_pgs = (
-                config.expert_model_parallel_size > 1
-                or config.expert_tensor_parallel_size != config.tensor_model_parallel_size
-            )
-            _set_expert_parameter_attributes(self, "column", use_expert_pgs)
-
     def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
         """Sharding along axis 0, bias sharded"""
         state_dict = self.state_dict(prefix="", keep_vars=True)
@@ -1498,11 +1486,6 @@ class TEColumnParallelLinear(TELinear):
             f"out_features={self.out_features}, "
             f"bias={self.use_bias}, "
             f"TP={self.tp_size}"
-            + (
-                f", GTP_remat={self.weight.gtp_remat_size}"
-                if getattr(self.weight, "gtp_remat_size", None) is not None
-                else ""
-            )
         )
 
     def backward_dw(self):
@@ -1675,10 +1658,6 @@ class TERowParallelLinear(TELinear):
             )
         tp_group = get_tensor_model_parallel_group_if_none(tp_group, is_expert=is_expert)
         self._tp_group = tp_group
-        pg_collection = ProcessGroupCollection.use_mpu_process_groups(
-            required_pgs=["gtp_remat", "expt_gtp_remat"]
-        )
-        gtp_remat_group = pg_collection.expt_gtp_remat if is_expert else pg_collection.gtp_remat
 
         super().__init__(
             input_size=input_size,
@@ -1699,7 +1678,6 @@ class TERowParallelLinear(TELinear):
             symmetric_ar_type=config.symmetric_ar_type,
             tp_group=tp_group,
             name=name,
-            gtp_remat_group=gtp_remat_group,
         )
         if config.use_cpu_initialization:
             world_size = get_pg_size(tp_group)
@@ -1727,13 +1705,6 @@ class TERowParallelLinear(TELinear):
                 setattr(self.bias, "allreduce", True)
                 setattr(self.bias, "sequence_parallel", config.sequence_parallel)
 
-        if is_expert:
-            use_expert_pgs = (
-                config.expert_model_parallel_size > 1
-                or config.expert_tensor_parallel_size != config.tensor_model_parallel_size
-            )
-            _set_expert_parameter_attributes(self, "row", use_expert_pgs)
-
     def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
         """Sharding along axis 1, bias not sharded"""
         state_dict = self.state_dict(prefix="", keep_vars=True)
@@ -1754,11 +1725,6 @@ class TERowParallelLinear(TELinear):
             f"out_features={self.out_features}, "
             f"bias={self.use_bias}, "
             f"TP={self.tp_size}"
-            + (
-                f", GTP_remat={self.weight.gtp_remat_size}"
-                if getattr(self.weight, "gtp_remat_size", None) is not None
-                else ""
-            )
         )
 
     def backward_dw(self):
@@ -1935,14 +1901,15 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             self.kept_packed_seq_params.discard("cu_seqlens_q_padded")
             self.kept_packed_seq_params.discard("cu_seqlens_kv_padded")
 
-        # total_tokens and seq_idx are only for Mamba and should not be forwarded to TE attention.
-        # tokens_per_sample is only for MoE sequence-level aux loss reshaping.
+        # These fields are MCore-only and should not be forwarded to TE attention.
+        # total_tokens and seq_idx are only for Mamba; tokens_per_sample is only for
+        # MoE sequence-level aux loss reshaping; cp_partition_mode and cp_partition_route
+        # are MCore CP metadata.
         self.kept_packed_seq_params.discard("total_tokens")
         self.kept_packed_seq_params.discard("seq_idx")
         self.kept_packed_seq_params.discard("tokens_per_sample")
-
-        if get_te_version() < PkgVersion("2.2.0"):
-            self.kept_packed_seq_params.discard("pad_between_seqs")
+        self.kept_packed_seq_params.discard("cp_partition_mode")
+        self.kept_packed_seq_params.discard("cp_partition_route")
 
         if config.qk_clip or config.log_max_attention_logit:
             # qk-clip is only supported in TE 2.9.0 and later
@@ -1981,23 +1948,28 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         num_splits: Optional[int] = None,
     ) -> torch.Tensor:
         """Forward."""
+        # Save TE's current CP group before potential DCP switch (for restore at end).
+        _te_orig_cp_group = self.cp_group
+        _te_orig_cp_global_ranks = self.cp_global_ranks
+
         if packed_seq_params is not None:
             # If Dynamic CP group is provided, update TE DPA CP group
-            if packed_seq_params.cp_group is not None:
-                self.cp_group = packed_seq_params.cp_group
-                super().set_context_parallel_group(
-                    self.cp_group,
-                    torch.distributed.get_process_group_ranks(self.cp_group),
-                    TEDotProductAttention.cp_stream,
-                    self.cp_comm_type,
-                )
-            # If cp_group is None but local_cp_size is provided,
-            # Indicates to turn off CP dynamically
-            elif packed_seq_params.local_cp_size is not None:
-                assert (
-                    packed_seq_params.local_cp_size == 1
-                ), "local_cp_size must be == 1 if provided without cp_group"
-                super().set_context_parallel_group(None, None, None, self.cp_comm_type)
+            if packed_seq_params.local_cp_size is not None:
+                if packed_seq_params.local_cp_size == 1:
+                    super().set_context_parallel_group(None, None, None, self.cp_comm_type)
+                else:
+                    assert (
+                        packed_seq_params.cp_group is not None
+                    ), "cp_group is not set in packed_seq_params for dynamic CP"
+                    self.cp_group = packed_seq_params.cp_group
+                    if TEDotProductAttention.cp_stream is None:
+                        TEDotProductAttention.cp_stream = torch.cuda.Stream()
+                    super().set_context_parallel_group(
+                        self.cp_group,
+                        torch.distributed.get_process_group_ranks(self.cp_group),
+                        TEDotProductAttention.cp_stream,
+                        self.cp_comm_type,
+                    )
             self.kept_packed_seq_params.discard("cp_group")
             self.kept_packed_seq_params.discard("local_cp_size")
 
@@ -2014,6 +1986,19 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             if packed_seq_params is not None
             else {}
         )
+        if (
+            packed_seq_kwargs.get("qkv_format") == "thd"
+            and packed_seq_kwargs.get("pad_between_seqs") is False
+        ):
+            # Megatron represents end padding as dummy THD sequences. TE DPA
+            # sizes THD outputs from cu_seqlens_q/kv, so pass padded
+            # boundaries as the effective attention boundaries while keeping
+            # the original PackedSeqParams metadata intact for downstream
+            # loss/routing paths.
+            if packed_seq_kwargs.get("cu_seqlens_q_padded") is not None:
+                packed_seq_kwargs["cu_seqlens_q"] = packed_seq_kwargs["cu_seqlens_q_padded"]
+            if packed_seq_kwargs.get("cu_seqlens_kv_padded") is not None:
+                packed_seq_kwargs["cu_seqlens_kv"] = packed_seq_kwargs["cu_seqlens_kv_padded"]
         qkv_format = packed_seq_kwargs.get('qkv_format', self.qkv_format)
 
         attention_bias_kwargs = {}
@@ -2078,6 +2063,19 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                 _fa_kwargs["num_splits"] = num_splits
             core_attn_out = super().forward(query, key, value, attention_mask, **_fa_kwargs)
 
+        # Restore TE's CP group after dynamic CP forward.
+        if (
+            packed_seq_params is not None
+            and packed_seq_params.local_cp_size is not None
+            and self.config.context_parallel_size > 1
+        ):
+            super().set_context_parallel_group(
+                _te_orig_cp_group,
+                _te_orig_cp_global_ranks,
+                TEDotProductAttention.cp_stream,
+                self.cp_comm_type,
+            )
+
         return core_attn_out
 
     def sharded_state_dict(
@@ -2102,6 +2100,10 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
 
 
 if HAVE_TE and is_te_min_version("1.9.0.dev0"):
+
+    _TE_GROUPED_LINEAR_SUPPORTS_GROUPED_TENSOR = (
+        "use_grouped_tensor" in inspect.signature(te.pytorch.GroupedLinear.__init__).parameters
+    )
 
     class TEGroupedLinear(te.pytorch.GroupedLinear):
         """
@@ -2160,10 +2162,6 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             extra_kwargs["ub_name"] = tp_comm_buffer_name
 
             self.expert_parallel = self.config.expert_model_parallel_size > 1
-            use_expert_pgs = is_expert and (
-                self.expert_parallel
-                or self.config.expert_tensor_parallel_size != self.config.tensor_model_parallel_size
-            )
             if is_expert:
                 extra_kwargs["rng_tracker_name"] = get_expert_parallel_rng_tracker_name()
 
@@ -2177,7 +2175,6 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             self._tp_group = tp_group
             tp_size = get_pg_size(tp_group)
             tp_group_for_te = tp_group
-            gtp_remat_group = pg_collection.expt_gtp_remat
 
             self.explicit_expert_comm = is_expert and (tp_size > 1 or self.expert_parallel)
 
@@ -2198,11 +2195,35 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 tp_group_for_te = None
 
             if is_te_min_version("2.14.0"):
-                extra_kwargs["single_grouped_weight"] = getattr(
-                    config, "moe_single_grouped_weight", False
-                )
-                extra_kwargs["single_grouped_bias"] = getattr(
-                    config, "moe_single_grouped_bias", False
+                # nemo_26.04 ships TE 2.14.0+71bbefbf whose GroupedLinear.__init__ does NOT
+                # yet accept single_grouped_{weight,bias}, even though the version string
+                # passes is_te_min_version("2.14.0"). Introspect the signature instead of
+                # version-gating, mirroring the patch in dsv4_fused_attn / main_megatron.
+                # The GroupedLinear.__init__ signature is constant for a given TE install, so
+                # introspect once and cache at module scope rather than on every TEGroupedLinear
+                # instantiation (matters for large MoE models with many expert groups).
+                global _TE_GROUPED_LINEAR_INIT_PARAMS
+                try:
+                    _gl_params = _TE_GROUPED_LINEAR_INIT_PARAMS
+                except NameError:
+                    _gl_params = _TE_GROUPED_LINEAR_INIT_PARAMS = set(
+                        inspect.signature(te.pytorch.GroupedLinear.__init__).parameters
+                    )
+                if "single_grouped_weight" in _gl_params:
+                    extra_kwargs["single_grouped_weight"] = getattr(
+                        config, "moe_single_grouped_weight", False
+                    )
+                if "single_grouped_bias" in _gl_params:
+                    extra_kwargs["single_grouped_bias"] = getattr(
+                        config, "moe_single_grouped_bias", False
+                    )
+
+            if _TE_GROUPED_LINEAR_SUPPORTS_GROUPED_TENSOR:
+                extra_kwargs["use_grouped_tensor"] = config.moe_use_grouped_tensor
+            elif config.moe_use_grouped_tensor and not config.use_transformer_engine_op_fuser:
+                raise RuntimeError(
+                    "moe_use_grouped_tensor=True requires a Transformer Engine GroupedLinear "
+                    "that exposes the use_grouped_tensor argument."
                 )
 
             self.te_quant_params: Optional[TEQuantizationParams] = None
@@ -2211,17 +2232,8 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             init_quant_context = _get_fp8_model_init_for_quant_params(
                 self.te_quant_params, torch.is_grad_enabled()
             )
-            init_gtp_remat_context = _init_gtp_remat_context(
-                self,
-                output_size,
-                gtp_remat_group,
-                extra_kwargs,
-                is_expert=True,
-                is_grouped=True,
-                out_split_size=tp_size if parallel_mode == "column" else 1,
-            )
 
-            with init_quant_context, init_gtp_remat_context as output_size:
+            with init_quant_context:
                 super().__init__(
                     num_gemms=num_gemms,
                     in_features=input_size,
@@ -2240,7 +2252,23 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                     **extra_kwargs,
                 )
 
-            _set_expert_parameter_attributes(self, original_parallel_mode, use_expert_pgs)
+            for param in self.parameters():
+                setattr(param, "allreduce", not (is_expert and self.expert_parallel))
+
+            # Explicitly stamp partition_dim and partition_stride on expert weight
+            # tensors when explicit_expert_comm cleared parallel_mode.  TE ≤2.12
+            # set these internally; TE ≥2.13 no longer does (parallel_mode=None
+            # is passed due to explicit_expert_comm).  The resharding/refit planner
+            # relies on partition_dim to correctly plan TP gather/scatter operations.
+            # NOTE: we intentionally do NOT stamp tensor_model_parallel here —
+            # doing so would change num-zeros gradient counting.
+            if self.explicit_expert_comm and original_parallel_mode in ("column", "row"):
+                part_dim = 0 if original_parallel_mode == "column" else 1
+                for i in range(num_gemms):
+                    weight = getattr(self, f"weight{i}", None)
+                    if weight is not None:
+                        setattr(weight, "partition_dim", part_dim)
+                        setattr(weight, "partition_stride", 1)
 
             self._register_load_state_dict_pre_hook(
                 type(self)._normalize_grouped_parameter_keys, with_module=True
@@ -2437,6 +2465,13 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 return out
             return out, None
 
+        def _get_weight_tensors(self):
+            """Get the weight tensors of the module."""
+            weight_tensors = super()._get_weight_tensors()
+            return maybe_fake_quantize_int4_weight_tensors(
+                self.config, self.delay_wgrad_compute, weight_tensors
+            )
+
         def _encode_extra_state(self, state):
             # TE 2.0 changed the format of extra_state to be a byte tensor
             if is_te_min_version("2.0.0"):
@@ -2469,8 +2504,6 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 return [state] * self.num_gemms
 
             state = self._decode_extra_state(state)
-            if state is None:
-                return [torch.empty(0, dtype=torch.uint8)] * self.num_gemms
             extra_states = []
             extra_fp8_variables = state["extra_fp8_variables"]
             extra_fp8_variables["num_gemms"] = 1
@@ -2570,12 +2603,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 )
                 if self.use_bias:
                     sharded_state_dict[f"{prefix}bias{gemm_idx}"] = sub_sd[f"{gemm_idx}.bias"]
-            # Set the expert-DP replica_id, picking the group by what EGTP_remat does to each entry:
-            #   - _extra_state ShardedObject: REPLICATED across EGTP_remat → need distinct ids
-            #     to avoid duplicate-writer collisions → use the full ``expt_dp_gtp_remat``.
-            #   - weight ShardedTensor: SHARDED across EGTP_remat (distinct) → not replicas →
-            #     elect the writer over the replicate group ``expt_dp``.
-            # EGTP_remat=1: the two groups coincide, so this is a no-op.
+            # Adjust replica ids - replication along DP modulo EP
             for k, sh_ten in sharded_state_dict.items():
                 replica_id = sh_ten.replica_id
                 assert (
@@ -2583,8 +2611,6 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 ), f"Expected replica_id for {k} to be in (PP, TP, DP) format, got: {replica_id}"
                 if getattr(sh_ten, "is_data_parallel_fully_shard", False):
                     edp_replica_id = 0
-                elif isinstance(sh_ten, ShardedObject):
-                    edp_replica_id = get_pg_rank(self._pg_collection.expt_dp_gtp_remat)
                 else:
                     edp_replica_id = get_pg_rank(self._pg_collection.expt_dp)
                 sh_ten.replica_id = (*replica_id[:2], edp_replica_id)
@@ -2597,17 +2623,6 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             """
             if self.delay_wgrad_compute:
                 super().backward_dw()
-
-        def __repr__(self):
-            gtp_remat = getattr(getattr(self, "weight0", None), "gtp_remat_size", None)
-            gtp_str = f", GTP_remat={gtp_remat}" if gtp_remat is not None else ""
-            return (
-                f"{type(self).__name__}(per expert(["
-                f"in={self.in_features}, out={self.out_features}]) "
-                f"X num_gemms={self.num_gemms}, "
-                f"bias={self.use_bias}, TP={self.tp_size}"
-                f"{gtp_str})"
-            )
 
     class TEColumnParallelGroupedLinear(TEGroupedLinear):
         """
@@ -2712,6 +2727,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             )
 
 else:
+    _TE_GROUPED_LINEAR_SUPPORTS_GROUPED_TENSOR = False
     TEGroupedLinear = None  # type: ignore[assignment, misc]
     TEColumnParallelGroupedLinear = None  # type: ignore[assignment, misc]
     TERowParallelGroupedLinear = None  # type: ignore[assignment, misc]
@@ -2876,6 +2892,12 @@ if HAVE_TE and is_te_min_version("1.13.0"):
                 op_type = te.pytorch.ops.ReLU
             elif (activation_func, gated_linear_unit) == (F.relu, True):
                 op_type = te.pytorch.ops.ReGLU
+            elif (activation_func, gated_linear_unit) == (situlu, True):
+                op_type = getattr(te.pytorch.ops, "SiTUGLU", None)
+                if op_type is None:
+                    raise RuntimeError(
+                        "SiTU-GLU requires Transformer Engine with " "pytorch.ops.SiTUGLU support."
+                    )
 
             # Could not find corresponding activation op
             if op_type is None:
@@ -2887,6 +2909,8 @@ if HAVE_TE and is_te_min_version("1.13.0"):
 
             # Construct op
             kwargs = {}
+            if activation_func is situlu:
+                kwargs.update(beta1=self.config.situ_glu_beta1, beta2=self.config.situ_glu_beta2)
             if is_te_min_version("2.3"):
                 kwargs["cache_quantized_input"] = cache_quantized_input
             return op_type(**kwargs)
@@ -3055,14 +3079,23 @@ if HAVE_TE and is_te_min_version("1.13.0"):
                     f"{self.__class__.__name__} does not support add_bias_linear=True; "
                     "the CuTeGEMM fused kernel requires bias-free linear layers."
                 )
-            if self.config.activation_func != F.silu or not self.config.gated_linear_unit:
+            if not self.config.gated_linear_unit or self.config.activation_func not in (
+                F.silu,
+                situlu,
+            ):
                 raise ValueError(
-                    f"{self.__class__.__name__} requires SwiGLU activation "
-                    "(activation_func=F.silu, gated_linear_unit=True) "
+                    f"{self.__class__.__name__} requires SwiGLU or SiTU-GLU activation "
+                    "with gated_linear_unit=True "
                     "for the CuTeGEMM fused kernel, but got "
                     f"activation_func={self.config.activation_func}, "
                     f"gated_linear_unit={self.config.gated_linear_unit}."
                 )
+            if self.config.activation_func is situlu:
+                if not hasattr(te.pytorch.ops, "ScaledSiTUGLU"):
+                    raise RuntimeError(
+                        "SiTU-GLU requires Transformer Engine with "
+                        "pytorch.ops.ScaledSiTUGLU support."
+                    )
 
         def _make_fused_impl(self) -> te.pytorch.ops.Sequential:
             """Construct fused module with GroupedLinear(num_groups=1) + ScaledSwiGLU."""
@@ -3139,9 +3172,19 @@ if HAVE_TE and is_te_min_version("1.13.0"):
             op._glu_interleave_size = _GLU_INTERLEAVE_SIZE  # signals fuser_forward to interleave
             fused_impl.append(op)
 
-            # ScaledSwiGLU with glu_interleave_size=32
-            # Required by ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8
-            fused_impl.append(te.pytorch.ops.ScaledSwiGLU(glu_interleave_size=32))
+            if self.config.activation_func is situlu:
+                # ScaledSiTUGLU with glu_interleave_size=32.
+                fused_impl.append(
+                    te.pytorch.ops.ScaledSiTUGLU(
+                        glu_interleave_size=32,
+                        beta1=self.config.situ_glu_beta1,
+                        beta2=self.config.situ_glu_beta2,
+                    )
+                )
+            else:
+                # ScaledSwiGLU with glu_interleave_size=32
+                # Required by ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8
+                fused_impl.append(te.pytorch.ops.ScaledSwiGLU(glu_interleave_size=32))
 
             # FC2: GroupedLinear(num_groups=1) instead of BasicLinear
             weight = self.linear_fc2.weight
@@ -3212,8 +3255,13 @@ if HAVE_TE and is_te_min_version("1.13.0"):
 
             return out, bias
 
+    # ``TEFusedDenseMLP`` is the original dev name for the main-side
+    # ``TEFusedMLPWithGroupedLinear`` class. Keep it importable for dev callers.
+    TEFusedDenseMLP = TEFusedMLPWithGroupedLinear
+
 else:
     TEFusedMLP = None  # type: ignore[assignment, misc]
+    TEFusedDenseMLP = None  # type: ignore[assignment, misc]
     TEFusedMLPWithGroupedLinear = None  # type: ignore[assignment, misc]
 
 
@@ -3562,10 +3610,35 @@ if HAVE_TE and is_te_min_version("2.7.0.dev"):
         fused_topk_with_score_function,
     )
 
+    try:
+        from transformer_engine.pytorch.router import (  # pylint: disable=unused-import
+            mark_qb_bin_bounds_validated,
+        )
+    except ImportError:
+        mark_qb_bin_bounds_validated = None
+
+    try:
+        _fused_topk_sig = inspect.signature(fused_topk_with_score_function)
+        fused_topk_with_score_function_supports_qb = {
+            "qb_histogram",
+            "qb_bin_bounds",
+            "qb_histogram_mode",
+        }.issubset(_fused_topk_sig.parameters)
+        fused_topk_with_score_function_supports_topk_indices = (
+            "topk_indices" in _fused_topk_sig.parameters
+        )
+        del _fused_topk_sig
+    except (TypeError, ValueError):
+        fused_topk_with_score_function_supports_qb = False
+        fused_topk_with_score_function_supports_topk_indices = False
+
 else:
     fused_topk_with_score_function = None
     fused_compute_score_for_moe_aux_loss = None
     fused_moe_aux_loss = None
+    fused_topk_with_score_function_supports_qb = False
+    mark_qb_bin_bounds_validated = None
+    fused_topk_with_score_function_supports_topk_indices = False
 
 
 def set_save_original_input(module):
@@ -3601,3 +3674,24 @@ try:
     from transformer_engine.pytorch.float8_tensor import Float8Tensor
 except ImportError:
     Float8Tensor = None
+
+
+def get_thd_partitioned_indices(cu_seqlens, total_tokens, cp_size, cp_rank):
+    """Get partitioned indices for THD format data in context parallel.
+
+    Args:
+        cu_seqlens: Cumulative sequence lengths tensor.
+        total_tokens: Total number of tokens.
+        cp_size: Context parallel world size.
+        cp_rank: Context parallel rank.
+
+    Returns:
+        Partitioned indices tensor.
+    """
+    assert is_te_min_version("1.10.0"), (
+        "Please update Transformer Engine to >= 1.10 to use "
+        "Context Parallel with THD format data"
+    )
+    import transformer_engine_torch as tex
+
+    return tex.thd_get_partitioned_indices(cu_seqlens, total_tokens, cp_size, cp_rank)

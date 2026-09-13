@@ -87,7 +87,6 @@ functional:configure:
         "--record-checkpoints ${RECORD_CHECKPOINTS}"
         "--slurm-account ${CI_SLURM_ACCOUNT}"
         "--no-enable-warmup"
-        "--enable-error-extraction"
       )
     - |
       SMOKE_ARGS=(
@@ -102,7 +101,6 @@ functional:configure:
         "--record-checkpoints false"
         "--slurm-account ${CI_SLURM_ACCOUNT}"
         "--no-enable-warmup"
-        "--enable-error-extraction"
       )
     - |
       export PYTHONPATH=$(pwd)

@@ -35,12 +35,12 @@ import torch.distributed as dist
 
 try:
     from megatron.rl.rl_utils import get_rl_runtime_state
+
     has_rl_runtime_state = True
 except ImportError:
     has_rl_runtime_state = False
 
 logger = logging.getLogger(__name__)
-
 
 
 # RL timer names split into loggable (added to timers_to_log in training.py) and
@@ -137,14 +137,8 @@ TIMER_HIERARCHY = {
         "rl/log-wandb-tb",
         "rl/compute-logprobs",
     ],
-    "rl/compute-logprobs": [
-        "rl/compute-old-logprobs",
-        "rl/compute-ref-logprobs",
-    ],
-    "rl/get-logprobs": [
-        "rl/forward-pass",
-        "rl/log-softmax",
-    ],
+    "rl/compute-logprobs": ["rl/compute-old-logprobs", "rl/compute-ref-logprobs"],
+    "rl/get-logprobs": ["rl/forward-pass", "rl/log-softmax"],
     "optimizer": [
         "optimizer-copy-to-main-grad",
         "optimizer-inner-step",
@@ -156,6 +150,7 @@ TIMER_HIERARCHY = {
 @dataclass
 class IterationProfile:
     """Profile data for a single iteration."""
+
     iteration: int
     timestamp: str
     elapsed_time_ms: float  # Total iteration time
@@ -215,6 +210,7 @@ class IterationProfile:
 @dataclass
 class RunSummary:
     """Aggregated statistics across all iterations in a run."""
+
     run_id: str
     start_time: str
     end_time: str
@@ -370,8 +366,10 @@ class RLProfiler:
 
         # Warn if no timer data was collected (might indicate timing issue)
         if not timer_data:
-            logger.warning(f"[RLProfiler] No timer data collected for iteration {iteration}. "
-                          "Timers may have been reset before profiling.")
+            logger.warning(
+                f"[RLProfiler] No timer data collected for iteration {iteration}. "
+                "Timers may have been reset before profiling."
+            )
 
         # Compute load imbalance metrics
         load_imbalance = {}
@@ -416,7 +414,9 @@ class RLProfiler:
         if self.log_to_tensorboard and tb_writer:
             self._log_to_tensorboard(profile, tb_writer, iteration, extra_metrics)
 
-    def _collect_timer_data(self, timers) -> Tuple[Dict[str, Tuple[float, float]], Dict[str, float]]:
+    def _collect_timer_data(
+        self, timers
+    ) -> Tuple[Dict[str, Tuple[float, float]], Dict[str, float]]:
         """Collect min/max timer data across ranks and rank0 times.
 
         Returns:
@@ -584,24 +584,35 @@ class RLProfiler:
 
         with open(csv_path, "w", newline="") as f:
             writer = csv.writer(f)
-            writer.writerow([
-                "timer_name", "mean_ms", "std_ms", "min_ms", "max_ms",
-                "p50_ms", "p95_ms", "p99_ms", "count"
-            ])
+            writer.writerow(
+                [
+                    "timer_name",
+                    "mean_ms",
+                    "std_ms",
+                    "min_ms",
+                    "max_ms",
+                    "p50_ms",
+                    "p95_ms",
+                    "p99_ms",
+                    "count",
+                ]
+            )
             for name in self.timer_names:
                 if name in stats:
                     s = stats[name]
-                    writer.writerow([
-                        name,
-                        f"{s['mean']:.2f}",
-                        f"{s['std']:.2f}",
-                        f"{s['min']:.2f}",
-                        f"{s['max']:.2f}",
-                        f"{s['p50']:.2f}",
-                        f"{s['p95']:.2f}",
-                        f"{s['p99']:.2f}",
-                        s['count'],
-                    ])
+                    writer.writerow(
+                        [
+                            name,
+                            f"{s['mean']:.2f}",
+                            f"{s['std']:.2f}",
+                            f"{s['min']:.2f}",
+                            f"{s['max']:.2f}",
+                            f"{s['p50']:.2f}",
+                            f"{s['p95']:.2f}",
+                            f"{s['p99']:.2f}",
+                            s['count'],
+                        ]
+                    )
 
         logger.info(f"[RLProfiler] Exported summary to {csv_path}")
         return str(csv_path)
@@ -656,10 +667,7 @@ def get_rl_profiler() -> Optional[RLProfiler]:
 
 
 def initialize_rl_profiler(
-    output_dir: Optional[str] = None,
-    run_id: Optional[str] = None,
-    enabled: bool = True,
-    **kwargs,
+    output_dir: Optional[str] = None, run_id: Optional[str] = None, enabled: bool = True, **kwargs
 ) -> RLProfiler:
     """
     Initialize the global RL profiler.
@@ -667,12 +675,7 @@ def initialize_rl_profiler(
     Should be called once at training start.
     """
     global _RL_PROFILER
-    _RL_PROFILER = RLProfiler(
-        output_dir=output_dir,
-        run_id=run_id,
-        enabled=enabled,
-        **kwargs,
-    )
+    _RL_PROFILER = RLProfiler(output_dir=output_dir, run_id=run_id, enabled=enabled, **kwargs)
     return _RL_PROFILER
 
 
@@ -717,6 +720,7 @@ def shutdown_rl_profiler():
 # Analysis utilities for cross-run comparison
 # ============================================================================
 
+
 def load_profile_jsonl(path: str) -> List[Dict[str, Any]]:
     """Load profile data from a JSONL file."""
     profiles = []
@@ -748,9 +752,7 @@ def load_summary_csv(path: str) -> Dict[str, Dict[str, float]]:
 
 
 def compare_runs(
-    run_paths: List[str],
-    run_names: Optional[List[str]] = None,
-    output_path: Optional[str] = None,
+    run_paths: List[str], run_names: Optional[List[str]] = None, output_path: Optional[str] = None
 ) -> str:
     """
     Compare profiling data across multiple runs.
@@ -816,11 +818,7 @@ def analyze_bottlenecks(profile_path: str, top_n: int = 10) -> str:
     stats = load_summary_csv(profile_path)
 
     # Sort by mean time (descending)
-    sorted_timers = sorted(
-        stats.items(),
-        key=lambda x: x[1]["mean_ms"],
-        reverse=True
-    )
+    sorted_timers = sorted(stats.items(), key=lambda x: x[1]["mean_ms"], reverse=True)
 
     lines = []
     lines.append("=" * 70)
@@ -843,10 +841,7 @@ def analyze_bottlenecks(profile_path: str, top_n: int = 10) -> str:
             "rl/offload-optimizer-before-inference",
             "rl/restore-optimizer-after-inference",
         ],
-        "Logprobs Computation": [
-            "rl/compute-old-logprobs",
-            "rl/compute-ref-logprobs",
-        ],
+        "Logprobs Computation": ["rl/compute-old-logprobs", "rl/compute-ref-logprobs"],
         "Training": ["forward-backward"],
         "Sync/Wait": ["rl/suspend-engine", "rl/sync-rollouts"],
     }
@@ -864,6 +859,7 @@ def analyze_bottlenecks(profile_path: str, top_n: int = 10) -> str:
 # ============================================================================
 # CLI for analysis (can be run as: python -m megatron.rl.rl_profiling ...)
 # ============================================================================
+
 
 def main():
     """Command-line interface for profile analysis."""
@@ -896,7 +892,7 @@ def main():
         print(compare_runs(args.profiles, args.names, args.output))
     elif args.command == "list":
         profiles = load_profile_jsonl(args.profile)
-        for p in profiles[-args.last:]:
+        for p in profiles[-args.last :]:
             print(f"Iteration {p['iteration']}: {p['elapsed_time_ms']:.1f}ms")
     else:
         parser.print_help()

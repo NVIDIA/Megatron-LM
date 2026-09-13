@@ -1,0 +1,2 @@
+# WORLD_SIZE=1 LOCAL_RANK=0 python -m pytest examples/bagel/unit_test/test_attention_mot.py -v --tb=short 2>&1 | tail -40
+WORLD_SIZE=1 LOCAL_RANK=0 python -m pytest examples/bagel/unit_test/test_attention_mot.py

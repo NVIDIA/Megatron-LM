@@ -58,13 +58,18 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor, model: GPTMo
     if args.export_kd_teacher_load:
         # [ModelOpt]: Handle knowledge distillation
         losses = model.compute_kd_loss(
-            student_loss=loss_lm,
-            loss_reduction_fn=lambda x: _mask_loss(x, loss_mask),
+            student_loss=loss_lm, loss_reduction_fn=lambda x: _mask_loss(x, loss_mask)
         )
 
-        report["total loss"] = torch.cat([losses["kd_loss"].clone().detach().view(1), num_tokens.view(1)])
-        report["logits distillation loss"] = torch.cat([losses["logits_loss"].clone().detach().view(1), num_tokens.view(1)])
-        report["intermediate distillation loss"] = torch.cat([losses["intermediate_loss"].clone().detach().view(1), num_tokens.view(1)])
+        report["total loss"] = torch.cat(
+            [losses["kd_loss"].clone().detach().view(1), num_tokens.view(1)]
+        )
+        report["logits distillation loss"] = torch.cat(
+            [losses["logits_loss"].clone().detach().view(1), num_tokens.view(1)]
+        )
+        report["intermediate distillation loss"] = torch.cat(
+            [losses["intermediate_loss"].clone().detach().view(1), num_tokens.view(1)]
+        )
 
         if model.training:
             loss = losses["kd_loss"]

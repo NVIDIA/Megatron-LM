@@ -1,16 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 # TODO: Split this file into smaller files.
 
@@ -58,6 +46,18 @@ from .utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _same_tensor_view(a: Optional[torch.Tensor], b: torch.Tensor) -> bool:
+    if a is None:
+        return False
+    return (
+        a.data_ptr() == b.data_ptr()
+        and a.dtype == b.dtype
+        and a.shape == b.shape
+        and a.stride() == b.stride()
+        and a.storage_offset() == b.storage_offset()
+    )
 
 
 try:
@@ -522,6 +522,12 @@ class TemporaryBucketAllocator:
             _free_storage(self.buckets[bucket_id].data)
             del self.buckets[bucket_id]
 
+    def can_allocate(
+        self, bucket_ids: List[int], releasable_bucket_ids: Optional[set[int]] = None
+    ) -> bool:
+        """Return whether ``bucket_ids`` fit after releasing the supplied buckets."""
+        return True
+
 
 class StorageResizeBasedBucketAllocator(TemporaryBucketAllocator):
     """
@@ -751,6 +757,33 @@ class FixedPoolAllocator(TemporaryBucketAllocator):
             if self.dtype_fn(pg_a) != self.dtype_fn(pg_b) or a_size != b_size:
                 return False
         return True
+
+    def can_allocate(
+        self, bucket_ids: List[int], releasable_bucket_ids: Optional[set[int]] = None
+    ) -> bool:
+        """Return whether the requested buckets fit in the fixed pool."""
+        releasable_bucket_ids = releasable_bucket_ids or set()
+        available_by_offset = defaultdict(int)
+        for _, bucket_offset in self.idle_buffer:
+            available_by_offset[bucket_offset] += 1
+        for bucket_id in releasable_bucket_ids:
+            if bucket_id in self.using_buffer:
+                _, bucket_offset = self.using_buffer[bucket_id]
+                available_by_offset[bucket_offset] += 1
+
+        required_by_offset = defaultdict(int)
+        for bucket_id in set(bucket_ids):
+            fsdp_unit_id = self.fsdp_param_groups[bucket_id].fsdp_unit_id
+            if fsdp_unit_id not in self.fsdp_double_buffer_units or (
+                bucket_id in self.using_buffer and bucket_id not in releasable_bucket_ids
+            ):
+                continue
+            _, bucket_offset = self.fsdp_unit_buckets[fsdp_unit_id][bucket_id]
+            required_by_offset[bucket_offset] += 1
+        return all(
+            required <= available_by_offset[bucket_offset]
+            for bucket_offset, required in required_by_offset.items()
+        )
 
     def allocate(
         self,
@@ -1031,6 +1064,35 @@ class MaxPoolAllocator(TemporaryBucketAllocator):
                 ),
             )
 
+    def can_allocate(
+        self, bucket_ids: List[int], releasable_bucket_ids: Optional[set[int]] = None
+    ) -> bool:
+        """Return whether the requested buckets fit in the max-sized pool."""
+        releasable_bucket_ids = releasable_bucket_ids or set()
+        available_by_slot = defaultdict(int)
+        for _, dtype, bucket_offset in self.idle_buffer:
+            available_by_slot[(dtype, bucket_offset)] += 1
+        for bucket_id in releasable_bucket_ids:
+            if bucket_id in self.using_buffer:
+                _, dtype, bucket_offset = self.using_buffer[bucket_id]
+                available_by_slot[(dtype, bucket_offset)] += 1
+
+        required_by_slot = defaultdict(int)
+        for bucket_id in set(bucket_ids):
+            fsdp_unit_id = self.fsdp_param_groups[bucket_id].fsdp_unit_id
+            if fsdp_unit_id is None or (
+                bucket_id in self.using_buffer and bucket_id not in releasable_bucket_ids
+            ):
+                continue
+            _, bucket_offset = self.bucket_alloc_index[bucket_id]
+            dtype = self.dtype_fn(self.fsdp_param_groups[bucket_id])
+            if dtype == "float8":
+                dtype = torch.uint8
+            required_by_slot[(dtype, bucket_offset)] += 1
+        return all(
+            required <= available_by_slot[slot] for slot, required in required_by_slot.items()
+        )
+
     def allocate(
         self,
         bucket_id: int,
@@ -1277,6 +1339,8 @@ class DataParallelBuffer:
 
         # Count all parameters in this buffer and store their enumerated index.
         self.param_idx = {p: i for i, p in enumerate(self.params)}
+        self.cache_param_bucket_views = ddp_config.megatron_fsdp_cache_param_bucket_views
+        self._param_bucket_view_cache = {}
 
     def init_data(self, data: torch.Tensor):
         """Allocate a buffer Tensor to persistently store the data for this
@@ -1337,6 +1401,30 @@ class DataParallelBuffer:
 
         # Need to set parameter data after resize model weight buffer data-storage.
         if set_param_data:
+            self.set_param_data_from_bucket(bucket)
+        return bucket
+
+    def _bucket_view_cache_key(self, bucket: Bucket):
+        return (
+            bucket.data.data_ptr(),
+            bucket.data.numel(),
+            bucket.data.dtype,
+            str(bucket.data.device),
+            self.is_transpose_buffer,
+        )
+
+    def _build_param_bucket_view_entries(self, bucket: Bucket):
+        entries = []
+        for p in self.params:
+            item_id = self.param_idx[p]
+            p = to_local_if_dtensor(p)
+            data = self.get_item_from_bucket(bucket, item_id).view(p.shape)
+            entries.append((p, data, is_float8tensor(p)))
+        return entries
+
+    def set_param_data_from_bucket(self, bucket: Bucket) -> None:
+        """Attach module parameter tensors to their views in an all-gather bucket."""
+        if not self.cache_param_bucket_views:
             for p in self.params:
                 item_id = self.param_idx[p]
                 p = to_local_if_dtensor(p)
@@ -1345,7 +1433,24 @@ class DataParallelBuffer:
                     fp8_set_raw_data(p, data, self.is_transpose_buffer)
                 else:
                     p.data = data
-        return bucket
+            return
+
+        cache_key = self._bucket_view_cache_key(bucket)
+        entries = self._param_bucket_view_cache.get(cache_key)
+        if entries is None:
+            entries = self._build_param_bucket_view_entries(bucket)
+            self._param_bucket_view_cache[cache_key] = entries
+
+        for p, data, is_fp8 in entries:
+            if is_fp8:
+                old_data = fp8_get_raw_data(p, self.is_transpose_buffer)
+                if _same_tensor_view(old_data, data):
+                    continue
+                fp8_set_raw_data(p, data, self.is_transpose_buffer)
+            else:
+                if _same_tensor_view(p.data, data):
+                    continue
+                p.data = data
 
     def allocate_bucket_storage(
         self,
@@ -1781,6 +1886,29 @@ def _get_parameter_groups(
 
     is_expert_parameter = lambda n, p: ".experts." in n
 
+    def _should_split_from_grouped_expert_bucket(
+        is_expert_param: bool,
+        param: torch.nn.Parameter,
+        param_chunk_size_factor: int,
+        chunk_size_factor: int,
+        same_factor_params: List[torch.nn.Parameter],
+    ) -> bool:
+        """
+        Split grouped expert (>=3D) tensors with heterogeneous chunk size
+        factors into separate buckets to avoid LCM-inflated bucket alignment
+        padding.
+        """
+        # Non-expert groups keep the original LCM/fragment merge.
+        if not is_expert_param:
+            return False
+        # Param already aligns with bucket chunk size factor (always true for
+        # the first param after sort); no split needed.
+        if param_chunk_size_factor == chunk_size_factor:
+            return False
+        return to_local_if_dtensor(param).dim() >= 3 or any(
+            to_local_if_dtensor(p).dim() >= 3 for p in same_factor_params
+        )
+
     # Step 1: Group the parameters according to their execution order and attributes.
     # FSDP unit module parameters are split into multiple parameter sub-groups.
     # All parameters in the module are assigned a parameter group, even non-FSDP modules.
@@ -1880,17 +2008,27 @@ def _get_parameter_groups(
             remaining_params = []
             for param in params:
                 param_shape = to_local_if_dtensor(param).shape
+                param_chunk_size_factor = param_shape[1:].numel()
+                if _should_split_from_grouped_expert_bucket(
+                    group.is_expert_param,
+                    param,
+                    param_chunk_size_factor,
+                    chunk_size_factor,
+                    same_factor_params,
+                ):
+                    remaining_params.append(param)
+                    continue
                 if (
-                    param_shape[1:].numel() == chunk_size_factor
+                    param_chunk_size_factor == chunk_size_factor
                     or (
-                        chunk_size_factor % param_shape[1:].numel() == 0
+                        chunk_size_factor % param_chunk_size_factor == 0
                         and param_shape.numel() % chunk_size_factor == 0
                     )
                     or (param_shape.numel() < chunk_size_factor)
                 ):
                     same_factor_params.append(param)
                 else:
-                    lcm_chunk_size_factor = math.lcm(chunk_size_factor, param_shape[1:].numel())
+                    lcm_chunk_size_factor = math.lcm(chunk_size_factor, param_chunk_size_factor)
                     chunk_size_factor = lcm_chunk_size_factor
                     same_factor_params.append(param)
             # Create a new parameter group with the same chunk size factor.
@@ -2515,8 +2653,9 @@ class ParamAndGradBuffer:
         for group in self.parameter_groups:
             group.grad_dtype = self._resolve_group_grad_dtype(group, meta_device_init_fp8_params)
         if self.ddp_config.fsdp_double_buffer and len(self.bucketing_policy.fsdp_unit_modules) > 0:
-            # Double Buffering
-            UB_BUFFER_NUM = 2
+            # Persistent communication-buffer pooling. The default pool size is two,
+            # while combined 1F1B overlap may require a third concurrently-live unit.
+            ub_buffer_num = self.ddp_config.fsdp_buffer_count
             # Double Buffer Allocator Choice
             FIXED_POOL_ALLOC_TYPE = (
                 MaxPoolAllocator
@@ -2526,13 +2665,13 @@ class ParamAndGradBuffer:
             self.weight_alloc = FIXED_POOL_ALLOC_TYPE(
                 name="fsdp_params",
                 fsdp_param_groups=self.parameter_groups,
-                size=UB_BUFFER_NUM,
+                size=ub_buffer_num,
                 fallback_to_persistent_buffer=self.ddp_config.fsdp_db_use_persist_buf_on_alloc_fail,
             )
             self.transpose_weight_alloc = FIXED_POOL_ALLOC_TYPE(
                 name="fsdp_fp8_transpose_params",
                 fsdp_param_groups=self.parameter_groups,
-                size=UB_BUFFER_NUM,
+                size=ub_buffer_num,
                 fallback_to_persistent_buffer=self.ddp_config.fsdp_db_use_persist_buf_on_alloc_fail,
             )
             # Resolve gradient bucket dtype used for MaxPoolAllocator bucket allocation
@@ -2546,7 +2685,7 @@ class ParamAndGradBuffer:
             self.main_grad_alloc = FIXED_POOL_ALLOC_TYPE(
                 name="fsdp_grads",
                 fsdp_param_groups=self.parameter_groups,
-                size=UB_BUFFER_NUM,
+                size=ub_buffer_num,
                 dtype_fn=grad_dtype_fn,
                 fallback_to_persistent_buffer=(
                     self.ddp_config.fsdp_db_use_persist_buf_on_alloc_fail
@@ -2560,7 +2699,7 @@ class ParamAndGradBuffer:
                 self.hsdp_grad_comm_alloc = FIXED_POOL_ALLOC_TYPE(
                     name="hsdp_grad_comm",
                     fsdp_param_groups=self.parameter_groups,
-                    size=UB_BUFFER_NUM,
+                    size=ub_buffer_num,
                     dtype_fn=grad_dtype_fn,
                     fallback_to_persistent_buffer=(
                         self.ddp_config.fsdp_db_use_persist_buf_on_alloc_fail
@@ -2899,7 +3038,14 @@ class ParamAndGradBuffer:
                                 gc.collect()
                                 torch.cuda.empty_cache()
 
-                            m.to_empty(device=self.device, recurse=False)
+                            # Materialize only meta tensors in a module, preserving
+                            # non-meta tensors that are already initialized on device.
+                            m._apply(
+                                lambda t: (
+                                    torch.empty_like(t, device=self.device) if t.is_meta else t
+                                ),
+                                recurse=False,
+                            )
                             if (
                                 HAVE_TE
                                 and is_te_min_version("0.9.0")
@@ -3518,7 +3664,6 @@ class ParamAndGradBuffer:
                 if is_blockwise_float8tensor(param):
                     fp8_params.append(param)
                     if model_param.numel() == 0:
-                        # Empty parameter.
                         shard_fp32_from_fp8.append(None)
                         shard_offsets_in_fp8.append(None)
                         shard_model_params.append([None, None])
@@ -3949,21 +4094,23 @@ class GradReducePipeline:
         if not self.buffer.ddp_config.fsdp_double_buffer:
             return
 
+        buffer_count = self.buffer.ddp_config.fsdp_buffer_count
         param_groups = self.buffer.parameter_groups
         double_buf_units = set()
         for bucket_id in add_buckets:
             fsdp_unit_id = param_groups[bucket_id].fsdp_unit_id
             if fsdp_unit_id in self.buffer.double_buf_units:
                 double_buf_units.add(fsdp_unit_id)
-        assert (
-            len(double_buf_units) <= 2
-        ), f"Double buffer limit exceeded. Current double_buf_units: {double_buf_units}."
+        assert len(double_buf_units) <= buffer_count, (
+            f"FSDP buffer pool limit ({buffer_count}) exceeded. "
+            f"Current double_buf_units: {double_buf_units}."
+        )
 
         keep_n = len(self.grad_reduce_queue)
         for _, _, bucket_id in reversed(self.grad_reduce_queue):
             fsdp_unit_id = param_groups[bucket_id].fsdp_unit_id
             double_buf_units.add(fsdp_unit_id)
-            if len(double_buf_units) > 2:
+            if len(double_buf_units) > buffer_count:
                 keep_n -= 1
 
         with torch.cuda.stream(self.rs_stream):
@@ -4409,17 +4556,13 @@ class AllGatherPipeline:
         ag_buckets = [self.buffer.param_to_param_group[item] for item in params]
         ag_buckets = list(sorted(set(ag_buckets)))  # Sort in order of unique bucket ID.
         parameter_groups = self.buffer.parameter_groups
-        if self.buffer.ddp_config.fsdp_double_buffer:
-            double_buf_units = set()
-            for bucket_id in ag_buckets:
-                fsdp_unit_id = parameter_groups[bucket_id].fsdp_unit_id
-                if fsdp_unit_id in self.buffer.double_buf_units:
-                    double_buf_units.add(fsdp_unit_id)
-            if len(double_buf_units) > 2:
-                raise ValueError(
-                    f"{double_buf_units} FSDP units were requested, "
-                    "but double buffers can support no more than 2 FSDP units."
-                )
+        if self.buffer.ddp_config.fsdp_double_buffer and not self._persistent_allocators_can_fit(
+            ag_buckets, bwd
+        ):
+            raise ValueError(
+                f"FSDP buckets {ag_buckets} do not fit in the configured persistent "
+                f"buffer pools (fsdp_buffer_count={self.buffer.ddp_config.fsdp_buffer_count})."
+            )
 
         # Do not release the buckets that are being all-gathered.
         no_fsdp_units = True
@@ -4436,7 +4579,7 @@ class AllGatherPipeline:
             # Non-unit module pre-fetch can run inside other FSDP unit modules and
             # un-shard irrelevant model components that pointlessly steal buffer
             # allocations from the expected FSDP unit allocation and violating
-            # the maximum limit of 2 buffers allocated at any point in time.
+            # the configured persistent-buffer limit.
             self.buffer.ddp_config.fsdp_double_buffer
             and no_fsdp_units
         ):
@@ -4468,12 +4611,10 @@ class AllGatherPipeline:
                 # If use double buffer, we need to check if the next bucket
                 # is exceeding the coverage of the double buffer.
                 if self.buffer.ddp_config.fsdp_double_buffer:
-                    fsdp_unit_id = parameter_groups[bucket_id].fsdp_unit_id
-                    double_buf_units.add(fsdp_unit_id)
-                    if len(double_buf_units) > 2:
-                        # Prefetching the next bucket will exceed the coverage of
-                        # the double buffer, so we need to stop prefetching.
-                        return True
+                    candidate_buckets = self.buffer.bucket_to_bucket_group[bucket_id]
+                    return not self._persistent_allocators_can_fit(
+                        ag_buckets + candidate_buckets, bwd
+                    )
                 return False
 
             if suggested_AG_prefetch_size is None:
@@ -4506,6 +4647,11 @@ class AllGatherPipeline:
                 # Re-sort and find the next bucket not in the list.
                 ag_buckets = list(sorted(set(ag_buckets)))
                 bucket_id = next_bucket_id(ag_buckets)
+
+        # Do not release the buckets that are requested by this call, even if
+        # they are already ready and do not need a new all-gather.
+        for bucket_id in ag_buckets:
+            self.bucket_can_be_released[self.get_bucket_key(bucket_id, bwd)] = False
 
         # Only all-gather on buckets that have not been allocated yet or whose
         # persistent storage was preserved but is not ready for use.
@@ -4677,6 +4823,27 @@ class AllGatherPipeline:
             return param_group.transpose_weight_buffer
         else:
             return param_group.model_weight_buffer
+
+    def _persistent_allocators_can_fit(self, bucket_ids: List[int], bwd: bool) -> bool:
+        """Check pool capacity, including allocations live before this all-gather call."""
+        allocator_buckets = defaultdict(list)
+        for bucket_id in set(bucket_ids):
+            allocator = self.get_fsdp_buffer(bucket_id, bwd=bwd).temporary_bucket_allocator
+            allocator_buckets[allocator].append(bucket_id)
+
+        allocator_releasable_buckets = defaultdict(set)
+        for bucket_key, can_be_released in self.bucket_can_be_released.items():
+            if not can_be_released:
+                continue
+            bucket_id, release_bwd = bucket_key
+            allocator = self.get_fsdp_buffer(bucket_id, bwd=release_bwd).temporary_bucket_allocator
+            if bucket_id not in allocator_buckets[allocator]:
+                allocator_releasable_buckets[allocator].add(bucket_id)
+
+        return all(
+            allocator.can_allocate(requested_buckets, allocator_releasable_buckets[allocator])
+            for allocator, requested_buckets in allocator_buckets.items()
+        )
 
     @torch.no_grad()
     def async_bucket_gather(self, bucket_id, bwd) -> None:

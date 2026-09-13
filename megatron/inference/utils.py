@@ -87,9 +87,7 @@ def get_model_for_inference() -> MegatronModule:
     else:
         builder = get_model_builder(args)
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
-        model = builder.build_distributed_models(
-            pg_collection=pg_collection, wrap_with_ddp=False
-        )
+        model = builder.build_distributed_models(pg_collection=pg_collection, wrap_with_ddp=False)
 
     # Load checkpoint.
     assert args.load is not None
@@ -114,8 +112,7 @@ def get_model_for_inference() -> MegatronModule:
             quant_backend = "triton"
         elif backend == "te":
             raise ValueError(
-                "MXFP8 quantization is not supported with "
-                "inference_grouped_gemm_backend='te'."
+                "MXFP8 quantization is not supported with " "inference_grouped_gemm_backend='te'."
             )
         quantize_model_to_mxfp8(unwrap_model(model), backend=quant_backend)
     return model
@@ -321,7 +318,7 @@ def add_inference_args(parser: ArgumentParser) -> ArgumentParser:
         type=int,
         default=None,
         help="Maximum number of decode steps to trace (inference). Default is unlimited. "
-             "Training uses --moe-routing-trace-max-training-iters instead.",
+        "Training uses --moe-routing-trace-max-training-iters instead.",
     )
 
     return parser

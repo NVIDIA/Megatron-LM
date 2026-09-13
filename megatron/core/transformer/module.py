@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Megatron Module."""
+
 from functools import partial
 from typing import Optional, Tuple
 
@@ -185,6 +186,13 @@ class GraphableMegatronModule(MegatronModule):
             # script with the graphs returned by make_graphed_callables API before the first
             # training step.
             self.cuda_graphs = []
+            # Positional hidden-state inputs used as TE's fixed CUDA Graph input
+            # surfaces, indexed exactly like ``cuda_graphs``.  Most layers do not
+            # need to retain these handles.  They are exposed for eager producers
+            # whose recompute must restore bytes at the address captured by a
+            # downstream graph (for example, mHC aggregation feeding attention).
+            self._te_cuda_graph_static_hidden_inputs = ()
+            self._te_cuda_graph_static_hidden_input_ptrs = ()
             # List to store forward pre-hooks. Forward pre-hooks are not captured into CUDA
             # graphs. Those hooks and args are collected in this list and should be manually
             # triggered before CUDA Graph running. This is required to ensure the correct param
@@ -195,6 +203,48 @@ class GraphableMegatronModule(MegatronModule):
             # calls wgrad computation in attention module (contains attn and shared expert)
             # according to CUDA graph scope.
             self.cuda_graph_backward_dw_wrapper = None
+
+    def set_te_cuda_graph_static_hidden_inputs(self, inputs):
+        """Retain TE's fixed hidden-state input surface for each graph slot.
+
+        ``TECudaGraphHelper`` calls this only after ``make_graphed_callables``
+        returns because TE may rebind sample inputs while optimizing graph-buffer
+        reuse.  Different slots are allowed to alias when their schedule
+        lifetimes do not overlap.
+        """
+        inputs = tuple(inputs)
+        if len(inputs) != len(self.cuda_graphs):
+            raise ValueError(
+                "TE CUDA Graph static-input count must match graph count: "
+                f"got {len(inputs)} inputs and {len(self.cuda_graphs)} graphs"
+            )
+        if not all(isinstance(tensor, torch.Tensor) and tensor.is_cuda for tensor in inputs):
+            raise TypeError("TE CUDA Graph static hidden inputs must be CUDA tensors")
+
+        self._te_cuda_graph_static_hidden_inputs = inputs
+        self._te_cuda_graph_static_hidden_input_ptrs = tuple(tensor.data_ptr() for tensor in inputs)
+
+    def get_te_cuda_graph_static_hidden_input(self, microbatch_idx=None):
+        """Return the fixed hidden-state input for a TE CUDA Graph slot."""
+        if not self._te_cuda_graph_static_hidden_inputs:
+            raise RuntimeError("TE CUDA Graph static hidden inputs have not been attached")
+
+        if microbatch_idx is None:
+            microbatch_idx = getattr(self, 'current_microbatch', 0)
+        graph_index = microbatch_idx % len(self._te_cuda_graph_static_hidden_inputs)
+        tensor = self._te_cuda_graph_static_hidden_inputs[graph_index]
+        expected_ptr = self._te_cuda_graph_static_hidden_input_ptrs[graph_index]
+        if tensor.data_ptr() != expected_ptr:
+            raise RuntimeError(
+                f"TE CUDA Graph static hidden input {graph_index} changed address: "
+                f"expected {expected_ptr}, got {tensor.data_ptr()}"
+            )
+        return tensor
+
+    def clear_te_cuda_graph_static_hidden_inputs(self):
+        """Release retained TE static-input handles when graphs are deleted."""
+        self._te_cuda_graph_static_hidden_inputs = ()
+        self._te_cuda_graph_static_hidden_input_ptrs = ()
 
     def init_backward_dw_wrapper(self):
         """Initialize ``self.backward_dw_wrapper`` for delayed-wgrad scheduling.
@@ -234,6 +284,13 @@ class GraphableMegatronModule(MegatronModule):
             return
         self.cuda_graphs[cg_index].backward_dw()
 
+    def _is_thd_cuda_graph(self):
+        """Check if THD format with CUDA Graph is being used."""
+        return (
+            getattr(self.config, 'sequence_packing_scheduler', None) is not None
+            and self.config.cuda_graph_impl != "none"
+        )
+
     def get_layer_static_inputs(self, seq_length, micro_batch_size):
         """
         Get the static inputs for the layer.
@@ -241,26 +298,47 @@ class GraphableMegatronModule(MegatronModule):
         from the seq_length, micro_batch_size, and parallel config.
         Override this method if the module has other inputs.
 
+        For THD + CUDA Graph, hidden_states uses the padded max sequence length with
+        micro_batch_size=1 (packed sequence format).
+
         Returns:
             Dict[str, torch.Tensor]: A dictionary containing the static inputs for the layer.
         """
         # Calculate data shape related values.
         context_parallel_size = self.config.context_parallel_size
-        slen_per_cp = seq_length // context_parallel_size
         sequence_parallel = self.config.sequence_parallel
         tensor_model_parallel_size = self.config.tensor_model_parallel_size
-        slen_per_cptp = (
-            slen_per_cp // tensor_model_parallel_size if sequence_parallel else slen_per_cp
-        )
 
-        static_inputs = {}
-        static_inputs["hidden_states"] = torch.ones(
-            (slen_per_cptp, micro_batch_size, self.config.hidden_size),
-            dtype=torch.bfloat16,
-            requires_grad=True,
-            device=torch.cuda.current_device(),
-        )
-        return static_inputs
+        if self._is_thd_cuda_graph():
+            # THD + CUDA Graph: pre-padded packed-sequence buffer, batch dim = 1.
+            assert (
+                self.config.max_seqlen_per_dp_cp_rank is not None
+            ), "max_seqlen_per_dp_cp_rank must be set when using THD format with CUDA Graph."
+            slen_full = self.config.max_seqlen_per_dp_cp_rank
+            batch = 1
+        else:
+            # SBHD path: per-rank seq is split by CP and (optionally) by TP under SP.
+            slen_full = seq_length // context_parallel_size
+            batch = micro_batch_size
+        slen_per_cptp = slen_full // tensor_model_parallel_size if sequence_parallel else slen_full
+
+        # Static input dtype must match the runtime activation dtype that flows
+        # through the captured graph.
+        if self.config.bf16:
+            dtype = torch.bfloat16
+        elif self.config.fp16:
+            dtype = torch.float16
+        else:
+            dtype = torch.float32
+
+        return {
+            "hidden_states": torch.ones(
+                (slen_per_cptp, batch, self.config.hidden_size),
+                dtype=dtype,
+                requires_grad=True,
+                device=torch.cuda.current_device(),
+            )
+        }
 
     def setup_manual_hooks(self, make_hook_func):
         """
@@ -433,6 +511,44 @@ def float16_to_fp32(val):
     return conversion_helper(val, float_conversion)
 
 
+def mark_keep_in_fp32(tensor: torch.Tensor) -> torch.Tensor:
+    """Mark a parameter or buffer so that ``Float16Module`` keeps it in FP32.
+
+    Some parameters must stay in FP32 even when the rest of the model is converted to
+    FP16/BF16 (e.g. the ``ape`` and ``attn_sink`` parameters of DeepSeek V4 sparse
+    attention, which are FP32 in the reference checkpoint).
+
+    Args:
+        tensor: The parameter or buffer to mark.
+
+    Returns:
+        The same tensor, for call-site convenience.
+    """
+    tensor.keep_in_fp32 = True
+    return tensor
+
+
+def convert_module_to_dtype_except_fp32_marked(
+    module: torch.nn.Module, dtype: torch.dtype
+) -> torch.nn.Module:
+    """Cast floating-point parameters and buffers of ``module`` to ``dtype``.
+
+    Tensors marked with :func:`mark_keep_in_fp32` are left untouched.
+
+    Args:
+        module: The module to convert in place.
+        dtype: The target floating-point dtype (``torch.half`` or ``torch.bfloat16``).
+
+    Returns:
+        The converted module.
+    """
+    return module._apply(
+        lambda t: (
+            t.to(dtype) if t.is_floating_point() and not getattr(t, 'keep_in_fp32', False) else t
+        )
+    )
+
+
 class Float16Module(MegatronModule):
     """Float 16 Module.
 
@@ -455,13 +571,17 @@ class Float16Module(MegatronModule):
         self.pg_collection = getattr(module, 'pg_collection', None)
 
         if self.fp16:
-            self.add_module('module', module.half())
+            self.add_module(
+                'module', convert_module_to_dtype_except_fp32_marked(module, torch.half)
+            )
 
             def float16_convertor(val):
                 return val.half()
 
         elif self.bf16:
-            self.add_module('module', module.bfloat16())
+            self.add_module(
+                'module', convert_module_to_dtype_except_fp32_marked(module, torch.bfloat16)
+            )
 
             def float16_convertor(val):
                 return val.bfloat16()

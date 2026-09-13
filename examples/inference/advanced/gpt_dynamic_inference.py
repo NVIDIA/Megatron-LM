@@ -11,9 +11,10 @@ import warnings
 from collections import defaultdict
 from typing import Dict, List, Optional
 
-from megatron.training.arguments import parse_and_validate_args
 import torch
 from tqdm import tqdm
+
+from megatron.training.arguments import parse_and_validate_args
 
 sys.path.append(
     os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir, os.path.pardir))

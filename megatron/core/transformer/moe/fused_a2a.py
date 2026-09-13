@@ -3,21 +3,38 @@
 # Copyright (c) 2025 DeepSeek
 # Licensed under the MIT License - https://github.com/deepseek-ai/DeepEP/blob/main/LICENSE
 
-from typing import Optional
+import inspect
+from typing import Callable, Optional
 
 from megatron.core.utils import internal_api
 
 try:
-    from deep_ep import Buffer
     from deep_ep.utils import EventHandle, EventOverlap
+except ImportError:
+    try:
+        from deep_ep import EventHandle, EventOverlap
+    except ImportError:
+        EventHandle = None
+        EventOverlap = None
+
+try:
+    from deep_ep import Buffer
 
     HAVE_DEEP_EP = True
 except ImportError:
     HAVE_DEEP_EP = False
 
+try:
+    from deep_ep import ElasticBuffer
+
+    HAVE_DEEP_EP_V2 = True
+except ImportError:
+    HAVE_DEEP_EP_V2 = False
+
 import torch
 
 _buffer = None
+_elastic_buffer = None
 
 
 def get_hidden_bytes(x: torch.Tensor) -> int:
@@ -52,9 +69,12 @@ def get_buffer(group: torch.distributed.ProcessGroup, hidden_bytes: int):
         num_nvl_bytes = max(
             config.get_nvl_buffer_size_hint(hidden_bytes, group.size()), num_nvl_bytes
         )
-        num_rdma_bytes = max(
-            config.get_rdma_buffer_size_hint(hidden_bytes, group.size()), num_rdma_bytes
-        )
+        # Local-only EP groups do not need an RDMA buffer, and DeepEP builds
+        # without internode support may not expose RDMA size hints.
+        if group.size() > torch.cuda.device_count():
+            num_rdma_bytes = max(
+                config.get_rdma_buffer_size_hint(hidden_bytes, group.size()), num_rdma_bytes
+            )
 
     # Allocate buffer if not existed or not enough buffer
     # NOTES: the adaptive routing configuration of the network **must be off**
@@ -66,6 +86,32 @@ def get_buffer(group: torch.distributed.ProcessGroup, hidden_bytes: int):
     ):
         _buffer = Buffer(group, num_nvl_bytes, num_rdma_bytes)
     return _buffer
+
+
+def get_elastic_buffer(
+    group: torch.distributed.ProcessGroup, num_max_tokens_per_rank: int, hidden: int, num_topk: int
+):
+    """Get or create a DeepEP v2 elastic buffer for all-to-all communication."""
+    global _elastic_buffer
+
+    num_bytes = ElasticBuffer.get_buffer_size_hint(
+        group, num_max_tokens_per_rank=num_max_tokens_per_rank, hidden=hidden, num_topk=num_topk
+    )
+
+    if (
+        _elastic_buffer is None
+        or _elastic_buffer.group != group
+        or _elastic_buffer.num_bytes < num_bytes
+        or _elastic_buffer.num_max_tokens_per_rank < num_max_tokens_per_rank
+    ):
+        _elastic_buffer = ElasticBuffer(
+            group,
+            num_bytes=num_bytes,
+            num_max_tokens_per_rank=num_max_tokens_per_rank,
+            hidden=hidden,
+            num_topk=num_topk,
+        )
+    return _elastic_buffer
 
 
 class FusedDispatch(torch.autograd.Function):
@@ -267,14 +313,220 @@ else:
     set_deepep_num_sms = None
 
 
+class DeepepV2Dispatch(torch.autograd.Function):
+    """Dispatch operation using the DeepEP v2 ElasticBuffer backend."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        buffer,
+        x,
+        token_indices,
+        token_probs,
+        num_experts,
+        num_max_tokens_per_rank,
+        expert_alignment,
+        num_sms,
+        async_finish=False,
+        allocate_on_comm_stream=False,
+    ):
+        """Forward pass of dispatch using the DeepEP v2 ElasticBuffer backend."""
+        # Capture the current stream for the communication stream to wait on when
+        # DeepEP v2 allocates output tensors on the communication stream.
+        previous_event = buffer.capture() if async_finish and allocate_on_comm_stream else None
+        # Process the dispatch and keep the handle for the subsequent combine call.
+        recv_x, recv_token_indices, recv_token_probs, handle, event = buffer.dispatch(
+            x,
+            topk_idx=token_indices,
+            topk_weights=token_probs,
+            num_experts=num_experts,
+            num_max_tokens_per_rank=num_max_tokens_per_rank,
+            expert_alignment=expert_alignment,
+            num_sms=num_sms,
+            previous_event=previous_event,
+            async_with_compute_stream=async_finish,
+            allocate_on_comm_stream=allocate_on_comm_stream,
+        )
+
+        if async_finish:
+            event.current_stream_wait()
+
+        ctx.buffer = buffer
+        ctx.handle = handle
+        ctx.num_sms = handle.num_sms
+        ctx.async_finish = async_finish
+        ctx.allocate_on_comm_stream = allocate_on_comm_stream
+        tokens_per_expert = torch.tensor(handle.num_recv_tokens_per_expert_list)
+
+        return (recv_x, recv_token_indices, recv_token_probs, tokens_per_expert, handle)
+
+    @staticmethod
+    def backward(
+        ctx, grad_output, grad_token_indices, grad_token_probs, grad_tokens_per_expert, grad_handle
+    ):
+        """Backward pass of dispatch using the DeepEP v2 ElasticBuffer backend."""
+        # The backward pass of dispatch is a combine over the dispatch handle.
+        previous_event = (
+            ctx.buffer.capture() if ctx.async_finish and ctx.allocate_on_comm_stream else None
+        )
+        grad_x, grad_token_probs, event = ctx.buffer.combine(
+            grad_output.contiguous(),
+            handle=ctx.handle,
+            topk_weights=grad_token_probs.float(),
+            num_sms=ctx.num_sms,
+            previous_event=previous_event,
+            async_with_compute_stream=ctx.async_finish,
+            allocate_on_comm_stream=ctx.allocate_on_comm_stream,
+        )
+        if ctx.async_finish:
+            event.current_stream_wait()
+        return None, grad_x, None, grad_token_probs, None, None, None, None, None, None
+
+
+class DeepepV2Combine(torch.autograd.Function):
+    """DeepEP v2 elastic combine with autograd support."""
+
+    @staticmethod
+    def forward(ctx, buffer, x, handle, num_sms, async_finish=False, allocate_on_comm_stream=False):
+        """Forward pass of DeepEP v2 elastic combine."""
+        previous_event = buffer.capture() if async_finish and allocate_on_comm_stream else None
+        combined_x, combined_token_probs, event = buffer.combine(
+            x,
+            handle=handle,
+            num_sms=num_sms,
+            previous_event=previous_event,
+            async_with_compute_stream=async_finish,
+            allocate_on_comm_stream=allocate_on_comm_stream,
+        )
+        if async_finish:
+            event.current_stream_wait()
+
+        ctx.buffer = buffer
+        ctx.handle = handle
+        ctx.num_sms = handle.num_sms if num_sms == 0 else num_sms
+        ctx.async_finish = async_finish
+        ctx.allocate_on_comm_stream = allocate_on_comm_stream
+        return combined_x, combined_token_probs
+
+    @staticmethod
+    def backward(ctx, grad_output, grad_combined_token_probs):
+        """Backward pass of DeepEP v2 elastic combine."""
+        previous_event = (
+            ctx.buffer.capture() if ctx.async_finish and ctx.allocate_on_comm_stream else None
+        )
+        grad_x, _, _, _, event = ctx.buffer.dispatch(
+            grad_output.contiguous(),
+            handle=ctx.handle,
+            num_sms=ctx.num_sms,
+            previous_event=previous_event,
+            async_with_compute_stream=ctx.async_finish,
+            allocate_on_comm_stream=ctx.allocate_on_comm_stream,
+        )
+        if ctx.async_finish:
+            event.current_stream_wait()
+        return None, grad_x, None, None, None, None
+
+
+if HAVE_DEEP_EP_V2:
+
+    def deepepv2_dispatch(
+        buffer,
+        x,
+        token_indices,
+        token_probs,
+        num_experts,
+        num_max_tokens_per_rank,
+        expert_alignment=1,
+        num_sms=0,
+        async_finish=False,
+        allocate_on_comm_stream=False,
+    ):
+        """Perform dispatch using the DeepEP v2 ElasticBuffer backend.
+
+        Args:
+            buffer (ElasticBuffer):
+                DeepEP v2 buffer used for all-to-all communication.
+            x (torch.Tensor):
+                Input hidden states to dispatch.
+            token_indices (torch.Tensor):
+                Top-k expert indices for each token.
+            token_probs (torch.Tensor):
+                Top-k routing probabilities for each token.
+            num_experts (int):
+                Total number of experts across the communication group.
+            num_max_tokens_per_rank (int):
+                Maximum number of input tokens on each rank.
+            expert_alignment (int):
+                Alignment applied to per-expert token counts.
+            num_sms (int):
+                Number of SMs used by the dispatch API.
+            async_finish (bool):
+                Whether to use asynchronous communication completion.
+            allocate_on_comm_stream (bool):
+                Whether to allocate DeepEP output buffers on the communication stream.
+        """
+        return DeepepV2Dispatch.apply(
+            buffer,
+            x.contiguous(),
+            token_indices,
+            token_probs,
+            num_experts,
+            num_max_tokens_per_rank,
+            expert_alignment,
+            num_sms,
+            async_finish,
+            allocate_on_comm_stream,
+        )
+
+    def deepepv2_combine(
+        buffer, x, handle, num_sms=0, async_finish=False, allocate_on_comm_stream=False
+    ):
+        """Perform DeepEP v2 elastic combine."""
+        return DeepepV2Combine.apply(
+            buffer, x.contiguous(), handle, num_sms, async_finish, allocate_on_comm_stream
+        )
+
+else:
+    deepepv2_dispatch = None
+    deepepv2_combine = None
+
+
+def _has_parameter(function: Callable, parameter: str) -> bool:
+    """Return whether a callable exposes a named parameter."""
+    try:
+        return parameter in inspect.signature(function).parameters
+    except (TypeError, ValueError):
+        return False
+
+
 try:
     from deep_ep import HybridEPBuffer
 
     HAVE_HYBRIDEP = True
+    HAVE_HYBRIDEP_EXPLICIT_DENSE_ROUTING = _has_parameter(
+        HybridEPBuffer.dispatch_with_permute, "dense_routing"
+    )
+    try:
+        import hybrid_ep_cpp
+
+        HAVE_HYBRIDEP_INFERRED_DENSE_ROUTING = hasattr(
+            hybrid_ep_cpp.HybridEpConfigInstance(), "topk"
+        )
+    except (ImportError, AttributeError, TypeError, ValueError):
+        HAVE_HYBRIDEP_INFERRED_DENSE_ROUTING = False
+    HAVE_HYBRIDEP_DENSE_ROUTING = (
+        HAVE_HYBRIDEP_EXPLICIT_DENSE_ROUTING or HAVE_HYBRIDEP_INFERRED_DENSE_ROUTING
+    )
 except ImportError:
     HAVE_HYBRIDEP = False
+    HAVE_HYBRIDEP_EXPLICIT_DENSE_ROUTING = False
+    HAVE_HYBRIDEP_INFERRED_DENSE_ROUTING = False
+    HAVE_HYBRIDEP_DENSE_ROUTING = False
 
 _hybrid_ep_buffer = None
+
+# HybridEP dispatch/combine kernels use 64-token chunks for their public APIs.
+HYBRIDEP_TOKEN_ALIGNMENT = 64
 
 
 # HybridEP dispatch/combine kernels use 64-token chunks for their public APIs.
@@ -375,16 +627,16 @@ class HybridEPDispatch(torch.autograd.Function):
         num_permuted_tokens=None,
         pad_multiple=None,
         num_sms_preprocessing_api=108,
+        topk_idx=None,
+        num_of_experts=None,
     ):
         '''
         Forward pass of fused dispatch of the HybridEP backend
         '''
         if fused or num_blocks_permute is not None or num_blocks_unpermute is not None:
-            import inspect
             import warnings
 
-            sig = inspect.signature(HybridEPBuffer.dispatch_with_permute)
-            if 'fuse_permute_dispatch' not in sig.parameters:
+            if not _has_parameter(HybridEPBuffer.dispatch_with_permute, 'fuse_permute_dispatch'):
                 warnings.warn(
                     "Current DeepEP version does not support fused permute dispatch or "
                     "num_blocks_permute/num_blocks_unpermute. Falling back to unfused "
@@ -414,7 +666,21 @@ class HybridEPDispatch(torch.autograd.Function):
         # If we provide the num_permuted_tokens, we do not need to use sync to
         # wait for the data in pinned memory ready
         non_blocking = num_permuted_tokens is not None
-        # Process the dispatch
+        use_dense = topk_idx is not None and HAVE_HYBRIDEP_DENSE_ROUTING
+        if use_dense:
+            assert num_of_experts is not None, "num_of_experts is required for dense routing"
+            dense_kwargs = {"dense_routing": True} if HAVE_HYBRIDEP_EXPLICIT_DENSE_ROUTING else {}
+            dispatch_kwargs = {
+                "topk_idx": topk_idx,
+                "num_of_experts": num_of_experts,
+                **dense_kwargs,
+            }
+        else:
+            assert (
+                routing_map is not None
+            ), "routing_map is required when dense HybridEP routing is unavailable"
+            dispatch_kwargs = {"routing_map": routing_map}
+
         (
             dispatched_hidden,
             dispatched_probs,
@@ -423,7 +689,6 @@ class HybridEPDispatch(torch.autograd.Function):
             handle,
         ) = _hybrid_ep_buffer.dispatch_with_permute(
             hidden=x,
-            routing_map=routing_map,
             probs=probs,
             scaling_factor=None,
             num_of_experts_per_rank=num_local_experts,
@@ -431,6 +696,7 @@ class HybridEPDispatch(torch.autograd.Function):
             num_permuted_tokens=num_permuted_tokens,
             non_blocking=non_blocking,
             **({"fuse_permute_dispatch": fused} if fused else {}),
+            **dispatch_kwargs,
         )
 
         ctx.handle = handle
@@ -461,6 +727,8 @@ class HybridEPDispatch(torch.autograd.Function):
             combined_hidden,
             None,
             combined_probs,
+            None,
+            None,
             None,
             None,
             None,
@@ -531,6 +799,8 @@ if HAVE_HYBRIDEP:
         num_permuted_tokens=None,
         pad_multiple=None,
         num_sms_preprocessing_api=108,
+        topk_idx=None,
+        num_of_experts=None,
     ):
         '''
         Perform fused dispatch for "permute + dispatch a2a + permute" using the
@@ -564,6 +834,10 @@ if HAVE_HYBRIDEP:
                 is performed.
             num_sms_preprocessing_api (int):
                 Number of SMs used by the preprocessing (metadata scan) kernel.
+            topk_idx (torch.Tensor, optional):
+                Dense top-k expert indices with shape [num_tokens, topk].
+            num_of_experts (int, optional):
+                Total number of experts. Required when topk_idx is provided.
         '''
         return HybridEPDispatch.apply(
             x,
@@ -579,6 +853,8 @@ if HAVE_HYBRIDEP:
             num_permuted_tokens,
             pad_multiple,
             num_sms_preprocessing_api,
+            topk_idx,
+            num_of_experts,
         )
 
     @internal_api
@@ -620,6 +896,7 @@ def ensure_nccl_ep_bootstrapped(
     max_tokens_per_rank,
     recv_capacity_per_rank,
     hidden_dim,
+    num_topk,
     num_sms=0,
     zero_copy=False,
 ):
@@ -638,6 +915,7 @@ def ensure_nccl_ep_bootstrapped(
         recv_capacity_per_rank (int): Per-rank receive-buffer capacity in tokens. Must be
             ``>= max_tokens_per_rank``; runtime overflow hard-traps (no soft drop).
         hidden_dim (int): Token hidden size.
+        num_topk (int): Per-token top-k over ``ep_group``; sizes NCCL EP's internal buffers.
         num_sms (int): SM cap passed to TE as ``max_num_sms`` (0 lets TE/NCCL choose).
     """
     if not HAVE_TE_EP:
@@ -653,6 +931,7 @@ def ensure_nccl_ep_bootstrapped(
         max_tokens_per_rank=max_tokens_per_rank,
         recv_capacity_per_rank=recv_capacity_per_rank,
         hidden_dim=hidden_dim,
+        num_topk=num_topk,
         max_num_sms=num_sms,
         zero_copy=zero_copy,
     )

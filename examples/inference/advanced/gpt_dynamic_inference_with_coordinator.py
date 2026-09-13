@@ -75,11 +75,15 @@ async def main(
     )
 
     # All ranks agree on the number of suspend/resume cycles from args.
-    num_suspend_resume_cycles = len(requests) // args.suspend_resume_interval if args.suspend_resume_interval else 0
+    num_suspend_resume_cycles = (
+        len(requests) // args.suspend_resume_interval if args.suspend_resume_interval else 0
+    )
 
     # Create client and run example.
     if dist.get_rank() == 0:
-        client = InferenceClient(dp_addr, deserialize=True)  # submits requests to the inference coordinator
+        client = InferenceClient(
+            dp_addr, deserialize=True
+        )  # submits requests to the inference coordinator
         client.start()
         base_arrival_time = time.time_ns() / 10**9
         for request in requests:
@@ -105,7 +109,10 @@ async def main(
                     futures.append(client.add_request(request.prompt_text, request.sampling_params))
                     num_requests_added += 1
 
-                    if num_requests_added >= next_suspend_at and cycles_done < num_suspend_resume_cycles:
+                    if (
+                        num_requests_added >= next_suspend_at
+                        and cycles_done < num_suspend_resume_cycles
+                    ):
                         await suspend_resume_cycle(client, engine, args, futures)
                         cycles_done += 1
                         next_suspend_at += args.suspend_resume_interval
@@ -122,7 +129,10 @@ async def main(
                     futures.append(client.add_request(request.prompt_text, request.sampling_params))
                     num_requests_added += 1
 
-                    if num_requests_added >= next_suspend_at and cycles_done < num_suspend_resume_cycles:
+                    if (
+                        num_requests_added >= next_suspend_at
+                        and cycles_done < num_suspend_resume_cycles
+                    ):
                         await suspend_resume_cycle(client, engine, args, futures)
                         cycles_done += 1
                         next_suspend_at += args.suspend_resume_interval
@@ -161,7 +171,7 @@ async def main(
                 throughputs.append(throughput)
                 if req.routing_indices is not None:
                     result_dict["routing_indices"] = req.routing_indices.tolist()
-                                
+
                 json_results[req.request_id] = result_dict
             throughput_dict = {"throughput": throughputs}
             if args.throughput_check_only:

@@ -97,9 +97,8 @@ def _validate_prompt_lengths(args, llm, requests):
         for idx, r in enumerate(requests)
         if len(r.prompt_tokens) > llm.context.max_tokens
     }
-    assert not invalid, (
-        "request idxs with prompts longer than context.max_tokens: "
-        ", ".join(f"{k}({v})" for k, v in invalid.items())
+    assert not invalid, "request idxs with prompts longer than context.max_tokens: " ", ".join(
+        f"{k}({v})" for k, v in invalid.items()
     )
 
 
@@ -130,9 +129,7 @@ def _print_setup_prefix(setup_prefix: str) -> None:
         print("~~~")
 
 
-def _report_results(
-    args, setup_prefix, results, throughputs, total_time, peak_mem_stats, captured
-):
+def _report_results(args, setup_prefix, results, throughputs, total_time, peak_mem_stats, captured):
     if dist.get_rank() != 0:
         return
 
@@ -153,9 +150,7 @@ def _report_results(
     peak_resvd_gb = stats["reserved_bytes.all.peak"] / 1024**3
     throughput = throughputs[-1] if throughputs else 0.0
     capture_str = (
-        f"{captured['capture_stats']['time']:.2f} sec"
-        if captured["capture_stats"]
-        else "--"
+        f"{captured['capture_stats']['time']:.2f} sec" if captured["capture_stats"] else "--"
     )
     print("~~~")
     print(
@@ -302,7 +297,15 @@ def main():
 
     prompts_list = [r.prompt_text for r in requests]
 
-    runner_args = (args, model, tokenizer, inference_config, requests, prompts_list, sampling_params)
+    runner_args = (
+        args,
+        model,
+        tokenizer,
+        inference_config,
+        requests,
+        prompts_list,
+        sampling_params,
+    )
     if args.async_mode:
         asyncio.run(_run_async(*runner_args))
     else:

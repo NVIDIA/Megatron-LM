@@ -38,9 +38,9 @@ def sort_budget_list_descending(args):
 
     bp = getattr(args, 'budget_probs', None)
     if bp is not None:
-        assert len(bp) == len(bl), (
-            f'budget_probs length {len(bp)} does not match budget_list length {len(bl)}'
-        )
+        assert len(bp) == len(
+            bl
+        ), f'budget_probs length {len(bp)} does not match budget_list length {len(bl)}'
 
     order = sorted(range(len(bl)), key=lambda i: bl[i], reverse=True)
     args.budget_list = [bl[i] for i in order]

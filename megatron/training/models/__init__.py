@@ -5,8 +5,8 @@ from megatron.training.models.dist_utils import (
     build_virtual_pipeline_stages,
     unimodal_build_distributed_models,
 )
-from megatron.training.models.hybrid import HybridModelBuilder, HybridModelConfig
 from megatron.training.models.gpt import GPTModelBuilder, GPTModelConfig
+from megatron.training.models.hybrid import HybridModelBuilder, HybridModelConfig
 
 MambaModelConfig = HybridModelConfig
 MambaModelBuilder = HybridModelBuilder

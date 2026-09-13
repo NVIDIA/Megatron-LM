@@ -184,6 +184,7 @@ def _compile_dependencies():
 
     torch.distributed.barrier()
 
+
 def _initialize_tp_communicators():
     """initializing the communicators with user buffers for high-performance tensor-model-parallel
     communication overlap"""
@@ -379,7 +380,8 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
                 expert_gtp_remat_size=args.expert_gtp_weight_remat_size,
                 context_parallel_size=args.context_parallel_size,
                 hierarchical_context_parallel_sizes=args.hierarchical_context_parallel_sizes,
-                hybrid_context_parallel=args.hybrid_context_parallel,
+                dynamic_context_parallel=args.dynamic_context_parallel,
+                min_dynamic_context_parallel_size=args.min_dynamic_context_parallel_size,
                 expert_model_parallel_size=args.expert_model_parallel_size,
                 num_distributed_optimizer_instances=args.num_distributed_optimizer_instances,
                 expert_tensor_parallel_size=args.expert_tensor_parallel_size,
@@ -474,7 +476,22 @@ def set_jit_fusion_options(tp_size=None):
     """Set PyTorch JIT layer fusion options."""
     # flags required to enable jit fusion kernels
     if is_torch_min_version("2.2.0a0"):
-        pass  # we're using torch.compile for jit fusion
+        # we're using torch.compile for jit fusion.
+        # DSv4 hybrid: MoE-routing-driven fused ops (clamped_weighted_swiglu /
+        # bias_dropout_add_fused_train) see many distinct per-expert token counts and
+        # otherwise hit torch._dynamo's default cache_size_limit (8) -> eager fallback.
+        # Env-gated raise of the recompile cache limit; no-op when unset.
+        import os
+
+        _dynamo_lim = os.environ.get("DYNAMO_CACHE_SIZE_LIMIT")
+        if _dynamo_lim:
+            import torch._dynamo
+
+            _lim = int(_dynamo_lim)
+            torch._dynamo.config.cache_size_limit = _lim
+            torch._dynamo.config.accumulated_cache_size_limit = max(
+                _lim, torch._dynamo.config.accumulated_cache_size_limit
+            )
     elif is_torch_min_version("1.10.0a0"):
         # nvfuser
         torch._C._jit_set_profiling_executor(True)

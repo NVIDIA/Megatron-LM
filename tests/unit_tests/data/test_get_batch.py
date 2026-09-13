@@ -2,6 +2,7 @@
 
 import os
 import sys
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -41,7 +42,7 @@ def initialize_test_environment(
     args.sequence_parallel = True if tp_size > 1 else False
     args.pipeline_model_parallel_size = pp_size
     args.context_parallel_size = cp_size
-    args.hybrid_context_parallel = hybrid_context_parallel
+    args.dynamic_context_parallel = hybrid_context_parallel
     args.max_seqlen_per_cp_rank = max_seqlen_per_cp_rank
     args.sft = sft
     args.micro_batch_size = micro_batch_size
@@ -65,7 +66,7 @@ def initialize_test_environment(
         tensor_model_parallel_size=tp_size,
         pipeline_model_parallel_size=pp_size,
         context_parallel_size=cp_size,
-        hybrid_context_parallel=hybrid_context_parallel,
+        dynamic_context_parallel=hybrid_context_parallel,
     )
     return args
 
@@ -153,6 +154,63 @@ def create_sft_data_iterator(max_seq_length: int = 1024):
     return iter([batch]), num_real_tokens
 
 
+@pytest.mark.parametrize("tp_rank", [0, 1])
+@pytest.mark.parametrize("needs_padding_mask", [False, True])
+def test_get_batch_on_this_tp_rank_full_iteration_cudagraph_safe(
+    monkeypatch, tp_rank, needs_padding_mask
+):
+    """Optional batch inputs must not require host/device transfers during capture."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA Graph capture requires CUDA")
+
+    from megatron.training.utils import common_utils
+
+    torch.cuda.set_device(Utils.rank % torch.cuda.device_count())
+    device = torch.cuda.current_device()
+    shape = (1, 4)
+    data = {
+        "tokens": torch.ones(shape, dtype=torch.int64, device=device),
+        "labels": torch.ones(shape, dtype=torch.int64, device=device),
+        "loss_mask": torch.ones(shape, dtype=torch.float32, device=device),
+        "position_ids": torch.arange(shape[1], dtype=torch.int64, device=device).view(shape),
+    }
+    if needs_padding_mask:
+        data["padding_mask"] = torch.zeros(shape, dtype=torch.bool, device=device)
+
+    args = SimpleNamespace(
+        create_attention_mask_in_dataloader=False,
+        cuda_graph_impl="full_iteration",
+        dynamic_context_parallel=False,
+        micro_batch_size=shape[0],
+        pipeline_model_parallel_size=1,
+        seq_length=shape[1],
+        sft=False,
+    )
+    monkeypatch.setattr(common_utils, "get_args", lambda: args)
+    monkeypatch.setattr(common_utils.mpu, "get_tensor_model_parallel_rank", lambda: tp_rank)
+    monkeypatch.setattr(common_utils.mpu, "get_tensor_model_parallel_src_rank", lambda: 0)
+    monkeypatch.setattr(common_utils.mpu, "get_tensor_model_parallel_group", lambda: None)
+    monkeypatch.setattr(torch.distributed, "broadcast", lambda *args, **kwargs: None)
+
+    data_iterator = iter([data]) if tp_rank == 0 else None
+    marker = torch.zeros((), device=device)
+    marker.add_(1)
+    marker.zero_()
+    graph = torch.cuda.CUDAGraph()
+    torch.cuda.synchronize()
+    with torch.cuda.graph(graph):
+        marker.add_(1)
+        batch = common_utils.get_batch_on_this_tp_rank(
+            data_iterator, needs_padding_mask=needs_padding_mask
+        )
+    graph.replay()
+    torch.cuda.synchronize()
+
+    # Capture records CUDA work without executing it; one replay increments once.
+    assert marker.item() == 1
+    assert (batch["padding_mask"] is not None) == needs_padding_mask
+
+
 @pytest.mark.parametrize("tp_size", [1, 2, 4])
 @pytest.mark.parametrize("pp_size", [1, 2, 4])
 @pytest.mark.parametrize("cp_size", [1, 2, 4])
@@ -190,7 +248,12 @@ def test_sft_batch(tp_size, pp_size, cp_size, seq_length):
         max_seqlen,
         position_ids,
         tokens,
+        padding_mask,
+        packed_seq_params,
     ) = get_batch(data_iterator)
+
+    assert padding_mask is None
+    assert packed_seq_params is None
 
     is_first = mpu.is_pipeline_first_stage()
     is_last = mpu.is_pipeline_last_stage()
@@ -556,7 +619,12 @@ def test_inter_document_masking_batch(tp_size, pp_size, cp_size, seq_length):
         max_seqlen,
         position_ids,
         tokens,
+        padding_mask,
+        packed_seq_params,
     ) = get_batch(data_iterator)
+
+    assert padding_mask is None
+    assert packed_seq_params is None
 
     is_first = mpu.is_pipeline_first_stage()
     is_last = mpu.is_pipeline_last_stage()
@@ -757,7 +825,12 @@ def test_pretrain_batch(
         max_seqlen,
         position_ids,
         tokens,
+        padding_mask,
+        packed_seq_params,
     ) = get_batch(data_iterator)
+
+    assert padding_mask is None
+    assert packed_seq_params is None
 
     is_first = mpu.is_pipeline_first_stage()
     is_last = mpu.is_pipeline_last_stage()
@@ -903,6 +976,7 @@ def test_pretrain_batch(
 
 def create_hybrid_cp_data_iterator(seq_length: int = 1024, cp_size: int = 1):
     # Pack n_seqs equal-length sequences; total length must be divisible by 2 * cp_size for CP splitting
+    device = torch.cuda.current_device()
     n_seqs = max(2, 2 * cp_size)
     align = max(1, 2 * cp_size)
     seq_len_each = (seq_length // n_seqs // align) * align
@@ -910,28 +984,24 @@ def create_hybrid_cp_data_iterator(seq_length: int = 1024, cp_size: int = 1):
         seq_len_each = align
     total_seq_len = n_seqs * seq_len_each
 
-    text = torch.randint(0, 10000, (1, total_seq_len + 1), dtype=torch.int64)
-    tokens = text[:, :-1].contiguous()  # (1, total_seq_len)
-    labels = text[:, 1:].contiguous()  # (1, total_seq_len)
-    loss_mask = torch.ones((1, total_seq_len), dtype=torch.float32)
+    text = torch.randint(0, 10000, (total_seq_len + 1,), dtype=torch.int64, device=device)
+    tokens = text[:-1].contiguous()  # (total_seq_len,)
+    labels = text[1:].contiguous()  # (total_seq_len,)
+    loss_mask = torch.ones((total_seq_len,), dtype=torch.float32, device=device)
     position_ids = torch.cat(
-        [torch.arange(seq_len_each, dtype=torch.int64) for _ in range(n_seqs)]
-    ).unsqueeze(
-        0
-    )  # (1, total_seq_len)
+        [torch.arange(seq_len_each, dtype=torch.int64, device=device) for _ in range(n_seqs)]
+    )  # (total_seq_len,)
 
     cu_seqlens = torch.cat(
         [
-            torch.zeros(1, dtype=torch.int32),
-            torch.cumsum(torch.tensor([seq_len_each] * n_seqs, dtype=torch.int64), dim=0).to(
-                torch.int32
-            ),
+            torch.zeros(1, dtype=torch.int32, device=device),
+            torch.cumsum(
+                torch.tensor([seq_len_each] * n_seqs, dtype=torch.int64, device=device), dim=0
+            ).to(torch.int32),
         ]
-    ).unsqueeze(
-        0
-    )  # (1, n_seqs + 1) — dataloader always carries a batch dim
-    max_seqlen = torch.tensor([seq_len_each], dtype=torch.int32)
-    local_cp_size_tensor = torch.tensor([cp_size], dtype=torch.int32)
+    )  # (n_seqs + 1,)
+    max_seqlen = torch.tensor([seq_len_each], dtype=torch.int32, device=device)
+    local_cp_size_tensor = torch.tensor([cp_size], dtype=torch.int32, device=device)
 
     batch = {
         "tokens": tokens,
@@ -986,7 +1056,12 @@ def test_hybrid_cp_batch(tp_size, cp_size, seq_length, create_attention_mask):
         max_seqlen,
         position_ids,
         tokens,
+        padding_mask,
+        packed_seq_params,
     ) = get_batch(data_iterator)
+
+    assert padding_mask is not None
+    assert packed_seq_params is not None
 
     # Presence checks
     assert tokens is not None
@@ -994,9 +1069,11 @@ def test_hybrid_cp_batch(tp_size, cp_size, seq_length, create_attention_mask):
     assert loss_mask is not None
     assert position_ids is not None
     assert attention_mask is None
-    assert cu_seqlens is not None
-    assert max_seqlen is not None
-    assert local_cp_size is not None
+    assert cu_seqlens is None
+    assert cu_seqlens_padded is None
+    assert hybrid_cp_group is None
+    assert max_seqlen is None
+    assert local_cp_size is None
 
     # Data iterator parameters (must match create_hybrid_cp_data_iterator)
     n_seqs = max(2, 2 * cp_size)
@@ -1024,45 +1101,34 @@ def test_hybrid_cp_batch(tp_size, cp_size, seq_length, create_attention_mask):
         1,
         seq_len_per_rank,
     ), f"Expected position_ids shape (1, {seq_len_per_rank}), got {position_ids.shape}"
+    assert padding_mask.shape == (
+        1,
+        seq_len_per_rank,
+    ), f"Expected padding_mask shape (1, {seq_len_per_rank}), got {padding_mask.shape}"
 
     # Dtype checks
     assert tokens.dtype == torch.int64
     assert labels.dtype == torch.int64
     assert loss_mask.dtype == torch.float32
     assert position_ids.dtype == torch.int64
+    assert padding_mask.dtype == torch.bool
+    assert not padding_mask.any()
 
     # Loss mask is all-ones (no masking in the HybridCP pretrain dataloader)
     assert loss_mask.sum().item() == seq_len_per_rank
 
-    # cu_seqlens: 2-D int32 (1, n_seqs + 1) after flatten_batch_for_packed_sequences.
-    assert cu_seqlens.shape == (
-        1,
-        n_seqs + 1,
-    ), f"Expected cu_seqlens shape (1, {n_seqs + 1}), got {cu_seqlens.shape}"
-    assert cu_seqlens.dtype == torch.int32
-    assert cu_seqlens[0, 0].item() == 0
-    assert cu_seqlens[0, -1].item() == total_seq_len
-
-    # max_seqlen: scalar int32 equal to the per-sequence length in the iterator
-    assert max_seqlen.shape == (1,)
-    assert max_seqlen.dtype == torch.int32
-    assert max_seqlen.item() == seq_len_each
-
-    # local_cp_size: scalar int32 equal to cp_size
-    assert local_cp_size.shape == (1,)
-    assert local_cp_size.dtype == torch.int32
-    assert local_cp_size.item() == cp_size
-
-    if cp_size > 1:
-        assert cu_seqlens_padded is not None
-        assert cu_seqlens_padded.shape == (1, n_seqs + 1)
-        assert cu_seqlens_padded.dtype == torch.int32
-        assert cu_seqlens_padded[0, 0].item() == 0
-        assert cu_seqlens_padded[0, -1].item() == total_seq_len
-        assert hybrid_cp_group is not None
-    else:
-        assert cu_seqlens_padded is None
-        assert hybrid_cp_group is None
+    # Sequence-packing metadata is returned through PackedSeqParams.
+    expected_cu_seqlens = torch.arange(
+        0, total_seq_len + 1, seq_len_each, dtype=torch.int32, device=tokens.device
+    )
+    assert torch.equal(packed_seq_params.cu_seqlens_q, expected_cu_seqlens)
+    assert torch.equal(packed_seq_params.cu_seqlens_kv, expected_cu_seqlens)
+    assert torch.equal(packed_seq_params.cu_seqlens_q_padded, expected_cu_seqlens)
+    assert torch.equal(packed_seq_params.cu_seqlens_kv_padded, expected_cu_seqlens)
+    assert packed_seq_params.max_seqlen_q == seq_len_each
+    assert packed_seq_params.max_seqlen_kv == seq_len_each
+    assert packed_seq_params.local_cp_size == cp_size
+    assert packed_seq_params.cp_group is not None
 
     Utils.destroy_model_parallel()
 
@@ -1157,7 +1223,12 @@ def test_inter_document_masking_multi_mbs_batch(tp_size, micro_batch_size, seq_l
         max_seqlen,
         position_ids,
         tokens,
+        padding_mask,
+        packed_seq_params,
     ) = get_batch(data_iterator)
+
+    assert padding_mask is None
+    assert packed_seq_params is None
 
     total_tokens = micro_batch_size * seq_length
 

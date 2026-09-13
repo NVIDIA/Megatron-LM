@@ -86,6 +86,7 @@ MODEL_ARGS:
   --export-te-mcore-model: true
   #--export-default-te-spec: true   # TODO(aanoosheh): undo once TE fix is released
   --export-kd-teacher-load: ${MODEL_BF16_CKPT}
+  --export-kd-teacher-model-config: ./tests/functional_tests/test_cases/hybrid/hybrid_nemotron_v3_pico_7b_a1b_tp1_ep8_QAD_dgx_h100_1N8G/teacher_model_config.yaml
   --auto-detect-ckpt-format: true
   --finetune: true
   # Architecture

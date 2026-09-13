@@ -1,14 +1,12 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 # syntax=docker/dockerfile:1.3-labs
 
-ARG FROM_IMAGE_NAME=nvcr.io/nvidia/pytorch:26.06-py3
-FROM ${FROM_IMAGE_NAME} AS main
+ARG FROM_IMAGE_NAME
+FROM ${FROM_IMAGE_NAME} as main
 ENV PIP_CONSTRAINT=""
 ENV DEBIAN_FRONTEND=noninteractive
 ARG UV_VERSION=0.7.2
 ARG YQ_VERSION=4.44.1
-# TE 2.18's NCCL EP build requires NCCL 2.30.7+; the 26.06 base uses CUDA 13.3.
-ARG NCCL_VERSION=2.30.7-1+cuda13.3
 ENV PATH="/root/.local/bin:$PATH"
 ARG UV_PROJECT_ENVIRONMENT=/opt/venv
 ENV UV_PROJECT_ENVIRONMENT=${UV_PROJECT_ENVIRONMENT}
@@ -18,51 +16,38 @@ ENV UV_LINK_MODE=copy
 
 RUN bash -ex <<"EOF"
     apt-get update
-    apt-get install -y --no-install-recommends gettext python3-venv psmisc uuid-runtime
+    apt-get install -y --no-install-recommends gettext python3-venv psmisc uuid-runtime 
     apt-get clean
     python -m venv /opt/jet
     ARCH=$(uname -m)
     case "${ARCH}" in \
-      "x86_64") YQ_ARCH=amd64 ;; \
-      "aarch64") YQ_ARCH=arm64 ;; \
-      "armv7l") YQ_ARCH=arm ;; \
+      "x86_64") YQ_ARCH=amd64; YQ_SHA256=6dc2d0cd4e0caca5aeffd0d784a48263591080e4a0895abe69f3a76eb50d1ba3 ;; \
+      "aarch64") YQ_ARCH=arm64; YQ_SHA256=8c12fcc10e14774ca6624cc282f092a526568b036fe1192258c3aecbad56d063 ;; \
+      "armv7l") echo "Unsupported architecture: ${ARCH}" && exit 1 ;; \
       *) echo "Unsupported architecture: ${ARCH}" && exit 1 ;; \
     esac 
     wget https://github.com/mikefarah/yq/releases/download/v${YQ_VERSION}/yq_linux_${YQ_ARCH} -O /usr/local/bin/yq
+    echo "${YQ_SHA256}  /usr/local/bin/yq" | sha256sum --check -
     chmod a+x /usr/local/bin/yq
     curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh | sh
 EOF
 
-RUN --mount=type=bind,source=docker/common/install_nccl.sh,target=/opt/install_nccl.sh \
-    bash /opt/install_nccl.sh --NCCL_VER=${NCCL_VERSION}
+RUN ln -sf /usr/local/cuda/include/cccl/cuda \
+    /usr/local/include/cuda
+RUN find /usr/local/cuda -name "utility" 2>/dev/null | head -5 && \
+    ls /usr/local/cuda/targets/x86_64-linux/include/ | head -20
 
 COPY README.md pyproject.toml uv.lock /workspace/
 COPY megatron/core/__init__.py /workspace/megatron/core/
 COPY megatron/core/package_info.py /workspace/megatron/core/
 ARG IMAGE_TYPE=dev
-ENV IMAGE_TYPE=${IMAGE_TYPE}
-ENV NVTE_BUILD_NUM_PHILOX_ROUNDS=3
 RUN --mount=type=cache,target=/root/.cache/uv \
     bash -ex <<"EOF"
     export NVTE_CUDA_ARCHS="80;90;100"
-    # flash-mla (no_pypi_wheels group) has no PyPI wheel and is built from source by uv. Point the
-    # compilers at the CCCL/libcu++ headers (under cccl/ in this base image, not the default CUDA
-    # include path) and scope the build to the target archs. Skipped for the LTS image.
-    FLASH_MLA_GROUP=""
-    if [ "$IMAGE_TYPE" != "lts" ]; then
-        FLASH_MLA_GROUP="--group no_pypi_wheels"
-        export FLASH_MLA_DISABLE_SM90=1 NVCC_THREADS=16 \
-            CFLAGS="-I/usr/local/cuda/include/cccl" CXXFLAGS="-I/usr/local/cuda/include/cccl"
-    fi
     uv venv ${UV_PROJECT_ENVIRONMENT} --system-site-packages
     uv sync --only-group build
-    # Limit per-package compiler concurrency on ARM.
-    if [ "$(uname -m)" = "aarch64" ]; then
-        export MAX_JOBS=8
-    fi
     # Prevent overlapping CUTLASS base and CUDA wheel payloads from interleaving.
-    UV_CONCURRENT_INSTALLS=1 uv sync -v \
-        --extra ${IMAGE_TYPE} --extra mlm --extra ssm --extra te ${FLASH_MLA_GROUP} --link-mode copy --locked \
+    UV_CONCURRENT_INSTALLS=1 uv sync --extra ${IMAGE_TYPE} --extra mlm --group no_pypi_wheels --link-mode copy --locked \
         --no-install-package torch \
         --no-install-package torchvision \
         --no-install-package triton \
@@ -82,44 +67,20 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 EOF
 
 # Install DeepEP
-ARG DEEPEP_COMMIT=17cfb817bccec3a9c247013360cc550c2bac441e
-ENV DEEPEP_COMMIT=$DEEPEP_COMMIT
-ENV HYBRID_EP_MULTINODE=1
-ENV RDMA_CORE_HOME=/opt/rdma-core/build
-ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64/:$LD_LIBRARY_PATH
 COPY docker/patches/deepep.patch /workspace/deepep.patch
 RUN bash -ex <<"EOF"
-    if [ "$IMAGE_TYPE" = "lts" ]; then
-        echo "[DeepEP] skipping install for IMAGE_TYPE=lts"
-        exit 0
-    fi
-    apt-get update
-    apt-get install -y --allow-change-held-packages rdma-core libibverbs-dev
-    apt-get clean
-    ARCH_LIB=$(dpkg-architecture -qDEB_HOST_MULTIARCH)
-    test -f /usr/lib/${ARCH_LIB}/libmlx5.so || ln -sf /usr/lib/${ARCH_LIB}/libmlx5.so.1 /usr/lib/${ARCH_LIB}/libmlx5.so
-    mkdir -p ${RDMA_CORE_HOME}
-    ln -sfn /usr/include ${RDMA_CORE_HOME}/include
-    ln -sfn /usr/lib/${ARCH_LIB} ${RDMA_CORE_HOME}/lib
-
     cd /workspace
     uv pip install nvidia-nvshmem-cu13==3.4.5
     pushd /opt/venv/lib/python3.12/site-packages/nvidia/nvshmem/lib/
-        ln -sf libnvshmem_host.so.3 libnvshmem_host.so
+        ln -s libnvshmem_host.so.3 libnvshmem_host.so
     popd
 
-    git clone https://github.com/deepseek-ai/DeepEP.git
+    git clone --branch hybrid-ep https://github.com/deepseek-ai/DeepEP.git
     pushd DeepEP
-        git fetch origin $DEEPEP_COMMIT
-        git checkout FETCH_HEAD
+        git checkout eb9cee7de5a24193bf09500668d3a619d3d3f3fb
         patch -p1 < /workspace/deepep.patch
-        apt-get update
-        apt-get install -y --no-install-recommends libnvidia-ml-dev
-        TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0" uv pip install --no-build-isolation -v .
-        apt-get purge -y libnvidia-ml-dev
-        apt-get autoremove -y
-        rm -rf /var/lib/apt/lists/*
     popd
+    TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0" uv pip install --no-build-isolation -v DeepEP/.
     rm -rf DeepEP
 EOF
 
@@ -127,7 +88,7 @@ COPY assets/ /opt/data/
 ENV UV_PYTHON=$UV_PROJECT_ENVIRONMENT/bin/python
 
 ##### For NVIDIANS only #####
-FROM main AS jet
+FROM main as jet
 ARG JET_API_VERSION
 ENV PATH="$PATH:/opt/jet/bin"
 RUN --mount=type=secret,id=JET_INDEX_URLS bash -ex <<"EOF"
@@ -142,7 +103,7 @@ RUN --mount=type=secret,id=JET_INDEX_URLS \
     JET_INDEX_URLS=$(cat /run/secrets/JET_INDEX_URLS)
     LOGGER_INDEX_URL=$(cat /run/secrets/LOGGER_INDEX_URL)
     uv pip install --no-cache-dir --upgrade $LOGGER_INDEX_URL "one-logger"
-    uv pip install --no-cache-dir --upgrade "setuptools>=80"
+    uv pip install --no-cache-dir --upgrade "setuptools<80.0.0,>=77.0.0"
     uv pip install --no-cache-dir --upgrade $JET_INDEX_URLS "jet-client~=4.0" 
 EOF
 ###

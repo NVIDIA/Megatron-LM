@@ -2,9 +2,26 @@
 
 import warnings
 from dataclasses import dataclass, field
-from typing import Callable, ContextManager, Literal, Optional
+from typing import Callable, ContextManager, Literal, Optional, Union
 
 import torch
+
+from megatron.core.utils import experimental_api
+
+
+def _parse_pad_packed_seq_alignment(value):
+    """Parse THD packed-sequence padding alignment.
+
+    Accepts ``"max"`` or a positive integer alignment.
+    """
+    if value == "max":
+        return value
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "pad_packed_seq_alignment must be 'max' or a positive integer alignment."
+        ) from exc
 
 
 def resolve_tensor_parallel_weight_shards(
@@ -43,6 +60,7 @@ def resolve_tensor_parallel_weight_shards(
 
 
 @dataclass
+@experimental_api
 class ModelParallelConfig:
     """Base configuration for Megatron Core
 
@@ -114,14 +132,62 @@ class ModelParallelConfig:
     can handle without overflowing the memory. Typically, a good starting point is to set this
     to maximum sequence length / context parallel size.
     This is used to calculate the number and length of sub-samples assigned to 
-    each rank when using hybrid_context_parallel.
+    each rank when sequence_packing_scheduler is not None.
     """
 
-    hybrid_context_parallel: bool = False
+    dynamic_context_parallel: bool = False
     """
-    If true, enables hybrid context parallel. This is used to balance the workload of 
+    If true, enables dynamic context parallel. This is used to balance the workload of 
     each CP rank when we use packed samples with variable sequence lengths.
-    Please set max_seqlen_per_dp_cp_rank when using hybrid_context_parallel.
+    Dynamic CP forms variable-sized CP groups from the DPxCP ranks dynamically.
+    Please set max_seqlen_per_dp_cp_rank.
+    """
+
+    min_dynamic_context_parallel_size: int = 1
+    """Minimum CP group size for dynamic context parallel. Default 1 (no CP).
+    The maximum is dp_size * context_parallel_size (the full DPxCP group)."""
+
+    hybrid_context_parallel: bool = False
+    """Deprecated. Use ``dynamic_context_parallel`` instead."""
+
+    sequence_packing_scheduler: Optional[Literal['dp_balanced', 'default_dynamic_cp']] = None
+    """
+    Scheduler for sequence packing and dynamic context parallel.
+    dp_balanced: DP-balanced scheduler for sequence packing.
+    default_dynamic_cp: Dynamic-CP scheduler for packed sequence balancing.
+    """
+
+    pad_packed_seq_alignment: Optional[Union[int, Literal["max"]]] = field(
+        default=None,
+        metadata={
+            "argparse_meta": {
+                "arg_names": ["--pad-packed-seq-alignment"],
+                "type": _parse_pad_packed_seq_alignment,
+            }
+        },
+    )
+    """Pad THD packed sequence tensors after packing.
+
+    If set to ``max``, token-like tensors are padded to
+    max_seqlen_per_dp_cp_rank. If set to a positive integer N, token-like
+    tensors are padded to a multiple of N.
+    """
+
+    thd_tail_padding_policy: Optional[Literal["append_dummy_seq", "extend_last"]] = None
+    """Policy for representing the THD packed-sequence padding tail.
+
+    - append_dummy_seq: cover the post-pack padding tail with an ordinary
+      dummy sequence appended to the cu_seqlens metadata. Existing
+      valid/physical gaps between real sequences are preserved. This is the
+      default behavior.
+    - extend_last: keep valid cu_seqlens boundaries unchanged and extend the
+      final padded boundary so the tail is physical padding of the last
+      sequence. With context parallelism the extension is applied to the
+      global metadata before CP slicing.
+    - None (default): treated as append_dummy_seq.
+
+    When thd_max_packed_sequences is set, cu_seqlens tensors are padded to
+    that value + 1 entries in both eager and CUDA Graph modes.
     """
 
     expert_model_parallel_size: int = 1
@@ -322,9 +388,14 @@ class ModelParallelConfig:
        Defaults to False.
     """
 
-    cross_entropy_fusion_impl: Literal['native', 'te'] = 'native'
-    """If 'native', MCore based CE loss fusion is used, if 'te', Parallel CE loss
-       from Transformer Engine library is used. Defaults to 'native'.
+    cross_entropy_fusion_impl: Literal['native', 'te', 'linear'] = 'native'
+    """
+    Specifies the implementation of cross-entropy loss fusion.
+
+    Options:
+    - 'native': Uses MCore-based cross-entropy loss fusion (default).
+    - 'te': Uses the parallel cross-entropy loss implementation from the Transformer Engine library.
+    - 'linear': Uses a linear-cross-entropy fusion approach.
     """
 
     tp_comm_overlap_disable_qkv: bool = False
@@ -499,6 +570,62 @@ class ModelParallelConfig:
         See https://docs.python.org/3/library/dataclasses.html#post-init-processing for more
         details.
         """
+        if self.hybrid_context_parallel:
+            warnings.warn(
+                "hybrid_context_parallel is deprecated and will be removed in a future release. "
+                "Use dynamic_context_parallel instead.",
+                DeprecationWarning,
+            )
+            if self.dynamic_context_parallel:
+                raise ValueError(
+                    "Cannot set both hybrid_context_parallel and dynamic_context_parallel. "
+                    "Please use dynamic_context_parallel only."
+                )
+            self.dynamic_context_parallel = True
+
+        if self.dynamic_context_parallel:
+            if self.sequence_packing_scheduler is None:
+                self.sequence_packing_scheduler = 'default_dynamic_cp'
+            if self.sequence_packing_scheduler != 'default_dynamic_cp':
+                raise ValueError(
+                    'Dynamic context parallelism requires '
+                    'sequence_packing_scheduler=default_dynamic_cp'
+                )
+
+            if self.min_dynamic_context_parallel_size < 1:
+                raise ValueError(
+                    f"min_dynamic_context_parallel_size must be >= 1, "
+                    f"got {self.min_dynamic_context_parallel_size}"
+                )
+
+        if self.thd_tail_padding_policy not in (None, "append_dummy_seq", "extend_last"):
+            raise ValueError(
+                "thd_tail_padding_policy must be 'append_dummy_seq', 'extend_last', or None, "
+                f"got {self.thd_tail_padding_policy!r}."
+            )
+
+        if self.pad_packed_seq_alignment is not None:
+            self.pad_packed_seq_alignment = _parse_pad_packed_seq_alignment(
+                self.pad_packed_seq_alignment
+            )
+            if self.max_seqlen_per_dp_cp_rank is None:
+                raise ValueError(
+                    "max_seqlen_per_dp_cp_rank must be set when pad_packed_seq_alignment "
+                    "is enabled."
+                )
+            if self.pad_packed_seq_alignment != "max":
+                if self.pad_packed_seq_alignment <= 0:
+                    raise ValueError(
+                        "pad_packed_seq_alignment must be 'max' or a positive integer " "alignment."
+                    )
+                if self.pad_packed_seq_alignment > self.max_seqlen_per_dp_cp_rank:
+                    raise ValueError(
+                        "pad_packed_seq_alignment must not exceed "
+                        "max_seqlen_per_dp_cp_rank "
+                        f"({self.max_seqlen_per_dp_cp_rank}), got "
+                        f"{self.pad_packed_seq_alignment}."
+                    )
+
         if self.sequence_parallel:
             if self.tensor_model_parallel_size <= 1:
                 raise ValueError("Cannot use sequence parallelism without tensor parallelism")

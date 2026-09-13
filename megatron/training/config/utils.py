@@ -2,15 +2,17 @@
 
 import importlib
 import logging
-from functools import lru_cache
-from dataclasses import is_dataclass
 from dataclasses import fields as dataclass_fields
+from dataclasses import is_dataclass
+from functools import lru_cache
 from typing import Any
 
 logger = logging.getLogger(__name__)
 
 
-def sanitize_dataclass_config(config: dict[str, Any], _visited: set | None = None) -> dict[str, Any]:
+def sanitize_dataclass_config(
+    config: dict[str, Any], _visited: set | None = None
+) -> dict[str, Any]:
     """Remove init=False fields from a dataclass config dict for backward compatibility.
 
     This function automatically detects fields with init=False by inspecting the
@@ -58,7 +60,10 @@ def sanitize_dataclass_config(config: dict[str, Any], _visited: set | None = Non
         if isinstance(value, dict):
             value = sanitize_dataclass_config(value, _visited)
         elif isinstance(value, list):
-            value = [sanitize_dataclass_config(item, _visited) if isinstance(item, dict) else item for item in value]
+            value = [
+                sanitize_dataclass_config(item, _visited) if isinstance(item, dict) else item
+                for item in value
+            ]
 
         sanitized[key] = value
 

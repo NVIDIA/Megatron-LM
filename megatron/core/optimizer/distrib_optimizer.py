@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Megatron distributed optimizer."""
 
@@ -8,7 +8,7 @@ import logging
 from collections import ChainMap
 from dataclasses import replace
 from logging import getLogger
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import torch
 import torch.nn.functional
@@ -278,6 +278,26 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         }
 
     @classmethod
+    def _filter_gbuf_range_map(
+        cls, gbuf_range_map: Dict, optimizer_params: Set[torch.nn.Parameter]
+    ) -> Dict:
+        """Filter grad-buffer range maps to the params owned by this optimizer instance."""
+        return {
+            dtype: [
+                {
+                    **range_map,
+                    "param_map": {
+                        param: param_range
+                        for param, param_range in range_map["param_map"].items()
+                        if param in optimizer_params
+                    },
+                }
+                for range_map in range_maps
+            ]
+            for dtype, range_maps in gbuf_range_map.items()
+        }
+
+    @classmethod
     def _build_model_param_gbuf_map(
         cls, gbuf_ranges: List[Dict]
     ) -> Dict[torch.nn.Parameter, Tuple]:
@@ -425,7 +445,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         # precision at the beginning of training (this problem will not occur if the
                         # training is long enough or if the main params are loaded from a
                         # checkpoint).
-                        if is_nvfp4tensor(model_param) or cls._is_distopt_quantized_param(
+                        if cls._is_distopt_quantized_param(model_param) or is_nvfp4tensor(
                             model_param
                         ):
                             if hasattr(model_param, 'get_high_precision_init_val'):
@@ -613,7 +633,11 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         Returns:
             FullParamLayout with a PerBufferParamLayout per buffer group.
         """
-        buffer_groups = group_params_for_buffers(params, ddp_config.grad_reduce_in_fp32)
+        buffer_groups = group_params_for_buffers(
+            params,
+            ddp_config.grad_reduce_in_fp32,
+            merge_layerwise_fp8_grads=not getattr(ddp_config, 'use_layer_wise_param_layout', True),
+        )
         layouts = {}
         for buffer_key, (group_params, param_indices) in buffer_groups.items():
             if buffer_key.is_expert_parallel:
@@ -724,6 +748,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         for model_idx, buffers in self.per_model_buffers.items():
             self.per_model_bucket_groups[model_idx] = partition_buckets(buffers)
 
+        optimizer_params = {
+            param for param_group in self.optimizer.param_groups for param in param_group['params']
+        }
         self.gbuf_ranges = []
         self.per_bucket_numel = []
         self.per_bucket_numel_unpadded = []
@@ -743,7 +770,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     ]
                 }
             )
-            self.gbuf_ranges.append(self._build_gbuf_range_map(buffer))
+            self.gbuf_ranges.append(
+                self._filter_gbuf_range_map(self._build_gbuf_range_map(buffer), optimizer_params)
+            )
         self.model_param_gbuf_map = self._build_model_param_gbuf_map(self.gbuf_ranges)
 
         # Add main_param field to each parameter. We will use this fp32 copy to compute
@@ -775,6 +804,20 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             self.gbuf_ranges, self.model_param_gbuf_map, self.opt_group_ranges, config
         )
 
+        # _build_model_and_main_param_groups() installs each group's params as
+        # [*fp32 shards, *fp32-from-float16 shards], which reorders a group
+        # whenever it mixes fp32 and float16 model params (they live in
+        # different-dtype grad buffers, so the gbuf-iteration order used by
+        # _build_optimizer_group_ranges() interleaves them). Rebuild each
+        # param's group_order to match the installed order; the map is read by
+        # every optimizer-state save/load path via
+        # _get_main_param_and_optimizer_states().
+        for group_index, (model_fp32_params, model_float16_params) in enumerate(
+            zip(self.model_fp32_groups, self.model_float16_groups)
+        ):
+            for group_order, model_param in enumerate([*model_fp32_params, *model_float16_params]):
+                self.model_param_group_index_map[model_param] = (group_index, group_order)
+
         if isinstance(self.optimizer, HybridDeviceOptimizer):
             self.optimizer = HybridDeviceOptimizer(
                 params=[g["orig_group"] for g in self.opt_group_ranges], **self.optimizer.defaults
@@ -782,6 +825,43 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         else:
             self.optimizer.param_groups = [g["orig_group"] for g in self.opt_group_ranges]
             self.optimizer.load_state_dict(self.optimizer.state_dict())
+
+        if (
+            self.config.chunked_optimizer_state_offload
+            and self.config.optimizer_state_offload_fraction > 0.0
+        ):
+            separate_master_params = []
+            optimizer_owned_master_dtypes = {}
+            if bool(getattr(self.optimizer, "master_weights", False)):
+                # Precision-aware FusedAdam creates optimizer-owned masters for every
+                # optimizer parameter, including native-fp32 DistributedOptimizer shards.
+                for group in itertools.chain(self.shard_float16_groups, self.shard_fp32_groups):
+                    for param in group:
+                        if not isinstance(param, torch.Tensor):
+                            continue
+                        master_dtype = (
+                            torch.int16
+                            if self.config.store_param_remainders and param.dtype == torch.bfloat16
+                            else self.config.main_params_dtype
+                        )
+                        optimizer_owned_master_dtypes[param] = master_dtype
+            else:
+                separate_master_params = [
+                    param
+                    for group in self.shard_fp32_from_float16_groups
+                    for param in group
+                    if isinstance(param, torch.Tensor)
+                ]
+            state_dtypes = (
+                (self.config.exp_avg_dtype, self.config.exp_avg_sq_dtype)
+                if self.config.use_precision_aware_optimizer
+                else (torch.float32, torch.float32)
+            )
+            self.enable_chunked_optimizer_state_offload(
+                master_params=separate_master_params,
+                state_dtypes=state_dtypes,
+                optimizer_owned_master_dtypes=optimizer_owned_master_dtypes,
+            )
 
     def _get_model_param_range_map(self, param: torch.nn.Parameter):
         """
@@ -1043,9 +1123,16 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     v["step"] = step.detach().clone()
 
         # Optimizer.
-        self.optimizer.load_state_dict(
-            {"state": state_dict_state, "param_groups": state_dict_param_groups}
-        )
+        optimizer_state_dict = {"state": state_dict_state, "param_groups": state_dict_param_groups}
+        if self._optimizer_state_offloader is None:
+            self.optimizer.load_state_dict(optimizer_state_dict)
+        else:
+            # The distributed checkpoint path has already allocated selected tensor
+            # states on CPU. Avoid Optimizer.load_state_dict's automatic cast to the
+            # parameter device, which would recreate the complete state on CUDA.
+            self._optimizer_state_offloader.load_state_dict_without_device_cast(
+                optimizer_state_dict
+            )
 
         # Grad scaler.
         if 'grad_scaler' not in state_dict:
@@ -1219,10 +1306,15 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             for k, v in optim_state.items():
                 if isinstance(v, torch.Tensor):
                     dst_tensors[k] = v
-            for key in dst_tensors:
-                if not isinstance(tensors[key], torch.Tensor):
-                    continue
-                dst_tensors[key].copy_(tensors[key])
+            # For fp32 model params, main_param is an autograd-tracked view of
+            # the model param (built without detach() in
+            # _build_model_and_main_param_groups), so the in-place copy must
+            # run under no_grad.
+            with torch.no_grad():
+                for key in dst_tensors:
+                    if not isinstance(tensors[key], torch.Tensor):
+                        continue
+                    dst_tensors[key].copy_(tensors[key])
 
     def get_parameter_state_dp_reshardable(self):
         """Get internal representation of parameter state without any copies and modifications.
@@ -1497,6 +1589,14 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
         Regular state dict parameters are saved on DP rank 0 and loaded on all ranks.
         """
+        if self._optimizer_state_offloader is not None:
+            if is_loading:
+                self._optimizer_state_offloader.initialize_state_for_loading(
+                    self.init_state_fn, self.config
+                )
+            else:
+                self._optimizer_state_offloader.synchronize_for_checkpoint()
+
         if sharding_type is not None:
             log_single_rank(
                 logger,
@@ -1547,7 +1647,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 for k, v in state_dict.items()
             }
 
-        if is_loading:
+        if is_loading and self._optimizer_state_offloader is None:
             # Call the distributed optimizer's specialized load_state_dict(),
             # which conditionally skips re-allocating the optimizer's state if
             # already initialized, which in turn reduces memory fragmentation.
@@ -2812,41 +2912,39 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         if self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
             return
 
-        if self.ddp_config.fp8_param_gather:
-            # Grouped quantized tensors expose one logical parameter backed by multiple TE
-            # quantized members. Expand them so quantize_param_shard receives member-aligned
-            # master shards instead of a shard over the grouped wrapper.
-            fp8_params, shard_fp32_from_fp8, shard_offsets_in_fp8 = (
-                self._get_fp8_params_and_shard_fp32_from_fp8()
-            )
-            expanded_fp8_params = []
-            expanded_shard_fp32_from_fp8 = []
-            expanded_shard_offsets_in_fp8 = []
-            for model_param, shard_main_param, start_offset in zip(
-                fp8_params, shard_fp32_from_fp8, shard_offsets_in_fp8
-            ):
-                sub_model_params, sub_shard_main_params, sub_start_offsets = (
-                    self._expand_quantized_param_shard_for_cast(
-                        model_param, shard_main_param, start_offset
-                    )
-                )
-                expanded_fp8_params.extend(sub_model_params)
-                expanded_shard_fp32_from_fp8.extend(sub_shard_main_params)
-                expanded_shard_offsets_in_fp8.extend(sub_start_offsets)
+        self.ensure_master_weights_for_param_sync()
+        self.assert_master_weights_resident("_copy_main_params_to_model_params")
 
-            quantize_param_shard(
-                expanded_fp8_params,
-                expanded_shard_fp32_from_fp8,
-                expanded_shard_offsets_in_fp8,
-                self.data_parallel_group,
-            )
-        elif self.ddp_config.fp4_param_gather:
+        if self.ddp_config.fp4_param_gather:
             # Quantize FP32 master shards back to NVFP4 model params (rowwise only)
             quantize_nvfp4_param_shard(
                 *self._get_nvfp4_params_and_shard_fp32_from_nvfp4(), self.data_parallel_group
             )
-        else:
-            pass
+
+        fp8_params, shard_fp32_from_fp8, shard_offsets_in_fp8 = (
+            self._get_fp8_params_and_shard_fp32_from_fp8()
+        )
+        expanded_fp8_params = []
+        expanded_shard_fp32_from_fp8 = []
+        expanded_shard_offsets_in_fp8 = []
+        for model_param, shard_main_param, start_offset in zip(
+            fp8_params, shard_fp32_from_fp8, shard_offsets_in_fp8
+        ):
+            sub_model_params, sub_shard_main_params, sub_start_offsets = (
+                self._expand_quantized_param_shard_for_cast(
+                    model_param, shard_main_param, start_offset
+                )
+            )
+            expanded_fp8_params.extend(sub_model_params)
+            expanded_shard_fp32_from_fp8.extend(sub_shard_main_params)
+            expanded_shard_offsets_in_fp8.extend(sub_start_offsets)
+
+        quantize_param_shard(
+            expanded_fp8_params,
+            expanded_shard_fp32_from_fp8,
+            expanded_shard_offsets_in_fp8,
+            self.data_parallel_group,
+        )
 
         # Utility method for copying group params.
         def copy_group_params(shard_main_groups, model_groups):
@@ -2865,12 +2963,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         world_range.start : world_range.end
                     ]
 
-                    if self._is_distopt_quantized_param(model_param):
-                        # FP8 params are quantized in the above "quantize_param_shard" function.
-                        continue
-                    elif is_nvfp4tensor(model_param):
-                        # NVFP4 params are quantized in the above "quantize_nvfp4_param_shard"
-                        # function.
+                    if self._is_distopt_quantized_param(model_param) or is_nvfp4tensor(model_param):
+                        # Quantized params are handled above.
                         continue
                     else:
                         shard_model_param.data.copy_(shard_main_param)
@@ -2902,6 +2996,20 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             raise NotImplementedError(
                 "_copy_main_params_to_param_buffer not supported for Megatron-FSDP."
             )
+        self.ensure_master_weights_for_param_sync()
+        self.assert_master_weights_resident("_copy_main_params_to_param_buffer")
+
+        # A speculative next-bucket gather can still own the shared MXFP8 parameter
+        # buffer here. Finish only outstanding gathers before overwriting that buffer.
+        # force_sync consumes an existing handle without dispatching a new gather and
+        # is safe even if gradient finalization already reset the logical dispatch flag.
+        for model_chunk in self.model_chunks:
+            for bucket_group in (
+                model_chunk.bucket_groups + model_chunk.expert_parallel_bucket_groups
+            ):
+                if bucket_group.param_gather_handle is not None:
+                    model_chunk._start_bucket_group_param_sync(bucket_group, force_sync=True)
+
         for shard_main_group, model_group in zip(
             self.shard_fp32_from_float16_groups, self.model_float16_groups
         ):
@@ -3072,14 +3180,38 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         the model params. This copy does not make use of the grad buffer as
         an intermediary.
         """
+        self.ensure_master_weights_for_param_sync()
+        self.assert_master_weights_resident("_copy_model_params_to_main_params")
+
         if isinstance(self.optimizer, HybridDeviceOptimizer):
             self.optimizer.update_fp32_param_by_new_param()
             return
 
         if self.ddp_config.use_megatron_fsdp:
-            raise NotImplementedError(
-                "Megatron-FSDP does not implement a model-to-main parameter update."
-            )
+            # No-op under Megatron-FSDP: by the time we get here, the fp32
+            # ``main_weight_buffer`` is already populated and ``model_weight_buffer``
+            # mirrors it (bf16/fp16). Mechanism (see ``MegatronFSDP`` in
+            # ``megatron/core/distributed/fsdp/src/megatron_fsdp/megatron_fsdp.py``):
+            #   1. The ``state_dict`` pre-hook runs
+            #      ``_replace_param_with_distributed_if_needed`` before any state_dict
+            #      op, swapping each module ``nn.Parameter`` for the fp32 DTensor over
+            #      the matching ``main_weight_buffer`` slice.
+            #   2. The preceding ``model.load_state_dict(state_dict["model"])`` (from
+            #      checkpointing.py::_load_base_checkpoint -> dcp.load_state_dict,
+            #      then load_model_state_dict) therefore writes the checkpoint's fp32
+            #      tensors directly into ``main_weight_buffer``. ``--no-load-optim``
+            #      only skips ``state_dict["optimizer"]`` (Adam moments + group
+            #      metadata); it does NOT skip main params, because they live in the
+            #      *model* state dict under fsdp_dtensor.
+            #   3. The ``load_state_dict`` post-hook then calls
+            #      ``install_optimized_model_weights`` ->
+            #      ``copy_main_weights_to_model_weights``, which casts
+            #      ``main_weight_buffer`` down to bf16/fp16 to refresh
+            #      ``model_weight_buffer``.
+            # Implementing a model->main copy here would *downgrade* main precision
+            # from the loaded fp32 to ``model_weight.float()`` (bf16-cast-back-to-fp32);
+            # see PR #4748 / #4753 history for an empirical verification.
+            return
 
         # When using precision-aware optimizer, main params are held by self.optimizer. It will also
         # do the work of copying data from main params to model params.
@@ -3126,7 +3258,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         copy_group_params(self.model_float16_groups, self.shard_fp32_from_float16_groups)
         copy_group_params(self.model_fp32_groups, self.shard_fp32_groups)
 
-    def start_param_sync_for_bucket_group_subset(self) -> None:
+    def start_param_sync_for_bucket_group_subset(self, force_sync: bool = False) -> None:
         """Trigger ``start_param_sync`` on DistOpt-managed bucket groups only.
 
         Walks each model chunk's DDP bucket groups and skips those tagged
@@ -3152,7 +3284,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     bucket_group.buckets[0], default_for_untagged=False
                 ):
                     continue
-                model_chunk._start_bucket_group_param_sync(bucket_group, force_sync=False)
+                model_chunk._start_bucket_group_param_sync(bucket_group, force_sync=force_sync)
 
     @torch.no_grad()
     def step_with_ready_grads(self) -> bool:

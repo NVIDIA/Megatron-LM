@@ -1,0 +1,129 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+name: Mirror Dev to Main
+
+on:
+  push:
+    branches:
+      - "pull-request/[0-9]+"
+
+jobs:
+  cherry-pick-to-main:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.PAT }}
+
+      - name: Get PR info
+        id: get-pr-info
+        uses: nv-gha-runners/get-pr-info@main
+
+      - name: Configure Git
+        run: |
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git config --global user.name "GitHub Actions Bot"
+
+      - name: Cherry-pick to main
+        env:
+          GH_TOKEN: ${{ secrets.PAT }}
+        run: |
+          set -x
+
+          PR_NUMBER=${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }}
+          BASE_REF="${{ fromJSON(steps.get-pr-info.outputs.pr-info).base.ref }}"
+          HAS_MIRROR_MAIN_LABEL=$(gh pr view $PR_NUMBER --json labels | jq '[.labels[].name] | any(. == "mirror-to-main")' || echo "false")
+          TARGET_BRANCH="cherry-pick-$PR_NUMBER-into-main"
+
+          # Skip if not labeled with mirror-to-main
+          if [ "$HAS_MIRROR_MAIN_LABEL" != "true" ]; then
+            echo "PR is not labeled with mirror-to-main, will not mirror to main."
+            exit 0
+          fi
+
+          # Skip if not targeting dev
+          if [ "$BASE_REF" != "dev" ]; then
+            echo "PR is not targeting dev, will not mirror to main."
+            exit 0
+          fi
+
+          # Check if target branch already exists
+          if git ls-remote --heads origin "refs/heads/$TARGET_BRANCH" | grep -q .; then
+            echo "Target branch already exists, will not cherry-pick again."
+            exit 0
+          fi
+
+          # Get PR details
+          PR_AUTHOR="${{ fromJSON(steps.get-pr-info.outputs.pr-info).user.login }}"
+          PR_TITLE="${{ fromJSON(steps.get-pr-info.outputs.pr-info).title }}"
+          SOURCE_BRANCH="${{ fromJSON(steps.get-pr-info.outputs.pr-info).head.ref }}"
+          SOURCE_REPO="${{ fromJSON(steps.get-pr-info.outputs.pr-info).head.repo.full_name }}"
+
+          # Fetch all branches
+          git fetch origin dev
+
+          # Handle forks vs same repo
+          if [ "$SOURCE_REPO" = "${{ github.repository }}" ]; then
+            git fetch origin "$SOURCE_BRANCH"
+            git checkout "$SOURCE_BRANCH"
+          else
+            git fetch "https://github.com/$SOURCE_REPO.git" "$SOURCE_BRANCH"
+            git checkout FETCH_HEAD
+          fi
+
+          # Find commit range to cherry-pick
+          START_COMMIT=$(git merge-base origin/dev HEAD)
+          END_COMMIT=$(git rev-parse HEAD)
+
+          # Create cherry-pick branch from main
+          git fetch origin main
+          git checkout main
+          git checkout -b "$TARGET_BRANCH"
+
+          # Cherry-pick commits
+          if ! git cherry-pick "$START_COMMIT..$END_COMMIT"; then
+            # Comment on the original PR about the failure
+            COMMENT_BODY=$(cat <<'EOF'
+          ❌ **Cherry-pick to main failed**
+
+          The cherry-pick encountered conflicts and could not be completed automatically.
+
+          **Next steps:**
+          1. Manually create a PR with these changes to main
+          2. Resolve any conflicts
+          EOF
+            )
+
+            gh pr comment $PR_NUMBER --body "$COMMENT_BODY"
+            exit 1
+          fi
+
+          # Push branch
+          git push -u origin "$TARGET_BRANCH"
+
+          # Create PR to main
+          gh pr create \
+            --base main \
+            --head "$TARGET_BRANCH" \
+            --title "cp: \`$PR_TITLE ($PR_NUMBER)\` into \`main\`" \
+            --body "[🤖]: Hi @$PR_AUTHOR 👋<br><br>We've cherry-picked \`$PR_TITLE (#$PR_NUMBER)\` into \`main\` for you! 🚀<br><br>Please review and approve this cherry-pick at your convenience!" \
+            --label "cherry-pick" \
+            --reviewer "$PR_AUTHOR"
+

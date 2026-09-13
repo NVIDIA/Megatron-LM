@@ -9,6 +9,7 @@ from typing import Optional
 import torch
 import torch.nn.functional as F
 
+from megatron.core.activations import situlu
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fusions.fused_bias_geglu import bias_geglu_impl
@@ -201,6 +202,15 @@ class SharedExpertMLP(MLP):
             output = output * gate_score
         return output
 
+    def _reset_parameters(self):
+        """Initialize parameters owned directly by SharedExpertMLP for meta init."""
+
+        if self.use_shared_expert_gate and self.gate_weight is not None:
+            if self.config.perform_initialization:
+                self.config.init_method(self.gate_weight)
+            self.gate_weight.data = self.gate_weight.data.to(dtype=self.config.params_dtype)
+            setattr(self.gate_weight, 'sequence_parallel', self.config.sequence_parallel)
+
     def sharded_state_dict(
         self, prefix: str = '', sharded_offsets: tuple = (), metadata: Optional[dict] = None
     ) -> ShardedStateDict:
@@ -267,7 +277,14 @@ class SharedExpertMLP(MLP):
             if self.config.use_te_activation_func:
                 if bias_parallel is not None:
                     intermediate_parallel = intermediate_parallel + bias_parallel
-                intermediate_parallel = self.activation_func(intermediate_parallel)
+                if self.activation_func is situlu:
+                    intermediate_parallel = situlu(
+                        intermediate_parallel,
+                        self.config.situ_glu_beta1,
+                        self.config.situ_glu_beta2,
+                    )
+                else:
+                    intermediate_parallel = self.activation_func(intermediate_parallel)
             elif self.config.bias_activation_fusion:
                 if self.activation_func == F.gelu:
                     if self.config.gated_linear_unit:
@@ -282,6 +299,7 @@ class SharedExpertMLP(MLP):
                         intermediate_parallel,
                         bias_parallel,
                         self.config.activation_func_fp8_input_store,
+                        clamp_value=self.config.activation_func_clamp_value,
                     )
                 else:
                     raise ValueError("Only support fusion of gelu and swiglu")
@@ -291,8 +309,15 @@ class SharedExpertMLP(MLP):
                 if self.config.gated_linear_unit:
 
                     def glu(x):
-                        x = torch.chunk(x, 2, dim=-1)
-                        return self.config.activation_func(x[0]) * x[1]
+                        if self.config.activation_func is situlu:
+                            return situlu(x, self.config.situ_glu_beta1, self.config.situ_glu_beta2)
+                        x_glu, x_linear = torch.chunk(x, 2, dim=-1)
+                        if (val := self.config.activation_func_clamp_value) is not None:
+                            x_glu = x_glu.clamp(min=None, max=val)
+                            x_linear = x_linear.clamp(min=-val, max=val)
+                        return self.config.activation_func(x_glu) * (
+                            x_linear + self.config.glu_linear_offset
+                        )
 
                     intermediate_parallel = glu(intermediate_parallel)
                 else:
@@ -383,8 +408,6 @@ class FusedSharedExpertMLP(SharedExpertMLP):
         )
         self._fused_grouped_swiglu_ops = None
         self._fused_grouped_swiglu_recipe = None
-        self._fused_grouped_swiglu_unit_scale = None
-        self._fused_grouped_swiglu_tokens_per_expert = {}
         self._validate_fused_grouped_swiglu()
 
     def _validate_fused_grouped_swiglu(self) -> None:
@@ -404,12 +427,17 @@ class FusedSharedExpertMLP(SharedExpertMLP):
                 f"{self.__class__.__name__} does not support add_bias_linear=True; "
                 "the CuTeGEMM fused kernel requires bias-free linear layers."
             )
-        if not self.config.gated_linear_unit or self.config.activation_func != F.silu:
+        if not self.config.gated_linear_unit or self.config.activation_func not in (F.silu, situlu):
             raise ValueError(
-                f"{self.__class__.__name__} requires SwiGLU activation "
-                "(activation_func=F.silu, gated_linear_unit=True) for the CuTeGEMM "
+                f"{self.__class__.__name__} requires SwiGLU or SiTU-GLU activation "
+                "with gated_linear_unit=True for the CuTeGEMM "
                 f"fused kernel, but got activation_func={self.config.activation_func}, "
                 f"gated_linear_unit={self.config.gated_linear_unit}."
+            )
+        if self.config.activation_func is situlu and not hasattr(te.pytorch.ops, "ScaledSiTUGLU"):
+            raise RuntimeError(
+                f"{self.__class__.__name__} requires Transformer Engine with "
+                "pytorch.ops.ScaledSiTUGLU for SiTU-GLU."
             )
         if self.config.moe_shared_expert_glu_interleave_size is None:
             raise ValueError(
@@ -470,12 +498,16 @@ class FusedSharedExpertMLP(SharedExpertMLP):
         op._glu_interleave_size = glu_interleave_size
         ops.append(op)
 
-        activation_op = te.pytorch.ops.ScaledSwiGLU(glu_interleave_size=glu_interleave_size)
-        # Shared experts are not router-gated. Mark this fused-op instance so
-        # TE can omit the optional forward cuDNN probability tensor without
-        # changing the semantics of routed single-group MLPs.
-        activation_op._grouped_mlp_unit_activation_scale = True
-        ops.append(activation_op)
+        if self.config.activation_func is situlu:
+            ops.append(
+                te.pytorch.ops.ScaledSiTUGLU(
+                    glu_interleave_size=glu_interleave_size,
+                    beta1=self.config.situ_glu_beta1,
+                    beta2=self.config.situ_glu_beta2,
+                )
+            )
+        else:
+            ops.append(te.pytorch.ops.ScaledSwiGLU(glu_interleave_size=glu_interleave_size))
 
         fc2_weight = self.linear_fc2.weight
         op = te.pytorch.ops.GroupedLinear(
@@ -513,21 +545,10 @@ class FusedSharedExpertMLP(SharedExpertMLP):
         hidden_size = hidden_states.size(-1)
         hidden_states_2d = hidden_states.view(-1, hidden_size)
         total_tokens = hidden_states_2d.size(0)
-        tokens_key = (hidden_states.device, total_tokens)
-        tokens_per_expert = self._fused_grouped_swiglu_tokens_per_expert.get(tokens_key)
-        if tokens_per_expert is None:
-            tokens_per_expert = torch.tensor(
-                [total_tokens], dtype=torch.long, device=hidden_states.device
-            )
-            self._fused_grouped_swiglu_tokens_per_expert[tokens_key] = tokens_per_expert
-        scales = self._fused_grouped_swiglu_unit_scale
-        if (
-            scales is None
-            or scales.device != hidden_states.device
-            or scales.dtype != hidden_states.dtype
-        ):
-            scales = torch.ones(1, device=hidden_states.device, dtype=hidden_states.dtype)
-            self._fused_grouped_swiglu_unit_scale = scales
+        tokens_per_expert = torch.full(
+            (1,), total_tokens, dtype=torch.long, device=hidden_states.device
+        )
+        scales = torch.ones(total_tokens, device=hidden_states.device, dtype=hidden_states.dtype)
 
         recipe = self._get_fused_grouped_swiglu_recipe()
         if self._fused_grouped_swiglu_ops is None:

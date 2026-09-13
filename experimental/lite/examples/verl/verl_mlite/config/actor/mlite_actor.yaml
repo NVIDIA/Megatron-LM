@@ -1,0 +1,10 @@
+# Megatron Lite actor config for VERL's new engine worker path.
+defaults:
+  - /optim@optim: megatron
+  - /engine@engine: mlite
+  - actor
+  - _self_
+
+_target_: verl.workers.config.ActorConfig
+
+strategy: mlite

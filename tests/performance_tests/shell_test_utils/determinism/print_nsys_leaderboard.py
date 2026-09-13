@@ -5,6 +5,7 @@
 Usage: ``python print_nsys_leaderboard.py LEADERBOARD_DIR [LOG_DIR]``.
 If LOG_DIR is given, also check det/nondet step-time ratio < MAX_DET_NONDET_RATIO.
 """
+
 import csv
 import glob
 import re

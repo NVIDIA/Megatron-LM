@@ -1,16 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import logging
 import types
@@ -103,9 +91,12 @@ def fully_shard_model(
     fsdp_db_use_persist_buf_on_alloc_fail: bool = False,
     disable_symmetric_registration: bool = False,
     enable_fine_grained_param_gather: bool = False,
+    prefetch_recompute_forward_weights: bool = False,
+    cache_param_bucket_views: bool = False,
     use_decoupled_grad: bool = False,
     cuda_graph_mode: bool = False,
     maxpool_double_buffer: bool = False,
+    fsdp_buffer_count: int = 2,
 ) -> torch.nn.Module:
     """
     Fully-shard the model for Megatron-FSDP. This wraps the model in a MegatronFSDP
@@ -263,6 +254,14 @@ def fully_shard_model(
             unshards parameters per-Module instead of unsharding all sub-modules of an FSDP
             unit module simultaneously. Defaults to False.
 
+        prefetch_recompute_forward_weights (bool):
+            Whether to prefetch rowwise weights needed by activation recomputation during
+            backward before prefetching backward transpose weights. Defaults to False.
+
+        cache_param_bucket_views (bool):
+            Whether to cache parameter bucket views to reduce repeated Python-side view setup
+            when attaching module parameters to all-gather buckets. Defaults to False.
+
         use_decoupled_grad (bool):
             If true, reduced gradients are installed into `Parameter.decoupled_grad` instead
             of `Parameter.grad`. Defaults to False.
@@ -284,6 +283,10 @@ def fully_shard_model(
             parity between FSDP units, when using fsdp_double_buffer=True. Enables NCCL
             user buffer registration and CUDA graph replay for models with asymmetrical
             FSDP units, such as models with hybrid architectures (e.g. Mamba and MoE).
+
+        fsdp_buffer_count (int):
+            Number of persistent buffers allocated for each FSDP communication pool.
+            Defaults to two. Appended to preserve positional-call compatibility.
 
     Returns:
         model (MegatronFSDP): The wrapped Megatron-FSDP model configured for FSDP.
@@ -366,6 +369,17 @@ def fully_shard_model(
             "Meta device initialization (init_model_with_meta_device=True) is not "
             "supported or necessary for the 'no_shard' / 0 sharding strategy."
         )
+    if prefetch_recompute_forward_weights:
+        if zero_dp_strategy != "optim_grads_params":
+            raise ValueError(
+                "prefetch_recompute_forward_weights is only supported with "
+                "zero_dp_strategy='optim_grads_params'."
+            )
+        if not fsdp_unit_modules:
+            raise ValueError(
+                "prefetch_recompute_forward_weights requires fsdp_unit_modules to define "
+                "the Megatron-FSDP unit-level backward prefetch order."
+            )
 
     # DDP Config for Megatron FSDP.
     ddp_config = DistributedDataParallelConfig(
@@ -377,8 +391,11 @@ def fully_shard_model(
         keep_fp8_transpose_cache=keep_fp8_transpose_cache,  # pylint: disable=C0301
         nccl_ub=nccl_ub,
         fsdp_double_buffer=fsdp_double_buffer or nccl_ub,
+        fsdp_buffer_count=fsdp_buffer_count,
         fsdp_db_use_persist_buf_on_alloc_fail=fsdp_db_use_persist_buf_on_alloc_fail,
         disable_symmetric_registration=disable_symmetric_registration,
+        megatron_fsdp_prefetch_recompute_forward_weights=prefetch_recompute_forward_weights,
+        megatron_fsdp_cache_param_bucket_views=cache_param_bucket_views,
         megatron_fsdp_use_decoupled_grad=use_decoupled_grad,
         megatron_fsdp_cuda_graph_mode=cuda_graph_mode,
         megatron_fsdp_max_pool_double_buffer=maxpool_double_buffer,
@@ -731,9 +748,12 @@ def fully_shard(
     fsdp_db_use_persist_buf_on_alloc_fail: bool = False,
     disable_symmetric_registration: bool = False,
     enable_fine_grained_param_gather: bool = False,
+    prefetch_recompute_forward_weights: bool = False,
+    cache_param_bucket_views: bool = False,
     use_decoupled_grad: bool = False,
     cuda_graph_mode: bool = False,
     maxpool_double_buffer: bool = False,
+    fsdp_buffer_count: int = 2,
 ) -> tuple[MegatronFSDP, torch.optim.Optimizer]:
     """
     Fully shard the model and the optimizer for Megatron-FSDP.
@@ -781,8 +801,12 @@ def fully_shard(
         keep_fp8_transpose_cache=keep_fp8_transpose_cache,
         nccl_ub=nccl_ub,
         fsdp_double_buffer=fsdp_double_buffer,
+        fsdp_buffer_count=fsdp_buffer_count,
         fsdp_db_use_persist_buf_on_alloc_fail=fsdp_db_use_persist_buf_on_alloc_fail,
         disable_symmetric_registration=disable_symmetric_registration,
+        enable_fine_grained_param_gather=enable_fine_grained_param_gather,
+        prefetch_recompute_forward_weights=prefetch_recompute_forward_weights,
+        cache_param_bucket_views=cache_param_bucket_views,
         use_decoupled_grad=use_decoupled_grad,
         cuda_graph_mode=cuda_graph_mode,
         maxpool_double_buffer=maxpool_double_buffer,

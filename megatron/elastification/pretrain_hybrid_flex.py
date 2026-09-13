@@ -19,9 +19,11 @@ from megatron.core.num_microbatches_calculator import (
 )
 from megatron.core.parallel_state import (
     get_context_parallel_group,
+    get_context_parallel_rank,
+    get_context_parallel_world_size,
     get_data_parallel_rank,
     get_data_parallel_world_size,
-    get_hybrid_data_context_parallel_groups,
+    get_dynamic_data_context_parallel_groups,
     get_pipeline_model_parallel_rank,
     get_pipeline_model_parallel_world_size,
     get_tensor_model_parallel_group,
@@ -60,6 +62,7 @@ try:
     from megatron.post_training.model_builder import (
         modelopt_gpt_mamba_builder as model_provider_modelopt,
     )
+
     has_nvidia_modelopt = True
 except ImportError:
     print_rank_0("ModelOpt is not installed. Please install it using `pip install nvidia-modelopt`")
@@ -67,10 +70,23 @@ except ImportError:
 print_rank_0("has_nvidia_modelopt is {}".format(has_nvidia_modelopt))
 import numpy as np
 
+try:
+    # Register the TE CUDA kernels
+    import transformer_engine  # pylint: disable=unused-import
+
+    # Alias the PyTorch wrapper so we can call tex.* APIs
+    import transformer_engine_torch as tex
+except ImportError:
+    # TE isn’t installed or the torch wrapper is missing
+    tex = None
+
+from megatron.core.utils import is_te_min_version
+
 _global_choice_counter = 0
 _logged_params_norm = False
 
 stimer = StragglerDetector()
+
 
 def count_parameters_in_layer(model, layer_name):
     num_params = 0
@@ -81,7 +97,13 @@ def count_parameters_in_layer(model, layer_name):
     return num_params
 
 
-def model_provider(pre_process=True, post_process=True, vp_stage: Optional[int] = None, config = None, pg_collection = None) -> HybridModel:
+def model_provider(
+    pre_process=True,
+    post_process=True,
+    vp_stage: Optional[int] = None,
+    config=None,
+    pg_collection=None,
+) -> HybridModel:
     """Builds the model.
 
     Args:
@@ -95,21 +117,29 @@ def model_provider(pre_process=True, post_process=True, vp_stage: Optional[int] 
     args = get_args()
     if has_nvidia_modelopt:
 
-        model = model_provider_modelopt(args, pre_process, post_process, vp_stage=vp_stage, config=config, pg_collection=pg_collection)
+        model = model_provider_modelopt(
+            args,
+            pre_process,
+            post_process,
+            vp_stage=vp_stage,
+            config=config,
+            pg_collection=pg_collection,
+        )
         from megatron.elastification.flextron_utils import (
             inject_flextron_forward_logic,
             setup_flextron_model,
         )
+
         setup_flextron_model(model)
         inject_flextron_forward_logic(model)
 
         if args.freeze_model:
-            for name, param in model.named_parameters(): 
+            for name, param in model.named_parameters():
                 if 'gate' not in name:
                     param.requires_grad = False
-                    
+
         if args.freeze_router:
-            for name, param in model.named_parameters(): 
+            for name, param in model.named_parameters():
                 if 'gate' in name:
                     param.requires_grad = False
 
@@ -139,12 +169,13 @@ def model_provider(pre_process=True, post_process=True, vp_stage: Optional[int] 
         position_embedding_type=args.position_embedding_type,
         rotary_percent=args.rotary_percent,
         rotary_base=args.rotary_base,
-        vp_stage=vp_stage
+        vp_stage=vp_stage,
     )
     from megatron.elastification.flextron_utils import (
         inject_flextron_forward_logic,
         setup_flextron_model,
     )
+
     setup_flextron_model(model)
     inject_flextron_forward_logic(model)
 
@@ -179,7 +210,7 @@ def get_batch(data_iterator, vp_stage=None):
     tp_rank = mpu.get_tensor_model_parallel_rank()
     is_sft = args.sft
     has_cu_seqlens = is_sft or getattr(args, 'dataloader_inter_document_masking', False)
-    is_hybrid_cp = args.hybrid_context_parallel
+    is_hybrid_cp = args.dynamic_context_parallel
     mtp_on_this_rank = mtp_on_this_rank_func(
         layout=config.pipeline_model_parallel_layout,
         mtp_num_layers=config.mtp_num_layers,
@@ -187,9 +218,14 @@ def get_batch(data_iterator, vp_stage=None):
         vp_stage=vp_stage,
     )
 
-    if not is_first_or_last_pipeline_stage(vp_stage) and not mtp_on_this_rank and not has_cu_seqlens:
+    if (
+        not is_first_or_last_pipeline_stage(vp_stage)
+        and not mtp_on_this_rank
+        and not has_cu_seqlens
+    ):
         return None, None, None, None, None, None, None
 
+    # get batches based on the TP rank you are on
     batch = {}
     if tp_rank == 0:
         batch = next(data_iterator)
@@ -229,7 +265,7 @@ def get_batch(data_iterator, vp_stage=None):
         batch,
         is_hybrid_cp=is_hybrid_cp,
         cp_group=get_context_parallel_group(),
-        hybrid_cp_group_func=get_hybrid_data_context_parallel_groups,
+        hybrid_cp_group_func=get_dynamic_data_context_parallel_groups,
         use_per_sequence_balancing=(
             getattr(args, 'dataloader_inter_document_masking', False) and not is_sft
         ),
@@ -246,8 +282,8 @@ def get_batch(data_iterator, vp_stage=None):
         batch.get('loss_mask'),
         batch.get('attention_mask'),
         batch.get('position_ids'),
-        cu_seqlens,
-        max_seqlen,
+        batch.get('cu_seqlens'),
+        batch.get('max_seqlen'),
     )
 
 
@@ -255,7 +291,12 @@ def get_batch(data_iterator, vp_stage=None):
 SPIKY_LOSS_FACTOR = 10
 
 
-def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor, model: Optional[HybridModel] = None, selected_budget=None):
+def loss_func(
+    loss_mask: torch.Tensor,
+    output_tensor: torch.Tensor,
+    model: Optional[HybridModel] = None,
+    selected_budget=None,
+):
     """Loss function.
 
     Args:
@@ -270,12 +311,14 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor, model: Optio
     """
     args = get_args()
     if has_nvidia_modelopt:
-        return loss_func_modelopt(loss_mask, output_tensor, model=model, selected_budget=selected_budget)
+        return loss_func_modelopt(
+            loss_mask, output_tensor, model=model, selected_budget=selected_budget
+        )
 
-    alpha = args.loss_alpha 
+    alpha = args.loss_alpha
 
     (output_tensor, (param_loss, extra_reporting_dict)) = output_tensor
-    
+
     if param_loss is not None:
         if param_loss > 0:
             param_loss_report = param_loss.detach().clone()
@@ -294,14 +337,14 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor, model: Optio
             result=loss,
             rejection_func=torch.isnan,
             message="found NaN in local forward loss calculation",
-            tolerance=0.0,        # forward pass calculations are deterministic
+            tolerance=0.0,  # forward pass calculations are deterministic
             fatal=True,
         )
         rerun_state_machine.validate_result(
             result=loss,
             rejection_func=torch.isinf,
             message="found Inf in local forward loss calculation",
-            tolerance=0.0,        # forward pass calculations are deterministic
+            tolerance=0.0,  # forward pass calculations are deterministic
             fatal=True,
         )
     # Check for spiky loss
@@ -314,32 +357,38 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor, model: Optio
                 context="loss",
             ),
             message="Spiky loss",
-            tolerance=0.0,        # forward pass calculations are deterministic
+            tolerance=0.0,  # forward pass calculations are deterministic
             fatal=False,
         )
-
 
     num_tokens = loss_mask.sum().clone().detach().to(torch.int)
 
     if param_loss is not None:
         param_loss *= num_tokens * alpha
         if param_loss < 0:
-            param_loss = -args.router_beta * param_loss 
+            param_loss = -args.router_beta * param_loss
 
         param_loss_report = torch.cat([param_loss.clone().detach().view(1), num_tokens.view(1)])
         lm_loss_report = torch.cat([loss.clone().detach().view(1), num_tokens.view(1)])
         loss += param_loss[0]
-            
+
     # Protect against division by zero when all tokens are masked.
     num_tokens = torch.clamp(num_tokens, min=1)
     reporting_loss = torch.cat([loss.clone().detach().view(1), num_tokens.view(1)])
 
     if param_loss is not None:
-        return (loss, num_tokens, {'lm loss': lm_loss_report, 
-                                   'param loss': param_loss_report,
-                                   'total loss': reporting_loss})
+        return (
+            loss,
+            num_tokens,
+            {
+                'lm loss': lm_loss_report,
+                'param loss': param_loss_report,
+                'total loss': reporting_loss,
+            },
+        )
     else:
         return (loss, num_tokens, {'lm loss': reporting_loss})
+
 
 def get_grad_acc_based_random_choice(args, choices=None, prob=None, base_seed=42):
 
@@ -348,7 +397,9 @@ def get_grad_acc_based_random_choice(args, choices=None, prob=None, base_seed=42
     global _global_choice_counter
 
     # DP-specific seeding
-    rng = np.random.RandomState(base_seed + _global_choice_counter + grad_accumulation_steps*args.curr_iteration*10)
+    rng = np.random.RandomState(
+        base_seed + _global_choice_counter + grad_accumulation_steps * args.curr_iteration * 10
+    )
     if choices is None:
         choice = rng.uniform(0, 1)
     else:
@@ -359,6 +410,7 @@ def get_grad_acc_based_random_choice(args, choices=None, prob=None, base_seed=42
     _global_choice_counter += 1
     _global_choice_counter %= grad_accumulation_steps
     return choice
+
 
 def forward_step(data_iterator, model: HybridModel):
     """Forward training step.
@@ -375,6 +427,7 @@ def forward_step(data_iterator, model: HybridModel):
     if not _logged_params_norm:
         _logged_params_norm = True
         from collections import defaultdict
+
         groups = defaultdict(float)
         trainable_sq = frozen_sq = total_sq = 0.0
         for name, param in model.named_parameters():
@@ -387,7 +440,7 @@ def forward_step(data_iterator, model: HybridModel):
             # Strip DDP 'module.' wrappers to get the logical top-level name.
             clean = name
             while clean.startswith('module.'):
-                clean = clean[len('module.'):]
+                clean = clean[len('module.') :]
             top = clean.split('.')[0]
             groups[top] += norm_sq
             total_sq += norm_sq
@@ -406,15 +459,9 @@ def forward_step(data_iterator, model: HybridModel):
     timers('batch-generator', log_level=2).start()
     global stimer
     with stimer(bdata=True):
-        (
-            tokens,
-            labels,
-            loss_mask,
-            attention_mask,
-            position_ids,
-            cu_seqlens,
-            max_seqlen,
-        ) = get_batch(data_iterator)
+        (tokens, labels, loss_mask, attention_mask, position_ids, cu_seqlens, max_seqlen) = (
+            get_batch(data_iterator)
+        )
     timers('batch-generator').stop()
 
     if get_grad_acc_based_random_choice(args=args) < args.original_model_sample_prob:
@@ -428,20 +475,26 @@ def forward_step(data_iterator, model: HybridModel):
             budget_probs = [1.0 for _ in args.budget_list]
         else:
             budget_probs = args.budget_probs
-            
-        assert len(args.budget_list) == len(budget_probs), "budget_list and budget_probs must have the same length"
+
+        assert len(args.budget_list) == len(
+            budget_probs
+        ), "budget_list and budget_probs must have the same length"
         budget_probs = [float(p) for p in budget_probs]
         budget_probs = [p / sum(budget_probs) for p in budget_probs]
-        selected_budget = get_grad_acc_based_random_choice(args=args, choices=args.budget_list, prob=budget_probs)
+        selected_budget = get_grad_acc_based_random_choice(
+            args=args, choices=args.budget_list, prob=budget_probs
+        )
         flextron_kwargs = {'budget': selected_budget}
 
     with stimer:
-        output_tensor = model(tokens, position_ids, attention_mask,
-                              labels=labels, **flextron_kwargs)
+        output_tensor = model(
+            tokens, position_ids, attention_mask, labels=labels, **flextron_kwargs
+        )
 
     # [ModelOpt]: model is needed to access ModelOpt distillation losses
-    return output_tensor, partial(loss_func, loss_mask, model=model, selected_budget=selected_budget)
-
+    return output_tensor, partial(
+        loss_func, loss_mask, model=model, selected_budget=selected_budget
+    )
 
 
 def is_dataset_built_on_rank(vp_stage=None):
@@ -506,7 +559,7 @@ def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None
         dataset_type,
         train_val_test_num_samples,
         partial(is_dataset_built_on_rank, vp_stage=vp_stage),
-        config
+        config,
     ).build()
 
     print_rank_0("> finished creating GPT datasets ...")
@@ -546,13 +599,11 @@ if __name__ == "__main__":
         if lr_mult != 1.0:
             router_key = ParamKey(
                 with_name_predicate=ParamWithNamePredicate(
-                    name="router_pp",
-                    fn=lambda p, name: 'router_pp' in name,
+                    name="router_pp", fn=lambda p, name: 'router_pp' in name
                 )
             )
             router_override = ParamGroupOverride(
-                max_lr=args.lr * lr_mult,
-                min_lr=args.min_lr * lr_mult,
+                max_lr=args.lr * lr_mult, min_lr=args.min_lr * lr_mult
             )
             config_overrides = {**(config_overrides or {}), router_key: router_override}
         return config, config_overrides
@@ -567,10 +618,11 @@ if __name__ == "__main__":
     )
 
     full_config = pretrain_cfg_container_from_args(args)
-    pretrain(full_config,
-             train_valid_test_datasets_provider,
-             ModelType.encoder_or_decoder,
-             forward_step,
-             model_provider,
-             store=store,
-             )
+    pretrain(
+        full_config,
+        train_valid_test_datasets_provider,
+        ModelType.encoder_or_decoder,
+        forward_step,
+        model_provider,
+        store=store,
+    )

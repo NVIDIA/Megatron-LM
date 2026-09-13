@@ -68,8 +68,12 @@ def run_model_submodules_with_capture(model, input_tensors, microbatches):
     output_tensors = []
     # get callables
     callables, dw = build_layer_callables(model)
-    attn, dispatch, moe, combine, post_process = callables
+    # Six slots: mHC post-processing is its own node. This model has no hyper
+    # connections, so that slot is None -- but unpack it explicitly so a future
+    # width change fails here rather than silently dropping the last callable.
+    attn, dispatch, moe, combine, post_process, mhc_post = callables
     assert post_process is None
+    assert mhc_post is None
     dummy_model = DummyState()
     dummy_model.decoder = DummyState()
     dummy_model.decoder.final_layernorm = None
@@ -77,6 +81,7 @@ def run_model_submodules_with_capture(model, input_tensors, microbatches):
         # build mock func/state
         node = DummyNode()
         node.is_mtp = False
+        node.is_last_layer = False
         node.chunk_state.model = dummy_model
 
         # attn fwd

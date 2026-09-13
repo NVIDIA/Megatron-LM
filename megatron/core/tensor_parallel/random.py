@@ -1,4 +1,4 @@
-# Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 # Parts of the code here are adapted from PyTorch
 # repo: https://github.com/pytorch/pytorch
@@ -64,6 +64,33 @@ void share_storage(at::Tensor dst, at::Tensor src) {
 """
 
 _share_storage_ext = None
+
+# Set on the output StorageImpl wrapper used by CheckpointWithoutOutput.  The
+# storage-level marker is visible through aliases/views of the output tensor.
+_CHECKPOINT_WITHOUT_OUTPUT_STORAGE_ATTR = "_mcore_checkpoint_without_output"
+
+
+def _get_checkpoint_without_output_storage(tensor: torch.Tensor) -> torch.UntypedStorage | None:
+    """Return a tensor's storage, or None for storage-less tensor subclasses."""
+    try:
+        return tensor.untyped_storage()
+    except (AttributeError, NotImplementedError, RuntimeError):
+        return None
+
+
+def _mark_checkpoint_without_output_tensor(tensor: torch.Tensor) -> None:
+    """Mark a tensor's storage as owned by CheckpointWithoutOutput."""
+    storage = _get_checkpoint_without_output_storage(tensor)
+    if storage is not None:
+        setattr(storage, _CHECKPOINT_WITHOUT_OUTPUT_STORAGE_ATTR, True)
+
+
+def is_checkpoint_without_output_tensor(tensor: torch.Tensor) -> bool:
+    """Return whether a tensor aliases a CheckpointWithoutOutput output storage."""
+    storage = _get_checkpoint_without_output_storage(tensor)
+    return storage is not None and bool(
+        getattr(storage, _CHECKPOINT_WITHOUT_OUTPUT_STORAGE_ATTR, False)
+    )
 
 
 def _get_share_storage():
@@ -523,22 +550,101 @@ def is_graph_safe_cuda_rng_tracker(cuda_rng_tracker):
 
 
 def _get_all_rng_states():
-    """Get all the rng states."""
+    """Get all the rng states.
+
+    With a graph-safe RNG tracker, ``graphsafe_get_state``/``get_states`` return
+    generator handles that share the live generator state objects, so restoring
+    through them later is a no-op: by then the live state has advanced. Outside
+    CUDA graph capture we therefore snapshot state *contents* (``clone_state``)
+    so that checkpoint recompute and ``_fork_rng`` can actually rewind (e.g.
+    dropout inside a checkpointed region must replay the forward-time offsets).
+    Inside capture, host-side state reads are not capture-safe, so the original
+    handle semantics are kept.
+
+    The snapshot carries an explicit ``cloned``/``live`` tag. Both
+    ``clone_state()`` and ``graphsafe_get_state()`` return ``torch.Generator``,
+    so the kind cannot be recovered by inspecting the value, and re-deriving it
+    from ``is_current_stream_capturing()`` at restore time is wrong whenever the
+    snapshot and the restore sit on opposite sides of a capture boundary: a
+    cloned snapshot restored under capture would replace the tracker's live
+    generators with the clones (orphaning them from graph bookkeeping), and a
+    live snapshot restored outside capture would write each state onto itself
+    and silently skip the rewind.
+
+    Compatibility note: this is a behaviour change for configurations that
+    predate mHC. Any run combining a graph-safe tracker (``--te-rng-tracker`` or
+    ``use_cudagraphable_rng``) with activation recompute and non-zero dropout
+    previously restored through a live handle, which was a no-op by the time it
+    ran, so recompute drew a different dropout mask than its forward. Those runs
+    now rewind correctly and will not reproduce their prior loss curves. A
+    golden-value mismatch on such a configuration is expected and attributable
+    here.
+    """
     cpu_rng_state = torch.get_rng_state()
-    cuda_rng_state = _get_cuda_rng_state(
-        graph_safe=is_graph_safe_cuda_rng_tracker(get_cuda_rng_tracker())
-    )
-    cuda_rng_state_tracker = get_cuda_rng_tracker().get_states()
-    return cpu_rng_state, cuda_rng_state, cuda_rng_state_tracker
+    tracker = get_cuda_rng_tracker()
+    graph_safe = is_graph_safe_cuda_rng_tracker(tracker)
+    if graph_safe and not torch.cuda.is_current_stream_capturing():
+        kind = "cloned"
+        cuda_rng_state = _get_cuda_rng_state(clone=True, graph_safe=True)
+        cuda_rng_state_tracker = {
+            name: state.clone_state() for name, state in tracker.get_states().items()
+        }
+    else:
+        kind = "live"
+        cuda_rng_state = _get_cuda_rng_state(graph_safe=graph_safe)
+        cuda_rng_state_tracker = tracker.get_states()
+    return cpu_rng_state, cuda_rng_state, cuda_rng_state_tracker, kind
 
 
-def _set_all_rng_states(cpu_rng_state, cuda_rng_state, cuda_rng_state_tracker):
-    """Set all the rng states."""
+def _set_all_rng_states(cpu_rng_state, cuda_rng_state, cuda_rng_state_tracker, kind="live"):
+    """Set all the rng states.
+
+    Graph-safe eager restore writes the snapshot *contents* back into the live
+    state objects instead of pointer-swapping generators: captured CUDA graphs
+    and the RNG tracker hold references to the live generator states, and
+    replacing those objects would orphan them from graph replay bookkeeping.
+
+    ``kind`` is the tag produced by ``_get_all_rng_states`` and selects the
+    restore path directly, so a snapshot taken on one side of a capture boundary
+    cannot be restored with the other side's semantics. It defaults to ``live``
+    for the pre-tag call convention, which is the handle-swap behaviour.
+    """
     torch.set_rng_state(cpu_rng_state)
-    _set_cuda_rng_state(
-        cuda_rng_state, graph_safe=is_graph_safe_cuda_rng_tracker(get_cuda_rng_tracker())
-    )
-    get_cuda_rng_tracker().set_states(cuda_rng_state_tracker)
+    tracker = get_cuda_rng_tracker()
+    graph_safe = is_graph_safe_cuda_rng_tracker(tracker)
+    if kind == "cloned" and not graph_safe:
+        raise RuntimeError(
+            "Graph-safe RNG snapshot is being restored under a non-graph-safe tracker; "
+            "the tracker implementation changed across the fork."
+        )
+    if kind == "cloned" and torch.cuda.is_current_stream_capturing():
+        # The snapshot was taken eagerly but the restore landed inside capture,
+        # where these host-side state writes are not capture-safe. Fail loudly:
+        # the alternative is a graph that replays whatever offsets happened to be
+        # live at capture time.
+        raise RuntimeError(
+            "An eager graph-safe RNG snapshot is being restored inside CUDA graph "
+            "capture. Snapshot and restore must sit on the same side of a capture "
+            "boundary; restoring generator contents under capture is not capture-safe."
+        )
+    if kind == "cloned":
+        _get_cuda_rng_state(graph_safe=True).set_state(cuda_rng_state.get_state())
+        live_states = tracker.get_states()
+        # Unlike the tracker.set_states() branch below, which replaces the mapping
+        # wholesale, this one restores in place and so cannot express a change in
+        # the key set: a dropped name would raise KeyError mid-backward, and a name
+        # added since the snapshot would silently keep its advanced offsets and
+        # draw a different dropout mask on recompute than it did in forward.
+        if set(live_states) != set(cuda_rng_state_tracker):
+            raise RuntimeError(
+                "Graph-safe RNG tracker state names changed across the fork: snapshot "
+                f"{sorted(cuda_rng_state_tracker)} vs live {sorted(live_states)}"
+            )
+        for name, state in cuda_rng_state_tracker.items():
+            live_states[name].set_state(state.get_state())
+    else:
+        _set_cuda_rng_state(cuda_rng_state, graph_safe=graph_safe)
+        tracker.set_states(cuda_rng_state_tracker)
 
 
 @contextlib.contextmanager
@@ -624,7 +730,9 @@ class CheckpointFunction(torch.autograd.Function):
     @staticmethod
     def backward(ctx, *args):
         """Backward pass."""
-        if not torch.autograd._is_checkpoint_valid():
+        from megatron.core.transformer.cuda_graphs import is_graph_capturing
+
+        if not torch.autograd._is_checkpoint_valid() and not is_graph_capturing():
             raise RuntimeError(
                 "Checkpointing is not compatible with .grad(), "
                 "please use .backward() if possible"
@@ -675,10 +783,67 @@ def checkpoint(
     return CheckpointFunction.apply(function, distribute_saved_activations, *args)
 
 
+def _save_args_to_ctx(ctx, args):
+    """Save mixed tensor/non-tensor arguments into autograd ctx.
+
+    Since save_for_backward only supports tensors, this function separates
+    tensor and non-tensor arguments, saving tensors via save_for_backward
+    and storing non-tensor metadata (indices and values) as ctx attributes.
+
+    Use _load_args_from_ctx to reconstruct the original args.
+    """
+    tensor_args = []
+    non_tensor_entries = []
+
+    for index, arg in enumerate(args):
+        if isinstance(arg, torch.Tensor):
+            tensor_args.append(arg)
+            continue
+        non_tensor_entries.append((index, arg))
+
+    ctx.save_for_backward(*detach_variable(tuple(tensor_args)))
+    ctx._non_tensor_entries = tuple(non_tensor_entries)
+    ctx._total_args_count = len(args)
+
+
+def _load_args_from_ctx(ctx):
+    """Load and reconstruct mixed tensor/non-tensor arguments from autograd ctx.
+
+    This is the inverse of _save_args_to_ctx. It retrieves tensors from
+    ctx.saved_tensors and merges them with stored non-tensor arguments
+    to reconstruct the original args in their original order.
+
+    Returns:
+        tuple of reconstructed arguments in their original order.
+    """
+
+    def _detach_with_grad(tensor):
+        detached = tensor.detach()
+        detached.requires_grad_(tensor.requires_grad)
+        return detached
+
+    tensor_iter = iter(_detach_with_grad(t) for t in ctx.saved_tensors)
+    total_args_count = ctx._total_args_count
+    non_tensor_map = dict(ctx._non_tensor_entries)
+
+    reconstructed_args = []
+    for index in range(total_args_count):
+        if index in non_tensor_map:
+            reconstructed_args.append(non_tensor_map[index])
+        else:
+            reconstructed_args.append(next(tensor_iter))
+    return tuple(reconstructed_args)
+
+
 class CheckpointWithoutOutputFunction(torch.autograd.Function):
     """
     Checkpoint Function Helper for CheckpointWithoutOutput.
     Save context for recompute.
+
+    Handles both tensor and non-tensor arguments:
+    - Tensor arguments are saved via save_for_backward
+    - Non-tensor arguments (int, float, bool, None, etc.) are stored separately
+      in ctx attributes and reconstructed during recomputation
     """
 
     @staticmethod
@@ -701,7 +866,10 @@ class CheckpointWithoutOutputFunction(torch.autograd.Function):
 
         with torch.no_grad(), fwd_ctx:
             outputs = run_function(*args)
-        ctx.save_for_backward(*detach_variable(args))
+
+        # Save tensor and non-tensor arguments into ctx for recomputation
+        _save_args_to_ctx(ctx, args)
+
         # the CheckpointWithoutOutput object is passed in, then it can access the saved input
         # tensors later for recomputation
         checkpoint_without_output_obj.ctx = ctx
@@ -718,8 +886,149 @@ class CheckpointWithoutOutputFunction(torch.autograd.Function):
         torch.autograd.backward(outputs, args)
         ctx.outputs = None
         ctx.inputs = None
-        grads = tuple(inp.grad if isinstance(inp, torch.Tensor) else inp for inp in inputs)
+        grads = tuple(inp.grad if isinstance(inp, torch.Tensor) else None for inp in inputs)
         return (None, None) + grads
+
+
+class MHCCheckpointManager:
+    """Manage mHC checkpoints that are recomputed together across transformer layers.
+
+    This manager enables unified recomputation for checkpoint operations with sequential
+    dependencies, such as when one checkpoint's output is the next checkpoint's input.
+
+    Specific to manifold hyper-connections, and named for it: it owns an
+    ``MHCRecomputeArena``, validates slot addresses before every replay, and its
+    phase argument is ``MHCRecomputePhase``. Every construction site in the tree
+    is an mHC one. Should a second consumer ever want the group-replay machinery
+    without the arena, the general part is worth lifting into a base class at
+    that point rather than being asserted by the name now.
+
+    Examples:
+        ckpt_manager = MHCCheckpointManager()
+        ckpt_function = CheckpointWithoutOutput(ckpt_manager=ckpt_manager)
+        ckpt_function.checkpoint(run_function, *args)
+        # other checkpointed operations
+
+        # Hook-driven path:
+        ckpt_manager.discard_all_outputs_and_register_unified_recompute(final_output)
+
+        # Or scheduler-driven path:
+        ckpt_manager.discard_all_outputs()
+        ckpt_manager.recompute_now()
+    """
+
+    def __init__(self):
+        from megatron.core.transformer.mhc_recompute import MHCRecomputeArena
+
+        self.checkpoints = []
+        self._outputs_discarded = False
+        self._recomputed = False
+        self.mhc_arena = MHCRecomputeArena()
+        # Set by TransformerBlock before each layer forward.
+        # When True, the layer should keep block-boundary output uncheckpointed.
+        self.is_last_layer_in_recompute_block = False
+
+    def add_checkpoint(self, ckpt):
+        """Add a checkpoint to the manager."""
+        from megatron.core.transformer.mhc_recompute import MHCRecomputePhase
+
+        if not isinstance(ckpt, CheckpointWithoutOutput):
+            raise TypeError("Expected CheckpointWithoutOutput object")
+        if ckpt.outputs is None:
+            raise ValueError("CheckpointWithoutOutput must call checkpoint() before adding")
+        # Make the deferred-partitioning invariant executable rather than
+        # documentary: recompute_until() filters on recompute_phase, but every
+        # checkpoint sits at BEFORE_COMBINE_BWD today, so both call sites replay
+        # the whole group. The first checkpoint registered at another phase is
+        # where that filter starts to matter -- fail there instead of quietly
+        # changing what gets replayed. See MHCRecomputePhase's TODO.
+        if ckpt.recompute_phase is not MHCRecomputePhase.BEFORE_COMBINE_BWD:
+            raise NotImplementedError(
+                "mHC recompute phase partitioning is not implemented: every checkpoint "
+                f"must register at BEFORE_COMBINE_BWD, got {ckpt.recompute_phase!r}"
+            )
+        self.checkpoints.append(ckpt)
+
+    def discard_all_outputs_and_register_unified_recompute(self, hook_tensor):
+        """Discard all checkpoint outputs to save memory and register unified recompute hook."""
+        self.discard_all_outputs()
+
+        # Register unified recompute hook
+        if hook_tensor.requires_grad:
+            hook_tensor.register_hook(self._unified_recompute_hook)
+
+    def discard_all_outputs(self) -> None:
+        """Discard all managed checkpoint outputs without registering a backward hook.
+
+        This operation is idempotent; calls after the first successful discard are no-ops.
+        """
+        if self._outputs_discarded:
+            return
+
+        for ckpt in self.checkpoints:
+            if ckpt.output_slot is not None:
+                # This storage is the captured consumer input. It is already a
+                # mandatory CUDA Graph allocation and must retain its address;
+                # the producer output is discarded logically, then overwritten
+                # in place by recompute.
+                for output in ckpt.outputs:
+                    ckpt.output_slot.validate_output(output)
+                continue
+            for output in ckpt.outputs:
+                output.untyped_storage().resize_(0)
+        self._outputs_discarded = True
+
+    def recompute_until(self, phase) -> None:
+        """Replay checkpoints needed up to an explicit backward consumer phase.
+
+        The first implementation assigns existing checkpoints to the earliest
+        phase, preserving the conservative all-group ordering. The phase API is
+        nevertheless schedule-owned now, so later dependency partitioning does
+        not need another autograd-hook protocol change.
+        """
+        from megatron.core.transformer.mhc_recompute import MHCRecomputePhase
+
+        phase = MHCRecomputePhase(phase)
+        if self._recomputed:
+            return
+        if not self._outputs_discarded:
+            raise RuntimeError("MHCCheckpointManager.recompute_until() requires discarded outputs.")
+        self.mhc_arena.validate_addresses()
+        # NOTE: arena slots are deliberately never released in this method.
+        # The recompute node is not the last reader of the group -- the
+        # compute-stream mhc_post backward and the captured attention backward
+        # both still read these slots afterwards -- so releasing a slot here
+        # lets a later tenant's write land before those reads, and training
+        # diverges from the baseline loss series. Slot recycling needs the real
+        # last-consumer point, not the recompute point. (This held when mHC post
+        # ran on the communication stream and still holds now that it has its own
+        # compute-stream node: the ordering problem is the extra readers, not
+        # which stream they are on.)
+        for ckpt in self.checkpoints:
+            # This filter cannot discriminate yet: add_checkpoint rejects any
+            # phase other than BEFORE_COMBINE_BWD, so it admits every checkpoint
+            # for either barrier argument. Both call sites therefore replay the
+            # whole group. See MHCRecomputePhase's TODO.
+            if ckpt.recompute_phase <= phase:
+                ckpt._recompute(None)
+        self._recomputed = all(ckpt.ctx is None for ckpt in self.checkpoints)
+
+    def recompute_now(self) -> None:
+        """Eagerly replay all managed checkpoints in their original forward order.
+
+        This operation is idempotent; calls after the first successful replay are no-ops.
+
+        Raises:
+            RuntimeError: If the managed outputs have not been discarded before replay.
+        """
+        from megatron.core.transformer.mhc_recompute import MHCRecomputePhase
+
+        # Guards live in recompute_until; duplicating them here lets the two
+        # error paths drift apart.
+        self.recompute_until(MHCRecomputePhase.BEFORE_ATTN_BWD)
+
+    def _unified_recompute_hook(self, grad_output):
+        self.recompute_now()
 
 
 class CheckpointWithoutOutput(object):
@@ -736,17 +1045,46 @@ class CheckpointWithoutOutput(object):
     discarded output tensors are directly saved in the following modules for backward computation.
     """
 
-    def __init__(self, fp8=False):
-        self.fp8 = fp8 is not None
+    def __init__(self, fp8=False, ckpt_manager=None, output_slot=None, recompute_phase=None):
+        """
+        Initialize CheckpointWithoutOutput.
+
+        Args:
+            fp8: Whether to use FP8 mode. Defaults to False.
+            ckpt_manager: Optional MHCCheckpointManager instance. When provided,
+                         checkpoint() will auto-register to the manager, and
+                         discard_output_and_register_recompute() will only discard
+                         output without registering individual hooks.
+            output_slot: Optional MHCRecomputeArenaSlot written directly by the
+                         producer and consumed at its captured address.
+            recompute_phase: Earliest explicit backward barrier that needs this
+                             checkpoint. Defaults to the conservative first phase.
+        """
+        from megatron.core.transformer.mhc_recompute import MHCRecomputeArenaSlot, MHCRecomputePhase
+
+        self.fp8 = bool(fp8)
+        self.ckpt_manager = ckpt_manager
+        if output_slot is not None and not isinstance(output_slot, MHCRecomputeArenaSlot):
+            raise TypeError("output_slot must be an MHCRecomputeArenaSlot")
+        self.output_slot = output_slot
+        self.recompute_phase = MHCRecomputePhase(
+            MHCRecomputePhase.BEFORE_COMBINE_BWD if recompute_phase is None else recompute_phase
+        )
         self.run_function = None
-        self.fwd_cpu_rng_state = None
-        self.fwd_cuda_rng_state = None
-        self.fwd_cuda_rng_state_tracker = None
+        # Snapshot taken in checkpoint(), consumed and cleared in _recompute().
+        # This replaced three separate fwd_* fields; declaring it here keeps the
+        # field the code actually reads visible next to the rest of the state.
+        self.rng_states = None
         self.ctx = None
         self.outputs = None
 
     def checkpoint(self, run_function: Callable[[Unpack[_Ts]], _R], *args: Unpack[_Ts]) -> _R:
-        """Checkpoint function."""
+        """
+        Checkpoint function.
+
+        If ckpt_manager was provided during initialization, this checkpoint
+        will be automatically registered to the manager after execution.
+        """
 
         # If in cuda graph warmup, disable checkpointing, as 'discard_output_and_register_recompute'
         # may be called in a separate graph warmup.
@@ -757,12 +1095,34 @@ class CheckpointWithoutOutput(object):
 
         self.run_function = run_function
 
+        # Snapshot is per checkpoint, not per recompute group, and has to stay
+        # that way: each checkpoint's recompute must rewind to the offsets its
+        # own forward saw. Sharing one group-level snapshot would rewind every
+        # member to the first checkpoint's state, so any RNG the group consumed
+        # in between would replay the wrong draw. The cost is one clone_state()
+        # per tracked state per checkpoint.
         self.rng_states = _get_all_rng_states()
 
         outputs = CheckpointWithoutOutputFunction.apply(run_function, self, *args)
         self.outputs = outputs
         if isinstance(self.outputs, torch.Tensor):
             self.outputs = (self.outputs,)
+
+        if self.output_slot is not None:
+            if len(self.outputs) != 1:
+                raise ValueError("mHC arena slots currently support one checkpoint output")
+            self.output_slot.validate_output(self.outputs[0])
+
+        # Offload group commits can run before discard_output_and_register_recompute().
+        # Mark the output storages now so activation offload does not copy or release
+        # memory that this checkpoint owns and regenerates itself.
+        for output in self.outputs:
+            _mark_checkpoint_without_output_tensor(output)
+
+        # Auto-register to manager if provided
+        if self.ckpt_manager is not None:
+            self.ckpt_manager.add_checkpoint(self)
+
         return outputs
 
     def _recompute(self, _):
@@ -771,7 +1131,7 @@ class CheckpointWithoutOutput(object):
         from megatron.core.transformer.cuda_graphs import is_graph_capturing, is_graph_warmup
 
         # The recomputation has been triggered already. Just return.
-        # Handle cudagraphs, do nothing if currently in graph warmup
+        # Handle cudagraphs: do nothing if currently in graph warmup
         if self.ctx is None or is_graph_warmup():
             return
 
@@ -793,17 +1153,8 @@ class CheckpointWithoutOutput(object):
                 recompute_ctx = contextlib.nullcontext()
                 fp8_ctx = contextlib.nullcontext()
 
-            # Store the inputs for backward pass
-            inputs = self.ctx.saved_tensors
-
-            def detach(t):
-                if isinstance(t, torch.Tensor):
-                    requires_grad = t.requires_grad
-                    t = t.detach()
-                    t.requires_grad_(requires_grad)
-                return t
-
-            inputs = tuple(detach(t) for t in inputs)
+            # Reconstruct full args list from saved ctx
+            inputs = _load_args_from_ctx(self.ctx)
             with torch.enable_grad(), fp8_ctx, recompute_ctx:
                 outputs = self.run_function(*inputs)
 
@@ -813,14 +1164,28 @@ class CheckpointWithoutOutput(object):
         if isinstance(outputs, torch.Tensor):
             outputs = (outputs,)
 
+        if self.output_slot is not None:
+            if len(outputs) != 1:
+                raise ValueError("mHC arena slots currently support one recompute output")
+            self.output_slot.validate_output(outputs[0])
+
         # Zero-copy: make output's StorageImpl point to recomputation_output's data.
         # This operates at the UntypedStorage level (below TensorImpl), so:
         #   - ALL views / reshapes that reference output's StorageImpl see the data
         #     (e.g. TE GroupedLinear's inp.reshape() + torch.split() saved for backward)
         #   - No tensor version-counter bump (no autograd complaint)
-        share_storage = _get_share_storage()
+        # This remains necessary with a graph bridge: a later eager checkpoint
+        # in the same recompute group may consume this logical output.
+        # NOTE: deliberate private-API dependency -- ``_cdata`` is storage object
+        # *identity*, which is the question being asked here, and it has no public
+        # equivalent. ``data_ptr()`` is not a substitute: ``self.outputs`` has been
+        # discarded (``resize_(0)``), and a freed storage reports ``data_ptr() == 0``,
+        # so two independently-freed storages would compare equal and the rebind
+        # would be skipped. Grep for ``_cdata`` on a torch upgrade.
         for output, recomputation_output in zip(self.outputs, outputs):
-            share_storage(output, recomputation_output)
+            if output.untyped_storage()._cdata != recomputation_output.untyped_storage()._cdata:
+                share_storage = _get_share_storage()
+                share_storage(output, recomputation_output)
 
         self.ctx.outputs = outputs
         self.ctx.inputs = inputs
@@ -836,10 +1201,11 @@ class CheckpointWithoutOutput(object):
         in the forward pass and the gradient of the hook_tensor is computed before the recomputed
         tensors are used.
         """
-
+        # When ckpt_manager is set, this is a no-op.
+        # Manager handles all discarding and hook registration uniformly.
         from megatron.core.transformer.cuda_graphs import is_graph_warmup
 
-        if is_graph_warmup():
+        if self.ckpt_manager is not None or is_graph_warmup():
             return
 
         # use resize to release the output tensor memory and still keep the metadata in the tensors.

@@ -20,13 +20,19 @@ from typing import Any, Dict, List
 import torch
 from torch.utils._pytree import tree_map as tree_map_pyt
 
+from megatron.core import parallel_state
 from megatron.core.num_microbatches_calculator import get_num_microbatches
+from megatron.core.packed_seq_params import resolve_thd_tail_padding_policy
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import (
     CudaRNGStatesTracker,
     get_all_rng_states,
     get_cuda_rng_tracker,
     is_checkpointing,
+)
+from megatron.core.transformer.cuda_graph_config import (
+    is_whole_moe_cuda_graph_scope,
+    validate_moe_cuda_graph_support,
 )
 from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.module import GraphableMegatronModule, MegatronModule
@@ -2054,11 +2060,42 @@ def _layer_is_graphable(layer, config):
         return True
 
     # import modules here to avoid a circular import
+    from megatron.core.models.hybrid.hybrid_block import HyperConnectionHybridLayer
     from megatron.core.ssm.mamba_layer import MambaLayer
     from megatron.core.transformer.identity_op import IdentityOp
     from megatron.core.transformer.mlp import MLP
     from megatron.core.transformer.moe.moe_layer import MoELayer
     from megatron.core.transformer.transformer_layer import TransformerLayer
+
+    # mHC wrapper: graphability is decided by the inner layer's type/scope. Non-MoE
+    # inner layers are captured as one whole-wrapper graph (mHC aggregate + inner + BDA).
+    # MoE inner layers use partial capture: the wrapper graphs the deterministic prefix
+    # (mHC aggregate + router/preprocess) and runs the expert all-to-all + mHC BDA eagerly
+    # (the all-to-all is not graph-safe), mirroring the GPT HyperConnectionTransformerLayer.
+    if isinstance(layer, HyperConnectionHybridLayer):
+        inner = layer.inner_layer
+        if isinstance(inner, MambaLayer) and CudaGraphModule.mamba in config.cuda_graph_modules:
+            return True
+        if isinstance(inner, TransformerLayer):
+            if isinstance(inner.mlp, MoELayer):
+                # MoE inner: graphable via partial (router/preprocess) capture.
+                if (
+                    CudaGraphModule.moe in config.cuda_graph_modules
+                    or CudaGraphModule.moe_router in config.cuda_graph_modules
+                    or CudaGraphModule.moe_preprocess in config.cuda_graph_modules
+                ):
+                    return True
+                # attn-only scope on an MoE inner: the (identity) attention prefix has
+                # nothing graph-worthy, so leave eager.
+                return False
+            if CudaGraphModule.attn in config.cuda_graph_modules and not (
+                isinstance(inner.self_attention, IdentityOp)
+                and isinstance(inner.cross_attention, IdentityOp)
+            ):
+                return True
+            if CudaGraphModule.mlp in config.cuda_graph_modules and isinstance(inner.mlp, MLP):
+                return True
+        return False
 
     if isinstance(layer, MambaLayer) and CudaGraphModule.mamba in config.cuda_graph_modules:
         # mamba layer.
@@ -2083,6 +2120,55 @@ def _layer_is_graphable(layer, config):
     return False
 
 
+def _get_graphable_te_callables(layers, config):
+    """Return graphable layers, grouping a supported adjacent hybrid attention/MoE pair."""
+    graphable_layers = []
+    layer_number = 0
+    while layer_number < len(layers):
+        layer = layers[layer_number]
+        if not _layer_is_graphable(layer, config):
+            layer_number += 1
+            continue
+
+        if layer_number + 1 < len(layers):
+            next_layer = layers[layer_number + 1]
+            can_group = getattr(layer, '_can_group_te_cuda_graph_with', None)
+            if (
+                can_group is not None
+                and _layer_is_graphable(next_layer, config)
+                and can_group(next_layer)
+            ):
+                layer._set_te_cuda_graph_group_tail(next_layer)
+                graphable_layers.append(layer)
+                layer_number += 2
+                continue
+
+        graphable_layers.append(layer)
+        layer_number += 1
+    return graphable_layers
+
+
+def _get_mtp_te_callables(mtp_model_layer, config):
+    """Expose graphable layers inside a hybrid MTP stack; GPT MTP remains one callable."""
+    from megatron.core.models.hybrid.hybrid_block import HybridStack
+
+    layers = (
+        mtp_model_layer.layers if isinstance(mtp_model_layer, HybridStack) else [mtp_model_layer]
+    )
+    return _get_graphable_te_callables(layers, config)
+
+
+def _is_mtp_te_callable(layer, chunk_with_decoder):
+    """Whether a callable is an MTP wrapper or a layer nested in a hybrid MTP stack."""
+    for mtp_layer in getattr(getattr(chunk_with_decoder, 'mtp', None), 'layers', []):
+        mtp_model_layer = mtp_layer.mtp_model_layer
+        if layer is mtp_model_layer or any(
+            layer is inner_layer for inner_layer in getattr(mtp_model_layer, 'layers', [])
+        ):
+            return True
+    return False
+
+
 class TECudaGraphHelper:
     """
     Helper class to capture CUDA Graphs using TE make_graphed_callables().
@@ -2093,7 +2179,14 @@ class TECudaGraphHelper:
     """
 
     def __init__(
-        self, model, config, seq_length, micro_batch_size, optimizers=[], pg_collection=None
+        self,
+        model,
+        config,
+        seq_length,
+        micro_batch_size,
+        optimizers=[],
+        pg_collection=None,
+        thd_sequence_length_upper_bound=None,
     ):
         assert HAVE_TE_GRAPHS, "CUDA Graphs are not supported without TE."
         assert (
@@ -2109,12 +2202,14 @@ class TECudaGraphHelper:
         self.model = model
         self.config = config
         self.seq_length = seq_length
+        self.thd_sequence_length_upper_bound = thd_sequence_length_upper_bound
         self.micro_batch_size = micro_batch_size
         self.optimizers = optimizers
         self.pg_collection = pg_collection
         if self.pg_collection is None:
             self.pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         self.tp_group = self.pg_collection.tp
+        self.dp_group = self.pg_collection.dp
         self.dp_cp_group = self.pg_collection.dp_cp
         self.pp_group = self.pg_collection.pp
         from megatron.core.pipeline_parallel.p2p_communication import P2PCommunicator
@@ -2133,6 +2228,62 @@ class TECudaGraphHelper:
         #   layers found)
         self._capture_finished = False
         self._graphs_created = False
+        # [fwd, bwd] positions of every sample input in the capture ``_order``,
+        # keyed like sample_args. Static inputs may share an address only when
+        # their liveness windows are disjoint; capture validates this for the
+        # mHC direct-write arena.
+        self._mhc_sample_order_intervals = {}
+
+    def _uses_mhc_direct_write_arena(self):
+        """Whether attention-only graphs consume eager mHC recompute outputs."""
+        from megatron.core.transformer.mhc_recompute import uses_mhc_recompute_attn_cuda_graph_split
+
+        return uses_mhc_recompute_attn_cuda_graph_split(self.config)
+
+    def _validate_mhc_static_hidden_inputs(self, sample_args):
+        """Ensure aliased static inputs have disjoint [fwd, bwd] liveness windows.
+
+        Static hidden inputs may legally share an address: MCore's
+        consumed-sample reuse and TE's ``_reuse_graph_input_output_buffers``
+        both alias entries whose backward retired before the next
+        same-signature forward in ``_order``. Every mHC access to a slot —
+        forward direct-write, forward replay read, barrier recompute write,
+        attention-backward read — falls inside the owning entry's own
+        [forward, backward] window, so pairwise-disjoint windows are exactly
+        the safety condition. Overlapping windows on one address would let one
+        graph's eager aggregate write clobber a value another graph's captured
+        backward still reads, so that must fail at capture time rather than
+        corrupt replay numerics.
+        """
+        if not self._uses_mhc_direct_write_arena():
+            return
+        indices_by_ptr = {}
+        for index, args in enumerate(sample_args):
+            indices_by_ptr.setdefault(args[0].data_ptr(), []).append(index)
+        for ptr, indices in indices_by_ptr.items():
+            if len(indices) == 1:
+                continue
+            spans = []
+            for index in indices:
+                interval = self._mhc_sample_order_intervals.get(index)
+                if interval is None:
+                    raise RuntimeError(
+                        f"mHC CUDA Graph static input {index} has no recorded "
+                        "liveness window in the capture order"
+                    )
+                fwd_pos, bwd_pos = interval
+                spans.append((fwd_pos, math.inf if bwd_pos is None else bwd_pos, index))
+            spans.sort()
+            for (_prev_start, prev_end, prev_index), (next_start, _next_end, next_index) in zip(
+                spans, spans[1:]
+            ):
+                if next_start < prev_end:
+                    raise RuntimeError(
+                        f"mHC CUDA Graph static inputs {prev_index} and {next_index} "
+                        f"share address {ptr:#x} but their [fwd, bwd] liveness "
+                        "windows overlap in the capture order; aliasing them would "
+                        "corrupt the recompute direct-write replay"
+                    )
 
     def _discover_layers(self):
         """Discover captureable layers from the model and populate internal data structures."""
@@ -2163,20 +2314,16 @@ class TECudaGraphHelper:
                     num_mtp_layers = len(chunk_with_decoder.mtp.layers)
                 else:
                     num_mtp_layers = 0
-                num_graphable_layers = 0
-                callables, callables_is_mtp = [], []
-                for layer_number in range(num_decoder_layers):
-                    layer = chunk_with_decoder.decoder.layers[layer_number]
-                    if _layer_is_graphable(layer, self.config):
-                        num_graphable_layers += 1
-                        callables.append(layer)
-                        callables_is_mtp.append(False)
+                callables = _get_graphable_te_callables(
+                    chunk_with_decoder.decoder.layers, self.config
+                )
+                callables_is_mtp = [False] * len(callables)
                 for layer_number in range(num_mtp_layers):
-                    layer = chunk_with_decoder.mtp.layers[layer_number].mtp_model_layer
-                    if _layer_is_graphable(layer, self.config):
-                        num_graphable_layers += 1
-                        callables.append(layer)
-                        callables_is_mtp.append(True)
+                    mtp_model_layer = chunk_with_decoder.mtp.layers[layer_number].mtp_model_layer
+                    mtp_callables = _get_mtp_te_callables(mtp_model_layer, self.config)
+                    callables.extend(mtp_callables)
+                    callables_is_mtp.extend([True] * len(mtp_callables))
+                num_graphable_layers = len(callables)
                 log_on_each_pipeline_stage(
                     logger=logger,
                     tp_group=self.tp_group,
@@ -2287,21 +2434,34 @@ class TECudaGraphHelper:
                 self.num_microbatches == len(order) // self.num_model_chunks // 2
             ), "num_microbatches must match the number of microbatches in order."
 
+        # Import once per sample-building pass to avoid module-load cycles without
+        # repeating the imports for every layer and microbatch.
+        from megatron.core.models.hybrid.hybrid_block import HyperConnectionHybridLayer
+        from megatron.core.transformer.identity_op import IdentityOp
+        from megatron.core.transformer.transformer_layer import TransformerLayer
+
         # Generate sample arguments and keyword arguments for capturing.
         sample_args = [None] * (len(self.flattened_callables) * self.num_microbatches)
         sample_kwargs = [None] * (len(self.flattened_callables) * self.num_microbatches)
 
         rotary_pos_emb_cache = {}
+        # Avoid repeating the same message across layers within this capture setup.
+        warned_rotary_sample_contracts = set()
 
         def _get_layer_static_inputs(layer, chunk_of_the_layer):
             """
             Get the static inputs for a layer.
             """
-            assert layer in chunk_of_the_layer.decoder.layers or any(
-                layer is mtp_layer.mtp_model_layer for mtp_layer in chunk_of_the_layer.mtp.layers
+            assert layer in chunk_of_the_layer.decoder.layers or _is_mtp_te_callable(
+                layer, chunk_of_the_layer
             ), "Layer is not in the chunk"
 
             def get_rotary_pos_emb(transformer_module, transformer_input):
+                # The TE sample builder currently materializes only the regular RoPE
+                # contract. Yarn and mRoPE need different runtime inputs, while packed
+                # THD with CP>1 needs a full (not CP-sliced) RoPE table. Keep the legacy
+                # sample behavior unchanged here and warn below when one of those
+                # unsupported contracts is actually captured.
                 if (
                     transformer_module.position_embedding_type == 'rope'
                     and not self.config.multi_latent_attention
@@ -2319,17 +2479,72 @@ class TECudaGraphHelper:
 
             static_inputs = layer.get_layer_static_inputs(self.seq_length, self.micro_batch_size)
 
-            from megatron.core.transformer.identity_op import IdentityOp
-            from megatron.core.transformer.transformer_layer import TransformerLayer
+            if self._needs_full_local_padding_mask(layer, chunk_of_the_layer, static_inputs):
+                local_slen = self.config.max_seqlen_per_dp_cp_rank
+                static_inputs["padding_mask"] = torch.zeros(
+                    1, local_slen, dtype=torch.bool, device=torch.cuda.current_device()
+                )
 
+            # Hybrid mHC wraps the concrete TransformerLayer, but the wrapper is the
+            # callable passed to TE. Inspect the inner layer when deciding whether
+            # rotary embeddings belong to the graph's static keyword inputs.
+            attention_layer = (
+                layer.inner_layer if isinstance(layer, HyperConnectionHybridLayer) else layer
+            )
             contains_self_attn = (
-                isinstance(layer, TransformerLayer)
-                and not isinstance(layer.self_attention, IdentityOp)
+                isinstance(attention_layer, TransformerLayer)
+                and not isinstance(attention_layer.self_attention, IdentityOp)
                 and (
                     not self.config.cuda_graph_modules
                     or CudaGraphModule.attn in self.config.cuda_graph_modules
                 )
             )
+
+            if contains_self_attn and not self.config.multi_latent_attention:
+                position_embedding_type = getattr(
+                    chunk_of_the_layer, 'position_embedding_type', None
+                )
+                is_thd = 'cu_seqlens_q' in static_inputs
+                context_parallel_size = self.config.context_parallel_size
+                unsupported_reasons = []
+                if position_embedding_type == 'yarn':
+                    unsupported_reasons.append(
+                        'Yarn rotary embeddings are not represented in the capture sample inputs'
+                    )
+                elif position_embedding_type == 'mrope':
+                    unsupported_reasons.append(
+                        'mRoPE rotary embeddings are not represented in the capture sample inputs'
+                    )
+                if position_embedding_type == 'rope' and is_thd and context_parallel_size > 1:
+                    unsupported_reasons.append(
+                        'THD with context parallelism captures a CP-sliced RoPE table, while '
+                        'runtime packed sequences use the full table'
+                    )
+
+                warning_key = (position_embedding_type, is_thd, context_parallel_size)
+                if unsupported_reasons and warning_key not in warned_rotary_sample_contracts:
+                    warned_rotary_sample_contracts.add(warning_key)
+                    reasons = '; '.join(unsupported_reasons)
+                    if position_embedding_type == 'mrope':
+                        affected_models = 'GPTModel'
+                    else:
+                        affected_models = 'GPTModel and HybridModel'
+                    log_on_each_pipeline_stage(
+                        logger=logger,
+                        tp_group=self.tp_group,
+                        dp_cp_group=self.dp_cp_group,
+                        level=logging.WARNING,
+                        msg='TE CUDA Graph self-attention capture does not preserve the runtime '
+                        f'rotary embedding contract for position_embedding_type='
+                        f'{position_embedding_type!r}, input_format='
+                        f'{"THD" if is_thd else "SBHD"}, context_parallel_size='
+                        f'{context_parallel_size}: {reasons}. CUDA Graph replay may omit or '
+                        'mis-shape rotary_pos_emb, so numerical results are not reliable. '
+                        'This is a pre-existing limitation in the sample-input path affecting '
+                        f'{affected_models}. Disable TE attention capture, or use regular '
+                        'RoPE with SBHD (any supported CP) or THD with CP=1, until the shared '
+                        'sample-input path is fixed.',
+                    )
 
             _sample_kwargs = {}
             if is_te_min_version("1.10.0"):
@@ -2367,6 +2582,12 @@ class TECudaGraphHelper:
         fwd_sample_queues = {}
         consumed_sample_queue = {}
         layer_sample_keys_cache = {}
+        last_retired_samples = {}
+        # Only _validate_mhc_static_hidden_inputs reads these, and it early-returns
+        # off the same predicate; recording them for every TE capture would be
+        # bookkeeping no one consumes.
+        track_mhc_intervals = self._uses_mhc_direct_write_arena()
+        self._mhc_sample_order_intervals = {}
         fwd_idx = [0] * self.num_model_chunks
         for idx, chunk_id in enumerate(order):
             model_chunk_idx = abs(ceil(chunk_id)) - 1
@@ -2452,23 +2673,35 @@ class TECudaGraphHelper:
                             )
                         )
                         model_chunk_idx = abs(chunk_id) - 1
+                    if track_mhc_intervals:
+                        self._mhc_sample_order_intervals[per_callable_fwd_idx] = [idx, None]
                 fwd_idx[model_chunk_idx] += 1
             elif ceil(chunk_id) == chunk_id:
                 num_consumed_samples = min(
                     len(fwd_sample_queues[model_chunk_idx]),
                     self.num_layers_per_chunk[model_chunk_idx],
                 )
+                last_retired_samples[model_chunk_idx] = []
                 for sample_keys, per_callable_fwd_idx in fwd_sample_queues[model_chunk_idx][
                     :num_consumed_samples
                 ]:
                     if sample_keys not in consumed_sample_queue:
                         consumed_sample_queue[sample_keys] = []
                     consumed_sample_queue[sample_keys].append(per_callable_fwd_idx)
+                    if track_mhc_intervals:
+                        self._mhc_sample_order_intervals[per_callable_fwd_idx][1] = idx
+                    last_retired_samples[model_chunk_idx].append(per_callable_fwd_idx)
                 fwd_sample_queues[model_chunk_idx] = fwd_sample_queues[model_chunk_idx][
                     num_consumed_samples:
                 ]
             else:
-                # skip register static inputs for wgrad backward graphs
+                # Wgrad backward entries do not register static inputs, but they DO
+                # extend the liveness window of the samples whose dgrad just
+                # retired: a delayed wgrad graph replays after the dgrad graph and
+                # still reads the static input, so the window must end here.
+                if track_mhc_intervals:
+                    for per_callable_fwd_idx in last_retired_samples.get(model_chunk_idx, ()):
+                        self._mhc_sample_order_intervals[per_callable_fwd_idx][1] = idx
                 continue
 
         return sample_args, sample_kwargs
@@ -2490,6 +2723,161 @@ class TECudaGraphHelper:
                 assert self.pg_collection.tp is not None
                 return self.pg_collection.tp
 
+    def _should_use_dynamic_microbatch_slots(self) -> bool:
+        """Whether to capture a bounded number of graph slots and reuse them by modulo."""
+        return bool(getattr(self.config, "cuda_graph_dynamic_microbatches", False))
+
+    def _needs_full_local_padding_mask(self, layer, chunk, static_inputs) -> bool:
+        """Whether this layer's static padding_mask needs full max_seqlen_per_dp_cp_rank.
+
+        For the post_process chunk (last PP/VPP chunk that holds labels),
+        padding_mask arrives at the full CP-local length because:
+          1. labels are present -> actual_T_is_local=True -> no CP re-partition;
+          2. pre_process=False  -> _preprocess does not scatter under SP.
+        Other non-pre_process chunks (intermediate VPP) have no data, so their
+        captured padding_mask stays at the default scattered size from
+        `get_layer_static_inputs` (~max_seqlen/CP/TP).
+
+        Returns True only for that post_process-with-data case under THD CUDA
+        Graph + SP + PP>1.
+        """
+        return (
+            hasattr(layer, "_is_thd_cuda_graph")
+            and layer._is_thd_cuda_graph()
+            and self.config.sequence_parallel
+            and self.config.pipeline_model_parallel_size > 1
+            and not getattr(chunk, "pre_process", True)
+            and getattr(chunk, "post_process", False)
+            and "padding_mask" in static_inputs
+        )
+
+    @staticmethod
+    def _get_required_num_microbatch_slots_from_order(order, num_model_chunks):
+        """Infer the minimum safe slot count from a PP/VPP order.
+
+        The slot count is defined as the maximum number of real microbatches whose forward has
+        happened but whose corresponding backward for the same chunk has not completed yet.
+        This is the exact liveness condition for whether a static buffer/graph slot can be reused.
+        """
+        outstanding = [0] * num_model_chunks
+        max_outstanding = [0] * num_model_chunks
+
+        for c_id in order:
+            if ceil(c_id) != c_id:
+                continue
+            model_chunk_idx = abs(int(ceil(c_id))) - 1
+            if c_id > 0:
+                outstanding[model_chunk_idx] += 1
+                max_outstanding[model_chunk_idx] = max(
+                    max_outstanding[model_chunk_idx], outstanding[model_chunk_idx]
+                )
+            else:
+                outstanding[model_chunk_idx] -= 1
+                assert outstanding[model_chunk_idx] >= 0, (
+                    "Invalid PP/VPP schedule: negative outstanding microbatches while "
+                    f"inferring CUDA graph slots for chunk {model_chunk_idx}."
+                )
+
+        assert all(count == 0 for count in outstanding), (
+            "Invalid PP/VPP schedule: outstanding microbatches did not drain to zero when "
+            f"inferring CUDA graph slots. outstanding={outstanding}"
+        )
+        return max(1, max(max_outstanding, default=1))
+
+    def _get_probe_num_microbatches_for_dynamic_slots(self):
+        """Return a topology-only probe microbatch count for slot inference."""
+        pipeline_parallel_size = parallel_state.get_pipeline_model_parallel_world_size()
+        if pipeline_parallel_size == 1 and not self.config.overlap_moe_expert_parallel_comm:
+            return 1
+
+        group_size = self.config.microbatch_group_size_per_vp_stage
+        if group_size is None:
+            group_size = pipeline_parallel_size
+
+        return max(
+            pipeline_parallel_size * max(1, self.num_model_chunks) * 4,
+            group_size * max(1, self.num_model_chunks) * 2,
+            1,
+        )
+
+    @staticmethod
+    def _get_dp_balanced_thd_max_num_microbatches(
+        global_batch_size,
+        dp_size,
+        cp_size,
+        max_seqlen_per_dp_cp_rank,
+        max_sequence_length,
+        microbatch_group_size_per_vp_stage=None,
+        max_num_seqs=None,
+    ):
+        """Return the packed-microbatch upper bound for dp_balanced THD packing."""
+        assert global_batch_size >= 1
+        assert dp_size >= 1
+        assert cp_size >= 1
+        assert max_seqlen_per_dp_cp_rank >= 1
+        assert max_sequence_length >= 1
+
+        max_seq_len_all_ranks = max_seqlen_per_dp_cp_rank * cp_size
+        seqs_per_pack = max(1, max_seq_len_all_ranks // max_sequence_length)
+        if max_num_seqs is not None:
+            seqs_per_pack = min(seqs_per_pack, max(1, int(max_num_seqs)))
+
+        num_packed_sequences = math.ceil(global_batch_size / seqs_per_pack)
+        multiple = dp_size * (
+            microbatch_group_size_per_vp_stage
+            if microbatch_group_size_per_vp_stage is not None
+            else 1
+        )
+        num_packed_sequences = math.ceil(num_packed_sequences / multiple) * multiple
+        return max(1, num_packed_sequences // dp_size)
+
+    def _get_thd_varlen_max_num_microbatches(
+        self, runtime_num_microbatches, microbatch_group_size_per_vp_stage
+    ):
+        """Return the THD packing upper bound used for dynamic CUDA graph capture."""
+        if self.config.sequence_packing_scheduler != 'dp_balanced':
+            return runtime_num_microbatches, "runtime"
+        if self.config.max_seqlen_per_dp_cp_rank is None:
+            return runtime_num_microbatches, "runtime"
+
+        dp_size = self.dp_group.size()
+        cp_size = self.dp_cp_group.size() // dp_size
+        global_batch_size = runtime_num_microbatches * self.micro_batch_size * dp_size
+        # Use the dataset-produced padded sequence length upper bound when available.
+        # Do not use max_seqlen_per_dp_cp_rank here: under CP it is only the per-rank
+        # token budget, not the max length of one input sample before packing.
+        max_sequence_length = (
+            self.thd_sequence_length_upper_bound
+            if self.thd_sequence_length_upper_bound is not None
+            else self.seq_length
+        )
+
+        max_num_seqs = getattr(self.config, 'thd_max_packed_sequences', None)
+        if max_num_seqs is not None:
+            max_num_seqs = int(max_num_seqs)
+            if (
+                getattr(self.config, 'pad_packed_seq_alignment', None) is not None
+                and resolve_thd_tail_padding_policy(self.config) == 'append_dummy_seq'
+            ):
+                max_num_seqs -= 1
+
+        return (
+            self._get_dp_balanced_thd_max_num_microbatches(
+                global_batch_size,
+                dp_size,
+                cp_size,
+                int(self.config.max_seqlen_per_dp_cp_rank),
+                int(max_sequence_length),
+                microbatch_group_size_per_vp_stage=(
+                    None
+                    if self.config.virtual_pipeline_model_parallel_size is None
+                    else microbatch_group_size_per_vp_stage
+                ),
+                max_num_seqs=max_num_seqs,
+            ),
+            "thd_varlen_upper_bound",
+        )
+
     def _get_cuda_graph_input_data(self):
         """
         Create the CUDA Graph capturing input data.
@@ -2502,26 +2890,93 @@ class TECudaGraphHelper:
             get_schedule_table,
         )
 
+        microbatch_group_size_per_vp_stage = self.config.microbatch_group_size_per_vp_stage
+        if microbatch_group_size_per_vp_stage is None:
+            microbatch_group_size_per_vp_stage = (
+                parallel_state.get_pipeline_model_parallel_world_size()
+            )
+
         # If PP is not enabled, we only need to capture one microbatch.
         if self.pp_group.size() == 1 and not self.config.overlap_moe_expert_parallel_comm:
             assert (
                 self.num_model_chunks == 1
             ), "If PP is not enabled, there should be only one model chunk."
             self.num_microbatches = 1
+        elif self._should_use_dynamic_microbatch_slots():
+            probe_num_microbatches = self._get_probe_num_microbatches_for_dynamic_slots()
+            from megatron.core.pipeline_parallel.schedules import (
+                get_pp_rank_microbatches as _probe_get_pp,
+            )
+            from megatron.core.pipeline_parallel.schedules import (
+                get_schedule_table as _probe_get_st,
+            )
+
+            _, _, _probe_warmup, _ = _probe_get_pp(
+                probe_num_microbatches,
+                self.num_model_chunks,
+                microbatch_group_size_per_vp_stage,
+                False,
+                overlap_moe_expert_parallel_comm=self.config.overlap_moe_expert_parallel_comm,
+            )
+            _probe_st = _probe_get_st(
+                probe_num_microbatches, self.num_model_chunks, microbatch_group_size_per_vp_stage
+            )
+            _probe_order = convert_schedule_table_to_order(
+                _probe_warmup, self.num_model_chunks, _probe_st
+            )
+            auto_num_slots = self._get_required_num_microbatch_slots_from_order(
+                _probe_order, self.num_model_chunks
+            )
+            pp_group = parallel_state.get_pipeline_model_parallel_group()
+            if pp_group is not None and pp_group.size() > 1:
+                auto_num_slots_tensor = torch.tensor(
+                    [auto_num_slots], dtype=torch.int32, device=torch.cuda.current_device()
+                )
+                torch.distributed.all_reduce(
+                    auto_num_slots_tensor, op=torch.distributed.ReduceOp.MAX, group=pp_group
+                )
+                auto_num_slots = int(auto_num_slots_tensor.item())
+            runtime_num_microbatches = get_num_microbatches()
+            max_num_microbatches, capture_mode = self._get_thd_varlen_max_num_microbatches(
+                runtime_num_microbatches, microbatch_group_size_per_vp_stage
+            )
+            if self.config.overlap_moe_expert_parallel_comm or self.config.delay_wgrad_compute:
+                self.num_microbatches = runtime_num_microbatches
+                capture_mode = "runtime"
+                fallback_reason = "overlap_moe_expert_parallel_comm/delay_wgrad_compute"
+            else:
+                # auto_num_slots is a topology-only theoretical lower bound for PP/VPP graph
+                # slot liveness. THD varlen packing can produce different real microbatch
+                # counts across iterations, so capture uses the THD/GBS-derived upper
+                # bound instead of the reduced slot count for safety. Currently TE cuda
+                # graph backend may crash if use the auto_num_slots.
+                self.num_microbatches = max(runtime_num_microbatches, max_num_microbatches)
+                fallback_reason = None
+            log_on_each_pipeline_stage(
+                logger=logger,
+                tp_group=None,
+                dp_cp_group=None,
+                level=logging.INFO,
+                msg=f'Rank {torch.distributed.get_rank()}: dynamic CUDA graph slots '
+                f'enabled. runtime_num_microbatches={runtime_num_microbatches}, '
+                f'auto_num_slots={auto_num_slots}, '
+                f'max_num_microbatches={max_num_microbatches}, '
+                f'capture_num_microbatches={self.num_microbatches}, '
+                f'capture_mode={capture_mode}'
+                + (f', fallback_reason={fallback_reason}' if fallback_reason else ''),
+            )
         else:
             self.num_microbatches = get_num_microbatches()
 
         _, _, num_warmup_microbatches, _ = get_pp_rank_microbatches(
             self.num_microbatches,
             self.num_model_chunks,
-            self.config.microbatch_group_size_per_vp_stage,
+            microbatch_group_size_per_vp_stage,
             forward_only=False,
             p2p_communicator=self.p2p_communicator,
         )
         schedule_table = get_schedule_table(
-            self.num_microbatches,
-            self.num_model_chunks,
-            self.config.microbatch_group_size_per_vp_stage,
+            self.num_microbatches, self.num_model_chunks, microbatch_group_size_per_vp_stage
         )
         order = convert_schedule_table_to_order(
             num_warmup_microbatches, self.num_model_chunks, schedule_table
@@ -2590,8 +3045,16 @@ class TECudaGraphHelper:
                 # of layers per chunk.
                 kwargs['_num_layers_per_chunk'] = self.num_layers_per_chunk
             if is_te_min_version("2.7.0"):
-                # Starting from TE 2.7.0, make_graphed_callables() optimizes the graph memory usage
-                # by reusing input/output data buffers between graphs.
+                # Starting from TE 2.7.0, make_graphed_callables() optimizes the graph memory
+                # usage by reusing input/output data buffers between graphs. The reuse pass
+                # rebinds ``sample_args`` entries in place, aliasing entries whose backward
+                # retired before the next same-signature forward in ``_order`` — the same
+                # [fwd, bwd]-window liveness model as MCore's consumed-sample reuse. All
+                # mHC direct-write accesses (forward write, replay read, barrier recompute
+                # write, attention-backward read) fall inside the owning entry's own
+                # window, so the reuse is safe with the arena;
+                # _validate_mhc_static_hidden_inputs() enforces the window-disjointness
+                # invariant after capture.
                 kwargs['_reuse_graph_input_output_buffers'] = True
 
             if sample_kwargs:
@@ -2702,6 +3165,7 @@ class TECudaGraphHelper:
             off_interface.reset()
         torch.cuda.synchronize()
         self._reset_after_capture()
+
         if FREEZE_GC:
             gc.unfreeze()
         gc.collect()
@@ -2709,10 +3173,25 @@ class TECudaGraphHelper:
 
         self._capture_finished = True
 
+    def _should_enable_paged_stash_capture(self) -> bool:
+        """Whether this rank captures a complete local MoE with paged stash."""
+
+        has_local_moe_layer = any(
+            getattr(module, "is_moe_layer", False)
+            for layer in self.flattened_callables
+            for module in layer.modules()
+        )
+        return (
+            self.config.moe_paged_stash
+            and is_whole_moe_cuda_graph_scope(self.config.cuda_graph_modules)
+            and has_local_moe_layer
+        )
+
     def create_cudagraphs(self):
         """
         Capture CUDA Graphs per TransformerLayer per microbatch.
         """
+        validate_moe_cuda_graph_support(self.config)
         start_time = self._start_capturing()
 
         if not self.flattened_callables:
@@ -2728,16 +3207,31 @@ class TECudaGraphHelper:
                 rng_context = get_cuda_rng_tracker().fork()
             else:
                 rng_context = nullcontext()
-            with rng_context:
+            from megatron.core.transformer.moe.paged_stash import paged_stash_te_graph_capture
+
+            with (
+                rng_context,
+                paged_stash_te_graph_capture(
+                    self._should_enable_paged_stash_capture(),
+                    order=kwargs['_order'],
+                    config=self.config,
+                ),
+            ):
                 graphs = make_graphed_callables(
                     tuple(self.flattened_callables), sample_args, **kwargs
                 )
+            self._validate_mhc_static_hidden_inputs(sample_args)
 
             # Push the captured graphs to the corresponding TransformerBlock.
+            # Only the direct-write arena consumes these handles. Every other
+            # configuration would retain num_microbatches static input tensors
+            # per layer for nothing. Config-level, so hoisted out of both loops.
+            retain_static_inputs = self._uses_mhc_direct_write_arena()
             num_layers_accumulated = 0
             for layers in self.callables_per_chunk:
                 for layer_number, layer in enumerate(layers):
                     layer.cuda_graphs = []
+                    static_hidden_inputs = []
                     for batch_number in range(self.num_microbatches):
                         if self.config.overlap_moe_expert_parallel_comm:
                             graph_idx = (
@@ -2750,6 +3244,17 @@ class TECudaGraphHelper:
                                 + layer_number
                             )
                         layer.cuda_graphs.append(graphs[graph_idx])
+                        # TE may rebind sample inputs while optimizing
+                        # graph-buffer reuse, so retain the final fixed-address
+                        # surface only after make_graphed_callables() has
+                        # returned; the exact graph index keeps graph and input
+                        # slot in lockstep. _validate_mhc_static_hidden_inputs()
+                        # has asserted that aliased entries have disjoint
+                        # [fwd, bwd] liveness windows.
+                        if retain_static_inputs:
+                            static_hidden_inputs.append(sample_args[graph_idx][0])
+                    if retain_static_inputs:
+                        layer.set_te_cuda_graph_static_hidden_inputs(static_hidden_inputs)
                 num_layers_accumulated += len(layers)
 
             self._graphs_created = True
@@ -2784,6 +3289,7 @@ class TECudaGraphHelper:
                         graphs_not_reset += 1
                 layer.cuda_graphs = []
                 layer.cuda_graph_manual_hooks = []
+                layer.clear_te_cuda_graph_static_hidden_inputs()
 
         log_on_each_pipeline_stage(
             logger=logger,
@@ -2955,7 +3461,10 @@ def set_current_microbatch(model, microbatch_id):
                 assert hasattr(
                     layer, 'mtp_model_layer'
                 ), f"MTP layer {layer} must have 'mtp_model_layer' attribute"
-                layer.mtp_model_layer.current_microbatch = microbatch_id
+                mtp_model_layer = layer.mtp_model_layer
+                mtp_model_layer.current_microbatch = microbatch_id
+                for inner_layer in getattr(mtp_model_layer, 'layers', []):
+                    inner_layer.current_microbatch = microbatch_id
 
     # Also set current_microbatch on vision encoder layers so that
     # _te_cuda_graph_replay selects the correct graph index. Without this,

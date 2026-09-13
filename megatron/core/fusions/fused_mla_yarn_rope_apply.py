@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from typing import Optional
 from unittest.mock import MagicMock
@@ -29,25 +29,69 @@ if not HAVE_TRITON:
 
 @triton.jit
 def _get_thd_token_idx(cu_seqlens, pid_m, seq_num, cp_rank, cp_size):
-    token_idx = -1
-    this_seq_len = 0
+    # Cast ``pid_m`` and ``cu_seqlens`` loads to a single shared dtype so
+    # the loop-body reassignments don't surface as
+    # "initial value is int32 but redefined as int64" in newer Triton
+    # versions (which promote ``// Python_int`` to int64).
+    pid_m = pid_m.to(tl.int64)
+    token_idx = tl.full((), -1, dtype=tl.int64)
+    this_seq_len = tl.full((), 0, dtype=tl.int64)
     seq_idx = 0
-    last_cum_seqlen = tl.load(cu_seqlens) // cp_size
+    last_cum_seqlen = tl.load(cu_seqlens).to(tl.int64) // cp_size
     while seq_idx < seq_num:
-        cur_cum_seqlen = tl.load(cu_seqlens + seq_idx + 1) // cp_size
+        cur_cum_seqlen = tl.load(cu_seqlens + seq_idx + 1).to(tl.int64) // cp_size
         if token_idx == -1 and cur_cum_seqlen > pid_m:
             token_idx = pid_m - last_cum_seqlen
             this_seq_len = cur_cum_seqlen - last_cum_seqlen
         last_cum_seqlen = cur_cum_seqlen
         seq_idx += 1
+    # Padding tokens beyond cu_seqlens[-1] (from THD CUDA-graph padding)
+    # never match any sequence, leaving token_idx == -1.  Clamp to 0 so
+    # the cos/sin table loads stay in-bounds; the wrong RoPE result is
+    # harmless because padding positions are excluded by loss_mask.
+    if token_idx == -1:
+        token_idx = tl.full((), 0, dtype=tl.int64)
     if cp_size > 1:
-        if token_idx < this_seq_len // 2:
-            token_idx = token_idx + cp_rank * this_seq_len // 2
+        first_cp_seg = (this_seq_len + 1) // 2
+        second_cp_seg = this_seq_len // 2
+        if token_idx < first_cp_seg:
+            token_idx = token_idx + cp_rank * first_cp_seg
         else:
-            token_idx = (token_idx - this_seq_len // 2) + (
-                2 * cp_size - cp_rank - 1
-            ) * this_seq_len // 2
+            token_idx = (
+                token_idx
+                - first_cp_seg
+                + cp_size * first_cp_seg
+                + (cp_size - cp_rank - 1) * second_cp_seg
+            )
     return token_idx
+
+
+@triton.jit
+def _get_contiguous_thd_token_idx(cu_seqlens, pid_m, seq_num, global_start):
+    """Map a row in a contiguous THD slice to its position within the packed sequence."""
+    global_row = pid_m.to(tl.int64) + global_start
+    seq_count = tl.full((), seq_num, dtype=tl.int32)
+
+    # Find the first sequence whose end offset is greater than global_row,
+    # equivalent to torch.bucketize(global_row, cu_seqlens[1:], right=True).
+    # This keeps the per-row lookup logarithmic for batches with many short
+    # packed sequences. Using an upper bound also skips zero-length sequences
+    # represented by duplicate prefix offsets.
+    low = tl.full((), 0, dtype=tl.int32)
+    high = seq_count
+    while low < high:
+        mid = (low + high) >> 1
+        go_left = global_row < tl.load(cu_seqlens + mid + 1).to(tl.int64)
+        low = tl.where(go_left, low, mid + 1)
+        high = tl.where(go_left, mid, high)
+
+    in_sequence = low < seq_count
+    seq_start = tl.load(cu_seqlens + low, mask=in_sequence, other=0).to(tl.int64)
+    in_sequence = in_sequence & (global_row >= seq_start)
+    # Boundary and CUDA-graph padding rows outside every packed sequence use
+    # position zero so COS/SIN loads remain in bounds. Those rows are masked by
+    # their downstream consumers.
+    return tl.where(in_sequence, global_row - seq_start, 0)
 
 
 @triton.autotune(
@@ -65,29 +109,38 @@ def _get_thd_token_idx(cu_seqlens, pid_m, seq_num, cp_rank, cp_size):
     restore_value=["Q"],
 )
 @triton.jit
-def rotary_fwd_q_kernel(
+def _mla_rope_fwd_inplace_kernel(
     Q,
     COS,
     SIN,
-    qk_head_dim,
+    nope_dim,
     emb_dim: tl.constexpr,
     head_num: tl.constexpr,
     batch_size,
     seq_num,
     cu_seqlens_q,
+    position_ids,
+    thd_global_start,
     stride_x_seq,
     stride_x_nheads,
+    stride_cos_seq,
+    stride_sin_seq,
     cp_rank,
     cp_size,
+    INVERSE: tl.constexpr,
+    REMOVE_INTERLEAVING: tl.constexpr,
+    ROPE_FIRST: tl.constexpr,
+    HAS_THD_GLOBAL_START: tl.constexpr,
     BLOCK_H: tl.constexpr,
 ):
     """
-    Triton kernel of the forward pass for applying YARN RoPE to MLA's query.
-    This kernel inplace modifies the input tensor Q.
+    Forward pass: apply RoPE inplace to the leading emb_dim elements when ROPE_FIRST is true,
+    otherwise to the trailing emb_dim elements.
+    Reads from interleaved layout, writes back to interleaved layout.
 
     Input:
-        Q: [seq_len, batch_size, head_num, qk_head_dim + emb_dim]
-            or [total_seq_len, head_num, qk_head_dim + emb_dim]
+        Q: [seq_len, batch_size, head_num, nope_dim + emb_dim]
+            or [total_seq_len, head_num, nope_dim + emb_dim]
         COS/SIN: [max_seq_len, emb_dim]
 
         batch_size: batch size for sbhd format, not used for thd format
@@ -97,15 +150,26 @@ def rotary_fwd_q_kernel(
     pid_m = tl.program_id(axis=0)
     pid_head = tl.program_id(axis=1)
 
-    if cu_seqlens_q is None:
+    if position_ids is not None:
+        token_idx = tl.load(position_ids + pid_m)
+    elif cu_seqlens_q is None:
         token_idx = pid_m // batch_size
+    elif HAS_THD_GLOBAL_START:
+        token_idx = _get_contiguous_thd_token_idx(cu_seqlens_q, pid_m, seq_num, thd_global_start)
     else:
         token_idx = _get_thd_token_idx(cu_seqlens_q, pid_m, seq_num, cp_rank, cp_size)
 
-    cos_left = tl.load(COS + token_idx * emb_dim + tl.arange(0, emb_dim // 2))
-    sin_left = tl.load(SIN + token_idx * emb_dim + tl.arange(0, emb_dim // 2))
-    cos_right = tl.load(COS + token_idx * emb_dim + emb_dim // 2 + tl.arange(0, emb_dim // 2))
-    sin_right = tl.load(SIN + token_idx * emb_dim + emb_dim // 2 + tl.arange(0, emb_dim // 2))
+    cos_left = tl.load(COS + token_idx * stride_cos_seq + tl.arange(0, emb_dim // 2))
+    sin_left = tl.load(SIN + token_idx * stride_sin_seq + tl.arange(0, emb_dim // 2))
+    cos_right = tl.load(
+        COS + token_idx * stride_cos_seq + emb_dim // 2 + tl.arange(0, emb_dim // 2)
+    )
+    sin_right = tl.load(
+        SIN + token_idx * stride_sin_seq + emb_dim // 2 + tl.arange(0, emb_dim // 2)
+    )
+    if INVERSE:
+        sin_left = -sin_left
+        sin_right = -sin_right
     cos_left = cos_left.expand_dims(0).broadcast_to(BLOCK_H, emb_dim // 2)
     sin_left = sin_left.expand_dims(0).broadcast_to(BLOCK_H, emb_dim // 2)
     cos_right = cos_right.expand_dims(0).broadcast_to(BLOCK_H, emb_dim // 2)
@@ -113,7 +177,8 @@ def rotary_fwd_q_kernel(
 
     Q = Q + pid_m * stride_x_seq + pid_head * BLOCK_H * stride_x_nheads
 
-    x_off = tl.arange(0, BLOCK_H)[:, None] * stride_x_nheads + qk_head_dim
+    rope_offset = 0 if ROPE_FIRST else nope_dim
+    x_off = tl.arange(0, BLOCK_H)[:, None] * stride_x_nheads + rope_offset
     mask = x_off < head_num * stride_x_nheads
     # x1 = t[..., 0::2], x2 = t[..., 1::2]
     x_1_off = x_off + tl.arange(0, emb_dim // 2)[None, :] * 2
@@ -124,10 +189,14 @@ def rotary_fwd_q_kernel(
     x_left = x_1 * cos_left - x_2 * sin_left
     x_right = x_2 * cos_right + x_1 * sin_right
 
-    x_left_off = x_off + tl.arange(0, emb_dim // 2)[None, :]
-    x_right_off = x_left_off + emb_dim // 2
-    tl.store(Q + x_left_off, x_left, mask=mask)
-    tl.store(Q + x_right_off, x_right, mask=mask)
+    if REMOVE_INTERLEAVING:
+        tl.store(Q + x_1_off, x_left, mask=mask)
+        tl.store(Q + x_2_off, x_right, mask=mask)
+    else:
+        x_left_off = x_off + tl.arange(0, emb_dim // 2)[None, :]
+        x_right_off = x_left_off + emb_dim // 2
+        tl.store(Q + x_left_off, x_left, mask=mask)
+        tl.store(Q + x_right_off, x_right, mask=mask)
 
 
 @triton.autotune(
@@ -145,29 +214,38 @@ def rotary_fwd_q_kernel(
     restore_value=["DO"],
 )
 @triton.jit
-def rotary_bwd_q_kernel(
+def _mla_rope_bwd_inplace_kernel(
     DO,
     COS,
     SIN,
-    qk_head_dim,
+    nope_dim,
     emb_dim: tl.constexpr,
     head_num: tl.constexpr,
     batch_size,
     seq_num,
     cu_seqlens_q,
+    position_ids,
+    thd_global_start,
     stride_x_seq,
     stride_x_nheads,
+    stride_cos_seq,
+    stride_sin_seq,
     cp_rank,
     cp_size,
+    INVERSE: tl.constexpr,
+    REMOVE_INTERLEAVING: tl.constexpr,
+    ROPE_FIRST: tl.constexpr,
+    HAS_THD_GLOBAL_START: tl.constexpr,
     BLOCK_H: tl.constexpr,
 ):
     """
-    Triton kernel of the backward pass for applying YARN RoPE to MLA's query.
-    This kernel inplace modifies the input tensor DO.
+    Backward pass: inverse RoPE inplace on the leading emb_dim elements when ROPE_FIRST is true,
+    otherwise on the trailing emb_dim elements.
+    Reads from interleaved layout, writes to interleaved layout.
 
     Input:
-        DO: [seq_len, batch_size, head_num, qk_head_dim + emb_dim]
-            or [total_seq_len, head_num, qk_head_dim + emb_dim]
+        DO: [seq_len, batch_size, head_num, nope_dim + emb_dim]
+            or [total_seq_len, head_num, nope_dim + emb_dim]
         COS/SIN: [max_seq_len, emb_dim]
 
         batch_size, seq_num, and cu_seqlens_q are the same as in the forward pass
@@ -175,15 +253,26 @@ def rotary_bwd_q_kernel(
     pid_m = tl.program_id(axis=0)
     pid_head = tl.program_id(axis=1)
 
-    if cu_seqlens_q is None:
+    if position_ids is not None:
+        token_idx = tl.load(position_ids + pid_m)
+    elif cu_seqlens_q is None:
         token_idx = pid_m // batch_size
+    elif HAS_THD_GLOBAL_START:
+        token_idx = _get_contiguous_thd_token_idx(cu_seqlens_q, pid_m, seq_num, thd_global_start)
     else:
         token_idx = _get_thd_token_idx(cu_seqlens_q, pid_m, seq_num, cp_rank, cp_size)
 
-    cos_left = tl.load(COS + token_idx * emb_dim + tl.arange(0, emb_dim // 2))
-    sin_left = tl.load(SIN + token_idx * emb_dim + tl.arange(0, emb_dim // 2))
-    cos_right = tl.load(COS + token_idx * emb_dim + emb_dim // 2 + tl.arange(0, emb_dim // 2))
-    sin_right = tl.load(SIN + token_idx * emb_dim + emb_dim // 2 + tl.arange(0, emb_dim // 2))
+    cos_left = tl.load(COS + token_idx * stride_cos_seq + tl.arange(0, emb_dim // 2))
+    sin_left = tl.load(SIN + token_idx * stride_sin_seq + tl.arange(0, emb_dim // 2))
+    cos_right = tl.load(
+        COS + token_idx * stride_cos_seq + emb_dim // 2 + tl.arange(0, emb_dim // 2)
+    )
+    sin_right = tl.load(
+        SIN + token_idx * stride_sin_seq + emb_dim // 2 + tl.arange(0, emb_dim // 2)
+    )
+    if INVERSE:
+        sin_left = -sin_left
+        sin_right = -sin_right
     cos_left = cos_left.expand_dims(0).broadcast_to(BLOCK_H, emb_dim // 2)
     sin_left = sin_left.expand_dims(0).broadcast_to(BLOCK_H, emb_dim // 2)
     cos_right = cos_right.expand_dims(0).broadcast_to(BLOCK_H, emb_dim // 2)
@@ -191,25 +280,32 @@ def rotary_bwd_q_kernel(
 
     DO = DO + pid_m * stride_x_seq + pid_head * BLOCK_H * stride_x_nheads
 
-    x_off = tl.arange(0, BLOCK_H)[:, None] * stride_x_nheads + qk_head_dim
+    rope_offset = 0 if ROPE_FIRST else nope_dim
+    x_off = tl.arange(0, BLOCK_H)[:, None] * stride_x_nheads + rope_offset
     mask = x_off < head_num * stride_x_nheads
-    x_left_off = x_off + tl.arange(0, emb_dim // 2)[None, :]
-    x_right_off = x_left_off + emb_dim // 2
-    x_left = tl.load(DO + x_left_off, mask=mask)
-    x_right = tl.load(DO + x_right_off, mask=mask)
+    if REMOVE_INTERLEAVING:
+        x_1_off = x_off + tl.arange(0, emb_dim // 2)[None, :] * 2
+        x_2_off = x_1_off + 1
+        x_left = tl.load(DO + x_1_off, mask=mask)
+        x_right = tl.load(DO + x_2_off, mask=mask)
+    else:
+        x_left_off = x_off + tl.arange(0, emb_dim // 2)[None, :]
+        x_right_off = x_left_off + emb_dim // 2
+        x_left = tl.load(DO + x_left_off, mask=mask)
+        x_right = tl.load(DO + x_right_off, mask=mask)
+        x_1_off = x_off + tl.arange(0, emb_dim // 2)[None, :] * 2
+        x_2_off = x_1_off + 1
 
     x_1 = x_left * cos_left + x_right * sin_right
     x_2 = -x_left * sin_left + x_right * cos_right
 
-    x_1_off = x_off + tl.arange(0, emb_dim // 2)[None, :] * 2
-    x_2_off = x_1_off + 1
     tl.store(DO + x_1_off, x_1, mask=mask)
     tl.store(DO + x_2_off, x_2, mask=mask)
 
 
-class ApplyMLARotaryEmbQ(torch.autograd.Function):
+class _FusedMLARoPEInplace(torch.autograd.Function):
     """
-    Autograd function for applying YARN RoPE to MLA's query.
+    Autograd function for applying RoPE inplace to either end of a multi-head tensor.
     """
 
     @staticmethod
@@ -218,29 +314,40 @@ class ApplyMLARotaryEmbQ(torch.autograd.Function):
         q,
         cos,
         sin,
-        qk_head_dim,
+        nope_dim,
         emb_dim,
         cu_seqlens_q,
         cp_rank,
         cp_size,
         rotary_interleaved=False,
+        inverse=False,
+        remove_interleaving=False,
+        position_ids=None,
+        rope_first=False,
+        thd_global_start=None,
     ):
         """
-        Forward function for ApplyMLARotaryEmbQ.
+        Forward function for _FusedMLARoPEInplace.
 
         Args:
-            q: [seq_len, batch_size, head_num, qk_head_dim + emb_dim]
-                or [total_seq_len, head_num, qk_head_dim + emb_dim]
+            q: [seq_len, batch_size, head_num, nope_dim + emb_dim]
+                or [total_seq_len, head_num, nope_dim + emb_dim]
             cos/sin: [max_seq_len, 1, 1, emb_dim]
             cu_seqlens_q: [seq_num + 1] accumulated sequence lengths for thd format
             rotary_interleaved: whether to apply RoPE interleaved, only supports False for now
+            inverse: if True, negate sin inside the kernel to apply the inverse rotation
+            rope_first: if True, rotate the leading emb_dim elements instead of the trailing ones
+            thd_global_start: first global packed row for a contiguous THD input slice
         """
         assert not rotary_interleaved
+        has_thd_global_start = thd_global_start is not None
+        thd_global_start = 0 if thd_global_start is None else int(thd_global_start)
         max_seqlen = None
         batch_size = None
         seq_num = None
         if cu_seqlens_q is None:
             # sbhd
+            assert position_ids is None
             max_seqlen, batch_size, nheads, headdim = q.shape
             q = q.view(-1, nheads, headdim)
             total_seqlen = q.shape[0]
@@ -248,35 +355,51 @@ class ApplyMLARotaryEmbQ(torch.autograd.Function):
             # thd
             total_seqlen, nheads, headdim = q.shape
             seq_num = len(cu_seqlens_q) - 1
+            if position_ids is not None:
+                assert position_ids.shape == (total_seqlen,)
         assert q.stride(-1) == 1
-        assert cos.is_contiguous()
-        assert sin.is_contiguous()
-        assert headdim == qk_head_dim + emb_dim
+        assert cos.stride(-1) == 1
+        assert sin.stride(-1) == 1
+        assert headdim == nope_dim + emb_dim
         assert emb_dim % 4 == 0
 
         grid = lambda META: (total_seqlen, triton.cdiv(nheads, META["BLOCK_H"]))
-        rotary_fwd_q_kernel[grid](
+        _mla_rope_fwd_inplace_kernel[grid](
             q,
             cos,
             sin,
-            qk_head_dim,
+            nope_dim,
             emb_dim,
             nheads,
             batch_size,
             seq_num,
             cu_seqlens_q,
+            position_ids,
+            thd_global_start,
             q.stride(0),
             q.stride(1),
+            cos.stride(0),
+            sin.stride(0),
             cp_rank,
             cp_size,
+            INVERSE=inverse,
+            REMOVE_INTERLEAVING=remove_interleaving,
+            ROPE_FIRST=rope_first,
+            HAS_THD_GLOBAL_START=has_thd_global_start,
         )
-        ctx.save_for_backward(cos, sin)
-        ctx.qk_head_dim = qk_head_dim
+        ctx.save_for_backward(cos, sin, *(() if position_ids is None else (position_ids,)))
+        ctx.has_position_ids = position_ids is not None
+        ctx.nope_dim = nope_dim
         ctx.emb_dim = emb_dim
         ctx.cu_seqlens_q = cu_seqlens_q
         ctx.rotary_interleaved = rotary_interleaved
+        ctx.inverse = inverse
+        ctx.remove_interleaving = remove_interleaving
+        ctx.rope_first = rope_first
         ctx.cp_rank = cp_rank
         ctx.cp_size = cp_size
+        ctx.has_thd_global_start = has_thd_global_start
+        ctx.thd_global_start = thd_global_start
         if cu_seqlens_q is None:
             q = q.view(max_seqlen, batch_size, nheads, headdim)
         return q
@@ -284,13 +407,17 @@ class ApplyMLARotaryEmbQ(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad):
         """
-        Backward function for ApplyMLARotaryEmbQ.
+        Backward function for _FusedMLARoPEInplace.
 
         Args:
-            grad: [seq_len, batch_size, head_num, qk_head_dim + emb_dim]
-                or [total_seq_len, head_num, qk_head_dim + emb_dim]
+            grad: [seq_len, batch_size, head_num, nope_dim + emb_dim]
+                or [total_seq_len, head_num, nope_dim + emb_dim]
         """
-        cos, sin = ctx.saved_tensors
+        if ctx.has_position_ids:
+            cos, sin, position_ids = ctx.saved_tensors
+        else:
+            cos, sin = ctx.saved_tensors
+            position_ids = None
         max_seqlen = None
         batch_size = None
         seq_num = None
@@ -300,66 +427,467 @@ class ApplyMLARotaryEmbQ(torch.autograd.Function):
             total_seqlen = grad.shape[0]
         else:
             seq_num = len(ctx.cu_seqlens_q) - 1
+            if ctx.has_position_ids or ctx.has_thd_global_start:
+                grad = grad.contiguous()
             total_seqlen, nheads, headdim = grad.shape
         assert grad.stride(-1) == 1
 
         grid = lambda META: (total_seqlen, triton.cdiv(nheads, META["BLOCK_H"]))
-        rotary_bwd_q_kernel[grid](
+        _mla_rope_bwd_inplace_kernel[grid](
             grad,
             cos,
             sin,
-            ctx.qk_head_dim,
+            ctx.nope_dim,
             ctx.emb_dim,
             nheads,
             batch_size,
             seq_num,
             ctx.cu_seqlens_q,
+            position_ids,
+            ctx.thd_global_start,
             grad.stride(0),
             grad.stride(1),
+            cos.stride(0),
+            sin.stride(0),
             ctx.cp_rank,
             ctx.cp_size,
+            INVERSE=ctx.inverse,
+            REMOVE_INTERLEAVING=ctx.remove_interleaving,
+            ROPE_FIRST=ctx.rope_first,
+            HAS_THD_GLOBAL_START=ctx.has_thd_global_start,
         )
         if ctx.cu_seqlens_q is None:
             grad = grad.view(max_seqlen, batch_size, nheads, headdim)
-        return grad, None, None, None, None, None, None, None, None
+        return grad, None, None, None, None, None, None, None, None, None, None, None, None, None
 
 
-def fused_apply_mla_rope_for_q(
+def fused_mla_rope_inplace(
     t: torch.Tensor,
     cos: torch.Tensor,
     sin: torch.Tensor,
-    qk_head_dim: int,
+    nope_dim: int,
     emb_dim: int,
     cu_seqlens_q: Optional[torch.Tensor] = None,
     cp_rank: int = 0,
     cp_size: int = 1,
     rotary_interleaved: bool = False,
+    inverse: bool = False,
+    remove_interleaving: bool = False,
+    position_ids: Optional[torch.Tensor] = None,
+    rope_first: bool = False,
+    thd_global_start: int | None = None,
 ):
     """
-    Fused function for applying YARN RoPE to MLA's query.
-    This function inplace modifies the input tensor t.
-    Along the last dimension of t, the last emb_dim elements are applied with RoPE.
-    The first qk_head_dim elements are not modified.
-    It is an experimental feature and may change in future versions.
+    Fused RoPE applied inplace to emb_dim elements at either end of a tensor,
+    leaving the nope_dim elements unchanged.
     It supports both sbhd and thd input formats.
+
+    When ``inverse=True`` the rotation is reversed, which is useful for
+    undoing RoPE on the attention output.
 
     For the notations below, seq_len is the length of the sequence per batch for sbhd format,
     total_seq_len is the total length of the sequences for thd format.
     max_seq_len is the maximum length of the sequences in the input tensor.
 
     Args:
-        t: [seq_len, batch_size, head_num, qk_head_dim + emb_dim]
-            or [total_seq_len, head_num, qk_head_dim + emb_dim]
+        t: [seq_len, batch_size, head_num, nope_dim + emb_dim]
+            or [total_seq_len, head_num, nope_dim + emb_dim]
         cos/sin: [max_seq_len, 1, 1, emb_dim]
         cu_seqlens_q: [seq_num + 1] accumulated sequence lengths for thd format
         rotary_interleaved: whether to apply RoPE interleaved, only supports False for now
+        inverse: if True, apply the inverse rotation
+        remove_interleaving: if True, output RoPE dims in non-interleaved layout
+        position_ids: optional THD row positions. When supplied, these positions
+            replace the built-in CP row-to-position mapping.
+        rope_first: if True, rotate the leading emb_dim elements instead of the trailing ones.
+        thd_global_start: first global packed row for a contiguous THD slice. When supplied,
+            the kernel derives row positions directly from ``cu_seqlens_q`` instead of
+            materializing ``position_ids``.
 
     Returns:
         t: inplace modified input tensor
     """
-    return ApplyMLARotaryEmbQ.apply(
-        t, cos, sin, qk_head_dim, emb_dim, cu_seqlens_q, cp_rank, cp_size, rotary_interleaved
+    if thd_global_start is not None:
+        if cu_seqlens_q is None:
+            raise ValueError("thd_global_start requires cu_seqlens_q.")
+        if position_ids is not None:
+            raise ValueError("thd_global_start and position_ids are mutually exclusive.")
+        if cp_rank != 0 or cp_size != 1:
+            raise ValueError("thd_global_start cannot be combined with zigzag CP mapping.")
+
+    return _FusedMLARoPEInplace.apply(
+        t,
+        cos,
+        sin,
+        nope_dim,
+        emb_dim,
+        cu_seqlens_q,
+        cp_rank,
+        cp_size,
+        rotary_interleaved,
+        inverse,
+        remove_interleaving,
+        position_ids,
+        rope_first,
+        thd_global_start,
     )
+
+
+def fused_mla_rope_out_of_place(
+    t: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    nope_dim: int,
+    emb_dim: int,
+    cu_seqlens_q: Optional[torch.Tensor] = None,
+    cp_rank: int = 0,
+    cp_size: int = 1,
+    rotary_interleaved: bool = False,
+    inverse: bool = False,
+    remove_interleaving: bool = False,
+) -> torch.Tensor:
+    """Apply the fused RoPE kernel without modifying the input tensor.
+
+    Use this wrapper when an upstream autograd function may have retained its
+    output for backward. The underlying kernel remains in-place, so a private
+    copy is required to keep the retained tensor unchanged.
+    """
+    return fused_mla_rope_inplace(
+        t.clone(),
+        cos,
+        sin,
+        nope_dim,
+        emb_dim,
+        cu_seqlens_q=cu_seqlens_q,
+        cp_rank=cp_rank,
+        cp_size=cp_size,
+        rotary_interleaved=rotary_interleaved,
+        inverse=inverse,
+        remove_interleaving=remove_interleaving,
+    )
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_H": 1}),
+        triton.Config({"BLOCK_H": 2}),
+        triton.Config({"BLOCK_H": 4}),
+        triton.Config({"BLOCK_H": 8}),
+        triton.Config({"BLOCK_H": 16}),
+        triton.Config({"BLOCK_H": 32}),
+        triton.Config({"BLOCK_H": 64}),
+        triton.Config({"BLOCK_H": 128}),
+    ],
+    key=["nope_dim", "emb_dim", "head_num"],
+)
+@triton.jit
+def _mla_rope_concat_fwd_kernel(
+    NOPE,
+    ROPE,
+    OUTPUT,
+    COS,
+    SIN,
+    nope_dim: tl.constexpr,
+    emb_dim: tl.constexpr,
+    head_num: tl.constexpr,
+    batch_size,
+    seq_num,
+    cu_seqlens,
+    stride_nope_seq,
+    stride_nope_batch,
+    stride_nope_head,
+    stride_nope_dim,
+    stride_rope_seq,
+    stride_rope_batch,
+    stride_rope_head,
+    stride_rope_dim,
+    stride_output_seq,
+    stride_output_head,
+    stride_cos_seq,
+    stride_sin_seq,
+    cp_rank,
+    cp_size,
+    IS_THD: tl.constexpr,
+    NOPE_BLOCK: tl.constexpr,
+    ROT_BLOCK: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+):
+    """Concatenate the non-RoPE part with a rotated positional part."""
+    pid_m = tl.program_id(axis=0)
+    pid_head = tl.program_id(axis=1)
+
+    if IS_THD:
+        token_idx = _get_thd_token_idx(cu_seqlens, pid_m, seq_num, cp_rank, cp_size)
+        nope_row = NOPE + pid_m * stride_nope_seq
+        rope_row = ROPE + pid_m * stride_rope_seq
+    else:
+        seq_idx = pid_m // batch_size
+        batch_idx = pid_m % batch_size
+        token_idx = seq_idx
+        nope_row = NOPE + seq_idx * stride_nope_seq + batch_idx * stride_nope_batch
+        rope_row = ROPE + seq_idx * stride_rope_seq + batch_idx * stride_rope_batch
+
+    head_idx = pid_head * BLOCK_H + tl.arange(0, BLOCK_H)
+    head_mask = head_idx < head_num
+
+    nope_idx = tl.arange(0, NOPE_BLOCK)
+    nope_mask = head_mask[:, None] & (nope_idx[None, :] < nope_dim)
+    nope_offsets = head_idx[:, None] * stride_nope_head + nope_idx[None, :] * stride_nope_dim
+    nope = tl.load(nope_row + nope_offsets, mask=nope_mask)
+
+    rope_idx = tl.arange(0, ROT_BLOCK)
+    rope_mask = head_mask[:, None] & (rope_idx[None, :] < emb_dim // 2)
+    rope_base = head_idx[:, None] * stride_rope_head
+    rope_pair = rope_idx[None, :] * 2 * stride_rope_dim
+    x_1 = tl.load(rope_row + rope_base + rope_pair, mask=rope_mask)
+    x_2 = tl.load(rope_row + rope_base + rope_pair + stride_rope_dim, mask=rope_mask)
+
+    cos_left = tl.load(COS + token_idx * stride_cos_seq + rope_idx, mask=rope_idx < emb_dim // 2)
+    sin_left = tl.load(SIN + token_idx * stride_sin_seq + rope_idx, mask=rope_idx < emb_dim // 2)
+    cos_right = tl.load(
+        COS + token_idx * stride_cos_seq + emb_dim // 2 + rope_idx, mask=rope_idx < emb_dim // 2
+    )
+    sin_right = tl.load(
+        SIN + token_idx * stride_sin_seq + emb_dim // 2 + rope_idx, mask=rope_idx < emb_dim // 2
+    )
+    x_left = x_1 * cos_left[None, :] - x_2 * sin_left[None, :]
+    x_right = x_2 * cos_right[None, :] + x_1 * sin_right[None, :]
+
+    output_row = OUTPUT + pid_m * stride_output_seq
+    output_base = head_idx[:, None] * stride_output_head
+    output_nope_offsets = output_base + nope_idx[None, :]
+    tl.store(output_row + output_nope_offsets, nope, mask=nope_mask)
+    output_rope_offsets = output_base + nope_dim + rope_idx[None, :]
+    tl.store(output_row + output_rope_offsets, x_left, mask=rope_mask)
+    tl.store(output_row + output_rope_offsets + emb_dim // 2, x_right, mask=rope_mask)
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_H": 1}),
+        triton.Config({"BLOCK_H": 2}),
+        triton.Config({"BLOCK_H": 4}),
+        triton.Config({"BLOCK_H": 8}),
+        triton.Config({"BLOCK_H": 16}),
+        triton.Config({"BLOCK_H": 32}),
+        triton.Config({"BLOCK_H": 64}),
+        triton.Config({"BLOCK_H": 128}),
+    ],
+    key=["nope_dim", "emb_dim", "head_num"],
+)
+@triton.jit
+def _mla_rope_concat_bwd_kernel(
+    DOUTPUT,
+    DNOPE,
+    DROPE,
+    COS,
+    SIN,
+    nope_dim: tl.constexpr,
+    emb_dim: tl.constexpr,
+    head_num: tl.constexpr,
+    batch_size,
+    seq_num,
+    cu_seqlens,
+    stride_doutput_seq,
+    stride_doutput_head,
+    stride_dnope_seq,
+    stride_dnope_head,
+    stride_drope_seq,
+    stride_drope_head,
+    stride_cos_seq,
+    stride_sin_seq,
+    cp_rank,
+    cp_size,
+    IS_THD: tl.constexpr,
+    NOPE_BLOCK: tl.constexpr,
+    ROT_BLOCK: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+):
+    """Split the output gradient and apply the inverse rotation."""
+    pid_m = tl.program_id(axis=0)
+    pid_head = tl.program_id(axis=1)
+
+    if IS_THD:
+        token_idx = _get_thd_token_idx(cu_seqlens, pid_m, seq_num, cp_rank, cp_size)
+    else:
+        token_idx = pid_m // batch_size
+
+    head_idx = pid_head * BLOCK_H + tl.arange(0, BLOCK_H)
+    head_mask = head_idx < head_num
+    doutput_row = DOUTPUT + pid_m * stride_doutput_seq
+    doutput_base = head_idx[:, None] * stride_doutput_head
+
+    nope_idx = tl.arange(0, NOPE_BLOCK)
+    nope_mask = head_mask[:, None] & (nope_idx[None, :] < nope_dim)
+    nope_offsets = doutput_base + nope_idx[None, :]
+    dnope = tl.load(doutput_row + nope_offsets, mask=nope_mask)
+    dnope_row = DNOPE + pid_m * stride_dnope_seq
+    dnope_offsets = head_idx[:, None] * stride_dnope_head + nope_idx[None, :]
+    tl.store(dnope_row + dnope_offsets, dnope, mask=nope_mask)
+
+    rope_idx = tl.arange(0, ROT_BLOCK)
+    rope_mask = head_mask[:, None] & (rope_idx[None, :] < emb_dim // 2)
+    rope_offsets = doutput_base + nope_dim + rope_idx[None, :]
+    dx_left = tl.load(doutput_row + rope_offsets, mask=rope_mask)
+    dx_right = tl.load(doutput_row + rope_offsets + emb_dim // 2, mask=rope_mask)
+
+    cos_left = tl.load(COS + token_idx * stride_cos_seq + rope_idx, mask=rope_idx < emb_dim // 2)
+    sin_left = tl.load(SIN + token_idx * stride_sin_seq + rope_idx, mask=rope_idx < emb_dim // 2)
+    cos_right = tl.load(
+        COS + token_idx * stride_cos_seq + emb_dim // 2 + rope_idx, mask=rope_idx < emb_dim // 2
+    )
+    sin_right = tl.load(
+        SIN + token_idx * stride_sin_seq + emb_dim // 2 + rope_idx, mask=rope_idx < emb_dim // 2
+    )
+    dx_1 = dx_left * cos_left[None, :] + dx_right * sin_right[None, :]
+    dx_2 = -dx_left * sin_left[None, :] + dx_right * cos_right[None, :]
+
+    drope_row = DROPE + pid_m * stride_drope_seq
+    drope_base = head_idx[:, None] * stride_drope_head
+    drope_pair = rope_idx[None, :] * 2
+    tl.store(drope_row + drope_base + drope_pair, dx_1, mask=rope_mask)
+    tl.store(drope_row + drope_base + drope_pair + 1, dx_2, mask=rope_mask)
+
+
+class _FusedMLARoPEConcat(torch.autograd.Function):
+    """Autograd wrapper for fused MLA packing and RoPE."""
+
+    @staticmethod
+    def forward(ctx, nope, rope, cos, sin, cu_seqlens, cp_rank, cp_size):
+        """Pack non-positional and RoPE channels while applying rotary embeddings."""
+        assert nope.ndim in (3, 4)
+        assert rope.ndim == nope.ndim
+        assert nope.shape[:-1] == rope.shape[:-1]
+        assert nope.dtype == rope.dtype
+        assert nope.device == rope.device == cos.device == sin.device
+        assert cos.stride(-1) == 1 and sin.stride(-1) == 1
+
+        is_thd = nope.ndim == 3
+        if is_thd:
+            total_seqlen, nheads, nope_dim = nope.shape
+            seq_num = len(cu_seqlens) - 1
+            batch_size = 1
+            nope_strides = (nope.stride(0), 0, nope.stride(1), nope.stride(2))
+            rope_strides = (rope.stride(0), 0, rope.stride(1), rope.stride(2))
+        else:
+            max_seqlen, batch_size, nheads, nope_dim = nope.shape
+            total_seqlen = max_seqlen * batch_size
+            seq_num = 0
+            assert cu_seqlens is None
+            nope_strides = nope.stride()
+            rope_strides = rope.stride()
+
+        emb_dim = rope.size(-1)
+        assert emb_dim % 4 == 0
+        nope_block = triton.next_power_of_2(nope_dim)
+        rot_block = triton.next_power_of_2(emb_dim // 2)
+
+        output = nope.new_empty(total_seqlen, nheads, nope_dim + emb_dim)
+        grid = lambda META: (total_seqlen, triton.cdiv(nheads, META["BLOCK_H"]))
+        _mla_rope_concat_fwd_kernel[grid](
+            nope,
+            rope,
+            output,
+            cos,
+            sin,
+            nope_dim,
+            emb_dim,
+            nheads,
+            batch_size,
+            seq_num,
+            cu_seqlens,
+            *nope_strides,
+            *rope_strides,
+            output.stride(0),
+            output.stride(1),
+            cos.stride(0),
+            sin.stride(0),
+            cp_rank,
+            cp_size,
+            IS_THD=is_thd,
+            NOPE_BLOCK=nope_block,
+            ROT_BLOCK=rot_block,
+        )
+
+        ctx.save_for_backward(cos, sin)
+        ctx.input_shape = nope.shape
+        ctx.cu_seqlens = cu_seqlens
+        ctx.cp_rank = cp_rank
+        ctx.cp_size = cp_size
+        ctx.nope_dim = nope_dim
+        ctx.emb_dim = emb_dim
+        ctx.is_thd = is_thd
+        if not is_thd:
+            output = output.view(max_seqlen, batch_size, nheads, nope_dim + emb_dim)
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        """Compute gradients for the packed non-positional and RoPE inputs."""
+        cos, sin = ctx.saved_tensors
+        grad_output = grad_output.contiguous()
+        if ctx.is_thd:
+            total_seqlen, nheads, _ = grad_output.shape
+            batch_size = 1
+            seq_num = len(ctx.cu_seqlens) - 1
+        else:
+            max_seqlen, batch_size, nheads, _ = grad_output.shape
+            total_seqlen = max_seqlen * batch_size
+            grad_output = grad_output.view(total_seqlen, nheads, -1)
+            seq_num = 0
+
+        dnope = grad_output.new_empty(total_seqlen, nheads, ctx.nope_dim)
+        drope = grad_output.new_empty(total_seqlen, nheads, ctx.emb_dim)
+        nope_block = triton.next_power_of_2(ctx.nope_dim)
+        rot_block = triton.next_power_of_2(ctx.emb_dim // 2)
+        grid = lambda META: (total_seqlen, triton.cdiv(nheads, META["BLOCK_H"]))
+        _mla_rope_concat_bwd_kernel[grid](
+            grad_output,
+            dnope,
+            drope,
+            cos,
+            sin,
+            ctx.nope_dim,
+            ctx.emb_dim,
+            nheads,
+            batch_size,
+            seq_num,
+            ctx.cu_seqlens,
+            grad_output.stride(0),
+            grad_output.stride(1),
+            dnope.stride(0),
+            dnope.stride(1),
+            drope.stride(0),
+            drope.stride(1),
+            cos.stride(0),
+            sin.stride(0),
+            ctx.cp_rank,
+            ctx.cp_size,
+            IS_THD=ctx.is_thd,
+            NOPE_BLOCK=nope_block,
+            ROT_BLOCK=rot_block,
+        )
+        dnope = dnope.view(ctx.input_shape)
+        drope = drope.view(*ctx.input_shape[:-1], ctx.emb_dim)
+        return dnope, drope, None, None, None, None, None
+
+
+def fused_mla_rope_concat(
+    nope: torch.Tensor,
+    rope: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    cu_seqlens: Optional[torch.Tensor] = None,
+    cp_rank: int = 0,
+    cp_size: int = 1,
+) -> torch.Tensor:
+    """Pack MLA's non-positional and positional parts while applying RoPE.
+
+    ``nope`` and ``rope`` may use arbitrary input strides. The returned SBHD
+    or THD tensor is contiguous and stores the rotated positional channels
+    after the non-positional channels.
+    """
+    return _FusedMLARoPEConcat.apply(nope, rope, cos, sin, cu_seqlens, cp_rank, cp_size)
 
 
 @triton.autotune(
@@ -376,7 +904,7 @@ def fused_apply_mla_rope_for_q(
     key=["emb_dim", "k_dim", "v_dim", "head_num"],
 )
 @triton.jit
-def rotary_fwd_kv_kernel(
+def _mla_rope_fwd_kv_split_kernel(
     KV,
     K_POS_EMB,
     O_KEY,
@@ -399,12 +927,12 @@ def rotary_fwd_kv_kernel(
     stride_v_nheads,
     cp_rank,
     cp_size,
+    REMOVE_INTERLEAVING: tl.constexpr,
     BLOCK_H: tl.constexpr,
 ):
     """
-    Triton kernel of the forward pass for applying YARN RoPE to MLA's key and value.
-    It splits the input tensor KV into key and value,
-    and concatenates the processed RoPE to the key.
+    Forward pass: split KV into key and value, apply RoPE to k_pos_emb,
+    and concatenate the result onto key.
 
     Input:
         KV: [seq_len, batch_size, head_num, k_dim + v_dim]
@@ -460,14 +988,24 @@ def rotary_fwd_kv_kernel(
     x_left = x_left.expand_dims(0).broadcast_to(BLOCK_H, emb_dim // 2)
     x_right = x_right.expand_dims(0).broadcast_to(BLOCK_H, emb_dim // 2)
 
-    x_left_off = (
-        tl.arange(0, BLOCK_H)[:, None] * stride_k_nheads
-        + k_dim
-        + tl.arange(0, emb_dim // 2)[None, :]
-    )
-    x_right_off = x_left_off + emb_dim // 2
-    tl.store(K_ptr + x_left_off, x_left, mask=mask)
-    tl.store(K_ptr + x_right_off, x_right, mask=mask)
+    if REMOVE_INTERLEAVING:
+        x_1_off = (
+            tl.arange(0, BLOCK_H)[:, None] * stride_k_nheads
+            + k_dim
+            + tl.arange(0, emb_dim // 2)[None, :] * 2
+        )
+        x_2_off = x_1_off + 1
+        tl.store(K_ptr + x_1_off, x_left, mask=mask)
+        tl.store(K_ptr + x_2_off, x_right, mask=mask)
+    else:
+        x_left_off = (
+            tl.arange(0, BLOCK_H)[:, None] * stride_k_nheads
+            + k_dim
+            + tl.arange(0, emb_dim // 2)[None, :]
+        )
+        x_right_off = x_left_off + emb_dim // 2
+        tl.store(K_ptr + x_left_off, x_left, mask=mask)
+        tl.store(K_ptr + x_right_off, x_right, mask=mask)
 
 
 @triton.autotune(
@@ -484,7 +1022,7 @@ def rotary_fwd_kv_kernel(
     key=["emb_dim", "k_dim", "v_dim", "head_num"],
 )
 @triton.jit
-def rotary_bwd_kv_kernel(
+def _mla_rope_bwd_kv_split_kernel(
     dK,
     dV,
     dKV,
@@ -507,10 +1045,11 @@ def rotary_bwd_kv_kernel(
     stride_demb_seq,
     cp_rank,
     cp_size,
+    REMOVE_INTERLEAVING: tl.constexpr,
     BLOCK_H: tl.constexpr,
 ):
     """
-    Triton kernel of the backward pass for applying YARN RoPE to MLA's key and value.
+    Backward pass for the KV-split RoPE.
 
     Input:
         dK: [seq_len, batch_size, head_num, emb_dim + k_dim]
@@ -555,10 +1094,16 @@ def rotary_bwd_kv_kernel(
             dK_ptr = dK + pid_m * stride_dk_seq + i * BLOCK_H * stride_dk_nheads
             x_off = tl.arange(0, BLOCK_H)[:, None] * stride_dk_nheads + k_dim
             mask = x_off < head_num * stride_dk_nheads
-            x_left_off = x_off + tl.arange(0, emb_dim // 2)[None, :]
-            x_right_off = x_left_off + emb_dim // 2
-            x_left = tl.load(dK_ptr + x_left_off, mask=mask)
-            x_right = tl.load(dK_ptr + x_right_off, mask=mask)
+            if REMOVE_INTERLEAVING:
+                x_1_off = x_off + tl.arange(0, emb_dim // 2)[None, :] * 2
+                x_2_off = x_1_off + 1
+                x_left = tl.load(dK_ptr + x_1_off, mask=mask)
+                x_right = tl.load(dK_ptr + x_2_off, mask=mask)
+            else:
+                x_left_off = x_off + tl.arange(0, emb_dim // 2)[None, :]
+                x_right_off = x_left_off + emb_dim // 2
+                x_left = tl.load(dK_ptr + x_left_off, mask=mask)
+                x_right = tl.load(dK_ptr + x_right_off, mask=mask)
             x_left_accum += x_left
             x_right_accum += x_right
         x_left_accum = tl.sum(x_left_accum, axis=0)
@@ -578,9 +1123,10 @@ def rotary_bwd_kv_kernel(
         tl.store(dEMB_ptr + tl.arange(0, emb_dim // 2) * 2 + 1, x_2)
 
 
-class ApplyMLARotaryEmbKV(torch.autograd.Function):
+class _FusedMLARoPEKVSplit(torch.autograd.Function):
     """
-    Autograd function for applying YARN RoPE to MLA's key and value.
+    Autograd function for applying RoPE to MLA's key and value.
+    Splits KV, applies RoPE to k_pos_emb, concatenates onto key.
     """
 
     @staticmethod
@@ -597,9 +1143,10 @@ class ApplyMLARotaryEmbKV(torch.autograd.Function):
         cp_rank,
         cp_size,
         rotary_interleaved=False,
+        remove_interleaving=False,
     ):
         """
-        Forward function for ApplyMLARotaryEmbKV.
+        Forward function for _FusedMLARoPEKVSplit.
 
         Args:
             kv: [seq_len, batch_size, head_num, k_dim + v_dim]
@@ -634,7 +1181,7 @@ class ApplyMLARotaryEmbKV(torch.autograd.Function):
         o_value = kv.new_empty(total_seqlen, nheads, v_dim)
 
         grid = lambda META: (total_seqlen, triton.cdiv(nheads, META["BLOCK_H"]))
-        rotary_fwd_kv_kernel[grid](
+        _mla_rope_fwd_kv_split_kernel[grid](
             kv,
             k_pos_emb,
             o_key,
@@ -657,8 +1204,10 @@ class ApplyMLARotaryEmbKV(torch.autograd.Function):
             o_value.stride(1),
             cp_rank,
             cp_size,
+            REMOVE_INTERLEAVING=remove_interleaving,
         )
         ctx.save_for_backward(cos, sin)
+        ctx.remove_interleaving = remove_interleaving
         ctx.rotary_interleaved = rotary_interleaved
         ctx.emb_dim = emb_dim
         ctx.k_dim = k_dim
@@ -674,7 +1223,7 @@ class ApplyMLARotaryEmbKV(torch.autograd.Function):
     @staticmethod
     def backward(ctx, dk, dv):
         """
-        Backward function for ApplyMLARotaryEmbKV.
+        Backward function for _FusedMLARoPEKVSplit.
 
         Args:
             dk: [seq_len, batch_size, head_num, emb_dim + k_dim]
@@ -702,7 +1251,7 @@ class ApplyMLARotaryEmbKV(torch.autograd.Function):
         d_emb = dk.new_empty(total_seqlen, 1, ctx.emb_dim)
 
         grid = lambda META: (total_seqlen, triton.cdiv(nheads, META["BLOCK_H"]))
-        rotary_bwd_kv_kernel[grid](
+        _mla_rope_bwd_kv_split_kernel[grid](
             dk,
             dv,
             d_kv,
@@ -725,14 +1274,15 @@ class ApplyMLARotaryEmbKV(torch.autograd.Function):
             d_emb.stride(0),
             ctx.cp_rank,
             ctx.cp_size,
+            REMOVE_INTERLEAVING=ctx.remove_interleaving,
         )
         if ctx.cu_seqlens_kv is None:
             d_kv = d_kv.view(max_seqlen, batch_size, nheads, ctx.k_dim + ctx.v_dim)
             d_emb = d_emb.view(max_seqlen, batch_size, 1, ctx.emb_dim)
-        return d_kv, d_emb, None, None, None, None, None, None, None, None, None
+        return d_kv, d_emb, None, None, None, None, None, None, None, None, None, None
 
 
-def fused_apply_mla_rope_for_kv(
+def fused_mla_rope_kv_split(
     kv: torch.Tensor,
     k_pos_emb: torch.Tensor,
     cos: torch.Tensor,
@@ -744,9 +1294,10 @@ def fused_apply_mla_rope_for_kv(
     cp_rank: int = 0,
     cp_size: int = 1,
     rotary_interleaved: bool = False,
+    remove_interleaving: bool = False,
 ):
     """
-    Fused function for applying YARN RoPE to MLA's key and value.
+    Fused function for applying RoPE to MLA's key and value.
     It splits the input tensor kv into key and value,
     and concatenates the processed RoPE to the key.
 
@@ -761,13 +1312,14 @@ def fused_apply_mla_rope_for_kv(
         cos/sin: [max_seq_len, 1, 1, emb_dim]
         cu_seqlens_kv: [seq_num + 1] accumulated sequence lengths for thd format
         rotary_interleaved: whether to apply RoPE interleaved, only supports False for now
+        remove_interleaving: if True, output RoPE dims in non-interleaved layout
 
     Returns:
         key: [seq_len, batch_size, head_num, emb_dim + k_dim]
             or [total_seq_len, head_num, emb_dim + k_dim]
         value: [seq_len, batch_size, head_num, v_dim] or [total_seq_len, head_num, v_dim]
     """
-    return ApplyMLARotaryEmbKV.apply(
+    return _FusedMLARoPEKVSplit.apply(
         kv,
         k_pos_emb,
         cos,
@@ -779,4 +1331,12 @@ def fused_apply_mla_rope_for_kv(
         cp_rank,
         cp_size,
         rotary_interleaved,
+        remove_interleaving,
     )
+
+
+# ---------------------------------------------------------------------------
+# Backward-compatible aliases (deprecated, prefer the new names above)
+# ---------------------------------------------------------------------------
+fused_apply_mla_rope_for_q = fused_mla_rope_inplace
+fused_apply_mla_rope_for_kv = fused_mla_rope_kv_split

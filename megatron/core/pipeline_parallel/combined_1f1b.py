@@ -393,6 +393,15 @@ def combined_forward_backward_step(
         # each layer's all-gathered parameters explicitly after its compute.
         # Only needed for optim_grads_params strategy (where params are sharded).
         forward_fsdp_wrapper = find_megatron_fsdp(f_model)
+        # Full recompute re-runs each layer segment's forward at backward time, which
+        # needs the (sharded) parameters to be all-gathered again. That interaction
+        # with the FSDP reshard hooks is not yet supported.
+        assert not (
+            forward_fsdp_wrapper is not None and getattr(f_schedule_plan, "recompute_full", False)
+        ), (
+            "overlap_moe_expert_parallel_comm full recompute (recompute_granularity=full) "
+            "is not yet supported together with Megatron FSDP."
+        )
         if (
             forward_fsdp_wrapper is not None
             and forward_fsdp_wrapper.ddp_config.data_parallel_sharding_strategy
@@ -400,8 +409,8 @@ def combined_forward_backward_step(
         ):
             for i in range(f_schedule_plan.num_layers()):
                 layer_plan = f_schedule_plan.get_layer(i)
-                # Validation workaround: disable per-layer forward reshard in EP-overlap
-                # schedule to avoid releasing weights before the matching backward consumes them.
+                # Wire explicit FSDP reshard hooks for the EP-overlap schedule,
+                # which bypasses the normal TransformerLayer-level FSDP hooks.
                 layer_plan.set_fsdp_reshard_hooks(
                     forward_fsdp_wrapper.post_forward_release_module,
                     forward_fsdp_wrapper.post_backward_release_module,

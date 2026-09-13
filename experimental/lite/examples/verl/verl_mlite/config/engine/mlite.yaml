@@ -1,0 +1,36 @@
+_target_: verl_mlite.engine.config.MegatronLiteEngineConfig
+
+strategy: mlite
+custom_backend_module: verl_mlite.engine.mlite_engine
+param_offload: false
+optimizer_offload: false
+grad_offload: false
+forward_only: false
+dtype: bfloat16
+export_dtype: bfloat16
+# Optional MLite-owned QAT rollout export configuration.
+qat: {}
+resync_format: null
+resync_config: {}
+router_replay_mode: disabled
+load_hf_weights: true
+
+model_name: auto
+impl: lite
+
+tp: 1
+etp: null
+ep: 1
+pp: 1
+vpp: 1
+cp: 1
+
+attention_backend_override: flash
+router_aux_loss_coef: null
+impl_cfg:
+  use_thd: true
+  # MLite-owned training schema: controls forward fake quantization and STE.
+  # See ../../../../QAT.md for an enabled example.
+  qat:
+    enabled: false  # Opt in to MLite fake-quant parametrizations.
+    format: mxfp4  # int8, int4, fp8_e4m3, or mxfp4.
