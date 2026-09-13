@@ -145,6 +145,22 @@ def _simplified_indexer_uses_main_input_norm(config: TransformerConfig) -> bool:
     return getattr(config, "dsa_indexer_mode", "standard") == "simplified"
 
 
+def _dsa_caches_routing(config) -> bool:
+    """Whether the min-memory DSA kernels save the forward routing top-k for the backward pass.
+
+    Saving the route is the default. It is given up through the shared activation-recompute
+    policy: list ``dsa_simple_routing`` in ``recompute_modules`` under selective recomputation
+    to recompute the top-k in the backward pass instead, trading backward compute for roughly
+    O(batch * seq_len * dsa_indexer_topk) of index storage.
+    """
+    if getattr(config, "dsa_fwd_use_dense_attn", False):
+        # Dense indexer warmup bypasses routing altogether, so there is nothing to save.
+        return False
+    if getattr(config, "recompute_granularity", None) == "selective":
+        return "dsa_simple_routing" not in (getattr(config, "recompute_modules", None) or ())
+    return True
+
+
 def _split_topk_padding(topk_indices):
     """Split the indexer's -1 padding out of top-k indices.
 
@@ -886,8 +902,7 @@ class DSGQACoreAttention(MegatronModule):
                 "dsa_indexer_use_sparse_loss."
             )
         if dense_warmup and (
-            getattr(self.config, "dsa_kernel_cache_routing", False)
-            or getattr(self.config, "dsa_kernel_cache_indexer_k", False)
+            getattr(self.config, "dsa_kernel_cache_indexer_k", False)
             or getattr(self.config, "dsa_kernel_cache_selected_scores", False)
         ):
             raise NotImplementedError("dsa_fwd_use_dense_attn does not support DSA cache flags.")
@@ -1022,7 +1037,7 @@ class DSGQACoreAttention(MegatronModule):
             loss_coeff=sparse_loss_coeff,
             use_indexer_rope=use_indexer_rope,
             simplified_input_norm=indexer_input_norm,
-            cache_routing=getattr(self.config, "dsa_kernel_cache_routing", False),
+            cache_routing=_dsa_caches_routing(self.config),
             cache_indexer_k=getattr(self.config, "dsa_kernel_cache_indexer_k", False),
             cache_selected_scores=getattr(self.config, "dsa_kernel_cache_selected_scores", False),
             profile_enabled=getattr(self.config, "dsa_min_memory_profile", False),
