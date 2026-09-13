@@ -1196,12 +1196,11 @@ class DSASimplifiedMinMemoryGQAFn(torch.autograd.Function):
         ).routing_key_chunk
         routing_topk_cache = [] if cache_routing else None
         selected_scores_cache = [] if cache_selected_scores else None
-        use_learned_k = linear_k_weight.numel() > 0
         full_k_index = None
         with _triton_dispatch_enabled(use_triton):
             with profile.record("forward_total", query.device):
                 with torch.no_grad():
-                    if use_learned_k and cache_indexer_k:
+                    if cache_indexer_k:
                         with _profile_record(profile, "indexer_k_cache_fwd_project", query.device):
                             full_k_index = _project_simplified_k_index_block(
                                 hidden_states,
@@ -1237,7 +1236,7 @@ class DSASimplifiedMinMemoryGQAFn(torch.autograd.Function):
                         profile=profile,
                         routing_topk_cache=routing_topk_cache,
                         selected_scores_cache=selected_scores_cache,
-                        linear_k_weight=linear_k_weight if use_learned_k else None,
+                        linear_k_weight=linear_k_weight,
                         full_k_index=full_k_index,
                     )
         profile.log("forward")
@@ -1246,7 +1245,6 @@ class DSASimplifiedMinMemoryGQAFn(torch.autograd.Function):
         ctx.save_for_backward(
             query, key, value, hidden_states, linear_q_weight, linear_k_weight, cached_k
         )
-        ctx.use_learned_k = use_learned_k
         ctx.index_topk = index_topk
         ctx.index_head_dim = index_head_dim
         ctx.index_rotary_dim = index_rotary_dim
@@ -1288,9 +1286,7 @@ class DSASimplifiedMinMemoryGQAFn(torch.autograd.Function):
             _grad_accumulator(linear_q_weight) if ctx.needs_input_grad[4] else None
         )
         grad_linear_k_weight = (
-            _grad_accumulator(linear_k_weight)
-            if ctx.use_learned_k and ctx.needs_input_grad[5]
-            else None
+            _grad_accumulator(linear_k_weight) if ctx.needs_input_grad[5] else None
         )
         compute_loss_grad = (
             grad_indexer_loss is not None
@@ -1320,7 +1316,6 @@ class DSASimplifiedMinMemoryGQAFn(torch.autograd.Function):
             learned_k_norm_stats = None
             if (
                 compute_loss_grad
-                and ctx.use_learned_k
                 and grad_linear_k_weight is not None
                 and ctx.simplified_input_norm is not None
             ):
@@ -1358,7 +1353,7 @@ class DSASimplifiedMinMemoryGQAFn(torch.autograd.Function):
                                 ctx.simplified_input_norm,
                                 profile=profile,
                                 profile_suffix="bwd",
-                                linear_k_weight=(linear_k_weight if ctx.use_learned_k else None),
+                                linear_k_weight=linear_k_weight,
                                 full_k_index=full_k_index,
                             )
 
@@ -1452,9 +1447,7 @@ class DSASimplifiedMinMemoryGQAFn(torch.autograd.Function):
                 if compute_loss_grad:
                     with _profile_record(profile, "indexer_loss_bwd_prepare", query.device):
                         with torch.no_grad():
-                            if q_index is None and (
-                                ctx.selected_scores_cache is None or ctx.use_learned_k
-                            ):
+                            if q_index is None:
                                 q_index = _project_simplified_q_index_tile(
                                     hidden_states,
                                     q_start,
@@ -1468,57 +1461,46 @@ class DSASimplifiedMinMemoryGQAFn(torch.autograd.Function):
                                     ctx.simplified_input_norm,
                                 )
                             selected_score_k_index = None
-                            if ctx.use_learned_k:
-                                if full_k_index is not None:
-                                    selected_score_k_index = full_k_index
-                                else:
-                                    selected_score_k_index = _project_simplified_k_index_block(
-                                        hidden_states,
-                                        0,
-                                        q_end,
-                                        linear_k_weight,
-                                        ctx.index_head_dim,
-                                        ctx.index_rotary_dim,
-                                        ctx.rotary_pos_emb,
-                                        ctx.rotary_interleaved,
-                                        ctx.use_indexer_rope,
-                                        ctx.simplified_input_norm,
-                                    )
-                                if ctx.selected_scores_cache is not None:
-                                    selected_scores = ctx.selected_scores_cache[chunk_idx]
-                                else:
-                                    selected_scores = query.new_empty(
-                                        topk_indices.shape, dtype=torch.float32
-                                    )
-                                    support_chunk_size = min(
-                                        _SIMPLIFIED_LEARNED_K_SUPPORT_CHUNK_SIZE,
-                                        topk_indices.size(-1),
-                                    )
-                                    for support_start in range(
-                                        0, topk_indices.size(-1), support_chunk_size
-                                    ):
-                                        support_end = min(
-                                            support_start + support_chunk_size,
-                                            topk_indices.size(-1),
-                                        )
-                                        support_slice = slice(support_start, support_end)
-                                        selected_scores[:, :, support_slice] = (
-                                            _simplified_selected_index_scores(
-                                                q_index,
-                                                selected_score_k_index,
-                                                topk_indices[:, :, support_slice].contiguous(),
-                                                ctx.indexer_score_scale,
-                                                q_start,
-                                            )
-                                        )
+                            if full_k_index is not None:
+                                selected_score_k_index = full_k_index
                             else:
-                                selected_scores = (
-                                    ctx.selected_scores_cache[chunk_idx]
-                                    if ctx.selected_scores_cache is not None
-                                    else _simplified_selected_index_scores(
-                                        q_index, key, topk_indices, ctx.indexer_score_scale, q_start
-                                    )
+                                selected_score_k_index = _project_simplified_k_index_block(
+                                    hidden_states,
+                                    0,
+                                    q_end,
+                                    linear_k_weight,
+                                    ctx.index_head_dim,
+                                    ctx.index_rotary_dim,
+                                    ctx.rotary_pos_emb,
+                                    ctx.rotary_interleaved,
+                                    ctx.use_indexer_rope,
+                                    ctx.simplified_input_norm,
                                 )
+                            if ctx.selected_scores_cache is not None:
+                                selected_scores = ctx.selected_scores_cache[chunk_idx]
+                            else:
+                                selected_scores = query.new_empty(
+                                    topk_indices.shape, dtype=torch.float32
+                                )
+                                support_chunk_size = min(
+                                    _SIMPLIFIED_LEARNED_K_SUPPORT_CHUNK_SIZE, topk_indices.size(-1)
+                                )
+                                for support_start in range(
+                                    0, topk_indices.size(-1), support_chunk_size
+                                ):
+                                    support_end = min(
+                                        support_start + support_chunk_size, topk_indices.size(-1)
+                                    )
+                                    support_slice = slice(support_start, support_end)
+                                    selected_scores[:, :, support_slice] = (
+                                        _simplified_selected_index_scores(
+                                            q_index,
+                                            selected_score_k_index,
+                                            topk_indices[:, :, support_slice].contiguous(),
+                                            ctx.indexer_score_scale,
+                                            q_start,
+                                        )
+                                    )
                             teacher = _teacher_scores_tile(
                                 query[q_start:q_end].detach(),
                                 key.detach(),
@@ -1542,60 +1524,47 @@ class DSASimplifiedMinMemoryGQAFn(torch.autograd.Function):
                     with _profile_record(
                         profile, "indexer_loss_bwd_simplified_q_wgrad", query.device
                     ):
-                        if ctx.use_learned_k:
-                            grad_q_index = torch.zeros_like(q_index, dtype=torch.float32)
-                            # Bound the FP32 selected-K gradient scratch independently of
-                            # top-k. This also keeps learned-K WGRAD memory stable as top-k
-                            # is swept during adaptation experiments.
-                            support_chunk_size = min(
-                                _SIMPLIFIED_LEARNED_K_SUPPORT_CHUNK_SIZE, topk_indices.size(-1)
+                        grad_q_index = torch.zeros_like(q_index, dtype=torch.float32)
+                        # Bound the FP32 selected-K gradient scratch independently of
+                        # top-k. This also keeps learned-K WGRAD memory stable as top-k
+                        # is swept during adaptation experiments.
+                        support_chunk_size = min(
+                            _SIMPLIFIED_LEARNED_K_SUPPORT_CHUNK_SIZE, topk_indices.size(-1)
+                        )
+                        for support_start in range(0, topk_indices.size(-1), support_chunk_size):
+                            support_end = min(
+                                support_start + support_chunk_size, topk_indices.size(-1)
                             )
-                            for support_start in range(
-                                0, topk_indices.size(-1), support_chunk_size
-                            ):
-                                support_end = min(
-                                    support_start + support_chunk_size, topk_indices.size(-1)
-                                )
-                                support_slice = slice(support_start, support_end)
-                                selected_k_chunk = _gather_selected_indexer_k(
-                                    selected_score_k_index[:, :, 0, :],
+                            support_slice = slice(support_start, support_end)
+                            selected_k_chunk = _gather_selected_indexer_k(
+                                selected_score_k_index[:, :, 0, :],
+                                topk_indices[:, :, support_slice],
+                            )
+                            grad_q_chunk, grad_selected_k_chunk = (
+                                _simplified_selected_index_scores_backward_qk(
+                                    q_index,
+                                    selected_k_chunk,
                                     topk_indices[:, :, support_slice],
+                                    grad_scores[:, :, support_slice],
+                                    ctx.indexer_score_scale,
+                                    q_start,
                                 )
-                                grad_q_chunk, grad_selected_k_chunk = (
-                                    _simplified_selected_index_scores_backward_qk(
-                                        q_index,
-                                        selected_k_chunk,
-                                        topk_indices[:, :, support_slice],
-                                        grad_scores[:, :, support_slice],
-                                        ctx.indexer_score_scale,
-                                        q_start,
-                                    )
-                                )
-                                grad_q_index.add_(grad_q_chunk)
-                                if grad_k_linear_sequence is not None:
-                                    with _profile_record(
-                                        profile,
-                                        "indexer_loss_bwd_simplified_k_scatter",
-                                        query.device,
-                                    ):
-                                        _accumulate_simplified_learned_k_sequence_grad(
-                                            grad_selected_k_chunk,
-                                            topk_indices[:, :, support_slice],
-                                            grad_k_linear_sequence,
-                                            ctx.index_head_dim,
-                                            ctx.index_rotary_dim,
-                                            ctx.rotary_pos_emb,
-                                            ctx.rotary_interleaved,
-                                            ctx.use_indexer_rope,
-                                        )
-                        else:
-                            grad_q_index = _simplified_selected_index_scores_backward(
-                                key.detach(),
-                                topk_indices,
-                                grad_scores,
-                                ctx.indexer_score_scale,
-                                q_start,
                             )
+                            grad_q_index.add_(grad_q_chunk)
+                            if grad_k_linear_sequence is not None:
+                                with _profile_record(
+                                    profile, "indexer_loss_bwd_simplified_k_scatter", query.device
+                                ):
+                                    _accumulate_simplified_learned_k_sequence_grad(
+                                        grad_selected_k_chunk,
+                                        topk_indices[:, :, support_slice],
+                                        grad_k_linear_sequence,
+                                        ctx.index_head_dim,
+                                        ctx.index_rotary_dim,
+                                        ctx.rotary_pos_emb,
+                                        ctx.rotary_interleaved,
+                                        ctx.use_indexer_rope,
+                                    )
                         positions = torch.arange(
                             q_start, q_end, device=query.device, dtype=torch.long
                         )
@@ -1895,7 +1864,6 @@ class DSASimplifiedDenseIndexerLossFn(torch.autograd.Function):
                 )
         profile.log("forward")
         ctx.save_for_backward(query, key, hidden_states, linear_q_weight, linear_k_weight)
-        ctx.use_learned_k = linear_k_weight.numel() > 0
         ctx.index_head_dim = index_head_dim
         ctx.index_rotary_dim = index_rotary_dim
         ctx.rotary_pos_emb = rotary_pos_emb
@@ -1922,9 +1890,7 @@ class DSASimplifiedDenseIndexerLossFn(torch.autograd.Function):
             _grad_accumulator(linear_q_weight) if ctx.needs_input_grad[3] else None
         )
         grad_linear_k_weight = (
-            _grad_accumulator(linear_k_weight)
-            if ctx.use_learned_k and ctx.needs_input_grad[4]
-            else None
+            _grad_accumulator(linear_k_weight) if ctx.needs_input_grad[4] else None
         )
         if (
             grad_loss is None
@@ -1980,7 +1946,7 @@ class DSASimplifiedDenseIndexerLossFn(torch.autograd.Function):
                             query_tile,
                             key,
                             hidden_states,
-                            linear_k_weight if ctx.use_learned_k else None,
+                            linear_k_weight,
                             ctx.index_head_dim,
                             ctx.index_rotary_dim,
                             ctx.rotary_pos_emb,
@@ -2021,21 +1987,17 @@ class DSASimplifiedDenseIndexerLossFn(torch.autograd.Function):
                             ctx.pg_collection,
                         )
                         teacher = teacher / teacher_norm.unsqueeze(-1)
-                        student_key = (
-                            key[k_start:k_end]
-                            if not ctx.use_learned_k
-                            else _project_simplified_k_index_block(
-                                hidden_states,
-                                k_start,
-                                k_end,
-                                linear_k_weight,
-                                ctx.index_head_dim,
-                                ctx.index_rotary_dim,
-                                ctx.rotary_pos_emb,
-                                ctx.rotary_interleaved,
-                                ctx.use_indexer_rope,
-                                ctx.simplified_input_norm,
-                            )
+                        student_key = _project_simplified_k_index_block(
+                            hidden_states,
+                            k_start,
+                            k_end,
+                            linear_k_weight,
+                            ctx.index_head_dim,
+                            ctx.index_rotary_dim,
+                            ctx.rotary_pos_emb,
+                            ctx.rotary_interleaved,
+                            ctx.use_indexer_rope,
+                            ctx.simplified_input_norm,
                         )
                         student_logits = _simplified_index_scores_block(
                             q_index, student_key, ctx.student_score_scale, q_start, k_start
@@ -2063,21 +2025,17 @@ class DSASimplifiedDenseIndexerLossFn(torch.autograd.Function):
                             ctx.pg_collection,
                         )
                         teacher = teacher / teacher_norm.unsqueeze(-1)
-                        student_key = (
-                            key[k_start:k_end]
-                            if not ctx.use_learned_k
-                            else _project_simplified_k_index_block(
-                                hidden_states,
-                                k_start,
-                                k_end,
-                                linear_k_weight,
-                                ctx.index_head_dim,
-                                ctx.index_rotary_dim,
-                                ctx.rotary_pos_emb,
-                                ctx.rotary_interleaved,
-                                ctx.use_indexer_rope,
-                                ctx.simplified_input_norm,
-                            )
+                        student_key = _project_simplified_k_index_block(
+                            hidden_states,
+                            k_start,
+                            k_end,
+                            linear_k_weight,
+                            ctx.index_head_dim,
+                            ctx.index_rotary_dim,
+                            ctx.rotary_pos_emb,
+                            ctx.rotary_interleaved,
+                            ctx.use_indexer_rope,
+                            ctx.simplified_input_norm,
                         )
                         student_logits = _simplified_index_scores_block(
                             q_index, student_key, ctx.student_score_scale, q_start, k_start
@@ -2183,14 +2141,11 @@ def dsa_min_memory_gqa_forward_only(
         query_chunk_size = plan.query_chunk
         key_chunk_size = plan.routing_key_chunk
         profile = _DSATimingProfiler(profile_enabled, profile_rank, profile_label, query.device)
-        use_learned_k = getattr(indexer.config, "dsa_simplified_use_learned_k", False)
-        linear_k_weight = (
-            _module_weight(indexer.linear_k) if use_learned_k else query.new_empty((0,))
-        )
+        linear_k_weight = _module_weight(indexer.linear_k)
         full_k_index = None
         with torch.no_grad(), _triton_dispatch_enabled(use_triton):
             with profile.record("forward_total", query.device):
-                if use_learned_k and cache_indexer_k:
+                if cache_indexer_k:
                     with _profile_record(profile, "indexer_k_cache_fwd_project", query.device):
                         full_k_index = _project_simplified_k_index_block(
                             hidden_states,
@@ -2224,7 +2179,7 @@ def dsa_min_memory_gqa_forward_only(
                     getattr(indexer.config, "rotary_interleaved", False),
                     simplified_input_norm,
                     profile=profile,
-                    linear_k_weight=linear_k_weight if use_learned_k else None,
+                    linear_k_weight=linear_k_weight,
                     full_k_index=full_k_index,
                 )
         profile.log("forward")
@@ -2338,13 +2293,12 @@ def dsa_dense_indexer_loss(
         key_chunk_override=key_chunk_size,
     )
     if getattr(indexer.config, "dsa_indexer_mode", "standard") == "simplified":
-        use_learned_k = getattr(indexer.config, "dsa_simplified_use_learned_k", False)
         return DSASimplifiedDenseIndexerLossFn.apply(
             query,
             key,
             hidden_states,
             _module_weight(indexer.linear_q),
-            (_module_weight(indexer.linear_k) if use_learned_k else query.new_empty((0,))),
+            _module_weight(indexer.linear_k),
             indexer.index_head_dim,
             indexer.index_rotary_dim,
             indexer.rotary_pos_emb,
@@ -2394,18 +2348,13 @@ def dsa_min_memory_gqa(
         key_chunk_override=key_chunk_size,
     )
     if getattr(indexer.config, "dsa_indexer_mode", "standard") == "simplified":
-        use_learned_k = getattr(indexer.config, "dsa_simplified_use_learned_k", False)
-        if cache_indexer_k and not use_learned_k:
-            raise ValueError(
-                "Simplified DSA using main-attention K cannot cache a separate indexer K."
-            )
         return DSASimplifiedMinMemoryGQAFn.apply(
             query,
             key,
             value,
             hidden_states,
             _module_weight(indexer.linear_q),
-            (_module_weight(indexer.linear_k) if use_learned_k else query.new_empty((0,))),
+            _module_weight(indexer.linear_k),
             indexer.index_topk,
             indexer.index_head_dim,
             indexer.index_rotary_dim,
