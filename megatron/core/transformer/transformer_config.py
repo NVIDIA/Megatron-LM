@@ -3601,13 +3601,16 @@ class TransformerConfig(ModelParallelConfig):
                     ),
                     InferenceGroupedGemmBackend.TORCH: squared_relu_or_swiglu,
                     InferenceGroupedGemmBackend.FLASHINFER: non_gated_squared_relu,
+                    # MXFP8 vLLM dispatches through the same canonical
+                    # scaled-grouped-GEMM implementation as the torch backend.
+                    InferenceGroupedGemmBackend.VLLM: squared_relu_or_swiglu,
                 }.get(self.inference_grouped_gemm_backend, False)
                 mxfp8_inference_supported = mxfp8_params_enabled and backend_supports_mxfp8
                 assert mxfp8_inference_supported or not (self.fp8 or self.fp4), (
                     "Batch-invariant MoE supports bf16, native TE MXFP8 squared-ReLU/"
-                    "SwiGLU experts, Torch MXFP8 squared-ReLU/SwiGLU experts, or FlashInfer "
-                    "MXFP8 squared-ReLU experts with the inference-optimized transformer "
-                    "implementation."
+                    "SwiGLU experts, Torch/vLLM MXFP8 squared-ReLU/SwiGLU experts, or "
+                    "FlashInfer MXFP8 squared-ReLU experts with the inference-optimized "
+                    "transformer implementation."
                 )
                 assert not (self.moe_permute_fusion or self.moe_permute_fusion_into_hybridep), (
                     "Batch-invariant MoE requires the unfused permute/unpermute path so "

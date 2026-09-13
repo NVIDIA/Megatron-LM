@@ -17,7 +17,7 @@ import torch
 
 from megatron.core.activations import squared_relu
 from megatron.core.inference.communication.torch_symm_triton import are_tensors_nvls_eligible
-from megatron.core.inference.utils import InferenceMode
+from megatron.core.inference.utils import FLASHINFER_JIT_CACHE_VERSION, InferenceMode
 from megatron.core.transformer.enums import AttnBackend, InferenceCudaGraphScope
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_te_min_version, is_torch_min_version
@@ -179,6 +179,26 @@ def test_config_accepts_te_mxfp8_batch_invariant_with_swiglu():
     )
 
     assert config.gated_linear_unit
+
+
+@pytest.mark.parametrize("gated_linear_unit", [False, True])
+def test_config_accepts_vllm_mxfp8_batch_invariant(gated_linear_unit):
+    """MXFP8 vLLM uses the batch-invariant torch scaled-grouped-GEMM path."""
+    config = _make_base_config(
+        inference_grouped_gemm_backend="vllm",
+        fp8="hybrid",
+        fp8_recipe="mxfp8",
+        fp8_param=True,
+        gated_linear_unit=gated_linear_unit,
+        activation_func=(torch.nn.functional.silu if gated_linear_unit else squared_relu),
+        batch_invariant_mode=True,
+        batch_invariant_backend="te_native",
+        attention_backend=AttnBackend.flash,
+        flash_attention_version=4,
+        attention_dropout=0.0,
+    )
+
+    assert config.batch_invariant_mode
 
 
 @pytest.mark.internal
@@ -674,6 +694,8 @@ class TestNVLSAllGatherVDispatcher:
             pytest.param("flashinfer", True, False, False, id="flashinfer-bf16-edge"),
             pytest.param("vllm", False, True, False, id="vllm-mxfp8"),
             pytest.param("vllm", False, True, True, id="vllm-swiglu-mxfp8"),
+            pytest.param("vllm", True, True, False, id="vllm-mxfp8-invariant"),
+            pytest.param("vllm", True, True, True, id="vllm-swiglu-mxfp8-invariant"),
             pytest.param("vllm", False, False, False, id="vllm-bf16-edge"),
         ],
     )
@@ -710,6 +732,8 @@ class TestNVLSAllGatherVDispatcher:
             pytest.skip("Native TE MXFP8 grouped GEMM requires its device APIs")
         if inference_grouped_gemm_backend == "flashinfer" and not HAVE_FLASHINFER_ROUTED_MXFP8:
             pytest.skip("FlashInfer routed MXFP8 is unavailable")
+        if inference_grouped_gemm_backend == "flashinfer" and FLASHINFER_JIT_CACHE_VERSION is None:
+            pytest.skip("FlashInfer expert-parallel inference requires flashinfer-jit-cache")
         if inference_grouped_gemm_backend == "torch" and not HAVE_SCALED_GMM:
             pytest.skip("Torch scaled_grouped_mm MXFP8 is unavailable")
 
