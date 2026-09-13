@@ -1348,7 +1348,19 @@ class MegatronFSDP(torch.nn.Module):
 
         if not force_sync and self.ddp_config.overlap_param_gather:
             # All-gather the first bucket before the forward pass.
-            if self.ddp_config.fsdp_all_gather_in_start_param_sync:
+            #
+            # Skipped under CUDA graph mode. This all-gather is dispatched with
+            # wait_bucket_ready=False so it can overlap the next forward pass, and
+            # start_param_sync() is called outside the captured region (for example
+            # by DistributedOptimizer.step_with_ready_grads()). The captured forward
+            # then waits on it in the pre-forward unshard hook, and CUDA rejects
+            # that with "dependency created on uncaptured work in another stream"
+            # (cudaErrorStreamCaptureIsolation). Letting the capture issue its own
+            # all-gather keeps the whole dependency chain inside the graph.
+            if (
+                self.ddp_config.fsdp_all_gather_in_start_param_sync
+                and not self.ddp_config.megatron_fsdp_cuda_graph_mode
+            ):
                 first_param = list(self.module.parameters())[0]
                 self.all_gather_and_wait_parameters_ready(
                     params=[first_param], prefetch=True, wait_bucket_ready=False
