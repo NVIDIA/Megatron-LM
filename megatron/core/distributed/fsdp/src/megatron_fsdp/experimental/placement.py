@@ -24,7 +24,7 @@ Source         Destination    DBuffer operation
 sharded        ``Replicate``  ``allgather()``
 ``Partial``    sharded        ``reduce_scatter()``
 ``Partial``    ``Replicate``  ``allreduce()``
-``Replicate``  sharded        ``scatter()`` (local)
+``Replicate``  sharded        ``view()`` (local)
 =============  =============  ====================
 """
 
