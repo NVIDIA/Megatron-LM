@@ -352,9 +352,6 @@ class TransformerConfig(ModelParallelConfig):
     dsa_min_memory_profile_rank: int = 0
     """Global rank that prints DSA min-memory timings. Set to -1 to print on every rank."""
 
-    dsa_kernel_cache_routing: bool = False
-    """Whether DSA kernel backends may save forward routing top-k indices for backward speed."""
-
     dsa_kernel_cache_indexer_k: bool = False
     """Whether DSA kernel backends may save full-sequence projected indexer K for speed."""
 
@@ -646,7 +643,8 @@ class TransformerConfig(ModelParallelConfig):
     recompute_modules: Optional[List[str]] = None
     """The submodules to recompute.
     choices: "core_attn", "moe_act", "layernorm", "mla_up_proj", "mlp", "moe",
-    "shared_experts", "gdn_norm_out", "gdp_in_proj", "gdp_qkv", "mhc".
+    "shared_experts", "gdn_norm_out", "gdp_in_proj", "gdp_qkv", "mhc",
+    "dsa_simple_routing".
     default: ["core_attn"].
     "core_attn": recompute the core attention part of the transformer layer.
     "moe_act": recompute the MoE MLP activation function.
@@ -662,6 +660,10 @@ class TransformerConfig(ModelParallelConfig):
     "mhc": recompute HyperConnection intermediate activations via
             CheckpointWithoutOutput + CheckpointWithoutOutputManager. Requires
             enable_mhc_connections=True. Cannot be used with "mlp".
+    "dsa_simple_routing": recompute the simplified DSA routing top-k in the backward pass
+            instead of saving the forward indices, trading backward compute for roughly
+            O(batch * seq_len * dsa_indexer_topk) of index storage. Applies only to the
+            min-memory DSA backends, which are the only ones that can save the routing.
     "moe_act", "layernorm", "mla_up_proj", "gdn_norm_out", "gdp_in_proj", "gdp_qkv", and
     "mhc" use output-discarding checkpointing, "core_attn", "mlp", "moe", and
     "shared_experts" use normal checkpointing.
@@ -2205,6 +2207,7 @@ class TransformerConfig(ModelParallelConfig):
                     "gdp_in_proj",
                     "gdp_qkv",
                     "mhc",
+                    "dsa_simple_routing",
                 }
                 invalid_modules = set(self.recompute_modules) - allowed_modules
                 assert not invalid_modules, (
@@ -3552,9 +3555,6 @@ class TransformerConfig(ModelParallelConfig):
                 self.dsa_min_memory_profile_rank >= -1
             ), "dsa_min_memory_profile_rank must be -1 or a non-negative global rank."
             assert (
-                not self.dsa_kernel_cache_routing or min_memory_dsa_backend
-            ), "dsa_kernel_cache_routing requires a min-memory dsa_kernel_backend."
-            assert (
                 not self.dsa_kernel_cache_indexer_k or min_memory_dsa_backend
             ), "dsa_kernel_cache_indexer_k requires a min-memory dsa_kernel_backend."
             assert not self.dsa_kernel_cache_selected_scores or min_memory_dsa_backend, (
@@ -3609,10 +3609,6 @@ class TransformerConfig(ModelParallelConfig):
                     assert (
                         self.dsa_indexer_loss_coeff or 0.0
                     ) > 0.0, "dsa_fwd_use_dense_attn requires dsa_indexer_loss_coeff > 0."
-                    assert not self.dsa_kernel_cache_routing, (
-                        "dsa_fwd_use_dense_attn bypasses routing; do not set "
-                        "dsa_kernel_cache_routing."
-                    )
                     assert not self.dsa_kernel_cache_indexer_k, (
                         "dsa_fwd_use_dense_attn recomputes dense indexer K; do not set "
                         "dsa_kernel_cache_indexer_k."
