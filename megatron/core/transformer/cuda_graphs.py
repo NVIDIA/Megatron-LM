@@ -1640,15 +1640,6 @@ def _layer_is_graphable(layer, config):
     if not isinstance(layer, GraphableMegatronModule):
         return False
 
-    if getattr(config, 'dynamic_context_parallel', False) and not hasattr(
-        layer, '_activate_dynamic_cp_cuda_graph'
-    ):
-        return False
-
-    # If cuda_graph_modules is not set, every layer is graphed.
-    if not config.cuda_graph_modules:
-        return True
-
     # import modules here to avoid a circular import
     from megatron.core.models.hybrid.hybrid_block import HyperConnectionHybridLayer
     from megatron.core.ssm.mamba_layer import MambaLayer
@@ -1656,6 +1647,17 @@ def _layer_is_graphable(layer, config):
     from megatron.core.transformer.mlp import MLP
     from megatron.core.transformer.moe.moe_layer import MoELayer
     from megatron.core.transformer.transformer_layer import TransformerLayer
+
+    # Wrappers own the graph bank; their inner layer determines DCP support.
+    inner = layer.inner_layer if isinstance(layer, HyperConnectionHybridLayer) else layer
+    if getattr(config, 'dynamic_context_parallel', False) and not isinstance(
+        inner, TransformerLayer
+    ):
+        return False
+
+    # If cuda_graph_modules is not set, every supported layer is graphed.
+    if not config.cuda_graph_modules:
+        return True
 
     # mHC wrapper: graphability is decided by the inner layer's type/scope. Non-MoE
     # inner layers are captured as one whole-wrapper graph (mHC aggregate + inner + BDA).
@@ -1765,6 +1767,15 @@ class _DynamicCPCaptureCallable(torch.nn.Module):
     def __init__(self, module, context_setter, context):
         super().__init__()
         self.module = module
+        # A grouped hybrid graph can cover a sibling's prefix without registering it
+        # under the original layer. Expose that state and its TE hooks on this temporary
+        # callable too: nn.Module traversal does not invoke a child's parameters override.
+        graph_modules = getattr(module, '_get_submodules_under_cudagraphs', None)
+        if graph_modules is not None:
+            registered = set(module.modules())
+            self._capture_only_modules = torch.nn.ModuleList(
+                child for child in graph_modules() if child not in registered
+            )
         self._context_setter = context_setter
         self._capture_context = context
         self.training = module.training
@@ -2172,12 +2183,16 @@ class TECudaGraphHelper:
                     1, local_slen, dtype=torch.bool, device=torch.cuda.current_device()
                 )
 
+            from megatron.core.models.hybrid.hybrid_block import HyperConnectionHybridLayer
             from megatron.core.transformer.identity_op import IdentityOp
             from megatron.core.transformer.transformer_layer import TransformerLayer
 
+            attention_layer = (
+                layer.inner_layer if isinstance(layer, HyperConnectionHybridLayer) else layer
+            )
             contains_self_attn = (
-                isinstance(layer, TransformerLayer)
-                and not isinstance(layer.self_attention, IdentityOp)
+                isinstance(attention_layer, TransformerLayer)
+                and not isinstance(attention_layer.self_attention, IdentityOp)
                 and (
                     not self.config.cuda_graph_modules
                     or CudaGraphModule.attn in self.config.cuda_graph_modules

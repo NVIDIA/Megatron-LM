@@ -209,6 +209,44 @@ class GraphableMegatronModule(MegatronModule):
             # according to CUDA graph scope.
             self.cuda_graph_backward_dw_wrapper = None
 
+    def _get_thd_cuda_graph_capture_cp(self):
+        """Return the CP size/group whose constants are being captured."""
+        if self.config.dynamic_context_parallel:
+            return self.config._cuda_graph_capture_dynamic_cp
+        return self.config.context_parallel_size, None
+
+    def _activate_dynamic_cp_cuda_graph(self, packed_seq_params):
+        """Select the graph-bank entry on the module that owns capture/replay."""
+        graph_bank = self.cuda_graphs_by_dynamic_cp_size
+        if not graph_bank:
+            return
+
+        if packed_seq_params is None or packed_seq_params.local_cp_size is None:
+            raise RuntimeError(
+                "Dynamic-CP CUDA graph replay requires packed sequence metadata with "
+                "local_cp_size."
+            )
+        dynamic_cp_size = int(packed_seq_params.local_cp_size)
+        if dynamic_cp_size not in graph_bank:
+            raise RuntimeError(
+                f"No layer CUDA graph bank entry for local_cp_size={dynamic_cp_size}; "
+                f"available sizes are {sorted(graph_bank)}."
+            )
+        group_bank = self.cuda_graph_cp_groups_by_dynamic_cp_size
+        if dynamic_cp_size not in group_bank:
+            raise RuntimeError(
+                f"No captured process group for local_cp_size={dynamic_cp_size}; "
+                f"available sizes are {sorted(group_bank)}."
+            )
+        expected_group = group_bank[dynamic_cp_size]
+        if packed_seq_params.cp_group is not expected_group:
+            raise RuntimeError(
+                "Dynamic-CP CUDA graph replay received a process group that does not match "
+                f"local_cp_size={dynamic_cp_size}."
+            )
+        self.cuda_graphs = graph_bank[dynamic_cp_size]
+        self.activate_te_cuda_graph_static_hidden_inputs(dynamic_cp_size)
+
     def set_te_cuda_graph_static_hidden_inputs(self, inputs, dynamic_cp_size=None):
         """Retain TE's fixed hidden-state input surface for each graph slot.
 
