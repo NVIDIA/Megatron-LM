@@ -215,13 +215,9 @@ def test_transformer_config_accepts_min_memory_backend():
             dsa_kernel_backend=backend,
             dsa_indexer_loss_coeff=0.1,
             dsa_indexer_use_sparse_loss=True,
-            dsa_min_memory_profile=True,
-            dsa_min_memory_profile_rank=-1,
         )
 
         assert config.dsa_kernel_backend == backend
-        assert config.dsa_min_memory_profile
-        assert config.dsa_min_memory_profile_rank == -1
 
 
 def _simplified_test_indexer(hidden_size, head_dim, topk):
@@ -786,8 +782,6 @@ def test_min_memory_backend_supports_no_grad_validation_forward(monkeypatch):
                 fp8=None,
                 fp8_param=False,
                 layernorm_zero_centered_gamma=False,
-                dsa_min_memory_profile=False,
-                dsa_min_memory_profile_rank=0,
             ),
             indexer=object(),
             softmax_scale=4**-0.5,
