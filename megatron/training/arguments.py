@@ -3879,11 +3879,6 @@ def _add_experimental_attention_variant_args(parser):
         help='KL loss coefficient for training the DSA indexer.',
     )
     _maybe_add_argument(
-        '--dsa-sparse-attention-use-gather',
-        action='store_true',
-        help='Use the gather-based sparse DSA attention backend instead of the dense-mask reference path.',
-    )
-    _maybe_add_argument(
         '--dsa-indexer-use-sparse-loss',
         action='store_true',
         help='Train the DSA indexer with KL loss restricted to the selected top-k support.',
