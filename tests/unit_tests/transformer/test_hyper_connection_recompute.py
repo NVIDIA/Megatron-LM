@@ -1620,7 +1620,8 @@ class TestSinglePassMHC:
             torch.testing.assert_close(value, reference, rtol=0, atol=0)
 
     @pytest.mark.parametrize("enabled", [False, True])
-    def test_single_pass_cli_roundtrip_without_attention_version(self, enabled):
+    @pytest.mark.parametrize("etp_size", [1, 2])
+    def test_single_pass_cli_roundtrip_without_attention_version(self, enabled, etp_size):
         """The CLI switch works independently of any experimental attention variant."""
         from argparse import ArgumentParser
 
@@ -1635,10 +1636,15 @@ class TestSinglePassMHC:
             num_attention_heads=4,
             enable_hyper_connections=True,
             mhc_single_pass=args.mhc_single_pass,
+            expert_tensor_parallel_size=etp_size,
+            num_moe_experts=4,
+            add_bias_linear=False,
         )
         assert config.mhc_single_pass is enabled
         assert config.dsv4_version == "v4"
         assert config.experimental_attention_variant is None
+        assert config.tensor_model_parallel_size == 1
+        assert config.expert_tensor_parallel_size == etp_size
 
     @pytest.mark.parametrize(
         "overrides, message",

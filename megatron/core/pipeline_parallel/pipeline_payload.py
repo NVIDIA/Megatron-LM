@@ -74,15 +74,26 @@ class PipelineDataIterator:
         return batch
 
 
+@dataclass
+class _PipelineBackwardState:
+    """Autograd roots and wire shapes without owning the outgoing tensor wrappers."""
+
+    specs: tuple[PipelineTensorSpec, ...]
+    device: torch.device
+    edges: tuple[torch.autograd.graph.GradientEdge | None, ...]
+
+
 class PipelinePayload:
     """A model-owned snapshot whose tensors may share storage with the local graph.
 
-    The schedule retains these tensors until backward, including when ordinary
-    pipeline output pseudo-deallocation is enabled. Integer metadata and floating
-    fields without a gradient slot are excluded from distributed backward.
+    After posting a send, the transport may release the outgoing tensor references
+    and retain only their gradient edges. Autograd still owns tensors saved by local
+    consumers, including received leaves relayed downstream. Integer metadata and
+    floating fields without a gradient slot are excluded from distributed backward.
     """
 
     tensors: tuple[torch.Tensor, ...]
+    _backward_state: _PipelineBackwardState | None = None
 
     @property
     def tensor_specs(self) -> tuple[PipelineTensorSpec, ...]:
@@ -97,7 +108,40 @@ class PipelinePayload:
     @property
     def device(self) -> torch.device:
         """Return the activation device, including for auxiliary loss scaling."""
+        if self._backward_state is not None:
+            return self._backward_state.device
         return self.tensors[0].device
+
+    def release_output(self) -> None:
+        """Release an exported payload's tensor references after its send is posted.
+
+        GradientEdge preserves hooks and joint autograd without keeping otherwise
+        unused outputs alive. No tensor data or shared storage is modified. The P2P
+        Work owns detached send buffers until completion, and autograd retains any
+        values needed by local backward. A released payload is only valid for backward;
+        input payloads remain intact until their gradients have been collected.
+        """
+        if self._backward_state is not None:
+            return
+        specs = self.tensor_specs
+        with torch.enable_grad():
+            # A C++ view node owns the upstream graph even when its producer is a
+            # Python autograd.Function. A direct GradientEdge to that Python node
+            # can outlive its C++ owner after tensor release (PyTorch 2.6). The view
+            # adds no allocation and saves no activation storage.
+            edges = tuple(
+                (
+                    torch.autograd.graph.get_gradient_edge(tensor.view_as(tensor))
+                    if spec.requires_grad
+                    else None
+                )
+                for tensor, spec in zip(self.tensors, specs)
+            )
+        state = _PipelineBackwardState(specs, self.device, edges)
+        # Model payloads can be frozen dataclasses: their forward schema remains
+        # immutable, but ownership is explicitly transferred to backward here.
+        object.__setattr__(self, "_backward_state", state)
+        object.__setattr__(self, "tensors", ())
 
 
 # Gradients keep the forward field order; non-gradient slots are None.
@@ -128,17 +172,28 @@ def backward_pipeline_payload(
                 tensor.retain_grad()
 
     if isinstance(output, PipelinePayload):
-        if output_grad is None or len(output_grad) != len(output.tensors):
+        state = output._backward_state
+        specs = output.tensor_specs if state is None else state.specs
+        roots = output.tensors if state is None else state.edges
+        if output_grad is None or len(output_grad) != len(specs):
             raise ValueError("Pipeline gradient slots must match the forward payload")
+        if len(roots) != len(specs):
+            raise RuntimeError("Pipeline payload backward has already been consumed")
         outputs, grads = [], []
-        for tensor, spec, grad in zip(output.tensors, output.tensor_specs, output_grad):
+        for root, spec, grad in zip(roots, specs, output_grad):
             if spec.requires_grad:
-                outputs.append(tensor)
-                grads.append(torch.zeros_like(tensor) if grad is None else grad)
+                outputs.append(root)
+                grads.append(
+                    torch.zeros(spec.shape, dtype=spec.dtype, device=output.device)
+                    if grad is None
+                    else grad
+                )
             elif grad is not None:
                 raise ValueError(f"Unexpected gradient for pipeline field {spec.name}")
         if outputs:
             torch.autograd.backward(outputs, grad_tensors=grads)
+        if state is not None:
+            state.edges = ()
     else:
         if output_grad is not None or output.numel() != 1:
             raise ValueError("The last typed pipeline stage requires a scalar loss")

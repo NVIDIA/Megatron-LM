@@ -622,6 +622,21 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         )
         return output
 
+    def _discard_input_layernorm_checkpoint(
+        self, attention_output: Tensor, csa2_state: CSA2State | None
+    ) -> None:
+        """Restore a norm output before any of its independent consumers runs backward."""
+        hook_tensors = (attention_output,)
+        if csa2_state is not None:
+            # Shared outputs can receive a gradient before the local attention
+            # output, or without it. This applies to both Hybrid and GPT layers.
+            hook_tensors += tuple(
+                tensor
+                for tensor in (csa2_state.global_kv, csa2_state.indexer_k)
+                if tensor is not None
+            )
+        self.input_layernorm_checkpoint.discard_output_and_register_recompute(hook_tensors)
+
     def _forward_self_attention_output_with_bias(
         self,
         hidden_states: Tensor,
@@ -695,9 +710,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         nvtx_range_pop(suffix="self_attention")
 
         if checkpoint_input_layernorm:
-            self.input_layernorm_checkpoint.discard_output_and_register_recompute(
-                attention_output_with_bias[0]
-            )
+            self._discard_input_layernorm_checkpoint(attention_output_with_bias[0], csa2_state)
 
         return attention_output_with_bias, attn_norm_manager, residual
 
@@ -2402,9 +2415,7 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         nvtx_range_pop(suffix="self_attention")
 
         if checkpoint_input_layernorm:
-            self.input_layernorm_checkpoint.discard_output_and_register_recompute(
-                attention_output_with_bias[0]
-            )
+            self._discard_input_layernorm_checkpoint(attention_output_with_bias[0], csa2_state)
 
         nvtx_range_push(suffix="self_attention_fused_h_res_h_post_bda")
         with self.bias_dropout_add_exec_handler():

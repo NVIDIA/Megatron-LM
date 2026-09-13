@@ -4471,182 +4471,9 @@ class TransformerConfig(ModelParallelConfig):
         if self.mhc_single_pass:
             self._validate_mhc_single_pass()
 
-    def _validate_mhc_single_pass(self) -> None:
-        """Validate the forward-local single-pass implementation independently of model version."""
-        if not self.enable_hyper_connections:
-            raise ValueError("mhc_single_pass requires enable_hyper_connections=True")
-        if self.recompute_granularity is not None:
-            if not (
-                self.experimental_attention_variant == "dsv4_hybrid"
-                and self.dsv4_version == "v4.1"
-                and self.recompute_granularity == "selective"
-                and "mhc" in self.recompute_modules
-                and set(self.recompute_modules) <= {"mhc", "layernorm", "mla_up_proj"}
-            ):
-                raise ValueError(
-                    "mhc_single_pass activation recomputation requires V4.1 Hybrid with "
-                    "recompute_granularity='selective' and 'mhc' in recompute_modules; "
-                    "optional modules are 'layernorm' and 'mla_up_proj'"
-                )
-        if self.cuda_graph_impl != "none":
-            raise ValueError("mhc_single_pass does not yet support CUDA Graphs")
-        if self.mtp_num_layers:
-            raise ValueError("mhc_single_pass does not yet support MTP")
-        if self.pipeline_model_parallel_size != 1 and not (
-            self.experimental_attention_variant == "dsv4_hybrid" and self.dsv4_version == "v4.1"
-        ):
-            raise ValueError(
-                "mhc_single_pass requires pipeline_model_parallel_size=1 outside V4.1 Hybrid"
-            )
-        for name in (
-            "tensor_model_parallel_size",
-            "context_parallel_size",
-            "expert_model_parallel_size",
-            "expert_tensor_parallel_size",
-        ):
-            if getattr(self, name) != 1:
-                raise ValueError(f"mhc_single_pass requires {name}=1")
-        if self.virtual_pipeline_model_parallel_size is not None and not (
-            self.experimental_attention_variant == "dsv4_hybrid" and self.dsv4_version == "v4.1"
-        ):
-            raise ValueError("mhc_single_pass supports VPP only with V4.1 Hybrid")
-        if self.sequence_parallel:
-            raise ValueError("mhc_single_pass does not yet support sequence parallelism")
-        if self.dynamic_context_parallel:
-            raise ValueError("mhc_single_pass does not yet support dynamic CP")
-        for name in ("num_residual_streams", "mhc_sinkhorn_iterations"):
-            value = getattr(self, name)
-            if type(value) is not int or value < 1:
-                raise ValueError(f"mhc_single_pass requires positive integer {name}")
-        for name in ("mhc_epsilon", "layernorm_epsilon"):
-            value = getattr(self, name)
-            if not math.isfinite(value) or value <= 0:
-                raise ValueError(f"mhc_single_pass requires positive finite {name}")
-
-
-@dataclass
-@experimental_api
-class MLATransformerConfig(TransformerConfig):
-    """Configuration object for megatron-core Multi-Latent Attention (MLA) transformers.
-
-    The initialization function has an argument for each parameter, including those in
-    ModelParallelConfig. Included YaRN RoPE parameters that is fused in MLA.
-    """
-
-    multi_latent_attention: bool = True
-    """Whether to use Multi-Latent Attention."""
-
-    q_lora_rank: int = 512
-    """Rank of Query tensor's low rank representation."""
-
-    kv_lora_rank: int = 512
-    """Rank of Key and Value tensors' low rank representation.
-       This is not used for DSv4 Hybrid Attention and will be overridden automatically."""
-
-    attention_latent_norm_epsilon: float | None = None
-    """Epsilon for the primary query and key-value latent norms in attention.
-       If unset, inherit ``layernorm_epsilon`` for backward compatibility."""
-
-    qk_head_dim: int = 128
-    """Dimension of the head in the QK projection. q_head_dim = qk_head_dim + qk_pos_emb_head_dim
-       This is not used for DSv4 Hybrid Attention and will be overridden automatically."""
-
-    qk_pos_emb_head_dim: int = 64
-    """Dimension of the position embedding in the QK projection."""
-
-    v_head_dim: int = 128
-    """Dimension of the head in the V projection."""
-
-    normalization: str = "RMSNorm"
-    """Default normalization layer for MLA models is RMSNorm."""
-
-    rope_type: str = "yarn"
-    """Type of RoPE to use. Default to yarn, options are rope and yarn."""
-
-    rotary_base: float = 10000
-    """Rotary base for the rotary embeddings, used by rope and yarn."""
-
-    rotary_percent: float = 1.0
-    """Rotary percent for the rotary embeddings, used by rope."""
-
-    rotary_scaling_factor: float = 40
-    """Rotary scaling factor for the rotary embeddings, used by yarn."""
-
-    original_max_position_embeddings: int = 4096
-    """Original maximum position embeddings for the original model, used by yarn."""
-
-    beta_fast: float = 32
-    """Beta fast for YaRN RoPE, used by yarn."""
-
-    beta_slow: float = 1
-    """Beta slow for YaRN RoPE, used by yarn."""
-
-    mscale: float = 1.0
-    """Mscale for YaRN RoPE in Multi-Latent Attention, used by yarn."""
-
-    mscale_all_dim: float = 0.0
-    """Mscale all dimensions for YaRN RoPE in Multi-Latent Attention, used by yarn."""
-
-    o_groups: int = 8
-    """Number of groups for grouped low-rank output projection (wo_a)."""
-
-    o_lora_rank: int = 1024
-    """Low-rank dimension per group for grouped output (wo_a). Used when o_groups > 0."""
-
-    cache_mla_latents: bool = False
-    """Cache the low dimensional tensors for MLA rather than full KV cache.
-       This is only for the dynamic inference backend and requires that 
-       Flash MLA is installed."""
-
-    mla_down_proj_fusion: bool = False
-    """Enable fused q/kv down-projection and fused input layernorm when backend supports.
-       Otherwise fall back to the unfused MLA.
-    """
-
-    def __post_init__(self):
-        super().__post_init__()
-        if self.attention_latent_norm_epsilon is None:
-            self.attention_latent_norm_epsilon = self.layernorm_epsilon
-
-        if self.attention_output_gate and self.mla_down_proj_fusion:
-            # Fused MLA hides the post-input-LayerNorm activation inside the fused
-            # LayerNorm+linear module. Gated MLA must consume that activation as the
-            # gate input; using raw hidden_states would silently change the model.
-            # Keep this combination fail-fast until the fused API exposes the
-            # normalized activation.
-            raise ValueError(
-                "MLA output gating does not support fused down projections; "
-                "disable mla_down_proj_fusion to use the unfused path."
-            )
-
-        # DSv4 hybrid: derive qk_head_dim and kv_lora_rank from v_head_dim and qk_pos_emb_head_dim
-        if self.experimental_attention_variant == "dsv4_hybrid":
-            assert (
-                not self.mla_down_proj_fusion
-            ), "MLA down projection fusion must be disabled for DSv4 hybrid mode."
-            log_single_rank(
-                logger,
-                logging.WARNING,
-                f"DSv4 hybrid mode is enabled, deriving qk_head_dim and kv_lora_rank from "
-                f"v_head_dim and qk_pos_emb_head_dim",
-            )
-            derived = self.v_head_dim - self.qk_pos_emb_head_dim
-            self.qk_head_dim = derived
-            self.kv_lora_rank = derived
-
-        if self.cache_mla_latents:
-            assert (
-                self.apply_rope_fusion is False
-            ), "Rope Fusion is not compatible with caching latents"
-
     def _validate_dsv41_config(self) -> None:
         """Validate V4.1 training relationships and supported kernels on the DSv4 path."""
-        for name in (
-            "tensor_model_parallel_size",
-            "context_parallel_size",
-            "expert_model_parallel_size",
-            "expert_tensor_parallel_size",
-        ):
+        for name in ("tensor_model_parallel_size", "context_parallel_size"):
             if getattr(self, name) != 1:
                 raise ValueError(f"Native V4.1 currently requires {name}=1")
         if self.sequence_parallel:
@@ -4661,23 +4488,21 @@ class MLATransformerConfig(TransformerConfig):
         if self.dynamic_context_parallel:
             raise ValueError("Native V4.1 does not yet support dynamic CP")
         if self.recompute_granularity is not None and not (
-            self.mhc_single_pass
-            and self.recompute_granularity == "selective"
-            and "mhc" in self.recompute_modules
-            and set(self.recompute_modules) <= {"mhc", "layernorm", "mla_up_proj"}
+            self.recompute_granularity == "selective"
+            and ("mhc" not in self.recompute_modules or self.mhc_single_pass)
+            and set(self.recompute_modules)
+            <= {"mhc", "layernorm", "mla_up_proj", "moe_act", "moe", "shared_experts"}
         ):
             raise ValueError(
-                "V4.1 activation recomputation currently requires single-pass mHC with "
-                "recompute_granularity='selective' and 'mhc' in recompute_modules; "
-                "optional modules are 'layernorm' and 'mla_up_proj'. "
+                "V4.1 activation recomputation requires recompute_granularity='selective'; "
+                "supported modules are 'mhc', 'layernorm', 'mla_up_proj', 'moe_act', "
+                "'moe', and 'shared_experts'. The 'mhc' module requires single-pass Hybrid. "
                 "Full-layer and CSA2 core-attention replay are not supported"
             )
         if self.mtp_num_layers:
             raise ValueError("V4.1 backbone configuration must not include MTP/DSpark layers")
         if self.fp16 or self.params_dtype not in (torch.float32, torch.bfloat16):
             raise ValueError("Native V4.1 requires FP32 or BF16 parameters")
-        if self.fp8 or self.fp4 or self.quant_recipe is not None:
-            raise ValueError("Native V4.1 does not yet support quantization")
         if self.dsa_indexer_precision not in ("bf16", "mxfp8"):
             raise ValueError("V4.1 indexer precision must be 'bf16' or 'mxfp8'")
         if self.dsa_indexer_precision == "mxfp8" and (
@@ -4818,3 +4643,166 @@ class MLATransformerConfig(TransformerConfig):
                 raise ValueError(f"CSA2 layer {layer} has no preceding Full layer")
             elif ratio != source_ratio:
                 raise ValueError(f"CSA2 layer {layer} must use its KV source's compression ratio")
+
+    def _validate_mhc_single_pass(self) -> None:
+        """Validate the forward-local single-pass implementation independently of model version."""
+        if not self.enable_hyper_connections:
+            raise ValueError("mhc_single_pass requires enable_hyper_connections=True")
+        if self.recompute_granularity is not None:
+            if not (
+                self.experimental_attention_variant == "dsv4_hybrid"
+                and self.dsv4_version == "v4.1"
+                and self.recompute_granularity == "selective"
+                and set(self.recompute_modules)
+                <= {"mhc", "layernorm", "mla_up_proj", "moe_act", "moe", "shared_experts"}
+            ):
+                raise ValueError(
+                    "mhc_single_pass activation recomputation requires V4.1 Hybrid with "
+                    "recompute_granularity='selective'; supported modules are 'mhc', "
+                    "'layernorm', 'mla_up_proj', 'moe_act', 'moe', and 'shared_experts'"
+                )
+        if self.cuda_graph_impl != "none":
+            raise ValueError("mhc_single_pass does not yet support CUDA Graphs")
+        if self.mtp_num_layers:
+            raise ValueError("mhc_single_pass does not yet support MTP")
+        if self.pipeline_model_parallel_size != 1 and not (
+            self.experimental_attention_variant == "dsv4_hybrid" and self.dsv4_version == "v4.1"
+        ):
+            raise ValueError(
+                "mhc_single_pass requires pipeline_model_parallel_size=1 outside V4.1 Hybrid"
+            )
+        for name in ("tensor_model_parallel_size", "context_parallel_size"):
+            if getattr(self, name) != 1:
+                raise ValueError(f"mhc_single_pass requires {name}=1")
+        if self.virtual_pipeline_model_parallel_size is not None and not (
+            self.experimental_attention_variant == "dsv4_hybrid" and self.dsv4_version == "v4.1"
+        ):
+            raise ValueError("mhc_single_pass supports VPP only with V4.1 Hybrid")
+        if self.sequence_parallel:
+            raise ValueError("mhc_single_pass does not yet support sequence parallelism")
+        if self.dynamic_context_parallel:
+            raise ValueError("mhc_single_pass does not yet support dynamic CP")
+        for name in ("num_residual_streams", "mhc_sinkhorn_iterations"):
+            value = getattr(self, name)
+            if type(value) is not int or value < 1:
+                raise ValueError(f"mhc_single_pass requires positive integer {name}")
+        for name in ("mhc_epsilon", "layernorm_epsilon"):
+            value = getattr(self, name)
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(f"mhc_single_pass requires positive finite {name}")
+
+
+@dataclass
+@experimental_api
+class MLATransformerConfig(TransformerConfig):
+    """Configuration object for megatron-core Multi-Latent Attention (MLA) transformers.
+
+    The initialization function has an argument for each parameter, including those in
+    ModelParallelConfig. Included YaRN RoPE parameters that is fused in MLA.
+    """
+
+    multi_latent_attention: bool = True
+    """Whether to use Multi-Latent Attention."""
+
+    q_lora_rank: int = 512
+    """Rank of Query tensor's low rank representation."""
+
+    kv_lora_rank: int = 512
+    """Rank of Key and Value tensors' low rank representation.
+       This is not used for DSv4 Hybrid Attention and will be overridden automatically."""
+
+    attention_latent_norm_epsilon: float | None = None
+    """Epsilon for the primary query and key-value latent norms in attention.
+       If unset, inherit ``layernorm_epsilon`` for backward compatibility."""
+
+    qk_head_dim: int = 128
+    """Dimension of the head in the QK projection. q_head_dim = qk_head_dim + qk_pos_emb_head_dim
+       This is not used for DSv4 Hybrid Attention and will be overridden automatically."""
+
+    qk_pos_emb_head_dim: int = 64
+    """Dimension of the position embedding in the QK projection."""
+
+    v_head_dim: int = 128
+    """Dimension of the head in the V projection."""
+
+    normalization: str = "RMSNorm"
+    """Default normalization layer for MLA models is RMSNorm."""
+
+    rope_type: str = "yarn"
+    """Type of RoPE to use. Default to yarn, options are rope and yarn."""
+
+    rotary_base: float = 10000
+    """Rotary base for the rotary embeddings, used by rope and yarn."""
+
+    rotary_percent: float = 1.0
+    """Rotary percent for the rotary embeddings, used by rope."""
+
+    rotary_scaling_factor: float = 40
+    """Rotary scaling factor for the rotary embeddings, used by yarn."""
+
+    original_max_position_embeddings: int = 4096
+    """Original maximum position embeddings for the original model, used by yarn."""
+
+    beta_fast: float = 32
+    """Beta fast for YaRN RoPE, used by yarn."""
+
+    beta_slow: float = 1
+    """Beta slow for YaRN RoPE, used by yarn."""
+
+    mscale: float = 1.0
+    """Mscale for YaRN RoPE in Multi-Latent Attention, used by yarn."""
+
+    mscale_all_dim: float = 0.0
+    """Mscale all dimensions for YaRN RoPE in Multi-Latent Attention, used by yarn."""
+
+    o_groups: int = 8
+    """Number of groups for grouped low-rank output projection (wo_a)."""
+
+    o_lora_rank: int = 1024
+    """Low-rank dimension per group for grouped output (wo_a). Used when o_groups > 0."""
+
+    cache_mla_latents: bool = False
+    """Cache the low dimensional tensors for MLA rather than full KV cache.
+       This is only for the dynamic inference backend and requires that
+       Flash MLA is installed."""
+
+    mla_down_proj_fusion: bool = False
+    """Enable fused q/kv down-projection and fused input layernorm when backend supports.
+       Otherwise fall back to the unfused MLA.
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+        if self.attention_latent_norm_epsilon is None:
+            self.attention_latent_norm_epsilon = self.layernorm_epsilon
+
+        if self.attention_output_gate and self.mla_down_proj_fusion:
+            # Fused MLA hides the post-input-LayerNorm activation inside the fused
+            # LayerNorm+linear module. Gated MLA must consume that activation as the
+            # gate input; using raw hidden_states would silently change the model.
+            # Keep this combination fail-fast until the fused API exposes the
+            # normalized activation.
+            raise ValueError(
+                "MLA output gating does not support fused down projections; "
+                "disable mla_down_proj_fusion to use the unfused path."
+            )
+
+        # DSv4 hybrid: derive qk_head_dim and kv_lora_rank from v_head_dim and qk_pos_emb_head_dim
+        if self.experimental_attention_variant == "dsv4_hybrid":
+            assert (
+                not self.mla_down_proj_fusion
+            ), "MLA down projection fusion must be disabled for DSv4 hybrid mode."
+            log_single_rank(
+                logger,
+                logging.WARNING,
+                f"DSv4 hybrid mode is enabled, deriving qk_head_dim and kv_lora_rank from "
+                f"v_head_dim and qk_pos_emb_head_dim",
+            )
+            derived = self.v_head_dim - self.qk_pos_emb_head_dim
+            self.qk_head_dim = derived
+            self.kv_lora_rank = derived
+
+        if self.cache_mla_latents:
+            assert (
+                self.apply_rope_fusion is False
+            ), "Rope Fusion is not compatible with caching latents"

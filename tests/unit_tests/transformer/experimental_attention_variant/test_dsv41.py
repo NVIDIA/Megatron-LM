@@ -17,6 +17,7 @@ from megatron.core.models.gpt.experimental_attention_variant_module_specs import
     get_dsv4_hybrid_module_spec_for_backend,
     get_experimental_attention_variant_module_spec,
 )
+from megatron.core.quantization.utils import kitchen_quantization_recipe_config
 from megatron.core.transformer.experimental_attention_variant.csa2 import CompressedSparseAttention2
 from megatron.core.transformer.transformer_config import MLATransformerConfig, TransformerConfig
 from megatron.training.argument_utils import _resolve_dsa_kernel_backend_cli_default
@@ -138,6 +139,41 @@ def test_candidates_can_be_disabled():
         csa2_candidate_source_layer=None, csa2_candidate_topk_blocks=0, csa2_candidate_block_size=0
     )
     assert config.csa2_candidate_source_layer is None
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        {},
+        {"fp4": "e2m1"},
+        {"fp4": "e2m1", "fp4_param": True},
+        {
+            "fp4": "e2m1",
+            "fp4_recipe": "custom",
+            "fp4_quantizer_factory": "custom_quant.quantizer_factory",
+        },
+    ],
+)
+@pytest.mark.parametrize("with_quant_recipe", [False, True])
+def test_v41_accepts_existing_quantization_configuration(options, with_quant_recipe):
+    # Exercise configuration only; TE/Kitchen execution needs its own GPU coverage.
+    recipe = kitchen_quantization_recipe_config(2) if with_quant_recipe else None
+    config = _make_config(params_dtype=torch.bfloat16, quant_recipe=recipe, **options)
+    assert config.quant_recipe is recipe
+    assert all(getattr(config, name) == value for name, value in options.items())
+
+
+@pytest.mark.parametrize(
+    "options, message",
+    [
+        ({"fp4_param": True}, "fp4_param must be used together with fp4"),
+        ({"fp4": "e2m1", "fp8": "e4m3"}, "fp4 and fp8 cannot be used simultaneously"),
+        ({"fp4": "e2m1", "fp4_recipe": "custom"}, "fp4_quantizer_factory must be provided"),
+    ],
+)
+def test_v41_preserves_common_quantization_requirements(options, message):
+    with pytest.raises(ValueError, match=message):
+        _make_config(params_dtype=torch.bfloat16, **options)
 
 
 @pytest.mark.parametrize(

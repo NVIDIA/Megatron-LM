@@ -988,3 +988,14 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
         """Set the attention layer for recompute input_layernorm. Only needed for fp8/fp4."""
         set_save_original_input(self.linear_q_down_proj)
         set_save_original_input(self.linear_kv_proj)
+        if self.config.dsv4_version == "v4.1":
+            # CSA2 adds consumers of the same normalized hidden states. Keep the
+            # original input so norm recompute also saves their FP8 activation copies.
+            compressor = self.core_attention.compressor
+            if compressor is not None:
+                set_save_original_input(compressor.linear_wkv)
+                if compressor.linear_wgate is not None:
+                    set_save_original_input(compressor.linear_wgate)
+            indexer = self.core_attention.indexer
+            if indexer is not None:
+                set_save_original_input(indexer.linear_weights_proj)

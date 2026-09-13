@@ -53,7 +53,8 @@ class _Payload(PipelinePayload):
         )
 
 
-def test_joint_backward_sums_local_and_relay_contributions():
+@pytest.mark.parametrize("release", [False, True])
+def test_joint_backward_sums_local_and_relay_contributions(release):
     hidden = torch.tensor([1.0, 2.0], requires_grad=True)
     shared = torch.tensor([3.0, 4.0], requires_grad=True)
     indexer = torch.tensor([5.0, 6.0], requires_grad=True)
@@ -61,9 +62,9 @@ def test_joint_backward_sums_local_and_relay_contributions():
     incoming = _Payload((hidden, shared, indexer, indices))
     weight = torch.tensor(2.0, requires_grad=True)
     outgoing = _Payload((hidden * weight + shared.square(), shared, indexer, indices))
-    original_shapes = tuple(t.shape for t in outgoing.tensors)
-    deallocate_output_tensor(outgoing, True)
-    assert tuple(t.shape for t in outgoing.tensors) == original_shapes
+    deallocate_output_tensor(outgoing, release)
+    assert bool(outgoing.tensors) is not release
+    assert shared.shape == indexer.shape == hidden.shape == (2,)
     gradients = backward_step(
         incoming,
         outgoing,
@@ -77,6 +78,45 @@ def test_joint_backward_sums_local_and_relay_contributions():
     torch.testing.assert_close(gradients[2], torch.zeros(2))
     assert gradients[3] is None
     torch.testing.assert_close(weight.grad, torch.tensor(23.0))
+
+
+def test_payload_release_preserves_saved_views_hooks_and_empty_gradients():
+    """Only unused output ownership is dropped; local backward still owns its saved values."""
+
+    class Copy(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, tensor):
+            return tensor.clone()
+
+        @staticmethod
+        def backward(ctx, grad):
+            return grad
+
+    x = torch.tensor([1.0, 2.0, 3.0, 4.0], requires_grad=True)
+    hidden = Copy.apply(x * 2)
+    saved = x.sigmoid()
+    empty = x[:0]
+    hooks = []
+    hidden.register_hook(lambda grad: hooks.append(grad.clone()))
+    hidden_ref = weakref.ref(hidden)
+    payload = _Payload((hidden, saved.view(2, 2), empty))
+    saved_value = saved.detach().clone()
+    del hidden, saved, empty
+    payload.release_output()
+    payload.release_output()  # The schedule may retire the same output more than once.
+    gc.collect()
+    assert hidden_ref() is None
+    assert not payload.tensors
+    backward_step(
+        None,
+        payload,
+        (torch.ones(4), torch.ones(2, 2), None),
+        SimpleNamespace(timers=None, grad_scale_func=None, deallocate_pipeline_outputs=True),
+    )
+    torch.testing.assert_close(x.grad, 2 + saved_value * (1 - saved_value))
+    assert len(hooks) == 1
+    torch.testing.assert_close(hooks[0], torch.ones(4))
+    assert payload._backward_state.edges == ()
 
 
 def test_terminal_payload_backward_scales_loss_once():
@@ -356,14 +396,17 @@ def test_warmup_prefetch_defers_header_and_preserves_peer_order(
     assert all(request.wait_count == 1 for request in requests)
 
 
-def test_warmup_send_retains_header_and_all_fields_until_wait(delayed_transport):
+@pytest.mark.parametrize("release", [False, True])
+def test_warmup_send_retains_header_and_all_fields_until_wait(delayed_transport, release):
     communicator, requests, _ = delayed_transport
     communicator.config.overlap_p2p_comm_warmup_flush = True
+    communicator.config.deallocate_pipeline_outputs = release
     communicator.forward_only = True
     source = _Payload(
         (torch.ones(2, 3, requires_grad=True).t(), torch.ones(2, dtype=torch.bfloat16))
     )
     _, handles = communicator.send_forward_recv_forward(source, False, None, overlap_p2p_comm=True)
+    assert bool(source.tensors) is not release
     assert len(requests) == 3 and all(request.wait_count == 0 for request in requests)
     assert requests[0].buffer().dtype == torch.int64
     assert all(request.buffer().is_contiguous() for request in requests)
@@ -410,11 +453,13 @@ def test_retiring_send_advances_prefetched_data_before_wait(delayed_transport, m
 
 
 @pytest.mark.parametrize("warmup_flush", [False, True])
+@pytest.mark.parametrize("release", [False, True])
 def test_prepared_receive_posts_all_fields_without_waiting_for_a_header(
-    delayed_transport, monkeypatch, warmup_flush
+    delayed_transport, monkeypatch, warmup_flush, release
 ):
     communicator, requests, post = delayed_transport
     communicator.config.overlap_p2p_comm_warmup_flush = warmup_flush
+    communicator.config.deallocate_pipeline_outputs = release
     communicator.forward_only = True
     source = _Payload((torch.ones(3), torch.empty(0), torch.ones(2, dtype=torch.int64)))
     descriptor = PipelinePayloadSpec(source.tensor_specs, source.metadata)
@@ -445,6 +490,7 @@ def test_prepared_receive_posts_all_fields_without_waiting_for_a_header(
     received, handles = communicator.send_forward_recv_forward(
         source, True, None, overlap_p2p_comm=True, send_chunk_id=0, recv_chunk_id=1
     )
+    assert bool(source.tensors) is not release
     assert isinstance(received, PipelinePayload)
     assert len(requests) == 4  # Two nonempty fields in each direction; no header.
     assert all(request.wait_count == 0 for request in requests)

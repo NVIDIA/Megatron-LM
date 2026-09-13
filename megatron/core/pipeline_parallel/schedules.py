@@ -203,8 +203,7 @@ def deallocate_output_tensor(out, deallocate_pipeline_outputs=False):
         return
 
     if isinstance(out, PipelinePayload):
-        # Shared outputs can alias received leaves or tensors saved by a local
-        # consumer. Their storage is retained until this microbatch's backward.
+        out.release_output()
         return
 
     # Handle dict format (multi-module pipelines)
@@ -1244,6 +1243,8 @@ def forward_backward_pipelining_with_interleaving(
             device=first_parameter.device if first_parameter is not None else None,
             payload_plans=payload_plans,
         )
+    # Typed P2P releases payload references when posting the send; it retains the
+    # detached wire buffers itself. Do not pseudo-deallocate its terminal scalar loss.
     deallocate_pipeline_outputs = config.deallocate_pipeline_outputs and not typed_pipeline
 
     def communication_chunk_ids(**chunk_ids):
@@ -2566,6 +2567,7 @@ def forward_backward_pipelining_without_interleaving(
             device=first_parameter.device if first_parameter is not None else None,
             payload_plans=payload_plans,
         )
+    # Typed P2P owns payload release, including asynchronous send-buffer lifetimes.
     deallocate_pipeline_outputs = config.deallocate_pipeline_outputs and payload_factory is None
 
     # Needed only when gradients are finalized in M-Core

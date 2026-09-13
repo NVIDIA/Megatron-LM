@@ -275,7 +275,10 @@ def test_csa2_1f1b_matches_single_stage(
             config = _recompute_config(config, recompute_group_size)
         if recompute_modules is not None:
             config = replace(
-                config, multi_latent_attention=True, recompute_modules=recompute_modules
+                config,
+                multi_latent_attention=True,
+                recompute_granularity="selective",
+                recompute_modules=recompute_modules,
             )
         # Exercise the normal automatic binding path, rather than attaching a
         # codec/plan manually as the PP-1 local tests do.
@@ -461,15 +464,23 @@ def test_csa2_recompute_1f1b_matches_single_stage(
 
 
 @pytest.mark.parametrize("case", [_CASES[11], _CASES[12], _CASES[15]])
+@pytest.mark.parametrize("modules", [["mhc", "mla_up_proj"], ["layernorm"], ["mla_up_proj"]])
 @pytest.mark.parametrize(
     "batch_p2p,overlap,warmup_flush",
     [(False, False, False), (True, False, False), (False, True, False), (False, True, True)],
     ids=["blocking", "batched", "overlap", "warmup-flush"],
 )
 def test_csa2_mla_recompute_1f1b_matches_single_stage(
-    monkeypatch, cpu_checkpoint_rng, native_attention, case, batch_p2p, overlap, warmup_flush
+    monkeypatch,
+    cpu_checkpoint_rng,
+    native_attention,
+    case,
+    batch_p2p,
+    overlap,
+    warmup_flush,
+    modules,
 ):
-    """Exercise DSv4 QKV/RoPE checkpointing together with mHC and state transport."""
+    """Exercise independent norm/QKV recompute with shared state and early output release."""
     test_csa2_1f1b_matches_single_stage(
         monkeypatch,
         *case,
@@ -479,5 +490,5 @@ def test_csa2_mla_recompute_1f1b_matches_single_stage(
         True,
         recompute_group_size=None,
         attention=native_attention,
-        recompute_modules=["mhc", "mla_up_proj"],
+        recompute_modules=modules,
     )
