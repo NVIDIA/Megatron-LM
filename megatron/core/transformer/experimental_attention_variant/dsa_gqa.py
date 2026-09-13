@@ -1004,9 +1004,6 @@ class DSGQACoreAttention(MegatronModule):
                 loss_coeff=indexer_loss_coeff,
                 use_indexer_rope=use_indexer_rope,
                 simplified_input_norm=indexer_input_norm,
-                profile_enabled=getattr(self.config, "dsa_min_memory_profile", False),
-                profile_rank=getattr(self.config, "dsa_min_memory_profile_rank", 0),
-                profile_label=f"layer={self.layer_number}",
                 use_triton=dsa_kernel_backend == "min-memory-triton",
             )
             DSAIndexerLossLoggingHelper.save_loss_to_tracker(
@@ -1029,9 +1026,6 @@ class DSGQACoreAttention(MegatronModule):
                 use_indexer_rope=use_indexer_rope,
                 simplified_input_norm=indexer_input_norm,
                 cache_indexer_k=_dsa_caches_indexer_k(self.config),
-                profile_enabled=getattr(self.config, "dsa_min_memory_profile", False),
-                profile_rank=getattr(self.config, "dsa_min_memory_profile_rank", 0),
-                profile_label=f"layer={self.layer_number}",
                 use_triton=dsa_kernel_backend == "min-memory-triton",
             )
         if not self.training:
@@ -1062,9 +1056,6 @@ class DSGQACoreAttention(MegatronModule):
             cache_routing=_dsa_caches_routing(self.config),
             cache_indexer_k=_dsa_caches_indexer_k(self.config),
             cache_selected_scores=_dsa_caches_selected_scores(self.config),
-            profile_enabled=getattr(self.config, "dsa_min_memory_profile", False),
-            profile_rank=getattr(self.config, "dsa_min_memory_profile_rank", 0),
-            profile_label=f"layer={self.layer_number}",
             use_triton=dsa_kernel_backend == "min-memory-triton",
         )
         if sparse_fwd_dense_loss:
@@ -1077,9 +1068,6 @@ class DSGQACoreAttention(MegatronModule):
                 loss_coeff=indexer_loss_coeff,
                 use_indexer_rope=use_indexer_rope,
                 simplified_input_norm=indexer_input_norm,
-                profile_enabled=getattr(self.config, "dsa_min_memory_profile", False),
-                profile_rank=getattr(self.config, "dsa_min_memory_profile_rank", 0),
-                profile_label=f"layer={self.layer_number}",
                 use_triton=dsa_kernel_backend == "min-memory-triton",
             )
         DSAIndexerLossLoggingHelper.save_loss_to_tracker(
