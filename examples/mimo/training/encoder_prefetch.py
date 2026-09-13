@@ -403,9 +403,9 @@ class EncoderPrefetchLoader:
         if worker is not None:
             worker.join(timeout=self._worker_join_timeout_s)
             if worker.is_alive():
-                logger.warning(
-                    "encoder prefetch worker did not stop within %.2f seconds",
-                    self._worker_join_timeout_s,
+                raise RuntimeError(
+                    "encoder prefetch worker did not stop within "
+                    f"{self._worker_join_timeout_s:.2f} seconds"
                 )
         if self._debug:
             self._drain_encoder_wait_timings()

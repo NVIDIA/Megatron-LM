@@ -654,6 +654,10 @@ def _run_gpt_to_hybrid_optimizer_load(
         context_parallel_size=src_cp,
         expert_model_parallel_size=src_ep,
         expert_tensor_parallel_size=src_etp,
+        # FSDP checkpoints contain DTensors whose DeviceMesh resolves process-group
+        # names while saving and loading. Preserve those groups while the source and
+        # destination models coexist, then destroy the registry in teardown.
+        destroy_process_groups=not use_megatron_fsdp,
     )
     with TempNamedDir(tmp_path_dist_ckpt / 'gpt_hybrid_opt_interop') as ckpt_dir:
         mock_args = parse_args(ignore_unknown_args=True)
@@ -674,7 +678,6 @@ def _run_gpt_to_hybrid_optimizer_load(
             _configure_checkpoint_args(mock_args, ckpt_dir, src_parallel, moe, use_megatron_fsdp)
             mock_args.num_layers = num_gpt_layers
             save_checkpoint(10, gpt_model, gpt_optimizer, None, 0)
-            Utils.destroy_model_parallel()
 
             # Build a hybrid model + optimizer (independently seeded moments) and
             # load the GPT checkpoint, translating model and optimizer state.
@@ -684,6 +687,7 @@ def _run_gpt_to_hybrid_optimizer_load(
                 context_parallel_size=dest_cp,
                 expert_model_parallel_size=dest_ep,
                 expert_tensor_parallel_size=dest_etp,
+                destroy_process_groups=not use_megatron_fsdp,
             )
             hybrid_model, hybrid_optimizer = setup_model_and_optimizer(
                 seed=4,
@@ -782,6 +786,14 @@ class TestGPTToHybridOptimizerLoad:
 
 class TestGPTToHybridFSDPLoad:
     def teardown_method(self, method):
+        # Parameterized FSDP cases create DTensors whose DeviceMesh instances retain
+        # process-group names across the class. Reset the Megatron globals after each
+        # case without unregistering those names.
+        Utils.destroy_model_parallel(destroy_process_groups=False)
+
+    @classmethod
+    def teardown_class(cls):
+        # The final class teardown reclaims every process group retained above.
         Utils.destroy_model_parallel()
 
     @pytest.mark.internal

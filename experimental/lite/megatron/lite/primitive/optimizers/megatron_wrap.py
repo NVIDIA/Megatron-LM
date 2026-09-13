@@ -63,7 +63,13 @@ def _ensure_dist_opt_mpu_parallel_state(engine_cfg) -> None:
 def build_dist_opt_optimizer_config(
     opt, *, override_optimizer_config: dict[str, Any] | None = None
 ):
-    """Build Megatron-Core OptimizerConfig from user's OptimizerConfig (duck-typed)."""
+    """Build Megatron-Core OptimizerConfig from user's OptimizerConfig (duck-typed).
+
+    Single source of truth for Megatron Lite's Megatron-Core optimizer stack.
+
+    Works on either `runtime.contracts.config.OptimizerConfig` (real dataclass)
+    or a `SimpleNamespace` with the same field names (legacy lite path).
+    """
     from megatron.core.optimizer.optimizer_config import (
         OptimizerConfig as CoreOptimizerConfig,  # pyright: ignore[reportMissingImports]
     )
@@ -76,9 +82,6 @@ def build_dist_opt_optimizer_config(
         "weight_decay": opt.weight_decay,
         "clip_grad": opt.clip_grad,
         "use_distributed_optimizer": True,
-        # Core requires this to carry the same value as the DDP config's, which the dist_opt stack set
-        # s; the optimizer needs to know the gather is already in flight so it does not issue its own.
-        "overlap_param_gather": True,
         "bf16": True,
         "params_dtype": torch.bfloat16,
     }
@@ -101,24 +104,6 @@ def build_dist_opt_optimizer_config(
     return CoreOptimizerConfig(**args)
 
 
-def _enable_wgrad_accumulation_fusion(chunks: list[nn.Module]) -> int:
-    """Let Transformer Engine write weight gradients straight into ``main_grad``."""
-    switched = 0
-    for chunk in chunks:
-        for module in chunk.modules():
-            if not hasattr(module, "fuse_wgrad_accumulation") or module.fuse_wgrad_accumulation:
-                continue
-            weights = [
-                p
-                for name, p in module.named_parameters(recurse=False)
-                if p.requires_grad and "weight" in name
-            ]
-            if weights and all(getattr(p, "main_grad", None) is not None for p in weights):
-                module.fuse_wgrad_accumulation = True
-                switched += 1
-    return switched
-
-
 def build_dist_opt_stack(
     model_chunks: list[nn.Module],
     *,
@@ -129,7 +114,15 @@ def build_dist_opt_stack(
     proto=None,
     skip_ddp_wrap: bool = False,
 ):
-    """Wrap ML model chunks with Megatron-Core DDP and build the matching dist_opt optimizer."""
+    """Wrap ML model chunks with Megatron-Core DDP and build the matching dist_opt optimizer.
+
+    Args:
+        skip_ddp_wrap: when True, ``model_chunks`` are assumed to already be
+            Megatron-Core ``DistributedDataParallel``-wrapped; we skip our own wrapping
+            and feed them directly to the optimizer. The bucket layout
+            influences optimizer master-grad sharding, so callers that prewrap
+            chunks own the DDP config compatibility.
+    """
     from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
     from megatron.core.distributed.finalize_model_grads import finalize_model_grads
     from megatron.core.optimizer import get_megatron_optimizer
@@ -160,12 +153,7 @@ def build_dist_opt_stack(
         wrapped_chunks = list(model_chunks)
     else:
         ddp_config = DistributedDataParallelConfig(
-            # Core's DDP overlaps the gradient reduce-scatter and the parameter all-gather with compute; mcore's DSv4 configuration
-            # turns both on and hides 174 ms of NCCL per step behind the backward pass.
-            use_distributed_optimizer=True,
-            overlap_grad_reduce=True,
-            overlap_param_gather=True,
-            grad_reduce_in_fp32=True,
+            use_distributed_optimizer=True, overlap_grad_reduce=False, grad_reduce_in_fp32=True
         )
         wrapped_chunks = []
         for chunk_idx, chunk in enumerate(model_chunks):
@@ -183,10 +171,6 @@ def build_dist_opt_stack(
                     **ddp_kwargs,
                 )
             )
-
-    # DDP has now created main_grad for every trainable parameter, so the wgrad
-    # GEMMs can accumulate into it directly instead of via a per-parameter add.
-    _enable_wgrad_accumulation_fusion(wrapped_chunks)
 
     # Single-source-of-truth OptimizerConfig construction for native lite
     # model protocols.
@@ -301,7 +285,13 @@ def _build_transformer_config(model_cfg, engine_cfg):
 def _mark_dist_opt_parallel_attrs(
     model: nn.Module, is_expert_param: ExpertClassifierFn, *, tp_size: int
 ) -> None:
-    """Mark per-param optimizer metadata (allreduce / tensor_model_parallel / sequence_parallel)."""
+    """Mark per-param optimizer metadata (allreduce / tensor_model_parallel / sequence_parallel).
+
+    IMPORTANT: respect attrs that are already set. Prewrapped Megatron-Core models may
+    mark these correctly per-param (e.g. `moe.router.weight` is 2D but
+    TP-replicated, and must NOT have `tensor_model_parallel=True`). Blind
+    override would cause dist_opt grad-norm to over-count replicated params.
+    """
     sp_param_ids = {id(param) for param in getattr(model, "sp_params", [])}
     for name, param in model.named_parameters():
         # Megatron-Core uses `allreduce=False` to route expert params into expert-DP buffers.

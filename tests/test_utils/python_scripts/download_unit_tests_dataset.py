@@ -14,6 +14,11 @@ from pathlib import Path
 import click
 import requests
 
+if __package__:
+    from .archive_utils import safe_extract_tar, safe_extract_zip
+else:
+    from archive_utils import safe_extract_tar, safe_extract_zip
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -52,13 +57,13 @@ def extract_asset(asset_path: Path, assets_dir: Path) -> bool:
 
         if asset_path.name.endswith('.zip'):
             with zipfile.ZipFile(asset_path, 'r') as zip_ref:
-                zip_ref.extractall(assets_dir)
+                safe_extract_zip(zip_ref, assets_dir)
         elif asset_path.name.endswith(('.tar.gz', '.tgz')):
             with tarfile.open(asset_path, 'r:gz') as tar_ref:
-                tar_ref.extractall(assets_dir)
+                safe_extract_tar(tar_ref, assets_dir)
         elif asset_path.name.endswith('.tar'):
             with tarfile.open(asset_path, 'r') as tar_ref:
-                tar_ref.extractall(assets_dir)
+                safe_extract_tar(tar_ref, assets_dir)
         else:
             logger.warning(
                 f"  Warning: Unknown file type for {asset_path.name}, skipping extraction"
