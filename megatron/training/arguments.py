@@ -1078,10 +1078,6 @@ def validate_args(args, defaults={}):
     if getattr(args, 'dsa_indexer_mode', 'standard') == 'simplified':
         assert args.experimental_attention_variant == 'dsa', \
             '--dsa-indexer-mode simplified requires --experimental-attention-variant dsa'
-    elif getattr(args, 'dsa_simplified_use_learned_k', False):
-        raise AssertionError(
-            '--dsa-simplified-use-learned-k requires --dsa-indexer-mode simplified'
-        )
     if getattr(args, 'dsa_indexer_reset_method', 'random') != 'random':
         assert getattr(args, 'dsa_reset_indexer_on_load', False), \
             '--dsa-indexer-reset-method requires --dsa-reset-indexer-on-load'
@@ -1402,15 +1398,9 @@ def validate_args(args, defaults={}):
         assert getattr(args, 'dsa_indexer_n_heads', None) in (None, 1), (
             'simplified DSA requires --dsa-indexer-n-heads 1 when explicitly set'
         )
-        if getattr(args, 'dsa_simplified_use_learned_k', False):
-            assert getattr(args, 'dsa_indexer_head_dim', None) is None or (
-                args.dsa_indexer_head_dim > 0
-            ), '--dsa-indexer-head-dim must be positive when explicitly set'
-        else:
-            assert getattr(args, 'dsa_indexer_head_dim', None) in (None, args.kv_channels), (
-                'simplified DSA using main-attention K requires --dsa-indexer-head-dim to '
-                'equal --kv-channels when explicitly set'
-            )
+        assert getattr(args, 'dsa_indexer_head_dim', None) is None or (
+            args.dsa_indexer_head_dim > 0
+        ), '--dsa-indexer-head-dim must be positive when explicitly set'
         args.dsa_indexer_n_heads = 1
         if args.dsa_indexer_head_dim is None:
             args.dsa_indexer_head_dim = args.kv_channels
@@ -3805,16 +3795,7 @@ def _add_experimental_attention_variant_args(parser):
         choices=['standard', 'simplified'],
         help=(
             'DSA indexer formulation. simplified uses one Q index head and a plain scaled '
-            'dot-product score, with main-attention K unless '
-            '--dsa-simplified-use-learned-k is set.'
-        ),
-    )
-    _maybe_add_argument(
-        '--dsa-simplified-use-learned-k',
-        action='store_true',
-        help=(
-            'Use a separate learned K projection for simplified DSA instead of reusing the '
-            'main-attention K cache.'
+            'dot-product score against a separately learned indexer K.'
         ),
     )
     _maybe_add_argument(
