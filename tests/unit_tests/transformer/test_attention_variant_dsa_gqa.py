@@ -207,7 +207,6 @@ def test_transformer_config_accepts_min_memory_backend():
             kv_channels=8,
             experimental_attention_variant="dsa",
             dsa_indexer_mode="simplified",
-            dsa_simplified_use_learned_k=True,
             add_bias_linear=False,
             dsa_indexer_topk=4,
             dsa_kernel_backend=backend,
@@ -228,7 +227,7 @@ def test_transformer_config_accepts_min_memory_backend():
         assert config.dsa_min_memory_profile_rank == -1
 
 
-def _simplified_test_indexer(hidden_size, head_dim, topk, learned_k=False):
+def _simplified_test_indexer(hidden_size, head_dim, topk):
     indexer = SimpleNamespace(
         index_n_heads=1,
         index_head_dim=head_dim,
@@ -237,14 +236,10 @@ def _simplified_test_indexer(hidden_size, head_dim, topk, learned_k=False):
         index_rotary_dim=0,
         rotary_pos_emb=None,
         pg_collection=_DummyPGCollection(),
-        config=SimpleNamespace(
-            dsa_indexer_mode="simplified",
-            dsa_simplified_use_learned_k=learned_k,
-            rotary_interleaved=False,
-        ),
+        config=SimpleNamespace(dsa_indexer_mode="simplified", rotary_interleaved=False),
     )
     indexer.linear_q = torch.nn.Linear(hidden_size, head_dim, bias=False)
-    indexer.linear_k = torch.nn.Linear(hidden_size, head_dim, bias=False) if learned_k else None
+    indexer.linear_k = torch.nn.Linear(hidden_size, head_dim, bias=False)
     return indexer
 
 
@@ -300,7 +295,6 @@ def test_transformer_config_accepts_simplified_learned_k_with_independent_dimens
         experimental_attention_variant="dsa",
         add_bias_linear=False,
         dsa_indexer_mode="simplified",
-        dsa_simplified_use_learned_k=True,
         dsa_indexer_head_dim=6,
         dsa_indexer_topk=4,
         dsa_kernel_backend="min-memory-torch",
@@ -311,7 +305,6 @@ def test_transformer_config_accepts_simplified_learned_k_with_independent_dimens
 
     assert config.dsa_indexer_n_heads == 1
     assert config.dsa_indexer_head_dim == 6
-    assert config.dsa_simplified_use_learned_k
     assert config.dsa_kernel_cache_indexer_k
 
 
@@ -326,7 +319,6 @@ def test_simplified_main_q_reset_requires_main_attention_dimension_with_learned_
             experimental_attention_variant="dsa",
             add_bias_linear=False,
             dsa_indexer_mode="simplified",
-            dsa_simplified_use_learned_k=True,
             dsa_indexer_head_dim=6,
             dsa_indexer_topk=4,
             dsa_indexer_reset_method="main-q-mean-rescaled",
@@ -379,13 +371,13 @@ def test_simplified_indexer_accepts_internal_tp_group_rewrite(monkeypatch):
     monkeypatch.setattr(dsa_gqa, "build_module", _build_linear)
     indexer = SimplifiedDSGQAIndexer(
         config,
-        SimplifiedDSGQAIndexerSubmodules(linear_q=torch.nn.Linear),
+        SimplifiedDSGQAIndexerSubmodules(linear_q=torch.nn.Linear, linear_k=torch.nn.Linear),
         pg_collection=pg_collection,
     )
 
     assert indexer.linear_q.weight.shape == (8, 32)
-    assert indexer.linear_k is None
-    assert set(indexer.state_dict()) == {"linear_q.weight"}
+    assert indexer.linear_k.weight.shape == (8, 32)
+    assert set(indexer.state_dict()) == {"linear_q.weight", "linear_k.weight"}
     assert getattr(indexer.linear_q.weight, "average_gradients_across_tp_domain")
 
 
@@ -401,7 +393,6 @@ def test_simplified_learned_k_builds_replicated_independent_projection(monkeypat
         experimental_attention_variant="dsa",
         add_bias_linear=False,
         dsa_indexer_mode="simplified",
-        dsa_simplified_use_learned_k=True,
         dsa_indexer_head_dim=6,
         dsa_indexer_topk=4,
         dsa_kernel_backend="min-memory-torch",
@@ -481,8 +472,6 @@ def test_simplified_indexer_rope_matches_model_rotary_config(monkeypatch):
     [
         ({"num_query_groups": 2}, "num_query_groups == 1"),
         ({"dsa_indexer_n_heads": 2}, "one indexer Q head"),
-        ({"dsa_indexer_head_dim": 4}, "main attention head dimension"),
-        ({"dsa_kernel_cache_indexer_k": True}, "no separate indexer K cache"),
     ],
 )
 def test_transformer_config_rejects_incompatible_simplified_dsa_options(kwargs, message):
@@ -505,140 +494,6 @@ def test_transformer_config_rejects_incompatible_simplified_dsa_options(kwargs, 
         TransformerConfig(**config_kwargs)
 
 
-def test_simplified_dense_loss_matches_reference_and_only_grads_indexer_q():
-    torch.manual_seed(123)
-    seqlen, batch_size, hidden_size = 7, 2, 12
-    num_query_heads, head_dim = 4, 3
-    score_scale = 0.37
-    loss_coeff = 0.4
-    query = torch.randn(seqlen, batch_size, num_query_heads, head_dim)
-    key = torch.randn(seqlen, batch_size, 1, head_dim, requires_grad=True)
-    hidden_states = torch.randn(seqlen, batch_size, hidden_size, requires_grad=True)
-    indexer = _simplified_test_indexer(hidden_size, head_dim, topk=3)
-    linear_qkv = SimpleNamespace(
-        layer_norm_weight=torch.randn(hidden_size),
-        layer_norm_bias=None,
-        eps=1.0e-5,
-        skip_norm_and_all_gather=False,
-    )
-    norm_config = SimpleNamespace(
-        normalization="RMSNorm", layernorm_epsilon=1.0e-5, layernorm_zero_centered_gamma=False
-    )
-    input_norm = _simplified_indexer_norm_spec(linear_qkv, norm_config)
-    normalized_hidden = _simplified_indexer_input(hidden_states, input_norm)
-
-    q_index = indexer.linear_q(normalized_hidden).reshape(seqlen, batch_size, 1, head_dim)
-    index_scores = _simplified_index_scores(q_index, key.detach(), indexer.softmax_scale)
-    index_scores = index_scores + _causal_mask(seqlen, query.device)
-    topk_indices = index_scores.topk(indexer.index_topk, dim=-1).indices
-    reference_loss = compute_gqa_dsa_indexer_loss(
-        index_scores,
-        topk_indices,
-        query,
-        key.detach(),
-        score_scale,
-        loss_coeff,
-        False,
-        indexer.pg_collection,
-    )
-    reference_grad = torch.autograd.grad(reference_loss, indexer.linear_q.weight)[0]
-
-    dense_loss = dsa_dense_indexer_loss(
-        query.detach(),
-        key.detach(),
-        hidden_states.detach(),
-        indexer,
-        score_scale,
-        loss_coeff,
-        False,
-        query_chunk_size=3,
-        key_chunk_size=4,
-        use_triton=False,
-        simplified_input_norm=input_norm,
-    )
-    dense_grad, key_grad, hidden_grad = torch.autograd.grad(
-        dense_loss, (indexer.linear_q.weight, key, hidden_states), allow_unused=True
-    )
-
-    torch.testing.assert_close(dense_loss, reference_loss)
-    torch.testing.assert_close(dense_grad, reference_grad, atol=2e-6, rtol=2e-5)
-    assert key_grad is None
-    assert hidden_grad is None
-
-
-def test_simplified_sparse_min_memory_matches_reference_forward_loss_and_grads():
-    torch.manual_seed(456)
-    seqlen, batch_size, hidden_size = 8, 2, 12
-    num_query_heads, head_dim, topk = 4, 3, 4
-    score_scale = 0.37
-    loss_coeff = 0.3
-    query = torch.randn(seqlen, batch_size, num_query_heads, head_dim, requires_grad=True)
-    key = torch.randn(seqlen, batch_size, 1, head_dim, requires_grad=True)
-    value = torch.randn(seqlen, batch_size, 1, head_dim, requires_grad=True)
-    hidden_states = torch.randn(seqlen, batch_size, hidden_size)
-    indexer = _simplified_test_indexer(hidden_size, head_dim, topk)
-    linear_qkv = SimpleNamespace(
-        layer_norm_weight=torch.randn(hidden_size),
-        layer_norm_bias=None,
-        eps=1.0e-5,
-        skip_norm_and_all_gather=False,
-    )
-    norm_config = SimpleNamespace(
-        normalization="RMSNorm", layernorm_epsilon=1.0e-5, layernorm_zero_centered_gamma=False
-    )
-    input_norm = _simplified_indexer_norm_spec(linear_qkv, norm_config)
-    normalized_hidden = _simplified_indexer_input(hidden_states, input_norm)
-
-    q_index = indexer.linear_q(normalized_hidden).reshape(seqlen, batch_size, 1, head_dim)
-    index_scores = _simplified_index_scores(q_index, key.detach(), indexer.softmax_scale)
-    index_scores = index_scores + _causal_mask(seqlen, query.device)
-    topk_indices = index_scores.topk(topk, dim=-1).indices
-    reference_output = unfused_grouped_dsa_fn(
-        query, key, value, topk_indices, score_scale, use_gather=True
-    )
-    reference_loss = compute_gqa_dsa_indexer_loss(
-        index_scores,
-        topk_indices,
-        query.detach(),
-        key.detach(),
-        score_scale,
-        loss_coeff,
-        True,
-        indexer.pg_collection,
-    )
-    reference_grads = torch.autograd.grad(
-        reference_output.float().sum() + reference_loss,
-        (query, key, value, indexer.linear_q.weight),
-    )
-
-    min_query = query.detach().clone().requires_grad_(True)
-    min_key = key.detach().clone().requires_grad_(True)
-    min_value = value.detach().clone().requires_grad_(True)
-    min_output, min_loss = dsa_min_memory_gqa(
-        min_query,
-        min_key,
-        min_value,
-        hidden_states.detach(),
-        indexer,
-        score_scale,
-        loss_coeff,
-        False,
-        query_chunk_size=seqlen,
-        key_chunk_size=seqlen,
-        use_triton=False,
-        simplified_input_norm=input_norm,
-    )
-    min_grads = torch.autograd.grad(
-        min_output.float().sum() + min_loss,
-        (min_query, min_key, min_value, indexer.linear_q.weight),
-    )
-
-    torch.testing.assert_close(min_output, reference_output)
-    torch.testing.assert_close(min_loss, reference_loss)
-    for actual, expected in zip(min_grads, reference_grads):
-        torch.testing.assert_close(actual, expected, atol=3e-6, rtol=3e-5)
-
-
 def test_simplified_learned_k_dense_loss_matches_reference_and_is_detached():
     torch.manual_seed(789)
     seqlen, batch_size, hidden_size = 7, 2, 12
@@ -648,7 +503,7 @@ def test_simplified_learned_k_dense_loss_matches_reference_and_is_detached():
     query = torch.randn(seqlen, batch_size, num_query_heads, attention_dim)
     key = torch.randn(seqlen, batch_size, 1, attention_dim, requires_grad=True)
     hidden_states = torch.randn(seqlen, batch_size, hidden_size, requires_grad=True)
-    indexer = _simplified_test_indexer(hidden_size, index_dim, topk=3, learned_k=True)
+    indexer = _simplified_test_indexer(hidden_size, index_dim, topk=3)
 
     detached_hidden = hidden_states.detach()
     q_index = indexer.linear_q(detached_hidden).reshape(seqlen, batch_size, 1, index_dim)
@@ -705,7 +560,7 @@ def test_simplified_learned_k_sparse_min_memory_matches_reference():
     key = torch.randn(seqlen, batch_size, 1, attention_dim, requires_grad=True)
     value = torch.randn(seqlen, batch_size, 1, attention_dim, requires_grad=True)
     hidden_states = torch.randn(seqlen, batch_size, hidden_size, requires_grad=True)
-    indexer = _simplified_test_indexer(hidden_size, index_dim, topk, learned_k=True)
+    indexer = _simplified_test_indexer(hidden_size, index_dim, topk)
 
     q_index = indexer.linear_q(hidden_states.detach()).reshape(seqlen, batch_size, 1, index_dim)
     k_index = indexer.linear_k(hidden_states.detach()).reshape(seqlen, batch_size, 1, index_dim)
@@ -1070,7 +925,6 @@ def test_transformer_config_optional_kernel_caches_require_min_memory_backend(ca
             kv_channels=8,
             experimental_attention_variant="dsa",
             dsa_indexer_mode="simplified",
-            dsa_simplified_use_learned_k=True,
             add_bias_linear=False,
             dsa_indexer_topk=4,
             dsa_kernel_backend="reference",
