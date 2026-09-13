@@ -86,11 +86,11 @@ class BalancedCPScheduler:
             # Check if we should close this bucket
             if cur and (
                 projected > target * 1.1  # Too much work
-                or len(sample_seqlens) - i <= remaining_k - len(buckets)
+                or len(sample_seqlens) - i <= remaining_k - 1
             ):  # Need to save sequences for remaining buckets
                 buckets.append(deque(cur))
+                remaining_work -= cur_work
                 cur, cur_work = [], 0.0
-                remaining_work -= sum(compute_estimator(seq_len) for _, seq_len in cur)
                 remaining_k -= 1
 
             cur.append((sample_id, seq_len))
