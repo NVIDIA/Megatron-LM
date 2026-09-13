@@ -164,6 +164,26 @@ class TestShardingStrategyResolution:
         assert get_sharding_strategy(config, is_expert_param=False) == strategy
         assert get_sharding_strategy(config, is_expert_param=True) == strategy
 
+    @pytest.mark.parametrize("outer_strategy", ["no_shard", "optim"])
+    @pytest.mark.parametrize("expert_strategy", [None, "no_shard", "optim"])
+    def test_expert_outer_strategy_is_resolved_at_initialization(self, outer_strategy, expert_strategy):
+        config = MCoreDDPConfig(
+            outer_dp_sharding_strategy=outer_strategy,
+            expert_outer_dp_sharding_strategy=expert_strategy,
+        )
+        expected = outer_strategy if expert_strategy is None else expert_strategy
+        assert config.expert_outer_dp_sharding_strategy == expected
+
+    @pytest.mark.parametrize("strategy", ["zero_3", "optim_grads", "optim_grads_params"])
+    def test_invalid_expert_outer_strategy_is_rejected(self, strategy):
+        with pytest.raises(ValueError, match="expert_outer_dp_sharding_strategy must be one of"):
+            MCoreDDPConfig(expert_outer_dp_sharding_strategy=strategy)
+
+    @pytest.mark.parametrize("strategy", ["optim_grads", "optim_grads_params"])
+    def test_invalid_inherited_expert_outer_strategy_is_rejected(self, strategy):
+        with pytest.raises(ValueError, match="expert_outer_dp_sharding_strategy must be one of"):
+            MCoreDDPConfig(outer_dp_sharding_strategy=strategy)
+
     def test_strategies_in_use_reports_every_configured_strategy(self):
         uniform = self.make_config(OPTIM_GRADS)
         assert get_sharding_strategies_in_use(uniform) == (OPTIM_GRADS,)
