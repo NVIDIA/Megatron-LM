@@ -145,20 +145,54 @@ def _simplified_indexer_uses_main_input_norm(config: TransformerConfig) -> bool:
     return getattr(config, "dsa_indexer_mode", "standard") == "simplified"
 
 
+def _dsa_recomputes(config, module: str) -> bool:
+    """Whether the shared activation-recompute policy asks for ``module`` to be recomputed."""
+    if getattr(config, "recompute_granularity", None) != "selective":
+        return False
+    return module in (getattr(config, "recompute_modules", None) or ())
+
+
 def _dsa_caches_routing(config) -> bool:
     """Whether the min-memory DSA kernels save the forward routing top-k for the backward pass.
 
-    Saving the route is the default. It is given up through the shared activation-recompute
-    policy: list ``dsa_simple_routing`` in ``recompute_modules`` under selective recomputation
-    to recompute the top-k in the backward pass instead, trading backward compute for roughly
+    Saving the route is the default; list ``dsa_simple_routing`` in ``recompute_modules`` to
+    recompute it in the backward pass instead, trading backward compute for roughly
     O(batch * seq_len * dsa_indexer_topk) of index storage.
     """
     if getattr(config, "dsa_fwd_use_dense_attn", False):
         # Dense indexer warmup bypasses routing altogether, so there is nothing to save.
         return False
-    if getattr(config, "recompute_granularity", None) == "selective":
-        return "dsa_simple_routing" not in (getattr(config, "recompute_modules", None) or ())
-    return True
+    return not _dsa_recomputes(config, "dsa_simple_routing")
+
+
+def _dsa_caches_indexer_k(config) -> bool:
+    """Whether the min-memory DSA kernels save the full projected indexer K.
+
+    Saving it is the default; list ``dsa_indexer_k`` in ``recompute_modules`` to reproject in
+    the backward pass instead, trading backward compute for roughly
+    O(batch * seq_len * dsa_indexer_head_dim) of storage.
+    """
+    if getattr(config, "dsa_fwd_use_dense_attn", False):
+        # Dense indexer warmup reprojects a dense indexer K of its own.
+        return False
+    return not _dsa_recomputes(config, "dsa_indexer_k")
+
+
+def _dsa_caches_selected_scores(config) -> bool:
+    """Whether the min-memory DSA kernels save the selected indexer logits.
+
+    Only the sparse KL objective consumes them, so the cache follows the objective first and
+    the recompute policy second: it is unavailable without ``dsa_indexer_use_sparse_loss``,
+    and ``dsa_selected_scores`` in ``recompute_modules`` recomputes them in the backward pass
+    rather than saving roughly O(batch * seq_len * dsa_indexer_topk) of logits.
+    """
+    if getattr(config, "dsa_fwd_use_dense_attn", False):
+        # Dense indexer warmup scores densely and selects nothing.
+        return False
+    if not getattr(config, "dsa_indexer_use_sparse_loss", False):
+        # Sparse-forward dense-loss mode never materializes selected scores.
+        return False
+    return not _dsa_recomputes(config, "dsa_selected_scores")
 
 
 def _split_topk_padding(topk_indices):
@@ -901,18 +935,6 @@ class DSGQACoreAttention(MegatronModule):
                 "dsa_fwd_use_dense_attn uses dense indexer loss; do not set "
                 "dsa_indexer_use_sparse_loss."
             )
-        if dense_warmup and (
-            getattr(self.config, "dsa_kernel_cache_indexer_k", False)
-            or getattr(self.config, "dsa_kernel_cache_selected_scores", False)
-        ):
-            raise NotImplementedError("dsa_fwd_use_dense_attn does not support DSA cache flags.")
-        if sparse_fwd_dense_loss and getattr(
-            self.config, "dsa_kernel_cache_selected_scores", False
-        ):
-            raise NotImplementedError(
-                "Sparse-forward dense-loss mode has no selected-score sparse loss; do not set "
-                "dsa_kernel_cache_selected_scores."
-            )
         if not simplified_indexer and not getattr(
             self.config, "dsa_indexer_rotate_activation", True
         ):
@@ -1006,7 +1028,7 @@ class DSGQACoreAttention(MegatronModule):
                 softmax_scale=self.softmax_scale,
                 use_indexer_rope=use_indexer_rope,
                 simplified_input_norm=indexer_input_norm,
-                cache_indexer_k=getattr(self.config, "dsa_kernel_cache_indexer_k", False),
+                cache_indexer_k=_dsa_caches_indexer_k(self.config),
                 profile_enabled=getattr(self.config, "dsa_min_memory_profile", False),
                 profile_rank=getattr(self.config, "dsa_min_memory_profile_rank", 0),
                 profile_label=f"layer={self.layer_number}",
@@ -1038,8 +1060,8 @@ class DSGQACoreAttention(MegatronModule):
             use_indexer_rope=use_indexer_rope,
             simplified_input_norm=indexer_input_norm,
             cache_routing=_dsa_caches_routing(self.config),
-            cache_indexer_k=getattr(self.config, "dsa_kernel_cache_indexer_k", False),
-            cache_selected_scores=getattr(self.config, "dsa_kernel_cache_selected_scores", False),
+            cache_indexer_k=_dsa_caches_indexer_k(self.config),
+            cache_selected_scores=_dsa_caches_selected_scores(self.config),
             profile_enabled=getattr(self.config, "dsa_min_memory_profile", False),
             profile_rank=getattr(self.config, "dsa_min_memory_profile_rank", 0),
             profile_label=f"layer={self.layer_number}",
