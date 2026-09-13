@@ -222,6 +222,7 @@ def test_csa2_1f1b_matches_single_stage(
     recompute_group_size=0,
     attention=_Attention,
     recompute_modules=None,
+    full_recompute=None,
 ):
     if overlap and vp_size == 1:
         pytest.skip("P2P overlap requires VPP")
@@ -243,7 +244,7 @@ def test_csa2_1f1b_matches_single_stage(
             "megatron.core.pipeline_parallel.typed_p2p_communication._unpack_header", no_header
         )
     with _pipeline_groups(pp_size) as (groups, device):
-        _record_losses(monkeypatch)
+        auxiliary_losses = _record_losses(monkeypatch)
         torch.manual_seed(719)
         reference_groups = copy.copy(groups)
         reference_groups.pp = groups.tp
@@ -280,6 +281,14 @@ def test_csa2_1f1b_matches_single_stage(
                 recompute_granularity="selective",
                 recompute_modules=recompute_modules,
             )
+        if full_recompute is not None:
+            method, num_layers = full_recompute
+            config = replace(
+                config,
+                recompute_granularity="full",
+                recompute_method=method,
+                recompute_num_layers=num_layers,
+            )
         # Exercise the normal automatic binding path, rather than attaching a
         # codec/plan manually as the PP-1 local tests do.
         pattern = _pattern(cuts)
@@ -291,6 +300,8 @@ def test_csa2_1f1b_matches_single_stage(
                 overlap_p2p_comm=False,
                 overlap_p2p_comm_warmup_flush=False,
                 recompute_granularity=None,
+                recompute_method=None,
+                recompute_num_layers=None,
             ),
             reference_groups,
             "DE" * 6,
@@ -330,6 +341,7 @@ def test_csa2_1f1b_matches_single_stage(
             dict(atol=3e-6, rtol=5e-5) if dtype == torch.float32 else dict(atol=2e-3, rtol=5e-2)
         )
         for _ in range(2):  # Communication and activation state must not survive a step.
+            auxiliary_losses.clear()
             expected = []
             reference_optimizer.zero_grad(set_to_none=True)
             DSAIndexerLossAutoScaler.set_loss_scale(torch.tensor([1.0 / count], device=device))
@@ -340,6 +352,9 @@ def test_csa2_1f1b_matches_single_stage(
                     expected.append(loss.detach().clone())
                     if not forward_only:
                         (loss / count).backward()
+
+            reference_auxiliary_losses = list(auxiliary_losses)
+            auxiliary_losses.clear()
 
             actual, references = [], []
 
@@ -407,6 +422,42 @@ def test_csa2_1f1b_matches_single_stage(
                 )
             gc.collect()
             assert all(ref() is None for ref in references)
+            if full_recompute is not None:
+                # A checkpoint must reproduce the auxiliary gradient without logging
+                # the forward loss again. Compare only this rank's virtual chunks.
+                local_layers = {
+                    chunk.layer_offset + index + 1
+                    for chunk in chunks
+                    for index in range(len(chunk.layer_pattern))
+                }
+                expected_auxiliary_losses = [
+                    record
+                    for record in reference_auxiliary_losses
+                    if record["layer_number"] in local_layers
+                ]
+                assert sorted(record["layer_number"] for record in auxiliary_losses) == sorted(
+                    record["layer_number"] for record in expected_auxiliary_losses
+                )
+                for layer_number in {record["layer_number"] for record in auxiliary_losses}:
+                    observed = torch.stack(
+                        [
+                            record["loss"]
+                            for record in auxiliary_losses
+                            if record["layer_number"] == layer_number
+                        ]
+                    )
+                    expected_auxiliary = torch.stack(
+                        [
+                            record["loss"]
+                            for record in expected_auxiliary_losses
+                            if record["layer_number"] == layer_number
+                        ]
+                    )
+                    torch.testing.assert_close(
+                        observed.sort(dim=0).values,
+                        expected_auxiliary.sort(dim=0).values,
+                        **tolerance,
+                    )
             if models[-1].post_process:
                 torch.testing.assert_close(torch.stack(actual), torch.stack(expected), **tolerance)
             if not forward_only:
@@ -491,4 +542,24 @@ def test_csa2_mla_recompute_1f1b_matches_single_stage(
         recompute_group_size=None,
         attention=native_attention,
         recompute_modules=modules,
+    )
+
+
+@pytest.mark.parametrize(
+    "case,method,num_layers,overlap,warmup_flush",
+    [
+        pytest.param(_CASES[0], "uniform", 3, False, False, id="pp2-sbhd-uniform"),
+        pytest.param(_CASES[5], "block", 2, False, False, id="pp2-thd-bf16-block"),
+        pytest.param(_CASES[11], "uniform", 3, True, False, id="pp2-vpp2-thd-uniform-overlap"),
+        pytest.param(_CASES[11], "block", 1, True, True, id="pp2-vpp2-thd-block-warmup-flush"),
+        pytest.param(_CASES[15], "uniform", 2, True, False, id="pp4-vpp2-thd-uniform-overlap"),
+        pytest.param(_CASES[15], "block", 1, False, False, id="pp4-vpp2-thd-block"),
+    ],
+)
+def test_csa2_full_recompute_1f1b_matches_single_stage(
+    monkeypatch, cpu_checkpoint_rng, case, method, num_layers, overlap, warmup_flush
+):
+    """Full replay preserves THD/shared-state gradients, auxiliary logs and optimizer steps."""
+    test_csa2_1f1b_matches_single_stage(
+        monkeypatch, *case, False, overlap, warmup_flush, True, full_recompute=(method, num_layers)
     )

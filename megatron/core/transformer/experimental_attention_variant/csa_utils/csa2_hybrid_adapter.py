@@ -2,11 +2,15 @@
 
 """DSv4.1 state lifecycle and logical pipeline boundaries for HybridStack."""
 
-from typing import Any
+from dataclasses import replace
+from typing import Any, Callable, ContextManager
 
 from torch import Tensor
 from torch.distributed import ProcessGroup
+from torch.nn import ModuleList
 
+from megatron.core import tensor_parallel
+from megatron.core.extensions.transformer_engine import te_checkpoint
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.models.hybrid.hybrid_stack_adapter import HybridStackForwardContext
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -23,6 +27,7 @@ from megatron.core.transformer.experimental_attention_variant.csa_utils.csa2_pip
 from megatron.core.transformer.experimental_attention_variant.dsa_kernels import (
     use_fused_dsa_kernels,
 )
+from megatron.core.transformer.hyper_connection import SinglePassMHCState
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 
 
@@ -223,3 +228,110 @@ class CSA2HybridAdapter:
         """Guard shared KV backward even when it arrives before the hidden-state gradient."""
         state = context.layer_kwargs["csa2_state"]
         return tuple(tensor for tensor in (state.global_kv, state.indexer_k) if tensor is not None)
+
+    def _export_recompute_context(
+        self, context: HybridStackForwardContext
+    ) -> tuple[tuple[Tensor | None, ...], tuple[CSA2State, bool]]:
+        """Checkpoint canonical floating state; retain only layout/index metadata.
+
+        Derived flat K tensors must be rebuilt from checkpoint arguments so
+        replay cannot reuse views created by the original no-grad forward.
+        Integer selection/layout tensors are immutable within this forward.
+        """
+        state = context.layer_kwargs["csa2_state"]
+        mhc_state = context.mhc_state
+        tensors = (
+            None if mhc_state is None else mhc_state.pre_mix,
+            state.global_kv,
+            state.indexer_k,
+        )
+        metadata = replace(
+            state, global_kv=None, indexer_k=None, global_kv_flat=None, indexer_k_flat=None
+        )
+        return tensors, (metadata, mhc_state is not None)
+
+    def _restore_recompute_context(
+        self, tensors: tuple[Tensor | None, ...], metadata: tuple[CSA2State, bool]
+    ) -> HybridStackForwardContext:
+        """Restore a fresh state for a checkpoint invocation or its returned boundary."""
+        pre_mix, global_kv, indexer_k = tensors
+        state_metadata, has_mhc_state = metadata
+        state = replace(state_metadata, global_kv=global_kv, indexer_k=indexer_k)
+        if use_fused_dsa_kernels(self.config):
+            state.prepare_fused_kv()
+        return HybridStackForwardContext(
+            layer_kwargs={"csa2_state": state},
+            mhc_state=SinglePassMHCState(pre_mix) if has_mhc_state else None,
+        )
+
+    def checkpointed_forward(
+        self,
+        layers: ModuleList,
+        hidden_states: Tensor,
+        context: HybridStackForwardContext,
+        *,
+        tp_group: ProcessGroup,
+        quantization_context: Callable[[MLATransformerConfig, int], ContextManager],
+        **layer_kwargs: Any,
+    ) -> Tensor:
+        """Run local full-recompute groups with explicit CSA2/mHC tensor boundaries.
+
+        Routing/position metadata in ``layer_kwargs`` is immutable for this
+        microbatch. Each checkpoint invocation gets independent working state;
+        only its returned floating tensors can reach the next group or PP export.
+        """
+
+        def group_forward(start, end, metadata):
+            output_metadata = [None]
+
+            def forward(hidden, *state_tensors):
+                working = self._restore_recompute_context(state_tensors, metadata)
+                kwargs = {**layer_kwargs, **working.layer_kwargs}
+                if working.mhc_state is not None:
+                    kwargs["mhc_state"] = working.mhc_state
+                for index in range(start, end):
+                    layer = layers[index]
+                    with quantization_context(self.config, layer.layer_number - 1):
+                        output = layer(hidden_states=hidden, **kwargs)
+                    hidden = output[0] if isinstance(output, tuple) else output
+                tensors, output_metadata[0] = self._export_recompute_context(working)
+                return hidden, *tensors
+
+            return forward, output_metadata
+
+        uniform = self.config.recompute_method == "uniform"
+        count = self.config.recompute_num_layers
+        group_size = count if uniform else 1
+        remaining = count
+        for start in range(0, len(layers), group_size):
+            state_inputs, metadata = self._export_recompute_context(context)
+            args = (hidden_states, *state_inputs)
+            forward, output_metadata = group_forward(
+                start, min(start + group_size, len(layers)), metadata
+            )
+            # Reentrant checkpointing needs a differentiable input. Frozen
+            # groups run normally; block mode counts only eligible groups.
+            use_checkpoint = (uniform or remaining > 0) and any(
+                tensor is not None and tensor.requires_grad for tensor in args
+            )
+            if use_checkpoint:
+                if self.config.fp8 or self.config.fp4 or self.config.quant_recipe is not None:
+                    outputs = te_checkpoint(
+                        forward,
+                        self.config.distribute_saved_activations,
+                        tensor_parallel.random.get_cuda_rng_tracker,
+                        tp_group,
+                        *args,
+                    )
+                else:
+                    outputs = tensor_parallel.checkpoint(
+                        forward, self.config.distribute_saved_activations, *args
+                    )
+                remaining -= 1
+            else:
+                outputs = forward(*args)
+            hidden_states, *state_outputs = outputs
+            restored = self._restore_recompute_context(tuple(state_outputs), output_metadata[0])
+            context.layer_kwargs = restored.layer_kwargs
+            context.mhc_state = restored.mhc_state
+        return hidden_states

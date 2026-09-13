@@ -141,6 +141,50 @@ def test_candidates_can_be_disabled():
     assert config.csa2_candidate_source_layer is None
 
 
+@pytest.mark.parametrize("method", ["uniform", "block"])
+@pytest.mark.parametrize("enable_mhc,single_pass", [(False, False), (True, False), (True, True)])
+def test_v41_full_recompute_accepts_residual_modes(method, enable_mhc, single_pass):
+    config = _make_config(
+        enable_hyper_connections=enable_mhc,
+        mhc_single_pass=single_pass,
+        recompute_granularity="full",
+        recompute_method=method,
+        recompute_num_layers=2,
+    )
+    assert config.recompute_granularity == "full"
+    assert config.recompute_method == method
+    assert config.recompute_num_layers == 2
+
+
+@pytest.mark.parametrize(
+    "overrides,message",
+    [
+        ({"recompute_method": None}, "recompute_method must be"),
+        ({"recompute_method": "invalid"}, "recompute_method: invalid"),
+        ({"recompute_num_layers": None}, "recompute_num_layers must be between"),
+    ],
+)
+def test_v41_full_recompute_preserves_common_requirements(overrides, message):
+    options = dict(recompute_granularity="full", recompute_method="uniform", recompute_num_layers=2)
+    options.update(overrides)
+    with pytest.raises(ValueError, match=message):
+        _make_config(**options)
+
+
+@pytest.mark.parametrize("method", ["uniform", "block"])
+@pytest.mark.parametrize("num_layers", [0, -1, 1.5, True])
+def test_v41_full_recompute_requires_positive_integer_chunk_size(method, num_layers):
+    with pytest.raises(ValueError, match="positive integer recompute_num_layers"):
+        _make_config(
+            recompute_granularity="full", recompute_method=method, recompute_num_layers=num_layers
+        )
+
+
+def test_v41_full_recompute_does_not_enable_core_attention_selective_recompute():
+    with pytest.raises(ValueError, match="CSA2 core-attention selective replay is not supported"):
+        _make_config(recompute_granularity="selective", recompute_modules=["core_attn"])
+
+
 @pytest.mark.parametrize(
     "options",
     [
