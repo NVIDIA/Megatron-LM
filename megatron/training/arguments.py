@@ -3828,22 +3828,6 @@ def _add_experimental_attention_variant_args(parser):
         help='Global rank that prints DSA min-memory timings. Set to -1 to print on every rank.',
     )
     _maybe_add_argument(
-        '--dsa-kernel-cache-indexer-k',
-        action='store_true',
-        help=(
-            'Save full-sequence projected DSA indexer K for min-memory backend speed. '
-            'This adds O(sequence * batch * indexer_head_dim) activation memory.'
-        ),
-    )
-    _maybe_add_argument(
-        '--dsa-kernel-cache-selected-scores',
-        action='store_true',
-        help=(
-            'Save selected DSA indexer scores for min-memory backend backward speed. '
-            'This adds O(batch * sequence * topk) activation memory, stored by query tile.'
-        ),
-    )
-    _maybe_add_argument(
         '--dsa-fwd-use-dense-attn',
         action='store_true',
         help=(
