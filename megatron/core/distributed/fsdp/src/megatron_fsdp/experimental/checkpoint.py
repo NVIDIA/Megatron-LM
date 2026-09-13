@@ -21,11 +21,8 @@ on the same device mesh. The standard DCP state-dict helpers
 :func:`~torch.distributed.checkpoint.state_dict.get_optimizer_state_dict`) expose those as FQN-keyed
 DTensors and initialize the (empty) optimizer state on load, so we do not reimplement that here.
 
-The one Megatron-FSDP-specific step is :func:`preprocess_state_dict_for_uneven_dtensor`. A
-``FsdpParameterGroup`` packs several parameters into one flat buffer with least-common-multiple row
-padding, so a parameter's per-rank shard does not tile like torch's canonical ``Shard(0)`` (a rank
-may own several rows of one parameter and none of the next). The helper attaches each DTensor's true
-per-shard chunk offsets so DCP writes and reshards it correctly; without it the default planner
+The one Megatron-FSDP-specific step is :func:`attach_uneven_dtensor_metadata`, which describes each
+parameter's true position inside its packed parameter-group buffer. Without it the default planner
 assumes canonical ``Shard(0)`` offsets and silently corrupts the checkpoint.
 """
 
@@ -40,8 +37,8 @@ from torch.distributed.checkpoint.state_dict import (
     set_optimizer_state_dict,
 )
 
-from ..uneven_dtensor import preprocess_state_dict_for_uneven_dtensor
 from .parameter_group import sync_model_weights_from_main_weights
+from .uneven_dtensor import attach_uneven_dtensor_metadata
 
 __all__ = ["save_checkpoint", "load_checkpoint"]
 
@@ -83,8 +80,7 @@ def save_checkpoint(
     """
     model_state_dict = get_model_state_dict(model)
     optimizer_state_dict = get_optimizer_state_dict(model, optimizer)
-    preprocess_state_dict_for_uneven_dtensor(model_state_dict)
-    preprocess_state_dict_for_uneven_dtensor(optimizer_state_dict)
+    attach_uneven_dtensor_metadata(model, model_state_dict, optimizer_state_dict)
     dcp.save(
         {"model": model_state_dict, "optimizer": optimizer_state_dict}, checkpoint_id=checkpoint_dir
     )
@@ -114,8 +110,7 @@ def load_checkpoint(
     _init_optimizer_state(optimizer)
     model_state_dict = get_model_state_dict(model)
     optimizer_state_dict = get_optimizer_state_dict(model, optimizer)
-    preprocess_state_dict_for_uneven_dtensor(model_state_dict)
-    preprocess_state_dict_for_uneven_dtensor(optimizer_state_dict)
+    attach_uneven_dtensor_metadata(model, model_state_dict, optimizer_state_dict)
     dcp.load(
         {"model": model_state_dict, "optimizer": optimizer_state_dict}, checkpoint_id=checkpoint_dir
     )
