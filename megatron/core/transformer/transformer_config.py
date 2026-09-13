@@ -352,12 +352,6 @@ class TransformerConfig(ModelParallelConfig):
     dsa_min_memory_profile_rank: int = 0
     """Global rank that prints DSA min-memory timings. Set to -1 to print on every rank."""
 
-    dsa_kernel_cache_indexer_k: bool = False
-    """Whether DSA kernel backends may save full-sequence projected indexer K for speed."""
-
-    dsa_kernel_cache_selected_scores: bool = False
-    """Whether DSA kernel backends may save selected indexer scores for speed."""
-
     dsa_fwd_use_dense_attn: bool = False
     """Whether DSA min-memory backends use dense GQA attention forward for indexer warmup."""
 
@@ -644,7 +638,7 @@ class TransformerConfig(ModelParallelConfig):
     """The submodules to recompute.
     choices: "core_attn", "moe_act", "layernorm", "mla_up_proj", "mlp", "moe",
     "shared_experts", "gdn_norm_out", "gdp_in_proj", "gdp_qkv", "mhc",
-    "dsa_simple_routing".
+    "dsa_simple_routing", "dsa_indexer_k", "dsa_selected_scores".
     default: ["core_attn"].
     "core_attn": recompute the core attention part of the transformer layer.
     "moe_act": recompute the MoE MLP activation function.
@@ -664,6 +658,13 @@ class TransformerConfig(ModelParallelConfig):
             instead of saving the forward indices, trading backward compute for roughly
             O(batch * seq_len * dsa_indexer_topk) of index storage. Applies only to the
             min-memory DSA backends, which are the only ones that can save the routing.
+    "dsa_indexer_k": reproject the full DSA indexer K in the backward pass instead of saving
+            it, trading backward compute for roughly
+            O(batch * seq_len * dsa_indexer_head_dim) of storage.
+    "dsa_selected_scores": recompute the selected DSA indexer logits in the backward pass
+            instead of saving roughly O(batch * seq_len * dsa_indexer_topk) of them. Only the
+            sparse KL objective materializes these, so this has no effect without
+            dsa_indexer_use_sparse_loss.
     "moe_act", "layernorm", "mla_up_proj", "gdn_norm_out", "gdp_in_proj", "gdp_qkv", and
     "mhc" use output-discarding checkpointing, "core_attn", "mlp", "moe", and
     "shared_experts" use normal checkpointing.
@@ -2208,6 +2209,8 @@ class TransformerConfig(ModelParallelConfig):
                     "gdp_qkv",
                     "mhc",
                     "dsa_simple_routing",
+                    "dsa_indexer_k",
+                    "dsa_selected_scores",
                 }
                 invalid_modules = set(self.recompute_modules) - allowed_modules
                 assert not invalid_modules, (
@@ -3546,20 +3549,9 @@ class TransformerConfig(ModelParallelConfig):
                 'min-memory-torch',
             )
             dense_dsa_warmup = self.dsa_fwd_use_dense_attn
-            sparse_fwd_dense_loss = (
-                min_memory_dsa_backend
-                and not dense_dsa_warmup
-                and not self.dsa_indexer_use_sparse_loss
-            )
             assert (
                 self.dsa_min_memory_profile_rank >= -1
             ), "dsa_min_memory_profile_rank must be -1 or a non-negative global rank."
-            assert (
-                not self.dsa_kernel_cache_indexer_k or min_memory_dsa_backend
-            ), "dsa_kernel_cache_indexer_k requires a min-memory dsa_kernel_backend."
-            assert not self.dsa_kernel_cache_selected_scores or min_memory_dsa_backend, (
-                "dsa_kernel_cache_selected_scores requires " "a min-memory dsa_kernel_backend."
-            )
             assert (
                 not dense_dsa_warmup or min_memory_dsa_backend
             ), "dsa_fwd_use_dense_attn requires a min-memory dsa_kernel_backend."
@@ -3609,23 +3601,10 @@ class TransformerConfig(ModelParallelConfig):
                     assert (
                         self.dsa_indexer_loss_coeff or 0.0
                     ) > 0.0, "dsa_fwd_use_dense_attn requires dsa_indexer_loss_coeff > 0."
-                    assert not self.dsa_kernel_cache_indexer_k, (
-                        "dsa_fwd_use_dense_attn recomputes dense indexer K; do not set "
-                        "dsa_kernel_cache_indexer_k."
-                    )
-                    assert not self.dsa_kernel_cache_selected_scores, (
-                        "dsa_fwd_use_dense_attn has no selected scores; do not set "
-                        "dsa_kernel_cache_selected_scores."
-                    )
                 else:
                     assert (
                         self.dsa_indexer_loss_coeff or 0.0
                     ) > 0.0, "min-memory dsa_kernel_backend requires dsa_indexer_loss_coeff > 0."
-                    if sparse_fwd_dense_loss:
-                        assert not self.dsa_kernel_cache_selected_scores, (
-                            "Sparse-forward dense-loss mode has no selected scores; do not set "
-                            "dsa_kernel_cache_selected_scores."
-                        )
                 assert simplified_indexer or self.dsa_indexer_rotate_activation, (
                     "min-memory dsa_kernel_backend requires dsa_indexer_rotate_activation for "
                     "the standard DeepSeek indexer."
