@@ -346,12 +346,6 @@ class TransformerConfig(ModelParallelConfig):
 
     dsa_indexer_skip_topk_offset: int = 0
     """Layer offset for DSA cross-layer top-k sharing."""
-    dsa_min_memory_profile: bool = False
-    """Whether to print per-layer DSA min-memory forward/backward timing breakdowns."""
-
-    dsa_min_memory_profile_rank: int = 0
-    """Global rank that prints DSA min-memory timings. Set to -1 to print on every rank."""
-
     dsa_fwd_use_dense_attn: bool = False
     """Whether DSA min-memory backends use dense GQA attention forward for indexer warmup."""
 
@@ -3549,9 +3543,6 @@ class TransformerConfig(ModelParallelConfig):
                 'min-memory-torch',
             )
             dense_dsa_warmup = self.dsa_fwd_use_dense_attn
-            assert (
-                self.dsa_min_memory_profile_rank >= -1
-            ), "dsa_min_memory_profile_rank must be -1 or a non-negative global rank."
             assert (
                 not dense_dsa_warmup or min_memory_dsa_backend
             ), "dsa_fwd_use_dense_attn requires a min-memory dsa_kernel_backend."
