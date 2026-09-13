@@ -323,6 +323,10 @@ class DynamicInferenceEngine(AbstractEngine):
     # the += in resume() still rebinds onto the instance.
     _weight_epoch: int = 0
 
+    # Same rationale: engines built without __init__ lack the construction-time
+    # module snapshot; the refresh falls back to a live traversal when None.
+    _inference_grouped_mlp_modules: Optional[List["InferenceGroupedMLP"]] = None
+
     @deprecate_args(
         *DEPRECATED_ARGS,
         message="Argument `{name}` has been deprecated. Only pass `controller` and `context`",
@@ -1257,8 +1261,14 @@ class DynamicInferenceEngine(AbstractEngine):
 
         Iterates the snapshot taken at construction: this runs on the coordinator
         thread, where traversing the live module tree races caller-side mutation.
+        Engines built without __init__ (tests) have no snapshot and take the
+        traversal path.
         """
-        for module in self._inference_grouped_mlp_modules:
+        modules = self._inference_grouped_mlp_modules
+        if modules is None:
+            model = unwrap_model(self.controller.inference_wrapped_model.model)
+            modules = [m for m in model.modules() if isinstance(m, InferenceGroupedMLP)]
+        for module in modules:
             module.refresh_inference_weights()
 
     def resume(self):
