@@ -1045,7 +1045,11 @@ def validate_args(args, defaults={}):
                 ), 'Number of layers should be divisible by the pipeline-model-parallel size'
 
     if args.virtual_pipeline_model_parallel_size is not None:
-        if args.overlap_p2p_comm:
+        # V4.1 Hybrid uses typed P2P, which orders multiple fields sharing the
+        # same peer under PP=2. Keep the older restriction for tensor transport.
+        if args.overlap_p2p_comm or (
+            args.hybrid_layer_pattern is not None and args.dsv4_version == 'v4.1'
+        ):
             assert args.pipeline_model_parallel_size > 1, (
                 'When interleaved schedule is used, pipeline-model-parallel size '
                 'should be greater than 1'
