@@ -303,6 +303,11 @@ def _normalize_dsv4_hybrid_csa_compress_ratios(args, kw_args, pattern):
     if variant != 'dsv4_hybrid':
         return
 
+    dsv4_version = kw_args.get('dsv4_version', getattr(args, 'dsv4_version', 'v4'))
+    if dsv4_version == 'v4.1':
+        _normalize_dsv41_csa_compress_ratios(args, kw_args, pattern)
+        return
+
     fixed_ratio_map = {Symbols.WINDOW: 0, Symbols.CSA: 4, Symbols.HCA: 128}
     ratio_symbols = set(fixed_ratio_map)
     sections = pattern.split(Symbols.MTP_SEPARATOR)
@@ -367,6 +372,60 @@ def _normalize_dsv4_hybrid_csa_compress_ratios(args, kw_args, pattern):
             )
 
 
+def _normalize_dsv41_csa_compress_ratios(args, kw_args, pattern):
+    """DeepSeek-V4.1: compact ratios are per model layer (one per W/D attention symbol).
+
+    The CLI form lists one ratio per attention symbol (``W`` must carry 0, ``D`` a positive
+    ratio); ``TransformerConfig`` receives the pattern-position form with 0 at MoE
+    positions. A pattern-position list is accepted as well.
+    """
+    from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
+
+    attention_symbols = {Symbols.WINDOW, Symbols.DS_ATTENTION}
+    sections = pattern.split(Symbols.MTP_SEPARATOR)
+    layers = ''.join(section.replace(Symbols.PIPE, '') for section in sections)
+    compact_len = sum(symbol in attention_symbols for symbol in layers)
+    full_len = len(layers)
+
+    provided = getattr(args, 'csa_compress_ratios', None)
+    assert (
+        provided is not None
+    ), "dsv4_version='v4.1' requires --csa-compress-ratios (one entry per model layer)"
+    provided = list(provided)
+
+    def expand(compact):
+        full = []
+        compact_iter = iter(compact)
+        for symbol in layers:
+            if symbol in attention_symbols:
+                ratio = next(compact_iter)
+                if symbol == Symbols.WINDOW:
+                    assert ratio == 0, f"window symbol 'W' requires compress ratio 0, got {ratio}"
+                else:
+                    assert ratio > 0, f"symbol 'D' requires a positive compress ratio, got {ratio}"
+                full.append(ratio)
+            else:
+                full.append(0)
+        return full
+
+    if len(provided) == compact_len:
+        args.csa_compress_ratios = provided
+        kw_args['csa_compress_ratios'] = expand(provided)
+    elif len(provided) == full_len:
+        compact = [r for r, symbol in zip(provided, layers) if symbol in attention_symbols]
+        assert (
+            expand(compact) == provided
+        ), "pattern-position csa_compress_ratios must carry 0 at non-attention positions"
+        args.csa_compress_ratios = compact
+        kw_args['csa_compress_ratios'] = provided
+    else:
+        raise AssertionError(
+            f"csa_compress_ratios length ({len(provided)}) must equal the number of W/D "
+            f"attention symbols ({compact_len}) or the number of all pattern symbols "
+            f"({full_len}) for pattern '{pattern}'."
+        )
+
+
 def _resolve_dsa_kernel_backend_cli_default(args, kw_args):
     """Resolve an omitted --dsa-kernel-backend flag to its effective backend.
 
@@ -381,7 +440,11 @@ def _resolve_dsa_kernel_backend_cli_default(args, kw_args):
     if 'dsa_kernel_backend' not in kw_args or kw_args['dsa_kernel_backend'] is not None:
         return
     variant = kw_args.get('experimental_attention_variant') or kw_args.get('linear_attention_type')
-    if variant == 'dsv4_hybrid' and getattr(args, 'apply_dsa_kernel_fusion', None) is None:
+    dsv4_version = kw_args.get('dsv4_version', getattr(args, 'dsv4_version', 'v4'))
+    if dsv4_version == 'v4.1':
+        # CSA2 runs its own reference path in this phase; the V4 cuDNN kernels do not apply.
+        kw_args['dsa_kernel_backend'] = 'none'
+    elif variant == 'dsv4_hybrid' and getattr(args, 'apply_dsa_kernel_fusion', None) is None:
         kw_args['dsa_kernel_backend'] = 'cudnn'
     else:
         kw_args['dsa_kernel_backend'] = 'none'

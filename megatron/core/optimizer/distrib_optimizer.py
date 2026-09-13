@@ -1022,6 +1022,12 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         # inner optimizer below — but the next step runs at the wrong LR / WD. Adding the
         # distinguishing field to ``param_group_identifier_keys`` is the fix. See
         # ``test_filter_reorder_distinguishes_groups_by_max_lr``.
+        if "optimizer" not in state_dict:
+            raise KeyError(
+                "optimizer: the loaded DistributedOptimizer state dict has no inner optimizer "
+                f"entry; keys present: {sorted(map(str, state_dict.keys()))}; "
+                f"types: {[type(v).__name__ for v in state_dict.values()]}"
+            )
         param_groups_map = {}
         for param_group in state_dict["optimizer"]["param_groups"]:
             needed_groups = make_needed_groups(param_group)
@@ -1108,7 +1114,28 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
         # Optimizer.
         optimizer_state_dict = {"state": state_dict_state, "param_groups": state_dict_param_groups}
-        if self._optimizer_state_offloader is None:
+        if (
+            self._optimizer_state_offloader is None
+            and self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8
+            and self.init_state_fn is not None
+        ):
+            # Precision-aware TE FusedAdam: torch's Optimizer.load_state_dict() casts every
+            # state tensor to the parameter dtype and TE then re-creates it through
+            # set_scaled_state(state.float()), so a full second copy of the optimizer state
+            # (plus fp32 transients) is alive during the call. At 128K on GB300 that exceeded
+            # the device memory while resuming (274 GB allocated in
+            # load_state_dict, both on the first call from sharded_state_dict(is_loading=True)
+            # and on the second from load_checkpoint). Allocate the state once in the
+            # configured dtypes (if not there yet), take only the per-group scalars (lr, step,
+            # ...) from the checkpoint and keep the tensors: load_parameter_state*() writes
+            # the checkpoint values into them in place.
+            del state_dict_state
+            optimizer_state_dict = None
+            if len(self.optimizer.state) == 0:
+                self.init_state_fn(self.optimizer, self.config)
+            for group, saved_group in zip(self.optimizer.param_groups, state_dict_param_groups):
+                group.update({k: v for k, v in saved_group.items() if k != "params"})
+        elif self._optimizer_state_offloader is None:
             self.optimizer.load_state_dict(optimizer_state_dict)
         else:
             # The distributed checkpoint path has already allocated selected tensor
@@ -3200,6 +3227,53 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         # When using precision-aware optimizer, main params are held by self.optimizer. It will also
         # do the work of copying data from main params to model params.
         if self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
+            # The optimizer-owned master weights were initialised from the model parameters at
+            # construction time. After a checkpoint load without optimizer state (--finetune /
+            # --no-load-optim) they still hold the random initialisation, and the first step would
+            # write it back over the loaded weights (DeepSeek-V4.1 128K runs: loss 0.99 -> 7.9 after
+            # one step at lr 1e-12; tiny checkpoint diff showed every trainable tensor reset).
+            # Refresh them from the (loaded) model parameters. The optimizer parameters are views
+            # into the model parameters taken at construction time; re-point them if the storage
+            # changed, and rewrite any master weight the optimizer already materialised.
+            counts = {"params": 0, "realiased": 0, "with_state": 0, "master_refreshed": 0}
+            state_keys = set()
+            for model_groups, shard_groups in (
+                (self.model_float16_groups, self.shard_float16_groups),
+                (self.model_fp32_groups, self.shard_fp32_groups),
+            ):
+                for model_group, shard_group in zip(model_groups, shard_groups):
+                    for model_param, shard_param in zip(model_group, shard_group):
+                        if shard_param is None:
+                            continue
+                        counts["params"] += 1
+                        param_range = self._get_model_param_range_map(model_param)["param"]
+                        src = model_param.detach().view(-1)[param_range.start : param_range.end]
+                        if src.data_ptr() != shard_param.data_ptr():
+                            shard_param.data = src
+                            counts["realiased"] += 1
+                        state = self.optimizer.state.get(shard_param)
+                        if not state:
+                            continue
+                        counts["with_state"] += 1
+                        state_keys.update(state.keys())
+                        if "master_param" not in state:
+                            continue
+                        if (
+                            getattr(self.optimizer, "store_param_remainders", False)
+                            and shard_param.dtype == torch.bfloat16
+                        ):
+                            # Remainder bits: a zero remainder means master == bf16 parameter.
+                            state["master_param"].zero_()
+                        else:
+                            self.optimizer.set_scaled_state(
+                                shard_param, "master_param", shard_param.detach().clone().float()
+                            )
+                        counts["master_refreshed"] += 1
+            if torch.distributed.get_rank() == 0:
+                print(
+                    "> precision-aware optimizer reload_model_params: "
+                    f"{counts} state keys {sorted(state_keys)}"
+                )
             return
 
         if state_dict is not None:

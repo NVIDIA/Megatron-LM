@@ -409,6 +409,7 @@ def core_gpt_dataset_config_from_args(args: Any) -> GPTDatasetConfig:
         defer_npy_index_mmap=args.dataloader_defer_npy_index_mmap,
         varlen_mock_dataset_config_json=args.varlen_mock_dataset_config_json,
         varlen_sbhd_validation=args.varlen_sbhd_validation,
+        varlen_bins_as_samples=getattr(args, "varlen_bins_as_samples", False),
         context_parallel_size=args.context_parallel_size,
         data_parallel_size=args.data_parallel_size,
         sequence_parallel_size=args.tensor_model_parallel_size * args.sequence_parallel,

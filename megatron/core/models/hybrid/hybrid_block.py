@@ -951,7 +951,7 @@ class HybridStack(MegatronModule):
             if self.is_mtp_layer and self.mtp_layer_number is not None:
                 self._set_mtp_layer_number_for_moe_metrics(layer, self.mtp_layer_number)
             if self.config.enable_hyper_connections:
-                layer = HyperConnectionHybridLayer(config=self.config, layer=layer)
+                layer = self._wrap_hyper_connection_layer(layer, layer_number)
             self.layers.append(layer)
 
         if self.config.cuda_graph_impl == "local":
@@ -973,16 +973,67 @@ class HybridStack(MegatronModule):
         # params would be orphaned and break DDP's per-param grad-ready accounting
         # with a `len(per_param_grad_ready_counts) != len(params)` AssertionError.
         if self.config.enable_hyper_connections and self.post_process and not self.is_mtp_layer:
-            hc_mult = self.config.num_residual_streams
-            hc_dim = self.config.hidden_size * hc_mult
-            self.hc_head_fn = mark_keep_in_fp32(nn.Parameter(torch.randn(hc_mult, hc_dim)))
-            self.hc_head_base = mark_keep_in_fp32(nn.Parameter(torch.zeros(hc_mult)))
-            self.hc_head_scale = mark_keep_in_fp32(nn.Parameter(torch.ones(1)))
-            nn.init.xavier_uniform_(self.hc_head_fn)
-            if self.config.sequence_parallel:
-                setattr(self.hc_head_fn, 'sequence_parallel', True)
-                setattr(self.hc_head_base, 'sequence_parallel', True)
-                setattr(self.hc_head_scale, 'sequence_parallel', True)
+            self._build_output_contract_params()
+
+    # ---- Extension points for model-specific hybrid stacks (e.g. DeepSeek-V4.1) ----------
+
+    def _wrap_hyper_connection_layer(self, layer: MegatronModule, layer_number: int):
+        """Wrap a freshly built layer for mHC. Subclasses may return a different wrapper."""
+        return HyperConnectionHybridLayer(config=self.config, layer=layer)
+
+    def _build_output_contract_params(self) -> None:
+        """Create the learned n-stream -> 1-stream output contraction parameters."""
+        hc_mult = self.config.num_residual_streams
+        hc_dim = self.config.hidden_size * hc_mult
+        self.hc_head_fn = mark_keep_in_fp32(nn.Parameter(torch.randn(hc_mult, hc_dim)))
+        self.hc_head_base = mark_keep_in_fp32(nn.Parameter(torch.zeros(hc_mult)))
+        self.hc_head_scale = mark_keep_in_fp32(nn.Parameter(torch.ones(1)))
+        nn.init.xavier_uniform_(self.hc_head_fn)
+        if self.config.sequence_parallel:
+            setattr(self.hc_head_fn, 'sequence_parallel', True)
+            setattr(self.hc_head_base, 'sequence_parallel', True)
+            setattr(self.hc_head_scale, 'sequence_parallel', True)
+
+    def _contract_output_streams(self, hidden_states: Tensor) -> Tensor:
+        """Contract the n-stream mHC state to one stream before the final norm."""
+        return learned_output_contract(
+            hidden_states,
+            self.hc_head_fn,
+            self.hc_head_base,
+            self.hc_head_scale,
+            self.config.num_residual_streams,
+            self.config.layernorm_epsilon,
+        )
+
+    def _extra_layer_kwargs(self) -> dict:
+        """Per-forward keyword arguments handed to layers with ``accepts_extra_layer_kwargs``
+        on the eager (non-recompute) path."""
+        return {}
+
+    def _checkpointed_forward(
+        self,
+        hidden_states: Tensor,
+        attention_mask: Tensor,
+        rotary_pos_emb,
+        packed_seq_params: Optional[PackedSeqParams],
+        padding_mask,
+        input_ids: Optional[Tensor],
+        use_inner_quantization_context: bool,
+    ) -> Tensor:
+        """Full-recompute forward. Subclasses with cross-layer state override this."""
+        return checkpointed_forward(
+            self,
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            context=None,
+            context_mask=None,
+            rotary_pos_emb=rotary_pos_emb,
+            attention_bias=None,
+            packed_seq_params=packed_seq_params,
+            padding_mask=padding_mask,
+            input_ids=input_ids,
+            use_inner_quantization_context=use_inner_quantization_context,
+        )
 
     def _fuse_mla_down_proj(self, submodules: HybridStackSubmodules) -> HybridStackSubmodules:
         # Avoid modifying the original object so users don't get surprised about their `submodules`
@@ -1197,16 +1248,14 @@ class HybridStack(MegatronModule):
             use_mhc_recompute
         )
 
+        extra_layer_kwargs = self._extra_layer_kwargs()
+
         with outer_fp8_context:
             if self.config.recompute_granularity == 'full' and self.training:
-                hidden_states = checkpointed_forward(
-                    self,
+                hidden_states = self._checkpointed_forward(
                     hidden_states=hidden_states,
                     attention_mask=attention_mask,
-                    context=None,
-                    context_mask=None,
                     rotary_pos_emb=rotary_pos_emb,
-                    attention_bias=None,
                     packed_seq_params=packed_seq_params,
                     padding_mask=padding_mask,
                     input_ids=input_ids,
@@ -1247,6 +1296,10 @@ class HybridStack(MegatronModule):
                                 layer, HyperConnectionHybridLayer
                             ):
                                 layer_kwargs["mhc_recompute_manager"] = mhc_manager
+                            if extra_layer_kwargs and getattr(
+                                layer, "accepts_extra_layer_kwargs", False
+                            ):
+                                layer_kwargs.update(extra_layer_kwargs)
                             hidden_states, _ = layer(**layer_kwargs)
                         else:  # MambaLayer, Expert, or MLP
                             hidden_states = layer(
@@ -1287,14 +1340,7 @@ class HybridStack(MegatronModule):
         if self.config.enable_hyper_connections and self.post_process and not self.is_mtp_layer:
             if (self.config.mtp_num_layers or 0) > 0:
                 mhc_multistream = hidden_states
-            hidden_states = learned_output_contract(
-                hidden_states,
-                self.hc_head_fn,
-                self.hc_head_base,
-                self.hc_head_scale,
-                self.config.num_residual_streams,
-                self.config.layernorm_epsilon,
-            )
+            hidden_states = self._contract_output_streams(hidden_states)
 
         # Final layer norm.
         if self.post_process and self.post_layer_norm:

@@ -608,6 +608,78 @@ def _dsv4_hybrid_self_attention_flops(
     return token_linear, core
 
 
+def _dsv41_self_attention_flops(args):
+    """Per-iteration DeepSeek-V4.1 (CSA2) self-attention FLOPs coefficients.
+
+    Same contract as ``_dsv4_hybrid_self_attention_flops``: returns ``(token_linear, core)``
+    WITHOUT the fwd+bwd (x3) and FMA (x2) factors; multiply ``token_linear`` by the real token
+    count and ``core`` by ``sum_i(L_i ** 2)``.
+
+    V4.1 differs from V4 in what runs where (``args.csa_compress_ratios`` holds one ratio per
+    model layer):
+      * every layer: MLA projections and window attention over ``csa_window_size`` keys;
+      * ratio > 0 layers: attention over the ``dsa_indexer_topk`` selected compressed entries
+        (a fixed count per token, not an L^2 term);
+      * KV source layers (``csa2_kv_source_layers``): the compressor (wkv + wgate);
+      * index source layers (``csa2_index_source_layers``): indexer query / head-weight
+        projections, index keys over the compressed axis, and the scoring. The candidate
+        source layer scores every causal compressed entry (L^2 term); later index sources
+        score only the candidate set (``csa2_candidate_topk_blocks * csa2_candidate_block_size``
+        entries per token). Reuse layers add nothing beyond the attention itself.
+    Engram lookups and the mHC mixes are memory-bound and omitted.
+    """
+    ratios = list(args.csa_compress_ratios or [])
+    n_layers = len(ratios)
+    h = args.hidden_size
+    heads = args.num_attention_heads
+    dv = args.v_head_dim
+    q_lora = args.q_lora_rank
+    o_groups = args.o_groups
+    o_lora = args.o_lora_rank
+    window = args.csa_window_size
+    seq_len = args.seq_length
+    topk = args.dsa_indexer_topk
+
+    q_term = q_lora * (h + heads * dv + 1)
+    kv_term = h * dv + dv
+    o_term = heads * dv * o_lora + o_groups * o_lora * h
+    mla_proj_term = (q_term + kv_term + o_term) * n_layers
+
+    attn_term = 0.0
+    for ratio in ratios:
+        keys = window
+        if ratio > 0:
+            keys += min(topk, seq_len // ratio)
+        attn_term += heads * keys * dv * 2  # QK^T and PV
+
+    kv_sources = list(getattr(args, "csa2_kv_source_layers", None) or [])
+    compressor_term = len(kv_sources) * h * dv * 2  # wkv + wgate
+
+    index_sources = list(getattr(args, "csa2_index_source_layers", None) or [])
+    n_i = args.dsa_indexer_n_heads
+    d_i = args.dsa_indexer_head_dim
+    candidate_layer = getattr(args, "csa2_candidate_source_layer", None)
+    candidates = (getattr(args, "csa2_candidate_topk_blocks", 0) or 0) * (
+        getattr(args, "csa2_candidate_block_size", 0) or 0
+    )
+    indexer_term = 0.0
+    core_term = 0.0
+    for layer in index_sources:
+        ratio = max(ratios[layer], 1) if layer < n_layers else 1
+        # q projection, head weights, index keys (one per compressed entry ~ 1/ratio tokens)
+        indexer_term += q_lora * n_i * d_i + h * n_i + h * d_i / ratio
+        if candidate_layer is not None and layer > candidate_layer and candidates > 0:
+            # Reindex layers (after the candidate source) score the candidate set only.
+            indexer_term += n_i * d_i * min(candidates, seq_len // ratio)
+        else:
+            # Full index sources (up to and including the candidate source) score every
+            # causal compressed entry: L^2 / (2 * ratio) pairs per sequence.
+            core_term += n_i * d_i / (2 * ratio)
+
+    token_linear = mla_proj_term + attn_term + compressor_term + indexer_term
+    return token_linear, core_term
+
+
 def num_floating_point_operations(
     args, batch_size, seqlen_squared_sum_in_batch=None, total_real_tokens_in_batch=None
 ):
@@ -912,11 +984,18 @@ def num_floating_point_operations(
         dsa_indexer_n_heads=None,
         dsa_indexer_head_dim=None,
         dsa_indexer_topk=None,
+        dsv41_terms=None,
     ):
         """Calculate total FLOPs for the hybrid model."""
         # Self-attention (already summed over all attention layers, fwd-equivalent
         # with the FMA factor baked in; the global ``* 3`` below adds fwd+bwd).
-        if experimental_attention_variant == "dsv4_hybrid":
+        if dsv41_terms is not None:
+            # DeepSeek-V4.1 CSA2 layers (``_dsv41_self_attention_flops``).
+            dsv41_token_term, dsv41_core_term = dsv41_terms
+            attn_flops_total = 2 * (
+                dsv41_token_term * total_tokens + dsv41_core_term * seqlen_squared_sum
+            )
+        elif experimental_attention_variant == "dsv4_hybrid":
             # DSv4 uses sparse MLA attention. Keep the shared helper as the
             # single source of truth for both HybridModel and GPTModel.
             dsv4_token_term, dsv4_core_term = _dsv4_hybrid_self_attention_flops(
@@ -1469,7 +1548,13 @@ def num_floating_point_operations(
         dsv4_n_layers_r0 = layer_counts[Symbols.WINDOW]
         dsv4_n_layers_r4 = layer_counts[Symbols.CSA]
         dsv4_n_layers_r128 = layer_counts[Symbols.HCA]
-        if args.experimental_attention_variant == "dsv4_hybrid":
+        dsv41_terms = None
+        if getattr(args, "dsv4_version", "v4") == "v4.1":
+            # DeepSeek-V4.1: one compress ratio per model layer, shared compressed KV /
+            # index keys from the source layers, top-k over candidates. Own accounting.
+            dsv41_terms = _dsv41_self_attention_flops(args)
+            dsv4_n_layers_r0 = dsv4_n_layers_r4 = dsv4_n_layers_r128 = 0
+        elif args.experimental_attention_variant == "dsv4_hybrid":
             assert num_mla_layers == 0, "dsv4_hybrid does not support dense + MLA layers"
             assert num_attn_layers == (dsv4_n_layers_r0 + dsv4_n_layers_r4 + dsv4_n_layers_r128), (
                 "dsv4_hybrid expects all attention layers to be Window/CSA/HCA; "
@@ -1487,9 +1572,10 @@ def num_floating_point_operations(
         # kwargs (``arguments.py``/``argument_utils.py`` write it into
         # ``kw_args``, never back onto ``args``), so the attribute alone misses
         # exactly the runs this guard exists for.
-        assert (
-            args.experimental_attention_variant != "dsa"
-            and layer_counts[Symbols.DS_ATTENTION] == 0
+        # DeepSeek-V4.1 uses 'D' for its ratio-driven CSA2 layers (counted above), so the
+        # guard applies to the legacy DSA path only.
+        assert getattr(args, "dsv4_version", "v4") == "v4.1" or (
+            args.experimental_attention_variant != "dsa" and layer_counts[Symbols.DS_ATTENTION] == 0
         ), (
             "num_floating_point_operations does not support DSA "
             "('D' layers / experimental_attention_variant='dsa') on the "
@@ -1566,6 +1652,7 @@ def num_floating_point_operations(
             dsa_indexer_n_heads=getattr(args, "dsa_indexer_n_heads", None),
             dsa_indexer_head_dim=getattr(args, "dsa_indexer_head_dim", None),
             dsa_indexer_topk=getattr(args, "dsa_indexer_topk", None),
+            dsv41_terms=dsv41_terms,
         )
     else:
         # Compute standard Transformer model FLOPs.

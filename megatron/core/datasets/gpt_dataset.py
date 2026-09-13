@@ -92,6 +92,13 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
     SBHD reference run that mirrors the THD path's tokenization but skips all
     packing — useful for THD numerical-correctness validation."""
 
+    varlen_bins_as_samples: bool = False
+    """When True and the ``--use-varlen-dataset`` path reads a pre-packed parquet
+    (``input_ids`` / ``loss_mask`` / ``seq_start_id`` per row), one sample is a whole bin in
+    the pre-packed ``cu_seqlens`` format instead of one constituent sequence: the global batch
+    size then counts bins (as the NeMo packed loader does) and the packing scheduler keeps the
+    bins' fill because their sequences stay adjacent."""
+
     inter_document_masking: bool = False
     """When True, return cu_seqlens marking document boundaries within each sample so
     that attention is restricted to individual documents."""

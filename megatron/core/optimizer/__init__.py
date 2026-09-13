@@ -594,7 +594,11 @@ def _get_megatron_optimizer_based_on_param_groups(
                                 opt.state[p]['exp_avg'] = torch.zeros_like(p.data)
                                 opt.state[p]['exp_avg_sq'] = torch.zeros_like(p.data)
                             else:
-                                opt.initialize_state(p, config.store_param_remainders)
+                                # TE FusedAdam keeps int16 remainders only for bf16 params (its
+                                # step() decides per param); fp32 params get an fp32 master.
+                                opt.initialize_state(
+                                    p, config.store_param_remainders and p.dtype == torch.bfloat16
+                                )
 
         elif config.optimizer == 'lion':
             if not HAVE_EMERGING_OPTIMIZERS:

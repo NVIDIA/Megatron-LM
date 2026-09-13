@@ -487,6 +487,10 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
     and returns output of the same size.
     """
 
+    # DSv4 normalises every query head (weight-free RMS) after the up projection; DSv4.1 does
+    # not (its ``wq_b`` output is rotated and used directly). Subclasses override.
+    query_head_rms_norm: bool = True
+
     def __init__(
         self,
         config: MLATransformerConfig,
@@ -708,7 +712,8 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
 
             # q: [num_tokens, n, q_head_dim]
             q = q.view(*q.size()[:-1], self.num_attention_heads_per_partition, self.q_head_dim)
-            q = _q_rms_norm(q, self.config.layernorm_epsilon)
+            if self.query_head_rms_norm:
+                q = _q_rms_norm(q, self.config.layernorm_epsilon)
 
             boundary_rows = 0
             if boundary_kv_compressed is not None:

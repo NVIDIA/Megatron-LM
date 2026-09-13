@@ -2179,6 +2179,11 @@ def load_checkpoint(
         else:
             gen_sd_optim = None
             gen_sd_opt_param_scheduler = None
+            print_rank_0(
+                "optimizer state will not be requested from the checkpoint: "
+                f"release={release} finetune={args.finetune} no_load_optim={args.no_load_optim} "
+                f"ckpt no_save_optim={getattr(ckpt_args, 'no_save_optim', None)}"
+            )
 
         if dp_cp_group is None:
             dp_cp_group = mpu.get_data_parallel_group(with_context_parallel=True)
@@ -2230,6 +2235,25 @@ def load_checkpoint(
                 model_sd_kwargs=model_sd_kwargs,
                 rerun_state=gen_sd_rerun_state,
             )
+            if gen_sd_optim is not None and torch.distributed.get_rank() == 0:
+                # Diagnostic for resume failures: the optimizer keys rank 0 asks the checkpoint
+                # for, collapsed to families (compare with the checkpoint's keys). Rank 0 only:
+                # the traversal is not free and print_rank_0 drops the other ranks anyway.
+                import re as _re
+
+                from megatron.core.dist_checkpointing.dict_utils import nested_values as _nv
+                from megatron.core.dist_checkpointing.mapping import ShardedBase as _ShardedBase
+
+                fams = {}
+                for v in _nv(load_kwargs['sharded_state_dict'].get('optimizer', {})):
+                    if isinstance(v, _ShardedBase):
+                        fam = _re.sub(r"dp_group_idx_\d+", "dp_group_idx_N", v.key)
+                        fam = _re.sub(r"bucket_idx_\d+", "bucket_idx_N", fam)
+                        fams[fam] = fams.get(fam, 0) + 1
+                print_rank_0(
+                    "optimizer keys requested from the checkpoint (rank 0 families): "
+                    + "; ".join(f"{k} x{n}" for k, n in sorted(fams.items()))
+                )
     elif args.ckpt_format == "torch_dcp":
         model_sd = model[0].state_dict()
         optimizer_sd = optimizer.state_dict(is_loading=True)

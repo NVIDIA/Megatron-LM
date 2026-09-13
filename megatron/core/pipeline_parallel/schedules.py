@@ -1282,6 +1282,7 @@ def forward_backward_pipelining_with_interleaving(
         # For interleaved PP with hyper connections, all intermediate communications use n-stream
         # Note: This is a simplified approach - proper VPP support may need more complex logic
         hidden_dim = config.hidden_size * getattr(config, 'num_residual_streams', 1)
+        hidden_dim += _mhc_pipeline_handoff_channels(config)
 
     tensor_shape = [seq_length, micro_batch_size, hidden_dim]
     tensor_shape[0] = tensor_shape[0] // cp_group.size()
@@ -2271,9 +2272,22 @@ def get_tensor_shapes(
 
         if use_nstream:
             hidden_size = hidden_size * getattr(config, 'num_residual_streams', 1)
+            hidden_size += _mhc_pipeline_handoff_channels(config)
 
     tensor_shapes.append((effective_seq_length, micro_batch_size, hidden_size))
     return tensor_shapes
+
+
+def _mhc_pipeline_handoff_channels(config) -> int:
+    """Extra channels appended to the n-stream tensor between pipeline stages.
+
+    DeepSeek-V4.1's single-pass hyper-connections hand the aggregation weights of the last
+    layer of a stage (``[s, b, num_residual_streams]``) to the next stage together with the
+    residual streams; see ``megatron.core.models.deepseek_v41.hybrid_stack``.
+    """
+    if getattr(config, 'dsv4_version', 'v4') == 'v4.1':
+        return getattr(config, 'num_residual_streams', 1)
+    return 0
 
 
 def forward_backward_pipelining_without_interleaving(
