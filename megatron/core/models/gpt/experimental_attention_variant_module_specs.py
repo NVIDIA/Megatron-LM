@@ -4,7 +4,7 @@ import warnings
 from typing import List, Optional
 
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
-from megatron.core.models.backends import BackendSpecProvider
+from megatron.core.models.backends import BackendSpecProvider, get_backend_from_config
 from megatron.core.ssm.gated_delta_net import GatedDeltaNet, GatedDeltaNet2, GatedDeltaNetSubmodules
 from megatron.core.transformer.enums import AttnMaskType, LayerType
 from megatron.core.transformer.experimental_attention_variant import (
@@ -22,6 +22,7 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
     is_dsa_skip_topk_layer,
     source_dsa_compute_layer,
 )
+from megatron.core.transformer.hyper_connection import HyperConnectionModule
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import (
@@ -30,31 +31,13 @@ from megatron.core.transformer.transformer_block import (
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import (
+    HyperConnectionTransformerLayer,
     MlpBuilder,
     TransformerLayer,
     TransformerLayerSubmodules,
     get_transformer_layer_offset,
 )
 from megatron.core.typed_torch import not_none
-
-try:
-    import transformer_engine as te  # type: ignore[import-untyped]  # pylint: disable=unused-import
-
-    from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
-
-    HAVE_TE = True
-except ImportError:
-    HAVE_TE = False
-
-try:
-    import nvidia_kitchen  # type: ignore[import-not-found]  # pylint: disable=unused-import
-
-    from megatron.core.extensions.kitchen import KitchenSpecProvider
-
-    HAVE_KITCHEN = True
-except ImportError:
-    HAVE_KITCHEN = False
-
 
 ##########
 # Experimental Attention Variant Names
@@ -252,6 +235,9 @@ def get_transformer_layer_with_experimental_attention_variant_spec(
 
     # Get GPT decoder block layer specs
     rms_norm = config.normalization == "RMSNorm"
+    enable_mhc = config.enable_mhc_connections
+    hyper_connection = HyperConnectionModule if enable_mhc else IdentityOp
+    layer_module = HyperConnectionTransformerLayer if enable_mhc else TransformerLayer
     layer_specs = []
     for layer_number in range(config.num_layers):
         attention = (
@@ -278,14 +264,16 @@ def get_transformer_layer_with_experimental_attention_variant_spec(
 
         layer_specs.append(
             ModuleSpec(
-                module=TransformerLayer,
+                module=layer_module,
                 submodules=TransformerLayerSubmodules(
                     input_layernorm=input_layernorm,
                     self_attention=attention,
                     self_attn_bda=get_bias_dropout_add,
+                    self_attention_hyper_connection=hyper_connection,
                     pre_mlp_layernorm=pre_mlp_layernorm,
                     mlp=not_none(mlp),
                     mlp_bda=get_bias_dropout_add,
+                    mlp_hyper_connection=hyper_connection,
                 ),
             )
         )
@@ -506,16 +494,8 @@ def _get_backend_spec_provider(config: TransformerConfig) -> BackendSpecProvider
         "Experimental GPT decoder block spec only supports "
         "transformer engine implementation for now."
     )
-    backend: BackendSpecProvider = (
-        KitchenSpecProvider(
-            fallback=TESpecProvider(),
-            use_kitchen_attention=config.use_kitchen_attention,
-            kitchen_attention_backend=config.kitchen_attention_backend,
-        )
-        if config.use_kitchen
-        else TESpecProvider()
-    )
-    return backend
+    # The factory also applies config.use_kitchen with TE as its fallback provider.
+    return get_backend_from_config(config)
 
 
 ##########
