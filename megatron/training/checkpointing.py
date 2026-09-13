@@ -260,7 +260,6 @@ def check_checkpoint_args(
             )
     _compare('experimental_attention_variant', default=None)
     _compare('dsa_indexer_mode', default='standard')
-    _compare('dsa_simplified_use_learned_k', default=False)
     _compare('dsa_indexer_n_heads', default=None)
     _compare('dsa_indexer_head_dim', default=None)
     _compare('dsa_indexer_topk', default=None)
@@ -2535,10 +2534,7 @@ def load_args_from_checkpoint(args, load_arg='load', checkpointing_context=None)
         # These options were added after simplified DSA checkpoints already existed. Make the
         # historical main-attention-K and normalized-input behavior explicit before force-restoring
         # model arguments; otherwise an old checkpoint can retain runtime overrides accidentally.
-        if not hasattr(checkpoint_args, 'dsa_simplified_use_learned_k'):
-            setattr(checkpoint_args, 'dsa_simplified_use_learned_k', False)
         _set_arg('dsa_indexer_mode', force=True)
-        _set_arg('dsa_simplified_use_learned_k', force=True)
         _set_arg('dsa_indexer_n_heads', force=True)
         _set_arg('dsa_indexer_head_dim', force=True)
         _set_arg('dsa_indexer_topk', force=True)

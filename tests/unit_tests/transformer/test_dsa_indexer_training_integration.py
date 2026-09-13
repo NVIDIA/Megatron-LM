@@ -34,64 +34,6 @@ class _DummyPGCollection:
         self.cp = None
 
 
-def test_simplified_learned_k_is_model_defining_checkpoint_metadata(monkeypatch):
-    import megatron.training.checkpointing as checkpointing
-
-    common = dict(
-        num_layers=1,
-        hidden_size=32,
-        num_attention_heads=4,
-        add_position_embedding=True,
-        experimental_attention_variant="dsa",
-        add_bias_linear=False,
-        dsa_indexer_mode="simplified",
-        dsa_indexer_n_heads=1,
-        dsa_indexer_head_dim=8,
-        dsa_indexer_topk=4,
-        vocab_file=None,
-        data_parallel_random_init=False,
-        phase_transition_iterations=None,
-        use_dist_ckpt=True,
-    )
-    runtime_args = SimpleNamespace(**common, dsa_simplified_use_learned_k=True)
-    monkeypatch.setattr(checkpointing, "get_args", lambda: runtime_args)
-    monkeypatch.setattr(checkpointing, "get_checkpoint_version", lambda: 3.0)
-
-    checkpointing.check_checkpoint_args(
-        SimpleNamespace(**common, dsa_simplified_use_learned_k=True)
-    )
-    with pytest.raises(AssertionError, match="dsa_simplified_use_learned_k"):
-        checkpointing.check_checkpoint_args(
-            SimpleNamespace(**common, dsa_simplified_use_learned_k=False)
-        )
-
-    runtime_args.dsa_simplified_use_learned_k = False
-    checkpointing.check_checkpoint_args(SimpleNamespace(**common))
-
-    load_args = SimpleNamespace(
-        load="old-dsa-checkpoint",
-        experimental_attention_variant="dsa",
-        dsa_simplified_use_learned_k=True,
-        use_tokenizer_model_from_checkpoint_args=False,
-        use_mp_args_from_checkpoint_args=False,
-    )
-    old_checkpoint_args = SimpleNamespace(
-        experimental_attention_variant="dsa", dsa_indexer_mode="simplified"
-    )
-    monkeypatch.setattr(
-        checkpointing,
-        "_load_base_checkpoint",
-        lambda *args, **kwargs: (
-            {"args": old_checkpoint_args, "iteration": 17},
-            "checkpoint.pt",
-            False,
-            None,
-        ),
-    )
-    loaded_args, _ = checkpointing.load_args_from_checkpoint(load_args)
-    assert loaded_args.dsa_simplified_use_learned_k is False
-
-
 def test_dsa_trainability_mode_requires_no_load_optim_for_transitions(monkeypatch):
     import megatron.training.checkpointing as checkpointing
 
@@ -103,7 +45,6 @@ def test_dsa_trainability_mode_requires_no_load_optim_for_transitions(monkeypatc
         experimental_attention_variant="dsa",
         add_bias_linear=False,
         dsa_indexer_mode="standard",
-        dsa_simplified_use_learned_k=False,
         dsa_indexer_n_heads=2,
         dsa_indexer_head_dim=8,
         dsa_indexer_topk=4,
