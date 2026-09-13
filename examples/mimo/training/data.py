@@ -227,7 +227,12 @@ def _build_mock_vlm_dataloader(
         num_image_tiles=num_image_tiles,
     )
     return DataLoader(
-        dataset, batch_size=batch_size, shuffle=False, num_workers=0, collate_fn=_collate_mock_batch
+        dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=0,
+        collate_fn=_collate_mock_batch,
+        pin_memory=True,
     )
 
 

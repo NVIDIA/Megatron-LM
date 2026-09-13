@@ -52,6 +52,62 @@ def test_initialize_and_destroy_model_parallel(order):
     assert ps._MODEL_PARALLEL_GROUP is None
 
 
+def test_destroy_model_parallel_destroys_tracked_process_groups():
+    Utils.initialize_model_parallel()
+    groups = [group for group in ps._global_process_group_list if group is not None]
+    pg_map = torch.distributed.distributed_c10d._world.pg_map
+    assert groups
+    assert all(group in pg_map for group in groups)
+
+    Utils.destroy_model_parallel()
+
+    assert ps._global_process_group_list is None
+    assert all(group not in pg_map for group in groups)
+
+
+def test_reinitialize_model_parallel_replaces_tracked_process_groups():
+    Utils.initialize_model_parallel()
+    old_groups = [group for group in ps._global_process_group_list if group is not None]
+    pg_map = torch.distributed.distributed_c10d._world.pg_map
+
+    Utils.initialize_model_parallel()
+    new_groups = [group for group in ps._global_process_group_list if group is not None]
+
+    assert old_groups
+    assert new_groups
+    assert all(group not in pg_map for group in old_groups)
+    assert all(group in pg_map for group in new_groups)
+
+    Utils.destroy_model_parallel()
+
+
+def test_destroy_model_parallel_can_defer_process_group_destruction():
+    from torch.distributed.device_mesh import DeviceMesh, _mesh_resources
+
+    Utils.initialize_model_parallel()
+    old_groups = [group for group in ps._global_process_group_list if group is not None]
+    pg_map = torch.distributed.distributed_c10d._world.pg_map
+
+    Utils.destroy_model_parallel(destroy_process_groups=False)
+    assert all(group in pg_map for group in old_groups)
+
+    Utils.initialize_model_parallel(destroy_process_groups=False)
+    all_groups = [group for group in ps._global_process_group_list if group is not None]
+    new_groups = [group for group in all_groups if group not in old_groups]
+    assert new_groups
+    DeviceMesh.from_group(new_groups[0], device_type="cuda")
+    assert all(group in pg_map for group in all_groups)
+
+    Utils.destroy_model_parallel()
+    assert ps._global_process_group_list is None
+    assert all(group not in pg_map for group in all_groups)
+    # PyTorch releases with process-group-backed DeviceMesh either keep the
+    # legacy global child-to-root cache or store mesh relationships on the
+    # DeviceMesh itself. If the legacy cache exists, teardown must clear it.
+    child_to_root_mapping = getattr(_mesh_resources, 'child_to_root_mapping', None)
+    assert child_to_root_mapping is None or not child_to_root_mapping
+
+
 @pytest.mark.parametrize('order', test_parallel_order)
 def test_pipeline_parallel_initializations(order):
     Utils.initialize_model_parallel(

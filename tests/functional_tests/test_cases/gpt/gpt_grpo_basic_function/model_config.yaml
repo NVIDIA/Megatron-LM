@@ -97,3 +97,4 @@ MODEL_ARGS:
   --finetune: true
   --inference-logging-step-interval: 1
 METRICS: []
+LAUNCHER: ft_launcher
