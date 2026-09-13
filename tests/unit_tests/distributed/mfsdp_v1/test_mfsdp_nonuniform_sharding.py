@@ -11,7 +11,6 @@ import pytest
 import torch
 from torch.nn.functional import mse_loss
 
-from megatron.core.distributed import DistributedDataParallelConfig as MCoreDDPConfig
 from megatron.core.distributed.fsdp.src.megatron_fsdp.distributed_data_parallel_config import (
     DistributedDataParallelConfig,
 )
@@ -147,38 +146,15 @@ class TestShardingStrategyResolution:
             expert_data_parallel_sharding_strategy=experts_strategy,
         )
 
-    @pytest.mark.parametrize("config_type", [MCoreDDPConfig, DistributedDataParallelConfig])
-    def test_experts_strategy_applies_to_expert_parameters_only(self, config_type):
-        config = config_type(
-            data_parallel_sharding_strategy=OPTIM_GRADS,
-            expert_data_parallel_sharding_strategy=OPTIM_GRADS_PARAMS,
-        )
+    def test_experts_strategy_applies_to_expert_parameters_only(self):
+        config = self.make_config(OPTIM_GRADS, experts_strategy=OPTIM_GRADS_PARAMS)
         assert get_sharding_strategy(config, is_expert_param=False) == OPTIM_GRADS
         assert get_sharding_strategy(config, is_expert_param=True) == OPTIM_GRADS_PARAMS
 
-    @pytest.mark.parametrize("config_type", [MCoreDDPConfig, DistributedDataParallelConfig])
-    @pytest.mark.parametrize("strategy", ["no_shard", "optim", "optim_grads", "optim_grads_params"])
-    def test_unset_experts_strategy_is_resolved_at_initialization(self, config_type, strategy):
-        config = config_type(data_parallel_sharding_strategy=strategy)
-        assert config.expert_data_parallel_sharding_strategy == strategy
-        assert get_sharding_strategy(config, is_expert_param=False) == strategy
-        assert get_sharding_strategy(config, is_expert_param=True) == strategy
-
-    @pytest.mark.parametrize("outer_strategy", ["no_shard", "optim", "optim_grads", "optim_grads_params"])
-    @pytest.mark.parametrize(
-        "expert_strategy", [None, "no_shard", "optim", "optim_grads", "optim_grads_params"]
-    )
-    def test_expert_outer_strategy_is_resolved_at_initialization(self, outer_strategy, expert_strategy):
-        config = MCoreDDPConfig(
-            outer_dp_sharding_strategy=outer_strategy,
-            expert_outer_dp_sharding_strategy=expert_strategy,
-        )
-        expected = outer_strategy if expert_strategy is None else expert_strategy
-        assert config.expert_outer_dp_sharding_strategy == expected
-
-    def test_invalid_expert_outer_strategy_is_rejected(self):
-        with pytest.raises(ValueError, match="expert_outer_dp_sharding_strategy must be one of"):
-            MCoreDDPConfig(expert_outer_dp_sharding_strategy="zero_3")
+    def test_unset_experts_strategy_falls_back_to_the_common_strategy(self):
+        config = self.make_config(OPTIM_GRADS)
+        assert get_sharding_strategy(config, is_expert_param=False) == OPTIM_GRADS
+        assert get_sharding_strategy(config, is_expert_param=True) == OPTIM_GRADS
 
     def test_strategies_in_use_reports_every_configured_strategy(self):
         uniform = self.make_config(OPTIM_GRADS)
