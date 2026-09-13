@@ -160,4 +160,3 @@ METRICS:
   - "lm loss"
   - "mem-allocated-bytes"
   - "mem-max-allocated-bytes"
-LAUNCHER: ft_launcher

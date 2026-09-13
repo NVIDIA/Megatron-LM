@@ -189,4 +189,3 @@ TEST_TYPE: regular
 METRICS:
   - lm loss
   - total loss
-LAUNCHER: ft_launcher

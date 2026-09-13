@@ -200,23 +200,25 @@ continue to diverge:
 
 ### Special Handling: data_schedule.py
 
-Main and dev have completely different classes in this file:
-- Main: `HybridCPDataLoaderWrapper` (imported by main's `training.py`)
-- Dev: `BasePackingScheduler`, `DpBalancedScheduler`,
-  `DefaultDynamicCPScheduler`, `wrap_data_iterator`,
-  `get_batch_on_this_rank_for_sequence_packing` (imported by `pretrain_gpt.py`
-  and tests)
+Dev replaced the legacy hybrid-CP implementation with sequence-packing
+schedulers in PR #2000, after renaming hybrid CP to dynamic CP in PR #3405.
+Preserve dev's `BasePackingScheduler`, `DpBalancedScheduler`,
+`DefaultDynamicCPScheduler`, `wrap_data_iterator`, and
+`get_batch_on_this_rank_for_sequence_packing` when merging changes from main.
 
-**Do NOT take either version wholesale.** Keep dev's file and append main's
-`HybridCPDataLoaderWrapper` class (plus any missing imports like
-`BalancedCPScheduler`, `Any`, `List`) at the end.
+**Do NOT restore `HybridCPDataLoaderWrapper`, `BalancedCPScheduler`, or
+`hybrid_cp_schedule.py` from main.** PR #4716 restored this obsolete code even
+though dev had removed its training call sites. If incoming code references
+the legacy implementation, adapt it to dev's sequence-packing path instead
+of restoring the old wrapper, scheduler, or tests. Audit both training and
+evaluation call sites after resolving the merge.
 
 ### Restore Deleted Files
 
 Compare `git ls-tree` between `origin/main` and HEAD to find files in main
 that are missing from the merged tree. For each:
-- **Restore** if main's code imports/references it and would break without it
-  (e.g. `hybrid_cp_schedule.py` if `data_schedule.py` imports from it)
+- **Restore** if the merged code imports/references it and would break without
+  it, provided dev did not intentionally delete or replace it
 - **Do NOT restore** if dev intentionally deleted it — check
   `git log origin/dev -- <file>` for the deletion commit to understand intent
 - When in doubt, check whether any file in the merged tree imports from the
@@ -232,19 +234,13 @@ Run on ALL changed Python files (relative to `origin/dev`), in this order:
 4. `pylint` on changed `megatron/core/` files — fix missing-docstring and
    line-too-long violations before pushing
 
-### Pre-push advisory checks
+### Pre-push invariant checks
 
 Before every `git push` in this workflow (the initial push in Phase 1
-AND every fix-push in Phase 3), run these bash checks as guidance. They
-must never block the push. Review every finding: fix genuine merge accidents
-and document intentional main removals or formatting/reordering false positives
-in the PR body.
+AND every fix-push in Phase 3), run these bash checks. If any fails,
+fix the condition and re-check before pushing:
 
 ```bash
-set +e
-(
-set -euo pipefail
-
 MERGE_COMMIT=$(git rev-list --min-parents=2 --max-count=1 HEAD || true)
 if [ -n "$MERGE_COMMIT" ]; then
   DEV_REF="${MERGE_COMMIT}^1"
@@ -256,8 +252,9 @@ fi
 
 # 1. CODEOWNERS must be identical to dev's.
 if ! git diff --quiet "$DEV_REF" HEAD -- .github/CODEOWNERS; then
-  echo "WARNING: .github/CODEOWNERS differs from dev. Restore with:"
+  echo "ABORT: .github/CODEOWNERS differs from dev. Restore with:"
   echo "  git checkout $DEV_REF -- .github/CODEOWNERS"
+  exit 1
 fi
 
 # 2. Dependency-management triple must be identical to dev's.
@@ -265,7 +262,7 @@ for f in pyproject.toml uv.lock docker/Dockerfile.ci.dev; do
   if ! git diff --quiet "$DEV_REF" HEAD -- "$f"; then
     # pyproject.toml is allowed to differ ONLY for git source reconciliation
     # (new [tool.uv.sources] entries from main). If you intentionally edited
-    # it for that reason, document the reconciliation in the PR body.
+    # it for that reason, bypass this check by re-running with $f skipped.
     echo "WARNING: $f differs from dev"
   fi
 done
@@ -296,7 +293,7 @@ done
 INTENTIONAL_OVERRIDE_REGEX='^(megatron/training/training\.py|megatron/training/initialize\.py|megatron/training/utils\.py|megatron/training/datasets/data_samplers\.py|megatron/core/optimizer/layer_wise_optimizer\.py)$'
 SKIP_REGEX='^(pyproject\.toml|uv\.lock|docker/Dockerfile\.ci\.dev|\.github/CODEOWNERS)$'
 
-FINDINGS=0
+VIOLATIONS=0
 for f in $(git diff --name-only "$DEV_REF"..HEAD \
             -- '*.py' '*.md' '*.yaml' '*.yml' '*.toml' \
                '*.sh' '*.cpp' '*.cu' '*.h' \
@@ -315,36 +312,25 @@ for f in $(git diff --name-only "$DEV_REF"..HEAD \
   if [ -n "$missing" ]; then
     echo "=== $f ==="
     printf '%s\n' "$missing"
-    FINDINGS=$((FINDINGS + $(printf '%s\n' "$missing" | grep -c .)))
+    VIOLATIONS=$((VIOLATIONS + $(printf '%s\n' "$missing" | grep -c .)))
   fi
 done
 
-if [ "$FINDINGS" -gt 0 ]; then
-  echo "WARNING: $FINDINGS potential dev-only line removal(s) detected. For each:"
+if [ "$VIOLATIONS" -gt 0 ]; then
+  echo "ABORT: $VIOLATIONS dev-only line(s) dropped by the merge. For each:"
   echo "  (a) MAIN INTENTIONALLY REMOVED — find the specific commit in"
   echo "      'git log origin/main -- <file>' that removed it; document the"
   echo "      SHA in the PR body, then the drop is acceptable."
   echo "  (b) MERGE ACCIDENT — main never explicitly touched that line."
   echo "      RESTORE the dev line (Edit/Write to put it back)."
   echo "Default to (b); only declare (a) with a specific main commit as evidence."
-  echo "This audit is advisory; continue the push after reviewing the findings."
+  exit 1
 fi
-
-echo "nightly-sync pre-push guidance complete"
-)
-GUIDANCE_STATUS=$?
-if [ "$GUIDANCE_STATUS" -ne 0 ]; then
-  echo "WARNING: nightly-sync pre-push guidance failed with status $GUIDANCE_STATUS; allowing the push to continue."
-fi
-exit 0
 ```
 
-All pre-push findings are advisory. The hook must return success even when it
-finds a CODEOWNERS difference, potential dev-feature removal, dependency-triple
-difference, or an internal audit error. The underlying policies still apply:
-restore accidental changes, preserve dev-only features, and document exact main
-commits for intentional removals. A warning by itself is never a reason to stop
-the workflow or request authorization to continue.
+The CODEOWNERS check and the dev-feature preservation audit are HARD
+aborts — never push if either fails. The dep-triple check is a warning
+because git-source reconciliation can produce legitimate diffs there.
 
 Recent regressions the dev-feature audit would have flagged (all
 "merge accident" type from #4659 and #4716):
@@ -409,12 +395,7 @@ Phase 3 step 4 and the two-commit policy in Rules).
      in the PR body so reviewers see it at a glance.
   3. List of files where main's version was taken over the merge
   4. List of files that were deleted in dev but restored (and why)
-  5. Disposition of every pre-push advisory finding, including CODEOWNERS or
-     dependency-triple differences and potential dev-feature removals. Record
-     whether each was corrected, intentional (with the exact commit or reason),
-     or a formatting/reordering false positive. State explicitly if there were
-     no findings.
-  6. The remerge-diff output (`git show --remerge-diff HEAD` on the merge
+  5. The remerge-diff output (`git show --remerge-diff HEAD` on the merge
      commit) so reviewers can inspect ONLY the conflict resolutions. If the
      output is very long, summarize conflicts by file and put the full diff
      in a collapsed `<details>` block. If git is too old for `--remerge-diff`,

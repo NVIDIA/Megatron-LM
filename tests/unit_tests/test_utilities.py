@@ -99,60 +99,22 @@ class Utils:
             Utils.rank = rank
 
     @staticmethod
-    def _reset_model_parallel_state(destroy_process_groups=True):
-        """Clear process-group consumers before resetting Megatron state."""
-        from megatron.core.transformer.moe.fused_a2a import reset_hybrid_ep_buffer
-
-        reset_hybrid_ep_buffer()
-
-        # Transformer Engine retains the FP8 reduction group between contexts.
-        try:
-            from transformer_engine.pytorch.quantization import FP8GlobalStateManager
-
-            FP8GlobalStateManager.reset()
-        except ImportError:
-            pass
-
-        if not destroy_process_groups:
-            ps.destroy_model_parallel(destroy_process_groups=False)
-            return
-
-        # DeviceMesh caches process-group names globally. They must not survive a
-        # model-parallel generation whose groups are about to be unregistered.
-        try:
-            from torch.distributed.device_mesh import _mesh_resources
-        except ImportError:
-            pass
-        else:
-            for name in (
-                'child_to_root_mapping',
-                'root_to_flatten_mapping',
-                'mesh_stack',
-                'mesh_dim_group_options',
-                'flatten_name_to_root_dims',
-            ):
-                resource = getattr(_mesh_resources, name, None)
-                if resource is not None:
-                    resource.clear()
-
-        ps.destroy_model_parallel(destroy_process_groups=destroy_process_groups)
-
-    @staticmethod
-    def destroy_model_parallel(destroy_process_groups=True):
+    def destroy_model_parallel():
         os.environ.pop('NVTE_FLASH_ATTN', None)
         os.environ.pop('NVTE_FUSED_ATTN', None)
         os.environ.pop('NVTE_UNFUSED_ATTN', None)
-        if Utils.inited:
-            try:
-                # Flush pending CUDA work before the barrier so slow ranks don't
-                # time out while fast ranks tear down process groups.
-                torch.cuda.synchronize()
-                torch.distributed.barrier()
-            except Exception:
-                # A failed synchronization must not leave local consumer caches
-                # pointing at process groups that a later initialization replaces.
-                pass
-        Utils._reset_model_parallel_state(destroy_process_groups=destroy_process_groups)
+        if not Utils.inited:
+            return
+
+        try:
+            # Flush pending CUDA work before the barrier so slow ranks don't
+            # time out while fast ranks tear down process groups.
+            torch.cuda.synchronize()
+            torch.distributed.barrier()
+        except Exception:
+            Utils.inited = False
+            return
+        ps.destroy_model_parallel()
         Utils.inited = False
         torch.cuda.memory.empty_cache()
 
@@ -161,7 +123,6 @@ class Utils:
         tensor_model_parallel_size=1,
         pipeline_model_parallel_size=1,
         virtual_pipeline_model_parallel_size=None,
-        destroy_process_groups=True,
         **kwargs,
     ):
         # Need to unset these variables to make sure previous
@@ -170,7 +131,7 @@ class Utils:
         os.environ.pop('NVTE_FUSED_ATTN', None)
         os.environ.pop('NVTE_UNFUSED_ATTN', None)
 
-        Utils.destroy_model_parallel(destroy_process_groups=destroy_process_groups)
+        ps.destroy_model_parallel()
         Utils.initialize_distributed()
         ps.initialize_model_parallel(
             tensor_model_parallel_size,

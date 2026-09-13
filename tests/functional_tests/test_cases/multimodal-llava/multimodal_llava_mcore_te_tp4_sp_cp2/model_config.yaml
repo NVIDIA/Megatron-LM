@@ -57,4 +57,3 @@ MODEL_ARGS:
   --log-memory-to-tensorboard: true
   --calculate-per-token-loss: true
 TEST_TYPE: regular
-LAUNCHER: ft_launcher

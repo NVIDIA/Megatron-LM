@@ -497,10 +497,7 @@ def pack_inference_logprobs(
         bin_size: Size of each bin
 
     Returns:
-        Packed inference logprobs tensor of shape [num_bins, bin_size - 1], and a
-        bool mask of the same shape marking positions actually filled from the
-        engine (the train side appends tokens, e.g. EOD, that the engine never
-        reported a logprob for; those stay zero-filled and must not be compared).
+        Packed inference logprobs tensor of shape [num_bins, bin_size - 1]
     """
     num_bins = len(packing_info.bin_seq_indices)
 
@@ -508,7 +505,6 @@ def pack_inference_logprobs(
     packed_inference_logprobs = torch.zeros(
         (num_bins, bin_size - 1), dtype=torch.float32, device='cpu'
     )
-    filled_mask = torch.zeros((num_bins, bin_size - 1), dtype=torch.bool, device='cpu')
 
     # Create mapping from global sequence index to local bin index
     # This is needed because seq_to_bin_idx uses global bin indices,
@@ -553,9 +549,8 @@ def pack_inference_logprobs(
             packed_inference_logprobs[local_bin_idx, pack_start:pack_end] = seq_inf_logprobs[
                 :actual_len
             ]
-            filled_mask[local_bin_idx, pack_start:pack_end] = True
 
-    return packed_inference_logprobs, filled_mask
+    return packed_inference_logprobs
 
 
 def compute_packed_inference_logprobs_stats(
@@ -563,7 +558,6 @@ def compute_packed_inference_logprobs_stats(
     packed_inference_logprobs: torch.Tensor,
     packed_loss_mask: torch.Tensor,
     group_stats: Any,
-    filled_mask: Optional[torch.Tensor] = None,
 ) -> None:
     """Compute statistics for packed inference logprobs for logging purposes.
 
@@ -575,30 +569,17 @@ def compute_packed_inference_logprobs_stats(
         packed_inference_logprobs: Packed inference logprobs [num_bins, seq_len-1]
         packed_loss_mask: Loss mask indicating valid positions [num_bins, seq_len]
         group_stats: Statistics object to update with computed metrics
-        filled_mask: Optional bool mask [num_bins, seq_len-1] marking positions actually
-            filled from the engine's reported logprobs. Positions the engine never
-            reported (e.g. the train-side EOD append) stay zero-filled and are excluded
-            from the stats so they do not contribute spurious |p_old - 1| terms.
     """
     # Lazy import to avoid circular dependency (rl_utils imports from this module)
     from megatron.rl.rl_utils import update_inference_logprobs_group_stats
 
-    # Ensure all tensors are on the same device (CPU for stats computation).
-    # Compare in the training dtype: old_logprobs are bf16 while the engine reports
-    # fp32 logprobs, so comparing raw values shows bf16-rounding noise even when the
-    # two sides are bitwise identical (the unpacked path already rounds by writing
-    # into an old_logprobs-dtype buffer in align_unpacked_inference_logprobs).
+    # Ensure all tensors are on the same device (CPU for stats computation)
     old_logprobs = old_logprobs.cpu()
-    packed_inference_logprobs = packed_inference_logprobs.cpu().to(old_logprobs.dtype)
+    packed_inference_logprobs = packed_inference_logprobs.cpu()
     packed_loss_mask = packed_loss_mask.cpu()
 
     # Use packed_loss_mask to identify valid positions for stats (shift by 1 for logprobs)
     mask = packed_loss_mask[:, 1:].bool()
-    if filled_mask is not None:
-        # Exclude positions the engine never reported (zero-filled in packing), e.g.
-        # the train-side EOD append: comparing exp(0)=1 against a real prob there
-        # poisons the mismatch stats with spurious |p_old - 1| terms.
-        mask = mask & filled_mask.to(mask.device)
 
     # Ensure shapes match
     if mask.shape != old_logprobs.shape:

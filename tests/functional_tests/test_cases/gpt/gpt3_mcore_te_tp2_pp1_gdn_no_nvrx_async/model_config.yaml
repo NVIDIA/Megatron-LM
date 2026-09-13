@@ -86,4 +86,3 @@ MODEL_ARGS:
   --log-memory-to-tensorboard: true
 TEST_TYPE: regular
 TEST_EVALUATION: xpass
-LAUNCHER: torchrun

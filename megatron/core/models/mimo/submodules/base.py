@@ -310,18 +310,13 @@ class ModalitySubmodules(ABC, nn.Module):
                 Dictionary containing encoder-specific inputs. Keys should match encoder names.
                 Used when is_first_stage=True.
             hidden_states (Optional[torch.Tensor]):
-                Already-combined encoder features. When supplied, bypasses encoding on any stage.
+                Hidden states from previous pipeline stage. Used when is_first_stage=False.
 
         Returns:
             Optional[torch.Tensor]:
                 Processed and projected embeddings tensor, or None if no embeddings were produced.
         """
-        if encoder_inputs is not None and hidden_states is not None:
-            raise ValueError("encoder_inputs and hidden_states are mutually exclusive")
-
-        if hidden_states is not None:
-            combined = hidden_states
-        elif self.is_first_stage:
+        if self.is_first_stage:
             if encoder_inputs is None:
                 return None
             embeddings = self.encode(encoder_inputs)
@@ -329,7 +324,9 @@ class ModalitySubmodules(ABC, nn.Module):
                 return None
             combined = self.combine_embeddings(embeddings)
         else:
-            return None
+            if hidden_states is None:
+                return None
+            combined = hidden_states
 
         if self.is_last_stage:
             return self.project_embeddings([combined], is_input=True)

@@ -54,4 +54,3 @@ MODEL_ARGS:
   --attention-backend: unfused
   --log-memory-to-tensorboard: true
 TEST_TYPE: ckpt-resume
-LAUNCHER: ft_launcher
