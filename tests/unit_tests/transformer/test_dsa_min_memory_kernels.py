@@ -45,7 +45,7 @@ class _DummyPGCollection:
     tp = _DummyTPGroup()
 
 
-def _simplified_test_indexer(hidden_size, head_dim, topk, learned_k=False):
+def _simplified_test_indexer(hidden_size, head_dim, topk):
     indexer = SimpleNamespace(
         index_n_heads=1,
         index_head_dim=head_dim,
@@ -54,14 +54,10 @@ def _simplified_test_indexer(hidden_size, head_dim, topk, learned_k=False):
         index_rotary_dim=0,
         rotary_pos_emb=None,
         pg_collection=_DummyPGCollection(),
-        config=SimpleNamespace(
-            dsa_indexer_mode="simplified",
-            dsa_simplified_use_learned_k=learned_k,
-            rotary_interleaved=False,
-        ),
+        config=SimpleNamespace(dsa_indexer_mode="simplified", rotary_interleaved=False),
     )
     indexer.linear_q = torch.nn.Linear(hidden_size, head_dim, bias=False)
-    indexer.linear_k = torch.nn.Linear(hidden_size, head_dim, bias=False) if learned_k else None
+    indexer.linear_k = torch.nn.Linear(hidden_size, head_dim, bias=False)
     return indexer
 
 
@@ -140,7 +136,7 @@ def test_simplified_learned_k_only_persists_full_k_when_cached():
     key = torch.randn(seqlen, batch_size, 1, attention_dim, requires_grad=True)
     value = torch.randn(seqlen, batch_size, 1, attention_dim, requires_grad=True)
     hidden_states = torch.randn(seqlen, batch_size, hidden_size)
-    indexer = _simplified_test_indexer(hidden_size, index_dim, topk=3, learned_k=True)
+    indexer = _simplified_test_indexer(hidden_size, index_dim, topk=3)
     full_k_shape = (seqlen, batch_size, 1, index_dim)
 
     def saved_shapes(cache_indexer_k):
@@ -181,7 +177,7 @@ def test_simplified_learned_k_bounds_selected_k_scratch(monkeypatch):
     key = torch.randn(seqlen, batch_size, 1, attention_dim, requires_grad=True)
     value = torch.randn(seqlen, batch_size, 1, attention_dim, requires_grad=True)
     hidden_states = torch.randn(seqlen, batch_size, hidden_size)
-    indexer = _simplified_test_indexer(hidden_size, index_dim, topk, learned_k=True)
+    indexer = _simplified_test_indexer(hidden_size, index_dim, topk)
     gathered_support_sizes = []
 
     original_gather_key = min_memory._gather_simplified_selected_key
@@ -218,9 +214,8 @@ def test_simplified_learned_k_bounds_selected_k_scratch(monkeypatch):
     assert max(gathered_support_sizes) <= 64
 
 
-@pytest.mark.parametrize("learned_k", [False, True])
 @pytest.mark.parametrize("freeze_indexer", [False, True])
-def test_simplified_train_main_only_zero_loss_produces_no_indexer_update(learned_k, freeze_indexer):
+def test_simplified_train_main_only_zero_loss_produces_no_indexer_update(freeze_indexer):
     torch.manual_seed(654)
     seqlen, batch_size, hidden_size = 6, 1, 8
     num_query_heads, head_dim, topk = 4, 2, 3
@@ -228,11 +223,10 @@ def test_simplified_train_main_only_zero_loss_produces_no_indexer_update(learned
     key = torch.randn(seqlen, batch_size, 1, head_dim, requires_grad=True)
     value = torch.randn(seqlen, batch_size, 1, head_dim, requires_grad=True)
     hidden_states = torch.randn(seqlen, batch_size, hidden_size)
-    indexer = _simplified_test_indexer(hidden_size, head_dim, topk, learned_k=learned_k)
+    indexer = _simplified_test_indexer(hidden_size, head_dim, topk)
     if freeze_indexer:
-        for param in (indexer.linear_q.weight, indexer.linear_k.weight if learned_k else None):
-            if param is not None:
-                param.requires_grad_(False)
+        for param in (indexer.linear_q.weight, indexer.linear_k.weight):
+            param.requires_grad_(False)
 
     output, indexer_loss = dsa_min_memory_gqa(
         query,
@@ -247,9 +241,7 @@ def test_simplified_train_main_only_zero_loss_produces_no_indexer_update(learned
         key_chunk_size=3,
         use_triton=False,
     )
-    indexer_weights = (indexer.linear_q.weight,)
-    if learned_k:
-        indexer_weights += (indexer.linear_k.weight,)
+    indexer_weights = (indexer.linear_q.weight, indexer.linear_k.weight)
     grad_inputs = (query, key, value)
     if not freeze_indexer:
         grad_inputs += indexer_weights
