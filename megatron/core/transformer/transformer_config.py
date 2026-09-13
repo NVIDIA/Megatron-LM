@@ -1427,6 +1427,10 @@ class TransformerConfig(ModelParallelConfig):
 
     If ``None``, all local layers in the transformer block share one recompute group. The value must
     be a positive integer when set.
+
+    For V4.1 Hybrid, this counts attention/FFN sublayers (``DE`` counts as two) within each
+    local PP/VPP chunk. Group boundaries also guard live single-pass mixes and shared CSA2 KV;
+    these side outputs and the group-ending BDA remain materialized for downstream forwards.
     """
 
     mhc_recompute_attn_cuda_graph_split: bool = False
@@ -4472,22 +4476,42 @@ class TransformerConfig(ModelParallelConfig):
         if not self.enable_hyper_connections:
             raise ValueError("mhc_single_pass requires enable_hyper_connections=True")
         if self.recompute_granularity is not None:
-            raise ValueError("mhc_single_pass does not yet support activation recomputation")
+            if not (
+                self.experimental_attention_variant == "dsv4_hybrid"
+                and self.dsv4_version == "v4.1"
+                and self.recompute_granularity == "selective"
+                and "mhc" in self.recompute_modules
+                and set(self.recompute_modules) <= {"mhc", "layernorm", "mla_up_proj"}
+            ):
+                raise ValueError(
+                    "mhc_single_pass activation recomputation requires V4.1 Hybrid with "
+                    "recompute_granularity='selective' and 'mhc' in recompute_modules; "
+                    "optional modules are 'layernorm' and 'mla_up_proj'"
+                )
         if self.cuda_graph_impl != "none":
             raise ValueError("mhc_single_pass does not yet support CUDA Graphs")
         if self.mtp_num_layers:
             raise ValueError("mhc_single_pass does not yet support MTP")
+        if self.pipeline_model_parallel_size != 1 and not (
+            self.experimental_attention_variant == "dsv4_hybrid" and self.dsv4_version == "v4.1"
+        ):
+            raise ValueError(
+                "mhc_single_pass requires pipeline_model_parallel_size=1 outside V4.1 Hybrid"
+            )
         for name in (
             "tensor_model_parallel_size",
-            "pipeline_model_parallel_size",
             "context_parallel_size",
             "expert_model_parallel_size",
             "expert_tensor_parallel_size",
         ):
             if getattr(self, name) != 1:
                 raise ValueError(f"mhc_single_pass requires {name}=1")
-        if self.virtual_pipeline_model_parallel_size is not None or self.sequence_parallel:
-            raise ValueError("mhc_single_pass does not yet support VPP or sequence parallelism")
+        if self.virtual_pipeline_model_parallel_size is not None and not (
+            self.experimental_attention_variant == "dsv4_hybrid" and self.dsv4_version == "v4.1"
+        ):
+            raise ValueError("mhc_single_pass supports VPP only with V4.1 Hybrid")
+        if self.sequence_parallel:
+            raise ValueError("mhc_single_pass does not yet support sequence parallelism")
         if self.dynamic_context_parallel:
             raise ValueError("mhc_single_pass does not yet support dynamic CP")
         for name in ("num_residual_streams", "mhc_sinkhorn_iterations"):
@@ -4619,18 +4643,34 @@ class MLATransformerConfig(TransformerConfig):
         """Validate V4.1 training relationships and supported kernels on the DSv4 path."""
         for name in (
             "tensor_model_parallel_size",
-            "pipeline_model_parallel_size",
             "context_parallel_size",
             "expert_model_parallel_size",
             "expert_tensor_parallel_size",
         ):
             if getattr(self, name) != 1:
                 raise ValueError(f"Native V4.1 currently requires {name}=1")
-        if self.virtual_pipeline_model_parallel_size is not None or self.sequence_parallel:
-            raise ValueError("Native V4.1 does not yet support VPP or sequence parallelism")
-        if self.dynamic_context_parallel or self.recompute_granularity is not None:
+        if self.sequence_parallel:
+            raise ValueError("Native V4.1 does not yet support sequence parallelism")
+        if self.pipeline_model_parallel_size > 1:
+            if self.use_ring_exchange_p2p:
+                raise ValueError("V4.1 PP/VPP does not support ring_exchange")
+            if self.overlap_p2p_comm and (
+                (self.virtual_pipeline_model_parallel_size or 1) < 2 or self.batch_p2p_comm
+            ):
+                raise ValueError("V4.1 P2P overlap requires VPP and batch_p2p_comm=False")
+        if self.dynamic_context_parallel:
+            raise ValueError("Native V4.1 does not yet support dynamic CP")
+        if self.recompute_granularity is not None and not (
+            self.mhc_single_pass
+            and self.recompute_granularity == "selective"
+            and "mhc" in self.recompute_modules
+            and set(self.recompute_modules) <= {"mhc", "layernorm", "mla_up_proj"}
+        ):
             raise ValueError(
-                "Native V4.1 does not yet support dynamic CP or activation recomputation"
+                "V4.1 activation recomputation currently requires single-pass mHC with "
+                "recompute_granularity='selective' and 'mhc' in recompute_modules; "
+                "optional modules are 'layernorm' and 'mla_up_proj'. "
+                "Full-layer and CSA2 core-attention replay are not supported"
             )
         if self.mtp_num_layers:
             raise ValueError("V4.1 backbone configuration must not include MTP/DSpark layers")

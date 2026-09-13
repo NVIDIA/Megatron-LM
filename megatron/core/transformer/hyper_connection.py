@@ -683,8 +683,8 @@ class HyperConnectionModule(MegatronModule):
         if self.single_pass:
             if mhc_state is None:
                 raise ValueError("Single-pass mHC requires a forward-local SinglePassMHCState")
-            if mhc_recompute_manager is not None or output_slot is not None:
-                raise ValueError("Single-pass mHC does not yet support activation recomputation")
+            if output_slot is not None:
+                raise ValueError("Single-pass mHC does not yet support CUDA Graph output slots")
             if self.config.use_fused_mhc:
                 # Accumulate the residual/branch gradients before the mapping
                 # gradient, which also receives the next sublayer's pre-mix edge.
@@ -694,9 +694,19 @@ class HyperConnectionModule(MegatronModule):
             else:
                 mappings_input = aggregate_input = residual = hidden_states
             h_pre, h_post, h_res = self.compute_mappings(mappings_input)
-            aggregated = mhc_state.contract(
-                aggregate_input, self.n, use_fused=self.config.use_fused_mhc
-            )
+            if mhc_recompute_manager is None:
+                aggregated = mhc_state.contract(
+                    aggregate_input, self.n, use_fused=self.config.use_fused_mhc
+                )
+            else:
+                from megatron.core.tensor_parallel.random import CheckpointWithoutOutput
+
+                # Save the incoming mix as a tensor argument. Replaying a closure
+                # over mhc_state would read a later sublayer's mix and lose its
+                # original autograd edge (possibly across a pipeline boundary).
+                aggregated = CheckpointWithoutOutput(ckpt_manager=mhc_recompute_manager).checkpoint(
+                    self._single_pass_aggregate, aggregate_input, mhc_state.pre_mix
+                )
             mhc_state.pre_mix = h_pre
             return aggregated, h_res, h_post, residual
 
@@ -708,6 +718,16 @@ class HyperConnectionModule(MegatronModule):
             if output_slot is not None:
                 raise ValueError("fixed mHC outputs require an mHC recompute manager")
             return self._forward_normal(hidden_states)
+
+    def _single_pass_aggregate(self, hidden_states: Tensor, pre_mix: Tensor | None) -> Tensor:
+        """Replay aggregation with an explicit, forward-time mix and owned output storage."""
+        aggregated = SinglePassMHCState(pre_mix).contract(
+            hidden_states, self.n, use_fused=self.config.use_fused_mhc
+        )
+        # At stack entry contract selects stream zero. For one token or one
+        # stream, contiguous() can alias the input; discarding that storage
+        # would also destroy the checkpoint input and the residual branch.
+        return aggregated.clone() if pre_mix is None else aggregated
 
     def _forward_normal(self, hidden_states: Tensor) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
         """
@@ -876,20 +896,15 @@ class HyperConnectionModule(MegatronModule):
             output: [s, b, n*C] - final output after all operations
         """
         if self.single_pass:
-            if manager is not None:
-                raise ValueError("Single-pass mHC does not yet support activation recomputation")
             x, bias = layer_output_with_bias
-            if self.config.use_fused_mhc and (not training or dropout_prob == 0.0):
-                streams = original_residual.unflatten(-1, (self.n, self.hidden_size))
-                with torch.autocast(device_type=x.device.type, enabled=False):
-                    return self._h_post_bda_op(h_res, streams, h_post, x, bias).flatten(-2)
-            streams = original_residual.float().unflatten(-1, (self.n, self.hidden_size))
-            mixed = (h_res.float().unsqueeze(-1) * streams.unsqueeze(-2)).sum(-3)
-            expanded = h_post.float().unsqueeze(-1) * x.float().unsqueeze(-2)
-            if bias is not None:
-                expanded = expanded + h_post.float().unsqueeze(-1) * bias.float()
-            expanded = F.dropout(expanded, p=dropout_prob, training=training)
-            return (mixed + expanded).flatten(-2).to(x.dtype)
+            args = (h_res, original_residual, h_post, x, bias, dropout_prob, training)
+            if manager is None:
+                return self._single_pass_bda(*args)
+            from megatron.core.tensor_parallel.random import CheckpointWithoutOutput
+
+            return CheckpointWithoutOutput(ckpt_manager=manager).checkpoint(
+                self._single_pass_bda, *args
+            )
 
         if manager is not None:
             return self._fused_h_res_h_post_bda_with_checkpoint(
@@ -912,6 +927,29 @@ class HyperConnectionModule(MegatronModule):
                 training,
                 fused,
             )
+
+    def _single_pass_bda(
+        self,
+        h_res: Tensor,
+        original_residual: Tensor,
+        h_post: Tensor,
+        x: Tensor,
+        bias: Tensor | None,
+        dropout_prob: float,
+        training: bool,
+    ) -> Tensor:
+        """Pure single-pass residual mixing, also used by checkpoint replay."""
+        if self.config.use_fused_mhc and (not training or dropout_prob == 0.0):
+            streams = original_residual.unflatten(-1, (self.n, self.hidden_size))
+            with torch.autocast(device_type=x.device.type, enabled=False):
+                return self._h_post_bda_op(h_res, streams, h_post, x, bias).flatten(-2)
+        streams = original_residual.float().unflatten(-1, (self.n, self.hidden_size))
+        mixed = (h_res.float().unsqueeze(-1) * streams.unsqueeze(-2)).sum(-3)
+        expanded = h_post.float().unsqueeze(-1) * x.float().unsqueeze(-2)
+        if bias is not None:
+            expanded = expanded + h_post.float().unsqueeze(-1) * bias.float()
+        expanded = F.dropout(expanded, p=dropout_prob, training=training)
+        return (mixed + expanded).flatten(-2).to(x.dtype)
 
     def _fused_h_res_h_post_bda_native(
         self,

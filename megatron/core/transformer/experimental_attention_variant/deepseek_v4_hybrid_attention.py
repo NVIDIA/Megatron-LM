@@ -349,8 +349,7 @@ class DSv4HybridAttention(Attention):
                 core_attn_out.size(0), 1, self.query_projection_size
             )
 
-        if self.recompute_up_proj:
-            assert self.qkv_up_checkpoint is not None
+        if self.qkv_up_checkpoint is not None:
             self.qkv_up_checkpoint.discard_output_and_register_recompute(core_attn_out)
             self.qkv_up_checkpoint = None
 
@@ -918,7 +917,7 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
                 return query, key, value
             return query, key, value, boundary_kv
 
-        if self.recompute_up_proj:
+        if self.recompute_up_proj and self.training and torch.is_grad_enabled():
             quantization = self.config.fp8 or self.config.fp4
             self.qkv_up_checkpoint = tensor_parallel.CheckpointWithoutOutput(fp8=quantization)
             if boundary_kv_compressed is None:

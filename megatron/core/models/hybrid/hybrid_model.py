@@ -369,6 +369,23 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             name="decoder",
         )
 
+        adapter = getattr(self.decoder, "forward_adapter", None)
+        configure_pipeline = getattr(adapter, "configure_distributed_pipeline", None)
+        self.pipeline_payload_factory = (
+            configure_pipeline(self.hybrid_layer_pattern, self.pg_collection.pp, self.vp_stage)
+            if configure_pipeline is not None
+            else None
+        )
+        self.pipeline_payload_spec = getattr(adapter, "pipeline_payload_spec", None)
+        if (
+            self.config.mhc_single_pass
+            and self.pg_collection.pp.size() > 1
+            and self.pipeline_payload_factory is None
+        ):
+            raise ValueError(
+                "Single-pass mHC pipeline stages require a configured Hybrid forward adapter"
+            )
+
         # MTP block - uses mtp_block_spec from hybrid_stack_spec.submodules
         if self.mtp_process:
             hybrid_submodules = hybrid_stack_spec.submodules

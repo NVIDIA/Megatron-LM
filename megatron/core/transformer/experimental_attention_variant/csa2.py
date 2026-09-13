@@ -115,6 +115,17 @@ class CSA2State:
     thd_layout: CSA2THDLayout | None = None
     compressed_layout: CSA2THDCompressionLayout | None = None
 
+    def prepare_fused_kv(self) -> None:
+        """Pack canonical shared K once per owner or pipeline receiver, retaining its graph."""
+        if self.global_kv is not None and self.global_kv_flat is None:
+            self.global_kv_flat = (
+                self.global_kv.transpose(0, 1).reshape(-1, self.global_kv.shape[-1]).contiguous()
+            )
+        if self.indexer_k is not None and self.indexer_k_flat is None:
+            self.indexer_k_flat = (
+                self.indexer_k.transpose(0, 1).reshape(-1, self.indexer_k.shape[-1]).contiguous()
+            )
+
     def validate_forward(
         self, layer_idx: int, query: torch.Tensor, *, thd_layout: CSA2THDLayout | None = None
     ) -> None:
@@ -1091,25 +1102,17 @@ class CompressedSparseAttention2(MegatronModule):
             # All supervised consumers use the same storage and autograd edge.
             state.global_kv_flat = state.indexer_k_flat = None
             if self.use_fused_kernels:
-                state.global_kv_flat = (
-                    state.global_kv.transpose(0, 1)
-                    .reshape(-1, state.global_kv.shape[-1])
-                    .contiguous()
-                )
-                state.indexer_k_flat = (
-                    state.indexer_k.transpose(0, 1)
-                    .reshape(-1, state.indexer_k.shape[-1])
-                    .contiguous()
-                )
+                state.prepare_fused_kv()
             state.global_indices = state.candidates = None
             state.index_source_layer = state.candidate_source_layer = None
         elif (
             state.kv_source_layer != self.kv_source_layer
             or state.global_kv is None
-            or state.indexer_k is None
+            or (self.is_index_source and state.indexer_k is None)
         ):
             raise ValueError(
-                f"CSA2 layer {self.layer_idx} requires KV and indexer K from Full layer "
+                f"CSA2 layer {self.layer_idx} requires KV "
+                f"{'and indexer K ' if self.is_index_source else ''}from Full layer "
                 f"{self.kv_source_layer} in the same forward's CSA2State."
             )
 

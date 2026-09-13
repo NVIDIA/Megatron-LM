@@ -439,6 +439,12 @@ def hybrid_dsv4_stack_spec(config):
         hca_layer=_wrap_dsv4_layer(compress_ratio=128),  # 'H': HCA
         window_layer=_wrap_dsv4_layer(compress_ratio=0),  # 'W': sliding-window-only
     )
+    if config.dsv4_version == "v4.1":
+        from megatron.core.transformer.experimental_attention_variant.csa_utils.csa2_hybrid_adapter import (
+            CSA2HybridAdapter,
+        )
+
+        submodules.forward_adapter = CSA2HybridAdapter
     if config.dsv4_version == "v4.1" and config.num_moe_experts is not None:
         # V4.1's native path must honor the configured expert implementation instead of
         # inheriting the grouped-GEMM MoE from the default Hybrid spec.

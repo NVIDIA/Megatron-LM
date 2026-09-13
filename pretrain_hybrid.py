@@ -18,12 +18,13 @@ if rank != 0:
     warnings.filterwarnings("ignore", category=FutureWarning)
 
 from functools import partial
-from typing import Any, List, Optional, Tuple
+from typing import Any, List, NamedTuple, Optional, Tuple
 
 import torch
 
 from hybrid_builders import hybrid_builder
 from megatron.core import mpu
+from megatron.core.context_parallel_layout import finalize_packed_seq_params
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.data_schedule import get_batch_on_this_rank_for_sequence_packing
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
@@ -34,6 +35,10 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import (
     get_context_parallel_group,
     get_dynamic_data_context_parallel_groups,
+)
+from megatron.core.pipeline_parallel.pipeline_payload import (
+    PipelineDataIterator,
+    PipelinePayloadPlan,
 )
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
@@ -90,6 +95,9 @@ stimer = StragglerDetector()
 
 def get_batch(data_iterator, vp_stage=None):
     """Generate a batch."""
+
+    if isinstance(data_iterator, PipelineDataIterator):
+        return next(data_iterator)
 
     batch_keys = [
         "attention_mask",
@@ -219,6 +227,105 @@ def get_batch(data_iterator, vp_stage=None):
     return [batch[key] for key in batch_keys] + [None, None]
 
 
+class _HybridBatch(NamedTuple):
+    attention_mask: Any
+    cu_seqlens: Any
+    cu_seqlens_padded: Any
+    hybrid_cp_group: Any
+    labels: Any
+    local_cp_size: Any
+    loss_mask: Any
+    max_seqlen: Any
+    position_ids: Any
+    tokens: Any
+    padding_mask: Any
+    packed_seq_params: Any
+
+
+def _packed_params_from_batch(batch):
+    """Resolve packed host scalars once, during batch preparation when PP is used."""
+    batch = _HybridBatch(*batch)
+    if batch.packed_seq_params is not None or batch.cu_seqlens is None:
+        return batch.packed_seq_params
+    cu_seqlens = batch.cu_seqlens.squeeze(0)
+    cu_padded = batch.cu_seqlens_padded
+    cu_padded = cu_padded.squeeze(0) if cu_padded is not None else None
+    cu_for_params = cu_padded if cu_padded is not None else cu_seqlens
+    max_seqlen = int(batch.max_seqlen.item())
+    params = PackedSeqParams(
+        qkv_format="thd",
+        cu_seqlens_q=cu_for_params,
+        cu_seqlens_kv=cu_for_params,
+        cu_seqlens_q_padded=cu_padded,
+        cu_seqlens_kv_padded=cu_padded,
+        max_seqlen_q=max_seqlen,
+        max_seqlen_kv=max_seqlen,
+        local_cp_size=int(batch.local_cp_size.item()) if batch.local_cp_size is not None else None,
+        cp_group=batch.hybrid_cp_group,
+        total_tokens=int(cu_for_params[-1].item()),
+        tokens_per_sample=get_args().seq_length,
+    )
+    finalize_packed_seq_params(params)
+    return params
+
+
+def prepare_pipeline_inputs(
+    data_iterator: Any, model: HybridModel, num_microbatches: int, *, forward_only: bool = False
+) -> PipelineDataIterator:
+    """Prepare V4.1 wire boundaries before starting 1F1B.
+
+    Reuse the normal loader/packing/padding path exactly once per microbatch.
+    Fixed SBHD retains lazy data loading. Dynamic THD inputs are staged and
+    popped by forward_step; only host descriptors survive in the plan. Staging
+    contains input data for this invocation, not model activations.
+    """
+    args = get_args()
+    if args.tensor_model_parallel_size != 1 or args.context_parallel_size != 1:
+        raise ValueError("Prepared Hybrid pipeline payloads currently require TP=CP=1")
+    describe = get_attr_wrapped_model(model, "pipeline_payload_spec")
+    vp_stage = get_attr_wrapped_model(model, "vp_stage")
+    if not (args.sft or args.dataloader_inter_document_masking or args.sequence_packing_scheduler):
+        incoming, outgoing = describe(
+            args.seq_length, args.micro_batch_size, requires_grad=not forward_only
+        )
+        return PipelineDataIterator(
+            partial(get_batch, data_iterator, vp_stage),
+            PipelinePayloadPlan((incoming,) * num_microbatches, (outgoing,) * num_microbatches),
+        )
+    batches, incoming, outgoing = [], [], []
+    timer = get_timers()('batch-generator', log_level=2)
+    timer.start()
+    try:
+        with stimer(bdata=True):
+            for _ in range(num_microbatches):
+                batch = _HybridBatch(*get_batch(data_iterator, vp_stage))
+                params = _packed_params_from_batch(batch)
+                batch = batch._replace(packed_seq_params=params)
+                # Tokens/labels/padding_mask carry the actual capacity after all
+                # packing and tail padding. Middle SBHD stages need no dataset.
+                shape_source = next(
+                    (t for t in (batch.tokens, batch.labels, batch.padding_mask) if t is not None),
+                    None,
+                )
+                if shape_source is not None:
+                    batch_size, seq_length = shape_source.shape
+                elif params is not None:
+                    seq_length, batch_size = params.total_tokens, 1
+                    if type(seq_length) is not int:
+                        raise ValueError("Packed pipeline batches require a host token capacity")
+                else:
+                    seq_length, batch_size = args.seq_length, args.micro_batch_size
+                recv_spec, send_spec = describe(
+                    seq_length, batch_size, params, requires_grad=not forward_only
+                )
+                incoming.append(recv_spec)
+                outgoing.append(send_spec)
+                batches.append(tuple(batch))
+    finally:
+        timer.stop()
+    return PipelineDataIterator(batches, PipelinePayloadPlan(tuple(incoming), tuple(outgoing)))
+
+
 # define spiky loss as a loss that's 10x the max loss observed
 SPIKY_LOSS_FACTOR = 10
 
@@ -290,7 +397,6 @@ def forward_step(data_iterator, model: HybridModel):
         data_iterator : Input data iterator
         model (HybridModel): The Hybrid Model
     """
-    args = get_args()
     timers = get_timers()
 
     # Get the batch.
@@ -313,35 +419,14 @@ def forward_step(data_iterator, model: HybridModel):
             tokens,
             padding_mask,
             packed_seq_params,
-        ) = get_batch(data_iterator, vp_stage)
+        ) = batch = get_batch(data_iterator, vp_stage)
 
-    if packed_seq_params is not None:
-        if packed_seq_params.cu_seqlens_q is not None:
-            update_seqlen_stats_from_cu_seqlens(packed_seq_params.cu_seqlens_q)
-    elif cu_seqlens is not None:
-        # Squeeze the batch dim: the batch dict keeps cu_seqlens as (1, N)
-        # for consistency, but PackedSeqParams and TE expect 1-D.
-        cu_seqlens = cu_seqlens.squeeze(0)
-        if cu_seqlens_padded is not None:
-            cu_seqlens_padded = cu_seqlens_padded.squeeze(0)
-        # Use real (unpadded) cu_seqlens to feed the FLOPs accounting: varlen
-        # attention only computes work for real tokens within each chunk.
-        update_seqlen_stats_from_cu_seqlens(cu_seqlens)
-        cu_seqlens_for_params = cu_seqlens_padded if cu_seqlens_padded is not None else cu_seqlens
-        packed_seq_params = PackedSeqParams(
-            qkv_format="thd",
-            cu_seqlens_q=cu_seqlens_for_params,
-            cu_seqlens_kv=cu_seqlens_for_params,
-            cu_seqlens_q_padded=cu_seqlens_padded,
-            cu_seqlens_kv_padded=cu_seqlens_padded,
-            max_seqlen_q=int(max_seqlen.item()),
-            max_seqlen_kv=int(max_seqlen.item()),
-            local_cp_size=int(local_cp_size.item()) if local_cp_size is not None else None,
-            cp_group=hybrid_cp_group,
-            total_tokens=int(cu_seqlens_for_params[-1].item()),
-            tokens_per_sample=args.seq_length,
-        )
-        prepare_packed_seq_params(packed_seq_params, get_attr_wrapped_model(model, "config"))
+    if cu_seqlens is not None:
+        update_seqlen_stats_from_cu_seqlens(cu_seqlens.squeeze(0))
+    elif packed_seq_params is not None and packed_seq_params.cu_seqlens_q is not None:
+        update_seqlen_stats_from_cu_seqlens(packed_seq_params.cu_seqlens_q)
+    packed_seq_params = _packed_params_from_batch(batch)
+    prepare_packed_seq_params(packed_seq_params, get_attr_wrapped_model(model, "config"))
 
     timers('batch-generator').stop()
 
@@ -358,6 +443,9 @@ def forward_step(data_iterator, model: HybridModel):
 
     # [ModelOpt]: model is needed to access ModelOpt distillation losses
     return output_tensor, partial(loss_func, loss_mask, model=model)
+
+
+forward_step.prepare_pipeline_inputs = prepare_pipeline_inputs
 
 
 def is_dataset_built_on_rank(vp_stage=None, is_packed_sequence=False):

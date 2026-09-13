@@ -9,7 +9,7 @@ import copy
 import warnings
 from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, List, Optional, Tuple, Union
+from typing import Any, List, Optional, Tuple, Union
 
 import torch
 from torch import Tensor, nn
@@ -23,6 +23,10 @@ from megatron.core.fp8_utils import get_fp8_context, is_first_last_bf16_layer
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols as LayerSymbols
+from megatron.core.models.hybrid.hybrid_stack_adapter import (
+    HybridStackForwardAdapter,
+    HybridStackForwardContext,
+)
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.recompute import checkpointed_forward
@@ -53,9 +57,6 @@ from megatron.core.transformer.utils import (
 )
 from megatron.core.utils import WrappedTensor, deprecate_inference_params, make_viewless_tensor
 
-if TYPE_CHECKING:
-    from megatron.core.transformer.experimental_attention_variant.csa2 import CSA2State
-
 
 @dataclass
 class HybridStackSubmodules:
@@ -75,6 +76,7 @@ class HybridStackSubmodules:
     mlp_layer: Union[ModuleSpec, type] = IdentityOp
     moe_layer: Union[ModuleSpec, type] = IdentityOp
     mtp_block_spec: Optional[ModuleSpec] = None
+    forward_adapter: ModuleSpec | type[HybridStackForwardAdapter] | None = None
 
 
 class HyperConnectionHybridLayer(GraphableMegatronModule):
@@ -297,6 +299,13 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
         # Keep non-tensor recompute state out of TE CUDA graph inputs; the GPT
         # hyper-connection path follows the same pattern.
         self._mhc_recompute_manager = kwargs.pop("mhc_recompute_manager", None)
+        if self.config.mhc_single_pass:
+            # Eager single-pass forwards must not retain a microbatch's manager
+            # on a layer while another microbatch runs through this VPP chunk.
+            try:
+                return super().__call__(*args, **kwargs)
+            finally:
+                self._mhc_recompute_manager = None
         return super().__call__(*args, **kwargs)
 
     def _inner_is_moe(self) -> bool:
@@ -704,7 +713,7 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
         packed_seq_params: Optional[PackedSeqParams],
         padding_mask: Optional[Tensor],
         input_ids: Optional[Tensor] = None,
-        csa2_state: "CSA2State | None" = None,
+        **layer_kwargs: Any,
     ) -> Tuple[Tensor, Optional[Tensor]]:
         # When this wrapper is itself being CUDA-graph captured, the inner layer
         # must run as a plain forward: routing through its ``__call__`` would
@@ -727,7 +736,7 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
                 padding_mask=padding_mask,
                 input_ids=input_ids,
                 _called_from_hybrid_mhc_wrapper=True,
-                **({"csa2_state": csa2_state} if csa2_state is not None else {}),
+                **layer_kwargs,
             )
         else:
             # Non-transformer layers (e.g. MambaLayer; GatedDeltaNet which does
@@ -759,7 +768,7 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
         padding_mask: Optional[Tensor],
         input_ids: Optional[Tensor] = None,
         mhc_recompute_manager: Optional[MHCCheckpointManager] = None,
-        csa2_state: "CSA2State | None" = None,
+        **layer_kwargs: Any,
     ) -> Optional[Tuple[Tuple[Tensor, Optional[Tensor]], Optional[Tensor], float, bool]]:
         """Return a raw TransformerLayer branch output when the wrapped layer is split.
 
@@ -792,9 +801,11 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
                     packed_seq_params=packed_seq_params,
                     sequence_len_offset=sequence_len_offset,
                     mhc_recompute_manager=mhc_recompute_manager,
-                    **({"csa2_state": csa2_state} if csa2_state is not None else {}),
+                    **layer_kwargs,
                 )
             )
+            if self.config.mhc_single_pass:
+                layer.input_layernorm_checkpoint = None
             output_with_bias = layer._group_offload_output_with_bias(
                 output_with_bias, attn_norm_manager, forced_released_tensors=[residual]
             )
@@ -814,6 +825,8 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
             mhc_recompute_manager is not None and layer.mhc_checkpoint_pre_mlp_layernorm
         ):
             layer.pre_mlp_norm_checkpoint.discard_output_and_register_recompute(output_with_bias[0])
+            if self.config.mhc_single_pass:
+                layer.pre_mlp_norm_checkpoint = None
         if layer.mlp_norm_manager is not None:
             output_with_bias = layer._group_offload_output_with_bias(
                 output_with_bias, layer.mlp_norm_manager, forced_released_tensors=[residual]
@@ -832,8 +845,8 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
         padding_mask: Optional[Tensor] = None,
         input_ids: Optional[Tensor] = None,
         mhc_recompute_manager=None,
-        csa2_state: "CSA2State | None" = None,
         mhc_state: SinglePassMHCState | None = None,
+        **layer_kwargs: Any,
     ) -> Tuple[Tensor, Optional[Tensor]]:
         """Run the wrapped hybrid layer through one layer-boundary mHC update.
 
@@ -861,7 +874,7 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
             padding_mask,
             input_ids,
             mhc_recompute_manager=mhc_recompute_manager,
-            csa2_state=csa2_state,
+            **layer_kwargs,
         )
 
         if fast_path_result is None:
@@ -874,7 +887,7 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
                 packed_seq_params,
                 padding_mask,
                 input_ids,
-                csa2_state=csa2_state,
+                **layer_kwargs,
             )
             # The inner hybrid layer already applied its own local residual/dropout, so
             # it returns `aggregated + f(aggregated)`. We feed only the function
@@ -1028,6 +1041,18 @@ class HybridStack(MegatronModule):
             "--hybrid-layer-pattern by HybridModel."
         )
         self.layer_type_list = layer_type_list
+
+        self.forward_adapter: HybridStackForwardAdapter | None = None
+        if submodules.forward_adapter is not None:
+            self.forward_adapter = build_module(
+                submodules.forward_adapter,
+                config=config,
+                layer_type_list=layer_type_list,
+                pp_layer_offset=pp_layer_offset,
+                pre_process=pre_process,
+                post_process=post_process,
+                is_mtp_layer=is_mtp_layer,
+            )
 
         if getattr(self.config, "mla_down_proj_fusion", False):
             submodules = self._fuse_mla_down_proj(submodules)
@@ -1233,14 +1258,18 @@ class HybridStack(MegatronModule):
             if router is not None and getattr(router, "is_mtp_layer", False):
                 router.mtp_layer_number = mtp_layer_number
 
-    def set_input_tensor(self, input_tensor: Tensor):
+    def set_input_tensor(self, input_tensor: Any) -> None:
         """Set input tensor to be used instead of forward()'s input.
 
         When doing pipeline parallelism the input from the previous
         stage comes from communication, not from the input, so the
         model's forward_step_func won't have it. This function is thus
         used by internal code to bypass the input provided by the
-        forward_step_func"""
+        forward_step_func. An optional spec-injected adapter validates model-specific
+        inputs and controls whether the next forward consumes the pending input.
+        """
+        if self.forward_adapter is not None:
+            self.forward_adapter.validate_input(input_tensor)
         self.input_tensor = input_tensor
 
     def mamba_state_shapes_per_request(self) -> Optional[Tuple[Tuple[int], Tuple[int]]]:
@@ -1296,15 +1325,24 @@ class HybridStack(MegatronModule):
                 mhc_manager = MHCCheckpointManager()
         return layer_managers, is_recompute_block_end
 
-    @staticmethod
     def _finalize_mhc_recompute_layer(
+        self,
         mhc_manager: Optional[MHCCheckpointManager],
         hidden_states: Tensor,
         is_last_in_recompute_block: bool,
+        forward_context: HybridStackForwardContext,
     ) -> None:
         """Finalize MHC recompute state for the current layer when a block ends."""
         if mhc_manager is not None and is_last_in_recompute_block:
-            mhc_manager.discard_all_outputs_and_register_unified_recompute(hidden_states)
+            hook_tensors = (hidden_states,)
+            if (
+                forward_context.mhc_state is not None
+                and forward_context.mhc_state.pre_mix is not None
+            ):
+                hook_tensors += (forward_context.mhc_state.pre_mix,)
+            if self.forward_adapter is not None:
+                hook_tensors += self.forward_adapter.recompute_boundary_tensors(forward_context)
+            mhc_manager.discard_all_outputs_and_register_unified_recompute(hook_tensors)
 
     def forward(
         self,
@@ -1317,7 +1355,7 @@ class HybridStack(MegatronModule):
         packed_seq_params: Optional[PackedSeqParams] = None,
         padding_mask=None,
         input_ids: Optional[Tensor] = None,
-    ) -> Union[Tensor, Tuple[Tensor, Tensor]]:
+    ) -> Any:
         """
         Forward function of the HybridStack class.
 
@@ -1337,7 +1375,8 @@ class HybridStack(MegatronModule):
             ``enable_hyper_connections and post_process and mtp_num_layers > 0 and not
             is_mtp_layer`` — the extra element is the pre-contraction multi-stream tensor that
             MTP's ``_concat_embeddings`` consumes. Callers (e.g. ``HybridModel.forward``) must
-            handle both; pipeline send/recv only ever transfers the contracted ``hidden_states``.
+            handle both. A spec-injected forward adapter may restore model-specific input
+            and metadata from set_input_tensor() and export a custom output payload.
         """
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
@@ -1346,6 +1385,17 @@ class HybridStack(MegatronModule):
         if not self.pre_process:
             # See set_input_tensor()
             hidden_states = self.input_tensor
+
+        forward_context = HybridStackForwardContext()
+        if self.forward_adapter is not None:
+            if self.forward_adapter.consumes_input_tensor:
+                # Release the pending reference even if input restoration fails.
+                self.input_tensor = None
+            hidden_states, packed_seq_params, forward_context = (
+                self.forward_adapter.prepare_forward(
+                    hidden_states, packed_seq_params, inference_context
+                )
+            )
 
         # Delete the obsolete reference to the initial input tensor if necessary
         if isinstance(hidden_states, WrappedTensor):
@@ -1360,19 +1410,11 @@ class HybridStack(MegatronModule):
                 hidden_states, self.config.num_residual_streams
             )
 
-        csa2_kwargs = {}
-        mhc_state = None
-        if (
-            self.config.experimental_attention_variant == "dsv4_hybrid"
-            and self.config.dsv4_version == "v4.1"
-        ):
-            from megatron.core.transformer.experimental_attention_variant.csa2 import CSA2State
-
-            csa2_kwargs["csa2_state"] = CSA2State()
-        if self.config.mhc_single_pass:
+        if self.config.mhc_single_pass and forward_context.mhc_state is None:
             # The split attention/FFN wrappers share one pre-mix chain for
-            # this forward; a later forward must start with the identity mix.
-            mhc_state = SinglePassMHCState()
+            # this forward. Only the global entry starts with the identity mix.
+            forward_context.mhc_state = SinglePassMHCState()
+        mhc_state = forward_context.mhc_state
 
         if inference_context and inference_context.is_static_batching():
             # NOTE(bnorick): match BaseInferenceContext attributes for
@@ -1423,6 +1465,7 @@ class HybridStack(MegatronModule):
 
         use_mhc_recompute = (
             self.training
+            and torch.is_grad_enabled()
             and self.config.enable_hyper_connections
             and self.config.recompute_granularity == 'selective'
             and "mhc" in self.config.recompute_modules
@@ -1474,7 +1517,7 @@ class HybridStack(MegatronModule):
                                 sequence_len_offset=sequence_len_offset,
                                 packed_seq_params=packed_seq_params,
                                 padding_mask=padding_mask,
-                                **csa2_kwargs,
+                                **forward_context.layer_kwargs,
                             )
                             if mhc_state is not None:
                                 layer_kwargs["mhc_state"] = mhc_state
@@ -1506,6 +1549,7 @@ class HybridStack(MegatronModule):
                         mhc_manager=mhc_manager,
                         hidden_states=hidden_states,
                         is_last_in_recompute_block=mhc_is_last_in_recompute_block[l_no],
+                        forward_context=forward_context,
                     )
 
         # When mHC + MTP, save the pre-contraction multi-stream tensor for MTP input.
@@ -1550,9 +1594,10 @@ class HybridStack(MegatronModule):
             inp=hidden_states, requires_grad=hidden_states.requires_grad, keep_graph=True
         )
 
-        if mhc_multistream is not None:
-            return hidden_states, mhc_multistream
-        return hidden_states
+        output = (hidden_states, mhc_multistream) if mhc_multistream is not None else hidden_states
+        if self.forward_adapter is not None:
+            return self.forward_adapter.finalize_forward(output, packed_seq_params, forward_context)
+        return output
 
     def sharded_state_dict(
         self,

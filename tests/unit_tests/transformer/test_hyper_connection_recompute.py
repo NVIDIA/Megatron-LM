@@ -1049,15 +1049,14 @@ class TestSinglePassMHC:
         expanded = output.float() if bias is None else output.float() + bias.float()
         return (mixed + post.unsqueeze(-1) * expanded.unsqueeze(-2)).flatten(-2).to(output.dtype)
 
-    def test_single_pass_requires_local_state_and_rejects_recompute(self, device):
-        """The API must not silently reinitialize the shift or use V4 recomputation."""
+    def test_single_pass_requires_local_state_and_rejects_graph_slots(self, device):
+        """The API must not silently reinitialize the shift or use V4 graph slots."""
         module = self._module(device)
         hidden = torch.randn(3, 2, 128, device=device)
         with pytest.raises(ValueError, match="forward-local SinglePassMHCState"):
             module(hidden)
-        for kwargs in ({"mhc_recompute_manager": object()}, {"output_slot": object()}):
-            with pytest.raises(ValueError, match="activation recomputation"):
-                module(hidden, mhc_state=SinglePassMHCState(), **kwargs)
+        with pytest.raises(ValueError, match="CUDA Graph output slots"):
+            module(hidden, mhc_state=SinglePassMHCState(), output_slot=object())
 
     @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
     @pytest.mark.parametrize("amplitude", [1.0, 1e-12])

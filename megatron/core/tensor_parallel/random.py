@@ -923,13 +923,23 @@ class MHCCheckpointManager:
             )
         self.checkpoints.append(ckpt)
 
-    def discard_all_outputs_and_register_unified_recompute(self, hook_tensor):
-        """Discard all checkpoint outputs to save memory and register unified recompute hook."""
+    def discard_all_outputs_and_register_unified_recompute(
+        self, hook_tensor: torch.Tensor | tuple[torch.Tensor, ...]
+    ) -> None:
+        """Discard outputs and replay on the first gradient of a tensor or tuple of tensors.
+
+        A group with shared side outputs can receive a gradient through any of
+        them before its hidden-state gradient. Every live boundary edge must
+        trigger replay before an upstream consumer reads discarded storage.
+        """
         self.discard_all_outputs()
 
-        # Register unified recompute hook
-        if hook_tensor.requires_grad:
-            hook_tensor.register_hook(self._unified_recompute_hook)
+        hook_tensors = (hook_tensor,) if isinstance(hook_tensor, torch.Tensor) else hook_tensor
+        seen = set()
+        for tensor in hook_tensors:
+            if tensor.requires_grad and id(tensor) not in seen:
+                tensor.register_hook(self._unified_recompute_hook)
+                seen.add(id(tensor))
 
     def discard_all_outputs(self) -> None:
         """Discard all managed checkpoint outputs without registering a backward hook.
