@@ -1727,6 +1727,8 @@ def _get_graphable_te_callables(layers, config):
             can_group = getattr(layer, '_can_group_te_cuda_graph_with', None)
             if (
                 can_group is not None
+                and getattr(layer, '_te_cuda_graph_adapter', None) is None
+                and getattr(next_layer, '_te_cuda_graph_adapter', None) is None
                 and _layer_is_graphable(next_layer, config)
                 and can_group(next_layer)
             ):
@@ -1830,7 +1832,10 @@ class TECudaGraphHelper:
         """Whether attention-only graphs consume eager mHC recompute outputs."""
         from megatron.core.transformer.mhc_recompute import uses_mhc_recompute_attn_cuda_graph_split
 
-        return uses_mhc_recompute_attn_cuda_graph_split(self.config)
+        return uses_mhc_recompute_attn_cuda_graph_split(self.config) or any(
+            getattr(layer, '_uses_mhc_recompute_cuda_graph_split', lambda: False)()
+            for layer in getattr(self, 'flattened_callables', ())
+        )
 
     def _uses_graph_dynamic_dsa_route_arena(self):
         """Whether this capture needs block-owned, fixed-address DSA route metadata."""
@@ -2306,7 +2311,7 @@ class TECudaGraphHelper:
             means that once a microbatch's backward pass completes, its input buffers are no
             longer needed. This method tracks buffer lifecycle and reuses "consumed" buffers
             (those whose backward has completed) for new forward passes with matching tensor
-            signatures (shape, dtype, layout).
+            signatures (shape, dtype, layout, requires_grad).
 
             Example schedule: [1, 1, 1, 2, 2, 2, -2, 1, -2, 1, -2, 2, -1, 2, -1, -1, -2, -2, -1, -1]
             - Positive values indicate forward passes (chunk_id = value)
@@ -2336,8 +2341,9 @@ class TECudaGraphHelper:
                 Queue of forward samples per chunk awaiting their backward pass.
             - consumed_sample_queue: Dict[sample_keys, List[fwd_idx]]
                 Pool of buffer indices whose backward is complete, keyed by tensor signature.
-            - sample_keys: Tuple of (shape, dtype, layout) for args + (key, shape, dtype, layout)
-                for kwargs, used to match compatible buffers for reuse.
+            - sample_keys: Tuple of (shape, dtype, layout, requires_grad) for args +
+                (key, shape, dtype, layout, requires_grad) for kwargs, used to match
+                compatible buffers for reuse.
         """
         assert self.num_model_chunks == max(
             order
@@ -2392,6 +2398,9 @@ class TECudaGraphHelper:
                     return None
 
             static_inputs = layer.get_layer_static_inputs(self.seq_length, self.micro_batch_size)
+            adapter = getattr(layer, '_te_cuda_graph_adapter', None)
+            if adapter is not None:
+                static_inputs = adapter.get_static_inputs(static_inputs)
 
             if self._needs_full_local_padding_mask(layer, chunk_of_the_layer, static_inputs):
                 local_slen = self.config.max_seqlen_per_dp_cp_rank
@@ -2544,10 +2553,11 @@ class TECudaGraphHelper:
                             )
                         )
                         sample_args_keys = tuple(
-                            (t.shape, t.dtype, t.layout) for t in sample_args[per_callable_fwd_idx]
+                            (t.shape, t.dtype, t.layout, t.requires_grad)
+                            for t in sample_args[per_callable_fwd_idx]
                         )
                         sample_kwargs_keys = tuple(
-                            (k, v.shape, v.dtype, v.layout)
+                            (k, v.shape, v.dtype, v.layout, v.requires_grad)
                             for k, v in sorted(sample_kwargs[per_callable_fwd_idx].items())
                         )
                         sample_keys = sample_args_keys + sample_kwargs_keys
@@ -3000,7 +3010,10 @@ class TECudaGraphHelper:
                 # Starting from TE 2.6.0, make_graphed_callables() accepts different number
                 # of layers per chunk.
                 kwargs['_num_layers_per_chunk'] = self.num_layers_per_chunk
-            if is_te_min_version("2.7.0"):
+            if is_te_min_version("2.7.0") and not any(
+                getattr(layer, '_te_cuda_graph_adapter', None) is not None
+                for layer in self.flattened_callables
+            ):
                 # Starting from TE 2.7.0, make_graphed_callables() optimizes the graph memory
                 # usage by reusing input/output data buffers between graphs. The reuse pass
                 # rebinds ``sample_args`` entries in place, aliasing entries whose backward
@@ -3011,6 +3024,9 @@ class TECudaGraphHelper:
                 # window, so the reuse is safe with the arena;
                 # _validate_mhc_static_hidden_inputs() enforces the window-disjointness
                 # invariant after capture.
+                # State adapters introduce mixed floating/integer output tuples and
+                # input gradient flags. TE's reuse keys omit those distinctions;
+                # keep only MCore's signature-aware input reuse for adapted layers.
                 kwargs['_reuse_graph_input_output_buffers'] = True
 
             if sample_kwargs:

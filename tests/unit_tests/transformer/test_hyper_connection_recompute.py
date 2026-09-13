@@ -1049,14 +1049,97 @@ class TestSinglePassMHC:
         expanded = output.float() if bias is None else output.float() + bias.float()
         return (mixed + post.unsqueeze(-1) * expanded.unsqueeze(-2)).flatten(-2).to(output.dtype)
 
-    def test_single_pass_requires_local_state_and_rejects_graph_slots(self, device):
-        """The API must not silently reinitialize the shift or use V4 graph slots."""
+    def test_single_pass_requires_local_state_and_manager_for_graph_slots(self, device):
+        """A direct-write slot requires the manager that owns its backward restoration."""
         module = self._module(device)
         hidden = torch.randn(3, 2, 128, device=device)
         with pytest.raises(ValueError, match="forward-local SinglePassMHCState"):
             module(hidden)
-        with pytest.raises(ValueError, match="CUDA Graph output slots"):
+        with pytest.raises(ValueError, match="fixed mHC outputs require an mHC recompute manager"):
             module(hidden, mhc_state=SinglePassMHCState(), output_slot=object())
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+    @pytest.mark.parametrize("with_mix", [False, True])
+    @pytest.mark.parametrize("streams", [1, 4])
+    def test_single_pass_aggregate_direct_write_preserves_fp32_mix_gradient(
+        self, device, dtype, with_mix, streams
+    ):
+        """Native direct writes keep first-stream copies and FP32 weighted reductions exact."""
+        torch.manual_seed(2861)
+        module = self._module(device, num_residual_streams=streams)
+        hidden = torch.randn(
+            1, 1, streams * module.hidden_size, device=device, dtype=dtype, requires_grad=True
+        )
+        previous = (
+            torch.randn(1, 1, streams, device=device, dtype=torch.float32, requires_grad=True)
+            if with_mix
+            else None
+        )
+        slot = torch.empty(1, 1, module.hidden_size, device=device, dtype=dtype)
+        pointer = slot.data_ptr()
+        result = module._single_pass_aggregate(hidden, previous, out=slot)
+        expected = SinglePassMHCState(previous).contract(hidden, streams, use_fused=False)
+        torch.testing.assert_close(result, expected, atol=0, rtol=0)
+        assert result.data_ptr() == pointer
+        assert result.data_ptr() != hidden.data_ptr(), "stream 0 must never alias residual storage"
+        probe = torch.randn_like(result)
+        targets = (hidden, previous) if with_mix else (hidden,)
+        actual_gradients = torch.autograd.grad((result * probe).sum(), targets, retain_graph=True)
+        expected_gradients = torch.autograd.grad((expected * probe).sum(), targets)
+        for actual_gradient, expected_gradient in zip(actual_gradients, expected_gradients):
+            torch.testing.assert_close(actual_gradient, expected_gradient, atol=0, rtol=0)
+
+    @pytest.mark.parametrize("use_fused", [False, True])
+    @pytest.mark.parametrize("with_mix", [False, True])
+    def test_single_pass_graph_slot_survives_checkpoint_discard_and_restore(
+        self, device, use_fused, with_mix
+    ):
+        """Both native and fused CUDA producers restore the consumer's captured address."""
+        if device.type != "cuda":
+            pytest.skip("real CUDA arena slots require CUDA")
+        from megatron.core.transformer.mhc_recompute import MHCRecomputeArena
+
+        torch.manual_seed(4161)
+        module = self._module(device, use_fused_mhc=use_fused)
+        dtype = torch.bfloat16 if use_fused else torch.float32
+        module.to(dtype=dtype)
+        pairs = []
+        for microbatch in range(2):
+            hidden = torch.randn(3, 2, 4 * module.hidden_size, device=device, dtype=dtype)
+            hidden.requires_grad_()
+            previous = (
+                torch.randn(3, 2, 4, device=device, dtype=dtype, requires_grad=True)
+                if with_mix
+                else None
+            )
+            reference_hidden = hidden.detach().clone().requires_grad_()
+            reference_mix = previous.detach().clone().requires_grad_() if with_mix else None
+            manager = MHCCheckpointManager()
+            storage = torch.empty(3, 2, module.hidden_size, device=device, dtype=dtype)
+            slot = MHCRecomputeArena().bind_external_slot(microbatch, storage)
+            output = module(
+                hidden,
+                mhc_state=SinglePassMHCState(previous),
+                mhc_recompute_manager=manager,
+                output_slot=slot,
+            )[0]
+            expected = module(reference_hidden, mhc_state=SinglePassMHCState(reference_mix))[0]
+            torch.testing.assert_close(output, expected, atol=0, rtol=0)
+            loss = output.square().sum()
+            manager.discard_all_outputs_and_register_unified_recompute(loss)
+            slot.validate_output(output)
+            storage.fill_(float("nan"))
+            pairs.append((loss, expected, hidden, reference_hidden, previous, reference_mix, slot))
+        assert pairs[0][-1].metadata.data_ptr != pairs[1][-1].metadata.data_ptr
+        for loss, expected, hidden, reference_hidden, previous, reference_mix, slot in reversed(
+            pairs
+        ):
+            loss.backward()
+            expected.square().sum().backward()
+            slot.validate_address()
+            torch.testing.assert_close(hidden.grad, reference_hidden.grad)
+            if with_mix:
+                torch.testing.assert_close(previous.grad, reference_mix.grad)
 
     @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
     @pytest.mark.parametrize("amplitude", [1.0, 1e-12])

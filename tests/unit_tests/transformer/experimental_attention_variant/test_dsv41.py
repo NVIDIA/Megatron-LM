@@ -185,6 +185,83 @@ def test_v41_full_recompute_does_not_enable_core_attention_selective_recompute()
         _make_config(recompute_granularity="selective", recompute_modules=["core_attn"])
 
 
+@pytest.mark.parametrize("mhc", [False, True])
+@pytest.mark.parametrize("scopes", [["attn"], ["attn", "moe_router"], ["attn", "mlp"]])
+def test_v41_accepts_te_layer_graph_configuration(mhc, scopes):
+    config = _make_config(
+        cuda_graph_impl="transformer_engine",
+        cuda_graph_modules=scopes,
+        enable_hyper_connections=mhc,
+        moe_grouped_gemm=True,
+        moe_layer_freq=[0, 1, 1, 1, 1, 1] if "mlp" in scopes else 1,
+    )
+    assert config.cuda_graph_impl == "transformer_engine"
+    assert config.mhc_single_pass == mhc
+
+
+@pytest.mark.parametrize(
+    "module", ["mhc", "layernorm", "mla_up_proj", "moe_act", "moe", "shared_experts"]
+)
+def test_v41_te_graph_keeps_existing_selective_modules(module):
+    config = _make_config(
+        cuda_graph_impl="transformer_engine",
+        cuda_graph_modules=["attn"],
+        recompute_granularity="selective",
+        recompute_modules=[module],
+        moe_grouped_gemm=True,
+    )
+    assert config.recompute_modules == [module]
+
+
+@pytest.mark.parametrize(
+    "options, message",
+    [
+        ({"cuda_graph_impl": "local"}, "require cuda_graph_impl='transformer_engine'"),
+        ({"cuda_graph_impl": "full_iteration"}, "require cuda_graph_impl='transformer_engine'"),
+        ({"mhc_single_pass": False}, "require single-pass mHC"),
+        (
+            {
+                "recompute_granularity": "full",
+                "recompute_method": "uniform",
+                "recompute_num_layers": 1,
+            },
+            "do not yet support full recompute",
+        ),
+    ],
+)
+def test_v41_cuda_graph_rejects_unimplemented_state_lifetimes(options, message):
+    values = dict(cuda_graph_impl="transformer_engine", cuda_graph_modules=["attn"])
+    values.update(options)
+    with pytest.raises(ValueError, match=message):
+        _make_config(**values)
+
+
+@pytest.mark.parametrize("scopes", [["attn"], ["attn", "moe_router"]])
+@pytest.mark.parametrize("modules", [["mhc"], ["mhc", "layernorm", "mla_up_proj"]])
+def test_v41_te_graph_accepts_mhc_recompute_with_packed_pipeline(monkeypatch, scopes, modules):
+    # Configuration-only coverage; real capture is conditional on CUDA/TE.
+    monkeypatch.setattr(
+        "megatron.core.transformer.transformer_config.is_te_min_version", lambda *args: True
+    )
+    config = _make_config(
+        is_hybrid_model=True,
+        cuda_graph_impl="transformer_engine",
+        cuda_graph_modules=scopes,
+        recompute_granularity="selective",
+        recompute_modules=modules,
+        pipeline_model_parallel_size=2,
+        pipeline_dtype=torch.float32,
+        moe_token_dispatcher_type="alltoall",
+        sequence_packing_scheduler="dp_balanced",
+        max_seqlen_per_dp_cp_rank=32,
+        thd_max_packed_sequences=4,
+        pad_packed_seq_alignment="max",
+    )
+    assert config.mhc_single_pass
+    assert config.recompute_modules == modules
+    assert not config.mhc_recompute_attn_cuda_graph_split
+
+
 @pytest.mark.parametrize(
     "options",
     [

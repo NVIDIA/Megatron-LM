@@ -4557,7 +4557,15 @@ class TransformerConfig(ModelParallelConfig):
             if getattr(self, name):
                 raise ValueError(f"Native V4.1 requires {name}=False")
         if self.cuda_graph_impl != "none" or self.enable_cuda_graph:
-            raise ValueError("Native V4.1 does not yet support CUDA Graphs")
+            if self.cuda_graph_impl != "transformer_engine" or self.enable_cuda_graph:
+                raise ValueError("V4.1 CUDA Graphs require cuda_graph_impl='transformer_engine'")
+            if self.enable_hyper_connections and not self.mhc_single_pass:
+                raise ValueError("V4.1 CUDA Graphs require single-pass mHC when mHC is enabled")
+            if self.recompute_granularity == "full":
+                raise ValueError(
+                    "V4.1 per-layer CUDA Graphs do not yet support full recompute; "
+                    "their checkpoint boundaries must remain outside capture"
+                )
         if self.csa_dense_mode or self.dsa_indexer_rotate_activation or self.qk_clip:
             raise ValueError(
                 "V4.1 does not use dense CSA, indexer Hadamard rotation, or QK clipping"
@@ -4678,8 +4686,12 @@ class TransformerConfig(ModelParallelConfig):
                     "recompute_granularity='full' or 'selective'; supported selective modules "
                     "are 'mhc', 'layernorm', 'mla_up_proj', 'moe_act', 'moe', and 'shared_experts'"
                 )
-        if self.cuda_graph_impl != "none":
-            raise ValueError("mhc_single_pass does not yet support CUDA Graphs")
+        if self.cuda_graph_impl != "none" and not (
+            self.experimental_attention_variant == "dsv4_hybrid"
+            and self.dsv4_version == "v4.1"
+            and self.cuda_graph_impl == "transformer_engine"
+        ):
+            raise ValueError("mhc_single_pass CUDA Graphs require the V4.1 Hybrid TE state adapter")
         if self.mtp_num_layers:
             raise ValueError("mhc_single_pass does not yet support MTP")
         if self.pipeline_model_parallel_size != 1 and not (

@@ -143,7 +143,14 @@ class NativeHAggregateInto(torch.autograd.Function):
             raise ValueError("H-aggregate caller-owned output must be a detached tensor")
 
         ctx.mark_dirty(out)
-        torch.sum(x * h_pre.unsqueeze(-1), dim=2, out=out)
+        if h_pre.dtype == torch.float32 and x.dtype in (torch.bfloat16, torch.float16):
+            # Single-pass native mixing reduces FP32 products before its final
+            # activation cast. sum(..., out=out) instead uses out.dtype for the
+            # reduction and rounds those products early. The FP32 temporary is
+            # consumed immediately; only the fixed arena output stays live.
+            out.copy_(torch.sum(x.float() * h_pre.unsqueeze(-1), dim=2))
+        else:
+            torch.sum(x * h_pre.unsqueeze(-1), dim=2, out=out)
         ctx.save_for_backward(x, h_pre)
         return out
 
@@ -608,7 +615,7 @@ class HyperConnectionModule(MegatronModule):
         """
         if self.single_pass:
             if out is not None:
-                raise ValueError("Single-pass mHC does not support recompute output storage")
+                return self._single_pass_aggregate(x, h_pre, out=out)
             return SinglePassMHCState(h_pre).contract(
                 x, self.n, use_fused=self.config.use_fused_mhc
             )
@@ -683,8 +690,8 @@ class HyperConnectionModule(MegatronModule):
         if self.single_pass:
             if mhc_state is None:
                 raise ValueError("Single-pass mHC requires a forward-local SinglePassMHCState")
-            if output_slot is not None:
-                raise ValueError("Single-pass mHC does not yet support CUDA Graph output slots")
+            if output_slot is not None and mhc_recompute_manager is None:
+                raise ValueError("fixed mHC outputs require an mHC recompute manager")
             if self.config.use_fused_mhc:
                 # Accumulate the residual/branch gradients before the mapping
                 # gradient, which also receives the next sublayer's pre-mix edge.
@@ -704,9 +711,14 @@ class HyperConnectionModule(MegatronModule):
                 # Save the incoming mix as a tensor argument. Replaying a closure
                 # over mhc_state would read a later sublayer's mix and lose its
                 # original autograd edge (possibly across a pipeline boundary).
-                aggregated = CheckpointWithoutOutput(ckpt_manager=mhc_recompute_manager).checkpoint(
-                    self._single_pass_aggregate, aggregate_input, mhc_state.pre_mix
+                aggregate_function = (
+                    self._single_pass_aggregate
+                    if output_slot is None
+                    else lambda x, h: self._single_pass_aggregate(x, h, out=output_slot.writer)
                 )
+                aggregated = CheckpointWithoutOutput(
+                    ckpt_manager=mhc_recompute_manager, output_slot=output_slot
+                ).checkpoint(aggregate_function, aggregate_input, mhc_state.pre_mix)
             mhc_state.pre_mix = h_pre
             return aggregated, h_res, h_post, residual
 
@@ -719,8 +731,39 @@ class HyperConnectionModule(MegatronModule):
                 raise ValueError("fixed mHC outputs require an mHC recompute manager")
             return self._forward_normal(hidden_states)
 
-    def _single_pass_aggregate(self, hidden_states: Tensor, pre_mix: Tensor | None) -> Tensor:
+    def _single_pass_aggregate(
+        self, hidden_states: Tensor, pre_mix: Tensor | None, out: Tensor | None = None
+    ) -> Tensor:
         """Replay aggregation with an explicit, forward-time mix and owned output storage."""
+        if out is not None:
+            streams = hidden_states.unflatten(-1, (self.n, self.hidden_size))
+            if pre_mix is None:
+                # The first aggregate selects stream zero, including when the
+                # other streams contain non-finite values. Copy that selection
+                # into a fresh arena writer so residual storage is never owned
+                # by the aggregate checkpoint and its gradient only reaches
+                # stream zero. The copy's autograd edge is built on recompute.
+                if (
+                    out.shape != hidden_states.shape[:2] + (self.hidden_size,)
+                    or out.dtype != hidden_states.dtype
+                    or out.device != hidden_states.device
+                    or not out.is_contiguous()
+                    or out.requires_grad
+                ):
+                    raise ValueError(
+                        "Single-pass mHC output must be a detached matching contiguous tensor"
+                    )
+                return out.copy_(streams[..., 0, :])
+            expected_shape = hidden_states.shape[:2] + (self.n,)
+            if pre_mix.shape != expected_shape:
+                raise ValueError(
+                    f"Single-pass mHC pre_mix shape {tuple(pre_mix.shape)} "
+                    f"does not match {tuple(expected_shape)}"
+                )
+            # Native single-pass mixing retains FP32 coefficients and arithmetic;
+            # the fused DSv4 kernels use activation-dtype coefficients instead.
+            mix = pre_mix.to(hidden_states.dtype) if self.config.use_fused_mhc else pre_mix.float()
+            return self._h_aggregate_into_op(streams, mix, out)
         aggregated = SinglePassMHCState(pre_mix).contract(
             hidden_states, self.n, use_fused=self.config.use_fused_mhc
         )

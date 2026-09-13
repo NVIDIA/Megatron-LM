@@ -713,6 +713,9 @@ class GraphableMegatronModule(MegatronModule):
         Hence, check if the arguments are all tensors.
         """
         try:
+            # State adapters publish side outputs before the eager layer tail resumes.
+            # This forward-local callback stays outside TE's tensor-only input surface.
+            output_handler = kwargs.pop('_te_graph_output_handler', None)
             for arg in args:
                 assert isinstance(arg, torch.Tensor), "CUDA graph accepts only Tensor inputs."
             for _, value in kwargs.items():
@@ -732,7 +735,8 @@ class GraphableMegatronModule(MegatronModule):
 
             for hook, hook_args in self.cuda_graph_manual_hooks:
                 hook(*hook_args)
-            return self.cuda_graphs[cg_index](*cudagraph_args, **cudagraph_kwargs)
+            outputs = self.cuda_graphs[cg_index](*cudagraph_args, **cudagraph_kwargs)
+            return output_handler(outputs) if output_handler is not None else outputs
         finally:
             self._te_cuda_graph_route_replay_state = None
 
@@ -786,12 +790,17 @@ class GraphableMegatronModule(MegatronModule):
         if self._should_call_local_cudagraph(*args, **kwargs):
             return self.cudagraph_manager(self, args, kwargs)
         elif self._should_call_te_cudagraph(*args, **kwargs):
+            adapter = getattr(self, '_te_cuda_graph_adapter', None)
             if not self.cuda_graphs:
                 # Do CUDA Graphs capture.
                 cuda_graph_func = self._te_cuda_graph_capture
+                if adapter is not None:
+                    return adapter.capture(cuda_graph_func, *args, **kwargs)
             else:
                 # Do CUDA Graphs replay.
                 cuda_graph_func = self._te_cuda_graph_replay
+                if adapter is not None:
+                    return adapter.replay(cuda_graph_func, *args, **kwargs)
             return cuda_graph_func(*args, **kwargs)
         return super().__call__(*args, **kwargs)
 
