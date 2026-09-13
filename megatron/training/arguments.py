@@ -3817,17 +3817,6 @@ def _add_experimental_attention_variant_args(parser):
         help='Number of source tokens selected per query token by DSA.',
     )
     _maybe_add_argument(
-        '--dsa-min-memory-profile',
-        action='store_true',
-        help='Print per-layer DSA min-memory forward/backward timing breakdowns.',
-    )
-    _maybe_add_argument(
-        '--dsa-min-memory-profile-rank',
-        type=int,
-        default=0,
-        help='Global rank that prints DSA min-memory timings. Set to -1 to print on every rank.',
-    )
-    _maybe_add_argument(
         '--dsa-fwd-use-dense-attn',
         action='store_true',
         help=(
