@@ -1475,20 +1475,41 @@ class HybridStack(MegatronModule):
         )
 
         with outer_fp8_context:
-            if self.config.recompute_granularity == 'full' and self.training:
-                hidden_states = checkpointed_forward(
-                    self,
-                    hidden_states=hidden_states,
-                    attention_mask=attention_mask,
-                    context=None,
-                    context_mask=None,
-                    rotary_pos_emb=rotary_pos_emb,
-                    attention_bias=None,
-                    packed_seq_params=packed_seq_params,
-                    padding_mask=padding_mask,
-                    input_ids=input_ids,
-                    use_inner_quantization_context=(use_inner_fp8_context or use_fp4_context),
-                )
+            if (
+                self.config.recompute_granularity == 'full'
+                and self.training
+                and torch.is_grad_enabled()
+            ):
+                # Stateful adapters may own full replay; other stacks use the common loop.
+                adapter_checkpoint = getattr(self.forward_adapter, "checkpointed_forward", None)
+                if adapter_checkpoint is not None:
+                    hidden_states = adapter_checkpoint(
+                        self.layers,
+                        hidden_states,
+                        forward_context,
+                        tp_group=self.tp_group,
+                        quantization_context=get_inner_quant_context,
+                        attention_mask=attention_mask,
+                        rotary_pos_emb=rotary_pos_emb,
+                        packed_seq_params=packed_seq_params,
+                        padding_mask=padding_mask,
+                        input_ids=input_ids,
+                    )
+                    mhc_state = forward_context.mhc_state
+                else:
+                    hidden_states = checkpointed_forward(
+                        self,
+                        hidden_states=hidden_states,
+                        attention_mask=attention_mask,
+                        context=None,
+                        context_mask=None,
+                        rotary_pos_emb=rotary_pos_emb,
+                        attention_bias=None,
+                        packed_seq_params=packed_seq_params,
+                        padding_mask=padding_mask,
+                        input_ids=input_ids,
+                        use_inner_quantization_context=(use_inner_fp8_context or use_fp4_context),
+                    )
             else:
                 grouped_tail_to_skip = None
                 for l_no, layer in enumerate(self.layers):

@@ -4488,16 +4488,28 @@ class TransformerConfig(ModelParallelConfig):
         if self.dynamic_context_parallel:
             raise ValueError("Native V4.1 does not yet support dynamic CP")
         if self.recompute_granularity is not None and not (
-            self.recompute_granularity == "selective"
-            and ("mhc" not in self.recompute_modules or self.mhc_single_pass)
-            and set(self.recompute_modules)
-            <= {"mhc", "layernorm", "mla_up_proj", "moe_act", "moe", "shared_experts"}
+            self.recompute_granularity == "full"
+            or (
+                self.recompute_granularity == "selective"
+                and ("mhc" not in self.recompute_modules or self.mhc_single_pass)
+                and set(self.recompute_modules)
+                <= {"mhc", "layernorm", "mla_up_proj", "moe_act", "moe", "shared_experts"}
+            )
         ):
             raise ValueError(
-                "V4.1 activation recomputation requires recompute_granularity='selective'; "
-                "supported modules are 'mhc', 'layernorm', 'mla_up_proj', 'moe_act', "
-                "'moe', and 'shared_experts'. The 'mhc' module requires single-pass Hybrid. "
-                "Full-layer and CSA2 core-attention replay are not supported"
+                "V4.1 activation recomputation requires recompute_granularity='full' or "
+                "'selective'; supported selective modules are 'mhc', 'layernorm', 'mla_up_proj', "
+                "'moe_act', 'moe', and 'shared_experts'. The 'mhc' module requires single-pass Hybrid. "
+                "Full-layer replay requires HybridModel and its state adapter; "
+                "CSA2 core-attention selective replay is not supported"
+            )
+        if (
+            self.recompute_granularity == "full"
+            and self.recompute_num_layers is not None
+            and (type(self.recompute_num_layers) is not int or self.recompute_num_layers <= 0)
+        ):
+            raise ValueError(
+                "V4.1 full recomputation requires positive integer recompute_num_layers"
             )
         if self.mtp_num_layers:
             raise ValueError("V4.1 backbone configuration must not include MTP/DSpark layers")
@@ -4652,14 +4664,19 @@ class TransformerConfig(ModelParallelConfig):
             if not (
                 self.experimental_attention_variant == "dsv4_hybrid"
                 and self.dsv4_version == "v4.1"
-                and self.recompute_granularity == "selective"
-                and set(self.recompute_modules)
-                <= {"mhc", "layernorm", "mla_up_proj", "moe_act", "moe", "shared_experts"}
+                and (
+                    self.recompute_granularity == "full"
+                    or (
+                        self.recompute_granularity == "selective"
+                        and set(self.recompute_modules)
+                        <= {"mhc", "layernorm", "mla_up_proj", "moe_act", "moe", "shared_experts"}
+                    )
+                )
             ):
                 raise ValueError(
                     "mhc_single_pass activation recomputation requires V4.1 Hybrid with "
-                    "recompute_granularity='selective'; supported modules are 'mhc', "
-                    "'layernorm', 'mla_up_proj', 'moe_act', 'moe', and 'shared_experts'"
+                    "recompute_granularity='full' or 'selective'; supported selective modules "
+                    "are 'mhc', 'layernorm', 'mla_up_proj', 'moe_act', 'moe', and 'shared_experts'"
                 )
         if self.cuda_graph_impl != "none":
             raise ValueError("mhc_single_pass does not yet support CUDA Graphs")
