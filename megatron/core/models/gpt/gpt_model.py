@@ -326,7 +326,27 @@ class GPTModel(LanguageModule):
         if cp_size is None:
             cp_size = self.config.context_parallel_size
         upper_bound = getattr(self.config, '_cuda_graph_thd_rotary_seq_lens', {}).get(int(cp_size))
-        return rotary_seq_len if upper_bound is None else min(rotary_seq_len, upper_bound)
+        if upper_bound is None or rotary_seq_len <= upper_bound:
+            return rotary_seq_len
+
+        # pad_sequence_for_thd records this before appending a synthetic dummy tail.
+        # Other callers must supply real cumulative lengths to justify a shorter table.
+        real_max = getattr(packed_seq_params, '_max_seqlen_unpadded', None)
+        if real_max is None:
+            boundaries = [
+                getattr(packed_seq_params, name, None) for name in ('cu_seqlens_q', 'cu_seqlens_kv')
+            ]
+            if any(cu is None for cu in boundaries):
+                raise ValueError("Cannot bound THD RoPE without real sequence-length metadata.")
+            real_max = max(
+                int((cu[1:] - cu[:-1]).max().item()) if cu.numel() > 1 else 0 for cu in boundaries
+            )
+        if real_max > upper_bound:
+            raise ValueError(
+                f"THD real sequence length {real_max} exceeds the captured RoPE limit "
+                f"{upper_bound} for CP{cp_size}. Increase the capture bound or filter the input."
+            )
+        return upper_bound
 
     def _preprocess(
         self,

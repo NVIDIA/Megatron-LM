@@ -1267,7 +1267,9 @@ class TestDynamicMicrobatchSlots:
         helper = TECudaGraphHelper.__new__(TECudaGraphHelper)
         helper._graphs_created = True
         helper.config = SimpleNamespace(
-            _cuda_graph_num_microbatches=8, _cuda_graph_thd_rotary_seq_lens={2: 4096}
+            _cuda_graph_num_microbatches=8,
+            _cuda_graph_thd_rotary_seq_lens={2: 4096},
+            _cuda_graph_allowed_microbatches=frozenset((4, 8)),
         )
         chunk_config = SimpleNamespace(_cuda_graph_thd_rotary_seq_lens={2: 4096})
         helper.chunks_with_decoder = [SimpleNamespace(config=chunk_config)]
@@ -1296,6 +1298,7 @@ class TestDynamicMicrobatchSlots:
         assert layer.cuda_graphs == []
         assert layer.cuda_graphs_by_dynamic_cp_size == {}
         assert not hasattr(helper.config, '_cuda_graph_num_microbatches')
+        assert not hasattr(helper.config, '_cuda_graph_allowed_microbatches')
         assert not hasattr(helper.config, '_cuda_graph_thd_rotary_seq_lens')
         assert not hasattr(chunk_config, '_cuda_graph_thd_rotary_seq_lens')
 
@@ -1373,18 +1376,14 @@ class TestDynamicMicrobatchSlots:
             ),
         )
 
-        assert (
-            model._bound_thd_rotary_seq_len(
-                32768, SimpleNamespace(qkv_format='thd', local_cp_size=8)
+        def metadata(cp_size):
+            cu = torch.tensor([0, 16384, 16384])
+            return SimpleNamespace(
+                qkv_format='thd', local_cp_size=cp_size, cu_seqlens_q=cu, cu_seqlens_kv=cu
             )
-            == 16384
-        )
-        assert (
-            model._bound_thd_rotary_seq_len(
-                32768, SimpleNamespace(qkv_format='thd', local_cp_size=None)
-            )
-            == 16384
-        )
+
+        assert model._bound_thd_rotary_seq_len(32768, metadata(8)) == 16384
+        assert model._bound_thd_rotary_seq_len(32768, metadata(None)) == 16384
         assert (
             model._bound_thd_rotary_seq_len(
                 32768, SimpleNamespace(qkv_format='sbhd', local_cp_size=8)
@@ -1392,6 +1391,75 @@ class TestDynamicMicrobatchSlots:
             == 32768
         )
         assert model._bound_thd_rotary_seq_len(32768, None) == 32768
+
+    @pytest.mark.internal
+    @pytest.mark.parametrize("overlong_side", ('q', 'kv', 'missing'))
+    def test_thd_graph_runtime_rope_rejects_unproved_shortening(self, overlong_side):
+        from megatron.core.models.gpt.gpt_model import GPTModel
+
+        model = GPTModel.__new__(GPTModel)
+        object.__setattr__(
+            model,
+            'config',
+            SimpleNamespace(context_parallel_size=1, _cuda_graph_thd_rotary_seq_lens={1: 4}),
+        )
+        cu = torch.tensor([0, 4])
+        params = PackedSeqParams(qkv_format='thd', cu_seqlens_q=cu, cu_seqlens_kv=cu)
+        if overlong_side == 'missing':
+            params.cu_seqlens_kv = None
+        else:
+            setattr(params, f'cu_seqlens_{overlong_side}', torch.tensor([0, 8]))
+        with pytest.raises(
+            ValueError, match="real sequence-length metadata|exceeds the captured RoPE"
+        ):
+            model._bound_thd_rotary_seq_len(8, params)
+
+    @pytest.mark.internal
+    @pytest.mark.parametrize("tail_policy", ('append_dummy_seq', 'extend_last'))
+    def test_thd_graph_runtime_rope_allows_padding_beyond_real_limit(self, tail_policy):
+        from megatron.core.models.gpt.gpt_model import GPTModel
+
+        model = GPTModel.__new__(GPTModel)
+        object.__setattr__(
+            model,
+            'config',
+            SimpleNamespace(context_parallel_size=1, _cuda_graph_thd_rotary_seq_lens={1: 4}),
+        )
+        cu = torch.tensor([0, 4], dtype=torch.int32)
+        params = PackedSeqParams(
+            qkv_format='thd',
+            cu_seqlens_q=cu,
+            cu_seqlens_kv=cu,
+            cu_seqlens_q_padded=cu,
+            cu_seqlens_kv_padded=cu,
+            max_seqlen_q=4,
+            max_seqlen_kv=4,
+        )
+        padded = pad_sequence_for_thd(
+            torch.ones(1, 4),
+            None,
+            None,
+            None,
+            params,
+            target_len=16,
+            max_num_seqs=4,
+            tail_padding_policy=tail_policy,
+            cp_size=1,
+        )[4]
+        assert padded._max_seqlen_unpadded == 4
+        assert model._bound_thd_rotary_seq_len(16, padded) == 4
+        repadded = pad_sequence_for_thd(
+            torch.ones(1, 16),
+            None,
+            None,
+            None,
+            padded,
+            target_len=16,
+            max_num_seqs=4,
+            tail_padding_policy=tail_policy,
+            cp_size=1,
+        )[4]
+        assert model._bound_thd_rotary_seq_len(16, repadded) == 4
 
     @pytest.mark.internal
     def test_thd_capture_dummy_boundaries_are_seeded_in_place(self):
@@ -1823,14 +1891,18 @@ class TestDynamicMicrobatchSlots:
         helper.pp_group = SimpleNamespace(size=lambda: 8)
         helper.num_microbatches = 16
         helper._dynamic_slot_liveness_limit = 64
+        helper._dynamic_slot_liveness_counts = (16, 32, 48, 64)
 
         helper._publish_dynamic_cp_graph_microbatch_limit()
         assert helper.config._cuda_graph_num_microbatches == 64
+        assert helper.config._cuda_graph_allowed_microbatches == frozenset((16, 32, 48, 64))
 
         helper._dynamic_slot_liveness_limit = None
+        helper._dynamic_slot_liveness_counts = None
         helper.num_microbatches = 32
         helper._publish_dynamic_cp_graph_microbatch_limit()
         assert helper.config._cuda_graph_num_microbatches == 32
+        assert not hasattr(helper.config, '_cuda_graph_allowed_microbatches')
 
     @pytest.mark.internal
     @pytest.mark.parametrize(

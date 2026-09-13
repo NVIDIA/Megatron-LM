@@ -29,6 +29,21 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.multi_token_prediction import mtp_on_this_rank
 
 
+def _validate_cuda_graph_microbatch_count(config, num_microbatches: int) -> None:
+    """Require runtime packing to stay within the captured schedule proof."""
+    limit = getattr(config, '_cuda_graph_num_microbatches', None)
+    if limit is not None and not 1 <= num_microbatches <= limit:
+        raise ValueError(
+            f"{num_microbatches=} is outside the captured CUDA graph range 1..{limit}."
+        )
+    allowed = getattr(config, '_cuda_graph_allowed_microbatches', None)
+    if allowed is not None and num_microbatches not in allowed:
+        raise ValueError(
+            f"{num_microbatches=} is not covered by the CUDA graph liveness proof; "
+            f"supported counts are {sorted(allowed)}."
+        )
+
+
 def _build_thd_padding_mask(
     cu_seqlens: torch.Tensor, cu_seqlens_padded: torch.Tensor
 ) -> torch.Tensor:
@@ -392,9 +407,7 @@ class DpBalancedScheduler(BasePackingScheduler):
             )
         )
         num_micro_batches = int(num_micro_batches)
-        graph_slots = getattr(config, '_cuda_graph_num_microbatches', None)
-        if graph_slots is not None and num_micro_batches > graph_slots:
-            raise ValueError(f"{num_micro_batches=} exceeds captured CUDA graph {graph_slots=}.")
+        _validate_cuda_graph_microbatch_count(config, num_micro_batches)
 
         # Step 8: Broadcast to TP group and create data_iterator
         new_data_iterator = create_data_iterator(

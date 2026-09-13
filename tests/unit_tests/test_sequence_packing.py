@@ -27,6 +27,25 @@ from megatron.training.global_vars import unset_global_variables
 from tests.unit_tests.test_utilities import Utils
 
 
+@pytest.mark.parametrize("count", (0, 3, 5, 9))
+def test_cuda_graph_microbatch_count_rejects_unproved_schedule(count):
+    config = SimpleNamespace(
+        _cuda_graph_num_microbatches=8, _cuda_graph_allowed_microbatches=frozenset((4, 8))
+    )
+    with pytest.raises(ValueError, match="captured CUDA graph range|liveness proof"):
+        data_schedule._validate_cuda_graph_microbatch_count(config, count)
+
+
+def test_cuda_graph_microbatch_count_preserves_eager_and_fallback_paths():
+    config = SimpleNamespace()
+    data_schedule._validate_cuda_graph_microbatch_count(config, 3)
+    config._cuda_graph_num_microbatches = 8
+    data_schedule._validate_cuda_graph_microbatch_count(config, 3)
+    config._cuda_graph_allowed_microbatches = frozenset((4, 8))
+    for count in (4, 8):
+        data_schedule._validate_cuda_graph_microbatch_count(config, count)
+
+
 def test_scheduler_max_real_num_seqs_reserves_dummy_sequence():
     config = SimpleNamespace(
         thd_max_packed_sequences=32,

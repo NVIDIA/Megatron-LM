@@ -542,13 +542,23 @@ def pad_sequence_for_thd(
         )
     )
 
-    # Reject individual packed sequences that cannot fit the resolved target.
-    if packed_seq_params.cu_seqlens_q is not None:
-        _cu = packed_seq_params.cu_seqlens_q
-        _individual_lens = _cu[1:] - _cu[:-1]
-        _max_individual = int(_individual_lens.max().item()) if _individual_lens.numel() > 0 else 0
-        assert _max_individual <= global_target_len, (
-            f"Individual request length ({_max_individual}) exceeds the global max sequence length "
+    # Keep the real length before adding a synthetic padding sequence. This host-only
+    # validation value is deliberately not a dataclass field or a graph/TE input.
+    max_seqlen_unpadded = getattr(packed_seq_params, '_max_seqlen_unpadded', None)
+    if max_seqlen_unpadded is None:
+        boundaries = {
+            id(cu): cu
+            for cu in (packed_seq_params.cu_seqlens_q, packed_seq_params.cu_seqlens_kv)
+            if cu is not None
+        }
+        if boundaries:
+            max_seqlen_unpadded = max(
+                int((cu[1:] - cu[:-1]).max().item()) if cu.numel() > 1 else 0
+                for cu in boundaries.values()
+            )
+    if max_seqlen_unpadded is not None:
+        assert max_seqlen_unpadded <= global_target_len, (
+            f"Individual request length ({max_seqlen_unpadded}) exceeds the global max sequence length "
             f"({global_target_len}). Increase --max-seqlen-per-dp-cp-rank / alignment, "
             f"or filter out overlong requests."
         )
@@ -685,6 +695,8 @@ def pad_sequence_for_thd(
             )
         ),
     )
+
+    padded_params._max_seqlen_unpadded = max_seqlen_unpadded
 
     # True marks padded local token slots for routing/loss paths.
     tail_padding_mask = (

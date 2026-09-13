@@ -1844,6 +1844,7 @@ class TECudaGraphHelper:
         # _get_cuda_graph_input_data().
         self.num_microbatches = None
         self._dynamic_slot_liveness_limit = None
+        self._dynamic_slot_liveness_counts = None
 
         self._discover_layers()
         self._thd_rotary_seq_lens = thd_rotary_seq_lens
@@ -2388,6 +2389,16 @@ class TECudaGraphHelper:
             self.config._cuda_graph_num_microbatches = (
                 self._dynamic_slot_liveness_limit or self.num_microbatches
             )
+            counts = getattr(self, '_dynamic_slot_liveness_counts', None)
+            if counts is not None:
+                self.config._cuda_graph_allowed_microbatches = frozenset(counts)
+            else:
+                vars(self.config).pop('_cuda_graph_allowed_microbatches', None)
+
+    def _clear_dynamic_cp_graph_microbatch_limit(self) -> None:
+        """Remove the runtime schedule contract when its graphs are discarded."""
+        vars(self.config).pop('_cuda_graph_num_microbatches', None)
+        vars(self.config).pop('_cuda_graph_allowed_microbatches', None)
 
     def _needs_full_local_padding_mask(self, layer, chunk, static_inputs) -> bool:
         """Whether this layer's static padding_mask needs full max_seqlen_per_dp_cp_rank.
@@ -2703,6 +2714,7 @@ class TECudaGraphHelper:
                         ),
                     )
                 )
+                self._dynamic_slot_liveness_counts = candidate_num_microbatches_values
                 possible_orders = tuple(
                     tuple(
                         self._build_pipeline_order(
@@ -3394,6 +3406,8 @@ class TECudaGraphHelper:
                 cleanup()
         with suppress(BaseException):
             self._clear_thd_rotary_seq_lens()
+        with suppress(BaseException):
+            self._clear_dynamic_cp_graph_microbatch_limit()
 
     def _install_captured_graphs(
         self, capture_contexts, captured_graphs, captured_sample_args=None
@@ -3595,7 +3609,7 @@ class TECudaGraphHelper:
         finally:
             self._graphs_created = False
             cleanup_callbacks = (
-                lambda: vars(self.config).pop('_cuda_graph_num_microbatches', None),
+                self._clear_dynamic_cp_graph_microbatch_limit,
                 self._clear_thd_rotary_seq_lens,
             )
             for cleanup in cleanup_callbacks:
