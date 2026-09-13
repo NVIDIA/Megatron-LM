@@ -323,6 +323,11 @@ class DistributedDataParallelConfig:
                 raise ValueError(
                     f"{name} must be one of {list(_SHARDING_STRATEGIES)}, got {value!r}."
                 )
+        if self.expert_outer_dp_sharding_strategy not in ("no_shard", "optim"):
+            raise ValueError(
+                "expert_outer_dp_sharding_strategy must be one of ['no_shard', 'optim'], "
+                f"got {self.expert_outer_dp_sharding_strategy!r}."
+            )
         if self.megatron_fsdp_version not in (1, 2):
             raise ValueError("megatron_fsdp_version must be either 1 or 2")
 
