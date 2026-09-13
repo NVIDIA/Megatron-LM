@@ -627,8 +627,9 @@ def test_payload_preserves_residual_and_mixing_dtypes(monkeypatch, mix_dtype):
 @pytest.mark.parametrize("layout", ["sbhd", "thd"])
 @pytest.mark.parametrize("coefficient", [0, 0.3])
 @pytest.mark.parametrize("cuts", [(4,), (7, 8, 10)])
+@pytest.mark.parametrize("release", [False, True])
 def test_received_leaf_joint_backward_matches_unsplit(
-    monkeypatch, dtype, layout, coefficient, cuts
+    monkeypatch, dtype, layout, coefficient, cuts, release
 ):
     """Sever cross-chunk autograd edges and explicitly return every shared gradient."""
     _record_losses(monkeypatch)
@@ -659,6 +660,8 @@ def test_received_leaf_joint_backward_matches_unsplit(
             )
             payload = stacks[i + 1].forward_adapter.make_pipeline_payload(tensors, output.metadata)
             assert all(t.is_leaf for t in payload.tensors)
+            if release:
+                output.release_output()
     probe = torch.randn_like(expected) * 0.1
     (expected * probe).sum().backward()
     gradient = backward_pipeline_payload(incoming[-1], (outputs[-1] * probe).sum(), None)

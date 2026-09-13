@@ -292,7 +292,11 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
     ):
         super().__init__(config=config)
 
-        if config.mhc_single_pass and config.recompute_granularity is not None:
+        if (
+            config.mhc_single_pass
+            and config.recompute_granularity == "selective"
+            and "mhc" in config.recompute_modules
+        ):
             raise ValueError(
                 "Single-pass mHC recomputation requires HybridModel and its state adapter"
             )

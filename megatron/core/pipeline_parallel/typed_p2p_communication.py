@@ -325,6 +325,11 @@ class TypedP2PCommunicator(P2PCommunicator):
         return received.take_payload() if isinstance(received, _ForwardReceive) else received
 
     @nvtx_decorator()
+    def _release_sent_output(self, output: PipelinePayload | None) -> None:
+        """Keep autograd roots while Work handles own any unfinished wire transfers."""
+        if output is not None and getattr(self.config, "deallocate_pipeline_outputs", False):
+            output.release_output()
+
     def _exchange(
         self,
         *,
@@ -434,6 +439,7 @@ class TypedP2PCommunicator(P2PCommunicator):
                     recv_next=backward_tensors if recv_backward else None,
                     overlap=overlap,
                 )
+                self._release_sent_output(output)
                 result = (payload, backward_tensors if recv_backward else None)
                 return (*result, handles) if overlap else result
             if overlap and self.config.overlap_p2p_comm_warmup_flush:
@@ -447,6 +453,7 @@ class TypedP2PCommunicator(P2PCommunicator):
                     recv_next=backward_tensors if recv_backward else None,
                     overlap=True,
                 )
+                self._release_sent_output(output)
                 received = None
                 if recv_forward:
                     received = _ForwardReceive(
@@ -469,6 +476,7 @@ class TypedP2PCommunicator(P2PCommunicator):
                 recv_next=backward_tensors if recv_backward else None,
                 overlap=overlap,
             )
+            self._release_sent_output(output)
             result = payload, backward_tensors if recv_backward else None
             return (*result, handles) if overlap else result
         finally:
