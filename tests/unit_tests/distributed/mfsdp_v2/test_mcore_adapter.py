@@ -2,6 +2,7 @@
 
 """MCore adapter and optimizer integration tests for experimental MFSDP v2."""
 
+import contextlib
 import logging
 import os
 from dataclasses import replace
@@ -772,8 +773,12 @@ class TestMcoreAdapterHybrid:
         )
 
     @staticmethod
-    def _train(config, instances, outer_strategy, steps=3):
+    def _train(config, instances, outer_strategy, steps=3, microbatches=1):
         """Train over the already-initialized DP topology and return per-step losses.
+
+        With ``microbatches`` > 1 each step accumulates gradients, and every microbatch
+        but the last runs inside ``no_sync`` -- which is how MCore's schedules tell a
+        data-parallel wrapper which backward finalizes gradients.
 
         ``instances`` must match what initialize_model_parallel was given: it selects the
         adapter's mesh, while the process groups it maps onto come from the caller.
@@ -808,16 +813,29 @@ class TestMcoreAdapterHybrid:
         losses = []
         for step in range(steps):
             optimizer.zero_grad(set_to_none=True)
-            # Rank-dependent but step-deterministic input, so every configuration
-            # sees the same global batch however the domain is split.
-            hidden = torch.arange(
-                1, config.hidden_size + 1, device="cuda", dtype=torch.bfloat16
-            ).view(1, 1, -1).expand(8, 2, -1) * (torch.distributed.get_rank() + 1 + step)
-            loss = model(hidden_states=hidden, attention_mask=None).float().square().mean()
-            loss.backward()
+            step_losses = []
+            for index in range(microbatches):
+                # Only the last microbatch finalizes gradients, so it runs outside no_sync.
+                sync_context = (
+                    contextlib.nullcontext() if index == microbatches - 1 else model.no_sync()
+                )
+                with sync_context:
+                    # Rank-dependent but step-deterministic input, so every configuration
+                    # sees the same global batch however the domain is split. Microbatches
+                    # differ so that dropping any of them changes the result.
+                    hidden = torch.arange(
+                        1, config.hidden_size + 1, device="cuda", dtype=torch.bfloat16
+                    ).view(1, 1, -1).expand(8, 2, -1) * (
+                        torch.distributed.get_rank() + 1 + step + index
+                    )
+                    loss = model(hidden_states=hidden, attention_mask=None).float().square().mean()
+                    loss.backward()
+                step_losses.append(loss.detach())
             success, _, _ = optimizer.step()
             assert success
-            losses.append(loss.detach())
+            # No update happens until optimizer.step(), so every microbatch in a step sees
+            # the same parameters; averaging them matches what train_step reports.
+            losses.append(torch.stack(step_losses).float().mean())
         return torch.stack(losses)
 
     @pytest.mark.parametrize("outer_strategy", ["no_shard", "optim"], ids=["hsdp", "hfsdp"])
@@ -854,6 +872,26 @@ class TestMcoreAdapterHybrid:
         for parameter in graded:
             assert parameter.grad.device_mesh.mesh_dim_names == ("dp_outer", "dp_shard")
             assert parameter.grad.placements == (expected_outer, Shard(0))
+
+    @pytest.mark.parametrize("outer_strategy", ["no_shard", "optim"], ids=["hsdp", "hfsdp"])
+    def test_hybrid_matches_single_instance_accumulating(self, outer_strategy):
+        """Splitting the DP domain must not change the math under gradient accumulation.
+
+        HSDP/HFSDP keep the DP-outer axis Partial between microbatches and reduce it on
+        the last backward, so the adapter has to mark the earlier ones through no_sync.
+        When it does not, every backward finalizes that axis and the accumulation buffer
+        is dropped, leaving only the last microbatch's gradient: the losses then drift
+        away from the single-instance reference within a couple of steps.
+        """
+        config = self._config()
+        Utils.initialize_model_parallel(1, 1, num_distributed_optimizer_instances=1)
+        reference = self._train(config, instances=1, outer_strategy="no_shard", microbatches=2)
+        _destroy_model_parallel()
+
+        Utils.initialize_model_parallel(1, 1, num_distributed_optimizer_instances=2)
+        hybrid = self._train(config, instances=2, outer_strategy=outer_strategy, microbatches=2)
+        assert torch.isfinite(reference).all()
+        torch.testing.assert_close(hybrid, reference, rtol=1e-2, atol=0)
 
     @pytest.mark.parametrize("outer_strategy", ["no_shard", "optim"], ids=["hsdp", "hfsdp"])
     def test_hybrid_matches_single_instance(self, outer_strategy):

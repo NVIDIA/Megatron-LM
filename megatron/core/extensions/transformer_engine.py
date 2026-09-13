@@ -86,6 +86,7 @@ except ImportError:
         te = MagicMock()
         HAVE_TE = False
 
+
 def _get_te_linear_attention() -> type[torch.nn.Module] | None:
     """Return TE's GatedDeltaNetAttention (Gated DeltaNet) module, if available."""
     if not HAVE_TE:
@@ -2109,11 +2110,7 @@ class TEGatedDeltaNetAttention(torch.nn.Module):
     """Adapt Megatron GDN kernel inputs to Transformer Engine's GatedDeltaNetAttention."""
 
     def __init__(
-        self,
-        num_attention_heads: int,
-        qk_head_dim: int,
-        value_head_dim: int,
-        layer_number: int,
+        self, num_attention_heads: int, qk_head_dim: int, value_head_dim: int, layer_number: int
     ) -> None:
         super().__init__()
         if not HAVE_TE_GDN:
@@ -2170,6 +2167,13 @@ class TEGatedDeltaNetAttention(torch.nn.Module):
 
         output = output.reshape(batch, sequence, -1, self.value_head_dim)
         return output, final_state
+
+
+# Some patched TE builds expose a `softcap` kwarg on DotProductAttention without bumping the TE
+# version number, so we probe the signature once instead of gating on is_te_min_version().
+_te_dpa_supports_softcap = (
+    "softcap" in inspect.signature(te.pytorch.DotProductAttention.__init__).parameters
+)
 
 
 class TEDotProductAttention(te.pytorch.DotProductAttention):
@@ -2321,6 +2325,14 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                 "`softmax_type`."
             )
             extra_kwargs["softmax_type"] = self.config.softmax_type
+
+        if self.config.attn_logit_softcapping is not None:
+            assert _te_dpa_supports_softcap, (
+                f"Transformer-Engine v{get_te_version()} does not expose a `softcap` argument on "
+                "DotProductAttention, so `attn_logit_softcapping` cannot be used. Install a TE "
+                "build with softcap support or unset `attn_logit_softcapping`."
+            )
+            extra_kwargs["softcap"] = self.config.attn_logit_softcapping
 
         self.kept_packed_seq_params = set(
             field.name for field in dataclasses.fields(PackedSeqParams)

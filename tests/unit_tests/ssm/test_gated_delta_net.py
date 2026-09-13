@@ -33,10 +33,7 @@ from megatron.core.ssm.gated_delta_net.common import (
 )
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
-from tests.unit_tests.ssm.gated_delta_net_test_utils import (
-    GatedDeltaNetTestBase,
-    _unpack_sequence,
-)
+from tests.unit_tests.ssm.gated_delta_net_test_utils import GatedDeltaNetTestBase, _unpack_sequence
 from tests.unit_tests.test_utilities import Utils
 from tests.unit_tests.transformer.test_attention import _test_parallel_attention_correctness
 from tests.unit_tests.transformer.test_multi_latent_attention import (
@@ -55,17 +52,15 @@ def _assert_relative_rms_close(
     error_rms = (actual - expected).square().mean().sqrt()
     expected_rms = expected.square().mean().sqrt().clamp_min(1e-12)
     relative_rms = (error_rms / expected_rms).item()
-    assert relative_rms < tolerance, (
-        f"{name} relative RMS error {relative_rms:.4g} exceeds tolerance {tolerance}"
-    )
+    assert (
+        relative_rms < tolerance
+    ), f"{name} relative RMS error {relative_rms:.4g} exceeds tolerance {tolerance}"
 
 
 def _make_gdn_variant_stub(backend: str, *, deterministic_mode: bool = False) -> SimpleNamespace:
     """Build the minimal state needed to exercise GDN backend selection."""
     stub = SimpleNamespace(
-        config=SimpleNamespace(
-            deterministic_mode=deterministic_mode, gdn_kernel_backend=backend
-        ),
+        config=SimpleNamespace(deterministic_mode=deterministic_mode, gdn_kernel_backend=backend),
         num_value_heads=2,
         qk_dim_local_tp=64,
         v_dim_local_tp=128,
@@ -88,11 +83,7 @@ def test_gdn_selects_fla_backend(monkeypatch):
             raise AssertionError(f"TE should not be constructed: {kwargs}")
 
     monkeypatch.setattr(gdn_module, "HAVE_TE_GDN", True)
-    monkeypatch.setattr(
-        gdn_module,
-        "TEGatedDeltaNetAttention",
-        UnexpectedTEGatedDeltaNetAttention,
-    )
+    monkeypatch.setattr(gdn_module, "TEGatedDeltaNetAttention", UnexpectedTEGatedDeltaNetAttention)
     gdn = _make_gdn_variant_stub("fla")
 
     GatedDeltaNet._setup_variant_attrs(gdn)
@@ -173,10 +164,7 @@ def test_gdn_kernel_backend_validation(backend):
 
     with pytest.raises(ValueError, match="gdn_kernel_backend must be one of"):
         TransformerConfig(
-            num_layers=1,
-            hidden_size=128,
-            num_attention_heads=2,
-            gdn_kernel_backend=backend,
+            num_layers=1, hidden_size=128, num_attention_heads=2, gdn_kernel_backend=backend
         )
 
 
@@ -589,9 +577,7 @@ class TestGatedDeltaNet(GatedDeltaNetTestBase):
 def test_te_gdn_matches_previous_fla_path():
     """TE's fused GDN core matches the previously used FLA rule."""
     Utils.initialize_model_parallel(
-        tensor_model_parallel_size=1,
-        pipeline_model_parallel_size=1,
-        context_parallel_size=1,
+        tensor_model_parallel_size=1, pipeline_model_parallel_size=1, context_parallel_size=1
     )
     try:
         model_parallel_cuda_manual_seed(123)
@@ -645,9 +631,9 @@ def test_te_gdn_matches_previous_fla_path():
         ).bfloat16()
         k = F.normalize(torch.randn_like(q, dtype=torch.float32), dim=-1).bfloat16()
         v = (
-            torch.randn(
-                batch, sequence, heads, config.linear_value_head_dim, device="cuda"
-            ).mul_(0.1).bfloat16()
+            torch.randn(batch, sequence, heads, config.linear_value_head_dim, device="cuda")
+            .mul_(0.1)
+            .bfloat16()
         )
         g = torch.empty(batch, sequence, heads, device="cuda").uniform_(0.1, 1.0).log()
         beta = torch.rand(batch, sequence, heads, device="cuda").bfloat16()
@@ -752,8 +738,7 @@ def _have_cudnn_frontend_min_version(min_version: str = "1.29.0") -> bool:
     ],
 )
 @pytest.mark.parametrize(
-    "gdn_kernel_backend",
-    ["fla", pytest.param("transformer_engine", marks=pytest.mark.internal)],
+    "gdn_kernel_backend", ["fla", pytest.param("transformer_engine", marks=pytest.mark.internal)]
 )
 @pytest.mark.parametrize("head_dim", [32, 128])
 def test_parallel_gated_delta_net_correctness(

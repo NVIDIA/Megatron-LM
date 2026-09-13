@@ -71,8 +71,7 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
         backend = self.config.gdn_kernel_backend
         if self.config.deterministic_mode and backend != "torch":
             raise ValueError(
-                "deterministic_mode=True requires gdn_kernel_backend='torch' for "
-                "Gated DeltaNet."
+                "deterministic_mode=True requires gdn_kernel_backend='torch' for " "Gated DeltaNet."
             )
 
         if backend == "torch":
