@@ -331,9 +331,6 @@ class TransformerConfig(ModelParallelConfig):
     dsa_indexer_mode: Literal['standard', 'simplified'] = 'standard'
     """DSA indexer formulation. Simplified uses one Q head and a plain Q/K dot product."""
 
-    dsa_simplified_use_learned_k: bool = False
-    """Whether simplified DSA uses a learned indexer K instead of main-attention K."""
-
     dsa_indexer_n_heads: Optional[int] = None
     """Number of DSA indexer heads."""
 
@@ -3473,12 +3470,6 @@ class TransformerConfig(ModelParallelConfig):
         assert (
             self.dsa_indexer_mode == "standard" or self.experimental_attention_variant == "dsa"
         ), "dsa_indexer_mode='simplified' requires experimental_attention_variant='dsa'."
-        assert not self.dsa_simplified_use_learned_k or (
-            self.experimental_attention_variant == "dsa" and self.dsa_indexer_mode == "simplified"
-        ), (
-            "dsa_simplified_use_learned_k requires experimental_attention_variant='dsa' "
-            "and dsa_indexer_mode='simplified'."
-        )
         assert (
             not self.dsa_reset_indexer_on_load or self.experimental_attention_variant == "dsa"
         ), "dsa_reset_indexer_on_load requires experimental_attention_variant='dsa'."
@@ -3507,17 +3498,10 @@ class TransformerConfig(ModelParallelConfig):
                     "Simplified DSA derives one indexer Q head from the single KV group; "
                     "leave dsa_indexer_n_heads unset or set it to 1."
                 )
-                if self.dsa_simplified_use_learned_k:
-                    assert self.dsa_indexer_head_dim is None or self.dsa_indexer_head_dim > 0, (
-                        "Simplified DSA with a learned K requires a positive "
-                        "dsa_indexer_head_dim when explicitly set."
-                    )
-                else:
-                    assert self.dsa_indexer_head_dim in (None, self.kv_channels), (
-                        "Simplified DSA using main-attention K requires the indexer head "
-                        "dimension to equal the main attention head dimension; leave "
-                        "dsa_indexer_head_dim unset or set it equal to kv_channels."
-                    )
+                assert self.dsa_indexer_head_dim is None or self.dsa_indexer_head_dim > 0, (
+                    "Simplified DSA requires a positive dsa_indexer_head_dim when "
+                    "explicitly set."
+                )
                 self.dsa_indexer_n_heads = 1
                 if self.dsa_indexer_head_dim is None:
                     self.dsa_indexer_head_dim = self.kv_channels
@@ -3525,9 +3509,6 @@ class TransformerConfig(ModelParallelConfig):
                 # apply. dsa_indexer_rotate_activation defaults True for the standard indexer,
                 # so resolve it here rather than making every simplified config turn it off.
                 self.dsa_indexer_rotate_activation = False
-                assert (
-                    self.dsa_simplified_use_learned_k or not self.dsa_kernel_cache_indexer_k
-                ), "Simplified DSA using main-attention K has no separate indexer K cache."
                 main_q_reset = self.dsa_indexer_reset_method in (
                     'main-q-mean',
                     'main-q-mean-rescaled',

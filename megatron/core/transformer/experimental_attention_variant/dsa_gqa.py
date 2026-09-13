@@ -424,7 +424,6 @@ class SimplifiedDSGQAIndexer(MegatronModule):
         # one group per partition; the actual K passed to this indexer remains one replicated
         # local group on every TP rank.
         self.hidden_size = config.hidden_size
-        self.use_learned_k = getattr(config, "dsa_simplified_use_learned_k", False)
         self.index_n_heads = 1
         self.index_head_dim = config.dsa_indexer_head_dim
         self.index_topk = config.dsa_indexer_topk
@@ -483,19 +482,17 @@ class SimplifiedDSGQAIndexer(MegatronModule):
             skip_weight_param_allocation=False,
             parallel_mode="duplicated",
         )
-        self.linear_k = None
-        if self.use_learned_k:
-            self.linear_k = build_module(
-                submodules.linear_k,
-                self.hidden_size,
-                self.index_head_dim,
-                config=config,
-                init_method=config.init_method,
-                bias=False,
-                skip_bias_add=False,
-                skip_weight_param_allocation=False,
-                parallel_mode="duplicated",
-            )
+        self.linear_k = build_module(
+            submodules.linear_k,
+            self.hidden_size,
+            self.index_head_dim,
+            config=config,
+            init_method=config.init_method,
+            bias=False,
+            skip_bias_add=False,
+            skip_weight_param_allocation=False,
+            parallel_mode="duplicated",
+        )
         if self.pg_collection.tp.size() > 1:
             for param in self.parameters():
                 setattr(param, "average_gradients_across_tp_domain", True)
@@ -524,22 +521,6 @@ class SimplifiedDSGQAIndexer(MegatronModule):
         )
         return torch.cat([q_nope, q_pe], dim=-1)
 
-    def forward_q(
-        self,
-        hidden_states: torch.Tensor,
-        use_rope: bool,
-        packed_seq_params: Optional[PackedSeqParams] = None,
-    ) -> torch.Tensor:
-        """Project the indexer's Q from the layer input, applying RoPE when enabled."""
-        if self.config.sequence_parallel and self.pg_collection.tp.size() > 1:
-            hidden_states = gather_from_sequence_parallel_region(
-                hidden_states, group=self.pg_collection.tp
-            )
-        seqlen, batch_size, _ = hidden_states.shape
-        q, _ = self.linear_q(hidden_states)
-        q = q.reshape(seqlen, batch_size, 1, self.index_head_dim)
-        return self._apply_rope(q, use_rope=use_rope, packed_seq_params=packed_seq_params)
-
     def forward_qk(
         self,
         hidden_states: torch.Tensor,
@@ -547,8 +528,6 @@ class SimplifiedDSGQAIndexer(MegatronModule):
         packed_seq_params: Optional[PackedSeqParams] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Project the indexer's Q and its separately learned K from the layer input."""
-        if not self.use_learned_k or self.linear_k is None:
-            raise RuntimeError("Simplified DSA learned-K projection is not enabled.")
         if self.config.sequence_parallel and self.pg_collection.tp.size() > 1:
             hidden_states = gather_from_sequence_parallel_region(
                 hidden_states, group=self.pg_collection.tp
@@ -721,9 +700,6 @@ class DSGQACoreAttention(MegatronModule):
             )
 
         simplified_indexer = getattr(self.config, "dsa_indexer_mode", "standard") == "simplified"
-        simplified_learned_k = simplified_indexer and getattr(
-            self.config, "dsa_simplified_use_learned_k", False
-        )
 
         hidden_states = hidden_states.detach()
         if _simplified_indexer_uses_main_input_norm(self.config):
@@ -748,19 +724,9 @@ class DSGQACoreAttention(MegatronModule):
         if self.training and torch.is_grad_enabled():
             sparse_indexer_loss = getattr(self.config, "dsa_indexer_use_sparse_loss", False)
             if simplified_indexer:
-                if simplified_learned_k:
-                    q_index, k_index = self.indexer.forward_qk(
-                        hidden_states,
-                        use_rope=use_indexer_rope,
-                        packed_seq_params=packed_seq_params,
-                    )
-                else:
-                    q_index = self.indexer.forward_q(
-                        hidden_states,
-                        use_rope=use_indexer_rope,
-                        packed_seq_params=packed_seq_params,
-                    )
-                    k_index = key.detach()
+                q_index, k_index = self.indexer.forward_qk(
+                    hidden_states, use_rope=use_indexer_rope, packed_seq_params=packed_seq_params
+                )
                 weights = None
             else:
                 q_index, k_index, weights = self.indexer.forward_before_topk(
@@ -858,15 +824,9 @@ class DSGQACoreAttention(MegatronModule):
             return output
 
         if simplified_indexer:
-            if simplified_learned_k:
-                q_index, k_index = self.indexer.forward_qk(
-                    hidden_states, use_rope=use_indexer_rope, packed_seq_params=packed_seq_params
-                )
-            else:
-                q_index = self.indexer.forward_q(
-                    hidden_states, use_rope=use_indexer_rope, packed_seq_params=packed_seq_params
-                )
-                k_index = key.detach()
+            q_index, k_index = self.indexer.forward_qk(
+                hidden_states, use_rope=use_indexer_rope, packed_seq_params=packed_seq_params
+            )
             _, topk_indices = _simplified_qk_topk_naive(
                 q_index, k_index, self.indexer.index_topk, self.indexer.softmax_scale, routing_mask
             )
