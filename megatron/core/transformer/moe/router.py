@@ -287,9 +287,11 @@ class TopKRouter(Router):
             and hash_moe_layer_threshold > 0
             and layer_number <= hash_moe_layer_threshold
         )
-        if not self.is_hash_layer:
-            return
+        if self.is_hash_layer:
+            self._initialize_hash_routing()
 
+    def _initialize_hash_routing(self) -> None:
+        """Initialize the hash lookup table and disable learned-routing expert bias."""
         if self.tid2eid is None:
             token_ids = torch.arange(self.config.hash_moe_vocab_size, device=self.weight.device)
             expert_offsets = torch.arange(self.topk, device=token_ids.device)
