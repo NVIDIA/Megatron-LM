@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
 import logging
 import random
 from typing import Dict, List, NamedTuple, Optional, Tuple, Type
@@ -55,6 +56,7 @@ try:
         SchedulePolicy,
         fully_shard,
         fully_shard_context,
+        microbatch,
     )
     from megatron.core.distributed.fsdp.src.megatron_fsdp.utils import (
         all_sharding_strategies_in,
@@ -803,6 +805,21 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             )
         if ddp_config.megatron_fsdp_max_pool_double_buffer:
             raise ValueError("MFSDP v2 does not support megatron_fsdp_max_pool_double_buffer.")
+
+    @contextlib.contextmanager
+    def no_sync(self):
+        """Suppress gradient finalization for a non-final microbatch.
+
+        HSDP/HFSDP leave the DP-outer axis Partial across microbatches and reduce it
+        on the last backward of a step, so MFSDP has to be told which backward that
+        is. Without it every backward finalizes that axis and marks the accumulation
+        buffer stale, so the next microbatch zeroes it and only the last microbatch's
+        gradient reaches the optimizer.
+
+        MCore's schedules wrap every microbatch but the last in ``no_sync_func``.
+        """
+        with microbatch(self.module.context, is_last=False):
+            yield
 
     def start_param_sync(self, *unused, **unused_kwargs) -> None:
         """No-op: MFSDP v2 gathers parameters from its forward pre-hooks."""
