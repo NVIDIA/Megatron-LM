@@ -11,10 +11,15 @@ import torch
 import megatron.core  # noqa: F401
 
 
-def test_chunked_transport_owns_external_metadata_and_waits_before_finish(
-    transformer_engine_import_stub, monkeypatch
-):
+@pytest.fixture
+def ep(transformer_engine_import_stub):
     transformer_engine_import_stub()
+    from megatron.lite.primitive.modules import moe_ep_chunk_overlap
+
+    return moe_ep_chunk_overlap
+
+
+def test_chunked_transport_owns_external_metadata_and_waits_before_finish(ep, monkeypatch):
     from megatron.lite.primitive.modules import chunked_ep_dispatcher as transport
     from megatron.lite.primitive.modules import dispatcher as shared_transport
 
@@ -34,25 +39,27 @@ def test_chunked_transport_owns_external_metadata_and_waits_before_finish(
         "handle": object(),
         "event": event,
     }
-    output, counts, probs, metadata = dispatcher.finish_deepep_dispatch_external_with_options(
-        state, force_manual_map=True, force_direct_permute=True, materialize_local_tpe=False
-    )
+    output, counts, probs, metadata = dispatcher.finish_deepep_dispatch_for_backward(state)
     event.current_stream_wait.assert_called_once()
     torch.testing.assert_close(output, hidden.flip(0))
     torch.testing.assert_close(probs, state["recv_probs"].flatten().flip(0))
     assert counts is None and metadata["local_tpe_list"] == [1, 1]
     assert metadata["handle"] is state["handle"]
     assert dispatcher._handle is None
+    normal, counts, normal_probs = dispatcher.finish_deepep_dispatch(
+        state, materialize_local_tpe=False
+    )
+    torch.testing.assert_close(normal, output)
+    torch.testing.assert_close(normal_probs, probs)
+    assert counts is None and dispatcher._handle is state["handle"]
     completion = {"combined": hidden, "event": event}
     assert dispatcher.finish_deepep_combine(completion) is hidden
     assert completion == {}
-    assert event.current_stream_wait.call_count == 2
+    assert event.current_stream_wait.call_count == 3
 
 
-def test_qwen_release_visits_only_chunked_modules_once(transformer_engine_import_stub, monkeypatch):
-    transformer_engine_import_stub()
+def test_qwen_release_visits_only_chunked_modules_once(ep, monkeypatch):
     from megatron.lite.model.qwen3_moe.lite.chunked_ep import release_chunked_ep
-    from megatron.lite.primitive.modules import moe_ep_chunk_overlap as ep
 
     execution = Mock()
     monkeypatch.setattr(ep, "EPChunkExecution", lambda **kwargs: execution)
@@ -66,17 +73,12 @@ def test_qwen_release_visits_only_chunked_modules_once(transformer_engine_import
 
 
 @pytest.mark.parametrize("with_probs", [False, True])
-def test_shared_expert_backward_preserves_gradients_and_input_storage(
-    transformer_engine_import_stub, with_probs
-):
-    transformer_engine_import_stub()
-    from megatron.lite.primitive.modules.moe_ep_chunk_overlap import _backward_expert
-
+def test_shared_expert_backward_preserves_gradients_and_input_storage(ep, with_probs):
     x = torch.arange(6.0).reshape(3, 2).requires_grad_()
     probs = torch.full_like(x, 0.5, requires_grad=True) if with_probs else None
     output = x.square() if probs is None else x.square() * probs
     chunk = SimpleNamespace(dispatched=x, probs=probs, expert_out=output, expert_out_edge=None)
-    dx, dp, storage = _backward_expert(
+    dx, dp, storage = ep._backward_expert(
         chunk, torch.ones_like(x), SimpleNamespace(allocate=nullcontext)
     )
     torch.testing.assert_close(dx, 2 * x if probs is None else 2 * x * probs)
@@ -88,18 +90,38 @@ def test_shared_expert_backward_preserves_gradients_and_input_storage(
     assert chunk.dispatched is None and chunk.probs is None and chunk.expert_out is None
 
 
-@pytest.mark.parametrize("retain_output", [False, True])
-def test_context_capture_keeps_output_only_when_requested(
-    transformer_engine_import_stub, retain_output
-):
-    transformer_engine_import_stub()
-    from megatron.lite.primitive.modules.moe_ep_chunk_overlap import _BackwardChunk
+@pytest.mark.parametrize("edge", [False, True])
+@pytest.mark.parametrize("missing_scores", [False, True])
+def test_shared_router_backward(ep, edge, missing_scores):
+    x = torch.ones(2, requires_grad=True)
+    weight = torch.tensor(3.0, requires_grad=True)
+    scores = x * weight
+    chunk = SimpleNamespace(
+        x=x,
+        scores=None if edge else scores,
+        scores_edge=torch.autograd.graph.get_gradient_edge(scores) if edge else None,
+        scores_shape=scores.shape,
+        scores_dtype=scores.dtype,
+    )
+    accum = [torch.tensor(5.0)]
+    dx = ep._backward_router(
+        chunk,
+        torch.ones_like(x),
+        None if missing_scores else torch.ones_like(scores),
+        (weight,),
+        accum,
+    )
+    torch.testing.assert_close(dx, torch.full_like(x, 1.0 if missing_scores else 4.0))
+    torch.testing.assert_close(accum[0], torch.tensor(5.0 if missing_scores else 7.0))
 
+
+@pytest.mark.parametrize("retain_output", [False, True])
+def test_context_capture_keeps_output_only_when_requested(ep, retain_output):
     x = torch.ones(2, 2, requires_grad=True)
     scores, output = x.sigmoid(), x.square()
     state = dict(handle=object(), recv_hidden=x, recv_probs=scores)
     metadata = dict(manual_row_id_map=torch.arange(2), manual_prob_flat_indices=torch.arange(2))
-    chunk = _BackwardChunk.from_dispatch(
+    chunk = ep._BackwardChunk.from_dispatch(
         state,
         metadata,
         scores,
@@ -120,18 +142,22 @@ def test_context_capture_keeps_output_only_when_requested(
     torch.testing.assert_close(dx, 2 * x)
 
 
+def test_stream_cache_separates_roles_and_devices(ep, monkeypatch):
+    monkeypatch.setattr(ep, "_EP_CHUNK_STREAMS", {})
+    monkeypatch.setattr(ep, "_make_stream", lambda device: object())
+    comm = ep._shared_stream(0, "comm")
+    assert comm is ep._shared_stream(torch.device("cuda:0"), "comm")
+    assert comm is not ep._shared_stream(0, "wgrad")
+    assert comm is not ep._shared_stream(1, "comm")
+
+
 class Event:
     def query(self):
         return False
 
 
 @pytest.mark.parametrize("retain_backward", [False, True])
-def test_execution_owns_lifecycle_without_registering_parameters(
-    transformer_engine_import_stub, monkeypatch, retain_backward
-):
-    transformer_engine_import_stub()
-    from megatron.lite.primitive.modules import moe_ep_chunk_overlap as ep
-
+def test_execution_owns_lifecycle_without_registering_parameters(ep, monkeypatch, retain_backward):
     spaces = {}
 
     def acquire(key, factory):
@@ -189,10 +215,7 @@ class Stream:
 
 
 @pytest.fixture
-def workspaces(transformer_engine_import_stub, monkeypatch):
-    transformer_engine_import_stub()
-    from megatron.lite.primitive.modules import moe_ep_chunk_overlap as ep
-
+def workspaces(ep, monkeypatch):
     monkeypatch.setattr(ep, "_EXPERT_ACTIVATION_SIZE_CLASS_BYTES", 1)
     registry = ep.EPChunkWorkspaceRegistry()
     profile = ep.EPChunkShapeProfile(16, 4, 2, 2, expert_intermediate_size=3)
@@ -237,7 +260,7 @@ def test_cross_op_reuse_waits_for_consumer_and_rejects_live_owner(workspaces):
 def test_lazy_growth_reuses_capacity_across_ops(workspaces):
     _, (forward, _, fused) = workspaces
     stream = Stream()
-    arena = forward._expert_activation_owner.coordinator
+    arena = forward._activation_arena
     pointers = []
     capacities = []
     for workspace, rows in ((forward, 2), (fused, 2), (forward, 4), (fused, 3)):
@@ -259,7 +282,7 @@ def test_reserve_park_release_and_rematerialize(workspaces):
     registry, (forward, _, fused) = workspaces
     stream = Stream()
     forward.reserve_expert_activations(max_expert_rows=4)
-    arena = forward._expert_activation_owner.coordinator
+    arena = forward._activation_arena
     capacity = dict(arena.capacity_bytes)
     first = forward.acquire_expert_activation(stream=stream)
     first.tensor("fc1_input", (4, 4), dtype=torch.float32, device="cpu")
@@ -267,16 +290,26 @@ def test_reserve_park_release_and_rematerialize(workspaces):
         first.tensor("fc1_input", (5, 4), dtype=torch.float32, device="cpu")
     first.release(Event())
     forward.reset_tensors(stream=stream)
-    assert not arena.arena.tensors and not arena.backing_tensors
+    assert not arena.tensors and not arena.backing_tensors
     assert arena.capacity_bytes == capacity
     restored = fused.acquire_expert_activation(stream=stream)
     restored.tensor("fc1_input", (4, 4), dtype=torch.float32, device="cpu")
     restored.release(Event())
     for workspace in workspaces[1]:
         registry.release(workspace.key, stream=stream)
-    assert not arena.capacity_bytes and not arena.arena.tensors
+    assert not arena.capacity_bytes and not arena.tensors
     forward.materialize()
     assert forward.dispatcher(0) is not forward.dispatcher(1)
+
+
+@pytest.mark.parametrize("replacement_index", [0, 2])
+def test_released_workspace_rejects_replaced_identity(workspaces, replacement_index):
+    registry, spaces = workspaces
+    for workspace in spaces:
+        registry.release(workspace.key)
+    registry.get_or_create(spaces[replacement_index].key, lambda slot: Mock(use_deepep=True))
+    with pytest.raises(RuntimeError, match="key was reused|replaced activation arena"):
+        spaces[0].materialize()
 
 
 @pytest.mark.parametrize("mtp", [False, True])

@@ -99,11 +99,10 @@ class ChunkedDispatcher(_BaseDispatcher):
     def submit_deepep_combine_backward(
         self, grad_output: torch.Tensor, handle, *, allocate_on_comm_stream: bool = False
     ):
-        previous_event = _previous_event()
         grad_rank_grouped, _, _, _, _, event = self.buffer.dispatch(
             grad_output.contiguous(),
             handle=handle,
-            previous_event=previous_event,
+            previous_event=_previous_event(),
             async_finish=True,
             allocate_on_comm_stream=allocate_on_comm_stream,
         )
@@ -121,13 +120,12 @@ class ChunkedDispatcher(_BaseDispatcher):
         *,
         allocate_on_comm_stream: bool = False,
     ):
-        previous_event = _previous_event()
         grad_scores = None if grad_recv_probs is None else grad_recv_probs.float()
         grad_hidden, grad_topk_scores, event = self.buffer.combine(
             grad_recv_hidden.contiguous(),
             handle,
             topk_weights=grad_scores,
-            previous_event=previous_event,
+            previous_event=_previous_event(),
             async_finish=True,
             allocate_on_comm_stream=allocate_on_comm_stream,
         )
@@ -207,29 +205,11 @@ class ChunkedDispatcher(_BaseDispatcher):
         self._handle = state["handle"]
         self._deepep_event = state["event"]
         self.wait_dispatch_event()
-        recv_per_expert = state["recv_per_expert"]
-        return self._finish_deepep_dispatch(
+        dispatched, local_tpe, permuted_probs, metadata = self._finish_deepep_dispatch_external(
             state["recv_hidden"],
             state["recv_indices"],
             state["recv_probs"],
-            recv_per_expert,
-            materialize_local_tpe=materialize_local_tpe,
-        )
-
-    def _finish_deepep_dispatch(
-        self,
-        recv_hidden: torch.Tensor,
-        recv_indices: torch.Tensor,
-        recv_probs: torch.Tensor,
-        recv_per_expert,
-        *,
-        materialize_local_tpe: bool = True,
-    ):
-        dispatched, local_tpe, permuted_probs, metadata = self._finish_deepep_dispatch_external(
-            recv_hidden,
-            recv_indices,
-            recv_probs,
-            recv_per_expert,
+            state["recv_per_expert"],
             materialize_local_tpe=materialize_local_tpe,
         )
         self._local_tpe_list = metadata["local_tpe_list"]
@@ -244,8 +224,7 @@ class ChunkedDispatcher(_BaseDispatcher):
         recv_probs: torch.Tensor,
         recv_per_expert,
         *,
-        force_manual_map: bool = False,
-        force_direct_permute: bool = False,
+        manual_backward: bool = False,
         materialize_local_tpe: bool = True,
     ):
         if isinstance(recv_per_expert, torch.Tensor):
@@ -262,25 +241,18 @@ class ChunkedDispatcher(_BaseDispatcher):
             raise RuntimeError("DeepEP dispatch indices must have shape [recv_rows, topk]")
         valid = recv_indices >= 0
         num_out = sum(int(x) for x in recv_per_expert)
-        use_direct_permute = force_direct_permute
-        need_manual_map = force_manual_map or use_direct_permute
         valid_coords = valid.nonzero(as_tuple=False)
         valid_row_ids = valid_coords[:, 0]
         valid_topk_slots = valid_coords[:, 1]
         valid_expert_ids = recv_indices[valid_row_ids, valid_topk_slots]
         valid_prob_flat_indices = valid_row_ids * recv_indices.size(1) + valid_topk_slots
-        manual_order = None
+        manual_row_id_map = None
         manual_prob_flat_indices = None
-        if need_manual_map:
+        if manual_backward:
             manual_order = torch.argsort(valid_expert_ids * rows + valid_row_ids, stable=True)
             manual_row_id_map = valid_row_ids.index_select(0, manual_order)
             manual_prob_flat_indices = valid_prob_flat_indices.index_select(0, manual_order)
-        else:
-            manual_row_id_map = None
-        if use_direct_permute:
-            assert manual_order is not None
             sorted_indices = manual_row_id_map
-            assert sorted_indices is not None
             dispatched = recv_hidden.index_select(0, sorted_indices)
             permuted_probs = recv_probs.reshape(-1).index_select(0, manual_prob_flat_indices)
         else:
@@ -320,14 +292,7 @@ class ChunkedDispatcher(_BaseDispatcher):
         }
         return dispatched, local_tpe, permuted_probs, metadata
 
-    def finish_deepep_dispatch_external_with_options(
-        self,
-        state,
-        *,
-        force_manual_map: bool = False,
-        force_direct_permute: bool = False,
-        materialize_local_tpe: bool = True,
-    ):
+    def finish_deepep_dispatch_for_backward(self, state):
         _event_current_stream_wait(state.get("event"))
         recv_per_expert = state["recv_per_expert"]
         dispatched, local_tpe, permuted_probs, metadata = self._finish_deepep_dispatch_external(
@@ -335,9 +300,8 @@ class ChunkedDispatcher(_BaseDispatcher):
             state["recv_indices"],
             state["recv_probs"],
             recv_per_expert,
-            force_manual_map=force_manual_map,
-            force_direct_permute=force_direct_permute,
-            materialize_local_tpe=materialize_local_tpe,
+            manual_backward=True,
+            materialize_local_tpe=False,
         )
         metadata["handle"] = state["handle"]
         return dispatched, local_tpe, permuted_probs, metadata

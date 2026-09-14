@@ -58,7 +58,7 @@ def test_small_rank_forward_matches_ordinary_ep(
         def finish_deepep_dispatch(self, state, **kwargs):
             return (state["recv_hidden"], [len(state["recv_hidden"])], state["recv_probs"])
 
-        def finish_deepep_dispatch_external_with_options(self, state, **kwargs):
+        def finish_deepep_dispatch_for_backward(self, state):
             x, counts, scores = self.finish_deepep_dispatch(state)
             ids = torch.arange(len(x))
             return (
@@ -101,7 +101,7 @@ def test_small_rank_forward_matches_ordinary_ep(
         def release(self, event):
             pass
 
-    profile = overlap.EPChunkShapeProfile.for_two_slot_chunked_ep(
+    profile = overlap.EPChunkShapeProfile(
         max_input_rows=8, hidden_size=2, topk=1, ep_size=2, chunk_count=chunk_count
     )
     workspace = SimpleNamespace(

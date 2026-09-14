@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import weakref
-from contextlib import nullcontext
 from typing import Any
 
 import torch  # pyright: ignore[reportMissingImports]
@@ -83,20 +82,14 @@ def _caller_owned_dummy_wgrad(
 
 
 class _CallerOwnedGroupedLinear(torch.autograd.Function):
-    """TE 2.15 BF16 grouped-GEMM internals with explicit arena-owned outputs.
-
-    The enclosing helper deliberately retains TE's public module lifecycle.
-    This class changes only TE 2.15's two ``torch.empty`` allocation sites.
-    """
+    """TE 2.15 BF16 grouped GEMM with caller-owned outputs and alias-safe wgrad."""
 
     @staticmethod
     def forward(ctx, inp, out, dgrad_out, non_tensor_args, *weights):
         from transformer_engine.pytorch.cpp_extensions import general_grouped_gemm
         from transformer_engine.pytorch.module.base import _2X_ACC_FPROP
 
-        (m_splits, is_first_microbatch, wgrad_store, fuse_wgrad_accumulation, activation_dtype) = (
-            non_tensor_args
-        )
+        m_splits, wgrad_store, fuse_wgrad_accumulation, activation_dtype = non_tensor_args
         if inp.dtype != torch.bfloat16 or activation_dtype != torch.bfloat16:
             raise RuntimeError("Caller-owned grouped GEMM requires BF16 activation")
         if not fuse_wgrad_accumulation or not wgrad_store.delay_wgrad_compute():
@@ -128,12 +121,10 @@ class _CallerOwnedGroupedLinear(torch.autograd.Function):
             ctx.inp_shape = inp.shape
             ctx.dgrad_out = dgrad_out
             ctx.wgrad_store = wgrad_store
-            ctx.is_first_microbatch = is_first_microbatch
-            ctx.fuse_wgrad_accumulation = fuse_wgrad_accumulation
             ctx.requires_dgrad = inp.requires_grad
             ctx.weights_requires_grad = weights[0].requires_grad
             ctx.origin_weights_overwrite_main_grad = False
-            if ctx.fuse_wgrad_accumulation and ctx.weights_requires_grad:
+            if ctx.weights_requires_grad:
                 # Match TE2.15: only a weak reference preserves MCore's Python
                 # attributes, and FSDP is allowed to materialize main_grad after
                 # forward but before backward.
@@ -171,7 +162,7 @@ class _CallerOwnedGroupedLinear(torch.autograd.Function):
             dgrad = dgrad_out.view(-1, inp.shape[-1])
         origin_weights = [None] * len(weights)
         main_grads = [None] * len(weights)
-        if ctx.fuse_wgrad_accumulation and ctx.weights_requires_grad:
+        if ctx.weights_requires_grad:
             origin_weights = [ref() for ref in ctx.origin_weight_refs]
             ctx.origin_weight_refs = None
             if any(weight is None for weight in origin_weights):
@@ -181,10 +172,6 @@ class _CallerOwnedGroupedLinear(torch.autograd.Function):
                 raise RuntimeError("Caller-owned grouped GEMM requires prepared main_grad sinks")
             for weight, main_grad in zip(origin_weights, main_grads, strict=True):
                 weight.main_grad = main_grad
-        if ctx.is_first_microbatch is not None:
-            accumulate = ctx.fuse_wgrad_accumulation and not ctx.is_first_microbatch
-        else:
-            accumulate = ctx.fuse_wgrad_accumulation
         wgrad = partial(
             general_grouped_gemm,
             quantization_params=[None] * len(weights),
@@ -194,7 +181,7 @@ class _CallerOwnedGroupedLinear(torch.autograd.Function):
             m_splits=ctx.m_splits,
             use_bias=False,
             use_split_accumulator=_2X_ACC_WGRAD,
-            accumulate=accumulate and not ctx.origin_weights_overwrite_main_grad,
+            accumulate=not ctx.origin_weights_overwrite_main_grad,
         )
         inputmats = list(torch.split(inp.reshape(-1, inp.shape[-1]), ctx.m_splits))
         immediate_wgrad = (
@@ -269,7 +256,6 @@ def _caller_owned_grouped_linear(
             raise RuntimeError("Caller-owned grouped GEMM does not support TE quantizers")
         non_tensor_args = (
             list(m_splits),
-            None,
             linear.wgrad_store,
             linear.fuse_wgrad_accumulation,
             linear.activation_dtype,
@@ -440,14 +426,11 @@ class ChunkedExperts(_BaseExperts):
         tokens_per_expert,
         permuted_probs=None,
         tokens_per_expert_list=None,
-        activation_allocation=None,
         output_allocation=None,
     ):
         if output_allocation is None:
             # The saved-context route uses the unchanged expert computation.
-            scope = nullcontext if activation_allocation is None else activation_allocation
-            with scope():
-                return super().forward(x, tokens_per_expert, permuted_probs, tokens_per_expert_list)
+            return super().forward(x, tokens_per_expert, permuted_probs, tokens_per_expert_list)
         if (
             self.fp8
             or self.fc1_lora is not None
@@ -467,16 +450,14 @@ class ChunkedExperts(_BaseExperts):
             else list(tokens_per_expert_list)
         )
         probs = permuted_probs.unsqueeze(-1) if permuted_probs is not None else None
-        scope = nullcontext if activation_allocation is None else activation_allocation
-        with scope():
-            fc1_out = _caller_owned_grouped_linear(
-                self.fc1,
-                x,
-                splits,
-                output_allocation("fc1_output", (x.shape[0], self.fc1.out_features)),
-                output_allocation("fc1_dgrad", tuple(x.shape)) if x.requires_grad else None,
-            )
-            h = swiglu_with_probs(fc1_out, probs, self.swiglu_limit)
+        fc1_out = _caller_owned_grouped_linear(
+            self.fc1,
+            x,
+            splits,
+            output_allocation("fc1_output", (x.shape[0], self.fc1.out_features)),
+            output_allocation("fc1_dgrad", tuple(x.shape)) if x.requires_grad else None,
+        )
+        h = swiglu_with_probs(fc1_out, probs, self.swiglu_limit)
         return _caller_owned_grouped_linear(
             self.fc2,
             h,

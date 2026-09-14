@@ -7,8 +7,9 @@ recomputation uses a graph-free forward followed by fused forward/backward.
 The primitive owns the autograd bridge and buffer lifecycle. Qwen supplies
 only the attention/residual/norm prefix and selects the composition; the
 three OPs never read a recomputation setting. Model parameter paths are unchanged.
-ChunkedEP uses separate expert and transport implementations; the existing
-EP experts and dispatcher are unchanged. Model-owned cleanup is registered
+ChunkedEP subclasses reuse native setup and ordinary expert computation;
+native Experts adds only a linear-construction hook, not a ChunkedEP branch.
+Model-owned cleanup is registered
 through the generic runtime `before_model_offload` callback.
 
 ```python
@@ -35,24 +36,12 @@ runtime invokes release before model unload. Capture owners must discard
 graphs before explicit release. This PR does not claim CUDA graph validation.
 
 MTP is rejected. Ordinary ChunkedEP rejects outer MoE/full checkpoints; select
-the explicit full-recompute composition above. Head/loss computation retains
+the explicit full-recompute composition above, which replaces the outer
+recompute list (including attention) with full-layer recomputation. Head/loss retains
 the existing linear CE implementation and configuration, independently of
 ChunkedEP. Other model families are not qualified.
 
-## Historical measurements
-
-Qwen3 MoE, EP8/top-k8, two chunks, full recomputation, fresh processes,
-three warmups and ten iterations, random weights, no optimizer update.
-These measurements belong to `33be6f1ef`, before this NVIDIA-dev port.
-Those runs included a separate bounded LM-head/CE optimization, now removed
-from this PR. They are not isolated ChunkedEP gains and do not establish this
-PR's speed or memory benefit. New comparisons must use identical CE settings.
-
-| Layers / tokens / microbatches | Native / chunked median | Speedup | Peak allocated | Peak reserved |
-| --- | --- | --- | --- | --- |
-| 1 / 32K / 1 | 450.770 / 326.005 ms | 1.3827x | -56.673% | -12.935% |
-| 48 / 16K / 8 | 33514.279 / 29613.317 ms | 1.1317x | -9.809% | -13.355% |
-
-Loss maximum absolute differences were 9.54e-7 and 5.72e-5 respectively.
-Both runs had no allocator retries/OOMs and passed release/recovery checks.
-Rerun on the final upstream candidate before treating these as current results.
+Performance is not yet validated on this port. Compare native and ChunkedEP
+with identical existing linear CE settings; older combined head/CE measurements
+are not isolated ChunkedEP gains. Historical data and source commits remain in
+the [review PR](https://github.com/ISEEKYAN/Megatron-LM/pull/225).
