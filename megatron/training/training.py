@@ -427,7 +427,7 @@ def _dsa_indexer_flops(
     n_heads,
     head_dim,
     num_indexer_layers,
-    dsa_indexer_loss_coeff,
+    dsa_indexer_loss_enabled: bool,
     dsa_indexer_use_sparse_loss=False,
     sparse_core_scale=1.0,
 ):
@@ -477,6 +477,8 @@ def _dsa_indexer_flops(
 
     Whether the indexer is trained is part of the training procedure rather
     than the kernel schedule, so it belongs in this model-FLOPs count.
+    The caller derives ``dsa_indexer_loss_enabled`` from the configured loss
+    coefficient; its magnitude affects gradients but not the FLOPs count.
 
     Returns ``(token_linear, core)`` INCLUDING the fwd/bwd and FMA factors.
     Multiply ``token_linear`` by the real token count and ``core`` by
@@ -496,8 +498,7 @@ def _dsa_indexer_flops(
     # Scoring each query against every past token under a causal mask (/2).
     core = num_indexer_layers * index_dim / 2
     fma_expansion_factor = 2
-    loss_enabled = (dsa_indexer_loss_coeff or 0.0) > 0
-    if not loss_enabled:
+    if not dsa_indexer_loss_enabled:
         token_expansion, core_expansion = 1, 1
     else:
         # Projections: fwd + wgrad (input is detached, no dgrad).
@@ -1388,7 +1389,7 @@ def num_floating_point_operations(
                 num_indexer_layers=_num_dsa_indexer_layers(
                     num_layers, args.dsa_indexer_skip_topk_offset, args.dsa_indexer_topk_freq
                 ),
-                dsa_indexer_loss_coeff=args.dsa_indexer_loss_coeff,
+                dsa_indexer_loss_enabled=(args.dsa_indexer_loss_coeff or 0.0) > 0,
                 dsa_indexer_use_sparse_loss=getattr(args, "dsa_indexer_use_sparse_loss", False),
                 sparse_core_scale=dsa_sparse_core_scale,
             )
