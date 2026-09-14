@@ -272,9 +272,6 @@ def test_simplified_main_q_reset_handles_optimizer_load_modes(
         lambda model, optimizer: clear_calls.append((model, optimizer)) or 1,
     )
     monkeypatch.setattr(
-        training, "_apply_dsa_indexer_lr_warmup", lambda args, optimizer, scheduler: 0.0
-    )
-    monkeypatch.setattr(
         training,
         "_reload_dsa_indexer_optimizer_params",
         lambda model, optimizer: refresh_calls.append((model, optimizer)) or 1,
@@ -289,11 +286,10 @@ def test_simplified_main_q_reset_handles_optimizer_load_modes(
         dsa_indexer_reset_method=reset_method,
         no_load_optim=no_load_optim,
         finetune=False,
-        dsa_indexer_activation_start_samples=0,
         consumed_train_samples=0,
     )
 
-    training._reset_dsa_indexer_after_load([attention], optimizer, None, args, explicit_start=True)
+    training._reset_dsa_indexer_after_load([attention], optimizer, None, args)
 
     expected_k = attention.linear_qkv.weight[
         num_query_heads * head_dim : (num_query_heads + 1) * head_dim
@@ -331,17 +327,11 @@ def test_dsa_reset_on_load_allows_pipeline_stage_without_local_indexer(monkeypat
     )
     monkeypatch.setattr(training, "_global_dsa_indexer_reset_count", lambda local_count: 4)
     monkeypatch.setattr(training, "_broadcast_dsa_indexer_params", lambda model: None)
-    monkeypatch.setattr(
-        training, "_apply_dsa_indexer_lr_warmup", lambda args, optimizer, scheduler: None
-    )
     args = SimpleNamespace(
-        dsa_indexer_reset_method="main-q-mean",
-        no_load_optim=True,
-        dsa_indexer_activation_start_samples=0,
-        consumed_train_samples=0,
+        dsa_indexer_reset_method="main-q-mean", no_load_optim=True, consumed_train_samples=0
     )
 
-    training._reset_dsa_indexer_after_load([], None, None, args, explicit_start=True)
+    training._reset_dsa_indexer_after_load([], None, None, args)
 
 
 @pytest.mark.parametrize("fsdp_arg", ["use_torch_fsdp2", "use_megatron_fsdp"])
@@ -352,7 +342,7 @@ def test_dsa_reset_on_load_rejects_fsdp(fsdp_arg):
     setattr(args, fsdp_arg, True)
 
     with pytest.raises(RuntimeError, match="DDP/distributed-optimizer"):
-        training._reset_dsa_indexer_after_load([], None, None, args, explicit_start=True)
+        training._reset_dsa_indexer_after_load([], None, None, args)
 
 
 def test_dsa_reset_on_load_rejects_optimizer_cpu_offload(monkeypatch):
@@ -368,7 +358,7 @@ def test_dsa_reset_on_load_rejects_optimizer_cpu_offload(monkeypatch):
     args = SimpleNamespace(use_torch_fsdp2=False, use_megatron_fsdp=False)
 
     with pytest.raises(RuntimeError, match="optimizer CPU offload"):
-        training._reset_dsa_indexer_after_load([], optimizer, None, args, explicit_start=True)
+        training._reset_dsa_indexer_after_load([], optimizer, None, args)
 
 
 def test_dsa_train_indexer_only_allows_pipeline_stage_without_local_indexer(monkeypatch):
