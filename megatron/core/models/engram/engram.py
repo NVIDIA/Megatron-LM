@@ -137,6 +137,122 @@ def _row_cu_seqlens(packed_seq_params: PackedSeqParams | None) -> Tensor | None:
     return cu_seqlens.reshape(-1)
 
 
+class _ContextParallelConvHalo(torch.autograd.Function):
+    """Differentiable one-hop exchange of convolution context between zigzag CP neighbours.
+
+    Causal context parallelism cuts the sequence into ``2 * cp_size`` chunks and gives rank
+    ``r`` the pair ``(chunk[r], chunk[2 * cp_size - 1 - r])``. Each of those two chunks needs
+    the tail of the chunk that precedes it globally, and the ownership map makes both
+    predecessors land on an immediate neighbour:
+
+    * ``chunk[r]``'s predecessor ``chunk[r - 1]`` is rank ``r - 1``'s **first** chunk;
+      rank 0 has none, which is the true sequence start and stays zeros.
+    * ``chunk[2 * cp_size - 1 - r]``'s predecessor ``chunk[2 * cp_size - 2 - r]`` is rank
+      ``r + 1``'s **second** chunk -- except on the last rank, where it is that rank's own
+      first chunk and needs no communication at all (handled by the caller).
+
+    So the pattern is a fixed two-send/two-receive between ``r - 1`` and ``r + 1``, which is
+    why this is a generalization of the sequence-parallel halo rather than a new mechanism.
+    Backward is its transpose: the gradient of a received context returns to the trailing
+    positions of the chunk it came from.
+    """
+
+    @staticmethod
+    def _exchange(ops):
+        pending = [op for op in ops if op is not None]
+        if not pending:
+            return
+        for request in torch.distributed.batch_isend_irecv(pending):
+            request.wait()
+
+    @staticmethod
+    def _p2p(kind, tensor, peer, group):
+        return torch.distributed.P2POp(
+            kind, tensor, torch.distributed.get_global_rank(group, peer), group
+        )
+
+    @staticmethod
+    def forward(ctx, chunk_a: Tensor, chunk_b: Tensor, history_length: int, group):
+        rank, size = get_pg_rank(group), get_pg_size(group)
+        ctx.group, ctx.history_length = group, history_length
+        ctx.rank, ctx.size = rank, size
+        ctx.shape_a, ctx.shape_b = chunk_a.shape, chunk_b.shape
+
+        history_a = chunk_a.new_zeros((history_length, *chunk_a.shape[1:]))
+        history_b = chunk_b.new_zeros((history_length, *chunk_b.shape[1:]))
+        ops = [
+            # My first chunk's tail is the left context of rank r+1's first chunk.
+            (
+                _ContextParallelConvHalo._p2p(
+                    torch.distributed.isend, chunk_a[-history_length:].contiguous(), rank + 1, group
+                )
+                if rank + 1 <= size - 1
+                else None
+            ),
+            # My second chunk's tail is the left context of rank r-1's second chunk.
+            (
+                _ContextParallelConvHalo._p2p(
+                    torch.distributed.isend, chunk_b[-history_length:].contiguous(), rank - 1, group
+                )
+                if rank >= 1
+                else None
+            ),
+            (
+                _ContextParallelConvHalo._p2p(torch.distributed.irecv, history_a, rank - 1, group)
+                if rank >= 1
+                else None
+            ),
+            (
+                _ContextParallelConvHalo._p2p(torch.distributed.irecv, history_b, rank + 1, group)
+                if rank + 1 <= size - 1
+                else None
+            ),
+        ]
+        _ContextParallelConvHalo._exchange(ops)
+        return history_a, history_b
+
+    @staticmethod
+    def backward(ctx, grad_history_a: Tensor, grad_history_b: Tensor):
+        rank, size, group = ctx.rank, ctx.size, ctx.group
+        history_length = ctx.history_length
+        grad_a_tail = grad_history_a.new_zeros((history_length, *ctx.shape_a[1:]))
+        grad_b_tail = grad_history_b.new_zeros((history_length, *ctx.shape_b[1:]))
+        ops = [
+            # Transpose of forward: return each received context's gradient to its sender.
+            (
+                _ContextParallelConvHalo._p2p(
+                    torch.distributed.isend, grad_history_a.contiguous(), rank - 1, group
+                )
+                if rank >= 1
+                else None
+            ),
+            (
+                _ContextParallelConvHalo._p2p(
+                    torch.distributed.isend, grad_history_b.contiguous(), rank + 1, group
+                )
+                if rank + 1 <= size - 1
+                else None
+            ),
+            (
+                _ContextParallelConvHalo._p2p(torch.distributed.irecv, grad_a_tail, rank + 1, group)
+                if rank + 1 <= size - 1
+                else None
+            ),
+            (
+                _ContextParallelConvHalo._p2p(torch.distributed.irecv, grad_b_tail, rank - 1, group)
+                if rank >= 1
+                else None
+            ),
+        ]
+        _ContextParallelConvHalo._exchange(ops)
+
+        grad_chunk_a = grad_history_a.new_zeros(ctx.shape_a)
+        grad_chunk_b = grad_history_b.new_zeros(ctx.shape_b)
+        grad_chunk_a[-history_length:] = grad_a_tail
+        grad_chunk_b[-history_length:] = grad_b_tail
+        return grad_chunk_a, grad_chunk_b, None, None
+
+
 class Engram(MegatronModule):
     """DeepSeek Engram injection for one selected global transformer layer."""
 
@@ -298,13 +414,25 @@ class Engram(MegatronModule):
 
     def _short_convolution(self, value: Tensor) -> Tensor:
         cp_size = get_pg_size(self.cp_group)
+        if cp_size > 1 and not self.engram_config.cp_convolution_all_gather:
+            # Phase B (default): exchange only conv_history_length positions per boundary.
+            sequence_parallel = self.config.sequence_parallel and get_pg_size(self.tp_group) > 1
+            if sequence_parallel:
+                # The zigzag chunk boundary sits inside the sequence-parallel split, so the
+                # halo needs the CP-local sequence whole. Gathering it is still far cheaper
+                # than gathering across CP as well.
+                value = gather_from_sequence_parallel_region(
+                    value, tensor_parallel_output_grad=False, group=self.tp_group
+                )
+            convolved = self._short_convolution_cp_halo(value)
+            if sequence_parallel:
+                convolved = scatter_to_sequence_parallel_region(convolved, group=self.tp_group)
+            return convolved
         if cp_size > 1:
             # Phase A: restore the global sequence, convolve it as if CP were off, and give
-            # each rank its own chunks back. Under CP a rank owns two non-contiguous zigzag
-            # chunks, so it has two left boundaries whose predecessors live on other ranks;
-            # gathering sidesteps that at the cost of holding the full sequence for this one
-            # layer. Phase B replaces this with a halo exchange over the static zigzag
-            # predecessor map.
+            # each rank its own chunks back. Kept reachable as the correctness oracle that
+            # phase B is diffed against, and as the fallback if a layout ever breaks the
+            # static predecessor map.
             sequence_parallel = self.config.sequence_parallel and get_pg_size(self.tp_group) > 1
             if sequence_parallel:
                 value = gather_from_sequence_parallel_region(
@@ -318,10 +446,10 @@ class Engram(MegatronModule):
             return convolved
         return self._short_convolution_local(value)
 
-    def _short_convolution_local(self, value: Tensor) -> Tensor:
-        sequence_length, batch_size, num_streams, hidden_size = value.shape
-        normed = self.conv_norm(value.flatten(start_dim=-2)).view_as(value)
-        with_history = torch.cat((self._convolution_history(normed), normed), dim=0)
+    def _convolve_with_history(self, normed: Tensor, history: Tensor) -> Tensor:
+        """Valid causal convolution of ``normed`` given its explicit left context."""
+        sequence_length, batch_size, num_streams, hidden_size = normed.shape
+        with_history = torch.cat((history, normed), dim=0)
         channels_first = with_history.permute(1, 2, 3, 0).reshape(
             batch_size, num_streams * hidden_size, sequence_length + self.conv_history_length
         )
@@ -332,6 +460,47 @@ class Engram(MegatronModule):
             .view(batch_size, num_streams, hidden_size, sequence_length)
             .permute(3, 0, 1, 2)
             .contiguous()
+        )
+
+    def _short_convolution_local(self, value: Tensor) -> Tensor:
+        """Convolve one contiguous slice, taking its left context from the SP halo or zeros."""
+        normed = self.conv_norm(value.flatten(start_dim=-2)).view_as(value)
+        return self._convolve_with_history(normed, self._convolution_history(normed))
+
+    def _short_convolution_cp_halo(self, value: Tensor) -> Tensor:
+        """Phase B: give each of this rank's two zigzag chunks its own one-hop left context.
+
+        Cheaper than restoring the whole sequence -- only ``conv_history_length`` positions
+        cross the wire per boundary -- and the predecessor map is static, so this stays a
+        fixed two-send/two-receive between neighbouring CP ranks.
+        """
+        cp_size, cp_rank = get_pg_size(self.cp_group), get_pg_rank(self.cp_group)
+        history_length = self.conv_history_length
+        normed = self.conv_norm(value.flatten(start_dim=-2)).view_as(value)
+        if normed.shape[0] % 2 != 0:
+            raise RuntimeError(
+                "Engram context-parallel convolution expects an even local sequence length "
+                f"(two zigzag chunks); got {normed.shape[0]}."
+            )
+        chunk_a, chunk_b = normed.chunk(2, dim=0)
+        if chunk_a.shape[0] < history_length:
+            raise RuntimeError(
+                "Engram context-parallel convolution requires each zigzag chunk to own at "
+                f"least {history_length} positions; got {chunk_a.shape[0]}."
+            )
+        history_a, history_b = _ContextParallelConvHalo.apply(
+            chunk_a, chunk_b, history_length, self.cp_group
+        )
+        if cp_rank == cp_size - 1:
+            # The last rank's second chunk follows its own first chunk, so its context is
+            # local and must stay inside autograd rather than come off the wire.
+            history_b = chunk_a[-history_length:]
+        return torch.cat(
+            (
+                self._convolve_with_history(chunk_a, history_a),
+                self._convolve_with_history(chunk_b, history_b),
+            ),
+            dim=0,
         )
 
     def forward(

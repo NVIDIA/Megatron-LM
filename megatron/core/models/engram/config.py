@@ -217,6 +217,13 @@ class EngramConfig:
     tokenizer_map_path: str = ""
     variant: str = DEEPSEEK_VARIANT_NAME
     unigram_vocab_size: int | None = None
+    cp_convolution_all_gather: bool = False
+    """Use the context-parallel all-gather convolution instead of the zigzag halo.
+
+    The halo is the default: it moves only the convolution history per chunk boundary. The
+    all-gather path restores the whole sequence for this layer and is kept as the reference
+    both paths are diffed against.
+    """
     embedding_lr_multiplier: float = 5.0
     embedding_weight_decay: float = 0.0
     variant_spec: EngramVariant = field(init=False, repr=False)

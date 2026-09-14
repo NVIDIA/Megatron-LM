@@ -36,8 +36,14 @@ class _DifferentiableCPAllGather(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output: Tensor):
-        # Each rank keeps the slice it contributed; the peers' slices are their own business.
-        shards = grad_output.chunk(ctx.cp_size, dim=ctx.sequence_dim)
+        # Reduce-scatter, not just "take my slice". Every rank convolves the gathered
+        # sequence, so every rank produces gradient for *other* ranks' positions -- the
+        # convolution's left context reaches back across the chunk boundary. Dropping those
+        # contributions silently loses part of the gradient, and an end-to-end loss
+        # comparison does not catch it because the lost part is small.
+        reduced = grad_output.contiguous()
+        torch.distributed.all_reduce(reduced, group=ctx.group)
+        shards = reduced.chunk(ctx.cp_size, dim=ctx.sequence_dim)
         return shards[ctx.cp_rank].contiguous(), None, None
 
 
