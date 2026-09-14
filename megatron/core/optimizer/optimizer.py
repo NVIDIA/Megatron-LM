@@ -495,8 +495,6 @@ class MegatronOptimizer(ABC):
         self._last_dsa_split_grad_norms = (indexer_grad_norm, non_indexer_grad_norm)
 
         indexer_clip_grad = self.config.dsa_indexer_clip_grad
-        if indexer_clip_grad is None:
-            indexer_clip_grad = clip_grad
 
         use_decoupled_grad = self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8
         if non_indexer_params and clip_grad > 0.0:
@@ -966,11 +964,8 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
             )
         grad_norm = 0.0
         self._last_dsa_split_grad_norms = None
-        if self.config.dsa_separate_indexer_grad_clip:
-            indexer_clip_grad = self.config.dsa_indexer_clip_grad
-            if indexer_clip_grad is None:
-                indexer_clip_grad = self.config.clip_grad
-            if self.config.clip_grad > 0.0 or indexer_clip_grad > 0.0:
+        if self.config.dsa_indexer_clip_grad is not None:
+            if self.config.clip_grad > 0.0 or self.config.dsa_indexer_clip_grad > 0.0:
                 grad_norm = self.clip_grad_norm_separate_dsa_indexer(self.config.clip_grad)
         elif self.config.clip_grad > 0.0:
             self._maybe_store_dsa_split_grad_norms()
@@ -1517,11 +1512,8 @@ class FP32Optimizer(MegatronOptimizer):
             )
         grad_norm = None
         self._last_dsa_split_grad_norms = None
-        if self.config.dsa_separate_indexer_grad_clip:
-            indexer_clip_grad = self.config.dsa_indexer_clip_grad
-            if indexer_clip_grad is None:
-                indexer_clip_grad = self.config.clip_grad
-            if self.config.clip_grad > 0.0 or indexer_clip_grad > 0.0:
+        if self.config.dsa_indexer_clip_grad is not None:
+            if self.config.clip_grad > 0.0 or self.config.dsa_indexer_clip_grad > 0.0:
                 grad_norm = self.clip_grad_norm_separate_dsa_indexer(self.config.clip_grad)
         elif self.config.clip_grad > 0.0:
             self._maybe_store_dsa_split_grad_norms()
@@ -2121,7 +2113,7 @@ class ChainedOptimizer(MegatronOptimizer):
             return False, None, None
 
         self._last_dsa_split_grad_norms = None
-        if self.config.dsa_separate_indexer_grad_clip:
+        if self.config.dsa_indexer_clip_grad is not None:
             indexer_grad_norm, non_indexer_grad_norm = self.get_dsa_split_grad_norms()
             self._last_dsa_split_grad_norms = (indexer_grad_norm, non_indexer_grad_norm)
             grad_norm = math.sqrt(indexer_grad_norm**2 + non_indexer_grad_norm**2)
@@ -2157,10 +2149,8 @@ class ChainedOptimizer(MegatronOptimizer):
                 or use_fsdp_decoupled_grad
             )
             use_decoupled_grad = optimizer.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8
-            if self.config.dsa_separate_indexer_grad_clip:
+            if optimizer.config.dsa_indexer_clip_grad is not None:
                 indexer_clip_grad = optimizer.config.dsa_indexer_clip_grad
-                if indexer_clip_grad is None:
-                    indexer_clip_grad = optimizer.config.clip_grad
                 indexer_params, non_indexer_params = optimizer.get_dsa_split_parameters()
                 if non_indexer_params and optimizer.config.clip_grad > 0.0:
                     clip_grad_by_total_norm_fp32(
