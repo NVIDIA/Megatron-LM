@@ -91,6 +91,44 @@ def test_patchify_unpatchify_roundtrip(batched):
     assert torch.equal(unpatchify_image(patches, img_H=4, img_W=6, patch_dim=2), image)
 
 
+@pytest.mark.parametrize(
+    "pixel_shuffle,attn_pooling,expected_spatial",
+    [(False, False, 32), (True, False, 8), (False, True, 4), (True, True, 1)],
+)
+@pytest.mark.parametrize(
+    "disable_vision_class_token,use_tile_tags,expected_non_spatial",
+    [(True, False, 0), (False, False, 2), (True, True, 6), (False, True, 8)],
+)
+def test_get_num_image_embeddings_applies_attention_pooling(
+    pixel_shuffle,
+    attn_pooling,
+    expected_spatial,
+    disable_vision_class_token,
+    use_tile_tags,
+    expected_non_spatial,
+):
+    # The 4x8 patch grid is reduced by pixel shuffle and then 2x4 image pooling.
+    # Class tokens and tile tags must be added without spatial reduction.
+    assert (
+        get_num_image_embeddings(
+            img_h=8,
+            img_w=16,
+            patch_dim=2,
+            vision_model_type="clip",
+            disable_vision_class_token=disable_vision_class_token,
+            class_token_len=2,
+            pixel_shuffle=pixel_shuffle,
+            use_tile_tags=use_tile_tags,
+            max_num_tiles=1,
+            tokenizer_type="nemotron5",
+            attn_pooling=attn_pooling,
+            attn_pooling_img_h=2,
+            attn_pooling_img_w=4,
+        )
+        == expected_spatial + expected_non_spatial
+    )
+
+
 def test_get_num_video_embeddings_applies_temporal_and_attention_pooling():
     assert (
         get_num_video_embeddings(
