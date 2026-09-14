@@ -25,6 +25,11 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import MHCCheckpointManager
 from megatron.core.transformer.cuda_graphs import annotate_first_last_layer
 from megatron.core.transformer.enums import InferenceCudaGraphScope, LayerType
+from megatron.core.transformer.forward_sharing import (
+    forward_sharing_lifetime,
+    is_forward_sharing_enabled,
+    preserve_forward_sharing_for_checkpoint,
+)
 from megatron.core.transformer.hyper_connection import (
     HyperConnectionModule,
     learned_output_contract,
@@ -669,6 +674,10 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                         )
                 return hidden_states, context
 
+            if is_forward_sharing_enabled(self.config):
+                custom_forward = preserve_forward_sharing_for_checkpoint(
+                    custom_forward, packed_seq_params, self.config, attention_mask_arg=1
+                )
             return custom_forward
 
         def checkpoint_handler(forward_func):
@@ -964,7 +973,13 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             use_mhc_recompute
         )
 
-        with rng_context, outer_quantization_context:
+        sharing_lifetime = nullcontext()
+        if is_forward_sharing_enabled(self.config):
+            sharing_lifetime = forward_sharing_lifetime(
+                packed_seq_params, attention_mask, self.config
+            )
+
+        with sharing_lifetime, rng_context, outer_quantization_context:
             # Forward pass.
             if self.config.recompute_granularity == 'full' and self.training:
                 checkpointed_result = self._checkpointed_forward(

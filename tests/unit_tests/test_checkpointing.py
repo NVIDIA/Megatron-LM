@@ -192,6 +192,44 @@ def test_load_args_preserves_runtime_hybridep_routing_map_mode(
     assert restored_args.moe_hybridep_routing_map_mode == expected_mode
 
 
+@pytest.mark.parametrize(
+    ("checkpoint_args", "expected"),
+    [
+        pytest.param(
+            SimpleNamespace(mtp_repeated_layer_shared_components=["sparse_attention_index"]),
+            ["sparse_attention_index"],
+            id="nonempty",
+        ),
+        pytest.param(
+            SimpleNamespace(mtp_repeated_layer_shared_components=[]), [], id="explicit-empty"
+        ),
+        pytest.param(
+            SimpleNamespace(), ["sparse_attention_index"], id="old-checkpoint-without-field"
+        ),
+    ],
+)
+def test_load_args_restores_mtp_repeated_layer_shared_components_from_checkpoint(
+    checkpoint_args, expected
+):
+    """Repeated-layer sharing behavior must survive a training resume."""
+    args = SimpleNamespace(
+        load="checkpoint",
+        iteration=0,
+        mtp_repeated_layer_shared_components=["sparse_attention_index"],
+        use_tokenizer_model_from_checkpoint_args=False,
+        use_mp_args_from_checkpoint_args=False,
+    )
+    state_dict = {"args": checkpoint_args, "iteration": 12}
+
+    with mock.patch(
+        "megatron.training.checkpointing._load_base_checkpoint",
+        return_value=(state_dict, "checkpoint", False, CheckpointType.LEGACY),
+    ):
+        restored_args, _ = load_args_from_checkpoint(args)
+
+    assert restored_args.mtp_repeated_layer_shared_components == expected
+
+
 def create_checkpoint(load_path, ckpt_format):
     """Setup a dummy checkpoint directory."""
     iteration = 123
