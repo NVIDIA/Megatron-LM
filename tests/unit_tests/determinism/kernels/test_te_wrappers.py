@@ -15,7 +15,10 @@ import os
 import pytest
 import torch
 
+from megatron.core.enums import Fp8Recipe
 from megatron.core.extensions.transformer_engine import HAVE_TE
+from megatron.core.fp8_utils import get_fp8_context, is_mxfp8tensor
+from megatron.core.quantization.quant_config import RecipeConfig
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -42,6 +45,7 @@ if HAVE_TE:
     )
 
 HIDDEN, FFN, TOKENS = 2048, 8192, 8192
+_IS_BLACKWELL = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 10
 
 
 def _config(**overrides):
@@ -165,6 +169,76 @@ class TestTEWrappers:
         assert_module_replays_bit_exact(
             module, (x, m_splits), replays=3, contention=True, what="TEGroupedLinear"
         )
+
+    @pytest.mark.internal
+    @pytest.mark.launch_on_gb200
+    @pytest.mark.skipif(not _IS_BLACKWELL, reason="MXFP8 parameter storage needs Blackwell")
+    def test_per_module_mxfp8_recipe_inherits_outer_model_init_policy(self):
+        """An execution-only override must preserve first/last-layer BF16 storage."""
+        recipe = RecipeConfig.from_config_dict(
+            {
+                "configs": {
+                    "mxfp8": {
+                        "transformer_engine_config_type": "TEQuantizationParams",
+                        "training_recipe": {
+                            "fp8_quantization_recipe": "mxfp8",
+                            "override_quantized_autocast": True,
+                        },
+                    }
+                },
+                "matchers": {
+                    "routed_expert_fc1": {
+                        "config": "mxfp8",
+                        "type": "glob",
+                        "pattern": "*mlp.experts.linear_fc1",
+                        "enabled": True,
+                    }
+                },
+            }
+        )
+        config = _config(
+            num_layers=3,
+            hidden_size=128,
+            ffn_hidden_size=256,
+            num_attention_heads=4,
+            num_query_groups=4,
+            kv_channels=32,
+            num_moe_experts=2,
+            moe_router_topk=2,
+            moe_grouped_gemm=True,
+            add_bias_linear=False,
+            fp8="hybrid",
+            fp8_recipe=Fp8Recipe.mxfp8,
+            fp8_param=True,
+            quant_recipe=recipe,
+            first_last_layers_bf16=True,
+            num_layers_at_start_in_bf16=1,
+            num_layers_at_end_in_bf16=1,
+        )
+
+        def build(layer_number):
+            name = f"decoder.layers.{layer_number}.mlp.experts.linear_fc1"
+            with get_fp8_context(config, layer_number, is_init=True):
+                with pytest.warns(
+                    UserWarning, match="inherits the enclosing parameter-storage context"
+                ):
+                    return TEGroupedLinear(
+                        2,
+                        128,
+                        256,
+                        parallel_mode=None,
+                        config=config,
+                        init_method=init_method_normal(0.02),
+                        bias=False,
+                        skip_bias_add=False,
+                        is_expert=True,
+                        name=name,
+                    )
+
+        edge = build(0)
+        middle = build(1)
+        assert not is_mxfp8tensor(edge.weight0)
+        assert is_mxfp8tensor(middle.weight0)
 
     @pytest.mark.parametrize("backend", ["fused", "flash"])
     def test_te_dot_product_attention_replays(self, backend, monkeypatch):

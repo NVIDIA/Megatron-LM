@@ -1168,7 +1168,8 @@ class InferenceGroupedMLP(TEGroupedMLP):
     Supports three forward paths:
     - Training: delegates to parent TEGroupedMLP
     - Inference + FlashInfer: CUTLASS fused MoE for BF16 or routed block-scale MoE for MXFP8
-    - Inference + eager: torch.nn.functional.grouped_mm with GPU-resident cumsum offsets
+    - Inference + torch: torch.nn.functional.grouped_mm with GPU-resident cumsum offsets
+    - Inference + vLLM: Triton fused MoE for BF16, MCore scaled grouped GEMM for MXFP8
     """
 
     def __init__(
@@ -1267,7 +1268,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
     def _build_concatenated_mxfp8_weights(self):
         """Build contiguous expert stacks after checkpoint loading.
 
-        The torch backend rebinds each per-expert MXFP8Tensor to its stacked view.
+        The torch and vLLM backends rebind each per-expert MXFP8Tensor to its stacked view.
         FlashInfer keeps those canonical tensors for refit and derives a shuffled
         Major-K stack for its routed-MoE kernel.
         """
@@ -1297,7 +1298,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
                 concatenated_weight = stacked_weight
             setattr(self, buf_name, concatenated_weight)
 
-            # The torch path can redirect per-expert storage into the stacked
+            # The torch and vLLM paths can redirect per-expert storage into the stacked
             # representation. FlashInfer keeps the canonical Triton tensors intact
             # because its shuffled Major-K weights are a derived representation.
             if not use_flashinfer_routed:
@@ -1420,7 +1421,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
         return output, None
 
     def _mcore_fused_moe_forward(self, hidden_states, probs, routing_map):
-        """Torch grouped_mm fused MoE forward via mcore_fused_moe."""
+        """MCore permutation with the selected Torch or vLLM grouped-GEMM path."""
         local_expert_start = self.ep_group.rank() * self.num_local_experts
         output = mcore_fused_moe(
             hidden_states,
@@ -1464,12 +1465,14 @@ class InferenceGroupedMLP(TEGroupedMLP):
         permuted_probs: torch.Tensor,
         routing_map: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """Forward pass with three modes:
+        """Forward pass with backend-selected inference grouped GEMMs:
 
         - Training: delegates to parent TEGroupedMLP.
         - Inference + FlashInfer: fused BF16 or routed MXFP8 MoE. tokens_per_expert
           is not used in this path; the FlashInfer kernels operate directly on routing_map.
-        - Inference + eager: torch.nn.functional.grouped_mm with GPU-resident cumsum offsets.
+        - Inference + torch: torch.nn.functional.grouped_mm with GPU-resident cumsum offsets.
+        - Inference + vLLM: Triton fused MoE for BF16; MXFP8 layers use MCore's
+          scaled grouped-GEMM path because the vLLM kernel is BF16-only.
 
         Args:
             permuted_local_hidden_states: [num_tokens, hidden_size] input hidden states.
@@ -1508,9 +1511,16 @@ class InferenceGroupedMLP(TEGroupedMLP):
                 permuted_local_hidden_states, permuted_probs, routing_map=routing_map
             )
         elif self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.VLLM:
+            if isinstance(self._fc1_weight, MXFP8Tensor):
+                return self._mcore_fused_moe_forward(
+                    permuted_local_hidden_states, permuted_probs, routing_map=routing_map
+                )
             return self._vllm_forward(
                 permuted_local_hidden_states, permuted_probs, routing_map=routing_map
             )
+        raise ValueError(
+            f"Unsupported inference grouped-GEMM backend: {self.inference_grouped_gemm_backend}"
+        )
 
 
 class SequentialMLP(MegatronModule):

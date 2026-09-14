@@ -1025,3 +1025,33 @@ class TestPermuteAndQuantizeMxfp8:
             assert (
                 offs[i].item() % alignment == 0
             ), f"Offset {i}={offs[i].item()} not aligned to {alignment}"
+
+
+@pytest.mark.launch_on_gb200
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 10,
+    reason="MXFP8 parameter storage requires Blackwell",
+)
+def test_model_conversion_applies_parameter_precision_filter():
+    import transformer_engine_torch as tex
+    from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Quantizer
+
+    from megatron.core.inference.quantization.utils import quantize_model_to_mxfp8
+
+    quantizer = MXFP8Quantizer(tex.DType.kFloat8E4M3, rowwise=True, columnwise=False)
+    model = torch.nn.Module()
+    model.attention = torch.nn.Linear(128, 64, bias=False, device="cuda", dtype=torch.bfloat16)
+    model.mlp = torch.nn.Module()
+    model.mlp.experts = torch.nn.Module()
+    model.mlp.experts.linear_fc1 = torch.nn.Linear(
+        128, 64, bias=False, device="cuda", dtype=torch.bfloat16
+    )
+    for linear in (model.attention, model.mlp.experts.linear_fc1):
+        linear.weight = torch.nn.Parameter(quantizer(linear.weight.data), requires_grad=False)
+
+    quantize_model_to_mxfp8(
+        model, backend="triton", include_pattern=r"(^|\.)mlp\.experts\.linear_fc[12]\."
+    )
+
+    assert model.attention.weight.dtype == torch.bfloat16
+    assert isinstance(model.mlp.experts.linear_fc1.weight, MXFP8Tensor)

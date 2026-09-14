@@ -8,6 +8,7 @@ import torch.nn.functional as F
 
 from megatron.core.activations import squared_relu
 from megatron.core.inference.moe.flashinfer_mxfp8 import select_routed_mxfp8_active_rows
+from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.transformer.transformer_config import TransformerConfig
 
@@ -92,6 +93,45 @@ def test_bf16_config_ignores_inactive_mxfp8_recipe_gates():
     assert config.fp8 is None
 
 
+def test_vllm_backend_accepts_mxfp8_config_for_per_layer_dispatch():
+    config = _make_bounded_mxfp8_config(
+        inference_grouped_gemm_backend="vllm",
+        inference_flashinfer_mxfp8_token_capacity=None,
+        expert_model_parallel_size=1,
+    )
+
+    assert config.inference_grouped_gemm_backend.value == "vllm"
+
+
+def test_vllm_mxfp8_layer_dispatches_to_mcore_path():
+    from megatron.core.inference.moe import InferenceGroupedGemmBackend
+    from megatron.core.transformer.moe.experts import InferenceGroupedMLP
+
+    expected = (object(), None)
+    grouped_mlp = SimpleNamespace(
+        _concatenated_weights_built=True,
+        _fc1_weight=MXFP8Tensor(
+            data=torch.empty(1, dtype=torch.float8_e4m3fn),
+            scale=torch.empty(1, dtype=torch.uint8),
+            backend="triton",
+        ),
+        inference_grouped_gemm_backend=InferenceGroupedGemmBackend.VLLM,
+        _mcore_fused_moe_forward=lambda hidden, probs, routing_map: expected,
+        _vllm_forward=lambda *args, **kwargs: pytest.fail("BF16 vLLM path was selected"),
+    )
+
+    with InferenceMode.active():
+        actual = InferenceGroupedMLP.forward(
+            grouped_mlp,
+            torch.empty(1, 1),
+            None,
+            torch.empty(1, 1),
+            routing_map=torch.zeros(1, 1, dtype=torch.int64),
+        )
+
+    assert actual is expected
+
+
 @pytest.mark.parametrize("activation_func", [F.gelu, F.silu, F.relu])
 def test_flashinfer_mxfp8_config_rejects_unsupported_activation(activation_func):
     with pytest.raises(ValueError, match="supports only non-gated squared-ReLU experts"):
@@ -101,13 +141,6 @@ def test_flashinfer_mxfp8_config_rejects_unsupported_activation(activation_func)
 @pytest.mark.parametrize(
     ("overrides", "match"),
     [
-        (
-            {
-                "inference_grouped_gemm_backend": "vllm",
-                "inference_flashinfer_mxfp8_token_capacity": None,
-            },
-            "vLLM Triton fused MoE only supports BF16",
-        ),
         ({"fp8_param": False}, "fp8_param must be enabled"),
         ({"fp8": None, "fp8_param": False}, "requires.*FP8 enabled"),
         ({"inference_moe_token_dispatcher_type": "nccl"}, "requires.*nvls"),
