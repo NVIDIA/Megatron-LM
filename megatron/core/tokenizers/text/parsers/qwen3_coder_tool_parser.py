@@ -359,7 +359,6 @@ class _Qwen3CoderToolParser:
 class Qwen3CoderToolParser(BaseParser):
     """Parser for Qwen3 Coder style tool calls."""
 
-    implicit_reasoning_end_markers = ("<tool_call>",)
     streaming_markers = ("<tool_call>", "<function=")
 
     @staticmethod
@@ -383,3 +382,15 @@ class Qwen3CoderToolParser(BaseParser):
             return information.get("content", ""), {"tool_calls": information.get("tool_calls", [])}
         else:
             return text, {}
+
+
+class Qwen3CoderToolCombinedParser(Qwen3CoderToolParser):
+    """Qwen3 Coder tool parser where <tool_call> also ends an open reasoning block.
+
+    `qwen3-coder-tool` leaves a tool call emitted before `</think>` inside the
+    reasoning text, like vLLM's standalone reasoning parsers paired with the
+    qwen3_coder tool parser. This variant treats `<tool_call>` as an implicit
+    end of reasoning and parses it, like vLLM's combined qwen3 parser.
+    """
+
+    implicit_reasoning_end_markers = ("<tool_call>",)
