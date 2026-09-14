@@ -1910,6 +1910,20 @@ def _apply_dsa_indexer_lr_warmup(args, optimizer, opt_param_scheduler) -> float 
     return get_indexer_lr_for_logging(optimizer.param_groups)
 
 
+def _should_reset_dsa_indexer_after_load(args) -> bool:
+    """Whether a checkpoint load should run the one-time DSA indexer initialization.
+
+    The initialization derives the indexer from the loaded checkpoint, so it can only run
+    against the checkpoint the run starts from. ``args.iteration`` is zero exactly then:
+    ``load_checkpoint`` forces it to zero under ``--finetune`` and ``--pretrained-checkpoint``,
+    and reports the stored iteration on an ordinary resume. Re-running the initialization on
+    a resume would discard every indexer update the run has made.
+    """
+    if not getattr(args, "dsa_reset_indexer_on_load", False):
+        return False
+    return getattr(args, "iteration", 0) == 0
+
+
 def _reset_dsa_indexer_after_load(model, optimizer, opt_param_scheduler, args, explicit_start: bool):
     """Reset DSA indexer params/state after checkpoint load and initialize activation warmup."""
     if getattr(args, "use_torch_fsdp2", False) or getattr(args, "use_megatron_fsdp", False):
@@ -3510,7 +3524,7 @@ def setup_model_and_optimizer(
                 'load_checkpoint_time': timers('load-checkpoint').active_time(),
             }
         )
-        if getattr(args, "dsa_reset_indexer_on_load", False):
+        if _should_reset_dsa_indexer_after_load(args):
             _reset_dsa_indexer_after_load(
                 unwrapped_model,
                 optimizer,
@@ -3519,6 +3533,17 @@ def setup_model_and_optimizer(
                 explicit_start=dsa_activation_start_explicit,
             )
         else:
+            if getattr(args, "dsa_reset_indexer_on_load", False):
+                # Resuming mid-run: the indexer was already initialized by the launch that
+                # started this run, and re-running a one-time initialization here would
+                # discard everything it has learned since. Say so, because the alternative
+                # reading -- that the flag was meant to apply and silently did not -- is the
+                # dangerous one.
+                print_rank_0(
+                    f'> skipping DSA indexer reset: resuming at iteration {args.iteration}. '
+                    'Load with --finetune (or --pretrained-checkpoint) to initialize the '
+                    'indexer from a checkpoint that carries a non-zero iteration.'
+                )
             _apply_dsa_indexer_lr_warmup(args, optimizer, opt_param_scheduler)
     else:
         args.iteration = 0

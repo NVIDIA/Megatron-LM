@@ -305,6 +305,24 @@ def test_simplified_main_q_reset_handles_optimizer_load_modes(
     assert len(group_step_reset_calls) == (0 if no_load_optim else 1)
 
 
+def test_dsa_reset_on_load_only_initializes_at_the_start_of_a_run():
+    import megatron.training.training as training
+
+    # The run that starts phase 1 loads with --finetune / --pretrained-checkpoint, which
+    # force iteration 0, so the one-time initialization runs.
+    start = SimpleNamespace(dsa_reset_indexer_on_load=True, iteration=0)
+    assert training._should_reset_dsa_indexer_after_load(start)
+
+    # A requeue resumes from the run's own checkpoint at a non-zero iteration. Re-running
+    # the initialization there would discard the indexer training done so far.
+    resume = SimpleNamespace(dsa_reset_indexer_on_load=True, iteration=250)
+    assert not training._should_reset_dsa_indexer_after_load(resume)
+
+    # Without the flag the initialization never runs, at any iteration.
+    off = SimpleNamespace(dsa_reset_indexer_on_load=False, iteration=0)
+    assert not training._should_reset_dsa_indexer_after_load(off)
+
+
 def test_dsa_reset_on_load_allows_pipeline_stage_without_local_indexer(monkeypatch):
     import megatron.training.training as training
 
