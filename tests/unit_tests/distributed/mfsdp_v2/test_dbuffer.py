@@ -9,9 +9,13 @@ import torch
 import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
 from torch.distributed.device_mesh import init_device_mesh
-from torch.distributed.tensor import Partial, Replicate
+from torch.distributed.tensor import Partial, Replicate, Shard
 
-from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.dbuffer import DBuffer, Flat
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.dbuffer import DBuffer
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.placement import (
+    BlockAtomic,
+    Flat,
+)
 
 
 def _same_tensors_on_all_ranks(device: torch.device) -> list[torch.Tensor]:
@@ -66,6 +70,24 @@ def test_dbuffer_layout_aligns_fragment_offsets_to_rows(distributed_setup):
 
     assert buffer.layout.tensor_to_offset == (0, 18)
     assert buffer.layout.size == 24
+
+
+def test_block_atomic_layout_keeps_bf16_blocks_on_one_rank(distributed_setup):
+    """BlockAtomic keeps every local tensor shard aligned to its configured row block."""
+    if distributed_setup.world_size < 2:
+        pytest.skip("Requires at least 2 ranks.")
+
+    mesh = init_device_mesh(distributed_setup.device.type, (2,))
+    if mesh.get_coordinate() is None:
+        pytest.skip("Rank is outside the 2-rank BlockAtomic test mesh.")
+    tensors = [
+        torch.arange(24, dtype=torch.bfloat16, device=distributed_setup.device).reshape(4, 6),
+        torch.arange(32, dtype=torch.bfloat16, device=distributed_setup.device).reshape(8, 4),
+    ]
+    block_atomic = DBuffer.distribute_tensors(tensors, mesh, [BlockAtomic(2)], block_size=2)
+
+    assert block_atomic.layout.block_size == 2
+    assert all(block_atomic.get_local_tensor(index).shape[0] % 2 == 0 for index in range(2))
 
 
 def test_compute_layout_fills_lcm_padding_gaps(distributed_setup):
@@ -231,9 +253,7 @@ def test_from_local_reuses_required_local_buffer(distributed_setup):
     offset = distributed_setup.rank * local_numel
     local_buffer = replicated_buffer.local_buffer.narrow(0, offset, local_numel)
 
-    sharded_buffer = DBuffer.from_local(
-        local_buffer, mesh, [Flat()], replicated_buffer.layout.tensor_shapes
-    )
+    sharded_buffer = DBuffer.from_local(local_buffer, mesh, [Flat()], replicated_buffer.layout)
 
     assert sharded_buffer.placements == (Flat(),)
     assert sharded_buffer.layout == replicated_buffer.layout
@@ -558,7 +578,7 @@ def test_get_dtensor_from_sharded_buffer(distributed_setup):
         dtensor.to_local(), sharded_buffer.get_local_tensor(0), rtol=0, atol=0
     )
     assert dtensor.shape == tensors[0].shape
-    assert dtensor.placements == (Flat(),)
+    assert dtensor.placements == (Shard(0),)
 
 
 def test_2d_mesh_replicate_flat_round_trip(distributed_setup):
@@ -590,7 +610,7 @@ def test_2d_mesh_flat_before_replicate_is_rejected(distributed_setup):
         mesh_dim_names=("flat", "replicate"),
     )
 
-    with pytest.raises(ValueError, match="Flat placements must be a suffix"):
+    with pytest.raises(ValueError, match="Shard placements must be a suffix"):
         DBuffer(
             mesh=mesh,
             placements=[Flat(), Replicate()],
