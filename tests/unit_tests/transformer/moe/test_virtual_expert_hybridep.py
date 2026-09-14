@@ -181,6 +181,7 @@ def _assert_runtime_layout(manager, *, grad_dtype, mxfp8):
             assert _weight_storage_ptrs(runtime_weight) == _weight_storage_ptrs(expected_weight)
             assert runtime_weight.main_grad.data_ptr() == expected_grad.data_ptr()
             assert runtime_weight.overwrite_main_grad
+            assert not hasattr(runtime_weight, "grad_added_to_main_grad")
 
 
 def _run_full_layer_parity(
