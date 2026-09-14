@@ -429,6 +429,8 @@ def test_hybrid_stack_rejects_same_named_config_type():
             post_process=False,
             pg_collection=_make_pg_collection(),
         )
+
+
 _BF16 = {"bf16": True, "params_dtype": torch.bfloat16}
 # Current scaling, not delayed: delayed scaling opens one outer fp8 context for the whole stack
 # and the per-layer factory degenerates to nullcontext, so the block's interleaving of the two
@@ -440,11 +442,7 @@ TWO_STAGE_ATTENTION_CASES = [
     pytest.param(
         Symbols.GDN,
         hybrid_stack_spec,
-        {
-            "bf16": True,
-            "params_dtype": torch.bfloat16,
-            "activation_func": torch.nn.functional.silu,
-        },
+        {"bf16": True, "params_dtype": torch.bfloat16, "activation_func": torch.nn.functional.silu},
         marks=pytest.mark.skipif(not HAVE_GDN, reason="FLA is not installed"),
         id="gdn",
     ),
@@ -462,8 +460,7 @@ TWO_STAGE_ATTENTION_CASES = [
             "mamba_state_dim": 16,
         },
         marks=pytest.mark.skipif(
-            not (HAVE_GDP and HAVE_GDP_MAMBA),
-            reason="GDP dependencies are not installed",
+            not (HAVE_GDP and HAVE_GDP_MAMBA), reason="GDP dependencies are not installed"
         ),
         id="gdp",
     ),
@@ -718,8 +715,7 @@ class TestHybridBlock:
         )
 
     @pytest.mark.parametrize(
-        ("compute_symbol", "stack_spec", "compute_config"),
-        TWO_STAGE_ATTENTION_CASES,
+        ("compute_symbol", "stack_spec", "compute_config"), TWO_STAGE_ATTENTION_CASES
     )
     def test_two_stage_attention_matches_atomic_forward_bitwise(
         self, compute_symbol, stack_spec, compute_config
@@ -749,9 +745,7 @@ class TestHybridBlock:
 
             model_parallel_cuda_manual_seed(123)
             stage_one_state = layer.forward_pre_attn_and_core_attn(
-                hidden_states,
-                attention_mask=attention_mask,
-                packed_sequence_cp_metadata=None,
+                hidden_states, attention_mask=attention_mask, packed_sequence_cp_metadata=None
             )
             two_stage_output = layer.forward_post_core_attn(*stage_one_state)
 
@@ -769,8 +763,7 @@ class TestHybridBlock:
         assert_bitwise_equal(two_stage_output, atomic_output)
 
     @pytest.mark.parametrize(
-        ("compute_symbol", "stack_spec", "compute_config"),
-        TWO_STAGE_ATTENTION_CASES,
+        ("compute_symbol", "stack_spec", "compute_config"), TWO_STAGE_ATTENTION_CASES
     )
     @pytest.mark.parametrize("parallel", [False, True], ids=["serial", "overlap"])
     def test_shortcut_pair_eager_forward_backward(

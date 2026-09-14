@@ -31,10 +31,7 @@ class TwoStageAttentionLayer:
         return True
 
     def forward_pre_attn_and_core_attn(
-        self,
-        *args: Any,
-        packed_sequence_cp_metadata: Any = None,
-        **kwargs: Any,
+        self, *args: Any, packed_sequence_cp_metadata: Any = None, **kwargs: Any
     ) -> Any:
         """Run the pre-attention and core-attention stage."""
         raise NotImplementedError

@@ -954,7 +954,6 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
 
         return hidden_states, context
 
-
     @copy_signature(_forward_attention)
     def forward(self, *args, **kwargs):
         """

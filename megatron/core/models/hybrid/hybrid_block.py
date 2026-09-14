@@ -328,10 +328,7 @@ class HybridStack(MegatronModule):
         self._execution_layer_indices = list(range(len(self.layers)))
         if self.config.moe_shortcut_connection:
             self.layers = group_layers_into_shortcut_blocks(
-                self.layers,
-                self.layer_type_list,
-                self.config,
-                pp_layer_offset=pp_layer_offset,
+                self.layers, self.layer_type_list, self.config, pp_layer_offset=pp_layer_offset
             )
             self._execution_layer_indices = [
                 (

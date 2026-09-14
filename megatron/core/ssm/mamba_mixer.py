@@ -510,12 +510,12 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
         packed_sequence_cp_metadata=None,
     ):
         """Run the training pre-attention and core-attention stage."""
-        assert packed_sequence_cp_metadata is None, (
-            "MambaMixer does not support packed-sequence chunkwise CP metadata."
-        )
-        assert not InferenceMode.is_active(), (
-            "Two-stage mixer execution does not support inference."
-        )
+        assert (
+            packed_sequence_cp_metadata is None
+        ), "MambaMixer does not support packed-sequence chunkwise CP metadata."
+        assert (
+            not InferenceMode.is_active()
+        ), "Two-stage mixer execution does not support inference."
         return self._mamba_chunk(hidden_states, packed_seq_params=packed_seq_params)
 
     def forward_post_core_attn(self, y):

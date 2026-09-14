@@ -149,6 +149,8 @@ def test_attn_logit_softcapping_rejects_invalid_values(softcap):
     """
     with pytest.raises(ValueError, match="attn_logit_softcapping must be"):
         _make_softcap_config(softcap)
+
+
 @pytest.mark.parametrize(
     ("overrides", "error", "message"),
     [

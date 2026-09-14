@@ -164,9 +164,9 @@ class GatedDeltaNet2(_GDNBase):
         Return:
             torch.Tensor: Normalized recurrence output.
         """
-        assert packed_sequence_cp_metadata is None, (
-            "GDN2 does not support packed-sequence chunkwise CP metadata."
-        )
+        assert (
+            packed_sequence_cp_metadata is None
+        ), "GDN2 does not support packed-sequence chunkwise CP metadata."
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 

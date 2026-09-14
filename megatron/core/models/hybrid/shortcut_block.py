@@ -10,7 +10,7 @@ expert-parallel All-to-All communication can overlap with computation.
 Our variant adds two LayerNorms to the paper's design: `shortcut_pre_mlp_layernorm` normalizes
 the shortcut representation before routing and expert dispatch, while `shortcut_post_norm`
 normalizes the merged routed- and shared-expert result before the MoE residual/BDA step.
-Also supports selective activation recomputation, activation offloading on 
+Also supports selective activation recomputation, activation offloading on
 shortcut_pre_mlp_layernorm and shortcut_post_norm respectively, in which case the memory usage
 from enabling Shortcut-MoE is expected to be flat.
 """

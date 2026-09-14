@@ -152,11 +152,7 @@ def test_shortcut_owns_cp_layout_transitions(monkeypatch):
     attn_layer = _FakeCompute(config)
     moe_layer = _FakeMoE(config)
     block = ShortcutMoEBlock(
-        attn_layer,
-        moe_layer,
-        overlap_a2a=False,
-        attn_local_idx=4,
-        moe_local_idx=5,
+        attn_layer, moe_layer, overlap_a2a=False, attn_local_idx=4, moe_local_idx=5
     )
     calls = []
     observed = {}
@@ -203,10 +199,7 @@ def test_shortcut_owns_cp_layout_transitions(monkeypatch):
     monkeypatch.setattr(block, "_moe_router_preprocess", route)
     monkeypatch.setattr(block, "_launch_dispatch", lambda hidden, probs, **_: (hidden, probs))
     monkeypatch.setattr(
-        moe_layer.mlp,
-        "routed_experts_compute",
-        lambda hidden, probs: (hidden, None),
-        raising=False,
+        moe_layer.mlp, "routed_experts_compute", lambda hidden, probs: (hidden, None), raising=False
     )
     monkeypatch.setattr(block, "_launch_combine", lambda output, **_: output)
     monkeypatch.setattr(block, "_moe_shared_experts", shared)
@@ -385,9 +378,7 @@ def test_eager_overlap_matches_serial_output_and_gradients(monkeypatch):
             assert_quant_layer(1)
             return shortcut_hidden * self.route_scale, shortcut_hidden * self.prob_scale
 
-        def shortcut_shared_experts(
-            self, hidden_states, padding_mask=None, packed_seq_params=None
-        ):
+        def shortcut_shared_experts(self, hidden_states, padding_mask=None, packed_seq_params=None):
             assert_quant_layer(1)
             return hidden_states * self.shared_scale, None, hidden_states, ()
 

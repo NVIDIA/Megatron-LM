@@ -775,12 +775,10 @@ class TransformerConfig(ModelParallelConfig):
     moe_shortcut_connection: bool = False
     """Enable ScMoE shortcut-connected routing. When enabled, the MoE router and routed experts
     process the preceding layer's output (via a shortcut connection) instead of the current layer's
-    post-attention representation. The shared expert still processes the current layer's representation.
-    This decouples routing from current-layer computation. Supported only by HybridStack and requires
-    num_moe_experts > 0. Mutually exclusive with moe_shared_expert_overlap.
-    Without moe_shortcut_parallel, dispatch and combine communication are serialized with the
-    paired compute. CUDA graphs are not supported. For the first MoE layer (no preceding layer),
-    falls back to standard routing."""
+    post-attention representation, allowing the two layers to be run in parallel and hiding the MoE
+    layer's A2A coommuunication. Supported only by HybridStack and requires num_moe_experts > 0. 
+    CUDA graphs are not supported. For the first MoE layer (no preceding layer), falls back to 
+    standard routing."""
 
     moe_shortcut_post_norm: bool = False
     """Apply the configured normalization to the combined routed and shared expert output.
@@ -2085,13 +2083,10 @@ class TransformerConfig(ModelParallelConfig):
                 )
 
         if self.moe_shortcut_post_norm and not self.moe_shortcut_connection:
-            raise ValueError(
-                "moe_shortcut_post_norm requires moe_shortcut_connection = True."
-            )
+            raise ValueError("moe_shortcut_post_norm requires moe_shortcut_connection = True.")
         if shortcut_post_norm_offload and not self.moe_shortcut_post_norm:
             raise ValueError(
-                "shortcut_post_norm in offload_modules requires "
-                "moe_shortcut_post_norm = True."
+                "shortcut_post_norm in offload_modules requires " "moe_shortcut_post_norm = True."
             )
 
         if self.moe_shortcut_parallel:
