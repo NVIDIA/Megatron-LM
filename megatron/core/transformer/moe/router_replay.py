@@ -26,6 +26,22 @@ class RouterReplay:
     global_router_replay_instances: List['RouterReplay'] = []
 
     @staticmethod
+    def get_instances(is_mtp_layer: bool | None = None) -> List['RouterReplay']:
+        """Get registered router replay instances, optionally filtered by layer type.
+
+        Args:
+            is_mtp_layer (bool | None): Select MTP routers when true, base-model routers
+                when false, or all routers when unset.
+
+        Returns:
+            List[RouterReplay]: Matching router replay instances in registration order.
+        """
+        instances = RouterReplay.global_router_replay_instances
+        if is_mtp_layer is None:
+            return list(instances)
+        return [instance for instance in instances if instance.is_mtp_layer == is_mtp_layer]
+
+    @staticmethod
     def set_replay_data(all_layers_topk_indices: List[torch.Tensor]):
         """
         Distributes the topk indices for all layers to their respective RouterReplay instances.
@@ -42,13 +58,18 @@ class RouterReplay:
             router_instance.set_target_indices(all_layers_topk_indices[i])
 
     @staticmethod
-    def get_recorded_data() -> List[torch.Tensor]:
-        """
-        Collects the recorded topk indices from all RouterReplay instances.
-        :return: A list of tensors, each containing the recorded topk indices for a layer.
+    def get_recorded_data(is_mtp_layer: bool | None = None) -> List[torch.Tensor | None]:
+        """Collect recorded top-k indices, optionally filtered by layer type.
+
+        Args:
+            is_mtp_layer (bool | None): Select MTP routers when true, base-model routers
+                when false, or all routers when unset.
+
+        Returns:
+            List[torch.Tensor | None]: Recorded indices in router registration order.
         """
         return [
-            router.get_recorded_indices() for router in RouterReplay.global_router_replay_instances
+            router.get_recorded_indices() for router in RouterReplay.get_instances(is_mtp_layer)
         ]
 
     @staticmethod
@@ -58,9 +79,17 @@ class RouterReplay:
             router.clear_indices()
 
     @staticmethod
-    def set_global_router_replay_action(router_replay_action: RouterReplayAction):
-        """Sets the router replay action for all router instances."""
-        for router in RouterReplay.global_router_replay_instances:
+    def set_global_router_replay_action(
+        router_replay_action: RouterReplayAction, *, is_mtp_layer: bool | None = None
+    ) -> None:
+        """Set the replay action, optionally filtered by layer type.
+
+        Args:
+            router_replay_action (RouterReplayAction): Replay action to set.
+            is_mtp_layer (bool | None): Select MTP routers when true, base-model routers
+                when false, or all routers when unset.
+        """
+        for router in RouterReplay.get_instances(is_mtp_layer):
             router.set_router_replay_action(router_replay_action)
 
     @staticmethod
@@ -75,30 +104,44 @@ class RouterReplay:
         RouterReplay.global_router_replay_instances.clear()
 
     @staticmethod
-    def set_global_static_buffers(static_buffer: torch.Tensor):
-        """Sets static buffers for all router instances from a combined buffer.
+    def set_global_static_buffers(
+        static_buffer: torch.Tensor, *, is_mtp_layer: bool | None = None
+    ) -> None:
+        """Set static buffers, optionally filtered by layer type.
 
         Args:
-            static_buffer: Tensor of shape [max_tokens, num_layers, topk].
-                          Each layer's RouterReplay gets a slice [:, layer_idx, :].
+            static_buffer (torch.Tensor): Tensor shaped ``[max_tokens, num_layers, topk]``.
+            is_mtp_layer (bool | None): Select MTP routers when true, base-model routers
+                when false, or all routers when unset.
         """
-        num_layers = len(RouterReplay.global_router_replay_instances)
+        instances = RouterReplay.get_instances(is_mtp_layer)
+        num_layers = len(instances)
         assert static_buffer.shape[1] == num_layers, (
             f"Buffer has {static_buffer.shape[1]} layers but there are "
             f"{num_layers} RouterReplay instances."
         )
-        for layer_idx, router_instance in enumerate(RouterReplay.global_router_replay_instances):
+        for layer_idx, router_instance in enumerate(instances):
             # Each layer gets a view of shape [max_tokens, topk]
             router_instance.set_static_buffer(static_buffer[:, layer_idx, :])
 
     @staticmethod
-    def clear_global_static_buffers():
-        """Clears static buffers from all router instances."""
-        for router in RouterReplay.global_router_replay_instances:
+    def clear_global_static_buffers(*, is_mtp_layer: bool | None = None) -> None:
+        """Clear static buffers, optionally filtered by layer type.
+
+        Args:
+            is_mtp_layer (bool | None): Select MTP routers when true, base-model routers
+                when false, or all routers when unset.
+        """
+        for router in RouterReplay.get_instances(is_mtp_layer):
             router.clear_static_buffer()
 
-    def __init__(self):
-        """Initializes a RouterReplay instance for a specific layer."""
+    def __init__(self, is_mtp_layer: bool = False) -> None:
+        """Initialize a RouterReplay instance for a specific layer.
+
+        Args:
+            is_mtp_layer (bool): Whether this recorder belongs to an MTP layer.
+        """
+        self.is_mtp_layer = is_mtp_layer
         self.target_topk_idx: Optional[torch.Tensor] = None  # Target topk indices for replay
         self.recorded_topk_idx: Optional[torch.Tensor] = None  # Recorded topk indices for replay
         self.router_replay_action: Optional[RouterReplayAction] = (

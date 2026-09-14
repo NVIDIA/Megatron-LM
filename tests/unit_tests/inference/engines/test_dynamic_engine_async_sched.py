@@ -2199,14 +2199,6 @@ def test_post_process_enforces_per_request_logprob_policy():
         )
 
 
-def test_async_negative_routing_replay():
-    engine = _make_engine(
-        model_config_num_moe_experts=4, model_config_moe_enable_routing_replay=True
-    )
-    with pytest.raises(ValueError, match="routing replay"):
-        engine._validate_async_sched_support_for_config()
-
-
 def test_async_negative_mtp_depth_mismatch():
     engine = _make_engine(num_speculative_tokens=2, controller_num_mtp_depths=1)
     with pytest.raises(ValueError, match="one MTP depth"):

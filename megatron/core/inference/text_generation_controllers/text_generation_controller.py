@@ -1255,7 +1255,7 @@ class TextGenerationController(MTPInferenceMixin):
         if tracer is not None:
             layer_ids = [
                 router.layer_number
-                for router in RouterReplay.global_router_replay_instances
+                for router in RouterReplay.get_instances(is_mtp_layer=False)
                 if router.layer_number is not None
             ] or None
             tracer.record_indices(torch.from_numpy(routing_indices), layer_ids=layer_ids)
@@ -2271,7 +2271,6 @@ class TextGenerationController(MTPInferenceMixin):
         base_position = (context.gpu_view.token_to_pos_ids[self._last_accepted_seq_indices] + 1).to(
             torch.int64
         )
-        self._wait_for_async_sched_routing_source_capture()
         self._compute_serial_mtp_and_sample(base_position=base_position)
         sampled_tokens_gpu = self._sampled_tokens_cuda[:active_request_count]
         sampled_mtp_tokens_gpu = self._sampled_mtp_tokens_cuda[:, :active_request_count]
@@ -2669,7 +2668,9 @@ class TextGenerationController(MTPInferenceMixin):
         # Preserve the prior routing source before this forward can overwrite it.
         if self.model_config.moe_enable_routing_replay:
             self._wait_for_async_sched_routing_source_capture()
-            RouterReplay.set_global_router_replay_action(RouterReplayAction.RECORD)
+            RouterReplay.set_global_router_replay_action(
+                RouterReplayAction.RECORD, is_mtp_layer=False
+            )
 
         # Forward.
         range_push("forward_pass")
@@ -2713,7 +2714,6 @@ class TextGenerationController(MTPInferenceMixin):
                 self._dynamic_step_context_init(record_bookkeeping_done_event=True)
             )
             if self.num_speculative_tokens > 0 and self.model_config.expert_model_parallel_size > 1:
-                self._wait_for_async_sched_routing_source_capture()
                 self._run_dummy_serial_mtp_forward()
             self._run_async_sched_forward(input_ids_gpu_view, position_ids_gpu_view)
 
@@ -3213,7 +3213,9 @@ class TextGenerationController(MTPInferenceMixin):
             # Enable routing recording before forward pass if routing replay is enabled
             config = self.inference_wrapped_model.model.config
             if config.moe_enable_routing_replay:
-                RouterReplay.set_global_router_replay_action(RouterReplayAction.RECORD)
+                RouterReplay.set_global_router_replay_action(
+                    RouterReplayAction.RECORD, is_mtp_layer=False
+                )
 
             # Forward pass produces only base logits. When speculative decoding is
             # active, MTP logits are computed serially after verification.

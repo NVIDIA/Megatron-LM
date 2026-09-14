@@ -807,7 +807,7 @@ def test_run_async_sched_forward_records_pending_routing():
         controller._run_async_sched_forward(input_ids, position_ids)
 
     controller._wait_for_async_sched_routing_source_capture.assert_called_once_with()
-    set_action.assert_called_once_with(RouterReplayAction.RECORD)
+    set_action.assert_called_once_with(RouterReplayAction.RECORD, is_mtp_layer=False)
     controller._capture_async_sched_routing.assert_called_once_with()
     assert controller._async_sched_forward.routing_record is routing_record
 

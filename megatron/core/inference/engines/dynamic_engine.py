@@ -803,7 +803,9 @@ class DynamicInferenceEngine(AbstractEngine):
             # Enable routing recording during warmup if routing replay is enabled.
             # This ensures the record_indices copy operation is captured in the CUDA graph.
             if model_config.moe_enable_routing_replay:
-                RouterReplay.set_global_router_replay_action(RouterReplayAction.RECORD)
+                RouterReplay.set_global_router_replay_action(
+                    RouterReplayAction.RECORD, is_mtp_layer=False
+                )
 
             # Forward pass -> logits.
             with torch.inference_mode():

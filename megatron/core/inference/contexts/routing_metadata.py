@@ -1,6 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, cast
 
 import torch
 
@@ -41,7 +41,7 @@ class RoutingMetadata:
         if self.routing_indices_buffer is not None:
             return
 
-        self.num_moe_layers = len(RouterReplay.global_router_replay_instances)
+        self.num_moe_layers = len(RouterReplay.get_instances(is_mtp_layer=False))
 
         if self.num_moe_layers == 0:
             return
@@ -72,13 +72,13 @@ class RoutingMetadata:
             return self.routing_indices_buffer[: self.context.active_token_count]
         else:
             # Get from RouterReplay and stack into [num_tokens, num_layers, topk].
-            recorded_data = RouterReplay.get_recorded_data()
+            recorded_data = RouterReplay.get_recorded_data(is_mtp_layer=False)
             if recorded_data is None or len(recorded_data) == 0:
                 return None
             if recorded_data[0] is None:
                 return None
             # Stack: list of [num_tokens, topk] -> [num_tokens, num_layers, topk]
-            return torch.stack(recorded_data, dim=1)
+            return torch.stack(cast(list[torch.Tensor], recorded_data), dim=1)
 
     def enable_static_buffer_recording(self) -> None:
         """Enable recording into the static buffer for CUDA graph compatibility.
@@ -89,8 +89,8 @@ class RoutingMetadata:
         """
         self._ensure_buffer_allocated()
         if self.routing_indices_buffer is not None:
-            RouterReplay.set_global_static_buffers(self.routing_indices_buffer)
+            RouterReplay.set_global_static_buffers(self.routing_indices_buffer, is_mtp_layer=False)
 
     def disable_static_buffer_recording(self) -> None:
         """Disable static buffer recording, reverting to normal tensor assignment."""
-        RouterReplay.clear_global_static_buffers()
+        RouterReplay.clear_global_static_buffers(is_mtp_layer=False)
