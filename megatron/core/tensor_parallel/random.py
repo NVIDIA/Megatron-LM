@@ -923,13 +923,23 @@ class MHCCheckpointManager:
             )
         self.checkpoints.append(ckpt)
 
-    def discard_all_outputs_and_register_unified_recompute(self, hook_tensor):
-        """Discard all checkpoint outputs to save memory and register unified recompute hook."""
+    def discard_all_outputs_and_register_unified_recompute(
+        self, hook_tensor: torch.Tensor | tuple[torch.Tensor, ...]
+    ) -> None:
+        """Discard outputs and replay on the first gradient of a tensor or tuple of tensors.
+
+        A group with shared side outputs can receive a gradient through any of
+        them before its hidden-state gradient. Every live boundary edge must
+        trigger replay before an upstream consumer reads discarded storage.
+        """
         self.discard_all_outputs()
 
-        # Register unified recompute hook
-        if hook_tensor.requires_grad:
-            hook_tensor.register_hook(self._unified_recompute_hook)
+        hook_tensors = (hook_tensor,) if isinstance(hook_tensor, torch.Tensor) else hook_tensor
+        seen = set()
+        for tensor in hook_tensors:
+            if tensor.requires_grad and id(tensor) not in seen:
+                tensor.register_hook(self._unified_recompute_hook)
+                seen.add(id(tensor))
 
     def discard_all_outputs(self) -> None:
         """Discard all managed checkpoint outputs without registering a backward hook.
@@ -1169,17 +1179,23 @@ class CheckpointWithoutOutput(object):
     def discard_output_and_register_recompute(self, hook_tensor):
         """
         Release the output tensor storages and register the recompute function as a grad hook of
-        the hook_tensor.
+        the hook_tensor, or each tensor in a tuple of independent output branches.
 
         Note: the caller should make sure that the output tensors are no longer used
         in the forward pass and the gradient of the hook_tensor is computed before the recomputed
         tensors are used.
         """
+
         # When ckpt_manager is set, this is a no-op.
         # Manager handles all discarding and hook registration uniformly.
         from megatron.core.transformer.cuda_graphs import is_graph_warmup
 
         if self.ckpt_manager is not None or is_graph_warmup():
+            return
+
+        hook_tensors = hook_tensor if isinstance(hook_tensor, tuple) else (hook_tensor,)
+        hook_tensors = {id(tensor): tensor for tensor in hook_tensors if tensor.requires_grad}
+        if not hook_tensors:
             return
 
         # use resize to release the output tensor memory and still keep the metadata in the tensors.
@@ -1191,5 +1207,7 @@ class CheckpointWithoutOutput(object):
         # is computed, the recomputation will be triggered. The hook_tensor should be selected
         # carefully to ensure that the tensors are recomputed before it is used by other backward
         # computations.
-        if hook_tensor.requires_grad:
-            hook_tensor.register_hook(self._recompute)
+        # The first branch gradient restores the output; _recompute is idempotent
+        # for later hooks, including shared CSA2 KV and indexer-K branches.
+        for tensor in hook_tensors.values():
+            tensor.register_hook(self._recompute)

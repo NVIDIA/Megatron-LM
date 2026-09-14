@@ -519,6 +519,7 @@ if _CUTE_AVAILABLE:
         topk_length: cute.Tensor,
         indexer_physical_rows: cute.Tensor,
         q_padding_mask: cute.Tensor,
+        window_indices_out: cute.Tensor,
         n_seq: cutlass.Int32,
         global_start: cutlass.Int32,
         l_local: cutlass.Int32,
@@ -533,6 +534,9 @@ if _CUTE_AVAILABLE:
         index_mode: cutlass.Constexpr,
         compressed_is_sequence_major: cutlass.Constexpr,
         has_unpadded_seqlens: cutlass.Constexpr,
+        compressed_topk_is_physical: cutlass.Constexpr,
+        mask_padding_rows: cutlass.Constexpr,
+        emit_window_indices: cutlass.Constexpr,
     ):
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
@@ -552,30 +556,40 @@ if _CUTE_AVAILABLE:
             seq_real_len = cutlass.Int32(0)
             if cutlass.const_expr(index_mode == 0):
                 for seq in range(n_seq):
-                    seq_start = cu_seqlens[seq]
-                    seq_end = cu_seqlens[seq + 1]
+                    seq_start = cutlass.Int32(cu_seqlens[seq])
+                    seq_end = cutlass.Int32(cu_seqlens[seq + 1])
                     if global_q >= seq_start and global_q < seq_end:
                         seq_start_found = seq_start
                         if cutlass.const_expr(has_unpadded_seqlens):
-                            seq_real_len = cu_seqlens_unpadded[seq + 1] - cu_seqlens_unpadded[seq]
-                        if ratio > 1 and compressed_width > 0:
-                            seq_comp_start = cu_seqlens_compressed[seq]
-                            seq_comp_len = cu_seqlens_compressed[seq + 1] - seq_comp_start
+                            seq_real_len = cutlass.Int32(
+                                cu_seqlens_unpadded[seq + 1] - cu_seqlens_unpadded[seq]
+                            )
+                        if compressed_width > 0 and (
+                            ratio > 1 or cutlass.const_expr(compressed_topk_is_physical)
+                        ):
+                            seq_comp_start = cutlass.Int32(cu_seqlens_compressed[seq])
+                            seq_comp_len = (
+                                cutlass.Int32(cu_seqlens_compressed[seq + 1]) - seq_comp_start
+                            )
             else:
                 shared = utils.SmemAllocator().allocate_tensor(cutlass.Int32, cute.make_layout(4))
                 if tidx == 0:
                     for seq in range(n_seq):
-                        seq_start = cu_seqlens[seq]
-                        seq_end = cu_seqlens[seq + 1]
+                        seq_start = cutlass.Int32(cu_seqlens[seq])
+                        seq_end = cutlass.Int32(cu_seqlens[seq + 1])
                         if global_q >= seq_start and global_q < seq_end:
                             seq_start_found = seq_start
                             if cutlass.const_expr(has_unpadded_seqlens):
-                                seq_real_len = (
+                                seq_real_len = cutlass.Int32(
                                     cu_seqlens_unpadded[seq + 1] - cu_seqlens_unpadded[seq]
                                 )
-                            if ratio > 1 and compressed_width > 0:
-                                seq_comp_start = cu_seqlens_compressed[seq]
-                                seq_comp_len = cu_seqlens_compressed[seq + 1] - seq_comp_start
+                            if compressed_width > 0 and (
+                                ratio > 1 or cutlass.const_expr(compressed_topk_is_physical)
+                            ):
+                                seq_comp_start = cutlass.Int32(cu_seqlens_compressed[seq])
+                                seq_comp_len = (
+                                    cutlass.Int32(cu_seqlens_compressed[seq + 1]) - seq_comp_start
+                                )
                     shared[0] = seq_start_found
                     shared[1] = seq_comp_start
                     shared[2] = seq_comp_len
@@ -588,18 +602,27 @@ if _CUTE_AVAILABLE:
 
             is_padding = cutlass.Int32(0)
             if cutlass.const_expr(has_unpadded_seqlens):
+                if seq_start_found < 0:
+                    is_padding = 1
+                elif global_q - seq_start_found >= seq_real_len:
+                    is_padding = 1
                 if cutlass.const_expr(index_mode == 0):
-                    if seq_start_found < 0:
-                        is_padding = 1
-                    elif global_q - seq_start_found >= seq_real_len:
-                        is_padding = 1
                     q_padding_mask[row] = is_padding.to(q_padding_mask.element_type)
                 elif tidx == 0:
-                    if seq_start_found < 0:
-                        is_padding = 1
-                    elif global_q - seq_start_found >= seq_real_len:
-                        is_padding = 1
                     q_padding_mask[row] = is_padding.to(q_padding_mask.element_type)
+
+            row_valid = seq_start_found >= 0
+            if cutlass.const_expr(mask_padding_rows):
+                row_valid = row_valid and is_padding == 0
+            if cutlass.const_expr(compressed_topk_is_physical):
+                # CSA2 r1/r2 Top-K already addresses the packed compressed
+                # buffer. Limit it to this sequence's complete, causal groups.
+                if row_valid and compressed_width > 0:
+                    visible = (global_q - seq_start_found + 1) // ratio
+                    if seq_comp_len > visible:
+                        seq_comp_len = visible
+                    if seq_comp_len > compressed_rows - seq_comp_start:
+                        seq_comp_len = compressed_rows - seq_comp_start
 
             if cutlass.const_expr(index_mode != 0):
                 col = tidx
@@ -607,14 +630,20 @@ if _CUTE_AVAILABLE:
                     topk_value = cutlass.Int32(-1)
                     physical_value = cutlass.Int32(-1)
                     length = cutlass.Int32(0)
-                    if seq_start_found >= 0:
+                    window_value = cutlass.Int32(-1)
+                    if row_valid:
                         window_start = global_q - window_size + 1
                         if window_start < seq_start_found:
                             window_start = seq_start_found
                         window_count = global_q - window_start + 1
+                        if cutlass.const_expr(emit_window_indices):
+                            if col < window_count:
+                                window_value = d_window + window_start + col - global_start
                         if cutlass.const_expr(index_mode == 2):
                             if col < compressed_width:
                                 comp_id = indexer_topk[row, col]
+                                if cutlass.const_expr(compressed_topk_is_physical):
+                                    comp_id = comp_id - seq_comp_start
                                 if comp_id >= 0 and comp_id < seq_comp_len:
                                     seq_major_id = seq_comp_start + comp_id
                                     if seq_major_id < seq_major_rows:
@@ -636,7 +665,9 @@ if _CUTE_AVAILABLE:
                                         topk_value = d_window + pos - global_start
                         else:
                             comp_count = cutlass.Int32(0)
-                            if ratio > 1 and compressed_width > 0:
+                            if compressed_width > 0 and (
+                                ratio > 1 or cutlass.const_expr(compressed_topk_is_physical)
+                            ):
                                 comp_count = (global_q - seq_start_found + 1) // ratio
                                 if comp_count > compressed_width:
                                     comp_count = compressed_width
@@ -658,11 +689,16 @@ if _CUTE_AVAILABLE:
                                         physical_id = seq_to_rank_row[seq_major_id]
                                     if physical_id >= 0 and physical_id < compressed_rows:
                                         topk_value = compressed_base + physical_id
-                    elif total_width > 0 and cutlass.const_expr(index_mode != 2):
+                    elif total_width > 0 and cutlass.const_expr(
+                        index_mode != 2 and not mask_padding_rows
+                    ):
                         length = 1
                         if col == 0:
                             topk_value = 0
                     topk_idxs[row, col] = topk_value
+                    if cutlass.const_expr(emit_window_indices):
+                        if col < window_size:
+                            window_indices_out[row, col] = window_value
                     if cutlass.const_expr(index_mode == 2):
                         if col < compressed_width:
                             indexer_physical_rows[row, col] = physical_value
@@ -672,9 +708,12 @@ if _CUTE_AVAILABLE:
             else:
                 for out_col in range(total_width):
                     topk_idxs[row, out_col] = -1
+                    if cutlass.const_expr(emit_window_indices):
+                        if out_col < window_size:
+                            window_indices_out[row, out_col] = -1
                 topk_length[row] = 0
 
-                if seq_start_found >= 0:
+                if row_valid:
                     write_col = cutlass.Int32(0)
                     window_start = global_q - window_size + 1
                     if window_start < seq_start_found:
@@ -687,11 +726,17 @@ if _CUTE_AVAILABLE:
                                 topk_idxs[row, write_col] = pos - (global_start - d_window)
                             else:
                                 topk_idxs[row, write_col] = d_window + pos - global_start
+                            if cutlass.const_expr(emit_window_indices):
+                                window_indices_out[row, window_col] = d_window + pos - global_start
                             write_col = write_col + 1
 
-                    if ratio > 1 and compressed_width > 0:
+                    if compressed_width > 0 and (
+                        ratio > 1 or cutlass.const_expr(compressed_topk_is_physical)
+                    ):
                         for compressed_col in range(compressed_width):
                             comp_id = indexer_topk[row, compressed_col]
+                            if cutlass.const_expr(compressed_topk_is_physical):
+                                comp_id = comp_id - seq_comp_start
                             if comp_id >= 0 and comp_id < seq_comp_len:
                                 seq_major_id = seq_comp_start + comp_id
                                 if seq_major_id < seq_major_rows:
@@ -703,7 +748,7 @@ if _CUTE_AVAILABLE:
                                         topk_idxs[row, write_col] = compressed_base + physical_id
                                         write_col = write_col + 1
                     topk_length[row] = write_col
-                elif total_width > 0:
+                elif total_width > 0 and cutlass.const_expr(not mask_padding_rows):
                     topk_idxs[row, 0] = 0
                     topk_length[row] = 1
 
@@ -718,6 +763,7 @@ if _CUTE_AVAILABLE:
         topk_length: cute.Tensor,
         indexer_physical_rows: cute.Tensor,
         q_padding_mask: cute.Tensor,
+        window_indices_out: cute.Tensor,
         n_seq: cutlass.Int32,
         global_start: cutlass.Int32,
         l_local: cutlass.Int32,
@@ -732,6 +778,9 @@ if _CUTE_AVAILABLE:
         index_mode: cutlass.Constexpr,
         compressed_is_sequence_major: cutlass.Constexpr,
         has_unpadded_seqlens: cutlass.Constexpr,
+        compressed_topk_is_physical: cutlass.Constexpr,
+        mask_padding_rows: cutlass.Constexpr,
+        emit_window_indices: cutlass.Constexpr,
         launch_work: cutlass.Int32,
         stream: cuda.CUstream,
     ):
@@ -748,6 +797,7 @@ if _CUTE_AVAILABLE:
                 topk_length,
                 indexer_physical_rows,
                 q_padding_mask,
+                window_indices_out,
                 n_seq,
                 global_start,
                 l_local,
@@ -762,6 +812,9 @@ if _CUTE_AVAILABLE:
                 index_mode,
                 compressed_is_sequence_major,
                 has_unpadded_seqlens,
+                compressed_topk_is_physical,
+                mask_padding_rows,
+                emit_window_indices,
             ),
             grid=(cute.ceil_div(launch_work, 128), 1, 1),
             block=(128, 1, 1),
@@ -1022,11 +1075,14 @@ def build_attention_indices(
     compressed_is_sequence_major: bool = False,
     cu_seqlens_unpadded: Optional[torch.Tensor] = None,
     output_alignment: int = 1,
+    compressed_topk_is_physical: bool = False,
+    mask_padding_rows: bool = False,
+    window_indices_out: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
     """Build final sparse-attention and optional indexer-loss indices.
 
     Inputs:
-        cu_seqlens: int32 CUDA tensor, shape ``(n_seq + 1,)``.
+        cu_seqlens: int32/int64 CUDA tensor, shape ``(n_seq + 1,)``.
         global_start/l_local: this rank's global query start and row count.
         d_window/window_size: physical left-window capacity and per-query window width.
         ratio/compressed_width: compression mode and number of compressed columns.
@@ -1045,6 +1101,16 @@ def build_attention_indices(
             describes CUDA-graph-padded rows.
         output_alignment: pad the final attention-index width to this multiple.
             The logical window/compressed widths and ``topk_length`` are unchanged.
+        compressed_topk_is_physical: CSA2 r1/r2 Top-K already addresses physical
+            sequence-major compressed rows, including inter-sequence padding.
+            Requires ``compressed_is_sequence_major``. Only complete causal
+            groups of the query's own sequence are retained.
+        mask_padding_rows: write all -1 indices and length zero for padded or
+            unassigned query rows. Requires ``cu_seqlens_unpadded``. By default,
+            retain V4's indices and placeholder behavior for these rows.
+        window_indices_out: optional contiguous int32 CUDA output buffer, shape
+            ``(l_local, window_size)``. Receives the window's physical KV addresses
+            as a valid prefix followed by -1, for separate indexer-loss work.
 
     Outputs:
         ``topk_idxs`` int32, shape ``(l_local, padded_width)`` where
@@ -1058,6 +1124,13 @@ def build_attention_indices(
     """
     if for_indexer_loss and compressed_topk is None:
         raise RuntimeError("DSv4 THD indexer-loss indices require compressed_topk.")
+    if compressed_topk_is_physical and not compressed_is_sequence_major:
+        raise ValueError("Physical compressed Top-K requires sequence-major compressed rows.")
+    if compressed_topk_is_physical and compressed_width > 0:
+        if ratio < 1 or cu_seqlens_compressed is None:
+            raise ValueError("Physical compressed Top-K requires a positive ratio and prefixes.")
+    if mask_padding_rows and cu_seqlens_unpadded is None:
+        raise ValueError("Masking padding rows requires unpadded cumulative lengths.")
     _require_cute(
         "DSv4 THD final indices require CUDA tensors and CuTeDSL.",
         cu_seqlens,
@@ -1065,10 +1138,18 @@ def build_attention_indices(
         cu_seqlens_compressed,
         seq_to_rank_row,
         cu_seqlens_unpadded,
+        window_indices_out,
     )
     if cu_seqlens_unpadded is not None and cu_seqlens_unpadded.shape != cu_seqlens.shape:
         raise ValueError("padded and unpadded cumulative lengths must have the same shape")
     global_start, l_local = int(global_start), int(l_local)
+    if window_indices_out is not None and (
+        window_indices_out.shape != (l_local, window_size)
+        or window_indices_out.dtype != torch.int32
+        or window_indices_out.device != cu_seqlens.device
+        or not window_indices_out.is_contiguous()
+    ):
+        raise ValueError("window_indices_out must be contiguous int32 [l_local, window_size].")
     compressed_width = int(compressed_width)
     output_alignment = int(output_alignment)
     if output_alignment <= 0:
@@ -1133,6 +1214,7 @@ def build_attention_indices(
             topk_length_kernel,
             indexer_physical_rows,
             q_padding_mask_kernel,
+            indexer_physical_rows if window_indices_out is None else window_indices_out,
         ),
         (
             cu_seqlens.shape[0] - 1,
@@ -1149,9 +1231,12 @@ def build_attention_indices(
             index_mode,
             compressed_is_sequence_major,
             has_unpadded_seqlens,
+            bool(compressed_topk_is_physical),
+            bool(mask_padding_rows),
+            window_indices_out is not None,
             launch_work,
         ),
-        static_arg_indices=(11, 12, 13),
+        static_arg_indices=(11, 12, 13, 14, 15, 16),
     )
     q_padding_mask = q_padding_mask_kernel.view(torch.bool) if has_unpadded_seqlens else None
     if for_indexer_loss:

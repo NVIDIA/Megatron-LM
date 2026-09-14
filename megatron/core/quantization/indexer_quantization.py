@@ -438,6 +438,36 @@ def pack_indexer_mxfp8_scale(
     return out_scale
 
 
+def _update_indexer_mxfp8(x: Tensor, buffers: IndexerMXFP8QuantizationBuffers) -> None:
+    """Write TE's rowwise data and logical scales, including ragged input padding."""
+    source = x
+    if buffers.padded_input is not None:
+        buffers.padded_input[: buffers.num_rows].copy_(x.reshape(buffers.num_rows, x.shape[-1]))
+        source = buffers.padded_input
+    buffers.quantizer.update_quantized(source, buffers.quantized)
+
+
+@torch.no_grad()
+def quantize_indexer_mxfp8_logical(x: Tensor) -> tuple[Tensor, Tensor]:
+    """Return TE FP8 data and logical uint8 E8M0 scales for indexed dot products.
+
+    Scales have shape ``[flattened_rows, head_dim / 32]``. Unlike the cuDNN
+    dense scorer, the candidate scorer gathers logical rows directly, so it
+    needs neither the Blackwell physical scale permutation nor dequantized
+    Q/K tensors. This quantizer is only for discrete index selection.
+    """
+    if x.numel() == 0:
+        return (
+            torch.empty_like(x, dtype=torch.float8_e4m3fn),
+            torch.empty((0, x.shape[-1] // 32), device=x.device, dtype=torch.uint8),
+        )
+    x = x.contiguous()
+    buffers = create_indexer_mxfp8_quantization_buffers(x)
+    _update_indexer_mxfp8(x, buffers)
+    groups = x.shape[-1] // 32
+    return buffers.data, buffers.logical_scale[: buffers.num_rows, :groups]
+
+
 def quantize_indexer_mxfp8(
     x: Tensor,
     *,
@@ -486,18 +516,19 @@ def quantize_indexer_mxfp8(
     elif not buffers.matches(x):
         raise ValueError("MXFP8 quantization buffers do not match the input tensor")
 
-    source = x
-    if buffers.padded_input is not None:
-        buffers.padded_input[: buffers.num_rows].copy_(x.reshape(buffers.num_rows, head_dim))
-        source = buffers.padded_input
-    buffers.quantizer.update_quantized(source, buffers.quantized)
+    _update_indexer_mxfp8(x, buffers)
 
     if is_thd:
         if out_scale is None and torch.cuda.is_current_stream_capturing():
             raise RuntimeError("THD MXFP8 CUDA graph capture requires preallocated scale storage")
         expected_scale_shape = (
             indexer_mxfp8_thd_scale_shape(
-                int(cu_seqlens_scale_padded[-1].item()), num_heads, head_dim, sf_vec_size
+                # CSA2 can reserve K capacity while every sequence is shorter
+                # than r2. Keep one inactive scale atom for the all-zero prefix.
+                max(128 // math.gcd(128, num_heads), int(cu_seqlens_scale_padded[-1].item())),
+                num_heads,
+                head_dim,
+                sf_vec_size,
             )
             if out_scale is None
             else None
@@ -555,5 +586,6 @@ __all__ = [
     "make_indexer_mxfp8_scale_cu_seqlens",
     "pack_indexer_mxfp8_scale",
     "quantize_indexer_mxfp8",
+    "quantize_indexer_mxfp8_logical",
     "refresh_indexer_mxfp8_scale_cu_seqlens",
 ]

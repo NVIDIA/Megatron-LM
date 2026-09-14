@@ -2,13 +2,14 @@
 
 import signal
 from argparse import ArgumentError, ArgumentParser, Namespace
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from typing import Callable, Literal, Optional, Union
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
+from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.optimizer import OptimizerConfig
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.training.argument_utils import (
@@ -732,6 +733,135 @@ class TestDsv4HybridCsaCompressRatioNormalization:
 
         with pytest.raises(AssertionError, match=message):
             _normalize_dsv4_hybrid_csa_compress_ratios(args, {}, "-W|EC/H-")
+
+
+class TestDsv41HybridCsaCompressRatioNormalization:
+    """V4.1 ratios and sources use actual Hybrid layer indices throughout the CLI path."""
+
+    @pytest.mark.parametrize("pattern", ["DEDEDEDEDEDE", "WEDE|DEDEDEDE"])
+    def test_preserves_full_ratios_and_source_indices_when_rebuilt(self, pattern):
+        ratios = [0, 0, 2, 0, 2, 0, 1, 0, 1, 0, 1, 0]
+        args = Namespace(
+            experimental_attention_variant="dsv4_hybrid",
+            dsv4_version="v4.1",
+            csa_compress_ratios=ratios,
+            csa2_kv_source_layers=[2, 6],
+            csa2_index_source_layers=[2, 6, 8],
+            csa2_candidate_source_layer=6,
+        )
+
+        for _ in range(2):
+            kw_args = vars(args).copy()
+            _normalize_dsv4_hybrid_csa_compress_ratios(args, kw_args, pattern)
+            for values in (vars(args), kw_args):
+                assert values["csa_compress_ratios"] == ratios
+                assert values["csa2_kv_source_layers"] == [2, 6]
+                assert values["csa2_index_source_layers"] == [2, 6, 8]
+                assert values["csa2_candidate_source_layer"] == 6
+
+    @pytest.mark.parametrize(
+        ("pattern", "provided", "message"),
+        [
+            ("DEDE", None, "one entry per Hybrid layer"),
+            ("DEDE", [2, 1], "one entry per Hybrid layer"),
+            ("DEDE", [2, 0, 1, 0, 0], "one entry per Hybrid layer"),
+            ("DE", [4, 0], "only integer ratios 0, 1, or 2"),
+            ("DE", [-1, 0], "only integer ratios 0, 1, or 2"),
+            ("DE", [1.0, 0], "only integer ratios 0, 1, or 2"),
+            ("DE", [True, 0], "only integer ratios 0, 1, or 2"),
+            ("DE", [2, 1], "symbol 'E' requires compression ratio 0"),
+            ("D-", [2, 1], "symbol '-' requires compression ratio 0"),
+            ("WE", [1, 0], "symbol 'W' requires compression ratio 0"),
+            ("CE", [0, 0], "does not support the fixed-ratio C/H"),
+            ("HE", [0, 0], "does not support the fixed-ratio C/H"),
+        ],
+    )
+    def test_rejects_invalid_hybrid_ratios(self, pattern, provided, message):
+        args = Namespace(
+            experimental_attention_variant="dsv4_hybrid",
+            dsv4_version="v4.1",
+            csa_compress_ratios=provided,
+        )
+
+        with pytest.raises(AssertionError, match=message):
+            _normalize_dsv4_hybrid_csa_compress_ratios(args, {}, pattern)
+
+    @staticmethod
+    def _args():
+        from megatron.training.arguments import add_megatron_arguments
+        from tests.unit_tests.transformer.experimental_attention_variant.test_dsv41 import (
+            _make_config,
+        )
+
+        config = _make_config(
+            num_layers=12,
+            csa_compress_ratios=[0, 0, 2, 0, 2, 0, 1, 0, 1, 0, 1, 0],
+            csa2_kv_source_layers=[2, 6],
+            csa2_index_source_layers=[2, 6, 8],
+            csa2_candidate_source_layer=6,
+        )
+        args = add_megatron_arguments(ArgumentParser()).parse_args([])
+        for config_field in fields(config):
+            if config_field.init:
+                setattr(args, config_field.name, getattr(config, config_field.name))
+        args.hybrid_layer_pattern = "DE" * 6
+        args.num_experts = config.num_moe_experts
+        args.padded_vocab_size = 128
+        args.max_position_embeddings = 16
+        args.untie_embeddings_and_output_weights = True
+        args.no_persist_layer_norm = not config.persist_layer_norm
+        args.swiglu = True
+        args.bias_swiglu_fusion = False
+        args.cp_comm_type = ["p2p"]
+        return args
+
+    @pytest.mark.parametrize(
+        "with_spec",
+        [
+            False,
+            pytest.param(
+                True,
+                marks=pytest.mark.skipif(not HAVE_TE, reason="Transformer Engine is not installed"),
+            ),
+        ],
+    )
+    def test_actual_core_and_hybrid_config_adapters_preserve_indices(self, with_spec):
+        from megatron.core.transformer.moe.experts import SequentialMLP
+        from megatron.training.arguments import core_transformer_config_from_args
+
+        args = self._args()
+        if with_spec:
+            args.spec = ["megatron.core.models.hybrid.hybrid_layer_specs", "hybrid_dsv4_stack_spec"]
+        for _ in range(2):
+            core_config = core_transformer_config_from_args(args)
+            hybrid_config = hybrid_config_from_args(args)
+            for config in (core_config, hybrid_config.transformer):
+                assert config.is_hybrid_model
+                assert config.num_layers == 12
+                assert config.csa_compress_ratios == [0, 0, 2, 0, 2, 0, 1, 0, 1, 0, 1, 0]
+                assert config.csa2_kv_source_layers == [2, 6]
+                assert config.csa2_index_source_layers == [2, 6, 8]
+                assert config.csa2_candidate_source_layer == 6
+                assert config.mhc_single_pass
+            assert hybrid_config.hybrid_layer_pattern == "DE" * 6
+            if with_spec:
+                moe_spec = hybrid_config.hybrid_stack_spec.submodules.moe_layer.submodules.mlp
+                assert moe_spec.keywords["submodules"].experts.func is SequentialMLP
+
+    @pytest.mark.parametrize(
+        ("source_field", "value", "message"),
+        [
+            ("csa2_kv_source_layers", [2, 7], "cannot contain a SWA-only layer"),
+            ("csa2_index_source_layers", [2, 6, 7], "cannot contain a SWA-only layer"),
+            ("csa2_candidate_source_layer", 7, "must be a Full layer"),
+        ],
+    )
+    def test_hybrid_config_rejects_sources_pointing_to_moe(self, source_field, value, message):
+        args = self._args()
+        setattr(args, source_field, value)
+
+        with pytest.raises(ValueError, match=message):
+            hybrid_config_from_args(args)
 
 
 class TestHybridConfigFromArgs:

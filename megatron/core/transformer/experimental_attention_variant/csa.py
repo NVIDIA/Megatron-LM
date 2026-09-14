@@ -9,7 +9,10 @@ import torch
 import torch.nn as nn
 
 from megatron.core.fp8_utils import get_fp8_disabled_context
-from megatron.core.fusions.fused_mla_yarn_rope_apply import fused_mla_rope_inplace
+from megatron.core.fusions.fused_mla_yarn_rope_apply import (
+    fused_mla_rope_inplace,
+    fused_mla_rope_out_of_place,
+)
 from megatron.core.models.common.embeddings import RotaryEmbedding, apply_rotary_pos_emb
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -29,7 +32,6 @@ from megatron.core.transformer.experimental_attention_variant.csa_utils.fused_sp
     BSHDCompactIndexerWorkspace,
     FusedCSAIndexerSparseAttnFromTopkFunc,
     THDCompactIndexerWorkspace,
-    batch_of_row,
     bshd_compact_indexer_available,
     build_flat_topk_idxs,
     build_thd_compact_k_layout,
@@ -42,6 +44,12 @@ from megatron.core.transformer.experimental_attention_variant.csa_utils.fused_sp
     prepare_bshd_compact_indexer_workspace,
     prepare_thd_compact_indexer_workspace,
     thd_compact_indexer_available,
+)
+from megatron.core.transformer.experimental_attention_variant.csa_utils.thd_utils import (
+    batch_of_row,
+    get_thd_compressed_capacity,
+    get_thd_compressed_cu_seqlens,
+    get_thd_compressed_group_indices,
 )
 from megatron.core.transformer.experimental_attention_variant.dsa import (
     DSAIndexerLossAutoScaler,
@@ -134,7 +142,7 @@ def _get_csa_compressed_capacity(
     if max_seqlen is None or cu_seqlens is None:
         return None
     num_sequences = max(int(cu_seqlens.shape[0]) - 1, 0)
-    return min(int(total_tokens) // ratio, num_sequences * (int(max_seqlen) // ratio))
+    return get_thd_compressed_capacity(total_tokens, max_seqlen, num_sequences, ratio)
 
 
 def _build_compressed_thd_indexer_metadata(
@@ -452,6 +460,8 @@ def _apply_fused_rope(
     pos_dim: int,
     cu_seqlens: Optional[torch.Tensor],
     cp_group: torch.distributed.ProcessGroup,
+    *,
+    inplace: bool = True,
 ) -> torch.Tensor:
     """Apply the fused MLA RoPE kernel with automatic 3-D / 4-D handling."""
     packed_seq = cu_seqlens is not None
@@ -466,7 +476,8 @@ def _apply_fused_rope(
     if squeeze_head:
         x = x.unsqueeze(-2)
 
-    out = fused_mla_rope_inplace(
+    apply = fused_mla_rope_inplace if inplace else fused_mla_rope_out_of_place
+    out = apply(
         x,
         cos,
         sin,
@@ -550,6 +561,8 @@ def _apply_rope(
     cp_group: torch.distributed.ProcessGroup = None,
     cu_seqlens: Optional[torch.Tensor] = None,
     max_seqlen_rope: Optional[int] = None,
+    *,
+    inplace: bool = True,
 ) -> torch.Tensor:
     """Apply RoPE to the last ``pos_dim`` dims, leaving the rest unchanged.
 
@@ -565,10 +578,14 @@ def _apply_rope(
       (``table[:max_total:ratio]``), matching the SBHD approach.
 
     Args:
+        inplace: allow fused RoPE to overwrite its input. Disable when another
+            branch or normalization backward retains the pre-RoPE tensor.
         max_seqlen_rope: pre-computed ``max(seg_lens) * ratio`` for the
             THD + ``ratio > 1`` path (avoids a GPU→CPU sync when the
             caller already knows the max original sequence length).
     """
+    if x.shape[0] == 0:
+        return x
     packed_seq = cu_seqlens is not None
 
     if packed_seq:
@@ -602,7 +619,9 @@ def _apply_rope(
             if ratio > 1:
                 cos = cos[:total:ratio][:rotary_seq_len]
                 sin = sin[:total:ratio][:rotary_seq_len]
-        return _apply_fused_rope(x, cos, sin, nope_dim, pos_dim, cu_seqlens, cp_group)
+        return _apply_fused_rope(
+            x, cos, sin, nope_dim, pos_dim, cu_seqlens, cp_group, inplace=inplace
+        )
 
     # ---- Unfused path: build rotary_pos_emb tensor ----------------------
     if packed_seq:
@@ -1249,7 +1268,6 @@ class Compressor(MegatronModule):
             Pre-grouped CP inputs return ``None`` for this unused second value.
         """
         ratio = self.compress_ratio
-        device = x.device
         dtype = x.dtype
         pre_grouped = compressed_group_ids is not None
         has_pre_grouped_metadata = (
@@ -1268,14 +1286,7 @@ class Compressor(MegatronModule):
             total_comp = compressed_group_ids.shape[0]
         else:
             # Per-segment compressed lengths (vectorized).
-            seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
-            seg_compressed_lens = seq_lens // ratio
-            cu_seqlens_compressed = torch.cat(
-                [
-                    torch.zeros(1, dtype=cu_seqlens.dtype, device=device),
-                    seg_compressed_lens.cumsum(0).to(cu_seqlens.dtype),
-                ]
-            )
+            cu_seqlens_compressed = get_thd_compressed_cu_seqlens(cu_seqlens, ratio)
             total_comp = (
                 int(fixed_total_comp)
                 if fixed_total_comp is not None
@@ -1334,16 +1345,9 @@ class Compressor(MegatronModule):
                 # static capacity for CUDA graph capture, so rows beyond the true
                 # ``cu_seqlens_compressed[-1]`` are mapped to a safe source row and left
                 # as tail padding by downstream index lowering.
-                row_idx = torch.arange(total_comp, device=device, dtype=cu_seqlens_compressed.dtype)
-                batch_ids = batch_of_row(cu_seqlens_compressed, total_q=total_comp)
-                valid_comp = row_idx < cu_seqlens_compressed[-1]
-                local_pos = row_idx - cu_seqlens_compressed[batch_ids]
-                local_pos = torch.where(valid_comp, local_pos, torch.zeros_like(local_pos))
-                # (total_comp, 1) + (1, ratio)  →  (total_comp, ratio)
-                base = cu_seqlens[batch_ids].unsqueeze(1) + local_pos.unsqueeze(1) * ratio
-                base = torch.where(valid_comp.unsqueeze(1), base, torch.zeros_like(base))
-                offsets = torch.arange(ratio, device=device, dtype=base.dtype).unsqueeze(0)
-                gather_idx = base + offsets  # (total_comp, ratio)
+                gather_idx, local_pos, _, _ = get_thd_compressed_group_indices(
+                    cu_seqlens, cu_seqlens_compressed, ratio, total_comp
+                )
 
                 kv_grouped = kv[gather_idx]  # (total_comp, ratio, 1, coff * d)
                 score_grouped = score[gather_idx]

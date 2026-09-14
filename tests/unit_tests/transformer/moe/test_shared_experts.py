@@ -54,6 +54,14 @@ class _FakeTEScaledSwiGLU(torch.nn.Module):
         self.glu_interleave_size = glu_interleave_size
 
 
+class _FakeTEScaledClampedQGeGLU(_FakeTEScaledSwiGLU):
+    def __init__(self, glu_interleave_size, *, alpha, limit, glu_linear_offset):
+        super().__init__(glu_interleave_size)
+        self.alpha = alpha
+        self.limit = limit
+        self.glu_linear_offset = glu_linear_offset
+
+
 class _FakeTEScaledSiTUGLU(torch.nn.Module):
     def __init__(self, glu_interleave_size, *, beta1, beta2):
         super().__init__()
@@ -100,6 +108,7 @@ def _fake_te_module(linear_cls=_FakeTELinear):
             ops=SimpleNamespace(
                 GroupedLinear=_FakeTEGroupedLinear,
                 ScaledSwiGLU=_FakeTEScaledSwiGLU,
+                ScaledClampedQGeGLU=_FakeTEScaledClampedQGeGLU,
                 ScaledSiTUGLU=_FakeTEScaledSiTUGLU,
                 Sequential=_FakeTESequential,
             ),
@@ -221,11 +230,13 @@ def test_validate_fused_grouped_swiglu_rejects_unsupported_configs(
         shared_expert._validate_fused_grouped_swiglu()
 
 
-def test_make_fused_grouped_swiglu_ops_builds_grouped_pipeline(monkeypatch):
+@pytest.mark.parametrize("clamp_value", [None, 10.0])
+def test_make_fused_grouped_swiglu_ops_builds_grouped_pipeline(monkeypatch, clamp_value):
     _patch_fake_shared_expert_te(monkeypatch)
-    shared_expert = _fake_shared_expert()
+    shared_expert = _fake_shared_expert(activation_func_clamp_value=clamp_value)
     shared_expert.linear_fc1.fuse_wgrad_accumulation = True
 
+    shared_expert._validate_fused_grouped_swiglu()
     ops = shared_expert._make_fused_grouped_swiglu_ops()
 
     fc1_op, activation_op, fc2_op = list(ops.children())
@@ -242,6 +253,13 @@ def test_make_fused_grouped_swiglu_ops_builds_grouped_pipeline(monkeypatch):
 
     assert isinstance(activation_op, _FakeTEScaledSwiGLU)
     assert activation_op.glu_interleave_size == 32
+    if clamp_value is not None:
+        assert isinstance(activation_op, _FakeTEScaledClampedQGeGLU)
+        assert activation_op.limit == clamp_value
+        assert activation_op.alpha == 1.0
+        assert activation_op.glu_linear_offset == 0.0
+    else:
+        assert not isinstance(activation_op, _FakeTEScaledClampedQGeGLU)
 
     assert isinstance(fc2_op, _FakeTEGroupedLinear)
     assert fc2_op.kwargs["num_groups"] == 1
@@ -251,6 +269,22 @@ def test_make_fused_grouped_swiglu_ops_builds_grouped_pipeline(monkeypatch):
     assert fc2_op.kwargs["bias"] is False
     assert fc2_op.kwargs["accumulate_into_main_grad"] is False
     assert fc2_op.weight0 is shared_expert.linear_fc2.weight
+
+
+@pytest.mark.parametrize("missing_support", ["version", "op"])
+def test_fused_shared_expert_rejects_unsupported_clamp(monkeypatch, missing_support):
+    fake_te = _patch_fake_shared_expert_te(monkeypatch)
+    if missing_support == "version":
+        monkeypatch.setattr(
+            shared_experts_module, "is_te_min_version", lambda version: version == "2.14.0"
+        )
+    else:
+        del fake_te.pytorch.ops.ScaledClampedQGeGLU
+
+    # Older TE remains usable for ordinary SwiGLU, but must not silently ignore a clamp.
+    _fake_shared_expert()._validate_fused_grouped_swiglu()
+    with pytest.raises(RuntimeError, match="ScaledClampedQGeGLU for clamped SwiGLU"):
+        _fake_shared_expert(activation_func_clamp_value=10.0)._validate_fused_grouped_swiglu()
 
 
 def test_make_fused_grouped_swiglu_ops_selects_situ_glu(monkeypatch):

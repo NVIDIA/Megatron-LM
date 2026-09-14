@@ -439,6 +439,17 @@ class FusedSharedExpertMLP(SharedExpertMLP):
                 f"{self.__class__.__name__} requires Transformer Engine with "
                 "pytorch.ops.ScaledSiTUGLU for SiTU-GLU."
             )
+        if (
+            self.config.activation_func is F.silu
+            and self.config.activation_func_clamp_value is not None
+        ):
+            if not is_te_min_version("2.17.0.dev0") or not hasattr(
+                te.pytorch.ops, "ScaledClampedQGeGLU"
+            ):
+                raise RuntimeError(
+                    f"{self.__class__.__name__} requires Transformer Engine >= 2.17.0.dev0 "
+                    "with pytorch.ops.ScaledClampedQGeGLU for clamped SwiGLU."
+                )
         if self.config.moe_shared_expert_glu_interleave_size is None:
             raise ValueError(
                 f"{self.__class__.__name__} requires "
@@ -475,7 +486,7 @@ class FusedSharedExpertMLP(SharedExpertMLP):
         return self._fused_grouped_swiglu_recipe
 
     def _make_fused_grouped_swiglu_ops(self) -> torch.nn.Module:
-        """Construct GroupedLinear(num_groups=1) -> ScaledSwiGLU -> GroupedLinear."""
+        """Construct grouped FC1, scaled (optionally clamped) GLU, and grouped FC2."""
         ops = te.pytorch.ops.Sequential()
         tp_world_size = get_pg_size(self.tp_group)
         rng_state_tracker_function = None
@@ -504,6 +515,16 @@ class FusedSharedExpertMLP(SharedExpertMLP):
                     glu_interleave_size=glu_interleave_size,
                     beta1=self.config.situ_glu_beta1,
                     beta2=self.config.situ_glu_beta2,
+                )
+            )
+        elif self.config.activation_func_clamp_value is not None:
+            # Match routed experts: alpha=1 makes the clamped QGeGLU op SwiGLU.
+            ops.append(
+                te.pytorch.ops.ScaledClampedQGeGLU(
+                    glu_interleave_size=glu_interleave_size,
+                    alpha=1.0,
+                    limit=self.config.activation_func_clamp_value,
+                    glu_linear_offset=0.0,
                 )
             )
         else:
