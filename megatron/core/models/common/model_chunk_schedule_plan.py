@@ -303,7 +303,7 @@ class TransformerLayerSchedulePlan:
         extra_args["is_mtp"] = is_mtp
 
         # wrapper to help create TransformerLayerNode
-        def create_node(stream, module, name):
+        def create_node(stream, module, name, free_input_handback_stream=None):
             bwd_dw_callables = bwd_dw_callable_map.get(name, None)
             return TransformerLayerNode(
                 stream,
@@ -314,6 +314,7 @@ class TransformerLayerSchedulePlan:
                 name=name,
                 bwd_dw_callables=bwd_dw_callables,
                 extra_args=extra_args,
+                free_input_handback_stream=free_input_handback_stream,
             )
 
         (
@@ -328,7 +329,17 @@ class TransformerLayerSchedulePlan:
         # Create nodes for different operations in the layer
         # Each node type has a predefined name that determines its memory strategy
         self.attn = create_node(comp_stream, attn_module, "attn")
-        self.mlp = create_node(comp_stream, mlp_module, "mlp")
+        dispatch_output_handback_stream = (
+            comm_stream
+            if is_moe and self.config.moe_hybridep_use_manual_forward_stream_handback
+            else None
+        )
+        self.mlp = create_node(
+            comp_stream,
+            mlp_module,
+            "mlp",
+            free_input_handback_stream=dispatch_output_handback_stream,
+        )
         if is_moe:
             self.moe_dispatch = create_node(comm_stream, moe_dispatch_module, "moe_dispatch")
             self.moe_combine = create_node(comm_stream, moe_combine_module, "moe_combine")
