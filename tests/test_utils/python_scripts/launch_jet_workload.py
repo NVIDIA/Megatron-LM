@@ -443,14 +443,9 @@ def main(
     logging.basicConfig(level=logging.INFO)
     logger.info("Started")
 
-    model_config_path = pathlib.Path(
-        BASE_PATH
-        / ".."
-        / ".."
-        / "functional_tests"
-        / "test_cases"
-        / model
-        / test_case
+    model_config_path = (
+        BASE_PATH.parents[2]
+        / recipe_parser.functional_test_case_dir(model, test_case)
         / "model_config.yaml"
     )
 

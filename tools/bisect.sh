@@ -19,7 +19,6 @@ CHERRYPICK_SHAS=(
     "bfa0f308aa5f2df76eb24e6b9fb86de5b39b5334"
 )
 TEST_SCRIPT="test_cases/${MODEL}/${TESTCASE}.sh"
-GOLDEN_DIR="tests/functional_tests/test_cases/${MODEL}/${TESTCASE}"
 LOG_FILE="log.txt"
 
 REPO_ROOT="$(git rev-parse --show-toplevel)"
@@ -45,6 +44,21 @@ for sha in "${CHERRYPICK_SHAS[@]}"; do
    git fetch origin "${sha}"
    git cherry-pick "${sha}"
 done
+
+GOLDEN_DIR=$(python - "${MODEL}" "${TESTCASE}" <<'PY'
+import pathlib
+import sys
+
+from tests.test_utils.python_scripts import recipe_parser
+
+# Historical commits may predate the package-directory resolver.
+resolve_path = getattr(recipe_parser, "functional_test_case_dir", None)
+if resolve_path is None:
+    print(pathlib.Path("tests/functional_tests/test_cases") / sys.argv[1] / sys.argv[2])
+else:
+    print(resolve_path(sys.argv[1], sys.argv[2]))
+PY
+)
 
 python -m tests.test_utils.python_scripts.generate_local_jobs --environment dev --scope mr
 

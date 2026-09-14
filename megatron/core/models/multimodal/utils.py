@@ -2,7 +2,6 @@
 # Portions Copyright (c) 2023 OpenGVLab and licensed under the MIT license found in LICENSE.
 
 import torch
-from einops import rearrange
 
 
 def patchify_image(x: torch.Tensor, patch_dim: int) -> torch.Tensor:
@@ -10,6 +9,8 @@ def patchify_image(x: torch.Tensor, patch_dim: int) -> torch.Tensor:
     Option 1: (C,H,W) == (3,H,W) -> (L,3*patch_dim*patch_dim)
     Option 2: (B,C,H,W) == (B,3,H,W) -> (B,L,3*patch_dim*patch_dim)
     """
+    from einops import rearrange
+
     assert (
         x.shape[-2] % patch_dim == 0 and x.shape[-1] % patch_dim == 0
     ), f"H and W must be divisible by patch_dim={patch_dim}, found {x.shape[-2:]}"
@@ -46,6 +47,8 @@ def unpatchify_image(x: torch.Tensor, img_H: int, img_W: int, patch_dim: int) ->
     Option 1: (L,C) == (L,3*patch_dim*patch_dim) -> (3,H,W)
     Option 2: (B,L,C) == (B,L,3*patch_dim*patch_dim) -> (B,3,H,W)
     """
+    from einops import rearrange
+
     assert img_H % patch_dim == 0 and img_W % patch_dim == 0 and patch_dim > 0, (
         f"Expected img_H/img_W to be divisible by patch_dim={patch_dim}, "
         f"found img_H={img_H}, img_W={img_W}"

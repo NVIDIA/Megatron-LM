@@ -1,5 +1,5 @@
 # Model-specific args for the 583M mcore mistral checkpoint.
-# Sourced from tests/functional_tests/test_cases/gpt/gpt_dynamic_inference_tp1_pp1_dp8_583m_throughputtest_zmq/model_config.yaml
+# Sourced from tests/functional_tests/test_cases/core/models/gpt/gpt_dynamic_inference_tp1_pp1_dp8_583m_throughputtest_zmq/model_config.yaml
 # CHECKPOINT_LOAD_PATH must be set to the mcore_ci data root.
 --tiktoken-pattern v2
 --use-mcore-models
