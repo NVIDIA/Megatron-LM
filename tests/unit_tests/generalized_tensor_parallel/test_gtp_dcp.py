@@ -1559,13 +1559,13 @@ def _worker_restrict_shape_mismatch_to_explainable_padding(rank, world_size, ckp
     world_group = _cached_new_group(list(range(world_size)))
     trivial_replica_group = _cached_new_group([rank])
 
-    def _wrap(tensor, key, **extra):
+    def _wrap(tensor, key, prepend_offsets=(), **extra):
         return {
             key: make_tp_sharded_tensor_for_checkpoint(
                 tensor=tensor,
                 key=key,
                 tp_axis=0,
-                prepend_offsets=(),
+                prepend_offsets=prepend_offsets,
                 tp_group=trivial_replica_group,
                 dp_cp_group=world_group,
                 **extra,
@@ -1580,6 +1580,12 @@ def _worker_restrict_shape_mismatch_to_explainable_padding(rank, world_size, ckp
         )
         sharded_save = _wrap(weight_save, "weight")
         assert sharded_save["weight"].global_shape[0] == 256, sharded_save["weight"].global_shape
+        # Same tensor, second key: a prepended axis (e.g. a PP-layer axis) ahead of dim0, to
+        # pin that the padded axis is read from prepend_axis_num, not index 0 (see "Legit vs.
+        # prepended" below).
+        layer_axis = ((0, 1, 3),)  # (axis, layer_idx=1, num_layers=3)
+        sharded_save.update(_wrap(weight_save, "layer.weight", prepend_offsets=layer_axis))
+        assert sharded_save["layer.weight"].global_shape == (3, 256, in_features)
 
         with TempNamedDir(ckpt_base / 'gtp_restrict_bound', sync=True) as ckpt_dir:
             save(sharded_save, ckpt_dir)
@@ -1595,6 +1601,17 @@ def _worker_restrict_shape_mismatch_to_explainable_padding(rank, world_size, ckp
             assert (
                 sharded_legit["weight"].allow_shape_mismatch is True
             ), "padding-caused shape difference (256 vs dim0_unpadded=192) must NOT be restricted"
+
+            # Legit vs. prepended: same as above, but with a prepended axis ahead of dim0 (both
+            # sides' global_shape[0] is num_layers=3, always equal) -- would wrongly early-exit
+            # as "no difference" if the padded axis were read from index 0 instead of
+            # prepend_axis_num.
+            sharded_layer = _wrap(weight_legit, "layer.weight", prepend_offsets=layer_axis)
+            infer_gtp_allow_shape_mismatch(sharded_layer, ckpt_dir, pad_for_alignment)
+            assert sharded_layer["layer.weight"].allow_shape_mismatch is True, (
+                "prepended-axis padding (declared dim0=256 vs expected dim0=192) must be "
+                "recognized via prepend_axis_num, not silently no-op'd by comparing num_layers"
+            )
 
             # Bogus: a DIFFERENT weight (dim0=300) reusing the same key -- declared=256 <
             # dim0_unpadded=300, not padding, flag must flip to False. Needs legit_group (size 2):

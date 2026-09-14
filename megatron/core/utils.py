@@ -42,7 +42,6 @@ except ImportError:
     HAVE_DTENSOR = False
 
 from megatron.core import parallel_state
-from megatron.core.dist_checkpointing.dict_utils import nested_values
 from megatron.core.dist_checkpointing.mapping import ShardedTensor
 
 try:
@@ -1179,6 +1178,8 @@ def infer_gtp_allow_shape_mismatch(sharded_state_dict, checkpoint_dir, pad_for_a
     ``pad_for_alignment`` must come from the caller (the training recipe), not ``GTP_CONFIG`` --
     that global is only set when GTP is active in *this* process.
     """
+    from megatron.core.dist_checkpointing.dict_utils import nested_values
+
     sharded_tensors = [v for v in nested_values(sharded_state_dict) if isinstance(v, ShardedTensor)]
     if not sharded_tensors:
         return
@@ -1195,8 +1196,16 @@ def infer_gtp_allow_shape_mismatch(sharded_state_dict, checkpoint_dir, pad_for_a
             continue  # already granted for an unrelated reason (e.g., vocab padding)
         if sh_ten.key not in checkpoint_metadata:
             continue  # let the normal load path raise its own "key missing" error
-        declared0 = int(checkpoint_metadata[sh_ten.key].global_shape[0])
-        expected0 = int(sh_ten.global_shape[0])
+        ckpt_shape = checkpoint_metadata[sh_ten.key].global_shape
+        # The GTP-padded axis is dim0 of the WEIGHT, not necessarily index 0 of global_shape --
+        # e.g. a PP-layer axis prepended via prepend_offsets/sharded_offsets shifts it to
+        # prepend_axis_num. The checkpoint-side ShardedTensor is metadata-only (its own
+        # prepend_axis_num is meaningless, always 0), so index both shapes by the live tensor's.
+        axis0 = sh_ten.prepend_axis_num
+        if axis0 >= len(ckpt_shape):
+            continue  # axis layout mismatch -- not a shape this function understands
+        declared0 = int(ckpt_shape[axis0])
+        expected0 = int(sh_ten.global_shape[axis0])
         if declared0 == expected0:
             continue  # no difference -- nothing to fix
         dim0_unpadded = expected0 - int(getattr(sh_ten, "gtp_pad_length", 0))
