@@ -38,6 +38,7 @@ from megatron.core.enums import ModelType
 from megatron.training import get_args, pretrain
 from megatron.training.argument_utils import pretrain_cfg_container_from_args
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
+from megatron.training.training import validate_vision_flops_metadata
 from megatron.training.utils import start_memory_history_recording
 
 
@@ -90,6 +91,13 @@ def model_provider(
     vision_flops_fn = registry.get("vision_flops_fn")
     if vision_flops_fn is not None:
         vision_flops_fn(args, language_config, vision_config)
+        # Validate centrally here (not left to each vision_flops_fn to
+        # remember) so a future architecture that sets
+        # count_vision_model_flops=True without calling this itself still
+        # gets an eager, actionable error instead of a confusing
+        # AttributeError the first time FLOPs are computed. Idempotent, so
+        # this is harmless if an implementation also calls it directly.
+        validate_vision_flops_metadata(args)
 
     # --- build model (fully delegated to the arch factory) ---
     model = registry["model_factory_fn"](

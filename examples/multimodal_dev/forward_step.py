@@ -17,7 +17,9 @@ from megatron.core.parallel_state import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_src_rank,
 )
+from megatron.core.rerun_state_machine import RerunState, get_rerun_state_machine
 from megatron.training import get_args
+from megatron.training.training import update_vision_model_flops_stats
 
 # -------------------------------------------------------------------
 # dtype <-> int mapping for cross-rank broadcast
@@ -393,9 +395,49 @@ def loss_func(loss_mask, output_tensor):
 # -------------------------------------------------------------------
 
 
+def record_vision_model_flops(args, model, batch):
+    """Report this microbatch's vision grids to the FLOPs accumulator.
+
+    Called from :func:`forward_step` BEFORE its ``batch is None``
+    early-return, so a rank whose data iterator ran dry still reports an
+    explicit zero (``grid_thw=None``) instead of silently dropping its share
+    of the global batch. Entering the collective in
+    ``consume_vision_model_flops_stats`` is keyed off
+    ``args.count_vision_model_flops`` alone, so a missed report here cannot
+    desync the job -- it would only skew the reported number.
+
+    Two executions of a microbatch must not both be counted:
+
+    * ``model.training`` excludes ``evaluate()``, which calls
+      ``model.eval()``. ``evaluate()`` reuses this same forward step but never
+      drains the accumulator, so anything it added would leak into the next
+      ``train()`` iteration.
+    * ``RerunState.RERUNNING_IN_PLACE`` excludes the rerun state machine's
+      in-place replay of the SAME microbatches (``--check-for-nan-in-loss`` /
+      ``--check-for-spiky-loss``), which re-executes with the model still in
+      train mode. The accepted execution is the initial run, whose
+      contribution is already in the accumulator; the replay must add nothing.
+      The other rerun states replay in a freshly restarted process, whose
+      accumulator starts empty.
+    """
+    if not getattr(args, "count_vision_model_flops", False):
+        return
+    if not getattr(model, "training", True):
+        return
+    if get_rerun_state_machine().state == RerunState.RERUNNING_IN_PLACE:
+        return
+    update_vision_model_flops_stats(
+        batch.get("image_grid_thw", None) if batch is not None else None,
+        spatial_merge_size=getattr(args, "vision_spatial_merge_size", None),
+    )
+
+
 def forward_step(data_iterator, model):
     """Forward step for multimodal_dev training."""
     batch = get_batch(data_iterator)
+
+    args = get_args()
+    record_vision_model_flops(args, model, batch)
 
     if batch is None:
         return None, None
