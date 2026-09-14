@@ -35,6 +35,7 @@ from megatron.core.transformer.cuda_graph_config import (
     validate_moe_cuda_graph_support,
 )
 from megatron.core.transformer.enums import CudaGraphModule
+from megatron.core.transformer.experimental_attention_variant import dsa_logging
 from megatron.core.transformer.module import GraphableMegatronModule, MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import (
@@ -1806,6 +1807,13 @@ class TECudaGraphHelper:
         self.num_microbatches = None
 
         self._discover_layers()
+        attention_in_graph_scope = (
+            not self.config.cuda_graph_modules
+            or CudaGraphModule.attn in self.config.cuda_graph_modules
+        )
+        self._captures_dsa_metric_writes = attention_in_graph_scope and (
+            dsa_logging.get_dsa_metric_tracker_size(self.flattened_callables) > 0
+        )
 
         # Flags to track CUDA Graph state:
         # - _capture_finished: Whether create_cudagraphs() has been called (used by training loop)
@@ -2728,6 +2736,9 @@ class TECudaGraphHelper:
         for optimizer in self.optimizers:
             optimizer.zero_grad()
         get_moe_metrics_tracker().clear()
+        # TE executes real eager warmups before recording its graphs. Discard any metric writes
+        # while retaining the fixed storage and process-group metadata used by graph replay.
+        dsa_logging.DSAIndexerLossLoggingHelper.clean_loss_in_tracker(preserve_groups=True)
         reset_model_temporary_tensors(self.config, self.model)
 
     def _finish_capturing(self, start_time):
@@ -2777,6 +2788,12 @@ class TECudaGraphHelper:
         Capture CUDA Graphs per TransformerLayer per microbatch.
         """
         validate_moe_cuda_graph_support(self.config)
+        if self._captures_dsa_metric_writes:
+            dsa_metric_tracker = dsa_logging.DSAIndexerLossLoggingHelper.tracker
+            if dsa_metric_tracker.get("agreed_size") is None:
+                raise RuntimeError(
+                    "DSA metric tracker must be initialized before CUDA Graph capture."
+                )
         start_time = self._start_capturing()
 
         if not self.flattened_callables:
