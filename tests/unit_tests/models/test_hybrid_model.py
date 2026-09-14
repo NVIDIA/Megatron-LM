@@ -535,30 +535,77 @@ class TestHybridModel:
         assert model_config.overlap_moe_expert_parallel_comm is False
         assert mtp_config.overlap_moe_expert_parallel_comm is True
 
-    @pytest.mark.parametrize("mtp_suffix", [[], [MTPSplit]])
-    def test_config_list_rejects_hsm_with_fewer_than_two_heads(self, mtp_suffix):
+    @pytest.mark.parametrize("architecture", ["pattern", "config_list"])
+    @pytest.mark.parametrize("num_heads", [0, 1, 2])
+    def test_hsm_uses_resolved_mtp_depth(self, mocker, architecture, num_heads):
         model_config = TransformerConfig(
             num_layers=1,
             hidden_size=256,
             num_attention_heads=4,
             use_cpu_initialization=True,
             mtp_hsm=True,
-            is_hybrid_model=True,
         )
         main_config = MLPLayerConfig.from_config(model_config)
         mtp_config = AttentionLayerConfig.from_config(model_config)
-        source = [main_config]
-        if mtp_suffix:
-            source.extend([*mtp_suffix, mtp_config])
+        architecture_kwargs = (
+            {"hybrid_layer_pattern": "-" + "/*" * num_heads}
+            if architecture == "pattern"
+            else {"hybrid_layer_config_list": [main_config, *([MTPSplit, mtp_config] * num_heads)]}
+        )
+        mocker.patch(
+            "megatron.core.models.hybrid.hybrid_model.mtp_on_this_rank", return_value=False
+        )
+        log = mocker.patch("megatron.core.models.hybrid.hybrid_model.log_single_rank")
 
-        with pytest.raises(ValueError, match="mtp_hsm=True requires mtp_num_layers >= 2"):
-            HybridModel(
-                config=model_config,
-                hybrid_stack_spec=hybrid_stack_spec,
-                vocab_size=100,
-                max_sequence_length=4,
-                hybrid_layer_config_list=source,
-            )
+        model = HybridModel(
+            config=model_config,
+            hybrid_stack_spec=hybrid_stack_spec,
+            vocab_size=100,
+            max_sequence_length=4,
+            **architecture_kwargs,
+        )
+
+        assert model.config.mtp_hsm is (num_heads == 2)
+        assert model.config.mtp_num_layers == (num_heads or None)
+        assert model.mtp_num_depths == num_heads
+        assert model.mtp_process is False
+        warnings = [call.args[2] for call in log.call_args_list]
+        assert any("Disabling Hidden State Mixing" in message for message in warnings) is (
+            num_heads < 2
+        )
+        assert main_config.mtp_hsm is True
+        assert mtp_config.mtp_hsm is True
+        assert main_config.mtp_num_layers is None
+        assert mtp_config.mtp_num_layers is None
+
+    @pytest.mark.parametrize("legacy_override", [None, "*"])
+    def test_warns_for_missing_mtp_template(self, mocker, legacy_override):
+        model_config = TransformerConfig(
+            num_layers=1,
+            hidden_size=256,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            mtp_num_layers=2,
+            mtp_hsm=True,
+            mtp_hybrid_override_pattern=legacy_override,
+        )
+        log = mocker.patch("megatron.core.models.hybrid.hybrid_model.log_single_rank")
+
+        model = HybridModel(
+            config=model_config,
+            hybrid_stack_spec=hybrid_stack_spec,
+            vocab_size=100,
+            max_sequence_length=4,
+            hybrid_layer_pattern="-",
+        )
+
+        warnings = [call.args[2] for call in log.call_args_list]
+        assert any("no MTP template" in message for message in warnings) is (
+            legacy_override is None
+        )
+        assert model.mtp_num_depths == 0
+        assert model.config.mtp_hsm is False
+        assert model.mtp_process is False
 
     @pytest.mark.parametrize("architecture", ["pattern", "config_list"])
     def test_rejects_frozen_base_without_mtp(self, architecture):

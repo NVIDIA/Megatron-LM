@@ -589,53 +589,44 @@ class TestMultiTokenPredictionLayer:
         config = TransformerConfig(num_layers=2, hidden_size=4, num_attention_heads=1)
         assert config.mtp_hsm is False
 
-    @pytest.mark.parametrize("mtp_num_layers", [0, 1])
-    def test_mtp_hsm_requires_multiple_layers(self, mtp_num_layers):
-        """TransformerConfig rejects resolved depths with no history to mix."""
-        with pytest.raises(ValueError, match="mtp_hsm=True requires mtp_num_layers >= 2"):
-            TransformerConfig(
-                num_layers=2,
-                hidden_size=4,
-                num_attention_heads=1,
-                mtp_num_layers=mtp_num_layers,
-                mtp_hsm=True,
-            )
-
-    def test_mtp_hsm_allows_unresolved_depth_for_hybrid_list_inference(self):
+    @pytest.mark.parametrize("mtp_num_layers", [None, 0, 1, 2])
+    @pytest.mark.parametrize("is_hybrid_model", [False, True])
+    def test_mtp_hsm_config_defers_depth_validation_to_model(self, mtp_num_layers, is_hybrid_model):
         config = TransformerConfig(
             num_layers=2,
             hidden_size=4,
             num_attention_heads=1,
-            mtp_num_layers=None,
+            mtp_num_layers=mtp_num_layers,
             mtp_hsm=True,
-            is_hybrid_model=True,
+            is_hybrid_model=is_hybrid_model,
         )
 
-        assert config.mtp_num_layers is None
+        assert config.mtp_num_layers == mtp_num_layers
         assert config.mtp_hsm is True
 
-    def test_mtp_hsm_rejects_unresolved_depth_outside_hybrid_model(self):
-        with pytest.raises(ValueError, match="mtp_hsm=True requires mtp_num_layers >= 2"):
-            TransformerConfig(
-                num_layers=2,
-                hidden_size=4,
-                num_attention_heads=1,
-                mtp_num_layers=None,
-                mtp_hsm=True,
-            )
-
-    def test_mtp_block_rejects_unresolved_hsm_depth(self):
+    @pytest.mark.parametrize("mtp_num_layers", [None, 0, 1])
+    @pytest.mark.parametrize("mtp_num_depths", [0, 2])
+    def test_mtp_block_rejects_insufficient_hsm_depth(self, mtp_num_layers, mtp_num_depths):
         config = TransformerConfig(
             num_layers=2,
             hidden_size=4,
             num_attention_heads=1,
-            mtp_num_layers=None,
+            mtp_num_layers=mtp_num_layers,
             mtp_hsm=True,
-            is_hybrid_model=True,
         )
 
         with pytest.raises(ValueError, match="mtp_hsm=True requires mtp_num_layers >= 2"):
-            MultiTokenPredictionBlock(config=config, spec=object())
+            MultiTokenPredictionBlock(config=config, spec=object(), mtp_num_depths=mtp_num_depths)
+
+    def test_mtp_block_validates_executed_hybrid_hsm_depth(self):
+        config = TransformerConfig(
+            num_layers=2, hidden_size=4, num_attention_heads=1, mtp_num_layers=2, mtp_hsm=True
+        )
+
+        with pytest.raises(ValueError, match="mtp_hsm=True requires mtp_num_layers >= 2"):
+            MultiTokenPredictionBlock(
+                config=config, spec=object(), mtp_layer_pattern="*", mtp_num_depths=1
+            )
 
     @pytest.mark.parametrize(
         ("training", "expected_second_input"), [(True, [1.0, 2.0]), (False, [2.0, 2.0])]
@@ -2705,6 +2696,39 @@ class TestMultiTokenPrediction:
             # for param in gpt_model[0].parameters():
             for name, param in gpt_model[0].named_parameters():
                 assert param.main_grad is not None
+
+    @pytest.mark.skipif(
+        not HAVE_TE or not is_te_min_version("2.1.0"),
+        reason="grouped_gemm requires TransformerEngine >= 2.1.0",
+    )
+    @pytest.mark.parametrize("use_builder", [False, True])
+    def test_model_hsm_disable_is_synchronized_to_training_args(self, use_builder):
+        args = self.create_test_args(
+            tp=1,
+            cp=1,
+            sequence_length=self.seq_length,
+            micro_batch_size=self.micro_batch_size,
+            mtp_hsm=True,
+        )
+        args.mtp_num_layers = 1
+        set_args(args)
+        Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=1)
+        model_parallel_cuda_manual_seed(_SEED)
+        cfg_container = Utils.pretrain_config_from_global_args(args, "gpt") if use_builder else None
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+
+        models, _, _ = setup_model_and_optimizer(
+            ModelType.encoder_or_decoder,
+            self.model_provider,
+            cfg_container=cfg_container,
+            pg_collection=pg_collection,
+        )
+
+        assert args.mtp_hsm is False
+        model = unwrap_model(models[0])
+        assert model.config.mtp_hsm is False
+        assert model.mtp.config.mtp_hsm is False
+        assert model.config.mtp_num_layers == args.mtp_num_layers == 1
 
     @pytest.mark.skipif(
         not HAVE_TE or not is_te_min_version("2.1.0"),

@@ -119,6 +119,59 @@ class TestGPTModel:
         assert model.config.freeze_base_model_for_mtp is False
         assert model.mtp_process is False
 
+    @pytest.mark.parametrize("mtp_num_layers", [None, 0, 1, 2])
+    def test_hsm_uses_global_mtp_depth(self, mocker, mtp_num_layers):
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=12,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            mtp_num_layers=mtp_num_layers,
+            mtp_hsm=True,
+        )
+        mocker.patch("megatron.core.models.gpt.gpt_model.mtp_on_this_rank", return_value=False)
+        log = mocker.patch("megatron.core.models.gpt.gpt_model.log_single_rank")
+        layer_spec = get_gpt_layer_with_transformer_engine_spec()
+
+        model = GPTModel(
+            config=config,
+            transformer_layer_spec=layer_spec,
+            vocab_size=100,
+            max_sequence_length=4,
+            position_embedding_type="rope",
+            mtp_block_spec=layer_spec,
+        )
+
+        assert model.config.mtp_hsm is (mtp_num_layers == 2)
+        assert model.mtp_process is False
+        warnings = [call.args[2] for call in log.call_args_list]
+        assert any("Disabling Hidden State Mixing" in message for message in warnings) is (
+            mtp_num_layers != 2
+        )
+
+    @pytest.mark.parametrize("override_pattern", [None, "-"])
+    def test_warns_for_hybrid_mtp_override(self, mocker, override_pattern):
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=12,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            mtp_hybrid_override_pattern=override_pattern,
+        )
+        log = mocker.patch("megatron.core.models.gpt.gpt_model.log_single_rank")
+
+        GPTModel(
+            config=config,
+            transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
+            vocab_size=100,
+            max_sequence_length=4,
+        )
+
+        warnings = [call.args[2] for call in log.call_args_list]
+        assert any("This argument will be ignored" in message for message in warnings) is (
+            override_pattern is not None
+        )
+
     @pytest.mark.parametrize("has_mtp_spec", [False, True])
     def test_frozen_base_allows_global_mtp_without_local_mtp(self, mocker, has_mtp_spec):
         config = TransformerConfig(

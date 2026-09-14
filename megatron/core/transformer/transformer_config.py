@@ -98,7 +98,8 @@ class TransformerConfig(ModelParallelConfig):
     At every MTP depth, each token independently draws its input from the main model
     hidden state and the outputs of the earlier depths, all aligned on the same target
     token. Only takes effect during training and requires at least two MTP layers,
-    since a single depth has nothing to mix."""
+    since a single depth has nothing to mix. Model constructors disable it with a
+    warning when the resolved architecture has fewer than two MTP layers."""
 
     mtp_hybrid_override_pattern: Optional[str] = None
     """DEPRECATED: Use unified hybrid_layer_pattern instead.
@@ -1561,16 +1562,6 @@ class TransformerConfig(ModelParallelConfig):
 
         if self.moe_use_grouped_tensor and not self.moe_grouped_gemm:
             raise ValueError("moe_use_grouped_tensor=True requires moe_grouped_gemm=True.")
-
-        # A Python-defined HybridModel can infer this value from its MTPSplit sections later.
-        # Other config consumers retain the existing fail-fast validation for an unset depth.
-        defer_hybrid_mtp_depth = self.is_hybrid_model and self.mtp_num_layers is None
-        if (
-            self.mtp_hsm
-            and not defer_hybrid_mtp_depth
-            and (self.mtp_num_layers is None or self.mtp_num_layers < 2)
-        ):
-            raise ValueError("mtp_hsm=True requires mtp_num_layers >= 2.")
 
         # When fp32 residual connections are enabled, pipeline parallel communication must
         # use fp32 to match the dtype of the residual stream between pipeline stages.

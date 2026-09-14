@@ -129,10 +129,11 @@ physical layer occurrence.
 
 The Python definition remains the architecture source when resuming a
 checkpoint. Checkpoints record that the model is hybrid, but do not serialize
-or reconstruct `hybrid_layer_config_list`. A custom training entrypoint that
-validates arguments before creating the model should pass
-`is_hybrid_model=True` as an argument default; `pretrain_hybrid.py` already does
-this. The scalar is only a runtime/checkpoint family marker.
+or reconstruct `hybrid_layer_config_list`. No hybrid-family argument default is
+needed: model constructors validate MTP options after resolving the architecture,
+and training records the family marker from the built model. Configure VPP
+explicitly before distributed initialization; the list-backed builder rejects
+`--num-layers-per-virtual-pipeline-stage`.
 
 ## 2. How to Convert a Checkpoint
 

@@ -415,7 +415,7 @@ class TestHybridModelBuilderBuildModel:
         decoder_layer = AttentionLayerConfig.from_config(transformer)
         mtp_layer = AttentionLayerConfig.from_config(transformer)
         layer_config_list = [decoder_layer, decoder_layer, MTPSplit, mtp_layer, MTPSplit, mtp_layer]
-        args = Mock(mtp_num_layers=None)
+        args = Mock(mtp_num_layers=None, num_layers_per_virtual_pipeline_stage=None)
         mock_get_args.return_value = args
         config = _make_hybrid_config(
             transformer=transformer, hybrid_layer_config_list=layer_config_list
@@ -438,7 +438,7 @@ class TestHybridModelBuilderBuildModel:
     ):
         transformer = _make_transformer()
         decoder_layer = AttentionLayerConfig.from_config(transformer)
-        args = Mock(mtp_num_layers=None)
+        args = Mock(mtp_num_layers=None, num_layers_per_virtual_pipeline_stage=None)
         mock_get_args.return_value = args
         config = _make_hybrid_config(
             transformer=transformer, hybrid_layer_config_list=[decoder_layer, decoder_layer]
@@ -517,12 +517,28 @@ class TestHybridModelBuilderBuildModel:
             HybridModelBuilder(config).build_model(Mock(), pre_process=True, post_process=True)
 
     @patch("megatron.training.models.hybrid.get_args")
+    def test_config_list_rejects_cli_inferred_vpp_size(self, mock_get_args):
+        transformer = _make_transformer()
+        layer = AttentionLayerConfig.from_config(transformer)
+        config = _make_hybrid_config(
+            transformer=transformer, hybrid_layer_config_list=[layer, layer]
+        )
+        mock_get_args.return_value = Mock(
+            mtp_num_layers=None, num_layers_per_virtual_pipeline_stage=1
+        )
+
+        with pytest.raises(ValueError, match="must configure VPP explicitly"):
+            HybridModelBuilder(config).build_model(Mock(), pre_process=True, post_process=True)
+
+    @patch("megatron.training.models.hybrid.get_args")
     def test_config_list_rejects_runtime_mtp_depth_mismatch(self, mock_get_args):
         transformer = _make_transformer()
         decoder_layer = AttentionLayerConfig.from_config(transformer)
         mtp_layer = AttentionLayerConfig.from_config(transformer)
         layer_config_list = [decoder_layer, decoder_layer, MTPSplit, mtp_layer]
-        mock_get_args.return_value = Mock(mtp_num_layers=2)
+        mock_get_args.return_value = Mock(
+            mtp_num_layers=2, num_layers_per_virtual_pipeline_stage=None
+        )
         config = _make_hybrid_config(
             transformer=transformer, hybrid_layer_config_list=layer_config_list
         )

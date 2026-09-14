@@ -334,6 +334,20 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             parsed_pattern = parse_hybrid_pattern(self.hybrid_layer_pattern)
             self.mtp_pattern = parsed_pattern.mtp_pattern
             self.mtp_num_depths = parsed_pattern.mtp_num_depths
+            if self.config.mtp_num_layers is None and self.mtp_num_depths > 0:
+                self.config.mtp_num_layers = self.mtp_num_depths
+            if (
+                self.config.mtp_num_layers
+                and self.mtp_num_depths == 0
+                and self.config.mtp_hybrid_override_pattern is None
+            ):
+                log_single_rank(
+                    logger,
+                    logging.WARNING,
+                    "HybridModel has mtp_num_layers set but no MTP template. "
+                    "Use hybrid_layer_pattern with '/' separators (e.g., 'M*M*/MM/MM') "
+                    "or hybrid_layer_config_list with MTPSplit markers.",
+                )
             layer_config_list, layer_offset = select_pipeline_segment(
                 parsed_pattern.main_pattern or '',
                 self.config,
@@ -356,10 +370,15 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 f"{self.position_embedding_type} position embedding type. "
                 "The supported position embedding types are rope and none."
             )
-        if self.config.mtp_hsm and (
-            self.config.mtp_num_layers is None or self.config.mtp_num_layers < 2
-        ):
-            raise ValueError("mtp_hsm=True requires mtp_num_layers >= 2.")
+        if self.config.mtp_hsm and self.mtp_num_depths < 2:
+            log_single_rank(
+                logger,
+                logging.WARNING,
+                "mtp_hsm needs at least two MTP layers to mix anything, but "
+                f"the HybridModel architecture defines {self.mtp_num_depths} MTP heads. "
+                "Disabling Hidden State Mixing.",
+            )
+            self.config.mtp_hsm = False
 
         if self.hybrid_layer_config_list is not None:
             # Per-layer configs may predate list-backed MTP depth inference. Synchronize only the

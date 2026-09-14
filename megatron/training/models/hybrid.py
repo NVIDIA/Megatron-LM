@@ -160,6 +160,17 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
             args = None
         args_mtp_num_layers = getattr(args, "mtp_num_layers", None) if args is not None else None
         if hybrid_layer_config_list is not None:
+            # This CLI-only option is not part of TransformerConfig. Core validates the
+            # supplied PP/VPP topology against the list's PipelineSplit markers.
+            if (
+                args is not None
+                and getattr(args, "num_layers_per_virtual_pipeline_stage", None) is not None
+            ):
+                raise ValueError(
+                    "Python-defined HybridModel config lists must configure VPP explicitly with "
+                    "--num-virtual-stages-per-pipeline-rank; "
+                    "--num-layers-per-virtual-pipeline-stage would infer VPP from a layer count."
+                )
             has_deprecated_ratio = self._model_config.hybrid_attention_ratio != 0.0 or (
                 self._model_config.hybrid_mlp_ratio != 0.0
             )
