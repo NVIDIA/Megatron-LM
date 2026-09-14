@@ -529,8 +529,9 @@ class EngramConfig:
                 f"etp={transformer_config.expert_tensor_parallel_size} and "
                 f"tp={transformer_config.tensor_model_parallel_size}."
             )
-        if transformer_config.virtual_pipeline_model_parallel_size is not None:
-            raise ValueError("Engram does not yet support virtual pipeline parallelism.")
+        # Virtual pipeline parallelism is supported: the token prefetch returns one wrapper per
+        # model chunk over a single shared token store, which is all VPP needs because tokens
+        # depend on the microbatch and never on the chunk.
         tensor_parallel_size = transformer_config.tensor_model_parallel_size
         if transformer_config.sequence_parallel and sequence_length is not None:
             # Each rank fetches its convolution history from the previous rank in one hop, so

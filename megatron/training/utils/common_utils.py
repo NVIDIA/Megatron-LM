@@ -630,8 +630,27 @@ def prepare_tokens_for_pipeline(
     availability is broadcast first so an exhausted iterator fails on every rank instead of
     hanging the peers inside the token broadcast.
     """
-    if isinstance(data_iterator, list):
-        raise RuntimeError("Engram pipeline token prefetch does not support VPP data iterators.")
+    # Under VPP the scheduler hands each model chunk its own iterator and indexes the list
+    # itself before calling forward_step, so every chunk ends up with its own wrapper and no
+    # virtual-stage index has to be threaded anywhere. Tokens depend only on the microbatch,
+    # never on the chunk, so one prefetch feeds them all.
+    chunk_iterators = data_iterator if isinstance(data_iterator, list) else [data_iterator]
+    is_virtual = isinstance(data_iterator, list)
+    token_source = chunk_iterators[0] if chunk_iterators else None
+
+    def _wrap(per_chunk_tokens, prefetched, token_spec=None):
+        wrappers = [
+            PipelineTokenPrefetchIterator(
+                data_iterator=chunk_iterator,
+                # Only the chunk that was drained has batches to replay; the others still own
+                # an unconsumed iterator that yields the same microbatches.
+                prefetched_batches=prefetched if index == 0 else [],
+                pipeline_tokens=list(per_chunk_tokens),
+                token_spec=token_spec,
+            )
+            for index, chunk_iterator in enumerate(chunk_iterators)
+        ]
+        return wrappers if is_virtual else wrappers[0]
 
     padded_shape = (micro_batch_size, sequence_length)
     pp_rank = get_pg_rank(pp_group)
@@ -646,20 +665,15 @@ def prepare_tokens_for_pipeline(
     if pp_size == 1 and tp_size == 1:
         # Nothing to distribute: draining the schedule's whole global batch up front would
         # only hold every microbatch resident for no benefit.
-        return PipelineTokenPrefetchIterator(
-            data_iterator=data_iterator,
-            prefetched_batches=[],
-            pipeline_tokens=[],
-            token_spec=(micro_batch_size, sequence_length, device),
-        )
+        return _wrap([], [], token_spec=(micro_batch_size, sequence_length, device))
 
     if pp_rank == 0 and tp_rank == 0:
         microbatch_tokens = []
         try:
-            if data_iterator is None:
+            if token_source is None:
                 raise RuntimeError("The first pipeline stage TP source must own Engram data.")
             for _ in range(num_microbatches):
-                batch = next(data_iterator)
+                batch = next(token_source)
                 prefetched_batches.append(batch)
                 microbatch_tokens.append(
                     _pipeline_tokens_from_batch(batch, micro_batch_size, sequence_length, device)
@@ -708,11 +722,7 @@ def prepare_tokens_for_pipeline(
     if pp_size > 1:
         _broadcast_from_source(stacked_tokens, pp_group)
 
-    return PipelineTokenPrefetchIterator(
-        data_iterator=data_iterator,
-        prefetched_batches=prefetched_batches,
-        pipeline_tokens=list(stacked_tokens.unbind(0)),
-    )
+    return _wrap(stacked_tokens.unbind(0), prefetched_batches)
 
 
 def get_pipeline_prefetched_tokens(data_iterator) -> torch.Tensor:

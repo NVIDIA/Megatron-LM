@@ -196,6 +196,8 @@ def test_invalid_configuration_messages(tmp_path):
     # forwards input_ids to the layers it replays.
     config.validate_startup(_startup_transformer_config(recompute_granularity="full"), 16)
     config.validate_startup(_startup_transformer_config(recompute_granularity="selective"), 16)
+    # VPP needs no guard either: each model chunk gets its own prefetch wrapper.
+    config.validate_startup(_startup_transformer_config(virtual_pipeline_model_parallel_size=2), 16)
     with pytest.raises(ValueError, match="overlap_moe_expert_parallel_comm"):
         config.validate_startup(
             _startup_transformer_config(overlap_moe_expert_parallel_comm=True), 16
