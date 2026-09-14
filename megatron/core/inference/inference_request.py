@@ -1305,6 +1305,14 @@ class RequestPayloadStager(Protocol):
         ...
 
 
+# Request-metadata keys written by the chat endpoint when it defers the prompt
+# prefix splice to a RequestPromptPreparer: the current render's tokens from the
+# turn boundary onward, and the boundary (EOS) token id. The preparer supplies the
+# exact prior-turn tokens and concatenates ``prefix_without_boundary + suffix``.
+PREFIX_SPLICE_SUFFIX_FIELD = "prefix_splice_suffix_token_ids"
+PREFIX_SPLICE_BOUNDARY_FIELD = "prefix_splice_boundary_token_id"
+
+
 class RequestPromptPreparer(Protocol):
     """Protocol for resolving an exact prompt before engine admission."""
 
