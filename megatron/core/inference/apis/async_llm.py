@@ -2,7 +2,8 @@
 
 """Async high-level inference API for Megatron (``MegatronAsyncLLM``)."""
 
-from typing import List, Optional, Type, Union
+import asyncio
+from typing import Callable, List, Optional, Type, Union
 
 from megatron.core.inference.apis._llm_base import _MegatronLLMBase
 from megatron.core.inference.apis.serve_config import ServeConfig
@@ -31,7 +32,12 @@ class MegatronAsyncLLM(_MegatronLLMBase):
     - ``async generate`` accepting single or batched prompts.
     - ``async`` lifecycle controls: ``pause`` / ``unpause`` / ``suspend`` /
       ``resume`` / ``shutdown`` / ``wait_for_shutdown``.
+    - :meth:`close`: sync teardown for callers that cannot await ``shutdown()``
+      (a thread whose own event loop is running).
     - :meth:`serve` for OpenAI-compatible HTTP serving on the primary rank.
+    - ``loop_factory`` (constructor) and ``ServeConfig.loop_factory``:
+      pin the runtime / frontend event-loop implementation instead of inheriting
+      the process-wide policy (compatibility with Ray).
     - ``async with`` context-manager protocol; exit calls :meth:`shutdown`.
     """
 
@@ -45,6 +51,7 @@ class MegatronAsyncLLM(_MegatronLLMBase):
         coordinator_host: Optional[str] = None,
         coordinator_port: Optional[int] = None,
         inference_wrapper_cls: Optional[Type[AbstractModelInferenceWrapper]] = None,
+        loop_factory: Optional[Callable[[], asyncio.AbstractEventLoop]] = None,
     ) -> None:
         # Resolve the default at call time so tests can monkey-patch
         # ``GPTInferenceWrapper`` on this module.
@@ -72,6 +79,7 @@ class MegatronAsyncLLM(_MegatronLLMBase):
             coordinator_host=coordinator_host,
             coordinator_port=coordinator_port,
             inference_wrapper_cls=inference_wrapper_cls,
+            loop_factory=loop_factory,
         )
 
     async def generate(
@@ -169,9 +177,16 @@ class MegatronAsyncLLM(_MegatronLLMBase):
         """Stop the engine, tear down the coordinator, and join the runtime thread.
 
         Idempotent. No-op in direct mode.
+        Must be awaited from a loop other than the runtime loop,
+        because the final join targets the runtime thread.
         """
         if self._shutdown_called:
             return
+        if self._use_coordinator:
+            assert self._loop_manager is not None
+            # Reject the runtime-loop caller before any state changes; the
+            # final join would otherwise fail only after the engine is down.
+            self._loop_manager.assert_not_on_loop()
         self._shutdown_called = True
 
         self._stop_frontend_if_started()
@@ -230,6 +245,7 @@ class MegatronAsyncLLM(_MegatronLLMBase):
                 default_top_p=serve_config.default_top_p,
                 default_top_k=serve_config.default_top_k,
                 eval_mode=serve_config.eval_mode,
+                loop_factory=serve_config.loop_factory,
             )
             self._serve_started = True
 

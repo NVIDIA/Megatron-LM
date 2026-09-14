@@ -2,7 +2,8 @@
 
 """Sync high-level inference API for Megatron (``MegatronLLM``)."""
 
-from typing import List, Optional, Type, Union
+import asyncio
+from typing import Callable, List, Optional, Type, Union
 
 from megatron.core.inference.apis._llm_base import _MegatronLLMBase
 from megatron.core.inference.apis.serve_config import ServeConfig
@@ -32,6 +33,9 @@ class MegatronLLM(_MegatronLLMBase):
       :meth:`suspend` / :meth:`resume` / :meth:`shutdown` /
       :meth:`wait_for_shutdown`.
     - :meth:`serve` for OpenAI-compatible HTTP serving on the primary rank.
+    - ``loop_factory`` (constructor) and ``ServeConfig.loop_factory``:
+      pin the runtime / frontend event-loop implementation
+      instead of inheriting the process-wide policy (needed for Ray compatibility).
     - Context-manager protocol: ``with MegatronLLM(...) as llm:``; exit
       calls :meth:`shutdown`.
     """
@@ -46,6 +50,7 @@ class MegatronLLM(_MegatronLLMBase):
         coordinator_host: Optional[str] = None,
         coordinator_port: Optional[int] = None,
         inference_wrapper_cls: Optional[Type[AbstractModelInferenceWrapper]] = None,
+        loop_factory: Optional[Callable[[], asyncio.AbstractEventLoop]] = None,
     ) -> None:
         # Resolve the default at call time so tests can monkey-patch
         # ``GPTInferenceWrapper`` on this module. Binding it as the argument
@@ -62,6 +67,7 @@ class MegatronLLM(_MegatronLLMBase):
             coordinator_host=coordinator_host,
             coordinator_port=coordinator_port,
             inference_wrapper_cls=inference_wrapper_cls,
+            loop_factory=loop_factory,
         )
 
     def generate(
@@ -163,17 +169,11 @@ class MegatronLLM(_MegatronLLMBase):
         self._loop_manager.run_sync(self._resume_impl())
 
     def shutdown(self) -> None:
-        """Tear down the engine and runtime. Idempotent. Direct mode is a no-op."""
-        if self._shutdown_called:
-            return
-        self._shutdown_called = True
-        self._stop_frontend_if_started()
-        if not self._use_coordinator:
-            return  # direct mode: nothing to tear down
-        assert self._loop_manager is not None
-        self._loop_manager.run_sync(self._shutdown_impl())
-        # Sync caller already on its own thread; no need for to_thread.
-        self._loop_manager.stop()
+        """Tear down the engine and runtime. Idempotent. Direct mode is a no-op.
+
+        Alias of :meth:`close`; kept as the facade's lifecycle-verb name.
+        """
+        self.close()
 
     def serve(self, serve_config: ServeConfig, *, blocking: bool = True) -> None:
         """Start the OpenAI-compatible HTTP frontend.
@@ -223,6 +223,7 @@ class MegatronLLM(_MegatronLLMBase):
                 default_top_p=serve_config.default_top_p,
                 default_top_k=serve_config.default_top_k,
                 eval_mode=serve_config.eval_mode,
+                loop_factory=serve_config.loop_factory,
             )
             self._serve_started = True
 
