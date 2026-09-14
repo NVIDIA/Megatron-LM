@@ -54,12 +54,12 @@ from megatron.lite.model.qwen3_moe.common import is_expert_param
 from megatron.lite.model.qwen3_moe.config import Qwen3MoEConfig
 from megatron.lite.model.qwen3_moe.lite.checkpoint import EXPERT_CLASSIFIER, PLACEMENT_FN
 from megatron.lite.model.qwen3_moe.lite.checkpoint import load_hf_weights as _load_hf_weights_impl
-from megatron.lite.model.qwen3_moe.lite.model import (
-    MTPLossAutoScaler,
-    Qwen3MoEModel,
+from megatron.lite.model.qwen3_moe.lite.chunked_ep import (
+    Qwen3ChunkedEP,
     validate_chunked_ep_mtp,
     validate_qwen3_ep_chunk_recompute_composition,
 )
+from megatron.lite.model.qwen3_moe.lite.model import MTPLossAutoScaler, Qwen3MoEModel
 from megatron.lite.primitive.bundle import ModelBundle
 from megatron.lite.primitive.modules.lora import (
     LoraConfig,
@@ -303,10 +303,15 @@ def build_model(model_cfg: Qwen3MoEConfig, *, impl_cfg: ImplConfig) -> ModelBund
         mtp_enable=mtp_enable,
         mtp_enable_train=mtp_enable_train,
         mtp_detach_encoder=impl_cfg.mtp_detach_encoder,
-        enable_ep_chunk_overlap=impl_cfg.enable_ep_chunk_overlap,
-        ep_chunk_full_recompute=impl_cfg.ep_chunk_full_recompute,
-        ep_chunk_max_token_rows_per_rank=impl_cfg.ep_chunk_max_token_rows_per_rank,
-        ep_chunk_count=impl_cfg.ep_chunk_count,
+        chunked_ep=(
+            Qwen3ChunkedEP(
+                max_input_rows=impl_cfg.ep_chunk_max_token_rows_per_rank,
+                chunk_count=impl_cfg.ep_chunk_count,
+                full_recompute=impl_cfg.ep_chunk_full_recompute,
+            )
+            if impl_cfg.enable_ep_chunk_overlap
+            else None
+        ),
         lora_config=lora_config,
         attention_backend=("magi" if impl_cfg.attention_backend_override == "magi" else "te"),
     )

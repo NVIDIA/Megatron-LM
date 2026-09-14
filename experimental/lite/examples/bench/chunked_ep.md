@@ -4,6 +4,9 @@ Token-wise DeepEP overlap is opt-in. The three primitives expose forward,
 backward, and fused forward/backward; Qwen3 owns recomputation policy.
 Normal training uses forward with saved context plus backward. Full layer
 recomputation uses a graph-free forward followed by fused forward/backward.
+The primitive owns the autograd bridge and buffer lifecycle. Qwen supplies
+only the attention/residual/norm prefix and selects the composition; the
+three OPs never read a recomputation setting. Model parameter paths are unchanged.
 
 ```python
 from megatron.lite.model.qwen3_moe.lite.protocol import ImplConfig

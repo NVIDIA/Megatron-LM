@@ -988,7 +988,6 @@ class EPChunkWorkspace:
             "runtime_allocations": self._runtime_allocations,
             "waits": self._waits,
             "grows": self._grows,
-            "fallbacks": 0,
         }
 
     def evidence(self) -> dict[str, Any]:
@@ -2582,7 +2581,93 @@ class EPChunkExecution:
         op.workspace.park_expert_activations(stream=stream)
 
 
+class ChunkedMoE(nn.Module):
+    """Parameter-owning MoE module over the three policy-free EP operations."""
+
+    def __init__(self, *, router, experts, **execution_kwargs):
+        super().__init__()
+        self.router = router
+        self.experts = experts
+        self.chunked_ep = EPChunkExecution(router=router, experts=experts, **execution_kwargs)
+
+    def forward(self, x):
+        return self.chunked_ep.forward_op(x)
+
+
+class _EPChunkCheckpoint(torch.autograd.Function):
+    """Checkpoint a tensor prefix followed by residual + ChunkedEP.
+
+    The prefix returns (MoE input, residual). Architecture and recompute policy
+    belong to the caller; this bridge never inspects a model or its config.
+    """
+
+    @staticmethod
+    def forward(ctx, x, prefix, execution, finish_backward, prefix_count, *params):
+        ctx.prefix = prefix
+        ctx.execution = execution
+        ctx.finish_backward = finish_backward
+        ctx.prefix_count = prefix_count
+        ctx.params = params
+        ctx.cpu_rng = torch.get_rng_state()
+        ctx.device = x.device if x.is_cuda else None
+        ctx.cuda_rng = torch.cuda.get_rng_state(ctx.device) if ctx.device else None
+        ctx.save_for_backward(x.detach())
+        norm, residual = prefix(x)
+        return residual + execution.forward_op(norm)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        (saved,) = ctx.saved_tensors
+        x = saved.detach().requires_grad_(True)
+        prefix_params = ctx.params[: ctx.prefix_count]
+        devices = [] if ctx.device is None else [ctx.device]
+        with torch.random.fork_rng(devices=devices), torch.enable_grad():
+            torch.set_rng_state(ctx.cpu_rng)
+            if ctx.cuda_rng is not None:
+                torch.cuda.set_rng_state(ctx.cuda_rng, ctx.device)
+            norm, residual = ctx.prefix(x)
+            grad_norm, router_grads, expert_grads = ctx.execution.fused_op.forward_backward(
+                norm, grad_output
+            )
+            required = tuple(p for p in (x, *prefix_params) if p.requires_grad)
+            grads = torch.autograd.grad(
+                (norm, residual), required, (grad_norm, grad_output), allow_unused=True
+            )
+            if ctx.finish_backward:
+                ctx.execution.finish_backward(x)
+        by_id = {id(p): grad for p, grad in zip(required, grads, strict=True)}
+        return (
+            by_id.get(id(x)),
+            None,
+            None,
+            None,
+            None,
+            *(by_id.get(id(p)) for p in prefix_params),
+            *router_grads,
+            *expert_grads,
+        )
+
+
+def checkpoint_ep_chunk(prefix, x, execution, prefix_params, *, finish_backward=False):
+    """Use graph-free forward + fused backward without repeating MoE forward."""
+    if execution.fused_op is None:
+        raise ValueError("EP checkpoint requires a forward/fused composition")
+    params = tuple(prefix_params)
+    return _EPChunkCheckpoint.apply(
+        x,
+        prefix,
+        execution,
+        finish_backward,
+        len(params),
+        *params,
+        *execution.forward_op.router.parameters(),
+        *execution.forward_op.experts.parameters(),
+    )
+
+
 __all__ = [
+    "ChunkedMoE",
+    "checkpoint_ep_chunk",
     "EPChunkExecution",
     "EP_CHUNK_COUNT",
     "EPChunkBackwardOp",
