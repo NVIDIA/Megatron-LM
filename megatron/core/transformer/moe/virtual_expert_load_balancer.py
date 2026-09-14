@@ -114,6 +114,7 @@ class _VirtualExpertConfig:
     grad_dtype: torch.dtype
     num_sms: int
     gtp: tuple[bool, ...] = (False, False)
+    direct_main_grad: tuple[bool, ...] = (False, False)
 
 
 class _VirtualExpertStorage:
@@ -186,11 +187,15 @@ class _VirtualExpertStorage:
         self.slot_weights = tuple(
             self._slot_parameters(i, template) for i, template in enumerate(templates)
         )
-        # Plain natives' wgrad staging per FC layer: TE's GEMM overwrites it, the reduction adds the
-        # virtual-expert partials, autograd hands it on. GTP natives write per-backward scratch.
+        # DDP natives accumulate directly into main_grad; GTP natives bind per-backward
+        # scratch. Other callers retain staging whose result is handed to autograd.
         self.native_staging = tuple(
-            None if _is_gtp(t) else torch.empty((count, *s), dtype=config.grad_dtype, device=device)
-            for t, s in zip(templates, config.member_shapes)
+            (
+                None
+                if _is_gtp(t) or direct
+                else torch.empty((count, *s), dtype=config.grad_dtype, device=device)
+            )
+            for t, s, direct in zip(templates, config.member_shapes, config.direct_main_grad)
         )
 
     @staticmethod
@@ -290,6 +295,9 @@ class _VirtualExperts:
         self.runtime_weights = []
         for i, weights in enumerate(parameters):
             slots, grads = storage.slot_weights[i], storage.native_staging[i]
+            if config.direct_main_grad[i]:
+                grads = tuple(p.main_grad for p in weights)
+                self.native_grads[i] = grads
             if self.gtp_leaders[i] is not None:
                 # GTP shells borrow slot storage until push; main_grad stays empty until backward.
                 if config.mxfp8:
@@ -308,6 +316,9 @@ class _VirtualExperts:
                     )
                 grads = (self.placeholder,) * len(weights)
             natives = tuple(storage._runtime_parameter(w, g) for w, g in zip(weights, grads))
+            if config.direct_main_grad[i]:
+                for native in natives:
+                    native.overwrite_main_grad = False
             self.runtime_weights.append((*natives, *slots))
         self._tables: list[dict] = [{} for _ in parameters]
 
@@ -408,7 +419,23 @@ class _VirtualExperts:
     def consume(self, direction: WeightDirection) -> None:
         """Consume in GEMM order and bind persistent wgrad targets before backward."""
         backward = direction == WeightDirection.BACKWARD
+        if backward and any(self.config.direct_main_grad):
+            # TE uses the first native's accumulate flag for the whole grouped GEMM.
+            # Virtual slots have no optimizer history, so start their partials at zero.
+            # Previous owners have finished reading these shared slots before layer input
+            # backward completes; this clear precedes the next expert backward on compute.
+            if all(self.config.direct_main_grad):
+                self.storage.grad_arena.zero_()
+            else:
+                for direct, section in zip(
+                    self.config.direct_main_grad,
+                    self.storage.grad_arena.split(self.storage._grad_sections),
+                ):
+                    if direct:
+                        section.zero_()
         for i in range(len(self.parameters))[:: -1 if backward else 1]:
+            if backward and self.config.direct_main_grad[i]:
+                self.get_weight_table(i, "grad", tuple(p.main_grad for p in self.parameters[i]))
             leader = self.gtp_leaders[i]
             if leader is None:
                 continue
@@ -425,9 +452,10 @@ class _VirtualExperts:
 
     def hand_off_wgrads(self, fc_layer: int) -> tuple[torch.Tensor, ...]:
         """After the reduction: what autograd delivers to each of one FC layer's source parameters.
-        Plain parameters accumulate the staging into ``main_grad`` and get TE's dummy, so
-        AccumulateGrad still fires DDP's grad-ready hook without adding the dummy again (without a
-        main_grad, autograd owns a copy). GTP parameters reduce-scatter the bound scratch through
+        DDP natives and remote partials already accumulated into ``main_grad``. Return TE's
+        dummy so AccumulateGrad fires DDP's grad-ready hook without adding it again. Other plain
+        parameters retain staging (without a main_grad, autograd owns a copy). GTP parameters
+        reduce-scatter the bound scratch through
         the protocol call TE issues after a wgrad GEMM (``finalize_group_grads``), which adds into
         the shards' ``main_grad`` itself; the natives then park on the placeholder."""
         from transformer_engine.pytorch.module.base import get_dummy_wgrad
@@ -442,12 +470,14 @@ class _VirtualExperts:
             )
             self.bind_native_grads(fc_layer, None)
             return _as_tuple(reduced)
-        grads = []
+        grads, main_grads, staging = [], [], []
         for parameter, wgrad in zip(self.parameters[fc_layer], self.native_grads[fc_layer]):
             if getattr(parameter, "main_grad", None) is None:
                 grads.append(wgrad.clone())
             else:
-                parameter.main_grad.add_(wgrad)
+                if not self.config.direct_main_grad[fc_layer]:
+                    main_grads.append(parameter.main_grad)
+                    staging.append(wgrad)
                 parameter.grad_added_to_main_grad = True
                 grads.append(
                     get_dummy_wgrad(
@@ -456,6 +486,8 @@ class _VirtualExperts:
                         zero=getattr(parameter, "zero_out_wgrad", False),
                     )
                 )
+        if main_grads:
+            torch._foreach_add_(main_grads, staging)
         return tuple(grads)
 
 
@@ -626,6 +658,15 @@ class VirtualExpertLoadBalancer:
             grad_dtype=grad_dtype,
             num_sms=min(32 if num_sms is None else int(num_sms), MAX_VIRTUAL_EXPERT_WEIGHT_SMS),
             gtp=tuple(_is_gtp(p[0]) for p in parameters),
+            direct_main_grad=tuple(
+                all(
+                    not _is_gtp(p)
+                    and getattr(p, "main_grad", None) is not None
+                    and not getattr(p, "overwrite_main_grad", False)
+                    for p in weights
+                )
+                for weights in parameters
+            ),
         )
         cls = VirtualExpertLoadBalancer
         if cls.storages:

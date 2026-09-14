@@ -346,7 +346,10 @@ training. Eager execution and CUDA graphs share the ring allocator and reduce-sc
 Same-shaped layers share two buffers per FC role and local expert, guarded by the
 previous reduce-scatter's completion. Gradient targets bind before the backward GEMMs; their
 pointer tables are created at the first reduction and reused without CPU-to-GPU pointer updates.
-Without GTP, native weights alias model storage and native gradients use fixed staging.
+Without GTP, native weights alias model storage. DDP natives accumulate directly into their
+stable `main_grad` buffers, where the reduction also adds remote partials. Virtual gradient slots
+are cleared before each backward because TE uses one accumulation flag for all grouped experts.
+Callers without persistent main gradients, or with overwrite semantics, retain fixed staging.
 With GTP, weight push peeks at the actual gather: it launches a missing gather, drains one in
 flight, or waits on an already-ready gather's completion event. It then binds the runtime
 parameters to the returned buffers. The GEMM consumes those same buffers and advances prefetch.
@@ -359,8 +362,8 @@ shared symmetric weight and gradient arenas.
 Each MoE layer has one runtime owner for both FC layers' native parameters, runtime weights,
 GTP bindings and pointer tables. A shared storage object owns the arenas, NCCL registrations and
 virtual slot parameters for each compatible storage layout, allocated during late initialization.
-Layers share an EP topology; their precision, member shapes, gradient dtype and GTP layout
-determine which storage they reuse. This allows MXFP8 main experts and BF16 MTP experts in the same model.
+Layers share an EP topology; their precision, member shapes, gradient dtype, GTP layout and
+accumulation mode determine which storage they reuse. This allows MXFP8 main experts and BF16 MTP experts in the same model.
 BF16 precision overrides retain the unfused activation and recomputation path, with runtime weights
 attached to grouped linears that enter each original linear's precision context. Virtual parameters
 remain outside the model's optimizer and checkpoint parameter sets. Finalization releases every
