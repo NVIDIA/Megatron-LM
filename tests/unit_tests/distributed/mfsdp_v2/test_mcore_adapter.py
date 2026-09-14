@@ -167,7 +167,7 @@ class TestMcoreAdapterDense:
         parameters = dict(wrapped.module.named_parameters())
         assert parameters
         for name, parameter in parameters.items():
-            local_parameter = parameter.to_local()
+            local_parameter = parameter
 
             # Some parameters use module-specific initializers, so only check those
             # initialized by the configured init method.
@@ -466,8 +466,15 @@ class TestMcoreAdapterDense:
         parameters = [
             parameter for parameter in optimizer.get_parameters() if parameter.grad is not None
         ]
-        assert all(isinstance(parameter.grad, DTensor) for parameter in parameters)
-        expected_pre_clip_norm = global_norm([p.grad.to_local() for p in parameters])
+        assert all(not isinstance(parameter.grad, DTensor) for parameter in parameters)
+
+        def local_grads():
+            return [p.grad for p in parameters]
+
+        expected_pre_clip_norm = global_norm(local_grads())
+        zeros = sum((g == 0).sum() for g in local_grads())
+        torch.distributed.all_reduce(zeros)
+        assert optimizer.count_zeros() == zeros.item()
         assert (
             expected_pre_clip_norm > clip_grad
         ), "Test gradients must exceed the clipping threshold to exercise clipping."
@@ -476,9 +483,7 @@ class TestMcoreAdapterDense:
 
         assert success
         torch.testing.assert_close(pre_clip_norm.item(), expected_pre_clip_norm)
-        torch.testing.assert_close(
-            global_norm([p.grad.to_local() for p in parameters]), clip_grad, rtol=1e-3, atol=0
-        )
+        torch.testing.assert_close(global_norm(local_grads()), clip_grad, rtol=1e-3, atol=0)
 
 
 class TestMcoreAdapterCudaGraph:

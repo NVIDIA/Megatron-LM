@@ -23,6 +23,9 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     load_checkpoint,
     save_checkpoint,
 )
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.checkpoint import (
+    _wrap_local_state,
+)
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.uneven_dtensor import (
     attach_uneven_dtensor_metadata,
 )
@@ -182,6 +185,7 @@ def _save_through_stable_path(
     """Save the same state through Megatron-FSDP's stable, gather-based uneven-DTensor helper."""
     model_state_dict = get_model_state_dict(model)
     optimizer_state_dict = get_optimizer_state_dict(model, optimizer)
+    _wrap_local_state(model, model_state_dict, optimizer_state_dict)
     preprocess_state_dict_for_uneven_dtensor(model_state_dict)
     preprocess_state_dict_for_uneven_dtensor(optimizer_state_dict)
     dcp.save(
@@ -257,9 +261,9 @@ def _assert_model_matches_snapshot(
     # cross-rank "at least one rank compared something" check.
     local_nonempty = False
     for key, expected in model_snapshot.items():
-        assert isinstance(current[key], DTensor), f"{key} should rest as a DTensor"
+        assert not isinstance(current[key], DTensor), f"{key} should rest as a local tensor"
         _assert_tensors_identical(expected, current[key], f"model[{key}]")
-        local_nonempty = local_nonempty or expected.to_local().numel() > 0
+        local_nonempty = local_nonempty or expected.numel() > 0
     return local_nonempty
 
 
@@ -278,6 +282,13 @@ def _assert_optimizer_matches_snapshot(
                 assert expected == actual, f"optim[{index}][{key}] scalar mismatch"
 
 
+def _checkpoint_model_state(model: nn.Module) -> dict[str, torch.Tensor]:
+    """Expose logical tensors at the checkpoint boundary, not runtime local shards."""
+    state = get_model_state_dict(model)
+    _wrap_local_state(model, state, {})
+    return state
+
+
 def _assert_checkpoint_records_global_shapes(checkpoint_dir: Path, model: nn.Module) -> None:
     """Assert the saved checkpoint describes every parameter by its full global shape.
 
@@ -292,7 +303,7 @@ def _assert_checkpoint_records_global_shapes(checkpoint_dir: Path, model: nn.Mod
     what actually guards it.
     """
     metadata = FileSystemReader(checkpoint_dir).read_metadata()
-    for key, value in model.state_dict().items():
+    for key, value in _checkpoint_model_state(model).items():
         entry = metadata.state_dict_metadata[f"model.{key}"]
         assert tuple(entry.size) == tuple(value.shape), f"model.{key}: saved {entry.size}"
 
@@ -368,7 +379,7 @@ def test_saved_chunks_match_the_stable_path(distributed_setup, tmp_path_dist_ckp
     # On a single rank nothing can be misplaced: the one shard is the whole tensor.
     if world_size > 1:
         uneven = False
-        for key, parameter in model.state_dict().items():
+        for key, parameter in _checkpoint_model_state(model).items():
             saved_rows = sorted(sizes[0] for _, sizes in analytic_chunks[f"model.{key}"])
             # An empty shard writes nothing, so it has no chunk on either side to compare.
             even_rows = sorted(
@@ -396,7 +407,7 @@ def test_saved_chunks_tile_every_parameter(distributed_setup, tmp_path_dist_ckpt
         save_checkpoint(model, optimizer, checkpoint_dir)
         saved_chunks = _saved_chunks(checkpoint_dir)
 
-    for key, parameter in model.state_dict().items():
+    for key, parameter in _checkpoint_model_state(model).items():
         chunks = saved_chunks[f"model.{key}"]
         covered = 0
         for offsets, sizes in chunks:
@@ -462,6 +473,7 @@ def test_metadata_attach_issues_no_collectives(
     # shard's offset with one all_gather_object per DTensor; this path derives it from the layout.
     for name in ("all_gather", "all_gather_object", "all_gather_into_tensor", "all_reduce"):
         monkeypatch.setattr(dist, name, _fail)
+    _wrap_local_state(model, model_state_dict, optimizer_state_dict)
     attach_uneven_dtensor_metadata(model, model_state_dict, optimizer_state_dict)
 
     assert model_state_dict.keys() == dict(model.named_parameters()).keys()
