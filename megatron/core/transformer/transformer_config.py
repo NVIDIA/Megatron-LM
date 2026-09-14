@@ -1911,12 +1911,22 @@ class TransformerConfig(ModelParallelConfig):
 
             if self.batch_invariant_mode:
                 if self.inference_grouped_gemm_backend not in (
+                    InferenceGroupedGemmBackend.FLASHINFER,
                     InferenceGroupedGemmBackend.TORCH,
                     InferenceGroupedGemmBackend.VLLM,
                 ):
                     raise ValueError(
                         "batch_invariant_mode requires inference_grouped_gemm_backend "
-                        "'torch' or 'vllm'."
+                        "'flashinfer', 'torch', or 'vllm'."
+                    )
+                if (
+                    self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.FLASHINFER
+                    and not mxfp8_enabled
+                ):
+                    raise ValueError(
+                        "batch_invariant_mode currently supports the FlashInfer grouped-GEMM "
+                        "backend only for an MXFP8 model configuration. Selectively BF16 "
+                        "expert layers within that configuration remain supported."
                     )
                 if (
                     self.expert_model_parallel_size > 1
@@ -3557,9 +3567,21 @@ class TransformerConfig(ModelParallelConfig):
                     "this backend combination. "
                     "Install via `uv pip install -e .[batch_invariant]`."
                 )
-                assert not (
-                    self.fp8 or self.fp4
-                ), "Batch-invariant MoE is bf16-only. Disable fp8/fp4 to use it."
+                flashinfer_mxfp8_supported = (
+                    self.transformer_impl == "inference_optimized"
+                    and self.inference_grouped_gemm_backend
+                    == InferenceGroupedGemmBackend.FLASHINFER
+                    and bool(self.fp8)
+                    and self.fp8_recipe == Fp8Recipe.mxfp8
+                    and self.fp8_param
+                    and not self.fp4
+                    and not self.gated_linear_unit
+                    and self.activation_func == squared_relu
+                )
+                assert flashinfer_mxfp8_supported or not (self.fp8 or self.fp4), (
+                    "Batch-invariant MoE supports BF16, or FlashInfer MXFP8 squared-ReLU "
+                    "experts with the inference-optimized transformer implementation."
+                )
                 assert not (self.moe_permute_fusion or self.moe_permute_fusion_into_hybridep), (
                     "Batch-invariant MoE requires the unfused permute/unpermute path so "
                     "top-k reductions use the fixed batch-invariant add tree."
