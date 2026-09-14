@@ -19,7 +19,11 @@ def ep(transformer_engine_import_stub):
     return moe_ep_chunk_overlap
 
 
-def test_chunked_transport_owns_external_metadata_and_waits_before_finish(ep, monkeypatch):
+@pytest.mark.parametrize("caller_owned", [False, True])
+@pytest.mark.parametrize("rows", [0, 2])
+def test_chunked_transport_owns_external_metadata_and_waits_before_finish(
+    ep, monkeypatch, caller_owned, rows
+):
     from megatron.lite.primitive.modules import chunked_ep_dispatcher as transport
     from megatron.lite.primitive.modules import dispatcher as shared_transport
 
@@ -30,20 +34,31 @@ def test_chunked_transport_owns_external_metadata_and_waits_before_finish(ep, mo
     dispatcher = transport.ChunkedDispatcher(4, 3, ps)
     assert dispatcher.buffer is buffer
     event = SimpleNamespace(event=object(), current_stream_wait=Mock())
-    hidden = torch.arange(6.0).reshape(2, 3)
+    hidden = torch.arange(rows * 3.0).reshape(rows, 3).requires_grad_()
     state = {
         "recv_hidden": hidden,
-        "recv_indices": torch.tensor([[1], [0]]),
-        "recv_probs": torch.tensor([[0.2], [0.8]]),
-        "recv_per_expert": [1, 1],
+        "recv_indices": torch.tensor([[1], [0]])[:rows],
+        "recv_probs": torch.tensor([[0.2], [0.8]])[:rows],
+        "recv_per_expert": [rows // 2, rows // 2],
         "handle": object(),
         "event": event,
     }
-    output, counts, probs, metadata = dispatcher.finish_deepep_dispatch_for_backward(state)
+    target = torch.empty_like(hidden)
+    allocate = Mock(return_value=target) if caller_owned else None
+    output, counts, probs, metadata = dispatcher.finish_deepep_dispatch_for_backward(
+        state, output_allocation=allocate
+    )
+    if caller_owned:
+        allocate.assert_called_once_with("fc1_input", (rows, 3))
+        assert output is target and not output.requires_grad
+    else:
+        torch.testing.assert_close(
+            torch.autograd.grad(output.sum(), hidden)[0], torch.ones_like(hidden)
+        )
     event.current_stream_wait.assert_called_once()
     torch.testing.assert_close(output, hidden.flip(0))
     torch.testing.assert_close(probs, state["recv_probs"].flatten().flip(0))
-    assert counts is None and metadata["local_tpe_list"] == [1, 1]
+    assert counts is None and metadata["local_tpe_list"] == state["recv_per_expert"]
     assert metadata["handle"] is state["handle"]
     assert dispatcher._handle is None
     normal, counts, normal_probs = dispatcher.finish_deepep_dispatch(
@@ -56,6 +71,11 @@ def test_chunked_transport_owns_external_metadata_and_waits_before_finish(ep, mo
     assert dispatcher.finish_deepep_combine(completion) is hidden
     assert completion == {}
     assert event.current_stream_wait.call_count == 3
+    if caller_owned:
+        with pytest.raises(RuntimeError, match="Invalid caller-owned"):
+            dispatcher.finish_deepep_dispatch_for_backward(
+                state, output_allocation=lambda *args: torch.empty(1)
+            )
 
 
 def test_qwen_release_visits_only_chunked_modules_once(ep, monkeypatch):

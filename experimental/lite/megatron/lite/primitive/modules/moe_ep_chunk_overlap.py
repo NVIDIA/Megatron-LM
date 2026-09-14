@@ -1143,11 +1143,11 @@ class _EPChunkOperationBase:
             )
         return output_2d.view(input_shape).to(input_dtype).detach()
 
-    def _finish_backward_dispatch(self, dispatcher, state):
+    def _finish_backward_dispatch(self, dispatcher, state, **kwargs):
         state["recv_hidden"] = state["recv_hidden"].detach().requires_grad_(True)
         state["recv_probs"] = state["recv_probs"].detach().requires_grad_(True)
         dispatched, local_tpe, probs, metadata = dispatcher.finish_deepep_dispatch_for_backward(
-            state
+            state, **kwargs
         )
         _validate_finished_deepep_dispatch(self.workspace.key.shape_profile, state, dispatched)
         return dispatched, local_tpe, probs, metadata
@@ -1376,20 +1376,18 @@ class _EPChunkOperationBase:
 
         def finish_recompute_expert(dispatcher: TokenDispatcher, state: dict[str, Any]):
             with torch.cuda.stream(compute_stream):
-                dispatched, local_tpe, probs, metadata = self._finish_backward_dispatch(
-                    dispatcher, state
-                )
-                expert_probs = None if probs is None else probs.detach().requires_grad_(True)
                 expert_activation_lease = self.workspace.acquire_expert_activation(
                     stream=compute_stream
                 )
-                fc1_input = expert_activation_lease.tensor(
-                    "fc1_input", dispatched.shape, dtype=dispatched.dtype, device=dispatched.device
+                expert_input, local_tpe, probs, metadata = self._finish_backward_dispatch(
+                    dispatcher,
+                    state,
+                    output_allocation=_expert_activation_output_allocation(
+                        expert_activation_lease, state["recv_hidden"]
+                    ),
                 )
-                with torch.no_grad():
-                    fc1_input.copy_(dispatched)
-                del dispatched
-                expert_input = fc1_input.requires_grad_(True)
+                expert_input.requires_grad_(True)
+                expert_probs = None if probs is None else probs.detach().requires_grad_(True)
                 expert_out = self.experts(
                     expert_input,
                     local_tpe,

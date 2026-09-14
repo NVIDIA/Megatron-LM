@@ -226,6 +226,7 @@ class ChunkedDispatcher(_BaseDispatcher):
         *,
         manual_backward: bool = False,
         materialize_local_tpe: bool = True,
+        output_allocation=None,
     ):
         if isinstance(recv_per_expert, torch.Tensor):
             recv_per_expert = [int(x) for x in recv_per_expert.detach().cpu().tolist()]
@@ -253,7 +254,20 @@ class ChunkedDispatcher(_BaseDispatcher):
             manual_row_id_map = valid_row_ids.index_select(0, manual_order)
             manual_prob_flat_indices = valid_prob_flat_indices.index_select(0, manual_order)
             sorted_indices = manual_row_id_map
-            dispatched = recv_hidden.index_select(0, sorted_indices)
+            if output_allocation is None:
+                dispatched = recv_hidden.index_select(0, sorted_indices)
+            else:
+                shape = (sorted_indices.numel(), recv_hidden.size(1))
+                dispatched = output_allocation("fc1_input", shape)
+                if (
+                    dispatched.shape != shape
+                    or dispatched.dtype != recv_hidden.dtype
+                    or dispatched.device != recv_hidden.device
+                    or not dispatched.is_contiguous()
+                ):
+                    raise RuntimeError("Invalid caller-owned dispatch output")
+                with torch.no_grad():
+                    torch.index_select(recv_hidden, 0, sorted_indices, out=dispatched)
             permuted_probs = recv_probs.reshape(-1).index_select(0, manual_prob_flat_indices)
         else:
             routing_map = torch.zeros(
@@ -292,7 +306,7 @@ class ChunkedDispatcher(_BaseDispatcher):
         }
         return dispatched, local_tpe, permuted_probs, metadata
 
-    def finish_deepep_dispatch_for_backward(self, state):
+    def finish_deepep_dispatch_for_backward(self, state, *, output_allocation=None):
         _event_current_stream_wait(state.get("event"))
         recv_per_expert = state["recv_per_expert"]
         dispatched, local_tpe, permuted_probs, metadata = self._finish_deepep_dispatch_external(
@@ -302,6 +316,7 @@ class ChunkedDispatcher(_BaseDispatcher):
             recv_per_expert,
             manual_backward=True,
             materialize_local_tpe=False,
+            output_allocation=output_allocation,
         )
         metadata["handle"] = state["handle"]
         return dispatched, local_tpe, permuted_probs, metadata
