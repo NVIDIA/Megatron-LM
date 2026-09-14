@@ -16,6 +16,7 @@ import torch
 from megatron.core.enums import Fp8Recipe
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.models.hybrid import hybrid_block as hybrid_runtime
+from megatron.core.models.hybrid import hybrid_stack_adapter as recompute_runtime
 from megatron.core.models.hybrid.hybrid_stack_adapter import HybridStackForwardContext
 from megatron.core.tensor_parallel import random as checkpoint_runtime
 from megatron.core.transformer.enums import AttnMaskType
@@ -32,9 +33,6 @@ from megatron.core.transformer.experimental_attention_variant.csa2 import (
     CSA2Indexer,
     CSA2IndexerSubmodules,
     CSA2State,
-)
-from megatron.core.transformer.experimental_attention_variant.csa_utils import (
-    csa2_hybrid_adapter as adapter_runtime,
 )
 from megatron.core.transformer.experimental_attention_variant.csa_utils.csa2_pipeline import (
     build_csa2_pipeline_plan,
@@ -399,7 +397,7 @@ def test_gpt_norm_recompute_restores_shared_branch_inputs(
     ref_x = x.detach().clone().requires_grad_()
     for layer, inputs in ((actual, x), (reference, ref_x)):
         state = CSA2State()
-        layer(inputs, None, csa2_state=state, mhc_state=SinglePassMHCState())
+        layer(inputs, None, cross_layer_state=state, mhc_state=SinglePassMHCState())
         getattr(state, field).square().sum().backward()
     torch.testing.assert_close(x.grad, ref_x.grad)
     for parameter, ref_parameter in zip(actual.parameters(), reference.parameters()):
@@ -775,7 +773,7 @@ def test_full_recompute_quantization_dispatch_and_layer_context(monkeypatch, qua
         checkpoint_calls.append(len(inputs))
         return checkpoint_runtime.checkpoint(function, distribute, *inputs)
 
-    monkeypatch.setattr(adapter_runtime, "te_checkpoint", te_checkpoint)
+    monkeypatch.setattr(recompute_runtime, "te_checkpoint", te_checkpoint)
     monkeypatch.setattr(hybrid_runtime, "get_fp8_context", quantization_context)
     monkeypatch.setattr(hybrid_runtime, "get_fp4_context", quantization_context)
     x = torch.randn(9, 2, reference.config.hidden_size, requires_grad=True)
@@ -864,26 +862,19 @@ def test_recompute_restore_rebuilds_differentiable_fused_k_views(monkeypatch):
     with torch.no_grad():
         state.prepare_fused_kv()
     assert not state.global_kv_flat.requires_grad and not state.indexer_k_flat.requires_grad
-    context = HybridStackForwardContext(layer_kwargs={"csa2_state": state}, mhc_state=mhc_state)
-    adapter = stacks[0].forward_adapter
-    tensors, metadata = adapter._export_recompute_context(context)
-    assert all(
-        getattr(metadata[0], name) is None
-        for name in ("global_kv", "indexer_k", "global_kv_flat", "indexer_k_flat")
+    context = HybridStackForwardContext(cross_layer_state=state, mhc_state=mhc_state)
+    tensors, restore = context.save_for_recompute()
+    positional = tuple(
+        tensor.detach().requires_grad_() if tensor is not None else None for tensor in tensors
     )
-    positional = tuple(tensor.detach().requires_grad_() for tensor in tensors)
-    monkeypatch.setattr(
-        "megatron.core.transformer.experimental_attention_variant.csa_utils."
-        "csa2_hybrid_adapter.use_fused_dsa_kernels",
-        lambda config: True,
-    )
-    replay = adapter._restore_recompute_context(positional, metadata)
-    replay_state = replay.layer_kwargs["csa2_state"]
+    replay = restore(positional)
+    replay_state = replay.cross_layer_state
     objective = (
         replay.mhc_state.pre_mix.square().sum()
         + replay_state.global_kv_flat.square().sum()
         + replay_state.indexer_k_flat.square().sum()
     )
-    gradients = torch.autograd.grad(objective, positional)
-    for tensor, gradient in zip(positional, gradients):
+    differentiable = tuple(tensor for tensor in positional if tensor is not None)
+    gradients = torch.autograd.grad(objective, differentiable)
+    for tensor, gradient in zip(differentiable, gradients):
         torch.testing.assert_close(gradient, 2 * tensor)

@@ -235,7 +235,7 @@ class CSA2CudaGraphAdapter:
             state.prepare_fused_kv()
         mhc = SinglePassMHCState(values.get("pre_mix")) if self.graph_mhc else None
         if self.is_attention:
-            kwargs["csa2_state"] = state
+            kwargs["cross_layer_state"] = state
             if params is not None:
                 # The inner layer may reconstruct raw prefixes without a CP group.
                 # Bind this capture's static communicator before its attention runs.
@@ -268,7 +268,7 @@ class CSA2CudaGraphAdapter:
         # Validation/forward-only uses the normal layer contract and owns no graph slot.
         if not torch.is_grad_enabled():
             return function.__self__.forward(*args, **kwargs)
-        state = kwargs.pop("csa2_state", None)
+        state = kwargs.pop("cross_layer_state", None)
         mhc = kwargs.pop("mhc_state", None)
         kwargs.pop("attention_mask", None)
         hidden = args[0] if args else kwargs["hidden_states"]

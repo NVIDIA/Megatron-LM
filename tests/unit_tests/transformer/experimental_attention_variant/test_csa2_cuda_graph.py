@@ -414,8 +414,8 @@ def test_joint_graph_backward_does_not_inject_auxiliary_loss_for_unused_hidden(
     mhc_state, ref_mhc_state = (
         (SinglePassMHCState(mix), SinglePassMHCState(ref_mix)) if mhc else (None, None)
     )
-    kwargs = {"packed_seq_params": params, "csa2_state": state}
-    ref_kwargs = {"packed_seq_params": params, "csa2_state": ref_state}
+    kwargs = {"packed_seq_params": params, "cross_layer_state": state}
+    ref_kwargs = {"packed_seq_params": params, "cross_layer_state": ref_state}
     if mhc:
         kwargs["mhc_state"], ref_kwargs["mhc_state"] = mhc_state, ref_mhc_state
     # Attention index 2 is the first Full owner. Its graph emits the ordinary
