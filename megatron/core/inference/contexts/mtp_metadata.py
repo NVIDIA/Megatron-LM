@@ -62,8 +62,10 @@ class MTPMetadata:
     graphed: bool = False
     active_request_count: int = 0
     padded_count: int = 0
-    # `num_prefill_requests` saved across the commit pass, which forces the varlen path.
-    saved_num_prefill_requests: int = 0
+    # True while the varlen commit pass owns the forward. The draft-depth forwards are
+    # decode-shaped (one token per request) and leave this False; the commit pass is ragged, so
+    # `is_decode_only()` consults it to keep the attention off the uniform-reshape decode kernel.
+    varlen_forward_active: bool = False
     # Block table as of just before `_rewind_kv_cache` released the draft blocks. None until
     # the first snapshot of the run.
     prerewind_block_table: Optional[Tensor] = field(default=None, repr=False)
@@ -143,6 +145,7 @@ class MTPMetadata:
         self.active_offsets = None
         self.active_block_table = None
         self.forward_active = False
+        self.varlen_forward_active = False
         self.chunk_boundary_hidden = None
         self.invalidate_chunk_boundary()
 
@@ -278,6 +281,7 @@ class MTPMetadata:
     def end_forward(self) -> None:
         """Leave MTP-forward mode. No persistent length state to write back."""
         self.forward_active = False
+        self.varlen_forward_active = False
 
     # ------------------------------------------------------------------
     # Per-forward metadata staging.

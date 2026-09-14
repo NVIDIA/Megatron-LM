@@ -2960,7 +2960,9 @@ class TextGenerationController(MTPControllerMixin):
                 # Snapshot the block table BEFORE rewind releases the rejected-draft blocks;
                 # the MTP draft loop reuses it so its speculative writes land on valid blocks.
                 if getattr(context, "enable_mtp_kv_cache", False):
-                    context._mtp_snapshot_prerewind_block_table()
+                    context.mtp_metadata.snapshot_prerewind_block_table(
+                        context.request_to_kv_block_ids
+                    )
                 blocks_to_release, remove_mask = self._rewind_kv_cache()
                 # No separate MTP rewind: the draft loop re-derives its start from the (rewound)
                 # main KV offsets, so rejected drafts are naturally overwritten next step.

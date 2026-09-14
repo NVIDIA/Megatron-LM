@@ -181,15 +181,6 @@ class MTPContextMixin:
             graphed=graphed,
         )
 
-    def _mtp_snapshot_prerewind_block_table(self) -> None:
-        """Capture the block table before `_rewind_kv_cache` releases draft blocks.
-
-        Called right after the main forward and before the rewind. The MTP draft loop later
-        reuses this snapshot so its speculative writes/reads land on the blocks the main model
-        allocated for its own base+draft forward, not on blocks rewind has since released.
-        """
-        self.mtp_metadata.snapshot_prerewind_block_table(self.request_to_kv_block_ids)
-
     def _mtp_setup_decode_step(self) -> None:
         """Populate token write maps + MHA read metadata for one MTP draft depth."""
         mtp = self.mtp_metadata
@@ -328,15 +319,8 @@ class MTPContextMixin:
             padded_token_count=padded_total,
         )
         self.mtp_metadata.forward_active = True
-        # This is a VARLEN forward (per-request query lengths differ). Force the attention onto
-        # the prefill/varlen path: on a pure-decode step num_prefill_requests==0 would make
-        # is_decode_only() True, routing to the decode kernel whose uniform
-        # `q.reshape(num_requests, tokens_per_request, ...)` fails on ragged input. Restored in
-        # _mtp_finalize_prefill_step.
-        self.mtp_metadata.saved_num_prefill_requests = self.num_prefill_requests
-        self.num_prefill_requests = max(1, num_prefill)
-
-    def _mtp_finalize_prefill_step(self) -> None:
-        """Exit MTP-forward mode after the commit-pass (varlen) forward."""
-        self.mtp_metadata.end_forward()
-        self.num_prefill_requests = self.mtp_metadata.saved_num_prefill_requests
+        # Per-request query lengths differ here, so the attention must take the varlen path. On a
+        # pure-decode step `num_prefill_requests == 0` would otherwise make `is_decode_only()`
+        # True and route to the decode kernel, whose uniform
+        # `q.reshape(num_requests, tokens_per_request, ...)` cannot express ragged input.
+        self.mtp_metadata.varlen_forward_active = True

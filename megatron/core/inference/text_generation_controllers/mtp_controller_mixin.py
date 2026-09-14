@@ -406,7 +406,7 @@ class MTPControllerMixin:
             embedding=unwrapped_model.embedding,
             inference_context=context,
         )
-        context._mtp_finalize_prefill_step()
+        context.mtp_metadata.end_forward()
 
     def _mtp_dummy_prefill_forward(self, context, unwrapped_model) -> None:
         """Issue one MTP-layer forward with dummy tensors and NO KV append.

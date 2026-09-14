@@ -108,11 +108,7 @@ def _make_context(
     def _setup_prefill_step(**kwargs):
         context.setup_prefill_calls.append(kwargs)
 
-    def _finalize_prefill_step():
-        context.finalize_prefill_calls += 1
-
     context._mtp_setup_prefill_step = _setup_prefill_step
-    context._mtp_finalize_prefill_step = _finalize_prefill_step
     context.using_cuda_graph_this_step = lambda: False
 
     # A REAL MTPMetadata, so the chunk-boundary carry's id+position gating is exercised rather
@@ -131,6 +127,16 @@ def _make_context(
     context.mtp_metadata.allocate(
         device=torch.device(DEVICE), block_table_template=request_to_kv_block_ids
     )
+
+    # The commit pass finalises by calling `end_forward` directly; count it so the tests can
+    # still assert that it ran exactly once per issued forward.
+    _end_forward = context.mtp_metadata.end_forward
+
+    def _counting_end_forward():
+        context.finalize_prefill_calls += 1
+        _end_forward()
+
+    context.mtp_metadata.end_forward = _counting_end_forward
     return context
 
 

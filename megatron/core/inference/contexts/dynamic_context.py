@@ -1778,6 +1778,10 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         num_prefill_requests which is always up-to-date regardless of where we
         are in the step lifecycle.
         """
+        # The MTP commit pass is a varlen forward even on a pure-decode step, so it says so
+        # rather than being inferred from the request counts.
+        if self.mtp_metadata.varlen_forward_active:
+            return False
         if self._using_cuda_graph_this_step:
             return self.padded_batch_dimensions.prefill_req_count == 0
         return self.num_prefill_requests == 0

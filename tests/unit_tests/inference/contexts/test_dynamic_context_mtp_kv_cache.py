@@ -10,12 +10,11 @@ context with hand-seeded per-request state:
 
   * `_mtp_begin_decode` -- enter MTP-forward mode for a draft loop
   * `_mtp_setup_decode_step` -- one draft depth (roll-by-one)
-  * `_mtp_setup_prefill_step` / `_mtp_finalize_prefill_step` -- the varlen commit pass
-  * `_mtp_snapshot_prerewind_block_table` -- the pre-rewind block-table snapshot
+  * `_mtp_setup_prefill_step` -- the varlen commit pass
 
-The per-depth lifecycle itself (`begin_decode_for_capture`, `advance_decode_step`,
-`end_forward`) lives on `MTPMetadata` and is driven directly; only the steps needing context
-state have a wrapper here.
+The lifecycle itself (`begin_decode_for_capture`, `advance_decode_step`, `end_forward`,
+`snapshot_prerewind_block_table`) lives on `MTPMetadata` and is driven directly; only the
+steps that build metadata have a wrapper here.
 
 The invariants asserted are the ones the draft attention depends on: write position
 `P_r = base_position_r - 1 + depth`, read length `kv_len = P_r + 1` (write-then-attend), and
@@ -223,7 +222,7 @@ class TestMtpDecodeBookkeeping:
         """Deep drafts extend past the accepted range into blocks rewind has since released."""
         context = _make_context()
         _seed_requests(context, [[3, 4]])
-        context._mtp_snapshot_prerewind_block_table()
+        context.mtp_metadata.snapshot_prerewind_block_table(context.request_to_kv_block_ids)
         # Simulate `_rewind_kv_cache` releasing the second block and clearing it to -1.
         context.request_to_kv_block_ids[0, 1] = -1
 
@@ -247,14 +246,14 @@ class TestMtpDecodeBookkeeping:
     def test_snapshot_is_a_copy_not_an_alias(self):
         context = _make_context()
         _seed_requests(context, [[3, 4]])
-        context._mtp_snapshot_prerewind_block_table()
+        context.mtp_metadata.snapshot_prerewind_block_table(context.request_to_kv_block_ids)
         context.request_to_kv_block_ids[0, 0] = 99
 
         assert int(context.mtp_metadata.prerewind_block_table[0, 0].item()) == 3
 
     def test_snapshot_is_a_noop_when_disabled(self):
         context = _make_context(num_speculative_tokens=0)
-        context._mtp_snapshot_prerewind_block_table()
+        context.mtp_metadata.snapshot_prerewind_block_table(context.request_to_kv_block_ids)
         assert context.mtp_metadata.prerewind_block_table is None
 
     def test_setup_decode_step_writes_roll_by_one_maps(self):
@@ -391,7 +390,7 @@ class TestMtpDecodeBookkeeping:
                 device=device,
             ),
         )
-        context._mtp_finalize_prefill_step()
+        context.mtp_metadata.end_forward()
         assert context.using_cuda_graph_this_step() is False
 
         context._mtp_begin_decode(1, 1, torch.tensor([5], device=device), graphed=True)
@@ -714,7 +713,11 @@ class TestMtpPrefillBookkeeping:
         assert context.padded_active_token_count == padded_token_count
 
     def test_prefill_step_forces_varlen_path_on_a_pure_decode_step(self):
-        """`num_prefill_requests` is forced >= 1 so the ragged forward avoids the decode kernel."""
+        """The commit pass declares itself varlen, so the ragged forward avoids the decode kernel.
+
+        `num_prefill_requests` is left truthful: the flag states the mode directly rather than
+        faking a prefill count to imply it.
+        """
         context = _make_context()
         device = torch.cuda.current_device()
         context.num_prefill_requests = 0
@@ -727,7 +730,8 @@ class TestMtpPrefillBookkeeping:
             request_start_positions=torch.tensor([4, 6], device=device),
         )
 
-        assert context.num_prefill_requests == 2
+        assert context.num_prefill_requests == 0  # untouched
+        assert context.mtp_metadata.varlen_forward_active is True
         assert context.is_decode_only() is False
         assert context._using_cuda_graph_this_step is False
         assert context.mtp_metadata.forward_active is True
@@ -736,7 +740,7 @@ class TestMtpPrefillBookkeeping:
         assert mha.state_data["max_seqlen_q"] == 2
         assert mha.state_data["max_seqlen_k"] == 2
 
-    def test_finalize_restores_the_main_step_prefill_count(self):
+    def test_finalize_clears_the_varlen_mode(self):
         """The commit pass must hand the step back exactly as it found it."""
         context = _make_context()
         device = torch.cuda.current_device()
@@ -746,12 +750,16 @@ class TestMtpPrefillBookkeeping:
         context._mtp_setup_prefill_step(
             append_counts=torch.tensor([2], device=device), block_table_prefill=block_table
         )
-        assert context.num_prefill_requests == 1
+        assert context.mtp_metadata.varlen_forward_active is True
+        assert context.is_decode_only() is False
 
-        context._mtp_finalize_prefill_step()
+        context.mtp_metadata.end_forward()
 
-        assert context.num_prefill_requests == 0
+        assert context.mtp_metadata.varlen_forward_active is False
         assert context.mtp_metadata.forward_active is False
+        # With the flag cleared, the step's own counts decide again.
+        assert context.num_prefill_requests == 0
+        assert context.is_decode_only() is True
 
     def test_prefill_step_asserts_when_disabled(self):
         context = _make_context(num_speculative_tokens=0)
