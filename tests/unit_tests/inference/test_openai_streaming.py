@@ -9,9 +9,11 @@ from tokenizers import Tokenizer, decoders, models, pre_tokenizers
 from transformers import PreTrainedTokenizerFast
 
 from megatron.core.inference.async_stream import AsyncStream
+from megatron.core.inference.config import MultimodalPromptConfig
 from megatron.core.inference.text_generation_server.dynamic_text_gen_server.endpoints.chat_completions import (
     _sanitize_chat_template_kwargs,
     _sanitize_messages_for_template,
+    bp,
 )
 from megatron.core.inference.text_generation_server.dynamic_text_gen_server.incremental_detokenizer import (
     HuggingFaceFastIncrementalDetokenizer,
@@ -61,6 +63,74 @@ def _make_byte_level_fast_tokenizer():
     return SimpleNamespace(
         _tokenizer=SimpleNamespace(tokenizer=huggingface_tokenizer, include_special_tokens=True)
     )
+
+
+@pytest.mark.asyncio
+async def test_chat_completions_uses_generated_logprobs_only_when_requested():
+    quart = pytest.importorskip("quart")
+
+    class FakeTokenizer:
+        bos, chat_template = None, None
+
+        def tokenize(self, _text):
+            return [11, 12]
+
+        def detokenize(self, tokens):
+            return "".join(chr(ord("a") + token - 1) for token in tokens)
+
+    class FakeInferenceClient:
+        return_log_probs = []
+
+        async def add_request(self, _prompt_tokens, sampling_params, multi_modal_data=None):
+            self.return_log_probs.append(sampling_params.return_log_probs)
+            generated_log_probs = [-0.25, -0.5] if sampling_params.return_log_probs else None
+            return {
+                "uid": "request-1",
+                "status": "COMPLETED",
+                "generated_text": "ab",
+                "prompt_length": 2,
+                "generated_tokens": [1, 2],
+                "generated_log_probs": generated_log_probs,
+                "log_probs": [-9.0, -9.0],
+                "generated_top_n_logprobs": [{"a": -0.25}, {"b": -0.5}],
+                "policy_epoch": [],
+                "kv_cache_epoch": [],
+                "events": [],
+                "sampling_params": {"num_tokens_to_generate": 2},
+                "routing_indices": None,
+            }
+
+        def add_request_with_id(self, *args, **kwargs):
+            return "request-1", self.add_request(*args, **kwargs)
+
+    fake_client = FakeInferenceClient()
+    app = quart.Quart(__name__)
+    app.config.update(client=fake_client, tokenizer=FakeTokenizer(), parsers=[], verbose=False)
+    app.config["multimodal_prompt_config"] = MultimodalPromptConfig()
+    app.register_blueprint(bp)
+    client = app.test_client()
+    request_body = {
+        "messages": [{"role": "user", "content": "prompt"}],
+        "max_tokens": 2,
+        "prevent_retokenization": False,
+    }
+
+    with_logprobs = await client.post(
+        "/v1/chat/completions", json={**request_body, "logprobs": True, "top_logprobs": 1}
+    )
+    without_logprobs = await client.post(
+        "/v1/chat/completions", json={**request_body, "logprobs": False}
+    )
+
+    assert with_logprobs.status_code == without_logprobs.status_code == 200
+    with_payload = await with_logprobs.get_json()
+    without_payload = await without_logprobs.get_json()
+    assert fake_client.return_log_probs == [True, False]
+    assert [entry["logprob"] for entry in with_payload["choices"][0]["logprobs"]["content"]] == [
+        -0.25,
+        -0.5,
+    ]
+    assert without_payload["choices"][0]["logprobs"] is None
 
 
 @pytest.mark.asyncio
