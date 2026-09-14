@@ -89,8 +89,8 @@ class MTPMetadata:
     # `_mtp_prefill_commit_segments`.
     #
     # The carry records the producing request's id AND the prompt position the hidden was computed
-    # at, and `take_chunk_boundary` requires both to match, declining otherwise. The id alone is
-    # not sufficient -- see that method for why.
+    # at, and `take_chunk_boundary` asserts on both. The id alone is not sufficient -- see
+    # that method for why.
     chunk_boundary_valid: bool = False
     chunk_boundary_req_id: int = -1
     chunk_boundary_position: int = -1
@@ -202,41 +202,48 @@ class MTPMetadata:
         self.chunk_boundary_position = position
         self.chunk_boundary_valid = True
 
-    def take_chunk_boundary(self, req_id: int, seam_position: int) -> Optional[Tensor]:
-        """Return the carried hidden if it is the one this seam needs, else None.
+    def take_chunk_boundary(self, req_id: int, seam_position: int) -> Tensor:
+        """Return the carried hidden for this seam.
 
-        BOTH keys must match, and a mismatch is declined rather than raised.
+        The caller matches `chunk_boundary_req_id` against its own request list before calling,
+        so all three conditions below hold by construction:
 
-        A position mismatch should not happen: `_compute_prefix_match` gives up its ENTIRE prefix
-        match for a continuation chunk of a request that still holds a carry, precisely so this
-        chunk starts at `finished` and its seam lands where the carry describes. (Without that,
-        a mid-request prefix match would move the chunk's start past the carried position and
-        orphan that entry permanently.) This check is defence in depth for a path that is meant
-        to be unreachable, so it declines rather than raising: skipping one seam costs a little
-        draft acceptance and cannot affect verified output, whereas raising would kill a live
-        step.
+          * a carry is live -- an invalid carry records req_id -1, which never appears in a real
+            request list, so the caller cannot reach here without one;
+          * it belongs to `req_id` -- the caller derives `req_id` from `chunk_boundary_req_id`;
+          * it sits at `seam_position` -- `_compute_prefix_match` gives up a carry-holding
+            continuation chunk's ENTIRE prefix match, so `prefix_skip_tokens == 0`, the chunk
+            starts at `finished`, and its seam lands exactly where the carry was recorded. (This
+            also covers a first chunk, which would ask for `seam_position == -1`: a live carry is
+            only ever recorded at a position `>= 0`.)
 
-        The position key also subsumes the `off > 0` guard: a first chunk asks for
-        `seam_position == -1`, and a valid carry always records a position `>= 0`.
+        These RAISE rather than declining. Declining would skip the seam, leaving a committed
+        position unwritten -- a silent draft-acceptance regression that masks whichever
+        bookkeeping invariant actually broke. If one ever fires, find the new path rather than
+        softening the check; the messages name the state needed to do that.
 
         Args:
             req_id (int): Request that wants to write the seam.
             seam_position (int): MTP position the seam would be written at (`off - 1`).
 
         Returns:
-            (Optional[Tensor]): The `[1, 1, hidden_size]` carried hidden, or None on any mismatch.
+            (Tensor): The `[1, 1, hidden_size]` carried hidden.
         """
-        # The validity check must come first: the invalid sentinels are -1/-1, and an unfilled
-        # request slot is also -1, so an invalid carry could otherwise match `req_id == -1` at a
-        # first chunk's `seam_position == -1`.
-        if not self.chunk_boundary_valid or self.chunk_boundary_req_id != req_id:
-            return None
-
-        if self.chunk_boundary_position != seam_position:
-            # Logged rather than silent: this is legitimate (see above), but it is also what a
-            # genuine bookkeeping drift would look like, and either way it costs draft acceptance.
-            return None
-
+        assert self.chunk_boundary_valid, (
+            f"no live chunk-boundary carry, but request {req_id} asked for one at position "
+            f"{seam_position}. Callers must match `chunk_boundary_req_id` in their own request "
+            f"list first, and an invalid carry records -1, which is never a real request id."
+        )
+        assert self.chunk_boundary_req_id == req_id, (
+            f"chunk-boundary carry belongs to request {self.chunk_boundary_req_id}, not "
+            f"{req_id}; the caller passed a request it did not match on."
+        )
+        assert self.chunk_boundary_position == seam_position, (
+            f"chunk-boundary carry for request {req_id} sits at position "
+            f"{self.chunk_boundary_position}, but its seam is at {seam_position}. A carry-holding "
+            f"continuation chunk must take NO prefix skip -- check the back-off in "
+            f"`_compute_prefix_match`."
+        )
         return self.chunk_boundary_hidden
 
     # ------------------------------------------------------------------

@@ -37,11 +37,10 @@ class MTPContextMixin:
     """MTP draft-KV bookkeeping for `DynamicInferenceContext`."""
 
     @staticmethod
-    def compute_enable_mtp_kv_cache(
+    def should_enable_mtp_kv_cache(
         model_config,
         mamba_inference_state_config: "Optional[MambaInferenceStateConfig]",
         num_speculative_tokens: int,
-        is_hybrid_model: bool,
     ) -> bool:
         """Whether this model/config can populate an MTP draft-KV plane.
 
@@ -57,8 +56,6 @@ class MTPContextMixin:
             mamba_inference_state_config (Optional[MambaInferenceStateConfig]): Carries the MTP
                 head's layer pattern when the model is hybrid; None otherwise.
             num_speculative_tokens (int): Draft depth; 0 disables speculative decoding.
-            is_hybrid_model (bool): Whether the MAIN decoder is hybrid. Only consulted when the
-                head's own pattern is unavailable.
 
         Returns:
             (bool): True when the draft KV plane should be reserved.
@@ -69,10 +66,12 @@ class MTPContextMixin:
             else None
         )
         if head_layer_types is None:
-            # No hybrid MTP pattern to inspect: either a pure-Transformer model, whose head is a
-            # single attention TransformerLayer by construction, or a hybrid head whose pattern
-            # could not be read -- assume it matches the main decoder's recurrence.
-            head_is_single_attention = not is_hybrid_model
+            # No pattern to inspect means a pure-Transformer model, whose MTP head is a single
+            # attention TransformerLayer by construction. A HYBRID model always exposes its
+            # pattern when it has a head at all -- `HybridModel.mtp_pattern` is None only when
+            # the layer pattern has no MTP section -- and that case is already excluded by the
+            # `mtp_num_layers` check below.
+            head_is_single_attention = True
         else:
             attention_symbols = (Symbols.ATTENTION, Symbols.DS_ATTENTION, Symbols.MLA)
             num_attention = sum(t in attention_symbols for t in head_layer_types)

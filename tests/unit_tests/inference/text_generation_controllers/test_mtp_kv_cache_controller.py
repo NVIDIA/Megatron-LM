@@ -422,13 +422,13 @@ class TestMtpCommitPassPrefill:
         # The other request's hidden must not appear in the packed batch.
         assert 99.0 not in _row_ids(model.mtp_layer_calls[-1]["hidden_states"])
 
-    def test_a_carry_at_the_wrong_position_is_declined(self):
-        """A carry only applies at the position it recorded, and a mismatch is skipped silently.
+    def test_a_carry_at_the_wrong_position_raises(self):
+        """A carry only applies at the position it recorded, and a mismatch is a bug.
 
-        This is reachable on a healthy request: a continuation chunk's offset is
-        `finished_chunk_token_count + prefix_skip_tokens`, and the KV prefix skip is not gated on
-        `finished == 0`, so a mid-request prefix match moves the next chunk's seam away from the
-        carry. Skipping costs one stale draft K/V and cannot affect verified output.
+        `_compute_prefix_match` gives up a carry-holding continuation chunk's entire prefix
+        match so its seam lands exactly at the carried position. Reaching the commit pass with a
+        mismatch means that back-off stopped holding, and skipping the seam would leave a
+        committed position unwritten -- a silent acceptance regression.
         """
         context = _make_context(
             prefill_query_lengths=(3,), prefill_kv_offsets=(8,), request_ids=[42]
@@ -438,20 +438,15 @@ class TestMtpCommitPassPrefill:
         # Same request id, but recorded at position 3 while this chunk's seam is at off - 1 == 7.
         _seed_carry(context, req_id=42, position=3)
 
-        controller._mtp_commit_pass(
-            context,
-            model,
-            _hidden(3),
-            num_decode_requests=0,
-            active_request_count=1,
-            base_position=torch.tensor([11], device=DEVICE),
-        )
-
-        call = context.setup_prefill_calls[-1]
-        # Body rows only: no seam, so the run is not extended downward.
-        assert call["append_counts"].cpu().tolist() == [2]
-        assert call["request_start_positions"].cpu().tolist() == [8]
-        assert 99.0 not in _row_ids(model.mtp_layer_calls[-1]["hidden_states"])
+        with pytest.raises(AssertionError, match="sits at position 3"):
+            controller._mtp_commit_pass(
+                context,
+                model,
+                _hidden(3),
+                num_decode_requests=0,
+                active_request_count=1,
+                base_position=torch.tensor([11], device=DEVICE),
+            )
 
     def test_in_flight_chunk_carries_its_last_hidden_forward(self):
         """The chunked request's final hidden is kept for the next chunk's boundary entry."""

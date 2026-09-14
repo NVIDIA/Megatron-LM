@@ -810,28 +810,31 @@ class TestMtpChunkBoundaryCarry:
         assert taken.shape == (1, 1, meta.hidden_size)
         assert torch.equal(taken, hidden)
 
-    def test_take_declines_a_position_mismatch(self):
-        """Declined, not raised: a healthy continuation chunk can land at a new offset.
+    def test_take_raises_on_a_position_mismatch(self):
+        """A carry-holding continuation chunk takes no prefix skip, so its seam lands here.
 
-        `_compute_prefix_match` does not gate the KV prefix skip on `finished == 0`, so if
-        another request publishes cached blocks covering this one's unprefilled region between
-        its chunks, the next chunk starts past `off + q` and its seam is somewhere the carry does
-        not describe. Raising here would kill a live step over a legitimate schedule.
+        `_compute_prefix_match` gives up that chunk's ENTIRE match to guarantee it. A mismatch
+        therefore means the back-off stopped holding, not that the carry is merely stale, and
+        declining would leave a committed position unwritten.
         """
         meta = self._meta()
         meta.carry_chunk_boundary(hidden=self._hidden(meta, 1.0), req_id=42, position=3)
-        assert meta.take_chunk_boundary(req_id=42, seam_position=9) is None
+        with pytest.raises(AssertionError, match="sits at position 3"):
+            meta.take_chunk_boundary(req_id=42, seam_position=9)
 
-    def test_take_declines_a_request_mismatch(self):
+    def test_take_raises_on_a_request_mismatch(self):
+        """The caller derives `req_id` from the carry itself, so a mismatch is a caller bug."""
         meta = self._meta()
         meta.carry_chunk_boundary(hidden=self._hidden(meta, 1.0), req_id=42, position=3)
-        assert meta.take_chunk_boundary(req_id=7, seam_position=3) is None
+        with pytest.raises(AssertionError, match="belongs to request 42"):
+            meta.take_chunk_boundary(req_id=7, seam_position=3)
 
     def test_a_first_chunk_can_never_consume_a_carry(self):
         """off == 0 asks for seam position -1; a valid carry always records position >= 0."""
         meta = self._meta()
         meta.carry_chunk_boundary(hidden=self._hidden(meta, 1.0), req_id=42, position=0)
-        assert meta.take_chunk_boundary(req_id=42, seam_position=-1) is None
+        with pytest.raises(AssertionError, match="sits at position 0"):
+            meta.take_chunk_boundary(req_id=42, seam_position=-1)
 
     def test_invalidate_drops_the_carry_but_keeps_the_buffer(self):
         meta = self._meta()
@@ -842,7 +845,8 @@ class TestMtpChunkBoundaryCarry:
         assert not meta.chunk_boundary_valid
         assert meta.chunk_boundary_req_id == -1
         assert meta.chunk_boundary_position == -1
-        assert meta.take_chunk_boundary(req_id=42, seam_position=3) is None
+        with pytest.raises(AssertionError, match="no live chunk-boundary carry"):
+            meta.take_chunk_boundary(req_id=42, seam_position=3)
         # The buffer address is stable across invalidation -- only the keys are cleared.
         assert meta.chunk_boundary_hidden is buf_before
 
@@ -859,7 +863,8 @@ class TestMtpChunkBoundaryCarry:
 
         assert not meta.chunk_boundary_valid
         assert context.chunked_prefill_request_id == -1
-        assert meta.take_chunk_boundary(req_id=42, seam_position=3) is None
+        with pytest.raises(AssertionError, match="no live chunk-boundary carry"):
+            meta.take_chunk_boundary(req_id=42, seam_position=3)
 
     def test_deallocate_invalidates_the_carry(self):
         """This is what makes the carry safe: it dies with every other piece of MTP state."""
@@ -869,7 +874,8 @@ class TestMtpChunkBoundaryCarry:
 
         assert not meta.chunk_boundary_valid
         assert meta.chunk_boundary_hidden is None
-        assert meta.take_chunk_boundary(req_id=42, seam_position=3) is None
+        with pytest.raises(AssertionError, match="no live chunk-boundary carry"):
+            meta.take_chunk_boundary(req_id=42, seam_position=3)
 
     def test_carry_is_a_private_copy(self):
         """The producing step's activation buffer is reused; the carry must not alias it."""
@@ -889,4 +895,5 @@ class TestMtpChunkBoundaryCarry:
             hidden=torch.zeros((1, 1, 8), device="cuda"), req_id=42, position=3
         )
         assert not meta.chunk_boundary_valid
-        assert meta.take_chunk_boundary(req_id=42, seam_position=3) is None
+        with pytest.raises(AssertionError, match="no live chunk-boundary carry"):
+            meta.take_chunk_boundary(req_id=42, seam_position=3)

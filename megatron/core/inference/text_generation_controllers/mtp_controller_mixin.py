@@ -301,24 +301,19 @@ class MTPControllerMixin:
         tokens = prefill_tokens[body_idx + 1]  # the token one position to the right
 
         # Seam: at most one request continues its own prior chunk, so this is a single splice
-        # rather than a per-request branch. `take_chunk_boundary` gates on the carry's recorded
-        # POSITION as well as its request id, so a carry left behind by a request that has since
-        # restarted at a different offset is never consumed (it also subsumes the `off > 0` check:
-        # a first chunk asks for seam position -1, which no valid carry can hold).
+        # rather than a per-request branch. Matching `chunk_boundary_req_id` here is what makes
+        # `take_chunk_boundary`'s asserts hold: it verifies the carry's request AND recorded
+        # position, so a carry that does not describe this seam is a bug, not a miss.
         mtp_meta = context.mtp_metadata
         seam = (
             id_list.index(mtp_meta.chunk_boundary_req_id)
             if mtp_meta.chunk_boundary_req_id in id_list
             else None
         )
-        seam_hidden = (
-            None
-            if seam is None
-            else mtp_meta.take_chunk_boundary(
+        if seam is not None:
+            seam_hidden = mtp_meta.take_chunk_boundary(
                 req_id=id_list[seam], seam_position=off_list[seam] - 1
             )
-        )
-        if seam_hidden is not None:
             # The seam row precedes request `seam`'s body rows, which start after every earlier
             # request's q-1 body rows.
             insert_at = chunk_start[seam] - seam

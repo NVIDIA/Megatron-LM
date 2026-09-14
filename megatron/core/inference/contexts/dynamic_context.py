@@ -538,11 +538,10 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         # repeated MTP draft attention. Draft position i is aligned with main position i and the
         # draft is never longer, so it reuses main's block table; `append_key_value_cache` and
         # `key_value_cache` route to this slot on `mtp_metadata.forward_active`.
-        self.enable_mtp_kv_cache = self.compute_enable_mtp_kv_cache(
+        self.enable_mtp_kv_cache = self.should_enable_mtp_kv_cache(
             model_config=model_config,
             mamba_inference_state_config=mamba_inference_state_config,
             num_speculative_tokens=self.num_speculative_tokens,
-            is_hybrid_model=self.is_hybrid_model,
         )
         if self.enable_mtp_kv_cache:
             self.mtp_kv_layer_slot = self.num_attention_layers
