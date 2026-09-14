@@ -179,7 +179,7 @@ products:
   - test_case: [gpt3_mcore_te_tp2_zp_z3_resume_torch_dist_te_8experts2parallel_top2router]
     products:
       - environment: [dev]
-        scope: [mr-broken, mr-github-broken]
+        scope: [nightly-broken]
         platforms: [dgx_h100]
   - test_case: [gpt3_mcore_te_tp2_pp1_te_8experts2parallel_ddp_average_in_collective]
     products:
@@ -221,9 +221,29 @@ products:
   - test_case: [deepseek_proxy_mfsdp_v1_ep2_ep_overlap]
     products:
       - environment: [dev]
-        scope: [mr, mr-github]
+        scope: [nightly]
         platforms: [dgx_h100]
   - test_case: [deepseek_proxy_mfsdp_v2_ep2]
+    products:
+      - environment: [dev]
+        scope: [mr, mr-github]
+        platforms: [dgx_h100]
+  # Gradient accumulation over two microbatches, with and without an outer DP axis.
+  # All three must produce the same loss curve: splitting the data-parallel domain into
+  # optimizer instances is a sharding decision and must not change the math. MFSDP keeps
+  # the DP-outer axis Partial between microbatches and reduces it on the last backward,
+  # so this only has teeth with more than one microbatch.
+  - test_case: [deepseek_proxy_mfsdp_v2_ep2_mb2]
+    products:
+      - environment: [dev]
+        scope: [mr, mr-github]
+        platforms: [dgx_h100]
+  - test_case: [deepseek_proxy_mfsdp_v2_ep2_hsdp_mb2]
+    products:
+      - environment: [dev]
+        scope: [mr, mr-github]
+        platforms: [dgx_h100]
+  - test_case: [deepseek_proxy_mfsdp_v2_ep2_hfsdp_mb2]
     products:
       - environment: [dev]
         scope: [mr, mr-github]
