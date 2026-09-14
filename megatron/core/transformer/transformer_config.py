@@ -3569,8 +3569,7 @@ class TransformerConfig(ModelParallelConfig):
                         "moe_token_dispatcher_type='alltoall'."
                     )
                 mxfp8_params_enabled = (
-                    self.transformer_impl == "inference_optimized"
-                    and bool(self.fp8)
+                    bool(self.fp8)
                     and self.fp8_recipe == Fp8Recipe.mxfp8
                     and self.fp8_param
                     and not self.fp4
@@ -3605,12 +3604,21 @@ class TransformerConfig(ModelParallelConfig):
                     # scaled-grouped-GEMM implementation as the torch backend.
                     InferenceGroupedGemmBackend.VLLM: squared_relu_or_swiglu,
                 }.get(self.inference_grouped_gemm_backend, False)
-                mxfp8_inference_supported = mxfp8_params_enabled and backend_supports_mxfp8
-                assert mxfp8_inference_supported or not (self.fp8 or self.fp4), (
-                    "Batch-invariant MoE supports bf16, native TE MXFP8 squared-ReLU/"
-                    "SwiGLU experts, Torch/vLLM MXFP8 squared-ReLU/SwiGLU experts, or "
-                    "FlashInfer MXFP8 squared-ReLU experts with the inference-optimized "
-                    "transformer implementation."
+                if self.transformer_impl == "inference_optimized":
+                    mxfp8_supported = mxfp8_params_enabled and backend_supports_mxfp8
+                else:
+                    # The training policy uses TE GroupedLinear directly; the inference
+                    # backend selector is generation-only and therefore irrelevant here.
+                    mxfp8_supported = (
+                        mxfp8_params_enabled
+                        and self.moe_grouped_gemm
+                        and self.batch_invariant_backend == "te_native"
+                        and squared_relu_or_swiglu
+                    )
+                assert mxfp8_supported or not (self.fp8 or self.fp4), (
+                    "Batch-invariant MoE supports bf16; TE MXFP8 squared-ReLU/SwiGLU "
+                    "training experts; native TE or Torch/vLLM MXFP8 squared-ReLU/SwiGLU "
+                    "inference experts; and FlashInfer MXFP8 squared-ReLU inference experts."
                 )
                 assert not (self.moe_permute_fusion or self.moe_permute_fusion_into_hybridep), (
                     "Batch-invariant MoE requires the unfused permute/unpermute path so "

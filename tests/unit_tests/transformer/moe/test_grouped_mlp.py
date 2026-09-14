@@ -27,6 +27,20 @@ from megatron.training.initialize import _set_random_seed
 from tests.unit_tests.test_utilities import Utils
 
 
+def test_te_env_grouped_tensor_uses_256_row_padding(monkeypatch):
+    """The legacy TE env switch must request grouped-tensor alignment from MCore."""
+    config = SimpleNamespace(
+        fp8=True,
+        fp4=False,
+        fp8_recipe="mxfp8",
+        use_transformer_engine_op_fuser=False,
+        moe_use_grouped_tensor=False,
+    )
+    monkeypatch.setenv("NVTE_GROUPED_LINEAR_USE_FUSED_GROUPED_GEMM", "1")
+
+    assert experts_module._te_grouped_tensor_align_size(config) == 256
+
+
 def test_op_fuser_transformer_config_args_are_exposed():
     parser = argparse.ArgumentParser()
     _add_network_size_args(parser)

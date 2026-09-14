@@ -97,11 +97,20 @@ def _configure_flash_attention_env():
     os.environ['NVTE_UNFUSED_ATTN'] = '0'
 
 
-def _build_flash_attn_bik_model(seq_len: int, vocab_size: int, hidden_size: int = 128) -> GPTModel:
+def _build_flash_attn_bik_model(
+    seq_len: int,
+    vocab_size: int,
+    hidden_size: int = 128,
+    num_attention_heads: int = 4,
+    num_query_groups: int | None = None,
+    qk_layernorm: bool = False,
+) -> GPTModel:
     cfg = TransformerConfig(
         num_layers=2,
         hidden_size=hidden_size,
-        num_attention_heads=4,
+        num_attention_heads=num_attention_heads,
+        num_query_groups=num_query_groups,
+        qk_layernorm=qk_layernorm,
         use_cpu_initialization=True,
         hidden_dropout=0.0,
         attention_dropout=0.0,
@@ -117,7 +126,9 @@ def _build_flash_attn_bik_model(seq_len: int, vocab_size: int, hidden_size: int 
     cfg.bf16 = True
     model = GPTModel(
         config=cfg,
-        transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
+        transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(
+            qk_layernorm=qk_layernorm
+        ),
         vocab_size=vocab_size,
         max_sequence_length=seq_len,
     )
@@ -204,11 +215,23 @@ class TestGPTModelBatchInvariant:
 
         assert torch.equal(logits_full, logits_chunked)
 
-    def test_dynamic_engine_matches_batched_forward_rl(self):
+    @pytest.mark.parametrize("backend", ["triton", "te_native"])
+    @pytest.mark.parametrize("qwen3_shape", [False, True], ids=["small", "qwen3"])
+    def test_dynamic_engine_matches_batched_forward_rl(self, backend, qwen3_shape):
         _configure_flash_attention_env()
         seq_len = 48
         vocab_size = 96
-        base_model = _build_flash_attn_bik_model(seq_len, vocab_size)
+        model_kwargs = (
+            {
+                "hidden_size": 2048,
+                "num_attention_heads": 32,
+                "num_query_groups": 4,
+                "qk_layernorm": True,
+            }
+            if qwen3_shape
+            else {}
+        )
+        base_model = _build_flash_attn_bik_model(seq_len, vocab_size, **model_kwargs)
         inference_model = Float16Module(base_model.config, base_model).cuda().eval()
 
         ctx = DynamicInferenceContext(
@@ -221,8 +244,12 @@ class TestGPTModelBatchInvariant:
                 materialize_only_last_token_logits=False,
                 use_cuda_graphs_for_non_decode_steps=False,
                 unified_memory_level=0,
+                # NeMo RL requests FlashInfer RoPE for BF16 generation. Exercise
+                # that production setting for the Qwen3-shaped case.
+                use_flashinfer_fused_rope=qwen3_shape,
             ),
         )
+        assert not ctx.use_flashinfer_fused_rope
 
         wrapper = GPTInferenceWrapper(inference_model, ctx)
         tokenizer = DummyTokenizer(vocab_size=vocab_size, bos=None, eod=vocab_size - 1, pad=0)
@@ -248,7 +275,7 @@ class TestGPTModelBatchInvariant:
         )
 
         finished_requests = []
-        with set_batch_invariant_mode(True):
+        with set_batch_invariant_mode(True, backend=backend):
             for request_id, prompt in enumerate(prompts, start=1):
                 engine.add_request(request_id, prompt, sampling_params)
             while engine.has_unfinished_requests():

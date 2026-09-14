@@ -1207,6 +1207,50 @@ class TestTENativeGroupedMxfp8:
         assert len(launches) == num_chunks
         assert len(set(launches)) == 1
 
+    def test_batch_invariant_gemm_matches_te_grouped_linear(self, monkeypatch):
+        """The inference launch must match training's grouped-tensor MXFP8 GEMM exactly."""
+        import transformer_engine.pytorch as te
+        from transformer_engine.common.recipe import MXFP8BlockScaling
+
+        from megatron.core.inference.moe import fused_moe
+        from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+            set_batch_invariant_mode,
+        )
+
+        monkeypatch.setenv("NVTE_GROUPED_LINEAR_USE_FUSED_GROUPED_GEMM", "1")
+        torch.manual_seed(2029)
+        num_experts, hidden_size, rows_per_expert = 4, 128, 256
+        with te.fp8_model_init(enabled=True, recipe=MXFP8BlockScaling()):
+            linear = te.GroupedLinear(
+                num_experts,
+                hidden_size,
+                hidden_size,
+                bias=False,
+                params_dtype=torch.bfloat16,
+                device="cuda",
+            )
+
+        grouped_input = torch.zeros(
+            num_experts * rows_per_expert, hidden_size, device="cuda", dtype=torch.bfloat16
+        )
+        for expert, used_rows in enumerate((1, 17, 0, 39)):
+            start = expert * rows_per_expert
+            grouped_input[start : start + used_rows].normal_()
+        first_dims = torch.full((num_experts,), rows_per_expert, device="cuda", dtype=torch.int64)
+        weights = [getattr(linear, f"weight{i}") for i in range(num_experts)]
+
+        with torch.no_grad(), set_batch_invariant_mode(True, backend="te_native"):
+            with te.fp8_autocast(enabled=True, fp8_recipe=MXFP8BlockScaling()):
+                training_output = linear(grouped_input, first_dims, is_first_microbatch=True)
+            inference_output = fused_moe._te_batch_invariant_grouped_mm(
+                grouped_input, weights, first_dims, num_chunks=1
+            )
+
+        assert torch.equal(training_output, inference_output), (
+            "training and inference grouped MXFP8 GEMMs differ; max abs diff: "
+            f"{(training_output.float() - inference_output.float()).abs().max().item()}"
+        )
+
     def test_single_grouped_2d_swizzled_scale_layout(self, monkeypatch):
         """Single grouped weights accept TE's newer 2-D swizzled scale buffer."""
         import transformer_engine.pytorch as te
