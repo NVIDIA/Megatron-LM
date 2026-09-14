@@ -1,7 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Shared fixtures and helpers for all GTP unit tests.
-"""
+"""Shared fixtures and helpers for all GTP unit tests."""
 
 import pytest
 import torch
