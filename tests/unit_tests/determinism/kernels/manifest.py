@@ -157,6 +157,13 @@ KERNELS: Tuple[KernelEntry, ...] = (
         notes="Rejected by --deterministic-mode (op catalog); the replay test records its status as xfail(strict=False).",
     ),
     KernelEntry(
+        name="te_fused_cross_entropy",
+        sources=("megatron/core/extensions/transformer_engine.py",),
+        tests=(K + "test_te_wrappers.py",),
+        kind="external-lib",
+        notes="Replays TE's overwrite_input path when supported.",
+    ),
+    KernelEntry(
         name="jit_fuser",
         sources=("megatron/core/jit.py",),
         kind="torch.compile",
