@@ -1065,6 +1065,12 @@ def validate_args(args, defaults={}):
         assert getattr(args, 'dsa_separate_indexer_grad_clip', False), \
             '--dsa-indexer-clip-grad requires --dsa-separate-indexer-grad-clip'
 
+    if getattr(args, 'dsa_train_indexer_only', False):
+        assert args.experimental_attention_variant == 'dsa', \
+            '--dsa-train-indexer-only requires --experimental-attention-variant dsa'
+        assert (getattr(args, 'dsa_indexer_loss_coeff', None) or 0.0) > 0.0, \
+            '--dsa-train-indexer-only requires --dsa-indexer-loss-coeff > 0'
+
     if getattr(args, 'dsa_reset_indexer_on_load', False):
         assert args.experimental_attention_variant == 'dsa', \
             '--dsa-reset-indexer-on-load requires --experimental-attention-variant dsa'
