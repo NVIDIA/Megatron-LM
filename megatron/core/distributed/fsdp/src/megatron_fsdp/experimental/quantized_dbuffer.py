@@ -194,7 +194,14 @@ class QuantizedDBuffer:
         )
 
     def quantize_(self, main_weight: DBuffer) -> None:
-        """Quantize the local FP32 master shard into MXFP8 grouped planes."""
+        """Quantize a local master shard with matching mesh, placements, layout, and device."""
+        for attribute in ("mesh", "placements", "layout", "device"):
+            expected = getattr(self.rowwise_data, attribute)
+            actual = getattr(main_weight, attribute)
+            if actual != expected:
+                raise ValueError(
+                    f"Expected main_weight {attribute} {expected!r}, got {actual!r}."
+                )
         for index in range(len(self.rowwise_data.layout.tensor_shapes)):
             tensor = self.get_local_tensor(index)
             rowwise_scale = self.rowwise_scale.get_local_tensor(index)
@@ -202,7 +209,9 @@ class QuantizedDBuffer:
             tensor.quantize_(main_weight.get_local_tensor(index))
             assert tensor._rowwise_scale_inv is not None
             assert tensor._columnwise_scale_inv is not None
-            # Unpadded wrapper scales already alias their destination planes.
+            # get_local_tensor() creates a wrapper whose unpadded scales alias the
+            # DBuffer views, so TE updates those scales in place. Padded scales use
+            # separate allocations, so their logical contents must be copied back.
             if tensor._rowwise_scale_inv.shape != rowwise_scale.shape:
                 rowwise_scale.copy_(
                     tensor._rowwise_scale_inv[: rowwise_scale.shape[0], : rowwise_scale.shape[1]]
