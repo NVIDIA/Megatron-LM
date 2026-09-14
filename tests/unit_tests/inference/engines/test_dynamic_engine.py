@@ -384,6 +384,8 @@ class DynamicEngineTestConfig:
     force_build_cuda_graphs: bool = False
     transformer_impl: str = "local"
     inference_moe_token_dispatcher_type: str = "nccl"
+    moe_enable_routing_replay: bool = False
+    moe_pad_experts_for_cuda_graph_inference: bool = False
     # If False, do not build cuda graphs in the tests, even if
     # num_cuda_graphs is set.
     # For tests concerning cuda-graph warmups, we set this to False
@@ -657,6 +659,10 @@ class DynamicInferenceEngineTestBase:
                 inference_moe_token_dispatcher_type=(
                     test_config.inference_moe_token_dispatcher_type
                 ),
+                moe_enable_routing_replay=test_config.moe_enable_routing_replay,
+                moe_pad_experts_for_cuda_graph_inference=(
+                    test_config.moe_pad_experts_for_cuda_graph_inference
+                ),
                 normalization=(
                     "RMSNorm"
                     if test_config.transformer_impl == "inference_optimized"
@@ -745,6 +751,10 @@ class DynamicInferenceEngineTestBase:
                 transformer_impl=test_config.transformer_impl,
                 inference_moe_token_dispatcher_type=(
                     test_config.inference_moe_token_dispatcher_type
+                ),
+                moe_enable_routing_replay=test_config.moe_enable_routing_replay,
+                moe_pad_experts_for_cuda_graph_inference=(
+                    test_config.moe_pad_experts_for_cuda_graph_inference
                 ),
                 normalization=(
                     "RMSNorm"
@@ -999,7 +1009,7 @@ def test_recompute_suspend_resume_readds_prefix_cached_request_with_fresh_hashes
     )
     engine.requests = {request.request_id: types.SimpleNamespace(record=record)}
     engine.waiting_request_ids = deque()
-    engine.controller = types.SimpleNamespace(_async_sched_logits=mock.Mock())
+    engine.controller = types.SimpleNamespace(_async_sched_forward=mock.Mock())
     engine.state = EngineState.RUNNING
     engine.unified_memory_level = 0
     engine.use_coordinator = False
@@ -1027,7 +1037,7 @@ def test_recompute_suspend_resume_readds_prefix_cached_request_with_fresh_hashes
 
     assert engine.context.deallocate_inference_state_buffers.call_count == 1
     assert engine.context.reinitialize_inference_state_buffers.call_count == 1
-    engine.controller._async_sched_logits.clear.assert_called_once_with()
+    engine.controller._async_sched_forward.clear.assert_called_once_with()
     assert engine.state == EngineState.RUNNING
     assert engine._add_request.call_count == 1
     assert engine._add_request.call_args.args[0] is checkpointed

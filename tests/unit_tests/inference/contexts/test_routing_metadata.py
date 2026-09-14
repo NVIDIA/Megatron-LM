@@ -6,6 +6,7 @@ import pytest
 import torch
 
 from megatron.core.inference.contexts.routing_metadata import RoutingMetadata
+from megatron.core.transformer.moe.router_replay import RouterReplay
 
 MAX_TOKENS = 32
 TOPK = 2
@@ -32,7 +33,7 @@ class TestRoutingMetadata:
         buffer to record into."""
         with patch("megatron.core.inference.contexts.routing_metadata.RouterReplay") as fake_rr:
             # No MoE layers → no buffer allocated, no recording enabled.
-            fake_rr.global_router_replay_instances = []
+            fake_rr.get_instances.return_value = []
             rm = RoutingMetadata(_make_context(), moe_router_topk=TOPK)
             rm._ensure_buffer_allocated()
             assert rm.routing_indices_buffer is None
@@ -41,7 +42,7 @@ class TestRoutingMetadata:
             fake_rr.set_global_static_buffers.assert_not_called()
 
             # Re-binding global instances and allocating produces the expected shape.
-            fake_rr.global_router_replay_instances = [object()] * NUM_MOE_LAYERS
+            fake_rr.get_instances.return_value = [object()] * NUM_MOE_LAYERS
             rm2 = RoutingMetadata(_make_context(), moe_router_topk=TOPK)
             rm2._ensure_buffer_allocated()
             assert rm2.routing_indices_buffer.shape == (MAX_TOKENS, NUM_MOE_LAYERS, TOPK)
@@ -55,9 +56,11 @@ class TestRoutingMetadata:
             # enable/disable_static_buffer_recording forward to RouterReplay.
             fake_rr.reset_mock()
             rm2.enable_static_buffer_recording()
-            fake_rr.set_global_static_buffers.assert_called_once_with(rm2.routing_indices_buffer)
+            fake_rr.set_global_static_buffers.assert_called_once_with(
+                rm2.routing_indices_buffer, is_mtp_layer=False
+            )
             rm2.disable_static_buffer_recording()
-            fake_rr.clear_global_static_buffers.assert_called_once()
+            fake_rr.clear_global_static_buffers.assert_called_once_with(is_mtp_layer=False)
 
     @pytest.mark.parametrize(
         "using_cuda_graph,buffer_allocated,recorded_data,expected_shape",
@@ -95,7 +98,29 @@ class TestRoutingMetadata:
             else:
                 fake_rr.get_recorded_data.return_value = recorded_data
             out = rm.get_routing_indices()
+            if not using_cuda_graph:
+                fake_rr.get_recorded_data.assert_called_once_with(is_mtp_layer=False)
         if expected_shape is None:
             assert out is None
         else:
             assert out.shape == expected_shape
+
+    def test_eager_collection_ignores_unrecorded_mtp_router(self, monkeypatch):
+        """An unrecorded MTP router does not invalidate base-model routing."""
+        monkeypatch.setattr(RouterReplay, "global_router_replay_instances", [])
+        base_1 = RouterReplay()
+        RouterReplay(is_mtp_layer=True)
+        base_2 = RouterReplay()
+        base_1_indices = torch.zeros(7, TOPK, dtype=torch.int64, device="cuda")
+        base_2_indices = torch.ones(7, TOPK, dtype=torch.int64, device="cuda")
+        base_1.record_indices(base_1_indices)
+        base_2.record_indices(base_2_indices)
+
+        routing = RoutingMetadata(
+            _make_context(active_token_count=7), moe_router_topk=TOPK
+        ).get_routing_indices()
+
+        assert routing is not None
+        assert routing.shape == (7, 2, TOPK)
+        assert torch.equal(routing[:, 0], base_1_indices)
+        assert torch.equal(routing[:, 1], base_2_indices)

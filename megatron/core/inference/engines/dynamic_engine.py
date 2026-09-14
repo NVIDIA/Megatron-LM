@@ -515,7 +515,7 @@ class DynamicInferenceEngine(AbstractEngine):
         self._reset_pending_kv_imports()
         self.clear_vision_embedding_cache()
         self.context.reset()
-        self.controller._async_sched_logits.clear()
+        self.controller._async_sched_forward.clear()
 
         # Request state.
         self.request_counter = Counter()
@@ -803,7 +803,9 @@ class DynamicInferenceEngine(AbstractEngine):
             # Enable routing recording during warmup if routing replay is enabled.
             # This ensures the record_indices copy operation is captured in the CUDA graph.
             if model_config.moe_enable_routing_replay:
-                RouterReplay.set_global_router_replay_action(RouterReplayAction.RECORD)
+                RouterReplay.set_global_router_replay_action(
+                    RouterReplayAction.RECORD, is_mtp_layer=False
+                )
 
             # Forward pass -> logits.
             with torch.inference_mode():
@@ -1212,7 +1214,7 @@ class DynamicInferenceEngine(AbstractEngine):
         waiting_request_ids = list(self.waiting_request_ids)
         active_request_ids = set(self.requests.keys()) - set(waiting_request_ids)
         if self.context.kv_cache_management_mode == KVCacheManagementMode.RECOMPUTE:
-            self.controller._async_sched_logits.clear()
+            self.controller._async_sched_forward.clear()
             recompute_active_ids = active_request_ids
 
             # Reset any partially prefilled requests so they recompute from the start
@@ -1459,11 +1461,8 @@ class DynamicInferenceEngine(AbstractEngine):
         if mode != AsyncScheduleMode.ASYNC:
             raise AssertionError(f"Unexpected async scheduling mode: {mode}")
 
-        model_config = self.controller.inference_wrapped_model.model.config
         if self.num_speculative_tokens > self.controller.num_mtp_depths:
             raise ValueError("Async scheduling requires one MTP depth per speculative token.")
-        if model_config.moe_enable_routing_replay:
-            raise ValueError("Async scheduling does not support routing replay.")
 
     def _add_request(
         self, request: DynamicInferenceRequest
