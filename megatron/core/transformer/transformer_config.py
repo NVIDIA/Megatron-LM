@@ -1402,6 +1402,12 @@ class TransformerConfig(ModelParallelConfig):
     group is outside the attention graph either way and is unaffected. The split additionally
     constrains the configuration (see ``__post_init__``), which is why it is opt-in rather than
     implied by ``recompute_modules=[mhc]``.
+
+    Supported for GPT mHC layers and HybridStack attention-only mHC wrappers. Other HybridStack
+    layer families remain eager with the attention-only graph scope. ``mla_up_proj`` may also
+    be included in ``recompute_modules``; its checkpoint stays inside the attention consumer,
+    independently of the eager mHC recompute group. Packed (THD) sequences use the same
+    fixed-capacity sequence metadata inputs as ordinary attention CUDA graphs.
     """
 
     ####################
@@ -3662,12 +3668,10 @@ class TransformerConfig(ModelParallelConfig):
         if (
             use_mhc_recompute
             and not self.mhc_recompute_attn_cuda_graph_split
-            and not self.is_hybrid_model  # hybrid cannot take the switch this
-            # message recommends (rejected above); hybrid_block emits its own
-            # capture-scope warning instead
+            and not self.is_hybrid_model  # hybrid_block emits its own capture-scope warning
             and self.cuda_graph_impl == "transformer_engine"
             and list(self.cuda_graph_modules or []) == [CudaGraphModule.attn]
-            and list(self.recompute_modules) == ["mhc"]
+            and set(self.recompute_modules) <= {"mhc", "mla_up_proj"}
         ):
             # Exactly the shape that ran the #5841 split implicitly: such configs
             # hit this branch when they omit the new switch, and whole-attention
@@ -3675,18 +3679,14 @@ class TransformerConfig(ModelParallelConfig):
             # captured (its checkpoint no longer pays) and the static hidden input
             # grows from [s, b, C] to [s, b, n*C]. Say so once at config time,
             # since the alternative is a silent memory regression relative to the
-            # split. Deliberately narrow: broader attn-containing shapes (extra
-            # graph scopes, extra recompute modules) never ran the split, and the
-            # switch this message recommends is rejected for them.
+            # split. Only recommend the switch for supported recompute modules.
             warnings.warn(
                 "mHC recompute with an attn-scope Transformer Engine CUDA Graph is "
                 "capturing the whole attention range: the captured mHC producer's "
                 "checkpoint is not recovered and the static graph input is "
                 "[s, b, n*C]. Set mhc_recompute_attn_cuda_graph_split=True for the "
                 "attention-only split, which keeps the producer eager and shrinks "
-                "the captured input to [s, b, C]. (The split's replay does not yet "
-                "forward THD captured kwargs; on packed sequences keep the switch "
-                "off.)",
+                "the captured input to [s, b, C].",
                 UserWarning,
                 stacklevel=2,
             )
@@ -3706,16 +3706,6 @@ class TransformerConfig(ModelParallelConfig):
             )
 
         if use_mhc_recompute and self.mhc_recompute_attn_cuda_graph_split:
-            if self.is_hybrid_model:
-                raise ValueError(
-                    "mhc_recompute_attn_cuda_graph_split is not implemented for "
-                    "HybridStack mHC layers: HyperConnectionHybridLayer always "
-                    "captures the whole wrapper (mHC aggregate included) with an "
-                    "[s, b, n*C] static input and has no attention-consumer split "
-                    "path, so the switch would silently change nothing while the "
-                    "config claims the split is on. Keep the switch off for "
-                    "hybrid models."
-                )
             if self.cuda_graph_impl != "transformer_engine":
                 raise ValueError(
                     "mhc_recompute_attn_cuda_graph_split requires "
@@ -3723,25 +3713,17 @@ class TransformerConfig(ModelParallelConfig):
                     f"{self.cuda_graph_impl!r}: the split is a Transformer Engine "
                     "per-layer capture."
                 )
-            if list(self.cuda_graph_modules or []) != [CudaGraphModule.attn] or list(
+            if list(self.cuda_graph_modules or []) != [CudaGraphModule.attn] or set(
                 self.recompute_modules
-            ) != ["mhc"]:
+            ) - {"mhc", "mla_up_proj"}:
                 raise ValueError(
                     "mhc_recompute_attn_cuda_graph_split requires "
-                    "cuda_graph_modules=[attn] with recompute_modules=[mhc]: the split "
+                    "cuda_graph_modules=[attn] with recompute_modules=[mhc] or "
+                    "[mhc, mla_up_proj]: the split "
                     "captures input-layernorm plus self-attention only, so the eager mHC "
                     "producer stays outside the captured consumer. Clear "
                     "mhc_recompute_attn_cuda_graph_split to capture the whole attention "
                     "range instead."
-                )
-            if self.sequence_packing_scheduler is not None:
-                raise ValueError(
-                    "mhc_recompute_attn_cuda_graph_split does not support packed "
-                    "(THD) sequences: THD capture takes cu_seqlens_*/padding_mask "
-                    "as captured kwargs and the split's replay does not forward "
-                    "them, so the first replay fails at the Transformer Engine "
-                    "boundary. Keep the switch off on packed-sequence runs to "
-                    "capture the whole attention range instead."
                 )
             if self.fine_grained_activation_offloading:
                 # HyperConnectionTransformerLayer._te_cuda_graph_capture replaces
