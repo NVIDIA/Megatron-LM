@@ -2,7 +2,6 @@
 """Numerical contracts for the model-independent EP checkpoint bridge."""
 
 from copy import deepcopy
-from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -88,9 +87,8 @@ def test_checkpoint_publishes_main_grad_to_outer_ddp_hook(
         else:
             forward.backward_op = SimpleNamespace(backward=fused)
             forward._logical_chunk_count = 2
-            forward._routing_context = lambda value: nullcontext()
             forward._forward_saved_context_async = lambda value, *args: (experts(value), value)
-            output = _SavedContextEPChunkFunction.apply(x, None, forward, x.shape, weight)
+            output = _SavedContextEPChunkFunction.apply(x, forward, x.shape, weight)
         output.sum().backward()
     assert len(hooks) == 3
     for actual, expected in zip(hooks, (3, 8, 10), strict=True):
@@ -160,9 +158,6 @@ def test_checkpoint_matches_native_across_microbatches(
 
             def __init__(self):
                 pass  # CPU boundary test: no GPU workspace or transport initialization.
-
-            def _routing_context(self, routing_input):
-                return nullcontext()
 
             def _forward_output_async(self, x, ranges, input_shape, dtype):
                 return forward(x)
@@ -300,7 +295,7 @@ def test_qwen_layer_assembly_keeps_parameter_paths(
     changed.load_state_dict(native.state_dict(), strict=True)
     sibling = options.layer(cfg, ps, 1).double()
     selected = options.bind([changed, sibling])
-    assert changed.finish_backward == sibling.finish_backward == full_recompute
+    assert changed.full_recompute == sibling.full_recompute == full_recompute
     assert selected is changed.moe.chunked_ep
     assert options.bind([]) is None
     x = torch.randn(5, 1, 4, dtype=torch.double, requires_grad=True)

@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 import math
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field, fields
 from typing import Any, Callable, Literal
 
@@ -366,9 +366,7 @@ class _EPChunkExpertActivationArenaCoordinator:
         previous_trailing_shape = self.logical_trailing_shapes.get(name)
         if previous_trailing_shape is not None and previous_trailing_shape != trailing_shape:
             raise RuntimeError(
-                f"EP chunk expert activation {name!r} trailing shape {trailing_shape} "
-                f"does not match logical activation trailing shape "
-                f"{previous_trailing_shape}"
+                f"Activation {name!r} trailing shape {trailing_shape} != {previous_trailing_shape}"
             )
         existing = self.tensors.get(storage_name)
         requested_numel = math.prod(requested)
@@ -378,10 +376,7 @@ class _EPChunkExpertActivationArenaCoordinator:
             existing.dtype != dtype or existing.device != torch.device(device)
         )
         if incompatible:
-            raise RuntimeError(
-                f"EP chunk expert activation {name!r} does not match colored storage "
-                f"{storage_name!r}"
-            )
+            raise RuntimeError(f"Activation {name!r} incompatible with storage {storage_name!r}")
         if requested_numel == 0:
             # A zero-token expert is a logical view, not a request for the
             # allocator's positive-size reuse class.  In particular, a parked
@@ -413,8 +408,7 @@ class _EPChunkExpertActivationArenaCoordinator:
             )
         if growing and storage_name in self.issued_storage_slots:
             raise RuntimeError(
-                "EP chunk expert activation cannot grow colored storage "
-                f"{storage_name!r} during an active lease"
+                f"Cannot grow activation storage {storage_name!r} during an active lease"
             )
         if existing is None or growing:
             requested_capacity_bytes = _expert_activation_capacity_bytes(requested_bytes)
@@ -568,10 +562,10 @@ class EPChunkWorkspace:
         profile_device = self.prepare_scratch(device=device)
         if all(slot.dispatcher is not None for slot in self._slots):
             return
-        if self.key.device_type == "cuda":
-            with torch.cuda.device(profile_device):
-                dispatchers = [self._dispatcher_factory(slot) for slot in range(EP_CHUNK_COUNT)]
-        else:
+        device_context = (
+            torch.cuda.device(profile_device) if self.key.device_type == "cuda" else nullcontext()
+        )
+        with device_context:
             dispatchers = [self._dispatcher_factory(slot) for slot in range(EP_CHUNK_COUNT)]
         if len({id(dispatcher) for dispatcher in dispatchers}) != EP_CHUNK_COUNT:
             raise RuntimeError("EP chunk workspace requires two distinct dispatchers")
@@ -1021,15 +1015,7 @@ class _EPChunkOperationBase:
         router: nn.Module,
         experts: Experts,
         workspace: EPChunkWorkspace,
-        router_forward: (
-            Callable[
-                [nn.Module, torch.Tensor, torch.Tensor | None], tuple[torch.Tensor, torch.Tensor]
-            ]
-            | None
-        ) = None,
     ):
-        self._router_forward = router_forward
-        self._active_routing_input: torch.Tensor | None = None
         self.router = router
         self.experts = experts
         self.workspace = workspace
@@ -1040,26 +1026,6 @@ class _EPChunkOperationBase:
     @property
     def _logical_chunk_count(self) -> int:
         return self.workspace.key.shape_profile.chunk_count
-
-    @contextmanager
-    def _routing_context(self, routing_input: torch.Tensor | None):
-        previous = getattr(self, "_active_routing_input", None)
-        self._active_routing_input = routing_input
-        try:
-            yield
-        finally:
-            self._active_routing_input = previous
-
-    def _route(
-        self, x: torch.Tensor, start: int = 0, end: int | None = None
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        router_forward = getattr(self, "_router_forward", None)
-        if router_forward is None:
-            return self.router(x)
-        routing_input = self._active_routing_input
-        if routing_input is not None:
-            routing_input = routing_input.reshape(-1)[start:end]
-        return router_forward(self.router, x, routing_input)
 
     def _forward_output_async(
         self,
@@ -1240,7 +1206,7 @@ class _EPChunkOperationBase:
             dispatcher = lease.dispatcher
             with torch.cuda.stream(compute_stream):
                 compute_stream.wait_event(input_ready)
-                scores, indices = self._route(x_chunk, start, end)
+                scores, indices = self.router(x_chunk)
                 route_ready = torch.cuda.Event()
                 route_ready.record(compute_stream)
             with torch.cuda.stream(comm_stream):
@@ -1253,7 +1219,7 @@ class _EPChunkOperationBase:
                     indices.record_stream(comm_stream)
                 with lease.deepep_recv_allocation():
                     state = dispatcher.submit_deepep_dispatch(
-                        x_chunk, scores, indices, allocate_on_comm_stream=True, async_finish=True
+                        x_chunk, scores, indices, allocate_on_comm_stream=True
                     )
             return chunk_idx, start, end, x_chunk, scores, dispatcher, state, lease
 
@@ -1262,7 +1228,7 @@ class _EPChunkOperationBase:
             with torch.cuda.stream(comm_stream):
                 comm_stream.wait_event(ready)
                 combine_state = dispatcher.submit_deepep_combine_prepared(
-                    rank_grouped, handle, allocate_on_comm_stream=True, async_finish=True
+                    rank_grouped, handle, allocate_on_comm_stream=True
                 )
             return chunk_idx, dispatcher, combine_state, lease
 
@@ -1334,7 +1300,7 @@ class _EPChunkOperationBase:
             dispatcher = lease.dispatcher
             with torch.cuda.stream(compute_stream):
                 compute_stream.wait_event(input_ready)
-                scores, indices = self._route(x_chunk, start, end)
+                scores, indices = self.router(x_chunk)
                 router_ready = torch.cuda.Event()
                 router_ready.record(compute_stream)
             with torch.cuda.stream(comm_stream):
@@ -1347,7 +1313,6 @@ class _EPChunkOperationBase:
                             scores,
                             indices,
                             allocate_on_comm_stream=True,
-                            async_finish=True,
                         )
                     )
             return chunk_idx, start, end, x_chunk, scores, dispatcher, state, lease
@@ -1590,11 +1555,10 @@ class _EPChunkOperationBase:
                     grad_rank_grouped = chunk.dispatcher.finish_deepep_combine_backward(
                         combine_state
                     )
-                    local_state["grad_expert_out"] = _manual_unpermute_backward(
-                        chunk, grad_rank_grouped
-                    )
                     grad_dispatched, grad_probs, hidden_reuse_base = _backward_expert(
-                        chunk, local_state.pop("grad_expert_out"), expert_activation_lease
+                        chunk,
+                        _manual_unpermute_backward(chunk, grad_rank_grouped),
+                        expert_activation_lease,
                     )
                     local_state["hidden_reuse_base"] = hidden_reuse_base
                     local_state["grad_dispatched"] = grad_dispatched
@@ -1689,7 +1653,6 @@ class _SavedContextEPChunkFunction(torch.autograd.Function):
     def forward(
         ctx,
         x_2d: torch.Tensor,
-        routing_input: torch.Tensor | None,
         forward_op: "EPChunkForwardOp",
         input_shape: torch.Size,
         *params: torch.Tensor,
@@ -1697,7 +1660,7 @@ class _SavedContextEPChunkFunction(torch.autograd.Function):
         ctx.backward_op = forward_op.backward_op
         ctx.input_shape = x_2d.shape
         ctx.params = params
-        with torch.enable_grad(), forward_op._routing_context(routing_input):
+        with torch.enable_grad():
             x_graph = x_2d.detach().requires_grad_(True)
             output, saved_context = forward_op._forward_saved_context_async(
                 x_graph,
@@ -1720,7 +1683,6 @@ class _SavedContextEPChunkFunction(torch.autograd.Function):
             grad_x.reshape(ctx.input_shape),
             None,
             None,
-            None,
             *_outer_parameter_grads(ctx.params, (*router_grads, *expert_grads)),
         )
 
@@ -1736,19 +1698,16 @@ class EPChunkForwardOp(_EPChunkOperationBase):
             raise RuntimeError("Saved-context EP forward/backward must share router and experts")
         self.backward_op = backward_op
 
-    def forward(self, x: torch.Tensor, routing_input: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         input_shape = x.shape
         x_2d = x.view(-1, x.size(-1)) if x.dim() == 3 else x
         if torch.is_grad_enabled():
             if self.backward_op is None:
                 raise RuntimeError("Grad-enabled EPChunkForwardOp requires a paired backward op")
             params = tuple(self.router.parameters()) + tuple(self.experts.parameters())
-            return _SavedContextEPChunkFunction.apply(
-                x_2d, routing_input, self, input_shape, *params
-            )
+            return _SavedContextEPChunkFunction.apply(x_2d, self, input_shape, *params)
         ranges = runtime_ep_chunk_ranges(x_2d.size(0), chunk_count=self._logical_chunk_count)
-        with self._routing_context(routing_input):
-            return self._forward_output_async(x_2d, ranges, input_shape, x.dtype)
+        return self._forward_output_async(x_2d, ranges, input_shape, x.dtype)
 
     __call__ = forward
 
@@ -1770,11 +1729,10 @@ class EPChunkFusedForwardBackwardOp(_EPChunkOperationBase):
         self,
         x_saved: torch.Tensor,
         grad_output: torch.Tensor,
-        routing_input: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, list[torch.Tensor], list[torch.Tensor | None]]:
         x_2d = x_saved.view(-1, x_saved.size(-1))
         grad_2d = grad_output.contiguous().view(-1, grad_output.size(-1))
-        with self._routing_context(routing_input), torch.enable_grad():
+        with torch.enable_grad():
             grad_x, router_grads, expert_grads = self._full_recompute_fused_backward(x_2d, grad_2d)
         grad_x = grad_x.view_as(x_saved)
         return grad_x, router_grads, expert_grads

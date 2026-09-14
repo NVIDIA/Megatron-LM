@@ -72,14 +72,13 @@ class ChunkedDispatcher(_BaseDispatcher):
         handle,
         *,
         allocate_on_comm_stream: bool = False,
-        async_finish: bool = True,
     ):
-        previous_event = _previous_event() if async_finish else None
+        previous_event = _previous_event()
         combined = self.buffer.combine(
             rank_grouped,
             handle,
             previous_event=previous_event,
-            async_finish=async_finish,
+            async_finish=True,
             allocate_on_comm_stream=allocate_on_comm_stream,
         )
         event = None
@@ -156,11 +155,10 @@ class ChunkedDispatcher(_BaseDispatcher):
         topk_indices,
         *,
         allocate_on_comm_stream: bool = False,
-        async_finish: bool = True,
     ):
         topk_indices = topk_indices.contiguous()
         topk_scores = topk_scores.float().contiguous()
-        previous_event = _previous_event() if async_finish else None
+        previous_event = _previous_event()
         (
             num_tokens_per_rank,
             num_tokens_per_rdma_rank,
@@ -171,7 +169,7 @@ class ChunkedDispatcher(_BaseDispatcher):
             topk_indices,
             num_experts=self.num_experts,
             previous_event=previous_event,
-            async_finish=async_finish,
+            async_finish=True,
             allocate_on_comm_stream=allocate_on_comm_stream,
         )
         hidden_states_contig = hidden_states.contiguous()
@@ -185,7 +183,7 @@ class ChunkedDispatcher(_BaseDispatcher):
                 is_token_in_rank=is_token_in_rank,
                 num_tokens_per_expert=num_tokens_per_expert,
                 previous_event=event,
-                async_finish=async_finish,
+                async_finish=True,
                 allocate_on_comm_stream=allocate_on_comm_stream,
             )
         )

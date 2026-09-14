@@ -39,7 +39,6 @@ class _ChunkedTransformerLayer(TransformerLayer):
     def __init__(self, *args, chunked_ep, **kwargs):
         super().__init__(*args, moe_factory=chunked_ep.moe, **kwargs)
         self.full_recompute = chunked_ep.full_recompute
-        self.finish_backward = False
 
     def forward(self, x, position_ids=None, packed_seq_params=None):
         if not self.full_recompute or not torch.is_grad_enabled():
@@ -58,7 +57,7 @@ class _ChunkedTransformerLayer(TransformerLayer):
             x,
             self.moe.chunked_ep,
             (*self.attn.parameters(), *self.mlp_norm.parameters()),
-            finish_backward=self.finish_backward,
+            finish_backward=True,
         )
 
 
@@ -116,8 +115,6 @@ class Qwen3ChunkedEP:
     def bind(self, layers):
         if not layers:
             return None
-        for layer in layers:
-            layer.finish_backward = self.full_recompute
         return layers[0].moe.chunked_ep
 
 
