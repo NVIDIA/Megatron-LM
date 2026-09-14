@@ -1172,8 +1172,9 @@ def validate_args(args, defaults={}):
                 "GroupedTensor param buffers."
             )
         # Optimizer compatibility check.
-        assert args.optimizer in ('sgd', 'adam'), \
-            f"Megatron-FSDP does not support the {args.optimizer} optimizer yet."
+        assert args.optimizer in ('sgd', 'adam') or (
+            args.optimizer == 'muon' and args.megatron_fsdp_version == 2
+        ), f"Megatron-FSDP does not support the {args.optimizer} optimizer yet."
 
         # Expert parameters may be sharded differently from non-expert parameters, in which
         # case both strategies have to be considered by model-wide checks.
@@ -1813,7 +1814,7 @@ def validate_args(args, defaults={}):
 
     # emerging optimizer check
     args.use_layer_wise_distributed_optimizer = False
-    if args.optimizer not in ('sgd', 'adam'):
+    if args.optimizer not in ('sgd', 'adam') and not args.use_megatron_fsdp:
         if args.optimizer == 'dist_muon':
             warn_rank_0(
                 "optimizer='dist_muon' is deprecated. "
@@ -1826,9 +1827,12 @@ def validate_args(args, defaults={}):
             args.use_layer_wise_distributed_optimizer = True
             args.use_distributed_optimizer = False
 
-        assert not args.use_torch_fsdp2, "Emerging optimizer does not support Torch-FSDP2 for now."
-        assert not args.use_megatron_fsdp, "Emerging optimizer does not support Megatron-FSDP for now."
-        assert args.ckpt_format in ["torch", "torch_dist"], "Emerging optimizer supports torch and torch_dist checkpoint format."
+        assert not args.use_torch_fsdp2, (
+            "Emerging optimizer does not support Torch-FSDP2 for now."
+        )
+        assert args.ckpt_format in ["torch", "torch_dist"], (
+            "Emerging optimizer supports torch and torch_dist checkpoint format."
+        )
 
     assert not (
         args.use_layer_wise_distributed_optimizer and args.moe_single_grouped_weight
@@ -2790,6 +2794,12 @@ def _add_regularization_args(parser):
                        'Validated at optimizer creation time.')
     group.add_argument('--muon-num-ns-steps', type=int, default=5,
                        help='Number of Newton-Schulz steps for Muon optimizer')
+    group.add_argument('--muon-dp-subgroup-size', type=int, default=None,
+                       help='Maximum number of same-node DP ranks across which one parameter may be '
+                       'sharded by Megatron-FSDP v2 Muon. Defaults to the full DP group.')
+    group.add_argument('--muon-max-params-per-owner-chunk', type=int, default=16,
+                       help='Maximum number of parameters in each Megatron-FSDP v2 Muon owner '
+                       'communication chunk. Defaults to 16 parameters per chunk.')
     group.add_argument('--muon-tp-mode', type=str, default='duplicated',
                        choices=['blockwise', 'duplicated', 'distributed', 'auto'],
                        help='How to perform NS calculation for tensor model parallel weights. '

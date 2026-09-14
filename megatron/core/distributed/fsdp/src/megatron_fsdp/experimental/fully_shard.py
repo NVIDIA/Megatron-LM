@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,6 +15,8 @@
 """Minimal Megatron-FSDP fully_shard entrypoint."""
 
 import dataclasses
+import os
+from collections import Counter
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -65,6 +67,7 @@ def fully_shard_context(
     *,
     use_symmetric_memory: bool = False,
     unify_communication_stream: bool = False,
+    reuse_existing: bool = False,
 ) -> Iterator[FsdpContext]:
     """Construct FSDP modules that share runtime streams and prefetch orders.
 
@@ -79,8 +82,28 @@ def fully_shard_context(
         unify_communication_stream: Whether all-gathers and reduce-scatters share one
             communication stream to reduce peak transient memory. See
             https://github.com/NVIDIA/Megatron-LM/issues/6471.
+        reuse_existing: Reuse an already-active context on the same ``device`` instead
+            of starting a nested scope. When set, only the context that actually created
+            the shared context (the outermost scope) calls :meth:`FsdpContext.finalize`;
+            reused scopes exit without finalizing. A context cannot be shared across
+            devices, so requesting reuse while a context is active on a different
+            ``device`` raises ``ValueError``.
     """
-    if _FSDP_CONTEXT.get() is not None:
+    existing = _FSDP_CONTEXT.get()
+    if existing is not None:
+        if reuse_existing:
+            requested = device if device is not None else torch.device(
+                "cuda", torch.cuda.current_device()
+            )
+            if existing.allgather_stream.device != requested:
+                raise ValueError(
+                    "fully_shard_context cannot be shared across devices: active context "
+                    f"is on {existing.allgather_stream.device}, requested {requested}."
+                )
+            # Join the outermost scope's context. Only the scope that created the
+            # context finalizes it; reused scopes leave finalization to the creator.
+            yield existing
+            return
         raise RuntimeError("fully_shard_context does not support nesting.")
 
     device = device or torch.device("cuda", torch.cuda.current_device())
@@ -111,6 +134,7 @@ def fully_shard(
     grad_divisor: int = 1,
     schedule_policy: SchedulePolicy = SchedulePolicy(),
     register_hooks: bool = True,
+    subgroup_size: int | None = None,
 ) -> None:
     """Apply FSDP to a module in place.
 
@@ -139,6 +163,12 @@ def fully_shard(
             hooks on ``module``. Disable this when an external scheduler invokes the
             corresponding FSDP lifecycle methods explicitly. The state-dict safety hook
             is registered independently.
+        subgroup_size: Optional maximum number of same-node DP ranks across which one
+            parameter may be sharded.
+
+        Parameters that are TE MXFP8 primary weights (detected via
+        ``is_float8tensor`` + ``fp8_need_transpose_data``) are grouped into
+        ``Fp8ParameterGroup`` automatically; no flag is needed.
     """
     if isinstance(module, FsdpModule):
         raise ValueError("This module is already managed by FSDP.")
@@ -154,6 +184,11 @@ def fully_shard(
 
     _validate_dp_axes(mesh, placements.dp_axes)
     mixed_precision_policy = mixed_precision_policy or MixedPrecisionPolicy()
+    if subgroup_size is not None:
+        local_world_size = int(os.environ["LOCAL_WORLD_SIZE"])
+        ranks_per_node = Counter(rank // local_world_size for rank in mesh.mesh.flatten().tolist())
+        subgroup_size = min(subgroup_size, max(ranks_per_node.values()))
+
     original_cls = module.__class__
     _attach_mixin(module)
     try:
@@ -170,6 +205,7 @@ def fully_shard(
             schedule_policy=schedule_policy,
             use_symmetric_memory=context.use_symmetric_memory,
             register_hooks=register_hooks,
+            subgroup_size=subgroup_size,
         )
     except Exception:
         module.__class__ = original_cls
