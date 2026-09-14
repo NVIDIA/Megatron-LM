@@ -1080,23 +1080,17 @@ def _prepare_common_state(
 
 
 def _common_state_iteration(common_state: dict[str, Any]) -> int | None:
-    iterations = []
     if "iteration" in common_state:
-        iterations.append(common_state["iteration"])
-    checkpoint_args = common_state.get("args")
-    if checkpoint_args is not None and hasattr(checkpoint_args, "iteration"):
-        iterations.append(checkpoint_args.iteration)
+        iteration = common_state["iteration"]
+    else:
+        checkpoint_args = common_state.get("args")
+        if checkpoint_args is None or not hasattr(checkpoint_args, "iteration"):
+            return None
+        iteration = checkpoint_args.iteration
 
-    if not iterations:
-        return None
-    if any(not isinstance(iteration, int) for iteration in iterations):
+    if not isinstance(iteration, int):
         raise WeightedMergeError("Checkpoint common state contains a non-integer iteration.")
-    if len(set(iterations)) != 1:
-        raise WeightedMergeError(
-            "Checkpoint common state has inconsistent top-level and args iterations: "
-            f"{iterations}."
-        )
-    return iterations[0]
+    return iteration
 
 
 def _load_output_common_state(

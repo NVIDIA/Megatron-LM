@@ -147,10 +147,13 @@ def _write_checkpoint(
     iteration=0,
     shape=(2, 2),
     consumed_train_samples=0,
+    args_iteration=None,
 ):
     state_dict = _template(value, dtype=dtype, extra_value=extra_value, shape=shape)
     state_dict["args"] = SimpleNamespace(
-        iteration=iteration, hidden_size=2, consumed_train_samples=consumed_train_samples
+        iteration=iteration if args_iteration is None else args_iteration,
+        hidden_size=2,
+        consumed_train_samples=consumed_train_samples,
     )
     state_dict["checkpoint_version"] = 3.0
     state_dict["iteration"] = iteration
@@ -632,6 +635,12 @@ def test_invalid_pure_inputs_raise(tmp_path):
         weighted_merge_module._resolve_checkpoint_dir(tmp_path)
 
 
+def test_common_state_iteration_falls_back_to_checkpoint_args():
+    common_state = {"args": SimpleNamespace(iteration=123)}
+
+    assert weighted_merge_module._common_state_iteration(common_state) == 123
+
+
 def test_select_checkpoints_preserves_target_and_applies_interval(tmp_path):
     for iteration in [100, 150, 210, 260, 300]:
         (tmp_path / weighted_merge_module._iteration_dir_name(iteration)).mkdir()
@@ -740,7 +749,9 @@ def test_metadata_same_layout_uses_output_checkpoint_progress_state(
         TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_progress_out") as output_root,
     ):
         _write_checkpoint(ckpt_a, 1.0, iteration=1000, consumed_train_samples=128_000)
-        _write_checkpoint(ckpt_b, 5.0, iteration=2000, consumed_train_samples=256_000)
+        _write_checkpoint(
+            ckpt_b, 5.0, iteration=2000, consumed_train_samples=256_000, args_iteration=0
+        )
 
         result = merge_same_layout_dcp_metadata_checkpoints(
             [ckpt_a, ckpt_b], [0.25, 0.75], output_root, output_iteration=2000
@@ -763,7 +774,9 @@ def test_metadata_same_layout_uses_explicit_common_state_checkpoint(
     ):
         _write_checkpoint(ckpt_a, 1.0, iteration=1000)
         _write_checkpoint(ckpt_b, 5.0, iteration=2000)
-        _write_checkpoint(common_source, 9.0, iteration=2000, consumed_train_samples=256_000)
+        _write_checkpoint(
+            common_source, 9.0, iteration=2000, consumed_train_samples=256_000, args_iteration=0
+        )
         (ckpt_a / "common.pt").unlink()
         (ckpt_b / "common.pt").unlink()
 
