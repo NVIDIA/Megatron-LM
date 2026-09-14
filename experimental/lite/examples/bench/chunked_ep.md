@@ -22,9 +22,9 @@ impl = ImplConfig(
 Use BF16 experts and DeepEP with EP>1, top-k<=EP. Logical chunk count defaults
 to two; three and four are also representable. Set the input capacity to the
 largest flattened local batch. Activation backing grows lazily. For a frozen
-capacity, call each MoE layer's `materialize_ep_chunk_workspaces` with
+capacity, call each MoE layer's `chunked_ep.materialize` with
 `expert_activation_max_rows` before each phase. Shared storage is guarded by
-consumer events. `release_ep_chunk_workspaces` releases it for offload; the
+consumer events. `chunked_ep.release` releases it for offload; the
 runtime invokes release before model unload. Capture owners must discard
 graphs before explicit release. This PR does not claim CUDA graph validation.
 

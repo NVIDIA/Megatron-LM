@@ -2493,7 +2493,97 @@ def _materialize(
     ]
 
 
+class EPChunkExecution:
+    """Model-independent OP composition; parameters remain owned by the caller.
+
+    retain_backward selects saved-context forward/backward; otherwise expose
+    graph-free forward and fused forward/backward. No recompute policy is read.
+    Workspace construction stays lazy and shared through the existing registry.
+    """
+
+    def __init__(
+        self,
+        *,
+        router,
+        experts,
+        dispatcher_factory,
+        max_input_rows,
+        hidden_size,
+        expert_intermediate_size,
+        topk,
+        ep_size,
+        ep_group,
+        chunk_count=2,
+        retain_backward=False,
+    ):
+        profile = EPChunkShapeProfile.for_two_slot_chunked_ep(
+            max_input_rows=max_input_rows,
+            hidden_size=hidden_size,
+            expert_intermediate_size=expert_intermediate_size,
+            topk=topk,
+            ep_size=ep_size,
+            chunk_count=chunk_count,
+        )
+
+        def workspace(op):
+            return get_ep_chunk_workspace(
+                EPChunkWorkspaceKey(op, "cuda", None, id(ep_group), torch.bfloat16, profile),
+                dispatcher_factory,
+            )
+
+        kwargs = dict(router=router, experts=experts)
+        self.backward_op = (
+            EPChunkBackwardOp(workspace=workspace("backward"), **kwargs)
+            if retain_backward
+            else None
+        )
+        self.forward_op = EPChunkForwardOp(
+            workspace=workspace("forward"), backward_op=self.backward_op, **kwargs
+        )
+        self.fused_op = (
+            None
+            if retain_backward
+            else EPChunkFusedForwardBackwardOp(
+                workspace=workspace("fused_forward_backward"), **kwargs
+            )
+        )
+
+    def _requirements(self, phase):
+        if phase == "forward":
+            return ((self.forward_op.workspace, True),)
+        if phase == "backward":
+            op = self.fused_op or self.backward_op
+            return ((op.workspace, self.fused_op is not None),)
+        raise ValueError(f"Unsupported EP chunk workspace phase {phase!r}")
+
+    def materialize(self, *, phase="forward", device=None, expert_activation_max_rows=None):
+        for workspace, require_dispatcher in self._requirements(phase):
+            if require_dispatcher:
+                workspace.materialize(device=device)
+            else:
+                workspace.prepare_scratch(device=device)
+            if expert_activation_max_rows is not None:
+                workspace.reserve_expert_activations(
+                    max_expert_rows=expert_activation_max_rows, device=device
+                )
+
+    def release(self, *, stream=None):
+        for phase in ("forward", "backward"):
+            for workspace, _ in self._requirements(phase):
+                release_ep_chunk_workspace(workspace.key, stream=stream)
+
+    def finish_forward(self, tensor):
+        stream = torch.cuda.current_stream(tensor.device) if tensor.is_cuda else None
+        self.forward_op.workspace.reset_tensors(stream=stream)
+
+    def finish_backward(self, tensor):
+        stream = torch.cuda.current_stream(tensor.device) if tensor.is_cuda else None
+        op = self.fused_op or self.backward_op
+        op.workspace.park_expert_activations(stream=stream)
+
+
 __all__ = [
+    "EPChunkExecution",
     "EP_CHUNK_COUNT",
     "EPChunkBackwardOp",
     "EPChunkForwardOp",

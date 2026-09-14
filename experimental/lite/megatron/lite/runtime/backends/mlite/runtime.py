@@ -438,11 +438,12 @@ class MegatronLiteRuntime(RuntimeBase):
                 if id(module) in released:
                     continue
                 released.add(id(module))
-                release = getattr(module, "release_ep_chunk_workspaces", None)
+                execution = getattr(module, "chunked_ep", None)
+                release = getattr(execution, "release", None)
                 if callable(release):
                     if stream is None and torch.cuda.is_available():
                         stream = torch.cuda.current_stream()
-                    release(phase=None, stream=stream)
+                    release(stream=stream)
 
     # ── Memory ──
 

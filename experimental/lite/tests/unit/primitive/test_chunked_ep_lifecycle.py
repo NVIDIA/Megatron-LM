@@ -2,6 +2,7 @@
 """Event ordering, alias safety, capacity, and explicit release contracts."""
 
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -12,6 +13,61 @@ import megatron.core  # noqa: F401
 class Event:
     def query(self):
         return False
+
+
+@pytest.mark.parametrize("retain_backward", [False, True])
+def test_execution_owns_lifecycle_without_registering_parameters(
+    transformer_engine_import_stub, monkeypatch, retain_backward
+):
+    transformer_engine_import_stub()
+    from megatron.lite.primitive.modules import moe_ep_chunk_overlap as ep
+
+    spaces = {}
+
+    def acquire(key, factory):
+        return spaces.setdefault(key.op, Mock(key=key))
+
+    monkeypatch.setattr(ep, "get_ep_chunk_workspace", acquire)
+    release = Mock()
+    monkeypatch.setattr(ep, "release_ep_chunk_workspace", release)
+    router, experts = torch.nn.Linear(4, 2), torch.nn.Linear(4, 4)
+    model = torch.nn.Module()
+    model.router, model.experts = router, experts
+    keys = tuple(model.state_dict())
+    execution = ep.EPChunkExecution(
+        router=router,
+        experts=experts,
+        dispatcher_factory=Mock(),
+        max_input_rows=16,
+        hidden_size=4,
+        expert_intermediate_size=3,
+        topk=2,
+        ep_size=2,
+        ep_group=object(),
+        retain_backward=retain_backward,
+    )
+    model.chunked_ep = execution
+    assert tuple(model.state_dict()) == keys
+    assert execution.forward_op.router is router
+    assert (execution.backward_op is not None) == retain_backward
+    assert (execution.fused_op is not None) != retain_backward
+    backward = spaces["backward" if retain_backward else "fused_forward_backward"]
+    execution.materialize(phase="backward", expert_activation_max_rows=4)
+    if retain_backward:
+        backward.prepare_scratch.assert_called_once_with(device=None)
+        backward.materialize.assert_not_called()
+    else:
+        backward.materialize.assert_called_once_with(device=None)
+    backward.reserve_expert_activations.assert_called_once_with(max_expert_rows=4, device=None)
+    execution.finish_forward(torch.zeros(1))
+    spaces["forward"].reset_tensors.assert_called_once_with(stream=None)
+    execution.finish_backward(torch.zeros(1))
+    backward.park_expert_activations.assert_called_once_with(stream=None)
+    execution.release()
+    assert [call.args[0] for call in release.call_args_list] == [
+        spaces["forward"].key,
+        backward.key,
+    ]
 
 
 class Stream:

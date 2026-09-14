@@ -19,15 +19,7 @@ from megatron.lite.primitive.modules.dispatcher import TokenDispatcher
 from megatron.lite.primitive.modules.experts import Experts
 from megatron.lite.primitive.modules.gqa import GQAttention
 from megatron.lite.primitive.modules.lora import LoraConfig
-from megatron.lite.primitive.modules.moe_ep_chunk_overlap import (
-    EPChunkBackwardOp,
-    EPChunkForwardOp,
-    EPChunkFusedForwardBackwardOp,
-    EPChunkShapeProfile,
-    EPChunkWorkspaceKey,
-    get_ep_chunk_workspace,
-    release_ep_chunk_workspace,
-)
+from megatron.lite.primitive.modules.moe_ep_chunk_overlap import EPChunkExecution
 from megatron.lite.primitive.modules.moe_ep_chunk_overlap_policy import (
     validate_ep_chunk_overlap_config,
 )
@@ -121,9 +113,11 @@ class _Qwen3TransformerLayerFullRecomputeFunction(torch.autograd.Function):
                 )
                 residual = x + attention_out
                 norm_out = layer.mlp_norm(residual)
-                assert layer.moe.ep_chunk_fused is not None
-                grad_norm, router_grads, expert_grads = layer.moe.ep_chunk_fused.forward_backward(
-                    norm_out, grad_output
+                assert (
+                    layer.moe.chunked_ep is not None and layer.moe.chunked_ep.fused_op is not None
+                )
+                grad_norm, router_grads, expert_grads = (
+                    layer.moe.chunked_ep.fused_op.forward_backward(norm_out, grad_output)
                 )
                 differentiable = (x, *attention_params, *norm_params)
                 required = tuple(value for value in differentiable if value.requires_grad)
@@ -131,8 +125,7 @@ class _Qwen3TransformerLayerFullRecomputeFunction(torch.autograd.Function):
                     (norm_out, residual), required, (grad_norm, grad_output), allow_unused=True
                 )
                 if ctx.park_chunked_ep_after_backward:
-                    stream = torch.cuda.current_stream(x.device) if x.is_cuda else None
-                    layer.moe.ep_chunk_fused.workspace.park_expert_activations(stream=stream)
+                    layer.moe.chunked_ep.finish_backward(x)
         finally:
             torch.set_rng_state(current_cpu_rng_state)
             if current_cuda_rng_state is not None:
@@ -195,67 +188,35 @@ class MoELayer(nn.Module):
             delay_wgrad_compute=enable_ep_chunk_overlap,
             lora_config=lora_config,
         )
-        self.dispatcher: TokenDispatcher | None = None
-        self.ep_chunk_forward: EPChunkForwardOp | None = None
-        self.ep_chunk_backward: EPChunkBackwardOp | None = None
-        self.ep_chunk_fused: EPChunkFusedForwardBackwardOp | None = None
         self.ep_chunk_full_recompute = ep_chunk_full_recompute
-        if enable_ep_chunk_overlap:
-            assert ep_chunk_max_token_rows_per_rank is not None
-            shape_profile = EPChunkShapeProfile.for_two_slot_chunked_ep(
+        self.chunked_ep = (
+            EPChunkExecution(
+                router=self.router,
+                experts=self.experts,
+                dispatcher_factory=lambda _slot: TokenDispatcher(
+                    config.num_experts, config.hidden_size, ps, use_deepep=True
+                ),
                 max_input_rows=ep_chunk_max_token_rows_per_rank,
                 hidden_size=config.hidden_size,
                 expert_intermediate_size=getattr(config, "moe_intermediate_size", None),
                 topk=config.num_experts_per_tok,
                 ep_size=ps.ep_size,
+                ep_group=ps.tp_ep_group,
                 chunk_count=ep_chunk_count,
+                retain_backward=not ep_chunk_full_recompute,
             )
-            common_key = dict(
-                device_type="cuda",
-                # Bind to the actual runtime tensor/explicit materialize device,
-                # after the CPU-constructed module has been moved to its rank device.
-                device_index=None,
-                ep_group_id=id(ps.tp_ep_group),
-                dtype=torch.bfloat16,
-                shape_profile=shape_profile,
-            )
-
-            def workspace(op):
-                key = EPChunkWorkspaceKey(op=op, **common_key)
-                workspace = get_ep_chunk_workspace(
-                    key,
-                    lambda _slot: TokenDispatcher(
-                        config.num_experts, config.hidden_size, ps, use_deepep=True
-                    ),
-                )
-                return workspace
-
-            op_kwargs = dict(router=self.router, experts=self.experts)
-            if ep_chunk_full_recompute:
-                self.ep_chunk_forward = EPChunkForwardOp(
-                    workspace=workspace("forward"), **op_kwargs
-                )
-                self.ep_chunk_fused = EPChunkFusedForwardBackwardOp(
-                    workspace=workspace("fused_forward_backward"), **op_kwargs
-                )
-            else:
-                self.ep_chunk_backward = EPChunkBackwardOp(
-                    workspace=workspace("backward"), **op_kwargs
-                )
-                self.ep_chunk_forward = EPChunkForwardOp(
-                    workspace=workspace("forward"), backward_op=self.ep_chunk_backward, **op_kwargs
-                )
-        else:
-            self.dispatcher = TokenDispatcher(
-                config.num_experts, config.hidden_size, ps, use_deepep=use_deepep
-            )
+            if enable_ep_chunk_overlap
+            else None
+        )
+        self.dispatcher = (
+            None
+            if self.chunked_ep
+            else TokenDispatcher(config.num_experts, config.hidden_size, ps, use_deepep=use_deepep)
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.ep_chunk_forward is not None:
-            if self.ep_chunk_full_recompute:
-                return self.ep_chunk_forward(x)
-            assert self.ep_chunk_forward is not None
-            return self.ep_chunk_forward(x)
+        if self.chunked_ep is not None:
+            return self.chunked_ep.forward_op(x)
 
         assert self.dispatcher is not None
         input_shape = x.shape
@@ -279,77 +240,6 @@ class MoELayer(nn.Module):
         del expert_out
 
         return combined.view(input_shape).to(x.dtype)
-
-    def _ep_chunk_workspaces(self):
-        """Return the unique lightweight workspaces selected by Qwen composition."""
-        workspaces = []
-        for op in (self.ep_chunk_forward, self.ep_chunk_backward, self.ep_chunk_fused):
-            if op is not None and all(op.workspace is not workspace for workspace in workspaces):
-                workspaces.append(op.workspace)
-        return tuple(workspaces)
-
-    def _ep_chunk_workspaces_for_phase(self, phase: str):
-        """Select only workspaces first used by one execution phase."""
-        return tuple(
-            workspace
-            for workspace, _require_dispatcher in self._ep_chunk_requirements_for_phase(phase)
-        )
-
-    def _ep_chunk_requirements_for_phase(self, phase: str):
-        """Pair phase workspaces with their dispatcher materialization requirement."""
-        if phase == "forward":
-            requirements = ((self.ep_chunk_forward, True),)
-        elif phase == "backward":
-            requirements = (
-                (self.ep_chunk_fused, True)
-                if self.ep_chunk_full_recompute
-                else (self.ep_chunk_backward, False),
-            )
-        else:
-            raise ValueError(
-                f"Unsupported EP chunk workspace phase {phase!r}; expected 'forward' or 'backward'"
-            )
-        return tuple(
-            (op.workspace, require_dispatcher)
-            for op, require_dispatcher in requirements
-            if op is not None
-        )
-
-    def materialize_ep_chunk_workspaces(
-        self,
-        *,
-        phase: str = "forward",
-        device: torch.device | str | None = None,
-        expert_activation_max_rows: int | None = None,
-    ) -> None:
-        """Materialize one phase, optionally freezing caller-declared activations."""
-        for workspace, require_dispatcher in self._ep_chunk_requirements_for_phase(phase):
-            if require_dispatcher:
-                workspace.materialize(device=device)
-            else:
-                workspace.prepare_scratch(device=device)
-            if expert_activation_max_rows is not None:
-                workspace.reserve_expert_activations(
-                    max_expert_rows=expert_activation_max_rows, device=device
-                )
-
-    def ep_chunk_workspace_evidence(self) -> dict[str, dict]:
-        return {workspace.key.op: workspace.evidence() for workspace in self._ep_chunk_workspaces()}
-
-    def release_ep_chunk_workspaces(self, *, phase: str | None = None, stream=None) -> None:
-        """Release one phase or all selected workspaces for mode switch/teardown."""
-        workspaces = (
-            self._ep_chunk_workspaces()
-            if phase is None
-            else self._ep_chunk_workspaces_for_phase(phase)
-        )
-        for workspace in workspaces:
-            release_ep_chunk_workspace(workspace.key, stream=stream)
-
-    def reset_ep_chunk_workspace_tensors(self, *, phase: str, stream=None) -> None:
-        """Drop phase scratch at an explicit safe boundary, retaining DeepEP state."""
-        for workspace in self._ep_chunk_workspaces_for_phase(phase):
-            workspace.reset_tensors(stream=stream)
 
 
 # ---------------------------------------------------------------------------
@@ -472,8 +362,8 @@ class TransformerLayer(nn.Module):
         x = residual + h
         residual = x
         h = self.mlp_norm(x)
-        assert self.moe.ep_chunk_forward is not None
-        moe_out = self.moe.ep_chunk_forward(h)
+        assert self.moe.chunked_ep is not None
+        moe_out = self.moe.chunked_ep.forward_op(h)
         return residual + moe_out
 
     def forward(
@@ -847,7 +737,13 @@ class Qwen3MoEModel(nn.Module):
             if self.embed is not None:
                 h = scatter_to_sequence_parallel(h, self.ps)
             final_local_backward_chunked_ep = next(
-                (layer for layer in self.layers if layer.moe.ep_chunk_fused is not None), None
+                (
+                    layer
+                    for layer in self.layers
+                    if layer.moe.chunked_ep is not None
+                    and layer.moe.chunked_ep.fused_op is not None
+                ),
+                None,
             )
             for layer in self.layers:
                 h = layer(
@@ -864,10 +760,9 @@ class Qwen3MoEModel(nn.Module):
 
         def reset_forward_chunked_ep() -> None:
             """Park the shared forward arena after all Qwen3 MoE consumers."""
-            stream = torch.cuda.current_stream(h.device) if h.is_cuda else None
             for layer in self.layers:
-                if layer.moe.ep_chunk_forward is not None:
-                    layer.moe.reset_ep_chunk_workspace_tensors(phase="forward", stream=stream)
+                if layer.moe.chunked_ep is not None:
+                    layer.moe.chunked_ep.finish_forward(h)
                     break
 
         if self.head is not None:
