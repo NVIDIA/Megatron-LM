@@ -42,58 +42,6 @@ class TestInferenceConfig:
             InferenceGroupedGemmBackend.from_config("unknown")
 
     @pytest.mark.parametrize(
-        ("name", "include", "exclude", "expected"),
-        [
-            ("decoder.layers.2.mlp.experts.linear_fc1.weight0", None, None, True),
-            (
-                "decoder.layers.2.mlp.experts.linear_fc1.weight0",
-                r"\.mlp\.experts\.linear_fc[12]\.",
-                None,
-                True,
-            ),
-            ("decoder.layers.2.self_attention.linear_qkv.weight", r"\.mlp\.experts\.", None, False),
-            (
-                "decoder.layers.2.mlp.experts.linear_fc2.weight0",
-                r"\.mlp\.experts\.",
-                r"linear_fc2",
-                False,
-            ),
-        ],
-    )
-    def test_mxfp8_parameter_filter(self, name, include, exclude, expected):
-        from megatron.core.inference.quantization.utils import matches_mxfp8_parameter_filter
-
-        assert matches_mxfp8_parameter_filter(name, include, exclude) is expected
-
-    def test_apply_mxfp8_parameter_filter_from_config(self, monkeypatch):
-        """The Core hook forwards the model's configured include/exclude policy."""
-        import megatron.core.inference.quantization.utils as inference_quantization
-
-        model = torch.nn.Linear(4, 4, bias=False)
-        config = SimpleNamespace(
-            inference_mxfp8_include_parameters=r"experts\.linear_fc[12]",
-            inference_mxfp8_exclude_parameters=r"shared_experts",
-        )
-        calls = []
-        monkeypatch.setattr(
-            inference_quantization,
-            "materialize_unselected_mxfp8_parameters_as_bf16",
-            lambda *args, **kwargs: calls.append((args, kwargs)),
-        )
-
-        inference_quantization.apply_mxfp8_parameter_filter(model, config)
-
-        assert calls == [
-            (
-                (model,),
-                {
-                    "include_pattern": r"experts\.linear_fc[12]",
-                    "exclude_pattern": r"shared_experts",
-                },
-            )
-        ]
-
-    @pytest.mark.parametrize(
         ("grouped_gemm_backend", "expected_backend"),
         [
             ("torch", "triton"),

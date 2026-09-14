@@ -211,8 +211,8 @@ def test_mxfp8_quantize_replays():
     not hasattr(torch, "float8_e8m0fnu") or torch.cuda.get_device_capability()[0] < 10,
     reason="MXFP8 parameter storage needs Blackwell",
 )
-def test_mxfp8_parameter_precision_filter_replays():
-    """Selective conversion keeps chosen storage bit-exact and materializes the rest in BF16."""
+def test_mixed_precision_parameter_conversion_replays():
+    """Converting MXFP8 storage replays exactly while BF16 parameters remain unchanged."""
     import transformer_engine_torch as tex
     from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Quantizer
 
@@ -226,16 +226,14 @@ def test_mxfp8_parameter_precision_filter_replays():
     def convert(attention, expert):
         root = torch.nn.Module()
         root.attention = torch.nn.Module()
-        root.attention.weight = torch.nn.Parameter(quantizer(attention), requires_grad=False)
+        root.attention.weight = torch.nn.Parameter(attention.clone(), requires_grad=False)
         root.mlp = torch.nn.Module()
         root.mlp.experts = torch.nn.Module()
         root.mlp.experts.linear_fc1 = torch.nn.Module()
         root.mlp.experts.linear_fc1.weight = torch.nn.Parameter(
             quantizer(expert), requires_grad=False
         )
-        quantize_model_to_mxfp8(
-            root, backend="triton", include_pattern=r"(^|\.)mlp\.experts\.linear_fc[12]\."
-        )
+        quantize_model_to_mxfp8(root, backend="triton")
         selected = root.mlp.experts.linear_fc1.weight
         return (
             root.attention.weight,

@@ -92,12 +92,6 @@ def get_model_for_inference() -> MegatronModule:
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         model = builder.build_distributed_models(pg_collection=pg_collection, wrap_with_ddp=False)
 
-    use_mxfp8_inference = (
-        args.transformer_impl == "inference_optimized" and args.fp8_recipe == "mxfp8"
-    )
-    include_pattern = getattr(args, "inference_mxfp8_include_parameters", None)
-    exclude_pattern = getattr(args, "inference_mxfp8_exclude_parameters", None)
-
     # Load checkpoint.
     assert args.load is not None
     args.exit_on_missing_checkpoint = True
@@ -115,15 +109,9 @@ def get_model_for_inference() -> MegatronModule:
     # Eval mode.
     model.eval()
 
-    if use_mxfp8_inference:
+    if args.transformer_impl == "inference_optimized" and args.fp8_recipe == "mxfp8":
         quant_backend = resolve_mxfp8_backend(args.inference_grouped_gemm_backend)
-        unwrapped_model = unwrap_model(model)
-        quantize_model_to_mxfp8(
-            unwrapped_model,
-            backend=quant_backend,
-            include_pattern=include_pattern,
-            exclude_pattern=exclude_pattern,
-        )
+        quantize_model_to_mxfp8(unwrap_model(model), backend=quant_backend)
     return model
 
 

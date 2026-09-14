@@ -314,21 +314,13 @@ def _setup_mxfp8_transform_on_plan(plan, target_model) -> None:
     lm = target_model[0] if isinstance(target_model, (list, tuple)) else target_model
     core = unwrap_model(lm)
     decoder = core.decoder if hasattr(core, 'decoder') else core
-    include_pattern = getattr(lm.config, "inference_mxfp8_include_parameters", None)
-    exclude_pattern = getattr(lm.config, "inference_mxfp8_exclude_parameters", None)
 
     # 1. Quantize selected decoder weights -> persistent MXFP8Tensor buffers.
     # Routed FlashInfer MoE weights are derived from MCore's canonical Triton/cublas
     # representation. The reshard transform updates those canonical buffers, then
     # refresh_flashinfer_mxfp8_weights refreshes the derived buffers in place.
     backend = resolve_mxfp8_backend(lm.config.inference_grouped_gemm_backend)
-    persistent_buffers = quantize_params_to_mxfp8(
-        decoder,
-        backend=backend,
-        include_pattern=include_pattern,
-        exclude_pattern=exclude_pattern,
-        _filter_prefix="decoder.",
-    )
+    persistent_buffers = quantize_params_to_mxfp8(decoder, backend=backend)
 
     # 2. Derive the transform set from the buffers that were actually quantized.
     convertible = {f"decoder.{name}" for name in persistent_buffers}

@@ -153,24 +153,22 @@ workload rather than generalizing from any single comparison.
 > bf16 bindings: `uv pip install -e .[batch_invariant]`. Context parallelism and
 > attention dropout are not supported in either case.
 
-> **Selective MXFP8 parameter storage.** Set
-> `inference_mxfp8_include_parameters` and/or
-> `inference_mxfp8_exclude_parameters` on `TransformerConfig` to apply regular
-> expressions to fully qualified parameter names. Inclusion defaults to every
-> parameter and exclusion takes precedence. Parameters outside the resulting
-> selection are materialized by the Core GPT/Hybrid model constructors before
-> they return, so every checkpoint or refit integration loads those values
-> directly into BF16 storage. Within one MoE layer, every local expert's FC1 and
-> FC2 weight must use the same precision; select both projections and all local
-> experts together. The `flashinfer`, `torch`, and `vllm` grouped-GEMM backends
-> support this layer-wise mixture. vLLM uses its fused kernel for BF16 expert
-> layers and MCore's scaled grouped GEMM for MXFP8 expert layers.
+> **Selective MXFP8 parameter storage.** Use the same Transformer Engine per-module
+> precision recipe for training and inference through `TransformerConfig.quant_recipe`
+> (or `--te-precision-config-file`). The recipe selects storage before TE initializes
+> each module: BF16 modules allocate ordinary BF16 parameters and load checkpoint
+> values directly, without an intermediate MXFP8 conversion or a checkpoint callback.
+> With global `fp8_param=True` and `fp8_recipe="mxfp8"`, an MXFP8 recipe that omits
+> `fp8_param` inherits the global policy, including first/last BF16 layers.
+> For routed-expert-only quantization, match `*mlp.experts.linear_fc1` and
+> `*mlp.experts.linear_fc2` to MXFP8, with an MTP BF16 rule first and a catch-all
+> BF16 rule last. See
+> [TE precision recipes](../megatron/core/extensions/TransformerEngineMixedPrecision.md).
 >
-> Transformer Engine's per-module precision recipes can select storage during
-> model construction too. An MXFP8 execution recipe that omits `fp8_param`
-> automatically follows a matching global MXFP8 parameter policy, including its
-> first/last-layer BF16 boundary; a catch-all BF16 recipe keeps its own model-init
-> override. See `megatron/core/extensions/TransformerEngineMixedPrecision.md`.
+> Within one MoE layer, every local expert's FC1 and FC2 weight must use the same
+> precision. The `flashinfer`, `torch`, and `vllm` grouped-GEMM backends support
+> mixtures of BF16 and MXFP8 layers. vLLM uses its fused kernel for BF16 expert
+> layers and MCore's scaled grouped GEMM for MXFP8 expert layers.
 
 Many of these are toggled through `InferenceConfig`. Refer to the
 [Engine configuration](#engine-configuration).
@@ -467,8 +465,7 @@ than `InferenceConfig`, because they must be set when you build the model:
 `batch_invariant_mode` (and `batch_invariant_backend` /
 `batch_invariant_collective`), `inference_moe_token_dispatcher_type` (`nvls` by
 default, or `nccl`), `inference_grouped_gemm_backend` (`vllm` by default, or
-`torch` / `flashinfer`), `inference_mxfp8_include_parameters`,
-`inference_mxfp8_exclude_parameters`, `moe_enable_routing_replay`, and
+`torch` / `flashinfer`), `quant_recipe`, `moe_enable_routing_replay`, and
 `window_size` for sliding-window attention.
 
 ### Reading Results

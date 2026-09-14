@@ -1039,14 +1039,11 @@ def _make_te_mxfp8_expert_linear(quantizer, out_features, in_features):
     not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 10,
     reason="MXFP8 parameter storage requires Blackwell",
 )
-def test_model_conversion_applies_parameter_precision_filter():
+def test_model_conversion_preserves_bf16_parameters():
     import transformer_engine_torch as tex
     from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Quantizer
 
-    from megatron.core.inference.quantization.utils import (
-        materialize_unselected_mxfp8_parameters_as_bf16,
-        quantize_model_to_mxfp8,
-    )
+    from megatron.core.inference.quantization.utils import quantize_model_to_mxfp8
 
     quantizer = MXFP8Quantizer(tex.DType.kFloat8E4M3, rowwise=True, columnwise=False)
     model = torch.nn.Module()
@@ -1056,18 +1053,14 @@ def test_model_conversion_applies_parameter_precision_filter():
     model.mlp.experts.num_local_experts = 1
     model.mlp.experts.linear_fc1 = _make_te_mxfp8_expert_linear(quantizer, 64, 128)
     model.mlp.experts.linear_fc2 = _make_te_mxfp8_expert_linear(quantizer, 128, 64)
-    model.attention.weight = torch.nn.Parameter(
-        quantizer(model.attention.weight.data), requires_grad=False
-    )
-
-    include_pattern = r"(^|\.)mlp\.experts\.linear_fc[12]\."
-    materialize_unselected_mxfp8_parameters_as_bf16(model, include_pattern=include_pattern)
+    original_attention = model.attention.weight
     checkpoint_attention = torch.randn_like(model.attention.weight)
     with torch.no_grad():
         model.attention.weight.copy_(checkpoint_attention)
 
-    quantize_model_to_mxfp8(model, backend="triton", include_pattern=include_pattern)
+    quantize_model_to_mxfp8(model, backend="triton")
 
+    assert model.attention.weight is original_attention
     assert model.attention.weight.dtype == torch.bfloat16
     assert torch.equal(model.attention.weight, checkpoint_attention)
     assert isinstance(model.mlp.experts.linear_fc1.weight0, MXFP8Tensor)
@@ -1079,7 +1072,7 @@ def test_model_conversion_applies_parameter_precision_filter():
     not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 10,
     reason="MXFP8 parameter storage requires Blackwell",
 )
-def test_model_conversion_rejects_partial_expert_precision_filter():
+def test_model_conversion_rejects_mixed_expert_precision():
     import transformer_engine_torch as tex
     from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Quantizer
 
@@ -1089,11 +1082,14 @@ def test_model_conversion_rejects_partial_expert_precision_filter():
     model = torch.nn.Module()
     model.num_local_experts = 1
     model.linear_fc1 = _make_te_mxfp8_expert_linear(quantizer, 64, 128)
-    model.linear_fc2 = _make_te_mxfp8_expert_linear(quantizer, 128, 64)
+    model.linear_fc2 = torch.nn.Module()
+    model.linear_fc2.weight0 = torch.nn.Parameter(
+        torch.randn(128, 64, device="cuda", dtype=torch.bfloat16), requires_grad=False
+    )
     original_weights = (model.linear_fc1.weight0, model.linear_fc2.weight0)
 
     with pytest.raises(ValueError, match="select both expert projections and all local experts"):
-        quantize_model_to_mxfp8(model, backend="triton", include_pattern=r"(^|\.)linear_fc1\.")
+        quantize_model_to_mxfp8(model, backend="triton")
 
     assert model.linear_fc1.weight0 is original_weights[0]
     assert model.linear_fc2.weight0 is original_weights[1]

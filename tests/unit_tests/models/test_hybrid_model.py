@@ -222,25 +222,19 @@ class TestHybridModel:
             num_attention_heads=4,
             use_cpu_initialization=True,
         )
-        with patch(
-            'megatron.core.models.hybrid.hybrid_model.apply_mxfp8_parameter_filter'
-        ) as mock_mxfp8_filter:
-            self.model = HybridModel(
-                config=model_config,
-                hybrid_stack_spec=hybrid_stack_spec,
-                vocab_size=100,
-                max_sequence_length=4,
-                hybrid_layer_pattern="M*-",  # 1 Mamba, 1 attention, 1 MLP
-            )
-        self.mock_mxfp8_filter = mock_mxfp8_filter
+        self.model = HybridModel(
+            config=model_config,
+            hybrid_stack_spec=hybrid_stack_spec,
+            vocab_size=100,
+            max_sequence_length=4,
+            hybrid_layer_pattern="M*-",  # 1 Mamba, 1 attention, 1 MLP
+        )
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
     def test_constructor(self):
         assert isinstance(self.model, HybridModel)
-
-        self.mock_mxfp8_filter.assert_called_once_with(self.model, self.model.config)
 
         assert self.model.max_sequence_length == 4
 

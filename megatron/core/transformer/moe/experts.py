@@ -1246,7 +1246,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
             raise TypeError(
                 "FC1 and FC2 expert weights must use one precision within an MoE layer; "
                 f"found a mixture of {format_name} and BF16 weights. Adjust the selective "
-                "MXFP8 parameter filters to select both expert projections."
+                "TE precision recipe to select both expert projections."
             )
         return all(flags)
 

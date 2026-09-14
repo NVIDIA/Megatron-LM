@@ -2,7 +2,6 @@
 
 import logging
 import math
-import re
 import warnings
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -1326,22 +1325,6 @@ class TransformerConfig(ModelParallelConfig):
       grouped-GEMM path, allowing per-layer mixed BF16/MXFP8 policies.
     """
 
-    inference_mxfp8_include_parameters: str | None = None
-    """Regex selecting parameters to retain in MXFP8 for inference.
-
-    The regex is matched with ``re.search`` against fully qualified parameter names.
-    When unset, all MXFP8 parameters are included. Parameters not selected by this
-    regex are materialized in BF16 during Core model construction, before checkpoint
-    loading or refit setup.
-    """
-
-    inference_mxfp8_exclude_parameters: str | None = None
-    """Regex selecting parameters to materialize in BF16 for MXFP8 inference.
-
-    Exclusion is applied after ``inference_mxfp8_include_parameters`` and therefore
-    takes precedence when both regexes match.
-    """
-
     inference_moe_disable_fused_quant_kernels: bool = False
     """When False (default), use fused kernels that combine permute/activation with
     MXFP8 quantization + swizzle into a single kernel launch. Only applies when
@@ -1818,33 +1801,6 @@ class TransformerConfig(ModelParallelConfig):
 
         if self.expert_model_parallel_size > 1 and self.num_moe_experts is None:
             raise ValueError("num_moe_experts must be non None to use expert-parallel.")
-
-        mxfp8_parameter_filters = (
-            self.inference_mxfp8_include_parameters,
-            self.inference_mxfp8_exclude_parameters,
-        )
-        if any(pattern is not None for pattern in mxfp8_parameter_filters):
-            if not (
-                self.transformer_impl == "inference_optimized"
-                and self.fp8
-                and self.fp8_recipe == Fp8Recipe.mxfp8
-                and self.fp8_param
-            ):
-                raise ValueError(
-                    "inference_mxfp8_include_parameters and "
-                    "inference_mxfp8_exclude_parameters require "
-                    "transformer_impl='inference_optimized', FP8 enabled with "
-                    "fp8_recipe='mxfp8', and fp8_param=True."
-                )
-            for pattern in mxfp8_parameter_filters:
-                if pattern is None:
-                    continue
-                try:
-                    re.compile(pattern)
-                except re.error as error:
-                    raise ValueError(
-                        f"Invalid MXFP8 parameter regex {pattern!r}: {error}"
-                    ) from error
 
         if self.transformer_impl == "inference_optimized" and self.num_moe_experts is not None:
             self.inference_grouped_gemm_backend = InferenceGroupedGemmBackend.from_config(

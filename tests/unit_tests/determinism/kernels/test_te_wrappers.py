@@ -200,7 +200,11 @@ class TestTEWrappers:
                     "mxfp8": {
                         "transformer_engine_config_type": "TEQuantizationParams",
                         "training_recipe": training_recipe,
-                    }
+                    },
+                    "bf16": {
+                        "transformer_engine_config_type": "TEQuantizationParams",
+                        "training_recipe": {},
+                    },
                 },
                 "matchers": {
                     "routed_expert_fc1": {
@@ -208,7 +212,13 @@ class TestTEWrappers:
                         "type": "glob",
                         "pattern": "*mlp.experts.linear_fc1",
                         "enabled": True,
-                    }
+                    },
+                    "all_other_modules": {
+                        "config": "bf16",
+                        "type": "glob",
+                        "pattern": "*",
+                        "enabled": True,
+                    },
                 },
             }
         )
@@ -232,8 +242,8 @@ class TestTEWrappers:
             num_layers_at_end_in_bf16=1,
         )
 
-        def build(layer_number):
-            name = f"decoder.layers.{layer_number}.mlp.experts.linear_fc1"
+        def build(layer_number, module_path="mlp.experts.linear_fc1"):
+            name = f"decoder.layers.{layer_number}.{module_path}"
             with get_fp8_context(config, layer_number, is_init=True):
                 return TEGroupedLinear(
                     2,
@@ -252,6 +262,19 @@ class TestTEWrappers:
         middle = build(1)
         assert not is_mxfp8tensor(edge.weight0)
         assert is_mxfp8tensor(middle.weight0) is middle_uses_mxfp8
+
+        # The catch-all recipe allocates BF16 directly even inside an MXFP8 layer.
+        # Checkpoint loading must preserve the parameter object and its exact BF16 values.
+        other = build(1, "mlp.shared_experts.linear_fc1")
+        for module in (edge, build(2), other):
+            parameter = module.weight0
+            assert not is_mxfp8tensor(parameter)
+            checkpoint = module.state_dict()
+            expected = torch.randn_like(parameter)
+            checkpoint["weight0"] = expected
+            module.load_state_dict(checkpoint)
+            assert module.weight0 is parameter
+            assert torch.equal(module.weight0, expected)
 
     @pytest.mark.parametrize("backend", ["fused", "flash"])
     def test_te_dot_product_attention_replays(self, backend, monkeypatch):
