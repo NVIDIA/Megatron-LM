@@ -1,12 +1,27 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Optional, Tuple
 
 import torch
 from torch import Tensor
 
 from .gpu_view import ContextGPUView
+
+
+class MTPForwardMode(Enum):
+    """Which MTP forward, if any, currently owns the attention metadata.
+
+    The two non-NONE modes differ in query shape, which is what decides the attention kernel:
+    a draft depth contributes exactly one token per active request (uniform, so the decode
+    kernel's `q.reshape(num_requests, tokens_per_request, ...)` is valid), while the commit
+    pass is roll-by-one over each request's committed span (ragged, so it must go varlen).
+    """
+
+    NONE = "none"
+    DRAFT = "draft"
+    COMMIT = "commit"
 
 
 @dataclass
@@ -33,7 +48,7 @@ class MTPMetadata:
 
     Args:
         enabled (bool): Whether MTP KV caching is active for this context. When False the
-            object is inert: no buffers are allocated and `forward_active` stays False.
+            object is inert: no buffers are allocated and `forward_mode` stays NONE.
         max_requests (int): Worst-case active request count (`max_bs`).
         max_kv_block_count (int): Block-table width, in blocks per request.
         block_size_tokens (int): KV block size, used to split a write position into
@@ -55,17 +70,14 @@ class MTPMetadata:
     hidden_dtype: torch.dtype
 
     # ---- Draft-loop state (valid between begin_decode() and end_decode()). ----
-    # True while an MTP forward owns the attention metadata; the KV append/read paths key off
-    # this to route themselves to the MTP layer slot instead of a main attention layer.
-    forward_active: bool = False
+    # Which MTP forward owns the attention metadata right now. The KV append/read paths key off
+    # this being non-NONE to route to the MTP layer slot instead of a main attention layer, and
+    # `is_decode_only()` keys off COMMIT to force the varlen kernel.
+    forward_mode: MTPForwardMode = MTPForwardMode.NONE
     # Whether this draft loop replays captured CUDA graphs (True) or runs eager (False).
     graphed: bool = False
     active_request_count: int = 0
     padded_count: int = 0
-    # True while the varlen commit pass owns the forward. The draft-depth forwards are
-    # decode-shaped (one token per request) and leave this False; the commit pass is ragged, so
-    # `is_decode_only()` consults it to keep the attention off the uniform-reshape decode kernel.
-    varlen_forward_active: bool = False
     # Block table as of just before `_rewind_kv_cache` released the draft blocks. None until
     # the first snapshot of the run.
     prerewind_block_table: Optional[Tensor] = field(default=None, repr=False)
@@ -101,6 +113,16 @@ class MTPMetadata:
     # ---- Views into the buffers, refreshed once per draft loop by begin_decode(). ----
     active_offsets: Optional[Tensor] = field(default=None, repr=False)
     active_block_table: Optional[Tensor] = field(default=None, repr=False)
+
+    @property
+    def forward_active(self) -> bool:
+        """Whether any MTP forward currently owns the attention metadata."""
+        return self.forward_mode is not MTPForwardMode.NONE
+
+    @property
+    def is_varlen_forward(self) -> bool:
+        """Whether the current MTP forward has ragged per-request query lengths."""
+        return self.forward_mode is MTPForwardMode.COMMIT
 
     def allocate(self, device: torch.device, block_table_template: Tensor) -> None:
         """Reserve the persistent buffers. No-op when MTP KV caching is disabled.
@@ -144,8 +166,7 @@ class MTPMetadata:
         self.prerewind_block_table = None
         self.active_offsets = None
         self.active_block_table = None
-        self.forward_active = False
-        self.varlen_forward_active = False
+        self.forward_mode = MTPForwardMode.NONE
         self.chunk_boundary_hidden = None
         self.invalidate_chunk_boundary()
 
@@ -272,7 +293,7 @@ class MTPMetadata:
         self.active_offsets = self.offsets[:active_request_count]
         self.active_block_table = self.block_table[:active_request_count]
         self.graphed = graphed
-        self.forward_active = True
+        self.forward_mode = MTPForwardMode.DRAFT
 
     def advance_decode_step(self) -> None:
         """Advance every active request's MTP write position by one, in place."""
@@ -280,8 +301,7 @@ class MTPMetadata:
 
     def end_forward(self) -> None:
         """Leave MTP-forward mode. No persistent length state to write back."""
-        self.forward_active = False
-        self.varlen_forward_active = False
+        self.forward_mode = MTPForwardMode.NONE
 
     # ------------------------------------------------------------------
     # Per-forward metadata staging.

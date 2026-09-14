@@ -27,6 +27,7 @@ from torch import Tensor
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
 
 from .attention_context.mha_metadata import MHAMetadata
+from .mtp_metadata import MTPForwardMode
 
 if TYPE_CHECKING:
     from megatron.core.inference.config import MambaInferenceStateConfig
@@ -318,9 +319,8 @@ class MTPContextMixin:
             token_count=total,
             padded_token_count=padded_total,
         )
-        self.mtp_metadata.forward_active = True
-        # Per-request query lengths differ here, so the attention must take the varlen path. On a
-        # pure-decode step `num_prefill_requests == 0` would otherwise make `is_decode_only()`
-        # True and route to the decode kernel, whose uniform
+        # COMMIT rather than DRAFT: per-request query lengths differ here, so the attention must
+        # take the varlen path. On a pure-decode step `num_prefill_requests == 0` would otherwise
+        # make `is_decode_only()` True and route to the decode kernel, whose uniform
         # `q.reshape(num_requests, tokens_per_request, ...)` cannot express ragged input.
-        self.mtp_metadata.varlen_forward_active = True
+        self.mtp_metadata.forward_mode = MTPForwardMode.COMMIT

@@ -731,7 +731,7 @@ class TestMtpPrefillBookkeeping:
         )
 
         assert context.num_prefill_requests == 0  # untouched
-        assert context.mtp_metadata.varlen_forward_active is True
+        assert context.mtp_metadata.is_varlen_forward is True
         assert context.is_decode_only() is False
         assert context._using_cuda_graph_this_step is False
         assert context.mtp_metadata.forward_active is True
@@ -750,12 +750,12 @@ class TestMtpPrefillBookkeeping:
         context._mtp_setup_prefill_step(
             append_counts=torch.tensor([2], device=device), block_table_prefill=block_table
         )
-        assert context.mtp_metadata.varlen_forward_active is True
+        assert context.mtp_metadata.is_varlen_forward is True
         assert context.is_decode_only() is False
 
         context.mtp_metadata.end_forward()
 
-        assert context.mtp_metadata.varlen_forward_active is False
+        assert context.mtp_metadata.is_varlen_forward is False
         assert context.mtp_metadata.forward_active is False
         # With the flag cleared, the step's own counts decide again.
         assert context.num_prefill_requests == 0

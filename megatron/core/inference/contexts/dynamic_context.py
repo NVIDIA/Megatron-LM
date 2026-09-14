@@ -1780,7 +1780,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         """
         # The MTP commit pass is a varlen forward even on a pure-decode step, so it says so
         # rather than being inferred from the request counts.
-        if self.mtp_metadata.varlen_forward_active:
+        if self.mtp_metadata.is_varlen_forward:
             return False
         if self._using_cuda_graph_this_step:
             return self.padded_batch_dimensions.prefill_req_count == 0
