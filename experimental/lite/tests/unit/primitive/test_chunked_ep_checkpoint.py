@@ -12,6 +12,30 @@ import torch
 import megatron.core  # noqa: F401
 
 
+@pytest.mark.parametrize("shape", [(3, 2), (3, 1, 2), (3, 2, 2), (0, 1, 2)])
+def test_saved_bridge_preserves_input_gradient_shape(transformer_engine_import_stub, shape):
+    transformer_engine_import_stub()
+    from megatron.lite.primitive.modules.moe_ep_chunk_overlap import EPChunkForwardOp
+
+    router, experts = torch.nn.Identity(), torch.nn.Identity()
+    backward = SimpleNamespace(
+        router=router, experts=experts, backward=lambda context, grad: (2 * grad, [], [])
+    )
+    workspace = SimpleNamespace(key=SimpleNamespace(shape_profile=SimpleNamespace(chunk_count=2)))
+    forward = EPChunkForwardOp(
+        router=router, experts=experts, workspace=workspace, backward_op=backward
+    )
+    forward._forward_saved_context_async = lambda x, ranges, shape, dtype: (
+        (2 * x).view(shape),
+        None,
+    )
+    x = torch.ones(shape, requires_grad=True)
+    output = forward(x)
+    assert output.shape == x.shape
+    output.sum().backward()
+    torch.testing.assert_close(x.grad, torch.full_like(x, 2))
+
+
 @pytest.mark.parametrize("full_recompute", [False, True])
 @pytest.mark.parametrize("zero_out_wgrad", [False, True])
 def test_checkpoint_publishes_main_grad_to_outer_ddp_hook(

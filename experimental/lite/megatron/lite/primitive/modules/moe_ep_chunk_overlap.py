@@ -1709,6 +1709,7 @@ class _SavedContextEPChunkFunction(torch.autograd.Function):
         *params: torch.Tensor,
     ) -> torch.Tensor:
         ctx.backward_op = forward_op.backward_op
+        ctx.input_shape = x_2d.shape
         ctx.params = params
         with torch.enable_grad(), forward_op._routing_context(routing_input):
             x_graph = x_2d.detach().requires_grad_(True)
@@ -1730,7 +1731,7 @@ class _SavedContextEPChunkFunction(torch.autograd.Function):
                 ctx.saved_forward_context, grad_output
             )
         return (
-            grad_x,
+            grad_x.reshape(ctx.input_shape),
             None,
             None,
             None,
