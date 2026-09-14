@@ -3,7 +3,7 @@
 
 
 MAJOR = 0
-MINOR = 19
+MINOR = 20
 PATCH = 0
 PRE_RELEASE = ''
 
@@ -15,7 +15,6 @@ __version__ = '.'.join(map(str, VERSION[:3])) + ''.join(VERSION[3:])
 
 import os as _os  # noqa: I001
 import subprocess as _subprocess
-
 
 if not int(_os.getenv('NO_VCS_VERSION', '0')):
     try:

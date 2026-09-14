@@ -19,9 +19,9 @@ from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_submodules,
 )
+from megatron.core.tensor_parallel import get_cuda_rng_tracker
 from megatron.core.transformer.moe.fused_a2a import HAVE_DEEP_EP, HAVE_HYBRIDEP
 from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
-from megatron.core.transformer.moe.moe_utils import RandomSTE
 from megatron.core.transformer.spec_utils import get_submodules
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import nvtx_range_pop, nvtx_range_push
@@ -206,9 +206,14 @@ def _benchmark_moe_layer(layer: MoELayer, case: MoEPerformanceCase):
         generator=generator,
     )
     input_tensor.requires_grad_(True)
+    initial_rng_states = get_cuda_rng_tracker().get_states()
     for iteration in range(WARMUP_ITERS + MEASURE_ITERS):
-        if RandomSTE.generator is not None:
-            RandomSTE.generator.manual_seed(RandomSTE.generator.initial_seed())
+        get_cuda_rng_tracker().set_states(
+            {
+                name: state.clone() if isinstance(state, torch.Tensor) else state.clone_state()
+                for name, state in initial_rng_states.items()
+            }
+        )
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             torch.distributed.barrier()
         nvtx_iter_msg = f"({case.name}) iteration {iteration}"

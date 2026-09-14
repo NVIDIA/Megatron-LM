@@ -359,7 +359,10 @@ def print_unique_prompts_and_outputs(results: List["DynamicInferenceRequest"]) -
         unique_prompt_map[req.prompt].append(idx)
 
     for unique_idx, (prompt_text, request_idxs) in enumerate(unique_prompt_map.items()):
-        prompt_len = len(results[request_idxs[0]].prompt_tokens)
+        request = results[request_idxs[0]]
+        prompt_len = request.prompt_length
+        if prompt_len is None and request.prompt_tokens is not None:
+            prompt_len = len(request.prompt_tokens)
         print(
             f"\n{unique_idx+1}/{len(unique_prompt_map)}"
             f"[n {len(request_idxs)}, l {prompt_len}] {escape_str(prompt_text)}"
