@@ -8,7 +8,8 @@ logger = logging.getLogger(__name__)
 def has_gigatoken_support() -> bool:
     """Check if gigatoken library is installed."""
     try:
-        import gigatoken  # noqa: F401
+        import gigatoken
+
         return True
     except ModuleNotFoundError:
         return False
