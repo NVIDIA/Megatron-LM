@@ -620,7 +620,7 @@ class Fp8ParameterGroup(FsdpParameterGroup):
         main_weight_placements: tuple[Placement, ...],
         use_symmetric_memory: bool,
     ) -> None:
-        del main_weight_dtype, main_weight_placements, use_symmetric_memory
+        del main_weight_dtype, use_symmetric_memory
         # The bf16 model-weight storage is replaced by the two uint8 payload
         # DBuffers; the unsharded parameters are the module's own MXFP8Tensor
         # objects whose raw payloads are rebound from the gathered buffers.
@@ -629,7 +629,18 @@ class Fp8ParameterGroup(FsdpParameterGroup):
         device = self.main_weight.device
         self._rowwise_buffer = DBuffer(
             mesh=self.mesh,
-            placements=model_weight_placements,
+            # The fp8 payloads are quantized FROM the main weights, so they must be
+            # sharded exactly like them. That is NOT the parameter placement in
+            # general: _DATA_PARALLEL_PLACEMENTS maps ZeRO-1 to
+            # (parameter=Replicate, gradient=Partial, optimizer=Shard) and ZeRO-2 to
+            # (Replicate, Shard, Shard), while fully_shard.py derives
+            # model_weight_placements from placements.parameter but
+            # main_weight_placements from placements.optimizer. Using the parameter
+            # placement here leaves the payload replicated (full size) while the main
+            # weight is a shard, so the local shard->payload copy fails with a 2x size
+            # mismatch. Under ZeRO-3 the two placements coincide, which is why that
+            # configuration never exposed this.
+            placements=main_weight_placements,
             tensor_shapes=tensor_shapes,
             dtype=torch.uint8,
             device=device,
@@ -637,7 +648,7 @@ class Fp8ParameterGroup(FsdpParameterGroup):
         )
         self._colwise_buffer = DBuffer(
             mesh=self.mesh,
-            placements=model_weight_placements,
+            placements=main_weight_placements,
             tensor_shapes=tensor_shapes,
             dtype=torch.uint8,
             device=device,
@@ -733,16 +744,23 @@ class Fp8ParameterGroup(FsdpParameterGroup):
                 )
             )
 
+        # The reduce group is the axis the main weights are sharded over, which is the
+        # axis the amax must be reduced across (each rank owns a disjoint shard, so no
+        # rank sees the whole tensor's amax on its own). It is read from the payload
+        # buffers, which now follow the main-weight placement. When nothing is sharded
+        # (fully replicated main weights) fall back to this FSDP mesh's own axis: every
+        # rank then holds an identical copy, so the MAX is idempotent. The default
+        # process group must NOT be used -- it spans unrelated PP/TP ranks holding
+        # different parameters and would silently corrupt the scales.
         gather_axis = changed_mesh_axis(
-            self._model_weight_placements, tuple(Replicate() for _ in range(self.mesh.ndim))
+            tuple(self._rowwise_buffer.placements), tuple(Replicate() for _ in range(self.mesh.ndim))
         )
-        if gather_axis is None:
-            raise RuntimeError("FSDP fp8 parameter quantize requires a changed placement axis.")
+        reduce_axis = 0 if gather_axis is None else gather_axis
         cast_master_weights_to_fp8(
             model_weights=model_weights,
             master_weights=master_weights,
             start_offsets=start_offsets,
-            group=self.mesh.get_group(gather_axis),
+            group=self.mesh.get_group(reduce_axis),
             fsdp_shard_model_weights=fsdp_shard_model_weights,
         )
 
@@ -781,10 +799,15 @@ class Fp8ParameterGroup(FsdpParameterGroup):
         ):
             with self._symmetric_memory_context():
                 target.reallocate_storage()
+            # With all-Replicate placements (expert parameters at ZeRO-1) the source buffer
+            # already holds the whole tensor on this rank, so there is nothing to gather:
+            # copy locally into the unsharded buffer that was just reallocated. Both buffers
+            # share this mesh and the same tensor_shapes, so their local buffers match.
             gather_axis = changed_mesh_axis(source.placements, target.placements)
             if gather_axis is None:
-                raise RuntimeError("FSDP fp8 parameter unshard requires a changed placement axis.")
-            source.redistribute(target.placements, out=target)
+                target.local_buffer.copy_(source.local_buffer)
+            else:
+                source.redistribute(target.placements, out=target)
         for index, fsdp_parameter in enumerate(self.fsdp_parameters):
             tensor = fsdp_parameter.unsharded
             set_rowwise_payload(tensor, self._unsharded_rowwise.get_local_tensor(index))
