@@ -3223,11 +3223,16 @@ class DynamicInferenceContext(BaseInferenceContext):
                 num_mamba_matched <= num_matched
             ), f"Mamba match ({num_mamba_matched}) > KV match ({num_matched})"
             if prompt_logprob_key is not None and block_aligned:
-                # Recurrent state is stored only at block boundaries. Restore
-                # the preceding boundary and recompute the final sidecar-backed
-                # block so the first uncached prompt score has the right state.
-                executable_blocks = min(num_mamba_matched, num_logprob_matched)
-                prefix_skip_tokens = max(0, executable_blocks - 1) * self.block_size_tokens
+                # Recurrent state is stored only at selected block boundaries.
+                # The final sidecar-backed block must be replayed to produce its
+                # boundary score, so search below that block for the farthest
+                # boundary that actually has a saved state. Saved boundaries can
+                # be sparse, so arithmetic backoff may select a missing state.
+                max_restore_blocks = max(0, min(num_mamba_matched, num_logprob_matched - 1))
+                restore_blocks = self._find_mamba_match_count(
+                    req=req, start_block=0, end_block=max_restore_blocks
+                )
+                prefix_skip_tokens = restore_blocks * self.block_size_tokens
             elif num_mamba_matched > 0 and block_aligned:
                 raw_skip = num_mamba_matched * self.block_size_tokens
                 if raw_skip >= prefill_chunk_length:

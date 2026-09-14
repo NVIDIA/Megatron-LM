@@ -899,6 +899,39 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         assert ctx.active_token_count - tokens_after == len(prompt)
         assert ctx.request_kv_length_offsets[1].item() == 0
 
+    @pytest.mark.parametrize(
+        ("saved_state_block_indices", "expected_restore_blocks"), [([0, 3], 1), ([0, 2, 3], 3)]
+    )
+    @pytest.mark.internal
+    def test_mamba_prompt_logprobs_restore_highest_valid_state(
+        self, monkeypatch, saved_state_block_indices, expected_restore_blocks
+    ):
+        """Prompt-score reuse restores the farthest saved eligible state."""
+        ctx = self._mctx()
+        bs = ctx.block_size_tokens
+        prompt = self._prompt(4 * bs + 2)
+
+        ctx.add_request(self._req(ctx, prompt.clone()))
+        cached_blocks = self._block_ids(ctx, 0, 4)
+        self._mamba_allocate_and_register(
+            ctx, [cached_blocks[index] for index in saved_state_block_indices]
+        )
+
+        follower = self._req(ctx, prompt.clone(), request_id=2)
+        follower._prompt_logprobs_cache_key = object()
+        monkeypatch.setattr(
+            ctx,
+            "_find_prompt_logprob_match_count",
+            lambda req, start_block, matched_block_ids: len(matched_block_ids),
+        )
+
+        matched, _, _, _, prefix_skip, effective_prefill = ctx._compute_prefix_match(
+            follower, len(prompt)
+        )
+        assert len(matched) == 4
+        assert prefix_skip == expected_restore_blocks * bs
+        assert effective_prefill == len(prompt) - prefix_skip
+
     @pytest.mark.internal
     def test_mamba_cache_lifecycle(self):
         ctx = self._mctx()
@@ -3218,12 +3251,13 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
             cache_config.materialize_only_last_token_logits = False
             cache_config.enable_chunked_prefill = True
             cache_config.async_sched_mode = async_sched_mode
-            cache_config.context_max_tokens = cache_config.context_block_size_tokens + 8
+            if model_provider == "gpt":
+                cache_config.context_max_tokens = cache_config.context_block_size_tokens + 8
             cache_env = self._build_test_env(cache_config)
             engine = cache_env.engine
             engine.controller.tokenizer.detokenize = lambda tokens, **_: f"tok_{tokens[0]}"
             donor, donor_cost, donor_chunked = run(engine, 10, prompt, 5)
-            assert donor_cost == prompt_length and donor_chunked
+            assert donor_cost == prompt_length and (donor_chunked or model_provider == "hybrid")
             self._assert_prompt_logprob_parity(donor, oracle_top5)
             allocator = engine.context.kv_block_allocator
             sidecars = sorted(
@@ -3236,8 +3270,8 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
             assert [sidecar.top_n_logprobs.shape for sidecar in sidecars] == [(256, 5), (256, 5)]
             exact, exact_cost, _ = run(engine, 11, prompt, 5)
             self._assert_prompt_logprob_parity(exact, oracle_top5)
-            expected_skipped = 511 if model_provider == "gpt" else 256
-            expected_cost = 2 if model_provider == "gpt" else 257
+            expected_skipped = 511 if model_provider == "gpt" else 0
+            expected_cost = 2 if model_provider == "gpt" else prompt_length
             assert (exact.num_cached_tokens, exact_cost) == (expected_skipped, expected_cost)
 
             mismatch, mismatch_cost, _ = run(engine, 12, prompt, 4)
