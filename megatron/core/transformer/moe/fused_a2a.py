@@ -88,19 +88,13 @@ def get_buffer(group: torch.distributed.ProcessGroup, hidden_bytes: int):
 def get_elastic_buffer(
     group: torch.distributed.ProcessGroup, num_max_tokens_per_rank: int, hidden: int, num_topk: int
 ):
-    """Get a DeepEP v2 buffer using a token capacity shared by every rank.
-
-    ``num_max_tokens_per_rank`` may be a local bound. Reduce it across the group
-    before sizing the buffer, and use the returned buffer's capacity for dispatch.
-    """
+    """Get or create a DeepEP v2 elastic buffer for all-to-all communication."""
     global _elastic_buffer
 
-    # DeepEP requires the same capacity on every rank, including for uneven inputs.
-    # This collective also initializes the group's NCCL communicator before DeepEP
-    # reads _comm_ptr() in get_buffer_size_hint(), where a null pointer can segfault.
-    max_tokens = torch.tensor(num_max_tokens_per_rank, dtype=torch.int64, device="cuda")
-    torch.distributed.all_reduce(max_tokens, op=torch.distributed.ReduceOp.MAX, group=group)
-    num_max_tokens_per_rank = int(max_tokens.item())
+    if _elastic_buffer is None or _elastic_buffer.group != group:
+        # Initialize the NCCL communicator before DeepEP reads _comm_ptr() in
+        # get_buffer_size_hint(); a fresh group's pointer may still be null.
+        torch.distributed.all_reduce(torch.zeros(1, device="cuda"), group=group)
 
     num_bytes = ElasticBuffer.get_buffer_size_hint(
         group, num_max_tokens_per_rank=num_max_tokens_per_rank, hidden=hidden, num_topk=num_topk
