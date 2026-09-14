@@ -120,12 +120,44 @@ def get_standard_config_overrides(config: OptimizerConfig) -> Dict[ParamKey, Par
 
     if config.decoupled_lr is not None:
         decoupled_lr_config: ParamGroupOverride = {"max_lr": config.decoupled_lr}
-        decoupled_param_key = ParamKey(attr="is_embedding_or_output_parameter")
+        # Engram tables are embedding parameters but carry their own LR override; matching both
+        # here would make combine_param_group_overrides raise on a conflicting max_lr. Without
+        # Engram parameters this predicate is exactly the previous attribute match.
+        embedding_or_output_not_engram = ParamWithNamePredicate(
+            name="embedding_or_output_not_engram",
+            fn=lambda param, _: getattr(param, "is_embedding_or_output_parameter", False)
+            and not getattr(param, "is_engram_embedding", False),
+        )
+        decoupled_param_key = ParamKey(with_name_predicate=embedding_or_output_not_engram)
         if config.decoupled_min_lr is not None:
             decoupled_lr_config["min_lr"] = config.decoupled_min_lr
         config_overrides[decoupled_param_key] = decoupled_lr_config
 
     return config_overrides
+
+
+def get_engram_config_overrides(
+    config: OptimizerConfig, lr_multiplier: float = 5.0, weight_decay: float = 0.0
+) -> Dict[ParamKey, ParamGroupOverride]:
+    """Give EP-sharded Engram table weights their own LR schedule and weight decay.
+
+    The optimizer itself is not overridden: the tables are flagged
+    ``is_embedding_or_output_parameter``, so an emerging base optimizer such as Muon already
+    routes them to Adam through its own registered default_param_overrides.
+    """
+    if config.lr is None:
+        raise ValueError("Engram optimizer configuration requires a base maximum LR.")
+    if lr_multiplier <= 0:
+        raise ValueError("Engram embedding LR multiplier must be positive.")
+    if weight_decay < 0:
+        raise ValueError("Engram embedding weight decay must be nonnegative.")
+
+    override = ParamGroupOverride(
+        max_lr=config.lr * lr_multiplier, start_wd=weight_decay, end_wd=weight_decay, wd_mult=1.0
+    )
+    if config.min_lr is not None:
+        override["min_lr"] = config.min_lr * lr_multiplier
+    return {ParamKey(attr="is_engram_embedding"): override}
 
 
 def get_mup_config_overrides(

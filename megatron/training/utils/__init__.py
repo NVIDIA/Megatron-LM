@@ -11,6 +11,7 @@ from megatron.training.utils.common_utils import (
     get_device_arch_version,
     get_ltor_masks_and_position_ids,
     get_nvtx_range,
+    get_pipeline_prefetched_tokens,
     has_nvrx_checkpointing_async_support,
     has_nvrx_installed,
     is_first_or_last_pipeline_stage,
@@ -18,6 +19,7 @@ from megatron.training.utils.common_utils import (
     is_last_rank,
     is_rank0,
     logical_and_across_model_parallel_group,
+    prepare_tokens_for_pipeline,
     print_params_min_max_norm,
     print_rank_0,
     print_rank_last,
@@ -29,4 +31,4 @@ from megatron.training.utils.common_utils import (
     warn_rank_0,
 )
 from megatron.training.utils.log_utils import append_to_progress_log
-from megatron.training.utils.utils import start_memory_history_recording
+from megatron.training.utils.utils import memory_snapshot_path, start_memory_history_recording

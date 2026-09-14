@@ -1,5 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+from megatron.core.models.engram import EngramConfig, apply_engram_to_layer_spec
 from megatron.core.models.gpt import GPTModel
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
     get_transformer_block_with_experimental_attention_variant_spec,
@@ -53,6 +54,9 @@ def gpt_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_
         else:
             # Define the decoder layer spec
             transformer_layer_spec = _get_transformer_layer_spec(use_te, config)
+    engram_config = EngramConfig.from_args(args, config)
+    if engram_config is not None:
+        transformer_layer_spec = apply_engram_to_layer_spec(transformer_layer_spec, engram_config)
     mtp_block_spec = None
     if args.mtp_num_layers is not None:
         assert not (config.transformer_impl == "inference_optimized")

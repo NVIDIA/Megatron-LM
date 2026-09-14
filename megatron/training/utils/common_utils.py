@@ -1,14 +1,15 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """General utilities."""
+
 import json
 import os
 import sys
 import warnings
-from collections import defaultdict
+from collections import defaultdict, deque
 from contextlib import contextmanager
 from datetime import datetime
-from typing import Optional
+from typing import Any, Optional
 
 import torch
 
@@ -43,6 +44,7 @@ from megatron.core.utils import (
     get_batch_on_this_cp_rank,
     get_data_parallel_group_if_dtensor,
     get_pg_rank,
+    get_pg_size,
     to_local_if_dtensor,
     unwrap_model,
 )
@@ -528,6 +530,198 @@ def get_blend_and_blend_per_split(args):
         blend, blend_per_split = None, None
 
     return blend, blend_per_split
+
+
+def _pipeline_tokens_from_batch(
+    batch, micro_batch_size: int, sequence_length: int, device
+) -> torch.Tensor:
+    """Return one microbatch's tokens on ``device``, right-padded to the sequence capacity.
+
+    Packed (THD) rows may be shorter than the capacity; right-padding with zeros matches
+    ``pad_sequence_for_thd`` and the fixed pipeline activation shape.
+    """
+    if "tokens" not in batch:
+        raise RuntimeError("Engram data batches must contain token IDs.")
+    tokens = batch["tokens"].to(device=device, dtype=torch.int64, non_blocking=True)
+    if tokens.ndim != 2 or tokens.shape[0] != micro_batch_size or tokens.shape[1] > sequence_length:
+        raise ValueError(
+            f"Engram expected token shape [{micro_batch_size}, <= "
+            f"{sequence_length}], got {tuple(tokens.shape)}."
+        )
+    if tokens.shape[1] < sequence_length:
+        tokens = torch.nn.functional.pad(tokens, (0, sequence_length - tokens.shape[1]))
+    return tokens
+
+
+class PipelineTokenPrefetchIterator:
+    """Replay prefetched data while exposing PP-distributed tokens to ``get_batch``.
+
+    Only the first PP stage's TP source consumes its data iterator during prefetch. The
+    scheduler later receives those same batches from ``_prefetched_batches``; all other ranks
+    continue consuming their original iterator normally. The wrapper is scoped to one
+    forward/backward schedule and deliberately carries no model state.
+
+    When a single rank holds the whole schedule there is nothing to distribute, so
+    ``token_spec`` is set instead of ``pipeline_tokens`` and each microbatch's tokens are
+    derived on demand from the batch the scheduler just consumed.
+    """
+
+    def __init__(
+        self,
+        data_iterator,
+        prefetched_batches: list[Any],
+        pipeline_tokens: list[torch.Tensor],
+        token_spec: Optional[tuple] = None,
+    ) -> None:
+        self._data_iterator = data_iterator
+        self._prefetched_batches = deque(prefetched_batches)
+        self._pipeline_tokens = deque(pipeline_tokens)
+        self._token_spec = token_spec
+        self._last_batch = None
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self._prefetched_batches:
+            batch = self._prefetched_batches.popleft()
+        elif self._data_iterator is None:
+            raise StopIteration
+        else:
+            batch = next(self._data_iterator)
+        self._last_batch = batch
+        return batch
+
+    def pop_pipeline_tokens(self) -> torch.Tensor:
+        """Return the tokens prepared for the next scheduled microbatch.
+
+        Packed (THD) rows shorter than the sequence capacity are returned zero-padded to the
+        capacity, matching ``pad_sequence_for_thd``'s padding of the model-side tokens and the
+        fixed pipeline activation shape. Padding cannot leak into valid positions: the Engram
+        convolution is causal and the padded tail's hidden states are dummy sequence anyway.
+        """
+        if self._token_spec is not None:
+            # Consume the batch so a second call without an intervening microbatch raises
+            # instead of silently handing out the previous microbatch's tokens.
+            batch, self._last_batch = self._last_batch, None
+            if batch is None:
+                raise RuntimeError("Engram pipeline token prefetch queue is exhausted.")
+            return _pipeline_tokens_from_batch(batch, *self._token_spec)
+        if not self._pipeline_tokens:
+            raise RuntimeError("Engram pipeline token prefetch queue is exhausted.")
+        return self._pipeline_tokens.popleft()
+
+
+def prepare_tokens_for_pipeline(
+    data_iterator,
+    num_microbatches: int,
+    micro_batch_size: int,
+    sequence_length: int,
+    pp_group,
+    tp_group,
+) -> PipelineTokenPrefetchIterator:
+    """Distribute every Engram microbatch's tokens before pipeline scheduling starts.
+
+    A blocking PP collective inside ``forward_step`` deadlocks a non-interleaved pipeline:
+    stage zero enters the collective before sending its activation while the next stage waits
+    for that activation. This helper performs all token collectives before the schedule. On the
+    first PP stage, the TP source prefetches all microbatches and broadcasts one stacked token
+    tensor to its TP peers; each TP coordinate then broadcasts to the matching PP group. Data
+    availability is broadcast first so an exhausted iterator fails on every rank instead of
+    hanging the peers inside the token broadcast.
+    """
+    if isinstance(data_iterator, list):
+        raise RuntimeError("Engram pipeline token prefetch does not support VPP data iterators.")
+
+    padded_shape = (micro_batch_size, sequence_length)
+    pp_rank = get_pg_rank(pp_group)
+    tp_rank = get_pg_rank(tp_group)
+    pp_size = get_pg_size(pp_group)
+    tp_size = get_pg_size(tp_group)
+    device = torch.cuda.current_device() if torch.cuda.is_available() else torch.device("cpu")
+    prefetched_batches = []
+    source_failure = None
+    source_exception = None
+
+    if pp_size == 1 and tp_size == 1:
+        # Nothing to distribute: draining the schedule's whole global batch up front would
+        # only hold every microbatch resident for no benefit.
+        return PipelineTokenPrefetchIterator(
+            data_iterator=data_iterator,
+            prefetched_batches=[],
+            pipeline_tokens=[],
+            token_spec=(micro_batch_size, sequence_length, device),
+        )
+
+    if pp_rank == 0 and tp_rank == 0:
+        microbatch_tokens = []
+        try:
+            if data_iterator is None:
+                raise RuntimeError("The first pipeline stage TP source must own Engram data.")
+            for _ in range(num_microbatches):
+                batch = next(data_iterator)
+                prefetched_batches.append(batch)
+                microbatch_tokens.append(
+                    _pipeline_tokens_from_batch(batch, micro_batch_size, sequence_length, device)
+                )
+            stacked_tokens = torch.stack(microbatch_tokens).contiguous()
+        except StopIteration:
+            source_failure = "the Engram data iterator was exhausted during token prefetch"
+        except Exception as error:  # pylint: disable=broad-except
+            # Any source-side prefetch failure must reach the peers through the availability
+            # flag, or they hang in the token broadcast until the NCCL watchdog fires.
+            source_failure = f"Engram token prefetch failed on the source rank: {error}"
+            source_exception = error
+    else:
+        stacked_tokens = torch.empty(
+            (num_microbatches, *padded_shape), dtype=torch.int64, device=device
+        )
+
+    def _broadcast_from_source(tensor, group):
+        return torch.distributed.broadcast(
+            tensor, src=torch.distributed.get_global_rank(group, 0), group=group
+        )
+
+    # Broadcast availability before the payload so every rank raises together.
+    if pp_size > 1 or tp_size > 1:
+        data_available = torch.tensor(
+            [int(source_failure is None)], dtype=torch.int32, device=device
+        )
+        if pp_rank == 0 and tp_size > 1:
+            _broadcast_from_source(data_available, tp_group)
+        if pp_size > 1:
+            _broadcast_from_source(data_available, pp_group)
+        if not bool(data_available.item()):
+            # The source rank re-raises the original error; peers only know the flag.
+            if source_exception is not None:
+                raise source_exception
+            raise RuntimeError(
+                source_failure or "the Engram token prefetch source reported no data"
+            )
+    elif source_failure is not None:
+        if source_exception is not None:
+            raise source_exception
+        raise RuntimeError(source_failure)
+
+    if pp_rank == 0 and tp_size > 1:
+        _broadcast_from_source(stacked_tokens, tp_group)
+    if pp_size > 1:
+        _broadcast_from_source(stacked_tokens, pp_group)
+
+    return PipelineTokenPrefetchIterator(
+        data_iterator=data_iterator,
+        prefetched_batches=prefetched_batches,
+        pipeline_tokens=list(stacked_tokens.unbind(0)),
+    )
+
+
+def get_pipeline_prefetched_tokens(data_iterator) -> torch.Tensor:
+    """Consume the token batch prepared before the current pipeline schedule."""
+    if not isinstance(data_iterator, PipelineTokenPrefetchIterator):
+        raise RuntimeError(
+            "Engram requires pipeline tokens to be prepared before forward/backward scheduling."
+        )
+    return data_iterator.pop_pipeline_tokens()
 
 
 def get_batch_on_this_tp_rank(

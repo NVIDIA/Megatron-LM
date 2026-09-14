@@ -1100,6 +1100,11 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         if self.config.heterogeneous_block_specs:
             non_homogeneous_layers = True
 
+        # Engram is present only at selected global layers, so layer-numbered checkpoint keys
+        # avoid representing absent modules as holes in a homogeneous stacked tensor.
+        if self.config.engram_enabled:
+            non_homogeneous_layers = True
+
         singleton_local_shards = (metadata or {}).get('singleton_local_shards', False)
         if singleton_local_shards:
             if metadata is not None and metadata.get('non_homogeneous_layers') is False:

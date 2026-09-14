@@ -66,7 +66,11 @@ from megatron.training.arguments import core_transformer_config_from_args, parse
 from megatron.training.datasets.sft_dataset import MockSFTDataset, SFTDataset
 from megatron.training.datasets.varlen_dataset import MockVarlenDataset, VarlenDataset
 from megatron.training.training import update_seqlen_stats_from_cu_seqlens
-from megatron.training.utils import get_blend_and_blend_per_split, is_first_or_last_pipeline_stage
+from megatron.training.utils import (
+    get_blend_and_blend_per_split,
+    get_pipeline_prefetched_tokens,
+    is_first_or_last_pipeline_stage,
+)
 from model_provider import model_provider
 
 try:
@@ -83,6 +87,36 @@ except ImportError as error:
     has_nvidia_modelopt = False
 
 stimer = StragglerDetector()
+
+
+def _engram_tokens(data_iterator, tokens):
+    """Return this microbatch's n-gram memory tokens, distributed before the schedule.
+
+    Every pipeline stage needs the token IDs, including middle stages that own no batch, so
+    the tokens come from the pre-schedule broadcast rather than this rank's data iterator.
+    """
+    args = get_args()
+    prefetched_tokens = get_pipeline_prefetched_tokens(data_iterator)
+    if args.engram_verify_training and tokens is not None:
+        # This rank consumed its own iterator for labels; its tokens must match the batch
+        # broadcast from the first stage or the sampler states diverged. Packed rows are
+        # compared on the common prefix, since the local row is still unpadded here.
+        local_tokens = tokens.to(device=prefetched_tokens.device, dtype=prefetched_tokens.dtype)
+        common_length = min(local_tokens.shape[-1], prefetched_tokens.shape[-1])
+        assert torch.equal(
+            local_tokens[..., :common_length], prefetched_tokens[..., :common_length]
+        ), (
+            "Engram pipeline-prefetched tokens do not match this rank's own data iterator; "
+            "the data sampler state has diverged across pipeline stages."
+        )
+    if tokens is None:
+        # Middle stages never run pad_sequence_for_thd; use the full padded row so hash and
+        # hidden lengths match the fixed pipeline activation shape.
+        return prefetched_tokens
+    # Keep the batch's own unpadded length: pad_sequence_for_thd derives the local valid
+    # length from the token shape, so substituting the padded row would mark the dummy tail
+    # as valid for MoE routing statistics.
+    return prefetched_tokens[..., : tokens.shape[-1]]
 
 
 def get_batch(data_iterator, vp_stage=None):
@@ -155,6 +189,10 @@ def get_batch(data_iterator, vp_stage=None):
         and not mtp_on_this_rank
         and not has_cu_seqlens
     ):
+        if args.engram_enabled:
+            batch = {key: None for key in batch_keys}
+            batch["tokens"] = _engram_tokens(data_iterator, None)
+            return [batch[key] for key in batch_keys] + [None, None]
         return [None for _ in batch_keys] + [None, None]
 
     batch = {}
@@ -184,6 +222,12 @@ def get_batch(data_iterator, vp_stage=None):
         is_pipeline_last_stage=mpu.is_pipeline_last_stage(),
     )
 
+    if args.engram_enabled:
+        # Before flattening: flatten_batch_for_packed_sequences reshapes tokens together with
+        # labels and merges cu_seqlens, so substituting afterwards would restore the unflattened
+        # shape and silently misalign tokens against labels.
+        batch['tokens'] = _engram_tokens(data_iterator, batch.get('tokens'))
+
     batch = flatten_batch_for_packed_sequences(batch)
 
     if not is_first_or_last_pipeline_stage(vp_stage) and not mtp_on_this_rank:
@@ -198,7 +242,7 @@ def get_batch(data_iterator, vp_stage=None):
             None,
             batch['max_seqlen'],
             None,
-            None,
+            batch['tokens'] if args.engram_enabled else None,
             None,
             None,
         )

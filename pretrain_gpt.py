@@ -8,6 +8,7 @@ import time
 _PROGRAM_START_TIME = time.time()
 
 import json
+import logging
 
 # Suppress warnings on all ranks but rank 0.
 import os
@@ -62,6 +63,7 @@ from megatron.training.utils import (
     get_batch_on_this_cp_rank,
     get_batch_on_this_tp_rank,
     get_blend_and_blend_per_split,
+    get_pipeline_prefetched_tokens,
     is_first_or_last_pipeline_stage,
 )
 from model_provider import model_provider
@@ -80,6 +82,7 @@ except ImportError as error:
     has_nvidia_modelopt = False
 
 stimer = StragglerDetector()
+logger = logging.getLogger(__name__)
 
 
 def get_batch(data_iterator, vp_stage: Optional[int] = None):
@@ -152,20 +155,51 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
     # TODO: this is pretty hacky, find a better way
     is_packed_sequence = args.sft or (args.use_varlen_dataset and not args.varlen_sbhd_validation)
     needs_padding_mask = args.use_varlen_dataset and args.varlen_sbhd_validation
-    if (
+    middle_stage_without_batch = (
         not is_first_or_last_pipeline_stage(vp_stage)
         and not is_packed_sequence
         and not needs_padding_mask
         and ((not mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage)))
-    ):
+    )
+    if middle_stage_without_batch and not args.engram_enabled:
         return None, None, None, None, None, None, None
 
-    # get batches based on the TP rank you are on
-    batch = get_batch_on_this_tp_rank(
-        data_iterator,
-        mtp_on_this_rank=mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage),
-        needs_padding_mask=needs_padding_mask,
-    )
+    if middle_stage_without_batch:
+        batch = {}
+    else:
+        # get batches based on the TP rank you are on
+        batch = get_batch_on_this_tp_rank(
+            data_iterator,
+            mtp_on_this_rank=mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage),
+            needs_padding_mask=needs_padding_mask,
+        )
+
+    if args.engram_enabled:
+        prefetched_tokens = get_pipeline_prefetched_tokens(data_iterator)
+        if args.engram_verify_training and batch.get('tokens') is not None:
+            # The last pipeline stage consumes its own iterator for labels; its tokens must
+            # match the batch broadcast from the first stage or the sampler states diverged.
+            # Packed rows are compared on the common prefix: the local row is still unpadded
+            # here while the prefetched row is already zero-padded to the sequence capacity.
+            local_tokens = batch['tokens'].to(
+                device=prefetched_tokens.device, dtype=prefetched_tokens.dtype
+            )
+            common_length = min(local_tokens.shape[-1], prefetched_tokens.shape[-1])
+            local_tokens = local_tokens[..., :common_length]
+            assert torch.equal(local_tokens, prefetched_tokens[..., :common_length]), (
+                "Engram pipeline-prefetched tokens do not match this rank's own data iterator; "
+                "the data sampler state has diverged across pipeline stages."
+            )
+        if batch.get('tokens') is not None:
+            # Keep the batch's own unpadded length: pad_sequence_for_thd derives the local
+            # valid length from the token shape to build the THD padding mask, then re-pads
+            # with the same value to the same capacity. Substituting the padded row here
+            # would silently mark the dummy tail as valid for MoE routing statistics.
+            batch['tokens'] = prefetched_tokens[..., : batch['tokens'].shape[-1]]
+        else:
+            # Packed middle stages never run pad_sequence_for_thd; use the full padded row
+            # so hash and hidden lengths match the fixed pipeline activation shape.
+            batch['tokens'] = prefetched_tokens
 
     cu_seqlens = batch.pop('cu_seqlens', None)
     cu_seqlens_padded = batch.pop('cu_seqlens_padded', None)
@@ -190,7 +224,16 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
             qkv_format='thd',
         )
         finalize_packed_seq_params(packed_seq_params)
-        return (None, None, None, None, None, packed_seq_params, None)
+        return (
+            # Engram layers on middle stages consume the pipeline-prefetched tokens.
+            batch.get('tokens') if args.engram_enabled else None,
+            None,
+            None,
+            None,
+            None,
+            packed_seq_params,
+            None,
+        )
 
     thd_tail_padding_policy = resolve_thd_tail_padding_policy(config)
     if cu_seqlens is None:
@@ -373,6 +416,18 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
             get_batch(data_iterator, vp_stage)
         )
     timers('batch-generator').stop()
+
+    if args.engram_verify_training:
+        flat_tokens = tokens.reshape(-1).to(torch.int64)
+        positions = torch.arange(
+            1, flat_tokens.numel() + 1, dtype=torch.int64, device=flat_tokens.device
+        )
+        logger.info(
+            "[Engram batch] "
+            f"rank={torch.distributed.get_rank()} iteration={args.curr_iteration + 1} "
+            f"token_sum={flat_tokens.sum().item()} "
+            f"token_ordered_checksum={(flat_tokens * positions).sum().item()}"
+        )
 
     with stimer:
         if return_schedule_plan:

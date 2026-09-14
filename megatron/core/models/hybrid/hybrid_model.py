@@ -627,7 +627,17 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
 
         # Pass input_ids to decoder for hash-based MoE routing.
         decoder_extra_block_kwargs = {}
-        if self.config.moe_n_hash_layers > 0 and input_ids is not None:
+        if self.config.engram_enabled:
+            # Checked here rather than in the Engram layers: every pipeline stage runs this,
+            # so an unsupported input fails the job instead of hanging the stages that do not
+            # own an Engram layer in their pipeline collectives.
+            if inference_context is not None:
+                raise ValueError("Engram does not support inference or generation.")
+            if input_ids is None:
+                raise ValueError("Engram requires input token IDs on every pipeline stage.")
+        if (
+            self.config.moe_n_hash_layers > 0 or self.config.engram_enabled
+        ) and input_ids is not None:
             decoder_extra_block_kwargs['input_ids'] = input_ids
 
         # Run decoder.
