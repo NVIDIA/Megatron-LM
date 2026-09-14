@@ -331,6 +331,7 @@ def _fake_virtual_experts(mxfp8, device, num_local_experts, template, staging):
     virtual_experts.config = SimpleNamespace(
         mxfp8=mxfp8,
         member_shapes=(MEMBER_SHAPE,),
+        direct_main_grad=(False,),
         grad_dtype=staging.dtype if staging is not None else torch.float32,
         device=device,
     )
@@ -644,6 +645,7 @@ def test_virtual_expert_backward_consumes_gtp_weights_in_gemm_order():
 
     owner = _VirtualExperts.__new__(_VirtualExperts)
     owner.parameters = [None, None]
+    owner.config = SimpleNamespace(direct_main_grad=(False, False))
     owner.gtp_leaders = [
         SimpleNamespace(
             _weights=[

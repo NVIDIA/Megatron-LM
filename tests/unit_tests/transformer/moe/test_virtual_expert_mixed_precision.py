@@ -185,6 +185,16 @@ def test_virtual_expert_mixed_precision_repeated_layer_matches_hybridep(monkeypa
                 for fc in manager.virtual_experts.runtime_weights
                 for parameter in fc
             )
+            for manager in managers:
+                owner = manager.virtual_experts
+                assert all(owner.config.direct_main_grad)
+                assert owner.storage.native_staging == (None, None)
+                for sources, runtime in zip(owner.parameters, owner.runtime_weights):
+                    assert all(
+                        native.main_grad.data_ptr() == source.main_grad.data_ptr()
+                        and not native.overwrite_main_grad
+                        for source, native in zip(sources, runtime)
+                    )
             assert all(
                 manager._plan is None and not manager.over_budget.item() for manager in managers
             )
