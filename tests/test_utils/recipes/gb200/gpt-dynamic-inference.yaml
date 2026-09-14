@@ -13,15 +13,19 @@ spec:
   script_setup: |
     set -euo pipefail
     unset https_proxy
-    echo "machine gitlab-master.nvidia.com login okoenig password $RO_API_TOKEN" | tee -a /root/.netrc
+    authenticated_git() {
+      git -c credential.helper='!f() {
+        printf "%s\n" username=okoenig "password=$RO_API_TOKEN"
+      }; f' "$@"
+    }
 
     # Checkout latest
     cd /opt
     rm -rf /opt/megatron-lm; mkdir megatron-lm; cd megatron-lm
     git init
     git remote add origin $MCORE_REPO
-    git fetch origin '+refs/merge-requests/*:refs/remotes/merge-requests/*'
-    git fetch origin $MCORE_MR_COMMIT
+    authenticated_git fetch origin '+refs/merge-requests/*:refs/remotes/merge-requests/*'
+    authenticated_git fetch origin $MCORE_MR_COMMIT
     git checkout $MCORE_MR_COMMIT
     git rev-parse HEAD
     # Checkout backwards-ref
@@ -29,10 +33,12 @@ spec:
     rm -rf /opt/megatron-lm-legacy; mkdir megatron-lm-legacy; cd megatron-lm-legacy
     git init
     git remote add origin $MCORE_REPO
-    git fetch origin $MCORE_BACKWARDS_COMMIT
+    authenticated_git fetch origin $MCORE_BACKWARDS_COMMIT
     git checkout $MCORE_BACKWARDS_COMMIT
     git rev-parse HEAD
     rm -rf megatron; cp -a /opt/megatron-lm/megatron ./
+    unset -f authenticated_git
+    unset RO_API_TOKEN
   script: |-
     set -euo pipefail
     ls

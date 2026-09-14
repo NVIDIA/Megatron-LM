@@ -2138,7 +2138,7 @@ class TestCompressedSparseAttentionThd:
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_thd_path_a_forward(self):
         """Path A (THD): compress_ratio=128 → indexer=None → attend to
-        all visible compressed positions via final-index lowering.
+        ALL compressed positions per segment via ``get_compress_topk_idxs_thd``.
         """
         compress_ratio = 128
         csa = self._build_csa(compress_ratio)

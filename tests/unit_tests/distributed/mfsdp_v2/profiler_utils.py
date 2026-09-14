@@ -14,6 +14,22 @@ def events_overlap(first: FunctionEvent, second: FunctionEvent) -> bool:
     )
 
 
+def _event_correlation_id(event: FunctionEvent) -> int:
+    """Return the profiler correlation key across old and new PyTorch schemas."""
+    correlation_id = getattr(event, "linked_correlation_id", None)
+    return event.id if correlation_id is None else correlation_id
+
+
+def _is_kernel_event(event: FunctionEvent) -> bool:
+    """Distinguish kernels from CUDA runtime annotations across profiler schemas."""
+    activity_type = getattr(event, "activity_type", None)
+    if activity_type is not None:
+        return activity_type == "kernel"
+    return not getattr(event, "is_user_annotation", False) and not event.name.startswith(
+        ("Memcpy ", "Memset ")
+    )
+
+
 def collect_linked_kernels(
     prof: TorchProfiler, cpu_event_name_substring: str
 ) -> list[FunctionEvent]:
@@ -33,22 +49,21 @@ def collect_linked_kernels(
     events = prof.events()
     matching_correlations: set[int] = set()
     for event in events:
-        if event.device_type != DeviceType.CPU or not event.linked_correlation_id:
+        correlation_id = _event_correlation_id(event)
+        if event.device_type != DeviceType.CPU or not correlation_id:
             continue
         node = event
         while node is not None:
             if cpu_event_name_substring in node.name:
-                matching_correlations.add(event.linked_correlation_id)
+                matching_correlations.add(correlation_id)
                 break
             node = node.cpu_parent
 
     linked_kernels: list[FunctionEvent] = []
     for event in events:
-        if event.device_type != DeviceType.CUDA:
+        if event.device_type != DeviceType.CUDA or not _is_kernel_event(event):
             continue
-        if event.activity_type != "kernel":
-            continue
-        if event.linked_correlation_id not in matching_correlations:
+        if _event_correlation_id(event) not in matching_correlations:
             continue
         linked_kernels.append(event)
 

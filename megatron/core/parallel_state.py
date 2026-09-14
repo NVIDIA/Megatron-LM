@@ -474,9 +474,7 @@ class RankGenerator(object):
         rank_offset: int = 0,
         gtp_remat: int = 1,
     ) -> None:
-        assert (
-            ep == 1 or cp == 1
-        ), "Both EP and CP > 1 in not allow in one rank generator. \
+        assert ep == 1 or cp == 1, "Both EP and CP > 1 in not allow in one rank generator. \
             CP is only included in default RankGenerator, and EP only in expert RankGenerator."
 
         self.tp = tp
@@ -1865,7 +1863,7 @@ def get_hierarchical_context_parallel_groups(check_initialized=True):
 
 def get_dynamic_data_context_parallel_groups(check_initialized=True, group_size=None):
     """Get the dynamic context parallel groups the caller rank belongs to."""
-    if get_data_parallel_world_size(with_context_parallel=True) == group_size:
+    if get_data_parallel_world_size(with_context_parallel=True, with_gtp_remat=False) == group_size:
         if check_initialized:
             assert _DATA_PARALLEL_GROUP_WITH_CP is not None
         return _DATA_PARALLEL_GROUP_WITH_CP
@@ -2517,8 +2515,15 @@ def get_all_ranks():
     return "_".join(map(lambda x: str(x or 0), ranks))
 
 
-def destroy_model_parallel():
-    """Set the groups to none."""
+def destroy_model_parallel(destroy_process_groups: bool = True):
+    """Reset model-parallel state and optionally destroy its process groups.
+
+    Args:
+        destroy_process_groups: Destroy every process group tracked by
+            :func:`create_group`. Tests that serialize objects containing
+            process-group names may defer destruction until those objects have
+            been consumed, but must eventually call this function with ``True``.
+    """
     # Release the NCCL EP context (if the 'ncclep' flex dispatcher bootstrapped one) before the
     # process group's communicator is torn down. TE registers an atexit ep_finalize that would
     # otherwise run after dist.destroy_process_group() and hit a "corrupted comm object" at exit.
@@ -2610,7 +2615,8 @@ def destroy_model_parallel():
 
     global _DATA_PARALLEL_GROUP_GLOO
     if (
-        _DATA_PARALLEL_GROUP_GLOO is not None
+        destroy_process_groups
+        and _DATA_PARALLEL_GROUP_GLOO is not None
         and torch.distributed.distributed_c10d._world.pg_map.get(_DATA_PARALLEL_GROUP_GLOO, None)
         is not None
     ):
@@ -2619,7 +2625,8 @@ def destroy_model_parallel():
 
     global _DATA_PARALLEL_GROUP_WITH_CP_GLOO
     if (
-        _DATA_PARALLEL_GROUP_WITH_CP_GLOO is not None
+        destroy_process_groups
+        and _DATA_PARALLEL_GROUP_WITH_CP_GLOO is not None
         and torch.distributed.distributed_c10d._world.pg_map.get(
             _DATA_PARALLEL_GROUP_WITH_CP_GLOO, None
         )
@@ -2673,7 +2680,8 @@ def destroy_model_parallel():
 
     global _EXPERT_DATA_PARALLEL_GROUP_GLOO
     if (
-        _EXPERT_DATA_PARALLEL_GROUP_GLOO is not None
+        destroy_process_groups
+        and _EXPERT_DATA_PARALLEL_GROUP_GLOO is not None
         and torch.distributed.distributed_c10d._world.pg_map.get(
             _EXPERT_DATA_PARALLEL_GROUP_GLOO, None
         )
@@ -2687,7 +2695,8 @@ def destroy_model_parallel():
 
     global _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_GLOO
     if (
-        _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_GLOO is not None
+        destroy_process_groups
+        and _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_GLOO is not None
         and torch.distributed.distributed_c10d._world.pg_map.get(
             _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_GLOO, None
         )
@@ -2704,6 +2713,19 @@ def destroy_model_parallel():
     _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP = None
 
     global _global_process_group_list
-    _global_process_group_list = None
+    if destroy_process_groups and _global_process_group_list is not None:
+        # ``new_group`` keeps every process group registered in PyTorch's global
+        # process-group map. Dropping Megatron's references alone does not tear
+        # down the NCCL communicators, so repeated test initialization eventually
+        # exhausts the process' thread resources. Destroy every group created by
+        # ``create_group`` in reverse creation order before clearing the registry.
+        for group in reversed(_global_process_group_list):
+            if (
+                group is not None
+                and torch.distributed.distributed_c10d._world.pg_map.get(group) is not None
+            ):
+                torch.distributed.destroy_process_group(group)
+    if destroy_process_groups:
+        _global_process_group_list = None
 
     SymmetricMemoryManager.destroy()
