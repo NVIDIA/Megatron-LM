@@ -75,8 +75,9 @@ def test_checkpoint_publishes_main_grad_to_outer_ddp_hook(
 
 @pytest.mark.parametrize("layers", [1, 3])
 @pytest.mark.parametrize("frozen_prefix", [False, True])
+@pytest.mark.parametrize("park_each_layer", [False, True])
 def test_checkpoint_matches_native_across_microbatches(
-    transformer_engine_import_stub, layers, frozen_prefix
+    transformer_engine_import_stub, layers, frozen_prefix, park_each_layer
 ):
     transformer_engine_import_stub()
     from megatron.lite.primitive.modules.moe_ep_chunk_overlap import checkpoint_ep_chunk
@@ -97,7 +98,18 @@ def test_checkpoint_matches_native_across_microbatches(
 
     def prefix(block, x):
         residual = x + torch.nn.functional.dropout(block[0](x), p=0.2, training=True)
-        return torch.tanh(residual), residual
+        norm = torch.tanh(residual)
+        index = next((i for i, item in enumerate(candidate) if item is block), None)
+        if index is not None and (park_each_layer or index == 0) and torch.is_grad_enabled():
+            finish = executions[index].finish_backward
+            prior_calls = finish.call_count
+
+            def check_parked(grad):
+                assert finish.call_count == prior_calls + 1, "expert arena outlived fused backward"
+                return grad
+
+            norm.register_hook(check_parked)
+        return norm, residual
 
     def execution(block):
         def forward(x):
@@ -147,7 +159,7 @@ def test_checkpoint_matches_native_across_microbatches(
                     actual,
                     executions[i],
                     tuple(block[0].parameters()),
-                    finish_backward=i == 0,
+                    finish_backward=park_each_layer or i == 0,
                 )
         # The bridge retains only each layer input, not attention/norm activations.
         assert len(saved) == layers
@@ -164,7 +176,7 @@ def test_checkpoint_matches_native_across_microbatches(
     assert calls.count("fwd") == calls.count("fused") == 3 * layers
     assert executions[0].finish_backward.call_count == 3
     for execution in executions[1:]:
-        execution.finish_backward.assert_not_called()
+        assert execution.finish_backward.call_count == (3 if park_each_layer else 0)
 
 
 @pytest.mark.parametrize("full_recompute", [False, True])
@@ -259,7 +271,9 @@ def test_qwen_layer_assembly_keeps_parameter_paths(
     assert tuple(native.state_dict()) == tuple(changed.state_dict())
     assert tuple(dict(native.named_parameters())) == tuple(dict(changed.named_parameters()))
     changed.load_state_dict(native.state_dict(), strict=True)
-    selected = options.bind([changed])
+    sibling = options.layer(cfg, ps, 1).double()
+    selected = options.bind([changed, sibling])
+    assert changed.finish_backward == sibling.finish_backward == full_recompute
     assert selected is changed.moe.chunked_ep
     assert options.bind([]) is None
     x = torch.randn(5, 1, 4, dtype=torch.double, requires_grad=True)

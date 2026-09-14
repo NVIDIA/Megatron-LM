@@ -2115,12 +2115,12 @@ class _EPChunkCheckpoint(torch.autograd.Function):
             grad_norm, router_grads, expert_grads = ctx.execution.fused_op.forward_backward(
                 norm, grad_output
             )
+            if ctx.finish_backward:
+                ctx.execution.finish_backward(x)
             required = tuple(p for p in (x, *prefix_params) if p.requires_grad)
             grads = torch.autograd.grad(
                 (norm, residual), required, (grad_norm, grad_output), allow_unused=True
             )
-            if ctx.finish_backward:
-                ctx.execution.finish_backward(x)
         by_id = {id(p): grad for p, grad in zip(required, grads, strict=True)}
         return (
             by_id.get(id(x)),

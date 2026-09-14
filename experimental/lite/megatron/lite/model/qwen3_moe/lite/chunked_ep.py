@@ -116,7 +116,8 @@ class Qwen3ChunkedEP:
     def bind(self, layers):
         if not layers:
             return None
-        layers[0].finish_backward = self.full_recompute
+        for layer in layers:
+            layer.finish_backward = self.full_recompute
         return layers[0].moe.chunked_ep
 
 
