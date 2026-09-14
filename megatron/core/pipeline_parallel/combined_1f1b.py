@@ -415,6 +415,9 @@ def combined_forward_backward_step(
                     forward_fsdp_wrapper.post_forward_release_module,
                     forward_fsdp_wrapper.post_backward_release_module,
                 )
+                layer_plan.set_fsdp_recompute_prefetch_hook(
+                    forward_fsdp_wrapper.prefetch_recompute_forward_parameters
+                )
 
     # backward preprocess, the same as the backward_step()
     unwrap_input_tensor_grad = False
