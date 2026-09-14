@@ -340,7 +340,6 @@ class TestTeNativeBackend:
             import transformer_engine.pytorch.cpp_extensions.gemm as te_gemm_mod
 
             ws_fn_before = te_gemm_mod.get_cublas_workspace_size_bytes
-            unrestricted_ws_bytes = ws_fn_before()
             have_te = True
             have_grouped_workspace = hasattr(te_gemm_mod, "_get_grouped_cublas_workspace")
         except ImportError:
@@ -356,10 +355,8 @@ class TestTeNativeBackend:
             if have_te:
                 assert te_gemm_mod.get_cublas_workspace_size_bytes() == 1024
             if have_grouped_workspace:
-                grouped_workspace = te_gemm_mod._get_grouped_cublas_workspace(
-                    torch.cuda.current_device(), "TN"
-                )
-                assert grouped_workspace.numel() == unrestricted_ws_bytes
+                with pytest.raises(RuntimeError, match="moe_use_grouped_tensor=False"):
+                    te_gemm_mod._get_grouped_cublas_workspace(torch.cuda.current_device(), "TN")
             # te_native must NOT reroute aten::mm — native kernels stay
             a = torch.randn(64, 64, device="cuda", dtype=torch.bfloat16)
             b = torch.randn(64, 64, device="cuda", dtype=torch.bfloat16)

@@ -145,13 +145,18 @@ workload rather than generalizing from any single comparison.
 > selects the GEMM backend, and `batch_invariant_collective` (`ordered` by
 > default, or `multimem`) selects the cross-rank expert-combine reduction.
 >
-> Both dense and MoE models are supported. Batch-invariant MoE is bf16-only,
-> requires the unfused permute/unpermute path, and under
+> Both dense and MoE models are supported. Batch-invariant MoE supports BF16 and
+> MXFP8 squared-ReLU/SwiGLU experts, requires unfused permute/unpermute, and under
 > `--transformer-impl inference_optimized` requires
 > `inference_grouped_gemm_backend` of `vllm` or `torch` (plus the `nvls` token
 > dispatcher when `EP > 1`). Some backend combinations additionally need DeepGEMM
 > bf16 bindings: `uv pip install -e .[batch_invariant]`. Context parallelism and
-> attention dropout are not supported in either case.
+> attention dropout are not supported in either case. MXFP8 training uses
+> `batch_invariant_backend="te_native"` and legacy TE GroupedLinear:
+> `moe_use_grouped_tensor=False`, `use_transformer_engine_op_fuser=False`, and
+> `NVTE_GROUPED_LINEAR_USE_FUSED_GROUPED_GEMM=0`. TE device-metadata grouped GEMM
+> is not supported in batch-invariant mode because its full workspace can change
+> reduction order with batch size; 256-row alignment alone does not prevent this.
 
 > **Selective MXFP8 parameter storage.** Use the same Transformer Engine per-module
 > precision recipe for training and inference through `TransformerConfig.quant_recipe`
@@ -983,9 +988,10 @@ is the opposite of the `MegatronLLM` constructor default.
   warning if FlashInfer is not installed.
 - **Async scheduling excludes MoE router replay** and does not support paused
   requests. Refer to [Async Scheduling](#async-scheduling).
-- **Batch-invariant MoE is bf16-only** and requires the unfused
-  permute/unpermute path; batch-invariant mode in general excludes context
-  parallelism and attention dropout.
+- **Batch-invariant MoE supports BF16 and MXFP8 squared-ReLU/SwiGLU experts.**
+  MXFP8 uses legacy TE `te_native` for training and Torch/vLLM for inference.
+  It requires unfused permute/unpermute and excludes context parallelism,
+  attention dropout, and TE device-metadata grouped GEMM.
 - **MXFP8 fused quantization supports squared-ReLU only.** SwiGLU uses separate
   BF16 activation and MXFP8 quantization kernels; it does not fall back to BF16 GEMM.
 - **Disaggregated handoff does not support log-probs** (`return_log_probs` or

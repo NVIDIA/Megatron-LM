@@ -87,13 +87,13 @@ def _squared_relu_kernel(
                 for n in tl.range(0, N, BLOCK_N):
                     o = n + tl.arange(0, BLOCK_N)
                     m = o < N
-                    x = tl.load(input_ptr + row * N + o, mask=m).to(tl.float32)
+                    x = tl.load(input_ptr + row.to(tl.int64) * N + o, mask=m).to(tl.float32)
                     r = _clamped_relu(x, clamp_scale, CLAMP)
-                    tl.store(output_ptr + row * N + o, (r * r).to(tl.bfloat16), mask=m)
+                    tl.store(output_ptr + row.to(tl.int64) * N + o, (r * r).to(tl.bfloat16), mask=m)
             elif ZERO_PADDING:
                 for n in tl.range(0, N, BLOCK_N):
                     o = n + tl.arange(0, BLOCK_N)
-                    tl.store(output_ptr + row * N + o, 0.0, mask=o < N)
+                    tl.store(output_ptr + row.to(tl.int64) * N + o, 0.0, mask=o < N)
 
 
 def padded_squared_relu(
@@ -165,14 +165,18 @@ def _swiglu_kernel(
                 for n in tl.range(0, N, BLOCK_N):
                     o = n + tl.arange(0, BLOCK_N)
                     m = o < N
-                    gate = tl.load(input_ptr + row * two_N + o, mask=m).to(tl.float32)
-                    up = tl.load(input_ptr + row * two_N + N + o, mask=m).to(tl.float32)
+                    gate = tl.load(input_ptr + row.to(tl.int64) * two_N + o, mask=m).to(tl.float32)
+                    up = tl.load(input_ptr + row.to(tl.int64) * two_N + N + o, mask=m).to(
+                        tl.float32
+                    )
                     silu = gate * tl.sigmoid(gate)
-                    tl.store(output_ptr + row * N + o, (silu * up).to(tl.bfloat16), mask=m)
+                    tl.store(
+                        output_ptr + row.to(tl.int64) * N + o, (silu * up).to(tl.bfloat16), mask=m
+                    )
             elif ZERO_PADDING:
                 for n in tl.range(0, N, BLOCK_N):
                     o = n + tl.arange(0, BLOCK_N)
-                    tl.store(output_ptr + row * N + o, 0.0, mask=o < N)
+                    tl.store(output_ptr + row.to(tl.int64) * N + o, 0.0, mask=o < N)
 
 
 def padded_swiglu(
@@ -238,10 +242,10 @@ def _silu_mul_bounded_kernel(
             for n in tl.range(0, N, BLOCK_N):
                 o = n + tl.arange(0, BLOCK_N)
                 m = o < N
-                gate = tl.load(input_ptr + row * two_N + o, mask=m).to(tl.float32)
-                up = tl.load(input_ptr + row * two_N + N + o, mask=m).to(tl.float32)
+                gate = tl.load(input_ptr + row.to(tl.int64) * two_N + o, mask=m).to(tl.float32)
+                up = tl.load(input_ptr + row.to(tl.int64) * two_N + N + o, mask=m).to(tl.float32)
                 silu = gate * tl.sigmoid(gate)
-                tl.store(output_ptr + row * N + o, (silu * up).to(tl.bfloat16), mask=m)
+                tl.store(output_ptr + row.to(tl.int64) * N + o, (silu * up).to(tl.bfloat16), mask=m)
 
 
 def bounded_silu_mul(x: torch.Tensor, n_rows: torch.Tensor) -> torch.Tensor:
@@ -299,7 +303,9 @@ def _squared_relu_quantize_kernel(
                 mask = offs < K
 
                 # Load and apply squared ReLU
-                x = tl.load(input_ptr + row * K + offs, mask=mask, other=0.0).to(tl.float32)
+                x = tl.load(input_ptr + row.to(tl.int64) * K + offs, mask=mask, other=0.0).to(
+                    tl.float32
+                )
                 relu = _clamped_relu(x, clamp_scale, CLAMP)
                 # Match training and unfused inference: squared ReLU is materialized
                 # in BF16 before MXFP8 quantization, which determines the MXFP8 bins.
@@ -320,14 +326,14 @@ def _squared_relu_quantize_kernel(
                 out_fp8 = quantized_flat.to(tl.float8e4nv)
 
                 # Store FP8 data
-                tl.store(out_fp8_ptr + row * K + offs, out_fp8, mask=mask)
+                tl.store(out_fp8_ptr + row.to(tl.int64) * K + offs, out_fp8, mask=mask)
 
                 # Store swizzled scales
                 scale_exp = (dequant_exp >> 23).to(tl.uint8)
                 col_offs = tl.arange(0, BLOCK_GROUPS)
                 col_mask = col_offs < REAL_GROUPS
 
-                macro_row_block = row // 128
+                macro_row_block = row.to(tl.int64) // 128
                 macro_col_block = col_offs // 4
                 local_row = row % 128
                 local_col = col_offs % 4

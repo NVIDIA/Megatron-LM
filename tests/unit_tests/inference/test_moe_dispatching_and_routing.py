@@ -109,6 +109,25 @@ def test_config_accepts_mxfp8_batch_invariant_backends(backend, gated_linear_uni
     assert config.batch_invariant_mode
 
 
+@pytest.mark.parametrize("grouped_tensor", [False, True])
+def test_config_rejects_batch_invariant_device_metadata_gemm(monkeypatch, grouped_tensor):
+    monkeypatch.setenv("NVTE_GROUPED_LINEAR_USE_FUSED_GROUPED_GEMM", "0" if grouped_tensor else "1")
+    with pytest.raises(AssertionError, match="requires legacy TE GroupedLinear"):
+        _make_base_config(
+            transformer_impl="transformer_engine",
+            moe_token_dispatcher_type="alltoall",
+            moe_use_grouped_tensor=grouped_tensor,
+            fp8="hybrid",
+            fp8_recipe="mxfp8",
+            fp8_param=True,
+            batch_invariant_mode=True,
+            batch_invariant_backend="te_native",
+            attention_backend=AttnBackend.flash,
+            flash_attention_version=4,
+            attention_dropout=0.0,
+        )
+
+
 # ──────────────────────────────────────────────────────────────────────
 # InferenceTopKRouter
 # ──────────────────────────────────────────────────────────────────────
@@ -763,7 +782,7 @@ class TestNVLSAllGatherVDispatcher:
             fp8_recipe=("mxfp8" if mxfp8_swiglu else "delayed"),
             fp8_param=mxfp8_swiglu,
             use_cpu_initialization=not mxfp8_swiglu,
-            batch_invariant_backend=("te_native" if mxfp8_swiglu else None),
+            batch_invariant_backend="te_native",
         )
         NVLSAllGatherVDispatcher.allocate_buffers(
             per_rank_worst_case_token_count=_NVLS_ENGINE_MAX_TOKENS,

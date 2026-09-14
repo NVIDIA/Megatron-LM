@@ -284,8 +284,8 @@ def _permute_tokens_kernel(
                     o = h + tl.arange(0, BLOCK_H)
                     m = o < hidden_dim
                     tl.store(
-                        out_hidden_ptr + pos * hidden_dim + o,
-                        tl.load(hidden_ptr + tok * hidden_dim + o, mask=m),
+                        out_hidden_ptr + pos.to(tl.int64) * hidden_dim + o,
+                        tl.load(hidden_ptr + tok.to(tl.int64) * hidden_dim + o, mask=m),
                         mask=m,
                     )
                 tl.store(out_probs_ptr + pos, tl.load(probs_ptr + tok * topk + k))
@@ -475,7 +475,7 @@ def _zero_output_rows_kernel(
             for h in tl.range(0, hidden_dim, BLOCK_H):
                 o = h + tl.arange(0, BLOCK_H)
                 m = o < hidden_dim
-                tl.store(output_ptr + row * hidden_dim + o, zero, mask=m)
+                tl.store(output_ptr + row.to(tl.int64) * hidden_dim + o, zero, mask=m)
 
 
 @triton.jit
@@ -511,8 +511,14 @@ def _unpermute_tokens_kernel(
                     offsets = h + tl.arange(0, BLOCK_H)
                     m = offsets < hidden_dim
                     # Upcast bf16 expert output to fp32 before multiply + accumulate
-                    v = tl.load(expert_out_ptr + row * hidden_dim + offsets, mask=m).to(tl.float32)
-                    tl.atomic_add(output_ptr + source_idx * hidden_dim + offsets, v * prob, mask=m)
+                    v = tl.load(
+                        expert_out_ptr + row.to(tl.int64) * hidden_dim + offsets, mask=m
+                    ).to(tl.float32)
+                    tl.atomic_add(
+                        output_ptr + source_idx.to(tl.int64) * hidden_dim + offsets,
+                        v * prob,
+                        mask=m,
+                    )
 
 
 def unpermute_tokens(
@@ -632,7 +638,9 @@ def _permute_quantize_mxfp8_kernel(
                 # Load full row from source token
                 offs = tl.arange(0, BLOCK_K)
                 mask = offs < K
-                x = tl.load(hidden_ptr + tok * K + offs, mask=mask, other=0.0).to(tl.float32)
+                x = tl.load(hidden_ptr + tok.to(tl.int64) * K + offs, mask=mask, other=0.0).to(
+                    tl.float32
+                )
 
                 # Per-group-of-32 quantization
                 x_grouped = tl.reshape(x, [BLOCK_GROUPS, 32])
@@ -649,14 +657,14 @@ def _permute_quantize_mxfp8_kernel(
                 out_fp8 = quantized_flat.to(tl.float8e4nv)
 
                 # Store FP8 data at permuted position
-                tl.store(out_fp8_ptr + pos * K + offs, out_fp8, mask=mask)
+                tl.store(out_fp8_ptr + pos.to(tl.int64) * K + offs, out_fp8, mask=mask)
 
                 # Store swizzled scales at permuted position
                 scale_exp = (dequant_exp >> 23).to(tl.uint8)
                 col_offs = tl.arange(0, BLOCK_GROUPS)
                 col_mask = col_offs < REAL_GROUPS
 
-                macro_row_block = pos // 128
+                macro_row_block = pos.to(tl.int64) // 128
                 macro_col_block = col_offs // 4
                 local_row = pos % 128
                 local_col = col_offs % 4

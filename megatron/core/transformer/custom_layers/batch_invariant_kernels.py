@@ -9,7 +9,6 @@ import importlib.util
 import logging
 from collections import namedtuple
 from collections.abc import Callable
-from functools import lru_cache
 from typing import Any, Dict, List, Optional
 
 import torch
@@ -1664,20 +1663,14 @@ _TE_GROUPED_WORKSPACE_FN_ORIG = None
 _TE_NATIVE_ENV_ORIG: dict = {}
 
 
-def _get_unrestricted_te_workspace_size_bytes() -> int:
-    """Return TE's normal workspace size even while te_native starvation is active."""
-    import transformer_engine.pytorch.cpp_extensions.gemm as te_gemm
-
-    workspace_size_fn = _TE_WORKSPACE_SIZE_FN_ORIG or te_gemm.get_cublas_workspace_size_bytes
-    return workspace_size_fn()
-
-
-@lru_cache(maxsize=None)
-def _get_unrestricted_te_grouped_workspace(device: int, layout: str) -> torch.Tensor:
-    """Allocate the full workspace required by TE's device-metadata grouped GEMM."""
-    assert layout in ("TN", "NN", "NT"), f"unexpected grouped GEMM layout {layout}"
-    return torch.empty(
-        _get_unrestricted_te_workspace_size_bytes(), dtype=torch.uint8, device=device
+def _reject_te_native_grouped_workspace(device: int, layout: str) -> torch.Tensor:
+    """Reject device-metadata grouped GEMM rather than relaxing workspace starvation."""
+    raise RuntimeError(
+        "Batch-invariant te_native does not support TE device-metadata grouped GEMM: "
+        "it requires a full workspace, which can change the reduction order with batch size. "
+        "Use legacy TE GroupedLinear with moe_use_grouped_tensor=False, "
+        "use_transformer_engine_op_fuser=False, and "
+        "NVTE_GROUPED_LINEAR_USE_FUSED_GROUPED_GEMM=0."
     )
 
 
@@ -1737,18 +1730,17 @@ def _enable_te_native_workspace_starvation(workspace_bytes: int = _TE_NATIVE_WOR
             _te_gemm_mod.get_cublas_workspace_size_bytes = lambda: workspace_bytes
             if hasattr(getattr(_te_gemm_mod, "get_cublas_workspace", None), "cache_clear"):
                 _te_gemm_mod.get_cublas_workspace.cache_clear()
-        # TE's device-metadata grouped GEMM rejects a workspace smaller than its normal
-        # allocation. This path gets its batch invariance from padding every expert segment
-        # to a 256-row multiple, so preserve the mandatory full workspace at this narrow
-        # entry point while keeping ordinary GEMMs starved.
+        # Only general_grouped_gemm_for_grouped_tensor uses this workspace. Its full
+        # allocation admits algorithms we cannot guarantee are batch-invariant; rounding
+        # expert row counts to 256-multiples does not fix M. Fail at the actual dispatch
+        # (including BF16 modules in a mixed recipe), leaving legacy grouped GEMMs starved.
         if _TE_GROUPED_WORKSPACE_FN_ORIG is None and hasattr(
             _te_gemm_mod, "_get_grouped_cublas_workspace"
         ):
             _TE_GROUPED_WORKSPACE_FN_ORIG = _te_gemm_mod._get_grouped_cublas_workspace
             if hasattr(_TE_GROUPED_WORKSPACE_FN_ORIG, "cache_clear"):
                 _TE_GROUPED_WORKSPACE_FN_ORIG.cache_clear()
-            _get_unrestricted_te_grouped_workspace.cache_clear()
-            _te_gemm_mod._get_grouped_cublas_workspace = _get_unrestricted_te_grouped_workspace
+            _te_gemm_mod._get_grouped_cublas_workspace = _reject_te_native_grouped_workspace
     except ImportError:
         pass
 
@@ -1762,7 +1754,6 @@ def _disable_te_native_workspace_starvation():
         try:
             import transformer_engine.pytorch.cpp_extensions.gemm as _te_gemm_mod
 
-            _get_unrestricted_te_grouped_workspace.cache_clear()
             _te_gemm_mod._get_grouped_cublas_workspace = _TE_GROUPED_WORKSPACE_FN_ORIG
             if hasattr(_TE_GROUPED_WORKSPACE_FN_ORIG, "cache_clear"):
                 _TE_GROUPED_WORKSPACE_FN_ORIG.cache_clear()

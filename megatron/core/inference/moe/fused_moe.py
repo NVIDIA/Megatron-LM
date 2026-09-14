@@ -173,26 +173,17 @@ def mcore_fused_moe(
     )
     mm_fn: Callable[[Any, Any, torch.Tensor], torch.Tensor]
 
-    if batch_invariant_mode:
-        if use_mxfp8:
-            assert (
-                HAVE_SCALED_GMM
-            ), "Torch MXFP8 inference requires torch.nn.functional.scaled_grouped_mm."
-            mm_fn = _mxfp8_grouped_mm
-            # Keep every expert boundary aligned to the MXFP8 scale swizzle.
-            expert_alignment = MXFP8_SCALE_ROW_BLOCK
-        else:
-            mm_fn = batch_invariant.grouped_mm
-            expert_alignment = batch_invariant.grouped_mm_alignment()
-    elif use_mxfp8:
+    if use_mxfp8:
         assert (
             HAVE_SCALED_GMM
         ), "torch.nn.functional.scaled_grouped_mm not available. Install PyTorch 2.10+."
         mm_fn = _mxfp8_grouped_mm
-        # scaled_grouped_mm requires each expert's token count aligned to 32,
-        # but swizzled MXFP8 scales require alignment to 128. Use 128 to
-        # satisfy both constraints.
-        expert_alignment = 128
+        # scaled_grouped_mm needs each expert's token count aligned to 32; the
+        # swizzled MXFP8 scale layout needs 128, which satisfies both constraints.
+        expert_alignment = MXFP8_SCALE_ROW_BLOCK
+    elif batch_invariant_mode:
+        mm_fn = batch_invariant.grouped_mm
+        expert_alignment = batch_invariant.grouped_mm_alignment()
     else:
         assert (
             HAVE_GROUPED_MM

@@ -358,18 +358,6 @@ class TestMoEModules:
             what="TEGroupedMLP",
         )
 
-    @pytest.mark.skipif(not HAVE_TE, reason="TE grouped MLP needs Transformer Engine")
-    def test_te_device_metadata_mxfp8_padding_uses_256_rows(self, monkeypatch):
-        """The TE device-metadata grouped path must use its required row alignment."""
-        from megatron.core.transformer.moe.experts import _te_grouped_tensor_align_size
-
-        config = _moe_config(fp8="hybrid", fp8_recipe="mxfp8")
-        monkeypatch.delenv("NVTE_GROUPED_LINEAR_USE_FUSED_GROUPED_GEMM", raising=False)
-        assert _te_grouped_tensor_align_size(config) is None
-
-        monkeypatch.setenv("NVTE_GROUPED_LINEAR_USE_FUSED_GROUPED_GEMM", "1")
-        assert _te_grouped_tensor_align_size(config) == 256
-
     @pytest.mark.skipif(
         not hasattr(torch, "float8_e8m0fnu") or torch.cuda.get_device_capability()[0] < 10,
         reason="MXFP8 parameter storage needs Blackwell",

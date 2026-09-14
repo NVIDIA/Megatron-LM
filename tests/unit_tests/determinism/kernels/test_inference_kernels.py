@@ -500,3 +500,76 @@ def test_mxfp8_swiglu_moe_replays():
 
     # One route per token also makes the non-batch-invariant atomic combine exact.
     assert_replays_bit_exact(run, (x,), replays=3, backward=False, what="MXFP8 SwiGLU MoE")
+
+
+@pytest.mark.launch_on_gb200
+def test_torch_mxfp8_moe_is_batch_invariant():
+    """A routed token must be bitwise stable as its expert loads change."""
+    from megatron.core.inference.moe.fused_moe import (
+        HAVE_SCALED_GMM,
+        ActivationType,
+        mcore_fused_moe,
+    )
+    from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
+    from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+        set_batch_invariant_mode,
+    )
+
+    if not HAVE_SCALED_GMM or torch.cuda.get_device_capability()[0] < 10:
+        pytest.skip("MXFP8 scaled_grouped_mm requires PyTorch 2.10+ and Blackwell")
+
+    torch.manual_seed(1234)
+    num_experts, hidden_size, topk = 4, 256, 2
+
+    def _stack_weights() -> MXFP8Tensor:
+        quantized = [
+            MXFP8Tensor.from_bf16(
+                torch.randn(hidden_size, hidden_size, device="cuda", dtype=torch.bfloat16),
+                backend="triton",
+            )
+            for _ in range(num_experts)
+        ]
+        return MXFP8Tensor(
+            data=torch.stack([weight.data for weight in quantized]).contiguous(),
+            scale=torch.stack([weight.scale for weight in quantized]).contiguous(),
+            backend="triton",
+            dtype=torch.bfloat16,
+        )
+
+    fc1_weight = _stack_weights()
+    fc2_weight = _stack_weights()
+    target = torch.randn(hidden_size, device="cuda", dtype=torch.bfloat16)
+    target_experts = torch.tensor([0, 1], device="cuda", dtype=torch.int64)
+    target_probs = torch.tensor([0.625, 0.375], device="cuda", dtype=torch.float32)
+
+    def _run(num_tokens: int, target_row: int) -> torch.Tensor:
+        hidden_states = torch.randn(num_tokens, hidden_size, device="cuda", dtype=torch.bfloat16)
+        routing_map = torch.empty(num_tokens, topk, device="cuda", dtype=torch.int64)
+        # Route the co-batch through the target's experts so their padded GEMM
+        # row counts grow from 128 to 256. This exercises the M-dependent case
+        # that batch invariance must stabilize, rather than only unrelated experts.
+        routing_map.copy_(target_experts)
+        probs = torch.full((num_tokens, topk), 0.5, device="cuda", dtype=torch.float32)
+        hidden_states[target_row].copy_(target)
+        routing_map[target_row].copy_(target_experts)
+        probs[target_row].copy_(target_probs)
+        return mcore_fused_moe(
+            hidden_states,
+            probs,
+            fc1_weight,
+            fc2_weight,
+            ActivationType.SQUARED_RELU,
+            num_experts,
+            0,
+            _dev_scalar(num_tokens),
+            routing_map,
+        )[target_row]
+
+    with torch.no_grad(), set_batch_invariant_mode(True, backend="te_native"):
+        output_alone = _run(1, 0)
+        output_batched = _run(193, 73)
+
+    assert torch.equal(output_alone, output_batched), (
+        "Torch MXFP8 MoE output changed with the batch; max abs diff: "
+        f"{(output_alone - output_batched).abs().max().item()}"
+    )
