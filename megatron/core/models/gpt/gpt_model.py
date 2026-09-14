@@ -14,6 +14,7 @@ from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.extensions.transformer_engine import TELMHeadColumnParallelLinear
 from megatron.core.fp8_utils import is_mxfp8_output_proj_active
 from megatron.core.inference.contexts import BaseInferenceContext
+from megatron.core.inference.quantization.utils import apply_mxfp8_parameter_filter
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.common.embeddings import YarnRotaryEmbedding
 from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
@@ -310,6 +311,7 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
             if hasattr(module, 'finish_init'):
                 quant_config = get_quant_config_or_none(name, self.config.quant_recipe)
                 module.finish_init(quant_config)
+        apply_mxfp8_parameter_filter(self, self.config)
 
     def set_input_tensor(self, input_tensor: Tensor) -> None:
         """Sets input tensor to the model.

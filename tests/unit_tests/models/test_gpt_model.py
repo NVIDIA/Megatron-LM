@@ -48,7 +48,12 @@ class TestGPTModel:
             use_cpu_initialization=True,
             embedding_init_method_std=1.0,  # Test that we can initialize the embedding weights to something else.
         )
-        with patch('megatron.core.models.gpt.gpt_model.log_single_rank') as mock_log_single_rank:
+        with (
+            patch('megatron.core.models.gpt.gpt_model.log_single_rank') as mock_log_single_rank,
+            patch(
+                'megatron.core.models.gpt.gpt_model.apply_mxfp8_parameter_filter'
+            ) as mock_mxfp8_filter,
+        ):
             self.gpt_model = GPTModel(
                 config=transformer_config,
                 transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
@@ -56,6 +61,7 @@ class TestGPTModel:
                 max_sequence_length=4,
             )
         self.mock_log_single_rank = mock_log_single_rank
+        self.mock_mxfp8_filter = mock_mxfp8_filter
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
@@ -77,6 +83,8 @@ class TestGPTModel:
 
         num_weights = sum([p.numel() for p in self.gpt_model.parameters()])
         assert num_weights == 6240
+
+        self.mock_mxfp8_filter.assert_called_once_with(self.gpt_model, self.gpt_model.config)
 
     @pytest.mark.internal
     def test_set_input_tensor(self):

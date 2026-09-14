@@ -174,17 +174,26 @@ class TestTEWrappers:
     @pytest.mark.launch_on_gb200
     @pytest.mark.skipif(not _IS_BLACKWELL, reason="MXFP8 parameter storage needs Blackwell")
     @pytest.mark.parametrize(
-        ("inherit_model_init_context", "middle_uses_mxfp8"),
-        [(False, False), (True, True)],
-        ids=["legacy-override", "explicit-inheritance"],
+        ("recipe_storage", "global_recipe", "middle_uses_mxfp8"),
+        [
+            ({}, Fp8Recipe.mxfp8, True),
+            ({"inherit_model_init_context": True}, Fp8Recipe.mxfp8, True),
+            ({"fp8_param": False}, Fp8Recipe.mxfp8, False),
+            ({}, Fp8Recipe.tensorwise, False),
+        ],
+        ids=[
+            "automatic-inheritance",
+            "explicit-inheritance",
+            "explicit-bf16-override",
+            "mismatched-global-recipe",
+        ],
     )
     def test_per_module_mxfp8_recipe_model_init_policy(
-        self, inherit_model_init_context, middle_uses_mxfp8
+        self, recipe_storage, global_recipe, middle_uses_mxfp8
     ):
-        """Model-init inheritance is explicit and preserves BF16 boundary layers."""
+        """A matching global MXFP8 policy is inherited unless storage is explicit."""
         training_recipe = {"fp8_quantization_recipe": "mxfp8", "override_quantized_autocast": True}
-        if inherit_model_init_context:
-            training_recipe["inherit_model_init_context"] = True
+        training_recipe.update(recipe_storage)
         recipe = RecipeConfig.from_config_dict(
             {
                 "configs": {
@@ -215,7 +224,7 @@ class TestTEWrappers:
             moe_grouped_gemm=True,
             add_bias_linear=False,
             fp8="hybrid",
-            fp8_recipe=Fp8Recipe.mxfp8,
+            fp8_recipe=global_recipe,
             fp8_param=True,
             quant_recipe=recipe,
             first_last_layers_bf16=True,

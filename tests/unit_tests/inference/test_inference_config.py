@@ -65,48 +65,33 @@ class TestInferenceConfig:
 
         assert matches_mxfp8_parameter_filter(name, include, exclude) is expected
 
-    def test_selective_mxfp8_materializes_before_checkpoint_load(self, monkeypatch):
-        """Filtered BF16 parameters must bypass the checkpoint's MXFP8 cast."""
-        import megatron.inference.utils as inference_utils
+    def test_apply_mxfp8_parameter_filter_from_config(self, monkeypatch):
+        """The Core hook forwards the model's configured include/exclude policy."""
+        import megatron.core.inference.quantization.utils as inference_quantization
 
         model = torch.nn.Linear(4, 4, bias=False)
-        events = []
-        args = SimpleNamespace(
-            transformer_impl="inference_optimized",
-            fp8_recipe="mxfp8",
+        config = SimpleNamespace(
             inference_mxfp8_include_parameters=r"experts\.linear_fc[12]",
-            inference_mxfp8_exclude_parameters=None,
-            inference_grouped_gemm_backend="torch",
-            load="checkpoint",
-            inference_ckpt_non_strict=False,
+            inference_mxfp8_exclude_parameters=r"shared_experts",
         )
-        builder = SimpleNamespace(build_distributed_models=lambda **_kwargs: [model])
-
-        monkeypatch.setattr(inference_utils, "get_args", lambda: args)
-        monkeypatch.setattr(inference_utils, "HAS_NVIDIA_MODELOPT", False)
-        monkeypatch.setattr(inference_utils, "get_model_builder", lambda _args: builder)
+        calls = []
         monkeypatch.setattr(
-            inference_utils.ProcessGroupCollection,
-            "use_mpu_process_groups",
-            staticmethod(lambda: None),
-        )
-        monkeypatch.setattr(
-            inference_utils,
+            inference_quantization,
             "materialize_unselected_mxfp8_parameters_as_bf16",
-            lambda *_args, **_kwargs: events.append("materialize"),
-        )
-        monkeypatch.setattr(
-            inference_utils, "load_checkpoint", lambda **_kwargs: events.append("load_checkpoint")
-        )
-        monkeypatch.setattr(inference_utils, "resolve_mxfp8_backend", lambda _backend: "triton")
-        monkeypatch.setattr(
-            inference_utils,
-            "quantize_model_to_mxfp8",
-            lambda *_args, **_kwargs: events.append("quantize"),
+            lambda *args, **kwargs: calls.append((args, kwargs)),
         )
 
-        assert inference_utils.get_model_for_inference() is model
-        assert events == ["materialize", "load_checkpoint", "quantize"]
+        inference_quantization.apply_mxfp8_parameter_filter(model, config)
+
+        assert calls == [
+            (
+                (model,),
+                {
+                    "include_pattern": r"experts\.linear_fc[12]",
+                    "exclude_pattern": r"shared_experts",
+                },
+            )
+        ]
 
     @pytest.mark.parametrize(
         ("grouped_gemm_backend", "expected_backend"),

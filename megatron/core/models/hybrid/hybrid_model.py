@@ -11,6 +11,7 @@ from megatron.core import tensor_parallel
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
 from megatron.core.context_parallel import ContextParallelBatch
 from megatron.core.inference.contexts import BaseInferenceContext
+from megatron.core.inference.quantization.utils import apply_mxfp8_parameter_filter
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
@@ -353,6 +354,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             if hasattr(module, 'finish_init'):
                 quant_config = get_quant_config_or_none(name, self.config.quant_recipe)
                 module.finish_init(quant_config)
+        apply_mxfp8_parameter_filter(self, self.config)
 
     def set_input_tensor(self, input_tensor: Tensor) -> None:
         """Sets input tensor to the model.

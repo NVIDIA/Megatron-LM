@@ -1331,7 +1331,8 @@ class TransformerConfig(ModelParallelConfig):
 
     The regex is matched with ``re.search`` against fully qualified parameter names.
     When unset, all MXFP8 parameters are included. Parameters not selected by this
-    regex are materialized in BF16 after checkpoint loading.
+    regex are materialized in BF16 during Core model construction, before checkpoint
+    loading or refit setup.
     """
 
     inference_mxfp8_exclude_parameters: str | None = None

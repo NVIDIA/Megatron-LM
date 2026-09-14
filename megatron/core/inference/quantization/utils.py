@@ -16,6 +16,7 @@ from megatron.core.utils import copy_parameter_metadata
 
 if TYPE_CHECKING:
     from megatron.core.inference.moe import InferenceGroupedGemmBackend
+    from megatron.core.transformer.transformer_config import TransformerConfig
 
 try:
     from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Tensor as TEMXFP8Tensor
@@ -199,9 +200,9 @@ def materialize_unselected_mxfp8_parameters_as_bf16(
 ) -> None:
     """Materialize filtered-out TE MXFP8 parameters as ordinary BF16 parameters.
 
-    Standalone inference calls this before loading a BF16 checkpoint. The loader
-    can then copy directly into the replacement parameters instead of quantizing
-    into TE MXFP8 storage only for conversion to dequantize them afterward.
+    Core GPT and Hybrid model constructors call this before returning the model.
+    Any checkpoint loader can then copy directly into the replacement parameters
+    instead of quantizing into TE MXFP8 storage only to dequantize them afterward.
 
     Args:
         model: Model whose unselected TE MXFP8 parameters should be replaced.
@@ -237,6 +238,27 @@ def materialize_unselected_mxfp8_parameters_as_bf16(
             _materialize_mxfp8_parameter_as_bf16(model, parameter_name, parameter)
 
 
+def apply_mxfp8_parameter_filter(model: torch.nn.Module, config: "TransformerConfig") -> None:
+    """Apply the configured MXFP8 storage filter before checkpoint loading.
+
+    Core GPT and Hybrid model constructors call this after all submodules have
+    initialized. Checkpoint and refit integrations therefore receive the final
+    BF16/MXFP8 parameter layout without coordinating a separate callback.
+
+    Args:
+        model: Fully initialized model whose parameter names are available.
+        config: Model configuration containing the optional MXFP8 filters.
+    """
+    include_pattern = getattr(config, "inference_mxfp8_include_parameters", None)
+    exclude_pattern = getattr(config, "inference_mxfp8_exclude_parameters", None)
+    if include_pattern is None and exclude_pattern is None:
+        return
+
+    materialize_unselected_mxfp8_parameters_as_bf16(
+        model, include_pattern=include_pattern, exclude_pattern=exclude_pattern
+    )
+
+
 def quantize_model_to_mxfp8(
     model: torch.nn.Module,
     backend: MXFP8Backend = "flashinfer",
@@ -263,9 +285,8 @@ def quantize_model_to_mxfp8(
     if backend == "flashinfer":
         assert HAVE_FLASHINFER, "FlashInfer not available for MXFP8 quantization"
     if not _prefix:
-        # Keep this pre-pass for direct callers. The standalone checkpoint path
-        # invokes it before loading so filtered BF16 values never round-trip
-        # through MXFP8 storage.
+        # Keep this pre-pass for direct callers and custom model types that do
+        # not run the Core GPT/Hybrid model-construction hook.
         materialize_unselected_mxfp8_parameters_as_bf16(
             model, include_pattern=include_pattern, exclude_pattern=exclude_pattern
         )
