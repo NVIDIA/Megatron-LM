@@ -355,12 +355,6 @@ class TransformerConfig(ModelParallelConfig):
     dsa_indexer_reset_method: Literal['random', 'main-q-mean', 'main-q-mean-rescaled'] = 'random'
     """How to initialize DSA indexer parameters when resetting after checkpoint load."""
 
-    dsa_indexer_activation_start_samples: Optional[int] = None
-    """Sample position where DSA indexer activation/warmup starts."""
-
-    dsa_indexer_activation_warmup_samples: int = 0
-    """Number of samples over which to warm up only DSA indexer optimizer groups."""
-
     dsa_indexer_loss_coeff: Optional[float] = None
     """Coefficient for the DSA indexer KL divergence loss. Set to 0 to disable indexer loss."""
 
@@ -3470,13 +3464,6 @@ class TransformerConfig(ModelParallelConfig):
         assert (
             not self.dsa_reset_indexer_on_load or self.experimental_attention_variant == "dsa"
         ), "dsa_reset_indexer_on_load requires experimental_attention_variant='dsa'."
-        assert (
-            self.dsa_indexer_activation_start_samples is None
-            or self.dsa_indexer_activation_start_samples >= 0
-        ), "dsa_indexer_activation_start_samples must be non-negative when set."
-        assert (
-            self.dsa_indexer_activation_warmup_samples >= 0
-        ), "dsa_indexer_activation_warmup_samples must be non-negative."
 
         if self.experimental_attention_variant == "dsa":
             assert self.dsa_indexer_mode in (
