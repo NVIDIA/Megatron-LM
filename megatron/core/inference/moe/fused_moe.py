@@ -97,7 +97,7 @@ def _get_activation_func(
         return func if clamp_scale is None else partial(func, clamp_scale=clamp_scale)
     elif activation_type == ActivationType.SWIGLU:
         if fused_quant:
-            raise NotImplementedError("SWIGLU + MXFP8 fused-quant not implemented (bf16 only)")
+            raise NotImplementedError("SWIGLU requires separate activation and MXFP8 quantization")
         if activation_kwargs.get("clamp_scale") is not None:
             raise NotImplementedError(
                 "activation_func_tanh_clamp_scale is only implemented for squared ReLU here; "
@@ -124,9 +124,9 @@ def mcore_fused_moe(
 ) -> torch.Tensor:
     """Fused MoE: permute -> pad -> FC1 -> activation -> FC2 -> unpad -> unpermute.
 
-    Unless disable_fused_quant_kernels=True, when weights are MXFP8, uses fused
-    kernels that combine permute/activation with MXFP8 quantization into single
-    kernel launches.
+    MXFP8 squared-ReLU uses fused permute/activation-quantization kernels unless
+    disable_fused_quant_kernels=True. SwiGLU uses separate activation and MXFP8
+    quantization kernels.
 
     Args:
         hidden_states: [max_tokens, hidden_size] BF16 input. max_tokens =
@@ -162,7 +162,12 @@ def mcore_fused_moe(
     max_tokens = hidden_states.shape[0]
     use_mxfp8 = isinstance(fc1_weight, MXFP8Tensor)
     # Fused quant kernels only apply to MXFP8 path
-    use_fused_quant = use_mxfp8 and not disable_fused_quant_kernels
+    # SwiGLU uses separate activation and quantization kernels.
+    use_fused_quant = (
+        use_mxfp8
+        and activation_type == ActivationType.SQUARED_RELU
+        and not disable_fused_quant_kernels
+    )
     batch_invariant_mode = batch_invariant.enabled()
 
     if batch_invariant_mode:

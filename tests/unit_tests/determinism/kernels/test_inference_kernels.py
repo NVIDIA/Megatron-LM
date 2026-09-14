@@ -461,3 +461,42 @@ def test_mask_routing_padding_replays():
         return routing_map
 
     assert_replays_bit_exact(fn, (routing_map,), backward=False, what="mask_routing_padding")
+
+
+@pytest.mark.launch_on_gb200
+def test_mxfp8_swiglu_moe_replays():
+    """SwiGLU must select separate MXFP8 quantization without a caller override."""
+    from megatron.core.inference.moe.fused_moe import (
+        HAVE_SCALED_GMM,
+        ActivationType,
+        mcore_fused_moe,
+    )
+    from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
+
+    if not HAVE_SCALED_GMM or torch.cuda.get_device_capability()[0] < 10:
+        pytest.skip("MXFP8 scaled_grouped_mm requires PyTorch 2.10+ and Blackwell")
+    seeded()
+    tokens, hidden = 72, 128
+
+    def weight(rows):
+        q = MXFP8Tensor.from_bf16(
+            torch.randn(rows, hidden, device="cuda", dtype=torch.bfloat16), backend="triton"
+        )
+        return MXFP8Tensor(
+            data=q.data.unsqueeze(0),
+            scale=q.scale.unsqueeze(0),
+            dtype=torch.bfloat16,
+            backend="triton",
+        )
+
+    fc1, fc2 = weight(2 * hidden), weight(hidden)
+    x = torch.randn(tokens, hidden, device="cuda", dtype=torch.bfloat16)
+    probs = torch.ones(tokens, 1, device="cuda")
+    routes = torch.zeros(tokens, 1, device="cuda", dtype=torch.int64)
+    valid = _dev_scalar(tokens)
+
+    def run(x):
+        return mcore_fused_moe(x, probs, fc1, fc2, ActivationType.SWIGLU, 1, 0, valid, routes)
+
+    # One route per token also makes the non-batch-invariant atomic combine exact.
+    assert_replays_bit_exact(run, (x,), replays=3, backward=False, what="MXFP8 SwiGLU MoE")

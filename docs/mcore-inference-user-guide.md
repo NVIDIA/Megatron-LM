@@ -986,8 +986,8 @@ is the opposite of the `MegatronLLM` constructor default.
 - **Batch-invariant MoE is bf16-only** and requires the unfused
   permute/unpermute path; batch-invariant mode in general excludes context
   parallelism and attention dropout.
-- **MXFP8 fused quantization supports squared-ReLU only, not SwiGLU**, which
-  falls back to bf16.
+- **MXFP8 fused quantization supports squared-ReLU only.** SwiGLU uses separate
+  BF16 activation and MXFP8 quantization kernels; it does not fall back to BF16 GEMM.
 - **Disaggregated handoff does not support log-probs** (`return_log_probs` or
   `top_n_logprobs > 0` raises).
 
