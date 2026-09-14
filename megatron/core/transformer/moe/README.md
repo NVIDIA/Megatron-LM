@@ -333,8 +333,8 @@ allocating resources.
 
 Virtual experts require HybridEP's compact `topk_idx` API alongside dense probabilities;
 the fused TE router must expose its `topk_indices` output buffer. Ordinary HybridEP retains
-its older-build compatibility. The target router uses FP32 sigmoid scores, fusion, top-k 10
-of 512 experts, scaling 2.5, `seq_aux_loss` and expert bias. To use quantile balancing instead,
+its older-build compatibility. Supported routing includes FP32 sigmoid scores, fusion,
+`seq_aux_loss` and expert bias. To use `micro_batch` quantile balancing instead,
 set `--moe-router-load-balancing-type quantile_balancing --moe-aux-loss-coeff 0`, omit
 `--moe-router-enable-expert-bias` and `--moe-router-fusion`, and disable
 `--moe-router-force-load-balancing` for real routing. QB uses its existing unfused scorer and dual
@@ -357,10 +357,14 @@ fixed addresses and reuse the existing device tables without uploads. Virtual sl
 shared symmetric weight and gradient arenas.
 
 Each MoE layer has one runtime owner for both FC layers' native parameters, runtime weights,
-GTP bindings and pointer tables. Its class owns the shared arenas, NCCL registrations and virtual
-slot parameters, allocated at the first layer's late initialization. Later layers validate the
-same layout and create only their own native runtime parameters and tables. Finalization releases
-the shared slots and registrations before the EP process group is destroyed.
+GTP bindings and pointer tables. A shared storage object owns the arenas, NCCL registrations and
+virtual slot parameters for each compatible storage layout, allocated during late initialization.
+Layers share an EP topology; their precision, member shapes, gradient dtype and GTP layout
+determine which storage they reuse. This allows MXFP8 main experts and BF16 MTP experts in the same model.
+BF16 precision overrides retain the unfused activation and recomputation path, with runtime weights
+attached to grouped linears that enter each original linear's precision context. Virtual parameters
+remain outside the model's optimizer and checkpoint parameter sets. Finalization releases every
+layout's shared slots and registrations before the EP process group is destroyed.
 
 ### Upcycling
 Use `--moe-use-upcycling` to enable upcycling, which loads the dense model from the `--load` directory, converts it to an MoE model at runtime, and starts training. The converted model is saved to the `--save` path before training begins. Upcycling is built on distributed checkpointing, supporting parallel modes different from existing dense checkpoints, such as arbitrary expert parallelism during upcycling.
