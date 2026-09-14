@@ -184,7 +184,7 @@ def test_changed_dependency_is_selected_without_learning_or_execution(project, c
         result = _invoke(project, cache, "select")
         assert result.returncode == 0, result.stdout + result.stderr
         selected = cache / ".testmon-work/prod/rank-0/selected-tests"
-        assert selected.read_text().splitlines() == ["tests/test_app.py"]
+        assert selected.read_text().splitlines() == ["tests/test_app.py::test_active"]
         assert _snapshot(cache / "prod") == before
 
 
@@ -195,7 +195,81 @@ def test_new_test_file_is_discovered_from_old_baseline(project, cache):
     result = _invoke(project, cache, "select")
     assert result.returncode == 0, result.stdout + result.stderr
     selected = cache / ".testmon-work/prod/rank-0/selected-tests"
-    assert selected.read_text().splitlines() == ["tests/test_new.py"]
+    assert selected.read_text().splitlines() == ["tests/test_new.py::test_new"]
+
+
+def test_changed_function_selects_and_runs_only_affected_cases_in_same_file(project, tmp_path):
+    parameter_ids = ["space value", 'quote " and $value']
+    (project / "tests/test_app.py").write_text(
+        "import pytest\nfrom app import active, unused\n\n"
+        "class TestApp:\n"
+        f"    @pytest.mark.parametrize('value', [1, 2], ids={parameter_ids!r})\n"
+        "    def test_active(self, value):\n"
+        "        assert active(value) == value + 1\n\n"
+        "    def test_unused(self):\n"
+        "        assert unused(1) == 0\n"
+    )
+    cache = tmp_path / "cache"
+    baseline = _invoke(project, cache, "baseline")
+    assert baseline.returncode == 0, baseline.stdout + baseline.stderr
+    before = _snapshot(cache / "prod")
+    (project / "app.py").write_text(
+        "def active(value):\n    return 1 + value\n\n" "def unused(value):\n    return value - 1\n"
+    )
+
+    result = _invoke(project, cache, "select")
+    assert result.returncode == 0, result.stdout + result.stderr
+    expected = sorted(
+        f"tests/test_app.py::TestApp::test_active[{parameter_id}]" for parameter_id in parameter_ids
+    )
+    phase = cache / ".testmon-work/prod"
+    rank_zero = phase / "rank-0/selected-tests"
+    assert rank_zero.read_text().splitlines() == expected
+    assert _snapshot(cache / "prod") == before
+
+    # Merge overlapping, differently ordered rank results without dropping node IDs.
+    rank_zero.write_text("\n".join(reversed(expected)) + "\n")
+    (phase / "rank-1").mkdir()
+    (phase / "rank-1/selected-tests").write_text(expected[0] + "\n")
+    runner = _source("tests/unit_tests/run_ci_test.sh")
+    result = subprocess.run(
+        ["bash", "-e", "-u", "-o", "pipefail"],
+        input="\n".join(
+            (
+                "NUM_NODES=1",
+                "GPUS_PER_NODE=2",
+                "DISTRIBUTED_ARGS=()",
+                "IGNORE_ARGS=()",
+                "MARKER_ARG='not flaky'",
+                # Replace only uv/torchrun; run the actual coverage/pytest command locally.
+                "uv() {",
+                '    [[ "$1 $2 $3 $4 $5" == "run --no-sync python -m torch.distributed.run" ]]',
+                "    shift 5",
+                '    "$TEST_PYTHON" "$@"',
+                "}",
+                "merge_rank_selections() {" + _function(runner, "merge_rank_selections") + "\n}",
+                "run_selected_phase() {" + _function(runner, "run_selected_phase") + "\n}",
+                "merge_rank_selections prod",
+                "run_selected_phase prod",
+            )
+        ),
+        cwd=project,
+        env={
+            **os.environ,
+            "TEST_PYTHON": sys.executable,
+            "PYTHONPATH": str(project),
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "UNIT_TESTMON_CACHE_DIR": str(cache),
+        },
+        text=True,
+        capture_output=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (phase / "selected-tests").read_text().splitlines() == expected
+    assert "collected 2 items" in result.stdout
+    assert "2 passed" in result.stdout
+    assert _snapshot(cache / "prod") == before
 
 
 @pytest.mark.parametrize("problem", ("missing", "corrupt", "schema", "runtime"))

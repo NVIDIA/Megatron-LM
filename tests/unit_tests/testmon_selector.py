@@ -21,8 +21,8 @@ class _SelectionOutput:
         self.output = output
 
     def pytest_collection_finish(self, session) -> None:
-        selected_files = sorted({item.nodeid.split("::", 1)[0] for item in session.items})
-        self.output.write_text("".join(f"{path}\n" for path in selected_files))
+        selected_tests = sorted({item.nodeid for item in session.items})
+        self.output.write_text("".join(f"{nodeid}\n" for nodeid in selected_tests))
 
 
 def _database(cache_dir: Path, phase: str) -> Path:

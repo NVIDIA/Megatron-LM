@@ -186,7 +186,7 @@ write_testmon_summary() {
         echo "- Bucket: \`$BUCKET\`"
         echo "- Result: $result"
         if [[ -n "$selected_count" ]]; then
-            echo "- Selected files: \`$selected_count\`"
+            echo "- Selected tests: \`$selected_count\`"
         fi
     } > "$UNIT_TESTMON_CACHE_DIR/summary.md"
 }
@@ -244,13 +244,13 @@ merge_rank_selections() {
 run_selected_phase() {
     local phase="$1"
     local selection_file="$UNIT_TESTMON_CACHE_DIR/.testmon-work/$phase/selected-tests"
-    local -a selected_files=()
+    local -a selected_tests=()
     local -a command=(uv run --no-sync python -m torch.distributed.run "${DISTRIBUTED_ARGS[@]}")
 
-    while IFS= read -r path; do
-        [[ -n "$path" ]] && selected_files+=("$path")
+    while IFS= read -r nodeid; do
+        [[ -n "$nodeid" ]] && selected_tests+=("$nodeid")
     done < "$selection_file"
-    if [[ "${#selected_files[@]}" -eq 0 ]]; then
+    if [[ "${#selected_tests[@]}" -eq 0 ]]; then
         echo "Testmon selected no $phase tests."
         return 0
     fi
@@ -264,7 +264,7 @@ run_selected_phase() {
             -vs
             "${IGNORE_ARGS[@]}"
             -m "not experimental and ${MARKER_ARG}"
-            "${selected_files[@]}"
+            "${selected_tests[@]}"
         )
     else
         command+=(
@@ -273,7 +273,7 @@ run_selected_phase() {
             --experimental
             "${IGNORE_ARGS[@]}"
             -m "experimental and ${MARKER_ARG}"
-            "${selected_files[@]}"
+            "${selected_tests[@]}"
         )
     fi
     "${command[@]}"

@@ -2,7 +2,7 @@
 
 The `Run selective unit tests` label opts an eligible synthetic PR push into
 Testmon selection. The PR restores a compatible database recorded on `main`,
-selects affected files, and runs their eligible tests through the normal pytest
+selects individual affected tests, and runs them through the normal pytest
 and coverage path. PRs never record or publish Testmon databases.
 
 ## Produce the shared baseline
@@ -51,7 +51,7 @@ comparison includes all changes since that baseline.
 | Condition | Unit-test behavior |
 | --- | --- |
 | No selective label | Full bucket |
-| Label and valid compatible baseline | Select affected files |
+| Label and valid compatible baseline | Select individual affected tests |
 | Missing, incompatible or invalid baseline | Full bucket; no recording or save |
 | Selection failure | Full bucket; no recording or save |
 | Successful empty selection | No test execution for that phase |
