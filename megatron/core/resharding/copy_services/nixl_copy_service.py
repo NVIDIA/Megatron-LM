@@ -145,6 +145,7 @@ class NixlCopyService(CopyService):
         if not local_sends and not local_recvs:
             return
         pairs = match_local_ops_by_task_id(local_sends, local_recvs, "NixlCopyService", self.rank)
+        self._copy_stream.wait_stream(torch.cuda.current_stream())
         with torch.no_grad(), torch.cuda.stream(self._copy_stream):
             for send_op, recv_op in pairs:
                 recv_op.tensor.copy_(send_op.tensor)
