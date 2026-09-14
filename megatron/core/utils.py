@@ -1204,20 +1204,20 @@ def infer_gtp_allow_shape_mismatch(sharded_state_dict, checkpoint_dir, pad_for_a
         axis0 = sh_ten.prepend_axis_num
         if axis0 >= len(ckpt_shape):
             continue  # axis layout mismatch -- not a shape this function understands
-        declared0 = int(ckpt_shape[axis0])
-        expected0 = int(sh_ten.global_shape[axis0])
-        if declared0 == expected0:
+        ckpt_dim0 = int(ckpt_shape[axis0])
+        required_dim0 = int(sh_ten.global_shape[axis0])
+        if ckpt_dim0 == required_dim0:
             continue  # no difference -- nothing to fix
-        dim0_unpadded = expected0 - int(getattr(sh_ten, "gtp_pad_length", 0))
-        # Valid padding: either an unpadded save (declared0 == dim0_unpadded exactly), or an
-        # alignment-padded one (declared0 a multiple of pad_for_alignment). At
+        dim0_unpadded = required_dim0 - int(getattr(sh_ten, "gtp_pad_length", 0))
+        # Valid padding: either an unpadded save (ckpt_dim0 == dim0_unpadded exactly), or an
+        # alignment-padded one (ckpt_dim0 a multiple of pad_for_alignment). At
         # pad_for_alignment == 1 (bf16) every integer is "a multiple", so that disjunct is gated
-        # off there -- otherwise any declared0 >= expected0 would pass as "padding".
-        is_valid_padding = declared0 == dim0_unpadded or (
-            pad_for_alignment > 1 and declared0 % pad_for_alignment == 0
+        # off there -- otherwise any ckpt_dim0 >= required_dim0 would pass as "padding".
+        is_valid_padding = ckpt_dim0 == dim0_unpadded or (
+            pad_for_alignment > 1 and ckpt_dim0 % pad_for_alignment == 0
         )
-        # Padding only ever adds rows, so also require declared0 >= dim0_unpadded.
-        sh_ten.allow_shape_mismatch = declared0 >= dim0_unpadded and is_valid_padding
+        # Padding only ever adds rows, so also require ckpt_dim0 >= dim0_unpadded.
+        sh_ten.allow_shape_mismatch = ckpt_dim0 >= dim0_unpadded and is_valid_padding
 
 
 def make_sharded_tensor_for_checkpoint(tensor, key, prepend_offsets=(), replica_id=None, **kwargs):
