@@ -5,6 +5,7 @@ import functools
 import logging
 import warnings
 from abc import ABC
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Dict, Optional, Protocol, Union
 
@@ -23,6 +24,7 @@ except ImportError:
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
+from megatron.core.enums import Fp8Recipe
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -391,6 +393,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         attention_optional_kwargs["pg_collection"] = pg_collection
         if pp_layer_offset is not None:
             attention_optional_kwargs["pp_layer_offset"] = pp_layer_offset
+        attention_optional_kwargs["is_mtp_layer"] = is_mtp_layer
 
         # [Module 2: SelfAttention]
         self.self_attention = build_module(
@@ -562,6 +565,18 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             if "_forward_post_mlp" in vars(klass):
                 self._legacy_forward_post_mlp = klass._forward_post_mlp
                 break
+
+    def get_inner_quantization_context(self) -> AbstractContextManager:
+        """Return the quantization context for fine-grained layer execution."""
+        if self.config.fp8 and self.config.fp8_recipe != Fp8Recipe.delayed:
+            from megatron.core.fp8_utils import get_fp8_context  # to avoid circular import
+
+            return get_fp8_context(self.config, self.layer_number - 1)
+        if self.config.fp4:
+            from megatron.core.fp4_utils import get_fp4_context  # to avoid circular import
+
+            return get_fp4_context(self.config, self.layer_number - 1)
+        return nullcontext()
 
     def create_mcore_cudagraph_manager(self, config):
         """Register the transformer layer for cudagraphs."""
@@ -1743,6 +1758,7 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         hidden_dropout: Optional[float] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
         vp_stage: Optional[int] = None,
+        name: Optional[str] = None,
     ):
         super().__init__(
             config=config,
@@ -1751,6 +1767,7 @@ class HyperConnectionTransformerLayer(TransformerLayer):
             hidden_dropout=hidden_dropout,
             pg_collection=pg_collection,
             vp_stage=vp_stage,
+            name=name,
         )
 
         if submodules.cross_attention_hyper_connection is not IdentityOp:
@@ -1768,16 +1785,24 @@ class HyperConnectionTransformerLayer(TransformerLayer):
             "Use TransformerLayer instead if hyper connections are not needed."
         )
 
-        # mHC over a single MoE-MLP layer is not supported in this implementation;
-        # compose mHC with MoE by wrapping MoE inside a HyperConnectionHybridLayer
-        # (HybridStack path) instead. This guard fires at setup so misconfigured
-        # specs fail fast rather than producing silently-wrong shapes at runtime.
-        if self.is_moe_layer:
+        unsupported_moe_cuda_graph_modules = {
+            CudaGraphModule.moe,
+            CudaGraphModule.moe_router,
+            CudaGraphModule.moe_preprocess,
+        }
+        if self.is_moe_layer and unsupported_moe_cuda_graph_modules.intersection(
+            self.config.cuda_graph_modules
+        ):
             raise NotImplementedError(
-                "HyperConnectionTransformerLayer does not support MoE MLP submodules. "
-                "To combine mHC with MoE, wrap the MoE block as a HybridStack layer "
-                "via HyperConnectionHybridLayer instead."
+                "HyperConnectionTransformerLayer does not support MoE CUDA graph "
+                "scopes. Disable the moe, moe_router, and moe_preprocess CUDA graph modules "
+                "when combining mHC with a MoE MLP submodule."
             )
+
+        # GraphableMegatronModule calls create_mcore_cudagraph_manager before the MLP is
+        # built, so repeat the local-graph decision now that self.is_moe_layer is authoritative.
+        if self.config.cuda_graph_impl == "local":
+            self.create_mcore_cudagraph_manager(self.config)
 
         self.self_attention_hyper_connection = build_module(
             submodules.self_attention_hyper_connection,
@@ -1826,6 +1851,24 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         )
         return static_inputs
 
+    def create_mcore_cudagraph_manager(self, config):
+        """Create only CUDA graph managers compatible with this mHC layer."""
+        # The first call comes from GraphableMegatronModule before TransformerLayer has
+        # constructed self.mlp and set self.is_moe_layer.
+        if not hasattr(self, "mlp"):
+            return
+
+        if self.is_moe_layer:
+            # Whole-layer and MLP-scope graphs would capture dynamic MoE dispatch. Mixed
+            # models may still request MLP graphs globally, so leave only this MoE layer eager.
+            if not config.cuda_graph_modules or (
+                CudaGraphModule.mlp in config.cuda_graph_modules
+                and CudaGraphModule.attn not in config.cuda_graph_modules
+            ):
+                return
+
+        super().create_mcore_cudagraph_manager(config)
+
     def _get_submodules_under_cudagraphs(self):
         """Override to include hyper connection modules.
 
@@ -1841,8 +1884,7 @@ class HyperConnectionTransformerLayer(TransformerLayer):
 
         if CudaGraphModule.attn in self.config.cuda_graph_modules:
             submodules.append(self.self_attention_hyper_connection)
-        # HC layer rejects MoE MLPs in __init__, so only the dense (mlp) scope applies.
-        if CudaGraphModule.mlp in self.config.cuda_graph_modules:
+        if CudaGraphModule.mlp in self.config.cuda_graph_modules and not self.is_moe_layer:
             submodules.append(self.mlp_hyper_connection)
         return submodules
 
