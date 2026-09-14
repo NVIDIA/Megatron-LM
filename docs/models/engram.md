@@ -55,7 +55,9 @@ Startup validates the following before model allocation:
 - the memory dimension is divisible by the positive number of hash heads;
 - the versioned tokenizer-map artifact matches the configured tokenizer vocabulary, pad ID,
   selected layers, maximum order, and hash seed;
-- CUDA graphs and FSDP are off (CP is supported for unpacked rows; CP with packed rows is rejected);
+- CUDA graphs and FSDP are off;
+- context parallelism is not combined with packed rows -- the memory handles that layout, but
+  upstream's THD context-parallel partitioning crashes with or without Engram;
 - packed (THD) sequences use the `--sft` family (schedulers including `--use-varlen-dataset`
   are rejected) and, with PP > 1, `--pad-packed-seq-alignment max`; PP >= 3 is blocked upstream.
 

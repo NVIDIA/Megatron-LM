@@ -92,3 +92,53 @@ def scatter_sequence(tensor: Tensor, group, sequence_dim: int) -> Tensor:
     if cp_size == 1:
         return tensor
     return select_zigzag(tensor, cp_size, get_pg_rank(group), sequence_dim)
+
+
+def thd_partition_index(cu_seqlens: Tensor, cp_size: int, cp_rank: int) -> Tensor:
+    """Global positions owned by ``cp_rank`` when packed rows are zigzagged per document.
+
+    Packed (THD) context parallelism does not zigzag the row as a whole: it applies the same
+    load-balanced split *inside each document*, which is why every document length must be
+    divisible by ``2 * cp_size``. The layout therefore changes with the batch's document
+    count, and the sequence cannot be restored from a fixed chunk map the way an unpacked row
+    can. Mirrors Transformer Engine's ``thd_get_partitioned_indices``.
+    """
+    boundaries = cu_seqlens.to(torch.int64).tolist()
+    spans = []
+    for start, end in zip(boundaries[:-1], boundaries[1:]):
+        length = end - start
+        if length == 0:
+            continue
+        if length % (2 * cp_size) != 0:
+            raise ValueError(
+                f"Engram context-parallel packed rows require every document length to be "
+                f"divisible by 2 * cp_size ({2 * cp_size}); got {length}."
+            )
+        chunk = length // (2 * cp_size)
+        first = start + cp_rank * chunk
+        second = start + (2 * cp_size - cp_rank - 1) * chunk
+        spans.append(torch.arange(first, first + chunk, device=cu_seqlens.device))
+        spans.append(torch.arange(second, second + chunk, device=cu_seqlens.device))
+    if not spans:
+        return torch.empty(0, dtype=torch.int64, device=cu_seqlens.device)
+    return torch.cat(spans)
+
+
+def gather_sequence_thd(tensor: Tensor, group, cu_seqlens: Tensor, total_length: int) -> Tensor:
+    """Restore the packed row's global order from this rank's per-document zigzag shards."""
+    cp_size = get_pg_size(group)
+    if cp_size == 1:
+        return tensor
+    gathered = _DifferentiableCPAllGather.apply(tensor, group, 0)
+    index = torch.cat([thd_partition_index(cu_seqlens, cp_size, rank) for rank in range(cp_size)])
+    restored = gathered.new_zeros((total_length, *gathered.shape[1:]))
+    return restored.index_copy(0, index, gathered)
+
+
+def scatter_sequence_thd(tensor: Tensor, group, cu_seqlens: Tensor) -> Tensor:
+    """Take this rank's per-document zigzag positions out of a globally ordered packed row."""
+    cp_size = get_pg_size(group)
+    if cp_size == 1:
+        return tensor
+    index = thd_partition_index(cu_seqlens, cp_size, get_pg_rank(group))
+    return tensor.index_select(0, index)

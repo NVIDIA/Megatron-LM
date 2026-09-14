@@ -9,6 +9,7 @@ Getting this wrong is the kind of bug an end-to-end loss comparison hides, becau
 consistently permuted sequence still trains.
 """
 
+import pytest
 import torch
 
 from megatron.core.models.engram.cp_layout import restore_zigzag, select_zigzag
@@ -49,3 +50,29 @@ def test_cp_size_one_is_the_identity():
     sequence = _global(5)
     torch.testing.assert_close(select_zigzag(sequence, 1, 0, 1), sequence)
     torch.testing.assert_close(restore_zigzag(sequence, 1, 1), sequence)
+
+
+def test_thd_partition_matches_per_document_zigzag():
+    """Packed rows zigzag inside each document, not across the row."""
+    from megatron.core.models.engram.cp_layout import thd_partition_index
+
+    # Two documents of length 8 each, cp_size=2 -> 4 chunks of 2 per document.
+    cu_seqlens = torch.tensor([0, 8, 16], dtype=torch.int32)
+    # Rank 0 owns chunks 0 and 3 of every document; rank 1 owns chunks 1 and 2.
+    torch.testing.assert_close(
+        thd_partition_index(cu_seqlens, 2, 0), torch.tensor([0, 1, 6, 7, 8, 9, 14, 15])
+    )
+    torch.testing.assert_close(
+        thd_partition_index(cu_seqlens, 2, 1), torch.tensor([2, 3, 4, 5, 10, 11, 12, 13])
+    )
+    # Together the ranks cover every position exactly once.
+    covered = torch.cat([thd_partition_index(cu_seqlens, 2, r) for r in range(2)]).sort().values
+    torch.testing.assert_close(covered, torch.arange(16))
+
+
+def test_thd_partition_rejects_indivisible_documents():
+    from megatron.core.models.engram.cp_layout import thd_partition_index
+
+    cu_seqlens = torch.tensor([0, 6], dtype=torch.int32)  # 6 is not divisible by 2*cp_size=4
+    with pytest.raises(ValueError, match="divisible by 2 \\* cp_size"):
+        thd_partition_index(cu_seqlens, 2, 0)

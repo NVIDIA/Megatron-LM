@@ -171,7 +171,7 @@ def test_invalid_configuration_messages(tmp_path):
     # Context parallelism is supported for unpacked rows; only CP x packed rows is rejected,
     # because packed rows partition per batch rather than by a static zigzag.
     config.validate_startup(_startup_transformer_config(context_parallel_size=2), 16)
-    with pytest.raises(ValueError, match="context parallelism with packed"):
+    with pytest.raises(ValueError, match="cu_seqlens_padded=None"):
         config.validate_startup(
             _startup_transformer_config(context_parallel_size=2), 16, packed_sequences=True
         )

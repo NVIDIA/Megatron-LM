@@ -21,7 +21,15 @@ from megatron.core.transformer.module import MegatronModule
 from megatron.core.utils import get_pg_rank, get_pg_size, nvtx_range_pop, nvtx_range_push
 
 from .config import EngramConfig
-from .cp_layout import gather_sequence, scatter_sequence, select_zigzag
+from .cp_layout import (
+    gather_sequence,
+    restore_zigzag,
+    gather_sequence_thd,
+    scatter_sequence,
+    scatter_sequence_thd,
+    select_zigzag,
+    thd_partition_index,
+)
 from .distributed_embedding import EPShardedMultiTableEmbedding
 from .hashing import build_ngram_hashes, slice_hashes_for_sequence_parallel
 
@@ -121,6 +129,25 @@ class EngramGroupRMSNorm(torch.nn.Module):
         if self.zero_centered:
             gamma = 1.0 + gamma
         return (normed * gamma).type_as(hidden)
+
+
+def _gather_tokens_across_cp(input_ids: Tensor, cp_group, cu_seqlens: Tensor | None) -> Tensor:
+    """Restore the globally ordered token row from this rank's context-parallel shard.
+
+    Token IDs are not differentiable, so this is a plain all-gather plus the inverse of the
+    partitioning the batch went through: a plain zigzag for an unpacked row, and the
+    per-document zigzag for a packed one.
+    """
+    cp_size = get_pg_size(cp_group)
+    parts = [torch.empty_like(input_ids) for _ in range(cp_size)]
+    torch.distributed.all_gather(parts, input_ids.contiguous(), group=cp_group)
+    gathered = torch.cat(parts, dim=1)
+    if cu_seqlens is None:
+        return restore_zigzag(gathered, cp_size, sequence_dim=1)
+    total_length = int(cu_seqlens[-1].item())
+    index = torch.cat([thd_partition_index(cu_seqlens, cp_size, rank) for rank in range(cp_size)])
+    restored = gathered.new_zeros((gathered.shape[0], total_length))
+    return restored.index_copy(1, index, gathered)
 
 
 def _row_cu_seqlens(packed_seq_params: PackedSeqParams | None) -> Tensor | None:
@@ -412,8 +439,25 @@ class Engram(MegatronModule):
             )
         return _SequenceParallelConvHalo.apply(normed, self.conv_history_length, self.tp_group)
 
-    def _short_convolution(self, value: Tensor) -> Tensor:
+    def _short_convolution(self, value: Tensor, cu_seqlens: Tensor | None = None) -> Tensor:
         cp_size = get_pg_size(self.cp_group)
+        if cp_size > 1 and cu_seqlens is not None:
+            # Packed rows zigzag per document, so the chunk map changes with the batch and
+            # the halo's fixed neighbour pattern no longer describes it. Restore the row,
+            # convolve it as if CP were off, and scatter it back.
+            sequence_parallel = self.config.sequence_parallel and get_pg_size(self.tp_group) > 1
+            if sequence_parallel:
+                value = gather_from_sequence_parallel_region(
+                    value, tensor_parallel_output_grad=False, group=self.tp_group
+                )
+            total_length = int(cu_seqlens[-1].item())
+            restored = gather_sequence_thd(value, self.cp_group, cu_seqlens, total_length)
+            convolved = scatter_sequence_thd(
+                self._short_convolution_local(restored), self.cp_group, cu_seqlens
+            )
+            if sequence_parallel:
+                convolved = scatter_to_sequence_parallel_region(convolved, group=self.tp_group)
+            return convolved
         if cp_size > 1 and not self.engram_config.cp_convolution_all_gather:
             # Phase B (default): exchange only conv_history_length positions per boundary.
             sequence_parallel = self.config.sequence_parallel and get_pg_size(self.tp_group) > 1
@@ -524,6 +568,7 @@ class Engram(MegatronModule):
                 f"Engram expected hidden width {expected_hidden}, got {hidden_states.shape[-1]}."
             )
 
+        row_cu_seqlens = _row_cu_seqlens(packed_seq_params)
         message = "engram.hash"
         nvtx_range_push(message)
         try:
@@ -532,11 +577,12 @@ class Engram(MegatronModule):
             # placed on another rank, so the memory is computed on the restored global
             # sequence and re-selected afterwards. input_ids is a small int64 tensor, so the
             # gather costs far less than threading a second token channel through the model.
-            global_input_ids = (
-                gather_sequence(input_ids, self.cp_group, sequence_dim=1, differentiable=False)
-                if cp_size > 1
-                else input_ids
-            )
+            if cp_size > 1:
+                global_input_ids = _gather_tokens_across_cp(
+                    input_ids, self.cp_group, row_cu_seqlens
+                )
+            else:
+                global_input_ids = input_ids
             hash_ids = build_ngram_hashes(
                 input_ids=global_input_ids,
                 tokenizer_remap=self.tokenizer_remap,
@@ -546,12 +592,16 @@ class Engram(MegatronModule):
                 num_hash_heads=self.engram_config.num_hash_heads,
                 boundary_token_id=self.engram_config.hash_boundary_token_id,
                 reset_at_boundary=self.engram_config.variant_spec.resets_windows_at_boundary_token,
-                cu_seqlens=_row_cu_seqlens(packed_seq_params),
+                cu_seqlens=row_cu_seqlens,
             )
             if cp_size > 1:
-                hash_ids = select_zigzag(
-                    hash_ids, cp_size, get_pg_rank(self.cp_group), sequence_dim=1
-                )
+                if row_cu_seqlens is not None:
+                    index = thd_partition_index(row_cu_seqlens, cp_size, get_pg_rank(self.cp_group))
+                    hash_ids = hash_ids.index_select(1, index)
+                else:
+                    hash_ids = select_zigzag(
+                        hash_ids, cp_size, get_pg_rank(self.cp_group), sequence_dim=1
+                    )
             hash_ids = slice_hashes_for_sequence_parallel(
                 hash_ids, hidden_states.shape[0], self.tp_group
             )
@@ -584,7 +634,7 @@ class Engram(MegatronModule):
         message = "engram.short-conv"
         nvtx_range_push(message)
         try:
-            output = value + self._short_convolution(value)
+            output = value + self._short_convolution(value, row_cu_seqlens)
         finally:
             nvtx_range_pop(message)
         return output.reshape(hidden_states.shape)
