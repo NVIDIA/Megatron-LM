@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 from importlib.metadata import PackageNotFoundError, distributions, version
 from pathlib import Path
 
-SCHEMA = 2
+SCHEMA = 3
 TESTMON_VERSION = "2.2.0"
 PHASES = ("prod", "experimental")
 TRACKED_ENVIRONMENT_PACKAGES = frozenset(
@@ -100,7 +100,7 @@ def _digest(path: Path) -> str:
 
 
 def cache_identity(root: Path, bucket: str, recipe_platform: str, image_id: str) -> dict:
-    """Fingerprint build inputs and execution settings, excluding ordinary source edits."""
+    """Separate cache lookup from compatibility checks and diagnostic image identity."""
     if recipe_platform not in {"dgx_h100", "dgx_gb200"}:
         raise ValueError(f"unsupported Testmon platform: {recipe_platform}")
     if not bucket.startswith("tests/unit_tests/") or "\n" in bucket:
@@ -119,15 +119,13 @@ def cache_identity(root: Path, bucket: str, recipe_platform: str, image_id: str)
         "bucket": bucket,
         "environment": "dev",
         "tag": "latest",
-        "image_id": image_id,
         "inputs": inputs,
     }
-    fingerprint = hashlib.sha256(json.dumps(contract, sort_keys=True).encode()).hexdigest()
     bucket_hash = hashlib.sha256(bucket.encode()).hexdigest()[:16]
     return {
-        **contract,
-        "compatibility": fingerprint,
-        "cache_prefix": f"unit-testmon-v2-main-{recipe_platform}-{bucket_hash}-{fingerprint}-",
+        "compatibility": contract,
+        "image_id": image_id,
+        "cache_prefix": f"unit-testmon-v{SCHEMA}-main-{recipe_platform}-{bucket_hash}-",
     }
 
 
@@ -221,7 +219,8 @@ def finalize(cache_dir: Path, identity: dict, source_sha: str, generation: str) 
         "source_sha": source_sha,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "generation": generation,
-        "identity": identity,
+        "identity": identity["compatibility"],
+        "image_id": identity["image_id"],
     }
     _write_json(cache_dir / "manifest.json", manifest)
     return manifest
@@ -235,7 +234,7 @@ def validate_cache(cache_dir: Path, identity: dict, matched_key: str) -> dict:
         raise ValueError("invalid Testmon cache generation")
     if matched_key != identity["cache_prefix"] + generation:
         raise ValueError("restored Testmon key does not match its generation")
-    if manifest.get("schema") != SCHEMA or manifest.get("identity") != identity:
+    if manifest.get("schema") != SCHEMA or manifest.get("identity") != identity["compatibility"]:
         raise ValueError("Testmon cache compatibility changed")
     if manifest.get("source_ref") != "refs/heads/main" or not re.fullmatch(
         r"[0-9a-f]{40}", str(manifest.get("source_sha", ""))
@@ -279,12 +278,17 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "finalize":
             finalize(args.cache_dir, _read_json(args.identity), args.source_sha, args.generation)
         else:
-            manifest = validate_cache(args.cache_dir, _read_json(args.identity), args.matched_key)
+            identity = _read_json(args.identity)
+            manifest = validate_cache(args.cache_dir, identity, args.matched_key)
             created_at = datetime.fromisoformat(manifest["created_at"])
             age_hours = (datetime.now(timezone.utc) - created_at).total_seconds() / 3600
             print(
                 f"Baseline source: {manifest['source_sha']} "
                 f"(created {manifest['created_at']}; age {age_hours:.1f} hours)"
+            )
+            print(
+                f"Baseline image: {manifest.get('image_id', 'unknown')}; "
+                f"current image: {identity['image_id']}"
             )
     except (OSError, ValueError, sqlite3.Error) as error:
         print(f"Testmon cache: {error}", file=sys.stderr)

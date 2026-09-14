@@ -63,34 +63,40 @@ def _snapshot(directory):
     }
 
 
-def test_source_edits_preserve_identity_but_build_inputs_invalidate(source_tree):
+def test_source_edits_preserve_identity(source_tree):
     before = cache.cache_identity(source_tree, BUCKET, "dgx_h100", IMAGE_ID)
     (source_tree / "megatron/core/ordinary.py").write_text("changed source")
     assert cache.cache_identity(source_tree, BUCKET, "dgx_h100", IMAGE_ID) == before
-    (source_tree / "uv.lock").write_text("changed dependency")
-    assert (
-        cache.cache_identity(source_tree, BUCKET, "dgx_h100", IMAGE_ID)["cache_prefix"]
-        != before["cache_prefix"]
-    )
 
 
 @pytest.mark.parametrize(
-    "changed", ["docker/.ngc_version.dev", ".dockerignore", "tests/unit_tests/find_test_cases.py"]
+    "changed",
+    ["uv.lock", "docker/.ngc_version.dev", ".dockerignore", "tests/unit_tests/find_test_cases.py"],
 )
-def test_execution_and_hidden_container_inputs_invalidate(source_tree, changed):
-    before = cache.cache_identity(source_tree, BUCKET, "dgx_h100", IMAGE_ID)
+def test_build_inputs_preserve_lookup_prefix_but_reject_restored_generation(
+    source_tree, generation, changed
+):
+    directory, producer = generation
     (source_tree / changed).write_text("changed")
-    assert cache.cache_identity(source_tree, BUCKET, "dgx_h100", IMAGE_ID) != before
+    consumer = cache.cache_identity(source_tree, BUCKET, "dgx_h100", IMAGE_ID)
+    assert consumer["cache_prefix"] == producer["cache_prefix"]
+    assert consumer["compatibility"] != producer["compatibility"]
+    before = _snapshot(directory)
+    with pytest.raises(ValueError, match="compatibility"):
+        cache.validate_cache(directory, consumer, producer["cache_prefix"] + "123-1")
+    assert _snapshot(directory) == before
 
 
-def test_image_platform_and_bucket_are_isolated(source_tree):
+def test_platform_and_bucket_are_isolated(source_tree):
     identities = [
         cache.cache_identity(source_tree, BUCKET, "dgx_h100", IMAGE_ID),
         cache.cache_identity(source_tree, BUCKET, "dgx_gb200", IMAGE_ID),
         cache.cache_identity(source_tree, "tests/unit_tests/other.py", "dgx_h100", IMAGE_ID),
-        cache.cache_identity(source_tree, BUCKET, "dgx_h100", "sha256:" + "b" * 64),
     ]
-    assert len({identity["cache_prefix"] for identity in identities}) == 4
+    assert len({identity["cache_prefix"] for identity in identities}) == 3
+    assert all(
+        identity["cache_prefix"].startswith("unit-testmon-v3-main-") for identity in identities
+    )
     with pytest.raises(ValueError, match="immutable"):
         cache.cache_identity(source_tree, BUCKET, "dgx_h100", "image:latest")
 
@@ -119,18 +125,50 @@ def test_runtime_tracks_normalized_exact_versions_and_duplicate_distributions(mo
     assert identity["python"]
 
 
-def test_valid_generation_is_read_only(generation):
+@pytest.mark.parametrize("consumer_image", [IMAGE_ID, "sha256:" + "c" * 64])
+def test_valid_generation_accepts_different_image_and_is_read_only(
+    generation, source_tree, consumer_image
+):
     directory, identity = generation
+    consumer = cache.cache_identity(source_tree, BUCKET, "dgx_h100", consumer_image)
+    assert consumer["cache_prefix"] == identity["cache_prefix"]
     before = _snapshot(directory)
-    manifest = cache.validate_cache(directory, identity, identity["cache_prefix"] + "123-1")
+    manifest = cache.validate_cache(directory, consumer, identity["cache_prefix"] + "123-1")
     assert manifest["source_sha"] == "b" * 40
+    assert manifest["image_id"] == IMAGE_ID
+    assert manifest["identity"] == consumer["compatibility"]
+    assert "image_id" not in manifest["identity"]
     for phase in cache.PHASES:
         cache.validate_phase(directory, phase)
     assert _snapshot(directory) == before
 
 
+def test_run_and_attempt_generations_share_prefix_and_require_matching_key(generation):
+    directory, identity = generation
+    keys = []
+    for generation_id in ("123-1", "123-2", "456-1"):
+        cache.finalize(directory, identity, "b" * 40, generation_id)
+        key = identity["cache_prefix"] + generation_id
+        manifest = cache.validate_cache(directory, identity, key)
+        assert manifest["generation"] == generation_id
+        keys.append(key)
+    assert len(set(keys)) == 3
+    with pytest.raises(ValueError, match="generation"):
+        cache.validate_cache(directory, identity, keys[0])
+
+
 @pytest.mark.parametrize(
-    "mutation", ["missing", "corrupt", "schema", "wal", "metadata", "runtime", "checksum"]
+    "mutation",
+    [
+        "missing",
+        "corrupt",
+        "schema",
+        "wal",
+        "metadata",
+        "old-metadata-schema",
+        "runtime",
+        "checksum",
+    ],
 )
 def test_invalid_phase_is_rejected_without_repair(generation, mutation):
     directory, _ = generation
@@ -150,7 +188,9 @@ def test_invalid_phase_is_rejected_without_repair(generation, mutation):
         metadata_path.write_text("[]")
     else:
         metadata = json.loads(metadata_path.read_text())
-        if mutation == "runtime":
+        if mutation == "old-metadata-schema":
+            metadata["schema"] = 2
+        elif mutation == "runtime":
             metadata["runtime"]["python"] = "0.0.0"
         else:
             metadata["database_sha256"] = "0" * 64
@@ -161,19 +201,27 @@ def test_invalid_phase_is_rejected_without_repair(generation, mutation):
     assert _snapshot(directory) == before
 
 
-def test_manifest_rejects_wrong_key_compatibility_and_incomplete_phase(generation):
+def test_manifest_rejects_wrong_key_and_incomplete_phase(generation):
     directory, identity = generation
     with pytest.raises(ValueError, match="generation"):
         cache.validate_cache(directory, identity, identity["cache_prefix"] + "999-1")
-    with pytest.raises(ValueError, match="compatibility"):
-        cache.validate_cache(
-            directory, {**identity, "image_id": "different"}, identity["cache_prefix"] + "123-1"
-        )
     (directory / "manifest.json").unlink()
     (directory / "experimental/metadata.json").unlink()
     with pytest.raises(OSError):
         cache.finalize(directory, identity, "c" * 40, "456-1")
     assert not (directory / "manifest.json").exists()
+
+
+def test_manifest_rejects_previous_cache_schema(generation):
+    directory, identity = generation
+    path = directory / "manifest.json"
+    manifest = json.loads(path.read_text())
+    manifest["schema"] = 2
+    path.write_text(json.dumps(manifest))
+    before = _snapshot(directory)
+    with pytest.raises(ValueError, match="compatibility"):
+        cache.validate_cache(directory, identity, identity["cache_prefix"] + "123-1")
+    assert _snapshot(directory) == before
 
 
 def test_manifest_requires_timezone_for_age_reporting(generation):
@@ -220,9 +268,19 @@ def test_producer_result_requires_cache_publication(mode, publication, expected)
     assert result.stdout == expected
 
 
-@pytest.mark.parametrize("restore", ["valid", "miss", "error", "invalid", "identity-error"])
-def test_action_resolver_uses_prefix_restores_and_never_bootstraps(generation, tmp_path, restore):
+@pytest.mark.parametrize(
+    "restore",
+    ["valid", "different-image", "changed-config", "miss", "error", "invalid", "identity-error"],
+)
+def test_action_resolver_uses_prefix_restores_and_never_bootstraps(
+    generation, source_tree, tmp_path, restore
+):
     directory, identity = generation
+    if restore == "different-image":
+        identity = cache.cache_identity(source_tree, BUCKET, "dgx_h100", "sha256:" + "c" * 64)
+    elif restore == "changed-config":
+        (source_tree / "tests/unit_tests/find_test_cases.py").write_text("changed")
+        identity = cache.cache_identity(source_tree, BUCKET, "dgx_h100", IMAGE_ID)
     runtime_dir = tmp_path / "runtime"
     runtime_dir.mkdir()
     identity_file = runtime_dir / "unit-testmon-identity.json"
@@ -257,11 +315,12 @@ def test_action_resolver_uses_prefix_restores_and_never_bootstraps(generation, t
         check=False,
     )
     assert result.returncode == 0, result.stderr
-    assert output.read_text().strip() == ("mode=enforce" if restore == "valid" else "mode=full")
+    valid = restore in {"valid", "different-image"}
+    assert output.read_text().strip() == ("mode=enforce" if valid else "mode=full")
     after = _snapshot(directory)
     after.pop("summary.md", None)
     assert after == before
-    if restore == "valid":
+    if valid:
         assert "b" * 40 in summary.read_text()
     else:
         assert "without recording or saving" in summary.read_text()
