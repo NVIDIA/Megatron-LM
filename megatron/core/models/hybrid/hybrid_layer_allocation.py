@@ -208,10 +208,10 @@ def clone_hybrid_layer_config_list(
 ) -> list[TransformerConfig]:
     """Clone every physical layer-config occurrence without invoking ``__post_init__``."""
     _validate_layer_config_sequence(layer_config_list, "hybrid layer config list")
-    return [
-        layer_utils.normalize_hybrid_layer_config(type(layer_config).from_config(layer_config))
-        for layer_config in layer_config_list
-    ]
+    cloned_configs = [type(config).from_config(config) for config in layer_config_list]
+    for config in cloned_configs:
+        config.is_hybrid_model = True
+    return cloned_configs
 
 
 def pattern_from_ratios(

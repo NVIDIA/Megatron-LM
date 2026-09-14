@@ -351,9 +351,14 @@ class TestHybridModel:
         num_weights = sum([p.numel() for p in self.model.parameters()])
         assert num_weights == 1774872
 
-    def test_config_list_preserves_values_and_clones_each_occurrence(self):
+    @pytest.mark.parametrize("is_hybrid_model", [False, True])
+    def test_config_list_preserves_values_and_clones_each_occurrence(self, is_hybrid_model):
         model_config = TransformerConfig(
-            num_layers=3, hidden_size=256, num_attention_heads=4, use_cpu_initialization=True
+            num_layers=3,
+            hidden_size=256,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            is_hybrid_model=is_hybrid_model,
         )
         attention_config = AttentionLayerConfig.from_config(model_config)
         attention_config.num_layers = 7
@@ -362,6 +367,8 @@ class TestHybridModel:
         mlp_config.num_layers = 7
         mlp_config.ffn_hidden_size = 768
         source = [attention_config, mlp_config, attention_config]
+        source_state = [vars(config).copy() for config in source]
+        model_output_initializer = model_config.output_layer_init_method
 
         model = HybridModel(
             config=model_config,
@@ -370,6 +377,8 @@ class TestHybridModel:
             max_sequence_length=4,
             hybrid_layer_config_list=source,
         )
+        assert [vars(config) for config in source] == source_state
+        assert model_config.output_layer_init_method is model_output_initializer
         source.append(mlp_config)
 
         physical_configs = model.decoder.layer_config_list
@@ -386,19 +395,17 @@ class TestHybridModel:
             for physical, source_config in zip(physical_configs, source[:3], strict=True)
         )
         assert physical_configs[0].output_layer_init_method is torch.nn.init.zeros_
+        assert physical_configs[2].output_layer_init_method is torch.nn.init.zeros_
         assert all(config.num_layers == model_config.num_layers for config in physical_configs)
         assert attention_config.num_layers == 7
         assert mlp_config.num_layers == 7
         assert physical_configs[1].ffn_hidden_size == 768
-        assert physical_configs[1].output_layer_init_method.keywords["std"] == pytest.approx(
-            model_config.init_method_std / model_config.num_layers**0.5
-        )
-        assert mlp_config.output_layer_init_method.keywords["std"] == pytest.approx(
-            model_config.init_method_std / (2 * model_config.num_layers) ** 0.5
+        _assert_equal_with_partial_contents(
+            physical_configs[1].output_layer_init_method, mlp_config.output_layer_init_method
         )
         assert all(config.is_hybrid_model for config in physical_configs)
-        assert attention_config.is_hybrid_model is False
-        assert mlp_config.is_hybrid_model is False
+        assert attention_config.is_hybrid_model is is_hybrid_model
+        assert mlp_config.is_hybrid_model is is_hybrid_model
         assert model.config is model_config
         assert model_config.is_hybrid_model is True
         assert model_config._hybrid_has_moe_layers is False

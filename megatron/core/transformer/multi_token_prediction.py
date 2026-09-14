@@ -1382,7 +1382,6 @@ class MultiTokenPredictionLayer(MegatronModule):
                 clone_hybrid_layer_config_list,
                 validate_segment_layers,
             )
-            from megatron.core.models.hybrid.layers import utils as layer_utils
 
             if self.mtp_layer_config_list is not None:
                 layer_config_list = clone_hybrid_layer_config_list(self.mtp_layer_config_list)
@@ -1396,7 +1395,6 @@ class MultiTokenPredictionLayer(MegatronModule):
                     layer_config.num_layers = self.config.num_layers
                     layer_config.mtp_num_layers = self.config.mtp_num_layers
                     layer_config.mtp_use_repeated_layer = self.config.mtp_use_repeated_layer
-                    layer_utils.normalize_hybrid_layer_config(layer_config)
             self.mtp_model_layer = HybridStack(
                 config=self.config,
                 submodules=hybrid_submodules,

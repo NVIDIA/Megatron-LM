@@ -296,7 +296,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                     "MTP supports at most one layer when "
                     "overlap_moe_expert_parallel_comm is enabled."
                 )
-            layer_utils.normalize_hybrid_layer_config(self.config)
+            self.config.is_hybrid_model = True
 
             layer_config_list, layer_offset = select_pipeline_segment_from_config_list(
                 parsed_config_list.main_layer_config_list,
@@ -366,7 +366,6 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 layer_config.num_layers = self.config.num_layers
                 layer_config.mtp_num_layers = self.config.mtp_num_layers
                 layer_config.mtp_use_repeated_layer = self.config.mtp_use_repeated_layer
-                layer_utils.normalize_hybrid_layer_config(layer_config)
 
         # Determine if MTP is needed from either representation.
         self.mtp_process = (

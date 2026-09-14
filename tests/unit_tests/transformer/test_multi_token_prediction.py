@@ -130,8 +130,13 @@ class TestMultiTokenPredictionLayer:
     @pytest.mark.parametrize(
         ("mtp_use_repeated_layer", "expected_physical_depths"), [(False, 2), (True, 1)]
     )
+    @pytest.mark.parametrize("custom_output_initializer", [False, True])
     def test_hybrid_config_list_is_cloned_per_physical_layer(
-        self, monkeypatch, mtp_use_repeated_layer, expected_physical_depths
+        self,
+        monkeypatch,
+        mtp_use_repeated_layer,
+        expected_physical_depths,
+        custom_output_initializer,
     ):
         """Direct hybrid configs stay caller-owned and are cloned for each built layer."""
 
@@ -211,6 +216,9 @@ class TestMultiTokenPredictionLayer:
         source_config = AttentionLayerConfig.from_config(config)
         source_config.num_layers = 7
         source_config.caller_owned_state = []
+        if custom_output_initializer:
+            source_config.output_layer_init_method = torch.nn.init.zeros_
+        source_output_initializer = source_config.output_layer_init_method
         source_list = [source_config, source_config]
         group = FakeGroup()
         pg_collection = types.SimpleNamespace(cp=group, tp=group, pp=group, tp_cp=None, dp=None)
@@ -238,6 +246,14 @@ class TestMultiTokenPredictionLayer:
         assert all(layer_config is not source_config for layer_config in physical_configs)
         assert len({id(layer_config) for layer_config in physical_configs}) == len(physical_configs)
         assert all(layer_config.is_hybrid_model for layer_config in physical_configs)
+        for layer_config in physical_configs:
+            output_initializer = layer_config.output_layer_init_method
+            if custom_output_initializer:
+                assert output_initializer is source_output_initializer
+            else:
+                assert output_initializer.func is source_output_initializer.func
+                assert output_initializer.args == source_output_initializer.args
+                assert output_initializer.keywords == source_output_initializer.keywords
 
         hidden_states = torch.randn(4, 1, 8, requires_grad=True)
         output = block(
@@ -256,6 +272,8 @@ class TestMultiTokenPredictionLayer:
         assert [stack.forward_calls for stack in captured_stacks] == expected_calls
         assert source_config.num_layers == 7
         assert source_config.caller_owned_state == []
+        assert source_config.is_hybrid_model is False
+        assert source_config.output_layer_init_method is source_output_initializer
 
         captured_config_lists.clear()
         MultiTokenPredictionBlock(
