@@ -27,6 +27,11 @@ def test_small_rank_forward_matches_ordinary_ep(
         def wait_event(self, event):
             pass
 
+        def record_event(self):
+            event = Event()
+            event.record(self)
+            return event
+
     class Event:
         def record(self, stream):
             pass

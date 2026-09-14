@@ -886,11 +886,7 @@ def release_ep_chunk_workspace(key: EPChunkWorkspaceKey, *, stream: Any | None =
 def _make_stream(device: torch.device | int | str) -> torch.cuda.Stream:
     if not torch.cuda.is_available():
         raise RuntimeError("EP chunk overlap requires CUDA streams.")
-    try:
-        return torch.cuda.Stream(device=device)
-    except TypeError:
-        with torch.cuda.device(device):
-            return torch.cuda.Stream()
+    return torch.cuda.Stream(device=device)
 
 
 _EP_CHUNK_STREAMS: dict[tuple[int, str], torch.cuda.Stream] = {}
@@ -1071,8 +1067,7 @@ class _EPChunkOperationBase:
                         expert_activation_lease, fc1_input
                     ),
                 )
-                expert_ready = torch.cuda.Event()
-                expert_ready.record(compute_stream)
+                expert_ready = compute_stream.record_event()
                 expert_activation_lease.release(expert_ready)
                 _record_state_tensors_current_stream(state)
                 state.pop("recv_hidden", None)
@@ -1080,8 +1075,7 @@ class _EPChunkOperationBase:
                 state.pop("recv_probs", None)
                 state.pop("recv_per_expert", None)
                 rank_grouped, handle = dispatcher.prepare_deepep_combine(expert_out)
-                ready = torch.cuda.Event()
-                ready.record(compute_stream)
+                ready = compute_stream.record_event()
             del dispatched, probs, expert_out
             return chunk_idx, dispatcher, rank_grouped, handle, ready, lease
 
@@ -1153,10 +1147,8 @@ class _EPChunkOperationBase:
                     restore_shape=state["recv_hidden"].shape,
                     fused=dispatcher.moe_permute_fusion,
                 )
-                ready = torch.cuda.Event()
-                ready.record(compute_stream)
-                recv_consumed_event = torch.cuda.Event()
-                recv_consumed_event.record(compute_stream)
+                ready = compute_stream.record_event()
+                recv_consumed_event = compute_stream.record_event()
 
                 saved_chunks[chunk_idx] = _ForwardChunkContext.from_dispatch(
                     state,
@@ -1196,8 +1188,7 @@ class _EPChunkOperationBase:
         self, x_2d, ranges, compute_stream, caller_stream, comm_stream, finish_dispatch, run_expert
     ):
         """Shared two-slot schedule; expert callbacks own saved-context policy."""
-        input_ready = torch.cuda.Event()
-        input_ready.record(caller_stream)
+        input_ready = caller_stream.record_event()
 
         def submit_dispatch(chunk_idx: int):
             start, end = ranges[chunk_idx]
@@ -1207,8 +1198,7 @@ class _EPChunkOperationBase:
             with torch.cuda.stream(compute_stream):
                 compute_stream.wait_event(input_ready)
                 scores, indices = self.router(x_chunk)
-                route_ready = torch.cuda.Event()
-                route_ready.record(compute_stream)
+                route_ready = compute_stream.record_event()
             with torch.cuda.stream(comm_stream):
                 comm_stream.wait_event(route_ready)
                 if x_chunk.is_cuda:
@@ -1239,8 +1229,7 @@ class _EPChunkOperationBase:
             chunk_out = dispatcher.finish_deepep_combine(state)
             start, end = ranges[chunk_idx]
             output_2d[start:end].copy_(chunk_out)
-            consumed = torch.cuda.Event()
-            consumed.record(torch.cuda.current_stream(output_2d.device))
+            consumed = torch.cuda.current_stream(output_2d.device).record_event()
             lease.release(consumed)
 
         current_state = submit_dispatch(0)
@@ -1262,8 +1251,7 @@ class _EPChunkOperationBase:
                 finish_combine(pending_combine)
             pending_combine = submit_combine(prepared)
 
-        done = torch.cuda.Event()
-        done.record(compute_stream)
+        done = compute_stream.record_event()
         caller_stream.wait_event(done)
         if pending_combine is None:
             raise RuntimeError("EP chunk combine pipeline produced no pending output")
@@ -1276,8 +1264,7 @@ class _EPChunkOperationBase:
         expert_params = tuple(self.experts.parameters())
         compute_stream, comm_stream = self._streams(grad_2d.device)
         wgrad_stream = _shared_stream(grad_2d.device, "wgrad")
-        input_ready = torch.cuda.Event()
-        input_ready.record(torch.cuda.current_stream(grad_2d.device))
+        input_ready = torch.cuda.current_stream(grad_2d.device).record_event()
         grad_x_chunks: list[torch.Tensor | None] = [None for _ in ranges]
         router_accum: list[torch.Tensor | None] = [None for _ in router_params]
         pending_dispatch_bwd: list[tuple[_BackwardChunk, dict[str, Any]]] = []
@@ -1301,8 +1288,7 @@ class _EPChunkOperationBase:
             with torch.cuda.stream(compute_stream):
                 compute_stream.wait_event(input_ready)
                 scores, indices = self.router(x_chunk)
-                router_ready = torch.cuda.Event()
-                router_ready.record(compute_stream)
+                router_ready = compute_stream.record_event()
             with torch.cuda.stream(comm_stream):
                 comm_stream.wait_event(router_ready)
                 chain_deepep_event()
@@ -1374,8 +1360,7 @@ class _EPChunkOperationBase:
                 )
                 chunk.scores = None
                 chunk.scores_edge = None
-                consumed = torch.cuda.Event()
-                consumed.record(compute_stream)
+                consumed = compute_stream.record_event()
                 chunk.workspace_lease.release(consumed)
                 local_state.clear()
 
@@ -1440,14 +1425,12 @@ class _EPChunkOperationBase:
                     grad_dispatched, grad_probs, hidden_reuse_base = _backward_expert(
                         chunk, local_state.pop("grad_expert_out"), expert_activation_lease
                     )
-                    dgrad_ready = torch.cuda.Event()
-                    dgrad_ready.record(compute_stream)
+                    dgrad_ready = compute_stream.record_event()
 
                 with torch.cuda.stream(wgrad_stream):
                     wgrad_stream.wait_event(dgrad_ready)
                     self.experts.flush_delayed_weight_grads(num_contexts=1, stream=wgrad_stream)
-                    wgrad_done = torch.cuda.Event()
-                    wgrad_done.record(wgrad_stream)
+                    wgrad_done = wgrad_stream.record_event()
                     for tensor in (
                         grad_dispatched,
                         grad_probs,
@@ -1461,8 +1444,7 @@ class _EPChunkOperationBase:
                     grad_recv_hidden, grad_recv_probs = _dispatch_local_backward(
                         chunk, grad_dispatched, grad_probs, hidden_reuse_base=hidden_reuse_base
                     )
-                    local_bwd_ready = torch.cuda.Event()
-                    local_bwd_ready.record(wgrad_stream)
+                    local_bwd_ready = wgrad_stream.record_event()
                     expert_activation_lease.release(local_bwd_ready)
                     del grad_dispatched, grad_probs
                 last_wgrad_done = wgrad_done
@@ -1489,8 +1471,7 @@ class _EPChunkOperationBase:
 
         retire_pending_dispatch_bwd()
 
-        done = torch.cuda.Event()
-        done.record(compute_stream)
+        done = compute_stream.record_event()
         torch.cuda.current_stream(grad_2d.device).wait_event(done)
 
         grad_x = torch.cat(
@@ -1511,8 +1492,7 @@ class _EPChunkOperationBase:
         expert_params = tuple(self.experts.parameters())
         compute_stream, comm_stream = self._streams(grad_2d.device)
         caller_stream = torch.cuda.current_stream(grad_2d.device)
-        grad_ready = torch.cuda.Event()
-        grad_ready.record(caller_stream)
+        grad_ready = caller_stream.record_event()
         wgrad_stream = _shared_stream(grad_2d.device, "wgrad")
         grad_x_chunks: list[torch.Tensor | None] = [None for _ in context.chunks]
         router_accum: list[torch.Tensor | None] = [None for _ in router_params]
@@ -1570,13 +1550,11 @@ class _EPChunkOperationBase:
                     del hidden_reuse_base
                 pending_dispatch_bwd.append((chunk, local_state))
 
-            wgrad_ready = torch.cuda.Event()
-            wgrad_ready.record(compute_stream)
+            wgrad_ready = compute_stream.record_event()
             with torch.cuda.stream(wgrad_stream):
                 wgrad_stream.wait_event(wgrad_ready)
                 self.experts.flush_delayed_weight_grads(num_contexts=len(pending_dispatch_bwd))
-                wgrad_done = torch.cuda.Event()
-                wgrad_done.record(wgrad_stream)
+                wgrad_done = wgrad_stream.record_event()
             _queue_backward_stream_wait(wgrad_done, grad_2d.device)
 
             # Delayed grouped-linear Wgrad retains FC1 input. Do not repurpose its
@@ -1591,8 +1569,7 @@ class _EPChunkOperationBase:
                         local_state.pop("grad_probs"),
                         hidden_reuse_base=hidden_reuse_base,
                     )
-                    local_ready = torch.cuda.Event()
-                    local_ready.record(compute_stream)
+                    local_ready = compute_stream.record_event()
 
                 local_state["dispatch_bwd_state"] = remember_deepep_event(
                     _submit_dispatch_backward(
@@ -1607,8 +1584,7 @@ class _EPChunkOperationBase:
                 del grad_recv_hidden, grad_recv_probs, hidden_reuse_base
 
             with torch.cuda.stream(compute_stream):
-                backward_activation_done = torch.cuda.Event()
-                backward_activation_done.record(compute_stream)
+                backward_activation_done = compute_stream.record_event()
             expert_activation_lease.release(backward_activation_done)
 
             for chunk, local_state in pending_dispatch_bwd:
@@ -1619,12 +1595,10 @@ class _EPChunkOperationBase:
                     grad_x_chunks[chunk.idx] = _backward_router(
                         chunk, grad_hidden, grad_scores, router_params, router_accum
                     )
-                    consumed = torch.cuda.Event()
-                    consumed.record(compute_stream)
+                    consumed = compute_stream.record_event()
                     chunk.workspace_lease.release(consumed)
 
-        done = torch.cuda.Event()
-        done.record(compute_stream)
+        done = compute_stream.record_event()
         torch.cuda.current_stream(grad_2d.device).wait_event(done)
         grad_x = torch.cat(
             [
