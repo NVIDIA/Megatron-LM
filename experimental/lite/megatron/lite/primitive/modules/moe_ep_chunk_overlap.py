@@ -16,7 +16,10 @@ from megatron.lite.primitive.modules.chunked_ep_dispatcher import (
     ChunkedDispatcher as TokenDispatcher,
 )
 from megatron.lite.primitive.modules.chunked_ep_experts import ChunkedExperts as Experts
-from megatron.lite.primitive.modules.chunked_ep_experts import _tensor_byte_ranges_overlap
+from megatron.lite.primitive.modules.chunked_ep_experts import (
+    _caller_owned_dummy_wgrad,
+    _tensor_byte_ranges_overlap,
+)
 from megatron.lite.primitive.modules.moe_ep_chunk_overlap_policy import runtime_ep_chunk_ranges
 from megatron.lite.primitive.utils.moe import unpermute
 
@@ -1679,6 +1682,18 @@ class _EPChunkOperationBase:
         return (grad_x, _materialize(router_params, router_accum), [None for _ in expert_params])
 
 
+def _outer_parameter_grads(params, grads):
+    """Publish completed main-grad writes through the outer autograd/DDP edge."""
+    return [
+        _caller_owned_dummy_wgrad(
+            param.main_grad, param, zero=getattr(param, "zero_out_wgrad", False)
+        )
+        if grad is None and param.requires_grad and getattr(param, "grad_added_to_main_grad", False)
+        else grad
+        for param, grad in zip(params, grads, strict=True)
+    ]
+
+
 class _SavedContextEPChunkFunction(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -1690,6 +1705,7 @@ class _SavedContextEPChunkFunction(torch.autograd.Function):
         *params: torch.Tensor,
     ) -> torch.Tensor:
         ctx.backward_op = forward_op.backward_op
+        ctx.params = params
         with torch.enable_grad(), forward_op._routing_context(routing_input):
             x_graph = x_2d.detach().requires_grad_(True)
             output, saved_context = forward_op._forward_saved_context_async(
@@ -1709,7 +1725,13 @@ class _SavedContextEPChunkFunction(torch.autograd.Function):
             grad_x, router_grads, expert_grads = ctx.backward_op.backward(
                 ctx.saved_forward_context, grad_output
             )
-        return grad_x, None, None, None, *router_grads, *expert_grads
+        return (
+            grad_x,
+            None,
+            None,
+            None,
+            *_outer_parameter_grads(ctx.params, (*router_grads, *expert_grads)),
+        )
 
 
 class EPChunkForwardOp(_EPChunkOperationBase):
@@ -2106,9 +2128,10 @@ class _EPChunkCheckpoint(torch.autograd.Function):
             None,
             None,
             None,
-            *(by_id.get(id(p)) for p in prefix_params),
-            *router_grads,
-            *expert_grads,
+            *_outer_parameter_grads(
+                ctx.params,
+                (*(by_id.get(id(p)) for p in prefix_params), *router_grads, *expert_grads),
+            ),
         )
 
 

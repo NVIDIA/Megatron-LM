@@ -11,6 +11,68 @@ import torch
 import megatron.core  # noqa: F401
 
 
+@pytest.mark.parametrize("full_recompute", [False, True])
+@pytest.mark.parametrize("zero_out_wgrad", [False, True])
+def test_checkpoint_publishes_main_grad_to_outer_ddp_hook(
+    transformer_engine_import_stub, full_recompute, zero_out_wgrad
+):
+    transformer_engine_import_stub()
+    from megatron.lite.primitive.modules.moe_ep_chunk_overlap import (
+        checkpoint_ep_chunk,
+        _SavedContextEPChunkFunction,
+    )
+    from contextlib import nullcontext
+
+    experts = torch.nn.Linear(2, 2, bias=False)
+    weight = experts.weight
+    weight.main_grad = torch.zeros_like(weight)
+    weight.grad_added_to_main_grad = False
+    weight.zero_out_wgrad = zero_out_wgrad
+    hooks = []
+
+    def ddp_hook(param):
+        assert param.grad is not None, "DDP requires an outer autograd gradient sentinel"
+        assert param.grad_added_to_main_grad
+        if param.zero_out_wgrad:
+            param.main_grad.add_(param.grad)
+        param.grad = None
+        hooks.append(param.main_grad.clone())
+
+    weight.register_post_accumulate_grad_hook(ddp_hook)
+
+    class Forward:
+        router = torch.nn.Identity()
+
+        def __call__(self, x):
+            return experts(x)
+
+    forward = Forward()
+    forward.experts = experts
+
+    def fused(x, grad):
+        weight.main_grad.add_(grad.T @ x)
+        weight.grad_added_to_main_grad = True
+        return grad @ weight, [], [None]
+
+    execution = SimpleNamespace(
+        forward_op=forward, fused_op=SimpleNamespace(forward_backward=fused)
+    )
+    for rows in (3, 5, 2):
+        x = torch.ones(rows, 2, requires_grad=True)
+        if full_recompute:
+            output = checkpoint_ep_chunk(lambda value: (value, value), x, execution, ())
+        else:
+            forward.backward_op = SimpleNamespace(backward=fused)
+            forward._logical_chunk_count = 2
+            forward._routing_context = lambda value: nullcontext()
+            forward._forward_saved_context_async = lambda value, *args: (experts(value), value)
+            output = _SavedContextEPChunkFunction.apply(x, None, forward, x.shape, weight)
+        output.sum().backward()
+    assert len(hooks) == 3
+    for actual, expected in zip(hooks, (3, 8, 10), strict=True):
+        torch.testing.assert_close(actual, torch.full_like(weight, expected))
+
+
 @pytest.mark.parametrize("layers", [1, 3])
 @pytest.mark.parametrize("frozen_prefix", [False, True])
 def test_checkpoint_matches_native_across_microbatches(
