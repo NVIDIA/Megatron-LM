@@ -103,7 +103,8 @@ dev = [
     "megatron-energon[av_decode]~=7.0",
     "av",
     "Pillow",
-    "flashinfer-python>=0.5.0,<0.7.0",
+    "flashinfer-python==0.6.16.post3",
+    "flashinfer-jit-cache==0.6.16.post3; sys_platform == 'linux'",
     "nvidia-cudnn-frontend[cutedsl]==1.26.0",
     "wget",
     "onnxscript",
@@ -241,7 +242,14 @@ name = "fast-hadamard-transform"
 version = "1.0.4.post1"
 requires-dist = ["torch", "packaging", "ninja"]
 
+[[tool.uv.index]]
+name = "flashinfer-cu130"
+url = "https://flashinfer.ai/whl/cu130"
+explicit = true
+
 [tool.uv.sources]
+
+flashinfer-jit-cache = { index = "flashinfer-cu130", marker = "sys_platform == 'linux'" }
 
 flash_mla = [
     { git = "https://github.com/deepseek-ai/FlashMLA", rev = "nv_dev" },

@@ -90,9 +90,11 @@ from megatron.core.inference.moe.flashinfer_mxfp8 import (
     flashinfer_routed_mxfp8_moe,
     prepare_routed_mxfp8_weights,
     require_flashinfer_routed_mxfp8,
+    select_flashinfer_active_rows,
 )
 
 logger = logging.getLogger(__name__)
+_LOGGED_FLASHINFER_TOKEN_POLICIES: set[tuple[str, int, int]] = set()
 
 
 class GroupedLinearFc1Interface(Protocol):
@@ -1199,7 +1201,6 @@ class InferenceGroupedMLP(TEGroupedMLP):
         self._activation_clamp_scale = config.activation_func_tanh_clamp_scale
         self.inference_grouped_gemm_backend = config.inference_grouped_gemm_backend
         self._nvls_dispatcher = config.inference_moe_token_dispatcher_type == 'nvls'
-        self._flashinfer_mxfp8_token_capacity = config.inference_flashinfer_mxfp8_token_capacity
 
     def _resolve_flashinfer_activation_type(self):
         """Map megatron activation config to FlashInfer ActivationType."""
@@ -1397,14 +1398,34 @@ class InferenceGroupedMLP(TEGroupedMLP):
                 local_expert_offset=self.ep_group.rank() * self.num_local_experts,
                 activation_type=self._flashinfer_activation_type.value,
                 out=(NVLSAllGatherVDispatcher._get_rsv_tensor() if self._nvls_dispatcher else None),
-                token_capacity=self._flashinfer_mxfp8_token_capacity,
-                use_bounded_rows=InferenceMode.use_bounded_mxfp8_rows(),
+                token_capacity=InferenceMode.flashinfer_token_capacity(),
             )
             return output, None
+        full_rows = hidden_states.shape[0]
+        token_capacity = InferenceMode.flashinfer_token_capacity()
+        active_rows, policy = select_flashinfer_active_rows(
+            full_rows, token_capacity=token_capacity
+        )
+        if token_capacity is not None:
+            policy_key = (policy, token_capacity, full_rows)
+            if policy_key not in _LOGGED_FLASHINFER_TOKEN_POLICIES:
+                _LOGGED_FLASHINFER_TOKEN_POLICIES.add(policy_key)
+                logger.info(
+                    "FlashInfer BF16 token policy: %s active_rows=%d full_rows=%d "
+                    "inferred_capacity=%d",
+                    policy,
+                    active_rows,
+                    full_rows,
+                    token_capacity,
+                )
+        if routing_map.dtype != torch.int32:
+            raise TypeError(
+                f"FlashInfer BF16 requires int32 expert indices; got {routing_map.dtype}"
+            )
         output = fused_moe.cutlass_fused_moe(
-            hidden_states,
-            routing_map.int(),
-            probs,
+            hidden_states[:active_rows],
+            routing_map[:active_rows],
+            probs[:active_rows],
             self._fc1_weight,
             self._fc2_weight,
             hidden_states.dtype,
@@ -1413,10 +1434,24 @@ class InferenceGroupedMLP(TEGroupedMLP):
             ep_size=self.ep_group.size(),
             ep_rank=self.ep_group.rank(),
             # FlashInfer's BF16 CUTLASS kernel requires a BF16 output, while the
-            # NVLS reduce-scatter buffer is FP32. Let the kernel return BF16;
-            # token_combine() copies it into the symmetric FP32 buffer.
+            # NVLS reduce-scatter buffer is FP32. Full-capacity token_combine copies
+            # it there; bounded calls copy the produced prefix below.
             output=None,
         )[0]
+        if active_rows < full_rows:
+            if not self._nvls_dispatcher:
+                raise RuntimeError("bounded FlashInfer BF16 rows require the NVLS dispatcher")
+            # Preserve the full symmetric-buffer shape consumed by token_combine while
+            # copying only the prefix produced by the bounded BF16 kernel. The
+            # ReduceScatter-V metadata limits reads to the compact active-token prefix.
+            rsv_output = NVLSAllGatherVDispatcher._get_rsv_tensor()
+            if rsv_output.shape[0] < active_rows or rsv_output.shape[1:] != output.shape[1:]:
+                raise ValueError(
+                    f"NVLS output buffer shape {tuple(rsv_output.shape)} cannot hold "
+                    f"bounded FlashInfer BF16 output {tuple(output.shape)}"
+                )
+            rsv_output[:active_rows].copy_(output)
+            return rsv_output, None
         return output, None
 
     def _mcore_fused_moe_forward(self, hidden_states, probs, routing_map):

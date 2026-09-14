@@ -12,6 +12,7 @@ import torch.nn.functional as F  # type: ignore
 from torch import Tensor  # type: ignore
 
 from megatron.core import parallel_state
+from megatron.core.enums import Fp8Recipe
 from megatron.core.inference.batch_dimensions_utils import TOKEN_ROUNDER as _TOKEN_ROUNDER
 from megatron.core.inference.batch_dimensions_utils import (
     CUDAGraphBatchDimensionBuilder,
@@ -24,6 +25,7 @@ from megatron.core.inference.config import (
 )
 from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.moe import InferenceGroupedGemmBackend
+from megatron.core.inference.moe.flashinfer_mxfp8 import enforce_flashinfer_mxfp8_min_token_capacity
 from megatron.core.inference.moe.vllm_fused_moe import VllmFusedMoeBuffers
 from megatron.core.inference.sampling.base import Sampling
 from megatron.core.inference.sampling_params import (
@@ -399,6 +401,14 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.num_attention_heads_per_partition = 1
 
         self.batch_invariant_mode = model_config.batch_invariant_mode
+        self.inference_flashinfer_bounded_rows = model_config.inference_flashinfer_bounded_rows
+        self._uses_flashinfer_mxfp8 = (
+            model_config.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.FLASHINFER
+            and bool(model_config.fp8)
+            and model_config.fp8_recipe == Fp8Recipe.mxfp8
+        )
+        self._disaggregated_inference_role: Optional[str] = None
+        self._use_bounded_flashinfer_rows = False
         self.num_speculative_tokens = inference_config.num_speculative_tokens
         assert self.num_speculative_tokens < inference_config.block_size_tokens, (
             f"num_speculative_tokens ({self.num_speculative_tokens}) must be < "
@@ -424,12 +434,14 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.expert_model_parallel_group = parallel_state.get_expert_model_parallel_group()
         else:
             self.expert_model_parallel_group = None
+        self.expert_model_parallel_size = get_pg_size(self.expert_model_parallel_group)
 
         # Optional CPU-side collective for EP batch-dimension sync. Populated by
         # the engine via set_ep_zmq_communicator() when available. When set,
         # match_graph_config() uses this to perform the MAX reduction on the
         # CPU, avoiding a per-step NCCL AllReduce kernel on the compute stream.
         self._ep_zmq_communicator = None
+        self._ep_mode_sync_tensor = None
 
         # Mamba states.
         mamba_inference_state_config = inference_config.mamba_inference_state_config
@@ -824,6 +836,12 @@ class DynamicInferenceContext(BaseInferenceContext):
                 topk=model_config.moe_router_topk,
                 hidden_size=moe_hidden_size,
                 ep_group=self.expert_model_parallel_group,
+                routing_dtype=(
+                    torch.int32
+                    if model_config.inference_grouped_gemm_backend
+                    == InferenceGroupedGemmBackend.FLASHINFER
+                    else torch.int64
+                ),
             )
 
         # Pre-allocate the vLLM fused-MoE intermediates so no allocation happens
@@ -1113,6 +1131,12 @@ class DynamicInferenceContext(BaseInferenceContext):
                 "All tensors should be allocated within `initialize_all_tensors()`. "
                 f"Please move tensor '{key}'."
             )
+
+        self._ep_mode_sync_tensor = (
+            torch.zeros(1, dtype=torch.int32, device=torch.cuda.current_device())
+            if self.inference_flashinfer_bounded_rows and self.expert_model_parallel_size > 1
+            else None
+        )
 
         # Per-request state (CPU, pinned memory for fast H2D transfer).
         self.request_ids = torch.full(
@@ -1691,16 +1715,80 @@ class DynamicInferenceContext(BaseInferenceContext):
 
     def is_decode_only(self) -> bool:
         """
-        Return if this iteration we run decode only implementation.
+        Return whether this rank runs the decode-only implementation this iteration.
 
-        When CUDA graphs are active, uses padded_batch_dimensions because it
-        reflects the post-expert-parallel sync state.  Otherwise falls back to
-        num_prefill_requests which is always up-to-date regardless of where we
-        are in the step lifecycle.
+        When CUDA graphs are active, use the selected graph dimensions. Otherwise
+        fall back to num_prefill_requests, which is always current. For NVLS these
+        dimensions are rank-local because ranks may independently select graphs.
         """
         if self._using_cuda_graph_this_step:
             return self.padded_batch_dimensions.prefill_req_count == 0
         return self.num_prefill_requests == 0
+
+    def can_use_bounded_flashinfer_rows(self) -> bool:
+        """Return whether this step may use the inferred FlashInfer row bound."""
+        return self.inference_flashinfer_bounded_rows and self._use_bounded_flashinfer_rows
+
+    def flashinfer_token_capacity(self) -> int | None:
+        """Return the effective FlashInfer row capacity for this step, if enabled."""
+        if not self.can_use_bounded_flashinfer_rows():
+            return None
+        token_capacity = (
+            self.max_requests * (self.num_speculative_tokens + 1) * self.expert_model_parallel_size
+        )
+        if getattr(self, "_uses_flashinfer_mxfp8", False):
+            return enforce_flashinfer_mxfp8_min_token_capacity(token_capacity)
+        return token_capacity
+
+    def set_disaggregated_inference_role(self, role: str) -> None:
+        """Publish a dedicated prefill/decode role to row-policy selection."""
+        if role not in ("prefill", "decode"):
+            raise ValueError(
+                f"disaggregated inference role must be 'prefill' or 'decode', got {role!r}"
+            )
+        self._disaggregated_inference_role = role
+        if self.inference_flashinfer_bounded_rows:
+            policy = "bounded without per-step EP mode consensus" if role == "decode" else "full"
+            logging.info("FlashInfer disaggregated %s row policy: %s", role, policy)
+
+    def _sync_all_ep_ranks_decode_only(self, batch_dimensions: InferenceBatchDimensions) -> bool:
+        """Return whether every EP rank is decode-only for the current step."""
+        local_has_prefill = int(batch_dimensions.prefill_req_count > 0)
+        if self.expert_model_parallel_size <= 1:
+            return local_has_prefill == 0
+        if self._ep_zmq_communicator is not None:
+            any_rank_has_prefill = self._ep_zmq_communicator.sync_all_reduce_max(local_has_prefill)
+        else:
+            sync_tensor = self._ep_mode_sync_tensor
+            assert sync_tensor is not None
+            sync_tensor.fill_(local_has_prefill)
+            torch.distributed.all_reduce(
+                sync_tensor,
+                op=torch.distributed.ReduceOp.MAX,
+                group=self.expert_model_parallel_group,
+            )
+            any_rank_has_prefill = int(sync_tensor.item())
+        return any_rank_has_prefill == 0
+
+    def _resolve_bounded_flashinfer_rows(self, batch_dimensions: InferenceBatchDimensions) -> bool:
+        """Resolve the bounded/full FlashInfer policy for the current step."""
+        if not self.inference_flashinfer_bounded_rows:
+            return False
+
+        local_decode_only = batch_dimensions.prefill_req_count == 0
+        if self._disaggregated_inference_role == "prefill":
+            return False
+        if self.is_creating_cuda_graphs:
+            return local_decode_only
+
+        if self._disaggregated_inference_role == "decode":
+            if not local_decode_only:
+                raise RuntimeError(
+                    "a disaggregated decode engine cannot use a prefill-bearing batch"
+                )
+            return True
+
+        return self._sync_all_ep_ranks_decode_only(batch_dimensions)
 
     def using_cuda_graph_this_step(self) -> bool:
         """Returns True if cuda graphs are being used for this step."""
@@ -2464,6 +2552,8 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         self.batch_dimensions = batch_dimensions
 
+        self._use_bounded_flashinfer_rows = self._resolve_bounded_flashinfer_rows(batch_dimensions)
+
         best_graph = CUDAGraphBatchDimensionBuilder.match_graph_config(
             batch_dimensions,
             self.cuda_graph_batch_dimensions_list,
@@ -2472,6 +2562,16 @@ class DynamicInferenceContext(BaseInferenceContext):
             match_ep_token_counts=self._nccl_ep_dispatcher or self._training_ep_dispatcher,
             ep_zmq_communicator=self._ep_zmq_communicator,
         )
+        if (
+            best_graph is not None
+            and batch_dimensions.prefill_req_count == 0
+            and self.inference_flashinfer_bounded_rows
+            and not self._use_bounded_flashinfer_rows
+        ):
+            # This rank's decode graph was captured with a bounded FlashInfer
+            # prefix. If a peer has prefill, run eagerly over the full AGV buffer;
+            # its -1 routing sentinels make all remaining padding rows no-ops.
+            best_graph = None
         self._using_cuda_graph_this_step = best_graph is not None
 
         if construct_graph_dimensions is not None:
@@ -2937,6 +3037,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.chunked_prefill_request_id = -1
         self.num_prefill_requests = 0
         self._using_cuda_graph_this_step = False
+        self._use_bounded_flashinfer_rows = False
         self.is_creating_cuda_graphs = False
         self.padded_batch_dimensions = InferenceBatchDimensions(
             token_count=0, prefill_req_count=0, decode_req_count=0
