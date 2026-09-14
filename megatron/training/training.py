@@ -4006,6 +4006,7 @@ def save_checkpoint_and_time(
         ckpt_pgc = getattr(unwrap_model(model)[0], "pg_collection", None)
         tp_group = getattr(ckpt_pgc, "tp", None) if ckpt_pgc is not None else None
         pp_group = getattr(ckpt_pgc, "pp", None) if ckpt_pgc is not None else None
+        cp_group = getattr(ckpt_pgc, "cp", None) if ckpt_pgc is not None else None
         dp_group = getattr(ckpt_pgc, "dp", None) if ckpt_pgc is not None else None
         # Replica_id needs the gtp_remat-inclusive group (dp_cp_gtp_remat), not replicate dp_cp.
         dp_cp_group = getattr(ckpt_pgc, "dp_cp_gtp_remat", None) if ckpt_pgc is not None else None
@@ -4038,6 +4039,7 @@ def save_checkpoint_and_time(
                 dp_group=dp_group,
                 expt_dp_group=expt_dp_group,
                 rng_state_key_prefix=rng_state_key_prefix,
+                cp_group=cp_group,
             )
 
             # Stop timer and compute time elapsed to save checkpoint. Stop timer before timers.log() call as it resets the timer.
