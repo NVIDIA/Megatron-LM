@@ -225,26 +225,16 @@ def test_qwen_layer_assembly_keeps_parameter_paths(
     from megatron.lite.model.qwen3_moe.lite import model
     from megatron.lite.primitive.modules import moe_ep_chunk_overlap as ep
 
-    class Attention(torch.nn.Linear):
-        def __init__(self, **kwargs):
-            super().__init__(4, 4, bias=False)
-
-        def forward(self, x, **kwargs):
-            return super().forward(x)
-
-    class Router(torch.nn.Linear):
-        def __init__(self, *args, **kwargs):
-            super().__init__(4, 4, bias=False)
-
-        def forward(self, x):
-            return super().forward(x), None
-
-    class Experts(torch.nn.Linear):
+    class LinearStub(torch.nn.Linear):
         def __init__(self, *args, **kwargs):
             super().__init__(4, 4, bias=False)
 
         def forward(self, x, *args, **kwargs):
             return super().forward(x)
+
+    class Router(LinearStub):
+        def forward(self, x):
+            return super().forward(x), None
 
     class Dispatcher:
         def __init__(self, *args, **kwargs):
@@ -283,12 +273,12 @@ def test_qwen_layer_assembly_keeps_parameter_paths(
             self.finish_backward = Mock()
             self.finish_forward = Mock()
 
-    monkeypatch.setattr(model, "GQAttention", Attention)
+    monkeypatch.setattr(model, "GQAttention", LinearStub)
     monkeypatch.setattr(model.te, "RMSNorm", lambda *args, **kwargs: torch.nn.LayerNorm(4))
     monkeypatch.setattr(ep, "EPChunkExecution", Execution)
     for module in (model, adapter):
         monkeypatch.setattr(module, "TopKRouter", Router)
-        monkeypatch.setattr(module, "Experts", Experts)
+        monkeypatch.setattr(module, "Experts", LinearStub)
         monkeypatch.setattr(module, "TokenDispatcher", Dispatcher)
     cfg = SimpleNamespace(
         hidden_size=4,

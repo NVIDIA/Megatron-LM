@@ -28,9 +28,13 @@ EP_CHUNK_COUNT = 2
 EPChunkOpName = Literal["forward", "backward", "fused_forward_backward"]
 
 
+def _event_pending(event) -> bool:
+    return event is not None and not (hasattr(event, "query") and bool(event.query()))
+
+
 def _wait_for_consumer_event(event, stream) -> bool:
     """Wait before storage reuse; report whether a dependency was queued."""
-    if event is None or (hasattr(event, "query") and bool(event.query())):
+    if not _event_pending(event):
         return False
     if stream is not None and hasattr(stream, "wait_event"):
         stream.wait_event(event)
@@ -685,26 +689,14 @@ class EPChunkWorkspace:
                     f"Cannot {operation} in EP chunk workspace: slot {slot_idx} is leased"
                 )
         activation_event = coordinator.consumer_event
-        if (
-            activation_event is not None
-            and not (
-                bool(activation_event.query()) if hasattr(activation_event, "query") else False
-            )
-            and not (
-                (stream is not None and hasattr(stream, "wait_event"))
-                or hasattr(activation_event, "current_stream_wait")
-            )
+        if _event_pending(activation_event) and not (
+            (stream is not None and hasattr(stream, "wait_event"))
+            or hasattr(activation_event, "current_stream_wait")
         ):
             raise RuntimeError(
                 f"Cannot {operation} in EP chunk workspace with a pending expert activation event"
             )
-        pending_slots = []
-        for slot in self._slots:
-            event = slot.consumer_event
-            if event is not None and not (
-                bool(event.query()) if hasattr(event, "query") else False
-            ):
-                pending_slots.append(slot)
+        pending_slots = [slot for slot in self._slots if _event_pending(slot.consumer_event)]
         if pending_slots and (stream is None or not hasattr(stream, "wait_event")):
             raise RuntimeError(
                 f"Cannot {operation} in EP chunk workspace with a pending consumer event"
@@ -863,9 +855,7 @@ class EPChunkWorkspaceRegistry:
             candidate._activation_arena is coordinator for candidate in self._workspaces.values()
         ):
             event = coordinator.consumer_event
-            if event is not None and not (
-                bool(event.query()) if hasattr(event, "query") else False
-            ):
+            if _event_pending(event):
                 if stream is None or not hasattr(stream, "wait_event"):
                     raise RuntimeError(
                         "Cannot release EP chunk expert activation arena with pending event"
@@ -1503,23 +1493,17 @@ class _EPChunkOperationBase:
                     del grad_dispatched, grad_probs
                 last_wgrad_done = wgrad_done
 
-                with torch.cuda.stream(comm_stream):
-                    comm_stream.wait_event(local_bwd_ready)
-                    chain_deepep_event()
-                    local_state["dispatch_bwd_state"] = remember_deepep_event(
-                        chunk.dispatcher.submit_deepep_dispatch_backward(
-                            grad_recv_hidden,
-                            grad_recv_probs,
-                            chunk.handle,
-                            allocate_on_comm_stream=True,
-                        )
+                local_state["dispatch_bwd_state"] = remember_deepep_event(
+                    _submit_dispatch_backward(
+                        chunk,
+                        grad_recv_hidden,
+                        grad_recv_probs,
+                        comm_stream,
+                        local_bwd_ready,
+                        last_deepep_event,
                     )
-                    if grad_recv_hidden.is_cuda:
-                        grad_recv_hidden.record_stream(comm_stream)
-                    if grad_recv_probs.is_cuda:
-                        grad_recv_probs.record_stream(comm_stream)
-                    chunk.recv_probs_base = None
-                    del grad_recv_hidden, grad_recv_probs, hidden_reuse_base
+                )
+                del grad_recv_hidden, grad_recv_probs, hidden_reuse_base
 
                 pending_dispatch_bwd.append((chunk, local_state))
                 if len(pending_dispatch_bwd) > 1:
@@ -1637,24 +1621,17 @@ class _EPChunkOperationBase:
                     local_ready = torch.cuda.Event()
                     local_ready.record(compute_stream)
 
-                with torch.cuda.stream(comm_stream):
-                    comm_stream.wait_event(local_ready)
-                    if last_deepep_event is not None:
-                        _event_current_stream_wait(last_deepep_event)
-                    local_state["dispatch_bwd_state"] = remember_deepep_event(
-                        chunk.dispatcher.submit_deepep_dispatch_backward(
-                            grad_recv_hidden,
-                            grad_recv_probs,
-                            chunk.handle,
-                            allocate_on_comm_stream=True,
-                        )
+                local_state["dispatch_bwd_state"] = remember_deepep_event(
+                    _submit_dispatch_backward(
+                        chunk,
+                        grad_recv_hidden,
+                        grad_recv_probs,
+                        comm_stream,
+                        local_ready,
+                        last_deepep_event,
                     )
-                    if grad_recv_hidden.is_cuda:
-                        grad_recv_hidden.record_stream(comm_stream)
-                    if grad_recv_probs.is_cuda:
-                        grad_recv_probs.record_stream(comm_stream)
-                    chunk.recv_probs_base = None
-                    del grad_recv_hidden, grad_recv_probs, hidden_reuse_base
+                )
+                del grad_recv_hidden, grad_recv_probs, hidden_reuse_base
 
             with torch.cuda.stream(compute_stream):
                 backward_activation_done = torch.cuda.Event()
@@ -1943,6 +1920,21 @@ def _backward_router(chunk, grad_hidden, grad_scores, router_params, router_accu
         grad_score_x = torch.zeros_like(chunk.x)
     _accumulate(router_accum, router_params, router_grads[1:])
     return grad_hidden.to(chunk.x.dtype) + grad_score_x
+
+
+def _submit_dispatch_backward(chunk, grad_hidden, grad_probs, stream, ready, previous_event):
+    """Submit on the communication stream, retaining inputs until its work finishes."""
+    with torch.cuda.stream(stream):
+        stream.wait_event(ready)
+        _event_current_stream_wait(previous_event)
+        state = chunk.dispatcher.submit_deepep_dispatch_backward(
+            grad_hidden, grad_probs, chunk.handle, allocate_on_comm_stream=True
+        )
+        for tensor in (grad_hidden, grad_probs):
+            if tensor.is_cuda:
+                tensor.record_stream(stream)
+        chunk.recv_probs_base = None
+    return state
 
 
 def _retire_one_fused_dispatch_bwd(

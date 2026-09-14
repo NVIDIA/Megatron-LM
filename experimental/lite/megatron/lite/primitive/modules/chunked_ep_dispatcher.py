@@ -213,11 +213,7 @@ class ChunkedDispatcher(_BaseDispatcher):
         self._deepep_event = state["event"]
         self.wait_dispatch_event()
         dispatched, local_tpe, permuted_probs, metadata = self._finish_deepep_dispatch_external(
-            state["recv_hidden"],
-            state["recv_indices"],
-            state["recv_probs"],
-            state["recv_per_expert"],
-            materialize_local_tpe=materialize_local_tpe,
+            state, materialize_local_tpe=materialize_local_tpe
         )
         self._local_tpe_list = metadata["local_tpe_list"]
         self._row_id_map = metadata["row_id_map"]
@@ -226,15 +222,15 @@ class ChunkedDispatcher(_BaseDispatcher):
 
     def _finish_deepep_dispatch_external(
         self,
-        recv_hidden: torch.Tensor,
-        recv_indices: torch.Tensor,
-        recv_probs: torch.Tensor,
-        recv_per_expert,
+        state,
         *,
         manual_backward: bool = False,
         materialize_local_tpe: bool = True,
         output_allocation=None,
     ):
+        recv_hidden, recv_indices, recv_probs, recv_per_expert = (
+            state[name] for name in ("recv_hidden", "recv_indices", "recv_probs", "recv_per_expert")
+        )
         if isinstance(recv_per_expert, torch.Tensor):
             recv_per_expert = [int(x) for x in recv_per_expert.detach().cpu().tolist()]
         local_tpe_list = [int(x) for x in recv_per_expert[: self.num_local_experts]]
@@ -315,12 +311,8 @@ class ChunkedDispatcher(_BaseDispatcher):
 
     def finish_deepep_dispatch_for_backward(self, state, *, output_allocation=None):
         _event_current_stream_wait(state.get("event"))
-        recv_per_expert = state["recv_per_expert"]
         dispatched, local_tpe, permuted_probs, metadata = self._finish_deepep_dispatch_external(
-            state["recv_hidden"],
-            state["recv_indices"],
-            state["recv_probs"],
-            recv_per_expert,
+            state,
             manual_backward=True,
             materialize_local_tpe=False,
             output_allocation=output_allocation,

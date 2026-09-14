@@ -274,30 +274,22 @@ def _caller_owned_grouped_linear(
 def _record_cuda_tensor_tree_stream(value: Any, stream: Any) -> None:
     """Record every nested CUDA tensor and its view bases on one stream."""
     seen: set[int] = set()
-
-    def record(item: Any) -> None:
+    pending = [value]
+    while pending:
+        item = pending.pop()
         item_id = id(item)
         if item_id in seen:
-            return
+            continue
+        seen.add(item_id)
         if torch.is_tensor(item):
-            seen.add(item_id)
             if item.is_cuda:
                 item.record_stream(stream)
             base = getattr(item, "_base", None)
             if base is not None:
-                record(base)
-            return
-        if isinstance(item, dict):
-            seen.add(item_id)
-            for nested in item.values():
-                record(nested)
-            return
-        if isinstance(item, (list, tuple, set)):
-            seen.add(item_id)
-            for nested in item:
-                record(nested)
-
-    record(value)
+                pending.append(base)
+        elif isinstance(item, (dict, list, tuple, set)):
+            children = item.values() if isinstance(item, dict) else item
+            pending.extend(reversed(tuple(children)))
 
 
 class ChunkedExperts(_BaseExperts):
