@@ -11,7 +11,7 @@ import torch
 import megatron.core  # noqa: F401
 
 
-@pytest.mark.parametrize("chunk_count", [2, 4])
+@pytest.mark.parametrize("chunk_count", [2, 3, 4])
 @pytest.mark.parametrize("rows", [0, 1, 3])
 @pytest.mark.parametrize("saved_context", [False, True])
 @pytest.mark.parametrize("peer_rows", [0, 2])

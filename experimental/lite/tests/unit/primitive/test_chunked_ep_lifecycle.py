@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Event ordering, alias safety, capacity, and explicit release contracts."""
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -15,17 +16,14 @@ def test_chunked_transport_owns_external_metadata_and_waits_before_finish(
 ):
     transformer_engine_import_stub()
     from megatron.lite.primitive.modules import chunked_ep_dispatcher as transport
+    from megatron.lite.primitive.modules import dispatcher as shared_transport
 
     buffer = Mock()
-    monkeypatch.setattr(transport, "deep_ep", object())
-    monkeypatch.setattr(
-        transport,
-        "_build_deepep_buffer",
-        lambda *args: transport._DeepEPBufferAllocation(buffer, 8, 16),
-    )
+    monkeypatch.setattr(shared_transport, "deep_ep", object())
+    monkeypatch.setattr(shared_transport, "_build_deepep_buffer", lambda *args: buffer)
     ps = SimpleNamespace(ep_size=2, tp_ep_group=object())
     dispatcher = transport.ChunkedDispatcher(4, 3, ps)
-    assert dispatcher.deepep_buffer_resident_bytes == 24
+    assert dispatcher.buffer is buffer
     event = SimpleNamespace(event=object(), current_stream_wait=Mock())
     hidden = torch.arange(6.0).reshape(2, 3)
     state = {
@@ -49,6 +47,77 @@ def test_chunked_transport_owns_external_metadata_and_waits_before_finish(
     assert dispatcher.finish_deepep_combine(completion) is hidden
     assert completion == {}
     assert event.current_stream_wait.call_count == 2
+
+
+def test_qwen_release_visits_only_chunked_modules_once(transformer_engine_import_stub, monkeypatch):
+    transformer_engine_import_stub()
+    from megatron.lite.model.qwen3_moe.lite.chunked_ep import release_chunked_ep
+    from megatron.lite.primitive.modules import moe_ep_chunk_overlap as ep
+
+    execution = Mock()
+    monkeypatch.setattr(ep, "EPChunkExecution", lambda **kwargs: execution)
+    moe = ep.ChunkedMoE(router=torch.nn.Linear(4, 2), experts=torch.nn.Linear(4, 4))
+    native = torch.nn.Linear(4, 4)
+    native.chunked_ep = Mock()  # A coincidental attribute must not trigger cleanup.
+    parent = torch.nn.ModuleList([moe, native])
+    release_chunked_ep([parent, moe, parent])
+    execution.release.assert_called_once_with(stream=None)
+    native.chunked_ep.release.assert_not_called()
+
+
+@pytest.mark.parametrize("with_probs", [False, True])
+def test_shared_expert_backward_preserves_gradients_and_input_storage(
+    transformer_engine_import_stub, with_probs
+):
+    transformer_engine_import_stub()
+    from megatron.lite.primitive.modules.moe_ep_chunk_overlap import _backward_expert
+
+    x = torch.arange(6.0).reshape(3, 2).requires_grad_()
+    probs = torch.full_like(x, 0.5, requires_grad=True) if with_probs else None
+    output = x.square() if probs is None else x.square() * probs
+    chunk = SimpleNamespace(dispatched=x, probs=probs, expert_out=output, expert_out_edge=None)
+    dx, dp, storage = _backward_expert(
+        chunk, torch.ones_like(x), SimpleNamespace(allocate=nullcontext)
+    )
+    torch.testing.assert_close(dx, 2 * x if probs is None else 2 * x * probs)
+    if probs is None:
+        assert dp is None
+    else:
+        torch.testing.assert_close(dp, x.square())
+    assert storage.data_ptr() == x.data_ptr() and not storage.requires_grad
+    assert chunk.dispatched is None and chunk.probs is None and chunk.expert_out is None
+
+
+@pytest.mark.parametrize("retain_output", [False, True])
+def test_context_capture_keeps_output_only_when_requested(
+    transformer_engine_import_stub, retain_output
+):
+    transformer_engine_import_stub()
+    from megatron.lite.primitive.modules.moe_ep_chunk_overlap import _BackwardChunk
+
+    x = torch.ones(2, 2, requires_grad=True)
+    scores, output = x.sigmoid(), x.square()
+    state = dict(handle=object(), recv_hidden=x, recv_probs=scores)
+    metadata = dict(manual_row_id_map=torch.arange(2), manual_prob_flat_indices=torch.arange(2))
+    chunk = _BackwardChunk.from_dispatch(
+        state,
+        metadata,
+        scores,
+        output,
+        retain_output=retain_output,
+        idx=0,
+        start=0,
+        end=2,
+        x=x,
+        dispatched=x,
+        probs=scores,
+        dispatcher=None,
+        workspace_lease=None,
+    )
+    assert (chunk.expert_out is output) == retain_output
+    assert chunk.scores is None and chunk.recv_probs_base is scores
+    (dx,) = torch.autograd.grad(chunk.expert_out_edge, x, torch.ones_like(output))
+    torch.testing.assert_close(dx, 2 * x)
 
 
 class Event:
@@ -163,6 +232,27 @@ def test_cross_op_reuse_waits_for_consumer_and_rejects_live_owner(workspaces):
     normal_grad = normal.tensor("fc2_dgrad", (3, 4), dtype=torch.float32, device="cpu")
     assert normal_out.data_ptr() != normal_grad.data_ptr()
     normal.release(Event())
+
+
+def test_lazy_growth_reuses_capacity_across_ops(workspaces):
+    _, (forward, _, fused) = workspaces
+    stream = Stream()
+    arena = forward._expert_activation_owner.coordinator
+    pointers = []
+    capacities = []
+    for workspace, rows in ((forward, 2), (fused, 2), (forward, 4), (fused, 3)):
+        lease = workspace.acquire_expert_activation(stream=stream)
+        tensor = lease.tensor("fc1_input", (rows, 4), dtype=torch.float32, device="cpu")
+        assert tensor.shape == (rows, 4)
+        pointers.append(tensor.data_ptr())
+        capacities.append(dict(arena.capacity_bytes))
+        lease.release(Event())
+    assert pointers[0] == pointers[1]
+    assert pointers[2] == pointers[3]
+    assert capacities[0] == capacities[1]
+    assert capacities[2] == capacities[3]
+    assert sum(capacities[2].values()) > sum(capacities[0].values())
+    assert not arena.frozen
 
 
 def test_reserve_park_release_and_rematerialize(workspaces):

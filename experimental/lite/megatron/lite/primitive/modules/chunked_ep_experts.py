@@ -4,24 +4,15 @@
 from __future__ import annotations
 
 import weakref
-from contextlib import AbstractContextManager, nullcontext
-from typing import Any, Callable
+from contextlib import nullcontext
+from typing import Any
 
 import torch  # pyright: ignore[reportMissingImports]
-import torch.distributed as dist  # pyright: ignore[reportMissingImports]
 import torch.nn as nn  # pyright: ignore[reportMissingImports]
 
 from megatron.lite.primitive import transformer_engine as te
 from megatron.lite.primitive.modules.experts import Experts as _BaseExperts
-from megatron.lite.primitive.modules.experts import _AllReduceETP, swiglu_with_probs
-from megatron.lite.primitive.modules.lora import (
-    LoraConfig,
-    SharedGroupedLinearLoRA,
-    normalize_lora_config,
-)
-from megatron.lite.primitive.parallel import ParallelState
-from megatron.lite.primitive.recompute import CheckpointWithoutOutput
-from megatron.lite.primitive.utils import ensure_divisible
+from megatron.lite.primitive.modules.experts import swiglu_with_probs
 
 __all__ = ["ChunkedExperts"]
 
@@ -323,79 +314,19 @@ def _record_cuda_tensor_tree_stream(value: Any, stream: Any) -> None:
     record(value)
 
 
-class ChunkedExperts(nn.Module):
-    def __init__(
-        self,
-        config: Any,
-        ps: ParallelState,
-        *,
-        fp8: bool = False,
-        moe_act_recompute: bool = False,
-        delay_wgrad_compute: bool = False,
-        lora_config: LoraConfig | dict | None = None,
-    ):
-        super().__init__()
-        self.num_local_experts = ensure_divisible(config.num_experts, ps.ep_size)
-        self.fp8 = fp8
-        self.moe_act_recompute = moe_act_recompute
+class ChunkedExperts(_BaseExperts):
+    def __init__(self, config, ps, *, delay_wgrad_compute=False, **kwargs):
         self._delay_wgrad_compute = delay_wgrad_compute
-        self._owned_main_grad_aliases: dict[int, weakref.ReferenceType[torch.Tensor]] = {}
-        # ETP is untested and its backward disagrees with lora.py's; refuse it.
-        if ps.etp_size > 1:
-            raise NotImplementedError(f"etp_size={ps.etp_size} unsupported; use 1.")
-        self.etp_group = ps.etp_group if ps.etp_size > 1 else None
-        self.swiglu_limit = float(getattr(config, "swiglu_limit", 0.0) or 0.0)
-        self.fc1 = te.GroupedLinear(
-            self.num_local_experts,
-            config.hidden_size,
-            config.moe_intermediate_size * 2 // ps.etp_size,
-            bias=False,
-            params_dtype=torch.bfloat16,
-            delay_wgrad_compute=delay_wgrad_compute,
-            fuse_wgrad_accumulation=delay_wgrad_compute,
-        )
-        self.fc2 = te.GroupedLinear(
-            self.num_local_experts,
-            config.moe_intermediate_size // ps.etp_size,
-            config.hidden_size,
-            bias=False,
-            params_dtype=torch.bfloat16,
-            delay_wgrad_compute=delay_wgrad_compute,
-            fuse_wgrad_accumulation=delay_wgrad_compute,
-        )
-        lora = normalize_lora_config(lora_config)
-        self.fc1_lora: SharedGroupedLinearLoRA | None = None
-        self.fc2_lora: SharedGroupedLinearLoRA | None = None
-        if lora.enabled and lora.targets_module("linear_fc1"):
-            self.fc1_lora = SharedGroupedLinearLoRA(
-                self.num_local_experts,
-                config.hidden_size,
-                config.moe_intermediate_size * 2 // ps.etp_size,
-                lora.rank,
-                alpha=lora.alpha,
-                dropout=lora.dropout,
-            )
-        if lora.enabled and lora.targets_module("linear_fc2"):
-            self.fc2_lora = SharedGroupedLinearLoRA(
-                self.num_local_experts,
-                config.moe_intermediate_size // ps.etp_size,
-                config.hidden_size,
-                lora.rank,
-                alpha=lora.alpha,
-                dropout=lora.dropout,
-            )
-        if ps.tp_size > 1 and ps.ep_size == 1 and ps.etp_size == 1:
-            tp_group = ps.tp_group
-            for module in (self.fc1, self.fc2, self.fc1_lora, self.fc2_lora):
-                if module is None:
-                    continue
-                for param in module.parameters():
+        super().__init__(config, ps, **kwargs)
+        self._owned_main_grad_aliases = {}
 
-                    def _ar(grad, g=tp_group):
-                        dist.all_reduce(grad, op=dist.ReduceOp.SUM, group=g)
-                        return grad
-
-                    param.register_hook(_ar)
+    def _make_linear(self, *args, **kwargs):
+        return te.GroupedLinear(
+            *args,
+            delay_wgrad_compute=self._delay_wgrad_compute,
+            fuse_wgrad_accumulation=self._delay_wgrad_compute,
+            **kwargs,
+        )
 
     def _delayed_weight_parameters(self):
         for linear in (self.fc1, self.fc2):
@@ -505,54 +436,19 @@ class ChunkedExperts(nn.Module):
 
     def forward(
         self,
-        x: torch.Tensor,
-        tokens_per_expert: torch.Tensor | None,
-        permuted_probs: torch.Tensor | None = None,
-        tokens_per_expert_list: list[int] | None = None,
-        activation_allocation: Callable[[], AbstractContextManager[None]] | None = None,
-        output_allocation: Callable[[str, tuple[int, int]], torch.Tensor] | None = None,
-    ) -> torch.Tensor:
-        if tokens_per_expert_list is None:
-            if tokens_per_expert is None:
-                raise RuntimeError("Experts requires token counts in tensor or host-list form")
-            m_splits = tokens_per_expert.tolist()
-        else:
-            m_splits = list(tokens_per_expert_list)
-        pad_mask = None
-        if self.fp8:
-            x, permuted_probs, m_splits, pad_mask = self._fp8_pad(x, permuted_probs, m_splits)
-
-        etp_real_len = x.shape[0]
-        if self.etp_group is not None:
-            max_len = torch.tensor([etp_real_len], device=x.device, dtype=torch.int64)
-            dist.all_reduce(max_len, op=dist.ReduceOp.MAX, group=self.etp_group)
-            max_len = int(max_len.item())
-            if etp_real_len < max_len:
-                x = torch.cat(
-                    [
-                        x,
-                        torch.zeros(
-                            max_len - etp_real_len, x.shape[1], dtype=x.dtype, device=x.device
-                        ),
-                    ],
-                    dim=0,
-                )
-                if permuted_probs is not None:
-                    permuted_probs = torch.cat(
-                        [
-                            permuted_probs,
-                            torch.zeros(
-                                max_len - etp_real_len, dtype=permuted_probs.dtype, device=x.device
-                            ),
-                        ],
-                        dim=0,
-                    )
-                m_splits = list(m_splits)
-                m_splits[-1] += max_len - etp_real_len
-
-        probs = permuted_probs.unsqueeze(-1) if permuted_probs is not None else None
-        caller_owned_outputs = output_allocation is not None
-        if caller_owned_outputs and (
+        x,
+        tokens_per_expert,
+        permuted_probs=None,
+        tokens_per_expert_list=None,
+        activation_allocation=None,
+        output_allocation=None,
+    ):
+        if output_allocation is None:
+            # The saved-context route uses the unchanged expert computation.
+            scope = nullcontext if activation_allocation is None else activation_allocation
+            with scope():
+                return super().forward(x, tokens_per_expert, permuted_probs, tokens_per_expert_list)
+        if (
             self.fp8
             or self.fc1_lora is not None
             or self.fc2_lora is not None
@@ -560,50 +456,31 @@ class ChunkedExperts(nn.Module):
             or self.moe_act_recompute
         ):
             raise RuntimeError(
-                "Caller-owned ChunkedEP outputs support only BF16 Qwen3 without "
+                "Caller-owned ChunkedEP outputs support only BF16 without "
                 "FP8, LoRA, ETP, or activation recompute"
             )
-        allocation_scope = nullcontext if activation_allocation is None else activation_allocation
-        with allocation_scope():
-            if caller_owned_outputs:
-                fc1_out = _caller_owned_grouped_linear(
-                    self.fc1,
-                    x,
-                    m_splits,
-                    output_allocation("fc1_output", (x.shape[0], self.fc1.out_features)),
-                    (output_allocation("fc1_dgrad", tuple(x.shape)) if x.requires_grad else None),
-                )
-            else:
-                fc1_out = self.fc1(x, m_splits)
-            if self.fc1_lora is not None:
-                fc1_out = fc1_out + self.fc1_lora(x, m_splits)
-            if self.moe_act_recompute and probs is not None:
-                act_ckpt = CheckpointWithoutOutput(preserve_rng_state=True)
-                h = act_ckpt.checkpoint(swiglu_with_probs, fc1_out, probs, self.swiglu_limit)
-            else:
-                act_ckpt = None
-                h = swiglu_with_probs(fc1_out, probs, self.swiglu_limit)
-        if caller_owned_outputs:
-            out = _caller_owned_grouped_linear(
-                self.fc2,
-                h,
-                m_splits,
-                output_allocation("fc2_output", (h.shape[0], self.fc2.out_features)),
-                (output_allocation("fc2_dgrad", tuple(h.shape)) if h.requires_grad else None),
+        if tokens_per_expert_list is None and tokens_per_expert is None:
+            raise RuntimeError("Experts requires token counts in tensor or host-list form")
+        splits = (
+            tokens_per_expert.tolist()
+            if tokens_per_expert_list is None
+            else list(tokens_per_expert_list)
+        )
+        probs = permuted_probs.unsqueeze(-1) if permuted_probs is not None else None
+        scope = nullcontext if activation_allocation is None else activation_allocation
+        with scope():
+            fc1_out = _caller_owned_grouped_linear(
+                self.fc1,
+                x,
+                splits,
+                output_allocation("fc1_output", (x.shape[0], self.fc1.out_features)),
+                output_allocation("fc1_dgrad", tuple(x.shape)) if x.requires_grad else None,
             )
-        else:
-            out = self.fc2(h, m_splits)
-        if self.fc2_lora is not None:
-            out = out + self.fc2_lora(h, m_splits)
-        if act_ckpt is not None:
-            act_ckpt.discard_output_and_register_recompute(out)
-
-        if self.etp_group is not None:
-            out = _AllReduceETP.apply(out, self.etp_group)
-            out = out[:etp_real_len]
-
-        if pad_mask is not None:
-            out = out[pad_mask]
-        return out
-
-    _fp8_pad = staticmethod(_BaseExperts._fp8_pad)
+            h = swiglu_with_probs(fc1_out, probs, self.swiglu_limit)
+        return _caller_owned_grouped_linear(
+            self.fc2,
+            h,
+            splits,
+            output_allocation("fc2_output", (h.shape[0], self.fc2.out_features)),
+            output_allocation("fc2_dgrad", tuple(h.shape)) if h.requires_grad else None,
+        )

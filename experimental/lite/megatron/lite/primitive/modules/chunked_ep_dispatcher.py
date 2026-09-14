@@ -1,70 +1,23 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""ChunkedEP transport: explicit asynchronous DeepEP operations."""
+"""ChunkedEP transport: asynchronous extensions over the shared DeepEP setup."""
 
 from __future__ import annotations
 
-import os
-from dataclasses import dataclass
-from typing import Any
+import torch
+import torch.distributed as dist
 
-import torch  # pyright: ignore[reportMissingImports]
-import torch.distributed as dist  # pyright: ignore[reportMissingImports]
-
-from megatron.lite.primitive.parallel import ParallelState
-from megatron.lite.primitive.utils import ensure_divisible
+from megatron.lite.primitive.modules.dispatcher import (
+    EventHandle,
+    EventOverlap,
+    TokenDispatcher as _BaseDispatcher,
+)
 from megatron.lite.primitive.utils.moe import permute, unpermute
 
-try:
-    import deep_ep  # pyright: ignore[reportMissingImports]
-    from deep_ep.utils import EventHandle, EventOverlap  # pyright: ignore[reportMissingImports]
-except ImportError:
-    deep_ep = None  # type: ignore
-    EventHandle = None  # type: ignore
-    EventOverlap = None  # type: ignore
 
-
-def _hidden_bytes(hidden_size: int) -> int:
-    return hidden_size * 2
-
-
-@dataclass(frozen=True)
-class _DeepEPBufferAllocation:
-    buffer: Any
-    num_nvl_bytes: int
-    num_rdma_bytes: int
-
-    @property
-    def resident_bytes(self) -> int:
-        return self.num_nvl_bytes + self.num_rdma_bytes
-
-
-def _build_deepep_buffer(group: dist.ProcessGroup, hidden_size: int) -> _DeepEPBufferAllocation:
-    if deep_ep is None:
-        raise RuntimeError("DeepEP buffer requested but deep_ep is not installed.")
-
-    group_size = dist.get_world_size(group=group)
-    hidden_bytes = _hidden_bytes(hidden_size)
-    num_nvl_bytes = 0
-    num_rdma_bytes = 0
-
-    for config in (
-        deep_ep.Buffer.get_dispatch_config(group_size),
-        deep_ep.Buffer.get_combine_config(group_size),
-    ):
-        num_nvl_bytes = max(
-            config.get_nvl_buffer_size_hint(hidden_bytes, group_size), num_nvl_bytes
-        )
-        num_rdma_bytes = max(
-            config.get_rdma_buffer_size_hint(hidden_bytes, group_size), num_rdma_bytes
-        )
-
-    return _DeepEPBufferAllocation(
-        buffer=deep_ep.Buffer(
-            group=group, num_nvl_bytes=num_nvl_bytes, num_rdma_bytes=num_rdma_bytes
-        ),
-        num_nvl_bytes=num_nvl_bytes,
-        num_rdma_bytes=num_rdma_bytes,
-    )
+def _previous_event():
+    if EventHandle is not None and EventOverlap is not None:
+        return EventOverlap(EventHandle())
+    return None
 
 
 def _event_is_waitable(event) -> bool:
@@ -93,45 +46,13 @@ def _record_current_stream_event_if_unwaitable(event, tensor: torch.Tensor):
     return event
 
 
-def _use_moe_permute_fusion() -> bool:
-    return os.environ.get("MEGATRON_LITE_MOE_PERMUTE_FUSION", "0") == "1"
-
-
-class ChunkedDispatcher:
-    def __init__(
-        self,
-        num_experts: int,
-        hidden_size: int,
-        ps: ParallelState,
-        *,
-        use_deepep: bool = True,
-        moe_permute_fusion: bool | None = None,
-    ):
-        self.ps = ps
-        self.num_experts = num_experts
-        self.ep_size = ps.ep_size
-        self.num_local_experts = ensure_divisible(num_experts, ps.ep_size)
-        self.moe_permute_fusion = (
-            _use_moe_permute_fusion() if moe_permute_fusion is None else bool(moe_permute_fusion)
-        )
-
-        self.use_deepep = use_deepep and deep_ep is not None and ps.ep_size > 1
+class ChunkedDispatcher(_BaseDispatcher):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
         if not self.use_deepep:
             raise RuntimeError("ChunkedDispatcher requires DeepEP and EP > 1")
-        if self.use_deepep:
-            assert ps.tp_ep_group is not None
-            allocation = _build_deepep_buffer(ps.tp_ep_group, hidden_size)
-            self.buffer = allocation.buffer
-            self.deepep_buffer_resident_bytes = allocation.resident_bytes
-
-        self._row_id_map: torch.Tensor | None = None
-        self._restore_shape: tuple | None = None
-        self._handle = None
-        self._deepep_event = None
 
     def prepare_deepep_combine(self, expert_output: torch.Tensor):
-        if not self.use_deepep:
-            raise RuntimeError("prepare_deepep_combine requires DeepEP combine.")
         rank_grouped = unpermute(
             expert_output,
             self._row_id_map,
@@ -148,13 +69,7 @@ class ChunkedDispatcher:
         allocate_on_comm_stream: bool = False,
         async_finish: bool = True,
     ):
-        if not self.use_deepep:
-            raise RuntimeError("submit_deepep_combine_prepared requires DeepEP combine.")
-        previous_event = (
-            EventOverlap(EventHandle())
-            if async_finish and EventHandle is not None and EventOverlap is not None
-            else None
-        )
+        previous_event = _previous_event() if async_finish else None
         combined = self.buffer.combine(
             rank_grouped,
             handle,
@@ -184,13 +99,7 @@ class ChunkedDispatcher:
     def submit_deepep_combine_backward(
         self, grad_output: torch.Tensor, handle, *, allocate_on_comm_stream: bool = False
     ):
-        if not self.use_deepep:
-            raise RuntimeError("submit_deepep_combine_backward requires DeepEP.")
-        previous_event = (
-            EventOverlap(EventHandle())
-            if EventHandle is not None and EventOverlap is not None
-            else None
-        )
+        previous_event = _previous_event()
         grad_rank_grouped, _, _, _, _, event = self.buffer.dispatch(
             grad_output.contiguous(),
             handle=handle,
@@ -201,8 +110,6 @@ class ChunkedDispatcher:
         return {"grad_rank_grouped": grad_rank_grouped, "event": event}
 
     def finish_deepep_combine_backward(self, state):
-        if not self.use_deepep:
-            raise RuntimeError("finish_deepep_combine_backward requires DeepEP.")
         _event_current_stream_wait(state.get("event"))
         return state["grad_rank_grouped"]
 
@@ -214,13 +121,7 @@ class ChunkedDispatcher:
         *,
         allocate_on_comm_stream: bool = False,
     ):
-        if not self.use_deepep:
-            raise RuntimeError("submit_deepep_dispatch_backward requires DeepEP.")
-        previous_event = (
-            EventOverlap(EventHandle())
-            if EventHandle is not None and EventOverlap is not None
-            else None
-        )
+        previous_event = _previous_event()
         grad_scores = None if grad_recv_probs is None else grad_recv_probs.float()
         grad_hidden, grad_topk_scores, event = self.buffer.combine(
             grad_recv_hidden.contiguous(),
@@ -233,14 +134,10 @@ class ChunkedDispatcher:
         return {"grad_hidden": grad_hidden, "grad_topk_scores": grad_topk_scores, "event": event}
 
     def finish_deepep_dispatch_backward(self, state):
-        if not self.use_deepep:
-            raise RuntimeError("finish_deepep_dispatch_backward requires DeepEP.")
         _event_current_stream_wait(state.get("event"))
         return state["grad_hidden"], state["grad_topk_scores"]
 
     def finish_deepep_combine(self, state):
-        if not self.use_deepep:
-            raise RuntimeError("finish_deepep_combine requires DeepEP combine.")
         _event_current_stream_wait(state.get("event"))
         combined = state["combined"]
         state.clear()
@@ -256,15 +153,9 @@ class ChunkedDispatcher:
         allocate_on_comm_stream: bool = False,
         async_finish: bool = True,
     ):
-        if not self.use_deepep:
-            raise RuntimeError("submit_deepep_dispatch requires DeepEP dispatch.")
         topk_indices = topk_indices.contiguous()
         topk_scores = topk_scores.float().contiguous()
-        previous_event = (
-            EventOverlap(EventHandle())
-            if async_finish and EventHandle is not None and EventOverlap is not None
-            else None
-        )
+        previous_event = _previous_event() if async_finish else None
         (
             num_tokens_per_rank,
             num_tokens_per_rdma_rank,
@@ -312,16 +203,11 @@ class ChunkedDispatcher:
             "event": event,
         }
 
-    def _resolve_deepep_recv_per_expert(self, state):
-        return state["recv_per_expert"]
-
     def finish_deepep_dispatch(self, state, *, materialize_local_tpe: bool = True):
-        if not self.use_deepep:
-            raise RuntimeError("finish_deepep_dispatch requires DeepEP dispatch.")
         self._handle = state["handle"]
         self._deepep_event = state["event"]
         self.wait_dispatch_event()
-        recv_per_expert = self._resolve_deepep_recv_per_expert(state)
+        recv_per_expert = state["recv_per_expert"]
         return self._finish_deepep_dispatch(
             state["recv_hidden"],
             state["recv_indices"],
@@ -418,19 +304,6 @@ class ChunkedDispatcher:
                 fused=self.moe_permute_fusion,
             )[:3]
         restore_shape = recv_hidden.shape
-        if os.environ.get("MEGATRON_LITE_DEEPEP_DEBUG_METADATA") == "1":
-            ep_rank = dist.get_rank(group=self.ps.ep_group)
-            print(
-                "[DEEPEP_METADATA] "
-                f"ep_rank={ep_rank} recv_rows={int(recv_hidden.shape[0])} "
-                f"expert_rows={int(dispatched.shape[0])} "
-                f"recv_indices_shape={tuple(recv_indices.shape)} "
-                f"recv_per_expert_len={len(recv_per_expert)} "
-                f"recv_per_expert_sum={sum(int(x) for x in recv_per_expert)} "
-                f"recv_per_expert_head={recv_per_expert[: self.num_local_experts]} "
-                f"local_tpe_sum={sum(local_tpe_list)}",
-                flush=True,
-            )
         if sum(local_tpe_list) != int(dispatched.shape[0]):
             ep_rank = dist.get_rank(group=self.ps.ep_group)
             raise RuntimeError(
@@ -455,10 +328,8 @@ class ChunkedDispatcher:
         force_direct_permute: bool = False,
         materialize_local_tpe: bool = True,
     ):
-        if not self.use_deepep:
-            raise RuntimeError("finish_deepep_dispatch_external requires DeepEP dispatch.")
         _event_current_stream_wait(state.get("event"))
-        recv_per_expert = self._resolve_deepep_recv_per_expert(state)
+        recv_per_expert = state["recv_per_expert"]
         dispatched, local_tpe, permuted_probs, metadata = self._finish_deepep_dispatch_external(
             state["recv_hidden"],
             state["recv_indices"],
