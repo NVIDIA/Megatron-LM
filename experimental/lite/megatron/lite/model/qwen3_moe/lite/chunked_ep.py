@@ -6,8 +6,10 @@ from dataclasses import dataclass
 import torch
 
 from megatron.lite.model.qwen3_moe.lite.model import TransformerLayer
-from megatron.lite.primitive.modules.dispatcher import TokenDispatcher
-from megatron.lite.primitive.modules.experts import Experts
+from megatron.lite.primitive.modules.chunked_ep_dispatcher import (
+    ChunkedDispatcher as TokenDispatcher,
+)
+from megatron.lite.primitive.modules.chunked_ep_experts import ChunkedExperts as Experts
 from megatron.lite.primitive.modules.moe_ep_chunk_overlap import ChunkedMoE, checkpoint_ep_chunk
 from megatron.lite.primitive.modules.moe_ep_chunk_overlap_policy import (
     validate_ep_chunk_overlap_config,
@@ -116,3 +118,15 @@ class Qwen3ChunkedEP:
             return None
         layers[0].finish_backward = self.full_recompute
         return layers[0].moe.chunked_ep
+
+
+def release_chunked_ep(chunks):
+    """Release model-owned primitive state before model weights leave the device."""
+    seen = set()
+    for chunk in chunks:
+        for module in chunk.modules():
+            if isinstance(module, ChunkedMoE) and id(module) not in seen:
+                seen.add(id(module))
+                device = next(module.parameters()).device
+                stream = torch.cuda.current_stream(device) if device.type == "cuda" else None
+                module.chunked_ep.release(stream=stream)

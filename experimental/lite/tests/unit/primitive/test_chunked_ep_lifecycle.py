@@ -10,6 +10,47 @@ import torch
 import megatron.core  # noqa: F401
 
 
+def test_chunked_transport_owns_external_metadata_and_waits_before_finish(
+    transformer_engine_import_stub, monkeypatch
+):
+    transformer_engine_import_stub()
+    from megatron.lite.primitive.modules import chunked_ep_dispatcher as transport
+
+    buffer = Mock()
+    monkeypatch.setattr(transport, "deep_ep", object())
+    monkeypatch.setattr(
+        transport,
+        "_build_deepep_buffer",
+        lambda *args: transport._DeepEPBufferAllocation(buffer, 8, 16),
+    )
+    ps = SimpleNamespace(ep_size=2, tp_ep_group=object())
+    dispatcher = transport.ChunkedDispatcher(4, 3, ps)
+    assert dispatcher.deepep_buffer_resident_bytes == 24
+    event = SimpleNamespace(event=object(), current_stream_wait=Mock())
+    hidden = torch.arange(6.0).reshape(2, 3)
+    state = {
+        "recv_hidden": hidden,
+        "recv_indices": torch.tensor([[1], [0]]),
+        "recv_probs": torch.tensor([[0.2], [0.8]]),
+        "recv_per_expert": [1, 1],
+        "handle": object(),
+        "event": event,
+    }
+    output, counts, probs, metadata = dispatcher.finish_deepep_dispatch_external_with_options(
+        state, force_manual_map=True, force_direct_permute=True, materialize_local_tpe=False
+    )
+    event.current_stream_wait.assert_called_once()
+    torch.testing.assert_close(output, hidden.flip(0))
+    torch.testing.assert_close(probs, state["recv_probs"].flatten().flip(0))
+    assert counts is None and metadata["local_tpe_list"] == [1, 1]
+    assert metadata["handle"] is state["handle"]
+    assert dispatcher._handle is None
+    completion = {"combined": hidden, "event": event}
+    assert dispatcher.finish_deepep_combine(completion) is hidden
+    assert completion == {}
+    assert event.current_stream_wait.call_count == 2
+
+
 class Event:
     def query(self):
         return False

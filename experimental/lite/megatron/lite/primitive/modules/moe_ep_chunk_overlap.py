@@ -12,8 +12,10 @@ from typing import Any, Callable, Literal
 import torch
 import torch.nn as nn
 
-from megatron.lite.primitive.modules.dispatcher import TokenDispatcher
-from megatron.lite.primitive.modules.experts import Experts
+from megatron.lite.primitive.modules.chunked_ep_dispatcher import (
+    ChunkedDispatcher as TokenDispatcher,
+)
+from megatron.lite.primitive.modules.chunked_ep_experts import ChunkedExperts as Experts
 from megatron.lite.primitive.modules.moe_ep_chunk_overlap_policy import runtime_ep_chunk_ranges
 from megatron.lite.primitive.utils.moe import unpermute
 

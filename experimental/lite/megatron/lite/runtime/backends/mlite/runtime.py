@@ -427,24 +427,6 @@ class MegatronLiteRuntime(RuntimeBase):
             if callable(release):
                 release()
 
-    def release_ep_chunk_workspaces(self, handle: ModelHandle) -> None:
-        """Release unique ChunkedEP module workspaces at a training boundary."""
-        stream = None
-        released = set()
-        for chunk in handle._extras.get("model_chunks", [handle._model]):
-            modules = getattr(chunk, "modules", None)
-            candidates = (chunk,) if not callable(modules) else (chunk, *modules())
-            for module in candidates:
-                if id(module) in released:
-                    continue
-                released.add(id(module))
-                execution = getattr(module, "chunked_ep", None)
-                release = getattr(execution, "release", None)
-                if callable(release):
-                    if stream is None and torch.cuda.is_available():
-                        stream = torch.cuda.current_stream()
-                    release(stream=stream)
-
     # ── Memory ──
 
     def to(
@@ -471,9 +453,11 @@ class MegatronLiteRuntime(RuntimeBase):
         # scratch buffers or optimizer residency.
         training_transfer = model and grad
         if device == "cpu":
-            if training_transfer:
-                self.release_ep_chunk_workspaces(handle)
             if model:
+                # Optional model-owned cleanup; errors must stop the transfer.
+                before_offload = handle._extras.get("before_model_offload")
+                if before_offload is not None:
+                    before_offload()
                 offload_model_to_cpu(model_chunks)
             if (optimizer or training_transfer) and handle._optimizer is not None:
                 offload_state = getattr(handle._optimizer, "offload_state_to_cpu", None)

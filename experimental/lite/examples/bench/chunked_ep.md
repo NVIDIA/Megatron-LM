@@ -7,6 +7,9 @@ recomputation uses a graph-free forward followed by fused forward/backward.
 The primitive owns the autograd bridge and buffer lifecycle. Qwen supplies
 only the attention/residual/norm prefix and selects the composition; the
 three OPs never read a recomputation setting. Model parameter paths are unchanged.
+ChunkedEP uses separate expert and transport implementations; the existing
+EP experts and dispatcher are unchanged. Model-owned cleanup is registered
+through the generic runtime `before_model_offload` callback.
 
 ```python
 from megatron.lite.model.qwen3_moe.lite.protocol import ImplConfig

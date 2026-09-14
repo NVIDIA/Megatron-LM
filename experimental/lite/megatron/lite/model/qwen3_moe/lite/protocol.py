@@ -56,6 +56,7 @@ from megatron.lite.model.qwen3_moe.lite.checkpoint import EXPERT_CLASSIFIER, PLA
 from megatron.lite.model.qwen3_moe.lite.checkpoint import load_hf_weights as _load_hf_weights_impl
 from megatron.lite.model.qwen3_moe.lite.chunked_ep import (
     Qwen3ChunkedEP,
+    release_chunked_ep,
     validate_chunked_ep_mtp,
     validate_qwen3_ep_chunk_recompute_composition,
 )
@@ -430,6 +431,9 @@ def build_model(model_cfg: Qwen3MoEConfig, *, impl_cfg: ImplConfig) -> ModelBund
             "pre_forward_hook": _pre_forward_hook,
             "optimizer_backend": optimizer_backend,
             "post_model_load_hook": post_model_load_hook,
+            "before_model_offload": (
+                (lambda: release_chunked_ep(chunks)) if impl_cfg.enable_ep_chunk_overlap else None
+            ),
             "lora_config": lora_config,
             "lora_stats": lora_stats,
         },
