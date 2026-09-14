@@ -16,6 +16,7 @@ from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
 from tools.prepare_cache import (
+    _get_prepare_cache_num_samples,
     _normalize_prepare_cache_args,
     build_dataset_caches,
     core_gpt_dataset_config_from_args,
@@ -160,12 +161,136 @@ def test_prepare_cache_builds_blended_dataset_cache(tmp_path_dist_ckpt):
 
 
 def test_prepare_cache_world_size_override():
-    args = Namespace(rank=11, world_size=1, prepare_cache_world_size=8)
+    args = Namespace(
+        rank=11,
+        iteration=0,
+        world_size=1,
+        prepare_cache_world_size=8,
+        prepare_cache_start_iteration=None,
+        seq_length=4096,
+        encoder_seq_length=None,
+        micro_batch_size=None,
+        num_layers=None,
+        encoder_num_layers=None,
+        hidden_size=None,
+        num_attention_heads=None,
+        max_position_embeddings=None,
+    )
 
     _normalize_prepare_cache_args(args)
 
     assert args.rank == 0
     assert args.world_size == 8
+
+
+def test_prepare_cache_normalization_adds_training_validation_defaults():
+    args = Namespace(
+        rank=11,
+        iteration=0,
+        world_size=1,
+        prepare_cache_world_size=None,
+        prepare_cache_start_iteration=None,
+        seq_length=4096,
+        encoder_seq_length=None,
+        micro_batch_size=None,
+        num_layers=None,
+        encoder_num_layers=None,
+        hidden_size=None,
+        num_attention_heads=None,
+        max_position_embeddings=None,
+    )
+
+    _normalize_prepare_cache_args(args)
+
+    assert args.rank == 0
+    assert args.micro_batch_size == 1
+    assert args.num_layers == 1
+    assert args.hidden_size == 1
+    assert args.num_attention_heads == 1
+    assert args.max_position_embeddings == 4096
+
+
+def test_prepare_cache_normalization_requires_sequence_length():
+    args = Namespace(
+        rank=11,
+        iteration=0,
+        world_size=1,
+        prepare_cache_world_size=None,
+        prepare_cache_start_iteration=None,
+        seq_length=None,
+        encoder_seq_length=None,
+    )
+
+    with pytest.raises(ValueError, match="--seq-length"):
+        _normalize_prepare_cache_args(args)
+
+
+def test_prepare_cache_normalization_applies_start_iteration():
+    args = Namespace(
+        rank=11,
+        iteration=0,
+        world_size=1,
+        prepare_cache_world_size=None,
+        prepare_cache_start_iteration=74508,
+        seq_length=4096,
+        encoder_seq_length=None,
+        micro_batch_size=None,
+        num_layers=None,
+        encoder_num_layers=None,
+        hidden_size=None,
+        num_attention_heads=None,
+        max_position_embeddings=None,
+    )
+
+    _normalize_prepare_cache_args(args)
+
+    assert args.iteration == 74508
+
+
+def test_prepare_cache_normalization_rejects_negative_start_iteration():
+    args = Namespace(
+        rank=11,
+        iteration=0,
+        world_size=1,
+        prepare_cache_world_size=None,
+        prepare_cache_start_iteration=-1,
+        seq_length=4096,
+        encoder_seq_length=None,
+    )
+
+    with pytest.raises(ValueError, match="--prepare-cache-start-iteration"):
+        _normalize_prepare_cache_args(args)
+
+
+def test_prepare_cache_num_samples_allows_missing_eval_interval_with_no_eval(tmp_path):
+    args = _build_prepare_cache_args(
+        [], tmp_path / "cache", train_iters=4, eval_iters=0, eval_interval=None
+    )
+
+    assert _get_prepare_cache_num_samples(args) == (32, 0, 0)
+
+
+def test_prepare_cache_num_samples_preserves_eval_interval_formula(tmp_path):
+    args = _build_prepare_cache_args(
+        [], tmp_path / "cache", train_iters=4, eval_iters=2, eval_interval=2
+    )
+
+    assert _get_prepare_cache_num_samples(args) == (32, 48, 16)
+
+
+def test_prepare_cache_num_samples_uses_current_phase(tmp_path):
+    args = _build_prepare_cache_args(
+        [],
+        tmp_path / "cache",
+        train_iters=10,
+        global_batch_size=2,
+        eval_iters=0,
+        eval_interval=None,
+        phase_transition_iterations=[4],
+        iteration=4,
+    )
+
+    assert _get_prepare_cache_num_samples(args) == (12, 0, 0)
 
 
 def test_prepare_cache_builds_and_hits_per_split_dataset_cache(tmp_path_dist_ckpt):
