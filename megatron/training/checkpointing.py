@@ -2945,10 +2945,6 @@ def load_checkpoint(
         check_checkpoint_args(checkpoint_args, skip_args=skip_args)
         args.consumed_train_samples = getattr(checkpoint_args, 'consumed_train_samples', 0)
         args.skipped_train_samples = getattr(checkpoint_args, 'skipped_train_samples', 0)
-        if getattr(args, 'dsa_indexer_activation_start_samples', None) is None:
-            args.dsa_indexer_activation_start_samples = getattr(
-                checkpoint_args, 'dsa_indexer_activation_start_samples', None
-            )
         update_num_microbatches(consumed_samples=args.consumed_train_samples, verbose=True)
         args.consumed_valid_samples = getattr(checkpoint_args, 'consumed_valid_samples', 0)
     else:
