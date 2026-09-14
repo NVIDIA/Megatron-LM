@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import torch
 
 from megatron.core.models.hybrid import MTPSplit, PipelineSplit
+from megatron.core.ssm.mlp_layer_config import MLPLayerConfig
 from megatron.core.tokenizers.utils.build_tokenizer import vocab_size_with_padding
 from megatron.core.transformer.moe.moe_layer_config import MoELayerConfig
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -65,7 +66,7 @@ def create_test_args():
     return args
 
 
-def test_hybrid_config_list_moe_logging_metadata_counts_physical_contributors():
+def test_hybrid_config_list_moe_logging_metadata_counts_all_physical_moe_layers():
     base = TransformerConfig(num_layers=2, hidden_size=8, num_attention_heads=2)
     aux = MoELayerConfig.from_config(base)
     aux.moe_router_load_balancing_type = "aux_loss"
@@ -82,20 +83,20 @@ def test_hybrid_config_list_moe_logging_metadata_counts_physical_contributors():
     source = [aux, PipelineSplit, disabled, MTPSplit, mtp, MTPSplit, mtp]
 
     repeated = _hybrid_config_list_moe_logging_metadata(source, True)
-    assert repeated == (
-        ["load_balancing_loss", "seq_load_balancing_loss", "z_loss"],
-        3,
-        {"load_balancing_loss": 1, "seq_load_balancing_loss": 1, "z_loss": 1},
-        True,
-    )
+    # Disabled auxiliary losses do not remove an MoE layer from the averaging denominator.
+    assert repeated == (["load_balancing_loss", "seq_load_balancing_loss", "z_loss"], 3, 3, True)
 
     independent = _hybrid_config_list_moe_logging_metadata(source, False)
-    assert independent == (
-        ["load_balancing_loss", "seq_load_balancing_loss", "z_loss"],
-        4,
-        {"load_balancing_loss": 1, "seq_load_balancing_loss": 2, "z_loss": 2},
-        True,
-    )
+    assert independent == (["load_balancing_loss", "seq_load_balancing_loss", "z_loss"], 4, 4, True)
+
+
+def test_hybrid_config_list_moe_logging_metadata_without_moe():
+    base = TransformerConfig(num_layers=2, hidden_size=8, num_attention_heads=2)
+    dense = MLPLayerConfig.from_config(base)
+    source = [dense, PipelineSplit, dense, MTPSplit, dense, MTPSplit, dense]
+
+    assert _hybrid_config_list_moe_logging_metadata(source, True) == ([], 3, 0, False)
+    assert _hybrid_config_list_moe_logging_metadata(source, False) == ([], 4, 0, False)
 
 
 def test_runtime_metrics_find_hybrid_model_under_language_model_wrapper():

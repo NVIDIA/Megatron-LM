@@ -3376,7 +3376,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
 def _hybrid_config_list_moe_logging_metadata(
     hybrid_layer_config_list, mtp_use_repeated_layer: bool
 ):
-    """Derive exact physical MoE metric metadata from a HybridModel config list."""
+    """Derive metric names and physical layer counts from a HybridModel config list."""
     from megatron.core.models.hybrid.hybrid_layer_allocation import MTPSplit, PipelineSplit
     from megatron.core.transformer.moe.moe_layer_config import MoELayerConfig
 
@@ -3409,7 +3409,7 @@ def _hybrid_config_list_moe_logging_metadata(
 
     physical_moe_configs = [config for config in physical_configs if type(config) is MoELayerConfig]
     if not physical_moe_configs:
-        return [], len(physical_configs), {}, False
+        return [], len(physical_configs), 0, False
 
     routing_types = set()
     for moe_config in physical_moe_configs:
@@ -3428,20 +3428,7 @@ def _hybrid_config_list_moe_logging_metadata(
     if any(config.moe_z_loss_coeff is not None for config in physical_moe_configs):
         track_names.append("z_loss")
 
-    contributor_counts = {}
-    for track_name in track_names:
-        if track_name == "z_loss":
-            contributor_counts[track_name] = sum(
-                config.moe_z_loss_coeff is not None for config in physical_moe_configs
-            )
-        else:
-            routing_type = metric_to_routing_type[track_name]
-            contributor_counts[track_name] = sum(
-                routing_type in enabled_routing_types_for_config(config)
-                for config in physical_moe_configs
-            )
-
-    return track_names, len(physical_configs), contributor_counts, True
+    return track_names, len(physical_configs), len(physical_moe_configs), True
 
 
 def _find_hybrid_model_for_runtime_metrics(model):

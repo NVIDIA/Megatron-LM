@@ -99,7 +99,8 @@ class TestTop2Router:
         assert recorded["num_layers"] == 9
 
     @pytest.mark.internal
-    def test_heterogeneous_metrics_use_per_metric_contributor_counts(self, monkeypatch):
+    @pytest.mark.parametrize("num_moe_layers", [None, 2])
+    def test_heterogeneous_metrics_use_total_moe_layer_count(self, monkeypatch, num_moe_layers):
         tracker = MoEMetricsTracker()
         tracker.record("load_balancing_loss", torch.tensor(2.0), 1, 2)
         tracker.record("seq_load_balancing_loss", torch.tensor(6.0), 2, 2)
@@ -110,12 +111,13 @@ class TestTop2Router:
             loss_scale=1.0,
             iteration=1,
             track_names=["load_balancing_loss", "seq_load_balancing_loss"],
-            num_moe_layers={"load_balancing_loss": 1, "seq_load_balancing_loss": 1},
+            num_layers=2,
+            num_moe_layers=num_moe_layers,
             total_loss_dict=total_loss_dict,
         )
 
-        torch.testing.assert_close(total_loss_dict["load_balancing_loss"], torch.tensor(2.0))
-        torch.testing.assert_close(total_loss_dict["seq_load_balancing_loss"], torch.tensor(6.0))
+        torch.testing.assert_close(total_loss_dict["load_balancing_loss"], torch.tensor(1.0))
+        torch.testing.assert_close(total_loss_dict["seq_load_balancing_loss"], torch.tensor(3.0))
 
     @pytest.mark.internal
     def test_skip_muon(self):
