@@ -178,6 +178,20 @@ def test_flashinfer_mxfp8_refresh_reports_noop_before_weight_build():
     assert InferenceGroupedMLP.refresh_flashinfer_mxfp8_weights(grouped_mlp) is False
 
 
+def test_flashinfer_mxfp8_refresh_skips_bf16_expert_weights():
+    from megatron.core.inference.moe import InferenceGroupedGemmBackend
+    from megatron.core.transformer.moe.experts import InferenceGroupedMLP
+
+    grouped_mlp = SimpleNamespace(
+        _concatenated_weights_built=True,
+        inference_grouped_gemm_backend=InferenceGroupedGemmBackend.FLASHINFER,
+        _fc1_weight=torch.empty(2, 8, 8, dtype=torch.bfloat16),
+        _fc2_weight=torch.empty(2, 8, 8, dtype=torch.bfloat16),
+    )
+
+    assert InferenceGroupedMLP.refresh_flashinfer_mxfp8_weights(grouped_mlp) is False
+
+
 def test_bf16_flashinfer_nvls_uses_dispatcher_copy_fallback(monkeypatch):
     from megatron.core.transformer.moe import experts
 

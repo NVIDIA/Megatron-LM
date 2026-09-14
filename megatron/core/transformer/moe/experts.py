@@ -1323,11 +1323,20 @@ class InferenceGroupedMLP(TEGroupedMLP):
             or self.inference_grouped_gemm_backend != InferenceGroupedGemmBackend.FLASHINFER
         ):
             return False
+
+        fc1_is_mxfp8 = isinstance(self._fc1_weight, FlashInferRoutedMXFP8Weight)
+        fc2_is_mxfp8 = isinstance(self._fc2_weight, FlashInferRoutedMXFP8Weight)
+        if fc1_is_mxfp8 != fc2_is_mxfp8:
+            raise TypeError("FC1 and FC2 must use the same FlashInfer MXFP8 format")
+        if not fc1_is_mxfp8:
+            # Selective-precision recipes also build BF16 expert weights for
+            # FlashInfer. Those buffers are refit directly and have no derived
+            # routed representation to refresh.
+            return False
+
         require_flashinfer_routed_mxfp8()
         for linear_name, buf_name in [('linear_fc1', '_fc1_weight'), ('linear_fc2', '_fc2_weight')]:
             routed_weight = getattr(self, buf_name)
-            if not isinstance(routed_weight, FlashInferRoutedMXFP8Weight):
-                raise TypeError(f"{buf_name} is not a FlashInfer routed MXFP8 weight")
             canonical_weight = self._stack_mxfp8_linear_weight(linear_name, "triton")
             prepare_routed_mxfp8_weights(canonical_weight, out=routed_weight)
         return True
