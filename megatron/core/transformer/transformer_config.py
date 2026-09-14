@@ -3455,15 +3455,18 @@ class TransformerConfig(ModelParallelConfig):
             assert not self.add_qkv_bias
             assert not self.use_kitchen
 
-        assert (
-            not self.dsa_fwd_use_dense_attn or self.experimental_attention_variant == "dsa"
-        ), "dsa_fwd_use_dense_attn requires experimental_attention_variant='dsa'."
-        assert (
-            self.dsa_indexer_mode == "standard" or self.experimental_attention_variant == "dsa"
-        ), "dsa_indexer_mode='simplified' requires experimental_attention_variant='dsa'."
-        assert (
-            not self.dsa_reset_indexer_on_load or self.experimental_attention_variant == "dsa"
-        ), "dsa_reset_indexer_on_load requires experimental_attention_variant='dsa'."
+        if self.dsa_fwd_use_dense_attn:
+            assert (
+                self.experimental_attention_variant == "dsa"
+            ), "dsa_fwd_use_dense_attn requires experimental_attention_variant='dsa'."
+        if self.dsa_indexer_mode == "simplified":
+            assert (
+                self.experimental_attention_variant == "dsa"
+            ), "dsa_indexer_mode='simplified' requires experimental_attention_variant='dsa'."
+        if self.dsa_reset_indexer_on_load:
+            assert (
+                self.experimental_attention_variant == "dsa"
+            ), "dsa_reset_indexer_on_load requires experimental_attention_variant='dsa'."
 
         if self.experimental_attention_variant == "dsa":
             assert self.dsa_indexer_mode in (
