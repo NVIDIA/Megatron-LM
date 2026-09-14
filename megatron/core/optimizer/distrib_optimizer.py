@@ -3122,9 +3122,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     sub = name[len(layer_prefix) :]
                     for old_prefix, new_prefix in mappings:
                         if sub.startswith(old_prefix):
-                            candidates.append(
-                                f"{layer_prefix}{new_prefix}{sub[len(old_prefix) :]}"
-                            )
+                            candidates.append(f"{layer_prefix}{new_prefix}{sub[len(old_prefix) :]}")
                             break
                 return candidates
 

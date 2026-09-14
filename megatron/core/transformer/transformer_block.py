@@ -371,9 +371,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     pg_collection=self.pg_collection,
                     vp_stage=self.vp_stage,
                     name=(
-                        self.name + f".layers.{layer_number - 1}"
-                        if self.name is not None
-                        else None
+                        self.name + f".layers.{layer_number - 1}" if self.name is not None else None
                     ),
                 )
             if layer_config.enable_mhc_connections and not getattr(

@@ -1634,9 +1634,10 @@ class MultiTokenPredictionLayer(MegatronModule):
             with quantization_context:
                 hidden_states = self._concat_embeddings(hidden_states, decoder_input)
 
-            # Use a separate quantization context for the transformer layer. This is to ensure that
-            # when the transformer layer is cudagraphed, the FP8GlobalStateManager.is_first_fp8_module()
-            # is True so that the fp8 weight caching can be triggered correctly.
+            # Use a separate quantization context for the transformer layer. This is to ensure
+            # that when the transformer layer is cudagraphed, the
+            # FP8GlobalStateManager.is_first_fp8_module() is True so that the fp8 weight caching
+            # can be triggered correctly.
             with transformer_layer_quantization_context:
                 if self.mtp_layer_pattern is not None:
                     hidden_states = self.mtp_model_layer(
