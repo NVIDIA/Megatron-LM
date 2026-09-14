@@ -7,7 +7,8 @@ from __future__ import annotations
 import pytest
 import torch
 
-from examples.mimo.training.step import loss_func, move_batch_to_cuda
+from examples.mimo.training.batch import move_batch_to_cuda
+from examples.mimo.training.step import loss_func
 from megatron.core.packed_seq_params import PackedSeqParams
 
 

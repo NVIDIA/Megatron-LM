@@ -24,5 +24,4 @@ training-examples
 parallelism-guide
 deterministic-training
 features/index
-hybrid-model-migration
 ```

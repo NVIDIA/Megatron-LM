@@ -66,3 +66,4 @@ MODEL_ARGS:
   --inference-moe-token-dispatcher-type: nvls
   --inference-logging-step-interval: 1
 METRICS:
+LAUNCHER: ft_launcher

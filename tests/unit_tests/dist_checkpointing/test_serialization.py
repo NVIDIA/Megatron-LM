@@ -30,10 +30,15 @@ from megatron.core.dist_checkpointing.core import CheckpointingException, maybe_
 from megatron.core.dist_checkpointing.dict_utils import diff
 from megatron.core.dist_checkpointing.mapping import ShardedObject, ShardedTensorFactory
 from megatron.core.dist_checkpointing.serialization import (
+    get_default_load_sharded_strategy,
+    get_default_save_sharded_strategy,
     load_sharded_metadata,
     load_tensors_metadata,
 )
-from megatron.core.dist_checkpointing.strategies.torch import TorchDistSaveShardedStrategy
+from megatron.core.dist_checkpointing.strategies.torch import (
+    TorchDistLoadShardedStrategy,
+    TorchDistSaveShardedStrategy,
+)
 from megatron.core.dist_checkpointing.validation import StrictHandling
 from megatron.core.utils import is_torch_min_version
 from tests.unit_tests.dist_checkpointing import TempNamedDir
@@ -46,6 +51,12 @@ class TestSerialization:
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
+
+    def test_default_torch_dist_strategies(self):
+        assert isinstance(get_default_load_sharded_strategy(), TorchDistLoadShardedStrategy)
+        assert isinstance(
+            get_default_save_sharded_strategy("torch_dist"), TorchDistSaveShardedStrategy
+        )
 
     def test_single_process_save_load(self, tmp_path_dist_ckpt):
         Utils.initialize_model_parallel(1, 1)
