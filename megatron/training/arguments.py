@@ -1089,13 +1089,6 @@ def validate_args(args, defaults={}):
             '--dsa-indexer-reset-method requires --dsa-reset-indexer-on-load'
         assert getattr(args, 'dsa_indexer_mode', 'standard') == 'simplified', \
             '--dsa-indexer-reset-method main-Q methods require simplified DSA'
-    if getattr(args, 'dsa_indexer_activation_start_samples', None) is not None:
-        assert args.dsa_indexer_activation_start_samples >= 0, (
-            '--dsa-indexer-activation-start-samples must be non-negative'
-        )
-    assert getattr(args, 'dsa_indexer_activation_warmup_samples', 0) >= 0, (
-        '--dsa-indexer-activation-warmup-samples must be non-negative'
-    )
 
     if args.use_torch_fsdp2:
         assert is_torch_min_version("2.4.0"), \
@@ -3854,18 +3847,6 @@ def _add_experimental_attention_variant_args(parser):
             'per-head Frobenius energy of those weights. For simplified learned-K, both '
             'methods also initialize the indexer K from the loaded main-attention K.'
         ),
-    )
-    _maybe_add_argument(
-        '--dsa-indexer-activation-start-samples',
-        type=int,
-        default=None,
-        help='Sample position where DSA indexer activation/warmup starts.',
-    )
-    _maybe_add_argument(
-        '--dsa-indexer-activation-warmup-samples',
-        type=int,
-        default=0,
-        help='Sample count over which only DSA indexer optimizer groups warm up after activation.',
     )
     _maybe_add_argument(
         '--dsa-indexer-loss-coeff',
