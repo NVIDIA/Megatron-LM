@@ -116,10 +116,10 @@ class TorchSampling(Sampling):
         # take argmax(p / q). Distributionally identical to `torch.multinomial`,
         # but it never forms a cumulative sum, so the low-probability tail is not
         # eroded by the rounding an inverse-CDF walk accumulates across a 100k+
-        # vocabulary. Matches vLLM's sampler
-        # (`vllm/v1/sample/ops/topk_topp_sampler.py::random_sample`), which keeps
-        # the two engines' sampling paths aligned; vLLM also uses it to avoid the
-        # CPU-GPU sync that `torch.multinomial` incurs.
+        # vocabulary. Matches vLLM's sampler:
+        # https://github.com/vllm-project/vllm/blob/7702ee87dba0d8eed7f201e77a0a6613aac738a8/vllm/v1/sample/ops/topk_topp_sampler.py#L464
+        # which keeps the two engines' sampling paths aligned; vLLM also uses it to
+        # avoid the CPU-GPU sync that `torch.multinomial` incurs.
         q = torch.empty_like(probabilities)
         q.exponential_(generator=generator)
         sampled = probabilities.div_(q).argmax(dim=-1).view(-1)
