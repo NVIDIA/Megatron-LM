@@ -55,7 +55,7 @@ Startup validates the following before model allocation:
 - the memory dimension is divisible by the positive number of hash heads;
 - the versioned tokenizer-map artifact matches the configured tokenizer vocabulary, pad ID,
   selected layers, maximum order, and hash seed;
-- CP is one and CUDA graphs and FSDP are off;
+- CUDA graphs and FSDP are off (CP is supported for unpacked rows; CP with packed rows is rejected);
 - packed (THD) sequences use the `--sft` family (schedulers including `--use-varlen-dataset`
   are rejected) and, with PP > 1, `--pad-packed-seq-alignment max`; PP >= 3 is blocked upstream.
 
@@ -264,6 +264,6 @@ are permitted; Engram modules are plain torch modules outside the Transformer En
 regions and stay in BF16), standard residuals or native mHC, EP, TP, PP, SP, MoE coexistence,
 multi-token prediction (MTP layers never build Engram), native all-to-all, torch distributed
 checkpoints, and packed THD rows (document boundaries from EOS, from `cu_seqlens`, or both).
-CP greater than one, CUDA graphs, FSDP, inference serving,
+CP combined with packed rows, CUDA graphs, FSDP, inference serving,
 offload, DeepEP, communication overlap, request deduplication, FP8 table storage, and fused
 Engram kernels are intentionally deferred and rejected during startup.

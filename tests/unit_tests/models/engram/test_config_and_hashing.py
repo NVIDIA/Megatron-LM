@@ -168,8 +168,13 @@ def test_invalid_configuration_messages(tmp_path):
         boundary_token_id=0,
         tokenizer_map_path=str(artifact),
     )
-    with pytest.raises(ValueError, match="context_parallel_size == 1"):
-        config.validate_startup(_startup_transformer_config(context_parallel_size=2), 16)
+    # Context parallelism is supported for unpacked rows; only CP x packed rows is rejected,
+    # because packed rows partition per batch rather than by a static zigzag.
+    config.validate_startup(_startup_transformer_config(context_parallel_size=2), 16)
+    with pytest.raises(ValueError, match="context parallelism with packed"):
+        config.validate_startup(
+            _startup_transformer_config(context_parallel_size=2), 16, packed_sequences=True
+        )
     with pytest.raises(ValueError, match="expert_tensor_parallel_size == tensor_model_parallel"):
         config.validate_startup(
             _startup_transformer_config(

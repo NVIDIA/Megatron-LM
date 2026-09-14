@@ -13,10 +13,15 @@ from torch import Tensor, nn
 
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.tensor_parallel.mappings import (
+    gather_from_sequence_parallel_region,
+    scatter_to_sequence_parallel_region,
+)
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.utils import get_pg_rank, get_pg_size, nvtx_range_pop, nvtx_range_push
 
 from .config import EngramConfig
+from .cp_layout import gather_sequence, scatter_sequence, select_zigzag
 from .distributed_embedding import EPShardedMultiTableEmbedding
 from .hashing import build_ngram_hashes, slice_hashes_for_sequence_parallel
 
@@ -147,6 +152,7 @@ class Engram(MegatronModule):
         self.layer_number = layer_number
         self.pg_collection = pg_collection
         self.tp_group = pg_collection.tp
+        self.cp_group = getattr(pg_collection, "cp", None)
         self.num_streams = config.num_residual_streams if config.enable_hyper_connections else 1
         self.hidden_size = config.hidden_size
         device = (
@@ -291,6 +297,28 @@ class Engram(MegatronModule):
         return _SequenceParallelConvHalo.apply(normed, self.conv_history_length, self.tp_group)
 
     def _short_convolution(self, value: Tensor) -> Tensor:
+        cp_size = get_pg_size(self.cp_group)
+        if cp_size > 1:
+            # Phase A: restore the global sequence, convolve it as if CP were off, and give
+            # each rank its own chunks back. Under CP a rank owns two non-contiguous zigzag
+            # chunks, so it has two left boundaries whose predecessors live on other ranks;
+            # gathering sidesteps that at the cost of holding the full sequence for this one
+            # layer. Phase B replaces this with a halo exchange over the static zigzag
+            # predecessor map.
+            sequence_parallel = self.config.sequence_parallel and get_pg_size(self.tp_group) > 1
+            if sequence_parallel:
+                value = gather_from_sequence_parallel_region(
+                    value, tensor_parallel_output_grad=False, group=self.tp_group
+                )
+            value = gather_sequence(value, self.cp_group, sequence_dim=0, differentiable=True)
+            convolved = self._short_convolution_local(value)
+            convolved = scatter_sequence(convolved, self.cp_group, sequence_dim=0)
+            if sequence_parallel:
+                convolved = scatter_to_sequence_parallel_region(convolved, group=self.tp_group)
+            return convolved
+        return self._short_convolution_local(value)
+
+    def _short_convolution_local(self, value: Tensor) -> Tensor:
         sequence_length, batch_size, num_streams, hidden_size = value.shape
         normed = self.conv_norm(value.flatten(start_dim=-2)).view_as(value)
         with_history = torch.cat((self._convolution_history(normed), normed), dim=0)
@@ -330,8 +358,18 @@ class Engram(MegatronModule):
         message = "engram.hash"
         nvtx_range_push(message)
         try:
+            cp_size = get_pg_size(self.cp_group)
+            # Hash windows and the causal convolution both read positions that CP may have
+            # placed on another rank, so the memory is computed on the restored global
+            # sequence and re-selected afterwards. input_ids is a small int64 tensor, so the
+            # gather costs far less than threading a second token channel through the model.
+            global_input_ids = (
+                gather_sequence(input_ids, self.cp_group, sequence_dim=1, differentiable=False)
+                if cp_size > 1
+                else input_ids
+            )
             hash_ids = build_ngram_hashes(
-                input_ids=input_ids,
+                input_ids=global_input_ids,
                 tokenizer_remap=self.tokenizer_remap,
                 multipliers=self.hash_multipliers,
                 table_sizes=self.table_sizes,
@@ -341,6 +379,10 @@ class Engram(MegatronModule):
                 reset_at_boundary=self.engram_config.variant_spec.resets_windows_at_boundary_token,
                 cu_seqlens=_row_cu_seqlens(packed_seq_params),
             )
+            if cp_size > 1:
+                hash_ids = select_zigzag(
+                    hash_ids, cp_size, get_pg_rank(self.cp_group), sequence_dim=1
+                )
             hash_ids = slice_hashes_for_sequence_parallel(
                 hash_ids, hidden_states.shape[0], self.tp_group
             )

@@ -514,8 +514,6 @@ class EngramConfig:
         return (self.kernel_size - 1) * self.max_ngram_order
 
     def _validate_parallelism(self, transformer_config: Any, sequence_length: int | None) -> None:
-        if transformer_config.context_parallel_size != 1:
-            raise ValueError("Engram currently requires context_parallel_size == 1.")
         if (
             transformer_config.expert_tensor_parallel_size
             != transformer_config.tensor_model_parallel_size
@@ -548,6 +546,13 @@ class EngramConfig:
     def _validate_packed_sequences(self, transformer_config: Any, packed_sequences: bool) -> None:
         if not packed_sequences:
             return
+        if transformer_config.context_parallel_size != 1:
+            # The zigzag predecessor map is static only for unpacked rows; packed rows use a
+            # per-batch CP partitioning, so the memory cannot restore the global sequence from
+            # a fixed layout. Rejected until that partitioning is handled explicitly.
+            raise ValueError(
+                "Engram does not yet support context parallelism with packed (THD) sequences."
+            )
         if transformer_config.pipeline_model_parallel_size > 2:
             # TODO(upstream): middle pipeline stages receive no cu_seqlens/max_seqlen from the
             # TP batch broadcast, so packed training crashes there with or without Engram.
