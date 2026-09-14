@@ -14,6 +14,7 @@ from typing import Any
 import torch
 import torch.distributed as dist
 from torch.distributed.tensor import DTensor  # pyright: ignore[reportMissingImports]
+
 from megatron.lite.runtime.backends import Runtime as RuntimeBase
 from megatron.lite.runtime.backends.mlite.config import MegatronLiteConfig
 from megatron.lite.runtime.contracts.data import ForwardResult, ModelOutputs, PackedBatch
@@ -81,10 +82,7 @@ def _reset_parameters(module: torch.nn.Module) -> None:
                 )
             if original_local.data_ptr() != replacement_local.data_ptr():
                 original_local.copy_(
-                    replacement_local.to(
-                        device=original_local.device,
-                        dtype=original_local.dtype,
-                    )
+                    replacement_local.to(device=original_local.device, dtype=original_local.dtype)
                 )
             module._parameters[name] = original
 
@@ -429,6 +427,23 @@ class MegatronLiteRuntime(RuntimeBase):
             if callable(release):
                 release()
 
+    def release_ep_chunk_workspaces(self, handle: ModelHandle) -> None:
+        """Release unique ChunkedEP module workspaces at a training boundary."""
+        stream = None
+        released = set()
+        for chunk in handle._extras.get("model_chunks", [handle._model]):
+            modules = getattr(chunk, "modules", None)
+            candidates = (chunk,) if not callable(modules) else (chunk, *modules())
+            for module in candidates:
+                if id(module) in released:
+                    continue
+                released.add(id(module))
+                release = getattr(module, "release_ep_chunk_workspaces", None)
+                if callable(release):
+                    if stream is None and torch.cuda.is_available():
+                        stream = torch.cuda.current_stream()
+                    release(phase=None, stream=stream)
+
     # ── Memory ──
 
     def to(
@@ -455,6 +470,8 @@ class MegatronLiteRuntime(RuntimeBase):
         # scratch buffers or optimizer residency.
         training_transfer = model and grad
         if device == "cpu":
+            if training_transfer:
+                self.release_ep_chunk_workspaces(handle)
             if model:
                 offload_model_to_cpu(model_chunks)
             if (optimizer or training_transfer) and handle._optimizer is not None:

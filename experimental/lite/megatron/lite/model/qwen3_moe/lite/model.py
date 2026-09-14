@@ -13,13 +13,33 @@ from contextlib import nullcontext
 import torch
 import torch.nn as nn
 
-from megatron.lite.primitive import transformer_engine as te
 from megatron.lite.model.qwen3_moe.config import Qwen3MoEConfig
+from megatron.lite.model.qwen3_moe.lite.head_loss import (
+    balanced_head_loss_chunk_size,
+    use_chunked_head_loss,
+    validate_chunked_ep_mtp,
+)
+from megatron.lite.primitive import transformer_engine as te
 from megatron.lite.primitive.modules.dispatcher import TokenDispatcher
 from megatron.lite.primitive.modules.experts import Experts
 from megatron.lite.primitive.modules.gqa import GQAttention
 from megatron.lite.primitive.modules.lora import LoraConfig
+from megatron.lite.primitive.modules.moe_ep_chunk_overlap import (
+    EPChunkBackwardOp,
+    EPChunkForwardOp,
+    EPChunkFusedForwardBackwardOp,
+    EPChunkShapeProfile,
+    EPChunkWorkspaceKey,
+    get_ep_chunk_workspace,
+    release_ep_chunk_workspace,
+)
+from megatron.lite.primitive.modules.moe_ep_chunk_overlap_policy import (
+    validate_ep_chunk_overlap_config,
+)
 from megatron.lite.primitive.modules.router import TopKRouter
+from megatron.lite.primitive.ops.chunked_linear_cross_entropy import (
+    chunked_vocab_parallel_linear_cross_entropy,
+)
 from megatron.lite.primitive.ops.cross_entropy import vocab_parallel_cross_entropy
 from megatron.lite.primitive.ops.linear_cross_entropy import linear_cross_entropy
 from megatron.lite.primitive.ops.logprob import vocab_parallel_entropy
@@ -40,6 +60,101 @@ from megatron.lite.primitive.utils import build_fp8_recipe
 # ---------------------------------------------------------------------------
 
 
+class _Qwen3TransformerLayerFullRecomputeFunction(torch.autograd.Function):
+    """Full layer checkpoint with ChunkedEP owning only MoE recomputation."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        x: torch.Tensor,
+        position_ids: torch.Tensor | None,
+        packed_seq_params,
+        layer: "TransformerLayer",
+        park_chunked_ep_after_backward: bool,
+        *params: torch.Tensor,
+    ):
+        # ``Function.apply`` must make the initial whole-layer pass graph-free:
+        # saving a post-attention residual or the MLP norm output would restore
+        # the 48-layer activation growth that full recompute is meant to remove.
+        if torch.is_grad_enabled():
+            raise RuntimeError("Qwen3 full-recompute layer forward must run with grad disabled")
+        if torch.is_tensor(position_ids) and position_ids.requires_grad:
+            raise RuntimeError("Qwen3 full-recompute position_ids must not require gradients")
+        ctx.param_ids = tuple(id(param) for param in params)
+        ctx.cpu_rng_state = torch.get_rng_state()
+        ctx.cuda_device = x.device if x.is_cuda and torch.cuda.is_initialized() else None
+        ctx.cuda_rng_state = (
+            torch.cuda.get_rng_state(ctx.cuda_device) if ctx.cuda_device is not None else None
+        )
+        del params
+        ctx.layer = layer
+        ctx.park_chunked_ep_after_backward = park_chunked_ep_after_backward
+        ctx.position_ids = position_ids
+        ctx.packed_seq_params = packed_seq_params
+        ctx.save_for_backward(x.detach())
+        return layer._ep_chunk_full_recompute_forward(
+            x, position_ids=position_ids, packed_seq_params=packed_seq_params
+        ).detach()
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        (x_saved,) = ctx.saved_tensors
+        layer = ctx.layer
+        x = x_saved.detach().requires_grad_(True)
+        attention_params = tuple(layer.attn.parameters())
+        norm_params = tuple(layer.mlp_norm.parameters())
+        router_params = tuple(layer.moe.router.parameters())
+        expert_params = tuple(layer.moe.experts.parameters())
+        if ctx.param_ids != tuple(
+            id(param) for param in (*attention_params, *norm_params, *router_params, *expert_params)
+        ):
+            raise RuntimeError("Qwen3 full-recompute parameter order changed")
+        current_cpu_rng_state = torch.get_rng_state()
+        current_cuda_rng_state = (
+            torch.cuda.get_rng_state(ctx.cuda_device) if ctx.cuda_device is not None else None
+        )
+        try:
+            torch.set_rng_state(ctx.cpu_rng_state)
+            if ctx.cuda_rng_state is not None:
+                torch.cuda.set_rng_state(ctx.cuda_rng_state, ctx.cuda_device)
+            with torch.enable_grad():
+                attention_out = layer.attn(
+                    x, position_ids=ctx.position_ids, packed_seq_params=ctx.packed_seq_params
+                )
+                residual = x + attention_out
+                norm_out = layer.mlp_norm(residual)
+                assert layer.moe.ep_chunk_fused is not None
+                grad_norm, router_grads, expert_grads = layer.moe.ep_chunk_fused.forward_backward(
+                    norm_out, grad_output
+                )
+                differentiable = (x, *attention_params, *norm_params)
+                required = tuple(value for value in differentiable if value.requires_grad)
+                required_grads = torch.autograd.grad(
+                    (norm_out, residual), required, (grad_norm, grad_output), allow_unused=True
+                )
+                if ctx.park_chunked_ep_after_backward:
+                    stream = torch.cuda.current_stream(x.device) if x.is_cuda else None
+                    layer.moe.ep_chunk_fused.workspace.park_expert_activations(stream=stream)
+        finally:
+            torch.set_rng_state(current_cpu_rng_state)
+            if current_cuda_rng_state is not None:
+                torch.cuda.set_rng_state(current_cuda_rng_state, ctx.cuda_device)
+
+        grads_by_id = {
+            id(value): grad for value, grad in zip(required, required_grads, strict=True)
+        }
+        grad_x = grads_by_id.get(id(x))
+        param_grads = (
+            *[grads_by_id.get(id(param)) for param in attention_params],
+            *[grads_by_id.get(id(param)) for param in norm_params],
+            *router_grads,
+            *expert_grads,
+        )
+        if len(param_grads) != len(ctx.param_ids):
+            raise RuntimeError("Qwen3 full-recompute parameter gradient order changed")
+        return (grad_x, None, None, None, None, *param_grads)
+
+
 class MoELayer(nn.Module):
     def __init__(
         self,
@@ -50,21 +165,101 @@ class MoELayer(nn.Module):
         router_bias_rate: float = 0.0,
         fp8: bool = False,
         moe_act_recompute: bool = False,
+        enable_ep_chunk_overlap: bool = False,
+        ep_chunk_max_token_rows_per_rank: int | None = None,
+        ep_chunk_count: int = 2,
+        ep_chunk_full_recompute: bool = False,
         lora_config: LoraConfig | dict | None = None,
     ):
         super().__init__()
+        validate_qwen3_ep_chunk_recompute_composition(
+            enable_ep_chunk_overlap=enable_ep_chunk_overlap,
+            ep_chunk_full_recompute=ep_chunk_full_recompute,
+            recompute_modules=[],
+        )
+        validate_ep_chunk_overlap_config(
+            enable_ep_chunk_overlap,
+            use_deepep=use_deepep,
+            ep_size=ps.ep_size,
+            topk=config.num_experts_per_tok,
+            max_token_rows_per_rank=ep_chunk_max_token_rows_per_rank,
+            chunk_count=ep_chunk_count,
+        )
         # Match Qwen3-MoE's `load_balancing_type="none"` setting: no aux loss.
         self.router = TopKRouter(
             config, ps, router_bias_rate=router_bias_rate, compute_aux_loss=False
         )
         self.experts = Experts(
-            config, ps, fp8=fp8, moe_act_recompute=moe_act_recompute, lora_config=lora_config
+            config,
+            ps,
+            fp8=fp8,
+            moe_act_recompute=moe_act_recompute,
+            delay_wgrad_compute=enable_ep_chunk_overlap,
+            lora_config=lora_config,
         )
-        self.dispatcher = TokenDispatcher(
-            config.num_experts, config.hidden_size, ps, use_deepep=use_deepep
-        )
+        self.dispatcher: TokenDispatcher | None = None
+        self.ep_chunk_forward: EPChunkForwardOp | None = None
+        self.ep_chunk_backward: EPChunkBackwardOp | None = None
+        self.ep_chunk_fused: EPChunkFusedForwardBackwardOp | None = None
+        self.ep_chunk_full_recompute = ep_chunk_full_recompute
+        if enable_ep_chunk_overlap:
+            assert ep_chunk_max_token_rows_per_rank is not None
+            shape_profile = EPChunkShapeProfile.for_two_slot_chunked_ep(
+                max_input_rows=ep_chunk_max_token_rows_per_rank,
+                hidden_size=config.hidden_size,
+                expert_intermediate_size=getattr(config, "moe_intermediate_size", None),
+                topk=config.num_experts_per_tok,
+                ep_size=ps.ep_size,
+                chunk_count=ep_chunk_count,
+            )
+            common_key = dict(
+                device_type="cuda",
+                # Bind to the actual runtime tensor/explicit materialize device,
+                # after the CPU-constructed module has been moved to its rank device.
+                device_index=None,
+                ep_group_id=id(ps.tp_ep_group),
+                dtype=torch.bfloat16,
+                shape_profile=shape_profile,
+            )
+
+            def workspace(op):
+                key = EPChunkWorkspaceKey(op=op, **common_key)
+                workspace = get_ep_chunk_workspace(
+                    key,
+                    lambda _slot: TokenDispatcher(
+                        config.num_experts, config.hidden_size, ps, use_deepep=True
+                    ),
+                )
+                return workspace
+
+            op_kwargs = dict(router=self.router, experts=self.experts)
+            if ep_chunk_full_recompute:
+                self.ep_chunk_forward = EPChunkForwardOp(
+                    workspace=workspace("forward"), **op_kwargs
+                )
+                self.ep_chunk_fused = EPChunkFusedForwardBackwardOp(
+                    workspace=workspace("fused_forward_backward"), **op_kwargs
+                )
+            else:
+                self.ep_chunk_backward = EPChunkBackwardOp(
+                    workspace=workspace("backward"), **op_kwargs
+                )
+                self.ep_chunk_forward = EPChunkForwardOp(
+                    workspace=workspace("forward"), backward_op=self.ep_chunk_backward, **op_kwargs
+                )
+        else:
+            self.dispatcher = TokenDispatcher(
+                config.num_experts, config.hidden_size, ps, use_deepep=use_deepep
+            )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.ep_chunk_forward is not None:
+            if self.ep_chunk_full_recompute:
+                return self.ep_chunk_forward(x)
+            assert self.ep_chunk_forward is not None
+            return self.ep_chunk_forward(x)
+
+        assert self.dispatcher is not None
         input_shape = x.shape
         if x.dim() == 3:
             x_2d = x.view(-1, x.size(-1))
@@ -87,6 +282,77 @@ class MoELayer(nn.Module):
 
         return combined.view(input_shape).to(x.dtype)
 
+    def _ep_chunk_workspaces(self):
+        """Return the unique lightweight workspaces selected by Qwen composition."""
+        workspaces = []
+        for op in (self.ep_chunk_forward, self.ep_chunk_backward, self.ep_chunk_fused):
+            if op is not None and all(op.workspace is not workspace for workspace in workspaces):
+                workspaces.append(op.workspace)
+        return tuple(workspaces)
+
+    def _ep_chunk_workspaces_for_phase(self, phase: str):
+        """Select only workspaces first used by one execution phase."""
+        return tuple(
+            workspace
+            for workspace, _require_dispatcher in self._ep_chunk_requirements_for_phase(phase)
+        )
+
+    def _ep_chunk_requirements_for_phase(self, phase: str):
+        """Pair phase workspaces with their dispatcher materialization requirement."""
+        if phase == "forward":
+            requirements = ((self.ep_chunk_forward, True),)
+        elif phase == "backward":
+            requirements = (
+                (self.ep_chunk_fused, True)
+                if self.ep_chunk_full_recompute
+                else (self.ep_chunk_backward, False),
+            )
+        else:
+            raise ValueError(
+                f"Unsupported EP chunk workspace phase {phase!r}; expected 'forward' or 'backward'"
+            )
+        return tuple(
+            (op.workspace, require_dispatcher)
+            for op, require_dispatcher in requirements
+            if op is not None
+        )
+
+    def materialize_ep_chunk_workspaces(
+        self,
+        *,
+        phase: str = "forward",
+        device: torch.device | str | None = None,
+        expert_activation_max_rows: int | None = None,
+    ) -> None:
+        """Materialize one phase, optionally freezing caller-declared activations."""
+        for workspace, require_dispatcher in self._ep_chunk_requirements_for_phase(phase):
+            if require_dispatcher:
+                workspace.materialize(device=device)
+            else:
+                workspace.prepare_scratch(device=device)
+            if expert_activation_max_rows is not None:
+                workspace.reserve_expert_activations(
+                    max_expert_rows=expert_activation_max_rows, device=device
+                )
+
+    def ep_chunk_workspace_evidence(self) -> dict[str, dict]:
+        return {workspace.key.op: workspace.evidence() for workspace in self._ep_chunk_workspaces()}
+
+    def release_ep_chunk_workspaces(self, *, phase: str | None = None, stream=None) -> None:
+        """Release one phase or all selected workspaces for mode switch/teardown."""
+        workspaces = (
+            self._ep_chunk_workspaces()
+            if phase is None
+            else self._ep_chunk_workspaces_for_phase(phase)
+        )
+        for workspace in workspaces:
+            release_ep_chunk_workspace(workspace.key, stream=stream)
+
+    def reset_ep_chunk_workspace_tensors(self, *, phase: str, stream=None) -> None:
+        """Drop phase scratch at an explicit safe boundary, retaining DeepEP state."""
+        for workspace in self._ep_chunk_workspaces_for_phase(phase):
+            workspace.reset_tensors(stream=stream)
+
 
 # ---------------------------------------------------------------------------
 # Transformer Layer + Model
@@ -102,6 +368,37 @@ _SP_GRAD_SUFFIXES: tuple[str, ...] = (
     ".hnorm.weight",
     ".final_layernorm.weight",
 )
+
+
+def validate_qwen3_ep_chunk_recompute_composition(
+    *,
+    enable_ep_chunk_overlap: bool,
+    ep_chunk_full_recompute: bool,
+    recompute_modules: list[str] | tuple[str, ...],
+) -> None:
+    """Validate Qwen3 recompute composition without leaking policy to primitives."""
+    if ep_chunk_full_recompute and not enable_ep_chunk_overlap:
+        raise ValueError("ep_chunk_full_recompute=True requires enable_ep_chunk_overlap=True")
+    if (
+        enable_ep_chunk_overlap
+        and not ep_chunk_full_recompute
+        and any(module in {"moe", "full"} for module in recompute_modules)
+    ):
+        raise ValueError(
+            "normal ChunkedEP conflicts with outer MoE recompute; enable "
+            "ep_chunk_full_recompute or remove moe/full recompute"
+        )
+
+
+def _qwen3_moe_act_recompute_requested(
+    recompute_modules: list[str], *, ep_chunk_full_recompute: bool
+) -> bool:
+    """Keep recompute-policy interpretation in the Qwen composition layer."""
+    return (
+        "moe_act" in recompute_modules
+        and "moe" not in recompute_modules
+        and not ep_chunk_full_recompute
+    )
 
 
 def _collect_sp_grad_params(model: nn.Module) -> list[nn.Parameter]:
@@ -126,6 +423,10 @@ class TransformerLayer(nn.Module):
         moe_act_recompute: bool = False,
         use_thd: bool = False,
         lora_config: LoraConfig | dict | None = None,
+        enable_ep_chunk_overlap: bool = False,
+        ep_chunk_max_token_rows_per_rank: int | None = None,
+        ep_chunk_count: int = 2,
+        ep_chunk_full_recompute: bool = False,
         attention_backend: str = "te",
     ):
         super().__init__()
@@ -157,12 +458,43 @@ class TransformerLayer(nn.Module):
             router_bias_rate=router_bias_rate,
             fp8=fp8,
             moe_act_recompute=moe_act_recompute,
+            enable_ep_chunk_overlap=enable_ep_chunk_overlap,
+            ep_chunk_max_token_rows_per_rank=ep_chunk_max_token_rows_per_rank,
+            ep_chunk_count=ep_chunk_count,
+            ep_chunk_full_recompute=ep_chunk_full_recompute,
             lora_config=lora_config,
         )
 
-    def forward(
-        self, x: torch.Tensor, position_ids: torch.Tensor | None = None, packed_seq_params=None
+    def _ep_chunk_full_recompute_forward(
+        self, x: torch.Tensor, *, position_ids: torch.Tensor | None, packed_seq_params
     ) -> torch.Tensor:
+        """Run the graph-free initial pass for the composition-owned checkpoint."""
+        residual = x
+        h = self.attn(x, position_ids=position_ids, packed_seq_params=packed_seq_params)
+        x = residual + h
+        residual = x
+        h = self.mlp_norm(x)
+        assert self.moe.ep_chunk_forward is not None
+        moe_out = self.moe.ep_chunk_forward(h)
+        return residual + moe_out
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        position_ids: torch.Tensor | None = None,
+        packed_seq_params=None,
+        park_chunked_ep_after_backward: bool = False,
+    ) -> torch.Tensor:
+        if self.moe.ep_chunk_full_recompute and torch.is_grad_enabled():
+            params = (
+                *tuple(self.attn.parameters()),
+                *tuple(self.mlp_norm.parameters()),
+                *tuple(self.moe.router.parameters()),
+                *tuple(self.moe.experts.parameters()),
+            )
+            return _Qwen3TransformerLayerFullRecomputeFunction.apply(
+                x, position_ids, packed_seq_params, self, park_chunked_ep_after_backward, *params
+            )
         residual = x
         h = self.attn(x, position_ids=position_ids, packed_seq_params=packed_seq_params)
         x = residual + h
@@ -363,9 +695,22 @@ class Qwen3MoEModel(nn.Module):
         mtp_enable_train: bool = False,
         mtp_detach_encoder: bool = False,
         lora_config: LoraConfig | dict | None = None,
+        enable_ep_chunk_overlap: bool = False,
+        ep_chunk_max_token_rows_per_rank: int | None = None,
+        ep_chunk_count: int = 2,
+        ep_chunk_full_recompute: bool = False,
         attention_backend: str = "te",
     ):
         super().__init__()
+        validate_chunked_ep_mtp(
+            enable_ep_chunk_overlap=enable_ep_chunk_overlap, mtp_enable=mtp_enable
+        )
+        validate_qwen3_ep_chunk_recompute_composition(
+            enable_ep_chunk_overlap=enable_ep_chunk_overlap,
+            ep_chunk_full_recompute=ep_chunk_full_recompute,
+            recompute_modules=recompute_modules or [],
+        )
+        self._head_loss_chunk_count = ep_chunk_count
         self.config = config
         self.ps = ps
         self.fp8 = fp8
@@ -389,7 +734,9 @@ class Qwen3MoEModel(nn.Module):
             self.embed = VocabParallelEmbedding(config.vocab_size, config.hidden_size, ps)
 
         _recompute = recompute_modules or []
-        moe_act_recompute = "moe_act" in _recompute and "moe" not in _recompute
+        moe_act_recompute = _qwen3_moe_act_recompute_requested(
+            _recompute, ep_chunk_full_recompute=ep_chunk_full_recompute
+        )
         self.layers = nn.ModuleList(
             [
                 TransformerLayer(
@@ -403,6 +750,10 @@ class Qwen3MoEModel(nn.Module):
                     use_thd=use_thd,
                     lora_config=lora_config,
                     attention_backend=attention_backend,
+                    enable_ep_chunk_overlap=enable_ep_chunk_overlap,
+                    ep_chunk_max_token_rows_per_rank=ep_chunk_max_token_rows_per_rank,
+                    ep_chunk_count=ep_chunk_count,
+                    ep_chunk_full_recompute=ep_chunk_full_recompute,
                 )
                 for idx in self.layer_indices
             ]
@@ -498,13 +849,29 @@ class Qwen3MoEModel(nn.Module):
         with fp8_ctx:
             if self.embed is not None:
                 h = scatter_to_sequence_parallel(h, self.ps)
+            final_local_backward_chunked_ep = next(
+                (layer for layer in self.layers if layer.moe.ep_chunk_fused is not None), None
+            )
             for layer in self.layers:
-                h = layer(h, position_ids=position_ids, packed_seq_params=packed_seq_params)
+                h = layer(
+                    h,
+                    position_ids=position_ids,
+                    packed_seq_params=packed_seq_params,
+                    park_chunked_ep_after_backward=layer is final_local_backward_chunked_ep,
+                )
             # Head path is SP-aware: norm runs on SP-sharded [S/tp, B, H] and
             # head's internal all-gather happens inside VocabParallelOutput.
             # Mirrors MC GPTModel's final_layernorm → output_layer(sp=True).
 
         output = {"hidden_states": h}
+
+        def reset_forward_chunked_ep() -> None:
+            """Park the shared forward arena after all Qwen3 MoE consumers."""
+            stream = torch.cuda.current_stream(h.device) if h.is_cuda else None
+            for layer in self.layers:
+                if layer.moe.ep_chunk_forward is not None:
+                    layer.moe.reset_ep_chunk_workspace_tensors(phase="forward", stream=stream)
+                    break
 
         if self.head is not None:
             hidden_for_head = self.norm(h)
@@ -524,6 +891,7 @@ class Qwen3MoEModel(nn.Module):
                 if mtp_result is not None:
                     hidden_for_head, mtp_loss = mtp_result
                     output["mtp_loss"] = mtp_loss
+                reset_forward_chunked_ep()
                 labels_sb = labels.transpose(0, 1).contiguous()
                 if use_fused_kernels:
                     hidden_full = gather_from_sequence_parallel(hidden_for_head, self.ps)
@@ -540,6 +908,32 @@ class Qwen3MoEModel(nn.Module):
                         output["log_probs"] = log_probs.transpose(0, 1).contiguous()
                     if calculate_entropy:
                         output["entropy"] = entropy.transpose(0, 1).contiguous()
+                elif use_chunked_head_loss(
+                    has_labels=True,
+                    use_fused_kernels=False,
+                    calculate_entropy=calculate_entropy,
+                    has_chunked_ep=any(
+                        layer.moe.ep_chunk_forward is not None
+                        or layer.moe.ep_chunk_backward is not None
+                        or layer.moe.ep_chunk_fused is not None
+                        for layer in self.layers
+                    )
+                    and self.mtp is None,
+                ):
+                    token_loss = chunked_vocab_parallel_linear_cross_entropy(
+                        hidden_for_head,
+                        self.head.col.linear.weight,
+                        labels_sb,
+                        tp_group=self.ps.tp_group,
+                        sequence_parallel=self.ps.tp_size > 1,
+                        temperature=temperature_value,
+                        chunk_size=balanced_head_loss_chunk_size(
+                            labels_sb.numel(), self._head_loss_chunk_count
+                        ),
+                    )
+                    output["loss"] = token_loss.mean()
+                    if return_log_probs:
+                        output["log_probs"] = (-token_loss).transpose(0, 1).contiguous()
                 else:
                     logits = self.head(hidden_for_head)
                     if temperature_value != 1.0:
@@ -553,8 +947,11 @@ class Qwen3MoEModel(nn.Module):
                         output["entropy"] = entropy.transpose(0, 1).contiguous()
 
             if labels is None:
+                reset_forward_chunked_ep()
                 logits = self.head(hidden_for_head)
                 output["logits"] = self.head.gather(logits)
+        else:
+            reset_forward_chunked_ep()
 
         return output
 
