@@ -150,11 +150,11 @@ See [lens: metrics](https://github.com/NVIDIA-NeMo/Lens/blob/main/docs/user-guid
 
 ## Testing new instrumentation
 
-Megatron's telemetry tests live at `tests/unit_tests/telemetry/` and use the fixture pattern from lens's `conftest.py` (global OTel state reset before/after each test).
+Megatron's telemetry tests live at `tests/unit_tests/core/telemetry/` and use the fixture pattern from lens's `conftest.py` (global OTel state reset before/after each test).
 
 When adding a span:
 
-1. Add a test in `tests/unit_tests/telemetry/` that asserts the span is emitted when its group is enabled and absent when disabled.
+1. Add a test in `tests/unit_tests/core/telemetry/` that asserts the span is emitted when its group is enabled and absent when disabled.
 2. Use `InMemorySpanExporter` (from lens's `conftest.py`, shared via `sys.path` or a test utility) to capture spans.
 3. Assert on span name, attributes, and parent relationships.
 

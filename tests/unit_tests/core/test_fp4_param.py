@@ -1,0 +1,566 @@
+# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+
+import gc
+import os
+import sys
+from datetime import timedelta
+
+import pytest
+import torch
+from transformer_engine.pytorch.fp8 import check_nvfp4_support
+
+import megatron.core.parallel_state as ps
+from megatron.core.distributed import DistributedDataParallel as DDP
+from megatron.core.enums import ModelType
+from megatron.core.fp4_utils import is_nvfp4tensor
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+from megatron.core.models.gpt.gpt_model import GPTModel
+from megatron.core.num_microbatches_calculator import destroy_num_microbatches_calculator
+from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.utils import is_te_min_version
+from megatron.training.arguments import core_transformer_config_from_args, parse_args, validate_args
+from megatron.training.checkpointing import load_checkpoint, save_checkpoint
+from megatron.training.global_vars import (
+    destroy_global_vars,
+    get_args,
+    set_args,
+    set_global_variables,
+)
+from megatron.training.training import force_param_sync, get_model, setup_model_and_optimizer
+from megatron.training.utils import get_device_arch_version
+from tests.unit_tests.core.dist_checkpointing import TempNamedDir
+from tests.unit_tests.test_utilities import Utils
+
+cuda_graph_supported = False
+reason_for_no_cuda_graph = ""
+try:
+    from transformer_engine.pytorch.tensor.utils import post_all_gather_processing
+
+    if is_te_min_version("2.10.0"):
+        cuda_graph_supported = True
+    else:
+        reason_for_no_cuda_graph = "Need newer TransformerEngine"
+except ImportError:
+    reason_for_no_cuda_graph = "Need newer TransformerEngine"
+
+
+def enable_forward_pre_hook(model_chunks):
+    for model_chunk in model_chunks:
+        assert isinstance(model_chunk, DDP)
+        model_chunk.enable_forward_pre_hook()
+
+
+def disable_forward_pre_hook(model_chunks, param_sync=True):
+    for model_chunk in model_chunks:
+        assert isinstance(model_chunk, DDP)
+        model_chunk.disable_forward_pre_hook(param_sync=param_sync)
+
+
+def should_disable_forward_pre_hook(args):
+    """Block forward pre-hook for certain configurations."""
+    return (
+        not args.use_megatron_fsdp and args.use_distributed_optimizer and args.overlap_param_gather
+    )
+
+
+_SEED = 1234
+is_nvfp4_available, reason_for_no_nvfp4 = check_nvfp4_support()
+
+
+class TestFP4Param:
+
+    def setup_method(self, method):
+        # FP4 GEMM requires dimensions to be multiples of 64
+        self.seq_length = 512
+        self.micro_batch_size = 2
+        os.environ['CUDA_DEVICE_MAX_CONNECTIONS'] = '1'
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+        destroy_global_vars()
+        destroy_num_microbatches_calculator()
+
+    def model_provider(
+        self,
+        pre_process=True,
+        post_process=True,
+        layer_spec_fn=get_gpt_layer_with_transformer_engine_spec,
+        **config_kwargs,
+    ):
+        model_parallel_cuda_manual_seed(_SEED)
+        args = get_args()
+        config = core_transformer_config_from_args(args)
+        transformer_layer_spec = layer_spec_fn()
+        return GPTModel(
+            config=config,
+            transformer_layer_spec=transformer_layer_spec,
+            vocab_size=args.vocal_size,
+            max_sequence_length=args.max_position_embeddings,
+            pre_process=pre_process,
+            post_process=post_process,
+            fp16_lm_cross_entropy=args.fp16_lm_cross_entropy,
+            parallel_output=True,
+            share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,
+            position_embedding_type=args.position_embedding_type,
+            rotary_percent=args.rotary_percent,
+        )
+
+    def create_test_args(
+        self, tp, sequence_length, micro_batch_size, inference, fp4_param_gather, **kwargs
+    ):
+        destroy_global_vars()
+        destroy_num_microbatches_calculator()
+
+        sys.argv = ['test_fp4_param.py']
+        args = parse_args()
+        args.num_layers = 4
+        args.vocal_size = 128800
+        args.hidden_size = 256
+        args.num_attention_heads = 8
+        args.max_position_embeddings = 512
+        args.micro_batch_size = micro_batch_size
+        args.create_attention_mask_in_dataloader = True
+        args.seq_length = sequence_length
+        args.tensor_model_parallel_size = tp
+        args.sequence_parallel = True if tp > 1 else False
+        args.pipeline_model_parallel_size = 1
+        args.context_parallel_size = 1
+        args.train_iters = 10
+        args.lr = 3e-5
+        args.bf16 = True
+        args.add_bias_linear = False
+        args.swiglu = True
+        args.use_distributed_optimizer = not inference
+        args.attention_backend = "unfused"
+        # FP4 settings
+        args.fp4 = "e2m1"
+        args.fp4_recipe = "nvfp4"
+        args.fp4_param_gather = fp4_param_gather
+        args.ddp_bucket_size = 40960
+
+        # CUDA graph settings (must be set before kwargs to allow override)
+        if kwargs.get("enable_cuda_graph", False):
+            args.cuda_graph_impl = "transformer_engine"
+            args.cuda_graph_warmup_steps = 0
+            args.cuda_graph_modules = "full"
+
+        for key, value in kwargs.items():
+            if key == "enable_cuda_graph":
+                continue  # Already handled above
+            assert hasattr(args, key)
+            setattr(args, key, value)
+
+        validate_args(args)
+        set_global_variables(args, False)
+        return args
+
+    def get_batch(self, seq_length, micro_batch_size):
+        data = list(range(seq_length))
+        input_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
+        labels = 1 + torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
+        position_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
+        attention_mask = torch.ones(
+            (micro_batch_size, 1, seq_length, seq_length), dtype=bool
+        ).cuda()
+        loss_mask = torch.ones(seq_length).repeat((micro_batch_size, 1)).cuda()
+        return input_ids, labels, position_ids, attention_mask, loss_mask
+
+    def run_eval_transition(self, args, model_chunks, batch):
+        input_ids, labels, position_ids, attention_mask, loss_mask = batch
+
+        if should_disable_forward_pre_hook(args):
+            disable_forward_pre_hook(model_chunks, param_sync=True)
+
+        model_chunks[0].eval()
+        model_chunks[0].set_is_first_microbatch()
+        with torch.no_grad():
+            eval_output = model_chunks[0].forward(
+                input_ids=input_ids,
+                position_ids=position_ids,
+                attention_mask=attention_mask,
+                labels=labels,
+                loss_mask=loss_mask,
+            )
+        eval_loss = eval_output.mean()
+        model_chunks[0].train()
+
+        if should_disable_forward_pre_hook(args):
+            enable_forward_pre_hook(model_chunks)
+
+        return eval_loss.item()
+
+    def _run_test_helper(
+        self,
+        tp_size,
+        inference: bool = False,
+        fp4_param_gather: bool = True,
+        eval_transition: bool = False,
+        **kwargs,
+    ):
+        """Test fp4_param with gpt_model."""
+        args = self.create_test_args(
+            tp_size, self.seq_length, self.micro_batch_size, inference, fp4_param_gather, **kwargs
+        )
+
+        set_args(args)
+        torch.manual_seed(_SEED)
+        Utils.initialize_model_parallel(tensor_model_parallel_size=tp_size)
+        input_ids, labels, position_ids, attention_mask, loss_mask = self.get_batch(
+            self.seq_length, self.micro_batch_size
+        )
+        if inference:
+            gpt_model = get_model(
+                self.model_provider, ModelType.encoder_or_decoder, wrap_with_ddp=False
+            )
+            gpt_model[0].eval()
+            optimizer = None
+        else:
+            gpt_model, optimizer, _ = setup_model_and_optimizer(
+                ModelType.encoder_or_decoder, self.model_provider
+            )
+        assert len(gpt_model) == 1  # Assume only one model in the model provider.
+
+        num_fp4_params = 0
+        for _, param in gpt_model[0].named_parameters():
+            if not inference:
+                assert param.requires_grad
+                assert param.main_grad is not None
+            if is_nvfp4tensor(param):
+                num_fp4_params += 1
+
+        # Verify the number of fp4 params.
+        fp4_layers = args.num_layers
+        if kwargs.get("first_last_layers_bf16", False):
+            fp4_layers -= kwargs["num_layers_at_start_in_bf16"]
+            fp4_layers -= kwargs["num_layers_at_end_in_bf16"]
+        # Each layer has 4 GEMM weights: qkv, proj, fc1, fc2.
+        if fp4_param_gather:
+            assert num_fp4_params == 4 * fp4_layers
+
+        loss_list = []
+        eval_loss_list = []
+
+        # CUDA graph setup (transformer_engine implementation)
+        cuda_graph_helper = None
+        use_cuda_graph = kwargs.get("enable_cuda_graph", False)
+        if use_cuda_graph and args.cuda_graph_impl == "transformer_engine":
+            from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
+
+            cuda_graph_helper = TECudaGraphHelper(
+                model=gpt_model,
+                config=gpt_model[0].config,
+                seq_length=self.seq_length,
+                micro_batch_size=self.micro_batch_size,
+                optimizers=[optimizer],
+            )
+
+        for i in range(200):
+            if not inference:
+                gpt_model[0].zero_grad_buffer()
+                optimizer.zero_grad()
+
+            # CUDA graph: capture after warmup steps (warmup_steps=0 means capture on first iter)
+            cuda_graph_warmup_steps = 0
+            if cuda_graph_helper is not None and i == cuda_graph_warmup_steps:
+                if should_disable_forward_pre_hook(args):
+                    disable_forward_pre_hook(gpt_model, param_sync=False)
+                cuda_graph_helper.create_cudagraphs()
+                if should_disable_forward_pre_hook(args):
+                    enable_forward_pre_hook(gpt_model)
+                    cuda_graph_helper.cuda_graph_set_manual_hooks()
+
+            gpt_model[0].set_is_first_microbatch()
+            output = gpt_model[0].forward(
+                input_ids=input_ids,
+                position_ids=position_ids,
+                attention_mask=attention_mask,
+                labels=labels,
+                loss_mask=loss_mask,
+            )
+
+            # Check output shapes
+            assert output.shape[0] == self.micro_batch_size
+            assert output.shape[1] == self.seq_length
+
+            if inference:
+                continue
+
+            # Verify gradients
+            loss = output.mean()
+            loss.backward()
+
+            if args.overlap_grad_reduce:
+                gpt_model[0].finish_grad_sync()
+
+            for name, param in gpt_model[0].named_parameters():
+                assert param.main_grad is not None
+
+            update_successful, _, _ = optimizer.step()
+            assert update_successful
+
+            loss_list.append(loss.item())
+
+            if eval_transition:
+                eval_loss_list.append(
+                    self.run_eval_transition(
+                        args,
+                        gpt_model,
+                        (input_ids, labels, position_ids, attention_mask, loss_mask),
+                    )
+                )
+
+        if eval_transition:
+            return torch.tensor(loss_list), torch.tensor(eval_loss_list)
+        return torch.tensor(loss_list)
+
+    def run_test(self, tp_size, inference: bool = False, **kwargs):
+        """Test fp4_param with gpt_model."""
+        if inference:
+            with torch.inference_mode():
+                self._run_test_helper(tp_size, inference=True, **kwargs)
+        else:
+            print("\n=== Running with fp4_param_gather=True (NVFP4) ===")
+            loss_list = self._run_test_helper(tp_size, fp4_param_gather=True, **kwargs)
+            print("\n=== Running with fp4_param_gather=False (BF16) ===")
+            loss_list_ref = self._run_test_helper(tp_size, fp4_param_gather=False, **kwargs)
+
+            torch.testing.assert_close(loss_list, loss_list_ref, atol=1e-2, rtol=1e-2)
+
+    def run_test_with_eval_transition(self, tp_size, **kwargs):
+        """Test fp4_param eval transition with gpt_model."""
+        loss_list, eval_loss_list = self._run_test_helper(
+            tp_size, fp4_param_gather=True, eval_transition=True, **kwargs
+        )
+        loss_list_ref, eval_loss_list_ref = self._run_test_helper(
+            tp_size, fp4_param_gather=False, eval_transition=True, **kwargs
+        )
+
+        torch.testing.assert_close(loss_list, loss_list_ref, atol=1e-2, rtol=1e-2)
+        torch.testing.assert_close(eval_loss_list, eval_loss_list_ref, atol=1e-2, rtol=1e-2)
+
+    @pytest.mark.skipif(not is_nvfp4_available, reason=reason_for_no_nvfp4)
+    @pytest.mark.skipif(not is_te_min_version("2.7.0.dev0"), reason="TE 2.7.0.dev0 is required")
+    @pytest.mark.parametrize("tp_size", [2])
+    @pytest.mark.parametrize("dp_overlap", [(False, False), (True, True)])
+    def test_nvfp4(self, tp_size, dp_overlap):
+        """
+        Test NVFP4 primary weights with distributed optimizer.
+        dp_overlap: (overlap_param_gather, overlap_grad_reduce)
+        """
+        kwargs = {"overlap_param_gather": dp_overlap[0], "overlap_grad_reduce": dp_overlap[1]}
+        self.run_test(tp_size=tp_size, inference=False, **kwargs)
+
+    @pytest.mark.skipif(not is_nvfp4_available, reason=reason_for_no_nvfp4)
+    @pytest.mark.skipif(not is_te_min_version("2.7.0.dev0"), reason="TE 2.7.0.dev0 is required")
+    @pytest.mark.parametrize("tp_size", [2])
+    def test_nvfp4_eval_transition(self, tp_size):
+        kwargs = {"overlap_param_gather": True, "overlap_grad_reduce": True}
+        self.run_test_with_eval_transition(tp_size=tp_size, **kwargs)
+
+    @pytest.mark.skipif(not is_nvfp4_available, reason=reason_for_no_nvfp4)
+    @pytest.mark.skipif(not is_te_min_version("2.7.0.dev0"), reason="TE 2.7.0.dev0 is required")
+    @pytest.mark.parametrize("tp_size", [2])
+    def test_nvfp4_inference(self, tp_size):
+        """Test NVFP4 primary weights in inference mode."""
+        self.run_test(tp_size=tp_size, inference=True)
+
+    @pytest.mark.skipif(
+        get_device_arch_version() < 10, reason="NVFP4 is supported since Blackwell architecture"
+    )
+    @pytest.mark.skipif(not is_nvfp4_available, reason=reason_for_no_nvfp4)
+    @pytest.mark.skipif(not is_te_min_version("2.7.0.dev0"), reason="TE 2.7.0.dev0 is required")
+    @pytest.mark.parametrize("tp_size", [2])
+    def test_nvfp4_with_first_last_layers_bf16(self, tp_size):
+        """Test NVFP4 primary weights with first/last layers in BF16."""
+        kwargs = {
+            "first_last_layers_bf16": True,
+            "num_layers_at_start_in_bf16": 1,
+            "num_layers_at_end_in_bf16": 1,
+        }
+        self.run_test(tp_size=tp_size, **kwargs)
+
+    def run_determinism_test(self, tp_size, fp4_param_gather: bool, **kwargs):
+        """
+        Run the same model type twice to check for determinism. This is for debugging purposes.
+        If fp4_param_gather=True, runs NVFP4 twice.
+        If fp4_param_gather=False, runs BF16 twice.
+        """
+        mode = "NVFP4" if fp4_param_gather else "BF16"
+
+        print(f"\n=== {mode} Run 1 ===")
+        loss_list_1 = self._run_test_helper(tp_size, fp4_param_gather=fp4_param_gather, **kwargs)
+
+        print(f"\n=== {mode} Run 2 ===")
+        loss_list_2 = self._run_test_helper(tp_size, fp4_param_gather=fp4_param_gather, **kwargs)
+
+        torch.testing.assert_close(loss_list_1, loss_list_2, atol=0, rtol=0)
+
+    # ------------------------------------------------------------------
+    # Checkpoint round trip
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def quantized_param_state(model_chunk):
+        """Raw element codes and dequantized values of every NVFP4 param, by name.
+
+        Comparing the dequantized values alone would be weak: a block scale can change
+        without moving any value, and that still means the resumed tensor is not the one
+        that was saved. Comparing the raw codes alone would be weak the other way round,
+        since codes only mean something paired with a scale. So compare both.
+
+        The scale arrays are deliberately not compared directly. TE keeps block scales in a
+        padded, swizzled layout, and the padding entries are never read and not reproducible
+        across allocations, so they raise false mismatches. A scale that is actually used
+        shows up in the dequantized values.
+        """
+        data_attrs = ("_data", "_rowwise_data", "_columnwise_data")
+        state = {}
+        for name, param in model_chunk.named_parameters():
+            if not is_nvfp4tensor(param):
+                continue
+            # A quantized tensor may be the Parameter itself or its .data payload.
+            for holder in (param, param.data):
+                tensors = {
+                    attr: getattr(holder, attr).detach().clone()
+                    for attr in data_attrs
+                    if torch.is_tensor(getattr(holder, attr, None))
+                }
+                if tensors:
+                    break
+            assert tensors, f"no quantized storage found on {name} ({type(param).__name__})"
+            # .float() and not .dequantize(): on a quantized Parameter the latter recurses
+            # through __torch_dispatch__ until the stack overflows.
+            tensors["dequantized"] = param.detach().float().clone()
+            state[name] = tensors
+        return state
+
+    def setup_checkpoint_case(self, tp_size, ckpt_dir, **kwargs):
+        args = self.create_test_args(
+            tp_size,
+            self.seq_length,
+            self.micro_batch_size,
+            inference=False,
+            fp4_param_gather=True,
+            save=ckpt_dir,
+            load=ckpt_dir,
+            save_interval=1,
+            ckpt_format="torch_dist",
+            async_save=False,
+            save_tokenizer_assets=False,
+            **kwargs,
+        )
+        set_args(args)
+        torch.manual_seed(_SEED)
+        Utils.initialize_model_parallel(tensor_model_parallel_size=tp_size)
+        model_parallel_cuda_manual_seed(_SEED)
+        model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
+            ModelType.encoder_or_decoder, self.model_provider
+        )
+        assert len(model) == 1
+        return args, model, optimizer, opt_param_scheduler
+
+    def run_train_steps(self, args, model, optimizer, num_steps):
+        input_ids, labels, position_ids, attention_mask, loss_mask = self.get_batch(
+            self.seq_length, self.micro_batch_size
+        )
+        for _ in range(num_steps):
+            model[0].zero_grad_buffer()
+            optimizer.zero_grad()
+            model[0].set_is_first_microbatch()
+            output = model[0].forward(
+                input_ids=input_ids,
+                position_ids=position_ids,
+                attention_mask=attention_mask,
+                labels=labels,
+                loss_mask=loss_mask,
+            )
+            output.mean().backward()
+            if args.overlap_grad_reduce:
+                model[0].finish_grad_sync()
+            update_successful, _, _ = optimizer.step()
+            assert update_successful
+
+    def cleanup_between_runs(self):
+        Utils.destroy_model_parallel()
+        destroy_global_vars()
+        destroy_num_microbatches_calculator()
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    @pytest.mark.launch_on_gb200
+    @pytest.mark.skipif(
+        get_device_arch_version() < 10, reason="NVFP4 is supported since Blackwell architecture"
+    )
+    @pytest.mark.skipif(not is_nvfp4_available, reason=reason_for_no_nvfp4)
+    @pytest.mark.skipif(not is_te_min_version("2.7.0.dev0"), reason="TE 2.7.0.dev0 is required")
+    @pytest.mark.parametrize("tp_size", [2])
+    def test_nvfp4_checkpoint_resume_is_bitwise_exact(
+        self, tmp_path_dist_ckpt, monkeypatch, tp_size
+    ):
+        """A resumed run must hold exactly the NVFP4 weights the saving run held.
+
+        NVFP4 is block-scaled like MXFP8: an E4M3 scale per 16-element block on top of a
+        per-tensor FP32 scale. Quantized params are stored dequantized to BF16 and the block
+        scales are not stored, so loading re-quantizes a value that has already been through
+        one quantization round trip, whereas a training step quantizes the FP32 main param. That
+        costs MXFP8 its block scales; NVFP4 is measured to survive it today, so this is a
+        regression guard rather than a reproduction of a known break.
+        """
+        # TE refuses to load a pickled extra state by default. This checkpoint is created
+        # by the test and is therefore trusted.
+        monkeypatch.setenv("NVTE_ALLOW_UNSAFE_PICKLE_EXTRA_STATE", "1")
+        kwargs = {"overlap_param_gather": True, "overlap_grad_reduce": True}
+        # TempNamedDir(sync=True) barriers, so the process group has to exist first.
+        Utils.initialize_distributed()
+        with TempNamedDir(tmp_path_dist_ckpt / "test_nvfp4_ckpt_resume", sync=True) as ckpt_dir:
+            args, model, optimizer, opt_param_scheduler = self.setup_checkpoint_case(
+                tp_size, str(ckpt_dir), **kwargs
+            )
+            self.run_train_steps(args, model, optimizer, num_steps=3)
+            # Mirror save_checkpoint_and_time: the params are staged from the FP32 main params
+            # and gathered before the state dict is taken.
+            force_param_sync(model, optimizer=optimizer)
+            saved_state = self.quantized_param_state(model[0])
+            save_checkpoint(3, model, optimizer, opt_param_scheduler, 0)
+            torch.distributed.barrier()
+
+            self.cleanup_between_runs()
+
+            args, model, optimizer, opt_param_scheduler = self.setup_checkpoint_case(
+                tp_size, str(ckpt_dir), **kwargs
+            )
+            iteration, _ = load_checkpoint(model, optimizer, opt_param_scheduler, strict=True)
+            assert iteration == 3
+            loaded_state = self.quantized_param_state(model[0])
+
+        # Each layer contributes 4 GEMM weights: qkv, proj, fc1, fc2. Assert the count rather
+        # than just non-emptiness, so a config change that quietly drops --fp4-param-gather
+        # cannot turn this into a vacuous pass.
+        assert len(saved_state) == 4 * args.num_layers, sorted(saved_state)
+        assert saved_state.keys() == loaded_state.keys()
+        mismatches = []
+        for name, saved_tensors in saved_state.items():
+            for attr, saved_tensor in saved_tensors.items():
+                loaded_tensor = loaded_state[name][attr]
+                num_differing = int((saved_tensor != loaded_tensor).sum())
+                if num_differing:
+                    mismatches.append(f"{name}{attr}: {num_differing}/{saved_tensor.numel()}")
+        assert not mismatches, "NVFP4 params changed across a checkpoint round trip:\n" + "\n".join(
+            mismatches
+        )
+
+
+if __name__ == "__main__":
+    # Run tests directly without pytest
+    test = TestFP4Param()
+    test.setup_method(None)
+    kwargs = {
+        "enable_cuda_graph": True,
+        "first_last_layers_bf16": True,
+        "num_layers_at_start_in_bf16": 1,
+        "num_layers_at_end_in_bf16": 1,
+        "overlap_param_gather": True,
+        "overlap_grad_reduce": True,
+    }
+    test.run_test(tp_size=2, **kwargs)
+    test.teardown_method(None)

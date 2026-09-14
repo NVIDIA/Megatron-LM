@@ -26,7 +26,7 @@ numerical result could depend on scheduling:
 - torch ops with a non-deterministic accumulation: `scatter_add_`,
   `index_add_`, `index_put_(accumulate=True)`, `bincount`, embedding backward
 
-`tests/unit_tests/determinism/kernels/manifest.py` lists the patterns
+`tests/unit_tests/core/determinism/kernels/manifest.py` lists the patterns
 (`KERNEL_CONTENT_PATTERNS`) and the directories (`KERNEL_DIRECTORIES`) that
 make a file *kernel-bearing*. External-library patterns match *call sites*
 (`causal_conv1d_fn(`, `tex.rmsnorm_fwd(`, `buffer.dispatch(`, ...), never
@@ -41,11 +41,11 @@ covered by the replay tests of the kernels they call, named in the entry's
 
 | Layer | Location | What it asserts |
 | --- | --- | --- |
-| Kernel | `tests/unit_tests/determinism/kernels/test_*.py` | One kernel family per file. Each kernel is run several times on identical inputs and every output tensor and gradient must be byte-identical (`harness.assert_replays_bit_exact`, `assert_module_replays_bit_exact`; `harness.bytes_equal` compares bit patterns, so signed zeros and NaN payloads must match too). |
-| Module / model | `tests/unit_tests/determinism/correctness/` | GPT, TransformerBlock, HybridModel and FP8/FP4 recipes across parallelism cells (`BitExactRunner`). |
+| Kernel | `tests/unit_tests/core/determinism/kernels/test_*.py` | One kernel family per file. Each kernel is run several times on identical inputs and every output tensor and gradient must be byte-identical (`harness.assert_replays_bit_exact`, `assert_module_replays_bit_exact`; `harness.bytes_equal` compares bit patterns, so signed zeros and NaN payloads must match too). |
+| Module / model | `tests/unit_tests/core/determinism/correctness/` | GPT, TransformerBlock, HybridModel and FP8/FP4 recipes across parallelism cells (`BitExactRunner`). |
 | End to end | functional tests with `--deterministic-mode` | Loss and `num-zeros` compared against golden values at their recorded precision; legacy goldens use five decimals. |
 
-The manifest (`tests/unit_tests/determinism/kernels/manifest.py`) is the
+The manifest (`tests/unit_tests/core/determinism/kernels/manifest.py`) is the
 registry that ties kernel source files to the tests that cover them. Each
 `KernelEntry` names the source files, the tests, the kernel kind, and either a
 non-empty `tests` tuple or an explicit `exempt_reason` (for example a
@@ -54,7 +54,7 @@ with no compute kernel). Exemptions are visible coverage debt, not silence.
 
 ## How the requirement is enforced
 
-1. **Repository invariant** (`tests/unit_tests/determinism/kernels/test_manifest.py`,
+1. **Repository invariant** (`tests/unit_tests/core/determinism/kernels/test_manifest.py`,
    CPU only, runs in the unit-test bucket): every kernel-bearing file under
    `megatron/` is registered, every registered path exists, and every entry
    has tests or an exemption. Adding a Triton kernel to a new file without
@@ -85,13 +85,13 @@ python3 tools/check_kernel_determinism_coverage.py --base-ref origin/main
 
 ## Adding a kernel test
 
-1. Put the test in the `tests/unit_tests/determinism/kernels/test_*.py`
+1. Put the test in the `tests/unit_tests/core/determinism/kernels/test_*.py`
    module that matches the kernel family (or add one; the package `__init__`
    pins the determinism environment at import).
 2. Use the harness:
 
    ```python
-   from tests.unit_tests.determinism.kernels.harness import (
+   from tests.unit_tests.core.determinism.kernels.harness import (
        assert_replays_bit_exact,
        assert_module_replays_bit_exact,
        deterministic_algorithms,
@@ -119,6 +119,6 @@ python3 tools/check_kernel_determinism_coverage.py --base-ref origin/main
 
    ```bash
    uv run python -m torch.distributed.run --nproc-per-node 8 -m pytest -q \
-     tests/unit_tests/determinism/kernels/test_my_family.py \
-     tests/unit_tests/determinism/kernels/test_manifest.py
+     tests/unit_tests/core/determinism/kernels/test_my_family.py \
+     tests/unit_tests/core/determinism/kernels/test_manifest.py
    ```

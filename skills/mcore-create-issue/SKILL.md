@@ -101,7 +101,7 @@ From the logs, identify:
 - **Failed test(s)**: lines matching `FAILED tests/...::...` give the exact pytest node IDs.
 - **Error message**: the assertion failure, exception type, or first meaningful
   traceback frame — keep it under ~30 lines.
-- **Job name**: the GitHub Actions job name (e.g. `tests/unit_tests/transformer/moe/**/*.py - latest`).
+- **Job name**: the GitHub Actions job name (e.g. `tests/unit_tests/core/transformer/moe/**/*.py - latest`).
 - **Run / job URLs** and **PR URL**: for linking in the issue.
 
 ### 6. Check for duplicate issues

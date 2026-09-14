@@ -2,7 +2,7 @@
 
 """GPU-backed tests for FlextronMambaElasticityManager.
 
-Builds a real MambaMixer (mirroring ``tests/unit_tests/ssm/test_mamba_mixer.py``)
+Builds a real MambaMixer (mirroring ``tests/unit_tests/core/ssm/test_mamba_mixer.py``)
 and verifies that the elasticity hooks attach, behave as no-ops without
 elasticity params, and produce different activations once params are set.
 
