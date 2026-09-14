@@ -110,6 +110,7 @@ def fully_shard(
     mixed_precision_policy: MixedPrecisionPolicy | None = None,
     grad_divisor: int = 1,
     schedule_policy: SchedulePolicy = SchedulePolicy(),
+    register_hooks: bool = True,
 ) -> None:
     """Apply FSDP to a module in place.
 
@@ -134,6 +135,10 @@ def fully_shard(
             ``grad_divisor=ep_size`` makes up the difference. Dense parameters see only
             their own rank's tokens and need no divisor.
         schedule_policy: Communication scheduling policy for this FSDP module.
+        register_hooks: Whether to register the automatic forward and backward execution
+            hooks on ``module``. Disable this when an external scheduler invokes the
+            corresponding FSDP lifecycle methods explicitly. The state-dict safety hook
+            is registered independently.
     """
     if isinstance(module, FsdpModule):
         raise ValueError("This module is already managed by FSDP.")
@@ -164,6 +169,7 @@ def fully_shard(
             grad_divisor=grad_divisor,
             schedule_policy=schedule_policy,
             use_symmetric_memory=context.use_symmetric_memory,
+            register_hooks=register_hooks,
         )
     except Exception:
         module.__class__ = original_cls
