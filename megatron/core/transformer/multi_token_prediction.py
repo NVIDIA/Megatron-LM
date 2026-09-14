@@ -28,6 +28,13 @@ from megatron.core.tensor_parallel.inference_layers import (
     inference_all_gather_from_tensor_model_parallel_region,
 )
 from megatron.core.transformer.enums import AttnMaskType, LayerType
+from megatron.core.transformer.forward_sharing import (
+    forward_sharing_lifetime,
+    get_forward_sharing_state,
+    is_forward_sharing_enabled,
+    mtp_repeated_sharing_lifetime,
+    preserve_forward_sharing_for_checkpoint,
+)
 from megatron.core.transformer.hyper_connection import learned_output_contract
 from megatron.core.transformer.module import MegatronModule, mark_keep_in_fp32
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
@@ -1921,6 +1928,11 @@ class MultiTokenPredictionLayer(MegatronModule):
         self.cp_group = pg_collection.cp
         self.tp_group = pg_collection.tp if pg_collection is not None else None
         self.mtp_layer_pattern = mtp_layer_pattern
+        if self.config.mtp_repeated_layer_shared_components and mtp_layer_pattern is not None:
+            raise ValueError(
+                "mtp_repeated_layer_shared_components currently supports the GPT MTP path only, "
+                "not a hybrid MTP layer pattern."
+            )
 
         # Validate attention mask type if using transformer-based inner layers
         if self.submodules.mtp_model_layer is not None and hasattr(
@@ -2431,6 +2443,11 @@ class MultiTokenPredictionLayer(MegatronModule):
                 sequence_len_offset=sequence_len_offset,
             )
 
+        if is_forward_sharing_enabled(self.config):
+            custom_forward = preserve_forward_sharing_for_checkpoint(
+                custom_forward, packed_seq_params, self.config, attention_mask_arg=3
+            )
+
         # Decide the outer quantization context, matching
         # ``transformer_block._checkpointed_forward``. Only ``fp8 + delayed
         # scaling`` needs an active context at the ``te_checkpoint`` entry
@@ -2599,6 +2616,11 @@ class MultiTokenPredictionLayer(MegatronModule):
             and self.mtp_layer_pattern is None
         )
         if use_outer_recompute:
+            if self.config.mtp_repeated_layer_shared_components:
+                raise RuntimeError(
+                    "Repeated-MTP cross-depth sharing does not support "
+                    "full activation recomputation."
+                )
             hidden_states = self._checkpointed_forward(
                 hidden_states=hidden_states,
                 decoder_input=decoder_input,
@@ -2947,34 +2969,53 @@ class MultiTokenPredictionBlock(MegatronModule):
         if self.config.mtp_detach_heads:
             hidden_states = hidden_states.detach()
 
-        for iteration in range(self.config.mtp_num_layers):
-            layer_idx = 0 if self.mtp_use_repeated_layer else iteration
-            hidden_states, input_ids, position_ids, padding_mask = self.layers[layer_idx](
-                input_ids=input_ids,
-                position_ids=position_ids,
-                hidden_states=hidden_states,
-                attention_mask=attention_mask,
-                padding_mask=padding_mask,
-                inference_params=inference_params,
-                rotary_pos_emb=rotary_pos_emb,
-                rotary_pos_cos=rotary_pos_cos,
-                rotary_pos_sin=rotary_pos_sin,
-                packed_seq_params=packed_seq_params,
-                sequence_roll_context=sequence_roll_context,
-                roll_depth=iteration,
-                sequence_len_offset=sequence_len_offset,
-                embedding=embedding,
-                **(extra_block_kwargs or {}),
+        sharing_lifetime = nullcontext()
+        if is_forward_sharing_enabled(self.config):
+            sharing_lifetime = forward_sharing_lifetime(
+                packed_seq_params, attention_mask, self.config
+            )
+        repeated_lifetime = nullcontext()
+        forward_sharing_state = None
+        if self.config.mtp_repeated_layer_shared_components:
+            forward_sharing_state = get_forward_sharing_state(
+                packed_seq_params, attention_mask, self.config
+            )
+            repeated_layer_number = self.config.num_layers + offset + 1
+            repeated_lifetime = mtp_repeated_sharing_lifetime(
+                forward_sharing_state, repeated_layer_number
             )
 
-            if mhc_multistream is not None:
-                mhc_chunks.append(hidden_states)
-                hidden_states_list.append(self.layers[layer_idx]._postprocess(hidden_states))
-            else:
-                # append the output hidden states of the current mtp layer
-                # to the hidden_states_list
-                hidden_states_list.append(hidden_states)
+        with sharing_lifetime, repeated_lifetime as is_source_by_layer:
+            for depth in range(self.config.mtp_num_layers):
+                if is_source_by_layer is not None:
+                    is_source_by_layer[repeated_layer_number] = depth == 0
+                layer_idx = 0 if self.mtp_use_repeated_layer else depth
+                layer_outputs = self.layers[layer_idx](
+                    input_ids=input_ids,
+                    position_ids=position_ids,
+                    hidden_states=hidden_states,
+                    attention_mask=attention_mask,
+                    padding_mask=padding_mask,
+                    inference_params=inference_params,
+                    rotary_pos_emb=rotary_pos_emb,
+                    rotary_pos_cos=rotary_pos_cos,
+                    rotary_pos_sin=rotary_pos_sin,
+                    packed_seq_params=packed_seq_params,
+                    sequence_roll_context=sequence_roll_context,
+                    roll_depth=depth,
+                    sequence_len_offset=sequence_len_offset,
+                    embedding=embedding,
+                    **(extra_block_kwargs or {}),
+                )
+                hidden_states, input_ids, position_ids, padding_mask = layer_outputs
 
+                if mhc_multistream is not None:
+                    mhc_chunks.append(hidden_states)
+                    hidden_states_list.append(self.layers[layer_idx]._postprocess(hidden_states))
+                else:
+                    # append the output hidden states of the current mtp layer
+                    # to the hidden_states_list
+                    hidden_states_list.append(hidden_states)
         # concat the hidden states of all mtp layers
         hidden_states = torch.cat(hidden_states_list, dim=0)
         return hidden_states
