@@ -9,7 +9,7 @@ import torch
 import torch.distributed as dist
 
 from megatron.core.fp8_utils import get_grouped_tensor_members, is_grouped_tensor
-from megatron.core.parameter_metadata import copy_parameter_metadata
+from megatron.core.utils import copy_parameter_metadata
 
 if TYPE_CHECKING:
     from .transforms import ReshardTransform

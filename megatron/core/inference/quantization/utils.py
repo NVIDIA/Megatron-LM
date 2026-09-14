@@ -12,7 +12,7 @@ from megatron.core.inference.quantization.mxfp8_tensor import (
     MXFP8Tensor,
     validate_mxfp8_tensor,
 )
-from megatron.core.parameter_metadata import copy_parameter_metadata
+from megatron.core.utils import copy_parameter_metadata
 
 if TYPE_CHECKING:
     from megatron.core.inference.moe import InferenceGroupedGemmBackend
@@ -105,10 +105,84 @@ def matches_mxfp8_parameter_filter(
     return included and not excluded
 
 
+def _has_mxfp8_storage(parameter: object) -> bool:
+    """Return whether a parameter or its data uses TE or MCore MXFP8 storage."""
+    if isinstance(parameter, MXFP8Tensor) or (HAVE_TE and isinstance(parameter, TEMXFP8Tensor)):
+        return True
+    data = getattr(parameter, "data", None)
+    return isinstance(data, MXFP8Tensor) or (HAVE_TE and isinstance(data, TEMXFP8Tensor))
+
+
+def _validate_mxfp8_expert_precision_policy(
+    model: torch.nn.Module,
+    include_pattern: str | None,
+    exclude_pattern: str | None,
+    filter_prefix: str = "",
+) -> None:
+    """Reject a selective policy that splits an MoE layer across precisions."""
+    for module_name, module in model.named_modules():
+        if not (
+            hasattr(module, "num_local_experts")
+            and hasattr(module, "linear_fc1")
+            and hasattr(module, "linear_fc2")
+        ):
+            continue
+
+        weight_formats = []
+        for linear_name in ("linear_fc1", "linear_fc2"):
+            linear = getattr(module, linear_name)
+            if hasattr(linear, "weight0"):
+                weight_names = (
+                    f"weight{expert_index}" for expert_index in range(module.num_local_experts)
+                )
+            elif hasattr(linear, "weight"):
+                weight_names = ("weight",)
+            else:
+                continue
+
+            for weight_name in weight_names:
+                if not hasattr(linear, weight_name):
+                    continue
+                relative_name = ".".join(
+                    part for part in (module_name, linear_name, weight_name) if part
+                )
+                filter_name = f"{filter_prefix}{relative_name}"
+                keep_mxfp8 = _has_mxfp8_storage(getattr(linear, weight_name)) and (
+                    matches_mxfp8_parameter_filter(
+                        filter_name,
+                        include_pattern=include_pattern,
+                        exclude_pattern=exclude_pattern,
+                    )
+                )
+                weight_formats.append((filter_name, keep_mxfp8))
+
+        format_flags = [keep_mxfp8 for _, keep_mxfp8 in weight_formats]
+        if format_flags and any(format_flags) != all(format_flags):
+            mxfp8_name = next(name for name, keep_mxfp8 in weight_formats if keep_mxfp8)
+            bf16_name = next(name for name, keep_mxfp8 in weight_formats if not keep_mxfp8)
+            layer_name = f"{filter_prefix}{module_name}" or "<root>"
+            raise ValueError(
+                "MXFP8 inference requires every FC1 and FC2 expert weight in an MoE layer "
+                f"to use one precision, but the policy mixes formats in {layer_name!r}: "
+                f"{mxfp8_name!r} would remain MXFP8 while {bf16_name!r} would use BF16. "
+                "Adjust inference_mxfp8_include_parameters and "
+                "inference_mxfp8_exclude_parameters to select both expert projections and "
+                "all local experts together."
+            )
+
+
 def _materialize_mxfp8_parameter_as_bf16(
     module: torch.nn.Module, parameter_name: str, parameter: torch.Tensor
 ) -> None:
-    """Replace a TE MXFP8 parameter with a BF16 parameter while preserving sharding metadata."""
+    """Replace a filtered-out TE MXFP8 weight with an ordinary BF16 parameter.
+
+    ``fp8_param=True`` wraps eligible weights in TE MXFP8 storage during model
+    construction, before the inference include/exclude filters are applied. A
+    filtered-out weight must therefore be dequantized so the BF16 grouped-GEMM
+    and refit paths do not receive TE's quantized tensor subclass. Rebuilding
+    the parameter also requires copying Megatron's public sharding and refit
+    metadata so checkpoint loading and reshard planning retain the same layout.
+    """
     bf16_parameter = torch.nn.Parameter(
         parameter.dequantize().to(torch.bfloat16), requires_grad=parameter.requires_grad
     )
@@ -142,6 +216,8 @@ def quantize_model_to_mxfp8(
     assert HAVE_TE
     if backend == "flashinfer":
         assert HAVE_FLASHINFER, "FlashInfer not available for MXFP8 quantization"
+    if not _prefix:
+        _validate_mxfp8_expert_precision_policy(model, include_pattern, exclude_pattern)
 
     for child_name, child in model.named_children():
         child_prefix = f"{_prefix}{child_name}."
@@ -191,17 +267,7 @@ def quantize_model_to_mxfp8(
 
 def _should_quantize_param(val: torch.Tensor) -> bool:
     """Return True if a parameter should be converted to an MCore MXFP8 tensor."""
-    if not val.is_cuda:
-        return False
-    if HAVE_TE and isinstance(val, TEMXFP8Tensor):
-        return True
-    if HAVE_TE and hasattr(val, 'data') and isinstance(val.data, TEMXFP8Tensor):
-        return True
-    if isinstance(val, MXFP8Tensor):
-        return True
-    if hasattr(val, 'data') and isinstance(val.data, MXFP8Tensor):
-        return True
-    return False
+    return val.is_cuda and _has_mxfp8_storage(val)
 
 
 def _to_bf16(val: torch.Tensor) -> torch.Tensor:
@@ -270,6 +336,10 @@ def quantize_params_to_mxfp8(
     """
     if backend == "flashinfer":
         assert HAVE_FLASHINFER, "FlashInfer not available for MXFP8 quantization"
+    if not _prefix:
+        _validate_mxfp8_expert_precision_policy(
+            model, include_pattern, exclude_pattern, filter_prefix=_filter_prefix
+        )
 
     if persistent_buffers is None:
         persistent_buffers = {}

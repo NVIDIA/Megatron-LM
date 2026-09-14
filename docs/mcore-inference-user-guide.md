@@ -124,7 +124,7 @@ workload rather than generalizing from any single comparison.
 | **MoE** | Expert model parallelism with full CUDA-graph support, expert router replay, NVLS switch-multicast token dispatcher plus an allgatherv dispatcher optimized for multi-node NVLink, and shared-expert overlap with latent MoEs. Selectable grouped-GEMM backend (vLLM, torch, or FlashInfer) |
 | **Parallelism** | Data-parallel coordinator with full multi-node support, tensor model parallelism with low-latency comm primitives, expert model parallelism, and pipeline parallelism |
 | **Model families** | GPT-style dense models, MoE models, MLA models (for example DeepSeek-style, with `cache_mla_latents`), Mamba and hybrid (SSM and attention) models, Gated Delta Net and Gated Delta Product models, and vision-language models for image inputs. Refer to [Known Limitations](#known-limitations) for the per-family feature gaps |
-| **Precision** | MXFP8 weight quantization through `--transformer-impl inference_optimized --fp8-recipe mxfp8`, using latency-optimized inference kernels. Configurable Mamba conv and SSM state dtypes |
+| **Precision** | MXFP8 weight quantization through `--transformer-impl inference_optimized --fp8-recipe mxfp8`, using latency-optimized inference kernels with FlashInfer, torch, or vLLM grouped-GEMM selection. MXFP8 can be selected per parameter while unmatched layers remain BF16. Configurable Mamba conv and SSM state dtypes |
 | **RL** | [Weight refit and resharding](#weight-refit-and-resharding-for-rl) between training and inference over five transports, supporting both colocated (shared GPUs) and non-colocated (separate resources) deployments. Batch-invariant kernels for training and inference log-prob consistency. Per-DP-rank sampling seeds so the same prompt routed to different replicas yields different samples |
 | **Sampling** | Temperature, top-k, top-p, stop words, log-probs, and top-N log-probs, with raw or post-processed log-prob semantics (`logprobs_mode`). Pluggable torch or FlashInfer sampling backend |
 | **Disaggregation** | KV and SSM state handoff between prefill and decode engines over NIXL or NCCL, with resharding across mismatched TP/PP layouts. Refer to [Disaggregated Prefill and Decode](#disaggregated-prefill-and-decode) for what is and is not turnkey today |
@@ -152,6 +152,18 @@ workload rather than generalizing from any single comparison.
 > dispatcher when `EP > 1`). Some backend combinations additionally need DeepGEMM
 > bf16 bindings: `uv pip install -e .[batch_invariant]`. Context parallelism and
 > attention dropout are not supported in either case.
+
+> **Selective MXFP8 parameter storage.** Set
+> `inference_mxfp8_include_parameters` and/or
+> `inference_mxfp8_exclude_parameters` on `TransformerConfig` to apply regular
+> expressions to fully qualified parameter names. Inclusion defaults to every
+> parameter and exclusion takes precedence. Parameters outside the resulting
+> selection are materialized in BF16 after checkpoint loading. Within one MoE
+> layer, every local expert's FC1 and FC2 weight must use the same precision;
+> select both projections and all local experts together. The `flashinfer`,
+> `torch`, and `vllm` grouped-GEMM backends support this layer-wise mixture.
+> vLLM uses its fused kernel for BF16 expert layers and MCore's scaled grouped
+> GEMM for MXFP8 expert layers.
 
 Many of these are toggled through `InferenceConfig`. Refer to the
 [Engine configuration](#engine-configuration).
@@ -448,8 +460,9 @@ than `InferenceConfig`, because they must be set when you build the model:
 `batch_invariant_mode` (and `batch_invariant_backend` /
 `batch_invariant_collective`), `inference_moe_token_dispatcher_type` (`nvls` by
 default, or `nccl`), `inference_grouped_gemm_backend` (`vllm` by default, or
-`torch` / `flashinfer`), `moe_enable_routing_replay`, and `window_size` for
-sliding-window attention.
+`torch` / `flashinfer`), `inference_mxfp8_include_parameters`,
+`inference_mxfp8_exclude_parameters`, `moe_enable_routing_replay`, and
+`window_size` for sliding-window attention.
 
 ### Reading Results
 
@@ -706,7 +719,9 @@ The transport is selected by `refit_method`, exposed on the command line as
 MXFP8 targets are handled transparently: when the destination model uses
 `--transformer-impl inference_optimized` with `--fp8-recipe mxfp8`,
 `prepare_swap_model_weights` installs a quantizing transform that later
-`swap_model_weights` calls pick up. The built-in RL loop calls
+`swap_model_weights` calls pick up. Selective MXFP8 include/exclude filters are
+also honored, so the refit plan quantizes only the selected destination weights
+and sends the remaining parameters as BF16. The built-in RL loop calls
 `swap_model_weights(model, inference_model, args.refit_method)`; refer to
 [`megatron/core/resharding/README.md`](https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/core/resharding/README.md) for
 the plan-building and caching details.

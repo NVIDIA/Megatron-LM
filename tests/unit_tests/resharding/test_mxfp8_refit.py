@@ -445,7 +445,9 @@ class TestQuantizeParamsToMXFP8:
         model.attention = torch.nn.Linear(128, 64, bias=False)
         model.mlp = torch.nn.Module()
         model.mlp.experts = torch.nn.Module()
+        model.mlp.experts.num_local_experts = 1
         model.mlp.experts.linear_fc1 = torch.nn.Linear(128, 64, bias=False)
+        model.mlp.experts.linear_fc2 = torch.nn.Linear(64, 128, bias=False)
         model.to(dtype=torch.bfloat16, device="cuda")
         _pre_quantize_linear(model)
 
@@ -459,7 +461,29 @@ class TestQuantizeParamsToMXFP8:
         assert model.attention.weight.dtype == torch.bfloat16
         assert "attention.weight" not in buffers
         assert isinstance(model.mlp.experts.linear_fc1.weight, MXFP8Tensor)
+        assert isinstance(model.mlp.experts.linear_fc2.weight, MXFP8Tensor)
         assert "mlp.experts.linear_fc1.weight" in buffers
+        assert "mlp.experts.linear_fc2.weight" in buffers
+
+    def test_parameter_filter_rejects_partial_expert_precision(self):
+        from megatron.core.inference.quantization.utils import quantize_params_to_mxfp8
+
+        model = torch.nn.Module()
+        model.num_local_experts = 1
+        model.linear_fc1 = torch.nn.Linear(128, 64, bias=False)
+        model.linear_fc2 = torch.nn.Linear(64, 128, bias=False)
+        model.to(dtype=torch.bfloat16, device="cuda")
+        _pre_quantize_linear(model)
+
+        with pytest.raises(
+            ValueError, match="select both expert projections and all local experts"
+        ):
+            quantize_params_to_mxfp8(
+                model,
+                backend="triton",
+                include_pattern=r"(^|\.)linear_fc1\.",
+                _filter_prefix="decoder.",
+            )
 
 
 # ===========================================================================

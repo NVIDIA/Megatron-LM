@@ -25,9 +25,11 @@ like `--first-last-layers-bf16`.
 
 ## Limitations
 
-Relying on the module name to match against a configuration means the match is
-executed post-initialization, and initialization customization for a recipe
-override such as `fp4-param` and `fp8-param` are not in scope.
+Parameter-storage precision is selected while each matched module is initialized.
+For an FP8 recipe, `fp8_param: null` inherits the enclosing model-init context;
+this preserves model-wide policies such as `first_last_layers_bf16`. Set
+`fp8_param` to `true` or `false` to force FP8 or high-precision parameter storage
+for that recipe. FP4 recipes use `fp4_param` to select their parameter storage.
 
 The validation precision configurations rely on self.training. They have not
 yet been verified compatible with cuda-graphs and/or activation recompute.
@@ -56,6 +58,7 @@ configs:
     transformer_engine_config_type: "TEQuantizationParams"
     training_recipe:
       fp8_quantization_recipe: "mxfp8"
+      fp8_param: null
   bf16:
     transformer_engine_config_type: "TEQuantizationParams"
     training_recipe: {}
@@ -63,6 +66,7 @@ configs:
     transformer_engine_config_type: "TEQuantizationParams"
     training_recipe:
       fp8_quantization_recipe: "mxfp8"
+      fp8_param: null
     evaluation_recipe: {}
   nvfp4_evaluate_bf16:
     transformer_engine_config_type: "TEQuantizationParams"
@@ -70,6 +74,11 @@ configs:
       fp4_quantization_recipe: "nvfp4"
     evaluation_recipe: {}
 ```
+
+The explicit `fp8_param: null` entries inherit the enclosing parameter-storage
+policy without emitting the warning used for omitted legacy configuration. This
+allows a global FP8-parameter policy and BF16 boundary-layer policy to remain in
+control. Use an explicit boolean only when the recipe should override that policy.
 
 Recipes are selected by matchers. Currently implemented are glob style
 expressions.

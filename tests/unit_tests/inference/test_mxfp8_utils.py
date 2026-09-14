@@ -1027,6 +1027,13 @@ class TestPermuteAndQuantizeMxfp8:
             ), f"Offset {i}={offs[i].item()} not aligned to {alignment}"
 
 
+def _make_te_mxfp8_expert_linear(quantizer, out_features, in_features):
+    linear = torch.nn.Module()
+    weight = torch.randn(out_features, in_features, device="cuda", dtype=torch.bfloat16)
+    linear.weight0 = torch.nn.Parameter(quantizer(weight), requires_grad=False)
+    return linear
+
+
 @pytest.mark.launch_on_gb200
 @pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 10,
@@ -1043,15 +1050,42 @@ def test_model_conversion_applies_parameter_precision_filter():
     model.attention = torch.nn.Linear(128, 64, bias=False, device="cuda", dtype=torch.bfloat16)
     model.mlp = torch.nn.Module()
     model.mlp.experts = torch.nn.Module()
-    model.mlp.experts.linear_fc1 = torch.nn.Linear(
-        128, 64, bias=False, device="cuda", dtype=torch.bfloat16
+    model.mlp.experts.num_local_experts = 1
+    model.mlp.experts.linear_fc1 = _make_te_mxfp8_expert_linear(quantizer, 64, 128)
+    model.mlp.experts.linear_fc2 = _make_te_mxfp8_expert_linear(quantizer, 128, 64)
+    model.attention.weight = torch.nn.Parameter(
+        quantizer(model.attention.weight.data), requires_grad=False
     )
-    for linear in (model.attention, model.mlp.experts.linear_fc1):
-        linear.weight = torch.nn.Parameter(quantizer(linear.weight.data), requires_grad=False)
 
     quantize_model_to_mxfp8(
         model, backend="triton", include_pattern=r"(^|\.)mlp\.experts\.linear_fc[12]\."
     )
 
     assert model.attention.weight.dtype == torch.bfloat16
-    assert isinstance(model.mlp.experts.linear_fc1.weight, MXFP8Tensor)
+    assert isinstance(model.mlp.experts.linear_fc1.weight0, MXFP8Tensor)
+    assert isinstance(model.mlp.experts.linear_fc2.weight0, MXFP8Tensor)
+
+
+@pytest.mark.launch_on_gb200
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 10,
+    reason="MXFP8 parameter storage requires Blackwell",
+)
+def test_model_conversion_rejects_partial_expert_precision_filter():
+    import transformer_engine_torch as tex
+    from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Quantizer
+
+    from megatron.core.inference.quantization.utils import quantize_model_to_mxfp8
+
+    quantizer = MXFP8Quantizer(tex.DType.kFloat8E4M3, rowwise=True, columnwise=False)
+    model = torch.nn.Module()
+    model.num_local_experts = 1
+    model.linear_fc1 = _make_te_mxfp8_expert_linear(quantizer, 64, 128)
+    model.linear_fc2 = _make_te_mxfp8_expert_linear(quantizer, 128, 64)
+    original_weights = (model.linear_fc1.weight0, model.linear_fc2.weight0)
+
+    with pytest.raises(ValueError, match="select both expert projections and all local experts"):
+        quantize_model_to_mxfp8(model, backend="triton", include_pattern=r"(^|\.)linear_fc1\.")
+
+    assert model.linear_fc1.weight0 is original_weights[0]
+    assert model.linear_fc2.weight0 is original_weights[1]
