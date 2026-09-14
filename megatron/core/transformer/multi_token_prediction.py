@@ -1251,13 +1251,16 @@ class MultiTokenPredictionLayer(MegatronModule):
             raise ValueError(
                 "Exactly one of mtp_layer_pattern or mtp_layer_config_list may be provided"
             )
-        self.mtp_layer_pattern = mtp_layer_pattern
+        if mtp_layer_pattern is not None:
+            from megatron.core.models.hybrid.hybrid_layer_allocation import validate_segment_layers
+
+            mtp_layer_config_list = validate_segment_layers(mtp_layer_pattern, self.config)
         self.mtp_layer_config_list = (
             tuple(mtp_layer_config_list) if mtp_layer_config_list is not None else None
         )
-        self.is_hybrid_mtp = (
-            self.mtp_layer_pattern is not None or self.mtp_layer_config_list is not None
-        )
+        self.is_hybrid_mtp = self.mtp_layer_config_list is not None
+        if self.is_hybrid_mtp and not self.mtp_layer_config_list:
+            raise ValueError("Hybrid MTP layer config list must be non-empty")
         if self.is_hybrid_mtp and hybrid_submodules is None:
             raise ValueError(
                 "Hybrid MTP requires hybrid_submodules with either mtp_layer_pattern "
@@ -1380,21 +1383,13 @@ class MultiTokenPredictionLayer(MegatronModule):
             from megatron.core.models.hybrid.hybrid_block import HybridStack
             from megatron.core.models.hybrid.hybrid_layer_allocation import (
                 clone_hybrid_layer_config_list,
-                validate_segment_layers,
             )
 
-            if self.mtp_layer_config_list is not None:
-                layer_config_list = clone_hybrid_layer_config_list(self.mtp_layer_config_list)
-            else:
-                layer_config_list = validate_segment_layers(self.mtp_layer_pattern, self.config)
-            if not layer_config_list:
-                raise ValueError("Hybrid MTP layer config list must be non-empty")
-
-            if self.mtp_layer_config_list is not None:
-                for layer_config in layer_config_list:
-                    layer_config.num_layers = self.config.num_layers
-                    layer_config.mtp_num_layers = self.config.mtp_num_layers
-                    layer_config.mtp_use_repeated_layer = self.config.mtp_use_repeated_layer
+            layer_config_list = clone_hybrid_layer_config_list(self.mtp_layer_config_list)
+            for layer_config in layer_config_list:
+                layer_config.num_layers = self.config.num_layers
+                layer_config.mtp_num_layers = self.config.mtp_num_layers
+                layer_config.mtp_use_repeated_layer = self.config.mtp_use_repeated_layer
             self.mtp_model_layer = HybridStack(
                 config=self.config,
                 submodules=hybrid_submodules,
@@ -2170,21 +2165,24 @@ class MultiTokenPredictionBlock(MegatronModule):
             raise ValueError(
                 "Exactly one of mtp_layer_pattern or mtp_layer_config_list may be provided"
             )
-        self.submodules = _get_mtp_block_submodules(config, spec)
-        self.mtp_loss_scaling_factor = config.mtp_loss_scaling_factor
-        self.vp_stage = vp_stage
-        self.mtp_layer_pattern = mtp_layer_pattern
+        if mtp_layer_pattern is not None:
+            from megatron.core.models.hybrid.hybrid_layer_allocation import validate_segment_layers
+
+            mtp_layer_config_list = validate_segment_layers(mtp_layer_pattern, self.config)
         self.mtp_layer_config_list = (
             tuple(mtp_layer_config_list) if mtp_layer_config_list is not None else None
         )
-        self.is_hybrid_mtp = (
-            self.mtp_layer_pattern is not None or self.mtp_layer_config_list is not None
-        )
+        self.is_hybrid_mtp = self.mtp_layer_config_list is not None
+        if self.is_hybrid_mtp and not self.mtp_layer_config_list:
+            raise ValueError("Hybrid MTP layer config list must be non-empty")
         if self.is_hybrid_mtp and hybrid_submodules is None:
             raise ValueError(
                 "Hybrid MTP requires hybrid_submodules with either mtp_layer_pattern "
                 "or mtp_layer_config_list"
             )
+        self.submodules = _get_mtp_block_submodules(config, spec)
+        self.mtp_loss_scaling_factor = config.mtp_loss_scaling_factor
+        self.vp_stage = vp_stage
         self.mtp_num_depths = mtp_num_depths
         self.hybrid_submodules = hybrid_submodules
         self.mtp_use_repeated_layer = self.config.mtp_use_repeated_layer
@@ -2314,13 +2312,13 @@ class MultiTokenPredictionBlock(MegatronModule):
                     layer_number=layer_number,
                     vp_stage=self.vp_stage,
                     pg_collection=pg_collection,
-                    mtp_layer_pattern=self.mtp_layer_pattern,
+                    mtp_layer_pattern=None,
                     name=(self.name + f".layers.{layer_number}") if self.name is not None else None,
                 )
             return module
 
         def build_hybrid_layer(layer_spec, layer_number):
-            """Build a pattern- or config-list-backed hybrid MTP layer."""
+            """Build a hybrid MTP layer from the canonical config list."""
             fp8_init_context = get_fp8_context(self.config, is_init=True)
             with fp8_init_context:
                 module = build_module(
@@ -2329,14 +2327,13 @@ class MultiTokenPredictionBlock(MegatronModule):
                     layer_number=layer_number,
                     vp_stage=self.vp_stage,
                     pg_collection=pg_collection,
-                    mtp_layer_pattern=self.mtp_layer_pattern,
                     hybrid_submodules=self.hybrid_submodules,
                     mtp_layer_config_list=self.mtp_layer_config_list,
                     name=(self.name + f".layers.{layer_number}") if self.name is not None else None,
                 )
             return module
 
-        # Hybrid path: use either a pattern or direct layer configs with hybrid submodules.
+        # Hybrid path: use layer configs with hybrid submodules.
         if self.is_hybrid_mtp:
             if self.mtp_use_repeated_layer:
                 # Shared/repeated layer: build one layer, use it for all depths
