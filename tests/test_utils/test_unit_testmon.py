@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
+import sqlite3
 import subprocess
 import sys
 import textwrap
@@ -14,11 +16,16 @@ import pytest
 
 ROOT = Path(__file__).parents[2]
 WRAPPER_PATH = ROOT / "tests/unit_tests/testmon_selector.py"
-SPEC = importlib.util.spec_from_file_location("unit_testmon_wrapper", WRAPPER_PATH)
-assert SPEC is not None and SPEC.loader is not None
-wrapper = importlib.util.module_from_spec(SPEC)
-sys.modules[SPEC.name] = wrapper
-SPEC.loader.exec_module(wrapper)
+for name, filename in (
+    ("testmon_cache", "testmon_cache.py"),
+    ("unit_testmon_wrapper", "testmon_selector.py"),
+):
+    spec = importlib.util.spec_from_file_location(name, WRAPPER_PATH.with_name(filename))
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+wrapper = sys.modules["unit_testmon_wrapper"]
 
 
 def _source(relative: str) -> str:
@@ -29,29 +36,11 @@ def _function(source: str, name: str) -> str:
     return source.split(f"{name}() {{", 1)[1].split("\n}\n", 1)[0]
 
 
-def _fake_pytest(
-    monkeypatch: pytest.MonkeyPatch, *, return_code: int = 0, selected: tuple[str, ...] = ()
-) -> list[list[str]]:
-    calls: list[list[str]] = []
-
-    def main(arguments, *_args, **kwargs):
-        calls.append(list(arguments))
-        if "--testmon-noselect" in arguments:
-            database = Path(os.environ["TESTMON_DATAFILE"])
-            database.parent.mkdir(parents=True, exist_ok=True)
-            database.write_bytes(b"baseline")
-        session = SimpleNamespace(items=[SimpleNamespace(nodeid=nodeid) for nodeid in selected])
-        for plugin in kwargs.get("plugins", []):
-            plugin.pytest_collection_finish(session)
-        return return_code
-
-    monkeypatch.setitem(sys.modules, "pytest", SimpleNamespace(main=main))
-    return calls
-
-
-def _run_wrapper(cache: Path, mode: str, phase: str = "prod") -> int:
-    return wrapper.main(
+def _invoke(project, cache, mode, phase="prod", rank=0):
+    return subprocess.run(
         [
+            sys.executable,
+            str(WRAPPER_PATH),
             "--mode",
             mode,
             "--cache-dir",
@@ -59,11 +48,55 @@ def _run_wrapper(cache: Path, mode: str, phase: str = "prod") -> int:
             "--phase",
             phase,
             "--",
-            "-m",
-            "marker",
-            "tests/unit_tests/example",
-        ]
+            "-q",
+            "-c",
+            str(project / "pytest.ini"),
+            "tests",
+        ],
+        cwd=project,
+        env={
+            **os.environ,
+            "RANK": str(rank),
+            "WORLD_SIZE": "4",
+            "PYTHONPATH": str(project),
+            "PYTHONDONTWRITEBYTECODE": "1",
+        },
+        text=True,
+        capture_output=True,
+        timeout=30,
     )
+
+
+@pytest.fixture
+def project(tmp_path):
+    pytest.importorskip("testmon")
+    project = tmp_path / "project"
+    (project / "tests").mkdir(parents=True)
+    (project / "pytest.ini").write_text("[pytest]\n")
+    (project / "app.py").write_text(
+        "def active(value):\n    return value + 1\n\n" "def unused(value):\n    return value - 1\n"
+    )
+    (project / "tests/test_app.py").write_text(
+        "from app import active\n\ndef test_active():\n    assert active(1) == 2\n"
+    )
+    (project / "tests/test_other.py").write_text("def test_other():\n    assert 1 + 1 == 2\n")
+    return project
+
+
+@pytest.fixture
+def cache(project, tmp_path):
+    cache = tmp_path / "cache"
+    result = _invoke(project, cache, "baseline")
+    assert result.returncode == 0, result.stdout + result.stderr
+    return cache
+
+
+def _snapshot(directory):
+    return {
+        path.name: (path.read_bytes(), path.stat().st_mtime_ns)
+        for path in directory.iterdir()
+        if path.is_file()
+    }
 
 
 def test_dependency_override_tracks_only_selected_packages(monkeypatch):
@@ -71,126 +104,209 @@ def test_dependency_override_tracks_only_selected_packages(monkeypatch):
         wrapper,
         "distributions",
         lambda: (
-            SimpleNamespace(metadata={"Name": "numpy"}),
-            SimpleNamespace(metadata={"Name": "pytest"}),
-            SimpleNamespace(metadata={"Name": "torch"}),
-            SimpleNamespace(metadata={"Name": "Transformer_Engine"}),
-            SimpleNamespace(metadata={"Name": "Transformer_Engine_Torch"}),
-            SimpleNamespace(metadata={"Name": "transformers"}),
-            SimpleNamespace(metadata={"Name": "triton"}),
-            SimpleNamespace(metadata={"Name": "megatron-core"}),
-            SimpleNamespace(metadata={"Name": "pytest-testmon"}),
+            SimpleNamespace(metadata={"Name": name})
+            for name in (
+                "numpy",
+                "pytest",
+                "torch",
+                "Transformer_Engine",
+                "Transformer_Engine_Torch",
+                "transformers",
+                "triton",
+                "megatron-core",
+                "pytest-testmon",
+            )
         ),
     )
-
     assert (
         wrapper._testmon_dependency_override()
         == "testmon_ignore_dependencies=megatron-core pytest-testmon transformers"
     )
 
 
-def test_baseline_rank_zero_generates_one_database_per_phase(tmp_path, monkeypatch):
-    calls = _fake_pytest(monkeypatch)
-    monkeypatch.setenv("WORLD_SIZE", "8")
-    monkeypatch.setenv("RANK", "0")
-
-    assert _run_wrapper(tmp_path, "baseline") == 0
-
-    prod_database = tmp_path / "prod/.testmondata"
-    assert prod_database.read_bytes() == b"baseline"
-    assert {"--testmon", "--testmon-noselect"} <= set(calls[-1])
-    assert calls[-1][calls[-1].index("-o") + 1].startswith("testmon_ignore_dependencies=")
-
-    assert _run_wrapper(tmp_path, "baseline", "experimental") == 0
-    experimental_database = tmp_path / "experimental/.testmondata"
-    assert experimental_database.read_bytes() == b"baseline"
-    assert os.environ["TESTMON_DATAFILE"] == str(experimental_database)
+def test_successful_baseline_records_each_phase(project, cache):
+    result = _invoke(project, cache, "baseline", "experimental")
+    assert result.returncode == 0, result.stdout + result.stderr
+    for phase in ("prod", "experimental"):
+        assert (cache / phase / ".testmondata").is_file()
+        assert (cache / phase / "metadata.json").is_file()
 
 
-def test_baseline_nonzero_rank_disables_testmon(tmp_path, monkeypatch):
-    calls = _fake_pytest(monkeypatch)
-    monkeypatch.setenv("WORLD_SIZE", "8")
-    monkeypatch.setenv("RANK", "3")
+def test_failed_baseline_cannot_reuse_old_metadata(project, cache):
+    (project / "tests/test_app.py").write_text("def test_failure():\n    assert False\n")
+    result = _invoke(project, cache, "baseline")
+    assert result.returncode == 1
+    assert not (cache / "prod/metadata.json").exists()
 
-    assert _run_wrapper(tmp_path, "baseline") == 0
 
-    assert not list(tmp_path.rglob(".testmondata"))
-    assert {"-p", "no:testmon", "no:pytest-testmon"} <= set(calls[-1])
-    assert "-o" not in calls[-1]
-    assert "TESTMON_DATAFILE" not in os.environ
+def test_empty_baseline_phase_is_recorded(project, tmp_path):
+    for test_file in (project / "tests").iterdir():
+        test_file.unlink()
+    cache = tmp_path / "empty-cache"
+    result = _invoke(project, cache, "baseline")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (cache / "prod/metadata.json").is_file()
+    selected = _invoke(project, cache, "select")
+    assert selected.returncode == 0, selected.stdout + selected.stderr
+    assert (cache / ".testmon-work/prod/rank-0/selected-tests").read_text() == ""
+
+
+def test_nonzero_baseline_rank_runs_without_recording(project, tmp_path):
+    cache = tmp_path / "rank-three-cache"
+    result = _invoke(project, cache, "baseline", rank=3)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert not cache.exists()
 
 
 @pytest.mark.parametrize("rank", (0, 3))
-def test_selection_uses_a_copy_and_records_nodeids(tmp_path, monkeypatch, rank):
-    database = tmp_path / "experimental/.testmondata"
-    database.parent.mkdir(parents=True)
-    database.write_bytes(b"trusted baseline")
-    calls = _fake_pytest(
-        monkeypatch,
-        selected=("tests/unit_tests/test_a.py::test_a", "tests/unit_tests/test_b.py::test_b"),
+def test_zero_selection_uses_private_copy_and_keeps_cache_readonly(project, cache, rank):
+    phase = cache / "prod"
+    before = _snapshot(phase)
+    for path in phase.iterdir():
+        path.chmod(0o444)
+    phase.chmod(0o555)
+    try:
+        result = _invoke(project, cache, "select", rank=rank)
+        assert result.returncode == 0, result.stdout + result.stderr
+        private = cache / f".testmon-work/prod/rank-{rank}"
+        assert (private / ".testmondata").is_file()
+        assert (private / "selected-tests").read_text() == ""
+        assert _snapshot(phase) == before
+    finally:
+        phase.chmod(0o755)
+
+
+def test_changed_dependency_is_selected_without_learning_or_execution(project, cache):
+    before = _snapshot(cache / "prod")
+    # Executing this test would fail; selection must only collect it.
+    (project / "app.py").write_text("def active(value):\n    return value + 2\n")
+    for _ in range(2):
+        result = _invoke(project, cache, "select")
+        assert result.returncode == 0, result.stdout + result.stderr
+        selected = cache / ".testmon-work/prod/rank-0/selected-tests"
+        assert selected.read_text().splitlines() == ["tests/test_app.py"]
+        assert _snapshot(cache / "prod") == before
+
+
+def test_new_test_file_is_discovered_from_old_baseline(project, cache):
+    (project / "tests/test_new.py").write_text(
+        "def test_new():\n    raise AssertionError('selection must not execute tests')\n"
     )
-    monkeypatch.setenv("WORLD_SIZE", "8")
-    monkeypatch.setenv("RANK", str(rank))
-
-    assert _run_wrapper(tmp_path, "select", "experimental") == 0
-
-    arguments = calls[0]
-    assert {"--collect-only", "--testmon", "--testmon-nocollect", "--testmon-forceselect"} <= set(
-        arguments
-    )
-    assert arguments[arguments.index("-o") + 1].startswith("testmon_ignore_dependencies=")
-    disposable = tmp_path / f".testmon-work/experimental/rank-{rank}/.testmondata"
-    assert Path(os.environ["TESTMON_DATAFILE"]) == disposable
-    assert disposable.read_bytes() == b"trusted baseline"
-    assert database.read_bytes() == b"trusted baseline"
-    assert (disposable.parent / "selected-tests").read_text().splitlines() == [
-        "tests/unit_tests/test_a.py",
-        "tests/unit_tests/test_b.py",
-    ]
+    result = _invoke(project, cache, "select")
+    assert result.returncode == 0, result.stdout + result.stderr
+    selected = cache / ".testmon-work/prod/rank-0/selected-tests"
+    assert selected.read_text().splitlines() == ["tests/test_new.py"]
 
 
-def test_missing_rank_database_is_an_error(tmp_path, monkeypatch, capsys):
-    calls = _fake_pytest(monkeypatch)
-    monkeypatch.setenv("WORLD_SIZE", "8")
-    monkeypatch.setenv("RANK", "1")
-
-    assert _run_wrapper(tmp_path, "select") != 0
-    assert calls == []
-    assert "missing Testmon baseline" in capsys.readouterr().err
-
-
-def test_empty_selection_is_success(tmp_path, monkeypatch):
-    database = tmp_path / "prod/.testmondata"
-    database.parent.mkdir(parents=True)
-    database.write_bytes(b"baseline")
-    _fake_pytest(monkeypatch, return_code=5)
-    monkeypatch.setenv("WORLD_SIZE", "1")
-    monkeypatch.setenv("RANK", "0")
-
-    assert _run_wrapper(tmp_path, "select") == 0
-
-
-def test_runner_generates_databases_then_unions_rank_selections():
+@pytest.mark.parametrize("problem", ("missing", "corrupt", "schema", "runtime"))
+def test_invalid_baseline_falls_back_before_private_copy(project, cache, problem):
+    database = cache / "prod/.testmondata"
+    if problem == "missing":
+        database.unlink()
+    elif problem == "corrupt":
+        database.write_bytes(b"not a sqlite database")
+    elif problem == "schema":
+        with sqlite3.connect(database) as connection:
+            connection.execute("PRAGMA user_version = 999")
+        connection.close()
+    else:
+        metadata_path = cache / "prod/metadata.json"
+        metadata = json.loads(metadata_path.read_text())
+        metadata["runtime"]["python"] = "0.0.0"
+        metadata_path.write_text(json.dumps(metadata))
+    before = _snapshot(cache / "prod")
     runner = _source("tests/unit_tests/run_ci_test.sh")
-    full = _function(runner, "run_full_tests")
-    baseline = _function(runner, "run_baseline_tests")
-    bootstrap = _function(runner, "run_bootstrap_tests")
-    enforce = _function(runner, "run_enforced_tests")
+    script = "\n".join(
+        (
+            "set -euo pipefail",
+            'BUCKET="$PROJECT/tests"',
+            "IGNORE_ARGS=()",
+            "MARKER_ARG='not flaky'",
+            "UNIT_TEST_REPEAT=1",
+            'run_full_tests() { echo FULL_BUCKET; }',
+            'write_testmon_summary() { printf "%s\\n" "$1"; }',
+            "merge_rank_selections() { return 0; }",
+            'run_testmon_phase() { RANK=0 WORLD_SIZE=1 "$TEST_PYTHON" "$WRAPPER" '
+            '--mode "$1" --phase "$2" --cache-dir "$UNIT_TESTMON_CACHE_DIR" '
+            '-- -q -c "$PROJECT/pytest.ini" "$PROJECT/tests"; }',
+            "run_enforced_tests() {" + _function(runner, "run_enforced_tests") + "\n}",
+            "run_enforced_tests",
+        )
+    )
+    result = subprocess.run(
+        ["bash"],
+        input=script,
+        cwd=project,
+        env={
+            **os.environ,
+            "PROJECT": str(project),
+            "PYTHONPATH": str(project),
+            "TEST_PYTHON": sys.executable,
+            "WRAPPER": str(WRAPPER_PATH),
+            "UNIT_TESTMON_CACHE_DIR": str(cache),
+        },
+        text=True,
+        capture_output=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "full fallback: Testmon selection failed" in result.stdout
+    assert result.stdout.count("FULL_BUCKET") == 1
+    assert "Testmon wrapper (select/prod):" in result.stderr
+    assert "Traceback" not in result.stderr
+    assert not (cache / ".testmon-work").exists()
+    assert _snapshot(cache / "prod") == before
 
-    assert "-m coverage run" in full
-    assert "--experimental" in full
-    assert "testmon" not in full.lower()
-    assert "run_testmon_phase baseline prod" in baseline
-    assert "run_testmon_phase baseline experimental" in baseline
-    assert bootstrap.index("run_full_tests") < bootstrap.index("run_baseline_tests")
-    assert "run_testmon_phase select prod" in enforce
-    assert "run_testmon_phase select experimental" in enforce
-    assert "merge_rank_selections prod" in enforce
-    assert "merge_rank_selections experimental" in enforce
-    assert "run_full_tests" in enforce
-    assert "CoverageData" in enforce
-    assert "install_testmon" not in runner
-    assert "selected_test_failed" not in runner
+
+def test_empty_phase_does_not_launch_pytest(tmp_path):
+    phase = tmp_path / ".testmon-work/prod"
+    phase.mkdir(parents=True)
+    (phase / "selected-tests").write_text("")
+    runner = _source("tests/unit_tests/run_ci_test.sh")
+    result = subprocess.run(
+        ["bash", "-e", "-u", "-o", "pipefail"],
+        input="\n".join(
+            (
+                "DISTRIBUTED_ARGS=()",
+                "uv() { echo UNEXPECTED_EXECUTION; return 99; }",
+                "run_selected_phase() {" + _function(runner, "run_selected_phase") + "\n}",
+                "run_selected_phase prod",
+            )
+        ),
+        env={**os.environ, "UNIT_TESTMON_CACHE_DIR": str(tmp_path)},
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    assert "Testmon selected no prod tests." in result.stdout
+    assert "UNEXPECTED_EXECUTION" not in result.stdout
+
+
+def test_selected_test_failure_does_not_run_full_bucket(tmp_path):
+    runner = _source("tests/unit_tests/run_ci_test.sh")
+    result = subprocess.run(
+        ["bash", "-e", "-u", "-o", "pipefail"],
+        input="\n".join(
+            (
+                "BUCKET=tests/unit_tests/example",
+                "IGNORE_ARGS=()",
+                "MARKER_ARG='not flaky'",
+                "UNIT_TEST_REPEAT=1",
+                "run_testmon_phase() { return 0; }",
+                'merge_rank_selections() { mkdir -p "$UNIT_TESTMON_CACHE_DIR/.testmon-work/$1"; '
+                'echo tests/unit_tests/test_example.py > "$UNIT_TESTMON_CACHE_DIR/.testmon-work/$1/selected-tests"; }',
+                "run_selected_phase() { return 1; }",
+                "run_full_tests() { echo UNEXPECTED_FULL_BUCKET; }",
+                "run_enforced_tests() {" + _function(runner, "run_enforced_tests") + "\n}",
+                "run_enforced_tests",
+            )
+        ),
+        env={**os.environ, "UNIT_TESTMON_CACHE_DIR": str(tmp_path)},
+        text=True,
+        capture_output=True,
+    )
+    assert result.returncode == 1
+    assert "UNEXPECTED_FULL_BUCKET" not in result.stdout
 
 
 @pytest.mark.parametrize(
@@ -235,37 +351,11 @@ def test_pr_label_gate(overrides, expected):
     assert result.stdout.strip() == expected
 
 
-def test_cache_bootstraps_a_pr_scoped_baseline():
-    main = _source(".github/workflows/cicd-main.yml")
-    action = _source(".github/actions/action.yml")
-
-    assert 'any(. == "Run selective unit tests")' in main
-    assert "unit_testmon_mode: ${{ needs.configure.outputs.unit_testmon_eligible == 'true'" in main
-    assert "unit_testmon_target_branch: ${{ needs.configure.outputs.target_branch }}" in main
-
-    assert "unit-testmon-${TARGET_BRANCH_KEY}-${PLATFORM}-${BUCKET_HASH}" in action
-    assert "uses: actions/cache/restore@" in action
-    assert "uses: actions/cache/save@" in action
-    assert 'test -s "$CACHE_DIR/prod/.testmondata"' in action
-    assert 'test -s "$CACHE_DIR/experimental/.testmondata"' in action
-    assert "EXPECTED_RANKS" not in action
-    assert "restore-keys:" not in action
-    assert "outputs.cache-hit" in action
-    assert "EFFECTIVE_MODE=bootstrap" in action
-    assert "steps.unit-testmon.outputs.mode == 'bootstrap'" in action
-    assert "unit_testmon_head_sha" not in action + main
-    assert "CREATED_AT" not in action
-    assert "unit_testmon_base_sha" not in action
-    assert "unit_testmon_pr_number" not in action
-
-
 def test_mode_is_passed_as_container_environment():
     launcher = _source("tests/test_utils/python_scripts/launch_nemo_run_workload.py")
     h100_recipe = _source("tests/test_utils/recipes/h100/unit-tests.yaml")
     gb200_recipe = _source("tests/test_utils/recipes/gb200/unit-tests.yaml")
-    pyproject = _source("pyproject.toml")
 
     assert '"UNIT_TESTMON_MODE": unit_testmon_mode' in launcher
-    assert '["full", "enforce", "baseline", "bootstrap"]' in launcher
+    assert '["full", "enforce", "baseline"]' in launcher
     assert "{unit_testmon_mode}" not in h100_recipe + gb200_recipe
-    assert "pytest-testmon==2.2.0" in pyproject

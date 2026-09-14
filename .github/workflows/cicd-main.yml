@@ -260,6 +260,10 @@ jobs:
           HAS_MBRIDGE=$(echo "$LABELS"        | jq 'any(. == "Run MBridge tests")')
           HAS_NEMO_RL=$(echo "$LABELS"        | jq 'any(. == "Run NeMoRL tests")')
           HAS_UNIT_TESTMON=$(echo "$LABELS"   | jq 'any(. == "Run selective unit tests")')
+          # Synthetic PR pushes have no pull_request event payload for preflight.
+          if echo "$LABELS" | jq -e 'any(. == "force-run-all")' > /dev/null; then
+            FORCE_RUN_ALL=true
+          fi
 
           if [ "$IS_MERGE_GROUP" == "true" ]; then
             SCOPE=L1; N_REPEAT=1; LIGHTWEIGHT=false
@@ -328,8 +332,8 @@ jobs:
 
           DEV=true
 
-          # Testmon is an explicit PR-only fast path. Cache compatibility is
-          # checked later from the checked-out tree; a miss runs the full bucket.
+          # Labeled PRs only read the shared main baseline. A missing or
+          # incompatible cache runs the full bucket without recording a database.
           UNIT_TESTMON_ELIGIBLE=false
           if [[ "$LABELS_VALID" == "true" \
             && "$HAS_UNIT_TESTMON" == "true" \

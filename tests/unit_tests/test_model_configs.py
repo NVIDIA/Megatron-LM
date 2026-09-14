@@ -3,7 +3,6 @@ import pathlib
 import pytest
 import yaml
 
-# Testmon smoke test: intentional no-op to verify selective unit-test execution.
 YAML_DIR = pathlib.Path(__file__).parent / ".." / "functional_tests" / "test_cases"
 
 

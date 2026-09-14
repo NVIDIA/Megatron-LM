@@ -68,7 +68,7 @@ if [[ "$ENVIRONMENT" != "lts" && "$ENVIRONMENT" != "dev" ]]; then
     echo "Error: ENVIRONMENT must be either 'lts' or 'dev'"
     usage
 fi
-if [[ "$UNIT_TESTMON_MODE" != "full" && "$UNIT_TESTMON_MODE" != "enforce" && "$UNIT_TESTMON_MODE" != "baseline" && "$UNIT_TESTMON_MODE" != "bootstrap" ]]; then
+if [[ "$UNIT_TESTMON_MODE" != "full" && "$UNIT_TESTMON_MODE" != "enforce" && "$UNIT_TESTMON_MODE" != "baseline" ]]; then
     echo "Error: invalid Testmon mode: $UNIT_TESTMON_MODE"
     usage
 fi
@@ -195,7 +195,10 @@ run_testmon_phase() {
     local mode="$1"
     local phase="$2"
     shift 2
-    uv pip install --python /opt/venv/bin/python --no-deps "pytest-testmon==2.2.0"
+    if [[ "${UNIT_TESTMON_INSTALLED:-false}" != "true" ]]; then
+        uv pip install --python /opt/venv/bin/python --no-deps "pytest-testmon==2.2.0" || return
+        UNIT_TESTMON_INSTALLED=true
+    fi
     local -a command=(uv run --no-sync python -m torch.distributed.run "${DISTRIBUTED_ARGS[@]}")
     command+=(
         tests/unit_tests/testmon_selector.py
@@ -220,13 +223,6 @@ run_baseline_tests() {
     run_testmon_phase baseline experimental \
         -vs --experimental "${IGNORE_ARGS[@]}" -m "experimental and ${MARKER_ARG}" "$target"
     write_testmon_summary "baseline produced"
-}
-
-run_bootstrap_tests() {
-    # Keep the existing exhaustive path for its normal coverage artifact, then
-    # make a second one-time pass to record Testmon's per-test dependencies.
-    run_full_tests
-    run_baseline_tests
 }
 
 merge_rank_selections() {
@@ -327,9 +323,6 @@ full)
     ;;
 baseline)
     run_baseline_tests
-    ;;
-bootstrap)
-    run_bootstrap_tests
     ;;
 enforce)
     run_enforced_tests

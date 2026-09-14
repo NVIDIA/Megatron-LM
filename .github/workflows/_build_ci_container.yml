@@ -16,6 +16,10 @@ name: ~Build CI containers
 
 on:
   workflow_call:
+    outputs:
+      build-matrix:
+        description: Platforms, registries, and runners used for this build
+        value: ${{ jobs.cicd-compute-build-matrix.outputs.matrix }}
     inputs:
       is-maintainer:
         description: Whether the workflow is running with maintainer resources
