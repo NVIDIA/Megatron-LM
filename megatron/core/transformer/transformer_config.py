@@ -939,8 +939,8 @@ class TransformerConfig(ModelParallelConfig):
     moe_flex_dispatcher_backend: Literal['deepep', 'deepepv2', 'hybridep', 'ncclep'] = "deepep"
     """[Experimental] The backend to use for flex token dispatcher. The default is "deepep".
     Options are "deepep", "deepepv2", "hybridep", and "ncclep". Currently only "hybridep"
-    backend supports the MNNVL case. "ncclep" uses NVIDIA NCCL Expert Parallelism via TransformerEngine's
-    transformer_engine.pytorch.ep API."""
+    backend supports the MNNVL case. "ncclep" uses NVIDIA NCCL Expert Parallelism via
+    TransformerEngine's transformer_engine.pytorch.ep API."""
 
     moe_permute_fusion_into_hybridep: bool = False
     """Fuse token rearrangement ops during token dispatching for HybridEP."""
@@ -1008,8 +1008,9 @@ class TransformerConfig(ModelParallelConfig):
 
     moe_flex_dispatcher_num_sms: Optional[int] = None
     """Number of SMs for the flex token dispatcher's dispatch/combine communication, for all
-    backends (deepep, deepepv2, hybridep, ncclep). None lets each backend use its own default. Unifies the
-    deprecated per-backend moe_{deepep,hybridep}_num_sms knobs (routed in __post_init__)."""
+    backends (deepep, deepepv2, hybridep, ncclep). None lets each backend use its own default.
+    Unifies the deprecated per-backend moe_{deepep,hybridep}_num_sms knobs (routed in
+    __post_init__)."""
 
     moe_deepep_num_sms: Optional[int] = None
     """DEPRECATED: use moe_flex_dispatcher_num_sms. Number of SMs to use for DeepEP (historical

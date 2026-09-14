@@ -1544,7 +1544,7 @@ class _DeepepV2Manager(_DeepepManager):
                 self.token_indices,
                 self.token_probs,
                 self.num_experts,
-                num_max_tokens_per_rank=hidden_states.shape[0],
+                num_max_tokens_per_rank=buffer.num_max_tokens_per_rank,
                 expert_alignment=1,
                 num_sms=self.num_sms,
                 async_finish=async_finish,
