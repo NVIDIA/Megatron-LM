@@ -3460,11 +3460,15 @@ def training_log(
     is_first_iteration=False,
     seqlen_squared_sum_in_batch: float | None = None,
     total_real_tokens_in_batch: float | None = None,
-    hybrid_layer_config_list=None,
-    hybrid_mtp_use_repeated_layer=None,
-    model_flops_estimator: Callable[..., float | None] | None = None,
+    moe_logging_metadata: tuple[list[str], int, int, bool] | None = None,
+    num_floating_point_operations_in_batch: float | None = None,
 ):
-    """Log training information such as losses, timing, ...."""
+    """Log training information such as losses, timing, ....
+
+    ``moe_logging_metadata`` contains metric names, tracker size, MoE layer count,
+    and whether the model has MoE layers. If omitted, use the legacy args-based
+    metadata. Likewise, compute batch FLOPs from args only if no count is supplied.
+    """
     args = get_args()
     timers = get_timers()
     writer = get_tensorboard_writer()
@@ -3638,18 +3642,13 @@ def training_log(
                 wandb_writer.log({'max_attention_logit': max_attention_logit}, iteration)
     # Log MoE metrics.
     moe_log_string = ""
-    list_moe_metadata = None
-    if hybrid_layer_config_list is not None:
-        if hybrid_mtp_use_repeated_layer is None:
-            hybrid_mtp_use_repeated_layer = args.mtp_use_repeated_layer
-        list_moe_metadata = _hybrid_config_list_moe_logging_metadata(
-            hybrid_layer_config_list, hybrid_mtp_use_repeated_layer
-        )
-    has_moe_layers = list_moe_metadata[3] if list_moe_metadata else args.num_experts is not None
+    has_moe_layers = (
+        moe_logging_metadata[3] if moe_logging_metadata is not None else args.num_experts is not None
+    )
 
-    if list_moe_metadata and list_moe_metadata[3]:
+    if moe_logging_metadata is not None and has_moe_layers:
         moe_loss_scale = 1 / get_num_microbatches()
-        track_names, layers, num_moe_layers, _ = list_moe_metadata
+        track_names, layers, num_moe_layers, _ = moe_logging_metadata
         moe_log_string = get_moe_metrics_tracker().report(
             loss_scale=moe_loss_scale,
             iteration=iteration,
@@ -3665,7 +3664,7 @@ def training_log(
             total_loss_dict=total_loss_dict,
         )
 
-    if args.num_experts is not None and hybrid_layer_config_list is None:
+    if args.num_experts is not None and moe_logging_metadata is None:
         moe_loss_scale = 1 / get_num_microbatches()
         track_names = []
         if "aux_loss" in args.moe_router_load_balancing_type:
@@ -3762,13 +3761,16 @@ def training_log(
         elapsed_time_per_iteration = elapsed_time / total_iterations
         llm_world_size = getattr(args, 'mimo_llm_world_size', args.world_size)
 
-        throughput = num_floating_point_operations(
-            args,
-            batch_size,
-            seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
-            total_real_tokens_in_batch=total_real_tokens_in_batch,
-            model_flops_estimator=model_flops_estimator,
-        ) / (elapsed_time_per_iteration * 10**12 * llm_world_size)
+        if num_floating_point_operations_in_batch is None:
+            num_floating_point_operations_in_batch = num_floating_point_operations(
+                args,
+                batch_size,
+                seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
+                total_real_tokens_in_batch=total_real_tokens_in_batch,
+            )
+        throughput = num_floating_point_operations_in_batch / (
+            elapsed_time_per_iteration * 10**12 * llm_world_size
+        )
 
         one_logger_utils.track_e2e_metrics(args.log_throughput, throughput)
 
@@ -4395,17 +4397,13 @@ def train(
     timers = get_timers()
     hybrid_model = _find_hybrid_model_for_runtime_metrics(model[0])
     model_flops_estimator = hybrid_model.estimate_flops if hybrid_model is not None else None
-    hybrid_layer_config_list = (
-        hybrid_model.hybrid_layer_config_list if hybrid_model is not None else None
-    )
-    hybrid_mtp_use_repeated_layer = None
+    moe_logging_metadata = None
     has_moe_layers = args.num_experts is not None
-    if hybrid_layer_config_list is not None:
-        from megatron.core.transformer.moe.moe_layer_config import MoELayerConfig
-
-        hybrid_model_config = hybrid_model.config
-        hybrid_mtp_use_repeated_layer = hybrid_model_config.mtp_use_repeated_layer
-        has_moe_layers = any(type(entry) is MoELayerConfig for entry in hybrid_layer_config_list)
+    if hybrid_model is not None and hybrid_model.hybrid_layer_config_list is not None:
+        moe_logging_metadata = _hybrid_config_list_moe_logging_metadata(
+            hybrid_model.hybrid_layer_config_list, hybrid_model.config.mtp_use_repeated_layer
+        )
+        has_moe_layers = moe_logging_metadata[3]
 
     fault_injector_kwargs = {}
     for f in dataclasses.fields(FaultInjectorConfig):
@@ -5133,11 +5131,8 @@ def train(
                     max_attention_logit,
                     pg_collection=model_pg_collection,
                     is_first_iteration=is_first_iteration,
-                    seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
-                    total_real_tokens_in_batch=total_real_tokens_in_batch,
-                    hybrid_layer_config_list=hybrid_layer_config_list,
-                    hybrid_mtp_use_repeated_layer=hybrid_mtp_use_repeated_layer,
-                    model_flops_estimator=model_flops_estimator,
+                    moe_logging_metadata=moe_logging_metadata,
+                    num_floating_point_operations_in_batch=num_floating_point_operations_in_batch,
                 )
             # OTel: close the iteration-report super-span (parents params_norm + log;
             # its own uninstrumented time is the loss_scale sync + FLOPs bookkeeping).

@@ -3,9 +3,12 @@
 from collections import defaultdict
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock
 
+import pytest
 import torch
 
+import megatron.training.training as training_module
 from megatron.core.models.hybrid import MTPSplit, PipelineSplit
 from megatron.core.ssm.mlp_layer_config import MLPLayerConfig
 from megatron.core.tokenizers.utils.build_tokenizer import vocab_size_with_padding
@@ -142,6 +145,203 @@ def test_runtime_metrics_find_hybrid_model_under_language_model_wrapper():
     wrapper = SimpleNamespace(language_model=SimpleNamespace(module=hybrid_model))
 
     assert _find_hybrid_model_for_runtime_metrics(wrapper) is hybrid_model
+
+
+@pytest.fixture
+def training_log_context(monkeypatch):
+    """Exercise the logger with empty losses and no device or writer side effects."""
+    args = SimpleNamespace(
+        timing_log_level=0,
+        perform_rl_step=False,
+        micro_batch_size=2,
+        data_parallel_size=3,
+        gtp_weight_remat_size=2,
+        world_size=8,
+        seq_length=64,
+        num_experts=None,
+        mtp_num_layers=None,
+        dsa_indexer_loss_coeff=None,
+        log_interval=10,
+        profile_ranks=[],
+        record_memory_history=False,
+        log_throughput=True,
+        log_timers_to_tensorboard=False,
+        train_iters=20,
+        consumed_train_samples=240,
+        skipped_train_samples=0,
+        log_energy=False,
+        log_memory_interval=None,
+        rl_profile=False,
+        moe_per_layer_logging=True,
+        moe_layer_freq=None,
+    )
+    timers = Mock()
+    timers.return_value.elapsed.return_value = 20.0
+    tracker = Mock()
+    tracker.report.return_value = " MoE metrics |"
+    flops = Mock(return_value=32e12)
+    track_throughput = Mock()
+    print_log = Mock()
+    pg_collection = SimpleNamespace(mp=object())
+    for name, value in (
+        ("get_args", args),
+        ("get_timers", timers),
+        ("get_num_microbatches", 2),
+        ("get_moe_metrics_tracker", tracker),
+        ("get_tensorboard_writer", None),
+        ("get_wandb_writer", None),
+        ("get_one_logger", None),
+        ("get_energy_monitor", None),
+        ("get_telemetry", None),
+    ):
+        monkeypatch.setattr(training_module, name, Mock(return_value=value))
+    monkeypatch.setattr(training_module, "has_rl_utils", False)
+    monkeypatch.setattr(
+        training_module, "reduce_max_stat_across_model_parallel_group", lambda value, group: value
+    )
+    monkeypatch.setattr(training_module, "num_floating_point_operations", flops)
+    monkeypatch.setattr(training_module, "print_rank_last", print_log)
+    monkeypatch.setattr(training_module.one_logger_utils, "track_app_tag", Mock())
+    monkeypatch.setattr(training_module.one_logger_utils, "track_e2e_metrics", track_throughput)
+    monkeypatch.setattr(
+        training_module,
+        "_hybrid_config_list_moe_logging_metadata",
+        Mock(side_effect=AssertionError("The logger must not derive model metadata")),
+    )
+    total_loss_dict = {"advanced iterations": 3, "skipped iterations": 1, "nan iterations": 0}
+
+    def log(**kwargs):
+        training_module.training_log(
+            loss_dict={},
+            total_loss_dict=total_loss_dict,
+            learning_rate=0.1,
+            iteration=1 if kwargs.get("is_first_iteration") else 10,
+            loss_scale=1.0,
+            report_memory_flag=False,
+            skipped_iter=0,
+            grad_norm=None,
+            params_norm=None,
+            num_zeros_in_grad=None,
+            max_attention_logit=None,
+            pg_collection=pg_collection,
+            **kwargs,
+        )
+
+    return SimpleNamespace(
+        args=args,
+        log=log,
+        total_loss_dict=total_loss_dict,
+        timers=timers,
+        tracker=tracker,
+        flops=flops,
+        track_throughput=track_throughput,
+        print_log=print_log,
+        pg_collection=pg_collection,
+    )
+
+
+@pytest.mark.parametrize(
+    "batch_flops,is_first_iteration,llm_world_size",
+    [(0.0, False, None), (32e12, False, None), (32e12, True, None), (32e12, False, 4)],
+)
+def test_training_log_uses_precomputed_flops(
+    training_log_context, batch_flops, is_first_iteration, llm_world_size
+):
+    ctx = training_log_context
+    if llm_world_size is not None:
+        ctx.args.mimo_llm_world_size = llm_world_size
+
+    ctx.log(
+        num_floating_point_operations_in_batch=batch_flops, is_first_iteration=is_first_iteration
+    )
+
+    # The logger adds one advanced iteration: 20 elapsed seconds / 5 iterations = 4 s/iter.
+    expected_throughput = batch_flops / (4.0 * 1e12 * (llm_world_size or ctx.args.world_size))
+    ctx.track_throughput.assert_called_once_with(True, expected_throughput)
+    ctx.flops.assert_not_called()
+    ctx.timers.return_value.elapsed.assert_called_once_with(
+        barrier=True, reset=not is_first_iteration
+    )
+    ctx.timers.log.assert_called_once_with([], normalizer=10, reset=not is_first_iteration)
+    assert ctx.total_loss_dict["advanced iterations"] == (4 if is_first_iteration else 0)
+    assert ctx.total_loss_dict["skipped iterations"] == (1 if is_first_iteration else 0)
+
+
+def test_training_log_preserves_legacy_flops_fallback_with_packed_stats(training_log_context):
+    ctx = training_log_context
+
+    ctx.log(seqlen_squared_sum_in_batch=1234.0, total_real_tokens_in_batch=80.0)
+
+    ctx.flops.assert_called_once_with(
+        ctx.args, 24, seqlen_squared_sum_in_batch=1234.0, total_real_tokens_in_batch=80.0
+    )
+    ctx.track_throughput.assert_called_once_with(True, 1.0)
+
+
+@pytest.mark.parametrize("num_moe_layers", [3, 4])
+def test_training_log_uses_precomputed_moe_metadata_without_global_experts(
+    training_log_context, num_moe_layers
+):
+    ctx = training_log_context
+    track_names = ["load_balancing_loss", "seq_load_balancing_loss", "z_loss"]
+
+    ctx.log(
+        moe_logging_metadata=(track_names, 4, num_moe_layers, True),
+        num_floating_point_operations_in_batch=32e12,
+    )
+
+    assert ctx.args.num_experts is None
+    ctx.tracker.report.assert_called_once_with(
+        loss_scale=0.5,
+        iteration=10,
+        writer=None,
+        wandb_writer=None,
+        per_layer_logging=True,
+        force_initialize=True,
+        track_names=track_names,
+        num_layers=4,
+        num_moe_layers=num_moe_layers,
+        moe_layer_freq=None,
+        pg_collection=ctx.pg_collection,
+        total_loss_dict=ctx.total_loss_dict,
+    )
+    assert " MoE metrics |" in ctx.print_log.call_args.args[0]
+
+
+def test_training_log_dense_metadata_overrides_global_experts(training_log_context):
+    ctx = training_log_context
+    ctx.args.num_experts = 8
+
+    ctx.log(moe_logging_metadata=([], 4, 0, False), num_floating_point_operations_in_batch=32e12)
+
+    ctx.tracker.report.assert_not_called()
+    assert " MoE metrics |" not in ctx.print_log.call_args.args[0]
+
+
+@pytest.mark.parametrize("pattern,expected_moe_layers", [(None, 2), ("*E--", 1)])
+def test_training_log_preserves_legacy_moe_metadata(
+    training_log_context, pattern, expected_moe_layers
+):
+    ctx = training_log_context
+    ctx.args.num_experts = 8
+    ctx.args.num_layers = 4
+    ctx.args.moe_layer_freq = 2
+    ctx.args.hybrid_layer_pattern = pattern
+    ctx.args.moe_router_load_balancing_type = ["aux_loss", "seq_aux_loss"]
+    ctx.args.moe_z_loss_coeff = 0.1
+
+    ctx.log(num_floating_point_operations_in_batch=32e12)
+
+    ctx.tracker.report.assert_called_once()
+    report_args = ctx.tracker.report.call_args.kwargs
+    assert report_args["track_names"] == [
+        "load_balancing_loss",
+        "seq_load_balancing_loss",
+        "z_loss",
+    ]
+    assert report_args["num_layers"] == 4
+    assert report_args["num_moe_layers"] == expected_moe_layers
+    assert report_args["loss_scale"] == 0.5
 
 
 class TestTraining:
