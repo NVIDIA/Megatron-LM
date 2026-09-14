@@ -28,10 +28,10 @@ available; the cache set is not an atomic snapshot of all buckets.
 ## Restore on labeled PRs
 
 Producer and consumer use the lookup prefix
-`unit-testmon-v3-main-<platform>-<bucket-hash>-`. The producer appends its run ID
+`unit-testmon-v1-main-<platform>-<bucket-hash>-`. The producer appends its run ID
 and attempt to create a new immutable cache key. Image IDs, configuration hashes
-and source commit SHAs are not part of this prefix. The v3 namespace requires
-a fresh main generation; earlier namespaces are not restored.
+and source commit SHAs are not part of this prefix. Establish the first main
+generation after merging the workflow.
 
 PRs restore the newest accessible generation matching their platform and bucket,
 then validate compatibility. The manifest compares hashes of relevant build,

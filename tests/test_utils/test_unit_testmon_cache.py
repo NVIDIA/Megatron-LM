@@ -95,7 +95,7 @@ def test_platform_and_bucket_are_isolated(source_tree):
     ]
     assert len({identity["cache_prefix"] for identity in identities}) == 3
     assert all(
-        identity["cache_prefix"].startswith("unit-testmon-v3-main-") for identity in identities
+        identity["cache_prefix"].startswith("unit-testmon-v1-main-") for identity in identities
     )
     with pytest.raises(ValueError, match="immutable"):
         cache.cache_identity(source_tree, BUCKET, "dgx_h100", "image:latest")
@@ -165,7 +165,7 @@ def test_run_and_attempt_generations_share_prefix_and_require_matching_key(gener
         "schema",
         "wal",
         "metadata",
-        "old-metadata-schema",
+        "unsupported-metadata-schema",
         "runtime",
         "checksum",
     ],
@@ -188,7 +188,7 @@ def test_invalid_phase_is_rejected_without_repair(generation, mutation):
         metadata_path.write_text("[]")
     else:
         metadata = json.loads(metadata_path.read_text())
-        if mutation == "old-metadata-schema":
+        if mutation == "unsupported-metadata-schema":
             metadata["schema"] = 2
         elif mutation == "runtime":
             metadata["runtime"]["python"] = "0.0.0"
@@ -212,7 +212,7 @@ def test_manifest_rejects_wrong_key_and_incomplete_phase(generation):
     assert not (directory / "manifest.json").exists()
 
 
-def test_manifest_rejects_previous_cache_schema(generation):
+def test_manifest_rejects_unsupported_cache_schema(generation):
     directory, identity = generation
     path = directory / "manifest.json"
     manifest = json.loads(path.read_text())

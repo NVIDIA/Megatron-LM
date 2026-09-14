@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 from importlib.metadata import PackageNotFoundError, distributions, version
 from pathlib import Path
 
-SCHEMA = 3
+SCHEMA = 1
 TESTMON_VERSION = "2.2.0"
 PHASES = ("prod", "experimental")
 TRACKED_ENVIRONMENT_PACKAGES = frozenset(
