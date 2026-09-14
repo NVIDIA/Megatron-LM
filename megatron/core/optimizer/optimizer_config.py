@@ -380,11 +380,10 @@ class OptimizerConfig:
 
     Disabled by default. Set a finite value to enable skip-on-large-grad behavior.
     """
-    dsa_separate_indexer_grad_clip: bool = False
-    """If true, clip DSA indexer and non-indexer gradients with separate L2 norms."""
-
     dsa_indexer_clip_grad: Optional[float] = None
-    """DSA indexer gradient clipping threshold when using separate indexer clipping."""
+    """Threshold for clipping DSA indexer gradients with an L2 norm taken separately from the
+    non-indexer gradients, which keep the ``clip_grad`` threshold. ``None`` clips every
+    parameter together under ``clip_grad``."""
 
     log_num_zeros_in_grad: bool = False
     """If true, calculate and log the number of zeros in gradient."""
