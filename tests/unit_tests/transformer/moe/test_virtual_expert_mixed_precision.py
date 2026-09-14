@@ -180,6 +180,12 @@ def test_virtual_expert_mixed_precision_repeated_layer_matches_hybridep(monkeypa
             assert len(VirtualExpertLoadBalancer.storages) == 2
             assert managers[0].virtual_experts.storage is not managers[1].virtual_experts.storage
             assert all(
+                not hasattr(parameter, "grad_added_to_main_grad") and parameter.grad is None
+                for manager in managers
+                for fc in manager.virtual_experts.runtime_weights
+                for parameter in fc
+            )
+            assert all(
                 manager._plan is None and not manager.over_budget.item() for manager in managers
             )
             assert any((plan.experts_to_copy >= 0).any().item() for plan in plans)

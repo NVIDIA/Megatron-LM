@@ -366,6 +366,9 @@ attached to grouped linears that enter each original linear's precision context.
 remain outside the model's optimizer and checkpoint parameter sets. Finalization releases every
 layout's shared slots and registrations before the EP process group is destroyed.
 
+Runtime parameters receive fused wgrad writes through `main_grad` without allocating dummy leaf
+gradients; the semantic parameters retain their normal DDP gradient hooks.
+
 ### Upcycling
 Use `--moe-use-upcycling` to enable upcycling, which loads the dense model from the `--load` directory, converts it to an MoE model at runtime, and starts training. The converted model is saved to the `--save` path before training begins. Upcycling is built on distributed checkpointing, supporting parallel modes different from existing dense checkpoints, such as arbitrary expert parallelism during upcycling.
 
