@@ -26,6 +26,7 @@ from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols as Layer
 from megatron.core.models.hybrid.hybrid_stack_adapter import (
     HybridStackForwardAdapter,
     HybridStackForwardContext,
+    checkpointed_hybrid_forward,
 )
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -858,6 +859,12 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
                 attention_mask=attention_mask,
                 inference_context=inference_context,
                 packed_seq_params=packed_seq_params,
+                **(
+                    {"cross_layer_state": layer_kwargs["cross_layer_state"]}
+                    if getattr(self.inner_layer, "supports_cross_layer_state", False)
+                    and "cross_layer_state" in layer_kwargs
+                    else {}
+                ),
             )
 
         if isinstance(output, tuple):
@@ -1300,9 +1307,8 @@ class HybridStack(MegatronModule):
                 layer = HyperConnectionHybridLayer(config=self.config, layer=layer)
             self.layers.append(layer)
 
-        configure_graphs = getattr(self.forward_adapter, "configure_cuda_graphs", None)
-        if configure_graphs is not None:
-            configure_graphs(self.layers)
+        if self.forward_adapter is not None:
+            self.forward_adapter.configure_cuda_graphs(self.layers)
 
         if self.config.cuda_graph_impl == "local":
             annotate_first_last_layer(self.layers)
@@ -1447,14 +1453,7 @@ class HybridStack(MegatronModule):
     ) -> None:
         """Finalize MHC recompute state for the current layer when a block ends."""
         if mhc_manager is not None and is_last_in_recompute_block:
-            hook_tensors = (hidden_states,)
-            if (
-                forward_context.mhc_state is not None
-                and forward_context.mhc_state.pre_mix is not None
-            ):
-                hook_tensors += (forward_context.mhc_state.pre_mix,)
-            if self.forward_adapter is not None:
-                hook_tensors += self.forward_adapter.recompute_boundary_tensors(forward_context)
+            hook_tensors = (hidden_states, *forward_context.recompute_boundary_tensors())
             mhc_manager.discard_all_outputs_and_register_unified_recompute(hook_tensors)
 
     def forward(
@@ -1587,26 +1586,50 @@ class HybridStack(MegatronModule):
             use_mhc_recompute
         )
 
+        def layer_forward(layer, hidden, working_context, mhc_manager=None):
+            # Eager execution and full replay use the same layer contract. Custom
+            # non-Transformer layers opt in without widening every built-in layer.
+            kwargs = dict(
+                hidden_states=hidden,
+                attention_mask=attention_mask,
+                inference_context=inference_context,
+                packed_seq_params=packed_seq_params,
+            )
+            transformer_layer = isinstance(layer, (TransformerLayer, HyperConnectionHybridLayer))
+            if working_context.cross_layer_state is not None and (
+                transformer_layer or getattr(layer, "supports_cross_layer_state", False)
+            ):
+                kwargs["cross_layer_state"] = working_context.cross_layer_state
+            if transformer_layer:
+                kwargs.update(
+                    rotary_pos_emb=rotary_pos_emb,
+                    sequence_len_offset=sequence_len_offset,
+                    padding_mask=padding_mask,
+                )
+                if working_context.mhc_state is not None:
+                    kwargs["mhc_state"] = working_context.mhc_state
+                if input_ids is not None:
+                    kwargs["input_ids"] = input_ids
+                if mhc_manager is not None and isinstance(layer, HyperConnectionHybridLayer):
+                    kwargs["mhc_recompute_manager"] = mhc_manager
+            output = layer(**kwargs)
+            return output[0] if isinstance(output, tuple) else output
+
         with outer_fp8_context:
             if (
                 self.config.recompute_granularity == 'full'
                 and self.training
                 and torch.is_grad_enabled()
             ):
-                # Stateful adapters may own full replay; other stacks use the common loop.
-                adapter_checkpoint = getattr(self.forward_adapter, "checkpointed_forward", None)
-                if adapter_checkpoint is not None:
-                    hidden_states = adapter_checkpoint(
+                if self.forward_adapter is not None:
+                    hidden_states = checkpointed_hybrid_forward(
+                        self.config,
                         self.layers,
                         hidden_states,
                         forward_context,
                         tp_group=self.tp_group,
                         quantization_context=get_inner_quant_context,
-                        attention_mask=attention_mask,
-                        rotary_pos_emb=rotary_pos_emb,
-                        packed_seq_params=packed_seq_params,
-                        padding_mask=padding_mask,
-                        input_ids=input_ids,
+                        layer_forward=layer_forward,
                     )
                     mhc_state = forward_context.mhc_state
                 else:
@@ -1642,42 +1665,12 @@ class HybridStack(MegatronModule):
                         )
 
                     with inner_quant_context:
-                        if isinstance(layer, (TransformerLayer, HyperConnectionHybridLayer)):
-                            layer_kwargs = dict(
-                                hidden_states=hidden_states,
-                                attention_mask=attention_mask,
-                                inference_context=inference_context,
-                                rotary_pos_emb=rotary_pos_emb,
-                                sequence_len_offset=sequence_len_offset,
-                                packed_seq_params=packed_seq_params,
-                                padding_mask=padding_mask,
-                                **forward_context.layer_kwargs,
-                            )
-                            if mhc_state is not None:
-                                layer_kwargs["mhc_state"] = mhc_state
-                            if input_ids is not None:
-                                layer_kwargs["input_ids"] = input_ids
-                            if mhc_manager is not None and isinstance(
-                                layer, HyperConnectionHybridLayer
-                            ):
-                                layer_kwargs["mhc_recompute_manager"] = mhc_manager
-                            hidden_states, _ = layer(**layer_kwargs)
-                        else:  # MambaLayer, Expert, or MLP
-                            hidden_states = layer(
-                                hidden_states=hidden_states,
-                                attention_mask=attention_mask,
-                                inference_context=inference_context,
-                                packed_seq_params=packed_seq_params,
-                            )
+                        hidden_states = layer_forward(
+                            layer, hidden_states, forward_context, mhc_manager
+                        )
 
                     if isinstance(layer, HyperConnectionHybridLayer):
                         grouped_tail_to_skip = layer._get_active_te_cuda_graph_group_tail()
-
-                    # The attention layer (currently a simplified transformer layer)
-                    # outputs a tuple of (hidden_states, context). Context is intended
-                    # for cross-attention, and is not needed in our model.
-                    if isinstance(hidden_states, tuple):
-                        hidden_states = hidden_states[0]
 
                     self._finalize_mhc_recompute_layer(
                         mhc_manager=mhc_manager,

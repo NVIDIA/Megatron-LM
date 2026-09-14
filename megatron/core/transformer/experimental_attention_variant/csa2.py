@@ -10,7 +10,10 @@ Shared graph tensors belong to one stack forward and are passed explicitly; modu
 no activation state or inference caches.
 """
 
-from dataclasses import dataclass
+from __future__ import annotations
+
+from dataclasses import dataclass, replace
+from typing import TYPE_CHECKING, Any, Callable
 
 import torch
 import torch.nn.functional as F
@@ -88,6 +91,9 @@ from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 from megatron.core.utils import get_pg_size
 
+if TYPE_CHECKING:
+    from megatron.core.transformer.transformer_layer import RecomputeTensors
+
 
 @dataclass
 class CSA2State:
@@ -138,6 +144,42 @@ class CSA2State:
     # capture. A zero gradient on an unused hidden output must not inject aux loss.
     defer_indexer_loss: bool = False
     indexer_loss: torch.Tensor | None = None
+
+    def attention_kwargs(self) -> dict[str, Any]:
+        """Translate the generic layer contract into CSA2 attention's own argument."""
+        return {"csa2_state": self}
+
+    def recompute_boundary_tensors(self) -> tuple[torch.Tensor, ...]:
+        """Guard shared-K consumers even if the local attention output is unused."""
+        return tuple(tensor for tensor in (self.global_kv, self.indexer_k) if tensor is not None)
+
+    def save_for_recompute(
+        self,
+    ) -> tuple[RecomputeTensors, Callable[[RecomputeTensors], "CSA2State"]]:
+        """Checkpoint canonical floats and rebuild derived K views during replay."""
+        tensors = (self.global_kv, self.indexer_k, self.indexer_loss)
+        metadata = replace(
+            self,
+            global_kv=None,
+            indexer_k=None,
+            indexer_loss=None,
+            global_kv_flat=None,
+            indexer_k_flat=None,
+        )
+        # Preserve whether this boundary uses packed views without retaining the
+        # original views (which may have been built under checkpoint's no-grad).
+        packed_kv = self.global_kv_flat is not None or self.indexer_k_flat is not None
+
+        def restore(values: RecomputeTensors) -> "CSA2State":
+            global_kv, indexer_k, indexer_loss = values
+            state = replace(
+                metadata, global_kv=global_kv, indexer_k=indexer_k, indexer_loss=indexer_loss
+            )
+            if packed_kv:
+                state.prepare_fused_kv()
+            return state
+
+        return tensors, restore
 
     def prepare_fused_kv(self) -> None:
         """Pack canonical shared K once per owner or pipeline receiver, retaining its graph."""

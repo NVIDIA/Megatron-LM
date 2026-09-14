@@ -1926,7 +1926,10 @@ def test_cp_cuda_graph_static_shapes_and_group_validation(cp_size, cp_rank):
         )
         with pytest.raises(ValueError, match="different CP shard"):
             adapter.replay(
-                no_replay, values["hidden_states"], packed_seq_params=params, csa2_state=wrong_state
+                no_replay,
+                values["hidden_states"],
+                packed_seq_params=params,
+                cross_layer_state=wrong_state,
             )
 
 

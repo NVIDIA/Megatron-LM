@@ -6,11 +6,10 @@ import logging
 import warnings
 from abc import ABC
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Dict, Optional, Protocol, Union
+from typing import TYPE_CHECKING, Any, Callable, Dict, Optional, Protocol, Union
 
 if TYPE_CHECKING:
     from megatron.core.tensor_parallel.random import MHCCheckpointManager
-    from megatron.core.transformer.experimental_attention_variant.csa2 import CSA2State
     from megatron.core.transformer.hyper_connection import SinglePassMHCState
 
 import torch
@@ -220,6 +219,52 @@ def get_transformer_layer_offset(
     else:
         offset = 0
     return offset
+
+
+RecomputeTensors = tuple[Tensor | None, ...]
+
+
+class CrossLayerState(Protocol):
+    """Model-owned working state, passed explicitly rather than retained on modules.
+
+    A fresh instance belongs to each forward and each checkpoint invocation.
+    Producers and consumers define the data and its lifetime; the layer loop
+    only transports the state and protects its autograd boundaries. Custom
+    non-Transformer layers opt in with ``supports_cross_layer_state = True``
+    and accept the ``cross_layer_state`` keyword.
+
+    Pipeline serialization and CUDA Graph schemas remain model-specific: they
+    may carry a different subset of tensors than a local recompute boundary.
+    """
+
+    def attention_kwargs(self) -> dict[str, Any]:
+        """Return model-specific arguments for a TransformerLayer's self-attention.
+
+        The attention implementation must accept these arguments. Return an
+        empty dict when only custom layers consume this state.
+        """
+        ...
+
+    def recompute_boundary_tensors(self) -> tuple[Tensor, ...]:
+        """Snapshot live side outputs whose gradients may precede the local output.
+
+        Return tensor references now, not a callback that reads mutable state
+        during backward. Do not detach them: every consumer must reach its producer.
+        """
+        ...
+
+    def save_for_recompute(
+        self,
+    ) -> tuple[RecomputeTensors, Callable[[RecomputeTensors], CrossLayerState]]:
+        """Separate checkpoint tensors from a callable restoring fresh working state.
+
+        All differentiable state must be explicit tensor inputs/outputs. The
+        callable may capture immutable metadata, but must not retain the live
+        state or its floating activations. Rebuild derived views from the supplied
+        tensors so replay retains their new autograd edges. Each call must return
+        independent working state, including when several microbatches are live.
+        """
+        ...
 
 
 class MlpInterface(Protocol):
@@ -623,18 +668,14 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         return output
 
     def _discard_input_layernorm_checkpoint(
-        self, attention_output: Tensor, csa2_state: CSA2State | None
+        self, attention_output: Tensor, cross_layer_state: CrossLayerState | None
     ) -> None:
         """Restore a norm output before any of its independent consumers runs backward."""
         hook_tensors = (attention_output,)
-        if csa2_state is not None:
+        if cross_layer_state is not None:
             # Shared outputs can receive a gradient before the local attention
             # output, or without it. This applies to both Hybrid and GPT layers.
-            hook_tensors += tuple(
-                tensor
-                for tensor in (csa2_state.global_kv, csa2_state.indexer_k)
-                if tensor is not None
-            )
+            hook_tensors += cross_layer_state.recompute_boundary_tensors()
         self.input_layernorm_checkpoint.discard_output_and_register_recompute(hook_tensors)
 
     def _forward_self_attention_output_with_bias(
@@ -652,7 +693,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         mhc_recompute_manager: Optional['MHCCheckpointManager'] = None,
         *,
         inference_params: Optional[Any] = None,
-        csa2_state: CSA2State | None = None,
+        cross_layer_state: CrossLayerState | None = None,
     ):
         """Run input norm + self-attention and return the raw output before BDA."""
         inference_context = deprecate_inference_params(inference_context, inference_params)
@@ -705,12 +746,14 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             attention_bias=attention_bias,
             packed_seq_params=packed_seq_params,
             sequence_len_offset=sequence_len_offset,
-            **({"csa2_state": csa2_state} if csa2_state is not None else {}),
+            **(cross_layer_state.attention_kwargs() if cross_layer_state is not None else {}),
         )
         nvtx_range_pop(suffix="self_attention")
 
         if checkpoint_input_layernorm:
-            self._discard_input_layernorm_checkpoint(attention_output_with_bias[0], csa2_state)
+            self._discard_input_layernorm_checkpoint(
+                attention_output_with_bias[0], cross_layer_state
+            )
 
         return attention_output_with_bias, attn_norm_manager, residual
 
@@ -732,7 +775,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         input_ids: Optional[Tensor] = None,
         *,
         inference_params: Optional[Any] = None,
-        csa2_state: CSA2State | None = None,
+        cross_layer_state: CrossLayerState | None = None,
     ):
         """
         Perform a forward pass through the attention layer and the layernorms before and after
@@ -809,15 +852,15 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             attention_bias=attention_bias,
             packed_seq_params=packed_seq_params,
             sequence_len_offset=sequence_len_offset,
-            **({"csa2_state": csa2_state} if csa2_state is not None else {}),
+            **(cross_layer_state.attention_kwargs() if cross_layer_state is not None else {}),
         )
         nvtx_range_pop(suffix="self_attention")
 
         if self.recompute_input_layernorm:
             # discard the output of the input layernorm and register the recompute
             # as a gradient hook of attention_output_with_bias[0]
-            self.input_layernorm_checkpoint.discard_output_and_register_recompute(
-                attention_output_with_bias[0]
+            self._discard_input_layernorm_checkpoint(
+                attention_output_with_bias[0], cross_layer_state
             )
 
         # TODO: could we move `bias_dropout_add_exec_handler` itself
@@ -2364,7 +2407,7 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         mhc_recompute_manager: Optional['MHCCheckpointManager'] = None,
         *,
         inference_params: Optional[Any] = None,
-        csa2_state: CSA2State | None = None,
+        cross_layer_state: CrossLayerState | None = None,
         mhc_state: SinglePassMHCState | None = None,
     ):
         """Forward attention with hyper connection pre/post processing on self-attention."""
@@ -2410,12 +2453,14 @@ class HyperConnectionTransformerLayer(TransformerLayer):
             attention_bias=attention_bias,
             packed_seq_params=packed_seq_params,
             sequence_len_offset=sequence_len_offset,
-            **({"csa2_state": csa2_state} if csa2_state is not None else {}),
+            **(cross_layer_state.attention_kwargs() if cross_layer_state is not None else {}),
         )
         nvtx_range_pop(suffix="self_attention")
 
         if checkpoint_input_layernorm:
-            self._discard_input_layernorm_checkpoint(attention_output_with_bias[0], csa2_state)
+            self._discard_input_layernorm_checkpoint(
+                attention_output_with_bias[0], cross_layer_state
+            )
 
         nvtx_range_push(suffix="self_attention_fused_h_res_h_post_bda")
         with self.bias_dropout_add_exec_handler():

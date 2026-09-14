@@ -964,7 +964,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         ):
             from megatron.core.transformer.experimental_attention_variant.csa2 import CSA2State
 
-            shared_state_kwargs["csa2_state"] = CSA2State()
+            shared_state_kwargs["cross_layer_state"] = CSA2State()
         if self.config.mhc_single_pass:
             mhc_state = SinglePassMHCState()
             shared_state_kwargs["mhc_state"] = mhc_state
