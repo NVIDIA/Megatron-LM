@@ -33,7 +33,7 @@ sys.path.insert(
 )
 
 from examples.multimodal_dev.arguments import add_multimodal_args
-from examples.multimodal_dev.forward_step import forward_step
+from examples.multimodal_dev.forward_step import forward_step, seqlen_alignment_factor
 from megatron.core.enums import ModelType
 from megatron.training import get_args, pretrain
 from megatron.training.argument_utils import pretrain_cfg_container_from_args
@@ -68,6 +68,22 @@ def model_provider(
 
     # --- language config (generic + model-specific post-processing) ---
     language_config = core_transformer_config_from_args(args)
+    if getattr(args, "use_packed_sequence", False) and args.pipeline_model_parallel_size > 1:
+        # THD activation length varies per microbatch, so the pipeline
+        # scheduler must negotiate shapes at each send/recv instead of sizing
+        # its P2P buffers from --seq-length.  Assigned after
+        # TransformerConfig.__post_init__, hence the repeated dispatcher check.
+        language_config.variable_seq_lengths = True
+        if (
+            language_config.num_moe_experts is not None
+            and language_config.moe_token_dispatcher_type == "allgather"
+        ):
+            raise ValueError(
+                "--use-packed-sequence with pipeline_model_parallel_size > 1 "
+                "requires an alltoall MoE token dispatcher; the allgather "
+                "dispatcher does not support the variable sequence lengths "
+                "the pipeline scheduler needs to negotiate THD shapes."
+            )
     post_language_config_fn = registry.get("post_language_config_fn")
     if post_language_config_fn is not None:
         post_language_config_fn(language_config, args)
@@ -96,6 +112,8 @@ def model_provider(
         args=args,
         language_config=language_config,
         vision_config=vision_config,
+        pre_process=pre_process,
+        post_process=post_process,
         **kwargs,
     )
 
@@ -112,12 +130,15 @@ def _resolve_provider_fn(provider_fn):
     return provider_fn
 
 
-def datasets_provider(train_val_test_num_samples):
+def datasets_provider(train_val_test_num_samples, vp_stage=None):
     """Dataset provider dispatcher.
 
     Routes to the dataset factory registered for the current
-    ``(--model-arch, --dataset-provider)`` combination.
+    ``(--model-arch, --dataset-provider)`` combination. ``vp_stage`` is
+    accepted for the virtual-pipeline dataset-provider contract; the
+    registered datasets are stage-independent.
     """
+    del vp_stage
     args = get_args()
     model_arch = getattr(args, "model_arch", "qwen35_vl")
     provider = getattr(args, "dataset_provider", "mock")
@@ -150,16 +171,25 @@ if __name__ == "__main__":
         extra_args_provider=add_multimodal_args,
         args_defaults={},
     )
-    # multimodal_dev's model_provider builds the full model on every rank and
-    # does not honor pre_process / post_process pipeline-stage flags. PP>1
-    # would silently violate Megatron's pipeline-parallel contract.
-    if args.pipeline_model_parallel_size > 1:
-        raise ValueError(
-            "multimodal_dev does not support pipeline_model_parallel_size > 1 "
-            f"(got {args.pipeline_model_parallel_size}). The model provider "
-            "builds the full model on every rank; pipeline-stage splitting is "
-            "not wired through. Run with --pipeline-model-parallel-size 1."
+    if args.pipeline_model_parallel_size > 1 and not args.use_packed_sequence:
+        # The BSHD collate pads to --seq-length and rounds *up* to the CP/SP
+        # alignment factor, while the pipeline scheduler sizes its static P2P
+        # buffers from --seq-length with floor division.  An unaligned
+        # --seq-length would make the two disagree and hang at the first
+        # cross-stage send.  The packed/THD path is exempt: it sets
+        # ``variable_seq_lengths`` and negotiates shapes instead.
+        alignment = seqlen_alignment_factor(
+            args.tensor_model_parallel_size,
+            args.context_parallel_size,
+            args.sequence_parallel,
         )
+        if args.seq_length % alignment != 0:
+            raise ValueError(
+                f"--seq-length ({args.seq_length}) must be divisible by {alignment} "
+                f"when pipeline_model_parallel_size > 1: the pipeline scheduler "
+                f"sizes its static P2P buffers with floor division, so the padded "
+                f"activation length would not match them."
+            )
     full_config = pretrain_cfg_container_from_args(args)
     # training.py enables allocator history only on the config-container MODEL
     # flow; this entry uses model_provider, so it enables recording itself, and
