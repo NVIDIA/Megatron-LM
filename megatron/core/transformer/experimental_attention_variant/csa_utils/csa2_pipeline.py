@@ -47,7 +47,8 @@ class CSA2PipelineBoundary:
     for SBHD and [T, K] for THD. Candidate block IDs/counts use the same leading
     dimensions as top-k, but retain sequence-local block coordinates. THD prefixes
     preserve logical lengths and physical starts separately. Derived flat K and
-    fused attention indices never appear in the schema.
+    fused attention indices never appear in the schema. With CP, S/T and selection
+    rows are local, while compressed K rows and packed prefixes remain global.
     """
 
     layer_offset: int
@@ -93,6 +94,7 @@ class CSA2PipelineBoundary:
         packed_seq_params: PackedSeqParams | None = None,
         *,
         requires_grad: bool = True,
+        cp_group: torch.distributed.ProcessGroup | None = None,
     ) -> PipelinePayloadSpec:
         """Derive exact wire capacities from host metadata and the static boundary.
 
@@ -108,6 +110,15 @@ class CSA2PipelineBoundary:
         ):
             raise ValueError("CSA2 pipeline requires valid host token/batch capacities")
         packed = packed_seq_params is not None and packed_seq_params.qkv_format == "thd"
+        if packed and packed_seq_params.cp_group is not None:
+            cp_group = packed_seq_params.cp_group
+        if config.context_parallel_size > 1 and cp_group is None:
+            raise ValueError("CSA2 CP pipeline planning requires an explicit CP group")
+        cp_size, cp_rank = (cp_group.size(), cp_group.rank()) if cp_group is not None else (1, 0)
+        if cp_size > 1 and (not packed or packed_seq_params.cp_partition_mode != "contiguous"):
+            raise ValueError("CSA2 CP pipeline requires contiguous THD metadata")
+        if packed and packed_seq_params.local_cp_size not in (None, cp_size):
+            raise ValueError("CSA2 pipeline local_cp_size must match its CP group")
         if packed != (self.qkv_format == "thd"):
             raise ValueError("CSA2 pipeline batch layout disagrees with its boundary")
         prefixes = {}
@@ -136,7 +147,7 @@ class CSA2PipelineBoundary:
         def compressed_capacity(ratio):
             if packed:
                 return get_thd_compressed_capacity(
-                    seq_length, max_seqlen, logical.numel() - 1, ratio
+                    seq_length * cp_size, max_seqlen, logical.numel() - 1, ratio
                 )
             return seq_length // ratio
 
@@ -190,7 +201,7 @@ class CSA2PipelineBoundary:
             fields[name] = (tuple(prefix.shape), prefix.dtype, False)
         return PipelinePayloadSpec(
             tuple(PipelineTensorSpec(name, *fields[name]) for name in self.field_names),
-            (self.layer_offset, max_seqlen),
+            (self.layer_offset, max_seqlen) + ((cp_size, cp_rank) if cp_size > 1 else ()),
         )
 
     def export_payload(
@@ -200,6 +211,7 @@ class CSA2PipelineBoundary:
         mhc_state: SinglePassMHCState | None,
         *,
         packed_seq_params: PackedSeqParams | None = None,
+        cp_group: torch.distributed.ProcessGroup | None = None,
     ) -> "CSA2PipelinePayload":
         """Snapshot live tensor references without copying or detaching floating tensors."""
         if csa2_state.last_layer != self.last_attention_layer:
@@ -225,24 +237,28 @@ class CSA2PipelineBoundary:
             values["candidate_indices"] = candidates.indices
             values["candidate_lengths"] = candidates.lengths
         max_seqlen = None
+        cp_size, cp_rank = 1, 0
         if self.qkv_format == "thd":
             layout = csa2_state.thd_layout
             if layout is None:
                 if packed_seq_params is None:
                     raise ValueError("CSA2 THD pipeline payload requires packed sequence metadata")
-                layout = build_csa2_thd_layout(packed_seq_params, hidden_states.shape[0])
+                layout = build_csa2_thd_layout(
+                    packed_seq_params, hidden_states.shape[0], cp_group=cp_group
+                )
             elif packed_seq_params is not None:
-                layout.validate_compatible(packed_seq_params, hidden_states.shape[0])
+                layout.validate_compatible(packed_seq_params, hidden_states.shape[0], cp_group)
             # These prefixes are already independent snapshots of the batch input buffers.
             values["cu_seqlens"] = layout.cu_seqlens
             values["cu_seqlens_padded"] = layout.cu_seqlens_padded
             max_seqlen = layout.max_seqlen
+            cp_size, cp_rank = layout.cp_size, layout.cp_rank
         elif csa2_state.thd_layout is not None or (
             packed_seq_params is not None and packed_seq_params.qkv_format == "thd"
         ):
             raise ValueError("CSA2 pipeline plan expects SBHD, not THD")
         payload = CSA2PipelinePayload(
-            self, tuple(values.get(n) for n in self.field_names), max_seqlen
+            self, tuple(values.get(n) for n in self.field_names), max_seqlen, cp_size, cp_rank
         )
         payload.validate()
         return payload
@@ -373,14 +389,31 @@ class CSA2PipelinePayload(PipelinePayload):
     boundary: CSA2PipelineBoundary
     tensors: tuple[torch.Tensor, ...]
     max_seqlen: int | None = None
+    cp_size: int = 1
+    cp_rank: int = 0
 
     @property
-    def metadata(self) -> tuple[int, int]:
-        """Identify the cut and packed layout; all other boundary fields are static."""
-        return self.boundary.layer_offset, -1 if self.max_seqlen is None else self.max_seqlen
+    def metadata(self) -> tuple[int, ...]:
+        """Identify the cut, packed layout and CP shard without serializing process groups."""
+        metadata = self.boundary.layer_offset, -1 if self.max_seqlen is None else self.max_seqlen
+        return metadata + ((self.cp_size, self.cp_rank) if self.cp_size > 1 else ())
+
+    def validate_cp_group(self, cp_group: torch.distributed.ProcessGroup | None) -> None:
+        """PP peers must own the same CP coordinates in their respective local groups."""
+        coordinates = (cp_group.size(), cp_group.rank()) if cp_group is not None else (1, 0)
+        if coordinates != (self.cp_size, self.cp_rank):
+            raise ValueError("CSA2 pipeline payload CP shard does not match the receiving CP group")
 
     def validate(self) -> None:
         """Check field count, shapes, types and device without device-to-host reads."""
+        if (
+            type(self.cp_size) is not int
+            or type(self.cp_rank) is not int
+            or self.cp_size < 1
+            or not 0 <= self.cp_rank < self.cp_size
+            or (self.cp_size > 1 and self.boundary.qkv_format != "thd")
+        ):
+            raise ValueError("CSA2 pipeline payload has invalid CP metadata")
         names = self.boundary.field_names
         if len(self.tensors) != len(names) or any(
             not isinstance(t, torch.Tensor) for t in self.tensors
@@ -457,7 +490,10 @@ class CSA2PipelinePayload(PipelinePayload):
         )
 
     def restore(
-        self, *, use_fused_kernels: bool = False
+        self,
+        *,
+        use_fused_kernels: bool = False,
+        cp_group: torch.distributed.ProcessGroup | None = None,
     ) -> tuple[torch.Tensor, "CSA2State", SinglePassMHCState | None, PackedSeqParams | None]:
         """Create fresh working states and rebuild physical THD/flat-K caches locally.
 
@@ -467,6 +503,7 @@ class CSA2PipelinePayload(PipelinePayload):
         from megatron.core.transformer.experimental_attention_variant.csa2 import CSA2State
 
         self.validate()
+        self.validate_cp_group(cp_group)
         values = dict(zip(self.boundary.field_names, self.tensors))
         hidden = values["hidden_states"]
         b = self.boundary
@@ -481,8 +518,11 @@ class CSA2PipelinePayload(PipelinePayload):
                 max_seqlen_q=self.max_seqlen,
                 max_seqlen_kv=self.max_seqlen,
                 pad_between_seqs=True,
+                cp_partition_mode="contiguous" if self.cp_size > 1 else "zigzag",
+                local_cp_size=self.cp_size if self.cp_size > 1 else None,
+                cp_group=cp_group if self.cp_size > 1 else None,
             )
-            layout = build_csa2_thd_layout(params, hidden.shape[0])
+            layout = build_csa2_thd_layout(params, hidden.shape[0], cp_group=cp_group)
             if b.compress_ratio is not None:
                 compressed = layout.for_compression(b.compress_ratio)
                 if values["global_kv"].shape[0] != compressed.capacity:

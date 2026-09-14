@@ -4473,9 +4473,8 @@ class TransformerConfig(ModelParallelConfig):
 
     def _validate_dsv41_config(self) -> None:
         """Validate V4.1 training relationships and supported kernels on the DSv4 path."""
-        for name in ("tensor_model_parallel_size", "context_parallel_size"):
-            if getattr(self, name) != 1:
-                raise ValueError(f"Native V4.1 currently requires {name}=1")
+        if self.tensor_model_parallel_size != 1:
+            raise ValueError("Native V4.1 currently requires tensor_model_parallel_size=1")
         if self.sequence_parallel:
             raise ValueError("Native V4.1 does not yet support sequence parallelism")
         if self.pipeline_model_parallel_size > 1:
@@ -4700,9 +4699,12 @@ class TransformerConfig(ModelParallelConfig):
             raise ValueError(
                 "mhc_single_pass requires pipeline_model_parallel_size=1 outside V4.1 Hybrid"
             )
-        for name in ("tensor_model_parallel_size", "context_parallel_size"):
-            if getattr(self, name) != 1:
-                raise ValueError(f"mhc_single_pass requires {name}=1")
+        if self.tensor_model_parallel_size != 1:
+            raise ValueError("mhc_single_pass requires tensor_model_parallel_size=1")
+        if self.context_parallel_size != 1 and not (
+            self.experimental_attention_variant == "dsv4_hybrid" and self.dsv4_version == "v4.1"
+        ):
+            raise ValueError("mhc_single_pass requires context_parallel_size=1 outside V4.1 Hybrid")
         if self.virtual_pipeline_model_parallel_size is not None and not (
             self.experimental_attention_variant == "dsv4_hybrid" and self.dsv4_version == "v4.1"
         ):

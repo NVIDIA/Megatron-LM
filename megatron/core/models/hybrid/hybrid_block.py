@@ -1160,6 +1160,7 @@ class HybridStack(MegatronModule):
                 pre_process=pre_process,
                 post_process=post_process,
                 is_mtp_layer=is_mtp_layer,
+                pg_collection=pg_collection,
             )
 
         if getattr(self.config, "mla_down_proj_fusion", False):

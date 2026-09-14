@@ -18,6 +18,7 @@ from megatron.core.pipeline_parallel.pipeline_payload import (
     PipelinePayloadFactory,
     PipelinePayloadSpec,
 )
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.experimental_attention_variant.csa2 import CSA2State
 from megatron.core.transformer.experimental_attention_variant.csa_utils.csa2_cuda_graph import (
     CSA2CudaGraphAdapter,
@@ -51,6 +52,7 @@ class CSA2HybridAdapter:
         pre_process: bool,
         post_process: bool,
         is_mtp_layer: bool,
+        pg_collection: ProcessGroupCollection | None = None,
     ) -> None:
         if (
             config.experimental_attention_variant != "dsv4_hybrid"
@@ -63,6 +65,7 @@ class CSA2HybridAdapter:
         self.layer_offset = pp_layer_offset
         self.pre_process = pre_process
         self.post_process = post_process
+        self.cp_group = None if pg_collection is None else pg_collection.cp
         self._pipeline_chunk: CSA2PipelineChunk | None = None
         self._pipeline_chunks: dict[str, CSA2PipelineChunk] = {}
 
@@ -72,7 +75,10 @@ class CSA2HybridAdapter:
             return
         for layer, symbol in zip(layers, self.layer_pattern):
             layer._te_cuda_graph_adapter = CSA2CudaGraphAdapter(
-                self.config, layer_number=layer.layer_number, is_attention=symbol in ("D", "W")
+                self.config,
+                layer_number=layer.layer_number,
+                is_attention=symbol in ("D", "W"),
+                cp_group=self.cp_group,
             )
 
     def configure_pipeline(self, chunk: CSA2PipelineChunk) -> None:
@@ -114,17 +120,21 @@ class CSA2HybridAdapter:
         return self.make_pipeline_payload
 
     def make_pipeline_payload(
-        self, tensors: tuple[Tensor, ...], metadata: tuple[int, int]
+        self, tensors: tuple[Tensor, ...], metadata: tuple[int, ...]
     ) -> CSA2PipelinePayload:
         """Reconstruct a received input using this adapter's existing boundary plan."""
-        offset, max_seqlen = metadata
+        if len(metadata) not in (2, 4):
+            raise ValueError("CSA2 message has invalid pipeline metadata")
+        offset, max_seqlen = metadata[:2]
+        cp_size, cp_rank = metadata[2:] if len(metadata) == 4 else (1, 0)
         chunk = self._pipeline_chunks.get("sbhd" if max_seqlen == -1 else "thd")
         if chunk is None or chunk.incoming is None or chunk.incoming.layer_offset != offset:
             raise ValueError("CSA2 message does not match the incoming pipeline boundary")
         payload = CSA2PipelinePayload(
-            chunk.incoming, tensors, None if max_seqlen == -1 else max_seqlen
+            chunk.incoming, tensors, None if max_seqlen == -1 else max_seqlen, cp_size, cp_rank
         )
         payload.validate()
+        payload.validate_cp_group(self.cp_group)
         return payload
 
     def pipeline_payload_spec(
@@ -150,6 +160,7 @@ class CSA2HybridAdapter:
                     micro_batch_size,
                     packed_seq_params,
                     requires_grad=requires_grad,
+                    cp_group=self.cp_group,
                 )
                 if boundary is not None
                 else None
@@ -194,12 +205,12 @@ class CSA2HybridAdapter:
                 raise ValueError("CSA2 receiving chunk requires a payload from set_input_tensor()")
             self.validate_input(hidden_states)
             hidden_states, csa2_state, mhc_state, restored_params = hidden_states.restore(
-                use_fused_kernels=use_fused_dsa_kernels(self.config)
+                use_fused_kernels=use_fused_dsa_kernels(self.config), cp_group=self.cp_group
             )
             if packed_seq_params is not None:
                 if csa2_state.thd_layout is not None:
                     csa2_state.thd_layout.validate_compatible(
-                        packed_seq_params, hidden_states.shape[0]
+                        packed_seq_params, hidden_states.shape[0], self.cp_group
                     )
                 elif packed_seq_params.qkv_format == "thd":
                     raise ValueError("CSA2 pipeline payload expects SBHD, not THD")
@@ -233,6 +244,7 @@ class CSA2HybridAdapter:
                 context.layer_kwargs["csa2_state"],
                 context.mhc_state,
                 packed_seq_params=packed_seq_params,
+                cp_group=self.cp_group,
             )
         return output
 

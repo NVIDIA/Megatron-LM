@@ -338,6 +338,7 @@ def fused_candidate_blocks(
 
     fused_sparse_attention._ensure_dsa_namespace()
     cu_q, cu_k, max_q, score_max_k = inputs.packed_metadata
+    causal_offsets = inputs.packed_causal_offsets
     # Account for cuDNN's four-float row alignment. Even a single very long
     # row needs its own score buffer; otherwise cap the chunk at 32 MiB.
     row_bytes = ((score_max_k + 3) // 4 * 4) * 4
@@ -374,7 +375,7 @@ def fused_candidate_blocks(
     for start in range(0, q.shape[0], chunk_size):
         end = min(start + chunk_size, q.shape[0])
         chunk_cu_q = (cu_q.clamp(min=start, max=end) - start).contiguous()
-        offsets = (start - cu_q[:-1]).clamp_min(0).contiguous()
+        offsets = (causal_offsets + (start - cu_q[:-1]).clamp_min(0)).contiguous()
         kernel_q = q[start:end]
         kernel_w = scaled_weights[start:end]
         if precision == "mxfp8":

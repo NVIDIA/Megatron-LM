@@ -24,6 +24,9 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.attention import Attention
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.experimental_attention_variant.csa_utils import cp_utils
+from megatron.core.transformer.experimental_attention_variant.csa_utils.thd_utils import (
+    build_csa2_thd_layout,
+)
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_config import MLATransformerConfig
@@ -264,19 +267,29 @@ class DSv4HybridAttention(Attention):
         # Restore the static group before returning.
         _orig_cp_group = self.pg_collection.cp
         cp_group = _orig_cp_group
-        if packed_seq_params is not None and packed_seq_params.local_cp_size is not None:
+        if packed_seq_params is not None and (
+            packed_seq_params.local_cp_size is not None
+            or (self.config.dsv4_version == "v4.1" and packed_seq_params.cp_group is not None)
+        ):
             assert packed_seq_params.cp_group is not None, "cp_group must be set in dynamic-cp mode"
             cp_group = packed_seq_params.cp_group
 
         cp_size = cp_group.size()
         qkv_format = packed_seq_params.qkv_format if packed_seq_params is not None else None
-        if self.config.dsv4_version == "v4.1" and cp_size != 1:
-            raise NotImplementedError("Native CSA2 currently requires CP=1.")
         if cp_size > 1 and qkv_format != 'thd':
             raise ValueError("DSv4 Hybrid with CP requires qkv_format='thd'.")
         use_thd_cp = cp_size > 1 and qkv_format == 'thd'
         if use_thd_cp and packed_seq_params.cp_partition_mode != "contiguous":
             raise ValueError("DSv4 THD CP requires a contiguous CP partition.")
+
+        thd_layout = None
+        if use_thd_cp and self.config.dsv4_version == "v4.1":
+            thd_layout = build_csa2_thd_layout(
+                packed_seq_params, hidden_states.shape[0], cp_group=cp_group
+            )
+            # Clear logical padding before projections and boundary exchange;
+            # masking projected outputs alone can leave NaN weight gradients.
+            hidden_states = hidden_states.masked_fill(~thd_layout.valid_tokens[:, None, None], 0)
 
         self.pg_collection.cp = cp_group
 
@@ -332,6 +345,7 @@ class DSv4HybridAttention(Attention):
                 boundary_hidden=boundary_hidden,
                 boundary_kv=boundary_kv,
                 **({"csa2_state": csa2_state} if csa2_state is not None else {}),
+                **({"thd_layout": thd_layout} if thd_layout is not None else {}),
             )
         forced_released_tensors = [query, key, value]
         if boundary_kv is not None:
@@ -772,7 +786,10 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
             cp_size = cp_group.size()
             if skip_csa2_rope:
                 query = q
-                key = value = kv.unsqueeze(-2)
+                kv = kv.unsqueeze(-2)
+                if boundary_kv_compressed is not None:
+                    boundary_kv, kv = kv[:boundary_rows], kv[boundary_rows:]
+                key = value = kv
             elif self.config.apply_rope_fusion:
                 if cp_size > 1 and packed_seq:
                     cp_rank = cp_group.rank()
@@ -788,6 +805,9 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
                         global_start,
                     )
                     kv = kv.unsqueeze(-2)
+                    if self.config.dsv4_version == "v4.1":
+                        # Learned KV RMSNorm backward retains the pre-RoPE output.
+                        kv = kv.clone()
                     kv = cp_utils.apply_thd_cp_local_rope_fused(
                         kv,
                         rotary_pos_cos,

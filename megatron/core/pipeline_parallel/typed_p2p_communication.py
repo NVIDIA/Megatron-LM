@@ -25,16 +25,18 @@ from megatron.core.pipeline_parallel.pipeline_payload import (
 )
 from megatron.core.utils import nvtx_decorator
 
-# CSA2 needs at most nine fields, three dimensions, and two host metadata integers.
+# CSA2 needs at most nine fields, three dimensions, and four host metadata integers.
 _MAX_FIELDS, _MAX_NDIM = 9, 3
-_HEADER_SIZE = 5 + _MAX_FIELDS * (3 + _MAX_NDIM)
+# Keep the field offsets fixed; the tail stores metadata count and two optional integers.
+_HEADER_SIZE = 5 + _MAX_FIELDS * (3 + _MAX_NDIM) + 3
 _DTYPES = (torch.float32, torch.bfloat16, torch.float16, torch.float64, torch.int32, torch.int64)
 
 
 def _pack_header(specs, metadata, microbatch, chunk_id=0):
-    if not 0 < len(specs) <= _MAX_FIELDS or len(metadata) != 2:
+    if not 0 < len(specs) <= _MAX_FIELDS or len(metadata) not in (2, 4):
         raise ValueError("Invalid typed pipeline field/metadata count")
-    values = [microbatch, len(specs), *metadata, chunk_id] + [0] * (_HEADER_SIZE - 5)
+    values = [microbatch, len(specs), *metadata[:2], chunk_id] + [0] * (_HEADER_SIZE - 5)
+    values[-3:] = [len(metadata), *(metadata[2:] if len(metadata) == 4 else (0, 0))]
     for i, spec in enumerate(specs):
         if (
             len(spec.shape) > _MAX_NDIM
@@ -54,6 +56,8 @@ def _pack_header(specs, metadata, microbatch, chunk_id=0):
 
 
 def _unpack_header(values, microbatch, chunk_id=0):
+    if len(values) != _HEADER_SIZE or values[-3] not in (2, 4):
+        raise ValueError("Invalid typed pipeline header or metadata count")
     if values[0] != microbatch or values[4] != chunk_id or not 0 < values[1] <= _MAX_FIELDS:
         raise ValueError(
             "Typed pipeline microbatch mismatch, chunk mismatch or invalid field count"
@@ -69,7 +73,7 @@ def _unpack_header(values, microbatch, chunk_id=0):
                 str(i), tuple(values[start + 3 : start + 3 + ndim]), _DTYPES[dtype], bool(grad)
             )
         )
-    metadata = (values[2], values[3])
+    metadata = (values[2], values[3]) + (tuple(values[-2:]) if values[-3] == 4 else ())
     _pack_header(specs, metadata, microbatch, chunk_id)  # Validate signs and gradient dtypes too.
     return tuple(specs), metadata
 

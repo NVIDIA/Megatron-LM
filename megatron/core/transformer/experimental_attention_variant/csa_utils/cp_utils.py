@@ -217,6 +217,14 @@ def exchange_cp_boundary_hidden(
 # =============================================================================
 
 
+def get_cp_compressor_capacity(local_rows: int, ratio: int) -> int:
+    """Return DSv4's aligned per-rank compression capacity without reading device lengths."""
+    d_comp = 8 if ratio == 4 else ratio
+    group_alignment = 32 // math.gcd(32, ratio)
+    capacity = max(1, (local_rows + d_comp) // ratio)
+    return (capacity + group_alignment - 1) // group_alignment * group_alignment
+
+
 def prepare_cp_compressor_input(
     hidden_local: torch.Tensor,
     boundary_hidden: torch.Tensor,
@@ -252,9 +260,7 @@ def prepare_cp_compressor_input(
     d_comp = 8 if ratio == 4 else ratio
     global_start = int(global_start)
     l_local = hidden_local.shape[0]
-    group_alignment = 32 // math.gcd(32, ratio)
-    c_cap = max(1, (l_local + d_comp) // ratio)
-    c_cap = ((c_cap + group_alignment - 1) // group_alignment) * group_alignment
+    c_cap = get_cp_compressor_capacity(l_local, ratio)
     return thd_layout_kernels.CompressorInputCompact.apply(
         hidden_local, boundary_hidden, cu_seqlens, global_start, ratio, d_comp, c_cap, cp_size
     )

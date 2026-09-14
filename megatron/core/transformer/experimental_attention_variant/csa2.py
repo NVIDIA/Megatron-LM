@@ -16,23 +16,33 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from megatron.core.fusions.fused_mla_yarn_rope_apply import fused_mla_rope_inplace
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.tensor_parallel.mappings import async_gather_from_sequence_parallel_region
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.experimental_attention_variant.csa import (
     CompressedSparseAttentionSubmodules,
     CompressorSubmodules,
     _apply_rope,
+    _apply_unfused_rope,
     _compute_unfused_csa_non_compressed_lse,
     get_window_topk_idxs,
     get_window_topk_idxs_thd,
     unfused_compressed_sparse_attn,
 )
-from megatron.core.transformer.experimental_attention_variant.csa_utils import thd_layout_kernels
+from megatron.core.transformer.experimental_attention_variant.csa_utils import (
+    cp_utils,
+    thd_layout_kernels,
+)
 from megatron.core.transformer.experimental_attention_variant.csa_utils.csa2_candidates import (
     CSA2CandidateBlocks,
     candidate_blocks_from_scores,
     fused_candidate_blocks,
+)
+from megatron.core.transformer.experimental_attention_variant.csa_utils.csa2_context_parallel import (
+    CSA2CPCompressionLayout,
+    build_csa2_cp_compression_layout,
 )
 from megatron.core.transformer.experimental_attention_variant.csa_utils.csa2_indexer import (
     CSA2IndexerInputs,
@@ -63,6 +73,7 @@ from megatron.core.transformer.experimental_attention_variant.csa_utils.thd_util
     CSA2THDCompressionLayout,
     CSA2THDLayout,
     build_csa2_thd_layout,
+    get_thd_token_metadata,
 )
 from megatron.core.transformer.experimental_attention_variant.dsa import (
     DSAIndexerLossAutoScaler,
@@ -80,7 +91,7 @@ from megatron.core.utils import get_pg_size
 
 @dataclass
 class CSA2State:
-    """Shared attention tensors for one full-sequence stack forward.
+    """Shared attention tensors for one stack forward.
 
     Source layer IDs are zero-based, matching the configuration. ``global_indices`` uses
     compressed positions (per-batch for SBHD, physical packed rows for THD, and -1 for
@@ -89,6 +100,8 @@ class CSA2State:
     Float tensors retain their autograd graph,
     so every consumer contributes to its Full owner's gradient. Create a fresh state for each
     forward, including when another microbatch's backward is still outstanding.
+    Under CP, queries and selections stay local while canonical shared K spans
+    all ranks; its gather edge receives every local consumer's gradient.
 
     The fused path packs global/indexer K once per Full owner. ``fused_indices``
     contains compact physical addresses for batch-major local+global KV, with
@@ -105,7 +118,8 @@ class CSA2State:
     fused_topk_length: torch.Tensor | None = None
     fused_q_padding_mask: torch.Tensor | None = None
     fused_window_size: int | None = None
-    # Packed windows depend only on the layout and window size, so Full/Reindex
+    fused_halo_size: int = 0
+    # Packed windows depend on the layout, window and halo sizes, so Full/Reindex
     # sources can share this optional loss buffer independently of their Top-K.
     fused_window_indices: torch.Tensor | None = None
     global_indices: torch.Tensor | None = None
@@ -189,9 +203,10 @@ def apply_csa2_thd_rope(
     Masking before rotation also gives fused RoPE private storage, so the main and
     indexer branches cannot overwrite their shared pre-RoPE latent.
     """
-    if get_pg_size(cp_group) != 1:
-        raise NotImplementedError("CSA2 THD RoPE currently requires CP=1.")
     compressed = isinstance(layout, CSA2THDCompressionLayout)
+    layout_cp_size = layout.cp_size
+    if (cp_group.size() if cp_group is not None else 1) != layout_cp_size:
+        raise ValueError("CSA2 THD RoPE group must match its row layout")
     valid = layout.valid_groups if compressed else layout.valid_tokens
     if x.ndim not in (3, 4) or x.shape[0] != valid.shape[0] or (x.ndim == 4 and x.shape[1] != 1):
         raise ValueError("CSA2 THD RoPE expects one row per token or compressed capacity slot.")
@@ -205,6 +220,70 @@ def apply_csa2_thd_rope(
         return x
     ratio = layout.ratio if compressed else 1
     pos_dim = config.qk_pos_emb_head_dim
+    if layout_cp_size > 1:
+        if cp_group.rank() != layout.cp_rank:
+            raise ValueError("CSA2 THD RoPE rank must match its row layout")
+        if compressed:
+            # Like DSv4's pre-grouped compressor, use original sequence positions;
+            # local compact prefixes alone cannot describe a group crossing a CP cut.
+            length = layout.max_seqlen * ratio
+            if config.apply_rope_fusion:
+                cos, sin = rotary_pos_emb.get_cached_cos_sin(
+                    length, dtype=x.dtype, packed_seq=True, mscale=1.0
+                )
+                output = fused_mla_rope_inplace(
+                    x.squeeze(1) if x.ndim == 4 else x,
+                    cos,
+                    sin,
+                    x.shape[-1] - pos_dim,
+                    pos_dim,
+                    cu_seqlens_q=layout.cu_seqlens_padded,
+                    remove_interleaving=True,
+                    position_ids=layout.position_ids,
+                )
+                if x.ndim == 4:
+                    output = output.unsqueeze(1)
+            else:
+                freqs = rotary_pos_emb(length, packed_seq=True)
+                if isinstance(freqs, tuple):
+                    freqs = freqs[0]
+                output = _apply_unfused_rope(
+                    x,
+                    freqs.index_select(0, layout.position_ids),
+                    x.shape[-1] - pos_dim,
+                    pos_dim,
+                    config,
+                    None,
+                    cp_group,
+                )
+            return output.masked_fill(mask, 0)
+        if config.apply_rope_fusion:
+            cos, sin = rotary_pos_emb.get_cached_cos_sin(
+                layout.max_seqlen, dtype=x.dtype, packed_seq=True, mscale=1.0
+            )
+            output = cp_utils.apply_thd_cp_local_rope_fused(
+                x,
+                cos,
+                sin,
+                x.shape[-1] - pos_dim,
+                pos_dim,
+                layout.cu_seqlens_padded,
+                layout.global_start,
+            )
+        else:
+            freqs = rotary_pos_emb(layout.max_seqlen, packed_seq=True)
+            if isinstance(freqs, tuple):
+                freqs = freqs[0]
+            output = cp_utils.apply_thd_cp_local_rope_unfused(
+                x,
+                freqs,
+                x.shape[-1] - pos_dim,
+                pos_dim,
+                layout.cu_seqlens_padded,
+                layout.global_start,
+                config,
+            )
+        return output.masked_fill(mask, 0)
     output = _apply_rope(
         x,
         nope_dim=x.shape[-1] - pos_dim,
@@ -331,7 +410,8 @@ class CSA2Compressor(MegatronModule):
         *,
         thd_layout: CSA2THDLayout | None = None,
         input_is_sanitized: bool = False,
-    ) -> torch.Tensor | tuple[torch.Tensor, CSA2THDCompressionLayout]:
+        boundary_hidden: torch.Tensor | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, CSA2THDCompressionLayout | CSA2CPCompressionLayout]:
         """Compress SBHD input or return THD latents with their physical layout.
 
         Packed inputs keep the usual ``[total_tokens, 1, hidden]`` shape. Their
@@ -341,6 +421,8 @@ class CSA2Compressor(MegatronModule):
         ``input_is_sanitized`` lets attention reuse its already cleaned, finite
         hidden buffer for projection. Standalone callers leave it false so
         unused tokens, including incomplete groups, are cleared before Linear.
+        CP requires ``boundary_hidden`` from DSv4's exchange and returns local
+        latents plus a ``CSA2CPCompressionLayout`` describing local/global rows.
         """
         if packed_seq_params is not None or thd_layout is not None:
             if x.ndim != 3 or x.shape[1] != 1:
@@ -353,6 +435,10 @@ class CSA2Compressor(MegatronModule):
                 raise ValueError(
                     "CSA2 THD compressor input must match the layout's rows and device."
                 )
+            if thd_layout.cp_size > 1:
+                if boundary_hidden is None:
+                    raise ValueError("CSA2 CP compression requires the DSv4 left boundary")
+                return self._forward_thd_cp(x, boundary_hidden, thd_layout)
             return self._forward_thd(
                 x,
                 thd_layout.for_compression(self.compress_ratio),
@@ -425,12 +511,43 @@ class CSA2Compressor(MegatronModule):
             )
         else:
             latent = self._forward_thd_grouped(x, layout)
-        latent = latent.to(x.dtype)
+        return self._normalize_thd(latent.to(x.dtype), layout), layout
+
+    def _normalize_thd(self, latent, layout):
+        """Preserve norm parameters' gradient edges even for empty compression capacity."""
         if layout.capacity == 0:
             latent = latent * self.norm.weight
         else:
             latent = self.norm(latent)
-        return latent.masked_fill(~layout.valid_groups[:, None, None], 0), layout
+        return latent.masked_fill(~layout.valid_groups[:, None, None], 0)
+
+    def _forward_thd_cp(self, x, boundary_hidden, token_layout):
+        """Compress DSv4's compact local/halo groups before any K communication."""
+        if boundary_hidden.ndim != x.ndim or boundary_hidden.shape[1:] != x.shape[1:]:
+            raise ValueError("CSA2 compressor boundary must match local hidden dimensions")
+        layout = build_csa2_cp_compression_layout(
+            token_layout, self.compress_ratio, boundary_hidden.shape[0]
+        )
+        if self.use_fused_compressor and x.is_cuda and x.dtype == torch.bfloat16:
+            inputs, *_ = cp_utils.prepare_cp_compressor_input(
+                x,
+                boundary_hidden,
+                token_layout.cu_seqlens_padded,
+                token_layout.global_start,
+                token_layout.cp_size,
+                self.compress_ratio,
+            )
+            # DSv4 compaction follows physical lengths; remove logical padding
+            # before either Linear so NaN padding cannot affect weight gradients.
+            inputs = inputs.masked_fill(
+                ~layout.local.valid_groups.repeat_interleave(self.compress_ratio)[:, None, None], 0
+            )
+            latent, gate = self._project(inputs)
+            if self.compress_ratio == 2:
+                latent = self._pool_r2(latent, gate, x.dtype, layout.local.valid_groups)
+        else:
+            latent = self._forward_thd_grouped(torch.cat((boundary_hidden, x)), layout.local)
+        return self._normalize_thd(latent.to(x.dtype), layout.local), layout
 
     def _forward_thd_projected(self, x, layout, cu_seqlens_padded, *, input_is_sanitized):
         """Reuse token-order hidden storage and let the V4 kernel gather KV/gate."""
@@ -565,6 +682,7 @@ class CSA2Indexer(MegatronModule):
         rotary_pos_emb: nn.Module,
         *,
         thd_layout: CSA2THDCompressionLayout | None = None,
+        cp_group: torch.distributed.ProcessGroup | None = None,
     ) -> torch.Tensor:
         """Produce graph-connected rotated index keys at a Full owner."""
         if not self.owns_k:
@@ -582,7 +700,13 @@ class CSA2Indexer(MegatronModule):
         # An incomplete first compression group produces no key rows.
         k = self.k_norm(k) if k.shape[0] else k * self.k_norm.weight
         if thd_layout is not None:
-            return apply_csa2_thd_rope(k, rotary_pos_emb, self.config, thd_layout, self.cp_group)
+            return apply_csa2_thd_rope(
+                k,
+                rotary_pos_emb,
+                self.config,
+                thd_layout,
+                cp_group if cp_group is not None else self.cp_group,
+            )
         pos_dim = self.config.qk_pos_emb_head_dim
         return _apply_rope(
             k,
@@ -606,6 +730,7 @@ class CSA2Indexer(MegatronModule):
         indexer_k: torch.Tensor | None = None,
         thd_layout: CSA2THDLayout | None = None,
         compressed_layout: CSA2THDCompressionLayout | None = None,
+        cp_group: torch.distributed.ProcessGroup | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Project Q/W once, preserving the Full owner's shared K autograd graph."""
         if thd_layout is not None:
@@ -625,7 +750,9 @@ class CSA2Indexer(MegatronModule):
         if indexer_k is None:
             if latent is None:
                 raise ValueError("CSA2 indexer scores require latent or shared indexer_k.")
-            indexer_k = self.project_keys(latent, rotary_pos_emb, thd_layout=compressed_layout)
+            indexer_k = self.project_keys(
+                latent, rotary_pos_emb, thd_layout=compressed_layout, cp_group=cp_group
+            )
         elif latent is not None:
             raise ValueError("Provide either latent or indexer_k, not both.")
         q, _ = self.linear_wq_b(qr)
@@ -634,7 +761,13 @@ class CSA2Indexer(MegatronModule):
             if indexer_k.shape[:2] != (compressed_layout.capacity, 1):
                 raise ValueError("CSA2 shared indexer keys must match the THD compression layout.")
             indexer_k = indexer_k.masked_fill(~compressed_layout.valid_groups[:, None, None], 0)
-            q = apply_csa2_thd_rope(q, rotary_pos_emb, self.config, thd_layout, self.cp_group)
+            q = apply_csa2_thd_rope(
+                q,
+                rotary_pos_emb,
+                self.config,
+                thd_layout,
+                cp_group if cp_group is not None else self.cp_group,
+            )
             weights, _ = self.linear_weights_proj(x)
             return q.squeeze(1), indexer_k.squeeze(1), weights.squeeze(1)
         pos_dim = self.config.qk_pos_emb_head_dim
@@ -815,7 +948,7 @@ class CSA2Indexer(MegatronModule):
         # scaled/rounded weights. This temporary must never modify shared W.
         weights = (weights.float() * (self.head_dim**-0.5 * self.n_heads**-0.5)).to(weights.dtype)
         kwargs = {}
-        if thd_layout is not None:
+        if thd_layout is not None and thd_layout.cp_size == 1:
             cu_q, cu_k, max_q, max_k = inputs.packed_metadata
             kwargs = dict(
                 cu_seqlens_q=cu_q,
@@ -825,7 +958,7 @@ class CSA2Indexer(MegatronModule):
                 # contains only complete physical compression groups.
                 max_seqlen_kv=max((max_q + self.compress_ratio - 1) // self.compress_ratio, max_k),
             )
-        else:
+        elif thd_layout is None:
             batch, seq_len = inputs.output_shape
             # Like V4 Path B, view the prepared rows as BSHD and call the core
             # directly. The public SBHD wrapper would copy Q/K/W again.
@@ -837,19 +970,36 @@ class CSA2Indexer(MegatronModule):
                 # never-visible dummy key private to selection, not shared K.
                 k = F.pad(k, (0, 0, 0, 1))
 
-        indices, _, _, _ = _indexer_topk_core(
-            q,
-            k,
-            weights,
-            topk=width,
-            ratio=self.compress_ratio,
-            use_compact=True,
-            compact_workspace=self._get_compact_indexer_workspace(q, k, topk=width, **kwargs),
-            precision=self.precision,
-            # Native CSA2 also resolves exact ties toward earlier local keys.
-            deterministic=True,
-            **kwargs,
-        )
+        if thd_layout is not None and thd_layout.cp_size > 1:
+            indices, _, _ = cp_utils.compute_cp_indexer_topk(
+                q,
+                weights,
+                k,
+                thd_layout.cu_seqlens_padded,
+                compressed_layout.cu_seqlens_padded,
+                thd_layout.global_start,
+                self.compress_ratio,
+                width,
+                1.0,
+                max_seqlen_q=thd_layout.max_seqlen,
+                use_fused=True,
+                deterministic=True,
+                precision=self.precision,
+            )
+        else:
+            indices, _, _, _ = _indexer_topk_core(
+                q,
+                k,
+                weights,
+                topk=width,
+                ratio=self.compress_ratio,
+                use_compact=True,
+                compact_workspace=self._get_compact_indexer_workspace(q, k, topk=width, **kwargs),
+                precision=self.precision,
+                # Native CSA2 also resolves exact ties toward earlier local keys.
+                deterministic=True,
+                **kwargs,
+            )
         if thd_layout is not None:
             sequence_ids = thd_layout.sequence_ids.clamp_min(0)
             starts = inputs.starts.unsqueeze(-1)
@@ -898,7 +1048,9 @@ class CSA2Indexer(MegatronModule):
         else:
             sequence_ids = thd_layout.sequence_ids.clamp_min(0)
             starts = compressed_layout.cu_seqlens_padded[sequence_ids].long()
-            ends = compressed_layout.cu_seqlens_padded[sequence_ids + 1].long()
+            # An all-padding pack can have no sequence at all (prefix [0]).
+            cu_k = compressed_layout.cu_seqlens_padded
+            ends = cu_k[(sequence_ids + 1).clamp_max(cu_k.numel() - 1)].long()
             local = torch.arange(compressed_layout.max_seqlen, device=q.device)
             physical = starts[:, None] + local
             if k.shape[0] > 0:
@@ -933,6 +1085,7 @@ class CSA2Indexer(MegatronModule):
         return_scores: bool = False,
         return_candidates: bool = False,
         return_loss_inputs: bool = False,
+        cp_group: torch.distributed.ProcessGroup | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | CSA2IndexerInputs | None, CSA2CandidateBlocks | None]:
         """Select keys and optionally return supervision scores and compact candidates.
 
@@ -961,6 +1114,7 @@ class CSA2Indexer(MegatronModule):
             indexer_k=indexer_k,
             thd_layout=thd_layout,
             compressed_layout=compressed_layout,
+            cp_group=cp_group,
         )
         score_kwargs = dict(
             candidates=candidates, thd_layout=thd_layout, compressed_layout=compressed_layout
@@ -1075,8 +1229,8 @@ class CompressedSparseAttention2(MegatronModule):
             raise ValueError("CSA2 requires V4.1 causal attention.")
         if attention_type != "self" or is_mtp_layer:
             raise NotImplementedError("CSA2 currently supports backbone self-attention only.")
-        if get_pg_size(pg_collection.tp) != 1 or get_pg_size(pg_collection.cp) != 1:
-            raise NotImplementedError("Native CSA2 currently requires TP=CP=1.")
+        if get_pg_size(pg_collection.tp) != 1:
+            raise NotImplementedError("Native CSA2 currently requires TP=1.")
         if (attention_dropout or config.attention_dropout) != 0:
             raise NotImplementedError("Native CSA2 does not implement attention dropout.")
         layer_idx = layer_number - 1
@@ -1130,26 +1284,45 @@ class CompressedSparseAttention2(MegatronModule):
             )
 
     def _shared_global_attention(
-        self, x: torch.Tensor, qr: torch.Tensor, state: CSA2State, *, use_indexer_loss: bool = False
+        self,
+        x: torch.Tensor,
+        qr: torch.Tensor,
+        state: CSA2State,
+        *,
+        use_indexer_loss: bool = False,
+        boundary_hidden: torch.Tensor | None = None,
+        cp_group: torch.distributed.ProcessGroup | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | CSA2IndexerInputs | None]:
         """Publish or consume graph tensors and indices in compressed KV coordinates."""
         thd_layout = state.thd_layout
+        cp_group = self.pg_collection.cp if cp_group is None else cp_group
         if self.is_kv_source:
+            cp_layout = None
             if thd_layout is None:
                 latent = self.compressor(x)
                 state.compressed_layout = None
+                local_layout = None
             else:
                 # forward() has already cleared padding in this shared hidden
                 # buffer. Reuse it for both original Linear modules, as in V4.
-                latent, state.compressed_layout = self.compressor(
-                    x, thd_layout=thd_layout, input_is_sanitized=True
+                latent, local_layout = self.compressor(
+                    x,
+                    thd_layout=thd_layout,
+                    input_is_sanitized=True,
+                    boundary_hidden=boundary_hidden,
                 )
+                if isinstance(local_layout, CSA2CPCompressionLayout):
+                    cp_layout = local_layout
+                    state.compressed_layout = cp_layout.global_layout
+                    local_layout = cp_layout.local
+                else:
+                    state.compressed_layout = local_layout
             # The auxiliary objective trains the indexer, not the main compressor.
             # Detach BEFORE projection so Full and Reindex losses still reach the
             # owning indexer's K projection and normalization through the shared keys.
             indexer_latent = latent.detach() if use_indexer_loss else latent
             state.indexer_k = self.indexer.project_keys(
-                indexer_latent, self.rotary_pos_emb, thd_layout=state.compressed_layout
+                indexer_latent, self.rotary_pos_emb, thd_layout=local_layout, cp_group=cp_group
             )
             if thd_layout is None:
                 pos_dim = self.config.qk_pos_emb_head_dim
@@ -1168,8 +1341,19 @@ class CompressedSparseAttention2(MegatronModule):
                 )
             else:
                 state.global_kv = apply_csa2_thd_rope(
-                    latent, self.rotary_pos_emb, self.config, state.compressed_layout, self.cp_group
+                    latent, self.rotary_pos_emb, self.config, local_layout, cp_group
                 )
+            if cp_layout is not None:
+                # One autograd edge per shared tensor: reduce-scatter runs after
+                # all local consumers contribute, including future Reindex/Reuse.
+                indexer_gather = async_gather_from_sequence_parallel_region(
+                    state.indexer_k, group=cp_group
+                )
+                kv_gather = async_gather_from_sequence_parallel_region(
+                    state.global_kv, group=cp_group
+                )
+                state.indexer_k = cp_layout.to_sequence_major(indexer_gather.wait())
+                state.global_kv = cp_layout.to_sequence_major(kv_gather.wait())
             state.kv_source_layer = self.layer_idx
             # Pack shared K once per owner, with graph-connected views/copies.
             # All supervised consumers use the same storage and autograd edge.
@@ -1223,6 +1407,7 @@ class CompressedSparseAttention2(MegatronModule):
                     return_loss_inputs=use_indexer_loss
                     and self.use_fused_kernels
                     and self.indexer.use_fused_kernels,
+                    cp_group=cp_group,
                 )
             if self.is_candidate_source:
                 state.candidates = candidate_blocks
@@ -1289,7 +1474,8 @@ class CompressedSparseAttention2(MegatronModule):
             scores = scores.unsqueeze(0)
             global_indices = global_indices.unsqueeze(0)
             query_valid_rows = thd_layout.valid_tokens
-        return compute_dsa_indexer_loss(
+        is_cp = thd_layout is not None and thd_layout.cp_size > 1
+        loss = compute_dsa_indexer_loss(
             # The shared helper adds masks in place; keep the scoring/selection tensor intact.
             scores.clone(),
             global_indices,
@@ -1301,9 +1487,12 @@ class CompressedSparseAttention2(MegatronModule):
             self.pg_collection,
             mask=mask,
             query_valid_rows=query_valid_rows,
-            calculate_per_token_loss=self.config.calculate_per_token_loss,
+            calculate_per_token_loss=self.config.calculate_per_token_loss or is_cp,
             non_compressed_lse=non_compressed_lse,
         )
+        if is_cp and not self.config.calculate_per_token_loss:
+            loss = loss / thd_layout.cu_seqlens[-1].to(torch.float32).clamp_min(1)
+        return loss
 
     def _attention_inputs(self, local, window, global_kv=None, topk=None):
         """Lower shared logical indices out of place for this consumer's KV buffer."""
@@ -1314,7 +1503,7 @@ class CompressedSparseAttention2(MegatronModule):
         indices = torch.cat((window, torch.where(topk >= 0, topk + local.shape[0], -1)), -1)
         return torch.cat((local, global_kv), dim=0), indices
 
-    def _build_fused_thd_indices(self, query, topk, state, *, need_window=False):
+    def _build_fused_thd_indices(self, query, topk, state, *, need_window=False, halo=0):
         """Fuse packed window/global addressing, padding and compaction using V4."""
         layout = state.thd_layout
         window_size = self.config.csa_window_size
@@ -1329,9 +1518,9 @@ class CompressedSparseAttention2(MegatronModule):
         compressed_width = 0 if topk is None else topk.shape[-1]
         indices, lengths, _, padding_mask = thd_layout_kernels.build_attention_indices(
             layout.cu_seqlens_padded,
-            global_start=0,
+            global_start=layout.global_start,
             l_local=query.shape[0],
-            d_window=0,
+            d_window=halo,
             window_size=window_size,
             ratio=self.compress_ratio,
             compressed_width=compressed_width,
@@ -1339,7 +1528,7 @@ class CompressedSparseAttention2(MegatronModule):
             cu_seqlens_compressed=(
                 state.compressed_layout.cu_seqlens_padded if compressed_width else None
             ),
-            compressed_base=query.shape[0],
+            compressed_base=halo + query.shape[0],
             compressed_rows=state.global_kv_flat.shape[0] if compressed_width else 0,
             compressed_is_sequence_major=True,
             cu_seqlens_unpadded=layout.cu_seqlens,
@@ -1352,8 +1541,14 @@ class CompressedSparseAttention2(MegatronModule):
             state.fused_window_indices = window_out
         return indices, lengths, padding_mask
 
-    def _fused_indices(self, query, window, topk, state, *, need_window=False):
+    def _fused_indices(self, query, window, topk, state, *, need_window=False, halo=0):
         """Lower and compact once per index source; Reuse shares indices and lengths."""
+        if state.fused_halo_size != halo:
+            # A ratio transition can change the halo when the window is small.
+            # SWA layers do not overwrite this compressed-index cache.
+            state.fused_indices = state.fused_topk_length = state.fused_q_padding_mask = None
+            state.fused_window_indices = None
+            state.fused_halo_size = halo
         window_size = self.config.csa_window_size if window is None else window.shape[-1]
         have_window = (
             not need_window
@@ -1371,7 +1566,9 @@ class CompressedSparseAttention2(MegatronModule):
             return state.fused_indices
         if window is None:
             state.fused_indices, state.fused_topk_length, state.fused_q_padding_mask = (
-                self._build_fused_thd_indices(query, topk, state, need_window=need_window)
+                self._build_fused_thd_indices(
+                    query, topk, state, need_window=need_window, halo=halo
+                )
             )
             state.fused_window_size = window_size
             return state.fused_indices
@@ -1384,7 +1581,7 @@ class CompressedSparseAttention2(MegatronModule):
             topk = torch.where(topk >= 0, topk + batch_ids * state.global_kv.shape[0], -1)
             local_rows = batch * seq_len
         else:
-            local_rows = query.shape[0]
+            local_rows = halo + query.shape[0]
         state.fused_indices = (
             torch.cat((window, torch.where(topk >= 0, topk + local_rows, -1)), -1)
             .int()
@@ -1409,12 +1606,13 @@ class CompressedSparseAttention2(MegatronModule):
     def _fused_attention(self, query, local, window, global_kv=None, topk=None, state=None):
         """Reuse V4 attention with shared indices and producer KV storage."""
         is_thd = query.ndim == 3
+        halo = local.shape[0] - query.shape[0] if is_thd else 0
         if global_kv is None:
             padding_mask = None
             if is_thd:
                 if window is None:
                     indices, topk_length, padding_mask = self._build_fused_thd_indices(
-                        query, None, state
+                        query, None, state, halo=halo
                     )
                 else:
                     indices, topk_length = _compact_flat_topk_idxs(window.int().contiguous())
@@ -1433,7 +1631,7 @@ class CompressedSparseAttention2(MegatronModule):
                 is_thd=is_thd,
                 q_padding_mask=padding_mask,
             )
-        indices = self._fused_indices(query, window, topk, state)
+        indices = self._fused_indices(query, window, topk, state, halo=halo)
         if is_thd:
             q, local_flat = query.contiguous(), local.contiguous()
         else:
@@ -1456,13 +1654,15 @@ class CompressedSparseAttention2(MegatronModule):
             output = output.reshape(query.shape[0], query.shape[1], -1)
         return output
 
-    def _forward_unfused(self, query, local, window, x, qr, state, use_indexer_loss):
+    def _forward_unfused(
+        self, query, local, window, x, qr, state, use_indexer_loss, **shared_kwargs
+    ):
         """Native semantic reference, also handling empty packed batches."""
         loss = None
         kv, indices = local, window
         if self.compress_ratio:
             global_kv, topk, scores = self._shared_global_attention(
-                x, qr, state, use_indexer_loss=use_indexer_loss
+                x, qr, state, use_indexer_loss=use_indexer_loss, **shared_kwargs
             )
             if scores is not None:
                 loss = self._compute_indexer_loss(
@@ -1479,13 +1679,18 @@ class CompressedSparseAttention2(MegatronModule):
         """Window-only layer: one sparse-attention forward/backward."""
         return self._fused_attention(query, local, window, state=state), None
 
-    def _forward_fused_indexer_training(self, query, local, window, x, qr, state):
+    def _forward_fused_indexer_training(self, query, local, window, x, qr, state, **shared_kwargs):
         """Full/Reindex with supervision: shared selection, joint attention/KL autograd."""
-        global_kv, topk, scores = self._shared_global_attention(x, qr, state, use_indexer_loss=True)
+        global_kv, topk, scores = self._shared_global_attention(
+            x, qr, state, use_indexer_loss=True, **shared_kwargs
+        )
         need_window = (
             not isinstance(scores, CSA2IndexerInputs) or not self.config.dsa_indexer_use_sparse_loss
         )
-        indices = self._fused_indices(query, window, topk, state, need_window=need_window)
+        halo = local.shape[0] - query.shape[0] if state.thd_layout is not None else 0
+        indices = self._fused_indices(
+            query, window, topk, state, need_window=need_window, halo=halo
+        )
         if window is None and need_window:
             window = state.fused_window_indices
         if isinstance(scores, CSA2IndexerInputs):
@@ -1513,15 +1718,92 @@ class CompressedSparseAttention2(MegatronModule):
         )
         return output, loss
 
-    def _forward_fused_indexer_no_loss(self, query, local, window, x, qr, state):
+    def _forward_fused_indexer_no_loss(self, query, local, window, x, qr, state, **shared_kwargs):
         """Full/Reindex without auxiliary supervision; selection stays discrete."""
-        global_kv, topk, _ = self._shared_global_attention(x, qr, state)
+        global_kv, topk, _ = self._shared_global_attention(x, qr, state, **shared_kwargs)
         return self._fused_attention(query, local, window, global_kv, topk, state), None
 
-    def _forward_fused_reuse(self, query, local, window, x, qr, state):
+    def _forward_fused_reuse(self, query, local, window, x, qr, state, **shared_kwargs):
         """Consume the owner's shared KV/Top-K without indexer projection or loss."""
-        global_kv, topk, _ = self._shared_global_attention(x, qr, state)
+        global_kv, topk, _ = self._shared_global_attention(x, qr, state, **shared_kwargs)
         return self._fused_attention(query, local, window, global_kv, topk, state), None
+
+    def _forward_attention(
+        self, query, local, window, x, qr, state, use_indexer_loss, **shared_kwargs
+    ):
+        """Dispatch the same selection, supervision and attention paths for CP=1 and CP>1."""
+        if not self.use_fused_kernels or query.shape[0] == 0:
+            return self._forward_unfused(
+                query, local, window, x, qr, state, use_indexer_loss, **shared_kwargs
+            )
+        if not self.compress_ratio:
+            return self._forward_fused_no_indexer(query, local, window, state)
+        if not self.is_index_source:
+            return self._forward_fused_reuse(query, local, window, x, qr, state, **shared_kwargs)
+        if use_indexer_loss:
+            return self._forward_fused_indexer_training(
+                query, local, window, x, qr, state, **shared_kwargs
+            )
+        return self._forward_fused_indexer_no_loss(
+            query, local, window, x, qr, state, **shared_kwargs
+        )
+
+    def _forward_thd_cp(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        x: torch.Tensor,
+        qr: torch.Tensor,
+        boundary_hidden: torch.Tensor,
+        boundary_kv: torch.Tensor,
+        state: CSA2State,
+        cp_group: torch.distributed.ProcessGroup,
+        use_indexer_loss: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Address halo/local KV, then use the shared Full/Reindex/Reuse training paths."""
+        layout = state.thd_layout
+        if boundary_kv.ndim != 3 or boundary_kv.shape[1:] != key.shape[1:]:
+            raise ValueError("CSA2 CP boundary KV must have shape [halo, 1, head_dim]")
+        halo = boundary_kv.shape[0]
+        if halo < self.config.csa_window_size - 1:
+            raise ValueError("CSA2 CP boundary KV does not cover the attention window")
+        boundary_rows = torch.arange(halo, device=query.device) + layout.global_start - halo
+        _, _, boundary_valid = get_thd_token_metadata(
+            layout.cu_seqlens, layout.cu_seqlens_padded, boundary_rows
+        )
+        boundary_kv = boundary_kv.masked_fill(~boundary_valid[:, None, None], 0)
+        local = torch.cat((boundary_kv, key), dim=0).squeeze(1)
+        window = None
+        if not self.use_fused_kernels or query.shape[0] == 0:
+            query_rows = (
+                torch.arange(layout.total_tokens, device=query.device) + layout.global_start
+            )
+            key_rows = (
+                query_rows[:, None]
+                - self.config.csa_window_size
+                + 1
+                + torch.arange(self.config.csa_window_size, device=query.device)
+            )
+            sequence_ids, _, valid = get_thd_token_metadata(
+                layout.cu_seqlens, layout.cu_seqlens_padded, key_rows.contiguous()
+            )
+            valid = (
+                valid
+                & layout.valid_tokens[:, None]
+                & (sequence_ids == layout.sequence_ids[:, None])
+            )
+            window = (key_rows - layout.global_start + halo).masked_fill(~valid, -1)
+        return self._forward_attention(
+            query,
+            local,
+            window,
+            x,
+            qr,
+            state,
+            use_indexer_loss,
+            boundary_hidden=boundary_hidden,
+            cp_group=cp_group,
+        )
 
     def forward(
         self,
@@ -1543,8 +1825,15 @@ class CompressedSparseAttention2(MegatronModule):
         As in DSv4 CSA, attention_mask is unused: sparse indices and packed
         sequence metadata define causal visibility and sequence boundaries.
         """
-        if boundary_hidden is not None or boundary_kv is not None:
-            raise NotImplementedError("Native CSA2 currently requires CP=1.")
+        cp_group = self.pg_collection.cp
+        if packed_seq_params is not None and packed_seq_params.cp_group is not None:
+            cp_group = packed_seq_params.cp_group
+        cp_size = get_pg_size(cp_group)
+        if cp_size > 1:
+            if packed_seq_params is None or boundary_hidden is None or boundary_kv is None:
+                raise ValueError("CSA2 CP requires THD metadata and the DSv4 boundary exchange")
+        elif boundary_hidden is not None or boundary_kv is not None:
+            raise ValueError("CSA2 boundary tensors require a CP group larger than one")
         is_thd = packed_seq_params is not None
         if is_thd:
             if packed_seq_params.qkv_format != "thd":
@@ -1552,9 +1841,11 @@ class CompressedSparseAttention2(MegatronModule):
             if query.ndim != 3 or key.shape != (query.shape[0], 1, query.shape[-1]):
                 raise ValueError("CSA2 THD expects query [T, heads, dim] and key [T, 1, dim].")
             if thd_layout is None:
-                thd_layout = build_csa2_thd_layout(packed_seq_params, query.shape[0])
+                thd_layout = build_csa2_thd_layout(
+                    packed_seq_params, query.shape[0], cp_group=cp_group
+                )
             else:
-                thd_layout.validate_compatible(packed_seq_params, query.shape[0])
+                thd_layout.validate_compatible(packed_seq_params, query.shape[0], cp_group)
             # The DSv4 QKV wrapper returns packed qr without its dummy batch axis.
             if qr.ndim == 2:
                 qr = qr.unsqueeze(1)
@@ -1580,51 +1871,49 @@ class CompressedSparseAttention2(MegatronModule):
             csa2_state = CSA2State()
         csa2_state.validate_forward(self.layer_idx, query, thd_layout=thd_layout)
         seq_len, batch = query.shape[0], 1 if is_thd else query.shape[1]
-        if is_thd and self.use_fused_kernels and query.is_cuda and seq_len > 0:
-            # Build the final physical indices after selection. Reuse layers
-            # consume the source's cache without constructing a window matrix.
-            indices = None
-        elif is_thd:
-            indices = get_window_topk_idxs_thd(
-                self.config.csa_window_size, thd_layout.cu_seqlens_padded, total_q=seq_len
-            )
-            # DSv4's window helper returns segment-local positions; native THD
-            # sparse attention consumes physical flat rows in the packed KV.
-            starts = thd_layout.cu_seqlens_padded[thd_layout.sequence_ids.clamp_min(0)]
-            indices = torch.where(indices >= 0, indices + starts[:, None], -1)
-            valid_window = (
-                (indices >= 0)
-                & thd_layout.valid_tokens[:, None]
-                & thd_layout.valid_tokens[indices.clamp_min(0).long()]
-            )
-            indices = indices.masked_fill(~valid_window, -1)
-        else:
-            indices = get_window_topk_idxs(
-                self.config.csa_window_size, batch, seq_len, query.device
-            )
-        local = key.squeeze(-2)
         use_indexer_loss = (
             self.training
             and torch.is_grad_enabled()
             and (self.config.dsa_indexer_loss_coeff or 0.0) > 0
         )
-        if not self.use_fused_kernels or seq_len == 0:
-            output, indexer_loss = self._forward_unfused(
-                query, local, indices, x, qr, csa2_state, use_indexer_loss
-            )
-        elif not self.compress_ratio:
-            output, indexer_loss = self._forward_fused_no_indexer(query, local, indices, csa2_state)
-        elif not self.is_index_source:
-            output, indexer_loss = self._forward_fused_reuse(
-                query, local, indices, x, qr, csa2_state
-            )
-        elif use_indexer_loss:
-            output, indexer_loss = self._forward_fused_indexer_training(
-                query, local, indices, x, qr, csa2_state
+        if cp_size > 1:
+            output, indexer_loss = self._forward_thd_cp(
+                query,
+                key,
+                x,
+                qr,
+                boundary_hidden,
+                boundary_kv,
+                csa2_state,
+                cp_group,
+                use_indexer_loss,
             )
         else:
-            output, indexer_loss = self._forward_fused_indexer_no_loss(
-                query, local, indices, x, qr, csa2_state
+            if is_thd and self.use_fused_kernels and query.is_cuda and seq_len > 0:
+                # Build the final physical indices after selection. Reuse layers
+                # consume the source's cache without constructing a window matrix.
+                indices = None
+            elif is_thd:
+                indices = get_window_topk_idxs_thd(
+                    self.config.csa_window_size, thd_layout.cu_seqlens_padded, total_q=seq_len
+                )
+                # DSv4's window helper returns segment-local positions; native THD
+                # sparse attention consumes physical flat rows in the packed KV.
+                starts = thd_layout.cu_seqlens_padded[thd_layout.sequence_ids.clamp_min(0)]
+                indices = torch.where(indices >= 0, indices + starts[:, None], -1)
+                valid_window = (
+                    (indices >= 0)
+                    & thd_layout.valid_tokens[:, None]
+                    & thd_layout.valid_tokens[indices.clamp_min(0).long()]
+                )
+                indices = indices.masked_fill(~valid_window, -1)
+            else:
+                indices = get_window_topk_idxs(
+                    self.config.csa_window_size, batch, seq_len, query.device
+                )
+            local = key.squeeze(-2)
+            output, indexer_loss = self._forward_attention(
+                query, local, indices, x, qr, csa2_state, use_indexer_loss
             )
         if is_thd:
             output = output.masked_fill(~thd_layout.valid_tokens[:, None], 0)
@@ -1633,12 +1922,13 @@ class CompressedSparseAttention2(MegatronModule):
             # reduction mode. Backward still receives the raw sum in per-token mode.
             logged_loss = indexer_loss.detach()
             if self.config.calculate_per_token_loss:
-                token_count = (
-                    thd_layout.valid_tokens.sum().clamp_min(1) if is_thd else seq_len * batch
-                )
+                token_count = thd_layout.cu_seqlens[-1].clamp_min(1) if is_thd else seq_len * batch
                 logged_loss = logged_loss / token_count
             DSAIndexerLossLoggingHelper.save_loss_to_tracker(
-                loss=logged_loss, layer_number=self.layer_idx + 1, num_layers=self.config.num_layers
+                loss=logged_loss,
+                layer_number=self.layer_idx + 1,
+                num_layers=self.config.num_layers,
+                reduce_group=cp_group if cp_size > 1 else None,
             )
             if csa2_state.defer_indexer_loss:
                 csa2_state.indexer_loss = indexer_loss

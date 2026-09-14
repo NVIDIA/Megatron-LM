@@ -32,7 +32,8 @@ class HybridStackForwardAdapter(Protocol):
 
     Adapters are plain objects with static configuration, not parameter-bearing
     modules. HybridStack constructs one using ``config``, ``layer_type_list``,
-    ``pp_layer_offset``, ``pre_process``, ``post_process`` and ``is_mtp_layer``.
+    ``pp_layer_offset``, ``pre_process``, ``post_process``, ``is_mtp_layer`` and
+    the stack's explicit ``pg_collection``.
     All activation state must be returned in a fresh per-forward context.
     """
 

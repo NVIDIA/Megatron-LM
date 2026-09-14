@@ -24,7 +24,7 @@ class PipelinePayloadSpec:
     """Host-only description prepared before a microbatch enters the pipeline."""
 
     tensor_specs: tuple[PipelineTensorSpec, ...]
-    metadata: tuple[int, int]
+    metadata: tuple[int, ...]
 
 
 @dataclass(frozen=True)
@@ -101,8 +101,8 @@ class PipelinePayload:
         raise NotImplementedError
 
     @property
-    def metadata(self) -> tuple[int, int]:
-        """Return two model-owned host integers for reconstructing the input payload."""
+    def metadata(self) -> tuple[int, ...]:
+        """Return model-owned host integers for reconstructing the input payload."""
         return (0, 0)
 
     @property
@@ -149,7 +149,7 @@ PipelineGradients = tuple[torch.Tensor | None, ...]
 # Factories and tensor_specs may inspect only shapes, dtypes and host metadata:
 # with overlap, receive buffers are populated after payload construction. The
 # schedule waits the receive handle before model execution or state restoration.
-PipelinePayloadFactory = Callable[[tuple[torch.Tensor, ...], tuple[int, int]], PipelinePayload]
+PipelinePayloadFactory = Callable[[tuple[torch.Tensor, ...], tuple[int, ...]], PipelinePayload]
 
 
 def backward_pipeline_payload(

@@ -1494,10 +1494,10 @@ def test_unsupported_compression_ratio(ratio):
         layout.for_compression(ratio)
 
 
-def test_nonlocal_cp_metadata_is_rejected():
+def test_cp_metadata_requires_an_explicit_group():
     params = _params([0, 4])
     params.local_cp_size = 2
-    with pytest.raises(ValueError, match="requires CP=1"):
+    with pytest.raises(ValueError, match="matching explicit CP group"):
         build_csa2_thd_layout(params, 4)
 
 
