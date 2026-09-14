@@ -202,6 +202,8 @@ no-build-isolation-package = [
     "fast-hadamard-transform",
 ]
 link-mode = "copy"
+# TileLang 0.1.8 fails to import with 0.1.12; cuDNN Frontend requires >=0.1.11.
+constraint-dependencies = ["apache-tvm-ffi==0.1.11"]
 # We don't define override-dependencies globally but rather locally where we need it.
 # For instance, when installing into a PyTorch base image, we don't want to install torch,
 # torchvision, and triton.
