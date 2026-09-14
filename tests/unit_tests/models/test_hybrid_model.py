@@ -221,7 +221,8 @@ def test_hybrid_model_with_custom_process_groups(tmp_path, tp_size, cp_size, pp_
     reason="Config-list PP/VPP construction test requires exactly 2 ranks",
 )
 @pytest.mark.parametrize("vp_stage", [0, 1])
-def test_config_list_constructs_explicit_pp_vpp_segment(vp_stage):
+@pytest.mark.parametrize("freeze_base", [False, True])
+def test_config_list_constructs_explicit_pp_vpp_segment(vp_stage, freeze_base, monkeypatch):
     Utils.initialize_model_parallel(pipeline_model_parallel_size=2)
     try:
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
@@ -234,6 +235,7 @@ def test_config_list_constructs_explicit_pp_vpp_segment(vp_stage):
             pipeline_model_parallel_size=2,
             virtual_pipeline_model_parallel_size=2,
             pipeline_dtype=torch.float32,
+            freeze_base_model_for_mtp=freeze_base,
         )
         attention = AttentionLayerConfig.from_config(model_config)
         mlp = MLPLayerConfig.from_config(model_config)
@@ -243,6 +245,10 @@ def test_config_list_constructs_explicit_pp_vpp_segment(vp_stage):
             if segment_index:
                 source.append(PipelineSplit)
             source.extend(segment)
+        if freeze_base:
+            source.extend([MTPSplit, mlp])
+            # This test builds individual VP chunks without the matching embedding chunk.
+            monkeypatch.setattr(HybridModel, "setup_embeddings_and_output_layer", lambda self: None)
 
         model = HybridModel(
             config=model_config,
@@ -256,6 +262,8 @@ def test_config_list_constructs_explicit_pp_vpp_segment(vp_stage):
             vp_stage=vp_stage,
         )
 
+        assert model.mtp_num_depths == int(freeze_base)
+        assert model.mtp_process is (freeze_base and vp_stage == 1 and pp_rank == 1)
         segment_index = vp_stage * 2 + pp_rank
         expected_segment = segments[segment_index]
         expected_offset = sum(len(segment) for segment in segments[:segment_index])
@@ -450,7 +458,8 @@ class TestHybridModel:
         model(input_ids=None, position_ids=None, attention_mask=None, decoder_input=decoder_input)
         assert captured_rotary == [None]
 
-    def test_config_list_infers_mtp_depth_without_mutating_sources(self, mocker):
+    @pytest.mark.parametrize("freeze_base", [False, True])
+    def test_config_list_infers_mtp_depth_without_mutating_sources(self, mocker, freeze_base):
         model_config = TransformerConfig(
             num_layers=1,
             hidden_size=256,
@@ -458,6 +467,7 @@ class TestHybridModel:
             use_cpu_initialization=True,
             mtp_hsm=True,
             is_hybrid_model=True,
+            freeze_base_model_for_mtp=freeze_base,
         )
         main_config = MLPLayerConfig.from_config(model_config)
         mtp_config = AttentionLayerConfig.from_config(model_config)
@@ -478,6 +488,7 @@ class TestHybridModel:
         assert model.config.mtp_hsm is True
         assert model_config.mtp_num_layers == 2
         assert model.mtp_num_depths == 2
+        assert model.mtp_process is False
         assert model.mtp_layer_config_list == (mtp_config,)
         assert main_config.is_hybrid_model is True
         assert mtp_config.is_hybrid_model is True
@@ -549,7 +560,8 @@ class TestHybridModel:
                 hybrid_layer_config_list=source,
             )
 
-    def test_config_list_rejects_frozen_base_without_mtp(self):
+    @pytest.mark.parametrize("architecture", ["pattern", "config_list"])
+    def test_rejects_frozen_base_without_mtp(self, architecture):
         model_config = TransformerConfig(
             num_layers=1,
             hidden_size=256,
@@ -557,7 +569,11 @@ class TestHybridModel:
             use_cpu_initialization=True,
             freeze_base_model_for_mtp=True,
         )
-        main_config = MLPLayerConfig.from_config(model_config)
+        architecture_kwargs = (
+            {"hybrid_layer_pattern": "-"}
+            if architecture == "pattern"
+            else {"hybrid_layer_config_list": [MLPLayerConfig.from_config(model_config)]}
+        )
 
         with pytest.raises(ValueError, match="requires.*at least one MTP head"):
             HybridModel(
@@ -565,7 +581,7 @@ class TestHybridModel:
                 hybrid_stack_spec=hybrid_stack_spec,
                 vocab_size=100,
                 max_sequence_length=4,
-                hybrid_layer_config_list=[main_config],
+                **architecture_kwargs,
             )
 
     @pytest.mark.parametrize(

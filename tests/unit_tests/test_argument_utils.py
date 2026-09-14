@@ -125,22 +125,14 @@ def test_moe_norm_flag_requires_latent_size(monkeypatch):
         validate_args(args)
 
 
-@pytest.mark.parametrize(
-    ("overrides", "error"),
-    [
-        ({"mtp_num_layers": None}, "requires --mtp-num-layers"),
-        (
-            {"mtp_num_layers": 1, "freeze_all_layers": True, "position_embedding_type": "rope"},
-            "cannot be combined with --freeze-all-layers",
-        ),
-    ],
-)
-def test_freeze_base_model_for_mtp_validation(monkeypatch, overrides, error):
+@pytest.mark.parametrize("mtp_num_layers", [None, 0, 1])
+def test_freeze_base_model_for_mtp_rejects_freeze_all_layers(monkeypatch, mtp_num_layers):
     args = _minimal_training_args(monkeypatch)
-    for name, value in overrides.items():
-        setattr(args, name, value)
+    args.mtp_num_layers = mtp_num_layers
+    args.position_embedding_type = "rope"
+    args.freeze_all_layers = True
 
-    with pytest.raises(AssertionError, match=error):
+    with pytest.raises(AssertionError, match="cannot be combined with --freeze-all-layers"):
         validate_args(args)
 
 
@@ -171,15 +163,23 @@ def test_python_hybrid_marker_defers_unresolved_hsm_depth(monkeypatch):
     assert args.mtp_hsm is True
 
 
-def test_python_hybrid_marker_defers_freeze_validation_until_list_parse(monkeypatch):
+@pytest.mark.parametrize("is_hybrid_model", [False, True])
+@pytest.mark.parametrize("mtp_num_layers", [None, 0, 1])
+def test_freeze_base_model_for_mtp_depth_is_validated_by_model(
+    monkeypatch, is_hybrid_model, mtp_num_layers
+):
     args = _minimal_training_args(monkeypatch)
-    args.is_hybrid_model = True
-    args.mtp_num_layers = None
-    args.freeze_base_model_for_mtp = True
+    args.is_hybrid_model = is_hybrid_model
+    args.mtp_num_layers = mtp_num_layers
+    args.position_embedding_type = "rope"
 
     validate_args(args)
 
     assert args.freeze_base_model_for_mtp is True
+    assert args.mtp_num_layers == mtp_num_layers
+    config = core_transformer_config_from_args(args)
+    assert config.freeze_base_model_for_mtp is True
+    assert config.mtp_num_layers == mtp_num_layers
 
 
 def test_python_hybrid_marker_rejects_inferred_vpp_size(monkeypatch):

@@ -905,9 +905,6 @@ def validate_args(args, defaults={}):
         and args.mtp_num_layers is None
     )
     if args.freeze_base_model_for_mtp:
-        assert args.mtp_num_layers or defer_mtp_depth_to_python_model, (
-            "--freeze-base-model-for-mtp requires --mtp-num-layers to be set."
-        )
         assert not args.freeze_all_layers, (
             "--freeze-base-model-for-mtp cannot be combined with --freeze-all-layers."
         )

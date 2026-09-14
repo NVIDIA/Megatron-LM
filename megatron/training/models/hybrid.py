@@ -193,17 +193,6 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
             ):
                 self._model_config.transformer.mtp_num_layers = parsed_config_list.mtp_num_depths
 
-            freeze_base_model_for_mtp = self._model_config.transformer.freeze_base_model_for_mtp
-            if args is not None:
-                freeze_base_model_for_mtp = freeze_base_model_for_mtp or (
-                    getattr(args, "freeze_base_model_for_mtp", False) is True
-                )
-            if freeze_base_model_for_mtp and parsed_config_list.mtp_num_depths == 0:
-                raise ValueError(
-                    "freeze_base_model_for_mtp requires hybrid_layer_config_list "
-                    "to define at least one MTP head"
-                )
-
             if args is not None:
                 if (
                     args_mtp_num_layers is not None

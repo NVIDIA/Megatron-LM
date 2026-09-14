@@ -456,18 +456,23 @@ class TestHybridModelBuilderBuildModel:
     @patch("megatron.training.models.hybrid.is_pp_last_stage", return_value=True)
     @patch("megatron.training.models.hybrid.is_pp_first_stage", return_value=True)
     @patch("megatron.training.models.hybrid.HybridModel")
-    def test_config_list_rejects_frozen_base_without_mtp_heads(self, mock_model, *_):
+    def test_config_list_delegates_frozen_base_validation_to_model(self, mock_model, *_):
         transformer = _make_transformer()
         transformer.freeze_base_model_for_mtp = True
         decoder_layer = AttentionLayerConfig.from_config(transformer)
         config = _make_hybrid_config(
             transformer=transformer, hybrid_layer_config_list=[decoder_layer, decoder_layer]
         )
+        mock_model.side_effect = ValueError(
+            "freeze_base_model_for_mtp requires the HybridModel architecture "
+            "to define at least one MTP head"
+        )
 
         with pytest.raises(ValueError, match="requires.*at least one MTP head"):
             HybridModelBuilder(config).build_model(self.pg, pre_process=True, post_process=True)
 
-        assert not mock_model.called
+        mock_model.assert_called_once()
+        assert mock_model.call_args.kwargs["config"].freeze_base_model_for_mtp is True
 
     @patch("megatron.training.models.hybrid.get_args", side_effect=AssertionError)
     @patch("megatron.training.models.hybrid.calculate_padded_vocab_size")

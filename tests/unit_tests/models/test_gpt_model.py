@@ -78,6 +78,76 @@ class TestGPTModel:
         num_weights = sum([p.numel() for p in self.gpt_model.parameters()])
         assert num_weights == 6240
 
+    @pytest.mark.parametrize("mtp_num_layers", [None, 0, -1])
+    def test_frozen_base_requires_mtp(self, mtp_num_layers):
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=12,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            mtp_num_layers=mtp_num_layers,
+            freeze_base_model_for_mtp=True,
+        )
+
+        with pytest.raises(
+            ValueError, match="freeze_base_model_for_mtp requires mtp_num_layers >= 1"
+        ):
+            GPTModel(
+                config=config,
+                transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
+                vocab_size=100,
+                max_sequence_length=4,
+            )
+
+    @pytest.mark.parametrize("mtp_num_layers", [None, 0])
+    def test_unfrozen_base_without_mtp(self, mtp_num_layers):
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=12,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            mtp_num_layers=mtp_num_layers,
+        )
+
+        model = GPTModel(
+            config=config,
+            transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
+            vocab_size=100,
+            max_sequence_length=4,
+        )
+
+        assert model.config.freeze_base_model_for_mtp is False
+        assert model.mtp_process is False
+
+    @pytest.mark.parametrize("has_mtp_spec", [False, True])
+    def test_frozen_base_allows_global_mtp_without_local_mtp(self, mocker, has_mtp_spec):
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=12,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            mtp_num_layers=1,
+            freeze_base_model_for_mtp=True,
+        )
+        placement = mocker.patch(
+            "megatron.core.models.gpt.gpt_model.mtp_on_this_rank", return_value=False
+        )
+        layer_spec = get_gpt_layer_with_transformer_engine_spec()
+
+        model = GPTModel(
+            config=config,
+            transformer_layer_spec=layer_spec,
+            vocab_size=100,
+            max_sequence_length=4,
+            mtp_block_spec=layer_spec if has_mtp_spec else None,
+        )
+
+        assert placement.call_count == int(has_mtp_spec)
+        assert model.config.freeze_base_model_for_mtp is True
+        assert model.config.mtp_num_layers == 1
+        assert model.mtp_process is False
+        assert not hasattr(model, "mtp")
+
     @pytest.mark.internal
     def test_set_input_tensor(self):
         config: TransformerConfig = self.gpt_model.config

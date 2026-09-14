@@ -344,7 +344,8 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 **logging_pg_kwargs,
             )
 
-        if self.config.freeze_base_model_for_mtp and self.mtp_num_depths == 0:
+        # Validate the full architecture, including MTP heads on other pipeline stages.
+        if self.config.freeze_base_model_for_mtp and self.mtp_num_depths < 1:
             raise ValueError(
                 "freeze_base_model_for_mtp requires the HybridModel architecture "
                 "to define at least one MTP head"
