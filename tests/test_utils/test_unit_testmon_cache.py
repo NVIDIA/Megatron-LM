@@ -97,8 +97,6 @@ def test_platform_and_bucket_are_isolated(source_tree):
     assert all(
         identity["cache_prefix"].startswith("unit-testmon-v1-main-") for identity in identities
     )
-    with pytest.raises(ValueError, match="immutable"):
-        cache.cache_identity(source_tree, BUCKET, "dgx_h100", "image:latest")
 
 
 def test_runtime_tracks_normalized_exact_versions_and_duplicate_distributions(monkeypatch):
@@ -125,12 +123,17 @@ def test_runtime_tracks_normalized_exact_versions_and_duplicate_distributions(mo
     assert identity["python"]
 
 
-@pytest.mark.parametrize("consumer_image", [IMAGE_ID, "sha256:" + "c" * 64])
-def test_valid_generation_accepts_different_image_and_is_read_only(
+@pytest.mark.parametrize("consumer_image", [IMAGE_ID, "sha256:" + "c" * 64, "image:latest", None])
+def test_valid_generation_accepts_optional_image_diagnostics_and_is_read_only(
     generation, source_tree, consumer_image
 ):
     directory, identity = generation
-    consumer = cache.cache_identity(source_tree, BUCKET, "dgx_h100", consumer_image)
+    if consumer_image is None:
+        consumer = cache.cache_identity(source_tree, BUCKET, "dgx_h100")
+        assert consumer["image_id"] == "unknown"
+    else:
+        consumer = cache.cache_identity(source_tree, BUCKET, "dgx_h100", consumer_image)
+        assert consumer["image_id"] == consumer_image
     assert consumer["cache_prefix"] == identity["cache_prefix"]
     before = _snapshot(directory)
     manifest = cache.validate_cache(directory, consumer, identity["cache_prefix"] + "123-1")
@@ -239,6 +242,62 @@ def _action_script(name):
     return next(step["run"] for step in action["runs"]["steps"] if step["name"] == name)
 
 
+@pytest.mark.parametrize("diagnostic", ["failed-inspection", "omitted-cli-option"])
+def test_identity_without_image_diagnostics_preserves_usable_cache(
+    generation, source_tree, tmp_path, diagnostic
+):
+    directory, producer = generation
+    runtime_dir = tmp_path / "runtime"
+    runtime_dir.mkdir()
+    output = tmp_path / "output"
+    before = _snapshot(directory)
+    script = (
+        _action_script("Compute unit Testmon cache identity")
+        if diagnostic == "failed-inspection"
+        else 'python tests/unit_tests/testmon_cache.py identity --bucket "$BUCKET" '
+        '--platform "$RECIPE_PLATFORM" --output "$RUNNER_TEMP/unit-testmon-identity.json" '
+        '| tee -a "$GITHUB_OUTPUT"'
+    )
+    result = subprocess.run(
+        ["bash", "-e", "-u", "-o", "pipefail"],
+        input="\n".join(
+            (
+                # Do not inspect Docker or delete anything; use only the temporary source tree.
+                'docker() { [[ "$1 $2" == "image inspect" ]]; return 1; }',
+                'sudo() { [[ "$*" == "rm -rf -- assets_dir/testmon" ]]; }',
+                'python() { [[ "$1" == "tests/unit_tests/testmon_cache.py" ]]; '
+                'shift; "$TEST_PYTHON" "$TESTMON_HELPER" "$@"; }',
+                script,
+            )
+        ),
+        cwd=source_tree,
+        env={
+            **os.environ,
+            "TEST_PYTHON": sys.executable,
+            "TESTMON_HELPER": str(HELPER),
+            "TARGET_BRANCH": "main",
+            "SUITE_TAG": "latest",
+            "BUCKET": BUCKET,
+            "RECIPE_PLATFORM": "dgx_h100",
+            "CONTAINER_IMAGE": "image:latest",
+            "RUNNER_TEMP": str(runtime_dir),
+            "GITHUB_OUTPUT": str(output),
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    consumer = json.loads((runtime_dir / "unit-testmon-identity.json").read_text())
+    assert consumer["image_id"] == "unknown"
+    assert consumer["cache_prefix"] == producer["cache_prefix"]
+    assert consumer["compatibility"] == producer["compatibility"]
+    assert output.read_text().strip() == f"cache_prefix={producer['cache_prefix']}"
+    manifest = cache.validate_cache(directory, consumer, producer["cache_prefix"] + "123-1")
+    assert manifest["source_sha"] == "b" * 40
+    assert _snapshot(directory) == before
+
+
 @pytest.mark.parametrize(
     "mode,publication,expected",
     [
@@ -270,7 +329,16 @@ def test_producer_result_requires_cache_publication(mode, publication, expected)
 
 @pytest.mark.parametrize(
     "restore",
-    ["valid", "different-image", "changed-config", "miss", "error", "invalid", "identity-error"],
+    [
+        "valid",
+        "different-image",
+        "missing-image",
+        "changed-config",
+        "miss",
+        "error",
+        "invalid",
+        "identity-error",
+    ],
 )
 def test_action_resolver_uses_prefix_restores_and_never_bootstraps(
     generation, source_tree, tmp_path, restore
@@ -278,6 +346,8 @@ def test_action_resolver_uses_prefix_restores_and_never_bootstraps(
     directory, identity = generation
     if restore == "different-image":
         identity = cache.cache_identity(source_tree, BUCKET, "dgx_h100", "sha256:" + "c" * 64)
+    elif restore == "missing-image":
+        identity = cache.cache_identity(source_tree, BUCKET, "dgx_h100")
     elif restore == "changed-config":
         (source_tree / "tests/unit_tests/find_test_cases.py").write_text("changed")
         identity = cache.cache_identity(source_tree, BUCKET, "dgx_h100", IMAGE_ID)
@@ -315,7 +385,7 @@ def test_action_resolver_uses_prefix_restores_and_never_bootstraps(
         check=False,
     )
     assert result.returncode == 0, result.stderr
-    valid = restore in {"valid", "different-image"}
+    valid = restore in {"valid", "different-image", "missing-image"}
     assert output.read_text().strip() == ("mode=enforce" if valid else "mode=full")
     after = _snapshot(directory)
     after.pop("summary.md", None)

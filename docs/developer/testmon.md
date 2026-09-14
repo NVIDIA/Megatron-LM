@@ -42,8 +42,9 @@ an older compatible generation. GitHub's `cache-hit: false` can still mean a
 successful prefix restore; the matched key and validation determine eligibility.
 
 The cache records the producer SHA, creation time, compatibility identity and
-phase metadata. The producer image ID is diagnostic metadata, so independently
-built PR images can use the baseline when the compatibility checks pass.
+phase metadata. Image IDs are optional diagnostics; an unavailable ID is reported
+as `unknown`. Independently built PR images can use the baseline when the
+compatibility checks pass.
 Selection operates on private copies and does not modify the restored databases.
 An older compatible source baseline can select tests for a newer commit; the
 comparison includes all changes since that baseline.

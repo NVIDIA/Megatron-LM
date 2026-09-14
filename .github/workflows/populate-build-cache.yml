@@ -123,6 +123,7 @@ jobs:
       - name: Record and publish the complete bucket
         uses: ./.github/actions
         with:
+          script: ""
           test_case: ${{ matrix.bucket }}
           platform: ${{ matrix.platform }}
           container-image: ${{ matrix.image }}

@@ -99,14 +99,14 @@ def _digest(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def cache_identity(root: Path, bucket: str, recipe_platform: str, image_id: str) -> dict:
+def cache_identity(
+    root: Path, bucket: str, recipe_platform: str, image_id: str = "unknown"
+) -> dict:
     """Separate cache lookup from compatibility checks and diagnostic image identity."""
     if recipe_platform not in {"dgx_h100", "dgx_gb200"}:
         raise ValueError(f"unsupported Testmon platform: {recipe_platform}")
     if not bucket.startswith("tests/unit_tests/") or "\n" in bucket:
         raise ValueError("invalid unit-test bucket")
-    if not re.fullmatch(r"sha256:[0-9a-f]{64}", image_id):
-        raise ValueError("an immutable Docker image ID is required")
     paths = {root / path for path in COMPATIBILITY_FILES}
     paths.update(
         path for pattern in COMPATIBILITY_GLOBS for path in root.glob(pattern) if path.is_file()
@@ -258,7 +258,7 @@ def main(argv: list[str] | None = None) -> int:
     identity_parser.add_argument("--root", type=Path, default=Path("."))
     identity_parser.add_argument("--bucket", required=True)
     identity_parser.add_argument("--platform", required=True)
-    identity_parser.add_argument("--image-id", required=True)
+    identity_parser.add_argument("--image-id", default="unknown")
     identity_parser.add_argument("--output", type=Path, required=True)
     for command in ("validate", "finalize"):
         child = subparsers.add_parser(command)

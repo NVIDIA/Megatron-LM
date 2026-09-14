@@ -24,8 +24,7 @@ inputs:
     default: "30"
   script:
     description: "Test script to execute"
-    required: false
-    default: ""
+    required: true
   is-optional:
     description: "Pass this job on failure."
     required: false
@@ -160,7 +159,7 @@ runs:
       run: |
         [[ "$TARGET_BRANCH" == "main" && "$SUITE_TAG" == "latest" ]]
         sudo rm -rf -- assets_dir/testmon
-        IMAGE_ID=$(docker image inspect --format '{{.Id}}' "$CONTAINER_IMAGE")
+        IMAGE_ID=$(docker image inspect --format '{{.Id}}' "$CONTAINER_IMAGE") || IMAGE_ID=unknown
         python tests/unit_tests/testmon_cache.py identity \
           --bucket "$BUCKET" --platform "$RECIPE_PLATFORM" --image-id "$IMAGE_ID" \
           --output "$RUNNER_TEMP/unit-testmon-identity.json" | tee -a "$GITHUB_OUTPUT"
