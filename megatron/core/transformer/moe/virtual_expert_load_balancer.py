@@ -103,7 +103,7 @@ def plan_virtual_expert_routes(top_indices: torch.Tensor, workspace) -> VirtualE
 
 @dataclass(frozen=True, slots=True)
 class _VirtualExpertConfig:
-    """What sizes the shared slots; every virtual-expert layer of a process must agree on it."""
+    """The expert storage layout used to share slots between compatible layers."""
 
     group_name: str
     device: torch.device
@@ -113,97 +113,57 @@ class _VirtualExpertConfig:
     mxfp8: bool
     grad_dtype: torch.dtype
     num_sms: int
+    gtp: tuple[bool, ...] = (False, False)
 
 
-class _VirtualExperts:
-    """One MoE layer's runtime weights, GTP bindings and pointer tables over shared virtual slots.
+class _VirtualExpertStorage:
+    """Transport arenas and slots shared by layers with the same expert storage layout.
 
-    Class-level weight/gradient arenas, NCCL registrations, virtual parameters and plain native
-    staging serve every layer. One layer's virtual experts are live at a time: planner histogram
-    exchange orders pushes after the previous GEMMs, and reduction rendezvous orders gradient
-    rewrites after peer reads. MXFP8 shares arena bytes across its two GEMM orientations.
-    Instance state keeps each layer's native weights and pointer tables independent. The kernels
-    read the shared arenas/handles/barriers through the instance; their scratch stays private.
+    MXFP8 main layers and BF16 MTP layers retain separate arenas. A layout's storage is reused
+    across forwards; its NCCL registrations are released before the process group is destroyed.
     """
 
-    config: _VirtualExpertConfig | None = None
-    weight_arena = grad_arena = weight_handle = grad_handle = None
-    slot_weights = native_staging = ()
+    def __init__(self, group, config: _VirtualExpertConfig, templates) -> None:
+        self.config = config
+        self.weight_arena = self.grad_arena = self.weight_handle = self.grad_handle = None
+        self.slot_weights = self.native_staging = ()
+        try:
+            self._allocate(group, config, templates)
+        except Exception:
+            self.destroy()
+            raise
 
-    def __init__(self, group, config: _VirtualExpertConfig, parameters) -> None:
-        cls = type(self)
-        if cls.config is None:
-            try:
-                cls._allocate_shared(group, config, tuple(p[0] for p in parameters))
-            except Exception:
-                cls.destroy()
-                raise
-        elif cls.config != config:
-            raise ValueError(
-                f"Virtual-expert layers must share one layout: bound {cls.config}, got {config}. "
-                "Call VirtualExpertLoadBalancer.finalize() before rebuilding process groups."
-            )
-        self.parameters = parameters
-        self.gtp_leaders = tuple(p[0] if _is_gtp(p[0]) else None for p in parameters)
-        self.native_grads = list(cls.native_staging)
-        self.placeholder = torch.empty(0, dtype=config.grad_dtype, device=config.device)
-        self.runtime_weights = []
-        for i, weights in enumerate(parameters):
-            slots, grads = cls.slot_weights[i], cls.native_staging[i]
-            if self.gtp_leaders[i] is not None:
-                # GTP shells borrow slot storage until push; main_grad stays empty until backward.
-                if config.mxfp8:
-                    weights = self._wrap_mxfp8(
-                        weights[0],
-                        config.member_shapes[i],
-                        tuple(
-                            tuple(getattr(slot, name) for name in _MXFP8_COMPONENTS)
-                            for slot in slots
-                        ),
-                        config.device,
-                    )
-                else:
-                    weights = (torch.empty(0, dtype=torch.bfloat16, device=config.device),) * len(
-                        weights
-                    )
-                grads = (self.placeholder,) * len(weights)
-            self.runtime_weights.append(
-                (*(self._runtime_parameter(w, g) for w, g in zip(weights, grads)), *slots)
-            )
-        self._tables: list[dict] = [{} for _ in parameters]
-
-    @classmethod
-    def _allocate_shared(cls, group, config: _VirtualExpertConfig, templates) -> None:
+    def _allocate(self, group, config: _VirtualExpertConfig, templates) -> None:
         import torch.distributed._symmetric_memory as symm_mem
 
-        cls.config = config
+        self.config = config
         device, count, mxfp8 = config.device, config.num_local_experts, config.mxfp8
         # What the kernels read.
-        cls.rank = dist.get_rank(group=group)
-        cls.world_size = config.ep_size
-        cls.num_local_experts = count
-        cls.member_numels = tuple(math.prod(shape) for shape in config.member_shapes)
-        cls.num_sms = config.num_sms
+        self.rank = dist.get_rank(group=group)
+        self.world_size = config.ep_size
+        self.num_local_experts = count
+        self.member_numels = tuple(math.prod(shape) for shape in config.member_shapes)
+        self.num_sms = config.num_sms
         # One E8M0 scale byte per 32 MXFP8 weight bytes, unpadded (the config requires 128-aligned
         # FC layers so TE's padded scale layout has this exact size).
-        scale_numels = tuple(numel // 32 if mxfp8 else 0 for numel in cls.member_numels)
-        cls._weight_sections = [
-            count * n for pair in zip(cls.member_numels, scale_numels) for n in pair
+        scale_numels = tuple(numel // 32 if mxfp8 else 0 for numel in self.member_numels)
+        self._weight_sections = [
+            count * n for pair in zip(self.member_numels, scale_numels) for n in pair
         ]
-        cls._grad_sections = [count * numel for numel in cls.member_numels]
+        self._grad_sections = [count * numel for numel in self.member_numels]
         try:
             if symm_mem.get_backend(device) != "NCCL":
                 symm_mem.set_backend("NCCL")
-            cls.weight_arena = symm_mem.empty(
-                sum(cls._weight_sections),
+            self.weight_arena = symm_mem.empty(
+                sum(self._weight_sections),
                 dtype=torch.uint8 if mxfp8 else torch.bfloat16,
                 device=device,
             )
-            cls.weight_handle = symm_mem.rendezvous(cls.weight_arena, group)
-            cls.grad_arena = symm_mem.empty(
-                sum(cls._grad_sections), dtype=config.grad_dtype, device=device
+            self.weight_handle = symm_mem.rendezvous(self.weight_arena, group)
+            self.grad_arena = symm_mem.empty(
+                sum(self._grad_sections), dtype=config.grad_dtype, device=device
             )
-            cls.grad_handle = symm_mem.rendezvous(cls.grad_arena, group)
+            self.grad_handle = symm_mem.rendezvous(self.grad_arena, group)
         except RuntimeError as exc:
             raise RuntimeError(
                 "Virtual-expert weights could not allocate NCCL symmetric memory for the EP group; "
@@ -212,23 +172,23 @@ class _VirtualExperts:
         # The reduction reaches every peer's gradient slots through one TMA descriptor whose
         # outermost stride is the distance between consecutive peers' windows, so the allocator's
         # uniform mapping is a hard requirement: verify it once, here.
-        bases = cls.grad_handle.buffer_ptrs
+        bases = self.grad_handle.buffer_ptrs
         stride = bases[1] - bases[0] if len(bases) > 1 else 0
         if any(base != bases[0] + peer * stride for peer, base in enumerate(bases)):
             raise RuntimeError(
                 "NCCL symmetric memory did not map the peers' gradient windows at a uniform "
                 f"stride: {bases}."
             )
-        cls.weight_arena.zero_()
-        cls.grad_arena.zero_()
-        cls.weight_grid_barrier = torch.zeros(1, dtype=torch.int32, device=device)
-        cls.grad_grid_barrier = torch.zeros(1, dtype=torch.int32, device=device)
-        cls.slot_weights = tuple(
-            cls._slot_parameters(i, template) for i, template in enumerate(templates)
+        self.weight_arena.zero_()
+        self.grad_arena.zero_()
+        self.weight_grid_barrier = torch.zeros(1, dtype=torch.int32, device=device)
+        self.grad_grid_barrier = torch.zeros(1, dtype=torch.int32, device=device)
+        self.slot_weights = tuple(
+            self._slot_parameters(i, template) for i, template in enumerate(templates)
         )
         # Plain natives' wgrad staging per FC layer: TE's GEMM overwrites it, the reduction adds the
         # virtual-expert partials, autograd hands it on. GTP natives write per-backward scratch.
-        cls.native_staging = tuple(
+        self.native_staging = tuple(
             None if _is_gtp(t) else torch.empty((count, *s), dtype=config.grad_dtype, device=device)
             for t, s in zip(templates, config.member_shapes)
         )
@@ -267,16 +227,15 @@ class _VirtualExperts:
         parameter.register_post_accumulate_grad_hook(lambda p: setattr(p, "grad", None))
         return parameter
 
-    @classmethod
-    def _slot_parameters(cls, fc_layer: int, template) -> tuple[torch.nn.Parameter, ...]:
+    def _slot_parameters(self, fc_layer: int, template) -> tuple[torch.nn.Parameter, ...]:
         """One runtime parameter per slot of ``fc_layer`` over its arena sections (MXFP8-wrapped
         with ``template``'s quantization metadata), its ``main_grad`` the matching gradient slot."""
-        count, shape = cls.num_local_experts, cls.config.member_shapes[fc_layer]
-        weights = cls.weight_arena.split(cls._weight_sections)
+        count, shape = self.num_local_experts, self.config.member_shapes[fc_layer]
+        weights = self.weight_arena.split(self._weight_sections)
         data = weights[2 * fc_layer].view(count, *shape)
-        grads = cls.grad_arena.split(cls._grad_sections)[fc_layer].view(count, *shape)
-        if not cls.config.mxfp8:
-            return tuple(cls._runtime_parameter(w, g) for w, g in zip(data, grads))
+        grads = self.grad_arena.split(self._grad_sections)[fc_layer].view(count, *shape)
+        if not self.config.mxfp8:
+            return tuple(self._runtime_parameter(w, g) for w, g in zip(data, grads))
         scales = weights[2 * fc_layer + 1].view(count, -1)
         if _is_gtp(template):
             rowwise, columnwise = (
@@ -294,30 +253,63 @@ class _VirtualExperts:
         )
         # set_() empties the components at teardown but would leave a view's arena _base alive.
         views = tuple(tuple(view.detach() for view in slot) for slot in views)
-        weights = cls._wrap_mxfp8(template, shape, views, data.device)
-        return tuple(cls._runtime_parameter(w, g) for w, g in zip(weights, grads))
+        weights = self._wrap_mxfp8(template, shape, views, data.device)
+        return tuple(self._runtime_parameter(w, g) for w, g in zip(weights, grads))
 
-    @classmethod
-    def destroy(cls) -> None:
+    def destroy(self) -> None:
         """Release the arenas from every runtime parameter that views them and drop the NCCL
         window registrations, while the process group is still alive. The slot parameters are the
         shared objects every layer and every TE op hold, so emptying their storage in place frees
         the arenas without visiting the layers; a forward after this fails."""
-        if cls.config is None:
+        if self.weight_arena is None and self.grad_arena is None:
             return
-        torch.cuda.synchronize(cls.config.device)
+        torch.cuda.synchronize(self.config.device)
         with torch.no_grad():
-            for slots in cls.slot_weights:
+            for slots in self.slot_weights:
                 for slot in slots:
                     slot.main_grad = None
-                    if cls.config.mxfp8:
+                    if self.config.mxfp8:
                         for name in _MXFP8_COMPONENTS:
                             getattr(slot, name).set_()
                     else:
                         slot.set_()
-        cls.weight_handle = cls.grad_handle = cls.weight_arena = cls.grad_arena = None
-        cls.config = None
-        cls.slot_weights = cls.native_staging = ()
+        self.weight_handle = self.grad_handle = self.weight_arena = self.grad_arena = None
+        self.slot_weights = self.native_staging = ()
+
+
+class _VirtualExperts:
+    """One layer's runtime weights, GTP bindings and pointer tables over shared storage."""
+
+    def __init__(self, storage: _VirtualExpertStorage, parameters) -> None:
+        self.storage = storage
+        self.config = config = storage.config
+        self.parameters = parameters
+        self.gtp_leaders = tuple(p[0] if _is_gtp(p[0]) else None for p in parameters)
+        self.native_grads = list(storage.native_staging)
+        self.placeholder = torch.empty(0, dtype=config.grad_dtype, device=config.device)
+        self.runtime_weights = []
+        for i, weights in enumerate(parameters):
+            slots, grads = storage.slot_weights[i], storage.native_staging[i]
+            if self.gtp_leaders[i] is not None:
+                # GTP shells borrow slot storage until push; main_grad stays empty until backward.
+                if config.mxfp8:
+                    weights = storage._wrap_mxfp8(
+                        weights[0],
+                        config.member_shapes[i],
+                        tuple(
+                            tuple(getattr(slot, name) for name in _MXFP8_COMPONENTS)
+                            for slot in slots
+                        ),
+                        config.device,
+                    )
+                else:
+                    weights = (torch.empty(0, dtype=torch.bfloat16, device=config.device),) * len(
+                        weights
+                    )
+                grads = (self.placeholder,) * len(weights)
+            natives = tuple(storage._runtime_parameter(w, g) for w, g in zip(weights, grads))
+            self.runtime_weights.append((*natives, *slots))
+        self._tables: list[dict] = [{} for _ in parameters]
 
     def _components(self, key: WeightDirection | Literal["grad"]) -> tuple[str, ...]:
         if self.config.mxfp8 and key != "grad":
@@ -507,6 +499,7 @@ class VirtualExpertLoadBalancer:
     # Shared by every layer of the process, allocated by the first layer to bind. Two candidate
     # weight streams: a CUDA-graph capture stream comes from the same pool and may alias one.
     planner: VirtualExpertPlannerWorkspace | None = None
+    storages: dict[_VirtualExpertConfig, _VirtualExpertStorage] = {}
     weight_streams: tuple[torch.cuda.Stream, torch.cuda.Stream] | None = None
     grad_stream: torch.cuda.Stream | None = None
 
@@ -632,8 +625,21 @@ class VirtualExpertLoadBalancer:
             mxfp8=is_mxfp8tensor(parameters[0][0]),
             grad_dtype=grad_dtype,
             num_sms=min(32 if num_sms is None else int(num_sms), MAX_VIRTUAL_EXPERT_WEIGHT_SMS),
+            gtp=tuple(_is_gtp(p[0]) for p in parameters),
         )
         cls = VirtualExpertLoadBalancer
+        if cls.storages:
+            bound = next(iter(cls.storages))
+            if (bound.group_name, bound.device, bound.ep_size, bound.num_local_experts) != (
+                config.group_name,
+                config.device,
+                config.ep_size,
+                config.num_local_experts,
+            ):
+                raise ValueError(
+                    "Virtual-expert layers must share one expert topology. Call "
+                    "VirtualExpertLoadBalancer.finalize() before rebuilding process groups."
+                )
         if cls.planner is None:
             # The planner's allocation runs the first collective on the group, which creates the
             # device communicator the slots' NCCL window registrations need.
@@ -647,7 +653,11 @@ class VirtualExpertLoadBalancer:
                 torch.cuda.Stream(device=self.device),
             )
             cls.grad_stream = torch.cuda.Stream(device=self.device)
-        self.virtual_experts = _VirtualExperts(self.group, config, parameters)
+        storage = cls.storages.get(config)
+        if storage is None:
+            storage = _VirtualExpertStorage(self.group, config, tuple(p[0] for p in parameters))
+            cls.storages[config] = storage
+        self.virtual_experts = _VirtualExperts(storage, parameters)
         experts.bind_virtual_experts(self)
 
     @classmethod
@@ -656,7 +666,9 @@ class VirtualExpertLoadBalancer:
         callers that destroy their process groups while a model is still alive (tests, an orderly
         shutdown) call it first so the NCCL windows are deregistered while their communicator
         exists."""
-        _VirtualExperts.destroy()
+        for storage in cls.storages.values():
+            storage.destroy()
+        cls.storages.clear()
         if cls.planner is not None:
             cls.planner.destroy()
         cls.planner = cls.weight_streams = cls.grad_stream = None
@@ -753,7 +765,7 @@ class VirtualExpertLoadBalancer:
         weight_stream.wait_stream(current_stream)
         with torch.cuda.stream(weight_stream):
             launch_virtual_expert_weight_prefetch(
-                virtual_experts,
+                virtual_experts.storage,
                 sources=tuple(table[0] for table in tables),
                 scale_sources=(
                     tuple(table[1] for table in tables) if virtual_experts.config.mxfp8 else None
@@ -815,7 +827,7 @@ class VirtualExpertLoadBalancer:
         self.grad_stream.wait_stream(torch.cuda.current_stream(self.device))
         with torch.cuda.stream(self.grad_stream):
             launch_virtual_expert_grad_reduce(
-                self.virtual_experts,
+                self.virtual_experts.storage,
                 native_grads=native_grads,
                 experts_to_copy=plan.experts_to_copy,
                 fc_layers=(fc_layer,),

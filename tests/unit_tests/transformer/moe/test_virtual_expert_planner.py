@@ -25,6 +25,7 @@ from megatron.core.transformer.moe.virtual_expert_load_balancer import (
     WeightDirection,
     _VirtualExpertHook,
     _VirtualExperts,
+    _VirtualExpertStorage,
 )
 from tests.unit_tests.transformer.test_transformer_config import _virtual_expert_hybridep_config
 
@@ -325,11 +326,8 @@ def _fake_virtual_experts(mxfp8, device, num_local_experts, template, staging):
     """The slots object over plain tensors: no symmetric memory, no group."""
     numel = MEMBER_SHAPE[0] * MEMBER_SHAPE[1]
 
-    # Isolate shared class state between tests; exercise the real per-layer constructor.
-    class LocalVirtualExperts(_VirtualExperts):
-        pass
-
-    virtual_experts = LocalVirtualExperts
+    virtual_experts = _VirtualExpertStorage.__new__(_VirtualExpertStorage)
+    virtual_experts.weight_handle = virtual_experts.grad_handle = None
     virtual_experts.config = SimpleNamespace(
         mxfp8=mxfp8,
         member_shapes=(MEMBER_SHAPE,),
@@ -361,7 +359,7 @@ def _build_fc_layer(parameters, template, staging, *, mxfp8=False):
     virtual_experts = _fake_virtual_experts(
         mxfp8, parameters[0].device, len(parameters), template, staging
     )
-    return virtual_experts(None, virtual_experts.config, (parameters,))
+    return _VirtualExperts(virtual_experts, (parameters,))
 
 
 def _gtp_fc_layer(weight_format, device, num_local_experts=2):
@@ -793,9 +791,9 @@ def test_virtual_expert_owners_share_slots_but_keep_native_bindings_separate(wei
     parameters = [torch.nn.Parameter(_mxfp8(w) if mxfp8 else w) for w in weights]
     staging = torch.zeros((1, *MEMBER_SHAPE), dtype=torch.float32, device=device)
     first = _build_fc_layer((parameters[0],), parameters[0], staging, mxfp8=mxfp8)
-    cls, config = type(first), first.config
-    second = cls(None, config, ((parameters[1],),))
-    assert first.weight_arena is second.weight_arena and first.grad_arena is second.grad_arena
+    cls = first.storage
+    second = _VirtualExperts(cls, ((parameters[1],),))
+    assert first.storage is second.storage
     assert first.runtime_weights[0][0] is not second.runtime_weights[0][0]
     assert first.runtime_weights[0][1] is second.runtime_weights[0][1]
     assert first.native_grads[0] is second.native_grads[0] is staging
@@ -806,16 +804,11 @@ def test_virtual_expert_owners_share_slots_but_keep_native_bindings_separate(wei
             expected = _data_ptrs([parameter], weight_format, direction)
             assert table[0].tolist() == expected
             assert _data_ptrs(owner.runtime_weights[0][:1], weight_format, direction) == expected
-    bad = SimpleNamespace(**vars(config))
-    bad.member_shapes = ((256, 128),)
-    with pytest.raises(ValueError, match="share one layout"):
-        cls(None, bad, ((parameters[1],),))
-
     arenas = [weakref.ref(cls.weight_arena), weakref.ref(cls.grad_arena)]
     cls.destroy()
     cls.destroy()  # Idempotent, even while layers retain runtime parameters.
     assert all(ref() is None for ref in arenas), "slot views retained their arena base"
-    assert cls.config is None and cls.weight_arena is None and cls.grad_arena is None
+    assert cls.weight_arena is None and cls.grad_arena is None
     assert cls.slot_weights == cls.native_staging == ()
     for owner in (first, second):
         slot = owner.runtime_weights[0][1]
@@ -879,17 +872,17 @@ def test_virtual_expert_grad_table_is_created_before_reduction_stream_wait(monke
 
 
 @requires_cuda
-def test_virtual_expert_shared_allocation_failure_resets_class_state():
-    """A failed first allocation must not leave a partly initialized owner for a later model."""
+def test_virtual_expert_shared_allocation_failure_releases_storage():
+    """A failed allocation releases its partial arena before it can enter the shared cache."""
+    allocations = []
 
-    class FailingVirtualExperts(_VirtualExperts):
-        @classmethod
-        def _allocate_shared(cls, group, config, templates):
-            cls.config = config
-            cls.weight_arena = torch.empty(1, device=config.device)
+    class FailingStorage(_VirtualExpertStorage):
+        def _allocate(self, group, config, templates):
+            self.weight_arena = torch.empty(1, device=config.device)
+            allocations.append(weakref.ref(self.weight_arena))
             raise RuntimeError("allocation failed")
 
     config = SimpleNamespace(device=torch.device("cuda", torch.cuda.current_device()))
     with pytest.raises(RuntimeError, match="allocation failed"):
-        FailingVirtualExperts(None, config, ((None,),))
-    assert FailingVirtualExperts.config is None and FailingVirtualExperts.weight_arena is None
+        FailingStorage(None, config, (None,))
+    assert allocations[0]() is None
