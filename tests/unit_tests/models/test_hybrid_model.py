@@ -256,6 +256,32 @@ class TestHybridModel:
         num_weights = sum([p.numel() for p in self.model.parameters()])
         assert num_weights == 1774872
 
+    @pytest.mark.parametrize(
+        ("freeze_base", "training", "expected_grad_enabled"),
+        [(False, True, True), (True, True, False), (True, False, True)],
+    )
+    def test_frozen_base_decoder_grad_context(
+        self, monkeypatch, freeze_base, training, expected_grad_enabled
+    ):
+        decoder_input = torch.ones(4, 2, self.model.config.hidden_size, requires_grad=True)
+        grad_enabled = []
+
+        def capture_decoder(**kwargs):
+            grad_enabled.append(torch.is_grad_enabled())
+            return kwargs['hidden_states'] * 2
+
+        monkeypatch.setattr(self.model.decoder, 'forward', capture_decoder)
+        self.model.config.freeze_base_model_for_mtp = freeze_base
+        self.model.post_process = False
+        self.model.train(training)
+
+        output = self.model(
+            input_ids=None, position_ids=None, attention_mask=None, decoder_input=decoder_input
+        )
+
+        assert grad_enabled == [expected_grad_enabled]
+        assert output.requires_grad is expected_grad_enabled
+
     def test_mtp_rejects_tp_overlap(self):
         model_config = TransformerConfig(
             num_layers=1,

@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import logging
+from contextlib import nullcontext
 from typing import Literal, Optional
 
 import torch
@@ -205,6 +206,11 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         parsed = parse_hybrid_pattern(self.hybrid_layer_pattern)
         self.mtp_pattern = parsed.mtp_pattern
         self.mtp_num_depths = parsed.mtp_num_depths
+        if self.mtp_pattern is not None and self.config.overlap_moe_expert_parallel_comm:
+            raise ValueError(
+                "Hybrid MTP does not support overlap_moe_expert_parallel_comm because the "
+                "overlap scheduler does not expand the nested HybridStack."
+            )
 
         # Determine if MTP is needed (based on pattern parsing)
         self.mtp_process = (
@@ -544,16 +550,22 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         cp_layout_plan = cp_batch.thd_plan if cp_batch is not None else None
 
         # Run decoder.
-        decoder_output = self.decoder(
-            hidden_states=decoder_input,
-            attention_mask=attention_mask,
-            inference_context=inference_context,
-            rotary_pos_emb=rotary_pos_emb,
-            packed_seq_params=packed_seq_params,
-            padding_mask=padding_mask,
-            packed_seq_params_by_layout=packed_seq_params_by_layout,
-            cp_layout_plan=cp_layout_plan,
+        backbone_context = (
+            torch.no_grad()
+            if self.config.freeze_base_model_for_mtp and self.training
+            else nullcontext()
         )
+        with backbone_context:
+            decoder_output = self.decoder(
+                hidden_states=decoder_input,
+                attention_mask=attention_mask,
+                inference_context=inference_context,
+                rotary_pos_emb=rotary_pos_emb,
+                packed_seq_params=packed_seq_params,
+                padding_mask=padding_mask,
+                packed_seq_params_by_layout=packed_seq_params_by_layout,
+                cp_layout_plan=cp_layout_plan,
+            )
         if isinstance(decoder_output, tuple):
             hidden_states, mhc_multistream = decoder_output
         else:
