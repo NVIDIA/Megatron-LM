@@ -161,6 +161,52 @@ def _mxfp8_quant_swizzle_kernel(
     tl.store(scale_ptr + swizzled_offs, scale_exp, mask=col_mask)
 
 
+def mxfp8_quantize_into(x: torch.Tensor, out_data: torch.Tensor, out_scale: torch.Tensor) -> None:
+    """Quantize a 2D tensor into existing MXFP8 data and scale storage.
+
+    Args:
+        x: [M, K] tensor in bf16/fp16/fp32. K must be divisible by 32.
+        out_data: [M, K] contiguous float8_e4m3fn output tensor.
+        out_scale: Contiguous 1D scale storage in cuBLAS blocked layout. The
+            dtype may be uint8 or float8_e8m0fnu.
+    """
+    assert x.is_cuda and x.dim() == 2
+    assert x.dtype in (torch.bfloat16, torch.float16, torch.float32)
+    M, K = x.shape
+    assert K % MXFP8_BLOCK_SIZE == 0, f"K ({K}) must be divisible by {MXFP8_BLOCK_SIZE}"
+    assert out_data.is_cuda and out_data.device == x.device
+    assert out_data.shape == x.shape and out_data.dtype == torch.float8_e4m3fn
+    assert out_data.is_contiguous()
+    assert out_scale.is_cuda and out_scale.device == x.device
+    assert out_scale.dim() == 1 and out_scale.is_contiguous()
+    assert out_scale.dtype in (torch.uint8, torch.float8_e8m0fnu)
+
+    scale_cols = K // MXFP8_BLOCK_SIZE
+    n_row_blocks = _ceil_div(M, MXFP8_SCALE_ROW_BLOCK)
+    n_col_blocks = _ceil_div(scale_cols, MXFP8_SCALE_COL_BLOCK)
+    total_scale_bytes = n_row_blocks * n_col_blocks * MXFP8_SCALE_ROW_BLOCK * MXFP8_SCALE_COL_BLOCK
+    assert out_scale.numel() == total_scale_bytes
+
+    # The quantization kernel only writes logical scale entries. Clear the
+    # padded rows and columns so reused storage matches freshly quantized output.
+    out_scale_bytes = out_scale.view(torch.uint8)
+    out_scale_bytes.zero_()
+
+    BLOCK_K = triton.next_power_of_2(K)
+    BLOCK_GROUPS = BLOCK_K // MXFP8_BLOCK_SIZE
+
+    _mxfp8_quant_swizzle_kernel[(M,)](
+        out_data,
+        out_scale_bytes,
+        x,
+        K,
+        n_col_blocks,
+        REAL_GROUPS=scale_cols,
+        BLOCK_K=BLOCK_K,
+        BLOCK_GROUPS=BLOCK_GROUPS,
+    )
+
+
 def mxfp8_quantize(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Quantize a 2D tensor to MXFP8 with fused scale swizzle.
 
@@ -176,27 +222,13 @@ def mxfp8_quantize(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     assert x.dtype in (torch.bfloat16, torch.float16, torch.float32)
     M, K = x.shape
     assert K % MXFP8_BLOCK_SIZE == 0, f"K ({K}) must be divisible by {MXFP8_BLOCK_SIZE}"
-
     scale_cols = K // MXFP8_BLOCK_SIZE
     n_row_blocks = _ceil_div(M, MXFP8_SCALE_ROW_BLOCK)
     n_col_blocks = _ceil_div(scale_cols, MXFP8_SCALE_COL_BLOCK)
     total_scale_bytes = n_row_blocks * n_col_blocks * MXFP8_SCALE_ROW_BLOCK * MXFP8_SCALE_COL_BLOCK
 
     out_data = torch.empty(M, K, dtype=torch.float8_e4m3fn, device=x.device)
-    out_scale = torch.zeros(total_scale_bytes, dtype=torch.uint8, device=x.device)
-
-    BLOCK_K = triton.next_power_of_2(K)
-    BLOCK_GROUPS = BLOCK_K // MXFP8_BLOCK_SIZE
-
-    _mxfp8_quant_swizzle_kernel[(M,)](
-        out_data,
-        out_scale,
-        x,
-        K,
-        n_col_blocks,
-        REAL_GROUPS=scale_cols,
-        BLOCK_K=BLOCK_K,
-        BLOCK_GROUPS=BLOCK_GROUPS,
-    )
+    out_scale = torch.empty(total_scale_bytes, dtype=torch.uint8, device=x.device)
+    mxfp8_quantize_into(x, out_data, out_scale)
 
     return out_data, out_scale.view(torch.float8_e8m0fnu)

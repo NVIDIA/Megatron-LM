@@ -64,10 +64,20 @@ def _squared_relu_with_probs_kernel(
     probs_ptr,
     hidden_size,
     max_rows,
+    clamp_scale,
+    CLAMP: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     NUM_BLOCKS: tl.constexpr,
 ):
-    """Apply squared ReLU and router probabilities in training order."""
+    """Apply squared ReLU and router probabilities in training order.
+
+    With CLAMP set this reproduces training's fused ``weighted_clamped_squared_relu`` bit
+    for bit: the soft-clamped pre-activation and the square both stay in FP32, and the only
+    BF16 round is the final one after the FP32 routing probability is applied.
+
+    Without CLAMP the square is materialized in BF16 first, matching the unclamped
+    ``weighted_squared_relu``, which squares a BF16 ReLU output.
+    """
     pid = tl.program_id(0)
     n_used = tl.load(n_used_ptr)
     if pid >= n_used:
@@ -82,8 +92,15 @@ def _squared_relu_with_probs_kernel(
                     mask = cols < hidden_size
                     value = tl.load(input_ptr + row * hidden_size + cols, mask=mask).to(tl.float32)
                     value = tl.maximum(value, 0.0)
-                    value = (value * value).to(tl.bfloat16)
-                    value = (value.to(tl.float32) * prob).to(tl.bfloat16)
+                    if CLAMP:
+                        value = clamp_scale * libdevice.tanh(value / clamp_scale)
+                    value = value * value
+                    if not CLAMP:
+                        # Unclamped training (weighted_squared_relu) squares a BF16 ReLU
+                        # output, so the BF16 materialization is part of matching it. The
+                        # clamped path stays in FP32 to the single final round instead.
+                        value = value.to(tl.bfloat16).to(tl.float32)
+                    value = (value * prob).to(tl.bfloat16)
                     tl.store(output_ptr + row * hidden_size + cols, value, mask=mask)
 
 
@@ -225,9 +242,18 @@ def weighted_silu_mul_bounded(
 
 
 def squared_relu_with_probs(
-    x: torch.Tensor, permutation_map: torch.Tensor, n_used: torch.Tensor, probs: torch.Tensor
+    x: torch.Tensor,
+    permutation_map: torch.Tensor,
+    n_used: torch.Tensor,
+    probs: torch.Tensor,
+    clamp_scale: Optional[float] = None,
 ) -> torch.Tensor:
-    """Match training's BF16 squared-ReLU rounding before the FP32 probability multiply."""
+    """Match training's BF16 squared-ReLU rounding before the FP32 probability multiply.
+
+    Args:
+        clamp_scale: config.activation_func_tanh_clamp_scale. If set, precondition the
+            input with the tanh soft clamp ``s * tanh(x / s)``.
+    """
     num_rows, hidden_size = x.shape
     out = torch.empty_like(x)
     block_size = min(triton.next_power_of_2(hidden_size), 1024)
@@ -240,6 +266,8 @@ def squared_relu_with_probs(
         probs,
         hidden_size,
         num_rows,
+        clamp_scale if clamp_scale is not None else 0.0,
+        CLAMP=clamp_scale is not None,
         BLOCK_SIZE=block_size,
         NUM_BLOCKS=num_blocks,
     )
