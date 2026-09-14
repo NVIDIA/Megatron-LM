@@ -968,7 +968,7 @@ class TestDSAHelperEdgeCases:
             n_heads=4,
             head_dim=32,
             num_indexer_layers=0,
-            dsa_indexer_loss_coeff=0.01,
+            dsa_indexer_loss_enabled=True,
         ) == (0, 0)
 
     def test_indexer_flops_sparse_loss_expansion(self):
@@ -982,17 +982,17 @@ class TestDSAHelperEdgeCases:
         )
         fma = 2
         core = 4 * 32 / 2
-        _, off = _dsa_indexer_flops(**common, dsa_indexer_loss_coeff=0.0)
-        _, dense = _dsa_indexer_flops(**common, dsa_indexer_loss_coeff=0.01)
+        _, off = _dsa_indexer_flops(**common, dsa_indexer_loss_enabled=False)
+        _, dense = _dsa_indexer_flops(**common, dsa_indexer_loss_enabled=True)
         _, sparse = _dsa_indexer_flops(
             **common,
-            dsa_indexer_loss_coeff=0.01,
+            dsa_indexer_loss_enabled=True,
             dsa_indexer_use_sparse_loss=True,
             sparse_core_scale=0.25,
         )
         _, sparse_dense_scale = _dsa_indexer_flops(
             **common,
-            dsa_indexer_loss_coeff=0.01,
+            dsa_indexer_loss_enabled=True,
             dsa_indexer_use_sparse_loss=True,
             sparse_core_scale=1.0,
         )
@@ -1002,8 +1002,8 @@ class TestDSAHelperEdgeCases:
         assert sparse_dense_scale == dense
         # The flag is a no-op without the loss.
         assert _dsa_indexer_flops(
-            **common, dsa_indexer_loss_coeff=0.0, dsa_indexer_use_sparse_loss=True
-        ) == _dsa_indexer_flops(**common, dsa_indexer_loss_coeff=0.0)
+            **common, dsa_indexer_loss_enabled=False, dsa_indexer_use_sparse_loss=True
+        ) == _dsa_indexer_flops(**common, dsa_indexer_loss_enabled=False)
 
     def test_sparse_core_scale_degenerate_inputs(self):
         """Zero tokens or an unset top-k fall back to the dense scale of 1.0."""
