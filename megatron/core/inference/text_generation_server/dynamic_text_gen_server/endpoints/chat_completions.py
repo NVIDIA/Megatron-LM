@@ -893,10 +893,12 @@ try:
                             "compact_prompt_token_ids"
                         )
                         if not isinstance(previous_prompt_token_ids, list):
-                            raise ValueError(
-                                "Prefix stitching requires compact_prompt_token_ids "
-                                "from the previous Megatron-Inference response."
-                            )
+                            if previous_media_slots:
+                                raise ValueError(
+                                    "Prefix stitching requires compact_prompt_token_ids "
+                                    "from the previous Megatron-Inference response."
+                                )
+                            previous_prompt_token_ids = last_assistant_message["prompt_token_ids"]
                         eos_token_id = tokenizer.eos_id
                         assert eos_token_id is not None, "Your tokenizer must have an EOS token ID!"
 
