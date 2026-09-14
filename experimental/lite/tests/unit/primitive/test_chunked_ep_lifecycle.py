@@ -94,7 +94,7 @@ def test_reserve_park_release_and_rematerialize(workspaces):
 
 @pytest.mark.parametrize("mtp", [False, True])
 def test_mtp_composition_is_explicit(mtp):
-    from megatron.lite.model.qwen3_moe.lite.head_loss import validate_chunked_ep_mtp
+    from megatron.lite.model.qwen3_moe.lite.model import validate_chunked_ep_mtp
 
     if mtp:
         with pytest.raises(ValueError, match="MTP"):

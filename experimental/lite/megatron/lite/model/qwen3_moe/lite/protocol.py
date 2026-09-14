@@ -25,9 +25,7 @@ Qwen3 ChunkedEP fields in ``ImplConfig``:
   composition. ChunkedEP requires DeepEP, EP>1, top-k<=EP, and an explicit
   capacity. Full recompute requires ChunkedEP; normal ChunkedEP rejects outer
   ``moe``/``full`` recompute. ChunkedEP with MTP is rejected before allocation.
-  ``cross_entropy_fusion`` can coexist with ChunkedEP and takes precedence over
-  its non-fused chunked head loss. Without fusion, ``calculate_entropy=True``
-  uses the full-vocabulary head fallback (not the bounded chunked CE path).
+  Head and cross-entropy computation retain their existing configuration.
 """
 
 from __future__ import annotations
@@ -56,10 +54,10 @@ from megatron.lite.model.qwen3_moe.common import is_expert_param
 from megatron.lite.model.qwen3_moe.config import Qwen3MoEConfig
 from megatron.lite.model.qwen3_moe.lite.checkpoint import EXPERT_CLASSIFIER, PLACEMENT_FN
 from megatron.lite.model.qwen3_moe.lite.checkpoint import load_hf_weights as _load_hf_weights_impl
-from megatron.lite.model.qwen3_moe.lite.head_loss import validate_chunked_ep_mtp
 from megatron.lite.model.qwen3_moe.lite.model import (
     MTPLossAutoScaler,
     Qwen3MoEModel,
+    validate_chunked_ep_mtp,
     validate_qwen3_ep_chunk_recompute_composition,
 )
 from megatron.lite.primitive.bundle import ModelBundle
@@ -254,14 +252,15 @@ def build_model(model_cfg: Qwen3MoEConfig, *, impl_cfg: ImplConfig) -> ModelBund
         ep_chunk_full_recompute=impl_cfg.ep_chunk_full_recompute,
         recompute_modules=impl_cfg.recompute,
     )
-    validate_ep_chunk_overlap_config(
-        impl_cfg.enable_ep_chunk_overlap,
-        use_deepep=impl_cfg.use_deepep,
-        ep_size=impl_cfg.parallel.ep,
-        topk=model_cfg.num_experts_per_tok,
-        max_token_rows_per_rank=impl_cfg.ep_chunk_max_token_rows_per_rank,
-        chunk_count=impl_cfg.ep_chunk_count,
-    )
+    if impl_cfg.enable_ep_chunk_overlap:
+        validate_ep_chunk_overlap_config(
+            impl_cfg.enable_ep_chunk_overlap,
+            use_deepep=impl_cfg.use_deepep,
+            ep_size=impl_cfg.parallel.ep,
+            topk=model_cfg.num_experts_per_tok,
+            max_token_rows_per_rank=impl_cfg.ep_chunk_max_token_rows_per_rank,
+            chunk_count=impl_cfg.ep_chunk_count,
+        )
     p = impl_cfg.parallel
     lora_config = normalize_lora_config(impl_cfg.lora)
 

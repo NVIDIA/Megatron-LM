@@ -14,11 +14,6 @@ import torch
 import torch.nn as nn
 
 from megatron.lite.model.qwen3_moe.config import Qwen3MoEConfig
-from megatron.lite.model.qwen3_moe.lite.head_loss import (
-    balanced_head_loss_chunk_size,
-    use_chunked_head_loss,
-    validate_chunked_ep_mtp,
-)
 from megatron.lite.primitive import transformer_engine as te
 from megatron.lite.primitive.modules.dispatcher import TokenDispatcher
 from megatron.lite.primitive.modules.experts import Experts
@@ -37,9 +32,6 @@ from megatron.lite.primitive.modules.moe_ep_chunk_overlap_policy import (
     validate_ep_chunk_overlap_config,
 )
 from megatron.lite.primitive.modules.router import TopKRouter
-from megatron.lite.primitive.ops.chunked_linear_cross_entropy import (
-    chunked_vocab_parallel_linear_cross_entropy,
-)
 from megatron.lite.primitive.ops.cross_entropy import vocab_parallel_cross_entropy
 from megatron.lite.primitive.ops.linear_cross_entropy import linear_cross_entropy
 from megatron.lite.primitive.ops.logprob import vocab_parallel_entropy
@@ -58,6 +50,12 @@ from megatron.lite.primitive.utils import build_fp8_recipe
 # ---------------------------------------------------------------------------
 # MoE Layer (thin assembly over megatron.lite.primitive.modules)
 # ---------------------------------------------------------------------------
+
+
+def validate_chunked_ep_mtp(*, enable_ep_chunk_overlap: bool, mtp_enable: bool) -> None:
+    """Reject the unqualified MTP composition before allocation."""
+    if enable_ep_chunk_overlap and mtp_enable:
+        raise ValueError("ChunkedEP with MTP is unsupported; disable MTP or ChunkedEP.")
 
 
 class _Qwen3TransformerLayerFullRecomputeFunction(torch.autograd.Function):
@@ -710,7 +708,6 @@ class Qwen3MoEModel(nn.Module):
             ep_chunk_full_recompute=ep_chunk_full_recompute,
             recompute_modules=recompute_modules or [],
         )
-        self._head_loss_chunk_count = ep_chunk_count
         self.config = config
         self.ps = ps
         self.fp8 = fp8
@@ -908,32 +905,6 @@ class Qwen3MoEModel(nn.Module):
                         output["log_probs"] = log_probs.transpose(0, 1).contiguous()
                     if calculate_entropy:
                         output["entropy"] = entropy.transpose(0, 1).contiguous()
-                elif use_chunked_head_loss(
-                    has_labels=True,
-                    use_fused_kernels=False,
-                    calculate_entropy=calculate_entropy,
-                    has_chunked_ep=any(
-                        layer.moe.ep_chunk_forward is not None
-                        or layer.moe.ep_chunk_backward is not None
-                        or layer.moe.ep_chunk_fused is not None
-                        for layer in self.layers
-                    )
-                    and self.mtp is None,
-                ):
-                    token_loss = chunked_vocab_parallel_linear_cross_entropy(
-                        hidden_for_head,
-                        self.head.col.linear.weight,
-                        labels_sb,
-                        tp_group=self.ps.tp_group,
-                        sequence_parallel=self.ps.tp_size > 1,
-                        temperature=temperature_value,
-                        chunk_size=balanced_head_loss_chunk_size(
-                            labels_sb.numel(), self._head_loss_chunk_count
-                        ),
-                    )
-                    output["loss"] = token_loss.mean()
-                    if return_log_probs:
-                        output["log_probs"] = (-token_loss).transpose(0, 1).contiguous()
                 else:
                     logits = self.head(hidden_for_head)
                     if temperature_value != 1.0:

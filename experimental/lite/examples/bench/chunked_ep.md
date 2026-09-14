@@ -29,16 +29,18 @@ runtime invokes release before model unload. Capture owners must discard
 graphs before explicit release. This PR does not claim CUDA graph validation.
 
 MTP is rejected. Ordinary ChunkedEP rejects outer MoE/full checkpoints; select
-the explicit full-recompute composition above. Fused CE takes precedence over
-the bounded head loss; entropy requests use the full-logit fallback and do not
-have the same peak-memory guarantee. Other model families are not qualified.
+the explicit full-recompute composition above. Head/loss computation retains
+the existing linear CE implementation and configuration, independently of
+ChunkedEP. Other model families are not qualified.
 
 ## Historical measurements
 
 Qwen3 MoE, EP8/top-k8, two chunks, full recomputation, fresh processes,
 three warmups and ten iterations, random weights, no optimizer update.
 These measurements belong to `33be6f1ef`, before this NVIDIA-dev port.
-The complete switch includes bounded LM-head/CE; these are not isolated OP gains.
+Those runs included a separate bounded LM-head/CE optimization, now removed
+from this PR. They are not isolated ChunkedEP gains and do not establish this
+PR's speed or memory benefit. New comparisons must use identical CE settings.
 
 | Layers / tokens / microbatches | Native / chunked median | Speedup | Peak allocated | Peak reserved |
 | --- | --- | --- | --- | --- |
