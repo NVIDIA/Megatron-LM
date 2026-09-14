@@ -247,6 +247,9 @@ class OptimizerConfig:
     adam_eps: float = 1e-08
     """Term added to the denominator to improve numerical stability in Adam optimizer."""
 
+    native_unfused_adamw: bool = False
+    """Use torch.optim.AdamW with foreach=False and fused=False instead of TE/Apex Adam."""
+
     decoupled_weight_decay: bool = True
     """If true, decouples weight decay from the gradient update, equivalent to AdamW. If false,
     original Adam update rule will be used. Defaults to True.

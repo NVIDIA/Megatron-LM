@@ -29,6 +29,7 @@ from megatron.core.transformer.multi_token_prediction import (
     process_mtp_loss,
     roll_tensor,
 )
+from megatron.core.transformer.torch_norm import WrappedTorchNorm
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import get_batch_on_this_cp_rank, is_te_min_version, unwrap_model
 from megatron.training.argument_utils import gpt_config_from_args, hybrid_config_from_args
@@ -81,6 +82,32 @@ class TestMultiTokenPredictionLayer:
             config=config, spec=transformer_layer_spec, use_transformer_engine=use_te
         )
         return config, mtp_block_spec
+
+    def test_accuracy_compatible_norms_override_te_mtp_norms(self):
+        """Accuracy mode routes all MTP-owned norms through native Torch RMSNorm."""
+        Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=1)
+        config = TransformerConfig(
+            mtp_num_layers=1,
+            num_layers=1,
+            hidden_size=64,
+            num_attention_heads=8,
+            normalization="RMSNorm",
+            norm_accuracy_compatible=True,
+            use_cpu_initialization=True,
+        )
+        transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec()
+        mtp_block_spec = get_gpt_mtp_block_spec(
+            config=config, spec=transformer_layer_spec, use_transformer_engine=True
+        )
+        mtp_layer_spec = mtp_block_spec.layer_specs[0]
+
+        assert mtp_layer_spec.submodules.enorm is WrappedTorchNorm
+        assert mtp_layer_spec.submodules.hnorm is WrappedTorchNorm
+        assert mtp_layer_spec.submodules.layer_norm is WrappedTorchNorm
+        final_norm = mtp_layer_spec.submodules.layer_norm(
+            config=config, hidden_size=config.hidden_size, eps=config.layernorm_epsilon
+        )
+        assert isinstance(final_norm, torch.nn.RMSNorm)
 
     def test_mtp_detach_heads_config(self):
         """Test that mtp_detach_heads config defaults to False."""

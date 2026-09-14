@@ -150,6 +150,9 @@ class ModelParallelConfig:
        be synchronized.
     """
 
+    use_accuracy_compatible: bool = False
+    """Use explicit accuracy-compatible arithmetic in model layers."""
+
     deterministic_mode: bool = False
     """If true, code that has deterministic execution will be chosen. This usually
        means slower execution, but is good for debugging and testing. Defaults to False."""

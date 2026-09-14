@@ -186,6 +186,16 @@ class TransformerConfig(ModelParallelConfig):
     )
     """Epsilon value for any LayerNorm/RMSNorm operations."""
 
+    norm_accuracy_compatible: bool = field(
+        default=False, metadata={"argparse_meta": {"arg_names": ["--norm-accuracy-compatible"]}}
+    )
+    """Use native Torch RMSNorm modules instead of Transformer Engine norm modules for alignment."""
+
+    router_accuracy_compatible: bool = field(
+        default=False, metadata={"argparse_meta": {"arg_names": ["--router-accuracy-compatible"]}}
+    )
+    """Use an explicit fp32 router GEMM instead of the fused Transformer Engine path."""
+
     layernorm_zero_centered_gamma: bool = field(
         default=False, metadata={"argparse_meta": {"arg_names": ["--apply-layernorm-1p"]}}
     )
@@ -268,6 +278,13 @@ class TransformerConfig(ModelParallelConfig):
     """Whether cross entropy loss is calculated over the actual number of non-padded tokens in the
     global batch, versus the default behavior of assuming all tokens are non-padded."""
 
+    accuracy_compatible_loss_sum_dtype: Literal["float32", "float64"] = "float64"
+    """Token-loss accumulation dtype in accuracy-compatible training.
+
+    Preserve FP64 accumulation by default. Model providers can select FP32
+    when that is the reference loss-reduction contract.
+    """
+
     multi_latent_attention: bool = False
     """Whether to use multi-latent attention."""
 
@@ -317,6 +334,14 @@ class TransformerConfig(ModelParallelConfig):
     """Optional fused DSA kernel backend.
     ``none`` disables fused DSA kernels. Explicit ``tilelang`` or ``cudnn`` enables only that
     backend. Unsupported DSA layouts continue to use the PyTorch fallback."""
+
+    dsa_accuracy_compatible: bool = field(
+        default=False, metadata={"argparse_meta": {"arg_names": ["--dsa-accuracy-compatible"]}}
+    )
+    """Use DSA reference numerics: explicit softmax backward, deferred token-loss
+    normalization, FP32 MoE accumulation and TP1 autograd paths. Disabled by
+    default to preserve existing models' accuracy-compatible behavior.
+    """
 
     dsa_indexer_rope_interleaved: bool = False
     """Whether DSA indexer RoPE should use MLA-style interleaving."""

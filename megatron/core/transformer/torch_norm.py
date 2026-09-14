@@ -47,7 +47,9 @@ class WrappedTorchNorm:
 
         assert not config.persist_layer_norm, f"persist_layer_norm not supported by torch LayerNorm"
 
-        assert not config.sequence_parallel, f"sequence parallel not supported by torch LayerNorm"
+        assert (
+            config.norm_accuracy_compatible or not config.sequence_parallel
+        ), "sequence parallel not supported by torch LayerNorm"
 
         assert (
             not config.memory_efficient_layer_norm
@@ -66,7 +68,14 @@ class WrappedTorchNorm:
         else:
             raise Exception("Only LayerNorm, RMSNorm and L2Norm are currently supported")
 
-        return norm_cls(normalized_shape=hidden_size, eps=eps)
+        factory_kwargs = {}
+        if config.normalization == "RMSNorm" and config.norm_accuracy_compatible:
+            factory_kwargs["dtype"] = config.params_dtype
+        norm = norm_cls(normalized_shape=hidden_size, eps=eps, **factory_kwargs)
+        if config.sequence_parallel:
+            for parameter in norm.parameters():
+                parameter.sequence_parallel = True
+        return norm
 
 
 class L2Norm(torch.nn.Module, LayerNormInterface):

@@ -163,7 +163,7 @@ def get_forward_backward_func(
     return forward_backward_func
 
 
-def deallocate_output_tensor(out, deallocate_pipeline_outputs=False):
+def deallocate_output_tensor(out, deallocate_pipeline_outputs=False, config=None):
     '''Pseudo-deallocate (i.e., set to scalar) the output tensor's '.data' field.
 
     This method should be called right after the output tensor has been
@@ -177,17 +177,23 @@ def deallocate_output_tensor(out, deallocate_pipeline_outputs=False):
     '''
     if (out is None) or (not deallocate_pipeline_outputs):
         return
+    if (
+        config is not None
+        and config.dsa_accuracy_compatible
+        and config.tensor_model_parallel_size <= 1
+    ):
+        return
 
     # Handle dict format (multi-module pipelines)
     if isinstance(out, dict):
         for value in out.values():
-            deallocate_output_tensor(value, deallocate_pipeline_outputs)
+            deallocate_output_tensor(value, deallocate_pipeline_outputs, config)
         return
 
     # Handle list format
     if isinstance(out, list):
         for item in out:
-            deallocate_output_tensor(item, deallocate_pipeline_outputs)
+            deallocate_output_tensor(item, deallocate_pipeline_outputs, config)
         return
 
     # Base case: deallocate tensor
@@ -568,7 +574,10 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, config):
     # This results in a tensor that does not require gradients.
     # In such cases, we intentionally skip the backward pass while preserving zero gradients.
     if output_tensor[0].requires_grad:
-        if config.deallocate_pipeline_outputs:
+        _tp_size = int(getattr(config, "tensor_model_parallel_size", 1) or 1)
+        if config.deallocate_pipeline_outputs and (
+            not config.dsa_accuracy_compatible or _tp_size > 1
+        ):
             custom_backward(output_tensor[0], output_tensor_grad[0])
         else:
             torch.autograd.backward(output_tensor[0], grad_tensors=output_tensor_grad[0])
@@ -641,7 +650,10 @@ def backward_step_multimodule(
         # In multi-modal models like VLM, some batches may not have images.
         # In such cases, skip backward while preserving zero gradients.
         if output_tensor_module is not None and output_tensor_module.requires_grad:
-            if config.deallocate_pipeline_outputs:
+            _tp_size = int(getattr(config, "tensor_model_parallel_size", 1) or 1)
+            if config.deallocate_pipeline_outputs and (
+                not config.dsa_accuracy_compatible or _tp_size > 1
+            ):
                 custom_backward(output_tensor_module, output_tensor_grad_module)
             else:
                 torch.autograd.backward(
@@ -1637,7 +1649,7 @@ def forward_backward_pipelining_with_interleaving(
                 )
             if recv_prev:
                 input_tensors[next_forward_model_chunk_id].append(input_tensor)
-            deallocate_output_tensor(output_tensor, config.deallocate_pipeline_outputs)
+            deallocate_output_tensor(output_tensor, config.deallocate_pipeline_outputs, config)
         else:
             if not is_pp_first_stage(p2p_communicator.pp_group):
                 # Send only since recv prefetched.
@@ -1667,7 +1679,7 @@ def forward_backward_pipelining_with_interleaving(
                 send_next_wait_handle.wait()
                 send_next_wait_handle = None
 
-            deallocate_output_tensor(output_tensor, config.deallocate_pipeline_outputs)
+            deallocate_output_tensor(output_tensor, config.deallocate_pipeline_outputs, config)
             if recv_prev:
                 input_tensors[next_forward_model_chunk_id].append(
                     fwd_recv_buffer[k % fwd_recv_buffer_size]
@@ -1745,7 +1757,7 @@ def forward_backward_pipelining_with_interleaving(
                             recv_prev_wait_handle = recv_prev_wait_handles.pop(0)
                             recv_prev_wait_handle.wait()
 
-                deallocate_output_tensor(output_tensor, config.deallocate_pipeline_outputs)
+                deallocate_output_tensor(output_tensor, config.deallocate_pipeline_outputs, config)
 
             # Async forward send / receive
             def pp_post_forward(output_tensor, vp_stage=None):
@@ -1920,7 +1932,7 @@ def forward_backward_pipelining_with_interleaving(
                     tensor_shape=tensor_shape,
                 )
             )
-            deallocate_output_tensor(output_tensor, config.deallocate_pipeline_outputs)
+            deallocate_output_tensor(output_tensor, config.deallocate_pipeline_outputs, config)
             # Put input_tensor and output_tensor_grad in data structures in the
             # right location.
             if recv_prev:
@@ -1928,7 +1940,7 @@ def forward_backward_pipelining_with_interleaving(
             if recv_next:
                 output_tensor_grads[next_backward_model_chunk_id].append(output_tensor_grad)
 
-    deallocate_output_tensor(output_tensor, config.deallocate_pipeline_outputs)
+    deallocate_output_tensor(output_tensor, config.deallocate_pipeline_outputs, config)
     nvtx_range_pop(suffix="steady")
 
     # Run cooldown backward passes (flush out pipeline) for the last model chunk.
@@ -2353,7 +2365,7 @@ def forward_backward_pipelining_without_interleaving(
         if not forward_only:
             input_tensors.append(input_tensor)
             output_tensors.append(output_tensor)
-            deallocate_output_tensor(output_tensor, config.deallocate_pipeline_outputs)
+            deallocate_output_tensor(output_tensor, config.deallocate_pipeline_outputs, config)
 
     # Before running 1F1B, need to receive first forward tensor.
     # If all microbatches are run in warmup / cooldown phase, then no need to
@@ -2408,7 +2420,7 @@ def forward_backward_pipelining_without_interleaving(
             # Add input_tensor and output_tensor to end of list.
             input_tensors.append(input_tensor)
             output_tensors.append(output_tensor)
-            deallocate_output_tensor(output_tensor, config.deallocate_pipeline_outputs)
+            deallocate_output_tensor(output_tensor, config.deallocate_pipeline_outputs, config)
 
             # Pop input_tensor and output_tensor from the start of the list for
             # the backward pass.

@@ -30,7 +30,7 @@ from megatron.core.tensor_parallel.inference_layers import (
 from megatron.core.transformer.enums import AttnMaskType, LayerType
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
-from megatron.core.transformer.torch_norm import LayerNormBuilder
+from megatron.core.transformer.torch_norm import LayerNormBuilder, WrappedTorchNorm
 from megatron.core.transformer.transformer_block import TransformerBlockSubmodules
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.typed_torch import apply_module
@@ -577,7 +577,9 @@ class MultiTokenPredictionLayerSubmodules:
 
 
 def get_mtp_layer_spec(
-    mtp_model_layer_spec: ModuleSpec, use_transformer_engine: bool
+    mtp_model_layer_spec: ModuleSpec,
+    use_transformer_engine: bool,
+    config: Optional[TransformerConfig] = None,
 ) -> ModuleSpec:
     """Get the MTP layer spec.
 
@@ -587,11 +589,14 @@ def get_mtp_layer_spec(
     return get_mtp_layer_spec_for_backend(
         mtp_model_layer_spec,
         backend=TESpecProvider() if use_transformer_engine else LocalSpecProvider(),
+        config=config,
     )
 
 
 def get_mtp_layer_spec_for_backend(
-    mtp_model_layer_spec: ModuleSpec, backend: BackendSpecProvider
+    mtp_model_layer_spec: ModuleSpec,
+    backend: BackendSpecProvider,
+    config: Optional[TransformerConfig] = None,
 ) -> ModuleSpec:
     """Get the MTP layer spec.
 
@@ -599,7 +604,11 @@ def get_mtp_layer_spec_for_backend(
         ModuleSpec: Module specification with modules from the backend.
     """
     column_parallel_linear_impl: type = backend.column_parallel_linear()
-    layer_norm_impl = backend.layer_norm()
+    layer_norm_impl = (
+        WrappedTorchNorm
+        if config is not None and config.norm_accuracy_compatible
+        else backend.layer_norm()
+    )
     mtp_layer_spec = ModuleSpec(
         module=MultiTokenPredictionLayer,
         submodules=MultiTokenPredictionLayerSubmodules(
@@ -1106,7 +1115,11 @@ class MultiTokenPredictionLayer(MegatronModule):
         if self.config.mtp_detach_heads:
             decoder_input = decoder_input.detach()
 
-        hidden_states = make_viewless_tensor(inp=hidden_states, requires_grad=True, keep_graph=True)
+        _tp_size = 1 if self.tp_group is None else self.tp_group.size()
+        if not (self.config.dsa_accuracy_compatible and _tp_size <= 1):
+            hidden_states = make_viewless_tensor(
+                inp=hidden_states, requires_grad=True, keep_graph=True
+            )
         # make_viewless_tensor no-ops when hidden_states is not a view (_base is None),
         # which happens after detach() with mtp_detach_heads. Activation
         # checkpointing (CheckpointFunction.apply) requires at least one input tensor
@@ -1121,10 +1134,17 @@ class MultiTokenPredictionLayer(MegatronModule):
         """
         Concatenate the tokens before sending to transformer layer.
         """
+        _tp_size = 1 if self.tp_group is None else self.tp_group.size()
         decoder_input = apply_module(self.enorm)(decoder_input)
-        decoder_input = make_viewless_tensor(inp=decoder_input, requires_grad=True, keep_graph=True)
+        if not (self.config.dsa_accuracy_compatible and _tp_size <= 1):
+            decoder_input = make_viewless_tensor(
+                inp=decoder_input, requires_grad=True, keep_graph=True
+            )
         hidden_states = apply_module(self.hnorm)(hidden_states)
-        hidden_states = make_viewless_tensor(inp=hidden_states, requires_grad=True, keep_graph=True)
+        if not (self.config.dsa_accuracy_compatible and _tp_size <= 1):
+            hidden_states = make_viewless_tensor(
+                inp=hidden_states, requires_grad=True, keep_graph=True
+            )
         # At the (k - 1)-th MTP module, concatenates the i-th token's hidden_states
         # and the (i + K)-th token's embedding, and combine them with linear projection.
         hidden_states = torch.cat((decoder_input, hidden_states), -1)
@@ -1135,7 +1155,7 @@ class MultiTokenPredictionLayer(MegatronModule):
             hidden_states = inference_all_gather_from_tensor_model_parallel_region(
                 hidden_states, self.tp_group, self.config
             )
-        else:
+        elif not (self.config.dsa_accuracy_compatible and _tp_size <= 1):
             hidden_states = gather_from_tensor_model_parallel_region(
                 hidden_states, group=self.tp_group
             )

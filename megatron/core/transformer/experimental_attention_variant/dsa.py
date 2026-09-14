@@ -64,6 +64,7 @@ def _unfused_absorbed_dsa_fn(
     varlen_starts: Optional[torch.Tensor] = None,
     varlen_ends: Optional[torch.Tensor] = None,
     key_positions: Optional[torch.Tensor] = None,
+    accuracy_compatible: bool = False,
 ) -> torch.Tensor:
     """Unfused absorbed-MLA attention: output stays [sq, b, np, v_channels]."""
     sq, b, np, hn = query.size()
@@ -99,15 +100,39 @@ def _unfused_absorbed_dsa_fn(
     )
 
     attention_scores = attention_scores + index_mask.unsqueeze(1)
-    valid_index_mask = torch.isfinite(index_mask)
-    attention_scores = dsa_masking.masked_softmax(
-        attention_scores.float(), valid_index_mask.unsqueeze(1).expand(b, np, sq, skv), dim=-1
-    )
+    valid_index_mask = torch.isfinite(index_mask).unsqueeze(1).expand(b, np, sq, skv)
+    if accuracy_compatible:
+        attention_scores = _AccuracyCompatibleSoftmax.apply(
+            attention_scores.float(), valid_index_mask
+        )
+    else:
+        attention_scores = dsa_masking.masked_softmax(
+            attention_scores.float(), valid_index_mask, dim=-1
+        )
 
     # Latent value is the first v_channels slice of absorbed key cache.
     value = key[..., :v_channels].permute(1, 2, 0, 3)  # [b,1,skv,v]
     output = torch.matmul(attention_scores.to(value.dtype), value)  # [b,np,sq,v]
     return output.permute(2, 0, 1, 3).contiguous()
+
+
+class _AccuracyCompatibleSoftmax(torch.autograd.Function):
+    """Masked softmax with an explicit backward formula for DSA alignment."""
+
+    @staticmethod
+    def forward(ctx, logits: torch.Tensor, valid_mask: torch.Tensor) -> torch.Tensor:
+        probabilities = torch.softmax(logits.masked_fill(~valid_mask, float("-inf")), dim=-1)
+        probabilities = probabilities.masked_fill(~valid_mask, 0.0)
+        ctx.save_for_backward(probabilities, valid_mask)
+        return probabilities
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        probabilities, valid_mask = ctx.saved_tensors
+        grad_logits = probabilities * (
+            grad_output - (grad_output * probabilities).sum(dim=-1, keepdim=True)
+        )
+        return grad_logits.masked_fill(~valid_mask, 0.0), None
 
 
 def _run_sparse_attention(
@@ -127,6 +152,7 @@ def _run_sparse_attention(
     topk_length: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Run sparse attention for absorbed and non-absorbed MLA paths."""
+    accuracy_compatible = bool(getattr(config, "dsa_accuracy_compatible", False))
     if absorbed_mla:
         latent_v_channels = int(getattr(config, "kv_lora_rank", 0) or 0)
         if latent_v_channels <= 0:
@@ -143,7 +169,7 @@ def _run_sparse_attention(
                 "Received absorbed layout with explicit value tensor."
             )
         output = None
-        if dsa_kernels.use_fused_dsa_kernels(config):
+        if not accuracy_compatible and dsa_kernels.use_fused_dsa_kernels(config):
             output = dsa_kernels.run_fused_absorbed_sparse_attention(
                 config,
                 query,
@@ -166,6 +192,7 @@ def _run_sparse_attention(
                 varlen_starts=varlen_starts,
                 varlen_ends=varlen_ends,
                 key_positions=key_positions,
+                accuracy_compatible=accuracy_compatible,
             )
         assert output is not None
         output = torch.einsum("sbhc,hdc->sbhd", output, up_v_weight).contiguous()
@@ -182,6 +209,7 @@ def _run_sparse_attention(
         varlen_starts=varlen_starts,
         varlen_ends=varlen_ends,
         key_positions=key_positions,
+        accuracy_compatible=accuracy_compatible,
     )
 
 
@@ -1411,6 +1439,7 @@ def unfused_dsa_fn(
     varlen_starts: Optional[torch.Tensor] = None,
     varlen_ends: Optional[torch.Tensor] = None,
     key_positions: Optional[torch.Tensor] = None,
+    accuracy_compatible: bool = False,
 ):
     """
     Unfused sparse attention implementation.
@@ -1456,6 +1485,27 @@ def unfused_dsa_fn(
         b=b,
         device=query.device,
     )
+
+    if accuracy_compatible:
+        index_mask = torch.full((b, sq, skv), float("-inf"), device=query.device)
+        dsa_masking.scatter_topk_into_index_mask(index_mask, topk_indices)
+        index_mask = dsa_masking.apply_sparse_validity_to_index_mask(
+            index_mask,
+            row_mask=row_mask,
+            varlen_starts=varlen_starts,
+            varlen_ends=varlen_ends,
+            key_positions=key_positions,
+        )
+        valid_index_mask = torch.isfinite(index_mask).unsqueeze(1).expand(b, np, sq, skv)
+        attention_scores = (
+            torch.matmul(query_b.float(), key_b.float().transpose(-1, -2)) * softmax_scale
+        )
+        attention_probs = _AccuracyCompatibleSoftmax.apply(
+            attention_scores + index_mask.unsqueeze(1), valid_index_mask
+        )
+        output = torch.matmul(attention_probs.to(value_b.dtype), value_b)
+        output = output.permute(2, 0, 1, 3).contiguous().view(sq, b, np * hnv)
+        return output.squeeze(1) if query_was_thd else output
 
     seq_chunk_size = 512
     head_chunk_size = 16
@@ -1777,8 +1827,11 @@ class DSAttention(MegatronModule):
         skv = key.size(0)
 
         # Detach x and qr to prevent gradients of indexer from flowing back to the main model.
-        x = x.detach()
-        qr = qr.detach()
+        _tp_group = getattr(self.pg_collection, "tp", None)
+        _tp_size = 1 if _tp_group is None else _tp_group.size()
+        if not (self.config.dsa_accuracy_compatible and _tp_size <= 1):
+            x = x.detach()
+            qr = qr.detach()
 
         indexer_loss_coeff = self.config.dsa_indexer_loss_coeff or 0.0
         computes_topk = not self.skip_topk

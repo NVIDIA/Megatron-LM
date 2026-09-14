@@ -1347,35 +1347,24 @@ class SequentialMLP(MegatronModule):
 
             output_local_list = []
 
-            for _ei, (expert, tokens, probs) in enumerate(
-                zip(self.local_experts, tokens_list, probs_list)
-            ):
-                # Keep the expert GEMM shape identical to Paddle in bit-exact mode.
-                # Padding only Paddle aligns tiny-M forward, but changes its backward
-                # dgrad GEMM from M<17 to M=32. Padding both sides aligns all GEMMs.
+            for expert, tokens, probs in zip(self.local_experts, tokens_list, probs_list):
+                # The unfused Paddle expert pads tiny GEMMs to 32 rows. The
+                # grouped-storage fallback uses real token counts instead.
                 num_real_tokens = tokens.shape[0]
                 pad_small_expert = _use_accuracy_compatible() and 0 < num_real_tokens < 17
+                if self.config.dsa_accuracy_compatible:
+                    pad_small_expert = (
+                        self.config.use_accuracy_compatible
+                        and not self.config.moe_grouped_gemm
+                        and not (self.config.fp8 or self.config.fp4)
+                        and 0 < num_real_tokens < 17
+                    )
                 if pad_small_expert:
                     num_pad_tokens = 32 - num_real_tokens
                     tokens = torch.cat(
-                        (
-                            tokens,
-                            torch.zeros(
-                                num_pad_tokens,
-                                tokens.shape[1],
-                                dtype=tokens.dtype,
-                                device=tokens.device,
-                            ),
-                        ),
-                        dim=0,
+                        (tokens, tokens.new_zeros(num_pad_tokens, tokens.shape[1])), dim=0
                     )
-                    probs = torch.cat(
-                        (
-                            probs,
-                            torch.zeros(num_pad_tokens, dtype=probs.dtype, device=probs.device),
-                        ),
-                        dim=0,
-                    )
+                    probs = torch.cat((probs, probs.new_zeros(num_pad_tokens)), dim=0)
                 if self.config.fp8 or self.config.fp4:
                     hidden, probs = self._pad_tensor_for_quantization(tokens, probs)
                     output, output_bias = expert(hidden, probs)

@@ -59,6 +59,51 @@ except ImportError:
 
 from megatron.core.transformer.module import _use_accuracy_compatible
 
+
+class _EmbedFp32MainGrad(torch.autograd.Function):
+    """UAC embedding lookup whose wgrad lands in fp32 main_grad.
+
+    Forward is ``weight[ids]`` (bf16 activation unchanged). Backward uses a
+    unique-row clone plus ``autograd.grad``, then ``index_add_`` into an fp32
+    ``main_grad``. Returns None for weight.grad so MixPrecision cannot add_(bf16).
+    """
+
+    @staticmethod
+    def forward(ctx, weight, ids):
+        """Look up embeddings while retaining the accumulator owner."""
+        ctx.save_for_backward(ids)
+        ctx.weight_ref = weight
+        return weight[ids]
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        """Accumulate repeated-index gradients into the FP32 master buffer."""
+        (ids,) = ctx.saved_tensors
+        weight = ctx.weight_ref
+        prev = torch.is_grad_enabled()
+        torch.set_grad_enabled(True)
+        try:
+            ids_flat = ids.reshape(-1)
+            unique_ids, inv = torch.unique(ids_flat, return_inverse=True)
+            uniq_w = weight.detach()[unique_ids].clone().requires_grad_(True)
+            looked = uniq_w[inv.reshape(ids.shape)]
+            (gw,) = torch.autograd.grad(looked, uniq_w, grad_outputs=grad_output, allow_unused=True)
+        finally:
+            torch.set_grad_enabled(prev)
+        if gw is None:
+            return None, None
+        fp = gw.float()
+        if hasattr(weight, "main_grad") and weight.main_grad is not None:
+            weight.main_grad.index_add_(0, unique_ids, fp)
+        else:
+            acc = torch.zeros(weight.shape, dtype=torch.float32, device=weight.device)
+            acc.index_add_(0, unique_ids, fp)
+            weight.main_grad = acc
+        if hasattr(weight, "grad_added_to_main_grad"):
+            weight.grad_added_to_main_grad = True
+        return None, None
+
+
 _MODEL_PARALLEL_ATTRIBUTE_DEFAULTS = {
     "expert_tp": False,
     "is_qkv": False,
@@ -237,7 +282,11 @@ class VocabParallelEmbedding(torch.nn.Module):
             )
         )
         self.num_embeddings_per_partition = self.vocab_end_index - self.vocab_start_index
-        self.deterministic_mode = config.deterministic_mode or _use_accuracy_compatible()
+        self.deterministic_mode = (
+            config.deterministic_mode
+            or _use_accuracy_compatible()
+            or config.use_accuracy_compatible
+        )
         self.config = config
 
         self.use_inference_optimized_reduce_scatter = (
@@ -299,7 +348,11 @@ class VocabParallelEmbedding(torch.nn.Module):
             masked_input = input_
         # Get the embeddings.
         if self.deterministic_mode:
-            output_parallel = self.weight[masked_input]
+            _tp_size = 1 if self.tp_group is None else self.tp_group.size()
+            if getattr(self.config, "dsa_accuracy_compatible", False) and _tp_size <= 1:
+                output_parallel = _EmbedFp32MainGrad.apply(self.weight, masked_input)
+            else:
+                output_parallel = self.weight[masked_input]
         else:
             # F.embedding currently has a non-deterministic backward function
             output_parallel = F.embedding(masked_input, self.weight)
@@ -675,6 +728,7 @@ def linear_with_grad_accumulation_and_async_allreduce(
     grad_output_buffer: Optional[List[torch.Tensor]] = None,
     wgrad_deferral_limit: Optional[int] = 0,
     tp_group: Optional[torch.distributed.ProcessGroup] = None,
+    dsa_accuracy_compatible: bool = False,
 ) -> torch.Tensor:
     """Linear layer execution with asynchronous communication and
     gradient accumulation fusion in backprop.
@@ -740,6 +794,12 @@ def linear_with_grad_accumulation_and_async_allreduce(
     """
 
     tp_group = get_tensor_model_parallel_group_if_none(tp_group)
+    _tp_size = 1 if tp_group is None else tp_group.size()
+    if dsa_accuracy_compatible and _tp_size <= 1 and not sequence_parallel and not allreduce_dgrad:
+        output = torch.matmul(input, weight.t())
+        if bias is not None:
+            output = output + bias
+        return output
 
     args = [
         input,
@@ -775,6 +835,23 @@ def linear_with_grad_accumulation_and_async_allreduce(
 
 
 linear_with_grad_accumulation_and_async_allreduce.warned = False
+
+
+def _expert_grads_need_own_dp_domain(config) -> bool:
+    """Use expert DP for split expert tensor groups in DSA alignment.
+
+    The default retains EP-only grouping. With DSA TP2/ETP1, expert replicas
+    consume different sequence shards: reduce their gradients over expt_dp
+    instead of the dense dp_cp group.
+    """
+    if config.expert_model_parallel_size > 1:
+        return True
+    if not getattr(config, 'dsa_accuracy_compatible', False):
+        return False
+    etp = getattr(config, 'expert_tensor_parallel_size', None)
+    if etp is None:
+        return False
+    return etp != config.tensor_model_parallel_size
 
 
 class ColumnParallelLinear(torch.nn.Module):
@@ -921,7 +998,11 @@ class ColumnParallelLinear(torch.nn.Module):
                         tensor=self.weight, is_parallel=True, dim=0, stride=stride
                     )
 
-            setattr(self.weight, "allreduce", not (self.is_expert and self.expert_parallel))
+            setattr(
+                self.weight,
+                "allreduce",
+                not (self.is_expert and _expert_grads_need_own_dp_domain(config)),
+            )
         else:
             self.weight = None
 
@@ -943,7 +1024,11 @@ class ColumnParallelLinear(torch.nn.Module):
                 # Always initialize bias to zero.
                 with torch.no_grad():
                     self.bias.zero_()
-            setattr(self.bias, "allreduce", not (self.is_expert and self.expert_parallel))
+            setattr(
+                self.bias,
+                "allreduce",
+                not (self.is_expert and _expert_grads_need_own_dp_domain(config)),
+            )
         else:
             self.register_parameter("bias", None)
 
@@ -991,7 +1076,13 @@ class ColumnParallelLinear(torch.nn.Module):
         if not weight.requires_grad:
             return linear_with_frozen_weight(input, weight, *args, **kwargs)
         else:
-            return linear_with_grad_accumulation_and_async_allreduce(input, weight, *args, **kwargs)
+            return linear_with_grad_accumulation_and_async_allreduce(
+                input,
+                weight,
+                *args,
+                dsa_accuracy_compatible=getattr(self.config, "dsa_accuracy_compatible", False),
+                **kwargs,
+            )
 
     def forward(
         self,
@@ -1039,6 +1130,10 @@ class ColumnParallelLinear(torch.nn.Module):
             or self.disable_grad_reduce
         ):
             input_parallel = input_
+        elif getattr(self.config, "dsa_accuracy_compatible", False) and (
+            self.tp_group is None or self.tp_group.size() <= 1
+        ):
+            input_parallel = input_
         else:
             input_parallel = copy_to_tensor_model_parallel_region(input_, group=self.tp_group)
 
@@ -1084,7 +1179,10 @@ class ColumnParallelLinear(torch.nn.Module):
         if runtime_gather_output is not None:
             gather_output = runtime_gather_output
 
-        if gather_output:
+        if gather_output and (
+            not getattr(self.config, "dsa_accuracy_compatible", False)
+            or (self.tp_group is not None and self.tp_group.size() > 1)
+        ):
             # All-gather across the partitions.
             if self.use_inference_optimized_all_gather and not self.training:
                 # Deferred to avoid circular import: inference_layers → TE → layers.
@@ -1271,7 +1369,11 @@ class RowParallelLinear(torch.nn.Module):
                 set_tensor_model_parallel_attributes(
                     tensor=self.weight, is_parallel=True, dim=1, stride=stride
                 )
-        setattr(self.weight, "allreduce", not (self.is_expert and self.expert_parallel))
+        setattr(
+            self.weight,
+            "allreduce",
+            not (self.is_expert and _expert_grads_need_own_dp_domain(config)),
+        )
 
         if bias:
             if config.use_cpu_initialization:
@@ -1289,7 +1391,11 @@ class RowParallelLinear(torch.nn.Module):
                 # Always initialize bias to zero.
                 with torch.no_grad():
                     self.bias.zero_()
-            setattr(self.bias, "allreduce", not (self.is_expert and self.expert_parallel))
+            setattr(
+                self.bias,
+                "allreduce",
+                not (self.is_expert and _expert_grads_need_own_dp_domain(config)),
+            )
             setattr(self.bias, "sequence_parallel", self.sequence_parallel)
         else:
             self.register_parameter("bias", None)
@@ -1305,7 +1411,13 @@ class RowParallelLinear(torch.nn.Module):
         if not weight.requires_grad:
             return linear_with_frozen_weight(input, weight, *args, **kwargs)
         else:
-            return linear_with_grad_accumulation_and_async_allreduce(input, weight, *args, **kwargs)
+            return linear_with_grad_accumulation_and_async_allreduce(
+                input,
+                weight,
+                *args,
+                dsa_accuracy_compatible=getattr(self.config, "dsa_accuracy_compatible", False),
+                **kwargs,
+            )
 
     def forward(self, input_: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Forward of RowParallelLinear
@@ -1355,6 +1467,10 @@ class RowParallelLinear(torch.nn.Module):
             output_ = reduce_scatter_to_sequence_parallel_region(
                 output_parallel, group=self.tp_group
             )
+        elif getattr(self.config, "dsa_accuracy_compatible", False) and (
+            self.tp_group is None or self.tp_group.size() <= 1
+        ):
+            output_ = output_parallel
         else:
             output_ = reduce_from_tensor_model_parallel_region(output_parallel, group=self.tp_group)
         if not self.skip_bias_add:

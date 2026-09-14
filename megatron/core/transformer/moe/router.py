@@ -104,6 +104,12 @@ class Router(ABC, MegatronModule):
             router_dtype = torch.float32
         elif self.config.moe_router_dtype == 'fp64':
             router_dtype = torch.float64
+        if self.config.router_accuracy_compatible:
+            inp_shape = input.shape
+            logits = torch.mm(input.reshape(-1, inp_shape[-1]).float(), self.weight.float().t())
+            if self.bias is not None:
+                logits = logits + self.bias.float()
+            return logits.view(*inp_shape[:-1], -1)
         logits = router_gating_linear(input, self.weight, self.bias, router_dtype)
         return logits
 

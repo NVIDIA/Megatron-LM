@@ -99,6 +99,17 @@ class BackendSpecProvider(Protocol):
 class LocalSpecProvider(BackendSpecProvider):
     """A protocol for providing Local submodules used in Spec building."""
 
+    def linear(self) -> type:
+        """TP-replicated local Linear (modelopt Linear, not TELinear).
+
+        DSA indexer / MLA down-projections call backend.linear(). TESpecProvider
+        still returns TELinear; this method is the TE-off counterpart so a
+        LocalSpecProvider DSA spec does not re-enter Transformer Engine.
+        """
+        from megatron.core.post_training.modelopt.layers import Linear
+
+        return Linear
+
     def column_parallel_linear(self) -> type:
         """Which column parallel linear module the backend uses"""
         return ColumnParallelLinear

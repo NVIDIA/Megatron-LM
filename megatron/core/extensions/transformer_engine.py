@@ -916,8 +916,12 @@ class TELinear(te.pytorch.Linear):
 
         for param in self.parameters():
             if is_expert:
-                # Reduce the gradient on the expert_data_parallel group for expert linear layers
-                setattr(param, "allreduce", not self.expert_parallel)
+                # Reduce the gradient on the expert_data_parallel group for expert linear layers.
+                # See _expert_grads_need_own_dp_domain in tensor_parallel/layers.py: ETP < TP
+                # also puts expert grads in their own (larger) data-parallel domain.
+                from ..tensor_parallel.layers import _expert_grads_need_own_dp_domain
+
+                setattr(param, "allreduce", not _expert_grads_need_own_dp_domain(self.config))
             else:
                 # Reduce the gradient on DP group
                 setattr(param, "allreduce", True)
@@ -2035,7 +2039,15 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 )
 
             for param in self.parameters():
-                setattr(param, "allreduce", not (is_expert and self.expert_parallel))
+                # See _expert_grads_need_own_dp_domain in tensor_parallel/layers.py:
+                # ETP < TP also puts expert grads in their own data-parallel domain.
+                from ..tensor_parallel.layers import _expert_grads_need_own_dp_domain
+
+                setattr(
+                    param,
+                    "allreduce",
+                    not (is_expert and _expert_grads_need_own_dp_domain(self.config)),
+                )
 
             # Explicitly stamp partition_dim and partition_stride on expert weight
             # tensors when explicit_expert_comm cleared parallel_mode.  TE ≤2.12

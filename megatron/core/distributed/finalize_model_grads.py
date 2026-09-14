@@ -467,7 +467,9 @@ def finalize_model_grads(
     # fp32 gate wgrad 做一次 DP all-reduce, 与参考实现一致。
     from ..transformer.module import _use_accuracy_compatible
 
-    loss_normalized_in_graph = _use_accuracy_compatible() and (num_tokens is not None)
+    loss_normalized_in_graph = (
+        _use_accuracy_compatible() and not config.dsa_accuracy_compatible and num_tokens is not None
+    )
     if loss_normalized_in_graph:
         num_tokens = None
 
@@ -573,6 +575,7 @@ def finalize_model_grads(
             for model_chunk in model:
                 model_chunk.scale_gradients(1.0 / dp_size)
 
+    if loss_normalized_in_graph or config.dsa_accuracy_compatible:
         for model_chunk in model:
             for param in model_chunk.parameters():
                 gate_wgrad = getattr(param, "_run_torch_gate_fp32_wgrad", None)

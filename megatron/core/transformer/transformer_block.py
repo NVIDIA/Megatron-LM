@@ -590,7 +590,11 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         #   likely redundant, since p2p_communication.py (likely originator)
         #   already creates viewless tensors. That said, make_viewless_tensor()
         #   is called here to be future-proof and corner-case-proof.
-        hidden_states = make_viewless_tensor(inp=hidden_states, requires_grad=True, keep_graph=True)
+        _tp_size = int(getattr(self.config, "tensor_model_parallel_size", 1) or 1)
+        if not (self.config.dsa_accuracy_compatible and _tp_size <= 1):
+            hidden_states = make_viewless_tensor(
+                inp=hidden_states, requires_grad=True, keep_graph=True
+            )
 
         if self.config.sequence_parallel:
             rng_context = tensor_parallel.get_cuda_rng_tracker().fork()
@@ -694,9 +698,11 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             # TENorm produces a "viewed" tensor. This will result in schedule.py's
             # deallocate_output_tensor() throwing an error, so a viewless tensor is
             # created to prevent this.
-            hidden_states = make_viewless_tensor(
-                inp=hidden_states, requires_grad=True, keep_graph=True
-            )
+            _tp_size = int(getattr(self.config, "tensor_model_parallel_size", 1) or 1)
+            if not (self.config.dsa_accuracy_compatible and _tp_size <= 1):
+                hidden_states = make_viewless_tensor(
+                    inp=hidden_states, requires_grad=True, keep_graph=True
+                )
 
         # If this TransformerBlock is empty, input and output hidden states will be the same node
         # on the computational graph and will lead to unexpected errors in pipeline schedules.

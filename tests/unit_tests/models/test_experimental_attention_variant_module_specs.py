@@ -65,6 +65,7 @@ def _make_config(**overrides):
     defaults = dict(
         num_layers=4,
         normalization="RMSNorm",
+        norm_accuracy_compatible=False,
         qk_layernorm=False,
         multi_latent_attention=False,
         qk_l2_norm=False,
@@ -368,6 +369,23 @@ class TestGetDsaModuleSpec:
         # Both point to the same qk_norm object
         assert spec.submodules.q_layernorm is spec.submodules.kv_layernorm
         backend.layer_norm.assert_any_call(rms_norm=expected_rms, for_qk=True)
+
+    def test_accuracy_compatible_qk_rmsnorm(self):
+        """Verify DSA q/kv norms can use the native Torch RMSNorm builder."""
+        from megatron.core.transformer.torch_norm import WrappedTorchNorm
+
+        backend = _make_backend()
+        cfg = _make_config(
+            multi_latent_attention=True,
+            qk_l2_norm=False,
+            qk_layernorm=True,
+            normalization="RMSNorm",
+            norm_accuracy_compatible=True,
+        )
+        spec = self._call(cfg=cfg, backend=backend)
+
+        assert spec.submodules.q_layernorm is WrappedTorchNorm
+        assert spec.submodules.kv_layernorm is WrappedTorchNorm
 
     def test_qk_layernorm_disabled(self):
         """Verify q/kv layernorm becomes IdentityOp, skipping backend.layer_norm for qk."""

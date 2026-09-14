@@ -1,10 +1,40 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+from types import SimpleNamespace
+
 import pytest
 import torch
 
-from megatron.core.tensor_parallel.layers import linear_with_frozen_weight
+from megatron.core.tensor_parallel.layers import (
+    _expert_grads_need_own_dp_domain,
+    linear_with_frozen_weight,
+)
 from megatron.core.tensor_parallel.mappings import gather_from_tensor_model_parallel_region
 from tests.unit_tests.test_utilities import Utils
+
+
+def test_expert_grads_need_own_dp_domain_etp_lt_tp():
+    """EP=1 / ETP=1 / TP=2 expert wgrad must leave the dense dp_cp bucket."""
+    frozen = SimpleNamespace(
+        expert_model_parallel_size=1,
+        tensor_model_parallel_size=2,
+        expert_tensor_parallel_size=1,
+        dsa_accuracy_compatible=True,
+    )
+    assert _expert_grads_need_own_dp_domain(frozen) is True
+    frozen.dsa_accuracy_compatible = False
+    assert _expert_grads_need_own_dp_domain(frozen) is False
+    eq = SimpleNamespace(
+        expert_model_parallel_size=1, tensor_model_parallel_size=2, expert_tensor_parallel_size=2
+    )
+    assert _expert_grads_need_own_dp_domain(eq) is False
+    ep2 = SimpleNamespace(
+        expert_model_parallel_size=2, tensor_model_parallel_size=2, expert_tensor_parallel_size=1
+    )
+    assert _expert_grads_need_own_dp_domain(ep2) is True
+    missing = SimpleNamespace(
+        expert_model_parallel_size=1, tensor_model_parallel_size=2, expert_tensor_parallel_size=None
+    )
+    assert _expert_grads_need_own_dp_domain(missing) is False
 
 
 @pytest.mark.parametrize("tensor_parallel,allreduce_dgrad", [(1, False), (8, True)])

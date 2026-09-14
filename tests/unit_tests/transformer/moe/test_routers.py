@@ -63,6 +63,41 @@ class TestTop2Router:
         assert num_weights == 12 * 4, num_weights
 
     @pytest.mark.internal
+    def test_router_accuracy_compatible_gating(self):
+        hidden_states = torch.randn(
+            (3, 1, self.router.config.hidden_size), device="cuda", dtype=torch.bfloat16
+        )
+        self.router.config.router_accuracy_compatible = True
+
+        logits = self.router.gating(hidden_states)
+        expected = torch.mm(
+            hidden_states.reshape(-1, hidden_states.shape[-1]).float(),
+            self.router.weight.float().t(),
+        ).view(3, 1, -1)
+
+        assert logits.dtype == torch.float32
+        assert torch.equal(logits, expected)
+
+    @pytest.mark.internal
+    def test_default_router_gating_stays_native(self, monkeypatch):
+        expected = torch.randn((3, 1, self.router.config.num_moe_experts))
+        called = False
+
+        def fake_router_gating_linear(inp, weight, bias, router_dtype):
+            nonlocal called
+            called = True
+            return expected
+
+        monkeypatch.setattr(
+            "megatron.core.transformer.moe.router.router_gating_linear", fake_router_gating_linear
+        )
+        hidden_states = torch.randn((3, 1, self.router.config.hidden_size), dtype=torch.bfloat16)
+
+        assert self.router.config.router_accuracy_compatible is False
+        assert self.router.gating(hidden_states) is expected
+        assert called
+
+    @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.parametrize("moe_router_pre_softmax", [(True), (False)])
     @pytest.mark.parametrize("score_function", ["sigmoid", "softmax"])

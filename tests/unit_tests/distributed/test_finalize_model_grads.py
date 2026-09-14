@@ -1,5 +1,4 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
-import inspect
 import os
 
 import pytest
@@ -19,6 +18,54 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
+
+
+@pytest.mark.parametrize(
+    "accuracy,dsa,expected", [(False, False, 1.0), (True, False, 4.0), (True, True, 1.0)]
+)
+def test_token_normalization_preserves_legacy_and_dsa_contracts(
+    monkeypatch, accuracy, dsa, expected
+):
+    """Legacy in-graph normalization averages DP; DSA divides by global tokens."""
+    import importlib
+    from types import SimpleNamespace
+
+    implementation = importlib.import_module("megatron.core.distributed.finalize_model_grads")
+    module = importlib.import_module("megatron.core.transformer.module")
+    monkeypatch.setattr(module, "_use_accuracy_compatible", lambda: accuracy)
+    config = TransformerConfig(
+        num_layers=1, hidden_size=8, num_attention_heads=1, dsa_accuracy_compatible=dsa
+    )
+    gradient = torch.tensor(8.0, device="cuda")
+    events = []
+
+    def scale(value):
+        events.append("scale")
+        gradient.mul_(value)
+
+    model = SimpleNamespace(
+        config=config,
+        parameters=lambda: (),
+        scale_gradients=scale,
+        finish_grad_sync=lambda **kwargs: events.append("sync"),
+    )
+    monkeypatch.setattr(implementation, "get_model_config", lambda model: model.config)
+    for name in (
+        "_allreduce_conditional_embedding_grads",
+        "_allreduce_non_tensor_model_parallel_grads",
+        "_allreduce_word_embedding_grads",
+        "_allreduce_position_embedding_grads",
+        "reset_model_temporary_tensors",
+    ):
+        monkeypatch.setattr(implementation, name, lambda *args: None)
+    monkeypatch.setattr(parallel_state, "get_data_parallel_world_size", lambda **kwargs: 2)
+    monkeypatch.setattr(implementation, "get_pp_last_rank", lambda group: 0)
+    monkeypatch.setattr(dist, "broadcast", lambda tensor, **kwargs: None)
+    monkeypatch.setattr(dist, "all_reduce", lambda tensor, **kwargs: tensor.mul_(2))
+    groups = SimpleNamespace(tp=None, pp=None, embd=None, pos_embd=None, dp_cp=None)
+    finalize_model_grads([model], num_tokens=torch.tensor(4.0, device="cuda"), pg_collection=groups)
+    assert gradient.item() == expected
+    assert events == ["sync", "scale"]
 
 
 class _RouterExpertBiasModel(torch.nn.Module):

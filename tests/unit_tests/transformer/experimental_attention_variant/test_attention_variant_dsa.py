@@ -27,6 +27,7 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
     DSAttention,
     DSAttentionSubmodules,
     FusedDSAIndexerLoss,
+    _AccuracyCompatibleSoftmax,
     _run_sparse_attention,
     _validate_nonpacked_cp_uniform_length,
     compute_dsa_indexer_loss,
@@ -66,6 +67,59 @@ def mock_hadamard_transform(x: torch.Tensor, scale: float = 1.0) -> torch.Tensor
     This is a simple identity-like transformation that preserves shape and applies scaling.
     """
     return x * scale
+
+
+class TestAccuracyCompatibleDSA:
+    """Test the opt-in full-score DSA alignment path."""
+
+    def test_explicit_softmax_backward_matches_formula(self):
+        logits = torch.randn(2, 3, 5, device="cuda", requires_grad=True)
+        valid_mask = torch.ones_like(logits, dtype=torch.bool)
+        valid_mask[..., -1] = False
+        grad_output = torch.randn_like(logits)
+
+        probabilities = _AccuracyCompatibleSoftmax.apply(logits, valid_mask)
+        probabilities.backward(grad_output)
+        expected = probabilities.detach() * (
+            grad_output - (grad_output * probabilities.detach()).sum(dim=-1, keepdim=True)
+        )
+        expected = expected.masked_fill(~valid_mask, 0.0)
+
+        assert torch.equal(logits.grad, expected)
+        assert torch.equal(probabilities[..., -1], torch.zeros_like(probabilities[..., -1]))
+
+    def test_accuracy_compatible_switch_defaults_off(self, monkeypatch):
+        query = torch.randn(8, 1, 2, 8, device="cuda", dtype=torch.bfloat16)
+        key = torch.randn_like(query)
+        value = torch.randn(8, 1, 2, 4, device="cuda", dtype=torch.bfloat16)
+        indices = torch.arange(8, device="cuda").view(1, 8, 1)
+        original = unfused_dsa_fn
+        calls = []
+
+        def capture(*args, **kwargs):
+            calls.append(kwargs.get("accuracy_compatible"))
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(
+            "megatron.core.transformer.experimental_attention_variant.dsa.unfused_dsa_fn", capture
+        )
+        common = dict(
+            absorbed_mla=False,
+            query=query,
+            key=key,
+            value=value,
+            up_v_weight=None,
+            topk_indices=indices,
+            softmax_scale=query.size(-1) ** -0.5,
+            mask=None,
+            varlen_starts=None,
+            varlen_ends=None,
+            key_positions=None,
+        )
+        _run_sparse_attention(config=SimpleNamespace(), **common)
+        _run_sparse_attention(config=SimpleNamespace(dsa_accuracy_compatible=True), **common)
+
+        assert calls == [False, True]
 
 
 class TestDSAIndexShareHelpers:

@@ -941,9 +941,12 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # won't result in memory savings (like the data loader, or
         # p2p_communication), it serves to document the origin of this
         # 'view' tensor.
-        output = make_viewless_tensor(
-            inp=hidden_states, requires_grad=hidden_states.requires_grad, keep_graph=True
-        )
+        if self.config.dsa_accuracy_compatible and self.config.tensor_model_parallel_size <= 1:
+            output = hidden_states
+        else:
+            output = make_viewless_tensor(
+                inp=hidden_states, requires_grad=hidden_states.requires_grad, keep_graph=True
+            )
 
         return output
 
