@@ -1,8 +1,8 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Fused MoE: permute -> FC1 -> activation -> FC2 -> unpermute.
 
-Supports BF16 weights with torch.nn.functional.grouped_mm.
-All permutation logic is handled internally — callers invoke a single function.
+Supports BF16 grouped GEMM and MXFP8 scaled grouped GEMM. All permutation
+logic is handled internally — callers invoke a single function.
 """
 
 from enum import Enum
@@ -124,9 +124,9 @@ def mcore_fused_moe(
 ) -> torch.Tensor:
     """Fused MoE: permute -> pad -> FC1 -> activation -> FC2 -> unpad -> unpermute.
 
-    MXFP8 squared-ReLU uses fused permute/activation-quantization kernels unless
-    disable_fused_quant_kernels=True. SwiGLU uses separate activation and MXFP8
-    quantization kernels.
+    Outside batch-invariant mode, MXFP8 squared-ReLU uses fused kernels that
+    combine permute/activation with quantization unless
+    ``disable_fused_quant_kernels=True``. Other MXFP8 paths quantize separately.
 
     Args:
         hidden_states: [max_tokens, hidden_size] BF16 input. max_tokens =
@@ -134,7 +134,7 @@ def mcore_fused_moe(
         probs: [max_tokens, topk] routing probabilities.
         fc1_weight: stacked weight for FC1 (torch.Tensor for BF16, MXFP8Tensor for MXFP8).
         fc2_weight: stacked weight for FC2 (same type as fc1_weight).
-        activation_type: ActivationType enum (SQUARED_RELU).
+        activation_type: supported expert activation type.
         num_local_experts: number of experts on this rank.
         local_expert_start: first global expert index on this rank.
         valid_tokens: scalar int32 CUDA tensor holding the number of valid tokens this
@@ -171,6 +171,7 @@ def mcore_fused_moe(
         and not disable_fused_quant_kernels
         and not batch_invariant_mode
     )
+    mm_fn: Callable[[Any, Any, torch.Tensor], torch.Tensor]
 
     if batch_invariant_mode:
         if use_mxfp8:
@@ -255,11 +256,7 @@ def mcore_fused_moe(
                 "the gated form (SiTU-GLU) has no inference kernel yet."
             )
             activation_out = batch_invariant.swiglu_with_probs(
-                fc1_output,
-                permutation_map,
-                n_used,
-                permuted_probs,
-                zero_padding=use_mxfp8,
+                fc1_output, permutation_map, n_used, permuted_probs, zero_padding=use_mxfp8
             )
         else:
             activation_out = batch_invariant.squared_relu_with_probs(

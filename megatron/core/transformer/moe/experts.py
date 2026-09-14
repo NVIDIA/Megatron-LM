@@ -1179,7 +1179,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
     """Inference-optimized GroupedMLP with GPU-resident offsets.
 
     Inherits from TEGroupedMLP to reuse weight initialization and checkpoint compatibility.
-    Supports three forward paths:
+    Supports four forward paths:
     - Training: delegates to parent TEGroupedMLP
     - Inference + FlashInfer: CUTLASS fused MoE for BF16 or routed block-scale MoE for MXFP8
     - Inference + torch: torch.nn.functional.grouped_mm with GPU-resident cumsum offsets

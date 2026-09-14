@@ -1043,7 +1043,7 @@ def _make_te_mxfp8_expert_linear(quantizer, out_features, in_features):
     reason="MXFP8 scaled_grouped_mm requires PyTorch 2.10+ and Blackwell",
 )
 def test_torch_mxfp8_moe_is_batch_invariant():
-    """A routed token must be bitwise stable as other expert loads change."""
+    """A routed token must be bitwise stable as its expert loads change."""
     from megatron.core.inference.moe.fused_moe import ActivationType, mcore_fused_moe
     from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
         set_batch_invariant_mode,
@@ -1076,8 +1076,10 @@ def test_torch_mxfp8_moe_is_batch_invariant():
     def _run(num_tokens: int, target_row: int) -> torch.Tensor:
         hidden_states = torch.randn(num_tokens, hidden_size, device="cuda", dtype=torch.bfloat16)
         routing_map = torch.empty(num_tokens, topk, device="cuda", dtype=torch.int64)
-        routing_map[:, 0] = 2
-        routing_map[:, 1] = 3
+        # Route the co-batch through the target's experts so their padded GEMM
+        # row counts grow from 128 to 256. This exercises the M-dependent case
+        # that batch invariance must stabilize, rather than only unrelated experts.
+        routing_map.copy_(target_experts)
         probs = torch.full((num_tokens, topk), 0.5, device="cuda", dtype=torch.float32)
         hidden_states[target_row].copy_(target)
         routing_map[target_row].copy_(target_experts)
@@ -1096,7 +1098,7 @@ def test_torch_mxfp8_moe_is_batch_invariant():
 
     with torch.no_grad(), set_batch_invariant_mode(True, backend="te_native"):
         output_alone = _run(1, 0)
-        output_batched = _run(128, 73)
+        output_batched = _run(193, 73)
 
     assert torch.equal(output_alone, output_batched), (
         "Torch MXFP8 MoE output changed with the batch; max abs diff: "

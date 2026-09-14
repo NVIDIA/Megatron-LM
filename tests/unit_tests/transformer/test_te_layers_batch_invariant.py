@@ -734,24 +734,28 @@ def _te_general_gemm(*args, **kwargs):
     return te_general_gemm(*args, **kwargs)
 
 
-def test_te_native_preserves_full_grouped_gemm_workspace():
+def test_te_native_preserves_full_grouped_gemm_workspace(monkeypatch):
     """Workspace starvation must not make TE device-metadata grouped GEMM invalid."""
     import transformer_engine.pytorch.cpp_extensions.gemm as te_gemm
 
-    from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
-        get_unrestricted_te_workspace_size_bytes,
-    )
-
     if not hasattr(te_gemm, "_get_grouped_cublas_workspace"):
-        pytest.skip("Transformer Engine does not expose device-metadata grouped GEMM")
+        # Exercise the compatibility hook even with TE releases predating the
+        # device-metadata API used in production.
+        def _mock_grouped_workspace(device, layout):
+            del layout
+            return torch.empty(
+                te_gemm.get_cublas_workspace_size_bytes(), dtype=torch.uint8, device=device
+            )
 
-    unrestricted_bytes = get_unrestricted_te_workspace_size_bytes()
+        monkeypatch.setattr(
+            te_gemm, "_get_grouped_cublas_workspace", _mock_grouped_workspace, raising=False
+        )
+
+    unrestricted_bytes = te_gemm.get_cublas_workspace_size_bytes()
     original_grouped_workspace = te_gemm._get_grouped_cublas_workspace
     with set_batch_invariant_mode(True, backend="te_native"):
         assert te_gemm.get_cublas_workspace_size_bytes() == 1024
-        grouped_workspace = te_gemm._get_grouped_cublas_workspace(
-            torch.cuda.current_device(), "TN"
-        )
+        grouped_workspace = te_gemm._get_grouped_cublas_workspace(torch.cuda.current_device(), "TN")
         assert grouped_workspace.numel() == unrestricted_bytes
 
     assert te_gemm._get_grouped_cublas_workspace is original_grouped_workspace

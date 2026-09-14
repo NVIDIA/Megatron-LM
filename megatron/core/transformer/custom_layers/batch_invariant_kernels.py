@@ -52,7 +52,6 @@ __all__ = [
     "enable_batch_invariant_mode",
     "grouped_gemm_batch_invariant",
     "grouped_gemm_batch_invariant_alignment",
-    "get_unrestricted_te_workspace_size_bytes",
     "assert_te_supports_batch_invariant_attention",
     "te_supports_batch_invariant_attention",
     "HAVE_DEEPGEMM_BF16",
@@ -1665,7 +1664,7 @@ _TE_GROUPED_WORKSPACE_FN_ORIG = None
 _TE_NATIVE_ENV_ORIG: dict = {}
 
 
-def get_unrestricted_te_workspace_size_bytes() -> int:
+def _get_unrestricted_te_workspace_size_bytes() -> int:
     """Return TE's normal workspace size even while te_native starvation is active."""
     import transformer_engine.pytorch.cpp_extensions.gemm as te_gemm
 
@@ -1675,9 +1674,11 @@ def get_unrestricted_te_workspace_size_bytes() -> int:
 
 @lru_cache(maxsize=None)
 def _get_unrestricted_te_grouped_workspace(device: int, layout: str) -> torch.Tensor:
-    """Allocate the mandatory full workspace for fixed-shape TE grouped GEMMs."""
+    """Allocate the full workspace required by TE's device-metadata grouped GEMM."""
     assert layout in ("TN", "NN", "NT"), f"unexpected grouped GEMM layout {layout}"
-    return torch.empty(get_unrestricted_te_workspace_size_bytes(), dtype=torch.uint8, device=device)
+    return torch.empty(
+        _get_unrestricted_te_workspace_size_bytes(), dtype=torch.uint8, device=device
+    )
 
 
 def _enable_te_native_workspace_starvation(workspace_bytes: int = _TE_NATIVE_WORKSPACE_BYTES):
@@ -1737,9 +1738,9 @@ def _enable_te_native_workspace_starvation(workspace_bytes: int = _TE_NATIVE_WOR
             if hasattr(getattr(_te_gemm_mod, "get_cublas_workspace", None), "cache_clear"):
                 _te_gemm_mod.get_cublas_workspace.cache_clear()
         # TE's device-metadata grouped GEMM rejects a workspace smaller than its normal
-        # allocation.  Its expert rows are fixed to 256 under batch-invariant mode, so it does
-        # not need workspace starvation to stabilize algorithm selection.  Keep the restriction
-        # on ordinary GEMMs while restoring the mandatory workspace at this narrow entry point.
+        # allocation. This path gets its batch invariance from padding every expert segment
+        # to a 256-row multiple, so preserve the mandatory full workspace at this narrow
+        # entry point while keeping ordinary GEMMs starved.
         if _TE_GROUPED_WORKSPACE_FN_ORIG is None and hasattr(
             _te_gemm_mod, "_get_grouped_cublas_workspace"
         ):
@@ -1846,9 +1847,10 @@ def enable_batch_invariant_mode(backend: str = "te_native", collective: str = "o
     _batch_invariant_LIB.impl("aten::_log_softmax", _log_softmax_batch_invariant, dispatch_key)
     _batch_invariant_LIB.impl("aten::mean.dim", mean_batch_invariant, dispatch_key)
     # Also patch Transformer Engine kernels when available. Under te_native
-    # BOTH skips are set, so no TE kernel is substituted at all: GEMMs (dense
-    # and grouped) stay native under the starved workspace, and norms stay
-    # native under the 64-multiple alignment discipline. (The TE attention
+    # BOTH skips are set, so no TE kernel is substituted: dense GEMMs stay
+    # native under the starved workspace, device-metadata grouped GEMMs keep
+    # their required full workspace and use 256-row expert alignment, and norms
+    # stay native under the 64-multiple alignment discipline. (The TE attention
     # version gate is a separate standalone assert, not part of this patch.)
     if backend == "te_native":
         # te_native also keeps TE's NATIVE RMSNorm: its M%32 reduction

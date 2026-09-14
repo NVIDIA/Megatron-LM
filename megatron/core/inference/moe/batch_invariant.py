@@ -169,7 +169,11 @@ def swiglu_with_probs(
     probs: torch.Tensor,
     zero_padding: bool = False,
 ) -> torch.Tensor:
-    """Gated-SiLU counterpart of squared_relu_with_probs (SwiGLU models)."""
+    """Gated-SiLU counterpart of squared_relu_with_probs (SwiGLU models).
+
+    ``zero_padding`` initializes aligned dummy rows because MXFP8 quantization and
+    grouped GEMM have no permutation map with which to skip them.
+    """
     num_rows, two_ffn = x.shape
     ffn_size = two_ffn // 2
     out = torch.empty(num_rows, ffn_size, dtype=x.dtype, device=x.device)
@@ -277,6 +281,8 @@ def squared_relu_with_probs(
     Args:
         clamp_scale: config.activation_func_tanh_clamp_scale. If set, precondition the
             input with the tanh soft clamp ``s * tanh(x / s)``.
+        zero_padding: initialize aligned dummy rows because MXFP8 quantization and
+            grouped GEMM have no permutation map with which to skip them.
     """
     num_rows, hidden_size = x.shape
     out = torch.empty_like(x)

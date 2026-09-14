@@ -864,6 +864,11 @@ class DynamicInferenceContext(BaseInferenceContext):
         # used by a policy forward. Batch-invariant mode promises parity between
         # dynamic generation and that forward, so keep both on the shared path.
         if self.batch_invariant_mode:
+            if inference_config.use_flashinfer_fused_rope is True:
+                raise ValueError(
+                    "batch_invariant_mode does not support FlashInfer fused RoPE; "
+                    "set use_flashinfer_fused_rope=False or None."
+                )
             inference_config.use_flashinfer_fused_rope = False
         elif inference_config.use_flashinfer_fused_rope is True:
             assert HAVE_FLASHINFER, "flashinfer is not installed"

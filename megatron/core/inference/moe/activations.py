@@ -74,6 +74,8 @@ def _squared_relu_kernel(
 
     Grid: fixed NUM_BLOCKS CTAs, each iterating over multiple rows.
     n_used_ptr gates how many rows are processed — required for CUDA graph compatibility.
+    MXFP8 quantization and grouped GEMM do not receive ``perm_map``. ZERO_PADDING
+    therefore materializes neutral values for dummy rows inside each expert segment.
     """
     pid = tl.program_id(0)
     n_used = tl.load(n_used_ptr)
@@ -110,7 +112,8 @@ def padded_squared_relu(
         clamp_scale: config.activation_func_tanh_clamp_scale. If set, soft-clamp the
             pre-activation with ``s * tanh(x / s)`` first, bounding the output by ``s ** 2``.
         zero_padding: write zeros to alignment-padding rows instead of leaving them
-            undefined. Rows beyond n_used remain undefined.
+            undefined. MXFP8 quantization and grouped GEMM cannot skip dummy rows through
+            ``permutation_map``. Rows beyond n_used remain undefined.
     """
     M, N = x.shape
     out = torch.empty(M, N, dtype=x.dtype, device=x.device)
@@ -148,6 +151,8 @@ def _swiglu_kernel(
 
     Input row width is 2N: gate = first N cols, up = last N cols (megatron chunk convention).
     Output row width is N. Fixed NUM_BLOCKS CTAs iterating rows -> CUDA-graph compatible.
+    MXFP8 quantization and grouped GEMM do not receive ``perm_map``. ZERO_PADDING
+    therefore materializes neutral values for dummy rows inside each expert segment.
     """
     pid = tl.program_id(0)
     n_used = tl.load(n_used_ptr)
@@ -183,7 +188,8 @@ def padded_swiglu(
         permutation_map: [output_size] int32, original token index or -1 for padding.
         n_used: scalar int32 CUDA tensor = inclusive_expert_offsets[-1].
         zero_padding: write zeros to alignment-padding rows instead of leaving them
-            undefined. Rows beyond n_used remain undefined.
+            undefined. MXFP8 quantization and grouped GEMM cannot skip dummy rows through
+            ``permutation_map``. Rows beyond n_used remain undefined.
     Returns:
         [output_size, ffn_hidden] BF16.
     """

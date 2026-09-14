@@ -335,15 +335,18 @@ class TestTeNativeBackend:
             is_batch_invariant_mode_enabled,
         )
 
+        have_grouped_workspace = False
         try:
             import transformer_engine.pytorch.cpp_extensions.gemm as te_gemm_mod
 
             ws_fn_before = te_gemm_mod.get_cublas_workspace_size_bytes
-            grouped_ws_fn_before = te_gemm_mod._get_grouped_cublas_workspace
             unrestricted_ws_bytes = ws_fn_before()
             have_te = True
+            have_grouped_workspace = hasattr(te_gemm_mod, "_get_grouped_cublas_workspace")
         except ImportError:
             have_te = False
+        if have_grouped_workspace:
+            grouped_ws_fn_before = te_gemm_mod._get_grouped_cublas_workspace
         env_before = os.environ.get("CUBLASLT_WORKSPACE_SIZE")
         try:
             enable_batch_invariant_mode("te_native")
@@ -352,6 +355,7 @@ class TestTeNativeBackend:
             assert os.environ.get("CUBLASLT_WORKSPACE_SIZE") == "0"
             if have_te:
                 assert te_gemm_mod.get_cublas_workspace_size_bytes() == 1024
+            if have_grouped_workspace:
                 grouped_workspace = te_gemm_mod._get_grouped_cublas_workspace(
                     torch.cuda.current_device(), "TN"
                 )
@@ -367,5 +371,6 @@ class TestTeNativeBackend:
         # into subsequent non-BI work in the same process)
         if have_te:
             assert te_gemm_mod.get_cublas_workspace_size_bytes is ws_fn_before
+        if have_grouped_workspace:
             assert te_gemm_mod._get_grouped_cublas_workspace is grouped_ws_fn_before
         assert os.environ.get("CUBLASLT_WORKSPACE_SIZE") == env_before
