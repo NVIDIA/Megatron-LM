@@ -155,11 +155,14 @@ def _unpack_batch(batch: List[Dict[str, torch.Tensor]]) -> List[Dict[str, torch.
                 continue
             for key in data_keys:
                 sub_sample_dict[key] = sample[key][start_idx:end_idx]
-            # Since sft_dataset.py does not provide cu_seqlens_original,
-            # we assume original_seq_len equals padded_seq_len here.
-            # Ideally the dataset should define the pre-padding seq_len.
+            # sft_dataset.py does not provide the pre-padding lengths, so original_seq_len
+            # defaults to padded_seq_len; datasets that emit ``original_seq_lens`` (one entry
+            # per packed sequence, e.g. VarlenDataset in whole-bin mode) keep the real length.
             seq_len = (end_idx - start_idx).item()
-            original_seq_lens.append(seq_len)
+            if "original_seq_lens" in sample:
+                original_seq_lens.append(int(sample["original_seq_lens"][sub_sample]))
+            else:
+                original_seq_lens.append(seq_len)
             padded_seq_lens.append(seq_len)
             batch_unpacked.append(sub_sample_dict)
 

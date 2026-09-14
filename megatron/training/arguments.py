@@ -2309,7 +2309,7 @@ def core_transformer_config_from_args(args, config_class=None):
             # qk_head_dim/kv_lora_rank derivation). Set the variant so transformer_config runs
             # that validation+derivation rather than silently skipping it. 'D' alone stays legacy
             # DSv3 'dsa'. An explicit --experimental-attention-variant is always respected.
-            if _has_dsv4_csa:
+            if _has_dsv4_csa or getattr(args, 'dsv4_version', 'v4') == 'v4.1':
                 kw_args['experimental_attention_variant'] = 'dsv4_hybrid'
             elif _has_dsa:
                 kw_args['experimental_attention_variant'] = 'dsa'
@@ -5031,6 +5031,135 @@ def _add_mla_args(parser):
         "Otherwise fall back to the unfused MLA.",
     )
 
+    # DeepSeek-V4.1 (CSA2 shared attention state, Engram). These MLATransformerConfig fields
+    # are not covered by the TransformerConfig ArgumentGroupFactory group, so they are added
+    # here; their dest names match the config fields.
+    group.add_argument(
+        '--dsv4-version',
+        type=str,
+        choices=['v4', 'v4.1'],
+        default='v4',
+        help="DeepSeek-V4 family variant for --experimental-attention-variant dsv4_hybrid. "
+        "'v4.1' enables CSA2 cross-layer sharing and single-pass hyper-connections; layer ids "
+        "in the --csa2-* and --engram-* options are DeepSeek model layer ids.",
+    )
+    group.add_argument(
+        '--csa2-kv-source-layers',
+        type=int,
+        nargs='+',
+        default=None,
+        help="Model layers that run a compressor and publish compressed KV (DeepSeek-V4.1).",
+    )
+    group.add_argument(
+        '--csa2-index-source-layers',
+        type=int,
+        nargs='+',
+        default=None,
+        help="Model layers that run an indexer and publish top-k (DeepSeek-V4.1).",
+    )
+    group.add_argument(
+        '--csa2-candidate-source-layer',
+        type=int,
+        default=None,
+        help="Model layer publishing candidate blocks for two-level top-k (DeepSeek-V4.1).",
+    )
+    group.add_argument(
+        '--csa2-candidate-topk-blocks',
+        type=int,
+        default=0,
+        help="Candidate blocks kept per query (DeepSeek-V4.1).",
+    )
+    group.add_argument(
+        '--csa2-candidate-block-size',
+        type=int,
+        default=0,
+        help="Compressed positions per candidate block (DeepSeek-V4.1).",
+    )
+    group.add_argument(
+        '--engram-layer-ids',
+        type=int,
+        nargs='+',
+        default=None,
+        help="Model layers with an Engram n-gram memory (DeepSeek-V4.1).",
+    )
+    group.add_argument(
+        '--engram-num-embeddings',
+        type=int,
+        nargs='+',
+        default=None,
+        help="Rows of each Engram table, one per --engram-layer-ids entry.",
+    )
+    group.add_argument(
+        '--engram-max-ngram-size', type=int, default=4, help="Longest n-gram hashed by Engram."
+    )
+    group.add_argument(
+        '--engram-bucket-size',
+        type=int,
+        default=0,
+        help="Bucket count each (n-gram size, head) pair starts searching primes from.",
+    )
+    group.add_argument('--engram-n-heads', type=int, default=0, help="Engram hash heads.")
+    group.add_argument('--engram-head-dim', type=int, default=0, help="Engram table row width.")
+    group.add_argument(
+        '--engram-pad-token-id', type=int, default=2, help="Token filling empty n-gram slots."
+    )
+    group.add_argument(
+        '--engram-compressed-vocab-size',
+        type=int,
+        default=0,
+        help="Size of the normalised tokenizer vocabulary the Engram hash derives from.",
+    )
+    group.add_argument(
+        '--engram-token-map-path',
+        type=str,
+        default=None,
+        help="Token id -> compressed id map from tools/dsv41/build_engram_token_map.py.",
+    )
+    group.add_argument(
+        '--no-engram-frozen',
+        action='store_false',
+        dest='engram_frozen',
+        default=True,
+        help="Train the Engram parameters instead of keeping them frozen.",
+    )
+    group.add_argument(
+        '--engram-shard-group',
+        type=str,
+        choices=['ep', 'none'],
+        default='ep',
+        help="Process group over which Engram table rows are sharded.",
+    )
+    group.add_argument(
+        '--no-csa2-indexer-frozen',
+        action='store_false',
+        dest='csa2_indexer_frozen',
+        default=True,
+        help="Train the CSA2 indexer parameters (requires the indexer loss; not available yet).",
+    )
+    group.add_argument(
+        '--csa2-sparse-attention-impl',
+        type=str,
+        choices=['reference', 'fused'],
+        default='reference',
+        help="CSA2 sparse attention for packed inputs: gather-based reference or the fused "
+        "FlashMLA / cuDNN DSA kernels (64 heads, v_head_dim 512).",
+    )
+    group.add_argument(
+        '--csa2-indexer-impl',
+        type=str,
+        choices=['reference', 'fused'],
+        default='reference',
+        help="CSA2 dense indexer scoring: head-by-head fp32 PyTorch reduction (reference) or "
+        "the merged cuDNN DSA dense indexer kernel (fused; falls back to reference when the "
+        "kernel is unavailable).",
+    )
+    group.add_argument(
+        '--csa2-indexer-chunk-rows',
+        type=int,
+        default=4096,
+        help="Query rows scored per chunk in the CSA2 indexer.",
+    )
+
     return parser
 
 
@@ -5420,6 +5549,15 @@ def _add_varlen_dataset_args(parser):
         'be compared against the THD path to validate correctness. '
         'Incompatible with --dynamic-context-parallel and '
         '--sequence-packing-scheduler.',
+    )
+    group.add_argument(
+        '--varlen-bins-as-samples',
+        action="store_true",
+        help='With --use-varlen-dataset on a pre-packed parquet (input_ids / loss_mask / '
+        'seq_start_id per row): one sample is a whole bin in the pre-packed cu_seqlens '
+        'format, so --global-batch-size counts bins (as the NeMo packed loader does) and '
+        'the packing scheduler keeps each bin\'s fill. Default: one sample per constituent '
+        'sequence.',
     )
     group.add_argument(
         '--varlen-mock-dataset-config-json',

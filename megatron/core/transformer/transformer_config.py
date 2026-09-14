@@ -1934,9 +1934,17 @@ class TransformerConfig(ModelParallelConfig):
                 f"csa_compress_ratios length ({len(self.csa_compress_ratios)}) must be at least "
                 f"num_layers + mtp_num_layers ({self.num_layers} + {mtp_layers} = {expected_len})"
             )
-            assert all(
-                ratio in [0, 4, 128] for ratio in self.csa_compress_ratios
-            ), "csa_compress_ratios must be 0, 4, or 128"
+            if getattr(self, "dsv4_version", "v4") == "v4.1":
+                # DeepSeek-V4.1 CSA2 uses small non-overlapping ratios (2, 1) and shares the
+                # compressed KV across layers; the detailed layout check lives in
+                # MLATransformerConfig.__post_init__ (csa2 role resolution).
+                assert all(
+                    isinstance(ratio, int) and ratio >= 0 for ratio in self.csa_compress_ratios
+                ), "csa_compress_ratios must be non-negative integers for dsv4_version='v4.1'"
+            else:
+                assert all(
+                    ratio in [0, 4, 128] for ratio in self.csa_compress_ratios
+                ), "csa_compress_ratios must be 0, 4, or 128"
             assert (
                 self.tensor_model_parallel_size == 1
             ), "DSv4 Hybrid Attention only supports TP size 1."
@@ -4317,10 +4325,98 @@ class MLATransformerConfig(TransformerConfig):
        Otherwise fall back to the unfused MLA.
     """
 
+    ####################
+    # DeepSeek-V4.1: CSA2 shared attention state and Engram
+    ####################
+    dsv4_version: Literal["v4", "v4.1"] = "v4"
+    """DeepSeek-V4 family variant for ``experimental_attention_variant='dsv4_hybrid'``.
+    ``"v4.1"`` enables CSA2 (compressed KV / indexer keys / top-k shared across layers,
+    optional two-level candidate-block selection) and the single-pass hyper-connection
+    handoff. Layer ids in the ``csa2_*`` and ``engram_*`` options are DeepSeek model layer
+    ids (0-based, one per attention + MoE pair), not hybrid pattern positions."""
+
+    csa2_kv_source_layers: Optional[List[int]] = None
+    """Model layers that run a compressor and publish compressed KV plus indexer keys.
+    Strictly increasing; every entry must also appear in ``csa2_index_source_layers``."""
+
+    csa2_index_source_layers: Optional[List[int]] = None
+    """Model layers that run an indexer and publish their top-k selection. Layers between two
+    index sources reuse the selection of the most recent one."""
+
+    csa2_candidate_source_layer: Optional[int] = None
+    """Model layer whose indexer scores define candidate blocks for later indexers (two-level
+    top-k). Must be the last KV source layer. ``None`` disables candidate blocks."""
+
+    csa2_candidate_topk_blocks: int = 0
+    """Candidate blocks kept per query when ``csa2_candidate_source_layer`` is set."""
+
+    csa2_candidate_block_size: int = 0
+    """Compressed positions per candidate block when ``csa2_candidate_source_layer`` is set."""
+
+    engram_layer_ids: Optional[List[int]] = None
+    """Model layers that add an Engram n-gram memory to the residual streams before attention."""
+
+    engram_num_embeddings: Optional[List[int]] = None
+    """Rows of each Engram table, one entry per ``engram_layer_ids`` entry."""
+
+    engram_max_ngram_size: int = 4
+    """Longest n-gram hashed by Engram (2-grams up to this size are looked up)."""
+
+    engram_bucket_size: int = 0
+    """Bucket count each (n-gram size, head) pair starts searching primes from
+    (``engram_vocab_size`` in the DeepSeek configuration)."""
+
+    engram_n_heads: int = 0
+    """Hash heads per n-gram size."""
+
+    engram_head_dim: int = 0
+    """Width of one Engram table row."""
+
+    engram_pad_token_id: int = 2
+    """Token that fills n-gram slots without history (start of sequence)."""
+
+    engram_compressed_vocab_size: int = 0
+    """Size of the normalised (compressed) tokenizer vocabulary the hash multipliers derive from."""
+
+    engram_token_map_path: Optional[str] = None
+    """Path to the token id -> compressed id map produced by
+    ``tools/dsv41/build_engram_token_map.py``.
+    ``None`` uses the identity map (tests / synthetic data only)."""
+
+    engram_frozen: bool = True
+    """Keep every Engram parameter frozen (no gradient, no optimizer state)."""
+
+    engram_shard_group: Literal["ep", "none"] = "ep"
+    """Process group over which Engram table rows are sharded."""
+
+    csa2_indexer_frozen: bool = True
+    """Keep the CSA2 indexer parameters frozen. Only integer selections leave the indexer, so
+    without the indexer distillation loss (not implemented yet) they have no gradient path."""
+
+    csa2_sparse_attention_impl: Literal["reference", "fused"] = "reference"
+    """Sparse attention kernel for CSA2 packed (THD) inputs. ``reference`` is the gather-based
+    PyTorch path (small models, tests); ``fused`` uses the FlashMLA forward / cuDNN DSA backward
+    of the merged CSA utilities (requires head dim 512 and bf16)."""
+
+    csa2_indexer_impl: Literal["reference", "fused"] = "reference"
+    """Dense indexer scoring in the packed CSA2 indexer. ``reference`` reduces
+    ``relu(q_h . k) * w_h`` head by head in fp32 PyTorch ops (about 7 s per 128K step on the
+    second pipeline stage); ``fused`` calls the merged cuDNN DSA dense
+    indexer score kernel (bf16 inputs, fp32 accumulation, ratio-causal limit inside the
+    kernel) and falls back to ``reference`` when the kernel is unavailable."""
+
+    csa2_indexer_chunk_rows: int = 4096
+    """Upper bound on the query rows scored per chunk in the packed CSA2 indexer. The effective
+    chunk is further limited by a fixed memory budget on the fp32 [rows, n_compressed] score
+    matrix (``INDEXER_SCORE_BUDGET_BYTES`` in ``csa2/indexer.py``)."""
+
     def __post_init__(self):
         super().__post_init__()
         if self.attention_latent_norm_epsilon is None:
             self.attention_latent_norm_epsilon = self.layernorm_epsilon
+
+        if self.dsv4_version == "v4.1":
+            self._validate_dsv41()
 
         if self.attention_output_gate and self.mla_down_proj_fusion:
             # Fused MLA hides the post-input-LayerNorm activation inside the fused
@@ -4352,3 +4448,155 @@ class MLATransformerConfig(TransformerConfig):
             assert (
                 self.apply_rope_fusion is False
             ), "Rope Fusion is not compatible with caching latents"
+
+    def _validate_dsv41(self) -> None:
+        """Static checks for ``dsv4_version='v4.1'`` (CSA2 layout, mHC, Engram)."""
+        # Local import: the roles module is pure Python and imports nothing from megatron.
+        from megatron.core.transformer.experimental_attention_variant.csa2.roles import (
+            model_layer_ratios_from_pattern_ratios,
+            resolve_csa2_plan,
+        )
+
+        if self.experimental_attention_variant != "dsv4_hybrid":
+            raise ValueError(
+                "dsv4_version='v4.1' requires experimental_attention_variant='dsv4_hybrid'"
+            )
+        if not self.enable_hyper_connections:
+            raise ValueError("dsv4_version='v4.1' requires enable_hyper_connections=True")
+        if self.csa_compress_ratios is None:
+            raise ValueError("dsv4_version='v4.1' requires csa_compress_ratios")
+        if (self.mtp_num_layers or 0) > 0:
+            raise ValueError("dsv4_version='v4.1' does not support MTP layers yet")
+        if self.moe_n_hash_layers:
+            raise ValueError("dsv4_version='v4.1' does not use hash-routed MoE layers")
+        # Phase-M0 execution contract: eager reference path only.
+        if self.recompute_granularity == "full" and (self.fp8 or self.fp4):
+            raise ValueError(
+                "dsv4_version='v4.1' full recomputation is implemented for bf16 only (the FP8/FP4 "
+                "TE checkpoint path is not wired to the shared-state transport yet)"
+            )
+        if self.recompute_granularity == "selective" and "mhc" in (self.recompute_modules or []):
+            raise ValueError("dsv4_version='v4.1' does not support selective mHC recomputation yet")
+        if self.cuda_graph_impl not in (None, "none"):
+            raise ValueError("dsv4_version='v4.1' does not support CUDA graphs yet")
+        if self.hidden_dropout:
+            raise ValueError("dsv4_version='v4.1' hyper-connections require hidden_dropout=0")
+        if not self.qk_layernorm:
+            raise ValueError("dsv4_version='v4.1' requires qk_layernorm=True (q_norm / kv_norm)")
+        if self.normalization != "RMSNorm":
+            raise ValueError("dsv4_version='v4.1' requires normalization='RMSNorm'")
+        if self.activation_func is not F.silu or not self.gated_linear_unit:
+            # The official experts are SwiGLU; GeGLU (the TransformerConfig default) is close
+            # enough numerically to go unnoticed in loss curves.
+            raise ValueError(
+                "dsv4_version='v4.1' requires SwiGLU experts: activation_func=F.silu with "
+                "gated_linear_unit=True (--swiglu)"
+            )
+        if self.activation_func_clamp_value is None:
+            # The official SwiGLU clamps the gate from above and the up projection on both
+            # sides at swiglu_limit = 10 (inference/model.py; alignment tool TINY["swiglu_limit"]).
+            # Without the clamp the expert math silently deviates from the released model.
+            raise ValueError(
+                "dsv4_version='v4.1' requires the clamped SwiGLU of the released model: set "
+                "activation_func_clamp_value (--activation-func-clamp-value 10.0)"
+            )
+        if self.attention_dropout:
+            # CSA2 never applies attention dropout; reject rather than silently ignore it.
+            raise ValueError("dsv4_version='v4.1' requires attention_dropout=0")
+        if self.attention_latent_norm_epsilon != self.layernorm_epsilon:
+            # The compressor norm and the indexer key norm use layernorm_epsilon (one norm_eps in
+            # the released config); a different latent epsilon would be silently ignored.
+            raise ValueError(
+                "dsv4_version='v4.1' uses layernorm_epsilon for the compressor and indexer "
+                "norms; attention_latent_norm_epsilon must equal it"
+            )
+        if self.csa_dense_mode:
+            raise ValueError("dsv4_version='v4.1' does not support csa_dense_mode")
+        if (self.dsa_indexer_loss_coeff or 0.0) != 0.0:
+            raise ValueError(
+                "dsv4_version='v4.1' has no indexer distillation loss yet; set "
+                "dsa_indexer_loss_coeff to 0"
+            )
+        if not self.csa2_indexer_frozen:
+            # Without the distillation loss an unfrozen indexer would run its scoring under
+            # autograd and own parameters that never receive a gradient.
+            raise ValueError(
+                "dsv4_version='v4.1' requires csa2_indexer_frozen=True until the indexer "
+                "distillation loss exists"
+            )
+        for field_name in ("dsa_indexer_n_heads", "dsa_indexer_head_dim", "dsa_indexer_topk"):
+            value = getattr(self, field_name)
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"dsv4_version='v4.1' requires a positive integer {field_name}")
+        if self.dsa_indexer_head_dim <= self.qk_pos_emb_head_dim:
+            raise ValueError(
+                "dsa_indexer_head_dim must exceed qk_pos_emb_head_dim (rotary tail of the "
+                "indexer key)"
+            )
+        if self.v_head_dim <= self.qk_pos_emb_head_dim:
+            raise ValueError("v_head_dim must exceed qk_pos_emb_head_dim")
+        if self.csa_window_size <= 0:
+            raise ValueError("csa_window_size must be positive")
+
+        if (
+            self.csa2_candidate_source_layer is not None
+            and self.csa2_candidate_topk_blocks * self.csa2_candidate_block_size
+            < self.dsa_indexer_topk
+        ):
+            # With fewer candidate positions than top-k entries the official indexer fills the
+            # remaining slots with -inf-scored (non-candidate) positions in an order torch.topk
+            # leaves unspecified; this implementation keeps only finite-scored entries. The
+            # released model has 2048 x 8 candidates for top-512, so the case never arises
+            # there; reject it instead of diverging.
+            raise ValueError(
+                "csa2_candidate_topk_blocks * csa2_candidate_block_size must cover "
+                f"dsa_indexer_topk ({self.dsa_indexer_topk}); got "
+                f"{self.csa2_candidate_topk_blocks} x {self.csa2_candidate_block_size}"
+            )
+
+        pattern_ratios = list(self.csa_compress_ratios[: self.num_layers])
+        model_ratios = model_layer_ratios_from_pattern_ratios(pattern_ratios)
+        # Raises ValueError with a field-specific message on any inconsistency.
+        resolve_csa2_plan(
+            model_ratios,
+            self.csa2_kv_source_layers,
+            self.csa2_index_source_layers,
+            self.csa2_candidate_source_layer,
+            self.csa2_candidate_topk_blocks,
+            self.csa2_candidate_block_size,
+        )
+
+        if self.engram_layer_ids:
+            num_model_layers = len(model_ratios)
+            if self.engram_num_embeddings is None or len(self.engram_num_embeddings) != len(
+                self.engram_layer_ids
+            ):
+                raise ValueError(
+                    "engram_num_embeddings must have one entry per engram_layer_ids entry"
+                )
+            for layer_id in self.engram_layer_ids:
+                if isinstance(layer_id, bool) or not isinstance(layer_id, int):
+                    raise ValueError(f"engram_layer_ids must be integers, got {layer_id!r}")
+                if not 0 <= layer_id < num_model_layers:
+                    raise ValueError(
+                        f"engram_layer_ids entry {layer_id} is outside [0, {num_model_layers})"
+                    )
+            if len(set(self.engram_layer_ids)) != len(self.engram_layer_ids):
+                raise ValueError(f"engram_layer_ids has duplicates: {self.engram_layer_ids}")
+            for rows in self.engram_num_embeddings:
+                if isinstance(rows, bool) or not isinstance(rows, int) or rows <= 0:
+                    raise ValueError(
+                        f"engram_num_embeddings must be positive integers, got {rows!r}"
+                    )
+            if self.engram_max_ngram_size < 2:
+                raise ValueError("engram_max_ngram_size must be at least 2")
+            if (
+                self.engram_n_heads <= 0
+                or self.engram_head_dim <= 0
+                or self.engram_bucket_size <= 0
+            ):
+                raise ValueError(
+                    "engram_n_heads, engram_head_dim and engram_bucket_size must be positive"
+                )
+            if self.engram_compressed_vocab_size <= 0:
+                raise ValueError("engram_compressed_vocab_size must be positive")
