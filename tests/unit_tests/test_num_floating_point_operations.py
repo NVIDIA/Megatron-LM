@@ -63,6 +63,7 @@ def _make_gpt_args(
     args.moe_latent_size = None
     args.moe_shared_expert_intermediate_size = None
     args.mtp_num_layers = None
+    args.mtp_use_repeated_layer = False
     # Linear attention disabled.
     args.experimental_attention_variant = None
     args.linear_attention_freq = None
@@ -934,6 +935,33 @@ class TestDSA:
         assert num_floating_point_operations(args, batch_size) < num_floating_point_operations(
             no_sharing, batch_size
         )
+
+    @pytest.mark.parametrize(
+        ("num_decoder_layers", "mtp_use_repeated_layer", "expected_indexer_executions"),
+        [(78, False, 25), (78, True, 28), (80, False, 26), (80, True, 29)],
+    )
+    def test_cross_layer_index_sharing_with_repeated_mtp(
+        self, monkeypatch, num_decoder_layers, mtp_use_repeated_layer, expected_indexer_executions
+    ):
+        """MTP indexer FLOPs follow main's block-local DSA layer numbering."""
+        args = _make_dsa_args()
+        args.num_layers = num_decoder_layers
+        args.mtp_num_layers = 7
+        args.mtp_use_repeated_layer = mtp_use_repeated_layer
+        args.dsa_indexer_topk_freq = 4
+        args.dsa_indexer_skip_topk_offset = 3
+        observed_indexer_executions = []
+        original_indexer_flops = training_module._dsa_indexer_flops
+
+        def capture_indexer_count(**kwargs):
+            observed_indexer_executions.append(kwargs["num_indexer_layers"])
+            return original_indexer_flops(**kwargs)
+
+        monkeypatch.setattr(training_module, "_dsa_indexer_flops", capture_indexer_count)
+
+        num_floating_point_operations(args, batch_size=2)
+
+        assert observed_indexer_executions == [expected_indexer_executions]
 
     def test_topk_caps_long_context_growth(self):
         """Pin the bug: a long sequence must not be charged dense ``L^2 / 2``.

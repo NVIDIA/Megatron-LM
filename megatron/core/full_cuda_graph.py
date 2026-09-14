@@ -8,6 +8,7 @@ import logging
 import torch
 
 from megatron.core.tensor_parallel.random import get_all_rng_states
+from megatron.core.transformer.experimental_attention_variant import dsa_logging
 
 logger = logging.getLogger(__name__)
 
@@ -147,6 +148,7 @@ class FullCudaGraphWrapper:
         self.static_loader = StaticBufferLoader()
         self.cuda_graph_warmup_steps = cuda_graph_warmup_steps
         self.use_single_mempool = use_single_mempool
+        self._dsa_tracker_initialized_stages = set()
 
     def data_read(self, data_iterator, model, training, num_microbatches):
         """Read all microbatch inputs from Dataloader and copy to static buffers."""
@@ -199,11 +201,17 @@ class FullCudaGraphWrapper:
         num_microbatches = kwargs['num_microbatches']
 
         training = not kwargs['forward_only']
+        training_str = 'training' if training else 'validation'
+        if training_str not in self._dsa_tracker_initialized_stages:
+            # Custom full-iteration entrypoints may bypass standard training setup. Fix the
+            # PP-agreed tracker allocation before even the first eager warmup can write to it.
+            dsa_logging.initialize_dsa_metric_tracker(model, kwargs.get("pg_collection"))
+            self._dsa_tracker_initialized_stages.add(training_str)
+
         data_iterator = kwargs['data_iterator']
         data_list = self.data_read(data_iterator, model, training, num_microbatches)
         kwargs['data_iterator'] = data_list
 
-        training_str = 'training' if training else 'validation'
         curr_iteration = self.curr_iter(training_str)
         if curr_iteration == self.cuda_graph_warmup_steps:
             logger.info(f'Capture CUDA graph for {training_str}!!!')
@@ -258,10 +266,12 @@ class FullCudaGraphWrapper:
                 FullCudaGraphWrapper.cuda_graph['training'] = None
             FullCudaGraphWrapper.result['training'] = None
             FullCudaGraphWrapper.curr_iteration['training'] = 0
+            self._dsa_tracker_initialized_stages.discard('training')
         if stage is None or stage == 'validation':
             if FullCudaGraphWrapper.cuda_graph['validation'] is not None:
                 del FullCudaGraphWrapper.cuda_graph['validation']
                 FullCudaGraphWrapper.cuda_graph['validation'] = None
             FullCudaGraphWrapper.result['validation'] = None
             FullCudaGraphWrapper.curr_iteration['validation'] = 0
+            self._dsa_tracker_initialized_stages.discard('validation')
         gc.collect()

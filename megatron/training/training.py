@@ -119,9 +119,11 @@ from megatron.core.rerun_state_machine import (
 )
 from megatron.core.resharding.refit import swap_model_weights
 from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
-from megatron.core.transformer.experimental_attention_variant.dsa import (
+from megatron.core.transformer.experimental_attention_variant.dsa import is_dsa_skip_topk_layer
+from megatron.core.transformer.experimental_attention_variant.dsa_logging import (
     DSAIndexerLossLoggingHelper,
-    is_dsa_skip_topk_layer,
+    initialize_dsa_metric_tracker,
+    resolve_dsa_metric_pg_collection,
 )
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.moe import upcycling_utils
@@ -875,9 +877,10 @@ def _dsa_indexer_flops(
     only the model's defining GEMMs enter the estimate, not auxiliary-loss or
     sorting work.
 
-    Only ``num_indexer_layers`` layers pay: with cross-layer index sharing
-    (``dsa_indexer_topk_freq``) the layers in between reuse the most recent
-    top-k (see ``is_dsa_skip_topk_layer``).
+    Only ``num_indexer_layers`` indexer executions pay: with cross-layer index
+    sharing (``dsa_indexer_topk_freq``) the layers in between reuse the most
+    recent top-k (see ``is_dsa_skip_topk_layer``). Repeated MTP may execute the
+    same physical indexer multiple times.
 
     The indexer does NOT get the global fwd+bwd factor of 3. It is trained
     only by its own KL loss, so ``DSAttention.forward`` runs it under
@@ -944,20 +947,53 @@ def _dsa_indexer_flops(
     )
 
 
-def _num_dsa_indexer_layers(num_layers, skip_topk_offset, topk_freq):
-    """Count layers that compute their own DSA index (the rest reuse one).
+def _standard_csa_layer_numbers_for_execution(
+    num_decoder_layers, *, mtp_num_layers=0, mtp_use_repeated_layer=False
+):
+    """Return standard CSA layer numbers in their runtime execution order.
 
-    On the standard-model path every layer is a DSA attention layer (MTP
-    layers included -- ``DSAttention.__init__`` numbers them
-    ``layer_number + config.num_layers``, which is exactly how the caller
-    extends ``num_layers``), so the predicate runs over the whole
-    ``1..num_layers`` range.
+    ``CompressedSparseAttention`` explicitly offsets MTP layer numbers by the
+    decoder depth. Independent MTP layers therefore use ``N+1..N+D``, while
+    repeated MTP builds only layer ``N+1`` and executes it ``D`` times.
     """
-    return sum(
-        1
-        for layer_number in range(1, num_layers + 1)
-        if not is_dsa_skip_topk_layer(layer_number, skip_topk_offset or 0, topk_freq or 1)
+    layer_numbers = list(range(1, num_decoder_layers + 1))
+    mtp_num_layers = mtp_num_layers or 0
+    if mtp_use_repeated_layer and mtp_num_layers > 0:
+        layer_numbers.extend([num_decoder_layers + 1] * mtp_num_layers)
+    else:
+        layer_numbers.extend(range(num_decoder_layers + 1, num_decoder_layers + mtp_num_layers + 1))
+    return layer_numbers
+
+
+def _num_dsa_indexer_layers(
+    num_decoder_layers,
+    skip_topk_offset,
+    topk_freq,
+    *,
+    mtp_num_layers=0,
+    mtp_use_repeated_layer=False,
+):
+    """Count DSA indexer executions on the standard-model path.
+
+    Unlike CSA, standard GPT MTP keeps DSA layer numbers local to the MTP
+    block: independent layers use ``1..D`` and repeated MTP executes layer 1
+    ``D`` times.
+    """
+    main_executions = sum(
+        not is_dsa_skip_topk_layer(layer_number, skip_topk_offset or 0, topk_freq or 1)
+        for layer_number in range(1, num_decoder_layers + 1)
     )
+    mtp_num_layers = mtp_num_layers or 0
+    if mtp_use_repeated_layer:
+        mtp_executions = mtp_num_layers * (
+            not is_dsa_skip_topk_layer(1, skip_topk_offset or 0, topk_freq or 1)
+        )
+    else:
+        mtp_executions = sum(
+            not is_dsa_skip_topk_layer(layer_number, skip_topk_offset or 0, topk_freq or 1)
+            for layer_number in range(1, mtp_num_layers + 1)
+        )
+    return main_executions + mtp_executions
 
 
 def _num_dsa_indexer_layers_in_pattern(layer_types, dsa_symbol, skip_topk_offset, topk_freq):
@@ -1523,7 +1559,11 @@ def num_floating_point_operations(
                 n_heads=args.dsa_indexer_n_heads,
                 head_dim=args.dsa_indexer_head_dim,
                 num_indexer_layers=_num_dsa_indexer_layers(
-                    num_layers, args.dsa_indexer_skip_topk_offset, args.dsa_indexer_topk_freq
+                    args.num_layers,
+                    args.dsa_indexer_skip_topk_offset,
+                    args.dsa_indexer_topk_freq,
+                    mtp_num_layers=mtp_num_layers,
+                    mtp_use_repeated_layer=getattr(args, "mtp_use_repeated_layer", False),
                 ),
                 dsa_indexer_loss_coeff=args.dsa_indexer_loss_coeff,
                 dsa_indexer_use_sparse_loss=getattr(args, "dsa_indexer_use_sparse_loss", False),
@@ -3380,6 +3420,10 @@ def setup_model_and_optimizer(
         torch.distributed.barrier()
         exit()
 
+    # Establish one PP-agreed capacity before the first forward or graph capture.
+    if (getattr(args, "dsa_indexer_loss_coeff", None) or 0.0) > 0:
+        initialize_dsa_metric_tracker(unwrapped_model, pg_collection)
+
     return model, optimizer, opt_param_scheduler
 
 
@@ -3710,28 +3754,65 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
 
 
 def _get_indexer_logging_layer_counts(args) -> tuple[int, int | None]:
-    """Return tracker slots and active CSA indexer modules for loss logging."""
+    """Return tracker slots and indexer executions contributing to loss logging."""
     tracker_layers = args.num_layers + (args.mtp_num_layers or 0)
-    if args.csa_compress_ratios is None:
-        return tracker_layers, None
-
-    ratios = args.csa_compress_ratios
     if is_hybrid_model(args):
-        from megatron.core.models.hybrid.hybrid_layer_allocation import parse_hybrid_pattern
+        from megatron.core.models.hybrid.hybrid_layer_allocation import (
+            Symbols,
+            parse_hybrid_pattern,
+        )
 
         parsed_pattern = parse_hybrid_pattern(args.hybrid_layer_pattern)
         mtp_pattern_layers = len(parsed_pattern.mtp_pattern or "")
         tracker_layers = args.num_layers + mtp_pattern_layers
-        main_indexers = sum(ratio == 4 for ratio in ratios[: args.num_layers])
-        mtp_indexers_per_depth = sum(
-            ratio == 4 for ratio in ratios[args.num_layers : tracker_layers]
-        )
-        mtp_indexer_repeats = 1 if args.mtp_use_repeated_layer else parsed_pattern.mtp_num_depths
-        indexer_layers = main_indexers + (mtp_indexers_per_depth * mtp_indexer_repeats)
-    else:
-        indexer_layers = sum(ratio == 4 for ratio in ratios[:tracker_layers])
+        if args.csa_compress_ratios is not None:
+            ratios = args.csa_compress_ratios
+            main_indexers = sum(ratio == 4 for ratio in ratios[: args.num_layers])
+            mtp_indexers_per_depth = sum(
+                ratio == 4 for ratio in ratios[args.num_layers : tracker_layers]
+            )
+            indexer_executions = main_indexers + (
+                mtp_indexers_per_depth * parsed_pattern.mtp_num_depths
+            )
+            return tracker_layers, 0 if args.csa_dense_mode else indexer_executions
 
-    return tracker_layers, 0 if args.csa_dense_mode else indexer_layers
+        main_pattern = (parsed_pattern.main_pattern or "").replace(Symbols.PIPE, "")
+        indexer_executions = _num_dsa_indexer_layers_in_pattern(
+            main_pattern,
+            Symbols.DS_ATTENTION,
+            args.dsa_indexer_skip_topk_offset,
+            args.dsa_indexer_topk_freq,
+        )
+        if parsed_pattern.mtp_pattern:
+            indexer_executions += (
+                parsed_pattern.mtp_num_depths
+                * _num_dsa_indexer_layers_in_pattern(
+                    parsed_pattern.mtp_pattern,
+                    Symbols.DS_ATTENTION,
+                    args.dsa_indexer_skip_topk_offset,
+                    args.dsa_indexer_topk_freq,
+                )
+            )
+        return tracker_layers, indexer_executions
+
+    if args.csa_compress_ratios is not None:
+        ratios = [
+            args.csa_compress_ratios[layer_number - 1]
+            for layer_number in _standard_csa_layer_numbers_for_execution(
+                args.num_layers,
+                mtp_num_layers=args.mtp_num_layers,
+                mtp_use_repeated_layer=getattr(args, "mtp_use_repeated_layer", False),
+            )
+        ]
+        return tracker_layers, 0 if args.csa_dense_mode else sum(ratio == 4 for ratio in ratios)
+
+    return tracker_layers, _num_dsa_indexer_layers(
+        args.num_layers,
+        args.dsa_indexer_skip_topk_offset,
+        args.dsa_indexer_topk_freq,
+        mtp_num_layers=args.mtp_num_layers,
+        mtp_use_repeated_layer=getattr(args, "mtp_use_repeated_layer", False),
+    )
 
 
 def training_log(
@@ -3750,6 +3831,7 @@ def training_log(
     is_first_iteration=False,
     seqlen_squared_sum_in_batch: float | None = None,
     total_real_tokens_in_batch: float | None = None,
+    schedule_pg_collection=None,
 ):
     """Log training information such as losses, timing, ...."""
     args = get_args()
@@ -3999,33 +4081,45 @@ def training_log(
         )
 
     # Track sparse attention indexer loss.
-    if args.dsa_indexer_loss_coeff is not None and args.dsa_indexer_loss_coeff > 0:
+    should_track_dsa, dsa_metric_pg_collection = resolve_dsa_metric_pg_collection(
+        pg_collection, schedule_pg_collection=schedule_pg_collection
+    )
+    if (
+        args.dsa_indexer_loss_coeff is not None
+        and args.dsa_indexer_loss_coeff > 0
+        and should_track_dsa
+    ):
+        # Hybrid-CP reconstruction is normalized against the nominal scheduled
+        # microbatch count, not the physical packed-microbatch count.
         indexer_loss_scale = 1 / get_num_microbatches()
-        if isinstance(pg_collection, MultiModuleProcessGroupCollection):
-            assert pg_collection.has_language_model(), (
-                "DSA indexer logging requires a language-model ProcessGroupCollection"
+        pp_group = None
+        final_avg_group = None
+        configured_cp_size = args.context_parallel_size
+        if dsa_metric_pg_collection is not None:
+            pp_group = dsa_metric_pg_collection.pp
+            final_avg_group = (
+                getattr(dsa_metric_pg_collection, "dp_cp_gtp_remat", None)
+                or dsa_metric_pg_collection.dp_cp
             )
-            pg_collection = pg_collection.get_language_model_collection()
-        if pg_collection is None:
-            # Compatibility path for legacy training entrypoints such as tasks/finetune_utils.py.
-            # The core logger still receives explicit groups and does not read MPU globals.
-            pg_collection = ProcessGroupCollection.use_mpu_process_groups(
-                required_pgs=['pp', 'dp']
-            )
-        assert isinstance(
-            pg_collection, ProcessGroupCollection
-        ), "DSA indexer logging requires a ProcessGroupCollection"
+            metric_cp_group = getattr(dsa_metric_pg_collection, "cp", None)
+            if metric_cp_group is not None:
+                # Multi-module grids may give the language model a CP width that differs
+                # from the process-wide CLI value. Use the owning collection, as schedules do.
+                configured_cp_size = get_pg_size(metric_cp_group)
         indexer_tracker_layers, indexer_layer_count = _get_indexer_logging_layer_counts(args)
         DSAIndexerLossLoggingHelper.track_indexer_metrics(
             loss_scale=indexer_loss_scale,
             iteration=iteration,
             writer=writer,
-            pg_collection=pg_collection,
             wandb_writer=wandb_writer,
             total_loss_dict=total_loss_dict,
             num_layers=indexer_tracker_layers,
             num_indexer_layers=indexer_layer_count,
             preserve_groups=args.cuda_graph_impl != "none",
+            hybrid_context_parallel=args.hybrid_context_parallel,
+            configured_cp_size=configured_cp_size,
+            pp_group=pp_group,
+            final_avg_group=final_avg_group,
         )
 
     # Dump memory snapshot and print metrics to stdout.
@@ -5039,6 +5133,7 @@ def train(
             seq_length=args.seq_length,
             micro_batch_size=args.micro_batch_size,
             optimizers=[optimizer],
+            pg_collection=model_pg_collection,
         )
 
     # OTel: everything above in train() (the preamble: weight-hash check, sniff
@@ -5405,6 +5500,7 @@ def train(
                     is_first_iteration=is_first_iteration,
                     seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
                     total_real_tokens_in_batch=total_real_tokens_in_batch,
+                    schedule_pg_collection=pg_collection,
                 )
             # OTel: close the iteration-report super-span (parents params_norm + log;
             # its own uninstrumented time is the loss_scale sync + FLOPs bookkeeping).

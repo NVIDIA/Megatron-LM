@@ -847,6 +847,8 @@ class CompressedSparseAttention(MegatronModule):
       all causally valid compressed positions are attended.
     """
 
+    logs_dsa_indexer_loss = True
+
     def __init__(
         self,
         config: TransformerConfig,
