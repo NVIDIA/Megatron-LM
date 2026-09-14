@@ -45,6 +45,7 @@ from torch.utils.tensorboard import SummaryWriter
 from wandb import wandb_run
 
 from megatron.core import mpu
+from megatron.core.distributed import DistributedDataParallel
 from megatron.core.full_cuda_graph import FullCudaGraphWrapper
 from megatron.core.inference.contexts.dynamic_context import HAVE_TORCH_MEMORY_SAVER
 from megatron.core.inference.inference_request import FinishedRequestRecord
@@ -2972,7 +2973,7 @@ def calculate_grpo_loss(
 @contextmanager
 def megatron_rl_inference_mode(
     model: list[LanguageModule],
-    optimizer: MegatronOptimizer,
+    optimizer: MegatronOptimizer | None,
     cuda_graph_impl: str,
     offload_optimizer_during_inference: bool,
     training_model: Optional[list[LanguageModule]] = None,
@@ -2981,7 +2982,7 @@ def megatron_rl_inference_mode(
 
     Args:
         model: model to prepare for inference (may be separate inference model).
-        optimizer: optimizer used to train the model.
+        optimizer: optimizer used to train the model, or None for optimizer-free inference.
         cuda_graph_impl: which cuda graph implementation to use.
         offload_optimizer_during_inference: move optimizer to cpu during inference or not.
         training_model: training model (if separate from inference model). Used to offload
@@ -3018,6 +3019,17 @@ def megatron_rl_inference_mode(
     model_core = unwrap_model(model[0])
     with nvtx_range("rl/prefetch-weights-to-gpu", time=True):
         _maybe_prefetch_separate_inference_model_weights(model_core, to_cpu=False)
+    if training_model is None and optimizer is not None:
+        # Gather canonical parameters before the engine refreshes serving buffers.
+        with torch.no_grad(), nvtx_range("rl/synchronize-inference-parameters", time=True):
+            optimizer.prepare_model_params_for_param_sync()
+            for model_chunk in model:
+                # Ordinary DDP already has complete parameters.
+                if (
+                    isinstance(model_chunk, DistributedDataParallel)
+                    and model_chunk.ddp_config.param_sync_via_bucket_group
+                ):
+                    model_chunk.start_param_sync(force_sync=True)
 
     rotary_module = getattr(lang_module, "rotary_pos_emb", None)
     # Vanilla RotaryEmbedding module has lru_cache decorator which breaks RL training

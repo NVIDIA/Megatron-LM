@@ -11,6 +11,7 @@ import pytest
 import torch
 
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
+from megatron.core.distributed.param_and_grad_buffer import _ParamAndGradBucketGroup
 from megatron.core.enums import ModelType
 from megatron.core.inference.inference_request import FinishedRequestRecord
 from megatron.core.models.common.language_module.language_module import LanguageModule
@@ -500,8 +501,13 @@ class TestRLUtils:
         [pytest.param(True, id="shared-config"), pytest.param(False, id="distinct-config")],
     )
     @pytest.mark.parametrize("num_experts", [None, 8], ids=["dense", "moe"])
+    @pytest.mark.parametrize("separate_model", [False, True], ids=["colocated", "separate"])
+    @pytest.mark.parametrize(
+        "optimizer_mode",
+        ["none", "replicated", "distributed", "layerwise_overlap", "layerwise_mxfp8", "unwrapped"],
+    )
     def test_megatron_rl_inference_mode_restores_training_cuda_graph_state(
-        self, monkeypatch, share_config, num_experts
+        self, monkeypatch, share_config, num_experts, separate_model, optimizer_mode
     ):
         config = SimpleNamespace(
             cuda_graph_impl="none",
@@ -518,7 +524,50 @@ class TestRLUtils:
             )
         )
         lang_module = DummyLangModule(layer_config)
-        model = [SimpleNamespace(config=config, module=lang_module)]
+        events = []
+        needs_param_sync = optimizer_mode in {"distributed", "layerwise_overlap", "layerwise_mxfp8"}
+        param_sync = None
+        if optimizer_mode in {"none", "unwrapped"}:
+            # Optimizer-free and non-DDP models need not expose start_param_sync.
+            model_chunk = SimpleNamespace(config=config, module=lang_module)
+        else:
+            ddp_config = DistributedDataParallelConfig(
+                use_distributed_optimizer=optimizer_mode == "distributed",
+                overlap_param_gather=optimizer_mode == "layerwise_overlap",
+                reuse_grad_buf_for_mxfp8_param_ag=optimizer_mode == "layerwise_mxfp8",
+                fp8_param_gather=optimizer_mode == "layerwise_mxfp8",
+            )
+            # Exercise the real DDP/bucket-group entry points without allocating
+            # distributed buffers. A pending gather completes through force_sync.
+            bucket_group = _ParamAndGradBucketGroup.__new__(_ParamAndGradBucketGroup)
+            bucket_group.ddp_config = ddp_config
+            bucket_group.param_gather_handle = MagicMock()
+            bucket_group._post_param_sync = MagicMock()
+            model_chunk = DistributedDataParallel.__new__(DistributedDataParallel)
+            torch.nn.Module.__init__(model_chunk)
+            model_chunk.config = config
+            model_chunk.module = lang_module
+            model_chunk.ddp_config = ddp_config
+            model_chunk.bucket_groups = [bucket_group]
+            model_chunk.expert_parallel_bucket_groups = []
+            if not needs_param_sync:
+                # Establish the failure that an unconditional gather would cause.
+                with pytest.raises(AssertionError):
+                    model_chunk.start_param_sync(force_sync=True)
+            start_param_sync = model_chunk.start_param_sync
+
+            def sync(**kwargs):
+                events.append("param-sync")
+                start_param_sync(**kwargs)
+
+            param_sync = MagicMock(side_effect=sync)
+            model_chunk.start_param_sync = param_sync
+        model = [model_chunk]
+        optimizer = None if optimizer_mode == "none" else MagicMock()
+        if optimizer is not None:
+            optimizer.prepare_model_params_for_param_sync.side_effect = lambda: events.append(
+                "prepare"
+            )
         args = SimpleNamespace(
             rl_training_cuda_graphs=False,
             num_experts=num_experts,
@@ -528,15 +577,36 @@ class TestRLUtils:
             inference_cuda_graph_scope=InferenceCudaGraphScope.block,
         )
         interface, _ = self._patch_rl_inference_mode_deps(monkeypatch, args)
+        interface.resume.side_effect = lambda **_: events.append("resume")
         toggle_cuda_graphs = self._make_toggle_cuda_graphs_mock()
         monkeypatch.setattr(rl_utils, "toggle_cuda_graphs", toggle_cuda_graphs)
 
-        with rl_utils.megatron_rl_inference_mode(model, MagicMock(), "local", False) as result:
+        with rl_utils.megatron_rl_inference_mode(
+            model, optimizer, "local", False, training_model=model if separate_model else None
+        ) as result:
             assert result is interface
             for current_config in (config, layer_config):
                 assert current_config.cuda_graph_impl == "local"
                 assert current_config.cuda_graph_modules == []
                 assert current_config.inference_cuda_graph_scope == InferenceCudaGraphScope.block
+
+        should_prepare = not separate_model and optimizer is not None
+        should_sync = should_prepare and needs_param_sync
+        assert events == (
+            (["prepare"] if should_prepare else [])
+            + (["param-sync"] if should_sync else [])
+            + ["resume"]
+        )
+        if optimizer is not None:
+            if should_prepare:
+                optimizer.prepare_model_params_for_param_sync.assert_called_once_with()
+            else:
+                optimizer.prepare_model_params_for_param_sync.assert_not_called()
+        if param_sync is not None:
+            if should_sync:
+                param_sync.assert_called_once_with(force_sync=True)
+            else:
+                param_sync.assert_not_called()
 
         assert toggle_cuda_graphs.call_args_list == [
             call(lang_module, "local"),

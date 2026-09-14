@@ -1300,6 +1300,11 @@ class TransformerConfig(ModelParallelConfig):
     use_inference_optimized_layers: bool = False
     """If True, use inference optimized transformer layers during inference."""
 
+    inference_only: bool = False
+    """Guarantee this model is never DDP-wrapped or optimizer-owned.
+    Allows inference modules to share parameter and serving storage. This is a
+    lifetime ownership contract, not a transient eval()/inference mode."""
+
     inference_fuse_tp_communication: bool = False
     """ If true, uses a fused reduce-scatter-residual-norm-allgather kernel during inference. """
 

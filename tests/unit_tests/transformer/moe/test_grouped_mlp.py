@@ -17,7 +17,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 )
 from megatron.core.quantization.quant_config import RecipeConfig
 from megatron.core.transformer.module import Float16Module
-from megatron.core.transformer.moe.experts import TEGroupedMLP
+from megatron.core.transformer.moe.experts import InferenceGroupedMLP, TEGroupedMLP
 from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
 from megatron.core.transformer.spec_utils import get_submodules
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -93,6 +93,112 @@ def test_remove_glu_interleaving_restores_contiguous_gate_and_linear_halves():
     output = TEGroupedMLP._remove_glu_interleaving(interleaved, interleave_size=2)
 
     torch.testing.assert_close(output, expected)
+
+
+def _make_inference_grouped_mlp_skeleton(device, serving_weights_canonical=False):
+    module = InferenceGroupedMLP.__new__(InferenceGroupedMLP)
+    torch.nn.Module.__init__(module)
+    module.num_local_experts = 2
+    module._concatenated_weights_built = False
+    module._serving_weights_canonical = serving_weights_canonical
+
+    for linear_name, shape in (('linear_fc1', (4, 3)), ('linear_fc2', (3, 2))):
+        linear = torch.nn.Module()
+        for expert_idx in range(module.num_local_experts):
+            linear.register_parameter(
+                f'weight{expert_idx}',
+                torch.nn.Parameter(torch.full(shape, float(expert_idx + 1), device=device)),
+            )
+        setattr(module, linear_name, linear)
+    return module
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_inference_grouped_mlp_refreshes_serving_weights_without_redirecting_parameters(device):
+    module = _make_inference_grouped_mlp_skeleton(device)
+
+    parameter_ptrs = {name: param.data_ptr() for name, param in module.named_parameters()}
+    module._build_concatenated_weights()
+    module._concatenated_weights_built = True
+    serving_ptrs = (module._fc1_weight.data_ptr(), module._fc2_weight.data_ptr())
+
+    assert {name: param.data_ptr() for name, param in module.named_parameters()} == parameter_ptrs
+    assert module._fc1_weight.data_ptr() not in parameter_ptrs.values()
+    assert module._fc2_weight.data_ptr() not in parameter_ptrs.values()
+
+    if device == "cuda":
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            serving_sum = module._fc1_weight.sum() + module._fc2_weight.sum()
+
+    module.linear_fc1.weight0.data.fill_(11)
+    module.linear_fc2.weight1.data.fill_(22)
+
+    assert module.refresh_inference_weights()
+    assert (module._fc1_weight.data_ptr(), module._fc2_weight.data_ptr()) == serving_ptrs
+    torch.testing.assert_close(module._fc1_weight[0], module.linear_fc1.weight0)
+    torch.testing.assert_close(module._fc2_weight[1], module.linear_fc2.weight1)
+    if device == "cuda":
+        graph.replay()
+        torch.testing.assert_close(serving_sum, module._fc1_weight.sum() + module._fc2_weight.sum())
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_inference_only_grouped_mlp_retains_single_copy_of_expert_weights(device):
+    module = _make_inference_grouped_mlp_skeleton(device, serving_weights_canonical=True)
+
+    module._build_concatenated_weights()
+    module._concatenated_weights_built = True
+
+    # Every parameter is a view into the packed serving buffers: one retained copy.
+    for linear, serving_weight in (
+        (module.linear_fc1, module._fc1_weight),
+        (module.linear_fc2, module._fc2_weight),
+    ):
+        for expert_idx in range(module.num_local_experts):
+            param = getattr(linear, f'weight{expert_idx}')
+            assert param.data_ptr() == serving_weight[expert_idx].data_ptr()
+            torch.testing.assert_close(
+                serving_weight[expert_idx], torch.full_like(param, float(expert_idx + 1))
+            )
+
+    # In-place refit writes land in the serving buffers without a refresh.
+    module.linear_fc1.weight0.data.fill_(33)
+    torch.testing.assert_close(module._fc1_weight[0], torch.full_like(module._fc1_weight[0], 33.0))
+
+    # Steady state: nothing to refresh, serving addresses unchanged.
+    serving_ptrs = (module._fc1_weight.data_ptr(), module._fc2_weight.data_ptr())
+    assert not module.refresh_inference_weights()
+    assert (module._fc1_weight.data_ptr(), module._fc2_weight.data_ptr()) == serving_ptrs
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_inference_only_grouped_mlp_reattaches_detached_parameters_on_refresh(device):
+    module = _make_inference_grouped_mlp_skeleton(device, serving_weights_canonical=True)
+    module._build_concatenated_weights()
+    module._concatenated_weights_built = True
+    serving_ptrs = (module._fc1_weight.data_ptr(), module._fc2_weight.data_ptr())
+
+    if device == "cuda":
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            serving_sum = module._fc1_weight.sum() + module._fc2_weight.sum()
+
+    # Detach parameter storage without moving the captured serving buffers.
+    module.linear_fc1.weight0.data = torch.full_like(module.linear_fc1.weight0, 44.0)
+    module.linear_fc2.weight1.data = torch.full_like(module.linear_fc2.weight1, 55.0)
+
+    assert module.refresh_inference_weights()
+
+    # Values landed at the original serving addresses; parameters are views again.
+    assert (module._fc1_weight.data_ptr(), module._fc2_weight.data_ptr()) == serving_ptrs
+    torch.testing.assert_close(module._fc1_weight[0], torch.full_like(module._fc1_weight[0], 44.0))
+    torch.testing.assert_close(module._fc2_weight[1], torch.full_like(module._fc2_weight[1], 55.0))
+    assert module.linear_fc1.weight0.data_ptr() == module._fc1_weight[0].data_ptr()
+    assert module.linear_fc2.weight1.data_ptr() == module._fc2_weight[1].data_ptr()
+    if device == "cuda":
+        graph.replay()
+        torch.testing.assert_close(serving_sum, module._fc1_weight.sum() + module._fc2_weight.sum())
 
 
 def test_make_fused_ops_reuses_grouped_linear_weights_on_meta_device(monkeypatch):

@@ -61,6 +61,7 @@ from megatron.core.inference.utils import Counter, InferenceMode, await_process_
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.cuda_graphs import CudaGraphManager, delete_cuda_graphs
 from megatron.core.transformer.enums import InferenceCudaGraphScope
+from megatron.core.transformer.moe.experts import InferenceGroupedMLP
 from megatron.core.transformer.moe.router_replay import RouterReplay, RouterReplayAction
 from megatron.core.utils import (
     deprecate_args,
@@ -322,6 +323,10 @@ class DynamicInferenceEngine(AbstractEngine):
     # the += in resume() still rebinds onto the instance.
     _weight_epoch: int = 0
 
+    # Same rationale: engines built without __init__ lack the construction-time
+    # module snapshot; the refresh falls back to a live traversal when None.
+    _inference_grouped_mlp_modules: Optional[List["InferenceGroupedMLP"]] = None
+
     @deprecate_args(
         *DEPRECATED_ARGS,
         message="Argument `{name}` has been deprecated. Only pass `controller` and `context`",
@@ -345,6 +350,14 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # Initialization options.
         self.controller = controller
+        # Snapshot for the resume-time weight refresh: it runs on the coordinator
+        # thread, so it must not traverse a module tree the caller may be mutating
+        # (e.g. toggling CUDA-graph wrappers). The set is fixed at model build.
+        self._inference_grouped_mlp_modules = [
+            module
+            for module in unwrap_model(controller.inference_wrapped_model.model).modules()
+            if isinstance(module, InferenceGroupedMLP)
+        ]
         self.context = context
 
         self.num_speculative_tokens = inference_config.num_speculative_tokens
@@ -419,6 +432,10 @@ class DynamicInferenceEngine(AbstractEngine):
                         if isinstance(val, (int, float)) and int(val) > max_step:
                             max_step = int(val)
                     self.inference_step_offset = int(max_step)
+
+        # Repair expert aliases detached by conversion/load before the first capture;
+        # a new engine is already RUNNING, so resume() skips the refresh.
+        self._refresh_inference_grouped_mlp_weights()
 
         # Mark the inference engine as active. Cleared in `suspend()` and re-set in `resume()`.
         InferenceMode.set_active()
@@ -1238,6 +1255,22 @@ class DynamicInferenceEngine(AbstractEngine):
         if not self.use_coordinator:
             self.state = EngineState.SUSPENDED
 
+    @torch.no_grad()
+    def _refresh_inference_grouped_mlp_weights(self) -> None:
+        """Refresh materialized serving buffers after the caller has synchronized weights.
+
+        Iterates the snapshot taken at construction: this runs on the coordinator
+        thread, where traversing the live module tree races caller-side mutation.
+        Engines built without __init__ (tests) have no snapshot and take the
+        traversal path.
+        """
+        modules = self._inference_grouped_mlp_modules
+        if modules is None:
+            model = unwrap_model(self.controller.inference_wrapped_model.model)
+            modules = [m for m in model.modules() if isinstance(m, InferenceGroupedMLP)]
+        for module in modules:
+            module.refresh_inference_weights()
+
     def resume(self):
         """Resume engine by reallocating context's GPU state."""
 
@@ -1253,6 +1286,7 @@ class DynamicInferenceEngine(AbstractEngine):
         # that spans the refit republishes under its original generation and is
         # unmatchable by new arrivals.
         self._weight_epoch += 1
+        self._refresh_inference_grouped_mlp_weights()
 
         InferenceMode.set_active()
 

@@ -42,7 +42,10 @@ logger = logging.getLogger(__name__)
 
 
 def get_model_builder(
-    args: Namespace, provider: Optional[Literal["gpt", "hybrid", "mamba"]] = None
+    args: Namespace,
+    provider: Optional[Literal["gpt", "hybrid", "mamba"]] = None,
+    *,
+    inference_only: bool = False,
 ) -> ModelBuilder:
     """Construct a :class:`ModelBuilder` for the requested model provider.
 
@@ -57,6 +60,7 @@ def get_model_builder(
         provider: Optional override for the model provider name. Must be one of
             ``"gpt"``, ``"hybrid"``, or the deprecated ``"mamba"``. When omitted,
             falls back to ``args.model_provider`` (set by ``add_inference_args``).
+        inference_only: Whether the model will never be owned by DDP or an optimizer.
 
     Returns:
         A :class:`ModelBuilder` instance bound to a config derived from ``args``.
@@ -64,7 +68,9 @@ def get_model_builder(
     if provider is None:
         provider = args.model_provider
     if provider == "gpt":
-        return GPTModelBuilder(gpt_config_from_args(args))
+        config = gpt_config_from_args(args)
+        config.transformer.inference_only = inference_only
+        return GPTModelBuilder(config)
     if provider in ("hybrid", "mamba"):
         if provider == "mamba":
             warnings.warn(
@@ -72,7 +78,9 @@ def get_model_builder(
                 DeprecationWarning,
                 stacklevel=2,
             )
-        return HybridModelBuilder(hybrid_config_from_args(args))
+        config = hybrid_config_from_args(args)
+        config.transformer.inference_only = inference_only
+        return HybridModelBuilder(config)
     raise ValueError(f"Invalid model provider {provider}")
 
 
@@ -88,7 +96,7 @@ def get_model_for_inference() -> MegatronModule:
         # care of running the modelopt-checkpoint auto-detection side effect.
         model = _get_model(modelopt_gpt_hybrid_builder, wrap_with_ddp=False)
     else:
-        builder = get_model_builder(args)
+        builder = get_model_builder(args, inference_only=True)
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         model = builder.build_distributed_models(
             pg_collection=pg_collection, wrap_with_ddp=False
