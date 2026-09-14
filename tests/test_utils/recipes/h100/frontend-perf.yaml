@@ -1,0 +1,55 @@
+# Capacity tests for the inference frontend and coordinator. No checkpoint, no
+# model and no GPU work: the benchmark starts its own coordinator process and
+# fake ZMQ engines, so these numbers move only when the frontend, the
+# InferenceClient or the coordinator itself changes. It still runs on a GPU node
+# because that is what the runners provide, and because the baseline is keyed by
+# node type (CPU and NIC differences move the numbers).
+type: basic
+format_version: 1
+maintainers: [mcore]
+loggers: [stdout]
+spec:
+  name: '{test_case}_{environment}_{platforms}'
+  model: frontend
+  build: mcore-pyt-{environment}
+  nodes: 1
+  gpus: 1
+  n_repeat: 1
+  platforms: dgx_h100
+  time_limit: 1800
+  script_setup: |
+    set -euo pipefail
+    unset https_proxy
+    umask 077
+    printf '%s\n' "machine gitlab-master.nvidia.com login okoenig password $RO_API_TOKEN" >> "$HOME/.netrc"
+    trap 'rm -f "$HOME/.netrc"; unset RO_API_TOKEN' EXIT
+
+    cd /opt
+    rm -rf /opt/megatron-lm; mkdir megatron-lm; cd megatron-lm
+    git init
+    git remote add origin $MCORE_REPO
+    git fetch origin '+refs/merge-requests/*:refs/remotes/merge-requests/*'
+    git fetch origin $MCORE_MR_COMMIT
+    git checkout $MCORE_MR_COMMIT
+    git rev-parse HEAD
+    rm -f "$HOME/.netrc"
+    unset RO_API_TOKEN
+  script: |-
+    rm -f "${{HOME}}/.netrc"
+    unset RO_API_TOKEN
+    set -euo pipefail
+    cd /opt/megatron-lm
+
+    ARGUMENTS=(
+        "CONFIG_PATH=tests/performance_tests/test_cases/frontend/{test_case}/model_config.yaml"
+        "RESULTS_ROOT={assets_dir}/perf_results"
+    )
+
+    bash ./tests/performance_tests/shell_test_utils/run_frontend_perf_test.sh ${{ARGUMENTS[@]}}
+
+products:
+  - test_case: [frontend_capacity]
+    products:
+      - environment: [dev]
+        scope: [mr]
+        platforms: [dgx_h100]
