@@ -112,7 +112,7 @@ def unimodal_build_distributed_models(
         else:
             logger.warning("Final pre wrap hook returned None, skipping pre wrap hooks.")
 
-    # DSA parameter freezing (--dsa-train-indexer-only / --dsa-train-main-only).
+    # DSA parameter freezing (--dsa-train-indexer-only).
     # Must happen here, before prepare_existing_model_chunks_for_distributed_training
     # moves the model to GPU and wraps it in DDP: requires_grad is captured at wrap
     # time, so freezing afterwards is a no-op that fails silently.
