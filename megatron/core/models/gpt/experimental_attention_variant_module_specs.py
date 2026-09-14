@@ -1,11 +1,15 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
+import warnings
 from typing import List, Optional
 
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
-from megatron.core.models.backends import BackendSpecProvider
-from megatron.core.ssm.gated_delta_net import GatedDeltaNet, GatedDeltaNetSubmodules
+from megatron.core.models.backends import BackendSpecProvider, get_backend_from_config
+from megatron.core.ssm.gated_delta_net import GatedDeltaNet, GatedDeltaNet2, GatedDeltaNetSubmodules
 from megatron.core.transformer.enums import AttnMaskType, LayerType
+from megatron.core.transformer.experimental_attention_variant import (
+    deepseek_v4_hybrid_attention_module_specs as dsv4_hybrid_specs,
+)
 from megatron.core.transformer.experimental_attention_variant.absorbed_mla import (
     AbsorbedMLASelfAttention,
     AbsorbedMLASelfAttentionSubmodules,
@@ -18,6 +22,7 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
     is_dsa_skip_topk_layer,
     source_dsa_compute_layer,
 )
+from megatron.core.transformer.hyper_connection import HyperConnectionModule
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import (
@@ -26,6 +31,7 @@ from megatron.core.transformer.transformer_block import (
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import (
+    HyperConnectionTransformerLayer,
     MlpBuilder,
     TransformerLayer,
     TransformerLayerSubmodules,
@@ -33,23 +39,15 @@ from megatron.core.transformer.transformer_layer import (
 )
 from megatron.core.typed_torch import not_none
 
-try:
-    import transformer_engine as te  # type: ignore[import-untyped]  # pylint: disable=unused-import
+##########
+# Experimental Attention Variant Names
+##########
 
-    from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
+# Canonical ``experimental_attention_variant`` names served by the gated delta net family.
+GDN_ATTENTION_VARIANTS = ("gdn", "gdn2")
 
-    HAVE_TE = True
-except ImportError:
-    HAVE_TE = False
-
-try:
-    import nvidia_kitchen  # type: ignore[import-not-found]  # pylint: disable=unused-import
-
-    from megatron.core.extensions.kitchen import KitchenSpecProvider
-
-    HAVE_KITCHEN = True
-except ImportError:
-    HAVE_KITCHEN = False
+# Deprecated ``experimental_attention_variant`` spellings mapped to their canonical name.
+_DEPRECATED_ATTENTION_VARIANT_ALIASES = {"gated_delta_net": "gdn"}
 
 
 ##########
@@ -66,8 +64,12 @@ def get_gated_delta_net_module_spec(
         backend = _get_backend_spec_provider(config=config)
 
     rms_norm = config.normalization == "RMSNorm"
+    # gdn2 reuses the GDN submodules and spec structure with the GatedDeltaNet2 module.
+    gdn_module = (
+        GatedDeltaNet2 if config.experimental_attention_variant == "gdn2" else GatedDeltaNet
+    )
     attention = ModuleSpec(
-        module=GatedDeltaNet,
+        module=gdn_module,
         submodules=GatedDeltaNetSubmodules(
             in_proj=backend.column_parallel_layer_norm_linear(),
             out_norm=backend.layer_norm(rms_norm=rms_norm, for_qk=False),
@@ -138,10 +140,14 @@ def get_experimental_attention_variant_module_spec(
     if backend is None:
         backend = _get_backend_spec_provider(config=config)
 
-    if config.experimental_attention_variant == "gated_delta_net":
+    if is_gated_delta_net_variant(config.experimental_attention_variant):
         return get_gated_delta_net_module_spec(config=config, backend=backend)
     elif config.experimental_attention_variant == "dsa":
         return get_dsa_module_spec_for_backend(config=config, backend=backend)
+    elif config.experimental_attention_variant == "dsv4_hybrid":
+        return dsv4_hybrid_specs.get_dsv4_hybrid_module_spec_for_backend(
+            config=config, backend=backend
+        )
     else:
         raise ValueError(
             f"Invalid experimental attention variant: {config.experimental_attention_variant}"
@@ -229,6 +235,9 @@ def get_transformer_layer_with_experimental_attention_variant_spec(
 
     # Get GPT decoder block layer specs
     rms_norm = config.normalization == "RMSNorm"
+    enable_mhc = config.enable_mhc_connections
+    hyper_connection = HyperConnectionModule if enable_mhc else IdentityOp
+    layer_module = HyperConnectionTransformerLayer if enable_mhc else TransformerLayer
     layer_specs = []
     for layer_number in range(config.num_layers):
         attention = (
@@ -255,14 +264,16 @@ def get_transformer_layer_with_experimental_attention_variant_spec(
 
         layer_specs.append(
             ModuleSpec(
-                module=TransformerLayer,
+                module=layer_module,
                 submodules=TransformerLayerSubmodules(
                     input_layernorm=input_layernorm,
                     self_attention=attention,
                     self_attn_bda=get_bias_dropout_add,
+                    self_attention_hyper_connection=hyper_connection,
                     pre_mlp_layernorm=pre_mlp_layernorm,
                     mlp=not_none(mlp),
                     mlp_bda=get_bias_dropout_add,
+                    mlp_hyper_connection=hyper_connection,
                 ),
             )
         )
@@ -330,10 +341,50 @@ def get_transformer_block_with_experimental_attention_variant_spec(
 ##########
 
 
+def normalize_experimental_attention_variant(
+    experimental_attention_variant: Optional[str],
+) -> Optional[str]:
+    """Resolve a deprecated ``experimental_attention_variant`` spelling to its canonical name.
+
+    ``gated_delta_net`` is the deprecated spelling of ``gdn``. Passing it emits a
+    ``DeprecationWarning`` and returns the canonical name so that every downstream
+    consumer only has to handle ``gdn``.
+
+    Args:
+        experimental_attention_variant: The configured variant name, possibly a
+            deprecated alias.
+
+    Returns:
+        The canonical variant name, or the argument unchanged when it is not an alias.
+    """
+    canonical = _DEPRECATED_ATTENTION_VARIANT_ALIASES.get(experimental_attention_variant)
+    if canonical is None:
+        return experimental_attention_variant
+
+    warnings.warn(
+        f"experimental_attention_variant='{experimental_attention_variant}' is deprecated "
+        f"and will be removed in a future release. Use '{canonical}' instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    return canonical
+
+
+def is_gated_delta_net_variant(experimental_attention_variant: Optional[str]) -> bool:
+    """Check if the experimental attention variant is served by a gated delta net layer.
+
+    Accepts the deprecated ``gated_delta_net`` spelling without warning; use
+    :func:`normalize_experimental_attention_variant` to emit the deprecation notice.
+    """
+    canonical = _DEPRECATED_ATTENTION_VARIANT_ALIASES.get(
+        experimental_attention_variant, experimental_attention_variant
+    )
+    return canonical in GDN_ATTENTION_VARIANTS
+
+
 def is_linear_attention_variant(experimental_attention_variant: Optional[str]) -> bool:
     """Check if the experimental attention variant is a linear attention variant."""
-    linear_attention_variants = ["gated_delta_net"]
-    return experimental_attention_variant in linear_attention_variants
+    return is_gated_delta_net_variant(experimental_attention_variant)
 
 
 def _validate_dsa_index_share_pipeline_split(config: TransformerConfig, local_layer_ids) -> None:
@@ -443,16 +494,8 @@ def _get_backend_spec_provider(config: TransformerConfig) -> BackendSpecProvider
         "Experimental GPT decoder block spec only supports "
         "transformer engine implementation for now."
     )
-    backend: BackendSpecProvider = (
-        KitchenSpecProvider(
-            fallback=TESpecProvider(),
-            use_kitchen_attention=config.use_kitchen_attention,
-            kitchen_attention_backend=config.kitchen_attention_backend,
-        )
-        if config.use_kitchen
-        else TESpecProvider()
-    )
-    return backend
+    # The factory also applies config.use_kitchen with TE as its fallback provider.
+    return get_backend_from_config(config)
 
 
 ##########

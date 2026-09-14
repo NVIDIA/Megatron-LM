@@ -32,6 +32,8 @@ from megatron.core.inference.inference_request import (
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
     GPTInferenceWrapper,
 )
+from megatron.core.inference.moe.vllm_fused_moe import VllmFusedMoeBuffers
+from megatron.core.inference.sampling.torch_sampling import TorchSampling
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     AsyncScheduleForwardState,
@@ -44,19 +46,31 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_spec,
+    get_gpt_layer_with_inference_spec,
     get_gpt_mtp_block_spec,
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
-from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
+from megatron.core.models.hybrid.hybrid_layer_specs import (
+    hybrid_inference_stack_spec,
+    hybrid_stack_spec,
+)
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer.enums import AttnBackend
+from megatron.core.transformer.enums import AttnBackend, InferenceCudaGraphScope
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.moe.router_replay import RouterReplay, RouterReplayAction
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_fa_min_version, is_te_min_version
 from megatron.training.initialize import _set_random_seed
-from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.test_utilities import Utils, clear_nvte_env_vars
+
+
+def teardown_module(module):
+    # Some tests build inference_optimized MoE models with the default 'vllm'
+    # grouped-GEMM backend, which allocates class-level persistent intermediate
+    # buffers at context init. Release them so no GPU memory or state leaks
+    # across modules.
+    VllmFusedMoeBuffers._delete_buffers()
 
 
 class TextGenerationControllerTestBase:
@@ -83,7 +97,18 @@ class TextGenerationControllerTestBase:
         hybrid_layer_pattern: str = None,
         sampling_backend: str = 'torch',
         cuda_graph_impl: str = 'none',
+        transformer_impl: str = None,
     ):
+        # When transformer_impl == "inference_optimized" the model is built with the
+        # NVLS symmetric-memory inference linears (RMSNorm, no bias, flash attention);
+        # every other caller leaves it None and gets the unchanged local-spec build.
+        inference_optimized = transformer_impl == "inference_optimized"
+        if inference_optimized:
+            # The inference-optimized layers use TE attention with the "auto" backend,
+            # which conflicts with the NVTE_FLASH_ATTN/NVTE_FUSED_ATTN=0 pinned by the
+            # autouse conftest set_env fixture. Clear them so TE can select flash — the
+            # same thing the dynamic inference engine test does.
+            clear_nvte_env_vars()
         if use_training_random_init:
             # This is necessary to induce the training behavior which permutes the random seed
             # for every rank; otherwise, every rank will have the same seed.
@@ -99,7 +124,7 @@ class TextGenerationControllerTestBase:
             hidden_size=self.hidden_size,
             num_attention_heads=4,
             use_cpu_initialization=True,
-            attention_backend=AttnBackend.local,
+            attention_backend=AttnBackend.auto if inference_optimized else AttnBackend.local,
             params_dtype=dtype,
             symmetric_ar_type=symmetric_ar_type,
             fp8="hybrid" if fp8 else None,
@@ -112,7 +137,12 @@ class TextGenerationControllerTestBase:
             sequence_parallel=sequence_parallel,
             expert_model_parallel_size=expert_model_parallel_size,
             num_moe_experts=num_moe_experts,
-            add_bias_linear=num_moe_experts is None,
+            add_bias_linear=num_moe_experts is None and not inference_optimized,
+            **(
+                dict(transformer_impl="inference_optimized", normalization="RMSNorm")
+                if inference_optimized
+                else {}
+            ),
             **(
                 dict(is_hybrid_model=True, mamba_num_heads=2, mamba_head_dim=16, mamba_num_groups=2)
                 if hybrid_layer_pattern
@@ -127,7 +157,9 @@ class TextGenerationControllerTestBase:
         if hybrid_layer_pattern:
             model = HybridModel(
                 config=transformer_config,
-                hybrid_stack_spec=hybrid_stack_spec,
+                hybrid_stack_spec=(
+                    hybrid_inference_stack_spec if inference_optimized else hybrid_stack_spec
+                ),
                 vocab_size=self.vocab_size,
                 max_sequence_length=self.sequence_length,
                 parallel_output=True,
@@ -137,7 +169,11 @@ class TextGenerationControllerTestBase:
             ).cuda()
             mamba_inference_state_config = MambaInferenceStateConfig.from_model(model)
         else:
-            layer_spec = get_gpt_layer_local_spec()
+            layer_spec = (
+                get_gpt_layer_with_inference_spec()
+                if inference_optimized
+                else get_gpt_layer_local_spec()
+            )
 
             mtp_block_spec = None
             if mtp_num_layers > 0:
@@ -202,6 +238,15 @@ class TextGenerationControllerTestBase:
 
 def _make_async_sched_context(total_request_count=2, paused_request_count=0):
     metadata_len = max(total_request_count, 1)
+    request_metadata = {
+        "temperature": torch.ones(metadata_len),
+        "top_k": torch.ones(metadata_len, dtype=torch.int64),
+        "top_p": torch.zeros(metadata_len),
+        "return_log_probs": torch.zeros(metadata_len, dtype=torch.bool),
+        "top_n_logprobs": torch.zeros(metadata_len, dtype=torch.int64),
+        "skip_prompt_log_probs": torch.zeros(metadata_len, dtype=torch.bool),
+        "termination_id": torch.full((metadata_len,), 99, dtype=torch.int64),
+    }
     context = SimpleNamespace(
         config=SimpleNamespace(
             materialize_only_last_token_logits=True, async_sched_mode=AsyncScheduleMode.ASYNC
@@ -218,13 +263,18 @@ def _make_async_sched_context(total_request_count=2, paused_request_count=0):
         prefix_cache_lru_clock=0,
         lifetime_prefill_token_count=0,
         request_ids=torch.arange(10, 10 + metadata_len, dtype=torch.int32),
-        request_metadata={
-            "top_k": torch.ones(metadata_len, dtype=torch.int64),
-            "top_p": torch.zeros(metadata_len),
-            "return_log_probs": torch.zeros(metadata_len, dtype=torch.bool),
-            "top_n_logprobs": torch.zeros(metadata_len, dtype=torch.int64),
-            "termination_id": torch.full((metadata_len,), 99, dtype=torch.int64),
+        request_metadata=request_metadata,
+        active_request_metadata={
+            label: metadata.clone() for label, metadata in request_metadata.items()
         },
+        gpu_view=SimpleNamespace(
+            temperature=request_metadata["temperature"].clone(),
+            top_k=request_metadata["top_k"].to(torch.int32).clone(),
+            top_p=request_metadata["top_p"].clone(),
+            active_request_last_token_idxs=torch.arange(metadata_len, dtype=torch.int32),
+            request_query_lengths=torch.ones(metadata_len, dtype=torch.int32),
+            token_to_input_ids=torch.arange(32, dtype=torch.int64),
+        ),
         async_sched_step_count=0,
         async_sched_compaction_step_count=0,
         get_active_sequence_lengths=mock.Mock(
@@ -248,8 +298,17 @@ def _make_async_sched_context(total_request_count=2, paused_request_count=0):
         token_to_local_position_within_kv_block=torch.zeros(metadata_len, dtype=torch.int32),
         request_to_kv_block_ids=torch.arange(metadata_len, dtype=torch.int64).unsqueeze(1),
         max_requests=metadata_len,
+        max_tokens=32,
+        request_query_lengths=torch.ones(metadata_len, dtype=torch.int32),
+        kv_block_allocator=SimpleNamespace(
+            enable_handoff_pinning=False, block_routing={}, store_routing_per_block=mock.Mock()
+        ),
     )
     context.is_decode_only = mock.Mock(side_effect=lambda: context.num_prefill_requests == 0)
+    # Bind the real flags so the fake exercises the production no-op-filter gate.
+    context.active_sampling_filter_flags = lambda count=None: (
+        DynamicInferenceContext.active_sampling_filter_flags(context, count)
+    )
     return context
 
 
@@ -269,21 +328,36 @@ def _make_async_sched_controller(context=None, model_config=None):
     controller.model_config = model_config
     controller.num_speculative_tokens = 0
     controller._enable_cuda_graph = False
+    controller._sampling_backend = "torch"
     controller._async_sched_forward = AsyncScheduleForwardState(is_valid=True)
     controller._async_sched_mtp_token_row_indices = None
     controller._all_logits_cuda = torch.empty(0)
     controller._sampled_tokens_cuda = torch.empty(context.max_requests, dtype=torch.int64)
+
+    def sample_kernel(logits, n, _context, **kwargs):
+        sampled_tokens = torch.argmax(logits[:n], dim=-1)
+        output = kwargs.get("output")
+        if output is None:
+            return sampled_tokens
+        output.copy_(sampled_tokens)
+        return output
+
+    controller._sampling = SimpleNamespace(sample_kernel=mock.Mock(side_effect=sample_kernel))
+    controller._get_stop_word_finished_ids_callback = None
     controller._async_sched_sampled_tokens_cpu_buffer = torch.empty(
         context.max_requests, dtype=torch.int64
     )
     controller._tp_size = 1
     controller._sp_enabled = False
+    controller._async_sched_selected_log_probs_cpu_buffer = torch.empty(
+        context.max_tokens, dtype=torch.float32
+    )
+    controller._async_sched_top_n_log_probs_cpu_buffer = None
+    controller._async_sched_top_n_token_ids_cpu_buffer = None
+    controller._async_sched_top_n_capacity = 0
     controller._async_sched_routing_copy_stream = None
     controller._async_sched_routing_buffer_slots = []
     controller._async_sched_routing_source_captured_event = None
-    context.kv_block_allocator = SimpleNamespace(
-        block_routing={}, store_routing_per_block=mock.Mock()
-    )
     return controller
 
 
@@ -428,7 +502,24 @@ def test_async_sched_forward_state_releases_discarded_routing():
     ],
 )
 def test_async_sched_forward_compaction(enable_cuda_graph, survivor_idxs, expected_compaction):
-    controller = _make_async_sched_controller()
+    context = _make_async_sched_context(total_request_count=4)
+    context.active_request_metadata["temperature"].copy_(torch.tensor([0.1, 0.2, 0.3, 0.4]))
+    context.active_request_metadata["top_k"].copy_(torch.tensor([1, 2, 3, 4]))
+    context.active_request_metadata["top_p"].copy_(torch.tensor([0.5, 0.6, 0.7, 0.8]))
+    context.gpu_view.temperature.copy_(context.active_request_metadata["temperature"])
+    context.gpu_view.top_k.copy_(context.active_request_metadata["top_k"])
+    context.gpu_view.top_p.copy_(context.active_request_metadata["top_p"])
+    original_cpu_metadata = {
+        label: context.active_request_metadata[label].clone()
+        for label in ("temperature", "top_k", "top_p")
+    }
+    gpu_metadata = {
+        "temperature": context.gpu_view.temperature,
+        "top_k": context.gpu_view.top_k,
+        "top_p": context.gpu_view.top_p,
+    }
+    original_gpu_metadata = {label: metadata.clone() for label, metadata in gpu_metadata.items()}
+    controller = _make_async_sched_controller(context)
     controller._enable_cuda_graph = enable_cuda_graph
     controller._async_sched_forward = AsyncScheduleForwardState(
         is_valid=True, cuda_graph_request_count=8
@@ -446,6 +537,9 @@ def test_async_sched_forward_compaction(enable_cuda_graph, survivor_idxs, expect
 
     if not expected_compaction:
         assert torch.equal(controller._all_logits_cuda, logits)
+        for label in ("temperature", "top_k", "top_p"):
+            assert torch.equal(context.active_request_metadata[label], original_cpu_metadata[label])
+            assert torch.equal(gpu_metadata[label], original_gpu_metadata[label])
         return
 
     expected_logits = logits[:, survivor_idxs, :]
@@ -456,13 +550,22 @@ def test_async_sched_forward_compaction(enable_cuda_graph, survivor_idxs, expect
         assert controller._all_logits_cuda.shape == logits.shape
     else:
         assert torch.equal(controller._all_logits_cuda, expected_logits)
+    survivor_count = survivor_idxs.numel()
+    for label in ("temperature", "top_k", "top_p"):
+        assert torch.equal(
+            context.active_request_metadata[label][:survivor_count],
+            original_cpu_metadata[label][survivor_idxs],
+        )
+        assert torch.equal(
+            gpu_metadata[label][:survivor_count], original_gpu_metadata[label][survivor_idxs]
+        )
     assert controller._async_sched_forward.is_valid
     assert controller._async_sched_forward.cuda_graph_request_count == 8
 
 
-def test_async_sched_mtp_logits_compaction_preserves_input_rows():
+def test_async_sched_mtp_forward_compaction_preserves_input_rows():
     """MTP compaction applies the same survivor rows to logits and routing."""
-    controller = _make_async_sched_controller()
+    controller = _make_async_sched_controller(_make_async_sched_context(total_request_count=3))
     controller.num_speculative_tokens = 1
     controller._all_logits_cuda = torch.arange(18).reshape(1, 6, 3)
     routing_record = _AsyncScheduleRoutingRecord(
@@ -887,8 +990,104 @@ def test_run_async_sched_sample_reuses_gpu_buffer(logits_dtype):
     assert result.sampled_tokens_gpu.data_ptr() == controller._sampled_tokens_cuda.data_ptr()
     assert torch.equal(result.sampled_tokens_gpu, expected_tokens)
     assert torch.equal(result.sampled_tokens_cpu_view, expected_tokens)
+    controller._sampling.sample_kernel.assert_called_once()
+    logits, n, called_context = controller._sampling.sample_kernel.call_args.args
+    assert torch.equal(logits, controller._all_logits_cuda.squeeze(0))
+    assert n == 3
+    assert called_context is context
+    sample_kwargs = controller._sampling.sample_kernel.call_args.kwargs
+    assert set(sample_kwargs) == {"gather_indices", "no_top_k", "no_top_p", "output"}
+    assert sample_kwargs["gather_indices"] is None
+    assert not sample_kwargs["no_top_k"]
+    assert sample_kwargs["no_top_p"]
+    assert sample_kwargs["output"].data_ptr() == controller._sampled_tokens_cuda.data_ptr()
     assert result.routing_record is routing_record
     assert controller._async_sched_forward.routing_record is None
+
+
+def test_async_sched_log_probs_materializes_decode_top_n_without_padding():
+    """Async logprobs exclude padded graph rows from top-n results."""
+    context = _make_async_sched_context(total_request_count=3)
+    context.num_decode_requests = 3
+    context.active_request_metadata["return_log_probs"].fill_(True)
+    context.active_request_metadata["top_n_logprobs"].copy_(torch.tensor([0, 2, 1]))
+    context.calculate_log_probs_tensors = mock.Mock(
+        return_value=(
+            torch.tensor([-0.1, -0.2, -0.3]),
+            torch.tensor(
+                [
+                    [-4.0, -1.0, -3.0, -2.0],
+                    [-0.4, -0.1, -0.3, -0.2],
+                    [-2.0, -4.0, -1.0, -3.0],
+                    [10.0, 9.0, 8.0, 7.0],
+                ]
+            ),
+        )
+    )
+    controller = _make_async_sched_controller(context)
+    controller._all_logits_cuda = torch.empty(1, 3, 4)
+    sampled_tokens = torch.tensor([1, 1, 2])
+
+    gpu_result = controller._run_async_sched_log_probs(
+        SimpleNamespace(sampled_tokens_gpu=sampled_tokens, accepted_counts_gpu=None)
+    )
+    transfer = controller._copy_async_sched_log_probs_to_cpu(gpu_result)
+    log_probs, top_n_logprobs = controller._materialize_async_sched_log_probs(transfer)
+
+    assert [values[0] for values in log_probs] == pytest.approx([-0.1, -0.2, -0.3])
+    assert set(top_n_logprobs) == {1, 2}
+    assert torch.equal(top_n_logprobs[1][0][1], torch.tensor([1, 3]))
+    assert torch.equal(top_n_logprobs[2][0][1], torch.tensor([2]))
+
+
+def test_async_sched_log_probs_materializes_mtp_and_prefill_rows():
+    """Async logprobs preserve variable MTP acceptance and prompt row boundaries."""
+    context = _make_async_sched_context(total_request_count=3)
+    context.config.materialize_only_last_token_logits = False
+    context.num_decode_requests = 2
+    context.num_prefill_requests = 1
+    context.active_token_count = 9
+    context.request_query_lengths.copy_(torch.tensor([3, 3, 3]))
+    context.gpu_view.request_query_lengths.copy_(torch.tensor([3, 3, 3]))
+    context.gpu_view.token_to_input_ids[:9].copy_(torch.tensor([1, 2, 3, 4, 5, 6, 30, 31, 32]))
+    context.active_request_metadata["return_log_probs"].fill_(True)
+    context.active_request_metadata["top_n_logprobs"].copy_(torch.tensor([0, 0, 2]))
+    context.active_request_metadata["skip_prompt_log_probs"].copy_(
+        torch.tensor([False, False, True])
+    )
+    context.calculate_log_probs_tensors = mock.Mock(
+        return_value=(
+            -torch.arange(1, 10, dtype=torch.float32) / 10,
+            torch.arange(36, dtype=torch.float32).view(9, 4),
+        )
+    )
+    controller = _make_async_sched_controller(context)
+    controller.num_speculative_tokens = 2
+    controller._all_logits_cuda = torch.empty(1, 9, 4)
+    controller._accepted_tokens_per_request = torch.tensor([[10, -1], [11, 12], [-1, -1]])
+    sample_result = SimpleNamespace(
+        sampled_tokens_gpu=torch.tensor([20, 21, 22]), accepted_counts_gpu=torch.tensor([1, 2, 0])
+    )
+
+    gpu_result = controller._run_async_sched_log_probs(sample_result)
+    transfer = controller._copy_async_sched_log_probs_to_cpu(gpu_result)
+    log_probs, top_n_logprobs = controller._materialize_async_sched_log_probs(
+        transfer, torch.tensor([1, 2, 0])
+    )
+
+    assert log_probs[0] == pytest.approx([-0.1, -0.2])
+    assert log_probs[1] == pytest.approx([-0.4, -0.5, -0.6])
+    assert log_probs[2] == pytest.approx([-0.7, -0.8, -0.9])
+    assert len(top_n_logprobs[2]) == 1
+    assert torch.equal(top_n_logprobs[2][0][1], torch.tensor([3, 2]))
+    assert torch.equal(
+        context.calculate_log_probs_tensors.call_args.args[1],
+        torch.tensor([10, 20, 20, 11, 12, 21, 31, 32, 22]),
+    )
+    assert torch.equal(
+        context.calculate_log_probs_tensors.call_args.kwargs["row_to_request"],
+        torch.tensor([0, 0, 0, 1, 1, 1, 2, 2, 2]),
+    )
 
 
 @pytest.mark.internal
@@ -966,6 +1165,45 @@ def test_copy_async_sched_sample_to_cpu_uses_reusable_buffer_and_copy_stream():
     assert accepted_tokens_cpu is None
 
 
+@pytest.mark.internal
+def test_copy_async_sched_log_probs_to_cpu_uses_reusable_buffers_and_copy_stream():
+    """Async logprob D2H copies reuse pinned storage and report completion."""
+    context = _make_async_sched_context(total_request_count=3)
+    context.num_decode_requests = 3
+    context.active_request_metadata["return_log_probs"].fill_(True)
+    context.active_request_metadata["top_n_logprobs"].copy_(torch.tensor([0, 2, 1]))
+    context.calculate_log_probs_tensors = mock.Mock(
+        return_value=(
+            torch.tensor([-0.1, -0.2, -0.3], device="cuda"),
+            torch.tensor(
+                [[-4.0, -1.0, -3.0, -2.0], [-0.4, -0.1, -0.3, -0.2], [-2.0, -4.0, -1.0, -3.0]],
+                device="cuda",
+            ),
+        )
+    )
+    controller = _make_async_sched_controller(context)
+    controller._all_logits_cuda = torch.empty(1, 3, 4, device="cuda")
+    controller._async_sched_selected_log_probs_cpu_buffer = torch.empty(
+        3, dtype=torch.float32, device="cpu", pin_memory=True
+    )
+    controller._async_sched_log_probs_gpu_ready_event = torch.cuda.Event()
+    controller._async_sched_log_probs_cpu_ready_event = torch.cuda.Event()
+    controller._async_sched_copy_stream = torch.cuda.Stream()
+
+    gpu_result = controller._run_async_sched_log_probs(
+        SimpleNamespace(
+            sampled_tokens_gpu=torch.tensor([1, 1, 2], device="cuda"), accepted_counts_gpu=None
+        )
+    )
+    transfer = controller._copy_async_sched_log_probs_to_cpu(gpu_result)
+    transfer.cpu_ready_event.synchronize()
+    log_probs, top_n_logprobs = controller._materialize_async_sched_log_probs(transfer)
+
+    assert [values[0] for values in log_probs] == pytest.approx([-0.1, -0.2, -0.3])
+    assert torch.equal(top_n_logprobs[1][0][1], torch.tensor([1, 3]))
+    assert torch.equal(top_n_logprobs[2][0][1], torch.tensor([2]))
+
+
 def test_build_async_sched_request_state_uses_resolved_lengths():
     """Resolution tests the accepted output length, not speculative prepared state."""
     context = _make_async_sched_context(total_request_count=2)
@@ -995,12 +1233,77 @@ def test_build_async_sched_request_state_keeps_partial_chunk_active():
     assert finished_request_ids.tolist() == [11]
 
 
+def test_legacy_bookkeeping_keeps_partial_chunk_active():
+    """Legacy bookkeeping must not finish a request midway through its prompt."""
+    context = _make_async_sched_context(total_request_count=1)
+    context.chunked_prefill_request_id = 10
+    context.get_index_of_chunked_prefill_request = mock.Mock(return_value=0)
+    context.get_active_sequence_lengths.return_value = torch.tensor([3])
+    context.get_max_sequence_lengths.return_value = torch.tensor([4])
+    context.kv_block_allocator = SimpleNamespace(block_routing=False, enable_handoff_pinning=True)
+    context.request_to_kv_block_ids = torch.tensor([[1, 2, -1]], dtype=torch.int32)
+    controller = _make_async_sched_controller(context)
+    controller._sampled_tokens_cuda[0] = 7
+
+    result = controller._dynamic_step_context_bookkeeping()
+
+    assert result["finished_request_ids"].numel() == 0
+    assert result["finished_handoff_block_ids"] == {}
+    context.update_requests.assert_called_once()
+
+
+def test_async_bookkeeping_retains_finished_handoff_state():
+    context = _make_async_sched_context(total_request_count=3, paused_request_count=1)
+    context.get_max_sequence_lengths.return_value = torch.tensor([10, 10])
+    context.kv_block_allocator = SimpleNamespace(
+        enable_handoff_pinning=True, retain_memory_blocks=mock.Mock()
+    )
+    context.request_to_kv_block_ids = torch.tensor(
+        [[8, 9, -1], [10, 11, -1], [12, 13, -1]], dtype=torch.int32
+    )
+    controller = _make_async_sched_controller(context)
+    sample_result = SimpleNamespace(
+        sampled_tokens_cpu_view=torch.tensor([99, 7]),
+        sampled_mtp_tokens_cpu_view=None,
+        accepted_tokens_cpu_view=None,
+    )
+
+    result = controller._run_async_sched_update_requests(
+        sample_result, resolved_sequence_lengths=torch.tensor([3, 3])
+    )
+
+    assert result.finished_handoff_block_ids == {11: [10, 11]}
+    assert result.finished_handoff_ssm_slots == {}
+    assert result.finished_handoff_decode_tokens == {11: [99]}
+    context.kv_block_allocator.retain_memory_blocks.assert_called_once_with([10, 11])
+
+
+def test_finished_hybrid_handoff_detaches_live_ssm_slot():
+    context = _make_async_sched_context(total_request_count=2)
+    context.is_hybrid_model = True
+    context.kv_block_allocator = SimpleNamespace(
+        enable_handoff_pinning=True, retain_memory_blocks=mock.Mock()
+    )
+    context.request_to_kv_block_ids = torch.tensor([[10, 11, -1], [12, 13, -1]], dtype=torch.int32)
+    context.mamba_metadata = SimpleNamespace(detach_state_slot=mock.Mock(return_value=7))
+    controller = _make_async_sched_controller(context)
+
+    blocks, ssm_slots, decode_tokens = controller._collect_finished_handoff_state(
+        torch.tensor([1]), torch.tensor([91, 92]), None
+    )
+
+    assert blocks == {11: [12, 13]}
+    assert ssm_slots == {11: 7}
+    assert decode_tokens == {11: [92]}
+    context.mamba_metadata.detach_state_slot.assert_called_once_with(1)
+
+
 @pytest.mark.parametrize(
-    "termination_ids, expected_finished_routing_block_ids",
-    [([99, 99, 99], {}), ([99, 2, 99], {11: [41]})],
+    "termination_ids, stop_word_finished_ids, expected_finished_routing_block_ids",
+    [([99, 99, 99], set(), {}), ([99, 2, 99], set(), {11: [41]}), ([99, 99, 99], {11}, {11: [41]})],
 )
 def test_run_async_sched_resolve_compacts_without_forward_sync(
-    termination_ids, expected_finished_routing_block_ids
+    termination_ids, stop_word_finished_ids, expected_finished_routing_block_ids
 ):
     sample_tokens = torch.tensor([1, 2, 3], dtype=torch.int64)
     context = _make_async_sched_context(total_request_count=3)
@@ -1009,8 +1312,12 @@ def test_run_async_sched_resolve_compacts_without_forward_sync(
     context.kv_block_allocator.block_routing = {40: np.zeros((1, 1, 1))}
     context.request_to_kv_block_ids = torch.tensor([[40], [41], [42]])
     controller._synchronize_async_sched_event = mock.Mock()
+    controller._get_stop_word_finished_ids_callback = mock.Mock(return_value=stop_word_finished_ids)
 
     expected_mask = (sample_tokens != context.request_metadata["termination_id"]).byte()
+    for request_idx, request_id in enumerate(context.request_ids.tolist()):
+        if request_id in stop_word_finished_ids:
+            expected_mask[request_idx] = 0
     expected_finished_ids = context.request_ids[expected_mask == 0].clone()
     expected_survivor_idxs = torch.nonzero(expected_mask, as_tuple=True)[0]
     context.resolve_requests = mock.Mock(
@@ -1020,7 +1327,10 @@ def test_run_async_sched_resolve_compacts_without_forward_sync(
     controller._compact_async_sched_forward = mock.Mock()
 
     sample_result = SimpleNamespace(
-        sampled_tokens_cpu_view=sample_tokens, accepted_tokens_cpu_view=None, routing_record=None
+        sampled_tokens_cpu_view=sample_tokens,
+        sampled_mtp_tokens_cpu_view=None,
+        accepted_tokens_cpu_view=None,
+        routing_record=None,
     )
     result = controller._run_async_sched_resolve(
         sample_result, context.get_active_sequence_lengths() + 1
@@ -1035,9 +1345,11 @@ def test_run_async_sched_resolve_compacts_without_forward_sync(
     context.commit_sampled_tokens.assert_not_called()
     context.resolve_requests.assert_called_once()
     assert torch.equal(context.resolve_requests.call_args.args[0], expected_mask)
+    controller._get_stop_word_finished_ids_callback.assert_called_once_with([10, 11, 12])
 
 
 def test_async_sched_step_overlap_order():
+    """Logprob transfer overlaps after current-logit GPU work is queued."""
     sample_tokens = torch.tensor([1, 2, 3], dtype=torch.int64)
     sampled_tokens_cpu = sample_tokens.clone()
     input_ids = torch.tensor([[101, 102, 103]])
@@ -1069,6 +1381,18 @@ def test_async_sched_step_overlap_order():
     context.copy_async_sched_sample_to_forward = mock.Mock(
         side_effect=lambda _: call_order.append("copy_input")
     )
+    log_probs_gpu_result = object()
+    log_probs_transfer = SimpleNamespace(cpu_ready_event="log_probs")
+    controller._run_async_sched_log_probs = mock.Mock(
+        side_effect=lambda _: call_order.append("log_probs") or log_probs_gpu_result
+    )
+    controller._copy_async_sched_log_probs_to_cpu = mock.Mock(
+        side_effect=lambda _: call_order.append("copy_log_probs") or log_probs_transfer
+    )
+    controller._materialize_async_sched_log_probs = mock.Mock(
+        side_effect=lambda *_: call_order.append("materialize_log_probs")
+        or ([[0.1], [0.2], [0.3]], None)
+    )
     context.commit_sampled_tokens = mock.Mock(side_effect=lambda *_: call_order.append("commit"))
     controller._run_async_sched_publish_bookkeeping = mock.Mock(
         side_effect=lambda: call_order.append("publish") or "bookkeeping"
@@ -1086,6 +1410,9 @@ def test_async_sched_step_overlap_order():
             survivor_idxs=torch.tensor([0, 2]),
             newly_paused_request_ids=None,
             evict_request_ids=None,
+            finished_handoff_block_ids={},
+            finished_handoff_ssm_slots={},
+            finished_handoff_decode_tokens={},
             finished_routing_block_ids={},
         )
     )
@@ -1102,6 +1429,7 @@ def test_async_sched_step_overlap_order():
 
     assert result.output["sample"].tolist() == sample_tokens.tolist()
     assert result.decode_only == DecodeOnly(consumed=True, launched=True)
+    assert result.output["log_probs"] == [[0.1], [0.2], [0.3]]
     assert result.output["cuda_graph_request_count"] == 7
     assert context.async_sched_step_count == 1
     assert context.async_sched_compaction_step_count == 1
@@ -1109,12 +1437,16 @@ def test_async_sched_step_overlap_order():
         "prepare",
         "sample",
         "copy_input",
+        "log_probs",
+        "copy_log_probs",
         "publish",
         "forward",
         "wait:sample",
         "wait:bookkeeping",
         "resolve",
         "commit",
+        "wait:log_probs",
+        "materialize_log_probs",
         "yield",
     ]
     assert torch.equal(
@@ -1209,6 +1541,9 @@ def test_async_sched_step_yields_after_resolution_outside_inference_mode():
             survivor_idxs=torch.tensor([0]),
             newly_paused_request_ids=None,
             evict_request_ids=None,
+            finished_handoff_block_ids={},
+            finished_handoff_ssm_slots={},
+            finished_handoff_decode_tokens={},
             finished_routing_block_ids={},
         )
     )
@@ -1258,6 +1593,27 @@ def test_async_sched_initial_no_overlap_step_launches_primer_only():
     )
     assert call_order == ["admit", "primer", "wait:bookkeeping"]
     assert context.async_sched_step_count == 0
+
+
+def test_async_sched_no_overlap_admission_can_finish_without_launching_a_primer():
+    """An admission callback may resolve its request without adding model work."""
+
+    context = _make_async_sched_context(total_request_count=0)
+    context.active_token_count = 0
+    controller = _make_async_sched_controller(context)
+    controller._async_sched_forward = AsyncScheduleForwardState()
+    admit_request = mock.Mock()
+    controller._run_async_sched_forward_primer = mock.Mock()
+
+    result = asyncio.run(
+        controller._run_async_sched_step_no_overlap(schedule_waiting_requests=admit_request)
+    )
+
+    assert result == DynamicBatchControllerStepResult(
+        decode_only=DecodeOnly(consumed=None, launched=None)
+    )
+    admit_request.assert_called_once_with()
+    controller._run_async_sched_forward_primer.assert_not_called()
 
 
 def test_run_async_sched_update_requests_preserves_pre_update_output():
@@ -1331,6 +1687,9 @@ def test_async_sched_no_overlap_updates_before_admission(
         survivor_idxs=None,
         newly_paused_request_ids=torch.tensor([10]),
         evict_request_ids=torch.tensor([11]),
+        finished_handoff_block_ids={},
+        finished_handoff_ssm_slots={},
+        finished_handoff_decode_tokens={},
         finished_routing_block_ids={},
     )
     input_ids = torch.empty(1, dtype=torch.int64)
@@ -1350,6 +1709,17 @@ def test_async_sched_no_overlap_updates_before_admission(
         return request_result
 
     controller._run_async_sched_update_requests = mock.Mock(side_effect=update_request_state)
+    log_probs_gpu_result = object()
+    log_probs_transfer = SimpleNamespace(cpu_ready_event="log_probs")
+    controller._run_async_sched_log_probs = mock.Mock(
+        side_effect=lambda _: call_order.append("log_probs") or log_probs_gpu_result
+    )
+    controller._copy_async_sched_log_probs_to_cpu = mock.Mock(
+        side_effect=lambda _: call_order.append("copy_log_probs") or log_probs_transfer
+    )
+    controller._materialize_async_sched_log_probs = mock.Mock(
+        side_effect=lambda *_: call_order.append("materialize_log_probs") or ([[0.1], [0.2]], None)
+    )
     controller._dynamic_step_context_init = mock.Mock(
         side_effect=lambda: call_order.append("context_init") or (input_ids, position_ids, None)
     )
@@ -1377,13 +1747,18 @@ def test_async_sched_no_overlap_updates_before_admission(
     assert result.decode_only == DecodeOnly(
         consumed=consumed_prefill_requests == 0, launched=launched_prefill_requests == 0
     )
+    assert result.output["log_probs"] == [[0.1], [0.2]]
     assert call_order == [
         "sample",
+        "log_probs",
+        "copy_log_probs",
         "wait:sample",
         "update",
         "admit",
         "context_init",
         "forward",
+        "wait:log_probs",
+        "materialize_log_probs",
         "yield",
     ]
     context.resolve_requests.assert_not_called()
@@ -1420,6 +1795,9 @@ def test_async_sched_no_overlap_finishes_with_matching_ep_base_forward():
         survivor_idxs=None,
         newly_paused_request_ids=None,
         evict_request_ids=None,
+        finished_handoff_block_ids={},
+        finished_handoff_ssm_slots={},
+        finished_handoff_decode_tokens={},
         finished_routing_block_ids={},
     )
     controller._run_async_sched_sample = mock.Mock(return_value=sample_result)
@@ -1460,6 +1838,7 @@ def test_async_sched_mtp_overlap_step_order():
         sampled_mtp_tokens_gpu=sampled_mtp_tokens,
         sampled_mtp_tokens_cpu_view=sampled_mtp_tokens,
         accepted_tokens_cpu_view=accepted_tokens,
+        accepted_counts_cpu_view=torch.tensor([1, 1, 1]),
         sample_cpu_ready_event="sample",
     )
     resolve_result = SimpleNamespace(
@@ -1470,6 +1849,9 @@ def test_async_sched_mtp_overlap_step_order():
         survivor_idxs=torch.tensor([2, 1]),
         newly_paused_request_ids=None,
         evict_request_ids=None,
+        finished_handoff_block_ids={},
+        finished_handoff_ssm_slots={},
+        finished_handoff_decode_tokens={},
         finished_routing_block_ids={},
     )
     input_ids = torch.empty(9, dtype=torch.int64)
@@ -1481,6 +1863,18 @@ def test_async_sched_mtp_overlap_step_order():
     )
     controller._run_async_sched_mtp_rewind = mock.Mock(
         side_effect=lambda *_args, **_kwargs: call_order.append("rewind")
+    )
+    log_probs_gpu_result = object()
+    log_probs_transfer = SimpleNamespace(cpu_ready_event="log_probs")
+    controller._run_async_sched_log_probs = mock.Mock(
+        side_effect=lambda _: call_order.append("log_probs") or log_probs_gpu_result
+    )
+    controller._copy_async_sched_log_probs_to_cpu = mock.Mock(
+        side_effect=lambda _: call_order.append("copy_log_probs") or log_probs_transfer
+    )
+    controller._materialize_async_sched_log_probs = mock.Mock(
+        side_effect=lambda *_: call_order.append("materialize_log_probs")
+        or ([[0.1], [0.2], [0.3]], None)
     )
     controller._run_async_sched_prepare = mock.Mock(
         side_effect=lambda: call_order.append("prepare") or (input_ids, position_ids)
@@ -1506,9 +1900,12 @@ def test_async_sched_mtp_overlap_step_order():
 
     assert result.output["accepted_tokens"].tolist() == [9, 10, 11]
     assert result.decode_only == DecodeOnly(consumed=True, launched=True)
+    assert result.output["log_probs"] == [[0.1], [0.2], [0.3]]
     assert call_order == [
         "sample_mtp",
         "rewind",
+        "log_probs",
+        "copy_log_probs",
         "prepare",
         "copy_input",
         "publish",
@@ -1517,6 +1914,8 @@ def test_async_sched_mtp_overlap_step_order():
         "wait:bookkeeping",
         "resolve",
         "commit",
+        "wait:log_probs",
+        "materialize_log_probs",
     ]
     committed_tokens, committed_mtp_tokens = context.commit_sampled_tokens.call_args.args
     assert torch.equal(committed_tokens, torch.tensor([7, 4]))
@@ -1647,6 +2046,7 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
             [context.block_size_tokens - 1, 0], dtype=torch.int32
         )
         context.request_metadata["termination_id"][active_slice] = 99
+        context.build_active_slices(2)
 
         block_ids = context.kv_block_allocator.allocate_memory_blocks(2)
         context.request_to_kv_block_ids[active_slice, 0] = block_ids
@@ -1654,10 +2054,13 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         context.request_kv_block_counts[active_slice] = 1
         context.token_to_input_ids[active_slice] = torch.tensor([80, 81])
 
-        # Leave room in paused storage but no capacity to keep both requests active.
-        context.kv_block_allocator.active_count = context.kv_block_allocator.get_active_used()
-        context.kv_block_allocator.paused_count = 2
-        context.kv_block_allocator.total_avail = 0
+        # Retain one paused request, but exhaust shared-pool capacity with real allocations.
+        alloc = context.kv_block_allocator
+        alloc.paused_limit = 1
+        filler_blocks = alloc.allocate_memory_blocks(alloc.pool_avail)
+        assert filler_blocks is not None
+        filler_blocks = filler_blocks.clone()
+        assert alloc.get_allocatable_count() == 0
 
         sampled_tokens = torch.tensor([90, 91], dtype=torch.int64)
         controller._async_sched_forward = AsyncScheduleForwardState(
@@ -1702,6 +2105,75 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         controller._run_async_sched_forward.assert_called_once_with(
             forward_input_ids, forward_position_ids
         )
+        alloc.release_memory_blocks(filler_blocks)
+
+    @pytest.mark.internal
+    def test_async_sched_overlap_handles_hidden_chunked_prefill(self):
+        """Overlap ignores a continuing chunk outside the active request rows."""
+        self.setup_model(
+            torch.float32, batch_size=3, static=False, block_size_tokens=4, max_requests=4
+        )
+        controller = self.text_generation_controller
+        context = controller.inference_wrapped_model.inference_context
+        context.reset()
+
+        active_slice = slice(0, 3)
+        context.total_request_count = 3
+        context.active_token_count = 3
+        context.num_prefill_requests = 1
+        context.request_ids[active_slice] = torch.tensor([10, 11, 12], dtype=torch.int32)
+        context.request_in_prefill_status_tensor[active_slice] = torch.tensor(
+            [0, 0, 1], dtype=torch.int32
+        )
+        context.request_query_lengths[active_slice] = 1
+        context.request_output_lengths[active_slice] = 16
+        context.request_kv_length_offsets[active_slice] = 3
+        context.request_last_kv_block_offset[active_slice] = torch.tensor(
+            [context.block_size_tokens - 1, 0, 0], dtype=torch.int32
+        )
+        context.request_metadata["termination_id"][active_slice] = 99
+        context.chunked_prefill_request_id = 12
+        context.build_active_slices(3)
+
+        block_ids = context.kv_block_allocator.allocate_memory_blocks(3)
+        context.request_to_kv_block_ids[active_slice, 0] = block_ids
+        context.request_last_kv_block_id[active_slice] = block_ids
+        context.request_kv_block_counts[active_slice] = 1
+        context.token_to_input_ids[active_slice] = torch.tensor([80, 81, 82])
+
+        alloc = context.kv_block_allocator
+        alloc.paused_limit = 0
+        filler_blocks = alloc.allocate_memory_blocks(alloc.pool_avail)
+        assert filler_blocks is not None
+        filler_blocks = filler_blocks.clone()
+        assert alloc.get_allocatable_count() == 0
+
+        sampled_tokens = torch.tensor([90, 91, 92], dtype=torch.int64)
+        request_result = controller._run_async_sched_update_requests(
+            SimpleNamespace(
+                sampled_tokens_cpu_view=sampled_tokens,
+                sampled_mtp_tokens_cpu_view=None,
+                accepted_tokens_cpu_view=None,
+            ),
+            resolved_sequence_lengths=torch.tensor([4, 4, 4]),
+        )
+
+        assert request_result.evict_request_ids.tolist() == [10]
+        assert context.total_request_count == 1
+        assert context.request_ids[:2].tolist() == [11, 12]
+        assert context.get_index_of_chunked_prefill_request(safe=True) == -1
+        assert context.get_index_of_chunked_prefill_request(safe=False) == 1
+
+        active_request_ids, finished_request_ids, active_request_mask = (
+            controller._build_async_sched_request_state(
+                torch.tensor([93]), resolved_sequence_lengths=torch.tensor([5])
+            )
+        )
+
+        assert active_request_ids.tolist() == [11]
+        assert finished_request_ids.numel() == 0
+        assert active_request_mask.tolist() == [1]
+        alloc.release_memory_blocks(filler_blocks)
 
     def test_sample_from_logits(self):
         self.setup_model(torch.float32)
@@ -1712,15 +2184,7 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
                 sampling_params=SamplingParams(top_k=2, top_p=0.4),
                 vocab_size=self.vocab_size,
             )
-        assert str(aerror.value) == 'Cannot have top-p and top-k both greater than zero'
-
-        with pytest.raises(AssertionError) as aerror:
-            self.text_generation_controller.sample_from_logits(
-                last_token_logits=None,
-                sampling_params=SamplingParams(top_p=1.4, top_k=0),
-                vocab_size=self.vocab_size,
-            )
-        assert str(aerror.value) == 'top-p should be in (0,1]'
+        assert str(aerror.value) == 'Cannot have top-p and top-k both active'
 
         with pytest.raises(AssertionError) as aerror:
             self.text_generation_controller.sample_from_logits(
@@ -1729,6 +2193,24 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
                 vocab_size=self.vocab_size,
             )
         assert str(aerror.value) == 'top-k is larger than logit size.'
+
+        # top_p >= 1.0 is a no-op filter: identity on logits, legal alongside top-k;
+        # temperature=0 sharpens toward argmax instead of dividing into inf/NaN.
+        cpu_logits = torch.randn(4, 32)
+        assert torch.equal(
+            TorchSampling.filter_logits(cpu_logits, temperature=1.0, top_k=0, top_p=1.0), cpu_logits
+        )
+        for top_k, top_p in ((4, 0.0), (0, 0.9)):
+            filtered = TorchSampling.filter_logits(
+                cpu_logits, temperature=0.0, top_k=top_k, top_p=top_p
+            )
+            kept = filtered[filtered != float('-inf')]
+            assert torch.isfinite(kept).all()
+            assert torch.equal(filtered.argmax(dim=-1), cpu_logits.argmax(dim=-1))
+        sampled = TorchSampling.sample_from_logits(
+            cpu_logits, temperature=1.0, top_k=8, top_p=1.0, generator=torch.Generator()
+        )
+        assert sampled.shape == (4,)
 
         last_token_logits = (
             torch.arange(0, self.vocab_size).repeat(self.batch_size, 1).float().cuda()
@@ -1798,7 +2280,7 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
     ):
         if backend == "flashinfer":
             pytest.importorskip("flashinfer")
-        batch_size = 15
+        batch_size = 18
         self.setup_model(
             torch.float32,
             batch_size=batch_size,
@@ -1819,6 +2301,7 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
             (SamplingParams(top_p=0.8), [4, 1, 7]),
             (SamplingParams(temperature=10.0, top_k=5), [11, 5, 8]),
             (SamplingParams(temperature=0.0, top_k=1), [12, 13, 14]),
+            (SamplingParams(temperature=1.2), [15, 16, 17]),
         ]
         # For non-torch backends, test simultaneous top_k and top_p sampling.
         if backend != "torch":
@@ -1885,10 +2368,10 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         """`_sampled_tokens_cuda` is a single `max_requests` buffer written in place by
         every sampling path. The non-speculative path (`_dynamic_step_sample_logits`)
         writes its `active_request_count` prefix, and the async-scheduling path
-        (`_run_async_sched_sample`) writes its own prefix via `torch.max(out=...)`. The
-        buffer must retain its full capacity across successive steps regardless of each
-        step's active count, so a later step with more active requests than an earlier
-        one still has an in-bounds destination.
+        (`_run_async_sched_sample`) writes its own prefix through `sample_kernel`. The buffer
+        must retain its full capacity across successive steps regardless of each step's
+        active count, so a later step with more active requests than an earlier one still
+        has an in-bounds destination.
 
         Drive a small-batch non-speculative sample followed by a larger-batch async
         sample through the same buffer, and confirm the buffer keeps its capacity and
@@ -1928,10 +2411,12 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         assert controller._sampled_tokens_cuda.data_ptr() == buffer_ptr
         assert torch.equal(controller._sampled_tokens_cuda[:small_count], small_expected)
 
-        # Async-scheduling sample over a larger active batch through the same buffer;
-        # its `torch.max(out=...)` destination is `_sampled_tokens_cuda[:large_count]`.
+        # Async-scheduling sample over a larger active batch through the same buffer.
         context.total_request_count = large_count
         context.paused_request_count = 0
+        context.active_request_metadata["temperature"][:large_count].fill_(1.0)
+        context.active_request_metadata["top_k"][:large_count].fill_(1)
+        context.active_request_metadata["top_p"][:large_count].fill_(0.0)
         large_expected = torch.tensor([0, 1, 2, 3, 4], device="cuda")
         large_logits = torch.zeros(1, large_count, self.vocab_size, device="cuda")
         for row, col in enumerate(large_expected.tolist()):
@@ -2631,7 +3116,7 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         )
 
         # Initialize allocator and states
-        ctx.kv_block_allocator.total_avail = 100
+        ctx.kv_block_allocator.pool_avail = 100
         ctx.request_kv_length_offsets[:2] = torch.tensor([10, 15], device=context_device)
         ctx.request_kv_block_counts[:2] = torch.tensor([3, 4], device=context_device)
 
@@ -2683,7 +3168,7 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
 
         # Assert released block is cleared
         assert ctx.request_to_kv_block_ids[1, 3].item() == -1
-        assert ctx.kv_block_allocator.total_avail == 101  # 1 block released
+        assert ctx.kv_block_allocator.pool_avail == 101  # 1 block released
 
         if is_hybrid_model:
             # Check Mamba state was restored from intermediate cache based on accepted counts
@@ -2887,7 +3372,7 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         ctx.kv_block_allocator.block_ref_counts[20] = 2
         ctx.kv_block_allocator.block_ref_counts[10] = 1
 
-        initial_avail = ctx.kv_block_allocator.total_avail
+        initial_avail = ctx.kv_block_allocator.pool_avail
 
         # Req 0 accepts 1 (rewinds 1), Req 1 accepts 0 (rewinds 2, crosses boundary).
         self.text_generation_controller._init_mtp_sampling_tensors()
@@ -2933,7 +3418,7 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         )
 
         # Blocks 10, 20 are shared prefix blocks. Block 30, 40 are exclusive.
-        ctx.kv_block_allocator.total_avail = 50
+        ctx.kv_block_allocator.pool_avail = 50
 
         self.text_generation_controller._init_mtp_sampling_tensors()
         self.text_generation_controller._accepted_token_counts_per_request = torch.tensor(
@@ -2947,7 +3432,7 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         assert ctx.request_kv_block_counts[0].item() == 3
         assert ctx.request_last_kv_block_id[0].item() == 30
         assert ctx.request_to_kv_block_ids[0, 3].item() == -1
-        assert ctx.kv_block_allocator.total_avail == 51  # exactly 1 block released
+        assert ctx.kv_block_allocator.pool_avail == 51  # exactly 1 block released
 
         # Prefix blocks remain in request_to_kv_block_ids.
         assert ctx.request_to_kv_block_ids[0, 0].item() == 10
@@ -3018,6 +3503,68 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         assert torch.equal(
             captured_position_ids[1].squeeze(0), torch.tensor([14, 16], device='cuda')
         )
+
+    def test_serial_mtp_slices_block_cuda_graph_buffer_before_sp_gather(self):
+        """Only gather the valid local shard of a persistent block-graph buffer."""
+        self.setup_model(
+            torch.float32,
+            static=False,
+            tensor_model_parallel_size=2,
+            sequence_parallel=True,
+            num_speculative_tokens=2,
+            max_requests=2,
+            mtp_num_layers=2,
+        )
+
+        controller = self.text_generation_controller
+        context = controller.inference_wrapped_model.inference_context
+        context.total_request_count = 2
+        context.paused_request_count = 0
+        context.request_kv_length_offsets[:2] = 0
+        context.request_query_lengths[:2] = 1
+        context.padded_active_token_count = 2
+        context.inference_cuda_graph_scope = InferenceCudaGraphScope.block
+
+        controller._init_mtp_sampling_tensors()
+        controller._sampled_tokens_cuda[:2] = torch.tensor([1, 2], device='cuda')
+        controller._last_accepted_seq_indices = torch.tensor([0, 1], device='cuda')
+
+        # Each TP rank writes one row, but block graphs retain a max-token-sized
+        # allocation. Poisoning the tail mirrors stale data from an earlier replay.
+        context.mtp_decoder_hidden_states = torch.full((8, 1, 32), -1.0, device='cuda')
+        context.mtp_decoder_hidden_states[0] = parallel_state.get_tensor_model_parallel_rank()
+
+        gathered_inputs = []
+
+        def mock_gather(local_hidden, group=None):
+            gathered_inputs.append(local_hidden.clone())
+            return torch.cat((local_hidden, local_hidden), dim=0)
+
+        model = controller._unwrapped_model
+        model.compute_mtp_single_step = mock.MagicMock(
+            side_effect=lambda hidden_states, **kwargs: (
+                hidden_states,
+                torch.zeros(2, 1, self.vocab_size, device='cuda'),
+            )
+        )
+        controller._sample_from_logits_2d = mock.MagicMock(
+            return_value=torch.tensor([3, 4], device='cuda')
+        )
+
+        # The serial MTP path lives in the MTP mixin, so patch the SP collectives there.
+        mtp_module = "megatron.core.inference.text_generation_controllers.mtp_inference_mixin"
+        with (
+            mock.patch(f"{mtp_module}.gather_from_sequence_parallel_region", mock_gather),
+            mock.patch(
+                f"{mtp_module}.scatter_to_sequence_parallel_region",
+                side_effect=lambda hidden, group=None: hidden[:1],
+            ),
+        ):
+            controller._compute_serial_mtp_and_sample()
+
+        assert len(gathered_inputs) == 1
+        assert gathered_inputs[0].shape == (1, 1, 32)
+        assert not torch.any(gathered_inputs[0] == -1)
 
     @pytest.mark.parametrize("active_request_count", [2, 3, 4, 5])
     def test_mtp_sp_padding_real_ranks(self, active_request_count):
@@ -3139,6 +3686,168 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         assert hidden_out.shape == (1, 1, self.hidden_size)
         # Logits are gathered: [padded_count, 1, vocab_size] = [tp_size, 1, vocab_size].
         assert logits_out.shape == (tp_size, 1, self.vocab_size)
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Symmetric-buffer all-gather barrier invariant (real inference-optimized MTP)
+    # ──────────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _assert_no_unbarriered_consecutive_all_gathers(events):
+        """Enforce the buffer-reuse invariant over a recorded collective trace.
+
+        ``events`` is an ordered list of ``(multicast_ptr, kind, barrier_before)``,
+        where ``kind`` is "AG" (plain multimem all-gather), "RS" (multimem
+        reduce-scatter), or "FUSED_RS_AG" (fused reduce-scatter+add+norm+all-gather).
+
+        A plain all-gather overwrites its symmetric buffer. If the previous op on the
+        same buffer also left it written by an all-gather (another plain AG, or the
+        all-gather tail of a fused RS+AG) with no reduce-scatter in between, the
+        all-gather must have requested ``barrier_before`` so peers finish reading the
+        previous contents before the overwrite. A reduce-scatter synchronizes ranks
+        inside its own kernel, so it clears the hazard for the next all-gather.
+        """
+        last_write = {}  # multicast_ptr -> "AG" | "RS"
+        violations = []
+        for idx, (ptr, kind, barrier_before) in enumerate(events):
+            if kind == "AG":
+                if last_write.get(ptr) == "AG" and not barrier_before:
+                    violations.append((idx, ptr))
+                last_write[ptr] = "AG"
+            elif kind == "RS":
+                last_write[ptr] = "RS"
+            elif kind == "FUSED_RS_AG":
+                # Its own reduce-scatter precedes its all-gather (internally safe), but
+                # it leaves the buffer written by an all-gather for whatever runs next.
+                last_write[ptr] = "AG"
+            else:
+                raise AssertionError(f"unexpected collective kind {kind!r}")
+        assert not violations, (
+            f"{len(violations)} all-gather(s) reused a symmetric buffer immediately after "
+            f"another all-gather without barrier_before or an intervening reduce-scatter "
+            f"(event indices/ptrs: {violations}).\nFull trace: {events}"
+        )
+
+    def _run_serial_mtp_step(self, active_request_count=4):
+        """Drive _compute_serial_mtp_and_sample with a valid SP hidden-state cache.
+
+        Mirrors test_mtp_sp_padding_real_ranks but in the model's own param dtype
+        (bf16 for the inference-optimized path).
+        """
+        tp_size = parallel_state.get_tensor_model_parallel_world_size()
+        ctrl = self.text_generation_controller
+        ctx = ctrl.inference_wrapped_model.inference_context
+        dtype = next(ctrl.inference_wrapped_model.model.parameters()).dtype
+
+        ctx.total_request_count = active_request_count
+        ctx.paused_request_count = 0
+        ctx.request_kv_length_offsets[:active_request_count] = torch.arange(
+            active_request_count, dtype=torch.int32, device='cuda'
+        )
+        ctx.request_query_lengths[:active_request_count] = torch.ones(
+            active_request_count, dtype=torch.int32, device='cuda'
+        )
+
+        ctrl._init_mtp_sampling_tensors()
+        ctrl._sampled_tokens_cuda[:active_request_count] = torch.remainder(
+            torch.arange(active_request_count, device='cuda'), self.vocab_size
+        )
+
+        pad = (tp_size - active_request_count % tp_size) % tp_size
+        s_total = active_request_count + pad
+        torch.manual_seed(42)
+        full_hidden = torch.randn(s_total, 1, self.hidden_size, device='cuda', dtype=dtype)
+        torch.distributed.broadcast(full_hidden, src=0)
+        tp_rank = parallel_state.get_tensor_model_parallel_rank()
+        ctx.mtp_decoder_hidden_states = full_hidden.chunk(tp_size)[tp_rank].contiguous()
+
+        ctrl._last_accepted_seq_indices = torch.arange(active_request_count, device='cuda')
+        ctx.active_request_metadata["temperature"][:active_request_count] = 1.0
+        ctx.active_request_metadata["top_k"][:active_request_count] = 1
+        ctx.active_request_metadata["top_p"][:active_request_count] = 0.0
+
+        ctrl._compute_serial_mtp_and_sample()
+
+    def _collect_symm_collective_trace(self):
+        """Run the serial-MTP inference step and record every symmetric collective.
+
+        The three buffer-writing collectives are instrumented at their call site
+        (megatron.core.tensor_parallel.inference_layers) so the real Triton kernels
+        still run; returns the ordered ``(ptr, kind, barrier_before)`` trace.
+        """
+        import megatron.core.tensor_parallel.inference_layers as il
+
+        real_ag = il.multimem_all_gather
+        real_rs = il.multimem_reduce_scatter
+        real_fused = il.fused_multimem_rs_add_norm_ag
+        events = []
+
+        def rec_ag(output_tensor, input_tensor, symm_mem_hdl, *args, **kwargs):
+            events.append(
+                (symm_mem_hdl.multicast_ptr, "AG", bool(kwargs.get("barrier_before", False)))
+            )
+            return real_ag(output_tensor, input_tensor, symm_mem_hdl, *args, **kwargs)
+
+        def rec_rs(output_tensor, input_tensor, symm_mem_hdl, *args, **kwargs):
+            events.append((symm_mem_hdl.multicast_ptr, "RS", False))
+            return real_rs(output_tensor, input_tensor, symm_mem_hdl, *args, **kwargs)
+
+        def rec_fused(residual, symm_buffer_tensor, symm_mem_hdl, *args, **kwargs):
+            events.append((symm_mem_hdl.multicast_ptr, "FUSED_RS_AG", False))
+            return real_fused(residual, symm_buffer_tensor, symm_mem_hdl, *args, **kwargs)
+
+        with (
+            mock.patch.object(il, "multimem_all_gather", rec_ag),
+            mock.patch.object(il, "multimem_reduce_scatter", rec_rs),
+            mock.patch.object(il, "fused_multimem_rs_add_norm_ag", rec_fused),
+        ):
+            self._run_serial_mtp_step()
+
+        return events
+
+    def _check_mtp_all_gather_barrier_invariant(self):
+        """Skip unless the NVLS path engaged, then enforce the barrier invariant."""
+        from megatron.core.inference.communication.torch_symm_triton.utils import (
+            is_device_nvls_capable,
+        )
+
+        if not is_device_nvls_capable(torch.device("cuda", torch.cuda.current_device())):
+            pytest.skip("NVLS multicast requires a Hopper+ GPU (SM >= 9)")
+        if parallel_state.get_tensor_model_parallel_world_size() < 2:
+            pytest.skip("requires a tensor-model-parallel world size >= 2")
+
+        events = self._collect_symm_collective_trace()
+
+        if not any(kind == "AG" for _, kind, _ in events):
+            pytest.skip("NVLS all-gather path did not engage (symmetric memory unavailable)")
+        # The MTP path must request at least one buffer-reuse barrier (eh_proj, output
+        # projection, or the inner-block qkv) — otherwise the wiring silently regressed.
+        assert any(barrier for _, kind, barrier in events if kind == "AG"), (
+            "expected the MTP inference path to request barrier_before on at least one "
+            f"all-gather, but none did. Trace: {events}"
+        )
+        self._assert_no_unbarriered_consecutive_all_gathers(events)
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not is_fa_min_version("2.7.3"), reason="needs flash attn for MTP decode")
+    @torch.inference_mode()
+    def test_mtp_inference_optimized_hybrid_no_unbarriered_consecutive_all_gathers(self):
+        """HybridModel + inference-optimized + SP + MTP: no consecutive AG lacks a barrier.
+
+        The main body is a Mamba/attention hybrid ("M*M*"); each of the two MTP depths
+        is a single attention section ("*").
+        """
+        self.setup_model(
+            torch.bfloat16,
+            static=False,
+            tensor_model_parallel_size=2,
+            num_speculative_tokens=2,
+            max_requests=8,
+            mtp_num_layers=2,
+            sequence_parallel=True,
+            transformer_impl="inference_optimized",
+            hybrid_layer_pattern="M*M*/*/*",
+        )
+        self._check_mtp_all_gather_barrier_invariant()
 
     def test_mtp_sp_dummy_hidden_uses_full_seq_len(self):
         """Test that chaining MTP depths produces correct SP-format shapes throughout.

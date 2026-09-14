@@ -5,7 +5,12 @@ from typing import Protocol
 
 import pytest
 
-from megatron.core.transformer.spec_utils import ModuleSpec, build_module, get_submodules
+from megatron.core.transformer.spec_utils import (
+    ModuleSpec,
+    build_module,
+    get_submodules,
+    import_module,
+)
 
 
 def dummy_method(x: int, y: str) -> dict:
@@ -77,6 +82,26 @@ class TestBuildModule:
         assert isinstance(mixed, ExampleA)
         assert mixed.x == 3
         assert mixed.y == 'ghi'
+
+
+class TestImportModule:
+    """Unit tests for dynamic spec imports."""
+
+    def test_missing_module_raises(self):
+        with pytest.raises(
+            ImportError, match="Could not import module 'megatron.core.models.does_not_exist'"
+        ):
+            import_module(('megatron.core.models.does_not_exist', 'missing_spec'))
+
+    def test_missing_spec_raises(self):
+        with pytest.raises(
+            ImportError,
+            match=(
+                "Could not find spec 'does_not_exist' in module "
+                "'megatron.core.transformer.identity_op'"
+            ),
+        ):
+            import_module(('megatron.core.transformer.identity_op', 'does_not_exist'))
 
 
 class OtherChild:

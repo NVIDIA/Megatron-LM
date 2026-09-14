@@ -13,7 +13,8 @@ Trace-path capability matrix:
     predictability     hidden states + router wts   no          yes
 
   - Sink path:  --moe-enable-routing-replay (CUDA graphs on). Captures top-K indices only, from the
-        in-pipeline recorder's static buffer.
+        in-pipeline recorder's static buffer. Requires
+        --inference-dynamic-batching-async-sched-mode legacy.
   - Hook path:  Remove --moe-enable-routing-replay and add
       --moe-routing-trace-capture-hidden-states / --moe-routing-trace-dump-weights.
       Forward hooks do not fire under graph replay so requires disabling graphs for the MoE layer.

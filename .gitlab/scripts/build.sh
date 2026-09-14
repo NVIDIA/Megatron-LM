@@ -50,7 +50,7 @@ fi
 
 if [[ "$FILE" == "Dockerfile.linting" ]]; then
     ADDITIONAL_PARAMS+=("--build-arg CI_SERVER_URL=${CI_SERVER_URL}")
-    ADDITIONAL_PARAMS+=("--secret id=NEMO_CI_TRIAGE_TOKEN,env=PAT")
+    ADDITIONAL_PARAMS+=("--secret id=CERNO_TOKEN,env=PAT")
 fi
 
 echo $(git rev-parse HEAD)

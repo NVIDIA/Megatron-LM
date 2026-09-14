@@ -373,7 +373,10 @@ def modelopt_gpt_hybrid_builder(
                 config, use_transformer_engine=use_te,
             )
             mtp_block_spec = get_gpt_mtp_block_spec(
-                config, decoder_layer_specs[-1], use_transformer_engine=use_te,
+                config,
+                decoder_layer_specs[-1],
+                use_transformer_engine=use_te,
+                pp_rank=pg_collection.pp.rank() if pg_collection is not None else None,
             )
 
         model_kwargs = {
@@ -383,12 +386,14 @@ def modelopt_gpt_hybrid_builder(
             "pre_process": pre_process,
             "post_process": post_process,
             "fp16_lm_cross_entropy": args.fp16_lm_cross_entropy,
+            "logit_dtype": getattr(args, "logit_dtype", None),
             "parallel_output": True,
             "share_embeddings_and_output_weights": not args.untie_embeddings_and_output_weights,
             "position_embedding_type": args.position_embedding_type,
             "rotary_percent": args.rotary_percent,
             "rotary_base": args.rotary_base,
             "rope_scaling": args.use_rope_scaling,
+            "rope_scaling_factor": args.rope_scaling_factor,
             "mtp_block_spec": mtp_block_spec,
             "pg_collection": pg_collection,
         }
@@ -428,6 +433,7 @@ def modelopt_gpt_hybrid_builder(
             "pre_process": pre_process,
             "post_process": post_process,
             "fp16_lm_cross_entropy": args.fp16_lm_cross_entropy,
+            "logit_dtype": getattr(args, "logit_dtype", None),
             "parallel_output": True,
             "share_embeddings_and_output_weights": not args.untie_embeddings_and_output_weights,
             "position_embedding_type": args.position_embedding_type,

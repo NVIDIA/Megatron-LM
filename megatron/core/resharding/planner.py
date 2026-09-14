@@ -4,14 +4,17 @@ from __future__ import annotations
 import logging
 import math
 import warnings
+from dataclasses import dataclass
 
 import torch
 import torch.distributed as dist
 
+from .shard_planner import plan_sharded_transfer
 from .utils import (
     ParameterMetadata,
     ReshardPlan,
     ShardingDescriptor,
+    TensorReshardSpec,
     TransferOp,
     _build_layer_module_prefix_map,
     _get_rank_in_group,
@@ -21,6 +24,28 @@ from .utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class _NativeParameterPart:
+    global_shape: tuple[int, ...]
+    src_local_shape: tuple[int, ...]
+    dst_local_shape: tuple[int, ...]
+    src_slice: tuple[slice, ...] | None
+    dst_slice: tuple[slice, ...] | None
+
+
+def _find_source_metadata(
+    src_param_metadata: dict[str, list[ParameterMetadata]], resolved_name: str
+) -> list[ParameterMetadata] | None:
+    """Find source metadata, including the tied-output embedding alias."""
+    src_meta_list = src_param_metadata.get(resolved_name)
+    if not src_meta_list and resolved_name.endswith("output_layer.weight"):
+        for embedding_name in ("embedding.word_embeddings.weight", "word_embeddings.weight"):
+            src_meta_list = src_param_metadata.get(embedding_name)
+            if src_meta_list:
+                break
+    return src_meta_list
 
 
 def _sort_ops_by_dst_offset(ops, dim):
@@ -328,18 +353,7 @@ def _iter_global_transfer_ops(
     for dst_rank in sorted(dst_param_metadata_by_rank):
         dst_rank_params = dst_param_metadata_by_rank[dst_rank]
         for resolved_name, dst_metadata in dst_rank_params.items():
-            src_meta_list = src_param_metadata.get(resolved_name)
-            if not src_meta_list and resolved_name.endswith("output_layer.weight"):
-                # Tied embeddings: the source shares the output projection with
-                # the input embedding, so it has no separate output_layer.weight.
-                # A pp>1 destination materializes one (embedding and output land
-                # on different stages), e.g. pp=1 (tied) -> pp=2. Source it from
-                # the embedding weight (same shape + vocab/TP shard); that tensor
-                # then feeds both the destination embedding and output_layer.
-                for emb_name in ("embedding.word_embeddings.weight", "word_embeddings.weight"):
-                    src_meta_list = src_param_metadata.get(emb_name)
-                    if src_meta_list:
-                        break
+            src_meta_list = _find_source_metadata(src_param_metadata, resolved_name)
             if not src_meta_list:
                 raise RuntimeError(
                     f"Destination parameter '{resolved_name}' on rank {dst_rank} "
@@ -347,13 +361,341 @@ def _iter_global_transfer_ops(
                 )
             # Choose a representative source metadata with DP round-robin balancing.
             src_metadata = select_src_metadata_balanced(src_meta_list, dst_metadata, dst_rank)
-            sources = _determine_source_ranks_for_dst_param(
-                resolved_name, src_metadata, dst_metadata, dst_rank
-            )
+            if dst_metadata.is_gtp or any(metadata.is_gtp for metadata in src_meta_list):
+                # A GTP shard is an additional dim-0 partition layered on top
+                # of the TP layout. Plan in logical global coordinates so TP,
+                # packed parameters, GTP padding, and their combinations compose.
+                sources = plan_sharded_transfer(
+                    resolved_name, src_meta_list, src_metadata, dst_metadata
+                )
+            else:
+                # Preserve the established TP/DP lowering for non-GTP models.
+                sources = _determine_source_ranks_for_dst_param(
+                    resolved_name, src_metadata, dst_metadata, dst_rank
+                )
             for src_rank, src_slice, dst_slice in sources:
                 task_id = next_task_id
                 next_task_id += 1
                 yield task_id, dst_rank, src_rank, src_slice, dst_slice, src_metadata, dst_metadata
+
+
+def _build_execution_batch_ids(
+    dst_param_metadata_by_rank: dict[int, dict[str, ParameterMetadata]],
+    src_param_metadata: dict[str, list[ParameterMetadata]],
+    max_batch_bytes: int | None = None,
+) -> tuple[dict[str, int], int]:
+    """Assign complete logical parameters to deterministic memory-bounded batches.
+
+    The planner is replayed from the same global metadata roster on every rank,
+    so these IDs let the generic executor call ``CopyService.run()`` in lockstep
+    without another collective. Source and destination bytes are accumulated per
+    rank; starting a new batch when any rank would cross the soft limit bounds
+    both sender-side dequantization and receiver-side staging. All replicas and
+    shards of one resolved parameter stay in one batch. ``None`` assigns every
+    parameter to one model-wide batch, preserving the uncapped behavior.
+    """
+    parameter_order: list[str] = []
+    destination_bytes: dict[str, dict[int, int]] = {}
+    for dst_rank in sorted(dst_param_metadata_by_rank):
+        for resolved_name, metadata in dst_param_metadata_by_rank[dst_rank].items():
+            if resolved_name not in destination_bytes:
+                parameter_order.append(resolved_name)
+                destination_bytes[resolved_name] = {}
+            # MXFP8 tensors are materialized/received as logical BF16 by the
+            # generic executor, so their one-byte physical element size would
+            # underestimate transient memory. Plain wider dtypes keep their
+            # actual element size.
+            tensor_bytes = math.prod(metadata.shape) * max(metadata.element_size, 2)
+            destination_bytes[resolved_name][metadata.owner_rank] = max(
+                destination_bytes[resolved_name].get(metadata.owner_rank, 0), tensor_bytes
+            )
+
+    if max_batch_bytes is None:
+        return {resolved_name: 0 for resolved_name in parameter_order}, 1
+    if max_batch_bytes <= 0:
+        raise ValueError("max_batch_bytes must be positive or None")
+
+    source_bytes: dict[str, dict[int, int]] = {}
+    for resolved_name in parameter_order:
+        rank_bytes: dict[int, int] = {}
+        for metadata in _find_source_metadata(src_param_metadata, resolved_name) or ():
+            tensor_bytes = math.prod(metadata.shape) * max(metadata.element_size, 2)
+            rank_bytes[metadata.owner_rank] = max(
+                rank_bytes.get(metadata.owner_rank, 0), tensor_bytes
+            )
+        source_bytes[resolved_name] = rank_bytes
+
+    batch_ids: dict[str, int] = {}
+    batch_id = 0
+    current_rank_bytes: dict[int, int] = {}
+    for resolved_name in parameter_order:
+        parameter_rank_bytes = dict(source_bytes[resolved_name])
+        for rank, tensor_bytes in destination_bytes[resolved_name].items():
+            parameter_rank_bytes[rank] = parameter_rank_bytes.get(rank, 0) + tensor_bytes
+
+        if current_rank_bytes and any(
+            current_rank_bytes.get(rank, 0) + tensor_bytes > max_batch_bytes
+            for rank, tensor_bytes in parameter_rank_bytes.items()
+        ):
+            batch_id += 1
+            current_rank_bytes.clear()
+
+        batch_ids[resolved_name] = batch_id
+        for rank, tensor_bytes in parameter_rank_bytes.items():
+            current_rank_bytes[rank] = current_rank_bytes.get(rank, 0) + tensor_bytes
+
+    return batch_ids, batch_id + 1 if batch_ids else 1
+
+
+def _tensor_mesh(metadata: ParameterMetadata) -> tuple[int, ...]:
+    """Return the TP mesh that owns a local parameter shard or replica."""
+    ranks = metadata.tensor_parallel_group_ranks
+    return tuple(ranks) if ranks else (metadata.owner_rank,)
+
+
+def _global_shape_for_mesh(metadata: ParameterMetadata, mesh: tuple[int, ...]) -> tuple[int, ...]:
+    shape = list(metadata.shape)
+    if metadata.is_tp:
+        shape[metadata.partition_dim] *= len(mesh)
+    return tuple(shape)
+
+
+def _validate_native_mesh_metadata(
+    resolved_name: str,
+    side: str,
+    mesh: tuple[int, ...],
+    metadata_by_rank: dict[int, ParameterMetadata],
+) -> str | None:
+    """Return why a parameter mesh cannot use whole-tensor native resharding."""
+    if not mesh:
+        return f"{resolved_name}: {side} TP mesh is empty"
+    if set(metadata_by_rank) != set(mesh):
+        missing = sorted(set(mesh) - set(metadata_by_rank))
+        extra = sorted(set(metadata_by_rank) - set(mesh))
+        return (
+            f"{resolved_name}: {side} TP metadata does not cover its mesh "
+            f"(missing={missing}, extra={extra})"
+        )
+
+    first = metadata_by_rank[mesh[0]]
+    for rank in mesh:
+        metadata = metadata_by_rank[rank]
+        if tuple(metadata.shape) != tuple(first.shape):
+            return f"{resolved_name}: {side} TP ranks have different local shapes"
+        if metadata.dtype != first.dtype:
+            return f"{resolved_name}: {side} TP ranks have different dtypes"
+        if metadata.is_tp != first.is_tp:
+            return f"{resolved_name}: {side} TP ranks disagree on sharding"
+        if metadata.is_tp and metadata.partition_dim != first.partition_dim:
+            return f"{resolved_name}: {side} TP ranks disagree on the shard dimension"
+        if metadata.partition_sizes != first.partition_sizes:
+            return f"{resolved_name}: {side} TP ranks disagree on packed component sizes"
+        if metadata.partition_stride != 1:
+            return f"{resolved_name}: partition_stride={metadata.partition_stride} is unsupported"
+    return None
+
+
+def _native_parameter_parts(
+    resolved_name: str,
+    src_metadata: ParameterMetadata,
+    dst_metadata: ParameterMetadata,
+    src_mesh: tuple[int, ...],
+    dst_mesh: tuple[int, ...],
+) -> tuple[list[_NativeParameterPart] | None, str | None]:
+    """Split a packed TP parameter into regular tensors for native resharding.
+
+    Mamba-style projections concatenate several components that are each
+    independently TP-sharded. The concatenation itself is not a regular
+    sharded tensor, but each component is. Plain parameters remain a single
+    full-tensor part.
+    """
+    src_global_shape = _global_shape_for_mesh(src_metadata, src_mesh)
+    dst_global_shape = _global_shape_for_mesh(dst_metadata, dst_mesh)
+    src_sizes = src_metadata.partition_sizes
+    dst_sizes = dst_metadata.partition_sizes
+    if src_sizes is None and dst_sizes is None:
+        if src_global_shape != dst_global_shape:
+            return None, (
+                f"{resolved_name}: source global shape {src_global_shape} does not match "
+                f"destination global shape {dst_global_shape}"
+            )
+        return [
+            _NativeParameterPart(
+                global_shape=src_global_shape,
+                src_local_shape=tuple(src_metadata.shape),
+                dst_local_shape=tuple(dst_metadata.shape),
+                src_slice=None,
+                dst_slice=None,
+            )
+        ], None
+
+    partition_dim = (
+        src_metadata.partition_dim
+        if src_sizes is not None or src_metadata.is_tp
+        else dst_metadata.partition_dim
+    )
+    if (src_sizes is not None or src_metadata.is_tp) and (
+        dst_sizes is not None or dst_metadata.is_tp
+    ):
+        if src_metadata.partition_dim != dst_metadata.partition_dim:
+            return None, (
+                f"{resolved_name}: packed source and destination use different partition "
+                "dimensions"
+            )
+
+    src_shards = len(src_mesh) if src_metadata.is_tp else 1
+    dst_shards = len(dst_mesh) if dst_metadata.is_tp else 1
+    if src_sizes is not None:
+        full_sizes = [size * src_shards for size in src_sizes]
+    else:
+        full_sizes = [size * dst_shards for size in dst_sizes]
+    if src_sizes is None:
+        if any(size % src_shards for size in full_sizes):
+            return None, f"{resolved_name}: packed source component is not TP-divisible"
+        src_sizes = [size // src_shards for size in full_sizes]
+    if dst_sizes is None:
+        if any(size % dst_shards for size in full_sizes):
+            return None, f"{resolved_name}: packed destination component is not TP-divisible"
+        dst_sizes = [size // dst_shards for size in full_sizes]
+    if len(src_sizes) != len(dst_sizes):
+        return None, f"{resolved_name}: source and destination packed component counts differ"
+    for index, (src_size, dst_size, full_size) in enumerate(zip(src_sizes, dst_sizes, full_sizes)):
+        if src_size * src_shards != full_size or dst_size * dst_shards != full_size:
+            return None, f"{resolved_name}: packed component {index} has inconsistent TP sizes"
+    if sum(src_sizes) != src_metadata.shape[partition_dim]:
+        return None, f"{resolved_name}: source packed component sizes do not match its shape"
+    if sum(dst_sizes) != dst_metadata.shape[partition_dim]:
+        return None, f"{resolved_name}: destination packed component sizes do not match its shape"
+
+    src_other_shape = list(src_global_shape)
+    dst_other_shape = list(dst_global_shape)
+    src_other_shape[partition_dim] = dst_other_shape[partition_dim] = 0
+    if src_other_shape != dst_other_shape or sum(full_sizes) != src_global_shape[partition_dim]:
+        return None, f"{resolved_name}: source and destination packed shapes do not match"
+    if sum(full_sizes) != dst_global_shape[partition_dim]:
+        return None, f"{resolved_name}: source and destination packed shapes do not match"
+
+    parts = []
+    src_offset = 0
+    dst_offset = 0
+    for src_size, dst_size, full_size in zip(src_sizes, dst_sizes, full_sizes):
+        global_shape = list(src_global_shape)
+        src_local_shape = list(src_metadata.shape)
+        dst_local_shape = list(dst_metadata.shape)
+        global_shape[partition_dim] = full_size
+        src_local_shape[partition_dim] = src_size
+        dst_local_shape[partition_dim] = dst_size
+        src_slice = [slice(None)] * len(src_metadata.shape)
+        dst_slice = [slice(None)] * len(dst_metadata.shape)
+        src_slice[partition_dim] = slice(src_offset, src_offset + src_size)
+        dst_slice[partition_dim] = slice(dst_offset, dst_offset + dst_size)
+        parts.append(
+            _NativeParameterPart(
+                global_shape=tuple(global_shape),
+                src_local_shape=tuple(src_local_shape),
+                dst_local_shape=tuple(dst_local_shape),
+                src_slice=tuple(src_slice),
+                dst_slice=tuple(dst_slice),
+            )
+        )
+        src_offset += src_size
+        dst_offset += dst_size
+    return parts, None
+
+
+def _build_tensor_reshard_specs(
+    dst_param_metadata_by_rank: dict[int, dict[str, ParameterMetadata]],
+    src_param_metadata: dict[str, list[ParameterMetadata]],
+    my_global_rank: int,
+) -> tuple[list[TensorReshardSpec] | None, str | None]:
+    """Build native mesh specs without affecting the generic plan."""
+    dst_groups: dict[tuple[str, tuple[int, ...]], dict[int, ParameterMetadata]] = {}
+    for dst_rank in sorted(dst_param_metadata_by_rank):
+        for resolved_name, metadata in dst_param_metadata_by_rank[dst_rank].items():
+            mesh = _tensor_mesh(metadata)
+            dst_groups.setdefault((resolved_name, mesh), {})[metadata.owner_rank] = metadata
+
+    specs: list[TensorReshardSpec] = []
+    for (resolved_name, dst_mesh), dst_by_rank in dst_groups.items():
+        src_meta_list = _find_source_metadata(src_param_metadata, resolved_name)
+        if not src_meta_list:
+            # The generic schedule raises the authoritative missing-weight
+            # error. Keep this helper side-effect free for callers that invoke
+            # it independently in tests.
+            return None, f"{resolved_name}: source parameter metadata is missing"
+        if any(metadata.is_gtp for metadata in src_meta_list) or any(
+            metadata.is_gtp for metadata in dst_by_rank.values()
+        ):
+            return None, f"{resolved_name}: GTP shards are unsupported by native resharding"
+
+        src_groups: dict[tuple[int, ...], dict[int, ParameterMetadata]] = {}
+        for metadata in src_meta_list:
+            mesh = _tensor_mesh(metadata)
+            src_groups.setdefault(mesh, {})[metadata.owner_rank] = metadata
+        dst_metadata = dst_by_rank[dst_mesh[0]]
+        selected_src = select_src_metadata_balanced(src_meta_list, dst_metadata, dst_mesh[0])
+        src_mesh = _tensor_mesh(selected_src)
+        src_by_rank = src_groups[src_mesh]
+
+        error = _validate_native_mesh_metadata(
+            resolved_name, "source", src_mesh, src_by_rank
+        ) or _validate_native_mesh_metadata(resolved_name, "destination", dst_mesh, dst_by_rank)
+        if error is not None:
+            return None, error
+        if set(src_mesh) & set(dst_mesh):
+            return None, f"{resolved_name}: source and destination meshes overlap"
+
+        src_metadata = src_by_rank[src_mesh[0]]
+        if src_metadata.dtype != dst_metadata.dtype:
+            return None, (
+                f"{resolved_name}: source dtype {src_metadata.dtype} does not match "
+                f"destination dtype {dst_metadata.dtype}"
+            )
+        if (src_metadata.is_ep and src_metadata.global_expert_index is None) or (
+            dst_metadata.is_ep and dst_metadata.global_expert_index is None
+        ):
+            return None, (
+                f"{resolved_name}: fused expert tensors are not supported by native resharding"
+            )
+
+        parts, error = _native_parameter_parts(
+            resolved_name, src_metadata, dst_metadata, src_mesh, dst_mesh
+        )
+        if error is not None:
+            return None, error
+        assert parts is not None
+
+        local_src = src_by_rank.get(my_global_rank)
+        local_dst = dst_by_rank.get(my_global_rank)
+        for part_index, part in enumerate(parts):
+            specs.append(
+                TensorReshardSpec(
+                    resolved_name=resolved_name,
+                    src_ranks=src_mesh,
+                    dst_ranks=dst_mesh,
+                    global_shape=part.global_shape,
+                    src_local_shape=part.src_local_shape,
+                    dst_local_shape=part.dst_local_shape,
+                    dtype=src_metadata.dtype,
+                    src_shard_dim=src_metadata.partition_dim if src_metadata.is_tp else None,
+                    dst_shard_dim=dst_metadata.partition_dim if dst_metadata.is_tp else None,
+                    src_param_name=local_src.name if local_src is not None else None,
+                    dst_param_name=local_dst.name if local_dst is not None else None,
+                    src_param_shape=tuple(src_metadata.shape),
+                    dst_param_shape=tuple(dst_metadata.shape),
+                    src_slice=part.src_slice,
+                    dst_slice=part.dst_slice,
+                    part_index=part_index,
+                    part_count=len(parts),
+                )
+            )
+
+    specs.sort(
+        key=lambda spec: (spec.src_ranks, spec.dst_ranks, spec.resolved_name, spec.part_index)
+    )
+    if not specs:
+        return None, "the reshard plan contains no parameters"
+    return specs, None
 
 
 def _extract_module_metadata(
@@ -404,14 +746,22 @@ def build_plan_from_rosters(
     dst_param_metadata_by_rank: dict[int, dict[str, ParameterMetadata]],
     src_param_metadata: dict[str, list[ParameterMetadata]],
     my_global_rank: int,
+    execution_batch_bytes: int | None = None,
 ) -> ReshardPlan:
     """Replay the deterministic global schedule and keep only this rank's ops.
 
     Pure and collective-free, so it can be tested or reused with preassembled
     rosters without touching the process group. Live membership orchestration
-    is intentionally outside this module.
+    is intentionally outside this module. ``execution_batch_bytes`` is an optional
+    soft per-rank limit; a single complete parameter may exceed it. ``None`` keeps
+    the model-wide submission behavior.
     """
-    my_plan = ReshardPlan([], [])
+    batch_ids, num_batches = _build_execution_batch_ids(
+        dst_param_metadata_by_rank, src_param_metadata, max_batch_bytes=execution_batch_bytes
+    )
+    my_plan = ReshardPlan(
+        [], [], num_batches=num_batches, execution_batch_bytes=execution_batch_bytes
+    )
     for (
         task_id,
         dst_rank,
@@ -430,6 +780,7 @@ def build_plan_from_rosters(
                     my_slice=dst_slice,
                     peer_slice=src_slice,
                     task_id=task_id,
+                    batch_id=batch_ids[dst_metadata.resolved_name or dst_metadata.name],
                 )
             )
         if src_rank == my_global_rank:
@@ -441,12 +792,16 @@ def build_plan_from_rosters(
                     my_slice=src_slice,
                     peer_slice=dst_slice,
                     task_id=task_id,
+                    batch_id=batch_ids[dst_metadata.resolved_name or dst_metadata.name],
                 )
             )
 
     logger.info(
         f"Rank {my_global_rank}: Built plan locally - {len(my_plan.recv_ops)} recvs, "
         f"{len(my_plan.send_ops)} sends"
+    )
+    my_plan.tensor_reshard_specs, my_plan.tensor_reshard_error = _build_tensor_reshard_specs(
+        dst_param_metadata_by_rank, src_param_metadata, my_global_rank
     )
     return my_plan
 
@@ -458,6 +813,7 @@ def build_local_reshard_plan(
     group=None,
     src_rank_offset: int = 0,
     dst_rank_offset: int = 0,
+    execution_batch_bytes: int | None = None,
 ) -> ReshardPlan:
     """
     Build this rank's reshard plan locally: all-gather the parameter metadata,
@@ -472,7 +828,9 @@ def build_local_reshard_plan(
 
     src_module/dst_module may be None for non-collocated ranks (destination-only,
     source-only, or idle). Each rank contributes metadata only for the models it
-    owns, including its parallel-group membership.
+    owns, including its parallel-group membership. ``execution_batch_bytes`` is
+    an optional soft per-rank limit for transient generic-executor staging;
+    ``None`` keeps the model-wide submission behavior.
     """
     # group.rank()/size() (not dist.get_rank(group)) support cross-cluster PGs
     # whose members have independent default PGs.
@@ -490,14 +848,29 @@ def build_local_reshard_plan(
     )
 
     # One all-gather gives every rank the full (src, dst) picture, replacing the
-    # gather-to-0 + scatter.
-    gathered_pairs = [None] * world_size
-    dist.all_gather_object(gathered_pairs, (my_src_metadata, my_dst_metadata), group=group)
+    # gather-to-0 + scatter. Include each rank's configured staging limit so a
+    # heterogeneous source/destination cluster deterministically uses the
+    # smallest configured value and every rank derives matching batches. None
+    # means that rank does not request a cap; all None preserves one model-wide
+    # submission.
+    gathered_entries = [None] * world_size
+    dist.all_gather_object(
+        gathered_entries, (my_src_metadata, my_dst_metadata, execution_batch_bytes), group=group
+    )
     del my_src_metadata, my_dst_metadata
 
+    configured_limits = [entry[2] for entry in gathered_entries if entry[2] is not None]
+    execution_batch_bytes = min(configured_limits) if configured_limits else None
+    gathered_pairs = [(entry[0], entry[1]) for entry in gathered_entries]
+    del gathered_entries
     dst_param_metadata_by_rank, src_param_metadata = index_metadata_rosters(gathered_pairs)
     del gathered_pairs
-    return build_plan_from_rosters(dst_param_metadata_by_rank, src_param_metadata, my_global_rank)
+    return build_plan_from_rosters(
+        dst_param_metadata_by_rank,
+        src_param_metadata,
+        my_global_rank,
+        execution_batch_bytes=execution_batch_bytes,
+    )
 
 
 def build_centralized_reshard_plan(
@@ -507,6 +880,7 @@ def build_centralized_reshard_plan(
     group=None,
     src_rank_offset: int = 0,
     dst_rank_offset: int = 0,
+    execution_batch_bytes: int | None = None,
 ) -> ReshardPlan:
     """Deprecated compatibility wrapper for :func:`build_local_reshard_plan`."""
     warnings.warn(
@@ -521,4 +895,5 @@ def build_centralized_reshard_plan(
         group=group,
         src_rank_offset=src_rank_offset,
         dst_rank_offset=dst_rank_offset,
+        execution_batch_bytes=execution_batch_bytes,
     )

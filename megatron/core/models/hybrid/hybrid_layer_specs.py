@@ -16,6 +16,10 @@ from megatron.core.models.gpt.moe_module_specs import (
 )
 from megatron.core.models.hybrid.hybrid_block import HybridStack, HybridStackSubmodules
 from megatron.core.ssm.gated_delta_net import GatedDeltaNet, GatedDeltaNetSubmodules
+from megatron.core.ssm.gated_delta_product import (
+    GatedDeltaProductMixer,
+    GatedDeltaProductMixerSubmodules,
+)
 from megatron.core.ssm.mamba_layer import MambaLayer, MambaLayerSubmodules
 from megatron.core.ssm.mamba_mixer import MambaMixer, MambaMixerSubmodules
 from megatron.core.ssm.mlp_layer import MLPLayer
@@ -77,7 +81,11 @@ _hybrid_mtp_block_spec = ModuleSpec(
                 submodules=MultiTokenPredictionLayerSubmodules(
                     enorm=TENorm,
                     hnorm=TENorm,
+                    # Hybrid MTP selects the combined projection normally and
+                    # per-stream projections when mHC is enabled.
                     eh_proj=TEColumnParallelLinear,
+                    e_proj=TEColumnParallelLinear,
+                    h_proj=TEColumnParallelLinear,
                     mtp_model_layer=None,  # Built via pattern + hybrid_submodules
                     layer_norm=TENorm,
                 ),
@@ -85,6 +93,19 @@ _hybrid_mtp_block_spec = ModuleSpec(
         ]
     ),
 )
+
+
+def _get_gated_delta_product_mamba_layer_spec(in_proj, out_proj):
+    return ModuleSpec(
+        module=MambaLayer,
+        submodules=MambaLayerSubmodules(
+            mixer=ModuleSpec(
+                module=GatedDeltaProductMixer,
+                submodules=GatedDeltaProductMixerSubmodules(in_proj=in_proj, out_proj=out_proj),
+            ),
+            mamba_bda=get_bias_dropout_add,
+        ),
+    )
 
 
 hybrid_stack_spec = ModuleSpec(
@@ -217,6 +238,22 @@ hybrid_stack_spec = ModuleSpec(
 )
 
 
+gated_delta_product_stack_spec = ModuleSpec(
+    module=HybridStack,
+    submodules=HybridStackSubmodules(
+        mamba_layer=_get_gated_delta_product_mamba_layer_spec(
+            TELayerNormColumnParallelLinear, TERowParallelLinear
+        ),
+        gdn_layer=hybrid_stack_spec.submodules.gdn_layer,
+        attention_layer=hybrid_stack_spec.submodules.attention_layer,
+        dsa_layer=hybrid_stack_spec.submodules.dsa_layer,
+        mlp_layer=hybrid_stack_spec.submodules.mlp_layer,
+        moe_layer=hybrid_stack_spec.submodules.moe_layer,
+        mtp_block_spec=hybrid_stack_spec.submodules.mtp_block_spec,
+    ),
+)
+
+
 hybrid_inference_stack_spec = ModuleSpec(
     module=HybridStack,
     submodules=HybridStackSubmodules(
@@ -231,6 +268,20 @@ hybrid_inference_stack_spec = ModuleSpec(
                     ),
                 ),
                 mamba_bda=get_bias_dropout_add,
+            ),
+        ),
+        gdn_layer=ModuleSpec(
+            module=TransformerLayer,
+            submodules=TransformerLayerSubmodules(
+                self_attention=ModuleSpec(
+                    module=GatedDeltaNet,
+                    submodules=GatedDeltaNetSubmodules(
+                        in_proj=InferenceLayerNormColumnParallelLinear,
+                        out_norm=TENorm,
+                        out_proj=InferenceRowParallelLinear,
+                    ),
+                ),
+                self_attn_bda=get_bias_dropout_add,
             ),
         ),
         # Started with spec from gpt_layer_specs.py (with MLP removed)
@@ -340,7 +391,10 @@ hybrid_inference_stack_spec = ModuleSpec(
                         submodules=MultiTokenPredictionLayerSubmodules(
                             enorm=TENorm,
                             hnorm=TENorm,
+                            # Keep both projection forms available for Hybrid MTP.
                             eh_proj=InferenceColumnParallelLinear,
+                            e_proj=InferenceColumnParallelLinear,
+                            h_proj=InferenceColumnParallelLinear,
                             mtp_model_layer=None,  # Built via pattern + hybrid_submodules
                             layer_norm=TENorm,
                         ),
@@ -352,6 +406,24 @@ hybrid_inference_stack_spec = ModuleSpec(
 )
 
 
+gated_delta_product_inference_stack_spec = ModuleSpec(
+    module=HybridStack,
+    submodules=HybridStackSubmodules(
+        mamba_layer=_get_gated_delta_product_mamba_layer_spec(
+            InferenceLayerNormColumnParallelLinear, InferenceRowParallelLinear
+        ),
+        gdn_layer=hybrid_inference_stack_spec.submodules.gdn_layer,
+        attention_layer=hybrid_inference_stack_spec.submodules.attention_layer,
+        dsa_layer=hybrid_inference_stack_spec.submodules.dsa_layer,
+        mlp_layer=hybrid_inference_stack_spec.submodules.mlp_layer,
+        moe_layer=hybrid_inference_stack_spec.submodules.moe_layer,
+        mtp_block_spec=hybrid_inference_stack_spec.submodules.mtp_block_spec,
+    ),
+)
+
+
 # Backward-compatible aliases
 mamba_stack_spec = hybrid_stack_spec
 mamba_inference_stack_spec = hybrid_inference_stack_spec
+gdp_stack_spec = gated_delta_product_stack_spec
+gdp_inference_stack_spec = gated_delta_product_inference_stack_spec

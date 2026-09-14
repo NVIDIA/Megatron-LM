@@ -72,3 +72,4 @@ MODEL_ARGS:
   --inference-dynamic-batching-async-sched-mode: async
 METRICS:
   - "generated_tokens"
+LAUNCHER: ft_launcher

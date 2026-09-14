@@ -43,31 +43,39 @@ def extra_args_provider(parser: argparse.ArgumentParser) -> argparse.ArgumentPar
     return parser
 
 
+def _set_stock_parallel_args(args: argparse.Namespace) -> None:
+    # validate_args and the stock training loop consume these fields.
+    args.tensor_model_parallel_size = args.mimo_llm_tp
+    args.pipeline_model_parallel_size = args.mimo_llm_pp
+    args.context_parallel_size = args.mimo_llm_cp
+    args.expert_model_parallel_size = args.mimo_llm_ep
+    args.expert_tensor_parallel_size = args.mimo_llm_expt_tp or 1
+
+
 def _parse_and_validate() -> argparse.Namespace:
     """Parse stock plus MIMO arguments and validate the disjoint module grids."""
     args = parse_args(extra_args_provider)
-    validate_hetero_grid_args(args, args.world_size)
+    _, llm_size = validate_hetero_grid_args(args, args.world_size)
+    _set_stock_parallel_args(args)
     physical_world_size = args.world_size
-    # Stock validate_args sets data_parallel_size = world_size // (tp*pp*cp); feed the
-    # language module's world (llm_dp; stock tp/pp/cp stay 1, MIMO parallelism is in --llm-*)
-    # so it yields llm_dp. The physical world incl. encoder ranks is restored below.
-    args.world_size = (
-        args.llm_dp
-        * args.tensor_model_parallel_size
-        * args.pipeline_model_parallel_size
-        * args.context_parallel_size
-    )
+    args.world_size = llm_size
     try:
         validate_args(args, {"dataloader_type": "external"})
     finally:
         args.world_size = physical_world_size
-    if not args.use_distributed_optimizer:
-        raise ValueError("heterogeneous MIMO training requires --use-distributed-optimizer")
+    if not (
+        args.use_distributed_optimizer
+        or getattr(args, "use_layer_wise_distributed_optimizer", False)
+    ):
+        raise ValueError("Other optimizer paths have not been tested with heterogeneous MIMO")
     validate_encoder_prefetch_args(args)
 
     if getattr(args, "padded_vocab_size", None) is None:
         args.padded_vocab_size = calculate_padded_vocab_size(
-            args.vocab_size, args.make_vocab_size_divisible_by, args.llm_tp, logging_enabled=False
+            args.vocab_size,
+            args.make_vocab_size_divisible_by,
+            args.mimo_llm_tp,
+            logging_enabled=False,
         )
     return args
 
@@ -84,7 +92,7 @@ def main() -> None:
     # generic over any number of encoder grids in the topology.
     encoder_name = provider.encoder_module_names[0] if provider.encoder_module_names else None
     specs = build_module_grid_specs(args, args.world_size, encoder_name)
-    topology = create_topology(specs)
+    topology = create_topology(specs, args.high_priority_stream_groups)
 
     communicator = provider.build_communicator(args, topology)
 

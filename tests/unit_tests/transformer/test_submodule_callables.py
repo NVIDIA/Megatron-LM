@@ -128,9 +128,16 @@ def test_mtp_pre_dispatch_applies_hybrid_empty_decoder_final_norm(monkeypatch):
         mtp_model_layer = object()
 
         def _get_embeddings(
-            self, input_ids, position_ids, embedding, hidden_states, packed_seq_params, padding_mask
+            self,
+            input_ids,
+            position_ids,
+            embedding,
+            hidden_states,
+            packed_seq_params,
+            padding_mask,
+            mtp_input_mask=None,
         ):
-            return input_ids, position_ids, padding_mask, None, hidden_states
+            return input_ids, position_ids, padding_mask, mtp_input_mask, None, hidden_states
 
         def _concat_embeddings(self, hidden_states, decoder_input):
             return hidden_states
@@ -140,7 +147,9 @@ def test_mtp_pre_dispatch_applies_hybrid_empty_decoder_final_norm(monkeypatch):
 
     monkeypatch.setattr(common_callables, "build_layer_callables", fake_build_layer_callables)
     monkeypatch.setattr(common_callables, "get_layer_moe_metadata", lambda _layer: (True, 1))
-    monkeypatch.setattr(common_callables, "get_mtp_layer_offset", lambda _config, _vp_stage: 0)
+    monkeypatch.setattr(
+        common_callables, "get_mtp_layer_offset", lambda _config, _vp_stage, pp_rank=None: 0
+    )
 
     model = HybridModel.__new__(HybridModel)
     torch.nn.Module.__init__(model)
@@ -149,6 +158,9 @@ def test_mtp_pre_dispatch_applies_hybrid_empty_decoder_final_norm(monkeypatch):
     model.decoder.final_norm = lambda hidden_states: hidden_states + 4.0
     model.embedding = object()
     model.vp_stage = None
+    model.pg_collection = DummyState()
+    model.pg_collection.pp = DummyState()
+    model.pg_collection.pp.rank = lambda: 0
 
     node = DummyNode()
     node.chunk_state = DummyState()

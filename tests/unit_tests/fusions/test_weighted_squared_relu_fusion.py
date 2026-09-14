@@ -3,7 +3,7 @@
 import pytest
 import torch
 
-from megatron.core.activations import squared_relu
+from megatron.core.activations import squared_relu, tanh_soft_clamp
 from megatron.core.fusions.fused_weighted_squared_relu import weighted_squared_relu_impl
 
 
@@ -52,3 +52,43 @@ def test_weighted_squared_relu_fusion(input_dtype):
     if input_dtype == torch.float32:
         # For bf16 baseline weight grad computed in fp32 then cast may lose precision.
         assert torch.allclose(weights_fused.grad, weights.grad, **tols)
+
+
+@pytest.mark.internal
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.parametrize("input_dtype", [torch.bfloat16, torch.float32])
+def test_clamped_weighted_squared_relu_fusion_matches_unfused(input_dtype):
+    """Fused clamped Squared-ReLU must match an eager tanh soft clamp plus the activation."""
+    torch.manual_seed(0)
+    clamp_scale = 5.0
+
+    if input_dtype == torch.float32:
+        tols = dict(rtol=1.0e-6, atol=1.0e-6)
+    elif input_dtype == torch.bfloat16:
+        tols = dict(rtol=2.0e-2, atol=1.0e-3)
+    else:
+        raise ValueError(f"Unsupported dtype {input_dtype}")
+
+    # Scaled up so a good share of the inputs land in the saturating region of the clamp.
+    x = (torch.randn(16, 64, dtype=input_dtype, device="cuda") * 5.0).requires_grad_(True)
+    weights = torch.randn(16, 1, dtype=torch.float32, device="cuda", requires_grad=True)
+    grad_output = torch.randn(16, 64, dtype=input_dtype, device="cuda")
+
+    # Baseline: the unfused ordering used by MLP/experts when bias_activation_fusion is False.
+    y_baseline = (squared_relu(tanh_soft_clamp(x, clamp_scale)) * weights).to(input_dtype)
+    y_baseline.backward(grad_output)
+
+    x_fused = x.detach().clone().requires_grad_(True)
+    weights_fused = weights.detach().clone().requires_grad_(True)
+    y_fused = weighted_squared_relu_impl(x_fused, weights_fused, clamp_scale=clamp_scale)
+    y_fused.backward(grad_output.detach().clone())
+
+    assert y_fused.dtype == y_baseline.dtype
+    assert torch.allclose(y_fused, y_baseline, **tols)
+
+    assert x_fused.grad.dtype == x.grad.dtype
+    assert torch.allclose(x_fused.grad, x.grad, **tols)
+
+    assert weights_fused.grad.dtype == weights.grad.dtype
+    if input_dtype == torch.float32:
+        assert torch.allclose(weights_fused.grad, weights.grad, rtol=1.0e-5, atol=1.0e-5)

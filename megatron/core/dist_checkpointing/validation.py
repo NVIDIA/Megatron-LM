@@ -477,18 +477,21 @@ def _validate_objects_for_key(sharded_objects: List[ShardedObject]) -> List[Chec
 
 def determine_global_metadata(
     sharded_state_dict: ShardedStateDict,
+    process_group: Optional[torch.distributed.ProcessGroup] = None,
 ) -> Tuple[_LocalMetadata, _GlobalMetadata]:
     """Exchanges local metadata with `all_gather_object` to determine global metadata.
 
     Args:
         sharded_state_dict (ShardedStateDict): local sharded state dict
+        process_group (ProcessGroup, optional): ranks whose metadata forms one
+            complete checkpoint view. Defaults to the global process group.
 
     Returns:
         Tuple[_LocalMetadata, _GlobalMetadata]: local and global ShardedBase objects with stripped data
     """
     local_metadata = [ten.without_data() for ten in nested_values(sharded_state_dict)]
-    global_metadata = [None] * torch.distributed.get_world_size()
-    torch.distributed.all_gather_object(global_metadata, local_metadata)
+    global_metadata = [None] * torch.distributed.get_world_size(group=process_group)
+    torch.distributed.all_gather_object(global_metadata, local_metadata, group=process_group)
     return local_metadata, global_metadata  # type: ignore[return-value]
 
 

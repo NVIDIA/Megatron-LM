@@ -10,6 +10,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from megatron.core.activations import situ_glu, tanh_soft_clamp
 from megatron.core.dist_checkpointing import ShardedTensor
 from megatron.core.dist_checkpointing.mapping import (
     ReplicaId,
@@ -178,6 +179,7 @@ class MLP(MegatronModule):
         ffn_hidden_size: Optional[int] = None,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
         name: str | None = None,
+        pg_collection: Optional[ProcessGroupCollection] = None,
     ):
         """
         Args:
@@ -193,12 +195,8 @@ class MLP(MegatronModule):
         if ffn_hidden_size is None:
             if is_expert:
                 raise ValueError("MoE MLP requires `ffn_hidden_size`, but it was not provided.")
-            warnings.warn(
-                "MLP requires ffn_hidden_size, but it was not provided. Using \
-                    config.ffn_hidden_size by default.",
-                DeprecationWarning,
-                stacklevel=2,
-            )
+            warnings.warn("MLP requires ffn_hidden_size, but it was not provided. Using \
+                    config.ffn_hidden_size by default.", DeprecationWarning, stacklevel=2)
             ffn_hidden_size = not_none(self.config.ffn_hidden_size)
 
         # If this is a gated linear unit we double the output width
@@ -230,6 +228,7 @@ class MLP(MegatronModule):
             is_expert=is_expert,
             tp_comm_buffer_name="fc1",
             tp_group=tp_group,
+            pg_collection=pg_collection,
             stride=fc1_stride,
             name=(name + ".linear_fc1") if name is not None else None,
         )
@@ -252,6 +251,7 @@ class MLP(MegatronModule):
             is_expert=is_expert,
             tp_comm_buffer_name="fc2",
             tp_group=tp_group,
+            pg_collection=pg_collection,
             name=(name + ".linear_fc2") if name is not None else None,
         )
 
@@ -282,6 +282,9 @@ class MLP(MegatronModule):
                         bias_parallel,
                         per_token_scale.unsqueeze(-1),
                         self.config.activation_func_fp8_input_store,
+                        self.config.activation_func_clamp_value,
+                        gate_clamp_scale=self.config.activation_func_tanh_clamp_scale,
+                        linear_clamp_scale=self.config.activation_func_tanh_clamp_scale_linear,
                     )
                 elif self.activation_func == quick_gelu and self.config.gated_linear_unit:
                     intermediate_parallel = weighted_bias_quick_geglu_impl(
@@ -313,25 +316,39 @@ class MLP(MegatronModule):
                         self.config.cpu_offloading
                         and self.config.cpu_offloading_activations
                         and HAVE_TE,
+                        self.config.activation_func_clamp_value,
+                        gate_clamp_scale=self.config.activation_func_tanh_clamp_scale,
+                        linear_clamp_scale=self.config.activation_func_tanh_clamp_scale_linear,
                     )
                 else:
                     raise ValueError("Only support fusion of gelu and swiglu")
         else:
             if bias_parallel is not None:
                 intermediate_parallel = intermediate_parallel + bias_parallel
+            tanh_clamp_scale = self.config.activation_func_tanh_clamp_scale
             if self.config.gated_linear_unit:
-
-                def glu(x):
-                    x_glu, x_linear = torch.chunk(x, 2, dim=-1)
-                    if (val := self.config.activation_func_clamp_value) is not None:
-                        x_glu = x_glu.clamp(min=None, max=val)
-                        x_linear = x_linear.clamp(min=-val, max=val)
-                    return self.config.activation_func(x_glu) * (
-                        x_linear + self.config.glu_linear_offset
+                if tanh_clamp_scale is not None:
+                    intermediate_parallel = situ_glu(
+                        intermediate_parallel,
+                        tanh_clamp_scale,
+                        self.config.activation_func_tanh_clamp_scale_linear,
+                        self.config.glu_linear_offset,
                     )
+                else:
 
-                intermediate_parallel = glu(intermediate_parallel)
+                    def glu(x):
+                        x_glu, x_linear = torch.chunk(x, 2, dim=-1)
+                        if (val := self.config.activation_func_clamp_value) is not None:
+                            x_glu = x_glu.clamp(min=None, max=val)
+                            x_linear = x_linear.clamp(min=-val, max=val)
+                        return self.config.activation_func(x_glu) * (
+                            x_linear + self.config.glu_linear_offset
+                        )
+
+                    intermediate_parallel = glu(intermediate_parallel)
             else:
+                if tanh_clamp_scale is not None:
+                    intermediate_parallel = tanh_soft_clamp(intermediate_parallel, tanh_clamp_scale)
                 intermediate_parallel = self.activation_func(intermediate_parallel)
 
             if per_token_scale is not None:
@@ -414,6 +431,7 @@ class MLP(MegatronModule):
             config=config,
             submodules=submodules,
             tp_group=pg_collection.tp,
+            pg_collection=pg_collection,
             is_expert=is_expert,
             input_size=input_size,
             ffn_hidden_size=ffn_hidden_size,

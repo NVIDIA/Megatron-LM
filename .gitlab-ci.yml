@@ -283,7 +283,7 @@ variables:
     description: Apply proposed Linear issue opens, updates, and closes
 
   # CI wide variables
-  NEMO_CI_TRIAGE_CONFIG: .gitlab/nemo-ci-triage.yml
+  CERNO_CONFIG: .gitlab/cerno.yml
   CI_MCORE_LTS_IMAGE: ${GITLAB_ENDPOINT}:5005/adlr/megatron-lm/mcore_ci_lts
   CI_MCORE_DEV_IMAGE: ${GITLAB_ENDPOINT}:5005/adlr/megatron-lm/mcore_ci_dev
   CI_NEMO_IMAGE: ${GITLAB_ENDPOINT}:5005/adlr/megatron-lm/nemo_ci

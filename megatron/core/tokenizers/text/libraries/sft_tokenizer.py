@@ -165,7 +165,7 @@ class SFTTokenizer:
 
         # When using the default prompt format, we do not replace any tokens with IGNORE_INDEX.
         # Instead, all token losses will be used for simplicity.
-        if self._prompt_format in ["default", "identity"]:
+        if self._prompt_format == "default":
             return tokens, target
 
         # Mask system and user tokens in the target.

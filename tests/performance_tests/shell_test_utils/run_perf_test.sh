@@ -88,6 +88,10 @@ NUM_TIMED_ITERS=$("$YQ" '.NUM_TIMED_ITERS // 5' "$CONFIG_PATH")
 # hybrid models should use 'gsm8k' — synthetic input gives misleading
 # perf because every token is identical (uniform expert routing, hot KV).
 DATASET=$("$YQ" '.DATASET // "synthetic"' "$CONFIG_PATH")
+# Scheduler selection for the performance A/B baselines. True pins the async
+# scheduler; false (and a missing value) pins the legacy scheduler so changes to
+# the application default do not silently change an existing benchmark case.
+ASYNC_SCHED=$("$YQ" '.ASYNC_SCHED // false' "$CONFIG_PATH")
 mapfile -t BATCH_SIZES < <("$YQ" '.BATCH_SIZES[]' "$CONFIG_PATH")
 
 # For MoE configs, expert-parallelism is orthogonal to DP and reshapes the
@@ -193,6 +197,29 @@ SERVER_COMMON_ARGS=(
     --port "$SERVER_PORT"
     --host 0.0.0.0
 )
+
+# Pin both sides of the scheduler A/B comparison instead of inheriting the
+# application default. Async cases retain their established prompt-log-prob
+# setting so the benchmark invocation remains stable.
+case "$ASYNC_SCHED" in
+    true)
+        echo "[run_perf_test] pinning async scheduling (--inference-dynamic-batching-async-sched-mode async --skip-prompt-log-probs)"
+        SERVER_COMMON_ARGS+=(
+            --inference-dynamic-batching-async-sched-mode async
+            --skip-prompt-log-probs
+        )
+        ;;
+    false)
+        echo "[run_perf_test] pinning legacy scheduling (--inference-dynamic-batching-async-sched-mode legacy)"
+        SERVER_COMMON_ARGS+=(
+            --inference-dynamic-batching-async-sched-mode legacy
+        )
+        ;;
+    *)
+        echo "[run_perf_test] error: ASYNC_SCHED must be true or false; got '$ASYNC_SCHED' from $CONFIG_PATH" >&2
+        exit 2
+        ;;
+esac
 
 (
     cd "$ROOT_DIR"
