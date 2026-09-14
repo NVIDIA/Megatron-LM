@@ -19,7 +19,7 @@ from megatron.core.context_parallel.layout import (
     _build_group_rank_by_logical_rank,
     _build_layout_redistribution_plan,
     _build_thd_cp_layout_plan_from_rank_order_indices,
-    _build_thd_rank_order_indices,
+    _build_thd_zigzag_metadata,
     _local_segment_ids,
 )
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -154,57 +154,28 @@ def test_matching_cp_layouts_do_not_convert(monkeypatch):
     assert manager.build_forward_state(None) is None
 
 
-def test_packed_zigzag_layout_uses_padded_metadata(monkeypatch):
-    cp_group = SimpleNamespace(size=lambda: 2)
-    tp_group = object()
-    tp_cp_group = object()
+def test_prebuilt_packed_layout_state_is_reused():
     manager = ContextParallelLayoutManager(
-        layer_layouts=("contiguous", "zigzag"),
+        layer_layouts=("zigzag",),
         boundary_layout="contiguous",
         sequence_parallel=False,
-        cp_group=cp_group,
-        tp_group=tp_group,
-        tp_cp_group=tp_cp_group,
+        cp_group=SimpleNamespace(size=lambda: 2),
+        tp_group=None,
+        tp_cp_group=None,
     )
-    cu_seqlens = torch.tensor((0, 7, 16), dtype=torch.int32)
-    target_cu_seqlens_padded = torch.tensor((0, 8, 24), dtype=torch.int32)
-    packed_seq_params = PackedSeqParams(
-        qkv_format="thd",
-        cu_seqlens_q=cu_seqlens,
-        cu_seqlens_kv=cu_seqlens,
-        max_seqlen_q=9,
-        max_seqlen_kv=9,
-        total_tokens=16,
-    )
-    plan = SimpleNamespace(
-        cu_seqlens_padded=target_cu_seqlens_padded, max_seqlen_padded=16, pad_between_seqs=True
-    )
-    monkeypatch.setattr(
-        context_parallel_layout_module, "build_thd_cp_layout_plan", lambda *_args, **_kwargs: plan
+    contiguous_params = PackedSeqParams(qkv_format="thd")
+    zigzag_params = PackedSeqParams(qkv_format="thd")
+    plan = object()
+    packed_seq_params_by_layout = {"contiguous": contiguous_params, "zigzag": zigzag_params}
+
+    state = manager.build_forward_state(
+        contiguous_params, packed_seq_params_by_layout=packed_seq_params_by_layout, thd_plan=plan
     )
 
-    layout_state = manager.build_forward_state(packed_seq_params)
-
-    assert layout_state is not None
-    assert layout_state.thd_plan is plan
-    zigzag_params = layout_state.zigzag_packed_seq_params
-    assert zigzag_params is not None
-    assert zigzag_params.cu_seqlens_q is cu_seqlens
-    assert zigzag_params.cu_seqlens_kv is cu_seqlens
-    assert zigzag_params.cu_seqlens_q_padded is target_cu_seqlens_padded
-    assert zigzag_params.cu_seqlens_kv_padded is target_cu_seqlens_padded
-    assert zigzag_params.max_seqlen_q == 16
-    assert zigzag_params.max_seqlen_kv == 16
-    assert zigzag_params.pad_between_seqs
-    assert zigzag_params.total_tokens is None
-    assert zigzag_params.seq_idx is None
-
-    monkeypatch.setattr(manager, "prepare_layer_input", lambda _index, hidden, _plan: hidden)
-    hidden_states = torch.zeros(2, 1, 1)
-    _, layer_packed_seq_params = layout_state.prepare_layer(0, hidden_states)
-    assert layer_packed_seq_params is packed_seq_params
-    _, layer_packed_seq_params = layout_state.prepare_layer(1, hidden_states)
-    assert layer_packed_seq_params is zigzag_params
+    assert state is not None
+    assert state.thd_plan is plan
+    assert state.contiguous_packed_seq_params is contiguous_params
+    assert state.zigzag_packed_seq_params is zigzag_params
 
 
 @pytest.mark.parametrize(
@@ -285,14 +256,17 @@ def test_layout_redistribution_plan_restores_target_segments(
         )
 
 
-def test_thd_rank_order_indices_pad_uneven_sequences():
-    rank_order_indices, padded_cu_seqlens = _build_thd_rank_order_indices(
+def test_thd_zigzag_layout_pads_uneven_sequences():
+    metadata = _build_thd_zigzag_metadata(
         torch.tensor((0, 3, 8), dtype=torch.int32), None, cp_size=2, tp_size=1
     )
 
-    torch.testing.assert_close(padded_cu_seqlens, torch.tensor((0, 4, 12), dtype=torch.int32))
     torch.testing.assert_close(
-        rank_order_indices,
+        metadata.cu_seqlens_padded, torch.tensor((0, 4, 12), dtype=torch.int32)
+    )
+    assert metadata.pad_between_seqs
+    torch.testing.assert_close(
+        metadata.rank_order_indices,
         torch.tensor((0, -1, 3, 4, -1, -1, 1, 2, 5, 6, 7, -1), dtype=torch.int64),
     )
 
@@ -316,14 +290,12 @@ def test_thd_layout_plan_routes_per_sequence_zigzag_tokens(
         plan = _build_thd_cp_layout_plan_from_rank_order_indices(
             rank_order_indices,
             source_token_count=rank_order_indices.numel(),
-            cu_seqlens_padded=torch.tensor(cu_seqlens, dtype=torch.int32),
             cp_size=cp_size,
             cp_rank=cp_rank,
             tp_size=tp_size,
             tp_rank=tp_rank,
             group_rank_by_logical_rank=group_rank_by_logical_rank,
         )
-        assert not plan.pad_between_seqs
         plans_by_group_rank[group_rank] = (logical_rank, plan)
         contiguous_by_group_rank[group_rank] = torch.arange(
             logical_rank * local_sequence_length,
@@ -357,12 +329,13 @@ def test_thd_layout_plan_handles_padding(cp_size, tp_size, cu_seqlens, cu_seqlen
         if cu_seqlens_padded is not None
         else None
     )
-    rank_order_indices, target_cu_seqlens_padded = _build_thd_rank_order_indices(
+    metadata = _build_thd_zigzag_metadata(
         actual_cu_seqlens, source_cu_seqlens_padded, cp_size, tp_size
     )
-    assert target_cu_seqlens_padded.dtype == torch.int32
+    assert metadata.cu_seqlens_padded.dtype == torch.int32
+    assert metadata.pad_between_seqs
     if source_cu_seqlens_padded is not None:
-        torch.testing.assert_close(target_cu_seqlens_padded, source_cu_seqlens_padded)
+        torch.testing.assert_close(metadata.cu_seqlens_padded, source_cu_seqlens_padded)
     group_size = cp_size * tp_size
     source_token_count = (
         cu_seqlens[-1] if source_cu_seqlens_padded is None else cu_seqlens_padded[-1]
@@ -374,16 +347,13 @@ def test_thd_layout_plan_handles_padding(cp_size, tp_size, cu_seqlens, cu_seqlen
     for logical_rank in range(group_size):
         cp_rank, tp_rank = divmod(logical_rank, tp_size)
         plan = _build_thd_cp_layout_plan_from_rank_order_indices(
-            rank_order_indices,
+            metadata.rank_order_indices,
             source_token_count=source_token_count,
-            cu_seqlens_padded=target_cu_seqlens_padded,
             cp_size=cp_size,
             cp_rank=cp_rank,
             tp_size=tp_size,
             tp_rank=tp_rank,
-            pad_between_seqs=True,
         )
-        assert plan.pad_between_seqs
         plans_by_group_rank.append((logical_rank, plan))
         inputs_by_group_rank.append(
             torch.arange(
@@ -393,7 +363,7 @@ def test_thd_layout_plan_handles_padding(cp_size, tp_size, cu_seqlens, cu_seqlen
         )
 
     zigzag_by_group_rank = _simulate_thd_plan(plans_by_group_rank, inputs_by_group_rank)
-    torch.testing.assert_close(torch.cat(zigzag_by_group_rank), rank_order_indices)
+    torch.testing.assert_close(torch.cat(zigzag_by_group_rank), metadata.rank_order_indices)
 
     restored_by_group_rank = _simulate_thd_plan(
         plans_by_group_rank, zigzag_by_group_rank, reverse=True
@@ -507,23 +477,23 @@ def test_thd_layout_all_to_all_pads_and_round_trips(tp_size, cp_size):
             .clone()
             .requires_grad_(True)
         )
+        metadata = _build_thd_zigzag_metadata(cu_seqlens, None, cp_size, tp_size)
+        assert metadata.pad_between_seqs
         plan = build_thd_cp_layout_plan(
-            cu_seqlens,
+            metadata.rank_order_indices,
             total_tokens,
             cp_group,
             sequence_parallel=sequence_parallel,
             tp_group=tp_group,
             tp_cp_group=tp_cp_group,
         )
-        assert plan.pad_between_seqs
         zigzag = contiguous_to_zigzag(
             contiguous, cp_group, sequence_parallel, tp_group, tp_cp_group, plan
         )
-        rank_order_indices, _ = _build_thd_rank_order_indices(cu_seqlens, None, cp_size, tp_size)
         expected = global_values.new_zeros(
             (plan.zigzag_local_token_count, *global_values.shape[1:])
         )
-        expected_indices = rank_order_indices.view(group_size, -1)[logical_rank]
+        expected_indices = metadata.rank_order_indices.view(group_size, -1)[logical_rank]
         valid_positions = torch.nonzero(expected_indices >= 0, as_tuple=False).flatten()
         expected.index_copy_(
             0,

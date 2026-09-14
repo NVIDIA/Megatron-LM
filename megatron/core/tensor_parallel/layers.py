@@ -255,7 +255,8 @@ def _initialize_affine_weight_cpu(
     """Initialize affine weight for model parallel.
 
     Build the master weight on all processes and scatter
-    the relevant chunk."""
+    the relevant chunk. A ``weight`` that is already GTP_remat-sharded is sliced down to this
+    rank's GTP rows as well, so the initialization matches a run with GTP off."""
 
     if not skip_set_tensor_parallel_attributes:
         set_tensor_model_parallel_attributes(
@@ -277,7 +278,17 @@ def _initialize_affine_weight_cpu(
     with torch.no_grad():
         # all tensors must live on the same device
         cpu_weight = torch.cat(my_weight_list, dim=partition_dim).to_dense()
+        if getattr(weight, "gtp_remat_size", 1) > 1:
+            from megatron.core.tensor_parallel.gtp_api import gtp_remat_slice_rows
+
+            cpu_weight = gtp_remat_slice_rows(cpu_weight, weight.group)
         weight.data.copy_(cpu_weight)
+        # Quantized (FP8/FP4) primary weights snapshot their values at construction, before CPU
+        # init writes the real ones. The distributed optimizer seeds its master params from that
+        # snapshot, so it must be refreshed or training starts from uninitialized memory.
+        high_precision_init_val = getattr(weight, "_high_precision_init_val", None)
+        if high_precision_init_val is not None:
+            high_precision_init_val.copy_(cpu_weight)
     if return_master_weight:
         return master_weight
     return None

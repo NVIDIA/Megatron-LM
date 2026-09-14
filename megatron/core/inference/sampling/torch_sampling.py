@@ -7,6 +7,11 @@ import torch
 from torch import Tensor
 
 from megatron.core.inference.sampling.base import Sampling
+from megatron.core.inference.sampling_params import (
+    MIN_SAMPLING_TEMPERATURE,
+    is_no_op_top_k,
+    is_no_op_top_p,
+)
 
 
 class TorchSampling(Sampling):
@@ -54,18 +59,18 @@ class TorchSampling(Sampling):
         Returns a new tensor (input unmodified). Shared by `sample_from_logits` and
         `log_probs_kernel` so sampling and processed log-probs apply the same filter.
         """
-        assert not (top_k > 0 and top_p > 0.0), "Cannot have top-p and top-k both greater than zero"
-        assert top_p <= 1.0, "top-p should be in (0,1]"
+        top_p_active = not is_no_op_top_p(top_p)
+        assert not (top_k > 0 and top_p_active), "Cannot have top-p and top-k both active"
         # Clone needed: .div_() and the filters below modify in-place.
         last_token_logits = last_token_logits.clone()
         if temperature != 1.0:
-            last_token_logits.div_(temperature)
-        if top_k >= 1:
+            last_token_logits.div_(max(temperature, MIN_SAMPLING_TEMPERATURE))
+        if not is_no_op_top_k(top_k):
             assert top_k <= last_token_logits.size(1), "top-k is larger than logit size."
             if vocab_size:
                 assert top_k < vocab_size, "top-k is larger than vocab size."
             TorchSampling._modify_logits_for_top_k_filtering(last_token_logits, top_k)
-        elif top_p > 0.0:
+        elif top_p_active:
             TorchSampling._modify_logits_for_top_p_filtering(last_token_logits, top_p)
         return last_token_logits
 
@@ -87,7 +92,7 @@ class TorchSampling(Sampling):
             last_token_logits: Logits of shape `[batch_size, vocab_size]`.
             temperature: Temperature scaling factor.
             top_k: Top-k filtering value (0 = disabled).
-            top_p: Top-p (nucleus) filtering value (0.0 = disabled).
+            top_p: Top-p (nucleus) filtering value (0.0 or >= 1.0 = disabled).
             generator: RNG used by `torch.multinomial`.
             vocab_size: When provided, asserts `top_k < vocab_size` and clamps the
                 sampled ids to `[0, vocab_size - 1]`.
@@ -97,8 +102,9 @@ class TorchSampling(Sampling):
         """
         assert isinstance(top_p, float)
         assert isinstance(top_k, int)
-        assert not (top_k > 0 and top_p > 0.0), "Cannot have top-p and top-k both greater than zero"
-        assert top_p <= 1.0, "top-p should be in (0,1]"
+        assert not (
+            top_k > 0 and not is_no_op_top_p(top_p)
+        ), "Cannot have top-p and top-k both active"
         if top_k == 1:
             return torch.argmax(last_token_logits, dim=-1)
 

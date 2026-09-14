@@ -37,12 +37,13 @@ import torch
 
 from hybrid_builders import hybrid_builder
 from megatron.core import mpu
+from megatron.core.context_parallel import ContextParallelBatch, get_batches_on_this_cp_rank
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
+from megatron.core.datasets.data_schedule import get_batch_on_this_rank_for_sequence_packing
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
 from megatron.core.enums import ModelType
 from megatron.core.package_info import __version__ as mcore_version
 from megatron.core.models.hybrid.hybrid_model import HybridModel
-from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import (
     get_context_parallel_group,
     get_hybrid_data_context_parallel_groups,
@@ -56,7 +57,6 @@ from megatron.core.utils import (
     StragglerDetector,
     flatten_batch_for_packed_sequences,
     get_attr_wrapped_model,
-    get_batch_on_this_cp_rank,
     get_batch_on_this_tp_rank,
     get_te_version,
     get_torch_version,
@@ -75,6 +75,7 @@ from megatron.training.argument_utils import (
 )
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
 from megatron.training.datasets.sft_dataset import SFTDataset
+from megatron.training.datasets.varlen_dataset import MockVarlenDataset, VarlenDataset
 from megatron.training.training import update_seqlen_stats_from_cu_seqlens
 from megatron.training.utils import get_blend_and_blend_per_split, is_first_or_last_pipeline_stage
 from model_provider import model_provider
@@ -91,8 +92,8 @@ except ImportError:
 
 stimer = StragglerDetector()
 
-# Canonical, ordered schema of the fields ``get_batch`` returns. Kept alphabetical
-# to match the historical ``sorted(batch.keys())`` order that callers unpack into.
+# Canonical, ordered batch schema. Kept alphabetical to match the
+# historical ``sorted(batch.keys())`` order.
 BATCH_KEYS = [
     "attention_mask",
     "cu_seqlens",
@@ -113,6 +114,39 @@ def get_batch(data_iterator, vp_stage=None):
     args = get_args()
     config = core_transformer_config_from_args(args)
 
+    if args.sequence_packing_scheduler is not None:
+        (
+            tokens,
+            labels,
+            loss_mask,
+            attention_mask,
+            position_ids,
+            packed_seq_params,
+            padding_mask,
+        ) = get_batch_on_this_rank_for_sequence_packing(
+            data_iterator,
+            vpp_size=config.virtual_pipeline_model_parallel_size,
+            mtp_on_this_rank=mtp_on_this_rank_func(
+                layout=config.pipeline_model_parallel_layout,
+                mtp_num_layers=config.mtp_num_layers,
+                ignore_virtual=False,
+                vp_stage=vp_stage,
+            ),
+            vp_stage=vp_stage,
+        )
+        return ContextParallelBatch.from_single_layout(
+            config.linear_cp_layout,
+            {
+                "tokens": tokens,
+                "labels": labels,
+                "loss_mask": loss_mask,
+                "attention_mask": attention_mask,
+                "position_ids": position_ids,
+                "padding_mask": padding_mask,
+            },
+            packed_seq_params,
+        )
+
     cp_size = args.context_parallel_size
     tp_rank = mpu.get_tensor_model_parallel_rank()
     is_sft = args.sft
@@ -131,7 +165,11 @@ def get_batch(data_iterator, vp_stage=None):
         and not mtp_on_this_rank
         and not has_cu_seqlens
     ):
-        return [None for _ in BATCH_KEYS]
+        return ContextParallelBatch(
+            boundary_layout=config.linear_cp_layout,
+            batches_by_layout={config.linear_cp_layout: dict.fromkeys(BATCH_KEYS)},
+            packed_seq_params_by_layout={config.linear_cp_layout: None},
+        )
 
     batch = {}
     if tp_rank == 0:
@@ -164,35 +202,33 @@ def get_batch(data_iterator, vp_stage=None):
 
     if not is_first_or_last_pipeline_stage(vp_stage) and not mtp_on_this_rank:
         assert has_cu_seqlens
-        return (
-            None,
-            batch['cu_seqlens'],
-            batch['cu_seqlens_padded'],
-            None,
-            None,
-            None,
-            None,
-            batch['max_seqlen'],
-            None,
-            None,
-        )
+        batch = {
+            **dict.fromkeys(BATCH_KEYS),
+            'cu_seqlens': batch['cu_seqlens'],
+            'cu_seqlens_padded': batch['cu_seqlens_padded'],
+            'max_seqlen': batch['max_seqlen'],
+        }
 
-    batch = get_batch_on_this_cp_rank(
+    additional_layouts = set()
+    if cp_size > 1 and config.linear_cp_layout != config.attention_cp_layout:
+        additional_layouts.add(config.attention_cp_layout)
+    return get_batches_on_this_cp_rank(
         batch,
+        boundary_layout=config.linear_cp_layout,
         is_hybrid_cp=is_hybrid_cp,
         cp_group=get_context_parallel_group(),
+        additional_layouts=additional_layouts,
         hybrid_cp_group_func=get_hybrid_data_context_parallel_groups,
         use_per_sequence_balancing=args.dataloader_inter_document_masking and not is_sft,
-        use_contiguous_cp=(config.linear_cp_layout == "contiguous" and cp_size > 1),
+        sequence_parallel=config.sequence_parallel,
+        tp_group=mpu.get_tensor_model_parallel_group(),
+        tp_cp_group=(
+            mpu.get_tensor_and_context_parallel_group()
+            if config.sequence_parallel and config.tensor_model_parallel_size > 1
+            else None
+        ),
+        tokens_per_sample=args.seq_length,
     )
-
-    # Return values in BATCH_KEYS order so callers can unpack into the fixed
-    # names regardless of any provenance fields wrappers like BlendedDataset
-    # add (e.g. "dataset_id"). The for-loop above already populates every
-    # BATCH_KEYS entry on tp_rank 0; other tp_ranks receive a fresh dict from
-    # get_batch_on_this_tp_rank. BATCH_KEYS is already alphabetical, matching
-    # the historical sorted(batch.keys()) order.
-    return [batch[key] for key in BATCH_KEYS]
 
 
 # define spiky loss as a loss that's 10x the max loss observed
@@ -305,46 +341,18 @@ def forward_step(data_iterator, model: HybridModel):
 
     with stimer(bdata=True):
         vp_stage = get_attr_wrapped_model(model, "vp_stage")
-        (
-            attention_mask,
-            cu_seqlens,
-            cu_seqlens_padded,
-            hybrid_cp_group,
-            labels,
-            local_cp_size,
-            loss_mask,
-            max_seqlen,
-            position_ids,
-            tokens,
-        ) = get_batch(data_iterator, vp_stage)
-
-    packed_seq_params = None
-    if cu_seqlens is not None:
-        # Squeeze the batch dim: the batch dict keeps cu_seqlens as (1, N)
-        # for consistency, but PackedSeqParams and TE expect 1-D.
-        cu_seqlens = cu_seqlens.squeeze(0)
-        if cu_seqlens_padded is not None:
-            cu_seqlens_padded = cu_seqlens_padded.squeeze(0)
-        # Use real (unpadded) cu_seqlens to feed the FLOPs accounting: varlen
-        # attention only computes work for real tokens within each chunk.
-        update_seqlen_stats_from_cu_seqlens(cu_seqlens)
-        cu_seqlens_for_params = cu_seqlens_padded if cu_seqlens_padded is not None else cu_seqlens
-        total_tokens = int(cu_seqlens_for_params[-1].item())
-        if args.linear_cp_layout == "contiguous" and args.context_parallel_size > 1:
-            cu_seqlens_for_params = cu_seqlens
-        packed_seq_params = PackedSeqParams(
-            qkv_format="thd",
-            cu_seqlens_q=cu_seqlens_for_params,
-            cu_seqlens_kv=cu_seqlens_for_params,
-            cu_seqlens_q_padded=cu_seqlens_padded,
-            cu_seqlens_kv_padded=cu_seqlens_padded,
-            max_seqlen_q=int(max_seqlen.item()),
-            max_seqlen_kv=int(max_seqlen.item()),
-            local_cp_size=int(local_cp_size.item()) if local_cp_size is not None else None,
-            cp_group=hybrid_cp_group,
-            total_tokens=total_tokens,
-            tokens_per_sample=args.seq_length,
-        )
+        cp_batch = get_batch(data_iterator, vp_stage)
+        batch = cp_batch.get_batch()
+        attention_mask = batch.get("attention_mask")
+        cu_seqlens = batch.get("cu_seqlens")
+        labels = batch.get("labels")
+        loss_mask = batch.get("loss_mask")
+        position_ids = batch.get("position_ids")
+        tokens = batch.get("tokens")
+        packed_seq_params = cp_batch.get_packed_seq_params()
+        padding_mask = batch.get("padding_mask")
+        if cu_seqlens is not None:
+            update_seqlen_stats_from_cu_seqlens(cu_seqlens.squeeze(0))
 
     timers('batch-generator').stop()
 
@@ -356,6 +364,8 @@ def forward_step(data_iterator, model: HybridModel):
             labels=labels,
             packed_seq_params=packed_seq_params,
             loss_mask=loss_mask,
+            padding_mask=padding_mask,
+            cp_batch=cp_batch,
         )
 
     # [ModelOpt]: model is needed to access ModelOpt distillation losses
@@ -419,6 +429,8 @@ def core_gpt_dataset_config_from_args(args: Any) -> GPTDatasetConfig:
         sequence_parallel_size=args.tensor_model_parallel_size * args.sequence_parallel,
         hybrid_context_parallel=args.hybrid_context_parallel,
         inter_document_masking=args.dataloader_inter_document_masking,
+        varlen_mock_dataset_config_json=args.varlen_mock_dataset_config_json,
+        varlen_sbhd_validation=args.varlen_sbhd_validation,
     )
 
 
@@ -435,6 +447,17 @@ def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None
     if args.sft:
         dataset_type = SFTDataset
         is_packed_sequence = True  # SFT always uses packed sequence
+    elif args.use_varlen_dataset:
+        # Variable-length packed (THD) dataset, independent of --sft.
+        # Reuses SFTDataset's THD packing internally but is gated
+        # by its own top-level flag.
+        if args.mock_data:
+            dataset_type = MockVarlenDataset
+        else:
+            dataset_type = VarlenDataset
+        # SBHD validation mode runs the non-packed pipeline; THD mode
+        # is the packed-sequence path.
+        is_packed_sequence = not args.varlen_sbhd_validation
     else:
         if args.mock_data:
             dataset_type = MockGPTDataset

@@ -4,6 +4,25 @@ import warnings
 from dataclasses import dataclass
 from typing import List, Optional
 
+# Floor applied to temperature everywhere it divides logits to avoid inf/NaN.
+MIN_SAMPLING_TEMPERATURE = 1e-6
+
+
+def is_no_op_top_k(top_k):
+    """True where a top-k value does not truncate (top_k <= 0 is the disabled sentinel).
+
+    Works on Python scalars and torch tensors alike.
+    """
+    return top_k <= 0
+
+
+def is_no_op_top_p(top_p):
+    """True where a top-p value does not truncate (0.0 sentinel, or >= 1.0 = full mass).
+
+    Works on Python scalars and torch tensors alike.
+    """
+    return (top_p <= 0.0) | (top_p >= 1.0)
+
 
 @dataclass
 class SamplingParams:
@@ -38,6 +57,11 @@ class SamplingParams:
     # drops prompt_tokens before serializing the finished request, saving the ZMQ
     # transmission cost for long prompts. Opt in when the client needs them.
     return_prompt_tokens: bool = False
+    # When False, the DP coordinator skips detokenizing this request's output. The
+    # coordinator is a single process serving every DP rank, so per-request work there
+    # is a throughput ceiling; callers that can detokenize themselves (e.g. the HTTP
+    # frontend, which is replicated) should set this to False.
+    detokenize_generations: bool = True
     streaming: bool = False  # Emit incremental ENGINE_REPLY_PARTIAL frames.
     streaming_interval: int = 1  # Minimum unsent tokens per ENGINE_REPLY_PARTIAL.
     do_kv_handoff: bool = False  # Pin KV blocks and expose metadata for peer transfer.
@@ -48,8 +72,16 @@ class SamplingParams:
         Sets return_prompt_top_n_logprobs based on skip_prompt_log_probs and top_n_logprobs:
         - return_prompt_top_n_logprobs = not skip_prompt_log_probs and top_n_logprobs > 0
         """
+        self._normalize_filters()
         self._sync_prompt_logprobs_fields()
         self._validate_streaming_interval()
+
+    def _normalize_filters(self):
+        """Map no-op filter values to the disabled sentinels (top_k=0, top_p=0.0)."""
+        if is_no_op_top_p(self.top_p):
+            self.top_p = 0.0
+        if is_no_op_top_k(self.top_k):
+            self.top_k = 0
 
     def _sync_prompt_logprobs_fields(self):
         """Synchronize return_prompt_top_n_logprobs with skip_prompt_log_probs."""
@@ -91,6 +123,7 @@ class SamplingParams:
             setattr(self, key, value)
 
         # Synchronize fields after setting attributes
+        self._normalize_filters()
         self._sync_prompt_logprobs_fields()
         self._validate_streaming_interval()
 
