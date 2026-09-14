@@ -20,7 +20,7 @@ variant-specific conditionals:
 | Table primes | next unused prime above each order budget | n-th prime after `ngram_vocab_size_base − 1`, per head |
 | n-gram boundary | left-pad with the compressed pad token | window resets at every EOS (`--engram-eos-token-id`) |
 | Projection bias / gamma | biased projections, ordinary gamma | bias-free, zero-centered group-norm gamma |
-| Packed (THD) rows | rejected | supported via the `--sft` family; schedulers incl. `--use-varlen-dataset` rejected; with PP > 1 requires `--pad-packed-seq-alignment max` (fixed-capacity rows; the prefetched tokens are zero-padded identically) |
+| Packed (THD) rows | supported; boundaries come from `cu_seqlens` | supported; boundaries come from EOS and `cu_seqlens`, whichever is later |
 
 The qwen variant additionally requires `--engram-unigram-vocab-size` (the HF
 `config.vocab_size` bounding the multipliers; the padded vocabulary must not exceed it) and
@@ -55,9 +55,16 @@ Startup validates the following before model allocation:
 - the memory dimension is divisible by the positive number of hash heads;
 - the versioned tokenizer-map artifact matches the configured tokenizer vocabulary, pad ID,
   selected layers, maximum order, and hash seed;
-- CP is one and VPP, activation recomputation, CUDA graphs, and FSDP are off;
-- packed (THD) sequences are off, except for variants that reset n-gram windows at a document
-  boundary token (see the variant table above).
+- CP is one and CUDA graphs and FSDP are off;
+- packed (THD) sequences use the `--sft` family (schedulers including `--use-varlen-dataset`
+  are rejected) and, with PP > 1, `--pad-packed-seq-alignment max`; PP >= 3 is blocked upstream.
+
+Activation recomputation and virtual pipeline parallelism are supported. Recompute needs no
+Engram-specific plumbing: `checkpointed_forward` already forwards `input_ids` to the layers it
+replays, and every rank of an EP/TP group recomputes the same layer block, so the memory's
+collectives stay rank-symmetric under replay. VPP needs none either beyond handing each model
+chunk its own prefetch wrapper, because the tokens of a microbatch do not depend on the chunk
+that consumes them.
 
 EP is legal without MoE experts when Engram is enabled. If MoE and Engram coexist they share the
 same EP dimension and `ProcessGroupCollection.ep`.
@@ -256,7 +263,7 @@ The current milestone supports GPT training with BF16 parameters (FP8/MXFP8 main
 are permitted; Engram modules are plain torch modules outside the Transformer Engine autocast
 regions and stay in BF16), standard residuals or native mHC, EP, TP, PP, SP, MoE coexistence,
 multi-token prediction (MTP layers never build Engram), native all-to-all, torch distributed
-checkpoints, and — for the qwen variant — packed THD rows with EOS document boundaries.
-CP greater than one, VPP, activation recomputation, CUDA graphs, FSDP, inference serving,
+checkpoints, and packed THD rows (document boundaries from EOS, from `cu_seqlens`, or both).
+CP greater than one, CUDA graphs, FSDP, inference serving,
 offload, DeepEP, communication overlap, request deduplication, FP8 table storage, and fused
 Engram kernels are intentionally deferred and rejected during startup.

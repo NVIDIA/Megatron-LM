@@ -136,6 +136,7 @@ def _startup_transformer_config(**overrides):
         expert_tensor_parallel_size=1,
         sequence_parallel=False,
         overlap_moe_expert_parallel_comm=False,
+        pipeline_model_parallel_size=1,
     )
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -184,8 +185,13 @@ def test_invalid_configuration_messages(tmp_path):
     # MTP layers never build Engram).
     config.validate_startup(_startup_transformer_config(fp8="mxfp8"), 16)
     config.validate_startup(_startup_transformer_config(mtp_num_layers=1), 16)
-    with pytest.raises(ValueError, match="Packed sequences are not supported by the deepseek"):
-        config.validate_startup(_startup_transformer_config(), 16, packed_sequences=True)
+    # Packed rows are accepted for every variant: boundaries come from cu_seqlens when the
+    # variant has no boundary token of its own.
+    config.validate_startup(_startup_transformer_config(), 16, packed_sequences=True)
+    with pytest.raises(ValueError, match="pipeline_model_parallel_size > 2"):
+        config.validate_startup(
+            _startup_transformer_config(pipeline_model_parallel_size=4), 16, packed_sequences=True
+        )
     with pytest.raises(ValueError, match="overlap_moe_expert_parallel_comm"):
         config.validate_startup(
             _startup_transformer_config(overlap_moe_expert_parallel_comm=True), 16

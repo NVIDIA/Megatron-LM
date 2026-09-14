@@ -547,11 +547,6 @@ class EngramConfig:
     def _validate_packed_sequences(self, transformer_config: Any, packed_sequences: bool) -> None:
         if not packed_sequences:
             return
-        if not self.variant_spec.supports_packed_sequences:
-            raise ValueError(
-                f"Packed sequences are not supported by the {self.variant} variant, whose "
-                "n-gram windows do not reset at document boundaries."
-            )
         if transformer_config.pipeline_model_parallel_size > 2:
             # TODO(upstream): middle pipeline stages receive no cu_seqlens/max_seqlen from the
             # TP batch broadcast, so packed training crashes there with or without Engram.

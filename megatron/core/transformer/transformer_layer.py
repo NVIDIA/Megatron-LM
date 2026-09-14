@@ -769,7 +769,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         """
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
-        hidden_states = self._maybe_apply_engram(hidden_states, input_ids)
+        hidden_states = self._maybe_apply_engram(hidden_states, input_ids, packed_seq_params)
 
         # Optional Input Layer norm
         attn_norm_manager = self.off_interface(self.offload_attn_norm, hidden_states, "attn_norm")
@@ -885,7 +885,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
         return hidden_states, context
 
-    def _maybe_apply_engram(self, hidden_states, input_ids):
+    def _maybe_apply_engram(self, hidden_states, input_ids, packed_seq_params=None):
         """Add the Engram residual for the layers that carry an Engram module.
 
         Unsupported inputs are rejected by GPTModel.forward, which every pipeline stage
@@ -894,7 +894,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         """
         if self.engram is None:
             return hidden_states
-        return hidden_states + self.engram(hidden_states, input_ids)
+        return hidden_states + self.engram(hidden_states, input_ids, packed_seq_params)
 
     @copy_signature(_forward_attention)
     def forward(self, *args, **kwargs):
@@ -2385,7 +2385,7 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         """Forward attention with hyper connection pre/post processing on self-attention."""
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
-        hidden_states = self._maybe_apply_engram(hidden_states, input_ids)
+        hidden_states = self._maybe_apply_engram(hidden_states, input_ids, packed_seq_params)
 
         nvtx_range_push(suffix="self_attention_hyper_connection")
         hidden_states, self_attn_h_res, self_attn_hc_h_post, residual = (

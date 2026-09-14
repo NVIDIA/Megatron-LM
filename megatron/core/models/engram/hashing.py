@@ -18,17 +18,12 @@ def compress_token_ids(input_ids: Tensor, tokenizer_remap: Tensor) -> Tensor:
     return torch.where(input_ids >= 0, compressed, input_ids)
 
 
-def shift_right_reset_at_eos(token_ids: Tensor, shift: int, eos_token_id: int) -> Tensor:
-    """Shift tokens right by ``shift`` positions without crossing EOS document boundaries.
+def segment_starts_from_eos(token_ids: Tensor, eos_token_id: int) -> Tensor:
+    """Return the first position of the document containing each position, split at EOS.
 
-    Faithful to the official Qwen ``_shift_right_ignore_eos``: for every position, the segment
-    starts right after the previous EOS in the row; positions whose shifted source would fall
-    before their segment start (or before the row start) yield ``eos_token_id`` instead. EOS
-    tokens themselves terminate the segment they end, so n-grams never mix two documents. This
-    covers plain rows and packed rows alike, because boundaries live in the token stream.
+    Faithful to the official Qwen ``_shift_right_ignore_eos``: an EOS terminates the segment it
+    ends, so the next segment starts at the position right after it.
     """
-    if shift == 0:
-        return token_ids
     batch_size, sequence_length = token_ids.shape
     positions = torch.arange(sequence_length, device=token_ids.device, dtype=torch.int64)
     eos_positions = torch.where(token_ids == eos_token_id, positions, -1)
@@ -36,12 +31,63 @@ def shift_right_reset_at_eos(token_ids: Tensor, shift: int, eos_token_id: int) -
     previous_eos = torch.cat(
         [eos_positions.new_full((batch_size, 1), -1), previous_eos_inclusive[:, :-1]], dim=1
     )
-    position_in_segment = positions.unsqueeze(0) - (previous_eos + 1)
+    return previous_eos + 1
+
+
+def segment_starts_from_cu_seqlens(
+    cu_seqlens: Tensor, batch_size: int, sequence_length: int
+) -> Tensor:
+    """Return the first position of the packed document containing each position.
+
+    ``cu_seqlens`` holds the cumulative document lengths of one packed row, so consecutive
+    entries bracket each document. Positions beyond the last boundary belong to the padded
+    tail and are treated as one final segment, which keeps the padded region from pulling
+    context out of the last real document.
+    """
+    if cu_seqlens.ndim != 1:
+        raise ValueError(f"Engram expects a 1-D cu_seqlens, got shape {tuple(cu_seqlens.shape)}.")
+    positions = torch.arange(sequence_length, device=cu_seqlens.device, dtype=torch.int64)
+    boundaries = cu_seqlens.to(device=positions.device, dtype=torch.int64)
+    # For each position, the largest boundary <= position is its document start.
+    index = torch.searchsorted(boundaries, positions, right=True) - 1
+    starts = boundaries.clamp_max(sequence_length).index_select(0, index.clamp_min(0))
+    starts = torch.where(index >= 0, starts, torch.zeros_like(starts))
+    return starts.unsqueeze(0).expand(batch_size, -1)
+
+
+def shift_right_within_segments(
+    token_ids: Tensor, shift: int, fill_token_id: int, segment_starts: Tensor
+) -> Tensor:
+    """Shift tokens right by ``shift`` positions without crossing a document boundary.
+
+    Positions whose shifted source would fall before their own document's first token (or
+    before the row start) yield ``fill_token_id`` instead, so an n-gram window never mixes two
+    documents. With ``segment_starts`` all zero this degenerates to a plain right shift padded
+    at the row start, which is the unpacked convention.
+    """
+    if shift == 0:
+        return token_ids
+    batch_size, sequence_length = token_ids.shape
+    positions = torch.arange(sequence_length, device=token_ids.device, dtype=torch.int64)
+    position_in_segment = positions.unsqueeze(0) - segment_starts
     source_positions = positions - shift
     gather_positions = source_positions.clamp_min(0).unsqueeze(0).expand(batch_size, -1)
     shifted = token_ids.gather(dim=1, index=gather_positions)
     valid = (position_in_segment >= shift) & (source_positions.unsqueeze(0) >= 0)
-    return torch.where(valid, shifted, token_ids.new_full((), eos_token_id))
+    return torch.where(valid, shifted, token_ids.new_full((), fill_token_id))
+
+
+def shift_right_reset_at_eos(token_ids: Tensor, shift: int, eos_token_id: int) -> Tensor:
+    """Shift tokens right by ``shift`` without crossing an EOS document boundary.
+
+    Named after and bit-exact with the official Qwen ``_shift_right_ignore_eos``; kept as the
+    single place that spells out that convention, and checked against the published source by
+    the env-gated reference test.
+    """
+    if shift == 0:
+        return token_ids
+    segment_starts = segment_starts_from_eos(token_ids, eos_token_id)
+    return shift_right_within_segments(token_ids, shift, eos_token_id, segment_starts)
 
 
 def build_ngram_hashes(
@@ -53,6 +99,7 @@ def build_ngram_hashes(
     num_hash_heads: int,
     boundary_token_id: int,
     reset_at_boundary: bool = False,
+    cu_seqlens: Tensor | None = None,
 ) -> Tensor:
     """Compute official multiplicative-XOR multi-head hashes.
 
@@ -67,6 +114,10 @@ def build_ngram_hashes(
         boundary_token_id: Value filling the n-gram window before the start of a document.
         reset_at_boundary: When True, suffix windows reset at every ``boundary_token_id``
             occurrence so n-grams never cross packed document boundaries.
+        cu_seqlens: Cumulative document lengths of a packed (THD) row, or None. When given,
+            suffix windows also reset at each packed document boundary. This is what lets a
+            variant whose windows do not reset on a token value still hash packed rows
+            correctly, and it composes with ``reset_at_boundary`` for variants that do.
 
     Returns:
         Hash IDs with shape ``[batch, sequence, (max_ngram_order - 1) * heads]``.
@@ -77,10 +128,23 @@ def build_ngram_hashes(
         )
     tokens = input_ids.to(torch.int64)
     compressed = tokens if tokenizer_remap is None else compress_token_ids(tokens, tokenizer_remap)
-    sequence_length = compressed.shape[1]
+    batch_size, sequence_length = compressed.shape
+    segment_starts = None
     if reset_at_boundary:
+        segment_starts = segment_starts_from_eos(compressed, boundary_token_id)
+    if cu_seqlens is not None:
+        packed_starts = segment_starts_from_cu_seqlens(cu_seqlens, batch_size, sequence_length)
+        # Both sources are document starts, so the later one wins: a row may be packed *and*
+        # carry EOS boundaries, and either alone must not let a window reach back past it.
+        segment_starts = (
+            packed_starts
+            if segment_starts is None
+            else torch.maximum(segment_starts, packed_starts)
+        )
+
+    if segment_starts is not None:
         suffixes = [
-            shift_right_reset_at_eos(compressed, shift, boundary_token_id)
+            shift_right_within_segments(compressed, shift, boundary_token_id, segment_starts)
             for shift in range(max_ngram_order)
         ]
     else:

@@ -11,6 +11,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.utils import get_pg_rank, get_pg_size, nvtx_range_pop, nvtx_range_push
@@ -115,6 +116,20 @@ class EngramGroupRMSNorm(torch.nn.Module):
         if self.zero_centered:
             gamma = 1.0 + gamma
         return (normed * gamma).type_as(hidden)
+
+
+def _row_cu_seqlens(packed_seq_params: PackedSeqParams | None) -> Tensor | None:
+    """Return the packed document boundaries for this microbatch, or None when unpacked.
+
+    ``get_batch`` keeps ``cu_seqlens`` as ``(1, N)`` for consistency and squeezes it to 1-D
+    before building PackedSeqParams, so accept either and hand back a 1-D tensor.
+    """
+    if packed_seq_params is None:
+        return None
+    cu_seqlens = getattr(packed_seq_params, "cu_seqlens_q", None)
+    if cu_seqlens is None:
+        return None
+    return cu_seqlens.reshape(-1)
 
 
 class Engram(MegatronModule):
@@ -291,8 +306,19 @@ class Engram(MegatronModule):
             .contiguous()
         )
 
-    def forward(self, hidden_states: Tensor, input_ids: Tensor) -> Tensor:
-        """Return an Engram residual with the same standard or mHC layout as input."""
+    def forward(
+        self,
+        hidden_states: Tensor,
+        input_ids: Tensor,
+        packed_seq_params: PackedSeqParams | None = None,
+    ) -> Tensor:
+        """Return an Engram residual with the same standard or mHC layout as input.
+
+        ``packed_seq_params`` carries the packed (THD) document boundaries. It is only used to
+        stop an n-gram window from reaching back into the previous document of the same row;
+        the causal convolution deliberately still mixes across the boundary, matching both
+        published reference implementations.
+        """
         if hidden_states.ndim != 3:
             raise ValueError(f"Engram hidden_states must be [S,B,H], got {hidden_states.shape}.")
         expected_hidden = self.num_streams * self.hidden_size
@@ -313,6 +339,7 @@ class Engram(MegatronModule):
                 num_hash_heads=self.engram_config.num_hash_heads,
                 boundary_token_id=self.engram_config.hash_boundary_token_id,
                 reset_at_boundary=self.engram_config.variant_spec.resets_windows_at_boundary_token,
+                cu_seqlens=_row_cu_seqlens(packed_seq_params),
             )
             hash_ids = slice_hashes_for_sequence_parallel(
                 hash_ids, hidden_states.shape[0], self.tp_group

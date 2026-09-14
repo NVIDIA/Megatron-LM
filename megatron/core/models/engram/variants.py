@@ -41,15 +41,6 @@ class EngramVariant:
     zero_centered_gamma: bool
     boundary_token_flag: str
 
-    @property
-    def supports_packed_sequences(self) -> bool:
-        """Whether packed (THD) rows are meaningful for this variant.
-
-        Packed rows concatenate several documents into one row, so they are only safe when
-        the hash windows reset at the document boundaries inside that row.
-        """
-        return self.resets_windows_at_boundary_token
-
 
 DEEPSEEK_VARIANT = EngramVariant(
     name=DEEPSEEK_VARIANT_NAME,
