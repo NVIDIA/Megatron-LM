@@ -7,7 +7,8 @@ import multiprocessing as mp
 import socket
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
-from typing import List, Optional
+from multiprocessing import connection as mp_connection
+from typing import List, Optional, Tuple
 
 try:
     from hypercorn.asyncio import serve
@@ -58,10 +59,12 @@ async def _run_text_gen_server(
     eval_mode: bool = False,
     block_size_tokens: Optional[int] = None,
     prefix_caching_coordinator_policy: Optional[PrefixCachingCoordinatorPolicy] = None,
+    ready_conn: Optional[mp_connection.Connection] = None,
 ):
     """
     Initializes and runs the async web server. Automatically starts and
     manages its own InferenceClient connected to the provided coordinator address.
+    ``ready_conn`` receives one message once this replica's listener accepts connections.
     """
     if not HAS_BACKEND:
         raise RuntimeError(f"Web backend framework (Quart) not available")
@@ -132,7 +135,13 @@ async def _run_text_gen_server(
 
         # Held for this worker's lifetime; closing it would drop the listener.
         own_socket = _bind_reuseport_socket(server_port, bind_host)
+        # Listen now so connections queue in the kernel from this point on;
+        # hypercorn re-issues listen() on the fd when it starts accepting.
+        own_socket.listen(config.backlog)
         config.bind = [f"fd://{own_socket.fileno()}"]
+        if ready_conn is not None:
+            ready_conn.send(True)
+            ready_conn.close()
 
         with temp_log_level(logging.INFO, logger):
             logger.info(f"Starting text generation server on http://{hostname}:{server_port}")
@@ -172,6 +181,7 @@ def _server_process_worker(
     eval_mode: bool = False,
     block_size_tokens: Optional[int] = None,
     prefix_caching_coordinator_policy: Optional[PrefixCachingCoordinatorPolicy] = None,
+    ready_conn: Optional[mp_connection.Connection] = None,
 ):
     """Synchronous worker function that sets up a new event loop for the separate process."""
     loop = asyncio.new_event_loop()
@@ -194,6 +204,7 @@ def _server_process_worker(
                 eval_mode,
                 block_size_tokens,
                 prefix_caching_coordinator_policy,
+                ready_conn,
             )
         )
     except KeyboardInterrupt:
@@ -258,7 +269,7 @@ def start_text_gen_server(
     block_size_tokens: Optional[int] = None,
     prefix_caching_coordinator_policy: Optional[PrefixCachingCoordinatorPolicy] = None,
 ) -> Optional[str]:
-    """Start the text generation server.
+    """Start the text generation server and wait until every replica is listening.
 
     Every replica binds its own socket on ``server_port`` with SO_REUSEPORT, so
     each gets its own accept queue and the kernel spreads connections across
@@ -284,6 +295,10 @@ def start_text_gen_server(
     Returns:
         The base URL this rank serves on, or None if the server was already
         running.
+
+    Raises:
+        RuntimeError: a replica exited before listening; the whole replica group is
+            terminated first so a retry does not hit the guard.
     """
     global _SERVER_PROCESSES
 
@@ -303,7 +318,9 @@ def start_text_gen_server(
     elif server_port == 0:
         server_port = _reserve_port(hostname)
 
+    replicas = []
     for i in range(num_replicas):
+        ready_reader, ready_writer = mp.Pipe(duplex=False)
         p = mp.Process(
             target=_server_process_worker,
             args=(
@@ -322,17 +339,41 @@ def start_text_gen_server(
                 eval_mode,
                 block_size_tokens,
                 prefix_caching_coordinator_policy,
+                ready_writer,
             ),
             daemon=True,
         )
         p.start()
+        # Drop the parent's copy so a replica that dies before signalling reads as EOF.
+        ready_writer.close()
         _SERVER_PROCESSES.append(p)
+        replicas.append((p, ready_reader))
         logger.info(
             f"Started text gen frontend replica {i+1}/{num_replicas} "
             f"on port {server_port} (PID: {p.pid})"
         )
 
+    _wait_until_listening(replicas)
+
     return f"http://{hostname or socket.gethostname()}:{server_port}"
+
+
+def _wait_until_listening(replicas: List[Tuple[mp.Process, mp_connection.Connection]]) -> None:
+    """Block until every replica has bound and is listening, or fail loudly."""
+    global _SERVER_PROCESSES
+    for p, ready_reader in replicas:
+        ready = mp_connection.wait([ready_reader, p.sentinel])
+        try:
+            listening = ready_reader in ready and ready_reader.recv() is True
+        except EOFError:
+            listening = False
+        finally:
+            ready_reader.close()
+        if listening:
+            continue
+        _terminate(_SERVER_PROCESSES, "Text Gen frontend")
+        _SERVER_PROCESSES = []
+        raise RuntimeError(f"Text gen frontend replica (PID {p.pid}) exited before listening")
 
 
 def _terminate(processes: List[mp.Process], what: str):

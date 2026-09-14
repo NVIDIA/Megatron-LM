@@ -282,6 +282,7 @@ async def run_text_generation_server(
     try:
         url = None
         if getattr(args, 'frontend_on_all_ranks', False) or rank == 0:
+            # Blocks this loop until every replica is listening.
             url = start_text_gen_server(
                 coordinator_addr=coordinator_addr,
                 tokenizer=engine.controller.tokenizer,

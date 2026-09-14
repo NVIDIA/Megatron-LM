@@ -1,6 +1,5 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-import asyncio
 import logging
 
 import httpx
@@ -152,6 +151,7 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
             client = InferenceClient(inference_coordinator_address=dp_addr)
             client.start()
 
+            # Blocks this loop until every replica is listening.
             start_text_gen_server(
                 coordinator_addr=dp_addr,
                 tokenizer=inference_engine.controller.tokenizer,
