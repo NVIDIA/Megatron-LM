@@ -1534,12 +1534,12 @@ def test_async_sched_no_overlap_updates_before_admission(
         "log_probs",
         "copy_log_probs",
         "wait:sample",
-        "wait:log_probs",
-        "materialize_log_probs",
         "update",
         "admit",
         "context_init",
         "forward",
+        "wait:log_probs",
+        "materialize_log_probs",
         "yield",
     ]
     context.resolve_requests.assert_not_called()

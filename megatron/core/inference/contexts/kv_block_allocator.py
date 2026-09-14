@@ -2,6 +2,7 @@
 
 import heapq
 from collections import deque
+from dataclasses import dataclass, field
 from typing import Callable, Dict, NamedTuple, Optional, Sequence, Tuple
 
 import numpy as np
@@ -202,6 +203,91 @@ class PromptLogprobsBlock:
             np.array(self.top_n_logprobs[required], dtype=np.float32, copy=True),
             np.array(self.top_n_token_ids[required], dtype=np.int32, copy=True),
         )
+
+
+@dataclass
+class PromptLogprobsReservation:
+    """A lazy sidecar and allocator identity captured before lifecycle mutation."""
+
+    logical_block_index: int
+    block_id: int
+    key: PromptLogprobsKey
+    expected_mapping: Optional[PromptLogprobsBlock]
+    expected_block_hash: Optional[int]
+    expected_predecessor: Optional["PromptLogprobsReservation"] = field(default=None, repr=False)
+    block: Optional[PromptLogprobsBlock] = None
+
+
+@dataclass
+class PendingPromptLogprobsRow:
+    """One prompt-score row whose value and destination may arrive in either order."""
+
+    reservation: Optional[PromptLogprobsReservation] = None
+    local_position: Optional[int] = None
+    selected_logprobs: Optional[np.ndarray] = None
+    top_n_logprobs: Optional[np.ndarray] = None
+    top_n_token_ids: Optional[np.ndarray] = None
+    values_ready: bool = False
+    committed: bool = False
+    _allocator: Optional["KVBlockAllocator"] = field(default=None, repr=False)
+
+    @property
+    def block(self) -> Optional[PromptLogprobsBlock]:
+        """Return the bound sidecar once one exists."""
+        return self.reservation.block if self.reservation is not None else None
+
+    @property
+    def logical_block_index(self) -> Optional[int]:
+        """Return the bound logical block index."""
+        return self.reservation.logical_block_index if self.reservation is not None else None
+
+    def bind(
+        self,
+        allocator: "KVBlockAllocator",
+        reservation: PromptLogprobsReservation,
+        local_position: int,
+    ) -> None:
+        """Bind the row to its next-chunk sidecar without waiting for its value."""
+        if self.reservation is not None:
+            raise RuntimeError("prompt-logprob row already has a destination")
+        self._allocator = allocator
+        self.reservation = reservation
+        self.local_position = int(local_position)
+        self._commit_if_ready()
+
+    def fill(
+        self,
+        selected_logprobs: np.ndarray,
+        top_n_logprobs: Optional[np.ndarray],
+        top_n_token_ids: Optional[np.ndarray],
+    ) -> None:
+        """Supply the copied score values and commit if the destination is bound."""
+        if self.values_ready:
+            raise RuntimeError("prompt-logprob row values are already available")
+        self.selected_logprobs = np.asarray(selected_logprobs)
+        self.top_n_logprobs = None if top_n_logprobs is None else np.asarray(top_n_logprobs)
+        self.top_n_token_ids = None if top_n_token_ids is None else np.asarray(top_n_token_ids)
+        self.values_ready = True
+        self._commit_if_ready()
+
+    def _commit_if_ready(self) -> None:
+        """Store exactly once after both the copied values and destination exist."""
+        if not self.values_ready or self.reservation is None:
+            return
+        if self.committed:
+            raise RuntimeError("prompt-logprob row was committed more than once")
+        assert self._allocator is not None
+        assert self.local_position is not None
+        assert self.selected_logprobs is not None
+        self._allocator.fill_prompt_logprobs_reservation(
+            self.reservation,
+            target_positions=np.asarray([self.local_position], dtype=np.int32),
+            selected_logprobs=self.selected_logprobs,
+            top_n_logprobs=self.top_n_logprobs,
+            top_n_token_ids=self.top_n_token_ids,
+            publish_unregistered=True,
+        )
+        self.committed = True
 
 
 class KVBlockAllocator:
@@ -866,24 +952,120 @@ class KVBlockAllocator:
         Only the latest settings variant is discoverable. Existing strong
         references remain valid when a new variant replaces the mapping.
         """
+        reservation = self.reserve_prompt_logprobs(
+            logical_block_index=logical_block_index,
+            block_id=block_id,
+            key=key,
+            expected_block_hash=expected_block_hash,
+            block=block,
+        )
+        entry = self.fill_prompt_logprobs_reservation(
+            reservation,
+            target_positions=target_positions,
+            selected_logprobs=selected_logprobs,
+            top_n_logprobs=top_n_logprobs,
+            top_n_token_ids=top_n_token_ids,
+            publish_unregistered=True,
+        )
+        # This synchronous path does not cross a lifecycle mutation, so the
+        # validated destination is still current even when no hash was supplied.
+        self.block_prompt_logprobs[block_id] = entry
+        return entry
+
+    def reserve_prompt_logprobs(
+        self,
+        logical_block_index: int,
+        block_id: int,
+        key: PromptLogprobsKey,
+        expected_block_hash: Optional[int] = None,
+        block: Optional[PromptLogprobsBlock] = None,
+        expected_predecessor: Optional[PromptLogprobsReservation] = None,
+    ) -> PromptLogprobsReservation:
+        """Capture a sidecar destination without allocating, publishing, or pinning it."""
         logical_block_index = int(logical_block_index)
         if logical_block_index < 0:
             raise ValueError("logical_block_index must be non-negative")
         block_id = self._validate_prompt_logprobs_block_id(block_id)
         self._validate_prompt_logprobs_hash(block_id, expected_block_hash)
+        current = self.block_prompt_logprobs.get(block_id)
+        if expected_predecessor is not None and (
+            expected_predecessor.block_id != block_id
+            or expected_predecessor.expected_mapping is not current
+        ):
+            raise ValueError("prompt-logprob predecessor does not share the reserved identity")
         if block is not None:
             if block.block_id != block_id or not block.matches(logical_block_index, key):
-                raise ValueError("prompt-logprob block reference does not match the store target")
+                raise ValueError("prompt-logprob block reference does not match the reserve target")
             entry = block
+        elif current is not None and current.matches(logical_block_index, key):
+            entry = current
         else:
-            entry = self.block_prompt_logprobs.get(block_id)
-        if entry is None or not entry.matches(logical_block_index, key):
-            entry = PromptLogprobsBlock(
-                self.context.block_size_tokens, logical_block_index, key, block_id
-            )
+            entry = None
+        return PromptLogprobsReservation(
+            logical_block_index=logical_block_index,
+            block_id=block_id,
+            key=key,
+            expected_mapping=current,
+            expected_block_hash=expected_block_hash,
+            expected_predecessor=expected_predecessor,
+            block=entry,
+        )
 
-        self.block_prompt_logprobs[block_id] = entry
+    def fill_prompt_logprobs_reservation(
+        self,
+        reservation: PromptLogprobsReservation,
+        target_positions: np.ndarray,
+        selected_logprobs: np.ndarray,
+        top_n_logprobs: Optional[np.ndarray] = None,
+        top_n_token_ids: Optional[np.ndarray] = None,
+        *,
+        publish_unregistered: bool = False,
+    ) -> PromptLogprobsBlock:
+        """Fill a reserved sidecar and publish it only if its captured identity is still live."""
+        entry = reservation.block
+        if entry is None:
+            entry = PromptLogprobsBlock(
+                self.context.block_size_tokens,
+                reservation.logical_block_index,
+                reservation.key,
+                reservation.block_id,
+            )
+            reservation.block = entry
         entry.store(target_positions, selected_logprobs, top_n_logprobs, top_n_token_ids)
+
+        return self.publish_prompt_logprobs_reservation(
+            reservation, publish_unregistered=publish_unregistered
+        )
+
+    def publish_prompt_logprobs_reservation(
+        self, reservation: PromptLogprobsReservation, *, publish_unregistered: bool = False
+    ) -> PromptLogprobsBlock:
+        """Publish a filled or retained sidecar if its reserved KV identity is still live."""
+        entry = reservation.block
+        if entry is None:
+            raise RuntimeError("cannot publish an unmaterialized prompt-logprob reservation")
+
+        actual_hash = (
+            int(self.block_hashes[reservation.block_id]) if self.enable_prefix_caching else -1
+        )
+        hash_matches = reservation.expected_block_hash is not None and actual_hash == int(
+            reservation.expected_block_hash
+        )
+        if publish_unregistered and actual_hash == -1:
+            hash_matches = True
+        current = self.block_prompt_logprobs.get(reservation.block_id)
+        predecessor_mapping = (
+            reservation.expected_predecessor.block
+            if reservation.expected_predecessor is not None
+            else None
+        )
+        mapping_matches = (
+            current is reservation.expected_mapping
+            or current is entry
+            or (predecessor_mapping is not None and current is predecessor_mapping)
+        )
+        if hash_matches and mapping_matches:
+            self.block_prompt_logprobs[reservation.block_id] = entry
         return entry
 
     def get_prompt_logprobs_block(

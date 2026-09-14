@@ -36,6 +36,7 @@ from megatron.core.inference.contexts.dynamic_context import (
 )
 from megatron.core.inference.contexts.kv_block_allocator import (
     MAX_CACHED_PROMPT_TOP_N_LOGPROBS,
+    PendingPromptLogprobsRow,
     PromptLogprobsBlock,
     PromptLogprobsKey,
 )
@@ -2093,11 +2094,13 @@ class DynamicInferenceEngine(AbstractEngine):
             entry = self.requests[request_id]
             blocks = update.get("blocks", {})
             entry.prompt_logprob_blocks.update(blocks)
-            entry.prompt_logprobs_complete = bool(update.get("complete", False))
-            if blocks and not entry.prompt_logprobs_complete:
+            final_prefill = bool(update.get("complete", False))
+            entry.prompt_logprobs_complete = final_prefill and bool(update.get("filled", True))
+            if blocks and not final_prefill:
                 self.context.prompt_logprobs_matched_refs.setdefault(request_id, {}).update(blocks)
             pending_row = update.pop("pending_row", None)
             if pending_row is not None:
+                assert isinstance(pending_row, PendingPromptLogprobsRow)
                 request = entry.record[-1]
                 assert (
                     getattr(request, "_pending_prompt_logprob_row", None) is None
@@ -2119,6 +2122,8 @@ class DynamicInferenceEngine(AbstractEngine):
         pending_row = getattr(request, "_pending_prompt_logprob_row", None)
         if pending_row is None:
             return
+        if not isinstance(pending_row, PendingPromptLogprobsRow):
+            raise TypeError(f"unexpected prompt-logprob row type: {type(pending_row).__name__}")
 
         target_position = request.finished_chunk_token_count
         logical_block_index, local_position = divmod(
@@ -2133,25 +2138,34 @@ class DynamicInferenceEngine(AbstractEngine):
             if logical_block_index < len(request.precomputed_block_hashes)
             else None
         )
-        selected_logprobs, top_n_logprobs, top_n_token_ids = pending_row
         entry = self.requests[request.request_id]
         active_refs = self.context.prompt_logprobs_matched_refs.setdefault(request.request_id, {})
         block_ref = entry.prompt_logprob_blocks.get(logical_block_index)
         if block_ref is None:
             block_ref = active_refs.get(logical_block_index)
-        block_ref = self.context.kv_block_allocator.store_prompt_logprobs(
-            logical_block_index=logical_block_index,
-            block_id=block_id,
-            key=request._prompt_logprobs_cache_key,
-            target_positions=[local_position],
-            selected_logprobs=selected_logprobs,
-            top_n_logprobs=top_n_logprobs,
-            top_n_token_ids=top_n_token_ids,
-            expected_block_hash=expected_block_hash,
-            block=block_ref,
-        )
-        active_refs[logical_block_index] = block_ref
-        entry.prompt_logprob_blocks[logical_block_index] = block_ref
+        allocator = self.context.kv_block_allocator
+        reservation = pending_row.reservation
+        if reservation is None:
+            reservation = allocator.reserve_prompt_logprobs(
+                logical_block_index=logical_block_index,
+                block_id=block_id,
+                key=request._prompt_logprobs_cache_key,
+                expected_block_hash=expected_block_hash,
+                block=block_ref,
+            )
+            pending_row.bind(allocator, reservation, local_position)
+        elif (
+            reservation.logical_block_index != logical_block_index
+            or reservation.block_id != block_id
+            or reservation.key != request._prompt_logprobs_cache_key
+            or reservation.expected_block_hash != expected_block_hash
+            or pending_row.local_position != local_position
+        ):
+            raise RuntimeError("prompt-logprob row destination changed during continuation")
+        block_ref = pending_row.block
+        if block_ref is not None:
+            active_refs[logical_block_index] = block_ref
+            entry.prompt_logprob_blocks[logical_block_index] = block_ref
         del request._pending_prompt_logprob_row
 
     def post_process_requests(
