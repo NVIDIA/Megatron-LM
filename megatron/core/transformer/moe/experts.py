@@ -62,7 +62,11 @@ from megatron.core.utils import is_te_min_version
 if HAVE_TE:
     import transformer_engine as te
 
-    from megatron.core.extensions.transformer_engine import Fp8Padding, Fp8Unpadding
+    from megatron.core.extensions.transformer_engine import (
+        Fp8Padding,
+        Fp8Unpadding,
+        _get_fp8_autocast_for_quant_params,
+    )
 
     try:
         from transformer_engine.pytorch.ops.basic.grouped_linear import (
@@ -365,6 +369,21 @@ class TEGroupedMLP(MegatronModule):
                 "Virtual-expert weights must be bound before the first expert forward."
             )
         self._virtual_experts = load_balancer
+
+    def _virtual_expert_linear_forward(self, index, hidden_states, tokens_per_expert):
+        """Execute runtime expert weights while retaining the unfused layer's precision policy.
+
+        BF16 overrides must keep the original activation and recompute path. Only their grouped
+        linears use the runtime parameters; each linear enters its original quantization context.
+        """
+        if self._fused_ops is None:
+            self._fused_ops = (self._make_fused_ops(),)
+        if index == 0:
+            self._virtual_experts.prepare_expert_forward()
+        linear = self.linear_fc1 if index == 0 else self.linear_fc2
+        op = self._fused_ops[0][0 if index == 0 else -1]
+        with _get_fp8_autocast_for_quant_params(linear.te_quant_params, linear.training):
+            return op(hidden_states, tokens_per_expert), None
 
     @staticmethod
     def _apply_packed_bias(intermediate_parallel, packed_bias, tokens_per_expert, permuted_probs):
@@ -1003,9 +1022,14 @@ class TEGroupedMLP(MegatronModule):
             self.offload_expert_fc1, permuted_local_hidden_states, "expert_fc1"
         )
         with expert_fc1_manager as permuted_local_hidden_states:
-            fc1_output, bias_parallel = apply_module(self.linear_fc1)(
-                permuted_local_hidden_states, tokens_per_expert
-            )
+            if self._virtual_experts is not None:
+                fc1_output, bias_parallel = self._virtual_expert_linear_forward(
+                    0, permuted_local_hidden_states, tokens_per_expert
+                )
+            else:
+                fc1_output, bias_parallel = apply_module(self.linear_fc1)(
+                    permuted_local_hidden_states, tokens_per_expert
+                )
         fc1_output = expert_fc1_manager.group_offload(
             fc1_output,
             forced_released_tensors=[permuted_local_hidden_states],
@@ -1116,7 +1140,12 @@ class TEGroupedMLP(MegatronModule):
         else:
             with moe_act_manager as fc1_output:
                 bias_act_output = bias_act_func(fc1_output, bias_parallel, permuted_probs)
-        output, output_bias = apply_module(self.linear_fc2)(bias_act_output, tokens_per_expert)
+        if self._virtual_experts is not None:
+            output, output_bias = self._virtual_expert_linear_forward(
+                1, bias_act_output, tokens_per_expert
+            )
+        else:
+            output, output_bias = apply_module(self.linear_fc2)(bias_act_output, tokens_per_expert)
         if self.activation_recompute:
             self.activation_checkpoint.discard_output_and_register_recompute(output)
 

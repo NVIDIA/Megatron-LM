@@ -340,8 +340,8 @@ def test_virtual_expert_training_lifetime(monkeypatch, mxfp8):
                 for table, rows in tables.values()
             )
             current += (
-                _VirtualExperts.weight_arena.data_ptr(),
-                _VirtualExperts.grad_arena.data_ptr(),
+                managers[0].virtual_experts.storage.weight_arena.data_ptr(),
+                managers[0].virtual_experts.storage.grad_arena.data_ptr(),
             )
             if step >= 2:
                 assert len(current) == 3 * 2 * config.num_layers + 2  # tables and arenas
@@ -355,16 +355,16 @@ def test_virtual_expert_training_lifetime(monkeypatch, mxfp8):
         windows = [
             StorageWeakRef(t.untyped_storage())
             for t in (
-                _VirtualExperts.weight_arena,
-                _VirtualExperts.grad_arena,
+                managers[0].virtual_experts.storage.weight_arena,
+                managers[0].virtual_experts.storage.grad_arena,
                 planner.gathered_counts,
             )
         ]
         handles = [
             weakref.ref(handle)
             for handle in (
-                _VirtualExperts.weight_handle,
-                _VirtualExperts.grad_handle,
+                managers[0].virtual_experts.storage.weight_handle,
+                managers[0].virtual_experts.storage.grad_handle,
                 planner.histogram_handle,
             )
         ]
