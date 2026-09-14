@@ -535,10 +535,82 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         if in_inference_mode:
             assert runtime_gather_output, "Inference must always gather TP logits"
 
+        decoder_input, rotary_pos_emb, _, _, _, padding_mask = self._preprocess(
+            input_ids,
+            position_ids,
+            decoder_input,
+            inference_context=inference_context,
+            packed_seq_params=packed_seq_params,
+            padding_mask=padding_mask,
+        )
+
+        # Wrap decoder_input to allow the decoder (HybridStack) to delete the
+        # reference held by this caller function, enabling early garbage collection
+        # for inference.
+        if in_inference_mode:
+            decoder_input = WrappedTensor(decoder_input)
+
+        # The following assert will currently fail when running inference.
+        # Commented out for now.
+        # TODO (duncan/rwaleffe): (1) confirm that the externally-generated
+        #   attention mask is not needed and is ignored by the model in
+        #   inference mode, (2) reduce the size of the externally-generated
+        #   attention mask to prevent CPU OOM (as we did for training), (3)
+        #   force the attention mask passed to the model in inference mode to
+        #   be None, so this assert will succeed.
+        # assert attention_mask is None, "The attention mask is ignored and should be set to None"
+
+        # Pass input_ids to decoder for hash-based MoE routing.
+        decoder_extra_block_kwargs = {}
+        if self.config.moe_n_hash_layers > 0 and input_ids is not None:
+            decoder_extra_block_kwargs['input_ids'] = input_ids
+
+        # Run decoder.
+        decoder_output = self.decoder(
+            hidden_states=decoder_input,
+            attention_mask=attention_mask,
+            inference_context=inference_context,
+            rotary_pos_emb=rotary_pos_emb,
+            packed_seq_params=packed_seq_params,
+            padding_mask=padding_mask,
+            **decoder_extra_block_kwargs,
+        )
+        return self._postprocess(
+            decoder_output,
+            input_ids=input_ids,
+            position_ids=position_ids,
+            labels=labels,
+            attention_mask=attention_mask,
+            inference_context=inference_context,
+            inference_params=inference_params,
+            rotary_pos_emb=rotary_pos_emb,
+            packed_seq_params=packed_seq_params,
+            loss_mask=loss_mask,
+            padding_mask=padding_mask,
+            runtime_gather_output=runtime_gather_output,
+        )
+
+    def _preprocess(
+        self,
+        input_ids,
+        position_ids,
+        decoder_input=None,
+        *,
+        inference_context=None,
+        packed_seq_params=None,
+        padding_mask=None,
+    ):
+        """Shared embedding/RoPE preparation for ordinary and scheduled forwards."""
+        in_inference_mode = InferenceMode.is_active()
         # Decoder embedding.
         if decoder_input is not None:
             pass
         elif self.pre_process:
+            if padding_mask is not None:
+                assert padding_mask.shape == input_ids.shape, (
+                    f"padding_mask shape {padding_mask.shape} does not match "
+                    f"input_ids shape {input_ids.shape}"
+                )
             decoder_input = self.embedding(input_ids=input_ids, position_ids=position_ids)
 
             # Clear the outputs for padding tokens when using dynamic batching with
@@ -556,6 +628,14 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 # (e.g. VLM LMs); scatter here so a standalone LM forward isn't double-gathered.
                 decoder_input = tensor_parallel.scatter_to_sequence_parallel_region(
                     decoder_input, group=self.pg_collection.tp
+                )
+            if padding_mask is not None and self.config.sequence_parallel:
+                padding_mask = (
+                    tensor_parallel.scatter_to_sequence_parallel_region(
+                        padding_mask.transpose(0, 1).contiguous(), group=self.pg_collection.tp
+                    )
+                    .transpose(0, 1)
+                    .contiguous()
                 )
         else:
             # intermediate stage of pipeline
@@ -609,37 +689,26 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                     "MultimodalRotaryEmbedding yet."
                 )
 
-        # Wrap decoder_input to allow the decoder (HybridStack) to delete the
-        # reference held by this caller function, enabling early garbage collection
-        # for inference.
-        if in_inference_mode:
-            decoder_input = WrappedTensor(decoder_input)
+        return decoder_input, rotary_pos_emb, None, None, None, padding_mask
 
-        # The following assert will currently fail when running inference.
-        # Commented out for now.
-        # TODO (duncan/rwaleffe): (1) confirm that the externally-generated
-        #   attention mask is not needed and is ignored by the model in
-        #   inference mode, (2) reduce the size of the externally-generated
-        #   attention mask to prevent CPU OOM (as we did for training), (3)
-        #   force the attention mask passed to the model in inference mode to
-        #   be None, so this assert will succeed.
-        # assert attention_mask is None, "The attention mask is ignored and should be set to None"
-
-        # Pass input_ids to decoder for hash-based MoE routing.
-        decoder_extra_block_kwargs = {}
-        if self.config.moe_n_hash_layers > 0 and input_ids is not None:
-            decoder_extra_block_kwargs['input_ids'] = input_ids
-
-        # Run decoder.
-        decoder_output = self.decoder(
-            hidden_states=decoder_input,
-            attention_mask=attention_mask,
-            inference_context=inference_context,
-            rotary_pos_emb=rotary_pos_emb,
-            packed_seq_params=packed_seq_params,
-            padding_mask=padding_mask,
-            **decoder_extra_block_kwargs,
-        )
+    def _postprocess(
+        self,
+        decoder_output,
+        *,
+        input_ids=None,
+        position_ids=None,
+        labels=None,
+        attention_mask=None,
+        inference_context=None,
+        inference_params=None,
+        rotary_pos_emb=None,
+        packed_seq_params=None,
+        loss_mask=None,
+        padding_mask=None,
+        runtime_gather_output=None,
+    ):
+        """Shared output processing; scheduled training uses the same loss path."""
+        in_inference_mode = InferenceMode.is_active()
         # HybridStack.forward returns a single Tensor in the common case, but a 2-tuple
         # (hidden_states, mhc_multistream) in exactly one case: enable_hyper_connections and
         # post_process and mtp_num_layers > 0 and not is_mtp_layer — where MTP's mHC branch
@@ -780,3 +849,31 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         loss = self.compute_language_model_loss(labels, logits)
 
         return loss
+
+    def build_schedule_plan(
+        self,
+        input_ids,
+        position_ids,
+        attention_mask,
+        decoder_input=None,
+        labels=None,
+        packed_seq_params=None,
+        runtime_gather_output=None,
+        loss_mask=None,
+        padding_mask=None,
+    ):
+        """Build the DSv4 HybridModel computation plan for EP 1F1B overlap."""
+        from megatron.core.models.hybrid.fine_grained_callables import HybridModelChunkSchedulePlan
+
+        return HybridModelChunkSchedulePlan(
+            self,
+            input_ids,
+            position_ids,
+            attention_mask,
+            decoder_input,
+            labels,
+            packed_seq_params,
+            runtime_gather_output=runtime_gather_output,
+            loss_mask=loss_mask,
+            padding_mask=padding_mask,
+        )

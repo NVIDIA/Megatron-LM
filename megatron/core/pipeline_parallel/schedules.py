@@ -19,6 +19,7 @@ from megatron.core.pipeline_parallel.utils import (
     is_pp_last_stage,
     is_vp_first_stage,
     is_vp_last_stage,
+    set_streams,
 )
 from megatron.core.process_groups_config import (
     MultiModuleProcessGroupCollection,
@@ -39,6 +40,7 @@ from megatron.core.utils import (
 from .combined_1f1b import (
     combined_1f1b_schedule_for_interleaved_pipelining,
     combined_1f1b_schedule_for_no_pipelining,
+    combined_forward_backward_step,
 )
 
 # Types
@@ -904,6 +906,8 @@ def get_pp_rank_microbatches(
         if virtual_pipeline_parallel_size is None:
             # forward_backward_pipelining_without_interleaving
             num_warmup_microbatches = pipeline_parallel_size - pipeline_parallel_rank - 1
+            if overlap_moe_expert_parallel_comm:
+                num_warmup_microbatches += 1
         else:
             # forward_backward_pipelining_with_interleaving
             # Run (num_model_chunks-1)*microbatch_group_size_per_vp_stage on
@@ -919,8 +923,9 @@ def get_pp_rank_microbatches(
                 num_warmup_microbatches = num_warmup_microbatches + 1
     else:
         # forward_backward_no_pipelining
-        # This path is only used for cuda graph capturing compatibility for the PP=1 case.
-        num_warmup_microbatches = 0
+        # EP overlap retains the first forward before co-scheduling the next
+        # forward with its backward, even without pipeline parallelism.
+        num_warmup_microbatches = int(overlap_moe_expert_parallel_comm)
 
     if num_warmup_microbatches >= total_num_microbatches:
         num_warmup_microbatches = total_num_microbatches
@@ -1743,7 +1748,7 @@ def forward_backward_pipelining_with_interleaving(
                 recv_next = True
                 if is_pp_last_stage(p2p_communicator.pp_group):
                     recv_next = False
-                (input_tensor, output_tensor_grad) = (
+                input_tensor, output_tensor_grad = (
                     p2p_communicator.send_forward_backward_recv_forward_backward(
                         output_tensor,
                         input_tensor_grad,
@@ -1807,7 +1812,7 @@ def forward_backward_pipelining_with_interleaving(
                 if is_pp_last_stage(p2p_communicator.pp_group):
                     recv_next = False
 
-                (bwd_recv_buffer[-1], bwd_wait_handles) = (
+                bwd_recv_buffer[-1], bwd_wait_handles = (
                     p2p_communicator.send_backward_recv_backward(
                         input_tensor_grad,
                         recv_next=recv_next,
@@ -1960,7 +1965,7 @@ def forward_backward_pipelining_with_interleaving(
                     backward_k, forward=False
                 )
 
-                (bwd_recv_buffer[backward_k % bwd_recv_buffer_size], bwd_wait_handles) = (
+                bwd_recv_buffer[backward_k % bwd_recv_buffer_size], bwd_wait_handles = (
                     p2p_communicator.send_backward_recv_backward(
                         input_tensor_grad,
                         recv_next=recv_next,
@@ -2033,7 +2038,7 @@ def forward_backward_pipelining_with_interleaving(
                 recv_prev = False
 
             # Communicate tensors.
-            (input_tensor, output_tensor_grad) = (
+            input_tensor, output_tensor_grad = (
                 p2p_communicator.send_forward_backward_recv_forward_backward(
                     output_tensor,
                     input_tensor_grad,
@@ -2413,8 +2418,21 @@ def forward_backward_pipelining_without_interleaving(
 
     disable_grad_sync()
 
-    # Compute number of warmup microbatches.
+    overlap_ep = config.overlap_moe_expert_parallel_comm and not forward_only
+    fsdp_wrapper = None
+    if overlap_ep:
+        assert not is_multimodule, "EP overlap requires a single-module pipeline"
+        from megatron.core.distributed.fsdp.src.megatron_fsdp.utils import find_megatron_fsdp
+
+        set_streams(high_priority=config.high_priority_a2a_comm_stream)
+        fsdp_wrapper = find_megatron_fsdp(model)
+        if fsdp_wrapper is not None:
+            fsdp_wrapper._replace_param_with_raw_if_needed()
+
+    # EP overlap needs one additional forward so each paired backward belongs
+    # to an older microbatch, including on the last pipeline rank.
     num_warmup_microbatches = p2p_communicator.total_stages - p2p_communicator.current_stage - 1
+    num_warmup_microbatches += int(overlap_ep)
     num_warmup_microbatches = min(num_warmup_microbatches, num_microbatches)
     num_microbatches_remaining = num_microbatches - num_warmup_microbatches
 
@@ -2474,6 +2492,66 @@ def forward_backward_pipelining_without_interleaving(
         output_tensors = []
     forward_data_store = []
 
+    def run_forward(input_tensor, microbatch, checkpoint_activations_microbatch):
+        """Run a warmup/evaluation forward using this schedule's process groups."""
+        is_first_microbatch = check_first_val_step(first_val_step, forward_only, microbatch == 0)
+        if overlap_ep:
+            output, num_tokens, _ = combined_forward_backward_step(
+                forward_step_func,
+                data_iterator,
+                model,
+                num_microbatches,
+                input_tensor,
+                forward_data_store,
+                None,
+                None,
+                None,
+                None,
+                config,
+                collect_non_loss_data=collect_non_loss_data,
+                checkpoint_activations_microbatch=checkpoint_activations_microbatch,
+                is_first_microbatch=is_first_microbatch,
+                current_microbatch=microbatch,
+                cp_group_size=cp_size,
+                is_last_stage=p2p_communicator.is_pp_last_stage,
+            )
+            return output, num_tokens
+        return forward_step(
+            forward_step_func,
+            data_iterator,
+            model,
+            num_microbatches,
+            input_tensor,
+            forward_data_store,
+            config,
+            cp_group_size=cp_size,
+            collect_non_loss_data=collect_non_loss_data,
+            checkpoint_activations_microbatch=checkpoint_activations_microbatch,
+            is_first_microbatch=is_first_microbatch,
+            current_microbatch=microbatch,
+            is_last_stage=p2p_communicator.is_pp_last_stage,
+        )
+
+    if overlap_ep:
+
+        def backward_func(input_tensor, output_tensor, output_tensor_grad, config):
+            """Drain a retained schedule plan in the pipeline cooldown."""
+            _, _, input_tensor_grad = combined_forward_backward_step(
+                forward_step_func,
+                None,
+                None,
+                num_microbatches,
+                None,
+                forward_data_store,
+                model,
+                input_tensor,
+                output_tensor,
+                output_tensor_grad,
+                config,
+                fsdp_wrapper=fsdp_wrapper,
+            )
+            return input_tensor_grad
+
     # Run warmup forward passes.
     for i in range(num_warmup_microbatches):
         # Decide to checkpoint all layers' activations of the current micro-batch
@@ -2488,21 +2566,7 @@ def forward_backward_pipelining_without_interleaving(
         input_tensor = p2p_communicator.recv_forward(
             recv_tensor_shapes, p2p_communicator.is_pp_first_stage
         )
-        output_tensor, num_tokens = forward_step(
-            forward_step_func,
-            data_iterator,
-            model,
-            num_microbatches,
-            input_tensor,
-            forward_data_store,
-            config,
-            cp_group_size=cp_size,
-            collect_non_loss_data=collect_non_loss_data,
-            checkpoint_activations_microbatch=checkpoint_activations_microbatch,
-            is_first_microbatch=check_first_val_step(first_val_step, forward_only, i == 0),
-            current_microbatch=i,
-            is_last_stage=p2p_communicator.is_pp_last_stage,
-        )
+        output_tensor, num_tokens = run_forward(input_tensor, i, checkpoint_activations_microbatch)
         p2p_communicator.send_forward(output_tensor, p2p_communicator.is_pp_last_stage)
         total_num_tokens += num_tokens
 
@@ -2531,22 +2595,61 @@ def forward_backward_pipelining_without_interleaving(
         else:
             checkpoint_activations_microbatch = None
 
-        output_tensor, num_tokens = forward_step(
-            forward_step_func,
-            data_iterator,
-            model,
-            num_microbatches,
-            input_tensor,
-            forward_data_store,
-            config,
-            cp_group_size=cp_size,
-            collect_non_loss_data=collect_non_loss_data,
-            checkpoint_activations_microbatch=checkpoint_activations_microbatch,
-            is_first_microbatch=check_first_val_step(
-                first_val_step, forward_only, (i == 0) and (num_warmup_microbatches == 0)
-            ),
-            current_microbatch=i + num_warmup_microbatches,
-            is_last_stage=p2p_communicator.is_pp_last_stage,
+        if overlap_ep:
+            # Receive the oldest gradient before co-scheduling it with the new
+            # forward. The extra warmup provides this gradient without waiting
+            # for the new forward's send, avoiding a circular P2P dependency.
+            output_tensor_grad = p2p_communicator.recv_backward(
+                send_tensor_shapes, p2p_communicator.is_pp_last_stage
+            )
+            output_tensor, num_tokens, input_tensor_grad = combined_forward_backward_step(
+                forward_step_func,
+                data_iterator,
+                model,
+                num_microbatches,
+                input_tensor,
+                forward_data_store,
+                model,
+                input_tensors.pop(0),
+                output_tensors.pop(0),
+                output_tensor_grad,
+                config,
+                collect_non_loss_data=collect_non_loss_data,
+                checkpoint_activations_microbatch=checkpoint_activations_microbatch,
+                current_microbatch=i + num_warmup_microbatches,
+                fsdp_wrapper=fsdp_wrapper,
+                cp_group_size=cp_size,
+                is_last_stage=p2p_communicator.is_pp_last_stage,
+            )
+            total_num_tokens += num_tokens
+            input_tensors.append(input_tensor)
+            output_tensors.append(output_tensor)
+            p2p_communicator.send_forward(output_tensor, p2p_communicator.is_pp_last_stage)
+            deallocate_output_tensor(output_tensor, config.deallocate_pipeline_outputs)
+            if last_iteration:
+                input_tensor = None
+                p2p_communicator.send_backward(
+                    input_tensor_grad, p2p_communicator.is_pp_first_stage
+                )
+            elif config.variable_seq_lengths or config.mtp_standalone:
+                # Shape negotiation completes before either payload is sent.
+                # The upstream rank needs this gradient payload to compute the
+                # next forward, so waiting for its forward shape in a combined
+                # exchange would deadlock. Finish the backward send first.
+                p2p_communicator.send_backward(
+                    input_tensor_grad, p2p_communicator.is_pp_first_stage
+                )
+                input_tensor = p2p_communicator.recv_forward(
+                    recv_tensor_shapes, p2p_communicator.is_pp_first_stage
+                )
+            else:
+                input_tensor = p2p_communicator.send_backward_recv_forward(
+                    input_tensor_grad, recv_tensor_shapes, p2p_communicator.is_pp_first_stage
+                )
+            continue
+
+        output_tensor, num_tokens = run_forward(
+            input_tensor, i + num_warmup_microbatches, checkpoint_activations_microbatch
         )
         total_num_tokens += num_tokens
 

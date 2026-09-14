@@ -22,6 +22,7 @@ Public API (same shape as the old ``dsa_kernels`` package):
 
 from __future__ import annotations
 
+import logging
 import warnings
 from dataclasses import dataclass
 from functools import lru_cache
@@ -43,6 +44,10 @@ from megatron.core.quantization.indexer_quantization import (
     refresh_indexer_mxfp8_scale_cu_seqlens,
 )
 from megatron.core.tensor_parallel.mappings import async_reduce_scatter_along_first_dim
+from megatron.core.transformer.experimental_attention_variant.dsa_fused_safety import (
+    FUSED_INDEXER_MAX_SAFE_ROWS,
+    warn_fused_indexer_row_limit_once,
+)
 from megatron.core.utils import nvtx_range_pop, nvtx_range_push
 
 from . import csa_indexer_loss_kernels, thd_indexer_kernels, thd_layout_kernels
@@ -1525,6 +1530,10 @@ def csa_sparse_attn(
 # ---------------------------------------------------------------------------
 
 
+# The balanced CP path fails closed above the shared limit before reaching this
+# compatibility warning; see cp_utils.compute_cp_indexer_topk.
+
+
 def _indexer_topk_core(
     q: Tensor,
     k: Tensor,
@@ -1800,6 +1809,12 @@ def _indexer_topk_core(
         )
         if q_causal_offsets is not None:
             forward_kwargs["q_causal_offsets"] = q_causal_offsets
+        total_q_rows = int(q.shape[0])
+        if total_q_rows > FUSED_INDEXER_MAX_SAFE_ROWS:
+            # Warn only after validation and backend resolution, immediately before
+            # an affected fused invocation. Invalid/no-op calls must not consume the
+            # process-wide warning or imply that the kernel actually ran.
+            warn_fused_indexer_row_limit_once(total_q_rows, logger=logging.getLogger(__name__))
         scores = _DSA.indexer_forward_wrapper(q, k.unsqueeze(1), w, ratio=ratio, **forward_kwargs)[
             "scores"
         ]  # (total_q, max_seqlen_kv) fp32, -inf on masked positions
@@ -1813,6 +1828,9 @@ def _indexer_topk_core(
         )
     else:
         # Kernel wants k as 4-D ``(b, sk, h_kv, idx_hd)``.
+        total_q_rows = int(q.shape[0] * q.shape[1])
+        if total_q_rows > FUSED_INDEXER_MAX_SAFE_ROWS:
+            warn_fused_indexer_row_limit_once(total_q_rows, logger=logging.getLogger(__name__))
         scores = _DSA.indexer_forward_wrapper(q, k.unsqueeze(2), w, ratio=ratio)[
             "scores"
         ]  # (b, sq, sk) fp32, -inf on masked positions
@@ -1870,6 +1888,7 @@ def indexer_topk(
     q_causal_offsets: Optional[Tensor] = None,
     compact_workspace: BSHDCompactIndexerWorkspace | THDCompactIndexerWorkspace | None = None,
     precision: str = "bf16",
+    use_compact: bool = True,
     deterministic: bool = False,
     return_softmax: bool = False,
 ) -> Tuple[Tensor, Tensor] | Tuple[Tensor, Tensor, Optional[Tensor]]:
@@ -1900,6 +1919,9 @@ def indexer_topk(
             storage prepared during eager warmup. Candidate scratch and compact
             outputs are allocated by each dispatch. A matching workspace is
             required while capturing the compact path.
+        use_compact: select the compact forward plus Top-K backend when
+            available. False retains dense scoring for the balanced indexer's
+            existing unpadded synthetic layouts.
         deterministic: resolve exact-value ties at the K-th boundary toward
             the smallest local KV indices. The output slot order remains
             unspecified.
@@ -1948,7 +1970,7 @@ def indexer_topk(
         max_seqlen_q=int(max_seqlen_q) if max_seqlen_q is not None else None,
         max_seqlen_kv=int(max_seqlen_kv) if max_seqlen_kv is not None else None,
         q_causal_offsets=q_causal_offsets,
-        use_compact=True,
+        use_compact=use_compact,
         return_softmax=return_softmax,
         compact_workspace=compact_workspace,
         precision=precision,

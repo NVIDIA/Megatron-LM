@@ -1298,6 +1298,14 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 static_inputs["cu_seqlens_kv"] = cu_seqlens.clone()
                 static_inputs["cu_seqlens_q_padded"] = cu_seqlens.clone()
                 static_inputs["cu_seqlens_kv_padded"] = cu_seqlens.clone()
+                if self._uses_graph_dynamic_dsa_route():
+                    from megatron.core.transformer.experimental_attention_variant import (
+                        cp_balanced_indexer,
+                    )
+
+                    cp_balanced_indexer.add_graph_dynamic_plan_static_inputs(
+                        static_inputs, cu_seqlens, self.pg_collection.cp, max_T
+                    )
 
             slen_for_mask = self.config.max_seqlen_per_dp_cp_rank
             if self.config.sequence_parallel:
@@ -1347,6 +1355,23 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             )
         return static_inputs
 
+    def _uses_graph_dynamic_dsa_route(self):
+        """Whether this layer's captured attention consumes the opt-in route inputs."""
+        core_attention = getattr(self.self_attention, "core_attention", None)
+        has_dsa_indexer = (
+            getattr(self.self_attention, "indexer", None) is not None
+            or getattr(core_attention, "indexer", None) is not None
+        )
+        return (
+            getattr(self.config, "dsa_cp_balance_indexer_graph_dynamic_packs", False)
+            and not isinstance(self.self_attention, IdentityOp)
+            and (
+                not self.config.cuda_graph_modules
+                or CudaGraphModule.attn in self.config.cuda_graph_modules
+            )
+            and has_dsa_indexer
+        )
+
     def _get_submodules_under_cudagraphs(self):
         """
         Get the submodules that are covered by cudagraphs.
@@ -1375,8 +1400,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 submodules += [self.mlp.shared_experts]
         return submodules
 
-    @staticmethod
-    def _decompose_packed_seq_params_to_kwargs(kwargs):
+    def _decompose_packed_seq_params_to_kwargs(self, kwargs):
         """Decompose PackedSeqParams into individual tensor kwargs for CUDA graph.
 
         CUDA graph requires all inputs to be tensors. This extracts the cu_seqlens
@@ -1392,6 +1416,25 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         kwargs['cu_seqlens_kv'] = packed_seq_params.cu_seqlens_kv
         kwargs['cu_seqlens_q_padded'] = packed_seq_params.cu_seqlens_q_padded
         kwargs['cu_seqlens_kv_padded'] = packed_seq_params.cu_seqlens_kv_padded
+        from megatron.core.transformer.experimental_attention_variant import cp_balanced_indexer
+
+        if self._uses_graph_dynamic_dsa_route():
+            cp_group = self.pg_collection.cp
+            if cp_group is None or cp_group.size() != self.config.context_parallel_size:
+                raise RuntimeError(
+                    "graph-dynamic balanced CP route requires the layer's explicit CP group "
+                    f"to have size {self.config.context_parallel_size}"
+                )
+            cp_balanced_indexer.validate_graph_dynamic_plan_contract(
+                packed_seq_params,
+                self.config.context_parallel_size,
+                cp_group.rank(),
+                self.config.max_seqlen_per_dp_cp_rank,
+            )
+            cp_balanced_indexer.add_graph_dynamic_plan_to_kwargs(
+                packed_seq_params, kwargs, required=True
+            )
+            self._set_te_cuda_graph_route_replay_state(packed_seq_params)
 
     def _reconstruct_packed_seq_params_from_kwargs(self, kwargs):
         """Reconstruct PackedSeqParams from individual tensor kwargs (CUDA graph path).
@@ -1406,6 +1449,11 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         if 'cu_seqlens_q' not in kwargs:
             return
         max_seqlen = self.config.max_seqlen_per_dp_cp_rank * self.config.context_parallel_size
+        from megatron.core.transformer.experimental_attention_variant import cp_balanced_indexer
+
+        graph_dynamic_plan = cp_balanced_indexer.pop_graph_dynamic_plan_from_kwargs(
+            kwargs, self.config.context_parallel_size, self.config.max_seqlen_per_dp_cp_rank
+        )
         packed_seq_params = PackedSeqParams(
             qkv_format='thd',
             cp_partition_mode=self.config.cp_partition_mode,
@@ -1422,6 +1470,12 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             # selection for THD to cuDNN fused attention.
             pad_between_seqs=True,
         )
+        if graph_dynamic_plan is not None:
+            cp_balanced_indexer.attach_graph_dynamic_plan(packed_seq_params, graph_dynamic_plan)
+        elif self._uses_graph_dynamic_dsa_route():
+            raise RuntimeError(
+                "TE CUDA graph input is missing graph-dynamic balanced CP route metadata."
+            )
         kwargs['packed_seq_params'] = packed_seq_params
 
     def _te_cuda_graph_capture(self, *args, **kwargs):
@@ -1564,6 +1618,19 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             "HyperConnectionHybridLayer MoE CUDA-graph capture requires "
             "overlap_moe_expert_parallel_comm=False."
         )
+        hidden_states, _, _, _ = self.restore_moe_prefix_after_partial_cudagraph(cuda_graph_output)
+        nvtx_range_push(suffix="mlp")
+        mlp_output_with_bias = self.mlp(hidden_states)
+        self.mlp.cudagraph_tensor_store.clear()
+        nvtx_range_pop(suffix="mlp")
+        return mlp_output_with_bias
+
+    def restore_moe_prefix_after_partial_cudagraph(self, cuda_graph_output):
+        """Restore graph-produced router state without executing dispatch or experts.
+
+        Both the ordinary Hybrid wrapper and its overlap schedule consume this
+        prefix. The latter retains ownership of communication and residual nodes.
+        """
         shared_expert_output, routing_map = None, None
         # The inner residual is the last captured element; the mHC wrapper does not use it
         # (the n-stream BDA combines residual), so drop it.
@@ -1589,17 +1656,13 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             )
             hidden_states, probs, routing_map = cuda_graph_output
 
-        nvtx_range_push(suffix="mlp")
         self.mlp.cudagraph_tensor_store.set(
             hidden_states=hidden_states,
             probs=probs,
             routing_map=routing_map,
             shared_expert_output=shared_expert_output,
         )
-        mlp_output_with_bias = self.mlp(hidden_states)
-        self.mlp.cudagraph_tensor_store.clear()
-        nvtx_range_pop(suffix="mlp")
-        return mlp_output_with_bias
+        return hidden_states, probs, routing_map, shared_expert_output
 
     def _te_cuda_graph_replay_impl(self, args, kwargs, context):
         """Implementation of _te_cuda_graph_replay, separated for replay mode cleanup."""
@@ -1667,7 +1730,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             # If EP overlap is enabled, remaining of mlp will be called as fine_grained_callables
             # and should be skipped here.
             if self.config.overlap_moe_expert_parallel_comm:
-                probs, routing_map = self.mlp.route(hidden_states)
+                probs, routing_map = self.mlp.route(
+                    hidden_states, padding_mask=kwargs.get("padding_mask")
+                )
                 hidden_states, probs = self.mlp.preprocess(hidden_states, probs, routing_map)
                 nvtx_range_pop(suffix="mlp")
                 return residual, hidden_states, probs, shared_expert_output
@@ -1699,7 +1764,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                     hidden_states, residual = hidden_states
 
                 shared_expert_output = self.mlp.shared_experts_compute(hidden_states)
-                probs, routing_map = self.mlp.route(hidden_states)
+                padding_mask = self.mlp._normalize_padding_mask(
+                    hidden_states, kwargs.get("padding_mask")
+                )
+                probs, routing_map = self.mlp.route(hidden_states, padding_mask=padding_mask)
                 hidden_states, probs = self.mlp.preprocess(hidden_states, probs, routing_map)
                 return residual, hidden_states, probs, shared_expert_output
 
@@ -2743,9 +2811,10 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         # batches without failing anything. input_ids and packed_seq_params are
         # deliberately not forwarded: the eager callable does not pass them
         # either, and parity with eager is this method's contract.
-        probs, routing_map = self.mlp.route(
-            pre_mlp_layernorm_output, padding_mask=kwargs.get("padding_mask")
+        padding_mask = self.mlp._normalize_padding_mask(
+            pre_mlp_layernorm_output, kwargs.get("padding_mask")
         )
+        probs, routing_map = self.mlp.route(pre_mlp_layernorm_output, padding_mask=padding_mask)
         local_tokens, probs = self.mlp.preprocess(pre_mlp_layernorm_output, probs, routing_map)
         return (residual, local_tokens, probs, shared_expert_output, mlp_h_res, mlp_hc_h_post)
 
@@ -2906,6 +2975,7 @@ class HyperConnectionTransformerLayer(TransformerLayer):
                 # tail: the router consumes it in the z-loss mean, dropless
                 # gating, and the expert-load counters, so dropping it makes the
                 # graphed path drift from eager on padded batches.
+                padding_mask = self.mlp._normalize_padding_mask(hidden_states, padding_mask)
                 probs, routing_map = self.mlp.route(hidden_states, padding_mask=padding_mask)
                 hidden_states, probs = self.mlp.preprocess(hidden_states, probs, routing_map)
                 return (

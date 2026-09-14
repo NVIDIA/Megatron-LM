@@ -24,7 +24,6 @@ import torch
 
 from hybrid_builders import hybrid_builder
 from megatron.core import mpu
-from megatron.core.context_parallel_layout import finalize_packed_seq_params
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.data_schedule import get_batch_on_this_rank_for_sequence_packing
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
@@ -66,7 +65,11 @@ from megatron.training.arguments import core_transformer_config_from_args, parse
 from megatron.training.datasets.sft_dataset import MockSFTDataset, SFTDataset
 from megatron.training.datasets.varlen_dataset import MockVarlenDataset, VarlenDataset
 from megatron.training.training import update_seqlen_stats_from_cu_seqlens
-from megatron.training.utils import get_blend_and_blend_per_split, is_first_or_last_pipeline_stage
+from megatron.training.utils import (
+    get_blend_and_blend_per_split,
+    is_first_or_last_pipeline_stage,
+    prepare_packed_seq_params,
+)
 from model_provider import model_provider
 
 try:
@@ -134,7 +137,7 @@ def get_batch(data_iterator, vp_stage=None):
             dynamic_cp=is_dynamic_cp,
             config=config,
         )
-        finalize_packed_seq_params(packed_seq_params)
+        prepare_packed_seq_params(packed_seq_params, config)
         return (
             attention_mask,
             None,
@@ -280,12 +283,13 @@ def loss_func(
     return loss, num_tokens, report
 
 
-def forward_step(data_iterator, model: HybridModel):
+def forward_step(data_iterator, model: HybridModel, return_schedule_plan: bool = False):
     """Forward training step.
 
     Args:
         data_iterator : Input data iterator
         model (HybridModel): The Hybrid Model
+        return_schedule_plan (bool): Return the EP overlap plan instead of executing forward.
     """
     args = get_args()
     timers = get_timers()
@@ -338,12 +342,13 @@ def forward_step(data_iterator, model: HybridModel):
             total_tokens=int(cu_seqlens_for_params[-1].item()),
             tokens_per_sample=args.seq_length,
         )
-        finalize_packed_seq_params(packed_seq_params)
+        prepare_packed_seq_params(packed_seq_params, get_attr_wrapped_model(model, "config"))
 
     timers('batch-generator').stop()
 
     with stimer:
-        output_tensor = model(
+        forward = model.build_schedule_plan if return_schedule_plan else model
+        output_tensor = forward(
             tokens,
             position_ids,
             attention_mask,
