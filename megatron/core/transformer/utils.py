@@ -281,9 +281,14 @@ def sharded_state_dict_default(
     metadata = ensure_metadata_has_dp_cp_group(metadata)
 
     if hasattr(module, 'sharded_state_dict'):
-        module_sharded_sd = module.sharded_state_dict(
-            prefix=prefix, sharded_offsets=sharded_offsets, metadata=metadata
-        )
+        sharded_state_dict_kwargs: Dict[str, Any] = {
+            'prefix': prefix,
+            'sharded_offsets': sharded_offsets,
+            'metadata': metadata,
+        }
+        if getattr(module, '_mcore_sharded_state_dict_accepts_tp_group', False):
+            sharded_state_dict_kwargs['tp_group'] = tp_group
+        module_sharded_sd = module.sharded_state_dict(**sharded_state_dict_kwargs)
     else:
         module_sd = module.state_dict(prefix='', keep_vars=True)
         module_sharded_sd = make_sharded_tensors_for_checkpoint(

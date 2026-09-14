@@ -428,7 +428,14 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         # [tp_size]. Represents the number of tokens received by the current rank from
         # other TP ranks.
         self.output_splits_tp = None
-        self.permute_idx_device = torch.device("cuda") if self.config.moe_permute_fusion else "cpu"
+        cpu_only_initialization = (
+            self.config.use_cpu_initialization and not torch.cuda.is_available()
+        )
+        self.permute_idx_device = (
+            torch.device("cuda")
+            if self.config.moe_permute_fusion and not cpu_only_initialization
+            else "cpu"
+        )
         input_chunk_idxs = torch.arange(
             self.num_experts * self.tp_size, device=self.permute_idx_device
         )
@@ -468,7 +475,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             or not self.config.cuda_graph_modules
         ):
             self.cuda_dtoh_point = "before_ep_alltoall"
-        if MoEAlltoAllTokenDispatcher.cuda_dtoh_stream is None:
+        if not cpu_only_initialization and MoEAlltoAllTokenDispatcher.cuda_dtoh_stream is None:
             MoEAlltoAllTokenDispatcher.cuda_dtoh_stream = torch.cuda.Stream()
 
         # Attributes that need to be captured in cudagraph. These attributes are returned
