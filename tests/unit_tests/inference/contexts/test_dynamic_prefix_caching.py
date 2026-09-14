@@ -3257,7 +3257,8 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
             engine = cache_env.engine
             engine.controller.tokenizer.detokenize = lambda tokens, **_: f"tok_{tokens[0]}"
             donor, donor_cost, donor_chunked = run(engine, 10, prompt, 5)
-            assert donor_cost == prompt_length and (donor_chunked or model_provider == "hybrid")
+            assert donor_cost == prompt_length
+            assert donor_chunked == (model_provider == "gpt")
             self._assert_prompt_logprob_parity(donor, oracle_top5)
             allocator = engine.context.kv_block_allocator
             sidecars = sorted(
@@ -3367,15 +3368,15 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
 
             allocator = engine.context.kv_block_allocator
             sidecars_before = dict(allocator.block_prompt_logprobs)
-            hits_before = engine.context.prefix_cache_hits
-            blocks_matched_before = engine.context.prefix_cache_blocks_matched
+            hits_before = engine._prefix_cache_hits
+            blocks_matched_before = engine._prefix_cache_blocks_matched
 
             result, result_cost, _ = run(engine, 11, prompt, 101)
             self._assert_prompt_logprob_parity(result, oracle)
             assert result_cost == prompt_length
             assert result.num_cached_tokens == 0
-            assert engine.context.prefix_cache_hits == hits_before
-            assert engine.context.prefix_cache_blocks_matched == blocks_matched_before
+            assert engine._prefix_cache_hits == hits_before
+            assert engine._prefix_cache_blocks_matched == blocks_matched_before
             assert allocator.block_prompt_logprobs == sidecars_before
             assert all(len(row) == 101 for row in result.prompt_top_n_logprobs)
         finally:
