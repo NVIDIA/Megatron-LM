@@ -349,9 +349,6 @@ class TransformerConfig(ModelParallelConfig):
     dsa_fwd_use_dense_attn: bool = False
     """Whether DSA min-memory backends use dense GQA attention forward for indexer warmup."""
 
-    dsa_train_indexer_only: bool = False
-    """Whether to freeze non-indexer parameters and train only DSA indexer parameters."""
-
     dsa_reset_indexer_on_load: bool = False
     """Whether to reset DSA indexer parameters and optimizer state after checkpoint load."""
 
@@ -3474,9 +3471,6 @@ class TransformerConfig(ModelParallelConfig):
             not self.dsa_reset_indexer_on_load or self.experimental_attention_variant == "dsa"
         ), "dsa_reset_indexer_on_load requires experimental_attention_variant='dsa'."
         assert (
-            not self.dsa_train_indexer_only or self.experimental_attention_variant == "dsa"
-        ), "dsa_train_indexer_only requires experimental_attention_variant='dsa'."
-        assert (
             self.dsa_indexer_activation_start_samples is None
             or self.dsa_indexer_activation_start_samples >= 0
         ), "dsa_indexer_activation_start_samples must be non-negative when set."
@@ -3535,9 +3529,6 @@ class TransformerConfig(ModelParallelConfig):
             assert (
                 self.dsa_indexer_topk is not None and self.dsa_indexer_topk > 0
             ), "dsa_indexer_topk must be set to a positive integer when using DSA."
-            assert (
-                not self.dsa_train_indexer_only or (self.dsa_indexer_loss_coeff or 0.0) > 0.0
-            ), "dsa_train_indexer_only requires dsa_indexer_loss_coeff > 0."
             min_memory_dsa_backend = self.dsa_kernel_backend in (
                 'min-memory-triton',
                 'min-memory-torch',
