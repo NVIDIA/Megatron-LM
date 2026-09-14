@@ -21,9 +21,8 @@ from typing import TypeAlias
 
 import torch
 from torch.distributed import DeviceMesh
+from torch.distributed.tensor import Shard
 from torch.distributed.tensor.placement_types import Placement
-
-from .placement import Flat
 
 Shape: TypeAlias = torch.Size | Iterable[int]
 
@@ -35,9 +34,10 @@ class GlobalLayout:
     tensor_shapes: tuple[torch.Size, ...]
     tensor_to_offset: tuple[int, ...]
     size: int
+    block_size: int = 1
 
     @classmethod
-    def build(cls, shapes: Iterable[Shape], dp_size: int) -> "GlobalLayout":
+    def build(cls, shapes: Iterable[Shape], dp_size: int, *, block_size: int = 1) -> "GlobalLayout":
         """Compute global tensor element offsets and padded size.
 
         This is a DBuffer-specific reimplementation of
@@ -78,6 +78,8 @@ class GlobalLayout:
         """
         if dp_size <= 0:
             raise ValueError(f"DP size must be positive, got {dp_size}.")
+        if block_size <= 0:
+            raise ValueError(f"Block size must be positive, got {block_size}.")
 
         tensor_shapes = tuple(torch.Size(shape) for shape in shapes)
         chunk_size = 1
@@ -87,7 +89,11 @@ class GlobalLayout:
                 raise ValueError(
                     f"Cannot compute a layout for zero-sized non-leading dims: {shape}."
                 )
-            chunk_size = math.lcm(chunk_size, row_size)
+            if shape[0] % block_size != 0:
+                raise ValueError(
+                    f"Tensor dim 0 ({shape[0]}) must be divisible by block size {block_size}."
+                )
+            chunk_size = math.lcm(chunk_size, block_size * row_size)
 
         # chunk_size is the packing granularity. Since every tensor row size divides it,
         # DP shard boundaries that are multiples of chunk_size avoid splitting dim-0 rows.
@@ -150,7 +156,9 @@ class GlobalLayout:
             for fragment in fragment_items[:]:
                 frag_id, frag_shape = fragment
                 frag_numel = frag_shape.numel()
-                aligned_gap_offset = _pad_to_multiple(gap_offset, non_leading_numel(frag_shape))
+                aligned_gap_offset = _pad_to_multiple(
+                    gap_offset, block_size * non_leading_numel(frag_shape)
+                )
                 if aligned_gap_offset + frag_numel > fragment_gap_end:
                     continue
                 tensor_to_offset[frag_id] = aligned_gap_offset
@@ -159,7 +167,7 @@ class GlobalLayout:
 
         # Fragments that did not fit into regular-tensor gaps are appended at the tail.
         for frag_id, frag_shape in fragment_items:
-            next_offset = _pad_to_multiple(next_offset, non_leading_numel(frag_shape))
+            next_offset = _pad_to_multiple(next_offset, block_size * non_leading_numel(frag_shape))
             tensor_to_offset[frag_id] = next_offset
             next_offset += frag_shape.numel()
 
@@ -167,6 +175,7 @@ class GlobalLayout:
             tensor_shapes=tensor_shapes,
             tensor_to_offset=tuple(tensor_to_offset),
             size=_pad_to_multiple(next_offset, chunk_size * dp_size),
+            block_size=block_size,
         )
 
     def __post_init__(self) -> None:
@@ -198,9 +207,10 @@ class GlobalLayout:
             row_size = non_leading_numel(shape)
             if row_size <= 0:
                 raise AssertionError(f"Tensor {tensor_id} has invalid row size {row_size}.")
-            if start % row_size != 0:
+            if start % (self.block_size * row_size) != 0:
                 raise AssertionError(
-                    f"Tensor {tensor_id} offset {start} is not aligned to row size {row_size}."
+                    f"Tensor {tensor_id} offset {start} is not aligned to block size "
+                    f"{self.block_size * row_size}."
                 )
 
             end = start + shape.numel()
@@ -228,7 +238,7 @@ class GlobalLayout:
         offset = 0
         numel = self.size
         for axis, placement in reversed(tuple(enumerate(placements))):
-            if not isinstance(placement, Flat):
+            if not isinstance(placement, Shard):
                 continue
             axis_size = mesh.size(axis)
             if numel % axis_size != 0:
