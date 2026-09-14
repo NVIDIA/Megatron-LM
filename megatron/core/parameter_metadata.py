@@ -1,22 +1,21 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Shared parameter metadata used by sharding and parameter replacement paths."""
+"""Utilities for preserving metadata on replaced parameters."""
 
-# Metadata that must survive replacing a parameter or exposing member views of a
-# grouped parameter. Refit and tensor-parallel planning inspect these attributes.
-PARAMETER_SHARDING_ATTRIBUTES = (
-    "allreduce",
-    "expert_parallel",
-    "expert_tp",
-    "group",
-    "is_embedding_or_output_parameter",
-    "is_gtp_weight_remat",
-    "is_qkv",
-    "pad_length",
-    "partition_dim",
-    "partition_sizes",
-    "partition_stride",
-    "qkv_split_shapes",
-    "sequence_parallel",
-    "tensor_model_parallel",
-)
+import torch
+
+
+def copy_parameter_metadata(destination: torch.Tensor, source: torch.Tensor) -> None:
+    """Copy dynamically attached Megatron metadata between parameters.
+
+    Megatron records sharding and refit metadata as public Python attributes.
+    Tensor subclasses use private attributes for their storage and quantization
+    implementation details; those must not leak into a replacement tensor.
+
+    Args:
+        destination: Tensor receiving the metadata.
+        source: Tensor whose metadata should be copied.
+    """
+    for name, value in vars(source).items():
+        if not name.startswith("_"):
+            setattr(destination, name, value)

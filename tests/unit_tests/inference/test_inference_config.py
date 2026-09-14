@@ -29,6 +29,18 @@ from megatron.training.config.inference_config import InferenceSetupConfig
 
 
 class TestInferenceConfig:
+    @pytest.mark.parametrize("backend", list(InferenceGroupedGemmBackend))
+    def test_grouped_gemm_backend_parses_config_value(self, backend):
+        assert InferenceGroupedGemmBackend.from_config(backend.value) is backend
+        assert InferenceGroupedGemmBackend.from_config(backend) is backend
+
+    def test_grouped_gemm_backend_reports_supported_config_values(self):
+        with pytest.raises(
+            ValueError,
+            match="inference_grouped_gemm_backend must be one of.*'flashinfer'.*'torch'.*'vllm'",
+        ):
+            InferenceGroupedGemmBackend.from_config("unknown")
+
     @pytest.mark.parametrize(
         ("name", "include", "exclude", "expected"),
         [

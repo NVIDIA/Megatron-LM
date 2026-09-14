@@ -9,7 +9,7 @@ import torch
 import torch.distributed as dist
 
 from megatron.core.fp8_utils import get_grouped_tensor_members, is_grouped_tensor
-from megatron.core.parameter_metadata import PARAMETER_SHARDING_ATTRIBUTES
+from megatron.core.parameter_metadata import copy_parameter_metadata
 
 if TYPE_CHECKING:
     from .transforms import ReshardTransform
@@ -309,9 +309,7 @@ def named_refit_tensors(module: torch.nn.Module):
             # Megatron stamps expert/TP/GTP metadata on the registered grouped
             # parameter. Its TE member views share storage but do not inherit
             # arbitrary Python attributes, so propagate the planning metadata.
-            for attribute in PARAMETER_SHARDING_ATTRIBUTES:
-                if hasattr(param, attribute):
-                    setattr(member, attribute, getattr(param, attribute))
+            copy_parameter_metadata(member, param)
             yield f"{name}{index}", member
 
     for full_name, _sub, _buf_name, buf in named_persistent_buffers(module):

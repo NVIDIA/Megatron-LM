@@ -1846,15 +1846,9 @@ class TransformerConfig(ModelParallelConfig):
                     ) from error
 
         if self.transformer_impl == "inference_optimized" and self.num_moe_experts is not None:
-            try:
-                self.inference_grouped_gemm_backend = InferenceGroupedGemmBackend(
-                    self.inference_grouped_gemm_backend
-                )
-            except ValueError:
-                raise ValueError(
-                    "inference_grouped_gemm_backend must be 'flashinfer', 'torch', or "
-                    f"'vllm', got '{self.inference_grouped_gemm_backend}'"
-                )
+            self.inference_grouped_gemm_backend = InferenceGroupedGemmBackend.from_config(
+                self.inference_grouped_gemm_backend
+            )
 
             mxfp8_enabled = bool(self.fp8) and self.fp8_recipe == Fp8Recipe.mxfp8
             if self.expert_tensor_parallel_size > 1:

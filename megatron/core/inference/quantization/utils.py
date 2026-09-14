@@ -12,7 +12,7 @@ from megatron.core.inference.quantization.mxfp8_tensor import (
     MXFP8Tensor,
     validate_mxfp8_tensor,
 )
-from megatron.core.parameter_metadata import PARAMETER_SHARDING_ATTRIBUTES
+from megatron.core.parameter_metadata import copy_parameter_metadata
 
 if TYPE_CHECKING:
     from megatron.core.inference.moe import InferenceGroupedGemmBackend
@@ -112,9 +112,7 @@ def _materialize_mxfp8_parameter_as_bf16(
     bf16_parameter = torch.nn.Parameter(
         parameter.dequantize().to(torch.bfloat16), requires_grad=parameter.requires_grad
     )
-    for attribute in PARAMETER_SHARDING_ATTRIBUTES:
-        if hasattr(parameter, attribute):
-            setattr(bf16_parameter, attribute, getattr(parameter, attribute))
+    copy_parameter_metadata(bf16_parameter, parameter)
     del module._parameters[parameter_name]
     setattr(module, parameter_name, bf16_parameter)
 
