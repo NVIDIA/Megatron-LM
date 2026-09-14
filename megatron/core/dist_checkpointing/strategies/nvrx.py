@@ -41,9 +41,8 @@ def has_nvrx_async_support() -> bool:
         getattr(state_dict_saver, "save_state_dict_async_finalize", None),
         getattr(state_dict_saver, "save_state_dict_async_plan", None),
     )
-    assert (
-        is_nvrx_min_version()
-    ), f"Minimum required nvidia-resiliency-ext package version is {NVRX_MIN_VERSION}."
+    if not is_nvrx_min_version():
+        return False
 
     return all(symbol is not None for symbol in required_symbols) and hasattr(
         filesystem_async, "_results_queue"
@@ -82,6 +81,6 @@ def is_nvrx_min_version(version: str = NVRX_MIN_VERSION) -> bool:
     except (ImportError, ModuleNotFoundError):
         HAVE_NVRX = False
 
-    nvrx_version = str(nvrx.__version__) if HAVE_NVRX else "0.0.0"
+    nvrx_version = str(getattr(nvrx, "__version__", "0.0.0")) if HAVE_NVRX else "0.0.0"
 
     return PkgVersion(nvrx_version) >= PkgVersion(version)
