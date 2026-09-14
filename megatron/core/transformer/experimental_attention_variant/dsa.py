@@ -7,7 +7,6 @@ from typing import Optional, Tuple, Union
 
 import torch
 
-from megatron.core import parallel_state
 from megatron.core.models.common.embeddings import (
     RotaryEmbedding,
     YarnRotaryEmbedding,
@@ -18,6 +17,7 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.experimental_attention_variant import (
+    dsa_indexer_loss,
     dsa_kernels,
     dsa_layout,
     dsa_masking,
@@ -25,6 +25,7 @@ from megatron.core.transformer.experimental_attention_variant import (
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.utils import get_pg_size
 
 try:
     from fast_hadamard_transform import hadamard_transform
@@ -228,7 +229,7 @@ def _validate_nonpacked_cp_uniform_length(
         cp_group is not None
         and torch.distributed.is_available()
         and torch.distributed.is_initialized()
-        and cp_group.size() == cp_size
+        and get_pg_size(cp_group) == cp_size
     ):
         local_len = torch.tensor([sq], device=device, dtype=torch.int64)
         all_lens = [torch.empty_like(local_len) for _ in range(cp_size)]
@@ -294,32 +295,72 @@ class DSAIndexerLossLoggingHelper:
             return
 
         tracker = DSAIndexerLossLoggingHelper.tracker
+        # Hybrid MTP layer numbers can exceed ``num_layers + mtp_num_layers``
+        # because every prediction depth can contain multiple hybrid layers.
+        needed = max(num_layers, layer_number)
         if "values" not in tracker:
-            tracker["values"] = torch.zeros(num_layers, device=torch.cuda.current_device())
+            tracker["values"] = torch.zeros(needed, device=torch.cuda.current_device())
+        elif tracker["values"].shape[0] < needed:
+            grown = torch.zeros(
+                needed, device=tracker["values"].device, dtype=tracker["values"].dtype
+            )
+            grown[: tracker["values"].shape[0]] = tracker["values"]
+            tracker["values"] = grown
         tracker["values"][layer_number - 1] += loss.detach()
         tracker["reduce_group"] = reduce_group
         tracker["avg_group"] = avg_group
 
     @staticmethod
-    def clean_loss_in_tracker():
+    def clean_loss_in_tracker(preserve_groups: bool = False):
         """Clear the indexer losses."""
         tracker = DSAIndexerLossLoggingHelper.tracker
+        reduce_group = tracker.get("reduce_group") if preserve_groups else None
+        avg_group = tracker.get("avg_group") if preserve_groups else None
         if "values" in tracker:
             tracker["values"].zero_()
-        tracker["reduce_group"] = None
-        tracker["avg_group"] = None
+        tracker["reduce_group"] = reduce_group
+        tracker["avg_group"] = avg_group
 
     @staticmethod
-    def reduce_loss_in_tracker():
-        """Collect and reduce the indexer losses across ranks."""
+    def reduce_loss_in_tracker(
+        pg_collection: ProcessGroupCollection, num_layers: Optional[int] = None
+    ):
+        """Collect and reduce indexer losses across every pipeline rank.
+
+        Args:
+            pg_collection: Process groups used for pipeline and data-parallel reductions.
+            num_layers: Total number of decoder and MTP layers. When provided, ranks without
+                local indexer losses contribute zeros to the pipeline-wide reduction.
+        """
         tracker = DSAIndexerLossLoggingHelper.tracker
-        if "values" not in tracker:
+        pp_group = pg_collection.pp
+
+        # Pipeline ranks can own different attention variants, so first agree on
+        # a common tracker size. Cache the result because layer allocation is
+        # static and the negotiation requires a device-to-host synchronization.
+        if tracker.get("agreed_size") is not None:
+            size = tracker["agreed_size"]
+        else:
+            local_size = tracker["values"].shape[0] if "values" in tracker else (num_layers or 0)
+            size_t = torch.tensor(
+                [local_size], device=torch.cuda.current_device(), dtype=torch.long
+            )
+            torch.distributed.all_reduce(size_t, op=torch.distributed.ReduceOp.MAX, group=pp_group)
+            size = int(size_t.item())
+            tracker["agreed_size"] = size
+        if size == 0:
             return
+        if "values" not in tracker:
+            tracker["values"] = torch.zeros(size, device=torch.cuda.current_device())
+        elif tracker["values"].shape[0] < size:
+            grown = torch.zeros(
+                size, device=tracker["values"].device, dtype=tracker["values"].dtype
+            )
+            grown[: tracker["values"].shape[0]] = tracker["values"]
+            tracker["values"] = grown
         values = tracker["values"]
 
-        torch.distributed.all_reduce(
-            values, group=parallel_state.get_pipeline_model_parallel_group()
-        )
+        torch.distributed.all_reduce(values, group=pp_group)
         # Reduce indexer losses across ranks.
         if tracker.get('reduce_group') is not None:
             torch.distributed.all_reduce(values, group=tracker.get('reduce_group'))
@@ -328,9 +369,7 @@ class DSAIndexerLossLoggingHelper:
                 values, group=tracker['avg_group'], op=torch.distributed.ReduceOp.AVG
             )
         torch.distributed.all_reduce(
-            values,
-            group=parallel_state.get_data_parallel_group(with_context_parallel=False),
-            op=torch.distributed.ReduceOp.AVG,
+            values, group=pg_collection.dp, op=torch.distributed.ReduceOp.AVG
         )
 
     @staticmethod
@@ -338,9 +377,13 @@ class DSAIndexerLossLoggingHelper:
         loss_scale: float,
         iteration: int,
         writer,
+        pg_collection: ProcessGroupCollection,
         wandb_writer=None,
         total_loss_dict=None,
         per_layer_logging: bool = False,
+        num_layers: Optional[int] = None,
+        num_indexer_layers: Optional[int] = None,
+        preserve_groups: bool = False,
     ):
         """Track the sparse attention indexer metrics for logging.
 
@@ -348,20 +391,27 @@ class DSAIndexerLossLoggingHelper:
             loss_scale: Scale factor for the loss.
             iteration: Current training iteration.
             writer: TensorBoard writer.
+            pg_collection: Process groups used for pipeline and data-parallel reductions.
             wandb_writer: Weights & Biases writer.
             total_loss_dict: Dictionary to accumulate total losses.
             per_layer_logging: Whether to log per-layer losses.
+            num_layers: Total number of decoder and MTP layers. Passing it makes ranks
+                without a local indexer participate in the pipeline reduction.
+            num_indexer_layers: Number of layers that own an indexer. Defaults to the
+                tracker size when every tracked layer owns one.
+            preserve_groups: Keep the saved reduction groups for CUDA Graph replays.
         """
-        DSAIndexerLossLoggingHelper.reduce_loss_in_tracker()
+        DSAIndexerLossLoggingHelper.reduce_loss_in_tracker(
+            pg_collection=pg_collection, num_layers=num_layers
+        )
         tracker = DSAIndexerLossLoggingHelper.tracker
         if "values" not in tracker:
             return
 
         indexer_loss_values = tracker["values"] * loss_scale
-        num_layers = indexer_loss_values.shape[0]
-
-        # Average across all layers (assuming all layers have sparse attention)
-        avg_indexer_loss = indexer_loss_values.sum() / num_layers
+        if num_indexer_layers is None:
+            num_indexer_layers = indexer_loss_values.shape[0]
+        avg_indexer_loss = indexer_loss_values.sum() / max(num_indexer_layers, 1)
 
         # Log average loss
         if total_loss_dict is not None:
@@ -376,7 +426,7 @@ class DSAIndexerLossLoggingHelper:
         if wandb_writer is not None:
             wandb_writer.log({"indexer loss": avg_indexer_loss}, iteration)
 
-        DSAIndexerLossLoggingHelper.clean_loss_in_tracker()
+        DSAIndexerLossLoggingHelper.clean_loss_in_tracker(preserve_groups=preserve_groups)
 
 
 def compute_dsa_indexer_loss(
@@ -394,6 +444,7 @@ def compute_dsa_indexer_loss(
     key_positions: Optional[torch.Tensor] = None,
     query_valid_rows: Optional[torch.Tensor] = None,
     calculate_per_token_loss: bool = False,
+    non_compressed_lse: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
     Compute KL divergence loss between index_scores and true attention_scores.
@@ -419,6 +470,10 @@ def compute_dsa_indexer_loss(
         varlen_starts: Optional row-wise key start bounds [sq] for packed THD.
         varlen_ends: Optional row-wise key end bounds [sq] for packed THD.
         key_positions: Optional global key positions [sk] for packed THD.
+        non_compressed_lse: Optional detached FP32 log-sum-exp contribution
+            [batch, heads, seqlen_q] from teacher keys that are intentionally
+            omitted from ``key``. When provided, the selected ``key`` logits
+            are normalized with this external mass before heads are summed.
 
     Returns:
         index_loss: KL divergence loss (scalar).
@@ -432,6 +487,15 @@ def compute_dsa_indexer_loss(
         query_valid_rows, b=b, sq=sq, device=index_scores.device
     )
 
+    varlen_starts, varlen_ends, key_positions = dsa_masking.normalize_varlen_bounds(
+        mask=mask,
+        varlen_starts=varlen_starts,
+        varlen_ends=varlen_ends,
+        key_positions=key_positions,
+        sk=sk,
+        device=index_scores.device,
+    )
+
     # [sq, b, np, hn] -> [b, np, sq, hn] -> [b * np, sq, hn]
     query = query.permute(1, 2, 0, 3).reshape(b * np, sq, hn)
     # [sk, b, np, hn] -> [b, np, hn, sk] -> [b * np, hn, sk]
@@ -440,15 +504,6 @@ def compute_dsa_indexer_loss(
     attention_scores = torch.bmm(query.float(), key.float()) * softmax_scale
     # Reshape to [b, np, sq, sk]
     attention_scores = attention_scores.reshape(b, np, sq, sk)
-    varlen_starts, varlen_ends, key_positions = dsa_masking.normalize_varlen_bounds(
-        mask=mask,
-        varlen_starts=varlen_starts,
-        varlen_ends=varlen_ends,
-        key_positions=key_positions,
-        sk=sk,
-        device=attention_scores.device,
-    )
-
     if varlen_starts is not None:
         attention_scores = dsa_masking.apply_starts_ends_mask_to_scores(
             attention_scores, varlen_starts, varlen_ends, key_positions
@@ -487,11 +542,13 @@ def compute_dsa_indexer_loss(
     attention_valid_mask = index_valid_mask if sparse_loss else base_valid_mask
 
     # [b, np, sq, sk] -> [b, np, sq, sk]
-    attention_scores = dsa_masking.masked_softmax(
-        attention_scores.float(), attention_valid_mask.unsqueeze(1).expand(b, np, sq, sk), dim=-1
+    attention_scores = _compute_indexer_teacher_probabilities(
+        attention_scores, attention_valid_mask, non_compressed_lse=non_compressed_lse
     )
     # [b, sq, sk] -> [b, sq, sk]
-    index_scores = dsa_masking.masked_softmax(index_scores.float(), index_valid_mask, dim=-1)
+    index_log_scores = dsa_masking.masked_log_softmax(
+        index_scores.float(), index_valid_mask, dim=-1
+    )
 
     # Sum attention scores across heads.
     # [batch, heads, seqlen_q, seqlen_k] -> [batch, seqlen_q, seqlen_k]
@@ -499,37 +556,89 @@ def compute_dsa_indexer_loss(
     if pg_collection.tp.size() > 1:
         # attention scores are scattered to TP ranks in head dimension.
         torch.distributed.all_reduce(attention_scores.contiguous(), group=pg_collection.tp)
-    # L1 normalize target on the last dimension. Doesn't use abs() because attention_scores are
-    # obtained from softmax so they are already non-negative.
-    attention_scores = attention_scores / attention_scores.sum(dim=-1, keepdim=True).clamp_min(
-        1e-10
+    # The target is already non-negative because it is a sum of softmax probabilities.
+    attention_scores = _normalize_indexer_teacher_target(attention_scores, non_compressed_lse)
+    return dsa_indexer_loss.indexer_loss_from_target(
+        attention_scores,
+        index_log_scores,
+        loss_coeff,
+        query_valid_rows=query_valid_rows,
+        calculate_per_token_loss=calculate_per_token_loss,
     )
 
-    # Compute KL divergence: KL(target || index) = target(x) * log(target(x) / index(x))
-    # kl_per_element [b, sq, sk]
-    kl_per_element = attention_scores * (
-        torch.log(attention_scores + 1e-10) - torch.log(index_scores + 1e-10)
+
+def _compute_indexer_teacher_probabilities(
+    attention_scores: torch.Tensor,
+    attention_valid_mask: torch.Tensor,
+    non_compressed_lse: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Return selected-key teacher mass, optionally including omitted mass.
+
+    ``non_compressed_lse`` is a sufficient statistic for teacher logits that
+    must participate in the softmax denominator but must not appear in the
+    compressed-key target returned by this helper. When the absolute compressed
+    mass underflows FP32, all heads in a row receive the same log-domain shift;
+    the returned weights remain proportional and the caller L1-normalizes them.
+    """
+    b, np, sq, sk = attention_scores.shape
+    expanded_valid_mask = attention_valid_mask.unsqueeze(1).expand(b, np, sq, sk)
+    if non_compressed_lse is None:
+        return dsa_masking.masked_softmax(attention_scores.float(), expanded_valid_mask, dim=-1)
+
+    expected_shape = (b, np, sq)
+    if tuple(non_compressed_lse.shape) != expected_shape:
+        raise ValueError(
+            "non_compressed_lse must have shape [batch, heads, seqlen_q], "
+            f"got {tuple(non_compressed_lse.shape)}, expected {expected_shape}"
+        )
+    if non_compressed_lse.device != attention_scores.device:
+        raise ValueError(
+            "non_compressed_lse and attention_scores must be on the same device, "
+            f"got {non_compressed_lse.device} and {attention_scores.device}"
+        )
+    if non_compressed_lse.requires_grad:
+        raise ValueError("non_compressed_lse must be detached")
+
+    masked_scores = attention_scores.float().masked_fill(~expanded_valid_mask, float("-inf"))
+    compressed_lse = torch.logsumexp(masked_scores, dim=-1)
+    row_has_compressed_keys = expanded_valid_mask.any(dim=-1)
+    # Avoid the undefined ``-inf - -inf`` intermediate on fully masked rows.
+    # This is only a [batch, heads, seqlen] tensor, so it does not recreate the
+    # full-size temporary that the log-domain formulation is designed to avoid.
+    safe_compressed_lse = torch.where(
+        row_has_compressed_keys, compressed_lse, torch.zeros_like(compressed_lse)
+    )
+    conditional_probabilities = torch.exp(masked_scores - safe_compressed_lse.unsqueeze(-1))
+    del masked_scores
+
+    full_lse = torch.logaddexp(non_compressed_lse.float(), compressed_lse)
+    log_compressed_mass = (compressed_lse - full_lse).masked_fill(
+        ~row_has_compressed_keys, float("-inf")
     )
 
-    # [b, sq, sk] -> [b, sq] -> [1]
-    # Each real token has the same weight in the loss.
-    kl_per_row = kl_per_element.sum(dim=-1)
-    if calculate_per_token_loss:
-        if query_valid_rows is None:
-            kl_div = kl_per_row.sum()
-        else:
-            kl_div = (kl_per_row * query_valid_rows.to(dtype=torch.float32)).sum()
-    elif query_valid_rows is None:
-        kl_div = kl_per_row.mean()
-    else:
-        valid_row_count = query_valid_rows.sum().to(dtype=torch.float32, device=kl_per_row.device)
-        valid_row_count = valid_row_count.clamp_min(1.0)
-        kl_div = (kl_per_row * query_valid_rows.to(dtype=torch.float32)).sum() / valid_row_count
+    # The external window/sink mass can put every head's compressed mass below
+    # the FP32 normal range. A common per-row shift across heads
+    # preserves all relative teacher weights and cancels in the downstream L1
+    # normalization. CSA currently requires TP1, so no cross-rank MAX is needed.
+    row_max = log_compressed_mass.amax(dim=1, keepdim=True)
+    needs_rescale = torch.isfinite(row_max) & (row_max < math.log(torch.finfo(torch.float32).tiny))
+    common_shift = torch.where(needs_rescale, row_max, torch.zeros_like(row_max))
+    compressed_mass = torch.exp(log_compressed_mass - common_shift)
+    return conditional_probabilities * compressed_mass.unsqueeze(-1)
 
-    # Scale by coefficient.
-    indexer_loss = kl_div * loss_coeff
 
-    return indexer_loss
+def _normalize_indexer_teacher_target(
+    target: torch.Tensor, non_compressed_lse: torch.Tensor | None
+) -> torch.Tensor:
+    """L1-normalize teacher mass without changing the legacy DSA path."""
+    if non_compressed_lse is None:
+        return dsa_indexer_loss.normalize_indexer_target(target)
+    row_mass = target.sum(dim=-1, keepdim=True)
+    # External teacher mass can legitimately make the compressed mass smaller
+    # than INDEXER_LOSS_EPS (or even float32 tiny). Only an exactly zero row is
+    # degenerate; keep it zero rather than imposing a numerical floor.
+    safe_row_mass = torch.where(row_mass > 0, row_mass, torch.ones_like(row_mass))
+    return target / safe_row_mass
 
 
 def _compute_index_scores(
@@ -645,6 +754,7 @@ def fwd_fused_indexer_loss_naive(
     query_valid_rows=None,
     calculate_per_token_loss: bool = False,
     use_relu: bool = True,
+    non_compressed_lse: torch.Tensor | None = None,
 ):
     """Naive implementation of forward pass for indexer loss."""
     index_scores, topk_indices = fused_qk_topk_naive(
@@ -674,6 +784,7 @@ def fwd_fused_indexer_loss_naive(
         key_positions=key_positions,
         query_valid_rows=query_valid_rows,
         calculate_per_token_loss=calculate_per_token_loss,
+        non_compressed_lse=non_compressed_lse,
     )
 
     return topk_indices, indexer_loss
@@ -698,6 +809,7 @@ def bwd_fused_indexer_loss_naive(
     query_valid_rows=None,
     calculate_per_token_loss: bool = False,
     use_relu: bool = True,
+    non_compressed_lse: torch.Tensor | None = None,
 ):
     """Naive implementation of backward pass for indexer loss."""
     query, _ = dsa_layout.ensure_sbhd(query, "query")
@@ -770,8 +882,8 @@ def bwd_fused_indexer_loss_naive(
     else:
         index_valid_mask = base_valid_mask
     attention_valid_mask = index_valid_mask if sparse_loss else base_valid_mask
-    attention_scores_softmax = dsa_masking.masked_softmax(
-        attention_scores.float(), attention_valid_mask.unsqueeze(1).expand(b, np, sq, sk), dim=-1
+    attention_scores_softmax = _compute_indexer_teacher_probabilities(
+        attention_scores, attention_valid_mask, non_compressed_lse=non_compressed_lse
     )
     # Free attention_scores immediately
     del attention_scores
@@ -794,9 +906,9 @@ def bwd_fused_indexer_loss_naive(
     # L1 normalize. Fully masked packed/varlen rows can have zero summed
     # attention mass; clamp the denominator so those rows stay finite and are
     # later zeroed by the row-valid loss mask.
-    attention_scores_normalized = attention_scores_sum / attention_scores_sum.sum(
-        dim=-1, keepdim=True
-    ).clamp_min(1e-10)
+    attention_scores_normalized = _normalize_indexer_teacher_target(
+        attention_scores_sum, non_compressed_lse
+    )
     # Free attention_scores_sum - no longer needed after normalization
     del attention_scores_sum
 
@@ -826,19 +938,14 @@ def bwd_fused_indexer_loss_naive(
             dtype=grad_kl_per_element.dtype
         )
 
-    # Backward through kl_per_element = target * (log(target) - log(index))
-    # ∂kl/∂index_softmax = -target / index_softmax
-    grad_index_scores_softmax = (
-        -attention_scores_normalized / (index_scores_softmax + 1e-10) * grad_kl_per_element
-    )
-    # Free attention_scores_normalized - no longer needed
-    del attention_scores_normalized
-
-    # Backward through softmax: ∂L/∂x = softmax * (∂L/∂softmax - sum(∂L/∂softmax * softmax))
-    sum_grad = (grad_index_scores_softmax * index_scores_softmax).sum(dim=-1, keepdim=True)
-    grad_index_scores_logits = index_scores_softmax * (grad_index_scores_softmax - sum_grad)
-    # Free intermediate tensors
-    del index_scores_softmax, grad_index_scores_softmax, sum_grad
+    # For KL(target || softmax(logits)), the exact logit gradient is
+    # predict * target.sum(-1) - target. Positive teacher rows are L1-normalized,
+    # while a fully masked zero-mass row must have zero gradient.
+    attention_target_mass = attention_scores_normalized.sum(dim=-1, keepdim=True)
+    grad_index_scores_logits = (
+        index_scores_softmax * attention_target_mass - attention_scores_normalized
+    ) * grad_kl_per_element
+    del index_scores_softmax, attention_scores_normalized
 
     # Zero out gradients for masked positions.
     if sparse_loss:
@@ -916,6 +1023,7 @@ _FUSED_DSA_INDEXER_LOSS_INPUT_NAMES = (
     "query_valid_rows",
     "calculate_per_token_loss",
     "use_relu",
+    "non_compressed_lse",
 )
 
 
@@ -942,6 +1050,7 @@ class FusedDSAIndexerLoss(torch.autograd.Function):
         query_valid_rows=None,
         calculate_per_token_loss: bool = False,
         use_relu: bool = True,
+        non_compressed_lse: torch.Tensor | None = None,
     ):
         """
         Fused forward: index_scores never materialized in full.
@@ -964,10 +1073,17 @@ class FusedDSAIndexerLoss(torch.autograd.Function):
             query_valid_rows=query_valid_rows,
             calculate_per_token_loss=calculate_per_token_loss,
             use_relu=use_relu,
+            non_compressed_lse=non_compressed_lse,
         )
 
         # Save for backward (recomputation strategy)
-        ctx.save_for_backward(q, weights, k, query, key, topk_indices)
+        saved_non_compressed_lse = (
+            non_compressed_lse
+            if non_compressed_lse is not None
+            else q.new_empty(0, dtype=torch.float32)
+        )
+        ctx.save_for_backward(q, weights, k, query, key, topk_indices, saved_non_compressed_lse)
+        ctx.has_non_compressed_lse = non_compressed_lse is not None
         ctx.softmax_scale = softmax_scale
         ctx.loss_coeff = loss_coeff
         ctx.sparse_loss = sparse_loss
@@ -979,6 +1095,7 @@ class FusedDSAIndexerLoss(torch.autograd.Function):
         ctx.query_valid_rows = query_valid_rows
         ctx.calculate_per_token_loss = calculate_per_token_loss
         ctx.use_relu = use_relu
+        ctx.num_inputs = len(ctx.needs_input_grad)
 
         return topk_indices, loss
 
@@ -987,7 +1104,8 @@ class FusedDSAIndexerLoss(torch.autograd.Function):
         """
         Backward: Recompute what we need.
         """
-        q, weights, k, query, key, topk_indices = ctx.saved_tensors
+        q, weights, k, query, key, topk_indices, saved_non_compressed_lse = ctx.saved_tensors
+        non_compressed_lse = saved_non_compressed_lse if ctx.has_non_compressed_lse else None
 
         grad_q, grad_weights, grad_k = bwd_fused_indexer_loss_naive(
             q,
@@ -1008,6 +1126,7 @@ class FusedDSAIndexerLoss(torch.autograd.Function):
             query_valid_rows=ctx.query_valid_rows,
             calculate_per_token_loss=ctx.calculate_per_token_loss,
             use_relu=ctx.use_relu,
+            non_compressed_lse=non_compressed_lse,
         )
 
         grad_by_name = {
@@ -1017,8 +1136,10 @@ class FusedDSAIndexerLoss(torch.autograd.Function):
             # query and key are detached in forward, so return None for their gradients.
             "query": None,
             "key": None,
+            "non_compressed_lse": None,
         }
-        return tuple(grad_by_name.get(name) for name in _FUSED_DSA_INDEXER_LOSS_INPUT_NAMES)
+        gradients = tuple(grad_by_name.get(name) for name in _FUSED_DSA_INDEXER_LOSS_INPUT_NAMES)
+        return gradients[: ctx.num_inputs]
 
 
 class DSAIndexerLossAutoScaler(torch.autograd.Function):
@@ -1228,6 +1349,10 @@ class DSAIndexer(MegatronModule):
             skip_weight_param_allocation=False,
             parallel_mode="duplicated",
         )
+        # Indexer projections are duplicated across tensor-parallel ranks, so their gradients
+        # should be averaged during final gradient synchronization.
+        for param in self.parameters():
+            setattr(param, "average_gradients_across_tp_domain", True)
 
     def _apply_rope(
         self,
@@ -1714,48 +1839,158 @@ class DSAttention(MegatronModule):
             )
 
         sq, b, _, _ = query.size()
+        local_sequence_rows = x.size(0)
 
         cp_group = getattr(self.pg_collection, "cp", None)
-        cp_size = cp_group.size() if cp_group is not None else 1
+        cp_size = get_pg_size(cp_group)
         cp_rank = cp_group.rank() if cp_group is not None else 0
+        tp_group = getattr(self.pg_collection, "tp", None)
+        tp_size = get_pg_size(tp_group)
+        sequence_parallel_tp = self.config.sequence_parallel and tp_size > 1
+        sequence_parallel_tp_row_start = 0
+        sequence_parallel_tp_full_rows = sq
+        sequence_parallel_query_is_local = False
+        if sequence_parallel_tp:
+            sequence_parallel_tp_full_rows = local_sequence_rows * tp_size
+            if sq == local_sequence_rows:
+                sequence_parallel_query_is_local = True
+                sequence_parallel_tp_row_start = tp_group.rank() * local_sequence_rows
+            elif sq != sequence_parallel_tp_full_rows:
+                raise RuntimeError(
+                    "DSA sequence-parallel query row count mismatch: "
+                    f"query_rows={sq}, local_rows={local_sequence_rows}, tp_size={tp_size}"
+                )
         packed_thd = packed_seq_params is not None and packed_seq_params.qkv_format == "thd"
         packed_query_positions = None
+        nonpacked_query_positions = None
         kv_reorder_idx = None
         single_packed_thd_sequence = False
-        if packed_thd and cp_size > 1:
+        if packed_thd:
             cu_seqlens_q, cu_seqlens_kv = dsa_layout.get_packed_qk_cu_seqlens(packed_seq_params)
-            single_packed_thd_sequence = cu_seqlens_q.numel() == 2 and cu_seqlens_kv.numel() == 2
-            packed_query_positions, kv_reorder_idx = (
-                dsa_layout.build_packed_allgather_cp_query_positions_and_key_reorder(
-                    cu_seqlens_q=cu_seqlens_q,
-                    cu_seqlens_kv=cu_seqlens_kv,
-                    cp_size=cp_size,
-                    cp_rank=cp_rank,
-                    device=query.device,
-                    local_output_size=sq,
-                    global_output_size=sq * cp_size,
-                )
+            single_packed_thd_sequence = (
+                cp_size > 1 and cu_seqlens_q.numel() == 2 and cu_seqlens_kv.numel() == 2
             )
+            packed_query_output_size = (
+                sequence_parallel_tp_full_rows if sequence_parallel_tp else sq
+            )
+            packed_global_output_size = packed_query_output_size * cp_size
+            if sequence_parallel_query_is_local and cp_size == 1:
+                row_start = sequence_parallel_tp_row_start
+                packed_query_positions = torch.arange(
+                    row_start, row_start + sq, dtype=torch.int64, device=query.device
+                )
+            elif sequence_parallel_tp and cp_size > 1:
+                packed_query_positions_full = dsa_layout.build_packed_allgather_cp_local_positions(
+                    cu_seqlens_q,
+                    cp_size,
+                    cp_rank,
+                    query.device,
+                    output_size=packed_query_output_size,
+                )
+                if sequence_parallel_query_is_local:
+                    row_start = sequence_parallel_tp_row_start
+                    packed_query_positions = packed_query_positions_full[row_start : row_start + sq]
+                else:
+                    packed_query_positions = packed_query_positions_full
+            elif cp_size > 1:
+                # For one sequence, host max-seqlen metadata proves whether cu_seqlens already
+                # covers every packed row without synchronizing on the CUDA cu_seqlens tensor.
+                query_cu_seqlens_cover_output = (
+                    single_packed_thd_sequence
+                    and isinstance(packed_seq_params.max_seqlen_q, int)
+                    and packed_seq_params.max_seqlen_q == packed_global_output_size
+                )
+                key_cu_seqlens_cover_output = (
+                    single_packed_thd_sequence
+                    and isinstance(packed_seq_params.max_seqlen_kv, int)
+                    and packed_seq_params.max_seqlen_kv == packed_global_output_size
+                )
+                packed_query_positions, kv_reorder_idx = (
+                    dsa_layout.build_packed_allgather_cp_query_positions_and_key_reorder(
+                        cu_seqlens_q=cu_seqlens_q,
+                        cu_seqlens_kv=cu_seqlens_kv,
+                        cp_size=cp_size,
+                        cp_rank=cp_rank,
+                        device=query.device,
+                        local_output_size=packed_query_output_size,
+                        key_local_output_size=packed_query_output_size,
+                        global_output_size=packed_global_output_size,
+                        query_cu_seqlens_cover_output=query_cu_seqlens_cover_output,
+                        key_cu_seqlens_cover_output=key_cu_seqlens_cover_output,
+                    )
+                )
+            if packed_query_positions is not None:
+                packed_query_positions = packed_query_positions.contiguous()
         elif cp_size > 1:
             _validate_nonpacked_cp_uniform_length(
                 sq=sq, skv=key.size(0), cp_size=cp_size, cp_group=cp_group, device=query.device
             )
-            kv_reorder_idx = dsa_layout.build_zigzag_allgather_cp_key_reorder(
-                sq=sq, cp_size=cp_size, device=query.device
-            )
 
+        if sequence_parallel_tp:
+            if key.size(0) == local_sequence_rows:
+                key = gather_from_sequence_parallel_region(key, group=tp_group)
+            elif key.size(0) != sequence_parallel_tp_full_rows:
+                raise RuntimeError(
+                    "DSA sequence-parallel key row count mismatch before CP gather: "
+                    f"key_rows={key.size(0)}, local_rows={local_sequence_rows}, "
+                    f"full_rows={sequence_parallel_tp_full_rows}, tp_size={tp_size}"
+                )
+            if value is not None:
+                if value.size(0) == local_sequence_rows:
+                    value = gather_from_sequence_parallel_region(value, group=tp_group)
+                elif value.size(0) != sequence_parallel_tp_full_rows:
+                    raise RuntimeError(
+                        "DSA sequence-parallel value row count mismatch before CP gather: "
+                        f"value_rows={value.size(0)}, local_rows={local_sequence_rows}, "
+                        f"full_rows={sequence_parallel_tp_full_rows}, tp_size={tp_size}"
+                    )
+
+        local_cp_kv_lens = {sq}
+        if sequence_parallel_tp:
+            local_cp_kv_lens.add(sequence_parallel_tp_full_rows)
+        local_cp_kv_len = None
         if cp_size > 1:
             assert (
                 self.cp_comm_type == "allgather"
             ), "DSAttention context parallelism currently supports cp_comm_type=allgather only."
+
             # For allgather CP, keys/values are expected in full-sequence order.
             # Gather local-sequence tensors, then undo MCore's zigzag rank order.
+            def _build_kv_reorder_idx(local_len):
+                if packed_thd:
+                    _, idx = dsa_layout.build_packed_allgather_cp_query_positions_and_key_reorder(
+                        cu_seqlens_q=cu_seqlens_q,
+                        cu_seqlens_kv=cu_seqlens_kv,
+                        cp_size=cp_size,
+                        cp_rank=cp_rank,
+                        device=query.device,
+                        local_output_size=local_len,
+                        key_local_output_size=local_len,
+                        global_output_size=local_len * cp_size,
+                    )
+                    return idx
+                return dsa_layout.build_zigzag_allgather_cp_key_reorder(
+                    sq=local_len, cp_size=cp_size, device=query.device
+                )
+
             gathered_cp_key = False
             gathered_cp_value = False
-            if key.size(0) == sq:
+            if key.size(0) in local_cp_kv_lens:
+                local_cp_kv_len = key.size(0)
+                if kv_reorder_idx is None:
+                    kv_reorder_idx = _build_kv_reorder_idx(local_cp_kv_len)
                 key = gather_from_sequence_parallel_region(key, group=cp_group)
                 gathered_cp_key = True
-            if value is not None and value.size(0) == sq:
+            if value is not None and value.size(0) in local_cp_kv_lens:
+                if local_cp_kv_len is None:
+                    local_cp_kv_len = value.size(0)
+                    if kv_reorder_idx is None:
+                        kv_reorder_idx = _build_kv_reorder_idx(local_cp_kv_len)
+                elif value.size(0) != local_cp_kv_len:
+                    raise RuntimeError(
+                        "DSA local key/value sequence length mismatch before CP gather: "
+                        f"key_len={local_cp_kv_len}, value_len={value.size(0)}"
+                    )
                 value = gather_from_sequence_parallel_region(value, group=cp_group)
                 gathered_cp_value = True
             if kv_reorder_idx is not None:
@@ -1776,6 +2011,25 @@ class DSAttention(MegatronModule):
 
         skv = key.size(0)
 
+        if not packed_thd and sequence_parallel_query_is_local:
+            nonpacked_query_positions = dsa_layout.extract_query_positions_from_position_ids(
+                position_ids, sq, query.device
+            )
+            if nonpacked_query_positions is None:
+                full_query_positions, _ = dsa_layout.get_cp_positions_from_layout(
+                    sq=sequence_parallel_tp_full_rows,
+                    skv=skv,
+                    cp_size=cp_size,
+                    cp_rank=cp_rank,
+                    cp_comm_type=self.cp_comm_type,
+                    device=query.device,
+                    cp_group=cp_group,
+                )
+                row_start = sequence_parallel_tp_row_start
+                nonpacked_query_positions = full_query_positions[
+                    row_start : row_start + sq
+                ].contiguous()
+
         # Detach x and qr to prevent gradients of indexer from flowing back to the main model.
         x = x.detach()
         qr = qr.detach()
@@ -1785,20 +2039,28 @@ class DSAttention(MegatronModule):
         use_indexer_loss = (
             self.training and torch.is_grad_enabled() and indexer_loss_coeff > 0 and computes_topk
         )
-        float_mask, varlen_params = dsa_masking.build_dsattention_forward_mask(
-            sq=sq,
-            skv=skv,
-            b=b,
-            device=x.device,
-            cp_size=cp_size,
-            cp_rank=cp_rank,
-            cp_comm_type=self.cp_comm_type,
-            cp_group=cp_group,
-            attn_mask_type=attn_mask_type,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            packed_seq_params=packed_seq_params,
-            packed_query_positions=packed_query_positions,
+        if use_indexer_loss and sequence_parallel_query_is_local:
+            raise RuntimeError(
+                "DSA indexer loss requires TP ranks to own the same query rows; "
+                "sequence-local TP query shards cannot form a global-head target."
+            )
+        float_mask, varlen_params, varlen_is_plain_causal = (
+            dsa_masking.build_dsattention_forward_mask(
+                sq=sq,
+                skv=skv,
+                b=b,
+                device=x.device,
+                cp_size=cp_size,
+                cp_rank=cp_rank,
+                cp_comm_type=self.cp_comm_type,
+                cp_group=cp_group,
+                attn_mask_type=attn_mask_type,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                packed_seq_params=packed_seq_params,
+                packed_query_positions=packed_query_positions,
+                nonpacked_query_positions=nonpacked_query_positions,
+            )
         )
         if varlen_params is not None:
             varlen_starts, varlen_ends, key_positions = varlen_params
@@ -1815,6 +2077,7 @@ class DSAttention(MegatronModule):
             and attn_mask_type == AttnMaskType.causal
             and varlen_starts is not None
             and varlen_ends is not None
+            and key_positions is None
         )
         indexer_reduce_group = (
             cp_group if cp_size > 1 and self.config.calculate_per_token_loss else None
@@ -1836,6 +2099,11 @@ class DSAttention(MegatronModule):
         topk_indices = None
         topk_length = None
         q = k = weights = None
+        local_packed_cp_query_start = 0
+        local_packed_cp_query_len = sq
+        if sequence_parallel_query_is_local:
+            local_packed_cp_query_start = sequence_parallel_tp_row_start
+            local_packed_cp_query_len = sequence_parallel_tp_full_rows
 
         if self.skip_topk:
             assert topk_holder is not None
@@ -1855,16 +2123,38 @@ class DSAttention(MegatronModule):
                 topk_length = topk_length_holder.get(self.source_layer)
         else:
             assert self.indexer is not None
-            q, k, weights = self.indexer.forward_before_topk(x, qr, packed_seq_params)
-            if cp_size > 1 and k.size(0) == sq:
-                k = gather_from_sequence_parallel_region(k, group=cp_group)
-                if kv_reorder_idx is not None:
+            with torch.enable_grad() if use_indexer_loss else torch.no_grad():
+                q, k, weights = self.indexer.forward_before_topk(x, qr, packed_seq_params)
+                if cp_size > 1 and k.size(0) in local_cp_kv_lens:
+                    if kv_reorder_idx is None:
+                        kv_reorder_idx = _build_kv_reorder_idx(k.size(0))
+                    k = gather_from_sequence_parallel_region(k, group=cp_group)
                     if k.size(0) != kv_reorder_idx.numel():
                         raise RuntimeError(
                             "DSA gathered indexer-key length mismatch: "
                             f"k_seqlen={k.size(0)}, expected={kv_reorder_idx.numel()}"
                         )
                     k = k.index_select(0, kv_reorder_idx)
+                if sequence_parallel_tp and q.size(0) != sq:
+                    if (
+                        q.size(0) != sequence_parallel_tp_full_rows
+                        or weights.size(0) != sequence_parallel_tp_full_rows
+                    ):
+                        raise RuntimeError(
+                            "DSA sequence-parallel indexer row count mismatch: "
+                            f"q_rows={q.size(0)}, weights_rows={weights.size(0)}, "
+                            f"query_rows={sq}, full_rows={sequence_parallel_tp_full_rows}, "
+                            f"tp_size={tp_size}"
+                        )
+                    if not sequence_parallel_query_is_local:
+                        raise RuntimeError(
+                            "DSA indexer produced TP-gathered rows while attention query rows "
+                            "were not sequence-local."
+                        )
+                    row_start = sequence_parallel_tp_row_start
+                    row_end = row_start + sq
+                    q = q[row_start:row_end].contiguous()
+                    weights = weights[row_start:row_end].contiguous()
 
         def compute_indexer_loss_with_reference_path():
             key_for_loss = key.detach()
@@ -1904,7 +2194,7 @@ class DSAttention(MegatronModule):
                 indexer_weights=weights,
                 indexer_topk=self.index_topk,
                 softmax_scale=self.softmax_scale,
-                loss_coeff=indexer_loss_coeff,
+                loss_coeff=indexer_loss_coeff if use_indexer_loss else 0.0,
                 sparse_loss=sparse_indexer_loss,
                 calculate_per_token_loss=self.config.calculate_per_token_loss,
                 absorbed_mla=absorbed_mla,
@@ -1915,8 +2205,13 @@ class DSAttention(MegatronModule):
                 varlen_ends=varlen_ends,
                 key_positions=key_positions,
                 query_valid_rows=query_valid_rows,
+                varlen_is_plain_causal=varlen_is_plain_causal,
                 use_relu=self.config.dsa_indexer_scoring_relu,
                 use_local_indexer_varlen=use_local_indexer_varlen,
+                single_packed_thd_sequence=single_packed_thd_sequence,
+                local_packed_cp_rank=cp_rank,
+                local_packed_cp_query_start=local_packed_cp_query_start,
+                local_packed_cp_query_len=local_packed_cp_query_len,
                 pg_collection=self.pg_collection,
             )
         if fused_output is not None:
@@ -1949,6 +2244,25 @@ class DSAttention(MegatronModule):
 
         indexer_loss = None
 
+        def slice_topk_to_local_sequence_parallel_rows():
+            nonlocal topk_indices, topk_length
+            if topk_indices is None or not sequence_parallel_query_is_local:
+                return
+            topk_sq = topk_indices.size(1)
+            if topk_sq == sq:
+                return
+            expected_topk_sq = sequence_parallel_tp_full_rows
+            if topk_sq != expected_topk_sq:
+                raise RuntimeError(
+                    "DSA sequence-parallel top-k row count mismatch: "
+                    f"topk_rows={topk_sq}, query_rows={sq}, tp_size={tp_size}"
+                )
+            row_start = sequence_parallel_tp_row_start
+            row_end = row_start + sq
+            topk_indices = topk_indices[:, row_start:row_end].contiguous()
+            if topk_length is not None:
+                topk_length = topk_length[:, row_start:row_end].contiguous()
+
         if use_indexer_loss:
             assert q is not None and k is not None and weights is not None
             # ===================================
@@ -1975,12 +2289,20 @@ class DSAttention(MegatronModule):
                     calculate_per_token_loss=self.config.calculate_per_token_loss,
                     use_relu=self.config.dsa_indexer_scoring_relu,
                     use_local_indexer_varlen=use_local_indexer_varlen,
+                    single_packed_thd_sequence=single_packed_thd_sequence,
+                    local_packed_cp_rank=cp_rank,
+                    local_packed_cp_query_start=local_packed_cp_query_start,
+                    local_packed_cp_query_len=local_packed_cp_query_len,
+                    packed_seq_params=packed_seq_params,
+                    cp_size=cp_size,
                 )
                 if fused_topk_with_loss is not None:
                     topk_indices, topk_length, indexer_loss = fused_topk_with_loss
 
             if topk_indices is None or indexer_loss is None:
                 topk_indices, indexer_loss = compute_indexer_loss_with_reference_path()
+            # No TP-local top-k slicing here: the guard above forbids the indexer loss
+            # under sequence-local TP query shards, so the top-k rows are already global.
 
             # Save indexer loss for logging.
             if indexer_loss_coeff > 0:
@@ -2010,22 +2332,31 @@ class DSAttention(MegatronModule):
                     block_size=max(1, block_size),
                     use_relu=self.config.dsa_indexer_scoring_relu,
                     use_local_indexer_varlen=use_local_indexer_varlen,
+                    single_packed_thd_sequence=single_packed_thd_sequence,
+                    local_packed_cp_rank=cp_rank,
+                    local_packed_cp_query_start=local_packed_cp_query_start,
+                    local_packed_cp_query_len=local_packed_cp_query_len,
+                    packed_seq_params=packed_seq_params,
+                    cp_size=cp_size,
                 )
                 if fused_topk is not None:
                     topk_indices, topk_length = fused_topk
 
             if topk_indices is None:
-                _, topk_indices = fused_qk_topk_naive(
-                    q,
-                    k,
-                    weights,
-                    self.index_topk,
-                    mask=float_mask,
-                    varlen_starts=varlen_starts,
-                    varlen_ends=varlen_ends,
-                    key_positions=key_positions,
-                    use_relu=self.config.dsa_indexer_scoring_relu,
-                )
+                with torch.no_grad():
+                    index_scores, topk_indices = fused_qk_topk_naive(
+                        q,
+                        k,
+                        weights,
+                        self.index_topk,
+                        mask=float_mask,
+                        varlen_starts=varlen_starts,
+                        varlen_ends=varlen_ends,
+                        key_positions=key_positions,
+                        use_relu=self.config.dsa_indexer_scoring_relu,
+                    )
+                    del index_scores
+            slice_topk_to_local_sequence_parallel_rows()
 
         if self.index_share and computes_topk:
             assert topk_holder is not None and topk_indices is not None

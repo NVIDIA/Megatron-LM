@@ -30,6 +30,7 @@ def _create_engine(
         engine
     )
     engine._find_cg_chunk_size = DynamicInferenceEngine._find_cg_chunk_size.__get__(engine)
+    engine._matches_cg_admission = DynamicInferenceEngine._matches_cg_admission.__get__(engine)
     engine._cg_admission_check = DynamicInferenceEngine._cg_admission_check.__get__(engine)
     engine._register_cg_wait = DynamicInferenceEngine._register_cg_wait.__get__(engine)
     return engine

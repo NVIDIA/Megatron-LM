@@ -95,22 +95,22 @@ class MegatronTokenizerTextAbstract(ABC):
     @property
     def cls_id(self) -> int:
         """Property alias to match MegatronTokenizer; returns cls_id if available."""
-        if hasattr(self, 'cls_id'):
-            return self.cls_id
+        if hasattr(self, 'cls'):
+            return self.cls
         raise AttributeError(f"{type(self).__name__} has no attribute 'cls' or 'cls_id'")
 
     @property
     def sep_id(self) -> int:
         """Property alias to match MegatronTokenizer; returns sep_id if available."""
-        if hasattr(self, 'sep_id'):
-            return self.sep_id
+        if hasattr(self, 'sep'):
+            return self.sep
         raise AttributeError(f"{type(self).__name__} has no attribute 'sep' or 'sep_id'")
 
     @property
     def pad_id(self) -> int:
         """Property alias to match MegatronTokenizer; returns pad_id if available."""
-        if hasattr(self, 'pad_id'):
-            return self.pad_id
+        if hasattr(self, 'pad'):
+            return self.pad
         raise AttributeError(f"{type(self).__name__} has no attribute 'pad' or 'pad_id'")
 
     @property
@@ -128,20 +128,20 @@ class MegatronTokenizerTextAbstract(ABC):
     @property
     def bos_id(self) -> int:
         """Property alias to match MegatronTokenizer; returns bos_id if available."""
-        if hasattr(self, 'bos_id'):
-            return self.bos_id
+        if hasattr(self, 'bos'):
+            return self.bos
         raise AttributeError(f"{type(self).__name__} has no attribute 'bos' or 'bos_id'")
 
     @property
     def eos_id(self) -> int:
         """Property alias to match MegatronTokenizer; returns eos_id if available."""
-        if hasattr(self, 'eos_id'):
-            return self.eos_id
+        if hasattr(self, 'eos'):
+            return self.eos
         raise AttributeError(f"{type(self).__name__} has no attribute 'eos' or 'eos_id'")
 
     @property
     def mask_id(self) -> int:
         """Property alias to match MegatronTokenizer; returns mask_id if available."""
-        if hasattr(self, 'mask_id'):
-            return self.mask_id
+        if hasattr(self, 'mask'):
+            return self.mask
         raise AttributeError(f"{type(self).__name__} has no attribute 'mask' or 'mask_id'")

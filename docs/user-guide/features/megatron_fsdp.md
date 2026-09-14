@@ -136,7 +136,7 @@ fsdp_model.load_state_dict(ckpt["model"], strict=False)
 optimizer.load_state_dict(ckpt["optimizer"])
 ```
 
-> ℹ️ `fully_shard` is an _**experimental**_ API. Please check back for updates as we fine-tune our user experience! For more examples using `fully_shard` for Megatron-FSDP, refer to our suite of unit tests: [`tests/unit_tests/distributed/megatron_fsdp/test_mfsdp_fully_shard.py`](../../../tests/unit_tests/distributed/megatron_fsdp/test_mfsdp_fully_shard.py)
+> ℹ️ `fully_shard` is an _**experimental**_ API. Please check back for updates as we fine-tune our user experience! For more examples using `fully_shard` for Megatron-FSDP, refer to our suite of unit tests: [`tests/unit_tests/distributed/mfsdp_v1/test_mfsdp_fully_shard.py`](../../../tests/unit_tests/distributed/mfsdp_v1/test_mfsdp_fully_shard.py)
 
 ### 🤖 Megatron-LM
 
@@ -148,6 +148,15 @@ Megatron-FSDP is deeply integrated into Megatron-Core. To enable FSDP (where opt
 --data-parallel-sharding-strategy {no_shard, optim, optim_grads, optim_grads_params}
 --ckpt-format fsdp_dtensor
 ```
+
+> ℹ️ Loading a `fsdp_dtensor` checkpoint raises an error if the checkpoint cannot supply
+> every model weight the model asks for. Unlike `torch_dist`, the default
+> `--dist-ckpt-strictness assume_ok_unexpected` behaves like `raise_unexpected` for this
+> format, because Torch DCP skips absent weights silently and leaves them at their
+> initialized values, which surfaces as a convergence regression rather than a crash.
+> Weights that the checkpoint holds but a rank's model does not ask for — sharded experts,
+> for example — are always fine. Pass `--dist-ckpt-strictness ignore_all` to opt out, or
+> `--finetune` when loading only part of the model is the intent.
 
 Complete Llama-8B and DeepSeek-V3 training scripts using Megatron-FSDP with recommended settings can be found in [Megatron-LM/examples/megatron_fsdp](https://github.com/NVIDIA/Megatron-LM/tree/main/examples/megatron_fsdp).
 

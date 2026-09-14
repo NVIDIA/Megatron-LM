@@ -22,5 +22,6 @@ msc_integration
 data-preparation
 training-examples
 parallelism-guide
+deterministic-training
 features/index
 ```

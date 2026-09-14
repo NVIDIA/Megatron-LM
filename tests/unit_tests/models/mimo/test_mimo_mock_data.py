@@ -25,8 +25,9 @@ def _args():
         seed=123,
         dataset_provider="mock",
         micro_batch_size=2,
-        llm_dp=2,
-        encoder_dp=1,
+        mimo_llm_dp=2,
+        gtp_weight_remat_size=1,
+        mimo_encoder_dp=1,
         seq_length=8,
         image_seq_length=4,
         vocab_size=64,
@@ -46,10 +47,14 @@ def _args():
 def _topology(*, language_rank, encoder_rank=None):
     encoder = RADIO_ENCODER_MODULE_NAME
     grids = {"language": _grid(language_rank)}
-    pgs = {"language": SimpleNamespace(pp=_group(size=3), dp=_group(rank=0, size=2))}
+    pgs = {
+        "language": SimpleNamespace(
+            pp=_group(size=3), dp=_group(rank=0, size=2), dp_cp_gtp_remat=None
+        )
+    }
     if encoder_rank is not None:
         grids[encoder] = _grid(encoder_rank)
-        pgs[encoder] = SimpleNamespace(pp=_group(), dp=_group(rank=1, size=2))
+        pgs[encoder] = SimpleNamespace(pp=_group(), dp=_group(rank=1, size=2), dp_cp_gtp_remat=None)
     return SimpleNamespace(grids=grids, module_pgs=pgs)
 
 
@@ -66,7 +71,7 @@ def adapter(monkeypatch):
 def test_dynamic_radio_loader_emits_patchified_cpu_metadata(adapter):
     args = _args()
     args.micro_batch_size = 2
-    args.llm_dp = 1
+    args.mimo_llm_dp = 1
     args.seq_length = 24
     args.image_seq_length = 12
     args.params_dtype = torch.bfloat16
@@ -105,6 +110,7 @@ def test_data_adapter_builds_independent_role_specific_loaders(adapter):
         _args(), _topology(language_rank=True)
     )
     assert all(loader.batch_size == 2 for loader in language_loaders)
+    assert all(loader.pin_memory for loader in language_loaders)
     assert len({id(loader.dataset) for loader in language_loaders}) == 3
     assert len({loader.dataset.seed for loader in language_loaders}) == 3
     language_batch = next(iter(language_loaders[0]))
@@ -115,6 +121,7 @@ def test_data_adapter_builds_independent_role_specific_loaders(adapter):
         _args(), _topology(encoder_rank=True, language_rank=False)
     )
     assert all(loader.batch_size == 4 for loader in encoder_loaders)
+    assert all(loader.pin_memory for loader in encoder_loaders)
     encoder_batch = next(iter(encoder_loaders[0]))
     assert encoder_batch["input_ids"].shape == (4, 8)
     encoder_inputs = encoder_batch["modality_inputs"][RADIO_ENCODER_MODULE_NAME][

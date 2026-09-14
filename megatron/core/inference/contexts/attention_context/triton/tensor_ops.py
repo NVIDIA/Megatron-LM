@@ -25,8 +25,8 @@ def _tensor_get_slice_after_kernel(
     INPUT_TENSOR,
     OUTPUT_TENSOR,
     POS_ON_DEVICE,
-    INPUT_BATCH_SIZE: tl.constexpr,
-    OUTPUT_BATCH_SIZE: tl.constexpr,
+    INPUT_BATCH_SIZE,
+    OUTPUT_BATCH_SIZE,
     ROW_SIZE: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
@@ -56,10 +56,10 @@ def _tensor_merge_kernel(
     TENSOR_B,
     OUTPUT_TENSOR,
     POS_ON_DEVICE,
-    TENSOR_B_BATCH_SIZE: tl.constexpr,
+    TENSOR_B_BATCH_SIZE,
     ROW_SIZE: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
-    OUTPUT_BATCH_SIZE: tl.constexpr,
+    OUTPUT_BATCH_SIZE,
     IS_INPLACE: tl.constexpr,
 ):
     """

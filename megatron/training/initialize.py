@@ -14,6 +14,7 @@ import torch
 
 from megatron.core import mpu, tensor_parallel
 from megatron.core.fusions.fused_bias_dropout import bias_dropout_add_fused_train
+from megatron.core.fusions.fused_bias_geglu import bias_geglu
 from megatron.core.fusions.fused_bias_gelu import bias_gelu
 from megatron.core.fusions.fused_bias_swiglu import bias_swiglu
 from megatron.core.parallel_state import create_group
@@ -26,7 +27,13 @@ from megatron.core.rerun_state_machine import (
 from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
     enable_batch_invariant_mode,
 )
-from megatron.core.utils import get_pg_rank, get_te_version, is_te_min_version, is_torch_min_version
+from megatron.core.utils import (
+    get_pg_rank,
+    get_pg_size,
+    get_te_version,
+    is_te_min_version,
+    is_torch_min_version,
+)
 from megatron.training import (
     get_adlr_autoresume,
     get_args,
@@ -52,12 +59,15 @@ def initialize_megatron(
     seed_ep_group=None,
     seed_etp_group=None,
     skip_random_seed=False,
+    skip_dependency_compilation=False,
 ):
     """Set global variables, initialize distributed, and
     set autoresume and random seeds.
     `allow_no_cuda` should not be set unless using megatron for cpu only
     data processing. In general this arg should not be set unless you know
     what you are doing.
+    `skip_dependency_compilation` should only be set by workloads that do not
+    use the C++ dataset helpers.
     Returns a function to finalize distributed env initialization
     (optionally, only when args.lazy_mpu_init == True)
     """
@@ -94,8 +104,12 @@ def initialize_megatron(
     )
 
     if args.batch_invariant_mode:
-        print_rank_0("Enabling batch invariant mode globally")
-        enable_batch_invariant_mode()
+        backend = args.batch_invariant_backend
+        collective = args.batch_invariant_collective
+        print_rank_0(
+            f"Enabling batch invariant mode globally (backend={backend}, collective={collective})"
+        )
+        enable_batch_invariant_mode(backend, collective)
 
     # torch.distributed initialization
     def finish_mpu_init():
@@ -152,7 +166,8 @@ def initialize_megatron(
         _init_autoresume()
 
         # Compile dependencies.
-        _compile_dependencies()
+        if not skip_dependency_compilation:
+            _compile_dependencies()
 
         if args.tp_comm_overlap:
             # TODO: Should this be activated with just decoder-tp-comm-overlap too?
@@ -359,12 +374,24 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
         if mpu.model_parallel_is_initialized():
             print("model parallel is already initialized")
         else:
+            if args.gtp_weight_remat_size > 1 or args.expert_gtp_weight_remat_size > 1:
+                from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
+
+                assert HAVE_GTP, (
+                    "GTP requires TransformerEngine >= 2.19. "
+                    "Set both --gtp_remat-weight-remat-size and "
+                    "--expert-generalized-tensor-parallel-remat-size to 1 to disable GTP."
+                )
             mpu.initialize_model_parallel(
                 args.tensor_model_parallel_size,
                 args.pipeline_model_parallel_size,
                 args.virtual_pipeline_model_parallel_size,
                 pipeline_model_parallel_comm_backend=args.pipeline_model_parallel_comm_backend,
                 use_sharp=args.use_sharp,
+                # GTP_remat/EGTP_remat need world divisible by TP*PP*CP*GTP_remat (expert grid
+                # by ETP*EP*PP*EGTP_remat). Inactive when the remat sizes are 1.
+                gtp_remat_size=args.gtp_weight_remat_size,
+                expert_gtp_remat_size=args.expert_gtp_weight_remat_size,
                 context_parallel_size=args.context_parallel_size,
                 hierarchical_context_parallel_sizes=args.hierarchical_context_parallel_sizes,
                 hybrid_context_parallel=args.hybrid_context_parallel,
@@ -383,6 +410,10 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
             print_rank_0(
                 f"> initialized tensor model parallel with size "
                 f"{mpu.get_tensor_model_parallel_world_size()}"
+            )
+            print_rank_0(
+                f"> initialized gtp weight remat with size "
+                f"{mpu.get_gtp_weight_remat_world_size()}"
             )
             print_rank_0(
                 f"> initialized pipeline model parallel with size "
@@ -410,10 +441,12 @@ def _set_random_seed(
     tp_group: Optional[torch.distributed.ProcessGroup] = None,
     ep_group: Optional[torch.distributed.ProcessGroup] = None,
     etp_group: Optional[torch.distributed.ProcessGroup] = None,
+    gtp_remat_group: Optional[torch.distributed.ProcessGroup] = None,
+    egtp_remat_group: Optional[torch.distributed.ProcessGroup] = None,
 ):
     """Set random seed for reproducability.
 
-    The optional pp/dp/tp/ep/etp groups let a caller without an initialized mpu
+    The optional parallel groups let a caller without an initialized mpu
     (e.g. a disjoint-grid run) supply the parallel ranks explicitly; each falls
     back to the mpu group when None.
     """
@@ -432,6 +465,16 @@ def _set_random_seed(
             tp_rank = get_pg_rank(tp_group) if tp_group is not None else None
             ep_rank = get_pg_rank(ep_group) if ep_group is not None else None
             etp_rank = get_pg_rank(etp_group) if etp_group is not None else None
+            gtp_remat_rank = get_pg_rank(gtp_remat_group) if gtp_remat_group is not None else None
+            egtp_remat_rank = (
+                get_pg_rank(egtp_remat_group) if egtp_remat_group is not None else None
+            )
+            gtp_remat_world_size = (
+                get_pg_size(gtp_remat_group) if gtp_remat_group is not None else None
+            )
+            egtp_remat_world_size = (
+                get_pg_size(egtp_remat_group) if egtp_remat_group is not None else None
+            )
             tensor_parallel.model_parallel_cuda_manual_seed(
                 seed,
                 te_rng_tracker,
@@ -440,6 +483,10 @@ def _set_random_seed(
                 tp_rank=tp_rank,
                 ep_rank=ep_rank,
                 etp_rank=etp_rank,
+                gtp_remat_rank=gtp_remat_rank,
+                egtp_remat_rank=egtp_remat_rank,
+                gtp_remat_world_size=gtp_remat_world_size,
+                egtp_remat_world_size=egtp_remat_world_size,
             )
     else:
         raise ValueError("Seed ({}) should be a positive integer.".format(seed_))
@@ -488,7 +535,41 @@ def _warmup_jit_function(tp_size=None):
     else:
         dtype = torch.float32
 
-    # Warmup fused bias+gelu
+    # Check if TE activation function is used (in which case, no need to warmup custom fusions)
+    use_te_activation_func = getattr(args, 'use_te_activation_func', False)
+    gated_linear_unit = getattr(args, 'gated_linear_unit', False)
+
+    # Warmup bias_swiglu: swiglu activation (F.silu + GLU)
+    warmup_bias_swiglu = (
+        not use_te_activation_func
+        and args.swiglu
+        and args.bias_swiglu_fusion
+    )
+
+    warmup_bias_gelu = (
+        not use_te_activation_func
+        and not args.swiglu
+        and not getattr(args, 'quick_geglu', False)
+        and not gated_linear_unit
+        and args.bias_gelu_fusion
+    )
+
+    warmup_bias_geglu = (
+        not use_te_activation_func
+        and not args.swiglu
+        and not getattr(args, 'quick_geglu', False)
+        and gated_linear_unit
+        and args.bias_gelu_fusion
+    )
+
+    # NOTE: the torch.rand draws and the fused bias+dropout+add warmup below
+    # consume the default CUDA RNG stream before training starts. Downstream
+    # training numerics (and the golden values of the functional tests) encode
+    # exactly those consumptions, so they must stay UNCONDITIONAL with their
+    # historical shapes and order, independent of any argument; otherwise the
+    # RNG stream shifts for configs that differ from the golden baselines.
+    # Only the bias_swiglu/bias_gelu/bias_geglu calls are gated on arguments:
+    # they consume no RNG, so skipping them cannot perturb determinism.
     bias = torch.rand(
         args.ffn_hidden_size // args.tensor_model_parallel_size, dtype=dtype, device="cuda"
     )
@@ -501,18 +582,38 @@ def _warmup_jit_function(tp_size=None):
         dtype=dtype,
         device="cuda",
     )
-    # Warmup JIT fusions with the input grad_enable state of both forward
-    # prop and recomputation
-    for bias_grad, input_grad in zip([True, True], [False, True]):
-        bias.requires_grad, input.requires_grad = bias_grad, input_grad
-        for _ in range(5):
-            if args.swiglu:
-                output = bias_swiglu(input, bias)
-            else:
-                output = bias_gelu(bias, input)
-    del bias, input, output
 
-    # Warmup fused bias+dropout+add
+    # Warmup JIT fusions with the input grad_enable state of both forward
+    # prop and recomputation. The three branches are mutually exclusive.
+    if warmup_bias_swiglu:
+        for bias_grad, input_grad in zip([True, True], [False, True]):
+            bias.requires_grad, input.requires_grad = bias_grad, input_grad
+            for _ in range(5):
+                output = bias_swiglu(input, bias)
+        del output
+    elif warmup_bias_gelu:
+        for bias_grad, input_grad in zip([True, True], [False, True]):
+            bias.requires_grad, input.requires_grad = bias_grad, input_grad
+            for _ in range(5):
+                output = bias_gelu(bias, input)
+        del output
+    elif warmup_bias_geglu:
+        # bias_geglu splits the last dim into two GLU halves, so its tensors
+        # are 2x ffn-sized. torch.cat consumes no RNG, so doubling the drawn
+        # tensors here keeps the RNG stream identical to the historical code.
+        geglu_bias = torch.cat([bias, bias], dim=-1)
+        geglu_input = torch.cat([input, input], dim=-1)
+        for bias_grad, input_grad in zip([True, True], [False, True]):
+            geglu_bias.requires_grad, geglu_input.requires_grad = bias_grad, input_grad
+            for _ in range(5):
+                output = bias_geglu(geglu_bias, geglu_input)
+        del output, geglu_bias, geglu_input
+    del bias, input
+
+    # Warmup fused bias+dropout+add. Intentionally NOT gated on
+    # args.bias_dropout_fusion: the fused train calls consume RNG for the
+    # dropout mask, and conditioning them would shift downstream determinism
+    # relative to the historical behavior encoded in the golden values.
     if args.sequence_parallel:
         # tp_size threaded by the caller (hetero MIMO language PGC); None -> mpu.
         seq_length = args.seq_length // (tp_size or mpu.get_tensor_model_parallel_world_size())
@@ -539,6 +640,7 @@ def _warmup_jit_function(tp_size=None):
         for _ in range(5):
             output = bias_dropout_add_fused_train([input, bias], residual, dropout_rate)
     del bias, input, residual, output
+
     torch.cuda.empty_cache()
 
 
@@ -564,3 +666,13 @@ def setup_logging() -> None:
         if is_rank0():
             logger.info(f'Setting logging level to {logging_level}')
         logging.getLogger().setLevel(logging_level)
+
+    if not is_rank0():
+        for noisy_logger_name in [
+            'GroupedGemmQuantSm100',
+            'GroupedGemmDsreluSm100',
+            'GroupedGemmSreluSm100',
+            'GroupedGemmWgradSm100',
+            'absl',
+        ]:
+            logging.getLogger(noisy_logger_name).setLevel(logging.ERROR)

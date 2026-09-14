@@ -20,6 +20,7 @@ MODEL_ARGS:
   --apply-wd-to-qk-layernorm: true
   --attention-output-gate: true
   --experimental-attention-variant: gated_delta_net
+  --gdn-kernel-backend: transformer_engine
   --linear-attention-freq: 3
   --linear-conv-kernel-dim: 4
   --linear-key-head-dim: 64
@@ -80,3 +81,4 @@ MODEL_ARGS:
   --attention-backend: unfused
   --log-memory-to-tensorboard: true
 TEST_TYPE: ckpt-resume
+LAUNCHER: ft_launcher

@@ -20,7 +20,7 @@ knowledge distillation, pruning, speculative decoding, and more.
 
 ## Major Features
 
-- Start from Hugging Face pretrained model checkpoint with on-the-fly conversion to Megatron-LM checkpoint format.
+- Optimize Megatron-Core distributed checkpoints.
 - Support all kinds of model parallelism (TP, EP, ETP, PP).
 - Export to TensorRT-LLM, vLLM, and SGLang ready unified checkpoint.
 
@@ -33,6 +33,7 @@ knowledge distillation, pruning, speculative decoding, and more.
 | `meta-llama/Llama-4-{Scout,Maverick}-17B-{16,128}E-Instruct` | ✅ | ✅ | - | - |
 | `moonshotai/Kimi-K2-Instruct` | ✅ | ✅ | - | - |
 | `nvidia/NVIDIA-Nemotron-Nano-9B-v2` | ✅ | - | ✅ | ✅ |
+| `nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B` | ✅ | - | ✅ | ✅ |
 | `nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16` | ✅ | - | ✅ | ✅ |
 | `nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16` | ✅ | - | ✅ | ✅ |
 | `nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16` | ✅ | - | ✅ | ✅ |
@@ -40,26 +41,74 @@ knowledge distillation, pruning, speculative decoding, and more.
 | `Qwen/Qwen3-{0.6B, 8B}` | ✅ | ✅ | ✅ | ✅ |
 | `Qwen/Qwen3-{30B-A3B, 235B-A22B}` | **WAR** | ✅ | ✅ | ✅ |
 
-## Getting Started in a Local Environment
 
-Install `nvidia-modelopt` from [PyPI](https://pypi.org/project/nvidia-modelopt/):
+## Setup
+
+Run these examples in an NVIDIA GPU container. The [NVIDIA NGC NeMo container
+catalog](https://catalog.ngc.nvidia.com/orgs/nvidia/-/containers/nemo/-/tags)
+lists the current release; the commands below use `nvcr.io/nvidia/nemo:26.08`.
+The container includes Megatron-Bridge and a compatible Model Optimizer
+installation.
+
+To run the examples from a Megatron-LM checkout, mount that checkout and a
+workspace for Hugging Face models, checkpoints, datasets, and outputs. The
+workspace remains on the host after the container exits. Set `HF_TOKEN` before
+starting the container when accessing gated Hugging Face models.
+
 ```sh
-pip install -U nvidia-modelopt
+MEGATRON_LM_PATH=/path/to/Megatron-LM
+WORKSPACE_PATH=/path/to/modelopt-workspace
+
+docker run --rm -it --gpus all --shm-size=24g \
+    -e HF_TOKEN \
+    -v "${MEGATRON_LM_PATH}:/workspace/Megatron-LM" \
+    -v "${WORKSPACE_PATH}:/workspace/modelopt-workspace" \
+    -w /workspace/Megatron-LM/examples/post_training/modelopt \
+    nvcr.io/nvidia/nemo:26.08 \
+    bash
 ```
-Alternatively, you can install from [source](https://github.com/NVIDIA/Model-Optimizer)
-to try our latest features.
 
-> **❗ IMPORTANT:** The first positional argument (e.g. `meta-llama/Llama-3.2-1B-Instruct`) of each script
-> is the config name used to match the supported model config in `conf/`. The pretrained HF checkpoint should
-> be downloaded and provided through `${HF_MODEL_CKPT}`.
+Inside the container, run an example normally and set `MLM_SKIP_INSTALL=1` to
+use the Model Optimizer installation provided by the container. To try the
+latest Model Optimizer features from [source](https://github.com/NVIDIA/Model-Optimizer),
+add the following mount to the `docker run` command above:
 
+```sh
+MODEL_OPTIMIZER_PATH=/path/to/Model-Optimizer
+# Add: -v "${MODEL_OPTIMIZER_PATH}:/workspace/Model-Optimizer"
+```
 
-### ⭐ NVFP4 Quantization, Quantization-Aware Training, and Model Export
+Then install the mounted checkout inside the container. Keep
+`MLM_SKIP_INSTALL=1` when running the examples so their requirements file does
+not replace the editable installation:
 
-Provide the pretrained checkpoint path through variable `${HF_MODEL_CKPT}` and provide variable
-`${MLM_MODEL_SAVE}` which stores a resumeable Megatron-LM distributed checkpoint. To export
-Hugging Face-Like quantized checkpoint for TensorRT-LLM, vLLM, or SGLang deployement,
-provide `${EXPORT_DIR}` to `export.sh`.
+```sh
+pip install -e /workspace/Model-Optimizer
+```
+
+### Megatron-Core Checkpoint Prerequisite
+
+All examples require a Megatron-Core distributed checkpoint. To import a
+Hugging Face model, run the [Megatron-Bridge stable checkpoint conversion
+CLI](https://github.com/NVIDIA-NeMo/Megatron-Bridge/tree/main/examples/conversion#2-stable-checkpoint-conversion-cli)
+inside the NeMo container started above.
+
+Use `--device cpu` when the conversion fits in host memory; otherwise use
+`--device gpu` with the intended `--tp`, `--pp`, and `--ep` layout. See the
+Megatron-Bridge conversion documentation for distributed imports and supported
+architectures. To quantize directly from Hugging Face, use the
+[Megatron-Bridge quantization examples](https://github.com/NVIDIA-NeMo/Megatron-Bridge/tree/main/examples/quantization).
+
+### Megatron Model Configs
+
+**❗ IMPORTANT:** The first positional argument (e.g. `meta-llama/Llama-3.2-1B-Instruct`) of each script is the config name used to match the supported model config in `conf/`. Make sure the model you are running is supported by a config in `conf/`.
+
+## ⭐ Post-Training Quantization
+
+Post-training quantization (PTQ) converts a Megatron-Core checkpoint to a
+simulated or real low-precision checkpoint without training. Provide the
+imported checkpoint through `${MLM_MODEL_CKPT}` and set `${MLM_MODEL_SAVE}` to
+the resumable Megatron-LM distributed checkpoint to create.
 
 > **📙 NOTE:** ModelOpt supports different quantization formats which are listed in the [ModelOpt quant configs](https://github.com/NVIDIA/Model-Optimizer/blob/7971fff05882da7eae16eae6bc927d1481dcd63f/modelopt/torch/quantization/config.py#L626).
 > The quant config is specified by the full config name in all-caps, e.g. NVFP4_DEFAULT_CFG.
@@ -71,31 +120,14 @@ provide `${EXPORT_DIR}` to `export.sh`.
 ```sh
 \
     TP=1 \
-    HF_MODEL_CKPT=<pretrained_model_name_or_path> \
+    MLM_MODEL_CKPT=<megatron_core_checkpoint> \
     MLM_MODEL_SAVE=/tmp/Llama-3.2-1B-Instruct_quant \
     ./quantize.sh meta-llama/Llama-3.2-1B-Instruct NVFP4_DEFAULT_CFG 
-
-\
-    PP=1 \
-    HF_MODEL_CKPT=<pretrained_model_name_or_path> \
-    MLM_MODEL_CKPT=/tmp/Llama-3.2-1B-Instruct_quant \
-    EXPORT_DIR=/tmp/Llama-3.2-1B-Instruct_export \
-    ./export.sh meta-llama/Llama-3.2-1B-Instruct
-```
-
-To export the model for vLLM fakequant example in `modelopt/examples/vllm_serve/vllm_serve_fakequant.py`,
-export the model with flag `--export-vllm-fq`:
-```sh
-\
-    PP=1 \
-    MLM_EXTRA_ARGS=--export-vllm-fq \
-    HF_MODEL_CKPT=<pretrained_model_name_or_path> \
-    MLM_MODEL_CKPT=/tmp/Llama-3.2-1B-Instruct_quant \
-    EXPORT_DIR=/tmp/Llama-3.2-1B-Instruct_export \
-    ./export.sh meta-llama/Llama-3.2-1B-Instruct
 ```
 
 For KV cache quantization, add a flag like `MLM_EXTRA_ARGS="--export-kv-cache-quant fp8"` while specifying your desired KV cache precision (see `KV_QUANT_CFG_CHOICES` in `quantize.py`).
+
+For QAT exports, set `MLM_EXTRA_ARGS=--no-clamp-kv-scales` to disable KV-cache scale clamping and preserve the learned scales.
 
 ### ⭐ Auto Quantize (Mixed-Precision Search)
 
@@ -115,17 +147,10 @@ via the auto-quantize arguments.
 ```sh
 \
     TP=1 \
-    HF_MODEL_CKPT=<pretrained_model_name_or_path> \
+    MLM_MODEL_CKPT=<megatron_core_checkpoint> \
     MLM_MODEL_SAVE=/tmp/Llama-3.2-1B-Instruct_auto_quant \
     MLM_EXTRA_ARGS="--auto-quantize-bits 4.0" \
     ./quantize.sh meta-llama/Llama-3.2-1B-Instruct auto
-
-\
-    PP=1 \
-    HF_MODEL_CKPT=<pretrained_model_name_or_path> \
-    MLM_MODEL_CKPT=/tmp/Llama-3.2-1B-Instruct_auto_quant \
-    EXPORT_DIR=/tmp/Llama-3.2-1B-Instruct_auto_quant_export \
-    ./export.sh meta-llama/Llama-3.2-1B-Instruct
 ```
 
 Key arguments (passed via `MLM_EXTRA_ARGS`):
@@ -138,7 +163,78 @@ Key arguments (passed via `MLM_EXTRA_ARGS`):
 | `--auto-quantize-score-size` | `128` | Number of samples used for sensitivity scoring. |
 | `--auto-quantize-checkpoint` | `None` | Optional path to save/restore search state across runs. |
 
-### ⭐ Online BF16 EAGLE3 Training
+Export the PTQ checkpoint with [`export.sh`](#-megatron-checkpoint-export)
+before running inference with it.
+
+## ⭐ Quantization Aware Training & Distillation
+
+Quantization-aware training (QAT) fine-tunes the PTQ checkpoint with the
+supervised cross-entropy loss to adapt it to a target task.
+
+```sh
+\
+    TP=1 \
+    MLM_MODEL_CKPT=/tmp/Llama-3.2-1B-Instruct_quant \
+    MLM_MODEL_SAVE=/tmp/Llama-3.2-1B-Instruct-qat \
+    ./finetune.sh meta-llama/Llama-3.2-1B-Instruct
+```
+
+Quantization-aware distillation (QAD) instead distills the quantized student from a frozen BF16
+teacher to recover quantization accuracy. Both workflows use `finetune.sh`
+with the PTQ checkpoint in `${MLM_MODEL_CKPT}`.  For QAD, add the BF16 teacher checkpoint through `--export-kd-teacher-load`. The teacher checkpoint must include `model_config.yaml`, or provide its path
+with `--export-kd-teacher-model-config`:
+
+```sh
+\
+    TP=1 \
+    MLM_MODEL_CKPT=/tmp/Llama-3.2-1B-Instruct_quant \
+    MLM_MODEL_SAVE=/tmp/Llama-3.2-1B-Instruct-qad \
+    MLM_EXTRA_ARGS="--export-kd-teacher-load /path/to/Llama-3.2-1B-Instruct-bf16 \
+        --export-kd-teacher-model-config /path/to/Llama-3.2-1B-Instruct-bf16/model_config.yaml" \
+    ./finetune.sh meta-llama/Llama-3.2-1B-Instruct
+```
+
+See the [distillation documentation](./distillation.md) for teacher checkpoint
+requirements and optional distillation-loss configuration.
+
+For both QAT and QAD, configure the training data, hyper parameters, and the PTQ student and/or BF16 teacher according to your desired training recipe.
+
+Export the QAT or QAD checkpoint with [`export.sh`](#-megatron-checkpoint-export)
+before running inference with it.
+
+## ⭐ Megatron Checkpoint Export
+
+Export converts a Megatron-LM distributed checkpoint to the unified Hugging
+Face format used for inference with vLLM, TensorRT-LLM, and SGLang. Provide the
+checkpoint through `${MLM_MODEL_CKPT}` and set `${EXPORT_DIR}` to the export
+destination.
+
+```sh
+\
+    PP=1 \
+    MLM_MODEL_CKPT=/tmp/Llama-3.2-1B-Instruct_quant \
+    EXPORT_DIR=/tmp/Llama-3.2-1B-Instruct_export \
+    ./export.sh meta-llama/Llama-3.2-1B-Instruct
+```
+
+To export for the vLLM fake-quant example in
+`modelopt/examples/vllm_serve/vllm_serve_fakequant.py`, add
+`--export-vllm-fq`:
+
+```sh
+\
+    PP=1 \
+    MLM_EXTRA_ARGS=--export-vllm-fq \
+    MLM_MODEL_CKPT=/tmp/Llama-3.2-1B-Instruct_quant \
+    EXPORT_DIR=/tmp/Llama-3.2-1B-Instruct_export \
+    ./export.sh meta-llama/Llama-3.2-1B-Instruct
+```
+
+For KV cache quantization, add
+`MLM_EXTRA_ARGS="--export-kv-cache-quant fp8"` and specify the desired KV
+cache precision (see `KV_QUANT_CFG_CHOICES` in `quantize.py`).
+
+## ⭐ Online BF16 EAGLE3 Training
 
 Online EAGLE3 training has both the target (frozen) and draft models in the memory where the `hidden_states`
 required for training is generated on the fly. Periodically, acceptance length (AL, the higher the better) is
@@ -162,7 +258,7 @@ deployment.
 
 See [Advanced Topics](./ADVANCED.md) for a `moonshotai/Kimi-K2-Instruct` EAGLE3 training example using `slurm`.
 
-### ⭐ Offline BF16 EAGLE3 Training
+## ⭐ Offline BF16 EAGLE3 Training
 Unlike online EAGLE3 training, offline workflow precomputes target model `hidden_states` and dumps to disk.
 Then only the draft model is called during training. AL is no longer reported during training. After training,
 `export.sh` is used to export EAGLE3 checkpoint.
@@ -205,7 +301,7 @@ Then only the draft model is called during training. AL is no longer reported du
     ./export.sh meta-llama/Llama-3.2-1B-Instruct
 ```
 
-### ⭐ Pruning
+## ⭐ Pruning
 
 Pruning is supported for GPT and Mamba models in Pipeline Parallel mode. The `prune.sh` script
 prunes a model by passing `--prune-export-config '<json_without_spaces>'` to `prune.py` via `MLM_EXTRA_ARGS`.
@@ -248,7 +344,7 @@ For NAS-based automatic pruning (search across many candidate architectures and 
 MMLU scoring), see the [Megatron-Bridge pruning example](https://github.com/NVIDIA/Model-Optimizer/tree/main/examples/megatron_bridge#pruning).
 Checkout pruning getting started and general guidelines in the [ModelOpt pruning README](https://github.com/NVIDIA/Model-Optimizer/tree/main/examples/pruning).
 
-### ⭐ Inference and Training
+## ⭐ Inference and Training
 
 The saved Megatron-LM distributed checkpoint (output of above scripts) can be resumed for inference
 (generate or evaluate) or training (SFT or PEFT). To read more about these features, see

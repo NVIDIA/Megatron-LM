@@ -196,9 +196,10 @@ def _build_mamba_model(
     post_process: bool = True,
 ) -> HybridModel:
     """Build a HybridModel with the given hybrid layer pattern."""
-    layer_type_list = validate_segment_layers(layer_pattern)
     mamba_config = copy.deepcopy(config)
-    mamba_config.num_layers = len(layer_type_list)
+    mamba_config.num_layers = len(layer_pattern)
+    layer_config_list = validate_segment_layers(layer_pattern, mamba_config)
+    assert len(layer_config_list) == mamba_config.num_layers
     assert mamba_config.num_layers == _NUM_GPT_LAYERS * 2
     model = HybridModel(
         config=mamba_config,

@@ -31,7 +31,12 @@ class ContextGPUView:
         max_kv_blocks: int,
         device: torch.device,
         max_mamba_chunks: int = 0,
+        mamba_decode_indices_dtype: torch.dtype = torch.int64,
+        max_gdp_chunks: int = 0,
+        max_gdp_chunks_dp: int = 0,
+        has_gdp: bool = False,
     ):
+        assert mamba_decode_indices_dtype in (torch.int32, torch.int64)
         # Field layout (must match DynamicInferenceContext's CPU buffer layout):
         #   int64 token fields first (auto 8-byte alignment), then int32 token
         #   fields, then int32 request fields, then int32 MHA fields, then
@@ -43,6 +48,9 @@ class ContextGPUView:
         # query_lengths, kv_length_offsets) + 1 int32 (top_k) + 2 float32
         # (temperature, top_p) + 1 int32 (active_request_last_token_idxs) = 7 fields.
         req_4byte_bytes = max_requests * 4
+        # Scalar: real (unpadded) token count for the current step. Used by
+        # MoE routing to mask out CUDA-graph padding tokens.
+        real_token_count_bytes = 4
 
         # MHA section: 5 fields shared by both graphed and non-graphed MHAMetadata
         # (only one is active per step, so sharing storage is fine).
@@ -60,7 +68,7 @@ class ContextGPUView:
         mha_block_table_bytes = max_bs * max_kv_blocks * 4
 
         # Mamba section, only present for hybrid models.
-        #   mamba_batch_indices_decode    int64 (max_bs,)
+        #   mamba_batch_indices_decode    int32 or int64 (max_bs,)
         #   mamba_batch_indices_prefill   int32 (max_bs,)
         #   mamba_seq_idx                 int32 (1, max_tokens)
         #   mamba_cu_seqlens              int32 (max_bs + 1,)
@@ -74,6 +82,7 @@ class ContextGPUView:
             3 * tok_int64_bytes
             + 3 * tok_int32_bytes
             + 7 * req_4byte_bytes
+            + real_token_count_bytes
             + mha_query_lengths_bytes
             + mha_cu_query_seq_lengths_bytes
             + mha_kv_seq_lengths_bytes
@@ -82,9 +91,11 @@ class ContextGPUView:
         )
 
         if max_mamba_chunks > 0:
-            # mamba_batch_indices_decode is int64; pad to 8-byte alignment.
-            mamba_align_pad = (8 - pre_mamba_bytes % 8) % 8
-            mamba_batch_indices_decode_bytes = max_bs * 8
+            decode_index_bytes = 4 if mamba_decode_indices_dtype == torch.int32 else 8
+            mamba_align_pad = (
+                decode_index_bytes - pre_mamba_bytes % decode_index_bytes
+            ) % decode_index_bytes
+            mamba_batch_indices_decode_bytes = max_bs * decode_index_bytes
             mamba_batch_indices_prefill_bytes = max_bs * 4
             mamba_seq_idx_bytes = max_tokens * 4
             mamba_cu_seqlens_bytes = (max_bs + 1) * 4
@@ -117,6 +128,26 @@ class ContextGPUView:
             + mamba_seq_idx_for_varlen_bytes
             + mamba_conv_seq_idx_bytes
             + mamba_conv_seq_start_bytes
+        )
+        # GDP chunk descriptor section, only present for GDP models. All int32,
+        # so no alignment padding is needed after the Mamba section.
+        #   gdp_chunk_indices     int32 (max_gdp_chunks, 2)
+        #   gdp_chunk_indices_dp  int32 (max_gdp_chunks_dp, 2)
+        #   gdp_chunk_offsets     int32 (max_bs + 1,)
+        # `has_gdp` (not a chunk count) is the presence predicate, so that this
+        # layout and the CPU buffer layout in DynamicInferenceContext -- which
+        # must byte-match it -- cannot drift if the worst-case chunk-count
+        # formula ever returns zero for a GDP model.
+        if has_gdp:
+            gdp_chunk_indices_bytes = max_gdp_chunks * 2 * 4
+            gdp_chunk_indices_dp_bytes = max_gdp_chunks_dp * 2 * 4
+            gdp_chunk_offsets_bytes = (max_bs + 1) * 4
+        else:
+            gdp_chunk_indices_bytes = 0
+            gdp_chunk_indices_dp_bytes = 0
+            gdp_chunk_offsets_bytes = 0
+        total_bytes += (
+            gdp_chunk_indices_bytes + gdp_chunk_indices_dp_bytes + gdp_chunk_offsets_bytes
         )
 
         # Zero-initialized so pre-transfer reads see zeros (matches prior semantics).
@@ -163,6 +194,12 @@ class ContextGPUView:
         )
         off += req_4byte_bytes
 
+        # Real (unpadded) token count for the current step. Scalar int32 view.
+        # MoE routing reads this to skip routing CUDA-graph padding tokens to
+        # experts. Refreshed each step by transfer_bookkeeping_to_gpu().
+        self.real_token_count = self._buf[off : off + real_token_count_bytes].view(torch.int32)
+        off += real_token_count_bytes
+
         # MHA flash-attention metadata (shared between GraphedMHAMetadata and
         # NonGraphedMHAMetadata — only one is active per step).
         self.mha_query_lengths = self._buf[off : off + mha_query_lengths_bytes].view(torch.int32)
@@ -192,7 +229,7 @@ class ContextGPUView:
             off += mamba_align_pad
             self.mamba_batch_indices_decode = self._buf[
                 off : off + mamba_batch_indices_decode_bytes
-            ].view(torch.int64)
+            ].view(mamba_decode_indices_dtype)
             off += mamba_batch_indices_decode_bytes
             self.mamba_batch_indices_prefill = self._buf[
                 off : off + mamba_batch_indices_prefill_bytes
@@ -234,5 +271,30 @@ class ContextGPUView:
             self.mamba_seq_idx_for_varlen = None
             self.mamba_conv_seq_idx = None
             self.mamba_conv_seq_start = None
+
+        # GDP chunk descriptors (GDP models only). Each matches a pinned CPU
+        # view in DynamicInferenceContext._cpu_bookkeeping_buf and rides the
+        # same coalesced H2D as the Mamba fields above.
+        if has_gdp:
+            self.gdp_chunk_indices = (
+                self._buf[off : off + gdp_chunk_indices_bytes]
+                .view(torch.int32)
+                .view(max_gdp_chunks, 2)
+            )
+            off += gdp_chunk_indices_bytes
+            self.gdp_chunk_indices_dp = (
+                self._buf[off : off + gdp_chunk_indices_dp_bytes]
+                .view(torch.int32)
+                .view(max_gdp_chunks_dp, 2)
+            )
+            off += gdp_chunk_indices_dp_bytes
+            self.gdp_chunk_offsets = self._buf[off : off + gdp_chunk_offsets_bytes].view(
+                torch.int32
+            )
+            off += gdp_chunk_offsets_bytes
+        else:
+            self.gdp_chunk_indices = None
+            self.gdp_chunk_indices_dp = None
+            self.gdp_chunk_offsets = None
 
         assert off == total_bytes, f"layout bug: wrote {off} of {total_bytes} bytes"

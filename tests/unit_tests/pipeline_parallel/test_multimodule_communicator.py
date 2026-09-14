@@ -79,6 +79,11 @@ class TestMultiModulePipelineCommunicator:
         assert mllm_comm.config == config
         assert mllm_comm.current_rank == dist.get_rank()
 
+        for module_name, rank_module_info in mllm_comm.rank_module_map.items():
+            assert mllm_comm.is_module_pp_first_stage(module_name) == (
+                rank_module_info.pp_rank == 0
+            )
+
     def test_compute_total_pipeline_stages(self):
         """Test compute_total_pipeline_stages for overall chain and until specific ranks."""
 
