@@ -54,11 +54,6 @@ def _record_immediate_wgrad_context(store: Any) -> None:
     store._mlite_immediate_wgrad_contexts = count + 1
 
 
-def _caller_owned_dummy_is_capturing(main_grad: torch.Tensor) -> bool:
-    """Whether a dummy wgrad must retain CUDA-graph replay pointer stability."""
-    return main_grad.is_cuda and bool(torch.cuda.is_current_stream_capturing())
-
-
 def _caller_owned_dummy_wgrad(
     main_grad: torch.Tensor, weight: torch.Tensor, *, zero: bool
 ) -> torch.Tensor:
@@ -71,7 +66,7 @@ def _caller_owned_dummy_wgrad(
     capture is the narrow exception: TE's keyed cache supplies a replay-stable
     address until a graph lifecycle owner is available here.
     """
-    if _caller_owned_dummy_is_capturing(main_grad):
+    if main_grad.is_cuda and torch.cuda.is_current_stream_capturing():
         from transformer_engine.pytorch.module.base import get_dummy_wgrad
 
         return get_dummy_wgrad(list(main_grad.shape), weight.dtype, zero=zero)

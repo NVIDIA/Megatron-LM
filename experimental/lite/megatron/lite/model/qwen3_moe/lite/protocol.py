@@ -17,15 +17,8 @@ Protocol convention (what runtime calls):
   Escape hatch:
     create_runtime(hf_path, cfg) -> Runtime          — fully override runtime
 
-Qwen3 ChunkedEP fields in ``ImplConfig``:
-  ``enable_ep_chunk_overlap`` enables the two-physical-slot DeepEP composition
-  (``ep_chunk_count`` selects the logical chunk count, default 2);
-  ``ep_chunk_max_token_rows_per_rank`` is the required flattened per-rank
-  forward capacity; ``ep_chunk_full_recompute`` selects fwd+fused-fwd-bwd
-  composition. ChunkedEP requires DeepEP, EP>1, top-k<=EP, and an explicit
-  capacity. Full recompute requires ChunkedEP; normal ChunkedEP rejects outer
-  ``moe``/``full`` recompute. ChunkedEP with MTP is rejected before allocation.
-  Head and cross-entropy computation retain their existing configuration.
+ChunkedEP configuration, supported combinations, and measurements:
+``experimental/lite/examples/bench/chunked_ep.md``.
 """
 
 from __future__ import annotations
@@ -43,9 +36,7 @@ from megatron.lite.model.protocol_utils import (
     add_loss_context_kwargs,
     pack_magi_forward_kwargs,
     pack_thd_forward_kwargs,
-)
-from megatron.lite.model.protocol_utils import router_replay_roots as router_replay_roots
-from megatron.lite.model.protocol_utils import (
+    router_replay_roots as router_replay_roots,
     set_cross_entropy_fusion,
     unpack_magi_forward_output,
     unpack_thd_forward_output,
@@ -72,7 +63,11 @@ from megatron.lite.primitive.modules.moe_ep_chunk_overlap_policy import (
     validate_ep_chunk_overlap_config,
 )
 from megatron.lite.primitive.parallel import ParallelState, init_parallel
-from megatron.lite.primitive.quantization import QATSpec, apply_qat_to_chunks, normalize_qat_spec
+from megatron.lite.primitive.quantization import (
+    QATSpec,
+    apply_qat_to_chunks,
+    normalize_qat_spec,
+)
 from megatron.lite.primitive.recompute import apply_recompute, parse_recompute_spec
 from megatron.lite.runtime.contracts import OptimizerConfig, ParallelConfig
 from megatron.lite.runtime.contracts.data import PackedBatch
@@ -205,15 +200,6 @@ def _forward_step_bshd(model: nn.Module, batch: PackedBatch) -> dict:
     return model(input_ids=batch.input_ids.reshape(1, -1), labels=labels, packed_seq_params=None)
 
 
-def _qwen3_recompute_modules_for_ep_chunk_overlap(
-    modules: list[str], *, enabled: bool
-) -> list[str]:
-    """Let the Qwen composition own full ChunkedEP layer recomputation."""
-    if not enabled:
-        return modules
-    return []
-
-
 def unpack_forward_output(model: nn.Module, batch: PackedBatch, output) -> Any:
     if _model_attention_backend(model) == "magi":
         return unpack_magi_forward_output(model, batch, output)
@@ -290,10 +276,9 @@ def build_model(model_cfg: Qwen3MoEConfig, *, impl_cfg: ImplConfig) -> ModelBund
 
     # ── build chunks ──
     recompute_spec = parse_recompute_spec(
-        _qwen3_recompute_modules_for_ep_chunk_overlap(
-            impl_cfg.recompute,
-            enabled=(impl_cfg.enable_ep_chunk_overlap and impl_cfg.ep_chunk_full_recompute),
-        )
+        []
+        if impl_cfg.enable_ep_chunk_overlap and impl_cfg.ep_chunk_full_recompute
+        else impl_cfg.recompute
     )
     model_kwargs: dict[str, Any] = dict(
         use_deepep=impl_cfg.use_deepep,
@@ -465,7 +450,11 @@ def export_hf_weights(
 
 
 def save_hf_weights(
-    chunks: list[nn.Module], path: str, model_cfg: Qwen3MoEConfig, ps: ParallelState, **kwargs
+    chunks: list[nn.Module],
+    path: str,
+    model_cfg: Qwen3MoEConfig,
+    ps: ParallelState,
+    **kwargs,
 ) -> None:
     from megatron.lite.model.qwen3_moe.lite.checkpoint import save_hf_weights as _save
 

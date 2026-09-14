@@ -58,6 +58,11 @@ Negative reductions mean increased memory. Loss maximum absolute differences
 were 0 and 5.15e-5, respectively; sampled gradient differences were at most
 3.80e-7 and 2.80e-7. These are not full-tensor precision checks. Both scales
 completed offload/recovery with no measured allocator retries or OOMs; lazy
-capacity still grew after warmup. Qualification of normal backward, optimizer
-updates, and isolated OP activation savings remains incomplete. Older combined
-head/CE measurements are not isolated ChunkedEP gains.
+capacity still grew after warmup. At `2a2f98a03`, normal-backward smoke tests
+(1 layer, 32768 local tokens, 1 microbatch, EP8/top-k8, chunks 2/3/4,
+1 warmup + 2 repeats, no optimizer update) completed on all eight ranks:
+loss differences were zero and sampled gradient differences were at most
+1.20e-7. These short runs establish neither formal speedup nor full-tensor parity.
+Final-source end-to-end qualification, optimizer updates, and isolated OP
+activation savings remain incomplete. Older combined head/CE measurements
+are not isolated ChunkedEP gains.

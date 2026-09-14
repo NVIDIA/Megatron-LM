@@ -973,13 +973,11 @@ class _ChunkContext:
 
     @classmethod
     def from_dispatch(cls, state, metadata, scores, expert_out, *, retain_output=False, **kwargs):
-        scores_edge = expert_out_edge = None
-        if hasattr(torch.autograd.graph, "get_gradient_edge"):
-            scores_edge = torch.autograd.graph.get_gradient_edge(scores)
-            expert_out_edge = torch.autograd.graph.get_gradient_edge(expert_out)
+        scores_edge = torch.autograd.graph.get_gradient_edge(scores)
+        expert_out_edge = torch.autograd.graph.get_gradient_edge(expert_out)
         return cls(
             **kwargs,
-            scores=scores if scores_edge is None else None,
+            scores=None,
             handle=state["handle"],
             row_id_map=metadata["manual_row_id_map"].detach(),
             prob_flat_indices=metadata["manual_prob_flat_indices"].detach(),
@@ -988,7 +986,7 @@ class _ChunkContext:
             recv_probs_shape=state["recv_probs"].shape,
             recv_probs_dtype=state["recv_probs"].dtype,
             recv_probs_base=state["recv_probs"],
-            expert_out=expert_out if retain_output or expert_out_edge is None else None,
+            expert_out=expert_out if retain_output else None,
             scores_edge=scores_edge,
             scores_shape=scores.shape,
             scores_dtype=scores.dtype,
@@ -1397,13 +1395,24 @@ class _EPChunkOperationBase:
             workspace cannot keep a prior dispatch-backward lease and delayed
             wgrad aliases alive through another FC1/SwiGLU activation.
             """
-            _retire_one_fused_dispatch_bwd(
-                pending_dispatch_bwd,
-                compute_stream=compute_stream,
-                router_params=router_params,
-                grad_x_chunks=grad_x_chunks,
-                router_accum=router_accum,
-            )
+            if len(pending_dispatch_bwd) > 1:
+                raise RuntimeError("EP chunk fused backward retained more than one pending chunk")
+            if not pending_dispatch_bwd:
+                return
+            chunk, local_state = pending_dispatch_bwd.pop()
+            with torch.cuda.stream(compute_stream):
+                grad_hidden, grad_scores = chunk.dispatcher.finish_deepep_dispatch_backward(
+                    local_state["dispatch_bwd_state"]
+                )
+                grad_x_chunks[chunk.idx] = _backward_router(
+                    chunk, grad_hidden, grad_scores, router_params, router_accum
+                )
+                chunk.scores = None
+                chunk.scores_edge = None
+                consumed = torch.cuda.Event()
+                consumed.record(compute_stream)
+                chunk.workspace_lease.release(consumed)
+                local_state.clear()
 
         with torch.enable_grad():
             next_state = submit_recompute_dispatch(len(ranges) - 1)
@@ -1937,35 +1946,6 @@ def _submit_dispatch_backward(chunk, grad_hidden, grad_probs, stream, ready, pre
     return state
 
 
-def _retire_one_fused_dispatch_bwd(
-    pending: list[tuple[_BackwardChunk, dict[str, Any]]],
-    *,
-    compute_stream: torch.cuda.Stream,
-    router_params: tuple[torch.Tensor, ...],
-    grad_x_chunks: list[torch.Tensor | None],
-    router_accum: list[torch.Tensor | None],
-) -> None:
-    """Finish one dispatched backward chunk and release its slot lease."""
-    if len(pending) > 1:
-        raise RuntimeError("EP chunk fused backward retained more than one pending chunk")
-    if not pending:
-        return
-    chunk, local_state = pending.pop()
-    with torch.cuda.stream(compute_stream):
-        grad_hidden, grad_scores = chunk.dispatcher.finish_deepep_dispatch_backward(
-            local_state["dispatch_bwd_state"]
-        )
-        grad_x_chunks[chunk.idx] = _backward_router(
-            chunk, grad_hidden, grad_scores, router_params, router_accum
-        )
-        chunk.scores = None
-        chunk.scores_edge = None
-        consumed = torch.cuda.Event()
-        consumed.record(compute_stream)
-        chunk.workspace_lease.release(consumed)
-        local_state.clear()
-
-
 def _materialize(
     params: tuple[torch.Tensor, ...], accum: list[torch.Tensor | None]
 ) -> list[torch.Tensor]:
@@ -2032,27 +2012,27 @@ class EPChunkExecution:
 
     def _requirements(self, phase):
         if phase == "forward":
-            return ((self.forward_op.workspace, True),)
+            return self.forward_op.workspace, True
         if phase == "backward":
             op = self.fused_op or self.backward_op
-            return ((op.workspace, self.fused_op is not None),)
+            return op.workspace, self.fused_op is not None
         raise ValueError(f"Unsupported EP chunk workspace phase {phase!r}")
 
     def materialize(self, *, phase="forward", device=None, expert_activation_max_rows=None):
-        for workspace, require_dispatcher in self._requirements(phase):
-            if require_dispatcher:
-                workspace.materialize(device=device)
-            else:
-                workspace.prepare_scratch(device=device)
-            if expert_activation_max_rows is not None:
-                workspace.reserve_expert_activations(
-                    max_expert_rows=expert_activation_max_rows, device=device
-                )
+        workspace, require_dispatcher = self._requirements(phase)
+        if require_dispatcher:
+            workspace.materialize(device=device)
+        else:
+            workspace.prepare_scratch(device=device)
+        if expert_activation_max_rows is not None:
+            workspace.reserve_expert_activations(
+                max_expert_rows=expert_activation_max_rows, device=device
+            )
 
     def release(self, *, stream=None):
         for phase in ("forward", "backward"):
-            for workspace, _ in self._requirements(phase):
-                release_ep_chunk_workspace(workspace.key, stream=stream)
+            workspace, _ = self._requirements(phase)
+            release_ep_chunk_workspace(workspace.key, stream=stream)
 
     def finish_forward(self, tensor):
         stream = torch.cuda.current_stream(tensor.device) if tensor.is_cuda else None
