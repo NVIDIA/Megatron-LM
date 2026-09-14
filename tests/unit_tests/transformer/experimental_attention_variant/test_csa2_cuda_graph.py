@@ -93,19 +93,27 @@ class _JointGraphBackward(torch.autograd.Function):
                 outputs.append(output)
                 gradients.append(torch.zeros_like(output) if gradient is None else gradient)
         targets = tuple(value for value in ctx.inputs if value.requires_grad)
-        result = torch.autograd.grad(outputs, targets, gradients, allow_unused=True)
+        # TE builds the joint backward while MCore's capture flag is set.
+        # CheckpointWithoutOutput supports autograd.grad in that context.
+        _set_capture_start()
+        try:
+            result = torch.autograd.grad(outputs, targets, gradients, allow_unused=True)
+        finally:
+            _set_capture_end()
         result = iter(result)
         return None, None, *(next(result) if value.requires_grad else None for value in ctx.inputs)
 
 
-def _install_eager_graph_callables(stacks, *, joint_backward=False):
+def _install_eager_graph_callables(stacks, *, joint_backward=False, num_microbatches=2):
     calls = []
     for stack in stacks:
         for layer in stack.layers:
             adapter = layer._te_cuda_graph_adapter
             static = _static_inputs(layer)
             split = getattr(layer, "_uses_mhc_recompute_cuda_graph_split", lambda: False)()
-            hidden_slots = [static["hidden_states"].detach().clone() for _ in range(2)]
+            hidden_slots = [
+                static["hidden_states"].detach().clone() for _ in range(num_microbatches)
+            ]
             # TransformerLayer's override imports TE to support old versions.
             # CPU fakes exercise the current tensor-kwargs contract directly.
             layer._get_te_cuda_graph_replay_args = MethodType(
@@ -145,7 +153,7 @@ def _install_eager_graph_callables(stacks, *, joint_backward=False):
 
                 return graph
 
-            layer.cuda_graphs = [make_callable(layer, adapter, i) for i in range(2)]
+            layer.cuda_graphs = [make_callable(layer, adapter, i) for i in range(num_microbatches)]
             if split:
                 layer.set_te_cuda_graph_static_hidden_inputs(hidden_slots)
     return calls

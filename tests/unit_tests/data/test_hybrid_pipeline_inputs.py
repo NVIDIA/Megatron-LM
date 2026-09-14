@@ -15,6 +15,7 @@ from megatron.core.rerun_state_machine import RerunDataIterator, RerunMode
 from megatron.core.transformer.experimental_attention_variant.csa_utils.csa2_hybrid_adapter import (
     CSA2HybridAdapter,
 )
+from megatron.training.datasets import hybrid_pipeline
 from tests.unit_tests.pipeline_parallel.test_typed_pipeline import _Timers
 from tests.unit_tests.transformer.experimental_attention_variant.test_csa2 import _packed
 from tests.unit_tests.transformer.experimental_attention_variant.test_csa2_pipeline import (
@@ -44,7 +45,7 @@ def test_training_prepares_each_batch_once_and_rebuilds_plans_on_rerun(
     monkeypatch.setattr(entry, "stimer", lambda **kwargs: nullcontext())
     # CP=1 route initialization needs MPU globals but does not change the
     # batch descriptors exercised here. Packing tensors and host scalars are real.
-    monkeypatch.setattr(entry, "finalize_packed_seq_params", lambda params: params)
+    monkeypatch.setattr(hybrid_pipeline, "finalize_packed_seq_params", lambda params: params)
     monkeypatch.setattr(
         "megatron.core.rerun_state_machine.get_rerun_state_machine",
         lambda: SimpleNamespace(get_mode=lambda: RerunMode.VALIDATE_RESULTS),
@@ -124,7 +125,12 @@ def test_training_prepares_each_batch_once_and_rebuilds_plans_on_rerun(
 
                 context.setattr(torch.Tensor, "item", no_item)
                 batch = entry.get_batch(prepared, model.vp_stage)
-                assert entry._packed_params_from_batch(batch) is batch[-1]
+                assert (
+                    hybrid_pipeline.get_hybrid_packed_seq_params(
+                        batch, tokens_per_sample=args.seq_length
+                    )
+                    is batch[-1]
+                )
             for spec in (plan.incoming[index], plan.outgoing[index]):
                 if spec is not None:
                     assert spec.tensor_specs[0].shape[:2] == (tokens, batch_size)

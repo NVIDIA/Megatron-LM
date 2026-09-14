@@ -72,6 +72,9 @@ class CSA2IndexerInputs:
             return prefix * seq_len, prefix * self.key_capacity, seq_len, self.max_keys
         cu_q = self.thd_layout.cu_seqlens_padded.to(torch.int32).contiguous()
         cu_k = self.compressed_layout.cu_seqlens_padded.to(torch.int32).contiguous()
+        if self.thd_layout.cp_size > 1:
+            # Q owns a contiguous slice; K retains every sequence's global prefix.
+            cu_q = (cu_q - self.thd_layout.global_start).clamp(0, self.q.shape[0])
         # Compact Top-K scans every physical row, including unassigned capacity.
         # Split that tail into bounded padding segments on the device. Like V4,
         # launch bounds come from host metadata, not a device-to-host length read;
@@ -86,6 +89,23 @@ class CSA2IndexerInputs:
         tail_q = (cu_q[-1] + steps * max_q).clamp_max(self.q.shape[0]).int()
         tail_k = (cu_k[-1] + steps * max_k).clamp_max(self.k.shape[0]).int()
         return torch.cat((cu_q, tail_q)), torch.cat((cu_k, tail_k)), max_q, max_k
+
+    @cached_property
+    def packed_causal_offsets(self) -> Tensor:
+        """Original sequence positions of the first local Q row, including padding segments."""
+        offsets = torch.zeros_like(self.packed_metadata[0][:-1])
+        if self.thd_layout is not None and self.thd_layout.cp_size > 1:
+            cu_q = self.thd_layout.cu_seqlens_padded
+            offsets[: cu_q.numel() - 1] = (self.thd_layout.global_start - cu_q[:-1]).clamp_min(0)
+        return offsets
+
+    def loss_divisor(self, calculate_per_token_loss: bool) -> Tensor:
+        """Match DSv4: local sum divided by the global real-token count for mean loss."""
+        if calculate_per_token_loss:
+            return self.q.new_ones((), dtype=torch.float32)
+        if self.thd_layout is not None and self.thd_layout.cp_size > 1:
+            return self.thd_layout.cu_seqlens[-1].to(torch.float32).clamp_min(1)
+        return self.valid.sum(dtype=torch.float32).clamp_min(1)
 
 
 def prepare_csa2_indexer_inputs(
@@ -949,11 +969,7 @@ def fused_csa2_indexer_sparse_attn(
     else:
         ids = torch.empty((iq.shape[0], 0), dtype=torch.int32, device=q.device)
         width, mode, block_size = max_keys, 0, 1
-    divisor = (
-        iq.new_ones((), dtype=torch.float32)
-        if calculate_per_token_loss
-        else valid.sum(dtype=torch.float32).clamp_min(1)
-    )
+    divisor = inputs.loss_divisor(calculate_per_token_loss)
     if attention_indices is None:
         attention_indices = torch.cat(
             (window, torch.where(topk >= 0, topk + local.shape[0], -1)), -1
@@ -1063,11 +1079,7 @@ def fused_csa2_indexer_loss(
     if width == 0:
         return (q.float().sum() + k.float().sum() + w.float().sum()) * 0.0
     non_compressed_lse = fused_csa_window_lse(teacher_q, local, attn_sink, window, softmax_scale)
-    divisor = (
-        q.new_ones((), dtype=torch.float32)
-        if calculate_per_token_loss
-        else valid.sum(dtype=torch.float32).clamp_min(1)
-    )
+    divisor = inputs.loss_divisor(calculate_per_token_loss)
     return _CSA2IndexerLoss.apply(
         q,
         k,

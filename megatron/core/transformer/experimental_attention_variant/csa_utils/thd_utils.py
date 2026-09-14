@@ -2,7 +2,7 @@
 """Native packed-THD indexing shared by DSv4 and CSA2.
 
 Common helpers define segment indices, compression groups and static capacity.
-CSA2's CP=1 layouts add validity masks, rotary positions and metadata snapshots
+CSA2 layouts add validity masks, rotary positions and metadata snapshots
 for shared state. Logical cumulative lengths describe valid sequence prefixes;
 padded cumulative lengths describe physical addresses. As in DSv4, a dummy
 sequence registered in both sets of prefixes is processed as an ordinary sequence.
@@ -112,6 +112,26 @@ def _check_values(condition: torch.Tensor, message: str) -> None:
         raise ValueError(message)
 
 
+def get_thd_token_metadata(
+    cu_seqlens: Tensor, cu_seqlens_padded: Tensor, global_rows: Tensor
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Map global packed rows, including left halos, to sequence IDs, positions and validity."""
+    num_sequences = cu_seqlens.numel() - 1
+    if num_sequences == 0:
+        return (
+            torch.full_like(global_rows, -1),
+            torch.zeros_like(global_rows),
+            torch.zeros_like(global_rows, dtype=torch.bool),
+        )
+    sequence_ids = torch.bucketize(global_rows, cu_seqlens_padded[1:], right=True).clamp_max(
+        num_sequences - 1
+    )
+    positions = global_rows - cu_seqlens_padded[sequence_ids].to(torch.int64)
+    assigned = (global_rows >= 0) & (global_rows < cu_seqlens_padded[-1])
+    valid = assigned & (positions < cu_seqlens.diff()[sequence_ids])
+    return sequence_ids.masked_fill(~assigned, -1), positions.masked_fill(~valid, 0), valid
+
+
 @dataclass(frozen=True)
 class CSA2THDCompressionLayout:
     """Physical compression slots and their sequence-local rotary positions.
@@ -122,6 +142,8 @@ class CSA2THDCompressionLayout:
     ``cu_seqlens_padded`` defines their physical addresses. Consumers must retain
     ``valid_groups`` and must not renumber the sequence-local groups.
     Invalid slots have safe source indices and zero rotary positions.
+    Local CP compact layouts set ``cp_rank/cp_size`` and retain original
+    sequence positions despite using local compressed prefixes.
     """
 
     ratio: int
@@ -134,6 +156,8 @@ class CSA2THDCompressionLayout:
     position_ids: torch.Tensor
     source_indices: torch.Tensor
     valid_groups: torch.Tensor
+    cp_rank: int = 0
+    cp_size: int = 1
 
 
 @dataclass(frozen=True)
@@ -153,14 +177,30 @@ class CSA2THDLayout:
     sequence_ids: torch.Tensor
     position_ids: torch.Tensor
     valid_tokens: torch.Tensor
+    cp_rank: int = 0
+    cp_size: int = 1
+
+    @property
+    def global_start(self) -> int:
+        """First global physical token row owned by this contiguous CP partition."""
+        return self.cp_rank * self.total_tokens
+
+    @property
+    def global_total_tokens(self) -> int:
+        """Physical capacity across all equal-sized CP partitions."""
+        return self.cp_size * self.total_tokens
 
     def for_compression(self, ratio: int) -> CSA2THDCompressionLayout:
-        """Build r1/r2 groups without crossing sequence or padding boundaries."""
+        """Build canonical global r1/r2 groups without crossing sequence boundaries.
+
+        Under CP, source indices address the global packed buffer. Local
+        projection uses the separate CP compact layout and its halo indices.
+        """
         if type(ratio) is not int or ratio not in (1, 2):
             raise ValueError("CSA2 THD compression ratio must be 1 or 2")
         num_sequences = self.cu_seqlens.numel() - 1
         capacity = get_thd_compressed_capacity(
-            self.total_tokens, self.max_seqlen, num_sequences, ratio
+            self.global_total_tokens, self.max_seqlen, num_sequences, ratio
         )
         cu_physical = get_thd_compressed_cu_seqlens(self.cu_seqlens_padded, ratio)
         sources, local_groups, sequence_ids, assigned = get_thd_compressed_group_indices(
@@ -169,13 +209,19 @@ class CSA2THDLayout:
         # Keep DSv4's physical addresses while excluding groups past the logical
         # sequence length. Dummy sequences remain ordinary logical segments.
         sources = sources.to(torch.int64).masked_fill(~assigned[:, None], 0)
-        valid_groups = assigned & self.valid_tokens[sources].all(dim=-1)
+        if self.cp_size == 1:
+            source_valid = self.valid_tokens[sources]
+        else:
+            _, _, source_valid = get_thd_token_metadata(
+                self.cu_seqlens, self.cu_seqlens_padded, sources
+            )
+        valid_groups = assigned & source_valid.all(dim=-1)
         positions = (local_groups.to(torch.int64) * ratio).masked_fill(~valid_groups, 0)
         sequence_ids = sequence_ids.masked_fill(~assigned, -1)
 
         return CSA2THDCompressionLayout(
             ratio=ratio,
-            total_tokens=self.total_tokens,
+            total_tokens=self.global_total_tokens,
             capacity=capacity,
             max_seqlen=self.max_seqlen // ratio,
             cu_seqlens=get_thd_compressed_cu_seqlens(self.cu_seqlens, ratio),
@@ -186,13 +232,18 @@ class CSA2THDLayout:
             valid_groups=valid_groups,
         )
 
-    def validate_compatible(self, packed_seq_params: PackedSeqParams, total_tokens: int) -> None:
+    def validate_compatible(
+        self,
+        packed_seq_params: PackedSeqParams,
+        total_tokens: int,
+        cp_group: torch.distributed.ProcessGroup | None = None,
+    ) -> None:
         """Reject reusing a forward state with a different packed layout.
 
         Snapshotted prefixes also detect in-place mutation of the caller's
         original metadata. CUDA value comparisons remain on the device.
         """
-        other = build_csa2_thd_layout(packed_seq_params, total_tokens)
+        other = build_csa2_thd_layout(packed_seq_params, total_tokens, cp_group=cp_group)
         self.validate_layout(other)
 
     def validate_layout(self, other: "CSA2THDLayout") -> None:
@@ -201,6 +252,8 @@ class CSA2THDLayout:
             return
         if (
             self.total_tokens != other.total_tokens
+            or self.cp_rank != other.cp_rank
+            or self.cp_size != other.cp_size
             or self.max_seqlen != other.max_seqlen
             or self.cu_seqlens.shape != other.cu_seqlens.shape
             or self.cu_seqlens.dtype != other.cu_seqlens.dtype
@@ -214,14 +267,20 @@ class CSA2THDLayout:
             )
 
 
-def build_csa2_thd_layout(packed_seq_params: PackedSeqParams, total_tokens: int) -> CSA2THDLayout:
-    """Resolve logical validity and physical addresses for CP=1 packed tokens.
+def build_csa2_thd_layout(
+    packed_seq_params: PackedSeqParams,
+    total_tokens: int,
+    *,
+    cp_group: torch.distributed.ProcessGroup | None = None,
+) -> CSA2THDLayout:
+    """Resolve local token validity and positions from global packed prefixes.
 
     Args:
         packed_seq_params: Self-attention metadata in THD format. Query and KV
             layouts must agree. Padded prefixes fall back to logical prefixes.
-        total_tokens: Actual physical token tensor length, including all tail
-            capacity introduced by pad_packed_seq_alignment.
+        total_tokens: Local physical token capacity, including padding. With CP,
+            ranks own equal contiguous intervals of the global packed buffer.
+        cp_group: Static CP group when it is not specified by the packed metadata.
 
     Returns:
         An independent metadata snapshot with token validity and positions.
@@ -230,10 +289,15 @@ def build_csa2_thd_layout(packed_seq_params: PackedSeqParams, total_tokens: int)
         raise ValueError("CSA2 THD layout requires qkv_format='thd'")
     if type(total_tokens) is not int or total_tokens < 0:
         raise ValueError("CSA2 THD total_tokens must be a non-negative integer")
-    if packed_seq_params.local_cp_size not in (None, 1):
-        raise ValueError("CSA2 THD layout currently requires CP=1")
-    if packed_seq_params.cp_group is not None and packed_seq_params.cp_group.size() != 1:
-        raise ValueError("CSA2 THD layout currently requires CP=1")
+    group = packed_seq_params.cp_group if packed_seq_params.cp_group is not None else cp_group
+    cp_size, cp_rank = (group.size(), group.rank()) if group is not None else (1, 0)
+    if packed_seq_params.local_cp_size not in (None, cp_size):
+        raise ValueError("CSA2 THD local_cp_size requires a matching explicit CP group")
+    if cp_size < 1 or not 0 <= cp_rank < cp_size:
+        raise ValueError("CSA2 THD requires valid CP group membership")
+    if cp_size > 1 and packed_seq_params.cp_partition_mode != "contiguous":
+        raise ValueError("CSA2 THD CP requires a contiguous partition")
+    global_total = total_tokens * cp_size
 
     cu_q = packed_seq_params.cu_seqlens_q
     cu_kv = packed_seq_params.cu_seqlens_kv
@@ -247,7 +311,7 @@ def build_csa2_thd_layout(packed_seq_params: PackedSeqParams, total_tokens: int)
             raise ValueError("CSA2 THD cumulative lengths must be non-empty 1D tensors")
         if prefix.dtype not in (torch.int32, torch.int64):
             raise ValueError("CSA2 THD cumulative lengths must have int32 or int64 dtype")
-        if total_tokens > torch.iinfo(prefix.dtype).max:
+        if global_total > torch.iinfo(prefix.dtype).max:
             raise ValueError("CSA2 THD token capacity exceeds cumulative-length dtype limits")
         if prefix.shape != cu_q.shape or prefix.dtype != cu_q.dtype or prefix.device != cu_q.device:
             raise ValueError(
@@ -256,7 +320,7 @@ def build_csa2_thd_layout(packed_seq_params: PackedSeqParams, total_tokens: int)
         _check_values(prefix[0] == 0, "CSA2 THD cumulative lengths must start at zero")
         _check_values((prefix.diff() >= 0).all(), "CSA2 THD cumulative lengths must be monotonic")
         _check_values(
-            prefix[-1] <= total_tokens, "CSA2 THD metadata exceeds physical token capacity"
+            prefix[-1] <= global_total, "CSA2 THD metadata exceeds physical token capacity"
         )
     _check_values((cu_q == cu_kv).all(), "CSA2 THD self-attention requires equal query/KV lengths")
     _check_values(
@@ -283,19 +347,10 @@ def build_csa2_thd_layout(packed_seq_params: PackedSeqParams, total_tokens: int)
     # microbatch's in-place replacement of static cumulative-length buffers.
     cu_q = cu_q.clone()
     physical_q = physical_q.clone()
-    rows = torch.arange(total_tokens, device=cu_q.device, dtype=torch.int64)
-    num_sequences = cu_q.numel() - 1
-    if num_sequences == 0:
-        sequence_ids = torch.full_like(rows, -1)
-        positions = torch.zeros_like(rows)
-        valid_tokens = torch.zeros(total_tokens, device=cu_q.device, dtype=torch.bool)
-    else:
-        sequence_ids = batch_of_row(physical_q, total_q=total_tokens)
-        positions = rows - physical_q[sequence_ids].to(torch.int64)
-        assigned = rows < physical_q[-1]
-        valid_tokens = assigned & (positions < cu_q.diff()[sequence_ids])
-        sequence_ids = torch.where(assigned, sequence_ids, torch.full_like(sequence_ids, -1))
-        positions = torch.where(valid_tokens, positions, torch.zeros_like(positions))
+    rows = (
+        torch.arange(total_tokens, device=cu_q.device, dtype=torch.int64) + cp_rank * total_tokens
+    )
+    sequence_ids, positions, valid_tokens = get_thd_token_metadata(cu_q, physical_q, rows)
 
     return CSA2THDLayout(
         total_tokens=total_tokens,
@@ -305,4 +360,6 @@ def build_csa2_thd_layout(packed_seq_params: PackedSeqParams, total_tokens: int)
         sequence_ids=sequence_ids,
         position_ids=positions,
         valid_tokens=valid_tokens,
+        cp_rank=cp_rank,
+        cp_size=cp_size,
     )

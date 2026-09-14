@@ -46,9 +46,22 @@ class CSA2CudaGraphAdapter:
     """Static per-layer graph schema; never owns a microbatch's activation state."""
 
     def __init__(
-        self, config: MLATransformerConfig, *, layer_number: int, is_attention: bool
+        self,
+        config: MLATransformerConfig,
+        *,
+        layer_number: int,
+        is_attention: bool,
+        cp_group: torch.distributed.ProcessGroup | None = None,
     ) -> None:
         self.config = config
+        if config.context_parallel_size > 1 and cp_group is None:
+            raise ValueError("CSA2 CP CUDA Graphs require an explicit CP group")
+        self.cp_group = cp_group
+        self.cp_size, self.cp_rank = (
+            (cp_group.size(), cp_group.rank()) if cp_group is not None else (1, 0)
+        )
+        if self.cp_size != config.context_parallel_size:
+            raise ValueError("CSA2 CUDA Graph CP group size must match the static configuration")
         self.layer_idx = layer_number - 1
         self.is_attention = is_attention
         self.single_pass = config.enable_hyper_connections and config.mhc_single_pass
@@ -92,19 +105,39 @@ class CSA2CudaGraphAdapter:
         if not self.is_attention:
             return None
         if kwargs.get("packed_seq_params") is not None:
-            return kwargs["packed_seq_params"]
-        if "cu_seqlens_q" not in kwargs:
+            params = kwargs["packed_seq_params"]
+        elif "cu_seqlens_q" in kwargs:
+            max_seqlen = self.config.max_seqlen_per_dp_cp_rank * self.cp_size
+            params = PackedSeqParams(
+                qkv_format="thd",
+                cu_seqlens_q=kwargs["cu_seqlens_q"],
+                cu_seqlens_kv=kwargs["cu_seqlens_kv"],
+                cu_seqlens_q_padded=kwargs["cu_seqlens_q_padded"],
+                cu_seqlens_kv_padded=kwargs["cu_seqlens_kv_padded"],
+                max_seqlen_q=max_seqlen,
+                max_seqlen_kv=max_seqlen,
+                cp_partition_mode=self.config.cp_partition_mode,
+                local_cp_size=self.cp_size if self.cp_size > 1 else None,
+                cp_group=self.cp_group if self.cp_size > 1 else None,
+                pad_between_seqs=True,
+            )
+        elif self.cp_size > 1:
+            raise ValueError("CSA2 CP CUDA Graphs require contiguous THD metadata")
+        else:
             return None
-        return PackedSeqParams(
-            qkv_format="thd",
-            cu_seqlens_q=kwargs["cu_seqlens_q"],
-            cu_seqlens_kv=kwargs["cu_seqlens_kv"],
-            cu_seqlens_q_padded=kwargs["cu_seqlens_q_padded"],
-            cu_seqlens_kv_padded=kwargs["cu_seqlens_kv_padded"],
-            max_seqlen_q=self.config.max_seqlen_per_dp_cp_rank,
-            max_seqlen_kv=self.config.max_seqlen_per_dp_cp_rank,
-            pad_between_seqs=True,
-        )
+        if self.cp_size > 1 and (
+            params.qkv_format != "thd" or params.cp_partition_mode != "contiguous"
+        ):
+            raise ValueError("CSA2 CP CUDA Graphs require contiguous THD metadata")
+        if params.local_cp_size not in (None, self.cp_size):
+            raise ValueError("CSA2 CUDA Graph local_cp_size must match the captured CP group")
+        if params.cp_group is not None:
+            group = params.cp_group
+            if (group.size(), group.rank()) != (self.cp_size, self.cp_rank) or (
+                self.cp_size > 1 and group is not self.cp_group
+            ):
+                raise ValueError("CSA2 CUDA Graph replay must use the captured CP group")
+        return params
 
     def get_static_inputs(self, static_inputs: dict[str, Tensor]) -> dict[str, Tensor]:
         """Extend DSv4 sample inputs with this layer's actual shared dependencies."""
@@ -117,7 +150,10 @@ class CSA2CudaGraphAdapter:
         if self.ratio:
             capacity = (
                 get_thd_compressed_capacity(
-                    seq, params.max_seqlen_q, params.cu_seqlens_q.numel() - 1, self.ratio
+                    seq * self.cp_size,
+                    params.max_seqlen_q,
+                    params.cu_seqlens_q.numel() - 1,
+                    self.ratio,
                 )
                 if params is not None
                 else seq // self.ratio
@@ -170,7 +206,11 @@ class CSA2CudaGraphAdapter:
         values = {name: kwargs.pop(_PREFIX + name) for name in self.input_fields}
         hidden = args[0] if args else kwargs["hidden_states"]
         params = self._packed_params(kwargs)
-        layout = build_csa2_thd_layout(params, hidden.shape[0]) if params is not None else None
+        layout = (
+            build_csa2_thd_layout(params, hidden.shape[0], cp_group=self.cp_group)
+            if params is not None
+            else None
+        )
         compressed = (
             layout.for_compression(self.ratio) if layout is not None and self.ratio else None
         )
@@ -196,6 +236,12 @@ class CSA2CudaGraphAdapter:
         mhc = SinglePassMHCState(values.get("pre_mix")) if self.graph_mhc else None
         if self.is_attention:
             kwargs["csa2_state"] = state
+            if params is not None:
+                # The inner layer may reconstruct raw prefixes without a CP group.
+                # Bind this capture's static communicator before its attention runs.
+                for suffix in ("q", "kv", "q_padded", "kv_padded"):
+                    kwargs.pop("cu_seqlens_" + suffix, None)
+                kwargs["packed_seq_params"] = params
         if mhc is not None:
             kwargs["mhc_state"] = mhc
         outputs = tuple(function(*args, **kwargs))
@@ -232,6 +278,11 @@ class CSA2CudaGraphAdapter:
                 state.last_layer is not None and state.last_layer >= self.layer_idx
             ):
                 raise ValueError("CSA2 CUDA Graph replay requires fresh, ordered forward state")
+            if state.thd_layout is not None and (
+                state.thd_layout.cp_size,
+                state.thd_layout.cp_rank,
+            ) != (self.cp_size, self.cp_rank):
+                raise ValueError("CSA2 CUDA Graph state belongs to a different CP shard")
             if self.ratio and not self.full and state.kv_source_layer != self.kv_source:
                 raise ValueError("CSA2 CUDA Graph replay received the wrong shared KV owner")
             if self.ratio and not self.reindex and state.index_source_layer != self.index_source:
@@ -248,7 +299,8 @@ class CSA2CudaGraphAdapter:
         if params is not None:
             if (
                 params.qkv_format != "thd"
-                or params.max_seqlen_q != self.config.max_seqlen_per_dp_cp_rank
+                or params.max_seqlen_q != self.config.max_seqlen_per_dp_cp_rank * self.cp_size
+                or params.max_seqlen_kv != params.max_seqlen_q
             ):
                 raise ValueError("CSA2 CUDA Graph THD requires the configured static max_seqlen")
             for suffix in ("q", "kv"):
@@ -321,6 +373,8 @@ class CSA2CudaGraphAdapter:
                     state.thd_layout = CSA2THDLayout(
                         total_tokens=hidden.shape[0],
                         max_seqlen=params.max_seqlen_q,
+                        cp_size=self.cp_size,
+                        cp_rank=self.cp_rank,
                         **layout_values,
                     )
                     if self.ratio:
@@ -329,9 +383,9 @@ class CSA2CudaGraphAdapter:
                         )
                         state.compressed_layout = CSA2THDCompressionLayout(
                             ratio=self.ratio,
-                            total_tokens=hidden.shape[0],
+                            total_tokens=hidden.shape[0] * self.cp_size,
                             capacity=get_thd_compressed_capacity(
-                                hidden.shape[0],
+                                hidden.shape[0] * self.cp_size,
                                 params.max_seqlen_q,
                                 params.cu_seqlens_q.numel() - 1,
                                 self.ratio,
