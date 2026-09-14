@@ -580,8 +580,9 @@ class EngramConfig:
             # The fine-grained attention callable does not forward input_ids, so the Engram
             # layers would fail on the first microbatch.
             raise ValueError("Engram does not yet support overlap_moe_expert_parallel_comm.")
-        if transformer_config.recompute_granularity is not None:
-            raise ValueError("Engram does not yet support activation recomputation.")
+        # Activation recomputation is supported: checkpointed_forward already forwards
+        # input_ids to the layers it replays, and the Engram collectives stay rank-symmetric
+        # under replay because every rank in the EP/TP group recomputes the same layer block.
         if transformer_config.cuda_graph_impl != "none":
             raise ValueError("Engram does not yet support CUDA graphs.")
         if use_fsdp:
