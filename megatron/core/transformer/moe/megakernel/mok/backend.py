@@ -8,9 +8,8 @@ replaces dispatch, routed/shared expert computation, and combine.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
 from types import MethodType
+from typing import TYPE_CHECKING
 
 import torch
 from torch import nn
@@ -315,15 +314,15 @@ class MoKMegakernel(MegakernelBackend):
 
         The routed/shared weights registered on this module are ALIASES of parameters owned by TE
         modules (``TEGroupedLinear`` etc.). ``torch.nn.Module._apply`` moves traceable wrapper
-        subclasses (TE quantized tensors such as ``MXFP8Tensor``) with ``torch.utils.swap_tensors``,
-        which exchanges the parameter object's whole ``__dict__``. TE's own modules re-attach the
-        externally attached state afterwards (``TransformerEngineBaseModule._apply``), but this plain
-        module's visit of the *same* object (e.g. during ``model.cuda()``) swaps it again and nothing
-        restores it, so mcore's ``allreduce`` / ``partition_dim`` / ``tensor_model_parallel`` stamps
-        and TE's ``_high_precision_init_val`` are lost. DDP / the layer-wise optimizer then treat
-        the routed experts as data-parallel replicas (grads all-reduced across EP ranks, master
-        weights sharded over dp_cp, identical experts across the EP group). Mirror TE's fix here.
-
+        subclasses (TE quantized tensors such as ``MXFP8Tensor``) with
+        ``torch.utils.swap_tensors``, which exchanges the parameter object's whole ``__dict__``.
+        TE's own modules re-attach the externally attached state afterwards
+        (``TransformerEngineBaseModule._apply``), but this plain module's visit of the *same*
+        object (e.g. during ``model.cuda()``) swaps it again and nothing restores it, so mcore's
+        ``allreduce`` / ``partition_dim`` / ``tensor_model_parallel`` stamps and TE's
+        ``_high_precision_init_val`` are lost. DDP / the layer-wise optimizer then treat the routed
+        experts as data-parallel replicas (grads all-reduced across EP ranks, master weights
+        sharded over dp_cp, identical experts across the EP group). Mirror TE's fix here.
         """
         snapshots = {
             name: (param, dict(param.__dict__))
@@ -346,6 +345,16 @@ class MoKMegakernel(MegakernelBackend):
     def forward(
         self, hidden_states: torch.Tensor, probs: torch.Tensor, routing_map: torch.Tensor
     ) -> torch.Tensor:
+        """Run the fused MoE megakernel (dispatch, routed/shared experts, combine).
+
+        Args:
+            hidden_states: Input activations of shape ``[..., hidden_size]``.
+            probs: Router probabilities, flattened to ``[num_tokens, num_experts]``.
+            routing_map: Token-to-expert routing map matching ``probs``.
+
+        Returns:
+            MoE output with the same shape as ``hidden_states``.
+        """
         original_shape = hidden_states.shape
         x = hidden_states.reshape(-1, original_shape[-1]).contiguous()
         probs = probs.reshape(x.shape[0], -1)
