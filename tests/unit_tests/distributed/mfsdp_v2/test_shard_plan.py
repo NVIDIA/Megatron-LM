@@ -3,7 +3,7 @@
 """
 Pure CPU tests for the shard-planning and owner-compute packing logic.
 
-These tests exercise `ParameterLayout.from_layout`, `assign_owner_work`, `OwnerGatherPlan.pack`,
+These tests exercise `ParameterLayout.from_group`, `assign_owner_work`, `OwnerGatherPlan.pack`,
 `OwnerGatherPlan.reconstruct_full`, `OwnerScatterPlan.pack`, and `OwnerScatterPlan.unpack` without a
 process group or any `torch.distributed` dependency. P2P communication is simulated in-process by
 `_simulate_p2p`.
@@ -13,8 +13,12 @@ from collections.abc import Callable
 from types import SimpleNamespace
 
 import torch
+import torch.nn as nn
 
-from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.layout import GlobalLayout
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.layout import (
+    GlobalLayout,
+    non_leading_numel,
+)
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.shard_plan import (
     OwnerGatherPlan,
     OwnerScatterPlan,
@@ -31,36 +35,43 @@ def _ns_cost(num_ns_steps: int) -> Callable[[ParameterLayout], int]:
     """
 
     def cost_fn(layout: ParameterLayout) -> int:
-        rows, cols = layout.full_shape
-        short_dim = min(rows, cols)
+        shape = layout.full_shape
+        short_dim = min(shape[0], non_leading_numel(shape))
         return layout.full_numel() * (short_dim * num_ns_steps + 1)
 
     return cost_fn
 
 
-def _mock_mesh(dp_size: int, this_rank: int):
-    """Mock a DeviceMesh."""
-    return SimpleNamespace(size=lambda: dp_size, get_local_rank=lambda: this_rank)
+def _mock_group(shapes, offsets, size, dp_size, this_rank=0):
+    """Mock a `FsdpParameterGroup` with the given DBuffer layout.
 
-
-def _layout(shapes, offsets, size) -> GlobalLayout:
-    """Construct a `GlobalLayout` directly (bypassing `GlobalLayout.build`)."""
-    return GlobalLayout(
+    Creates `nn.Parameter`s for each shape so the default `eligible_fn` (`param.ndim >= 2`) can
+    filter on them.
+    """
+    layout = GlobalLayout(
         tensor_shapes=tuple(torch.Size(s) for s in shapes),
         tensor_to_offset=tuple(offsets),
         size=size,
     )
+    params = tuple(nn.Parameter(torch.zeros(s)) for s in shapes)
+    fsdp_parameters = tuple(SimpleNamespace(sharded=p) for p in params)
+    return SimpleNamespace(
+        mesh=SimpleNamespace(size=lambda: dp_size, get_local_rank=lambda: this_rank),
+        main_weight=SimpleNamespace(layout=layout),
+        fsdp_parameters=fsdp_parameters,
+        sharded_parameters=params,
+    )
 
 
 # ---------------------------------------------------------------------------
-# Shard-layout math
+# Layout construction
 # ---------------------------------------------------------------------------
 
 
-def test_compute_shard_plan_even_split():
+def test_from_group_even_split():
     """A matrix exactly divisible by dp_size splits evenly across ranks."""
-    layout = _layout([(8, 4)], [0], 32)
-    layout = ParameterLayout.from_layout(layout, tensor_index=0, mesh=_mock_mesh(2, 0))
+    group = _mock_group([(8, 4)], [0], 32, dp_size=2)
+    (layout,) = ParameterLayout.from_group(group).values()
     assert layout.full_shape == torch.Size((8, 4))
     assert layout.row_size == 4
     assert layout.row_counts == (4, 4)
@@ -68,35 +79,76 @@ def test_compute_shard_plan_even_split():
     assert layout.shard_numel(1) == 16
 
 
-def test_compute_shard_plan_boundary_param_split_across_ranks():
+def test_from_group_boundary_param_split_across_ranks():
     """A small matrix landing across a rank boundary is split unevenly."""
     # 6 rows, 3 cols; each rank's flat shard is 9 elements (= 3 rows). rank0 owns flat [0,9), rank1
     # owns [9,18). Tensor occupies [0,18) fully.
-    layout = _layout([(6, 3)], [0], 18)
-    layout = ParameterLayout.from_layout(layout, tensor_index=0, mesh=_mock_mesh(2, 0))
+    group = _mock_group([(6, 3)], [0], 18, dp_size=2)
+    (layout,) = ParameterLayout.from_group(group).values()
     assert layout.row_counts == (3, 3)
     assert layout.is_boundary()
 
 
-def test_compute_shard_plan_fully_local_param_on_one_rank():
+def test_from_group_fully_local_param_on_one_rank():
     """A matrix fully contained in one rank's flat shard is fully local."""
     # 4 rows, 2 cols = 8 elements. rank0 shard = [0,12), rank1 = [12,24). Tensor at offset 0 with 8
     # elements fits entirely in rank0.
-    layout = _layout([(4, 2)], [0], 24)
-    layout = ParameterLayout.from_layout(layout, tensor_index=0, mesh=_mock_mesh(2, 0))
+    group = _mock_group([(4, 2)], [0], 24, dp_size=2)
+    (layout,) = ParameterLayout.from_group(group).values()
     assert layout.row_counts == (4, 0)
     assert not layout.is_boundary()
     assert layout.owner_candidates() == (0,)
 
 
-def test_compute_shard_plan_empty_rank_has_zero_rows():
+def test_from_group_empty_rank_has_zero_rows():
     """A rank whose flat shard does not overlap the tensor owns zero rows."""
     # Tensor at offset 12 (entirely in rank1). rank0 gets (0,0).
-    layout = _layout([(4, 3)], [12], 24)
-    layout = ParameterLayout.from_layout(layout, tensor_index=0, mesh=_mock_mesh(2, 0))
+    group = _mock_group([(4, 3)], [12], 24, dp_size=2)
+    (layout,) = ParameterLayout.from_group(group).values()
     assert layout.row_counts == (0, 4)
     assert layout.is_boundary() is False
     assert layout.owner_candidates() == (1,)
+
+
+def test_from_group_filters_non_eligible():
+    """Params not selected by `eligible_fn` are absent from the result."""
+    # A 2D weight and a 1D bias in the same group.
+    group = _mock_group([(8, 4), (16,)], [0, 32], 48, dp_size=2)
+    layouts = ParameterLayout.from_group(group)
+    # Only the 2D weight is eligible (ndim >= 2); the 1D bias is excluded.
+    assert len(layouts) == 1
+    param, layout = next(iter(layouts.items()))
+    assert param.ndim == 2
+    assert layout.full_shape == torch.Size((8, 4))
+
+
+def test_from_group_per_rank_data_not_uniform():
+    """Flat sharding with uniform buffer size but non-uniform per-rank tensor data.
+
+    `GlobalLayout.build` pads the total size to a multiple of `chunk_size * dp_size` so every rank's
+    flat buffer is the same size. However, the actual tensor data per rank is not necessarily
+    uniform.
+
+    This test verifies `from_group` correctly computes the non-uniform per-rank row counts from a
+    uniform `rank_flat_shard_size`.
+    """
+    # 5 rows, 4 cols = 20 elements. dp_size = 3.
+    # GlobalLayout.build pads to 24 (next multiple of chunk_size * dp_size = 4 * 3 = 12), so
+    # rank_flat_shard_size = 24 // 3 = 8 (uniform buffer per rank).
+    # But the tensor occupies only 20 of 24 elements:
+    #   rank 0: [0, 8)   -> 8 elements -> 2 rows
+    #   rank 1: [8, 16)  -> 8 elements -> 2 rows
+    #   rank 2: [16, 24) -> 4 elements -> 1 row (4 elements of padding)
+    group = _mock_group([(5, 4)], [0], 24, dp_size=3)
+    (layout,) = ParameterLayout.from_group(group).values()
+    assert layout.row_counts == (2, 2, 1)
+    assert layout.shard_numel(0) == 8
+    assert layout.shard_numel(1) == 8
+    assert layout.shard_numel(2) == 4
+    assert layout.rank_row_count(0) == 2
+    assert layout.rank_row_count(1) == 2
+    assert layout.rank_row_count(2) == 1
+    assert layout.is_boundary()
 
 
 # ---------------------------------------------------------------------------
@@ -173,10 +225,10 @@ def test_pack_and_reconstruct_round_trip():
     torch.manual_seed(0)
     dp_size = 2
     # Two params, both boundary, shapes (6,3) and (4,2). Owners: param0->rank0, param1->rank1.
-    layout0 = _layout([(6, 3)], [0], 18)
-    layout1 = _layout([(4, 2)], [0], 8)
-    layout0 = ParameterLayout.from_layout(layout0, tensor_index=0, mesh=_mock_mesh(dp_size, 0))
-    layout1 = ParameterLayout.from_layout(layout1, tensor_index=0, mesh=_mock_mesh(dp_size, 0))
+    group0 = _mock_group([(6, 3)], [0], 18, dp_size=dp_size)
+    group1 = _mock_group([(4, 2)], [0], 8, dp_size=dp_size)
+    layout0 = ParameterLayout.from_group(group0)[group0.sharded_parameters[0]]
+    layout1 = ParameterLayout.from_group(group1)[group1.sharded_parameters[0]]
     layouts = [layout0, layout1]
     owners = {0: 0, 1: 1}
 
@@ -192,7 +244,8 @@ def test_pack_and_reconstruct_round_trip():
     per_rank_send = []
     per_rank_gather = []
     for r in range(dp_size):
-        gather = OwnerGatherPlan.pack(layouts, owners, per_rank_local[r], _mock_mesh(dp_size, r))
+        mesh = SimpleNamespace(size=lambda: dp_size, get_local_rank=lambda: r)
+        gather = OwnerGatherPlan.pack(layouts, owners, per_rank_local[r], mesh)
         per_rank_send.append(gather.send_buffers)
         per_rank_gather.append(gather)
 
@@ -210,10 +263,10 @@ def test_pack_and_unpack_result_round_trip():
     """Scattered result shards match the owner's full result sliced per rank."""
     torch.manual_seed(1)
     dp_size = 2
-    layout0 = _layout([(6, 3)], [0], 18)
-    layout1 = _layout([(4, 2)], [0], 8)
-    layout0 = ParameterLayout.from_layout(layout0, tensor_index=0, mesh=_mock_mesh(dp_size, 0))
-    layout1 = ParameterLayout.from_layout(layout1, tensor_index=0, mesh=_mock_mesh(dp_size, 0))
+    group0 = _mock_group([(6, 3)], [0], 18, dp_size=dp_size)
+    group1 = _mock_group([(4, 2)], [0], 8, dp_size=dp_size)
+    layout0 = ParameterLayout.from_group(group0)[group0.sharded_parameters[0]]
+    layout1 = ParameterLayout.from_group(group1)[group1.sharded_parameters[0]]
     layouts = [layout0, layout1]
     owners = {0: 0, 1: 1}
 
@@ -224,9 +277,8 @@ def test_pack_and_unpack_result_round_trip():
     per_rank_send = []
     per_rank_scatter = []
     for r in range(dp_size):
-        scatter = OwnerScatterPlan.pack(
-            full_results_by_rank[r], layouts, owners, _mock_mesh(dp_size, r)
-        )
+        mesh = SimpleNamespace(size=lambda: dp_size, get_local_rank=lambda: r)
+        scatter = OwnerScatterPlan.pack(full_results_by_rank[r], layouts, owners, mesh)
         per_rank_send.append(scatter.send_buffers)
         per_rank_scatter.append(scatter)
 
@@ -240,32 +292,3 @@ def test_pack_and_unpack_result_round_trip():
         rs, rc = layout.rank_row_start(r), layout.rank_row_count(r)
         expected = full_results_by_rank[owners[other]][other][rs : rs + rc]
         torch.testing.assert_close(received[other], expected, atol=0, rtol=0)
-
-
-def test_from_layout_per_rank_data_not_uniform():
-    """Flat sharding with uniform buffer size but non-uniform per-rank tensor data.
-
-    `GlobalLayout.build` pads the total size to a multiple of `chunk_size * dp_size` so every rank's
-    flat buffer is the same size. However, the actual tensor data per rank is not necessarily
-    uniform.
-
-    This test verifies `from_layout` correctly computes the non-uniform per-rank row counts from a
-    uniform `rank_flat_shard_size`.
-    """
-    # 5 rows, 4 cols = 20 elements. dp_size = 3.
-    # GlobalLayout.build pads to 24 (next multiple of chunk_size * dp_size = 4 * 3 = 12),
-    # so rank_flat_shard_size = 24 // 3 = 8 (uniform buffer per rank).
-    # But the tensor occupies only 20 of 24 elements:
-    #   rank 0: [0, 8)   -> 8 elements -> 2 rows
-    #   rank 1: [8, 16)  -> 8 elements -> 2 rows
-    #   rank 2: [16, 24) -> 4 elements -> 1 row  (4 elements of padding)
-    layout = _layout([(5, 4)], [0], 24)
-    layout = ParameterLayout.from_layout(layout, tensor_index=0, mesh=_mock_mesh(3, 0))
-    assert layout.row_counts == (2, 2, 1)
-    assert layout.shard_numel(0) == 8
-    assert layout.shard_numel(1) == 8
-    assert layout.shard_numel(2) == 4
-    assert layout.rank_row_count(0) == 2
-    assert layout.rank_row_count(1) == 2
-    assert layout.rank_row_count(2) == 1
-    assert layout.is_boundary()

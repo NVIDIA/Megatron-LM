@@ -3,10 +3,11 @@
 """
 Pure shard-planning and owner-compute packing logic for MFSDP v2's all-`Flat` layout.
 
-The central data structure is `ParameterLayout`, which describes how a single 2D parameter's full
-matrix is split across the DP group under MFSDP v2's all-`Flat` layout. Given parameter layouts,
-`assign_owner_work` balances owner-compute work across owner ranks using a caller-supplied cost
-function. `ParameterLayout.from_layout` builds a layout from DBuffer layout metadata,
+The central data structure is `ParameterLayout`, which describes how a single ≥2D parameter is split
+across the DP group under MFSDP v2's all-`Flat` layout (trailing dims are flattened into the row
+size, as per Muon's orthogonalization theory). `ParameterLayout.from_group` builds `{param: layout}`
+for eligible parameters in an `FsdpParameterGroup`; `assign_owner_work` balances owner-compute work
+across owner ranks using a caller-supplied cost function.
 `OwnerGatherPlan.pack`/`OwnerScatterPlan.pack` build the flat P2P send/recv buffers,
 `OwnerGatherPlan.reconstruct_full` stitches gathered shards back into the full matrix on the owner,
 and `OwnerScatterPlan.unpack` extracts received result shards.
@@ -19,7 +20,8 @@ from typing import Self
 import torch
 from torch.distributed.device_mesh import DeviceMesh
 
-from .layout import GlobalLayout, non_leading_numel
+from .layout import non_leading_numel
+from .parameter_group import FsdpParameterGroup
 
 
 @dataclasses.dataclass(frozen=True)
@@ -31,7 +33,8 @@ class ParameterLayout:
     DBuffer layout. A rank with `count == 0` holds no shard of this parameter.
 
     Attributes:
-        full_shape: Global `(rows, cols)` shape of the parameter.
+        full_shape: Global shape of the parameter (≥2D; trailing dims are flattened into the row
+            size, matching Muon's reshape rules).
         row_counts: Per-rank row count; `0` means the rank holds no shard.
         row_size: Number of elements per row (= `full_shape[1:].numel()`).
     """
@@ -41,8 +44,8 @@ class ParameterLayout:
     row_size: int
 
     def __post_init__(self) -> None:
-        if len(self.full_shape) != 2:
-            raise ValueError(f"ParameterLayout requires a 2D full_shape, got {self.full_shape}.")
+        if len(self.full_shape) < 2:
+            raise ValueError(f"ParameterLayout requires a ≥2D full_shape, got {self.full_shape}.")
         if len(self.row_counts) == 0:
             raise ValueError("ParameterLayout requires at least one rank.")
         if self.row_size != non_leading_numel(self.full_shape):
@@ -52,56 +55,77 @@ class ParameterLayout:
             )
 
     @classmethod
-    def from_layout(cls, layout: GlobalLayout, tensor_index: int, mesh: DeviceMesh) -> Self:
-        """Build a parameter layout for one parameter from a `GlobalLayout`.
+    def from_group(
+        cls, group: FsdpParameterGroup, *, eligible_fn: Callable[[torch.Tensor], bool] | None = None
+    ) -> dict[torch.Tensor, Self]:
+        """Build `{param: layout}` for eligible parameters in an `FsdpParameterGroup`.
 
-        Computes the per-rank row ranges for the given 2D parameter in a flat DBuffer layout.
+        Parameters not selected by `eligible_fn` are absent from the returned dict.
 
         Args:
-            layout: The DBuffer global layout that contains the parameter.
-            tensor_index: Index of the parameter within `layout`.
-            mesh: Device mesh of the DP group the DBuffer is sharded across. The DP group size is
-                derived from the mesh.
+            group: The FSDP parameter group whose DBuffer layout describes the parameter placements.
+            eligible_fn: Predicate selecting which parameters participate in owner-compute
+                orthogonalization. Takes a parameter tensor as input and return whether the
+                parameter is supposed to be included. When `None`, defaults to matching ≥2D tensors
+                (`param.ndim >= 2`).
         """
+        if eligible_fn is None:
+
+            def eligible_fn(param):
+                return param.ndim >= 2
+
+        mesh = group.mesh
+        layout = group.main_weight.layout
         dp_size = mesh.size()
-        full_shape = layout.tensor_shapes[tensor_index]
-        tensor_flat_offset = layout.tensor_to_offset[tensor_index]
         rank_flat_shard_size = layout.size // dp_size
 
-        if len(full_shape) != 2:
-            raise ValueError(f"ParameterLayout.from_layout requires a 2D shape, got {full_shape}.")
-        row_size = non_leading_numel(full_shape)
-        if row_size <= 0:
-            raise ValueError(
-                f"ParameterLayout.from_layout requires non-empty rows, got shape {full_shape}."
-            )
-        tensor_end = tensor_flat_offset + full_shape.numel()
-
-        row_counts: list[int] = []
-        for rank in range(dp_size):
-            rank_start = rank * rank_flat_shard_size
-            rank_end = rank_start + rank_flat_shard_size
-            overlap_start = max(tensor_flat_offset, rank_start)
-            overlap_end = min(tensor_end, rank_end)
-            if overlap_start >= overlap_end:
-                row_counts.append(0)
+        result: dict[torch.Tensor, Self] = {}
+        for tensor_index, fsdp_parameter in enumerate(group.fsdp_parameters):
+            param = fsdp_parameter.sharded
+            if not eligible_fn(param):
                 continue
-            if (overlap_start - tensor_flat_offset) % row_size != 0:
-                raise RuntimeError(
-                    f"Flat shard boundary is not row-aligned for shape {full_shape}: "
-                    f"overlap_start={overlap_start}, tensor_flat_offset={tensor_flat_offset}."
+
+            full_shape = layout.tensor_shapes[tensor_index]
+            if len(full_shape) < 2:
+                raise ValueError(
+                    f"ParameterLayout.from_group requires a ≥2D shape, got {full_shape}."
                 )
-            overlap_numel = overlap_end - overlap_start
-            if overlap_numel % row_size != 0:
-                raise RuntimeError(
-                    f"Flat shard overlap is not row-aligned for shape {full_shape}: "
-                    f"overlap_numel={overlap_numel}, row_size={row_size}."
+            row_size = non_leading_numel(full_shape)
+            if row_size <= 0:
+                raise ValueError(
+                    f"ParameterLayout.from_group requires non-empty rows, got shape {full_shape}."
                 )
-            row_count = overlap_numel // row_size
-            row_counts.append(row_count)
-        return cls(
-            full_shape=torch.Size(full_shape), row_counts=tuple(row_counts), row_size=row_size
-        )
+            tensor_flat_offset = layout.tensor_to_offset[tensor_index]
+            tensor_end = tensor_flat_offset + full_shape.numel()
+
+            row_counts: list[int] = []
+            for rank in range(dp_size):
+                rank_start = rank * rank_flat_shard_size
+                rank_end = rank_start + rank_flat_shard_size
+                overlap_start = max(tensor_flat_offset, rank_start)
+                overlap_end = min(tensor_end, rank_end)
+                if overlap_start >= overlap_end:
+                    row_counts.append(0)
+                    continue
+                if (overlap_start - tensor_flat_offset) % row_size != 0:
+                    raise RuntimeError(
+                        f"Flat shard boundary is not row-aligned for shape {full_shape}: "
+                        f"overlap_start={overlap_start}, tensor_flat_offset={tensor_flat_offset}."
+                    )
+                overlap_numel = overlap_end - overlap_start
+                if overlap_numel % row_size != 0:
+                    raise RuntimeError(
+                        f"Flat shard overlap is not row-aligned for shape {full_shape}: "
+                        f"overlap_numel={overlap_numel}, row_size={row_size}."
+                    )
+                row_count = overlap_numel // row_size
+                row_counts.append(row_count)
+
+            param_layout = cls(
+                full_shape=torch.Size(full_shape), row_counts=tuple(row_counts), row_size=row_size
+            )
+            result[param] = param_layout
+        return result
 
     @property
     def dp_size(self) -> int:
