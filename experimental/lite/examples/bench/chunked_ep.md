@@ -28,12 +28,15 @@ impl = ImplConfig(
 
 Use BF16 experts and DeepEP with EP>1, top-k<=EP. Logical chunk count defaults
 to two; three and four are also representable. Set the input capacity to the
-largest flattened local batch. Activation backing grows lazily. For a frozen
-capacity, call each MoE layer's `chunked_ep.materialize` with
-`expert_activation_max_rows` before each phase. Shared storage is guarded by
-consumer events. `chunked_ep.release` releases it for offload; the
-runtime invokes release before model unload. Capture owners must discard
-graphs before explicit release. This PR does not claim CUDA graph validation.
+largest flattened local batch. Activation backing grows lazily; new routing
+loads can grow it after warmup. Matching layers share one arena, not one per
+layer. To freeze capacity, call a representative layer's `chunked_ep.materialize`
+with `expert_activation_max_rows` for both `phase="forward"` and `phase="backward"`
+before execution; over-capacity requests then fail. Event-guarded eager parking
+returns backing to the caching allocator while retaining capacity, before each
+full-recompute prefix backward. The runtime's model-offload callback releases
+the workspace. Discard captured graphs before explicit release; CUDA graph
+capture/replay is not validated by this PR.
 
 MTP is rejected. Ordinary ChunkedEP rejects outer MoE/full checkpoints; select
 the explicit full-recompute composition above, which replaces the outer
@@ -41,7 +44,8 @@ recompute list (including attention) with full-layer recomputation. Head/loss re
 the existing linear CE implementation and configuration, independently of
 ChunkedEP. Other model families are not qualified.
 
-Performance is not yet validated on this port. Compare native and ChunkedEP
-with identical existing linear CE settings; older combined head/CE measurements
-are not isolated ChunkedEP gains. Historical data and source commits remain in
-the [review PR](https://github.com/ISEEKYAN/Megatron-LM/pull/225).
+Performance qualification is incomplete: single-layer end-to-end measurements
+do not establish isolated OP activation savings or multi-layer throughput.
+Compare native and ChunkedEP with identical existing linear CE settings; older
+combined head/CE measurements are not isolated ChunkedEP gains. Evidence and
+limitations are recorded in the [review PR](https://github.com/ISEEKYAN/Megatron-LM/pull/225).

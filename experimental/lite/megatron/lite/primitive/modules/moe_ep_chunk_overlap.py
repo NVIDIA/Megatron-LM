@@ -1388,6 +1388,7 @@ class _EPChunkOperationBase:
                 )
                 with torch.no_grad():
                     fc1_input.copy_(dispatched)
+                del dispatched
                 expert_input = fc1_input.requires_grad_(True)
                 expert_out = self.experts(
                     expert_input,
