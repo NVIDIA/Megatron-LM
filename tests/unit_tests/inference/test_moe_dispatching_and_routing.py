@@ -80,6 +80,33 @@ def _make_base_config(**overrides):
     return TransformerConfig(**params)
 
 
+def test_config_accepts_mxfp8_parameter_filters():
+    config = _make_base_config(
+        inference_grouped_gemm_backend="vllm",
+        inference_mxfp8_include_parameters=r"\.mlp\.experts\.linear_fc[12]\.",
+        inference_mxfp8_exclude_parameters=r"\.layers\.(?:0|1|4|5)\.",
+        fp8="hybrid",
+        fp8_recipe="mxfp8",
+        fp8_param=True,
+    )
+
+    assert config.inference_mxfp8_include_parameters is not None
+    assert config.inference_mxfp8_exclude_parameters is not None
+    assert config.inference_grouped_gemm_backend.value == "vllm"
+
+
+def test_config_rejects_invalid_mxfp8_parameter_regex():
+    with pytest.raises(ValueError, match="Invalid MXFP8 parameter regex"):
+        _make_base_config(
+            inference_mxfp8_include_parameters="[", fp8="hybrid", fp8_recipe="mxfp8", fp8_param=True
+        )
+
+
+def test_config_rejects_mxfp8_parameter_filter_without_mxfp8():
+    with pytest.raises(ValueError, match="require.*fp8_recipe='mxfp8'"):
+        _make_base_config(inference_mxfp8_include_parameters=r"\.mlp\.experts\.")
+
+
 # ──────────────────────────────────────────────────────────────────────
 # InferenceTopKRouter
 # ──────────────────────────────────────────────────────────────────────

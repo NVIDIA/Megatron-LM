@@ -207,6 +207,47 @@ def test_mxfp8_quantize_replays():
     assert_replays_bit_exact(fn, (x,), backward=False, what="mxfp8_quantize")
 
 
+@pytest.mark.skipif(
+    not hasattr(torch, "float8_e8m0fnu") or torch.cuda.get_device_capability()[0] < 10,
+    reason="MXFP8 parameter storage needs Blackwell",
+)
+def test_mxfp8_parameter_precision_filter_replays():
+    """Selective conversion keeps chosen storage bit-exact and materializes the rest in BF16."""
+    import transformer_engine_torch as tex
+    from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Quantizer
+
+    from megatron.core.inference.quantization.utils import quantize_model_to_mxfp8
+
+    seeded()
+    attention = torch.randn(64, 128, device="cuda", dtype=torch.bfloat16)
+    expert = torch.randn(64, 128, device="cuda", dtype=torch.bfloat16)
+    quantizer = MXFP8Quantizer(tex.DType.kFloat8E4M3, rowwise=True, columnwise=False)
+
+    def convert(attention, expert):
+        root = torch.nn.Module()
+        root.attention = torch.nn.Module()
+        root.attention.weight = torch.nn.Parameter(quantizer(attention), requires_grad=False)
+        root.mlp = torch.nn.Module()
+        root.mlp.experts = torch.nn.Module()
+        root.mlp.experts.linear_fc1 = torch.nn.Module()
+        root.mlp.experts.linear_fc1.weight = torch.nn.Parameter(
+            quantizer(expert), requires_grad=False
+        )
+        quantize_model_to_mxfp8(
+            root, backend="triton", include_pattern=r"(^|\.)mlp\.experts\.linear_fc[12]\."
+        )
+        selected = root.mlp.experts.linear_fc1.weight
+        return (
+            root.attention.weight,
+            selected.data.view(torch.uint8),
+            selected.scale.view(torch.uint8),
+        )
+
+    assert_replays_bit_exact(
+        convert, (attention, expert), backward=False, what="selective MXFP8 parameter conversion"
+    )
+
+
 # --- inference MoE permute / unpermute --------------------------------------------------------
 
 
