@@ -630,6 +630,7 @@ def save_checkpoint(
     dp_group: Optional[torch.distributed.ProcessGroup] = None,
     expt_dp_group: Optional[torch.distributed.ProcessGroup] = None,
     rng_state_key_prefix: str = '',
+    cp_group: Optional[torch.distributed.ProcessGroup] = None,
 ):
     """Save a model, optimizer and optionally dataloader checkpoint.
 
@@ -649,6 +650,8 @@ def save_checkpoint(
         dp_cp_group: Data parallel + context parallel group (default: None, falls back to mpu API)
         dp_group: Data parallel group (default: None, falls back to mpu API)
         expt_dp_group: Expert data parallel group (default: None, falls back to mpu API)
+        cp_group: Context-parallel group for dataloader saving. Falls back to the MPU group
+            when available. Callers using CP without global MPU initialization must pass it.
     """
     start_ckpt = time()
     args = get_args()
@@ -742,6 +745,7 @@ def save_checkpoint(
         tp_group=tp_group,
         pp_group=pp_group,
         dp_group=dp_group,
+        cp_group=cp_group,
     )
 
     # Save distributed optimizer's custom parameter state.
@@ -1487,7 +1491,14 @@ def cleanup_old_non_persistent_checkpoint(save_dir, leave_ckpt_num=1, do_async=F
 
 
 def maybe_save_dataloader_state(
-    train_iterator, iteration, dataloader_save_path, *, tp_group=None, pp_group=None, dp_group=None
+    train_iterator,
+    iteration,
+    dataloader_save_path,
+    *,
+    tp_group=None,
+    pp_group=None,
+    dp_group=None,
+    cp_group=None,
 ):
     """Saves dataloader state if the dataloader supports it.
 
@@ -1504,6 +1515,8 @@ def maybe_save_dataloader_state(
         tp_group (ProcessGroup): Tensor-parallel group, or MPU fallback when unset.
         pp_group (ProcessGroup): Pipeline-parallel group, or MPU fallback when unset.
         dp_group (ProcessGroup): Data-parallel group, or MPU fallback when unset.
+        cp_group (ProcessGroup): Context-parallel group, or the MPU group when available.
+            No group preserves the TP0/PP0 writer behavior without requiring MPU initialization.
     """
     # If no dataloader or saving path is provided, exit early, otherwise, raise an error.
     if train_iterator is None or dataloader_save_path is None or dataloader_save_path == '':
@@ -1515,6 +1528,12 @@ def maybe_save_dataloader_state(
             f'Could not find a save_state for the train_iterator of type {type(train_iterator)}'
         )
 
+    # Compatibility fallback for callers that still use the global MPU groups.
+    # Explicit-group callers need not initialize MPU, including when CP is unused.
+    if cp_group is None:
+        cp_group = mpu.get_context_parallel_group(check_initialized=False)
+    is_first_cp_rank = cp_group is None or get_pg_rank(cp_group) == 0
+
     # Save dataloader state for each data parallel rank only once.
     first_rank = (
         get_pg_rank(pp_group) == 0
@@ -1524,7 +1543,7 @@ def maybe_save_dataloader_state(
         get_pg_rank(tp_group) == 0
         if tp_group is not None
         else mpu.get_tensor_model_parallel_rank() == 0
-    ) and mpu.get_context_parallel_rank() == 0
+    ) and is_first_cp_rank
     if not first_rank:
         return
 
@@ -2410,6 +2429,10 @@ def _maybe_setup_gpt_to_hybrid_load(args, ckpt_args, model):
         return False
 
     runtime_is_hybrid = any(_contains_hybrid_model(m) for m in model)
+    if not vars(ckpt_args):
+        # Checkpoints imported by Megatron Bridge may omit training args entirely.
+        # Without explicit source-model metadata, keep the regular loading path.
+        return None, False
     ckpt_pattern = getattr(ckpt_args, 'hybrid_layer_pattern', None) or getattr(
         ckpt_args, 'hybrid_override_pattern', None
     )

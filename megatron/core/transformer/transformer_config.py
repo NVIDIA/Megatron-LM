@@ -178,6 +178,12 @@ class TransformerConfig(ModelParallelConfig):
        Supports both TE FusedAttention and local unfused attention. Supports both a fixed offset and 
        and learnable offset."""
 
+    attn_logit_softcapping: Optional[float] = None
+    """If not None, cap the attention logits at this value using cap * tanh(logits / cap) before
+    softmax. Must be positive; use None to disable softcapping. Note that TransformerEngine
+    spells the disabled state as 0.0 rather than None, so 0.0 is rejected here to keep the two
+    from meaning different things."""
+
     num_query_groups: Optional[int] = field(
         default=None, metadata={"argparse_meta": {"default": 1}}
     )
@@ -398,6 +404,11 @@ class TransformerConfig(ModelParallelConfig):
     Accepts either:
     - An integer N: Represents a (N-1):N ratio, meaning (N-1) LA layers for every 1 SDPA layer
     - A list that defines a custom pattern, e.g.: [1,1,1,0,1,1,1,0,1,1,1,0]"""
+
+    gdn_kernel_backend: Literal["transformer_engine", "fla", "torch"] = "fla"
+    """Kernel backend for Gated DeltaNet. The selected backend is required to be available;
+    there is no automatic fallback. ``torch`` selects the PyTorch-native reference
+    implementation and is required when deterministic mode is enabled."""
 
     linear_conv_kernel_dim: Optional[int] = 4
     """Conv kernel dimension for the gated delta net."""
@@ -1533,6 +1544,18 @@ class TransformerConfig(ModelParallelConfig):
         super().__post_init__()
         self._validate_cp_layouts()
 
+        if self.attn_logit_softcapping is not None and not (
+            math.isfinite(self.attn_logit_softcapping) and self.attn_logit_softcapping > 0
+        ):
+            raise ValueError(
+                "attn_logit_softcapping must be a positive finite value, got "
+                f"{self.attn_logit_softcapping}. Use None to disable softcapping. A cap of 0.0 "
+                "disables softcapping in TransformerEngine but collapses every logit to zero in "
+                "the local attention path, a negative cap is silently applied as its absolute "
+                "value there while FlashAttention ignores it entirely, and a non-finite cap "
+                "produces NaN logits."
+            )
+
         # Resolve deprecated attention variant spellings up front so that every consumer
         # downstream only has to handle the canonical names. Imported lazily because the
         # spec module imports this one.
@@ -1612,7 +1635,19 @@ class TransformerConfig(ModelParallelConfig):
                 f"tensor_model_parallel_size ({self.tensor_model_parallel_size})."
             )
 
+        if self.gdn_kernel_backend not in {"transformer_engine", "fla", "torch"}:
+            raise ValueError(
+                "gdn_kernel_backend must be one of {'transformer_engine', 'fla', 'torch'}, "
+                f"got {self.gdn_kernel_backend!r}."
+            )
+
         if is_gated_delta_net_variant(self.experimental_attention_variant):
+            if self.deterministic_mode and self.gdn_kernel_backend != "torch":
+                raise ValueError(
+                    "deterministic_mode=True requires gdn_kernel_backend='torch' for "
+                    "Gated DeltaNet."
+                )
+
             # gdn2 may also be enabled for GDN layers built via the hybrid layer pattern
             # symbol 'G', where linear_attention_freq is unused; the GPT experimental
             # attention route raises a clear error downstream if it is missing.
