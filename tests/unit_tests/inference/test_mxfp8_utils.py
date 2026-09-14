@@ -1043,7 +1043,10 @@ def test_model_conversion_applies_parameter_precision_filter():
     import transformer_engine_torch as tex
     from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Quantizer
 
-    from megatron.core.inference.quantization.utils import quantize_model_to_mxfp8
+    from megatron.core.inference.quantization.utils import (
+        materialize_unselected_mxfp8_parameters_as_bf16,
+        quantize_model_to_mxfp8,
+    )
 
     quantizer = MXFP8Quantizer(tex.DType.kFloat8E4M3, rowwise=True, columnwise=False)
     model = torch.nn.Module()
@@ -1057,11 +1060,16 @@ def test_model_conversion_applies_parameter_precision_filter():
         quantizer(model.attention.weight.data), requires_grad=False
     )
 
-    quantize_model_to_mxfp8(
-        model, backend="triton", include_pattern=r"(^|\.)mlp\.experts\.linear_fc[12]\."
-    )
+    include_pattern = r"(^|\.)mlp\.experts\.linear_fc[12]\."
+    materialize_unselected_mxfp8_parameters_as_bf16(model, include_pattern=include_pattern)
+    checkpoint_attention = torch.randn_like(model.attention.weight)
+    with torch.no_grad():
+        model.attention.weight.copy_(checkpoint_attention)
+
+    quantize_model_to_mxfp8(model, backend="triton", include_pattern=include_pattern)
 
     assert model.attention.weight.dtype == torch.bfloat16
+    assert torch.equal(model.attention.weight, checkpoint_attention)
     assert isinstance(model.mlp.experts.linear_fc1.weight0, MXFP8Tensor)
     assert isinstance(model.mlp.experts.linear_fc2.weight0, MXFP8Tensor)
 

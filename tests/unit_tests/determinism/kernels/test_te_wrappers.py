@@ -173,17 +173,24 @@ class TestTEWrappers:
     @pytest.mark.internal
     @pytest.mark.launch_on_gb200
     @pytest.mark.skipif(not _IS_BLACKWELL, reason="MXFP8 parameter storage needs Blackwell")
-    def test_per_module_mxfp8_recipe_inherits_outer_model_init_policy(self):
-        """An execution-only override must preserve first/last-layer BF16 storage."""
+    @pytest.mark.parametrize(
+        ("inherit_model_init_context", "middle_uses_mxfp8"),
+        [(False, False), (True, True)],
+        ids=["legacy-override", "explicit-inheritance"],
+    )
+    def test_per_module_mxfp8_recipe_model_init_policy(
+        self, inherit_model_init_context, middle_uses_mxfp8
+    ):
+        """Model-init inheritance is explicit and preserves BF16 boundary layers."""
+        training_recipe = {"fp8_quantization_recipe": "mxfp8", "override_quantized_autocast": True}
+        if inherit_model_init_context:
+            training_recipe["inherit_model_init_context"] = True
         recipe = RecipeConfig.from_config_dict(
             {
                 "configs": {
                     "mxfp8": {
                         "transformer_engine_config_type": "TEQuantizationParams",
-                        "training_recipe": {
-                            "fp8_quantization_recipe": "mxfp8",
-                            "override_quantized_autocast": True,
-                        },
+                        "training_recipe": training_recipe,
                     }
                 },
                 "matchers": {
@@ -219,26 +226,23 @@ class TestTEWrappers:
         def build(layer_number):
             name = f"decoder.layers.{layer_number}.mlp.experts.linear_fc1"
             with get_fp8_context(config, layer_number, is_init=True):
-                with pytest.warns(
-                    UserWarning, match="inherits the enclosing parameter-storage context"
-                ):
-                    return TEGroupedLinear(
-                        2,
-                        128,
-                        256,
-                        parallel_mode=None,
-                        config=config,
-                        init_method=init_method_normal(0.02),
-                        bias=False,
-                        skip_bias_add=False,
-                        is_expert=True,
-                        name=name,
-                    )
+                return TEGroupedLinear(
+                    2,
+                    128,
+                    256,
+                    parallel_mode=None,
+                    config=config,
+                    init_method=init_method_normal(0.02),
+                    bias=False,
+                    skip_bias_add=False,
+                    is_expert=True,
+                    name=name,
+                )
 
         edge = build(0)
         middle = build(1)
         assert not is_mxfp8tensor(edge.weight0)
-        assert is_mxfp8tensor(middle.weight0)
+        assert is_mxfp8tensor(middle.weight0) is middle_uses_mxfp8
 
     @pytest.mark.parametrize("backend", ["fused", "flash"])
     def test_te_dot_product_attention_replays(self, backend, monkeypatch):

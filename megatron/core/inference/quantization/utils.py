@@ -191,6 +191,52 @@ def _materialize_mxfp8_parameter_as_bf16(
     setattr(module, parameter_name, bf16_parameter)
 
 
+def materialize_unselected_mxfp8_parameters_as_bf16(
+    model: torch.nn.Module,
+    include_pattern: str | None = None,
+    exclude_pattern: str | None = None,
+    _prefix: str = "",
+) -> None:
+    """Materialize filtered-out TE MXFP8 parameters as ordinary BF16 parameters.
+
+    Standalone inference calls this before loading a BF16 checkpoint. The loader
+    can then copy directly into the replacement parameters instead of quantizing
+    into TE MXFP8 storage only for conversion to dequantize them afterward.
+
+    Args:
+        model: Model whose unselected TE MXFP8 parameters should be replaced.
+        include_pattern: Regex selecting fully qualified parameter names to keep in MXFP8.
+            If unset, all MXFP8 parameters are included.
+        exclude_pattern: Regex selecting fully qualified parameter names to materialize
+            in BF16. Exclusion takes precedence over inclusion.
+        _prefix: Internal recursion prefix; callers should not set this.
+    """
+    assert HAVE_TE
+    if not _prefix:
+        _validate_mxfp8_expert_precision_policy(model, include_pattern, exclude_pattern)
+
+    for child_name, child in model.named_children():
+        materialize_unselected_mxfp8_parameters_as_bf16(
+            child,
+            include_pattern=include_pattern,
+            exclude_pattern=exclude_pattern,
+            _prefix=f"{_prefix}{child_name}.",
+        )
+
+    for parameter_name, parameter in list(model._parameters.items()):
+        if parameter is None:
+            continue
+        is_te_mxfp8 = isinstance(parameter, TEMXFP8Tensor) or isinstance(
+            getattr(parameter, "data", None), TEMXFP8Tensor
+        )
+        if is_te_mxfp8 and not matches_mxfp8_parameter_filter(
+            f"{_prefix}{parameter_name}",
+            include_pattern=include_pattern,
+            exclude_pattern=exclude_pattern,
+        ):
+            _materialize_mxfp8_parameter_as_bf16(model, parameter_name, parameter)
+
+
 def quantize_model_to_mxfp8(
     model: torch.nn.Module,
     backend: MXFP8Backend = "flashinfer",
@@ -217,7 +263,12 @@ def quantize_model_to_mxfp8(
     if backend == "flashinfer":
         assert HAVE_FLASHINFER, "FlashInfer not available for MXFP8 quantization"
     if not _prefix:
-        _validate_mxfp8_expert_precision_policy(model, include_pattern, exclude_pattern)
+        # Keep this pre-pass for direct callers. The standalone checkpoint path
+        # invokes it before loading so filtered BF16 values never round-trip
+        # through MXFP8 storage.
+        materialize_unselected_mxfp8_parameters_as_bf16(
+            model, include_pattern=include_pattern, exclude_pattern=exclude_pattern
+        )
 
     for child_name, child in model.named_children():
         child_prefix = f"{_prefix}{child_name}."
@@ -238,13 +289,6 @@ def quantize_model_to_mxfp8(
                 hasattr(val, 'data') and isinstance(val.data, TEMXFP8Tensor)
             )
             if is_te_mxfp8:
-                full_name = f"{_prefix}{key}"
-                keep_mxfp8 = matches_mxfp8_parameter_filter(
-                    full_name, include_pattern=include_pattern, exclude_pattern=exclude_pattern
-                )
-                if not keep_mxfp8:
-                    _materialize_mxfp8_parameter_as_bf16(model, key, val)
-                    continue
                 # Undo the TE quantization and re-quantize
                 # Note that this introduces a one-time overhead but avoids any
                 # numerical differences between TE and mcore MXFP8 formats

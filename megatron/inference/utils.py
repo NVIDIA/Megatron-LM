@@ -13,6 +13,7 @@ from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper 
     GPTInferenceWrapper,
 )
 from megatron.core.inference.quantization.utils import (
+    materialize_unselected_mxfp8_parameters_as_bf16,
     quantize_model_to_mxfp8,
     resolve_mxfp8_backend,
 )
@@ -92,6 +93,22 @@ def get_model_for_inference() -> MegatronModule:
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         model = builder.build_distributed_models(pg_collection=pg_collection, wrap_with_ddp=False)
 
+    use_mxfp8_inference = (
+        args.transformer_impl == "inference_optimized" and args.fp8_recipe == "mxfp8"
+    )
+    include_pattern = getattr(args, "inference_mxfp8_include_parameters", None)
+    exclude_pattern = getattr(args, "inference_mxfp8_exclude_parameters", None)
+    if use_mxfp8_inference and (include_pattern is not None or exclude_pattern is not None):
+        # Replace filtered TE MXFP8 storage before checkpoint loading so excluded
+        # BF16 values are never quantized and dequantized on their way into the model.
+        model_chunks = model if isinstance(model, (list, tuple)) else (model,)
+        for model_chunk in model_chunks:
+            materialize_unselected_mxfp8_parameters_as_bf16(
+                unwrap_model(model_chunk),
+                include_pattern=include_pattern,
+                exclude_pattern=exclude_pattern,
+            )
+
     # Load checkpoint.
     assert args.load is not None
     args.exit_on_missing_checkpoint = True
@@ -109,14 +126,14 @@ def get_model_for_inference() -> MegatronModule:
     # Eval mode.
     model.eval()
 
-    if args.transformer_impl == "inference_optimized" and args.fp8_recipe == "mxfp8":
+    if use_mxfp8_inference:
         quant_backend = resolve_mxfp8_backend(args.inference_grouped_gemm_backend)
         unwrapped_model = unwrap_model(model)
         quantize_model_to_mxfp8(
             unwrapped_model,
             backend=quant_backend,
-            include_pattern=getattr(args, "inference_mxfp8_include_parameters", None),
-            exclude_pattern=getattr(args, "inference_mxfp8_exclude_parameters", None),
+            include_pattern=include_pattern,
+            exclude_pattern=exclude_pattern,
         )
     return model
 
