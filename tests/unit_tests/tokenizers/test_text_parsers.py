@@ -98,12 +98,12 @@ def test_parser_mapping_registers_nemotron_v3_reasoning():
     assert PARSER_MAPPING["nemotron-v3-reasoning"] is NemotronV3ReasoningParser
 
 
-def test_tool_call_marker_implicitly_ends_reasoning_for_downstream_parser():
+def test_tool_call_marker_implicitly_ends_reasoning_for_combined_parser():
     tool_text = (
         "<tool_call><function=bash><parameter=command>echo hi</parameter>" "</function></tool_call>"
     )
     model_output = f"I should inspect this first.\n{tool_text}"
-    tool_parser = PARSER_MAPPING["qwen3-coder-tool"]
+    tool_parser = PARSER_MAPPING["qwen3-coder-tool-combined"]
 
     content, reasoning_info = DeepSeekR1ReasoningParser.parse(
         model_output, implicit_reasoning_end_markers=tool_parser.implicit_reasoning_end_markers
@@ -133,3 +133,30 @@ def test_tool_call_marker_does_not_end_reasoning_unless_configured():
     model_output = "reasoning<tool_call>not enabled</tool_call>"
 
     assert DeepSeekR1ReasoningParser.parse(model_output) == ("", {"reasoning": model_output})
+
+
+def test_strict_tool_parser_keeps_unterminated_reasoning_intact():
+    tool_text = (
+        "<tool_call><function=bash><parameter=command>echo hi</parameter>" "</function></tool_call>"
+    )
+    model_output = f"I should inspect this first.\n{tool_text}"
+    tool_parser = PARSER_MAPPING["qwen3-coder-tool"]
+
+    assert getattr(tool_parser, "implicit_reasoning_end_markers", ()) == ()
+
+    content, reasoning_info = DeepSeekR1ReasoningParser.parse(
+        model_output,
+        implicit_reasoning_end_markers=getattr(tool_parser, "implicit_reasoning_end_markers", ()),
+    )
+
+    assert content == ""
+    assert reasoning_info == {"reasoning": model_output}
+
+
+def test_parser_mapping_registers_both_qwen3_coder_tool_parsers():
+    strict = PARSER_MAPPING["qwen3-coder-tool"]
+    combined = PARSER_MAPPING["qwen3-coder-tool-combined"]
+
+    assert issubclass(combined, strict)
+    assert combined.implicit_reasoning_end_markers == ("<tool_call>",)
+    assert combined.streaming_markers == strict.streaming_markers
