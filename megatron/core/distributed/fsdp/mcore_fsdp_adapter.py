@@ -96,14 +96,18 @@ def _materialize_meta_module(module: nn.Module, device: torch.device | None) -> 
         )
 
     # Both _apply() and TE reset_parameters() may replace Parameter objects.
-    attributes = {
-        name: save_parameter_attributes(parameter)
+    parameter_states = [
+        (name, parameter.requires_grad, save_parameter_attributes(parameter))
         for name, parameter in module.named_parameters(recurse=False)
-    }
+    ]
+
     module._apply(materialize_tensor, recurse=False)
     reset_parameters()
-    for name, saved_attributes in attributes.items():
-        restore_parameter_attributes(module.get_parameter(name), saved_attributes)
+
+    for name, requires_grad, attributes in parameter_states:
+        parameter = module.get_parameter(name)
+        parameter.requires_grad_(requires_grad)
+        restore_parameter_attributes(parameter, attributes)
 
 
 def _materialize_owned_meta_modules(module: nn.Module, device: torch.device | None) -> None:

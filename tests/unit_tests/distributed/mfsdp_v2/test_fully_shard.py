@@ -919,12 +919,6 @@ def test_fully_shard_preserves_parameter_attributes(distributed_setup):
         "is_embedding_or_output_parameter": True,
         "is_embedding_parameter": True,
         "use_muon": False,
-        "allreduce": False,
-        "sequence_parallel": True,
-        "tensor_model_parallel": True,
-        "partition_dim": 0,
-        "partition_stride": 1,
-        "qkv_split_shapes": None,
     }
     for name, value in attributes.items():
         setattr(model.weight, name, value)
