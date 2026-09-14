@@ -23,7 +23,15 @@ gh run list --repo NVIDIA/Megatron-LM --workflow populate-build-cache.yml --limi
 Each enabled platform/bucket records the complete production and experimental
 phases. Only successful, validated databases are saved. Publication is checked
 with an exact cache lookup. A failed bucket leaves its older generation
-available; the cache set is not an atomic snapshot of all buckets.
+available until retention cleanup or eviction; the cache set is not an atomic
+snapshot of all buckets.
+
+The same workflow deletes `unit-testmon-v1-main-` caches on `refs/heads/main`
+older than 48 hours by creation time, regardless of recent access. Cleanup runs
+independently of build/test success. With the six-hour schedule, deletion occurs
+on the first cleanup after expiry (normally within another six hours; scheduling
+delays can extend this). Other caches are untouched. If refreshes fail for two
+days, cleanup can remove the last baseline and PRs fall back to full testing.
 
 ## Restore on labeled PRs
 
@@ -93,5 +101,6 @@ retries when measuring elapsed-time or resource savings.
 Investigate failed refreshes and baselines older than two refresh intervals.
 Each refresh creates new generation keys; monitor cache storage and eviction.
 To stop selection, remove the selective label or apply `Run tests` and rerun CI.
-Preserve previous compatible generations during producer failures. A bad cache
-protocol can be retired by changing its namespace; no PR database needs recovery.
+Previous compatible generations remain usable during producer failures until
+retention cleanup or eviction. A bad cache protocol can be retired by changing
+its namespace; no PR database needs recovery.

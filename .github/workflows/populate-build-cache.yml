@@ -60,6 +60,53 @@ jobs:
             exit 1
           fi
 
+  cleanup-testmon-cache:
+    name: Delete Testmon caches older than two days
+    needs: validate-source
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: write
+    steps:
+      - name: Delete expired main Testmon generations
+        id: cleanup
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        with:
+          script: |
+            const ref = 'refs/heads/main';
+            const prefix = 'unit-testmon-v1-main-';
+            const cutoff = Date.now() - 2 * 24 * 60 * 60 * 1000;
+            // Finish pagination before deleting entries so page offsets stay stable.
+            const caches = await github.paginate('GET /repos/{owner}/{repo}/actions/caches', {
+              ...context.repo, ref, key: prefix, per_page: 100,
+              sort: 'created_at', direction: 'asc',
+            });
+            const expired = caches.filter(cache => {
+              if (cache.ref !== ref || !cache.key.startsWith(prefix)) return false;
+              const createdAt = Date.parse(cache.created_at);
+              if (!Number.isFinite(createdAt)) {
+                throw new Error(`Invalid creation time for Testmon cache ${cache.id}`);
+              }
+              return createdAt < cutoff;
+            });
+            let deleted = 0;
+            for (const cache of expired) {
+              try {
+                await github.request('DELETE /repos/{owner}/{repo}/actions/caches/{cache_id}', {
+                  ...context.repo, cache_id: cache.id,
+                });
+                deleted += 1;
+                core.info(`Deleted Testmon cache ${cache.id}: ${cache.key}`);
+              } catch (error) {
+                if (error.status !== 404) throw error;
+                core.info(`Testmon cache ${cache.id} was already deleted or evicted.`);
+              }
+            }
+            await core.summary
+              .addHeading('Testmon cache cleanup')
+              .addRaw(`Deleted ${deleted} main Testmon generations created before ${new Date(cutoff).toISOString()}.`)
+              .write();
+
   populate-build-cache:
     name: Populate build caches
     needs: validate-source
