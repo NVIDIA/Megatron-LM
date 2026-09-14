@@ -348,7 +348,7 @@ class CallbackManager:
 
 def normalize_callbacks(
     callbacks: list[Callback] | CallbackManager | None,
-) -> CallbackManager | None:
+) -> CallbackManager:
     """Normalize callbacks argument to a CallbackManager.
 
     This helper is used internally by pretrain() to accept multiple input formats.
@@ -358,10 +358,10 @@ def normalize_callbacks(
             or None.
 
     Returns:
-        A CallbackManager instance, or None if callbacks was None.
+        A CallbackManager instance.
     """
     if callbacks is None:
-        return None
+        return CallbackManager()
     if isinstance(callbacks, CallbackManager):
         return callbacks
     # It's a list of Callback instances

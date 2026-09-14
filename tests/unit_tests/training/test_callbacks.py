@@ -427,9 +427,13 @@ class TestUserStatePersistence:
 class TestNormalizeCallbacks:
     """Unit tests for the normalize_callbacks() helper function."""
 
-    def test_none_returns_none(self):
-        """None input returns None."""
-        assert normalize_callbacks(None) is None
+    def test_none_returns_empty_manager(self):
+        """None input returns an empty CallbackManager."""
+        result = normalize_callbacks(None)
+
+        assert isinstance(result, CallbackManager)
+        for event in VALID_EVENTS:
+            assert not result.has_callbacks(event)
 
     def test_callback_manager_returns_same_instance(self):
         """CallbackManager input returns the same instance."""
