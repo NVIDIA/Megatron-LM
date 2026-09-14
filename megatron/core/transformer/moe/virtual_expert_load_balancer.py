@@ -221,10 +221,10 @@ class _VirtualExpertStorage:
         """A parameter whose fused wgrad GEMM overwrites ``main_grad`` on every backward."""
         parameter = torch.nn.Parameter(weight)
         parameter.main_grad = main_grad
-        parameter.grad_added_to_main_grad = True
         parameter.overwrite_main_grad = True
-        # TE returns a dummy leaf grad once the fused wgrad is in main_grad; drop it.
-        parameter.register_post_accumulate_grad_hook(lambda p: setattr(p, "grad", None))
+        # These leaves have no DDP hooks. Without grad_added_to_main_grad, TE returns None
+        # after writing the fused wgrad, avoiding dummy gradients and AccumulateGrad work
+        # whose result would otherwise be immediately discarded.
         return parameter
 
     def _slot_parameters(self, fc_layer: int, template) -> tuple[torch.nn.Parameter, ...]:
