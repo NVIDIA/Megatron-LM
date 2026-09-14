@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import inspect
 import logging
+import os
 from collections.abc import Callable, Iterable
 from contextlib import nullcontext
 from copy import deepcopy
@@ -92,6 +93,17 @@ from megatron.core.inference.moe.flashinfer_mxfp8 import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _te_grouped_tensor_align_size(config: TransformerConfig) -> Optional[int]:
+    """Return explicit padding for TE's device-metadata grouped-linear path."""
+    requested = (
+        config.moe_use_grouped_tensor
+        or os.getenv("NVTE_GROUPED_LINEAR_USE_FUSED_GROUPED_GEMM", "0") == "1"
+    )
+    if not requested:
+        return None
+    return max(get_align_size_for_quantization(config), 256)
 
 
 class GroupedLinearFc1Interface(Protocol):
@@ -318,9 +330,12 @@ class TEGroupedMLP(MegatronModule):
         self._use_grouped_tensor = self.config.moe_use_grouped_tensor
         if self.config.fp8 or self.config.fp4 or self._use_grouped_tensor:
             assert HAVE_TE, "Quantized or TE grouped-tensor GroupedMLP execution requires TE."
-            align_size = (
-                get_align_size_for_quantization(self.config) if self._use_grouped_tensor else None
-            )
+            # Older TE releases select their device-metadata grouped-tensor path only through
+            # this environment variable (there is no constructor argument for MCore to mirror
+            # into ``moe_use_grouped_tensor``). That path requires 256-row expert segments,
+            # while ordinary MXFP8 padding is only 32 rows. Over-pad when either interface
+            # requests grouped tensors so the metadata and physical rows remain consistent.
+            align_size = _te_grouped_tensor_align_size(self.config)
             self.quantization_padding = Fp8Padding(self.num_local_experts, align_size=align_size)
             self.quantization_unpadding = Fp8Unpadding(
                 self.num_local_experts, align_size=align_size

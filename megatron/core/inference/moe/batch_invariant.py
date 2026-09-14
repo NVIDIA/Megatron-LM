@@ -66,6 +66,7 @@ def _squared_relu_with_probs_kernel(
     max_rows,
     clamp_scale,
     CLAMP: tl.constexpr,
+    ZERO_PADDING: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     NUM_BLOCKS: tl.constexpr,
 ):
@@ -85,12 +86,15 @@ def _squared_relu_with_probs_kernel(
 
     for row in tl.range(pid, max_rows, NUM_BLOCKS):
         if row < n_used:
-            if tl.load(permutation_map_ptr + row) >= 0:
-                prob = tl.load(probs_ptr + row)
+            row_i64 = row.to(tl.int64)
+            if tl.load(permutation_map_ptr + row_i64) >= 0:
+                prob = tl.load(probs_ptr + row_i64)
                 for offset in tl.range(0, hidden_size, BLOCK_SIZE):
                     cols = offset + tl.arange(0, BLOCK_SIZE)
                     mask = cols < hidden_size
-                    value = tl.load(input_ptr + row * hidden_size + cols, mask=mask).to(tl.float32)
+                    value = tl.load(input_ptr + row_i64 * hidden_size + cols, mask=mask).to(
+                        tl.float32
+                    )
                     value = tl.maximum(value, 0.0)
                     if CLAMP:
                         value = clamp_scale * libdevice.tanh(value / clamp_scale)
@@ -101,7 +105,13 @@ def _squared_relu_with_probs_kernel(
                         # clamped path stays in FP32 to the single final round instead.
                         value = value.to(tl.bfloat16).to(tl.float32)
                     value = (value * prob).to(tl.bfloat16)
-                    tl.store(output_ptr + row * hidden_size + cols, value, mask=mask)
+                    tl.store(output_ptr + row_i64 * hidden_size + cols, value, mask=mask)
+            elif ZERO_PADDING:
+                for offset in tl.range(0, hidden_size, BLOCK_SIZE):
+                    cols = offset + tl.arange(0, BLOCK_SIZE)
+                    tl.store(
+                        output_ptr + row_i64 * hidden_size + cols, 0.0, mask=cols < hidden_size
+                    )
 
 
 @triton.jit
@@ -113,6 +123,7 @@ def _swiglu_with_probs_kernel(
     probs_ptr,
     ffn_size,  # output width; input row width is 2*ffn_size (gate | up)
     max_rows,
+    ZERO_PADDING: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     NUM_BLOCKS: tl.constexpr,
 ):
@@ -131,21 +142,32 @@ def _swiglu_with_probs_kernel(
 
     for row in tl.range(pid, max_rows, NUM_BLOCKS):
         if row < n_used:
-            if tl.load(permutation_map_ptr + row) >= 0:
-                prob = tl.load(probs_ptr + row)
+            row_i64 = row.to(tl.int64)
+            if tl.load(permutation_map_ptr + row_i64) >= 0:
+                prob = tl.load(probs_ptr + row_i64)
                 for offset in tl.range(0, ffn_size, BLOCK_SIZE):
                     cols = offset + tl.arange(0, BLOCK_SIZE)
                     mask = cols < ffn_size
-                    gate = tl.load(input_ptr + row * two_n + cols, mask=mask).to(tl.float32)
-                    up = tl.load(input_ptr + row * two_n + ffn_size + cols, mask=mask).to(
+                    gate = tl.load(input_ptr + row_i64 * two_n + cols, mask=mask).to(tl.float32)
+                    up = tl.load(input_ptr + row_i64 * two_n + ffn_size + cols, mask=mask).to(
                         tl.float32
                     )
                     value = gate * tl.sigmoid(gate) * up * prob
-                    tl.store(output_ptr + row * ffn_size + cols, value.to(tl.bfloat16), mask=mask)
+                    tl.store(
+                        output_ptr + row_i64 * ffn_size + cols, value.to(tl.bfloat16), mask=mask
+                    )
+            elif ZERO_PADDING:
+                for offset in tl.range(0, ffn_size, BLOCK_SIZE):
+                    cols = offset + tl.arange(0, BLOCK_SIZE)
+                    tl.store(output_ptr + row_i64 * ffn_size + cols, 0.0, mask=cols < ffn_size)
 
 
 def swiglu_with_probs(
-    x: torch.Tensor, permutation_map: torch.Tensor, n_used: torch.Tensor, probs: torch.Tensor
+    x: torch.Tensor,
+    permutation_map: torch.Tensor,
+    n_used: torch.Tensor,
+    probs: torch.Tensor,
+    zero_padding: bool = False,
 ) -> torch.Tensor:
     """Gated-SiLU counterpart of squared_relu_with_probs (SwiGLU models)."""
     num_rows, two_ffn = x.shape
@@ -161,6 +183,7 @@ def swiglu_with_probs(
         probs,
         ffn_size,
         num_rows,
+        ZERO_PADDING=zero_padding,
         BLOCK_SIZE=block_size,
         NUM_BLOCKS=num_blocks,
     )
@@ -247,6 +270,7 @@ def squared_relu_with_probs(
     n_used: torch.Tensor,
     probs: torch.Tensor,
     clamp_scale: Optional[float] = None,
+    zero_padding: bool = False,
 ) -> torch.Tensor:
     """Match training's BF16 squared-ReLU rounding before the FP32 probability multiply.
 
@@ -268,6 +292,7 @@ def squared_relu_with_probs(
         num_rows,
         clamp_scale if clamp_scale is not None else 0.0,
         CLAMP=clamp_scale is not None,
+        ZERO_PADDING=zero_padding,
         BLOCK_SIZE=block_size,
         NUM_BLOCKS=num_blocks,
     )
@@ -405,14 +430,16 @@ def _unpermute_tokens_in_expert_order_kernel(
 
     acc = tl.zeros([BLOCK_H], dtype=tl.float32)
     if tok < valid_tokens:
+        tok_i64 = tok.to(tl.int64)
         for lid in tl.range(0, num_local_experts):
-            pos = tl.load(inverse_map_ptr + tok * num_local_experts + lid)
+            pos = tl.load(inverse_map_ptr + tok_i64 * num_local_experts + lid)
             if pos >= 0:
-                vals = tl.load(expert_out_ptr + pos * hidden_dim + offsets, mask=mask_h).to(
+                pos_i64 = pos.to(tl.int64)
+                vals = tl.load(expert_out_ptr + pos_i64 * hidden_dim + offsets, mask=mask_h).to(
                     tl.float32
                 )
                 acc += vals
-        tl.store(output_ptr + tok * hidden_dim + offsets, acc, mask=mask_h)
+        tl.store(output_ptr + tok_i64 * hidden_dim + offsets, acc, mask=mask_h)
 
 
 def unpermute_tokens_in_expert_order(

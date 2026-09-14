@@ -119,6 +119,25 @@ def _weighted_swiglu_reference(y, probs_flat):
 
 class TestWeightedSwigluKernels:
 
+    def test_swiglu_with_probs_matches_fused_training_order(self):
+        """Inference must reproduce TEGroupedMLP's weighted SwiGLU fusion exactly."""
+        from megatron.core.fusions.fused_bias_swiglu import weighted_bias_swiglu_impl
+        from megatron.core.inference.moe import batch_invariant
+
+        torch.manual_seed(6)
+        rows, ffn = 256, 128
+        y = (torch.randn(rows, 2 * ffn, device="cuda") * 2.0).bfloat16()
+        probs = torch.rand(rows, device="cuda", dtype=torch.float32)
+        perm_map = torch.arange(rows, device="cuda", dtype=torch.int32)
+        inference = batch_invariant.swiglu_with_probs(y, perm_map, _vt(rows), probs)
+
+        training = weighted_bias_swiglu_impl(y, None, probs[:, None])
+
+        assert torch.equal(training, inference), (
+            "fused training and inference SwiGLU differ; max abs diff: "
+            f"{(training.float() - inference.float()).abs().max().item()}"
+        )
+
     def test_swiglu_with_probs_value_deterministic_and_row_local(self):
         from megatron.core.inference.moe import batch_invariant
 
@@ -320,6 +339,8 @@ class TestTeNativeBackend:
             import transformer_engine.pytorch.cpp_extensions.gemm as te_gemm_mod
 
             ws_fn_before = te_gemm_mod.get_cublas_workspace_size_bytes
+            grouped_ws_fn_before = te_gemm_mod._get_grouped_cublas_workspace
+            unrestricted_ws_bytes = ws_fn_before()
             have_te = True
         except ImportError:
             have_te = False
@@ -331,6 +352,10 @@ class TestTeNativeBackend:
             assert os.environ.get("CUBLASLT_WORKSPACE_SIZE") == "0"
             if have_te:
                 assert te_gemm_mod.get_cublas_workspace_size_bytes() == 1024
+                grouped_workspace = te_gemm_mod._get_grouped_cublas_workspace(
+                    torch.cuda.current_device(), "TN"
+                )
+                assert grouped_workspace.numel() == unrestricted_ws_bytes
             # te_native must NOT reroute aten::mm — native kernels stay
             a = torch.randn(64, 64, device="cuda", dtype=torch.bfloat16)
             b = torch.randn(64, 64, device="cuda", dtype=torch.bfloat16)
@@ -342,4 +367,5 @@ class TestTeNativeBackend:
         # into subsequent non-BI work in the same process)
         if have_te:
             assert te_gemm_mod.get_cublas_workspace_size_bytes is ws_fn_before
+            assert te_gemm_mod._get_grouped_cublas_workspace is grouped_ws_fn_before
         assert os.environ.get("CUBLASLT_WORKSPACE_SIZE") == env_before
