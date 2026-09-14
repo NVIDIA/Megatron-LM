@@ -10,7 +10,7 @@ import torch
 
 from megatron.core.context_parallel import ContextParallelBatch
 from megatron.core.enums import ModelType
-from megatron.core.extensions.transformer_engine import HAVE_TE
+from megatron.core.extensions.transformer_engine import HAVE_TE, _resolve_is_first_microbatch
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_spec,
@@ -37,6 +37,7 @@ from megatron.core.transformer.multi_token_prediction import (
     MTPLossLoggingHelper,
     MultiTokenPredictionBlock,
     MultiTokenPredictionInputs,
+    MultiTokenPredictionLayer,
     _initialize_hidden_state_mixing_rng_tracker,
     _mix_hidden_state_history,
     _mtp_logits_are_vocab_sharded,
@@ -102,7 +103,7 @@ class TestMultiTokenPredictionLayer:
         destroy_global_vars()
         destroy_num_microbatches_calculator()
 
-    def _create_config_and_mtp_block_spec(self, tp, cp, use_te=False):
+    def _create_config_and_mtp_block_spec(self, tp, cp, use_te=False, use_repeated_layer=False):
         Utils.initialize_model_parallel(tensor_model_parallel_size=tp, context_parallel_size=cp)
         config = TransformerConfig(
             mtp_num_layers=2,
@@ -113,6 +114,7 @@ class TestMultiTokenPredictionLayer:
             tensor_model_parallel_size=tp,
             sequence_parallel=True if tp > 1 else False,
             context_parallel_size=cp,  # Enable CP for MTP testing
+            mtp_use_repeated_layer=use_repeated_layer,
         )
         if use_te:
             transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec()
@@ -624,6 +626,29 @@ class TestMultiTokenPredictionLayer:
             assert num_weights == 29664 * config.mtp_num_layers
         elif tp == 4:
             assert num_weights == 15216 * config.mtp_num_layers
+
+    @pytest.mark.skipif(not HAVE_TE, reason="transformer_engine not available")
+    @pytest.mark.parametrize('repeated', [False, True])
+    def test_repeated_layer_opts_out_of_is_first_microbatch(self, repeated):
+        """A shared MTP layer must hand TE None, because its first forward is its last backward."""
+        torch.manual_seed(_SEED)
+        config, mtp_block_spec = self._create_config_and_mtp_block_spec(
+            tp=1, cp=1, use_te=True, use_repeated_layer=repeated
+        )
+        mtp = MultiTokenPredictionBlock(config=config, spec=mtp_block_spec)
+
+        # Quantization is what would otherwise make TE act on the flag, so ask under it.
+        config.fp8 = "hybrid"
+        mtp.set_is_first_microbatch()
+        te_modules = [m for m in mtp.modules() if hasattr(m, 'is_first_microbatch')]
+        assert te_modules, "expected the TE spec to produce modules carrying is_first_microbatch"
+
+        if repeated:
+            assert len(mtp.layers) == 1
+            assert all(_resolve_is_first_microbatch(m) is None for m in te_modules)
+        else:
+            assert len(mtp.layers) == config.mtp_num_layers
+            assert all(_resolve_is_first_microbatch(m) is True for m in te_modules)
 
     def test_get_embeddings_rolls_padding_mask(self):
         """Test that _get_embeddings rolls padding_mask alongside input ids."""
@@ -3224,6 +3249,125 @@ class TestMultiTokenPredictionHybrid:
         destroy_global_vars()
         destroy_num_microbatches_calculator()
         MTPLossLoggingHelper.tracker = {}
+
+    def test_hybrid_mtp_delegates_full_recompute_to_nested_stack(self):
+        """Hybrid MTP must not add an outer checkpoint around its HybridStack."""
+        layer = MultiTokenPredictionLayer.__new__(MultiTokenPredictionLayer)
+        torch.nn.Module.__init__(layer)
+        layer.config = types.SimpleNamespace(recompute_granularity='full')
+        layer.mtp_layer_pattern = "M"
+        layer.training = True
+
+        input_ids = torch.arange(4).reshape(1, 4)
+        position_ids = torch.arange(4).reshape(1, 4)
+        padding_mask = torch.zeros_like(input_ids, dtype=torch.bool)
+        mtp_input_mask = torch.ones_like(input_ids, dtype=torch.bool)
+        decoder_input = torch.randn(4, 1, 8)
+        hidden_states = torch.randn(4, 1, 8)
+        calls = {"inner": 0, "outer": 0}
+
+        def get_embeddings(_self, **_kwargs):
+            return (
+                input_ids,
+                position_ids,
+                padding_mask,
+                mtp_input_mask,
+                decoder_input,
+                hidden_states,
+            )
+
+        def inner_forward(_self, **kwargs):
+            calls["inner"] += 1
+            assert kwargs["hidden_states"] is hidden_states
+            return hidden_states + 1
+
+        def outer_forward(_self, **_kwargs):
+            calls["outer"] += 1
+            raise AssertionError("Hybrid MTP must not use the outer checkpoint")
+
+        layer._get_embeddings = types.MethodType(get_embeddings, layer)
+        layer._proj_and_transformer_layer = types.MethodType(inner_forward, layer)
+        layer._checkpointed_forward = types.MethodType(outer_forward, layer)
+
+        output, *_ = layer(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            hidden_states=hidden_states,
+            attention_mask=None,
+            padding_mask=padding_mask,
+            embedding=object(),
+        )
+
+        assert calls == {"inner": 1, "outer": 0}
+        torch.testing.assert_close(output, hidden_states + 1)
+
+    @pytest.mark.skipif(not HAVE_TE, reason="transformer_engine not available")
+    def test_full_recompute_with_multi_layer_chunks_mamba(self):
+        """Hybrid MTP chunks are recomputed once without an outer MTP checkpoint."""
+        args = self.create_test_args(
+            tp=1,
+            cp=1,
+            sequence_length=self.seq_length,
+            micro_batch_size=self.micro_batch_size,
+            full_recompute=True,
+        )
+        # The main pattern has four symbols and each MTP pattern has two. A chunk
+        # size larger than both should checkpoint each nested HybridStack once.
+        args.recompute_num_layers = 8
+        set_args(args)
+
+        torch.manual_seed(_SEED)
+        Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=1)
+        batch = self.get_batch(self.seq_length, self.micro_batch_size)
+
+        model_parallel_cuda_manual_seed(_SEED)
+        cfg_container = Utils.pretrain_config_from_global_args(args, "hybrid")
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        model, _, _ = setup_model_and_optimizer(
+            ModelType.encoder_or_decoder,
+            self.model_provider,
+            cfg_container=cfg_container,
+            pg_collection=pg_collection,
+        )
+
+        mtp_layers = [
+            module
+            for module in unwrap_model(model[0]).modules()
+            if isinstance(module, MultiTokenPredictionLayer)
+        ]
+        assert len(mtp_layers) == args.mtp_num_layers
+
+        inner_layer_forward_counts = {}
+
+        def count_inner_layer_forward(module, _inputs, _output):
+            inner_layer_forward_counts[module] += 1
+
+        hook_handles = []
+        for mtp_layer in mtp_layers:
+            for inner_layer in mtp_layer.mtp_model_layer.layers:
+                inner_layer_forward_counts[inner_layer] = 0
+                hook_handles.append(inner_layer.register_forward_hook(count_inner_layer_forward))
+
+        try:
+            output = model[0].forward(
+                input_ids=batch['tokens'],
+                position_ids=batch['position_ids'],
+                attention_mask=batch['attention_mask'],
+                labels=batch['labels'],
+                loss_mask=batch['loss_mask'],
+            )
+            output.mean().backward()
+        finally:
+            for handle in hook_handles:
+                handle.remove()
+
+        # Each nested layer runs once in the original forward and once when its HybridStack
+        # chunk is recomputed in backward. An outer MTP checkpoint would add a third execution.
+        assert inner_layer_forward_counts
+        assert all(count == 2 for count in inner_layer_forward_counts.values())
+
+        for name, param in model[0].named_parameters():
+            assert param.main_grad is not None, f"Gradient missing for {name}"
 
     def model_provider(self, pre_process=True, post_process=True, **config_kwargs):
         """Model provider for Mamba hybrid models with MTP.

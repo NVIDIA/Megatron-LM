@@ -302,6 +302,7 @@ class Attention(MegatronModule, ABC):
         cp_comm_type: str | None = None,
         pg_collection: ProcessGroupCollection | None = None,
         pp_layer_offset: Optional[int] = None,
+        is_mtp_layer: bool = False,
         name: str | None = None,
     ):
         """
@@ -313,6 +314,7 @@ class Attention(MegatronModule, ABC):
         self.config = config
         self.layer_number = layer_number
         self._pp_layer_offset = pp_layer_offset
+        self.is_mtp_layer = is_mtp_layer
 
         self.attn_mask_type = attn_mask_type
         self.attention_type = attention_type
@@ -804,6 +806,15 @@ class Attention(MegatronModule, ABC):
             cache_seqlens=sequence_len_offset,
             rotary_interleaved=rotary_interleaved,
         )
+        # This path bypasses self.core_attention and calls flash-attention directly, so the
+        # configured cap has to be passed here too. Only when set, so runs without softcapping
+        # keep their current call signature on older flash-attention builds.
+        softcap = self.config.attn_logit_softcapping
+        if softcap is not None:
+            assert is_fa_min_version(
+                "2.6.0"
+            ), "attn_logit_softcapping requires flash-attn 2.6.0 or newer."
+            kv_kwargs["softcap"] = softcap
         if need_lse:
             kv_kwargs["return_softmax_lse"] = True
             out, softmax_lse = flash_attn_with_kvcache(**kv_kwargs)
@@ -952,7 +963,7 @@ class Attention(MegatronModule, ABC):
             "softmax_scale": softmax_scale,
             "causal": True,
             "attention_chunk": 0,
-            "softcap": 0.0,
+            "softcap": self.config.attn_logit_softcapping or 0.0,
             "window_size": window_size,
             "window_size_left": window_size[0],
             "window_size_right": window_size[1],
@@ -970,6 +981,10 @@ class Attention(MegatronModule, ABC):
             assert isinstance(_flash_attn_forward, torch._library.custom_ops.CustomOpDef)
             sig = inspect.signature(_flash_attn_forward._init_fn)
         valid_kwargs = set(sig.parameters.keys())
+        assert candidate_kwargs["softcap"] == 0.0 or "softcap" in valid_kwargs, (
+            "This FlashAttention 3 build does not accept softcap, so attn_logit_softcapping "
+            "cannot be honoured. Install a softcap-capable build or unset the config field."
+        )
         final_kwargs = {k: candidate_kwargs[k] for k in valid_kwargs if k in candidate_kwargs}
 
         ret = _flash_attn_forward(**final_kwargs)
@@ -1089,6 +1104,8 @@ class Attention(MegatronModule, ABC):
                 softmax_scale = self.softmax_scale
             else:
                 softmax_scale = q.shape[-1] ** -0.5
+            softcap = self.config.attn_logit_softcapping
+            softcap_kwargs = {} if softcap is None else {"softcap": softcap}
             if use_fa4:
                 output_total, softmax_lse = flash_attn4_varlen_func(
                     q,
@@ -1103,6 +1120,7 @@ class Attention(MegatronModule, ABC):
                     causal=True,
                     window_size=window_size,
                     num_splits=0 if not self.batch_invariant_mode else 1,
+                    **softcap_kwargs,
                 )
             elif use_fa3:
                 # TODO(ksanthanam): Replace with call to flash_attn_varlen_func once
@@ -1142,6 +1160,7 @@ class Attention(MegatronModule, ABC):
                     window_size=window_size,
                     block_table=block_table,
                     return_attn_probs=need_lse,
+                    **softcap_kwargs,
                 )
                 if need_lse:
                     # FA2 varlen with return_attn_probs=True returns
@@ -1186,6 +1205,10 @@ class Attention(MegatronModule, ABC):
                     "FlashMLA decode kernel does not support sliding window attention. "
                     "Set config.window_size = None or use a non-MLA attention layer."
                 )
+                assert self.config.attn_logit_softcapping is None, (
+                    "FlashMLA decode kernel does not support attention logit softcapping. "
+                    "Set config.attn_logit_softcapping = None or use a non-MLA attention layer."
+                )
                 softmax_scale = self.softmax_scale
 
                 num_heads_k = 1  # Only a single head for MLA Flash
@@ -1225,6 +1248,8 @@ class Attention(MegatronModule, ABC):
                         softmax_scale = q.shape[-1] ** -0.5
                     # Reshape q from (B, S, H, D) to (B*S, H, D) for varlen interface
                     q_varlen = q.reshape(-1, q.shape[-2], q.shape[-1])
+                    decode_softcap = self.config.attn_logit_softcapping
+                    softcap_kwargs = {} if decode_softcap is None else {"softcap": decode_softcap}
                     output_total, softmax_lse = flash_attn4_varlen_func(
                         q_varlen,
                         k,
@@ -1238,6 +1263,7 @@ class Attention(MegatronModule, ABC):
                         causal=True,
                         window_size=window_size,
                         num_splits=0 if not self.batch_invariant_mode else 1,
+                        **softcap_kwargs,
                     )
                     if need_lse:
                         # output_total: (B*S, H, D); softmax_lse: (H, B*S)
@@ -1264,6 +1290,9 @@ class Attention(MegatronModule, ABC):
                         "page_table" if use_fa3 else "block_table": block_table,
                         "num_splits": 0 if not self.batch_invariant_mode else 1,
                     }
+                    decode_softcap = self.config.attn_logit_softcapping
+                    if decode_softcap is not None:
+                        flash_attn_args["softcap"] = decode_softcap
                     if need_lse:
                         flash_attn_args["return_softmax_lse"] = True
                     if use_fa3:
@@ -1711,6 +1740,7 @@ class SelfAttention(Attention):
         cp_comm_type: str | None = None,
         pg_collection: ProcessGroupCollection | None = None,
         pp_layer_offset: Optional[int] = None,
+        is_mtp_layer: bool = False,
         name: str | None = None,
     ):
         """
@@ -1726,6 +1756,7 @@ class SelfAttention(Attention):
             cp_comm_type=cp_comm_type,
             pg_collection=pg_collection,
             pp_layer_offset=pp_layer_offset,
+            is_mtp_layer=is_mtp_layer,
             name=name,
         )
 
@@ -2128,6 +2159,7 @@ class CrossAttention(Attention):
         attn_mask_type: AttnMaskType = AttnMaskType.padding,
         cp_comm_type: str | None = None,
         pg_collection: ProcessGroupCollection | None = None,
+        is_mtp_layer: bool = False,
         name: str | None = None,
     ):
         """
@@ -2142,6 +2174,7 @@ class CrossAttention(Attention):
             attention_type="cross",
             cp_comm_type=cp_comm_type,
             pg_collection=pg_collection,
+            is_mtp_layer=is_mtp_layer,
             name=name,
         )
 
