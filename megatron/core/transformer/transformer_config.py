@@ -3471,6 +3471,19 @@ class TransformerConfig(ModelParallelConfig):
                 'simplified',
             ), "dsa_indexer_mode must be 'standard' or 'simplified'."
             simplified_indexer = self.dsa_indexer_mode == 'simplified'
+            # The dense indexer warmup and the indexer reset were built for, and have only
+            # been exercised with, the simplified indexer. The standard DeepSeek indexer
+            # reaches the same code paths, so refuse the combination rather than let an
+            # untested one run.
+            assert (
+                simplified_indexer or not self.dsa_fwd_use_dense_attn
+            ), "dsa_fwd_use_dense_attn requires dsa_indexer_mode='simplified'."
+            assert (
+                simplified_indexer or not self.dsa_reset_indexer_on_load
+            ), "dsa_reset_indexer_on_load requires dsa_indexer_mode='simplified'."
+            assert (
+                simplified_indexer or self.dsa_indexer_reset_method == 'random'
+            ), "dsa_indexer_reset_method requires dsa_indexer_mode='simplified'."
             if simplified_indexer:
                 assert (
                     self.num_query_groups == 1
