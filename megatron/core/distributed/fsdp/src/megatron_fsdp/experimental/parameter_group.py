@@ -36,6 +36,7 @@ from .placement import BlockAtomic
 if HAVE_TE:
     from .quantized_dbuffer import QuantizedDBuffer, effective_dtype
 else:
+    QuantizedDBuffer = None
 
     def effective_dtype(tensor: torch.Tensor) -> torch.dtype:
         """Without TE, all parameters use their native storage dtype."""
@@ -239,7 +240,7 @@ class FsdpParameterGroup:
             self.model_weight = self.main_weight
         else:
             with self._symmetric_memory_context():
-                if self.dtype == torch.uint8:
+                if HAVE_TE and self.dtype == torch.uint8:
                     self.model_weight = QuantizedDBuffer(
                         self.mesh, model_weight_placements, tensor_shapes, self.main_weight.device
                     )
@@ -394,6 +395,9 @@ class FsdpParameterGroup:
             # under no_grad. Without preserving it, backward can fail with "modified by an
             # inplace operation" even though FSDP only materialized internal storage.
             with torch.autograd._unsafe_preserve_version_counter(preserved_tensors):
+                # TODO: Gather only rowwise MXFP8 weights and scales for forward, and
+                # columnwise weights and scales for backward. Currently both are gathered
+                # in each phase, increasing communication and temporary storage.
                 self.model_weight.redistribute(
                     unsharded_model_weight.placements, out=unsharded_model_weight
                 )
