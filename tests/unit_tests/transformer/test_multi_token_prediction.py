@@ -209,6 +209,7 @@ class TestMultiTokenPredictionLayer:
             use_cpu_initialization=True,
         )
         source_config = AttentionLayerConfig.from_config(config)
+        source_config.num_layers = 7
         source_config.caller_owned_state = []
         source_list = [source_config, source_config]
         group = FakeGroup()
@@ -237,20 +238,6 @@ class TestMultiTokenPredictionLayer:
         assert all(layer_config is not source_config for layer_config in physical_configs)
         assert len({id(layer_config) for layer_config in physical_configs}) == len(physical_configs)
         assert all(layer_config.is_hybrid_model for layer_config in physical_configs)
-        assert all(layer_config.mtp_num_layers == 2 for layer_config in physical_configs)
-        assert all(
-            layer_config.mtp_use_repeated_layer is mtp_use_repeated_layer
-            for layer_config in physical_configs
-        )
-        expected_tracker_size = 4 if mtp_use_repeated_layer else 6
-        assert all(
-            layer_config._hybrid_moe_metrics_num_layers == expected_tracker_size
-            for layer_config in physical_configs
-        )
-        expected_tracker_layers = [3, 4] if mtp_use_repeated_layer else [3, 4, 5, 6]
-        assert [
-            layer_config._hybrid_moe_metrics_layer_number for layer_config in physical_configs
-        ] == expected_tracker_layers
 
         hidden_states = torch.randn(4, 1, 8, requires_grad=True)
         output = block(
@@ -267,6 +254,7 @@ class TestMultiTokenPredictionLayer:
         assert all(stack.scale.grad is not None for stack in captured_stacks)
         expected_calls = [2] if mtp_use_repeated_layer else [1, 1]
         assert [stack.forward_calls for stack in captured_stacks] == expected_calls
+        assert source_config.num_layers == 7
         assert source_config.caller_owned_state == []
 
         captured_config_lists.clear()
@@ -284,13 +272,22 @@ class TestMultiTokenPredictionLayer:
             for layer_config in layer_config_list
         ]
         assert pattern_configs
+        assert len(physical_configs) == len(pattern_configs)
+        for list_config, pattern_config in zip(physical_configs, pattern_configs):
+            assert list_config.num_layers == pattern_config.num_layers == 2
+            assert list_config.mtp_num_layers == pattern_config.mtp_num_layers == 2
+            assert (
+                list_config.mtp_use_repeated_layer
+                is pattern_config.mtp_use_repeated_layer
+                is mtp_use_repeated_layer
+            )
         assert all(
             not hasattr(layer_config, "_hybrid_moe_metrics_num_layers")
-            for layer_config in pattern_configs
+            for layer_config in physical_configs + pattern_configs
         )
         assert all(
             not hasattr(layer_config, "_hybrid_moe_metrics_layer_number")
-            for layer_config in pattern_configs
+            for layer_config in physical_configs + pattern_configs
         )
 
     @pytest.mark.parametrize("constructor", [MultiTokenPredictionLayer, MultiTokenPredictionBlock])

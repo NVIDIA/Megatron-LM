@@ -84,7 +84,7 @@ def test_hybrid_config_list_moe_logging_metadata_counts_all_physical_moe_layers(
 
     repeated = _hybrid_config_list_moe_logging_metadata(source, True)
     # Disabled auxiliary losses do not remove an MoE layer from the averaging denominator.
-    assert repeated == (["load_balancing_loss", "seq_load_balancing_loss", "z_loss"], 3, 3, True)
+    assert repeated == (["load_balancing_loss", "seq_load_balancing_loss", "z_loss"], 4, 3, True)
 
     independent = _hybrid_config_list_moe_logging_metadata(source, False)
     assert independent == (["load_balancing_loss", "seq_load_balancing_loss", "z_loss"], 4, 4, True)
@@ -95,8 +95,44 @@ def test_hybrid_config_list_moe_logging_metadata_without_moe():
     dense = MLPLayerConfig.from_config(base)
     source = [dense, PipelineSplit, dense, MTPSplit, dense, MTPSplit, dense]
 
-    assert _hybrid_config_list_moe_logging_metadata(source, True) == ([], 3, 0, False)
+    assert _hybrid_config_list_moe_logging_metadata(source, True) == ([], 4, 0, False)
     assert _hybrid_config_list_moe_logging_metadata(source, False) == ([], 4, 0, False)
+
+
+def test_hybrid_config_list_moe_logging_metadata_uses_standard_mtp_tracker_size():
+    base = TransformerConfig(num_layers=2, hidden_size=8, num_attention_heads=2)
+    dense = MLPLayerConfig.from_config(base)
+    moe = MoELayerConfig.from_config(base)
+    source = [moe, PipelineSplit, dense, MTPSplit, dense, moe, MTPSplit, dense, moe]
+
+    # The existing tracker allocates one slot per MTP depth, not per template sublayer.
+    assert _hybrid_config_list_moe_logging_metadata(source, True) == (
+        ["load_balancing_loss"],
+        4,
+        2,
+        True,
+    )
+    assert _hybrid_config_list_moe_logging_metadata(source, False) == (
+        ["load_balancing_loss"],
+        4,
+        3,
+        True,
+    )
+
+
+def test_hybrid_config_list_moe_logging_metadata_keeps_disabled_metric_names():
+    base = TransformerConfig(num_layers=2, hidden_size=8, num_attention_heads=2)
+    dense = MLPLayerConfig.from_config(base)
+    moe = MoELayerConfig.from_config(base)
+    moe.moe_router_load_balancing_type = ["aux_loss", "seq_aux_loss", "global_aux_loss"]
+    moe.moe_aux_loss_coeff = [0.0, 0.0, 0.0]
+
+    assert _hybrid_config_list_moe_logging_metadata([moe, dense], False) == (
+        ["load_balancing_loss", "seq_load_balancing_loss", "global_load_balancing_loss"],
+        2,
+        1,
+        True,
+    )
 
 
 def test_runtime_metrics_find_hybrid_model_under_language_model_wrapper():

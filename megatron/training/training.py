@@ -3376,28 +3376,12 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
 def _hybrid_config_list_moe_logging_metadata(
     hybrid_layer_config_list, mtp_use_repeated_layer: bool
 ):
-    """Derive metric names and physical layer counts from a HybridModel config list."""
+    """Derive config-list MoE metadata using the existing pattern logging conventions."""
     from megatron.core.models.hybrid.hybrid_layer_allocation import MTPSplit, PipelineSplit
     from megatron.core.transformer.moe.moe_layer_config import MoELayerConfig
 
-    def aux_loss_coeff_for_config(moe_config, routing_type):
-        configured_types = moe_config.moe_router_load_balancing_type
-        if isinstance(configured_types, str):
-            return moe_config.moe_aux_loss_coeff if configured_types == routing_type else 0.0
-        try:
-            routing_index = configured_types.index(routing_type)
-        except ValueError:
-            return 0.0
-        return moe_config.moe_aux_loss_coeff[routing_index]
-
-    def enabled_routing_types_for_config(moe_config):
-        return {
-            routing_type
-            for routing_type in ("aux_loss", "seq_aux_loss", "global_aux_loss")
-            if aux_loss_coeff_for_config(moe_config, routing_type) > 0
-        }
-
     physical_configs = []
+    num_decoder_layers = 0
     mtp_depth = 0
     for entry in hybrid_layer_config_list:
         if entry is PipelineSplit:
@@ -3406,14 +3390,19 @@ def _hybrid_config_list_moe_logging_metadata(
             mtp_depth += 1
         elif mtp_depth == 0 or not mtp_use_repeated_layer or mtp_depth == 1:
             physical_configs.append(entry)
+            if mtp_depth == 0:
+                num_decoder_layers += 1
 
+    # Routers reserve one logging slot per MTP depth, as on the pattern path.
+    num_layers = num_decoder_layers + mtp_depth
     physical_moe_configs = [config for config in physical_configs if type(config) is MoELayerConfig]
     if not physical_moe_configs:
-        return [], len(physical_configs), 0, False
+        return [], num_layers, 0, False
 
     routing_types = set()
     for moe_config in physical_moe_configs:
-        routing_types.update(enabled_routing_types_for_config(moe_config))
+        configured_types = moe_config.moe_router_load_balancing_type
+        routing_types.update([configured_types] if isinstance(configured_types, str) else configured_types)
 
     metric_to_routing_type = {
         "load_balancing_loss": "aux_loss",
@@ -3428,7 +3417,7 @@ def _hybrid_config_list_moe_logging_metadata(
     if any(config.moe_z_loss_coeff is not None for config in physical_moe_configs):
         track_names.append("z_loss")
 
-    return track_names, len(physical_configs), len(physical_moe_configs), True
+    return track_names, num_layers, len(physical_moe_configs), True
 
 
 def _find_hybrid_model_for_runtime_metrics(model):

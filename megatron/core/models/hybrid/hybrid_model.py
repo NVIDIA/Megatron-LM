@@ -360,23 +360,13 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             self.config.mtp_hsm = False
 
         if self.hybrid_layer_config_list is not None:
-            # Per-layer configs may predate list-backed MTP depth inference. Synchronize only the
-            # physical clones, and size the tracker for every physical layer in the MTP template.
-            mtp_template_length = len(self.mtp_layer_config_list or ())
-            physical_mtp_depths = (
-                1
-                if self.mtp_num_depths > 0 and self.config.mtp_use_repeated_layer
-                else self.mtp_num_depths
-            )
-            self.config._hybrid_moe_metrics_num_layers = (
-                self.config.num_layers + mtp_template_length * physical_mtp_depths
-            )
+            # Synchronize model-global depths, including inferred MTP depth, on physical clones
+            # only. Caller-owned configs can be reused in models with different depths.
             for layer_config in layer_config_list:
+                layer_config.num_layers = self.config.num_layers
                 layer_config.mtp_num_layers = self.config.mtp_num_layers
                 layer_config.mtp_use_repeated_layer = self.config.mtp_use_repeated_layer
-                layer_config._hybrid_moe_metrics_num_layers = (
-                    self.config._hybrid_moe_metrics_num_layers
-                )
+                layer_utils.normalize_hybrid_layer_config(layer_config)
 
         # Determine if MTP is needed from either representation.
         self.mtp_process = (

@@ -69,7 +69,13 @@ class TestTop2Router:
         assert num_weights == 12 * 4, num_weights
 
     @pytest.mark.internal
-    def test_hybrid_mtp_metric_uses_physical_layer_index(self, monkeypatch):
+    @pytest.mark.parametrize(
+        "is_mtp_layer,mtp_num_layers,expected_layer_number,expected_num_layers",
+        [(False, None, 1, 2), (False, 2, 1, 4), (True, 2, 3, 4)],
+    )
+    def test_metric_uses_standard_layer_index(
+        self, monkeypatch, is_mtp_layer, mtp_num_layers, expected_layer_number, expected_num_layers
+    ):
         recorded = {}
 
         class _MetricsTracker:
@@ -82,9 +88,9 @@ class TestTop2Router:
             "megatron.core.transformer.moe.router.get_moe_metrics_tracker",
             lambda: _MetricsTracker(),
         )
-        self.router.is_mtp_layer = True
-        self.router.config._hybrid_moe_metrics_layer_number = 7
-        self.router.config._hybrid_moe_metrics_num_layers = 9
+        self.router.is_mtp_layer = is_mtp_layer
+        self.router.set_layer_number(1)
+        self.router.config.mtp_num_layers = mtp_num_layers
 
         self.router.attach_and_log_load_balancing_loss(
             torch.ones(2, self.router.config.hidden_size),
@@ -95,8 +101,8 @@ class TestTop2Router:
         )
 
         assert recorded["name"] == "load_balancing_loss"
-        assert recorded["layer_number"] == 7
-        assert recorded["num_layers"] == 9
+        assert recorded["layer_number"] == expected_layer_number
+        assert recorded["num_layers"] == expected_num_layers
 
     @pytest.mark.internal
     @pytest.mark.parametrize("num_moe_layers", [None, 2])

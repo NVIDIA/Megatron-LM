@@ -356,8 +356,10 @@ class TestHybridModel:
             num_layers=3, hidden_size=256, num_attention_heads=4, use_cpu_initialization=True
         )
         attention_config = AttentionLayerConfig.from_config(model_config)
+        attention_config.num_layers = 7
         attention_config.output_layer_init_method = torch.nn.init.zeros_
         mlp_config = MLPLayerConfig.from_config(model_config)
+        mlp_config.num_layers = 7
         mlp_config.ffn_hidden_size = 768
         source = [attention_config, mlp_config, attention_config]
 
@@ -384,6 +386,9 @@ class TestHybridModel:
             for physical, source_config in zip(physical_configs, source[:3], strict=True)
         )
         assert physical_configs[0].output_layer_init_method is torch.nn.init.zeros_
+        assert all(config.num_layers == model_config.num_layers for config in physical_configs)
+        assert attention_config.num_layers == 7
+        assert mlp_config.num_layers == 7
         assert physical_configs[1].ffn_hidden_size == 768
         assert physical_configs[1].output_layer_init_method.keywords["std"] == pytest.approx(
             model_config.init_method_std / model_config.num_layers**0.5

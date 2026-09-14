@@ -1382,6 +1382,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                 clone_hybrid_layer_config_list,
                 validate_segment_layers,
             )
+            from megatron.core.models.hybrid.layers import utils as layer_utils
 
             if self.mtp_layer_config_list is not None:
                 layer_config_list = clone_hybrid_layer_config_list(self.mtp_layer_config_list)
@@ -1391,25 +1392,11 @@ class MultiTokenPredictionLayer(MegatronModule):
                 raise ValueError("Hybrid MTP layer config list must be non-empty")
 
             if self.mtp_layer_config_list is not None:
-                physical_mtp_depths = (
-                    1 if self.config.mtp_use_repeated_layer else (self.config.mtp_num_layers or 1)
-                )
-                metrics_num_layers = getattr(
-                    self.config,
-                    '_hybrid_moe_metrics_num_layers',
-                    self.config.num_layers + len(layer_config_list) * physical_mtp_depths,
-                )
-                physical_depth_index = 0 if self.config.mtp_use_repeated_layer else layer_number - 1
-                for inner_index, layer_config in enumerate(layer_config_list):
+                for layer_config in layer_config_list:
+                    layer_config.num_layers = self.config.num_layers
                     layer_config.mtp_num_layers = self.config.mtp_num_layers
                     layer_config.mtp_use_repeated_layer = self.config.mtp_use_repeated_layer
-                    layer_config._hybrid_moe_metrics_num_layers = metrics_num_layers
-                    layer_config._hybrid_moe_metrics_layer_number = (
-                        self.config.num_layers
-                        + physical_depth_index * len(layer_config_list)
-                        + inner_index
-                        + 1
-                    )
+                    layer_utils.normalize_hybrid_layer_config(layer_config)
             self.mtp_model_layer = HybridStack(
                 config=self.config,
                 submodules=hybrid_submodules,
