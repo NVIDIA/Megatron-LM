@@ -3189,6 +3189,9 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         block_aligned = finished % self.block_size_tokens == 0
         prompt_logprob_key = getattr(req, "_prompt_logprobs_cache_key", None)
+        needs_prompt_logprobs = (
+            req.sampling_params.return_log_probs and not req.sampling_params.skip_prompt_log_probs
+        )
         num_logprob_matched = self._find_prompt_logprob_match_count(
             req, already_allocated_blocks, matched_block_ids
         )
@@ -3203,7 +3206,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 prefix_skip_tokens = min(
                     num_logprob_matched * self.block_size_tokens - 1, prefill_chunk_length - 1
                 )
-        elif prompt_logprob_key is None and num_matched > 0 and block_aligned:
+        elif not needs_prompt_logprobs and num_matched > 0 and block_aligned:
             prefix_skip_tokens = min(num_matched * self.block_size_tokens, prefill_chunk_length - 1)
         else:
             prefix_skip_tokens = 0
@@ -3233,7 +3236,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                     req=req, start_block=0, end_block=max_restore_blocks
                 )
                 prefix_skip_tokens = restore_blocks * self.block_size_tokens
-            elif num_mamba_matched > 0 and block_aligned:
+            elif not needs_prompt_logprobs and num_mamba_matched > 0 and block_aligned:
                 raw_skip = num_mamba_matched * self.block_size_tokens
                 if raw_skip >= prefill_chunk_length:
                     # Back off to previous block with cached Mamba state
@@ -3418,6 +3421,9 @@ class DynamicInferenceContext(BaseInferenceContext):
             )
 
         prompt_logprob_key = getattr(req, "_prompt_logprobs_cache_key", None)
+        needs_prompt_logprobs = (
+            req.sampling_params.return_log_probs and not req.sampling_params.skip_prompt_log_probs
+        )
         if prompt_logprob_key is not None:
             self.prompt_logprobs_cache_keys[req.request_id] = prompt_logprob_key
             self.prompt_logprobs_block_hashes[req.request_id] = tuple(req.precomputed_block_hashes)
@@ -3436,10 +3442,11 @@ class DynamicInferenceContext(BaseInferenceContext):
         num_matched_blocks = len(matched_block_ids)
         effective_kv_offset = req.finished_chunk_token_count + prefix_skip_tokens
         cache_hit_blocks = num_matched_blocks
-        if prompt_logprob_key is not None:
+        if needs_prompt_logprobs:
             cache_hit_blocks = self._find_prompt_logprob_match_count(
                 req, already_allocated_blocks, matched_block_ids
             )
+        if prompt_logprob_key is not None:
             retained_refs = self.prompt_logprobs_matched_refs.setdefault(req.request_id, {})
             for offset, block_id in enumerate(matched_block_ids[:cache_hit_blocks]):
                 logical_block_index = already_allocated_blocks + offset

@@ -3326,6 +3326,65 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
             Utils.destroy_model_parallel()
             self._clear_engine_runtime()
 
+    @pytest.mark.internal
+    @pytest.mark.parametrize("model_provider", ["gpt", "hybrid"])
+    @torch.inference_mode()
+    def test_uncacheable_prompt_top_n_recomputes(self, model_provider):
+        if model_provider == "hybrid":
+            skip_if_sequence_packing_not_available("mamba")
+        Utils.initialize_model_parallel()
+        self._clear_engine_runtime()
+        try:
+            case = {
+                "name": f"{model_provider}-uncacheable-prompt-top-n",
+                "feature": "mamba" if model_provider == "hybrid" else "base",
+                "model_provider": model_provider,
+                "policy": PrefixCachingEvictionPolicy.LRU,
+            }
+            prompt_length = 2 * 256 + 1
+            prompt = torch.arange(prompt_length, device=torch.cuda.current_device()) % 99
+
+            oracle_config = self._case_config(case, enable_prefix_caching=False)
+            oracle_config.materialize_only_last_token_logits = False
+            oracle_config.vocab_size = 128
+            oracle_env = self._build_test_env(oracle_config)
+            oracle_env.engine.controller.tokenizer.detokenize = (
+                lambda tokens, **_: f"tok_{tokens[0]}"
+            )
+            run = self._run_prompt_logprob_request
+            oracle, oracle_cost, _ = run(oracle_env.engine, 0, prompt, 101)
+            assert oracle_cost == prompt_length
+            del oracle_env
+            self._clear_engine_runtime()
+
+            cache_config = self._case_config(case, enable_prefix_caching=True)
+            cache_config.materialize_only_last_token_logits = False
+            cache_config.vocab_size = 128
+            cache_env = self._build_test_env(cache_config)
+            engine = cache_env.engine
+            engine.controller.tokenizer.detokenize = lambda tokens, **_: f"tok_{tokens[0]}"
+            run(engine, 10, prompt, 5)
+
+            allocator = engine.context.kv_block_allocator
+            sidecars_before = dict(allocator.block_prompt_logprobs)
+            hits_before = engine.context.prefix_cache_hits
+            blocks_matched_before = engine.context.prefix_cache_blocks_matched
+
+            result, result_cost, _ = run(engine, 11, prompt, 101)
+            self._assert_prompt_logprob_parity(result, oracle)
+            assert result_cost == prompt_length
+            assert result.num_cached_tokens == 0
+            assert engine.context.prefix_cache_hits == hits_before
+            assert engine.context.prefix_cache_blocks_matched == blocks_matched_before
+            assert allocator.block_prompt_logprobs == sidecars_before
+            assert all(len(row) == 101 for row in result.prompt_top_n_logprobs)
+        finally:
+            DynamicInferenceContext.ROUNDER = 64
+            DynamicInferenceContext.TOKEN_ROUNDER = 64
+            DynamicInferenceContext.REQUEST_ROUNDER = 64
+            Utils.destroy_model_parallel()
+            self._clear_engine_runtime()
+
     @staticmethod
     def _clear_engine_runtime():
         """Release per-row model and inference allocations before rebuilding."""

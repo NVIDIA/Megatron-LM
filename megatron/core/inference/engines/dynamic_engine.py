@@ -1494,21 +1494,16 @@ class DynamicInferenceEngine(AbstractEngine):
         request_id = request.request_id
 
         prompt_logprobs_cache_key = None
+        needs_prompt_logprobs = (
+            request.sampling_params.return_log_probs
+            and not request.sampling_params.skip_prompt_log_probs
+        )
         wants_cached_prompt_logprobs = (
             self.context.enable_prefix_caching
             and request.enable_prefix_caching
-            and request.sampling_params.return_log_probs
-            and not request.sampling_params.skip_prompt_log_probs
+            and needs_prompt_logprobs
+            and request.sampling_params.top_n_logprobs <= MAX_CACHED_PROMPT_TOP_N_LOGPROBS
         )
-        if (
-            wants_cached_prompt_logprobs
-            and request.sampling_params.top_n_logprobs > MAX_CACHED_PROMPT_TOP_N_LOGPROBS
-        ):
-            raise ValueError(
-                "Prefix-cached prompt log probabilities support at most "
-                f"top_n_logprobs={MAX_CACHED_PROMPT_TOP_N_LOGPROBS}, got "
-                f"{request.sampling_params.top_n_logprobs}."
-            )
         if wants_cached_prompt_logprobs:
             prompt_logprobs_cache_key = PromptLogprobsKey.create(
                 mode=self.context.config.logprobs_mode,
