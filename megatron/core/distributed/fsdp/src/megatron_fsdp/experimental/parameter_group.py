@@ -647,7 +647,7 @@ class Fp8ParameterGroup(FsdpParameterGroup):
         use_symmetric_memory: bool,
         block_size: int = 1,
     ) -> None:
-        del main_weight_dtype, main_weight_placements, use_symmetric_memory
+        del main_weight_dtype, use_symmetric_memory
         # The bf16 model-weight storage is replaced by the two uint8 payload
         # DBuffers; the unsharded parameters are the module's own MXFP8Tensor
         # objects whose raw payloads are rebound from the gathered buffers.
@@ -656,7 +656,18 @@ class Fp8ParameterGroup(FsdpParameterGroup):
         device = self.main_weight.device
         self._rowwise_buffer = DBuffer.empty(
             mesh=self.mesh,
-            placements=model_weight_placements,
+            # The fp8 payloads are quantized FROM the main weights, so they must be
+            # sharded exactly like them. That is NOT the parameter placement in
+            # general: _DATA_PARALLEL_PLACEMENTS maps ZeRO-1 to
+            # (parameter=Replicate, gradient=Partial, optimizer=Shard) and ZeRO-2 to
+            # (Replicate, Shard, Shard), while fully_shard.py derives
+            # model_weight_placements from placements.parameter but
+            # main_weight_placements from placements.optimizer. Using the parameter
+            # placement here leaves the payload replicated (full size) while the main
+            # weight is a shard, so the local shard->payload copy fails with a 2x size
+            # mismatch. Under ZeRO-3 the two placements coincide, which is why that
+            # configuration never exposed this.
+            placements=main_weight_placements,
             tensor_shapes=tensor_shapes,
             dtype=torch.uint8,
             device=device,
@@ -665,7 +676,7 @@ class Fp8ParameterGroup(FsdpParameterGroup):
         )
         self._colwise_buffer = DBuffer.empty(
             mesh=self.mesh,
-            placements=model_weight_placements,
+            placements=main_weight_placements,
             tensor_shapes=tensor_shapes,
             dtype=torch.uint8,
             device=device,
@@ -764,15 +775,16 @@ class Fp8ParameterGroup(FsdpParameterGroup):
                 )
             )
 
-        # The reduce group is the axis the model weights are sharded over. With
-        # all-Replicate placements (expert parameters configured at ZeRO-1, where
-        # ``parameter=Replicate()``) there is no sharded axis, but the collective must
-        # still target this FSDP mesh: every rank in the mesh holds an identical copy of
-        # the parameter, so each computes an identical amax and the MAX is idempotent.
-        # The default process group must NOT be used here -- it spans unrelated PP/TP
-        # ranks holding different parameters, which would silently corrupt the scales.
+        # The reduce group is the axis the main weights are sharded over, which is the
+        # axis the amax must be reduced across (each rank owns a disjoint shard, so no
+        # rank sees the whole tensor's amax on its own). It is read from the payload
+        # buffers, which now follow the main-weight placement. When nothing is sharded
+        # (fully replicated main weights) fall back to this FSDP mesh's own axis: every
+        # rank then holds an identical copy, so the MAX is idempotent. The default
+        # process group must NOT be used -- it spans unrelated PP/TP ranks holding
+        # different parameters and would silently corrupt the scales.
         gather_axis = changed_mesh_axis(
-            self._model_weight_placements, tuple(Replicate() for _ in range(self.mesh.ndim))
+            tuple(self._rowwise_buffer.placements), tuple(Replicate() for _ in range(self.mesh.ndim))
         )
         reduce_axis = 0 if gather_axis is None else gather_axis
         cast_master_weights_to_fp8(
