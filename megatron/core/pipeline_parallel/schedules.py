@@ -1743,7 +1743,7 @@ def forward_backward_pipelining_with_interleaving(
                 recv_next = True
                 if is_pp_last_stage(p2p_communicator.pp_group):
                     recv_next = False
-                (input_tensor, output_tensor_grad) = (
+                input_tensor, output_tensor_grad = (
                     p2p_communicator.send_forward_backward_recv_forward_backward(
                         output_tensor,
                         input_tensor_grad,
@@ -1807,7 +1807,7 @@ def forward_backward_pipelining_with_interleaving(
                 if is_pp_last_stage(p2p_communicator.pp_group):
                     recv_next = False
 
-                (bwd_recv_buffer[-1], bwd_wait_handles) = (
+                bwd_recv_buffer[-1], bwd_wait_handles = (
                     p2p_communicator.send_backward_recv_backward(
                         input_tensor_grad,
                         recv_next=recv_next,
@@ -1960,7 +1960,7 @@ def forward_backward_pipelining_with_interleaving(
                     backward_k, forward=False
                 )
 
-                (bwd_recv_buffer[backward_k % bwd_recv_buffer_size], bwd_wait_handles) = (
+                bwd_recv_buffer[backward_k % bwd_recv_buffer_size], bwd_wait_handles = (
                     p2p_communicator.send_backward_recv_backward(
                         input_tensor_grad,
                         recv_next=recv_next,
@@ -2033,7 +2033,7 @@ def forward_backward_pipelining_with_interleaving(
                 recv_prev = False
 
             # Communicate tensors.
-            (input_tensor, output_tensor_grad) = (
+            input_tensor, output_tensor_grad = (
                 p2p_communicator.send_forward_backward_recv_forward_backward(
                     output_tensor,
                     input_tensor_grad,
@@ -2235,19 +2235,26 @@ def get_tensor_shapes(
                  This matters for hyper connections where first/last stages have different
                  send/recv dimensions.
 
-    Returns [()] for variable_seq_lengths mode (shapes exchanged dynamically),
-    or computed shapes for fixed sequence length mode.
+    Returns [()] for dynamic ``variable_seq_lengths`` mode, or computed shapes for fixed sequence
+    length mode. Packed sequences may opt into a fixed pipeline shape when they are padded to
+    ``max_seqlen_per_dp_cp_rank``.
     """
     tensor_shapes = []
 
-    if config.variable_seq_lengths:
+    use_fixed_packed_shape = config.variable_seq_lengths and getattr(
+        config, 'pipeline_p2p_fixed_shape', False
+    )
+    if config.variable_seq_lengths and not use_fixed_packed_shape:
         # Shapes exchanged dynamically during P2P communication
         tensor_shapes.append(())
         return tensor_shapes
 
     # Fixed sequence lengths - compute shape
-    effective_seq_length = decoder_seq_length if decoder_seq_length is not None else seq_length
-    effective_seq_length = effective_seq_length // cp_group.size()
+    if use_fixed_packed_shape:
+        effective_seq_length = config.max_seqlen_per_dp_cp_rank
+    else:
+        effective_seq_length = decoder_seq_length if decoder_seq_length is not None else seq_length
+        effective_seq_length = effective_seq_length // cp_group.size()
 
     if config.sequence_parallel:
         effective_seq_length = effective_seq_length // tp_group.size()
