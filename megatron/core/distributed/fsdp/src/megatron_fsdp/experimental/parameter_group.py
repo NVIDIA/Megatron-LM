@@ -764,16 +764,22 @@ class Fp8ParameterGroup(FsdpParameterGroup):
                 )
             )
 
+        # The reduce group is the axis the model weights are sharded over. With
+        # all-Replicate placements (expert parameters configured at ZeRO-1, where
+        # ``parameter=Replicate()``) there is no sharded axis, but the collective must
+        # still target this FSDP mesh: every rank in the mesh holds an identical copy of
+        # the parameter, so each computes an identical amax and the MAX is idempotent.
+        # The default process group must NOT be used here -- it spans unrelated PP/TP
+        # ranks holding different parameters, which would silently corrupt the scales.
         gather_axis = changed_mesh_axis(
             self._model_weight_placements, tuple(Replicate() for _ in range(self.mesh.ndim))
         )
-        if gather_axis is None:
-            raise RuntimeError("FSDP fp8 parameter quantize requires a changed placement axis.")
+        reduce_axis = 0 if gather_axis is None else gather_axis
         cast_master_weights_to_fp8(
             model_weights=model_weights,
             master_weights=master_weights,
             start_offsets=start_offsets,
-            group=self.mesh.get_group(gather_axis),
+            group=self.mesh.get_group(reduce_axis),
             fsdp_shard_model_weights=fsdp_shard_model_weights,
         )
 
@@ -812,10 +818,15 @@ class Fp8ParameterGroup(FsdpParameterGroup):
         ):
             with self._symmetric_memory_context():
                 target.reallocate_storage()
+            # With all-Replicate placements (expert parameters at ZeRO-1) the source buffer
+            # already holds the whole tensor on this rank, so there is nothing to gather:
+            # copy locally into the unsharded buffer that was just reallocated. Both buffers
+            # share this mesh and the same tensor_shapes, so their local buffers match.
             gather_axis = changed_mesh_axis(source.placements, target.placements)
             if gather_axis is None:
-                raise RuntimeError("FSDP fp8 parameter unshard requires a changed placement axis.")
-            source.redistribute(target.placements, out=target)
+                target.local_buffer.copy_(source.local_buffer)
+            else:
+                source.redistribute(target.placements, out=target)
         for index, fsdp_parameter in enumerate(self.fsdp_parameters):
             tensor = fsdp_parameter.unsharded
             set_rowwise_payload(tensor, self._unsharded_rowwise.get_local_tensor(index))
