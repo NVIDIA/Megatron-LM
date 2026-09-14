@@ -44,8 +44,20 @@ recompute list (including attention) with full-layer recomputation. Head/loss re
 the existing linear CE implementation and configuration, independently of
 ChunkedEP. Other model families are not qualified.
 
-Performance qualification is incomplete: single-layer end-to-end measurements
-do not establish isolated OP activation savings or multi-layer throughput.
-Compare native and ChunkedEP with identical existing linear CE settings; older
-combined head/CE measurements are not isolated ChunkedEP gains. Evidence and
-limitations are recorded in the [review PR](https://github.com/ISEEKYAN/Megatron-LM/pull/225).
+End-to-end measurements at `2dd2e71ec` used Qwen3, BF16, EP8, top-k8, two chunks,
+full recomputation, identical existing linear CE, random weights, no optimizer
+update, lazy activation capacity, and 3 warmup + 10 measured steps without a profiler.
+Ranges below cover all eight ranks of one paired run, not confidence intervals.
+
+| Layers / local tokens / microbatches | Speedup | Allocated peak reduction | Reserved peak reduction |
+| --- | --- | --- | --- |
+| 1 / 32768 / 1 | 1.0183–1.0188x | 12.67–16.11% | -12.95 to -10.03% |
+| 48 / 16384 / 16 | 1.1319x | 5.43–9.69% | -0.45 to 4.91% |
+
+Negative reductions mean increased memory. Loss maximum absolute differences
+were 0 and 5.15e-5, respectively; sampled gradient differences were at most
+3.80e-7 and 2.80e-7. These are not full-tensor precision checks. Both scales
+completed offload/recovery with no measured allocator retries or OOMs; lazy
+capacity still grew after warmup. Qualification of normal backward, optimizer
+updates, and isolated OP activation savings remains incomplete. Older combined
+head/CE measurements are not isolated ChunkedEP gains.

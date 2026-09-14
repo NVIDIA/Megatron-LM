@@ -1558,115 +1558,120 @@ class _EPChunkOperationBase:
         wgrad_stream = _shared_stream(grad_2d.device, "wgrad")
         grad_x_chunks: list[torch.Tensor | None] = [None for _ in context.chunks]
         router_accum: list[torch.Tensor | None] = [None for _ in router_params]
-        pending_dispatch_bwd: list[tuple[_BackwardChunk, dict[str, Any]]] = []
         last_deepep_event: Any | None = grad_ready
-        if context.chunks:
-            self.experts._prepare_delayed_weight_grad_sinks()
-        expert_activation_lease = self.workspace.acquire_expert_activation(stream=compute_stream)
 
         def remember_deepep_event(state: dict[str, Any]):
             nonlocal last_deepep_event
             last_deepep_event = state.get("event")
             return state
 
-        for saved in reversed(context.chunks):
-            lease = self.workspace.acquire(
-                saved.idx % EP_CHUNK_COUNT, stream=comm_stream, require_dispatcher=False
+        # Retire at most two logical chunks before reusing either physical slot.
+        for end in range(len(context.chunks), 0, -EP_CHUNK_COUNT):
+            pending_dispatch_bwd: list[tuple[_BackwardChunk, dict[str, Any]]] = []
+            self.experts._prepare_delayed_weight_grad_sinks()
+            expert_activation_lease = self.workspace.acquire_expert_activation(
+                stream=compute_stream
             )
-            chunk = _BackwardChunk(
-                **{item.name: getattr(saved, item.name) for item in fields(_ChunkContext)},
-                workspace_lease=lease,
-            )
-            with torch.cuda.stream(comm_stream):
-                if last_deepep_event is not None:
-                    _event_current_stream_wait(last_deepep_event)
-                combine_state = remember_deepep_event(
-                    chunk.dispatcher.submit_deepep_combine_backward(
-                        grad_2d[chunk.start : chunk.end].contiguous(),
-                        chunk.handle,
-                        allocate_on_comm_stream=True,
+            for saved in reversed(context.chunks[max(0, end - EP_CHUNK_COUNT) : end]):
+                lease = self.workspace.acquire(
+                    saved.idx % EP_CHUNK_COUNT, stream=comm_stream, require_dispatcher=False
+                )
+                chunk = _BackwardChunk(
+                    **{item.name: getattr(saved, item.name) for item in fields(_ChunkContext)},
+                    workspace_lease=lease,
+                )
+                with torch.cuda.stream(comm_stream):
+                    if last_deepep_event is not None:
+                        _event_current_stream_wait(last_deepep_event)
+                    combine_state = remember_deepep_event(
+                        chunk.dispatcher.submit_deepep_combine_backward(
+                            grad_2d[chunk.start : chunk.end].contiguous(),
+                            chunk.handle,
+                            allocate_on_comm_stream=True,
+                        )
                     )
-                )
 
-            local_state: dict[str, Any] = {}
-            with torch.cuda.stream(compute_stream):
-                compute_stream.wait_event(saved.recv_consumed_event)
-                grad_rank_grouped = chunk.dispatcher.finish_deepep_combine_backward(combine_state)
-                local_state["grad_expert_out"] = _manual_unpermute_backward(
-                    chunk, grad_rank_grouped
-                )
-                grad_dispatched, grad_probs, hidden_reuse_base = _backward_expert(
-                    chunk, local_state.pop("grad_expert_out"), expert_activation_lease
-                )
-                local_state["hidden_reuse_base"] = hidden_reuse_base
-                local_state["grad_dispatched"] = grad_dispatched
-                local_state["grad_probs"] = grad_probs
-                saved.probs = None
-                saved.expert_out = None
-                saved.expert_out_edge = None
-                saved.dispatched = None
-                del hidden_reuse_base
-            pending_dispatch_bwd.append((chunk, local_state))
-
-        wgrad_ready = torch.cuda.Event()
-        wgrad_ready.record(compute_stream)
-        with torch.cuda.stream(wgrad_stream):
-            wgrad_stream.wait_event(wgrad_ready)
-            self.experts.flush_delayed_weight_grads(num_contexts=len(pending_dispatch_bwd))
-            wgrad_done = torch.cuda.Event()
-            wgrad_done.record(wgrad_stream)
-        _queue_backward_stream_wait(wgrad_done, grad_2d.device)
-
-        # Delayed grouped-linear Wgrad retains FC1 input. Do not repurpose its
-        # distinct local-scatter destination until that queue drains.
-        for chunk, local_state in pending_dispatch_bwd:
-            with torch.cuda.stream(compute_stream):
-                compute_stream.wait_event(wgrad_done)
-                hidden_reuse_base = local_state.pop("hidden_reuse_base")
-                grad_recv_hidden, grad_recv_probs = _dispatch_local_backward(
-                    chunk,
-                    local_state.pop("grad_dispatched"),
-                    local_state.pop("grad_probs"),
-                    hidden_reuse_base=hidden_reuse_base,
-                )
-                local_ready = torch.cuda.Event()
-                local_ready.record(compute_stream)
-
-            with torch.cuda.stream(comm_stream):
-                comm_stream.wait_event(local_ready)
-                if last_deepep_event is not None:
-                    _event_current_stream_wait(last_deepep_event)
-                local_state["dispatch_bwd_state"] = remember_deepep_event(
-                    chunk.dispatcher.submit_deepep_dispatch_backward(
-                        grad_recv_hidden,
-                        grad_recv_probs,
-                        chunk.handle,
-                        allocate_on_comm_stream=True,
+                local_state: dict[str, Any] = {}
+                with torch.cuda.stream(compute_stream):
+                    compute_stream.wait_event(saved.recv_consumed_event)
+                    grad_rank_grouped = chunk.dispatcher.finish_deepep_combine_backward(
+                        combine_state
                     )
-                )
-                if grad_recv_hidden.is_cuda:
-                    grad_recv_hidden.record_stream(comm_stream)
-                if grad_recv_probs.is_cuda:
-                    grad_recv_probs.record_stream(comm_stream)
-                chunk.recv_probs_base = None
-                del grad_recv_hidden, grad_recv_probs, hidden_reuse_base
+                    local_state["grad_expert_out"] = _manual_unpermute_backward(
+                        chunk, grad_rank_grouped
+                    )
+                    grad_dispatched, grad_probs, hidden_reuse_base = _backward_expert(
+                        chunk, local_state.pop("grad_expert_out"), expert_activation_lease
+                    )
+                    local_state["hidden_reuse_base"] = hidden_reuse_base
+                    local_state["grad_dispatched"] = grad_dispatched
+                    local_state["grad_probs"] = grad_probs
+                    saved.probs = None
+                    saved.expert_out = None
+                    saved.expert_out_edge = None
+                    saved.dispatched = None
+                    del hidden_reuse_base
+                pending_dispatch_bwd.append((chunk, local_state))
 
-        with torch.cuda.stream(compute_stream):
-            backward_activation_done = torch.cuda.Event()
-            backward_activation_done.record(compute_stream)
-        expert_activation_lease.release(backward_activation_done)
+            wgrad_ready = torch.cuda.Event()
+            wgrad_ready.record(compute_stream)
+            with torch.cuda.stream(wgrad_stream):
+                wgrad_stream.wait_event(wgrad_ready)
+                self.experts.flush_delayed_weight_grads(num_contexts=len(pending_dispatch_bwd))
+                wgrad_done = torch.cuda.Event()
+                wgrad_done.record(wgrad_stream)
+            _queue_backward_stream_wait(wgrad_done, grad_2d.device)
 
-        for chunk, local_state in pending_dispatch_bwd:
+            # Delayed grouped-linear Wgrad retains FC1 input. Do not repurpose its
+            # distinct local-scatter destination until that queue drains.
+            for chunk, local_state in pending_dispatch_bwd:
+                with torch.cuda.stream(compute_stream):
+                    compute_stream.wait_event(wgrad_done)
+                    hidden_reuse_base = local_state.pop("hidden_reuse_base")
+                    grad_recv_hidden, grad_recv_probs = _dispatch_local_backward(
+                        chunk,
+                        local_state.pop("grad_dispatched"),
+                        local_state.pop("grad_probs"),
+                        hidden_reuse_base=hidden_reuse_base,
+                    )
+                    local_ready = torch.cuda.Event()
+                    local_ready.record(compute_stream)
+
+                with torch.cuda.stream(comm_stream):
+                    comm_stream.wait_event(local_ready)
+                    if last_deepep_event is not None:
+                        _event_current_stream_wait(last_deepep_event)
+                    local_state["dispatch_bwd_state"] = remember_deepep_event(
+                        chunk.dispatcher.submit_deepep_dispatch_backward(
+                            grad_recv_hidden,
+                            grad_recv_probs,
+                            chunk.handle,
+                            allocate_on_comm_stream=True,
+                        )
+                    )
+                    if grad_recv_hidden.is_cuda:
+                        grad_recv_hidden.record_stream(comm_stream)
+                    if grad_recv_probs.is_cuda:
+                        grad_recv_probs.record_stream(comm_stream)
+                    chunk.recv_probs_base = None
+                    del grad_recv_hidden, grad_recv_probs, hidden_reuse_base
+
             with torch.cuda.stream(compute_stream):
-                grad_hidden, grad_scores = chunk.dispatcher.finish_deepep_dispatch_backward(
-                    local_state["dispatch_bwd_state"]
-                )
-                grad_x_chunks[chunk.idx] = _backward_router(
-                    chunk, grad_hidden, grad_scores, router_params, router_accum
-                )
-                consumed = torch.cuda.Event()
-                consumed.record(compute_stream)
-                chunk.workspace_lease.release(consumed)
+                backward_activation_done = torch.cuda.Event()
+                backward_activation_done.record(compute_stream)
+            expert_activation_lease.release(backward_activation_done)
+
+            for chunk, local_state in pending_dispatch_bwd:
+                with torch.cuda.stream(compute_stream):
+                    grad_hidden, grad_scores = chunk.dispatcher.finish_deepep_dispatch_backward(
+                        local_state["dispatch_bwd_state"]
+                    )
+                    grad_x_chunks[chunk.idx] = _backward_router(
+                        chunk, grad_hidden, grad_scores, router_params, router_accum
+                    )
+                    consumed = torch.cuda.Event()
+                    consumed.record(compute_stream)
+                    chunk.workspace_lease.release(consumed)
 
         done = torch.cuda.Event()
         done.record(compute_stream)

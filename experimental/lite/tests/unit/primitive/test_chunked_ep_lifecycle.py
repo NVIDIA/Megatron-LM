@@ -188,6 +188,49 @@ class Event:
         return False
 
 
+@pytest.mark.parametrize("chunk_count", [2, 3, 4])
+def test_saved_backward_retires_two_slots_before_reuse(ep, monkeypatch, chunk_count):
+    """Exercise the real backward schedule and workspace, with CPU compute doubles."""
+    stream, event = Mock(), Mock(query=lambda: True)
+    monkeypatch.setattr(torch.cuda, "Event", lambda: event)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda *args: stream)
+    monkeypatch.setattr(torch.cuda, "stream", lambda *args: nullcontext())
+    monkeypatch.setattr(ep, "_shared_stream", lambda *args: stream)
+    monkeypatch.setattr(ep, "_queue_backward_stream_wait", lambda *args: None)
+    monkeypatch.setattr(ep._EPChunkOperationBase, "_streams", lambda *args: (stream, stream))
+    x = torch.ones(1, 2)
+    dispatcher = Mock()
+    dispatcher.submit_deepep_combine_backward.return_value = {"event": event}
+    dispatcher.submit_deepep_dispatch_backward.return_value = {"event": event}
+    dispatcher.finish_deepep_dispatch_backward.return_value = (x, None)
+    monkeypatch.setattr(ep, "_manual_unpermute_backward", lambda *args: x)
+    monkeypatch.setattr(ep, "_backward_expert", lambda *args: (x, None, x))
+    monkeypatch.setattr(ep, "_dispatch_local_backward", lambda *args, **kwargs: (x, x))
+    monkeypatch.setattr(ep, "_backward_router", lambda chunk, *args: x * (chunk.idx + 1))
+    profile = ep.EPChunkShapeProfile(8, 2, 1, 2, chunk_count=chunk_count)
+    workspace = ep.EPChunkWorkspace(
+        ep.EPChunkWorkspaceKey("backward", "cpu", None, 0, torch.float32, profile),
+        lambda slot: dispatcher,
+    )
+    # CPU streams have no CUDA device; the real scratch workspace stays on CPU.
+    stream.device = None
+    chunks = []
+    for idx in range(chunk_count):
+        values = {item.name: None for item in ep.fields(ep._ChunkContext)}
+        values.update(idx=idx, start=idx, end=idx + 1, x=x, dispatcher=dispatcher)
+        chunks.append(ep._ForwardChunkContext(**values, recv_consumed_event=event))
+    experts = Mock(parameters=lambda: ())
+    op = ep.EPChunkBackwardOp(router=torch.nn.Identity(), experts=experts, workspace=workspace)
+    grad, _, _ = op._saved_context_backward(
+        ep._SavedForwardContext(chunks, torch.Size((chunk_count, 2))), torch.ones(chunk_count, 2)
+    )
+    torch.testing.assert_close(grad, torch.arange(1.0, chunk_count + 1)[:, None].expand(-1, 2))
+    assert [
+        call.kwargs["num_contexts"] for call in experts.flush_delayed_weight_grads.call_args_list
+    ] == [min(2, remaining) for remaining in range(chunk_count, 0, -2)]
+    assert not any(slot.in_use for slot in workspace._slots)
+
+
 @pytest.mark.parametrize("retain_backward", [False, True])
 def test_execution_owns_lifecycle_without_registering_parameters(ep, monkeypatch, retain_backward):
     spaces = {}
