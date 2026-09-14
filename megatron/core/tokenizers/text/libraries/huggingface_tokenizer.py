@@ -303,9 +303,19 @@ class HuggingFaceTokenizer(MegatronTokenizerTextAbstract):
     def encode_files(self, paths: list[str], field: str = "text") -> "ak.Array":
         """Encodes whole jsonl file."""
         if self.use_gigatoken:
-            return self.tokenizer.tokenizer.encode_files(
-                gt.JsonlFileSource(paths, field=field), parallel=True
-            )
+            from megatron.core.tokenizers.utils import has_gigatoken_support
+
+            if has_gigatoken_support():
+                import gigatoken as gt
+
+                return self.tokenizer.tokenizer.encode_files(
+                    gt.JsonlFileSource(paths, field=field), parallel=True
+                )
+            else:
+                raise ModuleNotFoundError(
+                    "gigatoken library is not installed. "
+                    "Please, install gigatoken to use fast tokenizers: `pip install gigatoken`."
+                )
         else:
             raise NotImplementedError(
                 "This method is supported only for gigatoken tokenizers. "
