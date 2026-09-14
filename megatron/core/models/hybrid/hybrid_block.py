@@ -5,7 +5,6 @@
 # This source code is licensed under the Apache license found in the
 # LICENSE file in the root directory of this source tree.
 
-import copy
 import warnings
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -64,6 +63,7 @@ class HybridStackSubmodules:
 
     mamba_layer: Union[ModuleSpec, type] = IdentityOp
     gdn_layer: Union[ModuleSpec, type] = IdentityOp
+    gdn2_layer: ModuleSpec | None = None
     attention_layer: Union[ModuleSpec, type] = IdentityOp
     dsa_layer: Union[ModuleSpec, type] = IdentityOp
     mla_layer: Union[ModuleSpec, type] = IdentityOp
@@ -282,12 +282,13 @@ class HybridStack(MegatronModule):
                 elif type(layer_config) is layer_utils.GDNLayerConfig:
                     gdn_layer_spec = submodules.gdn_layer
                     if layer_config.experimental_attention_variant == "gdn2":
-                        # 'G' layers build the GDN2 variant when the gdn2 experimental
-                        # attention variant is selected.
-                        from megatron.core.ssm.gated_delta_net import GatedDeltaNet2
-
-                        gdn_layer_spec = copy.deepcopy(gdn_layer_spec)
-                        gdn_layer_spec.submodules.self_attention.module = GatedDeltaNet2
+                        # Only error if we actually try to use the GDN2 layer spec.
+                        if submodules.gdn2_layer is None:
+                            raise ValueError(
+                                "`experimental_attention_variant='gdn2'` requires the hybrid "
+                                "stack spec to provide the GDN2 layer spec under `gdn2_layer`."
+                            )
+                        gdn_layer_spec = submodules.gdn2_layer
                     layer = build_module(
                         gdn_layer_spec,
                         config=layer_config,

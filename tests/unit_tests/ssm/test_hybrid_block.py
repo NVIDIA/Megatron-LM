@@ -9,7 +9,7 @@ import transformer_engine as te
 import megatron.core.models.hybrid.hybrid_block as hybrid_block_module
 import megatron.core.transformer.utils as transformer_utils
 from megatron.core.extensions.transformer_engine import TEDotProductAttention
-from megatron.core.models.hybrid.hybrid_block import HybridStack
+from megatron.core.models.hybrid.hybrid_block import HybridStack, HybridStackSubmodules
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols, validate_segment_layers
 from megatron.core.models.hybrid.hybrid_layer_specs import (
     gated_delta_product_stack_spec,
@@ -21,14 +21,14 @@ from megatron.core.models.hybrid.layers import utils as layer_utils
 from megatron.core.models.hybrid.shortcut_block import ShortcutMoEBlock
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.gated_delta_net import HAVE_FLA as HAVE_GDN
-from megatron.core.ssm.gated_delta_net import GatedDeltaNet
+from megatron.core.ssm.gated_delta_net import GatedDeltaNet, GatedDeltaNet2
 from megatron.core.ssm.gated_delta_product import HAVE_FLA as HAVE_GDP
 from megatron.core.ssm.gated_delta_product import HAVE_MAMBA_SSM as HAVE_GDP_MAMBA
 from megatron.core.ssm.mamba_layer import MambaLayer
 from megatron.core.ssm.mamba_layer_config import MambaLayerConfig
 from megatron.core.ssm.mlp_layer_config import MLPLayerConfig
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer import TransformerConfig
+from megatron.core.transformer import ModuleSpec, TransformerConfig
 from megatron.core.transformer.attention import SelfAttention
 from megatron.core.transformer.attention_layer_config import AttentionLayerConfig
 from megatron.core.transformer.experimental_attention_variant.absorbed_mla import (
@@ -582,6 +582,22 @@ class TestHybridBlock:
             pg_collection=self.get_pg_collection(),
         )
 
+    def get_gdn2_hybrid_block(
+        self, layer_pattern, *, stack_spec=hybrid_stack_spec, **config_kwargs
+    ):
+        """Build a HybridStack with the "gdn2" experimental attention variant selected."""
+        return self.get_hybrid_block(
+            layer_pattern,
+            stack_spec=stack_spec,
+            experimental_attention_variant="gdn2",
+            linear_conv_kernel_dim=4,
+            linear_key_head_dim=64,
+            linear_value_head_dim=64,
+            linear_num_key_heads=4,
+            linear_num_value_heads=4,
+            **config_kwargs,
+        )
+
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
@@ -947,6 +963,31 @@ class TestHybridBlock:
         assert output.shape[1] == micro_batch_size
         assert output.shape[2] == block.config.hidden_size
         assert output.dtype == torch.float32
+
+    def test_gdn2_layer_types(self, monkeypatch):
+        """With the "gdn2" variant, 'G' builds GatedDeltaNet2 while '*' still wraps
+        SelfAttention.
+
+        `deterministic_mode` selects GDN2's pure-torch kernel fallback so this test
+        also runs without flash-linear-attention; the env var is Transformer Engine's
+        requirement for deterministic mode.
+        """
+        monkeypatch.setenv("NVTE_ALLOW_NONDETERMINISTIC_ALGO", "0")
+        block = self.get_gdn2_hybrid_block(Symbols.GDN + Symbols.ATTENTION, deterministic_mode=True)
+        layers = block.layers
+        assert isinstance(layers[0], TransformerLayer)
+        assert isinstance(layers[0].self_attention, GatedDeltaNet2)
+        assert isinstance(layers[1], TransformerLayer)
+        assert isinstance(layers[1].self_attention, SelfAttention)
+
+    def test_gdn2_without_spec_raises(self):
+        """Requesting the gdn2 variant without the pre-built GDN2 layer spec errors out."""
+        stack_spec = ModuleSpec(
+            module=HybridStack,
+            submodules=HybridStackSubmodules(gdn_layer=hybrid_stack_spec.submodules.gdn_layer),
+        )
+        with pytest.raises(ValueError, match="gdn2_layer"):
+            self.get_gdn2_hybrid_block(Symbols.GDN, stack_spec=stack_spec)
 
     def test_dsa_layer_types(self):
         """D symbol creates a TransformerLayer with absorbed MLA and DSA core attention."""
