@@ -19,6 +19,8 @@ import transformer_engine_torch as tex
 from transformer_engine.pytorch import is_mxfp8_available
 from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Quantizer
 
+pytestmark = pytest.mark.launch_on_gb200
+
 if not is_mxfp8_available():
     pytest.skip("MXFP8 quantization is not available.", allow_module_level=True)
 
