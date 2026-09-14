@@ -10,6 +10,7 @@ process group or any `torch.distributed` dependency. P2P communication is simula
 """
 
 from collections.abc import Callable
+from types import SimpleNamespace
 
 import torch
 
@@ -37,6 +38,11 @@ def _ns_cost(num_ns_steps: int) -> Callable[[ParameterLayout], int]:
     return cost_fn
 
 
+def _mock_mesh(dp_size: int, this_rank: int):
+    """Mock a DeviceMesh."""
+    return SimpleNamespace(size=lambda: dp_size, get_local_rank=lambda: this_rank)
+
+
 def _layout(shapes, offsets, size) -> GlobalLayout:
     """Construct a `GlobalLayout` directly (bypassing `GlobalLayout.build`)."""
     return GlobalLayout(
@@ -54,7 +60,7 @@ def _layout(shapes, offsets, size) -> GlobalLayout:
 def test_compute_shard_plan_even_split():
     """A matrix exactly divisible by dp_size splits evenly across ranks."""
     layout = _layout([(8, 4)], [0], 32)
-    layout = ParameterLayout.from_layout(layout, tensor_index=0, dp_size=2)
+    layout = ParameterLayout.from_layout(layout, tensor_index=0, mesh=_mock_mesh(2, 0))
     assert layout.full_shape == torch.Size((8, 4))
     assert layout.row_size == 4
     assert layout.row_counts == (4, 4)
@@ -67,7 +73,7 @@ def test_compute_shard_plan_boundary_param_split_across_ranks():
     # 6 rows, 3 cols; each rank's flat shard is 9 elements (= 3 rows). rank0 owns flat [0,9), rank1
     # owns [9,18). Tensor occupies [0,18) fully.
     layout = _layout([(6, 3)], [0], 18)
-    layout = ParameterLayout.from_layout(layout, tensor_index=0, dp_size=2)
+    layout = ParameterLayout.from_layout(layout, tensor_index=0, mesh=_mock_mesh(2, 0))
     assert layout.row_counts == (3, 3)
     assert layout.is_boundary()
 
@@ -77,7 +83,7 @@ def test_compute_shard_plan_fully_local_param_on_one_rank():
     # 4 rows, 2 cols = 8 elements. rank0 shard = [0,12), rank1 = [12,24). Tensor at offset 0 with 8
     # elements fits entirely in rank0.
     layout = _layout([(4, 2)], [0], 24)
-    layout = ParameterLayout.from_layout(layout, tensor_index=0, dp_size=2)
+    layout = ParameterLayout.from_layout(layout, tensor_index=0, mesh=_mock_mesh(2, 0))
     assert layout.row_counts == (4, 0)
     assert not layout.is_boundary()
     assert layout.owner_candidates() == (0,)
@@ -87,7 +93,7 @@ def test_compute_shard_plan_empty_rank_has_zero_rows():
     """A rank whose flat shard does not overlap the tensor owns zero rows."""
     # Tensor at offset 12 (entirely in rank1). rank0 gets (0,0).
     layout = _layout([(4, 3)], [12], 24)
-    layout = ParameterLayout.from_layout(layout, tensor_index=0, dp_size=2)
+    layout = ParameterLayout.from_layout(layout, tensor_index=0, mesh=_mock_mesh(2, 0))
     assert layout.row_counts == (0, 4)
     assert layout.is_boundary() is False
     assert layout.owner_candidates() == (1,)
@@ -169,8 +175,8 @@ def test_pack_and_reconstruct_round_trip():
     # Two params, both boundary, shapes (6,3) and (4,2). Owners: param0->rank0, param1->rank1.
     layout0 = _layout([(6, 3)], [0], 18)
     layout1 = _layout([(4, 2)], [0], 8)
-    layout0 = ParameterLayout.from_layout(layout0, tensor_index=0, dp_size=dp_size)
-    layout1 = ParameterLayout.from_layout(layout1, tensor_index=0, dp_size=dp_size)
+    layout0 = ParameterLayout.from_layout(layout0, tensor_index=0, mesh=_mock_mesh(dp_size, 0))
+    layout1 = ParameterLayout.from_layout(layout1, tensor_index=0, mesh=_mock_mesh(dp_size, 0))
     layouts = [layout0, layout1]
     owners = {0: 0, 1: 1}
 
@@ -186,7 +192,7 @@ def test_pack_and_reconstruct_round_trip():
     per_rank_send = []
     per_rank_gather = []
     for r in range(dp_size):
-        gather = OwnerGatherPlan.pack(layouts, owners, per_rank_local[r], dp_size, r)
+        gather = OwnerGatherPlan.pack(layouts, owners, per_rank_local[r], _mock_mesh(dp_size, r))
         per_rank_send.append(gather.send_buffers)
         per_rank_gather.append(gather)
 
@@ -206,8 +212,8 @@ def test_pack_and_unpack_result_round_trip():
     dp_size = 2
     layout0 = _layout([(6, 3)], [0], 18)
     layout1 = _layout([(4, 2)], [0], 8)
-    layout0 = ParameterLayout.from_layout(layout0, tensor_index=0, dp_size=dp_size)
-    layout1 = ParameterLayout.from_layout(layout1, tensor_index=0, dp_size=dp_size)
+    layout0 = ParameterLayout.from_layout(layout0, tensor_index=0, mesh=_mock_mesh(dp_size, 0))
+    layout1 = ParameterLayout.from_layout(layout1, tensor_index=0, mesh=_mock_mesh(dp_size, 0))
     layouts = [layout0, layout1]
     owners = {0: 0, 1: 1}
 
@@ -218,7 +224,9 @@ def test_pack_and_unpack_result_round_trip():
     per_rank_send = []
     per_rank_scatter = []
     for r in range(dp_size):
-        scatter = OwnerScatterPlan.pack(full_results_by_rank[r], layouts, owners, dp_size, r)
+        scatter = OwnerScatterPlan.pack(
+            full_results_by_rank[r], layouts, owners, _mock_mesh(dp_size, r)
+        )
         per_rank_send.append(scatter.send_buffers)
         per_rank_scatter.append(scatter)
 
@@ -252,7 +260,7 @@ def test_from_layout_per_rank_data_not_uniform():
     #   rank 1: [8, 16)  -> 8 elements -> 2 rows
     #   rank 2: [16, 24) -> 4 elements -> 1 row  (4 elements of padding)
     layout = _layout([(5, 4)], [0], 24)
-    layout = ParameterLayout.from_layout(layout, tensor_index=0, dp_size=3)
+    layout = ParameterLayout.from_layout(layout, tensor_index=0, mesh=_mock_mesh(3, 0))
     assert layout.row_counts == (2, 2, 1)
     assert layout.shard_numel(0) == 8
     assert layout.shard_numel(1) == 8

@@ -17,6 +17,7 @@ from collections.abc import Callable, Sequence
 from typing import Self
 
 import torch
+from torch.distributed.device_mesh import DeviceMesh
 
 from .layout import GlobalLayout, non_leading_numel
 
@@ -51,7 +52,7 @@ class ParameterLayout:
             )
 
     @classmethod
-    def from_layout(cls, layout: GlobalLayout, tensor_index: int, dp_size: int) -> Self:
+    def from_layout(cls, layout: GlobalLayout, tensor_index: int, mesh: DeviceMesh) -> Self:
         """Build a parameter layout for one parameter from a `GlobalLayout`.
 
         Computes the per-rank row ranges for the given 2D parameter in a flat DBuffer layout.
@@ -59,8 +60,10 @@ class ParameterLayout:
         Args:
             layout: The DBuffer global layout that contains the parameter.
             tensor_index: Index of the parameter within `layout`.
-            dp_size: DP group size.
+            mesh: Device mesh of the DP group the DBuffer is sharded across. The DP group size is
+                derived from the mesh.
         """
+        dp_size = mesh.size()
         full_shape = layout.tensor_shapes[tensor_index]
         tensor_flat_offset = layout.tensor_to_offset[tensor_index]
         rank_flat_shard_size = layout.size // dp_size
@@ -263,8 +266,7 @@ class OwnerGatherPlan:
         layouts: Sequence[ParameterLayout],
         owners: dict[int, int],
         local_shards: Sequence[torch.Tensor],
-        dp_size: int,
-        this_rank: int,
+        mesh: DeviceMesh,
     ) -> Self:
         """Pack this rank's local shards into per-owner P2P send buffers.
 
@@ -272,9 +274,11 @@ class OwnerGatherPlan:
             layouts: Parameter layouts in parameter order.
             owners: Mapping from parameter index to owner rank.
             local_shards: This rank's local shard per parameter.
-            dp_size: DP group size.
-            this_rank: This rank's DP index.
+            mesh: Device mesh of the DP group all parameters share. The DP group size and this
+                rank's index within the group are derived from the mesh.
         """
+        dp_size = mesh.size()
+        this_rank = mesh.get_local_rank()
         device = local_shards[0].device
         dtype = local_shards[0].dtype
         send_sizes: dict[int, int] = {}
@@ -392,8 +396,7 @@ class OwnerScatterPlan:
         full_results: dict[int, torch.Tensor],
         layouts: Sequence[ParameterLayout],
         owners: dict[int, int],
-        dp_size: int,
-        this_rank: int,
+        mesh: DeviceMesh,
     ) -> Self:
         """Pack this owner rank's full results into per-destination P2P send buffers.
 
@@ -401,9 +404,12 @@ class OwnerScatterPlan:
             full_results: Full result tensor per owned parameter index.
             layouts: Parameter layouts in parameter order.
             owners: Mapping from parameter index to owner rank.
-            dp_size: DP group size.
-            this_rank: This rank's DP index.
+            mesh: Device mesh of the DP group all parameters share. The DP group size and this
+                rank's index within the group are derived from the mesh.
         """
+        dp_size = mesh.size()
+        this_rank = mesh.get_local_rank()
+        dtype = device = None
         if full_results:
             first = next(iter(full_results.values()))
             device = first.device
@@ -429,6 +435,8 @@ class OwnerScatterPlan:
 
         send_buffers: dict[int, torch.Tensor] = {}
         for dest, size in send_sizes.items():
+            # Make sure these were assigned to. We should never hit this.
+            assert dtype is not None and device is not None
             send_buffers[dest] = torch.empty(size, dtype=dtype, device=device)
 
         cursors: dict[int, int] = {receiver: 0 for receiver in send_buffers}
