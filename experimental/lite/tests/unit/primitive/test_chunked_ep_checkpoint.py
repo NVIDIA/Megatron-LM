@@ -2,6 +2,7 @@
 """Numerical contracts for the model-independent EP checkpoint bridge."""
 
 from copy import deepcopy
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -21,7 +22,6 @@ def test_checkpoint_publishes_main_grad_to_outer_ddp_hook(
         checkpoint_ep_chunk,
         _SavedContextEPChunkFunction,
     )
-    from contextlib import nullcontext
 
     experts = torch.nn.Linear(2, 2, bias=False)
     weight = experts.weight
@@ -80,7 +80,10 @@ def test_checkpoint_matches_native_across_microbatches(
     transformer_engine_import_stub, layers, frozen_prefix, park_each_layer
 ):
     transformer_engine_import_stub()
-    from megatron.lite.primitive.modules.moe_ep_chunk_overlap import checkpoint_ep_chunk
+    from megatron.lite.primitive.modules.moe_ep_chunk_overlap import (
+        checkpoint_ep_chunk,
+        EPChunkForwardOp,
+    )
 
     torch.manual_seed(314)
     native = torch.nn.ModuleList(
@@ -126,10 +129,18 @@ def test_checkpoint_matches_native_across_microbatches(
             )
             return grads[0], grads[1:3], grads[3:]
 
-        class Forward:
+        class Forward(EPChunkForwardOp):
             router, experts = block[1], block[2]
+            backward_op = None
+            _logical_chunk_count = 2
 
-            def __call__(self, x):
+            def __init__(self):
+                pass  # CPU boundary test: no GPU workspace or transport initialization.
+
+            def _routing_context(self, routing_input):
+                return nullcontext()
+
+            def _forward_output_async(self, x, ranges, input_shape, dtype):
                 return forward(x)
 
         return SimpleNamespace(
@@ -139,6 +150,8 @@ def test_checkpoint_matches_native_across_microbatches(
         )
 
     executions = [execution(block) for block in candidate]
+    with torch.enable_grad(), pytest.raises(RuntimeError, match="requires a paired backward op"):
+        executions[0].forward_op(torch.ones(1, 4, dtype=torch.double))
     for rows in (4, 7, 3):
         x = torch.randn(rows, 4, dtype=torch.double, requires_grad=True)
         y = x.detach().clone().requires_grad_(True)
