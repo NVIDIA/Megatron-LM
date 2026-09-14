@@ -4,6 +4,7 @@ from __future__ import annotations
 import copy
 import dataclasses
 import enum
+import importlib
 import inspect
 import io
 import os
@@ -49,6 +50,7 @@ from megatron.core.tensor_parallel.random import (
 from megatron.core.tensor_parallel.utils import divide
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
+from megatron.core.transformer.module import is_first_microbatch_tracked
 from megatron.core.transformer.torch_norm import LayerNormInterface
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import (
@@ -83,6 +85,22 @@ except ImportError:
 
         te = MagicMock()
         HAVE_TE = False
+
+
+def _get_te_linear_attention() -> type[torch.nn.Module] | None:
+    """Return TE's GatedDeltaNetAttention (Gated DeltaNet) module, if available."""
+    if not HAVE_TE:
+        return None
+    try:
+        te_pytorch = importlib.import_module("transformer_engine.pytorch")
+        importlib.import_module("transformer_engine.pytorch.attention.linear_attention.gdn")
+        return te_pytorch.GatedDeltaNetAttention
+    except (AttributeError, ImportError):
+        return None
+
+
+_TE_LINEAR_ATTENTION = _get_te_linear_attention()
+HAVE_TE_GDN = _TE_LINEAR_ATTENTION is not None
 
 _TE_CONFIG_TYPE_KEY = "transformer_engine_config_type"
 _EXPERT_PARAMETER_NAME_PATTERN = re.compile(r"(weight|bias)\d*")
@@ -398,6 +416,21 @@ def _get_should_context_be_quantized_params(
         return _get_should_context_be_quantized_recipe(
             qparams.training_recipe, is_context_quantized
         )
+
+
+def _resolve_is_first_microbatch(module) -> Optional[bool]:
+    """The value to pass TE, or ``None`` meaning "no opinion, just accumulate".
+
+    A ``True`` tells TE the gradient is fresh, so backward writes over ``main_grad`` instead of
+    adding into it. Pass the flag on only when it can be trusted.
+    """
+    if (
+        module.disable_parameter_transpose_cache
+        or not is_first_microbatch_tracked(module.config)
+        or getattr(module, 'is_repeated_layer', False)
+    ):
+        return None
+    return module.is_first_microbatch
 
 
 def _get_extra_te_kwargs(config: TransformerConfig):
@@ -1374,9 +1407,7 @@ class TELinear(te.pytorch.Linear):
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Forward."""
-        _is_first_microbatch = (
-            None if self.disable_parameter_transpose_cache else self.is_first_microbatch
-        )
+        _is_first_microbatch = _resolve_is_first_microbatch(self)
         quant_context = _get_fp8_autocast_for_quant_params(self.te_quant_params, self.training)
 
         with quant_context:
@@ -1623,9 +1654,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
 
     def forward(self, x):
         """Forward."""
-        _is_first_microbatch = (
-            None if self.disable_parameter_transpose_cache else self.is_first_microbatch
-        )
+        _is_first_microbatch = _resolve_is_first_microbatch(self)
         quant_context = _get_fp8_autocast_for_quant_params(self.te_quant_params, self.training)
 
         # FP32 residual connections pass the FP32 residual stream into this fused module, but
@@ -2077,6 +2106,76 @@ class TERowParallelLinear(TELinear):
             super().backward_dw()
 
 
+class TEGatedDeltaNetAttention(torch.nn.Module):
+    """Adapt Megatron GDN kernel inputs to Transformer Engine's GatedDeltaNetAttention."""
+
+    def __init__(
+        self, num_attention_heads: int, qk_head_dim: int, value_head_dim: int, layer_number: int
+    ) -> None:
+        super().__init__()
+        if not HAVE_TE_GDN:
+            raise ImportError("Transformer Engine GatedDeltaNetAttention (GDN) is not available.")
+        assert _TE_LINEAR_ATTENTION is not None
+        self.value_head_dim = value_head_dim
+        self.te_attention = _TE_LINEAR_ATTENTION(
+            num_attention_heads=num_attention_heads,
+            kv_channels=(qk_head_dim, value_head_dim),
+            qkv_format="bshd",
+            layer_number=layer_number,
+        )
+
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        initial_state: torch.Tensor | None = None,
+        output_final_state: bool = False,
+        use_qk_l2norm_in_kernel: bool = False,
+        cu_seqlens: torch.Tensor | None = None,
+        **kwargs: Any,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Run TE GDN through the FLA-compatible Megatron kernel interface."""
+        del kwargs
+
+        batch, sequence = q.shape[:2]
+        qkv_format = "bshd"
+        if cu_seqlens is not None:
+            qkv_format = "thd"
+            q, k, v = (tensor.reshape(-1, *tensor.shape[2:]) for tensor in (q, k, v))
+            g, beta = (tensor.reshape(-1, tensor.shape[-1]) for tensor in (g, beta))
+
+        result = self.te_attention(
+            q,
+            k,
+            v,
+            qkv_format=qkv_format,
+            cu_seqlens=cu_seqlens,
+            g=g.float(),
+            beta=beta.float(),
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        )
+        if output_final_state:
+            output, final_state = result
+        else:
+            output = result
+            final_state = None
+
+        output = output.reshape(batch, sequence, -1, self.value_head_dim)
+        return output, final_state
+
+
+# Some patched TE builds expose a `softcap` kwarg on DotProductAttention without bumping the TE
+# version number, so we probe the signature once instead of gating on is_te_min_version().
+_te_dpa_supports_softcap = (
+    "softcap" in inspect.signature(te.pytorch.DotProductAttention.__init__).parameters
+)
+
+
 class TEDotProductAttention(te.pytorch.DotProductAttention):
     """Wrapper for the Transformer-Engine's `DotProductAttention` layer
     that also has "flash attention" enabled.
@@ -2227,6 +2326,14 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             )
             extra_kwargs["softmax_type"] = self.config.softmax_type
 
+        if self.config.attn_logit_softcapping is not None:
+            assert _te_dpa_supports_softcap, (
+                f"Transformer-Engine v{get_te_version()} does not expose a `softcap` argument on "
+                "DotProductAttention, so `attn_logit_softcapping` cannot be used. Install a TE "
+                "build with softcap support or unset `attn_logit_softcapping`."
+            )
+            extra_kwargs["softcap"] = self.config.attn_logit_softcapping
+
         self.kept_packed_seq_params = set(
             field.name for field in dataclasses.fields(PackedSeqParams)
         )
@@ -2296,6 +2403,13 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         if packed_seq_params is not None:
             # If Dynamic CP group is provided, update TE DPA CP group
             if packed_seq_params.cp_group is not None:
+                # Converse of the assert below: a CP-off (local_cp_size == 1)
+                # sub-sample must not carry a CP group, otherwise it would be
+                # routed through the CP attention path. Producers must only
+                # bind cp_group when local_cp_size > 1.
+                assert (
+                    packed_seq_params.local_cp_size is None or packed_seq_params.local_cp_size > 1
+                ), "cp_group must not be set when local_cp_size == 1 (CP-off convention)"
                 # Hybrid/dynamic CP can enable CP at runtime on a model built
                 # with context_parallel_size == 1, where the constructor never
                 # allocated the auxiliary CP stream. Create it lazily; TE's
@@ -2768,9 +2882,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
 
         def forward(self, x, m_splits):
             """Forward."""
-            _is_first_microbatch = (
-                None if self.disable_parameter_transpose_cache else self.is_first_microbatch
-            )
+            _is_first_microbatch = _resolve_is_first_microbatch(self)
             quant_context = _get_fp8_autocast_for_quant_params(self.te_quant_params, self.training)
 
             with quant_context:
@@ -3705,6 +3817,21 @@ try:
 
 except ImportError:
     te_parallel_cross_entropy = None  # type: ignore[assignment, misc]
+
+
+def te_cross_entropy(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    tp_group: torch.distributed.ProcessGroup | None = None,
+    *,
+    cuda_graph_capturable: bool = False,
+) -> torch.Tensor:
+    """Adapt TE cross entropy to the backend target signature and required label stride."""
+    if te_parallel_cross_entropy is None:
+        raise RuntimeError("Trying to use a TE block when it's not present.")
+    labels = torch.as_strided(labels, labels.size(), (labels.size()[1], 1))
+    return te_parallel_cross_entropy(logits, labels, tp_group, cuda_graph_capturable)
+
 
 try:
     from transformer_engine.pytorch.cpp_extensions import general_gemm
