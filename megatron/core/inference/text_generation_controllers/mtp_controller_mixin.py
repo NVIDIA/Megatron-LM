@@ -2,7 +2,7 @@
 
 """Multi-token-prediction (MTP) speculative decoding for dynamic inference.
 
-`MTPInferenceMixin` holds the MTP half of `TextGenerationController`: the draft-KV commit pass,
+`MTPControllerMixin` holds the MTP half of `TextGenerationController`: the draft-KV commit pass,
 the serial draft loop that produces speculative tokens, and the dummy forwards that keep idle
 expert-parallel ranks in lockstep with them. It is a mixin rather than a standalone helper
 because these paths read a large amount of controller state (sampling buffers, the wrapped
@@ -55,7 +55,7 @@ class _CommitSegments:
     tokens: Tensor
 
 
-class MTPInferenceMixin:
+class MTPControllerMixin:
     """MTP speculative-decoding paths for `TextGenerationController`."""
 
     def _init_mtp_sampling_tensors(self):

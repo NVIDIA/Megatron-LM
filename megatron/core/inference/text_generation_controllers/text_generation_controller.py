@@ -28,8 +28,8 @@ from megatron.core.inference.model_inference_wrappers.abstract_model_inference_w
     AbstractModelInferenceWrapper,
 )
 from megatron.core.inference.sampling_params import SamplingParams
-from megatron.core.inference.text_generation_controllers.mtp_inference_mixin import (
-    MTPInferenceMixin,
+from megatron.core.inference.text_generation_controllers.mtp_controller_mixin import (
+    MTPControllerMixin,
 )
 from megatron.core.inference.utils import (
     InferenceMode,
@@ -209,7 +209,7 @@ class _AsyncScheduleLogProbsTransfer:
 
 
 # pylint: disable=line-too-long
-class TextGenerationController(MTPInferenceMixin):
+class TextGenerationController(MTPControllerMixin):
     """The text generation controller (the main sampling loop)
 
     This class tokenizes the input, runs inference, samples from logits, and detokenizes the output.

@@ -1,6 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Unit tests for the controller half of the MTP KV cache (`MTPInferenceMixin`).
+"""Unit tests for the controller half of the MTP KV cache (`MTPControllerMixin`).
 
 Two things are covered:
 
@@ -589,7 +589,7 @@ class TestMtpCommitPassMixedBatch:
         controller = _make_controller(context, model)
 
         with mock.patch(
-            "megatron.core.inference.text_generation_controllers.mtp_inference_mixin."
+            "megatron.core.inference.text_generation_controllers.mtp_controller_mixin."
             "NVLSAllGatherVDispatcher"
         ) as nvls:
             controller._mtp_commit_pass(
@@ -613,7 +613,7 @@ class TestMtpCommitPassSequenceParallel:
         controller = _make_controller(context, model, sp_enabled=True, tp_size=4)
 
         with mock.patch(
-            "megatron.core.inference.text_generation_controllers.mtp_inference_mixin."
+            "megatron.core.inference.text_generation_controllers.mtp_controller_mixin."
             "scatter_to_sequence_parallel_region",
             side_effect=lambda t, group=None: t,
         ) as scatter:
@@ -646,7 +646,7 @@ class TestMtpCommitPassSequenceParallel:
         controller = _make_controller(context, model, sp_enabled=True, tp_size=4)
 
         with mock.patch(
-            "megatron.core.inference.text_generation_controllers.mtp_inference_mixin."
+            "megatron.core.inference.text_generation_controllers.mtp_controller_mixin."
             "scatter_to_sequence_parallel_region",
             side_effect=lambda t, group=None: t,
         ):
@@ -690,7 +690,7 @@ class TestMtpDummyPrefillForward:
         controller = _make_controller(context, model, sp_enabled=True, tp_size=4)
 
         with mock.patch(
-            "megatron.core.inference.text_generation_controllers.mtp_inference_mixin."
+            "megatron.core.inference.text_generation_controllers.mtp_controller_mixin."
             "scatter_to_sequence_parallel_region",
             side_effect=lambda t, group=None: t,
         ):
@@ -1325,12 +1325,12 @@ def _identity_sp_patches():
     """Patch the SP collectives to identities so shapes/paddings stay observable."""
     return (
         mock.patch(
-            "megatron.core.inference.text_generation_controllers.mtp_inference_mixin."
+            "megatron.core.inference.text_generation_controllers.mtp_controller_mixin."
             "scatter_to_sequence_parallel_region",
             side_effect=lambda t, group=None: t,
         ),
         mock.patch(
-            "megatron.core.inference.text_generation_controllers.mtp_inference_mixin."
+            "megatron.core.inference.text_generation_controllers.mtp_controller_mixin."
             "gather_from_sequence_parallel_region",
             side_effect=lambda t, group=None: t,
         ),
@@ -1479,7 +1479,7 @@ class TestExpertParallelForwardParity:
         context._nvls_dispatcher = object()
 
         with mock.patch(
-            "megatron.core.inference.text_generation_controllers.mtp_inference_mixin."
+            "megatron.core.inference.text_generation_controllers.mtp_controller_mixin."
             "NVLSAllGatherVDispatcher"
         ) as nvls:
             controller._compute_serial_mtp_and_sample(
