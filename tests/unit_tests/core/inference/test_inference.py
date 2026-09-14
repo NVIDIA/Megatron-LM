@@ -11,6 +11,7 @@ pytest.importorskip("flask")
 pytest.importorskip("flask_restful")
 
 from megatron.core.inference.text_generation_server import MegatronServer
+from megatron.core.inference.utils import InferenceMode
 from megatron.core.tokenizers import MegatronTokenizer
 from tests.unit_tests.core.inference.engines.test_static_engine import (
     StaticInferenceEngineTestHarness,
@@ -29,8 +30,9 @@ def gpt2_tiktoken_tokenizer():
 
 
 @pytest.fixture(scope="module")
-def static_inference_engine(gpt2_tiktoken_tokenizer):
+def static_inference_engine(gpt2_tiktoken_tokenizer, request):
     Utils.initialize_model_parallel()
+    request.addfinalizer(InferenceMode.unset_active)
     engine_wrapper = StaticInferenceEngineTestHarness()
     engine_wrapper.setup_engine(vocab_size=gpt2_tiktoken_tokenizer.vocab_size, legacy=True)
 
