@@ -71,6 +71,18 @@ def test_chunked_transport_owns_external_metadata_and_waits_before_finish(
     assert dispatcher.finish_deepep_combine(completion) is hidden
     assert completion == {}
     assert event.current_stream_wait.call_count == 3
+    for returned_event in (None, SimpleNamespace(event=None, current_stream_wait=Mock()), event):
+        buffer.dispatch.return_value = (hidden, None, None, None, None, returned_event)
+        buffer.combine.return_value = (hidden, None, returned_event)
+        for submit, args in (
+            (dispatcher.submit_deepep_combine_backward, (hidden, state["handle"])),
+            (dispatcher.submit_deepep_dispatch_backward, (hidden, None, state["handle"])),
+        ):
+            if returned_event is event:
+                assert submit(*args)["event"] is event
+            else:
+                with pytest.raises(RuntimeError, match="requires a completion event"):
+                    submit(*args)
     if caller_owned:
         with pytest.raises(RuntimeError, match="Invalid caller-owned"):
             dispatcher.finish_deepep_dispatch_for_backward(

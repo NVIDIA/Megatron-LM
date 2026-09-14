@@ -39,6 +39,11 @@ def _event_current_stream_wait(event) -> None:
         torch.cuda.current_stream().wait_event(event)
 
 
+def _require_backward_event(event):
+    if not _event_is_waitable(event):
+        raise RuntimeError("DeepEP async backward requires a completion event")
+
+
 def _record_current_stream_event_if_unwaitable(event, tensor: torch.Tensor):
     if not _event_is_waitable(event) and torch.cuda.is_available() and tensor.is_cuda:
         event = torch.cuda.Event()
@@ -106,6 +111,7 @@ class ChunkedDispatcher(_BaseDispatcher):
             async_finish=True,
             allocate_on_comm_stream=allocate_on_comm_stream,
         )
+        _require_backward_event(event)
         return {"grad_rank_grouped": grad_rank_grouped, "event": event}
 
     def finish_deepep_combine_backward(self, state):
@@ -129,6 +135,7 @@ class ChunkedDispatcher(_BaseDispatcher):
             async_finish=True,
             allocate_on_comm_stream=allocate_on_comm_stream,
         )
+        _require_backward_event(event)
         return {"grad_hidden": grad_hidden, "grad_topk_scores": grad_topk_scores, "event": event}
 
     def finish_deepep_dispatch_backward(self, state):
