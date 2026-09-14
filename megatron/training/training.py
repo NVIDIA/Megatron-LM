@@ -1511,7 +1511,7 @@ def _freeze_non_dsa_indexer_parameters(model):
 
 
 def apply_dsa_param_freezing(model):
-    """Apply --dsa-train-indexer-only / --dsa-train-main-only parameter freezing.
+    """Apply --dsa-train-indexer-only parameter freezing.
 
     Must run before the model is wrapped for distributed training: DDP and the
     optimizer capture ``requires_grad`` when they take the parameters, so freezing
