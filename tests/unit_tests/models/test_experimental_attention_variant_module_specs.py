@@ -277,10 +277,12 @@ class TestGetGatedDeltaNetModuleSpec:
         assert spec.metainfo == {"fuse_input_layernorm": True}
 
     def test_kda_uses_direct_projection_submodules(self):
-        """KDA uses separate input and beta projections without fused input norm."""
+        """KDA specs use the expected direct and tensor-parallel projections."""
+        from megatron.core.extensions.transformer_engine import TEColumnParallelLinear, TELinear
         from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
             get_gated_delta_net_module_spec,
         )
+        from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
         from megatron.core.ssm.gated_delta_net import (
             KimiDeltaAttention,
             KimiDeltaAttentionSubmodules,
@@ -294,7 +296,23 @@ class TestGetGatedDeltaNetModuleSpec:
         assert isinstance(spec.submodules, KimiDeltaAttentionSubmodules)
         assert spec.submodules.in_proj == _FakeColumnParallelLinear
         assert spec.submodules.beta_proj == _FakeColumnParallelLinear
+        assert spec.submodules.f_proj == _FakeColumnParallelLinear
+        assert spec.submodules.f_a_proj == _FakeLinear
+        assert spec.submodules.f_b_proj == _FakeColumnParallelLinear
+        assert spec.submodules.g_proj == _FakeColumnParallelLinear
+        assert spec.submodules.g_a_proj == _FakeLinear
+        assert spec.submodules.g_b_proj == _FakeColumnParallelLinear
         assert spec.metainfo == {"fuse_input_layernorm": False}
+
+        hybrid_submodules = (
+            hybrid_stack_spec.submodules.kda_layer.submodules.self_attention.submodules
+        )
+        assert hybrid_submodules.f_proj is TEColumnParallelLinear
+        assert hybrid_submodules.f_a_proj is TELinear
+        assert hybrid_submodules.f_b_proj is TEColumnParallelLinear
+        assert hybrid_submodules.g_proj is TEColumnParallelLinear
+        assert hybrid_submodules.g_a_proj is TELinear
+        assert hybrid_submodules.g_b_proj is TEColumnParallelLinear
 
     def test_submodules_use_backend_modules(self):
         """Verify backend-provided projection/norm modules are wired into submodules."""
