@@ -222,7 +222,10 @@ def test_hybrid_model_with_custom_process_groups(tmp_path, tp_size, cp_size, pp_
 )
 @pytest.mark.parametrize("vp_stage", [0, 1])
 @pytest.mark.parametrize("freeze_base", [False, True])
-def test_config_list_constructs_explicit_pp_vpp_segment(vp_stage, freeze_base, monkeypatch):
+@pytest.mark.parametrize("empty_first_segment", [False, True])
+def test_config_list_constructs_explicit_pp_vpp_segment(
+    vp_stage, freeze_base, empty_first_segment, monkeypatch
+):
     Utils.initialize_model_parallel(pipeline_model_parallel_size=2)
     try:
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
@@ -240,6 +243,8 @@ def test_config_list_constructs_explicit_pp_vpp_segment(vp_stage, freeze_base, m
         attention = AttentionLayerConfig.from_config(model_config)
         mlp = MLPLayerConfig.from_config(model_config)
         segments = [[attention], [mlp, attention], [mlp], [attention, mlp, attention]]
+        if empty_first_segment:
+            segments[1].insert(0, segments[0].pop())
         source = []
         for segment_index, segment in enumerate(segments):
             if segment_index:
@@ -281,6 +286,21 @@ def test_config_list_constructs_explicit_pp_vpp_segment(vp_stage, freeze_base, m
         )
         assert attention.is_hybrid_model is False
         assert mlp.is_hybrid_model is False
+
+        # Every chunk estimates the full architecture, even a chunk with no local layers
+        # or without the MTP module. Pipeline markers do not contribute any work.
+        total_tokens, seqlen_squared_sum = 8, 32
+        hidden_size = model_config.hidden_size
+        attention_flops = 8 * total_tokens * hidden_size**2 + 2 * seqlen_squared_sum * hidden_size
+        mlp_flops = 4 * total_tokens * hidden_size * mlp.ffn_hidden_size
+        logits_flops = 2 * total_tokens * hidden_size * model.vocab_size
+        mtp_flops = (
+            mlp_flops + 2 * total_tokens * (3 * hidden_size + 2 * hidden_size**2) + logits_flops
+        )
+        expected_flops = 3 * (
+            4 * attention_flops + 3 * mlp_flops + logits_flops + int(freeze_base) * mtp_flops
+        )
+        assert model.estimate_flops(total_tokens, seqlen_squared_sum) == expected_flops
     finally:
         Utils.destroy_model_parallel()
 
@@ -309,7 +329,7 @@ class TestHybridModel:
 
     def test_constructor(self):
         assert isinstance(self.model, HybridModel)
-        assert self.model._hybrid_dsa_uses_absorbed_mla is True
+        assert self.model.estimate_flops(8, 32) is None
 
         assert self.model.max_sequence_length == 4
 
@@ -378,6 +398,21 @@ class TestHybridModel:
         assert model_config.is_hybrid_model is True
         assert model_config._hybrid_has_moe_layers is False
 
+        source_state = [vars(config).copy() for config in source]
+        physical_state = [vars(config).copy() for config in physical_configs]
+        total_tokens, seqlen_squared_sum = 8, 32
+        hidden_size = model_config.hidden_size
+        attention_flops = 8 * total_tokens * hidden_size**2 + 2 * seqlen_squared_sum * hidden_size
+        expected_flops = 3 * (
+            2 * attention_flops
+            + 4 * total_tokens * hidden_size * 768
+            + 2 * total_tokens * hidden_size * model.vocab_size
+        )
+        # The later append to the caller's list must not change the model estimate.
+        assert model.estimate_flops(total_tokens, seqlen_squared_sum) == expected_flops
+        assert [vars(config) for config in source] == source_state
+        assert [vars(config) for config in physical_configs] == physical_state
+
     def test_config_list_marks_model_runtime_when_source_contains_moe(self, mocker):
         model_config = TransformerConfig(
             num_layers=1, hidden_size=256, num_attention_heads=4, use_cpu_initialization=True
@@ -399,11 +434,16 @@ class TestHybridModel:
         assert model.config._hybrid_has_moe_layers is True
         assert not hasattr(moe_config, "_hybrid_has_moe_layers")
 
-    def test_config_list_records_built_gdp_stack(self, mocker):
+    @pytest.mark.parametrize("use_gdp", [False, True])
+    def test_config_list_estimates_flops_from_built_stack(self, mocker, use_gdp):
         model_config = TransformerConfig(
             num_layers=1, hidden_size=256, num_attention_heads=4, use_cpu_initialization=True
         )
         mamba_config = MambaLayerConfig.from_config(model_config)
+        mamba_config.mamba_state_dim = 32
+        mamba_config.mamba_num_groups = 2
+        mamba_config.mamba_num_heads = 8
+        mamba_config.gdp_num_householder = 2
         mocker.patch(
             "megatron.core.models.hybrid.hybrid_model.build_module",
             return_value=torch.nn.Identity(),
@@ -411,13 +451,67 @@ class TestHybridModel:
 
         model = HybridModel(
             config=model_config,
-            hybrid_stack_spec=gated_delta_product_stack_spec,
+            hybrid_stack_spec=gated_delta_product_stack_spec if use_gdp else hybrid_stack_spec,
             vocab_size=100,
             max_sequence_length=4,
             hybrid_layer_config_list=[mamba_config],
         )
 
-        assert model._hybrid_uses_gated_delta_product is True
+        total_tokens = 8
+        hidden_size, inner_size = 256, 512
+        if use_gdp:
+            in_proj_dim = inner_size * 3 + 2 * 32 * 3 + 8 * 3
+            conv_dim = inner_size * 2 + 2 * 32 * 3
+            layer_flops = (
+                2
+                * total_tokens
+                * (hidden_size * in_proj_dim + 4 * conv_dim + inner_size * hidden_size)
+                + 11 * total_tokens * inner_size * 32
+            )
+        else:
+            layer_flops = (
+                2 * total_tokens * hidden_size * (2 * inner_size + 2 * 2 * 32 + 8)
+                + 7 * total_tokens * inner_size * 32
+                + 2 * total_tokens * inner_size * hidden_size
+            )
+        expected_flops = 3 * (layer_flops + 2 * total_tokens * hidden_size * model.vocab_size)
+        assert model.estimate_flops(total_tokens, 32) == expected_flops
+
+    @pytest.mark.parametrize("repeated_layer", [False, True])
+    def test_config_list_flops_count_executed_mtp_depths(self, repeated_layer):
+        model_config = TransformerConfig(
+            num_layers=1,
+            hidden_size=256,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            mtp_use_repeated_layer=repeated_layer,
+        )
+        main_config = MLPLayerConfig.from_config(model_config)
+        main_config.ffn_hidden_size = 512
+        mtp_config = MLPLayerConfig.from_config(model_config)
+        mtp_config.ffn_hidden_size = 768
+        source = [main_config, MTPSplit, mtp_config, MTPSplit, mtp_config]
+        source_state = [vars(main_config).copy(), vars(mtp_config).copy()]
+
+        model = HybridModel(
+            config=model_config,
+            hybrid_stack_spec=hybrid_stack_spec,
+            vocab_size=100,
+            max_sequence_length=4,
+            hybrid_layer_config_list=source,
+        )
+
+        assert model.mtp_num_depths == 2
+        assert len(model.mtp.layers) == (1 if repeated_layer else 2)
+        total_tokens, hidden_size = 8, model_config.hidden_size
+        expected_flops = 3 * (
+            4 * total_tokens * hidden_size * 512
+            + 2 * 4 * total_tokens * hidden_size * 768
+            + 2 * 2 * total_tokens * (3 * hidden_size + 2 * hidden_size**2)
+            + 3 * 2 * total_tokens * hidden_size * model.vocab_size
+        )
+        assert model.estimate_flops(total_tokens, 32) == expected_flops
+        assert [vars(main_config), vars(mtp_config)] == source_state
 
     def test_config_list_derives_mla_rope_handling_from_layer_type(self, monkeypatch):
         model_config = TransformerConfig(

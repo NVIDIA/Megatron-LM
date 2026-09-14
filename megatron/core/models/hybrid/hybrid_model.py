@@ -18,6 +18,7 @@ from megatron.core.models.common.embeddings.yarn_rotary_pos_embedding import Yar
 from megatron.core.models.common.language_module.language_module import LanguageModule
 from megatron.core.models.hybrid import HybridLayerConfigListEntry
 from megatron.core.models.hybrid.layers import utils as layer_utils
+from megatron.core.models.hybrid.layers.flops import estimate_hybrid_config_list_flops
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
@@ -159,28 +160,6 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             HybridModel.mup_warning_printed = True
 
         self.hybrid_stack_spec: ModuleSpec = hybrid_stack_spec
-        mamba_layer_spec = getattr(hybrid_stack_spec.submodules, 'mamba_layer', None)
-        mixer_spec = getattr(getattr(mamba_layer_spec, 'submodules', None), 'mixer', None)
-        if mixer_spec is not None:
-            from megatron.core.ssm.gated_delta_product import GatedDeltaProductMixer
-
-            self._hybrid_uses_gated_delta_product = mixer_spec.module is GatedDeltaProductMixer
-        else:
-            self._hybrid_uses_gated_delta_product = False
-        dsa_layer_spec = getattr(hybrid_stack_spec.submodules, 'dsa_layer', None)
-        dsa_attention_spec = getattr(
-            getattr(dsa_layer_spec, 'submodules', None), 'self_attention', None
-        )
-        if dsa_attention_spec is not None:
-            from megatron.core.transformer.experimental_attention_variant.absorbed_mla import (
-                AbsorbedMLASelfAttention,
-            )
-
-            self._hybrid_dsa_uses_absorbed_mla = (
-                dsa_attention_spec.module is AbsorbedMLASelfAttention
-            )
-        else:
-            self._hybrid_dsa_uses_absorbed_mla = False
         self.vocab_size = vocab_size
         self.max_sequence_length = max_sequence_length
         self.hybrid_layer_pattern = hybrid_layer_pattern
@@ -538,6 +517,31 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             if hasattr(module, 'finish_init'):
                 quant_config = get_quant_config_or_none(name, self.config.quant_recipe)
                 module.finish_init(quant_config)
+
+    def estimate_flops(
+        self, total_real_tokens_in_batch: float, seqlen_squared_sum_in_batch: float
+    ) -> float | None:
+        """Estimate global-batch training FLOPs for a list-defined model.
+
+        Args:
+            total_real_tokens_in_batch: Sum of unpadded sequence lengths in the global batch.
+            seqlen_squared_sum_in_batch: Sum of squared unpadded sequence lengths in the global batch.
+
+        Returns:
+            Whole-model forward/backward FLOPs, including all MTP depths regardless of
+            PP/VPP placement. Returns ``None`` for pattern-defined models so callers can
+            retain their existing args-based estimator.
+        """
+        if self.hybrid_layer_config_list is None:
+            return None
+        return estimate_hybrid_config_list_flops(
+            self.hybrid_layer_config_list,
+            self.hybrid_stack_spec,
+            self.config,
+            self.vocab_size,
+            total_real_tokens_in_batch,
+            seqlen_squared_sum_in_batch,
+        )
 
     def set_input_tensor(self, input_tensor: Tensor) -> None:
         """Sets input tensor to the model.

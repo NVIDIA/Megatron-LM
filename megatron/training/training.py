@@ -23,7 +23,7 @@ from collections import defaultdict
 from contextlib import nullcontext
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Optional, Tuple
 
 # Third-party.
 import torch
@@ -823,9 +823,7 @@ def num_floating_point_operations(
     batch_size,
     seqlen_squared_sum_in_batch=None,
     total_real_tokens_in_batch=None,
-    hybrid_layer_config_list=None,
-    hybrid_uses_gated_delta_product=None,
-    hybrid_dsa_uses_absorbed_mla=True,
+    model_flops_estimator: Callable[..., float | None] | None = None,
 ):
     """Compute the number of floating-point operations for one global batch.
 
@@ -850,13 +848,9 @@ def num_floating_point_operations(
             than ``batch_size * args.seq_length`` whenever the dataloader added
             CP-alignment padding or end-of-sequence padding, so neither kind of
             padding shows up in the reported FLOPs.
-        hybrid_layer_config_list: Optional unsplit config sequence for a list-defined
-            HybridModel. Configs are consumed directly; the sequence is never converted
-            to a hybrid pattern string.
-        hybrid_uses_gated_delta_product: Whether the built HybridModel's Mamba slot uses
-            gated delta product. When omitted, retain the existing args/spec lookup.
-        hybrid_dsa_uses_absorbed_mla: Whether the built HybridModel's DSA slot uses
-            absorbed MLA. Defaults to the standard training hybrid stack.
+        model_flops_estimator: Optional model-owned estimator receiving the resolved
+            token counts above as keyword arguments. Returning None selects the legacy
+            args-based estimator.
     """
     # Defaults: BSHD layout assumption (full causal mask, every sample length =
     # seq_length, no padding). For BSHD ``total_real_tokens = batch * s`` and
@@ -865,6 +859,14 @@ def num_floating_point_operations(
         seqlen_squared_sum_in_batch = batch_size * args.seq_length * args.seq_length
     if total_real_tokens_in_batch is None:
         total_real_tokens_in_batch = batch_size * args.seq_length
+
+    if model_flops_estimator is not None:
+        model_flops = model_flops_estimator(
+            total_real_tokens_in_batch=total_real_tokens_in_batch,
+            seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
+        )
+        if model_flops is not None:
+            return model_flops
 
     def mlp_layer_flops(total_tokens, hidden_size, expansion=4.0, swiglu=False):
         """Calculate FLOPs for an MLP layer."""
@@ -1034,196 +1036,6 @@ def num_floating_point_operations(
                 (2 * total_tokens * hidden_size * vocab_size * (1 + mtp_num_layers))  # logits computation
         )
         return flops_fwd * 3
-
-    def hybrid_config_list_flops(layer_config_list):
-        """Calculate HybridModel FLOPs from each layer's concrete config."""
-        from megatron.core.models.hybrid.hybrid_layer_allocation import MTPSplit, PipelineSplit
-        from megatron.core.ssm.gdn_layer_config import GDNLayerConfig
-        from megatron.core.ssm.mamba_layer_config import MambaLayerConfig
-        from megatron.core.ssm.mlp_layer_config import MLPLayerConfig
-        from megatron.core.transformer.attention_layer_config import AttentionLayerConfig
-        from megatron.core.transformer.experimental_attention_variant.dsa_layer_config import (
-            DSALayerConfig,
-        )
-        from megatron.core.transformer.mla_layer_config import MLALayerConfig
-        from megatron.core.transformer.moe.moe_layer_config import MoELayerConfig
-
-        def mla_projection_flops(config):
-            """Return token-linear MLA projection FLOPs shared by MLA and DSA."""
-            q_head_dim = config.qk_head_dim + config.qk_pos_emb_head_dim
-            if config.q_lora_rank is None:
-                q_term = config.hidden_size * config.num_attention_heads * q_head_dim
-            else:
-                q_term = config.q_lora_rank * (
-                    config.hidden_size + config.num_attention_heads * q_head_dim + 1
-                )
-            projection_term = (
-                q_term
-                + config.kv_lora_rank
-                * (
-                    config.hidden_size
-                    + config.num_attention_heads * (config.qk_head_dim + config.v_head_dim)
-                    + 1
-                )
-                + config.hidden_size * config.qk_pos_emb_head_dim
-                + config.num_attention_heads * config.v_head_dim * config.hidden_size
-            )
-            return 2 * total_real_tokens_in_batch * projection_term
-
-        def mla_layer_flops(config):
-            """Return forward dense MLA FLOPs using the existing estimator."""
-            q_head_dim = config.qk_head_dim + config.qk_pos_emb_head_dim
-            core_term = config.num_attention_heads * (q_head_dim + config.v_head_dim)
-            return mla_projection_flops(config) + seqlen_squared_sum_in_batch * core_term
-
-        def dsa_layer_flops(config, layer_number):
-            """Return forward DSA FLOPs for this concrete layer and physical position."""
-            from megatron.core.transformer.experimental_attention_variant.dsa import (
-                is_dsa_skip_topk_layer,
-            )
-
-            if hybrid_dsa_uses_absorbed_mla:
-                core_dim = 2 * config.kv_lora_rank + config.qk_pos_emb_head_dim
-            else:
-                core_dim = (
-                    config.qk_head_dim + config.qk_pos_emb_head_dim + config.v_head_dim
-                )
-            sparse_pair_measure = min(
-                seqlen_squared_sum_in_batch,
-                2 * total_real_tokens_in_batch * config.dsa_indexer_topk,
-            )
-            flops = (
-                mla_projection_flops(config)
-                + sparse_pair_measure * config.num_attention_heads * core_dim
-            )
-
-            if not is_dsa_skip_topk_layer(
-                layer_number,
-                config.dsa_indexer_skip_topk_offset,
-                config.dsa_indexer_topk_freq,
-            ):
-                indexer_query_input = config.q_lora_rank or config.hidden_size
-                indexer_projection_flops = 2 * total_real_tokens_in_batch * (
-                    indexer_query_input
-                    * config.dsa_indexer_n_heads
-                    * config.dsa_indexer_head_dim
-                    + config.hidden_size * config.dsa_indexer_head_dim
-                    + config.hidden_size * config.dsa_indexer_n_heads
-                )
-                indexer_score_flops = (
-                    seqlen_squared_sum_in_batch
-                    * config.dsa_indexer_n_heads
-                    * config.dsa_indexer_head_dim
-                )
-                flops += indexer_projection_flops + indexer_score_flops
-            return flops
-
-        forward_flops = 0
-        mtp_num_depths = 0
-        layer_number = 0
-        use_gated_delta_product = (
-            _uses_gated_delta_product_spec(args)
-            if hybrid_uses_gated_delta_product is None
-            else hybrid_uses_gated_delta_product
-        )
-        for entry in layer_config_list:
-            if entry is PipelineSplit:
-                continue
-            if entry is MTPSplit:
-                mtp_num_depths += 1
-                layer_number = 0
-                continue
-
-            layer_number += 1
-
-            if type(entry) is AttentionLayerConfig:
-                forward_flops += attn_layer_flops(
-                    total_real_tokens_in_batch,
-                    seqlen_squared_sum_in_batch,
-                    entry.hidden_size,
-                    entry.num_attention_heads,
-                    gqa=True,
-                    gqa_groups=entry.num_query_groups,
-                    kv_channels=entry.kv_channels,
-                )
-                if entry.attention_output_gate:
-                    query_projection_size = entry.kv_channels * entry.num_attention_heads
-                    forward_flops += (
-                        2 * total_real_tokens_in_batch * entry.hidden_size * query_projection_size
-                    )
-            elif type(entry) is MLALayerConfig:
-                forward_flops += mla_layer_flops(entry)
-            elif type(entry) is DSALayerConfig:
-                forward_flops += dsa_layer_flops(entry, layer_number)
-            elif type(entry) is MambaLayerConfig:
-                if use_gated_delta_product:
-                    forward_flops += gated_delta_product_layer_flops(
-                        total_real_tokens_in_batch,
-                        entry.hidden_size,
-                        entry.gdp_num_householder,
-                        entry.mamba_state_dim,
-                        entry.mamba_head_dim,
-                        entry.mamba_num_groups,
-                        entry.mamba_num_heads,
-                    )
-                else:
-                    forward_flops += mamba_layer_flops(
-                        total_real_tokens_in_batch,
-                        entry.hidden_size,
-                        entry.mamba_state_dim,
-                        entry.mamba_head_dim,
-                        entry.mamba_num_groups,
-                        entry.mamba_num_heads,
-                    )
-            elif type(entry) is GDNLayerConfig:
-                forward_flops += gdn_layer_flops(
-                    total_real_tokens_in_batch,
-                    entry.hidden_size,
-                    entry.linear_key_head_dim or 128,
-                    entry.linear_value_head_dim or 128,
-                    entry.linear_num_key_heads or 16,
-                    entry.linear_num_value_heads or 32,
-                    entry.linear_conv_kernel_dim or 4,
-                    entry.experimental_attention_variant == "gdn2",
-                )
-            elif type(entry) is MLPLayerConfig:
-                forward_flops += mlp_layer_flops(
-                    total_real_tokens_in_batch,
-                    entry.hidden_size,
-                    entry.ffn_hidden_size / entry.hidden_size,
-                    entry.gated_linear_unit,
-                )
-            elif type(entry) is MoELayerConfig:
-                forward_flops += moe_layer_flops(
-                    total_real_tokens_in_batch,
-                    entry.hidden_size,
-                    entry.moe_ffn_hidden_size or entry.ffn_hidden_size,
-                    entry.moe_shared_expert_intermediate_size or 0,
-                    entry.moe_router_topk,
-                    entry.moe_latent_size,
-                    entry.gated_linear_unit,
-                )
-            else:
-                raise ValueError(
-                    f"Unexpected hybrid layer config type in FLOPs calculation: {type(entry).__name__}"
-                )
-
-        # Each prediction depth executes its input norms/projection in addition to the concrete
-        # inner-layer template above. This work is repeated even when the module is shared.
-        forward_flops += (
-            2
-            * total_real_tokens_in_batch
-            * mtp_num_depths
-            * (3 * args.hidden_size + 2 * args.hidden_size**2)
-        )
-        forward_flops += (
-            2
-            * total_real_tokens_in_batch
-            * args.hidden_size
-            * args.padded_vocab_size
-            * (1 + mtp_num_depths)
-        )
-        return forward_flops * 3
 
     def transformer_flops():
         """Calculate FLOPs for a standard Transformer model."""
@@ -1548,9 +1360,6 @@ def num_floating_point_operations(
         return spec_parts[-1] in {'gdp_stack_spec', 'gated_delta_product_stack_spec'}
 
     # Main entrypoint for FLOPs calculation.
-    if hybrid_layer_config_list is not None:
-        return hybrid_config_list_flops(hybrid_layer_config_list)
-
     if is_hybrid_model(args):
         # Calculate the number of each type of layer.
         from operator import itemgetter
@@ -3677,8 +3486,7 @@ def training_log(
     total_real_tokens_in_batch: float | None = None,
     hybrid_layer_config_list=None,
     hybrid_mtp_use_repeated_layer=None,
-    hybrid_uses_gated_delta_product=None,
-    hybrid_dsa_uses_absorbed_mla=True,
+    model_flops_estimator: Callable[..., float | None] | None = None,
 ):
     """Log training information such as losses, timing, ...."""
     args = get_args()
@@ -3983,9 +3791,7 @@ def training_log(
             batch_size,
             seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
             total_real_tokens_in_batch=total_real_tokens_in_batch,
-            hybrid_layer_config_list=hybrid_layer_config_list,
-            hybrid_uses_gated_delta_product=hybrid_uses_gated_delta_product,
-            hybrid_dsa_uses_absorbed_mla=hybrid_dsa_uses_absorbed_mla,
+            model_flops_estimator=model_flops_estimator,
         ) / (elapsed_time_per_iteration * 10**12 * llm_world_size)
 
         one_logger_utils.track_e2e_metrics(args.log_throughput, throughput)
@@ -4612,20 +4418,17 @@ def train(
     args = get_args()
     timers = get_timers()
     hybrid_model = _find_hybrid_model_for_runtime_metrics(model[0])
+    model_flops_estimator = hybrid_model.estimate_flops if hybrid_model is not None else None
     hybrid_layer_config_list = (
         hybrid_model.hybrid_layer_config_list if hybrid_model is not None else None
     )
     hybrid_mtp_use_repeated_layer = None
-    hybrid_uses_gated_delta_product = None
-    hybrid_dsa_uses_absorbed_mla = True
     has_moe_layers = args.num_experts is not None
     if hybrid_layer_config_list is not None:
         from megatron.core.transformer.moe.moe_layer_config import MoELayerConfig
 
         hybrid_model_config = hybrid_model.config
         hybrid_mtp_use_repeated_layer = hybrid_model_config.mtp_use_repeated_layer
-        hybrid_uses_gated_delta_product = hybrid_model._hybrid_uses_gated_delta_product
-        hybrid_dsa_uses_absorbed_mla = hybrid_model._hybrid_dsa_uses_absorbed_mla
         has_moe_layers = any(type(entry) is MoELayerConfig for entry in hybrid_layer_config_list)
 
     fault_injector_kwargs = {}
@@ -5295,9 +5098,7 @@ def train(
             batch_size,
             seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
             total_real_tokens_in_batch=total_real_tokens_in_batch,
-            hybrid_layer_config_list=hybrid_layer_config_list,
-            hybrid_uses_gated_delta_product=hybrid_uses_gated_delta_product,
-            hybrid_dsa_uses_absorbed_mla=hybrid_dsa_uses_absorbed_mla,
+            model_flops_estimator=model_flops_estimator,
         )
         num_floating_point_operations_so_far += num_floating_point_operations_in_batch
         num_floating_point_operations_since_last_log_event += num_floating_point_operations_in_batch
@@ -5360,8 +5161,7 @@ def train(
                     total_real_tokens_in_batch=total_real_tokens_in_batch,
                     hybrid_layer_config_list=hybrid_layer_config_list,
                     hybrid_mtp_use_repeated_layer=hybrid_mtp_use_repeated_layer,
-                    hybrid_uses_gated_delta_product=hybrid_uses_gated_delta_product,
-                    hybrid_dsa_uses_absorbed_mla=hybrid_dsa_uses_absorbed_mla,
+                    model_flops_estimator=model_flops_estimator,
                 )
             # OTel: close the iteration-report super-span (parents params_norm + log;
             # its own uninstrumented time is the loss_scale sync + FLOPs bookkeeping).
