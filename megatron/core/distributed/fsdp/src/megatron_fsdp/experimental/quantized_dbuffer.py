@@ -17,6 +17,7 @@
 from collections.abc import Iterable
 
 import torch
+import torch.nn.functional as F
 import transformer_engine_torch as tex
 from torch.distributed import DeviceMesh
 from torch.distributed.tensor.placement_types import Placement
@@ -27,6 +28,8 @@ from .layout import GlobalLayout
 from .placement import BlockAtomic, Flat
 
 _MXFP8_DTYPE = tex.DType.kFloat8E4M3
+# TODO: Support quantizing only rowwise or columnwise data, allocating and
+# communicating only the required planes to save memory and communication.
 _MXFP8_QUANTIZER = MXFP8Quantizer(_MXFP8_DTYPE)
 _MXFP8_BLOCK_SIZE = 32
 
@@ -37,7 +40,7 @@ def effective_dtype(tensor: torch.Tensor) -> torch.dtype:
 
 
 def _rowwise_scale_layout(data_layout: GlobalLayout) -> GlobalLayout:
-    """Derive rowwise scale coordinates from the data layout."""
+    """Derive rowwise scales from the layout shared by rowwise_data and columnwise_data."""
     return GlobalLayout(
         tensor_shapes=tuple(
             torch.Size((shape[0], shape[1] // _MXFP8_BLOCK_SIZE))
@@ -52,7 +55,7 @@ def _rowwise_scale_layout(data_layout: GlobalLayout) -> GlobalLayout:
 
 
 def _columnwise_scale_layout(data_layout: GlobalLayout) -> GlobalLayout:
-    """Derive columnwise scale coordinates from the data layout."""
+    """Derive columnwise scales from the layout shared by rowwise_data and columnwise_data."""
     return GlobalLayout(
         tensor_shapes=tuple(
             torch.Size((shape[0] // _MXFP8_BLOCK_SIZE, shape[1]))
@@ -65,11 +68,11 @@ def _columnwise_scale_layout(data_layout: GlobalLayout) -> GlobalLayout:
     )
 
 
-def _columnwise_scale_placements(placements: Iterable[Placement]) -> tuple[Placement, ...]:
-    """Map weight placements to columnwise-scale coordinates.
+def _block_atomic_to_flat(placements: Iterable[Placement]) -> tuple[Placement, ...]:
+    """Replace BlockAtomic placements with Flat for coordinates measured in blocks.
 
-    A columnwise scale row describes one 32-row weight block, so it uses
-    Flat instead of BlockAtomic(32) to preserve the same shard boundaries.
+    For example, one MXFP8 columnwise scale row represents a 32-row weight
+    block, so Flat preserves the shard boundaries of BlockAtomic(32).
     """
     placements = tuple(placements)
     return tuple(
@@ -84,9 +87,7 @@ def _pad_rowwise_scale(scale: torch.Tensor) -> torch.Tensor:
     )
     if scale.shape == shape:
         return scale
-    padded = torch.zeros(shape, dtype=scale.dtype, device=scale.device)
-    padded[: scale.shape[0], : scale.shape[1]].copy_(scale)
-    return padded
+    return F.pad(scale, (0, shape[1] - scale.shape[1], 0, shape[0] - scale.shape[0]))
 
 
 def _pad_columnwise_scale(scale: torch.Tensor) -> torch.Tensor:
@@ -96,9 +97,7 @@ def _pad_columnwise_scale(scale: torch.Tensor) -> torch.Tensor:
     )
     if scale.shape == shape:
         return scale
-    padded = torch.zeros(shape, dtype=scale.dtype, device=scale.device)
-    padded[: scale.shape[0], : scale.shape[1]].copy_(scale)
-    return padded
+    return F.pad(scale, (0, shape[1] - scale.shape[1], 0, shape[0] - scale.shape[0]))
 
 
 class QuantizedDBuffer:
@@ -143,7 +142,7 @@ class QuantizedDBuffer:
         )
         self.columnwise_scale = DBuffer(
             mesh,
-            _columnwise_scale_placements(placements),
+            _block_atomic_to_flat(placements),
             _columnwise_scale_layout(self.rowwise_data.layout),
             torch.uint8,
             device,
@@ -199,9 +198,7 @@ class QuantizedDBuffer:
             expected = getattr(self.rowwise_data, attribute)
             actual = getattr(main_weight, attribute)
             if actual != expected:
-                raise ValueError(
-                    f"Expected main_weight {attribute} {expected!r}, got {actual!r}."
-                )
+                raise ValueError(f"Expected main_weight {attribute} {expected!r}, got {actual!r}.")
         for index in range(len(self.rowwise_data.layout.tensor_shapes)):
             tensor = self.get_local_tensor(index)
             rowwise_scale = self.rowwise_scale.get_local_tensor(index)
@@ -252,7 +249,7 @@ class QuantizedDBuffer:
             self.rowwise_data.view(placements),
             self.columnwise_data.view(placements),
             self.rowwise_scale.view(placements),
-            self.columnwise_scale.view(_columnwise_scale_placements(placements)),
+            self.columnwise_scale.view(_block_atomic_to_flat(placements)),
         )
 
     def redistribute(
@@ -265,7 +262,7 @@ class QuantizedDBuffer:
                 self.rowwise_data.redistribute(new_placements),
                 self.columnwise_data.redistribute(new_placements),
                 self.rowwise_scale.redistribute(new_placements),
-                self.columnwise_scale.redistribute(_columnwise_scale_placements(new_placements)),
+                self.columnwise_scale.redistribute(_block_atomic_to_flat(new_placements)),
             )
         if out.mesh != self.mesh:
             raise ValueError(f"Expected out mesh {self.mesh!r}, got {out.mesh!r}.")
@@ -278,7 +275,7 @@ class QuantizedDBuffer:
         self.columnwise_data.redistribute(new_placements, out=out.columnwise_data)
         self.rowwise_scale.redistribute(new_placements, out=out.rowwise_scale)
         self.columnwise_scale.redistribute(
-            _columnwise_scale_placements(new_placements), out=out.columnwise_scale
+            _block_atomic_to_flat(new_placements), out=out.columnwise_scale
         )
         return out
 
