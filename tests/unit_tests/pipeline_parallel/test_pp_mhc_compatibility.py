@@ -22,6 +22,7 @@ from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transfor
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel
+from megatron.core.pipeline_parallel.p2p_communication import P2PCommunicator
 from megatron.core.pipeline_parallel.schedules import (
     _get_pipeline_hidden_size,
     get_forward_backward_func,
@@ -85,6 +86,45 @@ def test_mhc_pipeline_rejects_ep_overlap():
             moe_token_dispatcher_type="alltoall",
             overlap_moe_expert_parallel_comm=True,
         )
+
+
+@pytest.mark.internal
+@pytest.mark.parametrize("pp_size", [2, 4])
+def test_mhc_batched_p2p_preserves_directions(pp_size):
+    """Activation and gradient messages must stay distinct when peers coincide."""
+    if Utils.world_size % pp_size != 0:
+        pytest.skip("Requires a world size divisible by PP")
+    try:
+        Utils.initialize_model_parallel(pipeline_model_parallel_size=pp_size)
+        groups = ProcessGroupCollection.use_mpu_process_groups()
+        config = TransformerConfig(
+            num_layers=4,
+            hidden_size=64,
+            num_attention_heads=4,
+            pipeline_model_parallel_size=pp_size,
+            pipeline_dtype=torch.float32,
+            enable_mhc_connections=True,
+            mhc_num_residual_streams=2,
+            batch_p2p_comm=True,
+        )
+        communicator = P2PCommunicator(groups.pp, config)
+        shape = (16, 1, _get_pipeline_hidden_size(config))
+        rank = groups.pp.rank()
+        activation = torch.full(shape, float(rank + 1), device="cuda")
+        gradient = torch.full(shape, float(rank + 101), device="cuda")
+        received_activation, received_gradient = (
+            communicator.send_forward_backward_recv_forward_backward(
+                activation, gradient, recv_prev=True, recv_next=True, tensor_shape=shape
+            )
+        )
+        torch.testing.assert_close(
+            received_activation, torch.full_like(activation, (rank - 1) % pp_size + 1)
+        )
+        torch.testing.assert_close(
+            received_gradient, torch.full_like(gradient, (rank + 1) % pp_size + 101)
+        )
+    finally:
+        Utils.destroy_model_parallel()
 
 
 def _canonical_name(model, name):
