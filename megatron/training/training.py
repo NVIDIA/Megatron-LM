@@ -2332,6 +2332,9 @@ def wrap_model_chunks_with_ddp(
                 if intra_expt_dp_group is not None
                 else getattr(layout_pgs, "expt_dp", None)
             )
+            # Must match DDP's own grouping: GTP params' bucket skips CP (folded into gtp_remat).
+            cp_group = getattr(layout_pgs, "cp", None)
+            context_parallel_size = get_pg_size(cp_group) if cp_group is not None else 1
             for i, (chunk, bucket_size) in enumerate(zip(model_chunks, bucket_sizes)):
                 all_params = [p for p in chunk.parameters() if p.requires_grad]
                 per_chunk_layouts[i] = compute_layout(
@@ -2340,6 +2343,7 @@ def wrap_model_chunks_with_ddp(
                     data_parallel_world_size,
                     ddp_config,
                     expert_data_parallel_world_size=expert_data_parallel_world_size,
+                    context_parallel_size=context_parallel_size,
                 )
 
     # Wrap each chunk.
