@@ -423,6 +423,10 @@ class ShardedTensorFactory(ShardedBase):
             factories in different processes
         flattened_range (slice, optional): indicates additional flattening
             applied to the ShardedTensors produced by the factory
+        optimizer_factory (ShardedTensorFactory, optional): companion factory whose
+            data is the original model parameter, for transformations that materialize
+            a different model-checkpoint tensor before building this factory. Its build
+            and merge functions map physical optimizer shards to the same logical keys.
     """
 
     key: str
@@ -431,6 +435,28 @@ class ShardedTensorFactory(ShardedBase):
     merge_fn: FactoryMergeFn
     replica_id: ReplicaId = 0
     flattened_range: Optional[slice] = None
+    optimizer_factory: Optional["ShardedTensorFactory"] = field(default=None, repr=False)
+
+    def for_optimizer(self) -> "ShardedTensorFactory":
+        """Return source-parameter metadata with current keys and replica ownership.
+
+        For three-coordinate (PP, TP/GTP, DP) replica IDs, propagate outer PP/DP
+        updates while retaining the companion's TP/GTP coordinate: physical GTP
+        shards are distinct even when the model factory contains gathered replicas.
+        Other replica ID forms propagate unchanged.
+        """
+        if self.optimizer_factory is None:
+            return self
+        replica_id = self.replica_id
+        companion_replica_id = self.optimizer_factory.replica_id
+        if (
+            isinstance(replica_id, tuple)
+            and len(replica_id) == 3
+            and isinstance(companion_replica_id, tuple)
+            and len(companion_replica_id) == 3
+        ):
+            replica_id = (replica_id[0], companion_replica_id[1], replica_id[2])
+        return replace(self.optimizer_factory, key=self.key, replica_id=replica_id)
 
     def build(self):
         """Builds a ShardedStateDict from the original tensor"""
@@ -441,7 +467,15 @@ class ShardedTensorFactory(ShardedBase):
         pass
 
     def without_data(self):
-        return replace(self, data=None)
+        return replace(
+            self,
+            data=None,
+            optimizer_factory=(
+                self.optimizer_factory.without_data()
+                if self.optimizer_factory is not None
+                else None
+            ),
+        )
 
 
 def apply_factories(sharded_state_dict: ShardedStateDict):

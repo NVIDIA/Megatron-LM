@@ -484,6 +484,7 @@ def configure_gtp_remat_from_recipe(
     fp8=False,
     calculate_per_token_loss=False,
     reduce_scatter_with_fp32_accumulation=False,
+    pad_for_alignment=None,
 ):
     """
     Configure GTP weight-remat (padding + loss reduction) from the training recipe.
@@ -497,7 +498,11 @@ def configure_gtp_remat_from_recipe(
         check_param_states=False,
         reduce_scatter_with_fp32_accumulation=reduce_scatter_with_fp32_accumulation,
     )
-    if fp4:
+    # An explicit value wins over the recipe defaults: 32 for MXFP8, 16 for other
+    # quantized recipes, and 1 for BF16 (the minimum needed for even GTP sharding).
+    if pad_for_alignment is not None:
+        update_gtp_config(pad_for_alignment=pad_for_alignment)
+    elif fp4:
         update_gtp_config(pad_for_alignment=16)
     elif fp8_recipe == "mxfp8":
         update_gtp_config(pad_for_alignment=32)
@@ -2848,6 +2853,10 @@ def make_sharded_tensors_for_checkpoint_with_gtp_remat(
                 )
             continue
 
+        # GTP-sharded tensor: delegate to the GTP-aware single-tensor helper — it layers the
+        # axis-0 GTP split onto TP, elects the writer over the gtp_remat-excluded DP group, and
+        # places alignment-padded shards in logical layout.
+        # With no TP, tp_axis defaults to 0 and tp_size to 1.
         # Only tensors present in the axis map are also sharded across TP.
         tp_axis = tensor_parallel_layers_axis_map.get(layer_name, None)
         sharded_state_dict[layer_key] = make_tp_sharded_tensor_for_checkpoint(
