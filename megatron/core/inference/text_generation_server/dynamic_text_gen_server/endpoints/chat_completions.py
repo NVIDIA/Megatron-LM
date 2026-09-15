@@ -702,9 +702,22 @@ try:
     bp = Blueprint('chat_completions_api', __name__)
 
     def apply_parsers(
-        message_text, tools, parsers_list, tools_requested, chat_template_kwargs=None
+        message_text,
+        tools,
+        parsers_list,
+        tools_requested,
+        chat_template_kwargs=None,
+        finished=True,
     ):
-        """Runs CPU-intensive text parsing."""
+        """Runs CPU-intensive text parsing.
+
+        `finished`: whether `message_text` is the complete response rather than
+        a partial chunk re-parsed mid-stream. Defaults to True for the one-shot
+        (non-streaming) caller; the streaming caller passes this explicitly on
+        every chunk. Forwarded to each parser so one, `qwen3-coder-tool`, can
+        gate its truncated-function-name fallback on it (see
+        `Qwen3CoderToolParser.parse`).
+        """
         for parser in parsers_list:
             if parser not in PARSER_MAPPING:
                 raise ValueError(f"Parser {parser} not found in PARSER_MAPPING")
@@ -729,6 +742,7 @@ try:
                 tools=tools,
                 chat_template_kwargs=chat_template_kwargs,
                 implicit_reasoning_end_markers=implicit_reasoning_end_markers,
+                finished=finished,
             )
             if "tool_calls" in new_info:
                 new_info["tool_calls"] = _normalize_tool_calls(
@@ -1076,13 +1090,14 @@ try:
                     else ()
                 )
 
-                def parse_streaming_text(text):
+                def parse_streaming_text(text, finished=False):
                     parsed_text, metadata = apply_parsers(
                         text,
                         tools,
                         parsers,
                         tools_requested,
                         chat_template_kwargs=chat_template_kwargs,
+                        finished=finished,
                     )
                     metadata["tool_calls"] = _maybe_filter_parallel_tool_calls(
                         metadata.get("tool_calls", []), parallel_tool_calls

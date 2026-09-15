@@ -7,7 +7,7 @@ import logging
 import math
 import re
 import uuid
-from typing import Any
+from typing import Any, Optional
 
 from megatron.core.tokenizers.text.parsers.base_parser import BaseParser
 
@@ -171,6 +171,78 @@ ChatCompletionToolsParam = dict[str, Any]
 ChatCompletionRequest = dict[str, Any]
 ExtractedToolCallInformation = dict
 
+_TOOL_CALL_START = "<tool_call>"
+_TOOL_CALL_END = "</tool_call>"
+_PARAM_OPEN_RE = re.compile(r"<\s*parameter\s*=[^>]*>")
+_PARAM_CLOSE_RE = re.compile(r"<\s*/\s*parameter\s*>")
+
+
+def _find_matching_tool_call_end(text: str, start: int) -> Optional[int]:
+    """Find the index just past the `</tool_call>` matching the call that begins
+    at `start` (the position right after its opening `<tool_call>` tag).
+
+    A `<parameter=...>...</parameter>` block is treated as atomic, so a
+    `</tool_call>` occurring inside a parameter value does not terminate the
+    call early -- the same intent the regex this replaces had, but without its
+    exponential worst case. That regex was `(?:PARAM_BLOCK|ANY_CHAR)*` wrapped
+    in an outer repetition: when no `</tool_call>` ever arrives (truncated
+    generation, or every streaming call before the terminator arrives), the
+    engine tries every way to partition the input between the two alternatives
+    before giving up -- confirmed locally to exceed 3s on `<function=f>` plus
+    20 `<parameter=a>x</parameter>` blocks with no closing `</tool_call>`.
+
+    This scans `text` once. The `i += 1` / atomic-skip loop below is O(n): `i`
+    only ever moves forward. The one part that could reintroduce quadratic
+    behavior -- searching for each parameter's closing tag -- is done with a
+    single upfront `finditer` pass plus a pointer into it that also only moves
+    forward, rather than a fresh search per parameter block.
+
+    Returns None if `</tool_call>` never appears -- mirrors the second
+    alternative of the old regex (`|<tool_call>(.*?)$`), which salvages a call
+    whose closing tag never arrived.
+    """
+    closes = [m.start() for m in _PARAM_CLOSE_RE.finditer(text, start)]
+    close_ptr = 0
+    i = start
+    n = len(text)
+    while i < n:
+        if text.startswith(_TOOL_CALL_END, i):
+            return i + len(_TOOL_CALL_END)
+        m = _PARAM_OPEN_RE.match(text, i)
+        if m is not None:
+            while close_ptr < len(closes) and closes[close_ptr] < m.end():
+                close_ptr += 1
+            if close_ptr < len(closes):
+                close_match = _PARAM_CLOSE_RE.match(text, closes[close_ptr])
+                i = close_match.end()
+                close_ptr += 1
+                continue
+        i += 1
+    return None
+
+
+def _extract_tool_call_bodies(model_output: str) -> list[str]:
+    """Linear-time replacement for the old `tool_call_regex.findall(model_output)`.
+
+    Returns the text between each `<tool_call>` and its matching `</tool_call>`
+    (or, for a call with no closing tag, everything to the end of the string --
+    same fallback the old regex's second alternative provided).
+    """
+    bodies = []
+    pos = 0
+    while True:
+        start = model_output.find(_TOOL_CALL_START, pos)
+        if start == -1:
+            break
+        body_start = start + len(_TOOL_CALL_START)
+        end = _find_matching_tool_call_end(model_output, body_start)
+        if end is None:
+            bodies.append(model_output[body_start:])
+            break
+        bodies.append(model_output[body_start : end - len(_TOOL_CALL_END)])
+        pos = end
+    return bodies
+
 
 class _Qwen3CoderToolParser:
 
@@ -184,19 +256,14 @@ class _Qwen3CoderToolParser:
     # A `</tool_call>` occurring INSIDE a parameter value must not terminate the
     # call. vLLM's engine is a state machine that knows it is inside a parameter;
     # the equivalent here is to consume complete `<parameter=...>...</parameter>`
-    # blocks atomically, so any `</tool_call>` within one is absorbed. Everything
-    # else is consumed a character at a time, guarded by a negative lookahead.
-    # This stays linear: measured 3.5x the old pattern at a constant ratio from
-    # 5k to 60k characters (~6 ms on a 60k-char truncated generation).
-    # The second alternative is unchanged and still salvages a call whose
-    # `</tool_call>` never arrived.
-    tool_call_regex = re.compile(
-        r"<tool_call>("
-        r"(?:<\s*parameter\s*=[^>]*>.*?<\s*/\s*parameter\s*>|(?!</tool_call>).)*"
-        r")</tool_call>"
-        r"|<tool_call>(.*?)$",
-        re.DOTALL,
-    )
+    # blocks atomically, so any `</tool_call>` within one is absorbed. This used
+    # to be a single `(?:PARAM_BLOCK|ANY_CHAR)*` regex, which was exponential on
+    # an unterminated call with many parameter blocks (no closing `</tool_call>`
+    # -- the case a truncated generation or a mid-stream chunk always is until
+    # the closing tag arrives). `_extract_tool_call_bodies` / `_find_matching_
+    # tool_call_end` above replace it with a linear scan carrying the identical
+    # semantics, including the "salvage everything to end of string" fallback
+    # for a call whose `</tool_call>` never arrived.
     tool_call_function_regex = re.compile(r"<function=(.*?)</function>|<function=(.*)$", re.DOTALL)
     # Mirrors vLLM's `_PARAM_RE` in `vllm/parser/qwen3.py`. Three properties are
     # load-bearing and each was previously wrong:
@@ -258,7 +325,10 @@ class _Qwen3CoderToolParser:
         return _coerce_to_schema_type(param_value, _extract_types_from_schema(schema))
 
     def _parse_xml_function_call(
-        self, function_call_str: str, tools: list[ChatCompletionToolsParam] | None
+        self,
+        function_call_str: str,
+        tools: list[ChatCompletionToolsParam] | None,
+        finished: bool = True,
     ) -> ToolCall | None:
         # Extract function name. When the opening tag was never closed -- e.g.
         # generation stopped mid-name, leaving `<function=f` -- vLLM still emits
@@ -266,8 +336,19 @@ class _Qwen3CoderToolParser:
         # left `<tool_call>` in the post-parse content, which NeMo-Gym reads as
         # `is_invalid_tool_call` and turns into a -5.0 advantage, so a merely
         # truncated call was being punished as a malformed one.
+        #
+        # Gated on `finished`: a streaming caller re-parses the whole
+        # accumulated text on every chunk, so `<function=get` mid-stream is not
+        # generation having stopped -- it is `<function=get_weather` that just
+        # has not fully arrived yet. StreamingChatParser emits a tool call's
+        # name delta exactly once, the first time it sees a non-None name, so
+        # firing this fallback mid-stream would permanently lock in the
+        # truncated prefix. Only treat a missing `>` as truly truncated once
+        # the caller confirms the response itself is finished.
         end_index = function_call_str.find(">")
         if end_index == -1:
+            if not finished:
+                return None
             function_name = function_call_str.strip()
             if not function_name:
                 return None
@@ -300,8 +381,7 @@ class _Qwen3CoderToolParser:
 
     def _get_function_calls(self, model_output: str) -> list[str]:
         # Find all tool calls
-        matched_ranges = self.tool_call_regex.findall(model_output)
-        raw_tool_calls = [match[0] if match[0] else match[1] for match in matched_ranges]
+        raw_tool_calls = _extract_tool_call_bodies(model_output)
 
         # Back-off strategy if no tool_call tags found
         if len(raw_tool_calls) == 0:
@@ -315,9 +395,16 @@ class _Qwen3CoderToolParser:
         return function_calls
 
     def extract_tool_calls(
-        self, model_output: str, tools: list[ChatCompletionToolsParam] | None
+        self,
+        model_output: str,
+        tools: list[ChatCompletionToolsParam] | None,
+        finished: bool = True,
     ) -> ExtractedToolCallInformation:
-        """Extracts the tool calls from the text using <tool_call>...</tool_call> tags."""
+        """Extracts the tool calls from the text using <tool_call>...</tool_call> tags.
+
+        `finished` gates the truncated-function-name fallback in
+        `_parse_xml_function_call`: see that method's docstring.
+        """
         # Quick check to avoid unnecessary processing
         if self.tool_call_prefix not in model_output:
             return ExtractedToolCallInformation(
@@ -332,7 +419,7 @@ class _Qwen3CoderToolParser:
                 )
 
             tool_calls = [
-                self._parse_xml_function_call(function_call_str, tools)
+                self._parse_xml_function_call(function_call_str, tools, finished=finished)
                 for function_call_str in function_calls
             ]
             tool_calls = [tc for tc in tool_calls if tc is not None]
@@ -370,6 +457,14 @@ class Qwen3CoderToolParser(BaseParser):
 
         Args:
             text (str): The text to parse.
+            finished (bool): Whether `text` is the complete, final response rather
+                than a partial chunk being re-parsed mid-stream. Defaults to True,
+                since most callers hand this a finished response; the streaming
+                path is the one exception and passes this explicitly on every
+                call. Gates whether a truncated `<function=name` with no closing
+                `>` is treated as "generation actually stopped here" (finished)
+                versus "the rest just has not arrived in this chunk yet" (not
+                finished) -- see `_Qwen3CoderToolParser._parse_xml_function_call`.
 
         Returns:
             tuple[str, dict[str, str]]: A tuple containing the unprocessed text
@@ -377,7 +472,7 @@ class Qwen3CoderToolParser(BaseParser):
         """
 
         information = _Qwen3CoderToolParser().extract_tool_calls(
-            text, tools=kwargs.get("tools", [])
+            text, tools=kwargs.get("tools", []), finished=kwargs.get("finished", True)
         )
         if information.get("tools_called", False):
             return information.get("content", ""), {"tool_calls": information.get("tool_calls", [])}

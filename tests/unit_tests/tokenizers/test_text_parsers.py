@@ -18,6 +18,7 @@ implementation:
 """
 
 import json
+import time
 
 import pytest
 
@@ -29,6 +30,7 @@ from megatron.core.tokenizers.text.parsers.nemotron_v3_reasoning_parser import (
     NemotronV3ReasoningParser,
 )
 from megatron.core.tokenizers.text.parsers.qwen3_coder_tool_parser import (
+    Qwen3CoderToolParser,
     _Qwen3CoderToolParser,
 )
 
@@ -333,3 +335,84 @@ def test_qwen3_coder_truncated_tool_call_without_function_yields_nothing():
     """`<tool_call>` with no `<function=` is not a call in either engine."""
     info = _Qwen3CoderToolParser().extract_tool_calls("<tool_call>\n", tools=GRAMMAR_TOOLS)
     assert not (info.get("tool_calls") or [])
+
+
+def _unterminated_tool_call(n_parameters: int) -> str:
+    """`<tool_call><function=f>` plus N closed parameter blocks, deliberately
+    missing the closing `</tool_call>` -- the shape that made the old
+    `tool_call_regex` backtrack exponentially: with no `</tool_call>` to match,
+    it tried every way to partition the input between its parameter-block and
+    plain-character alternatives before giving up.
+    """
+    body = "<tool_call><function=f>"
+    for i in range(n_parameters):
+        body += f"<parameter=a{i}>x</parameter>"
+    return body
+
+
+def test_qwen3_coder_unterminated_call_with_many_parameters_is_not_exponential():
+    """Regression test for exponential backtracking on an unterminated call.
+
+    The reviewer's repro (`<tool_call><function=f>` + 20 closed parameter
+    blocks, no closing `</tool_call>`) exceeded 3s against the old regex.
+    Streaming hits this shape on every chunk before the closing tag arrives,
+    so this has to stay fast, not just eventually finish. A generous absolute
+    bound is used rather than asserting a precise linear ratio, since CI
+    machines are shared and timing noise is real -- but 20 parameters
+    completing in over a second would still mean the fix regressed back
+    toward exponential, and this catches that.
+    """
+    text = _unterminated_tool_call(20)
+    start = time.perf_counter()
+    _Qwen3CoderToolParser().extract_tool_calls(text, tools=GRAMMAR_TOOLS)
+    elapsed = time.perf_counter() - start
+    assert elapsed < 1.0, f"took {elapsed:.3f}s on the reviewer's exact repro shape"
+
+    # 16x the reviewer's parameter count should not cost anywhere near 16x the
+    # time if the fix is actually linear (let alone the "orders of magnitude
+    # worse" a regression to exponential behavior would show).
+    larger_text = _unterminated_tool_call(320)
+    start = time.perf_counter()
+    _Qwen3CoderToolParser().extract_tool_calls(larger_text, tools=GRAMMAR_TOOLS)
+    larger_elapsed = time.perf_counter() - start
+    assert larger_elapsed < 2.0, f"took {larger_elapsed:.3f}s at 16x the parameter count"
+
+
+@pytest.mark.parametrize(
+    ("finished", "expect_call"),
+    [
+        # Generation is genuinely done: the truncated name is all there ever
+        # will be, so vLLM parity requires emitting it (this PR's original fix).
+        (True, True),
+        # Mid-stream: `<function=get` is not "the model stopped after `get`",
+        # it is "`get_weather` has not fully arrived in this chunk yet".
+        # StreamingChatParser emits a tool call's name delta exactly once, on
+        # the first non-None name it sees, so firing here would permanently
+        # lock in a truncated name once more of the text does arrive.
+        (False, False),
+    ],
+)
+def test_qwen3_coder_truncated_function_name_fallback_is_gated_on_finished(
+    finished, expect_call
+):
+    text = "<tool_call>\n<function=get"
+    info = Qwen3CoderToolParser.parse(text, tools=GRAMMAR_TOOLS, finished=finished)
+    _, metadata = info
+    calls = metadata.get("tool_calls") or []
+    if expect_call:
+        assert [c["function"]["name"] for c in calls] == ["get"]
+    else:
+        assert calls == []
+
+
+def test_qwen3_coder_parse_defaults_to_finished():
+    """Every non-streaming caller (chat_completions.py's finished-response path,
+    completions.py, and any direct one-shot use) calls `.parse()` without a
+    `finished` kwarg. The truncated-function-name fallback must still fire for
+    them by default -- only the streaming path explicitly opts into
+    `finished=False` per chunk.
+    """
+    text = "<tool_call>\n<function=get"
+    _, metadata = Qwen3CoderToolParser.parse(text, tools=GRAMMAR_TOOLS)
+    calls = metadata.get("tool_calls") or []
+    assert [c["function"]["name"] for c in calls] == ["get"]
