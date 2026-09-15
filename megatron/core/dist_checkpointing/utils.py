@@ -18,6 +18,8 @@ from .mapping import (
     StateDict,
 )
 
+from megatron.core.msc_utils import MultiStorageClientFeature
+
 
 CONFIG_FILE = "run_config.yaml"
 
@@ -312,6 +314,24 @@ def _clean_metadata_for_serialization(metadata: dict) -> dict:
     # Remove dp_cp_group as it's not serializable
     clean_metadata.pop('dp_cp_group', None)
     return clean_metadata
+
+
+def join_paths(*paths: str) -> str:
+    """Join paths, using MultiStorageClient when needed"""
+    if not paths:
+        raise ValueError("Empty paths")
+
+    if MultiStorageClientFeature.is_enabled():
+        msc = MultiStorageClientFeature.import_package()
+        path_cls = msc.Path
+    else:
+        path_cls = Path
+
+    path = path_cls(paths[0])
+    for part in paths[1:]:
+        path = path / part
+
+    return str(path)
 
 
 def get_checkpoint_run_config_filename(checkpoints_path: str) -> str:
