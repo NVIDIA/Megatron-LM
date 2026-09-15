@@ -282,6 +282,46 @@ _hybrid_ep_buffer = None
 HYBRIDEP_TOKEN_ALIGNMENT = 64
 
 
+def make_hybrid_ep_buffer(
+    group: torch.distributed.ProcessGroup,
+    hidden_dim: int,
+    num_tokens: int,
+    num_local_experts: int,
+    num_sms_dispatch_api: Optional[int] = None,
+    num_sms_combine_api: Optional[int] = None,
+    num_blocks_permute: Optional[int] = None,
+    num_blocks_unpermute: Optional[int] = None,
+    fp8_dispatch: bool = False,
+    num_sms_preprocessing_api: Optional[int] = None,
+):
+    '''
+    Build one HybridEP buffer and return it, leaving the module-global one alone.
+
+    Returns:
+        HybridEPBuffer: a buffer built for this geometry, owned by the caller.
+    '''
+    assert not fp8_dispatch, "HybridEP dispatcher does not support fp8 dispatch now"
+    kwargs = {}
+    if num_sms_dispatch_api is not None:
+        kwargs['num_sms_dispatch_api'] = num_sms_dispatch_api
+    if num_sms_combine_api is not None:
+        kwargs['num_sms_combine_api'] = num_sms_combine_api
+    if num_blocks_permute is not None:
+        kwargs['num_blocks_permute'] = num_blocks_permute
+    if num_blocks_unpermute is not None:
+        kwargs['num_blocks_unpermute'] = num_blocks_unpermute
+    if num_sms_preprocessing_api is not None:
+        kwargs['num_sms_preprocessing_api'] = num_sms_preprocessing_api
+    return HybridEPBuffer(
+        group=group,
+        hidden_dim=hidden_dim,
+        max_num_of_tokens_per_rank=num_tokens,
+        num_local_experts=num_local_experts,
+        use_fp8=fp8_dispatch,
+        **kwargs,
+    )
+
+
 def init_hybrid_ep_buffer(
     group: torch.distributed.ProcessGroup,
     hidden_dim: int,
@@ -353,6 +393,88 @@ def reset_hybrid_ep_buffer():
     '''
     global _hybrid_ep_buffer
     _hybrid_ep_buffer = None
+
+
+def hybrid_ep_dispatch_leg(
+    buffer,
+    hidden,
+    *,
+    handle=None,
+    routing_map=None,
+    probs=None,
+    topk_idx=None,
+    topk_weights=None,
+    num_of_experts=None,
+    num_of_experts_per_rank=None,
+    scaling_factor=None,
+    num_permuted_tokens=None,
+    pad_multiple=None,
+    non_blocking=False,
+    fused=False,
+):
+    '''
+    Issue one DISPATCH-SHAPED HybridEP collective on ``buffer`` and return its five outputs.
+
+    Args:
+        buffer (HybridEPBuffer):
+            The buffer to stage through, and the one every replay of this plan must reuse.
+        hidden (torch.Tensor):
+            Input hidden states to dispatch.
+        handle (Optional[tuple]):
+            A plan from an earlier dispatch, selecting cached replay; ``None`` builds one.
+        non_blocking (bool):
+            Skip the stream synchronization that would otherwise copy the per-expert counts
+            through pinned memory so Python could derive ``num_permuted_tokens``.
+        fused (bool):
+            Ask HybridEP to fuse the permute into the dispatch. Passed only when true, because
+            older ``deep_ep`` builds do not take the keyword at all.
+
+    Returns:
+        tuple: ``(hidden, probs, scaling_factor, tokens_per_expert, handle)``, HybridEP's own.
+    '''
+    return buffer.dispatch_with_permute(
+        hidden=hidden,
+        handle=handle,
+        routing_map=routing_map,
+        probs=probs,
+        topk_idx=topk_idx,
+        topk_weights=topk_weights,
+        num_of_experts=num_of_experts,
+        num_of_experts_per_rank=num_of_experts_per_rank,
+        scaling_factor=scaling_factor,
+        num_permuted_tokens=num_permuted_tokens,
+        pad_multiple=pad_multiple,
+        non_blocking=non_blocking,
+        **({"fuse_permute_dispatch": fused} if fused else {}),
+    )
+
+
+def hybrid_ep_combine_leg(buffer, hidden, handle, *, probs=None, pad_multiple=None, fused=False):
+    '''
+    Issue one COMBINE-SHAPED HybridEP collective on ``buffer``, replaying ``handle``.
+
+    Args:
+        buffer (HybridEPBuffer):
+            The buffer ``handle``'s dispatch staged through; a plan is not portable between them.
+        hidden (torch.Tensor):
+            Input hidden states to combine.
+        handle (tuple):
+            The plan to replay, from a dispatch on this same buffer.
+        probs (Optional[torch.Tensor]):
+            Per expanded row, when the caller also wants the probability adjoint back.
+        fused (bool):
+            Ask HybridEP to fuse the unpermute into the combine; see the dispatch leg.
+
+    Returns:
+        tuple: ``(hidden, probs)``, HybridEP's own; ``probs`` is ``None`` when none went in.
+    '''
+    return buffer.combine_with_unpermute(
+        hidden=hidden,
+        probs=probs,
+        handle=handle,
+        pad_multiple=pad_multiple,
+        **({"fuse_unpermute_combine": fused} if fused else {}),
+    )
 
 
 class HybridEPDispatch(torch.autograd.Function):

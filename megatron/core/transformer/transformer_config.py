@@ -1025,6 +1025,25 @@ class TransformerConfig(ModelParallelConfig):
     """DEPRECATED: use moe_flex_dispatcher_num_sms. Number of SMs to use for HybridEP (None uses the
     default from DeepEP). If set, routed to moe_flex_dispatcher_num_sms in __post_init__."""
 
+    moe_ep_chunk_overlap: bool = field(
+        default=False, metadata={"argparse_meta": {"arg_names": ["--moe-ep-chunk-overlap"]}}
+    )
+    """[Experimental] Enable the token-chunked EP overlap path. When set,
+    the whole routed-expert region (dispatch -> FC1/activation/FC2 -> combine) is replaced by a
+    chunked two-stream schedule that overlaps the EP A2A with the expert GEMMs. Training only. 
+    Its communication-SM budget is moe_ep_chunk_overlap_num_comm_sms."""
+
+    moe_ep_chunk_overlap_num_comm_sms: int = field(
+        default=32,
+        metadata={"argparse_meta": {"arg_names": ["--moe-ep-chunk-overlap-num-comm-sms"]}},
+    )
+    """SMs the EP chunk overlap path reserves for communication."""
+
+    moe_ep_chunk_overlap_num_chunks: int = field(
+        default=4, metadata={"argparse_meta": {"arg_names": ["--moe-ep-chunk-overlap-num-chunks"]}}
+    )
+    """Number of source-token chunks the EP chunk overlap path splits each microbatch into."""
+
     moe_hybridep_num_blocks_permute: Optional[int] = None
     """Number of CUDA thread blocks for the permute part in HybridEP.
     When permute_fusion_into_hybridep is True, this sets the number
