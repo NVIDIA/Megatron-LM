@@ -10,6 +10,7 @@ import pytest
 import torch
 
 from megatron.training.distillation import cached_logits_loss
+from megatron.training.distillation import utils as distillation_utils
 from megatron.training.distillation.cached_logits_loss import (
     CachedLogitsKDLoss,
     LossFuncCallable,
@@ -19,6 +20,7 @@ from megatron.training.distillation.utils import (
     LOGPROBS_TAR_MEMBER_SUFFIX,
     META_TAR_MEMBER,
     LogprobsReshardPlan,
+    peek_first_logprobs_metadata,
     v2_pack_indices,
 )
 
@@ -209,6 +211,25 @@ def test_invalid_global_batch_divisibility_still_fails():
         LogprobsReshardPlan(mbs_save=1, dp_save=4, gbs_save=24, mbs_load=1, dp_load=5, gbs_load=24)
 
 
+def test_peek_first_logprobs_metadata_local_path_skips_collective(tmp_path, monkeypatch):
+    """Local paths must not enter the TP×DP×CP broadcast: CI runs unit tests under
+    a multi-rank ``torch.distributed`` launcher without initializing
+    ``parallel_state``, so an unconditional collective asserts there.  The
+    collective only exists to limit object-store traffic (mirrors
+    :func:`storage_glob_with_caching`)."""
+    _write_v2_cache(tmp_path, mbs=1, dp=2, gbs=4, iterations=1)
+
+    def _boom(*args, **kwargs):
+        raise AssertionError("_broadcast_without_pp must not be called for local paths")
+
+    monkeypatch.setattr(distillation_utils, "_broadcast_without_pp", _boom)
+
+    meta = peek_first_logprobs_metadata(str(tmp_path))
+    assert meta is not None
+    assert meta["saver"]["format_version"] == 2
+    assert meta["saver"]["dp_size_save"] == 2
+
+
 # ---------------------------------------------------------------------------
 # LogprobsReshardPlan: MBS mismatch (existing tests above only exercise mbs=1)
 # ---------------------------------------------------------------------------
@@ -337,6 +358,12 @@ def test_lossfunccallable_wraps_stopiteration_as_runtimeerror(monkeypatch):
 
 
 def test_teacher_logits_trimmed_to_student_seq_len(monkeypatch):
+    # The trim warning is gated on safe_get_rank() == 0 (one warning per job,
+    # not one per rank). CI runs this suite under a real 8-rank
+    # torch.distributed.run, so without pinning the rank here this test only
+    # passes on whichever process happens to be global rank 0.
+    monkeypatch.setattr(cached_logits_loss, "safe_get_rank", lambda: 0)
+
     loss = _bare_kd_loss([])
     loss._current_iteration = 5
     loss._current_values = [torch.randn(4, 1, 2)]
