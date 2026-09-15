@@ -1239,8 +1239,8 @@ def test_distributed_optimizer_reload_main_params_from_fused_mla_canonical_state
         # Checkpoint-style state dict: canonical keys from sharded_state_dict, all values 3.
         sharded_state_dict = layer.sharded_state_dict(prefix="decoder.layers.0.")
         state_dict = {
-            key: torch.full_like(sh_ten.data, 3.0)
-            for key, sh_ten in sharded_state_dict.items()
+            sh_ten.key: torch.full_like(sh_ten.data, 3.0)
+            for sh_ten in sharded_state_dict.values()
             if isinstance(sh_ten, ShardedTensor)
         }
         assert any(key.startswith("decoder.layers.0.input_layernorm.") for key in state_dict)
