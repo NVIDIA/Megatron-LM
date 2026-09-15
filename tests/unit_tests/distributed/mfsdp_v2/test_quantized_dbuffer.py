@@ -8,7 +8,10 @@ from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import Replicate
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.dbuffer import DBuffer
-from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.placement import BlockAtomic
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.placement import (
+    BlockAtomic,
+    Flat,
+)
 
 QuantizedDBuffer = pytest.importorskip(
     "megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.quantized_dbuffer",
@@ -111,3 +114,52 @@ def test_quantized_dbuffer_redistributes_every_plane(distributed_setup):
     assert gathered.placements == (Replicate(),)
     for actual, expected in zip(gathered.planes, source.planes):
         torch.testing.assert_close(actual.local_buffer, expected.local_buffer)
+
+
+def test_quantized_dbuffer_view_shares_every_plane(distributed_setup):
+    """A sharded view aliases exactly this rank's slice of each replicated plane."""
+    mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
+    source = QuantizedDBuffer(mesh, [Replicate()], [(128, 64), (32, 128)], distributed_setup.device)
+    for plane in source.planes:
+        plane.local_buffer.zero_()
+    assert source.view([Replicate()]) is source
+
+    view = source.view([BlockAtomic(32)])
+    assert view.view([BlockAtomic(32)]) is view
+    for index, (actual, original) in enumerate(zip(view.planes, source.planes)):
+        assert actual.placements == ((Flat(),) if index == 3 else (BlockAtomic(32),))
+        chunks = original.local_buffer.view(mesh.size(), -1)
+        expected = chunks[mesh.get_local_rank()]
+        assert actual.local_buffer.shape == expected.shape
+        assert actual.local_buffer.data_ptr() == expected.data_ptr()
+
+        actual.local_buffer.fill_(index + 1)
+        assert expected.eq(index + 1).all()
+        for rank in range(mesh.size()):
+            if rank != mesh.get_local_rank():
+                assert chunks[rank].eq(0).all()
+
+
+@pytest.mark.parametrize("use_out", [False, True])
+def test_quantized_dbuffer_allgathers_every_plane(distributed_setup, use_out):
+    """All-gather preserves rank order in every plane, with or without an output buffer."""
+    if distributed_setup.world_size < 2:
+        pytest.skip("QuantizedDBuffer all-gather requires at least two ranks.")
+    mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
+    shapes = [(128, 64), (32, 128)]
+    source = QuantizedDBuffer(mesh, [BlockAtomic(32)], shapes, distributed_setup.device)
+    for index, plane in enumerate(source.planes):
+        plane.local_buffer.fill_(index * mesh.size() + mesh.get_local_rank())
+    destination = (
+        QuantizedDBuffer(mesh, [Replicate()], shapes, distributed_setup.device) if use_out else None
+    )
+
+    result = source.allgather(0, out=destination)
+
+    if use_out:
+        assert result is destination
+    for index, plane in enumerate(result.planes):
+        assert plane.placements == (Replicate(),)
+        chunks = plane.local_buffer.view(mesh.size(), -1)
+        for rank in range(mesh.size()):
+            assert chunks[rank].eq(index * mesh.size() + rank).all()
