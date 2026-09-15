@@ -274,6 +274,4 @@ def test_te_gated_delta_net_attention_replays():
     def fn(q, k, v, g, beta):
         return module(q, k, v, g, beta, output_final_state=True, use_qk_l2norm_in_kernel=True)
 
-    assert_replays_bit_exact(
-        fn, (q, k, v, g, beta), replays=4, what="TEGatedDeltaNetAttention"
-    )
+    assert_replays_bit_exact(fn, (q, k, v, g, beta), replays=4, what="TEGatedDeltaNetAttention")
