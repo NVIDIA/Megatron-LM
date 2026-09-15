@@ -794,10 +794,21 @@ def _run_compiled_launch(
 ) -> None:
     """Compile/cache a CuTe launch function and invoke it on the current stream."""
     static_arg_set = set(static_arg_indices)
+    # Layouts are dynamic and sizes are runtime scalars. Packed-batch shapes
+    # must not create a new compile key for every microbatch.
+    for tensor in tensor_args:
+        if tensor.ndim != 0 and tensor.stride(-1) != 1:
+            raise RuntimeError(
+                f"CSA THD CuTe kernel {launch_fn.__name__} requires last-dim-contiguous "
+                f"tensors, got shape {tuple(tensor.shape)} stride {tuple(tensor.stride())}."
+            )
     key = (
         launch_fn.__name__,
+        # CuTe retains broadcast (zero) strides as static even in a dynamic
+        # layout. Expanded and non-broadcast tensors need separate launches.
         tuple(
-            (tensor.dtype, tuple(tensor.shape), tuple(tensor.stride())) for tensor in tensor_args
+            (tensor.dtype, tensor.ndim, tuple(stride == 0 for stride in tensor.stride()))
+            for tensor in tensor_args
         ),
         tuple((i, scalar_args[i]) for i in static_arg_indices),
     )

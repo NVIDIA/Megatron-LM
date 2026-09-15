@@ -1367,6 +1367,16 @@ def _validate_kv_reconstruction_parts(
         )
 
 
+def _align_topk_width(topk_idxs: Tensor) -> Tensor:
+    """Pad invalid slots to the FlashMLA alignment to stabilize backward compile keys."""
+    topk = topk_idxs.shape[-1]
+    align = get_flash_mla_topk_alignment()
+    padded = (topk + align - 1) // align * align
+    if padded == topk:
+        return topk_idxs
+    return torch.nn.functional.pad(topk_idxs, (0, padded - topk), value=-1)
+
+
 class CSASparseAttnFunc(torch.autograd.Function):
     """Sparse attention fwd + bwd on flat tensors.
 
@@ -1387,6 +1397,9 @@ class CSASparseAttnFunc(torch.autograd.Function):
         kv_reconstruction_parts: Tuple[Tensor, Tensor, Tensor] | None = None,
     ) -> Tuple[Tensor, Tensor, Optional[Tensor]]:
         """Run FlashMLA sparse-attention forward and save tensors for backward."""
+        # cuDNN backward keys its compile cache on the saved top-k width. Align
+        # at the autograd boundary so both kernels use the same width buckets.
+        topk_idxs = _align_topk_width(topk_idxs)
         out, lse, lse_indexer = _csa_fwd_flash_mla(
             q,
             kv,

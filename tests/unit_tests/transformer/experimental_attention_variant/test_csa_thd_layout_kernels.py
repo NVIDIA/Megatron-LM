@@ -501,6 +501,47 @@ def test_build_attention_indices_matches_native():
     assert torch.equal(padded[1][8:10], torch.tensor([1, 1], dtype=torch.int32, device="cuda"))
 
 
+def test_attention_indices_cache_reuses_shapes_and_separates_broadcasts(monkeypatch):
+    _require_cute_cuda()
+    monkeypatch.setattr(thd_layout_kernels, "_COMPILED_LAUNCH_CACHE", {})
+    compile_calls = []
+    original_compile = thd_layout_kernels.cute.compile
+
+    def record_compile(*args, **kwargs):
+        compile_calls.append(args[0])
+        return original_compile(*args, **kwargs)
+
+    monkeypatch.setattr(thd_layout_kernels.cute, "compile", record_compile)
+    for lengths, width in [([32, 32], 8), ([16, 32, 48], 12), ([64, 64], 16)]:
+        cu = torch.tensor(
+            [0] + torch.tensor(lengths).cumsum(0).tolist(), dtype=torch.int32, device="cuda"
+        )
+        cu_comp = _compressed_cu_seqlens(cu, 4)
+        mapping = torch.arange(int(cu_comp[-1]), dtype=torch.int32, device="cuda")
+        rows = sum(lengths)
+        expanded = torch.arange(width, dtype=torch.int32, device="cuda").expand(rows, -1)
+        for logical_ids in (expanded, expanded.contiguous()):
+            actual = thd_layout_kernels.build_attention_indices(
+                cu,
+                0,
+                rows,
+                0,
+                16,
+                4,
+                width,
+                logical_ids,
+                cu_seqlens_compressed=cu_comp,
+                seq_to_rank_row=mapping,
+                compressed_rows=mapping.numel(),
+            )
+            expected = _native_attention_indices(
+                cu, cu_comp, 0, rows, 0, 16, 4, width, mapping, rows, logical_ids
+            )
+            assert torch.equal(actual[0], expected[0])
+            assert torch.equal(actual[1], expected[1])
+        assert len(compile_calls) == 2
+
+
 def test_build_attention_indices_writes_aligned_width():
     _require_cute_cuda()
     cu = torch.tensor([0, 8], dtype=torch.int32, device="cuda")
