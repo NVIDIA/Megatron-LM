@@ -2565,6 +2565,13 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             DP = torch_FSDP
         elif args.use_megatron_fsdp:
             DP = FullyShardedDataParallel
+            if args.overlap_moe_expert_parallel_comm and is_hybrid_model(args):
+                # Grouped HybridStack patterns (e.g. ``[M*E]``) make each bracket group the
+                # FSDP unit for the EP-overlap schedule plan; the adapter's unit filter
+                # excludes the outer decoder stack so only the groups become units.
+                from megatron.core.models.hybrid.hybrid_block import HybridStack
+
+                DP = functools.partial(FullyShardedDataParallel, fsdp_unit_modules=[HybridStack])
         else:
             DP = DDP
 

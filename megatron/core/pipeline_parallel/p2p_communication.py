@@ -414,9 +414,14 @@ class P2PCommunicator:
                 req.wait()
             reqs = None
 
-        if config.batch_p2p_comm and config.batch_p2p_sync:
+        if (
+            config.batch_p2p_comm
+            and config.batch_p2p_sync
+            and not torch.cuda.is_current_stream_capturing()
+        ):
             # To protect against race condition when using batch_isend_irecv().
-            # User should assert that we have a modern enough PyTorch to not need this
+            # User should assert that we have a modern enough PyTorch to not need this.
+            # Skipped under CUDA graph capture (illegal during stream capture + unnecessary).
             torch.cuda.synchronize()
 
         return tensor_recv_prev, tensor_recv_next, reqs

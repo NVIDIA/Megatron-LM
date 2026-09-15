@@ -22,6 +22,9 @@ class Symbols:
     MOE = 'E'
     PIPE = '|'
     MTP_SEPARATOR = "/"
+    # Bracketed groups (e.g. ``[M*E]``) build one nested HybridStack logical layer.
+    GROUP_START = "["
+    GROUP_END = "]"
     LAYER_CONFIG_MAP = {
         MAMBA: MambaLayerConfig,
         GDN: GDNLayerConfig,
