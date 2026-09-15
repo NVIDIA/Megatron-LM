@@ -64,6 +64,12 @@ capacity still grew after warmup. Normal-backward smoke tests at `2a2f98a03`
 loss differences were zero and sampled gradient differences were at most
 1.20e-7. The n=2 smoke repeated at `ba1709e5b` with the same precision bounds;
 allocated peak increased 10.43–10.81%. Smoke establishes no formal speedup or parity.
+Separate full-gradient diagnostics at `ba1709e5b` used 1 layer, 32768 local tokens,
+1 microbatch, EP8/top-k8, n=2, full recomputation, and no optimizer update.
+The paired run compared 1,245,452,544 finalized, optimizer-owned gradient elements
+across 280 shards; maximum absolute error was 2.39e-7. The router weight's
+relative L2 error was 0.2871%. This is measured disagreement, not accepted parity;
+no non-bitwise tolerance has been approved, and 48-layer full gradients remain unvalidated.
 Final-source n=3/4 GPU qualification, optimizer updates, and isolated OP
 activation savings remain incomplete. Older combined head/CE measurements
 are not isolated ChunkedEP gains.
