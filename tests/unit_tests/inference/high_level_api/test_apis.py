@@ -3,14 +3,14 @@
 """Unit tests for the high-level inference APIs."""
 
 import asyncio
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 import megatron.core.inference.apis._llm_base as base_mod
 import megatron.core.inference.apis.async_llm as async_llm_mod
 import megatron.core.inference.apis.llm as llm_mod
-from megatron.core.inference.apis._llm_base import _MegatronLLMBase
+from megatron.core.inference.apis._llm_base import _EventLoopManager, _MegatronLLMBase
 from megatron.core.inference.apis.async_llm import MegatronAsyncLLM
 from megatron.core.inference.apis.llm import MegatronLLM
 from megatron.core.inference.apis.serve_config import ServeConfig
@@ -64,14 +64,42 @@ class TestConstructorValidation:
     """Constructor-time validation for both ``MegatronLLM`` and ``MegatronAsyncLLM``."""
 
     @pytest.mark.parametrize(
-        "extra_kwargs", [{"coordinator_host": "x"}, {"coordinator_port": 5000}]
+        "extra_kwargs",
+        [
+            {"coordinator_host": "x"},
+            {"coordinator_port": 5000},
+            {"loop_factory": asyncio.SelectorEventLoop},
+        ],
     )
-    def test_coordinator_host_or_port_without_use_coordinator_raises(
+    def test_coordinator_only_kwargs_without_use_coordinator_raise(
         self, mock_pipeline, fake_model_and_tokenizer, extra_kwargs
     ):
         model, tok = fake_model_and_tokenizer
-        with pytest.raises(ValueError, match="coordinator_host/port require use_coordinator=True"):
+        with pytest.raises(ValueError, match="use_coordinator=True"):
             MegatronLLM(model=model, tokenizer=tok, use_coordinator=False, **extra_kwargs)
+
+    def test_loop_factory_reaches_event_loop_manager(
+        self, mock_pipeline, fake_model_and_tokenizer, monkeypatch
+    ):
+        """The constructor threads ``loop_factory`` through to ``_EventLoopManager``.
+        The manager's own use of the factory is covered in test_event_loop_manager.py."""
+        built = []
+
+        def factory():
+            loop = asyncio.SelectorEventLoop()
+            built.append(loop)
+            return loop
+
+        runtime = MagicMock()
+        runtime.setup = AsyncMock()
+        monkeypatch.setattr(base_mod, "_CoordinatorRuntime", MagicMock(return_value=runtime))
+        monkeypatch.setattr(base_mod.dist, "get_rank", lambda: 0)
+        model, tok = fake_model_and_tokenizer
+        llm = MegatronLLM(model=model, tokenizer=tok, loop_factory=factory)
+        try:
+            assert llm._loop_manager.loop is built[0]
+        finally:
+            llm._loop_manager.stop()
 
     def test_megatron_llm_direct_mode_succeeds(self, mock_pipeline, fake_model_and_tokenizer):
         model, tokenizer = fake_model_and_tokenizer
@@ -119,16 +147,60 @@ class TestLifecycleGuards:
         with pytest.raises(RuntimeError, match="use_coordinator=True"):
             getattr(llm, method)()
 
+    @pytest.mark.parametrize("method", ["shutdown", "close"])
     def test_sync_shutdown_is_noop_and_idempotent_in_direct_mode(
-        self, mock_pipeline, fake_model_and_tokenizer
+        self, mock_pipeline, fake_model_and_tokenizer, method
     ):
         model, tok = fake_model_and_tokenizer
         llm = MegatronLLM(model=model, tokenizer=tok, use_coordinator=False)
-        llm.shutdown()
+        getattr(llm, method)()
         assert llm._shutdown_called is True
-        llm.shutdown()  # second call is a no-op
+        getattr(llm, method)()  # second call is a no-op
         assert llm._shutdown_called is True
         llm.wait_for_shutdown()  # also a no-op
+
+    def test_close_from_foreign_running_loop_tears_down_runtime(self):
+        """``close()`` is the sync teardown for a caller whose own event loop is
+        running (e.g. a Ray asyncio actor): ``asyncio.run(llm.shutdown())`` is
+        illegal there, and hosting ``shutdown()`` on the runtime loop would make
+        it join its own thread. The STOP handshake runs on the runtime loop and
+        the runtime thread is joined from the caller's thread; the async
+        ``shutdown()`` afterwards is a no-op through the shared guard.
+
+        The one loop neither ``close()`` nor the async ``shutdown()`` may be
+        called from is the runtime loop itself; both are rejected before any
+        state changes, so the object stays fully closable."""
+        llm = _make_worker_instance(MegatronAsyncLLM)
+        mgr = _EventLoopManager()
+        mgr.start()
+        llm._loop_manager = mgr
+
+        async def engine_loop_task():
+            return None  # worker ranks only await the engine loop's exit
+
+        llm._engine.engine_loop_task = engine_loop_task()
+
+        async def close_on_runtime_loop():
+            llm.close()
+
+        async def shutdown_on_runtime_loop():
+            await llm.shutdown()
+
+        for misuse in (close_on_runtime_loop, shutdown_on_runtime_loop):
+            with pytest.raises(RuntimeError, match="background loop"):
+                mgr.submit(misuse()).result()
+            assert llm._shutdown_called is False
+            assert mgr._thread.is_alive()
+
+        async def caller_with_running_loop():
+            llm.close()
+
+        asyncio.run(caller_with_running_loop())
+        assert llm._shutdown_called is True
+        assert not mgr._thread.is_alive()
+
+        asyncio.run(llm.shutdown())  # no-op: already torn down
+        llm.close()  # idempotent
 
     def test_sync_generate_raises_on_worker_rank(self):
         llm = _make_worker_instance(MegatronLLM)
@@ -198,6 +270,7 @@ class TestLifecycleGuards:
                 default_top_p=0.95,
                 default_top_k=20,
                 eval_mode=True,
+                loop_factory=asyncio.SelectorEventLoop,
             ),
             blocking=False,
         )
@@ -209,6 +282,7 @@ class TestLifecycleGuards:
         assert started["default_top_p"] == 0.95
         assert started["default_top_k"] == 20
         assert started["eval_mode"] is True
+        assert started["loop_factory"] is asyncio.SelectorEventLoop
 
     @pytest.mark.asyncio
     async def test_async_serve_primary_rank_starts_frontend(self, monkeypatch):
@@ -237,6 +311,7 @@ class TestLifecycleGuards:
                 default_top_p=0.95,
                 default_top_k=20,
                 eval_mode=True,
+                loop_factory=asyncio.SelectorEventLoop,
             ),
             blocking=False,
         )
@@ -248,6 +323,7 @@ class TestLifecycleGuards:
         assert started["default_top_p"] == 0.95
         assert started["default_top_k"] == 20
         assert started["eval_mode"] is True
+        assert started["loop_factory"] is asyncio.SelectorEventLoop
 
 
 class TestNormalizePrompts:

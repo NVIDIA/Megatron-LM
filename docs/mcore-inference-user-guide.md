@@ -181,7 +181,7 @@ from megatron.core.inference.apis import (
 | Class | Use it when | Key methods |
 |---|---|---|
 | **`MegatronLLM`** | Synchronous offline batch generation (the common RL-rollout case). | `generate`, `pause`/`unpause`/`suspend`/`resume`, `serve(serve_config)`, `shutdown`/`wait_for_shutdown`; context manager (`with ... as llm:`) |
-| **`MegatronAsyncLLM`** | Asyncio-native generation, and HTTP serving from inside an existing event loop. | `async generate`, async lifecycle controls, `serve(serve_config)`; async context manager (`async with ... as llm:`) |
+| **`MegatronAsyncLLM`** | Asyncio-native generation, and HTTP serving from inside an existing event loop. | `async generate`, async lifecycle controls, `serve(serve_config)`, `close()` (sync teardown); async context manager (`async with ... as llm:`) |
 
 Both expose the underlying building blocks as read-only properties. Use these for [advanced customization](#customizing-the-pipeline):
 
@@ -196,8 +196,12 @@ async surface (for example `InferenceClient` streaming) without standing up your
 own loop.
 
 Constructor arguments worth knowing: `use_coordinator` (**defaults to `True`**),
-`coordinator_host` / `coordinator_port`, and `inference_wrapper_cls` (defaults to
-`GPTInferenceWrapper`; pass `VLMInferenceWrapper` for vision-language models).
+`coordinator_host` / `coordinator_port`, `inference_wrapper_cls` (defaults to
+`GPTInferenceWrapper`; pass `VLMInferenceWrapper` for vision-language models),
+and `loop_factory` (a callable such as `asyncio.SelectorEventLoop` that builds the
+background runtime loop; `None` uses `asyncio.new_event_loop()` under the
+process-wide policy). Set `loop_factory` when the host process installs its own
+policy, as Ray does with uvloop.
 
 **Caller responsibilities (before construction):**
 
@@ -474,9 +478,15 @@ for the RL loop where you alternate generation and training:
   states). Call `pause()` before `suspend()`.
 - `shutdown()` / `wait_for_shutdown()` — tear down or block until the engine
   loop terminates.
+- `close()` — synchronous teardown, on both classes. Use it where `shutdown()`
+  cannot be awaited: a thread whose own event loop is already running (for
+  example a Ray asyncio actor) can neither `asyncio.run(llm.shutdown())` nor
+  host the coroutine on the runtime loop. Callable from any thread except the
+  runtime loop itself.
 
-These raise `RuntimeError` in direct mode. The context-manager exit calls
-`shutdown()` for you.
+`pause()` / `unpause()` / `suspend()` / `resume()` raise `RuntimeError` in direct
+mode; `shutdown()`, `close()` and `wait_for_shutdown()` are no-ops there. The
+context-manager exit calls `shutdown()` for you.
 
 `suspend()` / `resume()` are also the hook for *weight refit or resharding*
 between training and inference: suspend the engine (optionally offloading the
@@ -612,6 +622,10 @@ socket to use instead of binding `host:port`).
 (`0`) provide sampling defaults for HTTP requests that omit those fields.
 `eval_mode` (`False`) switches the frontend to evaluation-oriented response
 defaults, avoiding prompt-token transmission unless a request opts in.
+`loop_factory` (`None`) builds each HTTP replica's event loop; pass an importable
+callable such as `asyncio.SelectorEventLoop` to pin the stdlib loop instead of
+inheriting the process-wide policy (needed under Ray, which installs uvloop).
+This is separate from the constructor's `loop_factory`, which pins the runtime loop.
 
 The same call works from a synchronous launcher:
 
