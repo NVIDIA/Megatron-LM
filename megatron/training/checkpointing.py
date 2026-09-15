@@ -563,6 +563,7 @@ def _build_sharded_state_dict_metadata(
         else:
             metadata['distrib_optim_sharding_type'] = 'dp_reshardable'
 
+    metadata['gdn_in_proj_bias_split'] = True
     metadata['singleton_local_shards'] = False
     metadata['chained_optim_avoid_prefix'] = True
     # Add dp_cp_group to metadata. If not provided, fallback to global parallel state.
@@ -570,6 +571,22 @@ def _build_sharded_state_dict_metadata(
         dp_cp_group = mpu.get_data_parallel_group(with_context_parallel=True)
     metadata['dp_cp_group'] = dp_cp_group
     return metadata
+
+
+def _load_gdn_bias_checkpoint_metadata(state_dict: dict) -> dict:
+    """Select the saved GDN bias layout for global and local checkpoint requests."""
+    saved_metadata = dist_checkpointing.load_content_metadata(preloaded_state_dict=state_dict) or {}
+    if saved_metadata.get('gdn_in_proj_bias_split', False):
+        return {'gdn_in_proj_bias_split': True}
+    # Unknown source TP must not inherit the general loader's default of 1:
+    # the legacy bias layout depends on the actual save-time TP degree.
+    return {
+        'gdn_in_proj_bias_split': False,
+        'gdn_legacy_in_proj_bias_tp_size': saved_metadata.get(
+            'gdn_legacy_in_proj_bias_tp_size',
+            getattr(state_dict.get('args'), 'tensor_model_parallel_size', None),
+        ),
+    }
 
 
 def save_grads(save_dir, state_dict, iteration, grad_label):
@@ -1002,6 +1019,10 @@ def save_checkpoint(
                     and 'local_checkpoint_cache' in checkpointing_context
                 ):
                     cached_metadata = checkpointing_context['local_checkpoint_cache']
+                # Local checkpoints need the saved model layout when rebuilding load requests.
+                state_dict['content_metadata'] = _clean_metadata_for_serialization(
+                    sharded_sd_metadata
+                )
                 state_dict_for_save, cacheable_metadata = MCoreTensorAwareStateDict.from_state_dict(
                     state_dict,
                     algo=algo,
@@ -2705,6 +2726,7 @@ def load_checkpoint(
         if sharded_sd_metadata is None:
             sharded_sd_metadata = {}
         sharded_sd_metadata['dp_cp_group'] = dp_cp_group
+        sharded_sd_metadata.update(_load_gdn_bias_checkpoint_metadata(state_dict))
 
         optim_sd_kwargs = dict(metadata=sharded_sd_metadata, is_loading=True)
         model_sd_kwargs = dict(metadata=sharded_sd_metadata)

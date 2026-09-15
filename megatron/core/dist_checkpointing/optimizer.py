@@ -5,6 +5,7 @@ for model parameters.
 """
 
 import logging
+import math
 from copy import deepcopy
 from dataclasses import replace
 from typing import Dict, Iterable, Tuple, Union
@@ -18,6 +19,7 @@ from megatron.core.utils import log_single_rank, to_local_if_dtensor
 from .dict_utils import nested_values
 from .mapping import (
     LocalNonpersistentObject,
+    ReplicaId,
     ShardedStateDict,
     ShardedTensor,
     ShardedTensorFactory,
@@ -106,6 +108,120 @@ def make_sharded_optimizer_tensor(
     )
     sh_ten.validate_metadata_integrity()
     return sh_ten
+
+
+def make_sharded_optimizer_fragment(
+    model_param: ShardedTensor,
+    optim_param: torch.Tensor,
+    prefix: str,
+    flattened_range: slice,
+    *,
+    replica_id: ReplicaId | None = None,
+    physical_numel: int | None = None,
+) -> ShardedTensorFactory:
+    """Map a flat optimizer fragment into regular chunks of a model tensor.
+
+    A contiguous flat interval may cross several rows or higher-dimensional slabs.
+    Split its boundaries into rectangular shards while retaining the model's keys and
+    global coordinates. The emitted ShardedTensors never use ``flattened_range``.
+
+    Args:
+        model_param: Logical model checkpoint metadata, including any prepended axes.
+        optim_param: Optimizer tensor containing exactly ``flattened_range``.
+        prefix: Optimizer state prefix prepended to the model checkpoint key.
+        flattened_range: Explicit start and stop within the physical local parameter.
+        replica_id: Optimizer replica identifier; defaults to the model's identifier.
+        physical_numel: Physical parameter size when validated trailing padding extends
+            beyond the logical model tensor. Padding is omitted and restored as zeros.
+
+    Returns:
+        A factory whose merge restores the input optimizer fragment's shape and dtype.
+
+    Raises:
+        ValueError: The physical size cannot contain the logical model tensor.
+    """
+    template = model_param.without_data()
+    shape = template.local_shape
+    logical_numel = math.prod(shape)
+    if physical_numel is None:
+        physical_numel = logical_numel
+    if physical_numel < logical_numel:
+        raise ValueError('Physical parameter size is smaller than its logical checkpoint tensor')
+    strides = tuple(math.prod(shape[axis + 1 :]) for axis in range(len(shape)))
+    if replica_id is None:
+        replica_id = template.replica_id
+
+    @torch.no_grad()
+    def build(key, data, replica_id, flattened_range):
+        if flattened_range is None:
+            start, stop = 0, physical_numel
+        else:
+            start, stop = flattened_range.start, flattened_range.stop
+            if (
+                flattened_range.step not in (None, 1)
+                or start is None
+                or stop is None
+                or not 0 <= start <= stop <= physical_numel
+            ):
+                raise ValueError(f'Invalid optimizer fragment: {flattened_range}')
+        if data.numel() != stop - start:
+            raise ValueError('Optimizer data size does not match its physical parameter slice')
+        flat = data.detach().reshape(-1)
+        cursor, logical_stop = start, min(stop, logical_numel)
+        chunks = []
+        while cursor < logical_stop:
+            coordinates = tuple((cursor // stride) % size for stride, size in zip(strides, shape))
+            chunk_shape = ()
+            count = 1
+            for axis, stride in enumerate(strides):
+                if any(coordinates[axis + 1 :]):
+                    continue
+                extent = min(shape[axis] - coordinates[axis], (logical_stop - cursor) // stride)
+                if extent:
+                    chunk_shape = (1,) * axis + (extent,) + shape[axis + 1 :]
+                    count = extent * stride
+                    break
+            offset = list(template.global_offset)
+            for axis, coordinate in enumerate(coordinates, template.prepend_axis_num):
+                offset[axis] += coordinate
+            # Expose prepended singleton dimensions directly to the DCP storage adapter.
+            chunk_shape = (1,) * template.prepend_axis_num + chunk_shape
+            chunk = flat[cursor - start : cursor - start + count].view(chunk_shape)
+            chunks.append(
+                replace(
+                    template,
+                    key=key,
+                    data=chunk,
+                    dtype=data.dtype,
+                    local_shape=chunk_shape,
+                    global_offset=tuple(offset),
+                    axis_fragmentations=None,
+                    prepend_axis_num=0,
+                    flattened_range=None,
+                    replica_id=replica_id,
+                )
+            )
+            cursor += count
+        saved_numel = max(0, logical_stop - start)
+        return {
+            'chunks': chunks,
+            'layout': LocalNonpersistentObject(
+                (tuple(data.shape), data.numel() - saved_numel, data.new_empty(0))
+            ),
+        }
+
+    @torch.no_grad()
+    def merge(state):
+        output_shape, padding, prototype = state['layout']
+        chunks = state['chunks']
+        flat = torch.cat([chunk.reshape(-1) for chunk in chunks]) if chunks else prototype
+        if padding:
+            flat = torch.cat((flat, flat.new_zeros(padding)))
+        return flat.reshape(output_shape)
+
+    return ShardedTensorFactory(
+        f'{prefix}.{template.key}', optim_param, build, merge, replica_id, flattened_range
+    )
 
 
 def optim_state_to_sharding_state(
