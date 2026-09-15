@@ -1806,19 +1806,33 @@ def get_data_parallel_group(
     return group
 
 
-def get_data_parallel_group_gloo(with_context_parallel=False, partial_data_parallel=False):
-    """Get the Gloo data-parallel group the caller rank belongs to."""
+def get_data_parallel_group_gloo(
+    with_context_parallel=False, partial_data_parallel=False, check_initialized=True
+):
+    """Get the Gloo data-parallel group the caller rank belongs to.
+
+    Args:
+        check_initialized: When False, return None instead of asserting if the gloo group was
+            never created (``initialize_model_parallel(create_gloo_process_groups=False)``).
+            Needed so a ProcessGroupCollection can be materialised in gloo-less jobs.
+    """
     if with_context_parallel:
         if partial_data_parallel:
+            if not check_initialized and _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_GLOO is None:
+                return None
             assert (
                 _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_GLOO is not None
             ), "Intra partial data parallel group is not initialized"
             return _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_GLOO
+        if not check_initialized and _DATA_PARALLEL_GROUP_WITH_CP_GLOO is None:
+            return None
         assert (
             _DATA_PARALLEL_GROUP_WITH_CP_GLOO is not None
         ), "data parallel group-gloo with context parallel combined is not initialized"
         return _DATA_PARALLEL_GROUP_WITH_CP_GLOO
     else:
+        if not check_initialized and _DATA_PARALLEL_GROUP_GLOO is None:
+            return None
         assert _DATA_PARALLEL_GROUP_GLOO is not None, "data parallel group-gloo is not initialized"
         assert partial_data_parallel == False, "Partial DP for Optimizer needs to include CP"
         return _DATA_PARALLEL_GROUP_GLOO
@@ -2410,14 +2424,23 @@ def get_expert_data_parallel_group(
     return group
 
 
-def get_expert_data_parallel_group_gloo(partial_expert_data_parallel=False):
-    """Get expert data parallel group-gloo."""
+def get_expert_data_parallel_group_gloo(partial_expert_data_parallel=False, check_initialized=True):
+    """Get expert data parallel group-gloo.
+
+    Args:
+        check_initialized: When False, return None instead of asserting if the gloo group was
+            never created. See get_data_parallel_group_gloo.
+    """
     if partial_expert_data_parallel:
+        if not check_initialized and _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_GLOO is None:
+            return None
         assert (
             _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_GLOO is not None
         ), "Intra partial expert data parallel group-gloo is not initialized"
         return _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_GLOO
     else:
+        if not check_initialized and _EXPERT_DATA_PARALLEL_GROUP_GLOO is None:
+            return None
         assert (
             _EXPERT_DATA_PARALLEL_GROUP_GLOO is not None
         ), "Expert data parallel group-gloo is not initialized"
