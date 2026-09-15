@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import contextlib
 from functools import partial
@@ -1182,7 +1182,7 @@ def forward_backward_pipelining_with_interleaving(
 
     model_type = get_model_type(model[0])
 
-    tensor_shape = [seq_length, micro_batch_size, config.hidden_size]
+    tensor_shape = [seq_length, micro_batch_size, _get_pipeline_hidden_size(config)]
     tensor_shape[0] = tensor_shape[0] // cp_group.size()
     if config.sequence_parallel:
         tensor_shape[0] = tensor_shape[0] // tp_group.size()
@@ -2113,6 +2113,19 @@ def forward_backward_pipelining_with_interleaving(
     return forward_data_store
 
 
+def _get_pipeline_hidden_size(config) -> int:
+    """Return the residual width carried across every logical pipeline boundary.
+
+    mHC expands at pre_process and contracts at post_process. All communicating
+    stages therefore carry every residual stream, including the last physical
+    rank sending to the next virtual chunk on the first physical rank.
+    """
+    hidden_size = config.hidden_size
+    if config.pipeline_model_parallel_size > 1 and getattr(config, "enable_mhc_connections", False):
+        hidden_size *= config.mhc_num_residual_streams
+    return hidden_size
+
+
 def get_tensor_shapes(
     *,
     seq_length: int,
@@ -2141,7 +2154,9 @@ def get_tensor_shapes(
     if config.sequence_parallel:
         effective_seq_length = effective_seq_length // tp_group.size()
 
-    tensor_shapes.append((effective_seq_length, micro_batch_size, config.hidden_size))
+    tensor_shapes.append(
+        (effective_seq_length, micro_batch_size, _get_pipeline_hidden_size(config))
+    )
     return tensor_shapes
 
 
