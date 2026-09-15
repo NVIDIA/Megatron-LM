@@ -104,7 +104,7 @@ dev = [
     "av",
     "Pillow",
     "flashinfer-python>=0.5.0,<0.7.0",
-    "nvidia-cudnn-frontend[cutedsl]==1.26.0",
+    "nvidia-cudnn-frontend[cutedsl]==1.27.0",
     "wget",
     "onnxscript",
     "fastapi~=0.50",                                    # Forcing a little bit more recent version of fastapi to be compatible with pydantic 2.0
@@ -119,6 +119,7 @@ dev = [
 ]
 
 inference = [
+    "flash-attn-4[cu13]>=4.0.0b20",
     "torch-memory-saver",
 ]
 
@@ -206,12 +207,43 @@ link-mode = "copy"
 # For instance, when installing into a PyTorch base image, we don't want to install torch,
 # torchvision, and triton.
 override-dependencies = [
+    # Use the newest TVM FFI supported by both FlashAttention 4 and Mamba.
+    "apache-tvm-ffi==0.1.12",
+    "tilelang==0.1.13",
+    "nvidia-cutlass-dsl[cu13]>=4.7.1,<4.8",
+    "quack-kernels>=0.6.4",
     "torch; sys_platform == 'never'",
     "torchvision; sys_platform == 'never'",
     "triton; sys_platform == 'never'",
     # TorchX 0.7.0 caps urllib3 below 1.27; require the fix for GHSA-38jv-5279-wg99.
     "urllib3>=2.6.3",
 ]
+[[tool.uv.dependency-metadata]]
+# DeepGEMM has no Python dependencies; avoid importing torch while resolving its VCS metadata.
+name = "deep-gemm"
+version = "2.5.0+local"
+requires-dist = []
+
+# Mamba imports torch while preparing metadata. Mirror upstream commit ed6ce09e's metadata-only
+# TVM FFI fix so uv lock stays independent of the active build environment without changing the reviewed VCS tree.
+# TileLang 0.1.13 is the first release
+# whose vendored TVM supports apache-tvm-ffi 0.1.12.
+[[tool.uv.dependency-metadata]]
+name = "mamba-ssm"
+version = "2.3.2.post1"
+requires-dist = [
+    "torch",
+    "tilelang==0.1.8",
+    "apache-tvm-ffi<=0.1.12",
+    "quack-kernels>=0.3.4",
+    "triton>=3.5.0",
+    "ninja",
+    "einops",
+    "transformers",
+    "packaging",
+    "setuptools>=61.0.0",
+]
+
 
 [[tool.uv.dependency-metadata]]
 name = "flash-mla"
