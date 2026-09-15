@@ -436,6 +436,16 @@ class TrainingTensorMetricObserver:
             self._prepared_forward_values = None
             self._prepared_forward_iteration = None
 
+    def has_due_metrics(self, iteration: int | None) -> bool:
+        """Whether any configured metric runs on ``iteration``.
+
+        Lets callers exempt the (potentially long, collective) metric commit from step-level
+        hang-detection timeouts only on the iterations where it actually runs.
+        """
+        if iteration is None:
+            return False
+        return bool(self._due_metrics(iteration))
+
     def _due_metrics(self, iteration: int) -> tuple[ScheduledMetric, ...]:
         """Return metrics due on ``iteration`` in configuration order."""
         return tuple(
