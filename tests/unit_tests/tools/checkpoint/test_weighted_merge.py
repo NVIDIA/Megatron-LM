@@ -763,6 +763,33 @@ def test_metadata_same_layout_uses_output_checkpoint_progress_state(
         assert common_state["args"].consumed_train_samples == 256_000
 
 
+def test_metadata_same_layout_supports_current_common_state_storage(
+    tmp_path_dist_ckpt, process_group
+):
+    with TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_common_state_layout") as checkpoint:
+        _write_checkpoint(checkpoint, 1.0, iteration=1000)
+
+        metadata = torch_dcp.FileSystemReader(checkpoint).read_metadata()
+        embedded_common_keys = {
+            str(key)
+            for key in metadata.state_dict_metadata
+            if weighted_merge_module._metadata_same_layout_is_common_state_key(str(key))
+        }
+        if (checkpoint / "common.pt").exists():
+            assert not embedded_common_keys
+        else:
+            assert embedded_common_keys == {"common_state/shard_0_1"}
+
+        snapshot = weighted_merge_module._read_public_dcp_metadata(
+            checkpoint, model_key_prefixes=weighted_merge_module.METADATA_SAME_LAYOUT_MODEL_PREFIXES
+        )
+        assert {"model.bias", "model.weight"}.issubset(snapshot.tensor_metadata)
+        assert not any(
+            weighted_merge_module._metadata_same_layout_is_common_state_key(key)
+            for key in snapshot.tensor_metadata
+        )
+
+
 def test_metadata_same_layout_uses_explicit_common_state_checkpoint(
     tmp_path_dist_ckpt, process_group
 ):
@@ -777,8 +804,11 @@ def test_metadata_same_layout_uses_explicit_common_state_checkpoint(
         _write_checkpoint(
             common_source, 9.0, iteration=2000, consumed_train_samples=256_000, args_iteration=0
         )
-        (ckpt_a / "common.pt").unlink()
-        (ckpt_b / "common.pt").unlink()
+        # Legacy checkpoints use common.pt, while newer DCP writers may embed
+        # common state in checkpoint metadata. In either format, the explicit
+        # source must take precedence over input state.
+        (ckpt_a / "common.pt").unlink(missing_ok=True)
+        (ckpt_b / "common.pt").unlink(missing_ok=True)
 
         result = merge_same_layout_dcp_metadata_checkpoints(
             [ckpt_a, ckpt_b],
@@ -836,11 +866,20 @@ def test_metadata_same_layout_factory_checkpoint_round_trip(tmp_path_dist_ckpt, 
 
         source_metadata = torch_dcp.FileSystemReader(ckpt_a).read_metadata()
         output_metadata = torch_dcp.FileSystemReader(result.output_dir).read_metadata()
-        assert set(output_metadata.state_dict_metadata) == set(source_metadata.state_dict_metadata)
+        expected_output_keys = {
+            key
+            for key in source_metadata.state_dict_metadata
+            if not weighted_merge_module._metadata_same_layout_is_common_state_key(key)
+        }
+        # Newer DCP writers may embed common state in the input metadata; the
+        # merge writer handles it separately from model tensor chunks.
+        assert set(output_metadata.state_dict_metadata) == expected_output_keys
         assert {"model.factory_weight.left", "model.factory_weight.right"}.issubset(
             output_metadata.state_dict_metadata
         )
         for fqn, source_tensor_metadata in source_metadata.state_dict_metadata.items():
+            if weighted_merge_module._metadata_same_layout_is_common_state_key(fqn):
+                continue
             source_chunks = [
                 (tuple(chunk.offsets), tuple(chunk.sizes))
                 for chunk in source_tensor_metadata.chunks

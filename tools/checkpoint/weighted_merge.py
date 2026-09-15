@@ -859,7 +859,7 @@ def _merge_state_dict_containers(target: Any, source: Any) -> Any:
 
 
 def _multi_path_state_dict(
-    path_leaves: Iterable[tuple[tuple[str | int, ...], Any]]
+    path_leaves: Iterable[tuple[tuple[str | int, ...], Any]],
 ) -> ShardedStateDict:
     state_dict: Any = None
     for path, leaf in path_leaves:
@@ -1194,6 +1194,12 @@ def _metadata_same_layout_is_extra_state_key(fqn: str) -> bool:
     )
 
 
+def _metadata_same_layout_is_common_state_key(fqn: str) -> bool:
+    """Identify common-state entries handled separately from model tensors."""
+
+    return fqn == "common_state" or fqn.startswith("common_state/")
+
+
 def _metadata_same_layout_path(fqn: str) -> tuple[str | int, ...]:
     return tuple(fqn.split("."))
 
@@ -1264,7 +1270,7 @@ def _read_public_dcp_metadata(
             else:
                 non_tensor_model_keys.append(fqn)
         elif isinstance(metadata_entry, BytesStorageMetadata):
-            if not ignore_non_model_state:
+            if not (ignore_non_model_state or _metadata_same_layout_is_common_state_key(fqn)):
                 non_model_byte_keys.append(fqn)
 
     if non_model_byte_keys:
@@ -1830,7 +1836,7 @@ def merge_same_layout_dcp_metadata_checkpoints(
     bytes_written = _directory_size_for_accounting(output_dir, byte_accounting)
     byte_accounting_time += time.perf_counter() - byte_accounting_start
     host_peak_bytes = _host_peak_memory_bytes()
-    (rank, world_size, max_host_peak_rank, max_host_peak_bytes) = _distributed_memory_peaks(
+    rank, world_size, max_host_peak_rank, max_host_peak_bytes = _distributed_memory_peaks(
         host_peak_bytes
     )
     timings = MergeTimings(
