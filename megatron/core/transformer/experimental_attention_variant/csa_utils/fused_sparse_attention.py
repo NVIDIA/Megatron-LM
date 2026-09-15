@@ -1525,6 +1525,11 @@ def csa_sparse_attn(
 # ---------------------------------------------------------------------------
 
 
+# Upper bound on the transient buffers one ``_stable_topk_indices`` sort may
+# hold at once: the masked score copy, the sorted scores and the int64 order.
+_STABLE_TOPK_SORT_BYTES = 256 << 20
+
+
 def _stable_topk_indices(scores: Tensor, seq_lens: Tensor, topk_k: int) -> Tensor:
     """Select the ``topk_k`` highest-scoring key ids per row with a fixed tie order.
 
@@ -1535,6 +1540,9 @@ def _stable_topk_indices(scores: Tensor, seq_lens: Tensor, topk_k: int) -> Tenso
     radix Top-K kernel does not order equal scores, which matters for ReLU-scored
     indexers where many keys share a score of exactly zero.
 
+    Rows are independent, so they are sorted in slabs sized to keep the sort's
+    temporary buffers under ``_STABLE_TOPK_SORT_BYTES`` regardless of ``rows``.
+
     Args:
         scores: ``(rows, sk)`` fp32 indexer scores; masked positions hold ``-inf``.
         seq_lens: ``(rows,)`` int32 number of candidate key columns per row.
@@ -1543,11 +1551,23 @@ def _stable_topk_indices(scores: Tensor, seq_lens: Tensor, topk_k: int) -> Tenso
     Returns:
         ``(rows, topk_k)`` int32 key ids, ``-1`` where a row has no more valid keys.
     """
-    columns = torch.arange(scores.shape[-1], device=scores.device, dtype=seq_lens.dtype)
-    candidates = scores.masked_fill(columns.unsqueeze(0) >= seq_lens.unsqueeze(1), float("-inf"))
-    sorted_scores, order = torch.sort(candidates, dim=-1, descending=True, stable=True)
-    selected = order[:, :topk_k].to(torch.int32)
-    return selected.masked_fill(torch.isneginf(sorted_scores[:, :topk_k]), -1)
+    rows, sk = scores.shape
+    columns = torch.arange(sk, device=scores.device, dtype=seq_lens.dtype)
+    bytes_per_row = sk * (2 * scores.element_size() + 8)
+    slab = max(1, min(rows, _STABLE_TOPK_SORT_BYTES // bytes_per_row))
+    selected = torch.empty(rows, topk_k, dtype=torch.int32, device=scores.device)
+    for start in range(0, rows, slab):
+        stop = min(start + slab, rows)
+        candidates = scores[start:stop].masked_fill(
+            columns.unsqueeze(0) >= seq_lens[start:stop].unsqueeze(1), float("-inf")
+        )
+        sorted_scores, order = torch.sort(candidates, dim=-1, descending=True, stable=True)
+        selected[start:stop] = (
+            order[:, :topk_k]
+            .to(torch.int32)
+            .masked_fill(torch.isneginf(sorted_scores[:, :topk_k]), -1)
+        )
+    return selected
 
 
 def _indexer_topk_core(

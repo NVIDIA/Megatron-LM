@@ -5491,3 +5491,10 @@ class TestStableTopkIndices:
         seq_lens = torch.tensor([4], dtype=torch.int32)
         out = dk._stable_topk_indices(scores, seq_lens, topk_k=3)
         assert torch.equal(out, torch.tensor([[1, 3, -1]], dtype=torch.int32))
+
+    def test_row_slabs_match_one_sort(self, monkeypatch):
+        scores = torch.relu(torch.randn(7, 12, generator=torch.Generator().manual_seed(0)))
+        seq_lens = torch.tensor([12, 5, 0, 12, 9, 1, 12], dtype=torch.int32)
+        whole = dk._stable_topk_indices(scores, seq_lens, topk_k=4)
+        monkeypatch.setattr(dk, "_STABLE_TOPK_SORT_BYTES", 1)
+        assert torch.equal(dk._stable_topk_indices(scores, seq_lens, topk_k=4), whole)
