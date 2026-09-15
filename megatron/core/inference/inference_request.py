@@ -2,6 +2,7 @@
 
 import copy
 import hashlib
+import math
 import time
 import uuid
 import warnings
@@ -18,35 +19,66 @@ from megatron.core.inference.utils import detokenize_tokens
 from megatron.core.utils import experimental_api, nvtx_range_pop, nvtx_range_push
 
 
-def serialize_tensor(tensor: torch.Tensor) -> List:
-    """Serialize tensor to bytes.
+def serialize_tensor(tensor: torch.Tensor) -> Dict[str, Any]:
+    """Serialize a tensor as contiguous binary data.
 
     Args:
         tensor (Tensor): Tensor.
 
     Returns:
-        (List) Tensor as a list
+        Dictionary containing dtype, shape, and raw bytes.
     """
-    nvtx_range_push("serialize_tensor")
-
-    # simply convert tensor into a list
-    tensor = tensor.cpu().tolist()
-
-    nvtx_range_pop("serialize_tensor")
-    return tensor
+    tensor_cpu = tensor.detach().contiguous().cpu()
+    tensor_bytes = tensor_cpu.reshape(-1).view(torch.uint8).numpy().tobytes()
+    return {"dtype": str(tensor_cpu.dtype), "shape": list(tensor_cpu.shape), "data": tensor_bytes}
 
 
-def deserialize_tensor(tensor_as_list: List) -> torch.Tensor:
-    """Deserialize tensor from bytes.
+def deserialize_tensor(tensor_data: Any) -> torch.Tensor:
+    """Deserialize binary tensor data or the legacy nested-list representation.
 
     Args:
-        tensor_as_list (List): List representation of tensor.
+        tensor_data: Binary tensor dictionary or legacy nested list.
 
     Returns:
         (Tensor) Tensor.
     """
-    tensor = torch.tensor(tensor_as_list)
-    return tensor
+    if not isinstance(tensor_data, dict):
+        return torch.tensor(tensor_data)
+
+    required_fields = {"dtype", "shape", "data"}
+    if set(tensor_data) != required_fields:
+        raise ValueError(
+            "Serialized tensor must contain exactly dtype, shape, and data; "
+            f"got {sorted(tensor_data)}."
+        )
+    dtype_name = tensor_data["dtype"]
+    if not isinstance(dtype_name, str):
+        raise TypeError("Serialized tensor dtype must be a string.")
+    dtype = getattr(torch, dtype_name.removeprefix("torch."), None)
+    if not isinstance(dtype, torch.dtype):
+        raise ValueError(f"Unsupported serialized tensor dtype {dtype_name!r}.")
+
+    serialized_shape = tensor_data["shape"]
+    if not isinstance(serialized_shape, (list, tuple)):
+        raise TypeError("Serialized tensor shape must be a list or tuple of integers.")
+    if any(not isinstance(dim, int) or isinstance(dim, bool) for dim in serialized_shape):
+        raise TypeError("Serialized tensor shape must contain only integers.")
+    shape = tuple(serialized_shape)
+    if any(dim < 0 for dim in shape):
+        raise ValueError(f"Serialized tensor shape must be non-negative, got {shape}.")
+    raw_data = tensor_data["data"]
+    if not isinstance(raw_data, (bytes, bytearray)):
+        raise TypeError("Serialized tensor data must be bytes.")
+
+    expected_bytes = math.prod(shape) * torch.empty((), dtype=dtype).element_size()
+    if len(raw_data) != expected_bytes:
+        raise ValueError(
+            f"Serialized tensor has {len(raw_data)} bytes, expected {expected_bytes} "
+            f"for shape {shape} and dtype {dtype}."
+        )
+    if expected_bytes == 0:
+        return torch.empty(shape, dtype=dtype)
+    return torch.frombuffer(bytearray(raw_data), dtype=dtype).reshape(shape).clone()
 
 
 def _normalize_raw_media_items(modality_data: Any) -> Optional[List[bytes]]:
@@ -104,7 +136,8 @@ def compute_media_cache_key(modality: str, modality_data: Any) -> str:
                 digest.update(b"\0")
                 # Viewing a flattened tensor as uint8 works for dtypes such as
                 # bfloat16 that NumPy cannot represent directly.
-                digest.update(tensor.reshape(-1).view(torch.uint8).numpy().tobytes())
+                tensor_bytes = tensor.reshape(-1).view(torch.uint8).numpy().tobytes()
+                digest.update(tensor_bytes)
             elif name == "num_img_embeddings_per_tile":
                 digest.update(str(int(value)).encode())
             else:
@@ -116,6 +149,9 @@ def compute_media_cache_key(modality: str, modality_data: Any) -> str:
         return digest.hexdigest()
 
     raise TypeError(f"Cannot compute a media cache key for {type(modality_data).__name__}.")
+
+
+_SERIALIZED_MULTIMODAL_DATA_KEY = "_is_serialized"
 
 
 def serialize_multimodal_data(multi_modal_data: Any) -> Optional[Dict[str, Any]]:
@@ -139,6 +175,10 @@ def serialize_multimodal_data(multi_modal_data: Any) -> Optional[Dict[str, Any]]
         return None
     if not isinstance(multi_modal_data, dict):
         raise TypeError(f"multi_modal_data must be a dict or None, got {type(multi_modal_data)}.")
+    if multi_modal_data.get(_SERIALIZED_MULTIMODAL_DATA_KEY) is True:
+        # If choices n > 1, reuse the serialized payload without re-hashing,
+        # converting tensors, or copying its dictionary structure.
+        return multi_modal_data
 
     unsupported = set(multi_modal_data) - {"image", "video", "media_tokens_preexpanded"}
     if "media_cache_key" in unsupported:
@@ -169,7 +209,12 @@ def serialize_multimodal_data(multi_modal_data: Any) -> Optional[Dict[str, Any]]
     raw_items = _normalize_raw_media_items(modality_data)
     if raw_items is not None:
         media_cache_key = compute_media_cache_key(modality, raw_items)
-        return {modality: raw_items, "media_cache_key": media_cache_key, **metadata}
+        return {
+            modality: raw_items,
+            "media_cache_key": media_cache_key,
+            _SERIALIZED_MULTIMODAL_DATA_KEY: True,
+            **metadata,
+        }
     elif isinstance(modality_data, dict):
         media_cache_key = compute_media_cache_key(modality, modality_data)
         wire: Dict[str, Any] = {}
@@ -185,7 +230,16 @@ def serialize_multimodal_data(multi_modal_data: Any) -> Optional[Dict[str, Any]]
             wire[key] = serialize_tensor(value)
         if "num_img_embeddings_per_tile" in modality_data:
             wire["num_img_embeddings_per_tile"] = int(modality_data["num_img_embeddings_per_tile"])
-        return {modality: wire, "media_cache_key": media_cache_key, **metadata} if wire else None
+        return (
+            {
+                modality: wire,
+                "media_cache_key": media_cache_key,
+                _SERIALIZED_MULTIMODAL_DATA_KEY: True,
+                **metadata,
+            }
+            if wire
+            else None
+        )
     else:
         raise TypeError(
             f"multi_modal_data[{modality!r}] must be bytes, list[bytes], or a "
@@ -215,7 +269,11 @@ def split_multimodal_data(
     modality = "video" if "video" in serialized else "image"
     if modality not in serialized:
         raise ValueError(f"Serialized multimodal data has no media payload: {sorted(serialized)}.")
-    media_meta = {key: value for key, value in serialized.items() if key != modality}
+    media_meta = {
+        key: value
+        for key, value in serialized.items()
+        if key not in (modality, _SERIALIZED_MULTIMODAL_DATA_KEY)
+    }
     media_meta["modality"] = modality
     return media_meta, serialized[modality]
 
@@ -241,7 +299,7 @@ def merge_multimodal_data(
     modality = media_meta.pop("modality", None)
     if modality not in ("image", "video"):
         raise ValueError(f"Media metadata carries an unsupported modality: {modality!r}.")
-    return {modality: payload, **media_meta}
+    return {modality: payload, _SERIALIZED_MULTIMODAL_DATA_KEY: True, **media_meta}
 
 
 def resolve_multimodal_data_for_engine(
@@ -275,6 +333,7 @@ def resolve_multimodal_data_for_engine(
         "video",
         "media_cache_key",
         "media_tokens_preexpanded",
+        _SERIALIZED_MULTIMODAL_DATA_KEY,
     }
     if unsupported:
         raise NotImplementedError(
@@ -296,6 +355,11 @@ def resolve_multimodal_data_for_engine(
             f"got {type(media_tokens_preexpanded)}."
         )
     metadata = {"media_tokens_preexpanded": True} if media_tokens_preexpanded else {}
+    media_cache_key = multi_modal_data.get("media_cache_key")
+    if media_cache_key is not None:
+        if not isinstance(media_cache_key, str) or not media_cache_key:
+            raise ValueError("Internal media_cache_key must be a non-empty string.")
+        metadata["media_cache_key"] = media_cache_key
     if isinstance(modality_data, list):
         from megatron.core.inference.text_generation_server.dynamic_text_gen_server import (
             image_preprocessing,
@@ -382,16 +446,20 @@ def deserialize_ndarray(obj: dict) -> np.ndarray:
 
 
 def unwrap_serialized_tensors(serialized_request: dict) -> dict:
-    """Unwrap ("tensor", [...]) tuples produced by serialize() into plain lists.
+    """Unwrap serialized tensor tuples produced by serialize() into plain lists.
 
     Args:
         serialized_request (dict): A dict produced by `serialize()`.
 
     Returns:
-        dict: A shallow copy with tensor wrapper tuples replaced by their inner lists.
+        dict: A shallow copy with tensor wrapper tuples replaced by plain lists.
     """
     return {
-        k: v[1] if isinstance(v, (list, tuple)) and len(v) == 2 and v[0] == "tensor" else v
+        k: (
+            deserialize_tensor(v[1]).tolist()
+            if isinstance(v, (list, tuple)) and len(v) == 2 and v[0] == "tensor"
+            else v
+        )
         for k, v in serialized_request.items()
     }
 
@@ -1096,6 +1164,7 @@ class DynamicInferenceRequestRecord:
                 imgs_sizes=old_request.imgs_sizes,
                 num_frames=old_request.num_frames,
                 media_tokens_preexpanded=old_request.media_tokens_preexpanded,
+                media_cache_key=old_request.media_cache_key,
                 decoder_seq_length=old_request.decoder_seq_length,
                 image_embeddings=old_request.image_embeddings,
                 image_token_mask=old_request.image_token_mask,
@@ -1254,3 +1323,4 @@ class DynamicVLMInferenceRequest(DynamicInferenceRequest, VLMInferenceRequest):
     imgs_sizes: Optional[torch.Tensor] = None
     num_frames: Optional[torch.Tensor] = None
     media_tokens_preexpanded: bool = False
+    media_cache_key: Optional[str] = None

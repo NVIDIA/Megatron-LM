@@ -20,6 +20,7 @@ from megatron.core.inference.apis.async_llm import MegatronAsyncLLM
 from megatron.core.inference.config import ImageProcessingConfig, VideoProcessingConfig
 from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine
 from megatron.core.inference.inference_request import (
+    compute_media_cache_key,
     resolve_multimodal_data_for_engine,
     serialize_multimodal_data,
 )
@@ -348,18 +349,24 @@ async def test_completions_multimodal_entrypoint_with_toy_model(
     if modality == "video":
         encoded_media = f"data:video/mp4;base64,{encoded_media}"
 
-    response = await app.test_client().post(
-        "/v1/completions",
-        json={
-            "prompt": _PROMPT_TOKENS,
-            "max_tokens": 2,
-            "multi_modal_data": {modality: encoded_media},
-        },
-    )
+    with mock.patch(
+        "megatron.core.inference.inference_request.compute_media_cache_key",
+        wraps=compute_media_cache_key,
+    ) as compute_key:
+        response = await app.test_client().post(
+            "/v1/completions",
+            json={
+                "prompt": [_PROMPT_TOKENS, _PROMPT_TOKENS],
+                "max_tokens": 2,
+                "multi_modal_data": {modality: encoded_media},
+            },
+        )
 
     assert response.status_code == 200
     payload = await response.get_json()
+    assert len(payload["choices"]) == 2
     assert payload["choices"][0]["text"] == "7 8"
+    assert compute_key.call_count == 1
     assert service.last_request.compact_prompt_tokens.tolist() == _PROMPT_TOKENS
     assert service.last_wire_data[modality] == [_MEDIA_BYTES]
     assert service.wrapper._forward_vision_encoder.call_count == 1
