@@ -23,7 +23,6 @@ MODEL_ARGS:
   --mhc-recompute-layer-num: 2
   --tensor-model-parallel-size: 1
   --pipeline-model-parallel-size: 2
-  --num-virtual-stages-per-pipeline-rank: 2
   --micro-batch-size: 1
   --global-batch-size: 16
   --seq-length: 128
