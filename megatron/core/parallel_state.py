@@ -446,9 +446,18 @@ def create_hybrid_dp_cp_groups(rank, ranks, pg_options):
     hybrid_dp_cp_groups = {}
     # Generate group for every power of 2 up to the number of CP ranks
     # We limit the allowed group sizes in order to avoid excessive overhead.
-    group_sizes = [2**i for i in range(int(log2(len(ranks))))][1:]
+    # Include the largest usable power of two when the full DPxCP domain is not
+    # itself a power of two (e.g. n=6 must expose a size-4 group). Using
+    # ``int(log2(n))`` as the exclusive range bound omitted that group and made
+    # valid long samples fail at runtime with a missing communicator.
+    group_sizes = [2**i for i in range(1, int(log2(len(ranks) - 1)) + 1)]
     for group_size in group_sizes:
         for i in range(0, len(ranks), group_size):
+            # The final slice may be smaller than ``group_size`` when the
+            # DPxCP domain is not a power of two. It is not a valid
+            # communicator for this key and must not be exposed as one.
+            if len(ranks[i : i + group_size]) != group_size:
+                continue
             group = create_group(
                 ranks[i : i + group_size],
                 pg_options=pg_options,
@@ -2533,11 +2542,17 @@ def destroy_model_parallel():
     global _DATA_PARALLEL_GROUP
     _DATA_PARALLEL_GROUP = None
 
+    global _DATA_PARALLEL_GLOBAL_RANKS
+    _DATA_PARALLEL_GLOBAL_RANKS = None
+
     global _DATA_PARALLEL_GROUP_WITH_GTP_REMAT
     _DATA_PARALLEL_GROUP_WITH_GTP_REMAT = None
 
     global _DATA_PARALLEL_GROUP_WITH_CP
     _DATA_PARALLEL_GROUP_WITH_CP = None
+
+    global _DATA_PARALLEL_GLOBAL_RANKS_WITH_CP
+    _DATA_PARALLEL_GLOBAL_RANKS_WITH_CP = None
 
     global _DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP_REMAT
     _DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP_REMAT = None
@@ -2551,8 +2566,22 @@ def destroy_model_parallel():
     global _CONTEXT_PARALLEL_GLOBAL_RANKS
     _CONTEXT_PARALLEL_GLOBAL_RANKS = None
 
+    global _HIERARCHICAL_CONTEXT_PARALLEL_GROUPS
+    _HIERARCHICAL_CONTEXT_PARALLEL_GROUPS = None
+
+    global _HYBRID_DP_CP_GROUPS
+    _HYBRID_DP_CP_GROUPS = {}
+
+    global _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP
+    _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP = None
+
+    global _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_GLOO
+
     global _EMBEDDING_GROUP
     _EMBEDDING_GROUP = None
+
+    global _EMBEDDING_GLOBAL_RANKS
+    _EMBEDDING_GLOBAL_RANKS = None
 
     global _POSITION_EMBEDDING_GROUP
     _POSITION_EMBEDDING_GROUP = None
@@ -2568,6 +2597,21 @@ def destroy_model_parallel():
 
     global _TENSOR_AND_CONTEXT_PARALLEL_GROUP
     _TENSOR_AND_CONTEXT_PARALLEL_GROUP = None
+
+    global _MODEL_PARALLEL_GLOBAL_RANKS
+    _MODEL_PARALLEL_GLOBAL_RANKS = None
+
+    global _TENSOR_MODEL_PARALLEL_GLOBAL_RANKS
+    _TENSOR_MODEL_PARALLEL_GLOBAL_RANKS = None
+
+    global _PIPELINE_GLOBAL_RANKS
+    _PIPELINE_GLOBAL_RANKS = None
+
+    global _MPU_DATA_PARALLEL_WORLD_SIZE
+    _MPU_DATA_PARALLEL_WORLD_SIZE = None
+
+    global _MPU_DATA_PARALLEL_RANK
+    _MPU_DATA_PARALLEL_RANK = None
 
     global _VIRTUAL_PIPELINE_MODEL_PARALLEL_RANK
     _VIRTUAL_PIPELINE_MODEL_PARALLEL_RANK = None
@@ -2610,6 +2654,16 @@ def destroy_model_parallel():
         torch.distributed.destroy_process_group(_DATA_PARALLEL_GROUP_WITH_CP_GLOO)
     _DATA_PARALLEL_GROUP_WITH_CP_GLOO = None
 
+    if (
+        _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_GLOO is not None
+        and torch.distributed.distributed_c10d._world.pg_map.get(
+            _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_GLOO, None
+        )
+        is not None
+    ):
+        torch.distributed.destroy_process_group(_INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_GLOO)
+    _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_GLOO = None
+
     # Destroy parallel state related to expert parallelism.
     global _EXPERT_GTP_WEIGHT_REMAT_GROUP
     _EXPERT_GTP_WEIGHT_REMAT_GROUP = None
@@ -2619,6 +2673,9 @@ def destroy_model_parallel():
 
     global _EXPERT_MODEL_PARALLEL_GROUP
     _EXPERT_MODEL_PARALLEL_GROUP = None
+
+    global _EXPERT_MODEL_PARALLEL_RANKS
+    _EXPERT_MODEL_PARALLEL_RANKS = None
 
     global _MPU_EXPERT_MODEL_PARALLEL_WORLD_SIZE
     _MPU_EXPERT_MODEL_PARALLEL_WORLD_SIZE = None
