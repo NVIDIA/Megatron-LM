@@ -12,7 +12,7 @@ import torch
 
 from megatron.core.datasets.blended_megatron_dataset_config import BlendedMegatronDatasetConfig
 from megatron.core.datasets.indexed_dataset import IndexedDataset
-from megatron.core.datasets.megatron_dataset import MegatronDataset
+from megatron.core.datasets.megatron_dataset import MegatronDataset, is_out_of_vocab_token_id
 from megatron.core.datasets.object_storage_utils import ObjectStorageConfig, is_object_storage_path
 from megatron.core.datasets.utils import Split
 from megatron.core.safe_globals import safe_numpy_load
@@ -312,8 +312,10 @@ class GPTDataset(MegatronDataset):
         loss_mask[labels == self._pad_token_id] = 0.0
 
         # For padded sequences, ensure the embedding layer can map the token ID
-        tokens[tokens == self._pad_token_id] = 0
-        labels[labels == self._pad_token_id] = 0
+        vocab_size = getattr(self.config.tokenizer, "vocab_size", None)
+        if is_out_of_vocab_token_id(self._pad_token_id, vocab_size):
+            tokens[tokens == self._pad_token_id] = 0
+            labels[labels == self._pad_token_id] = 0
 
         # Batch padding sequence so we mask the loss
         if idx is None:
