@@ -2483,8 +2483,6 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError("MOK requires EP in {1, 4, 8, 16, 32, 64}")
             if self.moe_shared_expert_intermediate_size is None:
                 raise ValueError("MOK requires a shared expert")
-            if self.moe_shared_expert_gate and not mok_bf16:
-                raise ValueError("MOK shared-expert output gate requires BF16 routed experts")
             if self.moe_shared_expert_overlap:
                 raise ValueError("MOK does not support MCore shared-expert overlap")
             if self.moe_latent_size is not None:

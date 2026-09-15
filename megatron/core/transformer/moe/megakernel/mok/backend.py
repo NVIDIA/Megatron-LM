@@ -84,8 +84,6 @@ class MoKMegakernel(MegakernelBackend):
         self.use_mxfp8_weights = bool(
             config.fp8 is not None and config.fp8_recipe == "mxfp8" and config.fp8_param
         )
-        if config.moe_shared_expert_gate and self.use_mxfp8_weights:
-            raise ValueError("MOK shared-expert output gate requires BF16 routed experts")
         if self.use_mxfp8_weights:
             from megatron.core import fp8_utils
 
@@ -353,6 +351,10 @@ class MoKMegakernel(MegakernelBackend):
                 if isinstance(value, MethodType) and value.__self__ is old_param:
                     value = MethodType(value.__func__, new_param)
                 setattr(new_param, key, value)
+        # Invalidate derived views after conversion; parameters stay native-owned.
+        self._routed_weight_view_cache = None
+        self._split_main_grad_descriptor_cache = None
+        self.is_first_microbatch = True
         return out
 
     def forward(
