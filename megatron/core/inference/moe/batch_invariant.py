@@ -152,7 +152,9 @@ def _swiglu_with_probs_kernel(
                     up = tl.load(input_ptr + row_i64 * two_n + ffn_size + cols, mask=mask).to(
                         tl.float32
                     )
-                    value = gate * tl.sigmoid(gate) * up * prob
+                    # Match training's fused SiLU instruction order. Multiplying
+                    # by sigmoid can round differently before MXFP8 quantization.
+                    value = (gate / (1.0 + libdevice.exp(-gate))) * up * prob
                     tl.store(
                         output_ptr + row_i64 * ffn_size + cols, value.to(tl.bfloat16), mask=mask
                     )

@@ -157,6 +157,29 @@ def test_inference_moe_activations_replay():
         )
 
 
+def test_batch_invariant_swiglu_matches_training():
+    """Exercise rounding boundaries that sigmoid-based SiLU evaluates differently."""
+    from megatron.core.fusions.fused_bias_swiglu import weighted_swiglu
+    from megatron.core.inference.moe.batch_invariant import swiglu_with_probs
+
+    gate = torch.tensor(
+        [0.032470703125, -1.078125, -5.0625, -12.0625], device="cuda", dtype=torch.bfloat16
+    )
+    up = torch.tensor(
+        [-0.0186767578125, 0.150390625, -3.875, 39.5], device="cuda", dtype=torch.bfloat16
+    )
+    probs = torch.tensor(
+        [0.688609778881073, 0.0012366651790216565, 0.2819514572620392, 0.7739971280097961],
+        device="cuda",
+    )
+    x = torch.cat((gate[:, None].expand(-1, 768), up[:, None].expand(-1, 768)), dim=-1)
+    perm = torch.arange(4, device="cuda", dtype=torch.int32)
+    used = _dev_scalar(4)
+    expected = weighted_swiglu(x, probs[:, None])
+    actual = swiglu_with_probs(x, perm, used, probs, zero_padding=True)
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
 def test_batch_invariant_inference_activations_replay():
     from megatron.core.inference.moe import batch_invariant
 
