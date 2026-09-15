@@ -18,7 +18,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_mtp_block_spec,
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
-from megatron.core.models.hybrid import hybrid_layer_allocation
+from megatron.core.models.hybrid import MTPSplit, hybrid_layer_allocation
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.num_microbatches_calculator import destroy_num_microbatches_calculator
@@ -35,6 +35,12 @@ from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import multi_token_prediction as mtp_module
 from megatron.core.transformer.attention_layer_config import AttentionLayerConfig
 from megatron.core.transformer.hyper_connection import learned_output_contract
+from megatron.core.transformer.moe.moe_layer_config import MoELayerConfig
+from megatron.core.transformer.moe.moe_logging import (
+    destroy_moe_metrics_tracker,
+    get_moe_metrics_tracker,
+)
+from megatron.core.transformer.moe.router import Router
 from megatron.core.transformer.multi_token_prediction import (
     MTPLossLoggingHelper,
     MultiTokenPredictionBlock,
@@ -3625,6 +3631,97 @@ class TestMultiTokenPredictionHybrid:
         destroy_global_vars()
         destroy_num_microbatches_calculator()
         MTPLossLoggingHelper.tracker = {}
+        destroy_moe_metrics_tracker()
+
+    @pytest.mark.skipif(not HAVE_TE, reason="transformer_engine not available")
+    @pytest.mark.parametrize("use_pattern", [False, True])
+    @pytest.mark.parametrize("num_heads", [1, 2])
+    @pytest.mark.parametrize("repeated", [False, True])
+    @pytest.mark.parametrize("moes_per_head", [1, 2])
+    def test_moe_mtp_head_metrics_forward_backward(
+        self, use_pattern, num_heads, repeated, moes_per_head
+    ):
+        """Multi-layer MTP heads log by head, including full activation recomputation."""
+        Utils.initialize_model_parallel(1, 1)
+        model_parallel_cuda_manual_seed(_SEED)
+        destroy_moe_metrics_tracker()
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=64,
+            num_attention_heads=4,
+            num_moe_experts=4,
+            moe_router_topk=2,
+            moe_ffn_hidden_size=64,
+            moe_grouped_gemm=True,
+            moe_router_load_balancing_type="seq_aux_loss",
+            moe_aux_loss_coeff=1e-4,
+            moe_z_loss_coeff=1e-3,
+            mtp_use_repeated_layer=repeated,
+            use_cpu_initialization=True,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            add_bias_linear=False,
+            hidden_dropout=0.0,
+            attention_dropout=0.0,
+            recompute_granularity="full",
+            recompute_method="uniform",
+            recompute_num_layers=1,
+        )
+        attention_config = AttentionLayerConfig.from_config(config)
+        moe_config = MoELayerConfig.from_config(config)
+        template = [attention_config, *([moe_config] * moes_per_head)]
+        architecture = (
+            {"hybrid_layer_pattern": "*" + ("/*" + "E" * moes_per_head) * num_heads}
+            if use_pattern
+            else {
+                "hybrid_layer_config_list": [attention_config, *([MTPSplit, *template] * num_heads)]
+            }
+        )
+        model = (
+            HybridModel(
+                config=config,
+                hybrid_stack_spec=hybrid_stack_spec,
+                vocab_size=128,
+                max_sequence_length=16,
+                position_embedding_type="none",
+                pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+                **architecture,
+            )
+            .cuda()
+            .bfloat16()
+        )
+
+        assert config.mtp_num_layers == num_heads
+        physical_heads = 1 if repeated else num_heads
+        assert len(model.mtp.layers) == physical_heads
+        for head_number, head in enumerate(model.mtp.layers, start=1):
+            routers = [module for module in head.modules() if isinstance(module, Router)]
+            assert len(routers) == moes_per_head
+            assert [router.layer_number for router in routers] == list(range(2, 2 + moes_per_head))
+            assert all(router.mtp_layer_number == head_number for router in routers)
+
+        tokens = torch.randint(0, 128, (2, 16), device="cuda")
+        output = model(
+            input_ids=tokens,
+            position_ids=torch.arange(16, device="cuda").unsqueeze(0).expand_as(tokens),
+            attention_mask=None,
+            labels=tokens,
+            loss_mask=torch.ones_like(tokens, dtype=torch.float32),
+        )
+        output.mean().backward()
+        assert torch.isfinite(output).all()
+        for parameter in model.parameters():
+            assert parameter.grad is not None
+            assert torch.isfinite(parameter.grad).all()
+
+        metrics = get_moe_metrics_tracker().metrics
+        for name in ("seq_load_balancing_loss", "z_loss"):
+            values = metrics[name].values
+            assert values.shape == (config.num_layers + num_heads,)
+            assert torch.isfinite(values).all()
+            assert values[0] == 0  # The decoder has no MoE.
+            assert (values[1 : 1 + physical_heads] > 0).all()
+            assert (values[1 + physical_heads :] == 0).all()
 
     def model_provider(self, pre_process=True, post_process=True, **config_kwargs):
         """Model provider for Mamba hybrid models with MTP.

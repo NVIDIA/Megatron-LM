@@ -1384,6 +1384,7 @@ class MultiTokenPredictionLayer(MegatronModule):
             from megatron.core.models.hybrid.hybrid_layer_allocation import (
                 clone_hybrid_layer_config_list,
             )
+            from megatron.core.transformer.moe.router import Router
 
             layer_config_list = clone_hybrid_layer_config_list(self.mtp_layer_config_list)
             for layer_config in layer_config_list:
@@ -1403,6 +1404,9 @@ class MultiTokenPredictionLayer(MegatronModule):
                 boundary_layout=self.config.attention_cp_layout,
                 name=(name + ".mtp_model_layer") if name is not None else None,
             )
+            for module in self.mtp_model_layer.modules():
+                if isinstance(module, Router):
+                    module.set_mtp_layer_number(self.layer_number)
         elif self.config.mtp_num_layers is not None:
             # GPT path: Uses the transformer block spec for MTP layer
             # MTP inner layers use their own layer numbering (self.layer_number = 1, 2, etc.)
