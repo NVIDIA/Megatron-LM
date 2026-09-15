@@ -64,7 +64,6 @@ class HeterogenousTransformerLayer(TransformerLayer):
         hidden_dropout: float | None = None,
         pg_collection: ProcessGroupCollection | None = None,
         vp_stage: int | None = None,
-        name: str | None = None,
     ):
         # Temporarily replace attention with IdentityOp,
         # This is a temporary workaround for the test until we have a better interface
@@ -83,7 +82,6 @@ class HeterogenousTransformerLayer(TransformerLayer):
             hidden_dropout=hidden_dropout,
             pg_collection=pg_collection,
             vp_stage=vp_stage,
-            name=name,
         )
 
         assert (
