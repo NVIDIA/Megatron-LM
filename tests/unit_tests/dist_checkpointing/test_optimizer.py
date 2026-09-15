@@ -1,6 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import re
+from contextlib import nullcontext
 from copy import deepcopy
 from functools import partial
 from unittest import mock
@@ -11,7 +12,16 @@ import torch
 from torch.optim import Adam
 
 from megatron.core import parallel_state
-from megatron.core.dist_checkpointing import ShardedTensor, load, load_plain_tensors, save
+from megatron.core.dist_checkpointing import (
+    LocalNonpersistentObject,
+    ShardedObject,
+    ShardedTensor,
+    load,
+    load_common_state_dict,
+    load_content_metadata,
+    load_plain_tensors,
+    save,
+)
 from megatron.core.dist_checkpointing.dict_utils import diff, nested_values
 from megatron.core.dist_checkpointing.optimizer import (
     get_param_id_to_sharded_param_map,
@@ -77,6 +87,21 @@ class Model(torch.nn.Module):
             'proj.bias', sharded_state_dict['proj.bias'], (0, Utils.rank, Utils.world_size)
         )
         return sharded_state_dict
+
+
+def iter_state_dict_keys(value, path=()):
+    """Iterate over keys from nested checkpoint mappings, including wrapped object data."""
+    if isinstance(value, ShardedObject):
+        yield from iter_state_dict_keys(value.data, path + ('<sharded_object_data>',))
+    elif isinstance(value, LocalNonpersistentObject):
+        yield from iter_state_dict_keys(value.unwrap(), path + ('<local_nonpersistent>',))
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            yield path, key
+            yield from iter_state_dict_keys(item, path + (key,))
+    elif isinstance(value, (list, tuple)):
+        for index, item in enumerate(value):
+            yield from iter_state_dict_keys(item, path + (index,))
 
 
 class NativeFp32Model(torch.nn.Module):
@@ -469,6 +494,173 @@ class TestDistributedOptimizer:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
+    @pytest.mark.skipif(
+        not is_torch_min_version("2.6a0"),
+        reason="distributed optimizer torch_dist formats require PyTorch 2.6a0 or later",
+    )
+    @pytest.mark.parametrize(
+        'sharding_type',
+        [
+            'dp_reshardable',
+            'dp_zero_gather_scatter',
+            'fully_reshardable',
+            # fsdp_dtensor uses a separate optimizer path. fully_sharded_model_space is
+            # deprecated and cannot be constructed with the current ShardedTensor API.
+        ],
+    )
+    def test_torch_dist_optimizer_state_dict_key_types(self, sharding_type):
+        """torch_dist optimizer checkpoints use only string or integer mapping keys."""
+        Utils.initialize_model_parallel(1, 1)
+        model, optimizer = setup_model_and_optimizer(
+            seed=2, tp=1, pp=1, bf16=True, dist_opt=True, initialize_fn=initialize_pp_agnostic_model
+        )
+        distributed_optimizer = self._unwrap_distributed_optimizer(optimizer)
+        runtime_dtype_keys = [
+            dtype
+            for per_buffer_numel in distributed_optimizer.per_bucket_numel
+            for dtype in per_buffer_numel
+        ]
+        assert runtime_dtype_keys
+        assert set(runtime_dtype_keys) == {'dtype_param_torch:bfloat16_grad_torch:bfloat16'}
+        metadata = {
+            'distrib_optim_sharding_type': sharding_type,
+            'distrib_optim_fully_reshardable_mem_efficient': False,
+        }
+
+        optim_sd = optimizer.sharded_state_dict(model[0].sharded_state_dict(), metadata=metadata)
+        unsupported_keys = [
+            (path, key)
+            for path, key in iter_state_dict_keys(optim_sd)
+            if not isinstance(key, (str, int))
+        ]
+
+        assert not unsupported_keys
+        runtime_dtype_keys = [
+            dtype
+            for per_buffer_numel in distributed_optimizer.per_bucket_numel
+            for dtype in per_buffer_numel
+        ]
+        assert runtime_dtype_keys and all(isinstance(key, str) for key in runtime_dtype_keys)
+
+    @pytest.mark.skipif(
+        not is_torch_min_version("2.6a0"),
+        reason="distributed optimizer torch_dist formats require PyTorch 2.6a0 or later",
+    )
+    @pytest.mark.parametrize('sharding_type', ['dp_reshardable', 'dp_zero_gather_scatter'])
+    @pytest.mark.parametrize('legacy_keys', [False, True])
+    def test_optimizer_checkpoint_key_compatibility(
+        self, tmp_path_dist_ckpt, sharding_type, legacy_keys
+    ):
+        """String- and tuple-key checkpoints load without compatibility settings."""
+        Utils.initialize_model_parallel(1, 1)
+        checkpoint_version = 3.0 if legacy_keys else 3.1
+        metadata = {'distrib_optim_sharding_type': sharding_type}
+
+        with TempNamedDir(
+            tmp_path_dist_ckpt / f'test_key_compatibility_{sharding_type}_{legacy_keys}', sync=True
+        ) as ckpt_dir:
+            dtype_key_context = (
+                mock.patch(
+                    'megatron.core.optimizer.distrib_optimizer._get_dtype_param_grad_key',
+                    side_effect=lambda param_dtype, grad_dtype: (param_dtype, grad_dtype),
+                )
+                if legacy_keys
+                else nullcontext()
+            )
+            with dtype_key_context:
+                model_A, optimizer_A = setup_model_and_optimizer(
+                    seed=2,
+                    tp=1,
+                    pp=1,
+                    bf16=True,
+                    dist_opt=True,
+                    initialize_fn=initialize_pp_agnostic_model,
+                )
+                optim_sd = optimizer_A.sharded_state_dict(
+                    model_A[0].sharded_state_dict(), metadata=metadata
+                )
+
+            has_tuple_key = torch.tensor(
+                any(isinstance(key, tuple) for _, key in iter_state_dict_keys(optim_sd)),
+                device='cuda',
+                dtype=torch.int,
+            )
+            torch.distributed.all_reduce(has_tuple_key, op=torch.distributed.ReduceOp.MAX)
+            assert bool(has_tuple_key.item()) == legacy_keys
+
+            save(
+                {'checkpoint_version': checkpoint_version, 'optimizer': optim_sd},
+                ckpt_dir,
+                content_metadata=metadata,
+            )
+            optim_param_state_A = get_param_state_dp_zero(optimizer_A)
+
+            model_B, optimizer_B = setup_model_and_optimizer(
+                seed=3,
+                tp=1,
+                pp=1,
+                bf16=True,
+                dist_opt=True,
+                initialize_fn=initialize_pp_agnostic_model,
+            )
+            common_state = load_common_state_dict(ckpt_dir)
+            assert common_state['checkpoint_version'] == checkpoint_version
+            loaded_metadata = load_content_metadata(preloaded_state_dict=common_state)
+            loaded_metadata['checkpoint_version'] = common_state['checkpoint_version']
+            load_sharded_state_dict = {
+                'optimizer': optimizer_B.sharded_state_dict(
+                    model_B[0].sharded_state_dict(), metadata=loaded_metadata, is_loading=True
+                )
+            }
+            if sharding_type == 'dp_reshardable':
+                uses_legacy_dtype_fqn = any(
+                    '.dtype_(torch.' in value.key
+                    for value in nested_values(load_sharded_state_dict)
+                    if isinstance(value, ShardedTensor)
+                )
+                assert uses_legacy_dtype_fqn == legacy_keys
+            loaded_state_dict = load(load_sharded_state_dict, ckpt_dir)
+            loaded_has_tuple_key = torch.tensor(
+                any(isinstance(key, tuple) for _, key in iter_state_dict_keys(loaded_state_dict)),
+                device='cuda',
+                dtype=torch.int,
+            )
+            torch.distributed.all_reduce(loaded_has_tuple_key, op=torch.distributed.ReduceOp.MAX)
+            assert bool(loaded_has_tuple_key.item()) == legacy_keys
+
+            optimizer_B.load_state_dict(loaded_state_dict['optimizer'])
+            optim_param_state_B = get_param_state_dp_zero(optimizer_B)
+
+            # The compatibility boundary normalizes old state before the regular loader sees it.
+            loaded_has_tuple_key = torch.tensor(
+                any(isinstance(key, tuple) for _, key in iter_state_dict_keys(loaded_state_dict)),
+                device='cuda',
+                dtype=torch.int,
+            )
+            torch.distributed.all_reduce(loaded_has_tuple_key, op=torch.distributed.ReduceOp.MAX)
+            assert not bool(loaded_has_tuple_key.item())
+
+            if legacy_keys:
+                distributed_optimizer_A = self._unwrap_distributed_optimizer(optimizer_A)
+                distributed_optimizer_A._back_compat_normalize_loaded_dtype_keys(
+                    optim_param_state_A, checkpoint_version
+                )
+
+            assert self.check_equal_dp_zero_state(
+                optim_param_state_A,
+                optim_param_state_B,
+                same_dp_group=True,
+                raise_if_different=True,
+            )
+
+            # Loading a tuple-key checkpoint must not affect subsequent checkpoint saves.
+            resaved_optim_sd = optimizer_B.sharded_state_dict(
+                model_B[0].sharded_state_dict(), metadata=metadata
+            )
+            assert all(
+                isinstance(key, (str, int)) for _, key in iter_state_dict_keys(resaved_optim_sd)
+            )
+
     @pytest.mark.parametrize("fully_parallel", [False, True])
     @pytest.mark.parametrize(
         ("tp_pp_ep", "is_moe", "is_mla", "test_step", "kwargs"),
@@ -790,6 +982,12 @@ class TestDistributedOptimizer:
             plain_state_dict_A = load_plain_tensors(ckpt_dir_A)
             plain_state_dict_B = load_plain_tensors(ckpt_dir_B)
             torch.distributed.barrier()
+
+            assert any(
+                '.dtype_dtype_param_torch:bfloat16_grad_torch:bfloat16.' in key
+                for key in plain_state_dict_B
+            )
+            assert not any('.dtype_(torch.' in key for key in plain_state_dict_B)
 
             # We test only the `plain_state_dict_B` keys because of decreasing PP
             for key in list(plain_state_dict_B.keys()):
