@@ -17,27 +17,33 @@ cover the Megatron-side wiring only:
   - ``Compressor._forward_thd`` integration: the fused dispatch engages and matches
     eager for regular and CP pre-grouped inputs, gradients flow, precomputed RoPE
     positions are reused, and the module falls back to the bitwise-identical eager
-    path when the frontend is unavailable.
+    path when the frontend is unavailable;
+  - CP projection before compaction: input/weight gradients inside MXFP8, saved
+    hidden storage, single-projection fallbacks, and changing-pack CUDA graph replay.
 
 Without a cudnn-frontend that provides ``cudnn.csa`` (or without CUDA / below
 compute-capability major 10) every kernel test skips.
 """
 
+import copy
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 import torch
 
+from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.transformer.experimental_attention_variant import csa as csa_module
 from megatron.core.transformer.experimental_attention_variant.csa import (
     Compressor,
     CompressorSubmodules,
     batch_of_row,
 )
+from megatron.core.transformer.experimental_attention_variant.csa_utils import cp_utils
 from megatron.core.transformer.experimental_attention_variant.csa_utils import (
     fused_compressor as cfc,
 )
+from megatron.core.transformer.experimental_attention_variant.csa_utils import thd_layout_kernels
 
 # Run this module on GB200 hardware in CI (marker-driven selection, see
 # tests/unit_tests/find_test_cases.py); everywhere else the tests skip via
@@ -384,23 +390,225 @@ class TestCompressorFusedIntegration:
         yield
         Utils.destroy_model_parallel()
 
-    def _make_compressor(self):
+    def _make_compressor(self, ratio=4, head_dim=None, config=None):
         from megatron.core.extensions.transformer_engine import TELinear, TENorm
         from megatron.core.transformer.spec_utils import ModuleSpec
 
         return Compressor(
-            config=self.config,
+            config=config or self.config,
             submodules=CompressorSubmodules(
                 linear_wkv=ModuleSpec(module=TELinear),
                 linear_wgate=ModuleSpec(module=TELinear),
                 norm=ModuleSpec(module=TENorm),
             ),
-            compress_ratio=4,
-            head_dim=self.config.v_head_dim,
+            compress_ratio=ratio,
+            head_dim=head_dim or self.config.v_head_dim,
             rotate=False,
             rotary_pos_emb=self.rotary_pos_emb,
             pg_collection=self.pg_collection,
         ).cuda()
+
+    @pytest.mark.parametrize("ratio,head_dim", [(4, 128), (4, 512), (128, 512)])
+    @pytest.mark.parametrize("detach_input", [False, True])
+    @pytest.mark.parametrize("fuse_wgrad", [False, True])
+    def test_cp_projects_before_compaction_forward_backward_and_saved_storage(
+        self, ratio, head_dim, detach_input, fuse_wgrad
+    ):
+        """BF16 compressor parity inside MXFP8, including first-microbatch fused wgrad.
+
+        The detached case is the indexer contract: its weights train without
+        adding gradients to local or exchanged hidden states. Saved-storage
+        checks guard the memory benefit rather than just a reordered forward.
+        """
+        if not thd_layout_kernels._CUTE_AVAILABLE:
+            pytest.skip("CP compressor requires CuTeDSL")
+        config = copy.copy(self.config)
+        config.hidden_size = 2048
+        config.gradient_accumulation_fusion = fuse_wgrad
+        config.fp8 = "e4m3"
+        config.fp8_recipe = "mxfp8"
+        config.fp8_param = True
+        reference = self._make_compressor(ratio, head_dim, config)
+        actual = self._make_compressor(ratio, head_dim, config)
+        actual.load_state_dict(reference.state_dict())
+        # Cross-rank groups, multiple packed sequences, and an incomplete tail.
+        cu = torch.tensor([0, 129, 1801, 2048], dtype=torch.int32, device="cuda")
+        local_rows, start, cp_size = 1024, 1024, 2
+        x_base = torch.randn(local_rows, 1, config.hidden_size, device="cuda", dtype=torch.bfloat16)
+        boundary_base = torch.randn(128, 1, config.hidden_size, device="cuda", dtype=torch.bfloat16)
+        layout = thd_layout_kernels.build_cp_compressor_layout(
+            cu, start, local_rows, cp_size, ratio
+        )
+        grad_out = torch.randn(
+            layout.group_ids.numel(), 1, head_dim, device="cuda", dtype=torch.bfloat16
+        )
+        # Only gathered canonical rows receive gradients. Halo and padding must
+        # not contribute, although halo tokens feed a canonical overlap window.
+        physical = torch.arange(grad_out.shape[0], device="cuda") + grad_out.shape[0]
+        canonical = torch.isin(physical, layout.seq_to_rank_row)
+        grad_out[~canonical] = 0
+        # Emphasize the first crossing group so losing the halo's wgrad cannot
+        # hide under the tolerance for BF16 reduction-order differences.
+        grad_out[torch.nonzero(canonical, as_tuple=True)[0][0]] *= 16
+
+        def run(module, projected):
+            x = x_base.detach().clone().requires_grad_(True)
+            boundary = boundary_base.detach().clone().requires_grad_(True)
+            x_input = x.detach() if detach_input else x
+            boundary_input = boundary.detach() if detach_input else boundary
+            for linear in (module.linear_wkv, module.linear_wgate):
+                if fuse_wgrad:
+                    linear.weight.main_grad = torch.zeros_like(linear.weight, dtype=torch.float32)
+            saved = []
+
+            def pack(tensor):
+                saved.append((tuple(tensor.shape), tensor.untyped_storage().data_ptr()))
+                return tensor
+
+            with (
+                get_fp8_context(config),
+                torch.autograd.graph.saved_tensors_hooks(pack, lambda tensor: tensor),
+            ):
+                if projected:
+                    out, _ = module._forward_thd_cp(x_input, boundary_input, cu, layout, 2048)
+                else:
+                    compact, group_ids, positions, local_cu, local_cuc, _, _ = (
+                        cp_utils.prepare_cp_compressor_input(
+                            x_input, boundary_input, cu, start, cp_size, ratio
+                        )
+                    )
+                    out, _ = module._forward_thd(
+                        compact,
+                        cu,
+                        max_seqlen_q=2048,
+                        compressed_group_ids=group_ids,
+                        compressed_position_ids=positions,
+                        pre_grouped_cu_seqlens=local_cu,
+                        pre_grouped_cu_seqlens_compressed=local_cuc,
+                    )
+            out.backward(grad_out)
+            weight_grads = [
+                (linear.weight.main_grad if fuse_wgrad else linear.weight.grad).clone()
+                for linear in (module.linear_wkv, module.linear_wgate)
+            ]
+            compact_rows = layout.compact_to_source.numel()
+            if projected:
+                assert not any(
+                    shape
+                    in ((compact_rows, config.hidden_size), (compact_rows, 1, config.hidden_size))
+                    for shape, _ in saved
+                )
+                assert any(ptr == x.untyped_storage().data_ptr() for _, ptr in saved)
+            else:
+                assert any(ptr == compact.untyped_storage().data_ptr() for _, ptr in saved)
+            if detach_input:
+                assert x.grad is None and boundary.grad is None
+            grads = weight_grads + [module.ape.grad, module.norm.weight.grad]
+            if not detach_input:
+                grads += [x.grad, boundary.grad]
+            return out.detach(), grads
+
+        ref_out, ref_grads = run(reference, False)
+        out, grads = run(actual, True)
+        torch.testing.assert_close(out[canonical], ref_out[canonical], rtol=2e-2, atol=2e-2)
+        # Splitting BF16 wgrad changes its reduction order and, without fusion,
+        # rounds each partial gradient before accumulation. It is not bitwise.
+        for result, expected in zip(grads, ref_grads):
+            torch.testing.assert_close(result.float(), expected.float(), rtol=3e-2, atol=5e-2)
+
+    @pytest.mark.parametrize("fallback", ["delay_wgrad_compute", "overwrite_main_grad"])
+    @pytest.mark.parametrize("shared_input", [False, True])
+    def test_cp_preserves_single_projection_contract(self, fallback, shared_input):
+        """Deferred wgrad/FSDP still enqueue exactly one call per linear."""
+        compressor = self._make_compressor()
+        compressor.config = copy.copy(compressor.config)
+        if fallback == "delay_wgrad_compute":
+            compressor.config.delay_wgrad_compute = True
+        else:
+            compressor.linear_wkv.weight.overwrite_main_grad = True
+            compressor.linear_wgate.weight.overwrite_main_grad = True
+        x = torch.randn(64, 1, self.config.hidden_size, device="cuda", dtype=torch.bfloat16)
+        boundary = torch.randn_like(x[:8])
+        cu = torch.tensor([0, 128], device="cuda", dtype=torch.int32)
+        layout = thd_layout_kernels.build_cp_compressor_layout(cu, 64, 64, 2, 4)
+        compact = None
+        if shared_input:
+            compact, *_ = cp_utils.prepare_cp_compressor_input(x, boundary, cu, 64, 2, 4)
+        with patch.object(
+            compressor.linear_wkv, "forward", wraps=compressor.linear_wkv.forward
+        ) as kv:
+            with patch.object(
+                compressor.linear_wgate, "forward", wraps=compressor.linear_wgate.forward
+            ) as gate:
+                compressor._forward_thd_cp(
+                    x, boundary, cu, layout, 128, pre_compacted_hidden=compact
+                )
+        assert kv.call_count == gate.call_count == 1
+        if shared_input:
+            assert kv.call_args.args[0] is compact
+            assert gate.call_args.args[0] is compact
+
+    @pytest.mark.parametrize("ratio,head_dim", [(4, 128), (128, 512)])
+    def test_cp_compressor_graph_replay_with_fused_wgrad(self, ratio, head_dim):
+        """Replay both GEMMs and pooling backward as packed sequence boundaries change."""
+        config = copy.copy(self.config)
+        config.gradient_accumulation_fusion = True
+        compressor = self._make_compressor(ratio, head_dim, config)
+        for linear in (compressor.linear_wkv, compressor.linear_wgate):
+            linear.weight.main_grad = torch.zeros_like(linear.weight, dtype=torch.float32)
+        x = torch.randn(
+            1024, 1, config.hidden_size, device="cuda", dtype=torch.bfloat16, requires_grad=True
+        )
+        boundary = torch.randn(
+            128, 1, config.hidden_size, device="cuda", dtype=torch.bfloat16, requires_grad=True
+        )
+        cu = torch.tensor([0, 129, 1801, 2048], dtype=torch.int32, device="cuda")
+        layout = thd_layout_kernels.build_cp_compressor_layout(cu, 1024, 1024, 2, ratio)
+        grad_out = torch.zeros(
+            layout.group_ids.numel(), 1, head_dim, device="cuda", dtype=torch.bfloat16
+        )
+
+        def step():
+            for tensor in (x, boundary, *compressor.parameters()):
+                if tensor.grad is not None:
+                    tensor.grad.zero_()
+            for linear in (compressor.linear_wkv, compressor.linear_wgate):
+                linear.weight.main_grad.zero_()
+            local_layout = thd_layout_kernels.build_cp_compressor_layout(cu, 1024, 1024, 2, ratio)
+            out, _ = compressor._forward_thd_cp(x, boundary, cu, local_layout, 2048)
+            out.backward(grad_out)
+            return (
+                out,
+                x.grad,
+                boundary.grad,
+                compressor.linear_wkv.weight.main_grad,
+                compressor.linear_wgate.weight.main_grad,
+                compressor.ape.grad,
+                compressor.norm.weight.grad,
+            )
+
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            for _ in range(3):
+                step()
+        torch.cuda.current_stream().wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured = step()
+        for prefixes in ([0, 129, 1801, 2048], [0, 997, 1025, 2048], [0, 0, 2048, 2048]):
+            cu.copy_(torch.tensor(prefixes, device="cuda", dtype=torch.int32))
+            layout = thd_layout_kernels.build_cp_compressor_layout(cu, 1024, 1024, 2, ratio)
+            physical = torch.arange(grad_out.shape[0], device="cuda") + grad_out.shape[0]
+            with torch.no_grad():
+                x.normal_()
+                boundary.normal_()
+                grad_out.normal_()
+                grad_out[~torch.isin(physical, layout.seq_to_rank_row)] = 0
+            expected = tuple(t.detach().clone() for t in step())
+            graph.replay()
+            for actual, eager in zip(captured, expected):
+                torch.testing.assert_close(actual.float(), eager.float(), rtol=2e-3, atol=2e-3)
 
     def test_forward_thd_fused_matches_eager(self):
         """THD forward: the fused dispatch engages and matches the eager path closely."""

@@ -8,7 +8,7 @@ directly. Local THD RoPE reuses MCore's fused MLA implementation.
 """
 
 import math
-from typing import Optional, Tuple
+from typing import NamedTuple, Optional, Tuple
 
 import torch
 
@@ -509,6 +509,237 @@ if _CUTE_AVAILABLE:
         )
 
     @cute.kernel
+    def _compressor_row_maps_kernel(
+        cu_seqlens: cute.Tensor,
+        compact_to_source: cute.Tensor,
+        source_to_compact: cute.Tensor,
+        comp_ids: cute.Tensor,
+        position_ids: cute.Tensor,
+        local_cu: cute.Tensor,
+        local_cuc: cute.Tensor,
+        global_cuc: cute.Tensor,
+        n_seq: cutlass.Int32,
+        global_start: cutlass.Int32,
+        l_local: cutlass.Int32,
+        ratio: cutlass.Constexpr,
+        d_comp: cutlass.Constexpr,
+        compact_len: cutlass.Int32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        bidx, _, _ = cute.arch.block_idx()
+        row = bidx * 128 + tidx
+        source_global = global_start - d_comp + row
+        source_row = cutlass.Int32(-1)
+        compact_row = cutlass.Int32(-1)
+        group_id = cutlass.Int32(-1)
+        running_tokens = 0
+        global_groups = 0
+        if row == 0:
+            local_cu[0] = 0
+            local_cuc[0] = 0
+            global_cuc[0] = 0
+        for seq in range(n_seq):
+            seq_start = cu_seqlens[seq]
+            seq_end = cu_seqlens[seq + 1]
+            local_end = cute.min(seq_end, global_start + l_local)
+            first = cute.ceil_div(cute.max(global_start - d_comp - seq_start, 0), ratio)
+            stop = (local_end - seq_start) // ratio
+            count = cutlass.Int32(0)
+            if seq_start < local_end and global_start < local_end:
+                count = cute.max(stop - first, 0)
+            tokens = count * ratio
+            if row >= running_tokens and row < running_tokens + tokens:
+                offset = row - running_tokens
+                group_id = first + offset // ratio
+                source_row = seq_start + first * ratio + offset - global_start + d_comp
+            if tokens > 0:
+                first_token = seq_start + first * ratio
+                if source_global >= first_token and source_global < first_token + tokens:
+                    compact_row = running_tokens + source_global - first_token
+            running_tokens = running_tokens + tokens
+            global_groups = global_groups + (seq_end - seq_start) // ratio
+            if row == 0:
+                local_cu[seq + 1] = running_tokens
+                local_cuc[seq + 1] = running_tokens // ratio
+                global_cuc[seq + 1] = global_groups
+        if row < compact_len:
+            compact_to_source[row] = source_row
+            if row % ratio == 0:
+                comp_ids[row // ratio] = group_id
+                position_ids[row // ratio] = cute.max(group_id, 0) * ratio
+        if row < l_local + d_comp:
+            source_to_compact[row] = compact_row
+
+    @cute.jit
+    def _compressor_row_maps_launch(
+        cu_seqlens: cute.Tensor,
+        compact_to_source: cute.Tensor,
+        source_to_compact: cute.Tensor,
+        comp_ids: cute.Tensor,
+        position_ids: cute.Tensor,
+        local_cu: cute.Tensor,
+        local_cuc: cute.Tensor,
+        global_cuc: cute.Tensor,
+        n_seq: cutlass.Int32,
+        global_start: cutlass.Int32,
+        l_local: cutlass.Int32,
+        ratio: cutlass.Constexpr,
+        d_comp: cutlass.Constexpr,
+        compact_len: cutlass.Int32,
+        stream: cuda.CUstream,
+    ):
+        _launch_named(
+            _compressor_row_maps_kernel,
+            "dsv4_cp_compressor_row_maps",
+            (
+                cu_seqlens,
+                compact_to_source,
+                source_to_compact,
+                comp_ids,
+                position_ids,
+                local_cu,
+                local_cuc,
+                global_cuc,
+                n_seq,
+                global_start,
+                l_local,
+                ratio,
+                d_comp,
+                compact_len,
+            ),
+            grid=(cute.ceil_div(cute.max(compact_len, l_local + d_comp), 128), 1, 1),
+            block=(128, 1, 1),
+            stream=stream,
+        )
+
+    @cute.jit
+    def _copy_compressor_projection_row(
+        local: cute.Tensor,
+        boundary: cute.Tensor,
+        compact: cute.Tensor,
+        row_map: cute.Tensor,
+        boundary_rows: cutlass.Int32,
+        row_width: cutlass.Constexpr,
+        backward: cutlass.Constexpr,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        row, _, _ = cute.arch.block_idx()
+        mapped_row = row_map[row]
+        # Both projections use the same row map. Vectorized copies preserve the
+        # projection bits, including exact zero writes for every padding row.
+        if cutlass.const_expr(compact.element_type.width == 16 and row_width % 4 == 0):
+            vec_elems = 4
+            copy_type = cutlass.Int64
+        elif cutlass.const_expr(compact.element_type.width == 16):
+            vec_elems = 1
+            copy_type = cutlass.Int16
+        else:
+            vec_elems = 1
+            copy_type = compact.element_type
+        for col in range(tidx, row_width // vec_elems, 64):
+            offset = col * vec_elems
+            value = copy_type(0)
+            if cutlass.const_expr(backward):
+                if mapped_row >= 0:
+                    src = cute.recast_ptr(
+                        compact.iterator + mapped_row * row_width + offset, dtype=copy_type
+                    )
+                    value = cute.arch.load(src.llvm_ptr, copy_type)
+                if row < boundary_rows:
+                    dst = cute.recast_ptr(
+                        boundary.iterator + row * row_width + offset, dtype=copy_type
+                    )
+                    cute.arch.store(dst.llvm_ptr, value)
+                else:
+                    dst = cute.recast_ptr(
+                        local.iterator + (row - boundary_rows) * row_width + offset, dtype=copy_type
+                    )
+                    cute.arch.store(dst.llvm_ptr, value)
+            else:
+                if mapped_row >= 0:
+                    if mapped_row < boundary_rows:
+                        src = cute.recast_ptr(
+                            boundary.iterator + mapped_row * row_width + offset, dtype=copy_type
+                        )
+                        value = cute.arch.load(src.llvm_ptr, copy_type)
+                    else:
+                        src = cute.recast_ptr(
+                            local.iterator + (mapped_row - boundary_rows) * row_width + offset,
+                            dtype=copy_type,
+                        )
+                        value = cute.arch.load(src.llvm_ptr, copy_type)
+                dst = cute.recast_ptr(compact.iterator + row * row_width + offset, dtype=copy_type)
+                cute.arch.store(dst.llvm_ptr, value)
+
+    @cute.kernel
+    def _compressor_projection_compact_kernel(
+        local_kv: cute.Tensor,
+        local_score: cute.Tensor,
+        boundary_kv: cute.Tensor,
+        boundary_score: cute.Tensor,
+        compact_kv: cute.Tensor,
+        compact_score: cute.Tensor,
+        row_map: cute.Tensor,
+        boundary_rows: cutlass.Int32,
+        row_width: cutlass.Constexpr,
+        backward: cutlass.Constexpr,
+    ):
+        _, projection, _ = cute.arch.block_idx()
+        if projection == 0:
+            _copy_compressor_projection_row(
+                local_kv, boundary_kv, compact_kv, row_map, boundary_rows, row_width, backward
+            )
+        else:
+            _copy_compressor_projection_row(
+                local_score,
+                boundary_score,
+                compact_score,
+                row_map,
+                boundary_rows,
+                row_width,
+                backward,
+            )
+
+    @cute.jit
+    def _compressor_projection_compact_launch(
+        local_kv: cute.Tensor,
+        local_score: cute.Tensor,
+        boundary_kv: cute.Tensor,
+        boundary_score: cute.Tensor,
+        compact_kv: cute.Tensor,
+        compact_score: cute.Tensor,
+        row_map: cute.Tensor,
+        boundary_rows: cutlass.Int32,
+        row_width: cutlass.Constexpr,
+        backward: cutlass.Constexpr,
+        rows: cutlass.Int32,
+        stream: cuda.CUstream,
+    ):
+        _launch_named(
+            _compressor_projection_compact_kernel,
+            (
+                "dsv4_cp_compressor_projection_compact_bwd"
+                if backward
+                else "dsv4_cp_compressor_projection_compact_fwd"
+            ),
+            (
+                local_kv,
+                local_score,
+                boundary_kv,
+                boundary_score,
+                compact_kv,
+                compact_score,
+                row_map,
+                boundary_rows,
+                row_width,
+                backward,
+            ),
+            grid=(rows, 2, 1),
+            block=(64, 1, 1),
+            stream=stream,
+        )
+
+    @cute.kernel
     def _build_attention_indices_kernel(
         cu_seqlens: cute.Tensor,
         cu_seqlens_unpadded: cute.Tensor,
@@ -832,6 +1063,154 @@ def _run_compiled_launch(
         *(cutlass.Int32(arg) for i, arg in enumerate(scalar_args) if i not in static_arg_set),
         cuda.CUstream(torch.cuda.current_stream(tensor_args[0].device).cuda_stream),
     )
+
+
+class CPCompressorLayout(NamedTuple):
+    """Reusable, fixed-capacity CP compressor row maps and pooling metadata.
+
+    Source rows address the conceptual ``[boundary[-d_comp:], local]`` buffer;
+    neither the hidden states nor their concatenation is stored in this layout.
+    The inverse map is injective, so backward needs no atomics or reductions.
+    All tensor values are rebuilt on device for each pack, including graph replay.
+    """
+
+    compact_to_source: torch.Tensor
+    source_to_compact: torch.Tensor
+    group_ids: torch.Tensor
+    position_ids: torch.Tensor
+    local_cu_seqlens: torch.Tensor
+    local_cu_seqlens_compressed: torch.Tensor
+    cu_seqlens_compressed: torch.Tensor
+    seq_to_rank_row: torch.Tensor
+    boundary_rows: int
+    global_start: int
+    cp_size: int
+
+
+def build_cp_compressor_layout(
+    cu_seqlens: torch.Tensor, global_start: int, l_local: int, cp_size: int, ratio: int
+) -> CPCompressorLayout:
+    """Build CP compaction metadata without materializing any hidden-size rows."""
+    if ratio < 1 or l_local < 1 or cp_size < 1:
+        raise ValueError("ratio, l_local and cp_size must all be positive.")
+    _require_cute("DSv4 CP compressor layout requires CUDA tensors and CuTeDSL.", cu_seqlens)
+    d_comp = 8 if ratio == 4 else ratio
+    alignment = 32 // math.gcd(32, ratio)
+    c_cap = max(1, (l_local + d_comp) // ratio)
+    c_cap = ((c_cap + alignment - 1) // alignment) * alignment
+    compact_len = c_cap * ratio
+
+    def empty(rows):
+        return torch.empty(rows, dtype=torch.int32, device=cu_seqlens.device)
+
+    compact_to_source = empty(compact_len)
+    source_to_compact = empty(l_local + d_comp)
+    group_ids, position_ids = empty(c_cap), empty(c_cap)
+    local_cu, local_cuc, global_cuc = (empty(cu_seqlens.shape[0]) for _ in range(3))
+    _run_compiled_launch(
+        _compressor_row_maps_launch,
+        (
+            cu_seqlens,
+            compact_to_source,
+            source_to_compact,
+            group_ids,
+            position_ids,
+            local_cu,
+            local_cuc,
+            global_cuc,
+        ),
+        (cu_seqlens.shape[0] - 1, int(global_start), int(l_local), ratio, d_comp, compact_len),
+        static_arg_indices=(3, 4),
+    )
+    seq_major_rows = l_local * cp_size // ratio
+    seq_to_rank_row = empty(seq_major_rows)
+    if seq_major_rows:
+        _run_compiled_launch(
+            _compressor_rank_row_launch,
+            (cu_seqlens, global_cuc, seq_to_rank_row),
+            (
+                cu_seqlens.shape[0] - 1,
+                int(l_local),
+                int(cp_size),
+                ratio,
+                d_comp,
+                c_cap,
+                seq_major_rows,
+            ),
+            static_arg_indices=(3, 4),
+        )
+    return CPCompressorLayout(
+        compact_to_source,
+        source_to_compact,
+        group_ids,
+        position_ids,
+        local_cu,
+        local_cuc,
+        global_cuc,
+        seq_to_rank_row,
+        d_comp,
+        int(global_start),
+        int(cp_size),
+    )
+
+
+class CompressorProjectionCompact(torch.autograd.Function):
+    """Compact KV and gate together after projection, retaining only the inverse map."""
+
+    @staticmethod
+    def forward(ctx, local_kv, local_score, boundary_kv, boundary_score, layout):
+        tensors = (local_kv, local_score, boundary_kv, boundary_score)
+        _require_cute("CP projection compaction requires CUDA and CuTeDSL.", *tensors)
+        if (
+            local_kv.shape != local_score.shape
+            or boundary_kv.shape != boundary_score.shape
+            or local_kv.shape[1:] != boundary_kv.shape[1:]
+            or boundary_kv.shape[0] != layout.boundary_rows
+            or local_kv.shape[0] + layout.boundary_rows != layout.source_to_compact.numel()
+        ):
+            raise ValueError("CP compressor projections do not match the shared row layout.")
+        if any(t.dtype != local_kv.dtype or not t.is_contiguous() for t in tensors):
+            raise ValueError(
+                "CP compressor projections must be contiguous and have the same dtype."
+            )
+        compact_shape = (layout.compact_to_source.numel(),) + tuple(local_kv.shape[1:])
+        compact_kv = local_kv.new_empty(compact_shape)
+        compact_score = torch.empty_like(compact_kv)
+        ctx.local_shape = local_kv.shape
+        ctx.boundary_shape = boundary_kv.shape
+        ctx.save_for_backward(layout.source_to_compact)
+        _run_compiled_launch(
+            _compressor_projection_compact_launch,
+            (*tensors, compact_kv, compact_score, layout.compact_to_source),
+            (layout.boundary_rows, math.prod(local_kv.shape[1:]), False, compact_shape[0]),
+            static_arg_indices=(1, 2),
+        )
+        return compact_kv, compact_score
+
+    @staticmethod
+    def backward(ctx, grad_kv, grad_score):
+        # Keep PyTorch's materialized zero gradient if only one output is used.
+        # Every unused source row is explicitly zeroed by the inverse-map kernel.
+        (inverse,) = ctx.saved_tensors
+        local_kv = grad_kv.new_empty(ctx.local_shape)
+        local_score = torch.empty_like(local_kv)
+        boundary_kv = grad_kv.new_empty(ctx.boundary_shape)
+        boundary_score = torch.empty_like(boundary_kv)
+        _run_compiled_launch(
+            _compressor_projection_compact_launch,
+            (
+                local_kv,
+                local_score,
+                boundary_kv,
+                boundary_score,
+                grad_kv.contiguous(),
+                grad_score.contiguous(),
+                inverse,
+            ),
+            (ctx.boundary_shape[0], math.prod(ctx.local_shape[1:]), True, inverse.numel()),
+            static_arg_indices=(1, 2),
+        )
+        return local_kv, local_score, boundary_kv, boundary_score, None
 
 
 class CompressorInputCompact(torch.autograd.Function):
