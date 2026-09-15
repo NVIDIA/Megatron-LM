@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum, auto
 from itertools import repeat
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, TypedDict, Union
 
 import torch
 from torch import Tensor
@@ -284,7 +284,16 @@ class RequestEntry:
     """Entry in the engine's `self.requests` dict."""
 
     record: DynamicInferenceRequestRecord
-    future: asyncio.Future
+    future: asyncio.Future[DynamicInferenceRequest]
+
+
+class DynamicInferenceEngineStepResult(TypedDict):
+    """Result returned by modern dynamic-engine step APIs."""
+
+    active_request_ids: list[int]
+    finished_requests: list[DynamicInferenceRequest]
+    step_time: float
+    cuda_graph_request_count: int | None
 
 
 # pylint: disable=line-too-long
@@ -302,7 +311,7 @@ class DynamicInferenceEngine(AbstractEngine):
     Args:
         text_generation_controller (TextGenerationController): A text generation
             controller that will be used to define how to preprocess prompts, generate
-            outputs and detokenizer the output tokens.
+            output tokens, and apply token-level generation policy.
         inference_context (DynamicInferenceContext): Context for managing in-flight
             batching and a dynamic block-level KV cache (similar to paged attention).
     """
@@ -510,8 +519,25 @@ class DynamicInferenceEngine(AbstractEngine):
         )
 
     def reset(self) -> None:
-        """Reset by removing all requests and reset all state."""
+        """Reset per-run state; the caller must first drain all requests."""
 
+        initialize_runtime_state = not hasattr(self, "_state_events")
+        if not initialize_runtime_state and self.state not in (
+            EngineState.RUNNING,
+            EngineState.PAUSED,
+        ):
+            raise RuntimeError(
+                "A drained engine can only be reset while RUNNING or PAUSED; "
+                f"got {self.state.name}."
+            )
+
+        if not initialize_runtime_state and self.requests:
+            raise RuntimeError(
+                "The engine must drain all requests before reset; "
+                f"got {len(self.requests)} outstanding request(s)."
+            )
+
+        use_coordinator = getattr(self, "use_coordinator", False)
         self._reset_pending_kv_imports()
         self.clear_vision_embedding_cache()
         self.context.reset()
@@ -552,12 +578,13 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # Runtime state.
         self.decode_only = DecodeOnly(consumed=None, launched=None)
-        self._loop = get_asyncio_loop(getattr(self, "_loop", None))
-        self._cond = asyncio.Condition()
-        self._state_events = {k: asyncio.Event() for k in self._STATE_EVENTS}
-        self.state = EngineState.RUNNING
-        self._state_events[EngineState.RUNNING].set()
-        self._pending_signals = deque()
+        if initialize_runtime_state:
+            self._loop = get_asyncio_loop(getattr(self, "_loop", None))
+            self._cond = asyncio.Condition()
+            self._state_events = {k: asyncio.Event() for k in self._STATE_EVENTS}
+            self.state = EngineState.RUNNING
+            self._state_events[EngineState.RUNNING].set()
+            self._pending_signals = deque()
 
         self.resume_request_ids = None
 
@@ -579,8 +606,9 @@ class DynamicInferenceEngine(AbstractEngine):
         self._prefill_tokens_skipped = 0
         self._prefix_coordination_waits = 0
 
-        # Coordinator state.
-        self.use_coordinator = False
+        # Coordinator mode and its long-lived runtime objects survive a drained
+        # reset; replacing them can strand waiters on the old asyncio objects.
+        self.use_coordinator = use_coordinator
 
     @staticmethod
     def _tensor_nbytes(tensor: Tensor) -> int:
@@ -1186,6 +1214,21 @@ class DynamicInferenceEngine(AbstractEngine):
         if dynamo_helper is not None:
             dynamo_helper.discard_pending_kv_stored_events()
 
+        # RECOMPUTE must preserve the current active row order, which maps sampling
+        # RNG draws and request metadata to IDs. Paused rows precede active rows and
+        # resume from the right (LIFO). Snapshot both before releasing their tensors.
+        if (
+            self.context.kv_cache_management_mode == KVCacheManagementMode.RECOMPUTE
+            and self.requests
+        ):
+            resident_request_ids = self.context.request_ids[
+                : self.context.total_request_count
+            ].tolist()
+            resident_paused_count = self.context.paused_request_count
+        else:
+            resident_request_ids = []
+            resident_paused_count = 0
+
         # Deallocate context tensors.
         with self.__class__.suspend_resume_ctx(
             "suspended", unified_memory_level=self.unified_memory_level
@@ -1210,28 +1253,40 @@ class DynamicInferenceEngine(AbstractEngine):
         # All waiting requests are always included; active requests are included
         # only if they are marked for recompute (their KV cache will be gone).
         waiting_request_ids = list(self.waiting_request_ids)
-        active_request_ids = set(self.requests.keys()) - set(waiting_request_ids)
+        waiting_request_id_set = set(waiting_request_ids)
         if self.context.kv_cache_management_mode == KVCacheManagementMode.RECOMPUTE:
             self.controller._async_sched_logits.clear()
-            recompute_active_ids = active_request_ids
+            ordered_resident_ids = [
+                *resident_request_ids[resident_paused_count:],
+                *reversed(resident_request_ids[:resident_paused_count]),
+            ]
+            recompute_resident_ids = [
+                request_id
+                for request_id in ordered_resident_ids
+                if request_id not in waiting_request_id_set
+            ]
 
             # Reset any partially prefilled requests so they recompute from the start
-            for req_id in [*waiting_request_ids, *recompute_active_ids]:
+            for req_id in [*waiting_request_ids, *recompute_resident_ids]:
                 req = self.get_request(req_id)
-                if req.finished_chunk_token_count > 0:
+                if req.finished_chunk_token_count > 0 and not req.generated_tokens:
                     req.remaining_prompt_tokens = req.prompt_tokens
                     req.finished_chunk_token_count = 0
+                    # The restarted prefill recomputes these positions, so its
+                    # scores must replace rather than follow the partial scores.
+                    req.prompt_log_probs = None
+                    req.prompt_top_n_logprobs = None
                     req.num_matched_prefix_blocks = 0
 
             # Reset the chunked prefill request id
             self.chunked_prefill_request_id = -1
         else:
-            recompute_active_ids = set()
-        self.resume_request_ids = [*recompute_active_ids, *waiting_request_ids]
+            recompute_resident_ids = []
+        self.resume_request_ids = [*recompute_resident_ids, *waiting_request_ids]
         self.waiting_request_ids.clear()
 
-        # Checkpoint active requests that are marked for recompute.
-        for request_id in recompute_active_ids:
+        # Checkpoint resident requests that are marked for recompute.
+        for request_id in recompute_resident_ids:
             self.requests[request_id].record.checkpoint()
 
         # If we are not using the inference coordinator, we need to manually handle state.
@@ -1289,7 +1344,7 @@ class DynamicInferenceEngine(AbstractEngine):
             torch.cuda.synchronize()
             for request_id in self.resume_request_ids:
                 request = self.get_request(request_id)
-                self._add_request(request)
+                self._add_request(request, is_resume=True)
                 if isinstance(request, DynamicVLMInferenceRequest):
                     # Buffer reinitialization wipes the context maps. Restore
                     # either the freshly recomputed state or the explicitly
@@ -1335,24 +1390,31 @@ class DynamicInferenceEngine(AbstractEngine):
         async with self._cond:
             self._cond.notify_all()
 
-    def _send_request_records_to_coordinator(
-        self, records: List[DynamicInferenceRequestRecord]
-    ) -> None:
-        """Send completed or failed request records from the MP coordinator."""
+    @staticmethod
+    def _complete_request(request_entry: RequestEntry) -> DynamicInferenceRequest:
+        """Merge an engine-owned record once and resolve its completion future."""
+        assert not request_entry.future.done(), "Request future was already resolved."
+        finished_request = request_entry.record.merge()
+        request_entry.future.set_result(finished_request)
+        return finished_request
 
-        merged_requests = [record.merge() for record in records]
+    def _send_requests_to_coordinator(self, requests: List[DynamicInferenceRequest]) -> None:
+        """Send completed or failed flat requests from model-parallel rank 0."""
+
         if self.local_metadata_ledger_enabled:
             # Failed requests are sent immediately but remain in the engine until the
             # next bookkeeping pass. Index only completed requests as they are dropped.
-            for merged in merged_requests:
-                if merged.status == Status.FAILED:
+            for request in requests:
+                if request.status == Status.FAILED:
                     continue
                 assert (
-                    merged.uid not in self.local_metadata_ledger
-                ), f"finished-request ledger: duplicate uid {merged.uid!r}"
-                self.local_metadata_ledger[merged.uid] = FinishedRequestRecord.from_request(merged)
+                    request.uid not in self.local_metadata_ledger
+                ), f"finished-request ledger: duplicate uid {request.uid!r}"
+                self.local_metadata_ledger[request.uid] = FinishedRequestRecord.from_request(
+                    request
+                )
         self.socket_for_receiving_requests.send_multipart(
-            _engine_reply_frames([request.serialize() for request in merged_requests])
+            _engine_reply_frames([request.serialize() for request in requests])
         )
 
     def _handle_failed_request(self, request_id: int):
@@ -1387,22 +1449,11 @@ class DynamicInferenceEngine(AbstractEngine):
         request.status = Status.FAILED
         request.add_event_fail()
         self.failed_request_ids.append(request_id)
+        finished_request = self._complete_request(request_entry)
 
         # Send the reply immediately, because it may never get a chance to be sent again.
         if self.use_coordinator and self.is_mp_coordinator:
-            self._send_request_records_to_coordinator([request_entry.record])
-        elif not self.use_coordinator:
-            if request.prompt is None:
-                request.prompt = self.controller.tokenizer.detokenize(
-                    request.prompt_tokens.tolist()
-                )
-            if request.generated_tokens:
-                request.generated_text = self.controller.tokenizer.detokenize(
-                    request.generated_tokens
-                )
-            else:
-                request.generated_text = ""
-        request_entry.future.set_result(request_entry.record)
+            self._send_requests_to_coordinator([finished_request])
 
     def _fail_submission(
         self, request_id: int, sampling_params: Optional[SamplingParams], exc: BaseException
@@ -1432,6 +1483,31 @@ class DynamicInferenceEngine(AbstractEngine):
             future=self._loop.create_future(),
         )
         self._handle_failed_request(request_id)
+
+    def _collect_failed_requests(
+        self, request_ids: Optional[set[int]] = None
+    ) -> List[DynamicInferenceRequest]:
+        """Remove and return a snapshot of synchronously failed requests.
+
+        Args:
+            request_ids: Optional ownership filter. Failed requests outside this
+                set remain queued for their caller.
+
+        Returns:
+            Failed requests selected from the current queue snapshot.
+        """
+        failed_request_ids, self.failed_request_ids = self.failed_request_ids, []
+        failed_requests = []
+        for failed_request_id in failed_request_ids:
+            if request_ids is not None and failed_request_id not in request_ids:
+                self.failed_request_ids.append(failed_request_id)
+                continue
+            failed_entry = self.requests.pop(failed_request_id)
+            assert (
+                failed_entry.future.done()
+            ), f"Failed request {failed_request_id} future has not been properly resolved."
+            failed_requests.append(failed_entry.future.result())
+        return failed_requests
 
     def has_unfinished_requests(self) -> bool:
         """Test if context contains unfinished requests."""
@@ -1466,12 +1542,14 @@ class DynamicInferenceEngine(AbstractEngine):
             raise ValueError("Async scheduling does not support routing replay.")
 
     def _add_request(
-        self, request: DynamicInferenceRequest
+        self, request: DynamicInferenceRequest, *, is_resume: bool = False
     ) -> asyncio.Future[DynamicInferenceRequest]:
         """Add a request to the engine.
 
         Args:
             request (DynamicInferenceRequest): Request to add.
+            is_resume (bool): Whether an existing record is being explicitly
+                re-admitted after suspend/resume.
 
         Returns:
             asyncio.Future[DynamicInferenceRequest]: Future completed when the request finishes.
@@ -1479,9 +1557,12 @@ class DynamicInferenceEngine(AbstractEngine):
 
         request_id = request.request_id
 
-        # Add request to self.requests. If the engine has previously been
-        # suspended, then the request may already exist.
-        if request_id not in self.requests:
+        if is_resume:
+            if request_id not in self.requests or self.get_request(request_id) is not request:
+                raise ValueError(f"Cannot resume unknown request ID {request_id}.")
+        elif request_id in self.requests:
+            raise ValueError(f"Request ID {request_id} is already active.")
+        else:
             self.requests[request_id] = RequestEntry(
                 record=DynamicInferenceRequestRecord.from_request(request),
                 future=self._loop.create_future(),
@@ -1635,6 +1716,11 @@ class DynamicInferenceEngine(AbstractEngine):
         Return:
             Returns an asyncio `Future[DynamicInferenceRequest]` for the user to wait on.
         """
+        if request_id in self.requests:
+            raise ValueError(f"Request ID {request_id} is already active.")
+        if sampling_params is None:
+            sampling_params = SamplingParams()
+
         input_modalities = ["text"]
         if num_frames is not None:
             input_modalities.append("video")
@@ -1937,7 +2023,7 @@ class DynamicInferenceEngine(AbstractEngine):
         finished_handoff_block_ids: Optional[Dict[int, list[int]]] = None,
         finished_handoff_ssm_slots: Optional[Dict[int, int]] = None,
         finished_handoff_decode_tokens: Optional[Dict[int, list[int]]] = None,
-    ) -> Tuple[List[DynamicInferenceRequest], List[DynamicInferenceRequest]]:
+    ) -> Tuple[List[int], List[DynamicInferenceRequest]]:
         """
         Handles post-processing for requests after a step.
 
@@ -1965,11 +2051,11 @@ class DynamicInferenceEngine(AbstractEngine):
                 needed to resume directly from imported prefill state on decode.
 
         Returns:
-            A list of active requests and completed requests as `DynamicInferenceRequest` objects
+            Active request IDs and completed requests.
         """
         active_request_ids: list[int] = []
         finished_request_ids = set(finished_request_ids.tolist())
-        finished_request_records: list[DynamicInferenceRequestRecord] = []
+        finished_requests: list[DynamicInferenceRequest] = []
         self.finished_request_count += len(finished_request_ids)
         if evict_request_ids is not None:
             self.evicted_request_count += evict_request_ids.numel()
@@ -2015,6 +2101,7 @@ class DynamicInferenceEngine(AbstractEngine):
         for req_idx, (request_id, tokens, accepted_tokens_list, request_log_probs) in enumerate(
             zip(request_id_list, sample.tolist(), accepted_tokens_iter, log_probs_iter)
         ):
+            finished_entry = None
 
             # Ensure tokens is always a list for consistent handling
             if not isinstance(tokens, list):
@@ -2033,6 +2120,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 tokens = accepted_tokens + tokens
 
             num_stop_word_trim = 0
+            num_stop_word_prompt_score_trim = 0
             is_prefill = len(request.generated_tokens) == 0
             if request_id != consumed_chunked_prefill_request_id:
                 # Skip appending token for requests being finished due to stop words
@@ -2109,8 +2197,15 @@ class DynamicInferenceEngine(AbstractEngine):
                 # appended token. The check truncates generated_tokens in-place and
                 # returns how many trailing tokens were removed so we can also trim
                 # the corresponding log probs below.
-                stop_word_hit, num_stop_word_trim = self._check_stop_words_for_request_post_append(
-                    request
+                num_new_tokens = (
+                    len(tokens) if request_id not in self.stop_word_being_finished_ids else 0
+                )
+                stop_word_hit, num_stop_word_trim, num_stop_word_prompt_score_trim = (
+                    self._check_stop_words_for_request_post_append(
+                        request,
+                        record=self.requests[request_id].record,
+                        num_new_tokens=num_new_tokens,
+                    )
                 )
 
                 # Track per-position acceptance statistics for logging.
@@ -2157,11 +2252,7 @@ class DynamicInferenceEngine(AbstractEngine):
                         self._release_pinned_handoff_ssm_slot(
                             handoff_ssm_slots_by_request.get(request_id)
                         )
-                    finished_entry = self.requests.pop(request_id)
-                    finished_request = finished_entry.record[-1]
-                    finished_request.generated_length = len(finished_request.generated_tokens)
-                    finished_request_records.append(finished_entry.record)
-                    finished_entry.future.set_result(finished_entry.record)
+                    finished_entry = self.requests[request_id]
                 elif stop_word_hit:
                     # Stop word detected - mark for removal in next step's bookkeeping
                     # Don't pop yet; let the next step handle it properly via callback
@@ -2177,11 +2268,12 @@ class DynamicInferenceEngine(AbstractEngine):
 
             # When a stop word was found mid-speculative-batch, trim log probs
             # and top_n_logprobs to match the truncated generated_tokens.
-            if num_stop_word_trim > 0:
+            num_stop_word_score_trim = num_stop_word_trim + num_stop_word_prompt_score_trim
+            if num_stop_word_score_trim > 0:
                 if request_log_probs is not None:
-                    request_log_probs = request_log_probs[:-num_stop_word_trim]
+                    request_log_probs = request_log_probs[:-num_stop_word_score_trim]
                 if top_n_logprobs is not None and req_idx in top_n_logprobs:
-                    top_n_logprobs[req_idx] = top_n_logprobs[req_idx][:-num_stop_word_trim]
+                    top_n_logprobs[req_idx] = top_n_logprobs[req_idx][:-num_stop_word_score_trim]
 
             # Process requested log_probs (unified for both regular and chunked prefill)
             # Skip for requests being finished due to stop words — tokens are not
@@ -2208,7 +2300,8 @@ class DynamicInferenceEngine(AbstractEngine):
                     if is_chunked_prefill:
                         pass
                     elif is_prefill:
-                        request.generated_log_probs.append(request_log_probs[-1])
+                        if request.generated_tokens and len(request_log_probs) > 0:
+                            request.generated_log_probs.append(request_log_probs[-1])
                     else:
                         request.generated_log_probs.extend(request_log_probs)
                 else:
@@ -2231,6 +2324,10 @@ class DynamicInferenceEngine(AbstractEngine):
                 top_n_logprobs is not None
                 and req_idx in top_n_logprobs
                 and request_id not in self.stop_word_being_finished_ids
+                and not (
+                    request_id == consumed_chunked_prefill_request_id
+                    and request.sampling_params.skip_prompt_log_probs
+                )
             ):
                 # Initialize lists if they don't exist
                 if request.prompt_top_n_logprobs is None:
@@ -2265,6 +2362,12 @@ class DynamicInferenceEngine(AbstractEngine):
                     else:
                         request.generated_top_n_logprobs.append(logit_dict)
 
+            # Merge only after the final token's scores and metadata have been applied.
+            if finished_entry is not None:
+                popped_entry = self.requests.pop(request_id)
+                assert popped_entry is finished_entry
+                finished_requests.append(self._complete_request(finished_entry))
+
         # Handle evicted requests.
         if evict_request_ids is not None and evict_request_ids.numel() > 0:
 
@@ -2285,12 +2388,11 @@ class DynamicInferenceEngine(AbstractEngine):
         # Clear the stop word being finished set after processing
         self.stop_word_being_finished_ids.clear()
 
-        # Remove VLM data for finished requests from the context.
-        for record in finished_request_records:
-            req = record[-1]
-            self.context.remove_vlm_request_data(req.request_id)
+        # Finished VLM data is no longer needed after the request has been flattened.
+        for request in finished_requests:
+            self.context.remove_vlm_request_data(request.request_id)
 
-        return active_request_ids, finished_request_records
+        return active_request_ids, finished_requests
 
     def _get_and_clear_stop_word_finished_ids(self, active_request_ids: list[int]) -> set[int]:
         """Get and clear the set of request IDs that should be finished due to stop words.
@@ -2316,8 +2418,12 @@ class DynamicInferenceEngine(AbstractEngine):
         return result
 
     def _check_stop_words_for_request_post_append(
-        self, request: DynamicInferenceRequest
-    ) -> Tuple[bool, int]:
+        self,
+        request: DynamicInferenceRequest,
+        *,
+        record: Optional[DynamicInferenceRequestRecord] = None,
+        num_new_tokens: Optional[int] = None,
+    ) -> Tuple[bool, int, int]:
         """Check if a request should stop due to stop words (after token is appended).
 
         This method is called from post_process_requests after the token has already
@@ -2333,35 +2439,167 @@ class DynamicInferenceEngine(AbstractEngine):
 
         Args:
             request: The request to check.
+            record: Full checkpoint history for the request. Supplying the record
+                lets stop sequences span checkpoint boundaries.
+            num_new_tokens: Number of tokens appended in the current step. The
+                returned trim count is limited to these tokens so the caller can
+                trim pending log-probability results without deleting prompt data.
 
         Returns:
-            Tuple of (stop_word_hit, num_tokens_trimmed):
+            Tuple of (stop_word_hit, num_new_tokens_trimmed,
+            num_recomputed_prompt_scores_trimmed):
                 stop_word_hit: True if the generated sequence contains a stop word.
-                num_tokens_trimmed: Number of tokens removed from the end of
-                    generated_tokens (0 when the stop word is at the very end
-                    or when no stop word was found).
+                num_new_tokens_trimmed: Number of current-step tokens removed
+                    from the end of generated_tokens.
+                num_recomputed_prompt_scores_trimmed: Number of prompt-score
+                    entries corresponding to stripped tokens from older
+                    checkpoint segments.
         """
         if request.stop_word_ids is None or len(request.stop_word_ids) == 0:
-            return False, 0
+            return False, 0, 0
 
-        generated_tokens = request.generated_tokens
+        segments = record.requests if record is not None else [request]
+        if record is not None:
+            assert record[-1] is request
 
+        # Legacy direct callers do not have pending score tensors to align and
+        # expect the complete token trim count. The engine path always supplies
+        # num_new_tokens.
+        engine_call = num_new_tokens is not None
+        endpoint_count = num_new_tokens if engine_call else self.num_speculative_tokens + 1
+        pending_token_count = num_new_tokens if engine_call else len(request.generated_tokens)
+        generated_tokens = []
+        suffix_length = max(map(len, request.stop_word_ids)) + max(0, endpoint_count - 1)
+        for segment in reversed(segments):
+            take = min(suffix_length - len(generated_tokens), len(segment.generated_tokens))
+            if take > 0:
+                generated_tokens[:0] = segment.generated_tokens[-take:]
+            if len(generated_tokens) == suffix_length:
+                break
+        tpot_is_token_aligned = {
+            id(segment): len(segment.tpot) == len(segment.generated_tokens) for segment in segments
+        }
+
+        def trim_segment_tail(
+            segment: DynamicInferenceRequest, trim: int, *, trim_stored_scores: bool
+        ) -> None:
+            """Trim token-correlated state from one request segment."""
+            if trim == 0:
+                return
+
+            removed_tokens = list(segment.generated_tokens[-trim:])
+            segment.generated_tokens = segment.generated_tokens[:-trim]
+
+            if trim_stored_scores:
+                for key in ("generated_log_probs", "generated_top_n_logprobs"):
+                    values = getattr(segment, key, None)
+                    if values is not None:
+                        setattr(segment, key, values[:-trim])
+
+            # TPOT is intentionally sparse on non-logging steps. Trim it only
+            # when it is demonstrably one value per generated token.
+            if tpot_is_token_aligned[id(segment)]:
+                segment.tpot = segment.tpot[:-trim]
+
+            generated_event_indexes = [
+                idx
+                for idx, event in enumerate(segment.events)
+                if event.type == DynamicInferenceEventType.GENERATED_TOKEN
+            ]
+            if generated_event_indexes:
+                assert len(generated_event_indexes) >= trim
+                indexes_to_remove = generated_event_indexes[-trim:]
+                event_tokens = [
+                    segment.events[idx].payload["token_id"] for idx in indexes_to_remove
+                ]
+                assert event_tokens == removed_tokens
+                for idx in reversed(indexes_to_remove):
+                    del segment.events[idx]
+
+            if segment.generated_length is not None:
+                segment.generated_length = len(segment.generated_tokens)
+
+        matched_stop = None
         for stop_word_ids in request.stop_word_ids:
             stop_len = len(stop_word_ids)
-            if len(generated_tokens) >= stop_len:
-                # Check the last stop_len tokens shifting by 1 up to num_speculative_tokens.
-                # Speculative decoding can append multiple tokens at once, so the stop
-                # word might end at any position within the newly appended tokens.
-                for i in range(self.num_speculative_tokens + 1):
-                    end_idx = -i if i > 0 else None
-                    if list(generated_tokens[-stop_len - i : end_idx]) == stop_word_ids:
-                        trim = (
-                            i if request.sampling_params.detokenize_stop_sequence else i + stop_len
-                        )
-                        if trim > 0:
-                            request.generated_tokens = request.generated_tokens[:-trim]
-                        return True, trim
-        return False, 0
+            if len(generated_tokens) < stop_len:
+                continue
+            # Search every endpoint produced in this step before mutating state.
+            # A larger trailing-token count means this stop completed earlier;
+            # at the same endpoint, prefer the longer stop sequence.
+            for trailing_token_count in range(endpoint_count):
+                end_idx = -trailing_token_count if trailing_token_count > 0 else None
+                if (
+                    list(generated_tokens[-stop_len - trailing_token_count : end_idx])
+                    == stop_word_ids
+                ):
+                    candidate = (trailing_token_count, stop_len)
+                    if matched_stop is None or candidate > matched_stop:
+                        matched_stop = candidate
+
+        if matched_stop is None:
+            return False, 0, 0
+
+        trailing_token_count, stop_len = matched_stop
+        total_trim = (
+            trailing_token_count
+            if request.sampling_params.detokenize_stop_sequence
+            else trailing_token_count + stop_len
+        )
+        pending_trim = min(total_trim, pending_token_count)
+        if pending_trim > 0:
+            trim_segment_tail(request, pending_trim, trim_stored_scores=False)
+
+        # Any remainder belongs to tokens generated before this step. Remove
+        # their already-stored result metadata from newest to oldest so merged
+        # tokens, logprobs, and top-N values stay aligned.
+        stored_trim = total_trim - pending_trim
+        older_segment_trim = 0
+        for segment in reversed(segments):
+            if stored_trim == 0:
+                break
+            segment_trim = min(stored_trim, len(segment.generated_tokens))
+            if segment_trim == 0:
+                continue
+            trim_segment_tail(segment, segment_trim, trim_stored_scores=True)
+            if segment is not request:
+                older_segment_trim += segment_trim
+            stored_trim -= segment_trim
+        assert stored_trim == 0, "Stop-word trim exceeds generated history."
+
+        # Tokens from older checkpoint segments are duplicated at the end of
+        # the active segment's cumulative prompt. Drop the same suffix so
+        # terminal routing/serialization lengths describe the visible result.
+        if older_segment_trim > 0:
+            old_prompt_tokens = request.prompt_tokens
+            old_remaining_prompt_tokens = request.remaining_prompt_tokens
+            request.prompt_tokens = old_prompt_tokens[:-older_segment_trim]
+            if old_remaining_prompt_tokens is not None:
+                remaining_length = max(0, len(old_remaining_prompt_tokens) - older_segment_trim)
+                request.remaining_prompt_tokens = (
+                    request.prompt_tokens[-remaining_length:]
+                    if remaining_length > 0
+                    else request.prompt_tokens[:0]
+                )
+
+        prompt_score_trim = 0
+        if older_segment_trim > 0 and not request.sampling_params.skip_prompt_log_probs:
+            # Chunked prefill may already have stored some prompt scores. Remove
+            # any suffix now outside the shortened prompt and ask the caller to
+            # trim only the remainder from this step's pending score tensors.
+            target_prompt_score_count = max(0, len(request.prompt_tokens) - 1)
+            existing_prompt_score_count = len(request.prompt_log_probs or [])
+            stored_prompt_score_trim = min(
+                older_segment_trim, max(0, existing_prompt_score_count - target_prompt_score_count)
+            )
+            if stored_prompt_score_trim > 0:
+                request.prompt_log_probs = request.prompt_log_probs[:-stored_prompt_score_trim]
+                if request.prompt_top_n_logprobs is not None:
+                    request.prompt_top_n_logprobs = request.prompt_top_n_logprobs[
+                        :-stored_prompt_score_trim
+                    ]
+            prompt_score_trim = older_segment_trim - stored_prompt_score_trim
+        return True, pending_trim, prompt_score_trim
 
     def get_prefix_coordination_metrics(self) -> dict:
         """Return prefix caching coordination metrics.
@@ -2978,7 +3216,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
     async def async_bookkeep(
         self, step_result: Optional[Dict], context_state: Dict, step_time: float
-    ):
+    ) -> DynamicInferenceEngineStepResult:
         """Uses `asyncio` for continuous bookkeeping.
 
         Args:
@@ -2989,8 +3227,8 @@ class DynamicInferenceEngine(AbstractEngine):
 
         Returns:
             A dictionary containing:
-                active_requests (List): Requests that ran in the last step and are still active.
-                finished_requests (List): Requests that ran in the last step and have now finished.
+                active_request_ids (List): IDs that ran in the last step and remain active.
+                finished_requests (List): Flat, text-unfinalized requests that finished.
                 step_time (float): The step time in seconds.
                 cuda_graph_request_count (int): The CUDA graph batch size matching this step.
         """
@@ -3018,8 +3256,8 @@ class DynamicInferenceEngine(AbstractEngine):
                 newly_paused_request_ids = newly_paused_request_ids.tolist()
                 [self.get_request(i).add_event_pause() for i in newly_paused_request_ids]
 
-            # Process finished requests (adds FINISH events and returns records).
-            active_request_ids, finished_request_records = self.post_process_requests(
+            # Process finished requests after applying all final-step metadata.
+            active_request_ids, finished_requests = self.post_process_requests(
                 active_request_ids,
                 finished_request_ids,
                 evict_request_ids,
@@ -3039,57 +3277,30 @@ class DynamicInferenceEngine(AbstractEngine):
 
         else:
             active_request_ids: list[int] = []
-            finished_request_records: list[DynamicInferenceRequestRecord] = []
+            finished_requests: list[DynamicInferenceRequest] = []
 
-        # Failed requests. Status and events were already set in _handle_failed_request;
-        # here we just clean up the entry and include it in finished_request_records.
-        for failed_request_id in self.failed_request_ids:
-            failed_entry = self.requests.pop(failed_request_id)
-            finished_request_records.append(failed_entry.record)
-            assert (
-                failed_entry.future.done()
-            ), f"Failed request {failed_request_id} future has not been properly resolved."
-        self.failed_request_ids.clear()
+        # Failed requests. Take the current queue snapshot so a later admission
+        # cannot be erased by this bookkeeping pass.
+        finished_requests.extend(self._collect_failed_requests())
 
         nvtx_range_pop("bookkeeping")
 
-        # Detokenize all finished requests if not using
-        # the coordinator. Otherwise, the coordinator will
-        # overlap detokenization with the engine.
-        if not self.use_coordinator:
-            nvtx_range_push("detokenization")
-            for record in finished_request_records:
-                for request in record.requests:
-                    if request.prompt is None:
-                        request.prompt = self.controller.detokenize(
-                            self.controller.tokenizer,
-                            request.prompt_tokens.tolist(),
-                            remove_EOD=False,
-                        )
-                    request.generated_text = self.controller.detokenize(
-                        self.controller.tokenizer,
-                        request.generated_tokens,
-                        remove_EOD=not request.sampling_params.detokenize_stop_sequence,
-                    )
-            nvtx_range_pop("detokenization")
-
         # Handle necessary ZMQ DP coordinator communication.
-        # Failed request replies were already sent in _handle_failed_request,
-        # so only send completed records here.
+        # Failed request replies were already sent in _handle_failed_request.
         if self.use_coordinator and self.is_mp_coordinator:
-            records_to_send = [
-                r for r in finished_request_records if r.requests[-1].status != Status.FAILED
+            requests_to_send = [
+                request for request in finished_requests if request.status != Status.FAILED
             ]
-            if records_to_send:
+            if requests_to_send:
                 nvtx_range_push("coordinator_communication")
-                self._send_request_records_to_coordinator(records_to_send)
+                self._send_requests_to_coordinator(requests_to_send)
                 nvtx_range_pop("coordinator_communication")
 
             # Stream newly generated tokens for active requests. Finished
             # requests were already popped from self.requests above, so their
             # emit lengths are dropped here rather than in the loop.
-            for record in finished_request_records:
-                self._partial_emit_lengths.pop(record.requests[-1].request_id, None)
+            for request in finished_requests:
+                self._partial_emit_lengths.pop(request.request_id, None)
             self._try_send_streaming_partials()
 
         # Drain prefix cache hit counters from context into engine accumulators.
@@ -3273,24 +3484,19 @@ class DynamicInferenceEngine(AbstractEngine):
 
         return {
             "active_request_ids": active_request_ids,
-            "finished_request_records": finished_request_records,
+            "finished_requests": finished_requests,
             "step_time": step_time,
             "cuda_graph_request_count": cuda_graph_request_count,
         }
 
-    async def async_step(
-        self,
-    ) -> Tuple[List[DynamicInferenceRequest], List[DynamicInferenceRequest], float]:
+    async def async_step(self) -> DynamicInferenceEngineStepResult:
         """
         Wrapper for controller.generate_output_tokens_dynamic_batch(), to
         match vLLM API. Uses `asyncio` for continuous generation which allows this
         method to sleep and wake up when new requests are available.
 
         Returns:
-            A tuple comprised of:
-                1. Requests that ran in the last step and are still active.
-                2. Requests that ran in the last step and have now finished.
-                3. The step time in seconds.
+            Active request IDs, finished requests, and step metadata.
         """
         last_step_data = await self.async_forward()
         ret = await self.async_bookkeep(*last_step_data)
@@ -3315,9 +3521,7 @@ class DynamicInferenceEngine(AbstractEngine):
             # No running loop - safe to use run_until_complete
             return self._loop.run_until_complete(coro)
 
-    def step_modern(
-        self,
-    ) -> Tuple[List[DynamicInferenceRequest], List[DynamicInferenceRequest], float]:
+    def step_modern(self) -> DynamicInferenceEngineStepResult:
         """Synchronous wrapper for `self.async_step`."""
         return self._run_coroutine_sync(self.async_step())
 
@@ -3332,8 +3536,7 @@ class DynamicInferenceEngine(AbstractEngine):
         )
         result = self._run_coroutine_sync(self.async_step())
         active_requests = [self.get_request(i) for i in result["active_request_ids"]]
-        finished_requests = [r.merge() for r in result["finished_request_records"]]
-        return active_requests, finished_requests, result["step_time"]
+        return active_requests, result["finished_requests"], result["step_time"]
 
     # For backwards compatibility, point `step()` to `step_legacy()`. Starting in
     # `megatron-core` 0.16, `step_modern()` will be renamed to `step()`.
@@ -3342,21 +3545,28 @@ class DynamicInferenceEngine(AbstractEngine):
     def generate(
         self, prompts: List[str], sampling_params: Optional[SamplingParams] = SamplingParams()
     ) -> List[DynamicInferenceRequest]:
-        """Generates completions for a static list of prompts."""
+        """Generate token-complete, text-unfinalized requests for a prompt batch."""
 
+        request_futures = []
+        submitted_request_ids = set()
         for prompt in prompts:
             request_id = int(next(self.request_counter))
-            _ = self.add_request(request_id, prompt, sampling_params)
+            submitted_request_ids.add(request_id)
+            request_futures.append(self.add_request(request_id, prompt, sampling_params))
 
-        finished_request_records_list = []
-        while self.has_unfinished_requests():
-            result = self.step_modern()
-            finished_request_records_list.extend(result["finished_request_records"])
+        # Admission failures resolve their futures synchronously. Remove only
+        # this call's failed entries, and do not run an empty model step solely
+        # to make bookkeeping observe them.
+        self._collect_failed_requests(submitted_request_ids)
+        while any(not future.done() for future in request_futures):
+            self.step_modern()
+
+        finished_requests = [future.result() for future in request_futures]
 
         # Ensure requests are returned in the same order they were passed in.
-        finished_request_records_list.sort(key=lambda r: r.request_id)
+        finished_requests.sort(key=lambda request: request.request_id)
 
-        return finished_request_records_list
+        return finished_requests
 
     @staticmethod
     def _pack_tp_broadcast(messages: List[List[bytes]]) -> List[bytes]:
@@ -3636,6 +3846,7 @@ class DynamicInferenceEngine(AbstractEngine):
             else:
                 raise UnknownHeaderError(header)
 
+        self._collect_failed_requests()
         return len(all_messages)
 
     async def shutdown(self):
