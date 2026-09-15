@@ -315,20 +315,24 @@ class TestMHCTEGraphs:
 
         def step(model, value):
             model.zero_grad(set_to_none=True)
-            delivered_grads = {}
-            handles = []
-            for name, parameter in model.named_parameters():
-                if parameter.requires_grad:
 
-                    def record_gradient(parameter, _name=name):
-                        delivered_grads[_name] = parameter.grad.detach().clone()
+            def own_gradient(parameter):
+                # TE reuses gradient buffers between captured backward graphs.
+                # Native DDP immediately copies into owned main_grad storage;
+                # this standalone optimizer must likewise own each .grad before
+                # the next backward graph can reuse its returned buffer.
+                parameter.grad = parameter.grad.clone()
 
-                    handles.append(parameter.register_post_accumulate_grad_hook(record_gradient))
-            hidden = value.detach().clone().requires_grad_()
-            output = model(
-                input_ids=ids, position_ids=positions, attention_mask=None, decoder_input=hidden
-            )
+            handles = [
+                parameter.register_post_accumulate_grad_hook(own_gradient)
+                for parameter in model.parameters()
+                if parameter.requires_grad
+            ]
             try:
+                hidden = value.detach().clone().requires_grad_()
+                output = model(
+                    input_ids=ids, position_ids=positions, attention_mask=None, decoder_input=hidden
+                )
                 output.float().square().mean().backward()
             finally:
                 for handle in handles:
@@ -337,15 +341,6 @@ class TestMHCTEGraphs:
                 name: None if p.grad is None else p.grad.detach().clone()
                 for name, p in model.named_parameters()
             }
-            for name, delivered in delivered_grads.items():
-                torch.testing.assert_close(
-                    grads[name],
-                    delivered,
-                    rtol=0,
-                    atol=0,
-                    msg=lambda message: f'Gradient storage changed after delivery for {name}: '
-                    f'{message}',
-                )
             return output.detach().clone(), hidden.grad.detach().clone(), grads
 
         # Warm up off the default stream, as TE does for its own warmup. Retained
