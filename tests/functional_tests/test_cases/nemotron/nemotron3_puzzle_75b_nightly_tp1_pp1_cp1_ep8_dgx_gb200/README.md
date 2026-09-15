@@ -15,12 +15,13 @@ and RNG restoration. The harness checks the resumed losses against the first run
 ## Target-hardware acceptance
 
 Full-size memory fit and numerical acceptance require an actual eight-GB200 run.
-Do not substitute a scaled model or copy another model's golden values. The
-expected baseline file is `golden_values_dev_dgx_gb200.json`; it must be generated
-from Puzzle's target-hardware TensorBoard results and committed after review.
+Do not substitute a scaled model or copy another model's golden values.
+`golden_values_dev_dgx_gb200.json` comes directly from the first 20-step training
+phase of [GB200 job 439930823](https://gitlab-master.nvidia.com/dl/jet/ci/-/jobs/439930823),
+at commit `964c8bdb7893f1fe85d92f05407af647054f2d64`. All six metrics retain the
+TensorBoard collector's original values; iteration timing starts at step 2.
 
-Until that file exists, the first baseline comparison fails even if both training
-phases finish. The harness extracts first-run results into the output directory
-before comparison, but compares goldens before checking resumed losses. After
-obtaining the baseline, rerun the test to exercise both checks. A recipe alone is
-not evidence that the full-size model fits or that checkpoint resume has passed.
+The baseline establishes reference metrics, not checkpoint-resume acceptance.
+A clean five-repeat run must pass both golden and resumed-loss comparisons.
+Allow a 9,000-second allocation for the full-size checkpoint I/O and all five
+repetitions (`--functional-test-time-limit 9000` with the internal CI helper).
