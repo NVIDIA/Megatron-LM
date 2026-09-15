@@ -2381,6 +2381,59 @@ class TestCompressedSparseAttentionThd:
         assert torch.equal(no_grad_lengths, grad_lengths)
         assert torch.equal(no_grad_idxs, grad_idxs)
 
+    # The marker routes this file to the GB200 unit-test bucket, the only CI
+    # runner with SM100 for the pinned FlashMLA kernels.
+    @pytest.mark.launch_on_gb200
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_thd_real_kernel_no_grad_forward_matches_grad_forward(self, monkeypatch):
+        """With the real cuDNN indexer and FlashMLA kernels, a forward-only pass
+        reproduces the grad-enabled forward bit for bit under deterministic_mode."""
+        from megatron.core.transformer.experimental_attention_variant.csa_utils import (
+            fused_sparse_attention as fsa,
+        )
+
+        if torch.cuda.get_device_capability()[0] < 10:
+            pytest.skip("pinned FlashMLA sparse kernels require SM100+")
+        try:
+            fsa._ensure_dsa_namespace()
+            fsa._ensure_flash_mla()
+        except ImportError as error:
+            pytest.skip(str(error))
+
+        # FlashMLA's sparse kernel is built for the 512-wide DSA value head.
+        config = _make_mla_config(
+            v_head_dim=512, csa_compress_ratios=[4], dsa_indexer_loss_coeff=0.0
+        )
+        config.dsa_kernel_backend = "cudnn"
+        config.deterministic_mode = True
+        monkeypatch.setattr(self, "config", config)
+        csa = self._build_csa(compress_ratio=4).train()
+        torch.manual_seed(7)
+        query, key, value, x, qr, packed = self._make_thd_inputs([96, 40, 72])
+        inputs = dict(
+            query=query,
+            key=key,
+            value=value,
+            attention_mask=None,
+            x=x,
+            qr=qr,
+            packed_seq_params=packed,
+        )
+
+        def forward(grad_enabled):
+            with torch.set_grad_enabled(grad_enabled):
+                return csa(**inputs).detach()
+
+        # First calls compile and autotune; compare only steady-state outputs.
+        forward(False)
+        forward(True)
+        no_grad_1, no_grad_2 = forward(False), forward(False)
+        grad_1, grad_2 = forward(True), forward(True)
+
+        torch.testing.assert_close(no_grad_1, no_grad_2, rtol=0, atol=0)
+        torch.testing.assert_close(grad_1, grad_2, rtol=0, atol=0)
+        torch.testing.assert_close(no_grad_1, grad_1, rtol=0, atol=0)
+
 
 # ===========================================================================
 # _apply_rope direct THD tests (4 corners: ratio={1, >1} × fused={False, True})
