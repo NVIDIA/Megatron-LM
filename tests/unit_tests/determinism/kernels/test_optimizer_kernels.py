@@ -6,11 +6,17 @@ Adam update. These run once per step on every parameter, so any drift here chang
 whole trajectory even when the model kernels are deterministic.
 """
 
+from types import SimpleNamespace
+from unittest.mock import Mock
+
 import pytest
 import torch
 
+import megatron.core.optimizer as optimizer_module
 from megatron.core.optimizer import Adam
 from megatron.core.optimizer.clip_grads import clip_grad_by_total_norm_fp32, get_grad_norm_fp32
+from megatron.core.optimizer.optimizer_config import OptimizerConfig
+from megatron.core.utils import is_te_min_version
 from tests.unit_tests.determinism.kernels.harness import (
     assert_replays_bit_exact,
     bytes_equal,
@@ -74,22 +80,59 @@ class TestGradNormAndClip:
                 assert bytes_equal(a, b), f"clipped grad {j} differs on replay {i}"
 
 
-def test_fused_adam_step_replays():
+@pytest.mark.parametrize("store_param_remainders", [False, True])
+def test_fused_adam_step_replays(monkeypatch, store_param_remainders):
     """Same params, grads and optimizer state -> identical updated params and moments."""
+    if store_param_remainders:
+        if not optimizer_module.USING_TE_OPTIMIZER or not is_te_min_version("2.1.0"):
+            pytest.skip("parameter remainders require TransformerEngine >= 2.1.0")
+        batched_adam = Mock(wraps=optimizer_module._multi_tensor_adam_batched)
+        monkeypatch.setattr(optimizer_module, "_multi_tensor_adam_batched", batched_adam)
+        # Exercise the factory's TE hook without the outer wrapper replacing BF16 params.
+        monkeypatch.setattr(
+            optimizer_module, "Float16OptimizerWithFloat16Params", lambda opt, *args: opt
+        )
     seeded()
-    shapes = [(4096, 4096), (16384, 2048), (2048,), (65536,)]
-    params0 = [torch.randn(*s, device="cuda", dtype=torch.float32) for s in shapes]
+    shapes = (
+        [(16,)] * 1025
+        if store_param_remainders
+        else [(4096, 4096), (16384, 2048), (2048,), (65536,)]
+    )
+    dtype = torch.bfloat16 if store_param_remainders else torch.float32
+    params0 = [torch.randn(*s, device="cuda", dtype=dtype) for s in shapes]
     grads = [torch.randn(*s, device="cuda", dtype=torch.float32) for s in shapes]
 
     def run_step():
         params = [torch.nn.Parameter(p.clone()) for p in params0]
         for p, g in zip(params, grads):
-            p.grad = g.clone()
-        opt = Adam(params, lr=1e-3, betas=(0.9, 0.95), weight_decay=0.1, eps=1e-8)
+            if store_param_remainders:
+                p.decoupled_grad = g.clone()
+            else:
+                p.grad = g.clone()
+        if store_param_remainders:
+            opt = optimizer_module._get_megatron_optimizer_based_on_param_groups(
+                config=OptimizerConfig(
+                    lr=1e-3,
+                    adam_beta2=0.95,
+                    weight_decay=0.1,
+                    bf16=True,
+                    use_precision_aware_optimizer=True,
+                    store_param_remainders=True,
+                ),
+                model_chunks=[torch.nn.Identity()],
+                param_groups=[{"params": params}],
+                pg_collection=SimpleNamespace(tp=None),
+            )
+            batched_adam.reset_mock()
+        else:
+            opt = Adam(params, lr=1e-3, betas=(0.9, 0.95), weight_decay=0.1, eps=1e-8)
         with RacingStreams():
             opt.step()
             opt.step()
         torch.cuda.synchronize()
+        if store_param_remainders:
+            assert batched_adam.call_count == 2
+            assert all(len(call.args[3][0]) == 1025 for call in batched_adam.call_args_list)
         out = [p.detach().clone() for p in params]
         for p in params:
             state = opt.state[p]
