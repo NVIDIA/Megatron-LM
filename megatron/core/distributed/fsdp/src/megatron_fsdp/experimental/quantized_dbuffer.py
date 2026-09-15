@@ -205,6 +205,9 @@ class QuantizedDBuffer:
         is needed; otherwise they are copied into padded allocations.
         """
         tensor = self.get_tensor_view(index)
+        # GEMM requires padded scales. Pad here until TE fuses padding into its
+        # scale-swizzle kernel, avoiding these separate allocations and copies:
+        # https://github.com/NVIDIA/TransformerEngine/issues/3518
         tensor._rowwise_scale_inv = _pad_rowwise_scale(tensor._rowwise_scale_inv)
         tensor._columnwise_scale_inv = _pad_columnwise_scale(tensor._columnwise_scale_inv)
         return tensor
