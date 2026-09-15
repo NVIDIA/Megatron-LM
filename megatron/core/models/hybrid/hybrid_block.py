@@ -18,7 +18,7 @@ from megatron.core.context_parallel import ContextParallelLayoutManager, CPLayou
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.enums import Fp8Recipe
-from megatron.core.extensions.transformer_engine import TELayerNormColumnParallelLinear, TENorm
+from megatron.core.extensions.transformer_engine import TENorm
 from megatron.core.fp4_utils import get_fp4_context
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.inference.contexts import BaseInferenceContext
@@ -46,7 +46,6 @@ from megatron.core.transformer.hyper_connection import (
 )
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule, mark_keep_in_fp32
-from megatron.core.transformer.multi_latent_attention import FusedMLASelfAttention
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.transformer.utils import (
@@ -68,6 +67,7 @@ class HybridStackSubmodules:
     attention_layer: Union[ModuleSpec, type] = IdentityOp
     dsa_layer: Union[ModuleSpec, type] = IdentityOp
     mla_layer: Union[ModuleSpec, type] = IdentityOp
+    mla_fused_down_proj_layer: ModuleSpec | None = None
     mlp_layer: Union[ModuleSpec, type] = IdentityOp
     moe_layer: Union[ModuleSpec, type] = IdentityOp
     mtp_block_spec: Optional[ModuleSpec] = None
@@ -193,9 +193,6 @@ class HybridStack(MegatronModule):
                 tp_group=self.tp_group,
                 tp_cp_group=self.tp_cp_group,
             )
-        if getattr(self.config, "mla_down_proj_fusion", False):
-            submodules = self._fuse_mla_down_proj(submodules)
-
         # Build layers from the pre-selected segment
         self.layers = nn.ModuleList()
         for i, layer_config in enumerate(self.layer_config_list):
@@ -243,8 +240,19 @@ class HybridStack(MegatronModule):
                         name=(name + f".layers.{i}") if name is not None else None,
                     )
                 elif type(layer_config) is layer_utils.MLALayerConfig:
+                    mla_layer_spec = (
+                        submodules.mla_fused_down_proj_layer
+                        if getattr(layer_config, "mla_down_proj_fusion", False)
+                        else submodules.mla_layer
+                    )
+                    # Only error if we actually try to use the MLA layer spec.
+                    if mla_layer_spec is None:
+                        raise ValueError(
+                            "`mla_down_proj_fusion=True` requires the hybrid stack spec to provide "
+                            "the fused MLA layer spec under `mla_fused_down_proj_layer`."
+                        )
                     layer = build_module(
-                        submodules.mla_layer,
+                        mla_layer_spec,
                         config=layer_config,
                         layer_number=layer_number,
                         pg_collection=pg_collection,
@@ -351,26 +359,6 @@ class HybridStack(MegatronModule):
         the source of truth.
         """
         return get_layer_type_list_from_layer_config_list(self.layer_config_list)
-
-    def _fuse_mla_down_proj(self, submodules: HybridStackSubmodules) -> HybridStackSubmodules:
-        # Avoid modifying the original object so users don't get surprised about their `submodules`
-        # being modified underneath them.
-        submodules = copy.deepcopy(submodules)
-        mla_spec = submodules.mla_layer
-        # We always fuse the input layernorm because Hybrid always uses TransformerEngine.
-        mla_spec.submodules.input_layernorm = IdentityOp
-        mla_spec.submodules.self_attention.module = FusedMLASelfAttention
-        mla_spec.submodules.self_attention.submodules.linear_qkv_down_proj = (
-            TELayerNormColumnParallelLinear
-        )
-        mla_spec.submodules.self_attention.submodules.linear_q_down_proj = None
-        mla_spec.submodules.self_attention.submodules.linear_kv_down_proj = None
-        mla_spec.submodules.sharded_state_dict_keys_map = {
-            "self_attention.linear_q_down_proj.layer_norm_": "input_layernorm.",
-            "self_attention.linear_kv_down_proj.layer_norm_": "input_layernorm.",
-            "self_attention.linear_qkv_down_proj.layer_norm_": "input_layernorm.",
-        }
-        return submodules
 
     def set_input_tensor(self, input_tensor: Tensor):
         """Set input tensor to be used instead of forward()'s input.
