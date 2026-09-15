@@ -200,6 +200,11 @@ discard unused batch fields without corrupting subsequent refills. Batched P2P
 communication retains its eager synchronization fence and omits that device-wide
 fence only while the CUDA stream is being captured.
 
+The mHC functional regression recipes enable `--deterministic-mode` and set
+`NVTE_ALLOW_NONDETERMINISTIC_ALGO=0` for reproducible golden metrics, including
+the number of zero gradients. GDN uses its existing deterministic implementation
+under this setting; fused mHC remains enabled in the recipes.
+
 ### Dense Model Training
 
 All three implementations work for dense models:
