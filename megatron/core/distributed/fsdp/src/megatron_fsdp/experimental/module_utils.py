@@ -24,7 +24,7 @@ def get_parameter_owner(root_module: nn.Module, parameter_fqn: str) -> tuple[nn.
     return owner, parameter_name
 
 
-# FSDP replaces model Parameters, but optimizer setup still needs these flags:
+# Some parameter attributes need to be preserved:
 # - Some weights (e.g. MoE router weights) need use_muon=False to explicitly
 #   exclude them from Muon.
 # - is_embedding_or_output_parameter and is_embedding_parameter identify embedding
