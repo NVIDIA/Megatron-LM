@@ -153,6 +153,7 @@ def _config(kind, scopes, fused=False, tp=1, cp=1, ep=1):
         context_parallel_size=cp,
         expert_model_parallel_size=ep,
         expert_tensor_parallel_size=tp,
+        add_bias_linear=not moe or tp == 1,
         sequence_parallel=tp > 1,
         linear_num_key_heads=4,
         linear_num_value_heads=4,
@@ -238,7 +239,7 @@ class TestMHCTEGraphs:
 
     def test_combined_hybrid_attention_moe_graph_is_rejected(self):
         Utils.initialize_model_parallel(1, 1)
-        model_parallel_cuda_manual_seed(123, force_reset_rng=True)
+        model_parallel_cuda_manual_seed(123, te_rng_tracker=True, force_reset_rng=True)
         config = _config('hybrid_moe', [CudaGraphModule.attn, CudaGraphModule.moe_router])
         spec = get_gpt_layer_with_transformer_engine_spec(num_experts=4, moe_grouped_gemm=True)
         inner = TransformerLayer(config, spec.submodules)
@@ -250,7 +251,7 @@ class TestMHCTEGraphs:
     @pytest.mark.parametrize('method', ['_te_cuda_graph_capture', '_te_cuda_graph_replay'])
     def test_te_training_rejects_inputs_without_static_samples(self, kind, input_name, method):
         Utils.initialize_model_parallel(1, 1)
-        model_parallel_cuda_manual_seed(123, force_reset_rng=True)
+        model_parallel_cuda_manual_seed(123, te_rng_tracker=True, force_reset_rng=True)
         config = _config(kind, [CudaGraphModule.attn, CudaGraphModule.moe_router])
         model = _model(kind, config, ProcessGroupCollection.use_mpu_process_groups())
         layer = model.decoder.layers[-1]
@@ -285,7 +286,7 @@ class TestMHCTEGraphs:
             expert_model_parallel_size=ep,
             expert_tensor_parallel_size=tp,
         )
-        model_parallel_cuda_manual_seed(123, force_reset_rng=True)
+        model_parallel_cuda_manual_seed(123, te_rng_tracker=True, force_reset_rng=True)
         expected_backend_calls = _expected_mhc_backend_calls(fused)
         backend_calls = _record_mhc_backend_calls(monkeypatch)
         init_num_microbatches_calculator(
