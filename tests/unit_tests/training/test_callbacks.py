@@ -220,24 +220,24 @@ class TestCallbackManagerRegistration:
         assert not manager.has_callbacks("on_test_end")
 
 
-class TestCallbackManagerFire:
-    """Unit tests for CallbackManager.fire() execution."""
+class TestCallbackManagerTrigger:
+    """Unit tests for CallbackManager.trigger() execution."""
 
-    def test_fire_calls_registered_callbacks(self):
-        """fire() invokes all callbacks for an event."""
+    def test_trigger_calls_registered_callbacks(self):
+        """trigger() invokes all callbacks for an event."""
         manager = CallbackManager()
         fn1, fn2 = Mock(), Mock()
         manager.register("on_train_start", fn1)
         manager.register("on_train_start", fn2)
         context = manager.callback_context
 
-        manager.fire("on_train_start")
+        manager.trigger("on_train_start")
 
         fn1.assert_called_once_with(context)
         fn2.assert_called_once_with(context)
 
-    def test_fire_respects_registration_order(self):
-        """Callbacks fire in the order they were registered."""
+    def test_trigger_respects_registration_order(self):
+        """trigger() invokes callbacks in registration order."""
         call_order = []
         manager = CallbackManager()
 
@@ -245,12 +245,12 @@ class TestCallbackManagerFire:
         manager.register("on_train_start", lambda ctx: call_order.append(2))
         manager.register("on_train_start", lambda ctx: call_order.append(3))
 
-        manager.fire("on_train_start")
+        manager.trigger("on_train_start")
 
         assert call_order == [1, 2, 3]
 
-    def test_fire_respects_mixed_registration_order(self):
-        """Order is preserved when mixing add() and register()."""
+    def test_trigger_respects_mixed_registration_order(self):
+        """trigger() preserves order when mixing add() and register()."""
         call_order = []
 
         class FirstCallback(Callback):
@@ -266,29 +266,29 @@ class TestCallbackManagerFire:
         manager.register("on_train_start", lambda ctx: call_order.append("fn_middle"))
         manager.add(LastCallback())
 
-        manager.fire("on_train_start")
+        manager.trigger("on_train_start")
 
         assert call_order == ["class_first", "fn_middle", "class_last"]
 
-    def test_fire_does_nothing_when_no_callbacks(self):
-        """fire() is a no-op when no callbacks are registered."""
+    def test_trigger_does_nothing_when_no_callbacks(self):
+        """trigger() is a no-op when no callbacks are registered."""
         manager = CallbackManager()
 
         # Should not raise
-        manager.fire("on_train_start")
+        manager.trigger("on_train_start")
 
-    def test_fire_skips_event_without_registered_callbacks(self):
-        """fire() skips a valid event that has no registered callbacks."""
+    def test_trigger_skips_event_without_registered_callbacks(self):
+        """trigger() skips a valid event that has no registered callbacks."""
         manager = CallbackManager()
         train_fn = Mock()
         manager.register("on_train_start", train_fn)
 
-        manager.fire("on_eval_start")
+        manager.trigger("on_eval_start")
 
         train_fn.assert_not_called()
 
-    def test_fire_only_fires_requested_event(self):
-        """fire() only invokes callbacks for the specified event."""
+    def test_trigger_only_invokes_requested_event(self):
+        """trigger() only invokes callbacks for the specified event."""
         manager = CallbackManager()
         train_fn = Mock()
         eval_fn = Mock()
@@ -296,7 +296,7 @@ class TestCallbackManagerFire:
         manager.register("on_train_start", train_fn)
         manager.register("on_eval_start", eval_fn)
 
-        manager.fire("on_train_start")
+        manager.trigger("on_train_start")
 
         train_fn.assert_called_once()
         eval_fn.assert_not_called()
@@ -307,7 +307,7 @@ class TestCallbackManagerFire:
         manager.register("on_train_start", lambda ctx: 1 / 0)
 
         with pytest.raises(ZeroDivisionError):
-            manager.fire("on_train_start")
+            manager.trigger("on_train_start")
 
     def test_exception_stops_subsequent_callbacks(self):
         """When a callback raises, subsequent callbacks are not called."""
@@ -320,7 +320,7 @@ class TestCallbackManagerFire:
         manager.register("on_train_start", second_fn)
 
         with pytest.raises(ZeroDivisionError):
-            manager.fire("on_train_start")
+            manager.trigger("on_train_start")
 
         first_fn.assert_called_once()
         second_fn.assert_not_called()
@@ -412,9 +412,9 @@ class TestCallbackManagerIntrospection:
 
         context = manager.callback_context
         context.user_state["started"] = True
-        manager.fire("on_train_start")
+        manager.trigger("on_train_start")
         context.loss_dict = {"loss": Mock()}
-        manager.fire("on_train_end")
+        manager.trigger("on_train_end")
 
         assert manager.callback_context is context
         assert manager.user_state is context.user_state
@@ -427,8 +427,8 @@ class TestCallbackManagerIntrospection:
 class TestUserStatePersistence:
     """Test that user_state persists across callback invocations."""
 
-    def test_user_state_persists_across_fires(self):
-        """Same user_state dict is available across multiple fire() calls."""
+    def test_user_state_persists_across_triggers(self):
+        """Same user_state dict is available across multiple trigger() calls."""
         manager = CallbackManager()
 
         def increment_counter(ctx):
@@ -438,7 +438,7 @@ class TestUserStatePersistence:
 
         persistent_state = manager.callback_context.user_state
         for _ in range(5):
-            manager.fire("on_train_step_end")
+            manager.trigger("on_train_step_end")
 
         assert persistent_state["counter"] == 5
 
@@ -456,8 +456,8 @@ class TestUserStatePersistence:
         manager.register("on_train_end", read_start_time)
 
         persistent_state = manager.callback_context.user_state
-        manager.fire("on_train_start")
-        manager.fire("on_train_end")
+        manager.trigger("on_train_start")
+        manager.trigger("on_train_end")
 
         assert persistent_state["start_time"] == 100
         assert persistent_state["elapsed"] == 100

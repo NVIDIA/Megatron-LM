@@ -23,7 +23,7 @@ Two registration patterns are supported:
    pretrain(config, forward_step_func, callbacks=manager)
    ```
 
-Both patterns can be mixed. Callbacks fire in registration order.
+Both patterns can be mixed. Callbacks trigger in registration order.
 """
 
 from __future__ import annotations
@@ -203,7 +203,7 @@ class CallbackManager:
        manager.register("on_train_start", my_function)
        ```
 
-    Both patterns can be mixed. Callbacks fire in registration order.
+    Both patterns can be mixed. Callbacks trigger in registration order.
 
     The manager also owns a `user_state` dictionary that persists across all
     callback invocations, allowing callbacks to share state.
@@ -335,13 +335,13 @@ class CallbackManager:
         """
         return event_name in self._active_events
 
-    def fire(self, event_name: str) -> None:
+    def trigger(self, event_name: str) -> None:
         """Execute all callbacks for an event, if any are registered.
 
         Exceptions from callbacks propagate to the caller.
 
         Args:
-            event_name: Name of the event to fire.
+            event_name: Name of the event to trigger.
         """
         if self.has_callbacks(event_name):
             for fn in self._callbacks[event_name]:

@@ -1848,7 +1848,7 @@ def pretrain(
     else:
         checkpointing_context = {}
 
-    callback_manager.fire("on_setup_start")
+    callback_manager.trigger("on_setup_start")
 
     # Model, optimizer, and learning rate.
     timers('model-and-optimizer-setup', log_level=0).start(barrier=True)
@@ -1966,7 +1966,7 @@ def pretrain(
     callback_manager.callback_context.model = model
     callback_manager.callback_context.optimizer = optimizer
     callback_manager.callback_context.scheduler = opt_param_scheduler
-    callback_manager.fire("on_data_init_start")
+    callback_manager.trigger("on_data_init_start")
 
     # Data stuff. Dataset index / dataloader construction (GPTDataset/BlendedDataset
     # index building or loading from the cache) can be a multi-second chunk of
@@ -3825,7 +3825,7 @@ def training_log(
         log_fragments: list[str] = []
         callback_manager.callback_context.log_fragments = log_fragments
         callback_manager.callback_context.timers_to_log = timers_to_log
-        callback_manager.fire("on_log")
+        callback_manager.trigger("on_log")
         log_string += "".join(log_fragments)
         print_rank_last(log_string)
 
@@ -4728,7 +4728,7 @@ def train(
     _end_otel_startup_span()
     _start_otel_train_span()
 
-    callback_manager.fire("on_train_start")
+    callback_manager.trigger("on_train_start")
 
     # Run training iterations till done.
     buffered_rollouts = None
@@ -4879,7 +4879,7 @@ def train(
             _step_span = None
         else:
 
-            callback_manager.fire("on_train_step_start")
+            callback_manager.trigger("on_train_step_start")
 
             # OTel: dedicated span for the first iteration actually executed in this
             # process (post checkpoint-resume, post iteration-skip) — not iteration 1,
@@ -4929,7 +4929,7 @@ def train(
             callback_manager.callback_context.loss_dict = loss_dict
             callback_manager.callback_context.grad_norm = grad_norm
             callback_manager.callback_context.skipped_iter = bool(skipped_iter)
-            callback_manager.fire("on_train_step_end")
+            callback_manager.trigger("on_train_step_end")
 
         if should_checkpoint:
             save_checkpoint_and_time(
@@ -5243,7 +5243,7 @@ def train(
     if args.rl_profile:
         shutdown_rl_profiler()
 
-    callback_manager.fire("on_train_end")
+    callback_manager.trigger("on_train_end")
 
     # If any exit conditions (signal handler, duration, iterations) have been reached, exit.
     if should_exit:
@@ -5403,7 +5403,7 @@ def evaluate(
 
             ft_integration.on_eval_step_start()
 
-            callback_manager.fire(step_start_event)
+            callback_manager.trigger(step_start_event)
 
             with _otel_managed_span('evaluate', 'megatron.evaluate.step',
                                     **{'megatron.eval_iteration': iteration}):
@@ -5421,7 +5421,7 @@ def evaluate(
                     p2p_communicator=p2p_communicator,
                 )
 
-            callback_manager.fire(step_end_event)
+            callback_manager.trigger(step_end_event)
 
             ft_integration.on_eval_step_end()
             config.timers = get_timers()
@@ -5576,7 +5576,7 @@ def evaluate_and_print_results(
             f"Number of --validation-set-names ({len(args.validation_set_names)}) must match " \
             f"the number of validation datasets ({len(data_iterators)})"
 
-    callback_manager.fire(start_event)
+    callback_manager.trigger(start_event)
 
     for index, (iterator, iterations) in enumerate(zip(data_iterators, eval_iters)):
         suffix = ""
@@ -5634,7 +5634,7 @@ def evaluate_and_print_results(
         print_rank_last('-' * length)
 
     callback_manager.callback_context.total_loss_dict = total_loss_dict
-    callback_manager.fire(end_event)
+    callback_manager.trigger(end_event)
 
 
 def cyclic_iter(iterable):
