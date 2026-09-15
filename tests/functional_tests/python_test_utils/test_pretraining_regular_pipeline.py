@@ -37,7 +37,7 @@ def test_regular_pipeline(
             model_config = yaml.safe_load(f)
 
         checks_types = (
-            model_config["METRICS"] if "METRICS" in model_config else ["lm loss", "num-zeros"]
+            model_config["METRICS"] if "METRICS" in model_config else common.DEFAULT_METRICS
         )
         checks = {metric: CHECK_THRESHOLDS[metric] for metric in checks_types}
 

@@ -3,13 +3,14 @@ import pathlib
 import pytest
 import yaml
 
+from tests.functional_tests.python_test_utils import common
+
 YAML_DIR = pathlib.Path(__file__).parent / ".." / "functional_tests" / "test_cases"
 
 # Default metrics a functional test validates against when its model_config.yaml
-# does not set an explicit METRICS list. Must match the fallback used by the
-# functional-test pipelines (see test_pretraining_regular_pipeline.py and
-# test_pretraining_resume_checkpoint_pipeline.py).
-DEFAULT_METRICS = ["lm loss", "num-zeros"]
+# does not set an explicit METRICS list. Sourced from the functional-test harness
+# (single source of truth in common.DEFAULT_METRICS).
+DEFAULT_METRICS = common.DEFAULT_METRICS
 
 # Mapping from a validated tensorboard metric to the MODEL_ARGS flag that must be
 # enabled for that metric to be recorded. Metrics not listed here (e.g. losses,
