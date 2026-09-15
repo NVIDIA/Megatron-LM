@@ -1,0 +1,137 @@
+type: basic
+format_version: 1
+maintainers: [mcore]
+loggers: [stdout]
+spec:
+  name: "{test_case}_{environment}_{platforms}"
+  model: unit-tests
+  nodes: 1
+  build: mcore-pyt-{environment}
+  platforms: dgx_h100
+  script_setup: |
+    set -euo pipefail
+    unset https_proxy
+    umask 077
+    printf '%s\n' "machine gitlab-master.nvidia.com login okoenig password $RO_API_TOKEN" >> "$HOME/.netrc"
+    trap 'rm -f "$HOME/.netrc"; unset RO_API_TOKEN' EXIT
+
+    cd /opt
+    rm -rf /opt/megatron-lm; mkdir megatron-lm; cd megatron-lm
+    git init
+    git remote add origin $MCORE_REPO
+    git fetch origin '+refs/merge-requests/*:refs/remotes/merge-requests/*'
+    git fetch origin $MCORE_MR_COMMIT
+    git checkout $MCORE_MR_COMMIT
+    git rev-parse HEAD
+    rm -f "$HOME/.netrc"
+    unset RO_API_TOKEN
+  script: |-
+    rm -f "${{HOME}}/.netrc"
+    unset RO_API_TOKEN
+    set -euo pipefail
+    cd /opt/megatron-lm
+    export ONE_LOGGER_JOB_CATEGORY=test
+
+    for attempt in $(seq {n_repeat}); do
+      uv run --no-sync python -m torch.distributed.run \
+        --standalone --nnodes 1 --nproc-per-node {gpus} \
+        --log-dir "{assets_dir}/logs/1/run-$attempt" --tee "0:3" --redirects "3" \
+        -m pytest -q -rA -m "not experimental and not flaky_in_dev" \
+        "{test_path}"
+    done
+
+products:
+  # These unit tests need smaller process groups than the standard 8-rank bucket.
+  # Like determinism-perf.yaml, this dedicated recipe is discovered through the
+  # full GitHub integration matrix's recipe glob. No functional data or golden
+  # values are needed, and the shared unit-test runner's defaults stay unchanged.
+  - test_case: [engram_parallel_2r]
+    products:
+      - environment: [dev]
+        scope: [mr-github]
+        tag: [latest]
+        gpus: [2]
+        test_path: [tests/unit_tests/models/engram/test_parallel.py]
+        n_repeat: [1]
+        time_limit: [1800]
+  - test_case: [engram_row_a2a_2r]
+    products:
+      - environment: [dev]
+        scope: [mr-github]
+        tag: [latest]
+        gpus: [2]
+        test_path: [tests/unit_tests/models/engram/test_row_a2a.py]
+        n_repeat: [1]
+        time_limit: [1800]
+  - test_case: [engram_row_a2a_4r]
+    products:
+      - environment: [dev]
+        scope: [mr-github]
+        tag: [latest]
+        gpus: [4]
+        test_path: [tests/unit_tests/models/engram/test_row_a2a.py]
+        n_repeat: [1]
+        time_limit: [1800]
+  - test_case: [engram_batch_routing_2r]
+    products:
+      - environment: [dev]
+        scope: [mr-github]
+        tag: [latest]
+        gpus: [2]
+        test_path: [tests/unit_tests/models/engram/test_batch_routing.py]
+        n_repeat: [1]
+        time_limit: [1800]
+  - test_case: [engram_batch_routing_4r]
+    products:
+      - environment: [dev]
+        scope: [mr-github]
+        tag: [latest]
+        gpus: [4]
+        test_path: [tests/unit_tests/models/engram/test_batch_routing.py]
+        n_repeat: [1]
+        time_limit: [1800]
+  - test_case: [engram_batch_routing_8r]
+    products:
+      - environment: [dev]
+        scope: [mr-github]
+        tag: [latest]
+        gpus: [8]
+        test_path: [tests/unit_tests/models/engram/test_batch_routing.py]
+        n_repeat: [1]
+        time_limit: [1800]
+  - test_case: [engram_context_model_2r]
+    products:
+      - environment: [dev]
+        scope: [mr-github]
+        tag: [latest]
+        gpus: [2]
+        test_path: [tests/unit_tests/models/engram/test_context_parallel_model.py]
+        n_repeat: [1]
+        time_limit: [1800]
+  - test_case: [engram_pipeline_model_2r]
+    products:
+      - environment: [dev]
+        scope: [mr-github]
+        tag: [latest]
+        gpus: [2]
+        test_path: [tests/unit_tests/models/engram/test_pipeline.py]
+        n_repeat: [1]
+        time_limit: [1800]
+  - test_case: [engram_sparse_topology_8r]
+    products:
+      - environment: [dev]
+        scope: [mr-github]
+        tag: [latest]
+        gpus: [8]
+        test_path: [tests/unit_tests/models/engram/test_sparse_topology.py]
+        n_repeat: [1]
+        time_limit: [1800]
+  - test_case: [engram_heterogeneous_model_2r]
+    products:
+      - environment: [dev]
+        scope: [mr-github]
+        tag: [latest]
+        gpus: [2]
+        test_path: [tests/unit_tests/models/engram/test_heterogeneous_model.py]
+        n_repeat: [1]
+        time_limit: [1800]

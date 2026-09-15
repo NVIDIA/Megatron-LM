@@ -11,6 +11,7 @@ logs
 local/
 .gitmodules
 wandb/
+.wandb.env
 onelogger.log
 onelogger.err
 .venv

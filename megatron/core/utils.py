@@ -2179,6 +2179,7 @@ def get_batch_on_this_tp_rank(
     pipeline_model_parallel_size: int = 1,
     is_pipeline_first_stage: bool = False,
     is_pipeline_last_stage: bool = False,
+    requires_token_ids: bool = False,
 ):
     """Broadcast batch tensors from TP rank 0 to all other ranks in the TP group.
 
@@ -2219,6 +2220,8 @@ def get_batch_on_this_tp_rank(
         pipeline_model_parallel_size (int): Number of pipeline-parallel stages.
         is_pipeline_first_stage (bool): Whether this rank is on the first PP stage.
         is_pipeline_last_stage (bool): Whether this rank is on the last PP stage.
+        requires_token_ids (bool): Whether this model chunk needs input token IDs
+            even when it does not own the embedding layer.
 
     Returns:
         dict[str, torch.Tensor]: The batch dict with all tensors populated on
@@ -2269,7 +2272,7 @@ def get_batch_on_this_tp_rank(
             if is_hybrid_cp:
                 _broadcast(batch['local_cp_size'])
 
-        elif is_pipeline_first_stage:
+        elif is_pipeline_first_stage or (requires_token_ids and not is_pipeline_last_stage):
             batch["labels"] = None
             batch["loss_mask"] = None
 
@@ -2284,8 +2287,12 @@ def get_batch_on_this_tp_rank(
                 _broadcast(batch['attention_mask'])
 
         elif is_pipeline_last_stage:
-            batch["tokens"] = None
-            batch["position_ids"] = None
+            if requires_token_ids:
+                _broadcast(batch['tokens'])
+                _broadcast(batch['position_ids'])
+            else:
+                batch["tokens"] = None
+                batch["position_ids"] = None
 
             _broadcast(batch['labels'])
             _broadcast(batch['loss_mask'])
@@ -2390,7 +2397,7 @@ def get_batch_on_this_tp_rank(
             if is_hybrid_cp:
                 _broadcast(local_cp_size)
 
-        elif is_pipeline_first_stage:
+        elif is_pipeline_first_stage or (requires_token_ids and not is_pipeline_last_stage):
             labels = None
             loss_mask = None
 
@@ -2405,8 +2412,12 @@ def get_batch_on_this_tp_rank(
                 _broadcast(attention_mask)
 
         elif is_pipeline_last_stage:
-            tokens = None
-            position_ids = None
+            if requires_token_ids:
+                _broadcast(tokens)
+                _broadcast(position_ids)
+            else:
+                tokens = None
+                position_ids = None
 
             _broadcast(labels)
             _broadcast(loss_mask)

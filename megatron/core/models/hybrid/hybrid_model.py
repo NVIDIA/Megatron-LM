@@ -17,6 +17,7 @@ from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEm
 from megatron.core.models.common.embeddings.yarn_rotary_pos_embedding import YarnRotaryEmbedding
 from megatron.core.models.common.language_module.language_module import LanguageModule
 from megatron.core.models.hybrid.layers import utils as layer_utils
+from megatron.core.models.hybrid.layers.token_context import TokenContextProvider
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
@@ -104,6 +105,8 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
              Defaults to None.
         pg_collection (ProcessGroupCollection, optional): Model communication process groups.
         vp_stage (Optional[int], optional): Virtual pipeline stage index. Defaults to None.
+        token_context_provider_spec (ModuleSpec, optional): Provider composing layers that consume
+            an explicit per-microbatch token context.
     """
 
     def __init__(
@@ -130,6 +133,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         seq_len_interpolation_factor: Optional[float] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
         vp_stage: Optional[int] = None,
+        token_context_provider_spec: ModuleSpec | None = None,
     ) -> None:
         super().__init__(config=config, pg_collection=pg_collection)
 
@@ -292,6 +296,20 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 use_cpu_initialization=self.config.use_cpu_initialization,
                 cp_group=self.pg_collection.cp,
             )
+        self._token_context_provider: TokenContextProvider | None = None
+        self.requires_token_context = False
+        decoder_extra_kwargs = {}
+        if token_context_provider_spec is not None:
+            self._token_context_provider = build_module(
+                token_context_provider_spec, config=self.config, pg_collection=self.pg_collection
+            )
+            decoder_extra_kwargs['layer_spec_overrides'] = (
+                self._token_context_provider.layer_spec_overrides(
+                    hybrid_stack_spec.submodules, layer_config_list, layer_offset
+                )
+            )
+            self.requires_token_context = bool(decoder_extra_kwargs['layer_spec_overrides'])
+
         self.decoder = build_module(
             hybrid_stack_spec,
             self.config,
@@ -302,6 +320,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             dtype=config.params_dtype,
             pg_collection=self.pg_collection,
             name="decoder",
+            **decoder_extra_kwargs,
         )
 
         # MTP block - uses mtp_block_spec from hybrid_stack_spec.submodules
@@ -477,6 +496,17 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
+        decoder_context_kwargs = {}
+        if self.requires_token_context:
+            token_context_provider = self._token_context_provider
+            assert token_context_provider is not None
+            decoder_context_kwargs['token_context'] = token_context_provider.prepare(
+                input_ids,
+                inference_context=inference_context,
+                packed_seq_params=packed_seq_params,
+                cp_batch=cp_batch,
+            )
+
         in_inference_mode = InferenceMode.is_active()
 
         if in_inference_mode:
@@ -565,6 +595,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 padding_mask=padding_mask,
                 packed_seq_params_by_layout=packed_seq_params_by_layout,
                 cp_layout_plan=cp_layout_plan,
+                **decoder_context_kwargs,
             )
         if isinstance(decoder_output, tuple):
             hidden_states, mhc_multistream = decoder_output

@@ -175,6 +175,7 @@ class DistributedDataParallel(_BaseDataParallel):
         # Collect all trainable parameters.
         param_to_name = {}
         self.params_with_grad = []
+        self.params_without_grad_buffer = []
         all_params = []
         for name, param in self.module.named_parameters():
             if not param.requires_grad:
@@ -186,7 +187,10 @@ class DistributedDataParallel(_BaseDataParallel):
 
             param.grad_added_to_main_grad = False
             param_to_name[param] = name
-            all_params.append(param)
+            if getattr(param, 'skip_param_and_grad_buffer', False):
+                self.params_without_grad_buffer.append(param)
+            else:
+                all_params.append(param)
 
         # Group parameters by (param_dtype, grad_dtype, is_expert_parallel).
         buffer_groups = group_params_for_buffers(all_params, self.ddp_config.grad_reduce_in_fp32)
@@ -703,6 +707,15 @@ class DistributedDataParallel(_BaseDataParallel):
         """Scale all gradients inside the buffers by `scaling_factor`."""
         for buffer in self.buffers + self.expert_parallel_buffers:
             buffer.scale_gradients(scaling_factor)
+        for param in self.params_without_grad_buffer:
+            if param.grad is None:
+                continue
+            grad = param.grad.coalesce() if param.grad.is_sparse else param.grad
+            if grad.is_sparse:
+                grad.values().mul_(scaling_factor)
+            else:
+                grad.mul_(scaling_factor)
+            param.grad = grad
 
     def zero_grad_buffer(self):
         """
@@ -725,6 +738,8 @@ class DistributedDataParallel(_BaseDataParallel):
         Syncs parameters across all DP ranks.
         """
         for param in self.module.parameters():
+            if getattr(param, 'skip_param_and_grad_buffer', False):
+                continue
             is_expert_parallel = not getattr(param, 'allreduce', True)
 
             if is_expert_parallel:
