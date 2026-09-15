@@ -2488,6 +2488,9 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
 
     Both variants share the FlashMLA sparse-attention forward + the
     cuDNN sparse-attn backward; only the indexer-loss path branches.
+
+    ``varlen_starts`` and ``varlen_ends`` may both be ``None`` for plain
+    causal scoring, where the scorer reconstructs the bounds internally.
     """
 
     @staticmethod
@@ -2504,8 +2507,8 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
         sparse_loss: bool,
         calculate_per_token_loss: bool,
         d_v: int,
-        varlen_starts: Tensor,
-        varlen_ends: Tensor,
+        varlen_starts: Optional[Tensor],
+        varlen_ends: Optional[Tensor],
         key_positions: Optional[Tensor],
         query_valid_rows: Optional[Tensor],
         use_local_indexer_varlen: bool,
