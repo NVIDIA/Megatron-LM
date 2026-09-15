@@ -137,7 +137,7 @@ def _build_models(
         mtp_loss_scaling_factor=0.2,
         num_moe_experts=(2 if static_moe else 4) if is_moe else None,
         moe_ffn_hidden_size=128 if is_moe else None,
-        moe_router_topk=2 if is_moe else 1,
+        moe_router_topk=2,
         moe_router_load_balancing_type="none",
         moe_router_dtype="fp32",
         moe_token_dispatcher_type="alltoall",

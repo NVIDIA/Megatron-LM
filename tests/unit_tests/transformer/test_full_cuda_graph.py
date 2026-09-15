@@ -26,6 +26,7 @@ from tests.unit_tests.test_utilities import Utils
 rank = Utils.rank
 
 
+@pytest.mark.launch_on_gb200
 @pytest.mark.parametrize("stage", ["training", "validation"])
 @pytest.mark.parametrize("first_stage", [False, True])
 def test_static_loader_preserves_tensors_after_pipeline_batch_preparation(stage, first_stage):

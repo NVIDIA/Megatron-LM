@@ -72,6 +72,7 @@ MODEL_ARGS:
   --moe-router-load-balancing-type: none
   --expert-model-parallel-size: 2
   --expert-tensor-parallel-size: 2
+  --disable-bias-linear: true
 TEST_TYPE: regular
 METRICS:
 - lm loss
