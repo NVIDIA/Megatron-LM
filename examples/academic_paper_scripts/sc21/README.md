@@ -16,9 +16,9 @@ To replicate these results use Megatron-LM commit: 6985e58938d40ad91ac07b0fddcfa
 
 ## Setup
 
-All the cluster-dependent variables are in [`CONFIG.sh`](./CONFIG.sh). Please
-update the unspecified values (in angle brackets `<...>`) before launching any
-scripts.
+All the cluster-dependent variables are validated in [`CONFIG.sh`](./CONFIG.sh).
+Set the required values before launching any scripts; missing values fail with
+an explicit error.
 
 
 
