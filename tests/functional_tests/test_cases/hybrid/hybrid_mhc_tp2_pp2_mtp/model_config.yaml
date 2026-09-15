@@ -44,6 +44,7 @@ MODEL_ARGS:
   --hidden-dropout: 0.0
   --attention-dropout: 0.0
   --normalization: RMSNorm
+  --swiglu: true
   --position-embedding-type: rope
   --transformer-impl: transformer_engine
   --bf16: true
@@ -62,3 +63,7 @@ MODEL_ARGS:
   --eval-iters: 2
   --ckpt-format: torch_dist
 TEST_TYPE: regular
+METRICS:
+  - lm loss
+  - mtp_1 loss
+  - num-zeros
