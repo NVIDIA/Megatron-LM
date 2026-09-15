@@ -56,6 +56,14 @@ from ..transformer.module import param_is_not_shared
 from ..utils import get_data_parallel_group_if_dtensor, to_local_if_dtensor
 
 
+def _group_grads_by_dtype(grads: List[torch.Tensor]) -> List[List[torch.Tensor]]:
+    # Fused multi-tensor kernels dispatch one dtype for each tensor list.
+    groups: dict[torch.dtype, List[torch.Tensor]] = {}
+    for grad in grads:
+        groups.setdefault(grad.dtype, []).append(grad)
+    return list(groups.values())
+
+
 def get_grad_norm_fp32(
     grads_for_norm: Union[List[torch.Tensor], torch.Tensor],
     norm_type: Union[int, float] = 2,
@@ -117,12 +125,15 @@ def get_grad_norm_fp32(
             # Use apex's multi-tensor applier for efficiency reasons.
             # Multi-tensor applier takes a function and a list of list
             # and performs the operation on that list all in one kernel.
-            grad_norm, _ = multi_tensor_applier(
-                l2_norm_impl, dummy_overflow_buf, [grads_for_norm], False  # no per-parameter norm
-            )
-            # Since we will be summing across data parallel groups,
-            # we need the pow(norm-type).
-            total_norm = grad_norm**norm_type
+            for index, dtype_grads in enumerate(_group_grads_by_dtype(grads_for_norm)):
+                grad_norm, _ = multi_tensor_applier(
+                    l2_norm_impl, dummy_overflow_buf, [dtype_grads], False
+                )
+                # Combine local squared norms before the existing collectives.
+                if index == 0:
+                    total_norm = grad_norm**norm_type
+                else:
+                    total_norm += grad_norm**norm_type
         else:
             for grad in grads_for_norm:
                 grad_norm = torch.norm(grad, norm_type)
@@ -187,13 +198,18 @@ def clip_grad_by_total_norm_fp32(
         assert (
             multi_tensor_scale_tensor_impl is not None
         ), "clip_coeff is tensor type. But multi_tensor_scale_tensor not available."
-        multi_tensor_applier(
-            multi_tensor_scale_tensor_impl, dummy_overflow_buf, [grads, grads], clip_coeff
-        )
+        for dtype_grads in _group_grads_by_dtype(grads):
+            multi_tensor_applier(
+                multi_tensor_scale_tensor_impl,
+                dummy_overflow_buf,
+                [dtype_grads, dtype_grads],
+                clip_coeff,
+            )
     elif clip_coeff < 1.0:
-        multi_tensor_applier(
-            multi_tensor_scale_impl, dummy_overflow_buf, [grads, grads], clip_coeff
-        )
+        for dtype_grads in _group_grads_by_dtype(grads):
+            multi_tensor_applier(
+                multi_tensor_scale_impl, dummy_overflow_buf, [dtype_grads, dtype_grads], clip_coeff
+            )
 
 
 def _gtp_pad_zero_count(param: torch.Tensor, grad: torch.Tensor) -> int:
