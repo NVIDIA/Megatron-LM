@@ -44,25 +44,25 @@ recompute list (including attention) with full-layer recomputation. Head/loss re
 the existing linear CE implementation and configuration, independently of
 ChunkedEP. Other model families are not qualified.
 
-End-to-end measurements at `21d6918ab` used Qwen3, BF16, EP8, top-k8, two chunks,
+End-to-end measurements at `ba1709e5b` used Qwen3, BF16, EP8, top-k8, two chunks,
 full recomputation, identical existing linear CE, random weights, no optimizer
 update, lazy activation capacity, and 3 warmup + 10 measured steps without a profiler.
 Ranges below cover all eight ranks of one paired run, not confidence intervals.
 
 | Layers / local tokens / microbatches | Speedup | Allocated peak reduction | Reserved peak reduction |
 | --- | --- | --- | --- |
-| 1 / 32768 / 1 | 1.0177–1.0185x | 12.67–16.11% | -12.95 to -10.03% |
-| 48 / 16384 / 16 | 1.1331–1.1334x | 5.43–9.69% | 0.20 to 4.91% |
+| 1 / 32768 / 1 | 1.0135–1.0178x | 12.67–16.11% | -12.95 to -10.03% |
+| 48 / 16384 / 16 | 1.1293x | 5.48–9.69% | 0.16 to 4.91% |
 
 Negative reductions mean increased memory. Loss maximum absolute differences
-were 0 and 5.44e-5, respectively; sampled gradient differences were at most
-4.10e-7 and 2.83e-7. These are not full-tensor precision checks. Both scales
+were 0 and 4.20e-5, respectively; sampled gradient differences were at most
+3.73e-7 and 2.92e-7. These are not full-tensor precision checks. Both scales
 completed offload/recovery with no measured allocator retries or OOMs; lazy
 capacity still grew after warmup. Normal-backward smoke tests at `2a2f98a03`
 (1 layer, 32768 local tokens, 1 microbatch, EP8/top-k8, chunks 2/3/4,
 1 warmup + 2 repeats, no optimizer update) completed on all eight ranks:
 loss differences were zero and sampled gradient differences were at most
-1.20e-7. The n=2 smoke repeated at `21d6918ab` with the same precision bounds;
+1.20e-7. The n=2 smoke repeated at `ba1709e5b` with the same precision bounds;
 allocated peak increased 10.43–10.81%. Smoke establishes no formal speedup or parity.
 Final-source n=3/4 GPU qualification, optimizer updates, and isolated OP
 activation savings remain incomplete. Older combined head/CE measurements
