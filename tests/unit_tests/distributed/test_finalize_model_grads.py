@@ -23,6 +23,7 @@ from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.moe.moe_layer import MoELayer
+from megatron.core.transformer.moe.moe_utils import get_updated_expert_bias_quantile_balancing
 from megatron.core.transformer.spec_utils import get_submodules
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.initialize import _set_random_seed
@@ -148,10 +149,11 @@ class TestUpdateRouterQBBeta:
             num_moe_experts=num_experts,
             use_cpu_initialization=True,
             moe_router_load_balancing_type="quantile_balancing",
-            moe_router_score_function="softmax",
+            moe_router_score_function="sigmoid",
             moe_router_topk=2,
             moe_aux_loss_coeff=0,
             moe_router_quantile_balancing_ema=ema,
+            moe_router_quantile_balancing_histogram=True,
             bf16=True,
             params_dtype=torch.bfloat16,
             add_bias_linear=False,
@@ -170,48 +172,46 @@ class TestUpdateRouterQBBeta:
         # Non-zero prior bias so the EMA term is actually exercised.
         router.qb_beta.copy_(torch.randn_like(router.qb_beta))
 
-        # The real router forward populates qb_beta_accum / qb_beta_count.
+        # The real router forward accumulates a whole-step histogram.
         hidden = torch.randn((32, 2, config.hidden_size)).cuda().bfloat16()
         router(hidden)
         router(hidden)
-        assert router.qb_beta_count.item() == 2
-        assert router.qb_beta_accum.abs().sum().item() > 0
-
-        # Expected from the real accumulators: DP-avg(accum/count), EMA-blend, re-center.
-        local_avg = router.qb_beta_accum / router.qb_beta_count.clamp(min=1).to(torch.float32)
-        torch.distributed.all_reduce(
-            local_avg, op=torch.distributed.ReduceOp.AVG, group=dist.group.WORLD
+        histogram = router.local_quantile_balancing_histogram.clone()
+        assert histogram.sum().item() > 0
+        expected = get_updated_expert_bias_quantile_balancing(
+            histogram,
+            router.qb_beta,
+            topk=config.moe_router_topk,
+            ema_beta=ema,
+            ema_step=torch.ones(1, dtype=torch.int64, device=router.qb_beta.device),
+            tp_dp_cp_group=dist.group.WORLD,
         )
-        blended = ema * router.qb_beta + (1.0 - ema) * local_avg
-        expected = blended - blended.mean(dim=-1, keepdim=True)
 
-        _update_router_qb_beta([moe_layer], config, dp_cp_group=dist.group.WORLD)
+        _update_router_qb_beta([moe_layer], config, tp_dp_cp_group=dist.group.WORLD)
 
         torch.testing.assert_close(router.qb_beta, expected)
         torch.testing.assert_close(
             router.qb_beta.mean(), torch.zeros((), device=router.qb_beta.device)
         )
 
-        # reset_model_temporary_tensors clears the accumulators for the next global batch.
+        # reset_model_temporary_tensors clears the histogram for the next global batch.
         reset_model_temporary_tensors(config, [moe_layer])
-        torch.testing.assert_close(router.qb_beta_accum, torch.zeros_like(router.qb_beta_accum))
-        assert router.qb_beta_count.item() == 0
+        torch.testing.assert_close(
+            router.local_quantile_balancing_histogram,
+            torch.zeros_like(router.local_quantile_balancing_histogram),
+        )
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_update_router_qb_beta_skips_eval(self):
         config, moe_layer = self._build_moe_layer(ema=0.0)
         router = moe_layer.router
-        # Non-zero prior + non-uniform accumulator, so a broken eval guard would visibly
-        # change qb_beta (a uniform accumulator re-centers to zero and hides the bug).
+        # Non-zero prior + non-empty histogram, so a broken eval guard would visibly change qb_beta.
         router.qb_beta.copy_(torch.ones_like(router.qb_beta))
-        router.qb_beta_accum.copy_(
-            torch.arange(router.qb_beta.numel(), dtype=torch.float32, device=router.qb_beta.device)
-        )
-        router.qb_beta_count.fill_(1)
+        router.local_quantile_balancing_histogram.fill_(1)
         before = router.qb_beta.clone()
         router.eval()
 
-        _update_router_qb_beta([moe_layer], config, dp_cp_group=dist.group.WORLD)
+        _update_router_qb_beta([moe_layer], config, tp_dp_cp_group=dist.group.WORLD)
 
         # Eval-mode modules are skipped, so qb_beta is unchanged.
         torch.testing.assert_close(router.qb_beta, before)
