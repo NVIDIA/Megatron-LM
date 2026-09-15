@@ -18,6 +18,7 @@ from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.training.dist_signal_handler import DistributedSignalHandler
 
 _GLOBAL_ARGS = None
+_GLOBAL_FULL_CONFIG = None
 _GLOBAL_TOKENIZER = None
 _GLOBAL_TENSORBOARD_WRITER = None
 _GLOBAL_WANDB_WRITER = None
@@ -32,6 +33,12 @@ def get_args():
     """Return arguments."""
     _ensure_var_is_initialized(_GLOBAL_ARGS, 'args')
     return _GLOBAL_ARGS
+
+
+def get_full_config():
+    """Return the full pretrain config container. It can be None so no need
+    to check if it is initialized."""
+    return _GLOBAL_FULL_CONFIG
 
 
 def get_tokenizer():
@@ -186,6 +193,7 @@ def unset_global_variables():
     """
 
     global _GLOBAL_ARGS
+    global _GLOBAL_FULL_CONFIG
     global _GLOBAL_NUM_MICROBATCHES_CALCULATOR
     global _GLOBAL_TOKENIZER
     global _GLOBAL_TENSORBOARD_WRITER
@@ -198,6 +206,7 @@ def unset_global_variables():
     global _GLOBAL_TELEMETRY_HANDLE
 
     _GLOBAL_ARGS = None
+    _GLOBAL_FULL_CONFIG = None
     _GLOBAL_NUM_MICROBATCHES_CALCULATOR = None
     _GLOBAL_TOKENIZER = None
     _GLOBAL_TENSORBOARD_WRITER = None
@@ -215,6 +224,11 @@ def unset_global_variables():
 def set_args(args):
     global _GLOBAL_ARGS
     _GLOBAL_ARGS = args
+
+
+def set_full_config(cfg_container):
+    global _GLOBAL_FULL_CONFIG
+    _GLOBAL_FULL_CONFIG = cfg_container
 
 
 def _build_tokenizer(args):
@@ -534,6 +548,9 @@ def _set_telemetry(args):
 def destroy_global_vars():
     global _GLOBAL_ARGS
     _GLOBAL_ARGS = None
+
+    global _GLOBAL_FULL_CONFIG
+    _GLOBAL_FULL_CONFIG = None
 
     global _GLOBAL_TOKENIZER
     _GLOBAL_TOKENIZER = None

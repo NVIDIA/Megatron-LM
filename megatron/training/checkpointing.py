@@ -61,7 +61,7 @@ from megatron.core.utils import (
 )
 from megatron.training.argument_utils import _default_config_from_args
 from megatron.training.config import TokenizerConfig
-from megatron.training.global_vars import get_tokenizer
+from megatron.training.global_vars import get_full_config, get_tokenizer
 
 from ..core.dist_checkpointing.utils import _clean_metadata_for_serialization
 from . import ft_integration, wandb_utils
@@ -1104,15 +1104,22 @@ def save_checkpoint(
                     f'gtp_remat {gtp_remat_rank}/{gtp_remat_size_to_print}, '
                     f'p {pipeline_mp_rank}/{pp_size_to_print} ]'
                 )
+
+                # Save run_config.yaml
+                checkpoint_name = get_checkpoint_name(save_dir, iteration=iteration, return_base_dir=True)
+                if args.ckpt_format == 'torch_dist' and iteration > 0:
+                    from megatron.training.utils.checkpoint_utils import get_checkpoint_run_config_filename
+
+                    run_config_filename = get_checkpoint_run_config_filename(checkpoint_name)
+                    run_config = get_full_config()
+                    run_config.to_yaml(run_config_filename)
+
                 # Save tokenizer files for torch_dist checkpoints (if enabled)
                 if (
                     args.save_tokenizer_assets
                     and args.ckpt_format == 'torch_dist'
                     and iteration > 0
                 ):
-                    checkpoint_name = get_checkpoint_name(
-                        save_dir, iteration=iteration, return_base_dir=True
-                    )
                     config = _default_config_from_args(TokenizerConfig, args)
                     save_tokenizer_assets(get_tokenizer(), config, checkpoint_name)
                 if args.log_progress and args.async_save:
