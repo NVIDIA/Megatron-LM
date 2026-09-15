@@ -20,7 +20,7 @@ Megatron Core can be installed from PyPI, built from source, or run inside an NG
 
 ### Software
 
-- **Python**: >= 3.10 (3.12 recommended)
+- **Python**: >= 3.12
 - **PyTorch**: >= 2.6.0
 - **CUDA Toolkit**: Latest stable version
 
