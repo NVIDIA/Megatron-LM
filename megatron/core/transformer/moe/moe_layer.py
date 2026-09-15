@@ -270,14 +270,12 @@ class MoELayer(BaseMoELayer):
         self.tp_group = pg_collection.tp
 
         # Initialize router.
-        router_kwargs = {
-            "config": self.config,
-            "pg_collection": pg_collection,
-            "is_mtp_layer": is_mtp_layer,
-        }
-        if hash_moe_layer_threshold is not None:
-            router_kwargs["hash_moe_layer_threshold"] = hash_moe_layer_threshold
-        self.router = self.submodules.router(**router_kwargs)
+        self.router = self.submodules.router(
+            config=self.config,
+            pg_collection=pg_collection,
+            is_mtp_layer=is_mtp_layer,
+            hash_moe_layer_threshold=hash_moe_layer_threshold,
+        )
         if layer_number is not None:
             self.router.set_layer_number(layer_number)
         self.tp_group = pg_collection.tp
@@ -493,12 +491,9 @@ class MoELayer(BaseMoELayer):
         This method uses the router to determine which experts to send each token to,
         producing routing probabilities and a mapping.
         """
-        if input_ids is None:
-            probs, routing_map = apply_module(self.router)(hidden_states, padding_mask)
-        else:
-            probs, routing_map = apply_module(self.router)(
-                hidden_states, padding_mask, input_ids=input_ids
-            )
+        probs, routing_map = apply_module(self.router)(
+            hidden_states, padding_mask, input_ids=input_ids
+        )
         return probs, routing_map
 
     @maybe_skip_or_early_return_by_cudagraph("preprocess")

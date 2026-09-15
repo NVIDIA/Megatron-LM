@@ -84,7 +84,7 @@ class TestGPTModel:
             hidden_size=12,
             num_attention_heads=4,
             num_moe_experts=4,
-            moe_n_hash_layers=1,
+            moe_num_hash_layers=1,
             hash_moe_vocab_size=100,
             use_cpu_initialization=True,
         )

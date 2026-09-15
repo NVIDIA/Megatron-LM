@@ -71,7 +71,7 @@ def _get_hash_moe_layer_threshold(main_pattern: str | None, n_hash_layers: int) 
     ]
     if n_hash_layers > len(moe_layer_numbers):
         raise ValueError(
-            f"moe_n_hash_layers={n_hash_layers} exceeds the {len(moe_layer_numbers)} "
+            f"moe_num_hash_layers={n_hash_layers} exceeds the {len(moe_layer_numbers)} "
             "MoE layers in the main hybrid layer pattern."
         )
     return moe_layer_numbers[n_hash_layers - 1]
@@ -252,7 +252,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         self.mtp_pattern = parsed.mtp_pattern
         self.mtp_num_depths = parsed.mtp_num_depths
         hash_moe_layer_threshold = _get_hash_moe_layer_threshold(
-            parsed.main_pattern, self.config.moe_n_hash_layers
+            parsed.main_pattern, self.config.moe_num_hash_layers
         )
 
         if self.mtp_pattern is not None and self.config.overlap_moe_expert_parallel_comm:
@@ -569,7 +569,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         # Hash routing consumes batch-major token IDs. Under sequence parallelism,
         # shard them with decoder activations so each TP rank hashes its local tokens.
         hash_input_ids = None
-        if self.config.moe_n_hash_layers > 0:
+        if self.config.moe_num_hash_layers > 0:
             hash_input_ids = input_ids
         if (
             self.config.sequence_parallel

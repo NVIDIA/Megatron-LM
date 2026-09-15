@@ -246,6 +246,7 @@ class MlpBuilder(Protocol):
         pg_collection: ProcessGroupCollection,
         is_mtp_layer: bool,
         name: str | None = None,
+        hash_moe_layer_threshold: int | None = None,
     ) -> MlpInterface: ...
 
 
@@ -444,13 +445,6 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         from megatron.core.extensions.transformer_engine import TEFusedMLP
         from megatron.core.transformer.moe.moe_layer import MoELayer
 
-        mlp_builder = (
-            submodules.mlp.module if isinstance(submodules.mlp, ModuleSpec) else submodules.mlp
-        )
-        while isinstance(mlp_builder, functools.partial):
-            mlp_builder = mlp_builder.func
-        is_moe_mlp_builder = isinstance(mlp_builder, type) and issubclass(mlp_builder, MoELayer)
-
         # MLP expects tp_group but MoELayer expects pg_collection to be passed in.
         # We can change MLP to accept pg_collection but it makes the logic implicit
         # The conditional below is to make the logic explicit
@@ -473,9 +467,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             pg_collection=pg_collection,
             is_mtp_layer=self.is_mtp_layer,
             name=(name + ".mlp") if name is not None else None,
+            hash_moe_layer_threshold=hash_moe_layer_threshold,
         )
-        if is_moe_mlp_builder and hash_moe_layer_threshold is not None:
-            mlp_kwargs["hash_moe_layer_threshold"] = hash_moe_layer_threshold
         self.mlp = submodules.mlp(**mlp_kwargs)
         if hasattr(self.mlp, 'set_layer_number'):
             self.mlp.set_layer_number(self.layer_number)

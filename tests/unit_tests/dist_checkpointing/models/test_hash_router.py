@@ -19,7 +19,7 @@ def _build_hash_router(tp_size, vocab_size):
         num_moe_experts=4,
         moe_router_topk=2,
         moe_router_load_balancing_type='none',
-        moe_n_hash_layers=1,
+        moe_num_hash_layers=1,
         hash_moe_vocab_size=vocab_size,
         tensor_model_parallel_size=tp_size,
         use_cpu_initialization=True,

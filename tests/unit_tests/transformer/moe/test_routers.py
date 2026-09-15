@@ -748,7 +748,7 @@ def _hash_routing_config(**overrides):
         moe_router_dtype="fp32",
         add_bias_linear=False,
         use_cpu_initialization=True,
-        moe_n_hash_layers=2,
+        moe_num_hash_layers=2,
         hash_moe_vocab_size=128,
     )
     defaults.update(overrides)
@@ -1011,7 +1011,7 @@ class TestHashRouting:
     @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_hash_layer_selection_uses_explicit_hybrid_threshold(self):
-        config = _hash_routing_config(num_layers=8, moe_n_hash_layers=3)
+        config = _hash_routing_config(num_layers=8, moe_num_hash_layers=3)
         routers = [
             _make_hash_router(config, layer_number, hash_moe_layer_threshold=6)
             for layer_number in (2, 4, 6, 8)
@@ -1043,7 +1043,9 @@ class TestHashRouting:
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.parametrize("moe_layer_recompute", [False, True])
     def test_transformer_layer_hash_routing(self, moe_layer_recompute):
-        config = _hash_routing_config(moe_n_hash_layers=1, moe_layer_recompute=moe_layer_recompute)
+        config = _hash_routing_config(
+            moe_num_hash_layers=1, moe_layer_recompute=moe_layer_recompute
+        )
         submodules = get_gpt_layer_local_submodules(
             num_experts=config.num_moe_experts, moe_grouped_gemm=False
         )

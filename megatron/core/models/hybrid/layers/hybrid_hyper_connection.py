@@ -70,9 +70,8 @@ class HyperConnectionHybridLayer(MegatronModule):
                 sequence_len_offset=sequence_len_offset,
                 packed_seq_params=packed_seq_params,
                 padding_mask=padding_mask,
+                input_ids=input_ids,
             )
-            if input_ids is not None:
-                layer_kwargs["input_ids"] = input_ids
             output = self.inner_layer(**layer_kwargs)
         else:
             # Mamba-like layers only consume the common HybridStack arguments.

@@ -128,7 +128,7 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
             "features. Please reference the migration guide "
             "`docs/user-guide/hybrid-model-migration.md` for details on how to use `HybridModel`",
         )
-        if config.moe_n_hash_layers > 0:
+        if config.moe_num_hash_layers > 0:
             raise ValueError(
                 "Hash-routed MoE is supported only by HybridModel because GPTModel does not "
                 "forward token IDs to transformer layers."

@@ -281,7 +281,7 @@ class TopKRouter(Router):
         super().set_layer_number(layer_number)
         hash_moe_layer_threshold = self.hash_moe_layer_threshold
         if hash_moe_layer_threshold is None:
-            hash_moe_layer_threshold = self.config.moe_n_hash_layers
+            hash_moe_layer_threshold = self.config.moe_num_hash_layers
         self.is_hash_layer = (
             not self.is_mtp_layer
             and hash_moe_layer_threshold > 0
@@ -885,7 +885,7 @@ class TopKRouter(Router):
         logits = self.apply_z_loss(logits, padding_mask=padding_mask)
 
         # Calculate probs and routing_map for token dispatching
-        if self.config.moe_n_hash_layers > 0:
+        if self.config.moe_num_hash_layers > 0:
             assert self.layer_number is not None, (
                 "Hash routing requires a layer number. Construct the router through MoELayer "
                 "or call set_layer_number() before routing."
@@ -1057,7 +1057,7 @@ class InferenceTopKRouter(TopKRouter):
         )
         supported_compiled_scores = ["sigmoid", "softmax"]
         assert config.moe_router_score_function in supported_compiled_scores or (
-            config.moe_n_hash_layers > 0 and config.moe_router_score_function == "sqrtsoftplus"
+            config.moe_num_hash_layers > 0 and config.moe_router_score_function == "sqrtsoftplus"
         ), (
             "InferenceTopKRouter requires moe_router_score_function to be sigmoid/softmax, "
             "or sqrtsoftplus for hash routing; got "

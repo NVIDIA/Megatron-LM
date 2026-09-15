@@ -308,15 +308,15 @@ def test_hybrid_stack_preserves_hash_ids_in_cuda_graph_signature(cuda_graph_impl
     assert transformer_layer.calls[0]['input_ids'] is input_ids
 
 
-@pytest.mark.parametrize("moe_n_hash_layers,expects_input_ids", [(0, False), (1, True)])
+@pytest.mark.parametrize("moe_num_hash_layers,expects_input_ids", [(0, False), (1, True)])
 def test_hybrid_model_passes_ids_to_decoder_only_for_hash_routing(
-    moe_n_hash_layers, expects_input_ids
+    moe_num_hash_layers, expects_input_ids
 ):
     decoder = RecordingDecoder()
     config = SimpleNamespace(
         fine_grained_activation_offloading=False,
         moe_paged_stash=False,
-        moe_n_hash_layers=moe_n_hash_layers,
+        moe_num_hash_layers=moe_num_hash_layers,
         hash_moe_vocab_size=128,
         sequence_parallel=False,
         freeze_base_model_for_mtp=False,
@@ -367,7 +367,7 @@ def test_hybrid_model_sequence_shards_hash_ids_with_decoder_input(monkeypatch):
         config=SimpleNamespace(
             fine_grained_activation_offloading=False,
             moe_paged_stash=False,
-            moe_n_hash_layers=1,
+            moe_num_hash_layers=1,
             hash_moe_vocab_size=128,
             sequence_parallel=True,
             freeze_base_model_for_mtp=False,
@@ -463,7 +463,7 @@ def test_hybrid_hash_moe_pp_does_not_require_explicit_pipeline_layout():
         pipeline_model_parallel_size=2,
         pipeline_dtype=torch.float32,
         num_moe_experts=4,
-        moe_n_hash_layers=3,
+        moe_num_hash_layers=3,
         hash_moe_vocab_size=128,
         is_hybrid_model=True,
     )
@@ -479,7 +479,7 @@ def test_hybrid_hash_moe_pp_does_not_require_explicit_pipeline_layout():
             pipeline_model_parallel_size=2,
             pipeline_dtype=torch.float32,
             num_moe_experts=4,
-            moe_n_hash_layers=3,
+            moe_num_hash_layers=3,
             hash_moe_vocab_size=128,
             is_hybrid_model=False,
         )

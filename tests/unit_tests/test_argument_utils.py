@@ -89,18 +89,23 @@ def test_moe_norm_flag_reaches_transformer_config():
     assert config.moe_use_norm_before_up_proj is True
 
 
-def test_hash_moe_uses_tp_independent_tokenizer_vocab_size():
+@pytest.mark.parametrize('input_vocab_size', [None, 100000])
+def test_hash_moe_uses_explicit_tokenizer_vocab_size(input_vocab_size):
     parser = ArgumentParser()
     add_megatron_arguments(parser)
     args = parser.parse_args([])
     args.params_dtype = torch.float32
-    args.tokenizer_vocab_size = 100003
-    args.vocab_size = 100003
+    # The actual vocabulary includes added tokens and does not follow TP padding.
+    args.vocab_size = input_vocab_size
     args.padded_vocab_size = 100352
 
-    config = core_transformer_config_from_args(args, config_class=CapturingTransformerConfig)
+    config = core_transformer_config_from_args(
+        args, config_class=CapturingTransformerConfig, tokenizer_vocab_size=100003
+    )
 
     assert config.hash_moe_vocab_size == 100003
+    assert args.vocab_size == input_vocab_size
+    assert not hasattr(args, 'tokenizer_vocab_size')
 
 
 def test_moe_norm_flag_requires_latent_size(monkeypatch):
