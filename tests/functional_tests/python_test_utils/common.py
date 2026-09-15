@@ -26,6 +26,11 @@ class TypeOfTestResult(enum.Enum):
     DETERMINISTIC = 2
 
 
+class ValuePrecision(str, enum.Enum):
+    ROUNDED_5_DECIMAL_PLACES = "rounded_5_decimal_places"
+    FULL = "full"
+
+
 class Test(pydantic.BaseModel):
     pass
 
@@ -71,6 +76,7 @@ class GoldenValueMetric(pydantic.BaseModel):
     start_step: int
     end_step: int
     step_interval: int
+    value_precision: ValuePrecision = ValuePrecision.ROUNDED_5_DECIMAL_PLACES
     values: Dict[int, Union[int, float, str]]
 
     def __repr__(self):
@@ -179,12 +185,10 @@ def read_tb_logs_as_list(
             if scalar_name in summaries:
                 for x in ea.Scalars(scalar_name):
                     if x.step not in summaries[scalar_name]:
-                        summaries[scalar_name][x.step] = round(x.value, 5)
+                        summaries[scalar_name][x.step] = x.value
 
             else:
-                summaries[scalar_name] = {
-                    x.step: round(x.value, 5) for x in ea.Scalars(scalar_name)
-                }
+                summaries[scalar_name] = {x.step: x.value for x in ea.Scalars(scalar_name)}
 
     golden_values = {}
 
@@ -209,6 +213,7 @@ def read_tb_logs_as_list(
             start_step=steps[0],
             end_step=steps[-1],
             step_interval=_infer_step_interval(steps, start_idx, step_size),
+            value_precision=ValuePrecision.FULL,
             values=values,
         )
 
@@ -230,6 +235,10 @@ def _filter_checks(
     checks: List[Union[ApproximateTest, DeterministicTest]], filter_for_type_of_check
 ):
     return [test for test in checks if test.type_of_test_result == filter_for_type_of_check]
+
+
+def _round_values(values: List[Union[int, float, str]]) -> List[Union[int, float, str]]:
+    return [round(value, 5) if not isinstance(value, str) else value for value in values]
 
 
 def pipeline(
@@ -266,6 +275,15 @@ def pipeline(
                     actual_values[metric_name].values.get(value_step, "nan")
                     for value_step in golden_value.values
                 ]
+
+                comparison_precision = (
+                    ValuePrecision.ROUNDED_5_DECIMAL_PLACES
+                    if test.type_of_test_result == TypeOfTestResult.APPROXIMATE
+                    else golden_value.value_precision
+                )
+                if comparison_precision == ValuePrecision.ROUNDED_5_DECIMAL_PLACES:
+                    golden_value_list = _round_values(golden_value_list)
+                    actual_value_list = _round_values(actual_value_list)
 
                 if metric_name == "iteration-time":
                     finite_golden_steps = [

@@ -101,12 +101,36 @@ class TestParallelTransformerLayer:
         num_weights = sum([p.numel() for p in parallel_transformer_layer.parameters()])
         assert num_weights == 1884
 
+    def test_mtp_flag_is_forwarded_to_attention(self):
+        """All attention builders receive the MTP-layer flag."""
+        config = TransformerConfig(
+            num_layers=2, hidden_size=12, num_attention_heads=4, use_cpu_initialization=True
+        )
+        config.experimental_attention_variant = "gdn"
+        strict_attention_spec = object()
+        submodules = TransformerLayerSubmodules(self_attention=strict_attention_spec)
+        attention_kwargs = {}
+
+        def fake_build_module(spec, *args, **kwargs):
+            if spec is strict_attention_spec:
+                attention_kwargs.update(kwargs)
+            return torch.nn.Identity()
+
+        with patch(
+            "megatron.core.transformer.transformer_layer.build_module",
+            side_effect=fake_build_module,
+        ):
+            TransformerLayer(config, submodules, is_mtp_layer=True)
+
+        assert attention_kwargs["is_mtp_layer"] is True
+
     def test_gpu_forward(self):
         parallel_transformer_layer = self.parallel_transformer_layer
         config: TransformerConfig = parallel_transformer_layer.config
         sequence_length = 32
         micro_batch_size = 2
         parallel_transformer_layer.cuda()
+        parallel_transformer_layer.eval()
 
         # [sequence length, batch size, hidden size]
         hidden_states = torch.ones((sequence_length, micro_batch_size, config.hidden_size))
@@ -114,12 +138,14 @@ class TestParallelTransformerLayer:
 
         attention_mask = torch.ones((1, 1, sequence_length, sequence_length), dtype=bool).cuda()
 
-        hidden_states, context = parallel_transformer_layer(
+        output, context = parallel_transformer_layer(
             hidden_states=hidden_states, attention_mask=attention_mask
         )
-        assert hidden_states.shape[0] == sequence_length
-        assert hidden_states.shape[1] == micro_batch_size
-        assert hidden_states.shape[2] == config.hidden_size
+        assert not parallel_transformer_layer.supports_two_stage_attention()
+        assert context is None
+        assert output.shape[0] == sequence_length
+        assert output.shape[1] == micro_batch_size
+        assert output.shape[2] == config.hidden_size
 
     def test_chunked_mlp(self):
         with torch.no_grad():
@@ -719,6 +745,98 @@ class TestTransformerLayerWithHyperConnectionRecompute:
         assert hidden_states.grad.shape == hidden_states.shape
         # Check that gradient is non-trivial (not all zeros)
         assert hidden_states.grad.abs().sum() > 0
+
+    def test_moe_layer_forward_backward_without_partial_cuda_graphs(self):
+        """mHC uses the ordinary MoE execution path when partial graphs are disabled."""
+        config = _make_mhc_config(
+            hidden_size=32,
+            num_streams=4,
+            num_layers=1,
+            ffn_hidden_size=64,
+            moe_ffn_hidden_size=64,
+            num_moe_experts=4,
+            moe_router_topk=2,
+            moe_router_load_balancing_type="none",
+            moe_token_dispatcher_type="allgather",
+            add_bias_linear=False,
+        )
+        layer = HyperConnectionTransformerLayer(
+            config,
+            _make_mhc_layer_spec(
+                num_experts=4, moe_grouped_gemm=False, use_te_op_fuser=False
+            ).submodules,
+        )
+
+        assert layer.is_moe_layer
+        assert layer.supports_mhc_connections
+
+        state_dict = layer.state_dict()
+        assert any("self_attention_hyper_connection" in key for key in state_dict)
+        assert any("mlp_hyper_connection" in key for key in state_dict)
+
+        layer = layer.cuda()
+        hidden_states = torch.randn(8, 2, 128, device="cuda", requires_grad=True)
+        attention_mask = torch.zeros((1, 1, 8, 8), dtype=bool, device="cuda")
+        output, _ = layer(hidden_states=hidden_states, attention_mask=attention_mask)
+        output.float().sum().backward()
+
+        assert output.shape == hidden_states.shape
+        assert torch.isfinite(output).all()
+        assert hidden_states.grad is not None
+
+    def test_moe_layer_skips_mlp_cuda_graph(self):
+        """A global MLP graph request must leave the mHC MoE layer eager."""
+        config = _make_mhc_config(
+            hidden_size=32,
+            num_streams=4,
+            num_layers=1,
+            ffn_hidden_size=64,
+            moe_ffn_hidden_size=64,
+            num_moe_experts=4,
+            moe_router_topk=2,
+            moe_router_load_balancing_type="none",
+            moe_token_dispatcher_type="allgather",
+        )
+        config.cuda_graph_impl = "local"
+        config.cuda_graph_modules = [CudaGraphModule.mlp]
+
+        layer = HyperConnectionTransformerLayer(
+            config,
+            _make_mhc_layer_spec(
+                num_experts=4, moe_grouped_gemm=False, use_te_op_fuser=False
+            ).submodules,
+        )
+
+        assert layer.is_moe_layer
+        assert not hasattr(layer, "cudagraph_manager")
+        assert layer.mlp_hyper_connection not in layer._get_submodules_under_cudagraphs()
+
+    @pytest.mark.parametrize(
+        "cuda_graph_module",
+        [CudaGraphModule.moe, CudaGraphModule.moe_router, CudaGraphModule.moe_preprocess],
+    )
+    def test_moe_layer_rejects_partial_cuda_graphs(self, cuda_graph_module):
+        """Partial MoE graphs must not drop the hyper-connection state."""
+        config = _make_mhc_config(
+            hidden_size=32,
+            num_streams=4,
+            num_layers=1,
+            ffn_hidden_size=64,
+            moe_ffn_hidden_size=64,
+            num_moe_experts=4,
+            moe_router_topk=2,
+            moe_router_load_balancing_type="none",
+            moe_token_dispatcher_type="allgather",
+        )
+        config.cuda_graph_modules = [cuda_graph_module]
+
+        with pytest.raises(NotImplementedError, match="MoE CUDA graph"):
+            HyperConnectionTransformerLayer(
+                config,
+                _make_mhc_layer_spec(
+                    num_experts=4, moe_grouped_gemm=False, use_te_op_fuser=False
+                ).submodules,
+            )
 
     @pytest.mark.parametrize("norm_attr", ["input_layernorm", "pre_mlp_layernorm"])
     def test_residual_returning_layernorm_is_rejected(self, norm_attr):

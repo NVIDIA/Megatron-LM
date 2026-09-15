@@ -187,7 +187,9 @@ class TopKRouter(Router):
                 'local_tokens_per_expert',
                 torch.zeros(
                     self.config.num_moe_experts,
-                    dtype=torch.float32,
+                    # Keep token counts exact through accumulation and cross-rank reduction.
+                    # Float16Module leaves integer buffers in their original dtype.
+                    dtype=torch.int64,
                     device=torch.cuda.current_device(),
                 ),
                 persistent=False,
@@ -439,7 +441,7 @@ class TopKRouter(Router):
             topk=self.topk,
             num_experts=self.config.num_moe_experts,
             moe_aux_loss_coeff=aux_loss_coeff,
-            fused=self.config.moe_router_fusion,
+            fused=self.config.moe_router_aux_loss_fusion,
         )
         probs = self.attach_and_log_load_balancing_loss(
             probs,
@@ -491,7 +493,7 @@ class TopKRouter(Router):
                 topk=self.topk,
                 num_experts=self.config.num_moe_experts,
                 moe_aux_loss_coeff=seq_aux_loss_coeff,
-                fused=self.config.moe_router_fusion,
+                fused=self.config.moe_router_aux_loss_fusion,
             )
             / bsz
         )
@@ -541,7 +543,7 @@ class TopKRouter(Router):
             topk=self.topk,
             num_experts=self.config.num_moe_experts,
             moe_aux_loss_coeff=global_aux_loss_coeff,
-            fused=self.config.moe_router_fusion,
+            fused=self.config.moe_router_aux_loss_fusion,
         )
         probs = self.attach_and_log_load_balancing_loss(
             probs,
@@ -649,9 +651,9 @@ class TopKRouter(Router):
 
         Args:
             logits (torch.Tensor): The logits of the router.
-            padding_mask (torch.Tensor, optional): Boolean mask indicating non-padding tokens.
-                                                   Shape in [num_tokens]. True for valid tokens,
-                                                   False for padding tokens. Defaults to None.
+            padding_mask (torch.Tensor, optional): Boolean mask indicating padding positions.
+                                                   Shape [num_tokens]. True = padding,
+                                                   False = valid. Defaults to None.
 
         Returns:
             torch.Tensor: The logits after applying the z-loss.
@@ -752,9 +754,9 @@ class TopKRouter(Router):
 
         Args:
             logits (torch.Tensor): Logits tensor after gating.
-            padding_mask (torch.Tensor, optional): Boolean mask indicating non-padding tokens.
-                                                   Shape [seq_length, bsz]. True for valid tokens,
-                                                   False for padding tokens. Defaults to None.
+            padding_mask (torch.Tensor, optional): Boolean mask indicating padding positions.
+                                                   Shape [seq_length, bsz]. True = padding,
+                                                   False = valid. Defaults to None.
 
         Returns:
             probs (torch.Tensor): The probabilities of token to experts assignment.
@@ -811,7 +813,7 @@ class TopKRouter(Router):
                 logits,
                 self.topk,
                 self.score_function,
-                fused=self.config.moe_router_fusion,
+                fused=self.config.moe_router_aux_loss_fusion,
                 padding_mask=padding_mask,
             )
             probs = self._apply_aux_loss(
@@ -852,9 +854,9 @@ class TopKRouter(Router):
 
         Args:
             input (torch.Tensor): Input tensor.
-            padding_mask (torch.Tensor, optional): Boolean mask indicating non-padding tokens.
-                                                   Shape [seq_length, bsz]. True for valid tokens,
-                                                   False for padding tokens. Defaults to None.
+            padding_mask (torch.Tensor, optional): Boolean mask indicating padding positions.
+                                                   Shape [seq_length, bsz]. True = padding,
+                                                   False = valid. Defaults to None.
         """
         self._maintain_float32_expert_bias()
 

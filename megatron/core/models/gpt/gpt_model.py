@@ -2,6 +2,7 @@
 
 import logging
 from collections import OrderedDict
+from contextlib import nullcontext
 from typing import Any, Callable, Dict, Literal, Optional
 
 import torch
@@ -180,6 +181,7 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
                 position_embedding_type=position_embedding_type,
                 scatter_to_sequence_parallel=scatter_embedding_sequence_parallel,
                 tp_group=self.pg_collection.tp,
+                pg_collection=self.pg_collection,
             )
 
         if self.position_embedding_type == 'rope' and not self.config.multi_latent_attention:
@@ -293,6 +295,7 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
                 embedding_activation_buffer=self.embedding_activation_buffer,
                 grad_output_buffer=self.grad_output_buffer,
                 tp_group=self.pg_collection.tp,
+                pg_collection=self.pg_collection,
                 output_dtype=self.logit_dtype,
             )
 
@@ -628,19 +631,25 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
         rotary_pos_cos_sin = preproc_output[6] if len(preproc_output) == 7 else None
 
         # Run decoder.
-        hidden_states = self.decoder(
-            hidden_states=decoder_input,
-            attention_mask=attention_mask,
-            inference_context=inference_context,
-            rotary_pos_emb=rotary_pos_emb,
-            rotary_pos_cos=rotary_pos_cos,
-            rotary_pos_sin=rotary_pos_sin,
-            rotary_pos_cos_sin=rotary_pos_cos_sin,
-            packed_seq_params=packed_seq_params,
-            sequence_len_offset=sequence_len_offset,
-            padding_mask=padding_mask,
-            **(extra_block_kwargs or {}),
+        backbone_context = (
+            torch.no_grad()
+            if self.config.freeze_base_model_for_mtp and self.training
+            else nullcontext()
         )
+        with backbone_context:
+            hidden_states = self.decoder(
+                hidden_states=decoder_input,
+                attention_mask=attention_mask,
+                inference_context=inference_context,
+                rotary_pos_emb=rotary_pos_emb,
+                rotary_pos_cos=rotary_pos_cos,
+                rotary_pos_sin=rotary_pos_sin,
+                rotary_pos_cos_sin=rotary_pos_cos_sin,
+                packed_seq_params=packed_seq_params,
+                sequence_len_offset=sequence_len_offset,
+                padding_mask=padding_mask,
+                **(extra_block_kwargs or {}),
+            )
 
         return self._postprocess(
             hidden_states=hidden_states,

@@ -26,7 +26,12 @@ from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.moe import InferenceGroupedGemmBackend
 from megatron.core.inference.moe.vllm_fused_moe import VllmFusedMoeBuffers
 from megatron.core.inference.sampling.base import Sampling
-from megatron.core.inference.sampling_params import SamplingParams
+from megatron.core.inference.sampling_params import (
+    MIN_SAMPLING_TEMPERATURE,
+    SamplingParams,
+    is_no_op_top_k,
+    is_no_op_top_p,
+)
 from megatron.core.inference.unified_memory import (
     UnifiedMemoryUnsupportedError,
     create_unified_mempool,
@@ -339,6 +344,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Hyperparameter for choosing to prioritize prefix hit matches vs minimizing idle load
         self.prefix_caching_routing_alpha = inference_config.prefix_caching_routing_alpha
+        self.prefix_cache_ttl_seconds = inference_config.prefix_cache_ttl_seconds
         self.media_cache_coordinator_policy = inference_config.media_cache_coordinator_policy
         self.media_cache_routing_weight = inference_config.media_cache_routing_weight
 
@@ -1379,6 +1385,12 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
         self._decode_logit_idxs = torch.arange(
             max_logit_idxs, dtype=torch.int32, device=torch.cuda.current_device()
+        )
+        # A partial prefill chunk's last logit predicts a known prompt token, not
+        # the provisional sample that is discarded after the step. The scheduler
+        # permits only one partial chunk, so one stable scalar is sufficient.
+        self.chunked_prefill_next_prompt_token = torch.empty(
+            (), dtype=torch.int64, device=torch.cuda.current_device()
         )
 
         # MHA flash-attention metadata views (write-only on CPU, read-only on
@@ -3337,6 +3349,11 @@ class DynamicInferenceContext(BaseInferenceContext):
             prefill_chunk_length <= req.remaining_prompt_length
         ), "Prefill chunk length is greater than remaining prompt length"
 
+        if prefill_chunk_length < req.remaining_prompt_length:
+            self.chunked_prefill_next_prompt_token.copy_(
+                req.remaining_prompt_tokens[prefill_chunk_length]
+            )
+
         # =========================================================================
         # Block allocation + prefix matching + prefill skipping
         # =========================================================================
@@ -3350,15 +3367,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         ) = self._compute_prefix_match(req, prefill_chunk_length, record_mamba_match=True)
         num_matched_blocks = len(matched_block_ids)
         effective_kv_offset = req.finished_chunk_token_count + prefix_skip_tokens
-
-        # Track prefix cache hits. num_cached_tokens accumulates across prefill
-        # chunks: each chunk matches a disjoint block range (start advances with
-        # finished_chunk_token_count), so a long cached prefix is discovered
-        # incrementally and must be summed, not overwritten.
-        if num_matched_blocks > 0:
-            self.prefix_cache_hits += 1
-            self.prefix_cache_blocks_matched += num_matched_blocks
-            req.num_cached_tokens += num_matched_blocks * self.block_size_tokens
 
         # Slice tokens to skip matched prefix
         this_round_tokens = req.remaining_prompt_tokens[prefix_skip_tokens:prefill_chunk_length]
@@ -3387,6 +3395,14 @@ class DynamicInferenceContext(BaseInferenceContext):
                 if matched_tensor is not None:
                     self.kv_block_allocator.block_ref_counts[matched_tensor] -= 1
                 raise BlockOverflowError(req.request_id)
+
+        # Track prefix cache hits only after allocation succeeds. Matched blocks
+        # measure KV reuse, while num_cached_tokens accumulates the prefill tokens
+        # actually skipped after Mamba and minimum-prefill backoff.
+        if num_matched_blocks > 0:
+            self.prefix_cache_hits += 1
+            self.prefix_cache_blocks_matched += num_matched_blocks
+            req.num_cached_tokens += prefix_skip_tokens
 
         # Note that we decremented the total_request_count for the chunked prefill request
         # in update_requests, so setting current_id to the total_request_count will again
@@ -3855,9 +3871,11 @@ class DynamicInferenceContext(BaseInferenceContext):
         active_request_count += resume_request_count
 
         # Resume requests by assigning blocks and updating bookkeeping tensors.
+        resumed_request_ids = None
         if resume_request_count > 0:
             resume_start = self.paused_request_count
             resume_end = self.paused_request_count + resume_request_count
+            resumed_request_ids = self.request_ids[resume_start:resume_end]
 
             # Check which resumed requests actually need a new block
             offsets = self.request_last_kv_block_offset[resume_start:resume_end]
@@ -3879,13 +3897,12 @@ class DynamicInferenceContext(BaseInferenceContext):
                 self.request_kv_block_counts[row_idx] += 1
                 self.request_last_kv_block_id[row_idx] = block_ids
 
-        # Remove resumed requests from newly_paused_request_ids. We do this by
-        # truncating the end of newly_paused_request_ids, which works because we
-        # resume requests in LIFO order. If resume_request_count >
-        # len(newly_paused_request_ids), this means that none of the paused
-        # requests are newly paused during this update.
+        # Eviction may change which paused suffix resumes, so filter by identity
+        # rather than assuming every resumed request is at the end of this list.
         if newly_paused_request_ids is not None and resume_request_count > 0:
-            newly_paused_request_ids = newly_paused_request_ids[:-resume_request_count]
+            newly_paused_request_ids = newly_paused_request_ids[
+                ~torch.isin(newly_paused_request_ids, resumed_request_ids)
+            ]
 
         return active_request_count, newly_paused_request_ids
 
@@ -4441,11 +4458,6 @@ class DynamicInferenceContext(BaseInferenceContext):
                 (active_requests_requiring_new_block == 1).sum().item()
             )
 
-            if active_requests_requiring_new_block_count > 0:
-                newly_paused_request_ids = self.request_ids[
-                    torch.nonzero(active_requests_requiring_new_block) + self.paused_request_count
-                ]
-
             # Swap unfinished active requests on the left side with paused requests on the right side
             # NOTE : We add paused request count because we concatenate
             # paused tokens to the left at the beginning of update requests
@@ -4481,6 +4493,14 @@ class DynamicInferenceContext(BaseInferenceContext):
                     next_tokens=next_tokens,
                     new_speculative_tokens=new_speculative_tokens,
                 )
+
+            if active_requests_requiring_new_block_count > 0:
+                # Clone required: request_ids is mutated later in update_requests,
+                # while this snapshot is returned to the caller.
+                newly_paused_request_ids = self.request_ids[
+                    self.paused_request_count : self.paused_request_count
+                    + active_requests_requiring_new_block_count
+                ].clone()
 
             self.paused_request_count += active_requests_requiring_new_block_count
             active_request_count -= active_requests_requiring_new_block_count
@@ -4718,6 +4738,25 @@ class DynamicInferenceContext(BaseInferenceContext):
             "evict_request_ids": evict_request_ids,
         }
 
+    def active_sampling_filter_flags(
+        self, active_request_count: Optional[int] = None
+    ) -> Tuple[bool, bool]:
+        """Return `(no_top_k, no_top_p)` batch-level flags for the active batch.
+
+        These are read from the pinned CPU sampling metadata, so they incur no GPU sync.
+        They are used in several places to decide whether to skip sampling-filtering work.
+        """
+        if active_request_count is None:
+            active_request_count = self.total_request_count - self.paused_request_count
+        if active_request_count <= 0:
+            return True, True
+
+        top_k = self.active_request_metadata["top_k"][:active_request_count]
+        top_p = self.active_request_metadata["top_p"][:active_request_count]
+        no_top_k = bool(is_no_op_top_k(top_k).all())
+        no_top_p = bool(is_no_op_top_p(top_p).all())
+        return no_top_k, no_top_p
+
     def _processed_log_probs(
         self,
         logits: Tensor,
@@ -4784,7 +4823,25 @@ class DynamicInferenceContext(BaseInferenceContext):
             log_probs = self._processed_log_probs(
                 active_logits, n_active, None, sampling, row_to_request
             )
-            return log_probs[seq_idx, new_tokens], log_probs
+            selected_log_probs = log_probs[seq_idx, new_tokens]
+            if self.config.logprobs_mode != "raw_logprobs" and not all(
+                self.active_sampling_filter_flags(n_active)
+            ):
+                if row_to_request is None:
+                    temperature = self.gpu_view.temperature[: len(new_tokens)]
+                else:
+                    temperature = self.gpu_view.temperature[
+                        row_to_request.to(logits.device, non_blocking=True)
+                    ]
+                scaled = active_logits / temperature.clamp(min=MIN_SAMPLING_TEMPERATURE).unsqueeze(
+                    1
+                )
+                gathered = scaled.gather(1, new_tokens.view(-1, 1).long()).squeeze(1)
+                tempered = gathered - scaled.logsumexp(dim=1)
+                selected_log_probs = torch.where(
+                    torch.isfinite(selected_log_probs), selected_log_probs, tempered
+                )
+            return selected_log_probs, log_probs
 
         logits_squeezed = logits_squeezed.float()
         active_slice = slice(self.paused_request_count, self.total_request_count)
@@ -4800,7 +4857,22 @@ class DynamicInferenceContext(BaseInferenceContext):
             logits_squeezed, n_active, active_query_lengths_cpu, sampling
         )
         seq_idx = torch.arange(self.active_token_count, device=log_probs.device)
-        return log_probs[seq_idx, active_token_ids], log_probs
+        selected_log_probs = log_probs[seq_idx, active_token_ids]
+        if self.config.logprobs_mode != "raw_logprobs" and not all(
+            self.active_sampling_filter_flags(n_active)
+        ):
+            # Only each request's final row is engine-sampled; prompt rows may keep -inf.
+            temperature = self.gpu_view.temperature[:n_active]
+            scaled = logits_squeezed[new_token_idx] / temperature.clamp(
+                min=MIN_SAMPLING_TEMPERATURE
+            ).unsqueeze(1)
+            gathered = scaled.gather(1, new_tokens.view(-1, 1).long()).squeeze(1)
+            tempered = gathered - scaled.logsumexp(dim=1)
+            sampled = selected_log_probs[new_token_idx]
+            selected_log_probs[new_token_idx] = torch.where(
+                torch.isfinite(sampled), sampled, tempered
+            )
+        return selected_log_probs, log_probs
 
     def calculate_log_probs(
         self,
