@@ -12,6 +12,8 @@ spec:
   n_repeat: 5
   time_limit_override: 5400
   platforms: dgx_gb200
+  training_script: pretrain_hybrid.py
+  compare_to_golden: "true"
   script_setup: |
     set -euo pipefail
     unset https_proxy
@@ -49,6 +51,11 @@ spec:
 
     export GPUS_PER_NODE={gpus}
 
+    GOLDEN_VALUES_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/golden_values_{environment}_{platforms}.json
+    if [[ "{compare_to_golden}" == "false" ]]; then
+        GOLDEN_VALUES_PATH=""
+    fi
+
     ARGUMENTS=(
         "DATA_PATH=/mnt/artifacts"
         "DATA_CACHE_PATH=/lustre/fsw/coreai_dlalgo_mcore/mcore_ci/data/$RUN_ID/cache/"
@@ -56,9 +63,9 @@ spec:
         "TENSORBOARD_PATH={assets_dir}/tensorboard"
         "CHECKPOINT_SAVE_PATH={artifacts_dir}/checkpoints"
         "CHECKPOINT_LOAD_PATH=/mnt/artifacts"
-        "TRAINING_SCRIPT_PATH=pretrain_hybrid.py"
+        "TRAINING_SCRIPT_PATH={training_script}"
         "TRAINING_PARAMS_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/model_config.yaml"
-        "GOLDEN_VALUES_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/golden_values_{environment}_{platforms}.json"
+        "GOLDEN_VALUES_PATH=$GOLDEN_VALUES_PATH"
         "N_REPEAT={n_repeat}"
         "ENABLE_LIGHTWEIGHT_MODE=${{ENABLE_LIGHTWEIGHT_MODE:-}}"
         "RECORD_CHECKPOINTS=${{RECORD_CHECKPOINTS:-}}"
@@ -73,3 +80,12 @@ products:
         scope: [L2]
         cadence: [nightly]
         platforms: [dgx_gb200]
+  - test_case: [nemotron3_puzzle_75b_nightly_tp1_pp1_cp1_ep8_dgx_gb200]
+    products:
+      - environment: [dev]
+        scope: [L2]
+        cadence: [nightly]
+        platforms: [dgx_gb200]
+        training_script: [tests/functional_tests/test_cases/nemotron/nemotron3_puzzle_75b_nightly_tp1_pp1_cp1_ep8_dgx_gb200/puzzle.py]
+        compare_to_golden: ["false"]
+        n_repeat: [1]

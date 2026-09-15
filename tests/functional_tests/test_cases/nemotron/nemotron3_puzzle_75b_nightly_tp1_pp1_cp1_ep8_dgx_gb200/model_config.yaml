@@ -1,0 +1,121 @@
+ENV_VARS:
+  NCCL_GRAPH_REGISTER: 0
+  NCCL_NVLS_ENABLE: 0
+  PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+  TORCH_NCCL_AVOID_RECORD_STREAMS: 1
+  TORCH_NCCL_HIGH_PRIORITY: 1
+  CUDA_DEVICE_MAX_CONNECTIONS: 32
+  NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN: 8
+  NUM_OF_TOKENS_PER_CHUNK_COMBINE_API: 128
+  NVLINK_DOMAIN_SIZE: 72
+  USE_MNNVL: 1
+  NVTE_BWD_LAYERNORM_SM_MARGIN: 20
+  NVTE_FWD_LAYERNORM_SM_MARGIN: 20
+  NVTE_NORM_BWD_USE_CUDNN: 1
+  NVTE_NORM_FWD_USE_CUDNN: 1
+  NVTE_ALLOW_NONDETERMINISTIC_ALGO: 1
+  NON_DETERMINSTIC_RESULTS: 1
+
+TEST_TYPE: ckpt-resume
+
+MODEL_ARGS:
+  # Full Puzzle architecture and its MTP head are defined in this test case's puzzle.py.
+  # Distributed topology: 2 nodes x 4 GB200 GPUs.
+  --tensor-model-parallel-size: 1
+  --pipeline-model-parallel-size: 1
+  --context-parallel-size: 1
+  --expert-model-parallel-size: 8
+  --expert-tensor-parallel-size: 1
+  --use-distributed-optimizer: true
+  --overlap-grad-reduce: true
+  --overlap-param-gather: true
+  --check-for-large-grads: true
+
+  # Full-size model, short training window, and activation-memory control.
+  --micro-batch-size: 1
+  --global-batch-size: 32
+  --train-iters: 20
+  --recompute-granularity: full
+  --recompute-method: uniform
+  --recompute-num-layers: 1
+  --manual-gc: true
+  --manual-gc-interval: 100
+  --cross-entropy-loss-fusion: true
+  --cross-entropy-fusion-impl: native
+  --attention-backend: fused
+  --te-rng-tracker: true
+
+  # HybridEP and grouped experts. Latent MoE does not support shared-expert overlap.
+  --moe-token-dispatcher-type: flex
+  --moe-flex-dispatcher-backend: hybridep
+  --moe-flex-dispatcher-num-sms: 16
+  --moe-grouped-gemm: true
+  --moe-permute-fusion: true
+  --moe-router-load-balancing-type: seq_aux_loss
+  --moe-aux-loss-coeff: 1.0e-4
+  --use-fused-weighted-squared-relu: true
+  --mtp-loss-scaling-factor: 0.3
+
+  # Reuse Lightning's staged Pile corpus and GPT-2 tokenizer.
+  --seq-length: 2048
+  --max-position-embeddings: 2048
+  --data-path: ${DATA_PATH}/text/the_pile/shard00/my-gpt3_00_text_document
+  --vocab-file: ${DATA_PATH}/text/the_pile/shard00/bpe/vocab.json
+  --merge-file: ${DATA_PATH}/text/the_pile/shard00/bpe/merges.txt
+  --data-cache-path: ${DATA_CACHE_PATH}
+  --split: 949,50,1
+  --dataloader-type: single
+  --num-workers: 8
+  --no-create-attention-mask-in-dataloader: true
+
+  # BF16 compute/reduction; precision-aware Adam retains parameter remainders by default.
+  --bf16: true
+  --grad-reduce-in-bf16: true
+  --use-precision-aware-optimizer: true
+  --main-grads-dtype: fp32
+  --main-params-dtype: fp32
+  --exp-avg-dtype: fp32
+  --exp-avg-sq-dtype: fp32
+
+  # Adam and cosine schedule shared with Lightning.
+  --optimizer: adam
+  --lr: 1.6e-3
+  --min-lr: 1.6e-5
+  --lr-decay-style: cosine
+  --lr-decay-iters: 39735
+  --lr-warmup-iters: 333
+  --lr-warmup-init: 0.0
+  --lr-wsd-decay-style: minus_sqrt
+  --adam-beta1: 0.9
+  --adam-beta2: 0.95
+  --adam-eps: 1.0e-8
+  --weight-decay: 0.1
+  --clip-grad: 1.0
+  --override-opt-param-scheduler: true
+  --attention-dropout: 0.0
+  --hidden-dropout: 0.0
+
+  # The harness resumes from step 10 through step 20, restoring optimizer and RNG state.
+  --save: ${CHECKPOINT_SAVE_PATH}
+  --load: ${CHECKPOINT_LOAD_PATH}
+  --save-interval: 10
+  --ckpt-format: torch_dist
+  --ckpt-assume-constant-structure: true
+  --dist-ckpt-strictness: log_all
+
+  # Validation and functional metrics.
+  --eval-interval: 500
+  --eval-iters: 32
+  --log-interval: 1
+  --log-num-zeros-in-grad: true
+  --log-timers-to-tensorboard: true
+  --log-memory-to-tensorboard: true
+  --tensorboard-dir: ${TENSORBOARD_PATH}
+  --timing-log-level: 0
+  --seed: 1234
+
+METRICS:
+  - lm loss
+  - mtp_1 loss
+
+LAUNCHER: ft_launcher

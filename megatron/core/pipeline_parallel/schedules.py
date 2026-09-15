@@ -355,7 +355,9 @@ def forward_step_calc_loss(
     # Set the loss scale for the auxiliary loss of the MoE layer.
     # Since we use a trick to do backward on the auxiliary loss, we need to set the scale
     # explicitly.
-    if hasattr(config, 'num_moe_experts') and config.num_moe_experts is not None:
+    if (hasattr(config, 'num_moe_experts') and config.num_moe_experts is not None) or getattr(
+        config, '_hybrid_has_moe_layers', False
+    ):
         device = get_tensor_device(output_tensor)
         loss_scale = _get_moe_loss_scale(config, device)
         # Set the loss scale

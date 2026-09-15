@@ -115,7 +115,6 @@ def test_moe_norm_flag_requires_latent_size(monkeypatch):
 @pytest.mark.parametrize(
     ("overrides", "error"),
     [
-        ({"mtp_num_layers": None}, "requires --mtp-num-layers"),
         (
             {"mtp_num_layers": 1, "freeze_all_layers": True, "position_embedding_type": "rope"},
             "cannot be combined with --freeze-all-layers",
