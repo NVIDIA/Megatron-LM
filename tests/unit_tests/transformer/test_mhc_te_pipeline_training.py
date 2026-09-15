@@ -31,6 +31,7 @@ import torch
 
 from megatron.core.num_microbatches_calculator import destroy_num_microbatches_calculator
 from megatron.core.pipeline_parallel import get_forward_backward_func
+from megatron.core.pipeline_parallel.p2p_communication import P2PCommunicator
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.cuda_graphs import TECudaGraphHelper, _get_mtp_te_layers
 from megatron.core.transformer.enums import CudaGraphModule
@@ -38,6 +39,7 @@ from megatron.core.transformer.module import Float16Module
 from megatron.core.utils import (
     get_batch_on_this_cp_rank,
     get_batch_on_this_tp_rank,
+    get_model_config,
     is_te_min_version,
 )
 from tests.unit_tests.test_utilities import Utils
@@ -66,6 +68,11 @@ def _run_te_pipeline_training(models, groups, pp_size, use_graph):
     parameters = _named_parameters(models)
     optimizer = torch.optim.SGD(list(parameters.values()), lr=0.02, momentum=0.1)
     forward_backward = get_forward_backward_func()
+    p2p_communicator = (
+        P2PCommunicator(pp_group=groups.pp, config=get_model_config(models[0]))
+        if pp_size > 1
+        else None
+    )
     gradients_seen = set()
     gradient_hooks = [
         parameter.register_hook(lambda gradient, name=name: gradients_seen.add(name))
@@ -173,6 +180,7 @@ def _run_te_pipeline_training(models, groups, pp_size, use_graph):
                 seq_length=_SEQ_LENGTH,
                 micro_batch_size=1,
                 forward_only=False,
+                p2p_communicator=p2p_communicator,
                 pg_collection=groups,
             )
             torch.cuda.synchronize()

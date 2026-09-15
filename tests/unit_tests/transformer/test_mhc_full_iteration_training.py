@@ -40,6 +40,7 @@ from megatron.core.num_microbatches_calculator import (
     init_num_microbatches_calculator,
 )
 from megatron.core.pipeline_parallel import get_forward_backward_func
+from megatron.core.pipeline_parallel.p2p_communication import P2PCommunicator
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import get_all_rng_states, model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnBackend
@@ -47,7 +48,11 @@ from megatron.core.transformer.hyper_connection import HyperConnectionModule
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import HyperConnectionTransformerLayer
-from megatron.core.utils import get_batch_on_this_cp_rank, get_batch_on_this_tp_rank
+from megatron.core.utils import (
+    get_batch_on_this_cp_rank,
+    get_batch_on_this_tp_rank,
+    get_model_config,
+)
 from megatron.training.models.dist_utils import _ddp_wrap
 from tests.unit_tests.test_utilities import Utils
 
@@ -247,6 +252,11 @@ def _run_training(models, groups, use_graph, pp_size):
     parameters = _named_parameters(models)
     optimizer = torch.optim.SGD(list(parameters.values()), lr=0.02, momentum=0.1)
     forward_backward = get_forward_backward_func()
+    p2p_communicator = (
+        P2PCommunicator(pp_group=groups.pp, config=get_model_config(models[0]))
+        if pp_size > 1
+        else None
+    )
     python_forward_calls = 0
     gradients_seen = set()
     gradient_hooks = [
@@ -311,6 +321,7 @@ def _run_training(models, groups, use_graph, pp_size):
                 seq_length=_SEQ_LENGTH,
                 micro_batch_size=1,
                 forward_only=False,
+                p2p_communicator=p2p_communicator,
                 pg_collection=groups,
             )
             # The actual schedule calls finalize_model_grads inside the captured

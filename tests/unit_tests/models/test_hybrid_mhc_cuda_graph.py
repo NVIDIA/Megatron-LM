@@ -443,6 +443,7 @@ class TestMHCTEGraphs:
             assert not any(backend_calls.values()), backend_calls
 
 
+@pytest.mark.launch_on_gb200
 @pytest.mark.parametrize('impl', ['transformer_engine', 'full_iteration'])
 @pytest.mark.parametrize(
     'extra,error',
@@ -467,6 +468,7 @@ def test_mhc_graph_combination_guards(impl, extra, error):
         )
 
 
+@pytest.mark.launch_on_gb200
 def test_mhc_te_repeated_mtp_is_rejected():
     with pytest.raises(NotImplementedError, match='independent MTP layers'):
         TransformerConfig(
