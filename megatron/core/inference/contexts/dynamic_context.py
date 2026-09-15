@@ -1961,7 +1961,6 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                 self.active_attn_metadata["mha_metadata"].state_data["block_table"],
             )
 
-    # ------------------------------------------------------------------
     def mamba_states_cache(
         self, layer_number: int, intermediate: bool = False
     ) -> Tuple[Tensor, Tensor]:
@@ -3235,21 +3234,15 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             req, already_allocated_blocks, overall_required_blocks
         )
 
-        # MTP draft KV: give up matched blocks we would otherwise inherit incorrectly.
-        #
-        # A block's FINAL draft slot is f(h_p, emb(t_{p+1})) -- it consumes one token past the
-        # block, so it is not determined by the block's hash, and the block is ref-counted so it
-        # cannot be corrected in place. Giving up the last matched block makes this request
-        # compute and own it. Costs one block of prefill per hit; keeps the draft KV exact.
-        #
-        # A continuation chunk still holding a boundary carry gives up the WHOLE match: the carry
-        # is only consumable at `finished - 1`, and any skip (block granular, so all-or-nothing)
-        # moves this chunk's start past it, orphaning that entry permanently.
-        #
-        # Trimming the list rather than the skip keeps the two consistent, which block-table
-        # assignment, `num_blocks_from_pool` and `req.num_matched_prefix_blocks` all depend on.
-        # Named `mtp_backed_off_blocks` because the Mamba branch below binds
-        # `backed_off_blocks` for an unrelated purpose.
+        # MTP draft KV: give up matched blocks we cannot inherit correctly. A block's FINAL draft
+        # slot consumes one token past the block, so it is not determined by the block's hash, and
+        # the block is ref-counted so it cannot be corrected in place. Giving up the last matched
+        # block costs one block of prefill per hit and keeps the draft KV exact. A continuation
+        # chunk still holding a boundary carry gives up the WHOLE match instead: the carry is only
+        # consumable at `finished - 1`, and any skip (block granular) moves past it, orphaning
+        # that entry permanently. Trim the list rather than the skip so the two stay consistent,
+        # which everything downstream depends on. Named `mtp_backed_off_blocks` because the Mamba
+        # branch below binds `backed_off_blocks` for an unrelated purpose.
         mtp_backed_off_blocks = 0
         if self.enable_mtp_kv_cache and matched_block_ids:
             if self.mtp_metadata.chunk_boundary_req_id == req.request_id:

@@ -560,29 +560,19 @@ class MTPControllerMixin:
         # base_position each step (rather than tracking a separate MTP length) means it can never
         # desync through compaction/pause/rewind. `advance_decode_step` bumps it per depth.
         mtp_kv_cache_on = getattr(context, "enable_mtp_kv_cache", False) and has_mtp
-        # Whether the MTP draft forwards replay captured CUDA graphs this step. Mirror the MAIN
-        # decode step's graph decision via `_mtp_resolved_padded_count` (set from the un-clobbered,
-        # EP-synced graph flag right after the main forward; None iff the main step was eager). This
-        # is the same signal the EP dummy path uses, so real and dummy ranks stay in lockstep.
+        # Mirror the main step's graph decision via the EP-synced `_mtp_resolved_padded_count`,
+        # never the live flag -- see `_run_dummy_serial_mtp_forward` for why.
         mtp_graphed = mtp_kv_cache_on and self._mtp_resolved_padded_count is not None
-        # KV-aware MTP graphs are captured under a distinct key ("mtp_kv") from the cache-free
-        # graphs ("mtp") that the normal spec-decode path and the EP dummy path replay. The dummy
-        # rank cannot safely replay the KV-aware graph (its append would write the idle rank's KV
-        # cache with no valid block table), so it uses the cache-free graph; both still issue
-        # identical fixed-size (expert-padded) MoE all-to-alls, keeping EP in lockstep.
+        # The KV-aware graph is captured under its own key; the dummy path replays the cache-free
+        # one (again, see `_run_dummy_serial_mtp_forward`).
         mtp_graph_key_prefix = "mtp_kv" if mtp_kv_cache_on else "mtp"
-        # The cache-free ("mtp") graph is captured with no `mtp_inference_context` kwarg at all
-        # (see `DynamicInferenceEngine.create_cuda_graphs`), and the EP dummy path replays it the
-        # same way. Replay requires the exact captured kwarg set, so pass the kwarg only on the
-        # KV-aware path -- sending an explicit `mtp_inference_context=None` into a cache-free
-        # replay fails with "CUDA graph argument mismatch: Unexpected kwargs".
+        # Replay requires the exact captured kwarg set, and the cache-free graph is captured with
+        # no `mtp_inference_context` at all -- passing it explicitly as None fails with
+        # "CUDA graph argument mismatch: Unexpected kwargs".
         mtp_context_kwarg = {"mtp_inference_context": context} if mtp_kv_cache_on else {}
-        # A still-prefilling chunked request (chunked_prefill_request_id != -1) is always the last
-        # active request and has base_position mid-prompt, so it must not draft — it decodes only
-        # once its prompt completes. Excluding it (reducing the draft count by 1) makes it a padding
-        # row in _mtp_setup_decode_step (no draft KV write); its chunk KV was already seeded by the
-        # commit pass. padded_count (the graph size) and the MTP-forward count are unchanged, so the
-        # captured graph, EP parity, and dummy path are unaffected.
+        # A still-prefilling chunked request is mid-prompt, so it must not draft; its chunk KV was
+        # already seeded by the commit pass. Dropping it from the draft count makes it a padding
+        # row, leaving `padded_count` and the forward count -- and so EP parity -- unchanged.
         num_mtp_draft_requests = active_request_count - (
             1 if context.chunked_prefill_request_id != -1 else 0
         )
