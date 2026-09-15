@@ -6,7 +6,9 @@ from dataclasses import dataclass
 from typing import Optional, Tuple, Union
 
 import torch
+import torch.nn as nn
 
+from megatron.core.fp8_utils import get_fp8_disabled_context
 from megatron.core.models.common.embeddings import (
     RotaryEmbedding,
     YarnRotaryEmbedding,
@@ -663,23 +665,25 @@ def _compute_index_scores(
     Returns:
         index_scores: FP32 [batch, seqlen_q, seqlen_k], the index scores.
     """
-    # Compute attention scores: q @ k^T
-    # [seqlen_q, batch, index_n_heads, index_head_dim] @ [seqlen_k, batch, index_head_dim]^T
-    #   -> [seqlen_q, batch, index_n_heads, seqlen_k]
-    index_scores = torch.einsum('sbhd,tbd->sbht', q.float(), k.float())
+    sq, batch, n_heads, head_dim = q.shape
+    sk = k.size(0)
+    k_fp32 = k.float()
 
-    # Optionally apply ReLU activation (used by DeepSeek V3.2, not GLM5).
-    if use_relu:
-        index_scores = torch.relu(index_scores)
+    # Chunk over seqlen_q to avoid materializing the full [sq, batch, heads, sk]
+    # fp32 tensor.  Target ~1 GB per chunk.
+    bytes_per_token = batch * n_heads * sk * 4
+    chunk_size = min(sq, max(1, 1024 * 1024 * 1024 // max(1, bytes_per_token)))
+    index_scores = torch.empty(sq, batch, sk, dtype=torch.float32, device=q.device)
 
-    # Weight each head by attention weights.
-    # [seqlen_q, batch, index_n_heads, seqlen_k] * [seqlen_q, batch, index_n_heads, 1]
-    #   -> [seqlen_q, batch, index_n_heads, seqlen_k]
-    index_scores = index_scores * weights.unsqueeze(-1)
-
-    # Sum across attention heads.
-    # [seqlen_q, batch, index_n_heads, seqlen_k] -> [seqlen_q, batch, seqlen_k]
-    index_scores = index_scores.sum(dim=2)
+    for start in range(0, sq, chunk_size):
+        end = min(start + chunk_size, sq)
+        # [chunk, batch, heads, sk]
+        scores = torch.einsum('sbhd,tbd->sbht', q[start:end].float(), k_fp32)
+        if use_relu:
+            scores.relu_()
+        # Weight and sum over heads in one step: [chunk, batch, sk]
+        index_scores[start:end] = (scores * weights[start:end].unsqueeze(-1)).sum(dim=2)
+        del scores
 
     # Transpose to [batch, seqlen_q, seqlen_k].
     index_scores = index_scores.transpose(0, 1)
@@ -734,6 +738,257 @@ def fused_qk_topk_naive(
         )
 
     return index_scores, topk_indices
+
+
+def _kpool_fp8_input(x: torch.Tensor) -> torch.Tensor:
+    """Match the indexer's FP32 Hadamard, BF16 rounding, and E4M3 power-of-two scale."""
+    if not x.numel():
+        return x.float()
+    assert hadamard_transform is not None, "fast_hadamard_transform is required for FP8 KPool."
+    x = hadamard_transform(x.float(), scale=x.shape[-1] ** -0.5).to(torch.bfloat16).float()
+    absmax = x.abs().amax(dim=-1, keepdim=True).clamp_min(1e-4)
+    scale = torch.exp2(torch.ceil(torch.log2(absmax / 448.0)))
+    return (x / scale).clamp(-448, 448).to(torch.float8_e4m3fn).float() * scale
+
+
+def _kpool_compress_keys(
+    k: torch.Tensor, gate_score: torch.Tensor, ape: torch.Tensor, pool_size: int
+) -> torch.Tensor:
+    """Softmax-weighted pool keys, accumulated in FP32 and returned in BF16.
+
+    Keys and gates are [tokens, batch, head_dim]; ape is [pool_size, head_dim].
+    Only complete pools are compressed. Query-local tails are appended separately.
+    """
+    seqlen, bsz, head_dim = k.shape
+    assert head_dim == ape.shape[1], f"head_dim {head_dim} != ape dim1 {ape.shape[1]}"
+    num_pools = seqlen // pool_size
+    # Drop the trailing incomplete pool from compression; its tokens are appended
+    # later via append_tail_to_topk (always_select_tail).
+    usable = num_pools * pool_size
+    # [num_pools, pool_size, batch, head_dim]
+    k_p = k[:usable].reshape(num_pools, pool_size, bsz, head_dim)
+    # gate_score: [seqlen, batch, head_dim] -> [num_pools, pool_size, batch, head_dim]
+    if gate_score is not None:
+        g = gate_score[:usable].reshape(num_pools, pool_size, bsz, head_dim).float()
+    else:
+        g = torch.zeros((num_pools, pool_size, bsz, head_dim), dtype=torch.float32, device=k.device)
+
+    # Per-dim softmax across the pool's slots: score[slot] = gate_score[slot] + ape[slot].
+    # ape: [pool_size, head_dim] -> broadcast over (num_pools, batch).
+    ape_f = ape.to(dtype=torch.float32, device=k.device)  # [pool_size, head_dim]
+    score = g + ape_f.unsqueeze(0).unsqueeze(2)  # [num_pools, pool_size, batch, head_dim]
+    # Numerically-stable per-dim softmax over dim=1 (the pool slot dim).
+    score_max = score.max(dim=1, keepdim=True).values
+    prob = torch.exp(score - score_max)
+    # weighted sum of k over pool slots: [num_pools, batch, head_dim]. Keep the
+    # numerator 4D ([num_pools, 1, batch, head_dim]) so it broadcasts cleanly
+    # against the 4D denom ([num_pools, 1, 1, head_dim]); a 3D numerator would
+    # left-pad and produce a spurious extra (num_pools) dimension.
+    k_f = k_p.float()
+    k_pooled = (prob * k_f).sum(dim=1, keepdim=True) / prob.sum(dim=1, keepdim=True).clamp(
+        min=1e-12
+    )
+    k_pooled = k_pooled.squeeze(1)  # [num_pools, batch, head_dim]
+    return k_pooled.to(torch.bfloat16)
+
+
+def _expand_pools_to_tokens(
+    pool_ids: torch.Tensor,
+    pool_valid: torch.Tensor,
+    topk_tokens: int,
+    pool_size: int,
+    pool_token_base: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Expand fixed-width pool IDs to token IDs, preserving -1 padding."""
+    assert pool_ids.ndim == 2 and pool_valid.shape == pool_ids.shape
+    assert pool_ids.shape[1] * pool_size == topk_tokens
+    if pool_token_base is None:
+        starts = pool_ids * pool_size
+    elif pool_token_base.numel():
+        starts = pool_token_base[pool_ids.clamp(min=0)]
+    else:
+        starts = torch.zeros_like(pool_ids)
+    offsets = torch.arange(pool_size, device=pool_ids.device)
+    tokens = starts.unsqueeze(-1) + offsets
+    tokens = tokens.masked_fill(~pool_valid.unsqueeze(-1), -1)
+    return tokens.reshape(pool_ids.shape[0], topk_tokens).to(torch.int32)
+
+
+def _append_tail_to_topk(
+    topk_result: torch.Tensor,
+    seq_lens: torch.Tensor,
+    pool_size: int,
+    tail_start_override: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Append each query's incomplete causal pool, in global token coordinates."""
+    tail_count = seq_lens.to(torch.int32).remainder(pool_size)
+    tail_start = (
+        seq_lens.to(torch.int32) - tail_count
+        if tail_start_override is None
+        else tail_start_override.to(torch.int32)
+    )
+    offsets = torch.arange(pool_size - 1, device=topk_result.device)
+    tail = tail_start[:, None] + offsets
+    tail = tail.masked_fill(offsets >= tail_count[:, None], -1).to(topk_result.dtype)
+    return torch.cat((topk_result, tail), dim=-1)
+
+
+def _kpool_compress_keys_per_seg(
+    k: torch.Tensor,
+    gate_score: Optional[torch.Tensor],
+    ape: torch.Tensor,
+    pool_size: int,
+    cu_seqlens_kv: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Compress complete pools within each packed segment.
+
+    Return pooled keys and their global starting token indices. Segment boundaries
+    need not be multiples of pool_size; a pool must never span two documents.
+    """
+    cu = cu_seqlens_kv.to(device=k.device, dtype=torch.int64)
+    n_seg = int(cu.numel()) - 1
+    pooled_parts = []
+    base_parts = []
+    for i in range(n_seg):
+        s = int(cu[i])
+        e = int(cu[i + 1])
+        seg_len = e - s
+        if seg_len <= 0:
+            continue
+        k_seg = k[s:e]
+        gate_seg = gate_score[s:e] if gate_score is not None else None
+        k_pooled_seg = _kpool_compress_keys(k_seg, gate_seg, ape, pool_size)
+        # [num_pools_seg, b, d]
+        n_pools_seg = k_pooled_seg.size(0)
+        pooled_parts.append(k_pooled_seg)
+        # pool j (local) of this segment starts at global token s + j*pool_size.
+        seg_bases = torch.arange(n_pools_seg, device=k.device, dtype=torch.int64) * pool_size + s
+        base_parts.append(seg_bases)
+    k_pooled_global = torch.cat(pooled_parts, dim=0)
+    pool_token_base = torch.cat(base_parts, dim=0)
+    return k_pooled_global, pool_token_base
+
+
+def fused_qk_topk_kpool(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    weights: torch.Tensor,
+    index_topk: int,
+    pool_size: int,
+    gate_score: torch.Tensor,
+    ape: torch.Tensor,
+    mask: Optional[torch.Tensor] = None,
+    varlen_starts: Optional[torch.Tensor] = None,
+    varlen_ends: Optional[torch.Tensor] = None,
+    key_positions: Optional[torch.Tensor] = None,
+    cu_seqlens_kv: Optional[torch.Tensor] = None,
+    use_relu: bool = True,
+    always_select_tail: bool = True,
+    fp8_indexer: bool = False,
+):
+    """Select complete causal pools and append each query's incomplete tail.
+
+    q is [queries, batch, heads, dim], k/gate_score are [keys, batch, dim],
+    and weights are [queries, batch, heads]. Packed bounds use global token
+    coordinates. Output indices are [batch, queries, index_topk + pool_size - 1]
+    when always_select_tail is enabled, with -1 for unused slots.
+    """
+    sk = k.size(0)
+
+    # Packed pools restart at each document boundary.
+    use_per_seg = cu_seqlens_kv is not None and cu_seqlens_kv.numel() >= 2
+    if use_per_seg:
+        k_pooled, pool_token_base = _kpool_compress_keys_per_seg(
+            k, gate_score, ape, pool_size, cu_seqlens_kv
+        )
+        num_pools = k_pooled.size(0)
+    else:
+        num_pools = sk // pool_size
+        k_pooled = _kpool_compress_keys(k, gate_score, ape, pool_size)
+        pool_token_base = torch.arange(num_pools, device=k.device, dtype=torch.int64) * pool_size
+
+    if fp8_indexer:
+        q, k_pooled = _kpool_fp8_input(q), _kpool_fp8_input(k_pooled)
+    index_scores = _compute_index_scores(q, weights, k_pooled, use_relu=use_relu)
+
+    # A pool is causal only when its final token is within the query's bounds.
+    pool_positions = pool_token_base + (pool_size - 1)
+    eff_key_positions = (
+        key_positions[pool_positions] if key_positions is not None else pool_positions
+    )
+    v_starts, v_ends, k_pos = dsa_masking.normalize_varlen_bounds(
+        mask=mask,
+        varlen_starts=varlen_starts,
+        varlen_ends=varlen_ends,
+        key_positions=eff_key_positions,
+        sk=num_pools,
+        device=index_scores.device,
+    )
+    if v_starts is not None:
+        index_scores = dsa_masking.apply_starts_ends_mask_to_scores(
+            index_scores, v_starts, v_ends, k_pos
+        )
+    elif mask is not None:
+        assert mask.dtype == index_scores.dtype, "Mask dtype must match index scores dtype"
+        index_scores = index_scores + mask
+
+    # Keep the selection width fixed, including when fewer causal pools exist.
+    budget = index_topk // pool_size
+    select_k = min(budget, num_pools)
+    if select_k > 0:
+        topk_scores, pool_topk = index_scores.topk(select_k, dim=-1)
+        # [batch, seqlen_q, select_k] -> mask invalid pools
+        pool_topk = pool_topk.masked_fill(topk_scores == float("-inf"), -1)
+    else:
+        pool_topk = torch.empty(
+            index_scores.shape[:-1] + (0,), dtype=torch.int64, device=index_scores.device
+        )
+    if pool_topk.shape[-1] < budget:
+        pad = torch.full(
+            index_scores.shape[:-1] + (budget - pool_topk.shape[-1],),
+            -1,
+            dtype=torch.int64,
+            device=index_scores.device,
+        )
+        pool_topk = torch.cat([pool_topk, pad], dim=-1)
+
+    # Expand [batch * queries, pools] to a fixed token budget.
+    rows = pool_topk.shape[0] * pool_topk.shape[1]
+    pool_flat = pool_topk.reshape(rows, -1)
+    pool_valid = pool_flat >= 0
+    # Clamp invalid ids to 0 for the arithmetic, restore -1 via the where mask.
+    safe_pool = pool_flat.clamp(min=0)
+    token_topk = _expand_pools_to_tokens(
+        safe_pool,
+        pool_valid,
+        index_topk,
+        pool_size,
+        pool_token_base=pool_token_base if use_per_seg else None,
+    )
+    # token_topk is [rows, index_topk]; reshape back to [batch, seqlen_q, index_topk].
+    token_topk = token_topk.reshape(pool_topk.shape[0], pool_topk.shape[1], index_topk)
+
+    if always_select_tail:
+        # Pool phase is query-local, never the final length of the packed sample.
+        sq, batch = q.shape[:2]
+        ends = v_ends if v_ends is not None else torch.arange(1, sq + 1, device=q.device)
+        if v_starts is not None:
+            starts = v_starts
+        elif cu_seqlens_kv is not None:
+            cu = cu_seqlens_kv.to(device=q.device, dtype=torch.int64)
+            starts = cu[torch.searchsorted(cu[1:], ends - 1, right=True)]
+        else:
+            starts = torch.zeros_like(ends)
+        lengths = ends - starts
+        tail_starts = ends - lengths.remainder(pool_size)
+        token_topk = _append_tail_to_topk(
+            token_topk.reshape(rows, -1),
+            lengths.expand(batch, -1).reshape(-1),
+            pool_size,
+            tail_start_override=tail_starts.expand(batch, -1).reshape(-1),
+        ).reshape(batch, sq, -1)
+
+    return index_scores, token_topk
 
 
 def fwd_fused_indexer_loss_naive(
@@ -971,36 +1226,47 @@ def bwd_fused_indexer_loss_naive(
     grad_weighted_scores = grad_index_scores.unsqueeze(2)  # [sq, b, 1, sk]
     del grad_index_scores
 
-    # Compute forward values needed for backward
-    scores = torch.einsum('sbhd,tbd->sbht', q.float(), k.float())  # [sq, b, h, sk]
+    # Chunk over seqlen_q to avoid materializing the full [sq, b, h, sk] fp32 tensor.
+    sq_q, b_q, h_q, d_q = q.shape
+    k_fp32 = k.float()
+    bytes_per_token = b_q * h_q * sk * 4
+    chunk_size = min(sq_q, max(1, 1024 * 1024 * 1024 // max(1, bytes_per_token)))
 
-    # Backward through multiplication by weights (with optional ReLU).
-    if use_relu:
-        scores_for_weights = torch.relu(scores)
-        relu_mask = scores > 0
-    else:
-        scores_for_weights = scores
-        relu_mask = None
-    del scores
+    grad_q = torch.empty(sq_q, b_q, h_q, d_q, dtype=torch.float32, device=q.device)
+    grad_weights = torch.empty(sq_q, b_q, h_q, dtype=torch.float32, device=q.device)
+    grad_k = torch.zeros(sk, b_q, d_q, dtype=torch.float32, device=q.device)
 
-    # ∂L/∂weights = grad * scores_for_weights (sum over sk)
-    grad_weights = (grad_weighted_scores * scores_for_weights).sum(dim=-1)  # [sq, b, h]
+    for start in range(0, sq_q, chunk_size):
+        end = min(start + chunk_size, sq_q)
+        q_chunk = q[start:end]  # [chunk, b, h, d]
+        gw_chunk = grad_weighted_scores[start:end]  # [chunk, b, 1, sk]
+        w_chunk = weights[start:end]  # [chunk, b, h]
 
-    # ∂L/∂scores = grad * weights
-    grad_scores = grad_weighted_scores * weights.unsqueeze(-1)  # [sq, b, h, sk]
-    del grad_weighted_scores, scores_for_weights
+        # Forward scores for this chunk: [chunk, b, h, sk]
+        scores_chunk = torch.einsum('sbhd,tbd->sbht', q_chunk.float(), k_fp32)
+        if use_relu:
+            relu_mask_chunk = scores_chunk > 0
+            scores_chunk.relu_()
+        else:
+            relu_mask_chunk = None
 
-    # Backward through ReLU (skip when use_relu=False)
-    if use_relu:
-        grad_scores = grad_scores * relu_mask.float()
-        del relu_mask
+        # ∂L/∂weights = grad * scores (sum over sk)
+        grad_weights[start:end] = (gw_chunk * scores_chunk).sum(dim=-1)
+        del scores_chunk
 
-    # Backward through einsum 'sbhd,tbd->sbht'
-    # ∂L/∂q = einsum('sbht,tbd->sbhd', grad_scores, k)
-    grad_q = torch.einsum('sbht,tbd->sbhd', grad_scores, k.float())  # [sq, b, h, d]
-    # ∂L/∂k = einsum('sbht,sbhd->tbd', grad_scores, q)
-    grad_k = torch.einsum('sbht,sbhd->tbd', grad_scores, q.float())  # [sk, b, d]
-    del grad_scores
+        # ∂L/∂scores = grad * weights: [chunk, b, h, sk]
+        grad_scores_chunk = gw_chunk * w_chunk.unsqueeze(-1)
+        if use_relu:
+            grad_scores_chunk.masked_fill_(~relu_mask_chunk, 0.0)
+            del relu_mask_chunk
+
+        # ∂L/∂q = einsum('sbht,tbd->sbhd', grad_scores, k)
+        grad_q[start:end] = torch.einsum('sbht,tbd->sbhd', grad_scores_chunk, k_fp32)
+        # ∂L/∂k = einsum('sbht,sbhd->tbd', grad_scores, q)  (accumulate)
+        grad_k += torch.einsum('sbht,sbhd->tbd', grad_scores_chunk, q_chunk.float())
+        del grad_scores_chunk
+
+    del grad_weighted_scores
 
     return grad_q.to(q.dtype), grad_weights.to(weights.dtype), grad_k.to(k.dtype)
 
@@ -1278,7 +1544,13 @@ class DSAIndexer(MegatronModule):
         self.pg_collection = pg_collection
 
         # Initialize Position Embedding.
-        if self.config.rope_type == 'rope':
+        # NoPE (qk_pos_emb_head_dim == 0, e.g. GLM-5.3-Flash indexer): skip the
+        # rotary embedding entirely; constructing it with dim=0 yields empty
+        # inv_freq / NaN, and the forward path skips RoPE split/apply.
+        self.use_rope = self.qk_pos_emb_head_dim > 0
+        if not self.use_rope:
+            self.rotary_pos_emb = None
+        elif self.config.rope_type == 'rope':
             self.rotary_pos_emb = RotaryEmbedding(
                 self.qk_pos_emb_head_dim,
                 rotary_percent=self.config.rotary_percent,
@@ -1303,6 +1575,8 @@ class DSAIndexer(MegatronModule):
                 f'"yarn"'
             )
 
+        # Indexer precision split: linear_wq_b runs FP8 (q-projection), while
+        # linear_wk + linear_weights_proj run BF16 (they feed index scores directly).
         self.linear_wq_b = build_module(
             submodules.linear_wq_b,
             self.q_lora_rank,
@@ -1315,17 +1589,19 @@ class DSAIndexer(MegatronModule):
             parallel_mode="duplicated",
         )
 
-        self.linear_wk = build_module(
-            submodules.linear_wk,
-            self.hidden_size,
-            self.index_head_dim,
-            config=self.config,
-            init_method=self.config.init_method,
-            bias=False,
-            skip_bias_add=False,
-            skip_weight_param_allocation=False,
-            parallel_mode="duplicated",
-        )
+        # wk + weights_proj run in BF16; they feed index scores directly.
+        with get_fp8_disabled_context(self.config, is_init=True):
+            self.linear_wk = build_module(
+                submodules.linear_wk,
+                self.hidden_size,
+                self.index_head_dim,
+                config=self.config,
+                init_method=self.config.init_method,
+                bias=False,
+                skip_bias_add=False,
+                skip_weight_param_allocation=False,
+                parallel_mode="duplicated",
+            )
 
         k_norm_config = copy.copy(self.config)
         k_norm_config.normalization = "LayerNorm"
@@ -1338,17 +1614,39 @@ class DSAIndexer(MegatronModule):
             submodules.k_norm, config=k_norm_config, hidden_size=self.index_head_dim, eps=k_norm_eps
         )
 
-        self.linear_weights_proj = build_module(
-            submodules.linear_weights_proj,
-            self.hidden_size,
-            self.index_n_heads,
-            config=self.config,
-            init_method=self.config.init_method,
-            bias=False,
-            skip_bias_add=False,
-            skip_weight_param_allocation=False,
-            parallel_mode="duplicated",
-        )
+        with get_fp8_disabled_context(self.config, is_init=True):
+            self.linear_weights_proj = build_module(
+                submodules.linear_weights_proj,
+                self.hidden_size,
+                self.index_n_heads,
+                config=self.config,
+                init_method=self.config.init_method,
+                bias=False,
+                skip_bias_add=False,
+                skip_weight_param_allocation=False,
+                parallel_mode="duplicated",
+            )
+
+        # Pool compression uses replicated per-token gates and slot-position biases.
+        self.index_kpool = int(self.config.dsa_indexer_kpool)
+        self.index_kpool_always_select_tail = bool(self.config.dsa_indexer_kpool_always_select_tail)
+        # Per-token gate score for the kpool path; set in forward_before_topk.
+        self._kpool_gate_score: Optional[torch.Tensor] = None
+        if self.index_kpool > 1:
+            # fp32 [kpool, index_head_dim] additive positional bias per pool slot.
+            self.index_kpool_compress_ape = torch.nn.Parameter(
+                torch.zeros(self.index_kpool, self.index_head_dim, dtype=torch.float32)
+            )
+            # bf16 [index_head_dim, hidden_size]; gate_score = F.linear(x, gate) = x @ gate^T
+            # -> [seqlen, index_head_dim]. Matches vLLM's checkpoint name (no .weight suffix).
+            self.index_kpool_compress_gate = torch.nn.Parameter(
+                torch.empty(self.index_head_dim, self.hidden_size, dtype=torch.bfloat16)
+            )
+            nn.init.normal_(self.index_kpool_compress_gate, std=0.01)
+        else:
+            self.index_kpool_compress_ape = None
+            self.index_kpool_compress_gate = None
+
         # Indexer projections are duplicated across tensor-parallel ranks, so their gradients
         # should be averaged during final gradient synchronization.
         for param in self.parameters():
@@ -1362,6 +1660,9 @@ class DSAIndexer(MegatronModule):
         cu_seqlens: Optional[torch.Tensor] = None,
     ):
         """Apply RoPE to the input tensor."""
+        # NoPE: no positional component; x is all nope, return unchanged.
+        if not self.use_rope:
+            return x
         # x_pe   [seqlen, batch, *, qk_pos_emb_head_dim]
         # x_nope [seqlen, batch, *, index_head_dim - qk_pos_emb_head_dim]
         # To align with DeepSeek's implementation,
@@ -1401,14 +1702,19 @@ class DSAIndexer(MegatronModule):
         # =========================================
         # Prepare RoPE params
         # =========================================
-        rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
-            None, None, x, self.config, packed_seq_params
-        )
-        if self.config.rope_type == "rope":
-            rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len, packed_seq=packed_seq)
-            mscale = 1.0
+        if self.use_rope:
+            rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
+                None, None, x, self.config, packed_seq_params
+            )
+            if self.config.rope_type == "rope":
+                rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len, packed_seq=packed_seq)
+                mscale = 1.0
+            else:
+                rotary_pos_emb, mscale = self.rotary_pos_emb(rotary_seq_len, packed_seq=packed_seq)
         else:
-            rotary_pos_emb, mscale = self.rotary_pos_emb(rotary_seq_len, packed_seq=packed_seq)
+            # NoPE: no rotary embedding; _apply_rope is a no-op.
+            rotary_pos_emb = None
+            mscale = 1.0
         if packed_seq:
             cu_seqlens_q, cu_seqlens_kv = dsa_layout.get_packed_qk_cu_seqlens(packed_seq_params)
         else:
@@ -1430,41 +1736,62 @@ class DSAIndexer(MegatronModule):
         # q linear and apply rope to q
         # =========================================
         # [seqlen, batch, q_lora_rank] -> [seqlen, batch, index_n_heads * index_head_dim]
-        q, _ = self.linear_wq_b(qr)
+        with get_fp8_disabled_context(self.config):
+            q, _ = self.linear_wq_b(qr)
         # [seqlen, batch, index_n_heads * index_head_dim]
         #   -> [seqlen, batch, index_n_heads, index_head_dim]
         q = q.reshape(seqlen, bsz, self.index_n_heads, self.index_head_dim)
         q = self._apply_rope(q, rotary_pos_emb, mscale, cu_seqlens=cu_seqlens_q)
-
-        # =========================================
-        # k linear and apply rope to k
-        # =========================================
-        # [seqlen, batch, hidden_size] -> [seqlen, batch, index_head_dim]
-        k, _ = self.linear_wk(x)
-        if self.config.dsa_indexer_k_norm_fp32:
-            k_dtype = k.dtype
-            k = self.k_norm(k.float()).to(dtype=k_dtype)
-        else:
-            k = self.k_norm(k)
-        # [seqlen, batch, index_head_dim] -> [seqlen, batch, 1, index_head_dim]
-        k = k.reshape(seqlen, bsz, 1, self.index_head_dim)
-        k = self._apply_rope(k, rotary_pos_emb, mscale, cu_seqlens=cu_seqlens_kv)
-        # [seqlen, batch, 1, index_head_dim] -> [seqlen, batch, index_head_dim]
-        k = k.reshape(seqlen, bsz, self.index_head_dim)
-
-        # =========================================
-        # Rotate activation
-        # =========================================
-        if self.config.dsa_indexer_rotate_activation:
+        if self.config.dsa_indexer_rotate_activation and not (
+            self.index_kpool > 1 and self.config.dsa_indexer_kpool_fp8
+        ):
             q = rotate_activation(q)
-            k = rotate_activation(k)
 
         # =========================================
-        # Prepare weights for index scores
+        # k linear, k_norm, rotate, and weights_proj run in BF16 (FP8 disabled).
         # =========================================
-        # [seqlen, batch, hidden_size] -> [seqlen, batch, index_n_heads]
-        weights, _ = self.linear_weights_proj(x)
+        with get_fp8_disabled_context(self.config):
+            # [seqlen, batch, hidden_size] -> [seqlen, batch, index_head_dim]
+            k, _ = self.linear_wk(x)
+            if self.config.dsa_indexer_k_norm_fp32:
+                k_dtype = k.dtype
+                k = self.k_norm(k.float()).to(dtype=k_dtype)
+            else:
+                k = self.k_norm(k)
+            # [seqlen, batch, index_head_dim] -> [seqlen, batch, 1, index_head_dim]
+            k = k.reshape(seqlen, bsz, 1, self.index_head_dim)
+            k = self._apply_rope(k, rotary_pos_emb, mscale, cu_seqlens=cu_seqlens_kv)
+            # [seqlen, batch, 1, index_head_dim] -> [seqlen, batch, index_head_dim]
+            k = k.reshape(seqlen, bsz, self.index_head_dim)
+
+            # =========================================
+            # Rotate activation (k only; q already rotated in FP8 path).
+            # Pooled keys are rotated after compression by _kpool_fp8_input.
+            # =========================================
+            if self.config.dsa_indexer_rotate_activation and self.index_kpool <= 1:
+                k = rotate_activation(k)
+
+            # =========================================
+            # Prepare weights for index scores
+            # =========================================
+            # [seqlen, batch, hidden_size] -> [seqlen, batch, index_n_heads]
+            # The pooled indexer keeps the head-gate projection in FP32.
+            if self.index_kpool > 1:
+                weights = torch.nn.functional.linear(
+                    x.float(), self.linear_weights_proj.weight.float()
+                )
+            else:
+                weights, _ = self.linear_weights_proj(x)
         weights = weights * (self.index_n_heads**-0.5) * self.softmax_scale
+
+        # Save token-aligned compression scores for the subsequent pool selection.
+        if self.index_kpool > 1 and self.index_kpool_compress_gate is not None:
+            with get_fp8_disabled_context(self.config):
+                self._kpool_gate_score = torch.nn.functional.linear(
+                    x, self.index_kpool_compress_gate
+                )
+        else:
+            self._kpool_gate_score = None
 
         return q, k, weights
 
@@ -1496,10 +1823,30 @@ class DSAIndexer(MegatronModule):
         # [seqlen, batch, index_n_heads]
         q, k, weights = self.forward_before_topk(x, qr, packed_seq_params)
 
-        # [batch, seqlen, seqlen], [batch, seqlen, index_topk]
-        index_scores, topk_indices = fused_qk_topk_naive(
-            q, k, weights, self.index_topk, mask, use_relu=self.config.dsa_indexer_scoring_relu
-        )
+        if self.index_kpool > 1 and self._kpool_gate_score is not None:
+            # Select pools, then expand them to token indices.
+            _cu_kv = None
+            if packed_seq_params is not None and packed_seq_params.qkv_format == "thd":
+                _cu_kv, _ = dsa_layout.get_packed_qk_cu_seqlens(packed_seq_params)
+            index_scores, topk_indices = fused_qk_topk_kpool(
+                q,
+                k,
+                weights,
+                self.index_topk,
+                self.index_kpool,
+                self._kpool_gate_score,
+                self.index_kpool_compress_ape,
+                mask=mask,
+                cu_seqlens_kv=_cu_kv,
+                use_relu=self.config.dsa_indexer_scoring_relu,
+                always_select_tail=self.index_kpool_always_select_tail,
+                fp8_indexer=self.config.dsa_indexer_kpool_fp8,
+            )
+        else:
+            # [batch, seqlen, seqlen], [batch, seqlen, index_topk]
+            index_scores, topk_indices = fused_qk_topk_naive(
+                q, k, weights, self.index_topk, mask, use_relu=self.config.dsa_indexer_scoring_relu
+            )
 
         return index_scores, topk_indices
 
@@ -2135,6 +2482,14 @@ class DSAttention(MegatronModule):
                             f"k_seqlen={k.size(0)}, expected={kv_reorder_idx.numel()}"
                         )
                     k = k.index_select(0, kv_reorder_idx)
+                    # Apply the same CP gather + reorder to the kpool gate score so it
+                    # matches the now-global key length (otherwise the per-seg reshape
+                    # in _kpool_compress_keys crashes with a size mismatch).
+                    gate = self.indexer._kpool_gate_score
+                    if gate is not None and gate.size(0) in local_cp_kv_lens:
+                        gate = gather_from_sequence_parallel_region(gate, group=cp_group)
+                        gate = gate.index_select(0, kv_reorder_idx)
+                        self.indexer._kpool_gate_score = gate
                 if sequence_parallel_tp and q.size(0) != sq:
                     if (
                         q.size(0) != sequence_parallel_tp_full_rows
@@ -2181,7 +2536,12 @@ class DSAttention(MegatronModule):
             )
 
         fused_output = None
-        if use_fused_kernels and not self.index_share:
+        # kpool DSA indexer (GLM-5.3-Flash, index_kpool > 1): the fused cuDNN DSA
+        # path computes its own per-token top-k and does NOT implement pool-granular
+        # selection / key compression / tail-append. Bypass it so the Python kpool
+        # top-k path below runs instead (mirrors DSAIndexer.forward_with_scores).
+        _is_kpool = self.indexer is not None and getattr(self.indexer, "index_kpool", 1) > 1
+        if use_fused_kernels and not self.index_share and not _is_kpool:
             assert q is not None and k is not None and weights is not None
             fused_output = dsa_kernels.run_fused_dsa_attention(
                 config=self.config,
@@ -2318,7 +2678,29 @@ class DSAttention(MegatronModule):
             # ===================================
             # Get top-k indices
             # ===================================
-            if fused_bounds is not None:
+            if _is_kpool:
+                # KPool selection is discrete and does not need an autograd graph.
+                with torch.no_grad():
+                    _index_scores, topk_indices = fused_qk_topk_kpool(
+                        q,
+                        k,
+                        weights,
+                        self.index_topk,
+                        self.indexer.index_kpool,
+                        self.indexer._kpool_gate_score,
+                        self.indexer.index_kpool_compress_ape,
+                        mask=float_mask,
+                        varlen_starts=varlen_starts,
+                        varlen_ends=varlen_ends,
+                        key_positions=key_positions,
+                        cu_seqlens_kv=cu_seqlens_kv if packed_thd else None,
+                        use_relu=self.config.dsa_indexer_scoring_relu,
+                        always_select_tail=self.indexer.index_kpool_always_select_tail,
+                        fp8_indexer=self.config.dsa_indexer_kpool_fp8,
+                    )
+                    del _index_scores
+                slice_topk_to_local_sequence_parallel_rows()
+            elif fused_bounds is not None:
                 starts_i32, ends_i32 = fused_bounds
                 block_size = int(getattr(self, "fused_indexer_block_size", 8192))
                 fused_topk = dsa_kernels.run_fused_qk_topk(
