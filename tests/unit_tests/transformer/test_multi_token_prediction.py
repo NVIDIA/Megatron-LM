@@ -147,9 +147,7 @@ class TestMultiTokenPredictionLayer:
         monkeypatch.setattr(
             mtp_module.parallel_state, "get_tensor_model_parallel_group", get_global_tp_group
         )
-        monkeypatch.setattr(
-            "megatron.core.extensions.transformer_engine.te_checkpoint", checkpoint
-        )
+        monkeypatch.setattr("megatron.core.extensions.transformer_engine.te_checkpoint", checkpoint)
         # Exercise the real checkpoint routing without initializing GPUs or process groups.
         layer = types.SimpleNamespace(
             config=types.SimpleNamespace(
