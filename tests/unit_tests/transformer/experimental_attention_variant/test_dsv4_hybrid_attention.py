@@ -1,7 +1,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
+from argparse import ArgumentParser
 from functools import partial
-from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -75,6 +75,9 @@ def _make_config(
     """Create an MLATransformerConfig for DSv4 hybrid attention tests."""
     if csa_compress_ratios is None:
         csa_compress_ratios = [0, 4, 128, 4]
+    extra_config_kwargs.setdefault('experimental_attention_variant', 'dsv4_hybrid')
+    # Native attention fixtures opt out of the DSv4 fused backend default.
+    extra_config_kwargs.setdefault('dsa_kernel_backend', 'none')
     return MLATransformerConfig(
         num_layers=num_layers,
         hidden_size=hidden_size,
@@ -96,7 +99,6 @@ def _make_config(
         rotary_base=10000,
         rotary_percent=1.0,
         multi_latent_attention=True,
-        experimental_attention_variant='dsv4_hybrid',
         csa_compress_ratios=csa_compress_ratios,
         csa_window_size=csa_window_size,
         dsa_indexer_n_heads=dsa_indexer_n_heads,
@@ -293,13 +295,23 @@ def test_config_rejects_tilelang_backend_for_dsv4():
     [("dsv4_hybrid", None, "cudnn"), ("dsv4_hybrid", "none", "none"), ("dsa", None, "none")],
 )
 def test_cli_backend_default_preserves_explicit_none(variant, requested, expected):
-    """Only an omitted DSv4 CLI backend selects cuDNN by default."""
-    from megatron.training.argument_utils import _resolve_dsa_kernel_backend_cli_default
+    """The generated CLI preserves omission for variant-aware config defaults."""
+    from megatron.training.arguments import _add_network_size_args
 
-    args = SimpleNamespace()
-    kwargs = {'experimental_attention_variant': variant, 'dsa_kernel_backend': requested}
-    _resolve_dsa_kernel_backend_cli_default(args, kwargs)
-    assert kwargs['dsa_kernel_backend'] == expected
+    parser = _add_network_size_args(ArgumentParser())
+    argv = [] if requested is None else ['--dsa-kernel-backend', requested]
+    args = parser.parse_args(argv)
+    assert args.dsa_kernel_backend == requested
+    with (
+        patch(
+            'megatron.core.transformer.transformer_config._validate_dsa_kernel_backend_dependencies'
+        ),
+        patch.object(torch.cuda, 'get_device_capability', return_value=(10, 0)),
+    ):
+        config = _make_config(
+            experimental_attention_variant=variant, dsa_kernel_backend=args.dsa_kernel_backend
+        )
+    assert config.dsa_kernel_backend == expected
 
 
 def test_config_accepts_hybrid_model_ratio_tail():

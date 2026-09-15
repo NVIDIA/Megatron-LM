@@ -1,6 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Bit-exact replay of Megatron's own Triton kernels under ``megatron/core/fusions/``.
+"""Bit-exact replay of Megatron's own Triton kernels.
 
 * ``fused_pad_routing_map`` / ``fused_indices_to_multihot``: integer routing bookkeeping with
   unique stores -- replay and agree with the torch reference.
@@ -18,6 +18,9 @@ from megatron.core import config as mcore_config
 from megatron.core.fusions import fused_mhc_kernels
 from megatron.core.fusions.fused_indices_converter import fused_indices_to_multihot
 from megatron.core.fusions.fused_pad_routing_map import fused_pad_routing_map
+from megatron.core.transformer.experimental_attention_variant.csa_utils.csa_teacher_lse import (
+    fused_csa_teacher_lse,
+)
 from megatron.core.transformer.moe.moe_utils import pad_routing_map
 from tests.unit_tests.determinism.kernels.harness import assert_replays_bit_exact, seeded
 
@@ -49,6 +52,47 @@ def experimental_enabled():
     mcore_config.ENABLE_EXPERIMENTAL = True
     yield
     mcore_config.ENABLE_EXPERIMENTAL = prev
+
+
+def test_csa_teacher_lse_replays():
+    """Replay window/sink and compressed-key reductions in SBHD layout."""
+    seeded()
+    batch, seqlen, heads, dim, ratio, window = 2, 257, 64, 128, 4, 65
+    query = torch.randn(seqlen * batch, heads, dim, device="cuda", dtype=torch.bfloat16)
+    full_kv = torch.randn(seqlen * batch, dim, device="cuda", dtype=torch.bfloat16)
+    compressed_kv = torch.randn(batch, seqlen // ratio, dim, device="cuda", dtype=torch.bfloat16)
+    sink = torch.randn(heads, device="cuda")
+    key_positions = torch.arange(seqlen, device="cuda")[:, None] - torch.arange(
+        window, device="cuda"
+    )
+    global_indices = (
+        key_positions[:, None, :] * batch + torch.arange(batch, device="cuda")[None, :, None]
+    )
+    window_indices = torch.where(key_positions[:, None, :] >= 0, global_indices, -1)
+    window_indices = window_indices.reshape(seqlen * batch, window).to(torch.int32)
+
+    def run(q, kv, compressed, attn_sink, indices):
+        return fused_csa_teacher_lse(
+            q,
+            kv,
+            compressed,
+            attn_sink,
+            indices,
+            dim**-0.5,
+            ratio,
+            batch_size=batch,
+            seqlen_q=seqlen,
+        )
+
+    outputs, _ = assert_replays_bit_exact(
+        run,
+        (query, full_kv, compressed_kv, sink, window_indices),
+        replays=3,
+        backward=False,
+        contention=True,
+        what="CSA teacher LSE",
+    )
+    assert torch.isfinite(outputs["out"]).all()
 
 
 def _topk_routing_map(num_tokens, num_experts, topk):

@@ -604,6 +604,10 @@ def _indexer_topk_bshd(
 
     k_bshd = k_bsd.unsqueeze(2)  # (b, sk, 1, idx_hd)
 
+    # DSA's _indexer_topk_from_score_chunks / _indexer_top_k_wrapper_chunked
+    # in dsa_cudnn_kernels.py (#5099) bound score and Top-K scratch storage.
+    # Keep the single-call path here. If profiling identifies this workspace
+    # as an end-to-end memory peak, add ratio-aware fused query chunking.
     scores = _DSA.indexer_forward_wrapper(q_bshd, k_bshd, w_bsh, ratio=ratio)[
         "scores"
     ]  # (b, sq, sk) fp32, -inf on masked positions
@@ -994,67 +998,65 @@ class FusedCSAIndexerSparseAttnFunc(torch.autograd.Function):
         global_idxs.clamp_min_(0)
 
         # ---- 5. Derive predict from indexer_scores, compute target. --------
-        # Attention-path tensors (detached — loss is not differentiable through them).
-        q_attn_bshd = query.detach().permute(1, 0, 2, 3).contiguous()
-        k_attn_compressed_bsd = kv_full[kv_offset:].detach().permute(1, 0, 2).contiguous()
-        # FlashMLA returns a KV-only LSE. Include the per-head sink so sparse
-        # loss sees the full selected-compressed + window + sink denominator.
-        sparse_teacher_lse_bsqh = (
-            torch.logaddexp(lse.detach().float(), attn_sink.detach().float().view(1, np_))
-            .reshape(sq, b, np_)
-            .permute(1, 0, 2)
-            .contiguous()
-        )
-
-        if sparse_loss:
-            # Derive predict: gather topk scores from indexer_scores → softmax.
-            safe_indices = topk_indices_cmp.clamp(min=0).long()
-            gathered_scores = torch.gather(indexer_scores, dim=2, index=safe_indices)
-            gathered_scores = torch.where(
-                topk_indices_cmp >= 0, gathered_scores, torch.finfo(torch.float32).min
-            )
-            predict = torch.softmax(gathered_scores, dim=-1)  # (b, sq, topk) fp32
-
-            target = _compute_attn_target(
-                q_attn_bshd,
-                k_attn_compressed_bsd,
-                sparse_teacher_lse_bsqh,
-                topk_indices_cmp,
-                softmax_scale,
-                qhead_per_kv_head=np_,
+        # Disabled indexer loss must not build teacher or prediction tensors.
+        if loss_coeff > 0:
+            # Attention-path tensors (detached — loss is not differentiable through them).
+            q_attn_bshd = query.detach().permute(1, 0, 2, 3).contiguous()
+            k_attn_compressed_bsd = kv_full[kv_offset:].detach().permute(1, 0, 2).contiguous()
+            # FlashMLA returns a KV-only LSE. Include the per-head sink so sparse
+            # loss sees the full selected-compressed + window + sink denominator.
+            sparse_teacher_lse_bsqh = (
+                torch.logaddexp(lse.detach().float(), attn_sink.detach().float().view(1, np_))
+                .reshape(sq, b, np_)
+                .permute(1, 0, 2)
+                .contiguous()
             )
 
-            if loss_coeff > 0:
+            if sparse_loss:
+                # Derive predict: gather topk scores from indexer_scores → softmax.
+                safe_indices = topk_indices_cmp.clamp(min=0).long()
+                gathered_scores = torch.gather(indexer_scores, dim=2, index=safe_indices)
+                gathered_scores = torch.where(
+                    topk_indices_cmp >= 0, gathered_scores, torch.finfo(torch.float32).min
+                )
+                predict = torch.softmax(gathered_scores, dim=-1)  # (b, sq, topk) fp32
+
+                target = _compute_attn_target(
+                    q_attn_bshd,
+                    k_attn_compressed_bsd,
+                    sparse_teacher_lse_bsqh,
+                    topk_indices_cmp,
+                    softmax_scale,
+                    qhead_per_kv_head=np_,
+                )
+
                 indexer_loss = _kl_loss_from_target_predict(
                     target, predict, topk_indices_cmp, loss_coeff, calculate_per_token_loss
                 )
             else:
-                indexer_loss = torch.zeros((), device=query.device, dtype=torch.float32)
-        else:
-            # Dense: use full indexer_scores directly + logsumexp.
-            index_score = indexer_scores  # (b, sq, n_comp) fp32
-            index_lse = torch.logsumexp(indexer_scores, dim=-1)  # (b, sq) fp32
+                # Dense: use full indexer_scores directly + logsumexp.
+                index_score = indexer_scores  # (b, sq, n_comp) fp32
+                index_lse = torch.logsumexp(indexer_scores, dim=-1)  # (b, sq) fp32
 
-            dense_teacher_lse = _compute_full_csa_teacher_lse(
-                q_attn_bshd,
-                q_flat,
-                kv_flat,
-                k_attn_compressed_bsd,
-                attn_sink,
-                window_global_idxs,
-                softmax_scale,
-                ratio,
-            )
-            attn_score, attn_l1norm = _compute_dense_attn_score(
-                q_attn_bshd,
-                k_attn_compressed_bsd.unsqueeze(2),
-                dense_teacher_lse,
-                qhead_per_kv_head=np_,
-                softmax_scale=softmax_scale,
-                ratio=ratio,
-            )
+                dense_teacher_lse = _compute_full_csa_teacher_lse(
+                    q_attn_bshd,
+                    q_flat,
+                    kv_flat,
+                    k_attn_compressed_bsd,
+                    attn_sink,
+                    window_global_idxs,
+                    softmax_scale,
+                    ratio,
+                )
+                attn_score, attn_l1norm = _compute_dense_attn_score(
+                    q_attn_bshd,
+                    k_attn_compressed_bsd.unsqueeze(2),
+                    dense_teacher_lse,
+                    qhead_per_kv_head=np_,
+                    softmax_scale=softmax_scale,
+                    ratio=ratio,
+                )
 
-            if loss_coeff > 0:
                 indexer_loss = _kl_loss_from_dense_scores(
                     attn_score,
                     attn_l1norm,
@@ -1063,19 +1065,16 @@ class FusedCSAIndexerSparseAttnFunc(torch.autograd.Function):
                     loss_coeff,
                     calculate_per_token_loss,
                 )
-            else:
-                indexer_loss = torch.zeros((), device=query.device, dtype=torch.float32)
 
-        # ---- 6. Eagerly compute indexer backward (grad_loss=1). ------------
-        # The actual grad_loss scaling is deferred to backward (when
-        # DSAIndexerLossAutoScaler provides the correct scale).
-        indexer_loss_coeff = loss_coeff
-        if calculate_per_token_loss:
-            indexer_loss_coeff = loss_coeff * (b * sq)
+            # ---- 6. Eagerly compute indexer backward (grad_loss=1). ------------
+            # The actual grad_loss scaling is deferred to backward (when
+            # DSAIndexerLossAutoScaler provides the correct scale).
+            indexer_loss_coeff = loss_coeff
+            if calculate_per_token_loss:
+                indexer_loss_coeff = loss_coeff * (b * sq)
 
-        unit_grad_loss = torch.ones((), device=query.device, dtype=torch.float32)
+            unit_grad_loss = torch.ones((), device=query.device, dtype=torch.float32)
 
-        if loss_coeff > 0:
             if sparse_loss:
                 attn_score_for_bwd = target.clone()
                 index_score_for_bwd = predict.clone()
@@ -1113,6 +1112,7 @@ class FusedCSAIndexerSparseAttnFunc(torch.autograd.Function):
             precomputed_grad_k_indexer = ig["d_index_k"].permute(1, 0, 2).contiguous()
             precomputed_grad_weights = ig["d_weights"].permute(1, 0, 2).contiguous()
         else:
+            indexer_loss = torch.zeros((), device=query.device, dtype=torch.float32)
             precomputed_grad_q_indexer = torch.zeros_like(q_indexer)
             precomputed_grad_k_indexer = torch.zeros_like(k_indexer)
             precomputed_grad_weights = torch.zeros_like(weights)

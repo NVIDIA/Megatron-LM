@@ -534,6 +534,103 @@ def test_sparse_indexer_backward_preserves_invalid_minus_one(monkeypatch):
     fake_dsa.indexer_backward_wrapper.assert_called_once()
 
 
+@pytest.mark.parametrize("sparse_loss", [False, True])
+@pytest.mark.parametrize("include_indexer_loss", [False, True])
+def test_zero_indexer_loss_skips_teacher_and_preserves_gradients(
+    monkeypatch, sparse_loss, include_indexer_loss
+):
+    """Disabling the auxiliary loss must leave only Top-K and attention work."""
+    seqlen, batch, heads, dim = 8, 2, 64, 512
+    compressed_rows, indexer_heads, indexer_dim, topk = 2, 64, 128, 512
+    query = torch.randn(seqlen, batch, heads, dim, requires_grad=True)
+    kv_full = torch.randn(seqlen + compressed_rows, batch, dim, requires_grad=True)
+    sink = torch.randn(heads, requires_grad=True)
+    q_indexer = torch.randn(seqlen, batch, indexer_heads, indexer_dim, requires_grad=True)
+    k_indexer = torch.randn(compressed_rows, batch, indexer_dim, requires_grad=True)
+    weights = torch.randn(seqlen, batch, indexer_heads, requires_grad=True)
+    window = torch.arange(seqlen, dtype=torch.int32).view(1, seqlen, 1).expand(batch, -1, -1)
+    selected = torch.full((batch, seqlen, topk), -1, dtype=torch.int32)
+    selected[:, 3:, 0] = 0
+    selected[:, 7:, 1] = 1
+    topk_call = MagicMock(
+        return_value=(
+            selected,
+            (selected >= 0).sum(dim=-1).int(),
+            torch.zeros(batch, seqlen, compressed_rows),
+        )
+    )
+    monkeypatch.setattr(fused_csa, "_indexer_topk_bshd", topk_call)
+
+    # Use a differentiable toy attention to exercise the actual custom autograd
+    # function without requiring either GPU backend.
+    def fake_attention_forward(q, kv, _indices, _scale, *, attn_sink, **_kwargs):
+        out = q + kv.mean(dim=0) + attn_sink.view(1, -1, 1)
+        return out, q.new_zeros(q.shape[:2]), None
+
+    def fake_attention_backward(q, kv, _out, d_out, _lse, _sink, *_args):
+        d_kv = d_out.sum(dim=(0, 1)).unsqueeze(0).expand_as(kv) / kv.shape[0]
+        return d_out.clone(), d_kv, d_out.sum(dim=(0, 2))
+
+    attention_forward = MagicMock(side_effect=fake_attention_forward)
+    attention_backward = MagicMock(side_effect=fake_attention_backward)
+    monkeypatch.setattr(fused_csa, "_csa_fwd_flash_mla", attention_forward)
+    monkeypatch.setattr(fused_csa, "_csa_sparse_attention_backward", attention_backward)
+
+    unexpected = MagicMock(side_effect=AssertionError("disabled indexer loss performed loss work"))
+    for name in (
+        "_compute_attn_target",
+        "_compute_full_csa_teacher_lse",
+        "_compute_dense_attn_score",
+        "_kl_loss_from_target_predict",
+        "_kl_loss_from_dense_scores",
+    ):
+        monkeypatch.setattr(fused_csa, name, unexpected)
+    for name in ("logaddexp", "logsumexp", "softmax"):
+        monkeypatch.setattr(torch, name, unexpected)
+    monkeypatch.setattr(
+        fused_csa,
+        "_DSA",
+        SimpleNamespace(
+            indexer_backward_wrapper=unexpected, dense_indexer_backward_wrapper=unexpected
+        ),
+    )
+
+    output, indexer_loss = fused_csa.fused_csa_indexer_sparse_attn(
+        query,
+        kv_full,
+        sink,
+        window,
+        q_indexer,
+        k_indexer,
+        weights,
+        indexer_topk=topk,
+        ratio=4,
+        softmax_scale=0.5,
+        loss_coeff=0.0,
+        sparse_loss=sparse_loss,
+        kv_offset=seqlen,
+    )
+    assert indexer_loss.shape == torch.Size([])
+    assert indexer_loss.dtype == torch.float32
+    assert indexer_loss.item() == 0.0
+    objective = 2.0 * output.sum()
+    if include_indexer_loss:
+        objective = objective + 3.0 * indexer_loss
+    objective.backward()
+
+    topk_call.assert_called_once()
+    attention_forward.assert_called_once()
+    attention_backward.assert_called_once()
+    unexpected.assert_not_called()
+    torch.testing.assert_close(query.grad, torch.full_like(query, 2.0))
+    expected_kv_grad = 2.0 * seqlen * heads / (seqlen + compressed_rows)
+    torch.testing.assert_close(kv_full.grad, torch.full_like(kv_full, expected_kv_grad))
+    torch.testing.assert_close(sink.grad, torch.full_like(sink, 2.0 * seqlen * batch * dim))
+    for indexer_input in (q_indexer, k_indexer, weights):
+        assert indexer_input.grad is not None
+        torch.testing.assert_close(indexer_input.grad, torch.zeros_like(indexer_input))
+
+
 def test_ratio4_training_dispatch_never_touches_native_dense_fallback(monkeypatch):
     import torch.nn as nn
 

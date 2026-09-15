@@ -357,8 +357,9 @@ class TransformerConfig(ModelParallelConfig):
     """Whether to use sparse DSA indexer loss. If True, the indexer loss will be computed using the
     top-k indices."""
 
-    dsa_kernel_backend: Literal["none", "tilelang", "cudnn"] = "none"
+    dsa_kernel_backend: Literal["none", "tilelang", "cudnn"] | None = None
     """Optional fused DSA kernel backend.
+    When unset, DSv4 hybrid uses ``cudnn`` and other attention variants use ``none``.
     ``none`` disables fused DSA kernels. Explicit ``tilelang`` or ``cudnn`` enables only that
     backend. Unsupported DSA layouts continue to use the PyTorch fallback."""
 
@@ -1573,6 +1574,11 @@ class TransformerConfig(ModelParallelConfig):
         if self.experimental_attention_variant is not None:
             self.experimental_attention_variant = normalize_experimental_attention_variant(
                 self.experimental_attention_variant
+            )
+
+        if self.dsa_kernel_backend is None:
+            self.dsa_kernel_backend = (
+                "cudnn" if self.experimental_attention_variant == "dsv4_hybrid" else "none"
             )
 
         if self.use_transformer_engine_op_fuser and self.moe_grouped_gemm:
