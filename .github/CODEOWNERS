@@ -100,5 +100,3 @@ test/unit_tests/test_rl_utils.py @NVIDIA/reinforcement-learning
 train_rl.py @NVIDIA/reinforcement-learning
 
 tests/unit_tests/resharding/ @NVIDIA/refit
-tests/unit_tests/rl/test_refit_arguments.py @NVIDIA/refit
-examples/rl/benchmark_refit.py @NVIDIA/reinforcement-learning @NVIDIA/refit
