@@ -10,6 +10,7 @@ import pytest
 import torch
 
 from megatron.training.distillation import cached_logits_loss
+from megatron.training.distillation import utils as distillation_utils
 from megatron.training.distillation.cached_logits_loss import (
     CachedLogitsKDLoss,
     LossFuncCallable,
@@ -19,6 +20,7 @@ from megatron.training.distillation.utils import (
     LOGPROBS_TAR_MEMBER_SUFFIX,
     META_TAR_MEMBER,
     LogprobsReshardPlan,
+    peek_first_logprobs_metadata,
     v2_pack_indices,
 )
 
@@ -207,6 +209,25 @@ def test_needed_d_saves_covers_all_smaller_gbs_phases():
 def test_invalid_global_batch_divisibility_still_fails():
     with pytest.raises(ValueError, match="gbs_load"):
         LogprobsReshardPlan(mbs_save=1, dp_save=4, gbs_save=24, mbs_load=1, dp_load=5, gbs_load=24)
+
+
+def test_peek_first_logprobs_metadata_local_path_skips_collective(tmp_path, monkeypatch):
+    """Local paths must not enter the TP×DP×CP broadcast: CI runs unit tests under
+    a multi-rank ``torch.distributed`` launcher without initializing
+    ``parallel_state``, so an unconditional collective asserts there.  The
+    collective only exists to limit object-store traffic (mirrors
+    :func:`storage_glob_with_caching`)."""
+    _write_v2_cache(tmp_path, mbs=1, dp=2, gbs=4, iterations=1)
+
+    def _boom(*args, **kwargs):
+        raise AssertionError("_broadcast_without_pp must not be called for local paths")
+
+    monkeypatch.setattr(distillation_utils, "_broadcast_without_pp", _boom)
+
+    meta = peek_first_logprobs_metadata(str(tmp_path))
+    assert meta is not None
+    assert meta["saver"]["format_version"] == 2
+    assert meta["saver"]["dp_size_save"] == 2
 
 
 # ---------------------------------------------------------------------------

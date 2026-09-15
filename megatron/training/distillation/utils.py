@@ -654,12 +654,20 @@ def peek_first_logprobs_metadata(logprobs_dir: str) -> Optional[Dict[str, Any]]:
     """Read ``_meta.json`` from any available tar in *logprobs_dir*.
 
     Listing goes through :func:`storage_glob_with_caching` (rank-0 object-store
-    list + cache).  The metadata peek itself is also rank-0 on the TP×DP×CP
-    group and broadcast to the rest of the stage, so only one rank opens the
-    tar.  Returns ``None`` if no tars are present yet.
+    list + cache).  For remote storage the metadata peek itself is also rank-0
+    on the TP×DP×CP group and broadcast to the rest of the stage, so only one
+    rank opens the object.  Local paths read directly on every rank -- the
+    collective exists only to limit object-store traffic, and (mirroring
+    :func:`storage_glob_with_caching`) skipping it for local paths keeps this
+    callable without an initialized ``parallel_state`` (e.g. single-process
+    unit tests running under a multi-rank ``torch.distributed`` launcher).
+    Returns ``None`` if no tars are present yet.
     """
     tars = storage_glob_with_caching(logprobs_dir, "*.tar")
-    return _broadcast_without_pp(lambda: peek_logprobs_metadata(tars[0]) if tars else None)
+    peek = lambda: peek_logprobs_metadata(tars[0]) if tars else None
+    if not is_remote_storage_path(logprobs_dir):
+        return peek()
+    return _broadcast_without_pp(peek)
 
 
 def decode_logprobs_payload(data: bytes) -> Tuple[Any, Any]:
