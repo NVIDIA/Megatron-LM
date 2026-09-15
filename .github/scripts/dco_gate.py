@@ -27,6 +27,7 @@ from urllib.request import Request, urlopen
 DCO_APP_SLUG = "dco"
 DCO_CHECK_NAME = "DCO"
 GATE_CHECK_NAME = "DCO gate"
+MERGE_QUEUE_REF_PREFIX = "gh-readonly-queue/"
 _SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 
 
@@ -77,6 +78,12 @@ def select_latest_dco(check_runs: list[dict[str, object]], head_sha: str) -> dic
     if not trusted:
         raise GateError("no completed DCO App check exists for the requested SHA")
     return max(trusted, key=_check_run_id)
+
+
+def is_merge_queue_branch(head_branch: object) -> bool:
+    """Report whether a check suite ran against a GitHub merge-queue ref."""
+
+    return isinstance(head_branch, str) and head_branch.startswith(MERGE_QUEUE_REF_PREFIX)
 
 
 def select_existing_gate(
@@ -138,6 +145,14 @@ def _check_run_id(check_run: dict[str, object]) -> int:
     return check_run_id
 
 
+def _check_suite_id(check_run: dict[str, object]) -> int:
+    check_suite = check_run.get("check_suite")
+    check_suite_id = check_suite.get("id") if isinstance(check_suite, dict) else None
+    if not isinstance(check_suite_id, int) or check_suite_id <= 0:
+        raise GateError("DCO check run has an invalid check suite ID")
+    return check_suite_id
+
+
 def _gate_external_id(head_sha: str) -> str:
     return f"dco-gate:{head_sha}"
 
@@ -189,18 +204,32 @@ def _list_check_runs(
     raise GateError("check-run pagination exceeded the safety limit")
 
 
+def _check_suite_head_branch(
+    api_url: str, repository: str, check_suite_id: int, token: str
+) -> object:
+    url = f"{api_url}/repos/{repository}/check-suites/{check_suite_id}"
+    return _request_json("GET", url, token).get("head_branch")
+
+
 def publish_gate(
     payload: dict[str, object],
     repository: str,
     api_url: str,
     token: str,
     requested_sha: str | None = None,
-) -> dict[str, object]:
-    """Re-read the current DCO result and publish its repository gate."""
+) -> dict[str, object] | None:
+    """Re-read the current DCO result and publish its repository gate.
+
+    Returns ``None`` when the result belongs to a merge-queue ref, where
+    ``dco-gate-merge-group.yml`` owns the gate instead.
+    """
 
     head_sha = validate_trigger(payload, requested_sha)
     source_runs = _list_check_runs(api_url, repository, head_sha, DCO_CHECK_NAME, token)
     source = select_latest_dco(source_runs, head_sha)
+    head_branch = _check_suite_head_branch(api_url, repository, _check_suite_id(source), token)
+    if is_merge_queue_branch(head_branch):
+        return None
     gate_runs = _list_check_runs(api_url, repository, head_sha, GATE_CHECK_NAME, token)
     existing_gate = select_existing_gate(gate_runs, head_sha)
 
@@ -227,7 +256,13 @@ def main() -> int:
         if not isinstance(payload, dict):
             raise GateError("event payload is not an object")
         result = publish_gate(payload, repository, api_url, token, requested_sha)
-        sys.stdout.write(f"Published {GATE_CHECK_NAME} check run {result.get('id')}\n")
+        if result is None:
+            sys.stdout.write(
+                f"Skipped {GATE_CHECK_NAME}: merge-queue refs are gated by the "
+                "merge_group workflow\n"
+            )
+        else:
+            sys.stdout.write(f"Published {GATE_CHECK_NAME} check run {result.get('id')}\n")
     except (GateError, KeyError, OSError, json.JSONDecodeError) as error:
         sys.stderr.write(f"DCO gate failed: {error}\n")
         return 1

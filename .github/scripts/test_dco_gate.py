@@ -9,12 +9,14 @@ import dco_gate
 from dco_gate import (
     GateError,
     gate_payload,
+    is_merge_queue_branch,
     select_existing_gate,
     select_latest_dco,
     validate_trigger,
 )
 
 SHA = "a" * 40
+MERGE_QUEUE_BRANCH = f"gh-readonly-queue/main/pr-5857-{'b' * 40}"
 
 
 def _dco(check_run_id: int, conclusion: str | None, *, app_slug: str = "dco", sha: str = SHA):
@@ -25,6 +27,7 @@ def _dco(check_run_id: int, conclusion: str | None, *, app_slug: str = "dco", sh
         "status": "completed",
         "conclusion": conclusion,
         "app": {"slug": app_slug},
+        "check_suite": {"id": check_run_id * 1000},
         "html_url": f"https://example.test/checks/{check_run_id}",
         "output": {"summary": "Commit sign-off was manually approved."},
     }
@@ -82,11 +85,32 @@ class TestDcoGate(unittest.TestCase):
         stale_gate = {**own_gate, "id": 13, "head_sha": "b" * 40}
         self.assertIs(select_existing_gate([stale_gate, own_gate], SHA), own_gate)
 
+    def test_recognises_merge_queue_refs(self) -> None:
+        self.assertTrue(is_merge_queue_branch(MERGE_QUEUE_BRANCH))
+        self.assertFalse(is_merge_queue_branch("main"))
+        self.assertFalse(is_merge_queue_branch("feature/gh-readonly-queue/main"))
+        self.assertFalse(is_merge_queue_branch(None))
+
+    def test_leaves_merge_queue_gate_to_merge_group_workflow(self) -> None:
+        source = _dco(20, "action_required")
+        with (
+            mock.patch.object(dco_gate, "_list_check_runs", side_effect=[[source], []]),
+            mock.patch.object(
+                dco_gate, "_check_suite_head_branch", return_value=MERGE_QUEUE_BRANCH
+            ),
+            mock.patch.object(dco_gate, "_request_json") as request,
+        ):
+            self.assertIsNone(
+                dco_gate.publish_gate({}, "NVIDIA/Megatron-LM", "https://api", "token", SHA)
+            )
+            request.assert_not_called()
+
     def test_publish_gate_creates_then_updates(self) -> None:
         source = _dco(20, "success")
         post_result = {"id": 100}
         with (
             mock.patch.object(dco_gate, "_list_check_runs", side_effect=[[source], []]),
+            mock.patch.object(dco_gate, "_check_suite_head_branch", return_value="feature-branch"),
             mock.patch.object(dco_gate, "_request_json", return_value=post_result) as request,
         ):
             self.assertEqual(
@@ -102,6 +126,7 @@ class TestDcoGate(unittest.TestCase):
         gate = {"id": 100, "name": "DCO gate", "head_sha": SHA, "external_id": f"dco-gate:{SHA}"}
         with (
             mock.patch.object(dco_gate, "_list_check_runs", side_effect=[[source], [gate]]),
+            mock.patch.object(dco_gate, "_check_suite_head_branch", return_value="feature-branch"),
             mock.patch.object(dco_gate, "_request_json", return_value={"id": 100}) as request,
         ):
             dco_gate.publish_gate({}, "NVIDIA/Megatron-LM", "https://api", "token", SHA)
@@ -118,6 +143,10 @@ class TestDcoGate(unittest.TestCase):
         self.assertIn("check_run:", publisher)
         self.assertIn("workflow_dispatch:", publisher)
         self.assertIn("github.event.check_run.app.slug == 'dco'", publisher)
+        self.assertIn(
+            "!startsWith(github.event.check_run.check_suite.head_branch, 'gh-readonly-queue/')",
+            publisher,
+        )
         self.assertIn("ref: ${{ github.event.repository.default_branch }}", publisher)
         self.assertIn("on:\n  merge_group:", merge_group)
         self.assertNotIn("push:", merge_group)
