@@ -4774,6 +4774,8 @@ def train(
                     f"going from {num_microbatches} to {get_num_microbatches()}"
                 )
                 if args.save is not None:
+                    print_rank_0("[StepBatchsizeNumMicroBatchesCalculator] Reached batch size "
+                                 "transition, saving checkpoint before exiting.")
                     save_checkpoint_and_time(
                         iteration,
                         model,
@@ -4783,6 +4785,16 @@ def train(
                         checkpointing_context,
                         train_data_iterator=train_data_iterator,
                     )
+                    print_rank_0("[StepBatchsizeNumMicroBatchesCalculator] Checkpoint saved, "
+                                 "exiting so the run can be relaunched at the new batch size.")
+                    # Break here rather than leaving it to the `should_exit` check further
+                    # down the loop body, which sits after train_step and would run one more
+                    # iteration at the new microbatch count before stopping.
+                    should_exit = True
+                    break
+                print_rank_0("[StepBatchsizeNumMicroBatchesCalculator] Reached batch size "
+                             "transition but --save is unset, so there is no checkpoint to "
+                             "relaunch from; continuing at the new batch size.")
         num_microbatches = get_num_microbatches()
         update_num_microbatches(args.consumed_train_samples, consistency_check=True, verbose=True)
 
