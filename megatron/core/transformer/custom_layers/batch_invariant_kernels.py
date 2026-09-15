@@ -9,6 +9,7 @@ import importlib.util
 import logging
 from collections import namedtuple
 from collections.abc import Callable
+from functools import lru_cache
 from typing import Any, Dict, List, Optional
 
 import torch
@@ -51,6 +52,7 @@ __all__ = [
     "enable_batch_invariant_mode",
     "grouped_gemm_batch_invariant",
     "grouped_gemm_batch_invariant_alignment",
+    "get_unrestricted_te_workspace_size_bytes",
     "assert_te_supports_batch_invariant_attention",
     "te_supports_batch_invariant_attention",
     "HAVE_DEEPGEMM_BF16",
@@ -1659,7 +1661,23 @@ _TE_NATIVE_WORKSPACE_BYTES = 1024
 
 # Originals saved by _enable_te_native_workspace_starvation for restoration.
 _TE_WORKSPACE_SIZE_FN_ORIG = None
+_TE_GROUPED_WORKSPACE_FN_ORIG = None
 _TE_NATIVE_ENV_ORIG: dict = {}
+
+
+def get_unrestricted_te_workspace_size_bytes() -> int:
+    """Return TE's normal workspace size even while te_native starvation is active."""
+    import transformer_engine.pytorch.cpp_extensions.gemm as te_gemm
+
+    workspace_size_fn = _TE_WORKSPACE_SIZE_FN_ORIG or te_gemm.get_cublas_workspace_size_bytes
+    return workspace_size_fn()
+
+
+@lru_cache(maxsize=None)
+def _get_unrestricted_te_grouped_workspace(device: int, layout: str) -> torch.Tensor:
+    """Allocate the mandatory full workspace for fixed-shape TE grouped GEMMs."""
+    assert layout in ("TN", "NN", "NT"), f"unexpected grouped GEMM layout {layout}"
+    return torch.empty(get_unrestricted_te_workspace_size_bytes(), dtype=torch.uint8, device=device)
 
 
 def _enable_te_native_workspace_starvation(workspace_bytes: int = _TE_NATIVE_WORKSPACE_BYTES):
@@ -1683,7 +1701,7 @@ def _enable_te_native_workspace_starvation(workspace_bytes: int = _TE_NATIVE_WOR
     import logging
     import os
 
-    global _TE_WORKSPACE_SIZE_FN_ORIG
+    global _TE_GROUPED_WORKSPACE_FN_ORIG, _TE_WORKSPACE_SIZE_FN_ORIG
     logger = logging.getLogger(__name__)
 
     # CUBLASLT_WORKSPACE_SIZE must be pinned (not setdefault): a preset value
@@ -1718,6 +1736,18 @@ def _enable_te_native_workspace_starvation(workspace_bytes: int = _TE_NATIVE_WOR
             _te_gemm_mod.get_cublas_workspace_size_bytes = lambda: workspace_bytes
             if hasattr(getattr(_te_gemm_mod, "get_cublas_workspace", None), "cache_clear"):
                 _te_gemm_mod.get_cublas_workspace.cache_clear()
+        # TE's device-metadata grouped GEMM rejects a workspace smaller than its normal
+        # allocation.  Its expert rows are fixed to 256 under batch-invariant mode, so it does
+        # not need workspace starvation to stabilize algorithm selection.  Keep the restriction
+        # on ordinary GEMMs while restoring the mandatory workspace at this narrow entry point.
+        if _TE_GROUPED_WORKSPACE_FN_ORIG is None and hasattr(
+            _te_gemm_mod, "_get_grouped_cublas_workspace"
+        ):
+            _TE_GROUPED_WORKSPACE_FN_ORIG = _te_gemm_mod._get_grouped_cublas_workspace
+            if hasattr(_TE_GROUPED_WORKSPACE_FN_ORIG, "cache_clear"):
+                _TE_GROUPED_WORKSPACE_FN_ORIG.cache_clear()
+            _get_unrestricted_te_grouped_workspace.cache_clear()
+            _te_gemm_mod._get_grouped_cublas_workspace = _get_unrestricted_te_grouped_workspace
     except ImportError:
         pass
 
@@ -1726,7 +1756,18 @@ def _disable_te_native_workspace_starvation():
     """Restore the TE workspace function and env pinned by the te_native backend."""
     import os
 
-    global _TE_WORKSPACE_SIZE_FN_ORIG
+    global _TE_GROUPED_WORKSPACE_FN_ORIG, _TE_WORKSPACE_SIZE_FN_ORIG
+    if _TE_GROUPED_WORKSPACE_FN_ORIG is not None:
+        try:
+            import transformer_engine.pytorch.cpp_extensions.gemm as _te_gemm_mod
+
+            _get_unrestricted_te_grouped_workspace.cache_clear()
+            _te_gemm_mod._get_grouped_cublas_workspace = _TE_GROUPED_WORKSPACE_FN_ORIG
+            if hasattr(_TE_GROUPED_WORKSPACE_FN_ORIG, "cache_clear"):
+                _TE_GROUPED_WORKSPACE_FN_ORIG.cache_clear()
+        except ImportError:
+            pass
+        _TE_GROUPED_WORKSPACE_FN_ORIG = None
     if _TE_WORKSPACE_SIZE_FN_ORIG is not None:
         try:
             import transformer_engine.pytorch.cpp_extensions.gemm as _te_gemm_mod

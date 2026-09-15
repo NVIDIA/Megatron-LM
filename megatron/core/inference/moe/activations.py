@@ -68,6 +68,7 @@ def _squared_relu_kernel(
     CLAMP: tl.constexpr,
     BLOCK_N: tl.constexpr,
     NUM_BLOCKS: tl.constexpr,  # grid size (fixed for CG)
+    ZERO_PADDING: tl.constexpr,
 ):
     """Squared ReLU that skips rows beyond n_used and alignment-padding rows (perm_map == -1).
 
@@ -87,6 +88,10 @@ def _squared_relu_kernel(
                     x = tl.load(input_ptr + row * N + o, mask=m).to(tl.float32)
                     r = _clamped_relu(x, clamp_scale, CLAMP)
                     tl.store(output_ptr + row * N + o, (r * r).to(tl.bfloat16), mask=m)
+            elif ZERO_PADDING:
+                for n in tl.range(0, N, BLOCK_N):
+                    o = n + tl.arange(0, BLOCK_N)
+                    tl.store(output_ptr + row * N + o, 0.0, mask=o < N)
 
 
 def padded_squared_relu(
@@ -94,6 +99,7 @@ def padded_squared_relu(
     permutation_map: torch.Tensor,
     n_used: torch.Tensor,
     clamp_scale: Optional[float] = None,
+    zero_padding: bool = False,
 ) -> torch.Tensor:
     """Squared ReLU activation that skips rows beyond n_used and alignment-padding rows.
 
@@ -103,6 +109,8 @@ def padded_squared_relu(
         n_used: scalar int32 CUDA tensor = inclusive_expert_offsets[-1].
         clamp_scale: config.activation_func_tanh_clamp_scale. If set, soft-clamp the
             pre-activation with ``s * tanh(x / s)`` first, bounding the output by ``s ** 2``.
+        zero_padding: write zeros to alignment-padding rows instead of leaving them
+            undefined. Rows beyond n_used remain undefined.
     """
     M, N = x.shape
     out = torch.empty(M, N, dtype=x.dtype, device=x.device)
@@ -119,6 +127,7 @@ def padded_squared_relu(
         CLAMP=clamp_scale is not None,
         BLOCK_N=BLOCK_N,
         NUM_BLOCKS=NUM_BLOCKS,
+        ZERO_PADDING=zero_padding,
     )
     return out
 
@@ -133,6 +142,7 @@ def _swiglu_kernel(
     max_rows,
     BLOCK_N: tl.constexpr,
     NUM_BLOCKS: tl.constexpr,
+    ZERO_PADDING: tl.constexpr,
 ):
     """SwiGLU: SiLU(gate) * up, skipping rows beyond n_used and padding rows (perm_map == -1).
 
@@ -154,10 +164,14 @@ def _swiglu_kernel(
                     up = tl.load(input_ptr + row * two_N + N + o, mask=m).to(tl.float32)
                     silu = gate * tl.sigmoid(gate)
                     tl.store(output_ptr + row * N + o, (silu * up).to(tl.bfloat16), mask=m)
+            elif ZERO_PADDING:
+                for n in tl.range(0, N, BLOCK_N):
+                    o = n + tl.arange(0, BLOCK_N)
+                    tl.store(output_ptr + row * N + o, 0.0, mask=o < N)
 
 
 def padded_swiglu(
-    x: torch.Tensor, permutation_map: torch.Tensor, n_used: torch.Tensor
+    x: torch.Tensor, permutation_map: torch.Tensor, n_used: torch.Tensor, zero_padding: bool = False
 ) -> torch.Tensor:
     """SwiGLU activation (SiLU(gate) * up); skips rows beyond n_used and alignment-padding rows.
 
@@ -168,6 +182,8 @@ def padded_swiglu(
         x: [output_size, 2 * ffn_hidden] BF16 FC1 output.
         permutation_map: [output_size] int32, original token index or -1 for padding.
         n_used: scalar int32 CUDA tensor = inclusive_expert_offsets[-1].
+        zero_padding: write zeros to alignment-padding rows instead of leaving them
+            undefined. Rows beyond n_used remain undefined.
     Returns:
         [output_size, ffn_hidden] BF16.
     """
@@ -178,7 +194,15 @@ def padded_swiglu(
     BLOCK_N = min(triton.next_power_of_2(N), 1024)
     NUM_BLOCKS = min(M, 512)
     _swiglu_kernel[(NUM_BLOCKS,)](
-        x, out, permutation_map, n_used, N, M, BLOCK_N=BLOCK_N, NUM_BLOCKS=NUM_BLOCKS
+        x,
+        out,
+        permutation_map,
+        n_used,
+        N,
+        M,
+        BLOCK_N=BLOCK_N,
+        NUM_BLOCKS=NUM_BLOCKS,
+        ZERO_PADDING=zero_padding,
     )
     return out
 

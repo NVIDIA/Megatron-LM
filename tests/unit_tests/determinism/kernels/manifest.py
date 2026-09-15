@@ -459,11 +459,12 @@ KERNELS: Tuple[KernelEntry, ...] = (
         sources=(
             "megatron/core/inference/moe/activations.py",
             "megatron/core/inference/moe/batch_invariant.py",
+            "megatron/core/inference/moe/fused_moe.py",
             "megatron/core/inference/moe/permute.py",
             "megatron/core/inference/moe/vllm_fused_moe.py",
             "megatron/core/inference/quantization/mxfp8_quantize.py",
         ),
-        tests=(K + "test_inference_kernels.py",),
+        tests=(K + "test_inference_kernels.py", "tests/unit_tests/inference/test_mxfp8_utils.py"),
         kind="triton",
         training_path=False,
         notes="Batch-invariant paths replay bit-exactly; the atomic default unpermute is the negative control. "
