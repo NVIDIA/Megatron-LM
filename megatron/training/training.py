@@ -5011,7 +5011,16 @@ def train(
             )
             # OTel: optional per-step span wrapping the real train_step.
             with _first_iter_span_cm, _otel_managed_span('step', 'megatron.train.iteration', is_goodput_span=True, **{'megatron.iteration': iteration}) as _step_span:
-                ft_integration.on_training_step_start()
+                # Iterations that run the periodic router tensor-metrics reduction are timed
+                # under a separate, generous section so their (potentially minutes-long) cost is
+                # not charged to the tight "step" hang-detection timeout.
+                ft_integration.on_training_step_start(
+                    is_tensor_metrics_iteration=(
+                        tensor_metric_observer is not None
+                        and hasattr(tensor_metric_observer, "has_due_metrics")
+                        and tensor_metric_observer.has_due_metrics(iteration)
+                    )
+                )
                 (
                     loss_dict,
                     skipped_iter,
