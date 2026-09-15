@@ -18,6 +18,7 @@ from transformer_engine.pytorch.fp8 import check_fp8_support
 
 from megatron.core import parallel_state
 from megatron.core.inference.config import (
+    AsyncScheduleMode,
     InferenceConfig,
     KVCacheManagementMode,
     MambaInferenceStateConfig,
@@ -148,6 +149,7 @@ class DynamicEngineTestConfig:
     num_speculative_tokens: int = 0
     position_embedding_type: str = "learned_absolute"
     sampling_backend: str = 'torch'
+    async_sched_mode: AsyncScheduleMode = AsyncScheduleMode.LEGACY
     # Sliding-window attention config. When `window_size` is None, SWA is
     # disabled and all layers do full causal attention. When set to a
     # `(left, right)` tuple, layers selected by `window_attn_skip_freq` use a
@@ -307,6 +309,7 @@ class DynamicInferenceEngineTestBase:
                 track_generated_token_events=test_config.track_generated_token_events,
                 num_speculative_tokens=test_config.num_speculative_tokens,
                 sampling_backend=test_config.sampling_backend,
+                async_sched_mode=test_config.async_sched_mode,
             ),
         )
 
@@ -1087,6 +1090,46 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                 )
 
             engine_task.cancel()
+
+    @pytest.mark.internal
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    async def test_async_sched_run_engine_accepts_request_during_decode(self):
+        """Verify async decode yields so a new request can enter a running engine."""
+        with torch.inference_mode():
+            test_config = DynamicEngineTestConfig(
+                num_requests=2,
+                min_prompt_length=4,
+                max_prompt_length=4,
+                num_tokens_to_generate=16,
+                async_sched_mode=AsyncScheduleMode.OVERLAP,
+            )
+            env = self._build_test_env(test_config)
+            long_request, short_request = env.requests
+            for request in env.requests:
+                request.sampling_params.top_k = 1
+                request.sampling_params.top_p = 0.0
+                request.sampling_params.termination_id = -1
+            short_request.sampling_params.num_tokens_to_generate = 2
+
+            engine_task = asyncio.create_task(env.engine.run_engine())
+            try:
+                long_request_future = env.engine._add_request(long_request)
+
+                while len(long_request.generated_tokens) < 2:
+                    await asyncio.sleep(0)
+
+                generated_count_at_submission = len(long_request.generated_tokens)
+                short_request_future = env.engine._add_request(short_request)
+                await asyncio.gather(long_request_future, short_request_future)
+
+                assert generated_count_at_submission < 16
+                assert len(short_request.generated_tokens) == 2
+            finally:
+                engine_task.cancel()
+                await engine_task
 
     @pytest.mark.internal
     @pytest.mark.skipif(

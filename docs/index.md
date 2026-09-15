@@ -50,6 +50,7 @@ get-started/quickstart
 user-guide/data-preparation
 user-guide/training-examples
 user-guide/parallelism-guide
+user-guide/hybrid-model-migration
 ```
 
 ```{toctree}

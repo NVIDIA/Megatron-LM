@@ -5,7 +5,8 @@
 import logging
 import os
 from argparse import Namespace
-from typing import Any, Dict
+from dataclasses import dataclass
+from typing import Any, ClassVar, Dict
 
 import modelopt.torch.distill as mtd
 import modelopt.torch.distill.plugins.megatron as mtd_mcore
@@ -18,15 +19,61 @@ from megatron.core.models.gpt.heterogeneous.heterogeneous_layer_specs import (
     get_gpt_heterogeneous_layer_spec,
 )
 from megatron.core.models.hybrid.hybrid_model import HybridModel as MCoreHybridModel
+from megatron.core.pipeline_parallel.utils import is_pp_first_stage, is_pp_last_stage
 from megatron.core.post_training.modelopt.gpt.model_specs import get_gpt_modelopt_spec
 from megatron.core.post_training.modelopt.gpt.state_dict_hooks import (
     mcore_gpt_load_te_state_dict_pre_hook,
 )
 from megatron.core.post_training.modelopt.hybrid.model_specs import get_hybrid_stack_modelopt_spec
+from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.transformer.module import MegatronModule
 from megatron.post_training.checkpointing import load_modelopt_state
 from megatron.post_training.utils import print_distributed_quant_summary
 from megatron.training import get_args, print_rank_0
 from megatron.training.arguments import core_transformer_config_from_args
+from megatron.training.models.gpt import GPTModelBuilder, GPTModelConfig
+from megatron.training.models.hybrid import HybridModelBuilder, HybridModelConfig
+
+
+@dataclass(kw_only=True)
+class ModelOptModelConfig(GPTModelConfig):
+    """Config for the legacy ModelOpt model construction path."""
+
+    builder: ClassVar[str] = "megatron.post_training.model_builder.ModelOptGPTModelBuilder"
+
+
+@dataclass(kw_only=True)
+class ModelOptHybridModelConfig(HybridModelConfig):
+    """Config for the legacy ModelOpt hybrid model construction path."""
+
+    builder: ClassVar[str] = "megatron.post_training.model_builder.ModelOptHybridModelBuilder"
+
+
+class _ModelOptBuilderMixin:
+    """Build a GPT or hybrid model through the legacy ModelOpt path."""
+
+    def build_model(
+        self,
+        pg_collection: ProcessGroupCollection,
+        pre_process: bool | None = None,
+        post_process: bool | None = None,
+        vp_stage: int | None = None,
+    ) -> MegatronModule:
+        if pre_process is None:
+            pre_process = is_pp_first_stage(pg_collection.pp)
+        if post_process is None:
+            post_process = is_pp_last_stage(pg_collection.pp)
+        return modelopt_gpt_hybrid_builder(
+            get_args(), pre_process, post_process, vp_stage, pg_collection=pg_collection
+        )
+
+
+class ModelOptGPTModelBuilder(_ModelOptBuilderMixin, GPTModelBuilder):
+    """Model builder adapter for the legacy ModelOpt GPT path."""
+
+
+class ModelOptHybridModelBuilder(_ModelOptBuilderMixin, HybridModelBuilder):
+    """Model builder adapter for the legacy ModelOpt hybrid path."""
 
 
 def count_parameters_in_layer(model, layer_name):
@@ -335,11 +382,9 @@ def modelopt_gpt_hybrid_builder(
             )
 
             use_te = args.transformer_impl == "transformer_engine"
-            decoder_layer_specs = get_gpt_decoder_layer_specs(
-                config, use_transformer_engine=use_te,
-            )
+            decoder_layer_specs = get_gpt_decoder_layer_specs(config, use_transformer_engine=use_te)
             mtp_block_spec = get_gpt_mtp_block_spec(
-                config, decoder_layer_specs[-1], use_transformer_engine=use_te,
+                config, decoder_layer_specs[-1], use_transformer_engine=use_te
             )
 
         model_kwargs = {

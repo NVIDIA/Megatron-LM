@@ -44,10 +44,6 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from tests.unit_tests.test_utilities import Utils
 
-os.environ.setdefault('NVTE_ALLOW_NONDETERMINISTIC_ALGO', '0')
-os.environ.setdefault('CUBLAS_WORKSPACE_CONFIG', ':4096:8')
-
-
 _REQUIRES_TWO_RANKS = pytest.mark.skipif(
     int(os.environ.get("WORLD_SIZE", "1")) < 2 or torch.cuda.device_count() < 2,
     reason="requires torchrun with at least 2 GPUs",

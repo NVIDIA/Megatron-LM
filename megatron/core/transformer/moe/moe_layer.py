@@ -15,6 +15,11 @@ from megatron.core.inference.utils import InferenceMode
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.moe.megakernel import (
+    build_megakernel_backend,
+    megakernel_shared_expert_init_context,
+    prepare_megakernel_shared_expert_config,
+)
 from megatron.core.transformer.moe.moe_logging import get_moe_overload_factor_tracker
 from megatron.core.transformer.moe.moe_utils import (
     MoECudaGraphPartialCaptureSignal,
@@ -63,9 +68,13 @@ except ImportError:
     HAVE_TRITON = False
 
 if HAVE_TE:
-    from megatron.core.extensions.transformer_engine import TELinear, te_checkpoint
+    from megatron.core.extensions.transformer_engine import (
+        TELinear,
+        TERMSNormDuplicatedLinear,
+        te_checkpoint,
+    )
 else:
-    TELinear, te_checkpoint = None, None
+    TELinear, TERMSNormDuplicatedLinear, te_checkpoint = None, None, None
 
 
 class ExpertsInterface(Protocol):
@@ -286,11 +295,19 @@ class MoELayer(BaseMoELayer):
         if self.config.moe_latent_size:
             assert HAVE_TE, "TransformerEngine is required for MoE latent projections."
             if self.config.transformer_impl == "inference_optimized":
+                if self.config.moe_latent_up_projection_rmsnorm:
+                    raise NotImplementedError(
+                        "The inference-optimized latent projection does not support "
+                        "RMSNorm followed by Linear."
+                    )
                 from megatron.core.tensor_parallel.inference_layers import InferenceLinear
 
                 linear_cls = InferenceLinear
             else:
                 linear_cls = TELinear
+            # TODO: When LatentMoE gains GTP plumbing on dev, resolve the non-expert GTP
+            # rematerialization group when `moe_latent_proj` is opted in, and pass that group
+            # plus `pg_collection.dp_cp` as the replica group to both latent projections.
             self.fc1_latent_proj = linear_cls(
                 self.config.hidden_size,
                 self.config.moe_latent_size,
@@ -303,7 +320,19 @@ class MoELayer(BaseMoELayer):
                 is_expert=False,
                 name=(name + ".fc1_latent_proj") if name is not None else None,
             )
-            self.fc2_latent_proj = linear_cls(
+            fc2_linear_cls = (
+                TERMSNormDuplicatedLinear
+                if self.config.moe_latent_up_projection_rmsnorm
+                else linear_cls
+            )
+            fc2_extra_kwargs = (
+                {"tp_group": pg_collection.tp}
+                if fc2_linear_cls is TERMSNormDuplicatedLinear
+                else {}
+            )
+            # TODO: When those GTP kwargs are added, carry them into this wrapper together with
+            # its owning TP group; TE tensor-parallel execution remains local with `tp_size=1`.
+            self.fc2_latent_proj = fc2_linear_cls(
                 self.config.moe_latent_size,
                 self.config.hidden_size,
                 parallel_mode="duplicated",
@@ -314,34 +343,37 @@ class MoELayer(BaseMoELayer):
                 skip_weight_param_allocation=False,
                 is_expert=False,
                 name=(name + ".fc2_latent_proj") if name is not None else None,
+                **fc2_extra_kwargs,
             )
 
-        # Initialize token dispatcher
-        if config.moe_token_dispatcher_type == "allgather":
-            self.token_dispatcher = MoEAllGatherTokenDispatcher(
-                self.num_local_experts,
-                self.local_expert_indices,
-                config=self.config,
-                pg_collection=pg_collection,
-            )
-        elif config.moe_token_dispatcher_type == "alltoall":
-            self.token_dispatcher = MoEAlltoAllTokenDispatcher(
-                self.num_local_experts,
-                self.local_expert_indices,
-                config=self.config,
-                pg_collection=pg_collection,
-            )
-        elif config.moe_token_dispatcher_type == "flex":
-            self.token_dispatcher = MoEFlexTokenDispatcher(
-                self.num_local_experts,
-                self.local_expert_indices,
-                config=self.config,
-                pg_collection=pg_collection,
-            )
-        else:
-            raise ValueError(
-                f"Unsupported token dispatcher type: {config.moe_token_dispatcher_type}"
-            )
+        # Megakernel backends replace native dispatch, expert compute, and combine,
+        # so only construct a token dispatcher for the native MoE path.
+        if config.moe_megakernel_backend is None:
+            if config.moe_token_dispatcher_type == "allgather":
+                self.token_dispatcher = MoEAllGatherTokenDispatcher(
+                    self.num_local_experts,
+                    self.local_expert_indices,
+                    config=self.config,
+                    pg_collection=pg_collection,
+                )
+            elif config.moe_token_dispatcher_type == "alltoall":
+                self.token_dispatcher = MoEAlltoAllTokenDispatcher(
+                    self.num_local_experts,
+                    self.local_expert_indices,
+                    config=self.config,
+                    pg_collection=pg_collection,
+                )
+            elif config.moe_token_dispatcher_type == "flex":
+                self.token_dispatcher = MoEFlexTokenDispatcher(
+                    self.num_local_experts,
+                    self.local_expert_indices,
+                    config=self.config,
+                    pg_collection=pg_collection,
+                )
+            else:
+                raise ValueError(
+                    f"Unsupported token dispatcher type: {config.moe_token_dispatcher_type}"
+                )
 
         # Initialize experts
         self.experts = self.submodules.experts(
@@ -356,14 +388,37 @@ class MoELayer(BaseMoELayer):
             assert (
                 self.submodules.shared_experts is not None
             ), "Shared experts builder is not provided in the module spec."
-            self.shared_experts = self.submodules.shared_experts(
-                config=self.config,
-                pg_collection=pg_collection,
-                gate=self.config.moe_shared_expert_gate,
-                name=(name + ".shared_experts") if name is not None else None,
-            )
+            if self.config.moe_megakernel_backend is None:
+                self.shared_experts = self.submodules.shared_experts(
+                    config=self.config,
+                    pg_collection=pg_collection,
+                    gate=self.config.moe_shared_expert_gate,
+                    name=(name + ".shared_experts") if name is not None else None,
+                )
+            else:
+                shared_expert_config = prepare_megakernel_shared_expert_config(self.config)
+                with megakernel_shared_expert_init_context(self.config):
+                    self.shared_experts = self.submodules.shared_experts(
+                        config=shared_expert_config,
+                        pg_collection=pg_collection,
+                        gate=self.config.moe_shared_expert_gate,
+                        name=(name + ".shared_experts") if name is not None else None,
+                    )
             if self.shared_expert_overlap:
+                assert self.token_dispatcher is not None
                 self.token_dispatcher.set_shared_experts(self.shared_experts)
+
+        # Native expert modules remain the authoritative parameter, optimizer,
+        # DDP, and checkpoint owners for every megakernel backend.
+        self.megakernel_experts = None
+        if self.config.moe_megakernel_backend is not None:
+            self.megakernel_experts = build_megakernel_backend(
+                config=self.config,
+                ep_group=self.ep_group,
+                routed_experts=self.experts,
+                shared_experts=self.shared_experts,
+                num_local_experts=self.num_local_experts,
+            )
 
         # Inference-optimized mode setup
         if config.transformer_impl == "inference_optimized":
@@ -747,6 +802,37 @@ class MoELayer(BaseMoELayer):
         # Transpose from [bsz, seq_length] to [seq_length, bsz] to align with hidden_states
         if padding_mask is not None:
             padding_mask = padding_mask.transpose(0, 1).bool()
+
+        if self.config.moe_megakernel_backend is not None:
+            if intermediate_tensors is not None:
+                raise RuntimeError(
+                    "The selected MoE megakernel backend does not support partial MoE "
+                    "CUDA-graph capture; remove moe_router/moe_preprocess from cuda_graph_modules"
+                )
+
+            def megakernel_forward(hidden_states, padding_mask):
+                probs, routing_map = self.route(
+                    hidden_states, padding_mask, input_ids, packed_seq_params
+                )
+                return apply_module(self.megakernel_experts)(hidden_states, probs, routing_map)
+
+            if self.moe_layer_recompute and self.training:
+                if self.config.fp8 or self.config.fp4:
+                    output = te_checkpoint(
+                        megakernel_forward,
+                        False,
+                        tensor_parallel.random.get_cuda_rng_tracker,
+                        self.tp_group,
+                        hidden_states,
+                        padding_mask,
+                    )
+                else:
+                    output = tensor_parallel.checkpoint(
+                        megakernel_forward, False, hidden_states, padding_mask
+                    )
+            else:
+                output = megakernel_forward(hidden_states, padding_mask)
+            return output, None
 
         # MoE forward: route -> dispatch -> compute -> combine
         def custom_forward(hidden_states, intermediate_tensors=None, padding_mask=None):

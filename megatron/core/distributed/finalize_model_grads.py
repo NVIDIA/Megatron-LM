@@ -13,6 +13,7 @@ try:
 except ImportError:
     HAVE_DTENSOR = False
 
+from megatron.core.extensions.transformer_engine import mark_qb_bin_bounds_validated
 from megatron.core.pipeline_parallel.utils import (
     get_pp_last_rank,
     is_pp_first_stage,
@@ -21,7 +22,10 @@ from megatron.core.pipeline_parallel.utils import (
 from megatron.core.process_groups_config import ProcessGroupCollection
 
 from .. import parallel_state
-from ..transformer.moe.moe_utils import get_updated_expert_bias
+from ..transformer.moe.moe_utils import (
+    get_updated_expert_bias,
+    get_updated_expert_bias_with_quantile,
+)
 from ..transformer.transformer_config import TransformerConfig
 from ..utils import (
     get_attr_wrapped_model,
@@ -325,6 +329,8 @@ def reset_model_temporary_tensors(config: TransformerConfig, model: List[torch.n
                 and module.expert_bias is not None
             ):
                 module.local_tokens_per_expert.zero_()
+            if getattr(module, 'qb_histogram', None) is not None:
+                module.qb_histogram.zero_()
             if (
                 config.moe_router_load_balancing_type == "global_aux_loss"
                 or "global_aux_loss" in config.moe_router_load_balancing_type
@@ -371,6 +377,46 @@ def _update_router_expert_bias(
 
     for expert_bias, updated_expert_bias in zip(expert_bias_list, stacked_updated_expert_bias):
         expert_bias.copy_(updated_expert_bias)
+
+
+def _update_router_expert_bias_with_quantile(
+    model: List[torch.nn.Module],
+    config: TransformerConfig,
+    tp_dp_cp_group: Optional[torch.distributed.ProcessGroup] = None,
+):
+    """Pool K3 histograms and update every local router once per global batch."""
+    expert_bias_list = []
+    qb_histogram_list = []
+    qb_bin_bounds_list = []
+    for model_chunk in model:
+        for module in get_attr_wrapped_model(model_chunk, 'modules')():
+            if (
+                getattr(module, 'qb_histogram', None) is not None
+                and module.training
+                and not getattr(module, 'frozen_expert_bias', False)
+            ):
+                expert_bias_list.append(module.expert_bias)
+                qb_histogram_list.append(module.qb_histogram)
+                qb_bin_bounds_list.append(module.qb_bin_bounds)
+
+    if not expert_bias_list:
+        return
+
+    stacked_bias = torch.stack(expert_bias_list, dim=0)
+    stacked_histogram = torch.stack(qb_histogram_list, dim=0)
+    stacked_bin_bounds = torch.stack(qb_bin_bounds_list, dim=0)
+    if get_pg_size(tp_dp_cp_group) > 1:
+        torch.distributed.all_reduce(stacked_histogram, group=tp_dp_cp_group)
+    updated_bias, updated_bin_bounds = get_updated_expert_bias_with_quantile(
+        stacked_histogram, stacked_bin_bounds, stacked_bias, config.moe_router_topk
+    )
+    for bias, bounds, next_bias, next_bounds in zip(
+        expert_bias_list, qb_bin_bounds_list, updated_bias, updated_bin_bounds
+    ):
+        bias.copy_(next_bias)
+        bounds.copy_(next_bounds)
+        if mark_qb_bin_bounds_validated is not None and bounds.is_cuda:
+            mark_qb_bin_bounds_validated(bounds)
 
 
 def _allreduce_non_tensor_model_parallel_grads(
@@ -483,10 +529,13 @@ def finalize_model_grads(
             "If you don't need pos_embd_group, you need to explicitly set it to None."
         )
         assert hasattr(pg_collection, 'dp_cp')
-        if config.moe_router_enable_expert_bias:
-            assert hasattr(pg_collection, 'tp_dp_cp') and pg_collection.tp_dp_cp is not None, (
-                "pg_collection must have tp_dp_cp when " "moe_router_enable_expert_bias is enabled."
-            )
+        if (
+            config.moe_router_enable_expert_bias
+            or config.moe_router_load_balancing_type == "quantile_balancing"
+        ):
+            assert (
+                hasattr(pg_collection, 'tp_dp_cp') and pg_collection.tp_dp_cp is not None
+            ), "pg_collection must have tp_dp_cp when router bias updates are enabled."
             tp_dp_cp_group = pg_collection.tp_dp_cp
         tp_group = pg_collection.tp
         pp_group = pg_collection.pp
@@ -546,6 +595,14 @@ def finalize_model_grads(
                 with_context_parallel=True
             )
         _update_router_expert_bias(model, config, tp_dp_cp_group=tp_dp_cp_group)
+
+    if config.moe_router_load_balancing_type == "quantile_balancing":
+        if pg_collection is None:
+            # Legacy compatibility; modern callers provide pg_collection.tp_dp_cp above.
+            tp_dp_cp_group = parallel_state.get_tensor_and_data_parallel_group(
+                with_context_parallel=True
+            )
+        _update_router_expert_bias_with_quantile(model, config, tp_dp_cp_group=tp_dp_cp_group)
 
     reset_model_temporary_tensors(config, model)
 
