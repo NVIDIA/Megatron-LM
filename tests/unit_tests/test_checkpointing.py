@@ -200,6 +200,38 @@ def test_load_args_restores_gdp_num_householder_from_checkpoint(
     assert restored_args.gdp_num_householder == expected_num_householder
 
 
+def test_load_args_restores_quantile_balancing_from_checkpoint():
+    """QB mode and histogram shape are reconstructed before the router is built."""
+    checkpoint_args = SimpleNamespace(
+        moe_router_load_balancing_type="quantile_balancing",
+        moe_aux_loss_coeff=0.0,
+        moe_router_quantile_balancing_estimation_scope="global_batch",
+        moe_router_qb_num_bins=257,
+    )
+    args = SimpleNamespace(
+        load="checkpoint",
+        iteration=0,
+        moe_router_load_balancing_type="aux_loss",
+        moe_aux_loss_coeff=0.01,
+        moe_router_quantile_balancing_estimation_scope="micro_batch",
+        moe_router_qb_num_bins=64,
+        use_tokenizer_model_from_checkpoint_args=False,
+        use_mp_args_from_checkpoint_args=False,
+    )
+    state_dict = {"args": checkpoint_args, "iteration": 12}
+
+    with mock.patch(
+        "megatron.training.checkpointing._load_base_checkpoint",
+        return_value=(state_dict, "checkpoint", False, CheckpointType.LEGACY),
+    ):
+        restored_args, _ = load_args_from_checkpoint(args)
+
+    assert restored_args.moe_router_load_balancing_type == "quantile_balancing"
+    assert restored_args.moe_aux_loss_coeff == 0.0
+    assert restored_args.moe_router_quantile_balancing_estimation_scope == "global_batch"
+    assert restored_args.moe_router_qb_num_bins == 257
+
+
 def create_checkpoint(load_path, ckpt_format):
     """Setup a dummy checkpoint directory."""
     iteration = 123
