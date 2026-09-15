@@ -12,6 +12,7 @@ from megatron.core.pipeline_parallel.p2p_communication import P2PCommunicator
 from tests.unit_tests.test_utilities import Utils
 
 
+@pytest.mark.launch_on_gb200
 @pytest.mark.parametrize("capturing", [False, True])
 def test_batched_p2p_waits_requests_and_only_synchronizes_eagerly(capturing):
     """Skipping the capture-illegal device fence must retain the request waits."""
@@ -31,7 +32,13 @@ def test_batched_p2p_waits_requests_and_only_synchronizes_eagerly(capturing):
         patch("torch.cuda.is_current_stream_capturing", return_value=capturing),
         patch("torch.cuda.synchronize", side_effect=lambda: calls.append("synchronize")),
     ):
-        _, _, requests = communicator._communicate(None, None, False, False, (8, 1, 32))
+        _, _, requests = communicator._communicate(
+            tensor_send_next=None,
+            tensor_send_prev=None,
+            recv_prev=False,
+            recv_next=False,
+            tensor_shape=(8, 1, 32),
+        )
     assert requests is None
     assert calls == (["wait"] if capturing else ["wait", "synchronize"])
 
