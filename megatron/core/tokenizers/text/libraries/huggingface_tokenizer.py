@@ -14,13 +14,6 @@ from megatron.core.utils import log_single_rank
 
 from .abstract_tokenizer import MegatronTokenizerTextAbstract
 
-try:
-    import gigatoken as gt
-
-    HAVE_GIGATOKEN = True
-except ModuleNotFoundError:
-    HAVE_GIGATOKEN = False
-
 logger = logging.getLogger(__name__)
 
 
@@ -195,19 +188,12 @@ class HuggingFaceTokenizer(MegatronTokenizerTextAbstract):
         ) + self.text_to_tokens('y')
         self._inv_vocab_dict = {}
 
+        self._hf_tokenizer = self.tokenizer
         if self.use_gigatoken:
             # restore tokenizer with gigatoken
-            if HAVE_GIGATOKEN:
-                self._hf_tokenizer = self.tokenizer
-                logger.info(f"Restoring {tokenizer_path} tokenizer with gigatoken.")
-                self.tokenizer = gt.Tokenizer(self.tokenizer).as_hf()
-            else:
-                raise ModuleNotFoundError(
-                    "gigatoken library is not installed. "
-                    "Please, install gigatoken to use fast tokenizers: `pip install gigatoken`."
-                )
-        else:
-            self._hf_tokenizer = self.tokenizer
+            from megatron.core.tokenizers.utils import init_gigatoken_from_hf
+
+            self.tokenizer = init_gigatoken_from_hf(self.tokenizer, tokenizer_path)
 
     def add_special_tokens(self, special_tokens_dict: dict) -> int:
         """
@@ -317,9 +303,19 @@ class HuggingFaceTokenizer(MegatronTokenizerTextAbstract):
     def encode_files(self, paths: list[str], field: str = "text") -> "ak.Array":
         """Encodes whole jsonl file."""
         if self.use_gigatoken:
-            return self.tokenizer.tokenizer.encode_files(
-                gt.JsonlFileSource(paths, field=field), parallel=True
-            )
+            from megatron.core.tokenizers.utils import has_gigatoken_support
+
+            if has_gigatoken_support():
+                import gigatoken as gt
+
+                return self.tokenizer.tokenizer.encode_files(
+                    gt.JsonlFileSource(paths, field=field), parallel=True
+                )
+            else:
+                raise ModuleNotFoundError(
+                    "gigatoken library is not installed. "
+                    "Please, install gigatoken to use fast tokenizers: `pip install gigatoken`."
+                )
         else:
             raise NotImplementedError(
                 "This method is supported only for gigatoken tokenizers. "
