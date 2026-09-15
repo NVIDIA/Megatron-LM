@@ -23,12 +23,13 @@ import pytest
 import torch
 import torch.distributed as dist
 from torch.distributed.device_mesh import init_device_mesh
-from torch.distributed.tensor import Shard
+from torch.distributed.tensor import Partial, Replicate, Shard
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     Placements,
     fully_shard,
     fully_shard_context,
+    fully_shard_optimizer,
 )
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel
@@ -36,6 +37,21 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import MoETransformerLayer
+
+_NO_SHARD = Placements(
+    dp_axes=[0], parameter=[Replicate()], gradient=[Partial("avg")], optimizer=[Replicate()]
+)
+
+
+_ZERO1_SHARD = Placements(
+    dp_axes=[0], parameter=[Replicate()], gradient=[Partial("avg")], optimizer=[Shard(0)]
+)
+
+
+_ZERO2_SHARD = Placements(
+    dp_axes=[0], parameter=[Replicate()], gradient=[Shard(0)], optimizer=[Shard(0)]
+)
+
 
 _FLAT_SHARD = Placements(
     dp_axes=[0], parameter=[Shard(0)], gradient=[Shard(0)], optimizer=[Shard(0)]
@@ -113,6 +129,7 @@ def _build_hybrid_model(
 
 def _train(
     model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
     ids: torch.Tensor,
     pos: torch.Tensor,
     mask: torch.Tensor | None,
@@ -120,7 +137,6 @@ def _train(
     loss_reduce_group: dist.ProcessGroup | None = None,
 ) -> list[torch.Tensor]:
     """Run 5 SGD steps; return the per-step losses (globally averaged if loss_reduce_group given)."""
-    optimizer = torch.optim.SGD(model.parameters(), lr=0.02, foreach=False)
     losses = []
     for _ in range(5):
         optimizer.zero_grad()
@@ -137,8 +153,18 @@ def _train(
     return losses
 
 
-def test_ep_fsdp_matches_fullbatch_reference(distributed_setup):
-    """EP=4 + mFSDP on 1/dp-sharded data reproduces single full-batch EP=1 training."""
+@pytest.mark.parametrize(
+    "dense_placements",
+    [_NO_SHARD, _ZERO1_SHARD, _ZERO2_SHARD, _FLAT_SHARD],
+    ids=["no-shard", "zero1", "zero2", "zero3"],
+)
+@pytest.mark.parametrize(
+    "moe_placements",
+    [_NO_SHARD, _ZERO1_SHARD, _ZERO2_SHARD, _FLAT_SHARD],
+    ids=["no-shard", "zero1", "zero2", "zero3"],
+)
+def test_ep_fsdp_matches_fullbatch_reference(distributed_setup, dense_placements, moe_placements):
+    """All dense/MoE ZeRO combinations reproduce sequential no-shard training."""
     device = distributed_setup.device
     world_size, rank = distributed_setup.world_size, distributed_setup.rank
 
@@ -208,10 +234,10 @@ def test_ep_fsdp_matches_fullbatch_reference(distributed_setup):
                 fully_shard(
                     decoder_layer.mlp.experts,
                     mesh=moe_mesh["edp"],
-                    placements=_FLAT_SHARD,
+                    placements=moe_placements,
                     grad_divisor=ep_size,
                 )
-        fully_shard(model, mesh=world_mesh, placements=_FLAT_SHARD)
+        fully_shard(model, mesh=world_mesh, placements=dense_placements)
 
     # One global batch, identical on every rank; the reference sees all of it, the model its shard.
     torch.manual_seed(4321)
@@ -221,9 +247,12 @@ def test_ep_fsdp_matches_fullbatch_reference(distributed_setup):
     target = torch.randn(global_batch, seq, vocab, device=device)
     shard = slice(rank * b_local, (rank + 1) * b_local)
 
-    reference_losses = _train(reference, ids, pos, mask, target)
+    reference_optimizer = torch.optim.Adam(reference.parameters(), lr=0.02)
+    model_optimizer = torch.optim.Adam(model.parameters(), lr=0.02)
+    fully_shard_optimizer(model_optimizer)
+    reference_losses = _train(reference, reference_optimizer, ids, pos, mask, target)
     model_losses = _train(
-        model, ids[shard], pos[shard], mask, target[shard], loss_reduce_group=world
+        model, model_optimizer, ids[shard], pos[shard], mask, target[shard], loss_reduce_group=world
     )
 
     torch.testing.assert_close(
@@ -233,5 +262,8 @@ def test_ep_fsdp_matches_fullbatch_reference(distributed_setup):
     )
 
     # Destroy the groups this test created; leave the default (world) group for later tests.
+    # A mesh dim that spans every rank is backed by the default group rather than a fresh one
+    # (e.g. "ep" here when edp_size == 1).
     for group in (one, ep_group, expert_dp_group):
-        dist.destroy_process_group(group)
+        if group is not dist.group.WORLD:
+            dist.destroy_process_group(group)

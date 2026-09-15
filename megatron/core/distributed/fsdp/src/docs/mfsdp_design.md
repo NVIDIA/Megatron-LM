@@ -48,10 +48,9 @@ established here.
 # API
 
 ```py
-class Placement
-class Replicate(Placement)
-class Partial(Placement)
-class Flat(Placement)
+from torch.distributed.tensor import Partial, Placement, Replicate, Shard
+
+
 class TensorAtomic(Placement)
 
 
@@ -122,14 +121,18 @@ axis.
 - `Replicate`. Not sharded.
 - `Partial`. Used internally for pre-reduce-scatter gradients, which are unsharded and
   only partially accumulated; not user-facing.
-- `Flat`. The current per-unit, dim-0 flat sharding. Good for elementwise optimizers.
+- `Shard(0)`. Torch's public dim-0 sharding placement. MFSDP specializes it to an
+  internal per-unit DBuffer layout. Only dim-0 `Shard` placements are currently
+  supported.
+  - `Flat`. The default row-atomic internal layout, good for elementwise optimizers.
+  - `BlockAtomic(block_size)`. An internal `Shard` subclass that doesn’t cut a block of
+    `block_size` rows. Simplifies blockwise quantization support. Currently, a 32x1
+    mxfp8 block may be sharded across ranks. This introduces complex host-side logic and
+    custom quantization kernels to handle two levels of absmax reduction. Using
+    block-atomic sharding with block_size=32 ensures that every 32-row block is owned by
+    a single rank.
 - `TensorAtomic`. Don’t cut a parameter. For emerging optimizers that need full
   parameters.
-- `BlockAtomic(block_size)`. Don’t cut a block of `block_size` rows. Simplifies
-  blockwise quantization support. Currently, a 32x1 mxfp8 block may be sharded across
-  ranks. This introduces complex host-side logic and custom quantization kernels to
-  handle two levels of absmax reduction. Using block-atomic sharding with block_size=32
-  ensures that every 32-row block is owned by a single rank.
 - `PerTensor(dist.tensor.Placement)`. If needed. Per-tensor dim-0 sharding used in
   FSDP2. It leads to extra data copy so won’t be used by default.
 
@@ -161,12 +164,12 @@ to use for each unit. We may want to pre-define a set of common placements for
 convenience, e.g.,
 
 ```py
-# Assuming `Flat` placement
+# Assuming `Shard(0)` placement
 def hfsdp(dp_outer: MeshAxis, dp_inner: MeshAxis) -> Placements:
     return Placements(dp_axes=[dp_outer, dp_inner],
-                      parameter=[Replicate(), Flat()],
-                      gradient=[Partial(), Flat()],
-                      optimizer=[Flat(), Flat()])
+                      parameter=[Replicate(), Shard(0)],
+                      gradient=[Partial(), Shard(0)],
+                      optimizer=[Shard(0), Shard(0)])
 ```
 
 If needed, grouping can be customized via the `fully_shard` API, similar to
@@ -203,8 +206,8 @@ uses the following placement lists, ordered to match `dp_axes` from outer to inn
 placements = Placements(
     dp_axes=[dp_outer, dp_inner],
     parameter=[Replicate(), Replicate()],
-    gradient=[Partial(), Flat()],
-    optimizer=[Flat(), Flat()],
+    gradient=[Partial(), Shard(0)],
+    optimizer=[Shard(0), Shard(0)],
 )
 ```
 

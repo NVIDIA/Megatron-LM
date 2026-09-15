@@ -31,6 +31,8 @@ from megatron.core.inference.inference_request import (
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
     GPTInferenceWrapper,
 )
+from megatron.core.inference.moe.vllm_fused_moe import VllmFusedMoeBuffers
+from megatron.core.inference.sampling.torch_sampling import TorchSampling
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     AsyncScheduleLogitsState,
@@ -57,6 +59,14 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_fa_min_version, is_te_min_version
 from megatron.training.initialize import _set_random_seed
 from tests.unit_tests.test_utilities import Utils, clear_nvte_env_vars
+
+
+def teardown_module(module):
+    # Some tests build inference_optimized MoE models with the default 'vllm'
+    # grouped-GEMM backend, which allocates class-level persistent intermediate
+    # buffers at context init. Release them so no GPU memory or state leaks
+    # across modules.
+    VllmFusedMoeBuffers._delete_buffers()
 
 
 class TextGenerationControllerTestBase:
@@ -285,6 +295,10 @@ def _make_async_sched_context(total_request_count=2, paused_request_count=0):
         kv_block_allocator=SimpleNamespace(enable_handoff_pinning=False),
     )
     context.is_decode_only = mock.Mock(side_effect=lambda: context.num_prefill_requests == 0)
+    # Bind the real flags so the fake exercises the production no-op-filter gate.
+    context.active_sampling_filter_flags = lambda count=None: (
+        DynamicInferenceContext.active_sampling_filter_flags(context, count)
+    )
     return context
 
 
@@ -332,6 +346,23 @@ def _make_async_sched_controller(context=None, model_config=None):
     controller._async_sched_top_n_token_ids_cpu_buffer = None
     controller._async_sched_top_n_capacity = 0
     return controller
+
+
+@pytest.mark.parametrize("chunk_row", [2, -1], ids=["active", "hidden"])
+def test_partial_prefill_selected_token_uses_known_prompt_target(chunk_row):
+    """A visible chunk uses its next prompt token; a hidden chunk changes no row."""
+    context = _make_async_sched_context(total_request_count=3)
+    context.chunked_prefill_request_id = 12
+    context.chunked_prefill_next_prompt_token = torch.tensor(42, dtype=torch.int64)
+    context.get_index_of_chunked_prefill_request = mock.Mock(return_value=chunk_row)
+    controller = _make_async_sched_controller(context)
+    controller._sampled_tokens_cuda.copy_(torch.tensor([7, 8, 9], dtype=torch.int64))
+
+    controller._replace_partial_prefill_sample_with_prompt_token()
+
+    expected = [7, 8, 42] if chunk_row == 2 else [7, 8, 9]
+    assert controller._sampled_tokens_cuda.tolist() == expected
+    context.get_index_of_chunked_prefill_request.assert_called_once_with(safe=True)
 
 
 @pytest.mark.parametrize(
@@ -1791,45 +1822,45 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
 
     @pytest.mark.internal
     def test_async_sched_no_overlap_pauses_boundary_request(self):
-        """No-overlap uses real lifecycle bookkeeping before forwarding survivors."""
+        """No-overlap reports the evicted, not resumed, boundary request."""
         self.setup_model(
-            torch.float32, batch_size=2, static=False, block_size_tokens=4, max_requests=2
+            torch.float32, batch_size=4, static=False, block_size_tokens=4, max_requests=4
         )
         controller = self.text_generation_controller
         context = controller.inference_wrapped_model.inference_context
         context.reset()
 
-        active_slice = slice(0, 2)
-        context.total_request_count = 2
-        context.active_token_count = 2
-        context.request_ids[active_slice] = torch.tensor([10, 11], dtype=torch.int32)
+        active_slice = slice(0, 4)
+        context.total_request_count = 4
+        context.active_token_count = 4
+        context.request_ids[active_slice] = torch.tensor([10, 11, 12, 13], dtype=torch.int32)
         context.request_in_prefill_status_tensor[active_slice] = 0
         context.request_query_lengths[active_slice] = 1
         context.request_output_lengths[active_slice] = 16
         context.request_kv_length_offsets[active_slice] = 3
         context.request_last_kv_block_offset[active_slice] = torch.tensor(
-            [context.block_size_tokens - 1, 0], dtype=torch.int32
+            [0, context.block_size_tokens - 1, 0, context.block_size_tokens - 1], dtype=torch.int32
         )
         context.request_metadata["termination_id"][active_slice] = 99
-        context.build_active_slices(2)
+        context.build_active_slices(4)
 
-        block_ids = context.kv_block_allocator.allocate_memory_blocks(2)
+        block_ids = context.kv_block_allocator.allocate_memory_blocks(4)
         context.request_to_kv_block_ids[active_slice, 0] = block_ids
         context.request_last_kv_block_id[active_slice] = block_ids
         context.request_kv_block_counts[active_slice] = 1
-        context.token_to_input_ids[active_slice] = torch.tensor([80, 81])
+        context.token_to_input_ids[active_slice] = torch.tensor([80, 81, 82, 83])
 
-        # Retain one paused request, but exhaust shared-pool capacity with real allocations.
+        # Eviction of one boundary request funds resumption of the other.
         alloc = context.kv_block_allocator
-        alloc.paused_limit = 1
+        alloc.paused_limit = 0
         filler_blocks = alloc.allocate_memory_blocks(alloc.pool_avail)
         assert filler_blocks is not None
         filler_blocks = filler_blocks.clone()
         assert alloc.get_allocatable_count() == 0
 
-        sampled_tokens = torch.tensor([90, 91], dtype=torch.int64)
+        sampled_tokens = torch.tensor([90, 91, 92, 93], dtype=torch.int64)
         controller._async_sched_logits = AsyncScheduleLogitsState(
-            is_valid=True, cuda_graph_request_count=2
+            is_valid=True, cuda_graph_request_count=4
         )
         controller._run_async_sched_sample = mock.Mock(
             return_value=SimpleNamespace(
@@ -1841,13 +1872,13 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
                 sample_cpu_ready_event=None,
             )
         )
-        forward_input_ids = torch.tensor([91])
-        forward_position_ids = torch.tensor([4])
+        forward_input_ids = torch.tensor([93, 90, 92])
+        forward_position_ids = torch.tensor([4, 4, 4])
 
         def initialize_survivor_forward():
-            assert context.paused_request_count == 1
-            assert context.request_ids[:2].tolist() == [10, 11]
-            assert context.token_to_input_ids[0].item() == 91
+            assert context.paused_request_count == 0
+            assert context.request_ids[:4].tolist() == [13, 10, 12, 11]
+            assert context.token_to_input_ids[:3].tolist() == [93, 90, 92]
             return forward_input_ids, forward_position_ids, None
 
         controller._dynamic_step_context_init = mock.Mock(side_effect=initialize_survivor_forward)
@@ -1857,15 +1888,16 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
             controller._run_async_sched_step_no_overlap(schedule_waiting_requests=None)
         ).output
 
-        assert result["sample"].tolist() == [90, 91]
+        assert result["sample"].tolist() == [90, 91, 92, 93]
         assert result["finished_request_ids"].numel() == 0
-        assert result["newly_paused_request_ids"].flatten().tolist() == [10]
-        assert result["evict_request_ids"] is None
-        assert context.paused_request_count == 1
+        assert result["newly_paused_request_ids"].ndim == 1
+        assert result["newly_paused_request_ids"].tolist() == [11]
+        assert result["evict_request_ids"].tolist() == [11]
+        assert context.paused_request_count == 0
         active_request_ids = context.request_ids[
             context.paused_request_count : context.total_request_count
         ]
-        assert active_request_ids.tolist() == [11]
+        assert active_request_ids.tolist() == [13, 10, 12]
         controller._run_async_sched_forward.assert_called_once_with(
             forward_input_ids, forward_position_ids
         )
@@ -1948,15 +1980,7 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
                 sampling_params=SamplingParams(top_k=2, top_p=0.4),
                 vocab_size=self.vocab_size,
             )
-        assert str(aerror.value) == 'Cannot have top-p and top-k both greater than zero'
-
-        with pytest.raises(AssertionError) as aerror:
-            self.text_generation_controller.sample_from_logits(
-                last_token_logits=None,
-                sampling_params=SamplingParams(top_p=1.4, top_k=0),
-                vocab_size=self.vocab_size,
-            )
-        assert str(aerror.value) == 'top-p should be in (0,1]'
+        assert str(aerror.value) == 'Cannot have top-p and top-k both active'
 
         with pytest.raises(AssertionError) as aerror:
             self.text_generation_controller.sample_from_logits(
@@ -1965,6 +1989,24 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
                 vocab_size=self.vocab_size,
             )
         assert str(aerror.value) == 'top-k is larger than logit size.'
+
+        # top_p >= 1.0 is a no-op filter: identity on logits, legal alongside top-k;
+        # temperature=0 sharpens toward argmax instead of dividing into inf/NaN.
+        cpu_logits = torch.randn(4, 32)
+        assert torch.equal(
+            TorchSampling.filter_logits(cpu_logits, temperature=1.0, top_k=0, top_p=1.0), cpu_logits
+        )
+        for top_k, top_p in ((4, 0.0), (0, 0.9)):
+            filtered = TorchSampling.filter_logits(
+                cpu_logits, temperature=0.0, top_k=top_k, top_p=top_p
+            )
+            kept = filtered[filtered != float('-inf')]
+            assert torch.isfinite(kept).all()
+            assert torch.equal(filtered.argmax(dim=-1), cpu_logits.argmax(dim=-1))
+        sampled = TorchSampling.sample_from_logits(
+            cpu_logits, temperature=1.0, top_k=8, top_p=1.0, generator=torch.Generator()
+        )
+        assert sampled.shape == (4,)
 
         last_token_logits = (
             torch.arange(0, self.vocab_size).repeat(self.batch_size, 1).float().cuda()
@@ -2538,6 +2580,7 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
 
         # No trailing EOD.
         assert detok(tokenizer, [1, 2, 3], remove_EOD=remove_EOD) == "T1 T2 T3"
+        self.mock_tokenizer.detokenize.assert_called_with([1, 2, 3], skip_special_tokens=True)
 
         # Single trailing EOD.
         result = detok(tokenizer, [1, 2, eod], remove_EOD=remove_EOD)
@@ -3305,13 +3348,12 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
             return_value=torch.tensor([3, 4], device='cuda')
         )
 
-        controller_module = (
-            "megatron.core.inference.text_generation_controllers.text_generation_controller"
-        )
+        # The serial MTP path lives in the MTP mixin, so patch the SP collectives there.
+        mtp_module = "megatron.core.inference.text_generation_controllers.mtp_inference_mixin"
         with (
-            mock.patch(f"{controller_module}.gather_from_sequence_parallel_region", mock_gather),
+            mock.patch(f"{mtp_module}.gather_from_sequence_parallel_region", mock_gather),
             mock.patch(
-                f"{controller_module}.scatter_to_sequence_parallel_region",
+                f"{mtp_module}.scatter_to_sequence_parallel_region",
                 side_effect=lambda hidden, group=None: hidden[:1],
             ),
         ):

@@ -7,8 +7,7 @@
 # baseline) — not a multi-node port of the DP=8 case.
 #
 # The server runs with --inference-dynamic-batching-async-sched-mode async.
-# Async scheduling requires greedy sampling / no logprobs / no stop words; the
-# static benchmark client already satisfies these (temperature 0.0, ignore_eos).
+# ASYNC_SCHED pins this A/B case to async regardless of the application default.
 
 MODEL: gpt_583m
 TP: 1

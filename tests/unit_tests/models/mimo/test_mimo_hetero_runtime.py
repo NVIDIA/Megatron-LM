@@ -135,7 +135,9 @@ def test_supplied_ddp_config_wins_over_global_args(mocker):
     mocker.patch("examples.mimo.training.runtime._module_config", return_value=mocker.MagicMock())
     mocker.patch("examples.mimo.training.runtime.print_rank_0")
 
-    args = _args(encoder_ddp_overlap=True, overlap_grad_reduce=False, overlap_param_gather=False)
+    args = _args(
+        mimo_encoder_ddp_overlap=True, overlap_grad_reduce=False, overlap_param_gather=False
+    )
     supplied_ddp_config = DistributedDataParallelConfig(
         overlap_grad_reduce=True, overlap_param_gather=True, bucket_size=1234
     )
