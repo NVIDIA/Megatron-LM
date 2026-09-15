@@ -66,6 +66,9 @@ class TrainingConfig:
     Note that either train_iters or train_samples should be provided.
     """
 
+    train_full_dataset: bool = False
+    """Train for one complete pass over an externally provided dataset."""
+
     train_samples: int | None = None
     """Total number of samples to train over all training runs.
     Note that either train_iters or train_samples should be provided."""
