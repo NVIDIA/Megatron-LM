@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-from types import SimpleNamespace
+import sys
+from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
@@ -298,12 +299,13 @@ def test_mxfp8_split_scale_and_descriptor_cache_refreshes_per_iteration(monkeypa
     assert [call[-1] for call in view_calls] == [None, None, first[0], first[1]]
 
 
-def _shared_module(fc1_weight, fc2_weight):
+def _shared_module(fc1_weight, fc2_weight, gate_weight=None):
     shared = torch.nn.Module()
     shared.linear_fc1 = torch.nn.Module()
     shared.linear_fc2 = torch.nn.Module()
     shared.linear_fc1.register_parameter("weight", fc1_weight)
     shared.linear_fc2.register_parameter("weight", fc2_weight)
+    shared.register_parameter("gate_weight", gate_weight)
     return shared
 
 
@@ -321,7 +323,8 @@ def test_register_shared_weights_rejects_non_bf16_parameters():
 
 
 @pytest.mark.parametrize("single_grouped", [False, True])
-def test_checkpoint_uses_only_canonical_mcore_parameters(single_grouped):
+@pytest.mark.parametrize("gated", [False, True])
+def test_checkpoint_uses_only_canonical_mcore_parameters(single_grouped, gated):
     experts = torch.nn.Module()
     experts.linear_fc1 = torch.nn.Module()
     experts.linear_fc2 = torch.nn.Module()
@@ -344,13 +347,16 @@ def test_checkpoint_uses_only_canonical_mcore_parameters(single_grouped):
             "experts.linear_fc2.weight0": torch.full_like(routed_fc2, 5.0),
         }
 
-    shared_fc1 = torch.nn.Parameter(torch.zeros((8, 8)))
-    shared_fc2 = torch.nn.Parameter(torch.zeros((8, 4)))
-    shared = _shared_module(shared_fc1, shared_fc2)
+    shared_fc1 = torch.nn.Parameter(torch.zeros((8, 8), dtype=torch.bfloat16))
+    shared_fc2 = torch.nn.Parameter(torch.zeros((8, 4), dtype=torch.bfloat16))
+    gate_weight = torch.nn.Parameter(torch.zeros((1, 8), dtype=torch.bfloat16)) if gated else None
+    shared = _shared_module(shared_fc1, shared_fc2, gate_weight)
 
     mok = mok_backend.MoKMegakernel.__new__(mok_backend.MoKMegakernel)
     torch.nn.Module.__init__(mok)
     mok.native_single_grouped_weights = single_grouped
+    mok.intermediate_size = 4
+    mok.hidden_size = 8
     mok._routed_weight_view_cache = object()
     mok._split_main_grad_descriptor_cache = object()
     mok.is_first_microbatch = False
@@ -362,8 +368,7 @@ def test_checkpoint_uses_only_canonical_mcore_parameters(single_grouped):
         mok._routed_fc2_parameter_names = ("routed_fc2_weight0",)
         mok.register_parameter("routed_fc1_weight0", routed_fc1)
         mok.register_parameter("routed_fc2_weight0", routed_fc2)
-    mok.register_parameter("shared_fc1_weight", shared_fc1)
-    mok.register_parameter("shared_fc2_weight", shared_fc2)
+    mok._register_shared_weights(shared, use_output_gate=gated)
 
     parent = torch.nn.Module()
     parent.add_module("experts", experts)
@@ -374,8 +379,14 @@ def test_checkpoint_uses_only_canonical_mcore_parameters(single_grouped):
         "shared_experts.linear_fc1.weight": torch.full_like(shared_fc1, 7.0),
         "shared_experts.linear_fc2.weight": torch.full_like(shared_fc2, 11.0),
     }
+    if gated:
+        checkpoint["shared_experts.gate_weight"] = torch.full_like(gate_weight, 13.0)
 
     assert set(parent.state_dict()) == set(checkpoint)
+    assert set(dict(parent.named_parameters())) == set(checkpoint)
+    assert mok.shared_output_gate_weight is gate_weight
+    if gated:
+        assert dict(mok.named_parameters(recurse=False))["shared_output_gate_weight"] is gate_weight
     assert mok.sharded_state_dict(prefix="megakernel_experts.") == {}
     parent.load_state_dict(checkpoint, strict=True)
 
@@ -383,6 +394,270 @@ def test_checkpoint_uses_only_canonical_mcore_parameters(single_grouped):
     torch.testing.assert_close(routed_fc2, tuple(routed_checkpoint.values())[1])
     torch.testing.assert_close(shared_fc1, checkpoint["shared_experts.linear_fc1.weight"])
     torch.testing.assert_close(shared_fc2, checkpoint["shared_experts.linear_fc2.weight"])
+    if gated:
+        torch.testing.assert_close(gate_weight, checkpoint["shared_experts.gate_weight"])
+        assert mok.shared_output_gate_weight is shared.gate_weight
     assert mok._routed_weight_view_cache is None
     assert mok._split_main_grad_descriptor_cache is None
     assert mok.is_first_microbatch
+
+
+def _mock_backend(monkeypatch, *, single_grouped=False, gated=True, mxfp8=False):
+    """Build the actual adapter while keeping these contract tests independent of MOK."""
+    package = ModuleType("mok")
+    functional = ModuleType("mok.functional")
+    functional.MoKConfig = lambda **kwargs: SimpleNamespace(**kwargs)
+    package.functional = functional
+    package.ops = SimpleNamespace(make_routed_d_weight_storage_table=lambda _: object())
+    monkeypatch.setitem(sys.modules, "mok", package)
+    monkeypatch.setitem(sys.modules, "mok.functional", functional)
+    experts = torch.nn.Module()
+    experts.linear_fc1 = torch.nn.Module()
+    experts.linear_fc2 = torch.nn.Module()
+    for linear, shape in ((experts.linear_fc1, (8, 8)), (experts.linear_fc2, (8, 4))):
+        linear.single_grouped_weight = single_grouped
+        if single_grouped:
+            linear.register_parameter(
+                "weight", torch.nn.Parameter(torch.zeros((2, *shape), dtype=torch.bfloat16))
+            )
+        else:
+            for index in range(2):
+                linear.register_parameter(
+                    f"weight{index}", torch.nn.Parameter(torch.zeros(shape, dtype=torch.bfloat16))
+                )
+    gate = torch.nn.Parameter(torch.zeros((1, 8), dtype=torch.bfloat16)) if gated else None
+    shared = _shared_module(
+        torch.nn.Parameter(torch.zeros((8, 8), dtype=torch.bfloat16)),
+        torch.nn.Parameter(torch.zeros((8, 4), dtype=torch.bfloat16)),
+        gate,
+    )
+    config = SimpleNamespace(
+        gradient_accumulation_fusion=True,
+        moe_mlp_glu_interleave_size=None,
+        moe_shared_expert_glu_interleave_size=None,
+        moe_pad_expert_input_to_capacity=False,
+        moe_shared_expert_gate=gated,
+        hidden_size=8,
+        moe_ffn_hidden_size=4,
+        moe_shared_expert_intermediate_size=4,
+        moe_router_topk=2,
+        activation_func_clamp_value=None,
+        fp8="hybrid" if mxfp8 else None,
+        fp8_recipe="mxfp8",
+        fp8_param=mxfp8,
+        moe_single_grouped_weight=single_grouped,
+        moe_megakernel_backend_config=None,
+    )
+    module = mok_backend.MoKMegakernel(config, object(), experts, shared, 2)
+    return module, shared, functional
+
+
+def test_backend_rejects_gated_mxfp8_before_importing_te_runtime(monkeypatch):
+    with pytest.raises(ValueError, match="output gate requires BF16 routed experts"):
+        _mock_backend(monkeypatch, gated=True, mxfp8=True)
+
+
+def test_output_gate_alias_participates_in_ddp_hooks_without_double_accumulation(monkeypatch):
+    from megatron.core.distributed import distributed_data_parallel as ddp_module
+
+    module, shared, _ = _mock_backend(monkeypatch)
+    gate = shared.gate_weight
+    with torch.no_grad():
+        gate.fill_(3.0)  # A nonzero sentinel would expose accidental duplicate accumulation.
+    gate.main_grad = torch.full_like(gate, 0.75, dtype=torch.float32)
+    waited, ready = [], []
+    bucket = SimpleNamespace(register_grad_ready=lambda param, force: ready.append((param, force)))
+    ddp = SimpleNamespace(
+        use_forward_hook=True,
+        param_to_bucket_group={gate: bucket},
+        _finish_param_sync_for_bucket_group=lambda group: waited.append(group),
+        ddp_config=SimpleNamespace(overlap_grad_reduce=True),
+        force_all_reduce=False,
+    )
+    monkeypatch.setattr(ddp_module, "is_graph_capturing", lambda: False)
+    ddp_module.DistributedDataParallel._make_forward_pre_hook(ddp)(module)
+    assert waited == [bucket]
+    gate.grad = parameter_bridge.finish_weight_gradient(gate)
+    ddp_module.DistributedDataParallel._make_backward_post_hook(ddp, gate)()
+    assert gate.grad is None
+    assert len(ready) == 1 and ready[0][0] is gate and ready[0][1] is False
+    torch.testing.assert_close(gate.main_grad, torch.full_like(gate.main_grad, 0.75))
+    torch.testing.assert_close(gate, torch.full_like(gate, 3.0))
+
+
+@pytest.mark.parametrize("invalid", ["missing", "dtype", "shape", "noncontiguous"])
+def test_register_shared_output_gate_validates_native_parameter(monkeypatch, invalid):
+    module, shared, _ = _mock_backend(monkeypatch)
+    bad_gate = {
+        "missing": None,
+        "dtype": torch.nn.Parameter(torch.zeros((1, 8), dtype=torch.float32)),
+        "shape": torch.nn.Parameter(torch.zeros((8,), dtype=torch.bfloat16)),
+        "noncontiguous": torch.nn.Parameter(torch.zeros((1, 16), dtype=torch.bfloat16)[:, ::2]),
+    }[invalid]
+    shared.gate_weight = bad_gate
+    with pytest.raises(RuntimeError, match="native contiguous BF16 Parameter"):
+        module._register_shared_weights(shared, use_output_gate=True)
+
+
+@pytest.mark.parametrize("single_grouped", [False, True])
+@pytest.mark.parametrize("gated", [False, True])
+def test_forward_keeps_fixed_gate_slot_and_param_gather_alias(monkeypatch, single_grouped, gated):
+    module, shared, _ = _mock_backend(monkeypatch, single_grouped=single_grouped, gated=gated)
+    probs = torch.ones((2, 2), dtype=torch.float32)
+    experts = torch.zeros((2, 2), dtype=torch.int32)
+    monkeypatch.setattr(mok_backend, "routing_map_to_mok_inputs", lambda *_: (probs, experts))
+    captured = []
+    aliases = []
+
+    def apply(*arguments):
+        captured.append(arguments)
+        return arguments[1]
+
+    monkeypatch.setattr(mok_backend._MoKAutograd, "apply", apply)
+    handle = module.register_forward_pre_hook(
+        lambda adapter, _: aliases.append(dict(adapter.named_parameters(recurse=False)))
+    )
+    x = torch.zeros((2, 1, 8), dtype=torch.bfloat16)
+    try:
+        output = module(x, probs, experts)
+    finally:
+        handle.remove()
+    arguments = captured[0]
+    assert output.shape == x.shape
+    assert arguments[0] is module and arguments[2] is probs and arguments[3] is experts
+    assert arguments[4] is shared.gate_weight
+    expected_parameters = module.autograd_routed_parameters + (
+        shared.linear_fc1.weight,
+        shared.linear_fc2.weight,
+    )
+    assert len(arguments) == 5 + len(expected_parameters)
+    assert all(actual is expected for actual, expected in zip(arguments[5:], expected_parameters))
+    if gated:
+        assert aliases[0]["shared_output_gate_weight"] is shared.gate_weight
+    else:
+        assert "shared_output_gate_weight" not in aliases[0]
+
+
+class _RuntimeContext:
+    def save_for_backward(self, *tensors):
+        self.saved_tensors = tensors
+
+
+@pytest.mark.parametrize("single_grouped", [False, True])
+@pytest.mark.parametrize("gated", [False, True])
+def test_runtime_gate_main_grad_accumulates_and_finishes_ddp_slot(
+    monkeypatch, single_grouped, gated
+):
+    module, shared, functional = _mock_backend(
+        monkeypatch, single_grouped=single_grouped, gated=gated
+    )
+    parameters = module.autograd_routed_parameters + (
+        shared.linear_fc1.weight,
+        shared.linear_fc2.weight,
+    )
+    for parameter in parameters:
+        parameter.main_grad = torch.zeros_like(parameter, dtype=torch.float32)
+    if gated:
+        shared.gate_weight.main_grad = torch.full_like(
+            shared.gate_weight, 0.25, dtype=torch.float32
+        )
+    monkeypatch.setattr(
+        module,
+        "quantized_routed_weights",
+        lambda: (module.routed_fc1_parameters[0], module.routed_fc2_parameters[0]),
+    )
+    functional.get_workspace = lambda *args, **kwargs: object()
+    functional.build_schedule = lambda *args, **kwargs: object()
+    calls = []
+
+    def forward(*args, **kwargs):
+        assert kwargs.get("shared_output_gate_weight") is shared.gate_weight
+        return args[3].clone(), object()
+
+    def backward(*args, **kwargs):
+        calls.append(kwargs)
+        assert kwargs.get("shared_output_gate_weight") is shared.gate_weight
+        gate_grad = kwargs.get("shared_output_gate_main_grad")
+        if gated:
+            assert gate_grad is shared.gate_weight.main_grad and gate_grad.dtype == torch.float32
+            gate_grad.add_(0.5)
+        else:
+            assert gate_grad is None
+        return torch.ones_like(args[5]), torch.ones_like(args[6]), *kwargs["main_grads"], gate_grad
+
+    if gated:
+        functional.forward = forward
+        functional.backward = backward
+    else:
+        # Older MOK integration versions accept no output-gate kwargs and
+        # return eight gradients. Ungated must still use that original API.
+        def legacy_forward(*args, swiglu_limit):
+            return forward(*args, swiglu_limit=swiglu_limit)
+
+        def legacy_backward(*args, swiglu_limit, main_grads, main_grad_storage_tables):
+            return backward(
+                *args,
+                swiglu_limit=swiglu_limit,
+                main_grads=main_grads,
+                main_grad_storage_tables=main_grad_storage_tables,
+            )[:8]
+
+        functional.forward = legacy_forward
+        functional.backward = legacy_backward
+    x = torch.zeros((4, 8), dtype=torch.bfloat16)
+    probs = torch.zeros((4, 2), dtype=torch.float32)
+    experts = torch.zeros((4, 2), dtype=torch.int32)
+    for iteration in range(2):
+        for parameter in parameters + ((shared.gate_weight,) if gated else ()):
+            parameter.grad_added_to_main_grad = False
+        ctx = _RuntimeContext()
+        mok_runtime._MoKAutograd.forward(
+            ctx, module, x, probs, experts, shared.gate_weight, *parameters
+        )
+        assert ctx.saved_tensors[2] is shared.gate_weight
+        gradients = mok_runtime._MoKAutograd.backward(ctx, torch.ones_like(x))
+        assert len(gradients) == 5 + len(parameters)
+        assert gradients[0] is None and gradients[3] is None
+        torch.testing.assert_close(gradients[1], torch.ones_like(x))
+        torch.testing.assert_close(gradients[2], torch.ones_like(probs))
+        for gradient, parameter in zip(gradients[5:], parameters):
+            assert gradient.data_ptr() == parameter.data_ptr()
+            assert not gradient.requires_grad and parameter.grad_added_to_main_grad
+        if gated:
+            assert gradients[4].data_ptr() == shared.gate_weight.data_ptr()
+            assert shared.gate_weight.grad_added_to_main_grad
+            torch.testing.assert_close(
+                shared.gate_weight.main_grad,
+                torch.full_like(shared.gate_weight.main_grad, 0.25 + 0.5 * (iteration + 1)),
+            )
+        else:
+            assert gradients[4] is None
+        assert ctx.module is None and ctx.forward_context is None
+    assert len(calls) == 2
+
+
+@pytest.mark.parametrize("main_grad", [None, "bf16"])
+def test_runtime_rejects_missing_or_bf16_output_gate_main_grad(monkeypatch, main_grad):
+    module, shared, functional = _mock_backend(monkeypatch)
+    if main_grad == "bf16":
+        shared.gate_weight.main_grad = torch.zeros_like(shared.gate_weight)
+    parameters = module.autograd_routed_parameters + (
+        shared.linear_fc1.weight,
+        shared.linear_fc2.weight,
+    )
+    for parameter in parameters:
+        parameter.main_grad = torch.zeros_like(parameter, dtype=torch.float32)
+    x = torch.zeros((4, 8), dtype=torch.bfloat16)
+    probs = torch.zeros((4, 2), dtype=torch.float32)
+    ctx = _RuntimeContext()
+    ctx.module = module
+    ctx.routed_weight_views = (module.routed_fc1_parameters[0], module.routed_fc2_parameters[0])
+    ctx.save_for_backward(x, probs, shared.gate_weight, *parameters)
+    functional.backward = lambda *args, **kwargs: pytest.fail("invalid main_grad reached MOK")
+    error = (
+        "DDP to assign param.main_grad"
+        if main_grad is None
+        else "output gate requires FP32 main_grad"
+    )
+    with pytest.raises(RuntimeError, match=error):
+        mok_runtime._MoKAutograd.backward(ctx, torch.ones_like(x))
