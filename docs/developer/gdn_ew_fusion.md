@@ -11,8 +11,7 @@ width 4, and context-parallel size 1. It requires FLA's convolution backward
 kernel. Unsupported shapes and deterministic mode retain the existing path.
 
 `MCORE_GDN_COMMON_OPT=1` independently enables fixed-launch unfused convolution.
-Both options reuse validated packed-sequence metadata while tensor identities
-and mutation versions remain unchanged. Both default to disabled.
+Both options default to disabled and retain the original packed-sequence checks.
 
 The kernels preserve intermediate BF16 rounding and additive Q/K L2 epsilon
 of `1e-6`. They support first-order autograd only. Floating-point operation

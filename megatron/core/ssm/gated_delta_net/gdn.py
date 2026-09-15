@@ -5,7 +5,6 @@
 # This source code is licensed under the Apache license found in the
 # LICENSE file in the root directory of this source tree.
 
-import os
 from functools import partial
 from typing import Optional
 
@@ -34,7 +33,6 @@ from megatron.core.ssm.gdn_fusion import enabled as gdn_fusion_enabled
 from megatron.core.ssm.gdn_fusion import fused_prepare
 from megatron.core.ssm.gdn_gated_norm import enabled as gdn_output_fusion_enabled
 from megatron.core.ssm.gdn_gated_norm import fused_gated_norm
-from megatron.core.ssm.gdn_packed_sequence import resolve_packed_sequences
 from megatron.core.ssm.ssm_inference import SSMDynamicInferenceMixin
 from megatron.core.utils import deprecate_inference_params, nvtx_range_pop, nvtx_range_push
 
@@ -138,38 +136,24 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
                 not self.config.deterministic_mode
             ), "Packed sequence does not support deterministic mode."
 
-            if (
-                (
-                    os.getenv("MCORE_GDN_FUSION", "0") == "1"
-                    or os.getenv("MCORE_GDN_COMMON_OPT", "0") == "1"
-                )
-                and self.cp_size == 1
-                and self.feat_dim_split == (3072, 2048, 16, 16)
-            ):
-                q = packed_seq_params.cu_seqlens_q_padded
-                kv = packed_seq_params.cu_seqlens_kv_padded
-                q = packed_seq_params.cu_seqlens_q if q is None else q
-                kv = packed_seq_params.cu_seqlens_kv if kv is None else kv
-                cu_seqlens_q, cu_seqlens_kv = resolve_packed_sequences(q, kv, seq_len)
-            else:
-                cu_seqlens_q = self._resolve_cu_seqlens(
-                    packed_seq_params.cu_seqlens_q_padded,
-                    packed_seq_params.cu_seqlens_q,
-                    seq_len,
-                    "cu_seqlens_q",
-                    cp_size=self.cp_size,
-                )
-                cu_seqlens_kv = self._resolve_cu_seqlens(
-                    packed_seq_params.cu_seqlens_kv_padded,
-                    packed_seq_params.cu_seqlens_kv,
-                    seq_len,
-                    "cu_seqlens_kv",
-                    cp_size=self.cp_size,
-                )
-                assert torch.equal(cu_seqlens_q, cu_seqlens_kv), (
-                    "Currently only support cu_seqlens_q equals to cu_seqlens_kv, "
-                    f"but got {cu_seqlens_q=} and {cu_seqlens_kv=}"
-                )
+            cu_seqlens_q = self._resolve_cu_seqlens(
+                packed_seq_params.cu_seqlens_q_padded,
+                packed_seq_params.cu_seqlens_q,
+                seq_len,
+                "cu_seqlens_q",
+                cp_size=self.cp_size,
+            )
+            cu_seqlens_kv = self._resolve_cu_seqlens(
+                packed_seq_params.cu_seqlens_kv_padded,
+                packed_seq_params.cu_seqlens_kv,
+                seq_len,
+                "cu_seqlens_kv",
+                cp_size=self.cp_size,
+            )
+            assert torch.equal(cu_seqlens_q, cu_seqlens_kv), (
+                "Currently only support cu_seqlens_q equals to cu_seqlens_kv, "
+                f"but got {cu_seqlens_q=} and {cu_seqlens_kv=}"
+            )
             num_packed_seqs = cu_seqlens_q.shape[0] - 1
             assert num_packed_seqs > 0, (
                 "Number of packed sequences must be greater than 0, "
