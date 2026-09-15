@@ -20,7 +20,11 @@ pytest.importorskip("emerging_optimizers", reason="LayerShardedMuon requires eme
 
 from emerging_optimizers.orthogonalized_optimizers.muon_utils import newton_schulz
 
-from megatron.core.optimizer.layer_sharded_muon import LayerShardedMuon
+from megatron.core.optimizer.layer_sharded_muon import (
+    LayerShardedMuon,
+    ParamSharding,
+    ParamShardSpec,
+)
 from megatron.core.utils import is_emerging_optimizers_min_version
 from tests.unit_tests.test_utilities import Utils
 
@@ -91,6 +95,13 @@ def _gtp_param(t):
     """Megatron tags GTP-row-sharded weights with is_gtp_weight_remat."""
     p = torch.nn.Parameter(t)
     p.is_gtp_weight_remat = True
+    return p
+
+
+def _mark_tp(p, partition_dim):
+    """Megatron tags TP-sharded weights with tensor_model_parallel plus partition_dim."""
+    p.tensor_model_parallel = True
+    p.partition_dim = partition_dim
     return p
 
 
@@ -175,7 +186,7 @@ def _dense_and_expert_params(t, g, ep_rank, egtp_rank, n_same_experts):
     for w, gr in zip(dense_w, dense_g):
         p = _gtp_param(_shard_2d(w, 0, t, g))
         p.grad = _shard_2d(gr, 0, t, g)
-        p.partition_dim = 0
+        _mark_tp(p, 0)
         dense.append(p)
 
     torch.manual_seed(_SEED + 70 + ep_rank)  # each EP group holds different experts
@@ -308,7 +319,7 @@ def test_2d_domain_matches_full_matrix_reference(ns_batch):
         p = _gtp_param(shard) if gtp else torch.nn.Parameter(shard)
         p.grad = _shard_2d(gr, pd, t, g, gtp)
         if pd is not None:
-            p.partition_dim = pd
+            _mark_tp(p, pd)
         params.append(p)
 
     opt = _muon(params, gtp_remat_group=gtp_remat_group, tp_group=tp_group, ns_batch_size=ns_batch)
@@ -434,7 +445,7 @@ def test_degenerate_domain_group_falls_back_to_local_ns():
     torch.manual_seed(_SEED + 90)
     other = _gtp_param(_shard_2d(torch.randn(32, 16), 0, r % 2, r // 2))
     other.grad = _shard_2d(torch.randn(32, 16), 0, r % 2, r // 2)
-    other.partition_dim = 0
+    _mark_tp(other, 0)
 
     opt = _muon(
         [{"params": [other]}, {"params": [p]}], gtp_remat_group=gtp_remat_group, tp_group=tp_group
@@ -520,7 +531,7 @@ def test_tp_replicated_ns_chunking_is_column_invariant():
     p_a.grad = _shard_2d(torch.randn(32, 16), None, t, g)
     p_b = _gtp_param(_shard_2d(torch.randn(32, 16), 0, t, g))
     p_b.grad = _shard_2d(torch.randn(32, 16), 0, t, g)
-    p_b.partition_dim = 0
+    _mark_tp(p_b, 0)
 
     opt = _muon(
         [p_a, p_b],
@@ -572,7 +583,7 @@ def test_padded_param_2d_two_stage_matches_reference(pd):
         )
 
     p = _gtp_param(_padded_shard(_tp_local(full_w), G, g, PAD))
-    p.partition_dim = pd
+    _mark_tp(p, pd)
     p.pad_length = PAD
     opt = _muon([p], nesterov=False, gtp_remat_group=gtp_remat_group, tp_group=tp_group)
     opt.set_param_ns_homes({id(p): (1, 1)})
@@ -608,6 +619,33 @@ def test_padded_param_2d_two_stage_matches_reference(pd):
 # ---------------------------------------------------------------------------
 
 
+def test_param_shard_spec_reads_model_attributes_once():
+    """ParamShardSpec.from_param turns the model's sharding attributes into the sharding of a
+    param within a (gtp_remat, tp) domain."""
+    spec = ParamShardSpec.from_param
+    dup = torch.nn.Parameter(torch.randn(6, 4))
+    dup.tensor_model_parallel, dup.partition_dim = False, 0  # duplicated-mode TE linear
+    s = spec(dup, gtp_remat_size=2, tp_size=2)
+    assert s.sharding is ParamSharding.REPLICATED and s.tp_dim is None
+    assert s.full_shape == (6, 4)
+
+    col = _mark_tp(_gtp_param(torch.randn(6, 4)), 0)
+    col.pad_length = 2
+    s = spec(col, 2, 2)
+    assert s.sharding is ParamSharding.GTP_REMAT_AND_TP and s.tp_dim == 0 and s.pad_length == 2
+    assert s.full_shape == ((6 * 2 - 2) * 2, 4)
+    assert s.ns_cost == s.full_shape[0] * s.full_shape[1] * min(s.full_shape)
+    assert spec(_mark_tp(_gtp_param(torch.randn(6, 4)), 1), 2, 2).full_shape == (12, 8)
+    assert spec(_gtp_param(torch.randn(6, 4)), 2, 2).sharding is ParamSharding.GTP_REMAT
+    # An axis of size 1 is absent from the domain: its tag is ignored.
+    assert spec(col, 2, 1).sharding is ParamSharding.GTP_REMAT
+    assert spec(col, 1, 1).sharding is ParamSharding.REPLICATED
+    tp_only = _mark_tp(torch.nn.Parameter(torch.randn(6, 4)), 1)
+    assert spec(tp_only, 1, 2).sharding is ParamSharding.TP
+    with pytest.raises(ValueError, match="not GTP-sharded"):
+        spec(_mark_tp(torch.nn.Parameter(torch.randn(6, 4)), 0), 2, 2)
+
+
 @pytest.mark.launch_on_gb200
 def test_tp_sharded_without_gtp_marker_is_rejected():
     """A TP-sharded param without is_gtp_weight_remat is replicated across GTP_remat; the
@@ -615,8 +653,7 @@ def test_tp_sharded_without_gtp_marker_is_rejected():
     collective."""
     _require_four_ranks("Requires exactly 4 ranks (TP=2 x GTP=2)")
     tp_group, gtp_remat_group = _get_2d_groups()
-    p = torch.nn.Parameter(torch.randn(8, 6))
-    p.partition_dim = 0
+    p = _mark_tp(torch.nn.Parameter(torch.randn(8, 6)), 0)
     opt = LayerShardedMuon([p], lr=0.1, gtp_remat_group=gtp_remat_group, tp_group=tp_group)
     opt.set_param_ns_homes({id(p): (0, 0)})
     p.grad = torch.randn_like(p)
@@ -643,16 +680,23 @@ def test_weight_update_hooks_called_on_all_paths():
     opt.step()
     assert calls == {"pre": 3, "post": 3}, f"hooks missed on the sharded paths: {calls}"
 
+    # Degenerate domain: group 1's (gtp_remat, tp) override is (None, None), so its param
+    # takes the replicated path (local NS) and must still fire the hooks once; group 0
+    # keeps the layer-sharded path active so this is not the empty-homes fallback.
+    anchor = _gtp_param(torch.randn(4, 8))
     p2 = torch.nn.Parameter(torch.randn(8, 8))
-    opt2 = _muon([p2], nesterov=False, gtp_remat_group=None)
+    opt2 = _muon([{"params": [anchor]}, {"params": [p2]}], nesterov=False, gtp_remat_group=_world())
+    opt2.set_group_process_groups({0: (_world(), None), 1: (None, None)})
+    opt2.set_param_ns_homes({id(anchor): (0, 0)})
     calls2 = {"pre": 0, "post": 0}
     opt2.pre_weight_update_fn_inplace = lambda p, update: calls2.__setitem__(
         "pre", calls2["pre"] + 1
     )
     opt2.post_weight_update_fn_inplace = lambda p: calls2.__setitem__("post", calls2["post"] + 1)
+    anchor.grad = torch.randn_like(anchor)
     p2.grad = torch.randn_like(p2)
     opt2.step()
-    assert calls2 == {"pre": 1, "post": 1}, f"hooks missed on the degenerate path: {calls2}"
+    assert calls2 == {"pre": 2, "post": 2}, f"hooks missed on the degenerate path: {calls2}"
 
 
 @pytest.mark.launch_on_gb200
@@ -670,8 +714,7 @@ def test_exchange_plan_cache_bitwise_and_reused():
     def _build():
         params = []
         for w, pd in zip(full_w, pdims):
-            p = _gtp_param(_shard_2d(w, pd, t, g))
-            p.partition_dim = pd
+            p = _mark_tp(_gtp_param(_shard_2d(w, pd, t, g)), pd)
             params.append(p)
         opt = _muon(params, nesterov=False, gtp_remat_group=gtp_remat_group, tp_group=tp_group)
         opt.set_param_ns_homes({id(params[0]): (0, 1), id(params[1]): (1, 0)})
@@ -685,11 +728,11 @@ def test_exchange_plan_cache_bitwise_and_reused():
             for i, p in enumerate(params):
                 p.grad = _shard_2d(step_grads[step][i], pdims[i], t, g)
             if cold:
-                opt._exchange_plans.clear()
+                opt._plans.clear()
             opt.step()
         for pa, pb in zip(params_a, params_b):
             assert torch.equal(pa.data, pb.data), f"warm/cold divergence at step {step}"
-        current = {tag: id(sub) for tag, sub in opt_a._exchange_plans[0].items() if tag != 'key'}
+        current = {tag: id(sub) for tag, sub in opt_a._plans[0].route_plans.items()}
         assert current, "no plans were cached"
         if plan_ids is None:
             plan_ids = current
@@ -714,11 +757,11 @@ def test_exchange_plan_rebuilds_when_param_set_changes():
     for p, w in zip(params, full_w):
         p.grad = _shard(torch.randn_like(w))
     opt.step()
-    key_both = opt._exchange_plans[0]['key']
+    key_both = opt._plans[0].param_ids
 
     params[1].grad = None
     params[0].grad = _shard(torch.randn_like(full_w[0]))
     before = params[1].data.clone()
     opt.step()
-    assert opt._exchange_plans[0]['key'] != key_both, "stale plan reused"
+    assert opt._plans[0].param_ids != key_both, "stale plan reused"
     assert torch.equal(params[1].data, before), "grad-less param must not move"
