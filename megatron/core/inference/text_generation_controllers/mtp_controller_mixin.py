@@ -16,6 +16,7 @@ the model -- including the chunked-prefill boundary carry, which lives on the co
 """
 
 from dataclasses import dataclass
+from itertools import accumulate
 from typing import List, Optional
 
 import torch
@@ -273,9 +274,7 @@ class MTPControllerMixin:
         # Host-side chunk geometry. `q_list` entries are >= 1, so every request contributes
         # q-1 >= 0 body rows and `chunk_start[i]` is the first row of request i's chunk.
         num_prefill = len(q_list)
-        chunk_start = [0] * num_prefill
-        for i in range(1, num_prefill):
-            chunk_start[i] = chunk_start[i - 1] + q_list[i - 1]
+        chunk_start = [0, *accumulate(q_list[:-1])]  # exclusive cumsum of the chunk lengths
         counts = torch.tensor([q - 1 for q in q_list], dtype=torch.long, device=device)
         starts = torch.tensor(off_list, dtype=torch.long, device=device)
 

@@ -1143,65 +1143,28 @@ class TestMtpCudaGraphs:
 
 
 class TestDummySerialMtpForward:
-    """The idle EP rank must match the real ranks' forward COUNT and graph/eager MODE."""
+    """Which GRAPH KEY the idle EP rank replays.
 
-    def _make_dummy_controller(self, num_mtp_depths=2, graphed=False, mtp_kv_cache_on=True):
-        context = _make_context(num_decode_requests=2)
-        controller, model, context = _make_draft_loop_controller(
-            context, num_mtp_depths=num_mtp_depths, graphed=graphed, mtp_kv_cache_on=mtp_kv_cache_on
-        )
-        controller.model_config.expert_model_parallel_size = 2
-        controller._mtp_resolved_padded_count = 2 if graphed else None
-        return controller, model, context
-
-    def test_forward_count_matches_the_real_path(self):
-        """Real ranks run 1 commit + D depths + 1 extra append; the dummy must run D+2 too."""
-        controller, model, context = self._make_dummy_controller(num_mtp_depths=2)
-
-        controller._run_dummy_serial_mtp_forward()
-
-        # The commit-pass slot is the MTP-layer forward; the depth loop and extra append are
-        # compute_mtp_single_step calls.
-        assert controller._mtp_dummy_prefill_forward.call_count == 1
-        assert len(model.mtp_step_calls) == 3
+    Forward COUNT and graph/eager MODE are covered by `TestExpertParallelForwardParity`, which
+    runs both paths and compares them -- a strictly stronger check than asserting the dummy's
+    count in isolation, since a hard-coded number cannot drift with the real path. The graph KEY
+    is the one property that comparison does not cover.
+    """
 
     def test_dummy_always_replays_the_cache_free_graph(self):
         """Replaying the KV-aware graph here would append with no valid block table."""
-        controller, model, _ = self._make_dummy_controller(num_mtp_depths=2, graphed=True)
+        context = _make_context(num_decode_requests=2)
+        controller, model, context = _make_draft_loop_controller(
+            context, num_mtp_depths=2, graphed=True, mtp_kv_cache_on=True
+        )
+        controller.model_config.expert_model_parallel_size = 2
+        controller._mtp_resolved_padded_count = 2
 
         controller._run_dummy_serial_mtp_forward()
 
         for call in model.mtp_step_calls:
             assert call["cache_key"][0] == "mtp", "the dummy rank replayed the KV-aware graph"
             assert call["eager"] is False
-
-    def test_dummy_mirrors_the_main_step_eager_mode(self):
-        """Mode comes from the EP-synced padded count, not the clobbered live graph flag."""
-        controller, model, context = self._make_dummy_controller(num_mtp_depths=2, graphed=False)
-        # The commit pass clobbers this on the real ranks, so the dummy must ignore it.
-        context.using_cuda_graph_this_step = lambda: True
-
-        controller._run_dummy_serial_mtp_forward()
-
-        for call in model.mtp_step_calls:
-            assert call["eager"] is True
-            assert call["cache_key"] is None
-
-    def test_no_extra_forwards_when_the_kv_cache_is_off(self):
-        controller, model, _ = self._make_dummy_controller(num_mtp_depths=2, mtp_kv_cache_on=False)
-
-        controller._run_dummy_serial_mtp_forward()
-
-        controller._mtp_dummy_prefill_forward.assert_not_called()
-        assert len(model.mtp_step_calls) == 2
-
-    @pytest.mark.parametrize("num_mtp_depths", [1, 3])
-    def test_forward_count_tracks_depth(self, num_mtp_depths):
-        controller, model, _ = self._make_dummy_controller(num_mtp_depths=num_mtp_depths)
-
-        controller._run_dummy_serial_mtp_forward()
-
-        assert len(model.mtp_step_calls) == num_mtp_depths + 1
 
 
 # ---------------------------------------------------------------------------
