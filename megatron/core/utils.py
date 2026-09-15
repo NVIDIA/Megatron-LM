@@ -767,6 +767,31 @@ def move_host_tensor_to_device(values: torch.Tensor, device: torch.device) -> to
     return values.to(device, non_blocking=device.type == "cuda")
 
 
+def maybe_move_tensor_to_cpu(
+    tensor: torch.Tensor, as_numpy: bool = False, record_stream: bool = False
+) -> torch.Tensor:
+    """Move a tensor to CPU if it is on GPU.
+    Args:
+        tensor (torch.Tensor): The tensor to move to CPU.
+        as_numpy (bool, optional): Whether to convert the tensor to a numpy array.
+                                   Defaults to False.
+        record_stream (bool, optional): Whether to record the stream of the tensor, to prevent
+                                        memory leak when the DtoH data transfer is on a side
+                                        stream. Defaults to False.
+
+    Returns:
+        torch.Tensor: The tensor moved to CPU.
+    """
+    if torch.is_tensor(tensor) and tensor.is_cuda:
+        cpu_tensor = tensor.to(torch.device("cpu"), non_blocking=True)
+        if as_numpy:
+            cpu_tensor = cpu_tensor.numpy()
+        if record_stream:
+            tensor.record_stream(torch.cuda.current_stream())
+        tensor = cpu_tensor
+    return tensor
+
+
 class GlobalMemoryBuffer:
     """Global buffer to avoid dynamic memory allocations.
     Caller should ensure that buffers of the same name
