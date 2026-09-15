@@ -174,8 +174,8 @@ class QuantizedDBuffer:
         result.columnwise_scale = columnwise_scale
         return result
 
-    def get_local_tensor(self, index: int) -> torch.Tensor:
-        """Construct a TE MXFP8 wrapper from this rank's physical-plane views."""
+    def get_tensor_view(self, index: int) -> MXFP8Tensor:
+        """Return a compact, unswizzled MXFP8 view that aliases all local planes."""
         rowwise_data = self.rowwise_data.get_local_tensor(index)
         rowwise_scale = self.rowwise_scale.get_local_tensor(index)
         columnwise_scale = self.columnwise_scale.get_local_tensor(index)
@@ -183,14 +183,25 @@ class QuantizedDBuffer:
             shape=rowwise_data.shape,
             dtype=torch.bfloat16,
             rowwise_data=rowwise_data,
-            rowwise_scale_inv=_pad_rowwise_scale(rowwise_scale),
+            rowwise_scale_inv=rowwise_scale,
             columnwise_data=self.columnwise_data.get_local_tensor(index),
-            columnwise_scale_inv=_pad_columnwise_scale(columnwise_scale),
+            columnwise_scale_inv=columnwise_scale,
             fp8_dtype=_MXFP8_DTYPE,
             quantizer=_MXFP8_QUANTIZER,
             with_gemm_swizzled_scales=False,
             device=rowwise_data.device,
         )
+
+    def get_local_tensor(self, index: int) -> MXFP8Tensor:
+        """Return an unswizzled compute tensor with scales padded for TE's GEMM path.
+
+        Data planes remain views. Scale planes alias storage only when no padding
+        is needed; otherwise they are copied into padded allocations.
+        """
+        tensor = self.get_tensor_view(index)
+        tensor._rowwise_scale_inv = _pad_rowwise_scale(tensor._rowwise_scale_inv)
+        tensor._columnwise_scale_inv = _pad_columnwise_scale(tensor._columnwise_scale_inv)
+        return tensor
 
     def quantize_(self, main_weight: DBuffer) -> None:
         """Quantize a local master shard with matching mesh, placements, layout, and device."""
@@ -200,25 +211,7 @@ class QuantizedDBuffer:
             if actual != expected:
                 raise ValueError(f"Expected main_weight {attribute} {expected!r}, got {actual!r}.")
         for index in range(len(self.rowwise_data.layout.tensor_shapes)):
-            tensor = self.get_local_tensor(index)
-            rowwise_scale = self.rowwise_scale.get_local_tensor(index)
-            columnwise_scale = self.columnwise_scale.get_local_tensor(index)
-            tensor.quantize_(main_weight.get_local_tensor(index))
-            assert tensor._rowwise_scale_inv is not None
-            assert tensor._columnwise_scale_inv is not None
-            # get_local_tensor() creates a wrapper whose unpadded scales alias the
-            # DBuffer views, so TE updates those scales in place. Padded scales use
-            # separate allocations, so their logical contents must be copied back.
-            if tensor._rowwise_scale_inv.shape != rowwise_scale.shape:
-                rowwise_scale.copy_(
-                    tensor._rowwise_scale_inv[: rowwise_scale.shape[0], : rowwise_scale.shape[1]]
-                )
-            if tensor._columnwise_scale_inv.shape != columnwise_scale.shape:
-                columnwise_scale.copy_(
-                    tensor._columnwise_scale_inv[
-                        : columnwise_scale.shape[0], : columnwise_scale.shape[1]
-                    ]
-                )
+            self.get_tensor_view(index).quantize_(main_weight.get_local_tensor(index))
 
     @property
     def planes(self) -> tuple[DBuffer, DBuffer, DBuffer, DBuffer]:

@@ -17,6 +17,7 @@ QuantizedDBuffer = pytest.importorskip(
 
 import transformer_engine_torch as tex
 from transformer_engine.pytorch import is_mxfp8_available
+from transformer_engine.pytorch.cpp_extensions import general_gemm
 from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Quantizer
 
 pytestmark = pytest.mark.launch_on_gb200
@@ -35,6 +36,7 @@ def test_quantized_dbuffer_quantization_matches_te(distributed_setup):
     )
     torch.manual_seed(1234 + distributed_setup.rank)
     main_weight.local_buffer.normal_()
+    views = [grouped.get_tensor_view(index) for index in range(len(shapes))]
     grouped.quantize_(main_weight)
 
     for index in range(len(shapes)):
@@ -50,8 +52,14 @@ def test_quantized_dbuffer_quantization_matches_te(distributed_setup):
         if data.numel() == 0:
             continue
         reference = MXFP8Quantizer(tex.DType.kFloat8E4M3)(main_weight.get_local_tensor(index))
-        for plane, expected in zip(
+        for plane, view, expected in zip(
             grouped.planes,
+            (
+                views[index]._rowwise_data,
+                views[index]._columnwise_data,
+                views[index]._rowwise_scale_inv,
+                views[index]._columnwise_scale_inv,
+            ),
             (
                 reference._rowwise_data,
                 reference._columnwise_data,
@@ -60,9 +68,27 @@ def test_quantized_dbuffer_quantization_matches_te(distributed_setup):
             ),
         ):
             actual = plane.get_local_tensor(index)
+            assert view.shape == actual.shape
+            assert view.data_ptr() == actual.data_ptr()
             torch.testing.assert_close(
                 actual, expected[: actual.shape[0], : actual.shape[1]], rtol=0, atol=0
             )
+
+    gathered = grouped.redistribute([Replicate()])
+    gathered_main = main_weight.redistribute([Replicate()])
+    quantizer = MXFP8Quantizer(tex.DType.kFloat8E4M3)
+    for index, shape in enumerate(shapes):
+        compute_tensor = gathered.get_local_tensor(index)
+        reference = quantizer(gathered_main.get_local_tensor(index))
+        for layout, inner_dim in (("TN", shape[1]), ("NN", shape[0])):
+            activation = quantizer(torch.randn((64, inner_dim), device=distributed_setup.device))
+            actual = general_gemm(
+                compute_tensor, activation, out_dtype=torch.bfloat16, layout=layout
+            )[0]
+            expected = general_gemm(reference, activation, out_dtype=torch.bfloat16, layout=layout)[
+                0
+            ]
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 def test_quantized_dbuffer_redistributes_every_plane(distributed_setup):
