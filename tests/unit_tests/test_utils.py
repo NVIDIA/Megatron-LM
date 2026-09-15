@@ -56,13 +56,22 @@ def test_divide_improperly():
     ("device", "expected_non_blocking"),
     [(torch.device("cpu"), False), (torch.device("cuda"), True)],
 )
-def test_move_host_tensor_to_device(device, expected_non_blocking):
+@pytest.mark.parametrize("pin_memory", [None, False, True])
+def test_move_host_tensor_to_device(device, expected_non_blocking, pin_memory):
     values = mock.Mock()
+    should_pin = expected_non_blocking and pin_memory is not False
+    source = values.pin_memory.return_value if should_pin else values
     moved = object()
-    values.to.return_value = moved
+    source.to.return_value = moved
 
-    assert util.move_host_tensor_to_device(values, device) is moved
-    values.to.assert_called_once_with(device, non_blocking=expected_non_blocking)
+    kwargs = {} if pin_memory is None else {"pin_memory": pin_memory}
+    assert util.move_host_tensor_to_device(values, device, **kwargs) is moved
+    source.to.assert_called_once_with(device, non_blocking=expected_non_blocking)
+    if should_pin:
+        values.pin_memory.assert_called_once_with()
+        values.to.assert_not_called()
+    else:
+        values.pin_memory.assert_not_called()
 
 
 @pytest.fixture

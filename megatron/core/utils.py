@@ -763,14 +763,14 @@ def get_model_config(model):
 
 
 def move_host_tensor_to_device(
-    values: torch.Tensor, device: torch.device, pin_memory: bool = False
+    values: torch.Tensor, device: torch.device, pin_memory: bool = True
 ) -> torch.Tensor:
     """Move a host tensor to ``device``.
 
     Args:
         values (torch.Tensor): The host tensor to move.
         device (torch.device): The destination device.
-        pin_memory (bool): Pin the source before a CUDA transfer. Defaults to False
+        pin_memory (bool): Pin the source before a CUDA transfer. Defaults to True
             and is ignored for non-CUDA destinations. Pinning an unpinned tensor
             adds a blocking host copy; already pinned tensors are reused.
 
