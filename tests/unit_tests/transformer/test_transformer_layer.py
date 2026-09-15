@@ -1,7 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 
-import copy
 import gc
 
 import pytest
@@ -111,7 +110,8 @@ class TestParallelTransformerLayer:
         num_weights = sum([p.numel() for p in parallel_transformer_layer.parameters()])
         assert num_weights == 1884
 
-    def test_dynamic_cp_passes_cp_comm_type_at_configured_cp1(self):
+    @pytest.mark.parametrize("cp_comm_type", ["all_gather", ["p2p", "all_gather"]])
+    def test_dynamic_cp_passes_cp_comm_type_at_configured_cp1(self, cp_comm_type):
         seen = {}
 
         class RecordingAttention(torch.nn.Module):
@@ -119,14 +119,27 @@ class TestParallelTransformerLayer:
                 super().__init__()
                 seen["cp_comm_type"] = cp_comm_type
 
-        config = copy.deepcopy(self.parallel_transformer_layer.config)
-        config.context_parallel_size = 1
-        config.dynamic_context_parallel = True
-        config.cp_comm_type = "all_gather"
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=12,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            context_parallel_size=1,
+            dynamic_context_parallel=True,
+            cp_comm_type=cp_comm_type,
+        )
 
-        TransformerLayer(config, TransformerLayerSubmodules(self_attention=RecordingAttention))
+        for layer_number in (1, 2):
+            TransformerLayer(
+                config,
+                TransformerLayerSubmodules(self_attention=RecordingAttention),
+                layer_number=layer_number,
+            )
 
-        assert seen["cp_comm_type"] == "all_gather"
+            expected = (
+                cp_comm_type[layer_number - 1] if isinstance(cp_comm_type, list) else cp_comm_type
+            )
+            assert seen["cp_comm_type"] == expected
 
     def test_split_branch_norms_join_mhc_recompute_manager(self, monkeypatch):
         """Explicit norms in split hybrid branches use the unified mHC manager."""

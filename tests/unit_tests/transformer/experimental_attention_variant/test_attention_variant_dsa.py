@@ -4256,7 +4256,7 @@ class TestDSAModuleSpecDispatch:
             (
                 {
                     "context_parallel_size": 1,
-                    "cp_comm_type": None,
+                    "cp_comm_type": "all_gather",
                     "sequence_packing_scheduler": "default_dynamic_cp",
                     "dynamic_context_parallel": True,
                 },
