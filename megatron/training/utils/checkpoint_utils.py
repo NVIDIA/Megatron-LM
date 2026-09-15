@@ -1,14 +1,20 @@
 # Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 
 import logging
+import sys
 from pathlib import Path
 from typing import Any
 
 import torch
 import yaml
 
+from megatron.core._rank_utils import (
+    safe_get_rank as get_rank_safe,
+    safe_get_world_size as get_world_size_safe,
+)
 from megatron.core.msc_utils import MultiStorageClientFeature
 from megatron.training.config.utils import sanitize_dataclass_config
+from megatron.training.utils.common_utils import print_rank_0
 
 CONFIG_FILE = "run_config.yaml"
 _RUNTIME_ONLY_TARGETS = frozenset({"megatron.core.timers.Timers"})
