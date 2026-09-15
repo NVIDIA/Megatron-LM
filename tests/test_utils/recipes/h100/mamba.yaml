@@ -63,6 +63,21 @@ spec:
     bash ./tests/functional_tests/shell_test_utils/run_ci_test.sh ${{ARGUMENTS[@]}}
 
 products:
+  - test_case: [hybrid_mhc_te_moe_mtp]
+    products:
+      - environment: [dev]
+        scope: [mr, mr-github]
+        platforms: [dgx_h100]
+  - test_case: [hybrid_mhc_full_iteration_mtp]
+    products:
+      - environment: [dev]
+        scope: [mr, mr-github]
+        platforms: [dgx_h100]
+  - test_case: [hybrid_mhc_full_iteration_moe_mtp]
+    products:
+      - environment: [dev]
+        scope: [mr, mr-github]
+        platforms: [dgx_h100]
   - test_case: [hybrid_llama3_proxy_mfsdp_v2_cuda_graph]
     products:
       - environment: [dev]
