@@ -23,5 +23,6 @@ data-preparation
 training-examples
 parallelism-guide
 deterministic-training
+determinism-tracing
 features/index
 ```

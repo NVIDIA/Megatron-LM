@@ -91,6 +91,7 @@ mcore-inference-user-guide
 :caption: Observability
 
 user-guide/observability/index
+user-guide/determinism-tracing
 user-guide/observability/configuration
 user-guide/observability/span-groups
 user-guide/observability/metrics
