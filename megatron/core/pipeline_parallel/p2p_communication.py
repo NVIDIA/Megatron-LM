@@ -30,21 +30,24 @@ def _batched_p2p_ops(
     next_pipeline_rank: int,
 ):
     ops = []
-    if tensor_send_prev is not None:
-        send_prev_op = torch.distributed.P2POp(
-            torch.distributed.isend, tensor_send_prev, prev_pipeline_rank, group
-        )
-        ops.append(send_prev_op)
-    if tensor_recv_prev is not None:
-        recv_prev_op = torch.distributed.P2POp(
-            torch.distributed.irecv, tensor_recv_prev, prev_pipeline_rank, group
-        )
-        ops.append(recv_prev_op)
+    # With PP2, prev and next are the same peer. NCCL matches messages by
+    # order, so both peers must enqueue forward traffic before backward
+    # traffic to keep activations and gradients in their respective buffers.
     if tensor_send_next is not None:
         send_next_op = torch.distributed.P2POp(
             torch.distributed.isend, tensor_send_next, next_pipeline_rank, group
         )
         ops.append(send_next_op)
+    if tensor_recv_prev is not None:
+        recv_prev_op = torch.distributed.P2POp(
+            torch.distributed.irecv, tensor_recv_prev, prev_pipeline_rank, group
+        )
+        ops.append(recv_prev_op)
+    if tensor_send_prev is not None:
+        send_prev_op = torch.distributed.P2POp(
+            torch.distributed.isend, tensor_send_prev, prev_pipeline_rank, group
+        )
+        ops.append(send_prev_op)
     if tensor_recv_next is not None:
         recv_next_op = torch.distributed.P2POp(
             torch.distributed.irecv, tensor_recv_next, next_pipeline_rank, group
@@ -237,31 +240,17 @@ class P2PCommunicator:
                 group=self.pp_group,
             )
         else:
-            ops = []
-            if send_prev_shape_tensor is not None:
-                send_prev_op = torch.distributed.P2POp(
-                    torch.distributed.isend, send_prev_shape_tensor, self.prev_rank, self.pp_group
-                )
-                ops.append(send_prev_op)
-            if recv_prev_shape_tensor is not None:
-                recv_prev_op = torch.distributed.P2POp(
-                    torch.distributed.irecv, recv_prev_shape_tensor, self.prev_rank, self.pp_group
-                )
-                ops.append(recv_prev_op)
-            if send_next_shape_tensor is not None:
-                send_next_op = torch.distributed.P2POp(
-                    torch.distributed.isend, send_next_shape_tensor, self.next_rank, self.pp_group
-                )
-                ops.append(send_next_op)
-            if recv_next_shape_tensor is not None:
-                recv_next_op = torch.distributed.P2POp(
-                    torch.distributed.irecv, recv_next_shape_tensor, self.next_rank, self.pp_group
-                )
-                ops.append(recv_next_op)
-            if len(ops) > 0:
-                reqs = torch.distributed.batch_isend_irecv(ops)
-                for req in reqs:
-                    req.wait()
+            reqs = _batched_p2p_ops(
+                tensor_send_prev=send_prev_shape_tensor,
+                tensor_recv_prev=recv_prev_shape_tensor,
+                tensor_send_next=send_next_shape_tensor,
+                tensor_recv_next=recv_next_shape_tensor,
+                group=self.pp_group,
+                prev_pipeline_rank=self.prev_rank,
+                next_pipeline_rank=self.next_rank,
+            )
+            for req in reqs:
+                req.wait()
 
         recv_prev_shape = [0, 0, 0]
         if recv_prev_shape_tensor is not None:
