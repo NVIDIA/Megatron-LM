@@ -321,15 +321,10 @@ class LayerShardedMuon(TensorParallelMuon):
             nothing downgrades silently. Only takes effect with
             ``fp32_matmul_prec="medium"`` and 8-aligned dims. Same math, different
             kernel — results differ from the GEMM path by kernel-level rounding.
-        ns_batch_size: Maximum number of same-shape matrices fused into a single
-            batched Newton-Schulz on a home. MoE homes own hundreds of identically
-            shaped expert weights, where the per-matrix loop is kernel-launch bound;
-            batching trades a transient ``ns_batch_size x matrix`` stack for far
-            fewer launches. Defaults to 1 (no batching): a batch of more than one
-            runs through ``baddbmm`` rather than ``addmm``, so results differ from
-            the unbatched path by kernel-level floating point rounding and bitwise
-            parity with duplicated mode is lost. Raise (e.g. to 32) to trade that
-            parity for launch-bound MoE-home throughput.
+        ns_batch_size: Maximum number of same-shape matrices fused into one batched
+            Newton-Schulz on a home (see ``OptimizerConfig.muon_ns_batch_size``). Defaults
+            to 1, the bit-exact per-matrix path; batches of more than one use ``baddbmm``
+            and lose bitwise parity with duplicated mode.
         concurrent_groups: Run each param group's pipeline on its own CUDA stream
             instead of serializing them. Groups own disjoint params and, under MoE,
             disjoint process groups, so nothing orders them against each other; on a

@@ -1805,7 +1805,7 @@ def validate_args(args, defaults={}):
     # sgd/adam that block is skipped entirely, which would silently ignore the
     # mode — the one case where the loud failure matters most.
     if getattr(args, 'muon_tp_mode', 'duplicated') == 'layer_sharded':
-        assert args.optimizer == 'muon', (
+        assert args.optimizer in ('muon', 'dist_muon'), (
             f"--muon-tp-mode layer_sharded is only supported with --optimizer muon "
             f"(got --optimizer {args.optimizer}). Other optimizers, including "
             "adaptive_muon, do not implement layer sharding."
@@ -2811,12 +2811,10 @@ def _add_regularization_args(parser):
                        'orthogonalize the whole matrix and give TP-invariant results; auto '
                        'select between duplicated and distributed mode per-weight for '
                        'dense weights; layer_sharded assigns each 2D weight one NS home '
-                       'rank in the (gtp_remat x tp) domain — all_to_all exchanges '
-                       'assemble the full matrix there, Newton-Schulz runs locally with '
-                       'zero communication and zero redundancy, and the result is '
-                       'scattered back. Mathematically identical to duplicated-mode NS; '
-                       'requires the layer-wise distributed optimizer path (emerging '
-                       'optimizer + --use-distributed-optimizer).')
+                       'rank in the (gtp_remat x tp) domain and routes the shards there '
+                       'with all_to_all (same math as duplicated, no redundant NS); '
+                       'requires --use-distributed-optimizer and --muon-no-split-qkv. See '
+                       'OptimizerConfig.muon_tp_mode.')
     group.add_argument('--muon-ns-batch-size', type=int, default=1,
                        help='Max number of same-shape matrices fused into one batched '
                        'Newton-Schulz on an NS home under --muon-tp-mode layer_sharded. '
