@@ -7,7 +7,6 @@ import time
 
 from megatron.core.inference.inference_request import unwrap_serialized_tensors
 from megatron.core.inference.sampling_params import SamplingParams
-from megatron.core.inference.utils import detokenize_tokens
 
 from ..incremental_detokenizer import HuggingFaceFastIncrementalDetokenizer
 from ..openai_streaming import json_safe_logprobs, json_safe_top_n_logprobs, openai_stream
@@ -195,9 +194,6 @@ try:
                     # keep the prompt tokens on the payload (default is now to drop them).
                     return_prompt_tokens=True,
                     streaming_interval=sampling_params.streaming_interval,
-                    # This frontend detokenizes its own output while formatting the response.
-                    # Keep that work off the coordinator so it can forward the reply body unchanged.
-                    detokenize_generations=False,
                 )
                 if stream_requested:
                     tasks.append(
@@ -295,12 +291,10 @@ try:
             result = unwrap_serialized_tensors(completed_request)
             if response_uid is None:
                 response_uid = result["uid"]
-            generated_tokens = result.get("generated_tokens") or []
-            full_text = detokenize_tokens(
-                tokenizer, generated_tokens, remove_EOD=not sampling_params.detokenize_stop_sequence
-            )
+            full_text = result["generated_text"] or ""
             text_output = (prompts_as_strings[request_idx] + full_text) if echo else full_text
 
+            generated_tokens = result.get("generated_tokens") or []
             prompt_tokens_list = result.get("prompt_tokens") or []
             total_completion_tokens += len(generated_tokens)
             prompt_tokens_counts.append(len(prompt_tokens_list))

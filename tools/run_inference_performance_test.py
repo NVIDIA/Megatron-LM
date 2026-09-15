@@ -11,7 +11,10 @@ import torch
 from megatron.core.inference.contexts import StaticInferenceContext
 from megatron.core.inference.engines import DynamicInferenceEngine, StaticInferenceEngine
 from megatron.core.inference.engines.abstract_engine import AbstractEngine
-from megatron.core.inference.inference_request import DynamicInferenceRequest, InferenceRequest
+from megatron.core.inference.inference_request import (
+    DynamicInferenceRequestRecord,
+    InferenceRequest,
+)
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
     GPTInferenceWrapper,
 )
@@ -132,7 +135,7 @@ def generate_dynamic(
     start_time = time.perf_counter()
     all_finished_requests = []
     while inference_engine.has_unfinished_requests():
-        result = inference_engine.step_modern()
+        result = inference_engine.step()
         finished_requests = result["finished_requests"]
         for request in finished_requests:
             req_id = request.request_id
@@ -226,11 +229,10 @@ def main():
         )
     else:
         prompts = [request.prompt_tokens for request in requests]
-        results: List[DynamicInferenceRequest] = inference_engine.generate(
+        records: List[DynamicInferenceRequestRecord] = inference_engine.generate(
             prompts=prompts, sampling_params=sampling_params
         )
-        for result in results:
-            result.finalize_text(tokenizer)
+        results: List[InferenceRequest] = [record.merge() for record in records]
 
     end_time = time.perf_counter()
     latency = end_time - start_time
@@ -253,7 +255,7 @@ def main():
                 'memory_usage_GB': memory_allocated / (1024**3),
             }
             if args.prompts is not None:
-                result_dict['generated_output'] = result.generated_text
+                result_dict['generated_output'] = tokenizer.detokenize(result.generated_tokens)
             print(result_dict)
 
     total_output_tokens = args.num_tokens_to_generate * args.inference_max_requests
