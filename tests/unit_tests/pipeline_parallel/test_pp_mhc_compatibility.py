@@ -90,7 +90,8 @@ def test_mhc_pipeline_rejects_ep_overlap():
 
 @pytest.mark.internal
 @pytest.mark.parametrize("pp_size", [2, 4])
-def test_mhc_batched_p2p_preserves_directions(pp_size):
+@pytest.mark.parametrize("variable", [False, True])
+def test_mhc_batched_p2p_preserves_directions(pp_size, variable):
     """Activation and gradient messages must stay distinct when peers coincide."""
     if Utils.world_size % pp_size != 0:
         pytest.skip("Requires a world size divisible by PP")
@@ -106,12 +107,14 @@ def test_mhc_batched_p2p_preserves_directions(pp_size):
             enable_mhc_connections=True,
             mhc_num_residual_streams=2,
             batch_p2p_comm=True,
+            variable_seq_lengths=variable,
         )
         communicator = P2PCommunicator(groups.pp, config)
         shape = (16, 1, _get_pipeline_hidden_size(config))
         rank = groups.pp.rank()
         activation = torch.full(shape, float(rank + 1), device="cuda")
-        gradient = torch.full(shape, float(rank + 101), device="cuda")
+        backward_shape = (32, 1, shape[-1]) if variable else shape
+        gradient = torch.full(backward_shape, float(rank + 101), device="cuda")
         received_activation, received_gradient = (
             communicator.send_forward_backward_recv_forward_backward(
                 activation, gradient, recv_prev=True, recv_next=True, tensor_shape=shape

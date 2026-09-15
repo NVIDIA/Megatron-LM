@@ -32,6 +32,9 @@ first rank's next virtual chunk. Suppressed sends/receives at the true model
 boundaries need no single-stream buffer. Sequence parallelism and context
 parallelism continue to divide the sequence axis, while variable sequence lengths
 continue to exchange actual shapes through the existing P2P protocol.
+At PP2 the previous and next ranks coincide; batched communication orders forward
+messages before backward messages so that VPP's simultaneous activation and
+gradient exchanges remain distinct.
 
 Empty intermediate Hybrid stages return an independent, graph-connected output.
 This allows the schedule to pseudo-deallocate a sent output without resizing its
