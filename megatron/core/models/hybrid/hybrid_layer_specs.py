@@ -21,7 +21,7 @@ from megatron.core.ssm.gated_delta_product import (
     GatedDeltaProductMixerSubmodules,
 )
 from megatron.core.ssm.mamba_layer import MambaLayer, MambaLayerSubmodules
-from megatron.core.ssm.mamba_mixer import MambaMixer, MambaMixerSubmodules
+from megatron.core.ops.ssm.mamba2.mixer import MambaMixer, MambaMixerSubmodules
 from megatron.core.ssm.mlp_layer import MLPLayer
 from megatron.core.tensor_parallel import (
     InferenceColumnParallelLinear,

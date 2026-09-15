@@ -39,7 +39,7 @@ except ImportError:
 # Re-use the load balancing and all-to-all helpers from the existing module.
 # The load-balancing helpers already handle packed (THD) input via their
 # ``packed_seq_params`` argument, so GDP just threads it through below.
-from megatron.core.ssm.mamba_context_parallel import (
+from megatron.core.ops.ssm.mamba2.context_parallel import (
     _all_to_all_cp2hp,
     _all_to_all_hp2cp,
     _redo_attention_load_balancing,

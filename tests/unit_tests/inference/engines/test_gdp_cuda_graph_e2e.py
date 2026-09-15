@@ -43,7 +43,7 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
 )
 from megatron.core.models.hybrid.hybrid_layer_specs import gated_delta_product_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel
-from megatron.core.ssm.packed_seq_helpers import check_fla_sequence_packing_support
+from megatron.core.ops.ssm.common.packed_seq import check_fla_sequence_packing_support
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.attention import HAVE_FA3, HAVE_FA4, Attention
 from megatron.core.transformer.cuda_graphs import CudaGraphManager, _CudagraphGlobalRecord

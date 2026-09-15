@@ -68,8 +68,8 @@ from megatron.core.ssm.gated_delta_product import GatedDeltaProductMixer
 from megatron.core.ssm.ops.gdp.chunk import chunk_gated_delta_product_varlen
 from megatron.core.ssm.ops.gdp.fused_recurrent import fused_recurrent_gated_delta_rule_update
 from megatron.core.ssm.ops.gdp.metadata import build_gdp_chunk_descriptors, max_gdp_chunk_counts
-from megatron.core.ssm.packed_seq_helpers import check_fla_sequence_packing_support
-from megatron.core.ssm.ssm_inference import SSMDynamicInferenceMixin
+from megatron.core.ops.ssm.common.packed_seq import check_fla_sequence_packing_support
+from megatron.core.ops.ssm.common.inference import SSMDynamicInferenceMixin
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.cuda_graphs import delete_cuda_graphs

@@ -27,12 +27,18 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.ssm.causal_conv1d import assert_causal_conv1d_deterministic, causal_conv1d_cp
+from megatron.core.ops.ssm.common.causal_conv1d_cp import (
+    assert_causal_conv1d_deterministic,
+    causal_conv1d_cp,
+)
 from megatron.core.ssm.context_parallel.chunkwise import PackedSequenceCPMetadata
 from megatron.core.ssm.context_parallel.gdp_common import gdp_chunkwise_context_parallel
 from megatron.core.ssm.gdp_context_parallel import GDPContextParallel
-from megatron.core.ssm.packed_seq_helpers import check_fla_sequence_packing_support, get_cu_seqlens
-from megatron.core.ssm.ssm_inference import SSMDynamicInferenceMixin
+from megatron.core.ops.ssm.common.packed_seq import (
+    check_fla_sequence_packing_support,
+    get_cu_seqlens,
+)
+from megatron.core.ops.ssm.common.inference import SSMDynamicInferenceMixin
 from megatron.core.tensor_parallel import get_cuda_rng_tracker
 from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
 from megatron.core.transformer import TransformerConfig
@@ -107,12 +113,12 @@ except ImportError:
 # the pip `flash-linear-attention` / `causal_conv1d` ones. The fork is
 # forward-only and CUDA-graph safe, so training (which owns the backward pass)
 # keeps calling upstream.
-from megatron.core.ssm.ops.common.causal_conv1d_triton import causal_conv1d_update
-from megatron.core.ssm.ops.common.causal_conv1d_varlen import (
+from megatron.core.ops.ssm.common.causal_conv1d_triton import causal_conv1d_update
+from megatron.core.ops.ssm.common.causal_conv1d_varlen import (
     causal_conv1d_varlen_carry_states,
     causal_conv1d_varlen_fn,
 )
-from megatron.core.ssm.ops.common.intermediate_extraction import (
+from megatron.core.ops.ssm.common.intermediate_extraction import (
     scatter_intermediate_conv,
     scatter_intermediate_ssm,
 )
