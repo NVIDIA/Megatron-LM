@@ -18,6 +18,9 @@ from .mapping import (
     StateDict,
 )
 
+
+CONFIG_FILE = "run_config.yaml"
+
 # _ShardId uniquely identifies a ShardedTensor. This is a subset of ShardedTensor
 # attributes: key (str), global_offset (tuple) and flattened_range (optional tuple)
 _ShardId = Tuple[str, tuple, Optional[tuple]]
@@ -309,3 +312,15 @@ def _clean_metadata_for_serialization(metadata: dict) -> dict:
     # Remove dp_cp_group as it's not serializable
     clean_metadata.pop('dp_cp_group', None)
     return clean_metadata
+
+
+def get_checkpoint_run_config_filename(checkpoints_path: str) -> str:
+    """Get the filename for the run configuration file within a checkpoint directory.
+
+    Args:
+        checkpoints_path: Base directory where checkpoints are stored.
+
+    Returns:
+        The full path to the run configuration file (e.g., run_config.yaml).
+    """
+    return join_paths(checkpoints_path, CONFIG_FILE)

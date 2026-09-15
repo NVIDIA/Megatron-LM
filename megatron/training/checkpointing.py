@@ -1095,15 +1095,20 @@ def save_checkpoint(
                     f'gtp_remat {gtp_remat_rank}/{gtp_remat_size_to_print}, '
                     f'p {pipeline_mp_rank}/{pp_size_to_print} ]'
                 )
+
+                # Save run_config.yaml
+                if args.ckpt_format == 'torch_dist' and iteration > 0:
+                    checkpoint_name = get_checkpoint_name(save_dir, iteration=iteration, return_base_dir=True)
+                    run_config_filename = get_checkpoint_run_config_filename(checkpoint_name)
+                    run_config = get_run_config()
+                    run_config.to_yaml(run_config_filename)
+
                 # Save tokenizer files for torch_dist checkpoints (if enabled)
                 if (
                     args.save_tokenizer_assets
                     and args.ckpt_format == 'torch_dist'
                     and iteration > 0
                 ):
-                    checkpoint_name = get_checkpoint_name(
-                        save_dir, iteration=iteration, return_base_dir=True
-                    )
                     config = _default_config_from_args(TokenizerConfig, args)
                     save_tokenizer_assets(get_tokenizer(), config, checkpoint_name)
                 if args.log_progress and args.async_save:
