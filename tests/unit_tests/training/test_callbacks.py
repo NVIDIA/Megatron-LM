@@ -12,7 +12,6 @@ from megatron.training.callbacks import (
     CallbackContext,
     CallbackManager,
     normalize_callbacks,
-    should_fire,
 )
 
 
@@ -278,6 +277,16 @@ class TestCallbackManagerFire:
         # Should not raise
         manager.fire("on_train_start")
 
+    def test_fire_skips_event_without_registered_callbacks(self):
+        """fire() skips a valid event that has no registered callbacks."""
+        manager = CallbackManager()
+        train_fn = Mock()
+        manager.register("on_train_start", train_fn)
+
+        manager.fire("on_eval_start")
+
+        train_fn.assert_not_called()
+
     def test_fire_only_fires_requested_event(self):
         """fire() only invokes callbacks for the specified event."""
         manager = CallbackManager()
@@ -539,41 +548,3 @@ class TestValidEvents:
     def test_valid_events_is_frozenset(self):
         """VALID_EVENTS is immutable (frozenset)."""
         assert isinstance(VALID_EVENTS, frozenset)
-
-
-class TestShouldFire:
-    """Tests for the should_fire helper function."""
-
-    def test_returns_false_when_manager_is_none(self):
-        """Returns False when callback_manager is None."""
-        assert should_fire(None, "on_train_start") is False
-
-    def test_returns_false_when_no_callbacks_registered(self):
-        """Returns False when manager has no callbacks for the event."""
-        manager = CallbackManager()
-        assert should_fire(manager, "on_train_start") is False
-
-    def test_returns_true_when_callbacks_registered(self):
-        """Returns True when manager has callbacks for the event."""
-        manager = CallbackManager()
-        manager.register("on_train_start", lambda ctx: None)
-        assert should_fire(manager, "on_train_start") is True
-
-    def test_returns_false_for_different_event(self):
-        """Returns False when callbacks are registered for a different event."""
-        manager = CallbackManager()
-        manager.register("on_train_end", lambda ctx: None)
-        assert should_fire(manager, "on_train_start") is False
-
-    def test_works_with_class_based_callbacks(self):
-        """Works correctly with class-based Callback instances."""
-
-        class MyCallback(Callback):
-            def on_eval_end(self, context):
-                pass
-
-        manager = CallbackManager()
-        manager.add(MyCallback())
-
-        assert should_fire(manager, "on_eval_end") is True
-        assert should_fire(manager, "on_train_start") is False

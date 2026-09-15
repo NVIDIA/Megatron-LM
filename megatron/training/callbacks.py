@@ -336,15 +336,16 @@ class CallbackManager:
         return event_name in self._active_events
 
     def fire(self, event_name: str) -> None:
-        """Execute all callbacks for an event.
+        """Execute all callbacks for an event, if any are registered.
 
         Exceptions from callbacks propagate to the caller.
 
         Args:
             event_name: Name of the event to fire.
         """
-        for fn in self._callbacks[event_name]:
-            fn(self.callback_context)
+        if self.has_callbacks(event_name):
+            for fn in self._callbacks[event_name]:
+                fn(self.callback_context)
 
 
 def normalize_callbacks(
@@ -369,18 +370,3 @@ def normalize_callbacks(
     manager = CallbackManager()
     manager.add(callbacks)
     return manager
-
-
-def should_fire(callback_manager: CallbackManager | None, event_name: str) -> bool:
-    """Check if callbacks should be fired for an event.
-
-    Combines the None check and has_callbacks check into a single call.
-
-    Args:
-        callback_manager: The callback manager instance, or None.
-        event_name: Name of the event to check.
-
-    Returns:
-        True if callback_manager exists and has callbacks for the event.
-    """
-    return callback_manager is not None and callback_manager.has_callbacks(event_name)
