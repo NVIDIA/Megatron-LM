@@ -1680,7 +1680,10 @@ class _ParamAndGradBuffer:
             if self.param_data_cpu is not None:
                 self.param_data_cpu.copy_(self.param_data, non_blocking=True)
             else:
-                self.param_data_cpu = self.param_data.cpu().pin_memory()
+                self.param_data_cpu = torch.empty_like(
+                    self.param_data, device="cpu", pin_memory=True
+                )
+                self.param_data_cpu.copy_(self.param_data, non_blocking=True)
             self.param_data.storage().resize_(0)
 
     def reload_from_cpu(self, move_params: bool = True, move_grads: bool = True):
