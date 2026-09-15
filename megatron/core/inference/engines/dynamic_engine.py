@@ -625,20 +625,27 @@ class DynamicInferenceEngine(AbstractEngine):
 
     @staticmethod
     def _tensor_nbytes(tensor: Tensor) -> int:
-        return tensor.numel() * tensor.element_size()
+        return tensor.untyped_storage().nbytes()
 
     def _vision_cache_entry_nbytes(self, entry: _VisionCacheEntry) -> int:
-        return sum(
-            self._tensor_nbytes(tensor)
-            for tensor in (
-                entry.embedding,
-                entry.imgs,
-                entry.num_tiles,
-                entry.imgs_sizes,
-                entry.num_frames,
-            )
-            if tensor is not None and tensor.is_cuda
-        )
+        total_bytes = 0
+        seen_storages = set()
+        for tensor in (
+            entry.embedding,
+            entry.imgs,
+            entry.num_tiles,
+            entry.imgs_sizes,
+            entry.num_frames,
+        ):
+            if tensor is None or not tensor.is_cuda:
+                continue
+            storage = tensor.untyped_storage()
+            storage_key = (tensor.device, storage.data_ptr())
+            if storage_key in seen_storages:
+                continue
+            seen_storages.add(storage_key)
+            total_bytes += self._tensor_nbytes(tensor)
+        return total_bytes
 
     def clear_vision_embedding_cache(self) -> None:
         """Release all projected embeddings and reusable media retained by this engine."""
@@ -729,7 +736,7 @@ class DynamicInferenceEngine(AbstractEngine):
         request.image_embeddings = embeddings
         request.image_token_mask = mask
         self._cache_vision_embedding(
-            request.block_hash_salt,
+            request.media_cache_key,
             embeddings,
             modality=modality,
             imgs=imgs,
@@ -752,11 +759,11 @@ class DynamicInferenceEngine(AbstractEngine):
             or cache_key not in self._vision_embedding_cache
         ):
             return None
-        entry = self._vision_embedding_cache.pop(cache_key)
-        self._vision_embedding_cache[cache_key] = entry
-        if modality is None or entry.modality == modality:
-            return entry
-        return None
+        entry = self._vision_embedding_cache[cache_key]
+        if modality is not None and entry.modality != modality:
+            return None
+        self._vision_embedding_cache.move_to_end(cache_key)
+        return entry
 
     def _get_cached_vision_embedding(self, cache_key: Optional[str]) -> Optional[Tensor]:
         entry = self._get_cached_vision_entry(cache_key)
@@ -2107,6 +2114,7 @@ class DynamicInferenceEngine(AbstractEngine):
             imgs_sizes=imgs_sizes,
             num_frames=num_frames,
             media_tokens_preexpanded=media_tokens_preexpanded,
+            media_cache_key=media_cache_key,
             decoder_seq_length=0,
             image_embeddings=image_embeddings,
             image_token_mask=mask_tensor,
@@ -3799,9 +3807,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 try:
                     prompt = msgpack.unpackb(message[1], raw=False)
                     media_cache_key = (
-                        media_meta.get("media_cache_key")
-                        if isinstance(media_meta, dict)
-                        else None
+                        media_meta.get("media_cache_key") if isinstance(media_meta, dict) else None
                     )
                     media_modality = (
                         media_meta.get("modality") if isinstance(media_meta, dict) else None
@@ -3811,9 +3817,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     )
                     if cached_vision_entry is None:
                         media_payload = msgpack.unpackb(message[2], raw=False)
-                        multi_modal_data = merge_multimodal_data(
-                            media_meta, media_payload
-                        )
+                        multi_modal_data = merge_multimodal_data(media_meta, media_payload)
                     else:
                         multi_modal_data = None
                     sampling_params = SamplingParams.deserialize(sampling_params)
