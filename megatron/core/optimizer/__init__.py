@@ -701,6 +701,11 @@ def _get_megatron_optimizer_based_on_param_groups(
     # TODO(M4): plumb TP groups through optimizer constructors so these setattrs disappear.
     setattr(optimizer, 'tp_group', tp_group)
     setattr(optimizer, 'expert_tp_group', expert_tp_group)
+    # The GTP axes this optimizer's params are sharded over. Taken from the collection rather
+    # than MPU because a MIMO module owns its axes through its own grid and leaves the MPU
+    # globals unset, where the duplicate filter would read rank 0 everywhere.
+    setattr(optimizer, 'gtp_group', getattr(pg_collection, 'gtp_remat', None))
+    setattr(optimizer, 'expert_gtp_group', getattr(pg_collection, 'expt_gtp_remat', None))
 
     return optimizer
 
@@ -926,6 +931,8 @@ def _get_megatron_emerging_optimizer(
             expert_tp_group = getattr(pg_collection, 'expt_tp', tp_group)
             setattr(optimizer, 'tp_group', tp_group)
             setattr(optimizer, 'expert_tp_group', expert_tp_group)
+            setattr(optimizer, 'gtp_group', getattr(pg_collection, 'gtp_remat', None))
+            setattr(optimizer, 'expert_gtp_group', getattr(pg_collection, 'expt_gtp_remat', None))
             results.append(optimizer)
             continue
         else:
