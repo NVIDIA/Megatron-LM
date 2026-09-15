@@ -981,6 +981,13 @@ class _EPChunkOperationBase:
     def _logical_chunk_count(self) -> int:
         return self.workspace.key.shape_profile.chunk_count
 
+    def _forward_streams(self, x_2d, ranges):
+        self.workspace.key.shape_profile.validate_input(x_2d)
+        if len(ranges) != self._logical_chunk_count:
+            raise RuntimeError("EP chunk overlap ranges do not match the shape profile")
+        compute_stream, comm_stream = self._streams(x_2d.device)
+        return compute_stream, comm_stream, torch.cuda.current_stream(x_2d.device)
+
     def _forward_output_async(
         self,
         x_2d: torch.Tensor,
@@ -988,12 +995,7 @@ class _EPChunkOperationBase:
         input_shape: torch.Size,
         input_dtype: torch.dtype,
     ) -> torch.Tensor:
-        self.workspace.key.shape_profile.validate_input(x_2d)
-        if len(ranges) != self._logical_chunk_count:
-            raise RuntimeError("EP chunk overlap ranges do not match the shape profile")
-
-        compute_stream, comm_stream = self._streams(x_2d.device)
-        caller_stream = torch.cuda.current_stream(x_2d.device)
+        compute_stream, comm_stream, caller_stream = self._forward_streams(x_2d, ranges)
 
         def finish_dispatch(pending):
             chunk_idx, _, _, _, _, dispatcher, state, lease = pending
@@ -1064,12 +1066,7 @@ class _EPChunkOperationBase:
         input_dtype: torch.dtype,
     ) -> tuple[torch.Tensor, _SavedForwardContext]:
         """Run the overlapped forward once and retain its graph for backward."""
-        self.workspace.key.shape_profile.validate_input(x_2d)
-        if len(ranges) != self._logical_chunk_count:
-            raise RuntimeError("EP chunk overlap ranges do not match the shape profile")
-
-        compute_stream, comm_stream = self._streams(x_2d.device)
-        caller_stream = torch.cuda.current_stream(x_2d.device)
+        compute_stream, comm_stream, caller_stream = self._forward_streams(x_2d, ranges)
         saved_chunks: list[_ForwardChunkContext | None] = [None for _ in ranges]
 
         def finish_dispatch(pending):
