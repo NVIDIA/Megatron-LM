@@ -771,7 +771,8 @@ class DynamicInferenceRequest(InferenceRequest):
             and self.prompt_tokens is not None
             and not self.precomputed_block_hashes
         ):
-            self._compute_block_hashes()
+            with torch.cuda.nvtx.range("megatron.multimodal.prefix_block_hashes"):
+                self._compute_block_hashes()
 
     def _compute_block_hashes(self) -> None:
         """Compute hashes for all complete blocks in the prompt.
