@@ -1,6 +1,6 @@
 ENV_VARS:
   CUDA_DEVICE_MAX_CONNECTIONS: 1
-  NVTE_ALLOW_NONDETERMINISTIC_ALGO: 1
+  NVTE_ALLOW_NONDETERMINISTIC_ALGO: 0
   NCCL_ALGO: Ring
   CUBLAS_WORKSPACE_CONFIG: :4096:8
 MODEL_ARGS:
@@ -48,6 +48,7 @@ MODEL_ARGS:
   --position-embedding-type: rope
   --transformer-impl: transformer_engine
   --bf16: true
+  --deterministic-mode: true
   --use-distributed-optimizer: true
   --no-gradient-accumulation-fusion: true
   --untie-embeddings-and-output-weights: true
