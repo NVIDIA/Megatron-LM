@@ -475,9 +475,6 @@ class MTPControllerMixin:
         else:
             last_accepted_hidden = None
 
-        # MTP KV cache (v1): seed the draft KV from the prompt for any request prefilling this
-        # step (roll-by-one), before the decode draft loop reads/extends it. Uses the gathered
-        # decoder hidden states above; runs only on the last PP stage where they exist.
         if base_position is None:
             # Legacy scheduling derives positions from post-rewind CPU state.
             # After rewind, request_kv_length_offsets has been adjusted. Read from
@@ -493,10 +490,11 @@ class MTPControllerMixin:
             # Cast to int64 to match CUDA graph capture dtype expectations.
             base_position = (adjusted_offsets + processed_tokens).to(torch.int64)
 
-        # MTP KV cache (v1): before the draft loop, refresh every committed position's draft KV
-        # from the MAIN model hidden states (a per-step "first pass"), so committed KV never
-        # carries a stale chained-draft-hidden value (which would decay acceptance with depth).
-        # Covers prefill prompts (seed) and decode accepted drafts (refresh) in one forward.
+        # Before the draft loop, refresh every committed position's draft KV from the MAIN model
+        # hidden states, so committed KV never carries a stale chained-draft-hidden value (which
+        # would decay acceptance with depth). One forward covers both prefill prompts (seeded
+        # roll-by-one from the prompt) and decode accepted drafts (refreshed). Runs only on the
+        # last PP stage, where the gathered decoder hidden states exist.
         if getattr(context, "enable_mtp_kv_cache", False) and has_mtp:
             issued_slot = self._mtp_commit_pass(
                 context,
@@ -553,7 +551,7 @@ class MTPControllerMixin:
         if context._nvls_dispatcher:
             NVLSAllGatherVDispatcher.modify_real_token_count_for_mtp(active_request_count)
 
-        # MTP KV cache (v1): give the draft attention its own KV in the shared buffer's reserved
+        # Give the draft attention its own KV in the shared buffer's reserved
         # slot. Each depth is a decode-style forward (one token per active request). The depth-0
         # write position is base_position - 1 (roll-by-one): the MTP entry for main position
         # base_position-1 is computed from H_{base_position-1} + emb(base token). Deriving it from
