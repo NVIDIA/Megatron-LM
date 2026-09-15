@@ -23,10 +23,14 @@ This repository contains two components: **Megatron-LM** and **Megatron Core**.
 
 ## Getting Started
 
-**Install from PyPI:**
+**Install from PyPI** (requires Python 3.10+):
 
 ```bash
+# Using uv (https://github.com/astral-sh/uv)
 uv pip install megatron-core
+
+# Or using standard pip
+pip install megatron-core
 ```
 
 **Or clone and install from source:**
@@ -34,7 +38,7 @@ uv pip install megatron-core
 ```bash
 git clone https://github.com/NVIDIA/Megatron-LM.git
 cd Megatron-LM
-uv pip install -e .
+uv pip install -e .  # or: pip install -e .
 ```
 
 > **Note:** Building from source can use a lot of memory. If the build runs out of memory, limit parallel compilation jobs by setting `MAX_JOBS` (for example, `MAX_JOBS=4 uv pip install -e .`).
@@ -43,7 +47,6 @@ For NVIDIA GPU Cloud (NGC) container setup and all installation options, review 
 
 - **[Your First Training Run](https://docs.nvidia.com/megatron-core/developer-guide/latest/get-started/quickstart.html)** - End-to-end training examples with data preparation
 - **[Parallelism Strategies](https://docs.nvidia.com/megatron-core/developer-guide/latest/user-guide/parallelism-guide.html)** - Scale training across GPUs with TP, PP, DP, EP, and CP
-- **[Contribution Guide](https://docs.nvidia.com/megatron-core/developer-guide/latest/developer/contribute.html)** - How to contribute to Megatron Core
 
 # Latest News
 
@@ -77,10 +80,10 @@ Megatron-LM/
 │   │   ├── optimizer/           # Optimizers
 │   │   ├── datasets/            # Dataset loaders
 │   │   ├── inference/           # Inference engines and server
-│   │   └── export/              # Model export (example: TensorRT-LLM)
+│   │   └── export/              # Model export (for example, TensorRT-LLM)
 │   ├── training/                # Training scripts
 │   ├── legacy/                  # Legacy components
-│   ├── post_training/           # Post-training (quantization, distillation, pruning, etc.)
+│   ├── post_training/           # Post-training (quantization, distillation, pruning, and more)
 │   └── rl/                      # Reinforcement learning (including RLHF)
 ├── examples/                    # Ready-to-use training examples
 ├── tools/                       # Utility tools
