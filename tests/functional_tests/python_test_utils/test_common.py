@@ -199,6 +199,16 @@ class TestPipelineDeterministic:
         with pytest.raises(AssertionError, match="loss"):
             run({"loss": golden}, {"loss": actual}, {"loss": [DeterministicTest()]})
 
+    def test_full_precision_golden_with_short_spelling_detects_one_ulp_mismatch(self):
+        # The explicit FULL marker, not the decimal spelling of the value, selects the
+        # bit-exact comparison: 0.5 vs the next float32 (0.5 + 2**-24) must fail even
+        # though both round to the same five decimals.
+        golden = make_metric({1: 0.5}, value_precision=ValuePrecision.FULL)
+        actual = make_metric({1: 0.5 + 2**-24}, value_precision=ValuePrecision.FULL)
+
+        with pytest.raises(AssertionError, match="loss"):
+            run({"loss": golden}, {"loss": actual}, {"loss": [DeterministicTest()]})
+
     def test_skipped_in_compare_approximate_mode(self):
         # Deterministic checks must be silently skipped when
         # compare_approximate_results=True, even if values differ wildly.
