@@ -87,7 +87,7 @@ def test_block_atomic_layout_keeps_bf16_blocks_on_one_rank(distributed_setup):
     block_atomic = DBuffer.distribute_tensors(tensors, mesh, [BlockAtomic(2)], block_size=2)
 
     assert block_atomic.layout.block_size == 2
-    assert all(block_atomic.get_local_tensor(index).shape[0] % 2 == 0 for index in range(2))
+    assert all(block_atomic.get_tensor_view(index).shape[0] % 2 == 0 for index in range(2))
 
 
 def test_compute_layout_fills_lcm_padding_gaps(distributed_setup):
