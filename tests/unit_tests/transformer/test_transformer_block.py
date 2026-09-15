@@ -861,6 +861,7 @@ class TestPipelineParallelLayoutTransformerBlock:
                 pre_process=pre_process,
                 post_process=post_process,
                 vp_stage=i,
+                pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
             )
             this_model.model_type = ModelType.encoder_or_decoder
             gpt_model.append(this_model)

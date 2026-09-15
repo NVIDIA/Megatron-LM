@@ -42,6 +42,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.models.hybrid.hybrid_block import HybridStack, HybridStackSubmodules
 from megatron.core.models.hybrid.hybrid_model import HybridModel
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.mappings import scatter_to_sequence_parallel_region
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
@@ -127,6 +128,7 @@ class TestMTPCudaGraphInference:
             pre_process=True,
             post_process=True,
             mtp_block_spec=mtp_block_spec,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         ).cuda()
         for param in model.parameters():
             param.data = param.data.to(config.params_dtype)
@@ -885,6 +887,7 @@ class TestMTPCudaGraphExpertParallel:
             pre_process=True,
             post_process=True,
             mtp_block_spec=mtp_block_spec,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         ).cuda()
         for param in model.parameters():
             param.data = param.data.to(config.params_dtype)
@@ -1207,6 +1210,7 @@ class TestMTPBlockScopeCudaGraph:
                 pre_process=True,
                 post_process=True,
                 position_embedding_type='rope',
+                pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
             ).cuda()
         elif model_type == 'hybrid':
             hybrid_stack_spec = _build_hybrid_stack_spec()
@@ -1220,6 +1224,7 @@ class TestMTPBlockScopeCudaGraph:
                 post_process=True,
                 hybrid_layer_pattern="****/*",
                 position_embedding_type='rope',
+                pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
             ).cuda()
         else:
             raise ValueError(f"Unknown model_type: {model_type!r}")

@@ -6,6 +6,7 @@ from megatron.core.enums import Fp8Recipe
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.models.gpt import GPTModel
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_block_spec
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.quantization.quant_config import MatchContext, RecipeConfig
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
@@ -81,6 +82,7 @@ class TestGPTModelKitchenQuantizationConfig:
             transformer_layer_spec=transformer_layer_spec,
             vocab_size=padded_vocab_size,
             max_sequence_length=max_position_embeddings,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
 
         expected_types = {
@@ -186,6 +188,7 @@ class TestGPTModelKitchenQuantizationConfig:
             transformer_layer_spec=transformer_layer_spec,
             vocab_size=padded_vocab_size,
             max_sequence_length=max_position_embeddings,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
 
         expected_types = {
@@ -304,6 +307,7 @@ class TestGPTModelKitchenQuantizationConfig:
             transformer_layer_spec=transformer_layer_spec,
             vocab_size=padded_vocab_size,
             max_sequence_length=max_position_embeddings,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
 
         expected_types = {
@@ -421,6 +425,7 @@ class TestGPTModelKitchenQuantizationConfig:
             transformer_layer_spec=transformer_layer_spec,
             vocab_size=padded_vocab_size,
             max_sequence_length=max_position_embeddings,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
 
         expected_types = {
@@ -535,6 +540,7 @@ class TestGPTModelKitchenQuantizationConfig:
             transformer_layer_spec=transformer_layer_spec,
             vocab_size=padded_vocab_size,
             max_sequence_length=max_position_embeddings,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
 
         expected_types = {
@@ -628,6 +634,7 @@ class TestGPTModelTEQuantizationConfig:
             transformer_layer_spec=transformer_layer_spec,
             vocab_size=padded_vocab_size,
             max_sequence_length=max_position_embeddings,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
 
         expected_types = {
