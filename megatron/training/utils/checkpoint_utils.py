@@ -1,14 +1,14 @@
 # Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 
 import logging
-import torch
-import yaml
 from pathlib import Path
 from typing import Any
 
+import torch
+import yaml
+
 from megatron.core.msc_utils import MultiStorageClientFeature
 from megatron.training.config.utils import sanitize_dataclass_config
-
 
 CONFIG_FILE = "run_config.yaml"
 _RUNTIME_ONLY_TARGETS = frozenset({"megatron.core.timers.Timers"})
