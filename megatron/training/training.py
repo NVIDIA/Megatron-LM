@@ -156,7 +156,7 @@ from megatron.training.initialize import (
 from megatron.training.utils import is_gtp_remat_active, is_hybrid_model
 
 # Local.
-from . import ft_integration, one_logger_utils
+from . import ft_integration, one_logger_utils, persistent_cache
 from .activation_logging import (
     disable_activation_logging,
     disable_tokens_per_expert_logging,
@@ -1621,6 +1621,11 @@ def pretrain(
 
     args = get_args()
     timers = get_timers()
+
+    # Persistent first-iteration cache: validate that the bash bootstrap populated
+    # the env, and register the atexit final writeback. No-op unless a persistent
+    # cache read/write dir is configured.
+    persistent_cache.init(args)
 
     # OTel span setup (_start_otel_job_spans) is deferred until after
     # set_jit_fusion_options() below, where program_start/main_entry/pretrain_entry
