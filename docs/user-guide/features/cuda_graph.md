@@ -194,6 +194,12 @@ support. The existing pipeline-parallel and MTP placement requirements still
 apply. Nonzero dropout requires the graph-safe RNG implementation used by the
 selected backend; it is not subject to a blanket mHC dropout restriction.
 
+When combined with PP/VPP support, full-iteration dropout can expose a native
+allocator capture error in NGC PyTorch 26.08 (`4fdf77b940`). Lazy RNG state
+initialization can query device-wide allocator events while another stream is
+capturing. This configuration requires a PyTorch allocator capture-safety fix;
+the MCore graph support does not repair that dependency error.
+
 The full-iteration loader returns a fresh batch dictionary for each consumer
 while retaining the captured tensor storage. This allows pipeline stages to
 discard unused batch fields without corrupting subsequent refills. Batched P2P
