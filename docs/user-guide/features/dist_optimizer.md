@@ -21,6 +21,11 @@ Theoretical memory savings depend on the data types of the model parameters (`pa
 
 This distributed optimizer uses contiguous buffers for parameters and main gradients. Model gradients copy into the main gradients as soon as they finish computing.
 
+Models may retain selected parameters in `fp32` alongside `fp16` or `bf16` weights,
+as mHC does. Optimizer checkpoint lookups follow the main-parameter group order
+(native `fp32` shards, then low-precision master shards), independently of the
+order of the parameter and gradient buffers.
+
 The following figures show the sharding scheme and the main steps of the parameter update.
 
 ## Data Flow
