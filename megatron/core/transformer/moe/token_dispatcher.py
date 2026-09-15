@@ -44,6 +44,7 @@ from megatron.core.transformer.moe.moe_utils import (
     permute,
     sort_chunks_by_idxs,
     unpermute,
+    warn_if_tokens_per_expert_unaligned,
 )
 from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -661,6 +662,12 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         self.tokens_per_expert = self._maybe_dtoh_and_synchronize(
             "before_permutation_1", self.tokens_per_expert
         )
+        if self.config.moe_router_padding_for_quantization and not self.drop_and_pad:
+            # The padding above can run out of zero entries to flip, which leaves an expert
+            # unaligned. `tokens_per_expert` is already on the host here, so the check costs
+            # no extra synchronization. With drop_and_pad the counts come from the capacity
+            # instead, so there is nothing to check here.
+            warn_if_tokens_per_expert_unaligned(self.tokens_per_expert, pad_multiple)
         self.hidden_shape_before_permute = hidden_states.shape
         (
             permutated_local_input_tokens,
