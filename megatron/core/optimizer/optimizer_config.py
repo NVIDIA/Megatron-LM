@@ -369,6 +369,12 @@ class OptimizerConfig:
     pin_cpu_params: bool = True
     """If True, pin the optimizer parameters to CPU memory."""
 
+    rl_offload_optimizer_during_inference: bool = False
+    """When True, the distributed optimizer allocates its master weights and optimizer state
+    inside a torch_memory_saver region, so RL offload/restore during inference pauses/resumes
+    their physical pages in place instead of doing a .cpu()/.cuda() round trip. This is faster and
+    keeps optimizer tensors out of the CUDA-graph memory pool. Requires torch_memory_saver."""
+
     ################
     # Miscellaneous
     ################
@@ -398,6 +404,16 @@ class OptimizerConfig:
 
     def __post_init__(self):
         """Check the validity of the config."""
+
+        if self.rl_offload_optimizer_during_inference:
+            assert (
+                self.use_distributed_optimizer
+            ), 'rl_offload_optimizer_during_inference only supported with distributed optimizer'
+            if self.optimizer_cpu_offload:
+                raise ValueError(
+                    "rl_offload_optimizer_during_inference is incompatible with "
+                    "optimizer_cpu_offload."
+                )
 
         # The following condition is used to avoid repetition in distrib_optimizer.py.
         # This is because in distrib_optimizer.py, the process to handle parameters are
