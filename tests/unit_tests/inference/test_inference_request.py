@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import warnings
+from unittest import mock
 
 import msgpack
 import numpy as np
@@ -15,8 +16,10 @@ from megatron.core.inference.inference_request import (
     InferenceRequest,
     Status,
     compute_block_hashes_batched,
+    compute_media_cache_key,
     deserialize_ndarray,
     deserialize_tensor,
+    prepare_multimodal_data,
     resolve_multimodal_data_for_engine,
     serialize_multimodal_data,
     serialize_ndarray,
@@ -71,6 +74,7 @@ def test_preexpanded_multimodal_request_round_trip():
 
     resolved = resolve_multimodal_data_for_engine(wire)
     assert resolved["media_tokens_preexpanded"] is True
+    assert resolved["media_cache_key"] == wire["media_cache_key"]
     assert torch.equal(resolved["imgs"], media["image"]["imgs"])
     assert torch.equal(resolved["imgs_sizes"], media["image"]["imgs_sizes"])
 
@@ -117,6 +121,19 @@ def test_multimodal_serialization_generates_stable_content_keys():
     assert tensor_a["media_cache_key"] == tensor_b["media_cache_key"]
     # Shape participates in identity even when the flattened bytes are equal.
     assert tensor_a["media_cache_key"] != tensor_c["media_cache_key"]
+
+
+def test_prepared_multimodal_data_reuses_computed_content_key():
+    with mock.patch(
+        "megatron.core.inference.inference_request.compute_media_cache_key",
+        wraps=compute_media_cache_key,
+    ) as compute_key:
+        prepared = prepare_multimodal_data({"image": [b"same-image"]})
+        first = serialize_multimodal_data(prepared)
+        second = serialize_multimodal_data(prepared)
+
+    assert first is second
+    assert compute_key.call_count == 1
 
 
 def test_multimodal_serialization_rejects_user_media_cache_key():

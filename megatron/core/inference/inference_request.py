@@ -118,6 +118,19 @@ def compute_media_cache_key(modality: str, modality_data: Any) -> str:
     raise TypeError(f"Cannot compute a media cache key for {type(modality_data).__name__}.")
 
 
+@dataclass(frozen=True)
+class PreparedMultimodalData:
+    """Multimodal wire data whose content identity has already been computed."""
+
+    serialized: Dict[str, Any]
+
+
+def prepare_multimodal_data(multi_modal_data: Any) -> Optional[PreparedMultimodalData]:
+    """Serialize and hash media once for reuse across equivalent submissions."""
+    serialized = serialize_multimodal_data(multi_modal_data)
+    return PreparedMultimodalData(serialized) if serialized is not None else None
+
+
 def serialize_multimodal_data(multi_modal_data: Any) -> Optional[Dict[str, Any]]:
     """Serialize one request's vLLM-style multimodal dictionary.
 
@@ -137,6 +150,8 @@ def serialize_multimodal_data(multi_modal_data: Any) -> Optional[Dict[str, Any]]
     """
     if multi_modal_data is None:
         return None
+    if isinstance(multi_modal_data, PreparedMultimodalData):
+        return multi_modal_data.serialized
     if not isinstance(multi_modal_data, dict):
         raise TypeError(f"multi_modal_data must be a dict or None, got {type(multi_modal_data)}.")
 
@@ -296,6 +311,11 @@ def resolve_multimodal_data_for_engine(
             f"got {type(media_tokens_preexpanded)}."
         )
     metadata = {"media_tokens_preexpanded": True} if media_tokens_preexpanded else {}
+    media_cache_key = multi_modal_data.get("media_cache_key")
+    if media_cache_key is not None:
+        if not isinstance(media_cache_key, str) or not media_cache_key:
+            raise ValueError("Internal media_cache_key must be a non-empty string.")
+        metadata["media_cache_key"] = media_cache_key
     if isinstance(modality_data, list):
         from megatron.core.inference.text_generation_server.dynamic_text_gen_server import (
             image_preprocessing,

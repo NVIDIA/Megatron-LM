@@ -140,7 +140,7 @@ def _build_mock_vlm_engine(image_embeddings):
     return engine, wrapper
 
 
-def _call_build_vlm_request(engine, tokens, *, media_tokens_preexpanded):
+def _call_build_vlm_request(engine, tokens, *, media_tokens_preexpanded, media_cache_key=None):
     with mock.patch.object(torch.cuda, "current_device", return_value=torch.device("cpu")):
         return engine._build_vlm_request(
             request_id=1,
@@ -152,6 +152,7 @@ def _call_build_vlm_request(engine, tokens, *, media_tokens_preexpanded):
             num_img_embeddings_per_tile=0,
             imgs_sizes=torch.tensor([[2, 2]]),
             media_tokens_preexpanded=media_tokens_preexpanded,
+            media_cache_key=media_cache_key,
         )
 
 
@@ -285,6 +286,30 @@ def test_build_vlm_request_enables_media_salted_prefix_caching():
     assert request.block_hash_salt == media_cache_key
     assert request.precomputed_block_hashes == compute_block_hashes_batched(
         request.prompt_tokens, block_size=2, cache_salt=media_cache_key
+    )
+
+
+def test_build_vlm_request_reuses_client_media_cache_key():
+    engine, wrapper = _build_mock_vlm_engine(torch.ones(2, 4))
+    engine.context.enable_prefix_caching = True
+    engine.context.block_size_tokens = 2
+    wrapper.expand_image_tokens.return_value = ([[10, -1, -1, 20]], [[None, 0, 1, None]])
+
+    with mock.patch(
+        "megatron.core.inference.engines.dynamic_engine.compute_media_cache_key"
+    ) as compute_key:
+        request = _call_build_vlm_request(
+            engine,
+            torch.tensor([10, 42, 20], dtype=torch.int64),
+            media_tokens_preexpanded=False,
+            media_cache_key="client-media-key",
+        )
+
+    compute_key.assert_not_called()
+    engine._get_cached_vision_embedding.assert_called_once_with("client-media-key")
+    assert request.block_hash_salt == "client-media-key"
+    assert request.precomputed_block_hashes == compute_block_hashes_batched(
+        request.prompt_tokens, block_size=2, cache_salt="client-media-key"
     )
 
 
