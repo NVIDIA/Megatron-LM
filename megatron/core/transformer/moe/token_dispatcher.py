@@ -1564,14 +1564,19 @@ class _NCCLEPManager(_DispatchManager):
         else:
             # Static shapes feed the experts the full receive buffer, so the grouped GEMM must
             # consume the ragged per-expert counts on device and never read the slack tail:
-            # moe_grouped_gemm selects the grouped experts and use_transformer_engine_op_fuser
-            # fuses FC1+act+FC2 over them (fp8/fp4 via the CuTe DSL fused grouped MLP, bf16 via
-            # the op-fuser GroupedLinear grouped-tensor path).
-            if not (config.use_transformer_engine_op_fuser and config.moe_grouped_gemm):
+            # moe_grouped_gemm selects the grouped experts, while either TE op-fuser option
+            # provides a grouped-tensor path over device-side expert counts.
+            if not (
+                (
+                    config.use_transformer_engine_op_fuser
+                    or config.moe_use_transformer_engine_fused_moe
+                )
+                and config.moe_grouped_gemm
+            ):
                 raise ValueError(
                     "moe_expert_rank_capacity_factor with the 'ncclep' backend requires BOTH "
-                    "use_transformer_engine_op_fuser and moe_grouped_gemm (the fused grouped GEMM "
-                    "over device-side per-expert counts); unset it to use eager mode instead."
+                    "an enabled TE MoE op-fuser path and moe_grouped_gemm (the grouped GEMM over "
+                    "device-side per-expert counts); unset it to use eager mode instead."
                 )
             if config.fp8 or config.fp4:
                 if torch.cuda.get_device_capability()[0] < 10:
@@ -1591,10 +1596,9 @@ class _NCCLEPManager(_DispatchManager):
         self.dispatch_fwd_quant_recipe = get_fp8_recipe_for_a2a(config.moe_dispatch_fwd_dtype)
         self.combine_bwd_quant_recipe = get_fp8_recipe_for_a2a(config.moe_combine_bwd_dtype)
 
-        # Fresh EpBuffer per dispatch, held until the matching combine consumes it. dispatch
-        # and combine share one buffer: handle_mem is the routing table that dispatch writes
-        # and combine reads. Safe because dispatch i / combine i strictly alternate.
+        # Per-forward routing state for the split NCCL-EP dispatch/combine path.
         self._buffer = None
+        self._fused_moe_ep_config = None
         self._bootstrapped: bool = False
         self._max_tokens_per_rank: Optional[int] = None
 
@@ -1741,6 +1745,35 @@ class _NCCLEPManager(_DispatchManager):
         # bf16 gets a fresh per-call pool buffer (not shared), so no copy is needed.
         self.dispatched_probs = dispatched_probs.clone() if self._zc_quant else dispatched_probs
         return recv_tokens
+
+    def prepare_fused_moe_sequential(self):
+        """Prepare the static EP configuration and routing inputs for FusedMoeEp."""
+        self._ensure_bootstrap()
+        if self.token_indices is None or self.token_probs is None or self.num_local_tokens is None:
+            raise RuntimeError(
+                "NCCL-EP routing metadata must be initialized before the fused MoE Sequential."
+            )
+        if self._fused_moe_ep_config is None:
+            from transformer_engine.pytorch import ep as te_ep
+
+            ep_group = te_ep.get_ep_group()
+            if ep_group is None:
+                raise RuntimeError(
+                    "NCCL-EP bootstrap did not establish a Transformer Engine EP group."
+                )
+            self._fused_moe_ep_config = te_ep.EpConfig(
+                top_k=self.router_topk,
+                max_tokens_per_rank=self._max_tokens_per_rank,
+                recv_capacity_per_rank=self._recv_capacity,
+                hidden_dim=self.hidden_dim,
+                num_local_experts=self.num_local_experts,
+                ep_group=ep_group,
+                alignment=self.alignment,
+                payload_dtype=torch.bfloat16,
+                zero_copy=self.zero_copy,
+                drop_on_overflow=te_ep.get_ep_drop_on_overflow(),
+            )
+        return self._fused_moe_ep_config, self.token_indices, self.token_probs.float()
 
     def grow_recv_capacity(self, new_capacity: int) -> None:
         """Raise the static receive budget to ``new_capacity``, the peak a dropped step needed.
@@ -1889,6 +1922,12 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
             None if self.config.overlap_moe_expert_parallel_comm else _detached("_zc_bwd_token_buf")
         )
         return _detached("_zc_fwd_token_buf"), dispatch_grad_input
+
+    def prepare_fused_moe_sequential(self):
+        """Return the EP configuration and top-k tensors for a full TE MoE sequence."""
+        if not isinstance(self._comm_manager, _NCCLEPManager):
+            raise RuntimeError("The full TE MoE Sequential requires the NCCL-EP flex backend.")
+        return self._comm_manager.prepare_fused_moe_sequential()
 
     def _initialize_metadata(self, routing_map: torch.Tensor, probs: torch.Tensor) -> torch.Tensor:
         """

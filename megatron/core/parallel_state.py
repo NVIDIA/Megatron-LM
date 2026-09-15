@@ -2504,6 +2504,16 @@ def get_all_ranks():
 
 def destroy_model_parallel():
     """Set the groups to none."""
+    # MegaMoE owns an NVSHMEM runtime backed by the expert process group. Release it before
+    # tearing down either Transformer Engine's EP context or the process groups.
+    try:
+        from transformer_engine.pytorch.ops.fused.moe_ep import finalize_moe_ep_resources
+
+        finalize_moe_ep_resources()
+    except ImportError:
+        # Compatibility with Transformer Engine versions without MegaMoE resource finalization.
+        pass
+
     # Release the NCCL EP context (if the 'ncclep' flex dispatcher bootstrapped one) before the
     # process group's communicator is torn down. TE registers an atexit ep_finalize that would
     # otherwise run after dist.destroy_process_group() and hit a "corrupted comm object" at exit.
