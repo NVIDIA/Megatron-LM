@@ -261,6 +261,7 @@ class MegatronMultimodalTokenizer:
         special_tokens: List[str],
         image_tag_type: str,
         force_system_message: bool = False,
+        use_gigatoken: bool = False,
         keep_history_thinking: bool = False,
         **kwargs,
     ):
@@ -273,6 +274,8 @@ class MegatronMultimodalTokenizer:
             prompt_format (str): Prompt format for the tokenizer.
             special_tokens (List[str]): Non-text tokens.
             image_tag_type (str): Image tag to apply, if any. For example <img><image></img>.
+            use_gigatoken (bool): Use GigaToken for encoding, retaining HF chat templates.
+            keep_history_thinking (bool): Preserve thinking traces in conversation history.
         """
         if not HAVE_TRANSFORMERS:
             raise ImportError(
@@ -437,6 +440,15 @@ class MegatronMultimodalTokenizer:
         self._keep_history_thinking = keep_history_thinking
         self._image_token_index = DEFAULT_IMAGE_TOKEN_INDEX
 
+        self.use_gigatoken = use_gigatoken
+        # Keep Hugging Face for templates, offsets, and vocabulary metadata; only
+        # the encoding backend changes. Multimodal sentinels are spliced afterward.
+        self._hf_tokenizer = self._tokenizer
+        if self.use_gigatoken:
+            from megatron.core.tokenizers.utils import init_gigatoken_from_hf
+
+            self.tokenizer = init_gigatoken_from_hf(self._hf_tokenizer, path)
+
     def _validate_nemotron6_moe_tokenizer_contract(self) -> None:
         """Fail if the tokenizer no longer matches the masking token IDs."""
         for token_ids, expected_text in _NEMOTRON6_MOE_TOKENIZER_CONTRACT.items():
@@ -502,7 +514,7 @@ class MegatronMultimodalTokenizer:
         tokens: List[int] = []
         for i, segment in enumerate(segments):
             if segment:
-                tokens.extend(self._tokenizer.encode(segment, add_special_tokens=False))
+                tokens.extend(self.tokenizer.encode(segment, add_special_tokens=False))
             if i < len(replacements):
                 tokens.extend(replacements[i])
         return tokens
@@ -522,7 +534,7 @@ class MegatronMultimodalTokenizer:
     def _apply_chat_template_to_text(
         self, conversation: List[Dict[str, Any]], add_generation_prompt: bool, **kwargs
     ) -> str:
-        rendered = self._tokenizer.apply_chat_template(
+        rendered = self._hf_tokenizer.apply_chat_template(
             conversation,
             tokenize=False,
             add_generation_prompt=add_generation_prompt,
@@ -614,6 +626,10 @@ class MegatronMultimodalTokenizer:
         a requested boundary falls inside a token. In that case callers must use
         the cumulative-prefix path to preserve legacy behavior.
         """
+        # GigaToken need not provide HF offset mappings. Use the prefix path so
+        # raw conversations still encode with the selected backend.
+        if self.use_gigatoken:
+            return None
         try:
             encoding = self._tokenizer(text, add_special_tokens=False, return_offsets_mapping=True)
         except (NotImplementedError, TypeError, ValueError):
@@ -731,7 +747,9 @@ class MegatronMultimodalTokenizer:
 
         return tokens, target
 
-    def tokenize(self, text: Union[str, List[Dict]], **kwargs):
+    def tokenize(
+        self, text: Union[str, List[Dict]], add_special_tokens: bool = True, **kwargs
+    ) -> List[int]:
         """Tokenize conversation or string input."""
         if isinstance(text, list):
             # This code path is used by the inference code currently.
@@ -739,7 +757,7 @@ class MegatronMultimodalTokenizer:
                 text, return_target=False, add_generation_prompt=True, **kwargs
             ).tolist()
 
-        return list(self._tokenizer.encode(text))
+        return list(self.tokenizer.encode(text, add_special_tokens=add_special_tokens))
 
     def tokenize_conversation(
         self,

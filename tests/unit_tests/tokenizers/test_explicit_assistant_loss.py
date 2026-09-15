@@ -23,6 +23,7 @@ class MockNemotron6Tokenizer:
         "\ue005": 11,
         "\ue006": 3263,
         "\ue007": 4000,
+        "\ue008": 16,
     }
     _id_to_special = {value: key for key, value in _special_to_id.items()}
     _text_offset = 20000
@@ -93,6 +94,8 @@ class MockNemotron6Tokenizer:
                 rendered.append(header + content + end)
             elif role == "user":
                 rendered.append("\ue001\ue006\ue004" + content + "\ue005\ue004")
+            elif role == "tool":
+                rendered.append("\ue001\ue006\ue004\ue008" + content + "\ue005\ue004")
             else:
                 rendered.append("\ue001\ue007\ue004" + content + "\ue005\ue004")
         if add_generation_prompt:
@@ -104,6 +107,7 @@ def _tokenizer(
     monkeypatch,
     *,
     keep_history_thinking: bool = True,
+    use_gigatoken: bool = False,
     drop_last_assistant_header: bool = False,
     drop_last_assistant_end: bool = False,
 ) -> MegatronMultimodalTokenizer:
@@ -125,6 +129,7 @@ def _tokenizer(
         special_tokens=[],
         image_tag_type="",
         keep_history_thinking=keep_history_thinking,
+        use_gigatoken=use_gigatoken,
     )
 
 
@@ -147,6 +152,60 @@ def _text_token(character: str) -> int:
 def _target_span_count(target: np.ndarray) -> int:
     trainable = target != IGNORE_INDEX
     return int(trainable[0]) + int(np.sum(trainable[1:] & ~trainable[:-1]))
+
+
+@pytest.mark.parametrize("structured_image", [False, True])
+@pytest.mark.parametrize(
+    "conversation_options",
+    [
+        {},
+        {"assistant_turn_loss": [False, True, True]},
+        {"train_only_on_last_assistant_turn": True, "tool_response_as_turn_boundary": True},
+        {"skip_chat_template": True},
+    ],
+    ids=["default", "explicit-loss", "tool-boundary", "raw"],
+)
+def test_gigatoken_backend_preserves_multimodal_loss(
+    monkeypatch, structured_image, conversation_options
+) -> None:
+    """Check backend routing independently of the optional GigaToken installation."""
+    encode_calls = []
+
+    def init_backend(hf_tokenizer, path):
+        assert path == "unused"
+
+        def encode(text, add_special_tokens=True):
+            encode_calls.append((text, add_special_tokens))
+            return hf_tokenizer.encode(text, add_special_tokens=add_special_tokens)
+
+        # Deliberately no template or offset API: those remain HF responsibilities.
+        return SimpleNamespace(encode=encode)
+
+    monkeypatch.setattr("megatron.core.tokenizers.utils.init_gigatoken_from_hf", init_backend)
+    default = _tokenizer(monkeypatch)
+    accelerated = _tokenizer(monkeypatch, use_gigatoken=True)
+    assert accelerated.tokenizer is not accelerated._hf_tokenizer
+    conversation = _conversation()
+    if structured_image:
+        conversation[1]["content"] = [{"type": "text", "text": "U"}, {"type": "image"}]
+
+    expected_tokens, expected_target = default.tokenize_conversation(
+        conversation, True, False, **conversation_options
+    )
+    tokens, target = accelerated.tokenize_conversation(
+        conversation, True, False, **conversation_options
+    )
+    np.testing.assert_array_equal(tokens, expected_tokens)
+    np.testing.assert_array_equal(target, expected_target)
+    assert encode_calls, "The selected encoding backend was bypassed"
+    assert all(not add_special_tokens for _, add_special_tokens in encode_calls)
+    assert all(accelerated._MM_MARKER not in text for text, _ in encode_calls)
+    if structured_image:
+        assert np.count_nonzero(tokens == accelerated.image_token_index) == 1
+
+    encode_calls.clear()
+    assert accelerated.tokenize("plain", add_special_tokens=False) == default.tokenize("plain")
+    assert encode_calls == [("plain", False)]
 
 
 def test_explicit_assistant_loss_selects_multiple_turns(monkeypatch) -> None:
