@@ -105,7 +105,7 @@ def main(
                 f'export OUTPUT_PATH={output_path}/runs/$(python3 -c "import uuid; print(uuid.uuid4())")\n'
             )
             fh.write(workload.spec["script"].format(**magic_values))
-            fh.write("\n\necho This test wrote results into $OUTPUT_PATH\n")
+            fh.write("\n\nEXIT_CODE=$?\necho This test wrote results into $OUTPUT_PATH\nexit $EXIT_CODE\n")
 
 
 if __name__ == "__main__":
