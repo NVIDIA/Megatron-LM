@@ -99,6 +99,7 @@ class TestParallelAttention:
 
         attention_mask = torch.ones((micro_batch_size, 1, 1, sequence_length), dtype=bool).cuda()
 
+        self.parallel_attention.eval()
         output, bias = self.parallel_attention(hidden_states, attention_mask)
 
         assert config.recompute_granularity is None
