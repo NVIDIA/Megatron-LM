@@ -87,7 +87,10 @@ def read_run_config(run_config_filename: str) -> dict[str, Any]:
                 sys.stderr.write(error_msg + "\n")
                 config_obj[0] = {"error": True, "msg": error_msg}
 
-        print_rank_0(f"Broadcasting config from rank 0 to all {get_world_size_safe()} ranks")
+        print_rank_0(
+            f"Broadcasting config from rank 0 to all {get_world_size_safe()} ranks",
+            rank=get_rank_safe(),
+        )
         torch.distributed.broadcast_object_list(config_obj, src=0)
 
         if isinstance(config_obj[0], dict) and config_obj[0].get("error", False):
