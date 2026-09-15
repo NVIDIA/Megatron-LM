@@ -1930,8 +1930,12 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     all_pad_tensors = {}
                     for i in range(-1, len(bucket_state)):
                         if i == len(bucket_state) - 1:
-                            # Potential padding at the end
-                            next_param_start = gbuf_local_numel
+                            # Include intra-bucket padding, but exclude the tail
+                            # used only to divide the buffer across DP ranks.
+                            next_param_start = min(
+                                gbuf_local_numel,
+                                gbuf_world_numel_unpadded - data_parallel_rank * gbuf_local_numel,
+                            )
                         else:
                             next_param_start = bucket_state[i + 1]['gbuf_local_start']
                         if i == -1:
