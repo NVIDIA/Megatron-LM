@@ -48,8 +48,14 @@ class _Chunk:
 def _Cfg(layer_sharded: bool) -> OptimizerConfig:
     """A real OptimizerConfig, so the reflective ``_kwargs_from_config`` lookups
     exercise the actual field surface instead of a stub that makes every
-    ``hasattr`` fail (which would shrink the test to the hardcoded keys only)."""
-    return OptimizerConfig(muon_tp_mode='layer_sharded' if layer_sharded else 'duplicated')
+    ``hasattr`` fail (which would shrink the test to the hardcoded keys only).
+    A valid muon config: ``__post_init__`` enforces the layer_sharded requirements."""
+    return OptimizerConfig(
+        optimizer='muon',
+        use_layer_wise_distributed_optimizer=True,
+        muon_split_qkv=False,
+        muon_tp_mode='layer_sharded' if layer_sharded else 'duplicated',
+    )
 
 
 def test_shared_muon_kwargs_ignore_layer_sharding_flag():
