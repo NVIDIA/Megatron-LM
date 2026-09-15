@@ -903,42 +903,9 @@ def validate_args(args, defaults={}):
         )
 
     if args.freeze_base_model_for_mtp:
-        assert args.mtp_num_layers, (
-            "--freeze-base-model-for-mtp requires --mtp-num-layers to be set."
-        )
         assert not args.freeze_all_layers, (
             "--freeze-base-model-for-mtp cannot be combined with --freeze-all-layers."
         )
-
-    if args.mtp_hsm and not (args.mtp_num_layers and args.mtp_num_layers >= 2):
-        warn_rank_0(
-            "--mtp-hsm needs at least two MTP layers to mix anything, but "
-            f"--mtp-num-layers is {args.mtp_num_layers}. Disabling Hidden State Mixing.",
-            args.rank,
-        )
-        args.mtp_hsm = False
-
-    # Validate MTP args for hybrid vs non-hybrid models
-    if args.hybrid_layer_pattern is not None:
-        # Mamba/hybrid model MTP validation
-        if args.mtp_num_layers and not (args.hybrid_layer_pattern and sep in args.hybrid_layer_pattern):
-            # Hybrid model wants MTP but no unified pattern - check for legacy args
-            if args.mtp_hybrid_override_pattern is None:
-                warn_rank_0(
-                    "Hybrid model with --mtp-num-layers but no MTP pattern. "
-                    "Use unified --hybrid-layer-pattern with '/' separator (e.g., 'M*M*/MM/MM') "
-                    "or legacy --mtp-hybrid-override-pattern for old checkpoints.",
-                    args.rank
-                )
-    else:
-        # Non-hybrid (GPT) model MTP validation
-        if args.mtp_hybrid_override_pattern is not None:
-            warn_rank_0(
-                "--mtp-hybrid-override-pattern is for Mamba/hybrid models only. "
-                "For GPT models, MTP replicates the main transformer layer structure. "
-                "This argument will be ignored.",
-                args.rank
-            )
 
     # Infer use of MLA from unified pattern
     if args.hybrid_layer_pattern and (
