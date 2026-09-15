@@ -24,22 +24,7 @@ zero-size all_to_all splits).
 
 import torch
 
-
-def _group_rank_and_size(group: "torch.distributed.ProcessGroup | None") -> tuple[int, int]:
-    """(rank, size) of ``group``, honouring the module convention that ``None``
-    means "no group / size 1" — NOT torch's "the default group"."""
-    if group is None:
-        return 0, 1
-    return group.rank(), group.size()
-
-
-def _cat_or_empty(parts: list[torch.Tensor], ref: torch.Tensor) -> torch.Tensor:
-    """Concatenate ``parts`` into one flat send buffer, or an empty buffer
-    matching ``ref``'s dtype/device when this rank has nothing to send (all of
-    its all_to_all input splits are zero)."""
-    if parts:
-        return torch.cat(parts)
-    return torch.empty(0, dtype=ref.dtype, device=ref.device)
+from megatron.core.utils import cat_or_empty, get_pg_rank, get_pg_size
 
 
 def params_by_home(num_params: int, home_of: dict, size: int) -> list[list[int]]:
@@ -99,7 +84,7 @@ def route_to_ns_home(
         # Nothing to exchange; avoid sending an empty buffer into the collective.
         return [], []
 
-    rank, size = _group_rank_and_size(group)
+    rank, size = get_pg_rank(group), get_pg_size(group)
     if size <= 1:
         # Trivial group: every param is homed locally and the shard IS the
         # complete matrix. Also keeps a None group away from
@@ -143,7 +128,7 @@ def route_to_ns_home(
         if send_idx[r]
     ]
 
-    send_buf = _cat_or_empty(send_parts, momentum_list[0])
+    send_buf = cat_or_empty(send_parts, momentum_list[0])
 
     recv_buf = torch.empty(my_param_numel * size, dtype=send_buf.dtype, device=send_buf.device)
 
@@ -214,7 +199,7 @@ def route_from_ns_home(
     if not momentum_list:
         return []
 
-    rank, size = _group_rank_and_size(group)
+    rank, size = get_pg_rank(group), get_pg_size(group)
     if size <= 1:
         update_shards: list["torch.Tensor | None"] = [None] * len(momentum_list)
         for ns_r, idx in zip(ns_results, my_param_indices):
@@ -270,7 +255,7 @@ def route_from_ns_home(
                 )
             )
 
-    send_buf = _cat_or_empty(send_parts, momentum_list[0])
+    send_buf = cat_or_empty(send_parts, momentum_list[0])
 
     recv_buf = torch.empty(sum(output_split_sizes), dtype=send_buf.dtype, device=send_buf.device)
 

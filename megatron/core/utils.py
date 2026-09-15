@@ -661,6 +661,25 @@ def get_pg_rank(group=None):
     return group.rank()
 
 
+def cat_or_empty(parts: List[torch.Tensor], ref: torch.Tensor) -> torch.Tensor:
+    """Concatenate ``parts`` into one flat tensor, or return an empty tensor matching
+    ``ref``'s dtype and device when there is nothing to concatenate.
+
+    Typical use: the send buffer of an all_to_all whose input splits are all zero on
+    this rank, where ``torch.cat`` of an empty list would raise.
+
+    Args:
+        parts: Tensors to concatenate along dim 0 (may be empty).
+        ref: Tensor whose dtype and device the empty result should match.
+
+    Returns:
+        torch.Tensor: The concatenation, or an empty 1-D tensor.
+    """
+    if parts:
+        return torch.cat(parts)
+    return torch.empty(0, dtype=ref.dtype, device=ref.device)
+
+
 def get_pg_src_rank(group=None):
     """Calculate the global rank corresponding to the first local rank
     in the given process group.
