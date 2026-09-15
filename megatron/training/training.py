@@ -40,9 +40,10 @@ logging.basicConfig(handlers=[CustomHandler()], level=logging.INFO)
 # measurement (kept for backwards compatibility).
 _LEGACY_TRAIN_START_TIME = time.time()  # NOTE(asolergi-nv): Legacy timestamp
 
+from megatron.core import mpu, nccl_allocator, tensor_parallel
+
 # First-party.
 from megatron.core._rank_utils import safe_get_rank
-from megatron.core import mpu, nccl_allocator, tensor_parallel
 from megatron.core.datasets.data_schedule import HybridCPDataLoaderWrapper, wrap_data_iterator
 from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core.distributed import (
@@ -56,6 +57,11 @@ from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
     FullyShardedDataParallelV2,
 )
 from megatron.core.enums import ModelType
+
+try:
+    from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import fully_shard_context
+except ImportError:
+    fully_shard_context = None
 from megatron.core.fp8_utils import correct_amax_history_if_needed
 from megatron.core.full_cuda_graph import FullCudaGraphWrapper, get_shared_capture_stream
 from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
@@ -312,10 +318,10 @@ def set_startup_timestamps(
 
 # OTel: module-level helpers imported once at startup.
 try:
-    from nemo.lens.state import is_span_group_enabled as _otel_sg_enabled
     from nemo.lens.helpers import managed_span as _otel_managed_span
     from nemo.lens.helpers import safe_set_span_attributes as _otel_safe_set_attrs
     from nemo.lens.helpers import trace_fn as _otel_trace_fn
+    from nemo.lens.state import is_span_group_enabled as _otel_sg_enabled
 except ImportError:
     from megatron.core.telemetry.fallbacks import is_span_group_enabled as _otel_sg_enabled
     from megatron.core.telemetry.fallbacks import managed_span as _otel_managed_span
@@ -429,9 +435,10 @@ def _start_otel_job_spans(model_type, program_start):
     if not _otel_sg_enabled('job'):
         return
 
-    from opentelemetry import context as _otel_ctx, trace as _otel_trace
-    from opentelemetry.context import Context as _OtelContext
     from nemo.lens.helpers import safe_set_span_attributes as _otel_set_attrs
+    from opentelemetry import context as _otel_ctx
+    from opentelemetry import trace as _otel_trace
+    from opentelemetry.context import Context as _OtelContext
 
     _otel_ctx_module = _otel_ctx
     _otel_tracer = get_telemetry().tracer
@@ -585,7 +592,8 @@ def _reroot_otel_interval():
     global _otel_interval_span, _otel_interval_ctx_token
     if get_telemetry() is None or not _otel_sg_enabled('job'):
         return
-    from opentelemetry import context as _octx, trace as _otr
+    from opentelemetry import context as _octx
+    from opentelemetry import trace as _otr
     from opentelemetry.context import Context
     from opentelemetry.trace import Link
     prev = _otel_interval_span
@@ -2343,25 +2351,52 @@ def wrap_model_chunks_with_ddp(
                 )
 
     # Wrap each chunk.
+    # MFSDP v2 chunks each open their own ``fully_shard_context`` scope via
+    # ``reuse_existing=True``. When a single call wraps multiple VPP chunks, open one
+    # ambient context around the whole loop so every chunk joins the SAME FSDP context,
+    # which is then finalized once here. Without this, each chunk would materialize its own
+    # streams and prefetch orders and the chunks would not share one context across VPP
+    # stages.
+    share_fsdp_context = (
+        fully_shard_context is not None
+        and (DP is FullyShardedDataParallel or DP is FullyShardedDataParallelV2)
+        and ddp_config.megatron_fsdp_version == 2
+        and n > 1
+    )
+    shared_context = (
+        fully_shard_context(reuse_existing=True, use_symmetric_memory=ddp_config.nccl_ub)
+        if share_fsdp_context
+        else nullcontext()
+    )
+    # MFSDP v2 rejects ``disable_bucketing=True`` (see
+    # FullyShardedDataParallelV2._validate_config) and does not use the classic per-chunk
+    # disabling that the DDP/distributed-optimizer path relies on to size only the first
+    # chunk's parameter layout. Each VPP chunk is sharded independently over its own
+    # FsdpModule, so bucketing must stay enabled for every chunk; otherwise a multi-chunk
+    # (VPP) wrap sets ``disable_bucketing=True`` on non-first chunks and fails validation.
+    is_mfsdp_v2 = (
+        DP is FullyShardedDataParallel or DP is FullyShardedDataParallelV2
+    ) and ddp_config.megatron_fsdp_version == 2
     wrapped = []
-    for chunk, layout, disable_bucketing in zip(
-        model_chunks, per_chunk_layouts, disable_bucketing_per_chunk
-    ):
-        chunk_kwargs = {}
-        # TorchFSDP takes process_group, not pg_collection.
-        if pg_collection is not None and not (HAVE_FSDP2 and DP is torch_FSDP):
-            chunk_kwargs["pg_collection"] = pg_collection
-        if layout is not None:
-            chunk_kwargs["full_param_layout"] = layout
-        wrapped.append(
-            DP(
-                config=config,
-                ddp_config=ddp_config,
-                module=chunk,
-                disable_bucketing=disable_bucketing,
-                **chunk_kwargs,
+    with shared_context:
+        for chunk, layout, disable_bucketing in zip(
+            model_chunks, per_chunk_layouts, disable_bucketing_per_chunk
+        ):
+            chunk_kwargs = {}
+            # TorchFSDP takes process_group, not pg_collection.
+            if pg_collection is not None and not (HAVE_FSDP2 and DP is torch_FSDP):
+                chunk_kwargs["pg_collection"] = pg_collection
+            if layout is not None:
+                chunk_kwargs["full_param_layout"] = layout
+            wrapped.append(
+                DP(
+                    config=config,
+                    ddp_config=ddp_config,
+                    module=chunk,
+                    disable_bucketing=False if is_mfsdp_v2 else disable_bucketing,
+                    **chunk_kwargs,
+                )
             )
-        )
     return wrapped
 
 
@@ -2593,14 +2628,20 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             for disable in per_chunk_disable_bucketing
         ]
 
+        current_stream = torch.cuda.current_stream()
         if config.cuda_graph_impl == "full_iteration":
             # DDP initialization must use the full-iteration capture stream so its retained
             # AccumulateGrad nodes do not reference a different, non-capturing stream.
             ddp_stream = get_shared_capture_stream()
+        elif config.cuda_graph_impl == "none":
+            # Eager initialization is serialized with the current stream. A one-shot side stream
+            # can leave cached blocks unavailable to later allocations on the current stream.
+            ddp_stream = current_stream
         else:
             # Preserve a dedicated initialization stream for all other implementations.
             ddp_stream = torch.cuda.Stream()
-        ddp_stream.wait_stream(torch.cuda.current_stream())
+        if ddp_stream is not current_stream:
+            ddp_stream.wait_stream(current_stream)
 
         with torch.cuda.stream(ddp_stream):
             model = wrap_model_chunks_with_ddp(
@@ -2618,8 +2659,9 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
                 bucket_sizes=per_chunk_bucket_sizes,
                 disable_bucketing_per_chunk=per_chunk_disable_bucketing,
             )
-        # Ensure initialization-stream work completes before touching params on the default stream.
-        torch.cuda.current_stream().wait_stream(ddp_stream)
+        # Ensure side-stream initialization completes before touching params on the current stream.
+        if ddp_stream is not current_stream:
+            current_stream.wait_stream(ddp_stream)
 
         # Broadcast params from data parallel src rank to other data parallel ranks.
         if args.data_parallel_random_init:
@@ -3103,7 +3145,8 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     # OTel: set up per-step sub-span support.
     _otel_step_tracer = None
     if _otel_sg_enabled('forward_backward') or _otel_sg_enabled('optimizer'):
-        from nemo.lens.helpers import span_cm, safe_set_span_attributes as _otel_set_attrs
+        from nemo.lens.helpers import safe_set_span_attributes as _otel_set_attrs
+        from nemo.lens.helpers import span_cm
         _otel_step_tracer = get_telemetry().tracer
 
     rerun_state_machine = get_rerun_state_machine()
@@ -3973,7 +4016,8 @@ def save_checkpoint_and_time(
     _exposed_save_span = None
     _exposed_save_token = None
     if _otel_sg_enabled('checkpoint'):
-        from opentelemetry import context as _octx, trace as _otr
+        from opentelemetry import context as _octx
+        from opentelemetry import trace as _otr
         _exposed_save_span = get_telemetry().tracer.start_span('megatron.checkpoint.exposed_save')
         _otel_mark_goodput(_exposed_save_span)
         _exposed_save_span.set_attribute('megatron.iteration', iteration)
@@ -5019,7 +5063,8 @@ def train(
         _report_span = None
         _report_token = None
         if _otel_sg_enabled('step'):
-            from opentelemetry import context as _octx, trace as _otr
+            from opentelemetry import context as _octx
+            from opentelemetry import trace as _otr
             _report_span = get_telemetry().tracer.start_span('megatron.train.iteration_report')
             _otel_mark_goodput(_report_span)
             _report_token = _octx.attach(_otr.set_span_in_context(_report_span))

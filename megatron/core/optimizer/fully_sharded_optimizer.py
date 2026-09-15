@@ -51,6 +51,12 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
     MFSDP-specific storage operations explicit.
     """
 
+    # ChainedOptimizer's combined gradient-statistics path requires every DTensor
+    # to use the same device mesh. MFSDP needs the per-optimizer implementation
+    # below so dense and expert parameters on different meshes are counted
+    # correctly, even when their final reduction process group is the same.
+    requires_individual_grad_stats = True
+
     @override
     def __init__(
         self,
@@ -88,8 +94,11 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
     @staticmethod
     def _validate_config(config: OptimizerConfig, model_chunks: List[MegatronModule]) -> None:
         """Validate the MFSDP v2 optimizer support contract."""
-        if len(model_chunks) != 1:
-            raise ValueError("MFSDP v2 currently supports exactly one model chunk.")
+        # Multiple model chunks are allowed: VPP shares a single FsdpContext across
+        # chunks, and FullyShardedOptimizer optimizes every chunk's parameters
+        # together (self.model_chunks is iterated in zero_grad / get_parameters).
+        if not model_chunks:
+            raise ValueError("MFSDP v2 requires at least one model chunk.")
         if config.use_distributed_optimizer:
             raise ValueError("MFSDP v2 currently requires use_distributed_optimizer=False.")
         if config.loss_scale is not None:

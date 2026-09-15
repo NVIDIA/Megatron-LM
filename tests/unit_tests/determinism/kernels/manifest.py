@@ -577,13 +577,27 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "megatron/core/fp8_utils.py",
             "megatron/core/fp4_utils.py",
             "megatron/core/distributed/fsdp/src/megatron_fsdp/mixed_precision.py",
+            # MFSDP v2's experimental fp8 parameter group is the second Megatron-FSDP dispatch
+            # site of the same TE master-weight cast: it quantizes each main-weight shard with
+            # per-shard start offsets. Grouped with the sibling mixed_precision.py above rather
+            # than given its own entry, so one external kernel keeps one registry entry (the
+            # same convention as inference_mxfp8_quantization / te_thd_partitioned_indices).
+            "megatron/core/distributed/fsdp/src/megatron_fsdp/experimental/parameter_group.py",
         ),
-        tests=(C + "test_fp8_determinism.py", K + "test_optimizer_kernels.py"),
+        tests=(
+            C + "test_fp8_determinism.py",
+            K + "test_optimizer_kernels.py",
+            # Module-level coverage for the MFSDP v2 call site: trains the same MXFP8 GPT-MoE
+            # through Fp8ParameterGroup and the v1 fp8 param-gather reference (Blackwell only).
+            "tests/unit_tests/distributed/mfsdp_v2/test_mxfp8_v1_parity.py",
+        ),
         kind="dispatch",
         notes="TE cast_master_weights_to_fp8 / cast_to_fp8 (covered at model level by "
         "test_fp8_determinism.py), NVFP4 quantize_master_weights (needs TE>=2.7 + Blackwell, "
         "uncovered) and the apex multi_tensor_scale used by Megatron-FSDP mixed precision "
-        "(kernel replayed in test_optimizer_kernels.py).",
+        "(kernel replayed in test_optimizer_kernels.py). The MFSDP v2 experimental fp8 "
+        "parameter group calls cast_master_weights_to_fp8 on the sharded main weights and is "
+        "exercised end to end by test_mxfp8_v1_parity.py.",
     ),
     KernelEntry(
         name="inference_mxfp8_quantization",
