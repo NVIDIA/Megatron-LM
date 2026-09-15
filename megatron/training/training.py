@@ -3426,9 +3426,10 @@ def training_log(
     seqlen_squared_sum_in_batch: float | None = None,
     total_real_tokens_in_batch: float | None = None,
     model=None,
-    callback_manager: CallbackManager = CallbackManager(),
+    callback_manager: CallbackManager | None = None,
 ):
     """Log training information such as losses, timing, ...."""
+    callback_manager = normalize_callbacks(callback_manager)
     args = get_args()
     timers = get_timers()
     writer = get_tensorboard_writer()
@@ -4344,7 +4345,7 @@ def train(
     inference_model=None,
     p2p_communicator: Optional[P2PCommunicator] = None,
     pg_collection: Optional[ProcessGroupCollection | MultiModuleProcessGroupCollection] = None,
-    callback_manager: CallbackManager = CallbackManager(),
+    callback_manager: CallbackManager | None = None,
 ):
     """Training function: run train_step desired number of times, run validation, checkpoint.
 
@@ -4353,6 +4354,7 @@ def train(
     pg_collection: optional carrier forwarded to the schedule for the cross-grid case; None
         preserves the default behavior.
     """
+    callback_manager = normalize_callbacks(callback_manager)
     args = get_args()
     timers = get_timers()
 
@@ -5305,10 +5307,11 @@ def evaluate(
     eval_iters=None,
     pg_collection=None,
     p2p_communicator=None,
-    callback_manager: CallbackManager = CallbackManager(),
+    callback_manager: CallbackManager | None = None,
     is_test: bool = False,
 ):
     """Evaluation."""
+    callback_manager = normalize_callbacks(callback_manager)
     args = get_args()
     timers = get_timers()
 
@@ -5531,10 +5534,11 @@ def evaluate_and_print_results(
     non_loss_data_func=None,
     pg_collection=None,
     p2p_communicator=None,
-    callback_manager: CallbackManager = CallbackManager(),
+    callback_manager: CallbackManager | None = None,
     is_test: bool = False,
 ):
     """Helper function to evaluate and dump results on screen."""
+    callback_manager = normalize_callbacks(callback_manager)
     args = get_args()
     if write_to_tensorboard:
         writer = get_tensorboard_writer()
