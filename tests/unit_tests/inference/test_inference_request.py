@@ -41,11 +41,20 @@ def _make_dynamic_request(**kwargs):
 
 def test_serialization_helpers_round_trip():
     """serialize_tensor / serialize_ndarray pair with their deserialize inverses;
-    unwrap_serialized_tensors replaces ('tensor', list) sentinels in place and
+    unwrap_serialized_tensors replaces ('tensor', payload) sentinels in place and
     leaves other wrappers untouched. The wrapper protocol is the contract every
     higher-level serialize() call depends on."""
-    t = torch.tensor([4, 5, 6, 7])
-    assert deserialize_tensor(serialize_tensor(t)).tolist() == [4, 5, 6, 7]
+    t = torch.tensor([[4, 5], [6, 7]], dtype=torch.bfloat16)
+    serialized = serialize_tensor(t)
+    restored = deserialize_tensor(msgpack.unpackb(msgpack.packb(serialized), raw=False))
+    assert set(serialized) == {"dtype", "shape", "data"}
+    assert isinstance(serialized["data"], bytes)
+    assert restored.dtype == t.dtype
+    assert restored.shape == t.shape
+    assert torch.equal(restored, t)
+
+    # Requests serialized by older clients remain readable.
+    assert deserialize_tensor([4, 5, 6, 7]).tolist() == [4, 5, 6, 7]
 
     arr = np.array([[1.5, 2.5], [3.5, 4.5]], dtype=np.float64)
     arr_out = deserialize_ndarray(serialize_ndarray(arr))
@@ -178,7 +187,7 @@ def test_inference_parameters_alias_warns_and_copies():
 
 def test_inference_request_serialize_round_trip_through_msgpack():
     """The full serialize → msgpack → deserialize cycle: tensor fields are
-    wrapped as ('tensor', list), msgpack converts the tuple to a list, and
+    wrapped as ('tensor', payload), msgpack converts the tuple to a list, and
     _post_deserialize reconstructs the tensor. Same for ndarray fields on
     DynamicInferenceRequest. status=None must pass through. This is the only
     serialization contract callers actually depend on; the wrapper details

@@ -15,6 +15,8 @@ import uuid
 import warnings
 from functools import partial
 
+import torch
+
 _MEDIA_FETCH_TIMEOUT_S = 5.0
 _MAX_IMAGE_BYTES = 20 * 1024 * 1024  # 20 MiB
 _MAX_VIDEO_BYTES = 256 * 1024 * 1024  # 256 MiB
@@ -1045,7 +1047,8 @@ try:
         # multiple independently sampled choices. Each request still carries
         # its own media payload, while coordinator affinity keeps equivalent
         # requests on the engine that owns the cached vision embedding.
-        prepared_multimodal_data = prepare_multimodal_data(multi_modal_data)
+        with torch.cuda.nvtx.range("megatron.multimodal.http_prepare_multimodal_data"):
+            prepared_multimodal_data = prepare_multimodal_data(multi_modal_data)
         stream_requested = bool(req.get("stream", False))
         if stream_requested:
             # Streaming currently supports only Hugging Face fast tokenizers.
@@ -1057,12 +1060,13 @@ try:
             except ValueError as error:
                 return Response(str(error), status=400)
 
-            streams = [
-                client.add_request_streaming(
-                    prompt_tokens, sampling_params, multi_modal_data=prepared_multimodal_data
-                )
-                for _ in range(n)
-            ]
+            with torch.cuda.nvtx.range("megatron.multimodal.http_stream_submission_batch"):
+                streams = [
+                    client.add_request_streaming(
+                        prompt_tokens, sampling_params, multi_modal_data=prepared_multimodal_data
+                    )
+                    for _ in range(n)
+                ]
             chat_parsers = None
             if parsers:
                 marker_prefixes = (
@@ -1125,12 +1129,13 @@ try:
         request_ids = []
         tasks = []
         try:
-            for _ in range(n):
-                request_id, future = client.add_request_with_id(
-                    prompt_tokens, sampling_params, multi_modal_data=prepared_multimodal_data
-                )
-                request_ids.append(request_id)
-                tasks.append(future)
+            with torch.cuda.nvtx.range("megatron.multimodal.http_request_submission_batch"):
+                for _ in range(n):
+                    request_id, future = client.add_request_with_id(
+                        prompt_tokens, sampling_params, multi_modal_data=prepared_multimodal_data
+                    )
+                    request_ids.append(request_id)
+                    tasks.append(future)
         except Exception as e:
             abort_requests(client, request_ids, f"submission failed: {e}")
             logger.error(f"Error submitting request: {e}")
