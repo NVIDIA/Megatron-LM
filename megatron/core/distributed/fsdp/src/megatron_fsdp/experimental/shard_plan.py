@@ -3,14 +3,20 @@
 """
 Pure shard-planning and owner-compute packing logic for MFSDP v2's all-`Flat` layout.
 
-The central data structure is `ParameterLayout`, which describes how a single ≥2D parameter is split
-across the DP group under MFSDP v2's all-`Flat` layout (trailing dims are flattened into the row
-size, as per Muon's orthogonalization theory). `ParameterLayout.from_group` builds `{tensor_index:
-layout}` for eligible parameters in an `FsdpParameterGroup`, keyed by each parameter's index within
-the group. `assign_owner_work` balances owner-compute work across owner ranks using a
-caller-supplied cost function. `OwnerGatherPlan.pack`/`OwnerScatterPlan.pack` build the flat P2P
-send/recv buffers, `OwnerGatherPlan.reconstruct_full` stitches gathered shards back into the full
-tensor on the owner, and `OwnerScatterPlan.unpack` extracts received result shards.
+- `ParameterLayout` describes how a single ≥2D parameter is split across the DP group under
+  MFSDP v2's all-`Flat` layout (trailing dims are flattened into the row size, as per Muon's
+  orthogonalization theory).
+- `ParameterLayout.from_group` builds `{tensor_index: layout}` for eligible parameters in an
+  `FsdpParameterGroup`, keyed by each parameter's index within the group.
+- `assign_owner_work` balances owner-compute work across owner ranks using a caller-supplied cost
+  function.
+- `GroupOwnerLayout.from_group` builds a data structure capturing the per-group owner layout upon
+  this.
+- `OwnerGatherPlan.pack`/`OwnerScatterPlan.pack` take the `GroupOwnerLayout` plus this rank's data
+  and build the flat P2P send/recv buffers,
+- `OwnerGatherPlan.reconstruct_full` stitches gathered shards back into the full tensor on the
+  owner, and
+- `OwnerScatterPlan.unpack` extracts received result shards.
 """
 
 import dataclasses
@@ -215,6 +221,55 @@ def assign_owner_work(
     return assignments
 
 
+@dataclasses.dataclass(frozen=True)
+class GroupOwnerLayout:
+    """Owner layout for one `FsdpParameterGroup`: its params and their owner ranks.
+
+    The layouts and assignments are step-independent in the general case, so the owner layout may be
+    cached across optimizer steps.
+
+    The `tensor_index` used here refers to the parameter's/tensor's index in the
+    `FsdpParameterGroup`.
+
+    Attributes:
+        group: The FSDP parameter group the layouts and owners refer to.
+        layouts: `{tensor_index: layout}` for the participating parameters.
+        owners: `{tensor_index: owner_rank}` with an entry for every participating parameter. Ranks
+            are indices into the group's mesh.
+    """
+
+    group: FsdpParameterGroup
+    layouts: dict[int, ParameterLayout]
+    owners: dict[int, int]
+
+    @classmethod
+    def from_group(
+        cls,
+        group: FsdpParameterGroup,
+        *,
+        cost_fn: Callable[[ParameterLayout], float],
+        eligible_fn: Callable[[torch.Tensor], bool] | None = None,
+    ) -> Self:
+        """Build the owner layout for one group.
+
+        Args:
+            group: The FSDP parameter group whose DBuffer layout describes the parameter placements.
+            cost_fn: Cost estimate per parameter layout used to balance owner assignments across
+                ranks. See also `assign_owner_work`.
+            eligible_fn: Predicate selecting which parameters participate in owner-compute
+                orthogonalization. When `None`, defaults to matching ≥2D tensors. See also
+                `ParameterLayout.from_group`.
+        """
+        layouts = ParameterLayout.from_group(group, eligible_fn=eligible_fn)
+        owners = assign_owner_work(layouts, cost_fn)
+        return cls(group=group, layouts=layouts, owners=owners)
+
+    @property
+    def mesh(self) -> DeviceMesh:
+        """Device mesh of the group."""
+        return self.group.mesh
+
+
 @dataclasses.dataclass
 class OwnerGatherPlan:
     """Metadata and send buffers for the owner-gather P2P step of a set of parameters.
@@ -235,7 +290,7 @@ class OwnerGatherPlan:
     param_1: torch.Tensor
     # Params are in this order as observed by MFSDP.
     model.param_groups == [{"params": [param_0, param_1]}]
-    # Both params are owned by rank 1 (was previously determined using `ParameterLayout`s).
+    # Both params are owned by rank 1 (was previously determined using `GroupOwnerLayout`).
     param_0.owner == 1
     param_1.owner == 1
 
@@ -295,27 +350,19 @@ class OwnerGatherPlan:
     recv_offsets: dict[tuple[int, int], int]
 
     @classmethod
-    def pack(
-        cls,
-        layouts: dict[int, ParameterLayout],
-        owners: dict[int, int],
-        local_shards: dict[int, torch.Tensor],
-        mesh: DeviceMesh,
-    ) -> Self:
+    def pack(cls, plan: GroupOwnerLayout, local_shards: dict[int, torch.Tensor]) -> Self:
         """Pack this rank's local shards into per-owner P2P send buffers.
 
         Args:
-            layouts: Parameter layouts keyed by each parameter's tensor index in its
-                `FsdpParameterGroup`.
-            owners: Mapping from tensor index to owner rank, with an entry for every parameter in
-                `layouts` (as returned by `assign_owner_work`).
+            plan: The group's owner layout.
             local_shards: This rank's local shard per parameter, only required for every parameter
                 it holds rows of.
-            mesh: Device mesh of the DP group all parameters share. The DP group size and this
-                rank's index within the group are derived from the mesh.
         """
+        mesh = plan.mesh
         dp_size = mesh.size()
         this_rank = mesh.get_local_rank()
+        layouts = plan.layouts
+        owners = plan.owners
         send_sizes: dict[int, int] = {}
         recv_sizes: dict[int, int] = {}
         for tensor_index, layout in layouts.items():
@@ -439,26 +486,18 @@ class OwnerScatterPlan:
     recv_offsets: dict[tuple[int, int], int]
 
     @classmethod
-    def pack(
-        cls,
-        layouts: dict[int, ParameterLayout],
-        owners: dict[int, int],
-        full_results: dict[int, torch.Tensor],
-        mesh: DeviceMesh,
-    ) -> Self:
+    def pack(cls, plan: GroupOwnerLayout, full_results: dict[int, torch.Tensor]) -> Self:
         """Pack this owner rank's full results into per-destination P2P send buffers.
 
         Args:
-            layouts: Parameter layouts keyed by each parameter's/tensor's index in its
-                `FsdpParameterGroup`.
-            owners: Mapping from tensor index to owner rank, with an entry for every parameter in
-                `layouts` (as returned by `assign_owner_work`).
+            plan: The group's owner layout.
             full_results: Full result tensor per parameter this rank owns.
-            mesh: Device mesh of the DP group all parameters share. The DP group size and this
-                rank's index within the group are derived from the mesh.
         """
+        mesh = plan.mesh
         dp_size = mesh.size()
         this_rank = mesh.get_local_rank()
+        layouts = plan.layouts
+        owners = plan.owners
         send_sizes: dict[int, int] = {}
         recv_sizes: dict[int, int] = {}
         for tensor_index, layout in layouts.items():
