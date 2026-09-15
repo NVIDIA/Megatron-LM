@@ -30,7 +30,7 @@ from megatron.core.transformer.hyper_connection import (
     finalize_mhc_recompute_layer,
 )
 from megatron.core.transformer.module import GraphableMegatronModule, MegatronModule
-from megatron.core.transformer.spec_utils import ModuleSpec, build_module
+from megatron.core.transformer.spec_utils import ModuleSpec, build_module, get_module
 from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import (
@@ -38,6 +38,11 @@ from megatron.core.transformer.transformer_layer import (
     get_transformer_layer_offset,
 )
 from megatron.core.transformer.utils import sharded_state_dict_default
+from megatron.core.transformer.wide_residual_layer import (
+    WideResidualTransformerLayer,
+    build_wide_residual_readout,
+    expand_wide_residual_stream,
+)
 from megatron.core.typed_torch import apply_module, not_none
 from megatron.core.utils import (
     WrappedTensor,
@@ -330,6 +335,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             and config.recompute_granularity == 'selective'
             and 'mhc' in config.recompute_modules
         )
+        self.residual_stream_readout = None
         self._build_layers()
         self.num_layers_per_pipeline_rank = len(self.layers)
 
@@ -361,6 +367,23 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             else:
                 quantization_context = nullcontext()
 
+            if layer_config.wide_residual is not None:
+                if not isinstance(layer_spec, ModuleSpec):
+                    raise ValueError(
+                        "wide_residual requires every TransformerBlock layer to use an "
+                        "explicit ModuleSpec naming WideResidualTransformerLayer."
+                    )
+                layer_module = get_module(layer_spec)
+                if not (
+                    isinstance(layer_module, type)
+                    and issubclass(layer_module, WideResidualTransformerLayer)
+                ):
+                    raise ValueError(
+                        "wide_residual requires every TransformerBlock layer spec to name "
+                        "WideResidualTransformerLayer explicitly; got "
+                        f"{layer_module!r}."
+                    )
+
             with quantization_context:
                 module = build_module(
                     layer_spec,
@@ -388,6 +411,10 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         )
         if self.config.cuda_graph_impl == "local":
             annotate_first_last_layer(self.layers)
+
+        self.residual_stream_readout = (
+            build_wide_residual_readout(self.config) if self.post_process else None
+        )
 
         # @TODO: add back account_for_embedding_in_pipeline_split (see issue #293)
         # In pipeline parallelism, we want to add this LN only to the last stage of the pipeline
@@ -618,6 +645,10 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             hidden_states = HyperConnectionModule.input_expand(
                 hidden_states, self.mhc_num_residual_streams
             )  # [s, b, C] -> [s, b, n*C]
+        elif self.config.wide_residual is not None and self.pre_process:
+            hidden_states = expand_wide_residual_stream(
+                hidden_states, self.config.wide_residual.num_streams
+            )
 
         if self.config.sequence_parallel:
             rng_context = tensor_parallel.get_cuda_rng_tracker().fork()
@@ -758,6 +789,8 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             hidden_states = HyperConnectionModule.output_contract(
                 hidden_states, self.mhc_num_residual_streams
             )  # [s, b, n*C] -> [s, b, C]
+        elif self.residual_stream_readout is not None:
+            hidden_states = apply_module(self.residual_stream_readout)(cast(Tensor, hidden_states))
 
         # Final layer norm.
         if self.final_layernorm is not None:

@@ -671,6 +671,7 @@ class TestMixedProcessGroups:
                     for i, layer_spec in enumerate(self.submodules.layer_specs)
                 ]
             )
+            self.residual_stream_readout = None
 
             # Copied from TransformerBlock.build_layers
             if self.submodules.layer_norm and self.post_process and self.post_layer_norm:
