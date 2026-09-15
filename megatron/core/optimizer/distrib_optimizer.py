@@ -334,10 +334,17 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         group_index = world_param_group_map[param]
                         group_range = group_ranges[group_index]
                         group_range["params"].append(param)
-                        local_param_group_map[param] = (group_index, len(group_range["params"]) - 1)
 
-        # Squeeze zero-size group ranges.
+        # Finalize group ranges and checkpoint indices.
         for group_index, group_range in enumerate(group_ranges):
+            # Main parameter groups put native FP32 shards before FP16/BF16
+            # master shards. Checkpoint lookups must use that same ordering,
+            # even when gradient buffers encountered the low-precision dtype first.
+            main_param_order = [
+                param for param in group_range["params"] if param.dtype == torch.float32
+            ] + [param for param in group_range["params"] if param.dtype != torch.float32]
+            for group_order, param in enumerate(main_param_order):
+                local_param_group_map[param] = (group_index, group_order)
             group_range["orig_group"] = param_groups[group_index]
             group_range["orig_group_idx"] = param_groups[group_index]
 
