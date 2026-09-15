@@ -364,10 +364,11 @@ def test_torch_chunk_gdn2_replays_fwd_bwd():
     q = torch.randn(B, T, H, K, device="cuda", dtype=torch.bfloat16, requires_grad=True)
     k = torch.randn(B, T, H, K, device="cuda", dtype=torch.bfloat16, requires_grad=True)
     v = torch.randn(B, T, H, K, device="cuda", dtype=torch.bfloat16, requires_grad=True)
-    g = (-torch.rand(B, T, H, device="cuda") * 0.1).requires_grad_(True)
-    beta = torch.rand(B, T, H, device="cuda").requires_grad_(True)
+    g = (-torch.rand(B, T, H, K, device="cuda") * 0.1).requires_grad_(True)
+    b = torch.rand(B, T, H, K, device="cuda", dtype=torch.bfloat16).requires_grad_(True)
+    w = torch.rand(B, T, H, K, device="cuda", dtype=torch.bfloat16).requires_grad_(True)
 
-    def fn(q, k, v, g, beta):
+    def fn(q, k, v, g, b, w):
         # Normalise outside so the test only depends on the torch path, matching
         # test_torch_chunk_gated_delta_rule_replays_fwd_bwd above.
         o, state = torch_chunk_gdn2(
@@ -375,11 +376,12 @@ def test_torch_chunk_gdn2_replays_fwd_bwd():
             torch.nn.functional.normalize(k, dim=-1),
             v,
             g,
-            beta,
+            b,
+            w,
             chunk_size=64,
             output_final_state=True,
             use_qk_l2norm_in_kernel=False,
         )
         return o, state
 
-    assert_replays_bit_exact(fn, (q, k, v, g, beta), replays=3, what="torch_chunk_gdn2")
+    assert_replays_bit_exact(fn, (q, k, v, g, b, w), replays=3, what="torch_chunk_gdn2")
