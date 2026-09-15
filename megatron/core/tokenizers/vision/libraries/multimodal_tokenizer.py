@@ -21,6 +21,42 @@ IMAGE_TAGS = {
     "": None,  # Image tag not used.
 }
 
+_NEMOTRON6_MOE_MESSAGE_START_TOKEN_ID = 10
+_NEMOTRON6_MOE_MESSAGE_END_TOKEN_ID = 11
+_NEMOTRON6_MOE_LINE_BREAK_TOKEN_ID = 1010
+_NEMOTRON6_MOE_ASSISTANT_ROLE_TOKEN_IDS = (1503, 19464)
+
+
+def _build_nemotron6_moe_target(tokens: np.ndarray) -> np.ndarray:
+    """Mask all tokens except Nemotron 6 MoE assistant responses."""
+    target = np.full_like(tokens, IGNORE_INDEX)
+    assistant_starts = np.where(
+        (tokens[:-2] == _NEMOTRON6_MOE_MESSAGE_START_TOKEN_ID)
+        & (tokens[1:-1] == _NEMOTRON6_MOE_ASSISTANT_ROLE_TOKEN_IDS[0])
+        & (tokens[2:] == _NEMOTRON6_MOE_ASSISTANT_ROLE_TOKEN_IDS[1])
+    )[0]
+    message_ends = np.where(tokens == _NEMOTRON6_MOE_MESSAGE_END_TOKEN_ID)[0]
+
+    for message_start in assistant_starts:
+        assistant_role_start = message_start + 1
+        content_start = assistant_role_start + 3
+        if tokens[content_start - 1] != _NEMOTRON6_MOE_LINE_BREAK_TOKEN_ID:
+            raise ValueError("expected a line break after the Nemotron 6 MoE assistant role")
+
+        following_ends = message_ends[message_ends > assistant_role_start]
+        if len(following_ends) == 0:
+            raise ValueError("Nemotron 6 MoE assistant message is missing its end token")
+        message_end = following_ends[0]
+        if (
+            message_end + 1 >= len(tokens)
+            or tokens[message_end + 1] != _NEMOTRON6_MOE_LINE_BREAK_TOKEN_ID
+        ):
+            raise ValueError("expected a line break after the Nemotron 6 MoE message end")
+
+        target[content_start : message_end + 1] = tokens[content_start : message_end + 1]
+
+    return target
+
 
 # The default mistral template raises exceptions so we use a custom one.
 mistral_custom_template = """
@@ -62,6 +98,7 @@ class MegatronMultimodalTokenizer:
         special_tokens: List[str],
         image_tag_type: str,
         force_system_message: bool = False,
+        keep_history_thinking: bool = False,
         **kwargs,
     ):
         """Tokenizer with a support for non-text inputs.
@@ -73,6 +110,7 @@ class MegatronMultimodalTokenizer:
             prompt_format (str): Prompt format for the tokenizer.
             special_tokens (List[str]): Non-text tokens.
             image_tag_type (str): Image tag to apply, if any. For example <img><image></img>.
+            keep_history_thinking (bool): Keep thinking traces from earlier assistant turns.
         """
         if not HAVE_TRANSFORMERS:
             raise ImportError(
@@ -198,6 +236,7 @@ class MegatronMultimodalTokenizer:
 
         self._prompt_format = prompt_format
         self._image_tag = IMAGE_TAGS[image_tag_type]
+        self._keep_history_thinking = keep_history_thinking
 
     def _apply_image_tag(self, text: Union[str, List[Dict]]):
         """Surround <image> with image tags such as <img> and </img>."""
@@ -263,6 +302,10 @@ class MegatronMultimodalTokenizer:
         # Apply possible image tag.
         conversation = self._apply_image_tag(conversation)
 
+        chat_template_kwargs = {}
+        if self._keep_history_thinking:
+            chat_template_kwargs["truncate_history_thinking"] = False
+
         tokens = self.tokenizer.apply_chat_template(
             conversation,
             tokenize=True,
@@ -271,12 +314,16 @@ class MegatronMultimodalTokenizer:
             return_tensors="np",
             return_dict=False,
             chat_template=self._prompt_config.custom_chat_template,
+            **chat_template_kwargs,
         )[0]
 
         if not return_target:
             return tokens
 
         target = tokens.copy()
+
+        if self._prompt_format == "nemotron6-moe":
+            return tokens, _build_nemotron6_moe_target(tokens)
 
         # Mask system and user tokens in the target.
         idx = 0
