@@ -28,16 +28,13 @@ def serialize_tensor(tensor: torch.Tensor) -> Dict[str, Any]:
     Returns:
         Dictionary containing dtype, shape, and raw bytes.
     """
-    with torch.cuda.nvtx.range("megatron.multimodal.client_tensor_serialize"):
-        with torch.cuda.nvtx.range("megatron.multimodal.client_tensor_d2h"):
-            tensor_cpu = tensor.detach().contiguous().cpu()
-        with torch.cuda.nvtx.range("megatron.multimodal.client_tensor_to_bytes"):
-            tensor_bytes = tensor_cpu.reshape(-1).view(torch.uint8).numpy().tobytes()
-        return {
-            "dtype": str(tensor_cpu.dtype),
-            "shape": list(tensor_cpu.shape),
-            "data": tensor_bytes,
-        }
+    tensor_cpu = tensor.detach().contiguous().cpu()
+    tensor_bytes = tensor_cpu.reshape(-1).view(torch.uint8).numpy().tobytes()
+    return {
+        "dtype": str(tensor_cpu.dtype),
+        "shape": list(tensor_cpu.shape),
+        "data": tensor_bytes,
+    }
 
 
 def deserialize_tensor(tensor_data: Any) -> torch.Tensor:
@@ -117,11 +114,10 @@ def compute_media_cache_key(modality: str, modality_data: Any) -> str:
 
     raw_items = _normalize_raw_media_items(modality_data)
     if raw_items is not None:
-        with torch.cuda.nvtx.range("megatron.multimodal.media_hash_raw_bytes"):
-            digest.update(b"raw\0")
-            for item in raw_items:
-                digest.update(len(item).to_bytes(8, "big"))
-                digest.update(item)
+        digest.update(b"raw\0")
+        for item in raw_items:
+            digest.update(len(item).to_bytes(8, "big"))
+            digest.update(item)
         return digest.hexdigest()
 
     if isinstance(modality_data, dict):
@@ -132,18 +128,15 @@ def compute_media_cache_key(modality: str, modality_data: Any) -> str:
             digest.update(name.encode())
             digest.update(b"\0")
             if isinstance(value, torch.Tensor):
-                with torch.cuda.nvtx.range("megatron.multimodal.media_hash_tensor_d2h"):
-                    tensor = value.detach().contiguous().cpu()
-                with torch.cuda.nvtx.range("megatron.multimodal.media_hash_tensor_to_bytes"):
-                    digest.update(str(tensor.dtype).encode())
-                    digest.update(b"\0")
-                    digest.update(repr(tuple(tensor.shape)).encode())
-                    digest.update(b"\0")
-                    # Viewing a flattened tensor as uint8 works for dtypes such as
-                    # bfloat16 that NumPy cannot represent directly.
-                    tensor_bytes = tensor.reshape(-1).view(torch.uint8).numpy().tobytes()
-                with torch.cuda.nvtx.range("megatron.multimodal.media_hash_tensor_digest"):
-                    digest.update(tensor_bytes)
+                tensor = value.detach().contiguous().cpu()
+                digest.update(str(tensor.dtype).encode())
+                digest.update(b"\0")
+                digest.update(repr(tuple(tensor.shape)).encode())
+                digest.update(b"\0")
+                # Viewing a flattened tensor as uint8 works for dtypes such as
+                # bfloat16 that NumPy cannot represent directly.
+                tensor_bytes = tensor.reshape(-1).view(torch.uint8).numpy().tobytes()
+                digest.update(tensor_bytes)
             elif name == "num_img_embeddings_per_tile":
                 digest.update(str(int(value)).encode())
             else:
@@ -166,8 +159,7 @@ class PreparedMultimodalData:
 
 def prepare_multimodal_data(multi_modal_data: Any) -> Optional[PreparedMultimodalData]:
     """Serialize and hash media once for reuse across equivalent submissions."""
-    with torch.cuda.nvtx.range("megatron.multimodal.client_prepare_multimodal_data"):
-        serialized = serialize_multimodal_data(multi_modal_data)
+    serialized = serialize_multimodal_data(multi_modal_data)
     return PreparedMultimodalData(serialized) if serialized is not None else None
 
 
@@ -191,6 +183,8 @@ def serialize_multimodal_data(multi_modal_data: Any) -> Optional[Dict[str, Any]]
     if multi_modal_data is None:
         return None
     if isinstance(multi_modal_data, PreparedMultimodalData):
+        # If choices n > 1, we don't need to re-serialize. Just use the
+        # previously serialized and cached PreparedMultimodalData.
         return multi_modal_data.serialized
     if not isinstance(multi_modal_data, dict):
         raise TypeError(f"multi_modal_data must be a dict or None, got {type(multi_modal_data)}.")
@@ -223,12 +217,10 @@ def serialize_multimodal_data(multi_modal_data: Any) -> Optional[Dict[str, Any]]
     metadata = {"media_tokens_preexpanded": True} if media_tokens_preexpanded else {}
     raw_items = _normalize_raw_media_items(modality_data)
     if raw_items is not None:
-        with torch.cuda.nvtx.range("megatron.multimodal.client_media_hash"):
-            media_cache_key = compute_media_cache_key(modality, raw_items)
+        media_cache_key = compute_media_cache_key(modality, raw_items)
         return {modality: raw_items, "media_cache_key": media_cache_key, **metadata}
     elif isinstance(modality_data, dict):
-        with torch.cuda.nvtx.range("megatron.multimodal.client_media_hash"):
-            media_cache_key = compute_media_cache_key(modality, modality_data)
+        media_cache_key = compute_media_cache_key(modality, modality_data)
         wire: Dict[str, Any] = {}
         for key in _media_tensor_keys(modality):
             value = modality_data.get(key)
@@ -403,13 +395,10 @@ def resolve_multimodal_data_for_engine(
         if modality == "video"
         else ("imgs", "imgs_sizes", "num_tiles")
     )
-    with torch.cuda.nvtx.range("megatron.multimodal.media_tensor_deserialize"):
-        for key in tensor_keys:
-            if key in modality_data:
-                value = modality_data[key]
-                kwargs[key] = (
-                    value if isinstance(value, torch.Tensor) else deserialize_tensor(value)
-                )
+    for key in tensor_keys:
+        if key in modality_data:
+            value = modality_data[key]
+            kwargs[key] = value if isinstance(value, torch.Tensor) else deserialize_tensor(value)
     if "num_img_embeddings_per_tile" in modality_data:
         kwargs["num_img_embeddings_per_tile"] = int(modality_data["num_img_embeddings_per_tile"])
 
@@ -502,10 +491,8 @@ def compute_block_hashes_batched(
         return []
 
     # Single GPU->CPU transfer, get contiguous bytes
-    with torch.cuda.nvtx.range("megatron.multimodal.prefix_hash_tokens_d2h"):
-        tokens_cpu = prompt_tokens[: num_complete_blocks * block_size].to(torch.int64).cpu()
-    with torch.cuda.nvtx.range("megatron.multimodal.prefix_hash_tokens_to_bytes"):
-        tokens_bytes = tokens_cpu.numpy().tobytes()
+    tokens_cpu = prompt_tokens[: num_complete_blocks * block_size].to(torch.int64).cpu()
+    tokens_bytes = tokens_cpu.numpy().tobytes()
     block_byte_size = block_size * tokens_cpu.element_size()  # 8 bytes per int64
 
     hashes = []
@@ -516,17 +503,16 @@ def compute_block_hashes_batched(
             b"megatron-prefix-cache-salt-v1\0" + cache_salt.encode()
         ).digest()
 
-    with torch.cuda.nvtx.range("megatron.multimodal.prefix_hash_chain"):
-        for i in range(num_complete_blocks):
-            block_bytes = tokens_bytes[i * block_byte_size : (i + 1) * block_byte_size]
-            digest = hashlib.sha256(parent_digest + block_bytes).digest()
+    for i in range(num_complete_blocks):
+        block_bytes = tokens_bytes[i * block_byte_size : (i + 1) * block_byte_size]
+        digest = hashlib.sha256(parent_digest + block_bytes).digest()
 
-            # Map to positive int64 range [1, 2^63-1], avoiding sentinels -1 and 0
-            raw = int.from_bytes(digest[:8], byteorder='little', signed=False)
-            hash_val = (raw % (2**63 - 1)) + 1
+        # Map to positive int64 range [1, 2^63-1], avoiding sentinels -1 and 0
+        raw = int.from_bytes(digest[:8], byteorder='little', signed=False)
+        hash_val = (raw % (2**63 - 1)) + 1
 
-            hashes.append(hash_val)
-            parent_digest = digest  # Full 32-byte digest chains into next block
+        hashes.append(hash_val)
+        parent_digest = digest  # Full 32-byte digest chains into next block
 
     return hashes
 
@@ -819,8 +805,7 @@ class DynamicInferenceRequest(InferenceRequest):
             and self.prompt_tokens is not None
             and not self.precomputed_block_hashes
         ):
-            with torch.cuda.nvtx.range("megatron.multimodal.prefix_block_hashes"):
-                self._compute_block_hashes()
+            self._compute_block_hashes()
 
     def _compute_block_hashes(self) -> None:
         """Compute hashes for all complete blocks in the prompt.

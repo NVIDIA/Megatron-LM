@@ -1840,7 +1840,9 @@ class DynamicInferenceEngine(AbstractEngine):
             or num_frames is not None
             or media_cache_key is not None
         ):
-            with torch.cuda.nvtx.range("megatron.multimodal.build_vlm_request"):
+            nvtx_range = "megatron.inference.multimodal.build_vlm_request"
+            nvtx_range_push(nvtx_range)
+            try:
                 request = self._build_vlm_request(
                     request_id=request_id,
                     prompt_str=prompt_str,
@@ -1855,6 +1857,8 @@ class DynamicInferenceEngine(AbstractEngine):
                     media_tokens_preexpanded=media_tokens_preexpanded,
                     media_cache_key=media_cache_key,
                 )
+            finally:
+                nvtx_range_pop(nvtx_range)
             # _build_vlm_request has already registered the image embeddings
             # and token mask into the context (add_vlm_request_data). If
             # _add_request now rejects the request (oversized prompt, cache
@@ -2030,8 +2034,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 expected_embedding_count = sum(value is not None for value in mask_list[0])
 
             # Retrieve or compute the vision embedding.
-            with torch.cuda.nvtx.range("megatron.multimodal.vision_cache_lookup"):
-                image_embeddings = self._get_cached_vision_embedding(media_cache_key)
+            image_embeddings = self._get_cached_vision_embedding(media_cache_key)
             if image_embeddings is None and imgs is not None:
                 imgs = imgs.to(device=device)
                 # PP>1 is rejected above, so this is the only stage that owns
@@ -3791,7 +3794,9 @@ class DynamicInferenceEngine(AbstractEngine):
                 # The prompt and the media each ride in their own frame. The
                 # coordinator forwarded both untouched, while the bounded media
                 # descriptor lets a cache hit avoid decoding the payload frame.
-                with torch.cuda.nvtx.range("megatron.multimodal.message_unpack"):
+                nvtx_range = "megatron.inference.multimodal.message_unpack"
+                nvtx_range_push(nvtx_range)
+                try:
                     prompt = msgpack.unpackb(message[1], raw=False)
                     media_cache_key = (
                         media_meta.get("media_cache_key")
@@ -3805,16 +3810,15 @@ class DynamicInferenceEngine(AbstractEngine):
                         media_cache_key, media_modality
                     )
                     if cached_vision_entry is None:
-                        with torch.cuda.nvtx.range(
-                            "megatron.multimodal.media_payload_unpack"
-                        ):
-                            media_payload = msgpack.unpackb(message[2], raw=False)
+                        media_payload = msgpack.unpackb(message[2], raw=False)
                         multi_modal_data = merge_multimodal_data(
                             media_meta, media_payload
                         )
                     else:
                         multi_modal_data = None
                     sampling_params = SamplingParams.deserialize(sampling_params)
+                finally:
+                    nvtx_range_pop(nvtx_range)
                 nvtx_range_push("add_request")
                 # TODO(perf): uncached media preprocessing (decode / resize /
                 # normalize / patchify) runs synchronously on the engine step
@@ -3838,9 +3842,11 @@ class DynamicInferenceEngine(AbstractEngine):
                         # every SUBMIT_REQUEST and desync the ranks.
                         vlm_kwargs = {}
                     else:
-                        with torch.cuda.nvtx.range(
-                            "megatron.multimodal.resolve_multimodal_data"
-                        ):
+                        nvtx_range = (
+                            "megatron.inference.multimodal.resolve_multimodal_data_for_engine"
+                        )
+                        nvtx_range_push(nvtx_range)
+                        try:
                             vlm_kwargs = resolve_multimodal_data_for_engine(
                                 multi_modal_data,
                                 image_preprocessing_config=(
@@ -3850,6 +3856,8 @@ class DynamicInferenceEngine(AbstractEngine):
                                     self.context.config.video_preprocessing_config
                                 ),
                             )
+                        finally:
+                            nvtx_range_pop(nvtx_range)
                     if vlm_kwargs:
                         self.add_request(request_id, prompt, sampling_params, **vlm_kwargs)
                     else:

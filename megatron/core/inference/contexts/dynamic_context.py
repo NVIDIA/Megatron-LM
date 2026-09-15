@@ -5054,71 +5054,69 @@ class DynamicInferenceContext(BaseInferenceContext):
         # would remove even this remaining sync; TODO before this path takes
         # heavy multimodal traffic.
         active_slice = slice(self.paused_request_count, self.total_request_count)
-        with torch.cuda.nvtx.range("megatron.multimodal.mask_bookkeeping_d2h"):
-            _sync_batch = torch.stack(
-                [
-                    self.request_ids[active_slice],
-                    self.request_query_lengths[active_slice],
-                    # KV offset — how far into the stored prompt this step begins.
-                    # Non-zero under chunked prefill and after pause/resume, so
-                    # slicing per_request_mask must start at kv_offset, not 0.
-                    self.request_kv_length_offsets[active_slice],
-                ],
-                dim=0,
-            ).tolist()
+        _sync_batch = torch.stack(
+            [
+                self.request_ids[active_slice],
+                self.request_query_lengths[active_slice],
+                # KV offset — how far into the stored prompt this step begins.
+                # Non-zero under chunked prefill and after pause/resume, so
+                # slicing per_request_mask must start at kv_offset, not 0.
+                self.request_kv_length_offsets[active_slice],
+            ],
+            dim=0,
+        ).tolist()
         active_request_ids, active_query_lengths, active_kv_offsets = (
             _sync_batch[0],
             _sync_batch[1],
             _sync_batch[2],
         )
 
-        with torch.cuda.nvtx.range("megatron.multimodal.image_token_mask_assembly"):
-            segments: List[Tensor] = []
-            cumulative_offset = 0
-            for request_id, query_len, kv_offset in zip(
-                active_request_ids, active_query_lengths, active_kv_offsets
-            ):
-                per_request_mask = self._request_to_image_token_mask.get(request_id, None)
-                if per_request_mask is None or kv_offset >= per_request_mask.numel():
-                    # Past the end of the stored prompt mask — decode step, or a
-                    # text-only request. Return an all-text (-1) segment; the
-                    # stored mask is prompt-length and doesn't cover generated
-                    # positions.
-                    seg = torch.full(
-                        (query_len,), -1, dtype=torch.long, device=torch.cuda.current_device()
-                    )
-                else:
-                    # kv_offset is normally 0 for a fresh prefill and grows with
-                    # chunked prefill / pause-and-resume — slice into the stored
-                    # mask from where this step actually resumes.
-                    seg = per_request_mask[kv_offset : kv_offset + query_len].clone()
-                    # Pad if the request is being prefilled beyond the mask (mixed
-                    # prefill+decode chunk).
-                    if seg.numel() < query_len:
-                        pad = torch.full(
-                            (query_len - seg.numel(),), -1, dtype=seg.dtype, device=seg.device
-                        )
-                        seg = torch.cat([seg, pad])
-                    positive = seg >= 0
-                    if positive.any():
-                        seg[positive] += cumulative_offset
-
-                segments.append(seg)
-                cumulative_offset += int(self._request_to_image_token_count.get(request_id, 0))
-
-            if len(segments) == 0:
-                return None
-
-            mask = torch.cat(segments, dim=0)
-            if mask.numel() < int(self.padded_active_token_count):
-                pad = torch.full(
-                    (int(self.padded_active_token_count) - mask.numel(),),
-                    -1,
-                    dtype=torch.long,
-                    device=mask.device,
+        segments: List[Tensor] = []
+        cumulative_offset = 0
+        for request_id, query_len, kv_offset in zip(
+            active_request_ids, active_query_lengths, active_kv_offsets
+        ):
+            per_request_mask = self._request_to_image_token_mask.get(request_id, None)
+            if per_request_mask is None or kv_offset >= per_request_mask.numel():
+                # Past the end of the stored prompt mask — decode step, or a
+                # text-only request. Return an all-text (-1) segment; the
+                # stored mask is prompt-length and doesn't cover generated
+                # positions.
+                seg = torch.full(
+                    (query_len,), -1, dtype=torch.long, device=torch.cuda.current_device()
                 )
-                mask = torch.cat([mask, pad], dim=0)
-            return mask.unsqueeze(0)
+            else:
+                # kv_offset is normally 0 for a fresh prefill and grows with
+                # chunked prefill / pause-and-resume — slice into the stored
+                # mask from where this step actually resumes.
+                seg = per_request_mask[kv_offset : kv_offset + query_len].clone()
+                # Pad if the request is being prefilled beyond the mask (mixed
+                # prefill+decode chunk).
+                if seg.numel() < query_len:
+                    pad = torch.full(
+                        (query_len - seg.numel(),), -1, dtype=seg.dtype, device=seg.device
+                    )
+                    seg = torch.cat([seg, pad])
+                positive = seg >= 0
+                if positive.any():
+                    seg[positive] += cumulative_offset
+
+            segments.append(seg)
+            cumulative_offset += int(self._request_to_image_token_count.get(request_id, 0))
+
+        if len(segments) == 0:
+            return None
+
+        mask = torch.cat(segments, dim=0)
+        if mask.numel() < int(self.padded_active_token_count):
+            pad = torch.full(
+                (int(self.padded_active_token_count) - mask.numel(),),
+                -1,
+                dtype=torch.long,
+                device=mask.device,
+            )
+            mask = torch.cat([mask, pad], dim=0)
+        return mask.unsqueeze(0)
 
     def current_image_embeddings(self) -> Optional[Tensor]:
         """Concatenate image embeddings for active requests.
@@ -5145,17 +5143,15 @@ class DynamicInferenceContext(BaseInferenceContext):
         if self.is_decode_only():
             return None
 
-        with torch.cuda.nvtx.range("megatron.multimodal.embedding_bookkeeping_d2h"):
-            active_request_ids = self.request_ids[
-                self.paused_request_count : self.total_request_count
-            ].tolist()
+        active_request_ids = self.request_ids[
+            self.paused_request_count : self.total_request_count
+        ].tolist()
 
-        with torch.cuda.nvtx.range("megatron.multimodal.image_embedding_assembly"):
-            parts: List[Tensor] = []
-            for request_id in active_request_ids:
-                emb = self._request_to_image_embeddings.get(request_id, None)
-                if emb is not None:
-                    parts.append(emb.reshape(-1, emb.shape[-1]))
-            if not parts:
-                return None
-            return torch.cat(parts, dim=0).unsqueeze(1)
+        parts: List[Tensor] = []
+        for request_id in active_request_ids:
+            emb = self._request_to_image_embeddings.get(request_id, None)
+            if emb is not None:
+                parts.append(emb.reshape(-1, emb.shape[-1]))
+        if not parts:
+            return None
+        return torch.cat(parts, dim=0).unsqueeze(1)
