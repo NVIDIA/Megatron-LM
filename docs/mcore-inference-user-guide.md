@@ -168,7 +168,7 @@ workload rather than generalizing from any single comparison.
 > For routed-expert-only quantization, match `*mlp.experts.linear_fc1` and
 > `*mlp.experts.linear_fc2` to MXFP8, with an MTP BF16 rule first and a catch-all
 > BF16 rule last. See
-> [TE precision recipes](../megatron/core/extensions/TransformerEngineMixedPrecision.md).
+> [TE precision recipes](https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/core/extensions/TransformerEngineMixedPrecision.md).
 >
 > Within one MoE layer, every local expert's FC1 and FC2 weight must use the same
 > precision. The `flashinfer`, `torch`, and `vllm` grouped-GEMM backends support
@@ -728,9 +728,9 @@ The transport is selected by `refit_method`, exposed on the command line as
 MXFP8 targets are handled transparently: when the destination model uses
 `--transformer-impl inference_optimized` with `--fp8-recipe mxfp8`,
 `prepare_swap_model_weights` installs a quantizing transform that later
-`swap_model_weights` calls pick up. Selective MXFP8 include/exclude filters are
-also honored, so the refit plan quantizes only the selected destination weights
-and sends the remaining parameters as BF16. The built-in RL loop calls
+`swap_model_weights` calls pick up. The refit plan follows the TE per-module
+precision recipe: only destination weights initialized with MXFP8 storage are
+quantized, while BF16 parameters remain BF16. The built-in RL loop calls
 `swap_model_weights(model, inference_model, args.refit_method)`; refer to
 [`megatron/core/resharding/README.md`](https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/core/resharding/README.md) for
 the plan-building and caching details.
@@ -895,10 +895,15 @@ arrival schedules, batch-drain modes, or suspend and resume policies:
 engine.add_request(request_id, prompt_text, sampling_params)
 while engine.has_unfinished_requests():
     result = engine.step_modern()
-    for record in result["finished_request_records"]:
-        finished = record.merge()
+    for finished in result["finished_requests"]:
+        finished.finalize_text(tokenizer)
         print(finished.request_id, finished.generated_text)
 ```
+
+The engine owns checkpoint records internally and returns one flat,
+token-complete `DynamicInferenceRequest` per finished request. Its
+`generated_text` starts as `None`; direct low-level callers decode the complete
+token stream once by calling `finalize_text(tokenizer)` where text is needed.
 
 The fully worked manual-stepping example is
 [`examples/inference/advanced/gpt_dynamic_inference.py`](https://github.com/NVIDIA/Megatron-LM/blob/main/examples/inference/advanced/gpt_dynamic_inference.py).
@@ -999,11 +1004,13 @@ is the opposite of the `MegatronLLM` constructor default.
 
 **Engine and serving**
 
-- **`engine.reset()` is unsafe in coordinator mode.** It can deadlock (rebinds
-  internal asyncio primitives that suspended waiters still reference) or
-  silently re-route to direct-mode branches. The offline example therefore
-  blocks `--inference-repeat-n > 1` together with `--use-coordinator`. Direct-mode
-  reset is safe.
+- **High-level coordinator reset is not synchronized.** Once an engine is drained,
+  `engine.reset()` preserves its coordinator mode and long-lived asyncio objects,
+  and accepts resets only while `RUNNING` or `PAUSED`. The high-level coordinator
+  API cannot yet prove that its background engine loop has finished bookkeeping
+  after the final reply, however, so an immediate reset can still race that loop.
+  The offline example therefore blocks `--inference-repeat-n > 1` together with
+  `--use-coordinator`. Direct-mode reset is safe.
 - **HTTP frontend is fixed to global rank 0.** There is no per-rank `role`
   override on `ServeConfig`. Control placement through the launcher (for example, torchrun
   rank-0 placement). `ServeConfig.sock` lets you pre-bind the listening socket,

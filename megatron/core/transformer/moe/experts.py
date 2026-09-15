@@ -1459,7 +1459,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
         return output, None
 
     def _mcore_fused_moe_forward(self, hidden_states, probs, routing_map):
-        """MCore permutation with the selected Torch or vLLM grouped-GEMM path."""
+        """MCore grouped GEMM for Torch and the vLLM-selected MXFP8 fallback."""
         local_expert_start = self.ep_group.rank() * self.num_local_experts
         output = mcore_fused_moe(
             hidden_states,

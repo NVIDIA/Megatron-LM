@@ -276,7 +276,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         post_process: bool = True,
         pg_collection: Optional[ProcessGroupCollection] = None,
         vp_stage: Optional[int] = None,
-        name: str = None,
+        name: str | None = None,
     ):
         super().__init__(config=config)
 
@@ -364,15 +364,21 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                 quantization_context = nullcontext()
 
             with quantization_context:
+                # Resolve per-module storage before TE allocates parameters, not
+                # only in GPTModel's post-construction finish_init pass. Avoid
+                # adding kwargs to custom layer specs when naming is unused.
+                layer_kwargs = (
+                    {"name": f"{self.name}.layers.{layer_number - 1}"}
+                    if self.name is not None
+                    else {}
+                )
                 module = build_module(
                     layer_spec,
                     config=layer_config,
                     layer_number=layer_number,
                     pg_collection=self.pg_collection,
                     vp_stage=self.vp_stage,
-                    name=(
-                        self.name + f".layers.{layer_number - 1}" if self.name is not None else None
-                    ),
+                    **layer_kwargs,
                 )
             if layer_config.enable_mhc_connections and not getattr(
                 module, "supports_mhc_connections", False
