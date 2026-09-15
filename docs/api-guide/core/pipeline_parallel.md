@@ -37,7 +37,8 @@ Empty intermediate Hybrid stages return an independent, graph-connected output.
 This allows the schedule to pseudo-deallocate a sent output without resizing its
 input or losing the gradient path. Standalone GPT embedding/loss stages and
 explicit Hybrid pipeline patterns, including empty segments, retain their normal
-boundary behavior.
+boundary behavior. GPT's embedding expansion returns a viewless tensor so that
+an embedding-only stage can safely release its sent output too.
 
 Eager selective mHC recomputation can be used with PP/VPP. Hybrid MTP must be on
 the final `post_process` chunk, where both the multi-stream decoder result and
