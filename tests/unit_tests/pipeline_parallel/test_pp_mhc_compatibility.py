@@ -285,8 +285,11 @@ def _run_schedule(config, models):
             seen_shapes.append(tuple(output.shape))
 
         def loss_func(losses):
-            loss = losses.float().mean()
-            return loss, {"loss": loss.detach().clone()}
+            # Use the native local-sum/token-count contract. The legacy
+            # two-value contract would add an extra CP factor to a local mean.
+            loss_sum = losses.float().sum()
+            num_tokens = torch.tensor(losses.numel(), dtype=torch.int, device=losses.device)
+            return loss_sum, num_tokens, {"loss": loss_sum.detach().clone() / num_tokens}
 
         return output, loss_func
 

@@ -56,4 +56,5 @@ an identically initialized PP1 model. It covers PP2, PP2/VPP2, standalone GPT
 embedding/loss stages, empty Hybrid stages with output deallocation, Hybrid MTP
 with TP/SP, and CP with changing sequence lengths. The test selects the existing
 mHC GPT layer through a custom spec; enabling mHC does not add a new default GPT
-factory path.
+factory path. BF16 CP cases use native FP32 gradient accumulation and the local
+loss-sum/token-count contract for CP-correct normalization.
