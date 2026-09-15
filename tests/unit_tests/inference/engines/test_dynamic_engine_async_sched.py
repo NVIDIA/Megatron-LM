@@ -1450,8 +1450,7 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
             runtime["steps"] += 1
             runtime["cuda_graph_steps"] += int(context.using_cuda_graph_this_step())
             runtime["max_paused"] = max(runtime["max_paused"], context.paused_request_count)
-            for record in result["finished_request_records"]:
-                request = record.merge()
+            for request in result["finished_requests"]:
                 env.requests[request.request_id] = request
                 if request.request_id == 1 and any(
                     other.request_id != 1 and other.status not in (Status.COMPLETED, Status.FAILED)

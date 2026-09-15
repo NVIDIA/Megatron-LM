@@ -40,6 +40,8 @@ megatron/core/transformer/fsdp_dtensor_checkpoint.py @NVIDIA/core-adlr @NVIDIA/c
 
 megatron/core/dist_checkpointing/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/dist-checkpointing
 
+megatron/core/resharding/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/refit
+
 megatron/core/optimizer/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/mcore-optimizer
 
 megatron/core/optimizer/distrib_optimizer.py @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/dist-optimizer
