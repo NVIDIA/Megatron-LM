@@ -317,6 +317,22 @@ class TEGroupedMLP(MegatronModule):
             )
 
         self._use_grouped_tensor = self.config.moe_use_grouped_tensor
+
+        from megatron.core.tensor_parallel import gtp_api
+
+        # GTP wraps a grouped module's weight0..N as a set, so weight0 is representative -- the
+        # same assumption TE makes when it gates on weights[0].
+        has_gtp_sharded_weights = gtp_api.HAVE_GTP and gtp_api.is_gtp_param(
+            getattr(self.linear_fc1, "weight0", None)
+        )
+        if self._use_grouped_tensor and not self._with_fused_impl and has_gtp_sharded_weights:
+            # TE's grouped-tensor path does not support GTP-sharded weights; the split-quantize
+            # path and the op fuser do. Both sides of the boundary have to agree, so flip both.
+            # mcore: selects the tokens_per_expert form below (CUDA tensor vs host list).
+            self._use_grouped_tensor = False
+            # TE: selects the path inside GroupedLinear.forward, which reads this per-forward.
+            self.linear_fc1.use_grouped_tensor = False
+            self.linear_fc2.use_grouped_tensor = False
         if self.config.fp8 or self.config.fp4 or self._use_grouped_tensor:
             assert HAVE_TE, "Quantized or TE grouped-tensor GroupedMLP execution requires TE."
             align_size = (
