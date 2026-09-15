@@ -13,7 +13,7 @@
 # limitations under the License.
 
 name: Populate CI build caches
-run-name: Populate CI build caches from main
+run-name: Populate CI build and Testmon caches from main
 
 on:
   push:
@@ -22,15 +22,23 @@ on:
     paths:
       - ".github/workflows/_build_ci_container.yml"
       - ".github/workflows/populate-build-cache.yml"
+      - ".github/actions/action.yml"
       - "docker/**"
       - "megatron/core/__init__.py"
       - "megatron/core/package_info.py"
       - "pyproject.toml"
       - "tests/test_utils/python_scripts/download_unit_tests_dataset.py"
       - "uv.lock"
+      - "tests/unit_tests/testmon*.py"
+      - "tests/unit_tests/run_ci_test.sh"
+      - "tests/test_utils/recipes/*/unit-tests.yaml"
   schedule:
-    - cron: "0 6 * * *"
+    - cron: "17 */6 * * *"
   workflow_dispatch:
+
+concurrency:
+  group: populate-ci-caches-main
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -67,3 +75,60 @@ jobs:
       lts: false
       timeout-minutes: 120
       verify-cache: true
+
+  parse-unit-tests:
+    name: Select Testmon cache buckets
+    needs: populate-build-cache
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - name: Checkout cache source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.sha }}
+      - name: Reuse the built platforms and unit-test recipes
+        id: matrix
+        env:
+          BUILDS: ${{ needs.populate-build-cache.outputs.build-matrix }}
+          SOURCE_SHA: ${{ github.sha }}
+        run: |
+          yq -o json '[.products[].test_case[]]' tests/test_utils/recipes/h100/unit-tests.yaml > h100.json
+          yq -o json '[.products[].test_case[]]' tests/test_utils/recipes/gb200/unit-tests.yaml > gb200.json
+          MATRIX=$(jq -cn --argjson builds "$BUILDS" --arg sha "$SOURCE_SHA" \
+            --slurpfile h100 h100.json --slurpfile gb200 gb200.json '
+            [$builds.include[] as $build
+              | (if $build.cloud == "aws-h100" then {platform: "dgx_h100", buckets: $h100[0]}
+                 elif $build.cloud == "gb-gpu" then {platform: "dgx_gb200", buckets: $gb200[0]}
+                 else error("Unsupported unit-test platform") end) as $suite
+              | $suite.buckets[] as $bucket
+              | {bucket: $bucket, platform: $suite.platform, runner: $build.runner,
+                 image: ($build.registry + "/megatron-lm:" + $sha + "-" + $build.cloud)}]')
+          echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
+
+  populate-testmon-cache:
+    name: "Testmon ${{ matrix.platform }} / ${{ matrix.bucket }}"
+    needs: parse-unit-tests
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.parse-unit-tests.outputs.matrix) }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    steps:
+      - name: Checkout cache source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.sha }}
+      - name: Record and publish the complete bucket
+        uses: ./.github/actions
+        with:
+          script: ""
+          test_case: ${{ matrix.bucket }}
+          platform: ${{ matrix.platform }}
+          container-image: ${{ matrix.image }}
+          sha: ${{ github.sha }}
+          tag: latest
+          is_unit_test: "true"
+          unit_testmon_mode: baseline
+          unit_testmon_target_branch: main
