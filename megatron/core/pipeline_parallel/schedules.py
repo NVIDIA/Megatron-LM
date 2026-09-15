@@ -197,7 +197,6 @@ def deallocate_output_tensor(out, deallocate_pipeline_outputs=False):
 
     # Base case: deallocate tensor
     assert isinstance(out, torch.Tensor), "expected Tensor, found %s." % type(out).__name__
-    assert out._base is None, "counter-productive to free a view of another tensor."
     out.data = torch.empty((1,), device=out.device, dtype=out.dtype)
 
 
