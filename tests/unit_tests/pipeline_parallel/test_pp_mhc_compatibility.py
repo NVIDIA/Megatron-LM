@@ -337,7 +337,12 @@ def test_mhc_schedule_matches_pp1(
     (ref_loss, ref_grads, ref_names), (loss, grads, names) = snapshots
     assert names == ref_names
     tolerance = dict(rtol=1.6e-2, atol=1e-5) if cp_size > 1 else dict(rtol=1e-5, atol=1e-5)
-    torch.testing.assert_close(loss, ref_loss, **tolerance)
+    torch.testing.assert_close(
+        loss,
+        ref_loss,
+        msg=lambda message: f"Microbatch losses {loss.tolist()} vs PP1 {ref_loss.tolist()}: {message}",
+        **tolerance,
+    )
     for name, grad in grads.items():
         assert name in ref_grads, name
         torch.testing.assert_close(
