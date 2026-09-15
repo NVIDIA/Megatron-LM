@@ -25,6 +25,8 @@ iterations, using real DDP gradient synchronization and an optimizer step.
 """
 
 import os
+import sys
+import traceback
 
 import pytest
 import torch
@@ -358,6 +360,10 @@ def _run_training(models, groups, use_graph, pp_size):
         if use_graph:
             assert wrapper.curr_iter("training") == _TRAIN_STEPS
         return history, _snapshot_rng()
+    except BaseException:
+        traceback.print_exc(file=sys.__stderr__)
+        sys.__stderr__.flush()
+        raise
     finally:
         for hook in gradient_hooks:
             hook.remove()
@@ -470,6 +476,10 @@ def _check_training_parity(model_kind, dtype, dropout):
             # parameter updates happen to remain non-trivial.
             torch.testing.assert_close(actual_rng, expected_rng, rtol=0, atol=0)
             assert not torch.equal(initial_rng[0], actual_rng[0])
+    except BaseException:
+        traceback.print_exc(file=sys.__stderr__)
+        sys.__stderr__.flush()
+        raise
     finally:
         torch.backends.cuda.matmul.allow_tf32 = previous_tf32
         StaticBufferLoader.static_buffers = {"training": [], "validation": []}
