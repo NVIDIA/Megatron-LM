@@ -44,6 +44,20 @@ def send_do_generate():
     torch.distributed.broadcast(choice, 0)
 
 
+def apply_optional_sampling_default(app_config, config_key, value) -> None:
+    """Set `app_config[config_key]` only when `value` was actually provided.
+
+    Startup passes `default_temperature`/`default_top_p`/`default_top_k`
+    through as `Optional`, `None` when the operator didn't configure one.
+    Setting the key unconditionally (even to a hardcoded fallback like `1.0`)
+    would make `resolve_sampling_default`'s `config_key in app_config` check
+    always true, permanently hiding the model's own `generation_config.json`
+    tier behind a value nobody actually asked for.
+    """
+    if value is not None:
+        app_config[config_key] = value
+
+
 def resolve_sampling_default(app_config, gen_defaults, key, config_key, hardcoded):
     """Resolve one sampling default: app config > generation_config > hardcoded.
 

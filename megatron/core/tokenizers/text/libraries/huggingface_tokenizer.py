@@ -7,6 +7,7 @@ from typing import List, Optional
 
 try:
     from transformers import AutoTokenizer
+    from transformers.utils import cached_file
 
     HAVE_TRANSFORMERS = True
 except ModuleNotFoundError:
@@ -24,6 +25,42 @@ except ModuleNotFoundError:
     HAVE_GIGATOKEN = False
 
 logger = logging.getLogger(__name__)
+
+
+
+def _load_generation_config(tokenizer_path: str) -> Optional[dict]:
+    """Load the model's generation_config.json, if present.
+
+    HF tokenizers do not load generation_config.json themselves -- it is a
+    model-level file -- but it holds `eos_token_id`, which may be a LIST of stop
+    tokens (e.g. [2, 11]). Reading it here lets termination honor every declared
+    eos token.
+
+    `tokenizer_path` can be a local directory OR a Hub model id (the
+    AutoTokenizer.from_pretrained call in __init__ already handles both). A
+    plain `os.path.join` + `os.path.isfile` only ever resolves the
+    local-directory case, silently finding nothing for a Hub id with no error
+    raised -- so this uses HF's own `cached_file` helper, which resolves and
+    caches from either source the same way `from_pretrained` does.
+
+    Returns None when the file is missing or unreadable (graceful, logged at
+    WARNING -- not every model ships a generation_config.json).
+    """
+    try:
+        gc_path = cached_file(
+            tokenizer_path, "generation_config.json", _raise_exceptions_for_missing_entries=False
+        )
+        if gc_path is None:
+            return None
+        with open(gc_path) as gc_file:
+            return json.load(gc_file)
+    except Exception as gc_e:
+        log_single_rank(
+            logger,
+            logging.WARNING,
+            f"Could not read generation_config.json from {tokenizer_path}: {gc_e}",
+        )
+        return None
 
 
 class HuggingFaceTokenizer(MegatronTokenizerTextAbstract):
@@ -104,24 +141,7 @@ class HuggingFaceTokenizer(MegatronTokenizerTextAbstract):
                 f'for {tokenizer_path}. Exception: {e}'
             )
 
-        # Attach the model's generation_config (if present in the tokenizer directory).
-        # HF tokenizers do not load generation_config.json themselves -- it is a
-        # model-level file -- but it holds `eos_token_id`, which may be a LIST of stop
-        # tokens (e.g. [2, 11]). Reading it here lets termination honor every declared
-        # eos token. Missing or unreadable file -> None (graceful).
-        self.generation_config = None
-        try:
-            gc_path = os.path.join(tokenizer_path, "generation_config.json")
-            if os.path.isfile(gc_path):
-                with open(gc_path) as gc_file:
-                    self.generation_config = json.load(gc_file)
-        except Exception as gc_e:
-            log_single_rank(
-                logger,
-                logging.WARNING,
-                f"Could not read generation_config.json from {tokenizer_path}: {gc_e}",
-            )
-            self.generation_config = None
+        self.generation_config = _load_generation_config(tokenizer_path)
 
         # Store the tokenizer's existing chat template if the user does not provide
         # a custom chat template. Otherwise, override the default chat template with
