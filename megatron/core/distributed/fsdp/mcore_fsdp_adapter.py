@@ -800,12 +800,12 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             )
         if (
             ddp_config.expert_outer_dp_sharding_strategy != "no_shard"
-            and ddp_config.num_distributed_optimizer_instances <= 1
+            and ddp_config.expert_num_distributed_optimizer_instances <= 1
         ):
             raise ValueError(
                 "MFSDP v2 expert_outer_dp_sharding_strategy="
                 f"{ddp_config.expert_outer_dp_sharding_strategy!r} requires "
-                "num_distributed_optimizer_instances > 1."
+                "expert_num_distributed_optimizer_instances > 1."
             )
         if config.gradient_accumulation_fusion:
             raise ValueError("MFSDP v2 does not currently support gradient accumulation fusion.")
@@ -951,11 +951,9 @@ def _build_expert_mesh_and_placements(
 
     inner_strategy = get_sharding_strategy(ddp_config, is_expert_param=True)
 
-    if ddp_config.num_distributed_optimizer_instances > 1:
-        # Match v1 topology: dense and expert parameters share the outer DP axis,
-        # while experts use the existing expert-DP inner group. Only placements differ.
+    if ddp_config.expert_num_distributed_optimizer_instances > 1:
         dp_mesh = _build_hybrid_dp_mesh(
-            pg_collection.inter_dist_opt,
+            pg_collection.inter_expt_dp,
             pg_collection.intra_expt_dp,
             device_type,
             flattened_group=pg_collection.expt_dp,
