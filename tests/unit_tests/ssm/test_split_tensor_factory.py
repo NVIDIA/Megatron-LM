@@ -10,13 +10,20 @@ from megatron.core.dist_checkpointing import ShardedTensor
 from megatron.core.ssm.gated_delta_net.common import (
     _split_tensor_factory as gated_delta_split_tensor_factory,
 )
+from megatron.core.ssm.gated_delta_product import (
+    _split_tensor_factory as gated_delta_product_split_tensor_factory,
+)
 from megatron.core.ssm.mamba_mixer import _split_tensor_factory as mamba_split_tensor_factory
 
 
 @pytest.mark.parametrize(
     "factory_fn",
-    [gated_delta_split_tensor_factory, mamba_split_tensor_factory],
-    ids=["gated_delta_net", "mamba_mixer"],
+    [
+        gated_delta_split_tensor_factory,
+        gated_delta_product_split_tensor_factory,
+        mamba_split_tensor_factory,
+    ],
+    ids=["gated_delta_net", "gated_delta_product", "mamba_mixer"],
 )
 @pytest.mark.internal
 def test_ssm_split_tensor_factory_oom_is_handled(factory_fn, caplog):

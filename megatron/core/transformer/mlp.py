@@ -25,6 +25,7 @@ from megatron.core.fusions.fused_bias_geglu import (
 from megatron.core.fusions.fused_bias_gelu import bias_gelu_impl
 from megatron.core.fusions.fused_bias_swiglu import bias_swiglu_impl, weighted_bias_swiglu_impl
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.tensor_parallel import gtp_api
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import (
@@ -388,13 +389,51 @@ class MLP(MegatronModule):
             if self.config.gated_linear_unit and name == "linear_fc1":
                 for k, v in sub_sd.items():
                     if k in (f"{prefix}{name}.weight", f"{prefix}{name}.bias"):
-                        sub_sd[k] = apply_swiglu_sharded_factory(
-                            v,
-                            sharded_offsets,
-                            singleton_local_shards,
-                            tp_group=self.tp_group,
-                            dp_group=metadata['dp_cp_group'],
-                        )
+                        weight = getattr(module, "weight", None)
+                        if (
+                            k == f"{prefix}{name}.weight"
+                            and gtp_api.HAVE_GTP
+                            and gtp_api.is_gtp_param(weight)
+                        ):
+                            # GTP shards dim0 of the fused [gate|up] weight, and the gate/up
+                            # boundary does not line up with the shard boundaries. Checkpoint
+                            # in the LOGICAL layout instead: gather the shards back to the
+                            # TP-local tensor (pad stripped), run the SAME swiglu split a
+                            # non-GTP run uses, and slice this rank's contiguous rows back
+                            # out on load. This also pins the storage mapping — a shard is a
+                            # contiguous row slice of [gate|up] — so the runtime all-gather
+                            # is already in logical order and needs no permutation.
+                            from megatron.core.tensor_parallel.gtp_utils import (
+                                _gtp_gather_rows_for_save,
+                                _gtp_slice_rows_on_load,
+                            )
+
+                            target_rows = weight._unsharded_shape[0]
+                            v = _gtp_gather_rows_for_save(
+                                v,
+                                k,
+                                weight,
+                                target_rows,
+                                self.tp_group,
+                                metadata['dp_cp_group'],
+                                sharded_offsets,
+                            )
+                            v = apply_swiglu_sharded_factory(
+                                v,
+                                sharded_offsets,
+                                singleton_local_shards,
+                                tp_group=self.tp_group,
+                                dp_group=metadata['dp_cp_group'],
+                            )
+                            sub_sd[k] = _gtp_slice_rows_on_load(v, weight)
+                        else:
+                            sub_sd[k] = apply_swiglu_sharded_factory(
+                                v,
+                                sharded_offsets,
+                                singleton_local_shards,
+                                tp_group=self.tp_group,
+                                dp_group=metadata['dp_cp_group'],
+                            )
             sharded_state_dict.update(sub_sd)
         return sharded_state_dict
 

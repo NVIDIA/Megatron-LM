@@ -27,7 +27,7 @@ from megatron.core.ssm.mamba_context_parallel import (
     _redo_attention_load_balancing,
     _undo_attention_load_balancing,
 )
-from megatron.core.ssm.utils import _split_tensor_factory
+from megatron.core.ssm.utils import _split_in_proj_factory, _split_tensor_factory
 from megatron.core.tensor_parallel import get_cuda_rng_tracker
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.identity_op import IdentityOp
@@ -541,17 +541,14 @@ class _GDNBase(MegatronModule):
 
         # At this point the TP sharding is correctly defined for each tensor, but some of the
         # tensors must be additionally split into separate parts
-        in_proj_dim_local_tp = self.in_proj_dim // self.tp_size
-        assert sharded_state_dict[f"{prefix}in_proj.weight"].data.size(0) == in_proj_dim_local_tp, (
-            in_proj_dim_local_tp,
-            sharded_state_dict[f"{prefix}in_proj.weight"],
-        )
-
-        sharded_state_dict[f"{prefix}in_proj.weight"] = _split_tensor_factory(
+        sharded_state_dict[f"{prefix}in_proj.weight"] = _split_in_proj_factory(
             sharded_state_dict[f"{prefix}in_proj.weight"],
             list(self.in_proj_split_sections),
             self.in_proj_split_names,
-            0,
+            weight=self.in_proj.weight,
+            tp_group=tp_group,
+            dp_cp_group=metadata['dp_cp_group'],
+            sharded_offsets=sharded_offsets,
         )
 
         conv_layer_name_list = ["conv1d.weight"]
