@@ -62,7 +62,8 @@ parity case starts with a fresh compiler cache so earlier topology/dtype cases
 cannot exhaust the native mHC helpers' recompile budget and trigger eager
 fallback. The PP1 reference and PP2 comparison share that cache within the case.
 
-The native functional recipes use deterministic mode for reproducible loss,
-MTP loss, and gradient-zero-count goldens. This selects the existing deterministic
-GDN and attention paths; PP/VPP communication and checkpoint validation remain
-part of each 20-iteration run.
+The native functional recipes request deterministic mode and verify loss,
+MTP loss, and gradient-zero-count goldens with the native exact comparator.
+This selects the existing deterministic GDN and attention paths; end-to-end
+reproducibility still requires a passing repeat run. PP/VPP communication and
+checkpoint validation remain part of each 20-iteration run.
