@@ -53,6 +53,7 @@ class Router(ABC, MegatronModule):
         self.num_experts = self.config.num_moe_experts
         self.moe_aux_loss_func = None
         self.layer_number = None
+        self.mtp_layer_number: int | None = None
         self.is_mtp_layer = is_mtp_layer
         self.tp_group = pg_collection.tp
         self.cp_group = pg_collection.cp
@@ -143,6 +144,13 @@ class Router(ABC, MegatronModule):
         self.layer_number = layer_number
         if getattr(self, "router_replay", None) is not None:
             self.router_replay.layer_number = layer_number
+
+    def get_loss_logging_layer_number(self) -> int | None:
+        """Map an MTP container's prediction depth onto its auxiliary metric slot."""
+        if not self.is_mtp_layer:
+            return self.layer_number
+        depth = self.mtp_layer_number if self.mtp_layer_number is not None else self.layer_number
+        return None if depth is None else self.config.num_layers + depth
 
 
 class TopKRouter(Router):
@@ -589,18 +597,11 @@ class TopKRouter(Router):
         ):
             aux_loss = aux_loss / self.config.mtp_num_layers
 
-        # TODO (zijiey): fix the per_layer_logging for MTP, currently it will incorrectly
-        # add the aux loss logging value to other layer's since it is difficult to get the
-        # correct layer_number for MTP. It does not affect the correctness of the calculation
-        # results and the reduced load_balancing_loss logging value.
         num_layers = self.config.num_layers
         if self.config.mtp_num_layers is not None:
             num_layers += self.config.mtp_num_layers
 
-        if self.is_mtp_layer:
-            layer_number = self.layer_number + self.config.num_layers
-        else:
-            layer_number = self.layer_number
+        layer_number = self.get_loss_logging_layer_number()
 
         get_moe_metrics_tracker().record(
             aux_loss_name,
@@ -700,10 +701,7 @@ class TopKRouter(Router):
             if self.config.mtp_num_layers is not None:
                 num_layers += self.config.mtp_num_layers
 
-            if self.is_mtp_layer:
-                layer_number = self.layer_number + self.config.num_layers
-            else:
-                layer_number = self.layer_number
+            layer_number = self.get_loss_logging_layer_number()
 
             get_moe_metrics_tracker().record(
                 "z_loss",
