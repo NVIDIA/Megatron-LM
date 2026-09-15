@@ -124,6 +124,36 @@ class TestGatedDeltaNetInference:
         actual, _ = self.gdn.out_proj(torch.cat(outputs, dim=0))
         torch.testing.assert_close(actual, expected, atol=3e-2, rtol=3e-2)
 
+    def test_forward_returns_dynamic_inference_result_without_reprojecting(self):
+        """ssm_dynamic_inference already projects, so forward must return it untouched.
+
+        Routing it through the two-stage path instead would hand an already-projected pair to
+        forward_post_core_attn, which projects a second time.
+        """
+        sentinel = (torch.zeros(1, 1, self.gdn.hidden_size, device="cuda"), None)
+        calls = []
+        self.gdn.ssm_dynamic_inference = lambda hidden_states, context: (
+            calls.append("dynamic") or sentinel
+        )
+        self.gdn.forward_pre_attn_and_core_attn = lambda *args, **kwargs: pytest.fail(
+            "the training two-stage path must not run during dynamic inference"
+        )
+        context = SimpleNamespace(
+            is_dynamic_batching=lambda: True,
+            is_static_batching=lambda: False,
+            num_speculative_tokens=0,
+            enable_prefix_caching=False,
+        )
+
+        output = self.gdn(
+            torch.randn(2, 1, self.gdn.hidden_size, device="cuda", dtype=torch.bfloat16),
+            attention_mask=None,
+            inference_context=context,
+        )
+
+        assert calls == ["dynamic"]
+        assert output is sentinel
+
     @torch.inference_mode()
     def test_padding_index_does_not_modify_state(self):
         conv_state, ssm_state = self._empty_states()
