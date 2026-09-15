@@ -15,6 +15,7 @@ from megatron.core.num_microbatches_calculator import (
     init_num_microbatches_calculator,
     unset_num_microbatches_calculator,
 )
+from megatron.core.rerun_state_machine import RerunMode, RerunState, RerunStateMachine
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -504,6 +505,54 @@ def test_load_checkpoint_override_opt_param_scheduler(
         loaded_iter_none, loaded_flops_none = load_checkpoint([new_model], None, None, strict=True)
         assert loaded_iter_none == iteration
         assert loaded_flops_none == num_floating_point_operations_so_far
+
+
+@pytest.mark.parametrize("load_rerun_mode", [RerunMode.DISABLED, RerunMode.VALIDATE_RESULTS])
+def test_strict_load_idle_rerun_checkpoint(
+    init_model_parallel, tmp_path_dist_ckpt, create_ckpt_load_args, load_rerun_mode
+):
+    """Load an idle rerun shard without treating it as a pending rerun."""
+    args = create_ckpt_load_args
+    args.ckpt_format = 'torch_dist'
+    args.use_dist_ckpt = True
+    args.use_distributed_optimizer = False
+    args.dist_ckpt_strictness = 'raise_all'
+    args.no_save_rng = True
+    args.no_load_rng = True
+    args.no_save_optim = True
+    args.no_load_optim = True
+    args.fp16 = False
+    args.bf16 = False
+    args.save_tokenizer_assets = False
+    args.finetune = False
+    config = TransformerConfig(num_layers=1, kv_channels=1)
+    model = MockModel(config)
+    saved_machine = RerunStateMachine(mode=RerunMode.VALIDATE_RESULTS)
+
+    with TempNamedDir(tmp_path_dist_ckpt / "test_strict_idle_rerun", sync=True) as ckpt_dir:
+        args.save = ckpt_dir
+        args.load = ckpt_dir
+        set_args(args)
+        with mock.patch(
+            'megatron.training.checkpointing.get_rerun_state_machine', return_value=saved_machine
+        ):
+            save_checkpoint(123, [model], None, None, 456)
+
+        loaded_model = MockModel(config)
+        with torch.no_grad():
+            loaded_model.l.weight.zero_()
+        loaded_machine = RerunStateMachine(mode=load_rerun_mode)
+        with mock.patch(
+            'megatron.training.checkpointing.get_rerun_state_machine', return_value=loaded_machine
+        ):
+            iteration, flops = load_checkpoint([loaded_model], None, None, strict=True)
+
+        assert iteration == 123
+        assert flops == 456
+        torch.testing.assert_close(loaded_model.l.weight, model.l.weight, rtol=0, atol=0)
+        assert loaded_machine.state == RerunState.NOT_RUNNING_YET
+        assert loaded_machine.mode == load_rerun_mode
+        assert not loaded_machine.rerun_requested
 
 
 def test_dist_checkpoint_versioning(init_model_parallel, tmp_path_dist_ckpt, create_ckpt_load_args):
