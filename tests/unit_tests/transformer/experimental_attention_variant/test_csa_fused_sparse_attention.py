@@ -4871,11 +4871,12 @@ class TestRealKernelFusedIndexerSparseAttnThd:
     def test_raw_thd_tail_padding_backward_uses_dummy_tile(self, reset_lazy_kernel_state):
         """Raw THD tail padding supplies a harmless tile to DSA backward.
 
-        CUDA graphs keep Q-side tensors at a static capacity, which may leave
-        physical rows beyond the last packed-sequence endpoint. Raw THD
-        lowering emits all ``-1`` indices for those rows, so FlashMLA forward
-        sees ``topk_length == 0``. DSA backward instead requires at least one
-        tile; the fused wrapper must pass length 1 after sanitizing the index.
+        CUDA graphs keep Q-side tensors at a static capacity. Physical sequence
+        lengths include the padding; unpadded lengths identify the real rows.
+        Raw THD lowering emits all ``-1`` indices for padding, so FlashMLA
+        forward sees ``topk_length == 0``. DSA backward instead requires at
+        least one tile; the fused wrapper must pass length 1 after sanitizing
+        the index.
         """
         _skip_if_real_kernels_unavailable(need_flash_mla=True)
         s = self.SHAPES
@@ -4899,8 +4900,8 @@ class TestRealKernelFusedIndexerSparseAttnThd:
         k_indexer = torch.randn(n_comp, s['idx_hd'], dtype=torch.bfloat16, device=dev)
         weights = torch.randn(total_q, s['idx_nh'], dtype=torch.bfloat16, device=dev)
 
-        cu_q = _make_cu_seqlens([real_q], device=dev)
-        cu_q_unpadded = cu_q.clone()
+        cu_q = _make_cu_seqlens([total_q], device=dev)
+        cu_q_unpadded = _make_cu_seqlens([real_q], device=dev)
         cu_kv = _make_cu_seqlens([kv_offset], device=dev)
         cu_comp_idx = _make_cu_seqlens([n_comp], device=dev)
         compressed_kv = kv_full.detach()[kv_offset:]
@@ -4946,7 +4947,7 @@ class TestRealKernelFusedIndexerSparseAttnThd:
                 cu_seqlens_q=cu_q,
                 cu_seqlens_kv=cu_kv,
                 cu_seqlens_compressed_idx=cu_comp_idx,
-                max_seqlen_q=real_q,
+                max_seqlen_q=total_q,
                 max_seqlen_compressed_idx=n_comp,
                 compressed_kv=compressed_kv,
                 cu_seqlens_q_unpadded=cu_q_unpadded,

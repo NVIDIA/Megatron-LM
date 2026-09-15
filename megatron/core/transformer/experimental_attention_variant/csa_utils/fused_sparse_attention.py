@@ -2557,6 +2557,10 @@ class FusedCSAIndexerSparseAttnFunc(torch.autograd.Function):
         # longer needs that segment boundary because FlashMLA's partial
         # ``lse_indexer`` is not used, so compact the full attention set once
         # and share the resulting prefix length with forward and backward.
+        if padding_row_mask is not None:
+            # Padding queries are sink-only in forward; backward supplies a
+            # harmless tile after masking their output gradients.
+            global_idxs.masked_fill_(padding_row_mask.unsqueeze(-1), -1)
         if is_thd and thd_compressed_is_sequence_major:
             logical_window_width = int(thd_window_size)
         else:
