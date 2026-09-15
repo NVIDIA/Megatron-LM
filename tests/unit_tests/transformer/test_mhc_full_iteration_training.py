@@ -8,6 +8,18 @@ PR is present, the same tests exercise PP2/VPP2 without changing validation:
     MHC_CG_PP_SIZE=2 MHC_CG_VP_SIZE=2 torchrun --nproc-per-node=4 -m pytest \
         tests/unit_tests/transformer/test_mhc_full_iteration_training.py
 
+Combined eight-GPU examples (use the same eager/graph comparison):
+
+    MHC_CG_PP_SIZE=2 MHC_CG_VP_SIZE=2 MHC_CG_TP_SIZE=2 MHC_CG_EP_SIZE=2 \
+        torchrun --nproc-per-node=8 -m pytest -k 'hybrid_moe_mtp and bf16' \
+        tests/unit_tests/transformer/test_mhc_full_iteration_training.py
+    MHC_CG_PP_SIZE=2 MHC_CG_CP_SIZE=2 MHC_CG_EP_SIZE=2 \
+        torchrun --nproc-per-node=8 -m pytest -k 'hybrid_moe_mtp and bf16' \
+        tests/unit_tests/transformer/test_mhc_full_iteration_training.py
+
+TP > 1 enables SP; expert TP equals TP. EP applies to MoE cases. CP uses fixed
+SBHD zigzag shards and BF16 fused attention; the FP32 cases remain CP1 checks.
+
 Every case runs three eager warmups, the capture iteration, and four replay
 iterations, using real DDP gradient synchronization and an optimizer step.
 """
@@ -23,6 +35,10 @@ from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transfor
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel
+from megatron.core.num_microbatches_calculator import (
+    destroy_num_microbatches_calculator,
+    init_num_microbatches_calculator,
+)
 from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import get_all_rng_states, model_parallel_cuda_manual_seed
@@ -31,7 +47,7 @@ from megatron.core.transformer.hyper_connection import HyperConnectionModule
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import HyperConnectionTransformerLayer
-from megatron.core.utils import get_batch_on_this_tp_rank
+from megatron.core.utils import get_batch_on_this_cp_rank, get_batch_on_this_tp_rank
 from megatron.training.models.dist_utils import _ddp_wrap
 from tests.unit_tests.test_utilities import Utils
 
@@ -60,7 +76,17 @@ def _restore_rng(snapshot):
 
 
 def _build_models(
-    model_kind, dtype, graph_impl, pp_size, vp_size, dropout, *, te_graph_modules=None
+    model_kind,
+    dtype,
+    graph_impl,
+    pp_size,
+    vp_size,
+    dropout,
+    *,
+    te_graph_modules=None,
+    tp_size=1,
+    cp_size=1,
+    ep_size=1,
 ):
     is_hybrid = model_kind.startswith("hybrid")
     is_moe = "moe" in model_kind
@@ -73,6 +99,11 @@ def _build_models(
         hidden_size=64,
         ffn_hidden_size=128,
         num_attention_heads=4,
+        tensor_model_parallel_size=tp_size,
+        context_parallel_size=cp_size,
+        expert_model_parallel_size=ep_size,
+        expert_tensor_parallel_size=tp_size,
+        sequence_parallel=tp_size > 1,
         pipeline_model_parallel_size=pp_size,
         virtual_pipeline_model_parallel_size=vp_size,
         microbatch_group_size_per_vp_stage=pp_size,
@@ -88,7 +119,8 @@ def _build_models(
         cuda_graph_modules=te_graph_modules if graph_impl == "transformer_engine" else [],
         use_te_rng_tracker=graph_impl == "transformer_engine",
         cuda_graph_warmup_steps=_WARMUP_STEPS,
-        attention_backend=AttnBackend.unfused,
+        attention_backend=AttnBackend.fused if cp_size > 1 else AttnBackend.unfused,
+        cp_comm_type="p2p" if cp_size > 1 else None,
         attention_dropout=dropout,
         hidden_dropout=dropout,
         normalization="RMSNorm",
@@ -115,6 +147,13 @@ def _build_models(
         finalize_model_grads_func=finalize_model_grads,
     )
     groups = ProcessGroupCollection.use_mpu_process_groups()
+    assert (groups.tp.size(), groups.pp.size(), groups.cp.size(), groups.ep.size()) == (
+        tp_size,
+        pp_size,
+        cp_size,
+        ep_size,
+    )
+    assert groups.expt_tp.size() == tp_size
     models = []
     for chunk_index in range(num_chunks):
         vp_stage = chunk_index if vp_size is not None else None
@@ -176,11 +215,13 @@ def _named_parameters(models):
     }
 
 
-def _make_batch(iteration, microbatch):
+def _make_batch(iteration, microbatch, data_parallel_rank=0):
     # No RNG consumption from the data loader: dropout's state trajectory can be
     # compared independently from changed inputs on every training iteration.
     positions = torch.arange(_SEQ_LENGTH, device="cuda").unsqueeze(0)
-    tokens = (positions + 7 * iteration + 3 * microbatch) % _VOCAB_SIZE
+    # Different DP replicas must contribute different gradients. CP peers use
+    # the same DP rank, then split this global sequence in the forward step.
+    tokens = (positions + 7 * iteration + 3 * microbatch + 17 * data_parallel_rank) % _VOCAB_SIZE
     return {
         "tokens": tokens,
         "labels": (tokens + 1 + iteration) % _VOCAB_SIZE,
@@ -188,6 +229,18 @@ def _make_batch(iteration, microbatch):
         "position_ids": positions,
         "attention_mask": None,
     }
+
+
+def _training_loss(losses, loss_mask):
+    """Use the native sum/token-count contract for CP-correct gradient scaling."""
+    losses = losses.reshape(-1).float()
+    loss_mask = loss_mask.reshape(-1).float()
+    loss_sum = (losses * loss_mask).sum()
+    num_tokens = loss_mask.sum().detach().clone().to(torch.int)
+    # The schedule normalizes the backward loss in place. Keep an independent
+    # local mean for reporting, and avoid its legacy two-value CP multiplier.
+    report = {"loss": loss_sum.detach().clone() / num_tokens.clamp(min=1)}
+    return loss_sum, num_tokens, report
 
 
 def _run_training(models, groups, use_graph, pp_size):
@@ -214,7 +267,7 @@ def _run_training(models, groups, use_graph, pp_size):
             create_attention_mask_in_dataloader=False,
             broadcast_src_rank=torch.distributed.get_global_rank(groups.tp, 0),
             broadcast_group=groups.tp,
-            cp_size=1,
+            cp_size=groups.cp.size(),
             tp_rank=groups.tp.rank(),
             micro_batch_size=1,
             seq_length=_SEQ_LENGTH,
@@ -223,13 +276,16 @@ def _run_training(models, groups, use_graph, pp_size):
             is_pipeline_first_stage=module.pre_process,
             is_pipeline_last_stage=module.post_process,
         )
+        if groups.cp.size() > 1:
+            batch = get_batch_on_this_cp_rank(batch, is_hybrid_cp=False, cp_group=groups.cp)
+            if batch.get("tokens") is not None:
+                assert batch["tokens"].shape[1] == _SEQ_LENGTH // groups.cp.size()
         output = model(
             batch["tokens"], batch["position_ids"], batch["attention_mask"], labels=batch["labels"]
         )
 
         def loss_func(losses):
-            loss = (losses.float() * batch["loss_mask"]).mean()
-            return loss, {"loss": loss.detach().clone()}
+            return _training_loss(losses, batch["loss_mask"])
 
         return output, loss_func
 
@@ -242,7 +298,10 @@ def _run_training(models, groups, use_graph, pp_size):
             optimizer.zero_grad(set_to_none=True)
             for model in models:
                 model.zero_grad_buffer()
-            batches = [_make_batch(iteration, index) for index in range(_NUM_MICROBATCHES)]
+            batches = [
+                _make_batch(iteration, index, data_parallel_rank=groups.dp.rank())
+                for index in range(_NUM_MICROBATCHES)
+            ]
             data_iterators = [iter([batch.copy() for batch in batches]) for _ in models]
             losses = run_step(
                 forward_step_func=forward_step,
@@ -320,22 +379,55 @@ def _assert_training_close(actual, expected, dtype):
                 )
 
 
-def _check_training_parity(model_kind, dtype, dropout):
+def _initialize_test_parallelism(model_kind, dtype):
+    """Read the integration topology and initialize its real process groups."""
     pp_size = int(os.environ.get("MHC_CG_PP_SIZE", "1"))
     vp_size = int(os.environ.get("MHC_CG_VP_SIZE", "0")) or None
-    if pp_size < 1 or Utils.world_size % pp_size:
-        pytest.skip("World size must be divisible by the requested PP size")
+    tp_size = int(os.environ.get("MHC_CG_TP_SIZE", "1"))
+    cp_size = int(os.environ.get("MHC_CG_CP_SIZE", "1"))
+    requested_ep_size = int(os.environ.get("MHC_CG_EP_SIZE", "1"))
+    assert min(pp_size, tp_size, cp_size, requested_ep_size) > 0
+    ep_size = requested_ep_size if "moe" in model_kind else 1
+    dense_model_parallel_size = pp_size * tp_size * cp_size
+    assert Utils.world_size % dense_model_parallel_size == 0
+    assert Utils.world_size % (pp_size * tp_size * ep_size) == 0
+    assert vp_size is None or (vp_size > 0 and pp_size > 1), "VPP requires PP > 1"
+    assert _SEQ_LENGTH % (2 * cp_size * tp_size) == 0
+    assert (
+        cp_size == 1 or dtype == torch.bfloat16
+    ), "CP integration uses BF16 fused attention; select the bf16 test cases."
     Utils.initialize_model_parallel(
-        pipeline_model_parallel_size=pp_size, virtual_pipeline_model_parallel_size=vp_size
+        tensor_model_parallel_size=tp_size,
+        pipeline_model_parallel_size=pp_size,
+        virtual_pipeline_model_parallel_size=vp_size,
+        context_parallel_size=cp_size,
+        expert_model_parallel_size=ep_size,
+        expert_tensor_parallel_size=tp_size,
     )
+    dp_size = Utils.world_size // dense_model_parallel_size
+    init_num_microbatches_calculator(
+        rank=torch.distributed.get_rank(),
+        global_batch_size=_NUM_MICROBATCHES * dp_size,
+        micro_batch_size=1,
+        data_parallel_size=dp_size,
+        decrease_batch_size_if_needed=False,
+    )
+    return dict(pp_size=pp_size, vp_size=vp_size, tp_size=tp_size, cp_size=cp_size, ep_size=ep_size)
+
+
+def _check_training_parity(model_kind, dtype, dropout):
+    parallel_sizes = _initialize_test_parallelism(model_kind, dtype)
+    pp_size = parallel_sizes["pp_size"]
     previous_tf32 = torch.backends.cuda.matmul.allow_tf32
     torch.backends.cuda.matmul.allow_tf32 = False
     try:
         torch.manual_seed(1234)
         model_parallel_cuda_manual_seed(1234, te_rng_tracker=True, force_reset_rng=True)
-        eager_models, groups = _build_models(model_kind, dtype, "none", pp_size, vp_size, dropout)
+        eager_models, groups = _build_models(
+            model_kind, dtype, "none", dropout=dropout, **parallel_sizes
+        )
         graph_models, _ = _build_models(
-            model_kind, dtype, "full_iteration", pp_size, vp_size, dropout
+            model_kind, dtype, "full_iteration", dropout=dropout, **parallel_sizes
         )
         eager_parameters = _named_parameters(eager_models)
         graph_parameters = _named_parameters(graph_models)
@@ -358,7 +450,7 @@ def _check_training_parity(model_kind, dtype, dropout):
         mhc_names = [name for name in graph_parameters if "hyper_connection" in name]
         assert mhc_names, "The selected model must contain real mHC parameters"
         assert any(actual[-1]["gradients"][name].count_nonzero() > 0 for name in mhc_names)
-        if model_kind == "hybrid_mtp" and groups.pp.rank() == pp_size - 1:
+        if "mtp" in model_kind and groups.pp.rank() == pp_size - 1:
             mtp_names = [name for name in graph_parameters if ".mtp." in name]
             assert mtp_names
             assert any(actual[-1]["gradients"][name].count_nonzero() > 0 for name in mtp_names)
@@ -370,13 +462,15 @@ def _check_training_parity(model_kind, dtype, dropout):
     finally:
         torch.backends.cuda.matmul.allow_tf32 = previous_tf32
         StaticBufferLoader.static_buffers = {"training": [], "validation": []}
+        destroy_num_microbatches_calculator()
         Utils.destroy_model_parallel()
 
 
 @pytest.mark.launch_on_gb200
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
 @pytest.mark.parametrize(
-    "model_kind", ["gpt_dense", "gpt_moe", "hybrid_dense", "hybrid_moe", "hybrid_mtp"]
+    "model_kind",
+    ["gpt_dense", "gpt_moe", "hybrid_dense", "hybrid_moe", "hybrid_mtp", "hybrid_moe_mtp"],
 )
 def test_mhc_full_iteration_training_parity(model_kind, dtype):
     """Changed batches, all synchronized gradients, and optimizer updates match eager."""

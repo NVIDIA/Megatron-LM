@@ -8,26 +8,38 @@ PRs present, run the identical checks through PP2/VPP2:
     MHC_CG_PP_SIZE=2 MHC_CG_VP_SIZE=2 torchrun --nproc-per-node=4 -m pytest \
         tests/unit_tests/transformer/test_mhc_te_pipeline_training.py
 
+Combine TP/SP or fixed CP with pipeline and ordinary expert parallelism on eight GPUs:
+
+    MHC_CG_PP_SIZE=2 MHC_CG_VP_SIZE=2 MHC_CG_TP_SIZE=2 MHC_CG_EP_SIZE=2 \
+        torchrun --nproc-per-node=8 -m pytest -k hybrid_moe_mtp \
+        tests/unit_tests/transformer/test_mhc_te_pipeline_training.py
+    MHC_CG_PP_SIZE=2 MHC_CG_CP_SIZE=2 MHC_CG_EP_SIZE=2 \
+        torchrun --nproc-per-node=8 -m pytest -k hybrid_moe_mtp \
+        tests/unit_tests/transformer/test_mhc_te_pipeline_training.py
+
+TP > 1 enables SP; expert TP equals TP. CP uses the official fixed-SBHD zigzag
+batch split. Different DP replicas consume different deterministic token batches.
+
 After three eager training warmups, capture real TE callables, then execute five
 changed-input replay steps with synchronized gradients and optimizer updates.
 """
 
-import os
 from collections import Counter
 
 import pytest
 import torch
 
-from megatron.core.num_microbatches_calculator import (
-    destroy_num_microbatches_calculator,
-    init_num_microbatches_calculator,
-)
+from megatron.core.num_microbatches_calculator import destroy_num_microbatches_calculator
 from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.cuda_graphs import TECudaGraphHelper, _get_mtp_te_layers
 from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.module import Float16Module
-from megatron.core.utils import get_batch_on_this_tp_rank, is_te_min_version
+from megatron.core.utils import (
+    get_batch_on_this_cp_rank,
+    get_batch_on_this_tp_rank,
+    is_te_min_version,
+)
 from tests.unit_tests.test_utilities import Utils
 from tests.unit_tests.transformer.test_mhc_full_iteration_training import (
     _NUM_MICROBATCHES,
@@ -36,10 +48,12 @@ from tests.unit_tests.transformer.test_mhc_full_iteration_training import (
     _WARMUP_STEPS,
     _assert_training_close,
     _build_models,
+    _initialize_test_parallelism,
     _make_batch,
     _named_parameters,
     _restore_rng,
     _snapshot_rng,
+    _training_loss,
 )
 
 
@@ -71,7 +85,7 @@ def _run_te_pipeline_training(models, groups, pp_size, use_graph):
             create_attention_mask_in_dataloader=False,
             broadcast_src_rank=torch.distributed.get_global_rank(groups.tp, 0),
             broadcast_group=groups.tp,
-            cp_size=1,
+            cp_size=groups.cp.size(),
             tp_rank=groups.tp.rank(),
             micro_batch_size=1,
             seq_length=_SEQ_LENGTH,
@@ -80,13 +94,16 @@ def _run_te_pipeline_training(models, groups, pp_size, use_graph):
             is_pipeline_first_stage=module.pre_process,
             is_pipeline_last_stage=module.post_process,
         )
+        if groups.cp.size() > 1:
+            batch = get_batch_on_this_cp_rank(batch, is_hybrid_cp=False, cp_group=groups.cp)
+            if batch.get("tokens") is not None:
+                assert batch["tokens"].shape[1] == _SEQ_LENGTH // groups.cp.size()
         output = model(
             batch["tokens"], batch["position_ids"], batch["attention_mask"], labels=batch["labels"]
         )
 
         def loss_func(losses):
-            loss = (losses.float() * batch["loss_mask"]).mean()
-            return loss, {"loss": loss.detach().clone()}
+            return _training_loss(losses, batch["loss_mask"])
 
         return output, loss_func
 
@@ -143,7 +160,10 @@ def _run_te_pipeline_training(models, groups, pp_size, use_graph):
             optimizer.zero_grad(set_to_none=True)
             for model in models:
                 model.zero_grad_buffer()
-            batches = [_make_batch(iteration, index) for index in range(_NUM_MICROBATCHES)]
+            batches = [
+                _make_batch(iteration, index, data_parallel_rank=groups.dp.rank())
+                for index in range(_NUM_MICROBATCHES)
+            ]
             data_iterators = [iter([batch.copy() for batch in batches]) for _ in models]
             losses = forward_backward(
                 forward_step_func=forward_step,
@@ -201,39 +221,30 @@ def _run_te_pipeline_training(models, groups, pp_size, use_graph):
 @pytest.mark.parametrize("model_kind", ["gpt_moe", "hybrid_dense", "hybrid_mtp", "hybrid_moe_mtp"])
 def test_mhc_te_pipeline_training_parity(model_kind):
     """Real TE graph replay matches eager through the selected PP/VPP schedule."""
-    pp_size = int(os.environ.get("MHC_CG_PP_SIZE", "1"))
-    vp_size = int(os.environ.get("MHC_CG_VP_SIZE", "0")) or None
-    assert pp_size > 0 and Utils.world_size % pp_size == 0
-    assert vp_size is None or pp_size > 1, "VPP requires pipeline parallelism"
-    Utils.initialize_model_parallel(
-        pipeline_model_parallel_size=pp_size, virtual_pipeline_model_parallel_size=vp_size
-    )
+    parallel_sizes = _initialize_test_parallelism(model_kind, torch.bfloat16)
+    pp_size = parallel_sizes["pp_size"]
     previous_tf32 = torch.backends.cuda.matmul.allow_tf32
     torch.backends.cuda.matmul.allow_tf32 = False
     try:
-        groups_dp_size = Utils.world_size // pp_size
-        init_num_microbatches_calculator(
-            rank=torch.distributed.get_rank(),
-            global_batch_size=_NUM_MICROBATCHES * groups_dp_size,
-            micro_batch_size=1,
-            data_parallel_size=groups_dp_size,
-            decrease_batch_size_if_needed=False,
-        )
         torch.manual_seed(1234)
         model_parallel_cuda_manual_seed(1234, te_rng_tracker=True, force_reset_rng=True)
         scopes = [CudaGraphModule.attn]
         scopes.append(CudaGraphModule.moe_router if "moe" in model_kind else CudaGraphModule.mlp)
         eager_models, groups = _build_models(
-            model_kind, torch.bfloat16, "none", pp_size, vp_size, 0.0, te_graph_modules=scopes
+            model_kind,
+            torch.bfloat16,
+            "none",
+            dropout=0.0,
+            te_graph_modules=scopes,
+            **parallel_sizes,
         )
         graph_models, _ = _build_models(
             model_kind,
             torch.bfloat16,
             "transformer_engine",
-            pp_size,
-            vp_size,
-            0.0,
+            dropout=0.0,
             te_graph_modules=scopes,
+            **parallel_sizes,
         )
         eager_parameters = _named_parameters(eager_models)
         graph_parameters = _named_parameters(graph_models)
