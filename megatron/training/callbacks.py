@@ -83,33 +83,20 @@ class CallbackContext:
         total_loss_dict: Aggregated eval losses. Available in on_eval_end.
         timers_to_log: Mutable timer-name list; append to include extra timers. In on_log.
         log_fragments: Mutable list; append strings to extend the stdout log line. In on_log.
-
-    Field Availability by Event:
-        All events: model (None in on_setup_start), user_state
-        Training events: optimizer, scheduler
-        on_data_init_start: optimizer, scheduler
-        on_train_step_end: loss_dict, grad_norm, skipped_iter
-        on_eval_end, on_test_end: total_loss_dict
-        on_log: timers_to_log, log_fragments
     """
 
-    # Always available (model is None in on_setup_start, before it is built)
     model: list[MegatronModule] | None
     user_state: dict = field(default_factory=dict)
 
-    # Training events only
     optimizer: MegatronOptimizer | None = None
     scheduler: OptimizerParamScheduler | None = None
 
-    # on_train_step_end
     loss_dict: dict[str, torch.Tensor] | None = None
     grad_norm: float | None = None
     skipped_iter: bool | None = None
 
-    # on_eval_end
     total_loss_dict: dict[str, torch.Tensor] | None = None
 
-    # on_log
     timers_to_log: list[str] | None = None
     log_fragments: list[str] | None = None
 
@@ -234,12 +221,27 @@ class CallbackManager:
         """Initialize the callback manager with empty callback lists and user state."""
         self._callbacks: dict[str, list[Callable[[CallbackContext], None]]] = {event: [] for event in VALID_EVENTS}
         self._active_events: set[str] = set()
-        self._user_state: dict = {}
+        self._callback_context: CallbackContext = CallbackContext(model=None, user_state={})
+
+    @property
+    def callback_context(self) -> CallbackContext:
+        """Mutable dataclass for tracking context passed to callbacks.
+
+        Updated by the training loop when new context becomes available.
+
+        Field Availability by Event:
+            user_state: Available in all events.
+            model, optimizer, scheduler: Available from on_data_init_start onward.
+            log_fragments, timers_to_log: Available from first on_log onward.
+            loss_dict, grad_norm, skipped_iter: Available from first on_train_step_end onward.
+            total_loss_dict: Available from first on_eval_end onward.
+        """
+        return self._callback_context
 
     @property
     def user_state(self) -> dict:
         """Mutable dictionary for storing user data across callback invocations."""
-        return self._user_state
+        return self._callback_context.user_state
 
     def add(self, callback: Callback | list[Callback]) -> None:
         """Register one or more Callback instances.
@@ -333,17 +335,16 @@ class CallbackManager:
         """
         return event_name in self._active_events
 
-    def fire(self, event_name: str, context: CallbackContext) -> None:
+    def fire(self, event_name: str) -> None:
         """Execute all callbacks for an event.
 
         Exceptions from callbacks propagate to the caller.
 
         Args:
             event_name: Name of the event to fire.
-            context: CallbackContext to pass to callbacks.
         """
         for fn in self._callbacks[event_name]:
-            fn(context)
+            fn(self.callback_context)
 
 
 def normalize_callbacks(

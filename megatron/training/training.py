@@ -1849,10 +1849,7 @@ def pretrain(
         checkpointing_context = {}
 
     if should_fire(callback_manager, "on_setup_start"):
-        callback_manager.fire(
-            "on_setup_start",
-            CallbackContext(model=None, user_state=callback_manager.user_state),
-        )
+        callback_manager.fire("on_setup_start")
 
     # Model, optimizer, and learning rate.
     timers('model-and-optimizer-setup', log_level=0).start(barrier=True)
@@ -1967,14 +1964,11 @@ def pretrain(
                 "This flag is only useful when doing refit since the weights are shared with the training model."
             )
 
+    callback_manager.callback_context.model = model
+    callback_manager.callback_context.optimizer = optimizer
+    callback_manager.callback_context.scheduler = opt_param_scheduler
     if should_fire(callback_manager, "on_data_init_start"):
-        context = CallbackContext(
-            model=model,
-            optimizer=optimizer,
-            scheduler=opt_param_scheduler,
-            user_state=callback_manager.user_state,
-        )
-        callback_manager.fire("on_data_init_start", context)
+        callback_manager.fire("on_data_init_start")
 
     # Data stuff. Dataset index / dataloader construction (GPTDataset/BlendedDataset
     # index building or loading from the cache) can be a multi-second chunk of
@@ -3830,18 +3824,12 @@ def training_log(
             total_loss_dict[skipped_iters_key] = 0
             total_loss_dict[nan_iters_key] = 0
 
+        log_fragments: list[str] = []
+        callback_manager.callback_context.log_fragments = log_fragments
+        callback_manager.callback_context.timers_to_log = timers_to_log
         if should_fire(callback_manager, "on_log"):
-            log_fragments: list[str] = []
-            callback_manager.fire(
-                "on_log",
-                CallbackContext(
-                    model=model,
-                    user_state=callback_manager.user_state,
-                    timers_to_log=timers_to_log,
-                    log_fragments=log_fragments,
-                ),
-            )
-            log_string += "".join(log_fragments)
+            callback_manager.fire("on_log")
+        log_string += "".join(log_fragments)
         print_rank_last(log_string)
 
         # OTel: emit training metrics at log interval (export rank only). Loss and
@@ -4744,15 +4732,7 @@ def train(
     _start_otel_train_span()
 
     if should_fire(callback_manager, "on_train_start"):
-        callback_manager.fire(
-            "on_train_start",
-            CallbackContext(
-                model=model,
-                user_state=callback_manager.user_state,
-                optimizer=optimizer,
-                scheduler=opt_param_scheduler,
-            ),
-        )
+        callback_manager.fire("on_train_start")
 
     # Run training iterations till done.
     buffered_rollouts = None
@@ -4904,15 +4884,7 @@ def train(
         else:
 
             if should_fire(callback_manager, "on_train_step_start"):
-                callback_manager.fire(
-                    "on_train_step_start",
-                    CallbackContext(
-                        model=model,
-                        user_state=callback_manager.user_state,
-                        optimizer=optimizer,
-                        scheduler=opt_param_scheduler,
-                    ),
-                )
+                callback_manager.fire("on_train_step_start")
 
             # OTel: dedicated span for the first iteration actually executed in this
             # process (post checkpoint-resume, post iteration-skip) — not iteration 1,
@@ -4959,19 +4931,11 @@ def train(
                         _step_span, {'megatron.skipped': bool(skipped_iter)}
                     )
 
+            callback_manager.callback_context.loss_dict = loss_dict
+            callback_manager.callback_context.grad_norm = grad_norm
+            callback_manager.callback_context.skipped_iter = bool(skipped_iter)
             if should_fire(callback_manager, "on_train_step_end"):
-                callback_manager.fire(
-                    "on_train_step_end",
-                    CallbackContext(
-                        model=model,
-                        user_state=callback_manager.user_state,
-                        optimizer=optimizer,
-                        scheduler=opt_param_scheduler,
-                        loss_dict=loss_dict,
-                        grad_norm=grad_norm,
-                        skipped_iter=bool(skipped_iter),
-                    ),
-                )
+                callback_manager.fire("on_train_step_end")
 
         if should_checkpoint:
             save_checkpoint_and_time(
@@ -5286,15 +5250,7 @@ def train(
         shutdown_rl_profiler()
 
     if should_fire(callback_manager, "on_train_end"):
-        callback_manager.fire(
-            "on_train_end",
-            CallbackContext(
-                model=model,
-                user_state=callback_manager.user_state,
-                optimizer=optimizer,
-                scheduler=opt_param_scheduler,
-            ),
-        )
+        callback_manager.fire("on_train_end")
 
     # If any exit conditions (signal handler, duration, iterations) have been reached, exit.
     if should_exit:
@@ -5455,13 +5411,7 @@ def evaluate(
             ft_integration.on_eval_step_start()
 
             if should_fire(callback_manager, step_start_event):
-                callback_manager.fire(
-                    step_start_event,
-                    CallbackContext(
-                        model=model,
-                        user_state=callback_manager.user_state,
-                    ),
-                )
+                callback_manager.fire(step_start_event)
 
             with _otel_managed_span('evaluate', 'megatron.evaluate.step',
                                     **{'megatron.eval_iteration': iteration}):
@@ -5480,13 +5430,7 @@ def evaluate(
                 )
 
             if should_fire(callback_manager, step_end_event):
-                callback_manager.fire(
-                    step_end_event,
-                    CallbackContext(
-                        model=model,
-                        user_state=callback_manager.user_state,
-                    ),
-                )
+                callback_manager.fire(step_end_event)
 
             ft_integration.on_eval_step_end()
             config.timers = get_timers()
@@ -5642,13 +5586,7 @@ def evaluate_and_print_results(
             f"the number of validation datasets ({len(data_iterators)})"
 
     if should_fire(callback_manager, start_event):
-        callback_manager.fire(
-            start_event,
-            CallbackContext(
-                model=model,
-                user_state=callback_manager.user_state,
-            ),
-        )
+        callback_manager.fire(start_event)
 
     for index, (iterator, iterations) in enumerate(zip(data_iterators, eval_iters)):
         suffix = ""
@@ -5705,15 +5643,9 @@ def evaluate_and_print_results(
         print_rank_last(string)
         print_rank_last('-' * length)
 
+    callback_manager.callback_context.total_loss_dict = total_loss_dict
     if should_fire(callback_manager, end_event):
-        callback_manager.fire(
-            end_event,
-            CallbackContext(
-                model=model,
-                user_state=callback_manager.user_state,
-                total_loss_dict=total_loss_dict,
-            ),
-        )
+        callback_manager.fire(end_event)
 
 
 def cyclic_iter(iterable):

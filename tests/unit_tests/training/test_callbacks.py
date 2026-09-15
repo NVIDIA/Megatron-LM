@@ -230,9 +230,9 @@ class TestCallbackManagerFire:
         fn1, fn2 = Mock(), Mock()
         manager.register("on_train_start", fn1)
         manager.register("on_train_start", fn2)
+        context = manager.callback_context
 
-        context = Mock(spec=CallbackContext)
-        manager.fire("on_train_start", context)
+        manager.fire("on_train_start")
 
         fn1.assert_called_once_with(context)
         fn2.assert_called_once_with(context)
@@ -246,7 +246,7 @@ class TestCallbackManagerFire:
         manager.register("on_train_start", lambda ctx: call_order.append(2))
         manager.register("on_train_start", lambda ctx: call_order.append(3))
 
-        manager.fire("on_train_start", Mock(spec=CallbackContext))
+        manager.fire("on_train_start")
 
         assert call_order == [1, 2, 3]
 
@@ -267,7 +267,7 @@ class TestCallbackManagerFire:
         manager.register("on_train_start", lambda ctx: call_order.append("fn_middle"))
         manager.add(LastCallback())
 
-        manager.fire("on_train_start", Mock(spec=CallbackContext))
+        manager.fire("on_train_start")
 
         assert call_order == ["class_first", "fn_middle", "class_last"]
 
@@ -276,7 +276,7 @@ class TestCallbackManagerFire:
         manager = CallbackManager()
 
         # Should not raise
-        manager.fire("on_train_start", Mock(spec=CallbackContext))
+        manager.fire("on_train_start")
 
     def test_fire_only_fires_requested_event(self):
         """fire() only invokes callbacks for the specified event."""
@@ -287,7 +287,7 @@ class TestCallbackManagerFire:
         manager.register("on_train_start", train_fn)
         manager.register("on_eval_start", eval_fn)
 
-        manager.fire("on_train_start", Mock(spec=CallbackContext))
+        manager.fire("on_train_start")
 
         train_fn.assert_called_once()
         eval_fn.assert_not_called()
@@ -298,7 +298,7 @@ class TestCallbackManagerFire:
         manager.register("on_train_start", lambda ctx: 1 / 0)
 
         with pytest.raises(ZeroDivisionError):
-            manager.fire("on_train_start", Mock(spec=CallbackContext))
+            manager.fire("on_train_start")
 
     def test_exception_stops_subsequent_callbacks(self):
         """When a callback raises, subsequent callbacks are not called."""
@@ -311,7 +311,7 @@ class TestCallbackManagerFire:
         manager.register("on_train_start", second_fn)
 
         with pytest.raises(ZeroDivisionError):
-            manager.fire("on_train_start", Mock(spec=CallbackContext))
+            manager.fire("on_train_start")
 
         first_fn.assert_called_once()
         second_fn.assert_not_called()
@@ -378,6 +378,42 @@ class TestCallbackManagerIntrospection:
         # Returns False rather than raising - defensive behavior
         assert not manager.has_callbacks("invalid_event")
 
+    def test_callback_context_has_expected_initial_values(self):
+        """A new manager exposes an empty context before setup starts."""
+        context = CallbackManager().callback_context
+
+        assert isinstance(context, CallbackContext)
+        assert context.model is None
+        assert context.user_state == {}
+        assert context.optimizer is None
+        assert context.scheduler is None
+        assert context.loss_dict is None
+        assert context.grad_norm is None
+        assert context.skipped_iter is None
+        assert context.total_loss_dict is None
+        assert context.timers_to_log is None
+        assert context.log_fragments is None
+
+    def test_callback_context_is_persistent_across_events(self):
+        """Callbacks receive one mutable context for the manager lifetime."""
+        manager = CallbackManager()
+        received_contexts = []
+        manager.register("on_train_start", received_contexts.append)
+        manager.register("on_train_end", received_contexts.append)
+
+        context = manager.callback_context
+        context.user_state["started"] = True
+        manager.fire("on_train_start")
+        context.loss_dict = {"loss": Mock()}
+        manager.fire("on_train_end")
+
+        assert manager.callback_context is context
+        assert manager.user_state is context.user_state
+        assert received_contexts[0] is context
+        assert received_contexts[1] is context
+        assert received_contexts[1].user_state["started"] is True
+        assert received_contexts[1].loss_dict is context.loss_dict
+
 
 class TestUserStatePersistence:
     """Test that user_state persists across callback invocations."""
@@ -391,11 +427,9 @@ class TestUserStatePersistence:
 
         manager.register("on_train_step_end", increment_counter)
 
-        # Simulate what framework does - same user_state dict each time
-        persistent_state = {}
+        persistent_state = manager.callback_context.user_state
         for _ in range(5):
-            ctx = CallbackContext(model=[Mock()], user_state=persistent_state)
-            manager.fire("on_train_step_end", ctx)
+            manager.fire("on_train_step_end")
 
         assert persistent_state["counter"] == 5
 
@@ -412,13 +446,9 @@ class TestUserStatePersistence:
         manager.register("on_train_start", write_start_time)
         manager.register("on_train_end", read_start_time)
 
-        persistent_state = {}
-
-        ctx1 = CallbackContext(model=[Mock()], user_state=persistent_state)
-        manager.fire("on_train_start", ctx1)
-
-        ctx2 = CallbackContext(model=[Mock()], user_state=persistent_state)
-        manager.fire("on_train_end", ctx2)
+        persistent_state = manager.callback_context.user_state
+        manager.fire("on_train_start")
+        manager.fire("on_train_end")
 
         assert persistent_state["start_time"] == 100
         assert persistent_state["elapsed"] == 100
