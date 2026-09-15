@@ -163,7 +163,7 @@ workload rather than generalizing from any single comparison.
 > For routed-expert-only quantization, match `*mlp.experts.linear_fc1` and
 > `*mlp.experts.linear_fc2` to MXFP8, with an MTP BF16 rule first and a catch-all
 > BF16 rule last. See
-> [TE precision recipes](../megatron/core/extensions/TransformerEngineMixedPrecision.md).
+> [TE precision recipes](https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/core/extensions/TransformerEngineMixedPrecision.md).
 >
 > Within one MoE layer, every local expert's FC1 and FC2 weight must use the same
 > precision. The `flashinfer`, `torch`, and `vllm` grouped-GEMM backends support
