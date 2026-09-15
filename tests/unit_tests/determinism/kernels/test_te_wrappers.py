@@ -248,3 +248,30 @@ def test_te_fused_rope_replays_fwd_bwd(layout):
         assert_replays_bit_exact(fn, (t,), replays=3, what=f"TE fused RoPE[{layout}]")
     finally:
         Utils.destroy_model_parallel()
+
+
+# --- TE Gated Delta Net attention ----------------------------------------------------------------
+
+
+def test_te_gated_delta_net_attention_replays():
+    """TE GatedDeltaNetAttention adapter (the ``transformer_engine`` GDN backend) replays bit-exact."""
+    from megatron.core.extensions.transformer_engine import HAVE_TE_GDN, TEGatedDeltaNetAttention
+
+    if not HAVE_TE_GDN:
+        pytest.skip("Transformer Engine GatedDeltaNetAttention (GDN) is not available here")
+
+    seeded()
+    b, s, h, qk_dim, v_dim = 2, 2048, 16, 128, 128
+    module = TEGatedDeltaNetAttention(
+        num_attention_heads=h, qk_head_dim=qk_dim, value_head_dim=v_dim, layer_number=1
+    ).cuda()
+    q = torch.randn(b, s, h, qk_dim, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    k = torch.randn(b, s, h, qk_dim, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    v = torch.randn(b, s, h, v_dim, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    g = (-torch.rand(b, s, h, device="cuda") * 0.1).requires_grad_(True)
+    beta = torch.rand(b, s, h, device="cuda").requires_grad_(True)
+
+    def fn(q, k, v, g, beta):
+        return module(q, k, v, g, beta, output_final_state=True, use_qk_l2norm_in_kernel=True)
+
+    assert_replays_bit_exact(fn, (q, k, v, g, beta), replays=4, what="TEGatedDeltaNetAttention")

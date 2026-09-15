@@ -353,3 +353,35 @@ def test_fla_chunk_gated_delta_rule_replays_fwd_bwd():
         return o, state
 
     assert_replays_bit_exact(fn, (q, k, v, g, beta), replays=4, what="fla chunk_gated_delta_rule")
+
+
+def test_torch_chunk_gdn2_replays_fwd_bwd():
+    """The torch GDN2 path ``--deterministic-mode`` selects (the FLA chunk_gdn2 is not deterministic)."""
+    from megatron.core.ssm.gated_delta_net.gdn2 import torch_chunk_gdn2
+
+    seeded()
+    B, T, H, K = 2, 2048, 16, 128
+    q = torch.randn(B, T, H, K, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    k = torch.randn(B, T, H, K, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    v = torch.randn(B, T, H, K, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    g = (-torch.rand(B, T, H, K, device="cuda") * 0.1).requires_grad_(True)
+    b = torch.rand(B, T, H, K, device="cuda", dtype=torch.bfloat16).requires_grad_(True)
+    w = torch.rand(B, T, H, K, device="cuda", dtype=torch.bfloat16).requires_grad_(True)
+
+    def fn(q, k, v, g, b, w):
+        # Normalise outside so the test only depends on the torch path, matching
+        # test_torch_chunk_gated_delta_rule_replays_fwd_bwd above.
+        o, state = torch_chunk_gdn2(
+            torch.nn.functional.normalize(q, dim=-1),
+            torch.nn.functional.normalize(k, dim=-1),
+            v,
+            g,
+            b,
+            w,
+            chunk_size=64,
+            output_final_state=True,
+            use_qk_l2norm_in_kernel=False,
+        )
+        return o, state
+
+    assert_replays_bit_exact(fn, (q, k, v, g, b, w), replays=3, what="torch_chunk_gdn2")
