@@ -158,6 +158,14 @@ def build_inference_pg_collection(
         tp_ep_pp=tp_ep_pp_group,
         dp_cp=dp_cp_group,
         tp_dp_cp=tp_dp_cp_group,
+        # Declare the GTP_remat axes OFF rather than leaving them unset. An inference
+        # layout never rematerializes weights, and `resolve_gtp_remat_group` falls back
+        # to the MPU globals for a field that is absent from `vars(pg_collection)` --
+        # which would hand this collection the *training* GTP layout and build a
+        # GTP-sharded inference model. Passing None explicitly puts the field in
+        # `vars()`, so the fallback is not taken.
+        gtp_remat=None,
+        expt_gtp_remat=None,
     )
 
 
