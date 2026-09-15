@@ -1259,6 +1259,9 @@ class MultiTokenPredictionLayer(MegatronModule):
         )
         self.vp_stage = vp_stage
         self.cp_group = pg_collection.cp
+        # Build-time CP group, kept so runtime (hybrid/dynamic) CP can restore
+        # it on microbatches that carry no per-microbatch CP group.
+        self._build_time_cp_group = pg_collection.cp
         self.tp_group = pg_collection.tp if pg_collection is not None else None
         self.mtp_layer_pattern = mtp_layer_pattern
         self.mhc_enabled = self.config.enable_mhc_connections
@@ -1945,6 +1948,18 @@ class MultiTokenPredictionLayer(MegatronModule):
             [s, b, h], and optionally the updated context tensor if cross-attention is used.
         """
         assert context is None, "multi token prediction + cross attention is not yet supported."
+        # Hybrid/dynamic CP: bind the sub-sample's runtime CP group
+        # (packed_seq_params.cp_group) so the roll_tensor calls in
+        # _get_embeddings shift input_ids/position_ids/padding_mask across the
+        # group this microbatch was actually sharded with; the build-time
+        # group reports cp_size=1 under dynamic CP. Restore the build-time
+        # group when no runtime group is bound (e.g. local_cp_size == 1
+        # sub-samples): the previous microbatch may have left another group
+        # behind.
+        if packed_seq_params is not None and packed_seq_params.cp_group is not None:
+            self.cp_group = packed_seq_params.cp_group
+        elif self.cp_group is not self._build_time_cp_group:
+            self.cp_group = self._build_time_cp_group
         input_ids, position_ids, padding_mask, mtp_input_mask, decoder_input, hidden_states = (
             self._get_embeddings(
                 input_ids=input_ids,
