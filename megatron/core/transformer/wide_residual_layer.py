@@ -194,6 +194,21 @@ class StreamwiseSigmoidWideResidualConnection(ResidualConnection):
             (),
         )
 
+    def _read_with_output_dtype(
+        self, hidden_states: Tensor, *, output_dtype: torch.dtype | None
+    ) -> tuple[Tensor, ResidualConnectionWriteState]:
+        """Fuse an optional branch-output conversion into the streamwise read."""
+
+        return (
+            streamwise_sigmoid_read(
+                hidden_states,
+                self.read_map(return_logits=True),
+                self.num_streams,
+                output_dtype=output_dtype,
+            ),
+            (),
+        )
+
     def _write(
         self,
         branch_output: ResidualBranchOutput,
@@ -208,7 +223,18 @@ class StreamwiseSigmoidWideResidualConnection(ResidualConnection):
         else:
             branch_update, bias = branch_output, None
 
-        branch_update = branch_update.to(dtype=residual_stream.dtype)
+        dropout_is_active = training and dropout_probability > 0.0
+        defer_update_cast = (
+            residual_stream.dtype == torch.float32
+            and branch_update.dtype in (torch.bfloat16, torch.float16)
+            and bias is None
+            and not dropout_is_active
+        )
+        # Bias addition and active dropout currently run in residual precision. Only defer the
+        # update cast when neither operation can observe its placement; the mixed-dtype Triton
+        # write then performs the BF16/FP16 -> FP32 conversion while loading the update.
+        if not defer_update_cast:
+            branch_update = branch_update.to(dtype=residual_stream.dtype)
         if bias is not None:
             branch_update = branch_update + bias.to(
                 device=branch_update.device, dtype=branch_update.dtype

@@ -1680,10 +1680,6 @@ class TransformerConfig(ModelParallelConfig):
                     "wide_residual is not compatible with inference_fuse_tp_communication. "
                     "The fused inference path assumes an ordinary-width residual tensor."
                 )
-            if self.fp32_residual_connection:
-                raise NotImplementedError(
-                    "wide_residual does not yet support fp32_residual_connection."
-                )
             if self.heterogeneous_block_specs:
                 raise NotImplementedError(
                     "wide_residual does not yet support heterogeneous_block_specs. "

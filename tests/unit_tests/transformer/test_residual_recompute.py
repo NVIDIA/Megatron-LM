@@ -143,8 +143,11 @@ class _StaticResidualChain(nn.Module):
 
 class _ConfigNorm(nn.LayerNorm):
     def __init__(self, config, hidden_size, eps=None):
-        del config
         super().__init__(hidden_size, eps=eps or 1.0e-5)
+        self.output_dtype = config.params_dtype
+
+    def forward(self, hidden_states):
+        return super().forward(hidden_states.to(dtype=self.output_dtype))
 
 
 class _TransformerBranch(nn.Module):
@@ -242,15 +245,22 @@ def _process_groups() -> ProcessGroupCollection:
 
 
 def _wide_recompute_config(
-    *, num_layers: int = 2, activation_offloading: bool = False
+    *,
+    num_layers: int = 2,
+    hidden_size: int = 8,
+    activation_offloading: bool = False,
+    fp32_residual_connection: bool = False,
 ) -> TransformerConfig:
     return TransformerConfig(
         num_layers=num_layers,
-        hidden_size=8,
+        hidden_size=hidden_size,
         num_attention_heads=2,
         hidden_dropout=0.0,
         bias_dropout_fusion=False,
         use_cpu_initialization=True,
+        bf16=fp32_residual_connection,
+        params_dtype=torch.bfloat16 if fp32_residual_connection else torch.float32,
+        fp32_residual_connection=fp32_residual_connection,
         recompute_granularity="selective",
         recompute_modules=["residual_stream"],
         residual_stream_recompute_num_layers=2,
@@ -320,6 +330,75 @@ def _assert_matching_gradients(reference: nn.Module, recomputed: nn.Module) -> N
     ):
         assert reference_name == recomputed_name
         torch.testing.assert_close(recomputed_parameter.grad, reference_parameter.grad)
+
+
+def test_legacy_residual_connection_subclass_honors_requested_branch_dtype():
+    """Existing subclasses inherit the default terminal-cast compatibility hook."""
+
+    connection = _StaticTestConnection(stream_width=12, branch_width=6)
+    hidden_states = torch.randn(4, 12, dtype=torch.float32)
+
+    branch_input, state = connection(
+        hidden_states,
+        operation="read",
+        fp32_residual_connection=True,
+        branch_input_dtype=torch.bfloat16,
+    )
+
+    expected = (hidden_states @ connection.read_map).to(torch.bfloat16)
+    assert branch_input.dtype == torch.bfloat16
+    assert torch.equal(branch_input, expected)
+    assert connection.residual_stream(state) is hidden_states
+
+
+def test_checkpoint_fp32_state_promotion_aliases_an_already_fp32_stream():
+    """Replay's defensive FP32 promotion must not allocate for normal FP32 ingress."""
+
+    connection = _StaticTestConnection(stream_width=12, branch_width=6)
+    hidden_states = torch.randn(4, 12, dtype=torch.float32, requires_grad=True)
+    context = build_residual_stream_recompute_plan(num_layers=1, block_size=1)[0]
+
+    _, state = checkpoint_residual_read(
+        connection,
+        hidden_states,
+        context,
+        fp32_residual_connection=True,
+        branch_input_dtype=torch.bfloat16,
+    )
+
+    residual_stream = connection.residual_stream(state)
+    assert residual_stream is hidden_states
+    assert residual_stream.data_ptr() == hidden_states.data_ptr()
+
+
+@pytest.mark.parametrize("invalid_dtype", ["bfloat16", torch.int32])
+def test_residual_connection_rejects_invalid_branch_dtype(invalid_dtype):
+    connection = _StaticTestConnection(stream_width=12, branch_width=6)
+    hidden_states = torch.randn(4, 12)
+
+    with pytest.raises(TypeError, match="branch_input_dtype"):
+        connection(
+            hidden_states,
+            operation="read",
+            fp32_residual_connection=False,
+            branch_input_dtype=invalid_dtype,
+        )
+
+
+def test_residual_connection_rejects_branch_dtype_on_write():
+    connection = _StaticTestConnection(stream_width=12, branch_width=6)
+    hidden_states = torch.randn(4, 12)
+    branch_input, state = connection(hidden_states, operation="read")
+
+    with pytest.raises(TypeError, match="read-only"):
+        connection(
+            branch_input,
+            operation="write",
+            state=state,
+            branch_input_dtype=torch.bfloat16,
+            dropout_probability=0.0,
+            training=False,
+        )
 
 
 class TestResidualStreamRecomputePlan:
@@ -490,23 +569,44 @@ class TestResidualStreamRecomputeIntegration:
         _assert_matching_gradients(reference, recomputed)
         assert operation_counts == {"connections": 7, "norms": 4, "branches": 2}
 
-    def test_transformer_block_matches_eager_forward_and_backward(self):
-        recomputed_config = _wide_recompute_config()
+    @pytest.mark.parametrize(
+        "fp32_residual_connection", [False, True], ids=["native-residual", "fp32-residual"]
+    )
+    def test_transformer_block_matches_eager_forward_and_backward(self, fp32_residual_connection):
+        recomputed_config = _wide_recompute_config(
+            fp32_residual_connection=fp32_residual_connection
+        )
         reference_config = copy.deepcopy(recomputed_config)
         reference_config.recompute_granularity = None
         reference_config.recompute_modules = ["core_attn"]
         reference_config.residual_stream_recompute_num_layers = None
 
         torch.manual_seed(1234)
-        reference = TransformerBlock(
-            reference_config, _layer_spec(), post_layer_norm=False, pg_collection=_process_groups()
-        ).cuda()
-        recomputed = TransformerBlock(
-            recomputed_config, _layer_spec(), post_layer_norm=False, pg_collection=_process_groups()
-        ).cuda()
+        reference = (
+            TransformerBlock(
+                reference_config,
+                _layer_spec(),
+                post_layer_norm=False,
+                pg_collection=_process_groups(),
+            )
+            .cuda()
+            .to(dtype=reference_config.params_dtype)
+        )
+        recomputed = (
+            TransformerBlock(
+                recomputed_config,
+                _layer_spec(),
+                post_layer_norm=False,
+                pg_collection=_process_groups(),
+            )
+            .cuda()
+            .to(dtype=recomputed_config.params_dtype)
+        )
         recomputed.load_state_dict(reference.state_dict())
 
-        reference_input = torch.randn(4, 3, 8, device="cuda", requires_grad=True)
+        reference_input = torch.randn(
+            4, 3, 8, device="cuda", dtype=reference_config.params_dtype, requires_grad=True
+        )
         recomputed_input = reference_input.detach().clone().requires_grad_(True)
         reference_output = reference(hidden_states=reference_input, attention_mask=None)
         reference_output.square().mean().backward()
@@ -516,6 +616,9 @@ class TestResidualStreamRecomputeIntegration:
         torch.testing.assert_close(recomputed_output, reference_output)
         torch.testing.assert_close(recomputed_input.grad, reference_input.grad)
         _assert_matching_gradients(reference, recomputed)
+        expected_dtype = torch.float32 if fp32_residual_connection else reference_input.dtype
+        assert reference_output.dtype == expected_dtype
+        assert recomputed_output.dtype == expected_dtype
 
     def test_replay_owns_connected_norms_under_fine_grained_offload(self):
         with pytest.warns(UserWarning, match="Residual-stream recomputation owns"):
@@ -598,20 +701,55 @@ class TestResidualStreamRecomputeIntegration:
         torch.testing.assert_close(offloaded_input.grad, reference_input.grad)
         _assert_matching_gradients(reference, offloaded)
 
-    def test_mamba_layer_matches_eager_forward_and_backward(self):
-        config = _wide_recompute_config(num_layers=1)
+    @pytest.mark.parametrize(
+        "fp32_residual_connection", [False, True], ids=["native-residual", "fp32-residual"]
+    )
+    def test_mamba_layer_matches_eager_forward_and_backward(self, fp32_residual_connection):
+        config = _wide_recompute_config(
+            num_layers=1, hidden_size=64, fp32_residual_connection=fp32_residual_connection
+        )
         layer_spec = _mamba_spec()
         torch.manual_seed(1234)
-        reference = build_module(
-            layer_spec, config=config, layer_number=1, pg_collection=_process_groups()
-        ).cuda()
-        recomputed = build_module(
-            layer_spec, config=config, layer_number=1, pg_collection=_process_groups()
-        ).cuda()
+        reference = (
+            build_module(layer_spec, config=config, layer_number=1, pg_collection=_process_groups())
+            .cuda()
+            .to(dtype=config.params_dtype)
+        )
+        recomputed = (
+            build_module(layer_spec, config=config, layer_number=1, pg_collection=_process_groups())
+            .cuda()
+            .to(dtype=config.params_dtype)
+        )
         recomputed.load_state_dict(reference.state_dict())
 
-        reference_input = torch.randn(4, 3, 24, device="cuda", requires_grad=True)
+        input_dtype = torch.float32 if fp32_residual_connection else config.params_dtype
+        reference_input = torch.randn(
+            128,
+            2,
+            config.wide_residual.num_streams * config.hidden_size,
+            device="cuda",
+            dtype=input_dtype,
+            requires_grad=True,
+        )
         recomputed_input = reference_input.detach().clone().requires_grad_(True)
+        read_dtypes = {"eager": [], "replay": []}
+        state_dtypes = {"eager": [], "replay": []}
+        read_grad_fns = {"eager": [], "replay": []}
+
+        def record_read(mode):
+            def hook(_module, _args, kwargs, output):
+                if kwargs.get("operation") == "read":
+                    branch_input, state = output
+                    read_dtypes[mode].append(branch_input.dtype)
+                    state_dtypes[mode].append(state[0].dtype)
+                    read_grad_fns[mode].append(type(branch_input.grad_fn).__name__)
+
+            return hook
+
+        reference.residual_connection.register_forward_hook(record_read("eager"), with_kwargs=True)
+        recomputed.residual_connection.register_forward_hook(
+            record_read("replay"), with_kwargs=True
+        )
         reference_output = reference(hidden_states=reference_input)
         reference_output.square().mean().backward()
 
@@ -626,9 +764,24 @@ class TestResidualStreamRecomputeIntegration:
         torch.testing.assert_close(recomputed_output, reference_output)
         torch.testing.assert_close(recomputed_input.grad, reference_input.grad)
         _assert_matching_gradients(reference, recomputed)
+        assert read_dtypes["eager"]
+        assert read_dtypes["replay"]
+        assert all(dtype == config.params_dtype for dtype in read_dtypes["eager"])
+        assert all(dtype == config.params_dtype for dtype in read_dtypes["replay"])
+        expected_state_dtype = torch.float32 if fp32_residual_connection else input_dtype
+        assert all(dtype == expected_state_dtype for dtype in state_dtypes["eager"])
+        assert all(dtype == expected_state_dtype for dtype in state_dtypes["replay"])
+        assert all(name == "_StreamwiseSigmoidReadBackward" for name in read_grad_fns["eager"])
+        assert "_StreamwiseSigmoidReadBackward" in read_grad_fns["replay"]
+        assert len(read_grad_fns["replay"]) > len(read_grad_fns["eager"])
 
-    def test_hybrid_stack_matches_eager_forward_and_backward(self):
-        recomputed_config = _wide_recompute_config()
+    @pytest.mark.parametrize(
+        "fp32_residual_connection", [False, True], ids=["native-residual", "fp32-residual"]
+    )
+    def test_hybrid_stack_matches_eager_forward_and_backward(self, fp32_residual_connection):
+        recomputed_config = _wide_recompute_config(
+            fp32_residual_connection=fp32_residual_connection
+        )
         reference_config = copy.deepcopy(recomputed_config)
         reference_config.recompute_granularity = None
         reference_config.recompute_modules = ["core_attn"]
@@ -639,23 +792,32 @@ class TestResidualStreamRecomputeIntegration:
         layer_types = [Symbols.MAMBA, Symbols.ATTENTION]
 
         torch.manual_seed(1234)
-        reference = HybridStack(
-            reference_config,
-            submodules,
-            layer_type_list=layer_types,
-            post_layer_norm=False,
-            pg_collection=_process_groups(),
-        ).cuda()
-        recomputed = HybridStack(
-            recomputed_config,
-            submodules,
-            layer_type_list=layer_types,
-            post_layer_norm=False,
-            pg_collection=_process_groups(),
-        ).cuda()
+        reference = (
+            HybridStack(
+                reference_config,
+                submodules,
+                layer_type_list=layer_types,
+                post_layer_norm=False,
+                pg_collection=_process_groups(),
+            )
+            .cuda()
+            .to(dtype=reference_config.params_dtype)
+        )
+        recomputed = (
+            HybridStack(
+                recomputed_config,
+                submodules,
+                layer_type_list=layer_types,
+                post_layer_norm=False,
+                pg_collection=_process_groups(),
+            )
+            .cuda()
+            .to(dtype=recomputed_config.params_dtype)
+        )
         recomputed.load_state_dict(reference.state_dict())
 
-        reference_input = torch.randn(4, 3, 8, device="cuda", requires_grad=True)
+        input_dtype = torch.float32 if fp32_residual_connection else reference_config.params_dtype
+        reference_input = torch.randn(4, 3, 8, device="cuda", dtype=input_dtype, requires_grad=True)
         recomputed_input = reference_input.detach().clone().requires_grad_(True)
         reference_output = reference(hidden_states=reference_input, attention_mask=None)
         reference_output.square().mean().backward()
@@ -668,6 +830,9 @@ class TestResidualStreamRecomputeIntegration:
         torch.testing.assert_close(recomputed_output, reference_output)
         torch.testing.assert_close(recomputed_input.grad, reference_input.grad)
         _assert_matching_gradients(reference, recomputed)
+        expected_dtype = torch.float32 if fp32_residual_connection else input_dtype
+        assert reference_output.dtype == expected_dtype
+        assert recomputed_output.dtype == expected_dtype
 
     def test_hybrid_mamba_cp_layout_finalizes_before_residual_replay(self, monkeypatch):
         config = _wide_recompute_config(num_layers=1)
