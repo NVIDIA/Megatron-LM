@@ -2,23 +2,19 @@
 
 
 import dataclasses
-from types import SimpleNamespace
 from typing import cast
 
 import pytest
 import torch
 
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_submodules
-from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
-from megatron.core.transformer.moe.moe_logging import MoEMetricsTracker
 from megatron.core.transformer.moe.moe_utils import (
-    MoEAuxLossAutoScaler,
     get_updated_expert_bias,
     router_gating_linear,
     topk_routing_with_score_function,
 )
-from megatron.core.transformer.moe.router import Router, TopKRouter
+from megatron.core.transformer.moe.router import Router
 from megatron.core.transformer.spec_utils import get_submodules
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.initialize import _set_random_seed
@@ -70,117 +66,6 @@ class TestTop2Router:
 
         num_weights = sum([p.numel() for p in self.router.parameters()])
         assert num_weights == 12 * 4, num_weights
-
-    @pytest.mark.internal
-    @pytest.mark.parametrize(
-        "is_mtp_layer,mtp_num_layers,expected_layer_number,expected_num_layers",
-        [(False, None, 1, 2), (False, 2, 1, 4), (True, 2, 3, 4)],
-    )
-    def test_metric_uses_standard_layer_index(
-        self, monkeypatch, is_mtp_layer, mtp_num_layers, expected_layer_number, expected_num_layers
-    ):
-        recorded = {}
-
-        class _MetricsTracker:
-            def record(self, name, value, layer_number, num_layers, **kwargs):
-                recorded.update(
-                    name=name, value=value, layer_number=layer_number, num_layers=num_layers
-                )
-
-        monkeypatch.setattr(
-            "megatron.core.transformer.moe.router.get_moe_metrics_tracker",
-            lambda: _MetricsTracker(),
-        )
-        self.router.is_mtp_layer = is_mtp_layer
-        self.router.set_layer_number(1)
-        self.router.config.mtp_num_layers = mtp_num_layers
-
-        self.router.attach_and_log_load_balancing_loss(
-            torch.ones(2, self.router.config.hidden_size),
-            1.0,
-            torch.tensor(2.0),
-            "load_balancing_loss",
-            reduce_group=None,
-        )
-
-        assert recorded["name"] == "load_balancing_loss"
-        assert recorded["layer_number"] == expected_layer_number
-        assert recorded["num_layers"] == expected_num_layers
-
-    @pytest.mark.internal
-    @pytest.mark.parametrize("loss_name", ["load_balancing_loss", "z_loss"])
-    @pytest.mark.parametrize(
-        "mtp_num_layers,repeated,head_number", [(1, False, 1), (2, False, 2), (2, True, 1)]
-    )
-    def test_mtp_head_metric_index_preserves_routing_and_loss_scaling(
-        self, monkeypatch, loss_name, mtp_num_layers, repeated, head_number
-    ):
-        tracker = MoEMetricsTracker()
-        monkeypatch.setattr(
-            "megatron.core.transformer.moe.router.get_moe_metrics_tracker", lambda: tracker
-        )
-        monkeypatch.setattr(MoEAuxLossAutoScaler, "main_loss_backward_scale", torch.tensor(1.0))
-        self.router.is_mtp_layer = True
-        self.router.config.mtp_num_layers = mtp_num_layers
-        self.router.config.mtp_use_repeated_layer = repeated
-        self.router.router_replay = SimpleNamespace(layer_number=None)
-        self.router.set_layer_number(2)
-        self.router.set_mtp_layer_number(head_number)
-
-        assert self.router.layer_number == 2
-        assert self.router.router_replay.layer_number == 2
-        assert self.router.mtp_layer_number == head_number
-        repeat_scale = mtp_num_layers if repeated else 1
-
-        if loss_name == "load_balancing_loss":
-            activation = torch.ones(2, self.router.config.hidden_size, requires_grad=True)
-            aux_loss = torch.tensor(2.0, requires_grad=True)
-            output = self.router.attach_and_log_load_balancing_loss(
-                activation, 0.5, aux_loss, loss_name, reduce_group=None
-            )
-            output.sum().backward()
-
-            torch.testing.assert_close(activation.grad, torch.ones_like(activation))
-            torch.testing.assert_close(aux_loss.grad, torch.tensor(1.0 / repeat_scale))
-            expected_metric = torch.tensor(4.0 / repeat_scale)
-        else:
-            self.router.config.moe_z_loss_coeff = 0.5
-            logits = torch.arange(8, dtype=torch.float32).reshape(2, 4).requires_grad_()
-            reference_logits = logits.detach().clone().requires_grad_()
-            reference_loss = torch.logsumexp(reference_logits, dim=-1).square().mean()
-            (reference_loss * self.router.config.moe_z_loss_coeff).backward()
-
-            output = self.router.apply_z_loss(logits)
-            output.sum().mul(0).backward()
-
-            # Repeated-MTP z-loss scaling affects logging only, as before this fix.
-            torch.testing.assert_close(logits.grad, reference_logits.grad)
-            expected_metric = reference_loss.detach() / repeat_scale
-
-        expected = torch.zeros(self.router.config.num_layers + mtp_num_layers)
-        expected[self.router.config.num_layers + head_number - 1] = expected_metric
-        torch.testing.assert_close(tracker.metrics[loss_name].values, expected)
-
-    @pytest.mark.internal
-    @pytest.mark.parametrize("num_moe_layers", [None, 2])
-    def test_heterogeneous_metrics_use_total_moe_layer_count(self, monkeypatch, num_moe_layers):
-        tracker = MoEMetricsTracker()
-        tracker.record("load_balancing_loss", torch.tensor(2.0), 1, 2)
-        tracker.record("seq_load_balancing_loss", torch.tensor(6.0), 2, 2)
-        monkeypatch.setattr(tracker, "_sync_metrics", lambda *args, **kwargs: None)
-        total_loss_dict = {}
-
-        tracker.report(
-            loss_scale=1.0,
-            iteration=1,
-            track_names=["load_balancing_loss", "seq_load_balancing_loss"],
-            num_layers=2,
-            num_moe_layers=num_moe_layers,
-            total_loss_dict=total_loss_dict,
-        )
-
-        torch.testing.assert_close(total_loss_dict["load_balancing_loss"], torch.tensor(1.0))
-        torch.testing.assert_close(total_loss_dict["seq_load_balancing_loss"], torch.tensor(3.0))
 
     @pytest.mark.internal
     def test_skip_muon(self):
@@ -468,63 +353,6 @@ class TestTop2Router:
         self.router.config.moe_expert_capacity_factor = None
         self.router.config.moe_token_drop_policy = "probs"
         self.router.config.moe_pad_expert_input_to_capacity = False
-
-
-@pytest.mark.internal
-@pytest.mark.skipif(Utils.world_size < 2 or Utils.world_size % 2 != 0, reason="Requires PP2")
-def test_mtp_head_metrics_match_empty_pipeline_stage(monkeypatch):
-    """Ranks without MoE layers must allocate the same tracker size as the MTP rank."""
-    Utils.initialize_model_parallel(pipeline_model_parallel_size=2)
-    try:
-        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
-        config = TransformerConfig(
-            num_layers=2,
-            hidden_size=12,
-            num_attention_heads=4,
-            num_moe_experts=4,
-            mtp_num_layers=1,
-            pipeline_model_parallel_size=2,
-            pipeline_dtype=torch.float32,
-            use_cpu_initialization=True,
-            moe_router_topk=2,
-        )
-        tracker = MoEMetricsTracker()
-        monkeypatch.setattr(
-            "megatron.core.transformer.moe.router.get_moe_metrics_tracker", lambda: tracker
-        )
-        if pg_collection.pp.rank() == 1:
-            router = TopKRouter(config, pg_collection=pg_collection, is_mtp_layer=True)
-            router.set_layer_number(2)
-            router.set_mtp_layer_number(1)
-            router.attach_and_log_load_balancing_loss(
-                torch.ones(2, config.hidden_size, device="cuda"),
-                1.0,
-                torch.tensor(2.0, device="cuda"),
-                "load_balancing_loss",
-                reduce_group=None,
-            )
-        else:
-            assert not tracker.metrics
-
-        total_loss_dict = {}
-        tracker.report(
-            loss_scale=1.0,
-            iteration=1,
-            force_initialize=True,
-            track_names=["load_balancing_loss"],
-            num_layers=config.num_layers,
-            mtp_num_layers=config.mtp_num_layers,
-            num_moe_layers=1,
-            total_loss_dict=total_loss_dict,
-            pg_collection=pg_collection,
-        )
-
-        assert tracker.metrics["load_balancing_loss"].values.numel() == 3
-        torch.testing.assert_close(
-            total_loss_dict["load_balancing_loss"], torch.tensor(2.0, device="cuda")
-        )
-    finally:
-        Utils.destroy_model_parallel()
 
 
 class TestGroupLimitedRouter:

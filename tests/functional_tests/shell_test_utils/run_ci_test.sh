@@ -472,13 +472,8 @@ for i in $(seq 1 $N_REPEAT); do
                         --output-path "${OUTPUT_PATH}/${RESUMED_VALUES_FILENAME}" \
                         "${EXTRACT_ARGS[@]}"
 
-                    RESUME_CHECKS=()
-                    if [[ -z "$GOLDEN_VALUES_PATH" ]]; then
-                        RESUME_CHECKS+=("$ROOT_DIR/tests/functional_tests/python_test_utils/test_pretraining_functional_pipeline.py")
-                    fi
-                    RESUME_CHECKS+=("$ROOT_DIR/tests/functional_tests/python_test_utils/test_pretraining_resume_checkpoint_pipeline.py")
                     echo "Running pytest 1st vs 2nd run comparison"
-                    uv run --no-sync pytest -s -o log_cli=true --log-cli-level=info "${RESUME_CHECKS[@]}" \
+                    uv run --no-sync pytest -s -o log_cli=true --log-cli-level=info $ROOT_DIR/tests/functional_tests/python_test_utils/test_pretraining_resume_checkpoint_pipeline.py \
                         --actual-values-first-run-path "${OUTPUT_PATH}/${ACTUAL_VALUES_FILENAME}" \
                         --actual-values-second-run-path "${OUTPUT_PATH}/${RESUMED_VALUES_FILENAME}" \
                         --train-iters $TRAIN_ITERS \

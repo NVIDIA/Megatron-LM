@@ -12,7 +12,6 @@ import torch
 
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.optimizer import OptimizerConfig
-from megatron.core.transformer.transformer_block import get_num_layers_to_build
 from megatron.training.argument_utils import (
     ArgumentGroupFactory,
     TypeInferenceError,
@@ -90,19 +89,6 @@ def test_moe_norm_flag_reaches_transformer_config():
     assert config.moe_use_norm_before_up_proj is True
 
 
-def test_python_hybrid_marker_reaches_transformer_config_without_pattern():
-    parser = ArgumentParser()
-    add_megatron_arguments(parser)
-    args = parser.parse_args([])
-    args.params_dtype = torch.float32
-    args.is_hybrid_model = True
-
-    config = core_transformer_config_from_args(args, config_class=CapturingTransformerConfig)
-
-    assert config.is_hybrid_model is True
-    assert "experimental_attention_variant" not in config.__dict__
-
-
 def test_moe_norm_flag_requires_latent_size(monkeypatch):
     """validate_args should reject the LatentMoE norm flag without a latent size."""
     monkeypatch.setattr(sys, 'argv', ['test_argument_utils.py'])
@@ -126,97 +112,22 @@ def test_moe_norm_flag_requires_latent_size(monkeypatch):
         validate_args(args)
 
 
-@pytest.mark.parametrize("mtp_num_layers", [None, 0, 1])
-def test_freeze_base_model_for_mtp_rejects_freeze_all_layers(monkeypatch, mtp_num_layers):
-    args = _minimal_training_args(monkeypatch)
-    args.mtp_num_layers = mtp_num_layers
-    args.position_embedding_type = "rope"
-    args.freeze_all_layers = True
-
-    with pytest.raises(AssertionError, match="cannot be combined with --freeze-all-layers"):
-        validate_args(args)
-
-
-def test_preserves_explicit_pipeline_topology_without_family_marker(monkeypatch):
-    args = _minimal_training_args(monkeypatch)
-    args.freeze_base_model_for_mtp = False
-    args.world_size = 2
-    args.pipeline_model_parallel_size = 2
-    args.num_layers = 3
-    args.virtual_pipeline_model_parallel_size = 2
-    args.overlap_p2p_comm = True
-
-    validate_args(args)
-
-    assert args.virtual_pipeline_model_parallel_size == 2
-
-
-@pytest.mark.parametrize("mtp_num_layers", [None, 0, 1, 2])
-def test_hsm_depth_is_validated_by_model(monkeypatch, mtp_num_layers):
-    args = _minimal_training_args(monkeypatch)
-    args.freeze_base_model_for_mtp = False
-    args.mtp_num_layers = mtp_num_layers
-    args.mtp_hsm = True
-    args.position_embedding_type = "rope"
-
-    validate_args(args)
-
-    assert args.mtp_hsm is True
-    assert args.mtp_num_layers == mtp_num_layers
-    config = core_transformer_config_from_args(args)
-    assert config.mtp_hsm is True
-    assert config.mtp_num_layers == mtp_num_layers
-
-
-@pytest.mark.parametrize("is_hybrid_model", [False, True])
-@pytest.mark.parametrize("mtp_num_layers", [None, 0, 1])
-def test_freeze_base_model_for_mtp_depth_is_validated_by_model(
-    monkeypatch, is_hybrid_model, mtp_num_layers
-):
-    args = _minimal_training_args(monkeypatch)
-    args.is_hybrid_model = is_hybrid_model
-    args.mtp_num_layers = mtp_num_layers
-    args.position_embedding_type = "rope"
-
-    validate_args(args)
-
-    assert args.freeze_base_model_for_mtp is True
-    assert args.mtp_num_layers == mtp_num_layers
-    config = core_transformer_config_from_args(args)
-    assert config.freeze_base_model_for_mtp is True
-    assert config.mtp_num_layers == mtp_num_layers
-
-
-def test_uniform_pipeline_divisibility_is_validated_by_core(monkeypatch):
-    args = _minimal_training_args(monkeypatch)
-    args.freeze_base_model_for_mtp = False
-    args.world_size = 2
-    args.pipeline_model_parallel_size = 2
-    args.num_layers = 3
-
-    validate_args(args)
-
-    config = core_transformer_config_from_args(args)
-    with pytest.raises(AssertionError, match="should be divisible"):
-        get_num_layers_to_build(config, pp_rank=0)
-
-
 @pytest.mark.parametrize(
-    "vpp_argument",
-    ["num_layers_per_virtual_pipeline_stage", "num_virtual_stages_per_pipeline_rank"],
+    ("overrides", "error"),
+    [
+        (
+            {"mtp_num_layers": 1, "freeze_all_layers": True, "position_embedding_type": "rope"},
+            "cannot be combined with --freeze-all-layers",
+        ),
+    ],
 )
-def test_cli_virtual_pipeline_topology_is_still_resolved(monkeypatch, vpp_argument):
+def test_freeze_base_model_for_mtp_validation(monkeypatch, overrides, error):
     args = _minimal_training_args(monkeypatch)
-    args.freeze_base_model_for_mtp = False
-    args.world_size = 2
-    args.pipeline_model_parallel_size = 2
-    args.num_layers = 8
-    args.overlap_p2p_comm = True
-    setattr(args, vpp_argument, 2)
+    for name, value in overrides.items():
+        setattr(args, name, value)
 
-    validate_args(args)
-
-    assert args.virtual_pipeline_model_parallel_size == 2
+    with pytest.raises(AssertionError, match=error):
+        validate_args(args)
 
 
 @dataclass

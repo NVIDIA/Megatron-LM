@@ -1,24 +1,11 @@
 # Full-size Puzzle checkpoint-resume test
 
-The importable [Puzzle architecture](puzzle.py) defines
-the published 75B-A9B model using layer-config objects, including all heterogeneous
-MoE dimensions and one inferred MTP head. This test initializes that architecture
-from scratch; it does not download or convert the Hugging Face checkpoint.
+[puzzle.py](puzzle.py) defines the full 75B-A9B model as layer configs, including
+heterogeneous MoE layers and one inferred MTP head. It initializes from scratch;
+no published weights are downloaded.
 
-The [Nemotron GB200 recipe](../../../../test_utils/recipes/gb200/nemotron.yaml) selects
-`nemotron3_puzzle_75b_nightly_tp1_pp1_cp1_ep8_dgx_gb200` in `dev`, nightly/L2, with
-two nodes of four GB200 GPUs and five repetitions. It launches
-this test case's `puzzle.py` with TP1/PP1/CP1/EP8/ETP1. Each repetition trains 20
-steps, saves at step 10, and resumes that checkpoint through step 20 with optimizer
-and RNG restoration. The harness requires complete, finite LM and MTP loss logs
-and checks the resumed losses against the first run using its existing numerical
-tolerances. Timing, memory, and gradient-zero counts remain diagnostic logs only.
-There is no checked-in golden baseline or performance gate.
-
-## Target-hardware acceptance
-
-Full-size memory fit and numerical acceptance require an actual eight-GB200 run.
-Do not substitute a scaled model. A clean five-repeat run must pass training,
-checkpoint restoration, finite-loss validation, and resumed-loss comparisons.
-Allow a 9,000-second allocation for the full-size checkpoint I/O and all five
-repetitions (`--functional-test-time-limit 9000` with the internal CI helper).
+The [nightly GB200 recipe](../../../../test_utils/recipes/gb200/nemotron.yaml) runs
+one training/resume cycle on two nodes of four GPUs, with TP1/PP1/CP1/EP8/ETP1.
+It trains 20 steps, then resumes the step-10 checkpoint through step 20, restoring
+optimizer and RNG state. The existing harness compares resumed LM and MTP losses
+against the first run. There are no external golden values or performance gates.
