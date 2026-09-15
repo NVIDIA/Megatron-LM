@@ -88,16 +88,11 @@ class EPChunkShapeProfile:
     def validate_rows(self, rows: int, kind: Literal["input", "recv", "expert"]) -> None:
         capacity = getattr(self, f"max_{kind}_rows")
         if rows > capacity:
-            raise RuntimeError(
-                f"EP chunk {kind} rows {rows} exceeds two-slot profile capacity {capacity}"
-            )
+            raise RuntimeError(f"{kind} rows {rows} exceed capacity {capacity}")
 
     def validate_input(self, value: torch.Tensor) -> None:
         if value.size(-1) != self.hidden_size:
-            raise RuntimeError(
-                f"EP chunk hidden size {value.size(-1)} does not match two-slot "
-                f"profile {self.hidden_size}"
-            )
+            raise RuntimeError(f"Hidden size {value.size(-1)} != profile {self.hidden_size}")
         self.validate_rows(value.numel() // self.hidden_size, "input")
 
 
@@ -120,15 +115,10 @@ def _validate_finished_deepep_dispatch(
     if recv_probs.size(0) != recv_hidden.size(0):
         raise RuntimeError("EP chunk recv_hidden and recv_probs rows must match")
     if recv_probs.size(1) != profile.topk:
-        raise RuntimeError(
-            f"EP chunk recv_probs top-k {recv_probs.size(1)} does not match "
-            f"fixed profile {profile.topk}"
-        )
+        raise RuntimeError(f"Recv top-k {recv_probs.size(1)} != profile {profile.topk}")
     profile.validate_rows(recv_probs.size(0), "recv")
     if dispatched.dim() != 2 or dispatched.size(1) != profile.hidden_size:
-        raise RuntimeError(
-            "EP chunk dispatched expert input must be rank-2 with the fixed hidden size"
-        )
+        raise RuntimeError("Expert input must be rank-2 with the fixed hidden size")
     profile.validate_rows(dispatched.size(0), "expert")
 
 
@@ -261,9 +251,7 @@ class _EPChunkExpertActivationArenaCoordinator:
 
     def acquire(self, *, op: EPChunkOpName, stream: Any | None) -> None:
         if self.claimed_op is not None:
-            raise RuntimeError(
-                f"EP chunk expert activation coordinator is already claimed by {self.claimed_op}"
-            )
+            raise RuntimeError(f"Activation arena is already claimed by {self.claimed_op}")
         self._wait_for_consumer(stream)
         self.claimed_op = op
         self.issued_storage_slots.clear()
@@ -291,10 +279,7 @@ class _EPChunkExpertActivationArenaCoordinator:
                 f"{name}: previous={old} current={new}"
                 for name, (old, new) in sorted(changed.items())
             )
-            raise RuntimeError(
-                "EP chunk expert activation backing pointers changed after frozen rehydrate: "
-                f"{details}"
-            )
+            raise RuntimeError(f"Frozen activation pointers changed after rehydrate: {details}")
         previous.update(current)
 
     def park(self, *, stream: Any | None) -> None:
@@ -393,9 +378,7 @@ class _EPChunkExpertActivationArenaCoordinator:
                 f"{requested_bytes} bytes over reserved {reserved_capacity_bytes}"
             )
         if growing and storage_name in self.issued_storage_slots:
-            raise RuntimeError(
-                f"Cannot grow activation storage {storage_name!r} during an active lease"
-            )
+            raise RuntimeError(f"Cannot grow {storage_name!r} during an active activation lease")
         if existing is None or growing:
             requested_capacity_bytes = _expert_activation_capacity_bytes(requested_bytes)
             capacity_bytes = max(reserved_capacity_bytes, requested_capacity_bytes)
@@ -638,27 +621,19 @@ class EPChunkWorkspace:
     def _prepare_slots_for_reset(self, *, stream: Any | None, operation: str) -> None:
         coordinator = self._activation_arena
         if coordinator.claimed_op is not None:
-            raise RuntimeError(
-                f"Cannot {operation} in EP chunk workspace: expert activation arena is leased"
-            )
+            raise RuntimeError(f"Cannot {operation}: activation arena is leased")
         for slot_idx, slot in enumerate(self._slots):
             if slot.in_use:
-                raise RuntimeError(
-                    f"Cannot {operation} in EP chunk workspace: slot {slot_idx} is leased"
-                )
+                raise RuntimeError(f"Cannot {operation}: slot {slot_idx} is leased")
         activation_event = coordinator.consumer_event
         if _event_pending(activation_event) and not (
             (stream is not None and hasattr(stream, "wait_event"))
             or hasattr(activation_event, "current_stream_wait")
         ):
-            raise RuntimeError(
-                f"Cannot {operation} in EP chunk workspace with a pending expert activation event"
-            )
+            raise RuntimeError(f"Cannot {operation}: pending activation event")
         pending_slots = [slot for slot in self._slots if _event_pending(slot.consumer_event)]
         if pending_slots and (stream is None or not hasattr(stream, "wait_event")):
-            raise RuntimeError(
-                f"Cannot {operation} in EP chunk workspace with a pending consumer event"
-            )
+            raise RuntimeError(f"Cannot {operation}: pending consumer event")
 
         coordinator.park(stream=stream)
         for slot in pending_slots:
@@ -683,10 +658,7 @@ class EPChunkWorkspace:
             or shape[1:] != capacity[1:]
             or dtype != expected_dtype
         ):
-            raise RuntimeError(
-                f"EP chunk tensor {name!r} shape {shape} dtype {dtype} exceeds fixed "
-                f"profile capacity {capacity} dtype {expected_dtype}"
-            )
+            raise RuntimeError(f"{name!r}: {shape}/{dtype} exceeds {capacity}/{expected_dtype}")
 
     def _reserve_tensor(
         self,
@@ -709,10 +681,7 @@ class EPChunkWorkspace:
                 or existing.device != torch.device(device)
                 or len(capacity) != len(requested)
             ):
-                raise RuntimeError(
-                    f"EP chunk tensor {name!r} shape {requested} exceeds the fixed "
-                    f"workspace shape {capacity}"
-                )
+                raise RuntimeError(f"{name!r}: shape {requested} exceeds capacity {capacity}")
             if all(want <= have for want, have in zip(requested, capacity, strict=True)):
                 return existing
         growing = existing is not None
@@ -730,15 +699,9 @@ class EPChunkWorkspace:
         )
         requested = key_device if device is None else torch.device(device)
         if requested.type != self.key.device_type:
-            raise RuntimeError(
-                f"EP chunk materialize device {requested} does not match workspace "
-                f"device type {self.key.device_type}"
-            )
+            raise RuntimeError(f"Device {requested} != workspace type {self.key.device_type}")
         if self.key.device_index is not None and requested.index != self.key.device_index:
-            raise RuntimeError(
-                f"EP chunk materialize device {requested} does not match workspace "
-                f"key device {key_device}"
-            )
+            raise RuntimeError(f"Device {requested} != workspace key {key_device}")
         if requested.type == "cuda" and requested.index is None:
             requested = torch.device("cuda", torch.cuda.current_device())
         return requested
@@ -750,10 +713,7 @@ class EPChunkWorkspace:
         if requested.type == "cuda" and requested.index is None:
             requested = torch.device("cuda", torch.cuda.current_device())
         if requested != self._bound_device:
-            raise RuntimeError(
-                f"EP chunk workspace already materialized on {self._bound_device}, "
-                f"cannot use stream/device {requested}"
-            )
+            raise RuntimeError(f"Workspace bound to {self._bound_device}, not {requested}")
 
     @staticmethod
     def _validate_slot(slot: int) -> None:
@@ -785,17 +745,13 @@ class EPChunkWorkspaceRegistry:
     def _claim(self, workspace: EPChunkWorkspace) -> None:
         current = self._workspaces.get(workspace.key)
         if current is not None and current is not workspace:
-            raise RuntimeError(
-                "Cannot rematerialize an EP chunk workspace after its key was reused"
-            )
+            raise RuntimeError("Cannot rematerialize: workspace key was reused")
         arena_key = workspace._activation_arena.key
         current_arena = self._expert_activation_arenas.get(arena_key)
         if current_arena is None:
             self._expert_activation_arenas[arena_key] = workspace._activation_arena
         elif current_arena is not workspace._activation_arena:
-            raise RuntimeError(
-                "Cannot rematerialize EP chunk workspace with replaced activation arena"
-            )
+            raise RuntimeError("Cannot rematerialize: replaced activation arena")
         self._workspaces[workspace.key] = workspace
 
     def release(self, key: EPChunkWorkspaceKey, *, stream: Any | None = None) -> None:
@@ -815,9 +771,7 @@ class EPChunkWorkspaceRegistry:
             event = coordinator.consumer_event
             if _event_pending(event):
                 if stream is None or not hasattr(stream, "wait_event"):
-                    raise RuntimeError(
-                        "Cannot release EP chunk activation arena with pending event"
-                    )
+                    raise RuntimeError("Cannot release activation arena with pending event")
                 stream.wait_event(event)
             if coordinator.claimed_op is not None:
                 raise RuntimeError("Cannot release leased EP chunk expert activation arena")
@@ -1324,9 +1278,7 @@ class _EPChunkOperationBase:
                 row_id_map = metadata["manual_row_id_map"]
                 prob_flat_indices = metadata["manual_prob_flat_indices"]
                 if row_id_map is None or prob_flat_indices is None:
-                    raise RuntimeError(
-                        "EP chunk overlap fused backward requires manual dgrad metadata."
-                    )
+                    raise RuntimeError("Fused backward requires manual dgrad metadata")
 
                 chunk = _BackwardChunk.from_dispatch(
                     state,
@@ -1678,9 +1630,7 @@ def _manual_unpermute_backward(
             or out.device != grad_rank_grouped.device
             or not out.is_contiguous()
         ):
-            raise RuntimeError(
-                "EP chunk unpermute storage must be contiguous, match shape/dtype/device"
-            )
+            raise RuntimeError("Unpermute storage must be contiguous and match shape/dtype/device")
         grad_expert_out = out
     with torch.no_grad():
         torch.index_select(grad_rank_grouped.detach(), 0, row_id_map, out=grad_expert_out)
@@ -1720,9 +1670,7 @@ def _dispatch_local_backward(
         or grad_recv_probs.dtype != chunk.recv_probs_dtype
         or grad_recv_probs.device != grad_dispatched.device
     ):
-        raise RuntimeError(
-            "EP chunk retained recv probability storage does not match saved metadata"
-        )
+        raise RuntimeError("Retained recv probability storage differs from saved metadata")
     grad_recv_hidden.zero_()
     grad_recv_hidden.scatter_add_(
         0,

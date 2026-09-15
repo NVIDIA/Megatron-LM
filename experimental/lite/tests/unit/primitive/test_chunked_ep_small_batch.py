@@ -23,19 +23,6 @@ def test_small_rank_forward_matches_ordinary_ep(
 
     calls = []
 
-    class Stream:
-        def wait_event(self, event):
-            pass
-
-        def record_event(self):
-            event = Event()
-            event.record(self)
-            return event
-
-    class Event:
-        def record(self, stream):
-            pass
-
     class Router(torch.nn.Module):
         def forward(self, x):
             return x[:, :1].sigmoid(), torch.zeros((len(x), 1), dtype=torch.long)
@@ -86,36 +73,26 @@ def test_small_rank_forward_matches_ordinary_ep(
         def finish_deepep_combine(self, state):
             return state
 
-    class Lease:
-        def __init__(self):
-            self.dispatcher = Dispatcher()
-
-        def check_active(self):
-            pass
-
-        def release(self, event):
-            pass
-
-    class Activation:
-        def tensor(self, name, shape, **kwargs):
-            return torch.empty(shape, **kwargs)
-
-        def allocate(self):
-            return nullcontext()
-
-        def release(self, event):
-            pass
-
     profile = overlap.EPChunkShapeProfile(
         max_input_rows=8, hidden_size=2, topk=1, ep_size=2, chunk_count=chunk_count
     )
     workspace = SimpleNamespace(
         key=SimpleNamespace(op="forward", shape_profile=profile),
-        acquire=lambda *args, **kwargs: Lease(),
-        acquire_expert_activation=lambda **kwargs: Activation(),
+        acquire=lambda *args, **kwargs: SimpleNamespace(
+            dispatcher=Dispatcher(), check_active=lambda: None, release=lambda event: None
+        ),
+        acquire_expert_activation=lambda **kwargs: SimpleNamespace(
+            tensor=lambda name, shape, **kw: torch.empty(shape, **kw),
+            allocate=nullcontext,
+            release=lambda event: None,
+        ),
     )
-    stream = Stream()
-    monkeypatch.setattr(overlap.torch.cuda, "Event", Event)
+
+    def event():
+        return SimpleNamespace(record=lambda stream: None)
+
+    stream = SimpleNamespace(wait_event=lambda event: None, record_event=event)
+    monkeypatch.setattr(overlap.torch.cuda, "Event", event)
     monkeypatch.setattr(overlap.torch.cuda, "current_stream", lambda *args: stream)
     monkeypatch.setattr(overlap.torch.cuda, "stream", lambda *args: nullcontext())
     monkeypatch.setattr(overlap._EPChunkOperationBase, "_streams", lambda *args: (stream, stream))

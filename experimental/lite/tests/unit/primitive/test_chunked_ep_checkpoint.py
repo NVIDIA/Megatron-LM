@@ -228,18 +228,12 @@ def test_qwen_layer_assembly_keeps_parameter_paths(
         def forward(self, x):
             return super().forward(x), None
 
-    class Dispatcher:
-        def __init__(self, *args, **kwargs):
-            pass
-
-        def dispatch(self, x, scores, indices):
-            return scores, None, None
-
-        def wait_dispatch_event(self):
-            pass
-
-        def combine(self, x):
-            return x
+    def dispatcher(*args, **kwargs):
+        return SimpleNamespace(
+            dispatch=lambda x, scores, indices: (scores, None, None),
+            wait_dispatch_event=lambda: None,
+            combine=lambda x: x,
+        )
 
     class Execution:
         def __init__(self, *, router, experts, retain_backward, **kwargs):
@@ -267,7 +261,7 @@ def test_qwen_layer_assembly_keeps_parameter_paths(
     for module in (model, adapter):
         monkeypatch.setattr(module, "TopKRouter", Router)
         monkeypatch.setattr(module, "Experts", LinearStub)
-        monkeypatch.setattr(module, "TokenDispatcher", Dispatcher)
+        monkeypatch.setattr(module, "TokenDispatcher", dispatcher)
     cfg = SimpleNamespace(
         hidden_size=4,
         num_attention_heads=1,
