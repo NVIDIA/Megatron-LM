@@ -46,8 +46,8 @@ def test_mixed_precision_checkpoint_state_roundtrip(low_precision_dtype, fp32_bu
     optimizer.gbuf_ranges = ranges
     optimizer.per_bucket_numel = []
     optimizer.per_bucket_numel_unpadded = []
-    optimizer.model_param_group_index_map, group_ranges = (
-        optimizer._build_optimizer_group_ranges(groups, ranges)
+    optimizer.model_param_group_index_map, group_ranges = optimizer._build_optimizer_group_ranges(
+        groups, ranges
     )
     optimizer._build_model_and_main_param_groups(
         ranges, optimizer._build_model_param_gbuf_map(ranges), group_ranges, optimizer.config
