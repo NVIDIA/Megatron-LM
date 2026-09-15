@@ -221,7 +221,7 @@ class FsdpParameterGroup:
             # into its local storage, so the first ZeRO-1 unshard can all-gather
             # directly into this allocation.
             with self._symmetric_memory_context():
-                self.model_weight = DBuffer(
+                self.model_weight = DBuffer.empty(
                     mesh=self.mesh,
                     placements=model_weight_placements,
                     tensor_shapes=tensor_shapes,
@@ -237,7 +237,7 @@ class FsdpParameterGroup:
         )
 
         with self._symmetric_memory_context():
-            self._unsharded_model_weight = DBuffer(
+            self._unsharded_model_weight = DBuffer.empty(
                 mesh=self.mesh,
                 placements=[Replicate()] * self.mesh.ndim,
                 tensor_shapes=tensor_shapes,
@@ -258,7 +258,7 @@ class FsdpParameterGroup:
         # eagerly deallocated right after optimizer.step(), avoiding main_grad
         # storage during forward. That requires a separate lifetime contract with
         # the optimizer, so this version keeps the simpler persistent buffer.
-        self.main_grad = DBuffer(
+        self.main_grad = DBuffer.empty(
             mesh=self.mesh,
             placements=main_grad_placements,
             tensor_shapes=self.main_weight.layout.tensor_shapes,
@@ -388,7 +388,7 @@ class FsdpParameterGroup:
                 raise RuntimeError(f"Missing gradient for FSDP parameter {fsdp_parameter.fqns!r}.")
             grads.append(fsdp_parameter.unsharded.grad)
         with self._symmetric_memory_context():
-            return DBuffer(
+            return DBuffer.empty(
                 mesh=self.mesh,
                 placements=[Partial("avg")] * self.mesh.ndim,
                 tensor_shapes=tuple(grad.shape for grad in grads),
