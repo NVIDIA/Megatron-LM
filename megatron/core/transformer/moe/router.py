@@ -448,7 +448,7 @@ class TopKRouter(Router):
             topk=self.topk,
             num_experts=self.config.num_moe_experts,
             moe_aux_loss_coeff=aux_loss_coeff,
-            fused=self.config.moe_router_fusion,
+            fused=self.config.moe_router_aux_loss_fusion,
         )
         probs = self.attach_and_log_load_balancing_loss(
             probs,
@@ -500,7 +500,7 @@ class TopKRouter(Router):
                 topk=self.topk,
                 num_experts=self.config.num_moe_experts,
                 moe_aux_loss_coeff=seq_aux_loss_coeff,
-                fused=self.config.moe_router_fusion,
+                fused=self.config.moe_router_aux_loss_fusion,
             )
             / bsz
         )
@@ -558,7 +558,7 @@ class TopKRouter(Router):
             topk=self.topk,
             num_experts=self.config.num_moe_experts,
             moe_aux_loss_coeff=global_aux_loss_coeff,
-            fused=self.config.moe_router_fusion,
+            fused=self.config.moe_router_aux_loss_fusion,
         )
         probs = self.attach_and_log_load_balancing_loss(
             probs,
@@ -828,7 +828,7 @@ class TopKRouter(Router):
                 logits,
                 self.topk,
                 self.score_function,
-                fused=self.config.moe_router_fusion,
+                fused=self.config.moe_router_aux_loss_fusion,
                 padding_mask=padding_mask,
             )
             probs = self._apply_aux_loss(

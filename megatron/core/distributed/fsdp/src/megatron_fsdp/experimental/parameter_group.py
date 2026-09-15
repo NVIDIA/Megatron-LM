@@ -14,6 +14,7 @@
 
 """Parameter-group runtime state for the minimal Megatron-FSDP path."""
 
+import math
 from collections.abc import Iterable
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -29,6 +30,7 @@ from torch.distributed.tensor.placement_types import Placement
 from ..mixed_precision import MixedPrecisionPolicy
 from .dbuffer import DBuffer
 from .module_utils import get_parameter_owner
+from .placement import BlockAtomic
 
 _CONTAINING_PARAMETER_GROUP_ATTR = "_mfsdp_parameter_group"
 
@@ -191,11 +193,17 @@ class FsdpParameterGroup:
             raise RuntimeError("Symmetric-memory MFSDP requires PyTorch 2.12 or later.")
 
         tensor_shapes = tuple(parameter.shape for parameter in parameters)
+        block_size = 1
+        for placements in (model_weight_placements, main_grad_placements, main_weight_placements):
+            for placement in placements:
+                if isinstance(placement, BlockAtomic):
+                    block_size = math.lcm(block_size, placement.block_size)
         main_weight_dtype = mixed_precision_policy.main_params_dtype or torch.float32
         self.main_weight = DBuffer.distribute_tensors(
             (parameter.to(dtype=main_weight_dtype) for parameter in parameters),
             mesh=self.mesh,
             placements=main_weight_placements,
+            block_size=block_size,
         )
 
         if use_symmetric_memory:
@@ -213,12 +221,13 @@ class FsdpParameterGroup:
             # into its local storage, so the first ZeRO-1 unshard can all-gather
             # directly into this allocation.
             with self._symmetric_memory_context():
-                self.model_weight = DBuffer(
+                self.model_weight = DBuffer.empty(
                     mesh=self.mesh,
                     placements=model_weight_placements,
                     tensor_shapes=tensor_shapes,
                     dtype=self.dtype,
                     device=self.main_weight.device,
+                    block_size=block_size,
                 )
         self.post_optimizer_model_weight = self.model_weight.view(main_weight_placements)
         # Cast into the preallocated optimizer-layout view on the current stream.
@@ -228,12 +237,13 @@ class FsdpParameterGroup:
         )
 
         with self._symmetric_memory_context():
-            self._unsharded_model_weight = DBuffer(
+            self._unsharded_model_weight = DBuffer.empty(
                 mesh=self.mesh,
                 placements=[Replicate()] * self.mesh.ndim,
                 tensor_shapes=tensor_shapes,
                 dtype=self.dtype,
                 device=self.main_weight.device,
+                block_size=block_size,
             )
 
         self.main_grad = None
@@ -248,12 +258,13 @@ class FsdpParameterGroup:
         # eagerly deallocated right after optimizer.step(), avoiding main_grad
         # storage during forward. That requires a separate lifetime contract with
         # the optimizer, so this version keeps the simpler persistent buffer.
-        self.main_grad = DBuffer(
+        self.main_grad = DBuffer.empty(
             mesh=self.mesh,
             placements=main_grad_placements,
             tensor_shapes=self.main_weight.layout.tensor_shapes,
             dtype=grad_dtype,
             device=self.main_weight.device,
+            block_size=block_size,
         )
         self.pre_optimizer_main_grad = self.main_grad.view(main_weight_placements)
         assert self.main_grad.layout == self.main_weight.layout, (
@@ -377,12 +388,13 @@ class FsdpParameterGroup:
                 raise RuntimeError(f"Missing gradient for FSDP parameter {fsdp_parameter.fqns!r}.")
             grads.append(fsdp_parameter.unsharded.grad)
         with self._symmetric_memory_context():
-            return DBuffer(
+            return DBuffer.empty(
                 mesh=self.mesh,
                 placements=[Partial("avg")] * self.mesh.ndim,
                 tensor_shapes=tuple(grad.shape for grad in grads),
                 dtype=grads[0].dtype,
                 device=grads[0].device,
+                block_size=self.main_weight.layout.block_size,
             )
 
     def copy_gradients_to_partial_buffer(self, partial_grad: DBuffer) -> None:

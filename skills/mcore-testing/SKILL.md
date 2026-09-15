@@ -206,6 +206,14 @@ For ad-hoc runs, prefer the direct `torch.distributed.run` invocations above.
 
 6. Commit the downloaded golden values.
 
+Golden values keep the full `float32` precision of the TensorBoard scalars,
+record it as `"value_precision": "full"`, and deterministic test cases are
+compared bit-exactly against them. Never round or hand-edit them:
+`tools/check_golden_values.py` (run by the `linting` CI job on changed golden
+files) rejects golden files of deterministically compared cases whose metrics
+lack the `full` marker. Legacy files (no marker) are still compared at five
+decimals until they are regenerated from a CI run.
+
 ---
 
 ## Common Pitfalls
