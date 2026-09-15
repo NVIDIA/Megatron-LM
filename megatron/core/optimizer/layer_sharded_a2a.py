@@ -42,20 +42,18 @@ def _cat_or_empty(parts: list[torch.Tensor], ref: torch.Tensor) -> torch.Tensor:
     return torch.empty(0, dtype=ref.dtype, device=ref.device)
 
 
-def _group_by_home(num_params: int, param_to_home_rank: dict, size: int) -> list[list[int]]:
+def params_by_home(num_params: int, home_of: dict, size: int) -> list[list[int]]:
     """Group param indices by their NS home rank in the group.
 
-    The wired path (LPT bin-packing in LayerWiseDistributedOptimizer) always
-    supplies every entry; the ``i % size`` default is a round-robin FALLBACK
-    for direct-API callers or missing entries only. Assignments may be uneven —
-    with fewer params than ranks, the unassigned ranks simply get empty lists
-    and receive zero-size all_to_all splits.
+    ``result[r]`` lists the params homed on rank ``r`` in increasing index order, the order
+    every exchange uses. ``home_of`` must cover every index (LayerShardedMuon's exchange
+    plan always does). Assignments may be uneven: ranks with no params get empty lists and
+    receive zero-size all_to_all splits.
     """
-    send_idx: list[list[int]] = [[] for _ in range(size)]
+    by_home: list[list[int]] = [[] for _ in range(size)]
     for param_idx in range(num_params):
-        home = param_to_home_rank.get(param_idx, param_idx % size)
-        send_idx[home].append(param_idx)
-    return send_idx
+        by_home[home_of[param_idx]].append(param_idx)
+    return by_home
 
 
 def route_to_ns_home(
@@ -113,7 +111,7 @@ def route_to_ns_home(
     if plan is None:
         plan = {}
     if not plan:
-        send_idx = _group_by_home(len(momentum_list), param_to_home_rank, size)
+        send_idx = params_by_home(len(momentum_list), param_to_home_rank, size)
         my_param_indices = send_idx[rank]
         my_param_numel = sum(momentum_list[i].numel() for i in my_param_indices)
         # Prefix offsets of each of my params within one source block.
@@ -226,7 +224,7 @@ def route_from_ns_home(
     if plan is None:
         plan = {}
     if not plan:
-        send_idx = _group_by_home(len(momentum_list), param_to_home_rank, size)
+        send_idx = params_by_home(len(momentum_list), param_to_home_rank, size)
 
         # Precondition: ns_r must span exactly ``size`` equal-sized shards so the
         # uniform-stride narrow below is correct.  A violated invariant produces
