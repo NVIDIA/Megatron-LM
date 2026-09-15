@@ -99,12 +99,20 @@ def checkpoint_residual_read(
     context: ResidualStreamRecomputeContext,
     *,
     fp32_residual_connection: bool,
+    branch_input_dtype: torch.dtype | None = None,
 ) -> tuple[Tensor, ResidualConnectionState]:
-    """Checkpoint a residual read while retaining its carried stream as state."""
+    """Checkpoint a residual read while retaining its carried stream as state.
+
+    An optional branch-input dtype request is captured by the replay closure so eager execution
+    and backward reconstruction produce the same branch dtype.
+    """
 
     def run_read(stream: Tensor) -> tuple[Tensor, ...]:
         branch_input, state = apply_module(connection)(
-            stream, operation="read", fp32_residual_connection=False
+            stream,
+            operation="read",
+            fp32_residual_connection=False,
+            branch_input_dtype=branch_input_dtype,
         )
         if state[0].shape != stream.shape:
             raise ValueError("Residual connection read returned an incompatible carried stream.")
@@ -118,6 +126,9 @@ def checkpoint_residual_read(
     if not all(torch.is_tensor(output) for output in outputs):
         raise TypeError("Checkpointed residual read state must contain only tensors.")
 
+    # This mirrors ResidualConnection's defensive state promotion. Normal full-model
+    # FP32-residual inputs are already FP32, making .float() an alias rather than a cast kernel;
+    # direct/custom low-precision inputs still need the conversion to preserve replay state.
     residual_stream = hidden_states.float() if fp32_residual_connection else hidden_states
     return outputs[0], (residual_stream, *outputs[1:])
 
