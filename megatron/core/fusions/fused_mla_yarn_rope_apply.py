@@ -66,6 +66,34 @@ def _get_thd_token_idx(cu_seqlens, pid_m, seq_num, cp_rank, cp_size):
     return token_idx
 
 
+@triton.jit
+def _get_contiguous_thd_token_idx(cu_seqlens, pid_m, seq_num, global_start):
+    """Map a row in a contiguous THD slice to its position within the packed sequence."""
+    global_row = pid_m.to(tl.int64) + global_start
+    seq_count = tl.full((), seq_num, dtype=tl.int32)
+
+    # Find the first sequence whose end offset is greater than global_row,
+    # equivalent to torch.bucketize(global_row, cu_seqlens[1:], right=True).
+    # This keeps the per-row lookup logarithmic for batches with many short
+    # packed sequences. Using an upper bound also skips zero-length sequences
+    # represented by duplicate prefix offsets.
+    low = tl.full((), 0, dtype=tl.int32)
+    high = seq_count
+    while low < high:
+        mid = (low + high) >> 1
+        go_left = global_row < tl.load(cu_seqlens + mid + 1).to(tl.int64)
+        low = tl.where(go_left, low, mid + 1)
+        high = tl.where(go_left, mid, high)
+
+    in_sequence = low < seq_count
+    seq_start = tl.load(cu_seqlens + low, mask=in_sequence, other=0).to(tl.int64)
+    in_sequence = in_sequence & (global_row >= seq_start)
+    # Boundary and CUDA-graph padding rows outside every packed sequence use
+    # position zero so COS/SIN loads remain in bounds. Those rows are masked by
+    # their downstream consumers.
+    return tl.where(in_sequence, global_row - seq_start, 0)
+
+
 @triton.autotune(
     configs=[
         triton.Config({"BLOCK_H": 1}),
@@ -92,6 +120,7 @@ def _mla_rope_fwd_inplace_kernel(
     seq_num,
     cu_seqlens_q,
     position_ids,
+    thd_global_start,
     stride_x_seq,
     stride_x_nheads,
     stride_cos_seq,
@@ -101,6 +130,7 @@ def _mla_rope_fwd_inplace_kernel(
     INVERSE: tl.constexpr,
     REMOVE_INTERLEAVING: tl.constexpr,
     ROPE_FIRST: tl.constexpr,
+    HAS_THD_GLOBAL_START: tl.constexpr,
     BLOCK_H: tl.constexpr,
 ):
     """
@@ -124,6 +154,8 @@ def _mla_rope_fwd_inplace_kernel(
         token_idx = tl.load(position_ids + pid_m)
     elif cu_seqlens_q is None:
         token_idx = pid_m // batch_size
+    elif HAS_THD_GLOBAL_START:
+        token_idx = _get_contiguous_thd_token_idx(cu_seqlens_q, pid_m, seq_num, thd_global_start)
     else:
         token_idx = _get_thd_token_idx(cu_seqlens_q, pid_m, seq_num, cp_rank, cp_size)
 
@@ -194,6 +226,7 @@ def _mla_rope_bwd_kernel(
     seq_num,
     cu_seqlens_q,
     position_ids,
+    thd_global_start,
     stride_x_seq,
     stride_x_nheads,
     stride_cos_seq,
@@ -203,6 +236,7 @@ def _mla_rope_bwd_kernel(
     INVERSE: tl.constexpr,
     REMOVE_INTERLEAVING: tl.constexpr,
     ROPE_FIRST: tl.constexpr,
+    HAS_THD_GLOBAL_START: tl.constexpr,
     COPY_NOPE: tl.constexpr,
     BLOCK_NOPE: tl.constexpr,
     BLOCK_H: tl.constexpr,
@@ -235,6 +269,8 @@ def _mla_rope_bwd_kernel(
         token_idx = tl.load(position_ids + pid_m)
     elif cu_seqlens_q is None:
         token_idx = pid_m // batch_size
+    elif HAS_THD_GLOBAL_START:
+        token_idx = _get_contiguous_thd_token_idx(cu_seqlens_q, pid_m, seq_num, thd_global_start)
     else:
         token_idx = _get_thd_token_idx(cu_seqlens_q, pid_m, seq_num, cp_rank, cp_size)
 
@@ -329,6 +365,7 @@ def mla_rope_apply_raw_(
     remove_interleaving: bool = False,
     position_ids: Optional[torch.Tensor] = None,
     rope_first: bool = False,
+    thd_global_start: Optional[int] = None,
 ) -> torch.Tensor:
     """Apply the MLA RoPE rotation to ``t`` in place, bypassing autograd.
 
@@ -345,6 +382,8 @@ def mla_rope_apply_raw_(
         remove_interleaving: if True, output RoPE dims in non-interleaved layout
         position_ids: optional thd row positions overriding the CP row mapping
         rope_first: if True, rotate the leading emb_dim elements instead of the trailing ones
+        thd_global_start: first global packed row for a contiguous THD slice, derived from
+            ``cu_seqlens_q`` instead of materializing ``position_ids``
 
     Returns:
         t: the same tensor, modified in place
@@ -352,6 +391,7 @@ def mla_rope_apply_raw_(
     x, batch_size, seq_num = _flatten_rope_input(t, cu_seqlens_q, position_ids)
     _check_rope_layout(x, cos, sin, nope_dim, emb_dim)
     total_seqlen, nheads, _ = x.shape
+    has_thd_global_start = thd_global_start is not None
 
     grid = lambda META: (total_seqlen, triton.cdiv(nheads, META["BLOCK_H"]))
     _mla_rope_fwd_inplace_kernel[grid](
@@ -365,6 +405,7 @@ def mla_rope_apply_raw_(
         seq_num,
         cu_seqlens_q,
         position_ids,
+        0 if thd_global_start is None else int(thd_global_start),
         x.stride(0),
         x.stride(1),
         cos.stride(0),
@@ -374,6 +415,7 @@ def mla_rope_apply_raw_(
         INVERSE=inverse,
         REMOVE_INTERLEAVING=remove_interleaving,
         ROPE_FIRST=rope_first,
+        HAS_THD_GLOBAL_START=has_thd_global_start,
     )
     return t
 
@@ -392,6 +434,7 @@ def mla_rope_unapply_raw(
     position_ids: Optional[torch.Tensor] = None,
     out: Optional[torch.Tensor] = None,
     rope_first: bool = False,
+    thd_global_start: Optional[int] = None,
 ) -> torch.Tensor:
     """Undo :func:`mla_rope_apply_raw_`, bypassing autograd.
 
@@ -410,6 +453,7 @@ def mla_rope_unapply_raw(
     x, batch_size, seq_num = _flatten_rope_input(t, cu_seqlens_q, position_ids)
     _check_rope_layout(x, cos, sin, nope_dim, emb_dim)
     total_seqlen, nheads, _ = x.shape
+    has_thd_global_start = thd_global_start is not None
 
     if out is None:
         y = x
@@ -432,6 +476,7 @@ def mla_rope_unapply_raw(
         seq_num,
         cu_seqlens_q,
         position_ids,
+        0 if thd_global_start is None else int(thd_global_start),
         x.stride(0),
         x.stride(1),
         cos.stride(0),
@@ -441,6 +486,7 @@ def mla_rope_unapply_raw(
         INVERSE=inverse,
         REMOVE_INTERLEAVING=remove_interleaving,
         ROPE_FIRST=rope_first,
+        HAS_THD_GLOBAL_START=has_thd_global_start,
         COPY_NOPE=out is not None,
         BLOCK_NOPE=triton.next_power_of_2(nope_dim) if out is not None else 1,
     )
@@ -468,6 +514,7 @@ class _FusedMLARoPEInplace(torch.autograd.Function):
         remove_interleaving=False,
         position_ids=None,
         rope_first=False,
+        thd_global_start=None,
     ):
         """
         Forward function for _FusedMLARoPEInplace.
@@ -480,6 +527,7 @@ class _FusedMLARoPEInplace(torch.autograd.Function):
             rotary_interleaved: whether to apply RoPE interleaved, only supports False for now
             inverse: if True, negate sin inside the kernel to apply the inverse rotation
             rope_first: if True, rotate the leading emb_dim elements instead of the trailing ones
+            thd_global_start: first global packed row for a contiguous THD input slice
         """
         assert not rotary_interleaved
         mla_rope_apply_raw_(
@@ -495,6 +543,7 @@ class _FusedMLARoPEInplace(torch.autograd.Function):
             remove_interleaving=remove_interleaving,
             position_ids=position_ids,
             rope_first=rope_first,
+            thd_global_start=thd_global_start,
         )
         ctx.save_for_backward(cos, sin, *(() if position_ids is None else (position_ids,)))
         ctx.has_position_ids = position_ids is not None
@@ -507,6 +556,7 @@ class _FusedMLARoPEInplace(torch.autograd.Function):
         ctx.rope_first = rope_first
         ctx.cp_rank = cp_rank
         ctx.cp_size = cp_size
+        ctx.thd_global_start = thd_global_start
         return q
 
     @staticmethod
@@ -523,7 +573,7 @@ class _FusedMLARoPEInplace(torch.autograd.Function):
         else:
             cos, sin = ctx.saved_tensors
             position_ids = None
-        if ctx.cu_seqlens_q is None or ctx.has_position_ids:
+        if ctx.cu_seqlens_q is None or ctx.has_position_ids or ctx.thd_global_start is not None:
             grad = grad.contiguous()
 
         mla_rope_unapply_raw(
@@ -539,8 +589,9 @@ class _FusedMLARoPEInplace(torch.autograd.Function):
             remove_interleaving=ctx.remove_interleaving,
             position_ids=position_ids,
             rope_first=ctx.rope_first,
+            thd_global_start=ctx.thd_global_start,
         )
-        return grad, None, None, None, None, None, None, None, None, None, None, None, None
+        return grad, None, None, None, None, None, None, None, None, None, None, None, None, None
 
 
 def fused_mla_rope_inplace(
@@ -557,6 +608,7 @@ def fused_mla_rope_inplace(
     remove_interleaving: bool = False,
     position_ids: Optional[torch.Tensor] = None,
     rope_first: bool = False,
+    thd_global_start: int | None = None,
 ):
     """
     Fused RoPE applied inplace to emb_dim elements at either end of a tensor,
@@ -581,10 +633,21 @@ def fused_mla_rope_inplace(
         position_ids: optional THD row positions. When supplied, these positions
             replace the built-in CP row-to-position mapping.
         rope_first: if True, rotate the leading emb_dim elements instead of the trailing ones.
+        thd_global_start: first global packed row for a contiguous THD slice. When supplied,
+            the kernel derives row positions directly from ``cu_seqlens_q`` instead of
+            materializing ``position_ids``.
 
     Returns:
         t: inplace modified input tensor
     """
+    if thd_global_start is not None:
+        if cu_seqlens_q is None:
+            raise ValueError("thd_global_start requires cu_seqlens_q.")
+        if position_ids is not None:
+            raise ValueError("thd_global_start and position_ids are mutually exclusive.")
+        if cp_rank != 0 or cp_size != 1:
+            raise ValueError("thd_global_start cannot be combined with zigzag CP mapping.")
+
     return _FusedMLARoPEInplace.apply(
         t,
         cos,
@@ -599,6 +662,7 @@ def fused_mla_rope_inplace(
         remove_interleaving,
         position_ids,
         rope_first,
+        thd_global_start,
     )
 
 
