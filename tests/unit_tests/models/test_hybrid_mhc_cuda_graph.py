@@ -315,15 +315,37 @@ class TestMHCTEGraphs:
 
         def step(model, value):
             model.zero_grad(set_to_none=True)
+            delivered_grads = {}
+            handles = []
+            for name, parameter in model.named_parameters():
+                if parameter.requires_grad:
+
+                    def record_gradient(parameter, _name=name):
+                        delivered_grads[_name] = parameter.grad.detach().clone()
+
+                    handles.append(parameter.register_post_accumulate_grad_hook(record_gradient))
             hidden = value.detach().clone().requires_grad_()
             output = model(
                 input_ids=ids, position_ids=positions, attention_mask=None, decoder_input=hidden
             )
-            output.float().square().mean().backward()
+            try:
+                output.float().square().mean().backward()
+            finally:
+                for handle in handles:
+                    handle.remove()
             grads = {
                 name: None if p.grad is None else p.grad.detach().clone()
                 for name, p in model.named_parameters()
             }
+            for name, delivered in delivered_grads.items():
+                torch.testing.assert_close(
+                    grads[name],
+                    delivered,
+                    rtol=0,
+                    atol=0,
+                    msg=lambda message: f'Gradient storage changed after delivery for {name}: '
+                    f'{message}',
+                )
             return output.detach().clone(), hidden.grad.detach().clone(), grads
 
         # Warm up off the default stream, as TE does for its own warmup. Retained
@@ -393,7 +415,11 @@ class TestMHCTEGraphs:
                 assert (actual_grad is None) == (expected_grad is None), name
                 if expected_grad is not None:
                     torch.testing.assert_close(
-                        actual_grad, expected_grad, rtol=3e-2, atol=2e-3, msg=name
+                        actual_grad,
+                        expected_grad,
+                        rtol=3e-2,
+                        atol=2e-3,
+                        msg=lambda message: f'replay={index} gradient {name}: {message}',
                     )
             mhc_grads = [
                 grad
@@ -408,7 +434,13 @@ class TestMHCTEGraphs:
                 graphed.named_parameters(), reference.named_parameters()
             ):
                 assert name == reference_name
-                torch.testing.assert_close(actual, reference_param, rtol=3e-2, atol=2e-3, msg=name)
+                torch.testing.assert_close(
+                    actual,
+                    reference_param,
+                    rtol=3e-2,
+                    atol=2e-3,
+                    msg=lambda message: f'replay={index} parameter {name}: {message}',
+                )
             assert all(replay_calls[id(layer)] == index + 1 for layer in expected)
             assert set(hooks) == covered_modules
             assert all(count == index + 1 for count in hooks.values())
