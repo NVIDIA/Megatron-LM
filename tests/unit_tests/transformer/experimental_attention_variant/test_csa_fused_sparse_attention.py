@@ -4310,7 +4310,7 @@ class TestThdWrapperDispatchAndValidation:
                 max_seqlen_q=3,
                 max_seqlen_kv=2,
                 q_causal_offsets=q_causal_offsets,
-                deterministic=True,
+                deterministic=False,
             )
         # THD return shape: (total_q, topk) + (total_q,).
         assert topk_idxs.shape == (total_q, 2)
@@ -4319,6 +4319,50 @@ class TestThdWrapperDispatchAndValidation:
         fake_dsa.indexer_forward_wrapper.assert_called_once()
         seq_lens = fake_dsa.indexer_top_k_wrapper.call_args.args[1]
         assert torch.equal(seq_lens, torch.tensor([1, 1, 2, 0, 0], device=q.device))
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_indexer_topk_thd_deterministic_fallback_skips_radix_kernel(
+        self, reset_lazy_kernel_state
+    ):
+        """Without a compact wrapper, ``deterministic=True`` selects ids from the
+        dense scores with a fixed tie order instead of the radix Top-K kernel."""
+        q, k, w, cu_q, cu_kv = self._make_indexer_topk_thd_inputs()
+        total_q = q.shape[0]
+        q_causal_offsets = torch.tensor([5, 0], dtype=torch.int32, device=q.device)
+
+        fake_dsa = MagicMock(name='_DSA_thd_deterministic_stub')
+        fake_dsa.indexer_forward_top_k_wrapper = None
+        # Causal lengths are [1, 1, 2, 0, 0]. Row 0 scores its out-of-range key
+        # highest, row 2 has two valid keys with equal scores, rows 3/4 have none.
+        scores = torch.zeros(total_q, 2, dtype=torch.float32, device=q.device)
+        scores[0, 1] = 1.0
+        scores[3:] = float('-inf')
+        fake_dsa.indexer_forward_wrapper.return_value = {'scores': scores}
+        dk._DSA = fake_dsa
+
+        with pytest.warns(RuntimeWarning, match="Compact indexer.*falling back"):
+            topk_idxs, topk_len = indexer_topk(
+                q,
+                k,
+                w,
+                topk=2,
+                ratio=4,
+                cu_seqlens_q=cu_q,
+                cu_seqlens_kv=cu_kv,
+                max_seqlen_q=3,
+                max_seqlen_kv=2,
+                q_causal_offsets=q_causal_offsets,
+                deterministic=True,
+            )
+
+        fake_dsa.indexer_top_k_wrapper.assert_not_called()
+        expected = torch.tensor(
+            [[0, -1], [0, -1], [0, 1], [-1, -1], [-1, -1]], dtype=torch.int32, device=q.device
+        )
+        assert torch.equal(topk_idxs, expected)
+        assert torch.equal(
+            topk_len, torch.tensor([1, 1, 2, 0, 0], dtype=torch.int32, device=q.device)
+        )
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_indexer_topk_thd_compact_dispatch(self, reset_lazy_kernel_state):
@@ -4827,11 +4871,12 @@ class TestRealKernelFusedIndexerSparseAttnThd:
     def test_raw_thd_tail_padding_backward_uses_dummy_tile(self, reset_lazy_kernel_state):
         """Raw THD tail padding supplies a harmless tile to DSA backward.
 
-        CUDA graphs keep Q-side tensors at a static capacity, which may leave
-        physical rows beyond the last packed-sequence endpoint. Raw THD
-        lowering emits all ``-1`` indices for those rows, so FlashMLA forward
-        sees ``topk_length == 0``. DSA backward instead requires at least one
-        tile; the fused wrapper must pass length 1 after sanitizing the index.
+        CUDA graphs keep Q-side tensors at a static capacity. Physical sequence
+        lengths include the padding; unpadded lengths identify the real rows.
+        Raw THD lowering emits all ``-1`` indices for padding, so FlashMLA
+        forward sees ``topk_length == 0``. DSA backward instead requires at
+        least one tile; the fused wrapper must pass length 1 after sanitizing
+        the index.
         """
         _skip_if_real_kernels_unavailable(need_flash_mla=True)
         s = self.SHAPES
@@ -4855,8 +4900,8 @@ class TestRealKernelFusedIndexerSparseAttnThd:
         k_indexer = torch.randn(n_comp, s['idx_hd'], dtype=torch.bfloat16, device=dev)
         weights = torch.randn(total_q, s['idx_nh'], dtype=torch.bfloat16, device=dev)
 
-        cu_q = _make_cu_seqlens([real_q], device=dev)
-        cu_q_unpadded = cu_q.clone()
+        cu_q = _make_cu_seqlens([total_q], device=dev)
+        cu_q_unpadded = _make_cu_seqlens([real_q], device=dev)
         cu_kv = _make_cu_seqlens([kv_offset], device=dev)
         cu_comp_idx = _make_cu_seqlens([n_comp], device=dev)
         compressed_kv = kv_full.detach()[kv_offset:]
@@ -4902,7 +4947,7 @@ class TestRealKernelFusedIndexerSparseAttnThd:
                 cu_seqlens_q=cu_q,
                 cu_seqlens_kv=cu_kv,
                 cu_seqlens_compressed_idx=cu_comp_idx,
-                max_seqlen_q=real_q,
+                max_seqlen_q=total_q,
                 max_seqlen_compressed_idx=n_comp,
                 compressed_kv=compressed_kv,
                 cu_seqlens_q_unpadded=cu_q_unpadded,
@@ -5566,3 +5611,39 @@ class TestPublicApi:
         assert issubclass(CSASparseAttnFunc, torch.autograd.Function)
         assert issubclass(FusedCSAIndexerSparseAttnFunc, torch.autograd.Function)
         assert issubclass(FusedCSAIndexerSparseAttnFromTopkFunc, torch.autograd.Function)
+
+
+# ---------------------------------------------------------------------------
+# _stable_topk_indices — deterministic fallback for the standalone Top-K
+# ---------------------------------------------------------------------------
+
+
+class TestStableTopkIndices:
+    """``_stable_topk_indices`` orders exact ties toward the smallest key id and
+    pads rows that run out of valid keys with ``-1``."""
+
+    def test_ties_resolve_toward_smallest_index(self):
+        scores = torch.tensor([[0.0, 3.0, 0.0, 3.0, 1.0, 0.0]])
+        seq_lens = torch.tensor([6], dtype=torch.int32)
+        out = dk._stable_topk_indices(scores, seq_lens, topk_k=4)
+        assert torch.equal(out, torch.tensor([[1, 3, 4, 0]], dtype=torch.int32))
+
+    def test_seq_lens_mask_and_padding(self):
+        scores = torch.tensor([[5.0, 4.0, 3.0, 2.0], [5.0, 4.0, 3.0, 2.0], [5.0, 4.0, 3.0, 2.0]])
+        seq_lens = torch.tensor([4, 2, 0], dtype=torch.int32)
+        out = dk._stable_topk_indices(scores, seq_lens, topk_k=3)
+        expected = torch.tensor([[0, 1, 2], [0, 1, -1], [-1, -1, -1]], dtype=torch.int32)
+        assert torch.equal(out, expected)
+
+    def test_masked_scores_are_never_selected(self):
+        scores = torch.tensor([[float('-inf'), 0.0, float('-inf'), 0.0]])
+        seq_lens = torch.tensor([4], dtype=torch.int32)
+        out = dk._stable_topk_indices(scores, seq_lens, topk_k=3)
+        assert torch.equal(out, torch.tensor([[1, 3, -1]], dtype=torch.int32))
+
+    def test_row_slabs_match_one_sort(self, monkeypatch):
+        scores = torch.relu(torch.randn(7, 12, generator=torch.Generator().manual_seed(0)))
+        seq_lens = torch.tensor([12, 5, 0, 12, 9, 1, 12], dtype=torch.int32)
+        whole = dk._stable_topk_indices(scores, seq_lens, topk_k=4)
+        monkeypatch.setattr(dk, "_STABLE_TOPK_SORT_BYTES", 1)
+        assert torch.equal(dk._stable_topk_indices(scores, seq_lens, topk_k=4), whole)
