@@ -139,15 +139,13 @@ class InferenceClient:
         if isinstance(prompt, str):
             # Hashing needs token ids and there is no tokenizer here.
             return None
-        with torch.cuda.nvtx.range("megatron.multimodal.client_block_hash_input_conversion"):
-            tokens = prompt.tolist() if isinstance(prompt, torch.Tensor) else list(prompt)
+        tokens = prompt.tolist() if isinstance(prompt, torch.Tensor) else list(prompt)
         cache_salt = media_meta.get("media_cache_key") if isinstance(media_meta, dict) else None
-        with torch.cuda.nvtx.range("megatron.multimodal.client_block_hash_compute"):
-            return compute_block_hashes_batched(
-                torch.tensor(tokens, dtype=torch.int64),
-                self.block_size_tokens,
-                cache_salt=cache_salt,
-            )
+        return compute_block_hashes_batched(
+            torch.tensor(tokens, dtype=torch.int64),
+            self.block_size_tokens,
+            cache_salt=cache_salt,
+        )
 
     def add_request(
         self,
@@ -214,13 +212,10 @@ class InferenceClient:
         Returns:
             tuple[int, asyncio.Future]: The request id and its completion future.
         """
-        with torch.cuda.nvtx.range("megatron.multimodal.client_add_request"):
-            request_id = self.next_request_id
-            self.next_request_id += 1
-            frames = self._pack_submit_frames(
-                request_id, prompt, sampling_params, multi_modal_data
-            )
-            return request_id, self._submit_request(frames, request_id)
+        request_id = self.next_request_id
+        self.next_request_id += 1
+        frames = self._pack_submit_frames(request_id, prompt, sampling_params, multi_modal_data)
+        return request_id, self._submit_request(frames, request_id)
 
     def _pack_submit_frames(self, request_id, prompt, sampling_params, multi_modal_data):
         """Build the multipart frames for a SUBMIT_REQUEST.
@@ -257,39 +252,22 @@ class InferenceClient:
         Returns:
             list: The frames to send, in wire order.
         """
-        with torch.cuda.nvtx.range("megatron.multimodal.client_request_pack"):
-            with torch.cuda.nvtx.range("megatron.multimodal.client_media_serialize"):
-                serialized_media = serialize_multimodal_data(multi_modal_data)
-            with torch.cuda.nvtx.range("megatron.multimodal.client_media_split"):
-                media_meta, media_payload = split_multimodal_data(serialized_media)
-            with torch.cuda.nvtx.range("megatron.multimodal.client_metadata_pack"):
-                packed_metadata = msgpack.packb(
-                    [
-                        Headers.SUBMIT_REQUEST.value,
-                        request_id,
-                        sampling_params.serialize(),
-                        media_meta,
-                    ],
-                    use_bin_type=True,
-                )
-            with torch.cuda.nvtx.range("megatron.multimodal.client_prompt_pack"):
-                packed_prompt = self._pack_prompt(prompt)
-            with torch.cuda.nvtx.range("megatron.multimodal.client_block_hash_pack"):
-                packed_block_hashes = msgpack.packb(
-                    self._block_hashes(prompt, media_meta), use_bin_type=True
-                )
-            with torch.cuda.nvtx.range("megatron.multimodal.client_media_payload_pack"):
-                packed_media_payload = msgpack.packb(media_payload, use_bin_type=True)
-            return [
-                packed_metadata,
-                packed_prompt,
-                # Routing hashes, when the caller computed them. None means it
-                # did not, and the coordinator hashes the prompt itself --
-                # deliberately distinct from an empty list, which means the
-                # caller hashed and the prompt was shorter than one block.
-                packed_block_hashes,
-                packed_media_payload,
-            ]
+        media_meta, media_payload = split_multimodal_data(
+            serialize_multimodal_data(multi_modal_data)
+        )
+        return [
+            msgpack.packb(
+                [Headers.SUBMIT_REQUEST.value, request_id, sampling_params.serialize(), media_meta],
+                use_bin_type=True,
+            ),
+            self._pack_prompt(prompt),
+            # Routing hashes, when the caller computed them. None means it did
+            # not, and the coordinator hashes the prompt itself -- deliberately
+            # distinct from an empty list, which means the caller hashed and the
+            # prompt was shorter than one block.
+            msgpack.packb(self._block_hashes(prompt, media_meta), use_bin_type=True),
+            msgpack.packb(media_payload, use_bin_type=True),
+        ]
 
     @staticmethod
     def _pack_prompt(prompt):
@@ -466,19 +444,15 @@ class InferenceClient:
         Returns:
             AsyncStream[dict]: Per-step partial and final reply frames.
         """
-        with torch.cuda.nvtx.range("megatron.multimodal.client_add_request_streaming"):
-            sampling_params.streaming = True
-            request_id = self.next_request_id
-            self.next_request_id += 1
-            frames = self._pack_submit_frames(
-                request_id, prompt, sampling_params, multi_modal_data
-            )
-            return self._submit_stream(frames, request_id)
+        sampling_params.streaming = True
+        request_id = self.next_request_id
+        self.next_request_id += 1
+        frames = self._pack_submit_frames(request_id, prompt, sampling_params, multi_modal_data)
+        return self._submit_stream(frames, request_id)
 
     def _submit_request(self, frames: list, request_id: int) -> asyncio.Future:
         """Send a prepared request and register its completion future."""
-        with torch.cuda.nvtx.range("megatron.multimodal.client_request_send"):
-            self.socket.send_multipart(frames)
+        self.socket.send_multipart(frames)
         assert request_id not in self.completion_futures
         future = asyncio.get_running_loop().create_future()
         self.completion_futures[request_id] = future
@@ -487,8 +461,7 @@ class InferenceClient:
 
     def _submit_stream(self, frames: list, request_id: int) -> AsyncStream[dict]:
         """Send a prepared streaming request and register its response stream."""
-        with torch.cuda.nvtx.range("megatron.multimodal.client_request_send"):
-            self.socket.send_multipart(frames)
+        self.socket.send_multipart(frames)
         stream = AsyncStream(
             request_id, functools.partial(self.abort_request, request_id), loop=self._loop
         )

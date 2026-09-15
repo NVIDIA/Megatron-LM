@@ -775,16 +775,13 @@ class TextGenerationController(MTPInferenceMixin):
         # them once per step (both would return None but still take an
         # attribute-access hop).
         if context.has_vlm_data:
-            with torch.cuda.nvtx.range("megatron.multimodal.current_image_token_mask"):
-                image_token_mask = context.current_image_token_mask()
-            with torch.cuda.nvtx.range("megatron.multimodal.current_image_embeddings"):
-                image_embeddings = context.current_image_embeddings()
-            with torch.cuda.nvtx.range("megatron.multimodal.has_images"):
-                has_images = (
-                    image_token_mask is not None
-                    and image_embeddings is not None
-                    and (image_token_mask >= 0).any()
-                )
+            image_token_mask = context.current_image_token_mask()
+            image_embeddings = context.current_image_embeddings()
+            has_images = (
+                image_token_mask is not None
+                and image_embeddings is not None
+                and (image_token_mask >= 0).any()
+            )
         else:
             image_token_mask = None
             image_embeddings = None

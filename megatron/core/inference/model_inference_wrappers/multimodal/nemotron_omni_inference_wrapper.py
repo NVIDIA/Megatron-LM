@@ -167,38 +167,35 @@ class NemotronOmniInferenceWrapper(GPTInferenceWrapper):
         model = get_attr_wrapped_model(self.model, "image_token_index", return_model_obj=True)
 
         # The mask covers compact-path padding and pre-expanded model sentinels.
-        with torch.cuda.nvtx.range("megatron.multimodal.text_embedding"):
-            input_ids_text = tokens.masked_fill(image_token_mask >= 0, 0)
-            decoder_input = model.language_model.embedding(
-                input_ids=input_ids_text, position_ids=position_ids
-            )
-            combined_embeddings = decoder_input.transpose(0, 1).contiguous()
+        input_ids_text = tokens.masked_fill(image_token_mask >= 0, 0)
+        decoder_input = model.language_model.embedding(
+            input_ids=input_ids_text, position_ids=position_ids
+        )
+        combined_embeddings = decoder_input.transpose(0, 1).contiguous()
 
         # Inject vision embeddings into the decoder input.
-        with torch.cuda.nvtx.range("megatron.multimodal.image_embedding_splice"):
-            image_positions = image_token_mask >= 0
-            if image_positions.any():
-                if image_embeddings is None:
-                    raise ValueError("Image positions were provided without image embeddings.")
-                flat_image_embeddings = image_embeddings.reshape(
-                    -1, image_embeddings.shape[-1]
-                ).to(dtype=combined_embeddings.dtype)
-                image_indices = image_token_mask[image_positions].to(dtype=torch.long)
-                max_index = int(image_indices.max().item())
-                if max_index >= flat_image_embeddings.shape[0]:
-                    raise ValueError(
-                        f"Image embedding index {max_index} exceeds "
-                        f"{flat_image_embeddings.shape[0]} available embeddings."
-                    )
-                combined_embeddings[image_positions] = flat_image_embeddings[image_indices]
+        image_positions = image_token_mask >= 0
+        if image_positions.any():
+            if image_embeddings is None:
+                raise ValueError("Image positions were provided without image embeddings.")
+            flat_image_embeddings = image_embeddings.reshape(
+                -1, image_embeddings.shape[-1]
+            ).to(dtype=combined_embeddings.dtype)
+            image_indices = image_token_mask[image_positions].to(dtype=torch.long)
+            max_index = int(image_indices.max().item())
+            if max_index >= flat_image_embeddings.shape[0]:
+                raise ValueError(
+                    f"Image embedding index {max_index} exceeds "
+                    f"{flat_image_embeddings.shape[0]} available embeddings."
+                )
+            combined_embeddings[image_positions] = flat_image_embeddings[image_indices]
 
-            decoder_input = combined_embeddings.transpose(0, 1).contiguous()
+        decoder_input = combined_embeddings.transpose(0, 1).contiguous()
 
         if model.sequence_parallel_lm:
-            with torch.cuda.nvtx.range("megatron.multimodal.sequence_parallel_scatter"):
-                decoder_input = tensor_parallel.scatter_to_sequence_parallel_region(
-                    decoder_input, group=model.pg_collection.tp
-                ).contiguous()
+            decoder_input = tensor_parallel.scatter_to_sequence_parallel_region(
+                decoder_input, group=model.pg_collection.tp
+            ).contiguous()
 
         return model.language_model(
             input_ids=None,
