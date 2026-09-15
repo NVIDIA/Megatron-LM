@@ -3595,17 +3595,15 @@ class TransformerConfig(ModelParallelConfig):
                         "moe_token_dispatcher_type='alltoall'."
                     )
                     if self.batch_invariant_backend == "te_native":
-                        assert not (
-                            self.moe_use_grouped_tensor
-                            or bool(
-                                int(os.getenv("NVTE_GROUPED_LINEAR_USE_FUSED_GROUPED_GEMM", "0"))
-                            )
+                        assert (
+                            not self.use_transformer_engine_op_fuser
+                        ), "Batch-invariant training does not support TE op fuser."
+                        assert self.moe_use_grouped_tensor or not bool(
+                            int(os.getenv("NVTE_GROUPED_LINEAR_USE_FUSED_GROUPED_GEMM", "0"))
                         ), (
-                            "Batch-invariant te_native requires legacy TE GroupedLinear. "
-                            "Set moe_use_grouped_tensor=False, "
-                            "use_transformer_engine_op_fuser=False, "
-                            "and NVTE_GROUPED_LINEAR_USE_FUSED_GROUPED_GEMM=0; device-metadata "
-                            "grouped GEMM requires a full workspace with unproven batch invariance."
+                            "Enable device-metadata GEMM with moe_use_grouped_tensor=True, "
+                            "not just NVTE_GROUPED_LINEAR_USE_FUSED_GROUPED_GEMM, so expert "
+                            "padding uses the required 256-row alignment."
                         )
                 mxfp8_params_enabled = (
                     bool(self.fp8)

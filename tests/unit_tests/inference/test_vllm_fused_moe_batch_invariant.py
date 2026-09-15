@@ -333,6 +333,7 @@ class TestTeNativeBackend:
             enable_batch_invariant_mode,
             get_batch_invariant_backend,
             is_batch_invariant_mode_enabled,
+            te_supports_batch_invariant_grouped_gemm,
         )
 
         have_grouped_workspace = False
@@ -355,8 +356,13 @@ class TestTeNativeBackend:
             if have_te:
                 assert te_gemm_mod.get_cublas_workspace_size_bytes() == 1024
             if have_grouped_workspace:
-                with pytest.raises(RuntimeError, match="moe_use_grouped_tensor=False"):
-                    te_gemm_mod._get_grouped_cublas_workspace(torch.cuda.current_device(), "TN")
+                device = torch.cuda.current_device()
+                if te_supports_batch_invariant_grouped_gemm(device):
+                    workspace = te_gemm_mod._get_grouped_cublas_workspace(device, "TN")
+                    assert workspace.numel() == ws_fn_before()
+                else:
+                    with pytest.raises(RuntimeError, match="moe_use_grouped_tensor=False"):
+                        te_gemm_mod._get_grouped_cublas_workspace(device, "TN")
             # te_native must NOT reroute aten::mm — native kernels stay
             a = torch.randn(64, 64, device="cuda", dtype=torch.bfloat16)
             b = torch.randn(64, 64, device="cuda", dtype=torch.bfloat16)
