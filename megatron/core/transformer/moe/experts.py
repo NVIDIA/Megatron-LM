@@ -1050,7 +1050,17 @@ class TEGroupedMLP(MegatronModule):
                 intermediate_parallel = intermediate_parallel.to(original_dtype)
             return intermediate_parallel
 
-        if self.activation_recompute:
+        # Only set up the checkpoint when a backward pass will actually follow.
+        # CheckpointWithoutOutput discards the activation and relies on a grad hook to
+        # recompute it; under torch.no_grad() the output does not require grad, so the
+        # hook is never registered and the discard is left without its counterpart.
+        # self.training is not sufficient here: when "moe" is also in recompute_modules,
+        # CheckpointFunction invokes this forward once under no_grad and again under
+        # enable_grad during backward, and self.training is True in both cases.
+        setup_activation_checkpoint = (
+                self.activation_recompute and torch.is_grad_enabled()
+            )
+        if setup_activation_checkpoint:
             self.activation_checkpoint = tensor_parallel.CheckpointWithoutOutput()
             with moe_act_manager as fc1_output:
                 bias_act_output = self.activation_checkpoint.checkpoint(
@@ -1060,7 +1070,8 @@ class TEGroupedMLP(MegatronModule):
             with moe_act_manager as fc1_output:
                 bias_act_output = bias_act_func(fc1_output, bias_parallel, permuted_probs)
         output, output_bias = apply_module(self.linear_fc2)(bias_act_output, tokens_per_expert)
-        if self.activation_recompute:
+
+        if setup_activation_checkpoint:
             self.activation_checkpoint.discard_output_and_register_recompute(output)
 
         # Delay the offload of the moe act until after the linear_fc2 has been computed
