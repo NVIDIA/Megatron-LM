@@ -56,12 +56,23 @@ _is_persistent_chkpt_loaded = False
 _is_async_chkpt_enabled = False
 _is_calculating_timeouts = False
 _is_setup_section_open = False
+_is_step_section_open = False
+_step_section_name = "step"  # section currently opened by the step hooks ("step" or _TENSOR_METRICS_SECTION)
 _seen_checkpoints_cnt = 0
 _seen_tr_iters_cnt = 0
 _curr_eval_iter_idx = 0
 
 _NUM_WARMUP_ITERS = 1  # Will be set by --ft-num-warmup-iters (default: 5)
 _MIN_ITERS_FOR_STEP_TIMEOUT_UPDATE = 16
+
+# Iterations that compute periodic, potentially long in-step diagnostics (the router
+# tensor-metrics reduction) are timed under this section instead of the tight "step" section,
+# so their cost is not charged to the step hang-detection timeout and does not cause
+# false-positive restarts. The whole such iteration (forward + commit) is covered, because the
+# expensive work is not confined to a single call the caller could wrap. Give the section a
+# generous budget via `--ft-rank-section-timeouts ...,tensor_metrics:<sec>`; if left
+# unconfigured the section is unmonitored (metric iters are exempt while normal steps stay tight).
+_TENSOR_METRICS_SECTION = "tensor_metrics"
 
 
 def get_rank_monitor_client() -> Optional[Any]:
@@ -118,16 +129,27 @@ def setup() -> None:
     _is_setup_section_open = True
 
 
-def on_training_step_start() -> None:
-    """Should be called before each training step"""
+def on_training_step_start(is_tensor_metrics_iteration: bool = False) -> None:
+    """Should be called before each training step.
+
+    Args:
+        is_tensor_metrics_iteration: True on iterations that run the periodic router
+            tensor-metrics reduction. Such iterations are timed under the ``tensor_metrics``
+            section (its own, generous budget) instead of the tight ``step`` section, so their
+            cost is excluded from step-level hang detection. Covering the whole iteration is
+            deliberate: the expensive work is spread across the forward observation and the
+            commit, not a single wrappable call.
+    """
     rmon_cli = get_rank_monitor_client()
     if rmon_cli is not None:
-        global _is_setup_section_open
+        global _is_setup_section_open, _is_step_section_open, _step_section_name
         if _is_setup_section_open:
             rmon_cli.end_section("setup")
             _is_setup_section_open = False
         if _seen_tr_iters_cnt >= _NUM_WARMUP_ITERS:
-            rmon_cli.start_section("step")
+            _step_section_name = _TENSOR_METRICS_SECTION if is_tensor_metrics_iteration else "step"
+            rmon_cli.start_section(_step_section_name)
+            _is_step_section_open = True
         # reset eval step index. we started training, so evaluation is done
         global _curr_eval_iter_idx
         _curr_eval_iter_idx = 0
@@ -137,9 +159,10 @@ def on_training_step_end() -> None:
     """Should be called after each training step"""
     rmon_cli = get_rank_monitor_client()
     if rmon_cli is not None:
-        global _seen_tr_iters_cnt
+        global _seen_tr_iters_cnt, _is_step_section_open
         if _seen_tr_iters_cnt >= _NUM_WARMUP_ITERS:
-            rmon_cli.end_section("step")
+            rmon_cli.end_section(_step_section_name)
+            _is_step_section_open = False
         _seen_tr_iters_cnt += 1
 
 
@@ -147,22 +170,25 @@ def on_eval_step_start() -> None:
     """Should be called before each validation step"""
     rmon_cli = get_rank_monitor_client()
     if rmon_cli is not None:
-        global _is_setup_section_open
+        global _is_setup_section_open, _is_step_section_open, _step_section_name
         if _is_setup_section_open:
             # setup section can be open if there were no training iters before evaluation
             rmon_cli.end_section("setup")
             _is_setup_section_open = False
         if _curr_eval_iter_idx >= _NUM_WARMUP_ITERS:
+            _step_section_name = "step"
             rmon_cli.start_section("step")
+            _is_step_section_open = True
 
 
 def on_eval_step_end() -> None:
     """Should be called after each validation step"""
     rmon_cli = get_rank_monitor_client()
     if rmon_cli is not None:
-        global _curr_eval_iter_idx
+        global _curr_eval_iter_idx, _is_step_section_open
         if _curr_eval_iter_idx >= _NUM_WARMUP_ITERS:
-            rmon_cli.end_section("step")
+            rmon_cli.end_section(_step_section_name)
+            _is_step_section_open = False
         _curr_eval_iter_idx += 1
 
 
