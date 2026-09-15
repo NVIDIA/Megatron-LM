@@ -17,6 +17,14 @@ def _wrapper(prompt_config=None):
     return wrapper
 
 
+def test_wrapper_rejects_shortcut_moe_models():
+    """Every engine builds one of these wrappers, so shortcut MoE is refused for all of them."""
+    model = SimpleNamespace(config=SimpleNamespace(moe_shortcut_connection=True))
+
+    with pytest.raises(NotImplementedError, match="moe_shortcut_connection"):
+        GPTInferenceWrapper(model, inference_context=None)
+
+
 def test_validate_input_modalities_accepts_declared_capabilities_and_rejects_others():
     wrapper = _wrapper()
     wrapper.supports_image = True

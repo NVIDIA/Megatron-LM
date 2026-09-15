@@ -29,7 +29,7 @@ from torch.distributed.tensor.placement_types import Placement
 
 from ..mixed_precision import MixedPrecisionPolicy
 from .dbuffer import DBuffer
-from .module_utils import get_parameter_owner
+from .module_utils import copy_parameter_attributes, get_parameter_owner
 from .placement import BlockAtomic
 
 _CONTAINING_PARAMETER_GROUP_ATTR = "_mfsdp_parameter_group"
@@ -283,11 +283,11 @@ class FsdpParameterGroup:
             if parameter.is_meta:
                 # A meta Parameter cannot set .data to a real tensor because their
                 # TensorImpl types are incompatible, so swap in a materialized Parameter.
-                # This may be problematic if attributes from the original Parameter need
-                # to be copied to the unsharded Parameter.
+                # Copy model metadata first since swap_tensors() also swaps attributes.
                 materialized_parameter = nn.Parameter(
                     unsharded_tensor, requires_grad=parameter.requires_grad
                 )
+                copy_parameter_attributes(parameter, materialized_parameter)
                 torch.utils.swap_tensors(parameter, materialized_parameter)
             else:
                 parameter.data = unsharded_tensor
@@ -298,6 +298,7 @@ class FsdpParameterGroup:
             sharded_parameter = nn.Parameter(
                 self.main_weight.get_dtensor(index), requires_grad=parameter.requires_grad
             )
+            copy_parameter_attributes(parameter, sharded_parameter)
             if main_grad_dtype:
                 sharded_parameter.grad_dtype = main_grad_dtype
             setattr(sharded_parameter, _CONTAINING_PARAMETER_GROUP_ATTR, ref(self))
