@@ -317,6 +317,11 @@ def test_gdn_torch_l2norm_matches_fla_and_replays(dtype, head_dim, compiled):
     # A zero row distinguishes additive epsilon from clamping the norm itself.
     x[0, 0].zero_()
     dy = torch.randn_like(x)
+    if dtype == torch.bfloat16:
+        # With an exactly parallel upstream gradient, differentiating an
+        # unrounded norm would erase FLA's saved-rounded-output contribution.
+        x[0, 1].fill_(0.5)
+        dy[0, 1].fill_(32.0)
     actual_input = x.clone().requires_grad_(True)
     expected_input = x.clone().requires_grad_(True)
     normalize = torch.compile(torch_l2norm) if compiled else torch_l2norm
@@ -324,6 +329,8 @@ def test_gdn_torch_l2norm_matches_fla_and_replays(dtype, head_dim, compiled):
     expected = l2norm(expected_input)
     actual.backward(dy)
     expected.backward(dy)
+    if dtype == torch.bfloat16:
+        assert expected_input.grad[0, 1].abs().min().item() > 1e-4
     torch.testing.assert_close(actual, expected)
     torch.testing.assert_close(actual_input.grad, expected_input.grad)
     assert_replays_bit_exact(
