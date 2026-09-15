@@ -235,27 +235,63 @@ jobs:
         shell: bash
         env:
           BASE_PR_CACHE: ${{ matrix.registry }}/megatron-lm:${{ steps.cache_keys.outputs.base-pr }}-buildcache-${{ matrix.cloud }}
+          BASE_PR_IMAGE: ${{ matrix.registry }}/megatron-lm:${{ steps.cache_keys.outputs.base-pr }}-${{ matrix.cloud }}
           BASE_PR_KEY: ${{ steps.cache_keys.outputs.base-pr }}
           BASELINE_CACHE: ${{ matrix.registry }}/megatron-lm:${{ steps.cache_keys.outputs.baseline }}-buildcache-${{ matrix.cloud }}
+          BASELINE_IMAGE: ${{ matrix.registry }}/megatron-lm:${{ steps.cache_keys.outputs.baseline }}-${{ matrix.cloud }}
           EVENT_NAME: ${{ github.event_name }}
           LEGACY_CACHE: ${{ matrix.registry }}/megatron-lm:0-buildcache-${{ matrix.cloud }}
           RUN_CACHE: ${{ matrix.registry }}/megatron-lm:${{ steps.cache_keys.outputs.key }}-buildcache-${{ matrix.cloud }}
+          RUN_IMAGE: ${{ matrix.registry }}/megatron-lm:${{ steps.cache_keys.outputs.key }}-${{ matrix.cloud }}
         run: |
           if [ "$EVENT_NAME" = "merge_group" ]; then
-            CANDIDATES=("$BASELINE_CACHE" "$RUN_CACHE" "$LEGACY_CACHE")
+            CANDIDATE_CACHES=("$RUN_CACHE" "$BASELINE_CACHE")
+            CANDIDATE_IMAGES=("$RUN_IMAGE" "$BASELINE_IMAGE")
           elif [ -n "$BASE_PR_KEY" ]; then
-            CANDIDATES=("$RUN_CACHE" "$BASE_PR_CACHE" "$BASELINE_CACHE" "$LEGACY_CACHE")
+            CANDIDATE_CACHES=("$RUN_CACHE" "$BASE_PR_CACHE" "$BASELINE_CACHE")
+            CANDIDATE_IMAGES=("$RUN_IMAGE" "$BASE_PR_IMAGE" "$BASELINE_IMAGE")
           else
-            CANDIDATES=("$RUN_CACHE" "$BASELINE_CACHE" "$LEGACY_CACHE")
+            CANDIDATE_CACHES=("$RUN_CACHE" "$BASELINE_CACHE")
+            CANDIDATE_IMAGES=("$RUN_IMAGE" "$BASELINE_IMAGE")
           fi
 
+          image_created_epoch() {
+            local image="$1"
+            local created
+            created=$(docker buildx imagetools inspect "$image" --format '{{json .Image}}' 2>/dev/null \
+              | jq -r '.created // empty')
+            if [ -z "$created" ]; then
+              return 1
+            fi
+            python -c 'import datetime, sys; print(int(datetime.datetime.fromisoformat(sys.argv[1].replace("Z", "+00:00")).timestamp()))' \
+              "$created" 2>/dev/null
+          }
+
           DONOR_CACHE="$LEGACY_CACHE"
-          for candidate in "${CANDIDATES[@]}"; do
-            if docker buildx imagetools inspect "$candidate" >/dev/null 2>&1; then
-              DONOR_CACHE="$candidate"
-              break
+          DONOR_CREATED=-1
+          # Each cache is exported alongside a normal output image. Rank the
+          # caches using the portable OCI creation time from that companion image.
+          for index in "${!CANDIDATE_CACHES[@]}"; do
+            candidate_cache="${CANDIDATE_CACHES[$index]}"
+            candidate_image="${CANDIDATE_IMAGES[$index]}"
+            if ! docker buildx imagetools inspect "$candidate_cache" >/dev/null 2>&1; then
+              continue
+            fi
+
+            if created_epoch=$(image_created_epoch "$candidate_image"); then
+              echo "Companion image for $candidate_cache was created at epoch $created_epoch"
+            else
+              echo "::warning::Unable to determine creation time for cache candidate $candidate_cache"
+              created_epoch=0
+            fi
+            # Baseline is last in the candidate list, so it wins ties and the
+            # all-metadata-missing fallback.
+            if [ "$created_epoch" -ge "$DONOR_CREATED" ]; then
+              DONOR_CACHE="$candidate_cache"
+              DONOR_CREATED="$created_epoch"
             fi
           done
+
           echo "donor=$DONOR_CACHE" | tee -a "$GITHUB_OUTPUT"
 
       - name: Build and push
