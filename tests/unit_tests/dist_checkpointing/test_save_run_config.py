@@ -16,7 +16,12 @@ from megatron.training.utils.checkpoint_utils import (
     read_run_config,
 )
 from tests.unit_tests.dist_checkpointing import TempNamedDir
-from tests.unit_tests.test_checkpointing import MockModel, MockState, create_args, init_model_parallel
+from tests.unit_tests.test_checkpointing import (
+    MockModel,
+    MockState,
+    create_args,
+    init_model_parallel,
+)
 
 
 class MockFullConfig:

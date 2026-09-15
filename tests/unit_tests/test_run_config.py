@@ -52,10 +52,7 @@ class TestReadRunConfigNonDistributed:
 
     def test_strips_runtime_only_timers_target(self, tmp_path):
         run_config_path = tmp_path / "run_config.yaml"
-        data = {
-            "_target_": "some.Config",
-            "timers": {"_target_": "megatron.core.timers.Timers"},
-        }
+        data = {"_target_": "some.Config", "timers": {"_target_": "megatron.core.timers.Timers"}}
         with open(run_config_path, "w") as f:
             yaml.safe_dump(data, f)
 
@@ -96,15 +93,11 @@ class TestReadRunConfigDistributed:
 
         with (
             mock.patch("torch.distributed.is_initialized", return_value=True),
-            mock.patch(
-                "megatron.training.utils.checkpoint_utils.get_rank_safe", return_value=0
-            ),
+            mock.patch("megatron.training.utils.checkpoint_utils.get_rank_safe", return_value=0),
             mock.patch(
                 "megatron.training.utils.checkpoint_utils.get_world_size_safe", return_value=4
             ),
-            mock.patch(
-                "torch.distributed.broadcast_object_list", side_effect=_fake_broadcast
-            ),
+            mock.patch("torch.distributed.broadcast_object_list", side_effect=_fake_broadcast),
         ):
             loaded = read_run_config(str(run_config_path))
 
@@ -120,15 +113,11 @@ class TestReadRunConfigDistributed:
 
         with (
             mock.patch("torch.distributed.is_initialized", return_value=True),
-            mock.patch(
-                "megatron.training.utils.checkpoint_utils.get_rank_safe", return_value=1
-            ),
+            mock.patch("megatron.training.utils.checkpoint_utils.get_rank_safe", return_value=1),
             mock.patch(
                 "megatron.training.utils.checkpoint_utils.get_world_size_safe", return_value=4
             ),
-            mock.patch(
-                "torch.distributed.broadcast_object_list", side_effect=_fake_broadcast
-            ),
+            mock.patch("torch.distributed.broadcast_object_list", side_effect=_fake_broadcast),
         ):
             loaded = read_run_config(str(run_config_path))
 
@@ -142,15 +131,11 @@ class TestReadRunConfigDistributed:
 
         with (
             mock.patch("torch.distributed.is_initialized", return_value=True),
-            mock.patch(
-                "megatron.training.utils.checkpoint_utils.get_rank_safe", return_value=0
-            ),
+            mock.patch("megatron.training.utils.checkpoint_utils.get_rank_safe", return_value=0),
             mock.patch(
                 "megatron.training.utils.checkpoint_utils.get_world_size_safe", return_value=4
             ),
-            mock.patch(
-                "torch.distributed.broadcast_object_list", side_effect=_fake_broadcast
-            ),
+            mock.patch("torch.distributed.broadcast_object_list", side_effect=_fake_broadcast),
         ):
             with pytest.raises(RuntimeError):
                 read_run_config(str(missing_path))
