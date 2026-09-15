@@ -2825,6 +2825,10 @@ def setup_model_and_optimizer(
 
     model = _build_model_wrapper(wrap_with_ddp)
     unwrapped_model = unwrap_model(model)
+    # Model constructors resolve architecture-dependent options before checkpointing/reporting.
+    model_config = getattr(unwrapped_model[0], 'config', None)
+    if model_config is not None and hasattr(model_config, 'mtp_hsm'):
+        args.mtp_hsm = model_config.mtp_hsm
 
     # Classify each GTP param's prefetch chain after model build + DDP wrap, before the
     # first forward. Placed here (not in get_model) so it also covers the config-container

@@ -129,6 +129,30 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
             "`docs/user-guide/hybrid-model-migration.md` for details on how to use `HybridModel`",
         )
         super().__init__(config=config, pg_collection=pg_collection)
+        # MTP depth is model-wide; non-MTP pipeline stages still freeze their backbone.
+        if self.config.freeze_base_model_for_mtp and (
+            self.config.mtp_num_layers is None or self.config.mtp_num_layers < 1
+        ):
+            raise ValueError("freeze_base_model_for_mtp requires mtp_num_layers >= 1.")
+        if self.config.mtp_hsm and (
+            self.config.mtp_num_layers is None or self.config.mtp_num_layers < 2
+        ):
+            log_single_rank(
+                logger,
+                logging.WARNING,
+                "mtp_hsm needs at least two MTP layers to mix anything, but "
+                f"mtp_num_layers is {self.config.mtp_num_layers}. "
+                "Disabling Hidden State Mixing.",
+            )
+            self.config.mtp_hsm = False
+        if self.config.mtp_hybrid_override_pattern is not None:
+            log_single_rank(
+                logger,
+                logging.WARNING,
+                "mtp_hybrid_override_pattern is for Mamba/hybrid models only. "
+                "For GPT models, MTP replicates the main transformer layer structure. "
+                "This argument will be ignored.",
+            )
 
         if has_config_logger_enabled(config):
             log_config_to_disk(config, locals(), prefix=type(self).__name__)

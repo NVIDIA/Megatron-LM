@@ -2134,6 +2134,12 @@ class MultiTokenPredictionBlock(MegatronModule):
             name (str | None): module instance name passed top-down from its paranet module
         """
         super().__init__(config=config)
+        if self.config.mtp_hsm and (
+            self.config.mtp_num_layers is None
+            or self.config.mtp_num_layers < 2
+            or 0 < mtp_num_depths < 2
+        ):
+            raise ValueError("mtp_hsm=True requires mtp_num_layers >= 2.")
         if mamba_submodules is not None:
             if hybrid_submodules is not None:
                 raise ValueError(
