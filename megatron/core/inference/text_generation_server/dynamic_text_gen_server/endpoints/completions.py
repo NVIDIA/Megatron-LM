@@ -5,7 +5,10 @@ import base64
 import logging
 import time
 
-from megatron.core.inference.inference_request import unwrap_serialized_tensors
+from megatron.core.inference.inference_request import (
+    serialize_multimodal_data,
+    unwrap_serialized_tensors,
+)
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.utils import detokenize_tokens
 
@@ -180,6 +183,7 @@ try:
         # through openai_stream's finally, which never runs because the
         # generator is never started.
         try:
+            serialized_multimodal_data = serialize_multimodal_data(multi_modal_data)
             for prompt_tokens in prompts_as_tokens:
                 per_req_params = SamplingParams(
                     temperature=sampling_params.temperature,
@@ -202,7 +206,9 @@ try:
                 if stream_requested:
                     tasks.append(
                         client.add_request_streaming(
-                            prompt_tokens, per_req_params, multi_modal_data=multi_modal_data
+                            prompt_tokens,
+                            per_req_params,
+                            multi_modal_data=serialized_multimodal_data,
                         )
                     )
                 else:
@@ -210,7 +216,7 @@ try:
                     # writes nothing to the socket while generating, so a disconnect
                     # is never discovered as a broken pipe. Aborting needs the ids.
                     request_id, future = client.add_request_with_id(
-                        prompt_tokens, per_req_params, multi_modal_data=multi_modal_data
+                        prompt_tokens, per_req_params, multi_modal_data=serialized_multimodal_data
                     )
                     request_ids.append(request_id)
                     tasks.append(future)
