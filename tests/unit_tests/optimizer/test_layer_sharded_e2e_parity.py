@@ -6,6 +6,9 @@ Runs ``setup_model_and_optimizer`` on a TP(2) x GTP_remat(2) grid and checks tha
 loss trajectory of ``--muon-tp-mode layer_sharded`` (the two-stage exchange over a
 genuine GTP_remat x TP domain) is bitwise identical to ``duplicated`` mode.
 
+Skips at module level when GTP is unavailable (TransformerEngine < 2.19.0.dev0), like
+``test_gtp_fp8_param_gather.py``.
+
 Launch with 4 ranks:
   torchrun --nproc-per-node=4 -m pytest tests/unit_tests/optimizer/test_layer_sharded_e2e_parity.py
 """
@@ -14,6 +17,11 @@ import pytest
 import torch
 
 pytest.importorskip("emerging_optimizers", reason="LayerShardedMuon requires emerging-optimizers")
+
+from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
+
+if not HAVE_GTP:
+    pytest.skip("GTP requires TransformerEngine >= 2.19", allow_module_level=True)
 
 from megatron.core.optimizer.layer_sharded_muon import LayerShardedMuon
 from tests.unit_tests.test_fp8_param import TestFP8Param as _Harness
