@@ -303,6 +303,34 @@ def test_gdp_l2norm_and_cumsum_replay():
 # --- Gated Delta Net (deterministic torch path vs FLA) ---------------------------------------
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("head_dim", [32, 128])
+@pytest.mark.parametrize("compiled", [False, True], ids=["eager", "compiled"])
+def test_gdn_torch_l2norm_matches_fla_and_replays(dtype, head_dim, compiled):
+    """Preserve FLA's output/gradient contract while removing autotune-dependent rounding."""
+    from fla.modules.l2norm import l2norm
+
+    from megatron.core.ssm.gated_delta_net.common import torch_l2norm
+
+    seeded()
+    x = torch.randn(2, 256, head_dim, device="cuda", dtype=dtype)
+    # A zero row distinguishes additive epsilon from clamping the norm itself.
+    x[0, 0].zero_()
+    dy = torch.randn_like(x)
+    actual_input = x.clone().requires_grad_(True)
+    expected_input = x.clone().requires_grad_(True)
+    normalize = torch.compile(torch_l2norm) if compiled else torch_l2norm
+    actual = normalize(actual_input)
+    expected = l2norm(expected_input)
+    actual.backward(dy)
+    expected.backward(dy)
+    torch.testing.assert_close(actual, expected)
+    torch.testing.assert_close(actual_input.grad, expected_input.grad)
+    assert_replays_bit_exact(
+        normalize, (x.requires_grad_(True),), replays=3, contention=True, what="GDN torch L2 norm"
+    )
+
+
 def test_torch_chunk_gated_delta_rule_replays_fwd_bwd():
     """The path ``--deterministic-mode`` selects for GDN (FLA is not deterministic)."""
     from megatron.core.ssm.gated_delta_net.gdn import torch_chunk_gated_delta_rule
