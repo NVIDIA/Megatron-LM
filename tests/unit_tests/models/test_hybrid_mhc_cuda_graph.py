@@ -1,12 +1,20 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Real TE capture/replay regressions for the existing main mHC model entry points."""
+"""Real TE capture/replay regressions for the existing main mHC model entry points.
+
+Fused cases count the actual accelerated forward/backward launchers during CUDA
+capture, independently of eager warmup and reference execution. SM10x Blackwell
+also requires the cuTile projection and aggregation-backward paths; Hopper can
+use the supported Triton/native combination selected by the same auto policy.
+"""
 
 from collections import Counter
+from functools import wraps
 
 import pytest
 import torch
 
+from megatron.core.fusions import fused_mhc_kernels
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
@@ -37,6 +45,79 @@ from megatron.core.transformer.transformer_layer import (
 )
 from megatron.core.utils import is_te_min_version
 from tests.unit_tests.test_utilities import Utils
+
+
+def _record_mhc_backend_calls(monkeypatch):
+    """Observe real kernel dispatch without changing the selected implementation."""
+    calls = {'eager': Counter(), 'capture': Counter()}
+
+    def record(name, implementation):
+        @wraps(implementation)
+        def counted(*args, **kwargs):
+            phase = 'capture' if torch.cuda.is_current_stream_capturing() else 'eager'
+            result = implementation(*args, **kwargs)
+            calls[phase][name] += 1
+            return result
+
+        return counted
+
+    # These Python launchers are looked up directly by the autograd functions.
+    for name in (
+        '_triton_sinkhorn_fwd',
+        '_triton_sinkhorn_bwd',
+        '_cutile_sinkhorn_fwd',
+        '_cutile_sinkhorn_bwd',
+        '_cutile_h_aggregate_fwd',
+        '_cutile_h_aggregate_bwd',
+        '_cutile_h_post_bda_fwd',
+        '_cutile_h_post_bda_bwd',
+        '_cutile_proj_rms_compute_h_fwd',
+        '_cutile_fused_compute_h_proj_rms_bwd',
+    ):
+        implementation = getattr(fused_mhc_kernels, name, None)
+        if implementation is not None:
+            monkeypatch.setattr(fused_mhc_kernels, name, record(name, implementation))
+
+    # The other Triton launchers are saved in the implementation table at import.
+    for name in ('h_aggregate_fwd', 'h_post_bda_fwd', 'h_post_bda_bwd'):
+        implementation = fused_mhc_kernels._TRITON_IMPLS.get(name)
+        if implementation is not None:
+            monkeypatch.setitem(
+                fused_mhc_kernels._TRITON_IMPLS, name, record(f'_triton_{name}', implementation)
+            )
+    return calls
+
+
+def _expected_mhc_backend_calls(fused):
+    """Require acceleration for fused cases, using the existing auto policy."""
+    if not fused:
+        return set()
+    triton = fused_mhc_kernels.is_triton_available()
+    cutile = fused_mhc_kernels.is_cutile_available()
+    assert triton or cutile, 'The fused mHC case requires an accelerated backend.'
+    if torch.cuda.get_device_capability()[0] == 10:
+        assert cutile, 'The SM10x Blackwell fused mHC lane requires cuTile support.'
+
+    backend = 'triton' if triton else 'cutile'
+    expected = {
+        f'_{backend}_{operation}'
+        for operation in (
+            'sinkhorn_fwd',
+            'sinkhorn_bwd',
+            'h_aggregate_fwd',
+            'h_post_bda_fwd',
+            'h_post_bda_bwd',
+        )
+    }
+    if cutile:
+        expected.update(
+            {
+                '_cutile_h_aggregate_bwd',
+                '_cutile_proj_rms_compute_h_fwd',
+                '_cutile_fused_compute_h_proj_rms_bwd',
+            }
+        )
+    return expected
 
 
 def _config(kind, scopes, fused=False, tp=1, cp=1, ep=1):
@@ -152,8 +233,8 @@ class TestMHCTEGraphs:
         ],
     )
     @pytest.mark.parametrize('fused', [False, True])
-    def test_capture_replay_all_gradients(self, kind, scopes, fused):
-        self._run(kind, scopes, fused)
+    def test_capture_replay_all_gradients(self, kind, scopes, fused, monkeypatch):
+        self._run(kind, scopes, fused, monkeypatch)
 
     def test_combined_hybrid_attention_moe_graph_is_rejected(self):
         Utils.initialize_model_parallel(1, 1)
@@ -185,10 +266,18 @@ class TestMHCTEGraphs:
             )
 
     @pytest.mark.parametrize('kind', ['hybrid_moe_mtp', 'gpt_moe'])
-    def test_parallel_capture_replay(self, kind):
-        self._run(kind, [CudaGraphModule.attn, CudaGraphModule.moe_router], False, tp=2, cp=2, ep=2)
+    def test_parallel_capture_replay(self, kind, monkeypatch):
+        self._run(
+            kind,
+            [CudaGraphModule.attn, CudaGraphModule.moe_router],
+            False,
+            monkeypatch,
+            tp=2,
+            cp=2,
+            ep=2,
+        )
 
-    def _run(self, kind, scopes, fused, tp=1, cp=1, ep=1):
+    def _run(self, kind, scopes, fused, monkeypatch, tp=1, cp=1, ep=1):
         Utils.initialize_model_parallel(
             tensor_model_parallel_size=tp,
             pipeline_model_parallel_size=1,
@@ -197,6 +286,8 @@ class TestMHCTEGraphs:
             expert_tensor_parallel_size=tp,
         )
         model_parallel_cuda_manual_seed(123, force_reset_rng=True)
+        expected_backend_calls = _expected_mhc_backend_calls(fused)
+        backend_calls = _record_mhc_backend_calls(monkeypatch)
         init_num_microbatches_calculator(
             rank=0,
             global_batch_size=2,
@@ -247,6 +338,10 @@ class TestMHCTEGraphs:
             assert sum(self.helper.flattened_callables_is_mtp) == 4
         self.helper.create_cudagraphs()
         assert self.helper.graphs_created()
+        # Python dispatch runs when recording a CUDA graph, not on its replay.
+        # Counting capture separately prevents eager warmup from proving this.
+        assert set(backend_calls['capture']) == expected_backend_calls, backend_calls
+        print(f'mHC fused={fused}; captured backend calls: {dict(backend_calls["capture"])}')
         assert all(layer.cuda_graphs for layer in expected)
         assert set(graphed.state_dict()) == initial_keys
 
@@ -310,6 +405,8 @@ class TestMHCTEGraphs:
             assert all(replay_calls[id(layer)] == index + 1 for layer in expected)
             assert set(hooks) == covered_modules
             assert all(count == index + 1 for count in hooks.values())
+        if not fused:
+            assert not any(backend_calls.values()), backend_calls
 
 
 @pytest.mark.parametrize('impl', ['transformer_engine', 'full_iteration'])
