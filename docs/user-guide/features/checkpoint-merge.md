@@ -88,8 +88,8 @@ reshaped or reconciled.
 
 ### VLM checkpoints with split model roots
 
-Some VLM checkpoints store distributed model shards separately from
-`common.pt` and use two top-level roots rather than the default `model.` root:
+Some VLM checkpoints store distributed model shards without common state and
+use two top-level roots rather than the default `model.` root:
 
 - `language_model.` contains the language model, including any MTP parameters;
 - `modality_submodules.` contains the vision encoder and multimodal projector.
@@ -99,9 +99,9 @@ checkpoints can also contain optimizer, RNG, or other training state under
 unrelated roots. `--merge-ignore-non-model-state` is the explicit opt-in to
 exclude that state; it does not make it part of the merged output.
 
-When the selected `iter_*` directories do not contain `common.pt`, point
-`--common-state-checkpoint` at a trusted, complete checkpoint for the output
-iteration:
+When the selected `iter_*` directories contain neither legacy `common.pt` nor
+the current embedded DCP common state, point `--common-state-checkpoint` at a
+trusted, complete checkpoint for the output iteration:
 
 ```bash
 python tools/checkpoint/weighted_merge.py \
@@ -120,8 +120,8 @@ python tools/checkpoint/weighted_merge.py \
   --merge-balance-rank-work
 ```
 
-The common-state checkpoint supplies both `common.pt` and model
-`_extra_state`, so they remain aligned to one source. If it records an
+The common-state checkpoint supplies common state and model `_extra_state`, so
+they remain aligned to one source. If it records an
 iteration, that iteration must equal `--output-iteration`. Run the same command
 with `--dry-run` first to validate the selected roots and every source layout
 without writing output. The resulting checkpoint contains merged model state,
@@ -221,7 +221,7 @@ iteration under the wrong path.
 By default, common checkpoint state comes from the input whose recorded iteration
 matches `--output-iteration`, or from the first input when no output iteration is
 requested. Use `--common-state-checkpoint PATH` when the merge inputs contain only
-distributed model shards and a separate checkpoint must supply `common.pt`. If
+distributed model shards and a separate checkpoint must supply common state. If
 the supplied common state records an iteration, it must match
 `--output-iteration`. The explicit checkpoint also supplies model `_extra_state`,
 keeping the copied common and extra state from one consistent source; otherwise
@@ -229,6 +229,10 @@ keeping the copied common and extra state from one consistent source; otherwise
 may name either a concrete checkpoint directory or a root with a latest marker.
 Common state and byte/object `_extra_state` loading use checkpoint
 deserialization, so every source checkpoint must be trusted.
+
+The metadata path recognizes legacy `common.pt`, the current embedded DCP key
+`common_state/shard_0_1`, and model-only inputs. It rejects checkpoints that mix
+the legacy and embedded forms or use an unknown embedded common-state layout.
 
 The output `common.pt` includes `weighted_merge_provenance`: input paths, source
 iterations when they can be inferred from `iter_*` directory names, weights,

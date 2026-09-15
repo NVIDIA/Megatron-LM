@@ -763,7 +763,7 @@ def test_metadata_same_layout_uses_output_checkpoint_progress_state(
         assert common_state["args"].consumed_train_samples == 256_000
 
 
-def test_metadata_same_layout_supports_current_common_state_storage(
+def test_metadata_same_layout_matches_current_common_state_storage(
     tmp_path_dist_ckpt, process_group
 ):
     with TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_common_state_layout") as checkpoint:
@@ -775,10 +775,10 @@ def test_metadata_same_layout_supports_current_common_state_storage(
             for key in metadata.state_dict_metadata
             if weighted_merge_module._metadata_same_layout_is_common_state_key(str(key))
         }
-        if (checkpoint / "common.pt").exists():
-            assert not embedded_common_keys
-        else:
-            assert embedded_common_keys == {"common_state/shard_0_1"}
+        assert not (checkpoint / "common.pt").exists()
+        assert embedded_common_keys == {
+            weighted_merge_module.METADATA_SAME_LAYOUT_CURRENT_COMMON_STATE_KEY
+        }
 
         snapshot = weighted_merge_module._read_public_dcp_metadata(
             checkpoint, model_key_prefixes=weighted_merge_module.METADATA_SAME_LAYOUT_MODEL_PREFIXES
@@ -788,6 +788,65 @@ def test_metadata_same_layout_supports_current_common_state_storage(
             weighted_merge_module._metadata_same_layout_is_common_state_key(key)
             for key in snapshot.tensor_metadata
         )
+
+
+def test_metadata_same_layout_accepts_legacy_and_model_only_common_state_storage(
+    tmp_path_dist_ckpt, process_group
+):
+    with TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_common_state_legacy") as checkpoint:
+        _write_checkpoint(checkpoint, 1.0, iteration=1000)
+        metadata = torch_dcp.FileSystemReader(checkpoint).read_metadata()
+        model_only_metadata = {
+            key: entry
+            for key, entry in metadata.state_dict_metadata.items()
+            if not weighted_merge_module._metadata_same_layout_is_common_state_key(str(key))
+        }
+
+        weighted_merge_module._metadata_same_layout_validate_common_state_storage(
+            checkpoint, model_only_metadata
+        )
+        torch.save({}, checkpoint / "common.pt")
+        weighted_merge_module._metadata_same_layout_validate_common_state_storage(
+            checkpoint, model_only_metadata
+        )
+
+
+def test_metadata_same_layout_rejects_mixed_common_state_storage(tmp_path_dist_ckpt, process_group):
+    with TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_common_state_mixed") as checkpoint:
+        _write_checkpoint(checkpoint, 1.0, iteration=1000)
+        metadata = torch_dcp.FileSystemReader(checkpoint).read_metadata()
+        torch.save({}, checkpoint / "common.pt")
+
+        with pytest.raises(WeightedMergeError, match="mixes legacy common.pt"):
+            weighted_merge_module._metadata_same_layout_validate_common_state_storage(
+                checkpoint, metadata.state_dict_metadata
+            )
+
+
+def test_metadata_same_layout_rejects_unknown_common_state_storage_when_ignoring_non_model(
+    tmp_path_dist_ckpt, process_group, monkeypatch
+):
+    with TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_common_state_unknown") as checkpoint:
+        _write_checkpoint(checkpoint, 1.0, iteration=1000)
+        metadata = torch_dcp.FileSystemReader(checkpoint).read_metadata()
+        current_key = weighted_merge_module.METADATA_SAME_LAYOUT_CURRENT_COMMON_STATE_KEY
+        unknown_state_dict_metadata = dict(metadata.state_dict_metadata)
+        unknown_state_dict_metadata["common_state/shard_0_2"] = unknown_state_dict_metadata.pop(
+            current_key
+        )
+        unknown_metadata = replace(metadata, state_dict_metadata=unknown_state_dict_metadata)
+        monkeypatch.setattr(
+            weighted_merge_module.FileSystemReader,
+            "read_metadata",
+            lambda _reader: unknown_metadata,
+        )
+
+        with pytest.raises(WeightedMergeError, match="unsupported embedded common-state layout"):
+            weighted_merge_module._read_public_dcp_metadata(
+                checkpoint,
+                model_key_prefixes=weighted_merge_module.METADATA_SAME_LAYOUT_MODEL_PREFIXES,
+                ignore_non_model_state=True,
+            )
 
 
 def test_metadata_same_layout_uses_explicit_common_state_checkpoint(

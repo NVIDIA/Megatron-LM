@@ -59,6 +59,7 @@ from megatron.core import dist_checkpointing
 from megatron.core._rank_utils import safe_get_rank
 from megatron.core.dist_checkpointing.core import maybe_load_config
 from megatron.core.dist_checkpointing.mapping import ShardedObject, ShardedStateDict, ShardedTensor
+from megatron.core.dist_checkpointing.strategies.common import COMMON_STATE_FNAME
 from megatron.core.dist_checkpointing.strategies.torch import TorchDistLoadShardedStrategy
 from megatron.core.dist_checkpointing.utils import force_all_tensors_to_non_fp8
 from megatron.core.dist_checkpointing.validation import StrictHandling
@@ -76,6 +77,8 @@ METADATA_SAME_LAYOUT_MODE = "dcp-metadata-same-layout"
 METADATA_SAME_LAYOUT_MODEL_PREFIXES = ("model.",)
 METADATA_SAME_LAYOUT_NUMBERED_MODEL_RE = re.compile(r"^model\d+\.")
 METADATA_SAME_LAYOUT_UNPREFIXED_MODEL_ROOTS = ("decoder.", "embedding.", "output_layer.", "mtp.")
+# Deliberately pin the known layout so a writer-format change fails closed.
+METADATA_SAME_LAYOUT_CURRENT_COMMON_STATE_KEY = "common_state/shard_0_1"
 
 __all__ = (
     "WeightedMergeError",
@@ -1195,9 +1198,40 @@ def _metadata_same_layout_is_extra_state_key(fqn: str) -> bool:
 
 
 def _metadata_same_layout_is_common_state_key(fqn: str) -> bool:
-    """Identify common-state entries handled separately from model tensors."""
+    """Identify the current common-state entry handled separately from model tensors."""
 
-    return fqn == "common_state" or fqn.startswith("common_state/")
+    return fqn == METADATA_SAME_LAYOUT_CURRENT_COMMON_STATE_KEY
+
+
+def _metadata_same_layout_validate_common_state_storage(
+    checkpoint_dir: Path, state_dict_metadata: dict[str, Any]
+) -> None:
+    """Reject mixed or unknown common-state storage layouts."""
+
+    common_state_entries = {
+        str(fqn): entry
+        for fqn, entry in state_dict_metadata.items()
+        if str(fqn) == "common_state" or str(fqn).startswith("common_state/")
+    }
+    has_legacy_sidecar = (checkpoint_dir / COMMON_STATE_FNAME).is_file()
+    if has_legacy_sidecar and common_state_entries:
+        raise WeightedMergeError(
+            f"Checkpoint {checkpoint_dir} mixes legacy {COMMON_STATE_FNAME} with embedded "
+            f"DCP common state: {sorted(common_state_entries)}."
+        )
+    if not common_state_entries:
+        return
+    if set(common_state_entries) != {
+        METADATA_SAME_LAYOUT_CURRENT_COMMON_STATE_KEY
+    } or not isinstance(
+        common_state_entries.get(METADATA_SAME_LAYOUT_CURRENT_COMMON_STATE_KEY),
+        BytesStorageMetadata,
+    ):
+        raise WeightedMergeError(
+            f"Checkpoint {checkpoint_dir} has an unsupported embedded common-state layout: "
+            f"{sorted(common_state_entries)}. Expected exactly "
+            f"{METADATA_SAME_LAYOUT_CURRENT_COMMON_STATE_KEY!r}."
+        )
 
 
 def _metadata_same_layout_path(fqn: str) -> tuple[str | int, ...]:
@@ -1249,6 +1283,10 @@ def _read_public_dcp_metadata(
             f"Could not read public DCP metadata from {checkpoint_dir}: "
             f"{type(exc).__name__}: {exc}"
         ) from exc
+
+    _metadata_same_layout_validate_common_state_storage(
+        checkpoint_dir, metadata.state_dict_metadata
+    )
 
     tensor_metadata: dict[str, TensorStorageMetadata] = {}
     non_tensor_model_keys: list[str] = []
