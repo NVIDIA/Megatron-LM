@@ -72,9 +72,7 @@ class TestMfsdpV2VppSharedContext:
             # virtual_pipeline_model_parallel_size > 1 yields multiple chunks on this
             # rank; model two VPP sub-stages here. The ambient shared
             # fully_shard_context is only opened when more than one chunk is wrapped.
-            chunks = [
-                _VppChunk().to(device=device, dtype=torch.bfloat16) for _ in range(2)
-            ]
+            chunks = [_VppChunk().to(device=device, dtype=torch.bfloat16) for _ in range(2)]
 
             wrapped = wrap_model_chunks_with_ddp(
                 chunks,

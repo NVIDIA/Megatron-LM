@@ -784,7 +784,8 @@ class Fp8ParameterGroup(FsdpParameterGroup):
         # process group must NOT be used -- it spans unrelated PP/TP ranks holding
         # different parameters and would silently corrupt the scales.
         gather_axis = changed_mesh_axis(
-            tuple(self._rowwise_buffer.placements), tuple(Replicate() for _ in range(self.mesh.ndim))
+            tuple(self._rowwise_buffer.placements),
+            tuple(Replicate() for _ in range(self.mesh.ndim)),
         )
         reduce_axis = 0 if gather_axis is None else gather_axis
         cast_master_weights_to_fp8(

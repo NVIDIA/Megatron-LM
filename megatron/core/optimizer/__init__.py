@@ -935,15 +935,15 @@ def _get_megatron_emerging_optimizer(
                 config, groups, eopt_name, model_chunks, pg_collection
             )
             if is_mfsdp_v2:
-                from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.orthogonalized_optimizer import (
-                    FsdpMuon,
+                from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
+                    orthogonalized_optimizer,
                 )
 
                 parameters = [parameter for group in groups for parameter in group['params']]
                 if not parameters:
                     raise RuntimeError("MFSDP v2 Muon received no parameters on this rank.")
 
-                optimizer = FsdpMuon(
+                optimizer = orthogonalized_optimizer.FsdpMuon(
                     groups,
                     inner_optimizer=optimizer,
                     max_params_per_owner_chunk=config.muon_max_params_per_owner_chunk,

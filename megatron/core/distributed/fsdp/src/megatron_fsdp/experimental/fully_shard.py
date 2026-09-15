@@ -92,8 +92,8 @@ def fully_shard_context(
     existing = _FSDP_CONTEXT.get()
     if existing is not None:
         if reuse_existing:
-            requested = device if device is not None else torch.device(
-                "cuda", torch.cuda.current_device()
+            requested = (
+                device if device is not None else torch.device("cuda", torch.cuda.current_device())
             )
             if existing.allgather_stream.device != requested:
                 raise ValueError(

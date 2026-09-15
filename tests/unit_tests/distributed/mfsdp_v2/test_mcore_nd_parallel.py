@@ -261,10 +261,7 @@ class TestMfsdpV2OverlapParity:
                     )
                 parameter_snapshots.append(cls._capture_parameters(model))
 
-            return {
-                "losses": losses,
-                "parameters": parameter_snapshots,
-            }
+            return {"losses": losses, "parameters": parameter_snapshots}
         finally:
             Utils.destroy_model_parallel()
             destroy_global_vars()

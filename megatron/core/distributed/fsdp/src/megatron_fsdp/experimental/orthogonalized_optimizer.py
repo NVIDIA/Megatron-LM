@@ -99,9 +99,7 @@ def _get_parameter_dp_group(param: DTensor) -> dist.ProcessGroup:
     )
 
 
-def _get_parameter_shard_order(
-    param: DTensor, process_group: dist.ProcessGroup
-) -> tuple[int, ...]:
+def _get_parameter_shard_order(param: DTensor, process_group: dist.ProcessGroup) -> tuple[int, ...]:
     """Map outer-major process-group ranks to flat-shard order."""
     parameter_group = cast(FsdpParameterGroup, get_containing_parameter_group(param))
     mesh = parameter_group.mesh
@@ -406,11 +404,7 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
             rank_flat_shard_size = layout.size // world_size
             shard_order = _get_parameter_shard_order(param, process_group)
             plan = compute_shard_plan(
-                shape,
-                tensor_flat_offset,
-                rank_flat_shard_size,
-                world_size,
-                shard_order=shard_order,
+                shape, tensor_flat_offset, rank_flat_shard_size, world_size, shard_order=shard_order
             )
             self._shard_plans[key] = plan
             plans.append(plan)
@@ -485,13 +479,9 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
             collective_group = _get_parameter_dp_group(param) if group is not None else None
             key = (plan.is_boundary(), id(collective_group), shard.device, shard.dtype, param.dtype)
             compatible_chunks = chunks.setdefault(key, [])
-            if (
-                not compatible_chunks
-                or
-                (
-                    self._max_params_per_owner_chunk is not None
-                    and len(compatible_chunks[-1]) >= self._max_params_per_owner_chunk
-                )
+            if not compatible_chunks or (
+                self._max_params_per_owner_chunk is not None
+                and len(compatible_chunks[-1]) >= self._max_params_per_owner_chunk
             ):
                 compatible_chunks.append([])
             compatible_chunks[-1].append(index)
@@ -521,13 +511,8 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
         return pack_owner_work(plans, owners, local_shards, comm_groups)
 
     def _send_to_owner(
-        self,
-        gather_plan: OwnerGatherPlan,
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> tuple[
-        dict[tuple[int, int], torch.Tensor], list[dist.Work], torch.cuda.Event | None
-    ]:
+        self, gather_plan: OwnerGatherPlan, device: torch.device, dtype: torch.dtype
+    ) -> tuple[dict[tuple[int, int], torch.Tensor], list[dist.Work], torch.cuda.Event | None]:
         """Send orthogonalization input shards to their respective owner.
 
         Uses peer-to-peer communication (`batch_isend_irecv`) to avoid memory
@@ -631,21 +616,11 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
         Pack all update shards for their destination into the destination's respective collective
         buffer. This sets up the buffers for communicating update shards to their destination.
         """
-        return pack_update_shards(
-            full_updates,
-            plans,
-            owners,
-            comm_groups,
-        )
+        return pack_update_shards(full_updates, plans, owners, comm_groups)
 
     def _send_to_destination(
-        self,
-        scatter_plan: OwnerScatterPlan,
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> tuple[
-        dict[tuple[int, int], torch.Tensor], list[dist.Work], torch.cuda.Event | None
-    ]:
+        self, scatter_plan: OwnerScatterPlan, device: torch.device, dtype: torch.dtype
+    ) -> tuple[dict[tuple[int, int], torch.Tensor], list[dist.Work], torch.cuda.Event | None]:
         """Send update shards to their respective destination.
 
         Uses peer-to-peer communication (`batch_isend_irecv`) to avoid memory
@@ -686,9 +661,7 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
         return recv_buffers, list(works or []), completion_event
 
     def _unpack_update_shards(
-        self,
-        scatter_plan: OwnerScatterPlan,
-        recv_buffers: dict[tuple[int, int], torch.Tensor],
+        self, scatter_plan: OwnerScatterPlan, recv_buffers: dict[tuple[int, int], torch.Tensor]
     ) -> dict[int, torch.Tensor]:
         """Unpack the packed update shards in the given buffer."""
         return unpack_update_shards(scatter_plan, recv_buffers)
@@ -857,9 +830,7 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
         b_owners = {i: owners[boundary_indices[i]] for i in range(len(boundary_indices))}
         comm_groups = [_get_parameter_dp_group(param) for param in b_params]
         gather_plan = self._pack_owner_work(b_plans, b_owners, b_local, comm_groups)
-        recv_buffers, gather_works, gather_event = self._send_to_owner(
-            gather_plan, device, dtype
-        )
+        recv_buffers, gather_works, gather_event = self._send_to_owner(gather_plan, device, dtype)
 
         # Optionally also gather each rank's local *weight* shard so the owner can
         # reconstruct the full parameter and pass it to `orthogonalize` (some
@@ -873,9 +844,7 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
         if self.reconstruct_full_param:
             weight_local = [p.to_local() for p in b_params]
             weight_dtype = b_params[0].dtype
-            weight_gather_plan = self._pack_owner_work(
-                b_plans, b_owners, weight_local, comm_groups
-            )
+            weight_gather_plan = self._pack_owner_work(b_plans, b_owners, weight_local, comm_groups)
             weight_recv_buffers, weight_gather_works, weight_gather_event = self._send_to_owner(
                 weight_gather_plan, device, weight_dtype
             )
@@ -936,10 +905,7 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
             if self.reconstruct_full_param and state.weight_gather_plan is not None:
                 assert state.weight_recv_buffers is not None
                 param_arg = reconstruct_full_tensor(
-                    i,
-                    plan,
-                    state.weight_gather_plan,
-                    state.weight_recv_buffers,
+                    i, plan, state.weight_gather_plan, state.weight_recv_buffers
                 )
             else:
                 param_arg = b_params[i]
@@ -1006,6 +972,7 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
         self._inner.pre_weight_update_fn_inplace(p_local, update)
         p_local.add_(update, alpha=-lr)
         self._inner.post_weight_update_fn_inplace(p_local)
+
 
 class FsdpMuon(FsdpOrthogonalizedOptimizer):
     """Muon optimizer for all-`Flat` M-FSDPv2 parameters.

@@ -286,9 +286,7 @@ def _build_subgroup_layout(
 ) -> tuple[tuple[int, ...], int]:
     """Keep ordinary tensors subgroup-local while allowing oversized tensors to cross."""
     num_subgroups = dp_size // subgroup_size
-    tensor_ids = sorted(
-        range(len(tensor_shapes)), key=lambda i: (-tensor_shapes[i].numel(), i)
-    )
+    tensor_ids = sorted(range(len(tensor_shapes)), key=lambda i: (-tensor_shapes[i].numel(), i))
     # Keep moderately large tensors subgroup-local; only oversized tensors may cross.
     average_payload = 1.7 * sum(shape.numel() for shape in tensor_shapes) / num_subgroups
     large_ids = [i for i in tensor_ids if tensor_shapes[i].numel() > average_payload]
@@ -315,23 +313,20 @@ def _build_subgroup_layout(
             shape = tensor_shapes[tensor_id]
             starts = [_pad_to_multiple(cursor, non_leading_numel(shape)) for cursor in cursors]
             bin_id = min(
-                range(len(cursors)),
-                key=lambda i: (starts[i] + shape.numel(), cursors[i], i),
+                range(len(cursors)), key=lambda i: (starts[i] + shape.numel(), cursors[i], i)
             )
             placements.append((tensor_id, bin_id, starts[bin_id]))
             cursors[bin_id] = starts[bin_id] + shape.numel()
         span = _pad_to_multiple(
-            max(
-                (large_size + large_spans - 1) // large_spans if large_spans else 0,
-                max(cursors),
-            ),
+            max((large_size + large_spans - 1) // large_spans if large_spans else 0, max(cursors)),
             chunk_size * subgroup_size,
         )
         return span * num_subgroups, large_spans, placements
 
     # Minimize total padded storage, then prefer fewer spans for oversized tensors.
     total_size, large_spans, placements = min(
-        (build_candidate(n) for n in range(bool(large_ids), num_subgroups)), key=lambda item: item[:2]
+        (build_candidate(n) for n in range(bool(large_ids), num_subgroups)),
+        key=lambda item: item[:2],
     )
     # Convert subgroup-local placements into offsets in the global flat buffer.
     subgroup_span = total_size // num_subgroups

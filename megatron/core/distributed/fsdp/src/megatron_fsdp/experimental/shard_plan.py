@@ -132,9 +132,7 @@ def compute_shard_plan(
 
 
 def assign_owner_work(
-    plans: Sequence[ShardPlan],
-    num_ns_steps: int,
-    chunks: Sequence[Sequence[int]] | None = None,
+    plans: Sequence[ShardPlan], num_ns_steps: int, chunks: Sequence[Sequence[int]] | None = None
 ) -> dict[int, int]:
     """Assign one owner rank to each parameter with chunk-local load balancing.
 
@@ -163,9 +161,7 @@ def assign_owner_work(
     costs: dict[int, float] = {}
     for param_index, plan in enumerate(plans):
         rows, cols = plan.full_shape
-        costs[param_index] = float(
-            plan.full_numel() * (min(rows, cols) * num_ns_steps + 1)
-        )
+        costs[param_index] = float(plan.full_numel() * (min(rows, cols) * num_ns_steps + 1))
 
     assignments: dict[int, int] = {}
     total_running = {rank: 0.0 for rank in range(plans[0].world_size)}
@@ -260,9 +256,7 @@ def pack_owner_work(
     recv_sizes: dict[tuple[int, int], int] = {}
     own_shards: dict[int, torch.Tensor] = {}
     recv_offsets: dict[tuple[int, int], tuple[int, int, int]] = {}
-    for param_index, (plan, shard, comm_group) in enumerate(
-        zip(plans, local_shards, comm_groups)
-    ):
+    for param_index, (plan, shard, comm_group) in enumerate(zip(plans, local_shards, comm_groups)):
         world_size = torch.distributed.get_world_size(group=comm_group)
         this_rank = torch.distributed.get_rank(group=comm_group)
         owner = owners[param_index]
@@ -313,9 +307,7 @@ def reconstruct_full_tensor(
     world_size = plan.world_size
     owner_rank = torch.distributed.get_rank(group=gather_plan.comm_groups[param_index])
     shards: list[torch.Tensor] = []
-    ranks_by_row = sorted(
-        range(world_size), key=lambda rank: plan.rank_rows[rank][0]
-    )
+    ranks_by_row = sorted(range(world_size), key=lambda rank: plan.rank_rows[rank][0])
     for src in ranks_by_row:
         row_count = plan.rank_row_count(src)
         if src == owner_rank:
@@ -382,18 +374,14 @@ def pack_update_shards(
             for dest in range(world_size):
                 row_start, row_count = plan.rank_rows[dest]
                 if dest != this_rank and row_count > 0:
-                    send_buffers[(param_index, dest)] = full_update[
-                        row_start : row_start + row_count
-                    ].reshape(-1).clone()
+                    send_buffers[(param_index, dest)] = (
+                        full_update[row_start : row_start + row_count].reshape(-1).clone()
+                    )
         else:
             numel = plan.shard_numel(this_rank)
             if numel > 0:
                 recv_sizes[(param_index, owner)] = numel
-                recv_offsets[(param_index, owner)] = (
-                    0,
-                    numel,
-                    plan.rank_row_count(this_rank),
-                )
+                recv_offsets[(param_index, owner)] = (0, numel, plan.rank_row_count(this_rank))
 
     return OwnerScatterPlan(
         send_buffers=send_buffers,
@@ -404,8 +392,7 @@ def pack_update_shards(
 
 
 def unpack_update_shards(
-    scatter_plan: OwnerScatterPlan,
-    recv_buffers: dict[tuple[int, int], torch.Tensor],
+    scatter_plan: OwnerScatterPlan, recv_buffers: dict[tuple[int, int], torch.Tensor]
 ) -> dict[int, torch.Tensor]:
     """Extract this rank's local update shards from the per-owner recv buffers.
 
