@@ -386,8 +386,18 @@ def test_mhc_schedule_matches_pp1(
         msg=lambda message: f"Microbatch losses {loss.tolist()} vs PP1 {ref_loss.tolist()}: {message}",
         **tolerance,
     )
+    gradient_errors = []
     for name, grad in grads.items():
         assert name in ref_grads, name
-        torch.testing.assert_close(
-            grad, ref_grads[name], msg=lambda message: f"{name}: {message}", **tolerance
-        )
+        reference = ref_grads[name]
+        try:
+            torch.testing.assert_close(grad, reference, **tolerance)
+        except AssertionError as error:
+            difference = grad - reference
+            gradient_errors.append(
+                f"{name}: max_abs={difference.abs().max().item():.8g}, "
+                f"reference_max={reference.abs().max().item():.8g}, "
+                f"difference_l2={difference.norm().item():.8g}, "
+                f"reference_l2={reference.norm().item():.8g}\n{error}"
+            )
+    assert not gradient_errors, "\n\n".join(gradient_errors)
