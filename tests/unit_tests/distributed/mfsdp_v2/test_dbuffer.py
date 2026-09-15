@@ -9,9 +9,13 @@ import torch
 import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
 from torch.distributed.device_mesh import init_device_mesh
-from torch.distributed.tensor import Partial, Replicate
+from torch.distributed.tensor import Partial, Replicate, Shard
 
-from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.dbuffer import DBuffer, Flat
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.dbuffer import DBuffer
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.placement import (
+    BlockAtomic,
+    Flat,
+)
 
 
 def _same_tensors_on_all_ranks(device: torch.device) -> list[torch.Tensor]:
@@ -35,7 +39,7 @@ def test_dbuffer_layout_pads_to_lcm_times_dp_size_and_fills_gaps(distributed_set
     mesh = init_device_mesh(distributed_setup.device.type, (2,))
     shapes = [torch.Size((5, 4)), torch.Size((2, 6)), torch.Size((3,))]
 
-    buffer = DBuffer(
+    buffer = DBuffer.empty(
         mesh=mesh,
         placements=[Replicate()],
         tensor_shapes=shapes,
@@ -56,7 +60,7 @@ def test_dbuffer_layout_aligns_fragment_offsets_to_rows(distributed_setup):
     mesh = init_device_mesh(distributed_setup.device.type, (2,))
     shapes = [torch.Size((4, 4)), torch.Size((1, 6))]
 
-    buffer = DBuffer(
+    buffer = DBuffer.empty(
         mesh=mesh,
         placements=[Replicate()],
         tensor_shapes=shapes,
@@ -66,6 +70,24 @@ def test_dbuffer_layout_aligns_fragment_offsets_to_rows(distributed_setup):
 
     assert buffer.layout.tensor_to_offset == (0, 18)
     assert buffer.layout.size == 24
+
+
+def test_block_atomic_layout_keeps_bf16_blocks_on_one_rank(distributed_setup):
+    """BlockAtomic keeps every local tensor shard aligned to its configured row block."""
+    if distributed_setup.world_size < 2:
+        pytest.skip("Requires at least 2 ranks.")
+
+    mesh = init_device_mesh(distributed_setup.device.type, (2,))
+    if mesh.get_coordinate() is None:
+        pytest.skip("Rank is outside the 2-rank BlockAtomic test mesh.")
+    tensors = [
+        torch.arange(24, dtype=torch.bfloat16, device=distributed_setup.device).reshape(4, 6),
+        torch.arange(32, dtype=torch.bfloat16, device=distributed_setup.device).reshape(8, 4),
+    ]
+    block_atomic = DBuffer.distribute_tensors(tensors, mesh, [BlockAtomic(2)], block_size=2)
+
+    assert block_atomic.layout.block_size == 2
+    assert all(block_atomic.get_local_tensor(index).shape[0] % 2 == 0 for index in range(2))
 
 
 def test_compute_layout_fills_lcm_padding_gaps(distributed_setup):
@@ -86,7 +108,7 @@ def test_compute_layout_fills_lcm_padding_gaps(distributed_setup):
     if mesh.get_coordinate() is None:
         pytest.skip("Rank is outside the 5-rank DBuffer mesh.")
 
-    buffer = DBuffer(
+    buffer = DBuffer.empty(
         mesh=mesh,
         placements=[Flat()],
         tensor_shapes=shapes,
@@ -117,14 +139,14 @@ def test_constructor_allocates_local_buffer(distributed_setup):
     tensor_shapes = [torch.Size((7, 3)), torch.Size((2, 5)), torch.Size((7,))]
     mesh_size = mesh.size()
 
-    replicated_buffer = DBuffer(
+    replicated_buffer = DBuffer.empty(
         mesh=mesh,
         placements=[Replicate()],
         tensor_shapes=tensor_shapes,
         dtype=torch.float32,
         device=distributed_setup.device,
     )
-    sharded_buffer = DBuffer(
+    sharded_buffer = DBuffer.empty(
         mesh=mesh,
         placements=[Flat()],
         tensor_shapes=tensor_shapes,
@@ -180,7 +202,7 @@ def test_cast_with_out_reuses_destination_and_casts_values(distributed_setup):
     mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
     tensors = _same_tensors_on_all_ranks(distributed_setup.device)
     buffer = DBuffer.distribute_tensors(tensors, mesh, [Replicate()])
-    destination = DBuffer(
+    destination = DBuffer.empty(
         mesh=mesh,
         placements=[Replicate()],
         tensor_shapes=buffer.layout.tensor_shapes,
@@ -201,7 +223,7 @@ def test_cast_with_out_reuses_destination_and_casts_values(distributed_setup):
 def test_release_and_reallocate_storage_preserves_buffer_views(distributed_setup):
     """DBuffer storage can be released and reallocated without replacing existing views."""
     mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
-    buffer = DBuffer(
+    buffer = DBuffer.empty(
         mesh=mesh,
         placements=[Replicate()],
         tensor_shapes=[torch.Size((4, 4))],
@@ -231,9 +253,7 @@ def test_from_local_reuses_required_local_buffer(distributed_setup):
     offset = distributed_setup.rank * local_numel
     local_buffer = replicated_buffer.local_buffer.narrow(0, offset, local_numel)
 
-    sharded_buffer = DBuffer.from_local(
-        local_buffer, mesh, [Flat()], replicated_buffer.layout.tensor_shapes
-    )
+    sharded_buffer = DBuffer.from_local(local_buffer, mesh, [Flat()], replicated_buffer.layout)
 
     assert sharded_buffer.placements == (Flat(),)
     assert sharded_buffer.layout == replicated_buffer.layout
@@ -321,7 +341,7 @@ def test_sharded_allgather_into_existing_buffer(distributed_setup):
     mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
     tensors = _same_tensors_on_all_ranks(distributed_setup.device)
     sharded_buffer = DBuffer.distribute_tensors(tensors, mesh, [Flat()])
-    destination = DBuffer(
+    destination = DBuffer.empty(
         mesh=mesh,
         placements=[Replicate()],
         tensor_shapes=sharded_buffer.layout.tensor_shapes,
@@ -344,7 +364,7 @@ def test_replicate_view_round_trip(distributed_setup):
 
     replicated_buffer = DBuffer.distribute_tensors(tensors, mesh, [Replicate()])
     sharded_buffer = replicated_buffer.view([Flat()])
-    redistribute_destination = DBuffer(
+    redistribute_destination = DBuffer.empty(
         mesh=mesh,
         placements=[Flat()],
         tensor_shapes=replicated_buffer.layout.tensor_shapes,
@@ -402,7 +422,7 @@ def test_partial_allreduce_average(distributed_setup):
     ]
     partial_buffer = DBuffer.distribute_tensors(tensors, mesh, [Partial("avg")])
 
-    destination = DBuffer(
+    destination = DBuffer.empty(
         mesh=mesh,
         placements=[Replicate()],
         tensor_shapes=partial_buffer.layout.tensor_shapes,
@@ -558,7 +578,7 @@ def test_get_dtensor_from_sharded_buffer(distributed_setup):
         dtensor.to_local(), sharded_buffer.get_local_tensor(0), rtol=0, atol=0
     )
     assert dtensor.shape == tensors[0].shape
-    assert dtensor.placements == (Flat(),)
+    assert dtensor.placements == (Shard(0),)
 
 
 def test_2d_mesh_replicate_flat_round_trip(distributed_setup):
@@ -590,8 +610,8 @@ def test_2d_mesh_flat_before_replicate_is_rejected(distributed_setup):
         mesh_dim_names=("flat", "replicate"),
     )
 
-    with pytest.raises(ValueError, match="Flat placements must be a suffix"):
-        DBuffer(
+    with pytest.raises(ValueError, match="Shard placements must be a suffix"):
+        DBuffer.empty(
             mesh=mesh,
             placements=[Flat(), Replicate()],
             tensor_shapes=[torch.Size((6, 4))],

@@ -41,7 +41,11 @@ rubric, so loading the other adds nothing but noise:
    `mcore-onboard-gb200-1node-tests`, …).
 3. Read those `SKILL.md` files with the Read tool.
 4. Read the depth reference from the table above.
-5. Only then review.
+5. For Python changes, read the local [style-guide.md](../../style-guide.md)
+   with the Read tool. Do not load the entire Google Python Style Guide by
+   default. Consult relevant sections as needed; read it in full when performing
+   a comprehensive style audit.
+6. Only then review.
 
 The order is what makes the review worth reading. A reviewer who forms an
 opinion before loading `mcore-testing` will invent a test convention that this
