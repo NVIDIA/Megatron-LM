@@ -1546,6 +1546,9 @@ class InferenceGroupedMLP(TEGroupedMLP):
                 permuted_local_hidden_states, permuted_probs, routing_map=routing_map
             )
         elif self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.VLLM:
+            # The vLLM kernel integrated here handles BF16, not MCore's MXFP8 layout.
+            # Use MCore's scaled grouped GEMM for MXFP8 without dequantizing the weights;
+            # BF16 layers in a mixed-precision recipe still use the vLLM path below.
             if self._uses_mxfp8_weights:
                 return self._mcore_fused_moe_forward(
                     permuted_local_hidden_states, permuted_probs, routing_map=routing_map
