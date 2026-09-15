@@ -58,7 +58,7 @@ Negative reductions mean increased memory. Loss maximum absolute differences
 were 0 and 6.78e-5, respectively; sampled gradient differences were at most
 3.66e-7 and 2.34e-7. These are not full-tensor precision checks. Neither scale
 had measured allocator retries or OOMs; lazy capacity still grew after warmup.
-Normal-backward smoke at `ba1709e5b` (1 layer, 32768 tokens, 1 microbatch,
+Normal-backward smoke at `a4f2e2b4a` (1 layer, 32768 tokens, 1 microbatch,
 EP8/top-k8/n=2, 1 warmup + 2 repeats, no update) had zero loss difference,
 sampled gradient error <=1.20e-7 and allocated peak increase 10.43–10.81%.
 Isolated OPs at `a4f2e2b4a` (32768 tokens, EP8/top-k8/n=2, 5 warmup + 30 repeats)
@@ -71,6 +71,6 @@ The paired run compared 1,245,452,544 finalized, optimizer-owned gradient elemen
 across 280 shards; maximum absolute error was 2.39e-7. The router weight's
 relative L2 error was 0.2871%. This is measured disagreement, not accepted parity;
 no non-bitwise tolerance has been approved, and 48-layer full gradients remain unvalidated.
-Final-source n=3/4 GPU qualification, normal backward, optimizer updates, and
-activation-only savings remain incomplete. All measurements use the same contiguous
-router-index adapter in both arms; older combined head/CE gains are not isolated EP gains.
+Actual-update checks at `a4f2e2b4a` completed three steps per arm at 1 layer/32768 tokens/1 microbatch; at 48 layers/16384 tokens/16 microbatches, native OOMed after its first update, while ChunkedEP completed three updates but incurred allocator retries. One ChunkedEP offload/recovery run completed; another timed out, so recovery reliability remains unresolved.
+These checks do not establish trained-model speedup or accepted numerical parity. Final-source n=3/4 qualification, normal-backward performance, and activation-only savings remain incomplete.
+Both arms use the same contiguous router-index adapter; older combined head/CE gains are not isolated EP gains. No private backing-retention candidate is included in this implementation.
