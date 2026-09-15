@@ -1,5 +1,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -46,8 +48,8 @@ def test_mixed_precision_checkpoint_state_roundtrip(low_precision_dtype, fp32_bu
     optimizer.gbuf_ranges = ranges
     optimizer.per_bucket_numel = []
     optimizer.per_bucket_numel_unpadded = []
-    optimizer.model_param_group_index_map, group_ranges = (
-        optimizer._build_optimizer_group_ranges(groups, ranges)
+    optimizer.model_param_group_index_map, group_ranges = optimizer._build_optimizer_group_ranges(
+        groups, ranges
     )
     optimizer._build_model_and_main_param_groups(
         ranges, optimizer._build_model_param_gbuf_map(ranges), group_ranges, optimizer.config
@@ -87,3 +89,67 @@ def test_mixed_precision_checkpoint_state_roundtrip(low_precision_dtype, fp32_bu
             ):
                 for key, expected in saved[parameter].items():
                     torch.testing.assert_close(state[key], expected)
+
+
+@pytest.mark.internal
+@pytest.mark.parametrize('dp_rank', [0, 1])
+def test_dp_reshardable_checkpoint_excludes_final_bucket_padding(dp_rank):
+    """Every saved optimizer chunk fits inside the real, unpadded bucket extent."""
+    # Two DP shards of eight elements cover a bucket with thirteen real elements.
+    # Rank 1 owns a three-element parameter and two elements of internal padding;
+    # the final three elements of its allocation are only DP divisibility padding.
+    parameter_size = 8 if dp_rank == 0 else 3
+    parameter = torch.nn.Parameter(torch.arange(parameter_size, device='cuda').float())
+    dtype = (torch.float32, torch.float32)
+    ranges = [
+        {
+            dtype: [
+                {
+                    'param_map': {
+                        parameter: {
+                            'param': Range(0, parameter_size),
+                            'gbuf_local': Range(0, parameter_size),
+                        }
+                    }
+                }
+            ]
+        }
+    ]
+    optimizer = DistributedOptimizer.__new__(DistributedOptimizer)
+    optimizer.config = OptimizerConfig()
+    optimizer.gbuf_ranges = ranges
+    optimizer.data_parallel_group = SimpleNamespace(rank=lambda: dp_rank, size=lambda: 2)
+    optimizer.data_parallel_group_idx = 0
+    optimizer.distributed_optimizer_instance_id = 0
+    optimizer.per_bucket_numel = [{dtype: [16]}]
+    optimizer.per_bucket_numel_unpadded = [{dtype: [13]}]
+    optimizer.buffers = [
+        SimpleNamespace(
+            buckets=[SimpleNamespace(numel_unpadded=13, grad_data=torch.empty(16, device='cuda'))]
+        )
+    ]
+    groups = [{'params': [parameter]}]
+    optimizer.model_param_group_index_map, group_ranges = optimizer._build_optimizer_group_ranges(
+        groups, ranges
+    )
+    optimizer._build_model_and_main_param_groups(
+        ranges, optimizer._build_model_param_gbuf_map(ranges), group_ranges, optimizer.config
+    )
+    optimizer.optimizer = torch.optim.Adam([group['orig_group'] for group in group_ranges])
+    main_parameter = optimizer.optimizer.param_groups[0]['params'][0]
+    optimizer.optimizer.state[main_parameter] = {
+        'exp_avg': torch.ones_like(main_parameter),
+        'exp_avg_sq': torch.full_like(main_parameter, 2),
+    }
+
+    checkpoint = optimizer.sharded_param_state_dp_reshardable({})
+    for key in ['param', 'exp_avg', 'exp_avg_sq']:
+        chunks = [state[key] for state in checkpoint[0][dtype][0]]
+        expected_offset = dp_rank * 8
+        for chunk in chunks:
+            chunk.validate_metadata_integrity()
+            assert chunk.global_shape == (13,)
+            assert chunk.global_offset == (expected_offset,)
+            expected_offset += chunk.data.numel()
+            assert expected_offset <= 13
+        assert expected_offset == min((dp_rank + 1) * 8, 13)
