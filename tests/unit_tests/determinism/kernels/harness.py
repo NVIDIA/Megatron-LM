@@ -19,6 +19,8 @@ Sizing matters more than replay count: a reduction with two contending blocks ca
 from __future__ import annotations
 
 import contextlib
+import functools
+import inspect
 from typing import Any, Callable, Dict, Optional, Tuple
 
 import torch
@@ -30,10 +32,63 @@ from tests.unit_tests.determinism.utils import (
     restore_rng_state,
     zero_grads,
 )
+from tools.determinism.coverage import (
+    ReplayMismatch,
+    is_recording,
+    observe_replay,
+    runtime_signature,
+)
 
 # Shapes that make many CTAs contend on shared outputs. A token count of a few thousand
 # with a hidden size of ~1-4k puts dozens of blocks on every reduction.
 CONTENTION_TOKENS = 4096
+
+
+def _input_signature(value):
+    if isinstance(value, torch.Tensor):
+        return {
+            "shape": list(value.shape),
+            "stride": list(value.stride()),
+            "dtype": str(value.dtype),
+            "requires_grad": value.requires_grad,
+        }
+    if isinstance(value, dict):
+        return {str(key): _input_signature(item) for key, item in value.items()}
+    if isinstance(value, (tuple, list)):
+        return [_input_signature(item) for item in value]
+    if value is None or isinstance(value, (str, bool, int, float)):
+        return value
+    return {"type": type(value).__qualname__}
+
+
+def _recorded_replay(replay):
+    """Observe the existing protocol only inside explicitly annotated pytest cases."""
+
+    @functools.wraps(replay)
+    def wrapped(*args, **kwargs):
+        if not is_recording():
+            return replay(*args, **kwargs)
+        bound = inspect.signature(replay).bind(*args, **kwargs)
+        bound.apply_defaults()
+        options = bound.arguments
+        signature = {
+            "inputs": _input_signature(options["inputs"]),
+            "phase": "forward_backward" if options["backward"] else "forward",
+            "deterministic_algorithms": torch.are_deterministic_algorithms_enabled(),
+            "runtime": runtime_signature(torch),
+        }
+        protocol = {key: options[key] for key in ("replays", "contention", "restore_rng")}
+        protocol.update(
+            scope="same_process_outputs_and_gradients",
+            what=options["what"],
+            warn_only=torch.is_deterministic_algorithms_warn_only_enabled(),
+        )
+        with observe_replay(signature, protocol) as observation:
+            result = replay(*args, **kwargs)
+            observation.update(compared_outputs=len(result[0]), compared_gradients=len(result[1]))
+            return result
+
+    return wrapped
 
 
 def _clone_preserving_layout(t: torch.Tensor) -> torch.Tensor:
@@ -164,6 +219,7 @@ def run_once(
     return {k: v.detach().clone() for k, v in outputs.items()}, grads
 
 
+@_recorded_replay
 def assert_replays_bit_exact(
     fn: Callable[..., Any],
     inputs: Any,
@@ -218,7 +274,7 @@ def assert_replays_bit_exact(
 def _assert_replay_matches(i, ref_out, ref_grad, out, grad, what) -> None:
     """Raise if replay ``i`` differs from the reference in any output or gradient tensor."""
     if out.keys() != ref_out.keys() or grad.keys() != ref_grad.keys():
-        raise AssertionError(
+        raise ReplayMismatch(
             f"{what}: replay {i} returned different tensors "
             f"({sorted(out)}/{sorted(grad)} vs {sorted(ref_out)}/{sorted(ref_grad)})"
         )
@@ -232,7 +288,7 @@ def _assert_replay_matches(i, ref_out, ref_grad, out, grad, what) -> None:
         if not bytes_equal(ref_grad[name], grad[name])
     ]
     if mismatches:
-        raise AssertionError(
+        raise ReplayMismatch(
             f"{what} is not bit-exact across replays (replay {i} vs 1):\n  "
             + "\n  ".join(mismatches)
         )
@@ -309,6 +365,7 @@ def _module_fwd_bwd(module, inputs, grad_output, backward):
     return {k: v.detach().clone() for k, v in outputs.items()}, grads
 
 
+@_recorded_replay
 def assert_module_replays_bit_exact(
     module: torch.nn.Module,
     inputs: Any,
