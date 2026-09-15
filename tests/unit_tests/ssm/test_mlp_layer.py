@@ -2,7 +2,7 @@
 
 from unittest.mock import patch
 
-from megatron.core.ssm.mlp_layer import MLPLayer
+from megatron.core.transformer.mlp_layer import MLPLayer
 
 
 def test_mlp_layer_forwards_name_to_transformer_layer():

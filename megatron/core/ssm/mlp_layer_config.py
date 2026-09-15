@@ -1,10 +1,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-from megatron.core.transformer.transformer_config import TransformerConfig
+"""Deprecated import path; use ``megatron.core.transformer.mlp_layer_config``."""
 
+from megatron.core.ops._compat import deprecated_module
 
-class MLPLayerConfig(TransformerConfig):
-    """Configuration for a dense MLP layer in a hybrid stack.
-
-    Due to backwards-compatibility, this config's arguments are defined in TransformerConfig.
-    """
+__getattr__, __dir__ = deprecated_module(__name__, "megatron.core.transformer.mlp_layer_config")

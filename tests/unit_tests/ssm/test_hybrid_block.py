@@ -18,9 +18,9 @@ from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.models.hybrid.layers import utils as layer_utils
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ops.ssm.gated_delta.gdn import GatedDeltaNet
-from megatron.core.ssm.mamba_layer import MambaLayer
-from megatron.core.ssm.mamba_layer_config import MambaLayerConfig
-from megatron.core.ssm.mlp_layer_config import MLPLayerConfig
+from megatron.core.transformer.mamba_layer import MambaLayer
+from megatron.core.transformer.mamba_layer_config import MambaLayerConfig
+from megatron.core.transformer.mlp_layer_config import MLPLayerConfig
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.attention import SelfAttention

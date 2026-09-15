@@ -18,9 +18,9 @@ from megatron.core.models.hybrid.hybrid_block import HybridStack, HybridStackSub
 from megatron.core.ops.ssm.gated_delta.gdn import GatedDeltaNet
 from megatron.core.ops.ssm.gated_delta.common import GatedDeltaNetSubmodules
 from megatron.core.ops.ssm.gdp.mixer import GatedDeltaProductMixer, GatedDeltaProductMixerSubmodules
-from megatron.core.ssm.mamba_layer import MambaLayer, MambaLayerSubmodules
+from megatron.core.transformer.mamba_layer import MambaLayer, MambaLayerSubmodules
 from megatron.core.ops.ssm.mamba2.mixer import MambaMixer, MambaMixerSubmodules
-from megatron.core.ssm.mlp_layer import MLPLayer
+from megatron.core.transformer.mlp_layer import MLPLayer
 from megatron.core.tensor_parallel import (
     InferenceColumnParallelLinear,
     InferenceLayerNormColumnParallelLinear,

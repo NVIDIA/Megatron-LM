@@ -1,8 +1,8 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-from megatron.core.ssm.gdn_layer_config import GDNLayerConfig
-from megatron.core.ssm.mamba_layer_config import MambaLayerConfig
-from megatron.core.ssm.mlp_layer_config import MLPLayerConfig
+from megatron.core.transformer.gdn_layer_config import GDNLayerConfig
+from megatron.core.transformer.mamba_layer_config import MambaLayerConfig
+from megatron.core.transformer.mlp_layer_config import MLPLayerConfig
 from megatron.core.transformer.attention_layer_config import AttentionLayerConfig
 from megatron.core.transformer.dsa_layer_config import DSALayerConfig
 from megatron.core.transformer.mla_layer_config import MLALayerConfig

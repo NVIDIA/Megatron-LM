@@ -9,7 +9,7 @@ from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.post_training.modelopt.layers import Linear, Norm
 from megatron.core.ops.ssm.gated_delta.gdn import GatedDeltaNet
 from megatron.core.ops.ssm.gated_delta.common import GatedDeltaNetSubmodules
-from megatron.core.ssm.mamba_layer import MambaLayer, MambaLayerSubmodules
+from megatron.core.transformer.mamba_layer import MambaLayer, MambaLayerSubmodules
 from megatron.core.ops.ssm.mamba2.mixer import MambaMixer, MambaMixerSubmodules
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules

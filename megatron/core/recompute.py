@@ -10,7 +10,7 @@ from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fp4_utils import get_fp4_context
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.core.ssm.mamba_layer_config import MambaLayerConfig
+from megatron.core.transformer.mamba_layer_config import MambaLayerConfig
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_layer import TransformerLayer
 
