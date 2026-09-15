@@ -331,7 +331,20 @@ def _run_schedule(config, models):
     return local_loss.cpu(), grads, set().union(*map(set, all_names))
 
 
+@pytest.fixture
+def fresh_mhc_compile_cache():
+    """Keep independent model configurations from exhausting Dynamo's cache."""
+    # mHC's native aggregate and post-BDA helpers use torch.compile. Running
+    # every topology/dtype in one process otherwise exhausts their default
+    # recompile budget and mixes compiled and eager BF16 rounding. Keep the
+    # default budget and share the cache across PP1 and PP2 within each case.
+    torch.compiler.reset()
+    yield
+    torch.compiler.reset()
+
+
 @pytest.mark.internal
+@pytest.mark.usefixtures("fresh_mhc_compile_cache")
 @pytest.mark.parametrize("recompute", [False, True], ids=["eager", "recompute_mhc"])
 @pytest.mark.parametrize(
     "kind,vp_size,tp_size,cp_size,variable,standalone,empty,mtp",
