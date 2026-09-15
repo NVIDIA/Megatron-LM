@@ -1226,6 +1226,7 @@ class MultiTokenPredictionLayer(MegatronModule):
         mtp_layer_pattern: Optional[str] = None,
         hybrid_submodules: Optional[HybridStackSubmodules] = None,
         mamba_submodules: Optional[HybridStackSubmodules] = None,
+        hash_moe_layer_threshold: Optional[int] = None,
         name: str | None = None,
     ):
         """
@@ -1374,6 +1375,8 @@ class MultiTokenPredictionLayer(MegatronModule):
                 pg_collection=pg_collection,
                 is_mtp_layer=True,
                 boundary_layout=self.config.attention_cp_layout,
+                mtp_layer_number=self.layer_number,
+                hash_moe_layer_threshold=hash_moe_layer_threshold,
                 name=(name + ".mtp_model_layer") if name is not None else None,
             )
         elif self.config.mtp_num_layers is not None:
@@ -2127,6 +2130,7 @@ class MultiTokenPredictionBlock(MegatronModule):
         mtp_num_depths: int = 0,
         hybrid_submodules: Optional["HybridStackSubmodules"] = None,
         mamba_submodules: Optional["HybridStackSubmodules"] = None,
+        hash_moe_layer_threshold: Optional[int] = None,
         name: str | None = None,
     ):
         """
@@ -2152,6 +2156,7 @@ class MultiTokenPredictionBlock(MegatronModule):
         self.mtp_layer_pattern = mtp_layer_pattern
         self.mtp_num_depths = mtp_num_depths
         self.hybrid_submodules = hybrid_submodules
+        self.hash_moe_layer_threshold = hash_moe_layer_threshold
         self.mtp_use_repeated_layer = self.config.mtp_use_repeated_layer
         self.name = name
 
@@ -2305,6 +2310,7 @@ class MultiTokenPredictionBlock(MegatronModule):
                     pg_collection=pg_collection,
                     mtp_layer_pattern=mtp_layer_pattern,
                     hybrid_submodules=hybrid_submodules,
+                    hash_moe_layer_threshold=self.hash_moe_layer_threshold,
                     name=(self.name + f".layers.{layer_number}") if self.name is not None else None,
                 )
             return module

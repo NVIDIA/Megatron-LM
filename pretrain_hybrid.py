@@ -42,8 +42,8 @@ from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegat
 from megatron.core.datasets.data_schedule import get_batch_on_this_rank_for_sequence_packing
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
 from megatron.core.enums import ModelType
-from megatron.core.package_info import __version__ as mcore_version
 from megatron.core.models.hybrid.hybrid_model import HybridModel
+from megatron.core.package_info import __version__ as mcore_version
 from megatron.core.parallel_state import (
     get_context_parallel_group,
     get_hybrid_data_context_parallel_groups,
@@ -64,6 +64,7 @@ from megatron.core.utils import (
 from megatron.training import (
     get_args,
     get_timers,
+    get_tokenizer,
     inprocess_restart,
     pretrain,
     print_rank_0,
@@ -112,7 +113,12 @@ def get_batch(data_iterator, vp_stage=None):
     """Generate a batch."""
 
     args = get_args()
-    config = core_transformer_config_from_args(args)
+    config = core_transformer_config_from_args(
+        args,
+        tokenizer_vocab_size=(
+            get_tokenizer().vocab_size if getattr(args, 'moe_num_hash_layers', 0) else None
+        ),
+    )
 
     if args.sequence_packing_scheduler is not None:
         (
@@ -375,7 +381,12 @@ def forward_step(data_iterator, model: HybridModel):
 def is_dataset_built_on_rank(vp_stage=None, is_packed_sequence=False):
     """Whether the dataset should be built on the current rank."""
     args = get_args()
-    config = core_transformer_config_from_args(args)
+    config = core_transformer_config_from_args(
+        args,
+        tokenizer_vocab_size=(
+            get_tokenizer().vocab_size if getattr(args, 'moe_num_hash_layers', 0) else None
+        ),
+    )
     if mpu.get_tensor_model_parallel_rank() != 0:
         return False
     elif is_packed_sequence:
@@ -572,10 +583,17 @@ if __name__ == "__main__":
     )
     if has_nvidia_modelopt:
         maybe_enable_modelopt(args)
+    tokenizer_vocab_size = (
+        get_tokenizer().vocab_size if getattr(args, 'moe_num_hash_layers', 0) else None
+    )
     if has_nvidia_modelopt and getattr(args, "modelopt_enabled", False):
-        model_cfg = hybrid_config_from_args(args, model_config_cls=ModelOptHybridModelConfig)
+        model_cfg = hybrid_config_from_args(
+            args,
+            model_config_cls=ModelOptHybridModelConfig,
+            tokenizer_vocab_size=tokenizer_vocab_size,
+        )
     else:
-        model_cfg = hybrid_config_from_args(args)
+        model_cfg = hybrid_config_from_args(args, tokenizer_vocab_size=tokenizer_vocab_size)
     full_config = pretrain_cfg_container_from_args(args, model_cfg)
     pretrain(
         full_config,

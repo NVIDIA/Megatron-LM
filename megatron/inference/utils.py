@@ -63,8 +63,13 @@ def get_model_builder(
     """
     if provider is None:
         provider = args.model_provider
+    tokenizer_vocab_size = (
+        get_tokenizer().vocab_size if getattr(args, 'moe_num_hash_layers', 0) else None
+    )
     if provider == "gpt":
-        return GPTModelBuilder(gpt_config_from_args(args))
+        return GPTModelBuilder(
+            gpt_config_from_args(args, tokenizer_vocab_size=tokenizer_vocab_size)
+        )
     if provider in ("hybrid", "mamba"):
         if provider == "mamba":
             warnings.warn(
@@ -72,7 +77,9 @@ def get_model_builder(
                 DeprecationWarning,
                 stacklevel=2,
             )
-        return HybridModelBuilder(hybrid_config_from_args(args))
+        return HybridModelBuilder(
+            hybrid_config_from_args(args, tokenizer_vocab_size=tokenizer_vocab_size)
+        )
     raise ValueError(f"Invalid model provider {provider}")
 
 

@@ -116,7 +116,13 @@ def model_provider(pre_process=True, post_process=True, vp_stage: Optional[int] 
         return model
 
     print_rank_0('building Mamba model ...')
-    config = core_transformer_config_from_args(args, TransformerConfig)
+    config = core_transformer_config_from_args(
+        args,
+        TransformerConfig,
+        tokenizer_vocab_size=(
+            get_tokenizer().vocab_size if getattr(args, 'moe_num_hash_layers', 0) else None
+        ),
+    )
 
     assert args.use_legacy_models == False, "Mamba only supported in Mcore!"
 
@@ -174,7 +180,12 @@ def get_batch(data_iterator, vp_stage=None):
     """Generate a batch."""
 
     args = get_args()
-    config = core_transformer_config_from_args(args)
+    config = core_transformer_config_from_args(
+        args,
+        tokenizer_vocab_size=(
+            get_tokenizer().vocab_size if getattr(args, 'moe_num_hash_layers', 0) else None
+        ),
+    )
 
     cp_size = args.context_parallel_size
     tp_rank = mpu.get_tensor_model_parallel_rank()

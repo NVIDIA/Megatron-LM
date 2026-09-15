@@ -1,23 +1,23 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from megatron.core.models.gpt import GPTModel
-from megatron.core.models.gpt.gpt_layer_specs import (
-    get_gpt_decoder_block_spec,
-    get_gpt_layer_local_spec,
-    get_gpt_layer_with_transformer_engine_spec,
-    get_gpt_layer_with_inference_spec,
-    get_gpt_mtp_block_spec,
-    get_gpt_decoder_layer_specs,
-)
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
     get_transformer_block_with_experimental_attention_variant_spec,
     get_transformer_layer_with_experimental_attention_variant_spec,
+)
+from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_decoder_block_spec,
+    get_gpt_decoder_layer_specs,
+    get_gpt_layer_local_spec,
+    get_gpt_layer_with_inference_spec,
+    get_gpt_layer_with_transformer_engine_spec,
+    get_gpt_mtp_block_spec,
 )
 from megatron.core.models.gpt.heterogeneous.heterogeneous_layer_specs import (
     get_gpt_heterogeneous_layer_spec,
 )
 from megatron.core.transformer.spec_utils import import_module
-from megatron.training import get_args, print_rank_0
+from megatron.training import get_args, get_tokenizer, print_rank_0
 from megatron.training.arguments import core_transformer_config_from_args
 from megatron.training.yaml_arguments import core_transformer_config_from_yaml
 
@@ -25,10 +25,17 @@ from megatron.training.yaml_arguments import core_transformer_config_from_yaml
 def gpt_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_collection=None):
     print_rank_0('building GPT model ...')
     if config is None:
+        tokenizer_vocab_size = (
+            get_tokenizer().vocab_size if getattr(args, 'moe_num_hash_layers', 0) else None
+        )
         if args.yaml_cfg is not None:
-            config = core_transformer_config_from_yaml(args, "language_model")
+            config = core_transformer_config_from_yaml(
+                args, "language_model", tokenizer_vocab_size=tokenizer_vocab_size
+            )
         else:
-            config = core_transformer_config_from_args(args)
+            config = core_transformer_config_from_args(
+                args, tokenizer_vocab_size=tokenizer_vocab_size
+            )
     if args.spec is not None:
         transformer_layer_spec = import_module(args.spec)
     else:

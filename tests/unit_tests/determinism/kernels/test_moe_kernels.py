@@ -304,15 +304,16 @@ class TestMoEModules:
         model_parallel_cuda_manual_seed(123)
 
     @pytest.mark.parametrize(
-        "balancing,score,expert_bias",
+        "balancing,score,expert_bias,hash_routing",
         [
-            ("aux_loss", "softmax", False),
-            ("seq_aux_loss", "sigmoid", True),
-            ("sinkhorn", "softmax", False),
+            ("aux_loss", "softmax", False, False),
+            ("seq_aux_loss", "sigmoid", True, False),
+            ("sinkhorn", "softmax", False, False),
+            ("none", "sigmoid", False, True),
         ],
-        ids=["aux_loss", "seq_aux_loss+sigmoid+bias", "sinkhorn"],
+        ids=["aux_loss", "seq_aux_loss+sigmoid+bias", "sinkhorn", "hash+sigmoid"],
     )
-    def test_topk_router_replays(self, balancing, score, expert_bias):
+    def test_topk_router_replays(self, balancing, score, expert_bias, hash_routing):
         self._init()
         seeded()
         config = _moe_config(
@@ -322,15 +323,31 @@ class TestMoEModules:
             moe_router_score_function=score,
             moe_router_enable_expert_bias=expert_bias,
             moe_router_pre_softmax=balancing == "sinkhorn",
-            moe_aux_loss_coeff=0.0 if balancing == "sinkhorn" else 0.01,
+            moe_aux_loss_coeff=0.0 if balancing in ("sinkhorn", "none") else 0.01,
+            moe_num_hash_layers=int(hash_routing),
+            hash_moe_vocab_size=128 if hash_routing else None,
         )
         router = TopKRouter(
             config, pg_collection=ProcessGroupCollection.use_mpu_process_groups()
         ).cuda()
         router.set_layer_number(0)
         hidden = torch.randn(2048, 4, 1024, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        inputs = (hidden,)
+        grad_output = None
+        if hash_routing:
+            assert router.is_hash_layer
+            # Repeated token IDs exercise the fixed table with many tokens per expert.
+            input_ids = torch.arange(8192, device="cuda").view(4, 2048) % config.hash_moe_vocab_size
+            inputs = {"input": hidden, "input_ids": input_ids}
+            # Summing normalized routing probabilities would mask their gradients.
+            grad_output = torch.randn(8192, config.num_moe_experts, device="cuda")
         assert_module_replays_bit_exact(
-            router, (hidden,), replays=3, what=f"TopKRouter[{balancing}]"
+            router,
+            inputs,
+            replays=3,
+            grad_output=grad_output,
+            contention=hash_routing,
+            what=f"TopKRouter[{balancing}, hash={hash_routing}]",
         )
 
     @pytest.mark.skipif(not HAVE_TE, reason="TE grouped MLP needs Transformer Engine")
@@ -387,6 +404,18 @@ class TestMoEModules:
         [
             ("allgather", 1, {}),
             ("alltoall", 1, {}),
+            pytest.param(
+                "alltoall",
+                1,
+                {
+                    "moe_num_hash_layers": 1,
+                    "hash_moe_vocab_size": 128,
+                    "moe_router_score_function": "sigmoid",
+                    "moe_router_load_balancing_type": "none",
+                    "moe_aux_loss_coeff": 0.0,
+                },
+                id="alltoall-hash",
+            ),
             (
                 "alltoall",
                 1,
@@ -417,14 +446,19 @@ class TestMoEModules:
             mlp_spec = get_gpt_layer_with_transformer_engine_spec(
                 num_experts=8, moe_grouped_gemm=True
             ).submodules.mlp
-        layer = MoELayer(config, get_submodules(mlp_spec)).cuda()
+        layer = MoELayer(
+            config,
+            get_submodules(mlp_spec),
+            hash_moe_layer_threshold=1 if config.moe_num_hash_layers else None,
+        ).cuda()
         layer.set_layer_number(0)
         hidden = torch.randn(2048, 2, 1024, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        inputs = (hidden,)
+        if config.moe_num_hash_layers:
+            assert layer.router.is_hash_layer
+            input_ids = torch.arange(4096, device="cuda").view(2, 2048) % config.hash_moe_vocab_size
+            inputs = {"hidden_states": hidden, "input_ids": input_ids}
         with deterministic_algorithms(True):
             assert_module_replays_bit_exact(
-                layer,
-                (hidden,),
-                replays=3,
-                contention=True,
-                what=f"MoELayer[{dispatcher}, ep={ep}]",
+                layer, inputs, replays=3, contention=True, what=f"MoELayer[{dispatcher}, ep={ep}]"
             )

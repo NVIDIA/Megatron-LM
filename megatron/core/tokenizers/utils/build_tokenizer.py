@@ -147,6 +147,6 @@ def vocab_size_with_padding(orig_vocab_size, args, logging_enabled=True):
 
 
 def _set_padded_vocab_size(args, tokenizer):
-    """Sets padded vocab size if None."""
+    """Set the padded model vocabulary if it was not provided."""
     if getattr(args, "padded_vocab_size", None) is None:
         args.padded_vocab_size = vocab_size_with_padding(tokenizer.vocab_size, args)
