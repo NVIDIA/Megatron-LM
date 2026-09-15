@@ -1768,7 +1768,7 @@ def _accumulate(
     for idx, (param, grad) in enumerate(zip(params, grads, strict=True)):
         if grad is None:
             continue
-        grad = grad.to(param.dtype)
+        grad = grad.to(accum[idx].dtype if accum[idx] is not None else param.dtype)
         if accum[idx] is None:
             accum[idx] = grad
         else:
@@ -1786,12 +1786,25 @@ def _backward_router(chunk, grad_hidden, grad_scores, router_params, router_accu
     router_output = chunk.scores_edge if chunk.scores_edge is not None else chunk.scores
     if router_output is None:
         raise RuntimeError("EP chunk overlap router graph was released.")
-    router_grads = torch.autograd.grad(
-        router_output,
-        (chunk.x, *router_params),
-        grad_scores.to(chunk.scores_dtype),
-        allow_unused=True,
-    )
+    if any(hasattr(param, "_wgrad_accumulator") for param in router_params):
+        raise RuntimeError("Router weight-gradient accumulator is already leased")
+    try:
+        for idx, param in enumerate(router_params):
+            if param.dtype == torch.float64 or chunk.scores_dtype == torch.float64:
+                continue
+            if router_accum[idx] is None:
+                router_accum[idx] = torch.zeros_like(param, dtype=torch.float32)
+            param._wgrad_accumulator = router_accum[idx]
+        router_grads = torch.autograd.grad(
+            router_output,
+            (chunk.x, *router_params),
+            grad_scores.to(chunk.scores_dtype),
+            allow_unused=True,
+        )
+    finally:
+        for param in router_params:
+            if hasattr(param, "_wgrad_accumulator"):
+                del param._wgrad_accumulator
     grad_score_x = router_grads[0]
     if grad_score_x is None:
         grad_score_x = torch.zeros_like(chunk.x)
@@ -1818,7 +1831,7 @@ def _materialize(
     params: tuple[torch.Tensor, ...], accum: list[torch.Tensor | None]
 ) -> list[torch.Tensor]:
     return [
-        torch.zeros_like(param) if grad is None else grad
+        torch.zeros_like(param) if grad is None else grad.to(param.dtype)
         for param, grad in zip(params, accum, strict=True)
     ]
 

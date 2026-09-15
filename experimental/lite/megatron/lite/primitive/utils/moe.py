@@ -33,6 +33,7 @@ def _te_general_gemm(
     out: torch.Tensor | None = None,
     bias: torch.Tensor | None = None,
     grad: bool = False,
+    accumulate: bool = False,
 ):
     if (get_workspace := getattr(te_module_base, "get_workspace", None)) is None:
         return None
@@ -42,7 +43,7 @@ def _te_general_gemm(
         quantization_params=None,
         gelu=None,
         gelu_in=None,
-        accumulate=False,
+        accumulate=accumulate,
         layout=layout,
         out=out,
         bias=bias,
@@ -390,6 +391,7 @@ class RouterGatingLinearFunction(torch.autograd.Function):
         grad_shape = grad_output.shape
         inp = inp.view(-1, inp_shape[-1])
         grad_output = grad_output.view(-1, grad_shape[-1])
+        accumulator = getattr(weight, "_wgrad_accumulator", None)
 
         grad_input_out = grad_weight_out = None
         if ctx.router_dtype != torch.float64:
@@ -397,14 +399,26 @@ class RouterGatingLinearFunction(torch.autograd.Function):
                 weight.to(ctx.router_dtype), grad_output, ctx.router_dtype, layout="NN", grad=True
             )
             grad_weight_out = _te_general_gemm(
-                inp.to(ctx.router_dtype), grad_output, ctx.router_dtype, layout="NT", grad=True
+                inp.to(ctx.router_dtype),
+                grad_output,
+                ctx.router_dtype if accumulator is None else torch.float32,
+                layout="NT",
+                grad=True,
+                out=accumulator,
+                accumulate=accumulator is not None,
             )
         if grad_input_out is not None and grad_weight_out is not None:
             grad_input = grad_input_out[0].to(ctx.input_dtype)
-            grad_weight = grad_weight_out[0].to(ctx.weight_dtype)
+            grad_weight = grad_weight_out[0].to(ctx.weight_dtype) if accumulator is None else None
         else:
             grad_input = torch.mm(grad_output, weight.to(ctx.router_dtype)).to(ctx.input_dtype)
-            grad_weight = torch.mm(grad_output.t(), inp.to(ctx.router_dtype)).to(ctx.weight_dtype)
+            if accumulator is None:
+                grad_weight = torch.mm(grad_output.t(), inp.to(ctx.router_dtype)).to(
+                    ctx.weight_dtype
+                )
+            else:
+                accumulator.addmm_(grad_output.float().t(), inp.to(ctx.router_dtype).float())
+                grad_weight = None
         grad_bias = grad_output.sum(dim=0).to(ctx.weight_dtype) if bias is not None else None
         return grad_input.view(*inp_shape), grad_weight, grad_bias, None
 
