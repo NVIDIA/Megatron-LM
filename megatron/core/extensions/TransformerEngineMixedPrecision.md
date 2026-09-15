@@ -25,9 +25,14 @@ like `--first-last-layers-bf16`.
 
 ## Limitations
 
-Relying on the module name to match against a configuration means the match is
-executed post-initialization, and initialization customization for a recipe
-override such as `fp4-param` and `fp8-param` are not in scope.
+Parameter-storage precision is selected while each matched module is initialized.
+An MXFP8 recipe that omits `fp8_param` automatically inherits the enclosing
+model-init context when the global configuration also enables MXFP8 parameter
+storage. This lets the global `first_last_layers_bf16` policy remain in control.
+Set `fp8_param: false` to opt out, or set `inherit_model_init_context: true` to
+force inheritance outside that automatically detected case. Other recipes keep
+the existing behavior of controlling their own storage through `fp8_param` or
+`fp4_param`.
 
 The validation precision configurations rely on self.training. They have not
 yet been verified compatible with cuda-graphs and/or activation recompute.
@@ -70,6 +75,12 @@ configs:
       fp4_quantization_recipe: "nvfp4"
     evaluation_recipe: {}
 ```
+
+When these MXFP8 recipes are used with a matching global MXFP8 parameter policy,
+their omitted `fp8_param` automatically leaves the enclosing model-init context
+in control. A global BF16 boundary-layer policy can therefore select storage
+while the recipe independently selects forward precision. Use an explicit
+`fp8_param` or `fp4_param` when the recipe should override that policy.
 
 Recipes are selected by matchers. Currently implemented are glob style
 expressions.

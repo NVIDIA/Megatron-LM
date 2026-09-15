@@ -39,7 +39,7 @@ def test_dbuffer_layout_pads_to_lcm_times_dp_size_and_fills_gaps(distributed_set
     mesh = init_device_mesh(distributed_setup.device.type, (2,))
     shapes = [torch.Size((5, 4)), torch.Size((2, 6)), torch.Size((3,))]
 
-    buffer = DBuffer(
+    buffer = DBuffer.empty(
         mesh=mesh,
         placements=[Replicate()],
         tensor_shapes=shapes,
@@ -60,7 +60,7 @@ def test_dbuffer_layout_aligns_fragment_offsets_to_rows(distributed_setup):
     mesh = init_device_mesh(distributed_setup.device.type, (2,))
     shapes = [torch.Size((4, 4)), torch.Size((1, 6))]
 
-    buffer = DBuffer(
+    buffer = DBuffer.empty(
         mesh=mesh,
         placements=[Replicate()],
         tensor_shapes=shapes,
@@ -108,7 +108,7 @@ def test_compute_layout_fills_lcm_padding_gaps(distributed_setup):
     if mesh.get_coordinate() is None:
         pytest.skip("Rank is outside the 5-rank DBuffer mesh.")
 
-    buffer = DBuffer(
+    buffer = DBuffer.empty(
         mesh=mesh,
         placements=[Flat()],
         tensor_shapes=shapes,
@@ -139,14 +139,14 @@ def test_constructor_allocates_local_buffer(distributed_setup):
     tensor_shapes = [torch.Size((7, 3)), torch.Size((2, 5)), torch.Size((7,))]
     mesh_size = mesh.size()
 
-    replicated_buffer = DBuffer(
+    replicated_buffer = DBuffer.empty(
         mesh=mesh,
         placements=[Replicate()],
         tensor_shapes=tensor_shapes,
         dtype=torch.float32,
         device=distributed_setup.device,
     )
-    sharded_buffer = DBuffer(
+    sharded_buffer = DBuffer.empty(
         mesh=mesh,
         placements=[Flat()],
         tensor_shapes=tensor_shapes,
@@ -202,7 +202,7 @@ def test_cast_with_out_reuses_destination_and_casts_values(distributed_setup):
     mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
     tensors = _same_tensors_on_all_ranks(distributed_setup.device)
     buffer = DBuffer.distribute_tensors(tensors, mesh, [Replicate()])
-    destination = DBuffer(
+    destination = DBuffer.empty(
         mesh=mesh,
         placements=[Replicate()],
         tensor_shapes=buffer.layout.tensor_shapes,
@@ -223,7 +223,7 @@ def test_cast_with_out_reuses_destination_and_casts_values(distributed_setup):
 def test_release_and_reallocate_storage_preserves_buffer_views(distributed_setup):
     """DBuffer storage can be released and reallocated without replacing existing views."""
     mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
-    buffer = DBuffer(
+    buffer = DBuffer.empty(
         mesh=mesh,
         placements=[Replicate()],
         tensor_shapes=[torch.Size((4, 4))],
@@ -341,7 +341,7 @@ def test_sharded_allgather_into_existing_buffer(distributed_setup):
     mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
     tensors = _same_tensors_on_all_ranks(distributed_setup.device)
     sharded_buffer = DBuffer.distribute_tensors(tensors, mesh, [Flat()])
-    destination = DBuffer(
+    destination = DBuffer.empty(
         mesh=mesh,
         placements=[Replicate()],
         tensor_shapes=sharded_buffer.layout.tensor_shapes,
@@ -364,7 +364,7 @@ def test_replicate_view_round_trip(distributed_setup):
 
     replicated_buffer = DBuffer.distribute_tensors(tensors, mesh, [Replicate()])
     sharded_buffer = replicated_buffer.view([Flat()])
-    redistribute_destination = DBuffer(
+    redistribute_destination = DBuffer.empty(
         mesh=mesh,
         placements=[Flat()],
         tensor_shapes=replicated_buffer.layout.tensor_shapes,
@@ -422,7 +422,7 @@ def test_partial_allreduce_average(distributed_setup):
     ]
     partial_buffer = DBuffer.distribute_tensors(tensors, mesh, [Partial("avg")])
 
-    destination = DBuffer(
+    destination = DBuffer.empty(
         mesh=mesh,
         placements=[Replicate()],
         tensor_shapes=partial_buffer.layout.tensor_shapes,
@@ -611,7 +611,7 @@ def test_2d_mesh_flat_before_replicate_is_rejected(distributed_setup):
     )
 
     with pytest.raises(ValueError, match="Shard placements must be a suffix"):
-        DBuffer(
+        DBuffer.empty(
             mesh=mesh,
             placements=[Flat(), Replicate()],
             tensor_shapes=[torch.Size((6, 4))],

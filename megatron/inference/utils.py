@@ -90,7 +90,9 @@ def get_model_for_inference() -> MegatronModule:
     else:
         builder = get_model_builder(args)
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
-        model = builder.build_distributed_models(pg_collection=pg_collection, wrap_with_ddp=False)
+        model = builder.build_distributed_models(
+            pg_collection=pg_collection, wrap_with_ddp=False
+        )
 
     # Load checkpoint.
     assert args.load is not None
@@ -111,13 +113,7 @@ def get_model_for_inference() -> MegatronModule:
 
     if args.transformer_impl == "inference_optimized" and args.fp8_recipe == "mxfp8":
         quant_backend = resolve_mxfp8_backend(args.inference_grouped_gemm_backend)
-        unwrapped_model = unwrap_model(model)
-        quantize_model_to_mxfp8(
-            unwrapped_model,
-            backend=quant_backend,
-            include_pattern=getattr(args, "inference_mxfp8_include_parameters", None),
-            exclude_pattern=getattr(args, "inference_mxfp8_exclude_parameters", None),
-        )
+        quantize_model_to_mxfp8(unwrap_model(model), backend=quant_backend)
     return model
 
 
@@ -321,7 +317,7 @@ def add_inference_args(parser: ArgumentParser) -> ArgumentParser:
         type=int,
         default=None,
         help="Maximum number of decode steps to trace (inference). Default is unlimited. "
-        "Training uses --moe-routing-trace-max-training-iters instead.",
+             "Training uses --moe-routing-trace-max-training-iters instead.",
     )
 
     return parser

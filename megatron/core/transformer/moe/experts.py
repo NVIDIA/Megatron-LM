@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import inspect
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from contextlib import nullcontext
 from copy import deepcopy
 from dataclasses import dataclass
@@ -86,7 +86,6 @@ except ImportError:
 from megatron.core.inference.moe import ActivationType as McoreActivationType
 from megatron.core.inference.moe import InferenceGroupedGemmBackend, mcore_fused_moe, vllm_fused_moe
 from megatron.core.inference.moe.flashinfer_mxfp8 import (
-    FlashInferRoutedMXFP8Weight,
     flashinfer_routed_mxfp8_moe,
     prepare_routed_mxfp8_weights,
     require_flashinfer_routed_mxfp8,
@@ -1172,6 +1171,8 @@ class InferenceGroupedMLP(TEGroupedMLP):
     - Inference + vLLM: Triton fused MoE for BF16, MCore scaled grouped GEMM for MXFP8
     """
 
+    _EXPERT_WEIGHT_GROUPS = (("linear_fc1", "_fc1_weight"), ("linear_fc2", "_fc2_weight"))
+
     def __init__(
         self,
         num_local_experts: int,
@@ -1192,6 +1193,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
         # Concatenated weights are built lazily on first forward to ensure
         # checkpoint loading has already populated the per-expert parameters.
         self._concatenated_weights_built = False
+        self._uses_mxfp8_weights: bool | None = None
 
         if HAVE_FLASHINFER:
             self._flashinfer_activation_type = self._resolve_flashinfer_activation_type()
@@ -1228,6 +1230,40 @@ class InferenceGroupedMLP(TEGroupedMLP):
             return McoreActivationType.SWIGLU
         raise ValueError(f"No mcore_fused_moe ActivationType mapping for activation_func={func}")
 
+    @staticmethod
+    def _unwrap_mxfp8_weight(weight: object) -> MXFP8Tensor | None:
+        """Return the MCore MXFP8 storage carried by a weight, if any."""
+        if isinstance(weight, MXFP8Tensor):
+            return weight
+        data = getattr(weight, "data", None)
+        return data if isinstance(data, MXFP8Tensor) else None
+
+    @staticmethod
+    def _require_uniform_weight_format(format_flags: Iterable[bool], format_name: str) -> bool:
+        """Return whether every expert projection uses a format, rejecting mixtures."""
+        flags = tuple(format_flags)
+        if any(flags) != all(flags):
+            raise TypeError(
+                "FC1 and FC2 expert weights must use one precision within an MoE layer; "
+                f"found a mixture of {format_name} and BF16 weights. Adjust the selective "
+                "TE precision recipe to select both expert projections."
+            )
+        return all(flags)
+
+    def _expert_weights_use_mxfp8(self) -> bool:
+        """Return whether all per-expert FC1 and FC2 weights use MCore MXFP8 storage."""
+        return InferenceGroupedMLP._require_uniform_weight_format(
+            (
+                InferenceGroupedMLP._unwrap_mxfp8_weight(
+                    getattr(getattr(self, linear_name), f"weight{expert_index}")
+                )
+                is not None
+                for linear_name, _ in InferenceGroupedMLP._EXPERT_WEIGHT_GROUPS
+                for expert_index in range(self.num_local_experts)
+            ),
+            "MXFP8",
+        )
+
     def _stack_mxfp8_linear_weight(self, linear_name: str, backend: str) -> MXFP8Tensor:
         """Stack one linear's per-expert MXFP8 weights in canonical layout."""
         linear = getattr(self, linear_name)
@@ -1235,11 +1271,8 @@ class InferenceGroupedMLP(TEGroupedMLP):
         source_dtype: torch.dtype | None = None
         for i in range(self.num_local_experts):
             weight = getattr(linear, f'weight{i}')
-            if isinstance(weight, MXFP8Tensor):
-                mxfp8 = weight
-            elif hasattr(weight, 'data') and isinstance(weight.data, MXFP8Tensor):
-                mxfp8 = weight.data
-            else:
+            mxfp8 = InferenceGroupedMLP._unwrap_mxfp8_weight(weight)
+            if mxfp8 is None:
                 raise RuntimeError(
                     f"Expected MXFP8Tensor for {linear_name}.weight{i}, "
                     f"got {type(weight).__name__}. Was quantize_model_to_mxfp8 called?"
@@ -1279,7 +1312,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
         backend = resolve_mxfp8_backend(self.inference_grouped_gemm_backend)
         if use_flashinfer_routed:
             require_flashinfer_routed_mxfp8()
-        for linear_name, buf_name in [('linear_fc1', '_fc1_weight'), ('linear_fc2', '_fc2_weight')]:
+        for linear_name, buf_name in InferenceGroupedMLP._EXPERT_WEIGHT_GROUPS:
             linear = getattr(self, linear_name)
             stacked_weight = self._stack_mxfp8_linear_weight(linear_name, backend)
             if use_flashinfer_routed:
@@ -1310,6 +1343,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
                     elif hasattr(w, 'data') and isinstance(w.data, MXFP8Tensor):
                         w.data.data = stacked_weight.data[i]
                         w.data.scale = stacked_weight.scale[i]
+        self._uses_mxfp8_weights = True
 
     @torch.inference_mode(False)
     @torch.no_grad()
@@ -1324,18 +1358,14 @@ class InferenceGroupedMLP(TEGroupedMLP):
         ):
             return False
 
-        fc1_is_mxfp8 = isinstance(self._fc1_weight, FlashInferRoutedMXFP8Weight)
-        fc2_is_mxfp8 = isinstance(self._fc2_weight, FlashInferRoutedMXFP8Weight)
-        if fc1_is_mxfp8 != fc2_is_mxfp8:
-            raise TypeError("FC1 and FC2 must use the same FlashInfer MXFP8 format")
-        if not fc1_is_mxfp8:
+        if not self._uses_mxfp8_weights:
             # Selective-precision recipes also build BF16 expert weights for
             # FlashInfer. Those buffers are refit directly and have no derived
             # routed representation to refresh.
             return False
 
         require_flashinfer_routed_mxfp8()
-        for linear_name, buf_name in [('linear_fc1', '_fc1_weight'), ('linear_fc2', '_fc2_weight')]:
+        for linear_name, buf_name in InferenceGroupedMLP._EXPERT_WEIGHT_GROUPS:
             routed_weight = getattr(self, buf_name)
             canonical_weight = self._stack_mxfp8_linear_weight(linear_name, "triton")
             prepare_routed_mxfp8_weights(canonical_weight, out=routed_weight)
@@ -1384,6 +1414,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
         # Register big tensors as non-persistent buffers (for .to() device movement, not saved)
         self.register_buffer('_fc1_weight', _fc1_weight, persistent=False)
         self.register_buffer('_fc2_weight', _fc2_weight, persistent=False)
+        self._uses_mxfp8_weights = False
 
     def _flashinfer_forward(self, hidden_states, routing_map, probs):
         """FlashInfer fused MoE kernel for CUDA-graphed inference iterations."""
@@ -1394,9 +1425,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
             "inference_grouped_gemm_backend=vllm or torch."
         )
         assert probs.dtype == torch.float32, "FlashInfer forward path requires fp32 probabilities."
-        if isinstance(self._fc1_weight, FlashInferRoutedMXFP8Weight):
-            if not isinstance(self._fc2_weight, FlashInferRoutedMXFP8Weight):
-                raise TypeError("FC1 and FC2 must use the same FlashInfer MXFP8 format")
+        if self._uses_mxfp8_weights:
             output = flashinfer_routed_mxfp8_moe(
                 hidden_states,
                 routing_map,
@@ -1430,7 +1459,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
         return output, None
 
     def _mcore_fused_moe_forward(self, hidden_states, probs, routing_map):
-        """MCore permutation with the selected Torch or vLLM grouped-GEMM path."""
+        """MCore grouped GEMM for Torch and the vLLM-selected MXFP8 fallback."""
         local_expert_start = self.ep_group.rank() * self.num_local_experts
         output = mcore_fused_moe(
             hidden_states,
@@ -1500,10 +1529,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
 
         # Lazily build concatenated weights on first forward (after checkpoint load)
         if not self._concatenated_weights_built:
-            w = self.linear_fc1.weight0
-            if isinstance(w, MXFP8Tensor) or (
-                hasattr(w, 'data') and isinstance(w.data, MXFP8Tensor)
-            ):
+            if InferenceGroupedMLP._expert_weights_use_mxfp8(self):
                 self._build_concatenated_mxfp8_weights()
             else:
                 self._build_concatenated_weights()
@@ -1520,7 +1546,10 @@ class InferenceGroupedMLP(TEGroupedMLP):
                 permuted_local_hidden_states, permuted_probs, routing_map=routing_map
             )
         elif self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.VLLM:
-            if isinstance(self._fc1_weight, MXFP8Tensor):
+            # The vLLM kernel integrated here handles BF16, not MCore's MXFP8 layout.
+            # Use MCore's scaled grouped GEMM for MXFP8 without dequantizing the weights;
+            # BF16 layers in a mixed-precision recipe still use the vLLM path below.
+            if self._uses_mxfp8_weights:
                 return self._mcore_fused_moe_forward(
                     permuted_local_hidden_states, permuted_probs, routing_map=routing_map
                 )

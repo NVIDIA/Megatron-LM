@@ -436,6 +436,13 @@ KERNELS: Tuple[KernelEntry, ...] = (
         kind="cuda-ext",
         exempt_reason="Pluggable allocator (ncclMemAlloc); allocation only, no compute kernel.",
     ),
+    KernelEntry(
+        name="vmm_symm_allocator",
+        sources=("megatron/core/allocator/vmm_symm_allocator.py",),
+        kind="cuda-ext",
+        exempt_reason="Pluggable allocator (CUDA VMM driver calls); allocation only, no "
+        "compute kernel.",
+    ),
     # ---------------------------------------------------------------- inference (single GPU)
     KernelEntry(
         name="inference_kv_cache_tensor_ops",
@@ -454,6 +461,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "megatron/core/inference/moe/batch_invariant.py",
             "megatron/core/inference/moe/permute.py",
             "megatron/core/inference/moe/vllm_fused_moe.py",
+            "megatron/core/inference/moe/fused_moe.py",
             "megatron/core/inference/quantization/mxfp8_quantize.py",
         ),
         tests=(K + "test_inference_kernels.py",),

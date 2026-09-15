@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import re
 from typing import TYPE_CHECKING, Dict, Optional, Tuple
 
 import torch
@@ -12,7 +11,6 @@ from megatron.core.inference.quantization.mxfp8_tensor import (
     MXFP8Tensor,
     validate_mxfp8_tensor,
 )
-from megatron.core.parameter_metadata import PARAMETER_SHARDING_ATTRIBUTES
 
 if TYPE_CHECKING:
     from megatron.core.inference.moe import InferenceGroupedGemmBackend
@@ -90,70 +88,82 @@ def resolve_mxfp8_backend(
     )
 
 
-def matches_mxfp8_parameter_filter(
-    parameter_name: str, include_pattern: str | None = None, exclude_pattern: str | None = None
-) -> bool:
-    """Return whether a fully qualified parameter name should remain in MXFP8.
-
-    Inclusion defaults to all parameters. Exclusion takes precedence when both
-    regular expressions match.
-    """
-    included = include_pattern is None or re.search(include_pattern, parameter_name) is not None
-    excluded = (
-        exclude_pattern is not None and re.search(exclude_pattern, parameter_name) is not None
-    )
-    return included and not excluded
+def _has_mxfp8_storage(parameter: object) -> bool:
+    """Return whether a parameter or its data uses TE or MCore MXFP8 storage."""
+    if isinstance(parameter, MXFP8Tensor) or (HAVE_TE and isinstance(parameter, TEMXFP8Tensor)):
+        return True
+    data = getattr(parameter, "data", None)
+    return isinstance(data, MXFP8Tensor) or (HAVE_TE and isinstance(data, TEMXFP8Tensor))
 
 
-def _materialize_mxfp8_parameter_as_bf16(
-    module: torch.nn.Module, parameter_name: str, parameter: torch.Tensor
-) -> None:
-    """Replace a TE MXFP8 parameter with a BF16 parameter while preserving sharding metadata."""
-    bf16_parameter = torch.nn.Parameter(
-        parameter.dequantize().to(torch.bfloat16), requires_grad=parameter.requires_grad
-    )
-    for attribute in PARAMETER_SHARDING_ATTRIBUTES:
-        if hasattr(parameter, attribute):
-            setattr(bf16_parameter, attribute, getattr(parameter, attribute))
-    del module._parameters[parameter_name]
-    setattr(module, parameter_name, bf16_parameter)
+def _validate_mxfp8_expert_precision_policy(model: torch.nn.Module) -> None:
+    """Reject a selective policy that splits an MoE layer across precisions."""
+    for module_name, module in model.named_modules():
+        if not (
+            hasattr(module, "num_local_experts")
+            and hasattr(module, "linear_fc1")
+            and hasattr(module, "linear_fc2")
+        ):
+            continue
+
+        weight_formats = []
+        for linear_name in ("linear_fc1", "linear_fc2"):
+            linear = getattr(module, linear_name)
+            if hasattr(linear, "weight0"):
+                weight_names = (
+                    f"weight{expert_index}" for expert_index in range(module.num_local_experts)
+                )
+            elif hasattr(linear, "weight"):
+                weight_names = ("weight",)
+            else:
+                continue
+
+            for weight_name in weight_names:
+                if not hasattr(linear, weight_name):
+                    continue
+                relative_name = ".".join(
+                    part for part in (module_name, linear_name, weight_name) if part
+                )
+                keep_mxfp8 = _has_mxfp8_storage(getattr(linear, weight_name))
+                weight_formats.append((relative_name, keep_mxfp8))
+
+        format_flags = [keep_mxfp8 for _, keep_mxfp8 in weight_formats]
+        if format_flags and any(format_flags) != all(format_flags):
+            mxfp8_name = next(name for name, keep_mxfp8 in weight_formats if keep_mxfp8)
+            bf16_name = next(name for name, keep_mxfp8 in weight_formats if not keep_mxfp8)
+            layer_name = module_name or "<root>"
+            raise ValueError(
+                "MXFP8 inference requires every FC1 and FC2 expert weight in an MoE layer "
+                f"to use one precision, but the policy mixes formats in {layer_name!r}: "
+                f"{mxfp8_name!r} uses MXFP8 while {bf16_name!r} uses BF16. "
+                "Adjust the TE precision recipe to select both expert projections and "
+                "all local experts together."
+            )
 
 
 def quantize_model_to_mxfp8(
-    model: torch.nn.Module,
-    backend: MXFP8Backend = "flashinfer",
-    include_pattern: str | None = None,
-    exclude_pattern: str | None = None,
-    _prefix: str = "",
+    model: torch.nn.Module, backend: MXFP8Backend = "flashinfer", _prefix: str = ""
 ) -> None:
     """Convert TE MXFP8 weights to mcore MXFP8Tensor format.
 
-    Recursively walks the model and applies the configured precision policy to
-    each TEMXFP8Tensor parameter. Selected parameters are re-quantized into an
-    MCore MXFP8Tensor and unselected parameters are materialized in BF16.
+    Recursively converts existing TE MXFP8 parameters to MCore MXFP8Tensor.
+    The TE per-module precision recipe selects storage during model construction;
+    ordinary BF16 parameters are left untouched.
 
     Args:
         model: The model whose TE MXFP8 parameters should be converted.
         backend: 'flashinfer' or 'triton' quantization backend.
-        include_pattern: Regex selecting fully qualified parameter names to keep in MXFP8.
-            If unset, all MXFP8 parameters are included.
-        exclude_pattern: Regex selecting fully qualified parameter names to materialize
-            in BF16. Exclusion takes precedence over inclusion.
         _prefix: Internal recursion prefix; callers should not set this.
     """
     assert HAVE_TE
     if backend == "flashinfer":
         assert HAVE_FLASHINFER, "FlashInfer not available for MXFP8 quantization"
+    if not _prefix:
+        _validate_mxfp8_expert_precision_policy(model)
 
     for child_name, child in model.named_children():
         child_prefix = f"{_prefix}{child_name}."
-        quantize_model_to_mxfp8(
-            child,
-            backend=backend,
-            include_pattern=include_pattern,
-            exclude_pattern=exclude_pattern,
-            _prefix=child_prefix,
-        )
+        quantize_model_to_mxfp8(child, backend=backend, _prefix=child_prefix)
 
     def replace_in_dict(attr_dict):
         """Helper function to replace TE MXFP8 weights."""
@@ -164,13 +174,6 @@ def quantize_model_to_mxfp8(
                 hasattr(val, 'data') and isinstance(val.data, TEMXFP8Tensor)
             )
             if is_te_mxfp8:
-                full_name = f"{_prefix}{key}"
-                keep_mxfp8 = matches_mxfp8_parameter_filter(
-                    full_name, include_pattern=include_pattern, exclude_pattern=exclude_pattern
-                )
-                if not keep_mxfp8:
-                    _materialize_mxfp8_parameter_as_bf16(model, key, val)
-                    continue
                 # Undo the TE quantization and re-quantize
                 # Note that this introduces a one-time overhead but avoids any
                 # numerical differences between TE and mcore MXFP8 formats
@@ -193,17 +196,7 @@ def quantize_model_to_mxfp8(
 
 def _should_quantize_param(val: torch.Tensor) -> bool:
     """Return True if a parameter should be converted to an MCore MXFP8 tensor."""
-    if not val.is_cuda:
-        return False
-    if HAVE_TE and isinstance(val, TEMXFP8Tensor):
-        return True
-    if HAVE_TE and hasattr(val, 'data') and isinstance(val.data, TEMXFP8Tensor):
-        return True
-    if isinstance(val, MXFP8Tensor):
-        return True
-    if hasattr(val, 'data') and isinstance(val.data, MXFP8Tensor):
-        return True
-    return False
+    return val.is_cuda and _has_mxfp8_storage(val)
 
 
 def _to_bf16(val: torch.Tensor) -> torch.Tensor:
@@ -241,14 +234,12 @@ def quantize_params_to_mxfp8(
     persistent_buffers: Optional[Dict[str, MXFP8Tensor]] = None,
     _prefix: str = "",
     backend: MXFP8Backend = "flashinfer",
-    include_pattern: str | None = None,
-    exclude_pattern: str | None = None,
-    _filter_prefix: str = "",
 ) -> Dict[str, MXFP8Tensor]:
     """Quantize model parameters to mutable MXFP8Tensor storage.
 
-    Handles both TEMXFP8Tensor (fp8_param=True) and BF16/FP16 nn.Parameter
-    inputs.  When *persistent_buffers* is provided, new quantized values are
+    Converts parameters already initialized with TE MXFP8 storage by the per-module
+    precision recipe; ordinary BF16/FP16 parameters are left untouched.
+    When *persistent_buffers* is provided, new quantized values are
     ``copy_()``'d into the existing MXFP8Tensor objects so that CUDA-graph
     device-pointer captures remain valid.  Persistent buffers are deliberately
     created outside inference mode so later refits can update them regardless
@@ -261,17 +252,14 @@ def quantize_params_to_mxfp8(
             Updated in-place and returned.
         _prefix: Internal recursion prefix; callers should not set this.
         backend: 'flashinfer' or 'triton' quantization backend.
-        include_pattern: Regex selecting fully qualified parameter names to keep in MXFP8.
-            If unset, all MXFP8 parameters are included.
-        exclude_pattern: Regex selecting fully qualified parameter names to materialize
-            in BF16. Exclusion takes precedence over inclusion.
-        _filter_prefix: Internal prefix used to match names from a model subtree.
 
     Returns:
         The ``persistent_buffers`` dict (created on first call if ``None``).
     """
     if backend == "flashinfer":
         assert HAVE_FLASHINFER, "FlashInfer not available for MXFP8 quantization"
+    if not _prefix:
+        _validate_mxfp8_expert_precision_policy(model)
 
     if persistent_buffers is None:
         persistent_buffers = {}
@@ -280,13 +268,7 @@ def quantize_params_to_mxfp8(
     for child_name, child_module in model.named_children():
         child_prefix = f"{_prefix}{child_name}." if _prefix else f"{child_name}."
         quantize_params_to_mxfp8(
-            child_module,
-            persistent_buffers,
-            _prefix=child_prefix,
-            backend=backend,
-            include_pattern=include_pattern,
-            exclude_pattern=exclude_pattern,
-            _filter_prefix=_filter_prefix,
+            child_module, persistent_buffers, _prefix=child_prefix, backend=backend
         )
 
     # Process parameters owned directly by this module
@@ -300,13 +282,6 @@ def quantize_params_to_mxfp8(
                 continue
 
             fqn = f"{_prefix}{key}"
-            filter_fqn = f"{_filter_prefix}{fqn}"
-            keep_mxfp8 = matches_mxfp8_parameter_filter(
-                filter_fqn, include_pattern=include_pattern, exclude_pattern=exclude_pattern
-            )
-            if not keep_mxfp8:
-                _materialize_mxfp8_parameter_as_bf16(model, key, val)
-                continue
             bf16_data = _to_bf16(val)
 
             if fqn in persistent_buffers:

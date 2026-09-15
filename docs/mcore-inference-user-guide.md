@@ -124,7 +124,7 @@ workload rather than generalizing from any single comparison.
 | **MoE** | Expert model parallelism with full CUDA-graph support, expert router replay, NVLS switch-multicast token dispatcher plus an allgatherv dispatcher optimized for multi-node NVLink, and shared-expert overlap with latent MoEs. Selectable grouped-GEMM backend (vLLM, torch, or FlashInfer) |
 | **Parallelism** | Data-parallel coordinator with full multi-node support, tensor model parallelism with low-latency comm primitives, expert model parallelism, and pipeline parallelism |
 | **Model families** | GPT-style dense models, MoE models, MLA models (for example DeepSeek-style, with `cache_mla_latents`), Mamba and hybrid (SSM and attention) models, Gated Delta Net and Gated Delta Product models, and vision-language models for image inputs. Refer to [Known Limitations](#known-limitations) for the per-family feature gaps |
-| **Precision** | MXFP8 weight quantization through `--transformer-impl inference_optimized --fp8-recipe mxfp8`, using latency-optimized inference kernels. Configurable Mamba conv and SSM state dtypes |
+| **Precision** | MXFP8 weight quantization through `--transformer-impl inference_optimized --fp8-recipe mxfp8`, using latency-optimized inference kernels with FlashInfer, torch, or vLLM grouped-GEMM selection. MXFP8 can be selected per parameter while unmatched layers remain BF16. Configurable Mamba conv and SSM state dtypes |
 | **RL** | [Weight refit and resharding](#weight-refit-and-resharding-for-rl) between training and inference over five transports, supporting both colocated (shared GPUs) and non-colocated (separate resources) deployments. Batch-invariant kernels for training and inference log-prob consistency. Per-DP-rank sampling seeds so the same prompt routed to different replicas yields different samples |
 | **Sampling** | Temperature, top-k, top-p, stop words, log-probs, and top-N log-probs, with raw or post-processed log-prob semantics (`logprobs_mode`). Pluggable torch or FlashInfer sampling backend |
 | **Disaggregation** | KV and SSM state handoff between prefill and decode engines over NIXL or NCCL, with resharding across mismatched TP/PP layouts. Refer to [Disaggregated Prefill and Decode](#disaggregated-prefill-and-decode) for what is and is not turnkey today |
@@ -145,13 +145,35 @@ workload rather than generalizing from any single comparison.
 > selects the GEMM backend, and `batch_invariant_collective` (`ordered` by
 > default, or `multimem`) selects the cross-rank expert-combine reduction.
 >
-> Both dense and MoE models are supported. Batch-invariant MoE is bf16-only,
-> requires the unfused permute/unpermute path, and under
+> Both dense and MoE models are supported. Batch-invariant MoE supports BF16 and
+> MXFP8 squared-ReLU/SwiGLU experts, requires unfused permute/unpermute, and under
 > `--transformer-impl inference_optimized` requires
 > `inference_grouped_gemm_backend` of `vllm` or `torch` (plus the `nvls` token
 > dispatcher when `EP > 1`). Some backend combinations additionally need DeepGEMM
 > bf16 bindings: `uv pip install -e .[batch_invariant]`. Context parallelism and
-> attention dropout are not supported in either case.
+> attention dropout are not supported in either case. MXFP8 training uses
+> `batch_invariant_backend="te_native"` and legacy TE GroupedLinear:
+> `moe_use_grouped_tensor=False`, `use_transformer_engine_op_fuser=False`, and
+> `NVTE_GROUPED_LINEAR_USE_FUSED_GROUPED_GEMM=0`. TE device-metadata grouped GEMM
+> is not supported in batch-invariant mode because its full workspace can change
+> reduction order with batch size; 256-row alignment alone does not prevent this.
+
+> **Selective MXFP8 parameter storage.** Use the same Transformer Engine per-module
+> precision recipe for training and inference through `TransformerConfig.quant_recipe`
+> (or `--te-precision-config-file`). The recipe selects storage before TE initializes
+> each module: BF16 modules allocate ordinary BF16 parameters and load checkpoint
+> values directly, without an intermediate MXFP8 conversion or a checkpoint callback.
+> With global `fp8_param=True` and `fp8_recipe="mxfp8"`, an MXFP8 recipe that omits
+> `fp8_param` inherits the global policy, including first/last BF16 layers.
+> For routed-expert-only quantization, match `*mlp.experts.linear_fc1` and
+> `*mlp.experts.linear_fc2` to MXFP8, with an MTP BF16 rule first and a catch-all
+> BF16 rule last. See
+> [TE precision recipes](https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/core/extensions/TransformerEngineMixedPrecision.md).
+>
+> Within one MoE layer, every local expert's FC1 and FC2 weight must use the same
+> precision. The `flashinfer`, `torch`, and `vllm` grouped-GEMM backends support
+> mixtures of BF16 and MXFP8 layers. vLLM uses its fused kernel for BF16 expert
+> layers and MCore's scaled grouped GEMM for MXFP8 expert layers.
 
 Many of these are toggled through `InferenceConfig`. Refer to the
 [Engine configuration](#engine-configuration).
@@ -448,8 +470,8 @@ than `InferenceConfig`, because they must be set when you build the model:
 `batch_invariant_mode` (and `batch_invariant_backend` /
 `batch_invariant_collective`), `inference_moe_token_dispatcher_type` (`nvls` by
 default, or `nccl`), `inference_grouped_gemm_backend` (`vllm` by default, or
-`torch` / `flashinfer`), `moe_enable_routing_replay`, and `window_size` for
-sliding-window attention.
+`torch` / `flashinfer`), `quant_recipe`, `moe_enable_routing_replay`, and
+`window_size` for sliding-window attention.
 
 ### Reading Results
 
@@ -706,7 +728,9 @@ The transport is selected by `refit_method`, exposed on the command line as
 MXFP8 targets are handled transparently: when the destination model uses
 `--transformer-impl inference_optimized` with `--fp8-recipe mxfp8`,
 `prepare_swap_model_weights` installs a quantizing transform that later
-`swap_model_weights` calls pick up. The built-in RL loop calls
+`swap_model_weights` calls pick up. The refit plan follows the TE per-module
+precision recipe: only destination weights initialized with MXFP8 storage are
+quantized, while BF16 parameters remain BF16. The built-in RL loop calls
 `swap_model_weights(model, inference_model, args.refit_method)`; refer to
 [`megatron/core/resharding/README.md`](https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/core/resharding/README.md) for
 the plan-building and caching details.
@@ -871,10 +895,15 @@ arrival schedules, batch-drain modes, or suspend and resume policies:
 engine.add_request(request_id, prompt_text, sampling_params)
 while engine.has_unfinished_requests():
     result = engine.step_modern()
-    for record in result["finished_request_records"]:
-        finished = record.merge()
+    for finished in result["finished_requests"]:
+        finished.finalize_text(tokenizer)
         print(finished.request_id, finished.generated_text)
 ```
+
+The engine owns checkpoint records internally and returns one flat,
+token-complete `DynamicInferenceRequest` per finished request. Its
+`generated_text` starts as `None`; direct low-level callers decode the complete
+token stream once by calling `finalize_text(tokenizer)` where text is needed.
 
 The fully worked manual-stepping example is
 [`examples/inference/advanced/gpt_dynamic_inference.py`](https://github.com/NVIDIA/Megatron-LM/blob/main/examples/inference/advanced/gpt_dynamic_inference.py).
@@ -964,21 +993,24 @@ is the opposite of the `MegatronLLM` constructor default.
   warning if FlashInfer is not installed.
 - **Async scheduling excludes MoE router replay** and does not support paused
   requests. Refer to [Async Scheduling](#async-scheduling).
-- **Batch-invariant MoE is bf16-only** and requires the unfused
-  permute/unpermute path; batch-invariant mode in general excludes context
-  parallelism and attention dropout.
-- **MXFP8 fused quantization supports squared-ReLU only, not SwiGLU**, which
-  falls back to bf16.
+- **Batch-invariant MoE supports BF16 and MXFP8 squared-ReLU/SwiGLU experts.**
+  MXFP8 uses legacy TE `te_native` for training and Torch/vLLM for inference.
+  It requires unfused permute/unpermute and excludes context parallelism,
+  attention dropout, and TE device-metadata grouped GEMM.
+- **MXFP8 fused quantization supports squared-ReLU only.** SwiGLU uses separate
+  BF16 activation and MXFP8 quantization kernels; it does not fall back to BF16 GEMM.
 - **Disaggregated handoff does not support log-probs** (`return_log_probs` or
   `top_n_logprobs > 0` raises).
 
 **Engine and serving**
 
-- **`engine.reset()` is unsafe in coordinator mode.** It can deadlock (rebinds
-  internal asyncio primitives that suspended waiters still reference) or
-  silently re-route to direct-mode branches. The offline example therefore
-  blocks `--inference-repeat-n > 1` together with `--use-coordinator`. Direct-mode
-  reset is safe.
+- **High-level coordinator reset is not synchronized.** Once an engine is drained,
+  `engine.reset()` preserves its coordinator mode and long-lived asyncio objects,
+  and accepts resets only while `RUNNING` or `PAUSED`. The high-level coordinator
+  API cannot yet prove that its background engine loop has finished bookkeeping
+  after the final reply, however, so an immediate reset can still race that loop.
+  The offline example therefore blocks `--inference-repeat-n > 1` together with
+  `--use-coordinator`. Direct-mode reset is safe.
 - **HTTP frontend is fixed to global rank 0.** There is no per-rank `role`
   override on `ServeConfig`. Control placement through the launcher (for example, torchrun
   rank-0 placement). `ServeConfig.sock` lets you pre-bind the listening socket,

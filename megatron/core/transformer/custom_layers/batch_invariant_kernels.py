@@ -1659,7 +1659,19 @@ _TE_NATIVE_WORKSPACE_BYTES = 1024
 
 # Originals saved by _enable_te_native_workspace_starvation for restoration.
 _TE_WORKSPACE_SIZE_FN_ORIG = None
+_TE_GROUPED_WORKSPACE_FN_ORIG = None
 _TE_NATIVE_ENV_ORIG: dict = {}
+
+
+def _reject_te_native_grouped_workspace(device: int, layout: str) -> torch.Tensor:
+    """Reject device-metadata grouped GEMM rather than relaxing workspace starvation."""
+    raise RuntimeError(
+        "Batch-invariant te_native does not support TE device-metadata grouped GEMM: "
+        "it requires a full workspace, which can change the reduction order with batch size. "
+        "Use legacy TE GroupedLinear with moe_use_grouped_tensor=False, "
+        "use_transformer_engine_op_fuser=False, and "
+        "NVTE_GROUPED_LINEAR_USE_FUSED_GROUPED_GEMM=0."
+    )
 
 
 def _enable_te_native_workspace_starvation(workspace_bytes: int = _TE_NATIVE_WORKSPACE_BYTES):
@@ -1683,7 +1695,7 @@ def _enable_te_native_workspace_starvation(workspace_bytes: int = _TE_NATIVE_WOR
     import logging
     import os
 
-    global _TE_WORKSPACE_SIZE_FN_ORIG
+    global _TE_GROUPED_WORKSPACE_FN_ORIG, _TE_WORKSPACE_SIZE_FN_ORIG
     logger = logging.getLogger(__name__)
 
     # CUBLASLT_WORKSPACE_SIZE must be pinned (not setdefault): a preset value
@@ -1718,6 +1730,17 @@ def _enable_te_native_workspace_starvation(workspace_bytes: int = _TE_NATIVE_WOR
             _te_gemm_mod.get_cublas_workspace_size_bytes = lambda: workspace_bytes
             if hasattr(getattr(_te_gemm_mod, "get_cublas_workspace", None), "cache_clear"):
                 _te_gemm_mod.get_cublas_workspace.cache_clear()
+        # Only general_grouped_gemm_for_grouped_tensor uses this workspace. Its full
+        # allocation admits algorithms we cannot guarantee are batch-invariant; rounding
+        # expert row counts to 256-multiples does not fix M. Fail at the actual dispatch
+        # (including BF16 modules in a mixed recipe), leaving legacy grouped GEMMs starved.
+        if _TE_GROUPED_WORKSPACE_FN_ORIG is None and hasattr(
+            _te_gemm_mod, "_get_grouped_cublas_workspace"
+        ):
+            _TE_GROUPED_WORKSPACE_FN_ORIG = _te_gemm_mod._get_grouped_cublas_workspace
+            if hasattr(_TE_GROUPED_WORKSPACE_FN_ORIG, "cache_clear"):
+                _TE_GROUPED_WORKSPACE_FN_ORIG.cache_clear()
+            _te_gemm_mod._get_grouped_cublas_workspace = _reject_te_native_grouped_workspace
     except ImportError:
         pass
 
@@ -1726,7 +1749,17 @@ def _disable_te_native_workspace_starvation():
     """Restore the TE workspace function and env pinned by the te_native backend."""
     import os
 
-    global _TE_WORKSPACE_SIZE_FN_ORIG
+    global _TE_GROUPED_WORKSPACE_FN_ORIG, _TE_WORKSPACE_SIZE_FN_ORIG
+    if _TE_GROUPED_WORKSPACE_FN_ORIG is not None:
+        try:
+            import transformer_engine.pytorch.cpp_extensions.gemm as _te_gemm_mod
+
+            _te_gemm_mod._get_grouped_cublas_workspace = _TE_GROUPED_WORKSPACE_FN_ORIG
+            if hasattr(_TE_GROUPED_WORKSPACE_FN_ORIG, "cache_clear"):
+                _TE_GROUPED_WORKSPACE_FN_ORIG.cache_clear()
+        except ImportError:
+            pass
+        _TE_GROUPED_WORKSPACE_FN_ORIG = None
     if _TE_WORKSPACE_SIZE_FN_ORIG is not None:
         try:
             import transformer_engine.pytorch.cpp_extensions.gemm as _te_gemm_mod
@@ -1805,9 +1838,10 @@ def enable_batch_invariant_mode(backend: str = "te_native", collective: str = "o
     _batch_invariant_LIB.impl("aten::_log_softmax", _log_softmax_batch_invariant, dispatch_key)
     _batch_invariant_LIB.impl("aten::mean.dim", mean_batch_invariant, dispatch_key)
     # Also patch Transformer Engine kernels when available. Under te_native
-    # BOTH skips are set, so no TE kernel is substituted at all: GEMMs (dense
-    # and grouped) stay native under the starved workspace, and norms stay
-    # native under the 64-multiple alignment discipline. (The TE attention
+    # BOTH skips are set, so no TE kernel is substituted: dense GEMMs stay
+    # native under the starved workspace, device-metadata grouped GEMMs keep
+    # their required full workspace and use 256-row expert alignment, and norms
+    # stay native under the 64-multiple alignment discipline. (The TE attention
     # version gate is a separate standalone assert, not part of this patch.)
     if backend == "te_native":
         # te_native also keeps TE's NATIVE RMSNorm: its M%32 reduction

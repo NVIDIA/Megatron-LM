@@ -473,8 +473,6 @@ class TestSetupMxfp8TransformOnPlan:
             fp8 = "hybrid"
             fp8_recipe = "mxfp8"
             inference_grouped_gemm_backend = "flashinfer"
-            inference_mxfp8_include_parameters = r"decoder\.mlp\.experts\."
-            inference_mxfp8_exclude_parameters = None
 
         class _Model(nn.Module):
             def __init__(self):
@@ -484,13 +482,8 @@ class TestSetupMxfp8TransformOnPlan:
 
         captured = {}
 
-        def _quantize(
-            _decoder, *, backend, include_pattern=None, exclude_pattern=None, _filter_prefix=""
-        ):
+        def _quantize(_decoder, *, backend):
             captured["backend"] = backend
-            captured["include_pattern"] = include_pattern
-            captured["exclude_pattern"] = exclude_pattern
-            captured["filter_prefix"] = _filter_prefix
             return {}
 
         monkeypatch.setattr(refit, "quantize_params_to_mxfp8", _quantize)
@@ -498,9 +491,6 @@ class TestSetupMxfp8TransformOnPlan:
         plan = ReshardPlan(send_ops=[], recv_ops=[])
         refit._setup_mxfp8_transform_on_plan(plan, _Model())
         assert captured["backend"] == plan.transform.backend == "triton"
-        assert captured["include_pattern"] == _Config.inference_mxfp8_include_parameters
-        assert captured["exclude_pattern"] is None
-        assert captured["filter_prefix"] == "decoder."
 
 
 class TestRefitTensorCache:

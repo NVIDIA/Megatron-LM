@@ -29,29 +29,17 @@ from megatron.training.config.inference_config import InferenceSetupConfig
 
 
 class TestInferenceConfig:
-    @pytest.mark.parametrize(
-        ("name", "include", "exclude", "expected"),
-        [
-            ("decoder.layers.2.mlp.experts.linear_fc1.weight0", None, None, True),
-            (
-                "decoder.layers.2.mlp.experts.linear_fc1.weight0",
-                r"\.mlp\.experts\.linear_fc[12]\.",
-                None,
-                True,
-            ),
-            ("decoder.layers.2.self_attention.linear_qkv.weight", r"\.mlp\.experts\.", None, False),
-            (
-                "decoder.layers.2.mlp.experts.linear_fc2.weight0",
-                r"\.mlp\.experts\.",
-                r"linear_fc2",
-                False,
-            ),
-        ],
-    )
-    def test_mxfp8_parameter_filter(self, name, include, exclude, expected):
-        from megatron.core.inference.quantization.utils import matches_mxfp8_parameter_filter
+    @pytest.mark.parametrize("backend", list(InferenceGroupedGemmBackend))
+    def test_grouped_gemm_backend_parses_config_value(self, backend):
+        assert InferenceGroupedGemmBackend.from_config(backend.value) is backend
+        assert InferenceGroupedGemmBackend.from_config(backend) is backend
 
-        assert matches_mxfp8_parameter_filter(name, include, exclude) is expected
+    def test_grouped_gemm_backend_reports_supported_config_values(self):
+        with pytest.raises(
+            ValueError,
+            match="inference_grouped_gemm_backend must be one of.*'flashinfer'.*'torch'.*'vllm'",
+        ):
+            InferenceGroupedGemmBackend.from_config("unknown")
 
     @pytest.mark.parametrize(
         ("grouped_gemm_backend", "expected_backend"),

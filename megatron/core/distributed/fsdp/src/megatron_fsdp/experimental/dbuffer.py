@@ -82,18 +82,16 @@ class DBuffer:
         self,
         mesh: DeviceMesh,
         placements: Iterable[Placement],
-        tensor_shapes: Iterable[Shape],
+        layout: GlobalLayout,
         dtype: torch.dtype,
         device: torch.device | str,
-        *,
-        block_size: int = 1,
     ) -> None:
         """Create a DBuffer and allocate its local buffer.
 
         Args:
             mesh: Device mesh whose dimensions correspond to ``placements``.
             placements: Per-mesh-axis DBuffer placements.
-            tensor_shapes: Global shapes for each logical tensor in this buffer.
+            layout: Global shapes, offsets, and allocation size for this buffer.
             dtype: Dtype for the local buffer.
             device: Device for the local buffer.
         """
@@ -107,13 +105,29 @@ class DBuffer:
         self.mesh = mesh
         self.placements = placements
 
-        tensor_shapes = tuple(torch.Size(shape) for shape in tensor_shapes)
-        self.layout = GlobalLayout.build(
-            tensor_shapes, dp_size=self.mesh.size(), block_size=block_size
-        )
+        self.layout = layout
 
         self.offset, local_numel = self.layout.get_local_range(self.mesh, self.placements)
         self.local_buffer = torch.empty(local_numel, dtype=dtype, device=device)
+
+    @classmethod
+    def empty(
+        cls,
+        mesh: DeviceMesh,
+        placements: Iterable[Placement],
+        tensor_shapes: Iterable[Shape],
+        dtype: torch.dtype,
+        device: torch.device | str,
+        *,
+        block_size: int = 1,
+    ) -> "DBuffer":
+        """Build a layout from logical tensor shapes and allocate its local buffer."""
+        layout = GlobalLayout.build(
+            tuple(torch.Size(shape) for shape in tensor_shapes),
+            dp_size=mesh.size(),
+            block_size=block_size,
+        )
+        return cls(mesh, placements, layout, dtype, device)
 
     @property
     def dtype(self) -> torch.dtype:
@@ -290,7 +304,7 @@ class DBuffer:
                 raise ValueError("All tensors in a DBuffer must have the same dtype.")
 
         tensor_shapes = tuple(tensor.shape for tensor in tensors)
-        buffer = cls(
+        buffer = cls.empty(
             mesh=mesh,
             placements=placements,
             tensor_shapes=tensor_shapes,
@@ -330,10 +344,9 @@ class DBuffer:
             return DBuffer(
                 mesh=self.mesh,
                 placements=placements,
-                tensor_shapes=self.layout.tensor_shapes,
+                layout=self.layout,
                 dtype=dtype,
                 device=self.device,
-                block_size=self.layout.block_size,
             )
 
         if out.mesh != self.mesh:

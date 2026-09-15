@@ -437,7 +437,7 @@ class TestQuantizeParamsToMXFP8:
         assert "0.weight" in buffers and "1.weight" in buffers
         assert isinstance(buffers["0.weight"], MXFP8Tensor)
 
-    def test_parameter_filter_materializes_unmatched_weight_in_bf16(self):
+    def test_mixed_precision_conversion_preserves_bf16_parameter(self):
         from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
         from megatron.core.inference.quantization.utils import quantize_params_to_mxfp8
 
@@ -445,21 +445,24 @@ class TestQuantizeParamsToMXFP8:
         model.attention = torch.nn.Linear(128, 64, bias=False)
         model.mlp = torch.nn.Module()
         model.mlp.experts = torch.nn.Module()
+        model.mlp.experts.num_local_experts = 1
         model.mlp.experts.linear_fc1 = torch.nn.Linear(128, 64, bias=False)
+        model.mlp.experts.linear_fc2 = torch.nn.Linear(64, 128, bias=False)
         model.to(dtype=torch.bfloat16, device="cuda")
-        _pre_quantize_linear(model)
+        _pre_quantize_linear(model.mlp.experts)
+        original_attention = model.attention.weight
+        attention_value = original_attention.detach().clone()
 
-        buffers = quantize_params_to_mxfp8(
-            model,
-            backend="triton",
-            include_pattern=r"(^|\.)mlp\.experts\.linear_fc[12]\.",
-            _filter_prefix="decoder.",
-        )
+        buffers = quantize_params_to_mxfp8(model, backend="triton")
 
+        assert model.attention.weight is original_attention
+        assert torch.equal(model.attention.weight, attention_value)
         assert model.attention.weight.dtype == torch.bfloat16
         assert "attention.weight" not in buffers
         assert isinstance(model.mlp.experts.linear_fc1.weight, MXFP8Tensor)
+        assert isinstance(model.mlp.experts.linear_fc2.weight, MXFP8Tensor)
         assert "mlp.experts.linear_fc1.weight" in buffers
+        assert "mlp.experts.linear_fc2.weight" in buffers
 
 
 # ===========================================================================

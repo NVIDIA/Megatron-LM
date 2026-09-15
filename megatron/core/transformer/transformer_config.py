@@ -2,7 +2,7 @@
 
 import logging
 import math
-import re
+import os
 import warnings
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -599,7 +599,8 @@ class TransformerConfig(ModelParallelConfig):
     recompute_modules: Optional[List[str]] = None
     """The submodules to recompute.
     choices: "core_attn", "moe_act", "layernorm", "mla_up_proj", "mlp", "moe",
-    "shared_experts", "gdn_norm_out", "gdp_in_proj", "gdp_qkv", "mhc".
+    "shared_experts", "gdn_norm_out", "gdp_in_proj", "gdp_qkv", "mhc",
+    "shortcut_pre_mlp_layernorm".
     default: ["core_attn"].
     "core_attn": recompute the core attention part of the transformer layer.
     "moe_act": recompute the MoE MLP activation function.
@@ -615,9 +616,11 @@ class TransformerConfig(ModelParallelConfig):
     "mhc": recompute HyperConnection intermediate activations via
             CheckpointWithoutOutput + CheckpointWithoutOutputManager. Requires
             enable_mhc_connections=True. Cannot be used with "mlp".
+    "shortcut_pre_mlp_layernorm": recompute the shortcut router's input normalization.
+            Requires moe_shortcut_connection=True and selective recomputation.
     "moe_act", "layernorm", "mla_up_proj", "gdn_norm_out", "gdp_in_proj", "gdp_qkv", and
-    "mhc" use output-discarding checkpointing, "core_attn", "mlp", "moe", and
-    "shared_experts" use normal checkpointing.
+    "mhc" and "shortcut_pre_mlp_layernorm" use output-discarding checkpointing,
+    "core_attn", "mlp", "moe", and "shared_experts" use normal checkpointing.
     """
 
     ####################
@@ -770,6 +773,24 @@ class TransformerConfig(ModelParallelConfig):
     interleaved format. This is only effective when
     use_grouped_gemm_for_shared_expert is set.
     """
+    moe_shortcut_connection: bool = False
+    """Enable ScMoE shortcut-connected routing. When enabled, the MoE router and routed experts
+    process the preceding layer's output (via a shortcut connection) instead of the current layer's
+    post-attention representation, allowing the two layers to be run in parallel and hiding the MoE
+    layer's A2A coommuunication. Supported only by HybridStack and requires num_moe_experts > 0. 
+    CUDA graphs are not supported. For the first MoE layer (no preceding layer), falls back to 
+    standard routing."""
+
+    moe_shortcut_post_norm: bool = False
+    """Apply the configured normalization to the combined routed and shared expert output.
+    Requires moe_shortcut_connection = True."""
+
+    moe_shortcut_parallel: bool = False
+    """Overlap shortcut MoE All-to-All communication with paired Attention/Mamba compute.
+    Dispatch and combine collectives run on a side CUDA stream; routing, experts, and paired
+    compute remain on the main stream. Requires moe_shortcut_connection = True and
+    num_moe_experts > 0. Mutually exclusive with moe_shared_expert_overlap and unsupported with
+    full activation recomputation."""
 
     moe_layer_freq: Union[int, List[int]] = 1
     """Frequency between MoE layers and Dense layers. Accepts either:
@@ -986,6 +1007,12 @@ class TransformerConfig(ModelParallelConfig):
     moe_router_fusion: bool = False
     """Enable fusion for MoE TopK routing and aux-loss computation. This is only
     supported in TransformerEngine 2.7.0 and above.
+    """
+
+    moe_router_aux_loss_fusion: Optional[bool] = None
+    """Enable fusion for the MoE aux loss only, independently of the fused TopK routing.
+    ``None`` follows ``moe_router_fusion`` and is resolved to a concrete bool in
+    ``__post_init__``.
     """
 
     moe_apply_probs_on_input: bool = False
@@ -1321,21 +1348,6 @@ class TransformerConfig(ModelParallelConfig):
       grouped-GEMM path, allowing per-layer mixed BF16/MXFP8 policies.
     """
 
-    inference_mxfp8_include_parameters: str | None = None
-    """Regex selecting parameters to retain in MXFP8 for inference.
-
-    The regex is matched with ``re.search`` against fully qualified parameter names.
-    When unset, all MXFP8 parameters are included. Parameters not selected by this
-    regex are materialized in BF16 after checkpoint loading.
-    """
-
-    inference_mxfp8_exclude_parameters: str | None = None
-    """Regex selecting parameters to materialize in BF16 for MXFP8 inference.
-
-    Exclusion is applied after ``inference_mxfp8_include_parameters`` and therefore
-    takes precedence when both regexes match.
-    """
-
     inference_moe_disable_fused_quant_kernels: bool = False
     """When False (default), use fused kernels that combine permute/activation with
     MXFP8 quantization + swizzle into a single kernel launch. Only applies when
@@ -1439,7 +1451,8 @@ class TransformerConfig(ModelParallelConfig):
     offload_modules: Optional[list[str]] = field(default_factory=list)
     """The submodules to offload its input.
     choices: "attn_norm", "qkv_linear", "core_attn", "attn_proj",
-             "mlp_norm", "expert_fc1", "moe_act", "fused_group_mlp", "gdp_qkv".
+             "mlp_norm", "expert_fc1", "moe_act", "fused_group_mlp", "gdp_qkv",
+             "shortcut_post_norm".
     "attn_norm": offload the input of the normalization in the attention part.
     "qkv_linear": offload the input of the qkv linear part.
     "core_attn": offload the input of the core attention part.
@@ -1450,6 +1463,8 @@ class TransformerConfig(ModelParallelConfig):
     "fused_group_mlp": offload the input of the whole fused grouped MLP.
     "gdp_qkv": offload the input of the causal conv and QKV preparation in the
                GatedDeltaProduct mixer.
+    "shortcut_post_norm": offload the input of the shortcut output normalization.
+            Requires moe_shortcut_connection=True.
     """
     min_offloaded_tensor_size: int = 1024 * 1024
     """The minimum size of the tensor to be offloaded."""
@@ -1567,6 +1582,11 @@ class TransformerConfig(ModelParallelConfig):
                 "value there while FlashAttention ignores it entirely, and a non-finite cap "
                 "produces NaN logits."
             )
+
+        # Unset means "follow moe_router_fusion". Resolve it here so every consumer
+        # downstream reads a plain bool.
+        if self.moe_router_aux_loss_fusion is None:
+            self.moe_router_aux_loss_fusion = self.moe_router_fusion
 
         # Resolve deprecated attention variant spellings up front so that every consumer
         # downstream only has to handle the canonical names. Imported lazily because the
@@ -1801,43 +1821,10 @@ class TransformerConfig(ModelParallelConfig):
         if self.expert_model_parallel_size > 1 and self.num_moe_experts is None:
             raise ValueError("num_moe_experts must be non None to use expert-parallel.")
 
-        mxfp8_parameter_filters = (
-            self.inference_mxfp8_include_parameters,
-            self.inference_mxfp8_exclude_parameters,
-        )
-        if any(pattern is not None for pattern in mxfp8_parameter_filters):
-            if not (
-                self.transformer_impl == "inference_optimized"
-                and self.fp8
-                and self.fp8_recipe == Fp8Recipe.mxfp8
-                and self.fp8_param
-            ):
-                raise ValueError(
-                    "inference_mxfp8_include_parameters and "
-                    "inference_mxfp8_exclude_parameters require "
-                    "transformer_impl='inference_optimized', FP8 enabled with "
-                    "fp8_recipe='mxfp8', and fp8_param=True."
-                )
-            for pattern in mxfp8_parameter_filters:
-                if pattern is None:
-                    continue
-                try:
-                    re.compile(pattern)
-                except re.error as error:
-                    raise ValueError(
-                        f"Invalid MXFP8 parameter regex {pattern!r}: {error}"
-                    ) from error
-
         if self.transformer_impl == "inference_optimized" and self.num_moe_experts is not None:
-            try:
-                self.inference_grouped_gemm_backend = InferenceGroupedGemmBackend(
-                    self.inference_grouped_gemm_backend
-                )
-            except ValueError:
-                raise ValueError(
-                    "inference_grouped_gemm_backend must be 'flashinfer', 'torch', or "
-                    f"'vllm', got '{self.inference_grouped_gemm_backend}'"
-                )
+            self.inference_grouped_gemm_backend = InferenceGroupedGemmBackend.from_config(
+                self.inference_grouped_gemm_backend
+            )
 
             mxfp8_enabled = bool(self.fp8) and self.fp8_recipe == Fp8Recipe.mxfp8
             if self.expert_tensor_parallel_size > 1:
@@ -2064,6 +2051,49 @@ class TransformerConfig(ModelParallelConfig):
                         "single moe_flex_dispatcher_num_sms instead."
                     )
                 self.moe_flex_dispatcher_num_sms = next(iter(_deprecated_num_sms.values()))
+        shortcut_pre_norm_recompute = "shortcut_pre_mlp_layernorm" in (self.recompute_modules or [])
+        shortcut_post_norm_offload = "shortcut_post_norm" in (self.offload_modules or [])
+        if (shortcut_pre_norm_recompute or shortcut_post_norm_offload) and not (
+            self.moe_shortcut_connection
+        ):
+            raise ValueError(
+                "shortcut_pre_mlp_layernorm recompute and shortcut_post_norm offload require "
+                "moe_shortcut_connection=True."
+            )
+        if shortcut_pre_norm_recompute and self.recompute_granularity != "selective":
+            raise ValueError(
+                "shortcut_pre_mlp_layernorm in recompute_modules requires "
+                "recompute_granularity='selective'."
+            )
+
+        if self.moe_shortcut_connection:
+            assert (
+                self.num_moe_experts is not None and self.num_moe_experts > 0
+            ), "moe_shortcut_connection requires MoE to be enabled (num_moe_experts > 0)"
+            if self.recompute_granularity == 'full':
+                raise ValueError(
+                    "moe_shortcut_connection is not supported with full activation recomputation"
+                )
+            if self.moe_shared_expert_overlap:
+                raise ValueError(
+                    "moe_shortcut_connection is mutually exclusive with "
+                    "moe_shared_expert_overlap. ScMoE computes shared experts inline."
+                )
+
+        if self.moe_shortcut_post_norm and not self.moe_shortcut_connection:
+            raise ValueError("moe_shortcut_post_norm requires moe_shortcut_connection = True.")
+        if shortcut_post_norm_offload and not self.moe_shortcut_post_norm:
+            raise ValueError(
+                "shortcut_post_norm in offload_modules requires " "moe_shortcut_post_norm = True."
+            )
+
+        if self.moe_shortcut_parallel:
+            assert (
+                self.moe_shortcut_connection
+            ), "moe_shortcut_parallel requires moe_shortcut_connection = True"
+            assert (
+                self.num_moe_experts is not None and self.num_moe_experts > 0
+            ), "moe_shortcut_parallel requires MoE to be enabled (num_moe_experts > 0)"
 
         if self.moe_shared_expert_intermediate_size is not None:
             if self.moe_shared_expert_intermediate_size <= 0:
@@ -2209,6 +2239,7 @@ class TransformerConfig(ModelParallelConfig):
                     "gdp_in_proj",
                     "gdp_qkv",
                     "mhc",
+                    "shortcut_pre_mlp_layernorm",
                 }
                 invalid_modules = set(self.recompute_modules) - allowed_modules
                 assert not invalid_modules, (
@@ -2253,15 +2284,21 @@ class TransformerConfig(ModelParallelConfig):
                     )
 
             if self.fp8:
-                if "moe_act" in self.recompute_modules or "layernorm" in self.recompute_modules:
+                fp8_output_discarding_modules = {
+                    "moe_act",
+                    "layernorm",
+                    "shortcut_pre_mlp_layernorm",
+                }
+                if fp8_output_discarding_modules & set(self.recompute_modules):
                     if self.fp8_recipe == 'delayed':
                         raise ValueError(
-                            "Delayed scaling does not support moe_act and layernorm recompute "
-                            "for fp8."
+                            "Delayed scaling does not support moe_act, layernorm, or "
+                            "shortcut_pre_mlp_layernorm recompute for fp8."
                         )
                     if not is_te_min_version("2.6.0dev0"):
                         raise ValueError(
-                            "moe_act and layernorm recompute for fp8 needs "
+                            "moe_act, layernorm, and shortcut_pre_mlp_layernorm recompute for "
+                            "fp8 need "
                             "transformer-engine>=2.6.0dev0, "
                             f"but your version is {get_te_version()}."
                         )
@@ -2399,6 +2436,7 @@ class TransformerConfig(ModelParallelConfig):
                 "mlp_norm",
                 "qkv_linear",
                 "gdp_qkv",
+                "shortcut_post_norm",
             }
             invalid_modules = set(self.offload_modules) - allowed_modules
             assert not invalid_modules, (
@@ -3102,6 +3140,10 @@ class TransformerConfig(ModelParallelConfig):
             self.cuda_graph_impl == "full_iteration" and self.cuda_graph_modules
         ), 'cuda_graph_modules must be empty when cuda_graph_impl="full_iteration".'
 
+        assert not (
+            self.moe_shortcut_connection and self.cuda_graph_impl != "none"
+        ), "CUDA graphs are not supported with moe_shortcut_connection."
+
         if self.cuda_graph_impl != "none":
 
             if self.cpu_offloading and self.cuda_graph_impl != "full_iteration":
@@ -3552,14 +3594,32 @@ class TransformerConfig(ModelParallelConfig):
                         "Batch-invariant MoE training requires "
                         "moe_token_dispatcher_type='alltoall'."
                     )
+                    if self.batch_invariant_backend == "te_native":
+                        assert not (
+                            self.moe_use_grouped_tensor
+                            or bool(
+                                int(os.getenv("NVTE_GROUPED_LINEAR_USE_FUSED_GROUPED_GEMM", "0"))
+                            )
+                        ), (
+                            "Batch-invariant te_native requires legacy TE GroupedLinear. "
+                            "Set moe_use_grouped_tensor=False, "
+                            "use_transformer_engine_op_fuser=False, "
+                            "and NVTE_GROUPED_LINEAR_USE_FUSED_GROUPED_GEMM=0; device-metadata "
+                            "grouped GEMM requires a full workspace with unproven batch invariance."
+                        )
+                mxfp8_params_enabled = (
+                    bool(self.fp8)
+                    and self.fp8_recipe == Fp8Recipe.mxfp8
+                    and self.fp8_param
+                    and not self.fp4
+                )
                 # DeepGEMM is used by the "deepgemm"/"triton" backends, and by
-                # the torch inference grouped-GEMM path under any backend. The
-                # "te_native" backend with the vLLM inference backend (or the
-                # training path, where TE grouped GEMM stays native) does not
-                # need it.
+                # the torch inference path for BF16 experts. MXFP8 experts use
+                # torch scaled_grouped_mm directly and do not need DeepGEMM.
                 needs_deepgemm = self.batch_invariant_backend in ("deepgemm", "triton") or (
                     self.transformer_impl == "inference_optimized"
                     and self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.TORCH
+                    and not mxfp8_params_enabled
                 )
                 assert not needs_deepgemm or HAVE_DEEPGEMM_BF16, (
                     "batch_invariant_mode=True with MoE requires DeepGEMM with bf16 "
@@ -3567,20 +3627,36 @@ class TransformerConfig(ModelParallelConfig):
                     "this backend combination. "
                     "Install via `uv pip install -e .[batch_invariant]`."
                 )
-                flashinfer_mxfp8_supported = (
-                    self.transformer_impl == "inference_optimized"
-                    and self.inference_grouped_gemm_backend
-                    == InferenceGroupedGemmBackend.FLASHINFER
-                    and bool(self.fp8)
-                    and self.fp8_recipe == Fp8Recipe.mxfp8
-                    and self.fp8_param
-                    and not self.fp4
-                    and not self.gated_linear_unit
-                    and self.activation_func == squared_relu
-                )
-                assert flashinfer_mxfp8_supported or not (self.fp8 or self.fp4), (
-                    "Batch-invariant MoE supports BF16, or FlashInfer MXFP8 squared-ReLU "
-                    "experts with the inference-optimized transformer implementation."
+                squared_relu_or_swiglu = (
+                    not self.gated_linear_unit and self.activation_func == squared_relu
+                ) or (self.gated_linear_unit and self.activation_func == F.silu)
+                if self.transformer_impl == "inference_optimized":
+                    mxfp8_supported = mxfp8_params_enabled and (
+                        (
+                            self.inference_grouped_gemm_backend
+                            in (InferenceGroupedGemmBackend.TORCH, InferenceGroupedGemmBackend.VLLM)
+                            and squared_relu_or_swiglu
+                        )
+                        or (
+                            self.inference_grouped_gemm_backend
+                            == InferenceGroupedGemmBackend.FLASHINFER
+                            and not self.gated_linear_unit
+                            and self.activation_func == squared_relu
+                        )
+                    )
+                else:
+                    # The training policy uses TE GroupedLinear directly; the inference
+                    # backend selector is generation-only and therefore irrelevant here.
+                    mxfp8_supported = (
+                        mxfp8_params_enabled
+                        and self.moe_grouped_gemm
+                        and self.batch_invariant_backend == "te_native"
+                        and squared_relu_or_swiglu
+                    )
+                assert mxfp8_supported or not (self.fp8 or self.fp4), (
+                    "Batch-invariant MoE supports BF16; TE MXFP8 squared-ReLU/SwiGLU "
+                    "training experts; and Torch/vLLM MXFP8 squared-ReLU/SwiGLU "
+                    "or FlashInfer MXFP8 squared-ReLU inference experts."
                 )
                 assert not (self.moe_permute_fusion or self.moe_permute_fusion_into_hybridep), (
                     "Batch-invariant MoE requires the unfused permute/unpermute path so "

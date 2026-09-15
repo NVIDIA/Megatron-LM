@@ -734,6 +734,34 @@ def _te_general_gemm(*args, **kwargs):
     return te_general_gemm(*args, **kwargs)
 
 
+def test_te_native_rejects_device_metadata_grouped_gemm(monkeypatch):
+    """Never silently give a batch-variant grouped GEMM an unrestricted workspace."""
+    import transformer_engine.pytorch.cpp_extensions.gemm as te_gemm
+
+    if not hasattr(te_gemm, "_get_grouped_cublas_workspace"):
+        # Exercise the compatibility hook even with TE releases predating the
+        # device-metadata API used in production.
+        def _mock_grouped_workspace(device, layout):
+            del layout
+            return torch.empty(
+                te_gemm.get_cublas_workspace_size_bytes(), dtype=torch.uint8, device=device
+            )
+
+        monkeypatch.setattr(
+            te_gemm, "_get_grouped_cublas_workspace", _mock_grouped_workspace, raising=False
+        )
+
+    unrestricted_bytes = te_gemm.get_cublas_workspace_size_bytes()
+    original_grouped_workspace = te_gemm._get_grouped_cublas_workspace
+    with set_batch_invariant_mode(True, backend="te_native"):
+        assert te_gemm.get_cublas_workspace_size_bytes() == 1024
+        with pytest.raises(RuntimeError, match="moe_use_grouped_tensor=False"):
+            te_gemm._get_grouped_cublas_workspace(torch.cuda.current_device(), "TN")
+
+    assert te_gemm._get_grouped_cublas_workspace is original_grouped_workspace
+    assert te_gemm.get_cublas_workspace_size_bytes() == unrestricted_bytes
+
+
 # ============================================================================
 # Numerical Tests for General GEMM
 # ============================================================================

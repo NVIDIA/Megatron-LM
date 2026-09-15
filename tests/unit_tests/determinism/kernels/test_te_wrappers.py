@@ -173,18 +173,38 @@ class TestTEWrappers:
     @pytest.mark.internal
     @pytest.mark.launch_on_gb200
     @pytest.mark.skipif(not _IS_BLACKWELL, reason="MXFP8 parameter storage needs Blackwell")
-    def test_per_module_mxfp8_recipe_inherits_outer_model_init_policy(self):
-        """An execution-only override must preserve first/last-layer BF16 storage."""
+    @pytest.mark.parametrize(
+        ("recipe_storage", "global_recipe", "middle_uses_mxfp8"),
+        [
+            ({}, Fp8Recipe.mxfp8, True),
+            ({"inherit_model_init_context": True}, Fp8Recipe.mxfp8, True),
+            ({"fp8_param": False}, Fp8Recipe.mxfp8, False),
+            ({}, Fp8Recipe.tensorwise, False),
+        ],
+        ids=[
+            "automatic-inheritance",
+            "explicit-inheritance",
+            "explicit-bf16-override",
+            "mismatched-global-recipe",
+        ],
+    )
+    def test_per_module_mxfp8_recipe_model_init_policy(
+        self, recipe_storage, global_recipe, middle_uses_mxfp8
+    ):
+        """A matching global MXFP8 policy is inherited unless storage is explicit."""
+        training_recipe = {"fp8_quantization_recipe": "mxfp8", "override_quantized_autocast": True}
+        training_recipe.update(recipe_storage)
         recipe = RecipeConfig.from_config_dict(
             {
                 "configs": {
                     "mxfp8": {
                         "transformer_engine_config_type": "TEQuantizationParams",
-                        "training_recipe": {
-                            "fp8_quantization_recipe": "mxfp8",
-                            "override_quantized_autocast": True,
-                        },
-                    }
+                        "training_recipe": training_recipe,
+                    },
+                    "bf16": {
+                        "transformer_engine_config_type": "TEQuantizationParams",
+                        "training_recipe": {},
+                    },
                 },
                 "matchers": {
                     "routed_expert_fc1": {
@@ -192,7 +212,13 @@ class TestTEWrappers:
                         "type": "glob",
                         "pattern": "*mlp.experts.linear_fc1",
                         "enabled": True,
-                    }
+                    },
+                    "all_other_modules": {
+                        "config": "bf16",
+                        "type": "glob",
+                        "pattern": "*",
+                        "enabled": True,
+                    },
                 },
             }
         )
@@ -208,7 +234,7 @@ class TestTEWrappers:
             moe_grouped_gemm=True,
             add_bias_linear=False,
             fp8="hybrid",
-            fp8_recipe=Fp8Recipe.mxfp8,
+            fp8_recipe=global_recipe,
             fp8_param=True,
             quant_recipe=recipe,
             first_last_layers_bf16=True,
@@ -216,29 +242,39 @@ class TestTEWrappers:
             num_layers_at_end_in_bf16=1,
         )
 
-        def build(layer_number):
-            name = f"decoder.layers.{layer_number}.mlp.experts.linear_fc1"
+        def build(layer_number, module_path="mlp.experts.linear_fc1"):
+            name = f"decoder.layers.{layer_number}.{module_path}"
             with get_fp8_context(config, layer_number, is_init=True):
-                with pytest.warns(
-                    UserWarning, match="inherits the enclosing parameter-storage context"
-                ):
-                    return TEGroupedLinear(
-                        2,
-                        128,
-                        256,
-                        parallel_mode=None,
-                        config=config,
-                        init_method=init_method_normal(0.02),
-                        bias=False,
-                        skip_bias_add=False,
-                        is_expert=True,
-                        name=name,
-                    )
+                return TEGroupedLinear(
+                    2,
+                    128,
+                    256,
+                    parallel_mode=None,
+                    config=config,
+                    init_method=init_method_normal(0.02),
+                    bias=False,
+                    skip_bias_add=False,
+                    is_expert=True,
+                    name=name,
+                )
 
         edge = build(0)
         middle = build(1)
         assert not is_mxfp8tensor(edge.weight0)
-        assert is_mxfp8tensor(middle.weight0)
+        assert is_mxfp8tensor(middle.weight0) is middle_uses_mxfp8
+
+        # The catch-all recipe allocates BF16 directly even inside an MXFP8 layer.
+        # Checkpoint loading must preserve the parameter object and its exact BF16 values.
+        other = build(1, "mlp.shared_experts.linear_fc1")
+        for module in (edge, build(2), other):
+            parameter = module.weight0
+            assert not is_mxfp8tensor(parameter)
+            checkpoint = module.state_dict()
+            expected = torch.randn_like(parameter)
+            checkpoint["weight0"] = expected
+            module.load_state_dict(checkpoint)
+            assert module.weight0 is parameter
+            assert torch.equal(module.weight0, expected)
 
     @pytest.mark.parametrize("backend", ["fused", "flash"])
     def test_te_dot_product_attention_replays(self, backend, monkeypatch):
