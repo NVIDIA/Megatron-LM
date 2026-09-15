@@ -10,21 +10,18 @@ duplicated mode — and two reverse all_to_all stages scatter the result back to
 original shards. All collectives use the existing gtp_remat / tp process groups.
 """
 
-# Postpone annotation evaluation: the emerging-optimizers type aliases
-# (FP32MatmulPrecT, NSCoeffT, MuonScaleT) only exist when the try-import below
-# succeeds; without this, importing the module on an environment without
-# emerging-optimizers raised NameError at class definition instead of the
-# ImportError-shaped absence the callers guard against.
-from __future__ import annotations
-
 import contextlib
 import dataclasses
 import enum
 import logging
 import math
-from typing import Any, Callable, Literal, Optional
+from typing import Any, Callable, Literal
 
 import torch
+from emerging_optimizers import triton_kernels
+from emerging_optimizers.orthogonalized_optimizers.muon import MuonScaleT, get_muon_scale_factor
+from emerging_optimizers.orthogonalized_optimizers.muon_utils import NSCoeffT, newton_schulz
+from emerging_optimizers.utils import FP32MatmulPrecT, fp32_matmul_precision
 from torch.optim.optimizer import ParamsT
 
 from megatron.core.optimizer.emerging_optimizers import TensorParallelMuon
@@ -40,6 +37,8 @@ from megatron.core.utils import (
     get_pg_size,
     is_emerging_optimizers_min_version,
     log_single_rank,
+    nvtx_range_pop,
+    nvtx_range_push,
 )
 
 try:
@@ -50,16 +49,6 @@ except ImportError:  # GTP module unavailable (TransformerEngine too old): same 
         """True if ``param`` carries the GTP weight-remat shard tag."""
         return getattr(param, "is_gtp_weight_remat", False)
 
-
-try:
-    from emerging_optimizers import triton_kernels
-    from emerging_optimizers.orthogonalized_optimizers.muon import MuonScaleT, get_muon_scale_factor
-    from emerging_optimizers.orthogonalized_optimizers.muon_utils import NSCoeffT, newton_schulz
-    from emerging_optimizers.utils import FP32MatmulPrecT, fp32_matmul_precision
-
-    HAVE_EMERGING_OPTIMIZERS = True
-except ImportError:
-    HAVE_EMERGING_OPTIMIZERS = False
 
 __all__ = ["LayerShardedMuon", "ParamShardSpec", "ParamSharding", "tp_partition_dim"]
 
@@ -122,27 +111,20 @@ def _validate_ns_config(use_syrk: bool, ns_batch_size: int) -> None:
         )
 
 
-# Phase-level NVTX ranges. Kernel-name classification cannot separate the forward
-# from the reverse all_to_all, nor the momentum update from the weight update, so
-# the step is annotated explicitly. Phase granularity (a handful of pushes per
-# step, not per param) keeps the cost negligible. The CUDA probe is lazy (first
-# _phase call, cached) so importing the module never touches the CUDA runtime.
-_NVTX_ENABLED: "bool | None" = None
-
-
 @contextlib.contextmanager
 def _phase(name: str):
-    global _NVTX_ENABLED
-    if _NVTX_ENABLED is None:
-        _NVTX_ENABLED = torch.cuda.is_available()
-    if not _NVTX_ENABLED:
-        yield
-        return
-    torch.cuda.nvtx.range_push(f"lsmuon/{name}")
+    """Phase-level NVTX range (active only under ``--profile`` with ``--nvtx-ranges``).
+
+    Kernel-name classification cannot separate the forward from the reverse all_to_all,
+    nor the momentum update from the weight update, so the step is annotated explicitly;
+    a handful of ranges per step, not per param.
+    """
+    msg = f"lsmuon/{name}"
+    nvtx_range_push(msg)
     try:
         yield
     finally:
-        torch.cuda.nvtx.range_pop()
+        nvtx_range_pop(msg)
 
 
 class ParamSharding(enum.Enum):
@@ -359,10 +341,6 @@ class LayerShardedMuon(TensorParallelMuon):
             than two param groups or without CUDA. Requires the groups' domains to
             be disjoint; groups sharing a (gtp_remat, tp) domain are automatically
             serialized (NCCL forbids concurrent collectives on one communicator).
-        nesterov: Defaults to False here (the parent defaults to True) —
-            intentional: it matches the reference behavior the bitwise parity
-            suite was written against. Direct-API users swapping classes should
-            pass it explicitly; the config path always does.
         All other args: same as :class:`TensorParallelMuon`. In particular
             ``split_qkv`` / ``is_qkv_fn`` / ``qkv_split_shapes``, ``tp_mode`` and
             ``pg_collection`` only take effect on the paths that delegate to the
@@ -393,14 +371,14 @@ class LayerShardedMuon(TensorParallelMuon):
         momentum: float = 0.95,
         weight_decay: float = 0.01,
         *,
-        nesterov: bool = False,
+        nesterov: bool = True,
         fp32_matmul_prec: FP32MatmulPrecT = "medium",
         coefficient_type: NSCoeffT = "quintic",
         num_ns_steps: int = 5,
         scale_mode: MuonScaleT = "spectral",
         extra_scale_factor: float = 1.0,
-        gtp_remat_group: "torch.distributed.ProcessGroup | None",
-        tp_group: "torch.distributed.ProcessGroup | None" = None,
+        gtp_remat_group: torch.distributed.ProcessGroup | None,
+        tp_group: torch.distributed.ProcessGroup | None = None,
         ns_batch_size: int = 1,
         use_syrk: bool = False,
         concurrent_groups: bool = True,
@@ -408,7 +386,7 @@ class LayerShardedMuon(TensorParallelMuon):
         split_qkv: bool = False,
         is_qkv_fn: Callable[[torch.Tensor], bool] | None = None,
         qkv_split_shapes: list[int] | None = None,
-        pg_collection: Optional[ProcessGroupCollection] = None,
+        pg_collection: ProcessGroupCollection | None = None,
         tp_mode: Literal["blockwise", "duplicated", "distributed", "auto"] = "duplicated",
     ) -> None:
         if tp_mode == "layer_sharded":
@@ -466,9 +444,15 @@ class LayerShardedMuon(TensorParallelMuon):
         self.scale_mode = scale_mode
         self.extra_scale_factor = extra_scale_factor
         self.concurrent_groups = concurrent_groups
-        self._group_streams: "list | None" = None
-        # id(param) -> (g_home, t_home). Set via set_param_ns_homes().
+        self._group_streams: list | None = None
+        # id(param) -> (g_home, t_home). Set via set_param_ns_homes(); until then step()
+        # delegates to the parent.
         self._param_ns_homes: dict[int, tuple[int, int]] = {}
+        self._homes_set = False
+        # Warn-once flags for the log messages below.
+        self._warned_no_homes = False
+        self._warned_missing_homes = False
+        self._warned_shared_domain = False
         # param_group index -> (gtp_remat_group, tp_group), overriding the constructor
         # defaults. Set via set_group_process_groups().
         self._group_process_groups: dict[int, tuple] = {}
@@ -480,7 +464,6 @@ class LayerShardedMuon(TensorParallelMuon):
         # grad on some step safely trigger a rebuild. Metadata only, never buffers:
         # persistent exchange buffers would raise steady-state memory between steps.
         self._plans: dict[int, _GroupExchangePlan] = {}
-        self._warned_missing_homes = False
 
     def set_param_ns_homes(self, param_ns_homes: dict[int, tuple[int, int]]) -> None:
         """Set the NS home for each param (by id).
@@ -489,8 +472,11 @@ class LayerShardedMuon(TensorParallelMuon):
             param_ns_homes: Maps ``id(param)`` -> ``(g_home, t_home)``: the rank in
                 ``gtp_remat_group`` and in ``tp_group`` that runs NS for it. ``t_home`` is
                 ignored for params that are not TP-sharded and when ``tp_group`` is None.
+                An empty mapping is valid: params in single-rank domains run local
+                Newton-Schulz, any other routed param falls back to round-robin homes.
         """
         self._param_ns_homes = param_ns_homes
+        self._homes_set = True
         self._warned_missing_homes = False
         self._plans.clear()
 
@@ -508,6 +494,7 @@ class LayerShardedMuon(TensorParallelMuon):
                 size 1 / not available).
         """
         self._group_process_groups = group_process_groups
+        self._warned_shared_domain = False
         self._plans.clear()
 
     def _apply_update(self, p: torch.Tensor, update: torch.Tensor, lr: float) -> None:
@@ -516,10 +503,10 @@ class LayerShardedMuon(TensorParallelMuon):
         ``OrthogonalizedOptimizer.step()`` brackets every ``p.add_`` with
         ``pre_weight_update_fn_inplace`` / ``post_weight_update_fn_inplace``;
         this helper keeps layer sharding's overridden ``step()`` honouring them
-        too, and keeps the three update sites (replicated, two-stage, degenerate
-        domain) from diverging. No dtype cast on purpose: the base
-        class's ``p.add_(orth_grad, alpha=-lr)`` — the fifth path, taken by the
-        empty-homes fallback — computes the fused multiply-add in the promoted
+        too, and keeps the two update sites (replicated, routed) from diverging. No
+        dtype cast on purpose: the base class's ``p.add_(orth_grad, alpha=-lr)``
+        (the third path, taken by the no-homes fallback) computes the fused
+        multiply-add in the promoted
         precision and downcasts once on store, so casting here first would give
         bf16 params different rounding on the layer-sharded paths than on the
         fallback and than TensorParallelMuon's duplicated mode. TODO: forward
@@ -571,7 +558,7 @@ class LayerShardedMuon(TensorParallelMuon):
                     ns_by_k[chunk[0]] = orth
         return ns_by_k
 
-    def _param_group_streams(self) -> "list | None":
+    def _param_group_streams(self) -> list | None:
         """Per-group CUDA streams, or None when the groups must stay serialized.
 
         Concurrency requires the groups' communication domains to be disjoint:
@@ -590,7 +577,7 @@ class LayerShardedMuon(TensorParallelMuon):
             pgs = self._group_process_groups.get(group_index, (self.gtp_remat_group, self.tp_group))
             domain_keys.append((id(pgs[0]), id(pgs[1])))
         if len(set(domain_keys)) != len(domain_keys):
-            if not getattr(self, '_warned_shared_domain', False):
+            if not self._warned_shared_domain:
                 self._warned_shared_domain = True
                 log_single_rank(
                     logger,
@@ -613,20 +600,19 @@ class LayerShardedMuon(TensorParallelMuon):
         if closure is not None:
             raise ValueError("closure is not supported")
 
-        # Fall back to TensorParallelMuon when no assignment is set: all-gather +
-        # TP-aware full-matrix Newton-Schulz per param. Mathematically correct
-        # (unlike the pre-refactor base-Muon fallback, which silently degraded to
-        # local-shard NS), just redundant — every rank recomputes every matrix.
-        if not self._param_ns_homes:
-            if not getattr(self, '_warned_no_homes', False):
+        # Fall back to TensorParallelMuon until homes are set: all-gather + TP-aware
+        # full-matrix Newton-Schulz per param (with the groups from pg_collection).
+        # Mathematically correct, just redundant: every rank recomputes every matrix.
+        if not self._homes_set:
+            if not self._warned_no_homes:
                 self._warned_no_homes = True
                 log_single_rank(
                     logger,
                     logging.WARNING,
-                    "LayerShardedMuon: param_ns_homes is empty — falling back to "
-                    "TensorParallelMuon (per-param all-gather + full-matrix "
-                    "Newton-Schulz on every rank; correct but redundant). Call "
-                    "set_param_ns_homes() before step() to enable layer sharding.",
+                    "LayerShardedMuon: set_param_ns_homes() was never called; falling back "
+                    "to TensorParallelMuon (per-param all-gather + full-matrix "
+                    "Newton-Schulz on every rank; correct but redundant). Call it before "
+                    "step() to enable layer sharding.",
                 )
             return super().step(closure)
 
@@ -723,7 +709,7 @@ class LayerShardedMuon(TensorParallelMuon):
             tp_complete=by_tp_dim[None],
         )
 
-    def _step_groups(self, streams: "list | None", ready: "torch.cuda.Event | None") -> None:
+    def _step_groups(self, streams: list | None, ready: torch.cuda.Event | None) -> None:
         for group_index, group in enumerate(self.param_groups):
             if streams is not None:
                 # Wait for the backward that produced these grads, then run this
