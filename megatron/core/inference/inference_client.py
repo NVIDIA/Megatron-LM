@@ -269,6 +269,7 @@ class InferenceClient:
             list: The frames to send, in wire order.
         """
         media_meta, media_payload = split_multimodal_data(
+            # If multi_modal_data is already serialized, then this is an identity function.
             serialize_multimodal_data(multi_modal_data)
         )
         return [
