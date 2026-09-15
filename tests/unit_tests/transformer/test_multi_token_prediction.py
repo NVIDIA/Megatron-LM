@@ -125,6 +125,54 @@ class TestMultiTokenPredictionLayer:
         )
         return config, mtp_block_spec
 
+    @pytest.mark.parametrize("precision", ["fp8", "fp4"])
+    @pytest.mark.parametrize("explicit_tp_group", [True, False])
+    def test_quantized_checkpoint_uses_layer_tp_group(
+        self, monkeypatch, precision, explicit_tp_group
+    ):
+        """Quantized recompute uses the layer's TP group, with a legacy MPU fallback."""
+        tp_group = object()
+        global_reads = []
+        checkpoint_groups = []
+
+        def get_global_tp_group():
+            global_reads.append(True)
+            assert not explicit_tp_group, "explicit TP group must bypass global parallel_state"
+            return tp_group
+
+        def checkpoint(forward_func, distribute_saved_activations, get_rng_tracker, group, *args):
+            checkpoint_groups.append(group)
+            return forward_func(*args)
+
+        monkeypatch.setattr(
+            mtp_module.parallel_state, "get_tensor_model_parallel_group", get_global_tp_group
+        )
+        monkeypatch.setattr(
+            "megatron.core.extensions.transformer_engine.te_checkpoint", checkpoint
+        )
+        # Exercise the real checkpoint routing without initializing GPUs or process groups.
+        layer = types.SimpleNamespace(
+            config=types.SimpleNamespace(
+                fp8="e4m3" if precision == "fp8" else None,
+                fp8_recipe=mtp_module.Fp8Recipe.tensorwise,
+                fp4="e2m1" if precision == "fp4" else None,
+                distribute_saved_activations=False,
+                recompute_method="uniform",
+                recompute_num_layers=1,
+            ),
+            mtp_layer_pattern=None,
+            tp_group=tp_group if explicit_tp_group else None,
+            _proj_and_transformer_layer=lambda **kwargs: kwargs["hidden_states"],
+        )
+        hidden_states = torch.ones(2, 1, 8)
+        result = MultiTokenPredictionLayer._checkpointed_forward(
+            layer, hidden_states=hidden_states, decoder_input=torch.zeros_like(hidden_states)
+        )
+
+        assert result is hidden_states
+        assert checkpoint_groups == [tp_group]
+        assert len(global_reads) == (0 if explicit_tp_group else 1)
+
     def test_mtp_placement_uses_explicit_pipeline_group(self, monkeypatch):
         """An explicit PP group must avoid global MPU reads during model construction."""
 
