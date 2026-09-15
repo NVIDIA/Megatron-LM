@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import warnings
-from contextlib import nullcontext
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Callable, List, Optional, Union
 
@@ -15,10 +15,9 @@ from megatron.core.context_parallel import ContextParallelBatch, convert_cp_layo
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping, replace_prefix_for_sharding
 from megatron.core.enums import Fp8Recipe
-from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.inference.utils import InferenceMode
-from megatron.core.models.backends import BackendSpecProvider, LocalSpecProvider
+from megatron.core.models.backends import BackendSpecProvider, get_backend
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.utils import is_vp_last_stage
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -61,11 +60,6 @@ SUPPORTED_ATTN_MASK = [
     AttnMaskType.no_mask,
     AttnMaskType.padding_causal,
 ]
-
-if HAVE_TE:
-    from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
-else:
-    TESpecProvider = None
 
 from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
 
@@ -761,7 +755,7 @@ class MultiTokenPredictionLayerSubmodules:
 
 
 def get_mtp_layer_spec(
-    mtp_model_layer_spec: ModuleSpec, use_transformer_engine: bool
+    mtp_model_layer_spec: ModuleSpec, use_transformer_engine: bool, rms_norm: bool = False
 ) -> ModuleSpec:
     """Get the MTP layer spec.
 
@@ -770,20 +764,25 @@ def get_mtp_layer_spec(
     """
     return get_mtp_layer_spec_for_backend(
         mtp_model_layer_spec,
-        backend=TESpecProvider() if use_transformer_engine else LocalSpecProvider(),
+        backend=get_backend("transformer_engine" if use_transformer_engine else "local"),
+        rms_norm=rms_norm,
     )
 
 
 def get_mtp_layer_spec_for_backend(
-    mtp_model_layer_spec: ModuleSpec, backend: BackendSpecProvider
+    mtp_model_layer_spec: ModuleSpec, backend: BackendSpecProvider, rms_norm: bool = False
 ) -> ModuleSpec:
     """Get the MTP layer spec.
+
+    Args:
+        rms_norm: whether the model uses RMSNorm. Must match ``config.normalization``: a
+            backend may answer with a LayerNorm-only kernel that refuses an RMSNorm config.
 
     Returns:
         ModuleSpec: Module specification with modules from the backend.
     """
     column_parallel_linear_impl: type = backend.column_parallel_linear()
-    layer_norm_impl = backend.layer_norm()
+    layer_norm_impl = backend.layer_norm(rms_norm=rms_norm)
     mtp_layer_spec = ModuleSpec(
         module=MultiTokenPredictionLayer,
         submodules=MultiTokenPredictionLayerSubmodules(
@@ -1426,6 +1425,14 @@ class MultiTokenPredictionLayer(MegatronModule):
                 setattr(self.hc_head_base, "sequence_parallel", True)
                 setattr(self.hc_head_scale, "sequence_parallel", True)
         self.offload_context = nullcontext()
+
+    def get_inner_quantization_context(self) -> AbstractContextManager:
+        """Return the quantization context for fine-grained MTP execution."""
+        if self.config.fp8 and self.config.fp8_recipe != Fp8Recipe.delayed:
+            return get_fp8_context(self.config)
+
+        # FP4 in MTP layers still needs numerical validation.
+        return nullcontext()
 
     def _get_embeddings(
         self,
@@ -2175,6 +2182,13 @@ class MultiTokenPredictionBlock(MegatronModule):
 
         self._build_layers(pg_collection)
         assert len(self.layers) > 0, "MultiTokenPredictionBlock must have at least one layer."
+
+        if self.mtp_use_repeated_layer:
+            # One layer object, called once per MTP depth, every call adding into the same
+            # main_grad. A True would make one of those calls overwrite instead of add.
+            for m in self.layers.modules():
+                if hasattr(m, 'is_first_microbatch'):
+                    m.is_repeated_layer = True
         self.cp_group = pg_collection.cp
         self.tp_group = pg_collection.tp
         self.tp_cp_group = getattr(pg_collection, 'tp_cp', None)
