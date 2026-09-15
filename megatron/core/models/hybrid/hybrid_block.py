@@ -1109,6 +1109,7 @@ class HybridStack(MegatronModule):
                         config=self.config,
                         layer_number=layer_number,
                         pg_collection=pg_collection,
+                        is_mtp_layer=is_mtp_layer,
                         add_layer_offset=False,
                         name=(name + f".layers.{i}") if name is not None else None,
                     )
@@ -1129,6 +1130,7 @@ class HybridStack(MegatronModule):
                         config=self.config,
                         layer_number=layer_number,
                         pg_collection=pg_collection,
+                        is_mtp_layer=is_mtp_layer,
                         # Set to False as we do not want to change offset.
                         add_layer_offset=False,
                         name=(name + f".layers.{i}") if name is not None else None,
@@ -1139,6 +1141,7 @@ class HybridStack(MegatronModule):
                         config=self.config,
                         layer_number=layer_number,
                         pg_collection=pg_collection,
+                        is_mtp_layer=is_mtp_layer,
                         add_layer_offset=False,
                         name=(name + f".layers.{i}") if name is not None else None,
                     )

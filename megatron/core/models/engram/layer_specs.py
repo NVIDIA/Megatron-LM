@@ -85,7 +85,7 @@ def apply_engram_to_hybrid_stack_spec(
     Layer selection itself stays in TransformerLayer, which builds the module only for the
     configured global layer numbers.
     """
-    from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols, parse_hybrid_pattern
+    from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
 
     if not isinstance(spec, ModuleSpec) or spec.submodules is None:
         raise TypeError(f"Unsupported hybrid stack spec for Engram: {type(spec).__name__}.")
@@ -95,15 +95,9 @@ def apply_engram_to_hybrid_stack_spec(
     # so the wrapper itself adds the memory residual to the n-stream tensor before its read gate
     # and tells the wrapped layer to skip its own injection (skip_engram).
 
-    if parse_hybrid_pattern(hybrid_layer_pattern).mtp_num_depths > 0:
-        # The nested MTP stack is built from these same submodules, and HybridStack omits
-        # is_mtp_layer when it builds '-', 'G' and 'K' layers, so TransformerLayer cannot tell
-        # an MTP layer from a decoder layer there and would build a second, unconfigured memory
-        # at the matching MTP-local layer number.
-        raise ValueError(
-            "Engram does not support multi-token prediction on the hybrid path, because the "
-            "MTP stack shares the decoder's layer submodules."
-        )
+    # Multi-token prediction is supported: the nested MTP stack is built from these same
+    # submodules, and HybridStack passes is_mtp_layer for every layer type, so
+    # TransformerLayer never builds a memory at an MTP-local layer number.
 
     field_for_symbol = {
         Symbols.MAMBA: "mamba_layer",

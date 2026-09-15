@@ -10,6 +10,7 @@ from megatron.core.models.engram import apply_engram_to_hybrid_stack_spec
 from megatron.core.models.engram.config import EngramConfig
 from megatron.core.models.engram.engram import Engram
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
+from megatron.core.transformer.identity_op import IdentityOp
 
 from ._test_utils import write_tokenizer_map
 
@@ -81,11 +82,13 @@ def test_pipeline_separators_and_mtp_do_not_shift_layer_numbering(tmp_path):
         _apply(tmp_path, None, layer_ids=(2,))
 
 
-def test_multi_token_prediction_is_rejected(tmp_path):
-    # The nested MTP stack is built from these same submodules, and HybridStack drops
-    # is_mtp_layer for '-', 'G' and 'K', so an MTP layer would build a second memory.
-    with pytest.raises(ValueError, match="multi-token prediction on the hybrid path"):
-        _apply(tmp_path, "M*M*/M-", layer_ids=(2,))
+def test_multi_token_prediction_is_accepted(tmp_path):
+    # The nested MTP stack is built from these same submodules; HybridStack passes
+    # is_mtp_layer for every layer type, and TransformerLayer skips the memory on MTP layers,
+    # so the decoder layer IDs keep their meaning and no second memory is built.
+    spec = _apply(tmp_path, "M*M*/M-", layer_ids=(2,))
+    assert spec.submodules.attention_layer.submodules.engram.module is Engram
+    assert spec.submodules.mlp_layer.submodules.engram is IdentityOp
 
 
 def test_hyper_connections_are_accepted(tmp_path):
