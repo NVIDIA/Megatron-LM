@@ -52,7 +52,13 @@ from megatron.core.post_training.modelopt.checkpointing import (
 )
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.tokenizers import MegatronTokenizer
-from megatron.core.utils import get_pg_rank, get_pg_size, unwrap_model
+from megatron.core.utils import (
+    get_pg_rank,
+    get_pg_size,
+    grant_shape_mismatch_for_gtp_padding,
+    resolve_gtp_pad_for_alignment,
+    unwrap_model,
+)
 from megatron.training.argument_utils import _default_config_from_args
 from megatron.training.config import TokenizerConfig
 from megatron.training.global_vars import get_tokenizer
@@ -1974,7 +1980,6 @@ def _load_global_dist_base_checkpoint(
         )
     if checkpointing_context is not None:
         checkpointing_context['load_strategy'] = load_strategy
-    from megatron.core.utils import infer_gtp_allow_shape_mismatch, resolve_gtp_pad_for_alignment
 
     # Computed fresh, not from GTP_CONFIG (only set when GTP is active): a non-GTP run may still
     # load a checkpoint saved with GTP padding and needs this to recognize it as padding.
@@ -1983,7 +1988,7 @@ def _load_global_dist_base_checkpoint(
         fp8_recipe=getattr(args, 'fp8_recipe', None),
         fp8=getattr(args, 'fp8', None) is not None,
     )
-    infer_gtp_allow_shape_mismatch(sharded_state_dict, checkpoint_name, gtp_pad_for_alignment)
+    grant_shape_mismatch_for_gtp_padding(sharded_state_dict, checkpoint_name, gtp_pad_for_alignment)
     state_dict = dist_checkpointing.load(
         sharded_state_dict,
         checkpoint_name,

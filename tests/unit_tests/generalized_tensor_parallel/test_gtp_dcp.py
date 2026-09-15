@@ -451,7 +451,7 @@ def _worker_helper_padded_inproj_pad_case(rank, world_size, port):
     )
     st = sharded["weight"]
     # Helper saves the padded global. Cross-topology portability (allow_shape_mismatch) is
-    # decided later, at load time, by infer_gtp_allow_shape_mismatch -- it's a save-time
+    # decided later, at load time, by grant_shape_mismatch_for_gtp_padding -- it's a save-time
     # no-op regardless, so it's not baked in here.
     assert (
         st.global_shape[0] == dim0_padded
@@ -465,7 +465,7 @@ def _worker_helper_cross_topology_reshard_metadata(rank, world_size, port):
     Can't run a real DCP save/load against itself in one torchrun (needs separate worlds), but we
     can verify the saved global_shape covers any compatible load-side topology (>= unpadded
     original). allow_shape_mismatch, the other half of the contract, is decided later at load
-    time by infer_gtp_allow_shape_mismatch, not baked in here.
+    time by grant_shape_mismatch_for_gtp_padding, not baked in here.
     """
     update_gtp_config(pad_for_alignment=16)
     dim0_unpadded = 1160
@@ -1467,14 +1467,14 @@ def _worker_cross_gtp_degree_save_load_roundtrip(rank, world_size, ckpt_base):
     """Regression: a checkpoint saved at one GTP degree must still load at a different one, even
     when only one side pads. Small-scale mirror of GTP64(pads 3072->4096)/GTP8(no pad) with
     pad_for_alignment=32, dim0=192: saves at gtp_remat_size=4 (pads 192->256), loads at
-    gtp_remat_size=2 (no pad needed). infer_gtp_allow_shape_mismatch, called right before
+    gtp_remat_size=2 (no pad needed). grant_shape_mismatch_for_gtp_padding, called right before
     load() (as production does), recognizes 256 as padding of true dim0=192 and sets
     allow_shape_mismatch=True, so DCP's overlap-copy completes the load with correct data -- even
     though the load-side shard grid doesn't line up with the save-side one (GTP2 rank 0 spans real
     data written by both GTP4 rank 0 and rank 1).
     """
     from megatron.core.dist_checkpointing import load, save
-    from megatron.core.utils import infer_gtp_allow_shape_mismatch
+    from megatron.core.utils import grant_shape_mismatch_for_gtp_padding
     from tests.unit_tests.dist_checkpointing import TempNamedDir
 
     update_gtp_config(pad_for_alignment=32)  # mxfp8-like alignment
@@ -1530,7 +1530,7 @@ def _worker_cross_gtp_degree_save_load_roundtrip(rank, world_size, ckpt_base):
             save(sharded_save, ckpt_dir)
             # THE FIX: without this, allow_shape_mismatch stays False (pad_length==0 here) and
             # strict validation raises comparing the checkpoint's 256 against the expected 192.
-            infer_gtp_allow_shape_mismatch(sharded_load, ckpt_dir, pad_for_alignment=32)
+            grant_shape_mismatch_for_gtp_padding(sharded_load, ckpt_dir, pad_for_alignment=32)
             assert sharded_load["weight"].allow_shape_mismatch is True
             # Pre-fix: raises CheckpointingException("Global shape mismatch ... (256) vs (192)").
             loaded = load(sharded_load, ckpt_dir)
@@ -1545,14 +1545,14 @@ def _worker_cross_gtp_degree_save_load_roundtrip(rank, world_size, ckpt_base):
 
 
 def _worker_restrict_shape_mismatch_to_explainable_padding(rank, world_size, ckpt_base):
-    """infer_gtp_allow_shape_mismatch sets allow_shape_mismatch from whether the
+    """grant_shape_mismatch_for_gtp_padding sets allow_shape_mismatch from whether the
     checkpoint-vs-expected difference is caused by GTP padding: OFF for a mismatch that isn't
     (catches a wrong checkpoint DCP would otherwise silently accept), ON for one that is --
     including for a plain non-GTP tensor, closing the GTP-saved -> non-GTP-loaded gap where that
     consumer previously had no signal at all.
     """
     from megatron.core.dist_checkpointing import save
-    from megatron.core.utils import infer_gtp_allow_shape_mismatch
+    from megatron.core.utils import grant_shape_mismatch_for_gtp_padding
     from tests.unit_tests.dist_checkpointing import TempNamedDir
 
     pad_for_alignment = 32  # mxfp8-like alignment
@@ -1594,7 +1594,7 @@ def _worker_restrict_shape_mismatch_to_explainable_padding(rank, world_size, ckp
                 dim0, in_features, legit_group, replica_group=trivial_replica_group
             )
             sharded_legit = _wrap(weight_legit, "weight")
-            infer_gtp_allow_shape_mismatch(sharded_legit, ckpt_dir, pad_for_alignment)
+            grant_shape_mismatch_for_gtp_padding(sharded_legit, ckpt_dir, pad_for_alignment)
             assert (
                 sharded_legit["weight"].allow_shape_mismatch is True
             ), "padding-caused shape difference (256 vs dim0_unpadded=192) must NOT be restricted"
@@ -1606,7 +1606,7 @@ def _worker_restrict_shape_mismatch_to_explainable_padding(rank, world_size, ckp
                 300, in_features, legit_group, replica_group=trivial_replica_group
             )
             sharded_bogus = _wrap(weight_bogus, "weight")
-            infer_gtp_allow_shape_mismatch(sharded_bogus, ckpt_dir, pad_for_alignment)
+            grant_shape_mismatch_for_gtp_padding(sharded_bogus, ckpt_dir, pad_for_alignment)
             assert sharded_bogus["weight"].allow_shape_mismatch is False, (
                 "unexplainable shape discrepancy (declared=256 < dim0_unpadded=300) must stay "
                 "strictly validated, never granted a mismatch-tolerant bypass"
@@ -1626,7 +1626,7 @@ def _worker_restrict_shape_mismatch_to_explainable_padding(rank, world_size, ckp
             assert (
                 sharded_plain["weight"].allow_shape_mismatch is False
             ), "a plain non-GTP tensor must never get allow_shape_mismatch from the GTP branch"
-            infer_gtp_allow_shape_mismatch(sharded_plain, ckpt_dir, pad_for_alignment)
+            grant_shape_mismatch_for_gtp_padding(sharded_plain, ckpt_dir, pad_for_alignment)
             assert sharded_plain["weight"].allow_shape_mismatch is True, (
                 "GTP-saved (256) -> non-GTP-loaded (192) is explainable padding and must be "
                 "reconciled to allow_shape_mismatch=True, closing the non-GTP load gap"
@@ -1652,7 +1652,7 @@ def _worker_restrict_shape_mismatch_to_explainable_padding(rank, world_size, ckp
             assert getattr(weight_gtp_load, "pad_length", 0) == 28, weight_gtp_load.pad_length
             sharded_gtp_load = _wrap(weight_gtp_load, "weight_unaligned")
             assert sharded_gtp_load["weight_unaligned"].global_shape[0] == 128
-            infer_gtp_allow_shape_mismatch(sharded_gtp_load, ckpt_dir2, pad_for_alignment)
+            grant_shape_mismatch_for_gtp_padding(sharded_gtp_load, ckpt_dir2, pad_for_alignment)
             assert sharded_gtp_load["weight_unaligned"].allow_shape_mismatch is True, (
                 "declared0 (100) == dim0_unpadded (100) must always count as valid padding, even "
                 "though 100 is not itself a multiple of pad_for_alignment"
@@ -1677,7 +1677,7 @@ def _worker_restrict_shape_mismatch_to_explainable_padding(rank, world_size, ckp
                 "weight_vocab_like",
                 allow_shape_mismatch=True,  # e.g. what VocabParallelEmbedding sets
             )
-            infer_gtp_allow_shape_mismatch(sharded_vocab_load, ckpt_dir3, pad_for_alignment)
+            grant_shape_mismatch_for_gtp_padding(sharded_vocab_load, ckpt_dir3, pad_for_alignment)
             assert sharded_vocab_load["weight_vocab_like"].allow_shape_mismatch is True, (
                 "a pre-set allow_shape_mismatch=True (non-GTP reason) must never be clobbered, "
                 "even when the shape difference (50 vs 80) doesn't look like GTP padding"
@@ -1698,7 +1698,7 @@ def _worker_restrict_shape_mismatch_to_explainable_padding(rank, world_size, ckp
                 torch.zeros(150, in_features, dtype=torch.bfloat16, device="cuda")
             )
             sharded_incompatible_load = _wrap(weight_expected, "weight_incompatible")
-            infer_gtp_allow_shape_mismatch(sharded_incompatible_load, ckpt_dir4, 1)
+            grant_shape_mismatch_for_gtp_padding(sharded_incompatible_load, ckpt_dir4, 1)
             assert sharded_incompatible_load["weight_incompatible"].allow_shape_mismatch is False, (
                 "declared0=200 vs expected0=150 at pad_for_alignment=1 is a genuine shape "
                 "mismatch, not GTP padding -- must stay strictly validated"
@@ -1719,7 +1719,7 @@ def _worker_restrict_shape_mismatch_to_explainable_padding(rank, world_size, ckp
             "megatron.core.dist_checkpointing.serialization.load_tensors_metadata",
             return_value=fake_metadata,
         ):
-            infer_gtp_allow_shape_mismatch(sharded_layer_load, "unused", pad_for_alignment)
+            grant_shape_mismatch_for_gtp_padding(sharded_layer_load, "unused", pad_for_alignment)
         assert sharded_layer_load["layer.weight"].allow_shape_mismatch is True, (
             "prepended-axis padding (declared dim0=256 vs expected dim0=192) must be "
             "recognized via prepend_axis_num, not silently no-op'd by comparing num_layers"

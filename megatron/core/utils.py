@@ -1137,7 +1137,7 @@ def make_tp_sharded_tensor_for_checkpoint(
         # sharding / loading for non-trivial parameters like SwiGLU.
         sharded_tensor.is_torch_fsdp2_param = is_torch_fsdp2_param
     # Plain attribute (not a ShardedTensor field, so DCP never serializes it): global_shape minus
-    # this gives the true unpadded dim0. Read later by infer_gtp_allow_shape_mismatch.
+    # this gives the true unpadded dim0. Read later by grant_shape_mismatch_for_gtp_padding.
     sharded_tensor.gtp_pad_length = gtp_pad_length
     return sharded_tensor
 
@@ -1160,7 +1160,7 @@ def resolve_gtp_pad_for_alignment(*, fp4=False, fp8_recipe=None, fp8=False):
     return 1
 
 
-def infer_gtp_allow_shape_mismatch(sharded_state_dict, checkpoint_dir, pad_for_alignment):
+def grant_shape_mismatch_for_gtp_padding(sharded_state_dict, checkpoint_dir, pad_for_alignment):
     """Decide, per tensor, whether a checkpoint-vs-expected shape mismatch is GTP padding.
 
     Reads the checkpoint's real on-disk shape and sets ``allow_shape_mismatch`` for every
@@ -1188,8 +1188,12 @@ def infer_gtp_allow_shape_mismatch(sharded_state_dict, checkpoint_dir, pad_for_a
         from megatron.core.dist_checkpointing.serialization import load_tensors_metadata
 
         checkpoint_metadata = load_tensors_metadata(str(checkpoint_dir))
-    except Exception:  # noqa: BLE001
-        return  # can't read metadata -> leave flags as-is, don't block the load on this check
+    except Exception as e:  # noqa: BLE001
+        logger.warning(
+            f"grant_shape_mismatch_for_gtp_padding: could not read metadata, "
+            f"skipping GTP padding check: {e}"
+        )
+        return
 
     for sh_ten in sharded_tensors:
         if sh_ten.allow_shape_mismatch:
