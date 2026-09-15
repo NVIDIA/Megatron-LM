@@ -52,6 +52,13 @@ Checked against the parsed `args` Namespace in `apply_determinism_to_args`. Inco
 
 Flash attention is permitted: Transformer Engine's flash-attention backend is deterministic when `NVTE_ALLOW_NONDETERMINISTIC_ALGO=0` (see the [Transformer Engine docs](https://docs.nvidia.com/deeplearning/transformer-engine/api/pytorch.html)).
 
+GDN and GDN2 use a torch-native query/key L2 normalization in deterministic mode,
+in addition to their native convolution and recurrence paths. FLA's normalization
+autotuner can select reduction layouts with different rounding between processes.
+The native path preserves additive epsilon, FP32 intermediate computation, and
+FLA's backward formula using the normalized output rounded to the input dtype.
+Training without deterministic mode continues to use the optimized FLA path.
+
 ## Uninitialized-memory fill
 
 Determinism costs an *independent* output buffer: a reduction that would otherwise accumulate into shared memory with unordered atomics writes into its own buffer instead, fixing the summation order run to run. That is what makes training reproducible, and `--deterministic-mode` keeps it.
