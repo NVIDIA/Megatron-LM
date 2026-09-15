@@ -9,7 +9,7 @@ import torch
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnMaskType
-from megatron.core.transformer.experimental_attention_variant.csa import (
+from megatron.core.ops.attention.csa.modules import (
     CSA_OPERATION_DETERMINISM,
     CompressedSparseAttention,
     CompressedSparseAttentionSubmodules,
@@ -26,7 +26,7 @@ from megatron.core.transformer.experimental_attention_variant.csa import (
     get_window_topk_idxs,
     unfused_compressed_sparse_attn,
 )
-from megatron.core.transformer.experimental_attention_variant.dsa import (
+from megatron.core.ops.attention.dsa.modules import (
     FusedDSAIndexerLoss,
     compute_dsa_indexer_loss,
     fused_qk_topk_naive,

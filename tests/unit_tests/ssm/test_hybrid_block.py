@@ -25,10 +25,8 @@ from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.attention import SelfAttention
 from megatron.core.transformer.attention_layer_config import AttentionLayerConfig
-from megatron.core.transformer.experimental_attention_variant.absorbed_mla import (
-    AbsorbedMLASelfAttention,
-)
-from megatron.core.transformer.experimental_attention_variant.dsa import DSAttention
+from megatron.core.ops.attention.mla import AbsorbedMLASelfAttention
+from megatron.core.ops.attention.dsa.modules import DSAttention
 from megatron.core.transformer.mla_layer_config import MLALayerConfig
 from megatron.core.transformer.mlp import MLP
 from megatron.core.transformer.multi_latent_attention import MLASelfAttention

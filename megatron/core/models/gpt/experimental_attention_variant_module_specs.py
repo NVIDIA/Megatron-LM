@@ -9,14 +9,12 @@ from megatron.core.ops.ssm.gated_delta.gdn import GatedDeltaNet
 from megatron.core.ops.ssm.gated_delta.gdn2 import GatedDeltaNet2
 from megatron.core.ops.ssm.gated_delta.common import GatedDeltaNetSubmodules
 from megatron.core.transformer.enums import AttnMaskType, LayerType
-from megatron.core.transformer.experimental_attention_variant import (
-    deepseek_v4_hybrid_attention_module_specs as dsv4_hybrid_specs,
-)
-from megatron.core.transformer.experimental_attention_variant.absorbed_mla import (
+from megatron.core.models.gpt import deepseek_v4_hybrid_attention_module_specs as dsv4_hybrid_specs
+from megatron.core.ops.attention.mla import (
     AbsorbedMLASelfAttention,
     AbsorbedMLASelfAttentionSubmodules,
 )
-from megatron.core.transformer.experimental_attention_variant.dsa import (
+from megatron.core.ops.attention.dsa.modules import (
     DSAIndexer,
     DSAIndexerSubmodules,
     DSAttention,

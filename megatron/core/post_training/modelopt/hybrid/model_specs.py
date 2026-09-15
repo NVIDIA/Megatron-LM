@@ -15,7 +15,7 @@ from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParall
 from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
 from megatron.core.transformer.dot_product_attention import DotProductAttention
 from megatron.core.transformer.enums import AttnMaskType
-from megatron.core.transformer.experimental_attention_variant.dsa import (
+from megatron.core.ops.attention.dsa.modules import (
     DSAIndexer,
     DSAIndexerSubmodules,
     DSAttention,

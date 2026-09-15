@@ -7,21 +7,8 @@ import pytest
 import torch
 
 from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.core.transformer.experimental_attention_variant import (
-    dsa_indexer_loss,
-    dsa_masking,
-    dsa_tilelang_kernels,
-)
-from megatron.core.transformer.experimental_attention_variant.ops import (
-    indexer,
-    sparse_mla,
-    tilelang_dsa,
-    tilelang_indexer_bwd,
-    tilelang_indexer_fwd,
-    tilelang_indexer_loss,
-    tilelang_sparse_mla_bwd,
-    tilelang_utils,
-)
+from megatron.core.ops.attention.dsa import dsa_indexer_loss, dsa_masking, dsa_tilelang_kernels
+from megatron.core.ops.attention.dsa.kernels import indexer, sparse_mla, tilelang_dsa, tilelang_indexer_bwd, tilelang_indexer_fwd, tilelang_indexer_loss, tilelang_sparse_mla_bwd, tilelang_utils
 
 
 def test_run_fused_qk_topk_forwards_to_tilelang_backend(monkeypatch):

@@ -17,11 +17,9 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnMaskType
-from megatron.core.transformer.experimental_attention_variant import dsa_indexer_loss, dsa_kernels
-from megatron.core.transformer.experimental_attention_variant.absorbed_mla import (
-    AbsorbedMLASelfAttention,
-)
-from megatron.core.transformer.experimental_attention_variant.dsa import (
+from megatron.core.ops.attention.dsa import dsa_indexer_loss, dsa_kernels
+from megatron.core.ops.attention.mla import AbsorbedMLASelfAttention
+from megatron.core.ops.attention.dsa.modules import (
     DSAIndexer,
     DSAIndexerLossAutoScaler,
     DSAIndexerSubmodules,
@@ -40,14 +38,14 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
     source_dsa_compute_layer,
     unfused_dsa_fn,
 )
-from megatron.core.transformer.experimental_attention_variant.dsa_layout import (
+from megatron.core.ops.attention.dsa.dsa_layout import (
     build_packed_allgather_cp_local_positions,
     build_packed_allgather_cp_query_positions_and_key_reorder,
     build_zigzag_allgather_cp_key_reorder,
     extract_query_positions_from_position_ids,
     get_cp_positions_from_layout,
 )
-from megatron.core.transformer.experimental_attention_variant.dsa_masking import (
+from megatron.core.ops.attention.dsa.dsa_masking import (
     build_causal_mask_from_positions,
     build_dsattention_forward_mask,
     build_fused_indexer_varlen_bounds,

@@ -807,9 +807,7 @@ class _MLAQKNormTestBase:
     def _get_mla_attention(self, model):
         """Return the attention submodule for the selected MLA variant, or None."""
         if self.experimental_attention_variant == "dsa":
-            from megatron.core.transformer.experimental_attention_variant.absorbed_mla import (
-                AbsorbedMLASelfAttention,
-            )
+            from megatron.core.ops.attention.mla import AbsorbedMLASelfAttention
 
             attention_cls = AbsorbedMLASelfAttention
         else:
@@ -1184,9 +1182,7 @@ class TestMLADownProjFusion:
 
     def test_enabled_leaves_dsa_layer_alone(self):
         """MLA fusion must not rewrite the absorbed DSA attention specification."""
-        from megatron.core.transformer.experimental_attention_variant.absorbed_mla import (
-            AbsorbedMLASelfAttention,
-        )
+        from megatron.core.ops.attention.mla import AbsorbedMLASelfAttention
         from megatron.core.transformer.multi_latent_attention import FusedMLASelfAttention
 
         submodules = self._fresh_submodules()

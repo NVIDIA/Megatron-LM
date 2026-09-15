@@ -1,10 +1,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-from megatron.core.transformer.transformer_config import MLATransformerConfig
+"""Deprecated import path; use ``megatron.core.transformer.dsa_layer_config``."""
 
+from megatron.core.ops._compat import deprecated_module
 
-class DSALayerConfig(MLATransformerConfig):
-    """Configuration for a DeepSeek Sparse Attention layer in a hybrid stack.
-
-    Due to backwards-compatibility, this config's arguments are defined in MLATransformerConfig.
-    """
+__getattr__, __dir__ = deprecated_module(__name__, "megatron.core.transformer.dsa_layer_config")

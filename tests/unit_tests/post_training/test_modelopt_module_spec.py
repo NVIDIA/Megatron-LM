@@ -26,7 +26,7 @@ from megatron.core.ops.ssm.gated_delta.gdn import GatedDeltaNet
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
-from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexer, DSAttention
+from megatron.core.ops.attention.dsa.modules import DSAIndexer, DSAttention
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.multi_latent_attention import MLASelfAttention
 from megatron.core.transformer.multi_token_prediction import (
