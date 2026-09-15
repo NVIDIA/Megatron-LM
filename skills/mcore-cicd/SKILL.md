@@ -96,8 +96,6 @@ The CI pipeline reads PR labels to decide test scope, n_repeat, and container im
 | Touches MBridge integration | add `Run MBridge tests` |
 | Could affect NeMo RL's Megatron integration | add `Run NeMoRL tests` |
 
-**Rule of thumb:** default to `Run tests`. Always use `Run functional tests` when the PR adds new test cases (golden values must be generated) or when the change could plausibly shift loss curves.
-
 ---
 
 ## Triggering Internal CI
