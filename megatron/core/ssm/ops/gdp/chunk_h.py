@@ -20,7 +20,7 @@ capped at 256.
 
 import torch
 
-from megatron.core.ssm.ops.common.determinism import autotune_configs
+from megatron.core.tuning import autotune_configs
 
 from .common import HAVE_TRITON, exp2, prepare_chunk_indices, prepare_chunk_offsets, tl, triton
 
