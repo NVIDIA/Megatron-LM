@@ -3,20 +3,19 @@
 """
 Pure shard-planning and owner-compute packing logic for MFSDP v2's all-`Flat` layout.
 
-- `ParameterLayout` describes how a single ≥2D parameter is split across the DP group under
-  MFSDP v2's all-`Flat` layout (trailing dims are flattened into the row size, as per Muon's
-  orthogonalization theory).
+- `ParameterLayout` describes how a single parameter's flat element range is split across the DP
+  group under MFSDP v2's all-`Flat` layout.
 - `ParameterLayout.from_group` builds `{tensor_index: layout}` for eligible parameters in an
   `FsdpParameterGroup`, keyed by each parameter's index within the group.
 - `assign_owner_work` balances owner-compute work across owner ranks using a caller-supplied cost
   function.
 - `GroupOwnerLayout.from_group` builds a data structure capturing the per-group owner layout upon
-  this.
+  the above.
 - `OwnerGatherPlan.pack`/`OwnerScatterPlan.pack` take the `GroupOwnerLayout` plus this rank's data
   and build the flat P2P send/recv buffers,
-- `OwnerGatherPlan.reconstruct_full` stitches gathered shards back into the full tensor on the
+- `OwnerGatherPlan.reconstruct_full` stitches gathered shards back into the full flat tensor on the
   owner, and
-- `OwnerScatterPlan.unpack` extracts received result shards.
+- `OwnerScatterPlan.unpack` extracts this rank's flat result shards from the received buffers.
 """
 
 import dataclasses
@@ -26,38 +25,32 @@ from typing import Self
 import torch
 from torch.distributed.device_mesh import DeviceMesh
 
-from .layout import non_leading_numel
 from .parameter_group import FsdpParameterGroup
 
 
 @dataclasses.dataclass(frozen=True)
 class ParameterLayout:
-    """How a single ≥2D parameter is split across the DP group.
+    """How a single parameter's flat element range splits across the DP group.
 
-    MFSDP v2's all-`Flat` layout shards dim-0 rows contiguously in rank order, so rank `r` owns the
-    contiguous global row range `[start, start + count)` where `start`/`count` come from the flat
-    DBuffer layout. A rank with `count == 0` holds no shard of this parameter.
+    MFSDP v2's all-`Flat` layout gives each rank one contiguous global element range per parameter,
+    in rank order, so rank `r` holds `[offset, offset + count)` where `offset` is the sum of the
+    previous ranks' counts. A rank with `count == 0` holds no elements of this parameter.
 
     Attributes:
-        full_shape: Global shape of the parameter (≥2D; trailing dims are flattened into the row
-            size, matching Muon's reshape rules).
-        row_counts: Per-rank row count; `0` means the rank holds no shard.
-        row_size: Number of elements per row (= `full_shape[1:].numel()`).
+        full_shape: The parameter's global shape.
+        flat_counts: Per-rank element count; `0` means the rank holds no elements.
     """
 
     full_shape: torch.Size
-    row_counts: tuple[int, ...]
-    row_size: int
+    flat_counts: tuple[int, ...]
 
     def __post_init__(self) -> None:
-        if len(self.full_shape) < 2:
-            raise ValueError(f"ParameterLayout requires a ≥2D full_shape, got {self.full_shape}.")
-        if len(self.row_counts) == 0:
+        if len(self.flat_counts) == 0:
             raise ValueError("ParameterLayout requires at least one rank.")
-        if self.row_size != non_leading_numel(self.full_shape):
+        if sum(self.flat_counts) != self.full_shape.numel():
             raise ValueError(
-                f"ParameterLayout row_size {self.row_size} != full_shape row size "
-                f"{non_leading_numel(self.full_shape)}."
+                f"ParameterLayout flat_counts sum {sum(self.flat_counts)} != full_shape "
+                f"numel {self.full_shape.numel()}."
             )
 
     @classmethod
@@ -93,75 +86,45 @@ class ParameterLayout:
                 continue
 
             full_shape = layout.tensor_shapes[tensor_index]
-            if len(full_shape) < 2:
-                raise ValueError(
-                    f"ParameterLayout.from_group requires a ≥2D shape, got {full_shape}."
-                )
-            row_size = non_leading_numel(full_shape)
-            if row_size <= 0:
-                raise ValueError(
-                    f"ParameterLayout.from_group requires non-empty rows, got shape {full_shape}."
-                )
             tensor_flat_offset = layout.tensor_to_offset[tensor_index]
             tensor_end = tensor_flat_offset + full_shape.numel()
 
-            row_counts: list[int] = []
+            flat_counts: list[int] = []
             for rank in range(dp_size):
                 rank_start = rank * rank_flat_shard_size
                 rank_end = rank_start + rank_flat_shard_size
                 overlap_start = max(tensor_flat_offset, rank_start)
                 overlap_end = min(tensor_end, rank_end)
-                if overlap_start >= overlap_end:
-                    row_counts.append(0)
-                    continue
-                if (overlap_start - tensor_flat_offset) % row_size != 0:
-                    raise RuntimeError(
-                        f"Flat shard boundary is not row-aligned for shape {full_shape}: "
-                        f"overlap_start={overlap_start}, tensor_flat_offset={tensor_flat_offset}."
-                    )
-                overlap_numel = overlap_end - overlap_start
-                if overlap_numel % row_size != 0:
-                    raise RuntimeError(
-                        f"Flat shard overlap is not row-aligned for shape {full_shape}: "
-                        f"overlap_numel={overlap_numel}, row_size={row_size}."
-                    )
-                row_count = overlap_numel // row_size
-                row_counts.append(row_count)
+                flat_counts.append(max(0, overlap_end - overlap_start))
 
-            param_layout = cls(
-                full_shape=torch.Size(full_shape), row_counts=tuple(row_counts), row_size=row_size
-            )
+            param_layout = cls(full_shape=torch.Size(full_shape), flat_counts=tuple(flat_counts))
             result[tensor_index] = param_layout
         return result
 
     @property
     def dp_size(self) -> int:
         """Number of ranks in the DP group for this parameter."""
-        return len(self.row_counts)
-
-    def rank_row_start(self, rank: int) -> int:
-        """Return the starting row of `rank`'s shard within the full tensor."""
-        return sum(self.row_counts[:rank])
-
-    def rank_row_count(self, rank: int) -> int:
-        """Return the number of rows owned by `rank`."""
-        return self.row_counts[rank]
-
-    def shard_numel(self, rank: int) -> int:
-        """Return the number of elements in `rank`'s shard."""
-        return self.rank_row_count(rank) * self.row_size
-
-    def owner_candidates(self) -> tuple[int, ...]:
-        """Return the ranks that hold a non-empty shard of this parameter."""
-        return tuple(r for r, count in enumerate(self.row_counts) if count > 0)
-
-    def is_boundary(self) -> bool:
-        """True if more than one rank owns a non-empty shard of this parameter."""
-        return any(0 < count < self.full_shape[0] for count in self.row_counts)
+        return len(self.flat_counts)
 
     def full_numel(self) -> int:
         """Return the total number of elements in the full (unsharded) parameter."""
         return self.full_shape.numel()
+
+    def rank_offset(self, rank: int) -> int:
+        """Return the starting offset of `rank`'s shard within the flat parameter."""
+        return sum(self.flat_counts[:rank])
+
+    def rank_numel(self, rank: int) -> int:
+        """Return the number of elements `rank` holds."""
+        return self.flat_counts[rank]
+
+    def owner_candidates(self) -> tuple[int, ...]:
+        """Return the ranks that hold a non-empty shard of this parameter."""
+        return tuple(r for r, count in enumerate(self.flat_counts) if count > 0)
+
+    def is_boundary(self) -> bool:
+        """True if more than one rank holds a non-empty shard of this parameter."""
+        return len(self.owner_candidates()) > 1
 
 
 def assign_owner_work(
@@ -169,10 +132,10 @@ def assign_owner_work(
 ) -> dict[int, int]:
     """Assign one owner rank to each parameter, keyed by tensor index.
 
-    Non-boundary parameters are assigned to their original rank (the only rank holding their rows,
-    so no communication is needed) and their cost counts toward that rank's running total cost.
-    Boundary parameters are processed in descending cost order and each is greedily given to its
-    eligible rank with the smallest running cost total.
+    Non-boundary parameters are assigned to their original rank (the only rank holding their
+    elements, so no communication is needed) and their cost counts toward that rank's running total
+    cost. Boundary parameters are processed in descending cost order and each is greedily given to
+    its eligible rank with the smallest running cost total.
 
     Args:
         layouts: Parameter layouts keyed by each parameter's tensor index in its
@@ -275,8 +238,9 @@ class OwnerGatherPlan:
     """Metadata and send buffers for the owner-gather P2P step of a set of parameters.
 
     The owner keeps its own shard locally (no self-send), so it only receives from the other
-    shard-holding ranks and reconstructs each owned tensor by concatenating shards in rank order
-    (own shard at the owner's rank rows).
+    shard-holding ranks. `reconstruct_full` reconstructs each owned tensor by concatenating the
+    per-rank shards in rank order (i.e., global element order).
+
 
     Example:
 
@@ -285,7 +249,7 @@ class OwnerGatherPlan:
 
     # Assume:
     torch.distributed.get_world_size() == 2
-    torch.distributed.get_rank() == 0  # We're observing from rank 0
+    torch.distributed.get_rank() == 0  # We're observing from rank 0
     param_0: torch.Tensor
     param_1: torch.Tensor
     # Params are in this order as observed by MFSDP.
@@ -296,37 +260,38 @@ class OwnerGatherPlan:
 
     param_0.shape == (6, 4)  # Global shape.
     param_1.shape == (4, 4)  # Global shape.
-    param_0.local_shard.shape == (3, 4)  # Rank 0 has shard indexed by `[0:3, ...]`.
-    param_1.local_shard.shape == (2, 4)  # Rank 0 has shard indexed by `[0:2, ...]`.
+    param_0.local_shard.shape == (3, 4)  # Rank 0 has shard indexed by `[0:3, ...]`.
+    param_1.local_shard.shape == (2, 4)  # Rank 0 has shard indexed by `[0:2, ...]`.
     param_0.local_shard.numel == 12
     param_1.local_shard.numel == 8
 
-    owner_gather_plan.send_buffers == {1: tensor(20)}  # 12 + 8 = 20 elements
+    owner_gather_plan.send_buffers == {1: tensor(20)}  # 12 + 8 = 20 elements
     # `owner_gather_plan.send_buffers[1]` represents the following in its packed flat buffer:
     #   +--------------------+-------------------+
     #   | param_0 (12 elems) | param_1 (8 elems) |
     #   +--------------------+-------------------+
     #                 byte order: -->
 
-    # Rank 0 owns nothing
+    # Rank 0 owns nothing
     owner_gather_plan.recv_sizes == {}
     owner_gather_plan.own_shards == {}
     owner_gather_plan.recv_offsets == {}
 
     # ---
 
-    # Same settings as above, now observing from rank 1 (the owner):
+    # Same settings as above, now observing from rank 1 (the owner):
     torch.distributed.get_rank() == 1
 
-    param_0.local_shard.shape == (3, 4)  # Rank 1 has shard indexed by `[3:6, ...]`.
-    param_1.local_shard.shape == (2, 4)  # Rank 1 has shard indexed by `[2:4, ...]`.
+    param_0.local_shard.shape == (3, 4)  # Rank 1 has shard indexed by `[3:6, ...]`.
+    param_1.local_shard.shape == (2, 4)  # Rank 1 has shard indexed by `[2:4, ...]`.
 
     send_buffers = {}  # Rank 1 owns everything.
-    recv_sizes = {0: 20}  # 12 + 8 = 20 elements from rank 0
-    own_shards = {0: param_0.local_shard, 1: param_1.local_shard}  # rank 1's own shards
+    recv_sizes = {0: 20}  # 12 + 8 = 20 elements from rank 0
+    # Rank 1's own shards, flattened (views):
+    own_shards = {0: param_0.local_shard.view(-1), 1: param_1.local_shard.view(-1)}
     recv_offsets = {
-        (0, 0): 0,  # `param_0` (tensor index 0) from rank 0: offset 0
-        (1, 0): 12,  # `param_1` (tensor index 1) from rank 0: offset 12
+        (0, 0): 0,  # `param_0` (tensor index 0) from rank 0: offset 0
+        (1, 0): 12,  # `param_1` (tensor index 1) from rank 0: offset 12
     }
     ```
 
@@ -335,11 +300,11 @@ class OwnerGatherPlan:
             params, in tensor-index order). Only owners with non-zero send size appear.
         recv_sizes: Per-source-rank element count this rank (as an owner) receives. Only sources
             with non-zero total size appear.
-        own_shards: This rank's local shard per owned parameter, keyed by tensor index (used
+        own_shards: This rank's flat local shard per owned parameter, keyed by tensor index (used
             directly in reconstruction, not communicated).
         recv_offsets: Per `(tensor_index, src_rank)`, the flat offset of this param's shard inside
             the recv buffer received from `src_rank`. Only contains tuples for which `src_rank`
-            holds rows.
+            holds elements.
     """
 
     layouts: dict[int, ParameterLayout]
@@ -356,7 +321,7 @@ class OwnerGatherPlan:
         Args:
             plan: The group's owner layout.
             local_shards: This rank's local shard per parameter, only required for every parameter
-                it holds rows of.
+                it holds elements of. Shards may be passed in any shape.
         """
         mesh = plan.mesh
         dp_size = mesh.size()
@@ -368,14 +333,14 @@ class OwnerGatherPlan:
         for tensor_index, layout in layouts.items():
             owner = owners[tensor_index]
             if owner != this_rank:
-                send_numel = layout.shard_numel(this_rank)
+                send_numel = layout.rank_numel(this_rank)
                 if send_numel > 0:
                     send_sizes[owner] = send_sizes.get(owner, 0) + send_numel
                 continue
             for src in range(dp_size):
                 if src == this_rank:
                     continue
-                recv_numel = layout.shard_numel(src)
+                recv_numel = layout.rank_numel(src)
                 if recv_numel > 0:
                     recv_sizes[src] = recv_sizes.get(src, 0) + recv_numel
 
@@ -393,9 +358,9 @@ class OwnerGatherPlan:
         for tensor_index in layouts:
             owner = owners[tensor_index]
             if owner == this_rank:
-                own_shards[tensor_index] = local_shards[tensor_index]
+                own_shards[tensor_index] = local_shards[tensor_index].flatten()
                 continue
-            numel = layouts[tensor_index].shard_numel(this_rank)
+            numel = layouts[tensor_index].rank_numel(this_rank)
             if numel == 0:
                 continue
             shard = local_shards[tensor_index]
@@ -412,7 +377,7 @@ class OwnerGatherPlan:
             for tensor_index, layout in layouts.items():
                 if owners[tensor_index] != this_rank:
                     continue
-                numel = layout.shard_numel(src)
+                numel = layout.rank_numel(src)
                 if numel == 0:
                     continue
                 recv_offsets[(tensor_index, src)] = offset
@@ -430,11 +395,11 @@ class OwnerGatherPlan:
     def reconstruct_full(
         self, param_index: int, recv_buffers: dict[int, torch.Tensor]
     ) -> torch.Tensor:
-        """Reconstruct the full tensor for one owned parameter from its per-rank shards.
+        """Reconstruct the full flat tensor for one owned parameter from its per-rank shards.
 
-        Concatenates shards in rank order: this rank's own local shard at its rank rows and each
-        source's received shard at that source's rank rows. For a parameter only this rank holds
-        rows of, the own shard is returned directly.
+        Concatenates the per-rank shards in rank order (i.e., global element order). Results can be
+        `view`ed into the desired shape. For a parameter only this rank holds elements of, the own
+        flat shard is returned directly.
 
         Args:
             param_index: Tensor index of the parameter (a key of the `layouts` dict passed to
@@ -448,17 +413,16 @@ class OwnerGatherPlan:
                 shards.append(self.own_shards[param_index])
                 continue
 
-            row_count = layout.rank_row_count(src)
-            if row_count == 0:
+            numel = layout.rank_numel(src)
+            if numel == 0:
                 continue
 
             offset = self.recv_offsets[(param_index, src)]
-            numel = layout.shard_numel(src)
             buf = recv_buffers[src]
-            shards.append(buf[offset : offset + numel].view(row_count, layout.row_size))
+            shards.append(buf[offset : offset + numel])
         if len(shards) == 1:
             return shards[0]
-        return torch.cat(shards, dim=0)
+        return torch.cat(shards)
 
 
 @dataclasses.dataclass
@@ -476,7 +440,7 @@ class OwnerScatterPlan:
             with non-zero total size appear.
         recv_offsets: Per `(tensor_index, owner_rank)`, the flat offset of this param's result shard
             inside the recv buffer received from `owner_rank`. Only contains tuples for which this
-            rank holds rows.
+            rank holds elements.
     """
 
     layouts: dict[int, ParameterLayout]
@@ -491,7 +455,8 @@ class OwnerScatterPlan:
 
         Args:
             plan: The group's owner layout.
-            full_results: Full result tensor per parameter this rank owns.
+            full_results: Full result tensor per parameter this rank owns. Tensors may be passed in
+                any shape.
         """
         mesh = plan.mesh
         dp_size = mesh.size()
@@ -506,11 +471,11 @@ class OwnerScatterPlan:
                 for dest in range(dp_size):
                     if dest == this_rank:
                         continue
-                    numel = layout.shard_numel(dest)
+                    numel = layout.rank_numel(dest)
                     if numel > 0:
                         send_sizes[dest] = send_sizes.get(dest, 0) + numel
                 continue
-            numel = layout.shard_numel(this_rank)
+            numel = layout.rank_numel(this_rank)
             if numel > 0:
                 recv_sizes[owner] = recv_sizes.get(owner, 0) + numel
 
@@ -527,19 +492,16 @@ class OwnerScatterPlan:
         for tensor_index, layout in layouts.items():
             if owners[tensor_index] != this_rank:
                 continue
-            full = full_results[tensor_index]
+            flat = full_results[tensor_index].flatten()
             for dest in range(dp_size):
                 if dest == this_rank:
                     continue
-                row_count = layout.rank_row_count(dest)
-                if row_count == 0:
+                numel = layout.rank_numel(dest)
+                if numel == 0:
                     continue
-                row_start = layout.rank_row_start(dest)
-                numel = row_count * layout.row_size
+                offset = layout.rank_offset(dest)
                 buf = send_buffers[dest]
-                buf[cursors[dest] : cursors[dest] + numel].copy_(
-                    full[row_start : row_start + row_count].flatten()
-                )
+                buf[cursors[dest] : cursors[dest] + numel].copy_(flat[offset : offset + numel])
                 cursors[dest] += numel
 
         recv_offsets: dict[tuple[int, int], int] = {}
@@ -550,7 +512,7 @@ class OwnerScatterPlan:
             for tensor_index, layout in layouts.items():
                 if owners[tensor_index] != owner:
                     continue
-                numel = layout.shard_numel(this_rank)
+                numel = layout.rank_numel(this_rank)
                 if numel == 0:
                     continue
                 recv_offsets[(tensor_index, owner)] = offset
@@ -565,20 +527,19 @@ class OwnerScatterPlan:
         )
 
     def unpack(self, recv_buffers: dict[int, torch.Tensor]) -> dict[int, torch.Tensor]:
-        """Extract this rank's local result shards from the per-owner recv buffers.
+        """Extract this rank's local flat result shards from the per-owner recv buffers.
 
         Args:
             recv_buffers: Per-owner-rank received buffer (only owners that sent).
 
         Returns:
-            Mapping from tensor index to the local result shard `(row_count, cols)`, for parameters
-            this rank holds rows of but does NOT own.
+            Mapping from tensor index to this rank's local flat result shard, for parameters this
+            rank holds elements of but does NOT own.
         """
         results: dict[int, torch.Tensor] = {}
         for (tensor_index, owner), offset in self.recv_offsets.items():
             layout = self.layouts[tensor_index]
-            row_count = layout.rank_row_count(self.this_rank)
-            numel = layout.shard_numel(self.this_rank)
+            numel = layout.rank_numel(self.this_rank)
             buf = recv_buffers[owner]
-            results[tensor_index] = buf[offset : offset + numel].view(row_count, layout.row_size)
+            results[tensor_index] = buf[offset : offset + numel]
         return results
