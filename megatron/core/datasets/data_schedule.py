@@ -14,21 +14,12 @@ from megatron.core.datasets.data_schedule_utils import (
     build_packed_microbatches,
     create_data_iterator,
     get_batch_and_global_seqlens,
+    get_cp_slice_for_thd,
     reroute_samples_to_dcp_ranks,
 )
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.hybrid_cp_schedule import BalancedCPScheduler
 from megatron.core.process_groups_config import ProcessGroupCollection
-
-try:
-    # Register the TE CUDA kernels
-    import transformer_engine  # pylint: disable=unused-import
-
-    # Alias the PyTorch wrapper so we can call tex.* APIs
-    import transformer_engine_torch as tex
-except ImportError:
-    # TE isn't installed or the torch wrapper is missing
-    tex = None
 
 
 def _build_thd_padding_mask(
@@ -745,6 +736,7 @@ def get_batch_on_this_rank_for_sequence_packing(
     mtp_on_this_rank: bool = False,
     vp_stage: Optional[int] = None,
     pg_collection: Optional[ProcessGroupCollection] = None,
+    config: Optional[Any] = None,
 ):
     """
     Get a batch of data for sequence packing.
@@ -752,6 +744,8 @@ def get_batch_on_this_rank_for_sequence_packing(
         data_iterator (Iterator): The data iterator to get the batch from.
         mtp_on_this_rank (bool): Whether to use multi-token prediction.
         vp_stage (Optional[int]): The stage of the pipeline.
+        config: Model config used to select the physical CP partition mode. When omitted,
+            scheduler batches retain the legacy zigzag layout.
     Returns:
         tuple of (tokens, labels, loss_mask, attention_mask, position_ids,
         packed_seq_params, padding_mask)
@@ -804,27 +798,16 @@ def get_batch_on_this_rank_for_sequence_packing(
         )
         _sanitize_thd_padding_values(batch, batch['padding_mask'])
 
+    cp_partition_mode = getattr(config, "cp_partition_mode", "zigzag")
     # Partition padding_mask for context parallel on every PP stage. Partition
     # token-like tensors only on stages that own them.
     if is_tp_rank_0:
-        cp_size = cp_group.size()
-        cp_rank = cp_group.rank()
-        # If cp_size == 1, no need to do further processing.
-        if cp_size > 1:
-            # Transformer Engine has a bug of cu_seqlens, we must treat cu_seqlens_padded as
-            # cu_seqlens to get the correct result.
-            # TODO: Revert this workaround once TE fixes the issue.
-            cu_seqlens = batch["cu_seqlens_padded"]
-            total_tokens = int(cu_seqlens[-1].item())
-            assert (
-                tex is not None
-            ), "Transformer Engine is required to use Context Parallel with THD format data."
-            index = tex.thd_get_partitioned_indices(cu_seqlens, total_tokens, cp_size, cp_rank)
-            cp_slice_keys = ['padding_mask']
-            if is_first_or_last_stage:
-                cp_slice_keys.extend(['tokens', 'position_ids', 'labels', 'loss_mask'])
-            for key in cp_slice_keys:
-                batch[key] = batch[key].index_select(0, index)
+        cp_slice_keys = ['padding_mask']
+        if is_first_or_last_stage or mtp_on_this_rank:
+            cp_slice_keys.extend(['tokens', 'position_ids', 'labels', 'loss_mask'])
+        get_cp_slice_for_thd(
+            batch=batch, cp_group=cp_group, keys=cp_slice_keys, cp_partition_mode=cp_partition_mode
+        )
 
     # Broadcast the receive-buffer shapes inside the TP group:
     # - cu_seqlen_size is needed to allocate cu_seqlens / cu_seqlens_padded on non TP 0 ranks.
@@ -919,6 +902,7 @@ def get_batch_on_this_rank_for_sequence_packing(
         cu_seqlens_kv_padded=cu_seqlens_padded,
         max_seqlen_q=max_seqlen,
         max_seqlen_kv=max_seqlen,
+        cp_partition_mode=cp_partition_mode,
     )
 
     # "attention_mask" is not valid for sequence packing, so set it to None.

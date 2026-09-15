@@ -266,6 +266,18 @@ def test_sequence_packing_requires_max_seqlen_per_dp_cp_rank():
         _make_packing_config(max_seqlen_per_dp_cp_rank=None)
 
 
+def test_sequence_packing_contiguous_cp_rejects_attention_cuda_graph():
+    with pytest.raises(
+        ValueError, match="native NCCL all-to-all.*CUDA graph capture that includes attention"
+    ):
+        _make_packing_config(
+            context_parallel_size=2,
+            cp_partition_mode="contiguous",
+            cuda_graph_impl="local",
+            cuda_graph_modules=["attn"],
+        )
+
+
 class TestTransformerConfig:
     def test_num_query_groups_divides_num_attention_heads(self):
         config = TransformerConfig(

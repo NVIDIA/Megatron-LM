@@ -1373,7 +1373,11 @@ class MultiTokenPredictionLayer(MegatronModule):
                 post_process=True,  # MTP layer is self-contained
                 pg_collection=pg_collection,
                 is_mtp_layer=True,
-                boundary_layout=self.config.attention_cp_layout,
+                boundary_layout=(
+                    self.config.cp_partition_mode
+                    if self.config.sequence_packing_scheduler is not None
+                    else self.config.attention_cp_layout
+                ),
                 name=(name + ".mtp_model_layer") if name is not None else None,
             )
         elif self.config.mtp_num_layers is not None:
@@ -2220,9 +2224,16 @@ class MultiTokenPredictionBlock(MegatronModule):
     ) -> MultiTokenPredictionInputs:
         """Prepare activations and token-aligned inputs for the MTP block's CP layout."""
         source_layout = (
-            cp_batch.boundary_layout if cp_batch is not None else self.config.linear_cp_layout
+            cp_batch.boundary_layout
+            if cp_batch is not None
+            else getattr(self.config, "cp_partition_mode", "zigzag")
         )
-        target_layout = self.config.attention_cp_layout
+        target_layout = (
+            self.config.attention_cp_layout
+            if cp_batch is not None
+            and getattr(self.config, "sequence_packing_scheduler", None) is None
+            else source_layout
+        )
         requires_conversion = self.cp_group.size() > 1 and source_layout != target_layout
 
         if requires_conversion:
@@ -2231,25 +2242,25 @@ class MultiTokenPredictionBlock(MegatronModule):
             if cp_batch is None:
                 raise ValueError("cp_batch is required when MTP uses a different CP layout")
             hidden_states = convert_cp_layout(
-                hidden_states,
-                source_layout,
-                target_layout,
-                self.cp_group,
-                self.sequence_parallel,
-                self.tp_group,
-                self.tp_cp_group,
-                cp_batch.thd_plan,
+                input_=hidden_states,
+                source_layout=source_layout,
+                target_layout=target_layout,
+                cp_group=self.cp_group,
+                sequence_parallel=self.sequence_parallel,
+                tp_group=self.tp_group,
+                tp_cp_group=self.tp_cp_group,
+                thd_plan=cp_batch.thd_plan,
             )
             if mhc_multistream is not None:
                 mhc_multistream = convert_cp_layout(
-                    mhc_multistream,
-                    source_layout,
-                    target_layout,
-                    self.cp_group,
-                    self.sequence_parallel,
-                    self.tp_group,
-                    self.tp_cp_group,
-                    cp_batch.thd_plan,
+                    input_=mhc_multistream,
+                    source_layout=source_layout,
+                    target_layout=target_layout,
+                    cp_group=self.cp_group,
+                    sequence_parallel=self.sequence_parallel,
+                    tp_group=self.tp_group,
+                    tp_cp_group=self.tp_cp_group,
+                    thd_plan=cp_batch.thd_plan,
                 )
             packed_seq_params = cp_batch.get_packed_seq_params(target_layout)
             layout_batch = cp_batch.get_batch(target_layout)

@@ -990,7 +990,8 @@ def create_pretrain_data_iterator(
     return iter([batch])
 
 
-def test_sequence_packing_batch_uses_context_parallel_batch_interface():
+@pytest.mark.parametrize("cp_partition_mode", ["zigzag", "contiguous"])
+def test_sequence_packing_batch_uses_context_parallel_batch_interface(cp_partition_mode):
     tokens = torch.tensor([[1, 2]])
     labels = torch.tensor([[2, 3]])
     loss_mask = torch.ones(1, 2)
@@ -1012,6 +1013,7 @@ def test_sequence_packing_batch_uses_context_parallel_batch_interface():
         pipeline_model_parallel_layout=None,
         mtp_num_layers=1,
         linear_cp_layout="zigzag",
+        cp_partition_mode=cp_partition_mode,
     )
 
     with (
@@ -1022,18 +1024,21 @@ def test_sequence_packing_batch_uses_context_parallel_batch_interface():
             pretrain_hybrid,
             "get_batch_on_this_rank_for_sequence_packing",
             return_value=scheduler_batch,
-        ),
+        ) as mock_get_scheduler_batch,
     ):
         cp_batch = get_batch(None)
 
-    assert set(cp_batch.batches_by_layout) == {"zigzag"}
+    assert set(cp_batch.batches_by_layout) == {cp_partition_mode}
+    assert cp_batch.boundary_layout == cp_partition_mode
     assert cp_batch.get_packed_seq_params() is packed_seq_params
+    assert packed_seq_params.cp_partition_mode == cp_partition_mode
     batch = cp_batch.get_batch()
     assert batch["tokens"] is tokens
     assert batch["labels"] is labels
     assert batch["loss_mask"] is loss_mask
     assert batch["position_ids"] is position_ids
     assert batch["padding_mask"] is padding_mask
+    assert mock_get_scheduler_batch.call_args.kwargs["config"] is config
 
 
 @pytest.mark.parametrize("tp_size", [1, 2, 4])
