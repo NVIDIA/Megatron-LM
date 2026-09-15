@@ -1244,8 +1244,7 @@ def test_distributed_optimizer_reload_main_params_from_fused_mla_canonical_state
             if isinstance(sh_ten, ShardedTensor)
         }
         assert any(
-            key.startswith("decoder.layers.0.self_attention.input_layernorm.")
-            for key in state_dict
+            key.startswith("decoder.layers.0.self_attention.input_layernorm.") for key in state_dict
         )
         assert not any("linear_qkv_down_proj.layer_norm_" in key for key in state_dict)
 
