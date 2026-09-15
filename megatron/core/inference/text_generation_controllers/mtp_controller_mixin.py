@@ -423,6 +423,12 @@ class MTPControllerMixin:
         )
 
     def _compute_serial_mtp_and_sample(self, base_position: Optional[Tensor] = None) -> None:
+        """Run the MTP phase with the main forward's execution state held across it."""
+        context = self.inference_wrapped_model.inference_context
+        with context._mtp_forward_phase():
+            self._compute_serial_mtp_and_sample_impl(base_position)
+
+    def _compute_serial_mtp_and_sample_impl(self, base_position: Optional[Tensor]) -> None:
         """Compute MTP logits serially after verification and sample speculative tokens.
 
         This ensures that MTP predictions are always conditioned on verified tokens.
@@ -571,9 +577,18 @@ class MTPControllerMixin:
         # A still-prefilling chunked request is mid-prompt, so it must not draft; its chunk KV was
         # already seeded by the commit pass. Dropping it from the draft count makes it a padding
         # row, leaving `padded_count` and the forward count -- and so EP parity -- unchanged.
-        num_mtp_draft_requests = active_request_count - (
-            1 if context.chunked_prefill_request_id != -1 else 0
-        )
+        # Condition on it having an ACTIVE ROW, not just on the id being set: under memory
+        # pressure its next chunk may not be admitted and it stays hidden for a step, and then
+        # the last active row is a real decode request whose drafts must not be discarded.
+        chunked_row = context.get_index_of_chunked_prefill_request(safe=True)
+        chunked_is_active = chunked_row >= context.paused_request_count
+        if chunked_is_active:
+            assert chunked_row == context.total_request_count - 1, (
+                "the chunked-prefill request must be the last active row for the draft loop to "
+                f"drop it as padding, but it sits at row {chunked_row} of "
+                f"{context.total_request_count}"
+            )
+        num_mtp_draft_requests = active_request_count - (1 if chunked_is_active else 0)
         if mtp_kv_cache_on:
             context._mtp_begin_decode(
                 num_mtp_draft_requests, padded_count, base_position - 1, graphed=mtp_graphed
@@ -663,16 +678,6 @@ class MTPControllerMixin:
                 mtp_inference_context=context,
             )
             context.mtp_metadata.advance_decode_step()
-
-        if mtp_kv_cache_on:
-            context.mtp_metadata.end_forward()
-
-        # In eager mode forward() assigns the hidden states tensor directly to
-        # the context attribute; release it so the tensor can be garbage
-        # collected. In block-scope CUDA graph mode the attribute is a
-        # pre-allocated fixed buffer that must persist across replays.
-        if has_mtp and context.inference_cuda_graph_scope != InferenceCudaGraphScope.block:
-            context.mtp_decoder_hidden_states = None
 
     @torch.inference_mode()
     def _run_dummy_serial_mtp_forward(self) -> None:

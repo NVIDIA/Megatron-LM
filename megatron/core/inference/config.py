@@ -63,13 +63,6 @@ class MambaInferenceStateConfig:
     model has none. Sizes the GDP chunk descriptors used by the forked prefill
     kernels, whose Householder-expanded token stream is this many times longer."""
 
-    mtp_layer_type_list: Optional[List[str]] = None
-    """Layer types of one MTP draft-head depth, one symbol per layer, or None when the model has
-    no MTP head. Distinct from `layer_type_list`, which describes the MAIN decoder: a hybrid
-    model states the two independently (`"<main>/<mtp>/..."`), so a Mamba main decoder can carry
-    an attention MTP head and vice versa. Read by `DynamicInferenceContext` to decide whether the
-    MTP draft attention can be given its own KV plane."""
-
     def __post_init__(self):
         if self.ssm_chunk_alignment is None:
             self.ssm_chunk_alignment = self.mamba_chunk_size
@@ -137,17 +130,8 @@ class MambaInferenceStateConfig:
                 mamba_chunk_size = chunking.chunk_size
                 ssm_chunk_alignment = chunking.inference_chunk_size
                 gdp_num_householder = chunking.num_householder
-            # The MTP head's layer types are stated separately from the main decoder's in the
-            # unified hybrid pattern ("<main>/<mtp>/..."), and only HybridModel parses them.
-            # Absent (non-hybrid wrapper, or no MTP) leaves this None.
-            try:
-                mtp_pattern = get_attr_wrapped_model(model, "mtp_pattern")
-            except RuntimeError:
-                mtp_pattern = None
-
             return cls(
                 layer_type_list=layer_type_list,
-                mtp_layer_type_list=list(mtp_pattern) if mtp_pattern else None,
                 conv_states_shape=mamba_conv_states_shape,
                 ssm_states_shape=mamba_ssm_states_shape,
                 conv_states_dtype=conv_states_dtype,
@@ -157,6 +141,24 @@ class MambaInferenceStateConfig:
                 gdp_num_householder=gdp_num_householder,
             )
         return None
+
+
+def mtp_layer_types_from_model(model: MegatronModule) -> Optional[List[str]]:
+    """Layer types of one MTP draft-head depth, or None for a non-hybrid model.
+
+    The MTP head's layer types come from the unified hybrid pattern ("<main>/<mtp>/..."), which
+    only HybridModel parses. Independent of whether the MAIN decoder has recurrent layers, so it
+    cannot be derived from `MambaInferenceStateConfig`.
+
+    Callers that never enable speculative decoding do not need this: the draft-KV gate requires
+    `num_speculative_tokens > 0` first, so leaving `InferenceConfig.mtp_layer_type_list` at None
+    is correct for them.
+    """
+    try:
+        mtp_pattern = get_attr_wrapped_model(model, "mtp_pattern")
+    except RuntimeError:
+        return None
+    return list(mtp_pattern) if mtp_pattern else None
 
 
 class PrefixCachingEvictionPolicy(str, Enum):
@@ -364,6 +366,12 @@ class InferenceConfig:
 
     mamba_inference_state_config: Optional[MambaInferenceStateConfig] = None
     """The Mamba inference state config if the model is a hybrid model."""
+
+    mtp_layer_type_list: Optional[List[str]] = None
+    """Layer types of one MTP draft-head depth, one symbol per layer, or None for a non-hybrid
+    model, whose head is a single attention layer by construction. Read by
+    `DynamicInferenceContext` to decide whether the MTP draft attention can be given its own KV
+    plane."""
 
     mamba_memory_ratio: Optional[float] = None
     """

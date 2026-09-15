@@ -3467,6 +3467,86 @@ class TestMtpPrefixCacheBackOff(PrefixCachingTestBase):
         self._assert_hash_registry_is_injective(alloc)
 
     @pytest.mark.internal
+    def test_a_recycled_block_carries_no_stale_lookahead_token(self):
+        """Deregistration must clear the recorded token, or a reused block matches on it.
+
+        `block_mtp_next_token` is the one piece of per-block state that decides whether a
+        block's final draft slot is inheritable. If it survived recycling, a later request
+        whose next token happened to equal the previous owner's would inherit a draft entry
+        computed from unrelated hidden states.
+        """
+        ctx = self._mtp_ctx()
+        alloc = ctx.kv_block_allocator
+        bs = ctx.block_size_tokens
+
+        ctx.add_request(self._req(ctx, self._prompt(bs * 3)))
+        blocks = self._block_ids(ctx, 0, 3)
+        # Block 0's successor is inside the prompt, so its slot was written and recorded.
+        assert alloc.block_mtp_next_token[blocks[0]].item() >= 0
+        # The last block's successor is past the prompt: nothing paired it, so it stays -1.
+        assert alloc.block_mtp_next_token[blocks[2]].item() == -1
+
+        alloc._deregister_blocks(torch.tensor(blocks, dtype=torch.int32))
+
+        for b in blocks:
+            assert alloc.block_mtp_next_token[b].item() == -1, (
+                f"block {b} kept its lookahead token through deregistration; a request that "
+                f"later allocates it could inherit a draft slot computed by its old owner."
+            )
+
+    @pytest.mark.internal
+    def test_a_block_is_inheritable_only_once_its_boundary_slot_is_written(self):
+        """A block completed at a chunk boundary is not inheritable until the next chunk.
+
+        Its final draft slot pairs its last hidden with the FIRST token of the next chunk,
+        which the boundary carry supplies. Recording that token when the block completes would
+        advertise a slot nothing has written yet, so a request matching in between would
+        inherit uninitialised draft KV.
+        """
+        ctx = self._mtp_ctx(enable_chunked_prefill=True)
+        alloc = ctx.kv_block_allocator
+        bs = ctx.block_size_tokens
+        prompt = self._prompt(bs * 3)
+
+        r = self._req(ctx, prompt.clone(), request_id=1)
+        ctx.add_request(r, prefill_chunk_length=bs)
+        block0 = self._block_ids(ctx, 0, 1)[0]
+        assert alloc.block_mtp_next_token[block0].item() == -1, (
+            "block 0 completed at the chunk boundary, so its final draft slot is unwritten "
+            "until the next chunk pairs it; advertising a token now would be a lie."
+        )
+
+        # The next chunk supplies the token the carry pairs into that slot. `update_requests`
+        # decrements the count so a continuation reuses its own row (see the note above
+        # `current_id` in `add_request`); emulate that, or the chunk lands on a fresh row and
+        # never sees the blocks it is continuing.
+        r.finished_chunk_token_count += bs
+        r.remaining_prompt_tokens = r.remaining_prompt_tokens[bs:]
+        ctx.total_request_count -= 1
+        ctx.add_request(r, prefill_chunk_length=bs)
+
+        assert alloc.block_mtp_next_token[block0].item() == int(prompt[bs]), (
+            "after the chunk that pairs it, block 0's slot is real and must advertise the "
+            "token it was computed against."
+        )
+
+    @pytest.mark.internal
+    def test_only_registration_opts_a_block_into_being_inherited(self):
+        """Every block starts at -1, so any path that does not record a token fails closed.
+
+        Blocks reach registration from the free pool, where entries are either never used or
+        were reset by `_deregister_blocks`. A registration path that does not record the
+        producer's next token -- the disaggregation import in `inference_state_handoff.py`
+        does not -- therefore leaves the block uninheritable rather than wrongly inheritable.
+        """
+        ctx = self._mtp_ctx()
+        alloc = ctx.kv_block_allocator
+        assert (alloc.block_mtp_next_token == -1).all(), (
+            "a freshly built allocator must start with every block uninheritable; the default "
+            "is what makes non-recording registration paths safe."
+        )
+
+    @pytest.mark.internal
     def test_continuation_chunk_with_a_pending_carry_gives_up_its_whole_match(self):
         """A carry pending for this request means its next chunk takes NO prefix skip.
 

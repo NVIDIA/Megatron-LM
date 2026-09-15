@@ -533,7 +533,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         # `key_value_cache` route to this slot on `mtp_metadata.forward_active`.
         self.enable_mtp_kv_cache = self.should_enable_mtp_kv_cache(
             model_config=model_config,
-            mamba_inference_state_config=mamba_inference_state_config,
+            mtp_layer_type_list=inference_config.mtp_layer_type_list,
             num_speculative_tokens=self.num_speculative_tokens,
         )
         if self.enable_mtp_kv_cache:
@@ -3241,13 +3241,17 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         )
 
         # MTP draft KV: give up matched blocks we cannot inherit correctly. A block's FINAL draft
-        # slot consumes one token past the block, so it is not determined by the block's hash, and
-        # the block is ref-counted so it cannot be corrected in place. Giving up the last matched
-        # block costs one block of prefill per hit and keeps the draft KV exact. A continuation
-        # chunk still holding a boundary carry gives up the WHOLE match instead: the carry is only
-        # consumable at `finished - 1`, and any skip (block granular) moves past it, orphaning
-        # that entry permanently. Trim the list rather than the skip so the two stay consistent,
-        # which everything downstream depends on. Named `mtp_backed_off_blocks` because the Mamba
+        # slot consumes one token past the block, so it is not determined by the block's hash and
+        # the block is ref-counted, meaning it cannot be corrected in place. Keep a block only
+        # while the token its producer paired into that slot is the token we continue with;
+        # truncate at the first disagreement, since everything after it is unreachable anyway.
+        # This covers both the last matched block (whose successor is past the match, so the
+        # producer's choice rarely agrees) and a branch point mid-chain, where an earlier block
+        # was registered by a request that continued differently. A continuation chunk still
+        # holding a boundary carry gives up the WHOLE match instead: the carry is only consumable
+        # at `finished - 1`, and any skip (block granular) moves past it, orphaning that entry
+        # permanently. Trim the list rather than the skip so the two stay consistent, which
+        # everything downstream depends on. Named `mtp_backed_off_blocks` because the Mamba
         # branch below binds `backed_off_blocks` for an unrelated purpose.
         mtp_backed_off_blocks = 0
         if self.enable_mtp_kv_cache and matched_block_ids:
@@ -3255,8 +3259,27 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                 mtp_backed_off_blocks = len(matched_block_ids)
                 matched_block_ids = []
             else:
-                mtp_backed_off_blocks = 1
-                matched_block_ids = matched_block_ids[:-1]
+                keep = len(matched_block_ids)
+                for k, block_id in enumerate(matched_block_ids):
+                    # Matching starts at `already_allocated_blocks`, so k is an offset into the
+                    # match, not an absolute block index -- a continuation chunk's first matched
+                    # block is not the prompt's block 0.
+                    absolute_block = already_allocated_blocks + k
+                    next_token_idx = (absolute_block + 1) * self.block_size_tokens
+                    our_next = (
+                        int(req.prompt_tokens[next_token_idx])
+                        if next_token_idx < len(req.prompt_tokens)
+                        else -1
+                    )
+                    producer_next = int(self.kv_block_allocator.block_mtp_next_token[block_id])
+                    # -1 on either side means the slot holds no draft KV (the producer's
+                    # successor had not arrived) or that we have no successor to match it
+                    # against, so equality there is not agreement -- neither is inheritable.
+                    if producer_next < 0 or producer_next != our_next:
+                        keep = k
+                        break
+                mtp_backed_off_blocks = len(matched_block_ids) - keep
+                matched_block_ids = matched_block_ids[:keep]
 
         num_matched = len(matched_block_ids)
 
@@ -3676,6 +3699,19 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                 self.kv_block_allocator.register_kv_block_hashes(
                     block_ids_to_hash, block_hashes_slice, parent_hashes_slice
                 )
+                if self.enable_mtp_kv_cache:
+                    # Record the token each block's final draft slot is paired with, so a later
+                    # request can tell whether that slot is reusable. Only tokens this chunk
+                    # actually computed count: a block completed exactly at a chunk boundary has
+                    # its successor in the NEXT chunk and its slot is still unwritten, so it
+                    # records -1 here and is upgraded below once that chunk arrives.
+                    for offset, block_id in enumerate(block_ids_to_hash):
+                        next_token_idx = (start + offset + 1) * self.block_size_tokens
+                        self.kv_block_allocator.block_mtp_next_token[block_id] = (
+                            int(req.prompt_tokens[next_token_idx])
+                            if next_token_idx < total_tokens_after
+                            else -1
+                        )
                 if self.dynamo_helper.has_kv_event_listeners:
                     token_start = start * self.block_size_tokens
                     token_end = end * self.block_size_tokens
@@ -3690,6 +3726,22 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                             ),
                         }
                     )
+
+            if (
+                self.enable_mtp_kv_cache
+                and previously_complete > 0
+                and req.finished_chunk_token_count % self.block_size_tokens == 0
+            ):
+                # The block ending exactly at `finished` has its successor token in THIS chunk,
+                # where the boundary carry pairs it into that block's final draft slot. The slot
+                # becomes real during this step's commit pass, which runs before any draft read,
+                # so recording it here is the earliest point a later request may inherit it.
+                prev_block = int(
+                    self.request_to_kv_block_ids[current_id][previously_complete - 1].item()
+                )
+                self.kv_block_allocator.block_mtp_next_token[prev_block] = int(
+                    req.prompt_tokens[req.finished_chunk_token_count]
+                )
 
             # Range 1: prior-chunk partial block that this chunk just completed
             _register_range(previously_complete, min(already_allocated_blocks, num_complete_blocks))

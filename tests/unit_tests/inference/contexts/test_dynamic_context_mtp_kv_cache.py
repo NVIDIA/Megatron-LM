@@ -21,6 +21,8 @@ The invariants asserted are the ones the draft attention depends on: write posit
 padding rows that never index real KV.
 """
 
+import math
+
 import pytest
 import torch
 
@@ -47,14 +49,13 @@ def _make_context(
     max_requests: int = 16,
 ) -> DynamicInferenceContext:
     """Build a real `DynamicInferenceContext`, MTP-KV-enabled unless a gate is switched off."""
-    if is_hybrid_model or mtp_layer_type_list is not None:
+    if is_hybrid_model:
         mamba_inference_state_config = MambaInferenceStateConfig(
             layer_type_list=[Symbols.MAMBA, Symbols.MLP, Symbols.ATTENTION, Symbols.MLP],
             conv_states_shape=(544, 4),
             ssm_states_shape=(8, 64, 16),
             conv_states_dtype=torch.bfloat16,
             ssm_states_dtype=torch.bfloat16,
-            mtp_layer_type_list=mtp_layer_type_list,
         )
     else:
         mamba_inference_state_config = None
@@ -78,6 +79,7 @@ def _make_context(
             max_requests=max_requests,
             num_speculative_tokens=num_speculative_tokens,
             mamba_inference_state_config=mamba_inference_state_config,
+            mtp_layer_type_list=mtp_layer_type_list,
             use_flashinfer_fused_rope=None,
             unified_memory_level=0,  # unit tests currently broken with UVM
         ),
@@ -152,6 +154,18 @@ class TestMtpKvCacheGating:
     def test_disabled_for_multi_attention_mtp_head(self):
         """Two attention layers in the head would collide on the single reserved slot."""
         context = _make_context(mtp_layer_type_list=[Symbols.ATTENTION, Symbols.ATTENTION])
+        assert context.enable_mtp_kv_cache is False
+
+    def test_disabled_for_multi_attention_head_on_an_attention_only_hybrid(self):
+        """`****/**`: no recurrent main layer, so the head pattern is the only gate input."""
+        context = _make_context(
+            is_hybrid_model=False, mtp_layer_type_list=[Symbols.ATTENTION, Symbols.ATTENTION]
+        )
+        assert context.enable_mtp_kv_cache is False
+
+    def test_disabled_for_recurrent_head_on_an_attention_only_hybrid(self):
+        """`****/M`: a recurrent head has no KV to append even with a pure-attention backbone."""
+        context = _make_context(is_hybrid_model=False, mtp_layer_type_list=[Symbols.MAMBA])
         assert context.enable_mtp_kv_cache is False
 
     def test_enabled_for_hybrid_main_decoder_with_attention_mtp_head(self):
@@ -502,6 +516,139 @@ class TestMtpDecodeBookkeeping:
         context = _make_context(num_speculative_tokens=0)
         with pytest.raises(AssertionError):
             context._mtp_begin_decode(1, 1, torch.tensor([5], device=torch.cuda.current_device()))
+
+
+class TestMtpDraftBlockCoverage:
+    """Every draft write must land on a block the main model actually allocated.
+
+    The main path pre-allocates a block once `request_last_kv_block_offset` reaches
+    `block_size_tokens - 1 - num_speculative_tokens`, reserving headroom for the speculative
+    positions. The draft loop writes `base_position - 1 + depth` for depth 0..D, so its deepest
+    write is one position BELOW the main model's own next forward. These tests pin that
+    relationship at and around the block boundary, where an off-by-one would send a deep draft
+    to an unallocated column (-1) and silently corrupt its KV.
+    """
+
+    @classmethod
+    def setup_class(cls):
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1, pipeline_model_parallel_size=1
+        )
+        model_parallel_cuda_manual_seed(123)
+
+    @classmethod
+    def teardown_class(cls):
+        Utils.destroy_model_parallel()
+
+    @staticmethod
+    def _blocks_for(context, num_positions):
+        """Block ids the main path would own after writing `num_positions`, incl. speculative."""
+        # `request_last_kv_block_offset` is the LAST WRITTEN token's index within its block
+        # (`(length - 1) % block_size`), not a token count, so an exactly-full block reports
+        # `block_size - 1` and trips the pre-allocation below.
+        offset_in_last = (num_positions - 1) % context.block_size_tokens
+        num_blocks = math.ceil(num_positions / context.block_size_tokens)
+        # Main pre-allocates one more once the last block is within D+1 of full.
+        if offset_in_last >= context.block_size_tokens - 1 - context.num_speculative_tokens:
+            num_blocks += 1
+        # Block 0 is the dummy block, so start real ids at 1.
+        return list(range(1, num_blocks + 1))
+
+    @pytest.mark.parametrize("prompt_length", list(range(1, 2 * BLOCK_SIZE_TOKENS + 1)))
+    def test_every_draft_depth_lands_on_an_allocated_block(self, prompt_length):
+        """Sweep every offset within two blocks, including both exact boundaries."""
+        context = _make_context()
+        device = torch.cuda.current_device()
+        depth = context.num_speculative_tokens
+
+        blocks = self._blocks_for(context, prompt_length)
+        _seed_requests(context, [blocks])
+        # Depth 0 writes the roll-by-one entry for main position `prompt_length - 1`.
+        base_position = torch.tensor([prompt_length], device=device)
+        context._mtp_begin_decode(
+            active_request_count=1, padded_count=1, start_positions=(base_position - 1)
+        )
+
+        for d in range(depth + 1):
+            context._mtp_setup_decode_step()
+            destination = context.gpu_view.token_to_block_idx[0].item()
+            position = prompt_length - 1 + d
+            assert destination != -1, (
+                f"prompt_length={prompt_length} depth={d} writes MTP position {position} "
+                f"(block column {position // context.block_size_tokens}) but the request only "
+                f"owns {len(blocks)} block(s); the main path under-allocated for the draft loop."
+            )
+            assert destination in blocks, (
+                f"prompt_length={prompt_length} depth={d} writes to block {destination}, "
+                f"which this request does not own ({blocks})."
+            )
+            context.mtp_metadata.advance_decode_step()
+        context.mtp_metadata.end_forward()
+
+
+class TestMtpMainExecutionState:
+    """Every MTP forward republishes the context's execution state; it must be put back."""
+
+    @classmethod
+    def setup_class(cls):
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1, pipeline_model_parallel_size=1
+        )
+        model_parallel_cuda_manual_seed(123)
+
+    @classmethod
+    def teardown_class(cls):
+        Utils.destroy_model_parallel()
+
+    def test_prefill_step_restores_the_main_forward_counts(self):
+        """Log-prob computation runs after the MTP phase and reads these as the MAIN counts."""
+        context = _make_context()
+        device = torch.cuda.current_device()
+        # Stand in for a 4-token prefill forward.
+        context.active_attn_metadata = context.non_graph_attn_metadata
+        context.active_token_count = 4
+        context.padded_active_token_count = 8
+        context._using_cuda_graph_this_step = False
+
+        table = torch.full(
+            (1, context.max_kv_block_count),
+            3,
+            dtype=context.gpu_view.mha_block_table.dtype,
+            device=device,
+        )
+        with context._mtp_forward_phase():
+            context.paused_request_count = 0
+            context.total_request_count = 1
+            context._mtp_setup_prefill_step(
+                append_counts=torch.tensor([1], device=device), block_table_prefill=table
+            )
+            # The MTP forward has overwritten the counts with its own one-token geometry.
+            assert context.active_token_count == 1
+
+        assert context.active_token_count == 4
+        assert context.padded_active_token_count == 8
+        assert context._using_cuda_graph_this_step is False
+        assert context.active_attn_metadata is context.non_graph_attn_metadata
+        # Leaving the scope must also leave MTP-forward mode, or KV routing stays on the
+        # draft plane and `is_decode_only` stays False for the rest of the run.
+        assert context.mtp_metadata.forward_active is False
+
+    def test_state_is_restored_when_a_draft_forward_raises(self):
+        """A failed draft must not leave its counts behind for the log-prob code."""
+        context = _make_context()
+        context.active_attn_metadata = context.non_graph_attn_metadata
+        context.active_token_count = 4
+        context.padded_active_token_count = 8
+
+        with pytest.raises(RuntimeError, match="draft blew up"):
+            with context._mtp_forward_phase():
+                context.active_token_count = 1
+                context.padded_active_token_count = 1
+                raise RuntimeError("draft blew up")
+
+        assert context.active_token_count == 4
+        assert context.padded_active_token_count == 8
+        assert context.mtp_metadata.forward_active is False
 
 
 class TestMtpPrefillBookkeeping:

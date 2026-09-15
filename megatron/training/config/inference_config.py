@@ -23,6 +23,7 @@ Use :meth:`InferenceSetupConfig.to_inference_config` to produce the runtime engi
 from this declarative config plus the runtime artifacts. This mirrors the
 ``GPTModelConfig -> TransformerConfig`` relationship.
 """
+
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -319,6 +320,7 @@ class InferenceSetupConfig:
             MediaCacheCoordinatorPolicy,
             PrefixCachingCoordinatorPolicy,
             PrefixCachingEvictionPolicy,
+            mtp_layer_types_from_model,
         )
         from megatron.core.utils import get_attr_wrapped_model
 
@@ -374,6 +376,7 @@ class InferenceSetupConfig:
             static_kv_memory_pointers=static_kv_memory_pointers,
             max_sequence_length=max_sequence_length,
             mamba_inference_state_config=mamba_inference_state_config,
+            mtp_layer_type_list=mtp_layer_types_from_model(model),
             pg_collection=pg_collection,
             use_flashinfer_fused_rope=self.use_flashinfer_fused_rope,
             materialize_only_last_token_logits=(
@@ -411,8 +414,6 @@ class InferenceSetupConfig:
             disable_ep_consensus=self.inference_disable_ep_consensus,
             sampling_backend=self.inference_dynamic_batching_sampling_backend,
             offset_sampling_seed_by_dp_rank=self.offset_sampling_seed_by_dp_rank,
-            async_sched_mode=AsyncScheduleMode(
-                self.inference_dynamic_batching_async_sched_mode
-            ),
+            async_sched_mode=AsyncScheduleMode(self.inference_dynamic_batching_async_sched_mode),
             logprobs_mode=self.inference_dynamic_batching_logprobs_mode,
         )

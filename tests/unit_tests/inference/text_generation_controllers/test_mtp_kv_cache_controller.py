@@ -18,12 +18,14 @@ positions and append COUNTS, which differ between a fresh prompt, a continuation
 prefix-cache hit.
 """
 
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from unittest import mock
 
 import pytest
 import torch
 
+from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
+from megatron.core.inference.contexts.mtp_context_mixin import MTPContextMixin
 from megatron.core.inference.contexts.mtp_metadata import MTPMetadata
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
@@ -87,6 +89,14 @@ def _make_context(
     )
 
     context = SimpleNamespace(
+        # Execution state the MTP phase parks and restores. Present so the REAL
+        # `_mtp_forward_phase` can be bound below rather than stubbed: it also performs the
+        # end-of-phase cleanups (`end_forward`, releasing the hidden states) that these tests
+        # assert on, and a no-op scope would drop them silently.
+        active_attn_metadata=None,
+        active_token_count=0,
+        padded_active_token_count=0,
+        _using_cuda_graph_this_step=False,
         enable_mtp_kv_cache=True,
         paused_request_count=paused_request_count,
         total_request_count=total,
@@ -103,6 +113,12 @@ def _make_context(
         mtp_decoder_hidden_states=None,
         setup_prefill_calls=[],
         finalize_prefill_calls=0,
+    )
+
+    context._mtp_forward_phase = MethodType(MTPContextMixin._mtp_forward_phase, context)
+    # The real lookup, so a chunked id with no active row behaves as it does in the engine.
+    context.get_index_of_chunked_prefill_request = MethodType(
+        DynamicInferenceContext.get_index_of_chunked_prefill_request, context
     )
 
     def _setup_prefill_step(**kwargs):
@@ -806,6 +822,34 @@ class TestSerialMtpDraftLoop:
         # The graph size and forward count are unchanged, so EP parity is preserved.
         assert args[1] == 2
 
+    def test_hidden_chunked_request_does_not_cost_a_real_request_its_drafts(self):
+        """A chunked id with no active row must not shrink the draft count.
+
+        Under memory pressure the next chunk is not admitted and the chunked request stays
+        hidden for a step while active decodes proceed (see the `chunked_prefill_rows.numel()
+        == 0` case in `_dynamic_step_sample_logits_and_verify_tokens`). Decrementing on the id
+        alone would turn the last active row -- a real decode request -- into a padding row:
+        zero kv_length, dummy block, and drafts sampled from a garbage attention output.
+        """
+        context = _make_context(
+            num_decode_requests=2,
+            request_ids=[100, 101],
+            # In flight, but not among this step's rows.
+            chunked_prefill_request_id=999,
+        )
+        controller, _, context = _make_draft_loop_controller(
+            context, num_mtp_depths=2, active_request_count=2
+        )
+
+        controller._compute_serial_mtp_and_sample(
+            base_position=torch.tensor([10, 12], device=DEVICE)
+        )
+
+        args, _ = context._mtp_begin_decode.call_args
+        assert (
+            args[0] == 2
+        ), "a chunked request with no active row stole a draft row from a live decode request"
+
     def test_all_requests_draft_when_no_chunk_is_in_flight(self):
         context = _make_context(num_decode_requests=2, chunked_prefill_request_id=-1)
         controller, _, context = _make_draft_loop_controller(
@@ -857,7 +901,10 @@ class TestSerialMtpDraftLoop:
             # `mtp_inference_context=None` fails with "argument mismatch: Unexpected kwargs".
             assert "mtp_inference_context" not in call
         context._mtp_begin_decode.assert_not_called()
-        context.mtp_metadata.end_forward.assert_not_called()
+        # `end_forward` is NOT part of this assertion: the phase scope calls it unconditionally
+        # on exit, and it is a no-op here because a disabled `MTPMetadata` never leaves
+        # `MTPForwardMode.NONE`. What matters is that no draft KV bookkeeping was entered.
+        assert context.mtp_metadata.forward_active is False
 
     def test_draft_forwards_receive_the_inference_context_when_enabled(self):
         """Without the context the MTP attention runs cache-free and appends nothing."""

@@ -8,18 +8,17 @@ for one depth or for the varlen commit pass, and leaving again. It also owns the
 decides whether this model/config can populate a draft KV plane at all.
 """
 
-from typing import TYPE_CHECKING, Optional
+import contextlib
+from typing import List, Optional
 
 import torch
 from torch import Tensor
 
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
+from megatron.core.transformer.enums import InferenceCudaGraphScope
 
 from .attention_context.mha_metadata import MHAMetadata
 from .mtp_metadata import MTPForwardMode
-
-if TYPE_CHECKING:
-    from megatron.core.inference.config import MambaInferenceStateConfig
 
 
 class MTPContextMixin:
@@ -27,16 +26,14 @@ class MTPContextMixin:
 
     @staticmethod
     def should_enable_mtp_kv_cache(
-        model_config,
-        mamba_inference_state_config: "Optional[MambaInferenceStateConfig]",
-        num_speculative_tokens: int,
+        model_config, mtp_layer_type_list: Optional[List[str]], num_speculative_tokens: int
     ) -> bool:
         """Whether this model/config can populate an MTP draft-KV plane.
 
         Args:
             model_config: Transformer config, read for the MTP head's shape.
-            mamba_inference_state_config (Optional[MambaInferenceStateConfig]): Carries the MTP
-                head's layer pattern when the model is hybrid; None otherwise.
+            mtp_layer_type_list (Optional[List[str]]): Layer types of one MTP draft-head depth
+                for a hybrid model; None for a non-hybrid one.
             num_speculative_tokens (int): Draft depth; 0 disables speculative decoding.
 
         Returns:
@@ -52,20 +49,17 @@ class MTPContextMixin:
         ):
             return False
 
-        head_layer_types = (
-            mamba_inference_state_config.mtp_layer_type_list
-            if mamba_inference_state_config is not None
-            else None
-        )
-        if head_layer_types is None:
+        if mtp_layer_type_list is None:
             # Non-hybrid model -- `HybridModel` builds a head only when the pattern has an MTP
             # section, so a hybrid head always exposes one. That layer is cloned from the last
             # decoder layer spec, so it is attention by construction.
             return True
 
+        # The reserved slot holds one layer's KV, so a head with a second attention layer would
+        # have both depths read and write the same plane.
         attention_symbols = (Symbols.ATTENTION, Symbols.DS_ATTENTION, Symbols.MLA)
-        num_attention = sum(t in attention_symbols for t in head_layer_types)
-        has_recurrent = any(t in (Symbols.MAMBA, Symbols.GDN) for t in head_layer_types)
+        num_attention = sum(t in attention_symbols for t in mtp_layer_type_list)
+        has_recurrent = any(t in (Symbols.MAMBA, Symbols.GDN) for t in mtp_layer_type_list)
         return num_attention == 1 and not has_recurrent
 
     # ------------------------------------------------------------------
@@ -85,6 +79,39 @@ class MTPContextMixin:
     # The metadata is driven directly on the GPU, bypassing the coalesced CPU->GPU bookkeeping
     # transfer, so draft forwards never disturb the main step's Mamba/H2D state.
     # ------------------------------------------------------------------
+    @contextlib.contextmanager
+    def _mtp_forward_phase(self):
+        """Scope one step's MTP forwards and undo their effects on the context on the way out.
+
+        Every MTP forward republishes the active attention metadata, token counts and CUDA-graph
+        flag, and leaves `forward_mode` set so KV append/read route to the draft plane. Log-prob
+        computation runs after this scope and reads those fields expecting the MAIN forward's
+        values, and a `forward_mode` left set would keep `is_decode_only` False and KV routing on
+        the draft plane for the rest of the run. Both are undone on exit, including when a draft
+        forward raises.
+        """
+        saved = (
+            self.active_attn_metadata,
+            self.active_token_count,
+            self.padded_active_token_count,
+            self._using_cuda_graph_this_step,
+        )
+        try:
+            yield
+        finally:
+            self.mtp_metadata.end_forward()
+            # In eager mode `forward()` assigns the hidden states straight to the context
+            # attribute; release it so the tensor can be collected. Under block-scope CUDA graphs
+            # the attribute is a pre-allocated buffer that must persist across replays.
+            if self.inference_cuda_graph_scope != InferenceCudaGraphScope.block:
+                self.mtp_decoder_hidden_states = None
+            (
+                self.active_attn_metadata,
+                self.active_token_count,
+                self.padded_active_token_count,
+                self._using_cuda_graph_this_step,
+            ) = saved
+
     def _mtp_activate_attn_metadata(
         self,
         graphed: bool,

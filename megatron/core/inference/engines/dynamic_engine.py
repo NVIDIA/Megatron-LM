@@ -2247,9 +2247,23 @@ class DynamicInferenceEngine(AbstractEngine):
                     and request_id != consumed_chunked_prefill_request_id
                     and request_id not in self.stop_word_being_finished_ids
                 ):
-                    emitted = max(0, len(tokens) - num_stop_word_trim)
-                    if emitted:
+                    emitted = len(tokens) - num_stop_word_trim
+                    if emitted > 0:
                         request.acceptance_step_lengths.append(emitted)
+                    else:
+                        # A stop sequence can reach back past this step's tokens, removing ones
+                        # earlier entries already counted. Unwind them so the list keeps summing
+                        # to `generated_length`; a client reconstructing acceptance from it
+                        # would otherwise read a length longer than the output.
+                        residual = -emitted
+                        while residual > 0 and request.acceptance_step_lengths:
+                            last = request.acceptance_step_lengths[-1]
+                            if last > residual:
+                                request.acceptance_step_lengths[-1] = last - residual
+                                residual = 0
+                            else:
+                                residual -= last
+                                request.acceptance_step_lengths.pop()
 
                 # Track per-position acceptance statistics for logging.
                 # Skip prefill requests: MTP heads only propose speculative tokens

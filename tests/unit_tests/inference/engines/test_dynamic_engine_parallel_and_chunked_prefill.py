@@ -817,6 +817,206 @@ class TestDynamicInferenceEngineParallel(DynamicInferenceEngineTestBase):
             f"chunked_prefill={enable_chunked_prefill}, prefix_caching={enable_prefix_caching}"
         )
 
+    @staticmethod
+    def _draft_kv_at(context, row, position):
+        """The MTP draft key/value this request reads at `position`, as a flat CPU tensor."""
+        bs = context.block_size_tokens
+        block = int(context.request_to_kv_block_ids[row][position // bs].item())
+        assert block >= 0, f"row {row} has no block for position {position}"
+        slot = context.mtp_kv_layer_slot
+        # [2 (k/v), layer, block, slot_in_block, heads, head_dim]
+        return context.memory_buffer[:, slot, block, position % bs].detach().float().cpu()
+
+    @staticmethod
+    def _branching_prompts(block_size, vocab_size):
+        """Three prompts forming the branching-prefix case that the back-off does not cover.
+
+        A and B share block 0 exactly but diverge at the FIRST token of block 1, so B matches
+        A's block 0 by hash. C repeats B. All three are two full blocks, so every block is
+        complete and hashable. The caller also replays A itself as a fourth request, which
+        SHOULD inherit.
+        """
+        shared = torch.arange(block_size, dtype=torch.int64) % (vocab_size - 1)
+        tail_a = torch.full((block_size,), 11, dtype=torch.int64)
+        tail_b = torch.full((block_size,), 22, dtype=torch.int64)
+        prompt_a = torch.cat([shared, tail_a])
+        prompt_b = torch.cat([shared, tail_b])
+        return prompt_a, prompt_b, prompt_b.clone()
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @pytest.mark.parametrize("enable_chunked_prefill", [False, True])
+    @torch.inference_mode()
+    def test_branching_prefix_does_not_inherit_a_foreign_lookahead_entry(
+        self, enable_chunked_prefill
+    ):
+        """A block's final draft entry is only reusable by a consumer with the same next token.
+
+        The back-off drops the LAST matched block because its final draft slot consumes one
+        token past the block. That assumes the rest of the matched chain came from a producer
+        with the same continuation, which branching breaks:
+
+          A = [shared | tail_a]  registers A0, A1.
+          B = [shared | tail_b]  matches [A0]; the back-off drops it, so B recomputes block 0
+                                 privately and registers B1 (whose parent hash is A0's).
+          C = B                  matches [A0, B1]; the back-off drops only B1, so C INHERITS
+                                 A0 -- whose final draft slot paired A's tail token, not B's.
+
+        Prefix caching may not change the draft KV, so running the same three prompts with it
+        disabled is an exact oracle. Only the block-0 boundary position is compared: that is
+        the one entry whose value depends on a token outside its own block.
+
+        Chunked prefill is parametrized because a continuation chunk matches from
+        `already_allocated_blocks` rather than block 0, so the comparison must convert its
+        offset into the match back into an absolute block index before indexing the prompt.
+        """
+        from tests.unit_tests.inference.engines.test_dynamic_engine import DynamicEngineTestConfig
+
+        skip_if_mamba_sequence_packing_not_available("hybrid")
+
+        block_size = 256
+        # Every earlier request must still be generating when the last one arrives: a finished
+        # request's blocks are released, recycled and deregistered, leaving nothing to match.
+        # Chunked prefill spends several steps per arrival, so it needs the longer budget.
+        tokens_to_generate = 24 if enable_chunked_prefill else 4
+
+        def run(enable_prefix_caching):
+            test_config = DynamicEngineTestConfig(
+                num_requests=0,
+                model_provider="hybrid",
+                mtp_layer_pattern="*-",
+                num_speculative_tokens=2,
+                mtp_use_repeated_layer=True,
+                enable_prefix_caching=enable_prefix_caching,
+                prefix_caching_mamba_gb=0.2 if enable_prefix_caching else None,
+                enable_chunked_prefill=enable_chunked_prefill,
+                num_tokens_to_generate=tokens_to_generate,
+                max_sequence_length=1024,
+                context_block_size_tokens=block_size,
+                # A token budget below the 2-block prompt is what forces chunking.
+                context_max_tokens=384 if enable_chunked_prefill else 1024,
+                context_max_requests=4,
+                materialize_only_last_token_logits=False,
+            )
+            env = self._build_test_env(test_config)
+            context = env.engine.context
+            self._assert_mtp_kv_cache_active(env)
+            prompts = self._branching_prompts(block_size, test_config.vocab_size)
+
+            # Diagnostics: every prefix-match decision, so a vacuous run says which invariant
+            # broke (nothing registered / nothing matched / match truncated / skip zeroed)
+            # instead of only that no hit occurred.
+            trace = []
+            _orig_match = context._compute_prefix_match
+
+            def _traced_match(req, *args, **kwargs):
+                m = _orig_match(req, *args, **kwargs)
+                trace.append(
+                    f"req={req.request_id} finished={req.finished_chunk_token_count} "
+                    f"chunk={args[0] if args else kwargs.get('prefill_chunk_length')} "
+                    f"matched={len(m.matched_block_ids)} backed_off={m.backed_off_blocks} "
+                    f"skip={m.prefix_skip_tokens} "
+                    # The hash map exists only when prefix caching is on; the oracle run has
+                    # no registry at all.
+                    f"registry={len(getattr(alloc, 'kv_hash_to_block_id', ()))}"
+                )
+                return m
+
+            alloc = context.kv_block_allocator
+            context._compute_prefix_match = _traced_match
+
+            def add(request_id, prompt):
+                env.engine.add_request(
+                    request_id=request_id,
+                    prompt=prompt.to("cuda"),
+                    sampling_params=SamplingParams(
+                        num_tokens_to_generate=tokens_to_generate,
+                        termination_id=-1,
+                        top_k=1,
+                        top_p=0.0,
+                    ),
+                )
+
+            boundary = None
+            saw_chunking = False
+
+            def step():
+                nonlocal saw_chunking
+                env.engine.step_modern()
+                saw_chunking |= context.chunked_prefill_request_id != -1
+
+            def sample_c():
+                """Record C's block-0 boundary entry while its row is live."""
+                nonlocal boundary
+                for r in range(context.paused_request_count, context.total_request_count):
+                    if int(context.request_ids[r].item()) != 2:
+                        continue
+                    # Only once C has prefilled past the boundary is the entry meaningful.
+                    if int(context.request_kv_length_offsets[r].item()) > block_size:
+                        boundary = self._draft_kv_at(context, r, block_size - 1)
+
+            # Requests must overlap: a drained request's blocks are free, so the pool hands
+            # them to the next request and deregisters them, and no match ever happens. One
+            # step between arrivals is enough for the previous request to prefill and register.
+            def settle():
+                """Step until the newest request has finished prefilling.
+
+                One step is enough only when a prompt prefills in a single forward. Under
+                chunked prefill it does not, and the engine tracks a single in-flight chunked
+                request, so the next arrival must wait for the current one to register its
+                blocks or it matches against nothing. The requests stay alive either way --
+                they still have tokens to generate -- which is what keeps their blocks
+                ref-counted and registered for the following match.
+                """
+                step()
+                for _ in range(16):
+                    if context.chunked_prefill_request_id == -1:
+                        return
+                    step()
+                raise AssertionError("prefill never settled; the chunk budget is too small")
+
+            add(0, prompts[0])
+            settle()
+            add(1, prompts[1])
+            settle()
+            add(2, prompts[2])
+            settle()
+            sample_c()
+            # D repeats A exactly, so A's recorded lookahead token agrees with D's and the
+            # match survives truncation. Without it the run would legitimately skip nothing
+            # (C must not inherit), and the non-vacuity guard could not tell a working cache
+            # from a dead one.
+            add(3, prompts[0])
+            while env.engine.has_unfinished_requests():
+                step()
+                sample_c()
+            assert boundary is not None, "request C never held a live row past the boundary"
+            return boundary, env, saw_chunking, trace
+
+        with_caching, env_on, saw_chunking, trace = run(enable_prefix_caching=True)
+        without_caching, _, _, _ = run(enable_prefix_caching=False)
+
+        if enable_chunked_prefill:
+            assert saw_chunking, "no request was ever chunked, so continuation matches never ran"
+
+        # D's hit proves the truncation did not simply disable the cache; C's oracle below
+        # proves it fired where it had to.
+        assert env_on.engine._prefill_tokens_skipped > 0, (
+            "no prefix-cache hit occurred at all, so the truncation has disabled prefix "
+            "caching. Prefix-match trace:\n  " + "\n  ".join(trace)
+        )
+
+        # An inherited foreign entry differs by an embedded token, not by reduction order, so
+        # the gap is large. The tolerance only absorbs genuine FP noise between the two runs.
+        max_diff = (with_caching - without_caching).abs().max().item()
+        assert max_diff < 1e-2, (
+            f"C's draft KV at the block-0 boundary differs by {max_diff:.4f} between "
+            f"prefix-caching on and off; it inherited a final draft slot computed against "
+            f"another request's next token."
+        )
+
     @pytest.mark.internal
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"

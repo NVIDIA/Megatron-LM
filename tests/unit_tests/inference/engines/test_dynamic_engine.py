@@ -4826,6 +4826,15 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             for i in range(len(finished_req.generated_tokens) - 2)
         ]
         assert [7, 8, 9] in token_triplets
+        # A stop sequence longer than the draft depth can reach back past the step that
+        # triggered it, removing tokens earlier `acceptance_step_lengths` entries counted. The
+        # list must still sum to the output length, or a client reconstructing acceptance from
+        # it reads more tokens than were emitted.
+        assert sum(finished_req.acceptance_step_lengths) == len(finished_req.generated_tokens), (
+            f"acceptance_step_lengths {finished_req.acceptance_step_lengths} sums to "
+            f"{sum(finished_req.acceptance_step_lengths)} but the request emitted "
+            f"{len(finished_req.generated_tokens)} tokens"
+        )
 
     @pytest.mark.internal
     @pytest.mark.skipif(
@@ -6434,6 +6443,16 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             # All tokens should be 0 (deterministic prediction).
             assert all(t == 0 for t in req.generated_tokens), (
                 f"Request {req.request_id}: expected all token 0, " f"got {req.generated_tokens}"
+            )
+            # A suspend/resume splits the request into segments whose `generated_tokens` and
+            # `acceptance_step_lengths` are concatenated by `merge()`. The per-step lengths must
+            # still sum to the emitted token count across that boundary, or a client
+            # reconstructing acceptance reads a length the request never produced.
+            assert sum(req.acceptance_step_lengths) == len(req.generated_tokens), (
+                f"Request {req.request_id}: acceptance_step_lengths "
+                f"{req.acceptance_step_lengths} sums to {sum(req.acceptance_step_lengths)} "
+                f"across {len(record.requests)} segment(s), but the request emitted "
+                f"{len(req.generated_tokens)} tokens"
             )
 
         assert engine.context.active_token_count == 0
