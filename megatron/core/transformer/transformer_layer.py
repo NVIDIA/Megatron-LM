@@ -33,6 +33,11 @@ from megatron.core.transformer.enums import CudaGraphModule, InferenceCudaGraphS
 from megatron.core.transformer.identity_op import IdentityFuncOp, IdentityOp
 from megatron.core.transformer.mlp import MLP
 from megatron.core.transformer.module import GraphableMegatronModule, TwoStageAttentionLayer
+from megatron.core.transformer.residual_recompute import (
+    ResidualStreamRecomputeContext,
+    checkpoint_residual_read,
+    checkpoint_residual_write,
+)
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -713,6 +718,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         context_mask: Optional[Tensor] = None,
         inference_context: Optional[BaseInferenceContext] = None,
         attn_state=(),
+        residual_stream_recompute_context: ResidualStreamRecomputeContext | None = None,
     ):
         """Apply checkpoint bookkeeping, self-attention BDA, and cross-attention."""
         if self._input_layernorm_checkpoint_active:
@@ -722,9 +728,17 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
                 attention_output_with_bias[0]
             )
 
-        hidden_states = self._apply_self_attn_bda_step(
-            attention_output_with_bias, residual, attn_state
-        )
+        if residual_stream_recompute_context is None:
+            hidden_states = self._apply_self_attn_bda_step(
+                attention_output_with_bias, residual, attn_state
+            )
+        else:
+            hidden_states = self._apply_self_attn_bda_step(
+                attention_output_with_bias,
+                residual,
+                attn_state,
+                residual_stream_recompute_context=residual_stream_recompute_context,
+            )
         return self._run_cross_attention(hidden_states, context, context_mask, inference_context)
 
     def _forward_attention(
@@ -742,6 +756,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         packed_seq_params: Optional[PackedSeqParams] = None,
         sequence_len_offset: Optional[Tensor] = None,
         padding_mask: Optional[Tensor] = None,
+        residual_stream_recompute_context: ResidualStreamRecomputeContext | None = None,
         *,
         inference_params: Optional[Any] = None,
     ):
@@ -765,6 +780,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             packed_seq_params (object, optional): Parameters for packed sequence processing.
             sequence_len_offset (Tensor, optional): Offset along sequence dimension
                 during inference.
+            residual_stream_recompute_context (ResidualStreamRecomputeContext, optional):
+                Call-local ordered replay state for configured residual connections.
 
         Returns:
             Tuple[Tensor, Tensor]: A tuple containing:
@@ -773,7 +790,12 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
                 otherwise None.
         """
         inference_context = deprecate_inference_params(inference_context, inference_params)
-        input_layernorm_output, residual, attn_state = self._run_input_layernorm(hidden_states)
+        if residual_stream_recompute_context is None:
+            input_layernorm_output, residual, attn_state = self._run_input_layernorm(hidden_states)
+        else:
+            input_layernorm_output, residual, attn_state = self._run_input_layernorm(
+                hidden_states, residual_stream_recompute_context=residual_stream_recompute_context
+            )
 
         using_fused_tp_inference_kernel = (
             InferenceMode.is_active() and self.config.inference_fuse_tp_communication
@@ -806,6 +828,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             context_mask=context_mask,
             inference_context=inference_context,
             attn_state=attn_state,
+            residual_stream_recompute_context=residual_stream_recompute_context,
         )
 
     def forward_pre_attn_and_core_attn(
@@ -871,7 +894,11 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
 
         return None
 
-    def _run_input_layernorm(self, hidden_states):
+    def _run_input_layernorm(
+        self,
+        hidden_states,
+        residual_stream_recompute_context: ResidualStreamRecomputeContext | None = None,
+    ):
         """Run input layernorm with optional output-discarding checkpoint and
         fine-grained activation offloading.
 
@@ -887,21 +914,38 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             it for the corresponding write state; otherwise base returns ``()``.
         """
         residual_connection = self._get_self_attention_residual_connection()
+        recompute_context = (
+            residual_stream_recompute_context if residual_connection is not None else None
+        )
         connection_state = ()
         if residual_connection is not None:
-            hidden_states, connection_state = apply_module(residual_connection)(
-                hidden_states,
-                operation="read",
-                fp32_residual_connection=self.config.fp32_residual_connection,
-            )
+            if recompute_context is None:
+                hidden_states, connection_state = apply_module(residual_connection)(
+                    hidden_states,
+                    operation="read",
+                    fp32_residual_connection=self.config.fp32_residual_connection,
+                )
+            else:
+                hidden_states, connection_state = checkpoint_residual_read(
+                    residual_connection,
+                    hidden_states,
+                    recompute_context,
+                    fp32_residual_connection=self.config.fp32_residual_connection,
+                )
 
         self.attn_norm_manager = self.off_interface(
-            self.offload_attn_norm, hidden_states, "attn_norm"
+            self.offload_attn_norm and recompute_context is None, hidden_states, "attn_norm"
         )
-        self._input_layernorm_checkpoint_active = self.recompute_input_layernorm
+        replay_input_layernorm = recompute_context is not None and not isinstance(
+            self.input_layernorm, IdentityOp
+        )
+        self._input_layernorm_checkpoint_active = (
+            self.recompute_input_layernorm or replay_input_layernorm
+        )
         if self._input_layernorm_checkpoint_active:
             self.input_layernorm_checkpoint = tensor_parallel.CheckpointWithoutOutput(
-                retain_input_tensors=self._input_layernorm_returns_residual
+                ckpt_manager=recompute_context.manager if replay_input_layernorm else None,
+                retain_input_tensors=self._input_layernorm_returns_residual,
             )
             with self.attn_norm_manager as hidden_states:
                 input_layernorm_output = self.input_layernorm_checkpoint.checkpoint(
@@ -910,6 +954,14 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         else:
             with self.attn_norm_manager as hidden_states:
                 input_layernorm_output = apply_module(self.input_layernorm)(hidden_states)
+
+        if recompute_context is not None and self.config.fine_grained_activation_offloading:
+            output = (
+                input_layernorm_output[0]
+                if isinstance(input_layernorm_output, tuple)
+                else input_layernorm_output
+            )
+            self.off_interface.mark_not_offload(output)
 
         if self._input_layernorm_returns_residual:
             input_layernorm_output, residual = input_layernorm_output
@@ -924,7 +976,13 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             residual = residual.float()
         return input_layernorm_output, residual, connection_state
 
-    def _apply_self_attn_bda_step(self, attention_output_with_bias, residual, attn_state=()):
+    def _apply_self_attn_bda_step(
+        self,
+        attention_output_with_bias,
+        residual,
+        attn_state=(),
+        residual_stream_recompute_context: ResidualStreamRecomputeContext | None = None,
+    ):
         """bias-dropout-add for self-attention output + post-step offload commit.
 
         Subclasses may override this to consume custom intermediates threaded via
@@ -935,6 +993,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             InferenceMode.is_active() and self.config.inference_fuse_tp_communication
         )
         residual_connection = self._get_self_attention_residual_connection()
+        recompute_context = (
+            residual_stream_recompute_context if residual_connection is not None else None
+        )
         # TODO: could we move `bias_dropout_add_exec_handler` itself
         # inside the module provided in the `bias_dropout_add_spec` module?
         nvtx_range_push(suffix="self_attn_bda")
@@ -946,14 +1007,29 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         elif residual_connection is not None:
             if not attn_state:
                 raise RuntimeError("Missing state for the self-attention residual connection.")
-            with self.bias_dropout_add_exec_handler():
-                hidden_states = apply_module(residual_connection)(
+            is_terminal_write = bool(
+                recompute_context is not None
+                and recompute_context.is_block_end
+                and self._get_mlp_residual_connection() is None
+            )
+            if recompute_context is not None and not is_terminal_write:
+                hidden_states = checkpoint_residual_write(
+                    residual_connection,
                     attention_output_with_bias,
-                    operation="write",
-                    state=attn_state,
+                    attn_state,
+                    recompute_context,
                     dropout_probability=self.hidden_dropout,
                     training=self.training,
                 )
+            else:
+                with self.bias_dropout_add_exec_handler():
+                    hidden_states = apply_module(residual_connection)(
+                        attention_output_with_bias,
+                        operation="write",
+                        state=attn_state,
+                        dropout_probability=self.hidden_dropout,
+                        training=self.training,
+                    )
         else:
             with self.bias_dropout_add_exec_handler():
                 hidden_states = self.self_attn_bda(self.training, self.config.bias_dropout_fusion)(
@@ -1013,19 +1089,41 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         ):
             hidden_states, context = self._forward_attention(*args, **kwargs)
             with _otel_managed_span('layer', 'megatron.layer.mlp'):
+                residual_stream_recompute_context = kwargs.get(
+                    "residual_stream_recompute_context", None
+                )
+                mlp_kwargs = {
+                    "padding_mask": kwargs.get("padding_mask", None),
+                    "packed_seq_params": kwargs.get("packed_seq_params", None),
+                }
+                if residual_stream_recompute_context is not None:
+                    mlp_kwargs["residual_stream_recompute_context"] = (
+                        residual_stream_recompute_context
+                    )
                 output = self._forward_mlp(
-                    hidden_states,
-                    kwargs.get("inference_context", None),
-                    padding_mask=kwargs.get("padding_mask", None),
-                    packed_seq_params=kwargs.get("packed_seq_params", None),
+                    hidden_states, kwargs.get("inference_context", None), **mlp_kwargs
                 )
             return output, context
 
-    def _forward_pre_mlp_layernorm(self, hidden_states: Tensor):
-        self.mlp_norm_manager = self.off_interface(self.offload_mlp_norm, hidden_states, "mlp_norm")
-        if self.recompute_pre_mlp_layernorm:
+    def _forward_pre_mlp_layernorm(
+        self,
+        hidden_states: Tensor,
+        residual_stream_recompute_context: ResidualStreamRecomputeContext | None = None,
+    ):
+        self.mlp_norm_manager = self.off_interface(
+            self.offload_mlp_norm and residual_stream_recompute_context is None,
+            hidden_states,
+            "mlp_norm",
+        )
+        replay_pre_mlp_layernorm = residual_stream_recompute_context is not None and not isinstance(
+            self.pre_mlp_layernorm, IdentityOp
+        )
+        if self.recompute_pre_mlp_layernorm or replay_pre_mlp_layernorm:
             self.pre_mlp_norm_checkpoint = tensor_parallel.CheckpointWithoutOutput(
-                retain_input_tensors=self._pre_mlp_layernorm_returns_residual
+                ckpt_manager=(
+                    residual_stream_recompute_context.manager if replay_pre_mlp_layernorm else None
+                ),
+                retain_input_tensors=self._pre_mlp_layernorm_returns_residual,
             )
             with self.mlp_norm_manager as hidden_states:
                 pre_mlp_layernorm_output = self.pre_mlp_norm_checkpoint.checkpoint(
@@ -1034,6 +1132,17 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         else:
             with self.mlp_norm_manager as hidden_states:
                 pre_mlp_layernorm_output = apply_module(self.pre_mlp_layernorm)(hidden_states)
+
+        if (
+            residual_stream_recompute_context is not None
+            and self.config.fine_grained_activation_offloading
+        ):
+            output = (
+                pre_mlp_layernorm_output[0]
+                if isinstance(pre_mlp_layernorm_output, tuple)
+                else pre_mlp_layernorm_output
+            )
+            self.off_interface.mark_not_offload(output)
 
         return pre_mlp_layernorm_output
 
@@ -1076,7 +1185,11 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             return output
         return output.transpose(0, 1).reshape(mbs * packed_seq_params.tokens_per_sample, 1, -1)
 
-    def _pre_mlp_layernorm_and_residual(self, hidden_states):
+    def _pre_mlp_layernorm_and_residual(
+        self,
+        hidden_states,
+        residual_stream_recompute_context: ResidualStreamRecomputeContext | None = None,
+    ):
         """Run pre-MLP layernorm (with optional recompute and offload), unpack a
         tuple-output layernorm, and apply the fp32-residual cast.
 
@@ -1088,15 +1201,28 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             uses it for the corresponding write state; otherwise base returns ``()``.
         """
         residual_connection = self._get_mlp_residual_connection()
+        recompute_context = (
+            residual_stream_recompute_context if residual_connection is not None else None
+        )
         connection_state = ()
         if residual_connection is not None:
-            hidden_states, connection_state = apply_module(residual_connection)(
-                hidden_states,
-                operation="read",
-                fp32_residual_connection=self.config.fp32_residual_connection,
-            )
+            if recompute_context is None:
+                hidden_states, connection_state = apply_module(residual_connection)(
+                    hidden_states,
+                    operation="read",
+                    fp32_residual_connection=self.config.fp32_residual_connection,
+                )
+            else:
+                hidden_states, connection_state = checkpoint_residual_read(
+                    residual_connection,
+                    hidden_states,
+                    recompute_context,
+                    fp32_residual_connection=self.config.fp32_residual_connection,
+                )
 
-        pre_mlp_layernorm_output = self._forward_pre_mlp_layernorm(hidden_states)
+        pre_mlp_layernorm_output = self._forward_pre_mlp_layernorm(
+            hidden_states, residual_stream_recompute_context=recompute_context
+        )
 
         if self._pre_mlp_layernorm_returns_residual:
             pre_mlp_layernorm_output, residual = pre_mlp_layernorm_output
@@ -1152,6 +1278,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         inference_context: BaseInferenceContext | None = None,
         padding_mask: Tensor | None = None,
         packed_seq_params=None,
+        residual_stream_recompute_context: ResidualStreamRecomputeContext | None = None,
     ) -> Tensor | list[Tensor | None]:
         """
         Perform a forward pass through the feed-forward layer.
@@ -1166,12 +1293,19 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
                 The MoELayer will internally transform this to [seq_length, bsz] format.
             packed_seq_params: Packed sequence parameters, used to detect flattened
                 batches that need reshaping for MoE sequence load balancing.
+            residual_stream_recompute_context: Call-local ordered replay state for the
+                configured MLP residual connection.
         Returns:
             output (Tensor): Transformed hidden states of shape [s, b, h].
         """
-        pre_mlp_layernorm_output, residual, mlp_state = self._pre_mlp_layernorm_and_residual(
-            hidden_states
-        )
+        if residual_stream_recompute_context is None:
+            pre_mlp_layernorm_output, residual, mlp_state = self._pre_mlp_layernorm_and_residual(
+                hidden_states
+            )
+        else:
+            pre_mlp_layernorm_output, residual, mlp_state = self._pre_mlp_layernorm_and_residual(
+                hidden_states, residual_stream_recompute_context=residual_stream_recompute_context
+            )
 
         pre_mlp_layernorm_output, padding_mask, moe_unflatten_mbs = self._maybe_unflatten_for_moe(
             pre_mlp_layernorm_output, padding_mask, packed_seq_params
@@ -1204,7 +1338,14 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
                     self.pre_mlp_norm_checkpoint.discard_output_and_register_recompute(tensor)
             return list(mlp_output_with_bias) + [residual]
         else:
-            return self._apply_mlp_bda_step(mlp_output_with_bias, residual, mlp_state)
+            if residual_stream_recompute_context is None:
+                return self._apply_mlp_bda_step(mlp_output_with_bias, residual, mlp_state)
+            return self._apply_mlp_bda_step(
+                mlp_output_with_bias,
+                residual,
+                mlp_state,
+                residual_stream_recompute_context=residual_stream_recompute_context,
+            )
 
     def _run_mlp(
         self,
@@ -1300,6 +1441,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         mlp_output_with_bias: tuple[Tensor, Tensor | None],
         residual: Tensor,
         mlp_state: tuple = (),
+        residual_stream_recompute_context: ResidualStreamRecomputeContext | None = None,
     ) -> Tensor:
         """
         Perform operations after the MLP computation: bias-dropout-add for
@@ -1338,6 +1480,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             InferenceMode.is_active() and self.config.inference_fuse_tp_communication
         )
         residual_connection = self._get_mlp_residual_connection()
+        recompute_context = (
+            residual_stream_recompute_context if residual_connection is not None else None
+        )
         if self.recompute_pre_mlp_layernorm:
             # discard the output of the pre-mlp layernorm and register the recompute
             # as a gradient hook of mlp_output_with_bias[0]
@@ -1356,14 +1501,24 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         elif residual_connection is not None:
             if not mlp_state:
                 raise RuntimeError("Missing state for the MLP residual connection.")
-            with self.bias_dropout_add_exec_handler():
-                hidden_states = apply_module(residual_connection)(
+            if recompute_context is not None and not recompute_context.is_block_end:
+                hidden_states = checkpoint_residual_write(
+                    residual_connection,
                     mlp_output_with_bias,
-                    operation="write",
-                    state=mlp_state,
+                    mlp_state,
+                    recompute_context,
                     dropout_probability=self.hidden_dropout,
                     training=self.training,
                 )
+            else:
+                with self.bias_dropout_add_exec_handler():
+                    hidden_states = apply_module(residual_connection)(
+                        mlp_output_with_bias,
+                        operation="write",
+                        state=mlp_state,
+                        dropout_probability=self.hidden_dropout,
+                        training=self.training,
+                    )
         else:
             with self.bias_dropout_add_exec_handler():
                 hidden_states = self.mlp_bda(self.training, self.config.bias_dropout_fusion)(
