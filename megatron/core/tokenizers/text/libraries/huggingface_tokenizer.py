@@ -13,6 +13,7 @@ except ModuleNotFoundError:
 from megatron.core.utils import log_single_rank
 
 from .abstract_tokenizer import MegatronTokenizerTextAbstract
+from .tokenizer_offsets import get_huggingface_token_offsets
 
 try:
     import gigatoken as gt
@@ -312,6 +313,17 @@ class HuggingFaceTokenizer(MegatronTokenizerTextAbstract):
         """Applies chat template and tokenizes results"""
         return self._hf_tokenizer.apply_chat_template(
             conversation=conversation, chat_template=chat_template, **kwargs
+        )
+
+    def offsets(self, ids: list[int], text: str) -> list[int]:
+        """Return character offsets for IDs in their detokenized text."""
+        # Inference can override include_special_tokens when detokenizing.
+        remove_special_tokens = self.ids_to_text(ids, remove_special_tokens=True) == text
+        return get_huggingface_token_offsets(
+            self._hf_tokenizer,
+            ids,
+            text,
+            lambda prefix: self.ids_to_text(prefix, remove_special_tokens=remove_special_tokens),
         )
 
     def encode_files(self, paths: list[str], field: str = "text") -> "ak.Array":

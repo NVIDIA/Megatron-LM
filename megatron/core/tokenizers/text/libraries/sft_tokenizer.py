@@ -5,6 +5,8 @@ from typing import Dict, List, Union
 
 import numpy as np
 
+from .tokenizer_offsets import get_huggingface_token_offsets
+
 try:
     import transformers
 
@@ -245,6 +247,10 @@ class SFTTokenizer:
     def add_special_tokens(self):
         """Add special tokens."""
         raise NotImplementedError("This method is not supported for SFTTokenizer.")
+
+    def offsets(self, ids: list[int], text: str) -> list[int]:
+        """Return character offsets for IDs in their detokenized text."""
+        return get_huggingface_token_offsets(self._tokenizer, ids, text, self.ids_to_text)
 
     @property
     def pad_id(self):
