@@ -160,14 +160,12 @@ def test_quantized_dbuffer_allgathers_every_plane(distributed_setup, use_out):
     source = QuantizedDBuffer(mesh, [BlockAtomic(32)], shapes, distributed_setup.device)
     for index, plane in enumerate(source.planes):
         plane.local_buffer.fill_(index * mesh.size() + mesh.get_local_rank())
-    destination = (
-        QuantizedDBuffer(mesh, [Replicate()], shapes, distributed_setup.device) if use_out else None
-    )
-
-    result = source.allgather(0, out=destination)
-
     if use_out:
+        destination = QuantizedDBuffer(mesh, [Replicate()], shapes, distributed_setup.device)
+        result = source.allgather(0, out=destination)
         assert result is destination
+    else:
+        result = source.allgather(0)
     for index, plane in enumerate(result.planes):
         assert plane.placements == (Replicate(),)
         chunks = plane.local_buffer.view(mesh.size(), -1)
