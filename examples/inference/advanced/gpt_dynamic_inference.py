@@ -11,10 +11,9 @@ import warnings
 from collections import defaultdict
 from typing import Dict, List, Optional
 
+from megatron.training.arguments import parse_and_validate_args
 import torch
 from tqdm import tqdm
-
-from megatron.training.arguments import parse_and_validate_args
 
 sys.path.append(
     os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir, os.path.pardir))
@@ -143,9 +142,9 @@ def run_inference(
 
         # Update requests.
         active_request_ids = result["active_request_ids"]
-        finished_requests = result["finished_requests"]
+        finished_request_records = result["finished_request_records"]
         step_time = result["step_time"]
-        if len(active_request_ids) > 0 or len(finished_requests) > 0:
+        if len(active_request_ids) > 0 or len(finished_request_records) > 0:
             if is_decode_only:
                 step_times["decode"].append(step_time)
             else:
@@ -153,8 +152,9 @@ def run_inference(
 
             # Append output tokens.
             output_start = get_curr_time(do_broadcast=False)
-            for finished_request in finished_requests:
-                finished_request.finalize_text(engine.controller.tokenizer)
+            for finished_request_record in finished_request_records:
+
+                finished_request = finished_request_record.merge()
 
                 # Update local request object.
                 request = requests[finished_request.request_id]

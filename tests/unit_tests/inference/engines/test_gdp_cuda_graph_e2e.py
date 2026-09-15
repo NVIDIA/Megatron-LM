@@ -268,8 +268,9 @@ class TestGDPCudaGraphE2E:
             step_log.append(
                 (dims.prefill_req_count, dims.decode_req_count, ctx.using_cuda_graph_this_step())
             )
-            for request in result["finished_requests"]:
-                finished[request.request_id] = list(request.generated_tokens)
+            for record in result["finished_request_records"]:
+                merged = record.merge()
+                finished[merged.request_id] = list(merged.generated_tokens)
 
         return finished, step_log
 

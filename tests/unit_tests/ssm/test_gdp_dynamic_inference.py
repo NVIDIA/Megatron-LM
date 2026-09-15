@@ -640,8 +640,9 @@ class TestGDPDynamicInferenceEngine:
         # Bound the loop so a scheduling regression fails loudly instead of hanging.
         for _ in range(1000):
             result = engine.step_modern()
-            for request in result["finished_requests"]:
-                finished[request.request_id] = request
+            for record in result["finished_request_records"]:
+                merged = record.merge()
+                finished[merged.request_id] = merged
             if not engine.has_unfinished_requests():
                 break
         assert not engine.has_unfinished_requests(), "engine did not drain within step budget"
@@ -707,7 +708,8 @@ class TestGDPDynamicInferenceEngine:
 
         engine.controller.tokenize_prompt = mock_tokenize_prompt
 
-        finished = engine.generate(prompts, requests[0].sampling_params)
+        finished_records = engine.generate(prompts, requests[0].sampling_params)
+        finished = [record.merge() for record in finished_records]
 
         assert len(finished) == len(prompts)
         # generate() returns finished requests in request-id order.
