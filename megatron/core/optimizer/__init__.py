@@ -4,6 +4,7 @@ import logging
 import warnings
 from collections import defaultdict
 from dataclasses import astuple
+from functools import partial
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
@@ -89,6 +90,20 @@ from .optimizer_config import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _multi_tensor_adam_batched(kernel, chunk_size, noop_flag, tensor_lists, *args):
+    """Bound TE's temporary tensor descriptors without changing Adam groups or steps."""
+    # TE allocates descriptors for all five parameter-remainder lists before launching
+    # the kernel. Its fixed 20 MiB descriptor pool can overflow with large MoE groups.
+    # 1024 parameters need 5121 descriptors, leaving room for other live TE tensors.
+    max_params = 1024
+    num_params = len(tensor_lists[0])
+    if num_params <= max_params:
+        return kernel(chunk_size, noop_flag, tensor_lists, *args)
+    for start in range(0, num_params, max_params):
+        batch = [tensors[start : start + max_params] for tensors in tensor_lists]
+        kernel(chunk_size, noop_flag, batch, *args)
 
 
 def get_standard_config_overrides(config: OptimizerConfig) -> Dict[ParamKey, ParamGroupOverride]:
@@ -594,6 +609,10 @@ def _get_megatron_optimizer_based_on_param_groups(
                     kwargs.update({"store_param_remainders": config.store_param_remainders})
 
             optimizer = adam_cls(**kwargs)
+            if getattr(optimizer, "store_param_remainders", False):
+                optimizer.multi_tensor_adam_param_remainder = partial(
+                    _multi_tensor_adam_batched, optimizer.multi_tensor_adam_param_remainder
+                )
 
             def init_state_fn(opt, config=None):
                 for group in opt.param_groups:
