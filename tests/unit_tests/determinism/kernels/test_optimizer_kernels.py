@@ -75,7 +75,7 @@ class TestGradNormAndClip:
 
 
 def test_fused_adam_step_replays():
-    """Same params, grads and optimizer state -> identical updated params and moments."""
+    """Mixed weight-decay groups produce identical updated params and moments on replay."""
     seeded()
     shapes = [(4096, 4096), (16384, 2048), (2048,), (65536,)]
     params0 = [torch.randn(*s, device="cuda", dtype=torch.float32) for s in shapes]
@@ -85,7 +85,17 @@ def test_fused_adam_step_replays():
         params = [torch.nn.Parameter(p.clone()) for p in params0]
         for p, g in zip(params, grads):
             p.grad = g.clone()
-        opt = Adam(params, lr=1e-3, betas=(0.9, 0.95), weight_decay=0.1, eps=1e-8)
+        # Retention routing places a 1-D controller in a decayed group while ordinary
+        # vector parameters remain in a zero-WD group. Exercise both kernel paths together.
+        opt = Adam(
+            [
+                {"params": params[:3], "weight_decay": 0.1},
+                {"params": params[3:], "weight_decay": 0.0},
+            ],
+            lr=1e-3,
+            betas=(0.9, 0.95),
+            eps=1e-8,
+        )
         with RacingStreams():
             opt.step()
             opt.step()
