@@ -104,7 +104,8 @@ _TENSORBOARD_PATH=$TENSORBOARD_PATH
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
 ROOT_DIR=$(realpath $SCRIPT_DIR/../../../)
 
-IS_NEMO_TEST=$([[ $(echo "$TRAINING_SCRIPT_PATH" | tr '[:upper:]' '[:lower:]') == *nemo* ]] && echo "true" || echo "false")
+# Match the NeMo CLI, not Python scripts in directories such as nemotron/.
+IS_NEMO_TEST=$([[ "${TRAINING_SCRIPT_PATH%% *}" == "nemo" ]] && echo "true" || echo "false")
 export IS_NEMO_TEST
 
 # Adjust model_config for lightweight mode

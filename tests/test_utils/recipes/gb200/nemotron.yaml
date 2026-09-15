@@ -85,5 +85,5 @@ products:
         scope: [L2]
         cadence: [nightly]
         platforms: [dgx_gb200]
-        training_script: [examples/hybrid/puzzle.py]
+        training_script: [tests/functional_tests/test_cases/nemotron/nemotron3_puzzle_75b_nightly_tp1_pp1_cp1_ep8_dgx_gb200/puzzle.py]
         compare_to_golden: ["false"]

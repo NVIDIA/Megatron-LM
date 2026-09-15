@@ -8,7 +8,7 @@ https://huggingface.co/nvidia/NVIDIA-Nemotron-Labs-3-Puzzle-75B-A9B-BF16/blob/7c
 The 88-layer decoder and its one attention/MoE prediction head are defined below.
 The architecture stays a list of configs throughout construction and is supplied
 again by this entrypoint on checkpoint resume. Training settings come from the
-normal Megatron arguments; no model weights are downloaded by this example.
+normal Megatron arguments; no model weights are downloaded by this test.
 """
 
 import time

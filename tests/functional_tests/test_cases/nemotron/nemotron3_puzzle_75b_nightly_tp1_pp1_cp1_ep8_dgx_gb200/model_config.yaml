@@ -19,7 +19,7 @@ ENV_VARS:
 TEST_TYPE: ckpt-resume
 
 MODEL_ARGS:
-  # Full Puzzle architecture and its MTP head are defined in examples/hybrid/puzzle.py.
+  # Full Puzzle architecture and its MTP head are defined in this test case's puzzle.py.
   # Distributed topology: 2 nodes x 4 GB200 GPUs.
   --tensor-model-parallel-size: 1
   --pipeline-model-parallel-size: 1

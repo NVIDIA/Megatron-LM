@@ -47,6 +47,7 @@ if "pytest" in sys.argv and os.environ.get("HARNESS_FAIL_VALIDATION") == "1":
     fake_uv.chmod(0o755)
     (script_dir / "_run_training.sh").write_text("""#!/bin/bash
 set -e
+test "$IS_NEMO_TEST" = "$HARNESS_EXPECT_NEMO"
 printf '%s:%s\\n' "$REPEAT" "$RUN_NUMBER" >> "$HARNESS_TRAINING_CALLS"
 if [[ "$HARNESS_FAIL_TRAINING" == "1" ]]; then exit 1; fi
 if [[ "$RUN_NUMBER" == "2" ]]; then
@@ -67,9 +68,16 @@ mkdir -p "$CHECKPOINT_SAVE_PATH/iter_0000010" "$CHECKPOINT_SAVE_PATH/iter_000002
     calls_path = tmp_path / "calls.jsonl"
     training_path = tmp_path / "training.txt"
 
-    def run(test_type="ckpt-resume", golden="", fail_validation=False, fail_training=False):
+    def run(
+        test_type="ckpt-resume",
+        golden="",
+        fail_validation=False,
+        fail_training=False,
+        training_script="unused.py",
+        expect_nemo=False,
+    ):
         arguments = {
-            "TRAINING_SCRIPT_PATH": "unused.py",
+            "TRAINING_SCRIPT_PATH": training_script,
             "TRAINING_PARAMS_PATH": str(config),
             "GOLDEN_VALUES_PATH": golden,
             "OUTPUT_PATH": str(tmp_path / "output"),
@@ -99,6 +107,7 @@ mkdir -p "$CHECKPOINT_SAVE_PATH/iter_0000010" "$CHECKPOINT_SAVE_PATH/iter_000002
                 "HARNESS_TRAINING_CALLS": str(training_path),
                 "HARNESS_FAIL_VALIDATION": str(int(fail_validation)),
                 "HARNESS_FAIL_TRAINING": str(int(fail_training)),
+                "HARNESS_EXPECT_NEMO": str(expect_nemo).lower(),
             },
         )
         calls = (
@@ -161,6 +170,24 @@ def test_training_failure_is_not_skipped(run_harness):
     assert training == ["1:1"]
 
 
+@pytest.mark.parametrize(
+    ("training_script", "expect_nemo"),
+    [
+        (
+            "tests/functional_tests/test_cases/nemotron/"
+            "nemotron3_puzzle_75b_nightly_tp1_pp1_cp1_ep8_dgx_gb200/puzzle.py",
+            False,
+        ),
+        ("pretrain_hybrid.py", False),
+        ('"nemo llm pretrain -y --factory llama3_8b"', True),
+    ],
+)
+def test_training_entrypoint_selects_correct_launcher(run_harness, training_script, expect_nemo):
+    result, _, training = run_harness(training_script=training_script, expect_nemo=expect_nemo)
+    assert result.returncode == 0, result.stderr
+    assert training == ["1:1", "1:2", "2:1", "2:2"]
+
+
 @pytest.mark.parametrize("puzzle", [False, True])
 def test_nemotron_launch_resolves_golden_path_without_changing_lightning(puzzle):
     workloads = load_and_flatten("tests/test_utils/recipes/gb200/nemotron.yaml")
@@ -183,7 +210,9 @@ def test_nemotron_launch_resolves_golden_path_without_changing_lightning(puzzle)
     )
     arguments = dict(line.split("=", 1) for line in result.stdout.splitlines())
     assert arguments["TRAINING_SCRIPT_PATH"] == (
-        "examples/hybrid/puzzle.py" if puzzle else "pretrain_hybrid.py"
+        f"tests/functional_tests/test_cases/nemotron/{spec['test_case']}/puzzle.py"
+        if puzzle
+        else "pretrain_hybrid.py"
     )
     assert arguments["GOLDEN_VALUES_PATH"] == (
         ""

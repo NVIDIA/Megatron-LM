@@ -11,11 +11,6 @@ import pytest
 import torch
 import yaml
 
-from examples.hybrid.puzzle import (
-    add_puzzle_args,
-    build_puzzle_layer_config_list,
-    build_puzzle_model_config,
-)
 from megatron.core.activations import squared_relu
 from megatron.core.models.hybrid import MTPSplit
 from megatron.core.models.hybrid.hybrid_layer_allocation import parse_hybrid_layer_config_list
@@ -26,10 +21,16 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.argument_utils import pretrain_cfg_container_from_args
 from megatron.training.arguments import add_megatron_arguments, parse_args, validate_args
 from megatron.training.models.hybrid import HybridModelBuilder
+from tests.functional_tests.test_cases.nemotron.nemotron3_puzzle_75b_nightly_tp1_pp1_cp1_ep8_dgx_gb200.puzzle import (
+    add_puzzle_args,
+    build_puzzle_layer_config_list,
+    build_puzzle_model_config,
+)
 from tests.test_utils.python_scripts.recipe_parser import load_and_flatten
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 PUZZLE_CASE = "nemotron3_puzzle_75b_nightly_tp1_pp1_cp1_ep8_dgx_gb200"
+PUZZLE_ENTRYPOINT = f"tests/functional_tests/test_cases/nemotron/{PUZZLE_CASE}/puzzle.py"
 LIGHTNING_CASE = "nemotron3_5_lightning_nightly_tp1_pp1_cp1_ep8_dgx_gb200"
 
 # Independent transcription of config.json at Hugging Face revision 7cd7fa0.
@@ -247,7 +248,7 @@ def test_puzzle_builder_infers_mtp_depth_without_mutating_layer_configs(puzzle_a
 
 @pytest.mark.parametrize(
     ("test_case", "entrypoint"),
-    [(PUZZLE_CASE, "examples/hybrid/puzzle.py"), (LIGHTNING_CASE, "pretrain_hybrid.py")],
+    [(PUZZLE_CASE, PUZZLE_ENTRYPOINT), (LIGHTNING_CASE, "pretrain_hybrid.py")],
 )
 def test_nemotron_nightly_recipe_entrypoints(test_case, entrypoint):
     workloads = load_and_flatten(REPO_ROOT / "tests/test_utils/recipes/gb200/nemotron.yaml")
@@ -288,7 +289,7 @@ def test_puzzle_recipe_covers_full_size_training_and_resume(puzzle_recipe):
 
 
 def test_puzzle_recipe_validates_and_builds_training_config(monkeypatch, puzzle_recipe):
-    argv = ["examples/hybrid/puzzle.py"]
+    argv = [PUZZLE_ENTRYPOINT]
     for flag, value in puzzle_recipe["MODEL_ARGS"].items():
         if value is False:
             continue
