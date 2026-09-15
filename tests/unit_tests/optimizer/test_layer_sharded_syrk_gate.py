@@ -1,12 +1,14 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Emerging-optimizers version-gate tests for the layer-sharded SYRK dispatch.
+"""Constructor guard tests for LayerShardedMuon's Newton-Schulz configuration.
 
-The batched-SYRK capability is detected by symbol (``triton_kernels.batched_tsyrk_ex``,
-emerging-optimizers >= 0.5.0a0), and installs without it must fall back to baddbmm
-for batched chunks while the baseline per-matrix path stays untouched. CI only ever
-installs one emerging-optimizers, so these tests pin BOTH sides of the gate by
-simulating symbol presence/absence, independent of the installed version.
+``_validate_ns_config`` rejects, at construction, every configuration the installed
+stack cannot run (``ns_batch_size < 1``, batched Newton-Schulz below emerging-optimizers
+0.3.0, and for ``use_syrk``: no CUDA device, Triton < 3.4.0, an SM emerging-optimizers
+has not validated, ``ns_batch_size > 1`` without the batched SYRK kernel) instead of
+downgrading. CI installs one emerging-optimizers on one GPU type, so every condition is
+simulated here, on both sides, independent of the installed stack. ``_run_ns`` then
+forwards ``use_syrk`` unchanged to every chunk.
 
 Pure single-process tests: no distributed init, no GPU.
 """
@@ -20,14 +22,10 @@ from megatron.core.optimizer import emerging_optimizers as eo_mod
 from megatron.core.optimizer import layer_sharded_muon as lsm
 from megatron.core.optimizer.layer_sharded_muon import LayerShardedMuon
 
-# No version skip on purpose: these tests pin gate/dispatch LOGIC and never execute
-# a real batched Newton-Schulz (newton_schulz is mocked, step() is never called),
-# so they must run — and give CI signal — on any installed emerging-optimizers.
-# Constructions with ns_batch_size > 1 or use_syrk=True bypass the constructor's
-# emerging-optimizers version gates via _make_opt(monkeypatch, ...): the >= 0.3.0
-# batched-NS floor in LayerShardedMuon.__init__ and the >= 0.4.0 use_syrk gate
-# inherited from TensorParallelMuon both guard kernel availability the mocked
-# path never reaches.
+# No version skip on purpose: these tests pin guard/dispatch LOGIC and never execute a
+# real Newton-Schulz (newton_schulz is mocked, step() is never called), so they must
+# run — and give CI signal — on any installed emerging-optimizers. Constructions with
+# ns_batch_size > 1 bypass the batched-NS version floor via _make_opt(monkeypatch, ...).
 
 
 def _make_opt(monkeypatch=None, **kwargs):
@@ -38,41 +36,102 @@ def _make_opt(monkeypatch=None, **kwargs):
     return LayerShardedMuon([p], lr=0.1, gtp_remat_group=None, **kwargs)
 
 
-class TestBatchedSyrkSymbolDetection:
-    def test_absent_symbol_reports_false(self, monkeypatch):
-        monkeypatch.delattr(lsm.triton_kernels, "batched_tsyrk_ex", raising=False)
-        assert lsm._has_batched_syrk() is False
-
-    def test_present_symbol_reports_true(self, monkeypatch):
-        monkeypatch.setattr(lsm.triton_kernels, "batched_tsyrk_ex", object(), raising=False)
-        assert lsm._has_batched_syrk() is True
+def _simulate_hardware(monkeypatch, sm=(9, 0), triton_340=True):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: sm)
+    monkeypatch.setattr(lsm.triton_kernels, "HAS_TRITON_340", triton_340, raising=False)
 
 
-class TestInitDerivesBatchedSyrk:
-    @pytest.mark.parametrize("has_symbol", [False, True])
-    def test_baseline_never_arms_batched_syrk(self, monkeypatch, has_symbol):
-        """use_syrk=False must yield _batched_syrk=False on every emerging-optimizers."""
-        monkeypatch.setattr(lsm, "_has_batched_syrk", lambda: has_symbol)
-        opt = _make_opt(use_syrk=False, ns_batch_size=1)
-        assert opt.use_syrk is False
-        assert opt._batched_syrk is False
+class TestValidateNsConfig:
+    def test_rejects_ns_batch_size_below_one(self):
+        with pytest.raises(ValueError, match="ns_batch_size must be at least 1"):
+            lsm._validate_ns_config(False, ns_batch_size=0)
 
-    @pytest.mark.parametrize("has_symbol,expected", [(False, False), (True, True)])
-    def test_syrk_arms_batched_only_with_symbol(self, monkeypatch, has_symbol, expected):
-        # Bypass the CUDA/Triton/SM hardware gate (this test pins the
-        # batched-capability derivation, not the hardware validation);
-        # _make_opt(monkeypatch) additionally bypasses the parent's >= 0.4.0
-        # use_syrk version gate.
-        monkeypatch.setattr(lsm, "_resolve_use_syrk", lambda flag: flag)
-        monkeypatch.setattr(lsm, "_has_batched_syrk", lambda: has_symbol)
-        opt = _make_opt(monkeypatch, use_syrk=True, ns_batch_size=4)
-        assert opt.use_syrk is True
-        assert opt._batched_syrk is expected
+    def test_rejects_batched_ns_on_old_emerging_optimizers(self, monkeypatch):
+        asked = []
+
+        def fake_min_version(version, check_equality=True):
+            asked.append(version)
+            return False
+
+        monkeypatch.setattr(lsm, "is_emerging_optimizers_min_version", fake_min_version)
+        with pytest.raises(ValueError, match="batched Newton-Schulz"):
+            lsm._validate_ns_config(False, ns_batch_size=4)
+        assert asked == [lsm._BATCHED_NS_MIN_EO_VERSION]
+
+    def test_unbatched_ns_needs_no_version_check(self, monkeypatch):
+        """ns_batch_size=1 uses the 2-D API every release ships: no floor consulted."""
+        monkeypatch.setattr(lsm, "is_emerging_optimizers_min_version", lambda v: False)
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+        lsm._validate_ns_config(False, ns_batch_size=1)
+
+    def test_use_syrk_false_skips_the_syrk_checks(self, monkeypatch):
+        monkeypatch.setattr(lsm, "is_emerging_optimizers_min_version", lambda v: True)
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+        lsm._validate_ns_config(False, ns_batch_size=32)
+
+    def test_rejects_without_cuda_device(self, monkeypatch):
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+        with pytest.raises(ValueError, match="CUDA device"):
+            lsm._validate_ns_config(True, ns_batch_size=1)
+
+    def test_rejects_old_triton(self, monkeypatch):
+        _simulate_hardware(monkeypatch, triton_340=False)
+        with pytest.raises(ValueError, match="Triton >= 3.4.0"):
+            lsm._validate_ns_config(True, ns_batch_size=1)
+
+    def test_rejects_unvalidated_sm(self, monkeypatch):
+        _simulate_hardware(monkeypatch, sm=(12, 0))
+        with pytest.raises(ValueError, match=r"SM \(12, 0\)"):
+            lsm._validate_ns_config(True, ns_batch_size=1)
+
+    @pytest.mark.parametrize("sm", [(8, 0), (9, 0), (10, 0), (10, 3)])
+    def test_accepts_validated_sms(self, monkeypatch, sm):
+        _simulate_hardware(monkeypatch, sm=sm)
+        lsm._validate_ns_config(True, ns_batch_size=1)
+
+    def test_rejects_batched_syrk_on_old_emerging_optimizers(self, monkeypatch):
+        _simulate_hardware(monkeypatch)
+        asked = []
+
+        def fake_min_version(version, check_equality=True):
+            asked.append(version)
+            return version == lsm._BATCHED_NS_MIN_EO_VERSION  # 0.3.x: batched NS, no batched SYRK
+
+        monkeypatch.setattr(lsm, "is_emerging_optimizers_min_version", fake_min_version)
+        with pytest.raises(ValueError, match="batched SYRK kernel"):
+            lsm._validate_ns_config(True, ns_batch_size=4)
+        assert asked == [lsm._BATCHED_NS_MIN_EO_VERSION, lsm._BATCHED_SYRK_MIN_EO_VERSION]
+
+    def test_unbatched_syrk_needs_no_batched_kernel(self, monkeypatch):
+        """2-D SYRK predates the batched kernel: ns_batch_size=1 must not consult it."""
+        _simulate_hardware(monkeypatch)
+        monkeypatch.setattr(lsm, "is_emerging_optimizers_min_version", lambda v: False)
+        lsm._validate_ns_config(True, ns_batch_size=1)
+
+    def test_accepts_batched_syrk_on_new_emerging_optimizers(self, monkeypatch):
+        _simulate_hardware(monkeypatch)
+        monkeypatch.setattr(lsm, "is_emerging_optimizers_min_version", lambda v: True)
+        lsm._validate_ns_config(True, ns_batch_size=4)
+
+    def test_constructor_runs_the_validation(self, monkeypatch):
+        """No CUDA in this process: use_syrk=True must be rejected at construction."""
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+        with pytest.raises(ValueError, match="CUDA device"):
+            _make_opt(monkeypatch, use_syrk=True)
+
+    def test_hardware_check_precedes_parent_version_gate(self, monkeypatch):
+        """A stack that cannot run SYRK at all reports that first: no emerging-optimizers
+        upgrade would help, so the parent's version gate must not mask that message."""
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+        monkeypatch.setattr(eo_mod, "is_emerging_optimizers_min_version", lambda v: False)
+        with pytest.raises(ValueError, match="CUDA device"):
+            _make_opt(use_syrk=True)
 
 
 class TestRunNsDispatch:
-    """_run_ns must pass use_syrk per chunk: batched chunks follow _batched_syrk,
-    unbatched chunks follow use_syrk — on both sides of the capability gate."""
+    """_run_ns forwards use_syrk unchanged to every chunk: on a validated stack the
+    batched (3-D) chunks reach newton_schulz's batched SYRK dispatch."""
 
     def _record_ns_calls(self, monkeypatch):
         calls = []
@@ -88,29 +147,17 @@ class TestRunNsDispatch:
         # Two same-shape matrices (batchable) + one odd shape (never batched).
         return {0: torch.randn(4, 4), 1: torch.randn(4, 4), 2: torch.randn(4, 6)}
 
-    def test_baseline_stays_2d_gemm_on_both_versions(self, monkeypatch):
+    def test_baseline_stays_2d_gemm(self, monkeypatch):
         calls = self._record_ns_calls(monkeypatch)
         opt = _make_opt(use_syrk=False, ns_batch_size=1)
         out = opt._run_ns(self._mats())
         assert calls == [(2, False)] * 3, "baseline must be per-matrix 2-D, use_syrk=False"
         assert set(out) == {0, 1, 2}
 
-    def test_old_eo_batched_falls_back_to_baddbmm(self, monkeypatch):
+    def test_use_syrk_reaches_batched_and_unbatched_chunks(self, monkeypatch):
         calls = self._record_ns_calls(monkeypatch)
         opt = _make_opt(monkeypatch, use_syrk=False, ns_batch_size=2)
-        opt.use_syrk = True  # as if _resolve_use_syrk passed on real hardware
-        opt._batched_syrk = False  # emerging-optimizers without batched_tsyrk_ex
-        opt._run_ns(self._mats())
-        assert sorted(calls) == [
-            (2, True),
-            (3, False),
-        ], "old EO: unbatched chunk keeps SYRK, batched chunk must drop to use_syrk=False"
-
-    def test_new_eo_batched_uses_syrk(self, monkeypatch):
-        calls = self._record_ns_calls(monkeypatch)
-        opt = _make_opt(monkeypatch, use_syrk=False, ns_batch_size=2)
-        opt.use_syrk = True
-        opt._batched_syrk = True  # emerging-optimizers with batched_tsyrk_ex
+        opt.use_syrk = True  # as if _validate_ns_config had passed on a validated stack
         opt._run_ns(self._mats())
         assert sorted(calls) == [(2, True), (3, True)]
 
@@ -123,28 +170,6 @@ class TestRunNsDispatch:
 
 
 class TestConstructorGuards:
-    def test_hardware_unfit_downgrades_use_syrk(self, monkeypatch):
-        """On unfit hardware (no CUDA here: SM (0,0)) use_syrk must downgrade to
-        False at construction instead of reaching the NS kernels unvalidated."""
-        monkeypatch.setattr(lsm, "is_emerging_optimizers_min_version", lambda v: True)
-        monkeypatch.setattr(eo_mod, "is_emerging_optimizers_min_version", lambda v: True)
-        monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
-        p = torch.nn.Parameter(torch.randn(4, 4))
-        opt = LayerShardedMuon([p], lr=0.1, gtp_remat_group=None, use_syrk=True)
-        assert opt.use_syrk is False
-        assert opt._batched_syrk is False
-
-    def test_hardware_downgrade_precedes_eo_version_gate(self, monkeypatch):
-        """Unfit hardware plus an EO too old for use_syrk must downgrade silently,
-        not raise about the EO version: _resolve_use_syrk runs BEFORE the parent
-        constructor. A refactor moving the resolve below
-        TensorParallelMuon.__init__ would raise ValueError here."""
-        monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
-        monkeypatch.setattr(eo_mod, "is_emerging_optimizers_min_version", lambda v: False)
-        p = torch.nn.Parameter(torch.randn(4, 4))
-        opt = LayerShardedMuon([p], lr=0.1, gtp_remat_group=None, use_syrk=True)
-        assert opt.use_syrk is False
-
     def test_tp_mode_layer_sharded_is_rejected(self):
         """'layer_sharded' is the registry selector, not a class mode; direct-API
         misuse would otherwise fall silently into the parent's distributed
