@@ -284,7 +284,9 @@ def _test_fused_mla_rope_inplace(input_format, inverse=False, remove_interleavin
     )
 
 
-def _test_fused_mla_rope_kv_split(input_format, remove_interleaving=False):
+def _test_fused_mla_rope_kv_split(
+    input_format, remove_interleaving=False, use_vmm_outputs=False
+):
     assert fused_mla_rope_kv_split is not None
     num_heads = 32
     k_dim = 128
@@ -373,6 +375,24 @@ def _test_fused_mla_rope_kv_split(input_format, remove_interleaving=False):
         (pytorch_k_output, pytorch_v_output), (pytorch_bwd_k_input, pytorch_bwd_v_input)
     )
 
+    output_kwargs = {}
+    vmm_allocators = []
+    if use_vmm_outputs:
+        try:
+            from transformer_engine.pytorch.tensor.vmm import VMMRowSplitAllocator
+
+            key_allocator = VMMRowSplitAllocator(fused_fwd_kv_input.device)
+            value_allocator = VMMRowSplitAllocator(fused_fwd_kv_input.device)
+            key_shape = (*fused_fwd_kv_input.shape[:-1], k_dim + emb_dim)
+            value_shape = (*fused_fwd_kv_input.shape[:-1], v_dim)
+            output_kwargs = {
+                "out_key": key_allocator.allocate(key_shape, dtype),
+                "out_value": value_allocator.allocate(value_shape, dtype),
+            }
+            vmm_allocators = [key_allocator, value_allocator]
+        except (ImportError, RuntimeError, ValueError) as exc:
+            pytest.skip(f"VMM-localized rotary outputs are unavailable: {exc}")
+
     fused_k_output, fused_v_output = fused_mla_rope_kv_split(
         fused_fwd_kv_input,
         fused_fwd_emb_input,
@@ -383,6 +403,7 @@ def _test_fused_mla_rope_kv_split(input_format, remove_interleaving=False):
         v_dim,
         cu_seqlens_kv=cu_seqlens,
         remove_interleaving=remove_interleaving,
+        **output_kwargs,
     )
     torch.autograd.backward(
         (fused_k_output, fused_v_output), (fused_bwd_k_input, fused_bwd_v_input)
@@ -413,6 +434,8 @@ def _test_fused_mla_rope_kv_split(input_format, remove_interleaving=False):
         msg=lambda msg: f"Mismatch in emb bwd: {msg}",
         **tols,
     )
+    for allocator in vmm_allocators:
+        allocator.close()
 
 
 @pytest.mark.experimental
@@ -432,6 +455,11 @@ class TestFusedMLARope:
     @pytest.mark.parametrize("remove_interleaving", [False, True])
     def test_kv_split_forward_backward(self, input_format, remove_interleaving):
         _test_fused_mla_rope_kv_split(input_format, remove_interleaving=remove_interleaving)
+
+    def test_kv_split_forward_backward_with_vmm_outputs(self, input_format):
+        if input_format != "sbhd":
+            pytest.skip("The focused VMM prototype covers the profiled SBHD path")
+        _test_fused_mla_rope_kv_split(input_format, use_vmm_outputs=True)
 
 
 @pytest.mark.experimental
@@ -550,7 +578,6 @@ def test_legacy_query_api_remains_in_place(input_format):
     assert output.data_ptr() == query.data_ptr()
     assert not torch.equal(query, reference)
     torch.testing.assert_close(output, expected, rtol=0, atol=0)
-
 
 class TestApplyRotaryPosEmbMlaFusionConflict:
     """Test apply_rotary_pos_emb: mla_rotary_interleaved vs apply_rope_fusion conflict."""

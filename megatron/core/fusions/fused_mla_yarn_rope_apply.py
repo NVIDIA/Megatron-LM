@@ -746,6 +746,8 @@ class _FusedMLARoPEKVSplit(torch.autograd.Function):
         cp_size,
         rotary_interleaved=False,
         remove_interleaving=False,
+        out_key=None,
+        out_value=None,
     ):
         """
         Forward function for _FusedMLARoPEKVSplit.
@@ -779,8 +781,37 @@ class _FusedMLARoPEKVSplit(torch.autograd.Function):
         assert sin.is_contiguous()
         assert emb_dim % 4 == 0
 
-        o_key = kv.new_empty(total_seqlen, nheads, emb_dim + k_dim)
-        o_value = kv.new_empty(total_seqlen, nheads, v_dim)
+        if (out_key is None) != (out_value is None):
+            raise ValueError("out_key and out_value must either both be provided or both be None")
+        if cu_seqlens_kv is None:
+            key_shape = (max_seqlen, batch_size, nheads, emb_dim + k_dim)
+            value_shape = (max_seqlen, batch_size, nheads, v_dim)
+        else:
+            key_shape = (total_seqlen, nheads, emb_dim + k_dim)
+            value_shape = (total_seqlen, nheads, v_dim)
+        if out_key is None:
+            out_key = kv.new_empty(key_shape)
+            out_value = kv.new_empty(value_shape)
+        else:
+            for name, out, shape in (
+                ("out_key", out_key, key_shape),
+                ("out_value", out_value, value_shape),
+            ):
+                if (
+                    tuple(out.shape) != shape
+                    or out.dtype != kv.dtype
+                    or out.device != kv.device
+                    or not out.is_contiguous()
+                ):
+                    raise ValueError(
+                        f"{name} must have shape {shape}, dtype {kv.dtype}, "
+                        f"device {kv.device}, and contiguous layout"
+                    )
+                if out.requires_grad:
+                    raise ValueError(f"{name} must not require gradients")
+            ctx.mark_dirty(out_key, out_value)
+        o_key = out_key.view(total_seqlen, nheads, emb_dim + k_dim)
+        o_value = out_value.view(total_seqlen, nheads, v_dim)
 
         grid = lambda META: (total_seqlen, triton.cdiv(nheads, META["BLOCK_H"]))
         _mla_rope_fwd_kv_split_kernel[grid](
@@ -817,10 +848,7 @@ class _FusedMLARoPEKVSplit(torch.autograd.Function):
         ctx.cu_seqlens_kv = cu_seqlens_kv
         ctx.cp_rank = cp_rank
         ctx.cp_size = cp_size
-        if cu_seqlens_kv is None:
-            o_key = o_key.view(max_seqlen, -1, nheads, emb_dim + k_dim)
-            o_value = o_value.view(max_seqlen, -1, nheads, v_dim)
-        return o_key, o_value
+        return out_key, out_value
 
     @staticmethod
     def backward(ctx, dk, dv):
@@ -881,7 +909,22 @@ class _FusedMLARoPEKVSplit(torch.autograd.Function):
         if ctx.cu_seqlens_kv is None:
             d_kv = d_kv.view(max_seqlen, batch_size, nheads, ctx.k_dim + ctx.v_dim)
             d_emb = d_emb.view(max_seqlen, batch_size, 1, ctx.emb_dim)
-        return d_kv, d_emb, None, None, None, None, None, None, None, None, None, None
+        return (
+            d_kv,
+            d_emb,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
 
 
 def fused_mla_rope_kv_split(
@@ -897,6 +940,8 @@ def fused_mla_rope_kv_split(
     cp_size: int = 1,
     rotary_interleaved: bool = False,
     remove_interleaving: bool = False,
+    out_key: Optional[torch.Tensor] = None,
+    out_value: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Fused function for applying RoPE to MLA's key and value.
@@ -915,6 +960,8 @@ def fused_mla_rope_kv_split(
         cu_seqlens_kv: [seq_num + 1] accumulated sequence lengths for thd format
         rotary_interleaved: whether to apply RoPE interleaved, only supports False for now
         remove_interleaving: if True, output RoPE dims in non-interleaved layout
+        out_key/out_value: optional persistent output buffers. Both must be provided
+            together and match the returned key/value shapes.
 
     Returns:
         key: [seq_len, batch_size, head_num, emb_dim + k_dim]
@@ -934,6 +981,8 @@ def fused_mla_rope_kv_split(
         cp_size,
         rotary_interleaved,
         remove_interleaving,
+        out_key,
+        out_value,
     )
 
 
@@ -979,6 +1028,8 @@ def fused_apply_mla_rope_for_kv(
     cp_rank: int = 0,
     cp_size: int = 1,
     rotary_interleaved: bool = False,
+    out_key: Optional[torch.Tensor] = None,
+    out_value: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Backward-compatible name for the MLA key/value split RoPE API."""
     return fused_mla_rope_kv_split(
@@ -993,4 +1044,6 @@ def fused_apply_mla_rope_for_kv(
         cp_rank=cp_rank,
         cp_size=cp_size,
         rotary_interleaved=rotary_interleaved,
+        out_key=out_key,
+        out_value=out_value,
     )
