@@ -4,7 +4,12 @@ import pytest
 import torch
 
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer.module import Float16Module, MegatronModule, mark_keep_in_fp32
+from megatron.core.transformer.module import (
+    Float16Module,
+    MegatronModule,
+    is_first_microbatch_tracked,
+    mark_keep_in_fp32,
+)
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
@@ -114,6 +119,80 @@ class TestSetIsFirstMicrobatch:
 
         module.set_is_first_microbatch()
         assert module.child.is_first_microbatch is False
+
+
+class _QuantizedExecutionModule(torch.nn.Module):
+    """Stand-in for a TE module answering whether it will execute quantized.
+
+    ``executes_quantized=None`` mirrors a module with no per-module recipe, which defers to
+    the ambient autocast.
+    """
+
+    def __init__(self, executes_quantized=None):
+        super().__init__()
+        self._executes_quantized = executes_quantized
+
+    def will_execute_quantized(self, is_context_quantized: bool) -> bool:
+        if self._executes_quantized is None:
+            return is_context_quantized
+        return self._executes_quantized
+
+
+class TestIsFirstMicrobatchTracked:
+    """quant_recipe decides quantization per module, so the predicate must ask the module."""
+
+    def setup_method(self, method):
+        Utils.initialize_model_parallel(1, 1)
+        model_parallel_cuda_manual_seed(123)
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    def _config(self, **overrides):
+        config = TransformerConfig(
+            num_layers=2, hidden_size=12, num_attention_heads=4, use_cpu_initialization=True
+        )
+        for key, value in overrides.items():
+            setattr(config, key, value)
+        return config
+
+    def test_unquantized_config_is_untracked(self):
+        assert is_first_microbatch_tracked(self._config()) is False
+
+    @pytest.mark.parametrize(
+        ('field', 'value'), [('fp8', 'hybrid'), ('fp4', 'e2m1'), ('quant_recipe', object())]
+    )
+    def test_model_wide_answer_without_module(self, field, value):
+        # set_is_first_microbatch has no module in hand and must keep its old answer.
+        assert is_first_microbatch_tracked(self._config(**{field: value})) is True
+
+    def test_kitchen_is_tracked_even_with_module(self):
+        # Kitchen sits outside TE's autocast state, so there is no per-module answer.
+        config = self._config(use_kitchen=True)
+        module = _QuantizedExecutionModule(executes_quantized=False)
+        assert is_first_microbatch_tracked(config, module, False) is True
+
+    def test_recipe_quantizing_unquantized_layer_is_tracked(self):
+        config = self._config(quant_recipe=object())
+        module = _QuantizedExecutionModule(executes_quantized=True)
+        assert is_first_microbatch_tracked(config, module, False) is True
+
+    def test_recipe_forcing_high_precision_under_fp8_is_untracked(self):
+        # The recipe overrides the fp8 autocast for this layer, so it has no quantized weight
+        # cache and the flag would only change its wgrad accumulation.
+        config = self._config(fp8='hybrid', quant_recipe=object())
+        module = _QuantizedExecutionModule(executes_quantized=False)
+        assert is_first_microbatch_tracked(config, module, True) is False
+
+    def test_module_without_recipe_follows_autocast(self):
+        config = self._config(fp8='hybrid')
+        module = _QuantizedExecutionModule()
+        assert is_first_microbatch_tracked(config, module, True) is True
+        assert is_first_microbatch_tracked(config, module, False) is False
+
+    def test_module_lacking_hook_falls_back_to_config(self):
+        config = self._config(fp8='hybrid')
+        assert is_first_microbatch_tracked(config, torch.nn.Linear(2, 2), False) is True
 
 
 class TestFloat16Module:
