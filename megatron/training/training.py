@@ -4497,9 +4497,15 @@ def train(
     # Setup some training config params.
     config.grad_scale_func = optimizer.scale_loss if optimizer is not None else None
     config.timers = timers
-    if isinstance(
-        model[0], (FullyShardedDataParallelV1, FullyShardedDataParallelV2, DDP)
-    ) and args.overlap_grad_reduce:
+    # MFSDP v2 always reduces gradients during backward -- that is how FSDP shards them --
+    # and defers only the DP-outer axis to the last microbatch, so it needs no_sync_func to
+    # know which backward that is. Without it every backward finalizes that axis, the
+    # accumulation buffer is dropped, and only the last microbatch's gradient survives.
+    # DDP and MFSDP v1 instead reduce during backward only when overlap_grad_reduce is on,
+    # so without that flag there is nothing for no_sync to suppress.
+    if isinstance(model[0], FullyShardedDataParallelV2) or (
+        isinstance(model[0], (FullyShardedDataParallelV1, DDP)) and args.overlap_grad_reduce
+    ):
         assert config.no_sync_func is None, (
             'When overlap_grad_reduce is True, config.no_sync_func must be None; '
             'a custom no_sync_func is not supported when overlapping grad-reduce'

@@ -30,6 +30,7 @@ from megatron.core.inference.model_inference_wrappers.abstract_model_inference_w
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.utils import (
     InferenceMode,
+    detokenize_tokens,
     get_attention_mask,
     set_decode_expert_padding,
     set_moe_metadata_sync,
@@ -41,7 +42,6 @@ from megatron.core.transformer.moe.router_replay import RouterReplay, RouterRepl
 from megatron.core.transformer.moe.router_trace import get_moe_router_tracer
 from megatron.core.transformer.utils import set_model_to_sequence_parallel
 from megatron.core.utils import (
-    accepts_parameter,
     get_asyncio_loop,
     get_model_config,
     get_pg_size,
@@ -406,14 +406,9 @@ class TextGenerationController(MTPInferenceMixin):
         Returns:
             str: The detokenized string.
         """
-        if remove_EOD and getattr(tokenizer, "eod", None) is not None:
-            while tokens and tokens[-1] == tokenizer.eod:
-                tokens = tokens[:-1]
-
-        if accepts_parameter(tokenizer.detokenize, "skip_special_tokens"):
-            return tokenizer.detokenize(tokens, skip_special_tokens=skip_special_tokens)
-        else:
-            return tokenizer.detokenize(tokens)
+        return detokenize_tokens(
+            tokenizer, tokens, remove_EOD=remove_EOD, skip_special_tokens=skip_special_tokens
+        )
 
     def detokenize_generations(
         self,
@@ -1091,6 +1086,21 @@ class TextGenerationController(MTPInferenceMixin):
             no_top_p=no_top_p,
             output=self._sampled_tokens_cuda[:n],
         )
+
+    def _replace_partial_prefill_sample_with_prompt_token(self) -> None:
+        """Use the known next prompt token for a partial chunk's selected logprob."""
+        context = self.inference_wrapped_model.inference_context
+        if context.chunked_prefill_request_id == -1:
+            return
+
+        context_idx = context.get_index_of_chunked_prefill_request(safe=True)
+        if context_idx == -1:
+            return
+        active_idx = context_idx - context.paused_request_count
+        active_request_count = context.total_request_count - context.paused_request_count
+        assert 0 <= active_idx < active_request_count
+        assert active_idx == active_request_count - 1
+        self._sampled_tokens_cuda[active_idx].copy_(context.chunked_prefill_next_prompt_token)
 
     def _dynamic_step_log_probs_bookkeeping(self) -> Tuple[bool, bool]:
         """Perform bookkeeping necessary to compute log probs for dynamic batching.
@@ -1977,6 +1987,7 @@ class TextGenerationController(MTPInferenceMixin):
 
         range_push("sampling")
         self._dynamic_step_sample_logits()
+        self._replace_partial_prefill_sample_with_prompt_token()
         sampled_tokens_gpu = self._sampled_tokens_cuda[:active_request_count]
         if sampled_tokens_gpu.is_cuda:
             self._async_sched_sample_gpu_ready_event.record(
@@ -2029,6 +2040,7 @@ class TextGenerationController(MTPInferenceMixin):
             torch.int64
         )
         self._compute_serial_mtp_and_sample(base_position=base_position)
+        self._replace_partial_prefill_sample_with_prompt_token()
         sampled_tokens_gpu = self._sampled_tokens_cuda[:active_request_count]
         sampled_mtp_tokens_gpu = self._sampled_mtp_tokens_cuda[:, :active_request_count]
         accepted_tokens_gpu = (
@@ -2976,6 +2988,8 @@ class TextGenerationController(MTPInferenceMixin):
                 context.kv_block_allocator.release_memory_blocks(blocks_to_release[remove_mask])
             else:
                 self._dynamic_step_sample_logits()
+
+            self._replace_partial_prefill_sample_with_prompt_token()
 
             log_probs = None
             top_n_logprobs = None
