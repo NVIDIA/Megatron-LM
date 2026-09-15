@@ -1016,7 +1016,13 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                                 for key in self.optimizer_state_keys
                             }
                             if self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
-                                if self.config.store_param_remainders and self.config.bf16:
+                                shard_param = self.optimizer.param_groups[group_index]["params"][
+                                    group_order
+                                ]
+                                if (
+                                    self.config.store_param_remainders
+                                    and shard_param.dtype == torch.bfloat16
+                                ):
                                     tensors["master_param"] = init_shard(torch.int16)
                                 else:
                                     tensors["master_param"] = init_shard(
@@ -1053,10 +1059,30 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 for v in self.optimizer.state.values():
                     v["step"] = step.detach().clone()
 
-        # Optimizer.
-        self.optimizer.load_state_dict(
-            {"state": state_dict_state, "param_groups": state_dict_param_groups}
+        # TE first casts all loaded state to the parameter dtype, then discards those
+        # copies and restores its configured dtypes. FP32 states (including int16
+        # parameter remainders) already have the correct representation here. Load
+        # only group metadata and reuse these buffers; parameter values load below.
+        reuse_fp32_state = (
+            USING_TE_OPTIMIZER
+            and isinstance(self.optimizer, Adam)
+            and self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8
+            and self.config.main_params_dtype == torch.float32
+            and all(
+                self._get_state_key_dtype(key) == torch.float32 for key in self.optimizer_state_keys
+            )
         )
+        self.optimizer.load_state_dict(
+            {
+                "state": {} if reuse_fp32_state else state_dict_state,
+                "param_groups": state_dict_param_groups,
+            }
+        )
+        if reuse_fp32_state:
+            for saved_group, group in zip(state_dict_param_groups, self.optimizer.param_groups):
+                for state_order, param in zip(saved_group["params"], group["params"]):
+                    if state_order in state_dict_state:
+                        self.optimizer.state[param] = state_dict_state[state_order]
 
         # Grad scaler.
         if 'grad_scaler' not in state_dict:
