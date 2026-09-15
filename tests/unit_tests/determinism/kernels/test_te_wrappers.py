@@ -15,7 +15,8 @@ import os
 import pytest
 import torch
 
-from megatron.core.extensions.transformer_engine import HAVE_TE
+from megatron.core.extensions.transformer_engine import HAVE_TE, _resolve_is_first_microbatch
+from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -248,3 +249,48 @@ def test_te_fused_rope_replays_fwd_bwd(layout):
         assert_replays_bit_exact(fn, (t,), replays=3, what=f"TE fused RoPE[{layout}]")
     finally:
         Utils.destroy_model_parallel()
+
+
+# --- is_first_microbatch -----------------------------------------------------------------------
+
+
+class TestIsFirstMicrobatchResolution:
+    """``is_first_microbatch`` picks whether wgrad overwrites ``main_grad`` or adds into it.
+
+    TE overwrites on a ``True``, which is only safe for a module that caches a quantized weight
+    for the rest of the step. A module running in high precision gets no such cache, so handing
+    it the flag would drop every earlier microbatch's gradient. The flag therefore has to track
+    what the module will actually execute, not what the config enables somewhere in the model.
+    """
+
+    def setup_method(self, method):
+        Utils.initialize_model_parallel()
+        model_parallel_cuda_manual_seed(123)
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    def _linear(self, **overrides):
+        seeded()
+        module = TEColumnParallelLinear(
+            HIDDEN,
+            FFN,
+            config=_config(**overrides),
+            init_method=init_method_normal(0.02),
+            gather_output=False,
+            bias=True,
+            skip_bias_add=False,
+            is_expert=False,
+        ).cuda()
+        module.is_first_microbatch = True
+        return module
+
+    def test_unquantized_module_keeps_no_opinion(self):
+        assert _resolve_is_first_microbatch(self._linear()) is None
+
+    def test_module_follows_the_quantization_autocast(self):
+        module = self._linear(fp8="hybrid", fp8_recipe="tensorwise")
+        # Outside the autocast the weight is not cached quantized, so the flag must not reach TE.
+        assert _resolve_is_first_microbatch(module) is None
+        with get_fp8_context(module.config):
+            assert _resolve_is_first_microbatch(module) is True

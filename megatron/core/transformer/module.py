@@ -45,7 +45,9 @@ def param_is_not_shared(param):  # pylint: disable=missing-function-docstring
     return not hasattr(param, 'shared') or not param.shared
 
 
-def is_first_microbatch_tracked(config) -> bool:
+def is_first_microbatch_tracked(
+    config, module: Optional[torch.nn.Module] = None, is_context_quantized: bool = False
+) -> bool:
     """True if ``is_first_microbatch`` is still being kept up to date.
 
     A training step runs N microbatches. The flag marks microbatch 1 -- the one that
@@ -54,11 +56,29 @@ def is_first_microbatch_tracked(config) -> bool:
         layer is built      ->  flag = True
         every forward       ->  flag = False   (microbatch 1 is over)
         start of each step  ->  flag = True    (only quantized configs)
+
+    Args:
+        config: the module's :class:`TransformerConfig`.
+        module: the module about to receive the flag. A ``quant_recipe`` decides quantization
+            per module and in both directions: it can quantize a layer the config leaves
+            alone, and it can force a layer to high precision while the config enables fp8.
+            Only the module can answer which of those applies to it, so pass it whenever one
+            is in hand. Omit it for the model-wide answer, which is what
+            :meth:`MegatronModule.set_is_first_microbatch` uses to decide whether to set the
+            flag at all.
+        is_context_quantized: whether a quantization autocast surrounds the call. Read only
+            when ``module`` is given, because it is the ambient state that a module's own
+            recipe overrides.
     """
+    if getattr(config, 'use_kitchen', False):
+        # Kitchen drives quantization outside TE's autocast state, so there is no per-module
+        # answer to consult here.
+        return True
+    if module is not None and hasattr(module, 'will_execute_quantized'):
+        return module.will_execute_quantized(is_context_quantized)
     return (
         config.fp8 is not None
         or config.fp4 is not None
-        or getattr(config, 'use_kitchen', False)
         or getattr(config, 'quant_recipe', None) is not None
     )
 
