@@ -915,11 +915,7 @@ def test_fully_shard_preserves_parameter_attributes(distributed_setup):
     device = distributed_setup.device
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
     model = nn.Linear(8, 8, bias=False, device=device)
-    attributes = {
-        "is_embedding_or_output_parameter": True,
-        "is_embedding_parameter": True,
-        "use_muon": False,
-    }
+    attributes = {"use_muon": False}
     for name, value in attributes.items():
         setattr(model.weight, name, value)
 

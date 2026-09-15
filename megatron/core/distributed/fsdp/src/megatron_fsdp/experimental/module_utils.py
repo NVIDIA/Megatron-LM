@@ -24,24 +24,23 @@ def get_parameter_owner(root_module: nn.Module, parameter_fqn: str) -> tuple[nn.
     return owner, parameter_name
 
 
-# Preserve the metadata used for Muon parameter selection and MuP embedding
-# classification. Public Parameter state (requires_grad) is handled explicitly
-# by callers; tensor storage, hooks, and FSDP runtime state are not copied.
-_PARAMETER_ATTRIBUTES = ("is_embedding_or_output_parameter", "is_embedding_parameter", "use_muon")
+# FSDP replaces model Parameters, but optimizer setup still needs these flags:
+# - Some weights (e.g. MoE router weights) need use_muon=False to explicitly
+#   exclude them from Muon.
+# - is_embedding_or_output_parameter and is_embedding_parameter identify embedding
+#   weights. The Muon optimizer needs to exclude these weights.
+_PARAMETER_ATTRIBUTES_TO_PRESERVE = (
+    "is_embedding_or_output_parameter",
+    "is_embedding_parameter",
+    "use_muon",
+)
 
 
-def save_parameter_attributes(parameter: nn.Parameter) -> dict[str, object]:
-    """Snapshot model metadata before materializing or replacing a Parameter.
+def copy_parameter_attributes(from_: nn.Parameter, to_: nn.Parameter) -> None:
+    """Copy model metadata between Parameters, including false or None values.
 
-    Values are shallow-copied: process-group references must retain their identity.
     Extend the shared attribute list when adding a new model-parameter contract.
     """
-    return {
-        name: getattr(parameter, name) for name in _PARAMETER_ATTRIBUTES if hasattr(parameter, name)
-    }
-
-
-def restore_parameter_attributes(parameter: nn.Parameter, attributes: dict[str, object]) -> None:
-    """Restore saved model metadata, including explicitly false or None values."""
-    for name, value in attributes.items():
-        setattr(parameter, name, value)
+    for name in _PARAMETER_ATTRIBUTES_TO_PRESERVE:
+        if hasattr(from_, name):
+            setattr(to_, name, getattr(from_, name))

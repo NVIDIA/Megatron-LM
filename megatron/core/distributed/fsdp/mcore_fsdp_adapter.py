@@ -59,8 +59,7 @@ try:
         microbatch,
     )
     from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module_utils import (
-        restore_parameter_attributes,
-        save_parameter_attributes,
+        copy_parameter_attributes,
     )
     from megatron.core.distributed.fsdp.src.megatron_fsdp.utils import (
         all_sharding_strategies_in,
@@ -100,17 +99,17 @@ def _materialize_meta_module(module: nn.Module, device: torch.device | None) -> 
 
     # Both _apply() and TE reset_parameters() may replace Parameter objects.
     parameter_states = [
-        (name, parameter.requires_grad, save_parameter_attributes(parameter))
+        (name, parameter, parameter.requires_grad)
         for name, parameter in module.named_parameters(recurse=False)
     ]
 
     module._apply(materialize_tensor, recurse=False)
     reset_parameters()
 
-    for name, requires_grad, attributes in parameter_states:
+    for name, original_parameter, requires_grad in parameter_states:
         parameter = module.get_parameter(name)
         parameter.requires_grad_(requires_grad)
-        restore_parameter_attributes(parameter, attributes)
+        copy_parameter_attributes(original_parameter, parameter)
 
 
 def _materialize_owned_meta_modules(module: nn.Module, device: torch.device | None) -> None:

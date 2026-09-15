@@ -29,11 +29,7 @@ from torch.distributed.tensor.placement_types import Placement
 
 from ..mixed_precision import MixedPrecisionPolicy
 from .dbuffer import DBuffer
-from .module_utils import (
-    get_parameter_owner,
-    restore_parameter_attributes,
-    save_parameter_attributes,
-)
+from .module_utils import copy_parameter_attributes, get_parameter_owner
 from .placement import BlockAtomic
 
 _CONTAINING_PARAMETER_GROUP_ATTR = "_mfsdp_parameter_group"
@@ -283,27 +279,26 @@ class FsdpParameterGroup:
         fsdp_parameters: list[FsdpParameter] = []
         main_grad_dtype = self.main_grad.dtype if self.main_grad is not None else None
         for index, (parameter, fqns) in enumerate(parameter_to_fqns.items()):
-            attributes = save_parameter_attributes(parameter)
             unsharded_tensor = self._unsharded_model_weight.get_local_tensor(index)
             if parameter.is_meta:
                 # A meta Parameter cannot set .data to a real tensor because their
                 # TensorImpl types are incompatible, so swap in a materialized Parameter.
-                # Restore model metadata below after swapping the tensor state.
+                # Copy model metadata first since swap_tensors() also swaps attributes.
                 materialized_parameter = nn.Parameter(
                     unsharded_tensor, requires_grad=parameter.requires_grad
                 )
+                copy_parameter_attributes(parameter, materialized_parameter)
                 torch.utils.swap_tensors(parameter, materialized_parameter)
             else:
                 parameter.data = unsharded_tensor
                 parameter.grad = None
-            restore_parameter_attributes(parameter, attributes)
             # Parameter-owned markers must not retain their FSDP module tree.
             setattr(parameter, _CONTAINING_PARAMETER_GROUP_ATTR, ref(self))
 
             sharded_parameter = nn.Parameter(
                 self.main_weight.get_dtensor(index), requires_grad=parameter.requires_grad
             )
-            restore_parameter_attributes(sharded_parameter, attributes)
+            copy_parameter_attributes(parameter, sharded_parameter)
             if main_grad_dtype:
                 sharded_parameter.grad_dtype = main_grad_dtype
             setattr(sharded_parameter, _CONTAINING_PARAMETER_GROUP_ATTR, ref(self))
