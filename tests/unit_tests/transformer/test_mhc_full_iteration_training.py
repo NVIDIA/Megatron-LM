@@ -59,10 +59,13 @@ def _restore_rng(snapshot):
         generators[name].set_state(state)
 
 
-def _build_models(model_kind, dtype, graph_impl, pp_size, vp_size, dropout):
+def _build_models(
+    model_kind, dtype, graph_impl, pp_size, vp_size, dropout, *, te_graph_modules=None
+):
     is_hybrid = model_kind.startswith("hybrid")
-    is_moe = model_kind.endswith("moe")
-    has_mtp = model_kind == "hybrid_mtp"
+    is_moe = "moe" in model_kind
+    has_mtp = "mtp" in model_kind
+    static_moe = is_moe and te_graph_modules is None
     num_chunks = vp_size or 1
     num_layers = 2 * pp_size * num_chunks
     config = TransformerConfig(
@@ -82,7 +85,8 @@ def _build_models(model_kind, dtype, graph_impl, pp_size, vp_size, dropout):
         mhc_sinkhorn_iterations=5,
         use_fused_mhc=True,
         cuda_graph_impl=graph_impl,
-        cuda_graph_modules=[],
+        cuda_graph_modules=te_graph_modules if graph_impl == "transformer_engine" else [],
+        use_te_rng_tracker=graph_impl == "transformer_engine",
         cuda_graph_warmup_steps=_WARMUP_STEPS,
         attention_backend=AttnBackend.unfused,
         attention_dropout=dropout,
@@ -99,14 +103,14 @@ def _build_models(model_kind, dtype, graph_impl, pp_size, vp_size, dropout):
         is_hybrid_model=is_hybrid,
         mtp_num_layers=1 if has_mtp else None,
         mtp_loss_scaling_factor=0.2,
-        num_moe_experts=2 if is_moe else None,
+        num_moe_experts=(2 if static_moe else 4) if is_moe else None,
         moe_ffn_hidden_size=128 if is_moe else None,
         moe_router_topk=2 if is_moe else 1,
         moe_router_load_balancing_type="none",
         moe_router_dtype="fp32",
         moe_token_dispatcher_type="alltoall",
-        moe_expert_capacity_factor=1.0 if is_moe else None,
-        moe_pad_expert_input_to_capacity=is_moe,
+        moe_expert_capacity_factor=1.0 if static_moe else None,
+        moe_pad_expert_input_to_capacity=static_moe,
         moe_grouped_gemm=is_moe,
         finalize_model_grads_func=finalize_model_grads,
     )
@@ -131,7 +135,7 @@ def _build_models(model_kind, dtype, graph_impl, pp_size, vp_size, dropout):
             segment = "*E" if is_moe else "*-"
             pattern = "|".join([segment] * (pp_size * num_chunks))
             if has_mtp:
-                pattern += "/*-"
+                pattern += "/" + segment
             model = HybridModel(
                 hybrid_stack_spec=hybrid_stack_spec, hybrid_layer_pattern=pattern, **kwargs
             )
