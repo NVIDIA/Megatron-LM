@@ -5,32 +5,44 @@ import os
 import sys
 from functools import partial
 
-from megatron.training.arguments import parse_and_validate_args
 import torch
-import yaml
 
 sys.path.append(
     os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir, os.path.pardir))
 )
 
-from dataloader_provider import train_valid_test_dataloaders_provider, is_first_or_last_stage
+from dataloader_provider import is_first_or_last_stage, train_valid_test_dataloaders_provider
 from model import model_provider
 from multimodal_args import add_multimodal_extra_args
 
-from megatron.core import mpu, tensor_parallel
-from megatron.core.utils import nvtx_range_pop, nvtx_range_push
+from megatron.core import parallel_state, tensor_parallel
 from megatron.core.enums import ModelType
-from megatron.core.models.multimodal import context_parallel
 from megatron.core.models.multimodal.llava_model import IGNORE_INDEX, LLaVAModel
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import (
-    get_tensor_model_parallel_rank,
     get_pipeline_model_parallel_world_size,
+    get_tensor_and_context_parallel_group,
+    get_tensor_model_parallel_rank,
     is_pipeline_last_stage,
 )
+from megatron.core.utils import nvtx_range_pop, nvtx_range_push
 from megatron.training import get_args, get_timers, get_tokenizer, pretrain
-from megatron.core.utils import get_batch_on_this_cp_rank
-from megatron.training.utils import is_last_rank
+from megatron.training.argument_utils import pretrain_cfg_container_from_args
+from megatron.training.arguments import parse_and_validate_args
+from megatron.training.training import (
+    update_packed_sequence_stats,
+    update_seqlen_stats_from_cu_seqlens,
+)
+
+
+def _get_batch_broadcast_group(args):
+    """Select the group that receives a prepared multimodal batch."""
+    if (
+        getattr(args, "deduplicate_dataloader_across_context_parallel", False)
+        and args.context_parallel_size > 1
+    ):
+        return get_tensor_and_context_parallel_group()
+    return None
 
 
 def get_batch(data_iterator, image_token_index, img_seq_len):
@@ -45,31 +57,104 @@ def get_batch(data_iterator, image_token_index, img_seq_len):
     attention_mask = None
     position_ids = None
     num_tiles = None
+    num_frames = None
     packed_seq_params = None
+    imgs_sizes = None
+    vision_packed_seq_params = None
+    has_pad_img = None
+    samples_seen = None
+    sample_lengths = None
 
     args = get_args()
+    batch_broadcast_group = _get_batch_broadcast_group(args)
+
+    def broadcast(keys, dtype):
+        return tensor_parallel.broadcast_data(
+            keys, data, dtype, tp_group=batch_broadcast_group
+        )
 
     # Dataloader doesn't run on the middle stages in a pipeline parallel model.
     pp_size = get_pipeline_model_parallel_world_size()
-    if not is_first_or_last_stage(pp_size):
+    if not is_first_or_last_stage(
+        pp_size, getattr(args, "encoder_pipeline_model_parallel_size", 0)
+    ):
         # Note these are all set to None above.
-        return tokens, labels, loss_mask, attention_mask, position_ids, imgs, num_tiles, packed_seq_params
+        return (
+            tokens,
+            labels,
+            loss_mask,
+            attention_mask,
+            position_ids,
+            imgs,
+            num_tiles,
+            num_frames,
+            packed_seq_params,
+            imgs_sizes,
+            vision_packed_seq_params,
+            has_pad_img,
+            samples_seen,
+        )
 
     # Broadcast data.
     nvtx_range_push("get_data")
     if data_iterator is not None and get_tensor_model_parallel_rank() == 0:
-        data = next(data_iterator)
+        timers = get_timers()
+        timers('dataloader-next', log_level=1).start()
+        try:
+            data = next(data_iterator)
+        finally:
+            timers('dataloader-next').stop()
     else:
         data = None
 
-    data_text = tensor_parallel.broadcast_data(["tokens"], data, torch.int64)["tokens"]
-    labels = tensor_parallel.broadcast_data(["labels"], data, torch.int64)["labels"]
+    if batch_broadcast_group is not None:
+        group_is_source = batch_broadcast_group.rank() == 0
+        if (data is not None) != group_is_source:
+            raise RuntimeError(
+                "CP-deduplicated dataloader ownership does not match the TP x CP "
+                "batch-broadcast source rank"
+            )
 
-    imgs = tensor_parallel.broadcast_data(["imgs"], data, torch.float32)["imgs"]
-    num_tiles = tensor_parallel.broadcast_data(["num_tiles"], data, torch.int32)["num_tiles"]
+    data_text = broadcast(["tokens"], torch.int64)["tokens"]
+    labels = broadcast(["labels"], torch.int64)["labels"]
+    imgs = broadcast(["imgs"], torch.float32)["imgs"]
 
-    cu_lengths = tensor_parallel.broadcast_data(["cu_lengths"], data, torch.int32)["cu_lengths"]
-    max_lengths = tensor_parallel.broadcast_data(["max_lengths"], data, torch.int32)["max_lengths"]
+    # Older image-only datasets do not provide frame counts.
+    if data is not None and "num_frames" not in data:
+        if "num_tiles" in data:
+            data["num_frames"] = torch.ones_like(data["num_tiles"], dtype=torch.int32)
+        else:
+            data["num_frames"] = torch.tensor([], dtype=torch.int32)
+
+    tile_metadata = broadcast(["num_tiles", "num_frames"], torch.int32)
+    num_tiles = tile_metadata["num_tiles"]
+    num_frames = tile_metadata["num_frames"]
+
+    cu_lengths = broadcast(["cu_lengths"], torch.int32)["cu_lengths"]
+    cu_lengths_padded = broadcast(["cu_lengths_padded"], torch.int32)["cu_lengths_padded"]
+    max_lengths = broadcast(["max_lengths"], torch.int32)["max_lengths"]
+
+    if data is not None and "samples_seen" not in data:
+        data["samples_seen"] = torch.tensor(1, dtype=torch.int32)
+    samples_seen = broadcast(["samples_seen"], torch.int32)["samples_seen"]
+
+    if args.log_packed_sequence_stats:
+        if data is not None and "sample_lengths" not in data:
+            if "cu_lengths" in data and data["cu_lengths"].numel() > 1:
+                cu_lengths_for_stats = data["cu_lengths"]
+                if cu_lengths_for_stats.dim() == 1:
+                    cu_lengths_for_stats = cu_lengths_for_stats.unsqueeze(0)
+                data["sample_lengths"] = (
+                    cu_lengths_for_stats[:, 1:] - cu_lengths_for_stats[:, :-1]
+                ).to(dtype=torch.int32)
+            else:
+                data["sample_lengths"] = torch.zeros((1, 1), dtype=torch.int32)
+        sample_lengths = broadcast(["sample_lengths"], torch.int32)["sample_lengths"]
+
+    imgs_sizes = broadcast(["imgs_sizes"], torch.int32)["imgs_sizes"]
+    vision_cu_lengths = broadcast(["vision_cu_lengths"], torch.int32)["vision_cu_lengths"]
+    vision_max_lengths = broadcast(["vision_max_lengths"], torch.int32)["vision_max_lengths"]
+    has_pad_img = broadcast(["has_pad_img"], torch.bool)["has_pad_img"]
 
     # No image input (text-only sample) if the dataloader returned a size 1 image.
     if imgs.shape == torch.Size([1, 1]):
@@ -77,13 +162,13 @@ def get_batch(data_iterator, image_token_index, img_seq_len):
         # model and then add image embeddings with a zero multiplier.
         if args.use_torch_fsdp2:
             imgs = torch.zeros((1, 3, args.img_h, args.img_w), dtype=torch.float32, device=data_text.device)
-            num_tiles = torch.tensor([], dtype=torch.int, device=data_text.device)
         else:
             # Similar workaround is not needed without FSDP and we can use an empty image.
             # FIXME: text-only data can cause still cause a hang in the special case where
             # the vision model is own its own pipeline rank and --freeze-ViT is enabled.
             imgs = torch.tensor([], dtype=torch.float32, device=data_text.device)
-            num_tiles = torch.tensor([], dtype=torch.int, device=data_text.device)
+        num_tiles = torch.tensor([], dtype=torch.int, device=data_text.device)
+        num_frames = torch.tensor([], dtype=torch.int, device=data_text.device)
 
     # Last pipeline parallel stage doesn't need images.
     if pp_size > 1 and is_pipeline_last_stage():
@@ -95,14 +180,41 @@ def get_batch(data_iterator, image_token_index, img_seq_len):
             cu_lengths.shape[0] == max_lengths.shape[0] == 1
         ), "micro-batch-size must be 1 for packing"
         cu_lengths = cu_lengths[0]
+        cu_lengths_padded = cu_lengths_padded[0]
         max_lengths = max_lengths[0]
+        total_tokens = int(
+            (cu_lengths_padded if cu_lengths_padded is not None else cu_lengths)[-1].item()
+        )
+
+        # The shared throughput accumulator otherwise uses args.seq_length,
+        # which is the vision length in multimodal training rather than the
+        # packed decoder work. PP>1 does not yet have all-rank participation.
+        if pp_size == 1:
+            update_seqlen_stats_from_cu_seqlens(cu_lengths)
 
         packed_seq_params = PackedSeqParams(
             qkv_format="thd",
             cu_seqlens_q=cu_lengths,
             cu_seqlens_kv=cu_lengths,
+            cu_seqlens_q_padded=cu_lengths_padded,
+            cu_seqlens_kv_padded=cu_lengths_padded,
             max_seqlen_q=max_lengths,
             max_seqlen_kv=max_lengths,
+            total_tokens=total_tokens,
+        )
+
+    if vision_cu_lengths.shape != torch.Size([1, 1]):
+        assert vision_cu_lengths.shape[0] == vision_max_lengths.shape[0] == 1, (
+            "micro-batch-size must be 1 for vision packing"
+        )
+        vision_cu_lengths = vision_cu_lengths[0]
+        vision_max_lengths = vision_max_lengths[0]
+        vision_packed_seq_params = PackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=vision_cu_lengths,
+            cu_seqlens_kv=vision_cu_lengths,
+            max_seqlen_q=vision_max_lengths,
+            max_seqlen_kv=vision_max_lengths,
         )
 
     nvtx_range_pop("get_data")
@@ -120,25 +232,16 @@ def get_batch(data_iterator, image_token_index, img_seq_len):
 
     nvtx_range_push("get_ltor_masks_and_position_ids")
     loss_mask, position_ids = get_ltor_masks_and_position_ids(tokens, labels, tokenizer.pad)
+    if packed_seq_params is not None and args.reset_position_ids_from_packed_metadata:
+        position_ids = build_position_ids_from_packed_metadata(
+            tokens,
+            packed_seq_params.cu_seqlens_q,
+            packed_seq_params.cu_seqlens_q_padded,
+        )
     nvtx_range_pop("get_ltor_masks_and_position_ids")
 
-    # If context parallel is enabled, must shard inputs to CP ranks.
-    if args.context_parallel_size > 1 or args.sequence_parallel:
-        assert tokens.shape[0], "micro-batch-size > 1 not supported yet with CP"
-
-        num_image_tokens = torch.sum(tokens == image_token_index).item()
-        num_image_embeddings = img_seq_len * imgs.shape[0] - num_image_tokens
-        seq_len = text_length + num_image_embeddings
-
-        # CP expects sequence length is divisible by CP size so apply padding.
-        mp_padding_needed = context_parallel.get_padding(
-            seq_len, args.context_parallel_size,
-            args.tensor_model_parallel_size, args.sequence_parallel,
-        )
-        tokens, position_ids, labels, loss_mask = [torch.nn.functional.pad(item, (0, mp_padding_needed)) for item in (tokens, position_ids, labels, loss_mask)]
-
-        # Get PackedSeqParams that indicate the amount of padding for TransformerEngine.
-        packed_seq_params = context_parallel.get_packed_seq_params(tokens, num_image_embeddings, mp_padding_needed, args.context_parallel_size, True)
+    if args.log_packed_sequence_stats and packed_seq_params is not None:
+        update_packed_sequence_stats(sample_lengths, loss_mask)
 
     return (
         tokens,
@@ -148,7 +251,12 @@ def get_batch(data_iterator, image_token_index, img_seq_len):
         position_ids,
         imgs,
         num_tiles,
+        num_frames,
         packed_seq_params,
+        imgs_sizes,
+        vision_packed_seq_params,
+        has_pad_img,
+        samples_seen,
     )
 
 
@@ -166,6 +274,37 @@ def get_ltor_masks_and_position_ids(input_ids, target, pad_token):
     loss_mask[target == IGNORE_INDEX] = 0.0  # mask prompts
 
     return loss_mask, position_ids
+
+
+def build_position_ids_from_packed_metadata(
+    tokens: torch.Tensor,
+    cu_seqlens: torch.Tensor | None,
+    cu_seqlens_padded: torch.Tensor | None,
+) -> torch.Tensor:
+    """Build position IDs that reset for every member of a packed sample."""
+    position_ids = torch.arange(tokens.shape[1], dtype=torch.long, device=tokens.device)
+    position_ids = position_ids.unsqueeze(0).expand_as(tokens).clone()
+    if cu_seqlens is None:
+        return position_ids
+
+    if cu_seqlens.dim() == 1:
+        cu_seqlens = cu_seqlens.unsqueeze(0)
+    if cu_seqlens_padded is None:
+        cu_seqlens_padded = cu_seqlens
+    elif cu_seqlens_padded.dim() == 1:
+        cu_seqlens_padded = cu_seqlens_padded.unsqueeze(0)
+
+    for batch_idx in range(tokens.shape[0]):
+        packed_offsets = cu_seqlens_padded[batch_idx].detach().cpu().tolist()
+        for start, end in zip(packed_offsets[:-1], packed_offsets[1:]):
+            start = int(start)
+            end = min(int(end), tokens.shape[1])
+            if end > start:
+                position_ids[batch_idx, start:end] = torch.arange(
+                    end - start, dtype=torch.long, device=tokens.device
+                )
+
+    return position_ids
 
 
 def get_mask_start_and_end_idx(arr):
@@ -193,7 +332,7 @@ def get_mask_start_and_end_idx(arr):
     return sequences
 
 
-def scaled_loss_func(loss_mask, output_tensor):
+def scaled_loss_func(loss_mask, output_tensor, samples_seen):
     """
     Scaled loss function
 
@@ -204,6 +343,9 @@ def scaled_loss_func(loss_mask, output_tensor):
     Where we use the loss mask to infer the start / end of the conversation turns.
     """
     args = get_args()
+    assert args.context_parallel_size == 1, (
+        "Per-turn loss scaling must be precomputed before context-parallel sharding"
+    )
     losses = output_tensor.float()
 
     loss_list = []
@@ -225,33 +367,60 @@ def scaled_loss_func(loss_mask, output_tensor):
         # normalize loss for each turn
         loss_list[idx] = loss_list[idx] * math.sqrt(num_valid_labels_list[idx]) / base_num
 
-    # Some ranks may not get loss tokens due to Context Parallel Sharding
     if len(loss_list) > 0:
         total_loss = torch.stack(loss_list).sum()
         total_tokens = torch.ones_like(total_loss)
-    elif len(loss_list) == 0 and args.context_parallel_size > 1:
-        total_tokens = loss_mask.sum()
-        total_loss = torch.sum(losses.view(-1) * loss_mask)
     else:
         raise RuntimeError("loss_list for loss scaling per conversation unexpectedly got empty list")
 
     num_tokens = total_tokens.clone().detach().to(torch.int)
     reporting_loss = torch.cat([total_loss.clone().detach().view(1), num_tokens.view(1)])
 
-    return (total_loss, num_tokens, {'lm loss': reporting_loss})
+    return (
+        total_loss,
+        num_tokens,
+        {"lm loss": reporting_loss, "_samples_seen": samples_seen.detach().float()},
+    )
 
 
-def loss_func(loss_mask, output_tensor):
+def loss_func(loss_mask, output_tensor, samples_seen):
     args = get_args()
 
     losses = output_tensor.view(-1).float()
     loss_mask = loss_mask.contiguous().view(-1).float()
     loss = torch.sum(losses * loss_mask)
 
-    num_tokens = loss_mask.sum().clone().detach().to(torch.int)
-    reporting_loss = torch.cat([loss.clone().detach().view(1), num_tokens.view(1)])
+    if args.no_calculate_per_token_loss:
+        num_tokens = loss_mask.sum().clone().detach().to(torch.int).clamp(min=1)
+    elif args.use_loss_scaling and args.context_parallel_size > 1:
+        # The precomputed mask already normalizes the loss; account for the loss
+        # reduction's division by the number of CP ranks.
+        num_tokens = torch.tensor(1, dtype=torch.int, device=losses.device)
+        loss *= args.context_parallel_size
+    else:
+        num_tokens = loss_mask.sum().clone().detach().to(torch.int)
 
-    return (loss, num_tokens, {'lm loss': reporting_loss})
+    global_loss = loss.detach().clone()
+    global_num_tokens = num_tokens.clone()
+    if torch.distributed.is_initialized() and args.context_parallel_size > 1:
+        torch.distributed.all_reduce(
+            global_loss,
+            op=torch.distributed.ReduceOp.SUM,
+            group=parallel_state.get_context_parallel_group(),
+        )
+        torch.distributed.all_reduce(
+            global_num_tokens,
+            op=torch.distributed.ReduceOp.SUM,
+            group=parallel_state.get_context_parallel_group(),
+        )
+
+    reporting_loss = torch.cat([global_loss.view(1), global_num_tokens.view(1)])
+
+    return (
+        loss,
+        num_tokens,
+        {"lm loss": reporting_loss, "_samples_seen": samples_seen.detach().float()},
+    )
 
 
 def forward_step(data_iterator, model: LLaVAModel):
@@ -268,7 +437,7 @@ def forward_step(data_iterator, model: LLaVAModel):
     timers = get_timers()
 
     # Get the batch.
-    timers('batch-generator', log_level=2).start()
+    timers('batch-generator', log_level=1).start()
     (
         tokens,
         labels,
@@ -277,7 +446,12 @@ def forward_step(data_iterator, model: LLaVAModel):
         position_ids,
         images,
         num_image_tiles,
+        num_frames,
         packed_seq_params,
+        imgs_sizes,
+        vision_packed_seq_params,
+        has_pad_img,
+        samples_seen,
     ) = get_batch(data_iterator, model.module.module.image_token_index, model.module.module.img_seq_len)
     timers('batch-generator').stop()
 
@@ -289,13 +463,17 @@ def forward_step(data_iterator, model: LLaVAModel):
         labels,
         loss_mask,
         num_image_tiles=num_image_tiles,
+        num_frames=num_frames,
         packed_seq_params=packed_seq_params,
+        imgs_sizes=imgs_sizes,
+        vision_packed_seq_params=vision_packed_seq_params,
+        has_pad_img=has_pad_img,
     )
     args = get_args()
-    if args.use_loss_scaling:
-        loss_function = partial(scaled_loss_func, loss_mask)
+    if args.use_loss_scaling and args.context_parallel_size == 1:
+        loss_function = partial(scaled_loss_func, loss_mask, samples_seen=samples_seen)
     else:
-        loss_function = partial(loss_func, loss_mask)
+        loss_function = partial(loss_func, loss_mask, samples_seen=samples_seen)
 
     return output_tensor, loss_function
 
@@ -335,6 +513,7 @@ def run_online_eval(model):
         return []
 
     from config import EvaluationConfig
+
     # Import the common evaluation functions
     from run_text_generation import get_evaluation_configs, run_evaluation_loop
 
@@ -383,6 +562,7 @@ def write_online_eval_to_tensorboard(data, iteration, writer, walltime=None):
 if __name__ == "__main__":
 
     train_valid_test_dataloaders_provider.is_distributed = True
+    train_valid_test_dataloaders_provider.supports_train_full_dataset = True
 
     args = parse_and_validate_args(
         extra_args_provider=add_multimodal_extra_args,
@@ -390,6 +570,7 @@ if __name__ == "__main__":
     )
     full_config = pretrain_cfg_container_from_args(args)
     pretrain(
+        full_config,
         train_valid_test_dataloaders_provider,
         ModelType.encoder_or_decoder,
         forward_step,
