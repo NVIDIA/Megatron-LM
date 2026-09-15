@@ -18,16 +18,37 @@ original shards. All collectives use the existing gtp_remat / tp process groups.
 from __future__ import annotations
 
 import contextlib
+import dataclasses
+import enum
 import logging
+import math
 from typing import Any, Callable, Literal, Optional
 
 import torch
 from torch.optim.optimizer import ParamsT
 
 from megatron.core.optimizer.emerging_optimizers import TensorParallelMuon
-from megatron.core.optimizer.layer_sharded_a2a import route_from_ns_home, route_to_ns_home
+from megatron.core.optimizer.layer_sharded_a2a import (
+    params_by_home,
+    route_from_ns_home,
+    route_to_ns_home,
+)
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.utils import is_emerging_optimizers_min_version, log_single_rank
+from megatron.core.utils import (
+    get_pg_rank,
+    get_pg_size,
+    is_emerging_optimizers_min_version,
+    log_single_rank,
+)
+
+try:
+    from megatron.core.tensor_parallel.gtp_api import is_gtp_param
+except ImportError:  # GTP module unavailable (TransformerEngine too old): same one-line tag test
+
+    def is_gtp_param(param) -> bool:
+        """True if ``param`` carries the GTP weight-remat shard tag."""
+        return getattr(param, "is_gtp_weight_remat", False)
+
 
 try:
     from emerging_optimizers import triton_kernels
@@ -39,7 +60,7 @@ try:
 except ImportError:
     HAVE_EMERGING_OPTIMIZERS = False
 
-__all__ = ["LayerShardedMuon"]
+__all__ = ["LayerShardedMuon", "ParamShardSpec", "ParamSharding", "tp_partition_dim"]
 
 logger = logging.getLogger(__name__)
 
@@ -109,15 +130,159 @@ def _phase(name: str):
         torch.cuda.nvtx.range_pop()
 
 
+class ParamSharding(enum.Enum):
+    """Which axes of a param group's (gtp_remat, tp) domain shard a 2-D weight.
+
+    Derived from the model's sharding attributes and the domain sizes
+    (:meth:`ParamShardSpec.from_param`); the exchanges follow from it: stage 1 runs for a
+    gtp_remat axis, stage 2 for a TP axis.
+    """
+
+    REPLICATED = "replicated"
+    """Whole on every rank of the domain (MoE router, latent projections, or any param in
+    a single-rank domain): no exchange, every rank runs the same local Newton-Schulz."""
+
+    GTP_REMAT = "gtp_remat"
+    """dim 0 split over gtp_remat: stage-1 exchange, then every TP peer of the home column
+    holds the full matrix and runs the same Newton-Schulz."""
+
+    TP = "tp"
+    """Split over TP only (the domain has no gtp_remat axis): stage-2 exchange only."""
+
+    GTP_REMAT_AND_TP = "gtp_remat_and_tp"
+    """gtp_remat shards of a TP shard: stage 1 assembles the TP-local matrix on the home
+    column, stage 2 assembles the full matrix on the ``(g_home, t_home)`` rank."""
+
+
+def tp_partition_dim(p: torch.Tensor) -> int | None:
+    """The dim TP splits ``p`` along, or None when ``p`` is replicated across TP.
+
+    ``tensor_model_parallel`` is the sharded/replicated flag and ``partition_dim`` is only
+    meaningful when it is set, the same convention ``param_is_not_tensor_parallel_duplicate``
+    uses. Megatron marks duplicated-mode TE weights ``tensor_model_parallel=False`` while TE
+    still stamps ``partition_dim=0`` on them, so ``partition_dim`` alone misclassifies them.
+    """
+    if not getattr(p, "tensor_model_parallel", False):
+        return None
+    pd = getattr(p, "partition_dim", None)
+    if pd is not None and pd >= 0:
+        return int(pd)
+    return None
+
+
+@dataclasses.dataclass(frozen=True)
+class ParamShardSpec:
+    """How the model sharded one parameter over a (gtp_remat, tp) domain.
+
+    Holds only model-imposed facts, fixed by the forward/backward parallelism: the
+    optimizer reads them once (:meth:`from_param`) and never recomputes them in ``step()``.
+    Everything the optimizer derives from them is a property.
+
+    - ``tp_dim``: the dim TP splits (0 column-parallel, 1 row-parallel) or None
+      (:func:`tp_partition_dim`, ignored when the domain has no TP axis).
+    - ``gtp_sharded``: dim 0 of the TP-local shard is split over gtp_remat
+      (``is_gtp_param``) and the domain has a gtp_remat axis.
+    - ``pad_length``: GTP alignment padding, trailing zero rows on the gtp-gathered
+      TP-local dim 0 (0 when not GTP-sharded).
+    - ``full_shape``: shape of the matrix Newton-Schulz runs on (pad stripped).
+    """
+
+    tp_dim: int | None
+    gtp_sharded: bool
+    pad_length: int
+    full_shape: tuple[int, ...]
+
+    @classmethod
+    def from_param(cls, p: torch.Tensor, gtp_remat_size: int, tp_size: int) -> "ParamShardSpec":
+        """Read ``p``'s sharding for a (gtp_remat, tp) domain of the given sizes.
+
+        An axis of size 1 is absent from the domain, so its tag is ignored: with
+        ``tp_size == 1`` every param is TP-replicated, and in a single-rank domain
+        everything is REPLICATED (plain local Newton-Schulz).
+
+        Raises:
+            ValueError: ``p`` is TP-sharded but not GTP-sharded while the domain has a
+                gtp_remat axis. Such a param is replicated across gtp_remat, and the
+                stage-1 exchange would concatenate its copies as dim-0 shards and
+                silently corrupt the update.
+        """
+        tp_dim = tp_partition_dim(p) if tp_size > 1 else None
+        gtp_tagged = bool(is_gtp_param(p))
+        if gtp_remat_size > 1 and tp_dim is not None and not gtp_tagged:
+            raise ValueError(
+                f"LayerShardedMuon: param of shape {tuple(p.shape)} is TP-sharded "
+                f"(partition_dim={tp_dim}) but not GTP-sharded (is_gtp_weight_remat "
+                f"absent/False) while gtp_remat_size={gtp_remat_size} > 1. The GTP_remat "
+                "exchange would concatenate replicated copies as shards and silently corrupt "
+                "the update. Tag the param with is_gtp_weight_remat or run it in a domain "
+                "without a GTP_remat axis."
+            )
+        gtp_sharded = gtp_tagged and gtp_remat_size > 1
+        pad_length = int(getattr(p, "pad_length", 0) or 0) if gtp_sharded else 0
+        if p.dim() != 2:
+            full_shape = tuple(p.shape)
+        else:
+            rows, cols = p.shape
+            if gtp_sharded:
+                rows = rows * gtp_remat_size - pad_length
+            if tp_dim == 0:
+                rows *= tp_size
+            elif tp_dim == 1:
+                cols *= tp_size
+            full_shape = (rows, cols)
+        return cls(tp_dim, gtp_sharded, pad_length, full_shape)
+
+    @property
+    def sharding(self) -> ParamSharding:
+        """Which domain axes shard the param; decides the exchanges it joins."""
+        if self.tp_dim is not None:
+            return ParamSharding.GTP_REMAT_AND_TP if self.gtp_sharded else ParamSharding.TP
+        return ParamSharding.GTP_REMAT if self.gtp_sharded else ParamSharding.REPLICATED
+
+    @property
+    def ns_cost(self) -> int:
+        """Newton-Schulz cost estimate on ``full_shape``, ~ max(M, N) * min(M, N)^2, the
+        weight NS-home balancing uses; non-2-D shapes count their elements."""
+        if len(self.full_shape) != 2:
+            return math.prod(self.full_shape)
+        m, n = self.full_shape
+        return m * n * min(m, n)
+
+
+@dataclasses.dataclass
+class _GroupExchangePlan:
+    """Everything ``step()`` needs for one param group that is constant across steps.
+
+    Built once per param identity tuple by :meth:`LayerShardedMuon._build_plan` and
+    invalidated by both setters; ``step()`` only consumes it. Index spaces: ``i`` indexes
+    the group's grad-bearing params, ``n`` the routed sub-list, ``k`` this rank's homed
+    subset of the routed list (``homed``).
+    """
+
+    param_ids: tuple[int, ...]
+    specs: list[ParamShardSpec]  # per i
+    replicated: list[int]  # i: whole on every rank, local NS
+    routed: list[int]  # i: goes through the exchanges
+    ns_homes: list[tuple[int, int]]  # per n: (g_home, t_home)
+    g_home: dict[int, int]  # n -> g_home, the stage-1 routing table
+    pad_lengths: list[int]  # per n
+    homed: list[int]  # k -> n: routed params whose g_home is this rank, in stage-1 order
+    tp_exchanges: dict[int, tuple[list[int], dict[int, int]]]  # tp_dim -> (k's, j -> t_home)
+    tp_complete: list[int]  # k: complete after stage 1 (no TP axis), skips stage 2
+    # a2a routing metadata per stage ('s1f', 's1b', ('s2f', pd), ('s2b', pd)), filled by
+    # the route_* helpers on the first step.
+    route_plans: dict = dataclasses.field(default_factory=dict)
+
+
 class LayerShardedMuon(TensorParallelMuon):
     """Muon with layer sharding over the GTP_remat x TP domain.
 
     Sharding model per 2D weight of full shape ``(P, Q)``:
 
-    - TP shards along ``param.partition_dim`` (0 = column-parallel, 1 = row-parallel,
-      None / -1 = not TP-sharded).
+    - TP shards along ``param.partition_dim`` (0 = column-parallel, 1 = row-parallel) when
+      ``param.tensor_model_parallel`` is set; otherwise the param is TP-replicated.
     - GTP_remat shards dim 0 of the TP-local shard, for params tagged
-      ``param.is_gtp_weight_remat`` (Megatron's marker; absent means unsharded).
+      ``param.is_gtp_weight_remat`` (``is_gtp_param``; absent means unsharded).
     - A param sharded by neither is whole on every rank of the domain (e.g. the MoE
       router and latent projections): it skips both exchanges and every rank runs the
       same deterministic NS on its own copy.
@@ -125,6 +290,10 @@ class LayerShardedMuon(TensorParallelMuon):
       gtp-gathered, TP-local dim 0) is stripped before Newton-Schulz — so the scale
       factor sees the true dims, matching the parent's duplicated path bitwise — and
       restored before the reverse gtp_remat exchange.
+
+    Each param's sharding is read once from these attributes
+    (:meth:`ParamShardSpec.from_param`), the per-group exchange plan (homes, routing
+    tables) is cached, and ``step()`` only consumes it.
 
     ``step()`` runs, per param group:
 
@@ -315,15 +484,15 @@ class LayerShardedMuon(TensorParallelMuon):
         # param_group index -> (gtp_remat_group, tp_group), overriding the constructor
         # defaults. Set via set_group_process_groups().
         self._group_process_groups: dict[int, tuple] = {}
-        # Cached a2a routing plans per param group. The routing metadata is a
-        # pure function of shapes, homes, pdims and group sizes, all static
-        # across steps; only the tensor packing is per-step. Keyed by the
-        # grad-filtered param identities so the wired path (persistent grad
-        # buffers, always fully populated) hits every step, while direct-API
-        # callers that drop a grad on some step safely trigger a rebuild.
-        # Metadata only, never buffers: persistent exchange buffers would
-        # raise steady-state memory between steps.
-        self._exchange_plans: dict[int, dict] = {}
+        # Per-group exchange plan (param specs, homes, a2a routing metadata): a pure
+        # function of the group's params, their sharding attributes and the domain sizes,
+        # all static across steps; only the tensor packing is per-step. Keyed by the
+        # grad-filtered param identities so the wired path (persistent grad buffers,
+        # always fully populated) hits every step, while direct-API callers that drop a
+        # grad on some step safely trigger a rebuild. Metadata only, never buffers:
+        # persistent exchange buffers would raise steady-state memory between steps.
+        self._plans: dict[int, _GroupExchangePlan] = {}
+        self._warned_missing_homes = False
 
     def set_param_ns_homes(self, param_ns_homes: dict[int, tuple[int, int]]) -> None:
         """Set the NS home for each param (by id).
@@ -335,7 +504,7 @@ class LayerShardedMuon(TensorParallelMuon):
         """
         self._param_ns_homes = param_ns_homes
         self._warned_missing_homes = False
-        self._exchange_plans.clear()
+        self._plans.clear()
 
     def set_group_process_groups(self, group_process_groups: dict[int, tuple]) -> None:
         """Override the (GTP, TP) process groups per param group.
@@ -351,7 +520,7 @@ class LayerShardedMuon(TensorParallelMuon):
                 size 1 / not available).
         """
         self._group_process_groups = group_process_groups
-        self._exchange_plans.clear()
+        self._plans.clear()
 
     def _apply_update(self, p: torch.Tensor, update: torch.Tensor, lr: float) -> None:
         """Apply one weight update through the base-class hook points.
@@ -493,6 +662,80 @@ class LayerShardedMuon(TensorParallelMuon):
             for s in streams:
                 default_stream.wait_stream(s)
 
+    def _plan_for(
+        self, group_index: int, params: list[torch.Tensor], gtp_remat_group, tp_group
+    ) -> _GroupExchangePlan:
+        """The cached exchange plan for this group's grad-bearing params.
+
+        Rebuilt only when the param set changes (a direct-API caller dropping a grad);
+        the wired path hits the cache every step.
+        """
+        param_ids = tuple(id(p) for p in params)
+        plan = self._plans.get(group_index)
+        if plan is None or plan.param_ids != param_ids:
+            plan = self._build_plan(params, gtp_remat_group, tp_group)
+            self._plans[group_index] = plan
+        return plan
+
+    def _build_plan(
+        self, params: list[torch.Tensor], gtp_remat_group, tp_group
+    ) -> _GroupExchangePlan:
+        """Read every param's sharding once and assemble the routing tables."""
+        gtp_remat_size = get_pg_size(gtp_remat_group)
+        tp_size = get_pg_size(tp_group)
+        specs = [ParamShardSpec.from_param(p, gtp_remat_size, tp_size) for p in params]
+        replicated = [i for i, s in enumerate(specs) if s.sharding is ParamSharding.REPLICATED]
+        routed = [i for i, s in enumerate(specs) if s.sharding is not ParamSharding.REPLICATED]
+
+        n_missing = sum(1 for i in routed if id(params[i]) not in self._param_ns_homes)
+        if n_missing and not self._warned_missing_homes:
+            # Any home is mathematically valid (assignment only affects load balance),
+            # but a miss usually means homes were wired against stale param objects
+            # (e.g. before an fp32 main-param swap): surface it.
+            self._warned_missing_homes = True
+            log_single_rank(
+                logger,
+                logging.WARNING,
+                f"LayerShardedMuon: {n_missing}/{len(routed)} params missing from "
+                "param_ns_homes; falling back to round-robin (g=i%G, t=0). Load "
+                "balancing (LPT) is NOT in effect for these params.",
+            )
+        ns_homes = [
+            self._param_ns_homes.get(id(params[i]), (i % gtp_remat_size, 0)) for i in routed
+        ]
+        g_home = {n: home[0] for n, home in enumerate(ns_homes)}
+
+        # This rank's share of the stage-1 exchange, by the rule the router itself applies
+        # (a trivial gtp_remat group homes everything locally).
+        if gtp_remat_size <= 1:
+            homed = list(range(len(routed)))
+        else:
+            homed = params_by_home(len(routed), g_home, gtp_remat_size)[
+                get_pg_rank(gtp_remat_group)
+            ]
+        by_tp_dim: dict[int | None, list[int]] = {0: [], 1: [], None: []}
+        for k, n in enumerate(homed):
+            by_tp_dim[specs[routed[n]].tp_dim].append(k)
+        tp_exchanges: dict[int, tuple[list[int], dict[int, int]]] = {}
+        for pd in (0, 1):
+            positions = by_tp_dim[pd]
+            if positions:
+                t_home = {j: ns_homes[homed[positions[j]]][1] for j in range(len(positions))}
+                tp_exchanges[pd] = (positions, t_home)
+
+        return _GroupExchangePlan(
+            param_ids=tuple(id(p) for p in params),
+            specs=specs,
+            replicated=replicated,
+            routed=routed,
+            ns_homes=ns_homes,
+            g_home=g_home,
+            pad_lengths=[specs[i].pad_length for i in routed],
+            homed=homed,
+            tp_exchanges=tp_exchanges,
+            tp_complete=by_tp_dim[None],
+        )
+
     def _step_groups(self, streams: "list | None", ready: "torch.cuda.Event | None") -> None:
         for group_index, group in enumerate(self.param_groups):
             if streams is not None:
@@ -501,14 +744,9 @@ class LayerShardedMuon(TensorParallelMuon):
                 streams[group_index].wait_event(ready)
                 torch.cuda.set_stream(streams[group_index])
             # Each param group may live in its own domain (dense vs expert).
-            pgs = self._group_process_groups.get(group_index, (self.gtp_remat_group, self.tp_group))
-            gtp_remat_group, tp_group = pgs[0], pgs[1]
-            gtp_remat_size = (
-                torch.distributed.get_world_size(gtp_remat_group)
-                if gtp_remat_group is not None
-                else 1
+            gtp_remat_group, tp_group = self._group_process_groups.get(
+                group_index, (self.gtp_remat_group, self.tp_group)
             )
-            tp_size = torch.distributed.get_world_size(tp_group) if tp_group is not None else 1
 
             self._init_group(group)
             lr = group["lr"]
@@ -517,10 +755,11 @@ class LayerShardedMuon(TensorParallelMuon):
             params = [p for p in group["params"] if p.grad is not None]
             if not params:
                 continue
+            plan = self._plan_for(group_index, params, gtp_remat_group, tp_group)
 
             # 1. Momentum update on the local shard.
             # NOTE: with nesterov=False, ``moms[i]`` aliases the momentum buffer
-            # (``.float()`` is a no-op on fp32) — everything below treats it as read-only.
+            # (``.float()`` is a no-op on fp32); everything below treats it as read-only.
             moms: list[torch.Tensor] = []
             with _phase("momentum"):
                 for p in params:
@@ -534,164 +773,85 @@ class LayerShardedMuon(TensorParallelMuon):
                         m = state["momentum_buffer"]
                     moms.append(m.float())
 
-            # Degenerate domain: this rank's shard is the whole matrix it owns, so
-            # run plain local NS exactly as base Muon would.
-            if gtp_remat_size * tp_size <= 1:
-                group_kwargs = {k: v for k, v in group.items() if k != "params"}
-                with fp32_matmul_precision(self.fp32_matmul_prec):
-                    for p, m in zip(params, moms):
-                        self._apply_update(p, self.orthogonalize(p, m, **group_kwargs), lr)
-                continue
-
-            def _partition_dim(p: torch.Tensor, _tp_size: int = tp_size) -> "int | None":
-                if _tp_size <= 1:
-                    return None
-                pd = getattr(p, "partition_dim", None)
-                return None if pd is None or pd == -1 else pd
-
-            def _gtp_remat_sharded(p: torch.Tensor, _gtp_remat_size: int = gtp_remat_size) -> bool:
-                return _gtp_remat_size > 1 and bool(getattr(p, "is_gtp_weight_remat", False))
-
-            # Params sharded by neither GTP_remat nor TP already hold the whole matrix on
-            # every rank of the domain (TE leaves the MoE router and the latent
-            # projections unsharded). They join neither exchange: every rank runs the
-            # same deterministic NS on its own copy, which is both correct and cheaper
-            # than electing a home and broadcasting the result back.
-            replicated, routed = [], []
-            for i, p in enumerate(params):
-                # A TP-sharded param that is not GTP-sharded is REPLICATED across the
-                # GTP_remat group; stage-1 would concatenate the G identical copies as if
-                # they were dim-0 shards and hand Newton-Schulz a (G*rows, cols)
-                # matrix. The reverse-path shape asserts come out numerically
-                # consistent, so this corrupts silently — reject it loudly instead.
-                if (
-                    gtp_remat_size > 1
-                    and _partition_dim(p) is not None
-                    and not _gtp_remat_sharded(p)
-                ):
-                    raise ValueError(
-                        f"LayerShardedMuon: param of shape {tuple(p.shape)} is TP-sharded "
-                        f"(partition_dim={getattr(p, 'partition_dim', None)}) but not GTP-sharded "
-                        f"(is_gtp_weight_remat absent/False) while "
-                        f"gtp_remat_size={gtp_remat_size} > 1. "
-                        "The GTP_remat exchange would concatenate replicated copies as shards and "
-                        "silently corrupt the update. Tag the param with is_gtp_weight_remat "
-                        "or run it in a domain without a GTP axis."
-                    )
-                sharded = _gtp_remat_sharded(p) or _partition_dim(p) is not None
-                target = routed if sharded else replicated
-                target.append(i)
-
-            if replicated:
-                # Batched like the routed path: these are few but identically shaped
-                # per layer (one router and two latent projections each), and the
-                # redundant NS is launch-bound, not compute-bound -- measured at 336
-                # kernels but only 0.74 ms of GPU time per step on a 12-layer MoE.
+            # 2. Replicated params (whole on every rank of the domain, which is every param
+            #    of a single-rank domain): local Newton-Schulz on each rank's own copy,
+            #    batched by shape. Correct and cheaper than electing a home and
+            #    broadcasting the result back.
+            if plan.replicated:
                 with _phase("ns_replicated"), fp32_matmul_precision(self.fp32_matmul_prec):
-                    for i, upd in self._run_ns({i: moms[i] for i in replicated}).items():
+                    for i, upd in self._run_ns({i: moms[i] for i in plan.replicated}).items():
                         self._apply_update(params[i], upd, lr)
-                if not routed:
-                    continue
-                params = [params[i] for i in routed]
-                moms = [moms[i] for i in routed]
-
-            n_missing = sum(1 for p in params if id(p) not in self._param_ns_homes)
-            if n_missing and not getattr(self, '_warned_missing_homes', False):
-                # Any home is mathematically valid (assignment only affects load
-                # balance), but a miss usually means homes were wired against stale
-                # param objects (e.g. before an fp32 main-param swap) — surface it.
-                self._warned_missing_homes = True
-                log_single_rank(
-                    logger,
-                    logging.WARNING,
-                    f"LayerShardedMuon: {n_missing}/{len(params)} params missing from "
-                    "param_ns_homes; falling back to round-robin (g=i%G, t=0). Load "
-                    "balancing (LPT) is NOT in effect for these params.",
-                )
-            homes = [
-                self._param_ns_homes.get(id(p), (routed[i] % gtp_remat_size, 0))
-                for i, p in enumerate(params)
-            ]
-            g_home = {i: homes[i][0] for i in range(len(params))}
-
-            # GTP alignment padding: ``p.pad_length`` trailing zero rows on the
-            # gtp-gathered, TP-LOCAL dim 0 — the same attribute the parent strips
-            # in its duplicated path. Stripped before Newton-Schulz so the scale
-            # factor sees the true dims (and parity with duplicated mode holds),
-            # restored before the reverse gtp_remat exchange, whose split sizes derive
-            # from the padded momentum shards.
-            pads = [getattr(p, 'pad_length', 0) for p in params]
-
-            # Per-group routing-plan cache: the a2a metadata is static across
-            # steps for a fixed set of routed params (shapes/homes/pdims never
-            # change between calls to set_param_ns_homes). Key on the routed
-            # param identities so a direct-API caller dropping a grad on some
-            # step rebuilds instead of reusing a stale plan.
-            plan_key = tuple(id(p) for p in params)
-            plans = self._exchange_plans.get(group_index)
-            if plans is None or plans['key'] != plan_key:
-                plans = {'key': plan_key}
-                self._exchange_plans[group_index] = plans
+            if not plan.routed:
+                continue
+            r_params = [params[i] for i in plan.routed]
+            r_moms = [moms[i] for i in plan.routed]
+            homed = plan.homed
+            route_plans = plan.route_plans
 
             with fp32_matmul_precision(self.fp32_matmul_prec):
                 with _phase("a2a_fwd"):
-                    # 2. Stage-1 all_to_all over GTP_remat (dim 0).
-                    stage1, my_g = route_to_ns_home(
-                        moms, g_home, gtp_remat_group, 0, plan=plans.setdefault('s1f', {})
+                    # 3. Stage-1 all_to_all over gtp_remat (dim 0): each param's gtp_remat
+                    #    extent is assembled on its g_home column. The router homes the
+                    #    same params on this rank as ``plan.homed`` (both use
+                    #    params_by_home).
+                    stage1, _ = route_to_ns_home(
+                        r_moms,
+                        plan.g_home,
+                        gtp_remat_group,
+                        0,
+                        plan=route_plans.setdefault('s1f', {}),
                     )
-                    # Strip the GTP alignment padding at the stage-1 seam: the
-                    # stage-1 output is the gtp-gathered TP-LOCAL tensor, where
-                    # the pad is a contiguous dim-0 tail for every partition_dim
-                    # (after TP assembly it would be embedded per TP block) —
-                    # the same strip point the parent's duplicated path uses.
-                    stage1 = [self._strip_pad(t, pads[my_g[k]]) for k, t in enumerate(stage1)]
+                    # Strip the GTP alignment padding at the stage-1 seam: the stage-1
+                    # output is the gtp-gathered TP-LOCAL tensor, where the pad is a
+                    # contiguous dim-0 tail for every partition dim (after TP assembly it
+                    # would be embedded per TP block), the same strip point the parent's
+                    # duplicated path uses.
+                    stage1 = [
+                        self._strip_pad(t, plan.pad_lengths[homed[k]]) for k, t in enumerate(stage1)
+                    ]
 
-                    # Split this column's params by TP partition dim. Keys 0/1 go
-                    # through stage 2; None params are already complete on every TP peer.
-                    sub_pos: dict = {0: [], 1: [], None: []}
-                    for k, i in enumerate(my_g):
-                        sub_pos[_partition_dim(params[i])].append(k)
-
-                    # 3. Stage-2 all_to_all over TP per partition dim.
+                    # 4. Stage-2 all_to_all over TP, one exchange per partition dim.
+                    #    GTP_REMAT-only params skip it: every TP peer of the column already
+                    #    holds their full matrix.
                     full_by_k: dict[int, torch.Tensor] = {}
-                    stage2_ctx: dict[int, tuple] = {}
-                    for pd in (0, 1):
-                        pos = sub_pos[pd]
-                        if not pos:
-                            continue
-                        templates = [stage1[k] for k in pos]
-                        t_home = {n: homes[my_g[pos[n]]][1] for n in range(len(pos))}
+                    tp_selected: dict[int, tuple[list[torch.Tensor], list[int]]] = {}
+                    for pd, (positions, t_home) in plan.tp_exchanges.items():
+                        templates = [stage1[k] for k in positions]
                         fulls, my_sel = route_to_ns_home(
-                            templates, t_home, tp_group, pd, plan=plans.setdefault(('s2f', pd), {})
+                            templates,
+                            t_home,
+                            tp_group,
+                            pd,
+                            plan=route_plans.setdefault(('s2f', pd), {}),
                         )
-                        stage2_ctx[pd] = (pos, templates, t_home, my_sel)
+                        tp_selected[pd] = (templates, my_sel)
                         for n_sel, full in zip(my_sel, fulls):
-                            full_by_k[pos[n_sel]] = full
-                    for k in sub_pos[None]:
+                            full_by_k[positions[n_sel]] = full
+                    for k in plan.tp_complete:
                         full_by_k[k] = stage1[k]
 
-                # 4. Full-matrix Newton-Schulz on the home (identical to duplicated
-                #    mode), batched by shape — see _run_ns. The pdim-None
-                #    (TP-replicated) subset runs through its OWN _run_ns call:
-                #    every TP column orthogonalizes those matrices independently
-                #    and scatters its own result over gtp_remat alone, so their
-                #    batch chunking must not depend on the column's TP-sharded
-                #    params (a different set per column) — pooled chunking would
-                #    put the same replicated matrix in a baddbmm chunk on one
-                #    column and addmm on another, and the TP replicas of its
+                # 5. Full-matrix Newton-Schulz on the home (identical to duplicated mode),
+                #    batched by shape; see _run_ns. The TP-complete (GTP_REMAT-only)
+                #    subset runs through its OWN _run_ns call: every TP column
+                #    orthogonalizes those matrices independently and scatters its own
+                #    result over gtp_remat alone, so their batch chunking must not depend
+                #    on the column's TP-sharded params (a different set per column).
+                #    Pooled chunking would put the same replicated matrix in a baddbmm
+                #    chunk on one column and addmm on another, and the TP replicas of its
                 #    weight would drift apart and compound every step.
-                tp_replicated_keys = set(sub_pos[None])
+                tp_complete = set(plan.tp_complete)
                 with _phase("ns"):
                     ns_by_k = self._run_ns(
-                        {k: v for k, v in full_by_k.items() if k not in tp_replicated_keys}
+                        {k: v for k, v in full_by_k.items() if k not in tp_complete}
                     )
-                    ns_by_k.update(self._run_ns({k: full_by_k[k] for k in sub_pos[None]}))
+                    ns_by_k.update(self._run_ns({k: full_by_k[k] for k in plan.tp_complete}))
 
             with _phase("a2a_bwd"):
-                # 5. Reverse stage-2 all_to_all: scatter NS results back to TP parts.
-                col_updates: list = [None] * len(my_g)
-                for pd, (pos, templates, t_home, my_sel) in stage2_ctx.items():
-                    ns_sub = [ns_by_k[pos[n]] for n in my_sel]
+                # 6. Reverse stage-2 all_to_all: scatter NS results back to TP parts.
+                col_updates: list = [None] * len(homed)
+                for pd, (positions, t_home) in plan.tp_exchanges.items():
+                    templates, my_sel = tp_selected[pd]
+                    ns_sub = [ns_by_k[positions[n]] for n in my_sel]
                     parts = route_from_ns_home(
                         ns_sub,
                         my_sel,
@@ -699,34 +859,35 @@ class LayerShardedMuon(TensorParallelMuon):
                         t_home,
                         tp_group,
                         pd,
-                        plan=plans.setdefault(('s2b', pd), {}),
+                        plan=route_plans.setdefault(('s2b', pd), {}),
                     )
                     for n, part in enumerate(parts):
-                        col_updates[pos[n]] = part
-                for k in sub_pos[None]:
+                        col_updates[positions[n]] = part
+                for k in plan.tp_complete:
                     col_updates[k] = ns_by_k[k]
 
-                # Restore the padding (zero rows) before the reverse gtp_remat
-                # exchange: its split sizes derive from the padded momentum
-                # shards, and every rank's shard slice must line up again.
+                # Restore the padding (zero rows) before the reverse gtp_remat exchange:
+                # its split sizes derive from the padded momentum shards, and every
+                # rank's shard slice must line up again.
                 col_updates = [
-                    None if t is None else self._restore_pad(t, pads[my_g[k]])
+                    None if t is None else self._restore_pad(t, plan.pad_lengths[homed[k]])
                     for k, t in enumerate(col_updates)
                 ]
 
-                # 6. Reverse stage-1 all_to_all: scatter column updates back to GTP_remat shards.
+                # 7. Reverse stage-1 all_to_all: scatter column updates back to the
+                #    gtp_remat shards.
                 update_shards = route_from_ns_home(
                     col_updates,
-                    my_g,
-                    moms,
-                    g_home,
+                    homed,
+                    r_moms,
+                    plan.g_home,
                     gtp_remat_group,
                     0,
-                    plan=plans.setdefault('s1b', {}),
+                    plan=route_plans.setdefault('s1b', {}),
                 )
 
-            # 7. Weight update on the local shard.
+            # 8. Weight update on the local shard.
             with _phase("update"):
-                for p, shard in zip(params, update_shards):
+                for p, shard in zip(r_params, update_shards):
                     if shard is not None:
                         self._apply_update(p, shard, lr)
