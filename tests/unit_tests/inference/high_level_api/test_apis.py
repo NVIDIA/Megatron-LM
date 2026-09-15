@@ -1,10 +1,8 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Unit tests for the high-level inference APIs (``MegatronLLM`` /
-``MegatronAsyncLLM``). Tests run without torch/megatron init by stubbing
-the engine pipeline; the worker-rank tests bypass ``__init__`` entirely
-via ``cls.__new__``."""
+"""Unit tests for the high-level inference APIs."""
 
+import asyncio
 from unittest.mock import MagicMock
 
 import pytest
@@ -76,10 +74,16 @@ class TestConstructorValidation:
             MegatronLLM(model=model, tokenizer=tok, use_coordinator=False, **extra_kwargs)
 
     def test_megatron_llm_direct_mode_succeeds(self, mock_pipeline, fake_model_and_tokenizer):
-        model, tok = fake_model_and_tokenizer
-        llm = MegatronLLM(model=model, tokenizer=tok, use_coordinator=False)
+        model, tokenizer = fake_model_and_tokenizer
+        llm = MegatronLLM(model=model, tokenizer=tokenizer, use_coordinator=False)
         assert llm.is_primary_rank is True
         assert llm._use_coordinator is False
+
+        request = MagicMock()
+        request.finalize_text.return_value = request
+        llm._engine.generate.return_value = [request]
+        assert llm.generate("hello")[0] is request
+        request.finalize_text.assert_called_once_with(llm._controller.tokenizer)
 
     def test_async_llm_requires_use_coordinator(self, mock_pipeline, fake_model_and_tokenizer):
         """``MegatronAsyncLLM`` rejects direct mode at ``__init__`` -- the
@@ -136,6 +140,14 @@ class TestLifecycleGuards:
         llm = _make_worker_instance(MegatronAsyncLLM)
         with pytest.raises(RuntimeError, match="primary rank"):
             await llm.generate("hello")
+
+        llm._is_primary_rank = True
+        request, future = MagicMock(), asyncio.get_running_loop().create_future()
+        future.set_result(request)
+        llm._coord_runtime = MagicMock()
+        llm._coord_runtime.client.add_request.return_value = future
+        assert await llm._generate_impl(["hello"], MagicMock()) == [request]
+        request.finalize_text.assert_not_called()
 
     def test_bridge_and_serve_raise_in_direct_mode(self, mock_pipeline, fake_model_and_tokenizer):
         model, tok = fake_model_and_tokenizer
