@@ -499,8 +499,8 @@ def build_packed_allgather_cp_local_positions_from_host(
     ``cu_seqlens`` are already on the host -- ``prebuild_thd_cp_partition_routes``
     stores them on ``PackedSeqParams`` at batch-construction time, where the one
     blocking copy is cheap because the CUDA queue is still shallow -- the whole
-    table is a closed form over Python ints: zero kernels, zero synchronization,
-    one asynchronous host-to-device copy of the finished table.
+    table is a closed form over Python ints: no device kernels or device-to-host
+    size readbacks, followed by one host-to-device copy of the finished table.
     """
     if cp_size <= 1:
         # Mirror the device builder: at cp_size <= 1 the local layout is the identity,
