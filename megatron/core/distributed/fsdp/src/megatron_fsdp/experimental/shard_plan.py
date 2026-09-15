@@ -5,16 +5,16 @@ Pure shard-planning and owner-compute packing logic for MFSDP v2's all-`Flat` l
 
 The central data structure is `ParameterLayout`, which describes how a single ≥2D parameter is split
 across the DP group under MFSDP v2's all-`Flat` layout (trailing dims are flattened into the row
-size, as per Muon's orthogonalization theory). `ParameterLayout.from_group` builds `{param: layout}`
-for eligible parameters in an `FsdpParameterGroup`; `assign_owner_work` balances owner-compute work
-across owner ranks using a caller-supplied cost function.
-`OwnerGatherPlan.pack`/`OwnerScatterPlan.pack` build the flat P2P send/recv buffers,
-`OwnerGatherPlan.reconstruct_full` stitches gathered shards back into the full matrix on the owner,
-and `OwnerScatterPlan.unpack` extracts received result shards.
+size, as per Muon's orthogonalization theory). `ParameterLayout.from_group` builds `{tensor_index:
+layout}` for eligible parameters in an `FsdpParameterGroup`, keyed by each parameter's index within
+the group. `assign_owner_work` balances owner-compute work across owner ranks using a
+caller-supplied cost function. `OwnerGatherPlan.pack`/`OwnerScatterPlan.pack` build the flat P2P
+send/recv buffers, `OwnerGatherPlan.reconstruct_full` stitches gathered shards back into the full
+tensor on the owner, and `OwnerScatterPlan.unpack` extracts received result shards.
 """
 
 import dataclasses
-from collections.abc import Callable, Sequence
+from collections.abc import Callable
 from typing import Self
 
 import torch
@@ -26,7 +26,7 @@ from .parameter_group import FsdpParameterGroup
 
 @dataclasses.dataclass(frozen=True)
 class ParameterLayout:
-    """How a single 2D parameter's full matrix is split across the DP group.
+    """How a single ≥2D parameter is split across the DP group.
 
     MFSDP v2's all-`Flat` layout shards dim-0 rows contiguously in rank order, so rank `r` owns the
     contiguous global row range `[start, start + count)` where `start`/`count` come from the flat
@@ -57,10 +57,11 @@ class ParameterLayout:
     @classmethod
     def from_group(
         cls, group: FsdpParameterGroup, *, eligible_fn: Callable[[torch.Tensor], bool] | None = None
-    ) -> dict[torch.Tensor, Self]:
-        """Build `{param: layout}` for eligible parameters in an `FsdpParameterGroup`.
+    ) -> dict[int, Self]:
+        """Build `{tensor_index: layout}` for eligible parameters in an `FsdpParameterGroup`.
 
-        Parameters not selected by `eligible_fn` are absent from the returned dict.
+        Keys are the parameters' indices within `group.fsdp_parameters` (their tensor indices in the
+        DBuffer layout). Parameters not selected by `eligible_fn` are absent from the returned dict.
 
         Args:
             group: The FSDP parameter group whose DBuffer layout describes the parameter placements.
@@ -79,7 +80,7 @@ class ParameterLayout:
         dp_size = mesh.size()
         rank_flat_shard_size = layout.size // dp_size
 
-        result: dict[torch.Tensor, Self] = {}
+        result: dict[int, Self] = {}
         for tensor_index, fsdp_parameter in enumerate(group.fsdp_parameters):
             param = fsdp_parameter.sharded
             if not eligible_fn(param):
@@ -124,7 +125,7 @@ class ParameterLayout:
             param_layout = cls(
                 full_shape=torch.Size(full_shape), row_counts=tuple(row_counts), row_size=row_size
             )
-            result[param] = param_layout
+            result[tensor_index] = param_layout
         return result
 
     @property
@@ -158,50 +159,58 @@ class ParameterLayout:
 
 
 def assign_owner_work(
-    layouts: Sequence[ParameterLayout], cost_fn: Callable[[ParameterLayout], float]
+    layouts: dict[int, ParameterLayout], cost_fn: Callable[[ParameterLayout], float]
 ) -> dict[int, int]:
-    """Assign one owner rank to each boundary parameter, balanced by cost.
+    """Assign one owner rank to each parameter, keyed by tensor index.
 
-    Non-boundary parameters stay on their original rank and are skipped. Only ranks that own a
-    non-empty shard of a parameter are eligible owners. Boundary parameters are processed in
-    descending cost order, and each is greedily given to its eligible rank with the smallest running
-    cost total.
+    Non-boundary parameters are assigned to their original rank (the only rank holding their rows,
+    so no communication is needed) and their cost counts toward that rank's running total cost.
+    Boundary parameters are processed in descending cost order and each is greedily given to its
+    eligible rank with the smallest running cost total.
 
     Args:
-        layouts: Parameter layouts indexed by their position in the input sequence.
+        layouts: Parameter layouts keyed by each parameter's tensor index in its
+            `FsdpParameterGroup`.
         cost_fn: Callable that returns a positive cost estimate for a given parameter layout. The
             greedy balancer minimizes the maximum running cost total across ranks, so the cost
             should reflect the relative compute weight of owning each parameter (e.g., an
             orthogonalization cost estimate).
 
     Returns:
-        Mapping from boundary parameter index (in `layouts`) to owner rank. Non-boundary parameters
-        are absent, as they stay on their original rank.
+        Mapping from tensor index to owner rank.
     """
     assignments: dict[int, int] = {}
     if not layouts:
         return assignments
-    running: dict[int, float] = {r: 0.0 for r in range(layouts[0].dp_size)}
+    dp_size = next(iter(layouts.values())).dp_size
+    running: dict[int, float] = {r: 0.0 for r in range(dp_size)}
+    # Non-boundary parameters are assigned to their sole holder; account for their cost.
+    for tensor_index, layout in layouts.items():
+        if layout.is_boundary():
+            continue
+        (holder,) = layout.owner_candidates()
+        assignments[tensor_index] = holder
+        running[holder] += cost_fn(layout)
     # Sort boundary params by descending cost (longest processing time first).
     boundary_costs = sorted(
         (
-            (param_index, cost_fn(layout))
-            for param_index, layout in enumerate(layouts)
+            (tensor_index, cost_fn(layout))
+            for tensor_index, layout in layouts.items()
             if layout.is_boundary()
         ),
         key=lambda item: item[1],
         reverse=True,
     )
-    for param_index, cost in boundary_costs:
-        layout = layouts[param_index]
+    for tensor_index, cost in boundary_costs:
+        layout = layouts[tensor_index]
         candidates = layout.owner_candidates()
         if not candidates:
             raise RuntimeError(
-                f"No eligible owner for parameter {param_index} with shape {layout.full_shape}; "
+                f"No eligible owner for tensor {tensor_index} with shape {layout.full_shape}; "
                 "no rank owns a shard."
             )
         owner = min(candidates, key=lambda r: running[r])
-        assignments[param_index] = owner
+        assignments[tensor_index] = owner
         running[owner] += cost
     return assignments
 
@@ -211,7 +220,7 @@ class OwnerGatherPlan:
     """Metadata and send buffers for the owner-gather P2P step of a set of parameters.
 
     The owner keeps its own shard locally (no self-send), so it only receives from the other
-    shard-holding ranks and reconstructs each owned matrix by concatenating shards in rank order
+    shard-holding ranks and reconstructs each owned tensor by concatenating shards in rank order
     (own shard at the owner's rank rows).
 
     Example:
@@ -261,23 +270,24 @@ class OwnerGatherPlan:
     recv_sizes = {0: 20}  # 12 + 8 = 20 elements from rank 0
     own_shards = {0: param_0.local_shard, 1: param_1.local_shard}  # rank 1's own shards
     recv_offsets = {
-        (0, 0): (0, 12, 3),  # `param_0` from rank 0: offset 0, 12 elems, 3 rows
-        (1, 0): (12, 8, 2),  # `param_1` from rank 0: offset 12, 8 elems, 2 rows
+        (0, 0): 0,  # `param_0` (tensor index 0) from rank 0: offset 0
+        (1, 0): 12,  # `param_1` (tensor index 1) from rank 0: offset 12
     }
     ```
 
     Attributes:
         send_buffers: Per-destination-owner flat send buffer (this rank's shards for that owner's
-            params, in param order). Only owners with non-zero send size appear.
+            params, in tensor-index order). Only owners with non-zero send size appear.
         recv_sizes: Per-source-rank element count this rank (as an owner) receives. Only sources
             with non-zero total size appear.
-        own_shards: This rank's local shard per owned parameter (used directly in reconstruction,
-            not communicated).
-        recv_offsets: Per `(param_index, src_rank)`, the flat offset of this param's shard inside
-            the recv buffer received from `src_rank`.
+        own_shards: This rank's local shard per owned parameter, keyed by tensor index (used
+            directly in reconstruction, not communicated).
+        recv_offsets: Per `(tensor_index, src_rank)`, the flat offset of this param's shard inside
+            the recv buffer received from `src_rank`. Only contains tuples for which `src_rank`
+            holds rows.
     """
 
-    layouts: tuple[ParameterLayout, ...]
+    layouts: dict[int, ParameterLayout]
     this_rank: int
     send_buffers: dict[int, torch.Tensor]
     recv_sizes: dict[int, int]
@@ -287,28 +297,29 @@ class OwnerGatherPlan:
     @classmethod
     def pack(
         cls,
-        layouts: Sequence[ParameterLayout],
+        layouts: dict[int, ParameterLayout],
         owners: dict[int, int],
-        local_shards: Sequence[torch.Tensor],
+        local_shards: dict[int, torch.Tensor],
         mesh: DeviceMesh,
     ) -> Self:
         """Pack this rank's local shards into per-owner P2P send buffers.
 
         Args:
-            layouts: Parameter layouts in parameter order.
-            owners: Mapping from parameter index to owner rank.
-            local_shards: This rank's local shard per parameter.
+            layouts: Parameter layouts keyed by each parameter's tensor index in its
+                `FsdpParameterGroup`.
+            owners: Mapping from tensor index to owner rank, with an entry for every parameter in
+                `layouts` (as returned by `assign_owner_work`).
+            local_shards: This rank's local shard per parameter, only required for every parameter
+                it holds rows of.
             mesh: Device mesh of the DP group all parameters share. The DP group size and this
                 rank's index within the group are derived from the mesh.
         """
         dp_size = mesh.size()
         this_rank = mesh.get_local_rank()
-        device = local_shards[0].device
-        dtype = local_shards[0].dtype
         send_sizes: dict[int, int] = {}
         recv_sizes: dict[int, int] = {}
-        for param_index, layout in enumerate(layouts):
-            owner = owners[param_index]
+        for tensor_index, layout in layouts.items():
+            owner = owners[tensor_index]
             if owner != this_rank:
                 send_numel = layout.shard_numel(this_rank)
                 if send_numel > 0:
@@ -322,37 +333,46 @@ class OwnerGatherPlan:
                     recv_sizes[src] = recv_sizes.get(src, 0) + recv_numel
 
         send_buffers: dict[int, torch.Tensor] = {}
-        for owner, size in send_sizes.items():
-            send_buffers[owner] = torch.empty(size, dtype=dtype, device=device)
+        if send_sizes:
+            first_shard = next(iter(local_shards.values()))
+            for owner, size in send_sizes.items():
+                send_buffers[owner] = torch.empty(
+                    size, dtype=first_shard.dtype, device=first_shard.device
+                )
 
-        # Fill each owner's send buffer in param order.
+        # Fill each owner's send buffer in tensor-index order.
         cursors: dict[int, int] = {owner: 0 for owner in send_buffers}
         own_shards: dict[int, torch.Tensor] = {}
-        for param_index, (layout, shard) in enumerate(zip(layouts, local_shards)):
-            owner = owners[param_index]
+        for tensor_index in layouts:
+            owner = owners[tensor_index]
             if owner == this_rank:
-                own_shards[param_index] = shard
+                own_shards[tensor_index] = local_shards[tensor_index]
                 continue
-            numel = layout.shard_numel(this_rank)
+            numel = layouts[tensor_index].shard_numel(this_rank)
             if numel == 0:
                 continue
+            shard = local_shards[tensor_index]
             buf = send_buffers[owner]
             buf[cursors[owner] : cursors[owner] + numel].copy_(shard.flatten())
             cursors[owner] += numel
 
         # Per (owned param, src) recv offset within the recv buffer from src.
         recv_offsets: dict[tuple[int, int], int] = {}
-        owned_indices = [i for i in range(len(layouts)) if owners[i] == this_rank]
         for src in range(dp_size):
             if src == this_rank:
                 continue
             offset = 0
-            for param_index in owned_indices:
-                recv_offsets[(param_index, src)] = offset
-                offset += layouts[param_index].shard_numel(src)
+            for tensor_index, layout in layouts.items():
+                if owners[tensor_index] != this_rank:
+                    continue
+                numel = layout.shard_numel(src)
+                if numel == 0:
+                    continue
+                recv_offsets[(tensor_index, src)] = offset
+                offset += numel
 
         return cls(
-            layouts=tuple(layouts),
+            layouts=dict(layouts),
             this_rank=this_rank,
             send_buffers=send_buffers,
             recv_sizes=recv_sizes,
@@ -363,13 +383,15 @@ class OwnerGatherPlan:
     def reconstruct_full(
         self, param_index: int, recv_buffers: dict[int, torch.Tensor]
     ) -> torch.Tensor:
-        """Reconstruct the full 2D tensor for one owned parameter from its per-rank shards.
+        """Reconstruct the full tensor for one owned parameter from its per-rank shards.
 
         Concatenates shards in rank order: this rank's own local shard at its rank rows and each
-        source's received shard at that source's rank rows.
+        source's received shard at that source's rank rows. For a parameter only this rank holds
+        rows of, the own shard is returned directly.
 
         Args:
-            param_index: Index of the parameter within the sequence of layouts passed to `pack`.
+            param_index: Tensor index of the parameter (a key of the `layouts` dict passed to
+                `pack`).
             recv_buffers: Per-source-rank received buffer (only sources that sent).
         """
         layout = self.layouts[param_index]
@@ -401,14 +423,16 @@ class OwnerScatterPlan:
 
     Attributes:
         send_buffers: Per-destination-rank flat send buffer (this owner's result shards for the
-            params it owns, in param order). Only destinations with non-zero send size appear.
+            params it owns, in tensor-index order). Only destinations with non-zero send size
+            appear.
         recv_sizes: Per-owner-rank element count this rank (as a destination) receives. Only owners
             with non-zero total size appear.
-        recv_offsets: Per `(param_index, owner_rank)`, the flat offset of this param's result shard
-            inside the recv buffer received from `owner_rank`.
+        recv_offsets: Per `(tensor_index, owner_rank)`, the flat offset of this param's result shard
+            inside the recv buffer received from `owner_rank`. Only contains tuples for which this
+            rank holds rows.
     """
 
-    layouts: tuple[ParameterLayout, ...]
+    layouts: dict[int, ParameterLayout]
     this_rank: int
     send_buffers: dict[int, torch.Tensor]
     recv_sizes: dict[int, int]
@@ -417,64 +441,62 @@ class OwnerScatterPlan:
     @classmethod
     def pack(
         cls,
-        full_results: dict[int, torch.Tensor],
-        layouts: Sequence[ParameterLayout],
+        layouts: dict[int, ParameterLayout],
         owners: dict[int, int],
+        full_results: dict[int, torch.Tensor],
         mesh: DeviceMesh,
     ) -> Self:
         """Pack this owner rank's full results into per-destination P2P send buffers.
 
         Args:
-            full_results: Full result tensor per owned parameter index.
-            layouts: Parameter layouts in parameter order.
-            owners: Mapping from parameter index to owner rank.
+            layouts: Parameter layouts keyed by each parameter's/tensor's index in its
+                `FsdpParameterGroup`.
+            owners: Mapping from tensor index to owner rank, with an entry for every parameter in
+                `layouts` (as returned by `assign_owner_work`).
+            full_results: Full result tensor per parameter this rank owns.
             mesh: Device mesh of the DP group all parameters share. The DP group size and this
                 rank's index within the group are derived from the mesh.
         """
         dp_size = mesh.size()
         this_rank = mesh.get_local_rank()
-        dtype = device = None
-        if full_results:
-            first = next(iter(full_results.values()))
-            device = first.device
-            dtype = first.dtype
-        owned_indices = [i for i in range(len(layouts)) if owners[i] == this_rank]
         send_sizes: dict[int, int] = {}
         recv_sizes: dict[int, int] = {}
-        for param_index in owned_indices:
-            layout = layouts[param_index]
-            for dest in range(dp_size):
-                if dest == this_rank:
-                    continue
-                numel = layout.shard_numel(dest)
-                if numel > 0:
-                    send_sizes[dest] = send_sizes.get(dest, 0) + numel
-        for param_index, layout in enumerate(layouts):
-            owner = owners[param_index]
+        for tensor_index, layout in layouts.items():
+            owner = owners[tensor_index]
             if owner == this_rank:
+                for dest in range(dp_size):
+                    if dest == this_rank:
+                        continue
+                    numel = layout.shard_numel(dest)
+                    if numel > 0:
+                        send_sizes[dest] = send_sizes.get(dest, 0) + numel
                 continue
             numel = layout.shard_numel(this_rank)
             if numel > 0:
                 recv_sizes[owner] = recv_sizes.get(owner, 0) + numel
 
         send_buffers: dict[int, torch.Tensor] = {}
-        for dest, size in send_sizes.items():
-            # Make sure these were assigned to. We should never hit this.
-            assert dtype is not None and device is not None
-            send_buffers[dest] = torch.empty(size, dtype=dtype, device=device)
+        if send_sizes:
+            first_result = next(iter(full_results.values()))
+            for dest, size in send_sizes.items():
+                send_buffers[dest] = torch.empty(
+                    size, dtype=first_result.dtype, device=first_result.device
+                )
 
-        cursors: dict[int, int] = {receiver: 0 for receiver in send_buffers}
-        for dest in range(dp_size):
-            if dest == this_rank:
+        # Fill each destination's send buffer in tensor-index order.
+        cursors: dict[int, int] = {dest: 0 for dest in send_buffers}
+        for tensor_index, layout in layouts.items():
+            if owners[tensor_index] != this_rank:
                 continue
-            for param_index in owned_indices:
-                layout = layouts[param_index]
+            full = full_results[tensor_index]
+            for dest in range(dp_size):
+                if dest == this_rank:
+                    continue
                 row_count = layout.rank_row_count(dest)
+                if row_count == 0:
+                    continue
                 row_start = layout.rank_row_start(dest)
                 numel = row_count * layout.row_size
-                if numel == 0:
-                    continue
-                full = full_results[param_index]
                 buf = send_buffers[dest]
                 buf[cursors[dest] : cursors[dest] + numel].copy_(
                     full[row_start : row_start + row_count].flatten()
@@ -486,14 +508,17 @@ class OwnerScatterPlan:
             if owner == this_rank:
                 continue
             offset = 0
-            for param_index, layout in enumerate(layouts):
-                if owners[param_index] != owner:
+            for tensor_index, layout in layouts.items():
+                if owners[tensor_index] != owner:
                     continue
-                recv_offsets[(param_index, owner)] = offset
-                offset += layout.shard_numel(this_rank)
+                numel = layout.shard_numel(this_rank)
+                if numel == 0:
+                    continue
+                recv_offsets[(tensor_index, owner)] = offset
+                offset += numel
 
         return cls(
-            layouts=tuple(layouts),
+            layouts=dict(layouts),
             this_rank=this_rank,
             send_buffers=send_buffers,
             recv_sizes=recv_sizes,
@@ -507,16 +532,14 @@ class OwnerScatterPlan:
             recv_buffers: Per-owner-rank received buffer (only owners that sent).
 
         Returns:
-            Mapping from parameter index to the local result shard `(row_count, cols)`, for
-            parameters this rank does NOT own.
+            Mapping from tensor index to the local result shard `(row_count, cols)`, for parameters
+            this rank holds rows of but does NOT own.
         """
         results: dict[int, torch.Tensor] = {}
-        for (param_index, owner), offset in self.recv_offsets.items():
-            layout = self.layouts[param_index]
-            numel = layout.shard_numel(self.this_rank)
-            if numel == 0:
-                continue
+        for (tensor_index, owner), offset in self.recv_offsets.items():
+            layout = self.layouts[tensor_index]
             row_count = layout.rank_row_count(self.this_rank)
+            numel = layout.shard_numel(self.this_rank)
             buf = recv_buffers[owner]
-            results[param_index] = buf[offset : offset + numel].view(row_count, layout.row_size)
+            results[tensor_index] = buf[offset : offset + numel].view(row_count, layout.row_size)
         return results

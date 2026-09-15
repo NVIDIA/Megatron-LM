@@ -42,7 +42,12 @@ def _ns_cost(num_ns_steps: int) -> Callable[[ParameterLayout], int]:
     return cost_fn
 
 
-def _mock_group(shapes, offsets, size, dp_size, this_rank=0):
+def _mock_mesh(dp_size: int, this_rank: int):
+    """Mock a `DeviceMesh` providing just the DP size and this rank's index."""
+    return SimpleNamespace(size=lambda: dp_size, get_local_rank=lambda: this_rank)
+
+
+def _mock_group(shapes, offsets, size, dp_size):
     """Mock a `FsdpParameterGroup` with the given DBuffer layout.
 
     Creates `nn.Parameter`s for each shape so the default `eligible_fn` (`param.ndim >= 2`) can
@@ -56,7 +61,7 @@ def _mock_group(shapes, offsets, size, dp_size, this_rank=0):
     params = tuple(nn.Parameter(torch.zeros(s)) for s in shapes)
     fsdp_parameters = tuple(SimpleNamespace(sharded=p) for p in params)
     return SimpleNamespace(
-        mesh=SimpleNamespace(size=lambda: dp_size, get_local_rank=lambda: this_rank),
+        mesh=_mock_mesh(dp_size, 0),
         main_weight=SimpleNamespace(layout=layout),
         fsdp_parameters=fsdp_parameters,
         sharded_parameters=params,
@@ -71,7 +76,9 @@ def _mock_group(shapes, offsets, size, dp_size, this_rank=0):
 def test_from_group_even_split():
     """A matrix exactly divisible by dp_size splits evenly across ranks."""
     group = _mock_group([(8, 4)], [0], 32, dp_size=2)
-    (layout,) = ParameterLayout.from_group(group).values()
+    layouts = ParameterLayout.from_group(group)
+    assert list(layouts) == [0]
+    layout = layouts[0]
     assert layout.full_shape == torch.Size((8, 4))
     assert layout.row_size == 4
     assert layout.row_counts == (4, 4)
@@ -84,7 +91,7 @@ def test_from_group_boundary_param_split_across_ranks():
     # 6 rows, 3 cols; each rank's flat shard is 9 elements (= 3 rows). rank0 owns flat [0,9), rank1
     # owns [9,18). Tensor occupies [0,18) fully.
     group = _mock_group([(6, 3)], [0], 18, dp_size=2)
-    (layout,) = ParameterLayout.from_group(group).values()
+    layout = ParameterLayout.from_group(group)[0]
     assert layout.row_counts == (3, 3)
     assert layout.is_boundary()
 
@@ -94,7 +101,7 @@ def test_from_group_fully_local_param_on_one_rank():
     # 4 rows, 2 cols = 8 elements. rank0 shard = [0,12), rank1 = [12,24). Tensor at offset 0 with 8
     # elements fits entirely in rank0.
     group = _mock_group([(4, 2)], [0], 24, dp_size=2)
-    (layout,) = ParameterLayout.from_group(group).values()
+    layout = ParameterLayout.from_group(group)[0]
     assert layout.row_counts == (4, 0)
     assert not layout.is_boundary()
     assert layout.owner_candidates() == (0,)
@@ -104,22 +111,22 @@ def test_from_group_empty_rank_has_zero_rows():
     """A rank whose flat shard does not overlap the tensor owns zero rows."""
     # Tensor at offset 12 (entirely in rank1). rank0 gets (0,0).
     group = _mock_group([(4, 3)], [12], 24, dp_size=2)
-    (layout,) = ParameterLayout.from_group(group).values()
+    layout = ParameterLayout.from_group(group)[0]
     assert layout.row_counts == (0, 4)
     assert layout.is_boundary() is False
     assert layout.owner_candidates() == (1,)
 
 
-def test_from_group_filters_non_eligible():
-    """Params not selected by `eligible_fn` are absent from the result."""
-    # A 2D weight and a 1D bias in the same group.
-    group = _mock_group([(8, 4), (16,)], [0, 32], 48, dp_size=2)
+def test_from_group_keys_are_tensor_indices():
+    """Keys are the params' tensor indices; non-eligible params leave gaps."""
+    # 2D weight (tensor 0), 1D bias (tensor 1), 2D weight (tensor 2).
+    # Only the ≥2D params are eligible (default `eligible_fn`); the 1D bias is
+    # excluded.
+    group = _mock_group([(8, 4), (16,), (4, 4)], [0, 32, 48], 64, dp_size=2)
     layouts = ParameterLayout.from_group(group)
-    # Only the 2D weight is eligible (ndim >= 2); the 1D bias is excluded.
-    assert len(layouts) == 1
-    param, layout = next(iter(layouts.items()))
-    assert param.ndim == 2
-    assert layout.full_shape == torch.Size((8, 4))
+    assert list(layouts) == [0, 2]
+    assert layouts[0].full_shape == torch.Size((8, 4))
+    assert layouts[2].full_shape == torch.Size((4, 4))
 
 
 def test_from_group_per_rank_data_not_uniform():
@@ -140,7 +147,7 @@ def test_from_group_per_rank_data_not_uniform():
     #   rank 1: [8, 16)  -> 8 elements -> 2 rows
     #   rank 2: [16, 24) -> 4 elements -> 1 row (4 elements of padding)
     group = _mock_group([(5, 4)], [0], 24, dp_size=3)
-    (layout,) = ParameterLayout.from_group(group).values()
+    layout = ParameterLayout.from_group(group)[0]
     assert layout.row_counts == (2, 2, 1)
     assert layout.shard_numel(0) == 8
     assert layout.shard_numel(1) == 8
@@ -162,8 +169,15 @@ def test_assign_owner_work_balances_by_cost():
     layout0 = ParameterLayout(torch.Size((8, 8)), (4, 4, 4, 4), 8)  # cost 64*41
     layout1 = ParameterLayout(torch.Size((4, 4)), (2, 2, 2, 2), 4)  # cost 16*21
     # Greedy min running cost: first param -> rank0 (cost 2624), second -> rank1 (cost 336).
-    owners = assign_owner_work([layout0, layout1], _ns_cost(5))
+    owners = assign_owner_work({0: layout0, 1: layout1}, _ns_cost(5))
     assert owners == {0: 0, 1: 1}
+
+
+def test_assign_owner_work_keys_pass_through():
+    """Keys pass through unchanged. Arbitrary tensor indices, not positions."""
+    layout = ParameterLayout(torch.Size((8, 8)), (4, 4, 4, 4), 8)
+    owners = assign_owner_work({7: layout}, _ns_cost(5))
+    assert owners == {7: 0}
 
 
 def test_assign_owner_work_only_eligible_ranks_can_own():
@@ -171,8 +185,8 @@ def test_assign_owner_work_only_eligible_ranks_can_own():
     # Only ranks 0 and 2 have shards for both params.
     layout0 = ParameterLayout(torch.Size((8, 8)), (4, 0, 4, 0), 8)
     layout1 = ParameterLayout(torch.Size((8, 8)), (4, 0, 4, 0), 8)
-    owners = assign_owner_work([layout0, layout1], _ns_cost(5))
-    assert all(owners[i] in (0, 2) for i in owners)
+    owners = assign_owner_work({0: layout0, 1: layout1}, _ns_cost(5))
+    assert all(owner in (0, 2) for owner in owners.values())
     # Two equal-cost params split across the two eligible ranks.
     assert owners[0] != owners[1]
 
@@ -187,16 +201,25 @@ def test_assign_owner_work_lpt_sorts_by_descending_cost():
     layout_cheap = ParameterLayout(torch.Size((8, 1)), (1, 1, 1, 1), 1)
     # Expensive param listed SECOND in input order.
     layout_expensive = ParameterLayout(torch.Size((8, 8)), (2, 2, 2, 2), 8)
-    owners = assign_owner_work([layout_cheap, layout_expensive], _ns_cost(5))
-    # LPT: expensive (index 1) → rank0 first, then cheap (index 0) → rank1.
+    owners = assign_owner_work({0: layout_cheap, 1: layout_expensive}, _ns_cost(5))
+    # LPT: expensive (tensor 1) → rank0 first, then cheap (tensor 0) → rank1.
     assert owners == {0: 1, 1: 0}
 
 
-def test_assign_owner_work_skips_non_boundary():
-    """Non-boundary parameters stay on their original rank – no assignment needed."""
+def test_assign_owner_work_non_boundary_gets_sole_holder():
+    """Non-boundary params are assigned their sole holder, not skipped."""
+    # All 4 rows on rank 0; rank 1 holds nothing.
     layout = ParameterLayout(torch.Size((4, 2)), (4, 0), 2)
-    owners = assign_owner_work([layout], _ns_cost(3))
-    assert owners == {}
+    owners = assign_owner_work({3: layout}, _ns_cost(3))
+    assert owners == {3: 0}
+
+
+def test_assign_owner_work_non_boundary_cost_counts_toward_balance():
+    """Forced non-boundary work biases the greedy balancer away from that rank."""
+    non_boundary = ParameterLayout(torch.Size((2, 2)), (2, 0), 2)
+    boundary = ParameterLayout(torch.Size((8, 8)), (4, 4), 8)
+    owners = assign_owner_work({0: non_boundary, 1: boundary}, _ns_cost(5))
+    assert owners == {0: 0, 1: 1}
 
 
 # ---------------------------------------------------------------------------
@@ -220,75 +243,116 @@ def _simulate_p2p(
     return per_rank_recv
 
 
-def test_pack_and_reconstruct_round_trip():
-    """Gathered + reconstructed shards matches the concatenation of local shards."""
-    torch.manual_seed(0)
-    dp_size = 2
-    # Two params, both boundary, shapes (6,3) and (4,2). Owners: param0->rank0, param1->rank1.
-    group0 = _mock_group([(6, 3)], [0], 18, dp_size=dp_size)
-    group1 = _mock_group([(4, 2)], [0], 8, dp_size=dp_size)
-    layout0 = ParameterLayout.from_group(group0)[group0.sharded_parameters[0]]
-    layout1 = ParameterLayout.from_group(group1)[group1.sharded_parameters[0]]
-    layouts = [layout0, layout1]
-    owners = {0: 0, 1: 1}
+def _round_trip_group():
+    """A 3-param group (dp_size 3): two boundary params and one non-boundary.
 
-    # Build per-rank local shards as distinct values so reconstruction is checkable.
-    full_p0 = torch.arange(18, dtype=torch.float32).reshape(6, 3)
-    full_p1 = torch.arange(8, dtype=torch.float32).reshape(4, 2) + 100
-    per_rank_local = []
-    for r in range(dp_size):
-        rs0, rc0 = layout0.rank_row_start(r), layout0.rank_row_count(r)
-        rs1, rc1 = layout1.rank_row_start(r), layout1.rank_row_count(r)
-        per_rank_local.append([full_p0[rs0 : rs0 + rc0].clone(), full_p1[rs1 : rs1 + rc1].clone()])
+    `GlobalLayout` size 36 → each rank's flat shard is 12 elements:
+    rank 0 [0,12), rank 1 [12,24), rank 2 [24,36).
+      - tensor 0 (6,3) at offset 0: rows (4, 2, 0) – boundary.
+      - tensor 1 (4,2) at offset 18: rows (0, 3, 1) – boundary.
+      - tensor 2 (2,2) at offset 26: rows (0, 0, 2) – non-boundary, holder rank 2.
+    """
+    return _mock_group([(6, 3), (4, 2), (2, 2)], [0, 18, 26], 36, dp_size=3)
+
+
+def test_pack_and_reconstruct_round_trip():
+    """Gathered + reconstructed shards match the full tensors on every owner.
+
+    Includes a non-boundary param (tensor 2): its owner reconstructs from its own
+    shard alone, with no P2P traffic.
+    """
+    torch.manual_seed(0)
+    dp_size = 3
+    layouts = ParameterLayout.from_group(_round_trip_group())
+    owners = assign_owner_work(layouts, _ns_cost(5))
+    # Least processing time over the boundary params:
+    #   tensor 0 → rank 0, tensor 1 → rank 1, tensor 2 → rank 2.
+    assert owners == {0: 0, 1: 1, 2: 2}
+
+    fulls = {
+        0: torch.arange(18, dtype=torch.float32).reshape(6, 3),
+        1: torch.arange(8, dtype=torch.float32).reshape(4, 2) + 100,
+        2: torch.arange(4, dtype=torch.float32).reshape(2, 2) + 200,
+    }
 
     per_rank_send = []
     per_rank_gather = []
-    for r in range(dp_size):
-        mesh = SimpleNamespace(size=lambda: dp_size, get_local_rank=lambda: r)
-        gather = OwnerGatherPlan.pack(layouts, owners, per_rank_local[r], mesh)
+    for rank in range(dp_size):
+        local_shards = {}
+        for tensor_index, layout in layouts.items():
+            row_start = layout.rank_row_start(rank)
+            row_count = layout.rank_row_count(rank)
+            if row_count > 0:
+                local_shards[tensor_index] = fulls[tensor_index][
+                    row_start : row_start + row_count
+                ].clone()
+        gather = OwnerGatherPlan.pack(layouts, owners, local_shards, _mock_mesh(dp_size, rank))
         per_rank_send.append(gather.send_buffers)
         per_rank_gather.append(gather)
 
     recv = _simulate_p2p(per_rank_send, dp_size)
 
-    # Rank0 owns param0; reconstruct and compare to full_p0.
-    full0 = per_rank_gather[0].reconstruct_full(0, recv[0])
-    torch.testing.assert_close(full0, full_p0, atol=0, rtol=0)
-    # Rank1 owns param1; reconstruct and compare to full_p1.
-    full1 = per_rank_gather[1].reconstruct_full(1, recv[1])
-    torch.testing.assert_close(full1, full_p1, atol=0, rtol=0)
+    # Rank 0 owns tensor 0 and receives only rank 1's 2-row shard (6 elements).
+    assert per_rank_gather[0].recv_sizes == {1: 6}
+    # Rank 2 owns the non-boundary tensor 2 and receives nothing.
+    assert per_rank_gather[2].recv_sizes == {}
+    # Each owner reconstructs the full tensor from its own + received shards.
+    for tensor_index, owner in owners.items():
+        full = per_rank_gather[owner].reconstruct_full(tensor_index, recv[owner])
+        torch.testing.assert_close(full, fulls[tensor_index], atol=0, rtol=0)
 
 
 def test_pack_and_unpack_result_round_trip():
     """Scattered result shards match the owner's full result sliced per rank."""
     torch.manual_seed(1)
-    dp_size = 2
-    group0 = _mock_group([(6, 3)], [0], 18, dp_size=dp_size)
-    group1 = _mock_group([(4, 2)], [0], 8, dp_size=dp_size)
-    layout0 = ParameterLayout.from_group(group0)[group0.sharded_parameters[0]]
-    layout1 = ParameterLayout.from_group(group1)[group1.sharded_parameters[0]]
-    layouts = [layout0, layout1]
-    owners = {0: 0, 1: 1}
+    dp_size = 3
+    layouts = ParameterLayout.from_group(_round_trip_group())
+    owners = assign_owner_work(layouts, _ns_cost(5))
 
-    full_result0 = torch.arange(18, dtype=torch.float32).reshape(6, 3) + 1.0
-    full_result1 = torch.arange(8, dtype=torch.float32).reshape(4, 2) + 2.0
-    full_results_by_rank = {0: {0: full_result0}, 1: {1: full_result1}}
-
+    full_results = {
+        0: torch.arange(18, dtype=torch.float32).reshape(6, 3) + 1.0,
+        1: torch.arange(8, dtype=torch.float32).reshape(4, 2) + 2.0,
+        2: torch.arange(4, dtype=torch.float32).reshape(2, 2) + 3.0,
+    }
     per_rank_send = []
     per_rank_scatter = []
-    for r in range(dp_size):
-        mesh = SimpleNamespace(size=lambda: dp_size, get_local_rank=lambda: r)
-        scatter = OwnerScatterPlan.pack(full_results_by_rank[r], layouts, owners, mesh)
+    for rank in range(dp_size):
+        owned_results = {
+            tensor_index: result
+            for tensor_index, result in full_results.items()
+            if owners[tensor_index] == rank
+        }
+        scatter = OwnerScatterPlan.pack(layouts, owners, owned_results, _mock_mesh(dp_size, rank))
         per_rank_send.append(scatter.send_buffers)
         per_rank_scatter.append(scatter)
 
     recv = _simulate_p2p(per_rank_send, dp_size)
 
-    for r in range(dp_size):
-        received = per_rank_scatter[r].unpack(recv[r])
-        # Rank r receives the result shard for the param it does NOT own.
-        other = 1 - r
-        layout = layouts[other]
-        rs, rc = layout.rank_row_start(r), layout.rank_row_count(r)
-        expected = full_results_by_rank[owners[other]][other][rs : rs + rc]
-        torch.testing.assert_close(received[other], expected, atol=0, rtol=0)
+    for rank in range(dp_size):
+        received = per_rank_scatter[rank].unpack(recv[rank])
+        for tensor_index, shard in received.items():
+            # Only params this rank holds rows of but does NOT own are received.
+            assert owners[tensor_index] != rank
+            layout = layouts[tensor_index]
+            row_start = layout.rank_row_start(rank)
+            row_count = layout.rank_row_count(rank)
+            expected = full_results[tensor_index][row_start : row_start + row_count]
+            torch.testing.assert_close(shard, expected, atol=0, rtol=0)
+    # Rank 0 receives nothing: it only holds rows of tensor 0, which it owns.
+    assert per_rank_scatter[0].unpack(recv[0]) == {}
+
+
+def test_pack_with_no_eligible_params():
+    """An empty layout dict (no eligible params) packs to an empty plan."""
+    mesh = _mock_mesh(2, 0)
+    gather = OwnerGatherPlan.pack({}, {}, {}, mesh)
+    assert gather.send_buffers == {}
+    assert gather.recv_sizes == {}
+    assert gather.own_shards == {}
+    assert gather.recv_offsets == {}
+
+    scatter = OwnerScatterPlan.pack({}, {}, {}, mesh)
+    assert scatter.send_buffers == {}
+    assert scatter.recv_sizes == {}
+    assert scatter.recv_offsets == {}
+    assert scatter.unpack({}) == {}
