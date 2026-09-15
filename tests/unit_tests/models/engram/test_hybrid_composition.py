@@ -88,8 +88,11 @@ def test_multi_token_prediction_is_rejected(tmp_path):
         _apply(tmp_path, "M*M*/M-", layer_ids=(2,))
 
 
-def test_hyper_connections_are_rejected(tmp_path):
-    # HyperConnectionHybridLayer's fast path calls the layer's attention/MLP helpers directly and
-    # never reaches _forward_attention, so the memory would be built but never applied.
-    with pytest.raises(ValueError, match="hyper-connections on the hybrid path"):
-        _apply(tmp_path, "M*M*", layer_ids=(2,), enable_hyper_connections=True)
+def test_hyper_connections_are_accepted(tmp_path):
+    # HyperConnectionHybridLayer adds the memory to the n-stream tensor before its read gate and
+    # tells the wrapped TransformerLayer to skip its own injection, so composition is the same
+    # with hyper connections on. (The gradient-level proof that the memory actually runs under
+    # the wrapper is the --engram-verify-training functional run.)
+    spec = _apply(tmp_path, "M*M*", layer_ids=(2,), enable_hyper_connections=True)
+    assert spec.submodules.attention_layer.submodules.engram.module is Engram
+    assert not hasattr(spec.submodules.mamba_layer.submodules, "engram")

@@ -739,6 +739,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         input_ids: Optional[Tensor] = None,
         *,
         inference_params: Optional[Any] = None,
+        skip_engram: bool = False,
     ):
         """
         Perform a forward pass through the attention layer and the layernorms before and after
@@ -769,7 +770,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         """
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
-        hidden_states = self._maybe_apply_engram(hidden_states, input_ids, packed_seq_params)
+        if not skip_engram:
+            # skip_engram=True means an outer hyper-connection wrapper already added the memory
+            # residual to the n-stream tensor, before its read gate.
+            hidden_states = self._maybe_apply_engram(hidden_states, input_ids, packed_seq_params)
 
         # Optional Input Layer norm
         attn_norm_manager = self.off_interface(self.offload_attn_norm, hidden_states, "attn_norm")
@@ -915,7 +919,11 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 "wrapped TransformerLayer through this path automatically for hybrid "
                 "stacks."
             )
-        hidden_states, context = self._forward_attention(*args, **kwargs)
+        # The hybrid hyper-connection wrapper owns the n-gram memory injection (it must happen
+        # on the n-stream tensor, before the read gate), so do not repeat it here.
+        hidden_states, context = self._forward_attention(
+            *args, **kwargs, skip_engram=called_from_hybrid_mhc_wrapper
+        )
         output = self._forward_mlp(
             hidden_states,
             kwargs.get("inference_context", None),

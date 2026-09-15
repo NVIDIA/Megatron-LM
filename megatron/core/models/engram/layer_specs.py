@@ -90,15 +90,10 @@ def apply_engram_to_hybrid_stack_spec(
     if not isinstance(spec, ModuleSpec) or spec.submodules is None:
         raise TypeError(f"Unsupported hybrid stack spec for Engram: {type(spec).__name__}.")
 
-    if transformer_config.enable_hyper_connections:
-        # HybridStack wraps every layer in HyperConnectionHybridLayer, whose fast path calls
-        # TransformerLayer._forward_self_attention_output_with_bias directly and so never
-        # reaches _forward_attention, where the memory residual is applied. The module would be
-        # built, occupy its full table shard and optimizer state, and never run.
-        raise ValueError(
-            "Engram does not support hyper-connections on the hybrid path, because the "
-            "hyper-connection layer wrapper bypasses the transformer layer's residual path."
-        )
+    # Hyper connections are supported: HybridStack wraps every layer in
+    # HyperConnectionHybridLayer, whose inner paths bypass TransformerLayer._forward_attention,
+    # so the wrapper itself adds the memory residual to the n-stream tensor before its read gate
+    # and tells the wrapped layer to skip its own injection (skip_engram).
 
     if parse_hybrid_pattern(hybrid_layer_pattern).mtp_num_depths > 0:
         # The nested MTP stack is built from these same submodules, and HybridStack omits

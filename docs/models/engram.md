@@ -263,7 +263,9 @@ distributed-optimizer sharding over expert-DP.
 
 The current milestone supports GPT training with BF16 parameters (FP8/MXFP8 main-model recipes
 are permitted; Engram modules are plain torch modules outside the Transformer Engine autocast
-regions and stay in BF16), standard residuals or native mHC, EP, TP, PP, SP, MoE coexistence,
+regions and stay in BF16), standard residuals, native mHC on the GPT path or the hyper-connection
+layer wrapper on the hybrid path (the wrapper adds the memory to the residual streams before its
+read gate), EP, TP, PP, SP, MoE coexistence,
 multi-token prediction (MTP layers never build Engram), native all-to-all, torch distributed
 checkpoints, and packed THD rows (document boundaries from EOS, from `cu_seqlens`, or both).
 CP combined with packed rows, CUDA graphs, FSDP, inference serving,
