@@ -37,7 +37,7 @@ jobs:
           determine_gpu_runner ${runner_name}
       - name: Determine Image Name
         run: |
-          echo "IMAGE_NAME=ccr-2vdh3abv-pub.cnc.bj.baidubce.com/paddlepaddle/paddle:ubuntu24-cuda130-py312-dev" >> "$GITHUB_ENV"
+          echo "IMAGE_NAME=ccr-2vdh3abv-pub.cnc.bj.baidubce.com/paddlepaddle/paddle:ubuntu24-cuda129-py312-dev" >> "$GITHUB_ENV"
       - name: Run Container
         run: |
           container_name=${TASK}-$(date +%Y%m%d-%H%M%S)
@@ -114,7 +114,7 @@ jobs:
           cd /workspace
           for url in \
             $BOS/PaddleFleet/develop/latest/paddlefleet-0.0.0-py3-none-linux_x86_64.whl \
-            $BOS/PaddleFleet/develop/latest/cu130/paddle-release/paddlefleet_ops-0.0.0-cp312-cp312-linux_x86_64.whl \
+            $BOS/PaddleFleet/develop/latest/cu129/paddle-release/paddlefleet_ops-0.0.0-cp312-cp312-linux_x86_64.whl \
             $BOS/whl/ms_swift-0.0.0-py3-none-any.whl \
             $BOS/whl/mcore_bridge-0.0.0-py3-none-any.whl ; do
             echo "Downloading $url"
