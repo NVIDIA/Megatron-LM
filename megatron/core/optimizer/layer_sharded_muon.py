@@ -35,6 +35,7 @@ from megatron.core.optimizer.layer_sharded_a2a import (
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.utils import (
+    get_emerging_optimizers_version,
     get_pg_rank,
     get_pg_size,
     is_emerging_optimizers_min_version,
@@ -64,47 +65,61 @@ __all__ = ["LayerShardedMuon", "ParamShardSpec", "ParamSharding", "tp_partition_
 
 logger = logging.getLogger(__name__)
 
+# newton_schulz() accepts a batched (3-D) input from this release on (PR #170); 0.2.0 fails
+# inside torch.addmm ("mat1 must be a matrix") on the first step. The per-matrix path
+# (ns_batch_size=1) uses the 2-D API every release ships.
+_BATCHED_NS_MIN_EO_VERSION = "0.3.0"
+# newton_schulz() dispatches 3-D inputs to the batched SYRK step (batched_tsyrk_ex, PR #276)
+# from this release on; older releases raise TypeError on a 3-D input with use_syrk.
+_BATCHED_SYRK_MIN_EO_VERSION = "0.5.0a0"
+# SM architectures emerging-optimizers validated the SYRK kernel on (its Muon.__init__).
+_SYRK_VALIDATED_SMS = ((8, 0), (9, 0), (10, 0), (10, 3))
 
-def _resolve_use_syrk(use_syrk: bool) -> bool:
-    """Validate SYRK hardware availability, downgrading to False (with an error
-    log) if unmet.
 
-    This guard lives in emerging-optimizers' ``Muon.__init__`` — which this
-    class no longer inherits from — and NOT in ``TensorParallelMuon``, whose
-    constructor only version-gates ``use_syrk``. Without it, Triton < 3.4.0
-    asserts on the first optimizer step instead of downgrading at construction,
-    and unvalidated SM architectures silently run a kernel emerging-optimizers
-    does not vouch for. Resolved *before* the parent constructor so the parent's
-    closure captures the resolved value (fallback and layer-sharded paths agree)
-    and so unfit hardware downgrades before the parent's EO-version raise.
+def _validate_ns_config(use_syrk: bool, ns_batch_size: int) -> None:
+    """Reject a Newton-Schulz configuration the installed stack cannot run.
+
+    One place, one exception type (ValueError, like the parent's own gates) for every
+    "this install cannot do that" condition: batched Newton-Schulz needs an
+    emerging-optimizers that accepts 3-D input, and SYRK needs Triton >= 3.4.0, an SM
+    emerging-optimizers validated the kernel on, and for batched chunks the batched SYRK
+    kernel. The Triton / SM conditions mirror the guard in emerging-optimizers'
+    ``Muon.__init__`` (which this class does not inherit from) but raise instead of
+    downgrading: a run must not silently switch kernels, and with them numerics, with the
+    hardware or the installed version. The parent's emerging-optimizers version gate for
+    ``use_syrk`` itself still applies. Follow-up: generalize the SYRK conditions to every
+    Muon mode in TensorParallelMuon.
     """
-    if not use_syrk:
-        return False
-    if torch.cuda.is_available():
-        sm_version = torch.cuda.get_device_capability()
-    else:
-        sm_version = (0, 0)
-    if not triton_kernels.HAS_TRITON_340:  # type: ignore[attr-defined]
-        logger.error("Triton 3.4.0 or higher is required for use_syrk to be True.")
-        return False
-    if sm_version not in ((8, 0), (9, 0), (10, 0), (10, 3)):
-        logger.error(
-            f"Correctness of Triton kernel on SM {sm_version} cannot be guaranteed. "
-            "Setting use_syrk to False."
+    if ns_batch_size < 1:
+        raise ValueError(f"ns_batch_size must be at least 1, got {ns_batch_size}")
+    if ns_batch_size > 1 and not is_emerging_optimizers_min_version(_BATCHED_NS_MIN_EO_VERSION):
+        raise ValueError(
+            "ns_batch_size > 1 (batched Newton-Schulz) requires emerging-optimizers >= "
+            f"{_BATCHED_NS_MIN_EO_VERSION}, but {get_emerging_optimizers_version()} is "
+            "installed; upgrade it or set ns_batch_size=1 (--muon-ns-batch-size 1)."
         )
-        return False
-    return True
-
-
-def _has_batched_syrk() -> bool:
-    """Whether the installed emerging-optimizers has the batched (3-D) SYRK kernel.
-
-    ``batched_tsyrk_ex`` landed on emerging-optimizers main with PR #276 (>= 0.5.0a0);
-    on such installs ``newton_schulz`` dispatches 3-D inputs to the batched SYRK step,
-    so batched chunks no longer need to fall back to baddbmm. Detected by symbol
-    rather than version so pre-release mains qualify.
-    """
-    return hasattr(triton_kernels, 'batched_tsyrk_ex')
+    if not use_syrk:
+        return
+    if not torch.cuda.is_available():
+        raise ValueError("use_syrk needs a CUDA device: the SYRK kernel is a Triton GPU kernel.")
+    if not triton_kernels.HAS_TRITON_340:
+        raise ValueError(
+            "use_syrk requires Triton >= 3.4.0; upgrade Triton or drop use_syrk (--muon-use-syrk)."
+        )
+    sm_version = torch.cuda.get_device_capability()
+    if sm_version not in _SYRK_VALIDATED_SMS:
+        raise ValueError(
+            "use_syrk: emerging-optimizers validates the SYRK kernel only on SM "
+            f"{_SYRK_VALIDATED_SMS}, this device is SM {sm_version}; drop use_syrk "
+            "(--muon-use-syrk)."
+        )
+    if ns_batch_size > 1 and not is_emerging_optimizers_min_version(_BATCHED_SYRK_MIN_EO_VERSION):
+        raise ValueError(
+            "use_syrk with ns_batch_size > 1 requires emerging-optimizers >= "
+            f"{_BATCHED_SYRK_MIN_EO_VERSION} (batched SYRK kernel), but "
+            f"{get_emerging_optimizers_version()} is installed; upgrade it, set "
+            "ns_batch_size=1 (--muon-ns-batch-size 1), or drop use_syrk (--muon-use-syrk)."
+        )
 
 
 # Phase-level NVTX ranges. Kernel-name classification cannot separate the forward
@@ -317,13 +332,13 @@ class LayerShardedMuon(TensorParallelMuon):
         tp_group: TP process group, or None when TP is not used.
         use_syrk: Use the Triton SYRK kernel for the two symmetric-output NS GEMMs
             (``A = X Xᵀ`` and ``B = bA + cA²``), computing one triangle only —
-            roughly a third off total NS FLOPs for near-square matrices. Applies to
-            unbatched chunks always; batched (3-D) chunks additionally require an
-            emerging-optimizers with the batched SYRK kernel (>= 0.5.0a0, PR #276)
-            and otherwise fall back to baddbmm. Only takes effect with
-            ``fp32_matmul_prec="medium"`` and 8-aligned dims; auto-disabled when
-            Triton/SM requirements are unmet. Same math, different kernel — results
-            differ from the GEMM path by kernel-level rounding.
+            roughly a third off total NS FLOPs for near-square matrices. Needs
+            Triton >= 3.4.0 and a validated SM (8.0/9.0/10.0/10.3); with
+            ``ns_batch_size > 1`` also an emerging-optimizers with the batched SYRK
+            kernel (>= 0.5.0a0, PR #276). Unmet requirements raise at construction;
+            nothing downgrades silently. Only takes effect with
+            ``fp32_matmul_prec="medium"`` and 8-aligned dims. Same math, different
+            kernel — results differ from the GEMM path by kernel-level rounding.
         ns_batch_size: Maximum number of same-shape matrices fused into a single
             batched Newton-Schulz on a home. MoE homes own hundreds of identically
             shaped expert weights, where the per-matrix loop is kernel-launch bound;
@@ -414,25 +429,11 @@ class LayerShardedMuon(TensorParallelMuon):
                 "LayerShardedMuon does not implement split-QKV Newton-Schulz on the "
                 "layer-sharded path; pass split_qkv=False (--muon-no-split-qkv)."
             )
-        # Hardware validation first: the parent only version-gates use_syrk, and
-        # unfit hardware should downgrade rather than hit the EO-version raise.
-        use_syrk = _resolve_use_syrk(use_syrk)
-        if ns_batch_size > 1 and not is_emerging_optimizers_min_version("0.3.0"):
-            # Only the batched (3-D) Newton-Schulz path needs emerging-optimizers
-            # >= 0.3.0 (older releases fail inside torch.addmm with "mat1 must be a
-            # matrix, got 3-D tensor"). The per-matrix baseline (ns_batch_size=1,
-            # the default) uses the 2-D newton_schulz API that 0.2.0 already ships,
-            # so it must not raise on older installs.
-            raise ImportError(
-                'LayerShardedMuon with ns_batch_size > 1 requires emerging-optimizers '
-                '>= 0.3.0 (batched Newton-Schulz).'
-            )
-        # The parent validates num_ns_steps and hard-raises when use_syrk is set on
-        # an emerging-optimizers older than the newton_schulz_tp use_syrk forwarding
-        # (>= 0.4.0.dev0). That gate is inherited deliberately: after this refactor
-        # the fallback and degenerate paths DO go through newton_schulz_tp, so on
-        # older installs those paths genuinely cannot do SYRK and failing loudly
-        # beats a partial silent downgrade.
+        # Fail loudly on a Newton-Schulz configuration this stack cannot run (batched NS
+        # floor, Triton/SM, batched SYRK kernel) before the parent's emerging-optimizers
+        # version gate for use_syrk itself: no version upgrade fixes unfit hardware, so
+        # that message must not be masked.
+        _validate_ns_config(use_syrk, ns_batch_size)
         # Explicit class call, matching the convention used by
         # TensorParallelAdaptiveMuon (see the comment in TensorParallelMuon.__init__).
         TensorParallelMuon.__init__(
@@ -457,26 +458,13 @@ class LayerShardedMuon(TensorParallelMuon):
         )
         self.gtp_remat_group = gtp_remat_group
         self.tp_group = tp_group
-        self.ns_batch_size = max(1, ns_batch_size)
-        # TensorParallelMuon does not set these on self -- it only captures them in
-        # its scaled_orthogonalize_fn closure. _run_ns reads them off self, so assign
-        # them as plain attributes here (safe: the parent defines no properties).
+        self.ns_batch_size = ns_batch_size
+        # The parent stores num_ns_steps and use_syrk (validated by _validate_ns_config) but
+        # only captures these three in its scaled_orthogonalize_fn closure; _run_ns reads
+        # them off self.
         self.coefficient_type = coefficient_type
-        self.num_ns_steps = num_ns_steps
         self.scale_mode = scale_mode
         self.extra_scale_factor = extra_scale_factor
-        self.use_syrk = use_syrk
-        # Batched (3-D) chunks can use SYRK only when the installed emerging-optimizers
-        # ships the batched kernel; otherwise they fall back to baddbmm as before.
-        self._batched_syrk = self.use_syrk and _has_batched_syrk()
-        if self.use_syrk and self.ns_batch_size > 1 and not self._batched_syrk:
-            log_single_rank(
-                logger,
-                logging.WARNING,
-                'use_syrk is set but this emerging-optimizers has no batched SYRK '
-                'kernel (needs >= 0.5.0a0, PR #276): batched chunks fall back to '
-                'baddbmm; only unbatched chunks get SYRK.',
-            )
         self.concurrent_groups = concurrent_groups
         self._group_streams: "list | None" = None
         # id(param) -> (g_home, t_home). Set via set_param_ns_homes().
@@ -561,15 +549,14 @@ class LayerShardedMuon(TensorParallelMuon):
                 chunk = ks[start : start + self.ns_batch_size]
                 batched = len(chunk) > 1
                 x = torch.stack([full_by_k[k] for k in chunk]) if batched else full_by_k[chunk[0]]
-                # SYRK halves the two symmetric-output NS GEMMs. Unbatched (2-D)
-                # chunks — the big dense matrices — always qualify; batched (3-D)
-                # chunks additionally need the batched SYRK kernel (emerging-
-                # optimizers >= 0.5.0a0, PR #276), else they fall back to baddbmm.
+                # SYRK halves the two symmetric-output NS GEMMs; for batched (3-D)
+                # chunks newton_schulz dispatches to the batched SYRK kernel, whose
+                # availability _validate_ns_config checked at construction.
                 orth = newton_schulz(
                     x,
                     steps=self.num_ns_steps,
                     coefficient_type=self.coefficient_type,
-                    use_syrk=self._batched_syrk if batched else self.use_syrk,
+                    use_syrk=self.use_syrk,
                 )
                 scale = get_muon_scale_factor(orth.size(-2), orth.size(-1), mode=self.scale_mode)
                 # Two sequential multiplies, NOT a pre-combined scalar: matches

@@ -2853,8 +2853,9 @@ def _add_regularization_args(parser):
                        help='Use the Triton SYRK kernel for the symmetric-output '
                        'Newton-Schulz GEMMs in Muon (~1/3 off '
                        'NS FLOPs for near-square matrices). Requires '
-                       '--muon-fp32-matmul-prec medium; auto-disabled when Triton/SM '
-                       'requirements are unmet.')
+                       '--muon-fp32-matmul-prec medium. Under --muon-tp-mode '
+                       'layer_sharded, unmet Triton/SM/emerging-optimizers '
+                       'requirements are rejected at startup.')
     group.add_argument('--muon-no-concurrent-groups', action='store_false',
                        dest='muon_concurrent_groups',
                        help='Serialize param groups on one CUDA stream under '
