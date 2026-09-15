@@ -63,13 +63,10 @@ def test_checkpoint_publishes_main_grad_to_outer_ddp_hook(
 
     weight.register_post_accumulate_grad_hook(ddp_hook)
 
-    class Forward:
-        router = torch.nn.Identity()
+    def forward(x):
+        return experts(x)
 
-        def __call__(self, x):
-            return experts(x)
-
-    forward = Forward()
+    forward.router = torch.nn.Identity()
     forward.experts = experts
 
     def fused(x, grad):
@@ -249,11 +246,7 @@ def test_qwen_layer_assembly_keeps_parameter_paths(
             def run(x):
                 return experts(router(x)[0])
 
-            class Forward:
-                def __call__(self, x):
-                    return run(x)
-
-            self.forward_op = Forward()
+            self.forward_op = run
             self.forward_op.router, self.forward_op.experts = router, experts
             self.backward_op = object() if retain_backward else None
 

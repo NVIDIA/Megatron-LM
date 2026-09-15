@@ -61,9 +61,7 @@ def test_chunked_transport_owns_external_metadata_and_waits_before_finish(
     assert counts is None and metadata["local_tpe_list"] == state["recv_per_expert"]
     assert metadata["handle"] is state["handle"]
     assert dispatcher._handle is None
-    normal, counts, normal_probs = dispatcher.finish_deepep_dispatch(
-        state, materialize_local_tpe=False
-    )
+    normal, counts, normal_probs = dispatcher.finish_deepep_dispatch(state)
     torch.testing.assert_close(normal, output)
     torch.testing.assert_close(normal_probs, probs)
     assert counts is None and dispatcher._handle is state["handle"]
@@ -111,7 +109,7 @@ def test_shared_expert_backward_preserves_gradients_and_input_storage(ep, with_p
     output = x.square() if probs is None else x.square() * probs
     chunk = SimpleNamespace(dispatched=x, probs=probs, expert_out=output, expert_out_edge=None)
     dx, dp, storage = ep._backward_expert(
-        chunk, torch.ones_like(x), SimpleNamespace(allocate=nullcontext)
+        chunk, torch.ones_like(x), SimpleNamespace(check_active=lambda: None)
     )
     torch.testing.assert_close(dx, 2 * x if probs is None else 2 * x * probs)
     if probs is None:

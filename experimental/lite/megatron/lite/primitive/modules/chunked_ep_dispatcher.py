@@ -67,11 +67,7 @@ class ChunkedDispatcher(_BaseDispatcher):
         return rank_grouped, self._handle
 
     def submit_deepep_combine_prepared(
-        self,
-        rank_grouped: torch.Tensor,
-        handle,
-        *,
-        allocate_on_comm_stream: bool = False,
+        self, rank_grouped: torch.Tensor, handle, *, allocate_on_comm_stream: bool = False
     ):
         previous_event = _previous_event()
         combined = self.buffer.combine(
@@ -149,12 +145,7 @@ class ChunkedDispatcher(_BaseDispatcher):
         return combined
 
     def submit_deepep_dispatch(
-        self,
-        hidden_states,
-        topk_scores,
-        topk_indices,
-        *,
-        allocate_on_comm_stream: bool = False,
+        self, hidden_states, topk_scores, topk_indices, *, allocate_on_comm_stream: bool = False
     ):
         topk_indices = topk_indices.contiguous()
         topk_scores = topk_scores.float().contiguous()
@@ -206,12 +197,12 @@ class ChunkedDispatcher(_BaseDispatcher):
             "event": event,
         }
 
-    def finish_deepep_dispatch(self, state, *, materialize_local_tpe: bool = True):
+    def finish_deepep_dispatch(self, state):
         self._handle = state["handle"]
         self._deepep_event = state["event"]
         self.wait_dispatch_event()
         dispatched, local_tpe, permuted_probs, metadata = self._finish_deepep_dispatch_external(
-            state, materialize_local_tpe=materialize_local_tpe
+            state
         )
         self._local_tpe_list = metadata["local_tpe_list"]
         self._row_id_map = metadata["row_id_map"]
@@ -219,12 +210,7 @@ class ChunkedDispatcher(_BaseDispatcher):
         return dispatched, local_tpe, permuted_probs
 
     def _finish_deepep_dispatch_external(
-        self,
-        state,
-        *,
-        manual_backward: bool = False,
-        materialize_local_tpe: bool = True,
-        output_allocation=None,
+        self, state, *, manual_backward: bool = False, output_allocation=None
     ):
         recv_hidden, recv_indices, recv_probs, recv_per_expert = (
             state[name] for name in ("recv_hidden", "recv_indices", "recv_probs", "recv_per_expert")
@@ -232,11 +218,6 @@ class ChunkedDispatcher(_BaseDispatcher):
         if isinstance(recv_per_expert, torch.Tensor):
             recv_per_expert = [int(x) for x in recv_per_expert.detach().cpu().tolist()]
         local_tpe_list = [int(x) for x in recv_per_expert[: self.num_local_experts]]
-        local_tpe = (
-            torch.tensor(local_tpe_list, dtype=torch.int64, device=recv_hidden.device)
-            if materialize_local_tpe
-            else None
-        )
         rows = recv_hidden.size(0)
         recv_indices = recv_indices.to(torch.long)
         if recv_indices.dim() != 2:
@@ -305,15 +286,12 @@ class ChunkedDispatcher(_BaseDispatcher):
             "manual_prob_flat_indices": manual_prob_flat_indices,
             "local_tpe_list": local_tpe_list,
         }
-        return dispatched, local_tpe, permuted_probs, metadata
+        return dispatched, None, permuted_probs, metadata
 
     def finish_deepep_dispatch_for_backward(self, state, *, output_allocation=None):
         _event_current_stream_wait(state.get("event"))
         dispatched, local_tpe, permuted_probs, metadata = self._finish_deepep_dispatch_external(
-            state,
-            manual_backward=True,
-            materialize_local_tpe=False,
-            output_allocation=output_allocation,
+            state, manual_backward=True, output_allocation=output_allocation
         )
         metadata["handle"] = state["handle"]
         return dispatched, local_tpe, permuted_probs, metadata

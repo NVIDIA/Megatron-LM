@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 import math
-from contextlib import contextmanager, nullcontext
+from contextlib import nullcontext
 from dataclasses import dataclass, field, fields
 from typing import Any, Callable, Literal
 
@@ -77,14 +77,12 @@ class EPChunkShapeProfile:
         if self.max_input_rows < self.chunk_count:
             raise ValueError("EP chunk profile requires at least one row per chunk")
         max_chunk_rows = (self.max_input_rows + self.chunk_count - 1) // self.chunk_count
-        # DeepEP recv storage may contain every source rank's chunk on one
-        # destination rank. It stores one hidden row per transported token and
-        # represents its local top-k destinations in recv_probs.
+        # All source chunks may land on one rank: one hidden row per transported
+        # token, with local top-k destinations represented in recv_probs.
         max_recv_rows = max_chunk_rows * self.ep_size
         object.__setattr__(self, "max_recv_rows", max_recv_rows)
-        # Manual expert permutation can expand one received token into as many
-        # as top-k local expert rows. This is a validation ceiling only: the
-        # workspace still reserves the observed runtime shape lazily.
+        # Permutation expands up to top-k rows/token. This is a validation ceiling;
+        # workspace allocation remains lazy and uses observed runtime shapes.
         object.__setattr__(self, "max_expert_rows", max_recv_rows * self.topk)
 
     def validate_rows(self, rows: int, kind: Literal["input", "recv", "expert"]) -> None:
@@ -176,23 +174,19 @@ _EXPERT_ACTIVATION_LOGICAL_NAMES = frozenset(
     {"fc1_input", "fc1_output", "fc2_output", "fc1_dgrad", "fc2_dgrad"}
 )
 
-# Normal saved-context backward keeps FC2 output separate because its delayed
-# FC2 Wgrad remains deferred. FC2 dgrad is consumed by SwiGLU before FC1 dgrad
-# is written, making that pair the only safe normal-mode raw-byte alias.
+# Normal mode retains FC2 output for delayed wgrad; only the dgrads can alias,
+# since SwiGLU consumes FC2 dgrad before FC1 dgrad is written.
 _NORMAL_EXPERT_ACTIVATION_STORAGE_SLOTS = {"fc1_dgrad": "fc2_dgrad"}
 
-# Forward runs under no-grad. Experts finishes the FC1/SwiGLU allocation scope
-# before FC2 starts, and FC2 reads only h, so its output may overwrite the
-# now-dead FC1 input. Requires-grad paths deliberately do not use this mapping.
+# No-grad FC2 reads only h after FC1/SwiGLU, so its output can overwrite FC1 input.
+# Requires-grad paths must not use this mapping.
 _FORWARD_EXPERT_ACTIVATION_STORAGE_SLOTS = {
     **_NORMAL_EXPERT_ACTIVATION_STORAGE_SLOTS,
     "fc2_output": "fc1_input",
 }
 
-# Fused backward enqueues overlapping FC2 Wgrad on the current stream before
-# writing FC2 dgrad, then writes FC1 dgrad after SwiGLU consumes it. Same-stream
-# ordering makes the overwrite safe without a CUDA synchronize and permits all
-# three logical tensors to use FC2-output raw storage in this OP only.
+# Fused: same-stream FC2 wgrad precedes FC2 dgrad, then SwiGLU precedes FC1 dgrad.
+# All three can alias FC2-output storage without CUDA synchronize, in this OP only.
 _FUSED_EXPERT_ACTIVATION_STORAGE_SLOTS = {"fc1_dgrad": "fc2_output", "fc2_dgrad": "fc2_output"}
 
 
@@ -239,18 +233,14 @@ class _EPChunkExpertActivationArenaCoordinator:
         """Freeze caller-declared capacities; physical backing remains lazy."""
         profile = self.key.shape_profile
         if not 0 < max_expert_rows <= profile.max_expert_rows:
-            raise ValueError(
-                "EP chunk max_expert_rows must be positive and within the profile ceiling"
-            )
+            raise ValueError("EP chunk max_expert_rows must be positive and within profile ceiling")
         if expert_intermediate_size <= 0:
             raise ValueError("EP chunk expert_intermediate_size must be positive")
         capacities = {
             "fc1_input": max_expert_rows * profile.hidden_size,
             "fc1_output": max_expert_rows * 2 * expert_intermediate_size,
             "fc2_output": max_expert_rows * profile.hidden_size,
-            # Normal backward aliases FC1 dgrad into FC2 dgrad storage.  The
-            # shared raw slot therefore must cover the wider of SwiGLU's
-            # intermediate gradient and FC1's hidden-size gradient.
+            # Normal-mode dgrads alias: reserve max(SwiGLU intermediate, FC1 hidden).
             "fc2_dgrad": max_expert_rows * max(profile.hidden_size, expert_intermediate_size),
         }
         itemsize = torch.empty((), dtype=self.key.dtype).element_size()
@@ -308,19 +298,15 @@ class _EPChunkExpertActivationArenaCoordinator:
         previous.update(current)
 
     def park(self, *, stream: Any | None) -> None:
-        """Park views after the consumer event without a device-wide sync.
-
-        Eager execution releases physical backing to PyTorch's default caching
-        allocator while retaining frozen capacity. CUDA graph capture/replay
-        owns backing until explicit close, matching graph-private lifetime.
+        """Wait by event, then return eager backing to the caching allocator.
+        Frozen capacity persists; graph-owned backing persists until close.
         """
         if self.claimed_op is not None:
             raise RuntimeError("Cannot park a leased EP chunk expert activation arena")
         self._wait_for_consumer(stream)
         if stream is not None and not self.graph_backing_owned:
-            # The reset stream waits for the final expert consumer. Recording it
-            # before dropping the last eager reference keeps default-allocator
-            # reuse ordered.
+            # Record the reset stream after its consumer wait, before dropping eager
+            # references, to order default-allocator reuse.
             for tensor in self.tensors.values():
                 if tensor.is_cuda:
                     tensor.record_stream(stream)
@@ -437,11 +423,9 @@ class _EPChunkExpertActivationLease:
         self.workspace = workspace
         self._active = True
 
-    @contextmanager
-    def allocate(self):
+    def check_active(self):
         if not self._active:
             raise RuntimeError("EP chunk expert activation lease has already been released")
-        yield
 
     def tensor(
         self,
@@ -451,14 +435,10 @@ class _EPChunkExpertActivationLease:
         dtype: torch.dtype,
         device: torch.device | str,
     ) -> torch.Tensor:
-        """Return this lease's stable activation storage.
-
-        The lease must remain live through every delayed TE consumer.  In
-        particular, FC1's saved input is reused only after the caller records
-        the wgrad completion event in ``release``.
+        """Return stable storage; keep the lease through all delayed TE consumers.
+        FC1 input reuse requires the wgrad completion event passed to release.
         """
-        if not self._active:
-            raise RuntimeError("EP chunk expert activation lease has already been released")
+        self.check_active()
         # Acquire already waited for the previous consumer; grow only to observed demand.
         op = self.workspace.key.op
         if op == "forward":
@@ -472,8 +452,7 @@ class _EPChunkExpertActivationLease:
         )
 
     def release(self, consumer_event: Any) -> None:
-        if not self._active:
-            raise RuntimeError("EP chunk expert activation lease has already been released")
+        self.check_active()
         if consumer_event is None:
             raise RuntimeError("EP chunk expert activation release requires a consumer event")
         self.workspace._activation_arena.release(op=self.workspace.key.op, event=consumer_event)
@@ -501,8 +480,7 @@ class EPChunkWorkspaceLease:
         dtype: torch.dtype,
         device: torch.device | str,
     ) -> torch.Tensor:
-        if not self._active:
-            raise RuntimeError("EP chunk workspace lease has already been released")
+        self.check_active()
         requested = tuple(int(dim) for dim in shape)
         self.workspace._validate_runtime_tensor(name, requested, dtype)
         tensor = self.workspace._reserve_tensor(
@@ -511,16 +489,12 @@ class EPChunkWorkspaceLease:
         slices = tuple(slice(0, dim) for dim in requested)
         return tensor[slices].view(requested).detach()
 
-    @contextmanager
-    def deepep_recv_allocation(self):
-        """Validate the active lease around a default-allocator DeepEP receive."""
+    def check_active(self):
         if not self._active:
             raise RuntimeError("EP chunk workspace lease has already been released")
-        yield
 
     def release(self, consumer_event: Any) -> None:
-        if not self._active:
-            raise RuntimeError("EP chunk workspace lease has already been released")
+        self.check_active()
         if consumer_event is None:
             raise RuntimeError("EP chunk workspace release requires a consumer event")
         slot = self.workspace._slots[self.slot]
@@ -583,7 +557,12 @@ class EPChunkWorkspace:
             if self._bound_device is None:
                 raise RuntimeError("Materialized EP chunk workspace has no bound device")
             return self._bound_device
-        return self._bind(device)
+        if self._registry is not None:
+            self._registry._claim(self)
+        profile_device = self._resolve_materialize_device(device)
+        self._bound_device = profile_device
+        self._materialized = True
+        return profile_device
 
     def reserve_expert_activations(
         self,
@@ -592,11 +571,8 @@ class EPChunkWorkspace:
         expert_intermediate_size: int | None = None,
         device: torch.device | str | None = None,
     ) -> None:
-        """Declare a bounded activation arena for capture or frozen measurement.
-
-        This is opt-in: absent a caller capacity the arena preserves lazy-growth
-        behavior. Frozen capacity survives eager ``reset_tensors``, but physical
-        backing survives only CUDA graph capture/replay; close drops both.
+        """Opt into frozen capacity instead of lazy growth, for capture/measurement.
+        Eager reset keeps capacity; only graphs keep backing. Close drops both.
         """
         self.prepare_scratch(device=device)
         intermediate = expert_intermediate_size
@@ -632,15 +608,6 @@ class EPChunkWorkspace:
         self._activation_arena.acquire(op=self.key.op, stream=stream)
         return _EPChunkExpertActivationLease(self)
 
-    def _bind(self, device: torch.device | str | None) -> torch.device:
-        """Claim registry identity and bind a runtime device without allocating."""
-        if self._registry is not None:
-            self._registry._claim(self)
-        profile_device = self._resolve_materialize_device(device)
-        self._bound_device = profile_device
-        self._materialized = True
-        return profile_device
-
     def close(self, *, stream: Any | None = None) -> None:
         """Release resident state without a device-wide synchronization."""
         if not self._materialized:
@@ -661,11 +628,8 @@ class EPChunkWorkspace:
         self._prepare_slots_for_reset(stream=stream, operation="reset tensors")
 
     def park_expert_activations(self, *, stream: Any | None = None) -> None:
-        """Park only the shared expert-activation coordinator.
-
-        This lifecycle boundary deliberately preserves workspace slots, their
-        DeepEP dispatchers, and slot scratch.  It is safe after a fused
-        backward has materialized its caller-visible outputs.
+        """Park the arena after fused backward materializes caller-visible outputs.
+        Preserve slots, DeepEP dispatchers and slot scratch.
         """
         if not self._materialized:
             return
@@ -830,7 +794,7 @@ class EPChunkWorkspaceRegistry:
             self._expert_activation_arenas[arena_key] = workspace._activation_arena
         elif current_arena is not workspace._activation_arena:
             raise RuntimeError(
-                "Cannot rematerialize an EP chunk workspace with a replaced activation arena"
+                "Cannot rematerialize EP chunk workspace with replaced activation arena"
             )
         self._workspaces[workspace.key] = workspace
 
@@ -852,7 +816,7 @@ class EPChunkWorkspaceRegistry:
             if _event_pending(event):
                 if stream is None or not hasattr(stream, "wait_event"):
                     raise RuntimeError(
-                        "Cannot release EP chunk expert activation arena with pending event"
+                        "Cannot release EP chunk activation arena with pending event"
                     )
                 stream.wait_event(event)
             if coordinator.claimed_op is not None:
@@ -1005,13 +969,7 @@ class _SavedForwardContext:
 class _EPChunkOperationBase:
     """Shared schedule mechanics; each public operation owns its own workspace."""
 
-    def __init__(
-        self,
-        *,
-        router: nn.Module,
-        experts: Experts,
-        workspace: EPChunkWorkspace,
-    ):
+    def __init__(self, *, router: nn.Module, experts: Experts, workspace: EPChunkWorkspace):
         self.router = router
         self.experts = experts
         self.workspace = workspace
@@ -1040,9 +998,7 @@ class _EPChunkOperationBase:
         def finish_dispatch(pending):
             chunk_idx, _, _, _, _, dispatcher, state, lease = pending
             with torch.cuda.stream(compute_stream):
-                dispatched, tpe, probs = dispatcher.finish_deepep_dispatch(
-                    state, materialize_local_tpe=False
-                )
+                dispatched, tpe, probs = dispatcher.finish_deepep_dispatch(state)
                 _validate_finished_deepep_dispatch(
                     self.workspace.key.shape_profile, state, dispatched
                 )
@@ -1207,10 +1163,10 @@ class _EPChunkOperationBase:
                     scores.record_stream(comm_stream)
                 if indices.is_cuda:
                     indices.record_stream(comm_stream)
-                with lease.deepep_recv_allocation():
-                    state = dispatcher.submit_deepep_dispatch(
-                        x_chunk, scores, indices, allocate_on_comm_stream=True
-                    )
+                lease.check_active()
+                state = dispatcher.submit_deepep_dispatch(
+                    x_chunk, scores, indices, allocate_on_comm_stream=True
+                )
             return chunk_idx, start, end, x_chunk, scores, dispatcher, state, lease
 
         def submit_combine(prepared):
@@ -1271,10 +1227,6 @@ class _EPChunkOperationBase:
         last_deepep_event: Any | None = None
         last_wgrad_done: torch.cuda.Event | None = None
 
-        def chain_deepep_event() -> None:
-            if last_deepep_event is not None:
-                _event_current_stream_wait(last_deepep_event)
-
         def remember_deepep_event(state: dict[str, Any]):
             nonlocal last_deepep_event
             last_deepep_event = state.get("event")
@@ -1291,22 +1243,19 @@ class _EPChunkOperationBase:
                 router_ready = compute_stream.record_event()
             with torch.cuda.stream(comm_stream):
                 comm_stream.wait_event(router_ready)
-                chain_deepep_event()
-                with lease.deepep_recv_allocation():
-                    state = remember_deepep_event(
-                        dispatcher.submit_deepep_dispatch(
-                            x_chunk,
-                            scores,
-                            indices,
-                            allocate_on_comm_stream=True,
-                        )
+                _event_current_stream_wait(last_deepep_event)
+                lease.check_active()
+                state = remember_deepep_event(
+                    dispatcher.submit_deepep_dispatch(
+                        x_chunk, scores, indices, allocate_on_comm_stream=True
                     )
+                )
             return chunk_idx, start, end, x_chunk, scores, dispatcher, state, lease
 
         def submit_combine_bwd(start: int, end: int, dispatcher: TokenDispatcher, handle: Any):
             with torch.cuda.stream(comm_stream):
                 grad_chunk = grad_2d[start:end].contiguous()
-                chain_deepep_event()
+                _event_current_stream_wait(last_deepep_event)
                 return remember_deepep_event(
                     dispatcher.submit_deepep_combine_backward(
                         grad_chunk, handle, allocate_on_comm_stream=True
@@ -1340,11 +1289,8 @@ class _EPChunkOperationBase:
             return metadata, expert_input, expert_probs, expert_out, expert_activation_lease
 
         def retire_pending_dispatch_bwd() -> None:
-            """Retire the previous chunk before the next large expert activation.
-
-            The next DeepEP receive may already be in flight, but a two-slot
-            workspace cannot keep a prior dispatch-backward lease and delayed
-            wgrad aliases alive through another FC1/SwiGLU activation.
+            """Retire prior dispatch-backward leases and delayed-wgrad aliases before
+            the next FC1/SwiGLU activation; the next DeepEP receive may be in flight.
             """
             if len(pending_dispatch_bwd) > 1:
                 raise RuntimeError("EP chunk fused backward retained more than one pending chunk")
@@ -1519,8 +1465,7 @@ class _EPChunkOperationBase:
                     workspace_lease=lease,
                 )
                 with torch.cuda.stream(comm_stream):
-                    if last_deepep_event is not None:
-                        _event_current_stream_wait(last_deepep_event)
+                    _event_current_stream_wait(last_deepep_event)
                     combine_state = remember_deepep_event(
                         chunk.dispatcher.submit_deepep_combine_backward(
                             grad_2d[chunk.start : chunk.end].contiguous(),
@@ -1662,7 +1607,7 @@ class _SavedContextEPChunkFunction(torch.autograd.Function):
 
 
 class EPChunkForwardOp(_EPChunkOperationBase):
-    """Two-chunk forward with saved-context autograd when gradients are enabled."""
+    """Chunked forward with saved-context autograd when gradients are enabled."""
 
     def __init__(self, *, backward_op: "EPChunkBackwardOp | None" = None, **kwargs):
         super().__init__(**kwargs)
@@ -1700,9 +1645,7 @@ class EPChunkFusedForwardBackwardOp(_EPChunkOperationBase):
     """Explicit recompute-forward plus backward owned by the fused workspace."""
 
     def forward_backward(
-        self,
-        x_saved: torch.Tensor,
-        grad_output: torch.Tensor,
+        self, x_saved: torch.Tensor, grad_output: torch.Tensor
     ) -> tuple[torch.Tensor, list[torch.Tensor], list[torch.Tensor | None]]:
         x_2d = x_saved.view(-1, x_saved.size(-1))
         grad_2d = grad_output.contiguous().view(-1, grad_output.size(-1))
@@ -1723,9 +1666,7 @@ def _manual_unpermute_backward(
         tuple(chunk.expert_out_shape) != expected_shape
         or grad_rank_grouped.dtype != chunk.expert_out_dtype
     ):
-        raise RuntimeError(
-            "EP chunk manual unpermute output metadata does not match the rank-grouped gradient"
-        )
+        raise RuntimeError("EP chunk unpermute metadata does not match rank-grouped gradient")
     if out is None:
         grad_expert_out = chunk.workspace_lease.tensor(
             "grad_expert_out",
@@ -1741,8 +1682,7 @@ def _manual_unpermute_backward(
             or not out.is_contiguous()
         ):
             raise RuntimeError(
-                "EP chunk manual unpermute output storage must be contiguous "
-                "with matching shape, dtype, and device"
+                "EP chunk unpermute storage must be contiguous, match shape/dtype/device"
             )
         grad_expert_out = out
     with torch.no_grad():
@@ -1770,8 +1710,7 @@ def _dispatch_local_backward(
         or hidden_reuse_base.numel() < required_hidden_numel
     ):
         raise RuntimeError(
-            "EP chunk hidden reuse storage must be contiguous with matching "
-            "dtype/device and sufficient capacity"
+            "EP chunk hidden reuse needs contiguous storage, matching dtype/device/capacity"
         )
     grad_recv_hidden = (
         hidden_reuse_base.detach().view(-1)[:required_hidden_numel].view(chunk.recv_hidden_shape)
@@ -1808,9 +1747,9 @@ def _backward_expert(chunk, grad_output, lease):
     dispatched, probs = chunk.dispatched, chunk.probs
     if dispatched is None or output is None:
         raise RuntimeError("EP chunk expert graph was released")
-    with lease.allocate():
-        inputs = (dispatched,) if probs is None else (dispatched, probs)
-        grads = torch.autograd.grad(output, inputs, grad_output, allow_unused=True)
+    lease.check_active()
+    inputs = (dispatched,) if probs is None else (dispatched, probs)
+    grads = torch.autograd.grad(output, inputs, grad_output, allow_unused=True)
     grad_dispatched = grads[0] if grads[0] is not None else torch.zeros_like(dispatched)
     grad_probs = None
     if probs is not None:
@@ -1888,11 +1827,8 @@ def _materialize(
 
 
 class EPChunkExecution:
-    """Model-independent OP composition; parameters remain owned by the caller.
-
-    retain_backward selects saved-context forward/backward; otherwise expose
-    graph-free forward and fused forward/backward. No recompute policy is read.
-    Workspace construction stays lazy and shared through the existing registry.
+    """Policy-free composition with caller-owned parameters and lazy shared workspaces.
+    retain_backward selects saved fwd+bwd; otherwise expose graph-free fwd+fused.
     """
 
     def __init__(
@@ -1990,10 +1926,8 @@ class ChunkedMoE(nn.Module):
 
 
 class _EPChunkCheckpoint(torch.autograd.Function):
-    """Checkpoint a tensor prefix followed by residual + ChunkedEP.
-
-    The prefix returns (MoE input, residual). Architecture and recompute policy
-    belong to the caller; this bridge never inspects a model or its config.
+    """Checkpoint prefix -> (MoE input, residual), then residual + ChunkedEP.
+    Architecture/recompute policy belongs to the caller; no model/config inspection.
     """
 
     @staticmethod

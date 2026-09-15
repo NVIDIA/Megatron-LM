@@ -90,8 +90,8 @@ def test_small_rank_forward_matches_ordinary_ep(
         def __init__(self):
             self.dispatcher = Dispatcher()
 
-        def deepep_recv_allocation(self):
-            return nullcontext()
+        def check_active(self):
+            pass
 
         def release(self, event):
             pass

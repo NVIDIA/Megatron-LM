@@ -57,14 +57,9 @@ def _record_immediate_wgrad_context(store: Any) -> None:
 def _caller_owned_dummy_wgrad(
     main_grad: torch.Tensor, weight: torch.Tensor, *, zero: bool
 ) -> torch.Tensor:
-    """Return the custom-DDP hook sentinel without retaining eager allocations.
-
-    MCore requires a non-None gradient to keep the parameter hook on the main
-    backward thread when ``grad_added_to_main_grad`` is set.  TE's provider is
-    process-global, which is correct for its native module but unnecessarily
-    retains caller-owned ChunkedEP sentinels across eager steps.  CUDA graph
-    capture is the narrow exception: TE's keyed cache supplies a replay-stable
-    address until a graph lifecycle owner is available here.
+    """Supply MCore's non-None main-thread hook sentinel for grad_added_to_main_grad.
+    Avoid TE's process-global cache retaining eager sentinels; only capture uses
+    its replay-stable addresses until a graph lifecycle owner is available here.
     """
     if main_grad.is_cuda and torch.cuda.is_current_stream_capturing():
         from transformer_engine.pytorch.module.base import get_dummy_wgrad
@@ -314,10 +309,7 @@ class ChunkedExperts(_BaseExperts):
             or sink.device != param.device
             or not sink.is_contiguous()
         ):
-            raise RuntimeError(
-                "Expert delayed weight-gradient sink must be a contiguous tensor "
-                "with matching shape and device"
-            )
+            raise RuntimeError("Expert wgrad sink must be contiguous with matching shape/device")
 
     def _prepare_delayed_weight_grad_sinks(self) -> None:
         """Prepare the sink selected by TE for each delayed expert wgrad."""
@@ -377,10 +369,7 @@ class ChunkedExperts(_BaseExperts):
                 or immediate_contexts < 0
                 or immediate_contexts > num_contexts
             ):
-                raise RuntimeError(
-                    "Expert delayed wgrad immediate/deferred context accounting "
-                    "does not match the requested flush"
-                )
+                raise RuntimeError("Expert immediate/deferred wgrad counts do not match flush")
             for _ in range(num_contexts - immediate_contexts):
                 if store.context is None or store.context.empty():
                     raise RuntimeError("Expert delayed weight-gradient queue is empty.")
@@ -399,9 +388,7 @@ class ChunkedExperts(_BaseExperts):
                     self._validate_weight_grad_sink(param, sink)
                     self._validate_weight_grad_sink(param, grad)
                     if grad.data_ptr() != sink.data_ptr():
-                        raise RuntimeError(
-                            "Expert delayed wgrad did not reuse its selected gradient sink"
-                        )
+                        raise RuntimeError("Expert delayed wgrad did not reuse its gradient sink")
             store._mlite_immediate_wgrad_contexts = 0
             if store.context is not None and not store.context.empty():
                 raise RuntimeError("Expert delayed weight-gradient queue was not drained.")
