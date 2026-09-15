@@ -178,9 +178,9 @@ class NemotronOmniInferenceWrapper(GPTInferenceWrapper):
         if image_positions.any():
             if image_embeddings is None:
                 raise ValueError("Image positions were provided without image embeddings.")
-            flat_image_embeddings = image_embeddings.reshape(
-                -1, image_embeddings.shape[-1]
-            ).to(dtype=combined_embeddings.dtype)
+            flat_image_embeddings = image_embeddings.reshape(-1, image_embeddings.shape[-1]).to(
+                dtype=combined_embeddings.dtype
+            )
             image_indices = image_token_mask[image_positions].to(dtype=torch.long)
             max_index = int(image_indices.max().item())
             if max_index >= flat_image_embeddings.shape[0]:

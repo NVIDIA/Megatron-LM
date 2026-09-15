@@ -142,9 +142,7 @@ class InferenceClient:
         tokens = prompt.tolist() if isinstance(prompt, torch.Tensor) else list(prompt)
         cache_salt = media_meta.get("media_cache_key") if isinstance(media_meta, dict) else None
         return compute_block_hashes_batched(
-            torch.tensor(tokens, dtype=torch.int64),
-            self.block_size_tokens,
-            cache_salt=cache_salt,
+            torch.tensor(tokens, dtype=torch.int64), self.block_size_tokens, cache_salt=cache_salt
         )
 
     def add_request(

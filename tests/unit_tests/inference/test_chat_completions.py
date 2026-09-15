@@ -128,6 +128,8 @@ async def test_n_choices_prepare_and_serialize_shared_media_once():
                     "status": "COMPLETED",
                     "generated_tokens": [request_id],
                     "prompt_length": len(prompt_tokens),
+                    "prompt_tokens": prompt_tokens,
+                    "compact_prompt_tokens": prompt_tokens,
                     "num_cached_tokens": 0,
                     "sampling_params": sampling_params.serialize(),
                     "routing_indices": None,

@@ -203,7 +203,8 @@ def test_prepared_multimodal_data_reuses_computed_content_key():
         first = serialize_multimodal_data(prepared)
         second = serialize_multimodal_data(prepared)
 
-    assert first is second
+    assert first == second
+    assert first is not second
     assert compute_key.call_count == 1
 
 
@@ -549,7 +550,7 @@ def test_dynamic_inference_request_serialize_strips_event_add_engine():
     ),
     [
         (False, None, None, None),  # default: prompt state dropped from payload
-        (True, ("tensor", [1, 2, 3, 4]), ("tensor", [1, 99, 4]), ("tensor", [1, 2, 3, 4])),
+        (True, [1, 2, 3, 4], [1, 99, 4], [1, 2, 3, 4]),
     ],
 )
 def test_dynamic_inference_request_serialize_return_prompt_tokens(
@@ -583,13 +584,14 @@ def test_dynamic_inference_request_serialize_return_prompt_tokens(
     )
 
     obj = req.serialize()
+    unwrapped_obj = unwrap_serialized_tensors(obj)
 
     # prompt_length is always populated (independent of the drop).
     assert obj["prompt_length"] == 4
-    # Payload either preserves the tensor wrapper or drops it (present but None).
-    assert obj["prompt_tokens"] == expected_prompt_field
-    assert obj["compact_prompt_tokens"] == expected_compact_prompt_field
-    assert obj["remaining_prompt_tokens"] == expected_remaining_prompt_field
+    # Payload either preserves the serialized tensor values or drops them.
+    assert unwrapped_obj["prompt_tokens"] == expected_prompt_field
+    assert unwrapped_obj["compact_prompt_tokens"] == expected_compact_prompt_field
+    assert unwrapped_obj["remaining_prompt_tokens"] == expected_remaining_prompt_field
     # Local instance is unaffected — the drop is wire-only.
     assert req.prompt_tokens is prompt
     assert req.compact_prompt_tokens is compact_prompt
