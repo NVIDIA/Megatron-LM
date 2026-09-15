@@ -81,7 +81,7 @@ def get_blend_from_list(
                 weight = None
             weight_per_dataset.append(weight)
 
-        is_none = map(lambda _: _ is None, weight_per_dataset)
+        is_none = [weight is None for weight in weight_per_dataset]
         if any(is_none):
             assert all(is_none)
             weight_per_dataset = None
