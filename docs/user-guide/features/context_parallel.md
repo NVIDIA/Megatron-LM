@@ -60,3 +60,8 @@ These are capability checks, not a prediction of each microbatch's group size.
 Numeric constraints such as head divisibility and hierarchical CP group sizes
 continue to use the configured parallel sizes. Ordinary static CP with
 `context_parallel_size=1` retains its existing validation behavior.
+
+Packed absorbed MLA uses the microbatch's actual CP group for RoPE indexing. Its
+frequency table must cover the full sequence even when each rank holds only a
+chunk and the configured CP size is one. QKV up-projection recomputation retains
+the forward microbatch's group after the caller restores or changes its group.

@@ -11,6 +11,7 @@ import pytest
 import torch
 
 import megatron.core.parallel_state as parallel_state
+from megatron.core.models.common.embeddings import RotaryEmbedding, apply_rotary_pos_emb
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
     _validate_dsa_index_share_pipeline_split,
     get_dsa_module_spec_for_backend,
@@ -320,6 +321,143 @@ class _FakeCPGroup:
 
     def rank(self) -> int:
         return self._rank
+
+
+@pytest.mark.parametrize(
+    ("configured_cp_size", "effective_cp_size", "cp_rank"),
+    [(1, 2, 0), (1, 2, 1), (2, 1, 0), (2, 2, 0), (2, 2, 1), (1, 1, 0)],
+)
+@pytest.mark.parametrize("sequence_lengths", [(8,), (8, 4)])
+@pytest.mark.parametrize("recompute_up_proj", [False, True])
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for packed MLA RoPE")
+def test_absorbed_mla_qkv_rope_uses_microbatch_cp_group(
+    monkeypatch, configured_cp_size, effective_cp_size, cp_rank, sequence_lengths, recompute_up_proj
+):
+    """Packed positions and deferred QKV replay must use the forward microbatch's CP group."""
+    Utils.initialize_distributed()
+    torch.manual_seed(1234)
+    effective_group = _FakeCPGroup(effective_cp_size, cp_rank)
+
+    # Explicit per-sequence zigzag positions, independent of the production layout helpers.
+    if effective_cp_size == 1:
+        positions = list(range(8)) + (list(range(4)) if len(sequence_lengths) == 2 else [])
+    else:
+        positions = [0, 1, 6, 7] if cp_rank == 0 else [2, 3, 4, 5]
+        if len(sequence_lengths) == 2:
+            positions += [0, 3] if cp_rank == 0 else [1, 2]
+    positions = torch.tensor(positions, device="cuda")
+    cu_seqlens = (
+        torch.tensor([0, *sequence_lengths], dtype=torch.int32, device="cuda").cumsum(0).int()
+    )
+    packed = PackedSeqParams(
+        qkv_format="thd",
+        cu_seqlens_q=cu_seqlens,
+        cu_seqlens_kv=cu_seqlens,
+        max_seqlen_q=8,
+        max_seqlen_kv=8,
+        local_cp_size=effective_cp_size,
+        cp_group=effective_group,
+    )
+
+    class TupleLinear(torch.nn.Linear):
+        def forward(self, x):
+            return super().forward(x), None
+
+    class DeferredCheckpoint:
+        """Retain the real QKV closure to test its lifetime without CUDA checkpoint machinery."""
+
+        def __init__(self, **_kwargs):
+            pass
+
+        def checkpoint(self, run_function, *args):
+            self.run_function, self.args = run_function, args
+            return run_function(*args)
+
+    monkeypatch.setattr(
+        "megatron.core.transformer.experimental_attention_variant.absorbed_mla."
+        "tensor_parallel.CheckpointWithoutOutput",
+        DeferredCheckpoint,
+    )
+
+    def make_config(cp_size, dynamic):
+        return MLATransformerConfig(
+            num_layers=1,
+            hidden_size=16,
+            num_attention_heads=2,
+            q_lora_rank=8,
+            kv_lora_rank=8,
+            qk_head_dim=4,
+            qk_pos_emb_head_dim=4,
+            v_head_dim=4,
+            rope_type="rope",
+            context_parallel_size=cp_size,
+            dynamic_context_parallel=dynamic,
+            cp_comm_type="all_gather",
+            apply_rope_fusion=False,
+            use_cpu_initialization=True,
+        )
+
+    k_up_weight = torch.randn(2, 4, 8, device="cuda")
+    rotary = RotaryEmbedding(
+        4, rotary_percent=1.0, use_cpu_initialization=True, cp_group=effective_group
+    )
+    # Only the surrounding projections are lightweight stand-ins. The QKV and RoPE
+    # implementations under test, including their packed metadata, are the real methods.
+    attention = SimpleNamespace(
+        config=make_config(configured_cp_size, configured_cp_size != effective_cp_size),
+        pg_collection=SimpleNamespace(cp=effective_group),
+        tp_group=_FakeCPGroup(1),
+        rotary_pos_emb=rotary,
+        linear_q_down_proj=TupleLinear(16, 8, bias=False).cuda(),
+        linear_kv_down_proj=TupleLinear(16, 12, bias=False).cuda(),
+        linear_q_up_proj=TupleLinear(8, 16, bias=False).cuda(),
+        q_layernorm=torch.nn.Identity(),
+        kv_layernorm=torch.nn.Identity(),
+        num_attention_heads_per_partition=2,
+        q_head_dim=8,
+        _get_kv_up_weights=lambda: (k_up_weight, None),
+        recompute_up_proj=recompute_up_proj,
+        cache_mla_latents=False,
+    )
+    reference = copy.copy(attention)
+    reference.config = make_config(effective_cp_size, False)
+    reference.pg_collection = SimpleNamespace(cp=effective_group)
+    reference.recompute_up_proj = False
+    full_freqs = rotary(8, packed_seq=True)
+    calls = []
+
+    def checked_apply(t, freqs, **kwargs):
+        assert kwargs["cp_group"] is effective_group
+        assert int(positions.max()) < freqs.size(0), "valid packed RoPE positions were truncated"
+        torch.testing.assert_close(freqs[positions], full_freqs[positions], rtol=0, atol=0)
+        calls.append(kwargs["cp_group"])
+        return apply_rotary_pos_emb(t, freqs, **kwargs)
+
+    monkeypatch.setattr(
+        "megatron.core.transformer.experimental_attention_variant.absorbed_mla."
+        "apply_rotary_pos_emb",
+        checked_apply,
+    )
+    hidden_states = torch.randn(len(positions), 1, 16, device="cuda")
+    expected = AbsorbedMLASelfAttention.get_query_key_value_tensors(
+        reference, hidden_states, packed_seq_params=packed
+    )
+    actual = AbsorbedMLASelfAttention.get_query_key_value_tensors(
+        attention, hidden_states, packed_seq_params=packed
+    )
+    for observed, baseline in zip(actual, expected):
+        torch.testing.assert_close(observed, baseline, rtol=0, atol=0)
+
+    if recompute_up_proj:
+        # Forward restores the caller's group, and a later microbatch can replace it.
+        restored_group = _FakeCPGroup(1 if effective_cp_size == 2 else 2)
+        attention.pg_collection.cp = restored_group
+        checkpoint = attention.qkv_up_checkpoint
+        replayed = checkpoint.run_function(*checkpoint.args)
+        for observed, baseline in zip(replayed, expected[:2]):
+            torch.testing.assert_close(observed, baseline, rtol=0, atol=0)
+        assert attention.pg_collection.cp is restored_group
+    assert len(calls) == (6 if recompute_up_proj else 4)
 
 
 @pytest.fixture(autouse=True)
