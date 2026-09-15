@@ -1,5 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import logging
 import os
 from types import SimpleNamespace
 
@@ -11,6 +12,7 @@ from megatron.core.transformer.enums import AttnBackend, AttnMaskType
 from megatron.core.transformer.experimental_attention_variant import dsa as dsa_module
 from megatron.core.transformer.experimental_attention_variant import (
     dsa_cudnn_kernels,
+    dsa_fused_safety,
     dsa_layout,
     dsa_masking,
 )
@@ -133,6 +135,35 @@ def test_cudnn_indexer_dispatch_declines_explicit_key_positions(monkeypatch):
             key_positions=torch.tensor([0, 2, 1, 3], dtype=torch.int64),
             return_scores=False,
         )
+
+
+@pytest.mark.parametrize("q_shape", [(3, 1, 1), (2, 3, 1, 1)])
+def test_cudnn_indexer_forward_warns_once_above_shared_row_limit(q_shape, monkeypatch, caplog):
+    """Both THD and BSHD DSv3.2 calls use the shared fused-row diagnostic."""
+
+    class FakeDSA:
+        calls = 0
+
+        @classmethod
+        def indexer_forward_wrapper(cls, index_q, index_k, weights, **kwargs):
+            cls.calls += 1
+            return {"scores": torch.zeros(1)}
+
+    monkeypatch.setattr(dsa_cudnn_kernels, "_cudnn_dsa", FakeDSA)
+    monkeypatch.setattr(dsa_fused_safety, "_ROW_LIMIT_WARNED", False)
+    monkeypatch.setattr(dsa_fused_safety, "FUSED_INDEXER_MAX_SAFE_ROWS", 2)
+    monkeypatch.setattr(dsa_cudnn_kernels, "FUSED_INDEXER_MAX_SAFE_ROWS", 2)
+
+    q = torch.zeros(q_shape)
+    k = torch.zeros(1)
+    w = torch.zeros(1)
+    with caplog.at_level(logging.WARNING, logger=dsa_cudnn_kernels.__name__):
+        for _ in range(2):
+            dsa_cudnn_kernels._indexer_forward_wrapper_with_warning(q, k, w, ratio=1)
+
+    assert FakeDSA.calls == 2
+    warnings = [record for record in caplog.records if "CORRECTNESS WARNING" in record.message]
+    assert len(warnings) == 1
 
 
 class _SingleRankTensorParallel:
