@@ -422,6 +422,19 @@ def _roll_tensor_packed_seq(
 
         seq_result = torch.cat(rolled_chunks, dim=dims)
 
+        if packed_seq_params.cu_seqlens_q_padded is not None:
+            # Physical chunks determine ownership; logical lengths determine valid continuations.
+            chunk_size = seq_result.size(-1) // 2
+            offsets = torch.arange(chunk_size, device=tensor.device)
+            positions = torch.cat(
+                (
+                    offsets + local_rank * chunk_size,
+                    offsets + (2 * cp_size - local_rank - 1) * chunk_size,
+                )
+            )
+            valid_length = cu_seqlens[i + 1] - cu_seqlens[i]
+            seq_result = seq_result.masked_fill(positions >= valid_length - 1, 0)
+
         # update the rolled tensor
         rolled_tensor[..., local_start_idx:local_end_idx] = seq_result
 
