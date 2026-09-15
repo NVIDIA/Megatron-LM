@@ -39,6 +39,8 @@ def test_save_checkpoint_writes_run_config(init_model_parallel, create_args, tmp
     args.ckpt_format = "torch_dist"
     args.use_distributed_optimizer = True
     args.use_dist_ckpt = True
+    args.ckpt_assume_constant_structure = False
+    args.ckpt_load_validate_sharding_integrity = True
 
     iteration = 123
     config = TransformerConfig(num_layers=1, kv_channels=1)
