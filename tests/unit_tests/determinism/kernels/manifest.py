@@ -398,9 +398,27 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "megatron/core/ssm/gated_delta_net/gdn.py",
             "megatron/core/ssm/gated_delta_net/gdn2.py",
         ),
-        tests=(K + "test_ssm_kernels.py", C + "test_hybrid_model.py"),
+        tests=(K + "test_ssm_kernels.py", K + "test_gdn_fusion.py", C + "test_hybrid_model.py"),
         kind="torch.compile",
         notes="deterministic_mode selects torch_chunk_gated_delta_rule over FLA (recorded non-deterministic).",
+    ),
+    KernelEntry(
+        name="gdn_elementwise_fusion",
+        sources=(
+            "megatron/core/ssm/gdn_fusion.py",
+            "megatron/core/ssm/gdn_fusion_kernels.py",
+            "megatron/core/ssm/gdn_gated_norm.py",
+        ),
+        tests=(K + "test_gdn_fusion.py",),
+        kind="triton",
+        notes="Fixed launch configurations and ordered parameter-gradient reductions; first-order replay.",
+    ),
+    KernelEntry(
+        name="gdn_fixed_launch_convolution",
+        sources=("megatron/core/ssm/gdn_common_optimizations.py",),
+        tests=(K + "test_gdn_fusion.py",),
+        kind="external-lib",
+        notes="FLA causal convolution with fixed backward tiles and ordered parameter-gradient reductions.",
     ),
     KernelEntry(
         name="ssm_triton_cache_manager",

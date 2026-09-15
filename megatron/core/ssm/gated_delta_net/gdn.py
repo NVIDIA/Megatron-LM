@@ -5,6 +5,7 @@
 # This source code is licensed under the Apache license found in the
 # LICENSE file in the root directory of this source tree.
 
+import os
 from functools import partial
 from typing import Optional
 
@@ -27,6 +28,13 @@ from megatron.core.ssm.gated_delta_net.common import (
     get_parameter_local_cp,
     l2norm,
 )
+from megatron.core.ssm.gdn_common_optimizations import enabled as gdn_common_enabled
+from megatron.core.ssm.gdn_common_optimizations import tuned_causal_conv1d
+from megatron.core.ssm.gdn_fusion import enabled as gdn_fusion_enabled
+from megatron.core.ssm.gdn_fusion import fused_prepare
+from megatron.core.ssm.gdn_gated_norm import enabled as gdn_output_fusion_enabled
+from megatron.core.ssm.gdn_gated_norm import fused_gated_norm
+from megatron.core.ssm.gdn_packed_sequence import resolve_packed_sequences
 from megatron.core.ssm.ssm_inference import SSMDynamicInferenceMixin
 from megatron.core.utils import deprecate_inference_params, nvtx_range_pop, nvtx_range_push
 
@@ -130,25 +138,38 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
                 not self.config.deterministic_mode
             ), "Packed sequence does not support deterministic mode."
 
-            # Resolve cu_seqlens with alignment padding handling.
-            cu_seqlens_q = self._resolve_cu_seqlens(
-                packed_seq_params.cu_seqlens_q_padded,
-                packed_seq_params.cu_seqlens_q,
-                seq_len,
-                "cu_seqlens_q",
-                cp_size=self.cp_size,
-            )
-            cu_seqlens_kv = self._resolve_cu_seqlens(
-                packed_seq_params.cu_seqlens_kv_padded,
-                packed_seq_params.cu_seqlens_kv,
-                seq_len,
-                "cu_seqlens_kv",
-                cp_size=self.cp_size,
-            )
-            assert torch.equal(cu_seqlens_q, cu_seqlens_kv), (
-                "Currently only support cu_seqlens_q equals to cu_seqlens_kv, "
-                f"but got {cu_seqlens_q=} and {cu_seqlens_kv=}"
-            )
+            if (
+                (
+                    os.getenv("MCORE_GDN_FUSION", "0") == "1"
+                    or os.getenv("MCORE_GDN_COMMON_OPT", "0") == "1"
+                )
+                and self.cp_size == 1
+                and self.feat_dim_split == (3072, 2048, 16, 16)
+            ):
+                q = packed_seq_params.cu_seqlens_q_padded
+                kv = packed_seq_params.cu_seqlens_kv_padded
+                q = packed_seq_params.cu_seqlens_q if q is None else q
+                kv = packed_seq_params.cu_seqlens_kv if kv is None else kv
+                cu_seqlens_q, cu_seqlens_kv = resolve_packed_sequences(q, kv, seq_len)
+            else:
+                cu_seqlens_q = self._resolve_cu_seqlens(
+                    packed_seq_params.cu_seqlens_q_padded,
+                    packed_seq_params.cu_seqlens_q,
+                    seq_len,
+                    "cu_seqlens_q",
+                    cp_size=self.cp_size,
+                )
+                cu_seqlens_kv = self._resolve_cu_seqlens(
+                    packed_seq_params.cu_seqlens_kv_padded,
+                    packed_seq_params.cu_seqlens_kv,
+                    seq_len,
+                    "cu_seqlens_kv",
+                    cp_size=self.cp_size,
+                )
+                assert torch.equal(cu_seqlens_q, cu_seqlens_kv), (
+                    "Currently only support cu_seqlens_q equals to cu_seqlens_kv, "
+                    f"but got {cu_seqlens_q=} and {cu_seqlens_kv=}"
+                )
             num_packed_seqs = cu_seqlens_q.shape[0] - 1
             assert num_packed_seqs > 0, (
                 "Number of packed sequences must be greater than 0, "
@@ -180,6 +201,7 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
         # Split the tensor into q, k, v, gate (z), and the variant-specific gate features
         # (beta, alpha for GDN; f, b, w for GDN2)
         qkv, gate, beta, alpha = self._split_projection(qkvzba, batch, seq_len)
+        use_fusion = gdn_fusion_enabled(self, qkvzba)
 
         # Convolution on qkv
         nvtx_range_push(suffix="conv1d")
@@ -218,9 +240,10 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
             )
             qkv = self.act_fn(conv_out[..., :seq_len])
             qkv = qkv.transpose(1, 2)  # b, d, s -> b, s, d
-        else:
+        elif not use_fusion:
             assert self.activation in ["silu", "swish"]
-            qkv, _ = causal_conv1d(
+            conv_fn = tuned_causal_conv1d if gdn_common_enabled(self, qkvzba) else causal_conv1d
+            qkv, _ = conv_fn(
                 x=qkv,  # FLA conv1d accepts [b, s, d] format input
                 weight=conv1d_weight.squeeze(1),  # d, 1, w -> d, w
                 bias=conv1d_bias,
@@ -238,9 +261,20 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
 
         # Prepare all kernel inputs (split, reshape, L2 norm, gates, contiguous)
         nvtx_range_push(suffix="prepare_input_for_gated_delta_rule")
-        kernel_inputs = self._prepare_input_for_gated_delta_rule(
-            qkv, gate, A_log_local_cp, dt_bias_local_cp, batch, seq_len, beta, alpha
-        )
+        if use_fusion:
+            query, key, value, gate, g, beta = fused_prepare(
+                qkvzba,
+                conv1d_weight.squeeze(1),
+                conv1d_bias,
+                A_log_local_cp,
+                dt_bias_local_cp,
+                cu_seqlens_q,
+            )
+            kernel_inputs = {"q": query, "k": key, "v": value, "g": g, "beta": beta, "gate": gate}
+        else:
+            kernel_inputs = self._prepare_input_for_gated_delta_rule(
+                qkv, gate, A_log_local_cp, dt_bias_local_cp, batch, seq_len, beta, alpha
+            )
         gate = kernel_inputs.pop("gate")
         nvtx_range_pop(suffix="prepare_input_for_gated_delta_rule")
 
@@ -323,6 +357,14 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
             sequence_len_offset=sequence_len_offset,
             **kwargs,
         )
+
+    def _apply_gated_norm(self, x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
+        """Use fused output gating for supported RMSNorm layouts."""
+        if gdn_output_fusion_enabled(self, x, gate):
+            return fused_gated_norm(
+                x, gate, self.out_norm.weight, self.out_norm.eps, self.out_norm.zero_centered_gamma
+            ).reshape(-1, self.value_head_dim)
+        return super()._apply_gated_norm(x, gate)
 
     def _split_projection(
         self, projected: torch.Tensor, batch: int, seq_len: int
