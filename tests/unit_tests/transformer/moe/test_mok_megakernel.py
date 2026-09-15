@@ -1,7 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import sys
-from types import ModuleType, SimpleNamespace
+from types import MethodType, ModuleType, SimpleNamespace
 
 import pytest
 import torch
@@ -452,9 +452,228 @@ def _mock_backend(monkeypatch, *, single_grouped=False, gated=True, mxfp8=False)
     return module, shared, functional
 
 
-def test_backend_rejects_gated_mxfp8_before_importing_te_runtime(monkeypatch):
-    with pytest.raises(ValueError, match="output gate requires BF16 routed experts"):
+@pytest.fixture
+def mxfp8_runtime_available(monkeypatch):
+    """Isolate adapter contracts from the installed TE runtime's capabilities."""
+    from megatron.core import fp8_utils
+
+    monkeypatch.setattr(fp8_utils, "te_post_all_gather_processing", object())
+
+
+@pytest.mark.parametrize("single_grouped", [False, True])
+def test_backend_accepts_gated_mxfp8_with_bf16_shared_alias(
+    monkeypatch, mxfp8_runtime_available, single_grouped
+):
+    module, shared, _ = _mock_backend(
+        monkeypatch, single_grouped=single_grouped, gated=True, mxfp8=True
+    )
+    assert module.use_mxfp8_weights
+    assert module.shared_output_gate_weight is shared.gate_weight
+    assert module.shared_output_gate_weight.dtype == torch.bfloat16
+    assert module.shared_fc1_weight is shared.linear_fc1.weight
+    assert module.shared_fc2_weight is shared.linear_fc2.weight
+    assert module.shared_fc1_weight.dtype == module.shared_fc2_weight.dtype == torch.bfloat16
+
+
+def test_backend_rejects_gated_mxfp8_without_te_post_all_gather_processing(monkeypatch):
+    from megatron.core import fp8_utils
+
+    monkeypatch.setattr(fp8_utils, "te_post_all_gather_processing", None)
+    with pytest.raises(RuntimeError, match="post_all_gather_processing support"):
         _mock_backend(monkeypatch, gated=True, mxfp8=True)
+
+
+@pytest.mark.parametrize("single_grouped", [False, True])
+@pytest.mark.parametrize("gated", [False, True])
+def test_apply_converts_owners_and_adapter_and_preserves_alias_metadata(
+    monkeypatch, single_grouped, gated
+):
+    module, shared, _ = _mock_backend(monkeypatch, single_grouped=single_grouped, gated=gated)
+    # Plain Parameters model the identity-preserving owner contract here; real
+    # TE MXFP8 cuda/Float16Module conversion is covered by integration tests.
+    monkeypatch.setattr(torch.__future__, "get_swap_module_params_on_conversion", lambda: False)
+    monkeypatch.setattr(
+        torch.__future__, "get_overwrite_module_params_on_conversion", lambda: False
+    )
+    owners = torch.nn.Module()
+    owners.add_module("experts", torch.nn.ParameterList(module.autograd_routed_parameters))
+    owners.add_module("shared_experts", shared)
+    owners.add_module("megakernel_experts", module)
+    aliases = dict(module.named_parameters(recurse=False))
+    routed_ids = {id(param) for param in module.autograd_routed_parameters}
+    marker = object()
+    main_grads = {}
+    for name, param in aliases.items():
+        param.allreduce = id(param) not in routed_ids
+        param.partition_stride = 1
+        param.audit_marker = marker
+        param.main_grad = torch.zeros_like(param, dtype=torch.float32)
+        main_grads[name] = param.main_grad
+    module._routed_weight_view_cache = object()
+    module._split_main_grad_descriptor_cache = object()
+    module.is_first_microbatch = False
+    calls = []
+
+    def convert(param):
+        calls.append(id(param))
+        return param.to(torch.float32)
+
+    assert owners._apply(convert) is owners
+    # The canonical owners and the adapter each run Module._apply on the aliases.
+    assert sorted(calls) == sorted([id(param) for param in aliases.values()] * 2)
+    for name, param in aliases.items():
+        assert module.get_parameter(name) is param and param.dtype == torch.float32
+        assert param.allreduce is (id(param) not in routed_ids)
+        assert param.partition_stride == 1 and param.audit_marker is marker
+        assert param.main_grad is main_grads[name]
+    assert module._routed_weight_view_cache is None
+    assert module._split_main_grad_descriptor_cache is None
+    assert module.is_first_microbatch
+    calls.clear()
+    assert module._apply(convert, recurse=False) is module
+    assert sorted(calls) == sorted(id(param) for param in aliases.values())
+    assert module.shared_fc1_weight is shared.linear_fc1.weight
+    assert module.shared_fc2_weight is shared.linear_fc2.weight
+    assert module.shared_output_gate_weight is shared.gate_weight
+
+
+def test_apply_restores_external_metadata_after_parameter_swap(monkeypatch):
+    module, shared, _ = _mock_backend(monkeypatch, gated=False)
+    module.register_parameter("unused_weight", None)
+    # Force ordinary Parameters through the same swap_tensors path used by TE
+    # wrapper subclasses. monkeypatch restores both process-global flags.
+    monkeypatch.setattr(torch.__future__, "get_swap_module_params_on_conversion", lambda: True)
+    monkeypatch.setattr(
+        torch.__future__, "get_overwrite_module_params_on_conversion", lambda: False
+    )
+    aliases = dict(module.named_parameters(recurse=False))
+    routed_ids = {id(param) for param in module.autograd_routed_parameters}
+    snapshots = {}
+
+    def get_high_precision_init_val(param):
+        return param._high_precision_init_val
+
+    for name, param in aliases.items():
+        param.allreduce = id(param) not in routed_ids
+        param.tensor_model_parallel = True
+        param.partition_dim = 0
+        param.partition_stride = 1
+        param.audit_marker = object()
+        param.main_grad = torch.zeros_like(param, dtype=torch.float32)
+        param._high_precision_init_val = torch.ones_like(param, dtype=torch.float32)
+        param.get_high_precision_init_val = MethodType(get_high_precision_init_val, param)
+        snapshots[name] = dict(param.__dict__)
+
+    module._routed_weight_view_cache = object()
+    module._split_main_grad_descriptor_cache = object()
+    module.is_first_microbatch = False
+    swap_tensors = torch.utils.swap_tensors
+    swapped = []
+
+    def swap_and_check_metadata_loss(param, converted):
+        swap_tensors(param, converted)
+        # Confirm this test exercises real attribute loss before _apply repairs it.
+        assert "allreduce" not in param.__dict__
+        assert "_high_precision_init_val" not in param.__dict__
+        assert "get_high_precision_init_val" not in param.__dict__
+        swapped.append(id(param))
+
+    monkeypatch.setattr(torch.utils, "swap_tensors", swap_and_check_metadata_loss)
+    assert module._apply(lambda param: param.to(torch.float32), recurse=False) is module
+
+    assert sorted(swapped) == sorted(id(param) for param in aliases.values())
+    for name, param in aliases.items():
+        assert module.get_parameter(name) is param
+        assert param.dtype == torch.float32
+        for key, value in snapshots[name].items():
+            actual = getattr(param, key)
+            if isinstance(value, MethodType):
+                assert actual.__self__ is param
+                assert actual.__func__ is value.__func__
+            else:
+                assert actual is value
+        assert param.get_high_precision_init_val() is snapshots[name]["_high_precision_init_val"]
+    assert module.shared_fc1_weight is shared.linear_fc1.weight
+    assert module.shared_fc2_weight is shared.linear_fc2.weight
+    assert module._parameters["unused_weight"] is None
+    assert module._routed_weight_view_cache is None
+    assert module._split_main_grad_descriptor_cache is None
+    assert module.is_first_microbatch
+
+
+def test_apply_does_not_overwrite_converted_parameter_attributes(monkeypatch):
+    module, _, _ = _mock_backend(monkeypatch)
+    name = module._routed_fc1_parameter_names[0]
+    old_param = module.get_parameter(name)
+    old_param.allreduce = False
+    old_param.audit_marker = object()
+    old_param.partition_dim = 0
+    old_param._high_precision_init_val = torch.zeros_like(old_param, dtype=torch.float32)
+
+    def get_high_precision_init_val(param):
+        return param._high_precision_init_val
+
+    old_param.get_high_precision_init_val = MethodType(get_high_precision_init_val, old_param)
+    converted = torch.nn.Parameter(old_param.detach().to(torch.float32))
+    converted.allreduce = True
+    converted.audit_marker = None  # An existing falsey value must also win over the snapshot.
+    converted._high_precision_init_val = torch.ones_like(converted)
+    converted.get_high_precision_init_val = MethodType(get_high_precision_init_val, converted)
+    converted_attrs = dict(converted.__dict__)
+
+    def apply_with_converted_attributes(self, fn, recurse=True):
+        assert self is module
+        assert recurse is False
+        self._parameters[name] = fn(old_param)
+        return self
+
+    # Model a superclass conversion that installs a new Parameter with its own
+    # attributes; restoration must fill missing keys, not replace converted state.
+    monkeypatch.setattr(torch.nn.Module, "_apply", apply_with_converted_attributes)
+    assert module._apply(lambda param: converted, recurse=False) is module
+
+    assert module.get_parameter(name) is converted
+    for key, value in converted_attrs.items():
+        assert getattr(converted, key) is value
+    assert converted.partition_dim == old_param.partition_dim
+    assert converted.get_high_precision_init_val() is converted_attrs["_high_precision_init_val"]
+
+
+def test_apply_rebinds_restored_methods_to_replacement_parameter(monkeypatch):
+    module, _, _ = _mock_backend(monkeypatch)
+    monkeypatch.setattr(torch.__future__, "get_swap_module_params_on_conversion", lambda: False)
+    monkeypatch.setattr(torch.__future__, "get_overwrite_module_params_on_conversion", lambda: True)
+    name = module._routed_fc1_parameter_names[0]
+    old_param = module.get_parameter(name)
+    high_precision_init_val = torch.ones_like(old_param, dtype=torch.float32)
+    old_param._high_precision_init_val = high_precision_init_val
+
+    def get_high_precision_init_val(param):
+        return param._high_precision_init_val
+
+    def clear_high_precision_init_val(param):
+        del param._high_precision_init_val
+
+    old_param.get_high_precision_init_val = MethodType(get_high_precision_init_val, old_param)
+    old_param.clear_high_precision_init_val = MethodType(clear_high_precision_init_val, old_param)
+    foreign_owner = SimpleNamespace(_high_precision_init_val=object())
+    old_param.foreign_method = MethodType(get_high_precision_init_val, foreign_owner)
+
+    assert module._apply(lambda param: param.to(torch.float32), recurse=False) is module
+
+    converted = module.get_parameter(name)
+    assert converted is not old_param
+    assert converted.dtype == torch.float32
+    assert converted.get_high_precision_init_val.__self__ is converted
+    assert converted.get_high_precision_init_val.__func__ is get_high_precision_init_val
+    assert converted.clear_high_precision_init_val.__self__ is converted
+    assert converted.clear_high_precision_init_val.__func__ is clear_high_precision_init_val
+    assert converted.get_high_precision_init_val() is high_precision_init_val
+    assert converted.foreign_method is old_param.foreign_method
+    assert converted.foreign_method() is foreign_owner._high_precision_init_val
+    converted.clear_high_precision_init_val()
+    assert "_high_precision_init_val" not in converted.__dict__
+    assert old_param._high_precision_init_val is high_precision_init_val
 
 
 def test_output_gate_alias_participates_in_ddp_hooks_without_double_accumulation(monkeypatch):
@@ -501,8 +720,13 @@ def test_register_shared_output_gate_validates_native_parameter(monkeypatch, inv
 
 @pytest.mark.parametrize("single_grouped", [False, True])
 @pytest.mark.parametrize("gated", [False, True])
-def test_forward_keeps_fixed_gate_slot_and_param_gather_alias(monkeypatch, single_grouped, gated):
-    module, shared, _ = _mock_backend(monkeypatch, single_grouped=single_grouped, gated=gated)
+@pytest.mark.parametrize("mxfp8", [False, True])
+def test_forward_keeps_fixed_gate_slot_and_param_gather_alias(
+    monkeypatch, mxfp8_runtime_available, single_grouped, gated, mxfp8
+):
+    module, shared, _ = _mock_backend(
+        monkeypatch, single_grouped=single_grouped, gated=gated, mxfp8=mxfp8
+    )
     probs = torch.ones((2, 2), dtype=torch.float32)
     experts = torch.zeros((2, 2), dtype=torch.int32)
     monkeypatch.setattr(mok_backend, "routing_map_to_mok_inputs", lambda *_: (probs, experts))
@@ -545,11 +769,12 @@ class _RuntimeContext:
 
 @pytest.mark.parametrize("single_grouped", [False, True])
 @pytest.mark.parametrize("gated", [False, True])
+@pytest.mark.parametrize("mxfp8", [False, True])
 def test_runtime_gate_main_grad_accumulates_and_finishes_ddp_slot(
-    monkeypatch, single_grouped, gated
+    monkeypatch, mxfp8_runtime_available, single_grouped, gated, mxfp8
 ):
     module, shared, functional = _mock_backend(
-        monkeypatch, single_grouped=single_grouped, gated=gated
+        monkeypatch, single_grouped=single_grouped, gated=gated, mxfp8=mxfp8
     )
     parameters = module.autograd_routed_parameters + (
         shared.linear_fc1.weight,
@@ -561,22 +786,35 @@ def test_runtime_gate_main_grad_accumulates_and_finishes_ddp_slot(
         shared.gate_weight.main_grad = torch.full_like(
             shared.gate_weight, 0.25, dtype=torch.float32
         )
-    monkeypatch.setattr(
-        module,
-        "quantized_routed_weights",
-        lambda: (module.routed_fc1_parameters[0], module.routed_fc2_parameters[0]),
-    )
+    # Opaque payloads exercise the bridge's view selection without pretending
+    # that BF16 mock Parameters contain real MXFP8 storage. Numerical/native TE
+    # storage validation belongs to the kernel and weight-adaptation tests.
+    fc1_view, fc2_view = object(), object()
+    if mxfp8 and single_grouped:
+        fc1_view = tuple(object() for _ in range(4))
+        fc2_view = tuple(object() for _ in range(4))
+    monkeypatch.setattr(module, "quantized_routed_weights", lambda: (fc1_view, fc2_view))
     functional.get_workspace = lambda *args, **kwargs: object()
     functional.build_schedule = lambda *args, **kwargs: object()
     calls = []
 
     def forward(*args, **kwargs):
         assert kwargs.get("shared_output_gate_weight") is shared.gate_weight
+        assert args[8] is args[9]
+        if mxfp8 and single_grouped:
+            assert args[8] == fc1_view[:2] and args[10] == fc2_view[:2]
+        else:
+            assert args[8] is fc1_view and args[10] is fc2_view
         return args[3].clone(), object()
 
     def backward(*args, **kwargs):
         calls.append(kwargs)
         assert kwargs.get("shared_output_gate_weight") is shared.gate_weight
+        assert args[10] is args[11] is fc1_view
+        if mxfp8 and single_grouped:
+            assert args[12] == fc2_view[2:]
+        else:
+            assert args[12] is fc2_view
         gate_grad = kwargs.get("shared_output_gate_main_grad")
         if gated:
             assert gate_grad is shared.gate_weight.main_grad and gate_grad.dtype == torch.float32
@@ -637,8 +875,11 @@ def test_runtime_gate_main_grad_accumulates_and_finishes_ddp_slot(
 
 
 @pytest.mark.parametrize("main_grad", [None, "bf16"])
-def test_runtime_rejects_missing_or_bf16_output_gate_main_grad(monkeypatch, main_grad):
-    module, shared, functional = _mock_backend(monkeypatch)
+@pytest.mark.parametrize("mxfp8", [False, True])
+def test_runtime_rejects_missing_or_bf16_output_gate_main_grad(
+    monkeypatch, mxfp8_runtime_available, main_grad, mxfp8
+):
+    module, shared, functional = _mock_backend(monkeypatch, mxfp8=mxfp8)
     if main_grad == "bf16":
         shared.gate_weight.main_grad = torch.zeros_like(shared.gate_weight)
     parameters = module.autograd_routed_parameters + (
