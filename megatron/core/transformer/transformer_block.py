@@ -223,6 +223,38 @@ class TransformerBlockSubmodules:
     layer_norm: LayerNormBuilder | None = None
 
 
+def _has_interleaved_moe_layer_pattern(config: TransformerConfig) -> bool:
+    """
+    Check whether `config` asks for a mix of dense and MoE layers.
+
+    Mirrors the `moe_layer_freq` parsing in
+    `megatron.core.models.gpt.gpt_layer_specs.get_gpt_decoder_layer_specs`.
+
+    Args:
+        config (TransformerConfig): Configuration object for the transformer model.
+
+    Returns:
+        bool: True if some layers are dense and some are MoE, False if the stack is
+            homogeneous (or if `moe_layer_freq` is malformed, which the model-specific
+            spec builders report with a better message).
+    """
+    if config.num_moe_experts is None:
+        return False
+
+    if isinstance(config.moe_layer_freq, int):
+        if config.moe_layer_freq < 1:
+            return False
+        moe_layer_pattern = [
+            1 if (i % config.moe_layer_freq == 0) else 0 for i in range(config.num_layers)
+        ]
+    elif isinstance(config.moe_layer_freq, list):
+        moe_layer_pattern = config.moe_layer_freq
+    else:
+        return False
+
+    return 0 in moe_layer_pattern and 1 in moe_layer_pattern
+
+
 def _get_block_submodules(
     config: TransformerConfig,
     spec: Union[TransformerBlockSubmodules, ModuleSpec],
@@ -254,6 +286,21 @@ def _get_block_submodules(
         if issubclass(spec.module, TransformerBlock):
             return spec.submodules
         elif issubclass(spec.module, BaseTransformerLayer):
+            # A single layer spec is replicated for every layer, so it can only describe a
+            # homogeneous stack. Replicating it while `moe_layer_freq` asks for interleaved
+            # dense/MoE layers silently builds the wrong model (e.g. every layer MoE),
+            # which is easy to miss beyond the inflated parameter count.
+            if _has_interleaved_moe_layer_pattern(config):
+                raise ValueError(
+                    f"Cannot build a transformer block from a single layer spec "
+                    f"({spec.module.__name__}) when config.moe_layer_freq="
+                    f"{config.moe_layer_freq} requests a mix of dense and MoE layers: the "
+                    f"spec would be replicated for all {config.num_layers} layers and "
+                    f"moe_layer_freq would be silently ignored. Pass a "
+                    f"TransformerBlockSubmodules instead, e.g. from "
+                    f"megatron.core.models.gpt.gpt_layer_specs.get_gpt_decoder_block_spec(), "
+                    f"or set moe_layer_freq=1 if every layer is meant to be an MoE layer."
+                )
             num_layers = get_num_layers_to_build(config, vp_stage, pp_rank)
             return TransformerBlockSubmodules(
                 layer_specs=[spec] * num_layers, layer_norm=LayerNormImpl
