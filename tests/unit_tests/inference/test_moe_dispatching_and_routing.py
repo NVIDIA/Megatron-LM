@@ -10,6 +10,7 @@ dimensions for fast unit test execution:
 - shared experts
 """
 
+import contextlib
 import gc
 
 import pytest
@@ -110,9 +111,14 @@ def test_config_accepts_mxfp8_batch_invariant_backends(backend, gated_linear_uni
 
 
 @pytest.mark.parametrize("grouped_tensor", [False, True])
-def test_config_rejects_batch_invariant_device_metadata_gemm(monkeypatch, grouped_tensor):
+def test_config_batch_invariant_device_metadata_gemm(monkeypatch, grouped_tensor):
     monkeypatch.setenv("NVTE_GROUPED_LINEAR_USE_FUSED_GROUPED_GEMM", "0" if grouped_tensor else "1")
-    with pytest.raises(AssertionError, match="requires legacy TE GroupedLinear"):
+    expected = (
+        contextlib.nullcontext()
+        if grouped_tensor
+        else pytest.raises(AssertionError, match="not just NVTE_GROUPED_LINEAR")
+    )
+    with expected:
         _make_base_config(
             transformer_impl="transformer_engine",
             moe_token_dispatcher_type="alltoall",
@@ -706,18 +712,25 @@ class TestNVLSAllGatherVDispatcher:
         assert graph_output.dtype == torch.bfloat16
 
     @pytest.mark.parametrize(
-        ("inference_grouped_gemm_backend", "activation_clamp_scale", "mxfp8_swiglu"),
+        (
+            "inference_grouped_gemm_backend",
+            "activation_clamp_scale",
+            "mxfp8_swiglu",
+            "grouped_tensor",
+        ),
         [
-            pytest.param("torch", None, False, id="torch"),
-            pytest.param("torch", 0.5, False, id="torch-clamped"),
-            pytest.param("vllm", None, False, id="vllm"),
-            pytest.param("vllm", 0.5, False, id="vllm-clamped"),
-            pytest.param("torch", None, True, id="torch-mxfp8-swiglu"),
-            pytest.param("vllm", None, True, id="vllm-mxfp8-swiglu"),
+            pytest.param("torch", None, False, False, id="torch"),
+            pytest.param("torch", 0.5, False, False, id="torch-clamped"),
+            pytest.param("vllm", None, False, False, id="vllm"),
+            pytest.param("vllm", 0.5, False, False, id="vllm-clamped"),
+            pytest.param("torch", None, True, False, id="torch-mxfp8-swiglu"),
+            pytest.param("vllm", None, True, False, id="vllm-mxfp8-swiglu"),
+            pytest.param("torch", None, True, True, id="torch-mxfp8-device-metadata"),
+            pytest.param("vllm", None, True, True, id="vllm-mxfp8-device-metadata"),
         ],
     )
     def test_batch_invariant_moe_matches_training(
-        self, inference_grouped_gemm_backend, activation_clamp_scale, mxfp8_swiglu
+        self, inference_grouped_gemm_backend, activation_clamp_scale, mxfp8_swiglu, grouped_tensor
     ):
         """The NVLS inference MoE path should exactly match training AllToAll.
 
@@ -756,6 +769,20 @@ class TestNVLSAllGatherVDispatcher:
             if not HAVE_SCALED_GMM or torch.cuda.get_device_capability()[0] < 10:
                 pytest.skip("MXFP8 scaled_grouped_mm requires PyTorch 2.10+ and Blackwell")
 
+        if grouped_tensor:
+            from megatron.core.extensions.transformer_engine import (
+                _TE_GROUPED_LINEAR_SUPPORTS_GROUPED_TENSOR,
+            )
+            from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+                te_supports_batch_invariant_grouped_gemm,
+            )
+
+            if (
+                not _TE_GROUPED_LINEAR_SUPPORTS_GROUPED_TENSOR
+                or not te_supports_batch_invariant_grouped_gemm()
+            ):
+                pytest.skip("Requires TE grouped-tensor API, SM100, and cuBLASLt 13.5.1")
+
         torch.manual_seed(2028)
         torch.cuda.manual_seed(2028)
 
@@ -793,6 +820,7 @@ class TestNVLSAllGatherVDispatcher:
 
         if mxfp8_swiglu:
             training_config = _make_base_config(
+                moe_use_grouped_tensor=grouped_tensor,
                 expert_model_parallel_size=Utils.world_size,
                 transformer_impl="transformer_engine",
                 moe_token_dispatcher_type="alltoall",
