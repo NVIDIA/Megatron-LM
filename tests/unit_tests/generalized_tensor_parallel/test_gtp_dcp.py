@@ -1160,7 +1160,7 @@ def _build_gdp_mixer(required_pgs):
     parallel with ``gtp_remat_size=2`` first.
     """
     from megatron.core.models.hybrid.hybrid_layer_specs import gdp_stack_spec
-    from megatron.core.ssm.gated_delta_product import GatedDeltaProductMixer
+    from megatron.core.ops.ssm.gdp.mixer import GatedDeltaProductMixer
 
     pg = ProcessGroupCollection.use_mpu_process_groups(required_pgs=required_pgs)
     config = TransformerConfig(
@@ -1229,7 +1229,7 @@ def _worker_gdp_inproj_gather_split(rank, world_size, port):
         # Save side: the gathered tensor is the full TP-local width, pad stripped.
         assert factory.data.size(0) == in_proj_dim, (factory.data.size(0), in_proj_dim)
 
-        from megatron.core.ssm.gated_delta_product import _get_in_proj_checkpoint_split_layout
+        from megatron.core.ops.ssm.gdp.mixer import _get_in_proj_checkpoint_split_layout
 
         # The chunk names/sizes come from _get_in_proj_checkpoint_split_layout (householder-major:
         # z, V0..V(M-1), K0..K(M-1), Q, b0..b(M-1), a). Derive the expectation from that helper so

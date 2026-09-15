@@ -12,8 +12,8 @@ from unittest.mock import patch
 import torch
 
 from megatron.core.dist_checkpointing import ShardedTensor
-from megatron.core.ssm import gated_delta_product as gdp_module
-from megatron.core.ssm.gated_delta_product import (
+from megatron.core.ops.ssm.gdp import mixer as gdp_module
+from megatron.core.ops.ssm.gdp.mixer import (
     GatedDeltaProductMixer,
     _get_in_proj_checkpoint_split_layout,
     _split_tensor_factory,
