@@ -253,15 +253,8 @@ class PrefixMatch:
         prefix_skip_tokens (int): Prompt tokens this chunk skips because they are cached.
         effective_prefill_chunk_length (int): Tokens this chunk actually computes.
         backed_off_blocks (int): Matched blocks deliberately NOT inherited, dropped from the tail
-            of `matched_block_ids`. The MTP draft KV rides in the same blocks as the main KV, but
-            its entry at a block's final slot consumes one token PAST the block, so that slot is
-            not determined by the block's hash and cannot be inherited correctly. Dropping the
-            block lets this request compute and own it. Those blocks are recomputed into fresh
-            blocks whose hashes are still owned by the producer's copy, so the registration step
-            in `add_request` must skip exactly this many blocks -- re-registering would repoint
-            the hash map at our private copy while the producer's block keeps the same
-            `block_hashes` entry, and `_deregister_blocks` pops by hash, so releasing the
-            producer's block would then evict our entry.
+            of `matched_block_ids` -- see `_compute_prefix_match` for why. The registration step
+            in `add_request` must skip exactly this many blocks.
     """
 
     matched_block_ids: list
@@ -3253,10 +3246,10 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         # is only consumable at `finished - 1`, and any skip (block granular, so all-or-nothing)
         # moves this chunk's start past it, orphaning that entry permanently.
         #
-        # Trimming here rather than adjusting `prefix_skip_tokens` keeps the matched-block list
-        # and the skip consistent, which block-table assignment, `num_blocks_from_pool` and
-        # `req.num_matched_prefix_blocks` all depend on. Named `mtp_backed_off_blocks` because
-        # the Mamba branch below binds `backed_off_blocks` for an unrelated purpose.
+        # Trimming the list rather than the skip keeps the two consistent, which block-table
+        # assignment, `num_blocks_from_pool` and `req.num_matched_prefix_blocks` all depend on.
+        # Named `mtp_backed_off_blocks` because the Mamba branch below binds
+        # `backed_off_blocks` for an unrelated purpose.
         mtp_backed_off_blocks = 0
         if self.enable_mtp_kv_cache and matched_block_ids:
             if self.mtp_metadata.chunk_boundary_req_id == req.request_id:
@@ -3697,9 +3690,11 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             # Range 1: prior-chunk partial block that this chunk just completed
             _register_range(previously_complete, min(already_allocated_blocks, num_complete_blocks))
             # Range 2: newly allocated (non-matched) blocks that are now complete. Starts past
-            # the blocks the MTP draft-KV back-off declined to inherit (see
-            # `PrefixMatch.backed_off_blocks`): their hashes are still owned by the producer's
-            # copies, so ours stay unregistered and private.
+            # the blocks the MTP draft-KV back-off declined to inherit: their hashes are still
+            # owned by the producer's copies, so ours must stay unregistered and private.
+            # Registering them would repoint the hash map at our copy while the producer's block
+            # keeps the same `block_hashes` entry -- and `_deregister_blocks` pops by hash, not
+            # by block id, so releasing the producer's block would then evict our entry.
             _register_range(
                 already_allocated_blocks + num_matched_blocks + match.backed_off_blocks,
                 num_complete_blocks,

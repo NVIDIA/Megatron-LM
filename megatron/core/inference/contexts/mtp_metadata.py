@@ -33,18 +33,8 @@ class MTPMetadata:
     fields. Rather than build those tensors per forward, this class owns them as fixed-address
     buffers sized for the worst case and updates them in place. That keeps the draft loop
     allocation-free and CUDA-graph safe (a captured MTP graph replays against the same
-    addresses each step).
-
-    The buffers fall into two groups:
-      * Draft-loop state (`offsets`, `block_table`): staged once per step by
-        `begin_decode` and advanced per depth by `advance_decode_step`.
-      * Per-forward staging (`query_lengths`, `kv_lengths`): rebuilt by `stage_*_lengths` for
-        each forward, then written into the context's `gpu_view` by `write_mha_metadata`.
-        They are staged here rather than written straight into `gpu_view` because the padded-row
-        adjustments must be applied before the cumulative sums are taken.
-
-    Construction is cheap and unconditional; `allocate` (called from the context's
-    `initialize_all_tensors`) is what reserves GPU memory, and only when `enabled`.
+    addresses each step). Construction is cheap and unconditional; `allocate` is what reserves
+    GPU memory, and only when `enabled`.
 
     Args:
         enabled (bool): Whether MTP KV caching is active for this context. When False the
@@ -205,22 +195,14 @@ class MTPMetadata:
     def take_chunk_boundary(self, req_id: int, seam_position: int) -> Tensor:
         """Return the carried hidden for this seam.
 
-        The caller matches `chunk_boundary_req_id` against its own request list before calling,
-        so all three conditions below hold by construction:
+        All three conditions below hold by construction. The caller derives `req_id` by matching
+        `chunk_boundary_req_id` in its own request list, which settles the first two. The third
+        rests on `_compute_prefix_match` giving up a carry-holding continuation chunk's ENTIRE
+        prefix match, so the chunk starts at `finished` and its seam lands exactly where the
+        carry was recorded.
 
-          * a carry is live -- an invalid carry records req_id -1, which never appears in a real
-            request list, so the caller cannot reach here without one;
-          * it belongs to `req_id` -- the caller derives `req_id` from `chunk_boundary_req_id`;
-          * it sits at `seam_position` -- `_compute_prefix_match` gives up a carry-holding
-            continuation chunk's ENTIRE prefix match, so `prefix_skip_tokens == 0`, the chunk
-            starts at `finished`, and its seam lands exactly where the carry was recorded. (This
-            also covers a first chunk, which would ask for `seam_position == -1`: a live carry is
-            only ever recorded at a position `>= 0`.)
-
-        These RAISE rather than declining. Declining would skip the seam, leaving a committed
-        position unwritten -- a silent draft-acceptance regression that masks whichever
-        bookkeeping invariant actually broke. If one ever fires, find the new path rather than
-        softening the check; the messages name the state needed to do that.
+        They RAISE rather than declining: skipping the seam would leave a committed position
+        unwritten, a silent draft-acceptance regression that masks whichever invariant broke.
 
         Args:
             req_id (int): Request that wants to write the seam.
@@ -333,13 +315,10 @@ class MTPMetadata:
         The commit pass is a fresh causal prefill, so a request's KV length equals its query
         length and one buffer serves as both.
 
-        The pad rows are query rows as well as KV writes: the packed hidden is padded up to a
-        TP multiple so it can be scattered for sequence parallelism, so after the MTP layer's
-        internal gather the attention sees `total + pad_tokens` query rows while `append_counts`
-        describes only `total` of them. Varlen attention requires `q.shape[0] == cu_seqlens_q[-1]`,
-        so every pad row is given an owning request. Only the write maps decide where a forward's
-        KV lands, and `write_token_maps` redirects the pad rows to the dummy block, so the
-        extra query rows are inert wherever they are attributed.
+        The hidden is padded to a TP multiple for the sequence-parallel scatter, so attention
+        sees `total + pad_tokens` query rows while `append_counts` describes only `total`. Varlen
+        requires `q.shape[0] == cu_seqlens_q[-1]`, so every pad row needs an owning request --
+        and it does not matter which, since `write_token_maps` sends them to the dummy block.
 
         Args:
             append_counts (Tensor): [P] KV entries each request writes this pass.
@@ -387,12 +366,10 @@ class MTPMetadata:
             block_table (Tensor): [R, max_kv_block_count] block ids indexed by `rows`.
             padded_token_count (int): Token rows the forward runs, including padding. Padded
                 rows are redirected to the dummy block so they never touch real KV.
-            inherited_blocks (Optional[Tensor]): [R] leading blocks each row INHERITED from the
-                prefix cache rather than computed. Tokens landing in those blocks are redirected
-                to the dummy block: their KV is already correct from the producing request, and
-                the block is ref-counted, so writing would corrupt every request sharing it.
-                The main KV path redirects the same span (`overlap_start_token` in
-                `add_request`). None disables the redirect, for callers with no inherited blocks.
+            inherited_blocks (Optional[Tensor]): [R] leading blocks each row INHERITED rather
+                than computed. Tokens landing in those blocks go to the dummy block: the KV is
+                already correct from the producer, and the block is ref-counted, so writing would
+                corrupt every request sharing it. None disables the redirect.
         """
         total = positions.numel()
         block_within = (positions // self.block_size_tokens).to(torch.long)

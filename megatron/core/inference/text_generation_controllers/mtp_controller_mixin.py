@@ -133,15 +133,9 @@ class MTPControllerMixin:
         position p always holds draft KV = f(h_p^main + emb(t_{p+1})) and never a stale
         chained-draft-hidden value (the cause of depth-increasing acceptance decay). K/V are pure
         projections of the input (no RoPE), so only the write positions matter; the output hidden
-        is discarded. Covers, per request:
-          - decode: the a_r accepted-draft positions this step (base + drafts 0..a-2), from this
-            step's main hiddens for the accepted forwarded tokens. The LAST accepted
-            position is written by decode depth 0, so this covers the earlier a_r
-            positions (start = base-1-a_r).
-          - prefill: the chunk's positions off..off+q-2 (start = off = request_kv_length_offset);
-            for a continuation chunk (off > 0) the straddling position off-1 is also seeded from the
-            carried-over previous-chunk hidden. off == 0 and q == full prompt length in the common
-            (single-chunk) case.
+        is discarded. `_mtp_decode_commit_segments` and `_mtp_prefill_commit_segments` derive the
+        per-request positions.
+
         Returns True if it issued a forward (caller runs a dummy slot otherwise for EP balance).
         """
         stride = self.num_speculative_tokens + 1
@@ -253,13 +247,11 @@ class MTPControllerMixin:
         `off-1`. At most one request per step qualifies, since chunked prefill admits one
         in-flight request.
 
-        A prefix-cache hit also gives `off > 0`, and writes no seam: the skipped prefix came from
-        a DIFFERENT request whose activations are gone, so no carry matches. That is correct
-        because every inherited entry is already right, `off-1` included --
-        `_compute_prefix_match` drops the last HASH-MATCHED block, so `t_off` is the first token
-        of that dropped block, still inside the matched prefix and identical for every sibling.
-        The entry that genuinely diverges sits one block later, in the block this request now
-        computes, where the body rows below write it. Removing that back-off silently breaks this.
+        A prefix-cache hit also gives `off > 0` but writes no seam: the skipped prefix came from
+        a DIFFERENT request, so no carry matches. None is needed -- `_compute_prefix_match` drops
+        the last hash-matched block, which leaves `off-1` already correct in the inherited block
+        and moves the divergent entry into one the body rows below write. Removing that back-off
+        silently breaks this.
 
         Every request contributes exactly ONE segment (q-1 entries, or q with a seam), so the
         segment count stays `active_request_count` and the fixed-size MHA buffers never overflow.

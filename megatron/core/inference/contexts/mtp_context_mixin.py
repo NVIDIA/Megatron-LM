@@ -45,11 +45,10 @@ class MTPContextMixin:
         """Whether this model/config can populate an MTP draft-KV plane.
 
         There is no opt-in flag: the draft KV only affects acceptance rate, never verified
-        output, so the gate is purely whether the config CAN populate it. The gate is on the MTP
-        HEAD, not the decoder -- a hybrid decoder is fine, because the reserved slot bypasses
-        `layer_map` entirely. A recurrent head has no KV to append, and a multi-attention head
-        would collide on the single reserved slot. Hybrid models state the two patterns
-        independently as "<main>/<mtp>/...", so only the MTP half is consulted.
+        output, so the gate is purely whether the config CAN populate it. It reads the MTP
+        HEAD's shape, not the decoder's -- a hybrid decoder is fine, because the reserved slot
+        bypasses `layer_map` entirely, and a hybrid pattern states the two halves independently
+        as "<main>/<mtp>/...".
 
         Args:
             model_config: Transformer config, read for the MTP head's shape.
@@ -100,17 +99,7 @@ class MTPContextMixin:
     # advances by exactly 1 + accepted and rejected drafts are overwritten next step.
     #
     # The metadata is driven directly on the GPU, bypassing the coalesced CPU->GPU bookkeeping
-    # transfer, so draft forwards never disturb the main step's Mamba/H2D state. Callers drive
-    # the per-depth lifecycle through `mtp_metadata` directly (`advance_decode_step`,
-    # `end_forward`); only the steps that need context state live here.
-    #
-    # Every draft forward -- depth or varlen commit pass -- prepares the same three things, and
-    # the setups below differ only in how they derive the (row, position) pairs and lengths:
-    #   1. `mtp.write_token_maps`       : per-token KV write destinations.
-    #   2. `mtp.write_mha_metadata`     : per-request read metadata + padded-row sentinels.
-    #   3. `_mtp_activate_attn_metadata`: graphed vs eager object, bounds, token counts.
-    # Everything persistent lives in `self.mtp_metadata`, allocated once and updated in place,
-    # so no draft depth allocates metadata tensors.
+    # transfer, so draft forwards never disturb the main step's Mamba/H2D state.
     # ------------------------------------------------------------------
     def _mtp_activate_attn_metadata(
         self,
@@ -239,18 +228,12 @@ class MTPContextMixin:
     ) -> None:
         """Populate token write maps + MHA metadata for a varlen roll-by-one MTP write forward.
 
-        Used for two cases, both roll-by-one over main hidden states (K/V = f(input), independent
-        of the attention window since there is no RoPE, so only the write positions must be right):
-          - PROMPT SEED (prefill requests): each request writes positions 0..L-2 into empty KV
-            (request_start_positions=None -> start at 0).
-          - COMMIT REFRESH (decode requests): rewrite the accepted-draft positions' KV from the
-            MAIN hidden each step (a per-step "first pass"), so committed KV never carries a stale
-            chained-draft-hidden value. Here each request writes at its own committed offset via
-            `request_start_positions[r]` (the MTP position of the request's first refreshed token).
-        `append_counts`/`block_table_prefill` are GPU tensors for the P requests
-        (active-slice order).
-        `total` is `append_counts.sum()`; pass it when the caller already has it, to skip a
-        redundant device sync.
+        Each request writes `append_counts[r]` consecutive positions starting at
+        `request_start_positions[r]`, or at 0 when that is None (a fresh prompt seed).
+
+        `append_counts`/`block_table_prefill` are GPU tensors for the P requests in active-slice
+        order. `total` is `append_counts.sum()`; pass it when the caller already has it, to skip
+        a redundant device sync.
         """
         assert self.enable_mtp_kv_cache
         gv = self.gpu_view
