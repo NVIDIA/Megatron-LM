@@ -60,6 +60,8 @@ class MegatronCheckpointSaverBase:
             # These are arguments that we are either changing, or cause problems for validation if they are set
             # Note that some of these deal with T5 so will need to be changed if we support T5.
             args_to_keep = ['tensor_model_parallel_size', 'pipeline_model_parallel_size', 'expert_model_parallel_size', 'world_size', 'params_dtype',
+                            'tensor_parallel_num_weight_shards', 'gtp_weight_remat_size',
+                            'expert_tensor_parallel_num_weight_shards', 'expert_gtp_weight_remat_size',
                             'num_layers_per_virtual_pipeline_stage', 'virtual_pipeline_model_parallel_size',
                             'masked_softmax_fusion', 'bias_gelu_fusion', 'bias_dropout_fusion',
                             'sequence_parallel',
