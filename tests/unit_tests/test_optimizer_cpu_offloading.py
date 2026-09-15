@@ -75,6 +75,19 @@ class BigNet(nn.Module):
         return x
 
 
+class ConditionalParameterModel(nn.Module):
+    def __init__(self, dtype):
+        super().__init__()
+        self.always = nn.Parameter(torch.tensor(1.0, device="cuda", dtype=dtype))
+        self.optional = nn.Parameter(torch.tensor(1.0, device="cuda", dtype=dtype))
+
+    def forward(self, use_optional):
+        output = self.always
+        if use_optional:
+            output = output + self.optional
+        return output
+
+
 def setup_seed(seed):
     random.seed(seed)  # Set Python's built-in random seed
     np.random.seed(seed)  # Set NumPy's random seed
@@ -129,6 +142,43 @@ def test_load_state_dict_with_native_fp32_param():
 
     restored_model(inputs).sum().backward()
     restored_optimizer.step()
+
+
+@pytest.mark.parametrize(
+    "dtype,offload_fraction,param_update_in_fp32",
+    [(torch.float32, 1.0, False), (torch.bfloat16, 0.0, True)],
+    ids=["cpu-offloaded-param", "gpu-fp32-master-param"],
+)
+def test_conditional_parameter_matches_torch_sgd_reference(
+    dtype, offload_fraction, param_update_in_fp32
+):
+    """HybridDeviceOptimizer must not reuse a previous grad when a param is inactive."""
+    model = ConditionalParameterModel(dtype)
+    reference_model = ConditionalParameterModel(dtype)
+    optimizer = HybridDeviceOptimizer(
+        model.parameters(),
+        offload_fraction=offload_fraction,
+        cpu_optimizer_cls=SGD,
+        gpu_optimizer_cls=SGD,
+        param_update_in_fp32=param_update_in_fp32,
+        overlap_cpu_optimizer_d2h_h2d=False,
+        lr=0.25,
+    )
+    reference_optimizer = SGD(reference_model.parameters(), lr=0.25)
+
+    for use_optional in (True, False, True):
+        optimizer.zero_grad(set_to_none=True)
+        reference_optimizer.zero_grad(set_to_none=True)
+        model(use_optional).backward()
+        reference_model(use_optional).backward()
+        assert (model.optional.grad is None) == (reference_model.optional.grad is None)
+
+        optimizer.step()
+        reference_optimizer.step()
+        torch.cuda.synchronize()
+
+        torch.testing.assert_close(model.always, reference_model.always)
+        torch.testing.assert_close(model.optional, reference_model.optional)
 
 
 @pytest.mark.skipif(
