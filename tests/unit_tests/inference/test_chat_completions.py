@@ -88,7 +88,7 @@ def test_media_tokenization_is_synchronous_so_it_can_be_offloaded_whole():
 
 
 @pytest.mark.asyncio
-async def test_n_choices_prepare_and_serialize_shared_media_once():
+async def test_n_choices_serialize_shared_media_once():
     quart = pytest.importorskip("quart")
     from megatron.core.inference.text_generation_server.dynamic_text_gen_server.endpoints import (
         chat_completions,
@@ -178,6 +178,5 @@ async def test_n_choices_prepare_and_serialize_shared_media_once():
     assert response.status_code == 200
     assert len((await response.get_json())["choices"]) == 3
     assert len(client.serialized_media) == 3
-    assert all(wire == client.serialized_media[0] for wire in client.serialized_media)
-    assert all(wire is not client.serialized_media[0] for wire in client.serialized_media[1:])
+    assert all(wire is client.serialized_media[0] for wire in client.serialized_media)
     assert compute_key.call_count == 1

@@ -151,17 +151,7 @@ def compute_media_cache_key(modality: str, modality_data: Any) -> str:
     raise TypeError(f"Cannot compute a media cache key for {type(modality_data).__name__}.")
 
 
-@dataclass(frozen=True)
-class _PreparedMultimodalData:
-    """Multimodal wire data whose content identity has already been computed."""
-
-    serialized: Dict[str, Any]
-
-
-def prepare_multimodal_data(multi_modal_data: Any) -> Optional[_PreparedMultimodalData]:
-    """Serialize and hash media once for reuse across equivalent submissions."""
-    serialized = serialize_multimodal_data(multi_modal_data)
-    return _PreparedMultimodalData(serialized) if serialized is not None else None
+_SERIALIZED_MULTIMODAL_DATA_KEY = "_is_serialized"
 
 
 def serialize_multimodal_data(multi_modal_data: Any) -> Optional[Dict[str, Any]]:
@@ -183,13 +173,12 @@ def serialize_multimodal_data(multi_modal_data: Any) -> Optional[Dict[str, Any]]
     """
     if multi_modal_data is None:
         return None
-    if isinstance(multi_modal_data, _PreparedMultimodalData):
-        # If choices n > 1, reuse the serialized payload without re-hashing or
-        # converting tensors. Return an isolated structure so callers cannot
-        # mutate the prepared payload or its cache identity.
-        return copy.deepcopy(multi_modal_data.serialized)
     if not isinstance(multi_modal_data, dict):
         raise TypeError(f"multi_modal_data must be a dict or None, got {type(multi_modal_data)}.")
+    if multi_modal_data.get(_SERIALIZED_MULTIMODAL_DATA_KEY) is True:
+        # If choices n > 1, reuse the serialized payload without re-hashing,
+        # converting tensors, or copying its dictionary structure.
+        return multi_modal_data
 
     unsupported = set(multi_modal_data) - {"image", "video", "media_tokens_preexpanded"}
     if "media_cache_key" in unsupported:
@@ -220,7 +209,12 @@ def serialize_multimodal_data(multi_modal_data: Any) -> Optional[Dict[str, Any]]
     raw_items = _normalize_raw_media_items(modality_data)
     if raw_items is not None:
         media_cache_key = compute_media_cache_key(modality, raw_items)
-        return {modality: raw_items, "media_cache_key": media_cache_key, **metadata}
+        return {
+            modality: raw_items,
+            "media_cache_key": media_cache_key,
+            _SERIALIZED_MULTIMODAL_DATA_KEY: True,
+            **metadata,
+        }
     elif isinstance(modality_data, dict):
         media_cache_key = compute_media_cache_key(modality, modality_data)
         wire: Dict[str, Any] = {}
@@ -236,7 +230,16 @@ def serialize_multimodal_data(multi_modal_data: Any) -> Optional[Dict[str, Any]]
             wire[key] = serialize_tensor(value)
         if "num_img_embeddings_per_tile" in modality_data:
             wire["num_img_embeddings_per_tile"] = int(modality_data["num_img_embeddings_per_tile"])
-        return {modality: wire, "media_cache_key": media_cache_key, **metadata} if wire else None
+        return (
+            {
+                modality: wire,
+                "media_cache_key": media_cache_key,
+                _SERIALIZED_MULTIMODAL_DATA_KEY: True,
+                **metadata,
+            }
+            if wire
+            else None
+        )
     else:
         raise TypeError(
             f"multi_modal_data[{modality!r}] must be bytes, list[bytes], or a "
@@ -266,7 +269,11 @@ def split_multimodal_data(
     modality = "video" if "video" in serialized else "image"
     if modality not in serialized:
         raise ValueError(f"Serialized multimodal data has no media payload: {sorted(serialized)}.")
-    media_meta = {key: value for key, value in serialized.items() if key != modality}
+    media_meta = {
+        key: value
+        for key, value in serialized.items()
+        if key not in (modality, _SERIALIZED_MULTIMODAL_DATA_KEY)
+    }
     media_meta["modality"] = modality
     return media_meta, serialized[modality]
 
@@ -292,7 +299,7 @@ def merge_multimodal_data(
     modality = media_meta.pop("modality", None)
     if modality not in ("image", "video"):
         raise ValueError(f"Media metadata carries an unsupported modality: {modality!r}.")
-    return {modality: payload, **media_meta}
+    return {modality: payload, _SERIALIZED_MULTIMODAL_DATA_KEY: True, **media_meta}
 
 
 def resolve_multimodal_data_for_engine(
@@ -326,6 +333,7 @@ def resolve_multimodal_data_for_engine(
         "video",
         "media_cache_key",
         "media_tokens_preexpanded",
+        _SERIALIZED_MULTIMODAL_DATA_KEY,
     }
     if unsupported:
         raise NotImplementedError(

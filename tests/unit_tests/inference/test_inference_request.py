@@ -19,7 +19,6 @@ from megatron.core.inference.inference_request import (
     compute_media_cache_key,
     deserialize_ndarray,
     deserialize_tensor,
-    prepare_multimodal_data,
     resolve_multimodal_data_for_engine,
     serialize_multimodal_data,
     serialize_ndarray,
@@ -122,18 +121,6 @@ def test_serialization_helpers_round_trip():
     assert out["tokens"] == [4, 5, 6]
 
 
-def test_prepared_multimodal_data_protects_computed_identity():
-    prepared = prepare_multimodal_data({"image": [b"image"]})
-    wire = serialize_multimodal_data(prepared)
-    expected_key = wire["media_cache_key"]
-    wire["media_cache_key"] = "forged"
-    wire["image"].append(b"different-image")
-
-    fresh_wire = serialize_multimodal_data(prepared)
-    assert fresh_wire["media_cache_key"] == expected_key
-    assert fresh_wire["image"] == [b"image"]
-
-
 def test_preexpanded_multimodal_request_round_trip():
     media = {
         "image": {"imgs": torch.ones(1, 2, 4), "imgs_sizes": torch.tensor([[2, 2]])},
@@ -194,14 +181,14 @@ def test_multimodal_serialization_generates_stable_content_keys():
     assert tensor_a["media_cache_key"] != tensor_c["media_cache_key"]
 
 
-def test_prepared_multimodal_data_reuses_computed_content_key():
+def test_serialized_multimodal_data_reuses_computed_content_key():
     with mock.patch(
         "megatron.core.inference.inference_request.compute_media_cache_key",
         wraps=compute_media_cache_key,
     ) as compute_key:
-        prepared = prepare_multimodal_data({"image": [b"same-image"]})
-        first = serialize_multimodal_data(prepared)
-        second = serialize_multimodal_data(prepared)
+        serialized = serialize_multimodal_data({"image": [b"same-image"]})
+        first = serialize_multimodal_data(serialized)
+        second = serialize_multimodal_data(serialized)
 
     assert first is second
     assert compute_key.call_count == 1
