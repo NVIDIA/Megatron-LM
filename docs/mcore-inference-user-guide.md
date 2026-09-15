@@ -723,9 +723,9 @@ The transport is selected by `refit_method`, exposed on the command line as
 MXFP8 targets are handled transparently: when the destination model uses
 `--transformer-impl inference_optimized` with `--fp8-recipe mxfp8`,
 `prepare_swap_model_weights` installs a quantizing transform that later
-`swap_model_weights` calls pick up. Selective MXFP8 include/exclude filters are
-also honored, so the refit plan quantizes only the selected destination weights
-and sends the remaining parameters as BF16. The built-in RL loop calls
+`swap_model_weights` calls pick up. The refit plan follows the TE per-module
+precision recipe: only destination weights initialized with MXFP8 storage are
+quantized, while BF16 parameters remain BF16. The built-in RL loop calls
 `swap_model_weights(model, inference_model, args.refit_method)`; refer to
 [`megatron/core/resharding/README.md`](https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/core/resharding/README.md) for
 the plan-building and caching details.
