@@ -61,6 +61,7 @@ def github_team_to_slack_usergroup(team_slug):
     """Convert a GitHub team slug to a Slack usergroup handle.
 
     Rules:
+    - Training team: "training" -> "mlm-training"
     - Base pattern: "test" -> "mcore-test"
     - Remove "core-" prefix: "core-test" -> "mcore-test"
     - Remove "megatron-" prefix: "megatron-test" -> "mcore-test"
@@ -69,6 +70,9 @@ def github_team_to_slack_usergroup(team_slug):
     - Shorten "pipeline-parallelism" to "pp"
     - Shorten "reinforcement-learning" to "rl"
     """
+    if team_slug == "training":
+        return "mlm-training"
+
     name = team_slug
 
     # Apply shortenings first (before removing prefixes)
