@@ -588,8 +588,11 @@ class EngramConfig:
                 )
 
     def _validate_unsupported_features(self, transformer_config: Any, use_fsdp: bool) -> None:
-        if not transformer_config.bf16:
-            raise ValueError("Engram currently requires BF16 parameters.")
+        if transformer_config.fp16:
+            # The hashed tables and the PLE gate are plain torch modules in params_dtype; fp16's
+            # range is too small for the sqrt-gated scores. BF16 is the production dtype and
+            # FP32 is needed for numerical validation against reference implementations.
+            raise ValueError("Engram does not support FP16 parameters; use BF16 or FP32.")
         if transformer_config.fp4 is not None:
             raise ValueError("Engram does not yet support FP4 training.")
         # FP8/MXFP8 recipes are permitted: Engram modules are plain torch modules outside the

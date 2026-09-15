@@ -125,6 +125,7 @@ def _startup_transformer_config(**overrides):
         num_layers=8,
         context_parallel_size=1,
         bf16=True,
+        fp16=False,
         mtp_num_layers=None,
         virtual_pipeline_model_parallel_size=None,
         recompute_granularity=None,
@@ -182,8 +183,10 @@ def test_invalid_configuration_messages(tmp_path):
             ),
             16,
         )
-    with pytest.raises(ValueError, match="BF16 parameters"):
-        config.validate_startup(_startup_transformer_config(bf16=False), 16)
+    with pytest.raises(ValueError, match="FP16 parameters"):
+        config.validate_startup(_startup_transformer_config(bf16=False, fp16=True), 16)
+    # FP32 parameters are accepted (reference-parity runs); BF16 stays the production dtype.
+    config.validate_startup(_startup_transformer_config(bf16=False), 16)
     with pytest.raises(ValueError, match="FP4"):
         config.validate_startup(_startup_transformer_config(fp4="e2m1"), 16)
     # FP8/MXFP8 recipes and MTP layers are permitted (Engram modules stay in BF16;

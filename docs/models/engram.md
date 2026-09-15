@@ -261,9 +261,9 @@ distributed-optimizer sharding over expert-DP.
 
 ## Supported and deferred combinations
 
-The current milestone supports GPT training with BF16 parameters (FP8/MXFP8 main-model recipes
-are permitted; Engram modules are plain torch modules outside the Transformer Engine autocast
-regions and stay in BF16), standard residuals, native mHC on the GPT path or the hyper-connection
+The current milestone supports GPT training with BF16 or FP32 parameters (FP16 is rejected;
+FP8/MXFP8 main-model recipes are permitted; Engram modules are plain torch modules outside the
+Transformer Engine autocast regions and stay in the parameter dtype), standard residuals, native mHC on the GPT path or the hyper-connection
 layer wrapper on the hybrid path (the wrapper adds the memory to the residual streams before its
 read gate), EP, TP, PP, SP, MoE coexistence,
 multi-token prediction (MTP layers never build Engram), native all-to-all, torch distributed
