@@ -4,7 +4,6 @@
 
 import logging
 from contextlib import contextmanager
-from pathlib import Path
 from time import time
 from typing import Dict, Optional, Tuple
 
@@ -18,11 +17,6 @@ from .mapping import (
     ShardedTensorFactory,
     StateDict,
 )
-
-from megatron.core.msc_utils import MultiStorageClientFeature
-
-
-CONFIG_FILE = "run_config.yaml"
 
 # _ShardId uniquely identifies a ShardedTensor. This is a subset of ShardedTensor
 # attributes: key (str), global_offset (tuple) and flattened_range (optional tuple)
@@ -315,33 +309,3 @@ def _clean_metadata_for_serialization(metadata: dict) -> dict:
     # Remove dp_cp_group as it's not serializable
     clean_metadata.pop('dp_cp_group', None)
     return clean_metadata
-
-
-def join_paths(*paths: str) -> str:
-    """Join paths, using MultiStorageClient when needed"""
-    if not paths:
-        raise ValueError("Empty paths")
-
-    if MultiStorageClientFeature.is_enabled():
-        msc = MultiStorageClientFeature.import_package()
-        path_cls = msc.Path
-    else:
-        path_cls = Path
-
-    path = path_cls(paths[0])
-    for part in paths[1:]:
-        path = path / part
-
-    return str(path)
-
-
-def get_checkpoint_run_config_filename(checkpoints_path: str) -> str:
-    """Get the filename for the run configuration file within a checkpoint directory.
-
-    Args:
-        checkpoints_path: Base directory where checkpoints are stored.
-
-    Returns:
-        The full path to the run configuration file (e.g., run_config.yaml).
-    """
-    return join_paths(checkpoints_path, CONFIG_FILE)
