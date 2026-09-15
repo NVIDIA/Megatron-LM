@@ -705,12 +705,15 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         are pooled so LPT balances all of them at once, and the ``(g_home, t_home)``
         assignments are pushed onto the ``LayerShardedMuon``.
 
-        A single-rank domain is left unassigned; its groups run plain local Newton-Schulz
-        inside ``LayerShardedMuon.step``. Nothing here creates process groups or issues a
+        Params of a single-rank domain get no home; ``LayerShardedMuon.step`` runs plain
+        local Newton-Schulz on them. Nothing here creates process groups or issues a
         collective: this code runs with rank-local inventory, which differs across
         pipeline and multimodal stages.
         """
-        from megatron.core.optimizer.layer_sharded_muon import LayerShardedMuon, ParamShardSpec
+        try:
+            from megatron.core.optimizer.layer_sharded_muon import LayerShardedMuon, ParamShardSpec
+        except ImportError:  # emerging-optimizers absent: no LayerShardedMuon can exist
+            return
 
         dense_axes = (getattr(pg_collection, 'gtp_remat', None), getattr(pg_collection, 'tp', None))
         expert_axes = (
@@ -755,9 +758,15 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                     f'{tp_size} x {gtp_remat_size} (TP x GTP_remat) NS homes.',
                 )
 
-            if assignment:
-                inner.set_group_process_groups(group_axes)
-                inner.set_param_ns_homes(assignment)
+            if not assignment:
+                log_single_rank(
+                    logger,
+                    logging.INFO,
+                    'LayerShardedMuon: no NS homes to assign (single-rank domains or '
+                    'replicated params only); step() runs local Newton-Schulz.',
+                )
+            inner.set_group_process_groups(group_axes)
+            inner.set_param_ns_homes(assignment)
 
     @staticmethod
     def _check_gtp_group_matches(params: list, specs: list, gtp_remat_group) -> None:

@@ -184,3 +184,9 @@ class TestConstructorGuards:
         p = torch.nn.Parameter(torch.randn(4, 4))
         with pytest.raises(ValueError, match="split-QKV"):
             LayerShardedMuon([p], lr=0.1, gtp_remat_group=None, split_qkv=True)
+
+    def test_ns_batch_size_below_one_is_rejected(self):
+        """ns_batch_size is validated like the parent's num_ns_steps, not clamped."""
+        p = torch.nn.Parameter(torch.randn(4, 4))
+        with pytest.raises(ValueError, match="ns_batch_size"):
+            LayerShardedMuon([p], lr=0.1, gtp_remat_group=None, ns_batch_size=0)

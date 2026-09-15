@@ -27,11 +27,8 @@ from megatron.core.optimizer.optimizer_config import OptimizerConfig
 
 # No version guard on purpose: nothing here constructs LayerShardedMuon (whose
 # __init__ raises on emerging-optimizers < 0.3.0), so these tests run — and give
-# real CI signal — even on containers pinned to older emerging-optimizers.
-# (A try/except around the import would guard nothing anyway: layer_sharded_muon
-# swallows its own emerging-optimizers import failures behind
-# HAVE_EMERGING_OPTIMIZERS and postpones annotation evaluation
-# (from __future__ import annotations), so the import always succeeds.)
+# real CI signal — even on containers pinned to older emerging-optimizers (the
+# importorskip above only requires the package to be present).
 # INVARIANT for future additions: tests in this file must stay signature/registry
 # level (inspect, kwargs dicts) and never instantiate an optimizer — the moment
 # one does, it inherits LayerShardedMuon's version-conditional construction
