@@ -241,6 +241,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         self._decoder_uses_mla = self.config.multi_latent_attention
         self._mtp_uses_mla = self.config.multi_latent_attention
         logging_pg_kwargs = _hybrid_logging_pg_kwargs(self.pg_collection)
+        mtp_overlap_configs = (self.config,)
         if self.hybrid_layer_config_list is not None:
             if self.config.pipeline_model_parallel_layout is not None:
                 raise ValueError(
@@ -288,14 +289,6 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 *parsed_config_list.main_layer_config_list,
                 *(self.mtp_layer_config_list or ()),
             )
-            if any(
-                getattr(layer_config, 'overlap_moe_expert_parallel_comm', False)
-                for layer_config in mtp_overlap_configs
-            ) and self.config.mtp_num_layers not in (None, 0, 1):
-                raise ValueError(
-                    "MTP supports at most one layer when "
-                    "overlap_moe_expert_parallel_comm is enabled."
-                )
             self.config.is_hybrid_model = True
 
             layer_config_list, layer_offset = select_pipeline_segment_from_config_list(
@@ -338,6 +331,14 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             )
 
         # Validate the full architecture, including MTP heads on other pipeline stages.
+        if self.mtp_num_depths > 0 and any(
+            getattr(layer_config, "overlap_moe_expert_parallel_comm", False)
+            for layer_config in mtp_overlap_configs
+        ):
+            raise ValueError(
+                "Hybrid MTP does not support overlap_moe_expert_parallel_comm because the "
+                "overlap scheduler does not expand the nested HybridStack."
+            )
         if self.config.freeze_base_model_for_mtp and self.mtp_num_depths < 1:
             raise ValueError(
                 "freeze_base_model_for_mtp requires the HybridModel architecture "
