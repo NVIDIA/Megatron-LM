@@ -57,4 +57,7 @@ embedding/loss stages, empty Hybrid stages with output deallocation, Hybrid MTP
 with TP/SP, and CP with changing sequence lengths. The test selects the existing
 mHC GPT layer through a custom spec; enabling mHC does not add a new default GPT
 factory path. BF16 CP cases use native FP32 gradient accumulation and the local
-loss-sum/token-count contract for CP-correct normalization.
+loss-sum/token-count contract for CP-correct normalization. Each independent
+parity case starts with a fresh compiler cache so earlier topology/dtype cases
+cannot exhaust the native mHC helpers' recompile budget and trigger eager
+fallback. The PP1 reference and PP2 comparison share that cache within the case.
