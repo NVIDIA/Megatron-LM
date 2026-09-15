@@ -6,7 +6,7 @@ The forward exchange must assemble each home's complete matrices from the per-ra
 shards, and a fwd -> identity -> bwd roundtrip over uneven shapes and homes must
 reproduce the input bit-for-bit. Pure routing properties: a failure is an indexing bug.
 
-Launch with torchrun (the fixtures initialize the torchrun-managed group):
+Launch with torchrun (the shared conftest fixture initializes the torchrun-managed group):
   torchrun --nproc-per-node=4 -m pytest tests/unit_tests/optimizer/test_layer_sharded_a2a.py
 """
 
@@ -15,23 +15,13 @@ import torch
 import torch.distributed as dist
 
 from megatron.core.optimizer.layer_sharded_a2a import route_from_ns_home, route_to_ns_home
-from tests.unit_tests.test_utilities import Utils
 
 _SEED = 42
 
 
 @pytest.fixture(scope="module", autouse=True)
-def _torchrun_dist_init():
-    Utils.initialize_model_parallel()
-    # Utils uses the NCCL backend, so the exchanged tensors must live on this
-    # rank's GPU; defaulting the device keeps every torch.randn in the tests
-    # device-agnostic. (Utils already bound the rank to its device.)
-    if torch.cuda.is_available():
-        torch.set_default_device("cuda")
+def _torchrun_dist_init(layer_sharded_dist_init):
     yield
-    if torch.cuda.is_available():
-        torch.set_default_device("cpu")
-    Utils.destroy_model_parallel()
 
 
 def _world():

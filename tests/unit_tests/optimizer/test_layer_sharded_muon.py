@@ -11,6 +11,7 @@ Launch: torchrun --nproc-per-node=4 -m pytest tests/unit_tests/optimizer/test_la
 """
 
 import os
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -26,7 +27,6 @@ from megatron.core.optimizer.layer_sharded_muon import (
     ParamShardSpec,
 )
 from megatron.core.utils import is_emerging_optimizers_min_version
-from tests.unit_tests.test_utilities import Utils
 
 # Batched (3-D) Newton-Schulz needs emerging-optimizers >= 0.3.0; the per-matrix path
 # runs on any version with the newton_schulz API.
@@ -46,23 +46,15 @@ _MUON_KW = dict(
 
 
 @pytest.fixture(scope="module", autouse=True)
-def _torchrun_dist_init():
-    Utils.initialize_model_parallel()
-    cuda = os.environ.get("TEST_DEVICE", "cuda" if torch.cuda.is_available() else "cpu") == "cuda"
-    if cuda:
-        local_rank = int(os.environ.get("LOCAL_RANK", 0))
-        torch.cuda.set_device(local_rank)
-        torch.set_default_device(f"cuda:{local_rank}")
-    torch.manual_seed(_SEED)
-    # Reference newton_schulz calls run under the ambient precision; pin it to the
-    # optimizer's so the comparisons are exact.
-    prev_prec = torch.get_float32_matmul_precision()
-    torch.set_float32_matmul_precision("highest")
+def _torchrun_dist_init(layer_sharded_dist_init):
     yield
-    torch.set_float32_matmul_precision(prev_prec)
-    if cuda:
-        torch.set_default_device("cpu")
-    Utils.destroy_model_parallel()
+    # Drop the ad-hoc TP / GTP_remat / EGTP subgroups before the shared fixture tears
+    # down the process group.
+    global _TP_GROUP, _GTP_REMAT_GROUP, _EGTP_GROUP
+    for group in (_TP_GROUP, _GTP_REMAT_GROUP, _EGTP_GROUP):
+        if group is not None:
+            dist.destroy_process_group(group)
+    _TP_GROUP = _GTP_REMAT_GROUP = _EGTP_GROUP = None
 
 
 # ---------------------------------------------------------------------------
@@ -142,14 +134,11 @@ def _shard_2d(full, pd, t, g, gtp=True, T=2, G=2):
     return full.clone()
 
 
-class _PGStub:
-    """Duck-typed ProcessGroupCollection: TensorParallelMuon only reads these fields."""
-
-    def __init__(self, gtp_remat=None, expt_gtp_remat=None, tp=None, expt_tp=None):
-        self.gtp_remat = gtp_remat
-        self.expt_gtp_remat = expt_gtp_remat
-        self.tp = tp
-        self.expt_tp = expt_tp
+def _pg_stub(**groups):
+    """Duck-typed ProcessGroupCollection: TensorParallelMuon only reads these four fields."""
+    fields = dict(gtp_remat=None, expt_gtp_remat=None, tp=None, expt_tp=None)
+    fields.update(groups)
+    return SimpleNamespace(**fields)
 
 
 _TP_GROUP = None
@@ -246,7 +235,7 @@ def test_step_matches_duplicated_mode(case):
     for p in params:
         if pad:
             p.pad_length = pad
-    extra = {"pg_collection": _PGStub(gtp_remat=_world())} if c["homes"] is None else {}
+    extra = {"pg_collection": _pg_stub(gtp_remat=_world())} if c["homes"] is None else {}
     opt = _muon(params, momentum=momentum, nesterov=nesterov, gtp_remat_group=_world(), **extra)
     if c["homes"] == "even":
         opt.set_param_ns_homes({id(p): (i % S, 0) for i, p in enumerate(params)})
