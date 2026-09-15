@@ -602,6 +602,10 @@ def _get_megatron_optimizer_based_on_param_groups(
                             if config is None or not config.use_precision_aware_optimizer:
                                 opt.state[p]['exp_avg'] = torch.zeros_like(p.data)
                                 opt.state[p]['exp_avg_sq'] = torch.zeros_like(p.data)
+                            elif is_te_min_version("2.1.0.dev0"):
+                                opt.initialize_state(
+                                    p, opt.store_param_remainders and p.dtype == torch.bfloat16
+                                )
                             else:
                                 opt.initialize_state(p)
 

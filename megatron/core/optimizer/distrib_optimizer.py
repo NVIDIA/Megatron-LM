@@ -6,6 +6,7 @@ import gc
 import itertools
 import logging
 from collections import ChainMap
+from copy import deepcopy
 from dataclasses import replace
 from logging import getLogger
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -833,6 +834,38 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         }
         return dtype_map.get(key, torch.float32)
 
+    def _can_reuse_precision_aware_checkpoint_state(self):
+        """Whether unscaled checkpoint tensors alias the final TE optimizer state.
+
+        FP32 moments and masters (or raw int16 BF16 master remainders) need no
+        conversion. Other representations still require TE's public loader, as do
+        custom optimizer subclasses and optimizers with registered load hooks.
+        """
+        return (
+            USING_TE_OPTIMIZER
+            and type(self.optimizer) is Adam
+            and self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8
+            and self.config.exp_avg_dtype == torch.float32
+            and self.config.exp_avg_sq_dtype == torch.float32
+            and self.config.main_params_dtype == torch.float32
+            and callable(self.init_state_fn)
+            and not self.optimizer._optimizer_load_state_dict_pre_hooks
+            and not self.optimizer._optimizer_load_state_dict_post_hooks
+        )
+
+    def _load_optimizer_param_groups_without_state(self, state_dict_param_groups):
+        """Restore already matched group metadata without recasting live TE state."""
+        restored_groups = deepcopy(state_dict_param_groups)
+        for current_group, restored_group in zip(
+            self.optimizer.param_groups, restored_groups, strict=True
+        ):
+            restored_group["params"] = current_group["params"]
+            if "param_names" in current_group and "param_names" not in restored_group:
+                restored_group["param_names"] = current_group["param_names"]
+        self.optimizer.__setstate__(
+            {"state": self.optimizer.state, "param_groups": restored_groups}
+        )
+
     def state_dict(self):
         """
         The state dict contains all non-DP-rank-dependent (i.e., non-parameter-
@@ -938,6 +971,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         if len(self.optimizer.state) == 0:
             if isinstance(self.optimizer, HybridDeviceOptimizer):
                 self.optimizer.dummy_step()
+            elif self._can_reuse_precision_aware_checkpoint_state():
+                # Allocate the final state once, for DCP to overwrite in place.
+                self.init_state_fn(self.optimizer, self.config)
 
         # Get the Torch optimizer's state dict.
         # - This 'inner' optimizer at this point is unallocated, and only
@@ -1053,10 +1089,14 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 for v in self.optimizer.state.values():
                     v["step"] = step.detach().clone()
 
-        # Optimizer.
-        self.optimizer.load_state_dict(
-            {"state": state_dict_state, "param_groups": state_dict_param_groups}
-        )
+        # TE's public loader casts through PyTorch and then rebuilds the state.
+        # Avoid those temporary copies when the live tensors are valid DCP targets.
+        if self._can_reuse_precision_aware_checkpoint_state():
+            self._load_optimizer_param_groups_without_state(state_dict_param_groups)
+        else:
+            self.optimizer.load_state_dict(
+                {"state": state_dict_state, "param_groups": state_dict_param_groups}
+            )
 
         # Grad scaler.
         if 'grad_scaler' not in state_dict:
