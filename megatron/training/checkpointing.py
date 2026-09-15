@@ -57,7 +57,7 @@ from megatron.training.global_vars import get_tokenizer
 from ..core.dist_checkpointing.utils import _clean_metadata_for_serialization
 from . import ft_integration, wandb_utils
 from .async_utils import get_save_and_finalize_callbacks, is_empty_async_queue, schedule_async_save
-from .global_vars import get_args
+from .global_vars import get_args, get_full_config
 from .one_logger_utils import on_save_checkpoint_start, on_save_checkpoint_success
 from .utils import append_to_progress_log, is_last_rank, print_rank_0, print_rank_last, warn_rank_0
 
