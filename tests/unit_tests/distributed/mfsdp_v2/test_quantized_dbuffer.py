@@ -52,8 +52,6 @@ def test_quantized_dbuffer_quantization_matches_te(distributed_setup):
             data.shape[0] // 32,
             data.shape[1],
         )
-        if data.numel() == 0:
-            continue
         reference = MXFP8Quantizer(tex.DType.kFloat8E4M3)(main_weight.get_local_tensor(index))
         for plane, view, expected in zip(
             grouped.planes,
@@ -77,6 +75,18 @@ def test_quantized_dbuffer_quantization_matches_te(distributed_setup):
                 actual, expected[: actual.shape[0], : actual.shape[1]], rtol=0, atol=0
             )
 
+
+def test_quantized_dbuffer_get_local_tensor_supports_gemm(distributed_setup):
+    """Compute tensors prepare gathered scales for rowwise and columnwise GEMMs."""
+    mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
+    shapes = [(128, 128), (128, 128), (64, 64), (32, 64)]
+    grouped = QuantizedDBuffer(mesh, [BlockAtomic(32)], shapes, distributed_setup.device)
+    main_weight = DBuffer.empty(
+        mesh, [BlockAtomic(32)], shapes, torch.float32, distributed_setup.device, block_size=32
+    )
+    torch.manual_seed(1234 + distributed_setup.rank)
+    main_weight.local_buffer.normal_()
+    grouped.quantize_(main_weight)
     gathered = grouped.redistribute([Replicate()])
     gathered_main = main_weight.redistribute([Replicate()])
     quantizer = MXFP8Quantizer(tex.DType.kFloat8E4M3)
