@@ -326,9 +326,15 @@ class TestMHCTEGraphs:
             }
             return output.detach().clone(), hidden.grad.detach().clone(), grads
 
-        # Warm up the actual eager model path before TE's own warmup/capture.
-        for _ in range(3):
-            step(graphed, inputs[0])
+        # Warm up off the default stream, as TE does for its own warmup. Retained
+        # AccumulateGrad nodes must not pull the default stream into capture.
+        warmup_stream = torch.cuda.Stream()
+        warmup_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(warmup_stream):
+            for _ in range(3):
+                step(graphed, inputs[0])
+        torch.cuda.current_stream().wait_stream(warmup_stream)
+        graphed.zero_grad(set_to_none=True)
         self.helper = TECudaGraphHelper([graphed], config, 32, 2, pg_collection=pg)
         expected = list(graphed.decoder.layers)
         for mtp in getattr(getattr(graphed, 'mtp', None), 'layers', []):
