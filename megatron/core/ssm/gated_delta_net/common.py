@@ -61,6 +61,7 @@ class _TorchL2Norm(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, x, eps):
+        """Normalize in FP32 and save the rounded output used by FLA's backward."""
         x_float = x.float()
         rstd = 1.0 / torch.sqrt((x_float * x_float).sum(dim=-1, keepdim=True) + eps)
         y = (x_float * rstd).to(x.dtype)
@@ -69,6 +70,7 @@ class _TorchL2Norm(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dy):
+        """Apply the saved-output gradient formula in FP32."""
         y, rstd = ctx.saved_tensors
         y_float, dy_float = y.float(), dy.float()
         dx = dy_float * rstd - (dy_float * y_float).sum(dim=-1, keepdim=True) * y_float * rstd
