@@ -807,6 +807,12 @@ if HAVE_TE:
                 fp8_format=fp8_format,
                 override_linear_precision=(False, False, not config.fp8_wgrad),
             )
+
+        # Set recipe attrs
+        if fp8_recipe is not None and config.fp8_recipe_attrs is not None:
+            for key, val in config.fp8_recipe_attrs.items():
+                setattr(fp8_recipe, key, val)
+
         return fp8_recipe
 
     def get_fp8_recipe_for_a2a(a2a_dtype: str):
