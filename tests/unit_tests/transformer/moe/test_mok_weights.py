@@ -55,6 +55,8 @@ def test_mxfp8_shared_expert_config_expresses_bf16_module(monkeypatch, recwarn):
     "overrides",
     [
         {},
+        {"moe_shared_expert_gate": True},
+        {"moe_shared_expert_gate": True, "moe_layer_recompute": True},
         {
             "fp8": "hybrid",
             "fp8_recipe": "mxfp8",
@@ -81,6 +83,23 @@ def test_mok_accepts_key_supported_configurations(overrides):
         ),
         ({"gradient_accumulation_fusion": False}, "gradient_accumulation_fusion=True"),
         ({"fp8": "hybrid", "fp8_recipe": "mxfp8", "fp8_param": False}, "fp8_param=True"),
+        (
+            {
+                "fp8": "hybrid",
+                "fp8_recipe": "mxfp8",
+                "fp8_param": True,
+                "moe_shared_expert_gate": True,
+            },
+            "output gate requires BF16 routed experts",
+        ),
+        (
+            {
+                "moe_shared_expert_gate": True,
+                "moe_shared_expert_overlap": True,
+                "moe_token_dispatcher_type": "alltoall",
+            },
+            "does not support MCore shared-expert overlap",
+        ),
     ],
 )
 def test_mok_rejects_key_incompatible_configurations(overrides, error):

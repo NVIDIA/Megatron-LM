@@ -10,6 +10,9 @@ import torch
 from megatron.core.transformer.moe.megakernel.parameter_bridge import (
     finish_weight_gradient as _finish_weight_gradient,
 )
+from megatron.core.transformer.moe.megakernel.parameter_bridge import (
+    main_grad_buffer as _main_grad_buffer,
+)
 
 if TYPE_CHECKING:
     from megatron.core.transformer.moe.megakernel.mok.backend import MoKMegakernel
@@ -58,6 +61,7 @@ class _MoKAutograd(torch.autograd.Function):
         x: torch.Tensor,
         router_weights: torch.Tensor,
         top_experts: torch.Tensor,
+        shared_output_gate_weight: torch.Tensor | None,
         *parameters: torch.Tensor,
     ) -> torch.Tensor:
         """Run MOK forward and retain the state needed by backward."""
@@ -95,6 +99,9 @@ class _MoKAutograd(torch.autograd.Function):
         shared_gate, shared_up, routed_gate, routed_up = _gate_up_weight_arguments(
             shared_fc1, fc1_forward, module.intermediate_size
         )
+        gate_kwargs = {}
+        if shared_output_gate_weight is not None:
+            gate_kwargs["shared_output_gate_weight"] = shared_output_gate_weight
         output, forward_context = functional.forward(
             module.mok_config,
             workspace,
@@ -108,6 +115,7 @@ class _MoKAutograd(torch.autograd.Function):
             routed_up,
             fc2_forward,
             swiglu_limit=module.swiglu_limit,
+            **gate_kwargs,
         )
 
         ctx.module = module
@@ -115,7 +123,9 @@ class _MoKAutograd(torch.autograd.Function):
         ctx.schedule = schedule
         ctx.forward_context = forward_context
         ctx.routed_weight_views = (fc1_weight_view, fc2_weight_view)
-        ctx.save_for_backward(x, router_weights, *routed_parameters, shared_fc1, shared_fc2)
+        ctx.save_for_backward(
+            x, router_weights, shared_output_gate_weight, *routed_parameters, shared_fc1, shared_fc2
+        )
         return output
 
     @staticmethod
@@ -123,7 +133,7 @@ class _MoKAutograd(torch.autograd.Function):
         """Run MOK backward and return gradients for its autograd inputs."""
         from mok import functional
 
-        x, router_weights, *parameters = ctx.saved_tensors
+        x, router_weights, shared_output_gate_weight, *parameters = ctx.saved_tensors
         num_routed_parameters = len(ctx.module.autograd_routed_parameters)
         shared_fc1, shared_fc2 = parameters[num_routed_parameters:]
         fc1_weight_view, fc2_weight_view = ctx.routed_weight_views
@@ -142,6 +152,15 @@ class _MoKAutograd(torch.autograd.Function):
         main_grads, main_grad_storage_tables = _gate_up_main_grad_arguments(
             main_grads, main_grad_storage_tables, ctx.module.intermediate_size
         )
+        gate_kwargs = {}
+        if shared_output_gate_weight is not None:
+            gate_main_grad = _main_grad_buffer(ctx.module.shared_output_gate_weight)
+            if gate_main_grad.dtype != torch.float32:
+                raise RuntimeError("MOK shared output gate requires FP32 main_grad")
+            gate_kwargs = {
+                "shared_output_gate_weight": shared_output_gate_weight,
+                "shared_output_gate_main_grad": gate_main_grad,
+            }
         d_x, d_router_weights, *_ = functional.backward(
             ctx.module.mok_config,
             ctx.workspace,
@@ -159,11 +178,17 @@ class _MoKAutograd(torch.autograd.Function):
             swiglu_limit=ctx.module.swiglu_limit,
             main_grads=main_grads,
             main_grad_storage_tables=main_grad_storage_tables,
+            **gate_kwargs,
         )
 
         routed_parameter_grads = ctx.module.finish_routed_weight_gradients()
         d_shared_fc1 = _finish_weight_gradient(ctx.module.shared_fc1_weight)
         d_shared_fc2 = _finish_weight_gradient(ctx.module.shared_fc2_weight)
+        d_output_gate = (
+            _finish_weight_gradient(ctx.module.shared_output_gate_weight)
+            if shared_output_gate_weight is not None
+            else None
+        )
 
         ctx.module = None
         ctx.workspace = None
@@ -175,6 +200,7 @@ class _MoKAutograd(torch.autograd.Function):
             d_x,
             d_router_weights,
             None,
+            d_output_gate,
             *routed_parameter_grads,
             d_shared_fc1,
             d_shared_fc2,
