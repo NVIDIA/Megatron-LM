@@ -31,6 +31,7 @@ from megatron.core.tokenizers.text.parsers import PARSER_MAPPING
 from ..incremental_detokenizer import HuggingFaceFastIncrementalDetokenizer
 from ..openai_streaming import (
     StreamingChatParser,
+    detokenize_top_n_keys,
     json_safe_logprobs,
     json_safe_top_n_logprobs,
     openai_stream,
@@ -1234,7 +1235,7 @@ try:
 
                 # Get top_n_logprobs if available
                 generated_top_n_logprobs = json_safe_top_n_logprobs(
-                    result.get('generated_top_n_logprobs') or []
+                    detokenize_top_n_keys(result.get('generated_top_n_logprobs') or [], tokenizer)
                 )
 
                 logprobs_content = []
@@ -1242,7 +1243,8 @@ try:
                     # Build top_logprobs list for this token position
                     top_logprobs_list = []
                     if generated_top_n_logprobs and i < len(generated_top_n_logprobs):
-                        top_n_dict = generated_top_n_logprobs[i]
+                        # A position with no top-n entry arrives as None, not {}.
+                        top_n_dict = generated_top_n_logprobs[i] or {}
                         for token_str, logprob in top_n_dict.items():
                             top_logprobs_list.append(
                                 {
