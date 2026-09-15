@@ -72,7 +72,13 @@ def test_chunked_transport_owns_external_metadata_and_waits_before_finish(
     for returned_event in (None, SimpleNamespace(event=None, current_stream_wait=Mock()), event):
         buffer.dispatch.return_value = (hidden, None, None, None, None, returned_event)
         buffer.combine.return_value = (hidden, None, returned_event)
+        buffer.get_dispatch_layout.return_value = (None, None, None, None, event)
         for submit, args in (
+            (dispatcher.submit_deepep_combine_prepared, (hidden, state["handle"])),
+            (
+                dispatcher.submit_deepep_dispatch,
+                (hidden, state["recv_probs"], state["recv_indices"]),
+            ),
             (dispatcher.submit_deepep_combine_backward, (hidden, state["handle"])),
             (dispatcher.submit_deepep_dispatch_backward, (hidden, None, state["handle"])),
         ):

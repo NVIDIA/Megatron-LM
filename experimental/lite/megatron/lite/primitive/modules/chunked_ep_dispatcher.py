@@ -39,16 +39,9 @@ def _event_current_stream_wait(event) -> None:
         torch.cuda.current_stream().wait_event(event)
 
 
-def _require_backward_event(event):
+def _require_completion_event(event):
     if not _event_is_waitable(event):
-        raise RuntimeError("DeepEP async backward requires a completion event")
-
-
-def _record_current_stream_event_if_unwaitable(event, tensor: torch.Tensor):
-    if not _event_is_waitable(event) and torch.cuda.is_available() and tensor.is_cuda:
-        event = torch.cuda.Event()
-        event.record(torch.cuda.current_stream(tensor.device))
-    return event
+        raise RuntimeError("DeepEP async transport requires a completion event")
 
 
 class ChunkedDispatcher(_BaseDispatcher):
@@ -82,7 +75,7 @@ class ChunkedDispatcher(_BaseDispatcher):
             if len(combined) >= 3:
                 event = combined[2]
             combined = combined[0]
-        event = _record_current_stream_event_if_unwaitable(event, rank_grouped)
+        _require_completion_event(event)
         return {
             "combined": combined,
             "event": event,
@@ -106,7 +99,7 @@ class ChunkedDispatcher(_BaseDispatcher):
             async_finish=True,
             allocate_on_comm_stream=allocate_on_comm_stream,
         )
-        _require_backward_event(event)
+        _require_completion_event(event)
         return {"grad_rank_grouped": grad_rank_grouped, "event": event}
 
     def finish_deepep_combine_backward(self, state):
@@ -130,7 +123,7 @@ class ChunkedDispatcher(_BaseDispatcher):
             async_finish=True,
             allocate_on_comm_stream=allocate_on_comm_stream,
         )
-        _require_backward_event(event)
+        _require_completion_event(event)
         return {"grad_hidden": grad_hidden, "grad_topk_scores": grad_topk_scores, "event": event}
 
     def finish_deepep_dispatch_backward(self, state):
@@ -178,7 +171,7 @@ class ChunkedDispatcher(_BaseDispatcher):
                 allocate_on_comm_stream=allocate_on_comm_stream,
             )
         )
-        event = _record_current_stream_event_if_unwaitable(event, hidden_states_contig)
+        _require_completion_event(event)
         return {
             "_dispatch_inputs": (
                 hidden_states_contig,
