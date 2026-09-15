@@ -1,5 +1,4 @@
 # Copyright (c) 2023-2026, NVIDIA CORPORATION. All rights reserved.
-from dataclasses import replace
 from functools import partial
 
 from megatron.core.extensions.transformer_engine import (
@@ -10,6 +9,7 @@ from megatron.core.extensions.transformer_engine import (
     TENorm,
     TERowParallelLinear,
 )
+from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.models.gpt.moe_module_specs import (
     get_inference_optimized_moe_spec,
@@ -31,12 +31,21 @@ from megatron.core.tensor_parallel import (
 )
 from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
 from megatron.core.transformer.enums import AttnMaskType
-from megatron.core.transformer.experimental_attention_variant import (
-    deepseek_v4_hybrid_attention_module_specs as dsv4_module_specs,
-)
 from megatron.core.transformer.experimental_attention_variant.absorbed_mla import (
     AbsorbedMLASelfAttention,
     AbsorbedMLASelfAttentionSubmodules,
+)
+from megatron.core.transformer.experimental_attention_variant.csa import (
+    CompressedSparseAttention,
+    CompressedSparseAttentionSubmodules,
+    Compressor,
+    CompressorSubmodules,
+    CSAIndexer,
+    CSAIndexerSubmodules,
+)
+from megatron.core.transformer.experimental_attention_variant.deepseek_v4_hybrid_attention import (
+    DSv4HybridSelfAttention,
+    DSv4HybridSelfAttentionSubmodules,
 )
 from megatron.core.transformer.experimental_attention_variant.dsa import (
     DSAIndexer,
@@ -58,7 +67,6 @@ from megatron.core.transformer.multi_token_prediction import (
     MultiTokenPredictionLayerSubmodules,
 )
 from megatron.core.transformer.spec_utils import ModuleSpec
-from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import (
     MoETransformerLayer,
     TransformerLayer,
@@ -74,6 +82,18 @@ moe = get_moe_module_spec(
 
 # Inference-optimized MoE spec
 moe_inference = get_inference_optimized_moe_spec()
+
+_csa_compressor = partial(
+    Compressor,
+    submodules=CompressorSubmodules(linear_wkv=TELinear, linear_wgate=TELinear, norm=TENorm),
+)
+_csa_indexer = partial(
+    CSAIndexer,
+    submodules=CSAIndexerSubmodules(
+        linear_wq_b=TELinear, linear_weights_proj=TELinear, compressor=_csa_compressor
+    ),
+)
+_csa_qk_norm = TESpecProvider().layer_norm(for_qk=True)
 
 
 # MTP block spec - provides norms and projection only.
@@ -192,6 +212,32 @@ hybrid_stack_spec = ModuleSpec(
                         q_layernorm=IdentityOp,
                         kv_layernorm=IdentityOp,
                     ),
+                ),
+                self_attn_bda=get_bias_dropout_add,
+            ),
+        ),
+        csa_layer=ModuleSpec(
+            module=TransformerLayer,
+            submodules=TransformerLayerSubmodules(
+                input_layernorm=TENorm,
+                self_attention=ModuleSpec(
+                    module=DSv4HybridSelfAttention,
+                    params={"attn_mask_type": AttnMaskType.causal},
+                    submodules=DSv4HybridSelfAttentionSubmodules(
+                        linear_q_down_proj=TELinear,
+                        linear_q_up_proj=TEColumnParallelLinear,
+                        linear_kv_proj=TEColumnParallelLinear,
+                        core_attention=partial(
+                            CompressedSparseAttention,
+                            submodules=CompressedSparseAttentionSubmodules(
+                                compressor=_csa_compressor, indexer=_csa_indexer
+                            ),
+                        ),
+                        linear_proj=TERowParallelLinear,
+                        q_layernorm=_csa_qk_norm,
+                        kv_layernorm=_csa_qk_norm,
+                    ),
+                    metainfo={"fuse_input_layernorm": False},
                 ),
                 self_attn_bda=get_bias_dropout_add,
             ),
@@ -487,26 +533,5 @@ gdp_stack_spec = gated_delta_product_stack_spec
 gdp_inference_stack_spec = gated_delta_product_inference_stack_spec
 
 
-def hybrid_dsv4_stack_spec(config: TransformerConfig) -> ModuleSpec:
-    """Build a HybridStack with DSv4 C/H/W attention layers."""
-    assert (
-        config.transformer_impl == "transformer_engine"
-    ), "DSv4 HybridModel currently supports only the transformer-engine implementation."
-
-    from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
-
-    dsv4_attention = dsv4_module_specs.get_dsv4_hybrid_module_spec_for_backend(
-        config=config, backend=TESpecProvider()
-    )
-
-    dsv4_layer = ModuleSpec(
-        module=TransformerLayer,
-        submodules=TransformerLayerSubmodules(
-            input_layernorm=TENorm,
-            self_attention=dsv4_attention,
-            self_attn_bda=get_bias_dropout_add,
-        ),
-    )
-
-    submodules = replace(hybrid_stack_spec.submodules, csa_layer=dsv4_layer)
-    return replace(hybrid_stack_spec, submodules=submodules)
+# Preserve the existing --spec import path; C/H/W use the standard static stack spec.
+hybrid_dsv4_stack_spec = hybrid_stack_spec

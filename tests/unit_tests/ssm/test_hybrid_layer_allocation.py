@@ -336,12 +336,18 @@ class TestParseHybridPattern:
             ("MMMM/*M/*M/*M", "MMMM", "*M", 3),
             ("M*/*/*/*", "M*", "*", 3),
             ("M/M/M/M/M", "M", "M", 4),
+            ("C-H-/W-/W-", "C-H-", "W-", 2),
         ]
         for pattern, expected_main, expected_mtp, expected_depths in test_cases:
             result = parse_hybrid_pattern(pattern)
             assert result.main_pattern == expected_main, f"Failed for pattern: {pattern}"
             assert result.mtp_pattern == expected_mtp, f"Failed for pattern: {pattern}"
             assert result.mtp_num_depths == expected_depths, f"Failed for pattern: {pattern}"
+
+    @pytest.mark.parametrize("pattern", ["*-/C-", "C-/*-"])
+    def test_rejects_standard_and_mla_attention_across_main_and_mtp(self, pattern):
+        with pytest.raises(ValueError, match="both Attention and MLA/DSA/CSA/HCA/Window"):
+            parse_hybrid_pattern(pattern)
 
     def test_pipe_with_mtp(self):
         """Test patterns with both pipe and MTP separators."""

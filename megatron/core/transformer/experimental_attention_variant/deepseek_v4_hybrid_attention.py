@@ -22,6 +22,7 @@ from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.experimental_attention_variant.csa import (
     CompressedSparseAttentionBuilder,
 )
+from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_config import MLATransformerConfig
@@ -84,6 +85,17 @@ class DSv4HybridAttention(Attention):
 
         if pg_collection is None:
             raise ValueError("DSv4 hybrid attention requires an explicit ProcessGroupCollection.")
+
+        if config.experimental_attention_variant != "dsv4_hybrid":
+            raise ValueError(
+                "DSv4 attention requires experimental_attention_variant='dsv4_hybrid' "
+                "so the config validates and derives DSv4 projection dimensions."
+            )
+        assert config.multi_latent_attention, "Currently only MLA supports sparse attention."
+        assert config.qk_l2_norm is False, "qk_l2_norm is not supported with MLA."
+        assert (
+            config.transformer_impl == "transformer_engine"
+        ), "DSv4 HybridModel currently supports only the transformer-engine implementation."
 
         super().__init__(
             config=config,
@@ -424,7 +436,7 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
         is_mtp_layer: bool = False,
         compress_ratio: Optional[int] = None,
         name: str | None = None,
-    ):
+    ) -> None:
         super().__init__(
             config=config,
             submodules=submodules,
@@ -492,17 +504,20 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
             pg_collection=self.pg_collection,
             name=(name + ".linear_kv_proj") if name is not None else None,
         )
-        self.kv_layernorm = submodules.kv_layernorm(
-            hidden_size=self.config.v_head_dim,
-            config=self.config,
-            eps=self.config.attention_latent_norm_epsilon,
-        )
-
-        self.q_layernorm = submodules.q_layernorm(
-            hidden_size=self.config.q_lora_rank,
-            config=self.config,
-            eps=self.config.attention_latent_norm_epsilon,
-        )
+        if self.config.qk_layernorm:
+            self.kv_layernorm = submodules.kv_layernorm(
+                hidden_size=self.config.v_head_dim,
+                config=self.config,
+                eps=self.config.attention_latent_norm_epsilon,
+            )
+            self.q_layernorm = submodules.q_layernorm(
+                hidden_size=self.config.q_lora_rank,
+                config=self.config,
+                eps=self.config.attention_latent_norm_epsilon,
+            )
+        else:
+            self.kv_layernorm = IdentityOp()
+            self.q_layernorm = IdentityOp()
 
     def get_query_key_value_tensors(
         self,

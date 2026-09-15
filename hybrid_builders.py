@@ -21,8 +21,8 @@ def hybrid_builder(args, pre_process, post_process, vp_stage=None, config=None, 
         ), "inference_fuse_tp_communication is not supported for HybridModel"
     elif args.spec is not None:
         hybrid_stack_spec = import_module(args.spec)
-        if callable(hybrid_stack_spec) and not isinstance(hybrid_stack_spec, ModuleSpec):
-            hybrid_stack_spec = hybrid_stack_spec(config)
+        if not isinstance(hybrid_stack_spec, ModuleSpec):
+            raise TypeError("--spec must refer to a static ModuleSpec for HybridModel.")
     else:
         raise ValueError("You must provide a valid hybrid layer spec via --spec")
 

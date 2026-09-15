@@ -1,5 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
+from dataclasses import replace
 from functools import partial
 from unittest.mock import patch
 
@@ -268,26 +269,54 @@ def test_config_accepts_hybrid_model_ratio_tail():
     assert config.csa_compress_ratios == [0, 4, 128, 4]
 
 
-def test_hybrid_stack_spec_uses_one_ratio_agnostic_spec_without_mutating_base_spec():
-    """Each config-aware build gets one private DSv4 spec; layer configs provide ratios."""
+def test_hybrid_stack_spec_uses_one_static_ratio_agnostic_spec():
+    """C/H/W share one static attention spec; layer configs provide their ratios."""
     from megatron.core.models.hybrid.hybrid_layer_specs import (
         hybrid_dsv4_stack_spec,
         hybrid_stack_spec,
     )
+    from megatron.core.transformer.experimental_attention_variant.deepseek_v4_hybrid_attention import (
+        DSv4HybridSelfAttention,
+    )
+    from megatron.core.transformer.spec_utils import ModuleSpec
 
-    first = hybrid_dsv4_stack_spec(_make_config())
-    second = hybrid_dsv4_stack_spec(_make_config())
-    baseline = hybrid_stack_spec.submodules
+    assert isinstance(hybrid_dsv4_stack_spec, ModuleSpec)
+    assert hybrid_dsv4_stack_spec is hybrid_stack_spec
+    attention = hybrid_stack_spec.submodules.csa_layer.submodules.self_attention
+    assert attention.module is DSv4HybridSelfAttention
+    assert "compress_ratio" not in attention.params
 
-    assert first.submodules is not baseline
-    assert second.submodules is not first.submodules
-    assert first.submodules.dsa_layer is baseline.dsa_layer
-    assert first.submodules.mla_layer is baseline.mla_layer
 
-    first_attention = first.submodules.csa_layer.submodules.self_attention
-    second_attention = second.submodules.csa_layer.submodules.self_attention
-    assert "compress_ratio" not in first_attention.params
-    assert first_attention is not second_attention
+@pytest.mark.parametrize("variant", [None, "dsa"])
+@pytest.mark.parametrize("entrypoint", ["hybrid_stack", "attention"])
+def test_dsv4_construction_rejects_incompatible_variant_before_backend_work(variant, entrypoint):
+    from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_dsv4_stack_spec
+    from megatron.core.transformer.attention import Attention
+    from megatron.core.transformer.experimental_attention_variant.deepseek_v4_hybrid_attention import (
+        DSv4HybridSelfAttention,
+    )
+    from megatron.core.transformer.spec_utils import build_module
+
+    config = replace(_make_config(), experimental_attention_variant=variant)
+    with (
+        patch.object(Attention, "__init__", return_value=None) as attention_init,
+        pytest.raises(ValueError, match="DSv4 attention requires.*dsv4_hybrid"),
+    ):
+        if entrypoint == "hybrid_stack":
+            build_module(
+                hybrid_dsv4_stack_spec.submodules.csa_layer.submodules.self_attention,
+                config=config,
+                layer_number=1,
+                pg_collection=ProcessGroupCollection(),
+            )
+        else:
+            DSv4HybridSelfAttention(
+                config=config,
+                submodules=None,
+                layer_number=1,
+                pg_collection=ProcessGroupCollection(),
+            )
+    attention_init.assert_not_called()
 
 
 def _build_cpu_attention_for_ratio_resolution(monkeypatch, config, explicit_ratio=None):
@@ -370,10 +399,11 @@ def test_constructor_requires_explicit_process_groups():
 
 
 def _build_attention(config, layer_number, pg_collection, **kwargs):
-    """Instantiate a DSv4HybridSelfAttention from config."""
+    """Instantiate DSv4 attention through HybridModel's static spec."""
+    from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
     from megatron.core.transformer.spec_utils import build_module
 
-    spec = _make_attention_spec(config)
+    spec = hybrid_stack_spec.submodules.csa_layer.submodules.self_attention
     return build_module(
         spec, config=config, layer_number=layer_number, pg_collection=pg_collection, **kwargs
     )
@@ -402,6 +432,7 @@ class TestDSv4HybridAttentionConstructor:
         from megatron.core.transformer.experimental_attention_variant.deepseek_v4_hybrid_attention import (
             DSv4HybridSelfAttention,
         )
+        from megatron.core.transformer.identity_op import IdentityOp
 
         torch.manual_seed(_SEED)
         model_parallel_cuda_manual_seed(_SEED)
@@ -417,8 +448,11 @@ class TestDSv4HybridAttentionConstructor:
         assert hasattr(attn, 'linear_proj')
         assert hasattr(attn, 'linear_o_group_proj')
         assert hasattr(attn, 'core_attention')
-        assert hasattr(attn, 'q_layernorm')
-        assert hasattr(attn, 'kv_layernorm')
+        assert isinstance(attn.q_layernorm, IdentityOp)
+        assert isinstance(attn.kv_layernorm, IdentityOp)
+        assert not any(
+            key.startswith(("q_layernorm.", "kv_layernorm.")) for key in attn.state_dict()
+        )
 
     def test_latent_norm_epsilon_is_scoped_to_q_and_kv_latents(self):
         """The dedicated epsilon must not change the compressor norm."""
@@ -433,6 +467,8 @@ class TestDSv4HybridAttentionConstructor:
 
         assert attn.q_layernorm.eps == pytest.approx(1e-6)
         assert attn.kv_layernorm.eps == pytest.approx(1e-6)
+        assert attn.state_dict()["q_layernorm.weight"].shape == (config.q_lora_rank,)
+        assert attn.state_dict()["kv_layernorm.weight"].shape == (config.v_head_dim,)
         assert attn.core_attention.compressor.norm.eps == pytest.approx(1e-5)
 
     def test_q_head_dim_equals_v_head_dim(self):

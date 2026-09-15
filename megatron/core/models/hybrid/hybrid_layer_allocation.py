@@ -243,6 +243,8 @@ def parse_hybrid_pattern(pattern: Optional[str]) -> ParsedHybridPattern:
             )
 
     _validate_pattern(mtp_pattern)
+    # Decoder and MTP share the model's MLA mode and positional embeddings.
+    _validate_pattern(main_pattern + mtp_pattern, allow_pipe=True)
 
     return ParsedHybridPattern(
         main_pattern=main_pattern if main_pattern else None,

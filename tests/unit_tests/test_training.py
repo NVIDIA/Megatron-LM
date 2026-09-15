@@ -7,9 +7,9 @@ from types import SimpleNamespace
 import torch
 
 from megatron.core.tokenizers.utils.build_tokenizer import vocab_size_with_padding
-from megatron.training.argument_utils import _normalize_dsv4_hybrid_csa_compress_ratios
 from megatron.training.checkpointing import save_grads
 from megatron.training.global_vars import set_args
+from megatron.training.models.deepseek_v4 import normalize_dsv4_hybrid_csa_compress_ratios
 from megatron.training.training import (
     _get_indexer_logging_layer_counts,
     build_train_valid_test_data_iterators,
@@ -109,7 +109,7 @@ def test_indexer_logging_uses_normalized_hybrid_layer_positions():
     )
     config_kwargs = {}
 
-    _normalize_dsv4_hybrid_csa_compress_ratios(args, config_kwargs, args.hybrid_layer_pattern)
+    normalize_dsv4_hybrid_csa_compress_ratios(args, config_kwargs, args.hybrid_layer_pattern)
 
     expected_ratios = [0, 0, 4, 128, 0, 4, 128, 0, 4]
     assert args.csa_compress_ratios == expected_ratios
