@@ -478,7 +478,13 @@ class TestMtpCommitPassPrefill:
         assert _row_ids(meta.chunk_boundary_hidden) == [3]
 
     def test_boundary_hidden_is_cleared_when_no_chunk_is_in_flight(self):
-        """A finished chunk must not leave a boundary a later request could match."""
+        """A finished chunk must not leave a boundary a later request could match.
+
+        The carry belongs to request 7, which is not in this step's batch -- the case where no
+        one consumes it. Request 42 seeds a fresh prompt alongside, so the step still runs a
+        real commit pass. The carry for a request that IS present is covered by the continuation
+        scenarios, which consume it at its recorded seam before this same clear.
+        """
         context = _make_context(
             prefill_query_lengths=(4,),
             prefill_kv_offsets=(0,),
@@ -487,7 +493,7 @@ class TestMtpCommitPassPrefill:
         )
         model = _make_model()
         controller = _make_controller(context, model)
-        _seed_carry(context, req_id=42, position=3)
+        _seed_carry(context, req_id=7, position=3)
 
         controller._mtp_commit_pass(
             context,
@@ -1574,7 +1580,9 @@ class TestMtpKvCacheCombinations:
         # 3. Draft writes: one setup+advance per forward, positions strictly +1 per depth.
         assert context._mtp_setup_decode_step.call_count == num_mtp_depths + 1
         assert context.mtp_metadata.advance_decode_step.call_count == num_mtp_depths + 1
-        context.mtp_metadata.end_forward.assert_called_once()
+        # One `end_forward` closes each MTP forward phase: the draft loop always, plus the
+        # commit pass whenever it had rows to write (one `_mtp_setup_prefill_step` per forward).
+        assert context.mtp_metadata.end_forward.call_count == 1 + len(context.setup_prefill_calls)
         positions = state["positions"]
         assert positions[0] == (base_position - 1).cpu().tolist()
         for earlier, later in zip(positions, positions[1:]):

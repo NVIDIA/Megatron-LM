@@ -520,7 +520,14 @@ class TestMtpPrefillBookkeeping:
 
     @staticmethod
     def _block_table(context, block_rows):
-        """Build the GPU block table argument the controller passes in."""
+        """Build the GPU block table argument the controller passes in.
+
+        Also declares `len(block_rows)` active requests on the context: `_mtp_setup_prefill_step`
+        reads `request_matched_prefix_blocks` over the active slice to keep writes out of
+        inherited blocks, so the slice must be at least as long as the block table.
+        """
+        context.paused_request_count = 0
+        context.total_request_count = len(block_rows)
         table = torch.full(
             (len(block_rows), context.max_kv_block_count),
             -1,

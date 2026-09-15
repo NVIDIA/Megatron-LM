@@ -6,17 +6,6 @@
 MTP draft attention: entering draft-forward mode, publishing the write maps and read metadata
 for one depth or for the varlen commit pass, and leaving again. It also owns the gate that
 decides whether this model/config can populate a draft KV plane at all.
-
-Like `MTPControllerMixin` on the controller, this is a mixin rather than a standalone helper
-because these paths read a large amount of context state (`gpu_view`, the graphed and
-non-graphed attention metadata, the per-request block tables and counts); the split is for
-readability.
-
-NOT everything MTP-related moves here. The gate's RESULT is consumed by the KV append/read
-routing in `append_key_value_cache` / `key_value_cache`, the prefix-match back-off in
-`_compute_prefix_match`, and the `request_matched_prefix_blocks` bookkeeping that travels with
-the other per-request tensors -- all of which stay on the context because they are interleaved
-with non-MTP logic. Grep `mtp` in `dynamic_context.py` to find them.
 """
 
 from typing import TYPE_CHECKING, Optional
@@ -44,12 +33,6 @@ class MTPContextMixin:
     ) -> bool:
         """Whether this model/config can populate an MTP draft-KV plane.
 
-        There is no opt-in flag: the draft KV only affects acceptance rate, never verified
-        output, so the gate is purely whether the config CAN populate it. It reads the MTP
-        HEAD's shape, not the decoder's -- a hybrid decoder is fine, because the reserved slot
-        bypasses `layer_map` entirely, and a hybrid pattern states the two halves independently
-        as "<main>/<mtp>/...".
-
         Args:
             model_config: Transformer config, read for the MTP head's shape.
             mamba_inference_state_config (Optional[MambaInferenceStateConfig]): Carries the MTP
@@ -59,30 +42,31 @@ class MTPContextMixin:
         Returns:
             (bool): True when the draft KV plane should be reserved.
         """
+        # The draft plane reserves exactly one attention slot, so the head must be one layer.
+        # `mtp_use_repeated_layer` is what guarantees that: it builds a single layer and applies
+        # it at every depth, where the non-repeated path builds `mtp_num_layers` of them.
+        if not (
+            num_speculative_tokens > 0
+            and getattr(model_config, "mtp_num_layers", None)
+            and getattr(model_config, "mtp_use_repeated_layer", False)
+        ):
+            return False
+
         head_layer_types = (
             mamba_inference_state_config.mtp_layer_type_list
             if mamba_inference_state_config is not None
             else None
         )
         if head_layer_types is None:
-            # No pattern to inspect means a pure-Transformer model, whose MTP head is a single
-            # attention TransformerLayer by construction. A HYBRID model always exposes its
-            # pattern when it has a head at all -- `HybridModel.mtp_pattern` is None only when
-            # the layer pattern has no MTP section -- and that case is already excluded by the
-            # `mtp_num_layers` check below.
-            head_is_single_attention = True
-        else:
-            attention_symbols = (Symbols.ATTENTION, Symbols.DS_ATTENTION, Symbols.MLA)
-            num_attention = sum(t in attention_symbols for t in head_layer_types)
-            has_recurrent = any(t in (Symbols.MAMBA, Symbols.GDN) for t in head_layer_types)
-            head_is_single_attention = num_attention == 1 and not has_recurrent
+            # Non-hybrid model -- `HybridModel` builds a head only when the pattern has an MTP
+            # section, so a hybrid head always exposes one. That layer is cloned from the last
+            # decoder layer spec, so it is attention by construction.
+            return True
 
-        return bool(
-            num_speculative_tokens > 0
-            and getattr(model_config, "mtp_num_layers", None)
-            and getattr(model_config, "mtp_use_repeated_layer", False)
-            and head_is_single_attention
-        )
+        attention_symbols = (Symbols.ATTENTION, Symbols.DS_ATTENTION, Symbols.MLA)
+        num_attention = sum(t in attention_symbols for t in head_layer_types)
+        has_recurrent = any(t in (Symbols.MAMBA, Symbols.GDN) for t in head_layer_types)
+        return num_attention == 1 and not has_recurrent
 
     # ------------------------------------------------------------------
     # MTP draft-KV bookkeeping.

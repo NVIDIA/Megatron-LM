@@ -2142,6 +2142,20 @@ class DynamicInferenceEngine(AbstractEngine):
                     request
                 )
 
+                # Record tokens emitted (and kept) this step so a client can reconstruct
+                # per-step acceptance lengths. Runs AFTER the stop-word check, which may
+                # truncate the last step in place, so subtract the trim to keep the list
+                # summing to `generated_length`. The same reason excludes a consumed chunked
+                # prefill: it samples tokens that are never appended. Spec decoding only.
+                if (
+                    self.num_speculative_tokens > 0
+                    and request_id != consumed_chunked_prefill_request_id
+                    and request_id not in self.stop_word_being_finished_ids
+                ):
+                    emitted = max(0, len(tokens) - num_stop_word_trim)
+                    if emitted:
+                        request.acceptance_step_lengths.append(emitted)
+
                 # Track per-position acceptance statistics for logging.
                 # Skip prefill requests: MTP heads only propose speculative tokens
                 # for decode requests, so counting prefill requests would inflate
