@@ -1243,6 +1243,10 @@ def test_distributed_optimizer_reload_main_params_from_fused_mla_canonical_state
             for key, sh_ten in sharded_state_dict.items()
             if isinstance(sh_ten, ShardedTensor)
         }
+        print("SSD_KEYS_BEGIN")
+        for _k in sorted(state_dict):
+            print("SSD_KEY", _k)
+        print("SSD_KEYS_END")
         assert any(
             key.startswith("decoder.layers.0.self_attention.input_layernorm.") for key in state_dict
         )
