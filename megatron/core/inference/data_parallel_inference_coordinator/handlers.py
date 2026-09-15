@@ -88,7 +88,8 @@ def handle_submit_request(coordinator, sender_identity, metadata, bodies):
 
     Sent by ``InferenceClient.add_request`` / ``add_request_streaming``.
 
-    ``metadata``: ``[header, client_request_id, sampling_params, media_meta]``,
+    ``metadata``: ``[header, client_request_id, sampling_params, media_meta,
+        request_metadata]``,
         where ``sampling_params`` is the serialized dict and ``media_meta`` is the
         bounded media descriptor -- a content key plus modality and token-expansion
         flags -- carrying the identity the routing policy keys on. Both are small
@@ -123,7 +124,7 @@ def handle_submit_request(coordinator, sender_identity, metadata, bodies):
     # rank and every client, so an IndexError raised out of it takes the whole
     # coordinator down; a client that framed its request wrongly should only cost
     # itself that request.
-    if len(metadata) != 4 or len(bodies) != 3:
+    if len(metadata) not in (4, 5) or len(bodies) != 3:
         logging.error(
             "Coordinator: malformed SUBMIT_REQUEST with %d metadata fields, %d bodies",
             len(metadata) - 1,
@@ -131,7 +132,8 @@ def handle_submit_request(coordinator, sender_identity, metadata, bodies):
         )
         return
 
-    _, client_request_id, sampling_params, media_meta = metadata
+    _, client_request_id, sampling_params, media_meta = metadata[:4]
+    request_metadata = metadata[4] if len(metadata) == 5 else None
     prompt_frame = bodies[0]
     media_frame = bodies[2]
 
@@ -146,7 +148,8 @@ def handle_submit_request(coordinator, sender_identity, metadata, bodies):
     # Rebuilding the metadata frame is cheap: it holds neither prompt tokens nor
     # media bytes, only the bounded media descriptor.
     engine_metadata = msgpack.packb(
-        [Headers.SUBMIT_REQUEST.value, request_id, sampling_params, media_meta], use_bin_type=True
+        [Headers.SUBMIT_REQUEST.value, request_id, sampling_params, media_meta, request_metadata],
+        use_bin_type=True,
     )
 
     # Media identity is read straight from the metadata frame; it salts the

@@ -157,6 +157,13 @@ class MaxSequenceLengthOverflowError(ContextOverflowError):
         super().__init__(request_id, message=message, is_transient=False)
 
 
+class PromptPreparationError(ContextOverflowError):
+    """An external prompt preparer could not build the admitted prompt."""
+
+    def __init__(self, request_id, message: Optional[str] = None):
+        super().__init__(request_id, message=message, is_transient=False)
+
+
 class BlockOverflowError(ContextOverflowError):
     """Adding request would overflow available memory blocks."""
 
@@ -219,6 +226,7 @@ class ContextErrorFactory:
             "RequestOverflowError": RequestOverflowError,
             "TokenOverflowError": TokenOverflowError,
             "MaxSequenceLengthOverflowError": MaxSequenceLengthOverflowError,
+            "PromptPreparationError": PromptPreparationError,
             "BlockOverflowError": BlockOverflowError,
             "ActiveRequestCountOverflowError": ActiveRequestCountOverflowError,
         }[obj["type"]]

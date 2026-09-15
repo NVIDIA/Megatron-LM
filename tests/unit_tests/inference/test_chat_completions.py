@@ -5,8 +5,15 @@ import base64
 import pytest
 
 from megatron.core.inference.config import MediaPromptSpec, MultimodalPromptConfig
+from megatron.core.inference.inference_request import (
+    PREFIX_SPLICE_BOUNDARY_FIELD,
+    PREFIX_SPLICE_SUFFIX_FIELD,
+)
 from megatron.core.inference.text_generation_server.dynamic_text_gen_server.endpoints.chat_completions import (
+    _build_prefix_splice_metadata,
     _extract_media_url_bytes,
+    _prefix_replacement_start,
+    _replace_prefix_tokens,
     _tokenize_with_media_slots_sync,
 )
 
@@ -26,6 +33,33 @@ def test_extract_media_data_url_rejects_decoded_payload_over_limit():
 
     with pytest.raises(ValueError, match="data:video/mp4;base64 payload exceeds 4 byte limit"):
         _extract_media_url_bytes(url, max_bytes=4)
+
+
+def test_prefix_replacement_uses_shared_rendered_boundary():
+    eos_token_id = 99
+    previous_rendering = [1, 99, 2, 99]
+    current_rendering = [1, 99, 2, 99, 3, 4]
+
+    assert _prefix_replacement_start(eos_token_id, previous_rendering, current_rendering) == 3
+    assert _replace_prefix_tokens(
+        eos_token_id, [7, 8, eos_token_id], previous_rendering, current_rendering
+    ) == [7, 8, 99, 3, 4]
+
+
+def test_prefix_splice_metadata_carries_suffix_from_the_rendered_boundary():
+    eos = 99
+    previous_rendering = [1, 99, 2, 99]
+    current_rendering = [1, 99, 2, 99, 3, 4]
+    request_metadata = {"ng_capture": {"staging_chain": ["k1"]}}
+
+    out = _build_prefix_splice_metadata(
+        eos, previous_rendering, current_rendering, request_metadata
+    )
+
+    assert out[PREFIX_SPLICE_SUFFIX_FIELD] == [99, 3, 4]
+    assert out[PREFIX_SPLICE_BOUNDARY_FIELD] == 99
+    assert out["ng_capture"] == {"staging_chain": ["k1"]}
+    assert PREFIX_SPLICE_SUFFIX_FIELD not in request_metadata  # input not mutated
 
 
 def test_media_slot_uses_tokenizer_id_when_model_id_is_unspecified():

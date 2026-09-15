@@ -7,7 +7,7 @@ import uuid
 import warnings
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Protocol, Tuple, Union
 
 import numpy as np
 import torch
@@ -706,6 +706,8 @@ class DynamicInferenceRequest(InferenceRequest):
     prompt: Optional[str] = None
     prompt_tokens: Optional[torch.Tensor] = None
     compact_prompt_tokens: Optional[torch.Tensor] = None
+    # Opaque JSON/msgpack-compatible metadata owned by an external payload stager.
+    request_metadata: Optional[Dict[str, Any]] = None
     # remaining prompt tokens are used for chunked prefill
     remaining_prompt_tokens: Optional[torch.Tensor] = None
     policy_epoch: Optional[list[tuple[int, int]]] = None
@@ -738,6 +740,13 @@ class DynamicInferenceRequest(InferenceRequest):
     # Shape: {"request_id", "block_ids", "kv_meta"}.
     # Hybrid models may add kv_meta["ssm"] for recurrent state.
     disaggregated_params: Optional[dict] = None
+
+    # Wire marker: serialize(payload_offloaded=True) writes this key after dropping the
+    # per-token payload (log probs, MoE routing indices) from the wire; the engine sets it
+    # only for requests whose payload it handed to its RequestPayloadStager.
+    payload_offloaded: bool = False
+    # Response-only metadata returned by the payload stager.
+    payload_stage_metadata: Dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self):
         self.sampling_params = copy.deepcopy(self.sampling_params)
@@ -810,8 +819,18 @@ class DynamicInferenceRequest(InferenceRequest):
             )
         )
 
-    def serialize(self):
+    def serialize(
+        self,
+        payload_offloaded: bool = False,
+        payload_stage_metadata: Optional[Dict[str, Any]] = None,
+    ):
         """Converts the instance into a serializable dictionary.
+
+        Args:
+            payload_offloaded (bool): Drop the per-token payload (log probs, MoE routing
+                indices) from the wire; the engine's RequestPayloadStager has custody of it.
+            payload_stage_metadata: Opaque metadata returned by the stager for the
+                REST endpoint to attach to its response.
 
         Returns:
             (dict) A dictionary representation of the instance suitable for
@@ -824,46 +843,56 @@ class DynamicInferenceRequest(InferenceRequest):
         # client asked for them back (return_prompt_tokens). Null all prompt tensor
         # views around super(), then restore the request's local state.
         prompt_len = len(self.prompt_tokens) if self.prompt_tokens is not None else None
-        drop_prompt = not getattr(self.sampling_params, "return_prompt_tokens", False) and any(
-            tensor is not None
-            for tensor in (
-                self.prompt_tokens,
-                self.compact_prompt_tokens,
-                self.remaining_prompt_tokens,
+
+        # Sanity check routing_indices: ndarray [total_tokens - 1, num_layers, topk]
+        if self.routing_indices is not None:
+            total_tokens = prompt_len + len(self.generated_tokens)
+            # the last generated token does not undergo a forward pass
+            # hence we expect routing indices for total_tokens - 1
+            assert self.routing_indices.shape[0] == total_tokens - 1, (
+                f"routing_indices first dimension {self.routing_indices.shape[0]} does not match "
+                f"total tokens {total_tokens-1}."
             )
+
+        sampling_params = self.sampling_params
+        # Payload offload must not override an explicit request to return prompt
+        # tokens. Some endpoints include those tokens in their response contract.
+        should_drop_prompt_tokens = (
+            payload_offloaded
+            if sampling_params is None
+            else not getattr(sampling_params, "return_prompt_tokens", False)
         )
-        saved_prompt_tokens = self.prompt_tokens
-        saved_compact_prompt_tokens = self.compact_prompt_tokens
-        saved_remaining_prompt_tokens = self.remaining_prompt_tokens
+        dropped_fields = {}
+        if should_drop_prompt_tokens:
+            for field_name in ("prompt_tokens", "compact_prompt_tokens", "remaining_prompt_tokens"):
+                if getattr(self, field_name) is not None:
+                    dropped_fields[field_name] = getattr(self, field_name)
+        if payload_offloaded:
+            dropped_fields["generated_log_probs"] = self.generated_log_probs
+            dropped_fields["prompt_log_probs"] = self.prompt_log_probs
+            dropped_fields["routing_indices"] = self.routing_indices
+
+        # Dropped fields are nulled only for the duration of super().serialize();
+        # this mutate-and-restore makes serialize() non-reentrant on one request object.
         try:
-            if drop_prompt:
-                self.prompt_tokens = None
-                self.compact_prompt_tokens = None
-                self.remaining_prompt_tokens = None
-
+            for field_name in dropped_fields:
+                setattr(self, field_name, None)
             obj = super().serialize()
-            obj["events"] = [e.serialize() for e in self.events]
-            obj.pop("event_add_engine", None)
-            obj["prompt_length"] = prompt_len
-
-            # Sanity check routing_indices: ndarray [total_tokens - 1, num_layers, topk]
-            if self.routing_indices is not None:
-                total_tokens = prompt_len + len(self.generated_tokens)
-                # the last generated token does not undergo a forward pass
-                # hence we expect routing indices for total_tokens - 1
-                assert self.routing_indices.shape[0] == total_tokens - 1, (
-                    "routing_indices first dimension "
-                    f"{self.routing_indices.shape[0]} does not match "
-                    f"total tokens {total_tokens-1}."
-                )
-
-            return obj
         finally:
-            if drop_prompt:
-                self.prompt_tokens = saved_prompt_tokens
-                self.compact_prompt_tokens = saved_compact_prompt_tokens
-                self.remaining_prompt_tokens = saved_remaining_prompt_tokens
+            for field_name, value in dropped_fields.items():
+                setattr(self, field_name, value)
             nvtx_range_pop("DynamicInferenceRequest.serialize")
+
+        obj["events"] = [e.serialize() for e in self.events]
+        obj.pop("event_add_engine", None)
+        # Request metadata is input-only. Only the stager's response metadata
+        # crosses back to the REST endpoint.
+        obj.pop("request_metadata", None)
+        obj["prompt_length"] = prompt_len
+        obj["payload_offloaded"] = payload_offloaded
+        obj["payload_stage_metadata"] = dict(payload_stage_metadata or {})
+
+        return obj
 
     def _post_deserialize(self, obj):
         super()._post_deserialize(obj)
@@ -1073,9 +1102,11 @@ class DynamicInferenceRequestRecord:
         # dynamically added fields, so the new request owns the copy adjusted below.
         common_kwargs = dict(
             request_id=old_request.request_id,
+            uid=old_request.uid,
             prompt_tokens=new_prompt_tokens,
             compact_prompt_tokens=old_request.compact_prompt_tokens,
             sampling_params=old_request.sampling_params,
+            request_metadata=copy.deepcopy(old_request.request_metadata),
             status=old_request.status,
             policy_epoch=policy_epoch,
             kv_cache_epoch=kv_cache_epoch,
@@ -1175,6 +1206,7 @@ class DynamicInferenceRequestRecord:
             prompt=prompt_text,
             prompt_tokens=prompt_tokens,
             compact_prompt_tokens=first_request.compact_prompt_tokens,
+            request_metadata=copy.deepcopy(first_request.request_metadata),
             prompt_log_probs=self.requests[0].prompt_log_probs,
             prompt_top_n_logprobs=self.requests[0].prompt_top_n_logprobs,
             generated_text=None,
@@ -1228,6 +1260,86 @@ class FinishedRequestRecord:
             ),
         )
         return record
+
+
+@dataclass
+class OffloadedRequestPayload:
+    """A finished request's per-token payload, kept off the RESTful reply by payload offload.
+
+    Self-contained: a consumer can rebuild the served sequence from it alone,
+    keyed by the request uid (the OpenAI response id).
+    """
+
+    prompt_token_ids: Optional[list[int]]
+    generated_token_ids: list[int]
+    generated_log_probs: Optional[list[float]]
+    prompt_log_probs: Optional[list[float]]
+    routing_indices: Optional[np.ndarray]
+
+    @classmethod
+    def from_request(cls, request: "DynamicInferenceRequest") -> "OffloadedRequestPayload":
+        """Copy the payload off a finished (merged) request as plain host-side values."""
+
+        def to_plain_list(value):
+            if value is None:
+                return None
+            if isinstance(value, torch.Tensor):
+                return value.cpu().tolist()
+            return list(value)
+
+        if isinstance(request.prompt_tokens, torch.Tensor):
+            # One device-to-host copy serves both the payload and the wire reply.
+            request.prompt_tokens = request.prompt_tokens.cpu()
+        return cls(
+            prompt_token_ids=to_plain_list(request.prompt_tokens),
+            generated_token_ids=list(request.generated_tokens),
+            generated_log_probs=to_plain_list(request.generated_log_probs),
+            prompt_log_probs=to_plain_list(request.prompt_log_probs),
+            routing_indices=request.routing_indices,
+        )
+
+
+@dataclass(frozen=True)
+class RequestPayloadStageResult:
+    """A custody acknowledgement and opaque metadata for the served response."""
+
+    response_metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+class RequestPayloadStager(Protocol):
+    """Protocol to handle offloading of request payloads to a storage backend."""
+
+    def stage(
+        self,
+        uid: str,
+        payload: OffloadedRequestPayload,
+        *,
+        finished_metadata: FinishedRequestRecord,
+        request_metadata: Optional[Dict[str, Any]] = None,
+    ) -> Optional[RequestPayloadStageResult]:
+        """Stage a payload, or return ``None`` to keep it on the normal reply path."""
+        ...
+
+
+# Request-metadata keys written by the chat endpoint when it defers the prompt
+# prefix splice to a RequestPromptPreparer: the current render's tokens from the
+# turn boundary onward, and the boundary (EOS) token id. The preparer supplies the
+# exact prior-turn tokens and concatenates ``prefix_without_boundary + suffix``.
+PREFIX_SPLICE_SUFFIX_FIELD = "prefix_splice_suffix_token_ids"
+PREFIX_SPLICE_BOUNDARY_FIELD = "prefix_splice_boundary_token_id"
+
+
+class RequestPromptPreparer(Protocol):
+    """Protocol for resolving an exact prompt before engine admission."""
+
+    def prepare_prompt(
+        self,
+        prompt: Union[str, List[int], torch.Tensor],
+        *,
+        request_metadata: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[Union[str, List[int], torch.Tensor], Optional[Dict[str, Any]]]:
+        """Return the engine prompt and metadata that describe that prompt."""
+        ...
 
 
 @dataclass(kw_only=True)
