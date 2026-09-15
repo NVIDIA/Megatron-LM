@@ -15,8 +15,10 @@ from megatron.core.inference.moe import InferenceGroupedGemmBackend
 from megatron.core.quantization.quant_config import RecipeConfig
 from megatron.core.transformer.cuda_graph_config import (
     ALLOWED_INFERENCE_SCOPES,
+    PACKED_DSA_CP_CUDA_GRAPH_WARNING,
     cuda_graph_captures_attention,
     get_deprecated_cuda_graph_modules_migration,
+    is_packed_dsa_cp_cuda_graph_experimental,
     is_whole_moe_cuda_graph_scope,
     normalize_cuda_graph_modules,
     normalize_inference_cuda_graph_scope,
@@ -1623,6 +1625,8 @@ class TransformerConfig(ModelParallelConfig):
         details.
         """
         super().__post_init__()
+        # Dynamic CP can assign a multi-rank group even when configured CP is one.
+        has_context_parallelism = self.context_parallel_size > 1 or self.dynamic_context_parallel
 
         # Imported lazily because the module-spec module imports TransformerConfig.
         from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
@@ -1771,7 +1775,7 @@ class TransformerConfig(ModelParallelConfig):
                     "follow-up change."
                 )
 
-        if self.context_parallel_size > 1:
+        if has_context_parallelism:
             if self.cp_partition_mode == "contiguous":
                 if (
                     self.multi_latent_attention
@@ -1946,7 +1950,7 @@ class TransformerConfig(ModelParallelConfig):
                 f"linear_num_key_heads ({self.linear_num_key_heads})."
             )
             if (
-                self.experimental_attention_variant == "kda" or self.context_parallel_size > 1
+                self.experimental_attention_variant == "kda" or has_context_parallelism
             ) and self.linear_cp_mode not in ("headwise", "chunkwise"):
                 raise ValueError(
                     f"linear_cp_mode must be either 'headwise' or 'chunkwise', "
@@ -1958,11 +1962,11 @@ class TransformerConfig(ModelParallelConfig):
                     f"got {self.gdn_conv_pad_alignment}."
                 )
 
-            if self.context_parallel_size > 1:
+            if has_context_parallelism:
                 if self.gdn_conv_pad_alignment is not None:
                     assert self.linear_cp_mode != "chunkwise", (
                         "gdn_conv_pad_alignment is incompatible with "
-                        "linear_cp_mode='chunkwise' when context_parallel_size > 1. "
+                        "linear_cp_mode='chunkwise' with context parallelism. "
                         "Padding chunk-local GDN causal-conv inputs can change later "
                         "chunk numerics."
                     )
@@ -1995,7 +1999,7 @@ class TransformerConfig(ModelParallelConfig):
                     "dsa_indexer_skip_topk_offset must be non-negative, got "
                     f"{self.dsa_indexer_skip_topk_offset}."
                 )
-            if self.context_parallel_size > 1:
+            if has_context_parallelism:
                 cp_comm_types = (
                     self.cp_comm_type
                     if isinstance(self.cp_comm_type, list)
@@ -3841,6 +3845,15 @@ class TransformerConfig(ModelParallelConfig):
                 "attention capture, or disable pipeline parallelism."
             )
 
+        if is_packed_dsa_cp_cuda_graph_experimental(
+            experimental_attention_variant=self.experimental_attention_variant,
+            sequence_packing_scheduler=self.sequence_packing_scheduler,
+            dynamic_context_parallel=self.dynamic_context_parallel,
+            context_parallel_size=self.context_parallel_size,
+            cuda_graph_impl=self.cuda_graph_impl,
+        ):
+            warnings.warn(PACKED_DSA_CP_CUDA_GRAPH_WARNING, stacklevel=2)
+
         cp_layout_conversion_required = is_gated_delta_net_variant(
             self.experimental_attention_variant
         )
@@ -4226,7 +4239,7 @@ class TransformerConfig(ModelParallelConfig):
                 'ep_overlap_early_attn_memory_release'
             )
 
-        if self.context_parallel_size > 1 and self.cp_comm_type is not None:
+        if has_context_parallelism and self.cp_comm_type is not None:
             if isinstance(self.cp_comm_type, list):
                 assert len(self.cp_comm_type) == self.num_layers, (
                     f"Length of cp_comm_type ({len(self.cp_comm_type)}) should equal to "
@@ -4295,7 +4308,7 @@ class TransformerConfig(ModelParallelConfig):
             )
 
         if self.fallback_to_eager_attn or self.transformer_impl == "local":
-            if self.context_parallel_size > 1 and self.cp_comm_type is not None:
+            if has_context_parallelism and self.cp_comm_type is not None:
                 all_cp_comm_types_are_all_gather = (
                     all(item == "all_gather" for item in self.cp_comm_type)
                     if isinstance(self.cp_comm_type, list)
