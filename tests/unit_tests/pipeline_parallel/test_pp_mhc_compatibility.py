@@ -253,7 +253,11 @@ def _run_schedule(config, models):
     wrapped = [
         DistributedDataParallel(
             config=config,
-            ddp_config=DistributedDataParallelConfig(overlap_grad_reduce=False),
+            # Match native BF16 training: accumulate and reduce main grads in
+            # FP32, even when the parameter and pipeline activation are BF16.
+            ddp_config=DistributedDataParallelConfig(
+                grad_reduce_in_fp32=True, overlap_grad_reduce=False
+            ),
             module=model,
         )
         for model in models
@@ -312,6 +316,7 @@ def _run_schedule(config, models):
         for name, param in model.named_parameters():
             assert _canonical_name(model, name) in grad_seen, name
             assert hasattr(param, "main_grad"), name
+            assert param.main_grad.dtype == torch.float32, name
             assert torch.isfinite(param.main_grad).all(), name
             key = _canonical_name(model, name)
             assert key not in grads, key
