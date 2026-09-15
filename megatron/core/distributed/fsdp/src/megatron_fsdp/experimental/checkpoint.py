@@ -14,11 +14,11 @@
 
 """PyTorch Distributed Checkpoint (DCP) save/load for the experimental Megatron-FSDP path.
 
-These helpers wrap local parameters and optimizer state
-only for DCP and unwrap loaded state before reinstalling it. Bare model/optimizer state_dict()
+These helpers wrap local parameters and optimizer state only for DCP and unwrap
+loaded state before reinstalling it. Bare model/optimizer state_dict()
 calls return local shards and must not be used as distributed checkpoints.
 
-The one Megatron-FSDP-specific step is :func:`attach_uneven_dtensor_metadata`, which describes each
+:func:`attach_uneven_dtensor_metadata` describes each
 parameter's true position inside its packed parameter-group buffer. Without it the default planner
 assumes canonical ``Shard(0)`` offsets and silently corrupts the checkpoint.
 """
@@ -149,9 +149,8 @@ def load_checkpoint(
 
     The model and optimizer must already be sharded with the same layout used at save time (the same
     module structure and mesh); DCP reshards the on-disk data to this rank's shards.
-    :func:`~torch.distributed.checkpoint.state_dict.get_optimizer_state_dict` initializes the
-    (empty) optimizer state so DCP has DTensors to load into in place, and the ``set_*`` helpers
-    reinstall the loaded state.
+    Empty optimizer state is initialized before wrapping local tensors for DCP.
+    After loading, the ``set_*`` helpers reinstall unwrapped local state.
 
     Args:
         model: A module tree sharded with :func:`fully_shard`, whose weights receive the load.
