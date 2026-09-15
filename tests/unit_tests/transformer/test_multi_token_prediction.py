@@ -47,6 +47,7 @@ from megatron.core.transformer.multi_token_prediction import (
     mtp_on_this_rank,
     process_mtp_loss,
     roll_tensor,
+    roll_tensor_precomputed_embeddings,
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import (
@@ -470,6 +471,49 @@ class TestMultiTokenPredictionLayer:
         )
         assert len(seen_masks) == 2
         assert all(mask is mtp_input_mask for mask in seen_masks)
+
+    def test_block_rolls_precomputed_embeddings_for_each_depth(self):
+        config = TransformerConfig(
+            num_layers=2, hidden_size=1, num_attention_heads=1, mtp_num_layers=2
+        )
+        seen_embeddings = []
+
+        class _CaptureLayer:
+            def __call__(
+                self, hidden_states, input_ids, position_ids, padding_mask, decoder_input, **kwargs
+            ):
+                seen_embeddings.append(decoder_input.clone())
+                return hidden_states, input_ids, position_ids, padding_mask, None
+
+        block = types.SimpleNamespace(
+            config=config,
+            training=True,
+            vp_stage=None,
+            pp_rank=0,
+            mtp_use_repeated_layer=False,
+            cp_group=None,
+            tp_group=None,
+            hidden_state_mixing_rng_tracker_name=None,
+            sequence_parallel=False,
+            layers=[_CaptureLayer(), _CaptureLayer()],
+        )
+        decoder_input = torch.arange(4, dtype=torch.float32).view(4, 1, 1)
+
+        MultiTokenPredictionBlock.forward(
+            block,
+            input_ids=None,
+            position_ids=None,
+            hidden_states=torch.ones_like(decoder_input),
+            decoder_input=decoder_input,
+            attention_mask=None,
+        )
+
+        torch.testing.assert_close(
+            seen_embeddings[0], torch.tensor([1.0, 2.0, 3.0, 0.0]).view(4, 1, 1)
+        )
+        torch.testing.assert_close(
+            seen_embeddings[1], torch.tensor([2.0, 3.0, 0.0, 0.0]).view(4, 1, 1)
+        )
 
     @pytest.mark.parametrize("packed", [False, True])
     def test_hsm_aligns_history_with_target_tokens(self, monkeypatch, packed):
@@ -2819,6 +2863,32 @@ class TestMultiTokenPrediction:
         assert torch.equal(rolled, expected)
         Utils.destroy_model_parallel()
 
+    def test_roll_precomputed_embeddings_respects_packed_boundaries(self):
+        embeddings = torch.arange(10, dtype=torch.float32).view(5, 1, 2)
+        cu_seqlens = torch.tensor([0, 3, 5], dtype=torch.int32)
+        packed_seq_params = PackedSeqParams(
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_kv=cu_seqlens,
+            max_seqlen_q=3,
+            max_seqlen_kv=3,
+            qkv_format='thd',
+        )
+
+        rolled, rolled_sum = roll_tensor_precomputed_embeddings(
+            embeddings, packed_seq_params=packed_seq_params
+        )
+
+        expected = torch.cat(
+            (
+                embeddings[1:3],
+                torch.zeros_like(embeddings[:1]),
+                embeddings[4:5],
+                torch.zeros_like(embeddings[:1]),
+            )
+        )
+        torch.testing.assert_close(rolled, expected)
+        torch.testing.assert_close(rolled_sum, expected.sum())
+
     def test_process_mtp_loss_skips_when_no_labels_and_no_input_ids(self):
         """When labels and input_ids are both None, MTP loss is skipped (early return)."""
         config = TransformerConfig(
@@ -3470,7 +3540,13 @@ class TestMultiTokenPredictionHybrid:
     @staticmethod
     def _make_forward_stub():
         hidden_states = torch.arange(4, dtype=torch.float32).reshape(2, 1, 2)
-        call_counts = {"mtp": 0, "mtp_loss": 0, "main_loss": 0, "mtp_input_mask": None}
+        call_counts = {
+            "mtp": 0,
+            "mtp_loss": 0,
+            "main_loss": 0,
+            "decoder_input": None,
+            "mtp_input_mask": None,
+        }
         metric_avg_group = object()
 
         def decoder(**kwargs):
@@ -3483,6 +3559,7 @@ class TestMultiTokenPredictionHybrid:
 
         def mtp(**kwargs):
             call_counts["mtp"] += 1
+            call_counts["decoder_input"] = kwargs.get("decoder_input")
             call_counts["mtp_input_mask"] = kwargs.get("mtp_input_mask")
             decoder_hidden_states = kwargs["hidden_states"]
             return torch.cat((decoder_hidden_states, decoder_hidden_states + 100.0), dim=0)
@@ -3496,6 +3573,7 @@ class TestMultiTokenPredictionHybrid:
                     input_ids=kwargs["input_ids"],
                     position_ids=kwargs["position_ids"],
                     hidden_states=kwargs["hidden_states"],
+                    decoder_input=kwargs["decoder_input"],
                     mhc_multistream=kwargs["mhc_multistream"],
                     labels=kwargs["labels"],
                     loss_mask=kwargs["loss_mask"],
@@ -3600,6 +3678,8 @@ class TestMultiTokenPredictionHybrid:
         )
 
         expected_block_mask = mtp_input_mask if expected_mtp_calls else None
+        expected_decoder_input = hidden_states if expected_mtp_calls else None
+        assert call_counts.pop("decoder_input") is expected_decoder_input
         assert call_counts.pop("mtp_input_mask") is expected_block_mask
         assert call_counts == {
             "mtp": expected_mtp_calls,
@@ -3720,6 +3800,7 @@ class TestMultiTokenPredictionHybrid:
         )
 
         assert captured["mtp"]["hidden_states"] is zigzag_hidden_states
+        assert captured["mtp"]["decoder_input"] is zigzag_hidden_states
         assert captured["mtp"]["input_ids"] is zigzag_input_ids
         assert captured["mtp"]["position_ids"] is zigzag_position_ids
         assert captured["mtp"]["packed_seq_params"] is zigzag_packed_seq_params
@@ -3768,6 +3849,7 @@ class TestMultiTokenPredictionHybrid:
 
         torch.testing.assert_close(output, hidden_states.transpose(0, 1).contiguous())
         torch.testing.assert_close(inference_context.mtp_decoder_hidden_states, hidden_states)
+        assert call_counts.pop("decoder_input") is None
         assert call_counts.pop("mtp_input_mask") is None
         assert call_counts == {"mtp": 0, "mtp_loss": 0, "main_loss": 0}
 

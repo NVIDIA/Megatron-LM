@@ -27,6 +27,7 @@ from megatron.training.global_vars import (
 from tests.unit_tests.test_utilities import Utils
 
 GOLDEN_CONFIG: Dict[str, Any] = {
+    "keep_mtp_spec_in_bf16": False,
     "_cpu_offloading_context": None,
     "account_for_embedding_in_pipeline_split": False,
     "account_for_loss_in_pipeline_split": False,
