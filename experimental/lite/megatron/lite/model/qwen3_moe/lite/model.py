@@ -13,8 +13,8 @@ from contextlib import nullcontext
 import torch
 import torch.nn as nn
 
-from megatron.lite.primitive import transformer_engine as te
 from megatron.lite.model.qwen3_moe.config import Qwen3MoEConfig
+from megatron.lite.primitive import transformer_engine as te
 from megatron.lite.primitive.modules.dispatcher import TokenDispatcher
 from megatron.lite.primitive.modules.experts import Experts
 from megatron.lite.primitive.modules.gqa import GQAttention
@@ -127,6 +127,7 @@ class TransformerLayer(nn.Module):
         use_thd: bool = False,
         lora_config: LoraConfig | dict | None = None,
         attention_backend: str = "te",
+        moe_factory=MoELayer,
     ):
         super().__init__()
         self.layer_idx = layer_idx
@@ -150,7 +151,7 @@ class TransformerLayer(nn.Module):
             attention_backend=attention_backend,
         )
         self.mlp_norm = te.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.moe = MoELayer(
+        self.moe = moe_factory(
             config,
             ps,
             use_deepep=use_deepep,
@@ -364,8 +365,11 @@ class Qwen3MoEModel(nn.Module):
         mtp_detach_encoder: bool = False,
         lora_config: LoraConfig | dict | None = None,
         attention_backend: str = "te",
+        chunked_ep=None,
     ):
         super().__init__()
+        if chunked_ep is not None:
+            chunked_ep.validate(mtp_enable, recompute_modules or [])
         self.config = config
         self.ps = ps
         self.fp8 = fp8
@@ -389,10 +393,15 @@ class Qwen3MoEModel(nn.Module):
             self.embed = VocabParallelEmbedding(config.vocab_size, config.hidden_size, ps)
 
         _recompute = recompute_modules or []
-        moe_act_recompute = "moe_act" in _recompute and "moe" not in _recompute
+        moe_act_recompute = (
+            "moe_act" in _recompute
+            and "moe" not in _recompute
+            and not (chunked_ep is not None and chunked_ep.full_recompute)
+        )
+        layer_factory = TransformerLayer if chunked_ep is None else chunked_ep.layer
         self.layers = nn.ModuleList(
             [
-                TransformerLayer(
+                layer_factory(
                     config,
                     ps,
                     idx,
@@ -407,6 +416,8 @@ class Qwen3MoEModel(nn.Module):
                 for idx in self.layer_indices
             ]
         )
+
+        self._chunked_ep = None if chunked_ep is None else chunked_ep.bind(self.layers)
 
         self.norm: nn.Module | None = None
         self.head: VocabParallelOutput | None = None
@@ -504,6 +515,8 @@ class Qwen3MoEModel(nn.Module):
             # head's internal all-gather happens inside VocabParallelOutput.
             # Mirrors MC GPTModel's final_layernorm → output_layer(sp=True).
 
+        if self._chunked_ep is not None:
+            self._chunked_ep.finish_forward(h)
         output = {"hidden_states": h}
 
         if self.head is not None:
