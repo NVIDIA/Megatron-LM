@@ -1,8 +1,22 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Triton kernels for MoE paged stash."""
 
-import triton
-import triton.language as tl
+try:
+    import triton
+    import triton.language as tl
+
+    HAVE_TRITON = True
+except ImportError:
+    from unittest.mock import MagicMock
+
+    from megatron.core.utils import null_decorator
+
+    HAVE_TRITON = False
+    triton = MagicMock()
+    triton.jit = null_decorator
+    triton.autotune = null_decorator
+    triton.heuristics = null_decorator
+    tl = MagicMock()
 
 GLOBAL_BLOCK_SIZE = 1024
 
