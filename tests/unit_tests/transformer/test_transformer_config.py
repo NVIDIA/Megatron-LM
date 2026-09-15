@@ -242,7 +242,20 @@ def test_sequence_packing_dense_config_passes():
 
 
 @requires_te_2_9
-def test_sequence_packing_moe_requires_alltoall_dispatcher():
+def test_dynamic_cp_accepts_contiguous_linear_layout():
+    config = _make_packing_config(
+        dynamic_context_parallel=True,
+        sequence_packing_scheduler="default_dynamic_cp",
+        context_parallel_size=2,
+        linear_cp_layout="contiguous",
+        attention_cp_layout="zigzag",
+    )
+
+    assert config.linear_cp_layout == "contiguous"
+
+
+@requires_te_2_9
+def test_sequence_packing_moe_rejects_allgather_dispatcher():
     # The general allgather-vs-variable_seq_lengths check fires first, since
     # sequence packing derives variable_seq_lengths=True.
     with pytest.raises(ValueError, match="alltoall"):
@@ -252,6 +265,28 @@ def test_sequence_packing_moe_requires_alltoall_dispatcher():
 @requires_te_2_9
 def test_sequence_packing_moe_alltoall_dispatcher_passes():
     config = _make_packing_config(num_moe_experts=2, moe_token_dispatcher_type="alltoall")
+    assert config.variable_seq_lengths is True
+
+
+@requires_te_2_9
+def test_sequence_packing_moe_hybridep_requires_uneven_input_padding():
+    with pytest.raises(ValueError, match="HybridEP requires"):
+        _make_packing_config(
+            num_moe_experts=2,
+            moe_token_dispatcher_type="flex",
+            moe_flex_dispatcher_backend="hybridep",
+        )
+
+
+@requires_te_2_9
+def test_sequence_packing_moe_hybridep_with_uneven_input_padding_passes():
+    config = _make_packing_config(
+        num_moe_experts=2,
+        moe_token_dispatcher_type="flex",
+        moe_flex_dispatcher_backend="hybridep",
+        moe_hybridep_pad_uneven_dispatch_inputs=True,
+    )
+
     assert config.variable_seq_lengths is True
 
 
