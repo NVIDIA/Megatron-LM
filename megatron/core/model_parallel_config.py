@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import warnings
 from dataclasses import dataclass, field
@@ -338,6 +338,18 @@ class ModelParallelConfig:
     overlap_moe_expert_parallel_comm: bool = False
     """Overlap EP A2A communications with independent computations of different micro-batches
     in 1f1b phase of pipelining or non-pipelining schedule.
+    """
+
+    ep_overlap_use_scheduled_tensor_release: bool = False
+    """Use scheduled cross-stream tensor release for fine-grained EP overlap.
+
+    When enabled, each model-chunk plan binds tensors produced by schedule nodes to
+    their creation stream and hands them back through the existing event chain.
+    External and detached gradients keep using allocator ``record_stream`` release.
+    Enable this option only for the sync-free combined 1F1B path with
+    ``overlap_moe_expert_parallel_comm`` enabled, where schedule nodes pass tensors
+    across CUDA streams.  Other schedules should leave it disabled and use the
+    default allocator ``record_stream`` release path.  This option is experimental.
     """
 
     delay_wgrad_compute: bool = False
