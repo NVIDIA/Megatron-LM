@@ -1,6 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Prototype coverage for local optimizer tensors with checkpoint-only DTensors."""
+"""Coverage for local optimizer tensors with checkpoint-only DTensors."""
 
 import pytest
 import torch
