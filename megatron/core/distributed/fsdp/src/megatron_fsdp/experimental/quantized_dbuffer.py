@@ -198,7 +198,7 @@ class QuantizedDBuffer:
             device=rowwise_data.device,
         )
 
-    def get_local_tensor(self, index: int) -> MXFP8Tensor:
+    def get_tensor(self, index: int) -> MXFP8Tensor:
         """Return an unswizzled compute tensor with scales padded for TE's GEMM path.
 
         Data planes remain views. Scale planes alias storage only when no padding

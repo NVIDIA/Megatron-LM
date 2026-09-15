@@ -76,7 +76,7 @@ def test_quantized_dbuffer_quantization_matches_te(distributed_setup):
             )
 
 
-def test_quantized_dbuffer_get_local_tensor_supports_gemm(distributed_setup):
+def test_quantized_dbuffer_get_tensor_supports_gemm(distributed_setup):
     """Compute tensors prepare gathered scales for rowwise and columnwise GEMMs."""
     mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
     shapes = [(128, 128), (128, 128), (64, 64), (32, 64)]
@@ -91,7 +91,7 @@ def test_quantized_dbuffer_get_local_tensor_supports_gemm(distributed_setup):
     gathered_main = main_weight.redistribute([Replicate()])
     quantizer = MXFP8Quantizer(tex.DType.kFloat8E4M3)
     for index, shape in enumerate(shapes):
-        compute_tensor = gathered.get_local_tensor(index)
+        compute_tensor = gathered.get_tensor(index)
         reference = quantizer(gathered_main.get_local_tensor(index))
         for layout, inner_dim in (("TN", shape[1]), ("NN", shape[0])):
             activation = quantizer(torch.randn((64, inner_dim), device=distributed_setup.device))
