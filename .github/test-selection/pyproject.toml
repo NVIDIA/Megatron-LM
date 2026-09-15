@@ -1,0 +1,17 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+[project]
+name = "megatron-test-selection"
+version = "0.1.0"
+requires-python = ">=3.12"
+# Keep the analysis environment separate from Megatron's CUDA and linting
+# dependencies. pytest-impacted and pylint require different astroid versions.
+dependencies = [
+    "pytest-impacted[fast]==0.28.0",
+    "pytest-impacted-rs==0.28.0",
+    "pytest==9.1.1",
+    "pyyaml==6.0.3",
+]
+
+[tool.uv]
+package = false
