@@ -2213,7 +2213,10 @@ class MoETransformerLayer(TransformerLayer):
         token_dispatcher_attr_outputs = []
         for attr_name in self.mlp.token_dispatcher.cudagraph_attrs:
             obj, name = self._resolve_token_dispatcher_attr(attr_name)
-            attr = getattr(obj, name)
+            # a dispatcher the layer never ran has not created these yet. 
+            # E.g. moe_ep_chunk_overlap bypasses the dispatcher, so MoELayer.preprocess
+            # early-returns before they are set. 
+            attr = getattr(obj, name, None)
             if torch.is_tensor(attr):
                 attr_names.append(attr_name)
                 token_dispatcher_attr_outputs.append(attr)

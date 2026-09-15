@@ -356,6 +356,59 @@ class MoELayer(BaseMoELayer):
             name=(name + ".experts") if name is not None else None,
         )
 
+        self.moe_ep_chunk_overlap = None
+        if self.config.moe_ep_chunk_overlap:
+            from megatron.core.transformer.moe.moe_ep_chunk_overlap import MoEEPChunkOverlapRuntime
+            from megatron.core.transformer.moe.moe_ep_chunk_overlap.transport import MoEEPTransportType
+
+            selective_recompute = (
+                set(self.config.recompute_modules or [])
+                if self.config.recompute_granularity == 'selective'
+                else set()
+            )
+            assert self.config.recompute_granularity != 'full', (
+                "moe_ep_chunk_overlap forbids recompute_granularity='full'"
+            )
+            assert 'moe' not in selective_recompute, (
+                "moe_ep_chunk_overlap forbids 'moe' in recompute_modules"
+            )
+
+            if self.config.moe_paged_stash:
+                raise RuntimeError("moe_ep_chunk_overlap does not support moe_paged_stash.")
+
+            if self.config.expert_gtp_weight_remat_size != 1:
+                # TE's num_groups == 1 dense shortcuts read past sum(split_sizes): wrong or NaN
+                # expert wgrads, with the forward and dgrad bit-identical.
+                if self.num_local_experts < 2:
+                    raise RuntimeError(
+                        "moe_ep_chunk_overlap with expert GTP weight remat requires at "
+                        f"least 2 local experts, got {self.num_local_experts}."
+                    )
+
+            backend_transports = {
+                'ncclep': MoEEPTransportType.NCCL_EP,
+                'hybridep': MoEEPTransportType.HYBRID_EP,
+            }
+            backend = self.config.moe_flex_dispatcher_backend
+
+            if backend not in backend_transports:
+                raise ValueError(
+                    f"moe_ep_chunk_overlap has no transport for {backend!r}"
+                )
+
+            self.moe_ep_chunk_overlap = MoEEPChunkOverlapRuntime(
+                num_experts=self.config.num_moe_experts,
+                router_topk=self.config.moe_router_topk,
+                hidden_size=self.config.moe_latent_size or self.config.hidden_size,
+                ffn_hidden_size=self.config.moe_ffn_hidden_size,
+                num_chunks=self.config.moe_ep_chunk_overlap_num_chunks,
+                num_comm_SMs=self.config.moe_ep_chunk_overlap_num_comm_sms,
+                experts=self.experts,
+                tp_ep_group=pg_collection.tp_ep,
+                num_local_experts=self.num_local_experts,
+                transport_type=backend_transports[backend],
+            )
+
         # Initialize shared experts
         if self.use_shared_expert:
             assert (
@@ -462,6 +515,10 @@ class MoELayer(BaseMoELayer):
             self._delayed_wgrad_event = torch.cuda.Event()
             self._delayed_wgrad_stream = torch.cuda.Stream(device="cuda")
 
+    def _ep_chunk_overlap_active(self) -> bool:
+        """Whether this forward is served by the EP chunk overlap path."""
+        return self.moe_ep_chunk_overlap is not None and not torch.is_inference_mode_enabled()
+
     @maybe_skip_or_early_return_by_cudagraph("route")
     def route(self, hidden_states: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
         """Compute token routing for preprocessing.
@@ -481,6 +538,12 @@ class MoELayer(BaseMoELayer):
         This method preprocesses the hidden states and routing probabilities for the token
         dispatcher.
         """
+        # The overlap path owns routing and dispatch, so there is nothing to preprocess.
+        if self._ep_chunk_overlap_active():
+            if self.config.moe_latent_size:
+                hidden_states, _ = self.fc1_latent_proj(hidden_states)
+            return hidden_states, probs
+
         # Latent-MoE + NVLS-inference shared-expert overlap: launch the shared
         # expert on its side stream BEFORE fc1_latent_proj so it sees the full
         # hidden_states. The corresponding join+add runs in postprocess after
@@ -550,6 +613,13 @@ class MoELayer(BaseMoELayer):
                     )
             else:
                 shared_expert_output = apply_module(self.shared_experts)(hidden_states)
+        elif self.use_shared_expert and self._ep_chunk_overlap_active():
+            # The dispatcher that normally drives these five steps is never entered here,.
+            self.shared_experts.pre_forward_comm(hidden_states)
+            self.shared_experts.linear_fc1_forward_and_act()
+            self.shared_experts.linear_fc2_forward()
+            self.shared_experts.post_forward_comm()
+            shared_expert_output = self.shared_experts.get_output()
 
         return shared_expert_output
 
@@ -608,7 +678,8 @@ class MoELayer(BaseMoELayer):
         shared-expert overlap). It is populated in preprocess and joined here, after
         fc2_latent_proj, so the dimensions match the full hidden dim."""
 
-        output = self.token_dispatcher.combine_postprocess(output)
+        if not self._ep_chunk_overlap_active():
+            output = self.token_dispatcher.combine_postprocess(output)
         if self.config.moe_latent_size:
             if self.config.moe_use_norm_before_up_proj:
                 output = apply_module(self.fc2_norm)(output)
@@ -673,6 +744,11 @@ class MoELayer(BaseMoELayer):
             else:
                 self.token_dispatcher = self._training_token_dispatcher
                 self.shared_expert_overlap = self.config.moe_shared_expert_overlap
+
+        if self._ep_chunk_overlap_active():
+            if padding_mask is not None:
+                raise NotImplementedError("padding_mask is not supported with moe_ep_chunk_overlap")
+
         # Transpose from [bsz, seq_length] to [seq_length, bsz] to align with hidden_states
         if padding_mask is not None:
             padding_mask = padding_mask.transpose(0, 1).bool()
@@ -700,12 +776,15 @@ class MoELayer(BaseMoELayer):
                 if intermediate_tensors is not None:
                     hidden_states, probs = intermediate_tensors
 
-                dispatched_input, probs = self.dispatch(hidden_states, probs)
-                output, mlp_bias = self.routed_experts_compute(dispatched_input, probs)
-                assert (
-                    mlp_bias is None
-                ), f"mlp_bias is not supported for {type(self.token_dispatcher)}"
-                output = self.combine(output)
+                if self._ep_chunk_overlap_active():
+                    output, mlp_bias = self.moe_ep_chunk_overlap.forward(hidden_states, probs)
+                else:
+                    dispatched_input, probs = self.dispatch(hidden_states, probs)
+                    output, mlp_bias = self.routed_experts_compute(dispatched_input, probs)
+                    assert (
+                        mlp_bias is None
+                    ), f"mlp_bias is not supported for {type(self.token_dispatcher)}"
+                    output = self.combine(output)
 
                 if intermediate_tensors is not None:
                     return output, mlp_bias
@@ -749,6 +828,8 @@ class MoELayer(BaseMoELayer):
         # naming to better explain that they are actually from different fine-grained callables,
         # or use scanning to decide which backward_dw should be called.
         if routed_experts:
+            if self.moe_ep_chunk_overlap is not None:
+                raise NotImplementedError("MoELayer.backward_dw() is not supported with moe_ep_chunk_overlap: ")
             self.experts.backward_dw()
             if self.config.moe_latent_size and self.config.overlap_moe_expert_parallel_comm:
                 # TODO(Wohox): fc2_latent_proj forward and backward are executed in comm stream,
@@ -758,7 +839,10 @@ class MoELayer(BaseMoELayer):
                 with torch.cuda.stream(comm_stream):
                     self.fc2_latent_proj.backward_dw()
         if shared_experts:
-            if self.use_shared_expert and not self.shared_expert_overlap:
+            # Under the overlap this layer drives the shared expert itself.
+            if self.use_shared_expert and (
+                not self.shared_expert_overlap or self.moe_ep_chunk_overlap is not None
+            ):
                 self.shared_experts.backward_dw()
             if self.config.moe_latent_size and self.config.overlap_moe_expert_parallel_comm:
                 self.fc1_latent_proj.backward_dw()
