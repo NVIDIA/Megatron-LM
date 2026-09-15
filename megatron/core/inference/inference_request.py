@@ -30,11 +30,7 @@ def serialize_tensor(tensor: torch.Tensor) -> Dict[str, Any]:
     """
     tensor_cpu = tensor.detach().contiguous().cpu()
     tensor_bytes = tensor_cpu.reshape(-1).view(torch.uint8).numpy().tobytes()
-    return {
-        "dtype": str(tensor_cpu.dtype),
-        "shape": list(tensor_cpu.shape),
-        "data": tensor_bytes,
-    }
+    return {"dtype": str(tensor_cpu.dtype), "shape": list(tensor_cpu.shape), "data": tensor_bytes}
 
 
 def deserialize_tensor(tensor_data: Any) -> torch.Tensor:
@@ -62,7 +58,12 @@ def deserialize_tensor(tensor_data: Any) -> torch.Tensor:
     if not isinstance(dtype, torch.dtype):
         raise ValueError(f"Unsupported serialized tensor dtype {dtype_name!r}.")
 
-    shape = tuple(int(dim) for dim in tensor_data["shape"])
+    serialized_shape = tensor_data["shape"]
+    if not isinstance(serialized_shape, (list, tuple)):
+        raise TypeError("Serialized tensor shape must be a list or tuple of integers.")
+    if any(not isinstance(dim, int) or isinstance(dim, bool) for dim in serialized_shape):
+        raise TypeError("Serialized tensor shape must contain only integers.")
+    shape = tuple(serialized_shape)
     if any(dim < 0 for dim in shape):
         raise ValueError(f"Serialized tensor shape must be non-negative, got {shape}.")
     raw_data = tensor_data["data"]
@@ -151,16 +152,16 @@ def compute_media_cache_key(modality: str, modality_data: Any) -> str:
 
 
 @dataclass(frozen=True)
-class PreparedMultimodalData:
+class _PreparedMultimodalData:
     """Multimodal wire data whose content identity has already been computed."""
 
     serialized: Dict[str, Any]
 
 
-def prepare_multimodal_data(multi_modal_data: Any) -> Optional[PreparedMultimodalData]:
+def prepare_multimodal_data(multi_modal_data: Any) -> Optional[_PreparedMultimodalData]:
     """Serialize and hash media once for reuse across equivalent submissions."""
     serialized = serialize_multimodal_data(multi_modal_data)
-    return PreparedMultimodalData(serialized) if serialized is not None else None
+    return _PreparedMultimodalData(serialized) if serialized is not None else None
 
 
 def serialize_multimodal_data(multi_modal_data: Any) -> Optional[Dict[str, Any]]:
@@ -182,10 +183,11 @@ def serialize_multimodal_data(multi_modal_data: Any) -> Optional[Dict[str, Any]]
     """
     if multi_modal_data is None:
         return None
-    if isinstance(multi_modal_data, PreparedMultimodalData):
-        # If choices n > 1, we don't need to re-serialize. Just use the
-        # previously serialized and cached PreparedMultimodalData.
-        return multi_modal_data.serialized
+    if isinstance(multi_modal_data, _PreparedMultimodalData):
+        # If choices n > 1, reuse the serialized payload without re-hashing or
+        # converting tensors. Return an isolated structure so callers cannot
+        # mutate the prepared payload or its cache identity.
+        return copy.deepcopy(multi_modal_data.serialized)
     if not isinstance(multi_modal_data, dict):
         raise TypeError(f"multi_modal_data must be a dict or None, got {type(multi_modal_data)}.")
 
@@ -436,16 +438,20 @@ def deserialize_ndarray(obj: dict) -> np.ndarray:
 
 
 def unwrap_serialized_tensors(serialized_request: dict) -> dict:
-    """Unwrap ("tensor", [...]) tuples produced by serialize() into plain lists.
+    """Unwrap serialized tensor tuples produced by serialize() into plain lists.
 
     Args:
         serialized_request (dict): A dict produced by `serialize()`.
 
     Returns:
-        dict: A shallow copy with tensor wrapper tuples replaced by their inner lists.
+        dict: A shallow copy with tensor wrapper tuples replaced by plain lists.
     """
     return {
-        k: v[1] if isinstance(v, (list, tuple)) and len(v) == 2 and v[0] == "tensor" else v
+        k: (
+            deserialize_tensor(v[1]).tolist()
+            if isinstance(v, (list, tuple)) and len(v) == 2 and v[0] == "tensor"
+            else v
+        )
         for k, v in serialized_request.items()
     }
 
@@ -1150,6 +1156,7 @@ class DynamicInferenceRequestRecord:
                 imgs_sizes=old_request.imgs_sizes,
                 num_frames=old_request.num_frames,
                 media_tokens_preexpanded=old_request.media_tokens_preexpanded,
+                media_cache_key=old_request.media_cache_key,
                 decoder_seq_length=old_request.decoder_seq_length,
                 image_embeddings=old_request.image_embeddings,
                 image_token_mask=old_request.image_token_mask,
@@ -1308,3 +1315,4 @@ class DynamicVLMInferenceRequest(DynamicInferenceRequest, VLMInferenceRequest):
     imgs_sizes: Optional[torch.Tensor] = None
     num_frames: Optional[torch.Tensor] = None
     media_tokens_preexpanded: bool = False
+    media_cache_key: Optional[str] = None

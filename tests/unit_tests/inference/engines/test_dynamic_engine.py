@@ -142,12 +142,14 @@ def _build_mock_vlm_engine(image_embeddings):
     return engine, wrapper
 
 
-def _make_vision_cache_entry(embedding, *, imgs=None, imgs_sizes=None, num_tiles=None):
+def _make_vision_cache_entry(
+    embedding, *, modality="image", imgs=None, imgs_sizes=None, num_tiles=None
+):
     if imgs is None:
         imgs = torch.empty(0)
     return dynamic_engine._VisionCacheEntry(
         embedding=embedding,
-        modality="image",
+        modality=modality,
         imgs=imgs,
         num_tiles=num_tiles,
         num_img_embeddings_per_tile=0,
@@ -394,15 +396,116 @@ def test_vision_cache_lru_evicts_embedding_and_reusable_media_together():
     assert engine._vision_embedding_cache_bytes == 64
 
 
+def test_vision_cache_modality_mismatch_does_not_promote_entry():
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine.vision_embedding_cache_max_bytes = 64
+    engine._vision_embedding_cache = OrderedDict(
+        (
+            ("image", _make_vision_cache_entry(torch.ones(1), modality="image")),
+            ("video", _make_vision_cache_entry(torch.ones(1), modality="video")),
+        )
+    )
+
+    assert engine._get_cached_vision_entry("image", "video") is None
+    assert list(engine._vision_embedding_cache) == ["image", "video"]
+
+
 def test_vision_cache_memory_accounting_ignores_cpu_tensors():
     engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
     entry = _make_vision_cache_entry(
-        torch.ones(2),
-        imgs=torch.ones(2),
-        imgs_sizes=torch.tensor([[1, 1]]),
+        torch.ones(2), imgs=torch.ones(2), imgs_sizes=torch.tensor([[1, 1]])
     )
 
     assert engine._vision_cache_entry_nbytes(entry) == 0
+
+
+def test_vision_cache_retains_cpu_tensors_without_consuming_gpu_capacity():
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine.vision_embedding_cache_max_bytes = 1
+    engine._vision_embedding_cache = OrderedDict()
+    engine._vision_embedding_cache_bytes = 0
+    embedding = torch.ones(2)
+    imgs = torch.ones(3)
+    imgs_sizes = torch.tensor([[1, 1]])
+
+    engine._cache_vision_embedding(
+        "cpu-entry", embedding, modality="image", imgs=imgs, imgs_sizes=imgs_sizes
+    )
+
+    entry = engine._get_cached_vision_entry("cpu-entry", "image")
+    assert entry is not None
+    assert entry.embedding is embedding
+    assert entry.imgs is imgs
+    assert entry.imgs_sizes is imgs_sizes
+    assert engine._vision_embedding_cache_bytes == 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_vision_cache_mixed_device_accounting_and_real_capacity_eviction():
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    gpu_embedding = torch.ones(2, device="cuda", dtype=torch.float32)
+    gpu_num_tiles = torch.ones(1, device="cuda", dtype=torch.int64)
+    mixed_entry = _make_vision_cache_entry(
+        gpu_embedding,
+        imgs=torch.ones(3),
+        imgs_sizes=torch.tensor([[1, 1]]),
+        num_tiles=gpu_num_tiles,
+    )
+    expected_bytes = (
+        gpu_embedding.numel() * gpu_embedding.element_size()
+        + gpu_num_tiles.numel() * gpu_num_tiles.element_size()
+    )
+    assert engine._vision_cache_entry_nbytes(mixed_entry) == expected_bytes
+
+    engine.vision_embedding_cache_max_bytes = expected_bytes
+    engine._vision_embedding_cache = OrderedDict()
+    engine._vision_embedding_cache_bytes = 0
+    engine._cache_vision_embedding(
+        "first",
+        gpu_embedding,
+        modality="image",
+        imgs=mixed_entry.imgs,
+        num_tiles=gpu_num_tiles,
+        imgs_sizes=mixed_entry.imgs_sizes,
+    )
+    assert engine._vision_embedding_cache_bytes == expected_bytes
+
+    replacement_imgs = torch.ones(expected_bytes // 4, device="cuda", dtype=torch.float32)
+    engine._cache_vision_embedding("second", torch.ones(1), modality="image", imgs=replacement_imgs)
+
+    assert list(engine._vision_embedding_cache) == ["second"]
+    assert engine._vision_embedding_cache["second"].embedding.device.type == "cpu"
+    assert engine._vision_embedding_cache["second"].imgs.device.type == "cuda"
+    assert engine._vision_embedding_cache_bytes == expected_bytes
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_vision_cache_rejects_entry_over_gpu_capacity():
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine.vision_embedding_cache_max_bytes = 4
+    engine._vision_embedding_cache = OrderedDict()
+    engine._vision_embedding_cache_bytes = 0
+
+    engine._cache_vision_embedding(
+        "oversized",
+        torch.ones(2, device="cuda", dtype=torch.float32),
+        modality="image",
+        imgs=torch.ones(1),
+    )
+
+    assert "oversized" not in engine._vision_embedding_cache
+    assert engine._vision_embedding_cache_bytes == 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_vision_cache_accounts_for_retained_cuda_storage_once():
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    backing = torch.ones(1024, device="cuda", dtype=torch.float32)
+    entry = _make_vision_cache_entry(
+        backing[:1], imgs=backing[1:2], imgs_sizes=torch.tensor([[1, 1]])
+    )
+
+    assert engine._vision_cache_entry_nbytes(entry) == backing.untyped_storage().nbytes()
 
 
 def test_schedule_requests_skips_cached_media_payload_and_preprocessing():
@@ -455,10 +558,7 @@ def test_schedule_requests_skips_cached_media_payload_and_preprocessing():
     engine.add_request.assert_called_once()
     args, kwargs = engine.add_request.call_args
     assert args[:2] == (17, [10, 99])
-    assert kwargs == {
-        "media_cache_key": "shared-image",
-        "media_tokens_preexpanded": True,
-    }
+    assert kwargs == {"media_cache_key": "shared-image", "media_tokens_preexpanded": True}
 
 
 def teardown_module(module):
@@ -1378,9 +1478,7 @@ def test_drained_reset_preserves_coordinator_runtime_state():
     engine._state_events[EngineState.PAUSED].set()
     engine._pending_signals = deque([b"pending-control"])
     engine.resume_request_ids = []
-    engine._vision_embedding_cache = {
-        "cached": _make_vision_cache_entry(torch.ones(1))
-    }
+    engine._vision_embedding_cache = {"cached": _make_vision_cache_entry(torch.ones(1))}
     engine._vision_embedding_cache_bytes = 4
 
     loop = engine._loop
@@ -1580,9 +1678,7 @@ def test_vision_state_invalidation_marks_request_local_embeddings_stale():
 def test_vision_state_invalidation_can_explicitly_retain_stale_embeddings():
     engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
     engine.allow_stale_multimodal_embeddings = True
-    engine._vision_embedding_cache = {
-        "media": _make_vision_cache_entry(torch.ones(1))
-    }
+    engine._vision_embedding_cache = {"media": _make_vision_cache_entry(torch.ones(1))}
     engine._vision_embedding_cache_bytes = 4
     engine.requests = {}
 
@@ -1598,7 +1694,8 @@ def test_refresh_vlm_request_recomputes_embeddings_and_mask():
         prompt_tokens=torch.tensor([99, 99, 5, 7]),
         compact_prompt_tokens=torch.tensor([99, 5]),
         sampling_params=SamplingParams(num_tokens_to_generate=1, termination_id=-1),
-        block_hash_salt="media",
+        block_hash_salt="w7\0media",
+        media_cache_key="media",
         num_img_embeddings_per_tile=0,
         imgs=torch.ones(1),
         num_tiles=torch.tensor([1]),
@@ -1630,6 +1727,8 @@ def test_refresh_vlm_request_recomputes_embeddings_and_mask():
     assert encoder_kwargs["imgs_sizes"].device == request.prompt_tokens.device
     assert request.image_embeddings is wrapper._forward_vision_encoder.return_value
     assert request.image_token_mask.tolist() == [0, 1, -1, -1]
+    engine._cache_vision_embedding.assert_called_once()
+    assert engine._cache_vision_embedding.call_args.args[0] == "media"
     engine.context.add_vlm_request_data.assert_called_once_with(
         request.request_id,
         image_embeddings=request.image_embeddings,
@@ -1648,6 +1747,7 @@ def test_checkpointed_vlm_request_refreshes_cpu_media_on_gpu():
         compact_prompt_tokens=torch.tensor([99, 5], device=device),
         sampling_params=SamplingParams(num_tokens_to_generate=4, termination_id=-1),
         block_hash_salt="media",
+        media_cache_key="media",
         num_img_embeddings_per_tile=0,
         imgs=imgs,
         num_tiles=torch.tensor([1]),
@@ -1691,6 +1791,7 @@ def test_checkpointed_vlm_request_refreshes_cpu_media_on_gpu():
     assert checkpointed_request.compact_prompt_tokens is original_request.compact_prompt_tokens
     assert checkpointed_request.imgs is imgs
     assert checkpointed_request.imgs_sizes is imgs_sizes
+    assert checkpointed_request.media_cache_key == "media"
     assert checkpointed_request.imgs.device.type == "cpu"
     assert checkpointed_request.imgs_sizes.device.type == "cpu"
     assert checkpointed_request.image_embeddings is refreshed_embeddings

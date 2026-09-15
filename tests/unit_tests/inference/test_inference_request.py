@@ -39,20 +39,66 @@ def _make_dynamic_request(**kwargs):
     return DynamicInferenceRequest(**defaults)
 
 
+@pytest.mark.parametrize(
+    "tensor",
+    [
+        pytest.param(torch.tensor(3.25, dtype=torch.float32), id="scalar-fp32"),
+        pytest.param(torch.arange(6, dtype=torch.float16).reshape(2, 3), id="fp16"),
+        pytest.param(torch.arange(6, dtype=torch.bfloat16).reshape(2, 3), id="bf16"),
+        pytest.param(torch.arange(6, dtype=torch.int64).reshape(2, 3), id="int64"),
+        pytest.param(torch.tensor([[True, False], [False, True]]), id="bool"),
+        pytest.param(torch.empty((0, 3), dtype=torch.float32), id="empty"),
+        pytest.param(torch.arange(12, dtype=torch.float32).reshape(3, 4).T, id="noncontiguous"),
+    ],
+)
+def test_tensor_binary_serialization_round_trip(tensor):
+    serialized = serialize_tensor(tensor)
+    restored = deserialize_tensor(msgpack.unpackb(msgpack.packb(serialized), raw=False))
+
+    assert set(serialized) == {"dtype", "shape", "data"}
+    assert isinstance(serialized["data"], bytes)
+    assert restored.device.type == "cpu"
+    assert restored.dtype == tensor.dtype
+    assert restored.shape == tensor.shape
+    assert torch.equal(restored, tensor.cpu())
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_tensor_binary_serialization_round_trip_from_cuda():
+    tensor = torch.arange(12, device="cuda", dtype=torch.float32).reshape(3, 4).T
+
+    restored = deserialize_tensor(serialize_tensor(tensor))
+
+    assert restored.device.type == "cpu"
+    assert restored.dtype == tensor.dtype
+    assert restored.shape == tensor.shape
+    assert torch.equal(restored, tensor.cpu())
+
+
+@pytest.mark.parametrize(
+    ("payload", "error"),
+    [
+        ({"dtype": "torch.not_a_dtype", "shape": [1], "data": b"\0"}, "Unsupported"),
+        ({"dtype": "torch.float32", "shape": [-1], "data": b""}, "non-negative"),
+        ({"dtype": "torch.float32", "shape": [2], "data": b"\0" * 4}, "expected 8"),
+        ({"dtype": "torch.float32", "shape": [1], "data": "not-bytes"}, "must be bytes"),
+        ({"dtype": "torch.float32", "shape": [1]}, "exactly dtype, shape, and data"),
+        ({"dtype": "torch.float32", "shape": "1", "data": b"\0" * 4}, "list or tuple"),
+        ({"dtype": "torch.float32", "shape": [True], "data": b"\0" * 4}, "only integers"),
+        ({"dtype": "torch.float32", "shape": [1.0], "data": b"\0" * 4}, "only integers"),
+        ({"dtype": "torch.float32", "shape": ["1"], "data": b"\0" * 4}, "only integers"),
+    ],
+)
+def test_tensor_binary_deserialization_rejects_malformed_payload(payload, error):
+    with pytest.raises((TypeError, ValueError), match=error):
+        deserialize_tensor(payload)
+
+
 def test_serialization_helpers_round_trip():
     """serialize_tensor / serialize_ndarray pair with their deserialize inverses;
     unwrap_serialized_tensors replaces ('tensor', payload) sentinels in place and
     leaves other wrappers untouched. The wrapper protocol is the contract every
     higher-level serialize() call depends on."""
-    t = torch.tensor([[4, 5], [6, 7]], dtype=torch.bfloat16)
-    serialized = serialize_tensor(t)
-    restored = deserialize_tensor(msgpack.unpackb(msgpack.packb(serialized), raw=False))
-    assert set(serialized) == {"dtype", "shape", "data"}
-    assert isinstance(serialized["data"], bytes)
-    assert restored.dtype == t.dtype
-    assert restored.shape == t.shape
-    assert torch.equal(restored, t)
-
     # Requests serialized by older clients remain readable.
     assert deserialize_tensor([4, 5, 6, 7]).tolist() == [4, 5, 6, 7]
 
@@ -70,6 +116,22 @@ def test_serialization_helpers_round_trip():
     assert out["a"] == [1, 2, 3]
     assert out["b"] == "plain"
     assert out["c"] == ("ndarray", {"data": [], "dtype": "int32"})
+
+    binary_tensor = torch.tensor([4, 5, 6], dtype=torch.int64)
+    out = unwrap_serialized_tensors({"tokens": ("tensor", serialize_tensor(binary_tensor))})
+    assert out["tokens"] == [4, 5, 6]
+
+
+def test_prepared_multimodal_data_protects_computed_identity():
+    prepared = prepare_multimodal_data({"image": [b"image"]})
+    wire = serialize_multimodal_data(prepared)
+    expected_key = wire["media_cache_key"]
+    wire["media_cache_key"] = "forged"
+    wire["image"].append(b"different-image")
+
+    fresh_wire = serialize_multimodal_data(prepared)
+    assert fresh_wire["media_cache_key"] == expected_key
+    assert fresh_wire["image"] == [b"image"]
 
 
 def test_preexpanded_multimodal_request_round_trip():
