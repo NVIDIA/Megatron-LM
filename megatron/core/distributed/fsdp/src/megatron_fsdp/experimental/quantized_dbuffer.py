@@ -18,10 +18,16 @@ from collections.abc import Iterable
 
 import torch
 import torch.nn.functional as F
-import transformer_engine_torch as tex
 from torch.distributed import DeviceMesh
 from torch.distributed.tensor.placement_types import Placement
-from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Quantizer, MXFP8Tensor
+
+try:
+    import transformer_engine_torch as tex
+    from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Quantizer, MXFP8Tensor
+except ImportError as exc:
+    raise ImportError(
+        "UnavailableError: QuantizedDBuffer requires Transformer Engine MXFP8 support"
+    ) from exc
 
 from .dbuffer import DBuffer
 from .layout import GlobalLayout
