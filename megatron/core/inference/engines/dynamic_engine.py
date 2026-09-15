@@ -1680,6 +1680,7 @@ class DynamicInferenceEngine(AbstractEngine):
         imgs_sizes: Optional[Tensor] = None,
         num_frames: Optional[Tensor] = None,
         media_tokens_preexpanded: bool = False,
+        media_cache_key: Optional[str] = None,
     ) -> asyncio.Future[DynamicInferenceRequest]:
         """Add request to inference context.
 
@@ -1712,6 +1713,9 @@ class DynamicInferenceEngine(AbstractEngine):
             num_frames (Optional[Tensor]): Number of frames per image/video item.
             media_tokens_preexpanded (bool): Whether prompt token IDs already contain
                 one model token per projected media embedding.
+            media_cache_key (Optional[str]): Media identity computed by the submitting
+                inference client. Direct callers may omit it and let the engine derive
+                an identity from the resolved media tensors.
 
         Return:
             Returns an asyncio `Future[DynamicInferenceRequest]` for the user to wait on.
@@ -1777,6 +1781,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 precomputed_block_hashes=precomputed_block_hashes,
                 num_frames=num_frames,
                 media_tokens_preexpanded=media_tokens_preexpanded,
+                media_cache_key=media_cache_key,
             )
             # _build_vlm_request has already registered the image embeddings
             # and token mask into the context (add_vlm_request_data). If
@@ -1821,6 +1826,7 @@ class DynamicInferenceEngine(AbstractEngine):
         precomputed_block_hashes: Optional[List[int]] = None,
         num_frames: Optional[Tensor] = None,
         media_tokens_preexpanded: bool = False,
+        media_cache_key: Optional[str] = None,
     ) -> DynamicVLMInferenceRequest:
         """Prepare media tokens, run the vision encoder, register per-request
         media data on the context, and return a DynamicVLMInferenceRequest.
@@ -1860,14 +1866,16 @@ class DynamicInferenceEngine(AbstractEngine):
                 "which is not yet available upstream."
             )
 
-        # Compute multimodal media cache key, which is used by generators to
-        # skip re-computing multimodal embeddings if the cache is hit.
+        # Multimodal request preparation.
         modality = "video" if num_frames is not None else "image"
-        media_cache_key = None
         needs_media_identity = self.context.enable_prefix_caching or (
             getattr(self, "vision_embedding_cache_max_bytes", 0) > 0
         )
-        if imgs is not None and needs_media_identity:
+        if media_cache_key is None and imgs is not None and needs_media_identity:
+            # Compute multimodal media cache key, which is used by generators to
+            # skip re-computing multimodal embeddings if the cache is hit.
+            # Strongly recommend generating this hash upstream, such as via
+            # the InferenceClient or providing this argument in add_request().
             media_inputs = {"imgs": imgs}
             for name, value in (
                 ("num_tiles", num_tiles),
