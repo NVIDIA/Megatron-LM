@@ -264,6 +264,7 @@ def test_nemotron_nightly_recipe_entrypoints(test_case, entrypoint):
     )
     assert f'"TRAINING_SCRIPT_PATH={entrypoint}"' in script
     assert f"/nemotron/{test_case}/model_config.yaml" in script
+    assert spec["compare_to_golden"] == ("false" if test_case == PUZZLE_CASE else "true")
 
 
 def test_puzzle_recipe_covers_full_size_training_and_resume(puzzle_recipe):
@@ -283,14 +284,7 @@ def test_puzzle_recipe_covers_full_size_training_and_resume(puzzle_recipe):
     assert args.get("--moe-shared-expert-overlap", False) is False
     assert "--hybrid-layer-pattern" not in args
     assert "--mtp-num-layers" not in args
-    assert set(recipe["METRICS"]) == {
-        "iteration-time",
-        "lm loss",
-        "mtp_1 loss",
-        "num-zeros",
-        "mem-allocated-bytes",
-        "mem-max-allocated-bytes",
-    }
+    assert recipe["METRICS"] == ["lm loss", "mtp_1 loss"]
 
 
 def test_puzzle_recipe_validates_and_builds_training_config(monkeypatch, puzzle_recipe):

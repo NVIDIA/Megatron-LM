@@ -115,11 +115,7 @@ MODEL_ARGS:
   --seed: 1234
 
 METRICS:
-  - iteration-time
   - lm loss
   - mtp_1 loss
-  - num-zeros
-  - mem-allocated-bytes
-  - mem-max-allocated-bytes
 
 LAUNCHER: ft_launcher

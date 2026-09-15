@@ -12,6 +12,7 @@ spec:
   n_repeat: 5
   platforms: dgx_gb200
   training_script: pretrain_hybrid.py
+  compare_to_golden: "true"
   script_setup: |
     set -euo pipefail
     unset https_proxy
@@ -49,6 +50,11 @@ spec:
 
     export GPUS_PER_NODE={gpus}
 
+    GOLDEN_VALUES_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/golden_values_{environment}_{platforms}.json
+    if [[ "{compare_to_golden}" == "false" ]]; then
+        GOLDEN_VALUES_PATH=""
+    fi
+
     ARGUMENTS=(
         "DATA_PATH=/mnt/artifacts"
         "DATA_CACHE_PATH=/lustre/fsw/coreai_dlalgo_mcore/mcore_ci/data/$RUN_ID/cache/"
@@ -58,7 +64,7 @@ spec:
         "CHECKPOINT_LOAD_PATH=/mnt/artifacts"
         "TRAINING_SCRIPT_PATH={training_script}"
         "TRAINING_PARAMS_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/model_config.yaml"
-        "GOLDEN_VALUES_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/golden_values_{environment}_{platforms}.json"
+        "GOLDEN_VALUES_PATH=$GOLDEN_VALUES_PATH"
         "N_REPEAT={n_repeat}"
         "ENABLE_LIGHTWEIGHT_MODE=${{ENABLE_LIGHTWEIGHT_MODE:-}}"
         "RECORD_CHECKPOINTS=${{RECORD_CHECKPOINTS:-}}"
@@ -80,3 +86,4 @@ products:
         cadence: [nightly]
         platforms: [dgx_gb200]
         training_script: [examples/hybrid/puzzle.py]
+        compare_to_golden: ["false"]

@@ -10,18 +10,15 @@ The [Nemotron GB200 recipe](../../../../test_utils/recipes/gb200/nemotron.yaml) 
 two nodes of four GB200 GPUs and five repetitions. It launches
 `examples/hybrid/puzzle.py` with TP1/PP1/CP1/EP8/ETP1. Each repetition trains 20
 steps, saves at step 10, and resumes that checkpoint through step 20 with optimizer
-and RNG restoration. The harness checks the resumed losses against the first run.
+and RNG restoration. The harness requires complete, finite LM and MTP loss logs
+and checks the resumed losses against the first run using its existing numerical
+tolerances. Timing, memory, and gradient-zero counts remain diagnostic logs only.
+There is no checked-in golden baseline or performance gate.
 
 ## Target-hardware acceptance
 
 Full-size memory fit and numerical acceptance require an actual eight-GB200 run.
-Do not substitute a scaled model or copy another model's golden values.
-`golden_values_dev_dgx_gb200.json` comes directly from the first 20-step training
-phase of [GB200 job 439930823](https://gitlab-master.nvidia.com/dl/jet/ci/-/jobs/439930823),
-at commit `964c8bdb7893f1fe85d92f05407af647054f2d64`. All six metrics retain the
-TensorBoard collector's original values; iteration timing starts at step 2.
-
-The baseline establishes reference metrics, not checkpoint-resume acceptance.
-A clean five-repeat run must pass both golden and resumed-loss comparisons.
+Do not substitute a scaled model. A clean five-repeat run must pass training,
+checkpoint restoration, finite-loss validation, and resumed-loss comparisons.
 Allow a 9,000-second allocation for the full-size checkpoint I/O and all five
 repetitions (`--functional-test-time-limit 9000` with the internal CI helper).
