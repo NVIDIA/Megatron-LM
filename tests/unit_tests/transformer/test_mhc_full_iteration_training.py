@@ -475,7 +475,14 @@ def _check_training_parity(model_kind, dtype, dropout):
             # This catches replaying one captured mask forever even if loss and
             # parameter updates happen to remain non-trivial.
             torch.testing.assert_close(actual_rng, expected_rng, rtol=0, atol=0)
-            assert not torch.equal(initial_rng[0], actual_rng[0])
+            # Sequence-parallel dropout advances the tracked model-parallel
+            # generator; the default generator may remain unchanged.
+            default_rng_advanced = not torch.equal(initial_rng[0], actual_rng[0])
+            tracked_rng_advanced = any(
+                not torch.equal(state, actual_rng[1][name])
+                for name, state in initial_rng[1].items()
+            )
+            assert default_rng_advanced or tracked_rng_advanced, "Dropout must advance CUDA RNG"
     except BaseException:
         traceback.print_exc(file=sys.__stderr__)
         sys.__stderr__.flush()
