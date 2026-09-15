@@ -1335,13 +1335,14 @@ class BatchInvariantRMSNormFn(torch.autograd.Function):
             raise RuntimeError("Batch-invariant RMSNorm requires CUDA tensors.")
         if not _is_supported_dtype_for_bik(x.dtype):
             raise RuntimeError(f"Unsupported dtype for batch-invariant RMSNorm: {x.dtype}")
-        weight_eff = weight + 1.0 if zero_centered_gamma else weight
 
         # We do everything in rmsnorm_batch_invariant manually here so that we can
         # save rsigma in full precision for backward to match the TE behavior.
         x_dtype = x.dtype
         x_fp32 = x.float()
         w_fp32 = weight.to(device=x.device, dtype=torch.float32)
+        if zero_centered_gamma:
+            w_fp32 = w_fp32 + 1.0
         ms = mean_dim(x_fp32 * x_fp32, dim=-1, keepdim=True)
         rsigma = torch.rsqrt(ms + eps)
         out_fp32 = (x_fp32 * rsigma) * w_fp32
@@ -1376,7 +1377,7 @@ class BatchInvariantRMSNormFn(torch.autograd.Function):
         g_w = (go_fp32 * x_fp32 * r).sum(dim=red_dims).to(weight.dtype)
 
         s = (go_fp32 * x_fp32 * w_fp32).sum(dim=-1, keepdim=True)
-        dx = go_fp32 * (w_fp32 * r) - (w_fp32 * r3) * (s * x_fp32) / D
+        dx = go_fp32 * (w_fp32 * r) - r3 * (s * x_fp32) / D
         dx = dx.to(x.dtype)
 
         return dx, g_w, None, None
