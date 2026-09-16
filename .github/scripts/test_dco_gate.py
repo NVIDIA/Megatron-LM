@@ -10,6 +10,8 @@ from dco_gate import (
     GateError,
     gate_payload,
     is_merge_queue_branch,
+    list_open_pull_request_heads,
+    reconcile_open_pull_requests,
     select_existing_gate,
     select_latest_dco,
     validate_trigger,
@@ -17,6 +19,27 @@ from dco_gate import (
 
 SHA = "a" * 40
 MERGE_QUEUE_BRANCH = f"gh-readonly-queue/main/pr-5857-{'b' * 40}"
+
+
+def _head_sha(number: int) -> str:
+    return f"{number:040x}"
+
+
+def _gate(check_run_id: int, sha: str):
+    return {
+        "id": check_run_id,
+        "name": "DCO gate",
+        "head_sha": sha,
+        "external_id": f"dco-gate:{sha}",
+    }
+
+
+def _fake_check_runs(gates: dict[str, list], verdicts: dict[str, list]):
+    def _list_check_runs(api_url: str, repository: str, head_sha: str, name: str, token: str):
+        source = gates if name == "DCO gate" else verdicts
+        return source.get(head_sha, [])
+
+    return _list_check_runs
 
 
 def _dco(check_run_id: int, conclusion: str | None, *, app_slug: str = "dco", sha: str = SHA):
@@ -136,6 +159,63 @@ class TestDcoGate(unittest.TestCase):
             )
             self.assertNotIn("head_sha", payload)
 
+    def test_reconcile_publishes_only_heads_without_a_gate(self) -> None:
+        gated, ungated, unverdicted = _head_sha(1), _head_sha(2), _head_sha(3)
+        gates = {gated: [_gate(50, gated)]}
+        verdicts = {ungated: [_dco(60, "action_required", sha=ungated)]}
+        with (
+            mock.patch.object(
+                dco_gate,
+                "list_open_pull_request_heads",
+                return_value=[(1, gated), (2, ungated), (3, unverdicted)],
+            ),
+            mock.patch.object(
+                dco_gate, "_list_check_runs", side_effect=_fake_check_runs(gates, verdicts)
+            ),
+            mock.patch.object(dco_gate, "_request_json", return_value={"id": 70}) as request,
+        ):
+            outcomes = reconcile_open_pull_requests("NVIDIA/Megatron-LM", "https://api", "token")
+
+        self.assertEqual(outcomes["present"], [1])
+        self.assertEqual(outcomes["published"], [2])
+        self.assertEqual(outcomes["unverdicted"], [3])
+        method, url, _, payload = request.call_args.args
+        self.assertEqual((method, url), ("POST", "https://api/repos/NVIDIA/Megatron-LM/check-runs"))
+        self.assertEqual(payload["head_sha"], ungated)
+        self.assertEqual(payload["conclusion"], "failure")
+        self.assertEqual(request.call_count, 1)
+
+    def test_reconcile_defers_heads_beyond_the_publish_limit(self) -> None:
+        heads = [(number, _head_sha(number)) for number in range(1, 5)]
+        verdicts = {head_sha: [_dco(80, "success", sha=head_sha)] for _, head_sha in heads}
+        with (
+            mock.patch.object(dco_gate, "list_open_pull_request_heads", return_value=heads),
+            mock.patch.object(dco_gate, "RECONCILE_PUBLISH_LIMIT", 2),
+            mock.patch.object(
+                dco_gate, "_list_check_runs", side_effect=_fake_check_runs({}, verdicts)
+            ),
+            mock.patch.object(dco_gate, "_request_json", return_value={"id": 90}) as request,
+        ):
+            outcomes = reconcile_open_pull_requests("NVIDIA/Megatron-LM", "https://api", "token")
+
+        self.assertEqual(outcomes["published"], [1, 2])
+        self.assertEqual(outcomes["deferred"], [3, 4])
+        self.assertEqual(request.call_count, 2)
+
+    def test_open_pull_request_heads_paginate_and_reject_invalid_shas(self) -> None:
+        page = [{"number": index, "head": {"sha": _head_sha(index)}} for index in range(1, 101)]
+        with mock.patch.object(dco_gate, "_request_list", side_effect=[page, page[:1]]) as request:
+            heads = list_open_pull_request_heads("https://api", "NVIDIA/Megatron-LM", "token")
+        self.assertEqual(len(heads), 101)
+        self.assertIn("state=open", request.call_args_list[0].args[0])
+        self.assertIn("page=2", request.call_args_list[1].args[0])
+
+        with mock.patch.object(
+            dco_gate, "_request_list", return_value=[{"number": 1, "head": {"sha": "nope"}}]
+        ):
+            with self.assertRaisesRegex(GateError, "invalid head SHA"):
+                list_open_pull_request_heads("https://api", "NVIDIA/Megatron-LM", "token")
+
     def test_workflows_isolate_merge_group_and_preserve_legacy_dco(self) -> None:
         publisher = Path(".github/workflows/dco-gate.yml").read_text()
         merge_group = Path(".github/workflows/dco-gate-merge-group.yml").read_text()
@@ -153,6 +233,15 @@ class TestDcoGate(unittest.TestCase):
         self.assertIn("name: DCO gate", merge_group)
         self.assertIn("DCO_merge_group:", main)
         self.assertIn("name: DCO", main)
+
+    def test_reconcile_workflow_sweeps_on_a_schedule(self) -> None:
+        reconcile = Path(".github/workflows/dco-gate-reconcile.yml").read_text()
+        self.assertIn("schedule:\n    - cron:", reconcile)
+        self.assertIn("workflow_dispatch:", reconcile)
+        self.assertIn("DCO_GATE_MODE: reconcile", reconcile)
+        self.assertIn("ref: ${{ github.event.repository.default_branch }}", reconcile)
+        self.assertIn("checks: write", reconcile)
+        self.assertIn("pull-requests: read", reconcile)
 
 
 if __name__ == "__main__":
